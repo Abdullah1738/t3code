@@ -34,11 +34,11 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>) {
       if (name) component("robob", name, count, oks, failures, values);
     }
     if (line.error) {
-      const name = "name" in line.error && typeof line.error.name === "string" ? line.error.name : "UnknownError";
+      const name = line.error.name;
       const key = `${line.error.tag}\0${name}`;
       const item = errors.get(key) ?? { tag: line.error.tag, name, count: 0,
         sampleId: line.ids?.messageId ?? line.ids?.operationId ?? line.ids?.threadId ?? line.ids?.formId ?? line.ids?.runId,
-        ...("site" in line && typeof line.site === "string" ? { site: line.site } : {}) };
+        ...(line.site ? { site: line.site } : {}) };
       item.count++; errors.set(key, item);
     }
   }

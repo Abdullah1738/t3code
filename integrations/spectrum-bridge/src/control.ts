@@ -180,13 +180,13 @@ export class ControlClient {
         proxy: "",
         verbose: false,
       });
-    } catch { toolError("control", "control.catch1");
+    } catch (caughtError) { toolError("control", "control.catch1", caughtError);
       throw new ControlError(0);
     }
     let data: { ok?: unknown; error?: { code?: unknown } } | undefined;
     try {
       data = await response.json() as typeof data;
-    } catch { toolError("control", "control.catch2"); /* Non-JSON bodies only come from proxies or crashes. */ }
+    } catch (caughtError) { toolError("control", "control.catch2", caughtError); /* Non-JSON bodies only come from proxies or crashes. */ }
     if (!response.ok || data?.ok !== true) {
       throw new ControlError(response.status || 0, typeof data?.error?.code === "string" ? data.error.code : "");
     }
@@ -258,10 +258,10 @@ export class ControlClient {
         proxy: "",
         verbose: false,
       });
-    } catch { toolError("control", "control.catch3");
+    } catch (caughtError) { toolError("control", "control.catch3", caughtError);
       throw new ControlError(0, "upload_failed");
     }
-    await response.body?.cancel().catch(() => { toolError("control", "control.catch4");});
+    await response.body?.cancel().catch((caughtError) => { toolError("control", "control.catch4", caughtError);});
     if (!response.ok) throw new ControlError(response.status, "upload_failed");
     return { attachmentId: issued.attachmentId, type, name: file.name, mimeType: file.mimeType, sizeBytes: file.bytes.byteLength };
   }
@@ -286,11 +286,11 @@ export class ControlClient {
         proxy: "",
         verbose: false,
       });
-    } catch { toolError("control", "control.catch5");
+    } catch (caughtError) { toolError("control", "control.catch5", caughtError);
       throw new ControlError(0);
     }
     if (!response.ok || !response.body || response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !== "text/event-stream") {
-      await response.body?.cancel().catch(() => { toolError("control", "control.catch6");});
+      await response.body?.cancel().catch((caughtError) => { toolError("control", "control.catch6", caughtError);});
       throw new ControlError(response.status);
     }
     yield* parseSse(response.body, options.signal);
@@ -316,7 +316,7 @@ export async function* parseSse(body: ReadableStream<Uint8Array>, signal?: Abort
         if (line === "") {
           if (data.length) {
             let parsed: unknown;
-            try { parsed = JSON.parse(data.join("\n")); } catch { toolError("control", "control.catch7"); parsed = undefined; }
+            try { parsed = JSON.parse(data.join("\n")); } catch (caughtError) { toolError("control", "control.catch7", caughtError); parsed = undefined; }
             if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
               yield { ...frame, data: parsed as Record<string, unknown> };
             }
@@ -336,7 +336,7 @@ export async function* parseSse(body: ReadableStream<Uint8Array>, signal?: Abort
       if (done) return;
     }
   } finally {
-    await reader.cancel().catch(() => { toolError("control", "control.catch8");});
+    await reader.cancel().catch((caughtError) => { toolError("control", "control.catch8", caughtError);});
     reader.releaseLock();
   }
 }

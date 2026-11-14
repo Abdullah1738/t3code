@@ -106,7 +106,7 @@ export async function runIngress(deps: IngressDeps, signal: AbortSignal): Promis
         if (signal.aborted || pending) return;
         void refresh()
           .then(count => deps.log?.("ingress-backfill-periodic", String(count)))
-          .catch(() => { toolError("sb-ingress", "sb-ingress.periodic-backfill"); deps.log?.("ingress-backfill-failed"); });
+          .catch((caughtError) => { toolError("sb-ingress", "sb-ingress.periodic-backfill", caughtError); deps.log?.("ingress-backfill-failed"); });
       }, BACKFILL_INTERVAL_MS);
       const stopTimer = () => clearInterval(timer);
       signal.addEventListener("abort", stopTimer, { once: true });
@@ -116,10 +116,10 @@ export async function runIngress(deps: IngressDeps, signal: AbortSignal): Promis
           if (event.type === "message") {
             // The live stream sends only ids for a received message; the full row comes from the message list.
             if (!event.message.from) {
-              await refresh().catch(() => { toolError("sb-ingress", "sb-ingress.catch1"); return deps.log?.("ingress-backfill-failed"); });
+              await refresh().catch((caughtError) => { toolError("sb-ingress", "sb-ingress.catch1", caughtError); return deps.log?.("ingress-backfill-failed"); });
               continue;
             }
-            await handleInbound(deps, event.message).catch(() => { toolError("sb-ingress", "sb-ingress.catch2"); return deps.log?.("ingress-message-failed"); });
+            await handleInbound(deps, event.message).catch((caughtError) => { toolError("sb-ingress", "sb-ingress.catch2", caughtError); return deps.log?.("ingress-message-failed"); });
             advanceCursor(deps.ownerStore, event.message.sentAt);
           } else if (event.type === "typing") {
             handleTyping(deps, event);
@@ -131,7 +131,7 @@ export async function runIngress(deps: IngressDeps, signal: AbortSignal): Promis
         await pending?.catch(() => {});
       }
       backoff = 2_000;
-    } catch (error) { toolError("sb-ingress", "sb-ingress.catch3");
+    } catch (error) { toolError("sb-ingress", "sb-ingress.catch3", error);
       deps.log?.("ingress-unavailable", (error as { code?: string })?.code ?? "operationFailed");
       await sleep(backoff, signal);
       backoff = Math.min(60_000, backoff * 2);
@@ -145,7 +145,7 @@ export async function backfill(deps: IngressDeps, now: () => number, signal?: Ab
   for (const message of messages) {
     if (signal?.aborted) break;
     const arrivedAt = now();
-    const accepted = await handleInbound(deps, message, "backfill").catch(() => { toolError("sb-ingress", "sb-ingress.catch4"); return deps.log?.("ingress-backfill-failed"); });
+    const accepted = await handleInbound(deps, message, "backfill").catch((caughtError) => { toolError("sb-ingress", "sb-ingress.catch4", caughtError); return deps.log?.("ingress-backfill-failed"); });
     advanceCursor(deps.ownerStore, message.sentAt);
     if (accepted && arrivedAt - message.sentAt > INGRESS_GAP_MS) {
       deps.log?.("ingress-backfill-gap", `${Math.floor((arrivedAt - message.sentAt) / 1000)}s`);

@@ -861,7 +861,7 @@ export class Router {
               absent = false;
               break;
             }
-          } catch { toolError("router", "router.catch1"); absent = false; }
+          } catch (caughtError) { toolError("router", "router.catch1", caughtError); absent = false; }
         }
         const live = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(row.id);
         if (live?.state === "done" || this.store.get(`inbound-delivered:${leader}`) !== undefined) continue;
@@ -871,7 +871,7 @@ export class Router {
         // Failed rows belong to #932. This path reports only an unadmitted wake still in the queue.
         const live = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(row.id);
         if (live && ["pending", "batched", "processing"].includes(live.state)) {
-          const sent = await this.options.notifyFailure(`An iMessage background update still has no confirmed turn after its retry. Chat: ${chat?.slug ?? "owner"}. Message: ${row.id}.`, `imessage-stuck-wake:${row.id}`).catch(() => { toolError("router", "router.catch2"); return false; });
+          const sent = await this.options.notifyFailure(`An iMessage background update still has no confirmed turn after its retry. Chat: ${chat?.slug ?? "owner"}. Message: ${row.id}.`, `imessage-stuck-wake:${row.id}`).catch((caughtError) => { toolError("router", "router.catch2", caughtError); return false; });
           if (sent) this.store.set(`stuck-wake-alert:${row.id}`, true);
         }
       }
@@ -1017,7 +1017,7 @@ export class Router {
       let found: string | undefined;
       for (const id of [turn.messageId, ...turn.earlier ?? []]) {
         try { if (await bounded(this.backend.promptAccepted(turn.id, turn.directory, id))) { found = id; break; } }
-        catch { toolError("router", "router.catch3"); /* Unknown admission retains the receipt watch, never POST permission. */ }
+        catch (caughtError) { toolError("router", "router.catch3", caughtError); /* Unknown admission retains the receipt watch, never POST permission. */ }
       }
       if (!found) continue;
       this.store.db.transaction(() => {
@@ -1054,7 +1054,7 @@ export class Router {
         this.store.set(`failed-alert:${id}`, true);
         this.store.set(`failed-alert-pending:${id}`, null);
       }).immediate();
-    } catch { toolError("router", "router.catch4"); this.options.log?.("failed-alert-unavailable", id); }
+    } catch (caughtError) { toolError("router", "router.catch4", caughtError); this.options.log?.("failed-alert-unavailable", id); }
   }
 
   private async recoverFailedInbound(): Promise<void> {
@@ -1115,7 +1115,7 @@ export class Router {
         let conclusive = original !== undefined;
         for (const target of destinations) for (const id of [target.messageId, ...(target.earlier ?? [])]) {
           try { if (await bounded(this.backend.promptAccepted(target.id, target.directory, id))) return true; }
-          catch { toolError("router", "router.catch5"); conclusive = false; }
+          catch (caughtError) { toolError("router", "router.catch5", caughtError); conclusive = false; }
           if (receipted()) return true;
         }
         if (route && !this.current(route)) return undefined;
@@ -1453,7 +1453,7 @@ export class Router {
       if (this.isGroup()) await this.gateGroup();
       if (!dispatchFirst) await this.dispatch(preceding);
       // Transport hints are best effort and never part of prompt acceptance.
-      if (!sendblue && rows.length) await bounded(this.transport.read(this.options.chatGuid)).catch(() => { toolError("router", "router.catch6");});
+      if (!sendblue && rows.length) await bounded(this.transport.read(this.options.chatGuid)).catch((caughtError) => { toolError("router", "router.catch6", caughtError);});
       completed = true;
     } finally {
       let active = false;
@@ -1722,7 +1722,7 @@ export class Router {
     const attempt: SteerAttempt | undefined = this.store.get<SteerAttempt | null>(`steer-attempt:${row.id}`)
       ?? (turn?.steered?.includes(messageId) ? turn : undefined);
     if (attempt) {
-      const accepted = await this.reading(this.backend.promptAccepted(attempt.id, attempt.directory, messageId)).catch(() => { toolError("router", "router.catch7"); return undefined; });
+      const accepted = await this.reading(this.backend.promptAccepted(attempt.id, attempt.directory, messageId)).catch((caughtError) => { toolError("router", "router.catch7", caughtError); return undefined; });
       if (accepted === undefined) {
         this.options.log?.("steer-readback-unknown", `id=${row.id}`);
         return;
@@ -1739,7 +1739,7 @@ export class Router {
     const eyes = context !== undefined && this.eyesFor(input.batchIds ?? [row.id]);
     if (eyes && !this.store.get<boolean>(`eyes:${row.id}`)) {
       this.store.set(`eyes:${row.id}`, true);
-      await bounded(context.react(input.id, "👀")).catch(() => { toolError("router", "router.catch8"); return this.options.log?.("eyes-reaction-failed"); });
+      await bounded(context.react(input.id, "👀")).catch((caughtError) => { toolError("router", "router.catch8", caughtError); return this.options.log?.("eyes-reaction-failed"); });
       if (this.typingActive) await this.updateTyping(true, true);
     }
     let quote = "";
@@ -1831,14 +1831,14 @@ export class Router {
     try {
       delivery = await this.sending(this.backend.steer!(turn.id, turn.directory, messageId, body, guidance, parts,
         { signal: abort.signal, beforeSend: admission }), handled);
-    } catch { toolError("router", "router.catch9");
+    } catch (caughtError) { toolError("router", "router.catch9", caughtError);
       // Keep the sealed attempt: the next tick reads acceptance before retrying its id.
       this.options.log?.("steer-uncertain");
       return;
     } finally { abort.abort(); }
     if (delivery === "refused") {
       // A replayed send can be refused after its first try landed; only then is the text already in.
-      const accepted = await this.reading(this.backend.promptAccepted(turn.id, turn.directory, messageId)).catch(() => { toolError("router", "router.catch10"); return undefined; });
+      const accepted = await this.reading(this.backend.promptAccepted(turn.id, turn.directory, messageId)).catch((caughtError) => { toolError("router", "router.catch10", caughtError); return undefined; });
       if (accepted === undefined) return;
       if (accepted) this.consumeSteer(row.id, sent);
       else {
@@ -1911,7 +1911,7 @@ export class Router {
     const unread = rows.some(row => !synthetic(row.id) && !this.readIds.has(row.id));
     for (const row of rows) this.readIds.add(row.id);
     if (!unread) return;
-    await bounded(this.transport.read(this.options.chatGuid)).catch(() => { toolError("router", "router.catch11");});
+    await bounded(this.transport.read(this.options.chatGuid)).catch((caughtError) => { toolError("router", "router.catch11", caughtError);});
     if (this.typingActive) this.typingAt = 0;
   }
 
@@ -1938,7 +1938,7 @@ export class Router {
     if (!this.listing && (!this.listed || Date.now() - this.listed.at >= STATUS_LIST_MS)) {
       const revision = this.statusRevision;
       this.listing = bounded(this.backend.statuses(), 30_000)
-        .then(statuses => { if (revision === this.statusRevision) this.listed = { at: Date.now(), statuses }; }, () => { toolError("router", "router.catch12");})
+        .then(statuses => { if (revision === this.statusRevision) this.listed = { at: Date.now(), statuses }; }, (caughtError) => { toolError("router", "router.catch12", caughtError);})
         .finally(() => { this.listing = undefined; });
     }
     const own = await this.reading(busy.call(this.backend, route.id, route.directory));
@@ -1969,7 +1969,7 @@ export class Router {
     try {
       await bounded(this.transport.typing(this.options.chatGuid, active));
       if (sendblue && changed) this.options.log?.(active ? "typing-started" : "typing-stopped");
-    } catch (error) { toolError("router", "router.catch13");
+    } catch (error) { toolError("router", "router.catch13", error);
       // Best effort, but a silent failure here is what hid the missing bubble once.
       if (sendblue) this.options.log?.(active ? "typing-start-failed" : "typing-stop-failed", typingFailure(error));
     }
@@ -2047,7 +2047,7 @@ export class Router {
     this.retiring = true;
     void backend.retireOthers(keep)
       .then(count => { if (count) this.options.log?.("chats-settled", String(count)); })
-      .catch(() => { toolError("router", "router.catch14");})
+      .catch((caughtError) => { toolError("router", "router.catch14", caughtError);})
       .finally(() => {
         this.retiring = false;
         if (this.retireAgain) { this.retireAgain = false; this.retireOthers(); }
@@ -2224,7 +2224,7 @@ export class Router {
     try {
       const messages = await this.reading(this.backend.messages(route.id, route.directory, { until: mark.id, limit: 20 }));
       return messages.at(-1)?.id === mark.id;
-    } catch { toolError("router", "router.catch15");
+    } catch (caughtError) { toolError("router", "router.catch15", caughtError);
       return false;
     }
   }
@@ -2233,9 +2233,9 @@ export class Router {
   private async familyBusy(route: Route): Promise<boolean> {
     // A waiting root can still owe background work (commands, monitors) with no child session,
     // which statuses() and sessionBusy() both call idle, so the reset check asks resetBlocked.
-    const blocked = await this.reading(this.backend.resetBlocked?.(route.id, route.directory) ?? Promise.resolve(false)).catch(() => { toolError("router", "router.catch16"); return undefined; });
+    const blocked = await this.reading(this.backend.resetBlocked?.(route.id, route.directory) ?? Promise.resolve(false)).catch((caughtError) => { toolError("router", "router.catch16", caughtError); return undefined; });
     if (blocked === undefined || blocked) return true;
-    const statuses = await this.statusesFor(route).catch(() => { toolError("router", "router.catch17"); return undefined; });
+    const statuses = await this.statusesFor(route).catch((caughtError) => { toolError("router", "router.catch17", caughtError); return undefined; });
     if (!statuses) return true;
     if (statuses[route.id] !== undefined) return true;
     const seen = new Set<string>([route.id]);
@@ -2243,7 +2243,7 @@ export class Router {
     for (let depth = 0; parents.length && depth < MAX_SUBAGENT_DEPTH; depth++) {
       const next: Pick<Route, "id" | "directory">[] = [];
       for (const parent of parents) {
-        const children = await this.reading(this.backend.children(parent.id, parent.directory)).catch(() => { toolError("router", "router.catch18"); return undefined; });
+        const children = await this.reading(this.backend.children(parent.id, parent.directory)).catch((caughtError) => { toolError("router", "router.catch18", caughtError); return undefined; });
         // A family we can't list counts as busy: the deferral waits instead of repeating the refusal.
         if (!children) return true;
         for (const child of children) {
@@ -2309,7 +2309,7 @@ export class Router {
     await this.updateTyping(false);
     if (old && turn && turn.id === old.id && turn.generation === old.generation && turn.directory === old.directory) {
       // A turn that won't stop can't take the nudge, so that /new escapes to a new thread.
-      await this.reading(this.backend.abort(old.id, old.directory)).catch(() => { toolError("router", "router.catch19"); inPlace = false; });
+      await this.reading(this.backend.abort(old.id, old.directory)).catch((caughtError) => { toolError("router", "router.catch19", caughtError); inPlace = false; });
     }
     if (old && inPlace) {
       this.store.db.transaction(() => {
@@ -2334,7 +2334,7 @@ export class Router {
         this.acknowledge(inboundId, "Fresh start. What's up?");
       }).immediate();
       this.retireOthers();
-    } catch { toolError("router", "router.catch20");
+    } catch (caughtError) { toolError("router", "router.catch20", caughtError);
       this.acknowledge(inboundId, "Couldn't start fresh just now. Try /new again in a moment.", "unknown");
     }
   }
@@ -2369,7 +2369,7 @@ export class Router {
       const requests = await bounded<(PermissionRequest | QuestionRequest)[] | undefined>(pending.kind === "permission"
         ? this.backend.permissions(sessionId, directory) : this.backend.questions(sessionId, directory));
       request = requests?.find(r => r.id === pending.id && r.sessionID === sessionId);
-    } catch { toolError("router", "router.catch21");
+    } catch (caughtError) { toolError("router", "router.catch21", caughtError);
       // Leave the message queued; the next tick retries.
       return;
     }
@@ -2446,7 +2446,7 @@ export class Router {
         this.store.updateInbound(inboundId, "done");
       }).immediate();
       this.advance(turn);
-    } catch { toolError("router", "router.catch22");
+    } catch (caughtError) { toolError("router", "router.catch22", caughtError);
       if (!this.current(route)) return;
       this.store.db.transaction(() => {
         entry.state = "unknown";
@@ -2479,7 +2479,7 @@ export class Router {
       return;
     }
     let parsed: unknown;
-    try { parsed = JSON.parse(reply); } catch { toolError("router", "router.catch23"); /* handled below */ }
+    try { parsed = JSON.parse(reply); } catch (caughtError) { toolError("router", "router.catch23", caughtError); /* handled below */ }
     if (!Array.isArray(parsed) || !parsed.every(a => Array.isArray(a) && a.every(v => typeof v === "string"))) {
       this.acknowledge(inboundId, 'Use /answer REQUESTID with a JSON array of string arrays, for example [["choice"]].');
       return;
@@ -2491,7 +2491,7 @@ export class Router {
     let request: QuestionRequest | undefined;
     try {
       request = (await this.reading(this.backend.questions(sessionId, directory)))?.find(r => r.id === pending.id && r.sessionID === sessionId);
-    } catch { toolError("router", "router.catch24");
+    } catch (caughtError) { toolError("router", "router.catch24", caughtError);
       this.acknowledge(inboundId, "Couldn't check that question just now. Try again in a moment.");
       return;
     }
@@ -2525,7 +2525,7 @@ export class Router {
         this.store.set("pendingApprovals", entries);
         this.store.updateInbound(inboundId, "done");
       }).immediate();
-    } catch { toolError("router", "router.catch25");
+    } catch (caughtError) { toolError("router", "router.catch25", caughtError);
       if (!this.current(route)) return;
       this.store.db.transaction(() => {
         entry.state = "unknown";
@@ -2630,7 +2630,7 @@ export class Router {
       if (!requests) return "wait";
       if (!this.current(route) || !this.pending().some(entry => entry.prompt === item.id && entry.state === "pending")) return "cancel";
       return requests.some(request => request.id === pending.id && request.sessionID === sessionId && this.signature(request) === pending.signature) ? "send" : "cancel";
-    } catch { toolError("router", "router.catch26"); return "wait"; }
+    } catch (caughtError) { toolError("router", "router.catch26", caughtError); return "wait"; }
   }
 
   private isGroup(): boolean {
@@ -2735,7 +2735,7 @@ export class Router {
             const p = scores[index] ?? 0;
             gates.set(item.row.id, { verdict: p >= JEV_THRESHOLD ? "followup" : "observe", reason: `jev:${p.toFixed(2)}` });
           });
-        } catch (error) { toolError("router", "router.catch27");
+        } catch (error) { toolError("router", "router.catch27", error);
           this.options.log?.("group-judge-failed", `${context.chat.slug} ${error instanceof JudgeError ? error.code : "judgeFailed"}`);
           for (const item of chunk) gates.set(item.row.id, window(item, "fallback"));
         }
@@ -2829,7 +2829,7 @@ export class Router {
     const look = () => {
       try {
         return swipes.find(row.id);
-      } catch { toolError("router", "router.catch28");
+      } catch (caughtError) { toolError("router", "router.catch28", caughtError);
         failed = true;
         return undefined;
       }
@@ -2982,7 +2982,7 @@ export class Router {
         ? chat !== context.chat.key : !ownerChatGuid(chat, this.options.owner))) return;
       const said = (message.content.text ?? "").replace(/\uFFFC/g, "");
       return said.trim() ? { text: said, fromOwner: !message.isFromMe } : undefined;
-    } catch { toolError("router", "router.catch29");
+    } catch (caughtError) { toolError("router", "router.catch29", caughtError);
       this.options.log?.("reply-target-unavailable");
       return;
     }
@@ -3016,7 +3016,7 @@ export class Router {
     if (deferLargeFiles && taken.some(attachment => attachment.totalBytes > MAX_BLOB_BYTES)) {
       const id = deferLargeFiles.id;
       let busy = false;
-      try { busy = (await this.statusesFor(deferLargeFiles))[id] !== undefined; } catch { toolError("router", "router.catch30"); /* Checked again after downloads. */ }
+      try { busy = (await this.statusesFor(deferLargeFiles))[id] !== undefined; } catch (caughtError) { toolError("router", "router.catch30", caughtError); /* Checked again after downloads. */ }
       if (interrupted()) return;
       if (busy) { this.deferBusyBatch(row); return; }
     }
@@ -3045,7 +3045,7 @@ export class Router {
           assert.ok(file.data instanceof Uint8Array && (!cached || file.data.byteLength === cached.size));
           assert.match(file.mimeType, /^[\s\S]*$/u);
           assert.match(file.name, /^[\s\S]*$/u);
-        } catch { toolError("router", "router.catch31"); throw new TransportError("invalidAttachment"); }
+        } catch (caughtError) { toolError("router", "router.catch31", caughtError); throw new TransportError("invalidAttachment"); }
         if (file.data.byteLength > MAX_INCOMING_BYTES - total) throw new TransportError("attachmentTooLarge");
         total += file.data.byteLength;
         toolLog.capture(() => toolLog.write({ component: "attachments", kind: "event", name: "attachment.received", ids: { messageId: input.id }, props: { attachmentBytes: file.data.byteLength, count: 1 } }));
@@ -3058,7 +3058,7 @@ export class Router {
         }).immediate();
         else if (!cached) this.store.set(`${key}:retry`, null);
         downloaded.push({ ...file, guid: attachment.guid });
-      } catch (error) { toolError("router", "router.catch32");
+      } catch (error) { toolError("router", "router.catch32", error);
         if (interrupted()) return;
         const failure = classifyDownloadFailure(error);
         if (failure.code === "attachmentTooLarge") {
@@ -3080,7 +3080,7 @@ export class Router {
               ...(input.receivedAt === undefined ? {} : { receivedAt: input.receivedAt }),
               maxBytes: Math.max(1, MAX_INCOMING_BYTES - total),
             }), LOCAL_RECOVERY_MS);
-          } catch { toolError("router", "router.catch33"); result = { detail: { reason: "recoveryTimedOut" } }; }
+          } catch (caughtError) { toolError("router", "router.catch33", caughtError); result = { detail: { reason: "recoveryTimedOut" } }; }
           this.options.log?.("attachment-local-recovery", /^[A-Za-z]{1,32}$/.test(result.detail.reason) ? result.detail.reason : "unknown");
           const recovered = result.file;
           if (result.detail.reason === "tooLarge" || (recovered && recovered.data instanceof Uint8Array && recovered.data.byteLength > MAX_INCOMING_BYTES - total)) {
@@ -3125,7 +3125,7 @@ export class Router {
         try {
           transcript = (await bounded(this.options.transcribe!({ data: file.data, name: file.name, mimeType: file.mimeType }), 90_000)).trim();
           this.store.set(key, transcript);
-        } catch (error) { toolError("router", "router.catch34");
+        } catch (error) { toolError("router", "router.catch34", error);
           const code = error instanceof SttError ? error.code : "unknown";
           this.options.log?.("transcription-failed", /^[A-Za-z0-9]{1,32}$/.test(code) ? code : "unknown");
           transcript = "";
@@ -3161,7 +3161,7 @@ export class Router {
           } else {
             // If saving the preview fails, the original remains readable by path.
             let path: string | undefined;
-            try { path = savePreview(prepared.file, route.directory); } catch { toolError("router", "preview-save"); /* Use the original. */ }
+            try { path = savePreview(prepared.file, route.directory); } catch (caughtError) { toolError("router", "preview-save", caughtError); /* Use the original. */ }
             if (interrupted()) return;
             notes.push(path
               ? `The preceding file's preview was not attached (10 MiB of previews per message); the ${prepared.file.mime === "image/jpeg" ? "JPEG " : ""}preview is at ${JSON.stringify(path)} and the original at the quoted path. Open the preview with your read tool.`
@@ -3169,7 +3169,7 @@ export class Router {
           }
         }
       }
-    } catch { toolError("router", "router.catch37");
+    } catch (caughtError) { toolError("router", "router.catch37", caughtError);
       if (interrupted()) return;
       this.acknowledge(row.id, "I couldn't save those files. Mind sending them again?", "failed");
       return;
@@ -3271,7 +3271,7 @@ export class Router {
         const statuses = await this.statusesFor(activeRoute);
         busy = statuses[activeRoute.id] !== undefined;
         if (!busy && !steerAttempt && !latencyRoute) activeRoute = await this.rotate(activeRoute, statuses);
-      } catch { toolError("router", "router.catch35"); /* Unknown status: keep the current conversation. */ }
+      } catch (caughtError) { toolError("router", "router.catch35", caughtError); /* Unknown status: keep the current conversation. */ }
       if (busy) {
         // The agent is still finishing something on its own. Let that land first.
         this.deferBusyBatch(row);
@@ -3294,7 +3294,7 @@ export class Router {
           this.store.set(`batch-phase:${row.id}`, "preparing");
         }).immediate();
         this.retireOthers();
-      } catch (error) { toolError("router", "router.catch36");
+      } catch (error) { toolError("router", "router.catch36", error);
         this.recordFailure(row.id, "create-chat", error);
         if (replyNudgeRow(row.id)) this.store.db.transaction(() => {
           this.retrySynthetic(row.id, "undelivered");
@@ -3323,7 +3323,7 @@ export class Router {
         for (const prompt of earlier) {
           if (await this.reading(this.backend.promptAccepted(prompt.sessionId, prompt.directory, prompt.messageId))) { landed = prompt; break; }
         }
-      } catch { toolError("router", "router.catch38");
+      } catch (caughtError) { toolError("router", "router.catch38", caughtError);
         // Unknown is never permission to POST. Look again shortly.
         if (interrupted()) return;
         this.store.db.transaction(() => {
@@ -3378,7 +3378,7 @@ export class Router {
     const eyes = context !== undefined && this.eyesFor(input.batchIds ?? [row.id]);
     if (eyes && !this.store.get<boolean>(`eyes:${row.id}`)) {
       this.store.set(`eyes:${row.id}`, true);
-      await bounded(context.react(input.id, "👀")).catch(() => { toolError("router", "router.catch39"); return this.options.log?.("eyes-reaction-failed"); });
+      await bounded(context.react(input.id, "👀")).catch((caughtError) => { toolError("router", "router.catch39", caughtError); return this.options.log?.("eyes-reaction-failed"); });
       // A tapback is an outbound message too, and it ends the bubble on the recipient's phone.
       if (this.typingActive) await this.updateTyping(true, true);
     }
@@ -3476,7 +3476,7 @@ export class Router {
         this.store.set(`seed:${turn.id}`, null);
         this.landed(turn);
       }).immediate();
-    } catch (error) { toolError("router", "router.catch40");
+    } catch (error) { toolError("router", "router.catch40", error);
       if (turn.inboundId) this.recordFailure(turn.inboundId, "dispatch", error, turn);
       if (this.current(turn)) await this.reconcile(turn);
     }
@@ -3509,7 +3509,7 @@ export class Router {
       return;
     }
     if (Date.now() - settledAt < (this.options.resetIdleMs ?? RESET_IDLE)) return;
-    const statuses = await this.statusesFor(route).catch(() => { toolError("router", "router.catch41"); return undefined; });
+    const statuses = await this.statusesFor(route).catch((caughtError) => { toolError("router", "router.catch41", caughtError); return undefined; });
     if (!statuses || statuses[route.id] !== undefined) return;
     const nudged = this.store.db.transaction(() => {
       if (!this.current(route) || this.store.pendingInbound().length) return false;
@@ -3644,7 +3644,7 @@ export class Router {
       try {
         const session = await this.reading(this.backend.getSession(turn.id, turn.directory));
         if (session?.id === turn.id && refusalTitle(session.title)) hits.push(`title:${turn.id}`);
-      } catch { toolError("router", "router.catch42"); /* Unknown title: no evidence either way. */ }
+      } catch (caughtError) { toolError("router", "router.catch42", caughtError); /* Unknown title: no evidence either way. */ }
     }
     if (!hits.length || !this.current(turn)) return;
     this.store.set("refusedRoute", { sessionId: turn.id, generation: turn.generation, at: Date.now(), messageIds: hits } satisfies Refused);
@@ -3666,7 +3666,7 @@ export class Router {
     for (const id of found ? [] : ids) {
       try {
         if (await this.reading(this.backend.promptAccepted(turn.id, turn.directory, id))) { found = id; break; }
-      } catch { toolError("router", "router.catch43"); conclusive = false; /* Absence and failed reads are both uncertainty, never permission to POST. */ }
+      } catch (caughtError) { toolError("router", "router.catch43", caughtError); conclusive = false; /* Absence and failed reads are both uncertainty, never permission to POST. */ }
     }
     if (!this.current(turn)) return false;
     const next: Turn = found ? { ...turn, messageId: found, phase: "running" } : { ...turn, phase: turn.phase === "held" ? "held" : "unknown" };
@@ -3800,7 +3800,7 @@ export class Router {
         this.store.set(`seed:${turn.id}`, null);
         this.landed(turn);
       }).immediate();
-    } catch (error) { toolError("router", "router.catch44");
+    } catch (error) { toolError("router", "router.catch44", error);
       if (turn.inboundId) this.recordFailure(turn.inboundId, "dispatch", error, turn);
       if (this.current(turn)) await this.reconcile(turn);
     }
@@ -3888,7 +3888,7 @@ export class Router {
     if (this.requestScan?.key !== key) {
       this.requestScan = { key, result: this.requests(turn, statuses) };
       // A scan may fail between ticks, before its next reader attaches.
-      void this.requestScan.result.catch(() => { toolError("router", "router.catch45");});
+      void this.requestScan.result.catch((caughtError) => { toolError("router", "router.catch45", caughtError);});
     }
     const scan = this.requestScan;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -3900,7 +3900,7 @@ export class Router {
       ]);
       if (result !== undefined && this.requestScan === scan) this.requestScan = undefined;
       return result;
-    } catch (error) { toolError("router", "router.catch46");
+    } catch (error) { toolError("router", "router.catch46", error);
       if (this.requestScan === scan) this.requestScan = undefined;
       throw error;
     } finally { clearTimeout(timer); }
@@ -4105,7 +4105,7 @@ export class Router {
             break;
           }
         }
-      } catch { toolError("router", "router.catch47");
+      } catch (caughtError) { toolError("router", "router.catch47", caughtError);
         expansionHeld = true;
       }
       if (!this.current(turn)) return;
@@ -4354,7 +4354,7 @@ export class Router {
       // text; one that ends without text (after a reaction, poll or file, say)
       // or with NO_REPLY simply closes.
       await this.enqueueReply(turn, idle, replies, earlier, final, text, scope, entries, priorFailure);
-    } catch { toolError("router", "router.catch48");
+    } catch (caughtError) { toolError("router", "router.catch48", caughtError);
       // Transient backend trouble: polling simply retries on the next tick.
     }
   }
@@ -4508,7 +4508,7 @@ export class Router {
         id: route.id, directory: route.directory, generation: route.generation,
         messageId: mark.id, startedAt: now, phase: "running", background: true,
       } satisfies Turn);
-    } catch { toolError("router", "router.catch49");
+    } catch (caughtError) { toolError("router", "router.catch49", caughtError);
       // Best effort; the next tick looks again.
     }
   }

@@ -139,7 +139,7 @@ export class Delivery {
     this.options.log?.("outbound-failed", code);
   }
 
-  private failed(item: OutboxRecord, state: string, wasAmbiguous: boolean, failure: ReturnType<typeof classifySendFailure>): void {
+  private failed(item: OutboxRecord, state: string, wasAmbiguous: boolean, failure: ReturnType<typeof classifySendFailure>, cause?: unknown): void {
     if (!this.current(item, state)) return;
     this.store.db.transaction(() => {
       const ambiguous = wasAmbiguous || failure.uncertain;
@@ -161,7 +161,7 @@ export class Delivery {
         : { ...health, last: now, code: failure.code, failures: health.failures + 1 } satisfies Health);
     }).immediate();
     toolLog.capture(() => toolLog.write({ component: "delivery", kind: "error", name: "reply.failed", ok: false,
-      ids: { operationId: item.id, ...(item.sessionId ? { threadId: item.sessionId } : {}) }, error: { tag: failure.code, message: "" } }));
+      ids: { operationId: item.id, ...(item.sessionId ? { threadId: item.sessionId } : {}) }, error: { tag: failure.code, cause } }));
     this.lastError = failure.code;
     this.options.log?.("outbound-failed", failure.code);
   }
@@ -183,12 +183,12 @@ export class Delivery {
     this.nextHousekeeping = Date.now() + HOUSEKEEPING_EVERY;
     try {
       await this.alert();
-    } catch { toolError("delivery", "delivery.catch1");
+    } catch (caughtError) { toolError("delivery", "delivery.catch1", caughtError);
       this.options.log?.("outage-alert-failed");
     }
     try {
       await this.fallBack();
-    } catch { toolError("delivery", "delivery.catch2");
+    } catch (caughtError) { toolError("delivery", "delivery.catch2", caughtError);
       this.options.log?.("outbound-fallback-failed");
     }
   }
@@ -242,7 +242,7 @@ export class Delivery {
       let outcome: "sent" | "skip" | "retry";
       try {
         outcome = await this.options.fallback(item);
-      } catch { toolError("delivery", "delivery.catch3");
+      } catch (caughtError) { toolError("delivery", "delivery.catch3", caughtError);
         outcome = "retry";
       }
       if (outcome === "retry") {
@@ -298,7 +298,7 @@ export class Delivery {
     let statuses: Map<string, string>;
     try {
       statuses = await this.options.statuses(Math.min(...candidates.map(row => row.at)) - 60_000);
-    } catch { toolError("delivery", "delivery.catch4");
+    } catch (caughtError) { toolError("delivery", "delivery.catch4", caughtError);
       return; // the next check tries again
     }
     for (const { id, indexes } of candidates) {
@@ -421,7 +421,7 @@ export class Delivery {
             if (data.byteLength !== attachment.size || createHash("sha256").update(data).digest("hex") !== attachment.sha256) {
               throw new Error("Invalid attachment blob");
             }
-          } catch { toolError("delivery", "delivery.catch5");
+          } catch (caughtError) { toolError("delivery", "delivery.catch5", caughtError);
             this.store.outboxState(item.id, "failed");
             this.error("invalidAttachment");
             continue operations;
@@ -440,8 +440,8 @@ export class Delivery {
             uploaded = await this.photon.uploadAttachment!(Object.freeze({
               id, data, name: attachment.name, mimeType: attachment.mimeType,
             }));
-          } catch (error) { toolError("delivery", "delivery.catch6");
-            this.failed(item, state, false, { ...classifySendFailure(error), uncertain: false });
+          } catch (error) { toolError("delivery", "delivery.catch6", error);
+            this.failed(item, state, false, { ...classifySendFailure(error), uncertain: false }, error);
             continue operations;
           }
           if (typeof uploaded.guid !== "string" || !uploaded.guid.trim()) {
@@ -469,11 +469,11 @@ export class Delivery {
             if (state === "pending") dispatched++;
             state = "sending";
             sendPreparedApp = await this.photon.prepareApp({ id, chatGuid, ...app });
-          } catch (error) { toolError("delivery", "delivery.catch7");
+          } catch (error) { toolError("delivery", "delivery.catch7", error);
             if (!this.current(item, state)) continue operations;
             if (this.store.get(`firstAttempt:${item.id}`) === undefined) this.store.set(`firstAttempt:${item.id}`, Date.now());
             // Preparing an image cannot send a message; preserve uncertainty from any earlier send.
-            this.failed(item, state, wasAmbiguous, { ...classifySendFailure(error), uncertain: false });
+            this.failed(item, state, wasAmbiguous, { ...classifySendFailure(error), uncertain: false }, error);
             continue operations;
           }
         }
@@ -538,7 +538,7 @@ export class Delivery {
             try {
               // Once rich options were rejected, replays go straight to the plain copy.
               result = await sendChunk(this.store.get<boolean>(fallbackKey) === true);
-            } catch (error) { toolError("delivery", "delivery.catch8");
+            } catch (error) { toolError("delivery", "delivery.catch8", error);
               if (this.store.get<boolean>(fallbackKey)) throw error;
               // A rejected rich option must never cost the owner the reply itself. An invalid
               // argument is a definite rejection, so nothing was delivered.
@@ -549,7 +549,7 @@ export class Delivery {
               result = await sendChunk(true);
             }
           }
-        } catch (error) { toolError("delivery", "delivery.catch9");
+        } catch (error) { toolError("delivery", "delivery.catch9", error);
           const failure = classifySendFailure(error);
           // SMS refuses threaded replies (the owner's number dropped off iMessage on 20 Oct), so a
           // text reply that fails goes again shortly without its thread target, under its own id,
@@ -559,11 +559,11 @@ export class Delivery {
             && this.current(item, state)) {
             this.store.set(`unthreaded:${item.id}`, true);
             this.options.log?.("outbound-unthreaded", failure.code);
-            this.failed(item, state, wasAmbiguous, { ...failure, retryable: true });
+            this.failed(item, state, wasAmbiguous, { ...failure, retryable: true }, error);
             if (this.store.getOperation(item.id)?.state === "pending") this.store.set(`retry:${item.id}`, Date.now() + 5_000);
             continue operations;
           }
-          this.failed(item, state, wasAmbiguous, failure);
+          this.failed(item, state, wasAmbiguous, failure, error);
           continue operations;
         }
         // Provider acceptance is durable even if cancellation raced with this RPC.

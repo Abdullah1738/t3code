@@ -27,7 +27,7 @@ async function boundedBody(response: Response, limit: number): Promise<Uint8Arra
     }
     return size ? new Uint8Array(Buffer.concat(chunks)) : undefined;
   } finally {
-    await reader.cancel().catch(() => { toolError("card-preview", "card-preview.catch1");});
+    await reader.cancel().catch((caughtError) => { toolError("card-preview", "card-preview.catch1", caughtError);});
     reader.releaseLock();
   }
 }
@@ -36,7 +36,7 @@ function httpsUrl(value: string, base?: string): URL | undefined {
   try {
     const url = new URL(value, base);
     return url.protocol === "https:" && !url.username && !url.password && url.href.length <= 2048 ? url : undefined;
-  } catch { toolError("card-preview", "card-preview.catch2");
+  } catch (caughtError) { toolError("card-preview", "card-preview.catch2", caughtError);
     return undefined;
   }
 }
@@ -80,7 +80,7 @@ export function cardPreviewImage(upload: (file: LineFile) => Promise<string>, fe
       if (!result) throw new Error("invalid preview upload");
       ok = true;
       return result.href;
-    } catch { toolError("card-preview", "card-preview.catch3");
+    } catch (caughtError) { toolError("card-preview", "card-preview.catch3", caughtError);
       throw new LineError("Card preview is unavailable", "card_preview_unavailable", true, false);
     }
     } finally { toolLog.capture(() => toolLog.write({ component: "cards", kind: "perf", name: "card.render", ok, durationMs: performance.now() - at, props: { cardKind: cardKind(pageUrl) } })); }

@@ -314,6 +314,35 @@ class ToolLogTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 list(toollog.read(board, day))
 
+    def test_rollup_groups_error_tag_and_class(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        path = directory / (self.day + '.ndjson')
+        records = [{'kind': 'error', 'name': 'bridge.catch',
+                    'error': {'tag': 'secrets.catch9', **({'name': name} if name else {})}}
+                   for name in ('Error', 'Error', 'TypeError', None)]
+        path.write_text(''.join(json.dumps(row) + '\n' for row in records))
+        result = toollog.rollup('imessage', self.day)['topErrorTags']
+        self.assertEqual([(row['tag'], row['name'], row['count']) for row in result], [
+            ('secrets.catch9', 'Error', 2), ('secrets.catch9', 'TypeError', 1),
+            ('secrets.catch9', 'UnknownError', 1)])
+        self.assertEqual([row['sampleId']['line'] for row in result], [1, 3, 4])
+
+    def test_imessage_rollup_reduces_untrusted_class_name_shapes(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        cases = [('PRIVATE_FORM_VALUE', 'UnknownError'), ('PRIVATEError', 'UnknownError'),
+                 ('PRIVATE_PHONE_971501234567', 'UnknownError'), ('https://private/?token=PRIVATE', 'UnknownError'),
+                 ('/private/attachment.png', 'UnknownError'), (42, 'UnknownError'),
+                 (None, 'UnknownError'), ('TypeError', 'TypeError'), ('ControlError', 'ControlError')]
+        for name, expected in cases:
+            with self.subTest(name=name):
+                (directory / (self.day + '.ndjson')).write_text(json.dumps({
+                    'kind': 'error', 'name': 'bridge.catch', 'error': {'tag': 'fixture.catch1', 'name': name}}) + '\n')
+                result = toollog.rollup('imessage', self.day)['topErrorTags']
+                self.assertEqual(result[0]['name'], expected)
+                self.assertNotIn('PRIVATE', json.dumps(result))
+
     def test_rollup_prefers_available_error_ids(self):
         toollog.emit('fixture', 'error', 'fixture.error', error_tag='fixture.failure')
         toollog.emit('fixture', 'error', 'fixture.error', error_tag='fixture.failure', ids={'sessionId': 'available-id'})

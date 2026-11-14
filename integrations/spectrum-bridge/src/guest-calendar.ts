@@ -74,7 +74,7 @@ export async function applecalBusy(from: number, to: number): Promise<Busy[] | "
     return events.filter(event => !event.isAllDay && event.startDate && event.endDate)
       .map(event => ({ start: Date.parse(event.startDate!), end: Date.parse(event.endDate!) }))
       .filter(entry => Number.isFinite(entry.start) && Number.isFinite(entry.end));
-  } catch { toolError("guest-calendar", "guest-calendar.catch1"); return "unavailable"; }
+  } catch (caughtError) { toolError("guest-calendar", "guest-calendar.catch1", caughtError); return "unavailable"; }
 }
 
 export async function applecalHold(input: { title: string; start: number; end: number; notes: string }): Promise<boolean> {
@@ -86,5 +86,5 @@ export async function applecalHold(input: { title: string; start: number; end: n
     const code = await child.exited;
     clearTimeout(timer);
     return code === 0;
-  } catch { toolError("guest-calendar", "guest-calendar.catch2"); return false; }
+  } catch (caughtError) { toolError("guest-calendar", "guest-calendar.catch2", caughtError); return false; }
 }
