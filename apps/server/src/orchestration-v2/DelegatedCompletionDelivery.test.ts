@@ -1058,6 +1058,7 @@ const seedRestartCancelledChild = (input: {
   readonly name: string;
   readonly completionWake: "always" | "settled_only";
   readonly continuationPending: boolean;
+  readonly continuationCommandId?: CommandId;
   readonly runStatus?: "cancelled" | "completed" | "interrupted";
   readonly lostWork?: OrchestrationV2Run["restartCancelledBackgroundWork"];
   readonly partialResult?: string;
@@ -1146,7 +1147,7 @@ const seedRestartCancelledChild = (input: {
       now: input.now,
     });
     yield* eventSink.writeWithEffects({
-      commandId: reconcileCommandId(input.name),
+      commandId: input.continuationCommandId ?? reconcileCommandId(input.name),
       events: [
         input.lostWork === undefined
           ? childRun
@@ -1159,7 +1160,7 @@ const seedRestartCancelledChild = (input: {
         ? [
             {
               id: `effect:restart-continuation:${childRunId}`,
-              commandId: reconcileCommandId(input.name),
+              commandId: input.continuationCommandId ?? reconcileCommandId(input.name),
               threadId: childThreadId,
               request: { type: "provider-runtime.continue", sourceRunId: childRunId },
             },
@@ -3002,18 +3003,25 @@ it.layer(layerTest)("delegated tasks across a server restart", (it) => {
 
 it.layer(layerTest)("unstarted task-owned follow-ups after restart", (it) => {
   const cases = (["cancelled", "interrupted"] as const).flatMap((status) =>
-    [2, 4].flatMap((ordinal) =>
-      (["none", "partial", "nested", "native"] as const).map((work) => ({ status, ordinal, work })),
+    [1, 2, 4].flatMap((ordinal) =>
+      (["none", "partial", "nested", "native"] as const).flatMap((work) =>
+        (["startup", "prepared", "leftover"] as const).map((source) => ({
+          status,
+          ordinal,
+          work,
+          source,
+        })),
+      ),
     ),
   );
   it.effect.each(cases)(
-    "handles $status follow-up $ordinal with $work work",
-    ({ status, ordinal, work }) =>
+    "handles $status follow-up $ordinal with $work work from $source",
+    ({ status, ordinal, work, source }) =>
       Effect.gen(function* () {
         const orchestrator = yield* Orchestrator.OrchestratorV2;
         const sink = yield* EventSink.EventSinkV2;
         const now = yield* DateTime.now;
-        const name = `unstarted-${status}-${ordinal}-${work}`;
+        const name = `unstarted-${status}-${ordinal}-${work}-${source}`;
         const threadId = ThreadId.make(`thread:${name}:parent`);
         const projectId = ProjectId.make(`project:${name}`);
         const runId = RunId.make(`run:${name}:parent`);
@@ -3035,6 +3043,13 @@ it.layer(layerTest)("unstarted task-owned follow-ups after restart", (it) => {
           name,
           completionWake: "always",
           continuationPending: true,
+          continuationCommandId: CommandId.make(
+            source === "startup"
+              ? `command:runtime-reconcile:startup:${name}`
+              : source === "prepared"
+                ? `command:restart-prepare:${name}`
+                : `command:runtime-reconcile:shutdown:${name}`,
+          ),
           runStatus: status,
           ...(work === "partial" ? { partialResult: "Pending follow-up result" } : {}),
           now,
@@ -3052,7 +3067,10 @@ it.layer(layerTest)("unstarted task-owned follow-ups after restart", (it) => {
               occurredAt: now,
               payload: {
                 ...before.thread,
-                forkedFrom: { type: "node", nodeId: NodeId.make(`${name}:previous-task`) },
+                forkedFrom:
+                  ordinal === 1
+                    ? before.thread.forkedFrom
+                    : { type: "node", nodeId: NodeId.make(`${name}:previous-task`) },
               },
             },
             {
@@ -3062,19 +3080,23 @@ it.layer(layerTest)("unstarted task-owned follow-ups after restart", (it) => {
               occurredAt: now,
               payload: { ...current, ordinal, startedAt: null, delegatedTaskId: child.taskId },
             },
-            {
-              id: EventId.make(`${name}:previous-run`),
-              type: "run.created",
-              threadId: child.childThreadId,
-              occurredAt: now,
-              payload: {
-                ...current,
-                id: RunId.make(`${name}:previous-run`),
-                ordinal: 1,
-                status: "completed",
-                delegatedTaskId: NodeId.make(`${name}:previous-task`),
-              },
-            },
+            ...(ordinal === 1
+              ? []
+              : [
+                  {
+                    id: EventId.make(`${name}:previous-run`),
+                    type: "run.created" as const,
+                    threadId: child.childThreadId,
+                    occurredAt: now,
+                    payload: {
+                      ...current,
+                      id: RunId.make(`${name}:previous-run`),
+                      ordinal: 1,
+                      status: "completed" as const,
+                      delegatedTaskId: NodeId.make(`${name}:previous-task`),
+                    },
+                  },
+                ]),
             ...(work === "nested"
               ? [
                   {
@@ -3119,13 +3141,14 @@ it.layer(layerTest)("unstarted task-owned follow-ups after restart", (it) => {
           child.childThreadId,
           child.taskId,
         );
-        assert.equal(pending, work !== "none");
+        const shouldResume = (ordinal === 1 && source !== "leftover") || work !== "none";
+        assert.equal(pending, shouldResume);
         yield* orchestrator.recoverDelegatedTasks;
         const recovered = (yield* orchestrator.getThreadProjection(threadId)).subagents.find(
           (row) => row.id === child.taskId,
         )!;
-        assert.equal(recovered.status, work === "none" ? status : "running");
-        if (work === "none") assert.isNotNull(recovered.result);
+        assert.equal(recovered.status, shouldResume ? "running" : status);
+        if (!shouldResume) assert.isNotNull(recovered.result);
         else assert.isNull(recovered.result);
       }),
   );

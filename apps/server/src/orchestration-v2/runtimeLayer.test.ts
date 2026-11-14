@@ -307,7 +307,10 @@ const moveProject = (projectId: ProjectId, workspaceRoot: string, updatedAt: str
     }),
   );
 
-const layerTestWithContinuation = (continueThreadsAfterServerUpdate = false) =>
+const layerTestWithContinuation = (
+  continueThreadsAfterServerUpdate = false,
+  settings: Parameters<typeof ServerSettings.layerTest>[0] = {},
+) =>
   Layer.mergeAll(
     RuntimeLayer.layer,
     RuntimeLayer.layerEventSink,
@@ -322,7 +325,7 @@ const layerTestWithContinuation = (continueThreadsAfterServerUpdate = false) =>
     Layer.provide(SqlitePersistence.layerMemory),
     Layer.provide(layerCheckpointStoreTest),
     Layer.provide(layerServerConfig),
-    Layer.provide(ServerSettings.layerTest({ continueThreadsAfterServerUpdate })),
+    Layer.provide(ServerSettings.layerTest({ ...settings, continueThreadsAfterServerUpdate })),
     Layer.provide(layerTestProviderInstanceRegistry),
     Layer.provide(layerGitWorkflowTest),
     Layer.provide(layerProjectServiceTest),
@@ -9636,6 +9639,160 @@ const layerDeadlineBoards = Layer.effect(
 const layerDeadlineTest = layerTestWithContinuation().pipe(
   Layer.provide(layerDeadlineBoards),
   Layer.provide(Layer.succeed(RestartPacing.RestartLoad, () => 0)),
+);
+
+it.effect.each(["starting", "running"] as const)(
+  "restart recovery starts the parent and its awaited child cut while %s",
+  (childStatus) =>
+    Effect.gen(function* () {
+      const engine = yield* Orchestrator.OrchestratorV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      const recovery = yield* ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService;
+      const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const parentId = ThreadId.make(`awaited-restart-${childStatus}`);
+      const starts: ThreadId[] = [];
+      const openSpy = vi.spyOn(sessions, "open").mockImplementation((input) =>
+        Effect.gen(function* () {
+          const now = yield* DateTime.now;
+          const projection = yield* engine.getThreadProjection(input.threadId).pipe(Effect.orDie);
+          const owner = projection.providerThreads.find(
+            (thread) => thread.providerSessionId === input.providerSessionId,
+          )!;
+          return {
+            instanceId: modelSelection.instanceId,
+            providerSessionId: input.providerSessionId,
+            driver,
+            providerSession: {
+              id: input.providerSessionId,
+              driver,
+              providerInstanceId: modelSelection.instanceId,
+              status: "ready",
+              cwd: process.cwd(),
+              model: modelSelection.model,
+              capabilities: CodexProviderCapabilitiesV2,
+              createdAt: now,
+              updatedAt: now,
+              lastError: null,
+            },
+            ensureThread: () =>
+              Effect.succeed({
+                ...owner,
+                nativeThreadRef: { driver, nativeId: input.threadId, strength: "strong" },
+              }),
+            resumeThread: ({ providerThread }) => Effect.succeed(providerThread),
+            events: Stream.never,
+            startTurn: (turn) =>
+              sink
+                .write({
+                  events: [
+                    {
+                      id: EventId.make(`${turn.runId}:native-start`),
+                      type: "provider-turn.updated",
+                      threadId: input.threadId,
+                      runId: turn.runId,
+                      occurredAt: now,
+                      payload: {
+                        id: ProviderTurnId.make(`${turn.runId}:native-turn`),
+                        providerThreadId: turn.providerThread.id,
+                        nodeId: turn.rootNodeId,
+                        runAttemptId: turn.attemptId,
+                        nativeTurnRef: { driver, nativeId: turn.runId, strength: "strong" },
+                        ordinal: turn.providerTurnOrdinal,
+                        status: "running",
+                        promptAcceptedAt: now,
+                        startedAt: now,
+                        completedAt: null,
+                      },
+                    },
+                  ],
+                })
+                .pipe(
+                  Effect.tap(() => Effect.sync(() => starts.push(input.threadId))),
+                  Effect.asVoid,
+                  Effect.orDie,
+                ),
+            interruptTurn: () => Effect.void,
+            steerTurn: () => Effect.die("unused steer"),
+            respondToRuntimeRequest: () => Effect.die("unused response"),
+            readThreadSnapshot: () => Effect.die("unused snapshot"),
+            rollbackThread: () => Effect.die("unused rollback"),
+            forkThread: () => Effect.die("unused fork"),
+          } satisfies ProviderAdapter.ProviderAdapterV2SessionRuntime;
+        }),
+      );
+      yield* Effect.gen(function* () {
+        yield* engine.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`${parentId}:create`),
+          threadId: parentId,
+          createdBy: "user",
+          creationSource: "web",
+          projectId: ProjectId.make(`${parentId}:project`),
+          title: "Awaited recovery",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: process.cwd(),
+        });
+        yield* engine.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`${parentId}:send`),
+          threadId: parentId,
+          messageId: MessageId.make(`${parentId}:message`),
+          text: "Await a child",
+          attachments: [],
+          createdBy: "user",
+          creationSource: "web",
+          dispatchMode: { type: "start_immediately" },
+        });
+        yield* worker.drain();
+        const parent = yield* engine.getThreadProjection(parentId);
+        yield* engine.dispatch({
+          type: "delegated_task.request",
+          commandId: CommandId.make(`${parentId}:delegate`),
+          parentThreadId: parentId,
+          parentRunId: parent.runs[0]!.id,
+          parentNodeId: parent.runs[0]!.rootNodeId!,
+          createdBy: "agent",
+          creationSource: "mcp",
+          task: "Original child input",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          completionWake: "settled_only",
+        });
+        const task = (yield* engine.getThreadProjection(parentId)).subagents[0]!;
+        const childId = task.childThreadId!;
+        if (childStatus === "running") yield* worker.drain();
+        const child = yield* engine.getThreadProjection(childId);
+        assert.equal(child.runs[0]?.status, childStatus);
+        starts.length = 0;
+        yield* recovery.reconcile("startup");
+        yield* engine.recoverDelegatedTasks;
+        yield* worker.drain();
+        assert.deepEqual(starts.toSorted(), [parentId, childId].toSorted());
+        const resumed = yield* engine.getThreadProjection(childId);
+        assert.equal(resumed.runs[1]?.restartContinuationOfRunId, child.runs[0]!.id);
+        assert.equal(resumed.runs[1]?.status, "running");
+        assert.isNull(
+          (yield* engine.getThreadProjection(parentId)).subagents.find((row) => row.id === task.id)!
+            .result,
+        );
+      }).pipe(Effect.ensuring(Effect.sync(() => openSpy.mockRestore())));
+    }).pipe(
+      Effect.provide(
+        Layer.fresh(
+          layerTestWithContinuation(true, {
+            restartPacing: { maxActive: 1000, spacingMs: 0, loadHigh: 1000 },
+          }).pipe(
+            Layer.provide(layerDeadlineBoards),
+            Layer.provide(Layer.succeed(RestartPacing.RestartLoad, () => 0)),
+          ),
+        ),
+      ),
+    ),
 );
 
 it.effect("start deadline serializes promotion against a separate boards writer", () =>
