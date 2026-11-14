@@ -120,13 +120,26 @@ def card_owner(charge):
         raise Lookup('card owners: settings unreadable') from e
 
 
-def order_receipt(charge, at, now, deadline=None, lookup=None):
+def order_receipt(charge, at, now, deadline=None, lookup=None, memo=None):
     merchant = charge['merchant'].lower()
     app = 'careem' if 'careem' in merchant else 'noon' if 'noon' in merchant else None
     if not app:
         return None
     try:
-        result = (lookup or order_lookup.read)(app, deadline=deadline)
+        key = ('orders', app)
+        if memo is not None and key in memo:
+            result = memo[key]
+        else:
+            try:
+                result = (lookup or order_lookup.read)(app, deadline=deadline)
+            except (ValueError, OSError) as exc:
+                if isinstance(exc, order_lookup.OutOfTime):
+                    raise
+                result = exc
+            if memo is not None:
+                memo[key] = result
+        if isinstance(result, Exception):
+            raise result
         complete = result.get('complete') is True if isinstance(result, dict) else True
         rows = result.get('orders') if isinstance(result, dict) else result
         if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
@@ -476,14 +489,18 @@ def receipt(charge, at, now, find=None, deadline=None, read=None, memo=None, sta
     names = words(charge['merchant'])
     named = re.compile(r'\b(?:' + '|'.join(map(re.escape, names)) + r')\b', re.I) if names else None
     tries = []
+    integral = Decimal(charge['amount']) == Decimal(charge['amount']).to_integral_value()
+    # "$1" is just the common token "1" to FTS. For whole amounts, find candidates
+    # by merchant/card instead; the same currency/amount proof below still decides.
     if names:
         # Questions can remain unanswered indefinitely; a later recurring purchase's receipt
         # must not explain them merely because its merchant and amount happen to repeat.
-        tries.append((amount + ' ' + ' OR '.join(f'"{w}"' for w in names), *receipt_window(at, now, True),
+        named_query = ' OR '.join(f'"{w}"' for w in names)
+        tries.append(((named_query if integral else amount + ' ' + named_query), *receipt_window(at, now, True),
                       lambda text: named.search(text) and RECEIPT_WORDS.search(text)))
-    tries.append((amount, *receipt_window(at, now, False),
+    tries.append((f'"{charge["card"]}"' if integral else amount, *receipt_window(at, now, False),
                   lambda text: card.search(text) and RECEIPT_WORDS.search(text)))
-    reads, seen_bodies = 0, set()
+    reads, seen_bodies, incomplete = 0, set(), False
     for query, start, end, proves in tries:
         # Usage notices with the same amount and merchant can fill a page of hits, so the search goes
         # wider than one page. Reads are capped, and a body already read counts for nothing new: a
@@ -491,7 +508,9 @@ def receipt(charge, at, now, find=None, deadline=None, read=None, memo=None, sta
         # msgs accepts date bounds, with an exclusive until. Include the final day;
         # the exact shared timestamp window below filters the remaining partial day.
         until = day(end + dt.timedelta(days=1))
+        count = 0
         for row in find(query, day(start), until=until, source='email', n=RECEIPT_HITS, deadline=deadline):
+            count += 1
             ts = row.get('ts') or 0
             if not (start.timestamp() <= ts <= end.timestamp()) or row.get('from_me') \
                     or BANKS.search(str(row.get('sender') or '')):
@@ -501,7 +520,7 @@ def receipt(charge, at, now, find=None, deadline=None, read=None, memo=None, sta
             if key in seen_bodies:
                 continue
             if reads >= RECEIPT_READS:
-                return None
+                raise Lookup('receipt scan incomplete: read limit reached')
             reads += 1
             seen_bodies.add(key)
             if money.search(text) and proves(text):
@@ -510,6 +529,9 @@ def receipt(charge, at, now, find=None, deadline=None, read=None, memo=None, sta
                 # Identical receipt bodies can be sent for separate transactions. A rejected
                 # ambiguous copy must not hide an older, uniquely correlated receipt.
                 seen_bodies.discard(key)
+        incomplete = incomplete or count >= RECEIPT_HITS
+    if incomplete:
+        raise Lookup('receipt scan incomplete: search limit reached')
     return None
 
 
@@ -647,7 +669,7 @@ def found(charge, at, now, deadline=None, find=None, said=None, errors=None, mem
     except Lookup as e:
         errors.append(f'receipt: {e}')
     try:
-        hit = order_receipt(charge, at, now, deadline)
+        hit = order_receipt(charge, at, now, deadline, memo=memo)
         if hit:
             return {**hit, 'errors': errors}
     except Lookup as e:
