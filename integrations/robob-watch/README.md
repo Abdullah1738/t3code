@@ -32,6 +32,5 @@ homes so explicit overrides cannot bypass the same protections.
 replication lag; explicit snapshot overrides select offline inspection instead.
 Approval against an explicit snapshot still revalidates current owner messages
 through the control API before succeeding.
-The money-cases installer also copies `helpers/robob_readonly.py` beside its check.
 
 Install/sync: copy `src test helpers package.json tsconfig.json` to `~/.local/share/robob-watch`, the wrapper to `~/.local/bin/robob-watch`, the plist to `~/Library/LaunchAgents/`, the skill to `~/.config/opencode/skills/robob-watchers/`, then `launchctl kickstart -k gui/$(id -u)/com.ardud.robob-watch`.
