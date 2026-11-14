@@ -191,6 +191,74 @@ it.each([
   assert.strictEqual(approvalProblem(card, goChoiceSubtask) === null, approved);
 });
 
+const probeAskText =
+  "Approve up to two Android probe sessions at $0.02/min, each capped at 7 minutes, maximum $0.28 total?";
+const probeAskTitle = "#94: approve two short Run Cloud Android typing probes";
+const probeAskSummary =
+  "Create at most two Android sessions, run the public-text probes, clear clipboards and release both.";
+const probeSubtask: KanbanSubtask = {
+  ...goChoiceSubtask,
+  text: "Approve up to two Android probe sessions, each capped at 7 min, $0.28 total (rate $0.02/min)",
+  gate: "money",
+  createdAt: "2026-11-13T18:41:50.644Z",
+};
+
+const probeCard = (optionId = "o1") => {
+  const base = goChoiceCard(["Approve", "Skip paid probes"], [optionId], probeSubtask);
+  const ask: KanbanOwnerAsk = {
+    ...base.asks[0]!,
+    id: "q2",
+    kind: "action",
+    text: probeAskText,
+    title: probeAskTitle,
+    action: { summary: probeAskSummary },
+    at: "2026-11-14T06:40:00.000Z",
+    closedAt: "2026-11-14T06:46:23.000Z",
+    answer: {
+      verdict: "picked",
+      optionIds: [optionId],
+      by: owner,
+      at: "2026-11-14T06:46:23.000Z",
+    },
+  };
+  return { ...base, asks: [ask] };
+};
+
+it("#94 q2 infers money from its exact text, title and cleanup summary", () => {
+  assert.strictEqual(inferGate(`${probeAskText} ${probeAskTitle} ${probeAskSummary}`), "money");
+});
+
+it.each(["evaluator", "script"] as const)(
+  "#94 price approval clears a single %s money step",
+  (owner) => {
+    const subtask = { ...probeSubtask, owner };
+    assert.isNull(approvalProblem({ ...probeCard(), subtasks: [subtask] }, subtask));
+  },
+);
+
+it("#94 Skip paid probes does not approve the paid step", () => {
+  assert.isTrue(isNegativeOption("Skip paid probes"));
+  assert.include(approvalProblem(probeCard("o2"), probeSubtask)!, 'picked "Skip paid probes"');
+});
+
+it("an unnamed price approval cannot clear two money steps", () => {
+  const second = { ...probeSubtask, id: "s2", text: "Approve AED 45 order" };
+  const card = { ...probeCard(), subtasks: [probeSubtask, second] };
+  for (const subtask of card.subtasks) assert.isNotNull(approvalProblem(card, subtask));
+});
+
+it("a named price approval clears only its own step", () => {
+  const base = probeCard();
+  const second = { ...probeSubtask, id: "s2", text: "Approve AED 45 order" };
+  const card = {
+    ...base,
+    asks: [{ ...base.asks[0]!, text: `For s1: ${probeAskText}` }],
+    subtasks: [probeSubtask, second],
+  };
+  assert.isNull(approvalProblem(card, probeSubtask));
+  assert.isNotNull(approvalProblem(card, second));
+});
+
 const consentReplies = [
   { task: "Purchase the license", label: "Yes, buy it", reply: "yes", approved: true },
   { task: "Purchase the license", label: "Yes, buy this", reply: "yes", approved: true },
