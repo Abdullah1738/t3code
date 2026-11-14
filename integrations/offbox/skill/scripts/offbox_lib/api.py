@@ -932,6 +932,7 @@ def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7
 
 # Only retain durations observed in responses already needed by the caller. Logging never fetches a status.
 _COMMAND_DURATIONS = {}
+_COMMAND_HOST_BOXES = {}
 
 
 def execution_ms(status):
@@ -961,6 +962,19 @@ def remember_execution(box_id, status, *, pid=None, command_id=None):
         data = status['command'] if isinstance(status, dict) and isinstance(status.get('command'), dict) else status
         if isinstance(data, dict) and (data.get('running') or data.get('status') in ('queued', 'running')):
             _forget_execution(box_id, pid if pid is not None else data.get('processId'), command_id or data.get('commandId'))
+        if isinstance(data, dict) and not data.get('running') and data.get('status') not in ('queued', 'running'):
+            host = (data.get('metrics') or {}).get('host_boxes')
+            cid = command_id or data.get('commandId')
+            if isinstance(host, dict) and cid:
+                counts = {
+                    k: host.get(k) if type(host.get(k)) is int and host[k] >= 0 else None
+                    for k in ('start', 'end')}
+                _COMMAND_HOST_BOXES[(box_id, 'command', cid)] = (cid, counts)
+                observed_pid = pid if pid is not None else data.get('processId')
+                if observed_pid is not None:
+                    _COMMAND_HOST_BOXES[(box_id, 'pid', observed_pid)] = (cid, counts)
+                while len(_COMMAND_HOST_BOXES) > 256:
+                    _COMMAND_HOST_BOXES.pop(next(iter(_COMMAND_HOST_BOXES)))
         duration = execution_ms(data)
         if duration is None:
             return
@@ -979,9 +993,11 @@ def remember_execution(box_id, status, *, pid=None, command_id=None):
 def _forget_execution(box_id, pid, command_id=None):
     try:
         prior = _COMMAND_DURATIONS.pop((box_id, 'pid', pid), None)
-        for identity in (command_id, prior[0] if prior else None):
+        host_prior = _COMMAND_HOST_BOXES.pop((box_id, 'pid', pid), None)
+        for identity in (command_id, prior[0] if prior else None, host_prior[0] if host_prior else None):
             if identity:
                 _COMMAND_DURATIONS.pop((box_id, 'command', identity), None)
+                _COMMAND_HOST_BOXES.pop((box_id, 'command', identity), None)
     except Exception:
         pass
 
@@ -997,6 +1013,11 @@ def command_execution_ms(box_id, pid, command_id):
     except Exception:
         pass
     return None
+
+
+def command_host_boxes(box_id, pid, command_id):
+    found = _COMMAND_HOST_BOXES.get((box_id, 'command', command_id))
+    return found[1] if found else None
 
 
 def _execution_frames(box_id, pid, frames):
@@ -1061,7 +1082,9 @@ def cmd_attach(box_id: str, pid: int, out_off: int = 0, err_off: int = 0, timeou
 def history_logs(box_id: str, command_id: str, which: str, offset: int = 0,
                  *, deadline: float | None = None) -> dict:
     qs = urllib.parse.urlencode({"stream": which, "offset": offset})
-    return call("GET", f"/sandboxes/{box_id}/command-history/{command_id}/logs?{qs}", deadline=deadline)
+    result = call("GET", f"/sandboxes/{box_id}/command-history/{command_id}/logs?{qs}", deadline=deadline)
+    remember_execution(box_id, result, command_id=command_id)
+    return result
 
 
 def history_get(box_id: str, command_id: str) -> dict:
