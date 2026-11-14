@@ -2422,9 +2422,9 @@ it.effect(
         yield* TestClock.adjust(KanbanService.BOARD_WRITE_START_DEADLINE_MS + 1);
         for (const result of [yield* Fiber.join(create), yield* Fiber.join(open)]) {
           assert.isTrue(result.isError, result.text);
-          assert.include(
+          assert.match(
             result.text,
-            "Board busy: not written (held 2m0s by selectionMigration). Safe to retry once.",
+            /Board busy: not written \(waited 120s behind [01]; most time: selectionMigration 120s\). Safe to retry once\./,
           );
         }
         assert.isUndefined(holder.pollUnsafe());
