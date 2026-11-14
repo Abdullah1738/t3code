@@ -67,6 +67,8 @@ const GeneralEvent = Schema.Struct({
   errorPhase: Schema.optionalKey(McpPhase),
   saved: Schema.optionalKey(Schema.Union([Schema.Boolean, Schema.Literal("unknown")])),
   readerLane: Schema.optionalKey(Label),
+  waitStage: Schema.optionalKey(Schema.Literals(["lookup.caller", "lookup.target", "waiting"])),
+  waitLookupMs: Schema.optionalKey(Measurement),
   writerWaitMs: Schema.optionalKey(Measurement),
   props: Schema.optionalKey(
     Schema.Struct({
