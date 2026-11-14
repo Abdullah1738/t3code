@@ -307,6 +307,7 @@ commands, same box model, no hourly price, no start limits, no spend cap). Boat 
 - Marked up but not answering when your run starts (or while its box is being fetched): the run moves to Boat
   before it is sent, with one line (`... this run goes to Boat instead`). **Once the server accepted a run it
   never moves**, so nothing runs twice.
+- A run naming `--base` saved only on home waits for home (exit **93** when the wait expires) and never runs on Boat's template.
 - The server restarts under an accepted run (power cut, reboot, boatd restart): the client reconnects for up to
   15 minutes and carries on from where the output stopped. If the machine itself restarted, the server runs the
   command **again from the start, once**, and you get one line saying so (`... running it again from the start
