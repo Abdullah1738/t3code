@@ -8,12 +8,13 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
-from offbox_lib import api, base_catalog, bases, cli, common, home, identity, lease, outage, pool
+from offbox_lib import allocation, api, base_catalog, bases, cli, common, fallback, home, identity, lease, outage, pool
 
 
 class BaseRouting(unittest.TestCase):
@@ -26,6 +27,7 @@ class BaseRouting(unittest.TestCase):
         self.stack.enter_context(patch.dict(os.environ, {k: v for k, v in os.environ.items()
                                                        if not k.startswith('OFFBOX_')}, clear=True))
         for name, value in [('STATE', self.root), ('SERVER_CFG', self.root / 'server.json'),
+                            ('LOCKS_DIR', self.root / 'locks'), ('LOG_PATH', self.root / 'offbox.log'),
                             ('HOME_FAILURES', self.root / 'home-failures.jsonl'),
                             ('BACKEND_STATE', self.root / 'backend-state.json'),
                             ('BACKEND_PATH', self.root / 'backend'), ('DB_PATH', self.root / 'offbox-home.db'), ('_BACKEND', None), ('_BACKEND_REASON', None)]:
@@ -43,8 +45,11 @@ class BaseRouting(unittest.TestCase):
         self.stack.enter_context(patch.object(identity, 'whoami', return_value=self.me))
         self.stack.enter_context(patch.object(identity, 'repo_root', return_value=Path('/repo')))
         self.stack.enter_context(patch.object(identity, 'repo_key', return_value='torssh'))
+        self.real_acquire = pool.acquire
         for module, name in [(api, '_key'), (api, 'get'), (api, 'create'), (api, 'fork'), (pool, 'acquire')]:
             self.stack.enter_context(patch.object(module, name, side_effect=AssertionError('allocation/network forbidden')))
+        self.stack.enter_context(patch.object(home, 'probe', return_value=None))
+        self.stack.enter_context(patch.object(api, 'probe_backend', return_value=None))
         self.stack.enter_context(patch.object(home, 'person_gate'))
         self.logs = []
         self.stack.enter_context(patch.object(cli, 'log', side_effect=self.logs.append))
@@ -113,10 +118,10 @@ class BaseRouting(unittest.TestCase):
             common.select_backend('boat')
             output = io.StringIO()
             with contextlib.redirect_stderr(output), patch.object(lease, '_fit_new', return_value='default'), \
-                    patch.object(lease, 'pick_template', return_value=(None, 'none')), \
+                    patch.object(lease, 'pick_template', return_value=('crpko-node', 'package.json')), \
                     patch.object(lease, 'report_template'), patch.object(api, 'create', return_value={'id': 'new'}):
                 result = lease._new_box(self.cons['boat'], self.me, None, None, None, False)
-            self.assertEqual(result[1], 'fresh')
+            self.assertEqual(result[1], 'recipe:crpko-node')
             self.assertIn('using the repo template or recipe for this run', output.getvalue())
 
     def test_explicit_base_on_both_backends_is_preserved_on_boat(self):
@@ -157,6 +162,111 @@ class BaseRouting(unittest.TestCase):
         self.assertEqual(remote.call_count, 2)
         wait.assert_called_once()
         self.assertEqual(wait.call_args.kwargs['service'], 'home offbox server')
+
+    def test_outage_retry_deadlines_keep_the_home_base_restriction(self):
+        self.add('server', 'warm')
+        common.select_backend('server')
+        for shape in ('budget', 'wrapped_budget', 'pool_deadline'):
+            for flags in ([], ['--bg'], ['--remote'], ['--no-fallback']):
+                with self.subTest(shape=shape, flags=flags):
+                    clock = [1000.0]
+                    budget = api.BudgetExpired('allocation budget exhausted')
+                    error = budget
+                    if shape == 'wrapped_budget':
+                        error = common.OffboxError('wrapped allocation failure')
+                        error.__cause__ = budget
+                    elif shape == 'pool_deadline':
+                        error = pool.PoolBusyError('allocation wait expired; nothing ran')
+                    attempts = []
+                    def remote(*args):
+                        attempts.append(outage.allocation_left())
+                        if len(attempts) == 1:
+                            raise api.NetworkError('home is unreachable')
+                        clock[0] += 61
+                        raise error
+                    with patch.object(cli, '_remote_once', side_effect=remote), \
+                            patch.object(cli, 'time', types.SimpleNamespace(monotonic=lambda: clock[0])), \
+                            patch.object(outage, 'time', types.SimpleNamespace(monotonic=lambda: clock[0])), \
+                            patch.object(outage, 'window_seconds', return_value=60), \
+                            patch.object(outage, 'wait_until_up', return_value=True) as wait, \
+                            patch.object(fallback, 'run_local', return_value=17) as local, \
+                            patch.object(os, 'execve') as execute, contextlib.redirect_stderr(io.StringIO()) as err:
+                        code = cli.main(['run', '--base', 'warm', *flags, '--', 'true'])
+                    self.assertEqual(code, 93, err.getvalue())
+                    self.assertIn("saved base 'torssh:warm'", err.getvalue())
+                    self.assertEqual(attempts, [None, 60])
+                    wait.assert_called_once()
+                    local.assert_not_called()
+                    execute.assert_not_called()
+
+    def test_a_named_base_never_falls_back_locally_on_prestart_errors(self):
+        self.add('server', 'warm')
+        common.select_backend('server')
+        for boat_copy in (False, True):
+            if boat_copy:
+                self.add('boat', 'warm')
+            for error in (api.BudgetExpired('client budget'), pool.PoolBusyError('full pool'),
+                          common.OffboxError('setup failure')):
+                with self.subTest(error=type(error).__name__, boat_copy=boat_copy), \
+                        patch.object(cli, '_remote_once', side_effect=error), \
+                        patch.object(fallback, 'run_local', return_value=17) as local, \
+                        patch.object(fallback, 'note_infra_failure'), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(cli.main(['run', '--base', 'warm', '--', 'true']), error.code)
+                    local.assert_not_called()
+
+    def test_fresh_keeps_local_fallback_when_the_named_base_is_ignored(self):
+        self.add('server', 'warm')
+        common.select_backend('server')
+        with patch.object(cli, '_remote_once', side_effect=api.BudgetExpired('client budget')), \
+                patch.object(fallback, 'run_local', return_value=17) as local, \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(cli.main(['run', '--base', 'warm', '--fresh', '--', 'true']), 17)
+        local.assert_called_once()
+
+    def test_home_outage_is_checked_before_entering_a_full_pool(self):
+        self.add('server', 'warm')
+        common.select_backend('server')
+        con = self.cons['server']
+        con.execute("INSERT INTO leases(box_id,owner,repo_root,repo_key,remote_dir,state,size,source) "
+                    "VALUES ('busy','other','/other','torssh','w/other','running','default','base:torssh:warm')")
+        con.execute("INSERT INTO pool_members VALUES ('busy','torssh')")
+        con.execute("INSERT INTO runs(run_id,box_id,status,mode) VALUES ('busy-run','busy','running','fg')")
+        con.commit()
+        for state, health, auth in (('home_down', 'server says it cannot take runs', None),
+                                    ('home_up', 'server says it cannot take runs', None),
+                                    ('home_up', None, 'authenticated API did not answer')):
+            for flags in ([], ['--bg']):
+                with self.subTest(state=state, health=health, flags=flags):
+                    common.BACKEND_STATE.write_text(json.dumps({'state': state}))
+                    clock = [1000.0]
+                    def advance(seconds):
+                        clock[0] += seconds
+                    def pool_sleep(seconds):
+                        clock[0] += pool.HOME_WAIT_S
+                    pool_clock = types.SimpleNamespace(monotonic=lambda: clock[0], sleep=pool_sleep)
+                    wait_clock = types.SimpleNamespace(monotonic=lambda: clock[0], sleep=advance)
+                    with patch.object(home, 'probe', return_value=health) as health_probe, \
+                            patch.object(api, 'probe_backend', return_value=auth), \
+                            patch.object(api, 'probe', return_value='no answer') as probe, \
+                            patch.object(outage, 'window_seconds', return_value=60), \
+                            patch.object(cli, 'time', wait_clock), patch.object(outage, 'time', wait_clock), \
+                            patch.object(pool, 'time', pool_clock), patch.object(allocation, 'time', pool_clock), \
+                            patch.dict(os.environ, OFFBOX_POOL_SIZE='1'), \
+                            patch.object(pool, '_refresh_background'), patch.object(pool, '_recheck_prune_holds'), \
+                            patch.object(pool, 'acquire', side_effect=self.real_acquire) as acquire, \
+                            patch.object(cli, '_remote_once', side_effect=lambda a, me: pool.acquire(me, base=a.base)), \
+                            patch.object(fallback, 'run_local', return_value=17) as local, \
+                            patch.object(os, 'execve') as execute, contextlib.redirect_stderr(io.StringIO()) as err:
+                        code = cli.main(['run', '--base', 'warm', *flags, '--', 'true'])
+                    self.assertEqual(code, 93, err.getvalue())
+                    self.assertIn("saved base 'torssh:warm'", err.getvalue())
+                    self.assertLessEqual(clock[0] - 1000, 60)
+                    health_probe.assert_called_once()
+                    self.assertGreater(probe.call_count, 0)
+                    acquire.assert_not_called()
+                    local.assert_not_called()
+                    execute.assert_not_called()
 
     def test_fresh_ignores_named_base_during_failover(self):
         self.add('server', 'warm')

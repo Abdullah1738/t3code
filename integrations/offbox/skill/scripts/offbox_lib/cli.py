@@ -231,9 +231,7 @@ def _run_with_retries(a, me) -> int:
     explicit_base = full_name(a.base, me['repo_key']) if a.base and not a.fresh else None
     wait_explicit_base = home.active() and home.base_needs_home(explicit_base)
     home.WAIT_STARTED = time.monotonic()
-    if home.may_fail_over(explicit_base):
-        home.before_run(getattr(a, "argv", None) or sys.argv[1:], explicit_base=explicit_base)
-    elif (home.on_standby() and not os.environ.get(home.FAILOVER_ENV)
+    if (home.on_standby() and not os.environ.get(home.FAILOVER_ENV)
           and common._BACKEND_REASON != "boat-only-base"):
         st = common.home_state()
         home.failover_decision('boat', 'home_down', explicit_base, os.environ.get(runs.BACKGROUND_RUN_ENV, ''))
@@ -245,11 +243,16 @@ def _run_with_retries(a, me) -> int:
     capacity_since = capacity_last_say = None
     capacity_round = None
     last_outage = None
+    last_home_outage = None
+    preflight_done = False
     reprobed = False
     try:
         while True:
             try:
                 if waited_from is None:
+                    if not preflight_done:
+                        preflight_done = True
+                        home.before_run(getattr(a, "argv", None) or sys.argv[1:], explicit_base=explicit_base)
                     return _remote_once(a, me)
                 remaining = outage.window_seconds() - (time.monotonic() - waited_from)
                 if remaining <= 0:
@@ -270,6 +273,7 @@ def _run_with_retries(a, me) -> int:
                         time.monotonic() - waited_from >= outage.window_seconds() and not e.started:
                     raise last_outage
                 if home.active() and home.unreachable(e):
+                    last_home_outage = e
                     # Nothing was accepted by the home server. Ordinary work goes to Boat for this one run; a
                     # person's work waits for the home server; a pinned backend keeps today's waiting.
                     run_id = e.run_id or os.environ.get(runs.BACKGROUND_RUN_ENV, '')
@@ -315,7 +319,9 @@ def _run_with_retries(a, me) -> int:
                     raise home.base_down_error(explicit_base, str(e)) from e
                 raise outage.down_error(e, time.monotonic() - waited_from) from e
     except OffboxError as e:
-        if wait_explicit_base and home.unreachable(e):
+        # A retry's local deadline can expire after a successful probe without carrying an outage flag.
+        if wait_explicit_base and not e.started and (home.unreachable(e) or
+                (last_home_outage is not None and e.code == EXIT_INFRA and api.client_budget_expired(e))):
             e = home.base_down_error(explicit_base, str(e))
         if e.code not in (EXIT_INFRA, EXIT_CAP, EXIT_BUSY):
             say(str(e))
@@ -328,7 +334,7 @@ def _run_with_retries(a, me) -> int:
             say(f"remote run {e.run_id or 'unknown'} on {e.box or 'unknown box'} failed after the command may have "
                 f"started: {e}. Not re-running locally (it may have side effects). Check: {check}")
             return e.code
-        if a.no_fallback or a.remote:
+        if a.no_fallback or a.remote or explicit_base:
             say(str(e))
             return e.code
         if a.bg:
