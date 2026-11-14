@@ -826,7 +826,7 @@ it.effect.each([
 );
 
 it.effect.each([owner, evaluator])(
-  "$_tag drop cannot complete, skip, remove or verify a deploy gate",
+  "$_tag drop cannot complete, remove or verify a deploy gate",
   (dropper) =>
     Effect.gen(function* () {
       const fake = yield* makeFake;
@@ -854,13 +854,13 @@ it.effect.each([owner, evaluator])(
           dropper,
           dropper._tag === "owner" ? "owner" : "evaluator",
         );
-        for (const state of ["done", "skipped"] as const) {
+        for (const state of ["done"] as const) {
           const refused = yield* kanban
             .markSubtask(card.id, "s1", state, "Dropped", evaluator, "evaluator")
             .pipe(Effect.flip);
           assert.strictEqual(
             refused.detail,
-            `card #${card.number} subtask s1 (deploy: Restart LaunchAgent) needs Abdullah's ${state === "skipped" ? "answer before it can be skipped" : "approval"}: the latest decision, q1, was dropped (a dropped ask is not approval) (this board has no standing deploy approval); this gate was set on purpose and still needs Abdullah's answer naming s1`,
+            `card #${card.number} subtask s1 (deploy: Restart LaunchAgent) needs Abdullah's approval: the latest decision, q1, was dropped (a dropped ask is not approval) (this board has no standing deploy approval); this gate was set on purpose and still needs Abdullah's answer naming s1`,
           );
         }
         const verify = yield* kanban
@@ -944,10 +944,10 @@ it.effect("old approvals, text, drops and negative picks cannot approve a new ga
         },
         evaluator,
       );
-      const oldSkip = yield* kanban
-        .markSubtask(card.id, "s1", "skipped", "Old approval", evaluator, "evaluator")
+      const oldAction = yield* kanban
+        .markSubtask(card.id, "s1", "done", "Old approval", evaluator, "evaluator")
         .pipe(Effect.flip);
-      assert.include(oldSkip.detail, "needs Abdullah's answer before it can be skipped");
+      assert.include(oldAction.detail, "needs Abdullah's approval");
       yield* kanban.askOwner(
         card.id,
         { question: "Deploy?", blocking: false, options: ["Yes", "No"] },
@@ -2209,4 +2209,455 @@ it.effect("retaining a merge cannot become a board-wide standing approval", () =
       }
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
+);
+
+it.each(["open", "done", "skipped"] as const)(
+  "a recorded gate skip exempts only the skipped state: %s",
+  (state) => {
+    const subtask: KanbanSubtask = {
+      ...goChoiceSubtask,
+      gateSource: "set",
+      state,
+      gateSkipped: {
+        gate: "deploy",
+        reason: "Only edits fork code",
+        by: evaluator,
+        at: "2026-11-14T00:00:00.000Z",
+        text: goChoiceSubtask.text,
+      },
+    };
+    const card = { ...goChoiceCard([], [], subtask), asks: [] };
+    assert.strictEqual(approvalProblem(card, subtask) === null, state === "skipped");
+    const { gateSkipped: _skip, ...legacy } = subtask;
+    assert.include(approvalProblem(card, legacy)!, "needs Abdullah's approval");
+  },
+);
+
+it.effect.each(
+  (["deploy", "money", "secret"] as const).flatMap((gate) =>
+    (["evaluator", "script"] as const).flatMap((subtaskOwner) =>
+      (["set", "guessed"] as const).map((gateSource) => ({ gate, subtaskOwner, gateSource })),
+    ),
+  ),
+)("evaluator skips $gate $gateSource gate on $subtaskOwner, but cannot do it", (row) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard();
+      const text = {
+        deploy: "Edit fork source",
+        money: "Pay the invoice",
+        secret: "Share the token",
+      }[row.gate];
+      const created = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Mistaken explicit gate (#1372 shape)",
+          prompt: "Work",
+          subtasks: [
+            { text: "Write the change", owner: "evaluator" },
+            { text: "Read the change", owner: "evaluator" },
+            { text, owner: row.subtaskOwner, gate: row.gate },
+          ],
+        },
+        owner,
+      );
+      const store = yield* KanbanStore.KanbanStore;
+      yield* store.putCard({
+        ...created,
+        subtasks: created.subtasks.map((s) =>
+          s.id === "s3" ? { ...s, gateSource: row.gateSource } : s,
+        ),
+      });
+      yield* kanban.markSubtask(created.id, "s1", "done", null, evaluator, "evaluator");
+      yield* kanban.markSubtask(created.id, "s2", "done", null, evaluator, "evaluator");
+      const reason = "Only edits fork code";
+      const skipped = yield* kanban.markSubtask(
+        created.id,
+        "s3",
+        "skipped",
+        `  ${reason}  `,
+        evaluator,
+        "evaluator",
+      );
+      const entry = skipped.subtasks[2]!;
+      assert.strictEqual(entry.state, "skipped");
+      assert.strictEqual(entry.note, reason);
+      assert.deepStrictEqual(entry.gateSkipped, {
+        gate: row.gate,
+        reason,
+        by: evaluator,
+        at: skipped.updatedAt,
+        text,
+      });
+      assert.lengthOf(skipped.asks, 1);
+      const repeated = yield* kanban
+        .markSubtask(created.id, "s3", "skipped", reason, evaluator, "evaluator")
+        .pipe(Effect.flip);
+      assert.include(repeated.detail, "already skipped");
+      assert.lengthOf((yield* kanban.card(created.id)).card.asks, 1);
+      assert.deepStrictEqual(skipped.asks[0], {
+        id: "q1",
+        text: `An evaluator skipped s3, a ${row.gate}-gated step, without your approval: "${text}". Reason: ${reason}. It was not done; marking it done still needs your OK.`,
+        blocking: false,
+        by: evaluator,
+        at: skipped.updatedAt,
+        seq: null,
+        closedAt: null,
+        kind: "notice",
+        respond: { ack: true },
+        title: `Gate skipped on #${created.number} s3`,
+        batchKey: "gate-skipped",
+      });
+      assert.isTrue(
+        (yield* kanban.askFeed({ boardId: board.id })).open.some(
+          (item) => item.cardId === created.id && item.kind === "notice" && item.ask.id === "q1",
+        ),
+      );
+      assert.lengthOf(
+        (yield* kanban.card(created.id)).events.filter(
+          (event) =>
+            event.kind === "comment" &&
+            event.body ===
+              `Skipped ${row.gate}-gated s3 ("${text}") without owner approval: ${reason}`,
+        ),
+        1,
+      );
+      const edited = yield* kanban.editCard(
+        created.id,
+        { subtasks: [{ id: "s1" }, { id: "s2" }, { id: "s3", text: "Reword the skipped step" }] },
+        evaluator,
+      );
+      assert.deepStrictEqual(edited.subtasks[2], entry);
+      assert.strictEqual(
+        (yield* kanban.moveCard(created.id, "verified", "evaluator", evaluator)).stage,
+        "verified",
+      );
+      const done = () =>
+        kanban
+          .markSubtask(created.id, "s3", "done", "Performed", evaluator, "evaluator")
+          .pipe(Effect.flip);
+      assert.include((yield* done()).detail, "needs Abdullah's approval");
+      const reopened = yield* kanban.markSubtask(
+        created.id,
+        "s3",
+        "open",
+        null,
+        evaluator,
+        "evaluator",
+      );
+      assert.isUndefined(reopened.subtasks[2]!.gateSkipped);
+      assert.strictEqual(reopened.subtasks[2]!.state, "open");
+      assert.include((yield* done()).detail, "needs Abdullah's approval");
+      const twice = yield* kanban.markSubtask(
+        created.id,
+        "s3",
+        "skipped",
+        reason,
+        evaluator,
+        "evaluator",
+      );
+      assert.lengthOf(twice.asks, 2);
+      yield* kanban.markSubtask(created.id, "s3", "open", null, evaluator, "evaluator");
+      yield* kanban.askOwner(
+        created.id,
+        { question: "Approve s3?", blocking: false, action: { summary: text } },
+        evaluator,
+        "evaluator",
+      );
+      yield* kanban.answerAsk(created.id, "q3", { verdict: "approved", revision: 0 }, owner);
+      const approved = yield* kanban.markSubtask(
+        created.id,
+        "s3",
+        "done",
+        "Owner approved",
+        evaluator,
+        "evaluator",
+      );
+      assert.strictEqual(approved.subtasks[2]!.state, "done");
+      assert.isUndefined(approved.subtasks[2]!.gateSkipped);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect.each([null, "", "     ", "short", "x".repeat(9), "x".repeat(301)])(
+  "gated evaluator skip needs a reason of 10–300 trimmed characters: %s",
+  (note) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard();
+        const card = yield* kanban.createCard(
+          board.id,
+          {
+            prompt: "Work",
+            subtasks: [{ text: "Edit fork source", owner: "evaluator", gate: "deploy" }],
+          },
+          owner,
+        );
+        const before = yield* kanban.card(card.id);
+        const refused = yield* kanban
+          .markSubtask(card.id, "s1", "skipped", note, evaluator, "evaluator")
+          .pipe(Effect.flip);
+        assert.strictEqual(refused.code, "invalid");
+        assert.strictEqual(
+          refused.detail,
+          "skipping a gated step needs a reason of 10 to 300 characters in note",
+        );
+        assert.deepStrictEqual(yield* kanban.card(card.id), before);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect.each([10, 300])("gated skip accepts a %s-character reason", (length) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard();
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          prompt: "Work",
+          subtasks: [{ text: "Edit fork source", owner: "evaluator", gate: "deploy" }],
+        },
+        owner,
+      );
+      const skipped = yield* kanban.markSubtask(
+        card.id,
+        "s1",
+        "skipped",
+        ` ${"x".repeat(length)} `,
+        evaluator,
+        "evaluator",
+      );
+      assert.strictEqual(skipped.subtasks[0]!.gateSkipped?.reason.length, length);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect.each([
+  {
+    actor: { _tag: "thread", threadId: ThreadId.make("worker") } as KanbanActor,
+    role: "work" as const,
+  },
+  {
+    actor: { _tag: "script", scriptId: KanbanScriptId.make("script") } as KanbanActor,
+    role: "evaluator" as const,
+  },
+  {
+    actor: { _tag: "thread", threadId: ThreadId.make("reviewer") } as KanbanActor,
+    role: "review" as const,
+  },
+])("$actor._tag/$role cannot use evaluator gate skips", ({ actor, role }) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard();
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          prompt: "Work",
+          subtasks: [{ text: "Edit fork source", owner: "evaluator", gate: "deploy" }],
+        },
+        owner,
+      );
+      const refused = yield* kanban
+        .markSubtask(card.id, "s1", "skipped", "Only edits fork code", actor, role)
+        .pipe(Effect.flip);
+      assert.strictEqual(refused.code, "denied");
+      assert.strictEqual((yield* kanban.card(card.id)).card.subtasks[0]!.state, "open");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("owner skips still require no approval and add no notice", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard();
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          prompt: "Work",
+          subtasks: [{ text: "Edit fork source", owner: "evaluator", gate: "deploy" }],
+        },
+        owner,
+      );
+      const skipped = yield* kanban.markSubtask(card.id, "s1", "skipped", "No", owner, "evaluator");
+      assert.strictEqual(skipped.subtasks[0]!.state, "skipped");
+      assert.isUndefined(skipped.subtasks[0]!.gateSkipped);
+      assert.lengthOf(skipped.asks, 0);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("dropping a later blocking ask returns a skipped gate card to verified", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard();
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          prompt: "Work",
+          subtasks: [{ text: "Edit fork source", owner: "evaluator", gate: "deploy" }],
+        },
+        owner,
+      );
+      yield* kanban.markSubtask(
+        card.id,
+        "s1",
+        "skipped",
+        "Only edits fork code",
+        evaluator,
+        "evaluator",
+      );
+      yield* kanban.moveCard(card.id, "verified", "evaluator", evaluator);
+      yield* kanban.askOwner(
+        card.id,
+        { question: "Any follow-up?", blocking: true },
+        evaluator,
+        "evaluator",
+      );
+      const returned = yield* kanban.changeAsk(card.id, "q2", "drop", owner, "owner");
+      assert.strictEqual(returned.stage, "verified");
+      assert.strictEqual(returned.subtasks[0]!.state, "skipped");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a board script cannot skip its own gated step without approval", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard();
+      const store = yield* KanbanStore.KanbanStore;
+      const scriptId = KanbanScriptId.make("script-gated");
+      yield* store.putScript({
+        id: scriptId,
+        boardId: board.id,
+        name: "gated",
+        path: "/unused/gated.sh",
+        trigger: { _tag: "manual" },
+        enabled: true,
+        createdBy: owner,
+        createdAt: "2026-11-14T00:00:00.000Z",
+        lastRun: null,
+      });
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          prompt: "Work",
+          subtasks: [
+            { text: "Edit fork source", owner: "script", gate: "deploy", script: "gated" },
+          ],
+        },
+        owner,
+      );
+      const refused = yield* kanban
+        .markSubtask(
+          card.id,
+          "s1",
+          "skipped",
+          "Only edits fork code",
+          { _tag: "script", scriptId },
+          "script",
+        )
+        .pipe(Effect.flip);
+      assert.include(refused.detail, "needs Abdullah's answer before it can be skipped");
+      assert.lengthOf((yield* kanban.card(card.id)).card.asks, 0);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect(
+  "skipping an owner-only deploy records no release and keeps standing approvals intact",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard();
+        const store = yield* KanbanStore.KanbanStore;
+        const at = "2026-11-13T00:00:00.000Z";
+        yield* store.putBoard({
+          ...board,
+          standingApprovals: [
+            {
+              id: "sa-skip-regression",
+              gate: "deploy",
+              quote: "Boards may release",
+              sourceThreadId: "owner-thread",
+              saidAt: at,
+              approvedAsk: { cardId: "source", askId: "q1" },
+              recordedAt: at,
+              recordedBy: "evaluator",
+              minIntervalHours: 4,
+              revokedAt: null,
+              revokedBy: null,
+              revokeReason: null,
+            },
+          ],
+        });
+        const card = yield* kanban.createCard(
+          board.id,
+          {
+            prompt: "Work",
+            subtasks: [
+              {
+                text: "Edit fork source",
+                owner: "evaluator",
+                gate: "deploy",
+                ownerOnly: true,
+                interrupting: true,
+              },
+            ],
+          },
+          evaluator,
+        );
+        const skipped = yield* kanban.markSubtask(
+          card.id,
+          "s1",
+          "skipped",
+          "Only edits fork code",
+          evaluator,
+          "evaluator",
+        );
+        assert.isDefined(skipped.subtasks[0]!.gateSkipped);
+        assert.lengthOf(skipped.asks, 1);
+        assert.lengthOf((yield* kanban.snapshot(board.id)).board.releaseLedger ?? [], 0);
+        const denied = yield* kanban
+          .markSubtask(card.id, "s1", "done", "Done", evaluator, "evaluator")
+          .pipe(Effect.flip);
+        assert.include(denied.detail, "marked owner-only");
+        const actual = yield* kanban.createCard(
+          board.id,
+          {
+            prompt: "Ship",
+            subtasks: [
+              {
+                text: "Deploy the release",
+                owner: "evaluator",
+                gate: "deploy",
+                interrupting: true,
+              },
+            ],
+          },
+          evaluator,
+        );
+        const done = yield* kanban.markSubtask(
+          actual.id,
+          "s1",
+          "done",
+          "Shipped",
+          evaluator,
+          "evaluator",
+        );
+        assert.include(done.subtasks[0]!.note!, "cleared by standing approval sa-skip-regression");
+        const savedBoard = (yield* kanban.snapshot(board.id)).board;
+        assert.lengthOf(savedBoard.releaseLedger!, 1);
+        assert.strictEqual(savedBoard.releaseLedger![0]!.cardId, actual.id);
+        assert.strictEqual(savedBoard.releaseLedger![0]!.approvalId, "sa-skip-regression");
+        assert.lengthOf(savedBoard.standingApprovals, 1);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
 );

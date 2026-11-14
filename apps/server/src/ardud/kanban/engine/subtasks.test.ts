@@ -2708,3 +2708,32 @@ describe("cleared gates with standing approval and typed asks", () => {
     },
   );
 });
+
+it("replanning keeps a skipped gate record, while reopening or doing clears it", () => {
+  const skipped: KanbanSubtask = {
+    id: "s3",
+    step: 3,
+    owner: "evaluator",
+    text: "Edit fork source",
+    gate: "deploy",
+    gateSource: "set",
+    state: "skipped",
+    note: "Only edits fork code",
+    doneBy: owner,
+    doneAt: at,
+    gateSkipped: {
+      gate: "deploy",
+      reason: "Only edits fork code",
+      by: owner,
+      at,
+      text: "Edit fork source",
+    },
+  };
+  const plan = planSubtasks([skipped], [{ id: "s3", text: "Reword skipped step" }]);
+  expect(plan.ok && plan.subtasks[0]).toEqual(skipped);
+  for (const state of ["open", "done"] as const) {
+    const marked = markSubtask([skipped], "s3", state, null, owner, at)[0]!;
+    expect(marked.state).toBe(state);
+    expect(marked).not.toHaveProperty("gateSkipped");
+  }
+});

@@ -477,6 +477,7 @@ export const approvalProblem = (
   guessedGates?: KanbanBoard["guessedGates"],
   intent: "do" | "skip" = "do",
 ): string | null => {
+  if (subtask.state === "skipped" && subtask.gateSkipped !== undefined) return null;
   const gate = gateOf(subtask, guessedGates);
   if (gate === undefined) return null;
   const context = "approvals" in standing ? standing : undefined;
@@ -958,13 +959,20 @@ export const markSubtask = (
   by: KanbanActor,
   at: string,
 ): ReadonlyArray<KanbanSubtask> =>
-  subtasks.map((subtask) =>
-    subtask.id !== id
-      ? subtask
-      : state === "open"
-        ? { ...subtask, state, note: null, doneBy: null, doneAt: null }
-        : { ...subtask, state, note: note?.trim() || null, doneBy: by, doneAt: at },
-  );
+  subtasks.map((subtask) => {
+    if (subtask.id !== id) return subtask;
+    const { gateSkipped, ...rest } = subtask;
+    return state === "open"
+      ? { ...rest, state, note: null, doneBy: null, doneAt: null }
+      : {
+          ...rest,
+          ...(state === "skipped" && gateSkipped ? { gateSkipped } : {}),
+          state,
+          note: note?.trim() || null,
+          doneBy: by,
+          doneAt: at,
+        };
+  });
 
 export function reviewSubtasksToPass(card: Pick<KanbanCard, "subtasks">) {
   const current = kanbanOpenStep(card);

@@ -14439,8 +14439,6 @@ const make = Effect.gen(function* () {
         yield* checkText([["note", note]]);
         const card = yield* cardOf(cardId);
         const scriptName = role === "script" ? (yield* scriptFor(card, actor)).name : null;
-        const check = Subtasks.checkMark(card, subtaskId, state, role, note, scriptName);
-        if (!check.ok) return yield* failWith("denied", check.reason);
         const board = yield* boardOf(card.boardId);
         const gated = card.subtasks.find((subtask) => subtask.id === subtaskId);
         const at = yield* nowIso;
@@ -14451,24 +14449,46 @@ const make = Effect.gen(function* () {
           at,
           note,
         };
+        const candidate = gated && {
+          ...gated,
+          state,
+          ...(state !== "skipped" ? { gateSkipped: undefined } : {}),
+        };
         const missing =
-          gated && state !== "open"
+          candidate && state !== "open"
             ? Subtasks.approvalProblem(
                 card,
-                gated,
+                candidate,
                 standing,
                 board.guessedGates,
                 state === "skipped" ? "skip" : "do",
               )
             : null;
-        if (actor._tag !== "owner" && missing) return yield* failWith("denied", missing);
+        const skipGate =
+          missing &&
+          state === "skipped" &&
+          actor._tag === "evaluator" &&
+          (gated?.owner === "evaluator" || gated?.owner === "script")
+            ? Subtasks.gateOf(gated, board.guessedGates)
+            : undefined;
+        const reason = note?.trim() ?? "";
+        if (skipGate && (reason.length < 10 || reason.length > 300)) {
+          return yield* failWith(
+            "invalid",
+            "skipping a gated step needs a reason of 10 to 300 characters in note",
+          );
+        }
+        const check = Subtasks.checkMark(card, subtaskId, state, role, note, scriptName);
+        if (!check.ok) return yield* failWith("denied", check.reason);
+        if (actor._tag !== "owner" && missing && !skipGate)
+          return yield* failWith("denied", missing);
         const cleared =
-          gated &&
+          candidate &&
           state === "done" &&
           actor._tag !== "owner" &&
-          Subtasks.gateOf(gated, board.guessedGates) === "deploy" &&
-          !gated.ownerOnly &&
-          Subtasks.approvalProblem(card, gated, [], board.guessedGates) !== null
+          Subtasks.gateOf(candidate, board.guessedGates) === "deploy" &&
+          !candidate.ownerOnly &&
+          Subtasks.approvalProblem(card, candidate, [], board.guessedGates) !== null
             ? board.standingApprovals.find((entry) => entry.revokedAt === null)
             : undefined;
         const completionNote = cleared
@@ -14481,9 +14501,16 @@ const make = Effect.gen(function* () {
           completionNote,
           actor,
           at,
+        ).map((subtask) =>
+          subtask.id === subtaskId && skipGate
+            ? {
+                ...subtask,
+                gateSkipped: { gate: skipGate, reason, by: actor, at, text: subtask.text },
+              }
+            : subtask,
         );
         // The completed candidate is saved only with its release receipt below.
-        const marked = (yield* upgradeFindings(
+        let marked = (yield* upgradeFindings(
           [
             {
               ...card,
@@ -14498,6 +14525,28 @@ const make = Effect.gen(function* () {
         yield* logEvent(marked, actor, "subtask", {
           body: `${subtaskId} ${state}: ${text}${completionNote?.trim() ? ` (${completionNote.trim()})` : ""}`,
         });
+        if (skipGate) {
+          yield* logEvent(marked, actor, "comment", {
+            body: `Skipped ${skipGate}-gated ${subtaskId} ("${text}") without owner approval: ${reason}`,
+          });
+          const askId = Asks.nextAskId(marked);
+          marked = Asks.updateAsk(
+            Asks.addAsk(
+              marked,
+              `An evaluator skipped ${subtaskId}, a ${skipGate}-gated step, without your approval: "${text}". Reason: ${reason}. It was not done; marking it done still needs your OK.`,
+              false,
+              actor,
+              at,
+            ),
+            askId,
+            {
+              kind: "notice",
+              respond: { ack: true },
+              title: `Gate skipped on #${card.number} ${subtaskId}`,
+              batchKey: "gate-skipped",
+            },
+          );
+        }
         if (
           state !== "open" &&
           gated?.owner === "review" &&

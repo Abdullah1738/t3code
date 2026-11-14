@@ -6048,7 +6048,11 @@ const clearGateCallerCases = [
   { label: "parent cycle", role: "work", shape: "plain", state: "parent-cycle", linked: false },
 ] as const;
 
-it.effect.each(clearGateCallerCases)("clearGate caller ancestry: $label", (row) => {
+it.effect.each(
+  clearGateCallerCases.flatMap((row) =>
+    (["card_edit", "subtask_done"] as const).map((tool) => ({ ...row, tool })),
+  ),
+)("$tool caller ancestry: $label", (row) => {
   const { layer, parents, missing, deleted, unreadable } = fakeThreads();
   return Effect.gen(function* () {
     const kanban = yield* KanbanService.KanbanService;
@@ -6102,9 +6106,11 @@ it.effect.each(clearGateCallerCases)("clearGate caller ancestry: $label", (row) 
       );
       assert.strictEqual(card.subtasks[0]!.gate, gate);
       const before = yield* kanban.card(card.id);
-      const refused = yield* call(child, "card_edit", {
+      const refused = yield* call(child, row.tool, {
         card: card.id,
-        subtasks: [{ id: "s1", clearGate: "This gate was guessed incorrectly" }],
+        ...(row.tool === "card_edit"
+          ? { subtasks: [{ id: "s1", clearGate: "This gate was guessed incorrectly" }] }
+          : { subtask: "s1", state: "skipped", note: "This gate was filed incorrectly" }),
       });
       assert.isTrue(refused.isError, refused.text);
       assert.match(
@@ -7213,3 +7219,48 @@ it.effect.each([
     }).pipe(Effect.provide(fake.layer));
   },
 );
+
+it.effect("a top-level board evaluator skips an explicit gate through subtask_done", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "skip-root",
+      name: "Skip root",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    const root = yield* kanban.startEvaluator(board.id, {
+      kind: "request",
+      text: "Review the gate",
+    });
+    const card = yield* kanban.createCard(
+      board.id,
+      {
+        title: "Misfiled gate",
+        prompt: "Work",
+        subtasks: [{ text: "Edit fork source", owner: "evaluator", gate: "deploy" }],
+      },
+      owner,
+    );
+    const skipped = yield* call(root, "subtask_done", {
+      card: card.id,
+      subtask: "s1",
+      state: "skipped",
+      note: "Only edits fork code",
+    });
+    assert.isFalse(skipped.isError, skipped.text);
+    const saved = (yield* kanban.card(card.id)).card;
+    assert.deepStrictEqual(saved.subtasks[0]!.gateSkipped?.by, {
+      _tag: "evaluator",
+      threadId: root,
+    });
+    const refused = yield* call(root, "subtask_done", {
+      card: card.id,
+      subtask: "s1",
+      state: "done",
+      note: "Did it",
+    });
+    assert.isTrue(refused.isError);
+    assert.include(refused.text, "needs Abdullah's approval");
+  }).pipe(Effect.provide(layer));
+});
