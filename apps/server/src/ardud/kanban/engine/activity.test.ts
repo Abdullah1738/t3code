@@ -629,7 +629,16 @@ describe("rollup", () => {
     const stuckRun = Activity.rollup({ ...input, cards: [...input.cards, stuck] });
     expect(stuckRun.stages.withoutThread).toEqual({
       count: 1,
-      items: [{ card: 7, stage: "in_review", since: "2026-11-11T08:00Z" }],
+      byReason: { none: 1 },
+      none: {
+        count: 1,
+        items: [
+          { card: 7, stage: "in_review", since: "2026-11-11T08:00Z", reason: "none", hours: 40 },
+        ],
+      },
+      items: [
+        { card: 7, stage: "in_review", since: "2026-11-11T08:00Z", reason: "none", hours: 40 },
+      ],
     });
     expect(stuckRun.pools.used).toEqual(result.pools.used);
     // Its time still counts as time in review.
@@ -2106,7 +2115,7 @@ describe("without-thread reasons", () => {
       blockedBy: [blocker.id],
     }),
     card("blocked", { number: 3, blockedBy: [blocker.id], priority: 5 }),
-    card("paused", { number: 4, priority: 5, subtasks: step }),
+    card("backlog", { number: 4, priority: 5, subtasks: step }),
     card("evaluator", { number: 5, subtasks: step, stalled: flag("Stopped") }),
     card("failed", { number: 6, stalled: flag("Run failed: timeout") }),
     card("flagged", { number: 7, stalled: flag("Stopped") }),
@@ -2136,7 +2145,7 @@ describe("without-thread reasons", () => {
       "wait:ci": 1,
       owner_ask: 1,
       blocked: 1,
-      paused: 1,
+      backlog: 1,
       evaluator_step: 1,
       "stalled:run_failed": 1,
       "stalled:flagged": 1,
@@ -2244,6 +2253,22 @@ describe("without-thread reasons", () => {
     ).toBe("paused");
   });
 
+  it("uses the queued-card backlog reason for priority 5", () => {
+    const row = card("backlog", { priority: 5 });
+    const context = { byId: new Map(), pools, board: activityBoard };
+    expect(
+      Activity.rollup({
+        window,
+        cards: [row],
+        events: [],
+        threads: [],
+        pools,
+        board: activityBoard,
+      }).stages.queued.items[0]?.reason,
+    ).toBe("backlog");
+    expect(Activity.withoutThreadReason({ ...row, stage: "working" }, context)).toBe("backlog");
+  });
+
   it("does not call a multi-model worker paused while an alternative pool is open", () => {
     const row = card("alternatives", {
       stage: "working",
@@ -2299,5 +2324,252 @@ describe("without-thread reasons", () => {
     expect(section.items.length + (section.more ?? 0)).toBe(340);
     expect(section.items.every((row) => row.reason === "none")).toBe(true);
     expect(section.none.items).toEqual(section.items);
+  });
+});
+
+const reviewPr = (state: KanbanCard["links"][number]["state"]): KanbanCard["links"][number] => ({
+  kind: "pr",
+  url: "https://github.com/example/repo/pull/1",
+  label: null,
+  state,
+  checkedAt: before,
+});
+
+describe("detached review state", () => {
+  it.each(["work", "review", "evaluator", "script"] as const)(
+    "uses the dispatcher's remaining-step check for a later %s step",
+    (owner) => {
+      const row = card("review", {
+        stage: "in_review",
+        reviewStep: 1,
+        subtasks: [subtask("evaluator"), subtask(owner, { id: "later", step: 2 })],
+      });
+      const context = { byId: new Map(), pools, board: activityBoard };
+      expect(Activity.withoutThreadReason(row, context)).toBe(
+        owner === "evaluator" || owner === "script" ? "evaluator_step" : "none",
+      );
+      expect(
+        Activity.withoutThreadReason(
+          {
+            ...row,
+            subtasks: row.subtasks.map((item) =>
+              item.id === "later" ? { ...item, state: "done" } : item,
+            ),
+          },
+          context,
+        ),
+      ).toBe("evaluator_step");
+    },
+  );
+
+  const cases = [
+    {
+      name: "unfinished evaluator step",
+      step: 0,
+      chain: 1,
+      owners: ["evaluator"],
+      pr: "open",
+      reason: "none",
+    },
+    {
+      name: "unfinished script step",
+      step: 0,
+      chain: 1,
+      owners: ["script"],
+      pr: "open",
+      reason: "none",
+    },
+    {
+      name: "unfinished mixed evaluator/script step",
+      step: 0,
+      chain: 1,
+      owners: ["evaluator", "script"],
+      pr: "merged",
+      reason: "none",
+    },
+    {
+      name: "unfinished unplanned review",
+      step: 0,
+      chain: 1,
+      owners: [],
+      pr: "open",
+      reason: "none",
+    },
+    {
+      name: "only first of two reviewers finished",
+      step: 1,
+      chain: 2,
+      owners: ["evaluator"],
+      pr: "open",
+      reason: "none",
+    },
+    {
+      name: "both reviewers finished",
+      step: 2,
+      chain: 2,
+      owners: ["evaluator"],
+      pr: "open",
+      reason: "wait:merge",
+    },
+    {
+      name: "finished unplanned review with open PR",
+      step: 1,
+      chain: 1,
+      owners: [],
+      pr: "open",
+      reason: "wait:merge",
+    },
+    {
+      name: "merge takes precedence over evaluator step",
+      step: 1,
+      chain: 1,
+      owners: ["evaluator"],
+      pr: "open",
+      reason: "wait:merge",
+    },
+    {
+      name: "merged PR with evaluator step",
+      step: 1,
+      chain: 1,
+      owners: ["evaluator"],
+      pr: "merged",
+      reason: "evaluator_step",
+    },
+    {
+      name: "closed PR with script step",
+      step: 1,
+      chain: 1,
+      owners: ["script"],
+      pr: "closed",
+      reason: "evaluator_step",
+    },
+    {
+      name: "merged PR without next step",
+      step: 1,
+      chain: 1,
+      owners: [],
+      pr: "merged",
+      reason: "none",
+    },
+    {
+      name: "closed PR without next step",
+      step: 1,
+      chain: 1,
+      owners: [],
+      pr: "closed",
+      reason: "none",
+    },
+    { name: "no PR", step: 1, chain: 1, owners: [], pr: "absent", reason: "none" },
+    { name: "context-only PR state", step: 1, chain: 1, owners: [], pr: null, reason: "none" },
+  ] satisfies Array<{
+    name: string;
+    step: number;
+    chain: number;
+    owners: Array<KanbanSubtask["owner"]>;
+    pr: KanbanCard["links"][number]["state"] | "absent";
+    reason: string;
+  }>;
+  it.each(cases)("$name", ({ step, chain, owners, pr, reason }) => {
+    const row = card("review", {
+      stage: "in_review",
+      reviewStep: step,
+      subtasks: owners.map((owner) => subtask(owner)),
+      links: pr === "absent" ? [] : [reviewPr(pr)],
+    });
+    const board = {
+      ...activityBoard,
+      reviewChains: [{ name: "Default", steps: Array.from({ length: chain }, () => sonnet) }],
+    };
+    const section = Activity.rollup({ window, cards: [row], events: [], threads: [], pools, board })
+      .stages.withoutThread;
+    expect(section.items[0]?.reason).toBe(reason);
+    expect(section.byReason).toEqual({ [reason]: 1 });
+    expect(section.none.count).toBe(reason === "none" ? 1 : 0);
+  });
+
+  const pending = card("pending", { stage: "in_review", links: [reviewPr("open")] });
+  const outcome = Rules.applyReviewResult(pending, 1, "clear");
+  const reviewed = {
+    ...pending,
+    stage: outcome.stage,
+    reviewStep: outcome.reviewStep,
+    reviewRound: outcome.reviewRound,
+  };
+  it("recognizes the implicit merge wait left by a clear review", () => {
+    expect(reviewed.stage).toBe("in_review");
+    expect(reviewed.wait).toBeUndefined();
+    const read = (row: KanbanCard) =>
+      Activity.withoutThreadReason(row, { byId: new Map(), pools, board: activityBoard });
+    expect(read(reviewed)).toBe("wait:merge");
+    expect(read({ ...reviewed, asks: [ask("q", before, { blocking: true })] })).toBe("wait:merge");
+    expect(
+      read({
+        ...reviewed,
+        links: [
+          reviewPr("merged"),
+          { ...reviewPr("open"), url: "https://github.com/example/repo/pull/2" },
+        ],
+      }),
+    ).toBe("wait:merge");
+  });
+
+  it.each(["push", "merge", "ci", "card", "time", "owner_go", "script"] as const)(
+    "does not recreate an expired %s wait as an implicit merge wait",
+    (on) => {
+      const read = (row: KanbanCard) =>
+        Activity.rollup({
+          window,
+          cards: [row],
+          events: [],
+          threads: [],
+          pools,
+          board: activityBoard,
+        }).stages.withoutThread;
+      expect(read({ ...reviewed, wait: { ...waitOn, on } }).items[0]?.reason).toBe(`wait:${on}`);
+      const expired = { ...reviewed, wait: { ...waitOn, on, expiredAt: t("22:00") } };
+      expect(read(expired).items[0]).toMatchObject({ reason: "none", expiredWait: on });
+      expect(read(expired).none.count).toBe(1);
+      expect(
+        read({ ...expired, asks: [ask("q", before, { blocking: true })] }).items[0],
+      ).toMatchObject({ reason: "owner_ask", expiredWait: on });
+    },
+  );
+});
+
+describe("detached shared-worker timing", () => {
+  it.each(["secondary", "primary", null])(
+    "uses workThreadId when the worker's primary cardId is %s",
+    (primaryId) => {
+      const worker = thread("shared-worker", "primary", "work", opus, before, t("06:00"));
+      const row = card("secondary", { number: 9, stage: "working", workThreadId: worker.threadId });
+      const section = Activity.rollup({
+        window,
+        cards: [row],
+        events: [],
+        pools,
+        threads: [{ ...worker, cardId: primaryId === null ? null : KanbanCardId.make(primaryId) }],
+      }).stages.withoutThread;
+      expect(section.items).toEqual([
+        { card: 9, stage: "working", since: "2026-11-12T06:00Z", reason: "none", hours: 18 },
+      ]);
+    },
+  );
+
+  it("keeps the review role separate from an ended shared worker", () => {
+    const worker = thread("worker", "primary", "work", opus, before, t("06:00"));
+    const reviewer = thread("reviewer", "secondary", "review", sonnet, before, t("16:00"));
+    const row = card("secondary", {
+      stage: "in_review",
+      workThreadId: worker.threadId,
+      reviewThreadId: reviewer.threadId,
+    });
+    const section = Activity.rollup({
+      window,
+      cards: [row],
+      events: [],
+      threads: [worker, reviewer],
+      pools,
+    }).stages.withoutThread;
+    expect(section.items[0]).toMatchObject({ since: "2026-11-12T16:00Z", hours: 8 });
   });
 });

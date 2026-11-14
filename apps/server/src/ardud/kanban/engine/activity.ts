@@ -727,6 +727,11 @@ export const withoutThreadReason = (
 ): string => {
   const board = context.board && "reviewChains" in context.board ? context.board : undefined;
   if (card.wait?.expiredAt === null && kanbanWaiting(card)) return `wait:${card.wait.on}`;
+  const reviewed =
+    card.stage === "in_review" &&
+    Rules.reviewFinished(card, board ? (Rules.chainFor(board, card)?.steps.length ?? 1) : 1);
+  // A passed review waits for its tracked PRs even without card_wait. An expired wait must stay visible.
+  if (card.wait?.expiredAt == null && reviewed && !Rules.prsLanded(card)) return "wait:merge";
   if (card.asks.some((ask) => ask.closedAt === null && ask.blocking)) return "owner_ask";
   if (Rules.isBlocked(card, context.byId)) return "blocked";
   const models =
@@ -740,7 +745,11 @@ export const withoutThreadReason = (
     pools.every((pool) => pool !== undefined && pool.slots <= 0)
   )
     return "paused";
-  if (!kanbanWorkStep(card) && (kanbanEvaluatorStep(card) || kanbanScriptStep(card)))
+  if (
+    card.stage === "in_review"
+      ? reviewed && Rules.inReviewEvaluatorStepsOnly(card)
+      : !kanbanWorkStep(card) && (kanbanEvaluatorStep(card) || kanbanScriptStep(card))
+  )
     return "evaluator_step";
   if (card.stalled !== null) return `stalled:${stallKind(card.stalled.reason, card.stalled.by)}`;
   // Detached-card pool_full is out of scope; queued cards use dispatcher reservations.
@@ -909,7 +918,13 @@ export const rollup = (input: RollupInput) => {
     ) {
       const card = span.card;
       const role = span.stage === "in_review" ? "review" : "work";
-      const last = threadsByCard.get(card.id)?.findLast((link) => link.role === role);
+      const threadId = role === "work" ? card.workThreadId : card.reviewThreadId;
+      const linked = threadId === null ? undefined : threadsById.get(threadId);
+      // A carried card shares its worker's link, whose primary cardId can name another card.
+      const last =
+        linked?.role === role
+          ? linked
+          : threadsByCard.get(card.id)?.findLast((link) => link.role === role);
       const lastWritten = (byCard.get(card.id) ?? []).findLast(
         (event) => event.actor._tag === "thread" && event.actor.threadId === last?.threadId,
       );
@@ -927,7 +942,6 @@ export const rollup = (input: RollupInput) => {
         ...(card.wait?.expiredAt != null ? { expiredWait: card.wait.on } : {}),
       });
     }
-
   }
   const poolUsage = ledgerUsage(input, hourStarts, spans);
   idle.sort(
