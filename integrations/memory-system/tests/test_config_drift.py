@@ -33,6 +33,8 @@ class ConfigDrift(unittest.TestCase):
         self.other = self.root / "project"
         self.other.mkdir()
         self.loaded = [str(self.other), str(self.home)]
+        self.original_locations = set(self.loaded)
+        self.track_probes = False
         self.active = {}
         self.sid_dir = {"ses_home": str(self.home), "ses_other": str(self.other)}
         self.pending = {}
@@ -75,6 +77,9 @@ class ConfigDrift(unittest.TestCase):
             if route == "/api/session/active":
                 return 200, {"data": self.active.copy()}
             if route == "/api/config":
+                if (self.track_probes and Path(directory).name.startswith("opencode-config-drift-")
+                        and directory not in self.loaded):
+                    self.loaded.append(directory)
                 return 200, self.entries(directory)
             if route == "/api/session":
                 qs = urllib.parse.parse_qs(query)
@@ -98,7 +103,9 @@ class ConfigDrift(unittest.TestCase):
         if method == "DELETE" and route == "/api/debug/location":
             if self.unsupported:
                 raise urllib.error.HTTPError("http://fake", 405, "unsupported", {}, None)
-            if directory not in self.loaded:  # fresh reference probe cleanup
+            if directory not in self.original_locations:  # fresh reference probe cleanup
+                if directory in self.loaded:
+                    self.loaded.remove(directory)
                 return 204, None
             self.evictions.append(directory)
             if self.fail:
@@ -229,6 +236,18 @@ class ConfigDrift(unittest.TestCase):
                 else:
                     self.assertEqual(drift.live_queued_work(directory, 10000), expected)
 
+    def test_missing_and_null_timestamp_fields_fail_closed(self):
+        directory = str(self.home)
+        for times in ({}, {"created": 1}, {"updated": 1},
+                      {"created": None, "updated": 1}, {"created": 1, "updated": None},
+                      {"created": 1, "updated": 1, "viewed": None}, None, []):
+            with self.subTest(times=times):
+                self.sessions[directory][0]["time"] = times
+                self.run_pass()
+                self.assertNotIn(directory, self.evictions)
+                self.assertTrue(any(row["action"] == "failed" and row["directory"] == directory
+                                    for row in json.loads((self.logs / "config_drift_last.json").read_text())["decisions"]))
+
     def test_malformed_safety_response_fails_closed(self):
         original = self.api
         def malformed(method, path):
@@ -295,9 +314,59 @@ class ConfigDrift(unittest.TestCase):
 
     def test_genuinely_unsupported_delete_fails_closed_even_when_idle(self):
         self.unsupported = True
-        self.assertEqual(self.run_pass()["failed"], 2)
+        self.assertEqual(self.run_pass()["failed"], 1)
         self.assertEqual(self.global_calls, 0)
         self.assertEqual(self.evictions, [])
+
+    def test_failed_reference_cleanup_retains_one_probe_until_success(self):
+        self.track_probes = True
+        self.unsupported = True
+        self.assertEqual(self.run_pass()["failed"], 1)
+        probe = self.state()["probe"]
+        self.assertTrue(Path(probe).exists())
+        self.assertEqual(set(self.loaded) - self.original_locations, {probe})
+        self.file.write_text('{"model":"two"}')
+        self.assertEqual(self.run_pass(now=10301)["failed"], 1)
+        self.assertEqual(self.state()["probe"], probe)
+        self.assertEqual(set(self.loaded) - self.original_locations, {probe})
+        calls = len(self.calls)
+        self.run_pass(now=10302, dry_run=True)
+        self.assertFalse(any(method != "GET" for method, _, _ in self.calls[calls:]))
+        self.assertEqual(self.state()["probe"], probe)
+        self.unsupported = False
+        self.assertEqual(self.run_pass(now=10602)["reloaded"], 2)
+        self.assertNotIn("probe", self.state())
+        self.assertFalse(Path(probe).exists())
+        self.assertEqual(set(self.loaded), self.original_locations)
+
+    def test_foreign_probe_path_is_never_evicted_or_removed(self):
+        self.logs.mkdir()
+        (self.logs / "config_drift_state.json").write_text(json.dumps({"probe": str(self.other)}))
+        self.assertEqual(self.run_pass()["failed"], 1)
+        self.assertEqual(self.calls, [])
+        self.assertTrue(self.other.exists())
+
+    def test_config_edit_during_warmup_cannot_bind_wrong_signature(self):
+        directory = str(self.home)
+        self.loaded = [directory]
+        original = self.api
+        edited = False
+        def edit_during_eviction(method, path):
+            nonlocal edited
+            target = urllib.parse.parse_qs(path.partition("?")[2]).get("location[directory]", [None])[0]
+            result = original(method, path)
+            if method == "DELETE" and target == directory and not edited:
+                edited = True
+                self.file.write_text('{"model":"two"}')
+            return result
+        with mock.patch.object(reaper, "api", side_effect=edit_during_eviction):
+            self.assertEqual(self.run_pass()["failed"], 1)
+        self.assertNotIn("verified", self.state()["locations"][directory])
+        self.file.write_text('{"model":"one"}')
+        self.models[directory] = "two"
+        self.assertEqual(self.run_pass(now=10301)["reloaded"], 1)
+        self.assertEqual(self.run_pass(now=10602)["reloaded"], 0)
+        self.assertEqual(self.evictions, [directory, directory])
 
     def test_reverted_disk_edit_with_cached_intermediate_config_is_recovered(self):
         self.run_pass()

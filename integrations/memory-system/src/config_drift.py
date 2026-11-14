@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import tempfile
 import time
 import urllib.error
@@ -134,8 +135,12 @@ def live_queued_work(directory, now):
                 raise ValueError("invalid session location")
             ids.append(sid)
             times = session["time"]
+            if not isinstance(times, dict) or any(times.get(key) is None for key in ("created", "updated")):
+                raise ValueError("missing mandatory session timestamps")
             for key in ("created", "updated", "viewed"):
                 value = times.get(key)
+                if key in times and value is None:
+                    raise ValueError("null session timestamp")
                 if value is not None:
                     if isinstance(value, str):
                         at = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -181,15 +186,45 @@ def documents(entries, config):
     return result
 
 
-def fresh_documents(config):
-    # A new directory has no cached config. Never reload/evict another probe.
-    with tempfile.TemporaryDirectory(prefix="opencode-config-drift-") as scratch:
-        try:
-            return documents(get("/api/config?" + reaper.loc_q(scratch), list), config)
-        finally:
-            status, _ = reaper.api("DELETE", "/api/debug/location?" + reaper.loc_q(scratch))
-            if status != 204:
-                raise ValueError("scratch eviction failed")
+class ReferenceProbeError(ValueError):
+    pass
+
+
+def cleanup_probe(state, save, logs, sid_dir, last, keep, now):
+    scratch = state.get("probe")
+    if not scratch:
+        return
+    try:
+        probe = Path(scratch)
+        if probe.is_symlink() or probe.parent.resolve() != logs.resolve() or not probe.name.startswith("opencode-config-drift-"):
+            raise ValueError("unowned reference probe path")
+        if busy(scratch, sid_dir, last, keep, now):
+            raise ValueError("reference probe is busy")
+        status, _ = reaper.api("DELETE", "/api/debug/location?" + reaper.loc_q(scratch))
+        if status != 204:
+            raise ValueError("scratch eviction failed")
+        shutil.rmtree(scratch, ignore_errors=True)
+        del state["probe"]
+        save()
+    except Exception as e:
+        if isinstance(e, urllib.error.HTTPError):
+            e.close()
+        raise ReferenceProbeError("reference cleanup failed") from e
+
+
+def fresh_documents(config, state, save, logs, sid_dir, last, keep, now):
+    # Persist ownership before booting: a failed/ambiguous cleanup is retried
+    # before any new probe is created, including after process interruption.
+    state["probe"] = tempfile.mkdtemp(prefix="opencode-config-drift-", dir=logs)
+    save()
+    try:
+        return documents(get("/api/config?" + reaper.loc_q(state["probe"]), list), config)
+    except Exception as e:
+        if isinstance(e, urllib.error.HTTPError):
+            e.close()
+        raise ReferenceProbeError("reference read failed") from e
+    finally:
+        cleanup_probe(state, save, logs, sid_dir, last, keep, now)
 
 
 def dropped_events(path, previous):
@@ -261,6 +296,13 @@ def run(loaded, last, sid_dir, keep, *, dry_run=False, logs=None, home=None, con
             if not dry_run:
                 atomic_json(state_path, state)
 
+        if state.get("probe"):
+            loaded.discard(state["probe"])
+            if dry_run:
+                decision("would-clean-probe", state["probe"])
+            else:
+                cleanup_probe(state, save, logs, sid_dir, last, keep, now)
+
         count, state["log_cursor"] = dropped_events(service_log, state.get("log_cursor", {}))
         state["dropped_events_total"] = state.get("dropped_events_total", 0) + count
         st.update(dropped_events_new=count, dropped_events_total=state["dropped_events_total"])
@@ -284,11 +326,7 @@ def run(loaded, last, sid_dir, keep, *, dry_run=False, logs=None, home=None, con
                 previous = ledger.get(directory, {})
                 resolved = digest(observed_entries)
                 if previous.get("version") == version and previous.get("done"):
-                    if previous.get("verified") is None or previous["verified"] == resolved:
-                        # A 204 is saved before warming the replacement. If that
-                        # readback failed, this first successful read completes it.
-                        previous["verified"] = resolved
-                        save()
+                    if previous.get("verified") == resolved:
                         st["unchanged"] += 1
                         continue
                 decision("stale-detected", directory, version=version)
@@ -300,7 +338,7 @@ def run(loaded, last, sid_dir, keep, *, dry_run=False, logs=None, home=None, con
                     decision("would-reload", directory, version=version)
                     continue
                 if expected is None:
-                    expected = fresh_documents(config)
+                    expected = fresh_documents(config, state, save, logs, sid_dir, last, keep, now)
                     if content_hash(shared_roots) != shared:
                         raise ValueError("config changed during reference probe")
                 observed = documents(observed_entries, config)
@@ -308,6 +346,16 @@ def run(loaded, last, sid_dir, keep, *, dry_run=False, logs=None, home=None, con
                 # A matching document cannot prove plugin/skill content is fresh,
                 # so new input versions still get one conservative idle refresh.
                 mismatch = observed != expected
+                if version_for(paths) != version or content_hash(shared_roots) != shared:
+                    raise ValueError("config changed during pass")
+                if (previous.get("version") == version and previous.get("done")
+                        and previous.get("verified") is None and not previous.get("invalidated") and not mismatch):
+                    # A saved 204 may have lost only its warmup response. Accept
+                    # a matching, stable readback without another eviction.
+                    ledger[directory]["verified"] = resolved
+                    save()
+                    decision("reconciled", directory, version=version)
+                    continue
                 if previous.get("version") == version and previous.get("pending"):
                     # Only a stale-to-fresh document transition proves that an
                     # ambiguous send applied. Plugin-only changes have no such
@@ -352,9 +400,16 @@ def run(loaded, last, sid_dir, keep, *, dry_run=False, logs=None, home=None, con
                 save()
                 decision("reloaded", directory, version=version, resolved_mismatch=mismatch)
                 # Boot fresh services now, particularly for the HOME model probe.
-                ledger[directory]["verified"] = digest(get("/api/config?" + reaper.loc_q(directory), list))
+                warmed = get("/api/config?" + reaper.loc_q(directory), list)
+                if version_for(paths) != version or content_hash(shared_roots) != shared or documents(warmed, config) != expected:
+                    ledger[directory]["invalidated"] = True
+                    save()
+                    raise ValueError("config changed during warmup")
+                ledger[directory]["verified"] = digest(warmed)
                 save()
             except Exception as e:
+                if isinstance(e, ReferenceProbeError):
+                    raise
                 # HTTPError strings omit response payloads/config credentials.
                 if isinstance(e, urllib.error.HTTPError):
                     e.close()
