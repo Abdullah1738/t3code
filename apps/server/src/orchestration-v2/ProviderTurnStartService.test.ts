@@ -1,3 +1,5 @@
+import * as TestClock from "effect/testing/TestClock";
+import { PROVIDER_START_CLEANUP_TIMEOUT_MS } from "./providerStartDeadlinePolicy.ts";
 import { continuationReport, markQueuedRunRecovered } from "../ardud/fast-install/report.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it, vi } from "vite-plus/test";
@@ -36,7 +38,6 @@ import {
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
-import * as TestClock from "effect/testing/TestClock";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
@@ -79,6 +80,16 @@ import {
 } from "@t3tools/provider-core/server/failure";
 
 const isDomainEvent = Schema.is(OrchestrationV2DomainEvent);
+// Admission now persists a deadline before waiting on any provider I/O.
+const withoutStartDeadlineEvents = (
+  events: ReadonlyArray<typeof OrchestrationV2DomainEvent.Type>,
+) =>
+  events.filter(
+    (event) =>
+      event.type !== "run.updated" ||
+      event.payload.status !== "starting" ||
+      event.payload.providerStartDeadlineAt === undefined,
+  );
 
 const managedWorktreesDir = "/tmp/provider-turn-start-worktrees";
 // fs.realpath applies `..` and `.` before following symlinks.
@@ -998,6 +1009,8 @@ effectIt.effect.each([
       expect(harness.nativeInterruptTurn).toHaveBeenCalledWith({
         providerThread: controls.providerThread,
         providerTurnId: staleTurn,
+        requestRuntimeRestart: false,
+        stopBackgroundWork: false,
       });
   }),
 );
@@ -1519,8 +1532,8 @@ effectIt.effect.each([
       expect(resumeThread).not.toHaveBeenCalled();
       expect(forkThread).not.toHaveBeenCalled();
       expect(harness.startRootRun).not.toHaveBeenCalled();
-      expect(harness.writeIfRunCurrent).not.toHaveBeenCalled();
-      expect(harness.events).toEqual([]);
+      expect(withoutStartDeadlineEvents(harness.events)).toEqual([]);
+      expect(withoutStartDeadlineEvents(harness.events)).toEqual([]);
       expect(harness.projection()).toEqual(updated);
     }),
 );
@@ -1597,7 +1610,7 @@ effectIt.effect("leaves the run starting when a session-open failure will be ret
     const error = yield* harness.startWithRetry.pipe(Effect.flip);
 
     expect(error._tag).toBe("ProviderTurnStartError");
-    expect(harness.writeIfRunCurrent).not.toHaveBeenCalled();
+    expect(withoutStartDeadlineEvents(harness.events)).toEqual([]);
     expect(harness.projection().runs.at(-1)?.status).toBe("starting");
   }),
 );
@@ -1616,7 +1629,7 @@ effectIt.effect("keeps a session-open failure retryable when terminal persistenc
     expect(harness.writeIfRunCurrent).toHaveBeenCalledOnce();
     expect(harness.startRootRun).not.toHaveBeenCalled();
     expect(harness.projection().runs.at(-1)?.status).toBe("starting");
-    expect(harness.events).toEqual([]);
+    expect(withoutStartDeadlineEvents(harness.events)).toEqual([]);
   }),
 );
 
@@ -1630,10 +1643,10 @@ effectIt.effect("does not terminalize a provider-session open interruption", () 
     if (exit._tag === "Failure") {
       expect(Cause.hasInterruptsOnly(exit.cause)).toBe(true);
     }
-    expect(harness.writeIfRunCurrent).not.toHaveBeenCalled();
+    expect(withoutStartDeadlineEvents(harness.events)).toEqual([]);
     expect(harness.startRootRun).not.toHaveBeenCalled();
     expect(harness.projection().runs.at(-1)?.status).toBe("starting");
-    expect(harness.events).toEqual([]);
+    expect(withoutStartDeadlineEvents(harness.events)).toEqual([]);
   }),
 );
 
@@ -1647,14 +1660,14 @@ effectIt.effect("does not overwrite a run interrupted while its provider session
 
     yield* harness.start;
 
-    expect(harness.writeIfRunCurrent).toHaveBeenCalledOnce();
+    expect(harness.writeIfRunCurrent).toHaveBeenCalledTimes(2);
     expect(harness.startRootRun).not.toHaveBeenCalled();
     const projection = harness.projection();
     expect(projection.runs.at(-1)?.status).toBe("interrupted");
     expect(projection.attempts[0]?.status).toBe("pending");
     expect(projection.nodes[0]?.status).toBe("pending");
     expect(projection.turnItems).toEqual([]);
-    expect(harness.events).toEqual([]);
+    expect(withoutStartDeadlineEvents(harness.events)).toEqual([]);
   }),
 );
 
@@ -1695,7 +1708,7 @@ effectIt.effect("leaves the run starting when a thread-load failure will be retr
     const error = yield* harness.startWithRetry.pipe(Effect.flip);
 
     expect(error._tag).toBe("ProviderTurnStartError");
-    expect(harness.writeIfRunCurrent).not.toHaveBeenCalled();
+    expect(withoutStartDeadlineEvents(harness.events)).toEqual([]);
     expect(harness.projection().runs.at(-1)?.status).toBe("starting");
   }),
 );
@@ -1712,7 +1725,7 @@ effectIt.effect("keeps a thread-load failure retryable when terminal persistence
 
     expect(error._tag).toBe("ProviderTurnStartError");
     expect(harness.projection().runs.at(-1)?.status).toBe("starting");
-    expect(harness.events).toEqual([]);
+    expect(withoutStartDeadlineEvents(harness.events)).toEqual([]);
   }),
 );
 
@@ -1730,9 +1743,9 @@ effectIt.effect(
       expect(error._tag).toBe("ProviderTurnStartError");
       expect((error.cause as { _tag?: string } | undefined)?._tag).toBe("ProjectionStoreReadError");
       expect(harness.resumeFallbackEnsure).toHaveBeenCalledOnce();
-      expect(harness.writeIfRunCurrent).not.toHaveBeenCalled();
+      expect(withoutStartDeadlineEvents(harness.events)).toEqual([]);
       expect(harness.projection().runs.at(-1)?.status).toBe("starting");
-      expect(harness.events).toEqual([]);
+      expect(withoutStartDeadlineEvents(harness.events)).toEqual([]);
     }),
 );
 
@@ -2262,7 +2275,7 @@ effectIt.effect("does not overwrite a run interrupted while its thread loads", (
 
     expect(harness.projection().runs.at(-1)?.status).toBe("interrupted");
     expect(harness.projection().turnItems).toEqual([]);
-    expect(harness.events).toEqual([]);
+    expect(withoutStartDeadlineEvents(harness.events)).toEqual([]);
   }),
 );
 
@@ -3007,4 +3020,116 @@ effectIt.effect.each(
       expect(row.cardId).toBe("card:1300");
       if (phase === "registration") expect(harness.open).not.toHaveBeenCalled();
     }),
+);
+
+effectIt.effect("does not arm the provider deadline while waiting for the workspace lease", () =>
+  Effect.gen(function* () {
+    const worktreePath = "/tmp/provider-start-deadline-workspace";
+    const held = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const lease = yield* withWorkspaceLease(
+      worktreePath,
+      Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+    ).pipe(Effect.forkChild({ startImmediately: true }));
+    yield* Deferred.await(held);
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      worktreePath,
+      nativeDelivery: true,
+    });
+    const startup = yield* harness.start.pipe(Effect.forkChild({ startImmediately: true }));
+    yield* TestClock.adjust("20 minutes");
+    expect(harness.projection().runs.at(-1)?.providerStartDeadlineAt).toBeUndefined();
+    expect(harness.open).not.toHaveBeenCalled();
+    yield* Deferred.succeed(release, undefined);
+    yield* Fiber.join(lease);
+    yield* Fiber.join(startup);
+    const deadline = harness.projection().runs.at(-1)?.providerStartDeadlineAt;
+    expect(deadline).toBeDefined();
+    expect(DateTime.toEpochMillis(deadline!) - DateTime.toEpochMillis(yield* DateTime.now)).toBe(
+      10 * 60_000,
+    );
+  }),
+);
+
+effectIt.effect.each(["confirmed", "rejected", "unanswered"] as const)(
+  "successor preserves inherited Claude work when stale cleanup is %s",
+  (cleanup) =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({
+        text: "FIFO successor",
+        nativeDelivery: true,
+        providerDriver: "claudeAgent",
+      });
+      yield* harness.start;
+      const controls = harness.startRootRun.mock.calls[0]![0];
+      const oldRunId = RunId.make("r9-expired-claude-run");
+      const oldAttempt = RunAttemptId.make("r9-expired-claude-attempt");
+      const staleTurn = ProviderTurnId.make("r9-expired-claude-turn");
+      const projection = harness.projection();
+      harness.setProjection({
+        ...projection,
+        runs: [
+          ...projection.runs,
+          {
+            ...controls.run,
+            id: oldRunId,
+            ordinal: 1,
+            activeAttemptId: oldAttempt,
+            status: "failed",
+            completedAt: yield* DateTime.now,
+            providerStartDeadlineAt: yield* DateTime.now,
+          },
+        ],
+      });
+      harness.nativeStartTurn.mockImplementationOnce(() =>
+        Effect.fail(
+          new ProviderAdapter.ProviderAdapterTurnStartError({
+            driver: controls.session.driver,
+            threadId: controls.run.threadId,
+            providerThreadId: controls.providerThread.id,
+            runId: controls.run.id,
+            cause: new ProviderAdapter.ProviderAdapterProtocolError({
+              driver: controls.session.driver,
+              reason: "previous_turn_active",
+              detail: "expired prompt cancellation was unconfirmed",
+              activeTurn: {
+                runId: oldRunId,
+                attemptId: oldAttempt,
+                providerThreadId: controls.providerThread.id,
+                providerTurnId: staleTurn,
+              },
+            }),
+          }),
+        ),
+      );
+      const stopping = yield* Deferred.make<void>();
+      harness.nativeInterruptTurn.mockImplementation(() =>
+        Deferred.succeed(stopping, undefined).pipe(
+          Effect.andThen(
+            cleanup === "confirmed"
+              ? Effect.void
+              : cleanup === "unanswered"
+                ? Effect.never
+                : Effect.fail(
+                    new ProviderAdapter.ProviderAdapterInterruptError({
+                      driver: controls.session.driver,
+                      providerThreadId: controls.providerThread.id,
+                      providerTurnId: staleTurn,
+                      cause: "native cancellation unconfirmed",
+                    }),
+                  ),
+          ),
+        ),
+      );
+      const starting = yield* startPreparedTurn(controls).pipe(Effect.result, Effect.forkScoped);
+      yield* Deferred.await(stopping);
+      if (cleanup === "unanswered") yield* TestClock.adjust(PROVIDER_START_CLEANUP_TIMEOUT_MS);
+      const outcome = yield* Fiber.join(starting);
+      expect(outcome._tag).toBe(cleanup === "confirmed" ? "Success" : "Failure");
+      expect(harness.nativeStartTurn).toHaveBeenCalledTimes(cleanup === "confirmed" ? 2 : 1);
+      const request = harness.nativeInterruptTurn.mock.calls[0]?.[0];
+      expect(request?.stopBackgroundWork).toBe(false);
+      expect(request?.requestRuntimeRestart).toBe(false);
+    }).pipe(Effect.scoped),
 );

@@ -319,7 +319,8 @@ class EngineTests(unittest.TestCase):
             result = engine.decide(self.identity_probe(), "claude")
             wrapped = result["context"].get("updatedInput", {}).get("command", "")
             self.assertNotIn(engine.COMMAND_IDENTITY_ENV + "=", wrapped)
-        engine.decide(self.identity_probe(), "claude")
+        with patch.object(engine.time, "time", return_value=time.time() + engine._IDENTITY_UNAVAILABLE_TTL):
+            engine.decide(self.identity_probe(), "claude")
         self.age_identity_cache(3600)
         with patch.object(engine, "_get", side_effect=TimeoutError("stalled")):
             self.assertEqual(self.token_identity(engine.decide(self.identity_probe(), "claude"))["robobThreadId"], "child")
@@ -336,7 +337,7 @@ class EngineTests(unittest.TestCase):
                     self.assertEqual(engine.resolve_identity(self.identity_probe(), "claude")["resolution"], "unavailable")
 
     def test_claude_cache_expired_or_invalid_is_not_used(self):
-        for age in (engine._CLAUDE_IDENTITY_TTL + 1, -60):
+        for age in (engine._IDENTITY_FALLBACK_TTL + 1, -60):
             with self.subTest(age=age):
                 engine.decide(self.identity_probe(), "claude")
                 self.age_identity_cache(age)
@@ -371,7 +372,7 @@ class EngineTests(unittest.TestCase):
 
     def test_claude_binding_expiring_during_lookup_is_not_used(self):
         engine.decide(self.identity_probe(), "claude")
-        self.age_identity_cache(engine._CLAUDE_IDENTITY_TTL - 1)
+        self.age_identity_cache(engine._IDENTITY_FALLBACK_TTL - 1)
         now = time.time()
         with patch.object(engine.time, "time", side_effect=[now, now + 5]), \
              patch.object(engine, "_lookup_identity", side_effect=TimeoutError("stalled")):
@@ -401,7 +402,8 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(engine.resolve_identity(self.identity_probe(), "claude")["resolution"], "unavailable")
         self.assertEqual(deadlines, [103.0, 104.5])
         identity = self.state.identities[("session", "agent-child")]
-        with patch.object(engine, "_get", side_effect=[ConnectionRefusedError("retry"), {"identity": identity}]) as get:
+        with patch.object(engine.time, "time", return_value=time.time() + engine._IDENTITY_UNAVAILABLE_TTL), \
+             patch.object(engine, "_get", side_effect=[ConnectionRefusedError("retry"), {"identity": identity}]) as get:
             result = engine.decide(self.identity_probe(), "claude")
             self.assertEqual(get.call_count, 2)
             self.assertEqual(self.token_identity(result)["robobThreadId"], "child")

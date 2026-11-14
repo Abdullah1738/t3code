@@ -1,13 +1,14 @@
 import { toolError } from "./toollog.ts";
 /**
  * Photon-shaped transport over one chat of the shared Line, so Router and Delivery run unchanged.
- * Sendblue has no idempotency key; an uncertain send is checked against the line's outbound
+ * Initial sends have no provider idempotency key; an uncertain send is checked against the line's outbound
  * history before it is sent again.
  */
 import type { ChatKey, Line, LineFile, LineAppCard, LineOutbound } from "./line.ts";
 import { LineError, chatKey, safeLineFailureCode } from "./line.ts";
 import { TransportError, type NormalizedInbound } from "./photon.ts";
 import type { Store } from "./store.ts";
+import { createHash } from "node:crypto";
 import { CARD_TEXT_FIELDS, cardLayout, type CardText } from "./card-text.ts";
 
 const RESEND_LOOKBACK_MS = 60_000;
@@ -162,27 +163,45 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
         () => line.sendText(chat, "", { mediaUrl: input.attachmentGuid, ...(input.replyTo ? { replyTo: input.replyTo } : {}) }));
     },
     /** All reads/uploads finish before Delivery's final guards; the returned function only sends. */
-    async prepareApp(input: { id: string; chatGuid: string } & LineAppCard): Promise<() => Promise<Receipt>> {
-      const { id, chatGuid: _chat, ...given } = input;
+    async prepareApp(input: { id: string; chatGuid: string; updateOf?: string; previewPage?: string } & LineAppCard): Promise<() => Promise<Receipt>> {
+      const { id, chatGuid: _chat, updateOf, previewPage, ...given } = input;
+      let originalHandle: string | undefined;
+      if (updateOf) {
+        const saved = store.get<{ handle: string }>(sentKey(id));
+        if (saved) return async () => ({ providerId: saved.handle, duplicate: true });
+        if (!line.updateApp) throw new TransportError("unsupported", false, false);
+        const original = store.getOperation(updateOf);
+        if (!original?.app || original.app.updateOf || original.app.url !== given.url) throw new TransportError("invalid_app_card", false, false);
+        if (original.state !== "sent" || !original.providerId) throw new TransportError("sendUnconfirmed", true, false);
+        const message = await wrap(() => line.getMessage(original.providerId!));
+        if (!message || !("status" in message) || message.chat !== chat || message.card?.url !== given.url
+          || !message.card.sessionIdentifier || message.card.updateMessageHandle) throw new TransportError("invalid_app_card", false, false);
+        if (!/^(SENT|DELIVERED|READ)$/i.test(message.status)) throw new TransportError("sendUnconfirmed", true, false);
+        originalHandle = original.providerId;
+        store.set(`app-session:${updateOf}`, { handle: originalHandle, sessionIdentifier: message.card.sessionIdentifier });
+      }
       const layout = cardLayout(given);
       const sameLayout = (stored: CardText) => layout !== undefined
         && CARD_TEXT_FIELDS.every(key => sameText(stored[key] ?? "") === sameText(layout[key] ?? ""));
-      const receipt = await recover(id, undefined, message => message.card?.url === given.url && sameLayout(message.card.layout));
+      // Update retries use the provider's idempotency key; URL/layout matching could claim the placement itself.
+      const receipt = updateOf ? undefined : await recover(id, undefined, message => message.card?.url === given.url && sameLayout(message.card.layout));
       if (receipt) return async () => receipt;
       let card = given;
-      if (cards.static) {
+      if (cards.static || updateOf) {
         const key = `prepared-app:${id}`;
         const saved = store.get<LineAppCard>(key);
         if (saved) card = saved;
         else {
-          const imageUrl = card.imageUrl ?? await wrap(() => cards.previewImage?.(card.url) ?? Promise.resolve(undefined));
+          const imageUrl = card.imageUrl ?? await wrap(() => cards.previewImage?.(previewPage ?? card.url) ?? Promise.resolve(undefined));
+          if (updateOf && !imageUrl) throw new TransportError("card_preview_unavailable", true, false);
           card = { ...card, interactive: false, ...(imageUrl ? { imageUrl } : {}) };
           store.set(key, card);
         }
       }
-      return () => dispatch(id, () => line.sendApp(chat, card));
+      const updateKey = createHash("sha256").update(id).digest("hex");
+      return () => dispatch(id, () => originalHandle ? line.updateApp!(originalHandle, card, updateKey) : line.sendApp(chat, card));
     },
-    async sendApp(input: { id: string; chatGuid: string } & LineAppCard): Promise<Receipt> {
+    async sendApp(input: { id: string; chatGuid: string; updateOf?: string; previewPage?: string } & LineAppCard): Promise<Receipt> {
       return (await this.prepareApp(input))();
     },
     /** Polls are unsupported on Sendblue; the title and numbered options go out as plain text. */

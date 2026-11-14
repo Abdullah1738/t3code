@@ -41,7 +41,7 @@ def setup(root, backend='boat'):
                 home.fail_over('fixture home unavailable', ['run', '--bg', '--env', 'PRIVATE=env-private-marker'])
             return acquire(*args, **kwargs)
         pool.acquire = failover_acquire
-        home.record_failure = lambda *args: None
+        home.record_failure = lambda *args, **kwargs: None
         api.probe_backend = lambda *args: None
     destination = root / 'synced'
     # Exercise the real snapshot and sync orchestration through an isolated local transport.

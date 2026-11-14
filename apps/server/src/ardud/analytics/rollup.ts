@@ -114,11 +114,26 @@ export const makeAccumulator = () => ({
   total: 0,
   invalidLines: 0,
   kinds: new Map<string, number>(),
+  textGenerationOverflow: 0,
+  textGeneration: new Map<
+    string,
+    {
+      labels: {
+        hour: string;
+        provider: string;
+        operation: string;
+        boardId: string | null;
+        kind: "operation" | "child";
+        outcome: NonNullable<AnalyticsEvent["outcome"]>;
+      };
+      durations: Durations;
+    }
+  >(),
   errors: new Map<string, number>(),
   routes: new Map<string, Breakdown>(),
   mcpCodes: new Map<string, Breakdown>(),
   dbSpans: new Map<string, Breakdown>(),
-  rpcs: new Map<string, Durations>(),
+  rpcs: new Map<string, Durations & { totalWaitMs: number; outcomes: Map<string, number> }>(),
   longTasks: new Map<
     string,
     {
@@ -359,6 +374,29 @@ export function accumulate(
   boardAccumulate(target, event);
   target.total++;
   if ("runId" in event) accumulateUsage(target.usage, event);
+  if (
+    event.surface === "server" &&
+    (event.kind === "text-generation.operation" || event.kind === "text-generation.child") &&
+    event.props?.provider &&
+    event.props.operation &&
+    event.durationMs !== undefined
+  ) {
+    const labels = {
+      hour: (event.startedAt ?? event.ts).slice(11, 13),
+      provider: event.props.provider,
+      operation: event.props.operation,
+      boardId: event.boardId ?? null,
+      kind: event.kind === "text-generation.child" ? ("child" as const) : ("operation" as const),
+      outcome: event.outcome ?? "error",
+    };
+    const key = JSON.stringify(labels);
+    // Bound all dimensions together. Overflow remains visible in kindCounts and raw day files.
+    if (target.textGeneration.has(key) || target.textGeneration.size < 4096) {
+      const group = target.textGeneration.get(key) ?? { labels, durations: durations() };
+      addDuration(group.durations, event.durationMs);
+      target.textGeneration.set(key, group);
+    } else target.textGenerationOverflow++;
+  }
   increment(target.kinds, event.kind);
   if (event.props?.errorTag) increment(target.errors, event.props.errorTag);
   else if (event.errorTag) increment(target.errors, event.errorTag);
@@ -468,10 +506,12 @@ export function accumulate(
     const key = boundedKey(target.rpcs, event.props.method);
     let summary = target.rpcs.get(key);
     if (!summary) {
-      summary = durations();
+      summary = { ...durations(), totalWaitMs: 0, outcomes: new Map() };
       target.rpcs.set(key, summary);
     }
     addDuration(summary, event.durationMs);
+    summary.totalWaitMs += event.props.waitMs ?? 0;
+    if (event.outcome !== undefined) increment(summary.outcomes, event.outcome);
   }
 
   if (
@@ -629,6 +669,10 @@ export function finishRollup(
     total: target.total,
     invalidLines: target.invalidLines,
     kindCounts: Object.fromEntries(target.kinds),
+    textGenerationOverflow: target.textGenerationOverflow,
+    textGeneration: [...target.textGeneration.values()]
+      .map((group) => ({ ...group.labels, ...summarize(group.durations) }))
+      .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
     errorCounts: Object.fromEntries(target.errors),
     errorsByRoute: finishBreakdown(target.routes).map((row) => ({
       route: String(row.labels.route),
@@ -691,7 +735,12 @@ export function finishRollup(
           a.surface.localeCompare(b.surface),
       ),
     topSlowRpcs: [...target.rpcs]
-      .map(([method, values]) => ({ method, ...summarize(values) }))
+      .map(([method, values]) => ({
+        method,
+        ...summarize(values),
+        totalWaitMs: values.totalWaitMs,
+        outcomes: Object.fromEntries(values.outcomes),
+      }))
       .sort((a, b) => (b.p95Ms ?? 0) - (a.p95Ms ?? 0) || a.method.localeCompare(b.method))
       .slice(0, 20),
     askAnswerLatency: summarize(target.answers),

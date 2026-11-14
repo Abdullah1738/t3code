@@ -5,12 +5,12 @@
 T3 Code has one server-side observability model:
 
 - pretty logs go to stdout for humans
+- structured logs go to a rotating local NDJSON file
 - completed spans go to a local NDJSON trace file
 - traces, metrics, and logs can also be exported over OTLP to a real backend like Grafana LGTM
 
-The local trace file is the persisted source of truth for normal local launches. Those launches do not
-write a separate server log file, but SSH-managed launches also persist the remote process's
-stdout/stderr at `~/.t3/ssh-launch/<state>/server.log`.
+The server persists logs independently of desktop output capture and OTLP. SSH-managed launches
+also persist the remote process's stdout/stderr at `~/.t3/ssh-launch/<state>/server.log`.
 
 ## Where To Find Things
 
@@ -20,17 +20,24 @@ Logs are human-facing:
 
 - destination: stdout
 - format: `Logger.consolePretty()`
-- normal local persistence: none
+- local persistence: `<logsDir>/server.log`, next to `server.trace.ndjson`
 - SSH-managed launch persistence: `~/.t3/ssh-launch/<state>/server.log`
 - remote export: OTLP only, when configured
+
+The file uses Effect's structured JSON formatter and redaction hooks, at the configured
+`T3CODE_LOG_LEVEL` (Info by default). Writes batch every second and flush on graceful shutdown.
+It rotates at 10 MiB with ten backups (`server.log.1` through `server.log.10`). A record larger
+than the file limit is replaced by a structured size-limit notice. For Robob's installed home,
+the active file is `~/.robob/userdata/logs/server.log`. The desktop's `server-child.log` contains
+failure snapshots only; use the server-owned file for ongoing orchestration logs.
 
 If you want a log message to show up in the trace file, emit it inside an active span with `Effect.log...`. `Logger.tracerLogger` will attach it as a span event.
 
 Configuring a logs endpoint takes over that job. The server then exports log records, which cover
 every message instead of only the ones inside an active span and carry the trace and span ids so
 they still line up with the trace. `Logger.tracerLogger` is dropped in that mode, so the same
-message is not exported twice and the trace file stops carrying log messages. stdout output and
-SSH-managed launch persistence stay unchanged either way.
+message is not exported twice and the trace file stops carrying log messages. stdout output,
+the local log file and SSH-managed launch persistence stay unchanged either way.
 
 ### Traces
 
@@ -116,8 +123,8 @@ on. The span time is when the sample ran, not when the stall happened.
 
 Each stall is also appended as one
 NDJSON line to `event-loop-stalls.ndjson`, next to the trace file. A line has `time` and the span
-attributes. The file keeps the last 1000 or more stalls, with one rotated backup
-(`event-loop-stalls.ndjson.1`). Use it to see how often a server stalls over days.
+attributes. Each file is capped at 256 KiB, with one rotated backup
+(`event-loop-stalls.ndjson.1`). Quiet samples and heap diagnostics share that budget.
 
 Some delay is not recorded:
 
@@ -151,7 +158,7 @@ Provider event NDJSON files still exist for provider runtime streams. Those are 
 
 There are two useful modes:
 
-- local-only: stdout + local `server.trace.ndjson`
+- local-only: stdout + local `server.log` and `server.trace.ndjson`
 - full local observability: stdout + local trace file + OTLP export to Grafana/Tempo/Prometheus
 
 The local trace file is always on. OTLP export is opt-in.

@@ -9,9 +9,22 @@ lines with an explicit `ok`; `errorRate` is the share of error-kind lines.
 The collector reads DiagnosticReports and a filtered `log show`, retaining a
 separate cursor per source so an unavailable source is retried. Its first run
 looks back one hour. Report cursors cover since their last successful read.
-Unified-log queries cover at most the most recent hour; skipped older time is
-explicit in `skippedS`. Queries run in 15-minute chunks, checkpointing the cursor
-after each completed chunk. A failed query retains the unfinished suffix for retry.
+Unified-log windows cover at most the most recent 90 minutes, including retries;
+older time is skipped with exact `skippedS` and reason `lag_ceiling`. Queries start
+with 60 seconds of log and grow after successes. Two successful sizes estimate
+fixed startup cost separately from window work. Queries normally target 10 seconds
+of window work, increasing that target to amortize significant startup cost within
+the command deadline. Queries usually cover at most 15 minutes; startup-dominated
+reads may grow to the 90-minute ceiling. When the budget allows, a nominal-size
+probe checks window cost before a large jump. Accelerating marginal cost keeps
+queries within 15 minutes for the rest of the run. Each completed chunk checkpoints its cursor. A
+failed query retains the unfinished suffix, then continues into a fresh window
+when that suffix finishes. Each command has a 60-second cap including bounded
+process-group cleanup; the unified source shares a 135-second budget.
+`crash.unified.chunk` records requested bounds, elapsed time and outcome;
+`crash.unified.skip` records ceiling skips before advancing the cursor. Positive
+skip records and summaries survive the daily log cap so omitted time stays explicit.
+`crash.collect.stopReason` distinguishes completion, deadline and command failure.
 Boot observations include `observedAt` (Unix seconds) for the boot marker; duplicate
 markers at the same instant count once. Other observations remain aggregated.
 It rolls up yesterday on the first hourly run after 00:05 UTC. It writes only
@@ -26,17 +39,29 @@ stale children get the hourly inventory's remaining time, up to 210 s within
 the collector's 290 s deadline. Crash collection runs first.
 
 A separate `com.abdullah.mac-deep-inventory` LaunchAgent runs daily at 03:30
-local time (Asia/Dubai on this Mac). It visits the four SSD worktree farms first,
-then the other inventory roots, one bounded batch per root turn and oldest
-children first. Missing, partial,
-limited and 24-hour-old entries are eligible. Each command has at most ten
-minutes within a 45-minute pass, under nice 10 and background I/O policy.
-Every completed batch checkpoints the shared state atomically. Termination
-keeps completed rows; unfinished children remain explicit partials.
+local time (Asia/Dubai on this Mac). It starts with the four SSD worktree farms
+and checkpoints the next root to visit, so interrupted passes rotate fairly.
+Cheap batches can share a turn; known timeouts follow healthy discovery and
+refresh work after one early parts turn. Ordinary children that will expire
+during the pass are refreshed before more parts work can crowd them out.
+Unknown children get a 15-second probe; a batch deadline falls
+back to individual probes. A timed-out child is split into immediate entries,
+with each completed part checkpointed and at most ten minutes per child per
+pass. Checkpointed parts and their parent have a 72-hour freshness window so
+three nightly passes can finish a child. Ordinary children keep 24 hours.
+The child has no total until its listing and every part are complete and
+fresh; the total retains the oldest part's timestamp. At expiry it becomes
+partial with no total again. Its own directory allocation is included.
+Parts do not recurse. The hourly scanner leaves parts parents and recent
+timeouts to this pass.
+The daily budget is 90 minutes; du runs under nice 10
+and utility scheduling without inherited launchd background I/O policy.
+Termination keeps completed rows; unfinished children remain explicit partials.
 Both entry points acquire `state/disk-inventory.lock` non-blocking. A busy
 daily pass exits cleanly; a busy hourly scan logs `skipReason=deep_pass_running`
 and cached totals while crash collection continues. `disk.deep.start`,
-`disk.deep.root` and `disk.deep.end` record coverage, ages and stop reason.
+`disk.deep.root`, `disk.deep.parts` and `disk.deep.end` record coverage, ages,
+timeout time, parts progress, the parts freshness window and stop reason.
 `childrenRemaining` counts known eligible children; `rootsPartial` on pass
 summaries counts roots whose listing was unavailable, so zero remaining with
 unlisted roots is not complete coverage. All totals count hardlink occurrences,
@@ -171,6 +196,11 @@ exit code is available), and `elapsedMs`. Budget-exhausted roots get their own
 timeout line without launching another command. Confirmed missing inventory
 paths retain a zero total without a source error.
 
+`disk.inventory` also reports `rootsOk`, `rootsPartial`, `rootsTimeout`,
+`rootsDenied` and `scanMs`. Timeout/denial counts include affected children and
+can overlap the partial count. Daily `diskInventory` rollups sum those counts
+and scan time across `scans`; lock-skipped hourly runs are excluded.
+
 Only these source errors accept a diagnostic `error.message`: the first stderr
 or filesystem-error line, trimmed to 300 characters with credential-like text
 redacted. No du stdout, unified log messages, report contents or arbitrary
@@ -185,7 +215,11 @@ only readable entries; permission grants remain an owner action.
 
 Big roots emit child source events with `bytes`, `exitCode`, `elapsedMs`,
 `partial`, and `deniedCount`, plus a root aggregate with `completedCount` and
-`failedCount`. Child timeouts/errors remain named source errors. An incomplete
+`failedCount`. `deniedCount` sums only explicit numeric permission-denial counts.
+Root aggregates also report `partialChildCount`: cached children without a valid
+numeric denial count whose `partial` flag is true or unknown. An explicit zero
+denial count does not contribute to `partialChildCount`. Both counts preserve
+the root's existing `partial` flag. Child timeouts/errors remain named source errors. An incomplete
 root emits an error with `failure=partial`, `partial=true`, and the available
 children's `bytes`. The aggregate includes only recorded child measurements. `failedCount` includes one additional
 incomplete remainder when the root deadline stops enumeration; it is not a
@@ -194,7 +228,12 @@ hard links across children and excludes the root directory's own blocks.
 Root attempts rotate oldest first, with never-attempted roots ahead of measured
 ones. Budget-skipped roots retain their place; full failed attempts rotate too.
 Shortened failed attempts keep priority for a full allowance on the next run.
-`disk.inventory.turn` identifies each attempted root's `source` and `turn`.
+`disk.inventory.root` summarizes each root once per run, including `deniedCount`
+and `partialChildCount`. Detailed child sizes stay
+in `state/disk-inventory.json` (`childState`); successful child lines are retained
+only for changes of at least 1 GiB or 20%, new children of at least 1 GiB,
+or measurements taking at least ten seconds. Partial and error diagnostics
+are always retained.
 Child attempts rotate the same way. A failed child retains its last good size
 and timestamp in `childState`; missing, stale or unreadable children keep the
 root partial. `cachedCount` and `ageS` describe retained measurements.
@@ -207,24 +246,19 @@ scan coverage cannot become a reported grower.
 `disk.sample` reports success when its own measurements succeed; cached inventory
 errors or staleness are metadata rather than sample failures. Its `sourceErrors`
 still counts failures of its own free-space and existing-file stat measurements.
-Confirmed missing optional database/WAL files retain zero sizes. The filtered unified-log query
-has a one-hour maximum window, split into contiguous 15-minute chunks under a
-shared 135 s budget, allowing four chunks at the observed 30 s cost plus headroom.
-Each command has at most 60 s, shortened to that shared
-budget and the collector's remaining absolute budget. Its source event/error and
-`crash.collect` record `windowStart` and `windowEnd` (Unix seconds), `windowS`,
-`skippedS` (older time omitted by the cap), `chunks` (planned for this attempt),
-and `chunksDone`. Each completed chunk emits its observations and saves its cursor
-before the next command. The next chunk excludes that cursor's instant, including
-when log's second rounding/end padding returns overlapping rows. Missing or invalid
-event timestamps fail the chunk rather than risk attributing events twice.
-On failure, `unifiedRetry` retains the exact unfinished suffix until it succeeds;
-completed chunks are not queried again. An old one-hour retry is split the same
-way. Chunk checkpoints retain unreported `skippedS`, including after the final
-chunk, so interruption before the source result cannot hide a coverage gap.
-Once the source result reports the gap, a retained suffix clears that metadata.
-After a delayed retry completes, the next run applies the recent-hour cap
-again and reports any omitted older time in `skippedS`.
+Confirmed missing optional database/WAL files retain zero sizes. Unified source
+results and `crash.collect` retain `windowStart`, `windowEnd` (Unix seconds),
+`windowS`, `skippedS`, `chunks` and `chunksDone`. With adaptive sizing, `chunks`
+estimates the total using the current chunk size; on completion it equals
+`chunksDone`. Chunk bounds exclude the previous cursor even when log's second
+rounding/end padding returns overlapping rows. Missing or invalid event
+timestamps fail the chunk rather than risk attributing events twice.
+Retry checkpoints retain unreported `skippedS`, including after the final chunk,
+so interruption before the source result cannot hide a coverage gap. Once the
+source result reports the gap, a retained suffix clears that metadata. Retries
+older than the moving 90-minute ceiling log the exact additional skip before
+checkpointing that ceiling; a retry inside it preserves its frozen end. Finishing
+a retry continues into a fresh window within the same run's remaining budget.
 
 Report sources have independent checkpoints. Each attempt allows up to 10 s per
 source, capped by the collector's absolute deadline. Directory enumeration,
@@ -279,24 +313,42 @@ storagekitd and `diskutil list` improved from an 8 s timeout to 0.04–0.74 s.
 
 ## Processes stuck in disk wait
 
-Each hourly run emits `proc.disk_wait` from a read-only, 10 s-bounded
-`ps -axo pid,ppid,etime,stat,comm,args`. It counts processes observed in
-`U` with a process age of at least ten minutes, retaining the ten oldest
-(`pid`, `ppid`, `ageS`, `stat`, `comm`, `args`). Arguments are limited
-to 300 characters, with credential-like values redacted; no environment
-is logged. `stuckUnmount` and `mountPoint` flag an unmount among all matches,
-even if it is outside the ten retained entries. A failed ps records an error
-without stopping the other collector sources.
+`disk.clone_wedge` also records U-state `cp -c`/`clonefile` commands of any
+age, and groups of U processes naming the same absolute path in three
+one-second samples. Both must remain in U in every sample; CPU may advance.
+It records PID, process age, path, CPU delta and wait
+channel (`-` when macOS hides it). The probe uses only `ps`, never pathname
+lookups. Argument parsing is best effort: `ps` does not preserve argv quoting,
+so ambiguous pathname fragments, quotes and escapes do not establish
+shared-path identity. Clone commands with ambiguous operands still qualify
+under their own PID identity.
+Umount is excluded and remains covered by `proc.disk_wait`.
+One Telegram alert per PID/start incident uses the existing notify helper;
+shared-path waiters alert together, and failed sends retry frozen text/key.
+This is an I/O workload signal: CPU or device progress can mean slow APFS
+extent copying, so the alert does not diagnose deadlock or recommend a kill.
+The clone probe shares the disk-wait budget, with its own 20 s ceiling.
 
-Process age is not time continuously spent in U: this is an hourly observation,
-and an old process can be caught during normal I/O. An umount aged at least
-30 minutes, or another process aged at least six hours, triggers one Telegram
-attention alert per PID/start time. A bounded ps start-time lookup prevents
-PID reuse from suppressing a new incident. Failed notifications retry with
-the same key and frozen text; they never fail collection. The shared 45 s disk-wait
-budget defers remaining alerts to the next run when notifications are slow.
-Daily `diskWait` rollups give runs with matches, maximum process age, and
-the latest stuck-unmount mount point.
+Each hourly run selects processes in `U` aged at least ten minutes, then
+samples their state and cumulative CPU time six times, one second apart.
+Only `U` in every sample with no CPU progress counts as stuck. Processes
+that leave `U` or use CPU appear in `busy`, for information only, with no
+alerts. Vanished PIDs are dropped. Calls are bounded to ten seconds within
+a shared 45 s budget; a partial observation needs at least three samples
+to classify a stall. Failed sources never stop the rest of collection.
+
+`processAgeS` is uptime. `stuckForS` is a lower bound from the first consecutive
+hourly stuck observation, reset by recovery, CPU progress or PID reuse.
+For umount, it includes process age because unmounting is its only task.
+Alerts use `stuckForS`: thirty minutes for umount, six hours otherwise.
+Each PID/start time alerts once; failures retry the same frozen text and key.
+The event retains ten stuck and ten busy processes, six state samples each,
+and at most 300 characters of arguments, with credential-like text redacted.
+`stuckUnmount` and `mountPoint` cover all stuck matches, including omitted rows.
+
+Daily `diskWait` rollups report stuck runs, maximum `stuckForS`, the latest
+stuck-unmount mount point, busy runs and five top busy command names.
+Old lines still count; their uptime maximum is kept as `legacyMaxProcessAgeS`.
 
 A kernel-stuck unmount can block the stat child of plain lsof, even for an
 unrelated APFS file, and may also affect diskutil. While a U-state umount

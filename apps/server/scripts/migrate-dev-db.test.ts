@@ -7,6 +7,13 @@ import * as SqlClient from "effect/sql/SqlClient";
 
 import { runMigrations } from "../src/persistence/Migrations.ts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as Sqlite from "../src/persistence/Sqlite.ts";
+import { initializeHistoryArchive } from "../src/ardud/persistence/HistoryArchive.ts";
+import {
+  archiveFilename,
+  HISTORY_TABLES,
+  liveColumns,
+} from "../src/ardud/persistence/historyArchiveSql.ts";
 import { runMigrateDevDb } from "./migrate-dev-db.ts";
 
 const withDatabase = <A, E>(
@@ -87,7 +94,375 @@ const createFixtureSource = Effect.fn("createMigrateDevDbFixtureSource")(functio
   return databasePath;
 });
 
+const addColdHistory = Effect.fn("addMigrateDevDbColdHistory")(function* (
+  source: string,
+  mode: "archive" | "base" | "archive-and-base",
+) {
+  const path = yield* Path.Path;
+  const basePath = path.join(path.dirname(source), "statev2.pre-shrink-fixture.sqlite");
+  yield* withDatabase(
+    source,
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* initializeHistoryArchive();
+      yield* sql`INSERT INTO orchestration_v2_projection_turn_items
+      (turn_item_id, thread_id, ordinal, type, status, updated_at, payload_json)
+      VALUES ('hot-item', 'stopped-thread', 1, 'assistant_message', 'completed', '2026-08-01', '{"source":"hot"}'),
+        ('shadowed-item', 'settled-thread', 2, 'assistant_message', 'completed', '2026-08-01', '{"source":"hot"}')`;
+      yield* sql`INSERT INTO orchestration_events
+      (sequence, event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at, actor_kind, payload_json, metadata_json)
+      VALUES (100, 'hot-event', 'thread', 'stopped-thread', 1, 'thread.metadata-updated', '2026-08-01', 'server', '{"source":"hot"}', '{}'),
+        (400, 'shadowed-event', 'thread', 'settled-thread', 1, 'thread.metadata-updated', '2026-08-01', 'server', '{"source":"hot"}', '{}')`;
+      if (mode !== "archive") {
+        yield* sql`ATTACH DATABASE ${basePath} AS fixture_base`;
+        for (const table of HISTORY_TABLES) {
+          yield* sql.unsafe(
+            `CREATE TABLE fixture_base.${table.live} AS SELECT ${liveColumns(table.live)} FROM main.${table.live} WHERE 0`,
+          );
+        }
+        yield* sql`CREATE TABLE ardud_history_base_archive (filename TEXT NOT NULL)`;
+        yield* sql`INSERT INTO ardud_history_base_archive VALUES ('statev2.pre-shrink-fixture.sqlite')`;
+      }
+      for (const [store, offset] of [
+        ["archive", 600],
+        ["base", 900],
+      ] as const) {
+        if (mode !== store && mode !== "archive-and-base") continue;
+        const schema = store === "archive" ? "ardud_archive" : "fixture_base";
+        const events = store === "archive" ? "ardud_events" : "orchestration_events";
+        const items =
+          store === "archive" ? "ardud_turn_items" : "orchestration_v2_projection_turn_items";
+        const eventColumns = liveColumns("orchestration_events");
+        const itemColumns = liveColumns("orchestration_v2_projection_turn_items");
+        yield* sql.unsafe(
+          `INSERT INTO ${schema}.${events} (${eventColumns}) SELECT ${eventColumns} FROM main.orchestration_events WHERE sequence IN (100, 400)`,
+        );
+        yield* sql.unsafe(
+          `UPDATE ${schema}.${events} SET stream_id = 'stopped-thread' WHERE sequence = 400`,
+        );
+        yield* sql.unsafe(
+          `UPDATE ${schema}.${events} SET payload_json = '{"source":"stale"}' WHERE sequence = 100`,
+        );
+        yield* sql.unsafe(
+          `INSERT INTO ${schema}.${items} (${itemColumns}) SELECT ${itemColumns} FROM main.orchestration_v2_projection_turn_items`,
+        );
+        yield* sql.unsafe(
+          `UPDATE ${schema}.${items} SET payload_json = '{"source":"stale"}', thread_id = 'stopped-thread'`,
+        );
+        for (const [suffix, thread] of [
+          ["kept", "stopped-thread"],
+          ["dropped", "settled-thread"],
+          ["running", "running-thread"],
+        ] as const) {
+          const sequence = offset + (suffix === "kept" ? 0 : suffix === "dropped" ? 1 : 2);
+          yield* sql`INSERT INTO ${sql(`${schema}.${events}`)}
+          (sequence, event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at, actor_kind, payload_json, metadata_json, application_event_version)
+          VALUES (${sequence}, ${`${store}-${suffix}`}, 'thread', ${thread}, ${offset}, 'thread.metadata-updated', '2026-08-01', 'server', ${JSON.stringify({ source: store })}, '{}', 2)`;
+          yield* sql`INSERT INTO ${sql(`${schema}.${items}`)}
+          (turn_item_id, thread_id, ordinal, type, status, updated_at, payload_json)
+          VALUES (${`${store}-${suffix}`}, ${thread}, ${offset}, 'assistant_message', 'completed', '2026-08-01', ${JSON.stringify({ source: store })})`;
+        }
+        yield* sql`INSERT INTO ${sql(`${schema}.${events}`)}
+        (sequence, event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at, actor_kind, payload_json, metadata_json, application_event_version)
+        VALUES (${offset + 3}, ${`${store}-global`}, 'system', 'global', ${offset}, 'server.updated', '2026-08-01', 'server', ${JSON.stringify({ source: store })}, '{}', 2)`;
+      }
+      if (mode === "archive-and-base") {
+        yield* sql.unsafe(
+          `INSERT INTO fixture_base.orchestration_events SELECT ${liveColumns("orchestration_events")} FROM ardud_archive.ardud_events WHERE sequence = 600`,
+        );
+        yield* sql`UPDATE fixture_base.orchestration_events SET payload_json = '{"source":"stale"}' WHERE sequence = 600`;
+        yield* sql.unsafe(
+          `INSERT INTO fixture_base.orchestration_v2_projection_turn_items SELECT ${liveColumns("orchestration_v2_projection_turn_items")} FROM ardud_archive.ardud_turn_items WHERE turn_item_id = 'archive-kept'`,
+        );
+        yield* sql`UPDATE fixture_base.orchestration_v2_projection_turn_items SET payload_json = '{"source":"stale"}' WHERE turn_item_id = 'archive-kept'`;
+      }
+      yield* sql`INSERT INTO ardud_history_archive_state VALUES (1, 1)`;
+      yield* sql`INSERT INTO ardud_history_archive_cursor VALUES (1, 'stopped-thread')`;
+      yield* sql`INSERT INTO ardud_history_archive_progress (thread_id) VALUES ('stopped-thread')`;
+      yield* sql`INSERT INTO ardud_history_archive_deletions (table_name, row_key, through_event_sequence, archived_at)
+      VALUES ('orchestration_v2_projection_turn_items', 'old', 100, '2026-08-01')`;
+      yield* sql`UPDATE ardud_shell_item_count_state SET base = 'old-base.sqlite'`;
+      yield* sql`UPDATE ardud_shell_item_counts SET item_count = 999`;
+    }),
+  );
+});
+
 it.layer(NodeServices.layer)("migrate-dev-db", (it) => {
+  it.effect("reseeds a hot-only destination without retaining its old turn items", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const sourceDir = yield* fs.makeTempDirectoryScoped({
+        prefix: "migrate-dev-db-hot-reseed-src-",
+      });
+      const destDir = yield* fs.makeTempDirectoryScoped({
+        prefix: "migrate-dev-db-hot-reseed-dest-",
+      });
+      const source = yield* createFixtureSource(sourceDir);
+      const destination = yield* createFixtureSource(destDir);
+      yield* withDatabase(
+        destination,
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`INSERT INTO orchestration_v2_projection_turn_items
+          (turn_item_id, thread_id, ordinal, type, status, updated_at, payload_json)
+          VALUES ('previous-item', 'stopped-thread', 1, 'assistant_message', 'completed', '2026-08-01', '{}')`;
+        }),
+      );
+      const result = yield* runMigrateDevDb(
+        { baseDir: destDir, source, projects: 5, threadsPerProject: 1 },
+        { sharedHome: sourceDir },
+      );
+      assert.equal(result.databasePath, destination);
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        assert.deepStrictEqual(yield* sql`SELECT turn_item_id FROM ardud_history_turn_items`, []);
+      }).pipe(Effect.provide(Sqlite.layerFromPath(destination)));
+    }),
+  );
+
+  it.effect.each(["paired", "orphaned"] as const)(
+    "rejects reseeding with a %s destination archive and preserves its cold history",
+    (kind) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const sourceDir = yield* fs.makeTempDirectoryScoped({
+          prefix: "migrate-dev-db-reseed-src-",
+        });
+        const destDir = yield* fs.makeTempDirectoryScoped({
+          prefix: "migrate-dev-db-reseed-dest-",
+        });
+        const source = yield* createFixtureSource(sourceDir);
+        const destination = yield* createFixtureSource(destDir);
+        yield* addColdHistory(destination, "archive");
+        const archivePath = archiveFilename(destination);
+        const sourceBefore = yield* fs.readFile(source);
+        const destinationBefore = yield* fs.readFile(destination);
+        const archiveBefore = yield* fs.readFile(archivePath);
+        if (kind === "orphaned") yield* fs.remove(destination);
+
+        const error = yield* runMigrateDevDb(
+          { baseDir: destDir, source, projects: 5, threadsPerProject: 1 },
+          { sharedHome: sourceDir },
+        ).pipe(Effect.flip);
+        assert.equal(error._tag, "MigrateDevDbDestinationArchiveError");
+        if (error._tag === "MigrateDevDbDestinationArchiveError") {
+          assert.equal(error.databasePath, destination);
+          assert.equal(error.archivePath, archivePath);
+          assert.include(error.message, "new --base-dir");
+        }
+        assert.deepStrictEqual(yield* fs.readFile(source), sourceBefore);
+        assert.deepStrictEqual(yield* fs.readFile(archivePath), archiveBefore);
+        assert.isFalse(yield* fs.exists(`${destination}.migrate-dev-db-tmp`));
+        if (kind === "orphaned") {
+          assert.isFalse(yield* fs.exists(destination));
+        } else {
+          assert.deepStrictEqual(yield* fs.readFile(destination), destinationBefore);
+          yield* Effect.gen(function* () {
+            const sql = yield* SqlClient.SqlClient;
+            const items = yield* sql<{
+              turn_item_id: string;
+            }>`SELECT turn_item_id FROM ardud_history_turn_items ORDER BY turn_item_id`;
+            assert.deepStrictEqual(
+              items.map((row) => row.turn_item_id),
+              ["archive-dropped", "archive-kept", "archive-running", "hot-item", "shadowed-item"],
+            );
+          }).pipe(Effect.provide(Sqlite.layerFromPath(destination)));
+        }
+      }),
+  );
+
+  it.effect.each([
+    { suffix: "-wal", duringCopy: false },
+    { suffix: "-shm", duringCopy: false },
+    { suffix: "", duringCopy: true },
+    { suffix: "-wal", duringCopy: true },
+    { suffix: "-shm", duringCopy: true },
+  ])(
+    "rejects destination history file %j before replacing its database",
+    ({ suffix, duringCopy }) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const sourceDir = yield* fs.makeTempDirectoryScoped({
+          prefix: "migrate-dev-db-sidecar-src-",
+        });
+        const destDir = yield* fs.makeTempDirectoryScoped({
+          prefix: "migrate-dev-db-sidecar-dest-",
+        });
+        const source = yield* createFixtureSource(sourceDir);
+        const destination = yield* createFixtureSource(destDir);
+        const archivePath = archiveFilename(destination);
+        const historyPath = `${archivePath}${suffix}`;
+        const destinationBefore = yield* fs.readFile(destination);
+        if (!duringCopy) yield* fs.writeFileString(historyPath, "previous archive sidecar");
+        let checkedArchive = false;
+        const files = FileSystem.FileSystem.of({
+          ...fs,
+          exists: Effect.fn("lateDestinationArchive.exists")(function* (filename: string) {
+            if (duringCopy && filename === archivePath) {
+              if (checkedArchive) yield* fs.writeFileString(historyPath, "late archive file");
+              checkedArchive = true;
+            }
+            return yield* fs.exists(filename);
+          }),
+        });
+        const error = yield* runMigrateDevDb(
+          { baseDir: destDir, source, projects: 5, threadsPerProject: 1 },
+          { sharedHome: sourceDir },
+        ).pipe(Effect.provideService(FileSystem.FileSystem, files), Effect.flip);
+        assert.equal(error._tag, "MigrateDevDbDestinationArchiveError");
+        if (error._tag === "MigrateDevDbDestinationArchiveError")
+          assert.equal(error.archivePath, historyPath);
+        assert.deepStrictEqual(yield* fs.readFile(destination), destinationBefore);
+        assert.equal(
+          yield* fs.readFileString(historyPath),
+          duringCopy ? "late archive file" : "previous archive sidecar",
+        );
+        assert.isFalse(yield* fs.exists(`${destination}.migrate-dev-db-tmp`));
+      }),
+  );
+
+  it.effect.each(["archive", "base", "archive-and-base"] as const)(
+    "materializes %s history and opens through the server SQLite layer",
+    (mode) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const sourceDir = yield* fs.makeTempDirectoryScoped({ prefix: "migrate-dev-db-history-" });
+        const destDir = yield* fs.makeTempDirectoryScoped({
+          prefix: "migrate-dev-db-history-dest-",
+        });
+        const source = yield* createFixtureSource(sourceDir);
+        yield* addColdHistory(source, mode);
+        const before = yield* fs.readFile(source);
+        const result = yield* runMigrateDevDb(
+          { baseDir: destDir, source, projects: 5, threadsPerProject: 1 },
+          { sharedHome: sourceDir },
+        );
+        assert.deepStrictEqual(yield* fs.readFile(source), before);
+        assert.isFalse(yield* fs.exists(archiveFilename(result.databasePath)));
+        yield* withDatabase(
+          result.databasePath,
+          Effect.gen(function* () {
+            const sql = yield* SqlClient.SqlClient;
+            for (const name of [
+              "ardud_history_archive_identity",
+              "ardud_history_archive_state",
+              "ardud_history_base_archive",
+              "ardud_history_archive_cursor",
+              "ardud_history_archive_progress",
+              "ardud_history_archive_deletions",
+              "ardud_shell_item_count_state",
+              "ardud_shell_item_counts",
+            ]) {
+              const exists = yield* sql`SELECT 1 FROM sqlite_master WHERE name = ${name}`;
+              if (exists.length > 0)
+                assert.deepStrictEqual(yield* sql`SELECT * FROM ${sql(name)}`, []);
+            }
+          }),
+        );
+        const stores = mode === "archive-and-base" ? ["archive", "base"] : [mode];
+        yield* Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          assert.deepStrictEqual(
+            yield* sql`SELECT payload_json FROM ardud_history_events WHERE sequence = 100`,
+            [{ payload_json: '{"source":"hot"}' }],
+          );
+          const items = yield* sql<{
+            turn_item_id: string;
+            payload_json: string;
+          }>`SELECT turn_item_id, payload_json FROM ardud_history_turn_items ORDER BY turn_item_id`;
+          assert.deepStrictEqual(items, [
+            ...stores.map((store) => ({
+              turn_item_id: `${store}-kept`,
+              payload_json: JSON.stringify({ source: store }),
+            })),
+            { turn_item_id: "hot-item", payload_json: '{"source":"hot"}' },
+          ]);
+          const events = yield* sql<{
+            event_id: string;
+            payload_json: string;
+          }>`SELECT event_id, payload_json FROM ardud_history_events WHERE sequence > 100 ORDER BY sequence`;
+          assert.deepStrictEqual(
+            events,
+            stores.flatMap((store) => [
+              { event_id: `${store}-kept`, payload_json: JSON.stringify({ source: store }) },
+              { event_id: `${store}-global`, payload_json: JSON.stringify({ source: store }) },
+            ]),
+          );
+          const [sequence] = yield* sql<{
+            seq: number;
+            max: number;
+          }>`SELECT seq, (SELECT MAX(sequence) FROM orchestration_events) AS max FROM sqlite_sequence WHERE name = 'orchestration_events'`;
+          assert.isAtLeast(sequence!.seq, sequence!.max);
+          const [appended] = yield* sql<{ sequence: number }>`INSERT INTO orchestration_events
+          (event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at, actor_kind, payload_json, metadata_json)
+          VALUES ('appended', 'thread', 'stopped-thread', 999, 'thread.metadata-updated', '2026-08-01', 'server', '{}', '{}') RETURNING sequence`;
+          assert.isAbove(appended!.sequence, sequence!.max);
+          assert.isAbove(appended!.sequence, 400);
+          assert.deepStrictEqual(
+            yield* sql`SELECT item_count FROM ardud_shell_item_counts WHERE thread_id = 'stopped-thread'`,
+            [{ item_count: stores.length + 1 }],
+          );
+        }).pipe(Effect.provide(Sqlite.layerFromPath(result.databasePath)));
+      }),
+  );
+
+  it.effect.each(["missing", "identity-mismatch", "missing-base", "unsafe-base"] as const)(
+    "rejects %s history without publishing a destination",
+    (kind) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const sourceDir = yield* fs.makeTempDirectoryScoped({
+          prefix: "migrate-dev-db-broken-history-",
+        });
+        const destDir = yield* fs.makeTempDirectoryScoped({
+          prefix: "migrate-dev-db-broken-history-dest-",
+        });
+        const source = yield* createFixtureSource(sourceDir);
+        const archivePath = archiveFilename(source);
+        let expectedPath = archivePath;
+        if (kind === "identity-mismatch") {
+          yield* addColdHistory(source, "archive");
+          yield* withDatabase(
+            archivePath,
+            Effect.gen(function* () {
+              const sql = yield* SqlClient.SqlClient;
+              yield* sql`UPDATE ardud_identity SET identity = 'different'`;
+            }),
+          );
+        } else {
+          yield* withDatabase(
+            source,
+            Effect.gen(function* () {
+              const sql = yield* SqlClient.SqlClient;
+              if (kind === "missing") {
+                yield* sql`CREATE TABLE ardud_history_archive_state (singleton INTEGER PRIMARY KEY, has_cold_rows INTEGER)`;
+                yield* sql`INSERT INTO ardud_history_archive_state VALUES (1, 1)`;
+              } else {
+                yield* sql`CREATE TABLE ardud_history_base_archive (filename TEXT)`;
+                yield* sql`INSERT INTO ardud_history_base_archive VALUES (${kind === "unsafe-base" ? "../statev2.pre-shrink-outside.sqlite" : "statev2.pre-shrink-missing.sqlite"})`;
+              }
+            }),
+          );
+          if (kind === "missing-base")
+            expectedPath = path.join(path.dirname(source), "statev2.pre-shrink-missing.sqlite");
+          if (kind === "unsafe-base") expectedPath = source;
+        }
+        const error = yield* runMigrateDevDb(
+          { baseDir: destDir, source, projects: 5, threadsPerProject: 1 },
+          { sharedHome: sourceDir },
+        ).pipe(Effect.flip);
+        assert.equal(error._tag, "MigrateDevDbHistoryArchiveError");
+        if (error._tag === "MigrateDevDbHistoryArchiveError") {
+          assert.equal(error.archivePath, expectedPath);
+          assert.include(error.message, expectedPath);
+        }
+        const destination = path.join(destDir, "userdata", "statev2.sqlite");
+        assert.isFalse(yield* fs.exists(destination));
+        assert.isFalse(yield* fs.exists(`${destination}.migrate-dev-db-tmp`));
+      }),
+  );
+
   it.effect.each(["zero-byte", "no tables"] as const)(
     "rejects a %s source without replacing the destination",
     (kind) =>

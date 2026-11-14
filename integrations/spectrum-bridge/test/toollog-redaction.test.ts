@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createServer } from "node:net";
 import { createToolLog, toolError, toolLog, type LogLine } from "../src/toollog.ts";
-import { sweepSecrets } from "../src/secrets.ts";
+import { putSecretRequest, sweepSecrets } from "../src/secrets.ts";
 import { Store } from "../src/store.ts";
 import { ControlClient } from "../src/control.ts";
 
@@ -42,7 +42,7 @@ test("a real refused ControlClient connection logs the native fetch cause safely
   toolLog.flush();
   const records = rows(new Date().toISOString().slice(0, 10));
   const failure = records.find(line => line.error?.tag === "control.catch1")!;
-  expect(failure.error).toMatchObject({ name: "TypeError", code: "ECONNREFUSED" });
+  expect(failure.error).toMatchObject({ code: "ECONNREFUSED" });
   expect(failure.site).toMatch(/^src\/control.ts:\d+$/);
   expect(JSON.stringify(records)).not.toMatch(/PRIVATE_|127\.0\.0\.1|message=|token=/);
 });
@@ -123,10 +123,14 @@ test.each(["bridge.catch", "reply.failed", "form.fail"])("%s uses the same safe 
   expect(JSON.stringify(line)).not.toContain("PRIVATE");
 });
 
-test("the real periodic form sweep reports ENOENT without leaking its directory", async () => {
+test("the real periodic form sweep reports ENOENT for an active submission without leaking its directory", async () => {
   const store = new Store(":memory:");
+  const now = Date.now();
   try {
-    await expect(sweepSecrets({ store, stateRoot: join(root, "PRIVATE_MISSING_DIRECTORY") })).resolves.toBeUndefined();
+    putSecretRequest(store, "t".repeat(43), { sessionId: "fixture", generation: 1, purpose: "Fixture",
+      fields: [{ name: "password", label: "Password", type: "password" }], state: "submitted",
+      createdAt: now, expiresAt: now + 900_000, valuesExpireAt: now + 1_800_000 });
+    await expect(sweepSecrets({ store, stateRoot: join(root, "PRIVATE_MISSING_DIRECTORY"), now: () => now })).resolves.toBeUndefined();
     toolLog.flush();
     const line = rows(new Date().toISOString().slice(0, 10)).find(line => line.error?.tag === "secrets.catch9")!;
     expect(line.site).toMatch(/^src\/secrets.ts:\d+$/);

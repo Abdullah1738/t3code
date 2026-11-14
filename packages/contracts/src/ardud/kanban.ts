@@ -138,7 +138,27 @@ export const KanbanSubtask = Schema.Struct({
   text: Schema.String,
   owner: KanbanSubtaskOwner,
   gate: Schema.optional(Schema.Literals(["deploy", "money", "secret"])),
+  gateSource: Schema.optional(Schema.Literals(["guessed", "set"])),
+  gateCleared: Schema.optional(
+    Schema.Struct({
+      gate: Schema.Literals(["deploy", "money", "secret"]),
+      reason: Schema.String,
+      by: KanbanActor,
+      at: IsoDateTime,
+      text: Schema.String,
+    }),
+  ),
+  gateSkipped: Schema.optional(
+    Schema.Struct({
+      gate: Schema.Literals(["deploy", "money", "secret"]),
+      reason: Schema.String,
+      by: KanbanActor,
+      at: IsoDateTime,
+      text: Schema.String,
+    }),
+  ),
   ownerOnly: Schema.optional(Schema.Boolean),
+  interrupting: Schema.optional(Schema.Boolean),
   createdAt: Schema.optional(IsoDateTime),
   /** For a script's subtask: the name of the board script that does it. Absent: any script on the card's board. */
   script: Schema.optional(Schema.String),
@@ -1304,22 +1324,15 @@ export const kanbanScriptStep = (card: Pick<KanbanCard, "subtasks">): boolean =>
 
 /**
  * Unplanned cards retain the legacy workflow. Planned work uses the same open
- * step as subtask_done; a note never grants work on a later step. Findings
- * leave the review subtask open, so that review-only step is the one exception.
- * Its durable verdict bit survives note consumption, retries and fresh threads;
+ * step as subtask_done. Pending review findings are worker work on any step.
+ * The durable verdict bit survives note consumption, retries and fresh threads;
  * notes alone never grant eligibility; older verdicts are upgraded by the server.
  */
 export const kanbanWorkStep = (
   card: Pick<KanbanCard, "wakeNote" | "subtasks" | "reviewFindingsPending">,
 ): boolean => {
   if (card.subtasks.length === 0) return true;
-  const open = kanbanStepSubtasks(card);
-  return (
-    open.some((subtask) => subtask.owner === "work") ||
-    (open.length > 0 &&
-      open.every((subtask) => subtask.owner === "review") &&
-      card.reviewFindingsPending === true)
-  );
+  return card.reviewFindingsPending === true || kanbanStepSubtasks(card, "work").length > 0;
 };
 
 /** A todo card whose current step cannot be assigned to a worker. */
@@ -2039,6 +2052,9 @@ export type KanbanNightlyReview = typeof KanbanNightlyReview.Type;
 export const KanbanStandingApproval = Schema.Struct({
   id: TrimmedNonEmptyString,
   gate: Schema.Literal("deploy"),
+  minIntervalHours: Schema.optional(Schema.Number).pipe(
+    Schema.withDecodingDefault(Effect.succeed(4)),
+  ),
   quote: TrimmedNonEmptyString,
   sourceThreadId: TrimmedNonEmptyString,
   saidAt: IsoDateTime,
@@ -2050,6 +2066,17 @@ export const KanbanStandingApproval = Schema.Struct({
   revokeReason: Schema.NullOr(Schema.String),
 });
 export type KanbanStandingApproval = typeof KanbanStandingApproval.Type;
+
+export const KanbanRelease = Schema.Struct({
+  boardId: KanbanBoardId,
+  cardId: KanbanCardId,
+  cardNumber: Schema.Number,
+  subtaskId: TrimmedNonEmptyString,
+  at: IsoDateTime,
+  critical: Schema.NullOr(Schema.String),
+  approvalId: Schema.NullOr(TrimmedNonEmptyString),
+});
+export type KanbanRelease = typeof KanbanRelease.Type;
 
 export const KanbanBoard = Schema.Struct({
   id: KanbanBoardId,
@@ -2067,6 +2094,9 @@ export const KanbanBoard = Schema.Struct({
   reviewChains: Schema.Array(KanbanReviewChain),
   defaultReviewChain: Schema.NullOr(TrimmedNonEmptyString),
   guessedGates: Schema.optional(Schema.Array(Schema.Literals(["deploy", "money", "secret"]))),
+  releaseLedger: Schema.optional(Schema.Array(KanbanRelease)).pipe(
+    Schema.withDecodingDefault(Effect.succeed([])),
+  ),
   standingApprovals: Schema.Array(KanbanStandingApproval).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),
   ),

@@ -807,6 +807,8 @@ def _catch_up_finished(con, run_id, budget: float = 10) -> None:
 
 
 def _incomplete_log(r, result) -> None:
+    if r['status'] == 'source_gone':
+        return
     settled = r['status'] not in ('starting', 'running')
     p = LOGS_DIR / f"{r['run_id']}.log"
     size = p.stat().st_size if p.exists() else 0
@@ -840,6 +842,9 @@ def _refresh_running_ttl(r, until=None) -> None:
 
 
 def _validated_step_row(r, code):
+    import offbox_disk_space
+    if dict(r).get('mode') != 'local' and offbox_disk_space.result(LOGS_DIR / f"{r['run_id']}.log", code).get('infra_failure'):
+        return dict(r, status='infra', exit_code=code)
     from .runs import planned_steps
     if not planned_steps(r):
         return r
@@ -896,6 +901,9 @@ def _report_never_started(r) -> int:
 def logs(run_id: str, do_follow: bool) -> int:
     r = _run_row(run_id)
     _require_my_run(r)
+    if r['status'] == 'source_gone':
+        say(r['error'])
+        return 2
     if r['status'] == 'forwarded':
         return _follow_forwarded(r, 'logs', follow=do_follow)
     if _never_started(r):
@@ -939,6 +947,12 @@ def logs(run_id: str, do_follow: bool) -> int:
     if code is None:
         from .run_evidence import report
         report(dict(r), p)
+    from .runs import space_result
+    effective = space_result(r['run_id'], code, p, report=True)
+    import offbox_disk_space
+    if (offbox_disk_space.result(p, code).get('infra_failure') or
+            read_json(LOGS_DIR / f"{r['run_id']}.state.json", {}).get('infra_failure')):
+        return EXIT_INFRA
     if planned_steps(r) and code is None:
         return EXIT_INFRA
     if r['mode'] == 'bg' and not _has_data(p):
@@ -959,6 +973,9 @@ def wait(run_id: str, timeout: float | None) -> int:
 
 
 def _settled(r, echo=False, pos=0, *, locked=False, until=None, show_failure=False) -> int:
+    if r['status'] == 'source_gone':
+        say(r['error'])
+        return 2
     if r['status'] == 'forwarded':
         return _follow_forwarded(r, 'logs' if echo else 'wait', follow=echo,
                                  timeout=None if echo or until is None else until-now())
@@ -1007,7 +1024,9 @@ def _settled(r, echo=False, pos=0, *, locked=False, until=None, show_failure=Fal
     if code is None and r['box_id']:
         from .start_check import hint
         say(r['error'] or f"exit unknown; check: {hint(r['box_id'], r['run_id'])}")
-    return code if code is not None else 90
+    from .runs import space_result
+    effective = space_result(r['run_id'], code, report=True) if r['mode'] != 'local' else code
+    return effective if effective is not None else 90
 
 
 def _failure_tail(path) -> None:
@@ -1206,7 +1225,9 @@ def _holder_stuck(r, st, log_path, pos: int, echo: bool, deadline=None, *, show_
         from .run_evidence import report
         report(dict(r), log_path, until=deadline, receipt_code=receipt_code)
         say(f"exit unknown; inspect with offbox ssh {r['box_id']}")
-    return 90 if code is None else code
+    from .runs import space_result
+    effective = space_result(r['run_id'], code, log_path, report=True)
+    return 90 if effective is None else effective
 
 
 def _recover_by(r, log_path, deadline):
@@ -1484,7 +1505,8 @@ def _finalize(r, code, log_path, until=None, *, echo=False, show_failure=False) 
             do_pulls(r["box_id"], row, pulls, until=until)
         if until is not None and now() >= until:
             raise _wait_timeout(r)
-        code = settled_steps_code(r, code, log_path=log_path, locked=True, until=until)
+        code = settled_steps_code(r, code, log_path=log_path, locked=True, until=until,
+                                  report_start_failure=False)
         code = finish(r['run_id'], code, until=until, report=True, run=r)
         if dict(r).get('mode') == 'bg' and not _has_data(log_path):
             settled = _run_row(r['run_id'])
@@ -1520,7 +1542,9 @@ def _finalize(r, code, log_path, until=None, *, echo=False, show_failure=False) 
         from .run_evidence import report
         report(dict(r), log_path, until=until, receipt_code=receipt_code)
         say(f"exit unknown; inspect with offbox ssh {r['box_id']}")
-    return 90 if code is None else code
+    from .runs import space_result
+    effective = space_result(r['run_id'], code, log_path, report=True)
+    return 90 if effective is None else effective
 
 
 def _wait_run(r, echo, until=None, start_offsets=(0, 0), replay_path=None, *, show_failure=False):

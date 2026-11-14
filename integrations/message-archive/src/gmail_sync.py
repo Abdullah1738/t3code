@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 import common
 import mailparse
 import store
+import timing
 
 sys.path.insert(0, common.MAIL_LIBEXEC)
 import mail_oauth  # noqa: E402
@@ -64,6 +65,7 @@ class Api:
             self.local.conn = c
         return c
 
+    @timing.timed("fetch")
     def get(self, path, params=None):
         q = "?" + urllib.parse.urlencode(params, doseq=True) if params else ""
         url = f"/gmail/v1/users/me/{path}{q}"
@@ -125,6 +127,11 @@ def _fetch(api, acct, mid, names, me):
         return Skipped(mid, e)
     except (RuntimeError, KeyError, ValueError) as e:
         return Skipped(mid, e)
+    with timing.phase("parse"):
+        return _parse_message(m, raw, acct, mid, names, me)
+
+
+def _parse_message(m, raw, acct, mid, names, me):
     p = mailparse.parse(raw)
     ts = int(m.get("internalDate", 0)) // 1000 or p["ts"]
     rel = mailparse.raw_path(acct, ts, mid)
@@ -143,7 +150,7 @@ def _fetch_many(db, api, acct, ids, names, stats, stop):
             if stop is not None and stop.is_set():
                 return False
             chunk = ids[i:i + BATCH]
-            got = [x for x in pool.map(lambda mid: _fetch(api, acct, mid, names, me), chunk) if x]
+            got = [x for x in pool.map(timing.worker(lambda mid: _fetch(api, acct, mid, names, me)), chunk) if x]
             bad = [x for x in got if isinstance(x, Skipped)]
             items = [x for x in got if not isinstance(x, Skipped)]
             if bad and len(bad) * 2 > len(chunk):

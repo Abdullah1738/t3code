@@ -1,7 +1,6 @@
 import * as Effect from "effect/Effect";
 
-interface VersionedJsonRow {
-  readonly json: string;
+interface VersionedRow {
   readonly cache_version: number;
 }
 interface DecodeCounts {
@@ -16,7 +15,7 @@ const freeze = (value: unknown): void => {
   Object.freeze(value);
 };
 
-export const makeDecodeCache = <R extends VersionedJsonRow, A, E>(
+export const makeDecodeCache = <R extends VersionedRow, A, E>(
   name: string,
   decode: (json: string) => Effect.Effect<A, E>,
   key: (row: R) => string,
@@ -27,8 +26,17 @@ export const makeDecodeCache = <R extends VersionedJsonRow, A, E>(
   const drop = (id: string) => {
     if (values.delete(id)) counts.evictions++;
   };
+  const lookup = (row: R, read: typeof counts, shared = true) => {
+    if (!shared) return undefined;
+    const entry = values.get(key(row));
+    if (entry?.version !== row.cache_version) return undefined;
+    counts.hits++;
+    read.hits++;
+    return entry;
+  };
   return {
     name,
+    lookup,
     stats: () => ({ ...counts, entries: values.size }),
     drop: (id: string) =>
       Effect.flatMap(readCounters, (read) =>
@@ -50,16 +58,12 @@ export const makeDecodeCache = <R extends VersionedJsonRow, A, E>(
             counts.evictions - before;
         }),
       ),
-    decode: (row: R, read: typeof counts, shared = true) =>
+    decode: (row: R & { readonly json: string }, read: typeof counts, shared = true) =>
       Effect.suspend(() => {
         const id = key(row);
         if (!shared) return decode(row.json);
-        const entry = values.get(id);
-        if (entry?.version === row.cache_version) {
-          counts.hits++;
-          read.hits++;
-          return Effect.succeed(entry.value);
-        }
+        const entry = lookup(row, read, shared);
+        if (entry !== undefined) return Effect.succeed(entry.value);
         counts.misses++;
         read.misses++;
         return decode(row.json).pipe(

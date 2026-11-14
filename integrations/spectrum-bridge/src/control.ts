@@ -1,4 +1,5 @@
 import { toolError, toolLog } from "./toollog.ts";
+import { startTickRead } from "./tick-timing.ts";
 // Client for Robob's local control API (/api/ardud/control/*), plus the
 // mapping from its thread and request shapes onto the bridge vocabulary.
 // telegram-bridge carries its own variant of this file, since each package is
@@ -155,12 +156,15 @@ export class ControlClient {
 
   async request<T>(method: string, path: string, body?: unknown, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<T> {
     const loggingAt = performance.now();
+    const route = path.split("?", 1)[0]!.replace(/(\/threads\/)(?!by-native(?:\/|$))[^/]+/, "$1:id").replace(/(\/by-native\/)[^/]+/, "$1:id").replace(/(\/(?:runs|requests)\/)[^/]+/g, "$1:id");
+    const finishRead = method === "GET" ? startTickRead(route, loggingAt) : undefined;
     let loggingIds: Record<string, string> | undefined;
     toolLog.capture(() => {
       const encoded = /^\/threads\/(?!by-native(?:\/|$))([^/?]+)/.exec(path)?.[1];
       loggingIds = toolLog.runIds(encoded ? decodeURIComponent(encoded) : undefined);
     });
     let loggingOk = false;
+    let loggingError: unknown;
     try {
     // Reads get 25 s: Robob under load answers in seconds to tens of seconds, and giving up early only looks like an outage.
     const timeout = AbortSignal.timeout(options.timeoutMs ?? 25_000);
@@ -181,6 +185,7 @@ export class ControlClient {
         verbose: false,
       });
     } catch (caughtError) { toolError("control", "control.catch1", caughtError);
+      loggingError = caughtError;
       throw new ControlError(0);
     }
     let data: { ok?: unknown; error?: { code?: unknown } } | undefined;
@@ -192,11 +197,15 @@ export class ControlClient {
     }
     loggingOk = true;
     return data as T;
+    } catch (error) {
+      loggingError ??= error;
+      throw error;
     } finally {
       toolLog.capture(() => {
-      const route = path.split("?", 1)[0]!.replace(/(\/threads\/)(?!by-native(?:\/|$))[^/]+/, "$1:id").replace(/(\/by-native\/)[^/]+/, "$1:id").replace(/(\/(?:runs|requests)\/)[^/]+/g, "$1:id");
+      finishRead?.();
       toolLog.capture(() => toolLog.write({ component: "robob", kind: "perf", name: "turn.robob_call", durationMs: performance.now() - loggingAt,
-        ok: loggingOk, ids: loggingIds, props: { method, route } }));
+        ok: loggingOk, ids: loggingIds, props: { method, route },
+        ...(!loggingOk ? { error: { tag: "control.request_failed", cause: loggingError } } : {}) }));
       });
     }
   }

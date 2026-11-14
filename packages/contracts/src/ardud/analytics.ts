@@ -67,6 +67,8 @@ const GeneralEvent = Schema.Struct({
   errorPhase: Schema.optionalKey(McpPhase),
   saved: Schema.optionalKey(Schema.Union([Schema.Boolean, Schema.Literal("unknown")])),
   readerLane: Schema.optionalKey(Label),
+  waitStage: Schema.optionalKey(Schema.Literals(["lookup.caller", "lookup.target", "waiting"])),
+  waitLookupMs: Schema.optionalKey(Measurement),
   writerWaitMs: Schema.optionalKey(Measurement),
   props: Schema.optionalKey(
     Schema.Struct({
@@ -85,6 +87,9 @@ const GeneralEvent = Schema.Struct({
       reasonClass: Schema.optionalKey(Label),
       errorClass: Schema.optionalKey(Label),
       model: Schema.optionalKey(Label),
+      provider: Schema.optionalKey(Label),
+      operation: Schema.optionalKey(Label),
+      exitCode: Schema.optionalKey(Schema.Int),
       kind: Schema.optionalKey(Label),
       ageMs: Schema.optionalKey(Measurement),
       used: Schema.optionalKey(Measurement),
@@ -268,6 +273,20 @@ export const AnalyticsRollup = Schema.Struct({
   total: Measurement,
   invalidLines: Measurement,
   kindCounts: Schema.Record(Label, Measurement),
+  textGenerationOverflow: Schema.optionalKey(Measurement),
+  textGeneration: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        hour: Label,
+        provider: Label,
+        operation: Label,
+        boardId: Schema.NullOr(Id),
+        kind: Schema.Literals(["operation", "child"]),
+        outcome: McpOutcome,
+        ...LatencyFields,
+      }),
+    ),
+  ),
   errorCounts: Schema.Record(Label, Measurement),
   errorsByRoute: Schema.Array(
     Schema.Struct({
@@ -301,7 +320,14 @@ export const AnalyticsRollup = Schema.Struct({
       approximate: Schema.Boolean,
     }),
   ),
-  topSlowRpcs: Schema.Array(Schema.Struct({ method: Label, ...LatencyFields })),
+  topSlowRpcs: Schema.Array(
+    Schema.Struct({
+      method: Label,
+      ...LatencyFields,
+      totalWaitMs: Schema.optionalKey(Measurement),
+      outcomes: Schema.optionalKey(Schema.Record(Label, Measurement)),
+    }),
+  ),
   askAnswerLatency: Schema.Struct(LatencyFields),
   usage: Schema.Struct({
     totals: UsageTotals,

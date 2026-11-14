@@ -223,7 +223,7 @@ def entry_backend(argv: list[str]) -> str:
     if sub == "stats":
         return "server"
     first = default_backend()
-    if sub == "run" and first == "server" and person() is None:
+    if sub == "run" and person() is None:
         # The CLI parser has no backend-bound imports. Use it so equals, abbreviations, repeated options and
         # command arguments have exactly the same meaning here as when the run starts.
         from .cli import build_parser
@@ -232,8 +232,11 @@ def entry_backend(argv: list[str]) -> str:
             from . import base_catalog
             from .identity import repo_key, repo_root
             full = a.base if ":" in a.base else base_catalog.full_name(a.base, repo_key(repo_root()))
-            if (any(r["name"] == full for r in base_catalog.rows("boat"))
-                    and not any(r["name"] == full for r in base_catalog.rows("server"))):
+            on_boat = any(r["name"] == full for r in base_catalog.rows("boat"))
+            on_home = any(r["name"] == full for r in base_catalog.rows("server"))
+            if on_home and not on_boat:
+                return "server"
+            if first == "server" and on_boat and not on_home:
                 _BACKEND_REASON = "boat-only-base"
                 return "boat"
     if sub in ("logs", "wait", "kill", "release", "ssh", "ports", "keep", "exec"):
@@ -448,6 +451,16 @@ class OffboxError(Exception):
         self.outage = outage     # boat.dev's own API was unreachable (Cloudflare 52x or no answer)
 
 
+class SourceGone(OffboxError):
+    """The caller removed its source before the remote command started."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.checkpoint = 'push'
+        super().__init__(f"source checkout {path} was removed while the run was queued; nothing ran on the box",
+                         code=2, started=False)
+
+
 class SshHostKeyMismatch(OffboxError):
     """A terminal SSH identity failure: never replace a box or fall back to local execution."""
 
@@ -547,7 +560,7 @@ CAPACITY_SCHEMA = """
 """
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 DB_TIMEOUT = 30
 
 
@@ -623,7 +636,7 @@ def _migrate(con):
             con.execute(statement)
     have = {r[1] for r in con.execute("PRAGMA table_info(runs)")}
     for col in ("pulls TEXT", "rel_cwd TEXT", "remote_dir TEXT", "local_cwd TEXT", "docker INTEGER",
-                "client_pid INTEGER", "wrapper_pid INTEGER", "step_count INTEGER DEFAULT 0", "known_exit_code INTEGER", "command_at REAL", "logged_end_at REAL"):
+                "client_pid INTEGER", "wrapper_pid INTEGER", "step_count INTEGER DEFAULT 0", "known_exit_code INTEGER", "command_at REAL", "logged_end_at REAL", "cmd_bytes INTEGER", "cmd_via TEXT"):
         if col.split()[0] not in have:
             con.execute(f"ALTER TABLE runs ADD COLUMN {col}")
     if 'wrapper_pid' not in have:

@@ -164,7 +164,7 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
   Auto-pick: crpko-devops → crpko-go; repo key containing `harness` or go.mod with testcontainers → crpko-harness; other
   go.mod → crpko-go; package.json → crpko-node; otherwise generic. A root compose file alone doesn't pick a template.
   Each run prints the template it picked and why; `--template` overrides it.
-- On each box, crpko-devops runs check Vector 0.50.0, `/usr/bin/ruby`, AWS CLI v2, GNU time (`/usr/bin/time`), the Terraform version pinned in the checkout's `terraform-dev.yml` and a local Terraform provider mirror pre-filled from the repo's lock files and unpinned fixtures (`TERRAFORM_PROVIDER_MIRROR`). Missing or wrong versions are installed on the first run there (a few minutes); ready boxes only run a fast check. Binaries are installed on the runner PATH under `/usr/local/bin` (Ruby is installed by apt at `/usr/bin/ruby`). It has no package-lock.json, so run tests directly or use `npm install`, not `npm ci`.
+- On each box, crpko-devops runs check Vector 0.50.0, `/usr/bin/ruby`, GitHub CLI (`gh`), AWS CLI v2, GNU time (`/usr/bin/time`), the Terraform version pinned in the checkout's `terraform-dev.yml` and a local Terraform provider mirror pre-filled from the repo's lock files and unpinned fixtures (`TERRAFORM_PROVIDER_MIRROR`). Missing or wrong versions are installed on the first run there (a few minutes); ready boxes only run a fast check. Binaries are installed on the runner PATH under `/usr/local/bin` (Ruby and gh are installed by apt under `/usr/bin`). It has no package-lock.json, so run tests directly or use `npm install`, not `npm ci`.
 - LocalStack calls must still point `aws` at its endpoint (`--endpoint-url` or `AWS_ENDPOINT_URL`). Box runs get no AWS credentials unless forwarded with `--env`.
 - Type-check runs (tsc, tsc-rs, `vp run typecheck`) in JS/TS repos get xlarge by default; large boxes run out of memory on the Robob server typecheck.
 - Other automatic xlarge (no `--size` given; offbox says why): compose/LocalStack/testcontainers in the command,
@@ -307,6 +307,7 @@ commands, same box model, no hourly price, no start limits, no spend cap). Boat 
 - Marked up but not answering when your run starts (or while its box is being fetched): the run moves to Boat
   before it is sent, with one line (`... this run goes to Boat instead`). **Once the server accepted a run it
   never moves**, so nothing runs twice.
+- A run naming `--base` saved only on home waits for home (exit **93** when the wait expires) and never runs on Boat's template.
 - The server restarts under an accepted run (power cut, reboot, boatd restart): the client reconnects for up to
   15 minutes and carries on from where the output stopped. If the machine itself restarted, the server runs the
   command **again from the start, once**, and you get one line saying so (`... running it again from the start
@@ -355,7 +356,7 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
 
 ## Fallback and exit codes
 
-- Remote command's own exit code is returned as is, and offbox's last stderr line is `offbox: remote exit N`.
+- Remote command's own exit code is returned as is, except disk exhaustion returns **90**; the original command exit remains in the run record. Offbox's last stderr line reports the command's own exit.
   Command strings automatically use bash pipefail, so a failed check piped through `tee` or `tail` returns nonzero.
   A simple single-line pipeline such as `yes | head -1` succeeds when only non-last stages exit with SIGPIPE (141);
   compound scripts and uncertain shell syntax keep strict pipefail so skipped checks cannot look successful.
@@ -412,6 +413,14 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
   for a dead client's unrecorded start. Claims remain for the box's lifetime.
 
 - Three ordinary infra failures within an hour send one Telegram; start-limit alerts use the six-hour cooldown.
+
+## Disk space
+
+Offbox records /tmp, /var/tmp and workspace filesystem space before and after each run. Below 1 GiB free in /tmp it warns; below 256 MiB it refuses the command with **90**. On home boxes, an idle box first attempts safe cleanup of stale user-owned temp files. Critically full boxes with concurrent runs are refused without cleanup. The pool picker does not automatically move the run to another box.
+
+After a nonzero exit, ENOSPC output or less than 64 MiB free on a measured filesystem marks the result `infra_failure: "enospc"` and returns **90** from run/wait/logs. The command's original exit and the start/end measurements stay in the state record and analytics. These test results are invalid; rerun after space is available. Successful commands retain exit 0.
+
+The home reaper runs only below 50% temp space free. It preserves live-held files, recent trees, foreign-owned entries, sockets and every /tmp/offbox-run tree. Every removal is logged. Raising the tmpfs cap is a separate capacity change.
 
 ## Logs
 

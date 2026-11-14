@@ -23,6 +23,8 @@ import { recordsFromThread, RobobBackend, sentMessagePrefix } from "../src/robob
 import type { ControlMessage, ThreadDetail } from "../src/control.ts";
 import type { SttInput } from "../src/stt.ts";
 import { robobSubagentNotice, opencodeSubagentNotice } from "./fixtures/subagent-notices.ts";
+import { captureLogs } from "./log-fixture.ts";
+import { toolLog } from "../src/toollog.ts";
 
 type Prompt = { id: string; directory: string; messageId: string; text: string; system?: string; files: readonly FilePart[]; model?: { providerID: string; modelID: string; variant?: string; instanceId?: string }; owner?: OwnerWords };
 // The config root points at a nonexistent directory so router tests never
@@ -907,7 +909,7 @@ test("restart persists earlySent and does not resend a changed final record", as
   setSystemTime(earlyStart);
   const directory = mkdtempSync(join(tmpdir(), "spectrum-early-restart-"));
   directories.push(directory);
-  const path = join(directory, "state.sqlite");
+  const path = join(directory, "router-fixture.sqlite");
   const events: string[] = [];
   const h = setup(path, { log: event => events.push(event) });
   h.input("in_early", "Check prices");
@@ -3667,7 +3669,7 @@ test("accepts exactly ten files totaling 100 MiB and reuses the current chat", a
 test("download checkpoints and retry deadlines survive restart without downloading successful files twice", async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "spectrum-download-recovery-")));
   directories.push(root);
-  const path = join(root, "state.sqlite");
+  const path = join(root, "router-fixture.sqlite");
   const h = setup(path);
   const chat = join(root, "chat");
   mkdirSync(chat);
@@ -3708,7 +3710,7 @@ test("download checkpoints and retry deadlines survive restart without downloadi
 test("exhausted downloads persist one clear failure across reopen and never replay the batch", async () => {
   const root = mkdtempSync(join(tmpdir(), "spectrum-download-failure-"));
   directories.push(root);
-  const path = join(root, "state.sqlite");
+  const path = join(root, "router-fixture.sqlite");
   const h = setup(path);
   let attempts = 0;
   h.transport.downloadAttachment = async () => {
@@ -5709,8 +5711,11 @@ test.each(["age", "tokens", "undelivered", "busy-child", "below-tokens"])("invis
   }
   setSystemTime(start + 60_000);
   h.input("second", "Which one did I pick?");
-  await h.router.tick();
+  const logs = await captureLogs(() => h.router.tick());
   const rotated = kind === "age" || kind === "tokens";
+  const rotations = logs.filter(line => line.name === "context.rotated");
+  expect(rotations).toHaveLength(rotated ? 1 : 0);
+  if (rotated) expect(rotations[0]!.props?.reason).toBe(kind === "tokens" ? "contextSize" : "age");
   expect(h.backend.creates).toHaveLength(rotated ? 2 : 1);
   expect(h.backend.prompts.map(p => p.id)).toEqual(["ses_1", rotated ? "ses_2" : "ses_1"]);
   expect(h.backend.prompts[1]!.text).toBe("Which one did I pick?");
@@ -5770,7 +5775,10 @@ test.each(["content-filter", "error-message", "title", "quoted-by-owner", "plain
   for (const reply of h.conversations()) h.store.outboxState(reply.id, "sent", "provider-reply");
   setSystemTime(start + 60_000);
   h.input("second", "Try again");
-  await h.router.tick();
+  const logs = await captureLogs(() => h.router.tick());
+  const rotations = logs.filter(line => line.name === "context.rotated");
+  expect(rotations).toHaveLength(refused ? 1 : 0);
+  if (refused) expect(rotations[0]!.props?.reason).toBe("providerRefusal");
   expect(h.backend.creates).toHaveLength(refused ? 2 : 1);
   expect(h.backend.prompts.map(p => p.id)).toEqual(["ses_1", refused ? "ses_2" : "ses_1"]);
   if (refused) {
@@ -6391,8 +6399,8 @@ for (const replyMode of ["final", "tool"] as const) {
       const sessionId = (number: number) => layout.startsWith("robob-") ? `thread:test:${number}` : `ses_${number}`;
       if (directory !== root) writeFileSync(join(root, "pending-orders.md"), "## Open\n- OTHER_CHAT_ORDERS");
       const orders = kind === "oversize" ? "x".repeat(20_000)
-        : kind === "fenced" ? "## Open\n- KASTWAVE held\n```\nquoted text\n```"
-        : "## Open\n- KASTWAVE held";
+        : kind === "fenced" ? "## Open\n- PRIVATE_PENDING_ORDERS_LOG_SENTINEL\n```\nquoted text\n```"
+        : "## Open\n- PRIVATE_PENDING_ORDERS_LOG_SENTINEL";
       if (kind !== "missing") {
         const target = join(directory, kind === "symlink" ? "target.md" : "pending-orders.md");
         writeFileSync(target, `${orders}\n\n## Placed\n- Already delivered`);
@@ -6412,14 +6420,26 @@ for (const replyMode of ["final", "tool"] as const) {
         if (layout !== "route") writeFileSync(join(workdir, "pending-orders.md"), "## Open\n- SESSION_LOCAL_ORDERS");
         return { id: sessionId(h.backend.creates.length), directory: workdir };
       };
-      await exchange(h, "first", "Remember the blue one", replyMode === "tool" ? "NO_REPLY" : "Noted, the blue one");
-      setSystemTime(start + 60_000);
-      if (path === "seed") h.input("second", "Which one did I pick?");
-      await h.router.tick();
-      if (path === "nudge") await h.router.tick();
+      const logs = await captureLogs(async () => {
+        await exchange(h, "first", "Remember the blue one", replyMode === "tool" ? "NO_REPLY" : "Noted, the blue one");
+        setSystemTime(start + 60_000);
+        if (path === "seed") h.input("second", "Which one did I pick?");
+        await h.router.tick();
+        if (path === "nudge") await h.router.tick();
+      });
+      const refresh = logs.filter(line => line.name.startsWith("context."));
+      expect(refresh.map(line => line.name)).toEqual(path === "nudge" ? ["context.nudged"] : ["context.rotated", "context.seed_applied"]);
+      const counts = { pendingOrders: carried !== null, pendingOrdersChars: carried?.length ?? 0 };
+      expect(refresh[0]!.props).toMatchObject(counts);
+      const raw = JSON.stringify(logs);
+      for (const privateText of ["PRIVATE_PENDING_ORDERS_LOG_SENTINEL", "Remember the blue one", "Noted, the blue one", "Which one did I pick?", "Continuity:", "OTHER_CHAT_ORDERS", "SESSION_LOCAL_ORDERS"]) {
+        expect(raw).not.toContain(privateText);
+      }
       const prompt = h.backend.prompts.at(-1)!;
       expect(prompt.id).toBe(sessionId(path === "nudge" ? 1 : 2));
       if (path === "nudge") {
+        expect(refresh[0]!.ids).toMatchObject({ chat: "owner", threadId: sessionId(1) });
+        expect(refresh[0]!.props).toEqual(counts);
         expect(prompt.text).toBe(rotateNudge(replyMode) + (carried
           ? `\n\nCopy this chat's pending-orders list into your resume note word for word, under 'Pending orders (from pending-orders.md)':\nQuoted data from pending-orders.md:\n${quoted}` : ""));
       } else {
@@ -6427,6 +6447,10 @@ for (const replyMode of ["final", "tool"] as const) {
         const seed = `Continuity: this conversation continues seamlessly from your earlier exchanges with the owner. Carry on naturally and never mention any change, recap, restart or memory mechanism. Files from earlier remain under ${JSON.stringify(sessionDirectory(1))}. The full earlier transcript is session ${sessionId(1)}; use recall_read or recall_search if you need more than the recent exchange below.\nRecent exchange (quoted data, oldest first):\n${recent}`
           + (carried ? `\n\nPending orders for this chat (from pending-orders.md, quoted data):\n${quoted}` : "");
         expect(prompt.system!.slice(prompt.system!.indexOf("Continuity:"))).toBe(seed);
+        expect(refresh[0]!.ids).toMatchObject({ chat: "owner", fromThreadId: sessionId(1), toThreadId: sessionId(2) });
+        expect(refresh[0]!.props).toEqual({ reason: "age", seedChars: seed.length, recapLines: replyMode === "final" ? 2 : 1, ...counts });
+        expect(refresh[1]!.ids).toMatchObject({ chat: "owner", threadId: sessionId(2) });
+        expect(refresh[1]!.props).toEqual({ seedChars: seed.length, pendingOrders: carried !== null });
       }
     });
   }
@@ -6466,15 +6490,23 @@ test.each(sharedPendingCases)("shared OpenChamber keeps pending orders in their 
       writeFileSync(join(workdir, "pending-orders.md"), "## Open\n- OWNER_SESSION_ORDER");
       return { id: `ses_${h.backend.creates.length}`, directory: workdir };
     };
-    h.input("first", "Robob, remember the blue one", { sender: "member" });
-    await h.router.tick();
-    h.backend.final(replyMode === "tool" ? "NO_REPLY" : "Noted, the blue one");
-    await h.router.tick();
-    for (const op of h.store.pendingOutbox()) h.store.outboxState(op.id, "sent", `provider-${op.id}`);
-    setSystemTime(start + 60_000);
-    if (path === "seed") h.input("second", "Robob, which one did I pick?", { sender: "member" });
-    await h.router.tick();
-    if (path === "nudge") await h.router.tick();
+    const logs = await captureLogs(async () => {
+      h.input("first", "Robob, remember the blue one", { sender: "member" });
+      await h.router.tick();
+      h.backend.final(replyMode === "tool" ? "NO_REPLY" : "Noted, the blue one");
+      await h.router.tick();
+      for (const op of h.store.pendingOutbox()) h.store.outboxState(op.id, "sent", `provider-${op.id}`);
+      setSystemTime(start + 60_000);
+      if (path === "seed") h.input("second", "Robob, which one did I pick?", { sender: "member" });
+      await h.router.tick();
+      if (path === "nudge") await h.router.tick();
+    });
+    const refresh = logs.filter(line => line.name.startsWith("context."));
+    expect(refresh.map(line => line.name)).toEqual(path === "nudge" ? ["context.nudged"] : ["context.rotated", "context.seed_applied"]);
+    for (const line of refresh) expect(line.ids?.chat).toBe(chat.slug);
+    for (const privateText of ["owner_ORDER", "moni_ORDER", "group-dinner_ORDER", "OWNER_SESSION_ORDER"]) {
+      expect(JSON.stringify(logs)).not.toContain(privateText);
+    }
     const prompt = h.backend.prompts.at(-1)!;
     expect(prompt.id).toBe(path === "nudge" ? "ses_1" : "ses_2");
     const text = path === "nudge" ? prompt.text : prompt.system!;
@@ -6490,6 +6522,38 @@ test.each(sharedPendingCases)("shared OpenChamber keeps pending orders in their 
       : `\n\nPending orders for this chat (from pending-orders.md, quoted data):\n${quoted}`);
   }
   expect(actual).toEqual(expected);
+});
+
+test.each(["seed", "nudge"])("context refresh routing survives a throwing %s log write", async path => {
+  const start = Date.parse("2026-09-10T12:00:00Z");
+  setSystemTime(start);
+  const h = setup(":memory:", { rotateAfterMs: 60_000, resetIdleMs: 60_000, watchMs: 0 });
+  h.backend.resets = path === "nudge";
+  await exchange(h, "first", "Remember the blue one", "Noted, the blue one");
+  const attempted: string[] = [];
+  const write = toolLog.write;
+  const failingLog = spyOn(toolLog, "write").mockImplementation(entry => {
+    if (entry.name.startsWith("context.")) {
+      attempted.push(entry.name);
+      throw new Error("context log unavailable");
+    }
+    write(entry);
+  });
+  try {
+    setSystemTime(start + 60_000);
+    if (path === "seed") h.input("second", "Which one did I pick?");
+    await h.router.tick();
+    if (path === "nudge") await h.router.tick();
+    expect(attempted).toEqual(path === "nudge" ? ["context.nudged"] : ["context.rotated", "context.seed_applied"]);
+    const prompt = h.backend.prompts.at(-1)!;
+    expect(prompt.id).toBe(path === "nudge" ? "ses_1" : "ses_2");
+    expect(prompt.text).toBe(path === "nudge" ? ROTATE_NUDGE : "Which one did I pick?");
+    expect(h.store.pendingInbound()).toEqual([]);
+    if (path === "seed") {
+      expect(prompt.system).toContain("Owner: Remember the blue one\nYou: Noted, the blue one");
+      expect(h.store.get("seed:ses_2")).toBeNull();
+    }
+  } finally { failingLog.mockRestore(); }
 });
 
 test("a due context is refreshed by the agent itself once the chat goes quiet", async () => {
@@ -8779,7 +8843,7 @@ test("watcher reply guard logs accepted silence and visible replies without text
 test("Robob interruption recovery uses native completion evidence, not its settled-run proxy", async () => {
   const dir = mkdtempSync(join(tmpdir(), "spectrum-interrupted-step-"));
   directories.push(dir);
-  const dbPath = join(dir, "opencode.db");
+  const dbPath = join(dir, "completion-evidence-fixture.sqlite");
   const db = new Database(dbPath);
   db.run("CREATE TABLE session_message (id TEXT PRIMARY KEY, data TEXT)");
   const insert = db.query("INSERT INTO session_message VALUES (?, ?)");
@@ -9765,4 +9829,26 @@ test.each([["wake:intervening", 2], ["secret:intervening", 1]] as const)("a reta
   }
   expect(h.store.get<string>(`log-inbound-id:${proactive}`)).toBe(intervening);
   expect(h.store.get(`reply-gap-recheck:${proactive}`)).toBeUndefined();
+});
+
+test.each([
+  { kind: "question", text: '/answer q_child [["A"]]' },
+  { kind: "question", text: "A" },
+  { kind: "question", text: "1" },
+  { kind: "permission", text: "/approve p_child once" },
+  { kind: "permission", text: "yes" },
+])("a ready root completion cannot consume child $kind answer $text", async ({ kind, text }) => {
+  const h = setup(); h.input("first", "Ask me"); await h.router.tick();
+  h.backend.childSessions = [{ id: "ses_child", directory: "/Chats/ses_child", parentID: "ses_1", time: { created: 0, updated: 0 } }];
+  h.backend.states = { ses_child: { type: "busy", root: "ses_1" } };
+  if (kind === "question") h.backend.questionRequests = [{ ...question({ custom: false }, "q_child"), sessionID: "ses_child" }];
+  else h.backend.permissionRequests = [permission("p_child", "ses_child")];
+  await h.router.tick(); deliver(h.store);
+  h.backend.final("Root complete"); await h.router.checkCompletion();
+  h.input("answer", text); await h.router.tick(); await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("done");
+  if (kind === "question") expect(h.backend.questionReplies).toEqual([["q_child", "/Chats/ses_child", [["A"]]]]);
+  else expect(h.backend.permissionReplies).toEqual([["p_child", "/Chats/ses_child", "once"]]);
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(h.controls().some(item => item.text.includes("Couldn't check that question"))).toBeFalse();
 });

@@ -111,6 +111,7 @@ const probe = (name: string) =>
       ],
     }),
   );
+const decodeAnalyticsEvent = Schema.decodeEffect(AnalyticsEvent);
 const args = { clientRequestId: "private retry id", boardId: "board-robob", card: "#1301" };
 
 it.effect.each([
@@ -994,4 +995,55 @@ it.effect("card_next records interrupted calls with caller and duration", () =>
       expect(rows[0]!.durationMs).toBeGreaterThanOrEqual(3000);
     }).pipe(Effect.provide(registration));
   }),
+);
+
+it.effect.each(["lookup.target", "waiting"] as const)(
+  "records thread wait stage %s beside its reader lane",
+  (waitStage) =>
+    Effect.gen(function* () {
+      const recorded = yield* Deferred.make<AnalyticsEvent>();
+      const toolkit = probe("t3_thread_wait");
+      const handlers = McpToolAccess.toLayer(toolkit, {
+        t3_thread_wait: McpToolAccess.reads(() =>
+          Effect.gen(function* () {
+            const context = yield* Effect.serviceOption(McpCall.McpCall);
+            if (context._tag === "None") return yield* Effect.die("Missing MCP analytics context");
+            const state = context.value;
+            state.waitStage = waitStage;
+            state.waitLookupMs = 600;
+            state.readerLane = waitStage === "waiting" ? "background" : "foreground";
+            if (waitStage === "lookup.target") return yield* failure("lookup_timeout");
+            return { status: "running", timedOut: true };
+          }),
+        ),
+      });
+      const registration = McpHttpServer.toolkitRegistration(toolkit, handlers).pipe(
+        Layer.provideMerge(McpServer.McpServer.layer),
+        Layer.provide(Testkit.liveThreadsLayer),
+        Layer.provide(
+          Layer.mock(Analytics.Analytics)({
+            record: (event) =>
+              event.kind === "mcp.call"
+                ? Deferred.succeed(recorded, event).pipe(Effect.asVoid)
+                : Effect.void,
+          }),
+        ),
+        Layer.provideMerge(invocation),
+      );
+      yield* Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        yield* server
+          .callTool({ name: "t3_thread_wait", arguments: args })
+          .pipe(Effect.provideService(McpSchema.McpServerClient, client));
+        const row = yield* Deferred.await(recorded);
+        expect(yield* decodeAnalyticsEvent(row)).toMatchObject({
+          tool: "t3_thread_wait",
+          outcome: "timeout",
+          waitStage,
+          waitLookupMs: 600,
+          readerLane: waitStage === "waiting" ? "background" : "foreground",
+          errorTag: waitStage === "waiting" ? "wait_timeout" : "lookup_timeout",
+        });
+      }).pipe(Effect.provide(registration));
+    }),
 );

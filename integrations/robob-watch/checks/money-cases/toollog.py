@@ -34,18 +34,21 @@ _NAMES = {
 _ENUMS = {
     'lane': {'food', 'minutes', 'nownow', 'main', 'supermall', 'marketplace', 'careem', 'uber',
              'quik', 'shops', 'box', 'same-day'},
-    'merchant': {'noon', 'careem', 'amazon', 'uber', 'other', 'unknown'},
+    'merchant': {'noon', 'careem', 'amazon', 'web', 'uber', 'other', 'unknown'},
     'source': {'cli', 'phone', 'email'},
     'outcome': {'success', 'failure', 'refused', 'ask_now', 'dont_ask', 'unverified', 'failed'},
     'kind': {'refund', 'dispute', 'decline', 'unasked_charge', 'charge', 'hold',
              'payment_deadline', 'autopay_expected', 'merchant_card'},
+    'starved_by': {'none', 'owner_threads', 'msgs', 'lookups', 'census', 'receipt',
+                   'reconcile', 'follow', 'attention', 'build_write'},
     'slowestPhase': {'reconcile', 'follow', 'attention', 'build_write'},
-    'state': {'unknown', 'placed', 'preparing', 'picked up', 'out for delivery',
+    'state': {'unknown', 'placed', 'ordered', 'shipped', 'preparing', 'picked up', 'out for delivery',
               'nearby', 'delivered', 'cancelled', 'pending confirmation'},
 }
 _ENUMS['from'] = _ENUMS['to'] = _ENUMS['state']
 _BOOLS = {'prepareOnly', 'changed', 'fallback', 'budgetHit', 'unmatched', 'deadlineMoved', 'answered'}
-_NUMBERS = {'exitCode', 'amountMinor', 'count', 'ageDays', 'openCases', 'fired'}
+_NUMBERS = {'exitCode', 'amountMinor', 'count', 'ageDays', 'openCases', 'fired', 'sourceLimits',
+            'owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms'}
 _CASE_FIELDS = {'merchant', 'amount', 'currency', 'reference', 'state', 'next', 'deadline',
                 'due', 'why', 'who', 'watchers', 'note', 'because', 'reply', 'source'}
 _MONEY_PROPS = {
@@ -53,7 +56,8 @@ _MONEY_PROPS = {
     'case.update': {'fields', 'deadlineMoved', 'answered'},
     'case.close': {'kind', 'ageDays'},
     'question.ask': {'outcome'},
-    'check.run': {'budgetHit', 'openCases', 'fired', 'slowestPhase'},
+    'check.run': {'budgetHit', 'openCases', 'fired', 'slowestPhase', 'sourceLimits', 'limitKinds', 'orderCoverage', 'chargeCensus',
+                  'owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms', 'starved_by'},
 }
 _COMMANDS = {'test-talabat-shops', 'capabilities', 'restaurant-cart-contract', 'item-options', 'cart',
              'clear-cart', 'menu', 'choices', 'inspect', 'open-flows', 'recover-payment',
@@ -371,8 +375,41 @@ def _fields(props):
             result[key] = value
         elif key in _BOOLS and type(value) is bool:
             result[key] = value
-        elif key in _NUMBERS and type(value) is int and abs(value) <= 10**12:
+        elif key in _NUMBERS and type(value) is int and abs(value) <= 10**12 \
+                and (not key.endswith('_ms') or value >= 0):
             result[key] = value
+        elif key == 'limitKinds' and isinstance(value, list):
+            result[key] = sorted({v for v in value if isinstance(v, str) and v in {
+                'ORDER_LIST_HOST_BINDING_UNVERIFIED', 'food_page_1', 'nownow_page_1', 'marketplace_page_1'}})
+        elif key == 'chargeCensus' and isinstance(value, dict):
+            result[key] = {app: {k: v for k, v in counts.items()
+                if k in {'open', 'matched', 'proven_clean', 'limited', 'error', 'not_checked'}
+                and type(v) is int and 0 <= v <= 10**9}
+                for app, counts in value.items() if app in {'noon', 'careem'} and isinstance(counts, dict)}
+        elif key == 'orderCoverage' and isinstance(value, dict):
+            result[key] = {}
+            for app in ('noon', 'careem'):
+                lanes = value.get(app)
+                if not isinstance(lanes, dict):
+                    continue
+                result[key][app] = {}
+                for name in ('minutes', 'marketplace', 'food', 'nownow'):
+                    lane = lanes.get(name)
+                    if not isinstance(lane, dict):
+                        continue
+                    safe = {k: v for k, v in lane.items() if k in {'pages', 'fetched', 'cached', 'ms', 'coverage_cleared_rows'}
+                            and type(v) is int and 0 <= v <= 10**9}
+                    if type(lane.get('stop_reason')) is str and lane['stop_reason'] in {'slice_out', 'detail_error', 'unknown_time_row',
+                            'scoped_cancellation', 'scoped_conflict', 'unordered', 'repeated_page', 'invalid_detail',
+                            'invalid_paging', 'end_of_history', 'covered', 'unproven_paging', 'list_error', 'reader_error'}:
+                        safe['stop_reason'] = lane['stop_reason']
+                    covered = lane.get('covered_from')
+                    if covered is None or (isinstance(covered, str) and re.fullmatch(
+                            r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})', covered)):
+                        safe['covered_from'] = covered
+                    safe['exhaustive'] = lane.get('exhaustive') is True
+                    safe['limit'] = 'page-1 history only' if lane.get('limit') == 'page-1 history only' else None
+                    result[key][app][name] = safe
         elif key == 'fields' and type(value) is str and (value == '' or all(
                 field in _CASE_FIELDS for field in value.split(','))):
             result[key] = value

@@ -4,6 +4,8 @@ else:
     import test_environment
 
 import os
+import hashlib
+import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -38,3 +40,16 @@ class InstallTests(unittest.TestCase):
             self.assertFalse(shim.exists())
             self.assertEqual(unrelated.read_text(), "preserved")
             self.assertTrue((destination / "src/engine.py").exists())
+            pins = json.loads((destination / "snapshot-pin.json").read_text())
+            for name, digest in pins.items():
+                self.assertEqual(hashlib.sha256((destination / name).read_bytes()).hexdigest(), digest)
+            helper = destination / "bin/live-db-snapshot"
+            self.assertEqual(helper.stat().st_mode & 0o777, 0o700)
+            self.assertEqual((Path(temp) / ".local/bin/live-db-snapshot").resolve(), helper.resolve())
+            # The installed launcher runs in isolation, without importing a
+            # same-named module in the caller's working directory/PYTHONPATH.
+            (Path(temp) / "live_db_snapshot.py").write_text("raise RuntimeError('untrusted import')")
+            help_result = subprocess.run([str(helper), "--help"], cwd=temp,
+                                         env={**env, "PYTHONPATH": temp}, capture_output=True, text=True)
+            self.assertEqual(help_result.returncode, 0, help_result.stderr)
+            self.assertIn("--card", help_result.stdout)

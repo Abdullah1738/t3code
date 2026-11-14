@@ -14,7 +14,8 @@ CAP_BYTES = 50 * 1024 * 1024
 # Explicit schema: unknown keys and nested payloads cannot enter a log by accident.
 NUMBERS = set('internalFreeGb externalFreeGb baseline count bytes files snapshotAgeS resticExitCode exitCode found killed ageS autoFixed needsOwner critical high moderate medium low unknown skipped sourceErrors reports inventoryAgeS'.split())
 NUMBERS.update('diskCount storagekitdPid storagekitdUptimeS diskarbitrationdPid diskarbitrationdUptimeS hdiutilMs'.split())
-NUMBERS.update('elapsedMs deniedCount inventorySourceErrors'.split())
+NUMBERS.update('elapsedMs deniedCount partialChildCount inventorySourceErrors'.split())
+NUMBERS.update('rootsOk rootsTimeout rootsDenied scanMs'.split())
 NUMBERS.update(('unreadableCount', 'turn', 'cachedCount', 'rootsComplete', 'rootsPartial',
                 'childrenCached', 'oldestChildAgeS', 'unmeasuredCount', 'limitedCount', 'lagS'))
 NUMBERS.update(('deltaGb', 'deltaWindowS', 'purgeableGb', 'localSnapshotCount'))
@@ -33,6 +34,8 @@ BACKUP_STAGES = {'admission', 'stage', 'repo', 'disk', 'replica', 'verify', 'fil
 FAILURE_STAGES = {'admission', 'stage', 'repo', 'disk', 'replica', 'verify', 'files',
                   'restic', 'prune', 'dropbox', 'manifest', 'unknown'}
 NUMBERS.update(('durationMs', 'childrenMeasured', 'childrenPartial', 'childrenRemaining', 'bytesMeasured'))
+NUMBERS.update(('timeouts', 'secondsInTimeouts', 'childrenDescended', 'partsMeasured',
+                'childrenWithPartsInProgress', 'partsDone', 'partsTotal', 'partsFreshnessS'))
 NUMBERS.update(('loadPerCore', 'lastSuccessAgeS', 'deferredCount'))
 BACKUP_PROGRAMS = {'bash', 'zsh', 'sh', 'python', 'python3', 'restic', 'launchd',
                    'Robob', 'codex', 'claude', 'opencode', 'node', 'sleep', 'unknown'}
@@ -41,6 +44,7 @@ BACKUP_ARGS = {'memory_backup.sh', 'health_backup.sh', 'backup_control.py', 'red
                'backup', 'snapshots', 'forget', 'prune',
                '-c', '-f', '-l', '-lc', '-u', '-m', '[redacted]'}
 BOOLEANS = {'timedOut', 'hdiutilOk', 'probeError', 'partial', 'inventoryStale', 'inventoryComplete'}
+BOOLEANS.add('cached')
 NULLABLE = {'exitCode', 'diskCount', 'storagekitdPid', 'storagekitdUptimeS', 'storagekitdStat',
             'diskarbitrationdPid', 'diskarbitrationdUptimeS', 'diskarbitrationdStat'}
 NULLABLE.add('inventoryAgeS')
@@ -62,6 +66,10 @@ PROBE_ERRORS = {prefix+field for prefix in ('internal', 'external')
                 for field in ('PurgeableError', 'SnapshotError')}
 TEXT.update('blockedIn samplePath skipped storagekitdStat diskarbitrationdStat'.split())
 TEXT.add('failure')
+TEXT.add('child')
+TEXT.add('spawnPolicy')
+TEXT.update(('root', 'slowestChildPath'))
+NUMBERS.add('slowestChildMs')
 ATOM = re.compile(r'^[A-Za-z0-9_.:@/+ ()-]{1,180}$')
 SECRET = re.compile(r'(?i)(bearer |password|secret|token[=: ]|cookie|otp[=: ]|sk-[a-z0-9]|\b(?:\d[ -]?){13,19}\b)')
 
@@ -79,21 +87,59 @@ def directory():
     return Path(os.environ.get('TOOLLOG_DIR', str(Path.home() / '.robob/logs/tools/mac')))
 
 
-def process_fields(values):
+def process_fields(values, busy=False):
     result = []
+    numeric = ('pid', 'processAgeS', 'cpuDeltaS') if busy else ('pid', 'ppid', 'processAgeS', 'stuckForS')
+    texts = ('comm',) if busy else ('stat', 'comm', 'args', 'cpuTime')
+    sample_key = 'statSamples' if busy else 'samples'
     for proc in values[:10]:
         if not isinstance(proc, dict):
             continue
-        if any(type(proc.get(k)) is not int or proc[k] < 0 for k in ('pid', 'ppid', 'ageS')):
+        if any(not finite_number(proc.get(k)) or proc[k] < 0 for k in numeric):
             continue
-        if not all(isinstance(proc.get(k), str) for k in ('stat', 'comm', 'args')):
+        if any(type(proc[k]) is not int for k in numeric if k != 'cpuDeltaS'):
             continue
-        clean = {k: proc[k] for k in ('pid', 'ppid', 'ageS')}
-        for key, limit in (('stat', 16), ('comm', 300), ('args', 300)):
-            value = proc[key][:limit]
+        if not all(isinstance(proc.get(k), str) for k in texts):
+            continue
+        samples = proc.get(sample_key)
+        if not isinstance(samples, list) or not all(isinstance(v, str) and re.fullmatch(r'[A-Za-z+<>-]{1,16}', v) for v in samples):
+            continue
+        if not busy and not re.fullmatch(r'(?:\d+-)?\d+(?::[0-5]\d){1,2}(?:\.\d+)?', proc['cpuTime']):
+            continue
+        clean = {k: proc[k] for k in numeric}
+        clean[sample_key] = samples[:6]
+        for key in texts:
+            value = proc[key][:16 if key == 'stat' else 64 if key == 'cpuTime' else 300]
             clean[key] = '[redacted]' if SECRET.search(value) else ''.join(
                 c if c.isprintable() else ' ' for c in value)
         result.append(clean)
+    return result
+
+
+def finite_number(value):
+    try:
+        return type(value) in (int, float) and math.isfinite(value)
+    except OverflowError:
+        # Untrusted JSON integers can exceed the float range used by isfinite.
+        return False
+
+
+def disk_wait_fields(values):
+    result = {}
+    for key, value in (values or {}).items():
+        if key in ('count', 'busyCount', 'sampleCount') and type(value) is int and value >= 0:
+            result[key] = min(value, 6) if key == 'sampleCount' else value
+        elif key in ('procs', 'busy') and isinstance(value, list):
+            result[key] = process_fields(value, busy=key == 'busy')
+        elif key == 'stuckUnmount' and type(value) is bool:
+            result[key] = value
+        elif key == 'sampling' and value in ('full', 'partial'):
+            result[key] = value
+        elif key == 'failure' and value in ('timeout', 'exit', 'parse', 'unavailable'):
+            result[key] = value
+        elif key == 'mountPoint' and isinstance(value, str):
+            result[key] = '[redacted]' if SECRET.search(value) else ''.join(
+                c if c.isprintable() else ' ' for c in value[:300])
     return result
 
 
@@ -122,7 +168,7 @@ def memory_fields(values, event):
                'mbPerS', 'tps', 'pid', 'memMb', 'cmprsMb', 'cpu', 'count', 'ppid1Count'}
 
     def numeric(value):
-        return type(value) in (int, float) and math.isfinite(value) and value >= 0
+        return finite_number(value) and value >= 0
 
     def row(value, keys):
         if not isinstance(value, dict):
@@ -165,18 +211,34 @@ def memory_fields(values, event):
 
 
 def safe_fields(values, event=None):
+    if event == 'disk.clone_wedge':
+        result = {k: v for k, v in disk_wait_fields(values).items()
+                  if k in ('count', 'sampleCount', 'sampling', 'failure')}
+        if isinstance((values or {}).get('procs'), list):
+            result['procs'] = []
+            for proc in values['procs'][:10]:
+                if not isinstance(proc, dict) or proc.get('reason') not in ('clone', 'shared_path'):
+                    continue
+                if any(type(proc.get(k)) is not int or proc[k] < 0 for k in ('pid', 'processAgeS')):
+                    continue
+                cpu = proc.get('cpuDeltaS')
+                if not finite_number(cpu) or cpu < 0:
+                    continue
+                if not all(isinstance(proc.get(k), str) for k in ('path', 'wchan')):
+                    continue
+                clean = {k: proc[k] for k in ('pid', 'processAgeS', 'cpuDeltaS', 'reason')}
+                for key in ('path', 'wchan'):
+                    value = proc[key][:300 if key == 'path' else 64]
+                    clean[key] = '[redacted]' if SECRET.search(value) else ''.join(c if c.isprintable() else ' ' for c in value)
+                result['procs'].append(clean)
+        return result
+    if event == 'proc.disk_wait':
+        return disk_wait_fields(values)
     if event in ('memory.sample', 'memory.alert'):
         return memory_fields(values, event)
     result = {}
     for key, value in (values or {}).items():
-        if event == 'proc.disk_wait' and key == 'procs' and isinstance(value, list):
-            result[key] = process_fields(value)
-        elif event == 'proc.disk_wait' and key == 'stuckUnmount' and type(value) is bool:
-            result[key] = value
-        elif event == 'proc.disk_wait' and key == 'mountPoint' and isinstance(value, str):
-            result[key] = '[redacted]' if SECRET.search(value) else ''.join(
-                c if c.isprintable() else ' ' for c in value[:300])
-        elif key == 'lockHolderCmd' and backup_command(value):
+        if key == 'lockHolderCmd' and backup_command(value):
             result[key] = value
         elif key in ('trigger', 'lockHolderTrigger') and value in ('launchd', 'manual', 'installer', 'unknown', 'agent'):
             if key != 'trigger' or value != 'agent':
@@ -190,6 +252,13 @@ def safe_fields(values, event=None):
         elif event == 'backup.run' and key == 'failureStage' and isinstance(value, str):
             result[key] = value if value in FAILURE_STAGES else 'unknown'
         elif key == 'failReason' and value in ('password_unavailable', 'no_repo_access', 'source_missing', 'other'):
+            result[key] = value
+        elif event in ('crash.collect', 'crash.source', 'crash.unified.chunk') and key in ('stopReason', 'outcome') and value in (
+                'start', 'done', 'deadline', 'timeout', 'permission', 'exit', 'parse', 'error'):
+            result[key] = value
+        elif event in ('crash.collect', 'crash.source', 'crash.unified.skip') and key in ('skipReason', 'reason') and value == 'lag_ceiling':
+            result[key] = value
+        elif event == 'crash.unified.chunk' and key in ('chunk', 'timeoutS') and type(value) in (int, float) and math.isfinite(value) and value >= 0:
             result[key] = value
         elif key == 'stopReason' and value in ('done', 'budget', 'killed'):
             result[key] = value
@@ -211,7 +280,7 @@ def safe_fields(values, event=None):
             result[key] = None
         elif key in BOOLEANS and type(value) is bool:
             result[key] = value
-        elif key in NUMBERS and type(value) in (int, float) and math.isfinite(value):
+        elif key in NUMBERS and finite_number(value):
             result[key] = value
         elif key in TEXT and isinstance(value, str) and ATOM.fullmatch(value) and not SECRET.search(value):
             result[key] = value
@@ -225,7 +294,7 @@ def record(component, kind, name, now, duration_ms=None, ok=None, ids=None, prop
         raise ValueError('invalid component')
     row = dict(ts=now.isoformat(timespec='milliseconds').replace('+00:00', 'Z'), tool='mac',
                component=component, kind=kind, name=name)
-    if type(duration_ms) in (int, float) and math.isfinite(duration_ms) and duration_ms >= 0:
+    if finite_number(duration_ms) and duration_ms >= 0:
         row['durationMs'] = round(duration_ms, 3)
     if type(ok) is bool:
         row['ok'] = ok
@@ -283,7 +352,12 @@ def emit(component, kind, name, *, duration_ms=None, ok=None, ids=None, props=No
                 else:
                     os.close(capfd)
                     append(fd, record('logger', 'error', 'log.cap', now, ok=False, error_tag='log.cap'))
-                if kind != 'error':
+                # A coverage gap must survive the cap before its checkpoint
+                # retires it. Ordinary crash summaries remain capped.
+                coverage_gap = (component == 'crashes' and name in (
+                    'crash.unified.skip', 'crash.source', 'crash.collect') and
+                    row.get('props', {}).get('skippedS', 0) > 0)
+                if kind != 'error' and not coverage_gap:
                     return
             append(fd, row)
         finally:

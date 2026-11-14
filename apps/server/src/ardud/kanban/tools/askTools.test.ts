@@ -199,6 +199,74 @@ it.effect("card_ask warns when an ask cannot clear an open evaluator gate", () =
   }).pipe(Effect.provide(testLayer())),
 );
 
+it.effect('#94: card_ask warns about kind "secret" for approval without changing its preset', () =>
+  Effect.gen(function* () {
+    const { kanban, board } = yield* setup;
+    const card = yield* kanban.createCard(
+      board.id,
+      {
+        title: "Approve finished work",
+        prompt: "Work",
+        subtasks: [
+          { text: "Write code", owner: "work" },
+          { text: "Review", owner: "review" },
+          { text: "Check access", owner: "evaluator", gate: "secret" },
+        ],
+      },
+      owner,
+    );
+    const warning =
+      'Kind "secret" asks Abdullah to type a secret value. To approve s3, ask a decision naming s3 instead.';
+    const asked = yield* call(evaluator, "card_ask", {
+      card: card.id,
+      kind: "secret",
+      question: "Approve s3?",
+      title: "Approve the completed step",
+    });
+    assert.isFalse(asked.isError, asked.text);
+    assert.strictEqual(asked.structured.note, warning);
+    const stored = (yield* kanban.card(card.id)).card.asks.at(-1)!;
+    assert.strictEqual(stored.kind, "secret");
+    assert.isNull(stored.closedAt);
+    assert.deepStrictEqual(stored.respond?.fields, [
+      { id: "secret", label: "Approve the completed step", type: "secret", required: true },
+    ]);
+
+    const unnamed = yield* call(evaluator, "card_ask", {
+      card: card.id,
+      kind: "secret",
+      question: "Close the card?",
+    });
+    assert.isFalse(unnamed.isError, unnamed.text);
+    assert.strictEqual(
+      unnamed.structured.note,
+      `This ask won't clear s3 (secret). Name s3 in the text if it should. ${warning}`,
+    );
+
+    const decision = yield* call(evaluator, "card_ask", {
+      card: card.id,
+      kind: "decision",
+      question: "Approve s3?",
+      options: ["Approve", "Hold"],
+    });
+    assert.isFalse(decision.isError, decision.text);
+    assert.notProperty(decision.structured, "note");
+  }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect("card_ask permits a real secret request on an ungated card without a warning", () =>
+  Effect.gen(function* () {
+    const { card } = yield* setup;
+    const asked = yield* call(evaluator, "card_ask", {
+      card: card.id,
+      kind: "secret",
+      question: "What is the mirror job token?",
+    });
+    assert.isFalse(asked.isError, asked.text);
+    assert.notProperty(asked.structured, "note");
+  }).pipe(Effect.provide(testLayer())),
+);
+
 it.effect("card_ask has no gate warning for work, review or ungated steps", () =>
   Effect.gen(function* () {
     const { kanban, board } = yield* setup;
@@ -579,6 +647,8 @@ it("the card_ask description says what he can give back, and stays short", () =>
     "blocks",
     "html",
     "alt text",
+    "Kind secret asks him to type a secret value",
+    "ask a decision or action naming its id",
   ]) {
     assert.include(description, word);
   }

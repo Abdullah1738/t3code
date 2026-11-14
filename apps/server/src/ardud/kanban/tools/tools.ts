@@ -124,7 +124,19 @@ const SubtasksInput = describe(
           "Who does it: the worker, the reviewer (ticked when the review passes), an evaluator, or a board script (the script ticks it from its output; the evaluator hears about it only if the script hands it back). Required for a new subtask; omitted on an existing open id, keeps its owner. Done and skipped subtasks keep their owner.",
         ),
       ),
-      gate: Schema.optional(Schema.Literals(["deploy", "money", "secret"])),
+      gate: Schema.optional(Schema.NullOr(Schema.Literals(["deploy", "money", "secret"]))),
+      clearGate: Schema.optional(
+        describe(
+          TrimmedNonEmptyString,
+          "Evaluators: remove a gate the board guessed on this existing subtask, with the reason it is wrong. Abdullah gets a notice. A gate set on purpose can't be cleared this way; ask him naming the subtask id.",
+        ),
+      ),
+      interrupting: Schema.optional(
+        describe(
+          Schema.Boolean,
+          "Evaluator only: set on the install or restart subtask that interrupts running work; omit to preserve, false clears.",
+        ),
+      ),
       ownerOnly: Schema.optional(
         describe(
           Schema.Boolean,
@@ -744,6 +756,17 @@ const WikiRead = tool(
   { readonly: true },
 );
 
+const GatedResult = {
+  gated: Schema.Array(
+    Schema.Struct({
+      id: Schema.String,
+      gate: Schema.Literals(["deploy", "money", "secret"]),
+      source: Schema.Literals(["guessed"]),
+    }),
+  ),
+  message: Schema.optional(Schema.String),
+};
+
 const CardCreate = tool(
   "card_create",
   "Create a card",
@@ -778,7 +801,7 @@ const CardCreate = tool(
     ),
     subtasks: Schema.optional(SubtasksInput),
   },
-  { card: Record, brief: Schema.optional(Schema.String) },
+  { card: Record, brief: Schema.optional(Schema.String), ...GatedResult },
   { readonly: false },
 );
 
@@ -828,14 +851,14 @@ const CardEdit = tool(
     subtasks: Schema.optional(SubtasksInput),
     comment: Schema.optional(Schema.String),
   },
-  { card: Record },
+  { card: Record, ...GatedResult },
   { readonly: false },
 );
 
 const SubtaskDone = tool(
   "subtask_done",
   "Mark a subtask",
-  "Mark a card subtask done (with a short note on what was done) or skipped (with why). Workers mark the worker's subtasks of their own card, in the step the card is on; the review's are ticked when it passes. Evaluators mark any, and can set one open again. Doing a subtask follows the board's other rules: a message that needs the owner's approval still goes to him first, and the subtask stays open until it's sent. Unless standing deploy approval covers it, a gated subtask needs the owner's answer on an ask naming its id; a refusal says which ask is missing. With a standing approval live, keep deploy steps worded honestly; don't reword them to dodge the gate.",
+  "Mark a card subtask done (with a short note on what was done) or skipped (with why). Workers mark the worker's subtasks of their own card, in the step the card is on; the review's are ticked when it passes. Evaluators mark any, and can set one open again. Doing a subtask follows the board's other rules: a message that needs the owner's approval still goes to him first, and the subtask stays open until it's sent. Unless standing deploy approval covers it, a gated subtask needs the owner's answer on an ask naming its id; a refusal says which ask is missing. With a standing approval live, keep deploy steps worded honestly; don't reword them to dodge the gate. Evaluators may skip a deploy-, money- or secret-gated evaluator or script step without the owner's answer when the note gives the reason (10–300 characters); Abdullah gets a notice, and marking it done still needs his OK.",
   {
     boardId: BoardRef,
     card: Schema.optional(CardRef),
@@ -893,6 +916,21 @@ const BoardInstructionsSet = tool(
     text: Schema.String,
     card: CardRef,
     ask: TrimmedNonEmptyString,
+  },
+  { board: Record, applied: Schema.Boolean, reason: Schema.optional(Schema.String) },
+  { readonly: false, destructive: true },
+);
+
+const BoardSettingsSet = tool(
+  "board_settings_set",
+  "Apply approved board settings",
+  'Evaluators: set guessedGates to the value Abdullah approved in a closed change ask with an approved verdict. Its change/changes entry must label "<Board> guessed gates" (board slug or name; guessedGates also accepted), with before equal to the current setting and after equal to value: sort gates and join with ", " ("deploy, money, secret", "money, secret", "" for none; "(unset)" for an absent current setting).',
+  {
+    boardId: Schema.optional(TrimmedNonEmptyString),
+    card: CardRef,
+    ask: TrimmedNonEmptyString,
+    setting: Schema.Literals(["guessedGates"]),
+    value: Schema.Array(Schema.Literals(["deploy", "money", "secret"])),
   },
   { board: Record, applied: Schema.Boolean, reason: Schema.optional(Schema.String) },
   { readonly: false, destructive: true },
@@ -1110,6 +1148,7 @@ export const KanbanToolkit = Toolkit.make(
   CardThread,
   PoolSet,
   BoardInstructionsSet,
+  BoardSettingsSet,
   PoolRemove,
   GoalSet,
   GroupSet,

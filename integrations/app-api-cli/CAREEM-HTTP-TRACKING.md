@@ -1,5 +1,10 @@
 # Careem 26.39 native HTTP tracking/auth contract
 
+Read-only recheck, 14 November 2026: the managed capture interpreter's
+`careem_account_auth.py status` still returns `ACCOUNT_CAPTURE_REQUIRED`.
+No CUSTOMER session is available. The order-list host-binding gate remains;
+no bootstrap, refresh, OTP, marker changes or customer-network calls were made.
+
 Current status (8 October 2026): **blocked; no CUSTOMER session**. Account
 bootstrap/refresh and native Food read scaffolding are implemented, not verified
 customer tracking. Guest GET userinfo and native proof-of-work returned200.

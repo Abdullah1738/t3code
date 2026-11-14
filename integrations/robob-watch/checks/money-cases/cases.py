@@ -60,6 +60,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import charges  # noqa: E402
+from state_json import write_json as atomic_write_json
 import payments  # noqa: E402
 # Inbox triage already uses the watcher helper named toollog in this process.
 _log_spec = importlib.util.spec_from_file_location('money_cases_orders_log', Path(__file__).resolve().with_name('toollog.py'))
@@ -416,7 +417,7 @@ def check_watcher(watcher_id, root=None):
 
 
 UNMATCHED = 'unmatched'
-KINDS = ('charge', 'hold', 'payment_deadline', 'autopay_expected')
+KINDS = ('charge', 'hold', 'payment_deadline', 'autopay_expected', 'charge_unconfirmed')
 # Sent once after 2 days of reminders with no answer. The case then stays quiet until he answers.
 ASK = ('no reply from you for 2 days. Yes or no: keep chasing this case, or close it? '
        'I stay quiet on it until you answer')
@@ -548,14 +549,21 @@ def explain_charge(data, charge, at, now, deadline=None, find=None, said=None, q
     if shared and shared['verdict'] in ('receipt', 'owner', 'subscription'):
         return shared
     stop = deadline if deadline is not None else time.time() + 30
-    for q in [current] + [q for q in questions if q['id'] != qid and alert_alias(current, q)]:
+    aliases = [current] + [q for q in questions if q['id'] != qid and alert_alias(current, q)]
+    memo = {('orders_cache',): Path(data or DATA) / 'order-details.json'}
+    for app in ('noon', 'careem'):
+        times = [parse_time(q['at']) - charges.SAME_TIME for q in aliases
+                 if charges.order_app(charge_of(q)) == app]
+        if times:
+            memo[('orders_since', app)] = min(times)
+    for q in aliases:
         each = min(stop, time.time() + FOLLOW_EACH)
         try:
             with within(each, LookupTimeout('out of time')):
                 purchase = purchase_match(data, charge_of(q), parse_time(q['at']), q['id']) if purchases else None
                 result = purchase or charges.explain(
                     charge_of(q), parse_time(q['at']), now, each, find, said,
-                    receipt_ok=receipt_for_question(data, charge_of(q), q['id'], rows, parse_time(q['at'])))
+                    receipt_ok=receipt_for_question(data, charge_of(q), q['id'], rows, parse_time(q['at'])), memo=memo)
         except (charges.Lookup, LookupTimeout) as exc:
             result = {'verdict': 'unverified', 'why': 'sources unreadable; do not ask', 'errors': [str(exc)]}
         if result.get('purchase') and q['id'] != qid:
@@ -663,33 +671,17 @@ def read_json(path, default):
         return default
 
 
+if os.environ.get("WATCH_ATTEMPT"):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "helpers"))
+    from watch_admission import admitted_check
+else:
+    def admitted_check(fn):
+        return fn
+
+
+@admitted_check
 def write_json(path, obj, timing=None):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix='.' + path.name + '.', dir=path.parent)
-
-    def put(text):
-        pending = memoryview(text.encode('utf-8'))
-        while pending:
-            written = os.write(fd, pending)
-            if not written:
-                raise OSError('could not write temporary JSON file')
-            pending = pending[written:]
-
-    try:
-        # No buffered stream: closing after an interrupted flush must not retry the write.
-        put(json.dumps(obj, ensure_ascii=False, indent=1) + '\n')
-        os.fsync(fd)
-        if timing is not None:
-            # Sample after the data fsync; the timing footer and its fsync are also bounded.
-            os.lseek(fd, -2, os.SEEK_END)
-            put(',\n "timing": ' + json.dumps(timing(), ensure_ascii=False) + '\n}\n')
-            os.fsync(fd)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
-    finally:
-        os.close(fd)
-        if os.path.exists(tmp):
-            os.unlink(tmp)
+    return atomic_write_json(path, obj, timing)
 
 
 def load(data=None):
@@ -2017,17 +2009,20 @@ def runner_fires(wd):
 
 
 def runner_owns(wd, out):
-    """Whether the runner has accepted this check's output: it is saved as the runner's pending event.
+    """Whether the runner saved this output in its pending delivery or person-chat batch.
 
-    The runner saves `pending` (with the event text) before it acks the run, so a match means it will retry
+    The runner saves the event text before it acks the run, so a match means it will retry
     the event itself. No match and no delivery means the output was lost before acknowledgement."""
     try:
-        pending = json.loads((wd / 'state.json').read_text()).get('pending') or {}
+        runner = json.loads((wd / 'state.json').read_text())
+        pending = runner.get('pending') or {}
     except (OSError, ValueError, AttributeError):
         return False
     # An outbox from before this field (or an empty one) has no event to match, so it is never owned.
     event = (out.get('event') or '').strip()
-    return bool(event) and (pending.get('event') or '').strip() == event
+    queued = (runner.get('batch') or {}).get('events') or []
+    return bool(event) and ((pending.get('event') or '').strip() == event
+                            or any(isinstance(item, str) and item.strip() == event for item in queued))
 
 
 def delivery_time(out, wd):
@@ -2209,6 +2204,9 @@ def alert_verdict(evidence, q, now):
     explained = next((r for r in results if r['verdict'] in ('receipt', 'owner', 'subscription')), None)
     if explained:
         return explained
+    unreadable = next((r for r in results if r['verdict'] == 'unverified'), None)
+    if unreadable:
+        return unreadable
     waits = [r for r in results if r['verdict'] == 'wait' and (moment(r.get('until')) or now) > now]
     if waits:
         return max(waits, key=lambda r: parse_time(r['until']))
@@ -2449,7 +2447,8 @@ def screen(text, sender='', at=None, now=None, deadline=None, data=None, find=No
                 if verdict == 'wait':
                     q['wait_until'] = r['until']
             prune_questions(book, now)
-    return {**base, 'verdict': verdict, 'why': r['why'], 'id': qid, 'errors': r['errors']}
+    return {**base, 'verdict': verdict, 'why': r['why'], 'id': qid, 'errors': r['errors'],
+            **({'limits': r['limits']} if r.get('limits') else {})}
 
 
 def triaged(data, outcomes, now=None):
@@ -2518,6 +2517,8 @@ def ask(data, question, text=None, sender='', at=None, qid=None, now=None, deadl
         if r.get('purchase') and not bind_purchase(data, r, at, q['id']):
             r = explain_charge(data, charge, at, now, deadline, find, said, q['id'], purchases=False)
         note_why(q, r['why'], now)
+        if r['verdict'] == 'unverified' and not r['errors']:
+            return 4, f"UNVERIFIED: {r['why']} ({q['id']})"
         if r['errors']:
             return 4, '\n'.join(f"UNVERIFIED: source {e.split(':', 1)[0]} unreadable ({q['id']})" for e in r['errors'])
         if r['verdict'] in ('receipt', 'owner', 'subscription'):
@@ -2589,11 +2590,12 @@ def answered(data, qid, note, now=None):
 def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, stats=None):
     """Close questions a receipt or his words now explain, including ones already turned into money
     cases (FOLLOW_CASE). Asked questions remain awaiting_answer indefinitely. Least recently checked
-    first, at most FOLLOW_EACH seconds each, so one slow
-    question doesn't starve the rest. Lookups run outside the lock; returns lookup errors."""
+    first initially, then round robin. Persist the cursor before lookups so an interrupted
+    run cannot keep retrying its head. Lookups run outside the lock; returns lookup errors."""
     errors, hits, verdicts, looked, failed = [], {}, {}, set(), set()
     todo = []
-    questions = load_questions(data)['questions']
+    question_book = load_questions(data)
+    questions = question_book['questions']
     transactions = alert_verdicts(questions, now)
     cases, repaired = load(data)['cases'], set()
     for q in questions:
@@ -2623,15 +2625,72 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
         if active(q) or (q.get('status') == 'case' and now - at <= FOLLOW_CASE):
             todo.append((q.get('checked') or '', at, q))
     stats = stats if stats is not None else {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
-    memo = {}
-    source = said or (lambda *a, **kw: charges.owner_texts(*a, **kw, stats=stats))
+    # Count the active input snapshot, including deferred questions. not_checked
+    # is a subset of limited; only completed, error-free screens are proven_clean.
+    with charges.step_timing(stats, 'census'):
+        census = stats['charge_census'] = {app: dict.fromkeys(
+            ('open', 'matched', 'proven_clean', 'limited', 'error', 'not_checked'), 0)
+            for app in ('noon', 'careem')}
+        census_questions = {}
+        for q in questions:
+            app = charges.order_app(charge_of(q)) if q.get('kind') == 'charge' and active(q) else None
+            if app in census:
+                census_questions[q['id']] = app
+                for key in ('open', 'limited', 'not_checked'):
+                    census[app][key] += 1
+    census_outcomes = {}
+
+    def counted(qid, outcome):
+        old = census_outcomes.get(qid)
+        census_outcomes[qid] = outcome
+        app = census_questions.get(qid)
+        if app is None:
+            return
+        census[app][old or 'limited'] -= 1
+        if old is None:
+            census[app]['not_checked'] -= 1
+        census[app][outcome] += 1
+
+    memo = {('orders_cache',): Path(data) / 'order-details.json'}
+    for app in ('noon', 'careem'):
+        times = [at - charges.SAME_TIME for _, at, q in todo
+                 if q.get('kind') == 'charge' and charges.order_app(charge_of(q)) == app]
+        if times:
+            memo[('orders_since', app)] = min(times)
+    owner_source = said or (lambda *a, **kw: charges.owner_texts(*a, **kw, stats=stats))
+    source_error = None
+
+    def source(*args, **kwargs):
+        nonlocal source_error
+        if source_error is not None:
+            raise source_error
+        try:
+            # Old questions query separate windows; all windows share this cap.
+            remaining = charges.OWNER_BUDGET - stats.get('owner_threads_ms', 0) / 1000
+            if remaining <= 0:
+                raise charges.Lookup('Robob control: lookup over time')
+            stop = time.time() + remaining
+            if kwargs.get('deadline') is not None:
+                stop = min(stop, kwargs['deadline'])
+            kwargs['deadline'] = stop
+            with charges.step_timing(stats, 'owner_threads', stop), within(
+                    stop, charges.Lookup('Robob control: lookup over time')):
+                rows = owner_source(*args, **kwargs)
+                if time.time() >= stop:
+                    raise charges.Lookup('Robob control: lookup over time')
+                return rows
+        except charges.Lookup as exc:
+            if str(exc) != 'out of time':
+                source_error = exc
+            raise
     charge_times = [at for _, at, q in todo if q.get('kind') == 'charge']
     owner_rows = None
     owner_error = None
     if charge_times and now - (min(charge_times) - charges.OWNER_AROUND) <= dt.timedelta(days=2):
         try:
-            with within(deadline, LookupTimeout('out of time')):
-                owner_rows = source(min(charge_times) - charges.OWNER_AROUND, now, deadline=deadline)
+            owner_end = min(deadline, time.time() + 4) if deadline is not None else time.time() + 4
+            with within(owner_end, LookupTimeout('out of time')):
+                owner_rows = source(min(charge_times) - charges.OWNER_AROUND, now, deadline=owner_end)
         except (charges.Lookup, LookupTimeout) as e:
             owner_error = f'his threads: {e}'
             errors.append(owner_error)
@@ -2642,15 +2701,34 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
             return source(since, until, deadline=deadline)
         return [row for row in owner_rows if since <= parse_time(row[0]) <= until]
 
-    for _, at, q in sorted(todo, key=lambda x: x[0]):
-        if deadline is not None and deadline - time.time() < 2:
+    ordered = sorted(todo, key=lambda x: (x[1], x[2]['id']))
+    cursor = question_book.get('follow_cursor')
+    if cursor:
+        previous = (parse_time(cursor['at']), cursor['id'])
+        ordered = [item for item in ordered if (item[1], item[2]['id']) > previous] + \
+                  [item for item in ordered if (item[1], item[2]['id']) <= previous]
+    else:
+        ordered.sort(key=lambda x: x[0])
+    for _, at, q in ordered:
+        # A shortened tail attempt can fail at the same point every cycle.
+        if deadline is not None and deadline - time.time() < FOLLOW_EACH:
             errors.append('out of time; the rest next check')
             break
+        commit_end = deadline
+        if end is not None:
+            latest = end - FOLLOW_EACH - 0.1
+            commit_end = min(commit_end, latest) if commit_end is not None else latest
+        with within(commit_end, CheckTimeout('cursor commit out of time; the rest next check')):
+            with Locked(data, 'questions', wait=lock_wait(commit_end)) as book:
+                book['follow_cursor'] = {'at': stamp(at), 'id': q['id']}
         looked.add(q['id'])
+        counted(q['id'], 'error')  # An interrupted attempt must never look clean.
         before_errors = len(errors)
+        limits = []
         if q.get('kind') == 'charge':
+            # Start the full slice after the cursor commit. The phase deadline admits
+            # work; the enclosing whole-check alarm still bounds storage and lookups.
             each = time.time() + FOLLOW_EACH
-            each = each if deadline is None else min(deadline, each)
             stats['lookups'] += 1
             try:
                 with within(each, LookupTimeout('out of time')):
@@ -2665,21 +2743,29 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
                         result = charges.explain(charge, at, now, each, find, owner,
                                                  receipt_ok=receipt_ok, memo=memo, stats=stats)
                         errors.extend(result['errors'])
+                        limits.extend(result.get('limits', []))
                         verdicts[q['id']] = result
                         if result['verdict'] in ('receipt', 'owner'):
                             hit = result
                     elif not hit:
                         hit = charges.found(charge, at, now, each, find, owner, errors, memo, stats,
-                                            receipt_ok=receipt_ok)
+                                            receipt_ok=receipt_ok, limits=limits)
             except (charges.Lookup, LookupTimeout) as e:
                 errors.append(str(e))
                 # A slow receipt cannot hide owner evidence already loaded in this run.
                 hit = charges.owner_found(charge_of(q), at, now, said=owner, errors=errors) \
                     if owner_rows is not None and charges.card_owner(charge_of(q)) == 'abdullah' else None
+            counted(q['id'], 'matched' if hit else 'error' if owner_error or len(errors) > before_errors
+                    else 'limited' if limits else 'proven_clean')
             if hit:
                 hits[q['id']] = hit
-            if owner_error or len(errors) > before_errors:
+            if limits and not hit:
+                stats.setdefault('question_limits', []).extend(limits)
+            if owner_error or len(errors) > before_errors or (limits and not hit):
                 failed.add(q['id'])
+    stats['order_coverage'] = {app: result['lanes'] for (kind, *rest), result in memo.items()
+                               if kind == 'orders' and isinstance(result, dict) and 'lanes' in result
+                               for app in rest}
     if not looked and not repaired:
         return errors
     with Locked(data, 'questions', wait=lock_wait(end)) as book:
@@ -2693,6 +2779,7 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
             purchase = hit.get('purchase')
             if purchase and not bind_purchase(data, hit, parse_time(q['at']), q['id']):
                 failed.add(q['id'])
+                counted(q['id'], 'error')
                 errors.append(f"{q['id']}: purchase note matched a different charge; recheck next run")
                 continue
             verdicts[q['id']] = {k: v for k, v in hit.items() if k != 'purchase'}
@@ -2736,6 +2823,7 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
                 except CheckTimeout:
                     raise
                 except CaseError as e:
+                    counted(q['id'], 'error')
                     errors.append(f"{q['id']}: {e}")
             if result and not hit and active(q):
                 note_why(q, result['why'], now)
@@ -2752,6 +2840,23 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
                         raise
                     except CaseError as e:
                         errors.append(f"{q['id']}: {e}")
+        # Reconcile from a snapshot: updating one alias must not propagate its
+        # outcome through another alias to a distinct same-descriptor question.
+        with charges.step_timing(stats, 'census', end):
+            attempted = census_outcomes.copy()
+            for q in book['questions']:
+                if q['id'] not in census_questions:
+                    continue
+                if q.get('status') == 'closed' and (q.get('explanation') or {}).get('verdict') in (
+                        'receipt', 'owner', 'subscription'):
+                    counted(q['id'], 'matched')
+                elif active(q) and q['id'] in attempted:
+                    result = alert_verdict(transactions, q, now)
+                    if result and result['verdict'] == 'unverified':
+                        peers = transactions.get(unmatched_id(q), [])
+                        failed_alias = any(attempted.get(source['id']) == 'error' and alert_alias(q, source)
+                                           for source, _ in peers)
+                        counted(q['id'], 'error' if failed_alias else 'limited')
         prune_questions(book, now)
     return errors
 
@@ -2891,8 +2996,9 @@ def direct_refund_statement(evidence, done, merchant):
     return lead in ('', 'your', 'the', 'our', 'this', 'that') or money
 
 
-def refund_mails(data, now, deadline, find=None, read=None):
-    find, read = find or charges.search, read or charges.show
+def refund_mails(data, now, deadline, find=None, read=None, stats=None):
+    find = find or (lambda *a, **kw: charges.search(*a, **kw, stats=stats))
+    read = read or (lambda *a, **kw: charges.show(*a, **kw, stats=stats))
     errors = []
     for case in load(data)['cases']:
         merchant = case['merchant']
@@ -3184,13 +3290,79 @@ def payment_entries(cases, now, sent, pending=False):
     return entries
 
 
+def follow_order_charges(data, now, deadline, find=None, stats=None, end=None, registry=None, read=None):
+    import order_charges
+    registry = registry or Path(os.environ.get('ORDER_TRACKER_ROOT', '~/.local/state/order-tracker')).expanduser()
+    source = find or (lambda *args, **kwargs: charges.search(*args, **kwargs, stats=stats))
+    reader = read or (lambda *args, **kwargs: charges.show(*args, **kwargs, stats=stats))
+    book = load(data)
+    settled = book.get('order_charges', {})
+    orders = {cfg['watcher']: cfg for cfg in order_charges.registrations(registry)}
+    for case in book['cases']:
+        if case.get('kind') == 'charge_unconfirmed' and active(case) and case.get('order_registration'):
+            cfg = case['order_registration']
+            orders.setdefault(cfg['watcher'], cfg)
+    errors = []
+    # Rotate long lists so a noisy archive cannot starve the same older order forever.
+    for wid, cfg in sorted(orders.items(), key=lambda pair: settled.get(pair[0], {}).get('checked', '')):
+        prior = settled.get(wid, {})
+        placed = parse_time(cfg['placed_at'])
+        if prior.get('confirmed') or now < placed + dt.timedelta(minutes=15):
+            continue
+        cid = 'order-charge-' + hashlib.sha256(wid.encode()).hexdigest()[:20]
+        case = next((c for c in book['cases'] if c['id'] == cid), None)
+        if case and not active(case):
+            continue
+        if time.time() + 1 >= deadline:
+            break
+        proof = None
+        try:
+            each = min(deadline, time.time() + 4)
+            with within(each, LookupTimeout('order charge lookup out of time')):
+                peers = [dict(other, bank_confirmed_at=(settled.get(key, {}).get('confirmed') or {}).get('at'))
+                         for key, other in orders.items()]
+                proof = order_charges.matching_charge(cfg, now, source, reader, each, charges, peers)
+        except (charges.Lookup, LookupTimeout) as exc:
+            errors.append(f'{wid}: {exc}')
+        # One transaction owns both the per-order receipt and its case. Concurrent
+        # checks and repeated SMS/email copies cannot open a second case.
+        with Locked(data, wait=lock_wait(end or deadline + 2)) as current:
+            notes = current.setdefault('order_charges', {})
+            if notes.get(wid, {}).get('confirmed'):
+                continue
+            notes[wid] = {'checked': stamp(now), 'confirmed': proof}
+            settled[wid] = notes[wid]
+            live = next((c for c in current['cases'] if c['id'] == cid), None)
+            if proof:
+                if live and active(live):
+                    live.update(status='closed', closed=stamp(now), updated=stamp(now),
+                                outcome='bank charge confirmed')
+                    live['history'].append({'at': stamp(now), 'text': 'bank charge confirmed', 'source': proof['source']})
+            elif live is None:
+                merchant = check_text('merchant', order_charges.merchant(cfg))
+                current['cases'].append({
+                    'id': cid, 'kind': 'charge_unconfirmed', 'merchant': merchant,
+                    'amount': check_amount(cfg['amount']), 'currency': check_currency(cfg.get('currency', 'AED')),
+                    'card': cfg['card_last4'], 'reference': cfg['order'], 'charged': placed.date().isoformat(),
+                    'state': 'charge unconfirmed', 'next': 'Check bank evidence; do not pay or reorder again',
+                    'deadline': stamp(placed + dt.timedelta(minutes=15)),
+                    'why': 'No matching bank charge observed 15 minutes after order placement; this does not prove payment failed',
+                    'who': 'Moni' if cfg.get('for') == 'moni' else 'Abdullah', 'watchers': [], 'status': 'open',
+                    'asks': [], 'rev': 0, 'cycle': 0, 'opened': stamp(now), 'updated': stamp(now),
+                    'closed': None, 'outcome': None, 'history': [{'at': stamp(now), 'text': 'opened'}],
+                    'order_registration': cfg})
+    return errors
+
+
 @log_scope
 def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
     diagnostic = {'budgetHit': False, 'openCases': 0, 'fired': 0, 'ok': False,
                   'slowest': 'reconcile', 'started': time.time()}
     try:
         event = _run_check(wd, run, data, root, now, find, said, diagnostic=diagnostic)
-        # Exceptions and incomplete work (lookup/lock timeouts, follow-up errors or an unsaved outbox) are not ok.
+        # ok means the pass completed and saved without errors, including source
+        # read failures. Known source limits alone are not errors; coverage and
+        # the census describe those. Exceptions leave the initial False intact.
         diagnostic['ok'] = diagnostic.get('complete', True)
         return event
     finally:
@@ -3199,9 +3371,19 @@ def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
             duration = diagnostic.get('total_s')
             if duration is None:
                 duration = time.time() - diagnostic['started']
+            stats = diagnostic.get('stats', {})
+            diagnostic['charge_census'] = stats.get('charge_census', {})
+            diagnostic['order_coverage'] = stats.get('order_coverage', diagnostic.get('order_coverage', {}))
             record_event('check.run', kind='perf', duration_ms=duration * 1000, ok=diagnostic['ok'],
                          props={key: diagnostic[key] for key in ('budgetHit', 'openCases', 'fired')} |
-                               {'slowestPhase': diagnostic['slowest']})
+                               {'slowestPhase': diagnostic['slowest'],
+                                'sourceLimits': diagnostic.get('sourceLimits', 0),
+                                'limitKinds': diagnostic.get('limitKinds', []),
+                                'orderCoverage': diagnostic.get('order_coverage', {}),
+                                'chargeCensus': diagnostic.get('charge_census', {}),
+                                **{key: stats.get(key, 0) for key in (
+                                    'owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms')},
+                                'starved_by': stats.get('starved_by', diagnostic.get('starved_by', 'none'))})
         except Exception:
             pass
 
@@ -3212,6 +3394,7 @@ def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *,
     # Reserve a second for the final save, which still has the whole-check deadline.
     work_end = end - 1
     stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+    diagnostic['stats'] = stats
     phases = {}
     phase, phase_at = 'reconcile', started
     now = (now or now_dubai()).astimezone(TZ)
@@ -3261,16 +3444,25 @@ def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *,
                 raise
             except CaseError as exc:
                 errors.append(str(exc))
+            errors += follow_order_charges(data or DATA, now, min(end - 28, time.time() + 6), find, stats, end=work_end)
             errors += follow_payments(data or DATA, now, min(end - 28, time.time() + 6), find, stats, end=work_end)
             errors += follow(data or DATA, now, root, min(end - 8, time.time() + FOLLOW_BUDGET), find, said,
                             end=work_end, stats=stats)
-            errors += refund_mails(data or DATA, now, time.time() + 8, find)
+            errors += refund_mails(data or DATA, now, time.time() + 8, find, stats=stats)
             phases[phase] = time.time() - phase_at
             phase, phase_at = 'attention', time.time()
             if errors:
                 state['question_errors'] = {'at': stamp(now), 'errors': errors[:10]}
             else:
                 state.pop('question_errors', None)
+            limits = stats.get('question_limits', [])
+            if limits:
+                state['question_limits'] = {'at': stamp(now), 'limits': [l['why'] for l in limits][:10]}
+            else:
+                state.pop('question_limits', None)
+            diagnostic['sourceLimits'] = len(limits)
+            diagnostic['limitKinds'] = sorted({kind for l in limits for kind in l['kinds']})
+            diagnostic['order_coverage'] = stats.get('order_coverage', {})
             # Only new keys may produce another event, even when delivery is never acknowledged.
             cases = load(data)['cases']
             diagnostic['openCases'] = sum(active(c) for c in cases)
@@ -3372,6 +3564,8 @@ def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *,
                                        'clock': starts, 'days': list(dict.fromkeys(days)), 'event': event}
     except CheckTimeout as e:
         diagnostic['budgetHit'] = time.time() >= work_end
+        if diagnostic['budgetHit']:
+            stats['starved_by'] = getattr(e, '_money_cases_step', phase)
         errors = state.setdefault('question_errors', {'at': stamp(now), 'errors': []})['errors']
         errors.append(str(e))
         # A partly built event was never handed to the runner. Keep only a previously owned outbox.
@@ -3389,7 +3583,9 @@ def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *,
         phases['build_write'] = built_s + time.time() - save_at
         return {'at': stamp(now), 'total_s': round(time.time() - started, 3),
                 **{f'{key}_s': round(value, 3) for key, value in phases.items()},
-                **stats, 'slowest': max(phases, key=phases.get)}
+                **{k: stats[k] for k in ('lookups', 'owner_queries', 'msgs_calls')},
+                **{k: stats.get(k, 0) for k in ('owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms')},
+                'starved_by': stats.get('starved_by', 'none'), 'slowest': max(phases, key=phases.get)}
 
     saved = False
     state.pop('timing', None)
@@ -3397,8 +3593,11 @@ def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *,
         with within(end, CheckTimeout('out of time saving pings; the rest next check')):
             write_json(pings, state, timing=timing)
             saved = True
-    except CheckTimeout:
-        diagnostic['budgetHit'] = diagnostic['budgetHit'] or time.time() >= end
+    except CheckTimeout as exc:
+        already_expired = diagnostic['budgetHit']
+        diagnostic['budgetHit'] = already_expired or time.time() >= end
+        if time.time() >= end and (save_at < end or not already_expired):
+            stats['starved_by'] = getattr(exc, '_money_cases_step', 'build_write')
         # The old pings file is intact; never emit an event without its committed outbox.
         event = ''
     result = timing()

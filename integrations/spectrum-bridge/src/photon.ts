@@ -249,7 +249,9 @@ export class Photon {
   async sendApp(input: {
     id: string; chatGuid: string; url: string; caption: string;
     subcaption?: string; trailingCaption?: string; trailingSubcaption?: string; summary?: string;
+    updateOf?: string; previewPage?: string;
   }): Promise<SendResult> {
+    if (input.updateOf) throw new TransportError("unsupported", false, false);
     if (!input.id.trim()) throw new TransportError("invalidOperationId");
     const chatGuid = canonicalRpcChat(input.chatGuid);
     let url: URL;

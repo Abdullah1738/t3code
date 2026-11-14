@@ -76,14 +76,18 @@ class NativeOrdersTest(unittest.TestCase):
             listing.assert_called_once_with(page=1, pages=3, limit=80, timeout=9)
 
     def test_food_dispatch_is_explicit_and_default_does_not_expand(self):
+        with patch('noon_vertical_reads.food_orders') as listing:
+            with self.assertRaisesRegex(orders.OrderError, 'INVALID_HISTORY_CURSOR'):
+                orders.orders('noon', service='food', page=2, cursor='opaque')
+            listing.assert_not_called()
         with patch('noon_vertical_reads.track', return_value={'status': 'delivered'}) as track:
             self.assertEqual(orders.track('noon', 'F123')['status'], 'delivered')
             track.assert_called_once_with('F123', 'food', 10)
         with patch('noon_vertical_reads.food_orders', return_value={'ok': True}) as listing:
             orders.orders('noon', service='food', timeout=7)
-            listing.assert_called_once_with(7)
-            with self.assertRaisesRegex(orders.OrderError, 'PAGINATION'):
-                orders.orders('noon', service='food', page=2)
+            listing.assert_called_once_with(7, page=1)
+            orders.orders('noon', service='food', page=2)
+            listing.assert_called_with(10, page=2)
 
     def test_nownow_precedes_marketplace_and_listing_is_explicit(self):
         with patch('noon_vertical_reads.track', return_value={'status': 'delivered'}) as track, \
@@ -93,9 +97,9 @@ class NativeOrdersTest(unittest.TestCase):
             market.assert_not_called()
         with patch('noon_vertical_reads.nownow_orders', return_value={'ok': True}) as listing:
             orders.orders('noon', service='nownow', timeout=7)
-            listing.assert_called_once_with(7)
-            with self.assertRaisesRegex(orders.OrderError, 'PAGINATION'):
-                orders.orders('noon', service='nownow', page=2)
+            listing.assert_called_once_with(7, page=1)
+            orders.orders('noon', service='nownow', page=2)
+            listing.assert_called_with(10, page=2)
 
     def test_marketplace_full_manifest_closes_only_without_scoped_conflict(self):
         manifest = {'status': 'delivered', 'whole_order_complete': True, 'manifest_complete': True,

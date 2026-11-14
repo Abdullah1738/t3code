@@ -1,6 +1,7 @@
 """boatd (the offbox server): restart reconcile, persistent queue, tokens per owner, health, retention.
 
 Runs anywhere: Incus, systemd, ZFS and /proc are replaced by fakes; SQLite and the HTTP handler are real."""
+import contextlib
 import io
 import importlib.util
 import json
@@ -372,6 +373,27 @@ class ReconcileBoxes(Base):
 
 
 class Queue(Base):
+    def test_sync_rows_never_block_fifo_or_consume_admission_capacity(self):
+        boatd.mem_available = lambda: 500 * 2**30
+        boatd.CFG["max_running"] = 1
+        b = self.box()
+        sync_queued = self.cmd(b, pid=1001, status="queued", age=200)
+        sync_running = self.cmd(b, pid=1002, age=0)
+        self.con.execute("UPDATE commands SET sync=1 WHERE box_id=?", (b,))
+        self.assertEqual(boatd.admitted_bytes(self.con), 0)
+        for pid in range(1003, 1006):
+            self.cmd(b, pid=pid, status="exited")
+            self.con.execute("UPDATE commands SET sync=1, metrics=? WHERE box_id=? AND pid=?",
+                             (json.dumps({"box_mem_peak": 100 * 2**30}), b, pid))
+        self.assertEqual(boatd.predicted_peak(self.con, "k"), int(boatd.CFG["default_peak_gb"] * 2**30))
+        detached = self.cmd(b, pid=1006, status="queued", age=100)
+        with patch.object(boatd.time, "sleep", side_effect=AssertionError("sync row blocked admission")):
+            boatd.admit(self.con, b, detached, "k", io.BytesIO())
+        self.assertEqual(self.status(b, sync_queued)["status"], "queued")
+        self.assertEqual(self.status(b, sync_running)["status"], "running")
+        self.assertEqual(self.status(b, detached)["status"], "running")
+        self.assertEqual(boatd.admitted_bytes(self.con), int(boatd.CFG["default_peak_gb"] * 2**30))
+
     def admit_now(self, bid, pid):
         """One admission round for a queued run: True if it was let in."""
         done = {}
@@ -522,6 +544,97 @@ class Http(Base):
         self.con.execute("UPDATE boxes SET state='ready' WHERE id=?", (bid,))
         self.f.running.add(bid)
         return bid
+
+    def test_sync_exec_runs_while_own_or_other_box_run_is_waiting_for_admission(self):
+        for same_box in (False, True):
+            with self.subTest(same_box=same_box), contextlib.ExitStack() as stack:
+                b = self.box("bx_same" if same_box else "bx_exec")
+                queued_box = b if same_box else self.box("bx_queued")
+                queued_pid = self.cmd(queued_box, status="queued")
+                entered, release = threading.Event(), threading.Event()
+                errors = []
+                def hold_admission(_):
+                    entered.set()
+                    if not release.wait(10):
+                        raise RuntimeError("fixture admission was not released")
+                def wait_for_memory():
+                    con = boatd.db()
+                    try:
+                        boatd.admit(con, queued_box, queued_pid, "k", io.BytesIO())
+                    except Exception as error:
+                        errors.append(error)
+                    finally:
+                        con.close()
+                def process(args, **kw):
+                    kw["stdout"].write(b"ready\n")
+                    return subprocess.CompletedProcess(args, 0)
+                def spawn(bid, pid, attempt):
+                    boatd.run_cmd(bid, pid)
+                stack.enter_context(patch.object(boatd, "load_cfg"))
+                stack.enter_context(patch.object(boatd, "mem_available", return_value=0))
+                stack.enter_context(patch.object(boatd.time, "sleep", side_effect=hold_admission))
+                stack.enter_context(patch.object(boatd, "spawn_runner", side_effect=spawn))
+                stack.enter_context(patch.object(boatd, "ct_exec"))
+                stack.enter_context(patch.object(boatd.subprocess, "run", side_effect=process))
+                stack.enter_context(patch.object(boatd, "snapshot"))
+                stack.enter_context(patch.object(boatd, "prune_snaps"))
+                th = threading.Thread(target=wait_for_memory)
+                th.start()
+                try:
+                    self.assertTrue(entered.wait(10))
+                    st, data = self.call("ardud", "POST", f"/sandboxes/{b}/commands", {"command": "private command"})
+                    self.assertEqual(st, 200, data)
+                    self.assertEqual((data["stdout"], data["exitCode"], data["queuedMs"]), ("ready\n", 0, 0))
+                    self.assertGreaterEqual(data["runMs"], 0)
+                    self.assertEqual(self.status(queued_box, queued_pid)["status"], "queued")
+                    row = self.status(b, data["processId"])
+                    self.assertEqual((row["sync"], row["queued_s"], row["timeout_s"]), (1, 0, 60))
+                    self.assertIsNotNone(row["started_at"])
+                    self.assertIsNotNone(row["ended_at"])
+                    events = [json.loads(line) for p in (self.tmp / "shared-logs").glob("*.ndjson")
+                              for line in p.read_text().splitlines() if json.loads(line)["name"] == "exec.sync"]
+                    self.assertEqual(events[-1]["props"]["queueMs"], 0)
+                    self.assertFalse(events[-1]["props"]["killed"])
+                    self.assertNotIn("private command", json.dumps(events))
+                finally:
+                    (boatd.cmd_dir(queued_box) / f"{queued_pid}.kill").write_text("kill")
+                    release.set()
+                    th.join(10)
+                self.assertFalse(th.is_alive())
+                self.assertEqual(errors, [])
+
+    def test_sync_timeout_body_preserves_partial_streams_and_timings(self):
+        b = self.box()
+        def spawn(bid, pid, attempt):
+            con = boatd.db()
+            con.execute("UPDATE commands SET status='running', started_at=?, queued_s=0 WHERE box_id=? AND pid=?",
+                        (boatd.now(), bid, pid))
+            con.close()
+            (boatd.cmd_dir(bid) / f"{pid}.out").write_text("partial stdout\n")
+            (boatd.cmd_dir(bid) / f"{pid}.err").write_text("partial stderr\n")
+        real_kill = boatd.kill_cmd
+        def kill(con, bid, pid):
+            # Keep the real bookkeeping without a delayed systemctl stop in this fixture.
+            with patch.object(boatd.threading, "Thread"):
+                real_kill(con, bid, pid)
+        with patch.object(boatd, "spawn_runner", side_effect=spawn), patch.object(boatd, "kill_cmd", side_effect=kill):
+            st, data = self.call("ardud", "POST", f"/sandboxes/{b}/commands",
+                                 {"command": "private command", "timeoutSeconds": 1})
+        self.assertEqual((st, data["code"], data["processId"]), (408, "command_timeout", 1001))
+        self.assertFalse(data["ok"])
+        self.assertEqual((data["stdout"], data["stderr"]), ("partial stdout\n", "partial stderr\n"))
+        self.assertEqual(data["queuedMs"], 0)
+        self.assertGreaterEqual(data["runMs"], 1000)
+        self.assertTrue(data["killed"])
+        self.assertTrue(data["receivedAt"])
+        self.assertEqual(self.status(b, 1001)["timeout_s"], 1)
+
+    def test_detached_post_still_enters_admission(self):
+        b = self.box()
+        st, data = self.call("ardud", "POST", f"/sandboxes/{b}/commands", {"command": "true", "detached": True})
+        self.assertEqual(st, 200)
+        row = self.status(b, data["processId"])
+        self.assertEqual((row["status"], row["sync"], row["timeout_s"]), ("queued", 0, None))
 
     def test_health_needs_no_token_and_carries_no_box_or_owner_data(self):
         self.make_box("moni")

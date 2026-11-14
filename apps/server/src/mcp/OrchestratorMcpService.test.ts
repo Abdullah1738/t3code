@@ -1142,6 +1142,109 @@ describe("OrchestratorMcpService", () => {
       }),
   );
 
+  it.effect.each(
+    (["cancelled", "interrupted", "failed"] as const).flatMap((status) =>
+      (["linked", "legacy", "missing_spawn_target"] as const).map((link) => ({ status, link })),
+    ),
+  )("reads an unsettled old task as $status with $link run lookup", ({ status, link }) =>
+    Effect.gen(function* () {
+      const parentThreadId = ThreadId.make("thread:old-task-parent");
+      const childThreadId = ThreadId.make("thread:old-task-child");
+      const taskId = NodeId.make("node:old-task");
+      const now = yield* DateTime.now;
+      const parent = {
+        thread: { id: parentThreadId },
+        runs: [],
+        contextTransfers: [],
+        subagents: [
+          {
+            id: taskId,
+            threadId: parentThreadId,
+            origin: "app_owned",
+            childThreadId,
+            driver: "codex",
+            model: "gpt-6.1-sol",
+            status: "running",
+            result: null,
+            completionDelivery: { state: "pending" },
+          },
+        ],
+      } as unknown as OrchestrationV2ThreadProjection;
+      const child = {
+        thread: { id: childThreadId },
+        runs: [
+          {
+            id: RunId.make("run:old-task"),
+            ordinal: 1,
+            status,
+            startedAt: now,
+            completedAt: now,
+            ...(link === "linked" ? { delegatedTaskId: taskId } : {}),
+          },
+        ],
+        contextTransfers:
+          link === "missing_spawn_target"
+            ? [
+                {
+                  type: "subagent_spawn",
+                  sourceThreadId: parentThreadId,
+                  targetThreadId: childThreadId,
+                  targetRunId: null,
+                },
+              ]
+            : [],
+        messages: [],
+        subagents: [],
+        providerThreads: [],
+        providerTurns: [],
+        runtimeRequests: [],
+        turnItems: [],
+      } as unknown as OrchestrationV2ThreadProjection;
+      const dependencies = Layer.mergeAll(
+        NodeServices.layer,
+        Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getCallerRow: (id) => Effect.succeed(liveThreadShell(id)),
+          getThreadShell: (id) => Effect.succeed(liveThreadShell(id)),
+          getThreadRecords: (id) => Effect.succeed(id === parentThreadId ? parent : child),
+          delegatedTaskResultPending: () => Effect.succeed(false),
+        }),
+        ServerSettings.layerTest(),
+        Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+        Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+          list: () => Effect.succeed([]),
+        }),
+        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(SecretRequests.SecretRequests)({}),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        const result = yield* service.taskStatus(
+          {
+            environmentId: EnvironmentId.make("environment:old-task"),
+            requestNamespace: "old-task",
+            thread: {
+              threadId: parentThreadId,
+              providerSessionId: "old-task",
+              providerInstanceId: ProviderInstanceId.make("codex"),
+            },
+            client: undefined,
+            capabilities: new Set(["orchestration"]),
+            issuedAt: 1,
+          },
+          taskId,
+        );
+        assert.equal(result.status, status);
+        assert.equal(result.workState, "result_available");
+        assert.isNull(result.currentRunId);
+        assert.equal(result.latestTerminalStatus, status);
+        assert.isFalse(result.hasPendingChildRuns);
+        assert.equal(result.childRunId, link === "missing_spawn_target" ? null : child.runs[0]!.id);
+        assert.isNotNull(result.summary);
+      }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
+    }),
+  );
+
   it.effect.each([false, true])(
     "settles a run-less restart task with continuation pending=%s",
     (continuationPending) =>
@@ -2736,6 +2839,7 @@ describe("OrchestratorMcpService provider resolution", () => {
         const releaseLookup = yield* Deferred.make<void>();
         const watching = yield* Deferred.make<void>();
         const parent = parentProjection([]);
+        const target = { ...parent, thread: { ...parent.thread, deletedAt: null } };
         const dependencies = Layer.mergeAll(
           NodeServices.layer,
           Layer.mock(ThreadManagementService.ThreadManagementService)({
@@ -2744,7 +2848,7 @@ describe("OrchestratorMcpService provider resolution", () => {
             getThreadRecords: () =>
               Deferred.succeed(enteredLookup, undefined).pipe(
                 Effect.andThen(Deferred.await(releaseLookup)),
-                Effect.as(parent),
+                Effect.as(target),
               ),
             waitForThread: ({ timeoutMs }) =>
               Deferred.succeed(watching, undefined).pipe(

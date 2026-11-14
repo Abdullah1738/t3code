@@ -27,10 +27,12 @@ export const ensureShellLookupIndexes = Effect.fn("ensureShellLookupIndexes")(fu
   `;
   // Control pages/counts must not fetch each thread's payload to inspect lineage.
   // Keep the narrow recency index above for other queries; only control opts into this one.
+  // Epoch ordering also treats imported ISO dates with and without fractional seconds equally.
   yield* sql`
-    CREATE INDEX IF NOT EXISTS ardud_control_thread_candidates_idx
+    CREATE INDEX IF NOT EXISTS ardud_control_thread_candidates_desc_idx
     ON orchestration_v2_projection_threads(
-      updated_at DESC, thread_id ASC, deleted_at, project_id,
+      CAST(ROUND(unixepoch(updated_at, 'subsec') * 1000) AS INTEGER) DESC,
+      thread_id DESC, updated_at, deleted_at, project_id,
       json_extract(payload_json, '$.archivedAt') IS NOT NULL,
       json_extract(payload_json, '$.lineage.relationshipToParent'),
       json_extract(payload_json, '$.lineage.parentThreadId'),
@@ -38,6 +40,7 @@ export const ensureShellLookupIndexes = Effect.fn("ensureShellLookupIndexes")(fu
       json_extract(payload_json, '$.creationSource')
     )
   `;
+  yield* sql`DROP INDEX IF EXISTS ardud_control_thread_candidates_idx`;
   // The pull-request sweeps list every thread that has links, every ~23 s. Without this
   // they read each thread row's payload to test it (0.5-6 s on the live database, 10 Nov).
   // Its predicate is the sweep query's WHERE, term for term, so no other read can use it,
@@ -57,6 +60,12 @@ export const ensureShellLookupIndexes = Effect.fn("ensureShellLookupIndexes")(fu
       Effect.logWarning("Could not prepare the threads-with-pull-requests index", { cause }),
     ),
   );
+  // Startup repair scans only active runless turns, then probes roots by primary key.
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_runless_provider_turns_live_idx
+    ON orchestration_v2_projection_provider_turns(thread_id, node_id)
+    WHERE run_attempt_id IS NULL AND status IN ('pending', 'running')
+  `;
   // Only unfinished running turns need the second range scan.
   yield* sql`
     CREATE INDEX IF NOT EXISTS ardud_provider_turns_running_started_idx

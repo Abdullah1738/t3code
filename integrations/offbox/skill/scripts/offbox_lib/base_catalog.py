@@ -66,7 +66,7 @@ def validate(name: str, repo_key: str) -> None:
     if not available:
         raise missing(full)
     selected = backend_label(common.backend())
-    # Automatic failover also pins Boat in the re-executed process; home-only bases still use its recipe fallback.
+    # Automatic failover pins Boat too; _new_box refuses a home-only explicit base on that path.
     if (common.backend_pinned() and not os.environ.get("OFFBOX_FAILOVER")
             and not any(r["backend"] == selected for r in available)):
         r = available[0]

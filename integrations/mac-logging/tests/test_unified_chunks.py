@@ -22,6 +22,12 @@ class UnifiedChunkTests(unittest.TestCase):
         env = patch.dict(os.environ, TOOLLOG_DIR=str(self.logs))
         env.start()
         self.addCleanup(env.stop)
+        fixed = patch.object(collector, 'UNIFIED_FIRST_CHUNK_S', 900)
+        fixed.start()
+        self.addCleanup(fixed.stop)
+        growth = patch.object(collector, 'next_unified_chunk', side_effect=lambda size, elapsed, model=None: (900, model))
+        growth.start()
+        self.addCleanup(growth.stop)
         self.clock = 0
         self.calls = []
         self.cost = 12
@@ -77,13 +83,13 @@ class UnifiedChunkTests(unittest.TestCase):
         self.assertEqual((state['unifiedRetry']['windowStart'], state['unifiedRetry']['windowEnd']), (9100,10000))
         self.assertEqual(self.rows('crash.source')[-1]['props']['chunksDone'], 3)
         self.cost = 12
-        self.assertTrue(self.collect(17200))
+        self.assertTrue(self.collect(12700))
         self.assertEqual(self.calls[4][:2], (9100,10000))
-        self.assertEqual(jobs.read_state('crashes')['unified'], 17200)
+        self.assertEqual(jobs.read_state('crashes')['unified'], 12700)
         observed = self.rows('crash.observed')
         self.assertEqual([r['props']['observedAt'] for r in observed], list(self.boots))
         self.assertEqual(sum(r['props']['count'] for r in observed), 4)
-        self.assertTrue(self.collect(20800))
+        self.assertTrue(self.collect(16300))
         self.assertEqual(self.rows('crash.source')[-1]['props']['skippedS'], 0)
 
     def test_completed_chunk_is_checkpointed_before_next_command(self):
@@ -113,6 +119,7 @@ class UnifiedChunkTests(unittest.TestCase):
                 state = jobs.read_state('crashes')
                 self.assertEqual(state['unified'], cursor)
                 self.assertEqual(state['unifiedRetry']['skippedS'], 81000)
+                self.assertTrue(self.collect(10000))
                 self.assertTrue(self.collect(17200))
                 self.assertEqual(jobs.read_state('crashes')['unified'], 17200)
                 self.assertNotIn('unifiedRetry', jobs.read_state('crashes'))
@@ -123,7 +130,8 @@ class UnifiedChunkTests(unittest.TestCase):
                 self.assertEqual(len(sources), 2)
                 self.assertEqual(sources[0]['props']['skippedS'], 81000)
                 self.assertEqual(sources[1]['props']['skippedS'],1800)
-                self.assertEqual(summaries[0]['props']['skippedS'], 82800)
+                self.assertEqual(summaries[0]['props']['skippedS'], 81000)
+                self.assertEqual(summaries[1]['props']['skippedS'], 1800)
                 observed = [r['props']['observedAt'] for r in rows if r['name'] == 'crash.observed']
                 self.assertEqual(observed, list(self.boots))
                 self.assertEqual([(a,b) for a,b,_ in self.calls],
@@ -138,6 +146,7 @@ class UnifiedChunkTests(unittest.TestCase):
         self.assertEqual(self.rows('crash.collect')[-1]['props']['skippedS'], 81000)
         self.assertEqual(jobs.read_state('crashes')['unifiedRetry']['skippedS'], 0)
         self.cost = 12
+        self.assertTrue(self.collect(10000))
         self.assertTrue(self.collect(17200))
         self.assertEqual(self.rows('crash.source')[-2]['props']['skippedS'], 0)
         self.assertEqual(self.rows('crash.source')[-1]['props']['skippedS'], 1800)
@@ -229,12 +238,12 @@ class UnifiedChunkTests(unittest.TestCase):
         self.chunk_cost = lambda window_s: 15
         self.clock = 0
         before = len(self.calls)
-        self.assertTrue(self.collect(13870))
+        self.assertTrue(self.collect(13600))
         self.assertEqual([(a,b) for a,b,_ in self.calls[before:]],
                          [(8200,9100),(9100,10000),(10000,10900),(10900,11800),
-                          (11800,12700),(12700,13600),(13600,13870)])
-        self.assertEqual(self.clock, 105)
-        self.assertEqual(jobs.read_state('crashes')['unified'], 13870)
+                          (11800,12700),(12700,13600)])
+        self.assertEqual(self.clock, 90)
+        self.assertEqual(jobs.read_state('crashes')['unified'], 13600)
         self.assertNotIn('unifiedRetry', jobs.read_state('crashes'))
         self.assertEqual(self.rows('crash.collect')[-1]['props']['skippedS'], 0)
         self.assertEqual([r['props']['observedAt'] for r in self.rows('crash.observed')], list(self.boots))

@@ -1,3 +1,4 @@
+import { messageLengthError } from "./message-length.ts";
 import { cardKind, toolError, toolLog } from "./toollog.ts";
 import { constants } from "node:fs";
 import { lstat, open, stat } from "node:fs/promises";
@@ -80,7 +81,7 @@ const OPTIONS_BY_COMMAND: Record<string, string[]> = {
   guests: ["session"],
   "guest-send": ["address", "text", "session", "key"],
   "share-contact": ["address", "chat", "session"],
-  app: ["url", "caption", "subcaption", "trailing", "trailing-subcaption", "summary", "session", "key", "to"],
+  app: ["url", "caption", "subcaption", "trailing", "trailing-subcaption", "summary", "session", "key", "to", "update-id", "preview-page"],
   "secret-request": ["purpose", "field", "card", "session", "key"],
   secret: ["token", "field", "forget"],
   publish: ["port", "app"],
@@ -273,7 +274,7 @@ export function parseCommand(args: string[]): Command {
       const session = required(values.session, "--session");
       if (session.length > 200 || /\s|[\x00-\x1f\x7f-\x9f]/.test(session)) throw new CliError("Invalid --session");
       const text = values.text ?? "";
-      if (text.length > 12_000) throw new CliError("--text must be at most 12000 characters");
+      if (text.length > 12_000) throw new CliError(messageLengthError(text, 12_000));
       const body: Record<string, string> = { file, dedupeKey, text, sessionId: session };
       if (values.mime !== undefined) {
         if (!validMimeType(values.mime)) throw new CliError("Invalid --mime");
@@ -292,7 +293,7 @@ export function parseCommand(args: string[]): Command {
     }
     case "send": {
       const text = required(values.text, "--text");
-      if (text.length > 12_000) throw new CliError("--text must be at most 12000 characters");
+      if (text.length > 12_000) throw new CliError(messageLengthError(text, 12_000));
       if (values.to !== undefined) {
         if (values.effect !== undefined || values.subject !== undefined) throw new CliError("--to does not take --effect or --subject");
         return { method: "POST", path: "/send", body: { text, to: chatSlug(values.to), ...session() } };
@@ -310,7 +311,7 @@ export function parseCommand(args: string[]): Command {
     }
     case "wake": {
       const text = required(values.text, "--text");
-      if (text.length > 12_000) throw new CliError("--text must be at most 12000 characters");
+      if (text.length > 12_000) throw new CliError(messageLengthError(text, 12_000));
       if (values.chat !== undefined) {
         const source = label(values.source, "--source", 100);
         return { method: "POST", path: "/wake",
@@ -346,7 +347,7 @@ export function parseCommand(args: string[]): Command {
         body: { sessionId: sessionOnly(values.session)!, ...(values.chat === undefined ? {} : { chat: chatSlug(values.chat) }) } };
     case "ask-owner": {
       const text = required(values.text, "--text");
-      if (text.length > 12_000) throw new CliError("--text must be at most 12000 characters");
+      if (text.length > 12_000) throw new CliError(messageLengthError(text, 12_000));
       return { method: "POST", path: "/ask-owner", body: { text, ...session() } };
     }
     case "chats": {
@@ -400,7 +401,7 @@ export function parseCommand(args: string[]): Command {
     case "guest-send": {
       const address = label(required(values.address, "--address"), "--address", 200)!;
       const text = required(values.text, "--text");
-      if (text.length > 2_000) throw new CliError("--text must be at most 2000 characters");
+      if (text.length > 2_000) throw new CliError(messageLengthError(text, 2_000));
       return { method: "POST", path: "/guest-send", body: { address, text, ...session() } };
     }
     case "share-contact": {
@@ -424,6 +425,15 @@ export function parseCommand(args: string[]): Command {
       if (!validAppUrl(url)) throw new CliError("--url must be an absolute https URL");
       const body: Record<string, string> = { url, caption: label(required(values.caption, "--caption"), "--caption", 200)!, ...session() };
       if (values.to !== undefined) body.to = chatSlug(values.to);
+      if (values["update-id"] !== undefined) {
+        if (!/^app:[a-f0-9]{64}$/.test(values["update-id"])) throw new CliError("--update-id must identify the original app operation");
+        body.updateOf = values["update-id"];
+      }
+      if (values["preview-page"] !== undefined) {
+        const previewPage = values["preview-page"];
+        if (!validAppUrl(previewPage) || new URL(previewPage).origin !== new URL(url).origin) throw new CliError("--preview-page must use the card origin");
+        body.previewPage = previewPage;
+      }
       for (const [option, field, max] of [["subcaption", "subcaption", 200], ["trailing", "trailingCaption", 200],
         ["trailing-subcaption", "trailingSubcaption", 200], ["summary", "summary", 500]] as const) {
         const value = label(values[option], `--${option}`, max);

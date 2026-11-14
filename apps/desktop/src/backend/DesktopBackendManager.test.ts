@@ -265,7 +265,7 @@ describe("DesktopBackendManager", () => {
         assert.equal(spawnedCommand.options.additionalFds?.fd5?.type, "output");
         assert.equal(
           Duration.toMillis(Duration.fromInputUnsafe(spawnedCommand.options.forceKillAfter)),
-          5_000,
+          10_000,
         );
 
         assert.deepEqual(yield* decodeBootstrap(bootstrapJson), configWithObservability);
@@ -981,14 +981,14 @@ describe("DesktopBackendManager", () => {
           assert.include(yield* Queue.take(starts), "pid=123");
           assert.equal(yield* Queue.take(outputWrites), "before timeout\n");
           yield* Deferred.await(firstProbe);
-          yield* TestClock.adjust(Duration.minutes(1));
+          yield* TestClock.adjust(Duration.minutes(3));
 
           const firstSnapshot = yield* Queue.take(snapshots);
-          assert.include(firstSnapshot.details, "Timed out after 60000ms");
+          assert.include(firstSnapshot.details, "Timed out after 180000ms");
           assert.deepEqual(firstSnapshot.chunks, ["before timeout\n"]);
           assert.equal(logged("httpReadiness.timedOut").length, 1);
 
-          yield* TestClock.adjust(Duration.minutes(1));
+          yield* TestClock.adjust(Duration.minutes(3));
           assert.equal(yield* Queue.size(snapshots), 0);
           assert.equal(logged("httpReadiness.timedOut").length, 1);
           assert.equal(logged("backend readiness check failed during bootstrap").length, 1);
@@ -997,7 +997,7 @@ describe("DesktopBackendManager", () => {
           assert.deepEqual(stillStarting[0]?.annotations, {
             component: `desktop-backend-instance:${DesktopBackendManager.PRIMARY_INSTANCE_ID}`,
             pid: 123,
-            elapsedMs: 120_000,
+            elapsedMs: 360_000,
           });
           assert.equal(spawnCount, 1);
           assert.isFalse((yield* instance.snapshot).ready);
@@ -1007,6 +1007,10 @@ describe("DesktopBackendManager", () => {
           yield* Deferred.await(backendReady);
           assert.isTrue((yield* instance.snapshot).ready);
           assert.equal(spawnCount, 1);
+          const recovered = logged("backend readiness recovered after timeout");
+          assert.lengthOf(recovered, 1);
+          assert.equal(recovered[0]?.annotations.pid, 123);
+          assert.equal(recovered[0]?.annotations.component, "desktop-backend-process");
 
           yield* Deferred.succeed(trailingOutput, void 0);
           assert.equal(yield* Queue.take(outputWrites), "after timeout\n");
@@ -1023,10 +1027,10 @@ describe("DesktopBackendManager", () => {
           yield* instance.start;
           assert.include(yield* Queue.take(starts), "pid=456");
           yield* Deferred.await(secondChildProbe);
-          yield* TestClock.adjust(Duration.minutes(1));
+          yield* TestClock.adjust(Duration.minutes(3));
 
           const nextSnapshot = yield* Queue.take(snapshots);
-          assert.include(nextSnapshot.details, "Timed out after 60000ms");
+          assert.include(nextSnapshot.details, "Timed out after 180000ms");
           assert.deepEqual(nextSnapshot.chunks, []);
           assert.equal(spawnCount, 2);
           assert.equal(logged("httpReadiness.timedOut").length, 2);

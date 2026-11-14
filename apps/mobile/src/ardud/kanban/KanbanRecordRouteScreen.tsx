@@ -57,7 +57,7 @@ export function KanbanRecordRouteScreen({
   const back = () => navigation.goBack();
   const filter = useBoardFilter(boardId);
 
-  if (record === null) {
+  if (record === null || state?.board.archivedAt != null) {
     return (
       <Shell title="Board" onBack={back}>
         <EmptyLine label="This link does not open anything." />

@@ -8,7 +8,7 @@ import math
 import os
 from pathlib import Path
 import tempfile
-from toollog import directory, private_dir, safe_fields
+from toollog import directory, private_dir, safe_fields, finite_number
 
 
 def rollup(day, root=None):
@@ -16,10 +16,12 @@ def rollup(day, root=None):
     root = Path(root) if root else directory()
     names, kinds, durations, tags, samples = Counter(), Counter(), defaultdict(list), Counter(), {}
     disk = dict(probes=0, timeouts=0, maxDurationMs=None, latestBlockedIn=None)
+    inventory = dict(scans=0, rootsOk=0, rootsPartial=0, rootsTimeout=0, rootsDenied=0, scanMs=0)
     backup = {key: dict.fromkeys(('memory', 'health', 'other'), 0)
               for key in ('skipped_runs', 'ok_runs', 'failed_runs')}
     latest_blocked_at = ''
-    waits = dict(runs=0, maxAgeS=None, latestStuckUnmountMountPoint=None)
+    waits = dict(runs=0, maxStuckForS=None, latestStuckUnmountMountPoint=None, busyRuns=0, topBusyComms=[])
+    busy_comms = Counter()
     latest_unmount_at = ''
     total = oks = failed = outcomes = malformed = 0
     source = root / (day + '.ndjson')
@@ -49,26 +51,43 @@ def rollup(day, root=None):
                             elif props.get('skipped') == 0 and row.get('ok') is False:
                                 backup['failed_runs'][target] += 1
                     value = row.get('durationMs')
-                    if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+                    if finite_number(value) and value >= 0:
                         durations[name].append(value)
                     if name == 'disk.tooling_probe':
                         props = row.get('props', {})
                         if not props.get('skipped'):
                             disk['probes'] += 1
                             disk['timeouts'] += props.get('timedOut') is True
-                            if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+                            if finite_number(value) and value >= 0:
                                 disk['maxDurationMs'] = max(disk['maxDurationMs'] or 0, value)
                         blocked = props.get('blockedIn')
                         stamp = row.get('ts', '')
                         if blocked in ('SKHelperClient', 'SKManager', 'DiskArbitration', 'DASession', 'unknown') and stamp >= latest_blocked_at:
                             disk['latestBlockedIn'], latest_blocked_at = blocked, stamp
+                    if name == 'disk.inventory' and not row.get('props', {}).get('skipReason'):
+                        inventory['scans'] += 1
+                        props = safe_fields(row.get('props'))
+                        for key in ('rootsOk', 'rootsPartial', 'rootsTimeout', 'rootsDenied', 'scanMs'):
+                            value = props.get(key)
+                            if type(value) in (int, float) and value >= 0:
+                                inventory[key] += value
                     if name == 'proc.disk_wait':
-                        props = safe_fields(row.get('props'), name)
+                        raw = row.get('props', {})
+                        props = safe_fields(raw, name)
+                        # Legacy ageS measured uptime, not a stuck duration. Keep
+                        # its maximum separate so old days remain readable.
+                        for proc in raw.get('procs', []):
+                            age = proc.get('ageS') if isinstance(proc, dict) and 'processAgeS' not in proc else None
+                            if type(age) is int and age >= 0:
+                                waits['legacyMaxProcessAgeS'] = max(waits.get('legacyMaxProcessAgeS', 0), age)
                         count = props.get('count', 0)
                         if count > 0:
                             waits['runs'] += 1
                         for proc in props.get('procs', []):
-                            waits['maxAgeS'] = max(waits['maxAgeS'] or 0, proc['ageS'])
+                            waits['maxStuckForS'] = max(waits['maxStuckForS'] or 0, proc['stuckForS'])
+                        if props.get('busyCount', 0) > 0:
+                            waits['busyRuns'] += 1
+                        busy_comms.update(p['comm'] for p in props.get('busy', []))
                         mount = props.get('mountPoint')
                         stamp = row.get('ts', '')
                         if props.get('stuckUnmount') and mount and stamp >= latest_unmount_at:
@@ -79,11 +98,12 @@ def rollup(day, root=None):
                         samples.setdefault(tag, safe_fields(row.get('ids')))
                 except (ValueError, TypeError, KeyError, AttributeError):
                     malformed += 1
+    waits['topBusyComms'] = [dict(comm=comm, count=count) for comm, count in busy_comms.most_common(5)]
     stats = {}
     for name, values in durations.items():
         values.sort()
         stats[name] = {key: values[max(0, math.ceil(len(values) * pct) - 1)] for key, pct in [('p50', .5), ('p95', .95), ('max', 1)]}
-    result = dict(day=day, tool='mac', backup=backup, diskTooling=disk, diskWait=waits, total=total, countsByName=dict(names), countsByKind=dict(kinds),
+    result = dict(day=day, tool='mac', backup=backup, diskTooling=disk, diskWait=waits, diskInventory=inventory, total=total, countsByName=dict(names), countsByKind=dict(kinds),
                   outcomes=outcomes, okRate=oks / outcomes if outcomes else None,
                   errorRate=kinds['error'] / total if total else None,
                   failedRate=failed / outcomes if outcomes else None, durationMs=stats, malformed=malformed,

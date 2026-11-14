@@ -116,29 +116,54 @@ Coordinates are normalized 0..1 from the top-left. Acks mean "dispatched", not
 "rendered": verify with a screenshot or the accessibility tree.
 
 ```bash
-runcloud ios screenshot $ID --output tmp/shot.png
-runcloud ios accessibility-tree $ID --json        # check `truncated`
-runcloud ios tap $ID 0.5 0.82
-runcloud ios swipe $ID 0.5 0.8 0.5 0.3 --duration 300
-runcloud ios type-text $ID "hello"
-runcloud android type-text $ID "hello"
-runcloud android set-clipboard $ID "text"
-runcloud ios press-button $ID home               # android: back, menu, home
-runcloud ios open-url $ID "myapp://route"
-runcloud ios logs $ID --tail 500
-runcloud ios recording start $ID --idempotency-key rec-1   # then stop / download
+runcloud ios screenshot "$ID" --output tmp/shot.png
+runcloud ios accessibility-tree "$ID" --json        # check `truncated`
+runcloud ios tap "$ID" 0.5 0.82
+runcloud ios swipe "$ID" 0.5 0.8 0.5 0.3 --duration 300
+runcloud ios type-text "$ID" "hello"
+runcloud android type-text "$ID" "hello"
+runcloud android set-clipboard "$ID" "text"
+runcloud ios press-button "$ID" home               # android: back, menu, home
+runcloud ios open-url "myapp://route" --id "$ID"
+runcloud ios logs "$ID" --tail 500
+runcloud ios recording start "$ID" --idempotency-key rec-1 --json
+# Set RECORDING_ID to the id returned by the successful recording start.
+runcloud ios recording stop "$ID" "$RECORDING_ID" --json
+runcloud ios recording download "$ID" "$RECORDING_ID" --output tmp/recording.mp4
 ```
 
+These forms were checked against CLI 0.2.183. `open-url` takes the session via
+`--id`, unlike the coordinate commands, which take the session ID positionally.
 Same commands under `runcloud android`. `unsupported_action` errors are final,
 don't retry them. `simulator_capacity_unavailable` means retry later.
+
+Scripted collectors must capture both stdout and stderr, plus the exit code:
+`runcloud ... --json` prints structured failure JSON on stderr. Empty stdout
+does not mean there was no error. Strip signed viewer URLs before saving either
+stream.
 
 Android typing: `completed` and `characterCount` acknowledge injection, not the
 field's value. With CLI 0.2.183, a 62-character onion arrived as `vwxy` (4 chars)
 in Settings search. Confirm focus before input and check the field and screen
-afterward. Read non-secure fields from the accessibility tree (AX);
-values containing `"` can read as null even when visible (#113), so also check
-a screenshot. For secure fields, use the app's validator or a Show password
-toggle (confirm masking is off before reading AX).
+afterward. Read non-secure fields from the accessibility tree (AX).
+TorSSH captures lost `"`-bearing values, labels and `contentDescription`; the
+wrapper/CLI/SDK preserve these strings. Later Settings probes preserved quotes,
+so check nulls against screenshots or app code before filing an app-label defect.
+For secure fields, use the app's validator or a Show password toggle (confirm
+masking is off before reading AX).
+Ctrl+A lost focus without selecting in Settings and reportedly dismissed TorSSH
+D17. Prefer touch Select all/Paste for public text; touch Paste matched six short
+Settings probes (including quotes/JSON), without proving a secure-field route.
+
+- Cursor editing (CLI 0.2.183, Settings search): `type-text abcdef` →
+  `press-key arrowLeft` → `type-text X` left `abcdef`, with Back focused,
+  including without intervening AX captures. Adding 0.5 s or 2 s after Left
+  did not help. A single `X` in an empty focused field passed 5/5; re-tapping
+  the field before typing appended correctly at all three tested waits.
+  After navigation keys, check the intended input's focus before typing or
+  Enter; re-focus and verify the value and cursor position. A tap may move
+  the cursor. TorSSH key-strip/Enter recovery remains unverified (#123).
+
 SDK paste: one unverified reporter success in TorSSH #15's app, using
 `setClipboard(text)` + `pressKey('v', control)`. CLI Ctrl-V paste
 (`set-clipboard` then `press-key v --control`) did not work in the 2026-11-14
@@ -153,7 +178,20 @@ blindly to hide the keyboard. After tapping a secure target, re-read AX and requ
 keys can reach another field or nowhere. System screens are affected too:
 TorSSH #86's observed Set a PIN / screen-lock sighting had ACKed digit input,
 `secure=true`, `focused=false` afterward and Next disabled (reported, not
-independently verified). For a focused field, per-character `press-key` has one
+independently verified).
+System PIN setup accepted keypad taps at display coordinates → Next → repeat taps
+→ Confirm (TorSSH #84, 2026-11-14; repeated in #129).
+On the SystemUI device-credential sheet (BiometricPrompt with DEVICE_CREDENTIAL),
+`typeText` and semantic `press-key` cancelled authentication even with
+`focused=true`; keypad taps never authenticated, AX omitted IME keys and secure
+screenshots were black.
+There is no verified route or exposed biometric simulation in CLI 0.2.183 / SDK
+0.49.0: pull `runcloud android logs $ID --tail 1000 --json` immediately after each
+route and classify the result, not the ACK (`BiometricService/AuthSession:
+Dismissed! … Error: 10` = USER_CANCELED).
+Wrong-PIN rejection needs a verification failure or explicit error on the still-open
+sheet; success needs App Lock `checked=true`, not just a dismissed prompt.
+For a focused field, per-character `press-key` has one
 reported hex-credential authentication success in TorSSH (alphanumeric only);
 symbols and Shift remain unverified.
 Never put real secrets on the clipboard or command lines that get logged or
@@ -164,6 +202,29 @@ The signed viewer `url` in create/get/list/delete JSON is a secret (anyone with
 it can drive the session). Never print or paste it; strip it with
 `jq 'del(.url)'`. rcsim redacts it and only sends it to Abdullah's Telegram.
 `rcsim link <id>` resends it.
+
+### `simulator_session_ended` (HTTP 410)
+
+This error is non-retryable. First confirm the command used the current help's
+argument form (especially `open-url URL --id ID`). Compare one
+`runcloud ios get "$ID" --json` (or `android get`) with the failed data-plane
+call. If get still says `active`, the control-plane record and simulator lease
+disagree; `expiresAt` does not prove the simulator is usable. Stop retrying that
+session, release it with `rcsim release "$ID"`, and create one fresh session
+through rcsim within the task's approved budget. Record both IDs, UTC timestamps,
+elapsed time since create, get status, exit codes and sanitized stdout/stderr.
+
+Measured 13 Nov 2026 with CLI 0.2.183, bare headless sessions, inactivity timeout
+`none` and hard timeout 7m: idle Android returned 410 at its first read after
+6m15.7s. Busy Android and iOS both succeeded at 5m00s, then returned 410 at
+5m30s despite accessibility reads every 30s. All three still reported `active`
+from get until released. This is consistent with a short simulator-lease cutoff;
+frequent API reads did not keep it alive. The provider's internal cause and
+connected-viewer behavior remain unverified.
+
+Finish data-plane work within about 5 minutes of `createdAt`; split longer work
+across fresh sessions within the approved budget. Heartbeats and a future
+`expiresAt` do not establish data-plane liveness.
 
 ## Building apps for a session
 

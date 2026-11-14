@@ -11,10 +11,16 @@ offbox_apt_install() {
 
 offbox_crpko_tools_ready() {
   [ -x /usr/local/bin/vector ] && [[ $(vector --version 2>/dev/null) == "vector $OFFBOX_VECTOR_VERSION "* ]] &&
-    [ -x /usr/bin/ruby ] && [ -x /usr/local/bin/aws ] && [[ $(aws --version 2>&1) == aws-cli/2.* ]]
+    [ -x /usr/bin/ruby ] && [ -x /usr/local/bin/aws ] && [[ $(aws --version 2>&1) == aws-cli/2.* ]] &&
+    command -v gh >/dev/null
 }
 
 offbox_crpko_tools() {
+  command -v gh >/dev/null || offbox_apt_install gh || return $?
+  if ! command -v gh >/dev/null; then
+    echo 'offbox: gh install failed' >&2
+    return 1
+  fi
   # Keep apt's refresh flag in the caller shell for later recipe installs too.
   if [ ! -x /usr/bin/ruby ]; then
     offbox_apt_install ruby || return $?

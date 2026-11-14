@@ -10,12 +10,13 @@ import plistlib
 import tempfile
 from pathlib import Path
 import re
+import signal
 import subprocess
 import time
 from jobs import (read_state, save_state, state_path, directory_inventory,
                   SourceFailure, source_error, stderr_line, permission_denied, deadline_call)
 from rollup import rollup
-from toollog import emit, private_dir
+from toollog import emit, private_dir, safe_fields, finite_number
 
 REPORT_DIRS = [Path('/Library/Logs/DiagnosticReports'), Path('/Library/Logs/DiagnosticReports/Retired'),
                Path.home() / 'Library/Logs/DiagnosticReports']
@@ -24,6 +25,9 @@ REPORT_DIRS = [Path('/Library/Logs/DiagnosticReports'), Path('/Library/Logs/Diag
 # launchd's hourly interval also accrues runtime, sleep and coalescing drift.
 UNIFIED_WINDOW_S = 5400
 UNIFIED_CHUNK_S = 900
+UNIFIED_FIRST_CHUNK_S = 60
+UNIFIED_CALL_S = 60
+UNIFIED_TARGET_S = 10
 UNIFIED_BUDGET_S = 135
 
 
@@ -108,7 +112,72 @@ def reports(root, since, until, deadline=None, completed=None, stats=None):
     return counts
 
 
-def unified(since, until, run=subprocess.run, timeout=60):
+def unified_command(command, capture_output=True, text=True, timeout=60, env=None):
+    # subprocess.run kills only its direct child and can wait indefinitely on
+    # inherited pipes or an unkillable process. Reserve time to reap the group.
+    end = time.monotonic()+min(UNIFIED_CALL_S, timeout)
+    reserve = min(1, max(0, timeout)/10)
+    child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=text, env=env, start_new_session=True)
+    try:
+        output, error = child.communicate(timeout=max(0, end-time.monotonic()-reserve))
+        return subprocess.CompletedProcess(command, child.returncode, output, error)
+    except BaseException:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            child.wait(timeout=max(0, end-time.monotonic()))
+        except subprocess.TimeoutExpired:
+            # A kernel-stuck process cannot be reaped on demand. Never let its
+            # wait or inherited pipes hold the rest of the collector hostage.
+            pass
+        finally:
+            for stream in (child.stdout, child.stderr):
+                if stream is not None:
+                    stream.close()
+        raise
+
+
+def next_unified_chunk(size, elapsed, model=None):
+    model = dict(model or {})
+    previous = model.get('previous')
+    limit = model.get('limit', UNIFIED_CHUNK_S)
+    if previous and abs(size-previous[0]) > .000001:
+        delta = size-previous[0]
+        rate = max(0, (elapsed-previous[1])/delta)
+        previous_rate = model.get('rate')
+        # A rising marginal cost invalidates the affine model. Keep that
+        # evidence for the run, even when later windows have the same size.
+        if (delta > 0 and previous_rate is not None and rate > previous_rate*1.5 and
+                elapsed-previous[1]-previous_rate*delta > 1):
+            model['nonlinear'] = True
+        model['rate'] = rate
+        overhead = max(0, elapsed-rate*size)
+        limit = UNIFIED_WINDOW_S if (rate*UNIFIED_WINDOW_S <= 1 or
+                    overhead >= rate*UNIFIED_CHUNK_S) else UNIFIED_CHUNK_S
+        if model.get('nonlinear'):
+            limit = UNIFIED_CHUNK_S
+        work_budget = max(0, min(max(UNIFIED_TARGET_S, overhead),
+                                UNIFIED_CALL_S-1-overhead))
+        size_next = max(UNIFIED_FIRST_CHUNK_S, min(limit, work_budget/max(.001, rate)))
+        # Startup can hide curvature in two tiny probes. Sample the nominal
+        # window before a large jump when the model leaves room for four calls.
+        # Expensive startup may only afford three calls to clear the ceiling.
+        if (max(size, previous[0]) < UNIFIED_CHUNK_S and rate*UNIFIED_WINDOW_S > 1 and
+                4*overhead+rate*UNIFIED_WINDOW_S <= UNIFIED_BUDGET_S):
+            size_next = min(size_next, UNIFIED_CHUNK_S)
+    elif previous:
+        size_next = max(UNIFIED_FIRST_CHUNK_S, min(limit,
+                        size*max(UNIFIED_TARGET_S, previous[1])/max(.001, elapsed)))
+    else:
+        size_next = min(limit, max(UNIFIED_FIRST_CHUNK_S, size*2))
+    model.update(previous=(size, elapsed), limit=limit)
+    return size_next, model
+
+
+def unified(since, until, run=unified_command, timeout=60):
     if timeout <= 0:
         raise SourceFailure('timeout', 'collector budget exhausted')
     since = max(since, until-UNIFIED_WINDOW_S)
@@ -117,7 +186,7 @@ def unified(since, until, run=subprocess.run, timeout=60):
     result = run(['/usr/bin/log', 'show', '--style', 'json', '--timezone', 'UTC',
                   '--start', stamp(since), '--end', stamp(until+1), '--predicate',
                   'eventMessage CONTAINS "=== system boot" OR (process == "kernel" AND eventMessage CONTAINS "PMU") OR (process == "watchdogd" AND eventMessage CONTAINS "unresponsive")'],
-                 capture_output=True, text=True, timeout=min(60, timeout),
+                 capture_output=True, text=True, timeout=min(UNIFIED_CALL_S, timeout),
                  env={**os.environ, 'LC_ALL': 'C'})
     if result.returncode:
         message = stderr_line(getattr(result, 'stderr', ''))
@@ -204,25 +273,65 @@ def collect(now=None, roots=None, log_reader=None, deadline=None):
                     skippedS=max(0, now-UNIFIED_WINDOW_S-cursor))
 
     window = state.get('unifiedRetry') or fresh_window(since)
+    # Frozen retries must obey the same moving ceiling as fresh windows.
+    # Otherwise one slow historical suffix can pin the reader forever.
+    floor = now-UNIFIED_WINDOW_S
+    if window['windowStart'] < floor:
+        skipped_before = window['skippedS']
+        window = dict(windowStart=floor, windowEnd=max(floor, window['windowEnd']),
+                      skippedS=skipped_before+floor-window['windowStart'])
     unified_deadline = min(deadline, source_started+UNIFIED_BUDGET_S)
     skipped = 0
+    stop_reason = 'done'
+    chunk_size = UNIFIED_FIRST_CHUNK_S
+    cost_model = None
     def lag():
         return max(0, now+time.monotonic()-started-state.get('unified', since))
 
     try:
         while True:
             window = dict(window, windowS=window['windowEnd']-window['windowStart'])
-            window.update(chunks=math.ceil(max(0, window['windowS'])/UNIFIED_CHUNK_S), chunksDone=0)
+            window.update(chunks=math.ceil(max(0, window['windowS'])/chunk_size), chunksDone=0,
+                          skipReason='lag_ceiling' if window['skippedS'] else None)
             cursor = window['windowStart']
+            if cursor > state.get('unified', since):
+                emit('crashes', 'event', 'crash.unified.skip', ok=True,
+                     props=dict(windowStart=state.get('unified', since), windowEnd=cursor,
+                                skippedS=cursor-state.get('unified', since), reason='lag_ceiling'))
+                state['unified'] = cursor
+                state['unifiedRetry'] = dict(windowStart=cursor, windowEnd=window['windowEnd'],
+                                             skippedS=window['skippedS'])
+                save_state('crashes', state)
             while cursor < window['windowEnd']:
-                end = min(cursor+UNIFIED_CHUNK_S, window['windowEnd'])
-                remaining = min(60, unified_deadline-time.monotonic())
+                end = min(cursor+chunk_size, window['windowEnd'])
+                window['chunks'] = window['chunksDone']+math.ceil((window['windowEnd']-cursor)/chunk_size)
+                remaining = min(UNIFIED_CALL_S, unified_deadline-time.monotonic())
                 if remaining <= 0:
+                    stop_reason = 'deadline'
                     raise SourceFailure('timeout', 'unified log budget exhausted')
-                if log_reader is None:
-                    observed = deadline_call(unified_deadline, unified, cursor, end, timeout=remaining)
-                else:
-                    observed = deadline_call(unified_deadline, log_reader, cursor, end)
+                chunk_started = time.monotonic()
+                chunk = dict(chunk=window['chunksDone']+1, windowStart=cursor,
+                             windowEnd=end, windowS=end-cursor, timeoutS=remaining)
+                emit('crashes', 'event', 'crash.unified.chunk', ok=None,
+                     props=dict(chunk, outcome='start', elapsedMs=0))
+                try:
+                    if log_reader is None:
+                        observed = deadline_call(unified_deadline, unified, cursor, end, timeout=remaining)
+                    else:
+                        observed = deadline_call(unified_deadline, log_reader, cursor, end)
+                except Exception as exc:
+                    timed_out = isinstance(exc, subprocess.TimeoutExpired) or (
+                        isinstance(exc, SourceFailure) and exc.failure == 'timeout')
+                    stop_reason = ('deadline' if remaining < UNIFIED_CALL_S or time.monotonic() >= unified_deadline else 'timeout') if timed_out else (
+                        exc.failure if isinstance(exc, SourceFailure) else 'error')
+                    emit('crashes', 'error', 'crash.unified.chunk', ok=False,
+                         props=dict(chunk, outcome=stop_reason,
+                                    elapsedMs=(time.monotonic()-chunk_started)*1000))
+                    raise
+                elapsed = time.monotonic()-chunk_started
+                emit('crashes', 'event', 'crash.unified.chunk', ok=True,
+                     props=dict(chunk, outcome='done', elapsedMs=elapsed*1000))
+                chunk_size, cost_model = next_unified_chunk(end-cursor, elapsed, cost_model)
                 counts.update(observed)
                 crash_observations(observed)
                 cursor = end
@@ -237,7 +346,7 @@ def collect(now=None, roots=None, log_reader=None, deadline=None):
             state.pop('unifiedRetry', None)
             emit('crashes', 'event', 'crash.source', ok=True,
                  props=dict(source='unified', elapsedMs=(time.monotonic()-source_started)*1000,
-                            lagS=lag(), **window))
+                            lagS=lag(), stopReason='done', **window))
             skipped += window['skippedS']
             # Persist the reported gap's retirement before a fresh command can
             # be interrupted; otherwise the next run would report it again.
@@ -252,10 +361,11 @@ def collect(now=None, roots=None, log_reader=None, deadline=None):
         state['unifiedRetry'] = dict(windowStart=cursor, windowEnd=window['windowEnd'],
                                      skippedS=window['skippedS'])
         source_error('crashes', 'crash.source', 'unified', source_started, exc,
-                     dict(window, lagS=lag()))
+                     dict(window, lagS=lag(), stopReason=stop_reason))
         skipped += window['skippedS']
         state['unifiedRetry']['skippedS'] = 0
-    window = dict(window, skippedS=skipped, lagS=lag())
+    window = dict(window, skippedS=skipped, lagS=lag(), stopReason=stop_reason,
+                  skipReason='lag_ceiling' if skipped else None)
     emit('crashes', 'error' if errors else 'perf', 'crash.collect', ok=not errors,
          duration_ms=(time.monotonic()-started)*1000,
          props={'count': sum(counts.values()), 'sourceErrors': errors, **window},
@@ -304,7 +414,7 @@ def process_snapshot(run, timeout=10):
             continue
         try:
             pid, ppid, age, stat = line[:comm_at].split()
-            proc = dict(pid=int(pid), ppid=int(ppid), ageS=elapsed_seconds(age),
+            proc = dict(pid=int(pid), ppid=int(ppid), processAgeS=elapsed_seconds(age),
                         stat=stat, comm=line[comm_at:args_at].strip(),
                         args=line[args_at:].strip())
             if proc['pid'] <= 0 or proc['ppid'] < 0 or not proc['comm']:
@@ -361,9 +471,256 @@ def process_starts(pids, run, timeout=10):
     return starts
 
 
-def disk_wait_alerts(procs, all_pids, run, deadline):
-    candidates = [p for p in procs if p['ageS'] >= 21600 or
-                  (p['comm'] in ('umount', '/sbin/umount') and p['ageS'] >= 1800)]
+DISK_WAIT_SAMPLES = 6
+
+
+def cpu_seconds(value):
+    if not re.fullmatch(r'(?:\d+-)?\d+(?::[0-5]\d){1,2}(?:\.\d+)?', value):
+        raise ValueError('invalid CPU time')
+    days, _, clock = value.rpartition('-')
+    parts = clock.split(':')
+    if days and len(parts) != 3:
+        raise ValueError('invalid CPU time')
+    return int(days or 0)*86400 + sum(float(n)*60**i for i, n in enumerate(reversed(parts)))
+
+
+def process_sample(pids, run, timeout):
+    result = run(['/bin/ps', '-p', ','.join(str(pid) for pid in pids),
+                  '-o', 'pid=,stat=,time='], capture_output=True, text=True, timeout=timeout,
+                 env={**os.environ, 'LC_ALL': 'C'})
+    # ps exits 1 when none of the selected processes remain.
+    if result.returncode and not (result.returncode == 1 and not result.stdout.strip()):
+        raise SourceFailure('exit', 'ps sample failed', result.returncode)
+    samples = {}
+    for line in result.stdout.splitlines():
+        try:
+            pid, stat, cpu = line.split()
+            pid = int(pid)
+            if pid not in pids or not re.fullmatch(r'[A-Za-z+<>-]{1,16}', stat):
+                raise ValueError()
+            samples[pid] = dict(stat=stat, cpuTime=cpu, cpu=cpu_seconds(cpu))
+        except ValueError:
+            raise SourceFailure('parse', 'invalid ps sample') from None
+    return samples
+
+
+def sample_disk_wait(candidates, run, deadline, sample_count=DISK_WAIT_SAMPLES):
+    observations = {p['pid']: [] for p in candidates}
+    count = 0
+    starts = {}
+    for i in range(sample_count):
+        if not observations:
+            break
+        remaining = deadline-time.monotonic()
+        if i:
+            if remaining <= 1:
+                break
+            time.sleep(1)
+            remaining = deadline-time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            sample = process_sample(observations, run, min(10, remaining))
+        except subprocess.TimeoutExpired:
+            # A deadline-limited call may expire after enough valid samples.
+            # Other failures still invalidate the observation in the caller.
+            if time.monotonic() >= deadline:
+                break
+            raise
+        count += 1
+        # Once a PID disappears, never re-admit it during this observation.
+        observations = {pid: rows+[sample[pid]] for pid, rows in observations.items() if pid in sample}
+        # Capture identity after the first CPU sample, before follow-ups can
+        # consume the budget needed to preserve an existing stuck duration.
+        if i == 0 and observations:
+            remaining = deadline-time.monotonic()
+            if remaining > 0:
+                starts = process_starts(observations, run, min(10, remaining))
+    return observations, count, starts
+
+
+def clone_wait_paths(proc):
+    # ps arguments are not shell input. A quote may be a literal filename
+    # character, so shell parsing must not suppress a known clone command.
+    args = proc['args'].split()
+    command = proc['comm'].rsplit('/', 1)[-1]
+    clone = command == 'clonefile'
+    operands = args[1:]
+    if command == 'cp':
+        for index, arg in enumerate(args[1:], 1):
+            if arg == '--':
+                operands = args[index+1:]
+                break
+            if not arg.startswith('-'):
+                operands = args[index:]
+                break
+            clone |= 'c' in arg[1:] and not arg.startswith('--')
+    paths = list(dict.fromkeys(operands if clone else (arg for arg in args[1:] if arg.startswith('/'))))
+    return clone, paths
+
+
+def exact_wait_paths(proc):
+    if any(char in proc['args'] for char in "'\"\\"):
+        return set()
+    args = proc['args'].split()
+    # A bare word after an absolute token may be part of an unquoted path.
+    # Omit that ambiguous operand rather than group unrelated files by prefix.
+    return {arg for index, arg in enumerate(args[1:], 1) if arg.startswith('/') and
+            (index == len(args)-1 or args[index+1].startswith(('/', '-')))}
+
+
+def clone_wait_alerts(procs, snapshot, starts, run, deadline):
+    root = state_path('clone-wait-alert').parent
+    with (root / 'clone-wait-alert.lock').open('a') as lock:
+        os.chmod(lock.name, 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        alive = {str(p['pid']) for p in snapshot}
+        state = {pid: entry for pid, entry in read_state('clone-wait-alert').items() if pid in alive}
+        # Several waiters for one pathname are one incident. A clone PID is
+        # preferred as its identity when it also belongs to that group.
+        groups = {}
+        for proc in procs:
+            identity = ('path', proc['_incidentPath']) if proc['_incidentPath'] else ('pid', proc['pid'])
+            groups.setdefault(identity, []).append(proc)
+        for group in groups.values():
+            group.sort(key=lambda p: (p['reason'] != 'clone', p['pid']))
+            existing = [state[str(p['pid'])] for p in group
+                if state.get(str(p['pid']), {}).get('start') == starts[p['pid']]]
+            sent_entry = next((entry for entry in existing if entry.get('sent')), None)
+            if sent_entry:
+                for member in group:
+                    state[str(member['pid'])] = dict(sent_entry, start=starts[member['pid']])
+                save_state('clone-wait-alert', state)
+                continue
+            proc = group[0]
+            pid = str(proc['pid'])
+            entry = existing[0] if existing else None
+            if entry is None:
+                path = safe_fields(dict(procs=[proc]), 'disk.clone_wedge')['procs'][0]['path']
+                key = 'mac-upkeep:clone-wait:%s:%s' % (pid, starts[proc['pid']])
+                entry = dict(start=starts[proc['pid']], key=key, sent=False,
+                    text='APFS clone/path I/O wait: pid %s, %s. This may be progressing; compare CPU time and iostat, then collect spindump. Avoid more clones or pathname probes.' % (pid, path))
+            remaining = deadline-time.monotonic()
+            if remaining <= 0:
+                break
+            # Queueing can succeed before notify returns. Persist every
+            # survivor's retry identity before that interruption window.
+            for member in group:
+                state[str(member['pid'])] = dict(entry, start=starts[member['pid']], sent=False)
+            save_state('clone-wait-alert', state)
+            try:
+                sent = notify(entry['text'], entry['key'], run, timeout=min(20, remaining))
+            except Exception:
+                sent = False
+            emit('disk', 'event' if sent else 'error', 'disk.clone_wedge_alert', ok=sent,
+                 error_tag=None if sent else 'disk.notify_failed')
+            for member in group:
+                state[str(member['pid'])] = dict(entry, start=starts[member['pid']], sent=sent)
+            save_state('clone-wait-alert', state)
+
+
+def clone_wait(snapshot, run, deadline):
+    deadline = min(deadline, time.monotonic()+20)
+    props = dict(count=0, procs=[], sampleCount=0, sampling='full')
+    try:
+        selected, by_path = {}, {}
+        for proc in snapshot:
+            if 'U' not in proc['stat'] or proc['comm'] in ('umount', '/sbin/umount'):
+                continue
+            clone, paths = clone_wait_paths(proc)
+            exact = exact_wait_paths(proc)
+            selected[proc['pid']] = (proc, clone, paths, exact)
+            for path in paths:
+                if path in exact:
+                    by_path.setdefault(path, set()).add(proc['pid'])
+        shared = {path: pids for path, pids in by_path.items() if len(pids) >= 2}
+        candidates = [p for p, clone, paths, exact in selected.values()
+                      if clone or any(p['pid'] in shared.get(path, ()) for path in paths)]
+        if candidates:
+            observations, count, starts = sample_disk_wait(candidates, run, deadline, sample_count=3)
+            props.update(sampleCount=count, sampling='full' if count == 3 else 'partial')
+            if count != 3:
+                raise SourceFailure('timeout', 'incomplete clone observation')
+            # Revalidate identity after sampling rather than attributing a
+            # recycled PID's CPU or wait channel to its predecessor.
+            remaining = deadline-time.monotonic()
+            if remaining <= 0:
+                raise SourceFailure('timeout', 'clone observation budget exhausted')
+            ends = process_starts(observations, run, min(5, remaining)) if observations else {}
+            valid = {pid: rows for pid, rows in observations.items()
+                     if pid in starts and starts[pid] == ends.get(pid)}
+            waiting = {pid for pid, rows in valid.items() if all('U' in r['stat'] for r in rows)}
+            shared = {path: pids & waiting for path, pids in shared.items() if len(pids & waiting) >= 2}
+            procs = []
+            for proc in candidates:
+                pid = proc['pid']
+                if pid not in waiting:
+                    continue
+                _, clone, paths, exact = selected[pid]
+                matched = [path for path in paths if pid in shared.get(path, ())]
+                if not clone and not matched:
+                    continue
+                procs.append(dict(pid=pid, path=(matched[0] if matched else paths[-1] if paths else ''),
+                    _incidentPath=matched[0] if matched else paths[-1] if paths and paths[-1] in exact else None,
+                    reason='clone' if clone else 'shared_path', processAgeS=proc['processAgeS'],
+                    wchan='-', cpuDeltaS=max(0, valid[pid][-1]['cpu']-valid[pid][0]['cpu'])))
+            if procs:
+                remaining = deadline-time.monotonic()
+                if remaining <= 0:
+                    raise SourceFailure('timeout', 'clone observation budget exhausted')
+                channels = run(['/bin/ps', '-p', ','.join(str(p['pid']) for p in procs), '-o', 'pid=,wchan='],
+                               capture_output=True, text=True, timeout=min(5, remaining))
+                for line in channels.stdout.splitlines() if channels.returncode == 0 else []:
+                    fields = line.split()
+                    if len(fields) == 2:
+                        for proc in procs:
+                            if fields[0] == str(proc['pid']):
+                                proc['wchan'] = fields[1]
+            props.update(count=len(procs), procs=procs[:10])
+            props = safe_fields(props, 'disk.clone_wedge')
+            emit('disk', 'event', 'disk.clone_wedge', ok=True, props=props)
+            clone_wait_alerts(procs, snapshot, starts, run, deadline)
+            return
+    except Exception as exc:
+        props.update(failure='timeout' if isinstance(exc, subprocess.TimeoutExpired) else (
+            exc.failure if isinstance(exc, SourceFailure) else 'unavailable'), sampling='partial')
+        emit('disk', 'error', 'disk.clone_wedge', ok=False, props=props, error_tag='disk.clone_probe_failed')
+        return
+    emit('disk', 'event', 'disk.clone_wedge', ok=True, props=props)
+
+
+def stuck_durations(procs, observations, starts, now):
+    previous = read_state('disk-wait-stuck')
+    state = {}
+    for proc in procs:
+        pid = proc['pid']
+        rows = observations[pid]
+        first = now
+        if pid in starts:
+            entry = previous.get(str(pid), {})
+            if not isinstance(entry, dict):
+                entry = {}
+            try:
+                # CPU progress between hourly observations also breaks a stall.
+                if (entry.get('start') == starts[pid] and
+                        cpu_seconds(entry.get('cpu', '')) == rows[0]['cpu'] and
+                        finite_number(entry.get('firstStuckAt')) and 0 <= entry['firstStuckAt'] <= now):
+                    first = entry['firstStuckAt']
+            except (TypeError, ValueError):
+                pass
+            state[str(pid)] = dict(start=starts[pid], firstStuckAt=first, cpu=rows[-1]['cpuTime'])
+        proc['stuckForS'] = max(0, int(now-first))
+        if proc['comm'] in ('umount', '/sbin/umount'):
+            proc['stuckForS'] = max(proc['stuckForS'], proc['processAgeS'])
+    save_state('disk-wait-stuck', state)
+
+
+def disk_wait_alerts(procs, all_pids, starts, run, deadline):
+    candidates = [p for p in procs if p['stuckForS'] >= 21600 or
+                  (p['comm'] in ('umount', '/sbin/umount') and p['stuckForS'] >= 1800)]
     if not candidates:
         return
     root = state_path('disk-wait-alert').parent
@@ -380,7 +737,6 @@ def disk_wait_alerts(procs, all_pids, run, deadline):
         remaining = deadline-time.monotonic()
         if remaining <= 0:
             return
-        starts = process_starts([p['pid'] for p in candidates], run, min(10, remaining))
         for proc in candidates:
             pid = str(proc['pid'])
             if proc['pid'] not in starts:
@@ -389,8 +745,8 @@ def disk_wait_alerts(procs, all_pids, run, deadline):
             entry = state.get(pid, {})
             if entry.get('key') != key:
                 mount = unmount_point(proc)
-                text = '%s (pid %s) is in disk wait; process age %.1fh%s. lsof and diskutil may hang; a reboot clears a stuck umount.' % (
-                    proc['comm'], pid, proc['ageS']/3600,
+                text = '%s (pid %s) has been stuck in disk wait for at least %.1fh%s. lsof and diskutil may hang; a reboot clears a stuck umount.' % (
+                    proc['comm'], pid, proc['stuckForS']/3600,
                     ', unmounting '+mount if mount else '')
                 entry = dict(key=key, text=text, sent=False)
                 state[pid] = entry
@@ -414,15 +770,34 @@ def disk_wait_alerts(procs, all_pids, run, deadline):
 
 def disk_wait(run=subprocess.run, deadline=None):
     deadline = min(time.monotonic()+45, deadline) if deadline is not None else time.monotonic()+45
-    props = dict(count=0, procs=[], stuckUnmount=False)
+    props = dict(count=0, procs=[], stuckUnmount=False, busyCount=0, busy=[],
+                 sampleCount=0, sampling='partial')
     try:
         remaining = deadline-time.monotonic()
         if remaining <= 0:
             raise SourceFailure('timeout', 'collector budget exhausted')
         snapshot = process_snapshot(run, min(10, remaining))
-        procs = sorted((p for p in snapshot if 'U' in p['stat'] and p['ageS'] >= 600),
-                       key=lambda p: (-p['ageS'], p['pid']))
-        props.update(count=len(procs), procs=[dict(p, args=p['args'][:300]) for p in procs[:10]])
+        clone_wait(snapshot, run, deadline)
+        candidates = sorted((p for p in snapshot if 'U' in p['stat'] and p['processAgeS'] >= 600),
+                            key=lambda p: (-p['processAgeS'], p['pid']))
+        observations, count, starts = sample_disk_wait(candidates, run, deadline)
+        props.update(sampleCount=count, sampling='full' if count == DISK_WAIT_SAMPLES or not candidates else 'partial')
+        procs, busy = [], []
+        for proc in candidates:
+            rows = observations.get(proc['pid'])
+            if not rows:
+                continue
+            stats = [r['stat'] for r in rows]
+            if count >= 3 and all('U' in stat for stat in stats) and rows[0]['cpu'] == rows[-1]['cpu']:
+                procs.append(dict(proc, args=proc['args'][:300], samples=stats, cpuTime=rows[-1]['cpuTime']))
+            else:
+                # Every candidate was in U in the full snapshot, including
+                # those that recovered before the first CPU sample.
+                busy.append(dict(pid=proc['pid'], comm=proc['comm'], processAgeS=proc['processAgeS'],
+                                 statSamples=stats, cpuDeltaS=max(0, rows[-1]['cpu']-rows[0]['cpu'])))
+        stuck_durations(procs, observations, starts, time.time())
+        procs.sort(key=lambda p: (-p['stuckForS'], -p['processAgeS'], p['pid']))
+        props.update(count=len(procs), procs=procs[:10], busyCount=len(busy), busy=busy[:10])
         unmounts = [p for p in procs if p['comm'] in ('umount', '/sbin/umount')]
         if unmounts:
             props['stuckUnmount'] = True
@@ -430,17 +805,20 @@ def disk_wait(run=subprocess.run, deadline=None):
             if mount:
                 props['mountPoint'] = mount
     except Exception as exc:
+        # An unobserved interval cannot extend a later stuck duration.
+        try:
+            save_state('disk-wait-stuck', {})
+        except Exception:
+            pass
         props['failure'] = 'timeout' if isinstance(exc, subprocess.TimeoutExpired) else (
             exc.failure if isinstance(exc, SourceFailure) else 'unavailable')
-        emit('proc', 'error', 'proc.disk_wait', ok=False, props=props,
-             error_tag='proc.ps_failed')
+        emit('proc', 'error', 'proc.disk_wait', ok=False, props=props, error_tag='proc.ps_failed')
         return props
     emit('proc', 'event', 'proc.disk_wait', ok=True, props=props)
     try:
-        disk_wait_alerts(procs, {str(p['pid']) for p in snapshot}, run, deadline)
+        disk_wait_alerts(procs, {str(p['pid']) for p in snapshot}, starts, run, deadline)
     except Exception:
-        emit('proc', 'error', 'proc.disk_wait_alert', ok=False,
-             error_tag='proc.alert_failed')
+        emit('proc', 'error', 'proc.disk_wait_alert', ok=False, error_tag='proc.alert_failed')
     return props
 
 

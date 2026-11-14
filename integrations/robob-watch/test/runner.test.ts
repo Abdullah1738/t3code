@@ -18,7 +18,7 @@ void ${JSON.stringify(failOn)};`);
 };
 const db = join(sandbox, "bridge.sqlite");
 Bun.spawnSync(["/usr/bin/sqlite3", db, `create table kv (key text primary key, value text); create table inbound (id text primary key, payload text, state text); insert into kv values ('route', '{"id":"ses_live123","generation":1}');`]);
-const env = { ...process.env, ROBOB_WATCH_LOAD_OVERRIDE: "0.1", ROBOB_WATCH_ROOT: join(sandbox, "root"), TOOLLOG_DIR: join(sandbox, "logs"), ROBOB_WATCH_SPECTRUM_CLI: stub("spectrum", ""),
+const env = { ...process.env, ROBOB_WATCH_LOAD_OVERRIDE: "0.1", ROBOB_WATCH_TEST_BATCH_MS: "0", ROBOB_WATCH_ROOT: join(sandbox, "root"), TOOLLOG_DIR: join(sandbox, "logs"), ROBOB_WATCH_SPECTRUM_CLI: stub("spectrum", ""),
   ROBOB_WATCH_TELEGRAM_CLI: stub("telegram", ""), ROBOB_WATCH_BRIDGE_DB: db,
   ROBOB_WATCH_HEADSUP_MS: "1000", WACLI_STORE_DIR: join(sandbox, "wacli") };
 // Checks put the sandbox helpers first on PATH: a logging-only wa there keeps any check that drafts away from the real one.
@@ -78,7 +78,7 @@ test("a wake watcher fires once with its context, falling back to send when wake
   const inboundId = "wake:" + new Bun.CryptoHasher("sha256").update(sentKey).digest("hex");
   const correlationKey = new Bun.CryptoHasher("sha256").update(inboundId).digest("hex").slice(0, 24);
   expect(events("wake.sent", "demo")[0].ids.key).toBe(correlationKey);
-  expect(events("watch.fire", "demo")).toEqual([expect.objectContaining({ kind: "event", ok: true, ids: { watcher: "demo", key: correlationKey }, props: { count: 1 } })]);
+  expect(events("watch.fire", "demo")).toEqual([expect.objectContaining({ kind: "event", ok: true, ids: { watcher: "demo", key: correlationKey }, props: expect.objectContaining({ count: 1, events: 1, batched: false, urgent: false, route: "owner", closing: false }) })]);
   expect(rollupFor("demo")).toMatchObject({ runs: 1, fires: 1, outcomes: { fire: 1 } });
   expect(events("watch.fire_cap", "demo")).toHaveLength(1);
   expect(events("watch.disabled", "demo")).toHaveLength(1);
@@ -516,7 +516,7 @@ test("watchers from before relays that mention wa sends are listed and fire owne
   // Once it names its relays (here: nobody), it drops off the list.
   writeFileSync(join(dir, "watcher.json"), JSON.stringify({ ...JSON.parse(readFileSync(join(dir, "watcher.json"), "utf8")), relays: [] }));
   expect(cli("unscoped").stdout.toString()).toContain("No watchers mention");
-  for (const id of ["old-ek", "old-plain"]) cli("remove", id);
+  for (const id of ["old-ek", "old-plain"]) cli("remove", id, "--now");
 }, 20_000);
 
 test("an old watcher whose check runs wa draft runs as before: no hold, no held notice", async () => {
@@ -538,7 +538,7 @@ test("an old watcher whose check runs wa draft runs as before: no hold, no held 
   const notices = readCalls().slice(before).filter(call => call.args.some(arg => arg.includes("robob-watch:old-sender:held")));
   expect(notices).toHaveLength(0);
   expect(state("old-sender").held_alerted).toBeUndefined();
-  cli("remove", "old-sender");
+  cli("remove", "old-sender", "--now");
 }, 25_000);
 
 test("relays: a person's @lid and phone jid are one contact, and concurrent checks take one ETA slot", async () => {

@@ -1,3 +1,4 @@
+import { DeleteBoard, DeletedBoards } from "./BoardDeletion";
 import { ImageUpIcon, MinusIcon, PlusIcon, RepeatIcon, Trash2Icon } from "lucide-react";
 import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { useAtomValue } from "@effect/atom-react";
@@ -292,6 +293,7 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
   const canEdit = useKanbanPermission(KANBAN_WS_METHODS.boardUpdate);
   const canPool = useKanbanPermission(KANBAN_WS_METHODS.poolSet);
   const canRevoke = useKanbanPermission(KANBAN_WS_METHODS.standingApprovalRevoke);
+  const lastRelease = board.releaseLedger?.at(-1);
   // The level "Add model" gives a new pool; null when every level of it is pooled.
   const addLevel = (instanceId: ProviderInstanceId, model: string) =>
     boardPoolAddition(instanceId, model, instanceEntries, pools, apply);
@@ -314,6 +316,13 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
       </Section>
       {board.standingApprovals.some((entry) => entry.revokedAt === null) && (
         <Section title="Standing deploy approval">
+          {lastRelease && (
+            <p className="break-words text-sm text-(--m-muted)">
+              Last interrupting release: #{lastRelease.cardNumber} at{" "}
+              <time dateTime={lastRelease.at}>{new Date(lastRelease.at).toLocaleString()}</time>
+              {lastRelease.critical ? ` (critical: ${lastRelease.critical})` : ""}
+            </p>
+          )}
           {board.standingApprovals
             .filter((entry) => entry.revokedAt === null)
             .map((entry) => (
@@ -463,7 +472,6 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
                   type="button"
                   disabled={changingLevel}
                   aria-label={`Remove ${pool.name} pool`}
-                  title="Remove pool"
                   onClick={() =>
                     void runAction("Couldn't remove the pool", () =>
                       kanban.removePool(board.id, pool.model, { replaces: pool.key }),
@@ -638,7 +646,7 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
                 <button
                   type="button"
                   disabled={!canEdit}
-                  title={editNote}
+                  aria-description={editNote}
                   onClick={() => update({ defaultReviewChain: chain.name })}
                   className="h-7 rounded-full px-2.5 text-sm font-medium text-(--m-muted) outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
                 >
@@ -657,6 +665,8 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
           onSave={(instructions) => update({ instructions })}
         />
       </Section>
+      <Section title="Deleted boards"><DeletedBoards /></Section>
+      <Section title="Delete board"><DeleteBoard board={board} /></Section>
     </div>
   );
 }
@@ -758,7 +768,7 @@ function IconPicker(props: {
       aria-label={label}
       aria-pressed={current === icon}
       disabled={props.disabled}
-      title={props.disabledReason}
+      aria-description={props.disabledReason}
       onClick={() => {
         if (current !== icon) props.onChange(icon);
       }}
@@ -788,7 +798,7 @@ function IconPicker(props: {
         aria-label={image ? "Change the picture" : "Upload a picture"}
         aria-pressed={image !== null}
         disabled={props.disabled}
-        title={props.disabledReason}
+        aria-description={props.disabledReason}
         onClick={() => fileInput.current?.click()}
         className={cn(
           "grid size-9 place-items-center rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)",
@@ -805,7 +815,7 @@ function IconPicker(props: {
         <button
           type="button"
           disabled={props.disabled}
-          title={props.disabledReason}
+          aria-description={props.disabledReason}
           onClick={() => props.onImage(null)}
           className="h-9 rounded-lg px-2.5 text-sm font-medium text-(--m-muted) outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
         >
@@ -885,7 +895,7 @@ function Stepper(props: {
     <span
       role="group"
       aria-label={props.label}
-      title={props.disabledReason}
+      aria-description={props.disabledReason}
       className="inline-flex items-center gap-0.5 rounded-full bg-(--m-raised) p-0.5"
     >
       <button
@@ -1060,7 +1070,7 @@ function InstructionBlock(props: {
       <textarea
         value={draft}
         disabled={props.disabled}
-        title={props.disabledReason}
+        aria-description={props.disabledReason}
         onChange={(event) => setDraft(event.target.value)}
         onBlur={() => {
           if (draft !== props.value) props.onSave(draft);
@@ -1165,7 +1175,7 @@ function NightlyReviewSettings(props: { board: KanbanBoard; disabled: boolean })
               to="/boards/$boardId"
               params={{ boardId: board.id }}
               search={{ view: "discussions", discussion: saved.lastDiscussionId }}
-              className="rounded text-(--m-accent-text) underline underline-offset-4 outline-none focus-visible:ring-2 focus-visible:ring-(--m-accent)"
+              className="rounded text-(--m-accent-text) underline underline-offset-4 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
             >
               View review
             </Link>
@@ -1212,7 +1222,7 @@ function GuessedGateSettings(props: {
         aria-label={`Guess ${gate} approval gates from wording`}
         checked={selected.includes(gate)}
         disabled={props.disabled || pending}
-        title={props.disabledReason}
+        aria-description={props.disabledReason}
         onCheckedChange={(checked) => void save(gate, checked)}
       />
     </label>

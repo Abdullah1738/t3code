@@ -215,6 +215,7 @@ export const idleBlocker = (input: IdleInput): IdleBlocker | null => {
 
 const LIVE_TURN_STATUSES = new Set(["pending", "running"]);
 const OWED_TASK_DELIVERIES = new Set(["pending", "claimed"]);
+const TERMINAL_SUBAGENT_STATUSES = new Set(["completed", "failed", "cancelled", "interrupted"]);
 
 /** The run still owed a delegated task report, which wakes the thread when sent. */
 const owedDelegatedCompletion = (projection: IdleInput["projection"]): string | null => {
@@ -245,9 +246,31 @@ const sessionChange = (projection: IdleInput["projection"], expected: string): s
   if (native !== expected) return `is on native session ${native}, not ${expected}`;
   const latest = latestExecutedRun(projection.runs);
   if (latest === null) {
-    return projection.providerThreads.length === 1
+    const childIds = new Set(projection.subagents.map((subagent) => subagent.providerThreadId));
+    // An imported thread can itself be a child elsewhere and retain that
+    // owner's node id. appThreadId identifies its own sessions in either case.
+    const own = projection.providerThreads.filter(
+      (candidate) => candidate.appThreadId === projection.thread.id && !childIds.has(candidate.id),
+    );
+    if (own.length !== 1) {
+      return `has ${own.length} provider threads and no run to tell which is current`;
+    }
+    if (own[0]?.id !== activeId) {
+      return `has active native session ${expected} on a nested provider thread`;
+    }
+    const activeChild = projection.providerThreads.find(
+      (candidate) => candidate.id !== activeId && candidate.status === "active",
+    );
+    if (activeChild !== undefined) {
+      return `has nested provider thread ${activeChild.id} still active`;
+    }
+    const unsettled = projection.subagents.find(
+      (subagent) =>
+        subagent.providerThreadId !== null && !TERMINAL_SUBAGENT_STATUSES.has(subagent.status),
+    );
+    return unsettled === undefined
       ? null
-      : `has ${projection.providerThreads.length} provider threads and no run to tell which is current`;
+      : `has nested provider thread ${unsettled.providerThreadId} with subagent ${unsettled.id} still ${unsettled.status}`;
   }
   const attempt = projection.attempts.find((candidate) => candidate.id === latest.activeAttemptId);
   if (attempt === undefined || attempt.startedAt === null) {

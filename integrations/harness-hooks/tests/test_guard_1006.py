@@ -4,6 +4,7 @@ if __package__:
 else:
     import test_environment
 
+import errno
 import hashlib
 import json
 import os
@@ -44,7 +45,7 @@ class Reporter1006Tests(unittest.TestCase):
                 key = os.path.abspath(path)
                 if key in files:
                     return real_stat(files[key], *args, **kwargs)
-                raise FileNotFoundError(path)
+                raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
             def path_open(path, *args, **kwargs):
                 key = os.path.abspath(path)
                 if key in files:

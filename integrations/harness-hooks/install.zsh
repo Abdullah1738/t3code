@@ -13,6 +13,12 @@ esac
 rsync --copy-unsafe-links "${flags[@]}" \
   --exclude __pycache__ --exclude '*.pyc' --exclude tests --exclude .gitignore \
   "$pkg/" "$dst/"
+if [[ ${1:-} != --dry-run ]]; then
+  chmod 700 "$dst/bin/live-db-snapshot"
+  /usr/bin/python3 -I -c 'import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); from snapshot_guard import install_pin; install_pin(Path(sys.argv[1]).parent)' "$dst/src"
+  mkdir -p "$HOME/.local/bin"
+  ln -sfn "$dst/bin/live-db-snapshot" "$HOME/.local/bin/live-db-snapshot"
+fi
 # rsync preserves removed source files; retire the old wrappers explicitly.
 for retired in "$dst/coord-blockers" "$dst/src/coord_shim.py"; do
   if [[ -e $retired || -L $retired ]]; then

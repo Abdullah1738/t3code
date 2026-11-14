@@ -182,6 +182,89 @@ class ReadonlyTest(unittest.TestCase):
                 with self.assertRaises(ro.UnsafeStateDatabase):
                     ro.state_ro(self.replica)
 
+    def test_not_ready_includes_rebuild_start_and_progress(self):
+        self.make_replica()
+        with closing(sqlite3.connect(self.replica)) as con, con:
+            con.execute("UPDATE ardud_readonly_meta SET value='0' WHERE key='ready'")
+            con.executemany("INSERT OR REPLACE INTO ardud_readonly_meta VALUES (?,?)", [
+                ("rebuild_started_at", "2026-11-14T11:35:38.457Z"),
+                ("rebuild_progress", json.dumps({"table": "ardud_kanban_cards", "rows": 250})),
+            ])
+        with self.assertRaisesRegex(ro.ReplicaNotReady, r"rebuilding since 2026-11-14T11:35:38.457Z \(table ardud_kanban_cards, 250 rows\)"):
+            ro.state_ro(self.replica)
+
+    def test_published_but_aged_replica_is_reported_as_stale(self):
+        self.make_replica()
+        with closing(sqlite3.connect(self.replica)) as con, con:
+            ready(con, updated_at=(datetime.now(timezone.utc) - timedelta(seconds=121)).isoformat())
+        with self.assertRaisesRegex(ro.ReplicaNotReady, "recall replica stale"):
+            ro.state_ro(self.replica)
+
+    def test_unready_bootstrap_diagnostics_without_a_watermark(self):
+        self.make_replica()
+        with closing(sqlite3.connect(self.replica)) as con, con:
+            con.execute("DELETE FROM ardud_readonly_meta WHERE key='updated_at'")
+            con.execute("UPDATE ardud_readonly_meta SET value='0' WHERE key='ready'")
+            con.executemany("INSERT OR REPLACE INTO ardud_readonly_meta VALUES (?,?)", [
+                ("rebuild_started_at", "2026-11-14T11:35:38.457Z"),
+                ("rebuild_progress", json.dumps({"table": "threads", "rows": 3})),
+            ])
+        with self.assertRaisesRegex(ro.ReplicaNotReady, r"updated_at missing, ready 0.*rebuilding since 2026-11-14T11:35:38.457Z \(table threads, 3 rows\)"):
+            ro.state_ro(self.replica)
+        with closing(sqlite3.connect(self.replica)) as con, con:
+            con.execute("UPDATE ardud_readonly_meta SET value='1' WHERE key='ready'")
+        with self.assertRaises(ro.UnsafeStateDatabase):
+            ro.state_ro(self.replica)
+
+    def test_diagnostic_sidecar_identity_lifecycle_and_fallbacks(self):
+        self.make_replica()
+        started = "2026-11-14T11:35:38.457Z"
+        with closing(sqlite3.connect(self.replica)) as con, con:
+            con.execute("UPDATE ardud_readonly_meta SET value='0' WHERE key='ready'")
+            con.executemany("INSERT OR REPLACE INTO ardud_readonly_meta VALUES (?,?)", [
+                ("rebuild_started_at", started),
+                ("rebuild_progress", json.dumps({"table": "pending", "rows": 0})),
+            ])
+        diagnostic = {
+            "replica_identity": list(ro.file_identity(self.replica)),
+            "rebuild_started_at": started,
+            "rebuild_finished_at": "",
+            "rebuild_progress": json.dumps({"event": "progress", "table": "threads", "rows": 250}),
+            # These must never override the SQLite readiness decision.
+            "ready": "1", "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        cases = [
+            ("progress", diagnostic, "rebuilding since", "threads, 250 rows"),
+            ("abort", {**diagnostic, "rebuild_progress": json.dumps({"event": "abort", "table": "threads", "rows": 250})}, "rebuild aborted since", "threads, 250 rows"),
+            ("old inode", {**diagnostic, "replica_identity": [0, 0]}, "rebuilding since", "pending, 0 rows"),
+            ("old rebuild", {**diagnostic, "rebuild_started_at": "old"}, "rebuilding since", "pending, 0 rows"),
+            ("incomplete", {"replica_identity": diagnostic["replica_identity"], "rebuild_started_at": started}, "rebuilding since", "pending, 0 rows"),
+            ("invalid progress", {**diagnostic, "rebuild_progress": "{"}, "rebuilding since", ""),
+            ("invalid JSON", "{", "rebuilding since", "pending, 0 rows"),
+            ("wrong JSON type", [], "rebuilding since", "pending, 0 rows"),
+            ("published", {**diagnostic, "rebuild_finished_at": started}, "", ""),
+        ]
+        sidecar = self.replica.with_name(self.replica.name + ".rebuild.json")
+        for name, value, status, progress in cases:
+            with self.subTest(name=name):
+                sidecar.write_text(value if isinstance(value, str) else json.dumps(value))
+                with self.assertRaises(ro.ReplicaNotReady) as error:
+                    ro.state_ro(self.replica)
+                self.assertIn("ready 0", str(error.exception))
+                if status:
+                    self.assertIn(status, str(error.exception))
+                    self.assertIn(progress, str(error.exception))
+                else:
+                    self.assertNotIn("rebuilding since", str(error.exception))
+        # Publication may commit just before the diagnostic rename, or a pinned
+        # reader may still see the previous sidecar. SQL completion wins.
+        sidecar.write_text(json.dumps(diagnostic))
+        with closing(sqlite3.connect(self.replica)) as con, con:
+            con.execute("INSERT INTO ardud_readonly_meta VALUES ('rebuild_finished_at',?)", (started,))
+        with self.assertRaises(ro.ReplicaNotReady) as error:
+            ro.state_ro(self.replica)
+        self.assertNotIn("rebuilding since", str(error.exception))
+
     def test_native_freshness_uses_metadata_not_file_mtime(self):
         self.make_replica()
         old = time.time() - 121
