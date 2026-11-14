@@ -137,6 +137,8 @@ NodeFS.writeFileSync(
   NodePath.join(home, "userdata", "settings.json"),
   JSON.stringify({
     continueThreadsAfterServerUpdate: true,
+    // Measure recovery throughput and I7 here; restart pacing is tested separately.
+    restartPacing: { maxActive: 1000, spacingMs: 0, loadHigh: 1000 },
     providerInstances: {
       codex: {
         driver: "codex",

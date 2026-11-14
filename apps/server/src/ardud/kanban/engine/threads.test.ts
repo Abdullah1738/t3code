@@ -46,6 +46,8 @@ import {
   viewStateOf,
 } from "./threads.ts";
 
+import { liveThreadShell } from "../../../mcp/McpToolAccess.testkit.ts";
+
 const at = (iso: string) => DateTime.makeUnsafe(iso);
 const QUESTION_AT = "2026-10-25T00:10:00.000Z";
 const FINISHED_AT = "2026-10-25T00:20:00.000Z";
@@ -1687,3 +1689,30 @@ describe("queuedWakes", () => {
     },
   );
 });
+
+it.effect("claimContext loads only caller identity, without thread shell or run history", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("claim-caller");
+    const row = liveThreadShell(threadId);
+    const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+      getCallerRow: () => Effect.succeed(row),
+      getThreadShell: () => Effect.die("thread shell read"),
+      getThreadRecords: () => Effect.die("run history read"),
+    });
+    yield* Effect.gen(function* () {
+      const threads = yield* KanbanThreads;
+      expect(yield* threads.claimContext(threadId)).toEqual({
+        projectId: row.projectId,
+        model: row.modelSelection,
+      });
+    }).pipe(
+      Effect.provide(
+        layer.pipe(
+          Layer.provide(management),
+          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+          Layer.provide(Sqlite.layerMemory),
+        ),
+      ),
+    );
+  }),
+);

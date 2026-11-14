@@ -26,6 +26,7 @@ import common  # noqa: E402
 import mailparse  # noqa: E402
 import search  # noqa: E402
 import store  # noqa: E402
+import timing  # noqa: E402
 
 MAIL_EVERY = 180
 CHAT_EVERY = 30
@@ -245,9 +246,11 @@ def lock(name):
 def sync_one(name, stop=None, full=False):
     common.require_volume()
     lk = lock(name)
-    db = store.connect()
+    metrics = timing.CURRENT.get() or timing.Pass(name)
+    token = timing.CURRENT.set(metrics)
+    db = None
     try:
-        t = time.time()
+        db = store.connect()
         if name == "imessage":
             import imessage_sync
             stats = imessage_sync.sync(db, stop=stop, full=full)
@@ -265,11 +268,14 @@ def sync_one(name, stop=None, full=False):
         else:
             import imap_sync
             stats = imap_sync.sync(name, db, stop=stop)
-        stats["secs"] = round(time.time() - t, 1)
-        return stats
     finally:
-        db.close()
+        if db is not None:
+            with timing.phase("db_write"):
+                db.close()
+        timing.CURRENT.reset(token)
         lk.close()
+    stats.update(metrics.summary())
+    return stats
 
 
 def cmd_sync(args):
@@ -297,18 +303,21 @@ def _loop(name, every, stop, full_every=None):
             stop.wait(60)
             continue
         full = bool(full_every) and time.time() - last_full > full_every
+        metrics = timing.Pass(name)
+        token = timing.CURRENT.set(metrics)
         try:
             stats = sync_one(name, stop=stop, full=full and last_full > 0)
             if full:
                 last_full = time.time()
-            if stats.get("added") or stats.get("deleted") or stats.get("updated") or stats["secs"] > 30:
-                common.log(f"{name}: {stats}")
+            common.log(f"{name}: {stats}")
             backoff = every
         except Locked:
             pass
         except Exception as e:
-            common.log(f"{name}: ERROR {type(e).__name__}: {e}")
+            common.log(f"{name}: ERROR {type(e).__name__}: {e} {metrics.summary()}")
             backoff = min(backoff * 2, 3600)
+        finally:
+            timing.CURRENT.reset(token)
         stop.wait(backoff)
 
 

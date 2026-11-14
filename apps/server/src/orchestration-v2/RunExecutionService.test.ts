@@ -4271,6 +4271,7 @@ it.effect("fails the run when its event stream ends without a root terminal", ()
 it.effect("stops the provider turn when ingestion fails the run before a terminal", () =>
   Effect.gen(function* () {
     const interrupted = yield* Ref.make<ReadonlyArray<string>>([]);
+    const preservation: Array<readonly [boolean | undefined, boolean | undefined]> = [];
     const { observed } = yield* captureRootRunTermination({
       key: "ingest-failure:orphaned-turn",
       shouldFinalizeRun: () => Effect.succeed(true),
@@ -4290,10 +4291,17 @@ it.effect("stops the provider turn when ingestion fails the run before a termina
           }),
         ),
       interruptTurn: (turn) =>
-        Ref.update(interrupted, (current) => [...current, String(turn.providerTurnId)]),
+        Effect.sync(() => {
+          preservation.push([turn.requestRuntimeRestart, turn.stopBackgroundWork]);
+        }).pipe(
+          Effect.andThen(
+            Ref.update(interrupted, (current) => [...current, String(turn.providerTurnId)]),
+          ),
+        ),
     });
     assert.deepEqual(observed, ["run:failed", "pull-requests-refreshed"]);
     assert.deepEqual(yield* Ref.get(interrupted), ["provider-turn:ingest-failure:orphaned-turn"]);
+    assert.deepEqual(preservation, [[false, false]]);
   }),
 );
 
@@ -5032,6 +5040,7 @@ it.effect.each(["failure", "interruption"] as const)(
   (mode) =>
     Effect.gen(function* () {
       const order: Array<string> = [];
+      const cleanupPolicies: Array<boolean | undefined> = [];
       const ingestionStarted = yield* Deferred.make<void>();
       const result = yield* captureRootRunTermination({
         key: `claude-startup-${mode}`,
@@ -5057,10 +5066,11 @@ it.effect.each(["failure", "interruption"] as const)(
                   ),
             ),
           ),
-        interruptStartingRun: ({ runId, attemptId }) =>
+        interruptStartingRun: ({ runId, attemptId, stopBackgroundWork }) =>
           Effect.sync(() => {
             assert.equal(runId, RunId.make(`run:claude-startup-${mode}`));
             assert.equal(attemptId, RunAttemptId.make(`attempt:claude-startup-${mode}`));
+            cleanupPolicies.push(stopBackgroundWork);
             order.push("query.stopped");
           }),
         onSubscriptionClose: Effect.sync(() => {
@@ -5077,6 +5087,7 @@ it.effect.each(["failure", "interruption"] as const)(
           : ["query.stopped", "ingestion.closed"],
       );
       assert.equal(result._tag, mode === "failure" ? "Success" : "Failure");
+      assert.deepEqual(cleanupPolicies, [false]);
     }),
 );
 
@@ -5238,6 +5249,8 @@ function captureRootRunTermination(input: {
     | "other_task"
     | "read_error";
   readonly recoveryRun?: OrchestrationV2Run["transientRecovery"];
+  readonly providerStartDeadlineAt?: OrchestrationV2Run["providerStartDeadlineAt"];
+  readonly responseStreamingMode?: "turn" | "paragraph";
   readonly launchRecovery?: OrchestrationV2Run["launchRecovery"];
   readonly model?: string;
   readonly relayText?: string;
@@ -5390,7 +5403,11 @@ function captureRootRunTermination(input: {
           Layer.mock(ProviderEventIngestor.ProviderEventIngestorV2)({
             ingestNormalized: input.ingestNormalized ?? (() => Effect.succeed([])),
           }),
-          ServerSettings.layerTest(),
+          ServerSettings.layerTest(
+            input.responseStreamingMode === undefined
+              ? {}
+              : { responseStreamingMode: input.responseStreamingMode },
+          ),
           input.recordUsage
             ? Layer.mock(Analytics.Analytics)({ record: input.recordUsage })
             : Layer.empty,
@@ -5483,6 +5500,7 @@ function captureRootRunTermination(input: {
           startedAt: input.recordUsage ? usageStartedAt : null,
           providerInstanceId,
           transientRecovery: input.recoveryRun,
+          providerStartDeadlineAt: input.providerStartDeadlineAt,
           launchRecovery: input.launchRecovery,
           modelSelection: { instanceId: providerInstanceId, model: input.model ?? "gpt-5.4" },
           ...(input.delegated && input.legacyOwnership === undefined
@@ -5918,6 +5936,103 @@ function rootTerminalEvent(
     : { ...common, status, failure: null };
 }
 
+it.effect.each([
+  { provider: "cursor", mode: "turn" },
+  { provider: "cursor", mode: "paragraph" },
+  { provider: "muse", mode: "turn" },
+  { provider: "muse", mode: "paragraph" },
+  { provider: "pi", mode: "turn" },
+  { provider: "pi", mode: "paragraph" },
+] as const)(
+  "separates native acceptance from buffered output: $provider/$mode",
+  ({ provider, mode }) =>
+    Effect.gen(function* () {
+      const acknowledged = yield* Deferred.make<void>();
+      let heldTextWasPersisted = false;
+      const now = yield* DateTime.now;
+      yield* captureRootRunTermination({
+        key: `buffered-start-${provider}`,
+        providerDriver: ProviderDriverKind.make(provider),
+        responseStreamingMode: mode,
+        shouldFinalizeRun: () => Effect.succeed(true),
+        events: (ids) =>
+          Stream.make(
+            ...([
+              {
+                type: "provider_turn.updated",
+                driver: ProviderDriverKind.make(provider),
+                providerTurn: {
+                  id: ids.rootProviderTurnId,
+                  providerThreadId: ids.providerThreadId,
+                  nodeId: ids.rootNodeId,
+                  runAttemptId: ids.attemptId,
+                  nativeTurnRef: null,
+                  ordinal: 1,
+                  status: "running",
+                  startedAt: now,
+                  completedAt: null,
+                },
+              },
+              {
+                type: "turn_item.updated",
+                driver: ProviderDriverKind.make(provider),
+                turnItem: {
+                  id: TurnItemId.make(`${provider}:native-reasoning`),
+                  type: "reasoning",
+                  threadId: ids.threadId,
+                  runId: ids.runId,
+                  nodeId: ids.rootNodeId,
+                  providerThreadId: ids.providerThreadId,
+                  providerTurnId: ids.rootProviderTurnId,
+                  nativeItemRef: {
+                    driver: ProviderDriverKind.make(provider),
+                    nativeId: "reasoning",
+                    strength: "strong",
+                  },
+                  parentItemId: null,
+                  ordinal: 1,
+                  status: "running",
+                  title: null,
+                  startedAt: now,
+                  completedAt: null,
+                  updatedAt: now,
+                  text: "Still reasoning",
+                  streaming: true,
+                },
+              },
+            ] satisfies ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>),
+          ).pipe(
+            Stream.concat(
+              Stream.fromEffect(
+                (provider === "pi" || provider === "muse"
+                  ? Effect.void
+                  : Deferred.await(acknowledged)
+                ).pipe(
+                  Effect.andThen(TestClock.adjust("11 minutes")),
+                  Effect.as(rootTerminalEvent(ids, "completed")),
+                ),
+              ),
+            ),
+          ),
+        ingestNormalized: ({ event }) =>
+          Effect.gen(function* () {
+            if (event.type === "turn_item.updated" && event.turnItem.type === "reasoning")
+              heldTextWasPersisted = true;
+            if (
+              event.type === "provider_turn.updated" &&
+              event.providerTurn.promptAcceptedAt !== undefined
+            ) {
+              assert.isFalse(heldTextWasPersisted);
+              yield* Deferred.succeed(acknowledged, undefined);
+            }
+            return [];
+          }),
+      });
+      assert.equal(yield* Deferred.isDone(acknowledged), provider !== "pi" && provider !== "muse");
+      assert.isFalse(heldTextWasPersisted);
+    }),
+);
+
 it.effect("reserves a held reasoning item's position before an intervening tool", () =>
   Effect.gen(function* () {
     const key = "held-reasoning-position";
@@ -6316,6 +6431,7 @@ it.effect.each([
       key: `recovery-${category}`,
       delegated: true,
       shouldFinalizeRun: () => Effect.succeed(true),
+      providerStartDeadlineAt: DateTime.makeUnsafe(0),
       events: (ids) =>
         Stream.make({
           ...rootTerminalEvent(ids, "failed"),
@@ -6340,6 +6456,7 @@ it.effect.each([
       assert.equal(run?.payload.status, "starting");
       if (run?.type === "run.updated")
         assert.include(run.payload.transientRecovery?.firstError.message ?? "", "529");
+      assert.isUndefined(run?.payload.providerStartDeadlineAt);
     }
   }),
 );

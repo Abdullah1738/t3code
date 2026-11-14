@@ -2,6 +2,7 @@
 import type * as NodeSqlite from "node:sqlite";
 import type * as NodeFS from "node:fs";
 import type * as NodePath from "node:path";
+import { resolveHistoryBasePath } from "./historySourceFiles.ts";
 
 export interface ReadonlyReplicaOptions {
   readonly sourcePath: string;
@@ -42,6 +43,7 @@ export function createReadonlyReplica(
   fs: typeof NodeFS,
   path: typeof NodePath,
   options: ReadonlyReplicaOptions,
+  resolveBasePath = resolveHistoryBasePath,
 ) {
   const emptyMetrics = (): ReadonlyExportMetrics => ({
     lineageRepairCounts: {
@@ -170,25 +172,21 @@ export function createReadonlyReplica(
       }
     };
     assertRedactionComplete();
-    const baseFilename = () => {
+    const readBasePath = () => {
       if (
         !source.prepare("SELECT 1 FROM sqlite_schema WHERE name='ardud_history_base_archive'").get()
       )
         return undefined;
-      const rows = source.prepare("SELECT filename FROM ardud_history_base_archive LIMIT 2").all();
-      if (rows.length === 0) return undefined;
-      const filename = rows[0]!.filename;
-      if (
-        rows.length !== 1 ||
-        typeof filename !== "string" ||
-        !/^statev2\.pre-shrink-[^/\\]+\.sqlite$/.test(filename) ||
-        path.basename(filename) !== filename
-      )
-        throw new Error("Invalid readonly history base filename");
-      return filename;
+      return resolveBasePath(
+        path,
+        options.sourcePath,
+        source
+          .prepare("SELECT filename FROM ardud_history_base_archive LIMIT 2")
+          .all()
+          .map((row) => ({ filename: row.filename })),
+      );
     };
-    const baseName = baseFilename();
-    const basePath = baseName ? path.join(path.dirname(options.sourcePath), baseName) : undefined;
+    const basePath = readBasePath();
     if (basePath) {
       if (!fs.existsSync(basePath)) throw new Error("Readonly history base unavailable");
       baseArchive = open(basePath, { readOnly: true }, "primary");
@@ -449,21 +447,53 @@ export function createReadonlyReplica(
         throw invalidate(`Readonly export source table missing: ${name}`);
       return { name, db, schema };
     });
-    // A replaced source, a changed table or a regressed event history cannot be
+    const createExportedTable = ({ name, db, schema }: (typeof sourceTables)[number]) => {
+      out.exec(
+        schema.replace(/^CREATE TABLE\s+(?:IF NOT EXISTS\s+)?/i, "CREATE TABLE IF NOT EXISTS "),
+      );
+      // These indexes touch the exported copy only; no live schema changes.
+      for (const row of db
+        .prepare(
+          "SELECT sql FROM sqlite_schema WHERE type='index' AND tbl_name=? AND sql IS NOT NULL",
+        )
+        .all(name)) {
+        out.exec(
+          String(row.sql).replace(
+            /^CREATE (UNIQUE )?INDEX\s+(?:IF NOT EXISTS\s+)?/i,
+            "CREATE $1INDEX IF NOT EXISTS ",
+          ),
+        );
+      }
+    };
+    const pendingAuxiliarySchemas = new Map<string, (typeof sourceTables)[number]>();
+    const refreshAuxiliarySchemas = (changed: typeof sourceTables) => {
+      // applyAuxiliary runs inside the publication transaction, including first bootstrap.
+      for (const table of changed) {
+        out.exec(`DROP TABLE IF EXISTS ${q(table.name)}`);
+        createExportedTable(table);
+        meta(`schema:${table.name}`, table.schema);
+      }
+      meta(
+        "last_aux_schema_refresh",
+        JSON.stringify({ tables: changed.map(({ name }) => name), at: new Date().toISOString() }),
+      );
+    };
+    // A replaced source, a changed projection or a regressed event history cannot be
     // caught up incrementally. Rebuild in place instead of refusing every open
     // until someone deletes the file: readers see ready=0 until the fresh
     // generation publishes, exactly as on a first bootstrap.
     const storedSource = getMeta("source");
     const storedSequence = getMeta("sequence");
-    const changedTable = sourceTables.find(({ name, schema }) => {
+    const changedTables = sourceTables.filter(({ name, schema }) => {
       const previous = getMeta(`schema:${name}`);
       return previous !== undefined && normalizeSchema(previous) !== normalizeSchema(schema);
     });
+    const changedProjection = changedTables.find(({ name }) => !auxiliary.includes(name));
     const rebuildReason =
       storedSource !== undefined && !sameSource(storedSource)
         ? "source database was replaced"
-        : changedTable
-          ? `source schema changed: ${changedTable.name}`
+        : changedProjection
+          ? `source schema changed: ${changedProjection.name}`
           : storedSequence !== undefined && sequence() < Number(storedSequence)
             ? "source event sequence regressed"
             : undefined;
@@ -524,8 +554,9 @@ export function createReadonlyReplica(
           )
           .run();
       });
-    } else if (storedSource !== undefined && storedSource !== identity) {
-      meta("source", identity);
+    } else {
+      for (const table of changedTables) pendingAuxiliarySchemas.set(table.name, table);
+      if (storedSource !== undefined && storedSource !== identity) meta("source", identity);
     }
     if (!getMeta("sequence"))
       transaction(() => {
@@ -550,7 +581,7 @@ export function createReadonlyReplica(
         db: NodeSqlite.DatabaseSync;
         columns: string[];
         primary: string;
-        upsert: NodeSqlite.StatementSync;
+        upsert: NodeSqlite.StatementSync | undefined;
       }
     >();
     const sourceSchemas = new Map<string, string>();
@@ -584,13 +615,14 @@ export function createReadonlyReplica(
     const threadSequence = (threadId: NodeSqlite.SQLInputValue) =>
       // Journal fences must include events already moved out of main, too.
       Math.max(...threadEventSources.map((statement) => Number(statement.get(threadId)?.n ?? 0)));
-    for (const { name, db, schema } of sourceTables) {
-      // Any stored schema that differed was rebuilt above.
-      meta(`schema:${name}`, schema);
+    const configureTable = ({ name, db, schema }: (typeof sourceTables)[number]) => {
       sourceSchemas.set(name, schema);
-      out.exec(
-        schema.replace(/^CREATE TABLE\s+(?:IF NOT EXISTS\s+)?/i, "CREATE TABLE IF NOT EXISTS "),
-      );
+      // Keep the previous complete auxiliary table and schema marker visible
+      // until its replacement rows publish; reapers trust those rows while ready=1.
+      if (!pendingAuxiliarySchemas.has(name)) {
+        meta(`schema:${name}`, schema);
+        createExportedTable({ name, db, schema });
+      }
       const info = db.prepare(`PRAGMA table_info(${q(name)})`).all();
       const columns = info.map((row) => String(row.name));
       const primary = String(info.find((row) => row.pk === 1)?.name ?? "");
@@ -601,29 +633,20 @@ export function createReadonlyReplica(
         db,
         columns,
         primary,
-        // Identical rows are left alone: each cycle re-reads the small tables
-        // (75 MB of kanban card JSON on 10 Nov), and rewriting every unchanged
-        // row turned that into 75 MB of replica WAL per cycle.
-        upsert: out.prepare(
-          `INSERT INTO ${q(name)} (${columns.map(q).join(",")}) VALUES (${columns.map(() => "?").join(",")}) ON CONFLICT(${q(primary)}) DO UPDATE SET ${values
-            .map((c) => `${q(c)}=excluded.${q(c)}`)
-            .join(",")} WHERE ${values.map((c) => `${q(c)} IS NOT excluded.${q(c)}`).join(" OR ")}`,
-        ),
+        // Auxiliary rows go through staging, so their new columns need not
+        // exist in main until the publication transaction swaps the table.
+        upsert: auxiliary.includes(name)
+          ? undefined
+          : out.prepare(
+              `INSERT INTO ${q(name)} (${columns.map(q).join(",")}) VALUES (${columns.map(() => "?").join(",")}) ON CONFLICT(${q(primary)}) DO UPDATE SET ${values
+                .map((c) => `${q(c)}=excluded.${q(c)}`)
+                .join(
+                  ",",
+                )} WHERE ${values.map((c) => `${q(c)} IS NOT excluded.${q(c)}`).join(" OR ")}`,
+            ),
       });
-      // These indexes touch the exported copy only; no live schema changes.
-      for (const row of db
-        .prepare(
-          "SELECT sql FROM sqlite_schema WHERE type='index' AND tbl_name=? AND sql IS NOT NULL",
-        )
-        .all(name)) {
-        out.exec(
-          String(row.sql).replace(
-            /^CREATE (UNIQUE )?INDEX\s+(?:IF NOT EXISTS\s+)?/i,
-            "CREATE $1INDEX IF NOT EXISTS ",
-          ),
-        );
-      }
-    }
+    };
+    for (const table of sourceTables) configureTable(table);
     out.exec(
       "CREATE INDEX IF NOT EXISTS ardud_readonly_items_thread ON orchestration_v2_projection_turn_items(thread_id)",
     );
@@ -634,7 +657,7 @@ export function createReadonlyReplica(
           .prepare(`DELETE FROM ${q(name)} WHERE ${q(table.primary)}=?`)
           .run(row[table.primary]!).changes;
       } else {
-        const changes = table.upsert.run(...table.columns.map((c) => row[c]!)).changes;
+        const changes = table.upsert!.run(...table.columns.map((c) => row[c]!)).changes;
         if (name.endsWith("_turn_items"))
           out
             .prepare(
@@ -696,30 +719,25 @@ export function createReadonlyReplica(
     };
     // TEMP staging keeps auxiliary page pacing outside the publication lock.
     // No partial auxiliary generation is visible to outside readers.
-    const auxiliaryStages = new Map(
-      auxiliary.map((name) => {
-        const table = tables.get(name)!;
-        const stage = `readonly_stage_${name}`;
-        out.exec(
-          sourceSchemas
-            .get(name)!
-            .replace(
-              /^CREATE TABLE\s+(?:IF NOT EXISTS\s+)?[^ (]+/i,
-              `CREATE TEMP TABLE ${q(stage)}`,
-            ),
-        );
-        return [
-          name,
-          {
-            stage,
-            insert: out.prepare(
-              `INSERT OR REPLACE INTO temp.${q(stage)} (${table.columns.map(q)}) VALUES (${table.columns.map(() => "?")})`,
-            ),
-          },
-        ];
-      }),
-    );
+    const createAuxiliaryStage = (name: string) => {
+      const table = tables.get(name)!;
+      const stage = `readonly_stage_${name}`;
+      out.exec(
+        sourceSchemas
+          .get(name)!
+          .replace(/^CREATE TABLE\s+(?:IF NOT EXISTS\s+)?[^ (]+/i, `CREATE TEMP TABLE ${q(stage)}`),
+      );
+      return {
+        stage,
+        insert: out.prepare(
+          `INSERT OR REPLACE INTO temp.${q(stage)} (${table.columns.map(q)}) VALUES (${table.columns.map(() => "?")})`,
+        ),
+      };
+    };
+    const auxiliaryStages = new Map(auxiliary.map((name) => [name, createAuxiliaryStage(name)]));
     const applyAuxiliary = () => {
+      if (pendingAuxiliarySchemas.size)
+        refreshAuxiliarySchemas([...pendingAuxiliarySchemas.values()]);
       for (const name of auxiliary) {
         const { stage } = auxiliaryStages.get(name)!;
         const { primary, columns } = tables.get(name)!;
@@ -748,9 +766,9 @@ export function createReadonlyReplica(
       auxiliaryCursor = 0,
       reconcileIndex = 0,
       closed = false;
-    const sourceSchemaVersion = Number(
-      source.prepare("PRAGMA schema_version").get()?.schema_version,
-    );
+    const schemaVersion = (db: NodeSqlite.DatabaseSync) =>
+      Number(db.prepare("PRAGMA schema_version").get()?.schema_version);
+    const sourceSchemaVersions = new Map(sourceTables.map(({ db }) => [db, schemaVersion(db)]));
     const markSeen = (name: string, id: NodeSqlite.SQLInputValue, generation: number) =>
       out
         .prepare(
@@ -1014,7 +1032,7 @@ export function createReadonlyReplica(
     const validate = () => {
       if (closed) throw new Error("Readonly exporter is closed");
       if (invalidated) throw new Error(invalidated);
-      if (baseFilename() !== baseName)
+      if (readBasePath() !== basePath)
         throw invalidate("History base changed; reopen readonly sources");
       if (options.archivePath && !archive && fs.existsSync(options.archivePath))
         throw invalidate("History archive appeared; reopen readonly sources");
@@ -1039,17 +1057,34 @@ export function createReadonlyReplica(
           throw invalidate("Board split completed; reopen readonly sources");
         }
       }
-      if (
-        Number(source.prepare("PRAGMA schema_version").get()?.schema_version) !==
-        sourceSchemaVersion
-      ) {
-        for (const [name, schema] of sourceSchemas) {
-          if (
-            tables.get(name)!.db.prepare("SELECT sql FROM sqlite_schema WHERE name=?").get(name)
-              ?.sql !== schema
-          )
-            throw invalidate("Readonly source schema changed; restart export");
+      if ([...sourceSchemaVersions].some(([db, version]) => schemaVersion(db) !== version)) {
+        const changed = sourceTables.flatMap(({ name, db }) => {
+          const schema = db.prepare("SELECT sql FROM sqlite_schema WHERE name=?").get(name)?.sql;
+          if (typeof schema !== "string")
+            throw invalidate(`Readonly export source table missing: ${name}`);
+          return normalizeSchema(schema) === normalizeSchema(sourceSchemas.get(name)!)
+            ? []
+            : [{ name, db, schema }];
+        });
+        if (changed.some(({ name }) => !auxiliary.includes(name)))
+          throw invalidate("Readonly source schema changed; restart export");
+        if (changed.length) {
+          // Discard pending diffs before changing their table shapes. The last
+          // published projections and lineage stay readable while auxiliary pages refill.
+          abortCycle();
+          for (const table of changed) {
+            pendingAuxiliarySchemas.set(table.name, table);
+            configureTable(table);
+            out.exec(`DROP TABLE temp.${q(auxiliaryStages.get(table.name)!.stage)}`);
+            auxiliaryStages.set(table.name, createAuxiliaryStage(table.name));
+          }
+          auxiliaryIndex = 0;
+          auxiliaryCursor = 0;
+          auxiliaryCapturedAt = undefined;
+          cycleTarget = undefined;
         }
+        for (const db of sourceSchemaVersions.keys())
+          sourceSchemaVersions.set(db, schemaVersion(db));
       }
     };
     const stepOnce = (): boolean => {
@@ -1405,6 +1440,7 @@ export function createReadonlyReplica(
       if (cycleTransaction) {
         commitCycle();
       }
+      pendingAuxiliarySchemas.clear();
       identitySequence = Math.max(identitySequence, cycleTarget!);
       cycleTarget = undefined;
       auxiliaryIndex = 0;

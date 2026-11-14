@@ -8,11 +8,13 @@ import {
   RunId,
   TurnItemId,
   ScheduledTaskId,
+  CommandId,
   EnvironmentId,
   NodeId,
   ProviderInstanceId,
   ThreadId,
 } from "@t3tools/contracts";
+import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -582,4 +584,117 @@ it.effect.each(listTransitionCases)(
         ),
       );
     }),
+);
+
+it.effect.each(
+  (
+    [
+      {
+        state: "never_saved",
+        message:
+          "This delegation was never saved. Retry delegate_task with the same clientRequestId.",
+      },
+      {
+        state: "pending",
+        message: "This delegation is still being created; retry task_status with this task id",
+      },
+      {
+        state: "accepted",
+        message: "This delegation was saved; its task projection is catching up.",
+      },
+      { state: "rejected", message: "This delegation was rejected: Parent run ended." },
+    ] as const
+  ).flatMap((testCase) =>
+    [
+      "command:mcp:delegate-task:environment:caller:retry",
+      "command:mcp:delegate-task:env%3Aone:thread%3Aparent:review%2F%E9%9B%AA%3A1%25",
+      "command:mcp:old%3Acredential:delegate-task:review%2F%E9%9B%AA%3A1%25",
+    ].map((command) => ({ ...testCase, command })),
+  ),
+)(
+  "recovers a missing task from its $state command $command for status and cancel",
+  ({ state, message, command }) =>
+    Effect.gen(function* () {
+      const commandId = CommandId.make(command);
+      const taskId = IdAllocator.derive.delegatedTaskNode({ commandId });
+      const service = yield* OrchestratorMcp.OrchestratorMcpService;
+      for (const operation of [
+        service.taskStatus(scope, taskId).pipe(Effect.asVoid),
+        service.cancelTask(scope, { taskId }).pipe(Effect.asVoid),
+      ]) {
+        const error = yield* operation.pipe(Effect.flip);
+        assert.equal(error.code, "task_not_found");
+        assert.include(error.message, message);
+      }
+    }).pipe(
+      Effect.provide(
+        layer({
+          getCallerRow: () => Effect.succeed(liveThreadShell(callerId)),
+          getThreadRecords: () => Effect.succeed(idleThreadProjection(liveThreadShell(callerId))),
+          getDelegationCommandState: (commandId) =>
+            Effect.succeed(
+              state === "accepted" || state === "rejected"
+                ? {
+                    commandId,
+                    threadId: callerId,
+                    commandType: "delegated_task.request",
+                    acceptedAt: DateTime.makeUnsafe(0),
+                    resultSequence: 0,
+                    status: state,
+                    error: state === "rejected" ? "Parent run ended." : null,
+                  }
+                : { status: state },
+            ),
+        }),
+      ),
+    ),
+);
+
+it.effect.each([
+  "node:unrelated",
+  "node:delegated-task:%ZZ",
+  "node:delegated-task:command%3Amcp%3Abad",
+  "node:delegated-task:command%3Amcp%3Adelegate-task%3Aa%3Ab%3Ac%3Ad",
+])("does not look up a receipt for malformed task id %s", (id) =>
+  Effect.gen(function* () {
+    const service = yield* OrchestratorMcp.OrchestratorMcpService;
+    const error = yield* service.taskStatus(scope, NodeId.make(id)).pipe(Effect.flip);
+    assert.equal(error.code, "task_not_found");
+    assert.notInclude(error.message, "never saved");
+  }).pipe(
+    Effect.provide(
+      layer({
+        getCallerRow: () => Effect.succeed(liveThreadShell(callerId)),
+        getThreadRecords: () => Effect.succeed(idleThreadProjection(liveThreadShell(callerId))),
+      }),
+    ),
+  ),
+);
+
+it.effect("does not expose another parent's rejection reason", () =>
+  Effect.gen(function* () {
+    const service = yield* OrchestratorMcp.OrchestratorMcpService;
+    const commandId = CommandId.make("command:mcp:old-credential:delegate-task:retry");
+    const taskId = IdAllocator.derive.delegatedTaskNode({ commandId });
+    const error = yield* service.taskStatus(scope, taskId).pipe(Effect.flip);
+    assert.equal(error.code, "task_not_found");
+    assert.notInclude(error.message, "private reason");
+  }).pipe(
+    Effect.provide(
+      layer({
+        getCallerRow: () => Effect.succeed(liveThreadShell(callerId)),
+        getThreadRecords: () => Effect.succeed(idleThreadProjection(liveThreadShell(callerId))),
+        getDelegationCommandState: (commandId) =>
+          Effect.succeed({
+            commandId,
+            threadId: targetId,
+            commandType: "delegated_task.request",
+            acceptedAt: DateTime.makeUnsafe(0),
+            resultSequence: 0,
+            status: "rejected",
+            error: "private reason",
+          }),
+      }),
+    ),
+  ),
 );

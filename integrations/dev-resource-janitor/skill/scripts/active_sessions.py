@@ -4,10 +4,10 @@ Two sources, unioned:
   - Robob's control API, read in two queries that are each complete on their own, merged by threadId:
       a. GET /threads?active=true&includeSubagents=true: every non-idle thread (runs and pending requests). The
          server builds this from its live ids, so it is small (about 100 on a 26k-thread server).
-      b. GET /threads?creationSource=provider,mcp&includeSubagents=true&updatedSince=<now - 48 h>: recent
-         provider-native and delegated children. A child with no run or pending request is idle, and (a) misses
-         it, but it can still own a checkout between turns. A child idle for 2 days owns nothing live, so the
-         window bounds the list. The janitor's own idle threshold is 60 min.
+      b. GET /threads?creationSource=provider&updatedSince=<now - 48 h>: provider-native
+         children, including runless children whose app state is idle during native work.
+         MCP-delegated tasks have app runs, so (a) covers their non-terminal work without
+         pulling thousands of completed delegated tasks into this query.
     Each thread is judged by in_use(), and its workspace is its worktree path or, on the root workspace, its
     project's workspaceRoot. Claude and Codex threads (and OpenCode threads Robob drives) come from here.
   - The shared OpenCode service: GET /api/session/active, for OpenCode sessions Robob does not front.
@@ -15,9 +15,8 @@ Two sources, unioned:
 The snapshot is "complete" only when both sources answered in full. A source that is down, returns something
 unreadable, or is truncated (the control API caps a page at 500 and reports the full count in `total`) makes
 the snapshot incomplete. The reapers keep everything when it is incomplete: a missing source means "unknown",
-never "idle". Query (b) needs the server's creationSource filter. An older Robob ignores the parameter and
-returns the unfiltered list, which is truncated, so the snapshot stays incomplete until that server ships.
-That is the intended fail-closed behaviour.
+never "idle". Query (b) excludes completed MCP task history while preserving runless native children.
+The reaper reads complete historical activity separately, including archived threads.
 
 The control credential is the rcsim component's file. Robob has no janitor component yet; adding one is a server
 change (apps/server/src/ardud/auth/components.ts) that needs a deploy. rcsim is the closest existing read-only
@@ -26,9 +25,12 @@ OPENCODE_SERVICE_URL (default http://127.0.0.1:49374). Password: OPENCODE_SERVER
 ~/.config/opencode-service/password.
 """
 import base64
+import datetime
 import json
+import math
 import os
 import time
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -125,7 +127,14 @@ def _control_threads(query, timeout, label):
         return None, f"control api {label}: unreadable thread list"
     if total > len(threads):
         return None, f"control api {label}: {total} threads, only {len(threads)} returned (truncated)"
-    return {t["threadId"]: t for t in threads if isinstance(t, dict) and t.get("threadId")}, None
+    if total != len(threads) or any(not isinstance(t, dict) or not isinstance(t.get("threadId"), str)
+                                    or not t["threadId"] or t.get("state") not in {"idle", "running", "queued", "waiting", "needs-input"}
+                                    for t in threads):
+        return None, f"control api {label}: malformed roster"
+    mapped = {t["threadId"]: t for t in threads}
+    if len(mapped) != total:
+        return None, f"control api {label}: duplicate thread ids"
+    return mapped, None
 
 
 def robob_active(timeout=20, now_ms=None):
@@ -138,13 +147,12 @@ def robob_active(timeout=20, now_ms=None):
         timeout, "active")
     if err:
         return None, err
-    # (b) Provider-native and MCP-delegated children updated in the window. Idle children have no run or pending
-    # request, so (a) doesn't list them, but they can still own their checkout between turns. An older Robob ignores
-    # creationSource; if the resulting unfiltered list is truncated, the snapshot remains incomplete.
+    # Native children can be runless/idle during provider work. Filter by source,
+    # not state; app-delegated tasks with live work are already in query (a).
     now = int(time.time() * 1000) if now_ms is None else now_ms
     native, err = _control_threads(
         "/threads?" + urllib.parse.urlencode({
-            "creationSource": "provider,mcp",
+            "creationSource": "provider",
             "includeSubagents": "true",
             "updatedSince": str(now - NATIVE_WINDOW_MS),
             "limit": CONTROL_PAGE,
@@ -228,3 +236,188 @@ def snapshot(timeout=20):
 def active_session_ids(timeout=20):
     """Back-compat shape for callers that only know OpenCode: (ids, None) or (None, error)."""
     return opencode_active(timeout)
+
+
+def checked_snapshot(timeout=20):
+    """Convert even unexpected client failures to an incomplete roster, never an empty live set."""
+    try:
+        return snapshot(timeout)
+    except Exception as exc:
+        return Snapshot(complete=False, threads={}, opencode=set(), workspaces={},
+                        problems=[f"active sessions: {type(exc).__name__}"])
+
+
+def opencode_directories(ids, timeout=20):
+    """Resolve the active service ids through its supported session endpoint."""
+    result = {}
+    for sid in ids:
+        try:
+            req = urllib.request.Request(OC_SERVICE_URL.rstrip("/") + "/api/session/" +
+                                         urllib.parse.quote(sid, safe=""))
+            pw = _password()
+            if pw:
+                req.add_header("Authorization", "Basic " + base64.b64encode(f"opencode:{pw}".encode()).decode())
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                data = json.load(response).get("data")
+            if not isinstance(data, dict) or not isinstance((data.get("location") or {}).get("directory", data.get("directory")), str) or not (data.get("location") or {}).get("directory", data.get("directory")):
+                return None, "opencode-service: session directory unavailable"
+            result[sid] = (data.get("location") or {}).get("directory", data.get("directory"))
+        except Exception as exc:
+            return None, f"opencode-service directory: {type(exc).__name__}"
+    return result, None
+
+
+def directories(snap):
+    if not snap["complete"]:
+        return None, "; ".join(snap["problems"]) or "active set incomplete"
+    oc, err = opencode_directories(snap["opencode"])
+    if err:
+        return None, err
+    return {**oc, **{"thread:" + tid: path for tid, path in snap["workspaces"].items()}}, None
+
+
+def opencode_get(path, timeout=20):
+    req = urllib.request.Request(OC_SERVICE_URL.rstrip('/') + path)
+    pw = _password()
+    if pw:
+        req.add_header('Authorization', 'Basic ' + base64.b64encode(f'opencode:{pw}'.encode()).decode())
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.load(response)
+
+
+def _session_pages(activity, high_water=None, directory=None):
+    ids, cursors = set(), set()
+    cursor, previous, newest = None, None, high_water or 0
+    for page in range(200):
+        query = {'limit': CONTROL_PAGE, 'order': 'desc'}
+        if directory is not None:
+            query['directory'] = directory
+        if cursor:
+            query['cursor'] = cursor
+        body = opencode_get('/api/session?' + urllib.parse.urlencode(query))
+        rows = body.get('data')
+        pagination = body.get('cursor')
+        if not isinstance(rows, list) or not isinstance(pagination, dict) or 'next' not in pagination:
+            raise ValueError('session list/cursor unavailable')
+        updates = []
+        for row in rows:
+            sid = row.get('id')
+            row_directory = (row.get('location') or {}).get('directory', row.get('directory'))
+            updated = row.get('time', {}).get('updated')
+            if not sid or not row_directory or not isinstance(updated, (int, float)) or not math.isfinite(updated) or updated < 0:
+                raise ValueError('session id/location.directory/time.updated unavailable')
+            if directory is not None and directory.rstrip('/') != row.get('location', {}).get('directory', row.get('directory', '')).rstrip('/'):
+                raise ValueError('session directory filter ignored')
+            if sid in ids:
+                raise ValueError('session pagination repeated an id')
+            if previous is not None and updated > previous:
+                raise ValueError('session history is not newest-updated-first')
+            previous = updated
+            ids.add(sid)
+            updates.append(updated)
+            newest = max(newest, updated)
+            timestamps = [row['time'].get(key, 0) or 0 for key in ('updated', 'viewed', 'idle')]
+            if any(not isinstance(t, (int, float)) or not math.isfinite(t) or t < 0 for t in timestamps):
+                raise ValueError('session activity timestamp unavailable')
+            activity[row_directory.rstrip('/')] = max(activity.get(row_directory.rstrip('/'), 0), max(timestamps) / 1000)
+        # The installed service's SessionStore.list orders by time_updated DESC,
+        # id DESC; the route's cursor anchors on time.updated. Request that order
+        # explicitly and validate it on every page before using this cutoff.
+        if high_water is not None and updates and max(updates) < high_water:
+            return activity, newest, {'sessions': len(ids), 'pages': page + 1}
+        cursor = pagination['next']
+        if cursor is None:
+            return activity, newest, {'sessions': len(ids), 'pages': page + 1}
+        if not isinstance(cursor, str) or not cursor or cursor in cursors:
+            raise ValueError('session pagination did not advance')
+        cursors.add(cursor)
+    raise ValueError('session pagination truncated after 200 pages')
+
+
+def session_history(cache_path=None, write_cache=False, now=None):
+    """Complete directory history, bootstrapped daily and incrementally refreshed between full reads."""
+    started = time.monotonic()
+    now = time.time() if now is None else now
+    cache = None
+    if cache_path:
+        try:
+            with open(cache_path) as file:
+                saved = json.load(file)
+            if (saved['version'] == 1 and saved['service'] == OC_SERVICE_URL
+                    and 0 <= now - saved['full_at'] < 86400
+                    and isinstance(saved['high_water'], (int, float))
+                    and math.isfinite(saved['high_water']) and 0 <= saved['high_water'] <= now * 1000
+                    and isinstance(saved['directories'], dict)
+                    and all(isinstance(k, str) and isinstance(v, (int, float)) and math.isfinite(v) and v >= 0 for k, v in saved['directories'].items())):
+                cache = saved
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    mode = 'incremental' if cache else 'full'
+    try:
+        try:
+            activity, high_water, stats = _session_pages(dict(cache['directories']) if cache else {},
+                                                        cache['high_water'] if cache else None)
+        except Exception:
+            if cache is None:
+                raise
+            # A cursor/order failure invalidates the incremental proof. Rebuild
+            # once from the start; never publish a partially refreshed cache.
+            mode = 'full_after_incremental_error'
+            activity, high_water, stats = _session_pages({})
+            cache = None
+        stats.update(mode=mode, duration_s=round(time.monotonic() - started, 3), high_water=high_water)
+        if cache_path and write_cache:
+            state = dict(version=1, service=OC_SERVICE_URL, directories=activity, high_water=high_water,
+                         full_at=cache['full_at'] if cache else now)
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            fd, path = tempfile.mkstemp(prefix='.history-', dir=os.path.dirname(cache_path))
+            try:
+                with os.fdopen(fd, 'w') as file:
+                    json.dump(state, file)
+                os.replace(path, cache_path)
+            finally:
+                if os.path.exists(path):
+                    os.unlink(path)
+        return activity, stats, None
+    except Exception as exc:
+        return None, {}, f'opencode history: {type(exc).__name__}: {exc}'
+
+
+def project_activity(project_id, root, since_ms):
+    """Recent history for one project, including archived threads. A cap only disables that repo's reaping."""
+    activity = {}
+    for archived in (False, True):
+        query = {'projectId': project_id, 'includeSubagents': 'true', 'updatedSince': since_ms,
+                 'limit': CONTROL_PAGE}
+        if archived:
+            query['archived'] = 'true'
+        threads, err = _control_threads('/threads?' + urllib.parse.urlencode(query), NATIVE_TIMEOUT,
+                                        f'history {project_id} archived={archived}')
+        if err:
+            return None, err
+        for thread in threads.values():
+            path = thread.get('worktreePath') or root
+            try:
+                stamps = [thread.get('updatedAt'), thread.get('archivedAt')]
+                updated = max(datetime.datetime.fromisoformat(t.replace('Z', '+00:00')).timestamp()
+                              for t in stamps if t is not None)
+            except (ValueError, TypeError):
+                return None, 'control history: updatedAt unavailable'
+            activity[path.rstrip('/')] = max(activity.get(path.rstrip('/'), 0), updated)
+    return activity, None
+
+
+def worktree_activity(path, known_directories):
+    """Fresh complete directory reads cover viewed/idle changes below the updated-time cutoff."""
+    roots = {path.rstrip('/'), os.path.realpath(path).rstrip('/')}
+    directories = roots | {directory for directory in known_directories
+                           if any(directory == root or directory.startswith(root + '/') for root in roots)}
+    activity = {}
+    try:
+        for directory in sorted(directories):
+            paths, _, _ = _session_pages({}, directory=directory)
+            for key, value in paths.items():
+                activity[key] = max(activity.get(key, 0), value)
+        return activity, None
+    except Exception as exc:
+        return None, f'worktree activity: {type(exc).__name__}: {exc}'

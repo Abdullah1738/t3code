@@ -122,17 +122,23 @@ const spanAttributes = <A, E>(
     return spans;
   });
 
-for (const lane of ["foreground", "background", "writer", "checkpoint writer"] as const) {
-  const reader = lane === "foreground" || lane === "background";
-  const inLane = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-    lane === "foreground"
-      ? foreground(effect)
-      : lane === "background"
-        ? background(effect)
-        : effect;
-  const config = { foregroundReaderSlots: 1, checkpointWorker: lane === "checkpoint writer" };
+const statementLanes = (["foreground", "background", "writer", "checkpoint writer"] as const).map(
+  (lane) => {
+    const reader = lane === "foreground" || lane === "background";
+    const inLane = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      lane === "foreground"
+        ? foreground(effect)
+        : lane === "background"
+          ? background(effect)
+          : effect;
+    const config = { foregroundReaderSlots: 1, checkpointWorker: lane === "checkpoint writer" };
+    return { lane, reader, inLane, config };
+  },
+);
 
-  it.effect(`a plain statement interrupted waiting for the ${lane} records its wait`, () =>
+it.effect.each(statementLanes)(
+  "a plain statement interrupted waiting for the $lane records its wait",
+  ({ lane, reader, inLane, config }) =>
     withLanes(config, (sql) =>
       Effect.gen(function* () {
         const held = yield* Deferred.make<void>();
@@ -185,9 +191,11 @@ for (const lane of ["foreground", "background", "writer", "checkpoint writer"] a
         assert.equal(yield* inLane(countEntries(sql)), 1);
       }),
     ),
-  );
+);
 
-  it.effect(`a plain statement acquiring the ${lane} keeps its acquired attributes`, () =>
+it.effect.each(statementLanes)(
+  "a plain statement acquiring the $lane keeps its acquired attributes",
+  ({ lane, reader, inLane, config }) =>
     withLanes(config, (sql) =>
       Effect.gen(function* () {
         const spans = yield* spanAttributes(inLane(countEntries(sql)).pipe(Effect.orDie));
@@ -205,17 +213,16 @@ for (const lane of ["foreground", "background", "writer", "checkpoint writer"] a
           statement["db.reader.acquire_wait_ms"],
           reader ? statement["db.lock_wait_ms"] : undefined,
         );
+        assert.isNumber(statement["db.statement.execution_ms"]);
+        assert.isAtLeast(Number(statement["db.statement.execution_ms"]), 0);
         if (reader) {
-          assert.isNumber(statement["db.statement.execution_ms"]);
           assert.isNumber(statement["db.reader.hold_ms"]);
         } else {
-          assert.isUndefined(statement["db.statement.execution_ms"]);
           assert.isUndefined(statement["db.reader.hold_ms"]);
         }
       }),
     ),
-  );
-}
+);
 
 it.effect(
   "a foreground read does not wait behind a long background read",

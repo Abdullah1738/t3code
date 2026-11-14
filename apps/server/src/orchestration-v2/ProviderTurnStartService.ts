@@ -1,3 +1,8 @@
+import {
+  PROVIDER_START_CLEANUP_TIMEOUT_MS,
+  PROVIDER_START_TIMEOUT_MS,
+  withoutProviderStartDeadline,
+} from "./providerStartDeadlinePolicy.ts";
 import { isAutomaticClaudeRecovery } from "./launchRecovery.ts";
 import { isRecoveredQueueRun, markInstallLifecycle } from "../ardud/fast-install/report.ts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
@@ -230,6 +235,21 @@ export const layer: Layer.Layer<
             Effect.catchCause(() => Effect.succeed(input.inheritedBackgroundTurnItems)),
           ),
         shouldStartProviderTurn: () => isCurrentAttemptInStatus("running"),
+        loadRunInterruptReason: () =>
+          projectionStore
+            .getThreadRecords(input.threadId, ["turnItems"], {
+              turnItemRunIds: [input.runId],
+              turnItemTypes: ["run_interrupt_request"],
+            })
+            .pipe(
+              Effect.map(({ turnItems }) => {
+                const reason = turnItems.find(
+                  (item) => item.type === "run_interrupt_request",
+                )?.message;
+                return reason === "Interrupt requested" ? undefined : reason;
+              }),
+              Effect.catchCause(() => Effect.succeed(undefined)),
+            ),
         shouldFinalizeRun: () =>
           projectionStore
             .getRunControlState(input.threadId, input.runId)
@@ -310,10 +330,14 @@ export const layer: Layer.Layer<
           return yield* result.failure;
         }
         if (!(yield* incomingIsCurrent)) return;
-        yield* liveSession.interruptTurn({
-          providerThread: turnInput.providerThread,
-          providerTurnId: stale.providerTurnId,
-        });
+        yield* liveSession
+          .interruptTurn({
+            providerThread: turnInput.providerThread,
+            providerTurnId: stale.providerTurnId,
+            requestRuntimeRestart: false,
+            stopBackgroundWork: false,
+          })
+          .pipe(Effect.timeout(PROVIDER_START_CLEANUP_TIMEOUT_MS), Effect.mapError(readFailure));
         if (!(yield* incomingIsCurrent)) return;
         // Exactly one retry: another refusal belongs to normal start-failure handling.
         yield* start(turnInput);
@@ -365,6 +389,23 @@ export const layer: Layer.Layer<
             }),
       };
     };
+
+    // Restart workers keep this session too; its callbacks must not capture startup's projection.
+    const makeResumedSession = (session: ProviderAdapter.ProviderAdapterV2SessionRuntime) => ({
+      ...session,
+      startTurn: (input: Parameters<typeof session.startTurn>[0]) =>
+        Effect.sync(() => markInstallLifecycle("firstResumedProviderRequestAt")).pipe(
+          Effect.andThen(session.startTurn(input)),
+        ),
+      ...(session.compactThread === undefined
+        ? {}
+        : {
+            compactThread: (input: Parameters<typeof session.startTurn>[0]) =>
+              Effect.sync(() => markInstallLifecycle("firstResumedProviderRequestAt")).pipe(
+                Effect.andThen(session.compactThread!(input)),
+              ),
+          }),
+    });
 
     const start = Effect.fn("orchestrationV2.providerTurnStart.start")(function* (input: {
       readonly threadId: ThreadId;
@@ -742,6 +783,31 @@ export const layer: Layer.Layer<
       });
       const { isCurrentAttemptInStatus } = runControls;
 
+      if (run.providerRestartCleanup?.completed === false) return;
+
+      const providerStartDeadlineAt =
+        run.providerStartDeadlineAt ??
+        DateTime.makeUnsafe(
+          DateTime.toEpochMillis(yield* DateTime.now) + PROVIDER_START_TIMEOUT_MS,
+        );
+      const admitted = yield* eventSink.writeIfRunCurrent({
+        threadId: projection.thread.id,
+        runId: run.id,
+        activeAttemptId: attempt.id,
+        expectedStatus: "starting",
+        events: [
+          {
+            id: yield* idAllocator.allocate.event({ threadId: projection.thread.id }),
+            type: "run.updated",
+            threadId: projection.thread.id,
+            runId: run.id,
+            occurredAt: yield* DateTime.now,
+            payload: { ...withoutProviderStartDeadline(run), providerStartDeadlineAt },
+          },
+        ],
+      });
+      if (!admitted.committed) return;
+
       const resolvedRuntimePolicy = yield* runtimePolicy.resolve({
         thread: projection.thread,
         modelSelection: run.modelSelection,
@@ -812,7 +878,7 @@ export const layer: Layer.Layer<
       }
       const session = makeRecoverySession(
         sessionResult.success,
-        () => isCurrentAttemptInStatus("running"),
+        runControls.shouldStartProviderTurn,
         isAutomaticClaudeRecovery(sessionResult.success.driver, run)
           ? runControls.loadRecoveryAdmission
           : undefined,
@@ -1499,6 +1565,7 @@ export const layer: Layer.Layer<
       };
       const runningRun: OrchestrationV2Run = {
         ...run,
+        providerStartDeadlineAt,
         status: "running",
         startedAt: now,
       };
@@ -1732,21 +1799,7 @@ export const layer: Layer.Layer<
         session:
           run.restartContinuationOfRunId === undefined && !isRecoveredQueueRun(run.id)
             ? deliverySession
-            : {
-                ...deliverySession,
-                startTurn: (input) =>
-                  Effect.sync(() => markInstallLifecycle("firstResumedProviderRequestAt")).pipe(
-                    Effect.andThen(deliverySession.startTurn(input)),
-                  ),
-                ...(deliverySession.compactThread === undefined
-                  ? {}
-                  : {
-                      compactThread: (input: Parameters<typeof deliverySession.startTurn>[0]) =>
-                        Effect.sync(() =>
-                          markInstallLifecycle("firstResumedProviderRequestAt"),
-                        ).pipe(Effect.andThen(deliverySession.compactThread!(input))),
-                    }),
-              },
+            : makeResumedSession(deliverySession),
         run: runningRun,
         rootNode: runningRootNode,
         checkpointScope,
@@ -1780,21 +1833,7 @@ export const layer: Layer.Layer<
         loadRecoveryAdmission: runControls.loadRecoveryAdmission,
         shouldFinalizeRun: runControls.shouldFinalizeRun,
         hasUnpairedRunInterruptRequest: runControls.hasUnpairedRunInterruptRequest,
-        loadRunInterruptReason: () =>
-          projectionStore
-            .getThreadRecords(input.threadId, ["turnItems"], {
-              turnItemRunIds: [run.id],
-              turnItemTypes: ["run_interrupt_request"],
-            })
-            .pipe(
-              Effect.map(({ turnItems }) => {
-                const reason = turnItems.find(
-                  (item) => item.type === "run_interrupt_request",
-                )?.message;
-                return reason === "Interrupt requested" ? undefined : reason;
-              }),
-              Effect.catchCause(() => Effect.succeed(undefined)),
-            ),
+        loadRunInterruptReason: runControls.loadRunInterruptReason,
         message: {
           messageId: message.id,
           text:

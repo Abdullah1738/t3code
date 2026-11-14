@@ -1,3 +1,4 @@
+import { resolveHistoryBasePath } from "./historySourceFiles.ts";
 import { annotateSqliteError, ErrorObserver } from "@t3tools/shared/nodeSqliteErrors";
 import * as NodeWorkerThreads from "node:worker_threads";
 import * as Clock from "effect/Clock";
@@ -141,7 +142,7 @@ const fail = (stage, error) => {
   });
 };
 try {
-  replica = (${replicaFactory})(require('node:sqlite'), require('node:fs'), require('node:path'), workerData);
+  replica = (${replicaFactory})(require('node:sqlite'), require('node:fs'), require('node:path'), workerData, (${resolveHistoryBasePath.toString()}));
   beat('opened');
   const step = () => {
     try {

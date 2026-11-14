@@ -30,6 +30,7 @@ import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
@@ -196,7 +197,11 @@ const makeHarness = Effect.fnUntraced(function* (
   policy = runtimePolicy,
   overrides: Pick<
     MuseAdapterV2Options,
-    "createHost" | "nativeEventLogger" | "modelCatalog" | "continuationRequests"
+    | "createHost"
+    | "nativeEventLogger"
+    | "modelCatalog"
+    | "continuationRequests"
+    | "requestTimeoutMs"
   > = {},
 ) {
   let hostCount = 0;
@@ -370,6 +375,302 @@ const approval = (turnId: string) => ({
 });
 
 describe("MuseAdapterV2", () => {
+  it.effect.each([false, true])(
+    "does not accept inherited Muse compaction as a fresh manual request, tagged=%s",
+    (tagged) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakeMuse();
+        const offered = yield* Deferred.make<void>();
+        const harness = yield* makeHarness(
+          fake,
+          INSTANCE_ID,
+          undefined,
+          undefined,
+          undefined,
+          runtimePolicy,
+          { continuationRequests: { offer: () => Deferred.succeed(offered, undefined) } },
+        );
+        yield* fake.emit("turn/started", { turnId: "older-compaction" });
+        yield* Deferred.await(offered);
+        const oldItem = {
+          itemId: "older-compact-item",
+          ...(tagged ? { turnId: "older-compaction" } : {}),
+          kind: "compaction",
+          status: "inProgress",
+          revision: 1,
+        };
+        yield* fake.emit("item/started", { turnId: "older-compaction", item: oldItem });
+        const held = pendingPromise<Record<string, unknown>>();
+        fake.queueResponse("session/compact", held.promise);
+        const starting = yield* harness.runtime.compactThread!(
+          yield* turnInput(harness.providerThread),
+        ).pipe(Effect.forkScoped);
+        const command = yield* fake.takeCall("session/compact");
+        yield* harness.takeEvent(
+          "turn_item.updated",
+          (event) => event.turnItem.type === "compaction",
+        );
+        assert.isFalse(
+          harness.allEvents.some(
+            (event) =>
+              event.type === "provider_turn.updated" &&
+              event.providerTurn.promptAcceptedAt !== undefined,
+          ),
+        );
+        yield* fake.emit("item/updated", { item: { ...oldItem, revision: 2 } });
+        yield* harness.takeEvent(
+          "turn_item.updated",
+          (event) => event.turnItem.type === "compaction",
+        );
+        assert.isFalse(
+          harness.allEvents.some(
+            (event) =>
+              event.type === "provider_turn.updated" &&
+              event.providerTurn.promptAcceptedAt !== undefined,
+          ),
+        );
+        yield* fake.emit("turn/completed", { turnId: "older-compaction", terminal: "completed" });
+        yield* fake.emit("item/updated", { item: { ...oldItem, revision: 3 } });
+        yield* harness.takeEvent(
+          "turn_item.updated",
+          (event) => event.turnItem.type === "compaction",
+        );
+        assert.isFalse(
+          harness.allEvents.some(
+            (event) =>
+              event.type === "provider_turn.updated" &&
+              event.providerTurn.promptAcceptedAt !== undefined,
+          ),
+        );
+        yield* fake.emit("item/completed", {
+          item: { ...oldItem, status: "completed", revision: 4 },
+        });
+        yield* harness.takeEvent(
+          "turn_item.updated",
+          (event) => event.turnItem.type === "compaction",
+        );
+        assert.isFalse(harness.allEvents.some((event) => event.type === "turn.terminal"));
+        yield* fake.emit("item/started", {
+          item: {
+            itemId: "current-compact-item",
+            ...(tagged ? { turnId: command.commandId } : {}),
+            kind: "compaction",
+            status: "inProgress",
+            revision: 1,
+          },
+        });
+        yield* harness.takeEvent(
+          "turn_item.updated",
+          (event) => event.turnItem.type === "compaction",
+        );
+        assert.isTrue(
+          harness.allEvents.some(
+            (event) =>
+              event.type === "provider_turn.updated" &&
+              event.providerTurn.promptAcceptedAt !== undefined,
+          ),
+        );
+        held.resolve({ status: "accepted" });
+        yield* Fiber.join(starting);
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("pending manual Muse compaction cleanup preserves an inherited host", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeMuse();
+      const harness = yield* makeHarness(fake);
+      yield* fake.emit("turn/started", { turnId: "inherited-wake" });
+      const admission = pendingPromise<Record<string, unknown>>();
+      fake.queueResponse("session/compact", admission.promise);
+      const starting = yield* harness.runtime.compactThread!(
+        yield* turnInput(harness.providerThread),
+      ).pipe(Effect.forkScoped);
+      yield* fake.takeCall("session/compact");
+      const turn = yield* harness.takeEvent("provider_turn.updated");
+      const stopping = yield* harness.runtime
+        .interruptTurn({
+          providerThread: harness.providerThread,
+          providerTurnId: turn.providerTurn.id,
+          stopBackgroundWork: false,
+        })
+        .pipe(Effect.result, Effect.forkScoped);
+      admission.resolve({ status: "accepted" });
+      yield* Fiber.join(starting);
+      assert.equal((yield* Fiber.join(stopping))._tag, "Failure");
+      assert.equal(fake.closeCount(), 0);
+      assert.isFalse(harness.allEvents.some((event) => event.type === "turn.terminal"));
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect.each([false, true])(
+    "preserves inherited Muse host when interrupt command times out, explicit Stop=%s",
+    (explicitStop) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakeMuse();
+        const harness = yield* makeHarness(
+          fake,
+          INSTANCE_ID,
+          undefined,
+          undefined,
+          undefined,
+          runtimePolicy,
+          { requestTimeoutMs: 1000 },
+        );
+        const turn = yield* startConversation(harness, fake);
+        yield* fake.emit("turn/started", { turnId: "inherited" });
+        const hung = pendingPromise<Record<string, unknown>>();
+        fake.queueResponse("turn/interrupt", hung.promise);
+        const stopping = yield* harness.runtime
+          .interruptTurn({
+            providerThread: harness.providerThread,
+            providerTurnId: turn.providerTurn.id,
+            ...(explicitStop ? {} : { stopBackgroundWork: false }),
+          })
+          .pipe(Effect.result, Effect.forkScoped);
+        yield* fake.takeCall("turn/interrupt");
+        yield* TestClock.adjust("1 second");
+        if (explicitStop) {
+          // The first command targeted joined work; its failure is ignored before
+          // the current target is sent by explicit Stop.
+          yield* fake.takeCall("turn/interrupt");
+          yield* TestClock.adjust("1 second");
+        }
+        const result = yield* Fiber.join(stopping);
+        if (!explicitStop) assert.equal(result._tag, "Failure");
+        assert.equal(fake.closeCount(), explicitStop ? 1 : 0);
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("acknowledges a long manual Muse compaction when its native item starts", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeMuse();
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.compactThread!(yield* turnInput(harness.providerThread));
+      yield* fake.emit("item/started", {
+        item: { itemId: "manual-compact", kind: "compaction", status: "inProgress", revision: 1 },
+      });
+      yield* harness.takeEvent(
+        "turn_item.updated",
+        (event) => event.turnItem.type === "compaction",
+      );
+      assert.isTrue(
+        harness.allEvents.some(
+          (event) =>
+            event.type === "provider_turn.updated" &&
+            event.providerTurn.promptAcceptedAt !== undefined,
+        ),
+      );
+      yield* TestClock.adjust("11 minutes");
+      assert.isFalse(harness.allEvents.some((event) => event.type === "turn.terminal"));
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect.each([false, true])(
+    "timeout cleanup preserves Muse joined work, explicit Stop=%s",
+    (explicitStop) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakeMuse();
+        const harness = yield* makeHarness(fake);
+        const turn = yield* startConversation(harness, fake);
+        yield* fake.emit("turn/started", { turnId: "older-joined" });
+        yield* fake.emit("item/completed", {
+          item: {
+            itemId: "joined-answer",
+            turnId: "older-joined",
+            kind: "agentMessage",
+            status: "completed",
+            revision: 1,
+            text: "Older output",
+          },
+        });
+        yield* harness.takeEvent(
+          "turn_item.updated",
+          (event) => event.turnItem.type === "assistant_message",
+        );
+        assert.isFalse(
+          harness.allEvents.some(
+            (event) =>
+              event.type === "provider_turn.updated" &&
+              event.providerTurn.promptAcceptedAt !== undefined,
+          ),
+        );
+        const interrupting = yield* harness.runtime
+          .interruptTurn({
+            providerThread: harness.providerThread,
+            providerTurnId: turn.providerTurn.id,
+            ...(explicitStop ? {} : { stopBackgroundWork: false, requestRuntimeRestart: false }),
+          })
+          .pipe(Effect.forkScoped);
+        if (explicitStop)
+          assert.equal((yield* fake.takeCall("turn/interrupt")).params.turnId, "older-joined");
+        assert.equal((yield* fake.takeCall("turn/interrupt")).params.turnId, turn.nativeId);
+        yield* fake.emit("turn/completed", { turnId: turn.nativeId, terminal: "cancelled" });
+        yield* Fiber.join(interrupting);
+        assert.equal((yield* harness.takeEvent("turn.terminal")).status, "interrupted");
+        assert.deepEqual(
+          fake.calls
+            .filter((call) => call.method === "turn/interrupt")
+            .map((call) => call.params.turnId),
+          explicitStop ? ["older-joined", turn.nativeId] : [turn.nativeId],
+        );
+        assert.equal(fake.closeCount(), 0);
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("acknowledges the current native turn start independently of output", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeMuse(),
+        harness = yield* makeHarness(fake);
+      const { nativeId, providerTurn } = yield* startConversation(harness, fake);
+      assert.isUndefined(providerTurn.promptAcceptedAt);
+      yield* fake.emit("turn/started", { turnId: "joined-background" });
+      yield* fake.emit("turn/started", { turnId: nativeId });
+      const ack = yield* harness.takeEvent(
+        "provider_turn.updated",
+        (event) => event.providerTurn.promptAcceptedAt !== undefined,
+      );
+      assert.equal(ack.providerTurn.id, providerTurn.id);
+      assert.equal(ack.providerTurn.nativeTurnRef?.nativeId, nativeId);
+      assert.lengthOf(
+        harness.allEvents.filter(
+          (event) =>
+            event.type === "provider_turn.updated" &&
+            event.providerTurn.promptAcceptedAt !== undefined,
+        ),
+        1,
+      );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("acknowledges a native start replayed while adopting a held continuation", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeMuse();
+      const offers = yield* Deferred.make<void>();
+      const harness = yield* makeHarness(
+        fake,
+        INSTANCE_ID,
+        undefined,
+        undefined,
+        undefined,
+        runtimePolicy,
+        { continuationRequests: { offer: () => Deferred.succeed(offers, undefined) } },
+      );
+      yield* fake.emit("turn/started", { turnId: "held-native" });
+      yield* Deferred.await(offers);
+      const input = yield* turnInput(harness.providerThread);
+      yield* harness.runtime.startTurn({
+        ...input,
+        message: { ...input.message, createdBy: "agent", creationSource: "provider" },
+      });
+      const ack = yield* harness.takeEvent(
+        "provider_turn.updated",
+        (event) => event.providerTurn.promptAcceptedAt !== undefined,
+      );
+      assert.equal(ack.providerTurn.nativeTurnRef?.nativeId, "held-native");
+      assert.isFalse(fake.calls.some((call) => call.method === "turn/start"));
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
   it.effect("connects the thread's MCP credential on native start and resume", () =>
     Effect.gen(function* () {
       yield* (yield* McpProviderSessions.McpProviderSessions).set({
@@ -1605,3 +1906,109 @@ describe("MuseAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 });
+
+it.effect.each([
+  "nested",
+  "outer",
+  "both",
+  "old outer/current nested",
+  "current outer/old nested",
+] as const)("late inherited Muse compaction stays separate with %s identity", (identity) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFakeMuse();
+    const offered = yield* Deferred.make<void>();
+    const harness = yield* makeHarness(
+      fake,
+      INSTANCE_ID,
+      undefined,
+      undefined,
+      undefined,
+      runtimePolicy,
+      { continuationRequests: { offer: () => Deferred.succeed(offered, undefined) } },
+    );
+    yield* fake.emit("turn/started", { turnId: "r9-old-operation" });
+    yield* Deferred.await(offered);
+    const held = pendingPromise<Record<string, unknown>>();
+    fake.queueResponse("session/compact", held.promise);
+    const starting = yield* harness.runtime.compactThread!(
+      yield* turnInput(harness.providerThread),
+    ).pipe(Effect.forkScoped);
+    const command = yield* fake.takeCall("session/compact");
+    yield* fake.emit("turn/completed", { turnId: "r9-old-operation", terminal: "completed" });
+    const envelope =
+      identity === "nested"
+        ? {}
+        : {
+            turnId:
+              identity === "current outer/old nested" ? command.commandId : "r9-old-operation",
+          };
+    const itemIdentity =
+      identity === "outer"
+        ? {}
+        : {
+            turnId:
+              identity === "old outer/current nested" ? command.commandId : "r9-old-operation",
+          };
+    yield* fake.emit("item/updated", {
+      ...envelope,
+      item: {
+        ...itemIdentity,
+        itemId: "r9-late-old-compaction",
+        kind: "compaction",
+        status: "inProgress",
+        revision: 2,
+      },
+    });
+    yield* harness.takeEvent("turn_item.updated", (event) => event.turnItem.type === "compaction");
+    const falseAck = harness.allEvents.some(
+      (event) =>
+        event.type === "provider_turn.updated" && event.providerTurn.promptAcceptedAt !== undefined,
+    );
+    yield* fake.emit("item/completed", {
+      ...envelope,
+      item: {
+        ...itemIdentity,
+        itemId: "r9-late-old-compaction",
+        kind: "compaction",
+        status: "completed",
+        revision: 3,
+      },
+    });
+    yield* harness.takeEvent("turn_item.updated", (event) => event.turnItem.type === "compaction");
+    // The read is a transport/event milestone following the late completion.
+    yield* fake.emit("session/contextUsage", { usedTokens: 42 });
+    yield* harness.takeEvent(
+      "provider_thread.updated",
+      (event) => event.providerThread.contextUsage?.usedTokens === 42,
+    );
+    const falseTerminal = harness.allEvents.some((event) => event.type === "turn.terminal");
+    assert.isFalse(falseAck, "older outer turn id acknowledged the fresh compaction");
+    assert.isFalse(falseTerminal, "older outer turn id completed the fresh compaction");
+    yield* fake.emit("item/started", {
+      turnId: command.commandId,
+      item: {
+        itemId: "current-outer-compact",
+        kind: "compaction",
+        status: "inProgress",
+        revision: 1,
+      },
+    });
+    yield* harness.takeEvent(
+      "provider_turn.updated",
+      (event) => event.providerTurn.promptAcceptedAt !== undefined,
+    );
+    yield* fake.emit("item/completed", {
+      turnId: command.commandId,
+      item: {
+        itemId: "current-outer-compact",
+        kind: "compaction",
+        status: "completed",
+        revision: 2,
+      },
+    });
+    const terminal = yield* harness.takeEvent("turn.terminal");
+    assert.equal(terminal.status, "completed");
+    held.resolve({ status: "accepted" });
+    yield* Fiber.join(starting);
+  }).pipe(Effect.scoped, Effect.provide(testLayer)),
+);

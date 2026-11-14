@@ -208,7 +208,7 @@ it.effect.each([
     stage: "dispatch",
     taskId: "task",
     message:
-      "delegate_task timed out during dispatch for thread caller. Task task may still be created; check it with task_status. Retry only with the same clientRequestId: retry.",
+      "delegate_task timed out during dispatch for thread caller. Task task may still be created; use task_status to check whether it was saved. Retry only with the same clientRequestId: retry.",
   },
   {
     code: "delegation_timeout",

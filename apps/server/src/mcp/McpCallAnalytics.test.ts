@@ -948,3 +948,50 @@ it.effect.each(shutdownCommitRaces)(
       }).pipe(Effect.provide(registration));
     }),
 );
+
+it.effect("card_next records interrupted calls with caller and duration", () =>
+  Effect.gen(function* () {
+    const rows: AnalyticsEvent[] = [];
+    const entered = yield* Deferred.make<void>();
+    const toolkit = probe("card_next");
+    const handlers = McpToolAccess.toLayer(toolkit, {
+      card_next: McpToolAccess.reads(() =>
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+      ),
+    });
+    const registration = McpHttpServer.toolkitRegistration(toolkit, handlers).pipe(
+      Layer.provideMerge(McpServer.McpServer.layer),
+      Layer.provide(Testkit.liveThreadsLayer),
+      Layer.provide(
+        Layer.mock(Analytics.Analytics)({
+          record: (event) =>
+            Effect.sync(() => {
+              if (event.kind === "mcp.call") rows.push(event);
+            }),
+          flush: Effect.void,
+        }),
+      ),
+    );
+    yield* Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      const request = yield* server
+        .callTool({ name: "card_next", arguments: args })
+        .pipe(
+          Effect.provideService(McpSchema.McpServerClient, client),
+          Effect.provide(invocation),
+          Effect.forkChild,
+        );
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust("3 seconds");
+      yield* Fiber.interrupt(request);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        kind: "mcp.call",
+        tool: "card_next",
+        callerThreadId: "caller-ledger",
+        outcome: "interrupted",
+      });
+      expect(rows[0]!.durationMs).toBeGreaterThanOrEqual(3000);
+    }).pipe(Effect.provide(registration));
+  }),
+);

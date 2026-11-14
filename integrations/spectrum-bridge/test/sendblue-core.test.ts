@@ -11,6 +11,18 @@ import { Store } from "../src/store.ts";
 import { cardLayout } from "../src/card-text.ts";
 
 const owner = "+15555550123";
+
+for (const status of [408, 409, 429, 500, 400, 404]) {
+  test(`continuation HTTP ${status} retains its failure semantics`, async () => {
+    const line = new Sendblue({keyId:"test", secret:"test", number:"+15555550001", fetch: (async () =>
+      Response.json({ error: "provider failure" }, {status})) as unknown as typeof fetch});
+    const error = await line.updateApp("original", {url:"https://card.example/", caption:"Delivery tracking",
+      imageUrl:"https://cdn.example/stage.png"}, "stable-stage-key").catch(error => error);
+    expect(error).toBeInstanceOf(LineError);
+    expect(error.retryable).toBe([408, 409, 429, 500].includes(status));
+    expect(error.uncertain).toBe(status === 500);
+  });
+}
 const moni = "+15555550199";
 const access: Access = {
   people: [{ name: "Moni", role: "admin", addresses: [moni, "moni@example.com"] }],

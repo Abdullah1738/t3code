@@ -10,7 +10,12 @@ import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
+import * as Deferred from "effect/Deferred";
 import { runMigrations } from "./Migrations.ts";
+import {
+  runBootMigrations,
+  ShellRunLookupMigration,
+} from "../ardud/persistence/shellRunLookupMigration.ts";
 import { initializeV2Database } from "./initializeV2Database.ts";
 import { ensureShellLookupIndexes } from "../ardud/persistence/shellIndexes.ts";
 import * as ServerConfig from "../config.ts";
@@ -74,7 +79,15 @@ const layerSetup = Layer.effectDiscard(
           yield* sql`PRAGMA cache_size = -65536;`;
         }),
       );
-      yield* runSqliteSetupPhases(runMigrations(), ensureShellLookupIndexes());
+      const lookupMigration = yield* ShellRunLookupMigration;
+      const migrations =
+        lookupMigration === undefined
+          ? runMigrations()
+          : runBootMigrations(
+              (yield* sql<{ file: string }>`PRAGMA database_list`)[0]!.file,
+              lookupMigration,
+            );
+      yield* runSqliteSetupPhases(migrations, ensureShellLookupIndexes());
       const baseFilename = yield* withStartupPhase(
         "sqlite.archive-marker",
         Effect.gen(function* () {
@@ -128,6 +141,7 @@ export const layerFromPath = Effect.fn("makeSqlitePersistenceLive")(function* (d
   const observer = yield* ErrorObserver;
   const snapshotGate = yield* Semaphore.make(1);
   const checkpointWorkerStart = yield* ServerActivation;
+  const lookupMigration = yield* Deferred.make<void>();
   const baseFilename = yield* withStartupPhase(
     "sqlite.marker",
     Effect.gen(function* () {
@@ -179,8 +193,12 @@ export const layerFromPath = Effect.fn("makeSqlitePersistenceLive")(function* (d
 
   return Layer.provideMerge(
     Layer.mergeAll(
-      Layer.provideMerge(archiveCheckpointLayer(dbPath), layerSetup),
+      Layer.provideMerge(
+        archiveCheckpointLayer(dbPath),
+        Layer.provide(layerSetup, Layer.succeed(ShellRunLookupMigration, lookupMigration)),
+      ),
       Layer.succeed(ArchiveSnapshotGate, snapshotGate),
+      Layer.succeed(ShellRunLookupMigration, lookupMigration),
     ),
     Layer.effectContext(
       withStartupPhase(

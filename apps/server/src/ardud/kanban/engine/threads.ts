@@ -100,6 +100,7 @@ export interface KanbanLaunchInput {
 }
 
 export interface KanbanSendInput {
+  readonly flushQueued?: "wake" | "steer";
   readonly threadId: ThreadId;
   readonly text: string;
   /** Stable per logical send when a retry must not deliver a second message. */
@@ -130,6 +131,12 @@ export interface KanbanThreadsShape {
       readonly requestId: RuntimeRequestId;
       readonly questions: ReadonlyArray<OrchestrationV2UserInputQuestion>;
     }>,
+    KanbanThreadError
+  >;
+  readonly claimContext: (
+    threadId: ThreadId,
+  ) => Effect.Effect<
+    { readonly projectId: ProjectId; readonly model: ModelSelection } | null,
     KanbanThreadError
   >;
   readonly view: (threadId: ThreadId) => Effect.Effect<KanbanThreadView | null>;
@@ -364,6 +371,17 @@ const make = Effect.gen(function* () {
     },
     Effect.mapError(
       (error) => new KanbanThreadError({ operation: "view", detail: detailOf(error) }),
+    ),
+  );
+
+  const claimContext = Effect.fn("KanbanThreads.claimContext")(
+    function* (threadId: ThreadId) {
+      // Claim eligibility needs neither thread history nor activity/shell aggregation.
+      const row = yield* threads.getCallerRow(threadId);
+      return row === null ? null : { projectId: row.projectId, model: row.modelSelection };
+    },
+    Effect.mapError(
+      (error) => new KanbanThreadError({ operation: "claimContext", detail: detailOf(error) }),
     ),
   );
 
@@ -678,6 +696,12 @@ const make = Effect.gen(function* () {
       let id = yield* sendId(input, pruneMessageWakes);
       if (id === undefined) return;
       // Queue edits cannot change a run's model selection or steer a live turn.
+      if (input.flushQueued !== undefined) {
+        yield* threads.promoteQueuedMessages(input.threadId, input.flushQueued, {
+          deferBoardWakes: input.text.trim().length > 0,
+        });
+        if (!input.text.trim()) return;
+      }
       if (scope !== undefined) {
         const records = yield* threads.getThreadRecords(input.threadId, ["runs", "messages"]);
         if (input.isStale?.()) return;
@@ -964,6 +988,7 @@ const make = Effect.gen(function* () {
 
   return KanbanThreads.of({
     pendingUserInputs,
+    claimContext,
     view,
     find,
     model,

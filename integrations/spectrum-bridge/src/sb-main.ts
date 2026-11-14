@@ -59,6 +59,10 @@ export function sendblueLine(config: Config, env: Record<string, string | undefi
   return new Sendblue({ keyId, secret, number, ...(config.cardApp ? { cardApp: config.cardApp } : {}) });
 }
 
+export function cardDeliveryOptions(line: Pick<Line, "upload">, live: boolean, fetchFn: typeof fetch = fetch) {
+  return { static: !live, previewImage: cardPreviewImage(file => line.upload(file), fetchFn) };
+}
+
 /**
  * Wraps the line so health can see the stream: a finished backfill means caught up, and any
  * event means the connection is alive. Explicit delegation keeps Sendblue's private fields intact.
@@ -87,6 +91,7 @@ export function observedLine(line: Line, seen: { synchronized: boolean; lastEven
     upload: file => line.upload(file),
     getMessage: handle => line.getMessage(handle),
     sendApp: (chat, card) => line.sendApp(chat, card),
+    ...(line.updateApp ? { updateApp: (handle: string, card: Parameters<Line["sendApp"]>[1], key: string) => line.updateApp!(handle, card, key) } : {}),
     react: (handle, reaction) => line.react(handle, reaction),
     typing: (chat, options) => line.typing(chat, options),
     read: chat => line.read(chat),
@@ -206,8 +211,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
       ? backend.forChat(`chats/${chat.info.slug}`, chat.info.title) : backend;
     if (chatBackend instanceof RobobBackend) chatBackend.trackFirstTurns(chat.store);
     const liveCards = (config.liveCardChats ?? []).includes(chat.info.slug);
-    const transport = sbTransport(observed, chat.info.key, chat.store, undefined,
-      liveCards ? {} : { static: true, previewImage: cardPreviewImage(file => observed.upload(file)) });
+    const transport = sbTransport(observed, chat.info.key, chat.store, undefined, cardDeliveryOptions(observed, liveCards));
     // getMessage may resolve undefined for an unknown handle; the router's reply lookup already treats a throw there as unavailable.
     const router = new Router(chat.store, chatBackend, transport as unknown as ConstructorParameters<typeof Router>[2], {
       ...config, chatGuid: chat.info.key, skillPath, alertSkillPath, alertSocketPath: telegramBridgeSocket,
@@ -332,6 +336,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   const timer = setInterval(() => {
     for (const chat of chats.all()) {
       void chat.parts.delivery.tick().catch((caughtError) => { toolError("sb-main", "sb-main.catch13", caughtError); return log("sender-failed"); });
+      if (ready()) void chat.parts.router.checkCompletion();
       if (ready()) void chat.parts.replyGap.tick().catch((caughtError) => { toolError("sb-main", "reply-gap.check", caughtError); });
       if (ready()) void chat.parts.router.checkInboundLatency().catch((caughtError) => { toolError("sb-main", "sb-main.catch14", caughtError); return log("inbound-latency-check-failed"); });
       if (ready() && !chat.parts.busy) {

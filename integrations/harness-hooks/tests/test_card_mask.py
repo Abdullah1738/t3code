@@ -1,4 +1,9 @@
 """Payment text corpus: only synthetic test PANs, no owner data."""
+if __package__:
+    from . import test_environment
+else:
+    import test_environment
+
 import json
 from pathlib import Path
 import random

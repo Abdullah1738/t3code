@@ -37,6 +37,7 @@ import {
   KanbanBoard,
   KanbanDiscussionId,
   KanbanCardId,
+  kanbanOpenStep,
   KanbanBlock,
   KanbanBlockInput,
   KanbanScriptId,
@@ -248,6 +249,17 @@ const makeFake = Effect.gen(function* () {
             if (activeRun) return activeModels.get(threadId) ?? null;
             return all.get(threadId)?.model ?? null;
           }),
+        ),
+      claimContext: (threadId) =>
+        read(threadId).pipe(
+          Effect.flatMap((view) =>
+            Ref.get(threads).pipe(
+              Effect.map((all) => {
+                const model = all.get(threadId)?.model;
+                return view && model ? { projectId: view.projectId, model } : null;
+              }),
+            ),
+          ),
         ),
       // Like production, view answers null when the read fails.
       view: (threadId) =>
@@ -8336,6 +8348,317 @@ const toyBoard = Effect.gen(function* () {
   return { kanban, board: chained };
 });
 
+const offbox16ReviewFixture = Effect.fn("offbox16ReviewFixture")(function* (
+  fake: Effect.Success<typeof makeFake>,
+) {
+  const { kanban, board } = yield* toyBoard;
+  const store = yield* KanbanStore.KanbanStore;
+  const created = yield* kanban.createCard(
+    board.id,
+    {
+      title: "Offbox #16 replay",
+      prompt: "Keep Node deterministic",
+      subtasks: [
+        { step: 1, owner: "work", text: "Implement Node selection" },
+        { step: 1, owner: "work", text: "Update explanation" },
+        { step: 2, owner: "work", text: "Prove selected version" },
+        { step: 3, owner: "review", text: "Review Node selection" },
+        { step: 4, owner: "evaluator", text: "Merge into main" },
+        { step: 5, owner: "evaluator", text: "Release", gate: "deploy" },
+      ],
+    },
+    owner,
+  );
+  yield* kanban.dispatchNow;
+  const working = (yield* kanban.card(created.id)).card;
+  yield* setRunning(fake, working.workThreadId!, false);
+  const card = {
+    ...working,
+    stage: "todo" as const,
+    activeThreadId: null,
+    activeRole: null,
+    activePool: null,
+    subtasks: working.subtasks.map((task) =>
+      ["s2", "s3", "s5"].includes(task.id) ? { ...task, state: "done" as const } : task,
+    ),
+  };
+  yield* store.putCard(card);
+  yield* store.addCardEvent({
+    cardId: card.id,
+    at: card.updatedAt,
+    actor: owner,
+    kind: "review",
+    fromStage: "in_review",
+    toStage: "todo",
+    body: "clear",
+    head: "b21f374b796ee1dfc70433d1fdc370c7bb00b52d",
+  });
+  return { kanban, board, store, card };
+});
+
+it.effect.each(["done", "skipped"] as const)(
+  "#1416 Offbox #16 replay: ticking s4 %s advances to s6 and wakes its evaluator once",
+  (state) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board, store, card } = yield* offbox16ReviewFixture(fake);
+        const discussion = yield* kanban.cardDiscussion(card.id);
+        const own = yield* kanban.startEvaluator(board.id, {
+          kind: "discussion",
+          discussionId: discussion.id,
+          title: discussion.title,
+          cardNumber: card.number,
+        });
+        yield* store.putDiscussion({ ...discussion, evaluatorThreadId: own });
+        const evaluator: KanbanActor = {
+          _tag: "evaluator",
+          threadId: ThreadId.make("other-evaluator"),
+        };
+        const waiting = yield* kanban.markSubtask(
+          card.id,
+          "s1",
+          "done",
+          "Already reviewed",
+          evaluator,
+          "evaluator",
+        );
+        assert.strictEqual(waiting.stage, "needs_review");
+        assert.strictEqual(
+          (yield* kanban.card(card.id)).events.at(-1)?.body,
+          "Next step is the review",
+        );
+        const placed = yield* kanban.markSubtask(
+          card.id,
+          "s4",
+          state,
+          "Reuses the same-head clear",
+          evaluator,
+          "evaluator",
+        );
+        assert.strictEqual(placed.stage, "todo");
+        assert.isNull(placed.activeThreadId);
+        assert.isNull(placed.wakeNote);
+        assert.strictEqual(placed.subtasks[5]?.state, "open");
+        assert.strictEqual(placed.subtasks[5]?.gate, "deploy");
+        assert.isNull(Rules.reviewGate(placed, 1));
+        assert.include(
+          (yield* kanban.card(card.id)).events.at(-1)?.body ?? "",
+          "Review step already done (s4); next step is the evaluator's",
+        );
+        yield* kanban.dispatchNow;
+        assert.deepStrictEqual(
+          Rules.planDispatch(
+            board,
+            [(yield* kanban.card(card.id)).card],
+            yield* store.pools(board.id),
+          ),
+          [],
+        );
+        const notes = (yield* Ref.get(fake.threads))
+          .get(own)!
+          .messages.filter((text) => text.includes("waiting on your subtasks: s6"));
+        assert.strictEqual(notes.length, 1);
+      }).pipe(Effect.provide(inlineTestLayer(fake.layer)));
+    }),
+);
+
+it.effect.each(["same", "changed", "unknown", "findings"] as const)(
+  "#1416 dispatcher self-heals an old finished review with %s head evidence",
+  (head) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, store, card } = yield* offbox16ReviewFixture(fake);
+        const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+        const waiting = yield* kanban.markSubtask(
+          card.id,
+          "s1",
+          "done",
+          "Already reviewed",
+          evaluator,
+          "evaluator",
+        );
+        yield* store.putCard({
+          ...waiting,
+          subtasks: waiting.subtasks.map((task) =>
+            task.id === "s4" ? { ...task, state: "done" } : task,
+          ),
+        });
+        if (head !== "unknown")
+          fake.prs.set(card.workThreadId!, [
+            {
+              url: "https://github.com/o/r/pull/16",
+              title: "Node",
+              state: "open",
+              head: "b21f374b796ee1dfc70433d1fdc370c7bb00b52d",
+              observedHead:
+                head === "changed"
+                  ? "ccccccc33333333333333333333333333333333333"
+                  : "b21f374b796ee1dfc70433d1fdc370c7bb00b52d",
+            },
+          ]);
+        if (head === "findings")
+          yield* store.addCardEvent({
+            cardId: card.id,
+            at: card.updatedAt,
+            actor: owner,
+            kind: "review",
+            fromStage: "in_review",
+            toStage: "todo",
+            body: "- Fix it",
+            head: "b21f374b796ee1dfc70433d1fdc370c7bb00b52d",
+          });
+        yield* kanban.tick;
+        const result = yield* kanban.card(card.id);
+        const needed = head === "changed" || head === "findings";
+        assert.strictEqual(result.card.stage, needed ? "in_review" : "todo");
+        assert.strictEqual(result.card.activeRole, needed ? "review" : null);
+        assert.strictEqual(
+          result.events.filter(
+            (event) => event.kind === "moved" && event.body?.startsWith("Review step already done"),
+          ).length,
+          needed ? 0 : 1,
+        );
+        if (!needed) {
+          yield* kanban.tick;
+          assert.strictEqual(
+            (yield* kanban.card(card.id)).events.filter(
+              (event) =>
+                event.kind === "moved" && event.body?.startsWith("Review step already done"),
+            ).length,
+            1,
+          );
+          const notes = [...(yield* Ref.get(fake.threads)).values()]
+            .flatMap((thread) => thread.messages)
+            .filter((text) => text.includes("waiting on your subtasks: s6"));
+          assert.strictEqual(notes.length, 1);
+        }
+      }).pipe(Effect.provide(inlineTestLayer(fake.layer)));
+    }),
+);
+
+it.effect.each(["work", "script", "completed", "landing"] as const)(
+  "#1416 a finished review advances to %s by the existing placement rule",
+  (next) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, store, card } = yield* offbox16ReviewFixture(fake);
+        const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+        const waiting = yield* kanban.markSubtask(
+          card.id,
+          "s1",
+          "done",
+          "Checked",
+          evaluator,
+          "evaluator",
+        );
+        const subtasks = waiting.subtasks.map((task) =>
+          task.id !== "s6"
+            ? task
+            : next === "completed" || next === "landing"
+              ? { ...task, state: "done" as const }
+              : { ...task, owner: next },
+        );
+        const links =
+          next === "landing"
+            ? [
+                {
+                  kind: "pr" as const,
+                  url: "https://github.com/o/r/pull/16",
+                  state: "open" as const,
+                  label: null,
+                  checkedAt: null,
+                },
+              ]
+            : waiting.links;
+        yield* store.putCard({ ...waiting, subtasks, links });
+        const placed = yield* kanban.markSubtask(
+          card.id,
+          "s4",
+          "done",
+          "Checked",
+          evaluator,
+          "evaluator",
+        );
+        assert.strictEqual(
+          placed.stage,
+          next === "completed" ? "completed" : next === "landing" ? "in_review" : "todo",
+        );
+        assert.isNull(placed.activeThreadId);
+        if (next === "work") assert.include(placed.wakeNote!, "The review passed");
+        else assert.isNull(placed.wakeNote);
+        if (next === "completed" || next === "landing") assert.strictEqual(placed.reviewStep, 1);
+      }).pipe(Effect.provide(inlineTestLayer(fake.layer)));
+    }),
+);
+
+it.effect("#1416 ticking one of two review subtasks leaves the review eligible", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, store, card } = yield* offbox16ReviewFixture(fake);
+      const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+      const waiting = yield* kanban.markSubtask(
+        card.id,
+        "s1",
+        "done",
+        "Checked",
+        evaluator,
+        "evaluator",
+      );
+      yield* store.putCard({
+        ...waiting,
+        subtasks: [...waiting.subtasks, { ...waiting.subtasks[3]!, id: "s7" }],
+        subtaskSeq: 7,
+      });
+      const partial = yield* kanban.markSubtask(
+        card.id,
+        "s4",
+        "done",
+        "Checked",
+        evaluator,
+        "evaluator",
+      );
+      assert.strictEqual(partial.stage, "needs_review");
+      yield* kanban.dispatchNow;
+      assert.strictEqual((yield* kanban.card(card.id)).card.activeRole, "review");
+    }).pipe(Effect.provide(inlineTestLayer(fake.layer)));
+  }),
+);
+
+it.effect("#1416 ticking the last review subtask cannot clear a changed PR head", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, card } = yield* offbox16ReviewFixture(fake);
+      const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+      yield* kanban.markSubtask(card.id, "s1", "done", "Checked", evaluator, "evaluator");
+      fake.prs.set(card.workThreadId!, [
+        {
+          url: "https://github.com/o/r/pull/16",
+          title: "New work",
+          state: "open",
+          observedHead: "ccccccc33333333333333333333333333333333333",
+        },
+      ]);
+      const marked = yield* kanban.markSubtask(
+        card.id,
+        "s4",
+        "done",
+        "Old clear",
+        evaluator,
+        "evaluator",
+      );
+      assert.strictEqual(marked.stage, "needs_review");
+      assert.strictEqual(marked.subtasks[3]?.state, "done");
+      yield* kanban.dispatchNow;
+      assert.strictEqual((yield* kanban.card(card.id)).card.activeRole, "review");
+    }).pipe(Effect.provide(inlineTestLayer(fake.layer)));
+  }),
+);
+
 const setBackground = (fake: Effect.Success<typeof makeFake>, threadId: string, count: number) =>
   Ref.update(fake.threads, (all) => {
     all.get(threadId)!.background = count;
@@ -12355,15 +12678,6 @@ it.effect("#662 an unattached own worker can ask without blocking and drop the a
         activeRole: null,
         activePool: null,
       });
-      const before = yield* kanban.card(created.id);
-      const blockingMessage = `card #${created.number} has no thread attached; a blocking ask needs the card in Working. Ask without blocking, or wait for the dispatcher to attach you.`;
-      const denied = yield* kanban
-        .askOwner(created.id, { question: "Wait?", blocking: true }, worker, "cardThread")
-        .pipe(Effect.flip);
-      assert.strictEqual(denied.code, "denied");
-      assert.strictEqual(denied.detail, blockingMessage);
-      assert.deepStrictEqual(yield* kanban.card(created.id), before);
-
       const asked = yield* kanban.askOwner(
         created.id,
         { question: "Which fee?", blocking: false },
@@ -12378,12 +12692,6 @@ it.effect("#662 an unattached own worker can ask without blocking and drop the a
       );
       assert.deepStrictEqual(posted?.author, worker);
       assert.include(JSON.stringify(posted?.blocks), "Which fee?");
-      const askedBefore = yield* kanban.card(created.id);
-      const block = yield* kanban
-        .changeAsk(created.id, "q1", "block", worker, "cardThread")
-        .pipe(Effect.flip);
-      assert.strictEqual(block.detail, blockingMessage);
-      assert.deepStrictEqual(yield* kanban.card(created.id), askedBefore);
       const missing = yield* kanban
         .changeAsk(created.id, "missing", "block", worker, "cardThread")
         .pipe(Effect.flip);
@@ -12409,6 +12717,129 @@ it.effect("#662 an unattached own worker can ask without blocking and drop the a
       assert.strictEqual(edit.detail, `open ask q1 on card #${created.number}`);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
+);
+
+it.effect.each(
+  (["ask", "block"] as const).flatMap((path) =>
+    (["answer", "drop"] as const).flatMap((finish) =>
+      ([null, "answer", "drop"] as const).map((previous) => ({ path, finish, previous })),
+    ),
+  ),
+)(
+  "#1414 todo worker blocks via $path and resumes after $finish (pending $previous)",
+  ({ path, finish, previous }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        const created = yield* kanban.createCard(board.id, { title: "A", prompt: "A" }, owner);
+        yield* kanban.dispatchNow;
+        const running = (yield* kanban.card(created.id)).card;
+        const threadId = running.workThreadId!;
+        const worker: KanbanActor = { _tag: "thread", threadId };
+        const other: KanbanActor = { _tag: "thread", threadId: ThreadId.make("other") };
+        yield* store.putCard({
+          ...running,
+          stage: "todo",
+          activeThreadId: null,
+          activeRole: null,
+          activePool: null,
+        });
+        yield* setRunning(fake, threadId, false);
+        // Approval must be possible even while the worker's pool has no free slot.
+        yield* kanban.setPool(board.id, board.defaultCardModel, 0);
+        const refused = yield* kanban
+          .askOwner(created.id, { question: "Wait?", blocking: true }, other, "cardThread")
+          .pipe(Effect.flip);
+        assert.strictEqual(refused.code, "denied");
+        let previousWakeNote: string | null = null;
+        if (previous !== null) {
+          yield* kanban.askOwner(
+            created.id,
+            { question: "First approval?", blocking: true },
+            worker,
+            "cardThread",
+          );
+          if (previous === "answer") {
+            const talk = yield* kanban.cardDiscussion(created.id);
+            yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "First approval granted" }]);
+          } else {
+            yield* kanban.changeAsk(created.id, "q1", "drop", worker, "cardThread");
+          }
+          const pending = (yield* kanban.card(created.id)).card;
+          assert.strictEqual(pending.stage, "todo");
+          assert.include(
+            pending.wakeNote ?? "",
+            previous === "answer" ? "First approval granted" : "q1",
+          );
+          previousWakeNote = pending.wakeNote;
+          const messages = (yield* Ref.get(fake.threads)).get(threadId)!.messages;
+          assert.strictEqual(messages.filter((text) => text.includes(previousWakeNote!)).length, 0);
+        }
+        const askId = previous === null ? "q1" : "q2";
+        const opened = yield* kanban.askOwner(
+          created.id,
+          { question: "Wait?", blocking: path === "ask" },
+          worker,
+          "cardThread",
+        );
+        if (path === "block") {
+          assert.strictEqual(opened.stage, "todo");
+          const refused = yield* kanban
+            .changeAsk(created.id, askId, "block", other, "cardThread")
+            .pipe(Effect.flip);
+          assert.strictEqual(refused.code, "denied");
+          yield* kanban.changeAsk(created.id, askId, "block", worker, "cardThread");
+        }
+        const waiting = yield* kanban.card(created.id);
+        assert.strictEqual(waiting.card.stage, "needs_owner");
+        assert.isNull(waiting.card.activeThreadId);
+        assert.isNull(waiting.card.activeRole);
+        assert.isNull(waiting.card.activePool);
+        assert.strictEqual(waiting.card.workThreadId, threadId);
+        assert.isTrue(waiting.card.asks.at(-1)!.blocking);
+        assert.isNull(waiting.card.asks.at(-1)!.closedAt);
+        assert.strictEqual(Rules.poolThreads((yield* kanban.snapshot(board.id)).cards).size, 0);
+        const move = waiting.events.findLast((event) => event.kind === "moved");
+        assert.strictEqual(move?.fromStage, "todo");
+        assert.strictEqual(move?.toStage, "needs_owner");
+        assert.deepStrictEqual(move?.actor, worker);
+        const talk = yield* kanban.cardDiscussion(created.id);
+        const posted = (yield* kanban.messages(talk.id)).find(
+          (message) => message.seq === waiting.card.asks.at(-1)!.seq,
+        );
+        assert.deepStrictEqual(posted?.author, worker);
+        assert.include(JSON.stringify(posted?.blocks), "Wait?");
+        if (finish === "answer") {
+          yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Use 2%" }]);
+        } else {
+          yield* kanban.changeAsk(created.id, askId, "drop", worker, "cardThread");
+        }
+        const answered = (yield* kanban.card(created.id)).card;
+        assert.strictEqual(answered.stage, "todo");
+        assert.isNull(answered.activeThreadId);
+        assert.strictEqual(answered.workThreadId, threadId);
+        assert.isNotNull(answered.asks.at(-1)!.closedAt);
+        assert.include(answered.wakeNote ?? "", finish === "answer" ? "Use 2%" : askId);
+        if (previousWakeNote !== null) assert.include(answered.wakeNote ?? "", previousWakeNote);
+        const wakeNote = answered.wakeNote!;
+        const messages = (yield* Ref.get(fake.threads)).get(threadId)!.messages;
+        assert.strictEqual(messages.filter((text) => text.includes(wakeNote)).length, 0);
+        yield* kanban.dispatchNow;
+        assert.strictEqual((yield* kanban.card(created.id)).card.stage, "todo");
+        yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+        yield* kanban.dispatchNow;
+        const resumed = (yield* kanban.card(created.id)).card;
+        assert.strictEqual(resumed.stage, "working");
+        assert.strictEqual(resumed.activeThreadId, threadId);
+        assert.strictEqual(resumed.workThreadId, threadId);
+        assert.isNull(resumed.wakeNote);
+        assert.strictEqual(messages.filter((text) => text.includes(wakeNote)).length, 1);
+        yield* kanban.dispatchNow;
+        assert.strictEqual(messages.filter((text) => text.includes(wakeNote)).length, 1);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
 );
 
 it.effect.each(["needs_owner", "todo"] as const)(
@@ -12538,7 +12969,7 @@ it.effect.each([false, true])(
             .pipe(Effect.flip);
           assert.strictEqual(
             denied.detail,
-            `card #${created.number} has no thread attached: you can only move it to needs_review; ask without blocking for anything else`,
+            `card #${created.number} has no thread attached: you can only move it to needs_review; use card_ask for an owner question`,
           );
         }
         assert.deepStrictEqual(yield* kanban.card(created.id), before);
@@ -18341,6 +18772,25 @@ it.effect("a board created with picked models uses them and pools exactly those"
         keys,
         [Rules.poolKey(picked), Rules.poolKey(board.managerModel)].sort(),
       );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("updateBoard renames without changing identity and refuses blank names", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const renamed = yield* kanban.updateBoard(board.id, { name: "Board work" });
+      assert.strictEqual(renamed.id, board.id);
+      assert.strictEqual(renamed.slug, board.slug);
+      assert.strictEqual(renamed.name, "Board work");
+      for (const name of ["", "   ", "\t\r\n", "\u00a0\u2003"]) {
+        const error = yield* kanban.updateBoard(board.id, { name }).pipe(Effect.flip);
+        assert.strictEqual(error.code, "invalid");
+        assert.strictEqual(error.detail, "A board needs a name");
+        assert.deepStrictEqual((yield* kanban.snapshot(board.id)).board, renamed);
+      }
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
@@ -27009,6 +27459,93 @@ it.effect("current-step gate: review findings restart a worker with an open revi
   }),
 );
 
+it.effect.each(["reuse", "fresh"] as const)(
+  "current-step gate: findings on an evaluator step dispatch a %s worker until resubmission",
+  (mode) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+        const card = yield* kanban.createCard(
+          board.id,
+          {
+            title: "Fix the reviewed build",
+            prompt: "Build the feature",
+            subtasks: [
+              { text: "Build", owner: "work", step: 1 },
+              { text: "Check the build", owner: "evaluator", step: 2 },
+              { text: "Review", owner: "review", step: 3 },
+            ],
+          },
+          owner,
+        );
+        yield* kanban.dispatchNow;
+        const worker = (yield* kanban.card(card.id)).card.activeThreadId!;
+        const actor: KanbanActor = { _tag: "thread", threadId: worker };
+        yield* kanban.markSubtask(card.id, "s1", "done", null, actor, "work");
+        yield* kanban.moveCard(card.id, "needs_review", "cardThread", actor);
+        yield* kanban.dispatchNow;
+        const review = (yield* kanban.card(card.id)).card;
+        assert.strictEqual(review.activeRole, "review");
+        const reviewer = review.activeThreadId!;
+        const evaluatorMessages = () =>
+          Ref.get(fake.threads).pipe(
+            Effect.map((all) =>
+              [...all.values()]
+                .flatMap((thread) => thread.messages)
+                .filter(
+                  (text) =>
+                    text.includes("waiting on your subtasks") || text.includes("has waited"),
+                ),
+            ),
+          );
+        const before = yield* evaluatorMessages();
+        yield* kanban.reviewResult(reviewer, "findings", ["Fix the build output"]);
+        const findings = (yield* kanban.card(card.id)).card;
+        assert.strictEqual(findings.stage, "todo");
+        assert.isTrue(findings.reviewFindingsPending);
+        assert.strictEqual(kanbanOpenStep(findings), 2);
+        const brief = Briefs.workBrief(board, findings, null);
+        assert.include(brief, "Fix the build output");
+        assert.include(brief, "Fix them, then card_move to needs_review.");
+        assert.include(brief, "the evaluator's and the reviewer's aren't yours to do");
+        if (mode === "fresh") yield* kanban.cardThread(card.id, "reset", "", owner);
+        // Keep dispatch queued long enough to exercise the evaluator reminder too.
+        yield* kanban.setPool(board.id, board.defaultCardModel, 0);
+        yield* kanban.tick;
+        yield* TestClock.adjust("61 minutes");
+        yield* kanban.tick;
+        assert.deepStrictEqual(yield* evaluatorMessages(), before);
+        yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+        yield* kanban.dispatchNow;
+        const fixing = (yield* kanban.card(card.id)).card;
+        assert.strictEqual(fixing.stage, "working");
+        assert.strictEqual(fixing.activeRole, "work");
+        if (mode === "reuse") assert.strictEqual(fixing.activeThreadId, worker);
+        else assert.notStrictEqual(fixing.activeThreadId, worker);
+        assert.isTrue(fixing.reviewFindingsPending);
+        assert.isNull(fixing.wakeNote);
+        assert.include(
+          (yield* Ref.get(fake.threads)).get(fixing.activeThreadId!)!.messages.at(-1)!,
+          "Fix the build output",
+        );
+        const submitted = yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+          _tag: "thread",
+          threadId: fixing.activeThreadId!,
+        });
+        assert.isFalse(submitted.reviewFindingsPending);
+        assert.strictEqual(kanbanOpenStep(submitted), 2);
+        assert.deepStrictEqual(submitted.subtasks, findings.subtasks);
+        yield* kanban.dispatchNow;
+        const reviewing = (yield* kanban.card(card.id)).card;
+        assert.strictEqual(reviewing.stage, "in_review");
+        assert.strictEqual(reviewing.activeRole, "review");
+        assert.isFalse(reviewing.reviewFindingsPending);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
 it.effect("current-step gate: a failed start is held until the evaluator clears the flag", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
@@ -27368,7 +27905,7 @@ it.effect.each(["dispatch", "claim"] as const)(
 );
 
 it.effect.each(["saved", "legacy"] as const)(
-  "current-step gate: pending findings wait through an inserted gate (%s verdict)",
+  "current-step gate: only durable findings dispatch before an inserted evaluator step (%s verdict)",
   (verdict) =>
     Effect.gen(function* () {
       const fake = yield* makeFake;
@@ -27398,30 +27935,28 @@ it.effect.each(["saved", "legacy"] as const)(
           owner,
         );
         yield* kanban.dispatchNow;
-        assert.isNull((yield* kanban.card(card.id)).card.activeThreadId);
-        yield* TestClock.adjust(1);
-        const gate = edited.subtasks.find((s) => s.text === "Evaluator gate")!;
-        const opened = yield* kanban.markSubtask(
-          card.id,
-          gate.id,
-          "done",
-          null,
-          owner,
-          "evaluator",
-        );
-        assert.strictEqual(opened.stage, "todo");
-        assert.isTrue(opened.reviewFindingsPending);
-        yield* kanban.dispatchNow;
+        if (verdict === "legacy") {
+          assert.isNull((yield* kanban.card(card.id)).card.activeThreadId);
+          const gate = edited.subtasks.find((s) => s.text === "Evaluator gate")!;
+          yield* kanban.markSubtask(card.id, gate.id, "done", null, owner, "evaluator");
+          yield* kanban.dispatchNow;
+        }
         const running = (yield* kanban.card(card.id)).card;
         assert.strictEqual(running.activeRole, "work");
         assert.strictEqual(running.activeThreadId, worker);
+        assert.isTrue(running.reviewFindingsPending);
+        assert.strictEqual(kanbanOpenStep(running), verdict === "saved" ? 2 : 3);
+        assert.strictEqual(
+          running.subtasks.find((s) => s.text === "Evaluator gate")?.state,
+          verdict === "saved" ? "open" : "done",
+        );
         assert.include((yield* Ref.get(fake.threads)).get(worker)!.messages.at(-1)!, "Fix rate");
       }).pipe(Effect.provide(testLayer(fake.layer)));
     }),
 );
 
 it.effect.each(["steer", "wake", "idle wake", "reset"] as const)(
-  "current-step gate: pending findings retain owner words on gated %s",
+  "current-step gate: pending findings retain owner words across an evaluator step on %s",
   (action) =>
     Effect.gen(function* () {
       const fake = yield* makeFake;
@@ -27435,7 +27970,8 @@ it.effect.each(["steer", "wake", "idle wake", "reset"] as const)(
             ? { stage: "todo" as const, activeThreadId: null, activeRole: null, activePool: null }
             : {}),
         });
-        const edited = yield* kanban.editCard(
+        const before = (yield* Ref.get(fake.threads)).get(worker)!.messages.length;
+        yield* kanban.editCard(
           card.id,
           {
             subtasks: [
@@ -27447,7 +27983,6 @@ it.effect.each(["steer", "wake", "idle wake", "reset"] as const)(
           },
           owner,
         );
-        const before = (yield* Ref.get(fake.threads)).get(worker)!.messages.length;
         if (action === "idle wake") yield* setRunning(fake, worker, false);
         yield* kanban.cardThread(
           card.id,
@@ -27455,25 +27990,17 @@ it.effect.each(["steer", "wake", "idle wake", "reset"] as const)(
           "Owner says use 2%",
           owner,
         );
-        const queued = (yield* kanban.card(card.id)).card;
-        assert.include(queued.wakeNote ?? "", "Fix rate");
-        assert.include(queued.wakeNote ?? "", "Owner says use 2%");
-        assert.isFalse(
-          (yield* Ref.get(fake.threads))
-            .get(worker)!
-            .messages.slice(before)
-            .some((m) => m.includes("Owner says use 2%")),
-        );
         yield* TestClock.adjust(1);
-        const gate = edited.subtasks.find((s) => s.text === "Evaluator gate")!;
-        yield* kanban.markSubtask(card.id, gate.id, "done", null, owner, "evaluator");
         if ((yield* kanban.card(card.id)).card.activeThreadId === null) yield* kanban.dispatchNow;
         else yield* kanban.turnEnded(worker);
         const running = (yield* kanban.card(card.id)).card;
         assert.strictEqual(running.activeRole, "work");
+        assert.isTrue(running.reviewFindingsPending);
+        assert.strictEqual(kanbanOpenStep(running), 2);
         const delivered = (yield* Ref.get(fake.threads))
           .get(running.activeThreadId!)!
-          .messages.at(-1)!;
+          .messages.slice(running.activeThreadId === worker ? before : 0)
+          .join("\n\n");
         assert.include(delivered, "Fix rate");
         assert.include(delivered, "Owner says use 2%");
       }).pipe(Effect.provide(testLayer(fake.layer)));
@@ -28228,6 +28755,19 @@ it.effect.each([
       );
       assert.equal(flagged.activeThreadId, null);
       assert.deepEqual(fake.interrupted, [thread]);
+      if (kind === "stale promotion") {
+        // The queued run can still start after the sweep releases its card.
+        yield* setRunning(fake, thread, true);
+        assert.equal((yield* kanban.caller(thread))?.role, "work");
+        yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+          _tag: "thread",
+          threadId: thread,
+        });
+        fake.viewControl.beforeRead = () => Effect.die("card_next loaded thread activity");
+        const next = yield* kanban.agentCall(thread, kanban.nextCards(thread));
+        assert.deepEqual(next.carrying, []);
+        assert.isArray(next.candidates);
+      }
     }).pipe(
       Effect.ensuring(Deferred.succeed(delivered, undefined)),
       Effect.provide(testLayer(layer)),
@@ -28979,6 +29519,178 @@ it.effect(
         assert.strictEqual((yield* Ref.get(fake.threads)).size, 2);
       }).pipe(Effect.provide(inlineTestLayer(fake.layer)));
     }),
+);
+
+it.effect.each(["submitEvaluator", "reportBug"] as const)(
+  "#1440 %s persists admission and an unrelated card mutation while an evaluator launch holds serial",
+  (entry) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let first = true;
+      const gated = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (real) =>
+          KanbanThreads.of({
+            ...real,
+            launch: (input) =>
+              Effect.gen(function* () {
+                if (first) {
+                  first = false;
+                  yield* Deferred.succeed(entered, undefined);
+                  yield* Deferred.await(release);
+                }
+                return yield* real.launch(input);
+              }),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const card = yield* kanban.createCard(
+          board.id,
+          { title: "Writable", prompt: "Independent card" },
+          owner,
+        );
+        const launching = yield* Effect.forkChild(
+          kanban.submitEvaluator(board.id, { kind: "request", text: "First launch" }),
+        );
+        yield* Deferred.await(entered);
+        const mutation = yield* Effect.forkChild(
+          Effect.gen(function* () {
+            yield* kanban.editCard(card.id, { description: "Saved during launch" }, owner);
+            return yield* entry === "submitEvaluator"
+              ? kanban.submitEvaluator(board.id, { kind: "request", text: "Novel failure" })
+              : kanban.reportBug({
+                  boardId: board.id,
+                  title: "Novel failure",
+                  evidence: "An independent incident",
+                  threadId: ThreadId.make("reporter"),
+                });
+          }).pipe(Effect.timeout("1 second")),
+        );
+        yield* TestClock.adjust("1 second");
+        const queued = yield* Fiber.join(mutation);
+        assert.isTrue("queued" in queued);
+        const sql = yield* BoardsDatabase.client;
+        const rows = yield* sql<{ id: number; started_at: string | null }>`
+          SELECT id, started_at FROM ardud_kanban_evaluator_queue WHERE done_at IS NULL ORDER BY id
+        `;
+        assert.lengthOf(rows, 2);
+        assert.isNull(rows[1]!.started_at);
+        assert.strictEqual((yield* kanban.card(card.id)).card.description, "Saved during launch");
+        assert.isFalse(yield* Deferred.isDone(release));
+        yield* Deferred.succeed(release, undefined);
+        assert.isTrue("threadId" in (yield* Fiber.join(launching)));
+        yield* kanban.tick;
+        const evaluators = Effect.map(Ref.get(fake.threads), (all) =>
+          [...all.values()].filter((thread) => thread.title === "Evaluator: request"),
+        );
+        assert.lengthOf(yield* evaluators, 2);
+        assert.lengthOf(
+          yield* sql`SELECT id FROM ardud_kanban_evaluator_queue WHERE done_at IS NULL`,
+          0,
+        );
+        yield* kanban.tick;
+        assert.lengthOf(yield* evaluators, 2);
+      }).pipe(Effect.provide(inlineTestLayer(gated)));
+    }),
+);
+
+it.effect.each([
+  ...(
+    [
+      "request",
+      "setup",
+      "check",
+      "nightly",
+      "stalled",
+      "completed",
+      "deployed",
+      "packets",
+      "discussion",
+    ] as const
+  ).flatMap((kind) => (["queue only", "board input"] as const).map((change) => ({ kind, change }))),
+  ...(["setup", "nightly", "discussion"] as const).map((kind) => ({
+    kind,
+    change: "discussion input" as const,
+  })),
+])("#1440 sweep admission: $kind with $change", ({ kind, change }) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let first = true;
+    const gated = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (real) =>
+        KanbanThreads.of({
+          ...real,
+          launch: (input) =>
+            Effect.gen(function* () {
+              if (first) {
+                first = false;
+                yield* Deferred.succeed(entered, undefined);
+                yield* Deferred.await(release);
+              }
+              return yield* real.launch(input);
+            }),
+        }),
+      ),
+    ).pipe(Layer.provide(fake.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const channel =
+        kind === "setup" || kind === "discussion"
+          ? yield* kanban.createDiscussion(board.id, "Launch channel", owner)
+          : null;
+      const purpose: Briefs.EvaluatorPurpose =
+        kind === "request"
+          ? { kind, text: "First launch" }
+          : kind === "setup"
+            ? { kind, text: "First setup", discussionId: channel!.id }
+            : kind === "discussion"
+              ? { kind, discussionId: channel!.id, title: channel!.title, cardNumber: null }
+              : { kind };
+      const launching = yield* Effect.forkChild(
+        kanban.submitEvaluator(board.id, purpose).pipe(Effect.exit),
+      );
+      yield* Deferred.await(entered);
+      const admitting = yield* Effect.forkChild(
+        kanban
+          .reportBug({
+            boardId: board.id,
+            title: "Novel failure",
+            evidence: "Independent report during launch",
+            threadId: ThreadId.make("reporter"),
+          })
+          .pipe(Effect.timeout("1 second")),
+      );
+      yield* TestClock.adjust("1 second");
+      assert.isTrue("queued" in (yield* Fiber.join(admitting)));
+      if (change === "board input") {
+        yield* kanban.updateBoard(board.id, { name: "Changed launch input" });
+      } else if (change === "discussion input") {
+        const id =
+          channel?.id ?? (yield* kanban.snapshot(board.id)).board.nightlyReview!.lastDiscussionId!;
+        yield* kanban.updateDiscussion(id, { title: "Changed launch channel" }, owner);
+      }
+      assert.isFalse(yield* Deferred.isDone(release));
+      yield* Deferred.succeed(release, undefined);
+      const outcome = yield* Fiber.join(launching);
+      if (change === "queue only") {
+        assert.isTrue(Exit.isSuccess(outcome), JSON.stringify(outcome));
+        assert.lengthOf(fake.interrupted, 0);
+      } else {
+        assert.isTrue(Exit.isFailure(outcome), JSON.stringify(outcome));
+        assert.lengthOf(fake.interrupted, 1);
+      }
+    }).pipe(
+      Effect.provide(inlineTestLayer(gated)),
+      Effect.ensuring(Deferred.succeed(release, undefined)),
+    );
+  }),
 );
 
 it.effect("#1156 board cap retains eight jobs and starts them oldest first when slots free", () =>
@@ -30056,7 +30768,17 @@ it.effect.each(
           Exit.isSuccess(unrelated),
           "An ineligible discussion owner must not block unrelated evaluator requests",
         );
-        if (Exit.isSuccess(unrelated)) assert.property(unrelated.value, "threadId");
+        if (Exit.isSuccess(unrelated)) {
+          const admitted = unrelated.value;
+          if ("queued" in admitted) {
+            const sql = yield* BoardsDatabase.client;
+            const rows = yield* sql<{ json: string }>`
+              SELECT json FROM ardud_kanban_evaluator_queue WHERE id = ${admitted.queueId}
+            `;
+            assert.lengthOf(rows, 1);
+            assert.include(rows[0]!.json, "A new unrelated incident");
+          } else assert.property(admitted, "threadId");
+        }
         const current = yield* kanban.discussion(discussion.id);
         if (state === "recent" || state === "running" || state === "finished")
           assert.strictEqual(current.evaluatorThreadId, adopted);
@@ -30115,6 +30837,267 @@ it.effect("#1156 a queued setup discussion replacement inherits setup ownership"
       const done = yield* kanban.endSetup(board.id, { _tag: "evaluator", threadId: fresh });
       assert.strictEqual(done.setup?.status, "done");
     }).pipe(Effect.provide(inlineTestLayer(fake.layer)));
+  }),
+);
+
+const reportBugBoards = Effect.gen(function* () {
+  const { kanban, board } = yield* toyBoard;
+  const sql = yield* SqlClient.SqlClient;
+  const sourceBoard = yield* kanban.ensureBoard({
+    slug: "recall",
+    name: "Recall",
+    defaultProjectId: ProjectId.make("project-1"),
+  });
+  const store = yield* KanbanStore.KanbanStore;
+  const source = yield* kanban.createCard(
+    sourceBoard.id,
+    { title: "Source", prompt: "Fix" },
+    owner,
+  );
+  // Card numbers are immutable in putCard's upsert; fixture renumbering must update its index too.
+  yield* sql`UPDATE ardud_kanban_cards SET number = 41 WHERE id = ${source.id}`;
+  yield* store.putCard({ ...source, number: 41 });
+  yield* kanban.setPool(sourceBoard.id, sourceBoard.defaultCardModel, 1);
+  yield* kanban.dispatchNow;
+  const sourceCard = (yield* kanban.card(source.id)).card;
+  const threadId = sourceCard.activeThreadId!;
+  const unrelated = yield* kanban.createCard(
+    board.id,
+    { title: "Retire crw", prompt: "Retire" },
+    owner,
+  );
+  yield* sql`UPDATE ardud_kanban_cards SET number = 41 WHERE id = ${unrelated.id}`;
+  yield* store.putCard({ ...unrelated, number: 41 });
+  const target = yield* kanban.createCard(
+    board.id,
+    { title: "Kafka broker certificate expiry", prompt: "Fix cert" },
+    owner,
+  );
+  const targetCard = { ...target, number: 7 };
+  yield* sql`UPDATE ardud_kanban_cards SET number = 7 WHERE id = ${target.id}`;
+  yield* store.putCard(targetCard);
+  return {
+    sql,
+    kanban,
+    board,
+    sourceBoard,
+    store,
+    sourceCard,
+    threadId,
+    unrelated: { ...unrelated, number: 41 },
+    targetCard,
+  };
+});
+
+it.effect.each([
+  ["work", false, false, "#41"],
+  ["review", false, false, "#41"],
+  ["work", true, false, "#41"],
+  ["review", true, false, "#41"],
+  ["work", false, true, "#41"],
+  ["work", false, false, "41"],
+] as const)(
+  "reportBug ignores a cross-board reporter's own number (%s, title match %s, ended %s, hint %s)",
+  ([role, titleMatch, ended, hint]) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board, store, sourceCard, threadId, unrelated, targetCard } =
+          yield* reportBugBoards;
+        const link = (yield* store.threadLink(threadId))!;
+        yield* store.putThreadLink({ ...link, role });
+        if (ended) yield* store.putCard({ ...sourceCard, activeThreadId: null });
+        const before = (yield* Ref.get(fake.threads)).size;
+        const result = yield* kanban.reportBug({
+          boardId: board.id,
+          threadId,
+          title: titleMatch ? targetCard.title : "Novel parser failure",
+          evidence: "new failure",
+          cardHint: `  ${hint}  `,
+        });
+        assert.lengthOf(
+          (yield* kanban.card(unrelated.id)).events.filter((event) => event.kind === "comment"),
+          0,
+        );
+        assert.lengthOf(
+          (yield* kanban.card(sourceCard.id)).events.filter((event) => event.kind === "comment"),
+          0,
+        );
+        const threads = yield* Ref.get(fake.threads);
+        assert.strictEqual(threads.size, before + (titleMatch ? 0 : 1));
+        if (titleMatch) {
+          assert.strictEqual(result.appendedTo, "#7");
+          assert.lengthOf(
+            (yield* kanban.card(targetCard.id)).events.filter((event) => event.kind === "comment"),
+            1,
+          );
+        } else {
+          assert.isUndefined(result.appendedTo);
+          assert.isString(result.threadId);
+          assert.include(
+            threads.get(result.threadId!)!.messages[0]!,
+            `cardHint #41 is the reporter's own card on the "Recall" board, not a card on this board; ignored.`,
+          );
+        }
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect.each([
+  ["work", 7, 41, false],
+  ["review", 7, 41, false],
+  ["work", 7, 7, false],
+  ["work", 59, 59, false],
+  ["work", 7, 41, true],
+] as const)(
+  "reportBug protects all source cards (%s, carried #%s, hint #%s, original ended %s)",
+  ([role, carriedNumber, hintNumber, ended]) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board, sourceBoard, store, sourceCard, threadId, unrelated, sql } =
+          yield* reportBugBoards;
+        const carried = yield* kanban.createCard(
+          sourceBoard.id,
+          { title: "Carried source", prompt: "Fix" },
+          owner,
+        );
+        yield* sql`UPDATE ardud_kanban_cards SET number = ${carriedNumber} WHERE id = ${carried.id}`;
+        yield* store.putCard({ ...carried, number: carriedNumber });
+        yield* kanban.claimCard(threadId, carried.id);
+        assert.deepStrictEqual(
+          (yield* store.cardsByThread(threadId)).map((card) => card.number),
+          carriedNumber < 41 ? [carriedNumber, 41] : [41, carriedNumber],
+        );
+        const link = (yield* store.threadLink(threadId))!;
+        yield* store.putThreadLink({ ...link, role });
+        if (ended) yield* store.putCard({ ...sourceCard, activeThreadId: null });
+        if (hintNumber === 59) {
+          yield* sql`UPDATE ardud_kanban_cards SET number = 59 WHERE id = ${unrelated.id}`;
+          yield* store.putCard({ ...unrelated, number: 59 });
+        }
+        const before = (yield* Ref.get(fake.threads)).size;
+        const result = yield* kanban.reportBug({
+          boardId: board.id,
+          threadId,
+          title: "Novel parser failure",
+          evidence: "new failure",
+          cardHint: `#${hintNumber}`,
+        });
+        assert.isUndefined(result.appendedTo);
+        assert.isString(result.threadId);
+        const threads = yield* Ref.get(fake.threads);
+        assert.strictEqual(threads.size, before + 1);
+        assert.include(
+          threads.get(result.threadId!)!.messages[0]!,
+          `cardHint #${hintNumber} is the reporter's own card on the "Recall" board, not a card on this board; ignored.`,
+        );
+        for (const card of yield* kanban.cards(board.id))
+          assert.lengthOf(
+            (yield* kanban.card(card.id)).events.filter((event) => event.kind === "comment"),
+            0,
+          );
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect.each([
+  "bare hash",
+  "bare digits",
+  "card id",
+  "slug",
+  "board id",
+  "same board",
+  "explicit self-number",
+] as const)("reportBug appends a destination hint from a card thread: %s", (form) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board, sourceBoard, threadId, sourceCard, targetCard, unrelated } =
+        yield* reportBugBoards;
+      const sameBoard = form === "same board";
+      const hint = {
+        "bare hash": "#7",
+        "bare digits": "7",
+        "card id": targetCard.id.toUpperCase(),
+        slug: `${board.slug.toUpperCase()}#7`,
+        "board id": `${board.id.toUpperCase()}#7`,
+        "same board": "#41",
+        "explicit self-number": `${board.slug}#41`,
+      }[form];
+      const target = sameBoard
+        ? sourceCard
+        : form === "explicit self-number"
+          ? unrelated
+          : targetCard;
+      const before = (yield* Ref.get(fake.threads)).size;
+      const result = yield* kanban.reportBug({
+        boardId: sameBoard ? sourceBoard.id : board.id,
+        threadId,
+        title: "Different wording",
+        evidence: "new failure",
+        cardHint: `  ${hint}  `,
+      });
+      assert.deepStrictEqual(result, { appendedTo: `#${target.number}` });
+      assert.lengthOf(
+        (yield* kanban.card(target.id)).events.filter((event) => event.kind === "comment"),
+        1,
+      );
+      assert.strictEqual((yield* Ref.get(fake.threads)).size, before);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect.each([
+  "foreign card id",
+  "foreign slug",
+  "foreign board id",
+  "unknown slug",
+  "missing card id",
+  "settled card id",
+  "settled slug",
+  "malformed",
+] as const)("reportBug explains an unmatched explicit hint: %s", (form) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board, sourceBoard, store, threadId, sourceCard, targetCard, unrelated } =
+        yield* reportBugBoards;
+      const hint = {
+        "foreign card id": sourceCard.id,
+        "foreign slug": `${sourceBoard.slug.toUpperCase()}#7`,
+        "foreign board id": `${sourceBoard.id.toUpperCase()}#7`,
+        "unknown slug": "missing#7",
+        "missing card id": "card-00000000-0000-0000-0000-000000000000",
+        "settled card id": targetCard.id,
+        "settled slug": `${board.slug}#7`,
+        malformed: `${board.slug}#7foo`,
+      }[form];
+      if (form.startsWith("settled"))
+        yield* store.putCard({ ...targetCard, settledAt: "2026-11-01T00:00:00.000Z" });
+      const before = (yield* Ref.get(fake.threads)).size;
+      const result = yield* kanban.reportBug({
+        boardId: board.id,
+        threadId,
+        title: "Novel parser failure",
+        evidence: "new failure",
+        cardHint: hint,
+      });
+      assert.isUndefined(result.appendedTo);
+      assert.isString(result.threadId);
+      const threads = yield* Ref.get(fake.threads);
+      assert.strictEqual(threads.size, before + 1);
+      const note =
+        form === "foreign slug" || form === "foreign board id"
+          ? `cardHint ${hint} names a card on another board; ignored.`
+          : `cardHint ${hint} matched no unsettled card on this board.`;
+      assert.include(threads.get(result.threadId!)!.messages[0]!, note);
+      for (const card of [sourceCard, targetCard, unrelated])
+        assert.lengthOf(
+          (yield* kanban.card(card.id)).events.filter((event) => event.kind === "comment"),
+          0,
+        );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
 
@@ -31801,7 +32784,7 @@ it.effect(
           yield* kanban.askOwner(
             card.id,
             {
-              question: "Skip s6 deploy?",
+              question: 'Can I close 9router #19\'s deploy step as "not needed"?',
               blocking: false,
               options: [
                 { id: "o1", label: "Skip deploy" },
@@ -31811,6 +32794,18 @@ it.effect(
             evaluator,
             "evaluator",
           );
+          yield* kanban.askOwner(
+            card.id,
+            { question: "OK to skip s6 (the deploy step)?", blocking: false },
+            evaluator,
+            "evaluator",
+          );
+          yield* kanban.changeAsk(card.id, "q3", "drop", evaluator, "evaluator");
+          const unanswered = yield* kanban
+            .markSubtask(card.id, "s6", "skipped", "Not needed", evaluator, "evaluator")
+            .pipe(Effect.flip);
+          assert.include(unanswered.detail, "the latest decision, q3, was dropped");
+          yield* TestClock.adjust("1 second");
           yield* kanban.answerAsk(
             card.id,
             "q2",
@@ -31850,7 +32845,7 @@ it.effect(
             );
             const returned = yield* kanban.answerAsk(
               card.id,
-              "q3",
+              "q4",
               { verdict: "answered", revision: 0, text: "Recorded" },
               owner,
             );
@@ -32792,4 +33787,134 @@ it.effect.each(
         );
       }).pipe(Effect.provide(inlineTestLayer(wrapped)));
     }).pipe(Effect.provide(unstartedLifecycleLayer())),
+);
+
+it.effect("card_next skips the board and activity when a released worker's pool is full", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    let checking = false;
+    const observed = Layer.effect(
+      KanbanStore.KanbanStore,
+      Effect.map(KanbanStore.KanbanStore, (real) =>
+        KanbanStore.KanbanStore.of({
+          ...real,
+          cards: (id) => (checking ? Effect.die("full board scan") : real.cards(id)),
+          groups: (id) => (checking ? Effect.die("group scan") : real.groups(id)),
+          schedulingCards: (id) =>
+            checking ? Effect.die("ranking scan") : real.schedulingCards(id),
+        }),
+      ),
+    ).pipe(Layer.provide(KanbanStore.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const store = yield* KanbanStore.KanbanStore;
+      const card = yield* kanban.createCard(board.id, { title: "A", prompt: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const started = (yield* store.card(card.id))!;
+      const thread = started.workThreadId!;
+      yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+        _tag: "thread",
+        threadId: thread,
+      });
+      yield* setRunning(fake, thread, false);
+      yield* kanban.turnEnded(thread);
+      // 1,400 cards of settled history must never be decoded for this read.
+      for (let i = 0; i < 1400; i++)
+        yield* store.putCard({
+          ...started,
+          id: KanbanCardId.make(`history-${i}`),
+          number: 10000 + i,
+          stage: "completed",
+          activeThreadId: null,
+          activeRole: null,
+          activePool: null,
+        });
+      yield* store.putCard({
+        ...started,
+        id: KanbanCardId.make("occupied"),
+        number: 20000,
+        activeThreadId: ThreadId.make("other"),
+      });
+      fake.viewControl.beforeRead = () => Effect.die("thread activity read");
+      checking = true;
+      const next = yield* kanban.agentCall(thread, kanban.nextCards(thread));
+      assert.deepEqual(next, { carrying: [], candidates: [], holdsSlot: false });
+    }).pipe(Effect.provide(testLayer(fake.layer, undefined, undefined, observed)));
+  }),
+);
+
+it.effect.each([
+  { role: "work", gate: "event" },
+  { role: "work", gate: "save" },
+  { role: "review", gate: "event" },
+  { role: "review", gate: "save" },
+] as const)(
+  "rollback refuses a late $role consumer during $gate without exposing its claim",
+  ({ role, gate }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const beginRead = yield* Deferred.make<void>();
+      const readDone = yield* Deferred.make<void>();
+      let armed = false;
+      let triggered = false;
+      let exposed = false;
+      const pause = Effect.suspend(() => {
+        if (!armed || triggered) return Effect.void;
+        triggered = true;
+        return Deferred.succeed(beginRead, undefined).pipe(
+          Effect.andThen(Deferred.await(readDone)),
+        );
+      });
+      const observed = Layer.effect(
+        KanbanStore.KanbanStore,
+        Effect.map(KanbanStore.KanbanStore, (real) =>
+          KanbanStore.KanbanStore.of({
+            ...real,
+            addCardEvent: (event, application) =>
+              (gate === "event" && event.body === "Assignment wake did not complete"
+                ? pause
+                : Effect.void
+              ).pipe(Effect.andThen(real.addCardEvent(event, application))),
+            putCard: (card) =>
+              (gate === "save" && card.activeThreadId === null ? pause : Effect.void).pipe(
+                Effect.andThen(real.putCard(card)),
+              ),
+          }),
+        ),
+      ).pipe(Layer.provide(KanbanStore.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, card, thread } = yield* reuseDeliveryFixture(role);
+        armed = true;
+        const consumer = yield* Deferred.await(beginRead).pipe(
+          Effect.andThen(
+            kanban.agentCall(
+              thread,
+              kanban.card(card.id).pipe(
+                Effect.tap(() =>
+                  Effect.sync(() => {
+                    exposed = true;
+                  }),
+                ),
+              ),
+            ),
+          ),
+          Effect.result,
+          Effect.ensuring(Deferred.succeed(readDone, undefined)),
+          Effect.forkChild,
+        );
+        fake.conclusiveReject.add(thread);
+        yield* kanban.dispatchNow;
+        const result = yield* Fiber.join(consumer);
+        assert.isTrue(triggered);
+        assert.isFalse(exposed);
+        assert.equal(result._tag, "Failure");
+        if (result._tag === "Failure") assert.include(result.failure.detail, "being rolled back");
+        const after = (yield* kanban.card(card.id)).card;
+        assert.isNull(after.activeThreadId);
+        assert.equal(after.stage, role === "work" ? "todo" : "needs_review");
+        // Refused admission leaves no counter or barrier behind after cleanup.
+        const read = yield* kanban.agentCall(thread, kanban.card(card.id));
+        assert.isNull(read.card.activeThreadId);
+      }).pipe(Effect.provide(testLayer(fake.layer, undefined, undefined, observed)));
+    }),
 );

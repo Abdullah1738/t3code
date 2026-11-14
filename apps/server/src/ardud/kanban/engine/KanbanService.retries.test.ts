@@ -92,6 +92,13 @@ const makeFake = () => {
     KanbanThreads,
     KanbanThreads.of({
       pendingUserInputs: () => Effect.succeed([]),
+      claimContext: (threadId) =>
+        read(threadId).pipe(
+          Effect.map((view) => {
+            const model = threads.get(threadId)?.model;
+            return view && model ? { projectId: view.projectId, model } : null;
+          }),
+        ),
       view: read,
       find: read,
       model: (threadId) => Effect.sync(() => threads.get(threadId)?.model ?? null),
@@ -117,6 +124,8 @@ const makeFake = () => {
           Effect.andThen(
             Effect.sync(() => {
               threads.get(input.threadId)?.messages.push(input.text);
+              nextRun += 1;
+              return `run-${nextRun}`;
             }),
           ),
         ),
@@ -231,6 +240,44 @@ const reviewingCard = Effect.gen(function* () {
 
 const retriesOf = (card: KanbanCard) =>
   (card.retries ?? []).map((retry) => `${retry.kind}/${retry.role}/${retry.state}`);
+
+it.effect.each(["working", "todo", "reassigned"] as const)(
+  "start timeout flags the owning card after queue promotion: %s",
+  (state) =>
+    Effect.gen(function* () {
+      const fake = makeFake();
+      yield* Effect.gen(function* () {
+        const { kanban, card, thread, now } = yield* workingCard;
+        if (state !== "working") {
+          fake.fail(thread);
+          yield* kanban.turnEnded(thread);
+        }
+        if (state === "reassigned") {
+          const store = yield* KanbanStore.KanbanStore;
+          const current = (yield* now).card;
+          yield* store.putCard({ ...current, workThreadId: ThreadId.make("replacement-thread") });
+        }
+        // The FIFO successor is active before the board consumes the expired start.
+        yield* fake.start(thread);
+        const sent = fake.messages(thread).length;
+        yield* kanban.turnEnded(thread, {
+          runId: "expired-start",
+          reason: "The provider never started this run (waited 10 min).",
+        });
+        const result = (yield* now).card;
+        if (state === "reassigned") assert.isNull(result.stalled);
+        else {
+          assert.include(result.stalled?.reason ?? "", "never started");
+          assert.equal(result.stage, "todo");
+          assert.isNull(result.activePool);
+          assert.isNull(result.activeThreadId);
+          assert.equal(result.workThreadId, thread);
+        }
+        assert.deepEqual(fake.interrupted, []);
+        assert.equal(fake.messages(thread).length, sent);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
 
 it.effect(
   "a worker's first failed run is not flagged: the card waits in To-Do with no slot, then the same thread is woken once",
