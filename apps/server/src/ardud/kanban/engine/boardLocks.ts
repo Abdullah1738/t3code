@@ -101,7 +101,7 @@ export class BoardStateChanged {
 }
 
 // A budget miss gives the next writer a turn instead of immediately retrying the start.
-class DispatchReadBudgetExceeded extends BoardStateChanged {}
+export class DispatchReadBudgetExceeded extends BoardStateChanged {}
 const DISPATCH_READ_HOLD_MS = 2_000;
 
 export const MAY_HAVE_APPLIED =
@@ -495,20 +495,21 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
               ),
             ),
           ),
-          Effect.catchDefect((defect) =>
-            defect instanceof BoardStateChanged &&
-            !(defect instanceof DispatchReadBudgetExceeded) &&
-            !defect.committed &&
-            !op.committed &&
-            !op.sideEffect &&
-            attempt < policy.reruns
+          Effect.catchCause((cause) => {
+            const defect = cause.reasons.find((reason) => reason._tag === "Die")?.defect;
+            return defect instanceof BoardStateChanged &&
+              !(defect instanceof DispatchReadBudgetExceeded) &&
+              !defect.committed &&
+              !op.committed &&
+              !op.sideEffect &&
+              attempt < policy.reruns
               ? restore(
                   policy.backoffMs > 0
                     ? Effect.sleep(policy.backoffMs * 2 ** attempt)
                     : Effect.void,
                 ).pipe(Effect.andThen(run(effect, cardId, attempt + 1, replay, policy, op.label)))
-              : Effect.die(defect),
-          ),
+              : Effect.failCause(cause);
+          }),
         );
       }),
     );

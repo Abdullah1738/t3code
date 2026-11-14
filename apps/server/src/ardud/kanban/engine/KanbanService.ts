@@ -70,6 +70,7 @@ import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
 import * as Schedule from "effect/Schedule";
@@ -1957,11 +1958,14 @@ const make = Effect.gen(function* () {
           .pipe(
             // Resource fences still revoke successful launches; a failed launch
             // must reach the assignment-aware start handler with its typed error.
-            Effect.catchDefect((defect) =>
-              defect instanceof BoardLocks.BoardStateChanged && launchFailure !== undefined
-                ? Effect.fail(launchFailure)
-                : Effect.die(defect),
-            ),
+            Effect.catchDefect((defect) => {
+              if (!(defect instanceof BoardLocks.BoardStateChanged) || launchFailure === undefined)
+                return Effect.die(defect);
+              // Compensation needs the refusal; board deferral needs the exhausted budget too.
+              return defect instanceof BoardLocks.DispatchReadBudgetExceeded
+                ? Effect.failCause(Cause.combine(Cause.fail(launchFailure), Cause.die(defect)))
+                : Effect.fail(launchFailure);
+            }),
             Effect.flatMap((result) =>
               Result.isSuccess(result)
                 ? Effect.succeed(result.success)
@@ -7506,7 +7510,7 @@ const make = Effect.gen(function* () {
                       : card.reviewThreadId,
                 });
                 // The scope belongs to this start, not the planning pass or its siblings.
-                yield* locks
+                const continuePass = yield* locks
                   .run(
                     Effect.gen(function* () {
                       const wakeThreadId = destination.newThread
@@ -7682,6 +7686,7 @@ const make = Effect.gen(function* () {
                             ),
                           ),
                     ),
+                    Effect.as(true),
                     Effect.catchCause((cause) =>
                       Effect.logWarning("kanban dispatch failed", {
                         cardId: dispatch.cardId,
@@ -7694,11 +7699,19 @@ const make = Effect.gen(function* () {
                               : reason._tag === "Die" && Schema.is(KanbanStoreError)(reason.defect),
                           )
                             ? Effect.failCause(cause)
-                            : Effect.void,
+                            : Effect.succeed(
+                                !cause.reasons.some(
+                                  (reason) =>
+                                    reason._tag === "Die" &&
+                                    reason.defect instanceof BoardLocks.DispatchReadBudgetExceeded,
+                                ),
+                              ),
                         ),
                       ),
                     ),
                   );
+                // The reader may still be stalled; don't immediately retake the planning gate.
+                if (!continuePass) break;
               }
             }).pipe(Effect.scoped),
             false,

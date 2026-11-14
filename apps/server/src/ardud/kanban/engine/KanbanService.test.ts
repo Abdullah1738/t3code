@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Clock from "effect/Clock";
+import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
@@ -2576,6 +2577,9 @@ it.effect.each(
   ),
 )("#1397 a stalled $stage admits same-board writes (changed=$changed)", ({ stage, changed }) =>
   Effect.gen(function* () {
+    const stalledReader = Context.Reference("test/KanbanStalledDispatchReader", {
+      defaultValue: () => false,
+    });
     const fake = yield* makeFake;
     const entered = yield* Deferred.make<void>();
     const resume = yield* Deferred.make<void>();
@@ -2617,7 +2621,12 @@ it.effect.each(
             }),
           pools: (id) =>
             Effect.gen(function* () {
-              if (armed && ++reads === blockedRead) {
+              if (
+                armed &&
+                (yield* stalledReader) &&
+                blockedRead !== undefined &&
+                ++reads >= blockedRead
+              ) {
                 yield* Deferred.succeed(entered, undefined);
                 yield* Deferred.await(resume);
               }
@@ -2642,7 +2651,9 @@ it.effect.each(
         owner,
       );
       armed = true;
-      const dispatch = yield* Effect.forkChild(kanban.dispatchNow);
+      const dispatch = yield* Effect.forkChild(
+        kanban.dispatchNow.pipe(Effect.provideService(stalledReader, true)),
+      );
       yield* Deferred.await(entered);
       const admitted = yield* Deferred.make<void>();
       const write = yield* Effect.forkChild(
@@ -2662,12 +2673,15 @@ it.effect.each(
       );
       yield* TestClock.adjust("3 seconds");
       assert.isTrue(yield* Deferred.isDone(admitted));
+      if (blockedRead !== undefined) assert.strictEqual(reads, blockedRead);
       yield* Fiber.join(write);
       if (changed)
         yield* kanban.moveCard(target.id, "needs_owner", "owner", owner, {
           note: "Changed during validation",
         });
-      const concurrent = yield* Effect.forkChild(kanban.dispatchNow);
+      const concurrent = yield* Effect.forkChild(
+        kanban.dispatchNow.pipe(Effect.provideService(stalledReader, true)),
+      );
       yield* Deferred.succeed(resume, undefined);
       yield* Fiber.join(dispatch);
       yield* Fiber.join(concurrent);
@@ -2678,6 +2692,168 @@ it.effect.each(
       assert.lengthOf(fake.interrupted, 0);
     }).pipe(Effect.provide(testLayer(fake.layer, undefined, undefined, delayed)));
   }),
+);
+
+it.effect("#1397 a persistent start stall defers only its board until a later dispatch", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const entered = yield* Deferred.make<void>();
+    const ready = yield* Deferred.make<void>();
+    let blockedBoard: string | undefined;
+    let reads = 0;
+    const delayed = Layer.effect(
+      KanbanStore.KanbanStore,
+      Effect.map(KanbanStore.KanbanStore, (real) =>
+        KanbanStore.KanbanStore.of({
+          ...real,
+          pools: (id) =>
+            Effect.gen(function* () {
+              if (id === blockedBoard && ++reads >= 3) {
+                yield* Deferred.succeed(entered, undefined);
+                yield* Deferred.await(ready);
+              }
+              return yield* real.pools(id);
+            }),
+        }),
+      ),
+    ).pipe(Layer.provide(KanbanStore.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const target = yield* kanban.createCard(
+        board.id,
+        { title: "Blocked", prompt: "Blocked" },
+        owner,
+      );
+      const healthy = yield* kanban.ensureBoard({
+        slug: "healthy",
+        name: "Healthy",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* kanban.setPool(healthy.id, healthy.defaultCardModel, 1);
+      const sibling = yield* kanban.createCard(
+        healthy.id,
+        { title: "Healthy", prompt: "Healthy" },
+        owner,
+      );
+      blockedBoard = board.id;
+      const dispatch = yield* Effect.forkChild(kanban.dispatchNow);
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust("3 seconds");
+      yield* Fiber.join(dispatch);
+      assert.strictEqual(reads, 3);
+      assert.strictEqual((yield* kanban.card(target.id)).card.stage, "todo");
+      assert.strictEqual((yield* kanban.card(sibling.id)).card.stage, "working");
+      assert.strictEqual((yield* Ref.get(fake.threads)).size, 1);
+      yield* Deferred.succeed(ready, undefined);
+      yield* kanban.dispatchNow;
+      assert.strictEqual((yield* kanban.card(target.id)).card.stage, "working");
+      assert.strictEqual((yield* Ref.get(fake.threads)).size, 2);
+      assert.lengthOf(fake.interrupted, 0);
+    }).pipe(Effect.provide(testLayer(fake.layer, undefined, undefined, delayed)));
+  }),
+);
+
+it.effect.each([false, true])(
+  "#1397 a persistent post-launch stall defers its board (refused=%s)",
+  (refused) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const entered = yield* Deferred.make<void>();
+      const ready = yield* Deferred.make<void>();
+      const stalledReader = Context.Reference("test/KanbanPostLaunchReader", {
+        defaultValue: () => false,
+      });
+      let armed = false;
+      let launched = false;
+      let attempts = 0;
+      let reads = 0;
+      const delayed = Layer.effect(
+        KanbanStore.KanbanStore,
+        Effect.map(KanbanStore.KanbanStore, (real) =>
+          KanbanStore.KanbanStore.of({
+            ...real,
+            pools: (id) =>
+              Effect.gen(function* () {
+                if (launched && (yield* stalledReader)) {
+                  reads += 1;
+                  yield* Deferred.succeed(entered, undefined);
+                  yield* Deferred.await(ready);
+                }
+                return yield* real.pools(id);
+              }),
+          }),
+        ),
+      ).pipe(Layer.provide(KanbanStore.layer));
+      const launch = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (real) =>
+          KanbanThreads.of({
+            ...real,
+            launch: (input) =>
+              Effect.suspend(() => {
+                if (!armed) return real.launch(input);
+                attempts += 1;
+                launched = true;
+                return refused
+                  ? Effect.fail(
+                      new KanbanThreadError({
+                        operation: "launch",
+                        detail: "provider refused",
+                        rejected: true,
+                      }),
+                    )
+                  : real.launch(input);
+              }),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+        const sibling = yield* kanban.createCard(
+          board.id,
+          { title: "Sibling", prompt: "Sibling" },
+          owner,
+        );
+        yield* kanban.dispatchNow;
+        const worker = (yield* kanban.card(sibling.id)).card.activeThreadId!;
+        const target = yield* kanban.createCard(
+          board.id,
+          { title: "Target", prompt: "Target" },
+          owner,
+        );
+        armed = true;
+        const dispatch = yield* Effect.forkChild(
+          kanban.dispatchNow.pipe(Effect.provideService(stalledReader, true)),
+        );
+        yield* Deferred.await(entered);
+        const admitted = yield* Deferred.make<void>();
+        const write = yield* Effect.forkChild(
+          kanban
+            .agentCall(
+              worker,
+              kanban.editCard(
+                sibling.id,
+                { description: "Saved during post-launch validation" },
+                { _tag: "thread", threadId: worker },
+              ),
+            )
+            .pipe(Effect.tap(() => Deferred.succeed(admitted, undefined))),
+        );
+        yield* TestClock.adjust("3 seconds");
+        assert.isTrue(yield* Deferred.isDone(admitted));
+        yield* Fiber.join(write);
+        yield* Fiber.join(dispatch);
+        assert.strictEqual(reads, 1);
+        assert.strictEqual(attempts, 1);
+        const after = (yield* kanban.card(target.id)).card;
+        assert.strictEqual(after.stage, "todo");
+        assert.isNull(after.activeThreadId);
+        if (refused) assert.include(after.stalled?.reason ?? "", "provider refused");
+        else assert.isNull(after.stalled);
+        assert.lengthOf(fake.interrupted, refused ? 0 : 1);
+      }).pipe(Effect.provide(testLayer(launch, undefined, undefined, delayed)));
+    }),
 );
 
 it.effect.each(["slot", "blocker", "dependency"] as const)(
@@ -2777,14 +2953,19 @@ it.effect.each(["slot", "blocker", "dependency"] as const)(
         yield* Deferred.await(entered);
         yield* TestClock.adjust("3 seconds");
         yield* Fiber.join(dispatch);
-        assert.isAbove(refreshed, 1);
-        assert.strictEqual((yield* kanban.card(first.id)).card.stage, "todo");
-        assert.strictEqual(
-          (yield* kanban.card(second.id)).card.stage,
-          kind === "slot" ? "working" : "todo",
-        );
-        assert.strictEqual((yield* kanban.card(third.id)).card.stage, "todo");
-        assert.strictEqual((yield* Ref.get(fake.threads)).size, 0);
+        for (const retry of [false, true]) {
+          if (retry) {
+            yield* Deferred.succeed(pending, undefined);
+            yield* kanban.dispatchNow;
+          }
+          assert.strictEqual((yield* kanban.card(first.id)).card.stage, "todo");
+          assert.strictEqual(
+            (yield* kanban.card(second.id)).card.stage,
+            kind === "slot" ? "working" : "todo",
+          );
+          assert.strictEqual((yield* kanban.card(third.id)).card.stage, "todo");
+          assert.strictEqual((yield* Ref.get(fake.threads)).size, 0);
+        }
       }).pipe(Effect.provide(testLayer(fake.layer, undefined, undefined, delayed)));
     }),
 );
