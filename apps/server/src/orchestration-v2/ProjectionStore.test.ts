@@ -2351,6 +2351,13 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       // The unfinished first run stays; of the finished ones only the newest two.
       assert.deepEqual(yield* ordinals({ recentRunLimit: 2 }), [1, 4, 5]);
       assert.deepEqual(yield* ordinals({ recentRunLimit: 10 }), [1, 2, 3, 4, 5]);
+      assert.deepEqual(yield* ordinals({ latestRunOnly: true }), [5]);
+      assert.deepEqual(yield* ordinals({ latestRunOnly: true, runIds: [first.id] }), []);
+      assert.deepEqual(yield* ordinals({ latestRunOnly: true, runIds: [] }), []);
+      assert.deepEqual(
+        yield* ordinals({ latestRunOnly: true, runIds: [RunId.make("run:recent-run-limit:5")] }),
+        [5],
+      );
       assert.deepEqual(yield* ordinals({}), [1, 2, 3, 4, 5]);
     }),
   );

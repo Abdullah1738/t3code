@@ -3,6 +3,7 @@ import * as McpTaskTrace from "../ardud/observability/McpTaskTrace.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import { readCallerIdentity } from "./callerIdentity.ts";
 import * as McpCallAnalytics from "../ardud/analytics/McpCall.ts";
+import { ProjectionStoreThreadNotFoundError } from "../orchestration-v2/ProjectionStore.ts";
 import type { CallerRow } from "../orchestration-v2/ProjectionStore.ts";
 import { claudeRecoveryResult } from "../orchestration-v2/launchRecovery.ts";
 import { stalledSummary } from "../orchestration-v2/delegatedTaskProgress.ts";
@@ -244,6 +245,7 @@ export class OrchestratorMcpService extends Context.Service<
 type CallerParent = { readonly thread: CallerRow };
 
 const isThreadManagementError = Schema.is(ThreadManagementService.ThreadManagementError);
+const isProjectionStoreThreadNotFoundError = Schema.is(ProjectionStoreThreadNotFoundError);
 const isOrchestratorMcpFailure = Schema.is(OrchestratorMcpFailure);
 
 function failure(code: OrchestratorMcpFailure["code"], message: string): OrchestratorMcpFailure {
@@ -3869,28 +3871,72 @@ const make = Effect.gen(function* () {
     }),
     waitForThread: Effect.fn("OrchestratorMcpService.waitForThread")(function* (scope, input) {
       const waitStartedAt = yield* Clock.monotonicTimeNanos;
+      const call = yield* Effect.serviceOption(McpCallAnalytics.McpCall);
+      if (Option.isSome(call)) call.value.waitStage = "lookup.caller";
       let snapshot: OrchestratorMcpThreadWaitResult | undefined;
       const waiting = Effect.gen(function* () {
-        const { target } = yield* loadScopedThread(scope, input.threadId);
-        const records = yield* loadProjection(input.threadId, ["runs"]);
-        const selected =
-          input.runId === undefined
-            ? records.runs.toSorted((a, b) => b.ordinal - a.ordinal)[0]
-            : records.runs.find((run) => run.id === input.runId);
+        yield* loadCaller(scope);
+        if (Option.isSome(call)) {
+          call.value.waitStage = "lookup.target";
+          call.value.readerLane = "foreground";
+        }
+        // This path needs one thread row and one run, never shell/history hydration.
+        const records = yield* threadManagement
+          .getThreadRecords(
+            input.threadId,
+            ["runs"],
+            input.runId === undefined ? { latestRunOnly: true } : { runIds: [input.runId] },
+            { projectionOnly: true },
+          )
+          .pipe(
+            NodeSqliteClient.foregroundReads,
+            Effect.mapError((cause) =>
+              NodeSqliteClient.readerLaneFailure(cause) !== undefined
+                ? failure(
+                    "lookup_timeout",
+                    `Robob could not acquire the foreground reader for thread ${input.threadId}. Nothing changed. Retry t3_thread_wait, or check the task with task_status.`,
+                  )
+                : cause._tag === "OrchestratorProjectionError" &&
+                    isProjectionStoreThreadNotFoundError(cause.cause)
+                  ? failure("thread_not_found", `Thread ${input.threadId} was not found.`)
+                  : threadManagementFailure(cause),
+            ),
+          );
+        if (records.thread.deletedAt !== null)
+          return yield* failure("thread_not_found", `Thread ${input.threadId} was not found.`);
+        const selected = records.runs[0];
+        if (input.runId !== undefined && selected === undefined)
+          return yield* failure(
+            "run_not_found",
+            `Run ${input.runId} was not found in thread ${input.threadId}.`,
+          );
         snapshot = {
           threadId: input.threadId,
           runId: selected?.id ?? null,
           status: selected === undefined ? "idle" : runOutcome(selected),
           timedOut: true,
         };
+        if (Option.isSome(call)) {
+          call.value.waitLookupMs = Number((yield* Clock.monotonicTimeNanos) - waitStartedAt) / 1e6;
+          call.value.waitStage = "waiting";
+          // Event-driven waiting still uses background history and restart-continuation reads.
+          call.value.readerLane = "background";
+        }
         const result = yield* threadManagement
           .waitForThread({
-            projectId: target.thread.projectId,
+            projectId: records.thread.projectId,
             threadId: input.threadId,
             ...(input.runId === undefined ? {} : { runId: input.runId }),
             timeoutMs: yield* remainingWaitMs(waitStartedAt, input.timeoutMs),
           })
-          .pipe(Effect.mapError(threadManagementFailure));
+          .pipe(
+            NodeSqliteClient.backgroundReads,
+            Effect.catchIf(
+              (cause) => NodeSqliteClient.readerLaneFailure(cause) !== undefined,
+              () => Effect.succeed({ run: selected ?? null, timedOut: true }),
+            ),
+            Effect.mapError(threadManagementFailure),
+          );
         return {
           threadId: input.threadId,
           runId: result.run?.id ?? null,
@@ -3903,13 +3949,20 @@ const make = Effect.gen(function* () {
         Effect.timeoutOption(
           Duration.millis(yield* remainingWaitMs(waitStartedAt, input.timeoutMs)),
         ),
+        Effect.ensuring(
+          Effect.gen(function* () {
+            if (Option.isSome(call) && call.value.waitLookupMs === undefined)
+              call.value.waitLookupMs =
+                Number((yield* Clock.monotonicTimeNanos) - waitStartedAt) / 1e6;
+          }),
+        ),
       );
       if (Option.isSome(result)) return result.value;
       return (
         snapshot ??
         (yield* failure(
-          "orchestration_error",
-          "Thread wait timed out during lookup. Retry t3_thread_wait after reconnecting.",
+          "lookup_timeout",
+          `Robob took longer than ${Math.min(MAX_WAIT_TIMEOUT_MS, Math.max(1, input.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS)) / 1000} s to read thread ${input.threadId}. Nothing changed. Retry t3_thread_wait, or check the task with task_status.`,
         ))
       );
     }, untilShutdown),
