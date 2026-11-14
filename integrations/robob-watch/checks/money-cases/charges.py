@@ -32,7 +32,7 @@ RECEIPT_HITS = 60
 RECEIPT_READS = 12
 # A receipt under another name (Stripe's legal entity, a reseller) counts only this close to the
 # charge and only when it shows the same card's last four digits.
-SAME_TIME = dt.timedelta(minutes=15)
+SAME_TIME = order_lookup.SAME_TIME
 OWNER_AROUND = dt.timedelta(minutes=30)
 # Uber Eats receipts came 11 hours after their holds on 24 Oct.
 WAIT = dt.timedelta(hours=36)
@@ -109,6 +109,17 @@ class Lookup(Exception):
     """A source couldn't be read; the charge is then not explained by it."""
 
 
+class SourceLimit(Lookup):
+    def __init__(self, message, kinds):
+        self.kinds = kinds
+        super().__init__(message)
+
+
+def order_app(charge):
+    merchant = charge['merchant'].lower()
+    return 'careem' if 'careem' in merchant else 'noon' if 'noon' in merchant else None
+
+
 def card_owner(charge):
     path = Path(os.environ.get('MONEY_CASES_SETTINGS', Path(__file__).with_name('settings.json')))
     try:
@@ -121,8 +132,7 @@ def card_owner(charge):
 
 
 def order_receipt(charge, at, now, deadline=None, lookup=None, memo=None):
-    merchant = charge['merchant'].lower()
-    app = 'careem' if 'careem' in merchant else 'noon' if 'noon' in merchant else None
+    app = order_app(charge)
     if not app:
         return None
     try:
@@ -131,7 +141,12 @@ def order_receipt(charge, at, now, deadline=None, lookup=None, memo=None):
             result = memo[key]
         else:
             try:
-                result = (lookup or order_lookup.read)(app, deadline=deadline)
+                options = {}
+                if lookup is None:
+                    options = {'since': (memo or {}).get(('orders_since', app), at - SAME_TIME)}
+                    if memo is not None and ('orders_cache',) in memo:
+                        options['cache_path'] = memo[('orders_cache',)]
+                result = (lookup or order_lookup.read)(app, deadline=deadline, **options)
             except (ValueError, OSError) as exc:
                 if isinstance(exc, order_lookup.OutOfTime):
                     raise
@@ -161,8 +176,30 @@ def order_receipt(charge, at, now, deadline=None, lookup=None, memo=None):
             return {'verdict': 'receipt', 'why': f'{app} order {next(iter(matches))}: amount and time match', 'errors': []}
         if len(matches) > 1:
             raise ValueError('ambiguous orders')
-        if not complete:
+        if app == 'noon' and isinstance(result, dict):
+            lanes = result.get('lanes') or {}
+            short = []
+            for name in order_lookup.LANES:
+                lane = lanes.get(name) or {}
+                if lane.get('exhaustive') is True:
+                    continue
+                covered = lane.get('covered_from')
+                # A tied timestamp can continue on the next page at the inclusive match edge.
+                if covered is not None and order_lookup.moment(covered) < at - SAME_TIME:
+                    continue
+                short.append((name, lane))
+            if short:
+                if all(lane.get('limit') == 'page-1 history only' and lane.get('covered_from')
+                       for name, lane in short):
+                    names = ', '.join(name for name, lane in short)
+                    raise SourceLimit(f'noon orders: {names} history does not reach '
+                                      f'{(at - SAME_TIME).date()} (source limit)',
+                                      [name + '_page_1' for name, lane in short])
+                raise ValueError('incomplete history cannot authorize an ask')
+        elif not complete:
             raise ValueError('incomplete history cannot authorize an ask')
+    except order_lookup.SourceLimit as e:
+        raise SourceLimit('careem orders: order list binding unverified (source limit)', [e.code]) from e
     except (ValueError, TypeError, KeyError, InvalidOperation, OSError) as e:
         raise Lookup(f'{app} orders: lookup unavailable or incomplete') from e
     return None
@@ -657,9 +694,10 @@ def known(charge, at, find=None, deadline=None, read=None):
     return None
 
 
-def found(charge, at, now, deadline=None, find=None, said=None, errors=None, memo=None, stats=None, receipt_ok=None):
+def found(charge, at, now, deadline=None, find=None, said=None, errors=None, memo=None, stats=None, receipt_ok=None, limits=None):
     """A receipt or his own words that explain the charge, or None."""
     errors = [] if errors is None else errors
+    limits = [] if limits is None else limits
     try:
         row = receipt(charge, at, now, find, deadline, memo=memo, stats=stats, receipt_ok=receipt_ok)
         if row:
@@ -672,6 +710,8 @@ def found(charge, at, now, deadline=None, find=None, said=None, errors=None, mem
         hit = order_receipt(charge, at, now, deadline, memo=memo)
         if hit:
             return {**hit, 'errors': errors}
+    except SourceLimit as e:
+        limits.append({'why': str(e), 'kinds': e.kinds})
     except Lookup as e:
         errors.append(f'orders: {e}')
     if card_owner(charge) == 'moni':
@@ -694,17 +734,20 @@ def owner_found(charge, at, now, deadline=None, said=None, errors=None):
 
 def explain(charge, at, now, deadline=None, find=None, said=None, receipt_ok=None, *, memo=None, stats=None):
     """verdict receipt | owner | wait | ask, with why and any lookup errors."""
-    errors = []
+    errors, limits = [], []
     owner = card_owner(charge)
     if charge['kind'] != 'charge' and owner == 'moni':
         return {'verdict': 'held', 'why': 'held for Moni', 'errors': []}
     if charge['kind'] != 'charge':
         return {'verdict': 'ask', 'why': 'a declined payment goes to him', 'errors': errors}
-    hit = found(charge, at, now, deadline, find, said, errors, memo, stats, receipt_ok=receipt_ok)
+    hit = found(charge, at, now, deadline, find, said, errors, memo, stats, receipt_ok=receipt_ok, limits=limits)
     if hit:
         return hit
     if errors:
-        return {'verdict': 'unverified', 'why': 'sources unreadable; do not ask', 'errors': errors}
+        return {'verdict': 'unverified', 'why': 'sources unreadable; do not ask', 'errors': errors, 'limits': limits}
+    if limits:
+        return {'verdict': 'unverified', 'why': 'source limit: ' + '; '.join(l['why'] for l in limits) + '; do not ask',
+                'errors': [], 'limits': limits}
     if owner == 'moni':
         return {'verdict': 'held', 'why': 'held for Moni', 'errors': []}
     if now < at + WAIT:

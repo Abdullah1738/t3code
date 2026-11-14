@@ -215,7 +215,7 @@ class Logging(Base):
         row, = self.rows('check.run')
         self.assertFalse(row['ok'])
         self.assertEqual(row['durationMs'], 40000)
-        self.assertEqual(row['props'], {'budgetHit': True, 'openCases': 1, 'fired': 0, 'slowestPhase': 'follow'})
+        self.assertEqual(row['props'], {'budgetHit': True, 'openCases': 1, 'fired': 0, 'slowestPhase': 'follow', 'sourceLimits': 0, 'limitKinds': [], 'orderCoverage': {}})
 
     def test_check_distinguishes_short_lock_timeout_from_work_deadline(self):
         self.case()
@@ -386,6 +386,23 @@ class Logging(Base):
         self.assertNotIn('private', json.dumps(self.rows()))
         self.assertNotIn('amountMinor', json.dumps(self.rows()))
         self.assertNotIn('last4', json.dumps(self.rows()))
+
+    def test_order_coverage_and_source_limit_logs_drop_private_fields(self):
+        mc.toollog.emit('money-cases', 'check.run', ok=True, props={
+            'sourceLimits': 2, 'limitKinds': ['food_page_1', 'PRIVATE9999'],
+            'orderCoverage': {'noon': {'food': {'covered_from': '2026-11-10T12:00:00+00:00',
+                'pages': 1, 'fetched': 3, 'cached': 2, 'ms': 1000, 'exhaustive': False,
+                'limit': 'page-1 history only', 'address': 'PRIVATE9999', 'card': '9999'}},
+                'PRIVATE9999': {'food': {'covered_from': 'PRIVATE9999'}}},
+            'card': '9999', 'address': 'PRIVATE9999'})
+        run, = self.rows('check.run')
+        self.assertEqual(run['props']['sourceLimits'], 2)
+        self.assertEqual(run['props']['limitKinds'], ['food_page_1'])
+        lane = run['props']['orderCoverage']['noon']['food']
+        self.assertEqual(lane['covered_from'], '2026-11-10T12:00:00+00:00')
+        self.assertEqual((lane['fetched'], lane['cached']), (3, 2))
+        self.assertNotIn('PRIVATE', json.dumps(run))
+        self.assertNotIn('9999', json.dumps(run))
 
     def test_production_modules_never_import_test_runners(self):
         for path in HERE.glob('*.py'):
