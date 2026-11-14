@@ -30,7 +30,8 @@ _FIELDS = {'harness', 'guard', 'decision', 'rule', 'firstWord', 'commandLength',
            'filesChanged', 'driftFound', 'differingCount', 'platform', 'billedMinutes',
            'exitCode', 'failingStep', 'count', 'dryRun', 'toolCount', 'operation', 'status',
            'cwdClass', 'matchedRoot', 'argv0Class', 'repeatCount', 'threadIdSource',
-           'method', 'toolName', 'load1', 'load5', 'load15', 'sampleRate'}
+           'method', 'toolName', 'load1', 'load5', 'load15', 'sampleRate',
+           'httpMethod', 'ttfbMs', 'reason'}
 _IDS = {'sessionId', 'threadId', 'nativeAgentId', 'cardNumber', 'serverId', 'home', 'sampleId'}
 _WORDS = set('git rg grep find ls cat cp mv rm python python3 node bun npm pnpm yarn vp go cargo rustc make docker offbox bash sh zsh curl sqlite3 terraform aws rcsim runcloud printf echo env sudo'.split())
 
@@ -216,7 +217,9 @@ def _metadata(values, keys):
             continue
         if type(value) is bool or type(value) in (int, float) and math.isfinite(value):
             result[key] = value
-        elif isinstance(value, str) and (re.fullmatch(r"[A-Za-z/]{1,80}", value) if key == 'method'
+        elif key == 'reason' and isinstance(value, str):
+            result[key] = value[:120]
+        elif isinstance(value, str) and (re.fullmatch(r"[A-Za-z/:]{1,80}", value) if key == 'method'
                                        else (_ID_VALUE if keys is _IDS else _LABEL).fullmatch(value)):
             result[key] = value
     return result
