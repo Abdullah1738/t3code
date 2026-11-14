@@ -149,3 +149,32 @@ describe("paired measurement", () => {
     expect(() => instrumentSqlite("wrong source")).toThrow("no longer matches");
   });
 });
+
+it("records both actual DB identities outside steady ELU boundaries", () => {
+  let now = 100;
+  const paths = { statev2: "/fixture/statev2.sqlite", boards: "/fixture/boards.sqlite" };
+  const observed = [];
+  const m = makeMeasurement({
+    now: () => now,
+    wallNow: () => now,
+    elu: () => ({ active: 0, idle: now }),
+    filesystemSnapshot: (p) => {
+      observed.push(p);
+      now += 2;
+      return Object.entries(p).map(([name, path]) => ({ name, path }));
+    },
+  });
+  m.filesystems(paths, "start");
+  m.start(now);
+  now += 600000;
+  m.stop(now);
+  m.filesystems(paths, "end");
+  const result = m.snapshot();
+  expect(observed).toEqual([paths, paths]);
+  expect(result.version).toBe(3);
+  expect(result.filesystems.map((x) => [x.boundary, x.beforeEpochMs, x.afterEpochMs])).toEqual([
+    ["start", 100, 102],
+    ["end", 600102, 600104],
+  ]);
+  expect(result.intervals.at(-1).idleMs).toBe(600000);
+});

@@ -10,6 +10,13 @@ const replaceOnce = (source, needle, replacement) => {
 // These hooks add observation at the original boundaries; the frozen seed and
 // driver remain byte-identical on disk, and no SQL or provider work is added.
 export const instrumentHarness = (source) => {
+  const databasePaths =
+    '{ statev2: cfg.dbPath, boards: NodePath.join(NodePath.dirname(cfg.dbPath), "boards.sqlite") }';
+  source = replaceOnce(
+    source,
+    "const before = NodePerfHooks.performance.eventLoopUtilization();",
+    `globalThis.__overloadMeasurement.filesystems(${databasePaths}, "start");\n      globalThis.__overloadMeasurement.resources("start");\n      const before = NodePerfHooks.performance.eventLoopUtilization();`,
+  );
   source = replaceOnce(
     source,
     'import * as SqlClient from "effect/sql/SqlClient";',
@@ -33,7 +40,7 @@ export const instrumentHarness = (source) => {
   source = replaceOnce(
     source,
     "measuring = false;\n      lag.disable();",
-    "measuring = false;\n      globalThis.__overloadMeasurement.stop(gcWindowEnd);\n      lag.disable();",
+    `measuring = false;\n      globalThis.__overloadMeasurement.stop(gcWindowEnd);\n      lag.disable();\n      globalThis.__overloadMeasurement.resources("end");\n      globalThis.__overloadMeasurement.filesystems(${databasePaths}, "end");`,
   );
   source = replaceOnce(
     source,
@@ -111,7 +118,7 @@ export const instrumentSqlite = (source) => {
   return source;
 };
 
-export const makeMeasurement = ({ now, wallNow, elu }) => {
+export const makeMeasurement = ({ now, wallNow, elu, filesystemSnapshot, resourceSnapshot }) => {
   let active = false;
   let origin = 0;
   let epoch = 0;
@@ -124,6 +131,8 @@ export const makeMeasurement = ({ now, wallNow, elu }) => {
   const hooks = [];
   const marks = [];
   const nonExecutionReplies = [];
+  const filesystems = [];
+  const resources = [];
   const caller = (span) => {
     const names = [];
     for (let depth = 0; span?._tag === "Span" && depth < 32; depth++) {
@@ -152,6 +161,16 @@ export const makeMeasurement = ({ now, wallNow, elu }) => {
     row.samples.push({ seconds: offered.seconds, durationMs, success });
   };
   const api = {
+    resources(boundary) {
+      const beforeEpochMs = wallNow();
+      const data = resourceSnapshot();
+      resources.push({ boundary, beforeEpochMs, afterEpochMs: wallNow(), data });
+    },
+    filesystems(paths, boundary) {
+      const beforeEpochMs = wallNow();
+      const files = filesystemSnapshot(paths);
+      filesystems.push({ boundary, beforeEpochMs, afterEpochMs: wallNow(), files });
+    },
     hook(kind, source, instrumented) {
       const hash = (value) => NodeCrypto.createHash("sha256").update(value).digest("hex");
       hooks.push({ kind, sourceHash: hash(source), instrumentedHash: hash(instrumented) });
@@ -223,10 +242,12 @@ export const makeMeasurement = ({ now, wallNow, elu }) => {
       active = false;
     },
     snapshot: () => ({
-      version: 1,
+      version: 3,
       hooks,
       marks,
       nonExecutionReplies,
+      filesystems,
+      resources,
       steadyEpochMs: epoch,
       intervals,
       warnings,

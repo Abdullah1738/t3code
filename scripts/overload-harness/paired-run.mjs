@@ -4,11 +4,15 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 import * as NodeTimersPromises from "node:timers/promises";
 import { instrumentHarness, instrumentSqlite, makeMeasurement } from "./paired-measurement.mjs";
+import { captureOwnResources } from "./paired-resources.mjs";
+import { captureFilesystems } from "./paired-storage.mjs";
 
 globalThis.__overloadMeasurement = makeMeasurement({
   now: () => NodePerfHooks.performance.now(),
   wallNow: () => Date.now(),
   elu: () => NodePerfHooks.performance.eventLoopUtilization(),
+  filesystemSnapshot: captureFilesystems,
+  resourceSnapshot: captureOwnResources,
 });
 NodeModule.registerHooks({
   load(url, context, nextLoad) {
@@ -37,8 +41,12 @@ if (releaseFile) {
   await NodeFSP.mkdir(NodePath.dirname(readyFile), { recursive: true });
   await NodeFSP.writeFile(
     readyFile,
-    JSON.stringify({ readyAt: new Date().toISOString(), pid: process.pid, node: process.version }) +
-      "\n",
+    JSON.stringify({
+      readyAt: new Date().toISOString(),
+      pid: process.pid,
+      node: process.version,
+      identity: captureOwnResources(),
+    }) + "\n",
   );
   const deadline = Date.now() + 60 * 60 * 1000;
   let release;

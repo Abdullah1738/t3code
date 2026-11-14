@@ -146,3 +146,91 @@ What you do instead:
 5. Score C against A within each batch, as before. Every batch must pass. B is diagnostic.
 
 I'm also asking the offbox board for a benchmark-reservation feature so future release gates can get a quiet window. Don't wait for it.
+
+## Explicit tmpfs and idle host — evaluator amendment, 14 Nov 01:42Z
+
+The following decision supersedes the storage reference and host-load precondition in the matched-batch/q3 amendments above. Batches1/2 and all old runs are information only. Count the first three valid batches among at most six new attempts (numbered3–8); a valid numerical FAIL is retained, not replaced by a later attempt. The six frozen workload files and offered inputs stay unchanged. Database placement is explicit tmpfs; the measurement wrapper records both actual database files immediately before the steady ELU window and immediately after it. Filesystem probes execute outside the measured window. Other required telemetry and INVALID rules remain unchanged.
+
+Evaluator decision, verbatim:
+
+**Base runs:** we don't need to prove what d5e7/33c5/4463 used. Every matched batch carries its own A arm, and the verdict is C against A inside each batch. Those three runs and the old R11' runs are information only from now on. The calibration to live was about workload shape (cards, tx/min, tick rate), and that doesn't depend on the filesystem. Note in the report that the absolute busy level isn't proven to be the same as at calibration.
+
+**Storage for every counted batch: tmpfs, set explicitly, in all three arms.**
+- Point each arm's statev2 and boards data directory at a tmpfs mount. Don't rely on whatever /tmp happens to be. This also makes bx_61vytpaz usable.
+- At steady start and again at the end, record the filesystem identity of each **actual** database file (fs type plus device/mount) in the run artifacts.
+- If any arm isn't on tmpfs at either check, the batch is INVALID.
+- Why tmpfs: most boxes already use it, it gives every arm the same storage, and there's only one ZFS box, so three ZFS arms would mean co-loading it. Real-disk fidelity is still the separate question for after the verdict.
+
+**Verdict rule, set now:** three new matched batches (3, 4, 5) that pass the storage check, have no Warn-level stalls, and get host-wide idle before launch. Score C against A per batch under the relative gate (.11) plus q1. Every batch must pass. If a batch is INVALID, run another one; stop and report if you reach six attempts without three valid batches. B stays diagnostic.
+
+**One thing to report:** busy for the whole batch dropped from about 23% in batch 1 to about 14% in batch 2. That's a 9 pp swing between batches on the same code. Put each batch's spread beside the gate's margin. If the swing between batches is as big as the gate's margin, say so, because the paired comparison is then carrying the whole verdict.
+
+No need to wait for my reply after the information-only reports. Start batch 3 under these rules once host-wide idle is confirmed.
+
+## Bounded idle wait — evaluator amendment, 14 Nov01:51Z
+
+This supersedes only the unlimited idle wait above. The evaluator's45-minute clock began14 Nov01:51:13Z (fallback eligible02:36:13Z). Keep the same three arms, explicit tmpfs checks, Warn/INVALID rule and first-three-valid-in-six-attempts rule. Each batch is labelled idle or quiet-enough and records full host-wide co-load. No workload inputs change.
+
+Evaluator decision, verbatim:
+
+1. **Wait up to 45 minutes from now for full host-wide idle.** If you get it, launch.
+2. **If it doesn't come, launch on "quiet enough" instead:** no other benchmark, SQLite-heavy, disk-wait or profiling job anywhere on the host, and no xlarge job besides ours. Ordinary light jobs are acceptable. Record the full host-wide co-load across the steady window, as before.
+3. **A quiet-enough batch counts on the same terms as one launched on full idle:** storage check passes and no Warn-level stalls. The matched design is there to absorb load the arms share. It doesn't need an empty host.
+4. **Never pause, kill or move anyone else's jobs**, and don't open a new box to get around the wait.
+5. **In the report, mark each counted batch "idle" or "quiet-enough"** and give its co-load. If quiet-enough batches show clearly wider spread within the batch than idle ones, say so.
+
+The rest stands: three counted batches, C against A per batch, stop at six attempts. Batches 1 and 2 show a 9–10 pp swing between batches against C−A margins of −0.12 and −1.02 pp, which is why the verdict is paired. Put that in the report as written.
+
+## Loaded tier, CPU pressure and retained suites — evaluator decisions, 14 Nov
+
+These decisions were received before counted batch3 or any counted candidate process. They supersede only the launch/placement/run-identity provisions above; the workload, performance thresholds, q1 substitution and INVALID rules remain in force. Rotation advances by counted position: an INVALID attempt repeats its uncounted Latin-square row; a numerical FAIL is counted. No workload knob changes.
+
+Evaluator launch/placement decision, verbatim:
+
+**1. Wait for quiet-enough until 03:45Z.** Check about every 5 minutes. If quiet-enough arrives, launch and mark the batch "quiet-enough", same as before.
+
+**2. After 03:45Z, launch "loaded".** Three conditions:
+- None of our three arm boxes is running any other job at launch.
+- The storage check passes at both boundaries.
+- Full host-wide co-load is recorded across the steady window. List the other xlarge and opaque jobs by run id.
+
+A loaded batch counts on the same terms (no Warn-level stalls), plus one extra check. Record CPU steal/contention for each arm's box over the steady window (cgroup `cpu.stat` throttling and guest steal, whichever the VM exposes). If A's box and C's box differ by more than 2 pp of CPU time, the batch is INVALID. That is box-level unfairness, and the pairing can't absorb it. If neither metric is available on a box, the batch is INVALID too. Don't infer it.
+
+**3. Rotate box assignment across counted batches.** Over batches 3–5, each arm runs once on each of the three boxes (a Latin square). Write the assignment into the batch artifacts before each launch. This cancels whatever is left of the per-box effect we saw in batch 1. It's a placement rule only. Seed, drive, storage and thresholds stay frozen.
+
+**4. Everything else stands:** C against A in each batch under the relative gate (.11) plus q1, every counted batch must pass, B is diagnostic, and you stop and report at six attempts. Label each batch idle, quiet-enough or loaded in the report. Put each batch's within-batch spread next to its tier, so we can see whether load widened it.
+
+Land R8's fixes before batch 3, and launch on the reviewed tree. There's no need to wait for me after that. Go on the rule above.
+
+Evaluator q4, verbatim:
+
+Pressure is required (revision 0). A zero throttled_usec under cpu.max=unlimited can't show contention, because nothing can throttle. A zero steal in /proc/stat on Incus is the host's view, and on bare metal steal is always 0. Both counters read zero whatever happens, so they don't count as available for the gate.
+
+Gate formula, loaded tier only, fixed before any results:
+- For each arm, take the box container's own cgroup (the one holding the arm's server process). Read cpu.pressure `some total=` (µs) at steady start and steady end.
+- pressure_pct = Δsome_total_us / steady_wall_us × 100, using that arm's own steady wall in µs, from the same exact clock as the busy measurement.
+- INVALID if |pressure_pct(A) − pressure_pct(C)| > 2.0 pp.
+- INVALID if cpu.pressure is missing or unreadable on A's or C's box at either boundary, or if the counter goes backwards. Don't infer it.
+
+Diagnostic only, never the gate: record raw cpu.pressure `full`, throttled_usec / nr_throttled deltas, cpu.max, and /proc/stat steal, with /proc/stat labelled as a shared host view. One exception: if cpu.max is limited on any arm box (not `max`), throttled_usec Δ / steady_wall_us also gates at the same 2.0 pp.
+
+B: record the same values; it doesn't gate. Idle and quiet-enough batches: record the same values; they don't gate. Put pressure_pct for every arm in each batch row of the report.
+
+Evaluator's note, read this before you act:
+Both arms run the same workload, so in-container self-contention largely cancels. A pressure gap between A and C means the boxes were treated unequally, which is what the 2 pp rule is there to catch.
+
+Evaluator q5, verbatim:
+
+Retain three suite leases (revision 0). Waiting for an explicit box selector could take days, and the release is gated on this card. Three retained jobs on existing pooled xlarge boxes don't open a new box, and don't pause, kill or move anyone else's jobs. The offbox server has no caps, and other runs simply queue. So this stays within the rules.
+
+Conditions, all fixed before the first candidate:
+1. **Run identity.** A counted run's key is (parent offbox run id, batch, arm, Node pid + process start time, steady-window start/end). Change the reporter to require nine distinct keys. It must also reject any repeated artifact, profile or steady window, so nothing counts twice. Record the real parent offbox id on every run. Never fabricate an id, and never rewrite pool metadata.
+2. **A fresh start for every run.** Each run gets a new Node process and a new statev2/boards directory under /dev/shm/robob-overload-1352/<batch>-<arm>. Before each batch, delete the previous batch's directory and record that it is gone. Don't keep warm in-process state, caches or profiles between runs.
+3. **Placement proof.** At launch and at steady end, record the box identity from inside each job (offbox box id, hostname, and the Incus container id if the job exposes it). Check it against the Latin square written before that batch. If a job turns out to be on a box other than the planned one, that batch is INVALID.
+4. **Exclusivity.** Each lease holds its box, so the "nothing else on our arm boxes" condition is met by construction. Still record the box's other processes at launch as proof.
+5. **Release promptly.** Release all three leases as soon as the third valid batch finishes, or when you stop at six attempts or on any abort. Don't hold them idle between batches longer than the pre-batch checks need. Record lease start and end times in the report.
+
+Everything else stands: q4's pressure gate, storage checks at both boundaries, the tier labels, C against A in each batch, and the stop at six attempts.
+
+Evaluator's note, read this before you act:
+Box-held state between batches is limited to OS state, and each batch wipes its tmpfs directory. Mention this as a fidelity note in the report; it isn't a reason to invalidate.
