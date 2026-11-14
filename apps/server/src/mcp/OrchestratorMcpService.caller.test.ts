@@ -234,7 +234,7 @@ it.effect("bounds a stalled caller shell before loading any records", () =>
   }),
 );
 
-it.effect.each(["self", "other"] as const)("loads the full scoped target only for %s", (target) =>
+it.effect.each(["self", "other"] as const)("waiting for %s reads only run records", (target) =>
   Effect.gen(function* () {
     const recordReads: Array<ReadonlyArray<string>> = [];
     const id = target === "self" ? callerId : targetId;
@@ -242,23 +242,7 @@ it.effect.each(["self", "other"] as const)("loads the full scoped target only fo
       const mcp = yield* OrchestratorMcp.OrchestratorMcpService;
       const result = yield* mcp.waitForThread(scope, { threadId: id });
       assert.equal(result.status, "idle");
-      assert.deepEqual(recordReads, [
-        ...(target === "self"
-          ? [
-              [
-                "runs",
-                "messages",
-                "subagents",
-                "providerThreads",
-                "providerTurns",
-                "runtimeRequests",
-                "contextTransfers",
-                "turnItems",
-              ],
-            ]
-          : []),
-        ["runs"],
-      ]);
+      assert.deepEqual(recordReads, [["runs"]]);
     }).pipe(
       Effect.provide(
         layer({
