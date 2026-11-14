@@ -1,4 +1,8 @@
 """Case diagnostics stay outside book locks and never carry financial source text."""
+import os
+
+# Before any helper loads: the send guards refuse live sends under this marker, and conftest.py sets it for pytest only.
+os.environ.setdefault("ROBOB_TEST", "1")
 import ast
 import contextlib
 import fcntl
@@ -6,7 +10,6 @@ import hashlib
 import importlib.util
 import io
 import json
-import os
 from pathlib import Path
 import subprocess
 import sys

@@ -1,7 +1,10 @@
 """Deploy only source while preserving private files, runtime state and pause state."""
+import os
+
+# Before any helper loads: the send guards refuse live sends under this marker, and conftest.py sets it for pytest only.
+os.environ.setdefault("ROBOB_TEST", "1")
 import importlib.util
 import json
-import os
 import shutil
 import subprocess
 from pathlib import Path

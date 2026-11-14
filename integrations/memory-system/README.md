@@ -381,4 +381,4 @@ For fixtures, both commands accept `--root`; backup also accepts `--repository`,
 explicitly limits backup verification to the local replica/repo and skips cold
 archive/Dropbox. Never use that flag to claim a production incident is removed
 from every store. Python 3.11+ with SQLite 3.47+, restic with `rewrite`, and zstd for compressed
-transcripts are required. Fixture tests: `python3 -m pytest tests/test_redact.py`.
+transcripts are required. Fixture tests: `python3 tests/test_redact.py`.

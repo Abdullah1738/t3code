@@ -1,8 +1,11 @@
+import os
+
+# Before any helper loads: the send guards refuse live sends under this marker, and conftest.py sets it for pytest only.
+os.environ.setdefault("ROBOB_TEST", "1")
 import contextlib
 import datetime as dt
 import importlib.util
 import json
-import os
 from pathlib import Path
 import stat
 import sys

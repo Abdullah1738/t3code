@@ -36,4 +36,10 @@ stays in `~/.config/<name>` and `~/.local/share/<name>/data`.
 
 `deploy.zsh` rsyncs source files only and never deletes runtime state on the
 live side. Run the package's own checks first (`bun test` / `bun run check`
-for the bridges and robob-watch, `pytest` for memory-system).
+for the bridges and robob-watch, the Python tests below for the rest).
+
+Python tests are stdlib unittest; pytest isn't installed in agent shells and
+isn't needed (offbox's include-filter cases are the one pytest suite, and they
+skip without it). Run one file with `python3 <path/to/test_x.py>`, or a package's
+suite with `python3 -m unittest discover -s integrations/<pkg>/<tests dir>`
+(the dir is `tests` or `test`, e.g. `integrations/memory-system/tests`).
