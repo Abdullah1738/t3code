@@ -3,6 +3,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+import order_card
 from unittest.mock import Mock,patch
 
 import commerce_nownow as c
@@ -51,6 +52,7 @@ class NowNowFlowTests(unittest.TestCase):
             flow._before(*flow.expected)
         self.assertFalse(flow.opened)
 
+    @patch.multiple(order_card, LAST4='2342', NETWORK='mastercard')
     def test_current_controller_finalize_with_exact_review_journals_once(self):
         import json
         import test_noon_nownow_review as fixtures
@@ -61,8 +63,8 @@ class NowNowFlowTests(unittest.TestCase):
         flow.account_hash=fingerprint('customer');flow.address_hash=fingerprint('home','key')
         flow.snapshot=AuthSnapshot('nownow',flow.account_hash,flow.address_hash,time.time(),
             {'x-addresscode':'home','x-addresskey':'key','cookie':'synthetic=secret'},time.monotonic()+30)
-        flow.session_code='owned';flow.card=SavedCard('synthetic-token','xxxx2342','mastercard')
-        flow.controller_card={'id':'synthetic-token','ccMasked':'xxxx2342','ccType':'mastercard','isDeleted':False}
+        flow.session_code='owned';flow.card=SavedCard('synthetic-token','xxxx' + order_card.LAST4,order_card.NETWORK)
+        flow.controller_card={'id':'synthetic-token','ccMasked':'xxxx' + order_card.LAST4,'ccType':order_card.NETWORK,'isDeleted':False}
         from noon_nownow_controller import CardSyncBinding
         flow.card_binding=CardSyncBinding(flow.account_hash,flow.address_hash,fingerprint('owned'),
             fingerprint('synthetic-token'),'1'*64,'2'*64,time.time())

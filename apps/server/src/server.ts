@@ -1,3 +1,6 @@
+import * as RunStartDeadline from "./orchestration-v2/RunStartDeadline.ts";
+import * as McpCallLedger from "./ardud/analytics/McpCallLedger.ts";
+import * as McpAvailability from "./ardud/analytics/McpAvailability.ts";
 import * as AnalyticsDatabase from "./observability/AnalyticsDatabase.ts";
 import { layerServerAnalyticsErrors } from "./observability/RpcInstrumentation.ts";
 import * as OwnerAnalytics from "./ardud/analytics/Analytics.ts";
@@ -332,10 +335,12 @@ const layerRelayClient = Layer.unwrap(
 const layerHttpServer = Layer.unwrap(
   Effect.gen(function* () {
     const config = yield* ServerConfig.ServerConfig;
+    const availability = yield* McpAvailability.McpAvailability;
     return NodeHttpServer.layer(
       () =>
         rejectRequestsUntilServing(
           guardHttpResponseWriteErrors(deferIdleSocketClose(NodeHttp.createServer())),
+          availability.reject,
         ),
       {
         host: config.host ?? "127.0.0.1",
@@ -616,6 +621,9 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   ),
   layerThreadPullRequestWorker,
   DelegatedTaskAnalytics.layer,
+  Layer.effectDiscard(
+    Effect.flatMap(RunStartDeadline.RunStartDeadline, (service) => service.start()),
+  ),
   Layer.effectDiscard(
     Effect.flatMap(DelegatedTaskProgressGuard.DelegatedTaskProgressGuard, (service) =>
       service.start(),
@@ -1134,7 +1142,16 @@ const layerMakeServer = Layer.unwrap(
     }).pipe(
       StartupPhaseLog.withStartupLayer("http.routes"),
       withUntracedRequests,
-      Layer.tap(() => Deferred.succeed(routesReady, undefined).pipe(Effect.orDie)),
+      Layer.tap(() =>
+        Effect.gen(function* () {
+          const calls = yield* McpCallLedger.McpCallLedger;
+          const availability = yield* McpAvailability.McpAvailability;
+          // Run before HTTP serving interrupts request fibers and closes their tool scopes.
+          yield* Effect.addFinalizer(() => calls.shutdown);
+          yield* availability.ready;
+          yield* Deferred.succeed(routesReady, undefined).pipe(Effect.orDie);
+        }),
+      ),
     );
     const layerServerApplication = Layer.mergeAll(
       layerRoutes,
@@ -1161,7 +1178,9 @@ const layerMakeServer = Layer.unwrap(
       Layer.provide(layerServerAnalyticsErrors),
       Layer.provide(layerApplicationObservability),
       Layer.provide(AnalyticsDatabase.layer),
-      Layer.provide(OwnerAnalytics.layer),
+      Layer.provide(McpCallLedger.layer),
+      Layer.provide(McpAvailability.layer),
+      Layer.provide(OwnerAnalytics.layer.pipe(Layer.provide(layerPersistence))),
       Layer.provide(LargeReplyLog.layer),
       Layer.provide(ReplyBuilders.layer),
       Layer.provideMerge(FetchHttpClient.layer),

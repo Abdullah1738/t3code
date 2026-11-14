@@ -148,6 +148,35 @@ describe("guardHttpResponseWriteErrors", () => {
 });
 
 describe("rejectRequestsUntilServing", () => {
+  it("answers boot-window MCP POSTs with a restarting JSON-RPC error", async () => {
+    const server = HttpResponseErrorGuard.rejectRequestsUntilServing(
+      guardHttpResponseWriteErrors(NodeHttp.createServer()),
+      () => ({ bootId: "boot-test", phase: "sqlite.archive-shell-counts" }),
+    );
+    const port = await listen(server);
+    // @effect-diagnostics-next-line globalFetch:off -- Exercise the raw HTTP listener before Effect routing exists.
+    const response = await fetch(`http://127.0.0.1:${port}/mcp?threadId=caller`, {
+      method: "POST",
+      body: JSON.stringify({ jsonrpc: "2.0", id: 17, method: "tools/call" }),
+    });
+    expect(response.status).toBe(503);
+    expect(response.headers.get("retry-after")).toBe("5");
+    expect(await response.json()).toEqual({
+      jsonrpc: "2.0",
+      id: null,
+      error: {
+        code: -32000,
+        message: "Robob is restarting",
+        data: {
+          reason: "server_starting",
+          bootId: "boot-test",
+          phase: "sqlite.archive-shell-counts",
+        },
+      },
+    });
+    server.on("request", (_request, reply) => reply.writeHead(204).end());
+    expect((await fetchResponse(port, "/mcp")).statusCode).toBe(204);
+  });
   it("rejects early HTTP and upgrades, then hands each off to its serving handler", async () => {
     const writeErrors: unknown[] = [];
     const server = HttpResponseErrorGuard.rejectRequestsUntilServing(

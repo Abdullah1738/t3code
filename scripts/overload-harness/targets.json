@@ -1,0 +1,749 @@
+{
+  "decodeCache": {
+    "counters": {
+      "board": {
+        "entriesAtEnd": 17,
+        "evictions": {
+          "count": 0,
+          "perSecond": 0.0
+        },
+        "hits": {
+          "count": 3557,
+          "perSecond": 59.18270415963927
+        },
+        "misses": {
+          "count": 0,
+          "perSecond": 0.0
+        }
+      },
+      "card": {
+        "entriesAtEnd": 6352,
+        "evictions": {
+          "count": 0,
+          "perSecond": 0.0
+        },
+        "hits": {
+          "count": 910269,
+          "perSecond": 15145.39806935358
+        },
+        "misses": {
+          "count": 30,
+          "perSecond": 0.49915128613696325
+        }
+      },
+      "discussion": {
+        "entriesAtEnd": 2048,
+        "evictions": {
+          "count": 41715,
+          "perSecond": 694.0698633734473
+        },
+        "hits": {
+          "count": 15017,
+          "perSecond": 249.85849546395923
+        },
+        "misses": {
+          "count": 41715,
+          "perSecond": 694.0698633734473
+        }
+      },
+      "feed": {
+        "entriesAtEnd": 5711,
+        "evictions": {
+          "count": 0,
+          "perSecond": 0.0
+        },
+        "hits": {
+          "count": 0,
+          "perSecond": 0.0
+        },
+        "misses": {
+          "count": 0,
+          "perSecond": 0.0
+        }
+      },
+      "goal": {
+        "entriesAtEnd": 188,
+        "evictions": {
+          "count": 0,
+          "perSecond": 0.0
+        },
+        "hits": {
+          "count": 345,
+          "perSecond": 5.740239790575077
+        },
+        "misses": {
+          "count": 2,
+          "perSecond": 0.03327675240913088
+        }
+      },
+      "pool": {
+        "entriesAtEnd": 31,
+        "evictions": {
+          "count": 0,
+          "perSecond": 0.0
+        },
+        "hits": {
+          "count": 4001,
+          "perSecond": 66.57014319446633
+        },
+        "misses": {
+          "count": 0,
+          "perSecond": 0.0
+        }
+      },
+      "summary": {
+        "entriesAtEnd": 6340,
+        "evictions": {
+          "count": 0,
+          "perSecond": 0.0
+        },
+        "hits": {
+          "count": 0,
+          "perSecond": 0.0
+        },
+        "misses": {
+          "count": 0,
+          "perSecond": 0.0
+        }
+      },
+      "thread": {
+        "entriesAtEnd": 19483,
+        "evictions": {
+          "count": 0,
+          "perSecond": 0.0
+        },
+        "hits": {
+          "count": 17654,
+          "perSecond": 293.7338935153983
+        },
+        "misses": {
+          "count": 6,
+          "perSecond": 0.09983025722739265
+        }
+      }
+    },
+    "end": "2026-11-13T17:14:46.793076+00:00",
+    "seconds": 60.1020188331604,
+    "start": "2026-11-13T17:13:46.691057+00:00"
+  },
+  "driverCallsPerMinute": {
+    "boardGet": 0,
+    "kanbanToolsRead": 9,
+    "providerTurnEnd": 13,
+    "readOpenCards": 17
+  },
+  "driverCallsSource": "Exact .9 profile minute:13turnEndedUnlocked spans;0board_get MCP calls;17open-card SQL reads withKanbanStore.read root,9withKanbanTools.withCaller root. Sanctioned evaluator correction after diagnostic6.",
+  "earlierEstimatesNotUsedAsExactMinuteTargets": {
+    "boardCount": 260,
+    "discussionMissesPerSecond": 536,
+    "openCardRowsPerSecond": 6900,
+    "tickStepsPerSecond": 10,
+    "writerTransactionsPerMinute": 800
+  },
+  "evaluatorClarification": "13 Nov ~17:50Z: exact-minute targets accepted; logical work equivalence excludes physical cost reductions. Total cache rates use cumulative snapshots; see PASS-LINE.md.",
+  "eventWriteBatches": {
+    "all": {
+      "message.updated": 31,
+      "node.updated": 186,
+      "plan.updated": 5,
+      "provider-session.attached": 4,
+      "provider-session.updated": 17,
+      "provider-turn.updated": 48,
+      "turn-item.updated": 340
+    },
+    "batchSizes": {
+      "1": 631
+    },
+    "byRootCaller": {
+      "(no parent)": {
+        "message.updated": 20,
+        "node.updated": 112,
+        "plan.updated": 4,
+        "provider-turn.updated": 30,
+        "turn-item.updated": 191
+      },
+      "ProviderSessionManager.persistProviderSessionUpdate": {
+        "provider-session.updated": 4
+      },
+      "ProviderSessionManager.releaseIfStillIdle": {
+        "provider-session.updated": 8
+      },
+      "ProviderTurnStartService.start": {
+        "message.updated": 11,
+        "node.updated": 74,
+        "plan.updated": 1,
+        "provider-session.attached": 4,
+        "provider-session.updated": 5,
+        "provider-turn.updated": 18,
+        "turn-item.updated": 149
+      }
+    },
+    "parentless": {
+      "message.updated": 20,
+      "node.updated": 112,
+      "plan.updated": 4,
+      "provider-turn.updated": 30,
+      "turn-item.updated": 191
+    },
+    "source": "EventSink.write span orchestration_v2.event_types/count attributes, exact .9 profile minute"
+  },
+  "httpRoutes": [
+    {
+      "caller": "/api/ardud/control/threads/:threadId",
+      "count": 170,
+      "perSecond": 2.8333333333333335
+    },
+    {
+      "caller": "/api/ardud/control/identity/resolve",
+      "count": 95,
+      "perSecond": 1.5833333333333333
+    },
+    {
+      "caller": "/api/ardud/control/threads/:threadId/messages",
+      "count": 83,
+      "perSecond": 1.3833333333333333
+    },
+    {
+      "caller": "/mcp",
+      "count": 76,
+      "perSecond": 1.2666666666666666
+    },
+    {
+      "caller": "/api/ardud/control/threads",
+      "count": 50,
+      "perSecond": 0.8333333333333334
+    },
+    {
+      "caller": "/api/ardud/control/requests",
+      "count": 26,
+      "perSecond": 0.43333333333333335
+    },
+    {
+      "caller": "/api/ardud/control/health",
+      "count": 9,
+      "perSecond": 0.15
+    },
+    {
+      "caller": "/api/orchestration/threads/:threadId/bounded",
+      "count": 7,
+      "perSecond": 0.11666666666666667
+    },
+    {
+      "caller": "/api/ardud/control/threads/:threadId/runs/:runId/evidence",
+      "count": 4,
+      "perSecond": 0.06666666666666667
+    },
+    {
+      "caller": "/api/ardud/control/harness-cutover/status",
+      "count": 4,
+      "perSecond": 0.06666666666666667
+    },
+    {
+      "caller": "/api/ardud/kanban/asks",
+      "count": 1,
+      "perSecond": 0.016666666666666666
+    }
+  ],
+  "limitations": [
+    "SQL trace does not record returned rows. Per-operation KanbanStore counters (local, not global deltas) supply open-card rows; operation start and SQL start counts can differ at the window boundaries.",
+    "Cumulative board cache entries are observed, not a complete board count census. Requested synthetic board cardinality is in shape.json."
+  ],
+  "openCardSqlReads": {
+    "count": 346,
+    "nearestCallers": [
+      {
+        "caller": "KanbanStore.read < KanbanService.serial < KanbanService.dispatchUnlocked",
+        "count": 124,
+        "perSecond": 2.066666666666667
+      },
+      {
+        "caller": "KanbanStore.read < KanbanService.startCard < KanbanService.serial < KanbanService.dispatchUnlocked",
+        "count": 46,
+        "perSecond": 0.7666666666666667
+      },
+      {
+        "caller": "KanbanStore.read < KanbanService.tickLocalWaits < KanbanService.tickBoard < KanbanService.tickUnlocked",
+        "count": 34,
+        "perSecond": 0.5666666666666667
+      },
+      {
+        "caller": "KanbanStore.read < KanbanBoardLocks.outsideRead < KanbanService.startCard < KanbanService.serial",
+        "count": 23,
+        "perSecond": 0.38333333333333336
+      },
+      {
+        "caller": "KanbanStore.read < KanbanService.threadCompacting < KanbanService.startCard < KanbanService.serial",
+        "count": 22,
+        "perSecond": 0.36666666666666664
+      },
+      {
+        "caller": "KanbanStore.read < KanbanService.ensureWorkModel < KanbanService.startCard < KanbanService.serial",
+        "count": 22,
+        "perSecond": 0.36666666666666664
+      },
+      {
+        "caller": "KanbanStore.read < KanbanBoardLocks.scopeDispatch < KanbanService.serial < KanbanService.dispatchUnlocked",
+        "count": 22,
+        "perSecond": 0.36666666666666664
+      },
+      {
+        "caller": "KanbanStore.read",
+        "count": 17,
+        "perSecond": 0.2833333333333333
+      },
+      {
+        "caller": "KanbanStore.read < KanbanService.wakeBoardNudges < KanbanService.tickStep < KanbanService.tickSteps",
+        "count": 10,
+        "perSecond": 0.16666666666666666
+      },
+      {
+        "caller": "KanbanStore.read < KanbanService.agentCall < KanbanTools.withCaller",
+        "count": 9,
+        "perSecond": 0.15
+      },
+      {
+        "caller": "KanbanStore.read < KanbanService.serial < KanbanService.dispatchUnlocked < KanbanService.tickBoard",
+        "count": 9,
+        "perSecond": 0.15
+      },
+      {
+        "caller": "KanbanStore.read < KanbanService.tickStep < KanbanService.tickSteps < KanbanService.serial",
+        "count": 8,
+        "perSecond": 0.13333333333333333
+      }
+    ],
+    "perSecond": 5.766666666666667
+  },
+  "perOperationRows": {
+    "discussionMisses": 37263,
+    "openCardRows": 795178
+  },
+  "pollers": {
+    "asksRequestsPerMinute": 1,
+    "statusPeriodSeconds": 15,
+    "statusReplyApproxBytes": 3500000,
+    "statusSource": "Card #1352 / #1344; preserve until explicitly changed"
+  },
+  "schemaVersion": 1,
+  "source": {
+    "cacheSelection": "Per-operation read counters are local to each Effect read context on dbc99fc3a4 and count rows decoded by operations starting in the profile minute. Cumulative tickLocalWaits snapshots are a separate cross-check, with their own interval.",
+    "endExclusive": "2026-11-13T17:14:36Z",
+    "seconds": 60,
+    "sha256": "67a94b98d55e627e29c1a98d85e5ba2b4f2768f254c6c767bae906ff188cd4cd",
+    "spanSelection": "Count spans starting in the half-open profile window, as minute.py/cards.py/tx.py do; parent graph includes surrounding spans.",
+    "startInclusive": "2026-11-13T17:13:36Z",
+    "trace": "main-thread-overload-20261113/after/traces-profile-minute-b9/server.trace.ndjson",
+    "windowEvidence": "Source thread 8ffd9d49-05a6-4b23-b5f3-9cdfff5c3d3f positions 679 and 702; tx.py independently reproduces 795 writer transactions."
+  },
+  "storeOperations": [
+    {
+      "caller": "read card",
+      "count": 386,
+      "perSecond": 6.433333333333334
+    },
+    {
+      "caller": "read open cards",
+      "count": 375,
+      "perSecond": 6.25
+    },
+    {
+      "caller": "read pools",
+      "count": 217,
+      "perSecond": 3.6166666666666667
+    },
+    {
+      "caller": "read thread link",
+      "count": 203,
+      "perSecond": 3.3833333333333333
+    },
+    {
+      "caller": "read board",
+      "count": 200,
+      "perSecond": 3.3333333333333335
+    },
+    {
+      "caller": "read discussion",
+      "count": 162,
+      "perSecond": 2.7
+    },
+    {
+      "caller": "read discussions",
+      "count": 74,
+      "perSecond": 1.2333333333333334
+    },
+    {
+      "caller": "read boards",
+      "count": 47,
+      "perSecond": 0.7833333333333333
+    },
+    {
+      "caller": "read thread links",
+      "count": 37,
+      "perSecond": 0.6166666666666667
+    },
+    {
+      "caller": "read cards",
+      "count": 26,
+      "perSecond": 0.43333333333333335
+    },
+    {
+      "caller": "read goals",
+      "count": 22,
+      "perSecond": 0.36666666666666664
+    },
+    {
+      "caller": "read thread cards",
+      "count": 12,
+      "perSecond": 0.2
+    },
+    {
+      "caller": "read owner wait",
+      "count": 8,
+      "perSecond": 0.13333333333333333
+    },
+    {
+      "caller": "read wiki",
+      "count": 4,
+      "perSecond": 0.06666666666666667
+    },
+    {
+      "caller": "read card events",
+      "count": 4,
+      "perSecond": 0.06666666666666667
+    },
+    {
+      "caller": "read card by number",
+      "count": 2,
+      "perSecond": 0.03333333333333333
+    },
+    {
+      "caller": "read groups",
+      "count": 2,
+      "perSecond": 0.03333333333333333
+    },
+    {
+      "caller": "read all scripts",
+      "count": 1,
+      "perSecond": 0.016666666666666666
+    },
+    {
+      "caller": "read scripts",
+      "count": 1,
+      "perSecond": 0.016666666666666666
+    },
+    {
+      "caller": "read card page",
+      "count": 1,
+      "perSecond": 0.016666666666666666
+    },
+    {
+      "caller": "read all messages",
+      "count": 1,
+      "perSecond": 0.016666666666666666
+    },
+    {
+      "caller": "read messages",
+      "count": 1,
+      "perSecond": 0.016666666666666666
+    }
+  ],
+  "tickSteps": {
+    "byKind": {
+      "evaluatorStep": 2,
+      "landing": 99,
+      "localWait": 2,
+      "missingThread": 73,
+      "nativeQuestion": 8,
+      "ownerReminder": 13,
+      "reconcileHeldDiscussions": 2,
+      "reviewerBackstop": 5,
+      "scribe": 27,
+      "settleDiscussion": 179,
+      "silentRunBackstop": 91,
+      "typing": 8,
+      "unlistedPools": 31,
+      "wakeBoardNudges": 20,
+      "wakeDiscussionNudges": 11,
+      "workerBackstop": 83
+    },
+    "count": 654,
+    "perSecond": 10.9,
+    "seconds": 60
+  },
+  "totalCacheRates": {
+    "card": {
+      "evictions": 0.0,
+      "hits": 15145.39806935358,
+      "misses": 0.49915128613696325
+    },
+    "discussion": {
+      "evictions": 694.0698633734473,
+      "hits": 249.85849546395923,
+      "misses": 694.0698633734473
+    }
+  },
+  "workTargets": {
+    "cardRowsPerSecond": 13252.966666666667,
+    "discussionMissesPerSecond": 621.05,
+    "tickStepsPerSecond": 10.9,
+    "writerTransactionsPerMinute": 795
+  },
+  "writerTransactions": {
+    "count": 795,
+    "nearestCallers": [
+      {
+        "caller": "orchestrationV2.EventSink.write",
+        "count": 284,
+        "perSecond": 4.733333333333333
+      },
+      {
+        "caller": "orchestrationV2.EventSink.write < RunExecutionService.startRootRun < ProviderTurnStartService.start",
+        "count": 200,
+        "perSecond": 3.3333333333333335
+      },
+      {
+        "caller": "orchestrationV2.EventSink.commitCommand < RestartPacingState.status < RestartPacing.acquire",
+        "count": 189,
+        "perSecond": 3.15
+      },
+      {
+        "caller": "RestartPacingState.status < RestartPacing.acquire",
+        "count": 14,
+        "perSecond": 0.23333333333333334
+      },
+      {
+        "caller": "orchestrationV2.EventSink.commitCommand < orchestrationV2.dispatch.withReceipt < orchestrationV2.threadManagement.dispatchWithSelectionMigration",
+        "count": 10,
+        "perSecond": 0.16666666666666666
+      },
+      {
+        "caller": "orchestrationV2.EventSink.write < ProviderSessionManager.writeProviderSessionEvents < ProviderSessionManager.persistProviderSessionUpdate",
+        "count": 9,
+        "perSecond": 0.15
+      },
+      {
+        "caller": "orchestrationV2.EventSink.writeIfRunCurrent < RunExecutionService.writeFinalRunEvents < RunExecutionService.finalizeRootRun",
+        "count": 9,
+        "perSecond": 0.15
+      },
+      {
+        "caller": "orchestrationV2.EventSink.commitCommand < orchestrationV2.checkpointCapture.execute < RunFinalizationService.finalize",
+        "count": 9,
+        "perSecond": 0.15
+      },
+      {
+        "caller": "HistoryArchive.pass",
+        "count": 7,
+        "perSecond": 0.11666666666666667
+      },
+      {
+        "caller": "orchestrationV2.EventSink.write < ProviderSessionManager.writeProviderSessionEvents < ProviderSessionManager.writeReleasedSessionEvents",
+        "count": 7,
+        "perSecond": 0.11666666666666667
+      },
+      {
+        "caller": "Orchestrator.dispatchMessage < orchestrationV2.dispatch.once < orchestrationV2.dispatch.withReceipt",
+        "count": 6,
+        "perSecond": 0.1
+      },
+      {
+        "caller": "orchestrationV2.EventSink.commitCommand < orchestrationV2.dispatch.withReceipt < ThreadLaunchService.prepareInBackground",
+        "count": 6,
+        "perSecond": 0.1
+      },
+      {
+        "caller": "orchestrationV2.EventSink.writeIfRunCurrent < orchestrationV2.providerTurnStart.start < ProviderTurnStartService.start",
+        "count": 6,
+        "perSecond": 0.1
+      },
+      {
+        "caller": "ProviderSessionManager.readReleasedBackgroundTasks < ProviderSessionManager.releaseIfStillIdle",
+        "count": 5,
+        "perSecond": 0.08333333333333333
+      },
+      {
+        "caller": "ProviderSessionManager.writeReleasedRuntimeRequestEvents < ProviderSessionManager.releaseIfStillIdle",
+        "count": 4,
+        "perSecond": 0.06666666666666667
+      },
+      {
+        "caller": "orchestrationV2.EventSink.commitCommand < orchestrationV2.dispatch.withReceipt < ThreadLaunchService.launch",
+        "count": 4,
+        "perSecond": 0.06666666666666667
+      },
+      {
+        "caller": "orchestrationV2.dispatch.delegatedTaskRequest < orchestrationV2.dispatch.once < orchestrationV2.dispatch.withReceipt",
+        "count": 4,
+        "perSecond": 0.06666666666666667
+      },
+      {
+        "caller": "orchestrationV2.checkpointCapture.execute < RunFinalizationService.finalize",
+        "count": 3,
+        "perSecond": 0.05
+      },
+      {
+        "caller": "OrchestratorMcpService.readThread",
+        "count": 3,
+        "perSecond": 0.05
+      },
+      {
+        "caller": "orchestrationV2.EventSink.writeIfRunCurrent",
+        "count": 2,
+        "perSecond": 0.03333333333333333
+      },
+      {
+        "caller": "orchestrationV2.EventSink.write < ProviderSessionManager.writeProviderSessionEvents < orchestrationV2.providerTurnStart.start",
+        "count": 2,
+        "perSecond": 0.03333333333333333
+      },
+      {
+        "caller": "Orchestrator.dispatchMessage < orchestrationV2.dispatch.delegatedTaskRequest < orchestrationV2.dispatch.once",
+        "count": 2,
+        "perSecond": 0.03333333333333333
+      },
+      {
+        "caller": "orchestrationV2.EventSink.commitCommand < orchestrationV2.dispatch.withReceipt < McpDeadline.awaitInterruptibly",
+        "count": 2,
+        "perSecond": 0.03333333333333333
+      },
+      {
+        "caller": "Orchestrator.finalizeAppOwnedSubagent < Orchestrator.handleRunUpdate",
+        "count": 2,
+        "perSecond": 0.03333333333333333
+      },
+      {
+        "caller": "RunFinalizationService.finalize",
+        "count": 1,
+        "perSecond": 0.016666666666666666
+      },
+      {
+        "caller": "orchestrationV2.EventSink.commitCommand < orchestrationV2.dispatch.withReceipt < ThreadMessageIntake.dispatchCommand",
+        "count": 1,
+        "perSecond": 0.016666666666666666
+      },
+      {
+        "caller": "(no parent)",
+        "count": 1,
+        "perSecond": 0.016666666666666666
+      },
+      {
+        "caller": "orchestrationV2.EventSink.writeIfRunCurrent < RunExecutionService.startRootRun < ProviderTurnStartService.start",
+        "count": 1,
+        "perSecond": 0.016666666666666666
+      },
+      {
+        "caller": "Orchestrator.dispatchPreparedRunRelease < orchestrationV2.dispatch.once < orchestrationV2.dispatch.withReceipt",
+        "count": 1,
+        "perSecond": 0.016666666666666666
+      },
+      {
+        "caller": "RestartPacingState.status < RestartPacing.acquire < RestartPacing.acquireRun",
+        "count": 1,
+        "perSecond": 0.016666666666666666
+      }
+    ],
+    "perMinute": 795,
+    "rootCallers": [
+      {
+        "caller": "orchestrationV2.EventSink.write",
+        "count": 284,
+        "perSecond": 4.733333333333333
+      },
+      {
+        "caller": "ProviderTurnStartService.start",
+        "count": 219,
+        "perSecond": 3.65
+      },
+      {
+        "caller": "RestartPacing.acquire",
+        "count": 196,
+        "perSecond": 3.2666666666666666
+      },
+      {
+        "caller": "ProviderSessionManager.releaseIfStillIdle",
+        "count": 16,
+        "perSecond": 0.26666666666666666
+      },
+      {
+        "caller": "RunFinalizationService.finalize",
+        "count": 13,
+        "perSecond": 0.21666666666666667
+      },
+      {
+        "caller": "KanbanService.drainOwnerRoutes",
+        "count": 11,
+        "perSecond": 0.18333333333333332
+      },
+      {
+        "caller": "RestartPacing.acquireRun",
+        "count": 8,
+        "perSecond": 0.13333333333333333
+      },
+      {
+        "caller": "OrchestratorMcpService.delegateTask",
+        "count": 8,
+        "perSecond": 0.13333333333333333
+      },
+      {
+        "caller": "HistoryArchive.pass",
+        "count": 7,
+        "perSecond": 0.11666666666666667
+      },
+      {
+        "caller": "ThreadLaunchService.prepareInBackground",
+        "count": 7,
+        "perSecond": 0.11666666666666667
+      },
+      {
+        "caller": "ProviderSessionManager.persistProviderSessionUpdate",
+        "count": 4,
+        "perSecond": 0.06666666666666667
+      },
+      {
+        "caller": "RunExecutionService.finalizeRootRun",
+        "count": 4,
+        "perSecond": 0.06666666666666667
+      },
+      {
+        "caller": "KanbanTools.withCaller",
+        "count": 4,
+        "perSecond": 0.06666666666666667
+      },
+      {
+        "caller": "OrchestratorMcpService.readThread",
+        "count": 3,
+        "perSecond": 0.05
+      },
+      {
+        "caller": "KanbanService.dispatchUnlocked",
+        "count": 3,
+        "perSecond": 0.05
+      },
+      {
+        "caller": "orchestrationV2.EventSink.writeIfRunCurrent",
+        "count": 2,
+        "perSecond": 0.03333333333333333
+      },
+      {
+        "caller": "KanbanService.serial",
+        "count": 2,
+        "perSecond": 0.03333333333333333
+      },
+      {
+        "caller": "Orchestrator.handleRunUpdate",
+        "count": 2,
+        "perSecond": 0.03333333333333333
+      },
+      {
+        "caller": "ThreadMessageIntake.dispatchCommand",
+        "count": 1,
+        "perSecond": 0.016666666666666666
+      },
+      {
+        "caller": "(no parent)",
+        "count": 1,
+        "perSecond": 0.016666666666666666
+      }
+    ]
+  }
+}

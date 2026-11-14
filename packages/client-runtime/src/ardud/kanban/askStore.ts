@@ -409,7 +409,7 @@ export function createAskStore(host: AskStoreHost) {
       if (!ref.analytics) continue;
       const { createdAt, ...ids } = ref.analytics;
       const durationMs = Date.now() - Date.parse(createdAt);
-      collector?.record("ask.answered", {
+      collector?.record("ask.answer_sent", {
         ...ids,
         ...(Number.isFinite(durationMs) && durationMs >= 0 ? { durationMs } : {}),
         props: { createdAt, phase: "ask", key: ref.askId, count: 1 },

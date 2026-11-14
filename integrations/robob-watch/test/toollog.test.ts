@@ -1,10 +1,23 @@
 import { afterEach, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync, readdirSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { rollup, toolLog, toolError } from "../src/toollog.ts";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync, readdirSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join, relative } from "node:path";
+import { logDirectory, rollup, toolLog, toolError } from "../src/toollog.ts";
 
 const before = process.env.TOOLLOG_DIR;
+
+test("test default stays outside the home log tree when the override is absent", () => {
+  const previous = process.env.TOOLLOG_DIR;
+  delete process.env.TOOLLOG_DIR;
+  try {
+    const root = logDirectory();
+    expect(root.startsWith(join(homedir(), ".robob"))).toBe(false);
+    expect(relative(realpathSync(tmpdir()), realpathSync(root)).startsWith("..")).toBe(false);
+    expect(logDirectory()).toBe(root);
+  } finally {
+    if (previous === undefined) delete process.env.TOOLLOG_DIR; else process.env.TOOLLOG_DIR = previous;
+  }
+});
 const dirs: string[] = [];
 const fixture = () => { const dir = mkdtempSync(join(tmpdir(), "toollog-")); dirs.push(dir); process.env.TOOLLOG_DIR = dir; return dir; };
 const emptyBreakdown = {

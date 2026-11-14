@@ -109,6 +109,7 @@ export interface KanbanClient {
     options?: { readonly replaces?: string },
   ): Promise<void>;
   updateBoard(input: KanbanBoardUpdateInput): Promise<void>;
+  revokeStandingApproval(boardId: string, id: string): Promise<void>;
   /** Owner's New board: creates the board with its project and evaluator model. */
   createBoard(input: {
     slug: string;
@@ -957,6 +958,13 @@ export function createKanbanClient(
         ...(options?.replaces === undefined ? {} : { replaces: options.replaces }),
       });
     },
+    async revokeStandingApproval(boardId, id) {
+      await transport.request(M.standingApprovalRevoke, {
+        boardId: boardId as never,
+        id,
+        reason: "Revoked from board settings",
+      });
+    },
     async updateBoard(input) {
       await transport.request(M.boardUpdate, input);
     },
@@ -1026,7 +1034,7 @@ export function createKanbanClient(
       if (metadata) {
         // @effect-diagnostics-next-line globalDate:off - A client interaction, measured from the server's creation timestamp.
         const durationMs = Date.now() - Date.parse(metadata.createdAt);
-        analytics?.record("ask.answered", {
+        analytics?.record("ask.answer_sent", {
           boardId,
           discussionId,
           ...(Number.isFinite(durationMs) && durationMs >= 0 ? { durationMs } : {}),

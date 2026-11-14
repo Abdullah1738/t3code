@@ -25,8 +25,8 @@ test("watcher failure alerts share a stable burst key across episodes; ordinary 
     expect(child.exitCode, child.stderr.toString()).toBe(0);
     const calls = readFileSync(capture, "utf8").trim().split("\n").map(line => JSON.parse(line) as string[]);
     expect(calls).toHaveLength(3);
-    expect(calls[0]!.slice(-2)).toEqual(["--burst-key", "watcher-failure:health"]);
-    expect(calls[1]!.slice(-2)).toEqual(["--burst-key", "watcher-failure:health"]);
-    expect(calls[2]).not.toContain("--burst-key");
+    expect(calls[0]!.at(-1)).toBe("--burst-key=watcher-failure:health");
+    expect(calls[1]!.at(-1)).toBe("--burst-key=watcher-failure:health");
+    expect(calls[2]!.some(arg => arg.startsWith("--burst-key="))).toBe(false);
   } finally { rmSync(home, { recursive: true, force: true }); }
 });

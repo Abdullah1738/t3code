@@ -19,6 +19,7 @@ export function assertOpenCode2ToolCallOutput(
 ) {
   assertBaseProjection({ result, transcript, runCount: 1, runStatuses: ["completed"] });
   const projection = projectionFor(result, transcript.scenario);
+  assert.equal(projection.providerThreads[0]?.pendingBackgroundWork, false);
   assertSemanticProjectionIntegrity(projection);
   assertVisibleTurnItemsMirrorLocalTurnItems(projection);
   // Buffered delivery keeps streaming text out of the read model until

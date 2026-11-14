@@ -73,6 +73,7 @@ typeset -A live=(
   libexec/card-preview "$HOME/.local/libexec/card-preview"
   libexec/qcard "$HOME/.local/libexec/qcard"
   libexec/mirage "$HOME/.local/libexec/mirage"
+  libexec/vp "$HOME/.local/libexec/vp"
   juno-proxy "$HOME/.local/share/juno-proxy"
   lydia-ticks "$HOME/.local/share/lydia-ticks"
   bin "$HOME/.local/bin"
@@ -82,6 +83,7 @@ typeset -A live=(
 typeset -A private=(kc-read 1 kc-write 1 otp-watch.py 1 tunnel.sh 1)
 # ~/.local/bin entries that point into other deployed integrations.
 links=(
+  "$HOME/.local/share/quint-guard/bin/quint:$HOME/.local/bin/quint"
   "$HOME/.config/opencode/skills/image-generation/scripts/genimg.py:$HOME/.local/libexec/image-generation/genimg.py"
   "$HOME/.bun/bin/hcloud:$HOME/.local/bin/hcloud"
   "$HOME/.local/bin/wa:$HOME/.local/share/robob-watch/helpers/wa"
@@ -406,6 +408,8 @@ for f in "${plists[@]}"; do smoke plutil -lint "$f"; done
 smoke sh -n "$HOME/.local/bin/himalaya-heal"
 smoke sh -n "$HOME/.local/bin/mirage-beacon-keepalive"
 smoke sh -n "$lib/mirage/restart.sh"
+smoke sh -n "$HOME/.local/bin/vp"
+smoke sh -c 'cd / && "$1" --version >/dev/null 2>&1; [ "$?" = 127 ]' sh "$HOME/.local/bin/vp"
 smoke zsh -n "$HOME/.local/share/lydia-ticks/tunnel.sh"
 for f in power-unplug-telegram.sh battery-low-telegram.sh cards-tunnel cards-tunnel-setup cards-health robob-read-watchdog quint; do
   smoke zsh -n "$HOME/.local/bin/$f"

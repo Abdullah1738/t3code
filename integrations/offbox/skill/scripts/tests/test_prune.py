@@ -967,7 +967,7 @@ class ReleaseTests(NoNetwork):
                 self._box_with_hold()
                 self.con.execute('DELETE FROM pool_callers')
                 if mapped:
-                    self.con.execute("INSERT INTO pool_callers VALUES ('worker','/checkout/repo','bx','w/keep-cccccc')")
+                    self.con.execute("INSERT INTO pool_callers VALUES ('worker',?,'bx','w/keep-cccccc')", (self.me['repo_root'],))
                 self.con.commit()
                 me = self.me if mapped else dict(self.me, owner='o9', repo_root='/r9')
                 with patch.object(api, 'get', return_value={'state': 'running'}), \

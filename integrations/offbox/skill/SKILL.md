@@ -94,9 +94,9 @@ Record the Node version, manager/version, install command and the files that cho
    (e.g. `vp i` for this fork, once the manager install has put vite-plus in node_modules). An npm pin without its npm lockfile is a repo prerequisite to resolve, not a
    reason to run a different manager. Hints cover common literal pins; inspect expressions/matrices yourself.
 4. Select **versions**, not just a manager name. Node: `.nvmrc` / `.node-version`, then `engines.node`,
-   then CI `setup-node` / `NODE_VERSION`; check the selected version satisfies the engine range too.
+   then CI `setup-node`; offbox follows the CI setup-node version when the repo has no pin.
    Use an installed match on local narrow checks (e.g. put its `~/.nvm/versions/node/<version>/bin` first
-   on PATH); offbox provisions a matching Node or stops before the command. CI-only Node fallback on boxes is #694. Log `node --version`.
+   on PATH); offbox provisions a matching Node or stops before the command. Log `node --version`.
    pnpm: `packageManager`, then CI `PNPM_VERSION` / `pnpm/action-setup` `version`. Run it explicitly pinned
    (`corepack pnpm@10 ...` for CI major 10), never a conflicting global pnpm. Check the selected manager's
    `--version` under that Node before both install and checks; select matching npm/Yarn/Bun versions too.
@@ -152,15 +152,18 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
   A missing node_modules bin (`command not found`, exit 127, or `not found` under npm/pnpm, exit 1/254) can mean
   that box has no deps yet; local `node_modules` is never synced. Once #466's own-box affinity is installed,
   separate runs can reuse deps while no box switch is reported.
-- Node version: offbox selects the newest installed Node satisfying the nearest `.nvmrc`/`.node-version` and `package.json` `engines.node` together. If none matches, it bootstraps nvm and installs the newest published match from official Node binaries, checking SHASUMS256 before temporary extraction and activation. It prints `offbox: node vX (...)`; provisioning or activation failure stops before the command with exit 99. Repos without a usable Node pin keep their existing behaviour.
+- Node version: offbox selects Node from the repo pin (`.nvmrc`/`.node-version`/`engines.node`), then the CI setup-node version, then the nvm default (or newest installed nvm Node, otherwise the box default), and prints its choice, provisioning a missing pinned version or stopping with exit 99.
 - In JS repos, runs put the current directory's and ancestor `node_modules/.bin` directories up to the repo root first on PATH, so repo-pinned `vp`/`tsc-rs` win over global copies, including after `cd apps/server`. On a fresh checkout or box, install with the repo's package manager first (see **Install with the repo's package manager**); `vp i` itself needs vite-plus installed.
 - pnpm: repos with `pnpm-lock.yaml` use `packageManager` (including explicit pnpm 11+) > CI `PNPM_VERSION` / `pnpm/action-setup` version > lockfile compatibility (9.0 → pnpm 10; fallback never 11+). A verified package in the box-local cache supplies a PATH shim, bypassing Corepack defaults. `offbox: pnpm vX (<source>)` records the selection; activation failure exits 99. Matching installed/cached toolchains make no network requests. Downloads retry all errors twice with 20 s connect, <30 KB/s for 60 s stall, and 600 s per attempt limits.
 - Source of a new lease: `--base N` > the repo's default saved base > the repo's template > `generic`. If boat has
   deleted a template's data, the run builds its box from the template's recipe instead (a few minutes; `offbox:`
   says so) and the reaper rebuilds the template. An expired default base falls back to the template.
   Templates: `crpko-go` (Go 1.26 + FDB client + warm module cache, large), `crpko-node` (nvm Node 20, 22 (>=22.13) + 24, warm npm cache,
-  large), `crpko-harness` (large, Docker images for the harness stack pre-pulled), `generic` (default).
-  Auto-pick: crpko-devops / go.mod → crpko-go; package.json → crpko-node; compose file or testcontainers → crpko-harness.
+  large), `crpko-harness` (large, harness Docker images pre-pulled when the registry allows; rate-limited pulls retry, and
+  a failed pre-pull doesn't stop the box, the images are then pulled on first use), `generic` (default).
+  Auto-pick: crpko-devops → crpko-go; repo key containing `harness` or go.mod with testcontainers → crpko-harness; other
+  go.mod → crpko-go; package.json → crpko-node; otherwise generic. A root compose file alone doesn't pick a template.
+  Each run prints the template it picked and why; `--template` overrides it.
 - On each box, crpko-devops runs check Vector 0.50.0, `/usr/bin/ruby`, AWS CLI v2, GNU time (`/usr/bin/time`), the Terraform version pinned in the checkout's `terraform-dev.yml` and a local Terraform provider mirror pre-filled from the repo's lock files and unpinned fixtures (`TERRAFORM_PROVIDER_MIRROR`). Missing or wrong versions are installed on the first run there (a few minutes); ready boxes only run a fast check. Binaries are installed on the runner PATH under `/usr/local/bin` (Ruby is installed by apt at `/usr/bin/ruby`). It has no package-lock.json, so run tests directly or use `npm install`, not `npm ci`.
 - LocalStack calls must still point `aws` at its endpoint (`--endpoint-url` or `AWS_ENDPOINT_URL`). Box runs get no AWS credentials unless forwarded with `--env`.
 - Type-check runs (tsc, tsc-rs, `vp run typecheck`) in JS/TS repos get xlarge by default; large boxes run out of memory on the Robob server typecheck.
@@ -194,7 +197,7 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
 | `--git` | export a portable `.git` with the selected checkout's exact HEAD and ancestor history |
 | `--include PATH` | sync a path the filters skip (e.g. a committed `testdata/server.key`). Under a gitignored dir such as `tmp/`, only that path mirrors; the box's other files in that dir are kept |
 | `--no-sync` | run without syncing (box already has what you need) |
-| `--bg` | start and return a run id at once; then `offbox logs <id> --follow` / `offbox wait <id> [--timeout S]` (exits with its code, does `--pull`) |
+| `--bg` | queue in a detached client and return a run id at once, even while the pool is full; then `offbox logs <id> --follow` / `offbox wait <id> [--timeout S]` (exits with its code, does `--pull`). Client diagnostics: `logs/<id>.client.log` in the offbox state directory. |
 | `--base N` / `--fresh` | new lease from saved base N / ignoring bases and templates. `--fresh` doesn't always mean a new box: in the repository pool it can still reuse a pool box that was itself created fresh. In a full pool with no box of that kind, it stops at once (exit 2) instead of queueing. It isn't a way off a bad box: offbox now stops broken boxes itself, and `offbox release <id>` stops one by hand. |
 | `--no-fallback` | return 90/91 instead of falling back to a local run |
 | `--remote` | same as `--no-fallback` (kept for old commands; every run uses a box now) |
@@ -211,7 +214,7 @@ its end and returns its code. If the box says the process ended but that `offbox
 minute later (30 min with `--pull`), wait returns the box's exit code and says the other client looks stuck.
 `--timeout S` stops waiting after S seconds with exit 124; the run keeps going.
 On a run still queued for a pool box they say "waiting for a box" and keep polling until it gets one or settles.
-If that run's own `offbox run` has died (a tool-call timeout), wait marks it lost ("never started, nothing ran", 90).
+A queued `--bg` run survives its caller ending. If the offbox client itself dies before getting a box, wait marks the run lost and wait/logs return 100 ("never started; nothing ran, safe to rerun").
 
 `--git` works with normal checkouts and linked worktrees, including detached HEADs. It exports only HEAD's
 reachable history and branch/remote/tag refs whose commits are ancestors of HEAD; divergent refs and other
@@ -229,6 +232,17 @@ then sends HEAD alone as a one-commit shallow `.git` and says so in one line. If
 UIs/dashboards on the box: `offbox ports 3000` opens `http://127.0.0.1:3000` on the Mac via an SSH tunnel
 (`--local 13000` to pick the local port). `offbox ports 1055 --local 8080 --reverse` goes the other way: the Mac's
 `127.0.0.1:8080` shows up on the box at `127.0.0.1:1055` (e.g. a Mac-side proxy). Interactive shell or one-off command: `offbox ssh` / `offbox ssh -- 'docker ps'`.
+
+### Control a box without SSH
+
+`offbox exec [box_id] [--timeout N] [--cwd DIR] [--json] -- <command...>` runs through the authenticated
+offbox server API, owner-checked, on home or Boat. With no box ID it uses this caller's current lease.
+Use `offbox exec <box> -- <cmd>` when a guest has stopped, masked or replaced its own sshd (for example
+TorSSH testhost fixtures). Never bypass a host-key mismatch by editing known_hosts or disabling strict
+host-key checking. `boat exec` is Boat-only and returns 404 for home boxes.
+Timeout defaults to 60 seconds and is clamped to 1..600. Output goes to stdout/stderr, or `--json` prints
+the raw result dict; the CLI returns the remote exit code. API/transport failures exit 90. A box ID selects
+its recorded backend; a failed request never retries on the other backend. This command does not sync files.
 
 ## Repo toolchains
 
@@ -264,7 +278,7 @@ resumes+stops pinned leases and unsaved bases/templates before day 14. Save gene
   14 days (it still stops when idle). Unpinned leases stopped 14 days are gone; the next run starts a new box.
 - Leases are deleted only when their thread has been archived for 7 days, or unused for 30 days and not pinned.
 
-A saved base retains its checkout path in project build state. When offbox relocates that checkout for another local path, it clears project `.gradle` directories before the move, including nested Gradle builds; shared Gradle user-home dependency caches and module build outputs stay warm. For a lease created before this fix, move aside the project's `.gradle` once before rerunning Gradle. CMake and other build systems still need a fresh configure after relocation (for example, `cmake --fresh`).
+A saved base retains its checkout path in project build state. When offbox relocates that checkout for another local path, it clears project `.gradle` directories before the move, including nested Gradle builds; shared Gradle user-home dependency caches and module build outputs stay warm. For a lease created before this fix, move aside the project's `.gradle` once before rerunning Gradle. When a base is restored under a new directory, offbox removes CMake caches that name the old path.
 
 ## Housekeeping
 
@@ -281,6 +295,8 @@ A saved base retains its checkout path in project build state. When offbox reloc
 
 ## Home server, Boat standby
 
+On home boxes the stock ssh.service on port 22 is yours (stop, mask or replace it); offbox manages the box through its own `offbox-mgmt-ssh` service on port 2222, which you must leave alone.
+
 Once `bootstrap.zsh client` has written `server.json`, runs go to Abdullah's own server at home (boatd; same
 commands, same box model, no hourly price, no start limits, no spend cap). Boat stays as the standby. Each
 `offbox run` picks its backend once, when it starts:
@@ -296,8 +312,10 @@ commands, same box model, no hourly price, no start limits, no spend cap). Boat 
   command **again from the start, once**, and you get one line saying so (`... running it again from the start
   (attempt 2)`). Runs the server had queued start after it. `--no-retry` turns the second run off; the run then
   ends with **94**.
-- Each backend has its own boxes, saved states and templates (`offbox list`, `bases` show the backend in use;
-  `logs`, `wait`, `kill`, `release`, `ssh` find the right one from the run or box id). A saved state or template
+- Each backend has its own boxes, saved states and templates. `offbox bases` lists both backends; expired bases
+  are hidden unless `--all`. An unpinned run naming a base that exists only on Boat uses Boat and says so.
+  `offbox list` shows the selected backend; `logs`, `wait`, `kill`, `release`, `ssh` find the right one from the
+  run or box id. A saved state or template
   that exists only at home is not on Boat: a standby run says so in one line and uses a plain Boat box, so the
   first standby run of a repo is a cold one.
 - Person work (`offbox-person`, Moni's box) never goes to Boat. Server down = exit **93**, nothing ran; it waits.
@@ -363,6 +381,7 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
 - **94** = the home server restarted under the run and it was not run again (`--no-retry`, person work, or it
   had already been retried once). The command ran partly: check what it did before running it again.
 - **96** = local state DB failure. Before start: 'nothing ran, safe to retry'. After start: the message names the run and tells you to use `offbox wait <run>`; do not rerun the command. No automatic local fallback. A local bookkeeping failure after a known remote exit warns and returns that remote exit code.
+- **100** from `offbox wait` / `offbox logs` = the client ended before it got a box. The run never started; nothing ran, safe to rerun.
 - **124** from `offbox wait --timeout` = you stopped waiting; the run is still going. Wait again.
 - **90** = infra failure (or, on the Boat standby, an exhausted start budget); **91** = Boat's spend guard, which only
   exists on the standby (the home server has no cap). Heavy commands
@@ -393,6 +412,12 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
   for a dead client's unrecorded start. Claims remain for the box's lifetime.
 
 - Three ordinary infra failures within an hour send one Telegram; start-limit alerts use the six-hour cooldown.
+
+## Logs
+
+Detailed metadata logs are at `~/.robob/logs/tools/offbox/YYYY-MM-DD.ndjson` (UTC). Run events are `run.request`, `run.queue`, `run.lease`, `run.sync`, `run.command`, `run.pull`, `run.end`, `run.invocation` and `run.error`. Other events include `backend.failover`, `home.probe`, `pool.snapshot`, `gate.decision`, `local.override`, `ssh.setup`, `ssh.readiness`, `ssh.drop`, `ssh.put_file`, `mullvad.check`, `reaper.action`, `reaper.pass` and `cli.<command>`. Logs contain ids, counts, sizes, durations and stable error tags; command output stays in the existing per-run logs.
+
+`offbox log-rollup --day YYYY-MM-DD` writes `rollup-YYYY-MM-DD.json` beside the day file; omit `--day` for today. Monitor/reaper ticks roll up yesterday after 00:05 UTC. Logs keep 30 days; after 50 MB in a day, only errors continue. Home-server services write their own local file at the same path.
 
 ## Troubleshooting
 

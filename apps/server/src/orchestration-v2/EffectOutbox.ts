@@ -28,6 +28,10 @@ import * as SqlClient from "effect/sql/SqlClient";
 
 import { forkParked } from "../serverActivation.ts";
 
+const StoppedRunAttempts = Schema.Array(
+  Schema.Struct({ runId: RunId, attemptId: Schema.NullOr(RunAttemptId) }),
+);
+
 export const OrchestrationEffectRequestV2 = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("provider-runtime.continue"),
@@ -41,6 +45,19 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
     revokeMcpCredential: Schema.optional(Schema.Boolean),
   }),
   Schema.Struct({
+    type: Schema.Literal("provider-session.stop-background-work"),
+    throughRunOrdinal: Schema.Number,
+    runAttempts: StoppedRunAttempts,
+    backgroundThreads: Schema.Array(
+      Schema.Struct({
+        providerSessionId: ProviderSessionId,
+        providerThreadId: ProviderThreadId,
+        providerTurnId: ProviderTurnId,
+      }),
+    ),
+    onlyIfCancelled: Schema.Boolean,
+  }),
+  Schema.Struct({
     type: Schema.Literal("mcp-credential.revoke-thread"),
   }),
   Schema.Struct({
@@ -50,10 +67,14 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("provider-turn.interrupt"),
+    startTimeout: Schema.optional(Schema.Boolean),
+    replacementProviderSessionId: Schema.optional(ProviderSessionId),
     providerSessionId: ProviderSessionId,
     providerThreadId: ProviderThreadId,
     providerTurnId: ProviderTurnId,
     subagent: Schema.optional(Schema.Struct({ id: NodeId, nativeTaskId: Schema.String })),
+    stopThroughRunOrdinal: Schema.optional(Schema.Number),
+    stopRunAttempts: Schema.optional(StoppedRunAttempts),
   }),
   Schema.Struct({
     type: Schema.Literal("provider-turn.steer"),
@@ -67,6 +88,7 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("provider-turn.restart"),
+    expectedAttemptId: Schema.optional(RunAttemptId),
     providerSessionId: ProviderSessionId,
     providerThreadId: ProviderThreadId,
     providerTurnId: ProviderTurnId,
@@ -134,6 +156,7 @@ export const CONTROL_LANE_EFFECT_TYPES = [
   "runtime-request.respond",
   "delegated-tasks.stop",
   "provider-session.detach",
+  "provider-session.stop-background-work",
   "mcp-credential.revoke-thread",
   "checkpoint.capture",
   "scheduled-tasks.cleanup",
@@ -145,6 +168,7 @@ export const CONTROL_LANE_EFFECT_TYPES = [
 export const REPLAY_SAFE_EFFECT_TYPES_AFTER_PROCESS_LOSS = [
   "provider-runtime.continue",
   "provider-session.detach",
+  "provider-session.stop-background-work",
   "mcp-credential.revoke-thread",
   "provider-thread.rollback",
   "checkpoint.capture",
@@ -248,6 +272,7 @@ export interface EffectOutboxV2Shape {
   ) => Effect.Effect<ReadonlyArray<OrchestrationEffectV2>, EffectOutboxError>;
   readonly cancelUnsettled: (input: {
     readonly threadId: ThreadId;
+    readonly runId?: RunId;
     readonly effectTypes: ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
     readonly reason: string;
   }) => Effect.Effect<ReadonlyArray<string>, EffectOutboxError>;
@@ -517,7 +542,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
           ),
         ),
       cancelUnsettled: Effect.fn("EffectOutbox.cancelUnsettled")(
-        function* ({ threadId, effectTypes, reason }) {
+        function* ({ threadId, runId, effectTypes, reason }) {
           if (effectTypes.length === 0) return [];
           const now = DateTime.formatIso(yield* DateTime.now);
           const rows = yield* sql<{ readonly effect_id: string }>`
@@ -530,6 +555,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
               updated_at = ${now},
               last_error = ${reason}
             WHERE thread_id = ${threadId}
+              AND (${runId ?? null} IS NULL OR json_extract(payload_json, '$.runId') = ${runId ?? null})
               AND status IN ('pending', 'running')
               AND effect_type IN ${sql.in(effectTypes)}
               AND NOT (effect_type = 'provider-turn.steer'

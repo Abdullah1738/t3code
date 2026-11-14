@@ -257,7 +257,6 @@ env.mkdir(parents=True, exist_ok=True)
 fd, tmp = tempfile.mkstemp(prefix='.crpko-devops-', dir=env)
 try:
     with os.fdopen(fd, 'w') as stream:
-        stream.write('export PATH="/usr/local/bin:$PATH"\n')
         if sys.argv[2] == 'true':
             stream.write('export TERRAFORM_PROVIDER_MIRROR="$HOME/.offbox/tf-provider-mirror"\n')
         else:

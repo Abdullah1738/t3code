@@ -107,9 +107,27 @@ it.effect(
             worker,
             "cardThread",
           );
-          yield* http.post("/cards/toy:1/asks/q2/hand", { always: true });
-          const second = (yield* fake.evaluators).at(-1)!;
-          assert.include(second.messages.join("\n"), "He added no words of his own.");
+          const count = (yield* fake.evaluators).length;
+          const second = yield* http.post("/cards/toy:1/asks/q2/hand", { always: true });
+          assert.strictEqual(second.status, 200);
+          // #1156 / 31a19ca67b queues the replacement for the fake's old evaluator
+          // behind the card's spawn cap. The every-time request must retain its words.
+          assert.strictEqual(second.body.evaluator.started, false);
+          assert.isNull(second.body.evaluator.threadId);
+          assert.include(second.body.evaluator.error, "Evaluator queued");
+          assert.isUndefined(second.body.ask.handedThreadId);
+          assert.strictEqual(kanbanAskWaitsOn(second.body.ask), "evaluator");
+          assert.strictEqual(second.body.ask.handedAlways, true);
+          assert.strictEqual((yield* fake.evaluators).length, count);
+          const sql = yield* SqlClient.SqlClient;
+          const queued = yield* sql<{ text: string }>`
+            SELECT json_extract(json, '$.purpose.text') AS text
+            FROM ardud_kanban_evaluator_queue
+            WHERE done_at IS NULL AND json_extract(json, '$.purpose.kind') = 'request'
+          `;
+          assert.strictEqual(queued.length, 1);
+          assert.include(queued[0]!.text, "The ask: q2 on card toy:1");
+          assert.include(queued[0]!.text, "He added no words of his own.");
           const taken = yield* http.post("/cards/toy:1/asks/q2/hand", { action: "take_back" });
           assert.isUndefined(taken.body.ask.handedAlways);
           assert.isUndefined(taken.body.ask.handedThreadId);

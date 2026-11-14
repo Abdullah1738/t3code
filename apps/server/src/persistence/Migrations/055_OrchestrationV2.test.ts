@@ -41,6 +41,7 @@ layer("055_OrchestrationV2", (it) => {
         [65, "CodexUsageNativeTurnIndex"],
         [66, "CallerActiveRunIndex"],
         [67, "EffectOutboxSettledIndex"],
+        [68, "ShellRunLookupIndexes"],
       ]);
       assert.deepStrictEqual(yield* runMigrations(), []);
 
@@ -74,6 +75,7 @@ layer("055_OrchestrationV2", (it) => {
         { migration_id: 65, name: "CodexUsageNativeTurnIndex" },
         { migration_id: 66, name: "CallerActiveRunIndex" },
         { migration_id: 67, name: "EffectOutboxSettledIndex" },
+        { migration_id: 68, name: "ShellRunLookupIndexes" },
       ]);
 
       const tables = yield* sql<{ readonly name: string }>`

@@ -156,8 +156,11 @@ node --test "$D/supervisor.test.mjs"
 
 The tests use temporary state, real OS lease primitives, and injected fake
 router/control/Telegram functions only; they do not call the live router,
-create a thread, deliver notifications, start OAuth, or mutate accounts. The
-normal `robob-watch test` uses a scratch directory and is deliberately
+create a thread, deliver notifications, start OAuth, or mutate accounts.
+Both `node --test` and `bun test` support this suite. Cases requiring the real
+lease primitive run only on macOS with `/usr/bin/lockf`; other hosts report
+explicit skips while portable cases still run. Run on macOS for full coverage.
+The normal `robob-watch test` uses a scratch directory and is deliberately
 refused: a copied check must never accidentally launch or alert. Do not use
 `fire-test` for this watcher. The temporary deployment hold has been removed;
 do not run the live check by hand or manufacture a real auth failure to test it.
@@ -219,15 +222,18 @@ The shell records `sh` in `.phase`, retaining the previous marker for Node to
 report. Node records `start`, `load`, `providers`, `save`, `telegram:<command>`
 and `done`. Provider subphases distinguish credential reads, response headers,
 and response body parsing. Each marker is a best-effort plain write without
-fsync; it is diagnostic state, not a journal or a recovery lease. A failed or
-killed run leaves its last phase for the next run to report, with its age.
+fsync; it is diagnostic state, not a journal or a recovery lease. A run that
+fails by itself, including at the self-deadline, writes `failed` with `at`
+naming the phase where it failed. Only a run killed before it could write its
+exit marker leaves its last working phase for the next run to report as stalled,
+with its age.
 Failure messages and phase durations use synchronous stderr writes so the
 runner can retain them even when it kills a slow check. The error summary is
 last so it survives the runner's 500-character stderr tail. Because the runner
 discards successful stderr, a previous-stall warning is also appended directly
 to the watcher log. Recovery remains a successful exit: reporting evidence must
 not spend another failure or pause the watcher at its failure limit. The `done`
-marker prevents the warning from repeating after recovery.
+and `failed` markers prevent a stall warning on the next run.
 
 The 45-second timer includes shell-to-Node startup when invoked by `check.sh`.
 It does not unref; an unresolved provider promise still fails with the phase

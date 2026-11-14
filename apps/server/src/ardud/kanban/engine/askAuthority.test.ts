@@ -137,14 +137,18 @@ it.effect(
           const mine = yield* makeHttp;
           const snoozed = yield* mine.post("/cards/toy:1/asks/q1/snooze", { until: null });
           assert.strictEqual(snoozed.status, 200);
+          // #1158 / PR #49: posting first would close q1 as a text answer.
+          const picked = yield* mine.post(`/discussions/${discussion.id}/answer`, pick);
+          assert.strictEqual(picked.status, 200);
+          const approved = askOf((yield* kanban.card(card.id)).card).answer!;
+          assert.strictEqual(approved.verdict, "approved");
+          assert.deepStrictEqual(approved.by, { _tag: "owner" });
           const posted = yield* mine.post(`/discussions/${discussion.id}/messages`, {
             text: "Looking at it.",
           });
           assert.strictEqual(posted.status, 200);
           assert.strictEqual(posted.body.author._tag, "owner");
-          const picked = yield* mine.post(`/discussions/${discussion.id}/answer`, pick);
-          assert.strictEqual(picked.status, 200);
-          assert.strictEqual(askOf((yield* kanban.card(card.id)).card).answer?.verdict, "approved");
+          assert.deepStrictEqual(askOf((yield* kanban.card(card.id)).card).answer, approved);
         }),
       ).pipe(Effect.provide(testLayer(fake.layer)));
     }),
@@ -202,13 +206,17 @@ it.effect("over the socket, the same writes are refused with the board's typed d
         {} as KanbanScriptsShape,
         sessionOf({ _tag: "owner" }),
       );
+      // #1158 / PR #49: posting first would close q1 as a text answer.
+      yield* mine[M.answer](pick);
+      const approved = askOf((yield* kanban.card(card.id)).card).answer!;
+      assert.strictEqual(approved.verdict, "approved");
+      assert.deepStrictEqual(approved.by, { _tag: "owner" });
       const posted = yield* mine[M.messagePost]({
         discussionId: discussion.id,
         blocks: [{ _tag: "md", text: "Looking at it." }],
       });
       assert.strictEqual(posted.author._tag, "owner");
-      yield* mine[M.answer](pick);
-      assert.strictEqual(askOf((yield* kanban.card(card.id)).card).answer?.verdict, "approved");
+      assert.deepStrictEqual(askOf((yield* kanban.card(card.id)).card).answer, approved);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );

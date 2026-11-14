@@ -25,7 +25,7 @@ const PREFIX = "/api/ardud/control";
  *   rootThreadId: string, worktreePath: string | null,
  *   pendingRequest: { requestId: string, kind: "approval" | "question", requestKind: string } | null,
  *   latestMessage: { messageId: string, role: string, text: string } | null,
- *   createdAt: string, updatedAt: string,
+ *   archived: boolean, archivedAt: string | null, createdAt: string, updatedAt: string,
  * }} ThreadSummary
  * @typedef {{
  *   type: string, threadId?: string, runId?: string | null, status?: string, state?: ThreadState,
@@ -170,9 +170,9 @@ export class ControlClient {
 
   /**
    * @param {{ origin?: string, active?: boolean, state?: string, updatedSince?: string | number,
-   *   projectId?: string, creationSource?: string, parentThreadId?: string, includeSubagents?: boolean, archived?: boolean, limit?: number,
+   *   projectId?: string, creationSource?: string, parentThreadId?: string, includeSubagents?: boolean, archived?: boolean, limit?: number, cursor?: string,
    *   ids?: string[] }} [filters]
-   * @returns {Promise<{ total: number, threads: ThreadSummary[] }>}
+   * @returns {Promise<{ total: number, threads: ThreadSummary[], nextCursor: string | null }>}
    */
   listThreads(filters = {}) {
     const query = new URLSearchParams();

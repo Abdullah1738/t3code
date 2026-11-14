@@ -1,6 +1,7 @@
 import { expect, it } from "@effect/vitest";
 import {
   CommandId,
+  EventId,
   type ModelSelection,
   MessageId,
   NodeId,
@@ -43,6 +44,8 @@ import * as Orchestrator from "./Orchestrator.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
+import * as ProjectionStore from "./ProjectionStore.ts";
+import { idleThreadProjection, liveThreadShell } from "../mcp/McpToolAccess.testkit.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import { DispatchModeLimit, type DispatchModeRefusal } from "./DispatchModeLimit.ts";
 
@@ -2009,5 +2012,201 @@ it.effect.each([
     yield* service.settleAfterRun({ projectId, threadId, runId });
 
     expect(dispatched).toEqual(settles ? ["thread.settle"] : []);
+  }),
+);
+
+it.effect(
+  "project listings page the memory store without losing a thread updated between batches",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const projectId = ProjectId.make("project:paged-list");
+      const at = DateTime.makeUnsafe("2026-11-13T00:00:00Z");
+      const ids = Array.from({ length: 205 }, (_, index) =>
+        ThreadId.make(`thread:${String(index).padStart(3, "0")}`),
+      );
+      for (const [index, id] of ids.entries()) {
+        const thread = {
+          ...idleThreadProjection(liveThreadShell(id)).thread,
+          projectId,
+          updatedAt: DateTime.add(at, { seconds: index }),
+          lineage: {
+            rootThreadId: id,
+            parentThreadId: null,
+            relationshipToParent: index % 2 === 0 ? ("subagent" as const) : null,
+          },
+        };
+        yield* store.apply({
+          id: EventId.make(`event:page:${index}`),
+          type: "thread.created",
+          threadId: id,
+          occurredAt: at,
+          payload: thread,
+        });
+      }
+      const reads: Array<string | undefined> = [];
+      let changed = false;
+      const threads = yield* ThreadManagementService.ThreadManagementService.pipe(
+        Effect.provide(
+          ThreadManagementService.layer.pipe(
+            Layer.provide(
+              Layer.mergeAll(
+                Layer.mock(Orchestrator.OrchestratorV2)({
+                  getShellSnapshot: (options) =>
+                    Effect.gen(function* () {
+                      expect(options?.projectId).toEqual(projectId);
+                      expect(options?.location).toEqual("active");
+                      expect(options?.limit).toEqual(100);
+                      reads.push(options?.afterThreadId);
+                      if (!changed && options?.afterThreadId === "thread:099") {
+                        changed = true;
+                        const { thread } = yield* store.getThreadRecords(ids[150]!, []);
+                        yield* store.apply({
+                          id: EventId.make("event:page:update"),
+                          type: "thread.metadata-updated",
+                          threadId: thread.id,
+                          occurredAt: at,
+                          payload: { ...thread, updatedAt: DateTime.add(at, { seconds: 999 }) },
+                        });
+                      }
+                      return yield* store.getShellSnapshot(options);
+                    }).pipe(Effect.orDie),
+                }),
+                Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({}),
+                Layer.mock(LegacyV1ThreadImporter.LegacyV1ThreadImporter)({}),
+                Layer.mock(CommandReceiptStore.CommandReceiptStoreV2)({}),
+                ServerSettings.layerTest(),
+              ),
+            ),
+          ),
+        ),
+      );
+      const all = yield* threads.listProjectThreads({ projectId, includeSubagents: true });
+      expect(reads).toEqual([undefined, "thread:099", "thread:199"]);
+      expect(all.map((thread) => thread.id)).toEqual([
+        ids[150],
+        ...ids.toReversed().filter((id) => id !== ids[150]),
+      ]);
+      expect(new Set(all.map((thread) => thread.id)).size).toEqual(205);
+      reads.length = 0;
+      const roots = yield* threads.listProjectThreads({ projectId, includeSubagents: false });
+      expect(roots.map((thread) => thread.id)).toEqual(
+        all
+          .filter((thread) => thread.lineage.relationshipToParent !== "subagent")
+          .map((thread) => thread.id),
+      );
+      const empty = yield* store.getShellSnapshot({
+        projectId,
+        location: "active",
+        limit: 100,
+        afterThreadId: ids.at(-1)!,
+      });
+      expect(empty.threads).toEqual([]);
+    }).pipe(Effect.provide(ProjectionStore.layerMemory)),
+);
+
+it.effect.each(["accepted", "rejected"] as const)(
+  "rechecks a receipt that becomes %s between the missing read and the dispatch fence",
+  (status) =>
+    Effect.gen(function* () {
+      const read = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const commandId = CommandId.make("command:receipt-race");
+      const receipt: CommandReceiptStore.CommandReceiptV2 = {
+        commandId,
+        threadId: ThreadId.make("parent:receipt-race"),
+        commandType: "delegated_task.request",
+        acceptedAt: DateTime.makeUnsafe(0),
+        resultSequence: 1,
+        status,
+        error: status === "rejected" ? "Parent stopped." : null,
+      };
+      let saved = false;
+      let reads = 0;
+      const layerTest = ThreadManagementService.layer.pipe(
+        Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+        Layer.provide(Layer.mock(Orchestrator.OrchestratorV2)({})),
+        Layer.provide(ServerSettings.layerTest()),
+        Layer.provide(
+          Layer.mock(CommandReceiptStore.CommandReceiptStoreV2)({
+            getByCommandId: () =>
+              Effect.gen(function* () {
+                reads++;
+                const snapshot = saved ? Option.some(receipt) : Option.none();
+                if (reads === 1) {
+                  yield* Deferred.succeed(read, undefined);
+                  yield* Deferred.await(release);
+                }
+                return snapshot;
+              }),
+          }),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* ThreadManagementService.ThreadManagementService;
+        const reading = yield* service.getDelegationCommandState(commandId).pipe(Effect.forkChild);
+        yield* Deferred.await(read);
+        saved = true;
+        yield* Deferred.succeed(release, undefined);
+        expect(yield* Fiber.join(reading)).toEqual(receipt);
+        expect(reads).toBe(2);
+      }).pipe(Effect.provide(layerTest));
+    }),
+);
+
+it.effect("reports a delegation queued behind a receipt-read fence as pending", () =>
+  Effect.gen(function* () {
+    const held = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const parent = ThreadId.make("parent:read-fence-queue");
+    const commandId = CommandId.make("command:read-fence-queue");
+    let reads = 0;
+    const layerTest = ThreadManagementService.layer.pipe(
+      Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+      Layer.provide(ServerSettings.layerTest()),
+      Layer.provide(
+        Layer.mock(Orchestrator.OrchestratorV2)({
+          getThreadRecords: () => Effect.succeed(idleThreadProjection(liveThreadShell(parent))),
+          dispatch: () => Effect.succeed({ sequence: 0, storedEvents: [] }),
+        }),
+      ),
+      Layer.provide(
+        Layer.mock(CommandReceiptStore.CommandReceiptStoreV2)({
+          getByCommandId: () =>
+            Effect.gen(function* () {
+              reads++;
+              if (reads === 2) {
+                yield* Deferred.succeed(held, undefined);
+                yield* Deferred.await(release);
+              }
+              return Option.none();
+            }),
+        }),
+      ),
+    );
+    yield* Effect.gen(function* () {
+      const service = yield* ThreadManagementService.ThreadManagementService;
+      const reading = yield* service.getDelegationCommandState(commandId).pipe(Effect.forkChild);
+      yield* Deferred.await(held);
+      const creating = yield* service
+        .dispatch({
+          type: "delegated_task.request",
+          commandId,
+          parentThreadId: parent,
+          parentRunId: RunId.make("run:read-fence-queue"),
+          parentNodeId: NodeId.make("node:read-fence-queue"),
+          task: "Review",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          createdBy: "agent",
+          creationSource: "mcp",
+        })
+        .pipe(Effect.forkChild);
+      yield* TestClock.adjust(0);
+      yield* Deferred.succeed(release, undefined);
+      expect(yield* Fiber.join(reading)).toEqual({ status: "pending" });
+      yield* Fiber.join(creating);
+    }).pipe(Effect.provide(layerTest));
   }),
 );

@@ -91,6 +91,15 @@ def scan(roots):
     return {"roots": inventory, "findings": sorted(findings, key=lambda f: f["path"])}
 
 
+if os.environ.get("WATCH_ATTEMPT"):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "helpers"))
+    from watch_admission import admitted_check
+else:
+    def admitted_check(fn):
+        return fn
+
+
+@admitted_check
 def save(path, state):
     temporary = path.with_suffix(".new")
     with temporary.open("w") as handle:
@@ -125,7 +134,8 @@ def check(watch_dir, report, run_id):
     if pending:
         ack = watch_dir / ".run-ok"
         acknowledged = ack.exists() and ack.read_text().strip() == pending["run"]
-        owned = (runner.get("pending") or {}).get("event") == pending["event"]
+        owned = ((runner.get("pending") or {}).get("event") == pending["event"]
+                 or pending["event"] in (runner.get("batch") or {}).get("events", []))
         # The runner can crash after persisting pending but before writing .run-ok,
         # then deliver before it calls this check again. This watcher's fires counter
         # only advances on delivery; retain its original value across outbox replays.

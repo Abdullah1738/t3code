@@ -1,3 +1,4 @@
+import { interruptionProps } from "./analyticsInterruption.ts";
 import type { AnalyticsEvent } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import { AnalyticsOriginKind } from "./RpcInstrumentation.ts";
@@ -60,6 +61,7 @@ export const makeAnalyticsLogger = (analytics: Analytics.Analytics["Service"]) =
       props: {
         span: label(span?.name, "server"),
         errorTag,
+        ...interruptionProps(Cause.fromReasons(reasons)),
         originKind: fiber.getRef(AnalyticsOriginKind),
         reason: logLevel.toLowerCase(),
       },

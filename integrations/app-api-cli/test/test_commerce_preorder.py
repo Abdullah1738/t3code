@@ -3,6 +3,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+import order_card
 from unittest.mock import patch,Mock
 from noon_checkout import AccountHome,fingerprint
 from noon_auth_lifecycle import AuthSnapshot
@@ -23,6 +24,7 @@ class PreorderFlowTests(unittest.TestCase):
     def setUp(self):
         approve_test_flows(self)
 
+    @patch.multiple(order_card, LAST4='2342', NETWORK='mastercard')
     def test_native_preorder_reserves_before_wire_and_recovery_never_replays(self):
         fixture=fixtures.ReviewTests();fixture.setUp();fixture.row['prepaidPaymentMisc']['isCvvRequired']=True
         with tempfile.TemporaryDirectory() as temp,patch.object(c.journal,'ROOT',Path(temp).resolve()/'commerce'), \

@@ -3,6 +3,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import * as NodeNet from "node:net";
 import * as NetService from "@t3tools/shared/Net";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { assert, describe, it } from "@effect/vitest";
@@ -21,6 +22,7 @@ import {
   devPortProbeHosts,
   findFirstAvailableOffset,
   isBrowserAllowedPort,
+  makeDefaultCheckPortAvailability,
   resolveModePortOffsets,
   resolveOffset,
   runDevRunnerWithInput,
@@ -674,6 +676,109 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
           [13_773, "0.0.0.0"],
           [13_773, "::"],
         ]);
+      }),
+    );
+  });
+
+  describe("makeDefaultCheckPortAvailability", () => {
+    it.effect.each(["server", "web"] as const)(
+      "rejects a wildcard listener and skips its offset for the %s port",
+      (role) =>
+        Effect.acquireUseRelease(
+          Effect.promise(
+            () =>
+              new Promise<NodeNet.Server>((resolve, reject) => {
+                const server = NodeNet.createServer((socket) => socket.end());
+                server.once("error", reject);
+                server.listen(0, "0.0.0.0", () => resolve(server));
+              }),
+          ),
+          (server) =>
+            Effect.gen(function* () {
+              const address = server.address();
+              assert.ok(address !== null && typeof address === "object");
+              const port = address.port;
+              let bindCount = 0;
+              const net = {
+                ...NetService.make(),
+                // BSD permits a loopback bind beside some wildcard listeners.
+                canListenOnHost: () =>
+                  Effect.sync(() => {
+                    bindCount += 1;
+                    return true;
+                  }),
+              };
+              const check = makeDefaultCheckPortAvailability(undefined);
+              const layer = Layer.succeed(NetService.NetService, net);
+
+              assert.equal(yield* check(port, role).pipe(Effect.provide(layer)), false);
+              assert.equal(bindCount, 0);
+
+              const basePort = role === "web" ? 5733 : 13_773;
+              const startOffset = port - basePort;
+              const offsets = yield* resolveModePortOffsets({
+                mode: role === "web" ? "dev:web" : "dev:server",
+                startOffset,
+                hasExplicitServerPort: false,
+                hasExplicitDevUrl: false,
+              }).pipe(Effect.provide(layer));
+              const offset = role === "web" ? offsets.webOffset : offsets.serverOffset;
+
+              assert.ok(offset > startOffset);
+              assert.equal(yield* check(basePort + offset, role).pipe(Effect.provide(layer)), true);
+            }),
+          (server) =>
+            Effect.promise(() => new Promise<void>((resolve) => server.close(() => resolve()))),
+        ),
+    );
+
+    it.effect.each(["server", "web"] as const)(
+      "stops before binding when only IPv6 has a listener for the %s port",
+      (role) =>
+        Effect.gen(function* () {
+          const calls: string[] = [];
+          const net = {
+            ...NetService.make(),
+            hasListenerOnHost: (_port: number, host: string) =>
+              Effect.sync(() => {
+                calls.push(host);
+                return host === "::1";
+              }),
+            canListenOnHost: () => Effect.die("must not bind an occupied port"),
+          };
+
+          const available = yield* makeDefaultCheckPortAvailability(undefined)(13_773, role).pipe(
+            Effect.provide(Layer.succeed(NetService.NetService, net)),
+          );
+
+          assert.equal(available, false);
+          assert.deepStrictEqual(calls, ["127.0.0.1", "::1"]);
+        }),
+    );
+
+    it.effect.each([
+      ["server", ["127.0.0.1", "::1", "192.168.1.10"]],
+      ["web", ["127.0.0.1", "::1"]],
+    ] as const)("keeps the configured bind host probes for the %s port", ([role, hosts]) =>
+      Effect.gen(function* () {
+        const bound: string[] = [];
+        const net = {
+          ...NetService.make(),
+          hasListenerOnHost: () => Effect.succeed(false),
+          canListenOnHost: (_port: number, host: string) =>
+            Effect.sync(() => {
+              bound.push(host);
+              return host !== "192.168.1.10";
+            }),
+        };
+
+        const available = yield* makeDefaultCheckPortAvailability("192.168.1.10")(
+          13_773,
+          role,
+        ).pipe(Effect.provide(Layer.succeed(NetService.NetService, net)));
+
+        assert.equal(available, role === "web");
+        assert.deepStrictEqual(bound, [...hosts]);
       }),
     );
   });

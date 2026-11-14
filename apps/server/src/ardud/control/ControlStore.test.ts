@@ -10,6 +10,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as Tracer from "effect/Tracer";
 
 import * as Sqlite from "../../persistence/Sqlite.ts";
 import * as ExecutionIdentity from "../identity/ExecutionIdentity.ts";
@@ -350,3 +351,160 @@ describe("ControlStore native ids", () => {
     ),
   );
 });
+
+const candidateFilter: ControlStore.ThreadCandidateFilter = {
+  since: null,
+  location: "active",
+  includeSubagents: true,
+  parentThreadId: null,
+  projectId: null,
+};
+
+it.effect(
+  "candidate pages and totals never fetch thread payloads or sort the full thread table",
+  () =>
+    run(
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const store = yield* ControlStore.ControlStore;
+        const statements: string[] = [];
+        const tracer = Tracer.make({
+          span(options) {
+            const span = new Tracer.NativeSpan(options);
+            const end = span.end.bind(span);
+            span.end = (time, exit) => {
+              end(time, exit);
+              const query = span.attributes.get("db.query.text");
+              if (
+                typeof query === "string" &&
+                query.includes("ardud_control_thread_candidates_desc_idx")
+              )
+                statements.push(query);
+            };
+            return span;
+          },
+        });
+        const first = yield* store
+          .threadCandidatePage({ ...candidateFilter, limit: 1 })
+          .pipe(Effect.withTracer(tracer));
+        assert.lengthOf(first, 1);
+        assert.equal(
+          yield* store.threadCandidateCount(candidateFilter).pipe(Effect.withTracer(tracer)),
+          2,
+        );
+        const second = yield* store
+          .threadCandidatePage({ ...candidateFilter, after: first[0]!, limit: 1 })
+          .pipe(Effect.withTracer(tracer));
+        assert.lengthOf(second, 1);
+        assert.notEqual(first[0]?.threadId, second[0]?.threadId);
+        assert.lengthOf(
+          yield* store.threadCandidatePage({ ...candidateFilter, after: second[0]!, limit: 1 }),
+          0,
+        );
+        // Covering-index access matters more than a small fixture's wall-clock time: a
+        // payload read here reproduces the 13 s scan on large history rows.
+        const info = yield* sql<{
+          cid: number;
+          name: string;
+        }>`PRAGMA table_info(orchestration_v2_projection_threads)`;
+        const payloadColumn = info.find((column) => column.name === "payload_json")!.cid;
+        const root = (yield* sql<{
+          rootpage: number;
+        }>`SELECT rootpage FROM sqlite_schema WHERE name = 'orchestration_v2_projection_threads'`)[0]!
+          .rootpage;
+        assert.lengthOf(statements, 3);
+        for (const query of statements) {
+          const bindings = Array.from({ length: (query.match(/\?/g) ?? []).length }, () => null);
+          const plan = yield* sql.unsafe<{ detail: string }>(
+            `EXPLAIN QUERY PLAN ${query}`,
+            bindings,
+          );
+          assert.isTrue(
+            plan.some((row) => row.detail.includes("ardud_control_thread_candidates_desc_idx")),
+          );
+          assert.isFalse(plan.some((row) => row.detail.includes("TEMP B-TREE")));
+          const code = yield* sql.unsafe<{ opcode: string; p1: number; p2: number; p3: number }>(
+            `EXPLAIN ${query}`,
+            bindings,
+          );
+          const tableCursors = code
+            .filter((op) => op.opcode === "OpenRead" && op.p2 === root)
+            .map((op) => op.p1);
+          assert.isFalse(
+            code.some(
+              (op) =>
+                op.opcode === "Column" && tableCursors.includes(op.p1) && op.p2 === payloadColumn,
+            ),
+            query,
+          );
+          if (query.includes("ORDER BY")) assert.match(query, /LIMIT \?/);
+        }
+      }),
+    ),
+);
+
+it.effect("candidate cursor pages handle tied dates, filters and a capped page size", () =>
+  run(
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* ControlStore.ControlStore;
+      const timestamp = "2026-03-01T00:00:00.000Z";
+      for (let i = 0; i < 270; i++) {
+        const id = `page-${String(i).padStart(3, "0")}`;
+        yield* sql`INSERT INTO orchestration_v2_projection_threads ${sql.insert({
+          ...threadRow(id, null),
+          updated_at: timestamp,
+          payload_json: JSON.stringify({
+            archivedAt: null,
+            creationSource: "provider",
+            lineage: {
+              relationshipToParent: "subagent",
+              parentThreadId: "parent",
+              rootThreadId: "root",
+            },
+          }),
+        })}`;
+      }
+      const filter = {
+        ...candidateFilter,
+        since: Date.parse(timestamp) - 1,
+        parentThreadId: "parent",
+        creationSources: ["provider"],
+      };
+      assert.equal(yield* store.threadCandidateCount(filter), 270);
+      assert.equal(
+        yield* store.threadCandidateCount({ ...filter, since: Date.parse(timestamp) }),
+        0,
+      );
+      assert.equal(yield* store.threadCandidateCount({ ...filter, creationSources: [] }), 0);
+      assert.equal(yield* store.threadCandidateCount({ ...filter, projectId: "absent" }), 0);
+      assert.equal(yield* store.threadCandidateCount({ ...filter, location: "archive" }), 0);
+      assert.equal(
+        yield* store.threadCandidateCount({
+          ...filter,
+          parentThreadId: null,
+          includeSubagents: false,
+        }),
+        0,
+      );
+      const ids: string[] = [];
+      let after: ControlStore.ThreadCandidateCursor | undefined;
+      do {
+        const page = yield* store.threadCandidatePage({
+          ...filter,
+          ...(after === undefined ? {} : { after }),
+          limit: 500,
+        });
+        assert.isAtMost(page.length, 128);
+        ids.push(...page.map((row) => row.threadId));
+        const last = page.at(-1);
+        after =
+          last === undefined ? undefined : { threadId: last.threadId, updatedAt: last.updatedAt };
+      } while (after !== undefined);
+      assert.lengthOf(ids, 270);
+      assert.equal(new Set(ids).size, 270);
+      assert.equal(ids[0], "page-269");
+      assert.equal(ids.at(-1), "page-000");
+    }),
+  ),
+);

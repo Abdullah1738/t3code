@@ -3428,7 +3428,9 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                 );
               }
               turn.interrupted = true;
-              for (const controller of commandControllers.get(sessionId) ?? []) controller.abort();
+              if (interruptInput.stopBackgroundWork !== false)
+                for (const controller of commandControllers.get(sessionId) ?? [])
+                  controller.abort();
               const admissionWasPending = turn.admissionPending;
               cancelOpenCodePromptAdmission(turn, state!.nextAdmissionGeneration++);
               turn.admissionAbortController?.abort();
@@ -3455,7 +3457,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
               );
               // Root abort does not stop child sessions. Report incomplete cleanup
               // even if the root has already emitted its terminal event.
-              yield* abortDescendants(sessionId);
+              if (interruptInput.stopBackgroundWork !== false) yield* abortDescendants(sessionId);
             },
             (effect, interruptInput) =>
               effect.pipe(

@@ -90,6 +90,7 @@ const runFixtureProvider = Effect.fn("runOrchestratorReplayFixture")(function* <
   Transcript extends ProviderReplayTranscript,
   Error,
 >(input: {
+  readonly afterProviderEvent?: Effect.Effect<void>;
   readonly fixtureName: string;
   readonly buildInput: () => OrchestratorFixtureInput;
   readonly driver: ProviderOrchestratorReplayVariant;
@@ -129,11 +130,12 @@ const runFixtureProvider = Effect.fn("runOrchestratorReplayFixture")(function* <
     },
   };
 
-  const result = yield* runOrchestratorV2ProviderReplayScenario(
-    scenario,
-    input.harness,
-    input.driver.runContinuationWorker === true ? { runContinuationWorker: true } : {},
-  ).pipe(provideDeterministicTestRuntime);
+  const result = yield* runOrchestratorV2ProviderReplayScenario(scenario, input.harness, {
+    ...(input.driver.runContinuationWorker === true ? { runContinuationWorker: true } : {}),
+    ...(input.afterProviderEvent === undefined
+      ? {}
+      : { afterProviderEvent: input.afterProviderEvent }),
+  }).pipe(provideDeterministicTestRuntime);
   input.driver.assertOutput(result, transcript);
   assertProviderNativeSubagentRootTurns(result);
   const expectedAbsentWorkspacePaths = input.driver.expectedAbsentWorkspacePaths;
@@ -173,6 +175,7 @@ const runFixtureProvider = Effect.fn("runOrchestratorReplayFixture")(function* <
 });
 
 function runFixtureProviderWithRegisteredHarness(input: {
+  readonly afterProviderEvent?: Effect.Effect<void>;
   readonly fixtureName: string;
   readonly buildInput: () => OrchestratorFixtureInput;
   readonly driver: ProviderOrchestratorReplayVariant;
@@ -245,6 +248,18 @@ describe("orchestrator replay fixtures", () => {
       driver: provider,
     }),
   );
+
+  it.effect("drains nested OpenCode background output across provider event handoffs", () => {
+    const fixture = ORCHESTRATOR_REPLAY_FIXTURES.find(
+      (candidate) => candidate.name === "opencode2_nested_background",
+    )!;
+    return runFixtureProviderWithRegisteredHarness({
+      fixtureName: fixture.name,
+      buildInput: fixture.buildInput,
+      driver: fixture.providers[0]!,
+      afterProviderEvent: Effect.yieldNow,
+    });
+  });
 
   const steeringFixture = ORCHESTRATOR_REPLAY_FIXTURES.find(
     (fixture) => fixture.name === "message_steering",

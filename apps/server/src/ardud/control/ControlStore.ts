@@ -83,15 +83,29 @@ export interface ControlStoreShape {
     }>,
     ControlStoreError
   >;
-  /**
-   * Undeleted threads whose updated_at sorts after `sinceIso`, newest first (ties by thread id, as the full listing orders them), with the fields
-   * listings filter on, from ardud_v2_threads_updated_idx: no shell is built. A string range,
-   * so callers widen it and compare `updatedAt` exactly.
-   */
-  readonly threadsUpdatedSince: (
-    /** `null` lists every live thread's light row (no time filter). */
-    sinceIso: string | null,
+  readonly threadCandidatePage: (
+    options: ThreadCandidateFilter & {
+      readonly after?: ThreadCandidateCursor;
+      readonly limit: number;
+    },
   ) => Effect.Effect<ReadonlyArray<ControlThreadRow>, ControlStoreError>;
+  readonly threadCandidateCount: (
+    filter: ThreadCandidateFilter,
+  ) => Effect.Effect<number, ControlStoreError>;
+}
+
+export interface ThreadCandidateFilter {
+  readonly since: number | null;
+  readonly location: "active" | "archive";
+  readonly includeSubagents: boolean;
+  readonly parentThreadId: string | null;
+  readonly projectId: string | null;
+  readonly creationSources?: ReadonlyArray<string>;
+}
+
+export interface ThreadCandidateCursor {
+  readonly updatedAt: string;
+  readonly threadId: string;
 }
 
 export interface ControlThreadRow {
@@ -343,45 +357,82 @@ export const make = Effect.gen(function* () {
     }));
   });
 
-  const threadsUpdatedSince: ControlStoreShape["threadsUpdatedSince"] = (sinceIso) =>
-    sql<{
-      readonly thread_id: string;
-      readonly project_id: string;
-      readonly updated_at: string;
-      readonly archived: number;
-      readonly relationship_to_parent: string | null;
-      readonly parent_thread_id: string | null;
-      readonly root_thread_id: string | null;
-      readonly creation_source: string | null;
-    }>`
-      SELECT thread_id, project_id, updated_at,
-        json_extract(payload_json, '$.archivedAt') IS NOT NULL AS archived,
-        json_extract(payload_json, '$.lineage.relationshipToParent') AS relationship_to_parent,
-        json_extract(payload_json, '$.lineage.parentThreadId') AS parent_thread_id,
-        json_extract(payload_json, '$.lineage.rootThreadId') AS root_thread_id,
-        json_extract(payload_json, '$.creationSource') AS creation_source
-      FROM orchestration_v2_projection_threads
-      WHERE deleted_at IS NULL${sinceIso === null ? sql`` : sql` AND updated_at > ${sinceIso}`}
-      ORDER BY updated_at DESC, thread_id ASC
-    `.pipe(
-      NodeSqliteClient.readOnly,
-      Effect.map((rows) =>
-        rows.map((row): ControlThreadRow => ({
-          threadId: row.thread_id,
-          projectId: row.project_id,
-          updatedAt: row.updated_at,
-          archived: Boolean(row.archived),
-          relationshipToParent: row.relationship_to_parent,
-          parentThreadId: row.parent_thread_id,
-          rootThreadId: row.root_thread_id,
-          creationSource: row.creation_source,
-        })),
-      ),
-      Effect.mapError(fail("read-updated-threads")),
-    );
+  const candidatePredicate = (filter: ThreadCandidateFilter) => sql`
+    deleted_at IS NULL
+    AND (json_extract(payload_json, '$.archivedAt') IS NOT NULL) = ${filter.location === "archive" ? 1 : 0}
+    ${
+      filter.since === null
+        ? sql``
+        : sql`AND CAST(ROUND(unixepoch(updated_at, 'subsec') * 1000) AS INTEGER) > ${filter.since}`
+    }
+    ${filter.includeSubagents || filter.parentThreadId !== null ? sql`` : sql`AND json_extract(payload_json, '$.lineage.relationshipToParent') IS NOT 'subagent'`}
+    ${filter.parentThreadId === null ? sql`` : sql`AND json_extract(payload_json, '$.lineage.parentThreadId') = ${filter.parentThreadId}`}
+    ${filter.projectId === null ? sql`` : sql`AND project_id = ${filter.projectId}`}
+    ${filter.creationSources === undefined ? sql`` : filter.creationSources.length === 0 ? sql`AND 0` : sql`AND json_extract(payload_json, '$.creationSource') IN ${sql.in(filter.creationSources)}`}
+  `;
+
+  const threadCandidatePage: ControlStoreShape["threadCandidatePage"] = Effect.fn(
+    "ControlStore.threadCandidatePage",
+  )(
+    function* (options) {
+      const rows = yield* sql<{
+        readonly thread_id: string;
+        readonly project_id: string;
+        readonly updated_at: string;
+        readonly archived: number;
+        readonly relationship_to_parent: string | null;
+        readonly parent_thread_id: string | null;
+        readonly root_thread_id: string | null;
+        readonly creation_source: string | null;
+      }>`
+        SELECT thread_id, project_id, updated_at,
+          json_extract(payload_json, '$.archivedAt') IS NOT NULL AS archived,
+          json_extract(payload_json, '$.lineage.relationshipToParent') AS relationship_to_parent,
+          json_extract(payload_json, '$.lineage.parentThreadId') AS parent_thread_id,
+          json_extract(payload_json, '$.lineage.rootThreadId') AS root_thread_id,
+          json_extract(payload_json, '$.creationSource') AS creation_source
+        FROM orchestration_v2_projection_threads INDEXED BY ardud_control_thread_candidates_desc_idx
+        WHERE ${candidatePredicate(options)}
+          ${
+            options.after === undefined
+              ? sql``
+              : sql`AND CAST(ROUND(unixepoch(updated_at, 'subsec') * 1000) AS INTEGER) <= ${DateTime.toEpochMillis(DateTime.makeUnsafe(options.after.updatedAt))}
+            AND (CAST(ROUND(unixepoch(updated_at, 'subsec') * 1000) AS INTEGER) < ${DateTime.toEpochMillis(DateTime.makeUnsafe(options.after.updatedAt))} OR thread_id < ${options.after.threadId})`
+          }
+        ORDER BY CAST(ROUND(unixepoch(updated_at, 'subsec') * 1000) AS INTEGER) DESC, thread_id DESC
+        LIMIT ${Math.max(1, Math.min(128, Math.trunc(options.limit)))}
+      `;
+      return rows.map((row): ControlThreadRow => ({
+        threadId: row.thread_id,
+        projectId: row.project_id,
+        updatedAt: row.updated_at,
+        archived: Boolean(row.archived),
+        relationshipToParent: row.relationship_to_parent,
+        parentThreadId: row.parent_thread_id,
+        rootThreadId: row.root_thread_id,
+        creationSource: row.creation_source,
+      }));
+    },
+    NodeSqliteClient.readOnly,
+    Effect.mapError(fail("read-thread-candidate-page")),
+  );
+
+  const threadCandidateCount: ControlStoreShape["threadCandidateCount"] = Effect.fn(
+    "ControlStore.threadCandidateCount",
+  )(
+    (filter) =>
+      sql<{ readonly total: number }>`
+      SELECT COUNT(*) AS total
+      FROM orchestration_v2_projection_threads INDEXED BY ardud_control_thread_candidates_desc_idx
+      WHERE ${candidatePredicate(filter)}
+    `.pipe(Effect.map((rows) => rows[0]?.total ?? 0)),
+    NodeSqliteClient.readOnly,
+    Effect.mapError(fail("count-thread-candidates")),
+  );
 
   return ControlStore.of({
-    threadsUpdatedSince,
+    threadCandidatePage,
+    threadCandidateCount,
     getOrigin,
     getOrigins,
     setOrigin,

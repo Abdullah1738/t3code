@@ -1,12 +1,270 @@
 import { assert, it } from "@effect/vitest";
-import { ThreadId, type KanbanActor, type KanbanCard } from "@t3tools/contracts";
+import {
+  ThreadId,
+  type KanbanActor,
+  type KanbanCard,
+  type KanbanOwnerAsk,
+  type KanbanSubtask,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as TestClock from "effect/testing/TestClock";
 import * as KanbanStore from "../store/KanbanStore.ts";
-import { approvalProblem, inferGate, isNegativeOption } from "./subtasks.ts";
+import {
+  approvalProblem,
+  approvesGate,
+  askGateWarning,
+  inferGate,
+  isNegativeOption,
+  secretKindApprovalWarning,
+} from "./subtasks.ts";
 import { makeFake, owner, testLayer, toyBoard } from "./askFlows.testkit.ts";
 
 const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("asker") };
+
+const goChoiceSubtask: KanbanSubtask = {
+  id: "s1",
+  step: 1,
+  text: "Tag the edge-api main-dev tip and dev-deploy it",
+  owner: "evaluator",
+  gate: "deploy",
+  createdAt: "2026-11-13T14:00:00.000Z",
+  state: "open",
+  note: null,
+  doneBy: null,
+  doneAt: null,
+};
+
+const goChoiceCard = (
+  labels: readonly string[],
+  optionIds: readonly string[] = ["o1"],
+  subtask = goChoiceSubtask,
+): Pick<KanbanCard, "number" | "asks" | "createdAt" | "subtasks"> => ({
+  number: 3329,
+  createdAt: "2026-11-13T13:00:00.000Z",
+  subtasks: [subtask],
+  asks: [
+    {
+      id: "q1",
+      kind: "decision",
+      text: `For ${subtask.id}, should I tag and deploy the edge-api bundle now, or wait for #4280?`,
+      blocking: false,
+      by: evaluator,
+      at: "2026-11-13T14:01:00.000Z",
+      seq: null,
+      options: labels.map((label, index) => ({
+        id: `o${index + 1}`,
+        label,
+        recommended: index === 0,
+      })),
+      closedAt: "2026-11-13T14:08:11.000Z",
+      answer: {
+        verdict: "picked",
+        optionIds: [...optionIds],
+        by: owner,
+        at: "2026-11-13T14:08:11.000Z",
+      },
+    },
+  ],
+});
+
+it.each([
+  ...[
+    "Tag and deploy now",
+    "Merge and deploy",
+    "Deploy edge-api now",
+    "Yes, tag and release it",
+    "Cut the tag and release",
+    "Please install edge-api",
+    "Go ahead and restart edge-api",
+    "Ship edge-api",
+    "Approve deployment of edge-api",
+  ].map((label) => ({ label, approved: true })),
+  ...[
+    "Tag and deploy after CI",
+    "Deploy only the docs change",
+    "Tag and deploy without the read-backs",
+    "Prepare the deploy",
+    "Wait for #4280",
+    "Tag it",
+    "Redeploy edge-api",
+    ...["if", "unless", "before", "once", "when", "pending", "first", "then"].map(
+      (word) => `Tag and deploy ${word} CI passes`,
+    ),
+    ...[
+      "not",
+      "no",
+      "except",
+      "instead",
+      "partial",
+      "dry-run",
+      "dry run",
+      "draft",
+      "plan",
+      "preview",
+    ].map((word) => `Tag and deploy ${word} changes`),
+  ].map((label) => ({ label, approved: false })),
+])("go/hold deploy pick: $label approves=$approved", ({ label, approved }) => {
+  const problem = approvalProblem(goChoiceCard([label, "Wait for #4280"]), goChoiceSubtask);
+  assert.strictEqual(problem === null, approved);
+});
+
+it.each([
+  { others: ["Deploy tonight"] },
+  { others: ["Tag and deploy production", "Release edge-api"] },
+  { others: [] },
+])("a new approval path needs a hold option: $others", ({ others }) => {
+  // This label also fails the existing paths: it starts with "Tag" and isn't the task text.
+  const card = goChoiceCard(["Tag and deploy now", ...others]);
+  assert.include(approvalProblem(card, goChoiceSubtask)!, "approval");
+});
+
+it.each(["Don't deploy", "Show status"])("a hold can be %s", (hold) => {
+  assert.isNull(approvalProblem(goChoiceCard(["Tag and deploy now", hold]), goChoiceSubtask));
+});
+
+it.each([
+  { label: "Buy it on the 9546 card", approved: true },
+  { label: "Buy only one", approved: false },
+  { label: "Pay the vendor", approved: true },
+  { label: "Purchase the license now", approved: true },
+  { label: "Charge the saved card", approved: true },
+  { label: "Refund the invoice", approved: true },
+  { label: "Transfer the balance", approved: true },
+])("go/hold money pick: $label approves=$approved", ({ label, approved }) => {
+  const subtask = { ...goChoiceSubtask, text: "Purchase the license", gate: "money" as const };
+  assert.strictEqual(
+    approvalProblem(goChoiceCard([label, "Leave it"], ["o1"], subtask), subtask) === null,
+    approved,
+  );
+});
+
+it.each(
+  [
+    {
+      subtask: goChoiceSubtask,
+      lead: "Build the bundle",
+      verbs: ["deploy", "release", "install", "restart", "ship"],
+      hold: "Wait for #4280",
+    },
+    {
+      subtask: { ...goChoiceSubtask, text: "Purchase the license", gate: "money" as const },
+      lead: "Check prices",
+      verbs: ["pay", "purchase", "buy", "charge", "refund", "transfer"],
+      hold: "Leave it",
+    },
+  ].flatMap(({ verbs, ...fixture }) =>
+    verbs.flatMap((verb) =>
+      [
+        "don't",
+        "don’t",
+        "dont",
+        "DON'T",
+        "do not",
+        "never",
+        "cannot",
+        "can't",
+        "can’t",
+        "won't",
+        "won’t",
+        "shouldn't",
+        "shouldn’t",
+        "must not",
+      ].map((negation) => ({ ...fixture, label: `${fixture.lead}, ${negation} ${verb} it` })),
+    ),
+  ),
+)("a negated go/hold label cannot approve: $label", ({ subtask, label, hold }) => {
+  const card = goChoiceCard([label, hold], ["o1"], subtask);
+  assert.include(approvalProblem(card, subtask)!, "approval");
+});
+
+it("secret picks keep the strict approval path even with a hold", () => {
+  const subtask = { ...goChoiceSubtask, text: "Share the token", gate: "secret" as const };
+  const card = goChoiceCard(["Share the key with the worker", "Don't"], ["o1"], subtask);
+  assert.include(approvalProblem(card, subtask)!, "approval");
+});
+
+it("#3329: the owner's q1 go pick approves the evaluator's dev-deploy step", () => {
+  const subtask = { ...goChoiceSubtask, text: "Tag the main-dev tip and dev-deploy it" };
+  const card = goChoiceCard(["Tag and deploy now", "Wait for #4280"], ["o1"], subtask);
+  assert.isNull(approvalProblem(card, subtask));
+});
+
+it.each([
+  { labels: ["Tag and deploy now", "Merge and deploy", "Wait for #4280"], approved: false },
+  { labels: ["Tag and deploy now", "Approve", "Wait for #4280"], approved: false },
+  { labels: ["Deploy now", "Approve", "Wait for #4280"], approved: true },
+])("multi-picks keep existing approval paths: $labels", ({ labels, approved }) => {
+  const card = goChoiceCard(labels, ["o1", "o2"]);
+  assert.strictEqual(approvalProblem(card, goChoiceSubtask) === null, approved);
+});
+
+const probeAskText =
+  "Approve up to two Android probe sessions at $0.02/min, each capped at 7 minutes, maximum $0.28 total?";
+const probeAskTitle = "#94: approve two short Run Cloud Android typing probes";
+const probeAskSummary =
+  "Create at most two Android sessions, run the public-text probes, clear clipboards and release both.";
+const probeSubtask: KanbanSubtask = {
+  ...goChoiceSubtask,
+  text: "Approve up to two Android probe sessions, each capped at 7 min, $0.28 total (rate $0.02/min)",
+  gate: "money",
+  createdAt: "2026-11-13T18:41:50.644Z",
+};
+
+const probeCard = (optionId = "o1") => {
+  const base = goChoiceCard(["Approve", "Skip paid probes"], [optionId], probeSubtask);
+  const ask: KanbanOwnerAsk = {
+    ...base.asks[0]!,
+    id: "q2",
+    kind: "action",
+    text: probeAskText,
+    title: probeAskTitle,
+    action: { summary: probeAskSummary },
+    at: "2026-11-14T06:40:00.000Z",
+    closedAt: "2026-11-14T06:46:23.000Z",
+    answer: {
+      verdict: "picked",
+      optionIds: [optionId],
+      by: owner,
+      at: "2026-11-14T06:46:23.000Z",
+    },
+  };
+  return { ...base, asks: [ask] };
+};
+
+it("#94 q2 infers money from its exact text, title and cleanup summary", () => {
+  assert.strictEqual(inferGate(`${probeAskText} ${probeAskTitle} ${probeAskSummary}`), "money");
+});
+
+it.each(["evaluator", "script"] as const)(
+  "#94 price approval clears a single %s money step",
+  (owner) => {
+    const subtask = { ...probeSubtask, owner };
+    assert.isNull(approvalProblem({ ...probeCard(), subtasks: [subtask] }, subtask));
+  },
+);
+
+it("#94 Skip paid probes does not approve the paid step", () => {
+  assert.isTrue(isNegativeOption("Skip paid probes"));
+  assert.include(approvalProblem(probeCard("o2"), probeSubtask)!, 'picked "Skip paid probes"');
+});
+
+it("an unnamed price approval cannot clear two money steps", () => {
+  const second = { ...probeSubtask, id: "s2", text: "Approve AED 45 order" };
+  const card = { ...probeCard(), subtasks: [probeSubtask, second] };
+  for (const subtask of card.subtasks) assert.isNotNull(approvalProblem(card, subtask));
+});
+
+it("a named price approval clears only its own step", () => {
+  const base = probeCard();
+  const second = { ...probeSubtask, id: "s2", text: "Approve AED 45 order" };
+  const card = {
+    ...base,
+    asks: [{ ...base.asks[0]!, text: `For s1: ${probeAskText}` }],
+    subtasks: [probeSubtask, second],
+  };
+  assert.isNull(approvalProblem(card, probeSubtask));
+  assert.isNotNull(approvalProblem(card, second));
+});
 
 const consentReplies = [
   { task: "Purchase the license", label: "Yes, buy it", reply: "yes", approved: true },
@@ -179,12 +437,12 @@ it.effect.each([
         { verdict: "picked", optionIds: ["o1"], revision: 0 },
         owner,
       );
-      for (const state of ["done", "skipped"] as const) {
-        const refused = yield* kanban
-          .markSubtask(card.id, "s1", state, "Narrower choice", evaluator, "evaluator")
-          .pipe(Effect.flip);
-        assert.include(refused.detail, "needs Abdullah's approval");
-      }
+      const current = (yield* kanban.card(card.id)).card;
+      assert.isNull(approvalProblem(current, current.subtasks[0]!, [], undefined, "skip"));
+      const actionDenied = yield* kanban
+        .markSubtask(card.id, "s1", "done", "Narrower choice", evaluator, "evaluator")
+        .pipe(Effect.flip);
+      assert.include(actionDenied.detail, "needs Abdullah's approval");
       const refused = yield* kanban
         .moveCard(card.id, "verified", "evaluator", evaluator)
         .pipe(Effect.flip);
@@ -216,7 +474,7 @@ it.effect.each(
     (["done", "skipped"] as const).map((state) => ({ ...fixture, state })),
   ),
 )(
-  "$reply selects $label; $state requires consent ($approved)",
+  "$reply selects $label; $state follows owner answer (action approval=$approved)",
   ({ task, label, reply, approved, state }) =>
     Effect.gen(function* () {
       const fake = yield* makeFake;
@@ -240,7 +498,8 @@ it.effect.each(
         yield* kanban.changeAsk(card.id, "q1", "drop", owner, "owner");
         yield* kanban.askOwner(
           card.id,
-          { question: `${task} (s1)?`, blocking: false, options: [label, "No"] },
+          // The alternate action supplies no hold without also matching a bare "go" reply.
+          { question: `${task} (s1)?`, blocking: false, options: [label, `Alternate ${task}`] },
           evaluator,
           "evaluator",
         );
@@ -257,7 +516,7 @@ it.effect.each(
           evaluator,
           "evaluator",
         );
-        if (approved) {
+        if (state === "skipped" || approved) {
           assert.strictEqual((yield* complete).subtasks[0]?.state, state);
           assert.strictEqual(
             (yield* kanban.moveCard(card.id, "verified", "evaluator", evaluator)).stage,
@@ -359,12 +618,12 @@ it.effect.each([
           owner,
         );
         if (optionId === "o1") {
-          for (const state of ["done", "skipped"] as const) {
-            const refused = yield* kanban
-              .markSubtask(card.id, "s1", state, "Owner chose information", evaluator, "evaluator")
-              .pipe(Effect.flip);
-            assert.include(refused.detail, "approval");
-          }
+          const current = (yield* kanban.card(card.id)).card;
+          assert.isNull(approvalProblem(current, current.subtasks[0]!, [], undefined, "skip"));
+          const actionDenied = yield* kanban
+            .markSubtask(card.id, "s1", "done", "Owner chose information", evaluator, "evaluator")
+            .pipe(Effect.flip);
+          assert.include(actionDenied.detail, "approval");
           const verify = yield* kanban
             .moveCard(card.id, "verified", "evaluator", evaluator)
             .pipe(Effect.flip);
@@ -449,7 +708,7 @@ it.effect("#3917: a Sign off decision after a dropped draft allows verification"
           },
         ],
       };
-      assert.include(approvalProblem(legacy, subtask)!, "the latest decision, q2, was dropped");
+      assert.include(approvalProblem(legacy, subtask, [])!, "the latest decision, q2, was dropped");
       const signedOff: KanbanCard = {
         ...legacy,
         asks: [
@@ -479,7 +738,7 @@ it.effect("#3917: a Sign off decision after a dropped draft allows verification"
           },
         ],
       };
-      assert.isNull(approvalProblem(signedOff, subtask));
+      assert.isNull(approvalProblem(signedOff, subtask, []));
       yield* store.putCard(signedOff);
       assert.strictEqual(
         (yield* kanban.moveCard(card.id, "verified", "evaluator", evaluator)).stage,
@@ -504,7 +763,7 @@ it.effect("a missing decision names the gate and the subtask's time bound", () =
         .pipe(Effect.flip);
       assert.strictEqual(
         refused.detail,
-        `card #${card.number} subtask s1 (deploy: Deploy) needs Abdullah's approval: no owner answer on a deploy ask since ${card.subtasks[0]!.createdAt}; name the subtask id (e.g. s7) in the ask`,
+        `card #${card.number} subtask s1 (deploy: Deploy) needs Abdullah's approval: no owner answer on a deploy ask since ${card.subtasks[0]!.createdAt}; ask with card_ask naming s1 (e.g. "Approve s1: <step>") (this board has no standing deploy approval)`,
       );
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
@@ -558,7 +817,7 @@ it.effect.each([
         .pipe(Effect.flip);
       assert.strictEqual(
         refused.detail,
-        `card #${card.number} subtask s1 (deploy: Deploy) needs Abdullah's approval: the latest decision, q2, ${suffix}`,
+        `card #${card.number} subtask s1 (deploy: Deploy) needs Abdullah's approval: the latest decision, q2, ${suffix} (this board has no standing deploy approval)`,
       );
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
@@ -599,7 +858,7 @@ it.effect.each([owner, evaluator])(
             .pipe(Effect.flip);
           assert.strictEqual(
             refused.detail,
-            `card #${card.number} subtask s1 (deploy: Restart LaunchAgent) needs Abdullah's approval: the latest decision, q1, was dropped (a dropped ask is not approval)`,
+            `card #${card.number} subtask s1 (deploy: Restart LaunchAgent) needs Abdullah's ${state === "skipped" ? "answer before it can be skipped" : "approval"}: the latest decision, q1, was dropped (a dropped ask is not approval) (this board has no standing deploy approval)`,
           );
         }
         const verify = yield* kanban
@@ -683,6 +942,10 @@ it.effect("old approvals, text, drops and negative picks cannot approve a new ga
         },
         evaluator,
       );
+      const oldSkip = yield* kanban
+        .markSubtask(card.id, "s1", "skipped", "Old approval", evaluator, "evaluator")
+        .pipe(Effect.flip);
+      assert.include(oldSkip.detail, "needs Abdullah's answer before it can be skipped");
       yield* kanban.askOwner(
         card.id,
         { question: "Deploy?", blocking: false, options: ["Yes", "No"] },
@@ -713,7 +976,7 @@ it.effect("old approvals, text, drops and negative picks cannot approve a new ga
         "owner",
       );
       const textDenied = yield* kanban
-        .markSubtask(card.id, "s1", "skipped", "text", evaluator, "evaluator")
+        .markSubtask(card.id, "s1", "done", "text", evaluator, "evaluator")
         .pipe(Effect.flip);
       assert.include(textDenied.detail, "approval");
       // A separate non-gated subtask is unaffected.
@@ -816,6 +1079,763 @@ it.effect("dropping a blocking ask cannot restore a verified stage over an open 
       const dropped = yield* kanban.changeAsk(card.id, "q1", "drop", owner, "owner");
       assert.strictEqual(dropped.stage, "completed");
       assert.strictEqual(dropped.subtasks[0]?.state, "open");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.each([
+  { verdict: "picked", by: "owner", skip: true, done: false },
+  { verdict: "rejected", by: "owner", skip: true, done: false },
+  { verdict: "approved", by: "owner", skip: true, done: true },
+  { verdict: "answered", by: "owner", skip: true, done: false },
+  { verdict: "dropped", by: "owner", skip: false, done: false },
+  { verdict: "picked", by: "evaluator", skip: false, done: false },
+  { verdict: "absent", by: "owner", skip: false, done: false },
+] as const)("gate intent: $by $verdict", ({ verdict, by, skip, done }) => {
+  const at = "2026-11-13T18:00:00.000Z";
+  const subtask: KanbanCard["subtasks"][number] = {
+    id: "s6",
+    step: 2,
+    text: "Ask Abdullah to deploy",
+    owner: "evaluator",
+    gate: "deploy",
+    state: "open",
+    note: null,
+    doneBy: null,
+    doneAt: null,
+  };
+  const card: Pick<KanbanCard, "number" | "createdAt" | "subtasks" | "asks"> = {
+    number: 19,
+    createdAt: at,
+    subtasks: [subtask],
+    asks:
+      verdict === "absent"
+        ? []
+        : [
+            {
+              id: "q2",
+              text: "Skip s6 deploy?",
+              blocking: false,
+              by: evaluator,
+              at,
+              seq: null,
+              closedAt: at,
+              options: [
+                { id: "o1", label: "Skip deploy" },
+                { id: "o2", label: "Deploy anyway" },
+              ],
+              answer: { verdict, by: by === "owner" ? owner : evaluator, at, optionIds: ["o1"] },
+            },
+          ],
+  };
+  assert.strictEqual(approvalProblem(card, subtask, [], undefined, "skip") === null, skip);
+  assert.strictEqual(approvalProblem(card, subtask, [], undefined, "do") === null, done);
+  assert.strictEqual(
+    approvalProblem(card, subtask, [], undefined, "do"),
+    approvalProblem(card, subtask),
+  );
+  if (!skip)
+    assert.include(
+      approvalProblem(card, subtask, [], undefined, "skip")!,
+      "needs Abdullah's answer before it can be skipped",
+    );
+  if (verdict === "picked" && by === "owner") {
+    assert.strictEqual(
+      approvalProblem(card, subtask),
+      `card #19 subtask s6 (deploy: Ask Abdullah to deploy) needs Abdullah's approval: the latest decision, q2, picked "Skip deploy", which doesn't read as approving deploy; ask again with an Approve option or an action ask (this board has no standing deploy approval)`,
+    );
+  }
+});
+
+const relevanceSubtask: KanbanSubtask = {
+  ...goChoiceSubtask,
+  id: "s5",
+  text: "Provide the SSH key",
+  gate: "secret",
+};
+
+const relevanceAsk = (overrides: Partial<KanbanOwnerAsk> = {}): KanbanOwnerAsk => ({
+  id: "q4",
+  text: "Approve s5",
+  blocking: false,
+  by: evaluator,
+  at: "2026-11-13T14:01:00.000Z",
+  seq: null,
+  closedAt: "2026-11-13T14:03:00.000Z",
+  answer: { verdict: "approved", by: owner, at: "2026-11-13T14:03:00.000Z" },
+  ...overrides,
+});
+
+const relevanceCard = (
+  asks: readonly KanbanOwnerAsk[],
+): Pick<KanbanCard, "number" | "createdAt" | "subtasks" | "asks"> => ({
+  number: 14,
+  createdAt: "2026-11-13T13:00:00.000Z",
+  subtasks: [relevanceSubtask],
+  asks,
+});
+
+const billingSubtask: KanbanSubtask = {
+  ...goChoiceSubtask,
+  text: "Owner fixes the failed payment or Actions spending limit",
+  gate: "money",
+  createdAt: "2026-11-14T09:00:30.000Z",
+};
+
+const duplicateBillingCard = (title = "Close #4319 as a duplicate of #4315 Blacksmith") => ({
+  ...relevanceCard([
+    relevanceAsk({
+      id: "q1",
+      text: "Actions payments failed: fix the spending limit or billing?",
+      blocking: true,
+      at: "2026-11-14T09:01:00.000Z",
+      closedAt: "2026-11-14T09:03:51.000Z",
+      answer: {
+        verdict: "answered",
+        text: "Blacksmith migration is ongoing please follow it",
+        by: owner,
+        at: "2026-11-14T09:03:51.000Z",
+      },
+    }),
+    relevanceAsk({
+      id: "q2",
+      kind: "question",
+      text: "Close #4319 as a duplicate of #4315, with no billing change on Equicom-Crypto?",
+      title,
+      at: "2026-11-14T09:04:00.000Z",
+      closedAt: "2026-11-14T09:07:54.000Z",
+      answer: { verdict: "approved", by: owner, at: "2026-11-14T09:07:54.000Z" },
+    }),
+  ]),
+  number: 4319,
+  subtasks: [billingSubtask],
+});
+
+it("#4319: the reported billing title concerns the money step after #1418", () => {
+  const card = duplicateBillingCard(
+    "Close #4319 (Actions billing) as a duplicate of #4315 Blacksmith",
+  );
+  assert.isNull(approvalProblem(card, billingSubtask));
+});
+
+it.each([
+  { verdict: "answered", reason: "was answered" },
+  { verdict: "rejected", reason: "was rejected" },
+  { verdict: "dropped", reason: "was dropped (a dropped ask is not approval)" },
+  {
+    verdict: "picked",
+    reason:
+      'picked "Wait", which doesn\'t read as approving money; ask again with an Approve option or an action ask',
+  },
+] as const)("#4319: later unnamed approval explains refusal after q1 $verdict", ({ verdict, reason }) => {
+  const card = duplicateBillingCard();
+  const q1 = card.asks[0]!;
+  const q2 = card.asks[1]!;
+  const asks = [
+    {
+      ...q1,
+      options: [{ id: "wait", label: "Wait" }],
+      answer: { ...q1.answer!, verdict, optionIds: verdict === "picked" ? ["wait"] : [] },
+    },
+    q2,
+  ];
+  assert.strictEqual(inferGate(`${q2.text} ${q2.title}`), undefined);
+  assert.include(
+    approvalProblem({ ...card, asks }, billingSubtask)!,
+    `the latest decision, q1, ${reason}; q2 (approved later) doesn't name s1, so it doesn't count; ask again naming s1`,
+  );
+});
+
+it("#4319: naming s1 makes the later approval count; skipping needs only q1's owner answer", () => {
+  const card = duplicateBillingCard();
+  assert.isNotNull(approvalProblem(card, billingSubtask));
+  assert.isNull(approvalProblem(card, billingSubtask, [], undefined, "skip"));
+  const named = {
+    ...card,
+    asks: card.asks.map((ask) =>
+      ask.id === "q2" ? { ...ask, text: `Approve s1: ${ask.text}` } : ask,
+    ),
+  };
+  assert.isNull(approvalProblem(named, billingSubtask));
+});
+
+it.each(["2026-11-14T09:03:50.000Z", "2026-11-14T09:03:51.000Z"])(
+  "#4319: an unnamed approval at %s does not shadow the later or simultaneous q1 answer",
+  (at) => {
+    const card = duplicateBillingCard();
+    const q2 = card.asks[1]!;
+    const asks = [
+      card.asks[0]!,
+      { ...q2, at: "2026-11-14T09:02:00.000Z", closedAt: at, answer: { ...q2.answer!, at } },
+    ];
+    assert.strictEqual(
+      approvalProblem({ ...card, asks }, billingSubtask),
+      approvalProblem({ ...card, asks: [asks[0]!] }, billingSubtask),
+    );
+  },
+);
+
+it("#4319: a later unnamed picked approval keeps the naming hint", () => {
+  const card = duplicateBillingCard();
+  const q2 = card.asks[1]!;
+  const asks = [
+    card.asks[0]!,
+    {
+      ...q2,
+      options: [{ id: "go", label: "Approve" }],
+      answer: { ...q2.answer!, verdict: "picked" as const, optionIds: ["go"] },
+    },
+  ];
+  assert.include(
+    approvalProblem({ ...card, asks }, billingSubtask)!,
+    "q2 (approved later) doesn't name s1",
+  );
+});
+
+it.each(
+  ["2026-11-13T14:02:00.000Z", "2026-11-13T14:04:00.000Z"].flatMap((at) =>
+    ["Check the CI run", "Approve s6", "Deploy the bundle"].flatMap((text) =>
+      (["do", "skip"] as const).map((intent) => ({ at, text, intent })),
+    ),
+  ),
+)("an unrelated drop at $at ($text) does not block $intent", ({ at, text, intent }) => {
+  const card = relevanceCard([
+    relevanceAsk({
+      id: "q1",
+      text,
+      closedAt: at,
+      answer: { verdict: "dropped", by: evaluator, at },
+    }),
+    relevanceAsk(),
+  ]);
+  assert.isNull(approvalProblem(card, relevanceSubtask, [], undefined, intent));
+});
+
+it.each(
+  [owner, evaluator].flatMap((dropper) =>
+    [false, true].flatMap((draft) =>
+      ["text", "title", "summary"].flatMap((field) =>
+        (["do", "skip"] as const).map((intent) => ({ dropper, draft, field, intent })),
+      ),
+    ),
+  ),
+)(
+  "a relevant $field drop by $dropper._tag (draft=$draft) revokes approval for $intent",
+  ({ dropper, draft, field, intent }) => {
+    const card = relevanceCard([
+      relevanceAsk({ id: "q1" }),
+      relevanceAsk({
+        id: "q2",
+        text: field === "text" ? "Approve s5" : "Check the CI run",
+        ...(field === "title" ? { title: "Approve s5" } : {}),
+        ...(field === "summary" ? { action: { summary: "Approve s5" } } : {}),
+        ...(draft ? { draft: { text: "Ready to send", format: "markdown" } } : {}),
+        closedAt: "2026-11-13T14:04:00.000Z",
+        answer: { verdict: "dropped", by: dropper, at: "2026-11-13T14:04:00.000Z" },
+      }),
+    ]);
+    assert.include(
+      approvalProblem(card, relevanceSubtask, [], undefined, intent)!,
+      "the latest decision, q2, was dropped",
+    );
+  },
+);
+
+it.each(["do", "skip"] as const)(
+  "an unnamed approval gives a subtask-specific reason for %s",
+  (intent) => {
+    const card = relevanceCard([
+      relevanceAsk({
+        id: "q3",
+        kind: "signoff",
+        title: "Close #14",
+        text: "Close the card",
+      }),
+      relevanceAsk({
+        id: "q1",
+        text: "Check the CI run",
+        closedAt: "2026-11-13T14:04:00.000Z",
+        answer: { verdict: "dropped", by: evaluator, at: "2026-11-13T14:04:00.000Z" },
+      }),
+      relevanceAsk({
+        id: "q2",
+        text: "Close the card",
+        closedAt: "2026-11-13T14:02:00.000Z",
+        answer: { verdict: "approved", by: owner, at: "2026-11-13T14:02:00.000Z" },
+      }),
+    ]);
+    const problem = approvalProblem(card, relevanceSubtask, [], undefined, intent)!;
+    assert.include(
+      problem,
+      'q3 was approved but doesn\'t name s5; ask again naming the subtask id (e.g. "Approve s5")',
+    );
+    assert.notInclude(problem, "q1");
+  },
+);
+
+it.each([
+  { label: "draft", ask: relevanceAsk({ text: "Close", draft: { text: "Done", format: "text" } }) },
+  {
+    label: "non-owner",
+    ask: relevanceAsk({
+      text: "Close",
+      answer: { verdict: "approved", by: evaluator, at: "2026-11-13T14:03:00.000Z" },
+    }),
+  },
+  { label: "old ask", ask: relevanceAsk({ text: "Close", at: "2026-11-13T13:59:00.000Z" }) },
+  {
+    label: "old answer",
+    ask: relevanceAsk({
+      text: "Close",
+      answer: { verdict: "approved", by: owner, at: "2026-11-13T13:59:00.000Z" },
+    }),
+  },
+  { label: "open ask", ask: relevanceAsk({ text: "Close", closedAt: null }) },
+  { label: "another subtask", ask: relevanceAsk({ text: "Approve s6" }) },
+])("a $label approval keeps the missing-answer reason", ({ ask }) => {
+  for (const intent of ["do", "skip"] as const) {
+    assert.include(
+      approvalProblem(relevanceCard([ask]), relevanceSubtask, [], undefined, intent)!,
+      "no owner answer on a secret ask since",
+    );
+  }
+});
+
+it.each(["do", "skip"] as const)(
+  "a relevant drop before the time bound does not revoke %s",
+  (intent) => {
+    const card = relevanceCard([
+      relevanceAsk(),
+      relevanceAsk({
+        id: "q1",
+        closedAt: "2026-11-13T13:59:00.000Z",
+        answer: { verdict: "dropped", by: evaluator, at: "2026-11-13T13:59:00.000Z" },
+      }),
+    ]);
+    assert.isNull(approvalProblem(card, relevanceSubtask, [], undefined, intent));
+  },
+);
+
+it.each(["do", "skip"] as const)("an inferred relevant drop still revokes %s", (intent) => {
+  const card = relevanceCard([
+    relevanceAsk(),
+    relevanceAsk({
+      id: "q2",
+      text: "Provide the SSH key",
+      closedAt: "2026-11-13T14:04:00.000Z",
+      answer: { verdict: "dropped", by: evaluator, at: "2026-11-13T14:04:00.000Z" },
+    }),
+  ]);
+  assert.include(
+    approvalProblem(card, relevanceSubtask, [], undefined, intent)!,
+    "the latest decision, q2, was dropped",
+  );
+  const other = { ...relevanceSubtask, id: "s6" };
+  assert.isNull(
+    approvalProblem(
+      { ...card, subtasks: [...card.subtasks, other] },
+      relevanceSubtask,
+      [],
+      undefined,
+      intent,
+    ),
+  );
+});
+
+it("a later dropped decision still blocks skipping after the owner's earlier approval", () => {
+  const at = "2026-11-13T18:00:00.000Z";
+  const subtask: KanbanCard["subtasks"][number] = {
+    id: "s6",
+    step: 2,
+    text: "Deploy",
+    owner: "evaluator",
+    gate: "deploy",
+    state: "open",
+    note: null,
+    doneBy: null,
+    doneAt: null,
+  };
+  const asks: KanbanCard["asks"] = (["approved", "dropped"] as const).map((verdict, index) => ({
+    id: `q${index + 1}`,
+    text: "s6 deploy",
+    blocking: false,
+    by: owner,
+    at,
+    seq: null,
+    closedAt: at,
+    answer: {
+      verdict,
+      by: owner,
+      at: index === 0 ? at : "2026-11-13T18:01:00.000Z",
+    },
+  }));
+  assert.include(
+    approvalProblem(
+      { number: 19, createdAt: at, subtasks: [subtask], asks },
+      subtask,
+      [],
+      undefined,
+      "skip",
+    )!,
+    "the latest decision, q2, was dropped",
+  );
+});
+
+it.effect(
+  "Crpko #3329 dev rollout follows board guesses while stored deploy gates stay enforced",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard();
+        const text = "Tag the main-dev tip and dev-deploy it";
+        const legacy = yield* kanban.createCard(
+          board.id,
+          {
+            prompt: "Legacy rollout",
+            subtasks: [{ text, owner: "evaluator" }],
+          },
+          owner,
+        );
+        assert.strictEqual(legacy.subtasks[0]!.gate, "deploy");
+        yield* kanban.updateBoard(board.id, { guessedGates: ["money", "secret"] });
+        const card = yield* kanban.createCard(
+          board.id,
+          {
+            prompt: "Crpko #3329 rollout",
+            subtasks: [{ text, owner: "evaluator" }],
+          },
+          owner,
+        );
+        assert.isUndefined(card.subtasks[0]!.gate);
+        const done = yield* kanban.markSubtask(
+          card.id,
+          "s1",
+          "done",
+          "Dev rollout complete",
+          evaluator,
+          "evaluator",
+        );
+        assert.strictEqual(done.subtasks[0]!.state, "done");
+        const edited = yield* kanban.createCard(board.id, { prompt: "Edited rollout" }, owner);
+        const planned = yield* kanban.editCard(
+          edited.id,
+          {
+            subtasks: [{ text, owner: "evaluator" }],
+          },
+          evaluator,
+        );
+        assert.isUndefined(planned.subtasks[0]!.gate);
+        yield* kanban.markSubtask(
+          edited.id,
+          "s1",
+          "done",
+          "Dev rollout complete",
+          evaluator,
+          "evaluator",
+        );
+        for (const input of [
+          { text, owner: "evaluator", gate: "deploy" },
+          { text: "Pay the invoice", owner: "evaluator" },
+        ] as const) {
+          const gated = yield* kanban.createCard(
+            board.id,
+            { prompt: input.text, subtasks: [input] },
+            owner,
+          );
+          const result = yield* Effect.result(
+            kanban.markSubtask(gated.id, "s1", "done", "Done", evaluator, "evaluator"),
+          );
+          assert.strictEqual(result._tag, "Failure");
+          if (result._tag === "Failure")
+            assert.include(result.failure.detail, "needs Abdullah's approval");
+        }
+        const old = yield* Effect.result(
+          kanban.markSubtask(legacy.id, "s1", "done", "Done", evaluator, "evaluator"),
+        );
+        assert.strictEqual(old._tag, "Failure");
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+const mergeSubtask: KanbanSubtask = {
+  ...goChoiceSubtask,
+  id: "s4",
+  text: "Merge after a clear review at the exact head with green CI (CI/test only, no deploy)",
+};
+
+it("#4297: sign-off must name the merge subtask with a stored deploy gate", () => {
+  const ask = relevanceAsk({
+    id: "q1",
+    kind: "signoff",
+    title: "Sign off: PR #1288 merged into native-v1 (CI/test only)",
+    text: "Do you approve the merge?",
+  });
+  const card = { ...relevanceCard([ask]), number: 4297, subtasks: [mergeSubtask] };
+  for (const intent of ["do", "skip"] as const) {
+    assert.include(
+      approvalProblem(card, mergeSubtask, [], undefined, intent)!,
+      "q1 was approved but doesn't name s4",
+    );
+    assert.isNull(
+      approvalProblem(
+        { ...card, asks: [{ ...ask, text: "Approve s4: merge PR #1288" }] },
+        mergeSubtask,
+        [],
+        undefined,
+        intent,
+      ),
+    );
+  }
+});
+
+it.each([
+  { label: "Approve", hint: true },
+  { label: "Change", hint: false },
+  { label: "Drop", hint: false },
+])("#4281: unnamed decision pick $label approval hint=$hint", ({ label, hint }) => {
+  const subtask = { ...mergeSubtask, text: "Write the wiki note" };
+  const ask = relevanceAsk({
+    id: "q1",
+    kind: "decision",
+    text: "Close the card?",
+    options: ["Approve", "Change", "Drop"].map((label) => ({ id: label, label })),
+    answer: { verdict: "picked", optionIds: [label], by: owner, at: "2026-11-13T14:03:00.000Z" },
+  });
+  const card = { ...relevanceCard([ask]), number: 4281, subtasks: [subtask] };
+  const problem = approvalProblem(card, subtask)!;
+  assert.strictEqual(problem.includes("q1 was approved but doesn't name s4"), hint);
+  if (!hint) assert.include(problem, "no owner answer on a deploy ask");
+});
+
+it("explains how to ask when a gated step has no approval", () => {
+  const card = { ...relevanceCard([]), subtasks: [mergeSubtask] };
+  assert.include(
+    approvalProblem(card, mergeSubtask)!,
+    'ask with card_ask naming s4 (e.g. "Approve s4: <step>")',
+  );
+});
+
+it.each([
+  [mergeSubtask.text, undefined],
+  ["Merge (no deploy)", undefined],
+  ["Merge (no deploy), then restart Robob", "deploy"],
+  ["Deploy after CI (no restart)", "deploy"],
+] as const)("merge gate regression: %s", (text, gate) => assert.strictEqual(inferGate(text), gate));
+
+it.each([
+  { text: "Close the card?", warning: true },
+  { text: "Approve s4: merge PR #1288", warning: false },
+  { text: "Deploy the build?", warning: false },
+  { text: "Approve s5", warning: true },
+])("ask gate warning: $text", ({ text, warning }) => {
+  const card = { ...relevanceCard([]), subtasks: [mergeSubtask] };
+  const note = askGateWarning(card, relevanceAsk({ text }));
+  assert.strictEqual(note !== undefined, warning);
+  if (warning)
+    assert.strictEqual(note, "This ask won't clear s4 (deploy). Name s4 in the text if it should.");
+});
+
+it.each(["done", "skipped"] as const)("a %s gate needs no ask warning", (state) => {
+  const card = { ...relevanceCard([]), subtasks: [{ ...mergeSubtask, state }] };
+  assert.isUndefined(askGateWarning(card, relevanceAsk({ text: "Close the card?" })));
+});
+
+it.each([
+  { kind: "secret", state: "open", gate: "secret", warning: true },
+  { kind: "decision", state: "open", gate: "secret", warning: false },
+  { kind: "action", state: "open", gate: "secret", warning: false },
+  { kind: "secret", state: "done", gate: "secret", warning: false },
+  { kind: "secret", state: "skipped", gate: "secret", warning: false },
+  { kind: "secret", state: "open", gate: undefined, warning: false },
+  { kind: "secret", state: "open", gate: "deploy", warning: false },
+] as const)(
+  "secret-kind approval warning: $kind / $state / $gate",
+  ({ kind, state, gate, warning }) => {
+    const card = {
+      subtasks: [{ ...relevanceSubtask, id: "s3", text: "Check access", gate, state }],
+    };
+    const note = secretKindApprovalWarning(card, relevanceAsk({ kind, text: "Approve s3" }));
+    assert.strictEqual(note !== undefined, warning);
+    if (warning)
+      assert.strictEqual(
+        note,
+        'Kind "secret" asks Abdullah to type a secret value. To approve s3, ask a decision naming s3 instead.',
+      );
+  },
+);
+
+it("a real secret request on an ungated card needs no warning", () => {
+  assert.isUndefined(secretKindApprovalWarning({ subtasks: [] }, relevanceAsk({ kind: "secret" })));
+});
+
+it("a secret-kind warning lists only open secret-gated ids", () => {
+  const card = {
+    subtasks: [
+      { ...relevanceSubtask, id: "s3" },
+      { ...relevanceSubtask, id: "s4", state: "done" as const },
+      { ...relevanceSubtask, id: "s7" },
+      mergeSubtask,
+    ],
+  };
+  assert.strictEqual(
+    secretKindApprovalWarning(card, relevanceAsk({ kind: "secret", text: "Approve s3 and s7" })),
+    'Kind "secret" asks Abdullah to type a secret value. To approve s3, s7, ask a decision naming the intended subtask id instead.',
+  );
+});
+
+it.each(["work", "review"] as const)("a stored secret gate on $owner needs no warning", (owner) => {
+  const card = { subtasks: [{ ...relevanceSubtask, owner }] };
+  assert.isUndefined(secretKindApprovalWarning(card, relevanceAsk({ kind: "secret" })));
+});
+
+it("a secret-kind warning respects enabled inferred gates and explicit gates", () => {
+  const ask = relevanceAsk({ kind: "secret" });
+  const card = { subtasks: [{ ...relevanceSubtask, gate: undefined }] };
+  assert.isDefined(secretKindApprovalWarning(card, ask, ["secret"]));
+  assert.isUndefined(secretKindApprovalWarning(card, ask, []));
+  assert.isDefined(secretKindApprovalWarning({ subtasks: [relevanceSubtask] }, ask, []));
+});
+
+it("ambiguous inferred wording warns and naming one gate avoids the warning", () => {
+  const card = { ...relevanceCard([]), subtasks: [mergeSubtask, { ...mergeSubtask, id: "s6" }] };
+  assert.include(
+    askGateWarning(card, relevanceAsk({ text: "Deploy the build?" }))!,
+    "s4 (deploy), s6 (deploy)",
+  );
+  assert.isUndefined(askGateWarning(card, relevanceAsk({ text: "Approve s6" })));
+});
+
+it("ask kind and context cannot replace the gate's wording", () => {
+  const card = { ...relevanceCard([]), subtasks: [mergeSubtask] };
+  assert.isDefined(
+    askGateWarning(
+      card,
+      relevanceAsk({ text: "Close the card?", kind: "deploy", context: "Approve s4" }),
+    ),
+  );
+});
+
+it.each([
+  { label: "Keep it", hint: true },
+  { label: "Revert it", hint: false },
+])("Watchers #49: unnamed $label pick approval hint=$hint", ({ label, hint }) => {
+  const subtask = { ...mergeSubtask, id: "s5", text: "Merge into ardud/main and push origin main" };
+  const ask = relevanceAsk({
+    id: "q2",
+    kind: "decision",
+    title: "#49: keep the test-only merge I already pushed to main?",
+    text: "Keep it, or revert it?",
+    options: ["Keep it", "Revert it"].map((label) => ({ id: label, label })),
+    answer: { verdict: "picked", optionIds: [label], by: owner, at: "2026-11-13T14:03:00.000Z" },
+  });
+  const card = { ...relevanceCard([ask]), number: 49, subtasks: [subtask] };
+  assert.strictEqual(
+    approvalProblem(card, subtask)!.includes("q2 was approved but doesn't name s5"),
+    hint,
+  );
+  const named = { ...card, asks: [{ ...ask, text: "For s5: keep it, or revert it?" }] };
+  assert.strictEqual(approvalProblem(named, subtask) === null, hint);
+});
+
+it.each([
+  { task: "Deploy the build", gate: "deploy", hold: "Revert it" },
+  { task: "Purchase the license", gate: "money", hold: "Revert it" },
+  { task: "Merge into ardud/main", gate: "deploy", hold: "Wait" },
+] as const)("Keep it cannot approve $task against $hold", ({ task, gate, hold }) => {
+  const subtask = { ...mergeSubtask, text: task, gate };
+  assert.isNotNull(approvalProblem(goChoiceCard(["Keep it", hold], ["o1"], subtask), subtask));
+});
+
+it.each([
+  { owner: "evaluator", gate: "deploy", text: "Check CI" },
+  { owner: "script", gate: "money", text: "Check prices" },
+  { owner: "evaluator", gate: "secret", text: "Check access" },
+] as const)("warns for an explicit $gate gate owned by $owner", ({ owner, gate, text }) => {
+  const subtask = { ...mergeSubtask, owner, gate, text };
+  const card = { ...relevanceCard([]), subtasks: [subtask] };
+  assert.include(
+    askGateWarning(card, relevanceAsk({ text: "Close the card?" }), [])!,
+    `s4 (${gate})`,
+  );
+});
+
+it("warns for enabled inferred script gates", () => {
+  const subtask = {
+    ...mergeSubtask,
+    owner: "script" as const,
+    gate: undefined,
+    text: "Deploy the build",
+  };
+  const card = { ...relevanceCard([]), subtasks: [subtask] };
+  assert.isDefined(askGateWarning(card, relevanceAsk({ text: "Close the card?" }), ["deploy"]));
+  assert.isUndefined(askGateWarning(card, relevanceAsk({ text: "Close the card?" }), []));
+});
+
+it.each(["Keep it", "Keep it!", "Yes, keep it", "Please keep it"])(
+  "%s retains one merge without granting standing deploy permission",
+  (label) => {
+    const task = "Merge the watchers test-only change for s5";
+    assert.isTrue(approvesGate(label, "deploy", task, ["Revert it"], "subtask"));
+    assert.isFalse(approvesGate(label, "deploy", task, ["Revert it"]));
+    assert.isFalse(approvesGate(label, "deploy", task, ["Revert it"], "standing"));
+  },
+);
+
+it.effect("retaining a merge cannot become a board-wide standing approval", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard("watchers");
+      const store = yield* KanbanStore.KanbanStore;
+      const threadId = yield* kanban.startEvaluator(board.id, {
+        kind: "request",
+        text: "Check standing approval",
+      });
+      const actor: KanbanActor = { _tag: "evaluator", threadId };
+      const card = yield* kanban.createCard(
+        board.id,
+        { title: "Keep merge", prompt: "Work" },
+        owner,
+      );
+      for (const field of ["text", "summary"] as const) {
+        for (const label of ["Keep it", "Keep it!", "Yes, keep it", "Please keep it"]) {
+          const wording = "Merge the watchers test-only change for s5: keep it, or revert it?";
+          const ask = relevanceAsk({
+            id: "q1",
+            text: field === "text" ? wording : "Keep it, or revert it?",
+            ...(field === "summary" ? { action: { summary: wording } } : {}),
+            options: [
+              { id: "keep", label },
+              { id: "revert", label: "Revert it" },
+            ],
+            answer: {
+              verdict: "picked",
+              optionIds: ["keep"],
+              by: owner,
+              at: "2026-11-13T14:03:00.000Z",
+            },
+          });
+          yield* store.putCard({ ...card, asks: [ask] });
+          const denied = yield* kanban
+            .standingApproval(
+              board.id,
+              {
+                action: "grant",
+                cardId: card.id,
+                ask: "q1",
+                quote: label,
+                sourceThreadId: "owner-thread",
+                saidAt: ask.answer!.at,
+              },
+              actor,
+            )
+            .pipe(Effect.flip);
+          assert.strictEqual(denied.code, "denied", `${field}: ${label}`);
+          assert.include(denied.detail, "grant needs a closed ask approved by the owner");
+          assert.deepStrictEqual((yield* kanban.snapshot(board.id)).board.standingApprovals, []);
+        }
+      }
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );

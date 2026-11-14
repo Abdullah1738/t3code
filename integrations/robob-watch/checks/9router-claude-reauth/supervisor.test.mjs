@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,6 +9,12 @@ import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { acquireLease, leaseOwner, releaseLease } from './lease.mjs';
 import { assertCleared, assertIncident, lazyControlClient, liveProviders, notificationId, notificationState, pendingConnections, phaseReporter, readState, runBoundedCommand, runObserved, telegramHealthy, threadIdFor, tick, workerPrompt, writeState } from './supervisor.mjs';
+
+const HAS_LOCKF = process.platform === 'darwin' && existsSync('/usr/bin/lockf');
+const LOCKF_SKIP_REASON = 'needs macOS /usr/bin/lockf (watcher is macOS-only)';
+const lockfOnly = { skip: !HAS_LOCKF && LOCKF_SKIP_REASON };
+// Bun honors node:test skips but omits their reason from its reporter.
+if (!HAS_LOCKF) console.info(`Skipping lease tests: ${LOCKF_SKIP_REASON}`);
 
 const testLogDir = mkdtempSync(join(tmpdir(), 'reauth-logs-'));
 const previousLogDir = process.env.ROUTER_LOG_DIR;
@@ -56,7 +62,7 @@ function harness(t) {
   };
 }
 
-test('startup already-bad launches one exact worker after a fresh check with explicit model', async t => {
+test('startup already-bad launches one exact worker after a fresh check with explicit model', lockfOnly, async t => {
   const h = harness(t); await h.tick();
   assert.equal(h.sim.creates.length, 1); assert.equal(h.sim.providerCalls, 2);
   const b = h.sim.creates[0]; assert.equal(b.model, MODEL.model); assert.equal(b.variant, 'max'); assert.equal(b.providerInstanceId, 'opencode');
@@ -65,7 +71,7 @@ test('startup already-bad launches one exact worker after a fresh check with exp
   assert.equal(h.sim.lookups[0], threadIdFor(b.clientRequestId));
 });
 
-test('healthy-to-bad-to-healthy transition; marker, not status label, decides completion', async t => {
+test('healthy-to-bad-to-healthy transition; marker, not status label, decides completion', lockfOnly, async t => {
   const h = harness(t); h.sim.rows = [{ ...good(), testStatus: 'expired', errorCode: 401 }]; await h.tick(); assert.equal(h.sim.creates.length, 0);
   h.sim.rows = [{ ...bad(), testStatus: 'active' }]; await h.tick(); assert.equal(h.sim.creates.length, 1);
   h.complete(); h.sim.rows = [{ ...good(), testStatus: 'expired' }]; await h.tick();
@@ -90,7 +96,7 @@ test('ignore nonauth, 429, disabled, wrong provider/auth and effective stale mar
   assert.throws(() => pendingConnections({ connections: [bad('evil\ninjected')] }));
 });
 
-test('busy, waiting, queued and needs-input hold the global worker; only one attention', async t => {
+test('busy, waiting, queued and needs-input hold the global worker; only one attention', lockfOnly, async t => {
   const h = harness(t); h.sim.rows = [bad('alpha'), bad('beta')]; await h.tick();
   const a = h.state().active, thread = h.sim.threads.get(a.threadId);
   for (const state of ['running', 'waiting', 'queued', 'needs-input', 'needs-input']) { thread.state = state; await h.tick(); }
@@ -99,7 +105,7 @@ test('busy, waiting, queued and needs-input hold the global worker; only one att
   await h.tick(); assert.equal(h.sim.creates.length, 2); assert.match(h.sim.creates[1].prompt, /Connection ID: beta/);
 });
 
-test('terminal not-cleared retries after 5 and 15 minutes, then alerts once and blocks', async t => {
+test('terminal not-cleared retries after 5 and 15 minutes, then alerts once and blocks', lockfOnly, async t => {
   const h = harness(t); await h.tick(); h.complete(); await h.tick();
   await h.tick(); assert.equal(h.sim.creates.length, 1);
   h.sim.time += 5 * 60_000; await h.tick(); assert.equal(h.sim.creates.length, 2); h.complete(); await h.tick();
@@ -109,14 +115,14 @@ test('terminal not-cleared retries after 5 and 15 minutes, then alerts once and 
   assert.equal(new Set(h.sim.creates.map(x => x.clientRequestId)).size, 3);
 });
 
-test('human action terminal blocks without blind retry, bridge replay uses stable payload', async t => {
+test('human action terminal blocks without blind retry, bridge replay uses stable payload', lockfOnly, async t => {
   const h = harness(t); await h.tick(); h.complete(); h.sim.answer = 'REAUTH_RESULT: HUMAN_ACTION_REQUIRED'; h.sim.notifyError = true;
   await assert.rejects(h.tick()); assert.equal(h.state().active.phase, 'finishing');
   h.sim.notifyError = false; await h.tick(); await h.tick();
   assert.deepEqual(h.sim.alerts[0], h.sim.alerts[1]); assert.equal(h.sim.creates.length, 1); assert.equal(h.state().active, null);
 });
 
-test('service down is an error and never healthy; malformed status is unknown', async t => {
+test('service down is an error and never healthy; malformed status is unknown', lockfOnly, async t => {
   const h = harness(t); h.sim.providerError = true; await assert.rejects(h.tick()); assert.equal(h.sim.creates.length, 0);
   h.sim.providerError = false; h.sim.healthError = true; await assert.rejects(h.tick());
   assert.equal(h.state().active, null); assert.equal(h.state().incidents[0].attempts, 0);
@@ -126,13 +132,13 @@ test('service down is an error and never healthy; malformed status is unknown', 
   assert.equal(h.sim.creates.length, 1); assert.ok(h.state().active);
 });
 
-test('lost launch response: status first finds original worker; no duplicate', async t => {
+test('lost launch response: status first finds original worker; no duplicate', lockfOnly, async t => {
   const h = harness(t); h.sim.createError = true; await assert.rejects(h.tick());
   assert.equal(h.state().active.phase, 'sent'); h.sim.createError = false; await h.tick();
   assert.equal(h.sim.creates.length, 1); assert.equal(h.sim.lookups.at(-1), h.state().active.threadId);
 });
 
-test('ambiguous no-thread retries same key only after cooldown, status before every send', async t => {
+test('ambiguous no-thread retries same key only after cooldown, status before every send', lockfOnly, async t => {
   const h = harness(t); h.sim.noCreate = true; h.sim.createError = true; await assert.rejects(h.tick());
   await h.tick(); assert.equal(h.sim.creates.length, 1);
   for (let n = 0; n < 2; n++) { h.sim.time += 60_000; await assert.rejects(h.tick()); }
@@ -141,7 +147,7 @@ test('ambiguous no-thread retries same key only after cooldown, status before ev
   assert.equal(h.sim.alerts.length, 1); assert.ok(h.state().active); assert.ok(leaseOwner(h.leasePath));
 });
 
-test('crash between prepared state and lease acquisition resumes; manual holder wins race', async t => {
+test('crash between prepared state and lease acquisition resumes; manual holder wins race', lockfOnly, async t => {
   const h = harness(t); let once = true; const acquire = h.ctx.acquireLease;
   h.ctx.acquireLease = id => { if (once) { once = false; throw new Error('crash'); } return acquire(id); };
   await assert.rejects(h.tick()); assert.equal(h.state().active.phase, 'prepared'); assert.equal(leaseOwner(h.leasePath), null);
@@ -149,14 +155,14 @@ test('crash between prepared state and lease acquisition resumes; manual holder 
   assert.equal(releaseLease(h.leasePath, manual), true); await h.tick(); assert.equal(h.sim.creates.length, 1);
 });
 
-test('crash immediately after lease publish resumes with matching persisted owner', async t => {
+test('crash immediately after lease publish resumes with matching persisted owner', lockfOnly, async t => {
   const h = harness(t); let once = true; const acquire = h.ctx.acquireLease;
   h.ctx.acquireLease = id => { const v = acquire(id); if (once) { once = false; throw new Error('crash'); } return v; };
   await assert.rejects(h.tick()); assert.equal(leaseOwner(h.leasePath).id, h.state().active.leaseId);
   await h.tick(); assert.equal(h.sim.creates.length, 1);
 });
 
-test('unexpected existing thread for an unsent attempt fails closed', async t => {
+test('unexpected existing thread for an unsent attempt fails closed', lockfOnly, async t => {
   const h = harness(t); h.ctx.acquireLease = () => { throw new Error('crash'); }; await assert.rejects(h.tick());
   const active = h.state().active;
   h.sim.threads.set(active.threadId, { threadId: active.threadId, state: 'idle', model: MODEL, run: { runId: 'old', status: 'completed', model: MODEL } });
@@ -164,7 +170,7 @@ test('unexpected existing thread for an unsent attempt fails closed', async t =>
   await h.tick(); assert.equal(h.sim.creates.length, 0); assert.equal(h.sim.alerts.length, 1); assert.ok(h.state().active);
 });
 
-test('fresh recheck cancels prepared attempt if disabled, repaired, or incident changed', async t => {
+test('fresh recheck cancels prepared attempt if disabled, repaired, or incident changed', lockfOnly, async t => {
   for (const changed of [{ ...bad(), isActive: false }, good(), bad('alpha', '2026-11-01T00:01:00.000Z')]) {
     const h = harness(t); let n = 0;
     h.ctx.providers = async () => ({ connections: [++n === 1 ? bad() : changed] });
@@ -172,7 +178,7 @@ test('fresh recheck cancels prepared attempt if disabled, repaired, or incident 
   }
 });
 
-test('prepared recovery sees manual fix and never touches manual lease', async t => {
+test('prepared recovery sees manual fix and never touches manual lease', lockfOnly, async t => {
   const h = harness(t); h.ctx.acquireLease = () => { throw new Error('crash'); }; await assert.rejects(h.tick());
   const manual = acquireLease(h.leasePath, 'manual'); h.sim.rows = [good()]; await h.tick();
   assert.equal(h.state().active, null); assert.equal(h.state().incidents[0].attempts, 0);
@@ -180,26 +186,26 @@ test('prepared recovery sees manual fix and never touches manual lease', async t
   releaseLease(h.leasePath, manual);
 });
 
-test('model mismatch holds active worker and alerts; cannot start another', async t => {
+test('model mismatch holds active worker and alerts; cannot start another', lockfOnly, async t => {
   const h = harness(t); h.sim.badModel = true; await assert.rejects(h.tick());
   await h.tick(); assert.equal(h.sim.creates.length, 1); assert.equal(h.sim.alerts.length, 1); assert.equal(h.state().incidents[0].blocked, true);
 });
 
-test('a mismatching model on the status response is held and alerted', async t => {
+test('a mismatching model on the status response is held and alerted', lockfOnly, async t => {
   const h = harness(t); await h.tick();
   const thread = h.sim.threads.get(h.state().active.threadId);
   thread.run.model = { ...MODEL, instanceId: 'claudeAgent' };
   await h.tick(); await h.tick(); assert.equal(h.sim.creates.length, 1); assert.equal(h.sim.alerts.length, 1); assert.equal(h.state().incidents[0].blocked, true);
 });
 
-test('lease is exclusive, only owner releases, invalid lease fails closed', t => {
+test('lease is exclusive, only owner releases, invalid lease fails closed', lockfOnly, t => {
   const h = harness(t); const a = acquireLease(h.leasePath, 'manual');
   assert.equal(acquireLease(h.leasePath, 'auto'), null); assert.equal(releaseLease(h.leasePath, { ...a, id: 'other' }), false);
   assert.equal(releaseLease(h.leasePath, a), true);
   writeFileSync(h.leasePath, 'not a lease'); assert.equal(leaseOwner(h.leasePath).kind, 'unknown');
 });
 
-test('fd-owned guard is nonblocking and remains held until mutation process exits', async t => {
+test('fd-owned guard is nonblocking and remains held until mutation process exits', lockfOnly, async t => {
   const h = harness(t); const guard = `${h.leasePath}.guard`;
   const child = spawn('/bin/sh', ['-c', 'exec 9>>"$1"; /usr/bin/lockf -s -t 0 9 || exit 1; printf "ready\\n"; exec "$2" -e "process.stdin.resume()"', 'lease-test', guard, process.execPath], { stdio: ['pipe', 'pipe', 'pipe'] });
   t.after(() => { if (child.exitCode === null) child.kill(); });
@@ -224,13 +230,13 @@ test('journal rejects corrupt state rather than restarting empty', t => {
   writeFileSync(h.path, JSON.stringify({ version: 1, incidents: [], active: { phase: 'sent' } })); assert.throws(() => readState(h.path));
 });
 
-test('journal does not store auth secrets from provider response', async t => {
+test('journal does not store auth secrets from provider response', lockfOnly, async t => {
   const h = harness(t); h.sim.rows = [{ ...bad(), reauthTokenHash: 'do-not-store-hash', accessToken: 'do-not-store-secret', name: 'misleading-label' }];
   await h.tick(); const s = readFileSync(h.path, 'utf8');
   assert.doesNotMatch(s, /do-not-store|misleading-label/); assert.doesNotMatch(JSON.stringify(h.sim.creates), /do-not-store|misleading-label/);
 });
 
-test('crash after release, before final state save resumes without repeating outcome', async t => {
+test('crash after release, before final state save resumes without repeating outcome', lockfOnly, async t => {
   const h = harness(t); await h.tick(); h.complete(); let once = true; const save = h.ctx.save;
   h.ctx.save = s => { if (once && s.active === null) { once = false; throw new Error('crash'); } save(s); };
   await assert.rejects(h.tick()); assert.equal(h.state().active.phase, 'finishing'); assert.equal(leaseOwner(h.leasePath), null);
@@ -238,7 +244,7 @@ test('crash after release, before final state save resumes without repeating out
   await h.tick(); assert.equal(h.state().active, null); assert.equal(h.state().incidents[0].nextAt, nextAt); assert.equal(h.sim.creates.length, 1);
 });
 
-test('unknown create result or missing model cannot be treated as verified', async t => {
+test('unknown create result or missing model cannot be treated as verified', lockfOnly, async t => {
   const h = harness(t); const create = h.ctx.create;
   h.ctx.create = async body => { await create(body); return null; };
   await assert.rejects(h.tick()); assert.equal(h.state().incidents[0].blocked, false);
@@ -246,13 +252,13 @@ test('unknown create result or missing model cannot be treated as verified', asy
   await assert.rejects(h.tick()); assert.equal(h.sim.alerts.length, 0); assert.ok(h.state().active);
 });
 
-test('incident change after uncertain send stays held and requests attention instead of a duplicate', async t => {
+test('incident change after uncertain send stays held and requests attention instead of a duplicate', lockfOnly, async t => {
   const h = harness(t); h.sim.noCreate = true; h.sim.createError = true; await assert.rejects(h.tick());
   h.sim.rows = [good()]; await h.tick(); await h.tick();
   assert.equal(h.sim.alerts.length, 1); assert.equal(h.sim.creates.length, 1); assert.ok(h.state().active);
 });
 
-test('blocked incident remains blocked if disabled and re-enabled with the same marker', async t => {
+test('blocked incident remains blocked if disabled and re-enabled with the same marker', lockfOnly, async t => {
   const h = harness(t); await h.tick(); h.complete(); h.sim.answer = 'REAUTH_RESULT: HUMAN_ACTION_REQUIRED'; await h.tick();
   assert.equal(h.state().incidents[0].blocked, true);
   h.sim.rows = [{ ...bad(), isActive: false }]; await h.tick(); assert.equal(h.state().incidents.length, 1);
@@ -440,7 +446,7 @@ test('ambiguous enqueue with cleared marker and absent outbox fails closed, not 
   await assert.rejects(h.tick()); await assert.rejects(h.tick()); assert.equal(h.sim.alerts.length, 1);
 });
 
-test('detector leaves existing account budgets unchanged and fails closed on prior active worker', async t => {
+test('detector leaves existing account budgets unchanged and fails closed on prior active worker', lockfOnly, async t => {
   const h = harness(t); await h.tick(); const before = h.state(); h.ctx.enforceSafetyFence = true;
   await assert.rejects(h.tick()); const after = h.state();
   assert.deepEqual(after.incidents, before.incidents); assert.deepEqual(after.active, before.active); assert.ok(leaseOwner(h.leasePath));
@@ -474,7 +480,7 @@ test('worker prompt preserves supervisor markers and requires a separate reasone
   assert.match(p, /If the marker was not confirmed cleared, report NOT_VERIFIED/);
 });
 
-test('cleared rate-limited or otherwise unverified report never starts another login', async t => {
+test('cleared rate-limited or otherwise unverified report never starts another login', lockfOnly, async t => {
   for (const reason of ['RATE_LIMITED', 'PROFILE_UNAVAILABLE', 'IDENTITY_MISMATCH', 'PINNING_UNAVAILABLE', 'INFERENCE_FAILED', 'TOKEN_CHANGED']) {
     const h = harness(t); await h.tick(); h.complete(); h.sim.rows = [good()];
     h.sim.answer = `REAUTH_RESULT: CLEARED\nVERIFICATION_RESULT: CLEARED_UNVERIFIED\nVERIFICATION_REASON: ${reason}`;
@@ -483,21 +489,21 @@ test('cleared rate-limited or otherwise unverified report never starts another l
   }
 });
 
-test('rate limit with still-pending marker and human-action result blocks relogin', async t => {
+test('rate limit with still-pending marker and human-action result blocks relogin', lockfOnly, async t => {
   const h = harness(t); await h.tick(); h.complete();
   h.sim.answer = 'REAUTH_RESULT: HUMAN_ACTION_REQUIRED\nVERIFICATION_RESULT: NOT_VERIFIED\nVERIFICATION_REASON: RATE_LIMITED';
   await h.tick(); h.sim.time += 60 * 60_000; await h.tick();
   assert.equal(h.sim.creates.length, 1); assert.equal(h.state().incidents[0].blocked, true); assert.equal(h.sim.alerts.length, 1);
 });
 
-test('verified-working report does not override a still-present effective marker', async t => {
+test('verified-working report does not override a still-present effective marker', lockfOnly, async t => {
   const h = harness(t); await h.tick(); h.complete();
   h.sim.answer = 'REAUTH_RESULT: CLEARED\nVERIFICATION_RESULT: VERIFIED_WORKING\nVERIFICATION_REASON: NONE';
   await h.tick(); assert.equal(h.state().incidents[0].attempts, 1); assert.equal(h.state().incidents[0].blocked, false);
   h.sim.time += 5 * 60_000; await h.tick(); assert.equal(h.sim.creates.length, 2);
 });
 
-test('actual cleared marker ends retry even when an old-style or missing report is returned', async t => {
+test('actual cleared marker ends retry even when an old-style or missing report is returned', lockfOnly, async t => {
   for (const answer of ['REAUTH_RESULT: CLEARED', null, 'REAUTH_RESULT: NOT_CLEARED']) {
     const h = harness(t); await h.tick(); h.complete(); h.sim.rows = [good()]; h.sim.answer = answer;
     await h.tick(); h.sim.time += 60 * 60_000; await h.tick();
@@ -505,7 +511,7 @@ test('actual cleared marker ends retry even when an old-style or missing report 
   }
 });
 
-test('cancelled interrupted failed or rolled-back worker is held even if marker cleared; resume cannot release it', async t => {
+test('cancelled interrupted failed or rolled-back worker is held even if marker cleared; resume cannot release it', lockfOnly, async t => {
   for (const status of ['cancelled', 'interrupted', 'failed', 'rolled_back']) {
     const h = harness(t); await h.tick(); h.complete(status); h.sim.rows = [good()]; await h.tick();
     assert.equal(h.state().active.holdReason, 'worker-terminal-uncertain', status);
@@ -515,20 +521,20 @@ test('cancelled interrupted failed or rolled-back worker is held even if marker 
   }
 });
 
-test('idle null run partial acceptance is held and alerted once', async t => {
+test('idle null run partial acceptance is held and alerted once', lockfOnly, async t => {
   const h = harness(t); await h.tick(); const thread = h.sim.threads.get(h.state().active.threadId);
   thread.state = 'idle'; thread.run = null; thread.recentRuns = []; h.sim.rows = [good()];
   await h.tick(); await h.tick(); assert.equal(h.state().active.holdReason, 'partial-accept');
   assert.ok(leaseOwner(h.leasePath)); assert.equal(h.sim.alerts.length, 1); assert.equal(h.sim.creates.length, 1);
 });
 
-test('restart-resumed run cannot be mistaken for original completed run', async t => {
+test('restart-resumed run cannot be mistaken for original completed run', lockfOnly, async t => {
   const h = harness(t); await h.tick(); const thread = h.sim.threads.get(h.state().active.threadId);
   thread.state = 'running'; thread.run = { runId: 'run-2', status: 'running', model: MODEL }; thread.recentRuns = [thread.run, { runId: 'run-1', status: 'failed', model: MODEL }];
   await h.tick(); assert.equal(h.state().active.holdReason, 'run-changed'); assert.equal(h.sim.alerts.length, 1); assert.ok(leaseOwner(h.leasePath));
 });
 
-test('when launch reply is lost multi-run history fails closed instead of adopting resumed run', async t => {
+test('when launch reply is lost multi-run history fails closed instead of adopting resumed run', lockfOnly, async t => {
   const h = harness(t); h.sim.createError = true; await assert.rejects(h.tick());
   const thread = h.sim.threads.get(h.state().active.threadId);
   thread.state = 'idle'; thread.run = { runId: 'run-2', status: 'completed', model: MODEL }; thread.recentRuns = [thread.run, { runId: 'run-1', status: 'failed', model: MODEL }];
@@ -542,7 +548,7 @@ test('Telegram health requires healthy ready paired enabled and connected', () =
   for (const status of ['degraded', 'starting', 'ok', undefined]) assert.equal(telegramHealthy({ ...goodHealth, status }), false);
 });
 
-test('Telegram pending and sending are rechecked, only sent confirms, failure/disappearance fail closed', async t => {
+test('Telegram pending and sending are rechecked, only sent confirms, failure/disappearance fail closed', lockfOnly, async t => {
   const h = harness(t); await h.tick(); h.complete('failed');
   const original = h.ctx.notify; h.ctx.notify = async (key, text) => { const reply = await original(key, text); h.sim.outbox.set(reply.id, 'pending'); return reply; };
   await h.tick(); const id = notificationId(h.sim.alerts[0].key);
@@ -552,13 +558,13 @@ test('Telegram pending and sending are rechecked, only sent confirms, failure/di
   h.sim.outbox.set(id, 'sent'); await h.tick(); assert.equal(h.state().incidents[0].alertState, 'sent'); assert.ok(h.state().active);
 });
 
-test('notification queue response must match dedupe id; ambiguous replay uses identical key', async t => {
+test('notification queue response must match dedupe id; ambiguous replay uses identical key', lockfOnly, async t => {
   const h = harness(t); await h.tick(); h.complete('failed'); h.sim.notifyError = true; await assert.rejects(h.tick());
   assert.ok(h.state().active); h.sim.notifyError = false; await h.tick();
   assert.deepEqual(h.sim.alerts[0], h.sim.alerts[1]); assert.equal(h.sim.alerts.length, 2);
 });
 
-test('marker changes retain account attempts and cooldown; after third attempt no further relogin', async t => {
+test('marker changes retain account attempts and cooldown; after third attempt no further relogin', lockfOnly, async t => {
   const h = harness(t); await h.tick(); h.complete();
   h.sim.rows = [bad('alpha', '2026-11-01T00:01:00.000Z')]; await h.tick();
   assert.equal(h.state().incidents.length, 1); assert.equal(h.state().incidents[0].attempts, 1);
@@ -570,7 +576,7 @@ test('marker changes retain account attempts and cooldown; after third attempt n
   assert.equal(h.sim.creates.length, 3); assert.equal(h.state().incidents.length, 1); assert.equal(h.state().incidents[0].blocked, true); assert.equal(h.sim.alerts.length, 1);
 });
 
-test('marker clears then changes while disabled; budget and cooldown still apply', async t => {
+test('marker clears then changes while disabled; budget and cooldown still apply', lockfOnly, async t => {
   const h = harness(t); await h.tick(); h.complete(); h.sim.rows = [good()]; await h.tick();
   h.sim.rows = [{ ...bad('alpha', '2026-11-01T00:01:00.000Z'), isActive: false }]; await h.tick();
   h.sim.rows = [bad('alpha', '2026-11-01T00:01:00.000Z')]; await h.tick(); assert.equal(h.sim.creates.length, 1);
@@ -620,19 +626,49 @@ test('hung provider exits itself with providers and phase durations before runne
   assert.equal(r.code, 1); assert.equal(r.signal, null); assert.ok(r.ms < 2_000, r.ms);
   assert.match(r.stderr, /9router Claude detector: providers exceeded deadline/);
   assert.match(r.stderr, /phase durations: .*load=.*providers=/);
-  assert.equal(JSON.parse(readFileSync(join(dir, '.phase'))).phase, 'providers');
+  const marker = readFileSync(join(dir, '.phase'), 'utf8');
+  const { phase, at, t: failedAt } = JSON.parse(marker);
+  assert.deepEqual({ phase, at }, { phase: 'failed', at: 'providers' });
+  assert.ok(Number.isFinite(failedAt));
+  const lines = [];
+  const next = phaseReporter(dir, { previous: marker, stderr: line => lines.push(line) });
+  assert.equal(next.previousStall, undefined); assert.deepEqual(lines, []);
+  assert.equal(existsSync(join(dir, 'log')), false);
 });
 
-test('previous save/sh markers survive shell handoff; done and malformed markers are quiet', async t => {
-  for (const phase of ['save', 'sh', 'done', 'malformed']) {
+test('rejected provider leaves a terminal failure marker with its subphase and no following stall', async t => {
+  const { result, dir } = syntheticProcess(t, observedBody("async phase => { phase('providers:fetch'); throw new Error('private provider payload'); }"));
+  const r = await result;
+  assert.equal(r.code, 1); assert.equal(r.signal, null);
+  assert.match(r.stderr, /9router Claude detector: providers:fetch failed/);
+  assert.match(r.stderr, /phase durations: .*providers:fetch=/);
+  assert.doesNotMatch(r.stderr, /private provider payload/);
+  const marker = readFileSync(join(dir, '.phase'), 'utf8');
+  const { phase, at, t: failedAt } = JSON.parse(marker);
+  assert.deepEqual({ phase, at }, { phase: 'failed', at: 'providers:fetch' });
+  assert.ok(Number.isFinite(failedAt));
+  writeFileSync(join(dir, 'log'), 'existing log\n');
+  const lines = [];
+  const next = phaseReporter(dir, { previous: marker, stderr: line => lines.push(line) });
+  assert.equal(next.previousStall, undefined); assert.deepEqual(lines, []);
+  assert.equal(readFileSync(join(dir, 'log'), 'utf8'), 'existing log\n');
+});
+
+test('previous save/sh markers survive shell handoff; done, failed and malformed markers are quiet', async t => {
+  for (const phase of ['save', 'sh', 'done', 'failed', 'malformed']) {
     const dir = mkdtempSync(join(tmpdir(), 'reauth-stale-'));
     const previous = phase === 'malformed' ? '{' : JSON.stringify({ phase, t: Date.now() - 5_000 });
     // The shell has replaced .phase with sh; its env preserves the prior run.
     writeFileSync(join(dir, '.phase'), JSON.stringify({ phase: 'sh', t: Date.now() }));
     const r = await syntheticProcess(t, observedBody('async () => ({ connections: [] })'), { dir, previous }).result;
     assert.equal(r.code, 0, r.stderr);
-    if (phase === 'save' || phase === 'sh') assert.match(r.stderr, new RegExp(`previous run stalled in ${phase} [(]`));
-    else assert.equal(r.stderr, '');
+    if (phase === 'save' || phase === 'sh') {
+      assert.match(r.stderr, new RegExp(`previous run stalled in ${phase} [(]`));
+      assert.match(readFileSync(join(dir, 'log'), 'utf8'), new RegExp(`previous run stalled in ${phase} [(]`));
+    } else {
+      assert.equal(r.stderr, '');
+      assert.equal(existsSync(join(dir, 'log')), false);
+    }
     assert.equal(JSON.parse(readFileSync(join(dir, '.phase'))).phase, 'done');
   }
   const dir = mkdtempSync(join(tmpdir(), 'reauth-stale-direct-'));
@@ -645,7 +681,7 @@ test('previous save/sh markers survive shell handoff; done and malformed markers
   assert.equal(next.code, 0); assert.equal(next.stderr, '');
 });
 
-test('failure logs load/save timings, leaves failing marker, and never logs provider data', async t => {
+test('failure logs load/save timings despite an unwritable marker and never logs provider data', async t => {
   const h = harness(t), lines = [];
   h.ctx.enforceSafetyFence = true;
   h.ctx.save = () => { throw new Error('private payload'); };
@@ -761,25 +797,28 @@ test('runner stderr tail retains stalled phase after many phase timings', t => {
 });
 
 
-test('four failures followed by recovery remains successful and retains the stalled phase in log', async t => {
+test('four clean failures followed by recovery remain successful without a false stall', async t => {
   const dir = mkdtempSync(join(tmpdir(), 'reauth-recovery-'));
   const codes = [];
   for (let i = 0; i < 4; i++) {
     const r = await syntheticProcess(t, observedBody('async () => { throw new Error("down"); }'), { dir }).result;
     codes.push(r.code);
     assert.match(r.stderr.slice(-500), /providers failed/);
+    assert.doesNotMatch(r.stderr, /previous run stalled/);
+    const { phase, at } = JSON.parse(readFileSync(join(dir, '.phase'), 'utf8'));
+    assert.deepEqual({ phase, at }, { phase: 'failed', at: 'providers' });
   }
   const recovered = await syntheticProcess(t, observedBody('async () => ({ connections: [] })'), { dir }).result;
   codes.push(recovered.code);
   assert.deepEqual(codes, [1, 1, 1, 1, 0]);
-  assert.match(recovered.stderr, /previous run stalled in providers/);
-  assert.match(readFileSync(join(dir, 'log'), 'utf8'), /previous run stalled in providers/);
+  assert.equal(recovered.stderr, '');
+  assert.equal(existsSync(join(dir, 'log')), false);
   assert.equal(JSON.parse(readFileSync(join(dir, '.phase'))).phase, 'done');
   const next = await syntheticProcess(t, observedBody('async () => ({ connections: [] })'), { dir }).result;
   assert.equal(next.code, 0); assert.equal(next.stderr, '');
 });
 
-test('logging covers relogin needed, start, ok and fail while preserving the safety fence', async t => {
+test('logging covers relogin needed, start, ok and fail while preserving the safety fence', lockfOnly, async t => {
   const { fixture } = await import('../../../router-logging/test/support.mjs');
   const { rows } = fixture(t);
   const h = harness(t);

@@ -11,6 +11,7 @@ then install.
 | `libexec/mail/` | `~/.local/libexec/mail/` | `himalaya-heal`, `mailsearch`, otp watchers, message-archive (`MAIL_LIBEXEC`) |
 | `libexec/card-preview/` | `~/.local/libexec/card-preview/` | ride cards (`RIDE_CARD_PREVIEW_LIB`), coordinated-project daily cards |
 | `libexec/qcard/` | `~/.local/libexec/qcard/` | `qcard` |
+| `bin/vp`, `libexec/vp/` | `~/.local/bin/vp`, `~/.local/libexec/vp/` | current checkout’s pinned `vp`; dependencyless worktrees use main’s `fmt`/`lint` with worktree paths, ignores and overrides, refusing config drift; other commands give an offbox hint |
 | `juno-proxy/` | `~/.local/share/juno-proxy/` | `com.abdullah.juno-proxy`: HTTP/CONNECT proxy and `/proxy.pac` on the Tailscale IP, port 8118, so tailnet devices reach Juno hosts through this Mac's VPN |
 | `lydia-ticks/` | `~/.local/share/lydia-ticks/` | `com.ardud.lydia-ticks-server` (Bun, 127.0.0.1:18820: saves each tick on Lydia's checklist and serves the per-day history page) and `com.ardud.lydia-ticks-tunnel` (Cloudflare tunnel for https://lydia.abdullah.fund). `tunnel.json` (tunnel credentials), `history-token` (the private history link) and `ticks.db*` (Lydia's data) stay live-only, never in the repo |
 | `bin/` | `~/.local/bin/` | agents and skills; `power-unplug-telegram.sh` and `battery-low-telegram.sh` for the power agents; `cards-tunnel`, `cards-health` and `cards-tunnel-setup` for the card links; `opencode-web` for the emergency OpenCode web UI; `rclaude` for an interactive Claude Code launched like Robob's claudeAgent threads (pinned harness binary, `~/.robob/harness-homes/claude`, 9router env and model/effort from `~/.robob/userdata/settings.json`; `rclaude --rclaude-print` shows the resolved command) |
@@ -132,11 +133,10 @@ The pre-22 v1alpha gencode warning reported by Crpko #2329 can still appear outs
 `QUINT_ALLOW_VULNERABLE_APALACHE=1` explicitly bypasses this guard with a visible warning, permitting Quint's original cache/download/launch behavior; it never silences the protobuf warning.
 Upstream Apalache 0.63.0 still has no dependency fix (#787's 11 Nov check); issue filing and all installations remain owner-approved evaluator actions.
 
-Use `command -v quint` to confirm the wrapper is selected: harness PATHs put
-nvm before `~/.local/bin`. Until approved PATH changes and installation, call
-the checkout's `integrations/local-helpers/bin/quint` explicitly. The shared
-`~/.quint` cache is untouched. Offbox has no installed wrapper or pinned
-archive from this change; shipping both and fixing PATH is a separate task.
+Agent PATHs put `~/.local/share/quint-guard/bin` immediately after the blocker dirs, before nvm; its only tool is a symlink to `~/.local/bin/quint`.
+The shared shell fence refuses direct npm/Node/package-runner `quint verify`; use `/Users/ardud/.local/bin/quint` or explicitly set `QUINT_ALLOW_VULNERABLE_APALACHE=1`.
+Bare `quint` relies on the managed PATH when the hook cannot see the executing shell's PATH. Other subcommands pass through; the shared `~/.quint` cache is untouched.
+Offbox has no installed wrapper or pinned archive from this change; shipping both remains a separate task.
 
 Offbox investigation (9 Nov 2026, crpko-devops pool `bx_2vtg2veh`, three
 remote calls including one pre-command failure): Quint 0.33.1 downloads
@@ -225,8 +225,24 @@ Focused verification:
 NDJSON. Use `--day YYYY-MM-DD` for another day, `--name dotted.name` to filter,
 or another board slug for that board's logs. `toollog rollup --board agent-tools`
 writes `~/.robob/logs/tools/agent-tools/rollup-YYYY-MM-DD.json`.
+Non-error hook rows stop when the day file reaches 35 MiB; other components
+continue to 50 MiB. Errors always continue. `logCaps` identifies any reached
+budget, including older markers as `component: all`.
+Allowed/rewritten non-error decisions are sampled 1-in-128 and omit default
+optional props. Missing `repeatCount` means 1, `cwdClass` means `other`, and
+`matchedRoot`/`argv0Class` mean `none`. Rollup weights counts, rates, duration
+percentiles by `sampleRate`; `sampled: true` marks estimates,
+while `recordedRows` reports the stored count. Denials and other hook errors
+keep every row and all their context.
 Hook rollups include `topThreadsByRule` (`--top N`, default 20) and `repeatLoops`
-for a thread/rule appearing more than 20 times in a sliding hour. Loop windows
+for attributed threads refused more than 20 times in a sliding hour. Rankings
+exclude allowed decisions and split denied/rewritten counts; loops also split
+by decision. Legacy rows without a decision count only when `kind: error` or
+`ok: false`. Unexpected sampled refusals retain their weight and are marked
+`sampled: true`. `unattributedByRule` keeps `unknown:*` refusal buckets visible
+outside thread rankings and loops. `unrecognizedThreadIds` counts refusals with
+IDs outside the native or Robob thread formats, including test fixtures;
+`unrecognizedThreadIdsSampled` marks a weighted estimate for that counter. Loop windows
 can include the previous UTC day's last hour; daily totals stay local.
 `threadIdSource` distinguishes a resolved Robob ID from a native session fallback
 or missing identity. `repeatCount` tracks matching session/rule/first-word retries
