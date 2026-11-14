@@ -96,6 +96,14 @@ def process_fields(values):
     return result
 
 
+def finite_number(value):
+    try:
+        return type(value) in (int, float) and math.isfinite(value)
+    except OverflowError:
+        # Untrusted JSON integers can exceed the float range used by isfinite.
+        return False
+
+
 def safe_fields(values, event=None):
     result = {}
     for key, value in (values or {}).items():
@@ -139,7 +147,7 @@ def safe_fields(values, event=None):
             result[key] = None
         elif key in BOOLEANS and type(value) is bool:
             result[key] = value
-        elif key in NUMBERS and type(value) in (int, float) and math.isfinite(value):
+        elif key in NUMBERS and finite_number(value):
             result[key] = value
         elif key in TEXT and isinstance(value, str) and ATOM.fullmatch(value) and not SECRET.search(value):
             result[key] = value
@@ -153,7 +161,7 @@ def record(component, kind, name, now, duration_ms=None, ok=None, ids=None, prop
         raise ValueError('invalid component')
     row = dict(ts=now.isoformat(timespec='milliseconds').replace('+00:00', 'Z'), tool='mac',
                component=component, kind=kind, name=name)
-    if type(duration_ms) in (int, float) and math.isfinite(duration_ms) and duration_ms >= 0:
+    if finite_number(duration_ms) and duration_ms >= 0:
         row['durationMs'] = round(duration_ms, 3)
     if type(ok) is bool:
         row['ok'] = ok

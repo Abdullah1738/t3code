@@ -15,7 +15,7 @@ import sys
 import subprocess
 import tempfile
 import time
-from toollog import emit, directory, private_dir, SKIP_REASONS, BACKUP_PROGRAMS, BACKUP_ARGS, BACKUP_STAGES
+from toollog import emit, directory, private_dir, finite_number, SKIP_REASONS, BACKUP_PROGRAMS, BACKUP_ARGS, BACKUP_STAGES
 
 
 def state_path(name):
@@ -432,7 +432,7 @@ def directory_inventory(paths=None, run=subprocess.run, deadline=None):
          error_tag='disk.inventory_failed' if errors else None)
 
 def number(value):
-    return type(value) in (int, float) and math.isfinite(value) and value >= 0
+    return finite_number(value) and value >= 0
 
 
 def storage_value(output, snapshot=False):
@@ -441,7 +441,7 @@ def storage_value(output, snapshot=False):
         if not lines or not lines[0].startswith('Snapshots for '):
             raise ValueError('invalid snapshot list')
         snapshots = [line.strip() for line in lines[1:] if line.strip()]
-        if any(not re.fullmatch(r'com\.apple\.TimeMachine\.\d{4}-\d{2}-\d{2}-\d{6}(?:\.local)?', line)
+        if any(not re.fullmatch(r'com\.apple\.TimeMachine\.\d{4}-\d{2}-\d{2}-\d{6}(?:\.local)?(?: \(dataless\))?', line)
                for line in snapshots):
             raise ValueError('invalid snapshot list')
         return len(snapshots)

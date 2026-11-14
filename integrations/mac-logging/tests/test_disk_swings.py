@@ -118,6 +118,44 @@ class DiskSwingTests(unittest.TestCase):
                 self.assertIsNone(row['props']['externalFreeGbDelta'])
                 self.assertTrue(row['ok'])
 
+    def test_oversized_cached_numbers_do_not_suppress_samples(self):
+        for field in ('free', 'sizes', 'inventoryAt', 'inventory.at', 'inventory.sizes',
+                      'inventory.sourceErrors'):
+            with self.subTest(field=field):
+                jobs.save_state('disk', {})
+                self.inventory([95])
+                self.sample(642)
+                previous = jobs.read_state('disk')
+                inventory = jobs.read_state('disk-inventory')
+                huge = 10**400
+                if field == 'free':
+                    previous['free']['externalFreeGb'] = huge
+                elif field == 'sizes':
+                    previous['sizes'][str(self.paths[0])] = huge
+                elif field == 'inventoryAt':
+                    previous['inventoryAt'] = huge
+                elif field == 'inventory.at':
+                    inventory['at'] = huge
+                elif field == 'inventory.sizes':
+                    inventory['sizes'][str(self.paths[0])] = huge
+                else:
+                    inventory['sourceErrors'] = huge
+                jobs.save_state('disk', previous)
+                jobs.save_state('disk-inventory', inventory)
+                count = len(self.rows('disk.sample'))
+                row = self.sample(737)
+                self.assertEqual(len(self.rows('disk.sample')), count+1)
+                self.assertTrue(row['ok'])
+                if field == 'free':
+                    self.assertIsNone(row['props']['externalFreeGbDelta'])
+                    self.assertEqual(row['props']['externalDeltaUnavailable'], 'no_previous_numeric')
+                self.assertEqual(jobs.read_state('disk')['free']['externalFreeGb'], 737)
+                recovered = self.sample(711)
+                self.assertEqual(recovered['props']['externalFreeGbDelta'], -26)
+                swing = self.rows('disk.swing')[-1]['props']
+                self.assertEqual(swing['externalDeltaFromTs'], row['ts'])
+                self.assertEqual(swing['externalFreeGbDelta'], -26)
+
     def test_partial_inventory_does_not_claim_a_shrinker(self):
         self.inventory([100, 20, 10])
         self.sample()
@@ -383,6 +421,19 @@ class DiskSwingTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 jobs.storage_value(output, True)
 
+    def test_snapshot_name_forms(self):
+        name = 'com.apple.TimeMachine.2026-11-13-120000'
+        forms = ('', '.local', ' (dataless)', '.local (dataless)')
+        for suffix in forms:
+            with self.subTest(suffix=suffix):
+                output = ('Snapshots for private-volume-name:\n\n'+name+suffix+'\n\n').encode()
+                self.assertEqual(jobs.storage_value(output, True), 1)
+        output = ('Snapshots for disk:\n'+'\n'.join(name+suffix for suffix in forms)+'\n').encode()
+        self.assertEqual(jobs.storage_value(output, True), len(forms))
+        for suffix in ('.other', ' dataless', '(dataless)', ' (unknown)', ' (dataless) trailing'):
+            with self.subTest(invalid_suffix=suffix), self.assertRaises(ValueError):
+                jobs.storage_value(('Snapshots for disk:\n'+name+suffix+'\n').encode(), True)
+
     def test_busy_or_already_slow_run_launches_no_probe(self):
         with (jobs.state_path('disk').parent/'disk-space-probes.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -424,7 +475,8 @@ class DiskSwingShellTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which('zsh'), 'guard uses zsh')
     def test_fixture_guard_status_and_alerts_unchanged(self):
-        for scenario in ('baseline', 'small', 'plus95', 'minus26', 'stale', 'malformed', 'timeout'):
+        for scenario in ('baseline', 'small', 'plus95', 'minus26', 'stale', 'malformed',
+                         'huge-state', 'dataless', 'timeout'):
             for alert in ('healthy', 'low', 'suppressed', 'notify-fails'):
                 with self.subTest(scenario=scenario, alert=alert):
                     root, home, fake, logs, env = self.fixture()
@@ -442,13 +494,17 @@ class DiskSwingShellTests(unittest.TestCase):
                         command.write_text('#!'+sys.executable+'\nimport time,sys,plistlib\n'+
                             ('time.sleep(20)\n' if scenario == 'timeout' else '')+
                             ('sys.stdout.buffer.write(plistlib.dumps({"PurgeableSpace":1073741824}))\n' if name == 'diskutil'
-                             else 'print("Snapshots for private-volume-name:")\n'))
+                             else 'print("Snapshots for private-volume-name:")\n'+
+                             ('print("com.apple.TimeMachine.2026-11-13-120000.local (dataless)")\n'
+                              if scenario == 'dataless' else '')))
                         command.chmod(0o755)
                     state = logs/'state'; state.mkdir(parents=True)
                     free = 700
                     delta = {'small': 1, 'plus95': 95, 'minus26': -26}.get(scenario, 0)
                     previous = dict(free={'internalFreeGb': free-delta, 'externalFreeGb': free-delta},
                                     ts='2026-11-13T12:00:00.000Z', sizes={})
+                    if scenario == 'huge-state':
+                        previous['free'] = {key: 10**400 for key in previous['free']}
                     if scenario != 'baseline':
                         (state/'disk.json').write_text('{bad' if scenario == 'malformed' else json.dumps(previous))
                     (state/'disk-inventory.json').write_text(json.dumps(dict(at=time.time()-(8000 if scenario == 'stale' else 0),sizes={})))
@@ -471,6 +527,14 @@ class DiskSwingShellTests(unittest.TestCase):
                     self.assertTrue(samples[0]['ok'])
                     self.assertEqual(len([r for r in rows if r['name'] == 'disk.alert']), int(alert in ('low', 'notify-fails')))
                     self.assertEqual(len([r for r in rows if r['name'] == 'disk.swing']), int(scenario in ('plus95', 'minus26')))
+                    if scenario == 'dataless':
+                        for prefix in ('internal', 'external'):
+                            self.assertEqual(samples[0]['props'][prefix+'LocalSnapshotCount'], 1)
+                            self.assertNotIn(prefix+'SnapshotError', samples[0]['props'])
+                    if scenario == 'huge-state':
+                        for prefix in ('internal', 'external'):
+                            self.assertIsNone(samples[0]['props'][prefix+'FreeGbDelta'])
+                            self.assertEqual(json.loads((state/'disk.json').read_text())['free'][prefix+'FreeGb'], 700)
                     if scenario == 'timeout':
                         self.assertLess(elapsed, 6)
                         self.assertNotIn('internalPurgeableGb', samples[0]['props'])
