@@ -2812,6 +2812,69 @@ class CheckBudget(Base):
         self.assertTrue(all(q['checked'] and q['unverified'] for q in self.questions()))
         self.assertTrue(errors)
 
+    def test_source_census_accounts_for_matches_clean_limits_errors_and_deferred(self):
+        now = at('2026-11-14T12:00')
+        self.seed([now - dt.timedelta(days=3, hours=5-n) for n in range(5)])
+        with mc.Locked(self.data, 'questions') as book:
+            for n, q in enumerate(book['questions']):
+                q['merchant'] = 'careem' if n == 4 else 'noon'
+        stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+        outcomes = iter([
+            {'verdict': 'receipt', 'why': 'fixture match', 'errors': []},
+            {'verdict': 'wait', 'why': 'fixture wait', 'until': (now + dt.timedelta(days=1)).isoformat(), 'errors': []},
+            {'verdict': 'unverified', 'why': 'fixture limit', 'errors': [],
+             'limits': [{'why': 'fixture', 'kinds': ['food_page_1']}]},
+            {'verdict': 'unverified', 'why': 'fixture error', 'errors': ['fixture error']},
+            {'verdict': 'unverified', 'why': 'fixture limit', 'errors': [],
+             'limits': [{'why': 'fixture', 'kinds': ['ORDER_LIST_HOST_BINDING_UNVERIFIED']}]},
+        ])
+        with patch.object(mc.charges, 'explain', side_effect=lambda *a, **kw: next(outcomes)):
+            mc.follow(self.data, now, self.root, find=finder(), said=nobody, stats=stats)
+        self.assertEqual(stats['charge_census']['noon'], dict(open=4, matched=1,
+            proven_clean=1, limited=1, error=1, not_checked=0))
+        self.assertEqual(stats['charge_census']['careem'], dict(open=1, matched=0,
+            proven_clean=0, limited=1, error=0, not_checked=0))
+        # No time to admit another screen: remaining rows are deferred, never clean.
+        stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+        mc.follow(self.data, now, self.root, deadline=time.time(), find=finder(), said=nobody, stats=stats)
+        for counts in stats['charge_census'].values():
+            self.assertEqual(counts['open'], counts['limited'])
+            self.assertEqual(counts['open'], counts['not_checked'])
+            self.assertEqual(counts['proven_clean'], 0)
+
+    def test_source_census_uses_final_alias_matches(self):
+        now = at('2026-11-14T12:00')
+        forms = {
+            'limited': {'verdict': 'unverified', 'why': 'fixture limit', 'errors': [],
+                'limits': [{'why': 'fixture', 'kinds': ['food_page_1']}]},
+            'error': {'verdict': 'unverified', 'why': 'fixture error', 'errors': ['fixture']},
+            'clean': {'verdict': 'ask', 'why': 'fixture clean', 'errors': []},
+            'deferred': None,
+        }
+        for form, first in forms.items():
+            with self.subTest(form=form):
+                self.data = self.tmp / form
+                self.seed([now - dt.timedelta(days=3)] * 2)
+                with mc.Locked(self.data, 'questions') as book:
+                    for n, q in enumerate(book['questions']):
+                        q['merchant'] = 'noon' if n == 0 else 'noon food'
+                stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+                clock = [1000.0]
+                receipt = {'verdict': 'receipt', 'why': 'fixture receipt', 'errors': []}
+                outcomes = iter([first, receipt])
+                def explain(*args, **kw):
+                    if form == 'deferred':
+                        clock[0] += 2
+                        return receipt
+                    return next(outcomes)
+                with patch.object(mc.time, 'time', side_effect=lambda: clock[0]), \
+                        patch.object(mc.charges, 'explain', side_effect=explain):
+                    mc.follow(self.data, now, self.root, 1007 if form == 'deferred' else None,
+                              finder(), nobody, stats=stats)
+                self.assertTrue(all(q['status'] == 'closed' for q in self.questions()))
+                self.assertEqual(stats['charge_census']['noon'], dict(open=2, matched=2,
+                    proven_clean=0, limited=0, error=0, not_checked=0))
+
     def questions(self):
         return mc.load_questions(self.data)["questions"]
 

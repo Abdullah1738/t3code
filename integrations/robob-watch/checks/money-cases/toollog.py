@@ -53,7 +53,7 @@ _MONEY_PROPS = {
     'case.update': {'fields', 'deadlineMoved', 'answered'},
     'case.close': {'kind', 'ageDays'},
     'question.ask': {'outcome'},
-    'check.run': {'budgetHit', 'openCases', 'fired', 'slowestPhase', 'sourceLimits', 'limitKinds', 'orderCoverage'},
+    'check.run': {'budgetHit', 'openCases', 'fired', 'slowestPhase', 'sourceLimits', 'limitKinds', 'orderCoverage', 'chargeCensus'},
 }
 _COMMANDS = {'test-talabat-shops', 'capabilities', 'restaurant-cart-contract', 'item-options', 'cart',
              'clear-cart', 'menu', 'choices', 'inspect', 'open-flows', 'recover-payment',
@@ -376,6 +376,11 @@ def _fields(props):
         elif key == 'limitKinds' and isinstance(value, list):
             result[key] = sorted({v for v in value if isinstance(v, str) and v in {
                 'ORDER_LIST_HOST_BINDING_UNVERIFIED', 'food_page_1', 'nownow_page_1', 'marketplace_page_1'}})
+        elif key == 'chargeCensus' and isinstance(value, dict):
+            result[key] = {app: {k: v for k, v in counts.items()
+                if k in {'open', 'matched', 'proven_clean', 'limited', 'error', 'not_checked'}
+                and type(v) is int and 0 <= v <= 10**9}
+                for app, counts in value.items() if app in {'noon', 'careem'} and isinstance(counts, dict)}
         elif key == 'orderCoverage' and isinstance(value, dict):
             result[key] = {}
             for app in ('noon', 'careem'):
@@ -387,8 +392,12 @@ def _fields(props):
                     lane = lanes.get(name)
                     if not isinstance(lane, dict):
                         continue
-                    safe = {k: v for k, v in lane.items() if k in {'pages', 'fetched', 'cached', 'ms'}
+                    safe = {k: v for k, v in lane.items() if k in {'pages', 'fetched', 'cached', 'ms', 'coverage_cleared_rows'}
                             and type(v) is int and 0 <= v <= 10**9}
+                    if type(lane.get('stop_reason')) is str and lane['stop_reason'] in {'slice_out', 'detail_error', 'unknown_time_row',
+                            'scoped_cancellation', 'scoped_conflict', 'unordered', 'repeated_page', 'invalid_detail',
+                            'invalid_paging', 'end_of_history', 'covered', 'unproven_paging', 'list_error', 'reader_error'}:
+                        safe['stop_reason'] = lane['stop_reason']
                     covered = lane.get('covered_from')
                     if covered is None or (isinstance(covered, str) and re.fullmatch(
                             r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})', covered)):

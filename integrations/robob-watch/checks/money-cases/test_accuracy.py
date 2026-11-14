@@ -386,6 +386,7 @@ class Accuracy(Base):
         result = {'orders': [{'service': 'minutes', 'order': 'N1', 'total': '12.34', 'currency': 'EUR',
                               'placed_at': '2026-10-23T23:45:00+04:00'}], 'complete': False}
         with patch.object(lookup.time, 'time', return_value=1000.0), \
+                patch.object(lookup.time, 'monotonic', return_value=0.0), \
                 patch.object(lookup.subprocess, 'run', return_value=subprocess.CompletedProcess(
                     [], 0, json.dumps(result), '')) as run:
             self.assertEqual(lookup.read('noon', deadline=1003.0), result)

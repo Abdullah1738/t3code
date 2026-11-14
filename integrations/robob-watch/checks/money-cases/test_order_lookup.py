@@ -147,6 +147,38 @@ def details(oid, service, timeout):
     def native(self, since=None):
         return lookup.native('noon', str(self.root), since=since)
 
+    def test_stop_reasons_distinguish_detail_failure_unknown_time_and_slice(self):
+        for form, expected in (('fail', 'detail_error'), ('time', 'unknown_time_row'), ('late', 'slice_out')):
+            with self.subTest(form=form):
+                order = row('F1')
+                if form == 'time':
+                    order['detail_time'] = '2026-11-10T12:00:00'
+                self.fixture(food={'1': [order]}, fail=['F1'] if form == 'fail' else [])
+                if form == 'late':
+                    clock = [100.0]
+                    original = self.modules['noon_order_details'].details
+                    def late(*args, **kw):
+                        result = original(*args, **kw)
+                        clock[0] += 9
+                        return result
+                    with patch.object(lookup.time, 'monotonic', side_effect=lambda: clock[0]), \
+                            patch.object(self.modules['noon_order_details'], 'details', side_effect=late):
+                        result = lookup.native('noon', str(self.root), services=('food',))
+                else:
+                    result = lookup.native('noon', str(self.root), services=('food',))
+                lane = result['lanes']['food']
+                self.assertEqual(lane['stop_reason'], expected)
+                self.assertEqual(lane['coverage_cleared_rows'], 1)
+                self.assertIsNone(lane['covered_from'])
+                self.assertFalse(lane['exhaustive'])
+
+    def test_child_error_is_not_reported_as_a_time_slice(self):
+        with patch.object(lookup, 'native', side_effect=RuntimeError('private fixture')):
+            result = lookup.parallel_lanes(str(self.root), None, None, [])
+        self.assertFalse(result['complete'])
+        self.assertTrue(all(l['stop_reason'] == 'reader_error' for l in result['lanes'].values()))
+        self.assertNotIn('private', json.dumps(result))
+
     def test_verified_vertical_pages_cross_ties_and_skip_old_details(self):
         for service in ('food', 'nownow'):
             with self.subTest(service=service):
@@ -156,6 +188,7 @@ def details(oid, service, timeout):
                 result = lookup.native('noon', str(self.root), since=AT.isoformat(), services=(service,))
                 lane = result['lanes'][service]
                 self.assertEqual(lane['pages'], 3)
+                self.assertEqual(lane['stop_reason'], 'covered')
                 self.assertEqual(lane['fetched'], 2)
                 self.assertEqual(lane['covered_from'], row('C', -16)['placed_at'])
                 self.assertIsNone(lane['limit'])
@@ -390,6 +423,7 @@ def details(oid, service, timeout):
         lane = result['lanes']['marketplace']
         self.assertTrue(lane['exhaustive'])
         self.assertEqual(lane['pages'], 2)
+        self.assertEqual(lane['stop_reason'], 'end_of_history')
         self.assertIsNone(lane['covered_from'])
 
     def test_later_cancelled_shipment_stays_unread_even_for_seen_order(self):
@@ -417,6 +451,7 @@ def details(oid, service, timeout):
         self.assertEqual([r['order'] for r in result['orders']], ['F1'])
         self.assertEqual(result['lanes']['food']['covered_from'], row('F1')['placed_at'])
         self.assertIsNone(result['lanes']['minutes']['covered_from'])
+        self.assertEqual(result['lanes']['minutes']['stop_reason'], 'list_error')
         self.assertFalse(result['complete'])
 
     def test_detail_gap_cuts_coverage_and_preserves_later_positive(self):
