@@ -4795,6 +4795,55 @@ it.effect.each(
     ),
 );
 
+it.effect.each(
+  ["literal", "positional", "named"].flatMap((form) =>
+    ["ro", "rw"].map((mode) => ({ form, mode })),
+  ),
+)("keeps acknowledged ATTACH $mode options after a rejected $form ATTACH", ({ form, mode }) =>
+  withFileClient(
+    (sql, filename) =>
+      Effect.gen(function* () {
+        const path = `${filename}.readonly`;
+        const native = yield* openDatabase(path);
+        native.exec("CREATE TABLE entries(value INTEGER); INSERT INTO entries VALUES (1)");
+        const original = `file:${path}?mode=${mode}`;
+        const rejected = `file:${path}?mode=${mode === "ro" ? "rw" : "ro"}`;
+        const attach = (uri: string, alias: string) =>
+          form === "literal"
+            ? sql.unsafe(`ATTACH DATABASE '${uri.replaceAll("'", "''")}' AS ${alias}`)
+            : form === "positional"
+              ? sql.unsafe(`ATTACH DATABASE ? AS ${alias}`, [uri])
+              : sql.unsafe(`ATTACH DATABASE $uri AS ${alias}`, [{ $uri: uri }]);
+        const writer = writerWorkers.at(-1)!;
+        // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
+        writer.postMessage({ testCheckpoint: true, kind: "fail-attachments", args: [3] });
+        yield* writerBridgeBarrier(writer);
+        yield* attach(original, "original");
+        const blocked = yield* attach(rejected, "other").pipe(Effect.flip);
+        assert.include(String(blocked.reason.cause), "attachment metadata failure");
+        assert.deepEqual(yield* sql`SELECT value FROM original.entries`.values, [[1]]);
+        const count = writerWorkers.length;
+        yield* Effect.promise(() => writer.terminate());
+        assert.deepEqual(yield* sql`SELECT value FROM original.entries`.values, [[1]]);
+        assert.equal(writerWorkers.length, count + 1);
+        const databases = yield* sql<{ name: string }>`PRAGMA database_list`;
+        assert.isFalse(databases.some((row) => row.name === "other"));
+        if (mode === "ro") {
+          const denied = yield* sql`INSERT INTO original.entries VALUES (2)`.pipe(Effect.flip);
+          assert.include(String(denied.reason.cause), "readonly");
+        } else yield* sql`INSERT INTO original.entries VALUES (2)`;
+        assert.deepEqual(
+          native
+            .prepare("SELECT value FROM entries ORDER BY value")
+            .all()
+            .map((row) => row.value),
+          mode === "ro" ? [1] : [1, 2],
+        );
+      }),
+    { readerWorker: false },
+  ),
+);
+
 it.effect.each(["attach", "detach"] as const)(
   "retains a pending $s while repeated metadata failure rejects another attachment change",
   (operation) =>

@@ -1756,6 +1756,7 @@ parentPort.on("message", (request) => {
   let controlMs;
   let priorRecovery = {};
   let classification;
+  let executed = false;
   try {
     if (close) {
       operation = "close";
@@ -1814,6 +1815,7 @@ parentPort.on("message", (request) => {
       const result = statement.run(...params);
       return raw ? result : [];
     })();
+    executed = true;
     elapsedMs += performance.now() - executionStarted;
     if (controlStarted !== undefined) controlMs = performance.now() - controlStarted;
     executionStarted = undefined;
@@ -1831,7 +1833,7 @@ parentPort.on("message", (request) => {
     activeClassification = undefined;
     const statementElapsed = executionStarted === undefined ? elapsedMs : (elapsedMs ?? 0) + performance.now() - executionStarted;
     if (controlStarted !== undefined && controlMs === undefined) controlMs = performance.now() - controlStarted;
-    const snapshot = db ? { ...priorRecovery, ...recoverySnapshot(classification, sql, params) } : {};
+    const snapshot = db ? { ...priorRecovery, ...recoverySnapshot(classification && { ...classification, attachment: executed && classification.attachment }, sql, params) } : {};
     errorReply(id, error, operation, { ...snapshot, inTransaction: db?.isTransaction ?? false, write: observedWrite, elapsedMs: statementElapsed, controlMs });
   } finally {
     // Authorizer classification covers CTE/commented writes; transaction state
