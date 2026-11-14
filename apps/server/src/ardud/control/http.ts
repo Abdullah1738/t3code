@@ -1211,48 +1211,38 @@ const makeRoutes = Effect.gen(function* () {
     const params = yield* searchParams;
     // Bridge polls read one thread: they queue on the poll lane only, never
     // behind thread lists, HTTP snapshots or MCP reads.
-    const { records, detail } = yield* ReplyBuilders.bounded(
+    const page = yield* ReplyBuilders.bounded(
       Effect.gen(function* () {
         yield* getShell(threadId);
-        const records = yield* readMessages(threadId);
-        const detail = yield* readRecords(threadId);
-        return { records, detail };
+        // Imported transcripts hydrate through thread management before SQL paging.
+        yield* threads
+          .getThreadRecords(ThreadId.make(threadId), [])
+          .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+        return yield* store
+          .messagePage({
+            threadId,
+            role: params.get("role"),
+            runId: params.get("runId"),
+            since: parseSince(params.get("since")),
+            afterMessageId: params.get("afterMessageId"),
+            limit:
+              boolParam(params.get("all")) === true
+                ? null
+                : clampInt(params.get("limit"), DEFAULT_MESSAGE_LIMIT, 1000),
+          })
+          .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
       }),
       "poll",
     );
-    const role = params.get("role");
-    const runId = params.get("runId");
-    const since = parseSince(params.get("since"));
-    const after = params.get("afterMessageId");
-    const ordered = records.messages.toSorted(
-      (left, right) =>
-        DateTime.toEpochMillis(left.createdAt) - DateTime.toEpochMillis(right.createdAt) ||
-        left.id.localeCompare(right.id),
-    );
-    const afterIndex = after === null ? -1 : ordered.findIndex((message) => message.id === after);
-    const filtered = ordered
-      .slice(afterIndex + 1)
-      .filter(
-        (message) =>
-          message.role !== "system" &&
-          (role === null || role === "all" || message.role === role) &&
-          (runId === null || message.runId === runId) &&
-          (since === undefined || DateTime.toEpochMillis(message.updatedAt) > since),
-      );
-    const limit = clampInt(params.get("limit"), DEFAULT_MESSAGE_LIMIT, 1000);
-    const page = boolParam(params.get("all")) === true ? filtered : filtered.slice(-limit);
-    const last = lastAssistantText(records.messages, runId);
-    const pending = detail.runtimeRequests.some((request) => request.status === "pending");
-    const { state, run } = stateFromRuns(detail.runs, pending);
     return yield* encoded({
       ok: true,
       threadId,
-      state,
-      status: run?.status ?? "idle",
-      runId: run?.id ?? null,
-      total: filtered.length,
-      messages: page.map(messageSummary),
-      lastAssistant: last,
+      state: page.state,
+      status: page.status,
+      runId: page.runId,
+      total: page.total,
+      messages: page.messages.map(messageSummary),
+      lastAssistant: page.lastAssistant,
     });
   });
 

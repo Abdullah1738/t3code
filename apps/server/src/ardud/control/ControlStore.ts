@@ -4,10 +4,12 @@
  * that touches these tables, created idempotently, never a numbered migration.
  */
 import {
+  OrchestrationV2ConversationMessageJson,
   OrchestrationV2RuntimeRequestJson,
   OrchestrationV2TurnItemJson,
   type OrchestrationV2RuntimeRequest,
   type OrchestrationV2TurnItem,
+  type OrchestrationV2ConversationMessage,
   type OrchestrationV2Run,
   type ThreadId,
 } from "@t3tools/contracts";
@@ -18,9 +20,11 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
+import type * as Statement from "effect/sql/Statement";
 
 import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
 import { importedThreadQuery, providerThreadQuery } from "./nativeLookup.ts";
+import { lastAssistantText, stateFromRunStatus } from "./model.ts";
 
 export class ControlStoreError extends Schema.TaggedError<ControlStoreError>()(
   "ControlStoreError",
@@ -35,6 +39,24 @@ export interface ThreadOriginRow {
 
 export interface ControlStoreShape {
   readonly ownerShell: (threadId: string) => Effect.Effect<OwnerShell | null, ControlStoreError>;
+  readonly messagePage: (input: {
+    readonly threadId: string;
+    readonly role: string | null;
+    readonly runId: string | null;
+    readonly since: number | undefined;
+    readonly afterMessageId: string | null;
+    readonly limit: number | null;
+  }) => Effect.Effect<
+    {
+      readonly messages: ReadonlyArray<OrchestrationV2ConversationMessage>;
+      readonly total: number;
+      readonly lastAssistant: ReturnType<typeof lastAssistantText>;
+      readonly state: ReturnType<typeof stateFromRunStatus>;
+      readonly status: OrchestrationV2Run["status"] | "idle";
+      readonly runId: string | null;
+    },
+    ControlStoreError
+  >;
   readonly getOrigin: (threadId: string) => Effect.Effect<string | null, ControlStoreError>;
   readonly getOrigins: (
     threadIds: ReadonlyArray<string>,
@@ -494,7 +516,139 @@ export const make = Effect.gen(function* () {
     Effect.mapError(fail("count-thread-candidates")),
   );
 
+  const decodeMessage = Schema.decodeUnknownEffect(
+    Schema.fromJsonString(OrchestrationV2ConversationMessageJson),
+  );
+  const compareMessageIds = (
+    left: { readonly message_id: string; readonly created_at: string },
+    right: { readonly message_id: string; readonly created_at: string },
+  ) =>
+    DateTime.toEpochMillis(DateTime.makeUnsafe(right.created_at)) -
+      DateTime.toEpochMillis(DateTime.makeUnsafe(left.created_at)) ||
+    right.message_id.localeCompare(left.message_id);
+  const newestMessageIds = Effect.fn("ControlStore.newestMessageIds")(function* (
+    predicate: Statement.Fragment,
+    limit: number,
+  ) {
+    const rows = yield* sql<{ readonly message_id: string; readonly created_at: string }>`
+      SELECT message_id, created_at FROM orchestration_v2_projection_messages WHERE ${predicate}
+      ORDER BY CAST(ROUND(unixepoch(created_at, 'subsec') * 1000) AS INTEGER) DESC LIMIT ${limit}`;
+    const boundary = rows.at(-1);
+    if (boundary === undefined) return [];
+    // SQLite's binary id order differs from localeCompare. Include every id at
+    // the boundary before choosing the page, without reading their text payloads.
+    const ties = yield* sql<{ readonly message_id: string; readonly created_at: string }>`
+      SELECT message_id, created_at FROM orchestration_v2_projection_messages WHERE ${predicate}
+        AND CAST(ROUND(unixepoch(created_at, 'subsec') * 1000) AS INTEGER) = ${DateTime.toEpochMillis(DateTime.makeUnsafe(boundary.created_at))}`;
+    const unique = new Map([...rows, ...ties].map((row) => [row.message_id, row]));
+    return [...unique.values()]
+      .toSorted(compareMessageIds)
+      .slice(0, limit)
+      .map((row) => row.message_id);
+  });
+  const messagePage: ControlStoreShape["messagePage"] = Effect.fn("ControlStore.messagePage")(
+    (input) =>
+      sql.withTransaction(
+        Effect.gen(function* () {
+          const { threadId, role, runId, since, afterMessageId, limit } = input;
+          // Resolve the cursor before role/run/since filters: it may itself be a system message.
+          const anchor =
+            afterMessageId === null
+              ? undefined
+              : (yield* sql<{
+                  readonly created_at: string;
+                  readonly message_id: string;
+                }>`SELECT created_at, message_id FROM orchestration_v2_projection_messages
+        WHERE thread_id = ${threadId} AND message_id = ${afterMessageId}`)[0];
+          const anchorTime =
+            anchor === undefined
+              ? undefined
+              : DateTime.toEpochMillis(DateTime.makeUnsafe(anchor.created_at));
+          const ties =
+            anchorTime === undefined
+              ? []
+              : yield* sql<{ readonly message_id: string }>`
+        SELECT message_id FROM orchestration_v2_projection_messages WHERE thread_id = ${threadId}
+          AND CAST(ROUND(unixepoch(created_at, 'subsec') * 1000) AS INTEGER) = ${anchorTime}`;
+          const afterIds =
+            anchor === undefined
+              ? []
+              : ties
+                  .filter((row) => row.message_id.localeCompare(anchor.message_id) > 0)
+                  .map((row) => row.message_id);
+          const predicate = sql`thread_id = ${threadId} AND role <> 'system'
+        ${role === null || role === "all" ? sql`` : sql`AND role = ${role}`}
+        ${runId === null ? sql`` : sql`AND run_id = ${runId}`}
+        ${since === undefined ? sql`` : sql`AND CAST(ROUND(unixepoch(updated_at, 'subsec') * 1000) AS INTEGER) > ${since}`}
+        ${
+          anchorTime === undefined
+            ? sql``
+            : sql`AND (CAST(ROUND(unixepoch(created_at, 'subsec') * 1000) AS INTEGER) > ${anchorTime}
+          OR (CAST(ROUND(unixepoch(created_at, 'subsec') * 1000) AS INTEGER) = ${anchorTime}
+            AND message_id IN (SELECT value FROM json_each(${encodeIds(afterIds)}))))`
+        }`;
+          const count = yield* sql<{ readonly total: number }>`SELECT COUNT(*) AS total
+        FROM orchestration_v2_projection_messages WHERE ${predicate}`;
+          const ids = limit === null ? null : yield* newestMessageIds(predicate, limit);
+          const rows = yield* sql<{ readonly payload_json: string }>`SELECT payload_json
+        FROM orchestration_v2_projection_messages WHERE ${ids === null ? predicate : sql`thread_id = ${threadId} AND message_id IN (SELECT value FROM json_each(${encodeIds(ids)}))`}`;
+          const decoded = yield* Effect.forEach(rows, (row) => decodeMessage(row.payload_json));
+          const messages = decoded.toSorted(
+            (left, right) =>
+              DateTime.toEpochMillis(left.createdAt) - DateTime.toEpochMillis(right.createdAt) ||
+              left.id.localeCompare(right.id),
+          );
+          // Only assistant ids/timestamps are read up front. Text stays in bounded
+          // batches, preserving locale ties and JS trim's Unicode whitespace rules.
+          const assistantIds = (yield* sql<{
+            readonly message_id: string;
+            readonly created_at: string;
+          }>`
+        SELECT message_id, created_at FROM orchestration_v2_projection_messages
+        WHERE thread_id = ${threadId} AND role = 'assistant'
+          ${runId === null ? sql`` : sql`AND run_id = ${runId}`}`).toSorted(compareMessageIds);
+          let lastAssistant: ReturnType<typeof lastAssistantText> = null;
+          for (
+            let offset = 0;
+            offset < assistantIds.length && lastAssistant === null;
+            offset += 32
+          ) {
+            const ids = assistantIds.slice(offset, offset + 32).map((row) => row.message_id);
+            const candidates = yield* sql<{ readonly payload_json: string }>`SELECT payload_json
+          FROM orchestration_v2_projection_messages WHERE thread_id = ${threadId}
+            AND message_id IN (SELECT value FROM json_each(${encodeIds(ids)}))`;
+            lastAssistant = lastAssistantText(
+              yield* Effect.forEach(candidates, (row) => decodeMessage(row.payload_json)),
+              runId,
+            );
+          }
+          const runs = yield* sql<{
+            readonly run_id: string;
+            readonly status: OrchestrationV2Run["status"];
+          }>`
+        SELECT run_id, status FROM orchestration_v2_projection_runs WHERE thread_id = ${threadId}
+        ORDER BY CASE WHEN status IN ('preparing', 'starting', 'running') THEN 0
+          WHEN status = 'waiting' THEN 1 WHEN status = 'queued' THEN 2 ELSE 3 END,
+          ordinal DESC LIMIT 1`;
+          const pending = yield* sql`SELECT 1 FROM orchestration_v2_projection_runtime_requests
+        WHERE thread_id = ${threadId} AND status = 'pending' LIMIT 1`;
+          const run = runs[0];
+          return {
+            messages,
+            total: count[0]?.total ?? 0,
+            lastAssistant,
+            state: stateFromRunStatus(run?.status ?? null, pending.length > 0),
+            status: run?.status ?? ("idle" as const),
+            runId: run?.run_id ?? null,
+          };
+        }),
+      ),
+    NodeSqliteClient.readOnly,
+    Effect.mapError(fail("read-message-page")),
+  );
+
   return ControlStore.of({
+    messagePage,
     threadCandidatePage,
     threadCandidateCount,
     getOrigin,
