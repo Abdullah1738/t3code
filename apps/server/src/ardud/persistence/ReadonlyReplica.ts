@@ -17,6 +17,7 @@ import {
   createReadonlyReplica,
   type ReadonlyReplicaOptions,
   type ReadonlyExportMetrics,
+  type ReadonlyRebuildEvent,
 } from "./readonlyExport.ts";
 
 export class ReadonlyReplicaMaintenanceError extends Schema.TaggedError<ReadonlyReplicaMaintenanceError>()(
@@ -49,6 +50,7 @@ export class ReadonlyExportUnavailable extends Schema.TaggedError<ReadonlyExport
 
 /** Messages the export worker posts to its supervisor. */
 type WorkerMessage =
+  | { readonly type: "rebuild"; readonly rebuild: ReadonlyRebuildEvent }
   | { readonly type: "metrics"; readonly metrics: ReadonlyExportMetrics }
   | { readonly type: "opened" | "step" }
   | { readonly type: "published"; readonly cycleMs?: number }
@@ -142,7 +144,10 @@ const fail = (stage, error) => {
   });
 };
 try {
-  replica = (${replicaFactory})(require('node:sqlite'), require('node:fs'), require('node:path'), workerData, (${resolveHistoryBasePath.toString()}));
+  replica = (${replicaFactory})(require('node:sqlite'), require('node:fs'), require('node:path'), { ...workerData, onRebuildEvent: (rebuild) => {
+    console.log(JSON.stringify({ type: 'readonly-export', ...rebuild }));
+    parentPort.postMessage({ type: 'rebuild', rebuild });
+  } }, (${resolveHistoryBasePath.toString()}));
   beat('opened');
   const step = () => {
     try {
@@ -196,6 +201,13 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
     identityRows: 0,
     identityLagMaxMs: 0,
   };
+  const rebuildEvents: ReadonlyRebuildEvent[] = [];
+  const logRebuilds = Effect.gen(function* () {
+    for (const event of rebuildEvents.splice(0))
+      yield* (event.event === "abort" ? Effect.logWarning : Effect.logInfo)(
+        "Readonly export rebuild",
+      ).pipe(Effect.annotateLogs({ ...event }), Effect.withSpan("ardud.readonlyExport.rebuild"));
+  });
   let metricsLoggedAt = Number.NEGATIVE_INFINITY;
   let slowCycleMs: number | undefined;
   let slowLoggedAt = Number.NEGATIVE_INFINITY;
@@ -235,6 +247,7 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
           );
         } else {
           lastBeat = clock.currentTimeMillisUnsafe();
+          if (message?.type === "rebuild") rebuildEvents.push(message.rebuild);
           if (message?.type === "metrics") {
             for (const [cause, count] of Object.entries(message.metrics.lineageRepairCounts))
               metrics.lineageRepairCounts[cause] =
@@ -282,6 +295,7 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
     while (true) {
       yield* Effect.sleep(Duration.millis(Math.max(10, Math.min(stallMs / 4, 30_000))));
       const now = clock.currentTimeMillisUnsafe();
+      yield* logRebuilds;
       for (const bump of metrics.lineageRepairs.splice(0))
         yield* Effect.logInfo("Readonly lineage repair revision bumped").pipe(
           Effect.annotateLogs({ ...bump }),
@@ -336,7 +350,7 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
       try: spawn,
       catch: (error) => new ReadonlyExportUnavailable({ stage: "spawn", reason: String(error) }),
     }),
-    (worker) => Effect.raceFirst(signal(worker), watchdog),
+    (worker) => Effect.raceFirst(signal(worker), watchdog).pipe(Effect.ensuring(logRebuilds)),
     (worker) =>
       Effect.promise(() => worker.terminate()).pipe(
         Effect.timeout(options.terminateTimeout),

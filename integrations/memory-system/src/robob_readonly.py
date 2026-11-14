@@ -1,6 +1,7 @@
 """Outside readers use the server export, never the server's writable database."""
 
 import os
+import json
 import sqlite3
 import stat
 import sys
@@ -118,11 +119,12 @@ def connect_ro(path, *, timeout=30, check_same_thread=True):
 
 
 def ready_generation(con, *, max_age=120, source="Robob", schema_version=None, require_destructive=False):
-    """The exporter clears ready while paging, then publishes a new watermark."""
+    """Validate the published watermark; rebuild diagnostics never imply freshness."""
     try:
         metadata = dict(con.execute(
             "SELECT key,value FROM ardud_readonly_meta "
-            "WHERE key IN ('schema_version','destructive_ready','updated_at','ready','generation')"))
+            "WHERE key IN ('schema_version','destructive_ready','updated_at','ready','generation',"
+            "'rebuild_started_at','rebuild_progress','rebuild_finished_at')"))
         if schema_version is not None and metadata.get("schema_version") != schema_version:
             raise ValueError("unsupported export schema")
         if require_destructive and metadata.get("destructive_ready") != "1":
@@ -135,9 +137,18 @@ def ready_generation(con, *, max_age=120, source="Robob", schema_version=None, r
             raise ValueError("timestamp has no timezone")
         age = (datetime.now(timezone.utc) - at).total_seconds()
         if metadata.get("ready") != "1" or not -30 <= age <= max_age:
+            rebuilding = ""
+            if metadata.get("rebuild_started_at") and not metadata.get("rebuild_finished_at"):
+                rebuilding = f"; rebuilding since {metadata['rebuild_started_at']}"
+                try:
+                    progress = json.loads(metadata.get("rebuild_progress", "{}"))
+                    rebuilding += f" (table {progress.get('table') or 'pending'}, {progress.get('rows', 0)} rows)"
+                except (ValueError, TypeError, AttributeError):
+                    pass
+            status = "not ready" if metadata.get("ready") != "1" else "stale"
             raise ReplicaNotReady(
-                f"{source} recall replica not ready (generation {metadata.get('generation', 'unknown')}, "
-                f"updated_at {updated}, ready {metadata.get('ready', 'missing')}); retry later")
+                f"{source} recall replica {status} (generation {metadata.get('generation', 'unknown')}, "
+                f"updated_at {updated}, ready {metadata.get('ready', 'missing')}){rebuilding}; retry later")
     except ReplicaNotReady:
         raise
     except (sqlite3.Error, KeyError, TypeError, ValueError) as exc:

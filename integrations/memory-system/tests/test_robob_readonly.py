@@ -182,6 +182,24 @@ class ReadonlyTest(unittest.TestCase):
                 with self.assertRaises(ro.UnsafeStateDatabase):
                     ro.state_ro(self.replica)
 
+    def test_not_ready_includes_rebuild_start_and_progress(self):
+        self.make_replica()
+        with closing(sqlite3.connect(self.replica)) as con, con:
+            con.execute("UPDATE ardud_readonly_meta SET value='0' WHERE key='ready'")
+            con.executemany("INSERT OR REPLACE INTO ardud_readonly_meta VALUES (?,?)", [
+                ("rebuild_started_at", "2026-11-14T11:35:38.457Z"),
+                ("rebuild_progress", json.dumps({"table": "ardud_kanban_cards", "rows": 250})),
+            ])
+        with self.assertRaisesRegex(ro.ReplicaNotReady, r"rebuilding since 2026-11-14T11:35:38.457Z \(table ardud_kanban_cards, 250 rows\)"):
+            ro.state_ro(self.replica)
+
+    def test_published_but_aged_replica_is_reported_as_stale(self):
+        self.make_replica()
+        with closing(sqlite3.connect(self.replica)) as con, con:
+            ready(con, updated_at=(datetime.now(timezone.utc) - timedelta(seconds=121)).isoformat())
+        with self.assertRaisesRegex(ro.ReplicaNotReady, "recall replica stale"):
+            ro.state_ro(self.replica)
+
     def test_native_freshness_uses_metadata_not_file_mtime(self):
         self.make_replica()
         old = time.time() - 121
