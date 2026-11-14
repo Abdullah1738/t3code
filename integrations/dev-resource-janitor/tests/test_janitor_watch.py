@@ -1,6 +1,7 @@
 """The hourly watcher is bounded separately from its scan/apply worker."""
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -187,11 +188,33 @@ class QuietCheckTests(unittest.TestCase):
         self.command = self.root / "fake telegram"
         self.command.write_text(f"#!{sys.executable}\n" + """
 import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+key = args[args.index('--key') + 1]
+spec = {name: args[args.index('--' + name) + 1] for name in ('source', 'severity', 'text')}
+receipts_path = Path(os.environ['DEV_JANITOR_TEST_ARGV']).with_name('bridge-receipts.json')
+receipts = json.loads(receipts_path.read_text()) if receipts_path.exists() else {}
+rc = int(os.environ.get('DEV_JANITOR_TEST_RC', '0'))
+status, created = 503, False
+if rc == 0:
+    # Telegram's /notify receipts survive forever: same key/content replays; changed content conflicts.
+    if key not in receipts:
+        receipts[key] = spec
+        receipts_path.write_text(json.dumps(receipts))
+        status, created = 202, True
+    elif receipts[key] == spec:
+        status = 200
+    else:
+        status, rc = 409, 1
+saved = json.loads((Path(os.environ['DEV_JANITOR_WATCH_STATE']) / 'alerts.json').read_text())
+kind = key.split(':')[1]
+persisted = saved.get('last_alerts', {}).get(kind, {}).get('delivery_key') == key
 with open(os.environ['DEV_JANITOR_TEST_ARGV'], 'a') as f:
-    f.write(json.dumps({'argv': sys.argv[1:], 'inspect': os.environ.get('BUN_INSPECT')}) + '\\n')
-print('Telegram queue response')
+    f.write(json.dumps({'argv': args, 'inspect': os.environ.get('BUN_INSPECT'),
+                        'status': status, 'created': created, 'persisted': persisted}) + '\\n')
+print(json.dumps({'created': created}))
 print('Telegram diagnostic', file=sys.stderr)
-sys.exit(int(os.environ.get('DEV_JANITOR_TEST_RC', '0')))
+sys.exit(rc)
 """)
         self.command.chmod(0o755)
         self.env = {**os.environ, "DEV_JANITOR_TELEGRAM_CMD": str(self.command),
@@ -234,11 +257,14 @@ sys.exit(int(os.environ.get('DEV_JANITOR_TEST_RC', '0')))
         self.assertEqual(len(calls), 1)
         args = calls[0]["argv"]
         self.assertEqual(args[:5], ["notify", "--source", "Dev janitor", "--severity", "attention"])
-        self.assertEqual(args[-2:], ["--key", f"dev-janitor:{kind}"])
+        self.assertEqual(args[-2], "--key")
+        self.assertRegex(args[-1], rf"^dev-janitor:{kind}:[0-9a-f]{{32}}$")
         self.assertIsNone(calls[0]["inspect"])
+        self.assertTrue(calls[0]["persisted"], "delivery identity must be on disk before the send")
         entry = self.audits()[-1]
         self.assertEqual((entry["event"], entry["kind"], entry["telegram_ok"]), ("alert", kind, ok))
         self.assertEqual(entry["text"], args[args.index("--text") + 1])
+        self.assertEqual(entry["delivery_key"], args[-1])
         return entry
 
     def test_no_previous_state_is_silent(self):
@@ -272,6 +298,7 @@ sys.exit(int(os.environ.get('DEV_JANITOR_TEST_RC', '0')))
         self.assertEqual(len(self.calls()), 1)
         self.assertEqual(len(self.audits()), 2)
         self.assertTrue(self.audits()[-1]["deduplicated"])
+        self.assertEqual(self.audits()[-1]["delivery_key"], self.audits()[0]["delivery_key"])
         self.assertNotIn("last_alerts", janitor_watch.read_state())
 
     def test_dedupe_expires_at_six_hours(self):
@@ -286,6 +313,82 @@ sys.exit(int(os.environ.get('DEV_JANITOR_TEST_RC', '0')))
         self.check({"status": "failed", "error": "second"})
         self.check({"status": "running"})
         self.assertEqual(len(self.calls()), 3)
+        self.assertEqual([call["status"] for call in self.calls()], [202, 202, 202])
+        self.assertTrue(all(entry["telegram_ok"] for entry in self.audits()))
+
+    def test_bridge_permanent_receipts_survive_changed_text_and_cooldown_expiry(self):
+        cases = [
+            (100000, "a", 1),
+            (100001, "a", 1),
+            (100002, "b", 2),
+            (100003, "a", 2),
+            (121599, "a", 2),
+            (121600, "a", 3),
+            (121601, "b", 3),
+            (121602, "b", 4),
+        ]
+        for at, text, expected_calls in cases:
+            with self.subTest(at=at, text=text), patch.object(janitor_watch.time, "time", return_value=at):
+                self.check({"status": "failed", "error": text})
+            self.assertEqual(len(self.calls()), expected_calls)
+        calls = self.calls()
+        self.assertEqual([call["status"] for call in calls], [202] * 4)
+        self.assertTrue(all(call["created"] and call["persisted"] for call in calls))
+        keys = [call["argv"][-1] for call in calls]
+        self.assertEqual(len(set(keys)), 4)
+        self.assertEqual([entry["delivery_key"] for entry in self.audits()],
+                         [keys[0], keys[0], keys[1], keys[0], keys[0], keys[2], keys[1], keys[3]])
+        self.assertTrue(all(entry["telegram_ok"] for entry in self.audits() if not entry["deduplicated"]))
+
+    def test_bridge_fixture_replays_identical_keys_and_rejects_changed_payload(self):
+        self.check({"status": "failed", "error": "first"})
+        original = self.calls()[0]["argv"]
+        repeat = subprocess.run([str(self.command), *original], capture_output=True, text=True, timeout=5)
+        self.assertEqual(repeat.returncode, 0)
+        self.assertEqual((self.calls()[-1]["status"], self.calls()[-1]["created"]), (200, False))
+        changed = list(original)
+        changed[changed.index("--text") + 1] = "a different failure"
+        conflict = subprocess.run([str(self.command), *changed], capture_output=True, text=True, timeout=5)
+        self.assertEqual(conflict.returncode, 1)
+        self.assertEqual(self.calls()[-1]["status"], 409)
+
+    def test_timeout_after_queue_acceptance_preserves_occurrence_and_cooldown(self):
+        real_run = subprocess.run
+
+        def accepted_then_timeout(*args, **kwargs):
+            self.assertEqual(real_run(*args, **kwargs).returncode, 0)
+            raise subprocess.TimeoutExpired("fake", 20)
+
+        failure = {"status": "failed", "error": "a"}
+        with patch.object(janitor_watch.time, "time", return_value=100000), \
+                patch.object(janitor_watch.subprocess, "run", side_effect=accepted_then_timeout):
+            self.check(failure)
+        first_key = self.calls()[0]["argv"][-1]
+        self.assertTrue(self.calls()[0]["persisted"])
+        self.assertEqual(self.audits()[-1]["delivery_key"], first_key)
+        self.assertFalse(self.audits()[-1]["telegram_ok"])
+        with patch.object(janitor_watch.time, "time", return_value=100001):
+            self.check(failure)
+        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual(self.audits()[-1]["delivery_key"], first_key)
+        with patch.object(janitor_watch.time, "time", return_value=121600):
+            self.check(failure)
+        self.assertEqual([call["status"] for call in self.calls()], [202, 202])
+        self.assertNotEqual(self.calls()[-1]["argv"][-1], first_key)
+
+    def test_old_timestamp_state_keeps_cooldown_then_creates_a_new_occurrence(self):
+        text = "dev-janitor: a"
+        text_hash = hashlib.sha256(text.encode()).hexdigest()
+        janitor_watch.write_json(self.state / "alerts.json", {"last_alerts": {"worker_failed": {
+            "text_hash": text_hash, "at": 100000, "recent": {text_hash: 100000}}}})
+        with patch.object(janitor_watch.time, "time", return_value=100001):
+            self.check({"status": "failed", "error": "a"})
+        self.assertEqual(self.calls(), [])
+        self.assertTrue(self.audits()[-1]["deduplicated"])
+        self.assertIsNone(self.audits()[-1]["delivery_key"])
+        with patch.object(janitor_watch.time, "time", return_value=121600):
+            self.check({"status": "failed", "error": "a"})
+        self.assert_alert("worker_failed")
 
     def test_dedupe_handles_interleaved_failure_texts_and_failed_sends(self):
         cases = [

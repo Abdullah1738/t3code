@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 
 STATE_DIR = Path(os.environ.get(
@@ -57,16 +58,24 @@ def alert(kind, text):
         recent = dict(recent) if isinstance(recent, dict) else {}
         # Keep the six-hour text history: alternating failures must not reset each other's cooldown.
         if isinstance(previous.get("text_hash"), str):
-            recent.setdefault(previous["text_hash"], previous.get("at"))
-        recent = {h: at for h, at in recent.items()
-                  if isinstance(at, (int, float)) and now - at < ALERT_SECONDS}
+            recent.setdefault(previous["text_hash"], {"at": previous.get("at"),
+                                                     "delivery_key": previous.get("delivery_key")})
+        # Older state stored only timestamps. Keep its cooldown when upgrading.
+        recent = {h: {"at": entry} if isinstance(entry, (int, float)) else entry
+                  for h, entry in recent.items()}
+        recent = {h: entry for h, entry in recent.items()
+                  if isinstance(entry, dict) and isinstance(entry.get("at"), (int, float))
+                  and now - entry["at"] < ALERT_SECONDS}
         deduped = text_hash in recent
+        delivery_key = recent.get(text_hash, {}).get("delivery_key")
         telegram_ok = False
         error = "deduplicated for 6 hours" if deduped else None
         if not deduped:
-            # Persist attempts before sending: a timeout may already have queued the notification.
-            recent[text_hash] = now
-            last_alerts[kind] = {"text_hash": text_hash, "at": now, "recent": recent}
+            # Bridge keys are permanent. Persist a fresh identity per occurrence before a send can time out.
+            delivery_key = f"dev-janitor:{kind}:{uuid.uuid4().hex}"
+            recent[text_hash] = {"at": now, "delivery_key": delivery_key}
+            last_alerts[kind] = {"text_hash": text_hash, "at": now, "delivery_key": delivery_key,
+                                 "recent": recent}
             write_json(path, {"last_alerts": last_alerts})
             override = os.environ.get("DEV_JANITOR_TELEGRAM_CMD")
             cmd = [override] if override else [
@@ -74,7 +83,7 @@ def alert(kind, text):
             try:
                 result = subprocess.run(
                     ["env", "-u", "BUN_INSPECT", *cmd, "notify", "--source", "Dev janitor",
-                     "--severity", "attention", "--text", text, "--key", f"dev-janitor:{kind}"],
+                     "--severity", "attention", "--text", text, "--key", delivery_key],
                     capture_output=True, text=True, timeout=20)
                 telegram_ok = result.returncode == 0
                 if not telegram_ok:
@@ -82,7 +91,8 @@ def alert(kind, text):
             except (OSError, subprocess.SubprocessError) as e:
                 error = str(e)[:500]
         dev_janitor.audit({"ts": now, "event": "alert", "kind": kind, "text": text,
-                           "telegram_ok": telegram_ok, "error": error, "deduplicated": deduped})
+                           "telegram_ok": telegram_ok, "error": error, "deduplicated": deduped,
+                           "delivery_key": delivery_key})
 
 
 def read_state():

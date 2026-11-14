@@ -55,7 +55,9 @@ use their worktree or project workspace. No roster absence proves an ended owner
 each action, can run beyond the watcher's 60-second check deadline, and records its result for the next check.
 An overlapping check doesn't start a second worker. Checks never print to stdout (robob-watch would forward it
 to iMessage). Failed, lost or four-hour-overdue workers, spawn failures and tmpdir-prune failures go to Telegram
-with `dev-janitor:<kind>` keys and an audit `alert` entry, including whether Telegram accepted the request.
+with `dev-janitor:<kind>:<occurrence>` keys and an audit `alert` entry, including the delivery key and whether
+Telegram accepted the request. Each occurrence's key is persisted before sending: the bridge permanently
+deduplicates keys, so a changed error or a repeat after the cooldown needs a new key.
 Identical kind/text attempts are suppressed for six hours using `hourly/alerts.json`, separate from worker state.
 Telegram failures are audited without printing; check stderr goes to `~/.local/share/dev-janitor/watch.err`.
 Report-only findings and liveness problems stay in `audit.jsonl` as `report` entries and never alert.
