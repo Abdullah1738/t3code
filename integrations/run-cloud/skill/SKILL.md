@@ -72,6 +72,7 @@ rcsim list [--all]           # registered sessions, owners, last heartbeat
 - `--name` is the label Abdullah sees. Make it say what it is.
 - Short id prefixes work for `heartbeat/release/claim/link`.
 - `rcsim whoami` shows the owner thread and manager it resolved.
+- Exit 3 = Robob control API down or identity not mapped yet; wait and retry the same command. Exit 2 with `not-mapped` = the session has no Robob thread.
 - If caller resolution is refused, nothing reached Run Cloud. Do not report an
   outage or bypass ownership. Follow the diagnostic; a Claude shared-session
   refusal requires a resolved Codex/OpenCode child (`robob-dispatch`).
