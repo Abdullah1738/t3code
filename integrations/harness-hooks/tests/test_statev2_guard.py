@@ -2006,6 +2006,235 @@ class GuardTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertIsNone(guard.classify(command, str(root)))
 
+    def test_js_temp_database_fixture_reporters(self):
+        repo = Path(__file__).resolve().parents[3]
+        target = 'integrations/stream-recovery/test/cli.test.mjs'
+        for command in (f'node --test {target}', 'node --test integrations/stream-recovery/test',
+                        f'offbox run -- node --test {target}', f"offbox run -- 'node --test {target}'",
+                        f'offbox run --no-fallback --bg -- node --test {target}'):
+            with self.subTest(command=command):
+                self.assertIsNone(guard.classify(command, str(repo)))
+        source = '''import { test } from 'bun:test';
+import { mkdtempSync, realpathSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+const directories = [];
+const unrelatedLabel = '.robob';
+test('restart', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'spectrum-early-restart-'));
+  directories.push(directory);
+  const path = join(directory, 'state.sqlite');
+  new Database(path);
+});
+test('recovery', () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'spectrum-download-recovery-')));
+  const path = join(root, 'state.sqlite');
+  new Database(path);
+});
+test('failure', () => {
+  const root = mkdtempSync(join(tmpdir(), 'spectrum-download-failure-'));
+  const path = join(root, 'state.sqlite');
+  new Database(path);
+});
+'''
+        self.write('test/router.test.ts', source)
+        for command in ('bun test test/router.test.ts', 'node --test test/router.test.ts',
+                        'offbox run -- bun test test/router.test.ts',
+                        "offbox run -- 'bun --version && bun install --frozen-lockfile && bun test test/router.test.ts'"):
+            with self.subTest(command=command):
+                self.assertIsNone(self.classify(command))
+
+    def test_js_temp_database_fixture_expressions(self):
+        imports = '''import { mkdtempSync, realpathSync } from 'node:fs';
+import { mkdtemp, realpath } from 'node:fs/promises';
+import * as fs from 'node:fs';
+import * as fsp from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import os from 'node:os';
+import { join, resolve } from 'node:path';
+import path from 'node:path';
+'''
+        for expression in ('mkdtempSync(tmpdir())', 'await mkdtemp(join(tmpdir(), "case-"))',
+                           'fs.mkdtempSync(path.join(os.tmpdir(), "case-"))',
+                           'await fsp.mkdtemp(os.tmpdir())',
+                           'realpathSync(mkdtempSync(join(tmpdir(), "case-")))',
+                           'fs.realpathSync(mkdtempSync(tmpdir()))',
+                           'await realpath(await mkdtemp(tmpdir()))'):
+            for build in ('join(root, ".robob/userdata/statev2.sqlite")',
+                          'path.join(root, ".t3/userdata/state.sqlite")',
+                          'resolve(join(root, "nested"), "opencode.db")',
+                          '`${root}/.robob/userdata/statev2.sqlite`'):
+                self.write('temp.test.ts', imports + f'const root = {expression};\nnew Database({build});')
+                with self.subTest(expression=expression, build=build):
+                    self.assertIsNone(self.classify('bun test temp.test.ts'))
+        for setup, name in (('const fixture = {}; fixture.root = mkdtempSync(tmpdir());', 'fixture.root'),
+                            ('const fixture = { root: mkdtempSync(tmpdir()) };', 'fixture.root'),
+                            ('let root = mkdtempSync(tmpdir()); const child = join(root, "nested");', 'child')):
+            self.write('temp.test.ts', imports + setup + f'new Database(join({name}, ".robob/userdata/statev2.sqlite"));')
+            with self.subTest(setup=setup):
+                self.assertIsNone(self.classify('node --test temp.test.ts'))
+
+    def test_js_temp_database_fixture_near_misses(self):
+        imports = '''import { test } from 'bun:test';
+import { Database } from 'bun:sqlite';
+import { mkdtempSync, realpathSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+'''
+        rows = [
+            'new Database(join(homedir(), ".robob/userdata/statev2.sqlite"));',
+            'readFileSync(join(process.env.HOME, ".t3/userdata/state.sqlite"));',
+            'spawn("sqlite3", ["~/.robob/userdata/statev2.sqlite"]);',
+            'readFileSync("~/.local/share/opencode/opencode.db");',
+            'let root = mkdtempSync(tmpdir()); root = homedir(); new Database(join(root, ".robob/userdata/statev2.sqlite"));',
+            'let root = mkdtempSync(tmpdir()); root = process.env.HOME; new Database(join(root, ".t3/userdata/state.sqlite"));',
+            'let root = mkdtempSync(tmpdir()); root = "/Users/ardud/.robob/userdata"; new Database(join(root, "statev2.sqlite"));',
+            'const root = mkdtempSync(join(homedir(), ".robob/userdata/x")); new Database(join(root, "statev2.sqlite"));',
+            'const root = realpathSync(join(homedir(), ".t3/userdata")); new Database(join(root, "state.sqlite"));',
+            'const root = mkdtempSync(tmpdir()); new Database(resolve(root, "/Users/ardud/.robob/userdata/statev2.sqlite"));',
+            'const root = mkdtempSync(tmpdir()); new Database(join(root, "../../.robob/userdata/statev2.sqlite"));',
+            'const root = mkdtempSync(tmpdir()); new Database(join(root, ".robob/userdata/statev2.sqlite")); readFileSync("~/.robob/userdata/statev2.sqlite");',
+            'let root = mkdtempSync(tmpdir()); root += "/../../"; new Database(join(root, ".robob/userdata/statev2.sqlite"));',
+            'const fixture = {root: mkdtempSync(tmpdir())}; fixture.root = homedir(); new Database(join(fixture.root, ".robob/userdata/statev2.sqlite"));',
+            'const fixture = {root: mkdtempSync(tmpdir())}; fixture["root"] = process.env.HOME; new Database(join(fixture.root, ".t3/userdata/state.sqlite"));',
+            'const root = mkdtempSync(tmpdir()); new Database(join(root, ".robob/userdata/statev2.sqlite")); readFileSync(join(process["env"]["HOME"], ".t3/userdata/state.sqlite"));',
+            'const tmpdir = () => "/Users/ardud/.robob/userdata"; const root = mkdtempSync(tmpdir()); new Database(join(root, "statev2.sqlite"));',
+            'let root = mkdtempSync(tmpdir()); root = externalRoot; new Database(join(root, ".robob/userdata/statev2.sqlite"));',
+            'const root = realpathSync(externalRoot); new Database(join(root, ".robob/userdata/statev2.sqlite"));',
+            'const root = mkdtempSync("prefix-"); new Database(join(root, ".robob/userdata/statev2.sqlite"));',
+            'let fixture = {root: mkdtempSync(tmpdir())}; fixture = externalObject; new Database(join(fixture.root, ".robob/userdata/statev2.sqlite"));',
+            'const root = mkdtemp(tmpdir()); new Database(join(root, ".robob/userdata/statev2.sqlite"));',
+        ]
+        for source in rows:
+            self.write('temp.test.ts', imports + source)
+            for command in ('bun test temp.test.ts', 'node --test temp.test.ts', 'offbox run -- bun test temp.test.ts'):
+                with self.subTest(source=source, command=command):
+                    self.assertEqual(self.classify(command), SCRIPT)
+
+    def test_js_temp_database_parameter_bindings_shadow_outer_roots(self):
+        imports = '''import { mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+const root = mkdtempSync(join(tmpdir(), 'guard95-'));
+'''
+        read = "readFileSync(join(root, '.robob/userdata/statev2.sqlite'))"
+        rows = [
+            f'function readLive(root) {{ {read}; }} readLive("/Users/x");',
+            f'async function readLive(root) {{ {read}; }} readLive("/Users/x");',
+            f'const readLive = function(root) {{ {read}; }}; readLive("/Users/x");',
+            f'const readLive = (root) => {{ {read}; }}; readLive("/Users/x");',
+            f'const readLive = async (root) => {{ {read}; }}; readLive("/Users/x");',
+            f'const readLive = root => {{ {read}; }}; readLive("/Users/x");',
+            f'const readLive = root => {read}; readLive("/Users/x");',
+            f'const readLive = (root: string) => {{ {read}; }}; readLive("/Users/x");',
+            f'const readLive = (root: string): void => {{ {read}; }}; readLive("/Users/x");',
+            f'const readLive = async (root: string): Promise<void> => {{ {read}; }}; readLive("/Users/x");',
+            f'const readLive = (root: string): {{ok: boolean}} => {{ {read}; return {{ok:true}}; }}; readLive("/Users/x");',
+            f'function readLive(root: string): void {{ {read}; }} readLive("/Users/x");',
+            f'const object = {{ readLive(root) {{ {read}; }} }}; object.readLive("/Users/x");',
+            f'function readLive({{root}}) {{ {read}; }} readLive({{root:"/Users/x"}});',
+            f'try {{ throw "/Users/x"; }} catch(root) {{ {read}; }}',
+            f'for (const root of ["/Users/x"]) {{ {read}; }}',
+            f'{{ const {{root}} = {{root: "/Users/x"}}; {read}; }}',
+            f'{{ const [root] = ["/Users/x"]; {read}; }}',
+        ]
+        for source in rows:
+            self.write('shadow.test.ts', imports + source)
+            for command in ('node --test shadow.test.ts', 'bun test shadow.test.ts'):
+                with self.subTest(source=source, command=command):
+                    self.assertEqual(self.classify(command), SCRIPT)
+
+    def test_js_temp_database_property_receiver_shadowing(self):
+        imports = '''import { mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+const fixture = { root: mkdtempSync(join(tmpdir(), 'guard95-')) };
+'''
+        read = "readFileSync(join(fixture.root, '.robob/userdata/statev2.sqlite'))"
+        rows = [
+            f'function readLive(fixture) {{ {read}; }} readLive({{root:"/Users/x"}});',
+            f'async function readLive(fixture) {{ {read}; }} readLive({{root:"/Users/x"}});',
+            f'function readLive<T>(fixture: {{root:string}}) {{ {read}; }} readLive({{root:"/Users/x"}});',
+            f'async function readLive<T extends {{value: Array<string>}}>(fixture: {{root:string}}): Promise<void> {{ {read}; }} readLive({{root:"/Users/x"}});',
+            f'const readLive = function<T>(fixture: Fixture) {{ {read}; }}; readLive({{root:"/Users/x"}});',
+            f'const readLive = async <T>(fixture: Fixture): Promise<void> => {{ {read}; }}; readLive({{root:"/Users/x"}});',
+            f'const object = {{ readLive<T>(fixture: Fixture) {{ {read}; }} }}; object.readLive({{root:"/Users/x"}});',
+            f'const object = {{ async readLive<T>(fixture: Fixture): Promise<void> {{ {read}; }} }}; object.readLive({{root:"/Users/x"}});',
+            f'class Reader {{ readLive<T>(fixture: Fixture): void {{ {read}; }} }} new Reader().readLive({{root:"/Users/x"}});',
+            f'const readLive = function(fixture) {{ {read}; }}; readLive({{root:"/Users/x"}});',
+            f'const readLive = (fixture) => {{ {read}; }}; readLive({{root:"/Users/x"}});',
+            f'const readLive = fixture => {read}; readLive({{root:"/Users/x"}});',
+            f'const readLive = async (fixture: Fixture): Promise<void> => {{ {read}; }}; readLive({{root:"/Users/x"}});',
+            f'const object = {{ readLive(fixture) {{ {read}; }} }}; object.readLive({{root:"/Users/x"}});',
+            f'function readLive({{fixture}}) {{ {read}; }} readLive({{fixture:{{root:"/Users/x"}}}});',
+            f'try {{ throw {{root:"/Users/x"}}; }} catch(fixture) {{ {read}; }}',
+            f'for (const fixture of [{{root:"/Users/x"}}]) {{ {read}; }}',
+            f'{{ const fixture = {{root:"/Users/x"}}; {read}; }}',
+            f'{{ const {{fixture}} = {{fixture:{{root:"/Users/x"}}}}; {read}; }}',
+            f'{{ class fixture {{ static root = "/Users/x"; }} {read}; }}',
+            f'{{ class fixture {{ static root = "/home/x"; }} {read}; }}',
+            f'const object = {{ ["readLive"]<T>(fixture: Fixture) {{ {read}; }} }}; object.readLive({{root:"/Users/x"}});',
+            f'const object = {{ [method]<T>(fixture: Fixture) {{ {read}; }} }}; object[method]({{root:"/Users/x/folder/.."}});',
+            f'{{ class fixture {{ static root = {json.dumps(str(Path.home()))}; }} {read}; }}',
+            f'import {{cwd}} from "node:process"; const object = {{ ["readLive"]<T>(fixture: Fixture) {{ {read}; }} }}; object.readLive({{root:cwd()}});',
+        ]
+        for source in rows:
+            self.write('shadow.test.mjs', imports + source)
+            for command in ('node --test shadow.test.mjs', 'bun test shadow.test.mjs'):
+                with self.subTest(source=source, command=command):
+                    self.assertEqual(self.classify(command), SCRIPT)
+
+    def test_search_patterns_are_data_and_targets_remain_protected(self):
+        for command in (
+            "rg -n 'statev2 guard|names.*state.sqlite|test.*fixture' integrations/harness-hooks --glob '*.py' --glob '*.ts' --glob '*.sh' | head -40",
+            "grep -rn 'statev2.sqlite' integrations/", "rg -e 'opencode\\.db' src/",
+            "rg -n '~/.robob/userdata/statev2.sqlite' src/",
+            "rg -e '~/.robob/userdata/statev2.sqlite' src/", "rg --regexp='~/.robob/userdata/statev2.sqlite' src/",
+            "grep -rne '~/.robob/userdata/statev2.sqlite' src/", "rg -- '~/.robob/userdata/statev2.sqlite' src/",
+            "rg -e x -e '~/.robob/userdata/statev2.sqlite' src/", "grep --regexp '~/.robob/userdata/statev2.sqlite' src/",
+            "rg -e'~/.robob/userdata/statev2.sqlite' src/", "grep -n -e '~/.robob/userdata/statev2.sqlite' -- src/",
+        ):
+            with self.subTest(command=command):
+                self.assertIsNone(self.classify(command))
+        for command in (
+            'rg x ~/.robob/userdata/statev2.sqlite', 'grep -a foo ~/.t3/userdata/statev2.sqlite',
+            'rg -e x -- ~/.robob/userdata/statev2.sqlite', 'grep --regexp=x ~/.local/share/opencode/opencode.db',
+            'rg -g ~/.robob/userdata/statev2.sqlite x src/',
+            'rg --glob=statev2.sqlite x ~/.robob/userdata',
+            'grep -f ~/.robob/userdata/statev2.sqlite x src/',
+            'grep --exclude-from ~/.robob/userdata/statev2.sqlite x src/',
+            'rg --ignore-file ~/.robob/userdata/statev2.sqlite x src/',
+            'rg -n -- x ~/.robob/userdata/statev2.sqlite',
+            'grep -ne x -- ~/.robob/userdata/statev2.sqlite',
+            'rg --unknown-option ~/.robob/userdata/statev2.sqlite x',
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(self.classify(command), READ)
+
+    def test_search_runner_option_arity(self):
+        # The same short flag can be a switch in grep and a value in rg.
+        rows = [
+            ('grep', '-T'), ('grep', '-rnT'), ('grep', '--initial-tab'),
+            ('grep', '-r'), ('grep', '--recursive'), ('grep', '--color'),
+            ('grep', '--color=always'), ('grep', '--colour'),
+            ('grep', '-A 2'), ('grep', '-B2'), ('grep', '-C 2'), ('grep', '-m 2'),
+            ('grep', '-D read'), ('grep', '-d recurse'),
+            ('rg', '-T py'), ('rg', '-r replacement'), ('rg', '-M 80'), ('rg', '-j 2'),
+            ('rg', '-E utf-8'), ('rg', '--color always'), ('rg', '--color=always'),
+            ('rg', '-g *.ts'), ('rg', '-t ts'),
+        ]
+        for runner, options in rows:
+            for separator in ('', '-- '):
+                command = f'{runner} {options} {separator}needle {LIVE}'
+                with self.subTest(command=command):
+                    self.assertEqual(self.classify(command), READ)
+            command = f'{runner} {options} -e needle {LIVE}'
+            with self.subTest(command=command):
+                self.assertEqual(self.classify(command), READ)
+            command = f'{runner} {options} {shlex.quote(LIVE)} src/'
+            with self.subTest(command=command):
+                self.assertIsNone(self.classify(command))
+
     def test_node_test_refusal_only_hints_for_vitest_imports(self):
         for module in ('node:test', 'vitest', 'vite-plus/test', None):
             source = f'import {{ test }} from "{module}";\n' if module else '// fixture\n'
