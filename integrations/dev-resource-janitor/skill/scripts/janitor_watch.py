@@ -50,6 +50,10 @@ def check():
             return
 
         previous = read_state()
+        if previous.get("processes"):
+            print("dev-janitor processes (report-only): " + json.dumps(previous["processes"]))
+        if previous.get("liveness_unavailable"):
+            print("dev-janitor liveness_unavailable: " + previous["liveness_unavailable"])
         if previous.get("status") == "running":
             print("dev-janitor: previous hourly worker exited without recording a result")
         elif previous.get("status") == "failed":
@@ -78,9 +82,7 @@ def worker(lock_fd):
         import dev_janitor
 
         scan = dev_janitor.scan()
-        os.makedirs(dev_janitor.LOG_DIR, exist_ok=True)
-        with open(dev_janitor.LAST, "w") as f:
-            json.dump(scan, f, indent=1)
+        dev_janitor.record_report(scan)
         stats["found"] = len(scan["resources"])
         candidates = scan["candidates"]
         if candidates:
@@ -91,7 +93,9 @@ def worker(lock_fd):
             if failures:
                 raise RuntimeError("apply failed: " + "; ".join(failures))
         ok = True
-        write_state({"status": "ok", "finished_at": time.time()})
+        write_state({"status": "ok", "finished_at": time.time(),
+                     "liveness_unavailable": scan.get("liveness_unavailable"),
+                     "processes": {key: scan.get("processes", {}).get(key, []) for key in ("candidates", "problems", "checked", "skipped", "budget_skipped")}})
     except Exception as e:  # noqa: BLE001
         write_state({"status": "failed", "error": str(e)[:500], "finished_at": time.time()})
         return 1

@@ -1,3 +1,4 @@
+import { messageLengthError } from "./message-length.ts";
 import { toolError } from "./toollog.ts";
 import { newFormKeys } from "./secret-crypto.ts";
 import { createHash } from "node:crypto";
@@ -50,7 +51,7 @@ const errors = {
   502: "Tailnet publish failed", 503: "Bridge is not ready",
 } as const;
 class ApiError extends Error {
-  constructor(readonly status: keyof typeof errors) { super(errors[status]); }
+  constructor(readonly status: keyof typeof errors, message: string = errors[status]) { super(message); }
 }
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 const string = (value: unknown, max: number): value is string =>
@@ -298,6 +299,7 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         fields(body, ["base64", "name", "mimeType", "text", "dedupeKey", "sessionId"]);
         const { base64, name, mimeType, dedupeKey, sessionId } = body;
         const text = body.text === undefined ? "" : body.text;
+        if (typeof text === "string" && text.length > 12_000) throw new ApiError(400, messageLengthError(text, 12_000));
         // One-time notification attachments moved to the telegram bridge; only
         // interactive session-bound sends remain here.
         if (sessionId === undefined) throw new ApiError(400);
@@ -319,6 +321,7 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
       if (path === "/send") {
         fields(body, ["text", "effect", "subject", "dedupeKey", "sessionId"]);
         const { text, effect, subject, dedupeKey, sessionId } = body;
+        if (typeof text === "string" && text.length > 12_000) throw new ApiError(400, messageLengthError(text, 12_000));
         if (!string(text, 12_000) || !string(dedupeKey, 200) || !validSession(sessionId)
           || (effect !== undefined && !isEffect(effect)) || !optionalLine(subject, 256)) throw new ApiError(400);
         const turnKey = store.get<{ messageId: string } | undefined>("activeTurn")?.messageId ?? "idle";
@@ -358,6 +361,7 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         // Watchers wake whichever session is live, so this route is deliberately not session-bound.
         fields(body, ["text", "source", "dedupeKey"]);
         const { text, source, dedupeKey } = body;
+        if (typeof text === "string" && text.length > 12_000) throw new ApiError(400, messageLengthError(text, 12_000));
         if (!string(text, 12_000) || !line(source, 100) || !string(dedupeKey, 200)) throw new ApiError(400);
         const id = `wake:${hash(dedupeKey)}`;
         const created = store.db.transaction(() => {
@@ -462,7 +466,7 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
       throw new ApiError(404);
     } catch (error) { toolError("api", "api.catch6", error);
       const status = error instanceof ApiError ? error.status : 409;
-      return json({ error: errors[status] }, status);
+      return json({ error: error instanceof ApiError ? error.message : errors[status] }, status);
     }
   };
 }

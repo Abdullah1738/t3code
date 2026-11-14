@@ -15,6 +15,7 @@ import {
   askGateWarning,
   inferGate,
   isNegativeOption,
+  secretKindApprovalWarning,
 } from "./subtasks.ts";
 import { makeFake, owner, testLayer, toyBoard } from "./askFlows.testkit.ts";
 
@@ -1174,6 +1175,123 @@ const relevanceCard = (
   asks,
 });
 
+const billingSubtask: KanbanSubtask = {
+  ...goChoiceSubtask,
+  text: "Owner fixes the failed payment or Actions spending limit",
+  gate: "money",
+  createdAt: "2026-11-14T09:00:30.000Z",
+};
+
+const duplicateBillingCard = (title = "Close #4319 as a duplicate of #4315 Blacksmith") => ({
+  ...relevanceCard([
+    relevanceAsk({
+      id: "q1",
+      text: "Actions payments failed: fix the spending limit or billing?",
+      blocking: true,
+      at: "2026-11-14T09:01:00.000Z",
+      closedAt: "2026-11-14T09:03:51.000Z",
+      answer: {
+        verdict: "answered",
+        text: "Blacksmith migration is ongoing please follow it",
+        by: owner,
+        at: "2026-11-14T09:03:51.000Z",
+      },
+    }),
+    relevanceAsk({
+      id: "q2",
+      kind: "question",
+      text: "Close #4319 as a duplicate of #4315, with no billing change on Equicom-Crypto?",
+      title,
+      at: "2026-11-14T09:04:00.000Z",
+      closedAt: "2026-11-14T09:07:54.000Z",
+      answer: { verdict: "approved", by: owner, at: "2026-11-14T09:07:54.000Z" },
+    }),
+  ]),
+  number: 4319,
+  subtasks: [billingSubtask],
+});
+
+it("#4319: the reported billing title concerns the money step after #1418", () => {
+  const card = duplicateBillingCard(
+    "Close #4319 (Actions billing) as a duplicate of #4315 Blacksmith",
+  );
+  assert.isNull(approvalProblem(card, billingSubtask));
+});
+
+it.each([
+  { verdict: "answered", reason: "was answered" },
+  { verdict: "rejected", reason: "was rejected" },
+  { verdict: "dropped", reason: "was dropped (a dropped ask is not approval)" },
+  {
+    verdict: "picked",
+    reason:
+      'picked "Wait", which doesn\'t read as approving money; ask again with an Approve option or an action ask',
+  },
+] as const)("#4319: later unnamed approval explains refusal after q1 $verdict", ({ verdict, reason }) => {
+  const card = duplicateBillingCard();
+  const q1 = card.asks[0]!;
+  const q2 = card.asks[1]!;
+  const asks = [
+    {
+      ...q1,
+      options: [{ id: "wait", label: "Wait" }],
+      answer: { ...q1.answer!, verdict, optionIds: verdict === "picked" ? ["wait"] : [] },
+    },
+    q2,
+  ];
+  assert.strictEqual(inferGate(`${q2.text} ${q2.title}`), undefined);
+  assert.include(
+    approvalProblem({ ...card, asks }, billingSubtask)!,
+    `the latest decision, q1, ${reason}; q2 (approved later) doesn't name s1, so it doesn't count; ask again naming s1`,
+  );
+});
+
+it("#4319: naming s1 makes the later approval count; skipping needs only q1's owner answer", () => {
+  const card = duplicateBillingCard();
+  assert.isNotNull(approvalProblem(card, billingSubtask));
+  assert.isNull(approvalProblem(card, billingSubtask, [], undefined, "skip"));
+  const named = {
+    ...card,
+    asks: card.asks.map((ask) =>
+      ask.id === "q2" ? { ...ask, text: `Approve s1: ${ask.text}` } : ask,
+    ),
+  };
+  assert.isNull(approvalProblem(named, billingSubtask));
+});
+
+it.each(["2026-11-14T09:03:50.000Z", "2026-11-14T09:03:51.000Z"])(
+  "#4319: an unnamed approval at %s does not shadow the later or simultaneous q1 answer",
+  (at) => {
+    const card = duplicateBillingCard();
+    const q2 = card.asks[1]!;
+    const asks = [
+      card.asks[0]!,
+      { ...q2, at: "2026-11-14T09:02:00.000Z", closedAt: at, answer: { ...q2.answer!, at } },
+    ];
+    assert.strictEqual(
+      approvalProblem({ ...card, asks }, billingSubtask),
+      approvalProblem({ ...card, asks: [asks[0]!] }, billingSubtask),
+    );
+  },
+);
+
+it("#4319: a later unnamed picked approval keeps the naming hint", () => {
+  const card = duplicateBillingCard();
+  const q2 = card.asks[1]!;
+  const asks = [
+    card.asks[0]!,
+    {
+      ...q2,
+      options: [{ id: "go", label: "Approve" }],
+      answer: { ...q2.answer!, verdict: "picked" as const, optionIds: ["go"] },
+    },
+  ];
+  assert.include(
+    approvalProblem({ ...card, asks }, billingSubtask)!,
+    "q2 (approved later) doesn't name s1",
+  );
+});
+
 it.each(
   ["2026-11-13T14:02:00.000Z", "2026-11-13T14:04:00.000Z"].flatMap((at) =>
     ["Check the CI run", "Approve s6", "Deploy the bundle"].flatMap((text) =>
@@ -1521,6 +1639,62 @@ it.each([
 it.each(["done", "skipped"] as const)("a %s gate needs no ask warning", (state) => {
   const card = { ...relevanceCard([]), subtasks: [{ ...mergeSubtask, state }] };
   assert.isUndefined(askGateWarning(card, relevanceAsk({ text: "Close the card?" })));
+});
+
+it.each([
+  { kind: "secret", state: "open", gate: "secret", warning: true },
+  { kind: "decision", state: "open", gate: "secret", warning: false },
+  { kind: "action", state: "open", gate: "secret", warning: false },
+  { kind: "secret", state: "done", gate: "secret", warning: false },
+  { kind: "secret", state: "skipped", gate: "secret", warning: false },
+  { kind: "secret", state: "open", gate: undefined, warning: false },
+  { kind: "secret", state: "open", gate: "deploy", warning: false },
+] as const)(
+  "secret-kind approval warning: $kind / $state / $gate",
+  ({ kind, state, gate, warning }) => {
+    const card = {
+      subtasks: [{ ...relevanceSubtask, id: "s3", text: "Check access", gate, state }],
+    };
+    const note = secretKindApprovalWarning(card, relevanceAsk({ kind, text: "Approve s3" }));
+    assert.strictEqual(note !== undefined, warning);
+    if (warning)
+      assert.strictEqual(
+        note,
+        'Kind "secret" asks Abdullah to type a secret value. To approve s3, ask a decision naming s3 instead.',
+      );
+  },
+);
+
+it("a real secret request on an ungated card needs no warning", () => {
+  assert.isUndefined(secretKindApprovalWarning({ subtasks: [] }, relevanceAsk({ kind: "secret" })));
+});
+
+it("a secret-kind warning lists only open secret-gated ids", () => {
+  const card = {
+    subtasks: [
+      { ...relevanceSubtask, id: "s3" },
+      { ...relevanceSubtask, id: "s4", state: "done" as const },
+      { ...relevanceSubtask, id: "s7" },
+      mergeSubtask,
+    ],
+  };
+  assert.strictEqual(
+    secretKindApprovalWarning(card, relevanceAsk({ kind: "secret", text: "Approve s3 and s7" })),
+    'Kind "secret" asks Abdullah to type a secret value. To approve s3, s7, ask a decision naming the intended subtask id instead.',
+  );
+});
+
+it.each(["work", "review"] as const)("a stored secret gate on $owner needs no warning", (owner) => {
+  const card = { subtasks: [{ ...relevanceSubtask, owner }] };
+  assert.isUndefined(secretKindApprovalWarning(card, relevanceAsk({ kind: "secret" })));
+});
+
+it("a secret-kind warning respects enabled inferred gates and explicit gates", () => {
+  const ask = relevanceAsk({ kind: "secret" });
+  const card = { subtasks: [{ ...relevanceSubtask, gate: undefined }] };
+  assert.isDefined(secretKindApprovalWarning(card, ask, ["secret"]));
+  assert.isUndefined(secretKindApprovalWarning(card, ask, []));
+  assert.isDefined(secretKindApprovalWarning({ subtasks: [relevanceSubtask] }, ask, []));
 });
 
 it("ambiguous inferred wording warns and naming one gate avoids the warning", () => {

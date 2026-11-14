@@ -43,7 +43,7 @@ const HELP = `t3ctl <command> [options]
   projects                             list projects
   models                               default model and available models
   usage --since ISO|MS [--until ISO|MS] [--board ID] [--limit N] [--all-pages]
-  threads [--origin O] [--active] [--state S] [--since ISO] [--limit N] [--all-kinds]
+  threads [--origin O] [--active] [--state S] [--since ISO] [--limit N] [--cursor C] [--all-kinds]
   create [--prompt P] [--title T] [--dir D | --project ID] [--model M] [--instance I]
          [--variant V] [--option K=V ...] [--mode full-access|approval-required|...] [--origin O] [--plan]
          [--wait] [--timeout SECONDS]
@@ -253,6 +253,7 @@ async function main() {
       until: { type: "string" },
       board: { type: "string" },
       limit: { type: "string" },
+      cursor: { type: "string" },
       "all-pages": { type: "boolean" },
       "all-kinds": { type: "boolean" },
       last: { type: "boolean" },
@@ -463,6 +464,7 @@ async function main() {
         active: flags.active,
         state: flags.state,
         updatedSince: flags.since,
+        cursor: flags.cursor,
         limit: flags.limit,
         includeSubagents: flags["all-kinds"],
       });

@@ -308,7 +308,8 @@ test("files accept only strict canonical base64, bounded metadata, and bytes rat
     { url: "file:///PRIVATE_FILE" }, { attachment: {} }, { chatGuid: "other" }, { source: "other" }, { replyTo: "other" }, { generation: 1 }]) {
     const response = await h.post("/files", { ...file, ...change });
     expect(response.status).toBe(400);
-    expect(await response.json()).toEqual({ error: "Invalid request" });
+    expect(await response.json()).toEqual({ error: typeof change.text === "string" && change.text.length > 12_000
+      ? "message too long: 12,001 chars, limit 12,000; split it or send as a card" : "Invalid request" });
   }
   expect((await h.post("/files", { file: "/PRIVATE_FILE", dedupeKey: "path", sessionId: "current" })).status).toBe(400);
   expect(h.store.db.query("SELECT * FROM blobs").all()).toEqual([]);
@@ -352,4 +353,16 @@ test("only /files has a 28 MiB JSON budget, including declared and streaming lim
   }))).status).toBe(413);
   expect(cancelled).toBe(true);
   expect(reads).toBeLessThanOrEqual(30);
+});
+
+test("send and wake HTTP errors include the actual message length and limit", async () => {
+  const h = setup();
+  h.store.set("route", { id: "current", generation: 1 });
+  for (const path of ["/send", "/wake"]) {
+    const response = await h.post(path, { text: "x".repeat(12_412), dedupeKey: "long",
+      ...(path === "/send" ? { sessionId: "current" } : { source: "watch" }) });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: "message too long: 12,412 chars, limit 12,000; split it or send as a card" });
+  }
+  expect(h.store.pendingOutbox()).toEqual([]);
 });

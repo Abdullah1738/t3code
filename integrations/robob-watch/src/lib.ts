@@ -79,6 +79,8 @@ export type Watcher = {
   id: string;
   title: string;
   check: string;
+  /** Read-only poll for replies to existing outreach; the only check allowed during removal grace. */
+  inflight_check?: string;
   /** Side-effect-only check after a committed run or while delivery is pending; it must not consume ordinary events. */
   pending_check?: string;
   interval_s: number;
@@ -120,7 +122,16 @@ export type Watcher = {
   created_by_session: string | null;
 };
 export type State = {
-  status: "active" | "done" | "expired";
+  status: "active" | "closing" | "done" | "expired";
+  closing_until?: number;
+  closing_from?: "active" | "done" | "expired";
+  closing_watcher?: Watcher;
+  admitted_run?: { run: string; attempt: string; watcher: Watcher; accepted?: true };
+  reply_handoff?: { run: string; watcher: Watcher; accepted_run?: string };
+  discarded_run?: string;
+  closing_final_started?: boolean;
+  closing_final_check?: boolean;
+  batch?: { at: number; events: string[]; watcher?: Watcher; frozen_context?: true; healthRuns?: string[] };
   fires: number;
   last_run_at?: string;
   last_fire_at?: string;
@@ -140,7 +151,7 @@ export type State = {
   /** Wall time of the last check run, in ms. */
   last_run_ms?: number;
   /** An event whose delivery has not succeeded yet; retried verbatim with the same key. */
-  pending?: { key: string; event: string; at: string; healthRun?: string };
+  pending?: { key: string; event: string; at: string; count?: number; watcher?: Watcher; context_file?: string; healthRun?: string; healthRuns?: string[] };
   last_delivery?: string;
   /** Delivered wakes whose bridge inbound row may still be queued behind a busy agent turn. */
   wakes?: TrackedWake[];
@@ -148,6 +159,183 @@ export type State = {
   trigger_sig?: string;
 };
 export type TrackedWake = { inbound: string; key: string; event: string; delivered_at: number; attempts?: number };
+
+export const PERSON_BATCH_MS = 150_000;
+export const REMOVAL_GRACE_MS = 15 * 60_000;
+// The bridge is the only wake destination on this version; notify keeps its direct-send timing.
+export const personChat = (watcher: Watcher) => watcher.mode === "wake";
+export const sameDestination = (a: Watcher, b: Watcher) => a.mode === b.mode && a.chat === b.chat;
+export const checking = (state: State) => state.status === "active" || (state.status === "closing" && !!state.closing_watcher);
+export function pollingWatcher(watcher: Watcher, state: State) {
+  const admitted = state.reply_handoff?.watcher ?? (state.status === "closing" ? state.closing_watcher
+    : state.admitted_run && !state.admitted_run.accepted ? state.admitted_run.watcher : watcher);
+  if (!admitted || admitted === watcher) return admitted;
+  // Repairs change how checks run; their unaccepted output keeps its original destination and authority.
+  return { ...watcher, id: admitted.id, title: admitted.title, check: admitted.check,
+    inflight_check: admitted.inflight_check, mode: admitted.mode, context: admitted.context,
+    chat: admitted.chat, trip: admitted.trip, relays: admitted.relays,
+    created_at: admitted.created_at, created_by_session: admitted.created_by_session };
+}
+
+export function watcherInstance(id: string): string | undefined {
+  try {
+    // Removal renames this directory into archive; reusing the ID creates a different directory.
+    const stat = statSync(watcherDir(id));
+    return `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`;
+  } catch { return undefined; }
+}
+
+export function retiredWatcher(id: string): boolean {
+  return existsSync(join(ARCHIVE, "retired", `${id}.json`));
+}
+
+export function archiveWatcher(id: string): string {
+  const target = join(ARCHIVE, `${id}-${now()}`);
+  const retired = join(ARCHIVE, "retired");
+  mkdirSync(retired, { recursive: true, mode: 0o700 });
+  writeJson(join(retired, `${id}.json`), { archived: target, at: iso() });
+  log(id, "removed");
+  const state = loadState(id);
+  if (state.status === "closing" && state.closing_from) {
+    state.status = state.closing_from;
+    delete state.closing_from;
+    delete state.closing_until;
+    delete state.closing_watcher;
+    delete state.admitted_run;
+    delete state.reply_handoff;
+    delete state.closing_final_started;
+    delete state.closing_final_check;
+    saveState(id, state);
+  }
+  renameSync(watcherDir(id), target);
+  return target;
+}
+
+export function finalizeClosing(id: string): boolean {
+  return withRelayLock(() => {
+    const state = loadState(id);
+    const watcher = loadWatcher(id);
+    if (!watcher || state.status !== "closing" || now() < state.closing_until!
+      || (!watcher.paused && (!state.closing_final_check || state.pending || state.batch))) return false;
+    archiveWatcher(id);
+    return true;
+  });
+}
+
+export function removeWatcher(id: string, immediately = false): { archived?: string; closing_until?: number } {
+  return withRelayLock(() => {
+    if (immediately) return { archived: archiveWatcher(id) };
+    const watcher = loadWatcher(id);
+    if (!watcher) throw new Error(`Unknown watcher ${id}`);
+    if (!watcher.inflight_check || watcher.paused) return { archived: archiveWatcher(id) };
+    const state = loadState(id);
+    if (state.status !== "closing") {
+      state.closing_from = state.status;
+      state.closing_until = now() + REMOVAL_GRACE_MS;
+      state.closing_watcher = { ...watcher, check: watcher.inflight_check };
+      delete state.closing_final_started;
+      delete state.closing_final_check;
+    }
+    state.status = "closing";
+    state.next_at = 0;
+    delete state.failure_paused_at;
+    saveState(id, state);
+    log(id, `closing until ${iso(state.closing_until!)}`);
+    return { closing_until: state.closing_until };
+  });
+}
+
+export function editWatcher(id: string, change: (watcher: Watcher) => Watcher): Watcher {
+  return withRelayLock(() => {
+    const watcher = loadWatcher(id);
+    if (!watcher) throw new Error(`Unknown watcher ${id}`);
+    const next = normalize(change(watcher));
+    writeJson(join(watcherDir(id), "watcher.json"), next);
+    return next;
+  });
+}
+
+export function checkEvent(output: string): { event: string; urgent: boolean } {
+  const event = output.trim();
+  try {
+    const value = JSON.parse(event);
+    return { event, urgent: value?.urgent === true };
+  } catch { return { event, urgent: false }; }
+}
+
+function contextSnapshot(context: string): string {
+  const dir = join(ARCHIVE, "contexts");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const file = join(dir, `${hash(context)}.json`);
+  if (!existsSync(file)) writeJson(file, { context });
+  return file;
+}
+
+export function queueEvent(watcher: Watcher, state: State, event: string, urgent: boolean, preserveContext = false): void {
+  if (personChat(watcher) && !urgent) {
+    state.batch ??= { at: now(), events: [], watcher };
+    state.batch.events.push(event);
+    if (preserveContext) {
+      state.batch.watcher = watcher;
+      state.batch.frozen_context = true;
+    }
+  } else {
+    state.pending = { key: `robob-watch:${watcher.id}:${state.fires + 1}:${hash(event).slice(0, 16)}`, event, at: iso(), watcher, context_file: watcher.mode === "wake" ? contextSnapshot(watcher.context) : undefined };
+  }
+}
+
+export function sealBatch(watcher: Watcher, state: State): void {
+  const batch = state.batch!;
+  const accepted = batch.watcher ?? watcher;
+  const destination = !batch.frozen_context && sameDestination(accepted, watcher) ? { ...accepted, context: watcher.context } : accepted;
+  const key = `robob-watch:${watcher.id}:batch:${hash(JSON.stringify(batch)).slice(0, 32)}`;
+  const events = batch.events.length === 1 ? batch.events[0]! : batch.events.map((event, i) => `${i + 1}. ${event}`).join("\n\n");
+  // A large burst must survive the bridge's text cap. Keep the complete batch for the woken agent to read.
+  const file = join(ARCHIVE, "batches", `${watcher.id}-${hash(key).slice(0, 32)}.json`);
+  if (events.length > MAX_EVENT) {
+    mkdirSync(join(ARCHIVE, "batches"), { recursive: true, mode: 0o700 });
+    writeJson(file, { ...batch, context: destination.context });
+  }
+  const event = events.length <= MAX_EVENT ? events : `${batch.events.length} events, oldest first. Read the complete batch before replying: ${file}`;
+  state.pending = { key, event, count: batch.events.length, at: iso(batch.at), watcher: destination, context_file: contextSnapshot(destination.context), ...(batch.healthRuns ? { healthRuns: batch.healthRuns } : {}) };
+  delete state.batch;
+}
+
+function jsonObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function mergeContext(previous: Record<string, unknown>, patch: Record<string, unknown>): Record<string, unknown> {
+  const result = { ...previous };
+  for (const [key, value] of Object.entries(patch)) {
+    const old = previous[key];
+    Object.defineProperty(result, key, { enumerable: true, configurable: true, writable: true,
+      value: Array.isArray(old) && Array.isArray(value) ? [...old, ...value]
+        : jsonObject(old) && jsonObject(value) ? mergeContext(old, value) : value });
+  }
+  return result;
+}
+
+export function editContext(id: string, patch: string, replace = false): string {
+  return withRelayLock(() => {
+    const watcher = loadWatcher(id);
+    if (!watcher) throw new Error(`Unknown watcher ${id}`);
+    let context = patch;
+    if (!replace) {
+      let before: unknown, after: unknown;
+      try { before = JSON.parse(watcher.context); } catch { /* legacy prose */ }
+      try { after = JSON.parse(patch); } catch { /* prose append */ }
+      if (jsonObject(after)) {
+        context = JSON.stringify(mergeContext(jsonObject(before) ? before : { instructions: watcher.context }, after));
+      } else if (jsonObject(before)) {
+        context = JSON.stringify({ ...before, notes: [...(Array.isArray(before.notes) ? before.notes : before.notes === undefined ? [] : [before.notes]), patch] });
+      } else context = [watcher.context, patch].filter(Boolean).join("\n");
+    }
+    const next = normalize({ ...watcher, context });
+    writeJson(join(watcherDir(id), "watcher.json"), next);
+    return next.context;
+  });
+}
 
 export const HEADSUP_MS = Number(process.env.ROBOB_WATCH_HEADSUP_MS ?? 120_000);
 /** Tracking is dropped after this long even if the row state could never be read. */
@@ -241,6 +429,7 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
   if (!validId(input.id)) errors.push("id must be 1-48 chars of a-z, 0-9, - (starting alphanumeric)");
   if (typeof input.title !== "string" || !input.title.trim() || input.title.length > 200 || /[\x00-\x1f]/.test(input.title)) errors.push("title must be one line, 1-200 chars");
   if (typeof input.check !== "string" || !input.check.trim()) errors.push("check command is required");
+  if (input.inflight_check !== undefined && (typeof input.inflight_check !== "string" || !input.inflight_check.trim())) errors.push("inflight_check must be a nonempty read-only reply check command");
   if (input.pending_check !== undefined && (typeof input.pending_check !== "string" || !input.pending_check.trim())) errors.push("pending_check must be a nonempty command");
   const interval = input.interval_s === undefined ? DEFAULT_INTERVAL : Number(input.interval_s);
   if (!Number.isInteger(interval) || interval < MIN_INTERVAL) errors.push(`interval_s must be an integer >= ${MIN_INTERVAL}`);
@@ -288,6 +477,7 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
     // Only checks that drive the old whatscli TUI need the shared lock; whatsapp-new-message reads a DB now.
     max_fires: maxFires, serial: input.serial === true || /(^|[\s;|&(`$])wa\s+(tui|screen)\b/.test(input.check!),
     paused: input.paused === true,
+    ...(input.inflight_check !== undefined ? { inflight_check: input.inflight_check.trim() } : {}),
     ...(input.pending_check !== undefined ? { pending_check: input.pending_check } : {}),
     ...(timeout !== undefined ? { timeout_s: timeout } : {}),
     ...(maxFailures !== undefined ? { max_consecutive_failures: maxFailures } : {}),
@@ -310,6 +500,7 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
 }
 
 export function loadWatcher(id: string): Watcher | undefined {
+  if (retiredWatcher(id)) return undefined;
   return readJson<Watcher>(join(watcherDir(id), "watcher.json"));
 }
 
@@ -323,7 +514,7 @@ export function saveState(id: string, state: State): void {
 
 export function listIds(): string[] {
   if (!existsSync(WATCHERS)) return [];
-  return readdirSync(WATCHERS).filter(name => validId(name) && existsSync(join(WATCHERS, name, "watcher.json"))).sort();
+  return readdirSync(WATCHERS).filter(name => validId(name) && !!loadWatcher(name)).sort();
 }
 
 export function log(id: string | null, message: string): void {
@@ -348,7 +539,7 @@ export type CheckResult = { code: number | null; signal: NodeJS.Signals | null; 
  * than KILL_GRACE_MS past the timeout: a SIGKILLed process that the scheduler has not reaped yet must not keep
  * its watcher blocked (3 Oct 2026: killed checks lingered 9+ minutes and their watchers never re-ran).
  */
-export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string, string> = {}, timeoutMs = watcher.timeout_s === undefined ? CHECK_TIMEOUT_MS : watcher.timeout_s * 1_000): Promise<CheckResult> {
+export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string, string> = {}, timeoutMs = watcher.timeout_s === undefined ? CHECK_TIMEOUT_MS : watcher.timeout_s * 1_000, instance = watcherInstance(watcher.id)): Promise<CheckResult> {
   const shell = watcher.serial ? ["/usr/bin/lockf", "-k", "-t", "120", WA_LOCK, "/bin/zsh", "-c", watcher.check] : ["/bin/zsh", "-c", watcher.check];
   const started = now();
   return new Promise(resolve => {
@@ -368,10 +559,21 @@ export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string,
       toolLog({ component: "helpers", kind: code === 0 && !timedOut ? "perf" : "error", name: "helper.run", durationMs: ms, ok: code === 0 && !timedOut, ids: { watcher: watcher.id, helper: watcher.id }, props: { exitCode: code, signal, timedOut, ...(code === 0 && !timedOut ? {} : cause.props(timedOut)) }, ...(code === 0 && !timedOut ? {} : { error: { tag: timedOut ? "helper.timeout" : "helper.exit_failed" } }) });
       resolve({ code, signal, stdout, stderr: stderr + extra, timedOut, ms });
     };
-    const child = spawn(shell[0]!, shell.slice(1), {
+    const spawnChild = (closing = extraEnv.WATCH_CLOSING ?? (loadState(watcher.id).status === "closing" ? "1" : "0")) => spawn(shell[0]!, shell.slice(1), {
       cwd: dir, detached: true, stdio: ["ignore", "pipe", "pipe"],
-      env: { HOME, PATH, ...(process.env.TOOLLOG_DIR ? { TOOLLOG_DIR: process.env.TOOLLOG_DIR } : {}), ...(process.env.HEALTH_TOOLLOG_DIR ? { HEALTH_TOOLLOG_DIR: process.env.HEALTH_TOOLLOG_DIR } : {}), LANG: "en_US.UTF-8", WATCH_DIR: dir, WATCH_ID: watcher.id, ...testEnv(), ...(watcher.serial ? { WA_LOCKED: "1" } : {}), ...extraEnv },
+      env: { HOME, PATH, ...(process.env.TOOLLOG_DIR ? { TOOLLOG_DIR: process.env.TOOLLOG_DIR } : {}), ...(process.env.HEALTH_TOOLLOG_DIR ? { HEALTH_TOOLLOG_DIR: process.env.HEALTH_TOOLLOG_DIR } : {}), LANG: "en_US.UTF-8", WATCH_DIR: dir, WATCH_ID: watcher.id, ...testEnv(), ...(watcher.serial ? { WA_LOCKED: "1" } : {}), ...extraEnv, WATCH_CLOSING: closing },
     });
+    // Admission shares the removal lock; a stale callback must never start canceled outreach.
+    const child = dir === watcherDir(watcher.id) ? withRelayLock(() => {
+      if (retiredWatcher(watcher.id) || !instance || watcherInstance(watcher.id) !== instance) throw new Error("Watcher removed before check admission");
+      const state = loadState(watcher.id);
+      const definition = loadWatcher(watcher.id);
+      const current = definition && pollingWatcher(definition, state);
+      const pending = extraEnv.WATCH_PENDING === "1" && state.status !== "closing" && !state.reply_handoff
+        && definition?.pending_check === watcher.check;
+      if (!current || current.paused || (extraEnv.WATCH_PENDING === "1" ? !pending : !checking(state) || current.check !== watcher.check)) throw new Error("Watcher check changed before admission");
+      return spawnChild(state.status === "closing" || state.reply_handoff ? "1" : "0");
+    }) : spawnChild();
     child.stdout!.on("data", chunk => { if (stdout.length < 200_000) stdout += chunk; });
     child.stderr!.setEncoding("utf8");
     child.stderr!.on("data", (chunk: string) => { cause.add(chunk); if (stderr.length < 20_000) stderr += chunk; });
@@ -572,13 +774,17 @@ export function relayCheck(given: Watcher, to: string, eta?: number, at = now())
  * Relay checks, stops and replacements run one at a time across processes, so two fires can't both take one ETA
  * slot or miss a stop written meanwhile. A SQLite write lock: the OS drops it if the holder dies.
  */
+// Runner admission calls the library's spawn guard while holding the same process's lock.
+let relayLockDepth = 0;
 export function withRelayLock<T>(fn: () => T): T {
+  if (relayLockDepth) return fn();
   mkdirSync(ROOT, { recursive: true, mode: 0o700 });
   const db = new Database(join(ROOT, "relay-lock.sqlite"));
   try {
     db.exec("PRAGMA busy_timeout = 15000");
     db.exec("BEGIN IMMEDIATE");
-    try { return fn(); } finally { db.exec("COMMIT"); }
+    relayLockDepth++;
+    try { return fn(); } finally { relayLockDepth--; db.exec("COMMIT"); }
   } finally { db.close(); }
 }
 
@@ -618,13 +824,14 @@ function relayVerdict(watcher: Watcher, to: string, eta: number | undefined, at:
 /** Wakes repeat the saved context on every fire; this is the start that carries the action, the rest is a pointer. */
 export const CONTEXT_PREVIEW = 280;
 
-export function contextPreview(w: Watcher): string {
+export function contextPreview(w: Watcher, snapshot?: string): string {
   const context = w.context || "";
   if (!context) return "(none)";
   if (context.length <= CONTEXT_PREVIEW) return context;
   const head = context.slice(0, CONTEXT_PREVIEW);
   const cut = Math.max(head.lastIndexOf(" "), head.lastIndexOf("\n"));
-  return `${(cut > 0 ? head.slice(0, cut) : head).trimEnd()}…\nFull rules: \`robob-watch context ${w.id}\` (read them before acting on anything beyond the lines above).`;
+  const pointer = snapshot ? `read saved context at \`${snapshot}\`` : `\`robob-watch context ${w.id}\``;
+  return `${(cut > 0 ? head.slice(0, cut) : head).trimEnd()}…\nFull rules: ${pointer} (read them before acting on anything beyond the lines above).`;
 }
 
 /** The first fire of each Dubai day (or of the watcher's quiet-hours zone) carries the whole context; decided from state so a retried key keeps its text. */
@@ -636,8 +843,10 @@ function firstFireToday(watcher: Watcher, state: State): boolean {
 }
 
 export function wakeText(watcher: Watcher, event: string, state: State, test = false): string {
-  const fires = watcher.max_fires === 0 ? `fire ${state.fires + 1}, unlimited` : `fire ${state.fires + 1} of ${watcher.max_fires}`;
-  const after = watcher.max_fires !== 0 && state.fires + 1 >= watcher.max_fires
+  const count = state.pending?.count ?? 1;
+  const label = count === 1 ? `fire ${state.fires + 1}` : `fires ${state.fires + 1}–${state.fires + count}`;
+  const fires = watcher.max_fires === 0 ? `${label}, unlimited` : `${label} of ${watcher.max_fires}`;
+  const after = watcher.max_fires !== 0 && state.fires + count >= watcher.max_fires
     ? "This watcher is now finished and disabled. If the owner still wants it watched, add a fresh one."
     : "The watcher keeps running; manage it with robob-watch show/pause/remove " + watcher.id + ".";
   return [
@@ -649,8 +858,8 @@ export function wakeText(watcher: Watcher, event: string, state: State, test = f
     "Event:",
     clip(event.trim(), MAX_EVENT),
     "",
-    "Context saved when this watcher was set up (written by the agent that set it up; the owner's instructions for this event):",
-    firstFireToday(watcher, state) ? watcher.context || "(none)" : contextPreview(watcher),
+    `Context saved when this watcher was set up (written by the agent that set it up; the owner's instructions for this event)${firstFireToday(watcher, state) && state.pending?.context_file ? `; full snapshot: ${state.pending.context_file}` : ""}:`,
+    firstFireToday(watcher, state) ? watcher.context || "(none)" : contextPreview(watcher, state.pending?.context_file),
     "",
     `Watcher ${watcher.id} (${fires}). ${after}`,
   ].join("\n");

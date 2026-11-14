@@ -363,8 +363,7 @@ export const make = Effect.gen(function* () {
     ${
       filter.since === null
         ? sql``
-        : sql`AND updated_at > ${DateTime.formatIso(DateTime.makeUnsafe(filter.since - 1_000))}
-      AND CAST(ROUND(unixepoch(updated_at, 'subsec') * 1000) AS INTEGER) > ${filter.since}`
+        : sql`AND CAST(ROUND(unixepoch(updated_at, 'subsec') * 1000) AS INTEGER) > ${filter.since}`
     }
     ${filter.includeSubagents || filter.parentThreadId !== null ? sql`` : sql`AND json_extract(payload_json, '$.lineage.relationshipToParent') IS NOT 'subagent'`}
     ${filter.parentThreadId === null ? sql`` : sql`AND json_extract(payload_json, '$.lineage.parentThreadId') = ${filter.parentThreadId}`}
@@ -392,15 +391,15 @@ export const make = Effect.gen(function* () {
           json_extract(payload_json, '$.lineage.parentThreadId') AS parent_thread_id,
           json_extract(payload_json, '$.lineage.rootThreadId') AS root_thread_id,
           json_extract(payload_json, '$.creationSource') AS creation_source
-        FROM orchestration_v2_projection_threads INDEXED BY ardud_control_thread_candidates_idx
+        FROM orchestration_v2_projection_threads INDEXED BY ardud_control_thread_candidates_desc_idx
         WHERE ${candidatePredicate(options)}
           ${
             options.after === undefined
               ? sql``
-              : sql`AND updated_at <= ${options.after.updatedAt}
-            AND (updated_at < ${options.after.updatedAt} OR thread_id > ${options.after.threadId})`
+              : sql`AND CAST(ROUND(unixepoch(updated_at, 'subsec') * 1000) AS INTEGER) <= ${DateTime.toEpochMillis(DateTime.makeUnsafe(options.after.updatedAt))}
+            AND (CAST(ROUND(unixepoch(updated_at, 'subsec') * 1000) AS INTEGER) < ${DateTime.toEpochMillis(DateTime.makeUnsafe(options.after.updatedAt))} OR thread_id < ${options.after.threadId})`
           }
-        ORDER BY updated_at DESC, thread_id ASC
+        ORDER BY CAST(ROUND(unixepoch(updated_at, 'subsec') * 1000) AS INTEGER) DESC, thread_id DESC
         LIMIT ${Math.max(1, Math.min(128, Math.trunc(options.limit)))}
       `;
       return rows.map((row): ControlThreadRow => ({
@@ -424,7 +423,7 @@ export const make = Effect.gen(function* () {
     (filter) =>
       sql<{ readonly total: number }>`
       SELECT COUNT(*) AS total
-      FROM orchestration_v2_projection_threads INDEXED BY ardud_control_thread_candidates_idx
+      FROM orchestration_v2_projection_threads INDEXED BY ardud_control_thread_candidates_desc_idx
       WHERE ${candidatePredicate(filter)}
     `.pipe(Effect.map((rows) => rows[0]?.total ?? 0)),
     NodeSqliteClient.readOnly,
