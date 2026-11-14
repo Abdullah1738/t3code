@@ -20,6 +20,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
+import { importedThreadQuery, providerThreadQuery } from "./nativeLookup.ts";
 
 export class ControlStoreError extends Schema.TaggedError<ControlStoreError>()(
   "ControlStoreError",
@@ -270,18 +271,9 @@ export const make = Effect.gen(function* () {
     function* (nativeId, driver) {
       const imported =
         driver === undefined || driver === "opencode"
-          ? yield* controlSql<{ readonly thread_id: string }>`
-              SELECT thread_id FROM ardud_opencode_import WHERE native_session_id = ${nativeId}
-            `
+          ? yield* importedThreadQuery(controlSql, nativeId)
           : [];
-      const live = yield* sql<{ readonly thread_id: string }>`
-        SELECT DISTINCT pt.thread_id
-        FROM orchestration_v2_projection_provider_threads pt
-        WHERE json_extract(pt.payload_json, '$.nativeThreadRef.nativeId') = ${nativeId}
-          AND pt.thread_id IS NOT NULL
-          AND (${driver ?? null} IS NULL
-            OR COALESCE(pt.driver, json_extract(pt.payload_json, '$.driver')) = ${driver ?? null})
-      `;
+      const live = yield* providerThreadQuery(sql, nativeId, driver);
       const threadIds = new Set([
         ...imported.map((row) => row.thread_id),
         ...live.map((row) => row.thread_id),
