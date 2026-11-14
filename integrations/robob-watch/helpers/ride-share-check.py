@@ -38,6 +38,8 @@ from math import isfinite
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+from watch_admission import admitted_check
 sys.path.insert(0, str(HERE / "ride-card"))
 
 WD = os.environ.get("WATCH_DIR", os.getcwd())
@@ -89,6 +91,7 @@ def load():
     return s
 
 
+@admitted_check
 def save(s):
     tmp = STATE + ".tmp"
     with open(tmp, "w") as f:
@@ -238,9 +241,10 @@ def mark_fare_checked(uuid, now):
     save(checkpoint)
 
 
+@admitted_check
 def queue_fare_alert(uuid, t, line):
     # The receipt cannot be read twice, so persist the result before anything else can fail.
-    alert = {"line": line}
+    alert = {"line": line, **({"run": os.environ["WATCH_RUN"]} if os.environ.get("WATCH_RUN") else {})}
     checkpoint = load()
     checkpoint["trips"].setdefault(uuid, {})["fare_alert"] = alert
     save(checkpoint)
@@ -281,6 +285,7 @@ def clear_acked_fares(trips):
             t.pop("fare_alert")
 
 
+@admitted_check
 def finish_run(s, out):
     trips = s["trips"]
     alerts = [t["fare_alert"] for t in trips.values() if t.get("fare_alert")]

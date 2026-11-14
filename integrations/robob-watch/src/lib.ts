@@ -126,6 +126,7 @@ export type State = {
   closing_until?: number;
   closing_from?: "active" | "done" | "expired";
   closing_watcher?: Watcher;
+  admitted_run?: { run: string; attempt: string; watcher: Watcher; accepted?: true };
   reply_handoff?: { run: string; watcher: Watcher; accepted_run?: string };
   discarded_run?: string;
   closing_final_started?: boolean;
@@ -167,7 +168,8 @@ export const sameDestination = (a: Watcher, b: Watcher) => a.mode === b.mode && 
 export const checking = (state: State) => state.status === "active" || (state.status === "closing" && !!state.closing_watcher);
 export const pollingWatcher = (watcher: Watcher, state: State) => state.reply_handoff
   ? { ...state.reply_handoff.watcher, paused: watcher.paused }
-  : state.status === "closing" ? state.closing_watcher && { ...state.closing_watcher, paused: watcher.paused } : watcher;
+  : state.status === "closing" ? state.closing_watcher && { ...state.closing_watcher, paused: watcher.paused }
+  : state.admitted_run && !state.admitted_run.accepted ? { ...state.admitted_run.watcher, paused: watcher.paused } : watcher;
 
 export function watcherInstance(id: string): string | undefined {
   try {
@@ -193,6 +195,7 @@ export function archiveWatcher(id: string): string {
     delete state.closing_from;
     delete state.closing_until;
     delete state.closing_watcher;
+    delete state.admitted_run;
     delete state.reply_handoff;
     delete state.closing_final_started;
     delete state.closing_final_check;

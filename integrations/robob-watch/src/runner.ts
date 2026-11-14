@@ -87,7 +87,7 @@ async function deliverPending(watcher: Watcher, state: State): Promise<boolean> 
     state.wakes = [...(state.wakes ?? []), { inbound: wakeInboundId(pending.key), key: pending.key, event: pending.event, delivered_at: now() }];
   }
   delete state.pending;
-  if (state.status !== "closing" && definition.max_fires !== 0 && state.fires >= definition.max_fires && !state.batch) {
+  if (state.status !== "closing" && definition.max_fires !== 0 && state.fires >= definition.max_fires && !state.batch && !state.admitted_run && !state.reply_handoff) {
     toolLog({ component: "runner", kind: "event", name: "watch.fire_cap", ids: { watcher: watcher.id }, props: { count: state.fires } });
     finish(definition, state, "done");
   }
@@ -180,10 +180,41 @@ function acknowledgeRun(id: string, instance: string | undefined, run: string): 
     const state = loadState(id);
     const discarded = state.discarded_run === run;
     if (discarded) delete state.discarded_run;
+    const admitted = state.admitted_run?.run === run;
+    if (admitted) delete state.admitted_run;
     if (state.reply_handoff?.accepted_run === run) {
       delete state.reply_handoff;
       saveState(id, state);
-    } else if (discarded) saveState(id, state);
+    } else if (discarded || admitted) saveState(id, state);
+  });
+}
+
+function finishRecoveredCap(id: string): void {
+  const definition = loadWatcher(id);
+  const state = loadState(id);
+  if (definition && state.status === "active" && !state.admitted_run && !state.reply_handoff && !state.pending && !state.batch
+    && definition.max_fires !== 0 && state.fires >= definition.max_fires) finish(definition, state, "done");
+}
+
+function recoverAdmission(id: string, instance: string | undefined): void {
+  withRelayLock(() => {
+    if (!instance || watcherInstance(id) !== instance) return;
+    const state = loadState(id);
+    const admitted = state.admitted_run;
+    const definition = loadWatcher(id);
+    if (!admitted || admitted.accepted || !definition) return;
+    const expected = state.reply_handoff?.watcher ?? (state.status === "closing" ? state.closing_watcher : definition);
+    if (expected && sameDestination(admitted.watcher, expected) && admitted.watcher.check === expected.check
+      && (state.status !== "closing" || admitted.watcher.context === expected.context)) return;
+    // A crash can leave a helper outbox before its wrapper returns. Its saved admission, never
+    // a replacement definition, decides who may receive it and which reply checker can replay it.
+    if (admitted.watcher.inflight_check) state.reply_handoff ??= {
+      run: admitted.run, watcher: { ...admitted.watcher, check: admitted.watcher.inflight_check },
+    };
+    else state.discarded_run = admitted.run;
+    delete state.admitted_run;
+    state.next_at = 0;
+    saveState(id, state);
   });
 }
 
@@ -192,11 +223,16 @@ export async function tickOne(id: string): Promise<void> {
   const sameInstance = () => watcherInstance(id) === instance;
   const initial = loadWatcher(id);
   if (!initial) return;
+  finishRecoveredCap(id);
+  recoverAdmission(id, instance);
   let state = loadState(id);
-  const unacked = state.discarded_run ?? state.reply_handoff?.accepted_run;
+  const unacked = state.discarded_run ?? state.reply_handoff?.accepted_run
+    ?? (state.admitted_run?.accepted ? state.admitted_run.run : undefined);
   if (unacked) {
     // State records acceptance before the separate helper ack; finish that ack after a crash/write failure.
     try { acknowledgeRun(id, instance, unacked); } catch { toolError("runner", "watch.ack_failed", { watcher: id }); return; }
+    state = loadState(id);
+    finishRecoveredCap(id);
     state = loadState(id);
   }
   const initialPoller = pollingWatcher(initial, state);
@@ -217,7 +253,7 @@ export async function tickOne(id: string): Promise<void> {
   if (!checking(state) || watcher.paused) return;
   if (held(watcher)) return;
   const t = now();
-  if (state.status !== "closing" && !state.reply_handoff && watcher.expires_at && Date.parse(watcher.expires_at) <= t && !state.pending && !state.batch) {
+  if (state.status !== "closing" && !state.reply_handoff && !state.admitted_run && watcher.expires_at && Date.parse(watcher.expires_at) <= t && !state.pending && !state.batch) {
     finish(watcher, state, "expired");
     const sent = await alert(watcher, `Watcher "${watcher.title}" expired without firing${state.fires ? " again" : ""} and is now off.`,
       `robob-watch:${id}:expired`, "info");
@@ -253,7 +289,7 @@ export async function tickOne(id: string): Promise<void> {
   const finalCheck = state.status === "closing" && t >= state.closing_until!;
   if (state.failure_paused_at && !finalCheck) return;
   if (state.batch?.watcher && !sameDestination(state.batch.watcher, watcher)) return;
-  if (state.status !== "closing" && !state.reply_handoff && watcher.max_fires !== 0 && state.fires + (state.batch?.events.length ?? 0) >= watcher.max_fires) return;
+  if (state.status !== "closing" && !state.reply_handoff && !state.admitted_run && watcher.max_fires !== 0 && state.fires + (state.batch?.events.length ?? 0) >= watcher.max_fires) return;
   // Trigger files (e.g. chat.db-wal) run the check as soon as they change; interval_s stays the fallback.
   // A failing watcher keeps its backoff; the signature is recorded before the run so a change mid-run re-triggers.
   const sig = triggerSig(watcher);
@@ -269,15 +305,25 @@ export async function tickOne(id: string): Promise<void> {
 
   // WATCH_RUN lets helpers that commit their own cursor (whatsapp-new-message) keep an outbox: anything they
   // printed in a run that never reached RUN_OK_FILE (timeout, crash) is printed again on the next run.
-  const runId = `${t.toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  const attemptId = `${t.toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  let runId = attemptId;
   const healthRun = isHealthNag(id) ? randomUUID().replaceAll("-", "") : undefined;
   let startLoad = 0;
   let timeoutMs = 0;
   let checkedWatcher: Watcher | undefined;
   let handoffRun: string | undefined;
+  let recoveredRun: string | undefined;
   let finalDeadline: number | undefined;
   const result = await slots.run(async () => withRelayLock(() => {
     if (!sameInstance()) return undefined;
+    recoverAdmission(id, instance);
+    const recovery = loadState(id);
+    const unacked = recovery.discarded_run ?? recovery.reply_handoff?.accepted_run
+      ?? (recovery.admitted_run?.accepted ? recovery.admitted_run.run : undefined);
+    if (unacked) {
+      try { acknowledgeRun(id, instance, unacked); } catch { toolError("runner", "watch.ack_failed", { watcher: id }); return undefined; }
+      finishRecoveredCap(id);
+    }
     const definition = loadWatcher(id);
     state = loadState(id);
     const current = definition && pollingWatcher(definition, state);
@@ -286,13 +332,16 @@ export async function tickOne(id: string): Promise<void> {
     if (!current || !checking(state) || current.paused || (state.failure_paused_at && !final) || held(current)) return undefined;
     if (state.batch?.watcher && !sameDestination(state.batch.watcher, current)) return undefined;
     handoffRun = state.reply_handoff?.run;
+    recoveredRun = state.admitted_run?.run;
+    runId = recoveredRun ?? attemptId;
     if (final && !handoffRun) { finalDeadline = state.closing_until; state.closing_final_started = true; }
     checkedWatcher = current;
+    state.admitted_run = { run: runId, attempt: attemptId, watcher: current };
     schedule();
     startLoad = sampleLoad();
     timeoutMs = checkTimeout(current, startLoad);
     if (state.consecutive_failures || state.load_timeouts) toolLog({ component: "runner", kind: "event", name: "watch.retry", ids: { watcher: id, run: runId }, props: { action: "check", attempt: state.consecutive_failures + 1 } });
-    return runCheck(current, watcherDir(id), { WATCH_RUN: runId, WATCH_CLOSING: state.status === "closing" ? "1" : "0", ...(healthRun ? { HEALTH_TOOLLOG_RUN: healthRun } : {}) }, timeoutMs, instance);
+    return runCheck(current, watcherDir(id), { WATCH_RUN: runId, WATCH_ATTEMPT: attemptId, WATCH_CLOSING: state.status === "closing" ? "1" : "0", ...(healthRun ? { HEALTH_TOOLLOG_RUN: healthRun } : {}) }, timeoutMs, instance);
   }));
   if (!result) return;
   const runTimedOut = result.timedOut && (result.code === null || result.code === 0);
@@ -311,6 +360,7 @@ export async function tickOne(id: string): Promise<void> {
     if (checkedWatcher?.inflight_check) {
       fresh.reply_handoff ??= { run: runId, watcher: { ...checkedWatcher, check: checkedWatcher.inflight_check } };
     } else fresh.discarded_run = runId;
+    delete fresh.admitted_run;
     fresh.next_at = 0;
     saveState(id, fresh);
     if (!checkedWatcher?.inflight_check) ackRun();
@@ -422,13 +472,16 @@ export async function tickOne(id: string): Promise<void> {
     fresh.next_at = 0;
   }
   const { event, urgent } = checkEvent(result.stdout);
+  if (fresh.admitted_run?.run === runId) fresh.admitted_run.accepted = true;
   if (!event) {
     saveState(id, fresh); ackRun();
+    fresh = loadState(id);
+    finishRecoveredCap(id);
     if (fresh.status === "closing" && fresh.closing_final_check && !fresh.batch) finalizeClosing(id);
     await runPendingCheck(watcher, t, true);
     return;
   }
-  queueEvent(checkedWatcher!, fresh, event, urgent, !!handoffRun);
+  queueEvent(checkedWatcher!, fresh, event, urgent, !!handoffRun || !!recoveredRun);
   if (healthRun) {
     if (fresh.pending) fresh.pending.healthRun = healthRun;
     else if (fresh.batch) (fresh.batch.healthRuns ??= []).push(healthRun);

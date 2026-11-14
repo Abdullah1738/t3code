@@ -620,6 +620,15 @@ def read_json(path, default):
         return default
 
 
+if os.environ.get("WATCH_ATTEMPT"):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "helpers"))
+    from watch_admission import admitted_check
+else:
+    def admitted_check(fn):
+        return fn
+
+
+@admitted_check
 def write_json(path, obj, timing=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix='.' + path.name + '.', dir=path.parent)

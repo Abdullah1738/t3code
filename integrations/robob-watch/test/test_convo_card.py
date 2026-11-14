@@ -568,6 +568,32 @@ class WatchTest(Base):
     def watch(self, *extra, code=0, env=None):
         return self.run_card("watch", "--slug", "lydia-chat", "--state-dir", self.wdir, *extra, code=code, env=env)
 
+    def test_acknowledged_or_replaced_attempt_cannot_write_private_outbox(self):
+        self.wdir = os.path.join(self.dir, "root", "watchers", "convo")
+        os.makedirs(self.wdir)
+        self.msg(PHONE, "T1", T0, text="hi")
+        self.build()
+        self.watch("--now", "1000")
+        self.msg(PHONE, "T2", T0 + 1, text="private late reply")
+        lock = sqlite3.connect(os.path.join(self.dir, "root", "relay-lock.sqlite"))
+        lock.close()
+        cursor = os.path.join(self.wdir, "cursor.json")
+        with open(cursor) as f:
+            before = f.read()
+        env = dict(self.env, WATCH_DIR=self.wdir, WATCH_RUN="old", WATCH_ATTEMPT="old-attempt")
+        for admitted in [None, {"run": "new", "attempt": "new-attempt"},
+                         {"run": "old", "attempt": "old-attempt", "accepted": True}]:
+            with self.subTest(admitted=admitted):
+                with open(os.path.join(self.wdir, "state.json"), "w") as f:
+                    json.dump({"admitted_run": admitted}, f)
+                self.assertEqual(self.watch("--now", "1001", "--force", env=env).stdout, "")
+                with open(cursor) as f:
+                    self.assertEqual(f.read(), before)
+                self.assertFalse(os.path.exists(os.path.join(self.wdir, ".convo-outbox.json")))
+        with open(os.path.join(self.wdir, "state.json"), "w") as f:
+            json.dump({"admitted_run": {"run": "old", "attempt": "old-attempt"}}, f)
+        self.assertIn("private late reply", self.watch("--now", "1001", "--force", env=env).stdout)
+
     def test_baseline_then_quiet_burst(self):
         self.msg(PHONE, "T1", T0, text="hi")
         self.build()

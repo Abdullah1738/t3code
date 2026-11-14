@@ -512,6 +512,37 @@ class WatcherTest(Base):
         self.assertEqual(self.run_check(now + 15 * 86400 + 30, WATCH_RUN="r3"), [])
         self.assertEqual(self.receipt_calls(A), 1)
 
+    def test_replaced_attempt_cannot_checkpoint_or_emit_a_fare_alert(self):
+        wdir = os.path.join(self.dir, "root", "watchers", "rides")
+        os.makedirs(wdir)
+        lock = sqlite3.connect(os.path.join(self.dir, "root", "relay-lock.sqlite"))
+        lock.close()
+        with open(os.path.join(wdir, "state.json"), "w") as f:
+            json.dump({"admitted_run": {"run": "replacement", "attempt": "replacement-attempt"}}, f)
+        with open(self.state, "w") as f:
+            json.dump({"trips": {}, "pending": {}}, f)
+        with open(self.state) as f:
+            before = f.read()
+        wrapper = self._exe("stale-fare", """#!/usr/bin/python3
+import importlib.util, os
+spec = importlib.util.spec_from_file_location('ride_share_check', os.environ['TEST_HELPER'])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+s = m.load(); t = s['trips'].setdefault('fixture', {})
+m.queue_fare_alert('fixture', t, 'PRIVATE FARE')
+m.finish_run(s, [])
+""")
+        env = dict(self.env, WATCH_DIR=wdir, WATCH_RUN="original", WATCH_ATTEMPT="original-attempt", TEST_HELPER=HELPER)
+        p = subprocess.run([sys.executable, wrapper], capture_output=True, text=True, timeout=10, env=env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout, "")
+        with open(self.state) as f:
+            self.assertEqual(f.read(), before)
+        with open(os.path.join(wdir, "state.json"), "w") as f:
+            json.dump({"admitted_run": {"run": "original", "attempt": "original-attempt"}}, f)
+        p = subprocess.run([sys.executable, wrapper], capture_output=True, text=True, timeout=10, env=env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout.strip(), "PRIVATE FARE")
+
     def test_fare_alert_replayed_after_exception_and_acked_replay(self):
         self.audit_quote(A)
         self.start_completed(A, REAL_RECEIPT)

@@ -91,6 +91,15 @@ def scan(roots):
     return {"roots": inventory, "findings": sorted(findings, key=lambda f: f["path"])}
 
 
+if os.environ.get("WATCH_ATTEMPT"):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "helpers"))
+    from watch_admission import admitted_check
+else:
+    def admitted_check(fn):
+        return fn
+
+
+@admitted_check
 def save(path, state):
     temporary = path.with_suffix(".new")
     with temporary.open("w") as handle:

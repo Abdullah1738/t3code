@@ -32,7 +32,8 @@ appendFileSync(${JSON.stringify(join(root, "calls"))}, JSON.stringify(args)+"\\n
     process.env.ROBOB_WATCH_SPECTRUM_CLI = stub;
     process.env.ROBOB_WATCH_TELEGRAM_CLI = stub;
     const lib = await import(${JSON.stringify(join(import.meta.dir, "../src/lib.ts"))});
-    const { tickOne } = await import(${JSON.stringify(join(import.meta.dir, "../src/runner.ts"))});
+    const runnerModule = ${JSON.stringify(join(import.meta.dir, "../src/runner.ts"))};
+    const { tickOne } = await import(runnerModule);
     let clock = Date.parse("2026-11-13T10:00:00Z");
     Date.now = () => clock;
     lib.ensureDirs();
@@ -54,7 +55,7 @@ appendFileSync(${JSON.stringify(join(root, "calls"))}, JSON.stringify(args)+"\\n
     }
     function setupWhatsApp() {
       const store=process.env.WACLI_STORE_DIR; mkdirSync(store,{recursive:true}); mkdirSync(lib.HELPERS,{recursive:true});
-      for(const helper of ["whatsapp-new-message","wa-db","redact.py","toollog.py","toollog.zsh"]) writeFileSync(join(lib.HELPERS,helper),readFileSync(join(${JSON.stringify(join(import.meta.dir,"../helpers"))},helper)),{mode:0o755});
+      for(const helper of ["whatsapp-new-message","wa-db","redact.py","toollog.py","toollog.zsh","watch_admission.py"]) writeFileSync(join(lib.HELPERS,helper),readFileSync(join(${JSON.stringify(join(import.meta.dir,"../helpers"))},helper)),{mode:0o755});
       const db=new Database(join(store,"wacli.db"));
       db.exec('create table contacts (jid text primary key, phone text, push_name text, full_name text, first_name text, business_name text, system_name text, updated_at int); create table contact_aliases (jid text primary key, alias text, notes text, updated_at int); create table chats (jid text primary key, kind text, name text, last_message_ts int, unread_count int default 0); create table messages (rowid integer primary key autoincrement, chat_jid text, chat_name text, msg_id text, sender_jid text, sender_name text, ts int, from_me int, text text, display_text text, media_type text, media_caption text, filename text, reaction_emoji text, edited int default 0, edited_ts int default 0, revoked int default 0, deleted_at int, unique(chat_jid,msg_id))');
       const jid="971500000001@s.whatsapp.net";
@@ -101,6 +102,184 @@ for (const chat of [undefined, "moni", "family-trip"]) {
     expect(result.state.fires).toBe(6);
     expect(result.state.batch).toBeUndefined();
   });
+}
+
+const crashCases = [
+  { before: null, after: "moni", action: "remove", reply: true },
+  { before: "moni", after: null, action: "remove", reply: true },
+  { before: "moni", after: "family-trip", action: "remove", reply: true },
+  { before: "family-trip", after: "moni", action: "remove", reply: true },
+  { before: null, after: null, action: "remove", reply: true },
+  { before: null, after: "moni", action: "retarget", reply: true },
+  { before: null, after: "moni", action: "resume", reply: true },
+  { before: null, after: "moni", action: "remove", reply: false },
+  { before: null, after: "moni", action: "retarget", reply: false },
+  { before: null, after: null, action: "none", reply: false },
+  { before: null, after: null, action: "context", reply: false },
+  { before: null, after: "moni", action: "remove", reply: true, urgent: true },
+  { before: null, after: null, action: "remove", reply: true, mode: "notify" },
+  { before: null, after: "moni", action: "remove", reply: true, boundary: true },
+];
+for (const options of crashCases) {
+  test(`a crash before wrapper completion keeps admission ${JSON.stringify(options)}`, async () => {
+    const keepsReply = options.reply || options.action === "none" || options.action === "context";
+    const result = await scenario(`
+      const wa=setupWhatsApp();
+      const poll=wa.poll+(${!!options.urgent} ? ' | /usr/bin/python3 -I -c '+shell(["import json,sys; text=sys.stdin.read().strip(); print(json.dumps(dict(urgent=True,event=text))) if text else None"]) : "");
+      const replacement=join(root,"replacement.json");
+      const marker=join(root,"crashed");
+      const action=${JSON.stringify(options.action)};
+      const change=action==="none" ? "" : cliShell+' add --json '+shell([replacement])+' --replace >/dev/null; ';
+      const remove=action==="remove" || action==="resume" ? cliShell+' rm crash-handoff >/dev/null; ' : "";
+      const check='if [[ -f retry-failure ]]; then exit 7; fi; '+poll+'; if [[ ! -f '+shell([marker])+' ]]; then '+change+remove+'touch '+shell([marker])+'; kill -KILL "$PPID"; fi; true';
+      add("crash-handoff",{check,${options.reply ? 'inflight_check:poll,' : ''}chat:${options.before ? JSON.stringify(options.before) : "undefined"},mode:${JSON.stringify(options.mode ?? "wake")},context:"admitted-private-context"});
+      const next={...lib.loadWatcher("crash-handoff"),chat:${options.after ? JSON.stringify(options.after) : "undefined"},context:"replacement-context",check:action==="context" ? check : poll,inflight_check:poll};
+      writeFileSync(replacement,JSON.stringify(next));
+      wa.prime("crash-handoff");
+      wa.insert("admitted-provider-reply");
+      const crashSource='Date.now=()=>'+clock+'; const {tickOne}=await import('+JSON.stringify(runnerModule)+'); await tickOne("crash-handoff");';
+      const child=Bun.spawn([process.execPath,"-e",crashSource],{env:process.env,stdout:"ignore",stderr:"pipe"});
+      const [code,err]=await Promise.all([child.exited,new Response(child.stderr).text()]);
+      if(code===0 || !existsSync(marker))throw new Error("runner did not crash after admission: "+err);
+      const outbox=JSON.parse(readFileSync(wa.outbox("crash-handoff"),"utf8"));
+      const ackBefore=readFileSync(join(lib.watcherDir("crash-handoff"),".run-ok"),"utf8").trim();
+      if(action==="resume")cli("resume","crash-handoff");
+      clock+=5000;
+      if(${!!options.boundary})clock=state("crash-handoff").closing_until;
+      if(!${keepsReply})wa.insert("replacement-provider-reply");
+      await tickOne("crash-handoff"); clock+=150000; await tickOne("crash-handoff");
+      console.log(JSON.stringify({outbox,ackBefore,sent:sent()}));
+    `);
+    expect(result.ackBefore).not.toBe(result.outbox.run);
+    expect(result.sent).toHaveLength(1);
+    const args = result.sent[0];
+    const chat = keepsReply ? options.before : options.after;
+    if (chat) expect(args[args.indexOf("--chat") + 1]).toBe(chat);
+    else expect(args).not.toContain("--chat");
+    const text = args.join(" ");
+    expect(text).toContain(keepsReply ? "admitted-provider-reply" : "replacement-provider-reply");
+    expect(text).not.toContain(keepsReply ? "replacement-provider-reply" : "admitted-provider-reply");
+    if (!options.mode) {
+      expect(text).toContain(keepsReply ? "admitted-private-context" : "replacement-context");
+      expect(text).not.toContain(keepsReply ? "replacement-context" : "admitted-private-context");
+    }
+  }, 20_000);
+}
+
+for (const edge of ["queued-retarget", "failed-retry", "fire-cap", "accepted-ack"]) {
+  test(`crash recovery retains admission through ${edge}`, async () => {
+    const result = await scenario(`
+      const wa=setupWhatsApp();
+      const marker=join(root,"crashed");
+      const edge=${JSON.stringify(edge)};
+      const check='if [[ -f retry-failure ]]; then exit 7; fi; '+wa.poll+'; if [[ -f ack-failure ]]; then rm .run-ok; mkdir .run-ok; fi; if [[ ! -f '+shell([marker])+' ]]; then touch '+shell([marker])+'; kill -KILL "$PPID"; fi; true';
+      add("crash-edge",{check,context:"original-context",...(edge==="failed-retry" ? {} : {inflight_check:wa.poll}),max_fires:2});
+      wa.prime("crash-edge"); wa.insert("original-reply");
+      if(edge==="fire-cap")lib.saveState("crash-edge",{...state("crash-edge"),batch:{at:clock,events:["earlier-event"],watcher:lib.loadWatcher("crash-edge")}});
+      const child=Bun.spawn([process.execPath,"-e",'Date.now=()=>'+clock+'; const {tickOne}=await import('+JSON.stringify(runnerModule)+'); await tickOne("crash-edge");'],{env:process.env,stdout:"ignore",stderr:"pipe"});
+      const [code,err]=await Promise.all([child.exited,new Response(child.stderr).text()]);
+      if(code===0 || !existsSync(marker))throw new Error("runner did not crash: "+err);
+      const original=JSON.parse(readFileSync(wa.outbox("crash-edge"),"utf8"));
+      clock+=5000;
+      const retarget=()=>{lib.editWatcher("crash-edge",w=>({...w,chat:"moni",context:"replacement-context",check:wa.poll,inflight_check:wa.poll})); lib.removeWatcher("crash-edge")};
+      if(edge==="queued-retarget"){
+        const {CheckSlots}=await import(${JSON.stringify(join(import.meta.dir,"../src/host.ts"))});
+        const run=CheckSlots.prototype.run;
+        CheckSlots.prototype.run=function(fn){CheckSlots.prototype.run=run; retarget(); return run.call(this,fn)};
+      }
+      if(edge==="failed-retry"){
+        writeFileSync(join(lib.watcherDir("crash-edge"),"retry-failure"),"");
+        await tickOne("crash-edge");
+        retarget(); wa.insert("replacement-reply");
+      }
+      if(edge==="fire-cap"){
+        lib.editWatcher("crash-edge",w=>({...w,max_fires:1})); clock+=150000;
+      }
+      if(edge==="accepted-ack"){
+        writeFileSync(join(lib.watcherDir("crash-edge"),"ack-failure"),"");
+      }
+      await tickOne("crash-edge");
+      const accepted=state("crash-edge");
+      if(edge==="accepted-ack"){
+        rmSync(join(lib.watcherDir("crash-edge"),".run-ok"),{recursive:true}); rmSync(join(lib.watcherDir("crash-edge"),"ack-failure"));
+        await tickOne("crash-edge");
+      }
+      clock+=150000; await tickOne("crash-edge"); clock+=5000; await tickOne("crash-edge"); clock+=150000; await tickOne("crash-edge");
+      console.log(JSON.stringify({original,accepted,sent:sent(),state:state("crash-edge")}));
+    `);
+    const text=result.sent.map((args:string[])=>args.join(" ")).join("\n");
+    if(edge==="failed-retry"){
+      expect(text).not.toContain("original-reply"); expect(text).toContain("replacement-reply");
+    }else{
+      expect(result.sent.filter((args:string[])=>args.join(" ").includes("original-reply"))).toHaveLength(1);
+      expect(text).toContain("original-context"); expect(text).not.toContain("replacement-context");
+      expect(result.sent.flat()).not.toContain("moni");
+    }
+    if(edge==="fire-cap")expect(result.state.status).toBe("done");
+    if(edge==="accepted-ack")expect(result.accepted.admitted_run.accepted).toBe(true);
+  },20_000);
+}
+
+test("failed closing reply polls retain their recovery backoff", async () => {
+  const result=await scenario(`
+    addReplyWatcher("crash-backoff",{inflight_check:"exit 7"}); lib.removeWatcher("crash-backoff");
+    await tickOne("crash-backoff"); const first=state("crash-backoff");
+    clock+=1000; await tickOne("crash-backoff");
+    console.log(JSON.stringify({first,second:state("crash-backoff")}));
+  `);
+  expect(result.first.consecutive_failures).toBe(1);
+  expect(result.second.consecutive_failures).toBe(1);
+  expect(result.second.next_at).toBe(result.first.next_at);
+});
+
+test("a surviving wrapper cannot write its outbox after recovery acknowledgement", async () => {
+  const result=await scenario(`
+    const wa=setupWhatsApp(); const replacement=join(root,"replacement.json");
+    const gate=join(root,"release"); const done=join(root,"done");
+    if(Bun.spawnSync(["mkfifo",gate,done]).exitCode)throw new Error("mkfifo failed");
+    const completed=Bun.spawn(["cat",done],{stdout:"pipe",stderr:"ignore"});
+    const check=wa.poll+'; '+cliShell+' add --json '+shell([replacement])+' --replace >/dev/null; '+cliShell+' rm survivor >/dev/null; kill -KILL "$PPID"; read -r line < '+shell([gate])+'; '+wa.poll+'; echo done > '+shell([done]);
+    add("survivor",{check,inflight_check:wa.poll,context:"original-context"});
+    writeFileSync(replacement,JSON.stringify({...lib.loadWatcher("survivor"),chat:"moni",context:"replacement-context",check:wa.poll}));
+    wa.prime("survivor"); wa.insert("original-private-reply");
+    const child=Bun.spawn([process.execPath,"-e",'Date.now=()=>'+clock+'; const {tickOne}=await import('+JSON.stringify(runnerModule)+'); await tickOne("survivor");'],{env:process.env,stdout:"ignore",stderr:"ignore"});
+    if(await child.exited===0)throw new Error("runner did not crash");
+    await tickOne("survivor"); clock+=150000; await tickOne("survivor");
+    const before=readFileSync(wa.outbox("survivor"),"utf8");
+    wa.insert("late-private-reply"); writeFileSync(gate,"release\\n");
+    await new Response(completed.stdout).text(); await completed.exited;
+    const after=readFileSync(wa.outbox("survivor"),"utf8");
+    console.log(JSON.stringify({before,after,sent:sent()}));
+  `);
+  expect(result.after).toBe(result.before);
+  expect(result.after).not.toContain("late-private-reply");
+  expect(result.sent).toHaveLength(1);
+  expect(result.sent[0]).not.toContain("moni");
+},20_000);
+
+for (const repair of ["normal", "write-failure", "pre-ack-crash", "post-ack-crash"]) {
+  test(`empty crash recovery completes a reduced fire cap after ${repair}`, async () => {
+  const result=await scenario(`
+    add("empty-cap",{check:"true",max_fires:2}); const admitted=lib.loadWatcher("empty-cap");
+    lib.saveState("empty-cap",{...state("empty-cap"),admitted_run:{run:"crashed",attempt:"crashed-attempt",watcher:admitted},batch:{at:clock-150000,events:["earlier-event"],watcher:admitted}});
+    lib.editWatcher("empty-cap",w=>({...w,max_fires:1}));
+    await tickOne("empty-cap");
+    if(!["normal","post-ack-crash"].includes(${JSON.stringify(repair)}))mkdirSync(join(lib.watcherDir("empty-cap"),".run-ok"));
+    clock+=5000; await tickOne("empty-cap");
+    if(!["normal","post-ack-crash"].includes(${JSON.stringify(repair)})){
+      if(!state("empty-cap").admitted_run.accepted)throw new Error("acceptance not persisted");
+      rmSync(join(lib.watcherDir("empty-cap"),".run-ok"),{recursive:true});
+      if(${JSON.stringify(repair)}==="pre-ack-crash")writeFileSync(join(lib.watcherDir("empty-cap"),".run-ok"),"old-run");
+      await tickOne("empty-cap");
+    }
+    if(${JSON.stringify(repair)}==="post-ack-crash"){lib.saveState("empty-cap",{...state("empty-cap"),status:"active"}); await tickOne("empty-cap")}
+    const done=state("empty-cap"); cli("resume","empty-cap");
+    console.log(JSON.stringify({done,resumed:state("empty-cap")}));
+  `);
+  expect(result.done.status).toBe("done"); expect(result.done.admitted_run).toBeUndefined();
+  expect(result.resumed.status).toBe("active"); expect(result.resumed.fires).toBe(0);
+});
+
 }
 
 test("an urgent JSON fire wakes immediately while the other five keep their original window", async () => {
