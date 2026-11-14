@@ -14,7 +14,7 @@ export const emptyAccess: Access = { people: [], groups: [] };
 /** Missing file means nobody but the owner. Malformed JSON fails loud so a typo never silently opens the line. */
 export async function loadAccess(path: string): Promise<Access> {
   let raw: string;
-  try { raw = await readFile(path, "utf8"); } catch (error) { toolError("access", "access.catch1");
+  try { raw = await readFile(path, "utf8"); } catch (error) { toolError("access", "access.catch1", error);
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyAccess;
     throw error;
   }
@@ -36,7 +36,7 @@ export function accessReloader(path: string): () => Promise<Access> {
   let mtime = -1;
   let cached: Access = emptyAccess;
   return async () => {
-    const info = await stat(path).catch(() => { toolError("access", "access.catch2"); return undefined; });
+    const info = await stat(path).catch((caughtError) => { toolError("access", "access.catch2", caughtError); return undefined; });
     const next = info ? info.mtimeMs : -2;
     if (next !== mtime) {
       cached = await loadAccess(path);

@@ -296,6 +296,7 @@ export type OwnerWords = { inboundId: string; text: string };
  * became (or waits for) a run of its own; `refused` means nothing was sent.
  */
 export type SteerDelivery = "steered" | "started" | "queued" | "refused";
+export type SteerGuard = { signal: AbortSignal; beforeSend: () => Promise<boolean> };
 
 /**
  * What the router and the origin backfill need from a backend. OpenChamber
@@ -317,7 +318,7 @@ export interface ChatBackend {
    */
   runToolEvidence?(id: string, directory: string, sinceMs: number): Promise<"ran" | "none" | "unknown">;
   getSession(id: string, directory: string): Promise<SessionRecord | undefined>;
-  children(id: string, directory: string): Promise<SessionRecord[]>;
+  children(id: string, directory: string, complete?: boolean): Promise<SessionRecord[]>;
   messages(id: string, directory: string, options?: { until?: string; since?: number; limit?: number }): Promise<MessageRecord[]>;
   promptAccepted(id: string, directory: string, messageId: string): Promise<boolean>;
   /**
@@ -328,12 +329,12 @@ export interface ChatBackend {
   prompt(id: string, directory: string, messageId: string, text: string, system?: string, files?: readonly FilePart[],
     model?: { providerID: string; modelID: string; variant?: string; instanceId?: string }, owner?: OwnerWords): Promise<void>;
   /**
-   * Adds text to the session's running turn, never queueing behind it. Backends
+   * Adds a message to the session's running turn, never queueing behind it. Backends
    * without it (OpenChamber) keep follow-ups as their own turns.
    */
-  steer?(id: string, directory: string, messageId: string, text: string, guidance?: string): Promise<SteerDelivery>;
+  steer?(id: string, directory: string, messageId: string, text: string, guidance?: string, files?: readonly FilePart[], guard?: SteerGuard): Promise<SteerDelivery>;
   abort(id: string, directory: string): Promise<boolean>;
-  statuses(): Promise<Record<string, SessionStatus>>;
+  statuses(complete?: boolean): Promise<Record<string, SessionStatus>>;
   /**
    * Whether one session is busy. Optional because `statuses()` already answers it;
    * backends whose full list is slow (Robob) implement this cheap single lookup.
@@ -373,12 +374,12 @@ export class OpenChamber implements ChatBackend {
         throw new Error();
       }
       this.baseUrl = new URL(baseUrl).origin;
-    } catch { toolError("openchamber", "openchamber.catch1");
+    } catch (caughtError) { toolError("openchamber", "openchamber.catch1", caughtError);
       throw new Error("OpenChamber URL must be an HTTP origin on 127.0.0.1 or localhost");
     }
     try {
       this.headers = new Headers(headers);
-    } catch { toolError("openchamber", "openchamber.catch2");
+    } catch (caughtError) { toolError("openchamber", "openchamber.catch2", caughtError);
       throw new Error("Invalid OpenChamber headers");
     }
   }
@@ -412,12 +413,12 @@ export class OpenChamber implements ChatBackend {
         proxy: "",
         verbose: false,
       });
-    } catch { toolError("openchamber", "openchamber.catch3");
+    } catch (caughtError) { toolError("openchamber", "openchamber.catch3", caughtError);
       throw requestError(0, signal);
     }
     if (!response.ok) {
       await inspectFailure?.(response);
-      await response.body?.cancel().catch(() => { toolError("openchamber", "openchamber.catch4");});
+      await response.body?.cancel().catch((caughtError) => { toolError("openchamber", "openchamber.catch4", caughtError);});
       throw requestError(response.status, signal);
     }
     return response;
@@ -430,7 +431,7 @@ export class OpenChamber implements ChatBackend {
     if (response.status === 204) return undefined;
     try {
       return (await response.json()) as T;
-    } catch { toolError("openchamber", "openchamber.catch5");
+    } catch (caughtError) { toolError("openchamber", "openchamber.catch5", caughtError);
       throw requestError(response.status, signal);
     }
   }
@@ -490,7 +491,7 @@ export class OpenChamber implements ChatBackend {
         assert.match(session.parentID, ID);
         id = session.parentID;
       }
-    } catch { toolError("openchamber", "openchamber.catch6"); /* Keep pending permissions visible when the policy owner is unavailable. */ }
+    } catch (caughtError) { toolError("openchamber", "openchamber.catch6", caughtError); /* Keep pending permissions visible when the policy owner is unavailable. */ }
   }
 
   async createChat(title?: string): Promise<{ id: string; directory: string }> {
@@ -533,7 +534,7 @@ export class OpenChamber implements ChatBackend {
     try {
       // An id-only read: OpenCode resolves the session's own location.
       session = sessionRecord(await this.readOrNotFound(`/api/session/${encodeURIComponent(id)}`, id, directory));
-    } catch (error) { toolError("openchamber", "openchamber.catch7");
+    } catch (error) { toolError("openchamber", "openchamber.catch7", error);
       if (error === SESSION_NOT_FOUND) return "missing";
       throw error;
     }
@@ -559,12 +560,12 @@ export class OpenChamber implements ChatBackend {
     const response = await this.response(path, { signal, ...(directory === undefined ? {} : { directory }) }, "application/json",
       async failed => {
         if (failed.status !== 404) return;
-        const body = await failed.json().catch(() => { toolError("openchamber", "openchamber.catch8"); return undefined; }) as { _tag?: unknown; sessionID?: unknown } | undefined;
+        const body = await failed.json().catch((caughtError) => { toolError("openchamber", "openchamber.catch8", caughtError); return undefined; }) as { _tag?: unknown; sessionID?: unknown } | undefined;
         if (body?._tag === "SessionNotFoundError" && body.sessionID === id) throw SESSION_NOT_FOUND;
       });
     try {
       return await response.json();
-    } catch { toolError("openchamber", "openchamber.catch9");
+    } catch (caughtError) { toolError("openchamber", "openchamber.catch9", caughtError);
       throw requestError(response.status, signal);
     }
   }
@@ -625,7 +626,7 @@ export class OpenChamber implements ChatBackend {
       const message = unwrap<{ id?: unknown; type?: unknown } | undefined>(await this.request<unknown>(
         `/api/session/${encodeURIComponent(id)}/message/${encodeURIComponent(messageId)}`, { directory }));
       if (message?.id === messageId && message.type === "user") return true;
-    } catch (error) { toolError("openchamber", "openchamber.catch10");
+    } catch (error) { toolError("openchamber", "openchamber.catch10", error);
       // 404 is OpenCode's MessageNotFoundError: not promoted yet, or never admitted.
       if ((error as { status?: unknown }).status !== 404) throw error;
     }
@@ -750,7 +751,7 @@ export class OpenChamber implements ChatBackend {
     const response = await this.response(path, { signal }, "text/event-stream");
     if (response.status === 204) return;
     if (!response.body || response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !== "text/event-stream") {
-      await response.body?.cancel().catch(() => { toolError("openchamber", "openchamber.catch11");});
+      await response.body?.cancel().catch((caughtError) => { toolError("openchamber", "openchamber.catch11", caughtError);});
       throw requestError(response.status, signal);
     }
     const reader = response.body.getReader();
@@ -792,10 +793,10 @@ export class OpenChamber implements ChatBackend {
         // SSE dispatch requires a blank line; discard incomplete frames at EOF.
         if (done) return;
       }
-    } catch { toolError("openchamber", "openchamber.catch12");
+    } catch (caughtError) { toolError("openchamber", "openchamber.catch12", caughtError);
       throw requestError(response.status, signal);
     } finally {
-      await reader.cancel().catch(() => { toolError("openchamber", "openchamber.catch13");});
+      await reader.cancel().catch((caughtError) => { toolError("openchamber", "openchamber.catch13", caughtError);});
       reader.releaseLock();
     }
   }

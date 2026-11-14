@@ -188,7 +188,11 @@ console.log("ok");
                 alerts = folder / ('expiry-alerts-' + stage + '.jsonl')
                 stub.write_text('''import { appendFileSync } from "node:fs";
 const args = process.argv.slice(2);
-appendFileSync(''' + json.dumps(str(alerts)) + ''', JSON.stringify({key: args[args.indexOf("--key") + 1]}) + "\\n");
+const bound = args.find(arg => arg.startsWith("--key="));
+const index = args.indexOf("--key");
+const key = bound ? bound.slice("--key=".length) : index >= 0 ? args[index + 1] : undefined;
+if (!key) throw new Error("expiry alert missing key");
+appendFileSync(''' + json.dumps(str(alerts)) + ''', JSON.stringify({key}) + "\\n");
 console.log(JSON.stringify({ok: true}));
 ''')
                 env = {**tracker.store.clean_env(), 'ROBOB_TEST': '1', 'ROBOB_WATCH_ROOT': str(tracker.WATCHERS.parent),

@@ -13,6 +13,18 @@ import { OpenChamber, type MessageRecord, type PermissionRequest, type QuestionR
 const DM_KEY = "dm:+971585933213";
 const GROUP_KEY = "group:abc123def456";
 
+test("history guidance appears in every foreground chat, with only permitted cross-chat scope", () => {
+  for (const kind of ["owner", "dm", "group"] as const) {
+    const prompt = sendblueContextPrompt(context(kind), false, []);
+    expect(prompt).toContain("messages --session CURRENT_SESSION_ID");
+    expect(prompt.includes("for another chat")).toBe(kind === "owner");
+    expect(prompt.includes("for a group she has written in")).toBe(kind === "dm");
+    expect(sendblueContextPrompt(context(kind), false, [], true)).not.toContain("messages --session CURRENT_SESSION_ID");
+  }
+  const guest = context("dm", { roleOf: () => ({ name: "Guest", role: "guest" }) });
+  expect(sendblueContextPrompt(guest, false, [])).not.toContain("for a group she has written in");
+});
+
 type Prompt = { id: string; text: string; system?: string };
 
 class Recorder extends OpenChamber {
@@ -508,7 +520,7 @@ test("location guidance points at the Sendblue commands, never Find My, and only
   expect(owner).toContain("location --session CURRENT_SESSION_ID` (add `--chat moni`");
   expect(owner).toContain("Never use Find My");
   expect(moni).toContain("location-request --session CURRENT_SESSION_ID --key UNIQUE_KEY`, say you've asked");
-  expect(moni).not.toContain("--chat");
+  expect(moni.split("\n").find(line => line.startsWith("Location,"))).not.toContain("--chat");
   expect(group).toContain("Location: not available in groups");
 });
 
@@ -1607,7 +1619,8 @@ test.each(["dm", "group"] as const)("late accepted steer in %s forwards its own 
   expect(h.store.pendingOutbox().filter(op => op.kind === "conversation").map(op => [op.text, op.replyTo])).toEqual([
     ["Original answer", "first"], ["Follow-up answer", "followup"],
   ]);
-  expect(steers).toHaveLength(1);
+  expect(new Set(steers.map(call => call.messageId))).toEqual(new Set([original.messageId]));
+  expect(h.backend.records.filter(record => record.type === "user" && record.id === original.messageId)).toHaveLength(1);
   expect(h.backend.prompts).toHaveLength(1);
 });
 

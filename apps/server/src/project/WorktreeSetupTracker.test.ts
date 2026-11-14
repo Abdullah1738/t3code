@@ -1,4 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
+import { interruptionProps } from "../observability/analyticsInterruption.ts";
 import { ThreadId, WorktreeSetupSnapshot } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
@@ -170,6 +171,7 @@ describe("WorktreeSetupTracker", () => {
       expect(yield* tracker.cancel(threadId)).toBe(true);
       const exit = yield* Fiber.await(fiber);
       expect(Exit.hasInterrupts(exit)).toBe(true);
+      if (Exit.isFailure(exit)) expect(interruptionProps(exit.cause)).toEqual({ cause: "stop" });
 
       yield* tracker.finish(threadId, "cancelled");
       expect(yield* tracker.cancel(threadId)).toBe(false);

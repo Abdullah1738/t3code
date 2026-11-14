@@ -47,6 +47,7 @@ print(json.dumps(out))
 FAKE_BRIDGE = """#!/usr/bin/python3
 import hashlib, json, os, sqlite3, sys
 args = sys.argv[1:]
+args = [v for a in args for v in (a.split("=", 1) if a.startswith("--") and "=" in a else [a])]
 log = os.environ["FAKE_BRIDGE_LOG"]
 with open(log, "a") as f:
     f.write(json.dumps(args) + "\\n")

@@ -1,6 +1,8 @@
 #!/opt/homebrew/bin/python3
 """Run a command in its own process group with a wall-clock limit."""
 
+from __future__ import annotations
+
 import argparse
 import ctypes
 from dataclasses import dataclass

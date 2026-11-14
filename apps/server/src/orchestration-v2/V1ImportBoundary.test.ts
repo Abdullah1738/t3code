@@ -12,6 +12,8 @@ const legacyTable =
 const legacyReaders = ["orchestration-v2/legacy/", "persistence/Migrations/"] as const;
 const legacyReaderFiles: Record<string, string> = {
   "serverSettings.ts": "one-time provider history for settings migration",
+  // Imports retain V1 transcript rows, so maintenance must scrub them alongside V2 copies.
+  "ardud/redaction/ThreadRedaction.ts": "schema-wide output redaction of retained V1 transcripts",
 };
 const retiredPaths = [
   "orchestration",

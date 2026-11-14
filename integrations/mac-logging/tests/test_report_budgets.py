@@ -28,23 +28,28 @@ class ReportBudgetTests(unittest.TestCase):
         return [r for p in self.logs.glob('*.ndjson')
                 for r in map(json.loads, p.read_text().splitlines()) if r['name'] == name]
 
-    def test_all_slow_reports_reduce_unified_timeout_to_absolute_remaining(self):
-        clock, budgets = [0], []
+    def test_crashes_precede_disk_work_and_inventory_uses_remaining_budget(self):
+        clock, budgets, order = [0], [], []
         roots = [self.root/str(i) for i in range(3)]
         def probe():
+            order.append('probe')
             clock[0] += 80
         def inventory(**kw):
-            clock[0] += 145
+            order.append('inventory')
+            self.assertEqual(kw['deadline'], 290)
+            clock[0] += min(145, kw['deadline']-clock[0])
         def reports(*args, **kw):
             clock[0] += 6
             return {}
         def run(cmd, **kw):
+            order.append('unified')
             budgets.append(kw['timeout'])
             clock[0] += kw['timeout']
             raise subprocess.TimeoutExpired(cmd, kw['timeout'])
         unified = collector.unified
         collect = collector.collect
         with patch.object(collector.time, 'monotonic', side_effect=lambda: clock[0]), \
+             patch.object(collector, 'disk_wait'), \
              patch.object(collector, 'disk_tooling_probe', side_effect=probe), \
              patch.object(collector, 'directory_inventory', side_effect=inventory), \
              patch.object(collector, 'reports', side_effect=reports), \
@@ -52,7 +57,9 @@ class ReportBudgetTests(unittest.TestCase):
              patch.object(collector, 'collect', side_effect=lambda **kw: collect(10000, roots, **kw)):
             collector.main()
         self.assertLessEqual(clock[0], 290)
-        self.assertEqual(budgets, [47])
+        self.assertEqual(budgets, [60])
+        self.assertEqual(order, ['unified', 'probe', 'inventory'])
+        self.assertEqual(clock[0], 290)
         self.assertEqual(self.rows('crash.source')[-1]['props']['failure'], 'timeout')
         self.assertNotIn('unified', jobs.read_state('crashes'))
 

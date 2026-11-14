@@ -194,7 +194,7 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
 | `--git` | export a portable `.git` with the selected checkout's exact HEAD and ancestor history |
 | `--include PATH` | sync a path the filters skip (e.g. a committed `testdata/server.key`). Under a gitignored dir such as `tmp/`, only that path mirrors; the box's other files in that dir are kept |
 | `--no-sync` | run without syncing (box already has what you need) |
-| `--bg` | start and return a run id at once; then `offbox logs <id> --follow` / `offbox wait <id> [--timeout S]` (exits with its code, does `--pull`) |
+| `--bg` | queue in a detached client and return a run id at once, even while the pool is full; then `offbox logs <id> --follow` / `offbox wait <id> [--timeout S]` (exits with its code, does `--pull`). Client diagnostics: `logs/<id>.client.log` in the offbox state directory. |
 | `--base N` / `--fresh` | new lease from saved base N / ignoring bases and templates. `--fresh` doesn't always mean a new box: in the repository pool it can still reuse a pool box that was itself created fresh. In a full pool with no box of that kind, it stops at once (exit 2) instead of queueing. It isn't a way off a bad box: offbox now stops broken boxes itself, and `offbox release <id>` stops one by hand. |
 | `--no-fallback` | return 90/91 instead of falling back to a local run |
 | `--remote` | same as `--no-fallback` (kept for old commands; every run uses a box now) |
@@ -211,7 +211,7 @@ its end and returns its code. If the box says the process ended but that `offbox
 minute later (30 min with `--pull`), wait returns the box's exit code and says the other client looks stuck.
 `--timeout S` stops waiting after S seconds with exit 124; the run keeps going.
 On a run still queued for a pool box they say "waiting for a box" and keep polling until it gets one or settles.
-If that run's own `offbox run` has died (a tool-call timeout), wait marks it lost ("never started, nothing ran", 90).
+A queued `--bg` run survives its caller ending. If the offbox client itself dies before getting a box, wait marks the run lost and wait/logs return 100 ("never started; nothing ran, safe to rerun").
 
 `--git` works with normal checkouts and linked worktrees, including detached HEADs. It exports only HEAD's
 reachable history and branch/remote/tag refs whose commits are ancestors of HEAD; divergent refs and other
@@ -229,6 +229,17 @@ then sends HEAD alone as a one-commit shallow `.git` and says so in one line. If
 UIs/dashboards on the box: `offbox ports 3000` opens `http://127.0.0.1:3000` on the Mac via an SSH tunnel
 (`--local 13000` to pick the local port). `offbox ports 1055 --local 8080 --reverse` goes the other way: the Mac's
 `127.0.0.1:8080` shows up on the box at `127.0.0.1:1055` (e.g. a Mac-side proxy). Interactive shell or one-off command: `offbox ssh` / `offbox ssh -- 'docker ps'`.
+
+### Control a box without SSH
+
+`offbox exec [box_id] [--timeout N] [--cwd DIR] [--json] -- <command...>` runs through the authenticated
+offbox server API, owner-checked, on home or Boat. With no box ID it uses this caller's current lease.
+Use `offbox exec <box> -- <cmd>` when a guest has stopped, masked or replaced its own sshd (for example
+TorSSH testhost fixtures). Never bypass a host-key mismatch by editing known_hosts or disabling strict
+host-key checking. `boat exec` is Boat-only and returns 404 for home boxes.
+Timeout defaults to 60 seconds and is clamped to 1..600. Output goes to stdout/stderr, or `--json` prints
+the raw result dict; the CLI returns the remote exit code. API/transport failures exit 90. A box ID selects
+its recorded backend; a failed request never retries on the other backend. This command does not sync files.
 
 ## Repo toolchains
 
@@ -264,7 +275,7 @@ resumes+stops pinned leases and unsaved bases/templates before day 14. Save gene
   14 days (it still stops when idle). Unpinned leases stopped 14 days are gone; the next run starts a new box.
 - Leases are deleted only when their thread has been archived for 7 days, or unused for 30 days and not pinned.
 
-A saved base retains its checkout path in project build state. When offbox relocates that checkout for another local path, it clears project `.gradle` directories before the move, including nested Gradle builds; shared Gradle user-home dependency caches and module build outputs stay warm. For a lease created before this fix, move aside the project's `.gradle` once before rerunning Gradle. CMake and other build systems still need a fresh configure after relocation (for example, `cmake --fresh`).
+A saved base retains its checkout path in project build state. When offbox relocates that checkout for another local path, it clears project `.gradle` directories before the move, including nested Gradle builds; shared Gradle user-home dependency caches and module build outputs stay warm. For a lease created before this fix, move aside the project's `.gradle` once before rerunning Gradle. When a base is restored under a new directory, offbox removes CMake caches that name the old path.
 
 ## Housekeeping
 
@@ -367,6 +378,7 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
 - **94** = the home server restarted under the run and it was not run again (`--no-retry`, person work, or it
   had already been retried once). The command ran partly: check what it did before running it again.
 - **96** = local state DB failure. Before start: 'nothing ran, safe to retry'. After start: the message names the run and tells you to use `offbox wait <run>`; do not rerun the command. No automatic local fallback. A local bookkeeping failure after a known remote exit warns and returns that remote exit code.
+- **100** from `offbox wait` / `offbox logs` = the client ended before it got a box. The run never started; nothing ran, safe to rerun.
 - **124** from `offbox wait --timeout` = you stopped waiting; the run is still going. Wait again.
 - **90** = infra failure (or, on the Boat standby, an exhausted start budget); **91** = Boat's spend guard, which only
   exists on the standby (the home server has no cap). Heavy commands

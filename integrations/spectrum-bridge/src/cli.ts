@@ -30,7 +30,7 @@ class RawOutput {
 }
 
 const COMMANDS_HELP = "Expected health, send, cancel-send, send-file, poll, app, react, wake, secret-request, secret, publish, unpublish, ban, unban, or bans."
-  + " Sendblue mode adds location-request, location, ask-owner, chats, allow, allow-group,"
+  + " Sendblue mode adds location-request, location, messages, ask-owner, chats, allow, allow-group,"
   + " guest-allow, guest-revoke, guests, guest-send, and share-contact."
   + " Logs: log-rollup [--day YYYY-MM-DD]."
   + " Public links: share, unshare, and shares."
@@ -54,7 +54,7 @@ export const validAppUrl = (value: unknown): value is string => {
   try {
     const url = new URL(value);
     return url.protocol === "https:" && url.hostname.length > 0 && !url.username && !url.password;
-  } catch { toolError("cli", "cli.catch1"); return false; }
+  } catch (caughtError) { toolError("cli", "cli.catch1", caughtError); return false; }
 };
 const control = /[\x00-\x1f\x7f-\x9f]/;
 
@@ -70,6 +70,7 @@ const OPTIONS_BY_COMMAND: Record<string, string[]> = {
   wake: ["text", "source", "key", "chat", "session"],
   "location-request": ["session", "key", "chat"],
   location: ["session", "chat"],
+  messages: ["session", "chat", "limit", "before", "id"],
   "ask-owner": ["text", "session", "key"],
   chats: ["session"],
   allow: ["address", "name", "admin", "session"],
@@ -109,7 +110,7 @@ function parseOptions(args: string[]) {
       allowPositionals: true,
       tokens: true,
     });
-  } catch { toolError("cli", "cli.catch2");
+  } catch (caughtError) { toolError("cli", "cli.catch2", caughtError);
     // parseArgs errors can quote arbitrary argument values.
     throw new CliError("Invalid command arguments");
   }
@@ -221,7 +222,7 @@ export async function runLocalCommand(command: LocalCommand, options: { exec?: E
     if (!index) throw new CliError(`No app at ${appsRoot}/${command.app}/index.html`);
     const { url, port, created } = await publish(appsPort, deps);
     return { url: `${url}/${command.app}/`, port, created, metadataWarnings: metadataWarnings(await Bun.file(index).text()) };
-  } catch (error) { toolError("cli", "cli.catch3");
+  } catch (error) { toolError("cli", "cli.catch3", error);
     if (error instanceof CliError) throw error;
     throw new CliError(error instanceof PublishError ? error.message : "Tailnet publish failed");
   }
@@ -324,6 +325,22 @@ export function parseCommand(args: string[]): Command {
     case "location-request":
       return { method: "POST", path: "/location-request",
         body: { ...session(), ...(values.chat === undefined ? {} : { chat: chatSlug(values.chat) }) } };
+    case "messages": {
+      const body: Body = { sessionId: sessionOnly(values.session)! };
+      if (values.chat !== undefined) body.chat = chatSlug(values.chat);
+      if (values.limit !== undefined) {
+        if (!/^\d{1,3}$/.test(values.limit) || Number(values.limit) < 1 || Number(values.limit) > 100) throw new CliError("--limit must be 1 to 100");
+        body.limit = Number(values.limit);
+      }
+      for (const key of ["before", "id"] as const) {
+        const value = values[key];
+        if (value === undefined) continue;
+        if (!value.trim() || value.length > 200 || control.test(value)) throw new CliError(`Invalid --${key}`);
+        body[key] = value;
+      }
+      if (values.before !== undefined && values.id !== undefined) throw new CliError("--id and --before cannot be used together");
+      return { method: "POST", path: "/messages", body };
+    }
     case "location":
       return { method: "POST", path: "/location",
         body: { sessionId: sessionOnly(values.session)!, ...(values.chat === undefined ? {} : { chat: chatSlug(values.chat) }) } };
@@ -421,7 +438,7 @@ export function parseCommand(args: string[]): Command {
       const card = flags.card ? CARD_FIELDS.map(field => ({ ...field })) : [];
       if (specs.length + card.length < 1 || specs.length + card.length > 8) throw new CliError("--field must be given 1 to 8 times (--card counts as 4)");
       const fields = [...card, ...specs.map(spec => {
-        try { return parseFieldSpec(spec); } catch (error) { toolError("cli", "cli.catch4");
+        try { return parseFieldSpec(spec); } catch (error) { toolError("cli", "cli.catch4", error);
           throw new CliError(`--field must be name:Label[:type]. ${(error as Error).message}; type is ${SECRET_FIELD_TYPES.join(", ")}`);
         }
       })];
@@ -489,7 +506,7 @@ export async function loadCommandPayload(command: Command): Promise<Body | undef
     if (before.size === 0n || before.size > BigInt(MAX_FILE_BYTES)) throw new CliError("Attachment must contain 1 byte to 20 MiB");
     // Check identities too: a hard link, case alias, or parent symlink must not bypass the fixed exclusions.
     for (const path of protectedPaths) {
-      const secret = await stat(path, { bigint: true }).catch((error: NodeJS.ErrnoException) => { toolError("cli", "cli.catch5");
+      const secret = await stat(path, { bigint: true }).catch((error: NodeJS.ErrnoException) => { toolError("cli", "cli.catch5", error);
         if (error.code !== "ENOENT") throw error;
       });
       if (secret && secret.dev === before.dev && secret.ino === before.ino) throw new CliError("Bridge credentials and state cannot be attached");
@@ -512,10 +529,10 @@ export async function loadCommandPayload(command: Command): Promise<Body | undef
     return { base64: data.subarray(0, size).toString("base64"), name,
       mimeType: mimeType ?? mimeTypes[extname(name).toLowerCase()] ?? "application/octet-stream",
       text, dedupeKey, ...(sessionId === undefined ? {} : { sessionId }) };
-  } catch (error) { toolError("cli", "cli.catch6");
+  } catch (error) { toolError("cli", "cli.catch6", error);
     throw error instanceof CliError ? error : new CliError("Attachment could not be read safely");
   } finally {
-    await handle?.close().catch(() => { toolError("cli", "cli.catch7");});
+    await handle?.close().catch((caughtError) => { toolError("cli", "cli.catch7", caughtError);});
     toolLog.capture(() => {
       const kind = cardKind(name);
       if (kind !== "other") toolLog.write({ component: "card-file", kind: "perf", name: "card.render", ok: prepared,
@@ -530,7 +547,7 @@ async function sendCommand(command: Command): Promise<unknown> {
   try {
     if (!isAbsolute(socketPath) || socketPath.includes("\0")) throw new Error();
     socket = await lstat(socketPath);
-  } catch { toolError("cli", "cli.catch8");
+  } catch (caughtError) { toolError("cli", "cli.catch8", caughtError);
     throw new CliError("Bridge socket is unavailable");
   }
   // The daemon owns the private parent directory; never follow a socket symlink.
@@ -574,7 +591,7 @@ async function sendCommand(command: Command): Promise<unknown> {
           let data: unknown;
           try {
             data = JSON.parse(Buffer.concat(chunks, size).toString("utf8"));
-          } catch { toolError("cli", "cli.catch9");
+          } catch (caughtError) { toolError("cli", "cli.catch9", caughtError);
             reject(new CliError(ok ? "Bridge returned invalid JSON" : `Bridge request failed (HTTP ${status})`));
             return;
           }
@@ -633,7 +650,7 @@ if (import.meta.main) {
     const result = isLocalCommand(args) ? await runLocalCommand(parseLocalCommand(args)) : await sendCommand(parseCommand(args));
     if (result instanceof RawOutput) process.stdout.write(result.value);
     else console.log(JSON.stringify(result));
-  } catch (error) { toolError("cli", "cli.catch10");
+  } catch (error) { toolError("cli", "cli.catch10", error);
     console.error(JSON.stringify({ error: error instanceof CliError ? error.message : "Bridge request failed" }));
     process.exitCode = 1;
   }

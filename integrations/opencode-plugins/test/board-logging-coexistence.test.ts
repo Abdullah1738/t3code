@@ -39,6 +39,7 @@ test('the installed gate emits one event per decision into each board', () => {
       if (scenario.label==='exempt') writeFileSync(join(state,'exemptions.json'), JSON.stringify([{session_id:'fixture-session'}]));
       const script = `
         import {mock} from 'bun:test';
+        Math.random=()=>0;
         if (${JSON.stringify(scenario.label)}==='classifier-error') mock.module(${JSON.stringify(join(skill,'scripts/classify.ts'))},()=>({classify:()=>({heavy:false,error:'private-classifier-body'}),loadRules:()=>{}}));
         const {default:plugin} = await import(${JSON.stringify(join(config,'plugin/offbox-gate.ts'))});
         let before;

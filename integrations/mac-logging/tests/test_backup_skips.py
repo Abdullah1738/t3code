@@ -4,6 +4,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
@@ -88,7 +89,29 @@ class BackupSkipTests(unittest.TestCase):
     fixture = shell_jobs.ShellJobsTests.fixture
     rows = shell_jobs.ShellJobsTests.rows
 
-    def setup_run(self, target, point=''):
+    def memory_python(self):
+        if sys.version_info >= (3, 10):
+            return sys.executable
+        candidates = ['/opt/homebrew/bin/python3', shutil.which('python3')]
+        for directory in os.get_exec_path():
+            candidates.extend(str(path) for path in Path(directory).glob('python3.*')
+                              if path.name.removeprefix('python3.').isdigit())
+        for candidate in dict.fromkeys(candidates):
+            if not candidate:
+                continue
+            try:
+                result = subprocess.run(
+                    [candidate, '-c', 'import sys; sys.exit(sys.version_info < (3, 10))'],
+                    capture_output=True, timeout=5,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if result.returncode == 0:
+                return candidate
+        self.skipTest('memory-system runs under Homebrew Python ≥3.10; '
+                      f'no compatible interpreter available (test runner: {sys.version_info.major}.{sys.version_info.minor})')
+
+    def setup_run(self, target, point='', *, python=None):
         root, home, fake, logs, env = self.fixture()
         for name in ('python3', 'restic', 'rsync', 'df', 'stat', 'nice', 'bun', 'sqlite3', 'ps', 'mkdir', 'date'):
             text = FAKE.replace("if name=='python3':", EXTRA + "\nif name=='python3':", 1)
@@ -96,7 +119,7 @@ class BackupSkipTests(unittest.TestCase):
                 text += "\nif name=='mkdir': os.execv('/bin/mkdir',['/bin/mkdir']+args)\n"
             if name == 'date':
                 text += "\nif name=='date': os.execv('/bin/date',['/bin/date']+args)\n"
-            (fake/name).write_text(text.replace('PYTHON', sys.executable))
+            (fake/name).write_text(text.replace('PYTHON', python or sys.executable))
             (fake/name).chmod(0o755)
         vault = home/'health-data/abdullah'
         vault.mkdir(parents=True)
@@ -248,6 +271,7 @@ class BackupSkipTests(unittest.TestCase):
                     self.assertFalse(row['ok'])
 
     def test_real_runner_validation_never_claims_a_restic_exit(self):
+        python = self.memory_python()
         cases=[(key,value) for key in ('MEMORY_BACKUP_RESTIC_TIMEOUT_S',
                                       'MEMORY_BACKUP_MAX_SECONDS_UNDER_LOAD')
                for value in ('0','-1','nan','NaN','inf','-inf','1e309','invalid')]
@@ -255,7 +279,7 @@ class BackupSkipTests(unittest.TestCase):
                   ('MEMORY_BACKUP_LOAD_INTERVAL_S','0'), ('MEMORY_BACKUP_LOAD_HIGH','invalid')]
         for key,value in cases:
             with self.subTest(key=key,value=value):
-                fixture=self.setup_run('memory','runner_validation')
+                fixture=self.setup_run('memory','runner_validation',python=python)
                 fixture[3][key]=value
                 row,calls=self.execute(fixture,1)
                 self.assertEqual(calls,'')
@@ -300,8 +324,9 @@ class BackupSkipTests(unittest.TestCase):
             self.assertEqual(calls,'')
 
     def test_memory_redaction_wrapper_success_and_open_failure(self):
+        python = self.memory_python()
         for failure in (False,True):
-            fixture=self.setup_run('memory')
+            fixture=self.setup_run('memory',python=python)
             root,home,logs,env,run,calls=fixture
             env.pop('MEMORY_BACKUP_GUARDED')
             env.pop('RECALL_FENCED')
@@ -422,8 +447,76 @@ class BackupSkipTests(unittest.TestCase):
         rows=self.rows(logs)
         for row in rows[:-1]:
             self.assertIn(row['props']['skipReason'],toollog.SKIP_REASONS)
-            self.assertFalse(row['ok'])
+            self.assertEqual(row['ok'], row['props']['skipReason'] in ('load_deferred', 'boot_grace'))
         self.assertNotIn('private-',json.dumps(rows))
+
+    def test_deliberate_deferrals_have_numeric_metadata_and_no_error(self):
+        root,home,fake,logs,env=self.fixture()
+        with patch.dict(os.environ,env,clear=True), patch.object(jobs,'backup_snapshot_age',return_value=(None,'unavailable')):
+            for reason in ('load_deferred','boot_grace'):
+                jobs.backup_run('memory',time.time(),'',0,0,'',reason,'', '3.126','18000','3')
+        rows=self.rows(logs)
+        self.assertEqual(len(rows),2)
+        for row,reason in zip(rows,('load_deferred','boot_grace')):
+            self.assertTrue(row['ok'])
+            self.assertEqual(row['kind'],'perf')
+            self.assertNotIn('error',row)
+            props=row['props']
+            self.assertEqual(props['skipReason'],reason)
+            self.assertEqual(props['skipped'],1)
+            self.assertEqual(props['loadPerCore'],3.13)
+            self.assertEqual(props['lastSuccessAgeS'],18000)
+            self.assertEqual(props['deferredCount'],3)
+            self.assertIs(type(props['loadPerCore']),float)
+            self.assertIs(type(props['lastSuccessAgeS']),int)
+            self.assertIs(type(props['deferredCount']),int)
+            self.assertTrue(all('/' not in value and '\\' not in value for value in props.values() if isinstance(value,str)))
+            self.assertNotIn(str(root),json.dumps(props))
+
+    def test_optional_deferral_numbers_reject_invalid_input_independently(self):
+        root,home,fake,logs,env=self.fixture()
+        cases=[('', '', ''), ('/private/file','host.example','python backup.py'),
+               ('nan','1.5','1e2'), ('inf','-1','-1'), ('-1','True','False'),
+               (True,True,True), (None,None,None), ('1e9999','nan','inf')]
+        with patch.dict(os.environ,env,clear=True), patch.object(jobs,'backup_snapshot_age',return_value=(None,'unavailable')):
+            for values in cases:
+                jobs.backup_run('memory',time.time(),'',0,0,'','load_deferred','',*values)
+            jobs.backup_run('memory',time.time(),'',0,0,'','boot_grace','', 'bad','0','0')
+            jobs.backup_run('memory',time.time(),'',0,0,'','unknown-deferral','', '0','0','0')
+            jobs.backup_run('memory',time.time(),'',1,0,'','load_deferred','', '0','0','0')
+        rows=self.rows(logs)
+        self.assertEqual(len(rows),len(cases)+3)
+        for row in rows[:len(cases)]:
+            self.assertTrue(row['ok'])
+            for key in ('loadPerCore','lastSuccessAgeS','deferredCount'):
+                self.assertNotIn(key,row['props'])
+        self.assertNotIn('loadPerCore',rows[-3]['props'])
+        self.assertEqual(rows[-3]['props']['lastSuccessAgeS'],0)
+        self.assertEqual(rows[-3]['props']['deferredCount'],0)
+        self.assertEqual(rows[-2]['props']['skipReason'],'other')
+        self.assertFalse(rows[-2]['ok'])
+        self.assertEqual(rows[-2]['error']['tag'],'backup.skipped_other')
+        self.assertFalse(rows[-1]['ok'])
+        self.assertEqual(rows[-1]['error']['tag'],'backup.skipped_load_deferred')
+
+    def test_deferral_cli_keeps_restic_summary_on_stdin(self):
+        root,home,fake,logs,env=self.fixture()
+        for reason in ('load_deferred','boot_grace'):
+            result=subprocess.run([sys.executable,str(HERE/'jobs.py'),'backup','memory',str(time.time()),
+                                   '', '0','0',reason,'','3.126','18000','2'],env=env,
+                                  input=json.dumps({'total_files_processed':7,'path':'/private/file'}),
+                                  capture_output=True,text=True,timeout=8)
+            self.assertEqual(result.returncode,0,result.stderr)
+        rows=self.rows(logs)
+        self.assertEqual(len(rows),2)
+        for row in rows:
+            self.assertTrue(row['ok'])
+            self.assertNotIn('error',row)
+            self.assertEqual(row['props']['loadPerCore'],3.13)
+            self.assertEqual(row['props']['lastSuccessAgeS'],18000)
+            self.assertEqual(row['props']['deferredCount'],2)
+            self.assertEqual(row['props']['files'],7)
+            self.assertNotIn('/private/file',json.dumps(row))
 
     def test_missing_logger_preserves_success_and_failure(self):
         for target in ('health','memory'):

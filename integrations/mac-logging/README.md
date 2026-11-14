@@ -10,8 +10,10 @@ The collector reads DiagnosticReports and a filtered `log show`, retaining a
 separate cursor per source so an unavailable source is retried. Its first run
 looks back one hour. Report cursors cover since their last successful read.
 Unified-log queries cover at most the most recent hour; skipped older time is
-explicit in `skippedS`. A failed query retains the exact bounded window for retry,
-and success advances its cursor to that window end.
+explicit in `skippedS`. Queries run in 15-minute chunks, checkpointing the cursor
+after each completed chunk. A failed query retains the unfinished suffix for retry.
+Boot observations include `observedAt` (Unix seconds) for the boot marker; duplicate
+markers at the same instant count once. Other observations remain aggregated.
 It rolls up yesterday on the first hourly run after 00:05 UTC. It writes only
 its own state, day logs, rollups and probe samples, and never changes crash evidence.
 
@@ -19,10 +21,12 @@ Disk samples use `statvfs`, sizes of the known Robob/OpenCode/recall database
 and WAL files (metadata only), the guard's cached TMPDIR measurement, and an hourly cached directory inventory of worktrees, caches and backup repositories.
 The collector gathers directory sizes with read-only du calls outside the guard,
 allowing up to 60 s per root under a shared 210 s scan budget. The two big
-roots (`~/.local/share` and `~/.robob`) run first, one first-level child at a
-time with a 15 s child timeout. Each root gets at most 60 s. The collector
+roots (`~/.local/share` and `~/.robob`) scan one first-level child at a
+time with a 15 s child timeout. Roots rotate by their last attempt, and each
+gets at most 60 s. The collector
 also limits the scan to the time remaining in its five-minute run budget,
-reserving 65 s for crash collection after the existing disk tooling probe. Samples expose
+running crash collection first (at most 165 s), then disk-wait collection, the disk tooling probe and
+inventory with the remaining time. Inventory keeps its own 210 s maximum. Samples expose
 `inventorySourceErrors`, `inventoryAgeS` (null if absent), and `inventoryStale`
 (absent or older than two hours). These do not affect the sample's own success.
 The five largest positive deltas in that tracked set are flattened as
@@ -30,13 +34,32 @@ The five largest positive deltas in that tracked set are flattened as
 sample; `count=0` means no known positive growth, not a full-disk scan. GB is
 1024³ bytes, matching the guard's existing units. This avoids a recursive scan
 inside the guard. Snapshot age refers to the last completed restic snapshot,
-including one whose subsequent Dropbox mirror failed; unknown counters/age
+including one whose subsequent Dropbox mirror failed; unknown counters
 are omitted rather than reported as zero. A restic exit code of -1 means it
 was not reached. Fix versions use the sweep's known version transition or
 local package metadata; unavailable versions are `unknown`.
 
-Samples also include `internalFreeGbDelta`/`externalFreeGbDelta` (null on the
-first measurement), and optional `internal`/`external` `PurgeableGb` and
+Every `backup.run` includes `trigger` and `lastGoodSnapshotAgeS`. The latter
+comes from a lock-free restic snapshot query, even on admission skips; unreadable
+repositories yield null with a fixed `lastGoodSnapshotError` tag. The probe
+uses an inherited password or the target's fixed Keychain entry, never a supplied
+password command/file, with one second for Keychain and three for restic.
+Lock skips include holder parent PID, elapsed process age, and a command reduced
+to a known executable and first argument; other arguments are redacted. Ancestry
+supplies a best-effort holder trigger, including `agent`; unavailable details are
+null/unknown. A proven missing PID becomes `stale_lock`. No lock is changed.
+Daily rollups count `backup.skipped_runs` and `backup.ok_runs` by target;
+`log.rollup` flattens them as e.g. `backup.skipped_runs.memory`. Healthy lock
+skips count only as skips.
+
+Samples also include `internalFreeGbDelta`/`externalFreeGbDelta`, compared with
+each volume's last numeric measurement even across failed samples.
+`internalDeltaFromTs`/`externalDeltaFromTs` and the matching `DeltaWindowS`
+give each comparison's window; `deltaFromTs`/`deltaWindowS` use the internal
+comparison when available, otherwise external. Unknown deltas are null with a
+`deltaUnavailable` reason. Legacy state recovers missing numeric baselines from at
+most 1 MiB of each of today's and yesterday's logs; missing or corrupt state
+starts a tagged baseline instead. Samples also include optional `internal`/`external` `PurgeableGb` and
 `LocalSnapshotCount`. Four read-only diskutil/tmutil calls run concurrently
 under one five-second budget, including cleanup. Missing purgeable keys are
 `PurgeableError=unsupported`, never zero; command failures carry short error
@@ -56,6 +79,20 @@ Changes of at least 20 GB on either volume emit one
 to three flattened `topMover` pairs. These events never alert. The inventory is
 hourly and covers selected roots, so movers are evidence of tracked changes,
 not a complete accounting of each free-space delta.
+
+A volume losing more than 10 GB since its last numeric sample emits one
+`disk.drop` with its delta, window, purgeable space and local snapshot count
+(null when unavailable). Its five `grower…Name`/`grower…Bytes` pairs are positive
+directory growth from the existing inventory: immediate directory children of
+the two big roots, or the other tracked roots. File entries and deeper names
+are excluded. Fresh, fully measured child directories remain useful evidence
+when their parent scan is partial. `inventoryComplete=false` explicitly marks
+missing, stale, partial or reused inventory on either side; stale or reused
+snapshots supply no growers. A newly created child directory has a zero baseline
+only when a prior complete parent entry set proves that path was absent.
+Partial inventories and older snapshots without that evidence remain unknown.
+An unknown directory baseline also makes the event incomplete.
+These events never alert or launch extra scans.
 
 ## Source events
 
@@ -82,14 +119,20 @@ only readable entries; permission grants remain an owner action.
 Big roots emit child source events with `bytes`, `exitCode`, `elapsedMs`,
 `partial`, and `deniedCount`, plus a root aggregate with `completedCount` and
 `failedCount`. Child timeouts/errors remain named source errors. An incomplete
-root emits an error with `failure=partial`, `partial=true`, and the completed
-children's `bytes` as a lower bound. `failedCount` includes one additional
+root emits an error with `failure=partial`, `partial=true`, and the available
+children's `bytes`. Cached sizes make that aggregate an estimate. `failedCount` includes one additional
 incomplete remainder when the root deadline stops enumeration; it is not a
 count of every unvisited child. Summing child du totals does not deduplicate
 hard links across children and excludes the root directory's own blocks.
-Missing totals are never replaced with an old total, even within 24 hours.
-If every child fails, the root has an error and no cached size. Inventory state
-retains completed child sizes in `children` and aggregate flags in `partials`.
+Root attempts rotate oldest first, with never-attempted roots ahead of measured
+ones. Budget-skipped roots retain their place; full failed attempts rotate too.
+Shortened failed attempts keep priority for a full allowance on the next run.
+`disk.inventory.turn` identifies each attempted root's `source` and `turn`.
+Child attempts rotate the same way. A failed child retains its last good size
+and timestamp in `childState`; a root containing cached or unreadable children
+remains partial. `cachedCount` and `ageS` describe retained measurements.
+If every child fails without a last-good measurement, the root has no size.
+Inventory state retains child sizes in `children` and aggregate flags in `partials`.
 Summary `sourceErrors` counts affected roots, not their child error lines.
 Partial roots are excluded from growth comparisons on both sides, so changing
 scan coverage cannot become a reported grower.
@@ -98,11 +141,23 @@ scan coverage cannot become a reported grower.
 errors or staleness are metadata rather than sample failures. Its `sourceErrors`
 still counts failures of its own free-space and existing-file stat measurements.
 Confirmed missing optional database/WAL files retain zero sizes. The filtered unified-log query
-has a one-hour maximum window and a timeout of at most 60 s, shortened to the
-collector's remaining absolute budget. Its source event/error and
+has a one-hour maximum window, split into contiguous 15-minute chunks under a
+shared 135 s budget, allowing four chunks at the observed 30 s cost plus headroom.
+Each command has at most 60 s, shortened to that shared
+budget and the collector's remaining absolute budget. Its source event/error and
 `crash.collect` record `windowStart` and `windowEnd` (Unix seconds), `windowS`,
-and `skippedS` (older time omitted by the cap). On failure, `unifiedRetry`
-retains the exact window until it succeeds; then the cursor advances to its end.
+`skippedS` (older time omitted by the cap), `chunks` (planned for this attempt),
+and `chunksDone`. Each completed chunk emits its observations and saves its cursor
+before the next command. The next chunk excludes that cursor's instant, including
+when log's second rounding/end padding returns overlapping rows. Missing or invalid
+event timestamps fail the chunk rather than risk attributing events twice.
+On failure, `unifiedRetry` retains the exact unfinished suffix until it succeeds;
+completed chunks are not queried again. An old one-hour retry is split the same
+way. Chunk checkpoints retain unreported `skippedS`, including after the final
+chunk, so interruption before the source result cannot hide a coverage gap.
+Once the source result reports the gap, a retained suffix clears that metadata.
+After a delayed retry completes, the next run applies the recent-hour cap
+again and reports any omitted older time in `skippedS`.
 
 Report sources have independent checkpoints. Each attempt allows up to 10 s per
 source, capped by the collector's absolute deadline. Directory enumeration,
@@ -115,10 +170,17 @@ filenames (metadata only); retries skip those filenames, retaining progress
 without counting them again. The source cursor advances to that window's end
 only after enumeration completes. Reports arriving after that end remain for
 the next window. Healthy sources continue independently.
+IPS headers are read as at most 4096 bytes before decoding, so invalid body
+bytes cannot break a valid header. Unreadable or malformed files are skipped
+individually; each report source logs `unreadableCount` without file contents.
 
 `collector.main` sets a 290 s absolute work deadline, leaving ten seconds for
-state/log overhead within five minutes. Report work, the log query and daily
-rollup share that deadline; no log command starts once the budget is exhausted.
+state/log overhead within five minutes. Crash collection has at most 165 s for
+three 10 s report sources, the shared 135 s log budget, and daily rollup. The disk
+wait check follows with at most 45 s for ps and alerts, shortened to the remaining
+absolute budget. The disk tooling probe follows, then inventory uses what remains.
+No log command starts once its shared budget is exhausted. No live configuration
+or schedule change is needed for this order.
 
 ## diskutil hangs
 
@@ -148,6 +210,35 @@ On 13 Nov 2026, `sudo killall storagekitd` returned 0 but pid 80846 (up 17 h
 52 m) ignored SIGTERM. `sudo kill -9 80846` cleared it; launchd restarted
 storagekitd and `diskutil list` improved from an 8 s timeout to 0.04–0.74 s.
 
+## Processes stuck in disk wait
+
+Each hourly run emits `proc.disk_wait` from a read-only, 10 s-bounded
+`ps -axo pid,ppid,etime,stat,comm,args`. It counts processes observed in
+`U` with a process age of at least ten minutes, retaining the ten oldest
+(`pid`, `ppid`, `ageS`, `stat`, `comm`, `args`). Arguments are limited
+to 300 characters, with credential-like values redacted; no environment
+is logged. `stuckUnmount` and `mountPoint` flag an unmount among all matches,
+even if it is outside the ten retained entries. A failed ps records an error
+without stopping the other collector sources.
+
+Process age is not time continuously spent in U: this is an hourly observation,
+and an old process can be caught during normal I/O. An umount aged at least
+30 minutes, or another process aged at least six hours, triggers one Telegram
+attention alert per PID/start time. A bounded ps start-time lookup prevents
+PID reuse from suppressing a new incident. Failed notifications retry with
+the same key and frozen text; they never fail collection. The shared 45 s disk-wait
+budget defers remaining alerts to the next run when notifications are slow.
+Daily `diskWait` rollups give runs with matches, maximum process age, and
+the latest stuck-unmount mount point.
+
+A kernel-stuck unmount can block the stat child of plain lsof, even for an
+unrelated APFS file, and may also affect diskutil. While a U-state umount
+exists, use `lsof -b -w` with a subprocess timeout, preferably selecting
+a PID. It skips stat/lstat/readlink, so pathname queries may return
+'Resource temporarily unavailable'; missing output does not prove a file
+has no holders. A reboot clears a stuck umount. The collector only reports
+it and never changes mounts or restarts the Mac.
+
 ## Install after review and owner approval
 
 All scripts refuse dirty upkeep source or HEAD absent from origin/main. No
@@ -161,8 +252,10 @@ zsh integrations/mac-logging/install-jobs.zsh
 ```
 
 Each accepts `--dry-run` or `--check`. The final installer updates only the
-memory backup, disk check and two janitor scripts, retaining timestamped
-copies. This avoids deploying unrelated integration changes or skill wording.
+disk check and two janitor scripts, retaining timestamped copies.
+Memory-system belongs to the Recall board and is deployed from
+`robob/recall-golive`; send changes there as port requests. This installer
+refuses targets under `~/.local/share/memory-system`.
 The helper installer writes the proposed
 `com.abdullah.mac-log-collector.plist`; the evaluator must separately load it
 after approval. Existing job schedules and backup LaunchAgents stay in place.

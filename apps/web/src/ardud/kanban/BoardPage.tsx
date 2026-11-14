@@ -78,7 +78,7 @@ import { AutomationsView, WikiView } from "./SideViews";
 import { ThreadsView } from "./ThreadsView";
 import "./tokens.css";
 import "./kanban.css";
-import { useAnalyticsSearch } from "../useAnalytics";
+import { useAnalyticsCounts, useAnalyticsSearch } from "../useAnalytics";
 import { usePrimaryEnvironmentId } from "../../state/environments";
 
 /** Keys set to undefined are dropped from the URL. */
@@ -155,6 +155,7 @@ export function BoardPage(props: {
       : null;
   const steps = model && drawerOpen && search.card ? boardSteps(model, group, search.card) : null;
   useAnalyticsSearch(usePrimaryEnvironmentId(), "board", query.length, model?.total ?? 0, boardId);
+  useAnalyticsCounts(usePrimaryEnvironmentId(), view === "board" ? "board" : `board.${view}`, 0);
   const setLens = (next: BoardLens) => go({ lens: next === "stuck" ? "stuck" : undefined });
   const [lifting, setLifting] = useState(false);
   const liftPause = () => {

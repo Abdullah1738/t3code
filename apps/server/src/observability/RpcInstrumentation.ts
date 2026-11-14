@@ -1,3 +1,4 @@
+import { interruptionProps } from "./analyticsInterruption.ts";
 import { actionIdAttributes } from "../ardud/observability/actionCorrelation.ts";
 import {
   // ardud: missions board
@@ -392,6 +393,7 @@ export const layerServerAnalyticsErrors = Layer.unwrap(
         route: "server",
         props: {
           errorTag: analyticsErrorTag(cause),
+          ...interruptionProps(cause),
           span: span?._tag === "Span" ? safeAnalyticsLabel(span.name, "unknown") : "unknown",
           originKind: fiber.getRef(AnalyticsOriginKind),
         },
@@ -458,7 +460,12 @@ export const rpcInstrumentationLayer = Layer.succeed(RpcInstrumentation)((
                       : "unary",
                     span: `${RPC_SPAN_PREFIX}.${method}`,
                     originKind,
-                    ...(Exit.isFailure(exit) ? { errorTag: analyticsErrorTag(exit.cause) } : {}),
+                    ...(Exit.isFailure(exit)
+                      ? {
+                          errorTag: analyticsErrorTag(exit.cause),
+                          ...interruptionProps(exit.cause),
+                        }
+                      : {}),
                   },
                 });
               }),

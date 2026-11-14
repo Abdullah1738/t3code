@@ -43,6 +43,7 @@ import {
   type RefObject,
 } from "react";
 
+import { useAskTiming } from "./useAskTiming";
 import { observeResize } from "../../../lib/observeResize";
 import { cn } from "../../../lib/utils";
 import { BoardIcon } from "../boardIcon";
@@ -159,6 +160,7 @@ export function AskReader(props: {
   const refusal = askRefusal(response);
   const locked = turn === "evaluator" || turn === "expired";
   const root = useRef<HTMLDivElement>(null);
+  useAskTiming(entry.cardId, entry.ask.id, root);
 
   // The feed carries big blocks as stubs: read the ask whole once it is open.
   const needsDetail = detail === undefined && askNeedsDetail(entry.ask);

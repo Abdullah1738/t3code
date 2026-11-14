@@ -21,6 +21,8 @@ import { EvaluatorThreadLink } from "./HandOver";
 import { UnreadableNotice } from "./QueueRail";
 import { sameDay, shortWhen } from "./snoozeTimes";
 import { Bar, Btn, Label, linkClass, type PageLayout } from "./ui";
+import { useAnalyticsCounts } from "../../useAnalytics";
+import { usePrimaryEnvironmentId } from "../../../state/environments";
 
 function Line(props: { who: ReactNode; children: ReactNode }) {
   return (
@@ -250,6 +252,11 @@ export function HistoryView(props: {
   });
   const today = rows.filter((row) => sameDay(row.entry.ask.answer!.at, props.nowMs));
   const earlier = rows.filter((row) => !sameDay(row.entry.ask.answer!.at, props.nowMs));
+  useAnalyticsCounts(
+    usePrimaryEnvironmentId(),
+    "needs-owner.history",
+    rows.length + session.length,
+  );
   const facts = askHistoryFacts({
     today,
     waiting: props.waiting,

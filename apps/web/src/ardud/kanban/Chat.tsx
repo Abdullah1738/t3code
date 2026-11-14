@@ -69,6 +69,7 @@ import { usePrimaryEnvironmentId } from "../../state/environments";
 import { useAnalyticsScreen } from "../useAnalytics";
 import { recordAnalytics } from "@t3tools/client-runtime/ardud/analytics";
 import { useServerConfigs } from "../../state/entities";
+import { askTimingRef } from "./needsYou/useAskTiming";
 import { useNowMs } from "./useNowMs";
 import {
   kanban,
@@ -172,6 +173,7 @@ export function Chat(props: {
                 key={message.seq}
                 boardId={boardId}
                 message={message}
+                cardId={discussion.cardId}
                 cards={state.cards}
                 onOpenCard={props.onOpenCard}
                 seen={message.seq === lastOwnSeq ? presence.seenBy : undefined}
@@ -205,6 +207,7 @@ export function Chat(props: {
 }
 
 export const Message = memo(function Message(props: {
+  cardId?: string | null;
   boardId: string;
   message: KanbanMessage;
   cards: KanbanBoardState["cards"];
@@ -213,6 +216,11 @@ export const Message = memo(function Message(props: {
 }) {
   const { message } = props;
   const time = formatTimeOfDay(message.createdAt);
+  const ask = props.cardId
+    ? props.cards
+        .get(props.cardId)
+        ?.asks.find((ask) => ask.closedAt === null && ask.seq === message.seq)
+    : undefined;
   const renderBlock = (block: KanbanBlock, index: number) => (
     <Block
       key={blockKey(block, index)}
@@ -268,7 +276,10 @@ export const Message = memo(function Message(props: {
 
   const face = avatarOf(message.author, message.authorName);
   return (
-    <div className="grid grid-cols-[28px_1fr] gap-2.5">
+    <div
+      ref={props.cardId && ask ? askTimingRef(props.cardId, ask.id) : undefined}
+      className="grid grid-cols-[28px_1fr] gap-2.5"
+    >
       <Avatar kind={face.kind} letter={face.letter} name={message.authorName} />
       <div className="flex min-w-0 flex-col gap-1">
         <span className="flex items-baseline gap-2">

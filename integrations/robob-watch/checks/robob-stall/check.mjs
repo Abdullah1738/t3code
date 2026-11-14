@@ -26,7 +26,7 @@ export function accepted(state, now = Date.now()) {
 
 export function notify(pending, run = execFileSync) {
   const cli = process.env.ROBOB_WATCH_TELEGRAM_CLI ?? path.join(os.homedir(), ".local/share/telegram-bridge/src/cli.ts");
-  const result = JSON.parse(run(path.join(os.homedir(), ".bun/bin/bun"), [cli, "notify", "--source", "Robob stalls", "--severity", pending.kind === "alert" ? "attention" : "info", "--text", pending.text, "--key", pending.key], { encoding: "utf8", timeout: 20_000, maxBuffer: 64 * 1024, env: { ...process.env, BUN_INSPECT: "" } }));
+  const result = JSON.parse(run(path.join(os.homedir(), ".bun/bin/bun"), [cli, "notify", "--source", "Robob stalls", "--severity", pending.kind === "alert" ? "attention" : "info", `--text=${pending.text}`, `--key=${pending.key}`], { encoding: "utf8", timeout: 20_000, maxBuffer: 64 * 1024, env: { ...process.env, BUN_INSPECT: "" } }));
   if (!/^notify:[a-f0-9]{64}$/.test(result?.id) || typeof result.created !== "boolean") throw new Error("Telegram did not accept the notification");
 }
 

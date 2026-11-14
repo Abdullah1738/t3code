@@ -32,14 +32,14 @@ export function readReplyRulesStrict(path: string): ReplyRules {
   let text: string;
   try {
     text = readFileSync(path, "utf8");
-  } catch (error) { toolError("replyCheck", "replyCheck.catch1");
+  } catch (error) { toolError("replyCheck", "replyCheck.catch1", error);
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
     throw new Error(MALFORMED);
   }
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
-  } catch { toolError("replyCheck", "replyCheck.catch2");
+  } catch (caughtError) { toolError("replyCheck", "replyCheck.catch2", caughtError);
     throw new Error(MALFORMED);
   }
   if (!isObject(parsed)) throw new Error(MALFORMED);
@@ -57,7 +57,7 @@ export function readReplyRulesStrict(path: string): ReplyRules {
 export function readReplyRules(path: string): ReplyRules {
   try {
     return readReplyRulesStrict(path);
-  } catch { toolError("replyCheck", "replyCheck.catch3");
+  } catch (caughtError) { toolError("replyCheck", "replyCheck.catch3", caughtError);
     return {};
   }
 }
