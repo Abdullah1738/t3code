@@ -1254,6 +1254,48 @@ class Questions(Base):
         self.assertEqual(self.follow('2026-11-07T09:00', finder(REFUND), 'r3'), '')
         self.assertEqual(mc.load(self.data)['cases'][0], case)
 
+    def test_identified_automatic_case_reports_refund_once_without_asking(self):
+        for status in ('open', 'awaiting_answer'):
+            with self.subTest(status=status):
+                self.data = self.tmp / status
+                self.wd = self.tmp / ('wd-' + status)
+                self.wd.mkdir()
+                cid = 'identified-refund'
+                self.case(cid, merchant=None, unmatched=True, amount='864', currency='USD',
+                          deadline='2026-11-06T14:00', when=at('2026-11-06T14:25'),
+                          next_action='owner: which order is this?',
+                          alert_at=mc.stamp(at('2026-11-06T12:00')))
+                mc.update(self.data, cid, {'merchant': 'DigiCert', 'state': 'refund requested'},
+                          source='mail:identified', at=at('2026-11-06T14:26'))
+                with mc.Locked(self.data) as book:
+                    book['cases'][0]['status'] = status
+                before = mc.load(self.data)['cases'][0]
+                self.assertFalse(mc.owner_answered(before))
+                self.assertEqual(self.follow('2026-11-06T14:30', finder(), 'before'), '')
+                event = self.follow('2026-11-06T22:50', finder(REFUND))
+                case = mc.load(self.data)['cases'][0]
+                self.assertEqual(mc.deadline_of(case), at('2026-11-13T22:47'))
+                self.assertEqual(case['refund_mail'], {'id': 301, 'at': mc.stamp(at('2026-11-06T22:47'))})
+                self.assertIn('refund promised', case['state'])
+                self.assertFalse(mc.owner_answered(case))
+                self.assertEqual(event.count('mailed Fri 6 Nov 22:47'), 1)
+                self.assertNotIn('which order is this?', event)
+                self.assertNotIn(mc.ASK, event)
+                key = f'{cid}|refund|301'
+                state = json.loads((self.wd / 'pings.json').read_text())
+                self.assertEqual(state['outbox']['keys'], [key])
+                self.assertEqual(self.follow('2026-11-06T22:55', finder(REFUND), 'r2'), '')
+                self.assertEqual(mc.load(self.data)['cases'][0], case)
+                clock = {cid: {'answer': mc.answered_at(case).isoformat(),
+                               'at': mc.stamp(at('2026-11-06T14:30'))}}
+                future = at('2026-11-14T09:00')
+                due = mc.attention([case], future, {}, self.root, clock)
+                self.assertEqual([k for _, items, _, _ in due for k, _ in items], [key])
+                self.assertEqual(due[0][2], '')
+                self.assertEqual(mc.attention([case], future, {key}, self.root, clock), [])
+                day = f'{cid}|day|2026-11-14'
+                self.assertEqual(mc.attention([case], future, {day}, self.root, clock), [])
+
     def test_refund_mail_never_shortens_deadline_or_changes_unrelated_next(self):
         self.refund_case(deadline='2026-11-20', next_action='watch for the credit')
         self.follow('2026-11-06T22:50', finder(REFUND))

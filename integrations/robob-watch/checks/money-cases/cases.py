@@ -1919,8 +1919,7 @@ def attention(cases, now, sent, root=None, since=None, pending=False):
             continue
         # The daily list owns the first ask; an automatic case must not add a
         # deadline prompt while that charge still awaits his answer.
-        if case.get('alert_at') and not owner_answered(case):
-            continue
+        automatic = bool(case.get('alert_at') and not owner_answered(case))
         if case.get('kind') in ('payment_deadline', 'autopay_expected'):
             continue
         refund = case.get('refund_mail')
@@ -1929,6 +1928,7 @@ def attention(cases, now, sent, root=None, since=None, pending=False):
             continue
         deadline = deadline_of(case)
         cid = case['id']
+        day_key = f'{cid}|day|{now.date()}'
         # rev changes with every deadline edit, cycle with every reopen, so both re-arm pings.
         rev, cycle = case.get('rev', 0), case.get('cycle', 0)
         # Redact before clipping: a clipped card number would no longer match.
@@ -1940,6 +1940,11 @@ def attention(cases, now, sent, root=None, since=None, pending=False):
             found.append((f"{cid}|refund|{refund['id']}",
                           f"{case['merchant']} mailed {when(moment(refund['at']))} that the refund was processed; "
                           f'dispute step held until {when(deadline)}'))
+        if automatic:
+            # Refund news can bypass the first-ask suppression without exposing its next-action prompt.
+            if refund_pending and found and day_key not in sent:
+                entries.append((head, found, '', cid))
+            continue
         bill_key = f'{cid}|bill-ask|r{rev}|c{cycle}'
         urgent = overdue_bill(case, now) and bill_key not in sent
         if urgent:
@@ -1972,7 +1977,6 @@ def attention(cases, now, sent, root=None, since=None, pending=False):
             found.append((ask_key, ASK))
         if not found:
             continue
-        day_key = f'{cid}|day|{now.date()}'
         if day_key in sent and not urgent:
             # At most one reminder per case per day.
             continue
