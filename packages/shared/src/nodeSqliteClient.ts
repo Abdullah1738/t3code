@@ -1457,7 +1457,7 @@ const observeConnectionState = (classification, sql, params) => {
     const current = databases();
     const present = new Set(current.filter(entry => entry.name !== "main" && entry.name !== "temp").map(entry => entry.name));
     for (const name of attachmentStatements.keys()) if (!present.has(name)) attachmentStatements.delete(name);
-    const head = sql?.replace(/^(?:\\s|--[^\\n]*(?:\\n|$)|\\/\\*[\\s\\S]*?\\*\\/)+/, "");
+    const head = sql?.replace(/^(?:[;\\s]|--[^\\n]*(?:\\n|$)|\\/\\*[\\s\\S]*?\\*\\/)+/, "");
     if (/^ATTACH\\b/i.test(head ?? "")) for (const name of present) {
       if (!attachmentStatements.has(name)) attachmentStatements.set(name, { schema: name, sql, params });
     }

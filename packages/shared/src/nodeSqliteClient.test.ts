@@ -181,8 +181,8 @@ vi.mock("node:worker_threads", async (importOriginal) => {
             `,
             )
             .replace(
-              'if (isCancelled(id)) throw new Error("SQLite request cancelled before execution");\n    const entry = cached',
-              'await pauseStatement("elected", id, sql, params);\n    if (isCancelled(id)) throw new Error("SQLite request cancelled before execution");\n    const entry = cached',
+              'if (isCancelled(id)) throw new Error("SQLite request cancelled before execution");\n    executionStarted = performance.now();\n    const entry = cached',
+              'await pauseStatement("elected", id, sql, params);\n    if (isCancelled(id)) throw new Error("SQLite request cancelled before execution");\n    executionStarted = performance.now();\n    const entry = cached',
             )
             .replace(
               'if (isCancelled(id)) throw new Error("SQLite request cancelled before execution");\n    operation = "execute";',
@@ -3656,6 +3656,38 @@ for (const schema of ["temp", "scratch"] as const) {
     );
   }
 }
+
+it.effect.each(
+  [
+    { name: "no prefix", prefix: "" },
+    { name: "a semicolon", prefix: "; " },
+    { name: "repeated separators and a comment", prefix: ";; /* leading */ ; " },
+    { name: "line and block comments", prefix: "-- leading\n; /* middle */ ; " },
+  ].flatMap((form) => ["file", "memory"].map((target) => ({ ...form, target }))),
+)("restores $target attachments after $name and a writer crash", ({ prefix, target }) =>
+  withFileClient(
+    (sql, filename) =>
+      Effect.gen(function* () {
+        const archive = target === "memory" ? ":memory:" : `${filename}.archive`;
+        yield* sql.unsafe(`${prefix}ATTACH DATABASE ? AS archive`, [archive]).unprepared;
+        yield* sql`CREATE TABLE archive.entries(value INTEGER)`;
+        yield* sql`INSERT INTO archive.entries VALUES (2)`;
+        const count = writerWorkers.length;
+        yield* Effect.promise(() => writerWorkers.at(-1)!.terminate());
+        assert.deepEqual(
+          yield* sql`SELECT value FROM archive.entries`.values,
+          target === "memory" ? [] : [[2]],
+        );
+        assert.equal(writerWorkers.length, count + 1);
+        yield* sql`INSERT INTO archive.entries VALUES (3)`;
+        assert.deepEqual(
+          yield* sql`SELECT value FROM archive.entries ORDER BY value`.values,
+          target === "memory" ? [[3]] : [[2], [3]],
+        );
+      }),
+    { readerWorker: false },
+  ),
+);
 
 it.effect.each(["commit", "rollback", "savepoint commit", "savepoint rollback"] as const)(
   "restores ordered temp setup and query_only after %s and a crash",
