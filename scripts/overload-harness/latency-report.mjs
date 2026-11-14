@@ -48,7 +48,7 @@ try {
       invalid.push("missing run/source provenance");
     if (index === 0 && run.revision !== "dbc99fc3a4b817977bc23a57ea7c049da5d45190")
       invalid.push("base must be .9");
-    if (relativeMode && index === 1 && run.revision !== "aeb6617ef8219665cf7ce2e89f834a8abb801a05")
+    if (relativeMode && index === 1 && run.revision !== "58a926792ae28235d33d14025f417eccbc842549")
       invalid.push("candidate must be exact R11");
     if (index === 1 && run.candidateIndexPresent !== true)
       invalid.push("startup candidates index missing");

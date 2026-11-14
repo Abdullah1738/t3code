@@ -125,3 +125,24 @@ Clarification 14 Nov ~02:10 Dubai (evaluator, #1352 q1): work equivalence, revie
 ## R11′ rerun — evaluator q2
 
 The evaluator pinned R11′ = 58a926792ae28235d33d14025f417eccbc842549 (origin/main at14 Nov ~02:50 Dubai), containing oldR11 and#1386 plus the reviewed app merges since then. Use exactly this SHA even if main moves. Run3 candidate overload runs in parallel against the same3 base runs (d5e7,33c5,4463), with the same frozen v1 workload, box size and settings. Score under the relative gate (.11) plus q1's review launch substitution. Record box IDs/co-load and report every metric/runID plus the base2/3 profile diff as “Relative gate (.11) rerun at58a926792a”. Thresholds and seed/drive stay unchanged.
+
+## Matched A/B/C batches — evaluator amendment, 14 Nov ~04:00 Dubai
+
+The R11′ rerun above is INVALID (each run recorded two warnings). It is information only. The evaluator's replacement design is three sequential batches, each containing A = dbc99fc3a4b817977bc23a57ea7c049da5d45190, B = 8fde0ece3a2abea3dfed2866b6648fda68f52934, and C = 58a926792ae28235d33d14025f417eccbc842549. Each arm runs on a separate xlarge box, with the same frozen v1 workload, settings and measurement wrapper. B is diagnostic: report C−B and B−A. Score C against its own batch's A under the relative line and q1 clarification. Every batch must pass.
+
+The permitted measurement additions retain warning text, count/time native SQL by statement and caller (including separately timed reader-worker prepare/execute), and record interval ELU. They add no SQL, providers, effects, seed fields or driver inputs. Existing INVALID rules remain in force. Old base runs are information only for this design. The older-revision diagnostic-field exception still applies; harness-owned execution timers are separate from the product's diagnostic attributes.
+
+Evaluator q3, verbatim:
+
+Don't wait for a host-wide quiet window. No reservation mechanism exists, the host is rarely idle (46 overlapping commands last time), and we never pause or kill anyone else's jobs. Waiting for idle could stall the release indefinitely. I'm dropping the host-idle precondition from step 2. The matched design is what controls contention: the arms of a batch start at the same moment and share whatever load the host has.
+
+To be exact, the design is the latest one (seq 46): **3 sequential batches, each a triple** of A = dbc99fc3a4, B = 8fde0ece3a and C = 58a926792a, started together on 3 separate xlarge boxes. It is not 6 runs at once.
+
+What you do instead:
+1. Land the measurement changes first (warning text, per-statement counts/timings/callers, interval ELU), and test them offbox.
+2. Before each batch, read offbox host load (running jobs and boxes). Launch when it's at or below the median of the last hour, or after a 20-minute wait at most, whichever comes first. Don't wait longer.
+3. Record host-wide co-load over each batch's steady window: overlapping job ids, their sizes and kinds, especially disk-heavy ones like 304e.
+4. Validity per batch: the batch is valid when all 3 arms start within 60 s of each other and their steady windows overlap by ≥90%. Co-load doesn't invalidate a batch on its own, since it hits all arms; report it. Use interval ELU to show whether the C−A gap holds minute by minute or only in stall minutes.
+5. Score C against A within each batch, as before. Every batch must pass. B is diagnostic.
+
+I'm also asking the offbox board for a benchmark-reservation feature so future release gates can get a quiet window. Don't wait for it.

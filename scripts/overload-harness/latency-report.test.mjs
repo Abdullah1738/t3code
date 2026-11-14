@@ -55,7 +55,7 @@ const run = async (change, relativeMode = false, reusedInput) => {
   try {
     const rows = [make(0), make(1)];
     if (relativeMode) {
-      rows[1].revision = "aeb6617ef8219665cf7ce2e89f834a8abb801a05";
+      rows[1].revision = "58a926792ae28235d33d14025f417eccbc842549";
       rows[1].source.productRevision = rows[1].revision;
     }
     if (change) change(rows);

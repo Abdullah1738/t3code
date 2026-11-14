@@ -298,3 +298,24 @@ describe("q1 review launch substitution", () => {
     );
   });
 });
+
+describe("rerun box reuse", () => {
+  it("retains the three-base reference when a later candidate reuses a base box", () => {
+    const bases = [make(0), make(1), make(2)],
+      candidates = [make(3), make(4), make(5)];
+    candidates[0].offboxBoxId = bases[1].offboxBoxId;
+    bases[1].conditions.interval = { from: 100, to: 200 };
+    candidates[0].conditions.interval = { from: 300, to: 400 };
+    expect(selectReference(bases, candidates).selected).toHaveLength(3);
+    candidates[0].conditions.interval = { from: 150, to: 350 };
+    expect(selectReference(bases, candidates).selected).toHaveLength(2);
+  });
+  it("does not accept shared box identity with unproven command intervals", () => {
+    const bases = [make(0), make(1), make(2)],
+      candidates = [make(3), make(4), make(5)];
+    candidates[0].offboxBoxId = bases[1].offboxBoxId;
+    bases[1].conditions.interval = { from: 100, to: 200 };
+    candidates[0].conditions.interval = { from: 300, to: 200 };
+    expect(selectReference(bases, candidates).selected).toHaveLength(2);
+  });
+});

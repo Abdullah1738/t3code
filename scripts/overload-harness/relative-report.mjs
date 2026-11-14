@@ -6,7 +6,7 @@ import { profileMarkdown } from "./profile.mjs";
 import { equivalent } from "../../apps/server/src/ardud/perf/overloadMath.ts";
 
 const BASE = "dbc99fc3a4b817977bc23a57ea7c049da5d45190";
-const R11 = "aeb6617ef8219665cf7ce2e89f834a8abb801a05";
+const R11 = "58a926792ae28235d33d14025f417eccbc842549";
 const average = (values) => values.reduce((a, b) => a + b, 0) / values.length;
 const normalise = (run) => {
   const seconds = run.wallMs / 1000;
@@ -61,7 +61,22 @@ export const selectReference = (bases, candidates) => {
   if (!first || later.length !== 2 || candidates.length !== 3)
     throw new Error("d5e7 plus2 bases and3 candidates required");
   const five = [...later, ...candidates];
-  const separate = new Set(five.map((run) => run.offboxBoxId)).size === 5;
+  const separate = five.every((run, index) =>
+    five.slice(index + 1).every((other) => {
+      if (run.offboxBoxId !== other.offboxBoxId) return true;
+      const left = run.conditions?.interval;
+      const right = other.conditions?.interval;
+      // A later rerun can reuse a box after a base finishes without sharing its load.
+      return (
+        left &&
+        right &&
+        [left.from, left.to, right.from, right.to].every(Number.isFinite) &&
+        left.from < left.to &&
+        right.from < right.to &&
+        (left.to <= right.from || right.to <= left.from)
+      );
+    }),
+  );
   const idle = [first, ...five].every(
     (run) =>
       run.conditions?.verified === true &&
@@ -296,7 +311,7 @@ const main = async () => {
           : "NOT_RUN";
   const number = (n, d = 3) => (Number.isFinite(n) ? n.toFixed(d) : "unavailable");
   const lines = [
-    "# Relative gate (.11)",
+    "# Relative gate (.11) rerun at 58a926792a",
     "",
     `${informationOnly ? "Information-only score" : "Release verdict"}: **${verdict}**. Overload relative line: **${overloadVerdict}**. Latency: **${latency?.verdict ?? "NOT_RUN"}**.`,
     "",
@@ -326,7 +341,7 @@ const main = async () => {
     "",
     ...invalid.map((reason) => `- INVALID: ${reason}`),
     "",
-    "Logical counts are normalized to the600-second window before comparison. The line requires offered/completed/persisted counters within±10% of the selected base mean, identical poller result sizes, queue endpoints≤the base mean+10%, and no positive queue slope. Physical costs may fall. The requested5 new runs were submitted concurrently; offbox queues choose their start times.",
+    "Logical counts are normalized to the600-second window before comparison. The line requires offered/completed/persisted counters within±10% of the selected base mean, identical poller result sizes, queue endpoints≤the base mean+10%, and no positive queue slope. Physical costs may fall. The three new candidate runs were submitted concurrently against the same three retained base artifacts; offbox queues choose their start times.",
     "",
     "Absolute fidelity remains a documented v1 gap. The evaluator moved disk-latency/live-heap fidelity to a separate card; ≥55% busy and live-rate ±25% do not gate .11.",
     "",
@@ -344,7 +359,7 @@ const main = async () => {
       );
     lines.push(
       "",
-      "Co-load evidence uses each run's lease-to-end interval, which contains its full steady window. Details and provenance are retained with each result.",
+      "Co-load evidence uses each run's command-to-end interval, which contains its full steady window. Sequential reuse of a box by non-overlapping commands is not concurrent co-load; the same three base runs are retained for q2. Details and provenance are retained with each result.",
       "",
     );
     for (const finding of reference.noise)

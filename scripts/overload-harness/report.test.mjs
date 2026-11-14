@@ -147,7 +147,7 @@ const run = async (change = () => {}, relative = false, reusedInput) => {
           metadataPath: "fixture.json",
         };
         row.run.revision =
-          row.role === "base" ? baseSha : "aeb6617ef8219665cf7ce2e89f834a8abb801a05";
+          row.role === "base" ? baseSha : "58a926792ae28235d33d14025f417eccbc842549";
         row.run.source.productRevision = row.run.revision;
         row.run.source.harnessIndexTree = "5f055a5cc28ff8ed9f00de1ea515f486786e17f3";
         row.run.source.workloadHash =
