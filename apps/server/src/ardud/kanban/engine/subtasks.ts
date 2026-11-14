@@ -394,6 +394,20 @@ export const askGateWarning = (
   return `This ask won't clear ${steps}. Name ${target} in the text if it should.`;
 };
 
+export const secretKindApprovalWarning = (
+  card: Pick<KanbanCard, "subtasks">,
+  ask: KanbanOwnerAsk,
+  guessedGates?: KanbanBoard["guessedGates"],
+): string | undefined => {
+  if (ask.kind !== "secret") return undefined;
+  const ids = card.subtasks
+    .filter((subtask) => subtask.state === "open" && gateOf(subtask, guessedGates) === "secret")
+    .map((subtask) => subtask.id);
+  if (ids.length === 0) return undefined;
+  const target = ids.length === 1 ? ids[0]! : "the intended subtask id";
+  return `Kind "secret" asks Abdullah to type a secret value. To approve ${ids.join(", ")}, ask a decision naming ${target} instead.`;
+};
+
 const approvingAnswer = (
   ask: KanbanOwnerAsk,
   gate: NonNullable<KanbanSubtask["gate"]>,
