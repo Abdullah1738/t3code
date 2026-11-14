@@ -8,6 +8,7 @@ import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { type ClaudeSettings, TextGenerationError } from "@t3tools/contracts";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 
+import * as TextGenerationAnalytics from "./TextGenerationAnalytics.ts";
 import * as TextGenerationOperations from "@t3tools/provider-core/server/textGenerationOperations";
 import {
   normalizeCliError,
@@ -128,6 +129,8 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
 
   const runClaudeJson = Effect.fn("runClaudeJson")(function* <S extends Schema.Top>({
     operation,
+    operationLabel,
+    boardId,
     cwd,
     prompt,
     outputSchema: outputSchemaJson,
@@ -139,6 +142,12 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
     TextGenerationError,
     S["DecodingServices"]
   > {
+    const inheritedJob = yield* TextGenerationAnalytics.job;
+    const metadata = inheritedJob ?? {
+      provider: modelSelection.instanceId,
+      operation: operationLabel ? `${operation}:${operationLabel}` : operation,
+      boardId,
+    };
     const catalog = yield* scopedModelCatalog;
     const resolvedModelSelection = {
       ...modelSelection,
@@ -187,12 +196,17 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
 
     const runClaudeCommand = Effect.fn("runClaudeJson.runClaudeCommand")(function* () {
       const workingDirectory =
-        operation === "generateThreadTitle"
+        operation === "generateThreadTitle" || (operation === "generateJson" && !investigate)
           ? yield* fileSystem
-              .makeTempDirectoryScoped({ prefix: "t3code-claude-title-" })
+              .makeTempDirectoryScoped({ prefix: "t3code-claude-json-" })
               .pipe(
                 Effect.mapError((cause) =>
-                  normalizeCliError("claude", operation, cause, "Failed to create title directory"),
+                  normalizeCliError(
+                    "claude",
+                    operation,
+                    cause,
+                    "Failed to create generation directory",
+                  ),
                 ),
               )
           : cwd;
@@ -201,6 +215,13 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
         claudeSettings.binaryPath || "claude",
         [
           "-p",
+          "--no-session-persistence",
+          // Bare skips OAuth/keychain auth. Never select it for OAuth-only users or repo work.
+          ...(!investigate &&
+          (operation === "generateJson" || operation === "generateThreadTitle") &&
+          claudeEnvironment.ANTHROPIC_API_KEY?.trim()
+            ? ["--bare"]
+            : []),
           "--output-format",
           "json",
           "--json-schema",
@@ -247,11 +268,12 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
           ),
         );
 
+      const observedChild = yield* TextGenerationAnalytics.observeChild(child, "claude", operation);
       const [stdout, stderr, exitCode] = yield* Effect.all(
         [
           readStreamAsString(operation, child.stdout),
           readStreamAsString(operation, child.stderr),
-          child.exitCode.pipe(
+          observedChild.exitCode.pipe(
             Effect.mapError((cause) =>
               normalizeCliError("claude", operation, cause, "Failed to read Claude CLI exit code"),
             ),
@@ -282,7 +304,10 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
       { investigate, timeoutMs },
       CLAUDE_TIMEOUT_MS,
     );
-    const claudeRun = runClaudeCommand().pipe(Effect.scoped);
+    const claudeRun = runClaudeCommand().pipe(
+      Effect.provideService(TextGenerationAnalytics.job, metadata),
+      Effect.scoped,
+    );
     const rawStdout = yield* limitMs === null
       ? claudeRun
       : claudeRun.pipe(

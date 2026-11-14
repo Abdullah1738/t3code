@@ -19,6 +19,7 @@ import { resolveAttachmentPath } from "../attachmentStore.ts";
 import * as ServerConfig from "../config.ts";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
 import { codexExecLaunchArgs, resolveCodexLaunchArgs } from "../provider/codexLaunchArgs.ts";
+import * as TextGenerationAnalytics from "./TextGenerationAnalytics.ts";
 import * as TextGenerationOperations from "@t3tools/provider-core/server/textGenerationOperations";
 import {
   normalizeCliError,
@@ -181,11 +182,12 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
           forceKillAfter: "1 second",
         }),
       );
+      const observedChild = yield* TextGenerationAnalytics.observeChild(child, "codex", "mcp-list");
       const [stdout, , exitCode] = yield* Effect.all(
         [
           child.stdout.pipe(Stream.decodeText(), Stream.mkString),
           child.stderr.pipe(Stream.runDrain),
-          child.exitCode,
+          observedChild.exitCode,
         ],
         { concurrency: "unbounded" },
       );
@@ -332,11 +334,12 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
           ),
         );
 
+      const observedChild = yield* TextGenerationAnalytics.observeChild(child, "codex", operation);
       const [stdout, stderr, exitCode] = yield* Effect.all(
         [
           readStreamAsString(operation, child.stdout),
           readStreamAsString(operation, child.stderr),
-          child.exitCode.pipe(
+          observedChild.exitCode.pipe(
             Effect.mapError((cause) =>
               normalizeCliError("codex", operation, cause, "Failed to read Codex CLI exit code"),
             ),

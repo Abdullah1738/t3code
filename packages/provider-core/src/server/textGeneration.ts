@@ -56,6 +56,7 @@ export interface BranchNameGenerationResult {
 }
 
 export interface ThreadTitleGenerationInput {
+  boardId?: string | undefined;
   linkedContext?: string | undefined;
   cwd: string;
   message: string;
@@ -96,6 +97,9 @@ export type ReviewGuideGenerationResult = Omit<
 
 /** A free-form prompt answered as JSON matching `outputSchema` (fork: Missions board writer). */
 export interface JsonGenerationInput<S extends Schema.Top> {
+  operationLabel?: string | undefined;
+  boardId?: string | undefined;
+  investigate?: { readonly timeoutMs: number } | undefined;
   cwd: string;
   prompt: string;
   outputSchema: S;

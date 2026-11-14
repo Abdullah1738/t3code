@@ -8,12 +8,23 @@ function fail(message, code) {
   process.exit(code);
 }
 
+if (process.env.T3_FAKE_CLAUDE_REPORT) {
+  NodeFS.writeFileSync(
+    process.env.T3_FAKE_CLAUDE_REPORT,
+    JSON.stringify({
+      cwd: NodeFS.realpathSync(process.cwd()),
+      files: NodeFS.readdirSync(process.cwd()),
+      argv,
+    }),
+  );
+}
+
 const permissionIndex = argv.indexOf("--permission-mode");
 if (permissionIndex === -1 || argv[permissionIndex + 1] !== "dontAsk") {
   fail("text generation must deny permission prompts", 12);
 }
 const toolsIndex = argv.indexOf("--tools");
-if (toolsIndex === -1 || argv[toolsIndex + 1] !== "") {
+if (toolsIndex === -1 || !["", "Read,Grep,Glob,Bash"].includes(argv[toolsIndex + 1])) {
   fail("text generation must receive an explicit empty tool set", 6);
 }
 if (argv.includes("--dangerously-skip-permissions")) {
