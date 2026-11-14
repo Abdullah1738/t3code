@@ -5,7 +5,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 export const HOME = homedir();
 export const ROOT = process.env.ROBOB_WATCH_ROOT ?? join(HOME, ".local/share/robob-watch");
@@ -17,11 +17,20 @@ export const WA_LOCK = join(ROOT, "wa.lock");
 /** wacli's store (kept live by `wacli sync --follow`); its WAL grows/changes whenever a message is stored. */
 export const WACLI_STORE = process.env.WACLI_STORE_DIR ?? join(homedir(), ".wacli");
 export const WA_TRIGGERS = [join(WACLI_STORE, "wacli.db-wal"), join(WACLI_STORE, "wacli.db")];
-export const BUN = join(HOME, ".bun/bin/bun");
+function resolveBun(): string {
+  if (process.env.ROBOB_WATCH_BUN) return process.env.ROBOB_WATCH_BUN;
+  const installed = join(HOME, ".bun/bin/bun");
+  if (existsSync(installed)) return installed;
+  if (process.versions.bun) return process.execPath;
+  const found = Bun.which("bun");
+  if (found) return found;
+  throw new Error("Could not locate Bun; set ROBOB_WATCH_BUN to its executable path");
+}
+export const BUN = resolveBun();
 export const SPECTRUM_CLI = process.env.ROBOB_WATCH_SPECTRUM_CLI ?? join(HOME, ".local/share/spectrum-bridge/src/cli.ts");
 export const TELEGRAM_CLI = process.env.ROBOB_WATCH_TELEGRAM_CLI ?? join(HOME, ".local/share/telegram-bridge/src/cli.ts");
 export const BRIDGE_DB = process.env.ROBOB_WATCH_BRIDGE_DB ?? join(HOME, ".config/spectrum-bridge/state.sqlite");
-export const PATH = [HELPERS, join(HOME, ".local/bin"), join(HOME, ".bun/bin"), "/opt/homebrew/bin", "/usr/local/bin",
+export const PATH = [HELPERS, join(HOME, ".local/bin"), dirname(BUN), "/opt/homebrew/bin", "/usr/local/bin",
   "/usr/bin", "/bin", "/usr/sbin", "/sbin"].join(":");
 
 export const MIN_INTERVAL = 5;
