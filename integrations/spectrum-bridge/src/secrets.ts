@@ -167,6 +167,12 @@ function missingFile(error: unknown): boolean {
   return !!error && typeof error === "object" && "code" in error && error.code === "ENOENT";
 }
 
+function valuesExpiredOrForgotten(deps: SecretDeps, token: string): boolean {
+  const request = getSecretRequest(deps.store, token);
+  return request?.state === "expired" || request?.state === "forgotten"
+    || (request?.state === "submitted" && (deps.now?.() ?? Date.now()) >= (request.valuesExpireAt ?? 0));
+}
+
 async function removeValues(stateRoot: string, token: string): Promise<void> {
   await unlink(valuesPath(stateRoot, token)).catch(error => {
     if (missingFile(error)) return;
@@ -237,12 +243,13 @@ export async function submitSecret(deps: SecretDeps, token: string, form: URLSea
   return accepted ? { status: "ok" } : { status: "gone" };
 }
 
-async function readValues(stateRoot: string, token: string): Promise<Record<string, string>> {
+async function readValues(deps: SecretDeps, token: string): Promise<Record<string, string>> {
   let handle;
   try {
-    handle = await open(valuesPath(stateRoot, token), constants.O_RDONLY | constants.O_NOFOLLOW);
+    handle = await open(valuesPath(deps.stateRoot, token), constants.O_RDONLY | constants.O_NOFOLLOW);
   } catch (error) {
-    if (!missingFile(error)) secretError("secrets.catch7", error);
+    // Recheck after I/O: expiry or forgetting may have removed a previously live file.
+    if (!missingFile(error) || !valuesExpiredOrForgotten(deps, token)) secretError("secrets.catch7", error);
     throw new SecretError(410);
   }
   try {
@@ -281,7 +288,7 @@ export async function readSecret(deps: SecretDeps, token: string, field: string)
   if (!request || !request.fields.some(entry => entry.name === field)) throw new SecretError(404);
   if (request.state === "open") throw new SecretError(409);
   if (request.state !== "submitted") throw new SecretError(410);
-  const value = (await readValues(deps.stateRoot, token))[field];
+  const value = (await readValues(deps, token))[field];
   if (typeof value !== "string") throw new SecretError(410);
   return value;
 }
@@ -298,13 +305,13 @@ export async function forgetSecret(deps: SecretDeps, token: string): Promise<voi
 export async function sweepSecrets(deps: SecretDeps): Promise<void> {
   const now = deps.now?.() ?? Date.now();
   const rows = deps.store.db.query<{ key: string }, []>("SELECT key FROM kv WHERE key LIKE 'secret-request:%'").all();
-  const live = new Set<string>();
+  const live = new Map<string, string>();
   for (const { key } of rows) {
     const token = key.slice("secret-request:".length);
     if (!validToken(token)) continue;
     const request = await settle(deps, token, now);
     if (!request) continue;
-    if (request.state === "submitted") live.add(`${tokenHash(token)}.json`);
+    if (request.state === "submitted") live.set(`${tokenHash(token)}.json`, token);
     const settledAt = Math.max(request.expiresAt, request.valuesExpireAt ?? 0);
     if (request.state !== "submitted" && request.state !== "open" && now - settledAt > RECORD_RETENTION_MS) {
       deps.store.db.query("DELETE FROM kv WHERE key = ?").run(key);
@@ -313,8 +320,10 @@ export async function sweepSecrets(deps: SecretDeps): Promise<void> {
   let names: string[];
   try { names = await readdir(secretsDir(deps.stateRoot)); }
   catch (error) {
-    // Created on first submission, so an idle chat normally has no secrets directory.
-    if (!missingFile(error)) secretError("secrets.catch9", error);
+    // Idle chats have no directory; active submissions must retain theirs until removal is confirmed.
+    if (!missingFile(error) || [...live.values()].some(token => !valuesExpiredOrForgotten(deps, token))) {
+      secretError("secrets.catch9", error);
+    }
     return;
   }
   for (const name of names) {

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { forgetSecret, getSecretRequest, putSecretRequest, readSecret, submitSecret, sweepSecrets, tokenHash } from "../src/secrets.ts";
+import { forgetSecret, getSecretRequest, putSecretRequest, readSecret, SECRET_VALUE_TTL_MS, submitSecret, sweepSecrets, tokenHash } from "../src/secrets.ts";
 import { Store } from "../src/store.ts";
 import { type LogLine, toolLog } from "../src/toollog.ts";
 
@@ -10,12 +10,13 @@ let root: string;
 let store: Store;
 let originalLogRoot: string | undefined;
 const token = "t".repeat(43);
-const clock = Date.now();
+let clock: number;
 const secret = "PRIVATE_VALUE_SENTINEL";
 const deps = () => ({ store, stateRoot: root, now: () => clock });
 const valuePath = () => join(root, "secrets", `${tokenHash(token)}.json`);
 
 beforeEach(async () => {
+  clock = Date.now();
   root = await fs.mkdtemp(join(tmpdir(), "secrets-logging-"));
   store = new Store(":memory:");
   originalLogRoot = process.env.TOOLLOG_DIR;
@@ -35,8 +36,8 @@ async function lines(): Promise<LogLine[]> {
     .catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return ""; throw error; });
   return text.trim() ? text.trim().split("\n").map(line => JSON.parse(line)) : [];
 }
-function request(state: "open" | "submitted" = "open") {
-  putSecretRequest(store, token, { sessionId: "fixture", generation: 1, purpose: "PRIVATE_PURPOSE_SENTINEL",
+function request(state: "open" | "submitted" = "open", requestToken = token) {
+  putSecretRequest(store, requestToken, { sessionId: "fixture", generation: 1, purpose: "PRIVATE_PURPOSE_SENTINEL",
     fields: [{ name: "password", label: "PRIVATE_LABEL_SENTINEL", type: "password" }],
     createdAt: clock, expiresAt: clock + 900_000, state, valuesExpireAt: clock + 1_800_000 });
 }
@@ -56,10 +57,100 @@ test("missing values are normal for unsubmitted, forgotten, expired and already 
   await forgetSecret(deps(), token);
   await forgetSecret(deps(), token);
   request("submitted");
+  clock += SECRET_VALUE_TTL_MS;
   await expect(readSecret(deps(), token, "password")).rejects.toMatchObject({ status: 410 });
-  await sweepSecrets({ ...deps(), now: () => clock + 1_800_000 });
+  await sweepSecrets(deps());
   expect(getSecretRequest(store, token)?.state).toBe("expired");
   expect((await lines()).filter(line => line.component === "secrets")).toEqual([]);
+});
+
+test.each([
+  { operation: "read", missing: "file", tag: "secrets.catch7.ENOENT" },
+  { operation: "read", missing: "directory", tag: "secrets.catch7.ENOENT" },
+  { operation: "sweep", missing: "directory", tag: "secrets.catch9.ENOENT" },
+])("$operation reports a missing $missing for an active submission", async ({ operation, missing, tag }) => {
+  request();
+  expect(await submitSecret(deps(), token, new URLSearchParams({ password: secret }))).toEqual({ status: "ok" });
+  if (missing === "file") await fs.unlink(valuePath());
+  else await fs.rm(join(root, "secrets"), { recursive: true });
+  if (operation === "read") await expect(readSecret(deps(), token, "password")).rejects.toMatchObject({ status: 410 });
+  else await sweepSecrets(deps());
+  expect(getSecretRequest(store, token)?.state).toBe("submitted");
+  const logged = (await lines()).filter(line => line.component === "secrets");
+  expect(logged.map(line => line.error?.tag)).toEqual([tag]);
+  expect(logged[0]).toMatchObject({ kind: "error", ok: false });
+  for (const value of [secret, token, tokenHash(token), "PRIVATE_PURPOSE_SENTINEL", "PRIVATE_LABEL_SENTINEL"]) {
+    expect(JSON.stringify(logged)).not.toContain(value);
+  }
+});
+
+test.each(["forgotten", "expired", "deadline"])("read ENOENT stays quiet after confirmed %s race", async state => {
+  request();
+  await submitSecret(deps(), token, new URLSearchParams({ password: secret }));
+  const open = fs.open;
+  const race = spyOn(fs, "open").mockImplementationOnce(async (...args) => {
+    if (state === "forgotten") await forgetSecret(deps(), token);
+    else {
+      clock += SECRET_VALUE_TTL_MS;
+      if (state === "expired") await sweepSecrets(deps());
+      else await fs.unlink(valuePath());
+    }
+    return open(...args);
+  });
+  try { await expect(readSecret(deps(), token, "password")).rejects.toMatchObject({ status: 410 }); }
+  finally { race.mockRestore(); }
+  expect(getSecretRequest(store, token)?.state).toBe(state === "deadline" ? "submitted" : state);
+  expect((await lines()).filter(line => line.component === "secrets")).toEqual([]);
+});
+
+test.each(["forgotten", "expired", "deadline"])("sweep ENOENT stays quiet after confirmed %s race", async state => {
+  request();
+  await submitSecret(deps(), token, new URLSearchParams({ password: secret }));
+  const readdir = fs.readdir;
+  const race = spyOn(fs, "readdir").mockImplementationOnce(async (...args) => {
+    if (state === "forgotten") await forgetSecret(deps(), token);
+    else {
+      clock += SECRET_VALUE_TTL_MS;
+      if (state === "expired") await expect(readSecret(deps(), token, "password")).rejects.toMatchObject({ status: 410 });
+    }
+    await fs.rm(join(root, "secrets"), { recursive: true });
+    return readdir(...args);
+  });
+  try { await sweepSecrets(deps()); } finally { race.mockRestore(); }
+  expect(getSecretRequest(store, token)?.state).toBe(state === "deadline" ? "submitted" : state);
+  expect((await lines()).filter(line => line.component === "secrets")).toEqual([]);
+});
+
+test.each(["deleted-record", "reopened-record"])("read ENOENT remains an error after %s", async state => {
+  request();
+  await submitSecret(deps(), token, new URLSearchParams({ password: secret }));
+  const open = fs.open;
+  const race = spyOn(fs, "open").mockImplementationOnce(async (...args) => {
+    await fs.unlink(valuePath());
+    if (state === "deleted-record") store.db.query("DELETE FROM kv WHERE key = ?").run(`secret-request:${token}`);
+    else request();
+    return open(...args);
+  });
+  try { await expect(readSecret(deps(), token, "password")).rejects.toMatchObject({ status: 410 }); }
+  finally { race.mockRestore(); }
+  expect((await lines()).filter(line => line.component === "secrets").map(line => line.error?.tag)).toEqual(["secrets.catch7.ENOENT"]);
+});
+
+test("sweep still reports missing values when one submission is forgotten and another remains active", async () => {
+  const other = "u".repeat(43);
+  request(); request("open", other);
+  await submitSecret(deps(), token, new URLSearchParams({ password: secret }));
+  await submitSecret(deps(), other, new URLSearchParams({ password: secret }));
+  const readdir = fs.readdir;
+  const race = spyOn(fs, "readdir").mockImplementationOnce(async (...args) => {
+    await forgetSecret(deps(), token);
+    await fs.rm(join(root, "secrets"), { recursive: true });
+    return readdir(...args);
+  });
+  try { await sweepSecrets(deps()); } finally { race.mockRestore(); }
+  expect(getSecretRequest(store, token)?.state).toBe("forgotten");
+  expect(getSecretRequest(store, other)?.state).toBe("submitted");
+  expect((await lines()).filter(line => line.component === "secrets").map(line => line.error?.tag)).toEqual(["secrets.catch9.ENOENT"]);
 });
 
 test("a duplicate value file loses the submission race without a secrets error", async () => {
