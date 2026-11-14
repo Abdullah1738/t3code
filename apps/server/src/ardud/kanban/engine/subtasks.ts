@@ -589,8 +589,19 @@ export const approvalProblem = (
       const answer = ask.answer;
       if (!ask.closedAt || !answer || answer.at < since) return false;
       if (answer.verdict !== "dropped") {
-        if (answer.by._tag !== "owner" || (ask.revisedAt ?? ask.at) < since) return false;
+        // Closing clears handedAt; direct-to-evaluator asks retain their `to` instead.
+        const handedSkip =
+          intent === "skip" &&
+          answer.verdict === "handed" &&
+          answer.by._tag === "evaluator" &&
+          ask.to !== "evaluator";
+        if ((answer.by._tag !== "owner" && !handedSkip) || (ask.revisedAt ?? ask.at) < since)
+          return false;
         if (ask.draft) return false;
+        if (handedSkip) {
+          const wording = `${askWording(ask)} ${answer.text ?? ""} ${answer.note ?? ""}`;
+          return new Set(wording.match(/\bs\d+\b/g) ?? []).has(subtask.id);
+        }
       }
       // Explicit scopes replace wording matching for the entire ask, including other options.
       if (ask.options?.some((option) => optionScopeIds(card, option) !== undefined)) {
@@ -636,12 +647,21 @@ export const approvalProblem = (
     ? `${unnamedApproval.id} was approved but doesn't name ${subtask.id}; ask again naming the subtask id (e.g. "Approve ${subtask.id}")`
     : `no owner answer on a ${gate} ask since ${since}; ask with card_ask naming ${subtask.id} (e.g. "Approve ${subtask.id}: <step>")`;
   if (intent === "skip") {
-    if (answer && answer.verdict !== "dropped" && answer.by._tag === "owner") return null;
+    if (
+      answer &&
+      answer.verdict !== "dropped" &&
+      (answer.by._tag === "owner" || answer.verdict === "handed")
+    )
+      return null;
     const reason =
       answer?.verdict === "dropped"
         ? `the latest decision, ${latest!.id}, was dropped (a dropped ask is not approval)`
         : `${noDecisionReason}; no owner answer on a ${gate} ask since ${since}; name the subtask id (e.g. s7) in the ask or set approves: [${subtask.id}] on the go option`;
-    return `card #${card.number} subtask ${subtask.id} (${gate}: ${subtask.text}) needs Abdullah's answer before it can be skipped: ${reason}${standingReason}${clearGuidance}`.replace(
+    const handedGuidance =
+      answer?.verdict !== "dropped" && card.asks.some((ask) => ask.answer?.verdict === "handed")
+        ? "; a handed answer must name the subtask id and come from an ask the owner handed to the evaluator"
+        : "";
+    return `card #${card.number} subtask ${subtask.id} (${gate}: ${subtask.text}) needs Abdullah's answer before it can be skipped: ${reason}${standingReason}${clearGuidance}${handedGuidance}`.replace(
       /[\r\n]+/g,
       " ",
     );

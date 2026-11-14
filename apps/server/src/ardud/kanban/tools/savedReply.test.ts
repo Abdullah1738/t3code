@@ -1,14 +1,19 @@
 import { assert, it } from "@effect/vitest";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { ThreadId } from "@t3tools/contracts";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Logger from "effect/Logger";
 import * as References from "effect/References";
+import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as TestClock from "effect/testing/TestClock";
+import * as SqlClient from "effect/sql/SqlClient";
 import * as Tracer from "effect/Tracer";
 import { McpSchema } from "effect/ai";
 
@@ -38,6 +43,65 @@ const captureTrace = () => {
   });
   return { spans, tracer };
 };
+
+it.live.each([...SavedReply.TOOLS])("%s saves while the background reader is held", (tool) =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "saved-write-reader-" });
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`PRAGMA journal_mode = WAL`;
+      yield* sql`CREATE TABLE board_write_probe (reason TEXT NOT NULL)`;
+      yield* sql`INSERT INTO board_write_probe VALUES ('old reason')`;
+      const held = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const holder = yield* sql
+        .withTransaction(
+          sql`SELECT reason FROM board_write_probe`.pipe(
+            Effect.andThen(Deferred.succeed(held, undefined)),
+            Effect.andThen(Deferred.await(release)),
+          ),
+        )
+        .pipe(NodeSqliteClient.readOnly, Effect.forkChild);
+      yield* Deferred.await(held);
+      yield* Effect.gen(function* () {
+        const result = yield* SavedReply.protect(
+          Effect.gen(function* () {
+            // Caller and thread-link lookups opt into readOnly before the mutation.
+            const previous = yield* SavedWrite.stage(
+              sql<{ reason: string }>`SELECT reason FROM board_write_probe`.pipe(
+                NodeSqliteClient.readOnly,
+              ),
+              "read",
+            );
+            assert.strictEqual(previous[0]?.reason, "old reason");
+            yield* SavedWrite.committing;
+            yield* sql`UPDATE board_write_probe SET reason = 'new reason'`;
+            return reply;
+          }),
+          tool,
+        ).pipe(Effect.timeout("5 seconds"));
+        assert.isFalse(callResult(result).isError === true);
+        assert.isFalse(yield* Deferred.isDone(release));
+        assert.isUndefined(holder.pollUnsafe());
+        assert.deepStrictEqual(yield* sql`SELECT reason FROM board_write_probe`, [
+          { reason: "new reason" },
+        ]);
+      }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+      yield* Fiber.join(holder);
+    }).pipe(
+      Effect.provide(
+        NodeSqliteClient.layer({
+          filename: path.join(directory, "boards.sqlite"),
+          readerWorker: true,
+          foregroundReaderSlots: 1,
+          backgroundReaderSlots: 1,
+        }),
+      ),
+    );
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
 
 it.effect("a completed follow-up read does not replace a foreground admission stage", () =>
   Effect.gen(function* () {
