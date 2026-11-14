@@ -1359,6 +1359,8 @@ let memorySchemas = new Set();
 let deferredForeignKeys = false;
 let configurationDirty = false;
 let schemaDirty = false;
+let attachmentsDirty = false;
+let pendingAttachment;
 let openingFailed = false;
 const attachmentStatements = new Map((workerData.attachments ?? []).map(entry => [entry.schema, entry]));
 const setupPragmas = new Set(["busy_timeout", "foreign_keys", "defer_foreign_keys", "synchronous",
@@ -1454,13 +1456,19 @@ const volatileSchema = () => {
 const observeConnectionState = (classification, sql, params) => {
   const snapshot = {};
   if (classification?.attachment || typeof db.setAuthorizer !== "function") {
+    attachmentsDirty = true;
+    const head = sql?.replace(/^(?:[;\\s]|--[^\\n]*(?:\\n|$)|\\/\\*[\\s\\S]*?\\*\\/)+/, "");
+    if (/^ATTACH\\b/i.test(head ?? "")) pendingAttachment = { sql, params };
+  }
+  if (attachmentsDirty) {
     const current = databases();
     const present = new Set(current.filter(entry => entry.name !== "main" && entry.name !== "temp").map(entry => entry.name));
     for (const name of attachmentStatements.keys()) if (!present.has(name)) attachmentStatements.delete(name);
-    const head = sql?.replace(/^(?:[;\\s]|--[^\\n]*(?:\\n|$)|\\/\\*[\\s\\S]*?\\*\\/)+/, "");
-    if (/^ATTACH\\b/i.test(head ?? "")) for (const name of present) {
-      if (!attachmentStatements.has(name)) attachmentStatements.set(name, { schema: name, sql, params });
+    if (pendingAttachment) for (const name of present) {
+      if (!attachmentStatements.has(name)) attachmentStatements.set(name, { schema: name, ...pendingAttachment });
     }
+    pendingAttachment = undefined;
+    attachmentsDirty = false;
     memorySchemas = new Set(current.filter(entry => entry.name !== "main" && entry.file === "").map(entry => entry.name));
     snapshot.attachments = [...attachmentStatements.values()];
     configurationDirty = true;
@@ -1483,6 +1491,7 @@ const observeConnectionState = (classification, sql, params) => {
   return snapshot;
 };
 let recoveryFailureReported = false;
+let recoveryFailureCause;
 const recoverySnapshot = (classification, sql, params) => {
   // Introspection can itself end a read transaction. Preserve the flag as it
   // stood after the user's SQL, rather than letting metadata reads consume it.
@@ -1493,8 +1502,8 @@ const recoverySnapshot = (classification, sql, params) => {
     const snapshot = observeConnectionState(classification, sql, params);
     if (deferBefore !== undefined && snapshot.settings) snapshot.settings = snapshot.settings.map(entry =>
       entry.name === "defer_foreign_keys" ? { ...entry, value: deferBefore ? 1 : 0 } : entry);
-    const ready = !recoveryFailureReported || (!configurationDirty && !schemaDirty);
-    if (ready) recoveryFailureReported = false;
+    const ready = !attachmentsDirty && (!recoveryFailureReported || (!configurationDirty && !schemaDirty));
+    if (ready) { recoveryFailureReported = false; recoveryFailureCause = undefined; }
     return { ...snapshot, recoveryReady: ready };
   } catch (cause) {
     // Metadata failure must not turn a successful COMMIT into a failed write.
@@ -1502,6 +1511,7 @@ const recoverySnapshot = (classification, sql, params) => {
       code: cause?.code, errcode: cause?.errcode, errstr: cause?.errstr,
     }});
     recoveryFailureReported = true;
+    recoveryFailureCause = cause;
     configurationDirty = true;
     schemaDirty = true;
     return { recoveryReady: false };
@@ -1673,6 +1683,7 @@ parentPort.on("message", (request) => {
   let elapsedMs;
   let controlStarted;
   let controlMs;
+  let priorRecovery = {};
   try {
     if (close) {
       operation = "close";
@@ -1692,6 +1703,8 @@ parentPort.on("message", (request) => {
       parentPort.postMessage({ id, rows: [] });
       return;
     }
+    // Resolve an earlier attachment change before another statement can change its identity.
+    if (attachmentsDirty) priorRecovery = recoverySnapshot();
     if (isCancelled(id)) throw new Error("SQLite request cancelled before execution");
     executionStarted = performance.now();
     const entry = cached ? statements.get(sql) : undefined;
@@ -1706,6 +1719,7 @@ parentPort.on("message", (request) => {
         statements.set(sql, { statement, at: performance.now() });
       }
     }
+    if (attachmentsDirty && (classifications.get(statement)?.attachment || typeof db.setAuthorizer !== "function")) throw recoveryFailureCause ?? new Error("SQLite attachment state unavailable");
     observedWrite = Boolean(classifications.get(statement)?.write || classifications.get(statement)?.check);
     mayWrite = observedWrite || db.isTransaction;
     configurationDirty ||= Boolean(classifications.get(statement)?.configuration) || typeof db.setAuthorizer !== "function";
@@ -1738,12 +1752,12 @@ parentPort.on("message", (request) => {
     const classification = classifications.get(statement);
     parentPort.postMessage({ id, rows, committed, write: observedWrite, elapsedMs, controlMs,
       inTransaction: db.isTransaction,
-      ...recoverySnapshot(classification, sql, params) });
+      ...priorRecovery, ...recoverySnapshot(classification, sql, params) });
   } catch (error) {
     activeClassification = undefined;
     const statementElapsed = executionStarted === undefined ? elapsedMs : (elapsedMs ?? 0) + performance.now() - executionStarted;
     if (controlStarted !== undefined && controlMs === undefined) controlMs = performance.now() - controlStarted;
-    const snapshot = db ? recoverySnapshot(undefined, undefined, undefined) : {};
+    const snapshot = db ? { ...priorRecovery, ...recoverySnapshot(undefined, undefined, undefined) } : {};
     errorReply(id, error, operation, { ...snapshot, inTransaction: db?.isTransaction ?? false, write: observedWrite, elapsedMs: statementElapsed, controlMs });
   } finally {
     // Authorizer classification covers CTE/commented writes; transaction state

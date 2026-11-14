@@ -93,6 +93,7 @@ vi.mock("node:worker_threads", async (importOriginal) => {
             let nextChild = 0;
             let nextPause;
             let metadataFailures = 0;
+            let attachmentMetadataFailures = 0;
             let timedSql;
             let virtualClock;
             const nativeNow = performance.now.bind(performance);
@@ -104,6 +105,10 @@ vi.mock("node:worker_threads", async (importOriginal) => {
               if (virtualClock !== undefined) {
                 if (sql === timedSql) virtualClock += 100;
                 if (sql.startsWith("SELECT name, type, sql FROM ")) virtualClock += 5000;
+              }
+              if (attachmentMetadataFailures > 0 && sql === "PRAGMA database_list") {
+                attachmentMetadataFailures--;
+                throw new Error("test attachment metadata failure");
               }
               if (metadataFailures > 0 && sql.startsWith("SELECT name, type, sql FROM ")) {
                 metadataFailures--;
@@ -124,6 +129,7 @@ vi.mock("node:worker_threads", async (importOriginal) => {
               if (!message?.testCheckpoint) return;
               if (message.kind === "arm") { nextPause = message.args[0]; return; }
               if (message.kind === "fail-metadata") { metadataFailures = message.args[0]; return; }
+              if (message.kind === "fail-attachments") { attachmentMetadataFailures = message.args[0]; return; }
               if (message.kind === "time-prepare") { timedSql = message.args[0]; virtualClock = 0; return; }
               if (message.kind === "resume") {
                 pausedStatements.get(message.args[0])?.();
@@ -4114,6 +4120,98 @@ it.effect.each([-1, 0, 1048576, 9007199254740993n])(
           [1],
           [2],
         ]);
+      }),
+    ),
+);
+
+it.effect.each(
+  (["attach", "detach"] as const).flatMap((operation) =>
+    (["file", "memory"] as const).flatMap((target) =>
+      (["query", "attach", "detach", "crash"] as const).map((followup) => ({
+        operation,
+        target,
+        followup,
+      })),
+    ),
+  ),
+)(
+  "reconciles $operation of $target after metadata failure before $followup",
+  ({ operation, target, followup }) =>
+    withFileClient((sql, filename) =>
+      Effect.gen(function* () {
+        const attachment = target === "memory" ? ":memory:" : `${filename}.scratch`;
+        if (target === "file") {
+          const native = yield* openDatabase(attachment);
+          native.exec("CREATE TABLE entries(value INTEGER); INSERT INTO entries VALUES (1)");
+        }
+        yield* sql`ATTACH DATABASE ${`${filename}.stable`} AS stable`;
+        if (operation === "detach") yield* sql`ATTACH DATABASE ${attachment} AS scratch`;
+        const writer = writerWorkers.at(-1)!;
+        const count = writerWorkers.length;
+        // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
+        writer.postMessage({ testCheckpoint: true, kind: "fail-attachments", args: [1] });
+        yield* writerBridgeBarrier(writer);
+        if (operation === "attach") yield* sql`ATTACH DATABASE ${attachment} AS scratch`;
+        else yield* sql`DETACH DATABASE scratch`;
+        if (followup === "query") assert.deepEqual(yield* sql`SELECT 1 AS value`, [{ value: 1 }]);
+        else if (followup === "attach") yield* sql`ATTACH DATABASE ${`${filename}.extra`} AS extra`;
+        else if (followup === "detach") yield* sql`DETACH DATABASE stable`;
+        yield* Effect.promise(() => writer.terminate());
+        if (followup === "crash") {
+          const unavailable = yield* sql`SELECT 1`.pipe(Effect.flip);
+          assert.include(
+            String(unavailable.reason.cause),
+            "connection state could not be observed",
+          );
+          assert.equal(writerWorkers.length, count);
+          return;
+        }
+        const names = (yield* sql<{ name: string }>`PRAGMA database_list`).map((row) => row.name);
+        assert.equal(names.includes("scratch"), operation === "attach");
+        assert.equal(names.includes("stable"), followup !== "detach");
+        assert.equal(names.includes("extra"), followup === "attach");
+        assert.equal(writerWorkers.length, count + 1);
+        if (operation === "attach") {
+          if (target === "memory") {
+            yield* sql`CREATE TABLE scratch.entries(value INTEGER)`;
+            yield* sql`INSERT INTO scratch.entries VALUES (2)`;
+          }
+          assert.deepEqual(yield* sql`SELECT value FROM scratch.entries`.values, [
+            [target === "file" ? 1 : 2],
+          ]);
+        }
+      }),
+    ),
+);
+
+it.effect.each(["attach", "detach"] as const)(
+  "retains a pending $s while repeated metadata failure rejects another attachment change",
+  (operation) =>
+    withFileClient((sql, filename) =>
+      Effect.gen(function* () {
+        const attachment = `${filename}.scratch`;
+        if (operation === "detach") yield* sql`ATTACH DATABASE ${attachment} AS scratch`;
+        const writer = writerWorkers.at(-1)!;
+        // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
+        writer.postMessage({ testCheckpoint: true, kind: "fail-attachments", args: [3] });
+        yield* writerBridgeBarrier(writer);
+        if (operation === "attach") yield* sql`ATTACH DATABASE ${attachment} AS scratch`;
+        else yield* sql`DETACH DATABASE scratch`;
+        const failed = yield* sql`ATTACH DATABASE ${`${filename}.extra`} AS extra`.pipe(
+          Effect.flip,
+        );
+        assert.equal(failed._tag, "SqlError");
+        assert.include(String(failed.reason.cause), "test attachment metadata failure");
+        const names = (yield* sql<{ name: string }>`PRAGMA database_list`).map((row) => row.name);
+        assert.equal(names.includes("scratch"), operation === "attach");
+        assert.isFalse(names.includes("extra"));
+        yield* sql`ATTACH DATABASE ${`${filename}.extra`} AS extra`;
+        yield* Effect.promise(() => writer.terminate());
+        const reopened = (yield* sql<{ name: string }>`PRAGMA database_list`).map(
+          (row) => row.name,
+        );
+        assert.equal(reopened.includes("scratch"), operation === "attach");
+        assert.isTrue(reopened.includes("extra"));
       }),
     ),
 );

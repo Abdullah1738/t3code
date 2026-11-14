@@ -313,6 +313,7 @@ const threads = Layer.effect(
       find: view,
       model: () => Effect.succeed(model),
       pendingUserInputs: () => Effect.succeed([]),
+      queuedRuns: () => Effect.succeed([]),
       lastFailure: () => Effect.succeed(null),
       findLastFailure: () => Effect.succeed(null),
       latestRun: (threadId) =>
