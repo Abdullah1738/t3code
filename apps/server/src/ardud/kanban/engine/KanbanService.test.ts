@@ -135,8 +135,14 @@ const makeFake = Effect.gen(function* () {
   >();
   const failureReads: Array<string> = [];
   const missingFailureRunIds = new Set<string>();
-  const lastRuns = new Map<string, { runId: string; status: string; message: string | null }>();
-  const runHistory = new Map<string, { status: string; message: string | null }>();
+  const lastRuns = new Map<
+    string,
+    { runId: string; status: string; message: string | null; model?: ModelSelection | null }
+  >();
+  const runHistory = new Map<
+    string,
+    { status: string; message: string | null; model?: ModelSelection | null }
+  >();
   // One run id per stored failure object (the same run reports the same id).
   const runIds = new WeakMap<object, string>();
   let nextRun = 0;
@@ -544,7 +550,9 @@ const observedInlineTestLayer = (...args: Parameters<typeof observedTestLayer>) 
   );
 
 const owner: KanbanActor = { _tag: "owner" };
-const decodeAnalyticsEvent = Schema.decodeEffect(AnalyticsEvent, { onExcessProperty: "error" });
+const decodeAnalyticsEvent = Schema.decodeUnknownEffect(AnalyticsEvent, {
+  onExcessProperty: "error",
+});
 /** The session of the owner's own app, for the WS handlers. */
 const OWNER_APP_SESSION = {
   sessionId: "session-owner",
@@ -701,6 +709,10 @@ it.effect(
           name: "Private board",
           defaultProjectId: ProjectId.make("project-1"),
         });
+        yield* kanban.updateBoard(board.id, {
+          reviewChains: [{ name: "sol", steps: [board.defaultCardModel] }],
+          defaultReviewChain: "sol",
+        });
         yield* kanban.setPool(board.id, board.defaultCardModel, 0);
         const card = yield* kanban.createCard(
           board.id,
@@ -742,6 +754,185 @@ it.effect(
         assert.equal(dispatched?.props?.poolKey, Rules.poolKey(board.defaultCardModel));
         assert.equal(dispatched?.durationMs, 60_000);
         assert.isDefined(dispatched?.threadId);
+        const move = events.find(
+          (event) => event.kind === "kanban.card_move" && event.cardId === card.id,
+        );
+        assert.deepInclude(move?.props, {
+          from: "todo",
+          to: "working",
+          actor: "system",
+          msInPrevStage: 60_000,
+        });
+        const worker: KanbanActor = { _tag: "thread", threadId: dispatched!.threadId as ThreadId };
+        yield* kanban.askOwner(
+          card.id,
+          { question: "Private question", blocking: false, kind: "approval" },
+          worker,
+          "cardThread",
+        );
+        assert.isTrue(
+          events.some((event) => event.kind === "kanban.ask_opened" && event.props?.key === "q1"),
+        );
+        assert.isTrue(
+          events.some(
+            (event) => event.kind === "kanban.ask_updated" && event.props?.kind === "approval",
+          ),
+        );
+        yield* kanban.flagCard(card.id, "Private reason", owner);
+        yield* TestClock.adjust("1 minute");
+        yield* kanban.flagCard(card.id, null, owner);
+        assert.isTrue(
+          events.some(
+            (event) =>
+              event.kind === "kanban.stall" &&
+              event.props?.action === "set" &&
+              event.props.reasonClass === "other",
+          ),
+        );
+        assert.isTrue(
+          events.some(
+            (event) =>
+              event.kind === "kanban.stall" &&
+              event.props?.action === "clear" &&
+              event.props.ageMs === 60_000,
+          ),
+        );
+        yield* kanban.dispatchNow;
+        const resumed = (yield* kanban.card(card.id)).card;
+        assert.equal(resumed.stage, "working");
+        assert.equal(resumed.activeThreadId, worker.threadId);
+        yield* kanban.moveCard(card.id, "needs_review", "owner", owner);
+        yield* kanban.turnEnded(worker.threadId);
+        yield* kanban.dispatchNow;
+        const reviewer = (yield* kanban.card(card.id)).card.activeThreadId!;
+        yield* TestClock.adjust("2 minutes");
+        yield* kanban.reviewResult(reviewer, "findings", ["Private finding"], "abcdef1234");
+        yield* kanban.reviewResult(reviewer, "findings", ["Private finding"], "abcdef1234");
+        const verdicts = events.filter((event) => event.kind === "kanban.review_verdict");
+        assert.lengthOf(verdicts, 1);
+        assert.deepInclude(verdicts[0]?.props, {
+          round: 1,
+          verdict: "feedback",
+          head: "abcdef1234",
+          chain: "sol",
+        });
+        assert.equal(verdicts[0]?.durationMs, 120_000);
+        yield* kanban.dispatchNow;
+        const failedWorker = (yield* kanban.card(card.id)).card.activeThreadId!;
+        fake.failures.set(failedWorker, {
+          class: "provider_error",
+          code: "provider.invalid-request",
+          message: "Variant unavailable Private",
+        } as OrchestrationV2ProviderFailure);
+        yield* TestClock.adjust("3 minutes");
+        yield* kanban.turnEnded(failedWorker);
+        const released = (yield* kanban.card(card.id)).card;
+        assert.isTrue(
+          events.some(
+            (event) =>
+              event.kind === "kanban.card_move" &&
+              event.cardId === card.id &&
+              event.props?.from === "working" &&
+              event.props.to === "todo" &&
+              event.props.msInPrevStage === 180_000,
+          ),
+        );
+        assert.notEqual(released.analyticsStageEnteredAt, released.movedAt);
+        const store = yield* KanbanStore.KanbanStore;
+        const { analyticsStageEnteredAt: _clock, ...legacyReleased } = released;
+        yield* store.putCard(legacyReleased);
+        yield* kanban.editCard(card.id, { description: "Private edit" }, owner);
+        assert.equal(
+          (yield* store.card(card.id))!.analyticsStageEnteredAt,
+          released.analyticsStageEnteredAt,
+        );
+        yield* kanban.turnEnded(failedWorker);
+        const failures = events.filter(
+          (event) => event.kind === "kanban.worker_failed" && event.cardId === card.id,
+        );
+        assert.lengthOf(failures, 1);
+        assert.equal(failures[0]?.props?.errorClass, "variant_unavailable");
+        const second = yield* kanban.createCard(
+          board.id,
+          { title: "Private second", prompt: "Private" },
+          owner,
+        );
+        yield* TestClock.adjust("1 second");
+        yield* kanban.cardThread(second.id, "reset", "", owner);
+        assert.isTrue(
+          events.some(
+            (event) =>
+              event.cardId === second.id &&
+              event.kind === "kanban.card_move" &&
+              event.props?.from === "todo" &&
+              event.props.to === "todo" &&
+              event.props.msInPrevStage === 1000,
+          ),
+        );
+        yield* kanban.dispatchNow;
+        const secondWorker = (yield* kanban.card(second.id)).card.activeThreadId!;
+        fake.lastRuns.set(secondWorker, {
+          runId: "interrupted-run",
+          status: "interrupted",
+          message: "Private",
+        });
+        yield* kanban.turnEnded(secondWorker);
+        assert.isTrue(
+          events.some(
+            (event) =>
+              event.cardId === second.id &&
+              event.kind === "kanban.worker_failed" &&
+              event.props?.errorClass === "interrupted",
+          ),
+        );
+        yield* kanban.moveCard(second.id, "needs_review", "owner", owner);
+        yield* kanban.turnEnded(secondWorker);
+        yield* kanban.dispatchNow;
+        const secondReviewer = (yield* kanban.card(second.id)).card.activeThreadId!;
+        fake.failures.set(secondReviewer, {
+          class: "provider_error",
+          code: null,
+          message: "Provider blocked Private",
+        } as OrchestrationV2ProviderFailure);
+        yield* kanban.turnEnded(secondReviewer);
+        assert.isTrue(
+          events.some(
+            (event) =>
+              event.cardId === second.id &&
+              event.kind === "kanban.worker_failed" &&
+              event.props?.errorClass === "provider_blocked",
+          ),
+        );
+        const pools = events.filter((event) => event.kind === "kanban.pool_usage");
+        assert.isAbove(pools.length, 0);
+        assert.equal(pools[0]?.props?.slots, 0);
+        yield* TestClock.adjust("1 hour");
+        yield* kanban.dispatchNow;
+        assert.isAbove(
+          events.filter((event) => event.kind === "kanban.pool_usage").length,
+          pools.length,
+        );
+        assert.isTrue(
+          events.some((event) => event.kind === "kanban.ask_pending" && event.props?.key === "q1"),
+        );
+        const initialAsk = yield* kanban.createCard(
+          board.id,
+          {
+            title: "Private initial",
+            prompt: "Private initial",
+            stage: "needs_owner",
+            question: "Private question",
+          },
+          owner,
+        );
+        assert.isTrue(
+          events.some(
+            (event) =>
+              event.cardId === initialAsk.id &&
+              event.kind === "kanban.ask_opened" &&
+              event.props?.key === "q1",
+          ),
+        );
         assert.isFalse(JSON.stringify(events).includes("Private"));
       }).pipe(
         Effect.provide(
@@ -749,15 +940,101 @@ it.effect(
             Layer.provide(
               Layer.mock(Analytics.Analytics)({
                 record: (event) =>
-                  Effect.sync(() => {
-                    events.push(event);
-                  }),
+                  decodeAnalyticsEvent(event).pipe(
+                    Effect.orDie,
+                    Effect.tap((decoded) =>
+                      Effect.sync(() => {
+                        events.push(decoded);
+                      }),
+                    ),
+                    Effect.asVoid,
+                  ),
               }),
             ),
           ),
         ),
       );
     }),
+);
+
+it.effect.each(
+  (["todo", "needs_review", "in_review", "completed", "deployed", "verified"] as const).flatMap(
+    (stage) => (["owner", "evaluator", "script"] as const).map((actor) => ({ stage, actor })),
+  ),
+)("records step handoff actors from $stage as $actor", ({ stage, actor: kind }) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const events: AnalyticsEvent[] = [];
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const store = yield* KanbanStore.KanbanStore;
+      const scriptId = KanbanScriptId.make("script-check");
+      if (kind === "script")
+        yield* store.putScript({
+          id: scriptId,
+          boardId: board.id,
+          name: "check",
+          path: "/unused/check.sh",
+          trigger: { _tag: "manual" },
+          enabled: true,
+          createdBy: owner,
+          createdAt: "2026-10-29T00:00:00Z",
+          lastRun: null,
+        });
+      const actor: KanbanActor =
+        kind === "owner"
+          ? owner
+          : kind === "script"
+            ? { _tag: "script", scriptId }
+            : { _tag: "evaluator", threadId: ThreadId.make("eval") };
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Step handoff",
+          prompt: "Work",
+          subtasks: [
+            kind === "script"
+              ? { text: "Check inputs", owner: "script", script: "check", step: 1 }
+              : { text: "Check inputs", owner: "evaluator", step: 1 },
+            { text: "Implement", owner: "work", step: 2 },
+          ],
+        },
+        owner,
+      );
+      yield* store.putCard({ ...card, stage });
+      yield* TestClock.adjust("1 second");
+      yield* kanban.markSubtask(
+        card.id,
+        "s1",
+        "done",
+        "Checked",
+        actor,
+        kind === "owner" ? "evaluator" : kind,
+      );
+      const move = events.find(
+        (event) => event.cardId === card.id && event.kind === "kanban.card_move",
+      );
+      assert.deepInclude(move?.props, {
+        from: stage,
+        to: "todo",
+        actor: kind,
+        msInPrevStage: 1000,
+      });
+    }).pipe(
+      Effect.provide(
+        testLayer(fake.layer).pipe(
+          Layer.provide(
+            Layer.mock(Analytics.Analytics)({
+              record: (event) =>
+                Effect.sync(() => {
+                  events.push(event);
+                }),
+            }),
+          ),
+        ),
+      ),
+    );
+  }),
 );
 
 it.effect("refuses corrupted board text before saving and preserves clean comments", () =>
@@ -7049,6 +7326,7 @@ it.effect("a card moved to the backlog pauses, and goes back to its thread when 
 it.effect("stopping one card of a batch tells the thread instead of interrupting it", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
+    const events: AnalyticsEvent[] = [];
     yield* Effect.gen(function* () {
       const kanban = yield* KanbanService.KanbanService;
       const board = yield* kanban.ensureBoard({
@@ -7062,10 +7340,23 @@ it.effect("stopping one card of a batch tells the thread instead of interrupting
       const thread = (yield* kanban.card(first.id)).card.activeThreadId!;
       const second = yield* kanban.createForThread(thread, { prompt: "B", title: "B" });
 
+      const store = yield* KanbanStore.KanbanStore;
+      for (const id of [first.id, second.card.id]) {
+        const { analyticsStageEnteredAt: _clock, ...legacy } = (yield* store.card(id))!;
+        yield* store.putCard(legacy);
+      }
+      const switched = modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", variant: "max" });
+      yield* kanban.setPool(board.id, switched, 2);
+      yield* kanban.editCard(first.id, { model: switched }, owner);
+      assert.deepEqual((yield* kanban.card(second.card.id)).card.model, switched);
+      assert.equal((yield* kanban.card(second.card.id)).card.activePool, Rules.poolKey(switched));
+      assert.deepEqual((yield* store.threadLink(thread))!.model, board.defaultCardModel);
+
       // An evaluator stops the second card; the thread goes on with the first.
       const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
       yield* kanban.cardThread(second.card.id, "stop", "not needed", evaluator);
       assert.deepStrictEqual(fake.interrupted, []);
+      assert.isFalse(events.some((event) => event.kind === "kanban.worker_failed"));
       const sent = (yield* Ref.get(fake.threads)).get(thread)!.messages;
       assert.include(sent.at(-1) ?? "", `#${second.card.number}`);
       assert.include(sent.at(-1) ?? "", `#${first.number}`);
@@ -7074,9 +7365,49 @@ it.effect("stopping one card of a batch tells the thread instead of interrupting
       // Dropped for good: it won't rejoin this thread once unflagged.
       assert.strictEqual(stopped.workThreadId, null);
 
-      // The last card stopping interrupts the thread.
+      fake.lastRuns.set(thread, {
+        runId: "ordinary-interrupted",
+        status: "interrupted",
+        message: "private",
+        model: switched,
+      });
+      yield* kanban.turnEnded(thread);
+      yield* kanban.turnEnded(thread);
+      const ordinary = events.filter((event) => event.kind === "kanban.worker_failed");
+      assert.lengthOf(ordinary, 1);
+      assert.equal(ordinary[0]?.props?.model, switched.model);
+
+      // The last card stopping interrupts the thread; its terminal run arrives after release.
+      fake.lastRuns.set(thread, {
+        runId: "stop-run",
+        status: "running",
+        message: "private",
+        model: switched,
+      });
       yield* kanban.cardThread(first.id, "stop", "", evaluator);
       assert.deepStrictEqual(fake.interrupted, [thread]);
+      assert.lengthOf(
+        events.filter((event) => event.kind === "kanban.worker_failed"),
+        1,
+      );
+      fake.runHistory.set("stop-run", {
+        status: "interrupted",
+        message: "private",
+        model: switched,
+      });
+      fake.lastRuns.set(thread, {
+        runId: "new-run",
+        status: "running",
+        message: "private",
+        model: board.defaultCardModel,
+      });
+      yield* kanban.turnEnded(thread);
+      yield* kanban.turnEnded(thread);
+      const failures = events.filter((event) => event.kind === "kanban.worker_failed");
+      assert.lengthOf(failures, 2);
+      assert.isTrue(failures.every((event) => event.props?.model === switched.model));
+      assert.equal(failures[0]?.cardId, first.id);
+      assert.equal(failures[0]?.props?.errorClass, "interrupted");
 
       // Card history lists the thread for both cards.
       const threads = (yield* kanban.card(second.card.id)).threads;
@@ -7084,7 +7415,20 @@ it.effect("stopping one card of a batch tells the thread instead of interrupting
         threads.map((link) => link.threadId),
         [thread],
       );
-    }).pipe(Effect.provide(testLayer(fake.layer)));
+    }).pipe(
+      Effect.provide(
+        testLayer(fake.layer).pipe(
+          Layer.provide(
+            Layer.mock(Analytics.Analytics)({
+              record: (event) =>
+                Effect.sync(() => {
+                  events.push(event);
+                }),
+            }),
+          ),
+        ),
+      ),
+    );
   }),
 );
 

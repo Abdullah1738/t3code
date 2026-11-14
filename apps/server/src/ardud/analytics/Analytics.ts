@@ -22,6 +22,7 @@ import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "../../config.ts";
+import { sampleMix } from "./samples.ts";
 import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { askLatencyRollup, type AskTimingRow } from "./askLatency.ts";
@@ -155,11 +156,13 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
       day: string;
       filter: AnalyticsReadInput | undefined;
       accumulator: ReturnType<typeof makeAccumulator>;
-      samples: AnalyticsEvent[];
+      samples: ReturnType<ReturnType<typeof sampleMix>["entries"]>;
+      kinds: string[];
       signature: string;
     }
   >();
   const matches = (event: AnalyticsEvent, filter?: AnalyticsReadInput) =>
+    (filter?.boardId === undefined || event.kind !== "performance.long-task") &&
     (filter?.kind === undefined || filter.kind === event.kind) &&
     (filter?.boardId === undefined || filter.boardId === event.boardId) &&
     (filter?.tool === undefined || filter.tool === event.tool) &&
@@ -214,9 +217,7 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
     filter?: AnalyticsReadInput,
   ) {
     const accumulator = makeAccumulator();
-    const samples: AnalyticsEvent[] = [];
-    const limit = 500;
-    let cursor = 0;
+    const samples = sampleMix(500, filter?.kind);
     const selected = files
       .flatMap((file) => {
         const match = LOG_FILE.exec(file);
@@ -237,11 +238,7 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
       }
       if (!matches(event, filter)) return;
       accumulate(accumulator, event);
-      if (samples.length < limit) samples.push(event);
-      else {
-        samples[cursor] = event;
-        cursor = (cursor + 1) % limit;
-      }
+      samples.add(event);
     });
 
     for (const { file } of selected) {
@@ -254,7 +251,8 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
     }
     return {
       accumulator,
-      samples: [...samples.slice(cursor), ...samples.slice(0, cursor)].toReversed(),
+      samples: samples.entries(),
+      kinds: samples.kinds(),
     };
   });
 
@@ -275,6 +273,7 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
       filter,
       accumulator: scan.accumulator,
       samples: scan.samples,
+      kinds: scan.kinds,
       signature: fingerprint,
     };
     // FIFO bounds cardinality across days and arbitrary filter combinations.
@@ -451,12 +450,15 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
         const fingerprint = yield* signature(first.day, yield* listFiles());
         for (const view of views.values()) {
           if (view.day !== first.day) continue;
+          const samples = sampleMix(500, view.filter?.kind, view.kinds);
+          for (const sample of view.samples) samples.add(sample.event, sample.order);
           for (const entry of attempted) {
             if (!matches(entry.event, view.filter)) continue;
             accumulate(view.accumulator, entry.event);
-            view.samples.unshift(entry.event);
-            if (view.samples.length > 500) view.samples.pop();
+            samples.add(entry.event);
           }
+          view.samples = samples.entries();
+          view.kinds = samples.kinds();
           view.signature = fingerprint;
         }
         // Held entries remain in pending (and consume capacity) until append succeeds.
@@ -623,7 +625,7 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
               finishRollup(view.accumulator, input.day, generatedAt),
               input.boardId,
             ),
-            samples: view.samples.slice(0, input.limit ?? 100),
+            samples: view.samples.slice(0, input.limit ?? 100).map((sample) => sample.event),
           };
         }),
       )

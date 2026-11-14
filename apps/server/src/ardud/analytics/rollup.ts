@@ -132,6 +132,7 @@ export const makeAccumulator = () => ({
     }
   >(),
   answers: durations(),
+  boards: new Map<string, BoardGroup>(),
   tickPhases: new Map<string, { boardId: string; phase: string; durations: Durations }>(),
   mcp: new Map<string, McpGroup>(),
   retries: new Map<string, RetryAttempt[]>(),
@@ -173,10 +174,188 @@ export function addDuration(target: Durations, value: number): void {
   target.histogram.set(key, (target.histogram.get(key) ?? 0) + 1);
 }
 
+interface AskObservation {
+  ts: string;
+  closed: boolean;
+  rank: number;
+  cardId: string;
+  key: string;
+  kind: string;
+  blocking: boolean;
+  createdAt: string;
+}
+interface BoardGroup {
+  moves: Map<string, { from: string; to: string; count: number }>;
+  stages: Map<string, Durations>;
+  reviews: Map<string, { rounds: number; verdicts: number }>;
+  verdicts: Map<string, number>;
+  reviewDuration: Durations;
+  stalls: Map<string, { sets: number; clears: number; durations: Durations }>;
+  failures: Map<string, number>;
+  restarts: number;
+  asks: Map<string, AskObservation>;
+  snapshotRows: number;
+  snapshots: Map<string, { expected: number | undefined; asks: Map<string, AskObservation> }>;
+  pools: Map<
+    string,
+    { hour: string; poolKey: string; samples: number; used: number; slots: number; waiting: number }
+  >;
+  overflow: number;
+}
+const BOARD_LIMIT = 20_000;
+function boardAccumulate(target: ReturnType<typeof makeAccumulator>, event: AnalyticsEvent) {
+  if (!event.boardId || !(event.kind.startsWith("kanban.") || event.kind === "ask.answered"))
+    return;
+  let board = target.boards.get(event.boardId);
+  if (!board) {
+    if (target.boards.size >= MAX_GROUPS) return;
+    board = {
+      moves: new Map(),
+      stages: new Map(),
+      reviews: new Map(),
+      verdicts: new Map(),
+      reviewDuration: durations(),
+      stalls: new Map(),
+      failures: new Map(),
+      restarts: 0,
+      asks: new Map(),
+      snapshotRows: 0,
+      snapshots: new Map(),
+      pools: new Map(),
+      overflow: 0,
+    };
+    target.boards.set(event.boardId, board);
+  }
+  const p = event.props;
+  if (!p) return;
+  if (event.kind === "kanban.card_move" && p.from && p.to) {
+    const key = boundedKey(board.moves, JSON.stringify([p.from, p.to]));
+    const move = board.moves.get(key) ?? {
+      from: key === OTHER ? OTHER : p.from,
+      to: key === OTHER ? OTHER : p.to,
+      count: 0,
+    };
+    move.count++;
+    board.moves.set(key, move);
+    if (p.msInPrevStage !== undefined) {
+      const stage = boundedKey(board.stages, p.from);
+      const values = board.stages.get(stage) ?? durations();
+      addDuration(values, p.msInPrevStage);
+      board.stages.set(stage, values);
+    }
+  }
+  if (event.kind === "kanban.review_verdict") {
+    if (p.verdict) increment(board.verdicts, p.verdict);
+    if (event.durationMs !== undefined) addDuration(board.reviewDuration, event.durationMs);
+    if (event.cardId) {
+      if (!board.reviews.has(event.cardId) && board.reviews.size >= BOARD_LIMIT) board.overflow++;
+      else {
+        const review = board.reviews.get(event.cardId) ?? { rounds: 0, verdicts: 0 };
+        review.rounds = Math.max(review.rounds, p.round ?? 0);
+        review.verdicts++;
+        board.reviews.set(event.cardId, review);
+      }
+    }
+  }
+  if (event.kind === "kanban.stall" && p.reasonClass) {
+    const key = boundedKey(board.stalls, p.reasonClass);
+    const stall = board.stalls.get(key) ?? { sets: 0, clears: 0, durations: durations() };
+    if (p.action === "set") stall.sets++;
+    if (p.action === "clear") {
+      stall.clears++;
+      if (p.ageMs !== undefined) addDuration(stall.durations, p.ageMs);
+    }
+    board.stalls.set(key, stall);
+  }
+  if (event.kind === "kanban.worker_failed") increment(board.failures, p.errorClass ?? "other");
+  if (event.kind === "kanban.worker_restarted") board.restarts++;
+  if (event.kind === "kanban.ask_snapshot" || event.kind === "kanban.ask_pending") {
+    let snapshot = board.snapshots.get(event.ts);
+    if (!snapshot && board.snapshots.size >= MAX_GROUPS) {
+      board.overflow++;
+      return;
+    }
+    if (!snapshot) {
+      snapshot = { expected: undefined, asks: new Map() };
+      board.snapshots.set(event.ts, snapshot);
+    }
+    if (event.kind === "kanban.ask_snapshot") snapshot.expected = p.count;
+    if (event.kind === "kanban.ask_pending" && event.cardId && p.key && p.createdAt) {
+      const key = JSON.stringify([event.cardId, p.key]);
+      if (!snapshot.asks.has(key) && board.snapshotRows >= BOARD_LIMIT) board.overflow++;
+      else {
+        if (!snapshot.asks.has(key)) board.snapshotRows++;
+        snapshot.asks.set(key, {
+          ts: event.ts,
+          rank: 1,
+          closed: false,
+          cardId: event.cardId,
+          key: p.key,
+          kind: p.kind ?? "question",
+          blocking: p.blocking ?? false,
+          createdAt: p.createdAt,
+        });
+      }
+    }
+  }
+  if (
+    ["kanban.ask_opened", "kanban.ask_updated", "kanban.ask_closed", "ask.answered"].includes(
+      event.kind,
+    ) &&
+    event.cardId &&
+    p.key &&
+    p.createdAt
+  ) {
+    const key = JSON.stringify([event.cardId, p.key]);
+    const old = board.asks.get(key);
+    const closed = event.kind === "kanban.ask_closed" || event.kind === "ask.answered";
+    const rank = closed ? 3 : event.kind === "kanban.ask_updated" ? 2 : 0;
+    if (!old && board.asks.size >= BOARD_LIMIT) board.overflow++;
+    else if (!old || event.ts > old.ts || (event.ts === old.ts && rank >= old.rank))
+      board.asks.set(key, {
+        ts: event.ts,
+        rank,
+        closed,
+        cardId: event.cardId,
+        key: p.key,
+        kind: p.kind ?? "question",
+        blocking: p.blocking ?? false,
+        createdAt: p.createdAt,
+      });
+  }
+  if (
+    event.kind === "kanban.pool_usage" &&
+    p.poolKey &&
+    p.used !== undefined &&
+    p.slots !== undefined
+  ) {
+    const hour = `${event.ts.slice(0, 13)}:00:00.000Z`;
+    const key = JSON.stringify([hour, p.poolKey]);
+    if (!board.pools.has(key) && board.pools.size >= BOARD_LIMIT) {
+      board.overflow++;
+      return;
+    }
+    const pool = board.pools.get(key) ?? {
+      hour,
+      poolKey: p.poolKey,
+      samples: 0,
+      used: 0,
+      slots: 0,
+      waiting: 0,
+    };
+    pool.samples++;
+    pool.used += p.used;
+    pool.slots += p.slots;
+    pool.waiting += p.waiting ?? 0;
+    board.pools.set(key, pool);
+  }
+}
+
 export function accumulate(
   target: ReturnType<typeof makeAccumulator>,
   event: AnalyticsEvent,
 ): void {
+  boardAccumulate(target, event);
   target.total++;
   increment(target.kinds, event.kind);
   if (event.props?.errorTag) increment(target.errors, event.props.errorTag);
@@ -391,6 +570,38 @@ export function summarize(values: Durations): AnalyticsLatency {
   };
 }
 
+function finishBoardAsks(board: BoardGroup, day: string, generatedAt: string) {
+  const ordered = [...board.snapshots].sort(([a], [b]) => b.localeCompare(a));
+  const complete = ordered.find(
+    ([, snapshot]) => snapshot.expected !== undefined && snapshot.expected === snapshot.asks.size,
+  );
+  const asOf = complete?.[0] ?? null;
+  const asks = new Map(complete?.[1].asks ?? []);
+  for (const [key, observation] of board.asks) {
+    const prior = asks.get(key);
+    if (
+      (asOf === null || observation.ts >= asOf) &&
+      (!prior ||
+        observation.ts > prior.ts ||
+        (observation.ts === prior.ts && observation.rank >= prior.rank))
+    )
+      asks.set(key, observation);
+  }
+  const at = Date.parse(day < generatedAt.slice(0, 10) ? `${day}T23:59:59.999Z` : generatedAt);
+  return {
+    openAsks: [...asks.values()]
+      .filter((ask) => !ask.closed)
+      .map(({ ts: _ts, rank: _rank, closed: _closed, ...ask }) => ({
+        ...ask,
+        ageMs: Math.max(0, at - Date.parse(ask.createdAt)),
+      })),
+    openAsksAsOf: asOf,
+    incompleteAskSnapshots: ordered.filter(
+      ([, snapshot]) => snapshot.expected === undefined || snapshot.expected !== snapshot.asks.size,
+    ).length,
+  };
+}
+
 export function finishRollup(
   target: ReturnType<typeof makeAccumulator>,
   day: string,
@@ -482,6 +693,31 @@ export function finishRollup(
       .sort((a, b) => (b.p95Ms ?? 0) - (a.p95Ms ?? 0) || a.method.localeCompare(b.method))
       .slice(0, 20),
     askAnswerLatency: summarize(target.answers),
+    boards: [...target.boards].map(([boardId, board]) => ({
+      boardId,
+      moves: [...board.moves.values()],
+      timeInStage: [...board.stages].map(([stage, values]) => ({ stage, ...summarize(values) })),
+      reviewRounds: [...board.reviews].map(([cardId, value]) => ({ cardId, ...value })),
+      verdictCounts: Object.fromEntries(board.verdicts),
+      reviewDuration: summarize(board.reviewDuration),
+      stalls: [...board.stalls].map(([reasonClass, value]) => ({
+        reasonClass,
+        sets: value.sets,
+        clears: value.clears,
+        ...summarize(value.durations),
+      })),
+      failureCounts: Object.fromEntries(board.failures),
+      restarts: board.restarts,
+      ...finishBoardAsks(board, day, generatedAt),
+      poolUtilisation: [...board.pools.values()].map((pool) => ({
+        ...pool,
+        used: pool.used / pool.samples,
+        slots: pool.slots / pool.samples,
+        waiting: pool.waiting / pool.samples,
+        utilisation: pool.slots === 0 ? null : pool.used / pool.slots,
+      })),
+      overflow: board.overflow,
+    })),
     askLatency: {
       source: "unavailable",
       sentToSeen: summarize(durations()),

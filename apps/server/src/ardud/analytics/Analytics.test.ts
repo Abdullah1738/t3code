@@ -58,7 +58,95 @@ function open(
 }
 
 describe("Analytics", () => {
-  it.effect("reads filtered tick phase percentiles and persists the complete day", () =>
+  it.effect("prioritises board kinds and ignores board long tasks in samples and rollup", () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const analytics = yield* open(setup);
+      const boardId = "board-crpko";
+      for (const row of [
+        event({
+          boardId,
+          kind: "kanban.card_move",
+          props: { from: "todo", to: "working", msInPrevStage: 10 },
+        }),
+        ...Array.from({ length: 150 }, () => event({ boardId, kind: "performance.long-task" })),
+        event({ boardId, kind: "toast.show" }),
+        event({ boardId: "other", kind: "kanban.dispatch" }),
+      ])
+        yield* analytics.record(row);
+      const result = yield* analytics.read({ day, boardId, limit: 2 });
+      assert.deepEqual(
+        result.samples.map((row) => row.kind),
+        ["kanban.card_move", "toast.show"],
+      );
+      assert.equal(result.rollup.total, 2);
+      assert.isUndefined(result.rollup.kindCounts["performance.long-task"]);
+      assert.equal(result.rollup.boards[0]?.moves[0]?.count, 1);
+      for (let index = 0; index < 150; index++) {
+        yield* analytics.record(event({ boardId, kind: "kanban.queue_depth" }));
+        yield* analytics.record(event({ boardId, kind: "performance.long-task" }));
+      }
+      yield* analytics.record(event({ boardId, kind: "kanban.review_verdict" }));
+      const cached = yield* analytics.read({ day, boardId, limit: 100 });
+      assert.sameMembers(cached.samples.slice(0, 3).map((row) => row.kind), [
+        "kanban.card_move",
+        "kanban.queue_depth",
+        "kanban.review_verdict",
+      ]);
+      assert.equal(cached.samples.filter((row) => row.kind === "kanban.queue_depth").length, 50);
+      assert.isUndefined(cached.rollup.kindCounts["performance.long-task"]);
+      assert.equal(cached.rollup.total, 153);
+      const exact = yield* analytics.read({ day, boardId, kind: "kanban.queue_depth", limit: 75 });
+      assert.lengthOf(exact.samples, 75);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+  it.effect.each([117, 118, 119])(
+    "preserves cached kind admission with 10 board kinds and %s other kinds",
+    (otherKinds) =>
+      Effect.gen(function* () {
+        const setup = yield* fixture;
+        const analytics = yield* open(setup);
+        const boardId = "board-a";
+        for (let kind = 0; kind < 10; kind++)
+          for (let row = 0; row < 50; row++)
+            yield* analytics.record(event({ boardId, kind: `kanban.k${kind}` }));
+        for (let kind = 0; kind < otherKinds; kind++)
+          yield* analytics.record(event({ boardId, kind: `ui.k${kind}` }));
+        yield* analytics.read({ day, boardId, limit: 500 });
+        yield* analytics.record(event({ boardId, kind: "kanban.appended" }));
+        const warm = yield* analytics.read({ day, boardId, limit: 500 });
+        const cold = yield* (yield* open(setup)).read({ day, boardId, limit: 500 });
+        assert.deepEqual(warm.samples, cold.samples);
+        assert.equal(
+          warm.samples.some((row) => row.kind === "kanban.appended"),
+          otherKinds === 117,
+        );
+        assert.equal(warm.rollup.total, 501 + otherKinds);
+        assert.deepEqual(warm.rollup.kindCounts, cold.rollup.kindCounts);
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("keeps equal-timestamp mixed samples ordered across cached appends and cold reads", () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const analytics = yield* open(setup);
+      const boardId = "board-a";
+      for (const [kind, cardId] of [
+        ["kanban.card_move", "a1"],
+        ["kanban.queue_depth", "b1"],
+        ["kanban.queue_depth", "b2"],
+      ] as const)
+        yield* analytics.record(event({ boardId, kind, cardId }));
+      yield* analytics.read({ day, boardId });
+      yield* analytics.record(event({ boardId, kind: "kanban.card_move", cardId: "a2" }));
+      const warm = yield* analytics.read({ day, boardId });
+      const cold = yield* (yield* open(setup)).read({ day, boardId });
+      assert.deepEqual(warm.samples.map((row) => row.cardId), ["a2", "b2", "b1", "a1"]);
+      assert.deepEqual(warm.samples, cold.samples);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("reads tick phases and lifecycle rollups together and persists the complete day", () =>
     Effect.gen(function* () {
       const setup = yield* fixture;
       const analytics = yield* open(setup);
@@ -87,6 +175,21 @@ describe("Analytics", () => {
           props: { tickId: "tick-2", activeTickId: "tick-1", reason: "local_waits_only" },
         }),
       );
+      yield* analytics.record(
+        event({
+          kind: "kanban.card_move",
+          surface: "server",
+          boardId: "a",
+          cardId: "card-a",
+          props: { from: "todo", to: "working", msInPrevStage: 60_000 },
+        }),
+      );
+      const board = yield* analytics.read({ day, boardId: "a" });
+      assert.deepEqual(board.rollup.boards[0]?.moves, [
+        { from: "todo", to: "working", count: 1 },
+      ]);
+      assert.equal(board.rollup.tickPhases?.[0]?.p95Ms, 90);
+      assert.equal(board.rollup.boards[0]?.timeInStage[0]?.p95Ms, 60_000);
       const result = yield* analytics.read({
         day,
         kind: "kanban.tick_phase",
@@ -109,7 +212,8 @@ describe("Analytics", () => {
       const full = JSON.parse(
         yield* setup.fs.readFileString(`${setup.directory}/rollup-${day}.json`),
       ) as AnalyticsRollup;
-      assert.equal(full.total, 5);
+      assert.equal(full.total, 6);
+      assert.equal(full.boards[0]?.moves[0]?.count, 1);
       assert.equal(full.tickPhases?.length, 2);
       assert.equal(full.kindCounts["kanban.tick_overlap"], 1);
       assert.isFalse(yield* setup.fs.exists(`${setup.directory}/rollup-${day}.json.tmp`));
@@ -750,7 +854,11 @@ it.effect(
       const result = yield* analytics.read({ day, limit: 500 });
       assert.isBelow(performance.now() - started, 1000);
       assert.equal(result.rollup.errorsByRoute[0]!.count, 250_000);
-      assert.lengthOf(result.samples, 500);
+      assert.lengthOf(result.samples, 50);
+      assert.lengthOf(
+        (yield* analytics.read({ day, kind: "server.http", limit: 500 })).samples,
+        500,
+      );
       yield* analytics.record(row);
       assert.equal((yield* analytics.read({ day })).rollup.total, 250_001);
       assert.equal(
