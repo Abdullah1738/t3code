@@ -104,6 +104,71 @@ for (const chat of [undefined, "moni", "family-trip"]) {
   });
 }
 
+for (const phase of ["active", "closing", "handoff"]) {
+  test(`timeout repair applies to an unfinished ${phase} check`, async () => {
+    const result=await scenario(`
+      const phase=${JSON.stringify(phase)};
+      const check="sleep 1.2; echo recovered";
+      add("timeout-repair",{check,timeout_s:1,mode:phase==="active"?"notify":"wake",max_fires:1,
+        context:"admitted-context",...(phase==="active"?{}:{inflight_check:check})});
+      if(phase==="closing")lib.removeWatcher("timeout-repair");
+      if(phase==="handoff")lib.saveState("timeout-repair",{...state("timeout-repair"),reply_handoff:{run:"earlier-run",watcher:lib.loadWatcher("timeout-repair")}});
+      await tickOne("timeout-repair"); const failed=state("timeout-repair");
+      const file=join(root,"replacement.json");
+      writeFileSync(file,JSON.stringify({...lib.loadWatcher("timeout-repair"),timeout_s:3,context:"updated-context"}));
+      cli("add","--json",file,"--replace");
+      if(phase==="active")cli("resume","timeout-repair");
+      clock+=5000; await tickOne("timeout-repair"); clock+=150000; await tickOne("timeout-repair");
+      console.log(JSON.stringify({failed,sent:sent(),state:state("timeout-repair")}));
+    `);
+    expect(result.failed.consecutive_failures).toBe(1);
+    expect(result.failed.admitted_run).toBeDefined();
+    expect(result.sent).toHaveLength(1);
+    expect(result.sent[0].join(" ")).toContain("recovered");
+    if(phase!=="active"){
+      expect(result.sent[0].join(" ")).toContain("admitted-context");
+      expect(result.sent[0].join(" ")).not.toContain("updated-context");
+    }else expect(result.state.status).toBe("done");
+  },15_000);
+}
+
+test("unfinished checks use repaired dependency, failure and interval policies", async () => {
+  const result=await scenario(`
+    add("policy-repair",{check:"exit 7",mode:"notify",max_consecutive_failures:0,failure_notice_after:1,interval_s:5});
+    await tickOne("policy-repair"); const failed=state("policy-repair");
+    lib.editWatcher("policy-repair",w=>({...w,depends:["phone"],max_consecutive_failures:2,failure_notice_after:4,interval_s:60}));
+    lib.writeJson(lib.MAINTENANCE_FILE,{depends:["phone"],until:lib.iso(clock+600000),reason:"fixture"});
+    const held=lib.heldByMaintenance(lib.pollingWatcher(lib.loadWatcher("policy-repair"),state("policy-repair")),lib.loadMaintenance());
+    rmSync(lib.MAINTENANCE_FILE); clock+=5000; await tickOne("policy-repair");
+    console.log(JSON.stringify({failed,held,after:state("policy-repair"),sent:sent()}));
+  `);
+  expect(result.held).toBe(true);
+  expect(result.after.consecutive_failures).toBe(2);
+  expect(result.after.failure_paused_at).toBeString();
+  expect(result.after.next_at-Date.parse(result.after.last_run_at)).toBe(120000);
+});
+
+test("unfinished checks use the current quiet window and notice threshold", async () => {
+  const result=await scenario(`
+    add("quiet-repair",{check:"if [[ ! -f ready ]]; then exit 7; fi; echo recovered",mode:"notify",failure_notice_after:4});
+    await tickOne("quiet-repair");
+    lib.editWatcher("quiet-repair",w=>({...w,quiet:{start:10,end:11,time_zone:"UTC"}}));
+    writeFileSync(join(lib.watcherDir("quiet-repair"),"ready"),""); clock+=5000;
+    await tickOne("quiet-repair"); const held=state("quiet-repair"); const before=sent();
+    lib.editWatcher("quiet-repair",w=>({...w,quiet:undefined})); clock+=5000; await tickOne("quiet-repair");
+    const delivered=sent();
+    add("notice-repair",{check:"exit 7",mode:"notify",max_consecutive_failures:0,failure_notice_after:1});
+    await tickOne("notice-repair"); const first=sent().length;
+    lib.editWatcher("notice-repair",w=>({...w,failure_notice_after:4})); clock+=5000; await tickOne("notice-repair");
+    console.log(JSON.stringify({held,before,delivered,first,after:sent().length,state:state("notice-repair")}));
+  `);
+  expect(result.held.pending.event).toBe("recovered");
+  expect(result.before).toEqual([]);
+  expect(result.delivered).toHaveLength(1);
+  expect(result.after).toBe(result.first);
+  expect(result.state.consecutive_failures).toBe(2);
+});
+
 const crashCases = [
   { before: null, after: "moni", action: "remove", reply: true },
   { before: "moni", after: null, action: "remove", reply: true },

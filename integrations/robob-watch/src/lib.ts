@@ -166,10 +166,16 @@ export const REMOVAL_GRACE_MS = 15 * 60_000;
 export const personChat = (watcher: Watcher) => watcher.mode === "wake";
 export const sameDestination = (a: Watcher, b: Watcher) => a.mode === b.mode && a.chat === b.chat;
 export const checking = (state: State) => state.status === "active" || (state.status === "closing" && !!state.closing_watcher);
-export const pollingWatcher = (watcher: Watcher, state: State) => state.reply_handoff
-  ? { ...state.reply_handoff.watcher, paused: watcher.paused }
-  : state.status === "closing" ? state.closing_watcher && { ...state.closing_watcher, paused: watcher.paused }
-  : state.admitted_run && !state.admitted_run.accepted ? { ...state.admitted_run.watcher, paused: watcher.paused } : watcher;
+export function pollingWatcher(watcher: Watcher, state: State) {
+  const admitted = state.reply_handoff?.watcher ?? (state.status === "closing" ? state.closing_watcher
+    : state.admitted_run && !state.admitted_run.accepted ? state.admitted_run.watcher : watcher);
+  if (!admitted || admitted === watcher) return admitted;
+  // Repairs change how checks run; their unaccepted output keeps its original destination and authority.
+  return { ...watcher, id: admitted.id, title: admitted.title, check: admitted.check,
+    inflight_check: admitted.inflight_check, mode: admitted.mode, context: admitted.context,
+    chat: admitted.chat, trip: admitted.trip, relays: admitted.relays,
+    created_at: admitted.created_at, created_by_session: admitted.created_by_session };
+}
 
 export function watcherInstance(id: string): string | undefined {
   try {
