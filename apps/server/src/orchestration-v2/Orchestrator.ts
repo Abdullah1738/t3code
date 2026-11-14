@@ -16,6 +16,7 @@ import {
   emptyDelegatedRecoveryCounts,
   type DelegatedRecoveryCounts,
 } from "../ardud/observability/StartupPhaseLog.ts";
+import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Crypto from "effect/Crypto";
 import * as SendAcknowledgement from "../ardud/orchestration/ThreadSendAcknowledgement.ts";
@@ -173,6 +174,7 @@ import { RuntimePolicyV2 } from "./RuntimePolicy.ts";
 import {
   endOrphanedNativeSubagent,
   endRunlessRootTurns,
+  endRunlessProviderTurns,
   makeSubagentChildThread,
   subagentResultForRun,
   delegatedTaskProgress,
@@ -371,6 +373,10 @@ export interface OrchestratorV2Shape {
     options?: { readonly minWaitMs?: number; readonly deferBoardWakes?: boolean },
   ) => Effect.Effect<number, OrchestratorV2Error>;
   readonly resumeQueuedRuns: Effect.Effect<number, OrchestratorV2Error>;
+  readonly repairRunlessProviderTurns: Effect.Effect<
+    { readonly candidates: number; readonly turnsEnded: number },
+    OrchestratorV2Error
+  >;
   readonly recoverDelegatedTasks: Effect.Effect<DelegatedRecoveryCounts>;
   readonly recoverDelegatedTask: (threadId: ThreadId, sourceRunId: RunId) => Effect.Effect<void>;
   readonly delegatedTaskResultPending: (
@@ -9953,7 +9959,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         }
         childThreadIds.add(childThreadId);
         const child = yield* projectionStore
-          .getThreadRecords(childThreadId, ["nodes", "subagents", "turnItems"], {
+          .getThreadRecords(childThreadId, ["nodes", "subagents", "turnItems", "providerTurns"], {
             // Runless items are the subagent's; any run there is the user's own.
             turnItemRunIds: [null],
             turnItemStatuses: ["pending", "running", "waiting"],
@@ -10503,7 +10509,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         yield* Ref.update(events, (current) => [...current, ...ended]);
         if (subagent.childThreadId !== null) {
           const child = yield* projectionStore
-            .getThreadRecords(subagent.childThreadId, ["nodes", "turnItems"], {
+            .getThreadRecords(subagent.childThreadId, ["nodes", "turnItems", "providerTurns"], {
               turnItemRunIds: [null],
               turnItemStatuses: ["pending", "running", "waiting"],
             })
@@ -13809,6 +13815,69 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       Effect.forkDetach,
     );
 
+  const repairRunlessProviderTurns = Effect.fn("Orchestrator.repairRunlessProviderTurns")(
+    function* () {
+      const candidates = yield* projectionStore
+        .getRecoveryThreadIds("runless-provider-turns")
+        .pipe(Effect.mapError(shellProjectionError));
+      let turnsEnded = 0;
+      for (const threadId of candidates) {
+        turnsEnded += yield* threadDispatch.withLock(
+          threadId,
+          Effect.gen(function* () {
+            const commandId = yield* idAllocator.allocate.command({
+              fixtureName: "runless-provider-turn-repair",
+              commandName: "repair",
+            });
+            const now = yield* DateTime.now;
+            const sequence = yield* eventSink.latestSequence({ threadId });
+            const projection = yield* projectionStore
+              .getThreadRecords(threadId, ["nodes", "providerTurns"])
+              .pipe(NodeSqliteClient.readOnly, NodeSqliteClient.backgroundReads);
+            const events = yield* endRunlessProviderTurns({
+              threadId,
+              providerInstanceId: projection.thread.providerInstanceId,
+              projection,
+              now,
+              emitted: [],
+              allocateEventId: () => idAllocator.allocate.event({ threadId, commandId }),
+            });
+            if (events.length === 0) return 0;
+            const result = yield* eventSink.commitCommand({
+              commandId,
+              threadId,
+              commandType: "provider-turn.repair-runless",
+              acceptedAt: now,
+              events,
+              effects: [],
+              // Native ingestion bypasses dispatch locks; a changed thread is retried next boot.
+              recheck: Effect.gen(function* () {
+                if ((yield* eventSink.latestSequence({ threadId })) !== sequence) {
+                  return yield* Effect.fail("Thread changed during runless provider turn repair");
+                }
+              }),
+            });
+            return result.storedEvents.length;
+          }).pipe(
+            Effect.catchCause((cause) =>
+              Cause.hasInterruptsOnly(cause)
+                ? Effect.interrupt
+                : Effect.logWarning("Runless provider turn repair skipped a thread", {
+                    threadId,
+                    cause,
+                  }).pipe(Effect.as(0)),
+            ),
+          ),
+        );
+        // A small serial batch yields the writer and CPU to interactive commands.
+        yield* Effect.sleep("25 millis");
+      }
+      const summary = { candidates: candidates.length, turnsEnded };
+      yield* Effect.logInfo("Runless provider turn repair complete", summary);
+      return summary;
+    },
+  );
+
   const recoverDelegatedTasks = Effect.gen(function* () {
     const clock = yield* Clock.Clock;
     const counts = { ...emptyDelegatedRecoveryCounts };
@@ -14020,6 +14089,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   return OrchestratorV2.of({
     promoteQueuedMessages,
     resumeQueuedRuns,
+    repairRunlessProviderTurns: repairRunlessProviderTurns(),
     recoverDelegatedTasks,
     recoverDelegatedTask,
     delegatedTaskResultPending,
@@ -14215,6 +14285,7 @@ const layerUnavailable: Layer.Layer<OrchestratorV2> = Layer.succeed(
         cause: "Orchestration V2 live runtime is not configured.",
       }),
     ),
+    repairRunlessProviderTurns: Effect.succeed({ candidates: 0, turnsEnded: 0 }),
     recoverDelegatedTasks: Effect.succeed(emptyDelegatedRecoveryCounts),
     recoverDelegatedTask: () => Effect.void,
     delegatedTaskResultPending: () => Effect.succeed(false),

@@ -66,6 +66,7 @@ it.effect.each([
   "project-failure",
   "slow-recovery",
   "stuck-delegated",
+  "stuck-runless-repair",
 ] as const)("keeps bootstrap launch failures separate from project failures: %s", (scenario) =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -158,6 +159,20 @@ it.effect.each([
           reconcile: () => Effect.succeed(recovery),
         }),
         Layer.mock(Orchestrator.OrchestratorV2)({
+          repairRunlessProviderTurns: Effect.gen(function* () {
+            assert.isTrue(events.some((event) => event.type === "ready"));
+            assert.isTrue(
+              records.some(
+                (record) =>
+                  record.phase === "orchestration-v2.recovery" && record.outcome === "success",
+              ),
+            );
+            if (scenario === "stuck-runless-repair") {
+              yield* Deferred.succeed(recoveryStarted, undefined);
+              return yield* Effect.never;
+            }
+            return { candidates: 0, turnsEnded: 0 };
+          }),
           recoverDelegatedTasks:
             scenario === "stuck-delegated"
               ? Deferred.succeed(recoveryStarted, undefined).pipe(Effect.andThen(Effect.never))
@@ -300,6 +315,10 @@ it.effect.each([
         }
         const ready = yield* Effect.exit(startup.awaitCommandReady);
         assert.equal(Exit.isSuccess(ready), scenario !== "project-failure");
+        if (scenario === "stuck-runless-repair") {
+          yield* Deferred.await(recoveryStarted);
+          assert.isTrue(events.some((event) => event.type === "ready"));
+        }
         if (scenario === "stuck-delegated") {
           yield* Deferred.await(recoveryStarted);
           assert.isTrue(events.some((event) => event.type === "ready"));
