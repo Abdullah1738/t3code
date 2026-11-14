@@ -9,15 +9,40 @@ import re
 import shlex
 import shutil
 
+import statev2_guard
+
 
 FILES = ("bin/live-db-snapshot", "src/live_db_snapshot.py", "src/snapshot_guard.py",
          "src/engine.py", "src/statev2_guard.py")
 
 
-def snapshot_attempt(command):
+def snapshot_attempt(command, cwd):
     # Unknown executable names are not readers in the legacy classifier. Keep
     # a renamed/unpinned snapshot request closed as well as compound requests.
-    return all(flag in command for flag in ("--card", "--ask", "--db"))
+    if not all(flag in command for flag in ("--card", "--ask", "--db")):
+        return False
+    if statev2_guard.LIVE.search(command):
+        return True
+    # The helper's concrete source list includes legacy paths outside LIVE's
+    # patterns. Compare --db operands against that same list without expanding
+    # the ordinary shell classifier's policy.
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        words = list(lexer)
+    except ValueError:
+        return False
+    protected = statev2_guard.protected_databases()
+    for index, word in enumerate(words):
+        if word == "--db" and index + 1 < len(words):
+            value = words[index + 1]
+        elif word.startswith("--db="):
+            value = word.partition("=")[2]
+        else:
+            continue
+        if statev2_guard._literal_path(value, Path(cwd)) in protected:
+            return True
+    return False
 
 
 def install_pin(root):

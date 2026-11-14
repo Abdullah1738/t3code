@@ -35,6 +35,40 @@ class SnapshotGuardTests(unittest.TestCase):
     def decide(self, command, harness="codex"):
         return engine.decide({"hook_event_name": "PreToolUse", "tool_name": "Bash", "cwd": str(self.home), "tool_input": {"command": command}}, harness)
 
+    def protected_source_commands(self):
+        for index, source in enumerate(sorted(engine.statev2_guard.protected_databases())):
+            relative = source.relative_to(self.home.resolve())
+            alias = self.home / ("source-" + str(index))
+            alias.symlink_to(source)
+            forms = {"absolute": shlex.quote(str(source)), "tilde": "~/" + str(relative),
+                     "home-variable": "$HOME/" + str(relative), "braced-home": "${HOME}/" + str(relative),
+                     "relative": str(relative), "symlink": shlex.quote(str(alias))}
+            for form, value in forms.items():
+                prefix = shlex.join([str(self.helper), "--card", "card-fixture", "--ask", "q1"])
+                for separator in (" ", "="):
+                    yield str(relative), form, separator, prefix + " --db" + separator + value
+
+    def test_every_protected_source_accepts_the_exact_pinned_invocation(self):
+        for source in sorted(engine.statev2_guard.protected_databases()):
+            command = shlex.join([str(self.helper), "--card", "card-fixture", "--ask", "q1", "--db", str(source)])
+            for harness in ("codex", "claude"):
+                with self.subTest(source=str(source), harness=harness):
+                    result = self.decide(command, harness)
+                    self.assertEqual(result["decision"], "allow")
+                    self.assertEqual(result["context"]["rule"], "live-database-snapshot")
+
+    def test_every_protected_source_rejects_unverified_invocations(self):
+        commands = list(self.protected_source_commands())
+        original = self.helper.read_bytes()
+        for fault in ("changed-hash", "compound"):
+            self.helper.write_bytes(original + b"\n# changed\n" if fault == "changed-hash" else original)
+            for source, form, separator, command in commands:
+                for harness in ("codex", "claude"):
+                    with self.subTest(source=source, form=form, separator=separator, fault=fault, harness=harness):
+                        result = self.decide(command + ("; cat x" if fault == "compound" else ""), harness)
+                        self.assertEqual(result["decision"], "deny")
+                        self.assertTrue(result["context"]["rule"].startswith("live-database"))
+
     def test_exact_helper_and_symlink_allowed_for_native_harnesses(self):
         for harness in ("codex", "claude"):
             result = self.decide(self.command, harness)
@@ -84,6 +118,14 @@ class SnapshotGuardTests(unittest.TestCase):
     def test_unrelated_options_without_a_live_database_keep_their_policy(self):
         with patch.object(engine, "_offbox_mode", return_value="off"):
             self.assertEqual(self.decide("other-tool --card x --ask q1 --db /tmp/fixture.sqlite")["decision"], "allow")
+
+    def test_non_snapshot_legacy_commands_keep_their_policy(self):
+        legacy = self.home / ".t3/userdata/state.sqlite"
+        for command in ("cat " + shlex.quote(str(legacy)), "stat " + shlex.quote(str(legacy))):
+            with self.subTest(command=command), patch.object(engine, "_offbox_mode", return_value="off"):
+                result = self.decide(command)
+                self.assertEqual(result["decision"], "allow")
+                self.assertEqual(result["context"]["rule"], "no-policy")
 
 
 if __name__ == "__main__":

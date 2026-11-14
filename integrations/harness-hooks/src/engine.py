@@ -813,7 +813,7 @@ def decide(event, harness):
                               "context": {"rule": "live-database-snapshot"}}
                     return result
                 hit, cause = statev2_guard.classify_detail(command, command_cwd)
-                if not hit and statev2_guard.LIVE.search(command) and snapshot_guard.snapshot_attempt(command):
+                if not hit and snapshot_guard.snapshot_attempt(command, command_cwd):
                     hit, cause = "live-database-snapshot", "Snapshot requests require the exact installed, pinned helper invocation."
             except Exception as error:
                 error_type = type(error).__name__
