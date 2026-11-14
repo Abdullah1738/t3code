@@ -52,6 +52,7 @@ const compactWait = (card: KanbanCard, byId: ReadonlyMap<string, KanbanCard>) =>
       on: wait.on,
       pr: wait.pr,
       card: wait.card,
+      ...(wait.cardTarget === undefined ? {} : { cardTarget: wait.cardTarget }),
       script: wait.script,
       note: short(wait.note),
       status: wait.status,
