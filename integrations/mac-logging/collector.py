@@ -10,6 +10,7 @@ import plistlib
 import tempfile
 from pathlib import Path
 import re
+import signal
 import subprocess
 import time
 from jobs import (read_state, save_state, state_path, directory_inventory,
@@ -24,6 +25,9 @@ REPORT_DIRS = [Path('/Library/Logs/DiagnosticReports'), Path('/Library/Logs/Diag
 # launchd's hourly interval also accrues runtime, sleep and coalescing drift.
 UNIFIED_WINDOW_S = 5400
 UNIFIED_CHUNK_S = 900
+UNIFIED_FIRST_CHUNK_S = 60
+UNIFIED_CALL_S = 60
+UNIFIED_TARGET_S = 10
 UNIFIED_BUDGET_S = 135
 
 
@@ -108,7 +112,42 @@ def reports(root, since, until, deadline=None, completed=None, stats=None):
     return counts
 
 
-def unified(since, until, run=subprocess.run, timeout=60):
+def unified_command(command, capture_output=True, text=True, timeout=60, env=None):
+    # subprocess.run kills only its direct child and can wait indefinitely on
+    # inherited pipes or an unkillable process. Reserve time to reap the group.
+    end = time.monotonic()+min(UNIFIED_CALL_S, timeout)
+    reserve = min(1, max(0, timeout)/10)
+    child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=text, env=env, start_new_session=True)
+    try:
+        output, error = child.communicate(timeout=max(0, end-time.monotonic()-reserve))
+        return subprocess.CompletedProcess(command, child.returncode, output, error)
+    except BaseException:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            child.wait(timeout=max(0, end-time.monotonic()))
+        except subprocess.TimeoutExpired:
+            # A kernel-stuck process cannot be reaped on demand. Never let its
+            # wait or inherited pipes hold the rest of the collector hostage.
+            pass
+        finally:
+            for stream in (child.stdout, child.stderr):
+                if stream is not None:
+                    stream.close()
+        raise
+
+
+def next_unified_chunk(size, elapsed):
+    # Grow only after success, at most doubling. Slow successful reads reduce
+    # the next request instead of spending the whole share on another big one.
+    return min(UNIFIED_CHUNK_S, size*2,
+               max(UNIFIED_FIRST_CHUNK_S, size*UNIFIED_TARGET_S/max(.001, elapsed)))
+
+
+def unified(since, until, run=unified_command, timeout=60):
     if timeout <= 0:
         raise SourceFailure('timeout', 'collector budget exhausted')
     since = max(since, until-UNIFIED_WINDOW_S)
@@ -117,7 +156,7 @@ def unified(since, until, run=subprocess.run, timeout=60):
     result = run(['/usr/bin/log', 'show', '--style', 'json', '--timezone', 'UTC',
                   '--start', stamp(since), '--end', stamp(until+1), '--predicate',
                   'eventMessage CONTAINS "=== system boot" OR (process == "kernel" AND eventMessage CONTAINS "PMU") OR (process == "watchdogd" AND eventMessage CONTAINS "unresponsive")'],
-                 capture_output=True, text=True, timeout=min(60, timeout),
+                 capture_output=True, text=True, timeout=min(UNIFIED_CALL_S, timeout),
                  env={**os.environ, 'LC_ALL': 'C'})
     if result.returncode:
         message = stderr_line(getattr(result, 'stderr', ''))
@@ -204,25 +243,64 @@ def collect(now=None, roots=None, log_reader=None, deadline=None):
                     skippedS=max(0, now-UNIFIED_WINDOW_S-cursor))
 
     window = state.get('unifiedRetry') or fresh_window(since)
+    # Frozen retries must obey the same moving ceiling as fresh windows.
+    # Otherwise one slow historical suffix can pin the reader forever.
+    floor = now-UNIFIED_WINDOW_S
+    if window['windowStart'] < floor:
+        skipped_before = window['skippedS']
+        window = dict(windowStart=floor, windowEnd=max(floor, window['windowEnd']),
+                      skippedS=skipped_before+floor-window['windowStart'])
     unified_deadline = min(deadline, source_started+UNIFIED_BUDGET_S)
     skipped = 0
+    stop_reason = 'done'
+    chunk_size = UNIFIED_FIRST_CHUNK_S
     def lag():
         return max(0, now+time.monotonic()-started-state.get('unified', since))
 
     try:
         while True:
             window = dict(window, windowS=window['windowEnd']-window['windowStart'])
-            window.update(chunks=math.ceil(max(0, window['windowS'])/UNIFIED_CHUNK_S), chunksDone=0)
+            window.update(chunks=math.ceil(max(0, window['windowS'])/chunk_size), chunksDone=0,
+                          skipReason='lag_ceiling' if window['skippedS'] else None)
             cursor = window['windowStart']
+            if cursor > state.get('unified', since):
+                emit('crashes', 'event', 'crash.unified.skip', ok=True,
+                     props=dict(windowStart=state.get('unified', since), windowEnd=cursor,
+                                skippedS=cursor-state.get('unified', since), reason='lag_ceiling'))
+                state['unified'] = cursor
+                state['unifiedRetry'] = dict(windowStart=cursor, windowEnd=window['windowEnd'],
+                                             skippedS=window['skippedS'])
+                save_state('crashes', state)
             while cursor < window['windowEnd']:
-                end = min(cursor+UNIFIED_CHUNK_S, window['windowEnd'])
-                remaining = min(60, unified_deadline-time.monotonic())
+                end = min(cursor+chunk_size, window['windowEnd'])
+                window['chunks'] = window['chunksDone']+math.ceil((window['windowEnd']-cursor)/chunk_size)
+                remaining = min(UNIFIED_CALL_S, unified_deadline-time.monotonic())
                 if remaining <= 0:
+                    stop_reason = 'deadline'
                     raise SourceFailure('timeout', 'unified log budget exhausted')
-                if log_reader is None:
-                    observed = deadline_call(unified_deadline, unified, cursor, end, timeout=remaining)
-                else:
-                    observed = deadline_call(unified_deadline, log_reader, cursor, end)
+                chunk_started = time.monotonic()
+                chunk = dict(chunk=window['chunksDone']+1, windowStart=cursor,
+                             windowEnd=end, windowS=end-cursor, timeoutS=remaining)
+                emit('crashes', 'event', 'crash.unified.chunk', ok=None,
+                     props=dict(chunk, outcome='start', elapsedMs=0))
+                try:
+                    if log_reader is None:
+                        observed = deadline_call(unified_deadline, unified, cursor, end, timeout=remaining)
+                    else:
+                        observed = deadline_call(unified_deadline, log_reader, cursor, end)
+                except Exception as exc:
+                    timed_out = isinstance(exc, subprocess.TimeoutExpired) or (
+                        isinstance(exc, SourceFailure) and exc.failure == 'timeout')
+                    stop_reason = ('deadline' if time.monotonic() >= unified_deadline else 'timeout') if timed_out else (
+                        exc.failure if isinstance(exc, SourceFailure) else 'error')
+                    emit('crashes', 'error', 'crash.unified.chunk', ok=False,
+                         props=dict(chunk, outcome=stop_reason,
+                                    elapsedMs=(time.monotonic()-chunk_started)*1000))
+                    raise
+                elapsed = time.monotonic()-chunk_started
+                emit('crashes', 'event', 'crash.unified.chunk', ok=True,
+                     props=dict(chunk, outcome='done', elapsedMs=elapsed*1000))
+                chunk_size = next_unified_chunk(end-cursor, elapsed)
                 counts.update(observed)
                 crash_observations(observed)
                 cursor = end
@@ -237,7 +315,7 @@ def collect(now=None, roots=None, log_reader=None, deadline=None):
             state.pop('unifiedRetry', None)
             emit('crashes', 'event', 'crash.source', ok=True,
                  props=dict(source='unified', elapsedMs=(time.monotonic()-source_started)*1000,
-                            lagS=lag(), **window))
+                            lagS=lag(), stopReason='done', **window))
             skipped += window['skippedS']
             # Persist the reported gap's retirement before a fresh command can
             # be interrupted; otherwise the next run would report it again.
@@ -252,10 +330,11 @@ def collect(now=None, roots=None, log_reader=None, deadline=None):
         state['unifiedRetry'] = dict(windowStart=cursor, windowEnd=window['windowEnd'],
                                      skippedS=window['skippedS'])
         source_error('crashes', 'crash.source', 'unified', source_started, exc,
-                     dict(window, lagS=lag()))
+                     dict(window, lagS=lag(), stopReason=stop_reason))
         skipped += window['skippedS']
         state['unifiedRetry']['skippedS'] = 0
-    window = dict(window, skippedS=skipped, lagS=lag())
+    window = dict(window, skippedS=skipped, lagS=lag(), stopReason=stop_reason,
+                  skipReason='lag_ceiling' if skipped else None)
     emit('crashes', 'error' if errors else 'perf', 'crash.collect', ok=not errors,
          duration_ms=(time.monotonic()-started)*1000,
          props={'count': sum(counts.values()), 'sourceErrors': errors, **window},

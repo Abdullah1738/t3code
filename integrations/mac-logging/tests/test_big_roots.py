@@ -172,7 +172,7 @@ class BigRootTests(unittest.TestCase):
             windows.append((a,b))
             raise subprocess.TimeoutExpired('log',60)
         self.assertFalse(collector.collect(now, [], fail))
-        self.assertEqual(jobs.read_state('crashes')['unified'], now-86400)
+        self.assertEqual(jobs.read_state('crashes')['unified'], now-5400)
         row = self.rows('crash.source')[-1]
         self.assertEqual(row['props']['windowS'], 5400)
         self.assertEqual(row['props']['skippedS'], 81000)
@@ -181,9 +181,10 @@ class BigRootTests(unittest.TestCase):
             windows.append((a,b))
             return {}
         self.assertTrue(collector.collect(now+7200, [], success))
-        self.assertEqual(windows[0], windows[1])
+        self.assertEqual(windows[1][0], now+1800)
+        self.assertEqual(self.rows('crash.unified.skip')[-1]['props']['skippedS'], 7200)
         self.assertEqual(jobs.read_state('crashes')['unified'], now+7200)
-        self.assertEqual(self.rows('crash.source')[-1]['props']['skippedS'],1800)
+        self.assertEqual(sum(r['props']['skippedS'] for r in self.rows('crash.source')[1:]),7200)
         self.assertTrue(collector.collect(now+10800, [], success))
         self.assertEqual(jobs.read_state('crashes')['unified'], now+10800)
         row = self.rows('crash.source')[-1]

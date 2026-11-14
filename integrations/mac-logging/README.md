@@ -9,9 +9,16 @@ lines with an explicit `ok`; `errorRate` is the share of error-kind lines.
 The collector reads DiagnosticReports and a filtered `log show`, retaining a
 separate cursor per source so an unavailable source is retried. Its first run
 looks back one hour. Report cursors cover since their last successful read.
-Unified-log queries cover at most the most recent hour; skipped older time is
-explicit in `skippedS`. Queries run in 15-minute chunks, checkpointing the cursor
-after each completed chunk. A failed query retains the unfinished suffix for retry.
+Unified-log windows cover at most the most recent 90 minutes, including retries;
+older time is skipped with exact `skippedS` and reason `lag_ceiling`. Queries start
+with 60 seconds of log and grow after successes, targeting 10 seconds per call
+and at most 15 minutes of log. Each completed chunk checkpoints its cursor. A
+failed query retains the unfinished suffix, then continues into a fresh window
+when that suffix finishes. Each command has a 60-second cap including bounded
+process-group cleanup; the unified source shares a 135-second budget.
+`crash.unified.chunk` records requested bounds, elapsed time and outcome;
+`crash.unified.skip` records ceiling skips before advancing the cursor.
+`crash.collect.stopReason` distinguishes completion, deadline and command failure.
 Boot observations include `observedAt` (Unix seconds) for the boot marker; duplicate
 markers at the same instant count once. Other observations remain aggregated.
 It rolls up yesterday on the first hourly run after 00:05 UTC. It writes only
@@ -228,24 +235,19 @@ scan coverage cannot become a reported grower.
 `disk.sample` reports success when its own measurements succeed; cached inventory
 errors or staleness are metadata rather than sample failures. Its `sourceErrors`
 still counts failures of its own free-space and existing-file stat measurements.
-Confirmed missing optional database/WAL files retain zero sizes. The filtered unified-log query
-has a one-hour maximum window, split into contiguous 15-minute chunks under a
-shared 135 s budget, allowing four chunks at the observed 30 s cost plus headroom.
-Each command has at most 60 s, shortened to that shared
-budget and the collector's remaining absolute budget. Its source event/error and
-`crash.collect` record `windowStart` and `windowEnd` (Unix seconds), `windowS`,
-`skippedS` (older time omitted by the cap), `chunks` (planned for this attempt),
-and `chunksDone`. Each completed chunk emits its observations and saves its cursor
-before the next command. The next chunk excludes that cursor's instant, including
-when log's second rounding/end padding returns overlapping rows. Missing or invalid
-event timestamps fail the chunk rather than risk attributing events twice.
-On failure, `unifiedRetry` retains the exact unfinished suffix until it succeeds;
-completed chunks are not queried again. An old one-hour retry is split the same
-way. Chunk checkpoints retain unreported `skippedS`, including after the final
-chunk, so interruption before the source result cannot hide a coverage gap.
-Once the source result reports the gap, a retained suffix clears that metadata.
-After a delayed retry completes, the next run applies the recent-hour cap
-again and reports any omitted older time in `skippedS`.
+Confirmed missing optional database/WAL files retain zero sizes. Unified source
+results and `crash.collect` retain `windowStart`, `windowEnd` (Unix seconds),
+`windowS`, `skippedS`, `chunks` and `chunksDone`. With adaptive sizing, `chunks`
+estimates the total using the current chunk size; on completion it equals
+`chunksDone`. Chunk bounds exclude the previous cursor even when log's second
+rounding/end padding returns overlapping rows. Missing or invalid event
+timestamps fail the chunk rather than risk attributing events twice.
+Retry checkpoints retain unreported `skippedS`, including after the final chunk,
+so interruption before the source result cannot hide a coverage gap. Once the
+source result reports the gap, a retained suffix clears that metadata. Retries
+older than the moving 90-minute ceiling log the exact additional skip before
+checkpointing that ceiling; a retry inside it preserves its frozen end. Finishing
+a retry continues into a fresh window within the same run's remaining budget.
 
 Report sources have independent checkpoints. Each attempt allows up to 10 s per
 source, capped by the collector's absolute deadline. Directory enumeration,
