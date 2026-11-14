@@ -3060,7 +3060,7 @@ const make = Effect.gen(function* () {
     );
   });
 
-  const releaseStalled = (card: KanbanCard, at: string): KanbanCard => ({
+  const releaseToQueue = (card: KanbanCard, at: string): KanbanCard => ({
     ...release(card),
     stage:
       card.stage === "working" ? "todo" : card.stage === "in_review" ? "needs_review" : card.stage,
@@ -8860,7 +8860,7 @@ const make = Effect.gen(function* () {
           continue;
         const by: KanbanActor = { _tag: "system", component: "dispatcher" };
         const reason = `Run failed: ${startTimeout.reason}`;
-        const next = releaseStalled(
+        const next = releaseToQueue(
           { ...Retries.withoutRetries(current), stalled: { reason, by, at } },
           at,
         );
@@ -10141,7 +10141,7 @@ const make = Effect.gen(function* () {
                       }),
                     ),
                   );
-                  const next = releaseStalled(current, yield* nowIso);
+                  const next = releaseToQueue(current, yield* nowIso);
                   // Attribution also controls whether the old reviewer may submit a late verdict.
                   yield* logEvent(next, current.stalled.by, "flagged", {
                     fromStage: current.stage,
@@ -10313,7 +10313,7 @@ const make = Effect.gen(function* () {
                       ? "Stale queued runs on the thread"
                       : "Run went silent twice";
                     yield* endReviewLink(current.reviewThreadId, at);
-                    const next = releaseStalled(
+                    const next = releaseToQueue(
                       { ...current, stalled: { reason, by: system, at } },
                       at,
                     );
@@ -14105,7 +14105,7 @@ const make = Effect.gen(function* () {
         };
         // A stalled card holds no slot, whoever flagged it.
         const next: KanbanCard =
-          reason !== null && card.activeThreadId !== null ? releaseStalled(flagged, at) : flagged;
+          reason !== null && card.activeThreadId !== null ? releaseToQueue(flagged, at) : flagged;
         yield* logEvent(next, actor, "flagged", {
           fromStage: card.stage,
           toStage: next.stage,
@@ -14125,6 +14125,17 @@ const make = Effect.gen(function* () {
         return next;
       }),
     );
+
+  const activeWaitThreadRunning = Effect.fn("KanbanService.activeWaitThreadRunning")(function* (
+    card: KanbanCard,
+    io: typeof threadIo,
+  ) {
+    if (card.activeThreadId === null) return false;
+    const view = yield* io.view(card.activeThreadId);
+    // A missing/failed read cannot prove the owner is idle. PR watches alone may park.
+    if (view?.state !== "idle" || view.backgroundWork > 0) return true;
+    return (yield* io.queuedRuns(card.activeThreadId)).length > 0;
+  });
 
   const waitCard: KanbanServiceShape["waitCard"] = (cardId, input, actor) =>
     guard(
@@ -14213,12 +14224,19 @@ const make = Effect.gen(function* () {
               : null,
           args: input.args ?? null,
         };
-        const check = Waits.checkWait(card, request, actor, yield* nowMillis);
+        const check = Waits.checkWait(
+          card,
+          request,
+          actor,
+          yield* nowMillis,
+          Waits.WAITS_ENGINE_WIRED,
+          yield* activeWaitThreadRunning(card, threads),
+        );
         if (!check.ok) return yield* failWith(check.code, check.reason);
         const wait = Waits.newWait(request, actor, at);
         // A new wait is a decision: a hold for the evaluator from the last one ends here.
         const next: KanbanCard = {
-          ...kanbanWithoutDeciding(card),
+          ...kanbanWithoutDeciding(card.activeThreadId === null ? card : releaseToQueue(card, at)),
           wait,
           stalled: null,
           updatedAt: at,
@@ -14227,12 +14245,21 @@ const make = Effect.gen(function* () {
           target === null
             ? undefined
             : new Map([[target.id as string, yield* waitTargetFacts(target, card.boardId)]]);
+        // The preliminary read releases the board gate. Re-read without replay or
+        // releasing it before the first write, so a newly live turn keeps its card.
+        if (yield* activeWaitThreadRunning(card, threadIo)) {
+          const live = Waits.checkWait(card, request, actor, yield* nowMillis);
+          if (!live.ok) return yield* failWith(live.code, live.reason);
+        }
         yield* logEvent(next, actor, Waits.waitEventKind("wait_set"), {
+          fromStage: card.stage === next.stage ? null : card.stage,
+          toStage: card.stage === next.stage ? null : next.stage,
           body:
             Waits.waitSetBody(wait, known) +
             (card.stalled !== null ? ` (replaces the stalled flag: ${card.stalled.reason})` : ""),
         });
         yield* saveCard(next);
+        if (card.activeThreadId !== null) yield* kick;
         return next;
       }),
     );

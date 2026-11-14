@@ -1203,6 +1203,7 @@ export function checkWait(
   actor: KanbanActor,
   nowMs: number,
   wired: boolean = WAITS_ENGINE_WIRED,
+  activeThreadRunning = true,
 ): WaitCheck {
   const n = `card #${card.number}`;
   if (card.settledAt !== null) return denied(`${n} is settled`);
@@ -1220,9 +1221,11 @@ export function checkWait(
           : "This card is yours and you are running, so the board can't park it. Ask your board evaluator to set this wait (card_ask with to: evaluator, giving on, until or target, and the note), then end your turn; the evaluator sets it once your run has ended.",
       );
     }
-    return denied(
-      `${n} has a running thread, so it isn't waiting. Set the wait once the thread has handed the card on`,
-    );
+    if (activeThreadRunning) {
+      return denied(
+        `${n} has a running thread, so it isn't waiting. Set the wait once the thread has handed the card on`,
+      );
+    }
   }
   // A wait takes over a stalled flag, but only one its setter could clear (the card_flag rule).
   if (!mayClearFlag(card, actor)) {

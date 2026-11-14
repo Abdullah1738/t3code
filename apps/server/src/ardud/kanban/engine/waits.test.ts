@@ -1324,8 +1324,9 @@ describe("checkWait", () => {
     req: WaitRequest,
     actor: KanbanActor = evaluator,
     wired = false,
+    activeThreadRunning = true,
   ) => {
-    const check = checkWait(target, req, actor, NOW, wired);
+    const check = checkWait(target, req, actor, NOW, wired, activeThreadRunning);
     return check.ok ? "ok" : `${check.code}: ${check.reason}`;
   };
 
@@ -1394,6 +1395,27 @@ describe("checkWait", () => {
       "denied: card #1 has a running thread, so it isn't waiting. Set the wait once the thread has handed the card on",
     );
   });
+
+  it("keeps the own-worker refusal even when the supplied thread view lags its live tool call", () => {
+    expect(reason(running, request({ on: "time", pr: null }), worker, true, false)).toBe(
+      "denied: This card is yours and you are running, so the board can't park it. Ask your board evaluator to set this wait (card_ask with to: evaluator, giving on, until or target, and the note), then end your turn; the evaluator sets it once your run has ended.",
+    );
+  });
+
+  it.each(["time", "ci", "card"] as const)(
+    "accepts an evaluator's %s wait when the owning worker is idle",
+    (on) => {
+      expect(
+        reason(
+          running,
+          request({ on, until: "2026-11-11T12:00:00.000Z", card: card(2) }),
+          evaluator,
+          true,
+          false,
+        ),
+      ).toBe("ok");
+    },
+  );
 
   it("still accepts the worker's wait once its card has no running thread", () => {
     expect(reason(card(1, { workThreadId: worker.threadId }), request({ on: "ci" }), worker)).toBe(
