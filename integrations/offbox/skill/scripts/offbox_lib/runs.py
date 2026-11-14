@@ -1382,7 +1382,13 @@ class Runner:
         self.a, self.me = a, me
         self.run_id = os.environ.get(BACKGROUND_RUN_ENV) or new_id("run")
         self.root = Path(me["repo_root"])
-        self.cwd = Path(os.getcwd()).resolve()
+        recorded_cwd = None
+        if os.environ.get(BACKGROUND_RUN_ENV):
+            with contextlib.closing(db()) as con:
+                row = con.execute('SELECT local_cwd,cwd FROM runs WHERE run_id=?', (self.run_id,)).fetchone()
+                if row:
+                    recorded_cwd = row['local_cwd'] or row['cwd']
+        self.cwd = Path(recorded_cwd or os.getcwd()).resolve()
         try:
             self.rel = str(self.cwd.relative_to(self.root))
         except ValueError:
@@ -2762,9 +2768,14 @@ def background_client(a, me: dict, ready=None, accept=None, signal_mask=None, so
             if accepted not in (b'1', b''):
                 finish(rid, EXIT_LOCAL, 'local_error')
                 return EXIT_LOCAL
+        rn = Runner(a, me)
+        if source_failure is None:
+            try:
+                rn.check_source('queued')
+            except common.SourceGone as error:
+                source_failure = (error, 0)
         if source_failure is not None:
             error, queue_s = source_failure
-            rn = Runner(a, me)
             rn.queue_s = queue_s
             rn.source_gone(error)
             say(str(error))

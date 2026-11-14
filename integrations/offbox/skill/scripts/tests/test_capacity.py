@@ -55,7 +55,7 @@ class Isolated(unittest.TestCase):
         self.tg = self.stack.enter_context(patch('offbox_lib.identity.telegram', return_value=True))
         self.stack.enter_context(patch.object(spend, 'telegram', self.tg))
         self.stack.enter_context(patch.object(fallback, 'telegram', self.tg))
-        source = root / 'repo'
+        source = root / 'isolated-source'
         source.mkdir()
         self.me = dict(owner='worker', repo_key='repo', repo_root=str(source), session='s',thread='t')
 
@@ -193,7 +193,8 @@ class PoolTests(Isolated):
             row = pool.acquire(self.me, run_id='mine')
             try:
                 self.assertEqual(row['box_id'],'idle')
-                self.assertEqual(row['remote_dir'],'w/repo-'+__import__('hashlib').sha1(self.me['repo_root'].encode()).hexdigest()[:6])
+                from offbox_lib.identity import remote_dir_for
+                self.assertEqual(row['remote_dir'],remote_dir_for(self.me['repo_root']))
                 self.assertEqual(self.con.execute("SELECT box_id FROM runs WHERE run_id='mine'").fetchone()[0],'idle')
                 self.assertEqual(lease.find_lease(self.con,'worker',self.me['repo_root'])['box_id'],'idle')
                 new.assert_not_called()

@@ -214,6 +214,60 @@ class SourceGoneTests(Isolated):
                 self.infra.assert_not_called()
                 self.failures.assert_not_called()
 
+    def test_deleted_cwd_between_ready_and_accept(self):
+        a = cli.parse_args(['run', '--bg', '--', 'true'])
+        with contextlib.chdir(self.cwd):
+            rn = runs.Runner(a, self.me)
+            rn.register_pending()
+        ready_r, ready_w = os.pipe()
+        accept_r, accept_w = os.pipe()
+        original_read = os.read
+        def accept(fd, count):
+            if fd == accept_r:
+                shutil.rmtree(self.cwd)
+            return original_read(fd, count)
+        try:
+            os.write(accept_w, b'1')
+            payload = dict(args=vars(a), me=self.me, backend=common.backend(),
+                           ready_fd=ready_w, accept_fd=accept_r, signal_mask=[])
+            with patch.dict(os.environ, {}, clear=False), contextlib.chdir(self.root), \
+                    patch.object(runs.os, 'read', side_effect=accept), patch.object(pool, 'acquire') as acquire:
+                self.assertEqual(runs.background_queue(rn.run_id, payload), 2)
+            acquire.assert_not_called()
+        finally:
+            for fd in (ready_r, ready_w, accept_r, accept_w):
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+        row = self.con.execute('SELECT * FROM runs WHERE run_id=?', (rn.run_id,)).fetchone()
+        self.assertEqual((row['status'], row['exit_code']), ('source_gone', 2))
+        self.assertIn(str(self.cwd), row['error'])
+        self.assertGreater(Path(row['log_path']).stat().st_size, 0)
+        self.infra.assert_not_called()
+
+    def test_archived_resume_retry_source_error_is_not_wrapped(self):
+        self.box('old', state='stopped', member=True)
+        def bring_up(box, *, on_state, **kwargs):
+            self.clock.t += lease.RESUME_STUCK_S + 1
+            shutil.rmtree(self.root)
+            on_state({'state': 'archived'})
+        def reuse(con, row, *args, **kwargs):
+            return lease._bring_up_resumed(con, 'old', None, False,
+                                          request_resume=lambda **kw: allocation.check_source())
+        a = cli.parse_args(['run', '--', 'true'])
+        a.steps = []
+        with contextlib.chdir(self.cwd), patch.object(lease, 'now', self.clock.module.time), \
+                patch.object(lease, '_bring_up', side_effect=bring_up), patch.object(lease, '_reuse', side_effect=reuse):
+            self.assertEqual(cli._run_with_retries(a, self.me), 2)
+        row = self.con.execute("SELECT * FROM runs WHERE cmd IS NOT NULL").fetchone()
+        self.assertEqual((row['status'], row['exit_code']), ('source_gone', 2))
+        self.assertGreater(Path(row['log_path']).stat().st_size, 0)
+        self.assertIn('checkpoint=queued', self.con.execute("SELECT detail FROM events WHERE kind='run_source_gone'").fetchone()[0])
+        self.assertEqual(self.con.execute('SELECT COUNT(*) FROM pool_waiters').fetchone()[0], 0)
+        with common.file_lock('box-old', timeout=0):
+            pass
+        self.infra.assert_not_called()
+        self.failures.assert_not_called()
+
     def test_deleted_process_cwd_even_if_path_was_recreated(self):
         with contextlib.chdir(self.cwd):
             self.cwd.rmdir()

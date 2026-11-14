@@ -10,7 +10,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import api, capacity, ssh_sync
+from . import api, capacity, common, ssh_sync
 from .common import (SIZES, BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_CAP, EXIT_INFRA, RUN_TTL_S, TEMPLATES_DIR, TOO_BIG_NOTE, OffboxError, db, event,
                      SshHostKeyMismatch, file_lock, iso, kv_get, kv_set, log, mine, new_id, now, read_json, say, token_owner, write)
 from .identity import remote_dir_for
@@ -1254,6 +1254,8 @@ def _bring_up_resumed(con, box_id, confirmed, retried, request_resume=None, *, s
     except (api.SupplyOut, capacity.CapacityError, ArchivingSkip, ResumeProvisionStalled, BoxNotReady, SshHostKeyMismatch):
         raise
     except OffboxError as e:
+        if isinstance(e, common.SourceGone):
+            raise
         raise ResumeUnresolved(f"{box_id} was resumed but did not become ready; nothing ran: {e}", e) from e
 
 
