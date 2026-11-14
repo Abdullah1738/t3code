@@ -356,8 +356,12 @@ it.effect.each([...SavedReply.TOOLS])("%s interrupted before commit is not saved
     {
       assert.isTrue(result.isError);
       assert.strictEqual(data.saved, false);
-      assert.include(String(data.message), "Not saved");
-      assert.include(String(data.message), "Safe to retry");
+      if (tool === "report_bug")
+        assert.include(String(data.message), "retry with the same arguments");
+      else {
+        assert.include(String(data.message), "Not saved");
+        assert.include(String(data.message), "Safe to retry");
+      }
     }
     yield* Deferred.succeed(release, undefined);
     yield* TestClock.adjust(BoardLocks.WRITE_WAIT_MS);
@@ -391,11 +395,15 @@ it.effect.each([...SavedReply.TOOLS])(
       {
         assert.isTrue(result.isError);
         assert.isNull(data.saved);
-        assert.include(String(data.message), "may have been saved");
-        assert.include(
-          String(data.message),
-          tool === "discussion_post" ? "discussion_read" : "card_get",
-        );
+        if (tool === "report_bug")
+          assert.include(String(data.message), "Retry with the same arguments");
+        else {
+          assert.include(String(data.message), "may have been saved");
+          assert.include(
+            String(data.message),
+            tool === "discussion_post" ? "discussion_read" : "card_get",
+          );
+        }
       }
     }),
 );
@@ -448,6 +456,27 @@ it.effect("a saved receipt survives slow encoding as a non-error reply", () =>
       assert.strictEqual(data.threadId, threadId);
       assert.include(String(data.message), "Saved");
     }
+  }),
+);
+
+it.effect("report_bug returns its saved evaluator queue after a reply failure", () =>
+  Effect.gen(function* () {
+    const result = callResult(
+      yield* SavedReply.protect(
+        SavedWrite.record({ kind: "evaluatorQueue", key: "report-1480", queueId: 1480 }).pipe(
+          Effect.andThen(Effect.die(new BoardLocks.BoardStateChanged(true))),
+        ),
+        "report_bug",
+      ),
+    );
+    assert.isFalse(result.isError);
+    assert.deepInclude(result.structuredContent, {
+      saved: true,
+      queued: true,
+      queueId: 1480,
+      evaluatorKey: "report-1480",
+    });
+    assert.notInclude(JSON.stringify(result), BoardLocks.MAY_HAVE_APPLIED);
   }),
 );
 

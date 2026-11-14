@@ -59,7 +59,8 @@ export const linkReply = Effect.fnUntraced(function* () {
 export type Saved =
   | { readonly kind: "card"; readonly card: KanbanCard }
   | { readonly kind: "message"; readonly message: KanbanMessage }
-  | { readonly kind: "evaluator"; readonly threadId: ThreadId };
+  | { readonly kind: "evaluator"; readonly threadId: ThreadId; readonly key?: string | undefined }
+  | { readonly kind: "evaluatorQueue"; readonly key: string; readonly queueId: number };
 
 export const observer = Context.Reference<(saved: Saved) => void>("KanbanSavedWrite", {
   defaultValue: () => () => {},
