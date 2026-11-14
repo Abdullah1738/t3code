@@ -984,6 +984,58 @@ describe("ledger pool activity", () => {
     expect(result.queueWait[pool]).toEqual([1, 2, 4]);
   });
 
+  it.each([
+    {
+      name: "set before the window",
+      at: before,
+      expiredAt: null,
+      movedAt: before,
+      expected: [0, 0, 0],
+    },
+    {
+      name: "set inside the window",
+      at: t("00:30"),
+      expiredAt: null,
+      movedAt: before,
+      expected: [0.5, 0, 0],
+    },
+    {
+      name: "expired inside the window",
+      at: before,
+      expiredAt: t("01:30"),
+      movedAt: before,
+      expected: [0, 0.5, 1],
+    },
+    {
+      name: "made stale by a move",
+      at: before,
+      expiredAt: null,
+      movedAt: t("01:00"),
+      expected: [0, 1, 1],
+    },
+  ])(
+    "queue wait respects a persisted wait $name without wait events",
+    ({ at, expiredAt, movedAt, expected }) => {
+      const result = run([slot(1, "take", "t1", before), slot(2, "take", "t2", before)], {
+        cards: [card("w", { movedAt, wait: { ...waitOn, at, expiredAt } })],
+      });
+      expect(result.queueWait[pool] ?? [0, 0, 0]).toEqual(expected);
+    },
+  );
+
+  it.each(["edited", "wait_set"] as const)("queue wait reads %s wait markers", (kind) => {
+    const cleared = kind === "edited" ? "edited" : "wait_cleared";
+    const result = run([slot(1, "take", "t1", before), slot(2, "take", "t2", before)], {
+      cards: [card("w"), card("flag")],
+      events: [
+        event("w", t("00:30"), kind, null, null, "Waiting for CI on app#12: ci"),
+        event("w", t("01:30"), cleared, null, null, "Wait ended: cleared by hand"),
+        event("flag", t("01:00"), "flagged", "todo", "todo", "Cleared"),
+      ],
+    });
+    expect(result.queueWait[pool]).toEqual([0.5, 1.5, 2]);
+  });
+
   it("counts weighted alternatives once only when every enabled route is full", () => {
     const other = Rules.poolKey(sonnet);
     const weighted = card("weighted", {

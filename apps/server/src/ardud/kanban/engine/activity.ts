@@ -361,10 +361,14 @@ const waitIntervals = (
     const mark = waitEventOf(event);
     return mark === null ? [] : [{ mark, at: time(event.at) }];
   });
-  const waitingAtStart =
-    marks.length > 0
-      ? marks[0]!.mark === "end"
-      : card.wait !== undefined && card.wait.expiredAt === null && card.wait.at < since;
+  if (marks.length === 0) {
+    if (card.wait === undefined) return [];
+    const from = Math.max(time(since), time(card.wait.at));
+    const moved = card.movedAt > card.wait.at ? time(card.movedAt) : time(until);
+    const to = Math.min(time(until), moved, time(card.wait.expiredAt ?? until));
+    return from < to ? [[from, to] as const] : [];
+  }
+  const waitingAtStart = marks[0]!.mark === "end";
   const waits: Array<readonly [number, number]> = [];
   let waitFrom: number | null = waitingAtStart ? time(since) : null;
   for (const { mark, at } of marks) {
@@ -520,7 +524,10 @@ const ledgerUsage = (
         continue;
       const last = flags.findLast((event) => time(event.at) <= from);
       const stalled =
-        last !== undefined ? isStall(last) : card.stalled !== null && time(card.stalled.at) <= from;
+        last !== undefined
+          ? isStall(last)
+          : (flags[0] !== undefined && isFlagCleared(flags[0])) ||
+            (card.stalled !== null && time(card.stalled.at) <= from);
       if (
         stalled ||
         waits.some(([a, b]) => a <= from && b > from) ||
