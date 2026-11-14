@@ -15,6 +15,9 @@ import sys
 import tempfile
 from functools import lru_cache
 
+# Keep iMessage class names in sync with spectrum-bridge/src/log-error.ts.
+_IMESSAGE_ERROR_NAMES = frozenset('Error TypeError RangeError ReferenceError SyntaxError URIError EvalError AggregateError IMessageError APIError FetchError HTTPError NetworkError ZodError AbortError TimeoutError SystemError SQLiteError SqliteError DOMException JudgeError TransportError PublishError CliError SttError SecretError ShareError HttpError ApiError ControlError LineError SendblueError ValidationError UnknownError'.split())
+
 CAP_BYTES = 50 * 1024 * 1024
 HOOKS_CAP_BYTES = 35 * 1024 * 1024
 HOOK_SAMPLE_RATE = 128
@@ -27,7 +30,8 @@ _FIELDS = {'harness', 'guard', 'decision', 'rule', 'firstWord', 'commandLength',
            'filesChanged', 'driftFound', 'differingCount', 'platform', 'billedMinutes',
            'exitCode', 'failingStep', 'count', 'dryRun', 'toolCount', 'operation', 'status',
            'cwdClass', 'matchedRoot', 'argv0Class', 'repeatCount', 'threadIdSource',
-           'method', 'toolName', 'load1', 'load5', 'load15', 'sampleRate'}
+           'method', 'toolName', 'load1', 'load5', 'load15', 'sampleRate',
+           'httpMethod', 'ttfbMs', 'reason', 'identity_source'}
 _IDS = {'sessionId', 'threadId', 'nativeAgentId', 'cardNumber', 'serverId', 'home', 'sampleId'}
 _WORDS = set('git rg grep find ls cat cp mv rm python python3 node bun npm pnpm yarn vp go cargo rustc make docker offbox bash sh zsh curl sqlite3 terraform aws rcsim runcloud printf echo env sudo'.split())
 
@@ -213,7 +217,9 @@ def _metadata(values, keys):
             continue
         if type(value) is bool or type(value) in (int, float) and math.isfinite(value):
             result[key] = value
-        elif isinstance(value, str) and (re.fullmatch(r"[A-Za-z/]{1,80}", value) if key == 'method'
+        elif key == 'reason' and isinstance(value, str):
+            result[key] = value[:120]
+        elif isinstance(value, str) and (re.fullmatch(r"[A-Za-z/:]{1,80}", value) if key == 'method'
                                        else (_ID_VALUE if keys is _IDS else _LABEL).fullmatch(value)):
             result[key] = value
     return result
@@ -275,10 +281,12 @@ def emit(component, kind, name, *, board='agent-tools', duration_ms=None, ok=Non
         pass
 
 
-def hook(harness, guard, decision, rule, duration_ms, command=None, error_tag=None, ids=None, *, cwd=None, matched=None):
+def hook(harness, guard, decision, rule, duration_ms, command=None, error_tag=None, ids=None, *, cwd=None, matched=None, identity_source=None):
     try:
         identity, source = hook_ids(harness, ids)
         command_fields = command_props(command)
+        if isinstance(identity_source, str) and identity_source in {'cache', 'control', 'negative-cache'}:
+            command_fields['identity_source'] = identity_source
         emit('hooks', 'error' if decision == 'denied' or error_tag else 'perf', 'hook.decision',
              duration_ms=duration_ms, ok=decision != 'denied' and not error_tag, ids=identity,
              props=hook_props({'harness': harness, 'guard': guard, 'decision': decision, 'rule': rule,
@@ -315,6 +323,19 @@ def read(board, day, kind=None, name=None):
         yield row
 
 
+_UUID = r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}'
+_ENCODED_ID = r"[A-Za-z0-9_.%~!*'()-]+"
+# Control requests can use an encoded idempotency key instead of a UUID.
+# Imports and MCP-created children also have stable, non-UUID IDs.
+_ROBOB_THREAD = re.compile(
+    rf'(?:{_UUID}|mcp:{_UUID}(?::fork)?|ardud-control:thread:{_ENCODED_ID}'
+    rf'|ardud-opencode-import:thread:ses_[A-Za-z0-9]+'
+    rf'|import:[A-Za-z0-9_.-]+:[A-Za-z0-9_.:%-]+'
+    rf'|thread:project:[A-Za-z0-9_.:%-]+:{_UUID}'
+    rf'|thread:mcp:{_ENCODED_ID}:{_ENCODED_ID}:[0-9]+'
+    rf'|thread:delegated-task:{_ENCODED_ID})\Z')
+
+
 def _hook_attempt(row):
     if row.get('name') != 'hook.decision':
         return None
@@ -322,13 +343,29 @@ def _hook_attempt(row):
     if not isinstance(props, dict) or not isinstance(ids, dict):
         return None
     thread, rule, ts = ids.get('threadId'), props.get('rule'), row.get('ts')
-    if not isinstance(thread, str) or not isinstance(rule, str) or thread.startswith('unknown:'):
+    if not isinstance(thread, str) or not isinstance(rule, str):
+        return None
+    decision = props.get('decision')
+    if 'decision' not in props and (row.get('kind') == 'error' or row.get('ok') is False):
+        decision = 'denied'
+    if decision not in ('denied', 'rewritten'):
         return None
     try:
         at = datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp() if isinstance(ts, str) else None
     except (ValueError, TypeError):
         at = None
-    return thread, rule, at
+    return thread, rule, decision, at
+
+
+def _hook_weight(row):
+    # Refusals normally have no sampling. Preserve unexpected estimates and
+    # label them, even on error rows; the general totals retain their old rules.
+    rate = row['props'].get('sampleRate')
+    return rate if type(rate) is int and 1 <= rate <= 2**53 - 1 else 1
+
+
+def _attributed_thread(thread):
+    return bool(thread.startswith('native:') and thread[7:] or _ROBOB_THREAD.fullmatch(thread))
 
 
 def _sample_rate(row):
@@ -338,23 +375,105 @@ def _sample_rate(row):
     return rate if row.get('kind') != 'error' and type(rate) is int and 1 <= rate <= 2**53 - 1 else 1
 
 
+_IMESSAGE_CALLS = {
+    ('GET', '/health'): 'health', ('GET', '/projects'): 'projects', ('GET', '/threads'): 'threads',
+    ('POST', '/threads'): 'createThread', ('GET', '/threads/:id'): 'thread', ('PATCH', '/threads/:id'): 'settle',
+    ('GET', '/threads/by-native/:id'): 'byNative', ('GET', '/threads/:id/messages'): 'messages',
+    ('GET', '/threads/:id/runs/:id/evidence'): 'runEvidence', ('POST', '/threads/:id/requests/:id/respond'): 'respond',
+    ('POST', '/attachments'): 'attachment', ('PUT', '/threads/:id/origin'): 'origin',
+    ('POST', '/threads/:id/send'): 'send', ('POST', '/threads/:id/interrupt'): 'interrupt',
+}
+
+
+def _imessage_call_name(row):
+    props = row.get('props') if isinstance(row.get('props'), dict) else {}
+    method, route = props.get('method'), props.get('route')
+    return _IMESSAGE_CALLS.get((method, route)) if isinstance(method, str) and isinstance(route, str) else None
+
+
+def _imessage_call_stats(row):
+    # Same fixed operation names and millisecond histogram format as spectrum-bridge/src/log-calls.ts.
+    if row.get('component') != 'robob' or row.get('name') != 'turn.robob_calls' or row.get('kind') != 'perf':
+        return {}
+    calls = row.get('calls')
+    if not isinstance(calls, dict):
+        return {}
+    result = {}
+    for name, stats in calls.items():
+        if name not in _IMESSAGE_CALLS.values() or not isinstance(stats, dict):
+            continue
+        oks, failures, histogram = stats.get('ok'), stats.get('failed'), stats.get('histogram')
+        if (type(oks) is not int or type(failures) is not int or oks < 0 or failures < 0
+                or not 1 <= oks + failures <= 10_000_000 or not isinstance(histogram, list) or len(histogram) > 100_000):
+            continue
+        values = [(pair[0], pair[1]) for pair in histogram if isinstance(pair, list) and len(pair) == 2
+                  and type(pair[0]) is int and 0 <= pair[0] <= 86_400_000
+                  and type(pair[1]) is int and 1 <= pair[1] <= 10_000_000]
+        if sum(count for _, count in values) == oks + failures:
+            result[name] = (oks, failures, values)
+    return result
+
+
+def _imessage_rollup_records(board, day):
+    def batch(row):
+        identity = row.get('ids')
+        value = identity.get('callBatchId') if isinstance(identity, dict) else None
+        return value if isinstance(value, str) else None
+    represented = set()
+    pending = []
+    for line, raw in _read_records(board, day):
+        row = {key: value for key, value in raw.items() if not key.startswith('_rollup_')}
+        calls = _imessage_call_stats(row)
+        if calls:
+            for name, (oks, failed, histogram) in calls.items():
+                if batch(row) is not None:
+                    represented.add((batch(row), name))
+                yield line, {'ts': row.get('ts'), 'ids': row.get('ids'), 'component': 'robob', 'kind': 'perf',
+                             'name': 'turn.robob_call', '_rollup_count': oks + failed,
+                             '_rollup_ok': oks, '_rollup_failed': failed, '_rollup_histogram': histogram, '_rollup_call': name}
+        elif row.get('name') == 'turn.robob_call' and row.get('kind') == 'perf':
+            pending.append((line, row))
+            yield line, {'_rollup_skip': True}
+        else:
+            yield line, row
+    # Count retained observations only after seeing the summaries in this same read.
+    for line, row in pending:
+        if (batch(row), _imessage_call_name(row)) not in represented:
+            yield line, {**row, '_rollup_deferred': True}
+
+
 def rollup(board, day, top_n=20):
     from collections import Counter, defaultdict
     counts_name, counts_kind, tags = Counter(), Counter(), Counter()
     samples, references, durations = {}, {}, defaultdict(list)
+    order_errors, order_polls = {}, defaultdict(list)
+    component_totals, component_errors = Counter(), defaultdict(Counter)
+    component_samples, component_durations = defaultdict(dict), defaultdict(list)
     threads_by_rule, attempts = defaultdict(Counter), defaultdict(list)
+    thread_decisions, unattributed = defaultdict(Counter), defaultdict(Counter)
+    sampled_threads, sampled_attempts, sampled_unknown = set(), set(), set()
+    unrecognized = 0
+    unrecognized_sampled = False
     caps = []
     recorded = 0
+    last_record = None
+    component_stats = {}
     sampled = False
     day_start = datetime.strptime(day, '%Y-%m-%d').replace(tzinfo=timezone.utc)
     start = day_start.timestamp()
     total = oks = failed = errors = observed = 0
-    for line_number, row in _read_records(board, day):
-        recorded += 1
-        weight = _sample_rate(row)
-        sampled |= weight > 1
+    records = _imessage_rollup_records(board, day) if board == 'imessage' else _read_records(board, day)
+    for line_number, row in records:
+        if not (board == 'imessage' and row.get('_rollup_deferred')):
+            recorded += line_number != last_record
+            last_record = line_number
+        if board == 'imessage' and row.get('_rollup_skip'):
+            continue
+        aggregate = board == 'imessage' and '_rollup_count' in row
+        weight = row['_rollup_count'] if aggregate else _sample_rate(row)
+        sampled |= weight > 1 and not aggregate
         total += weight
-        if row.get('name') == 'log.cap':
+        if row.get('name') in {'log.cap', 'log.degraded'}:
             props = row.get('props') or {}
             caps.append({'component': props.get('component', 'all'),
                          'capBytes': props.get('capBytes'), 'ts': row.get('ts')})
@@ -363,25 +482,83 @@ def rollup(board, day, top_n=20):
         counts_kind[kind] += weight
         attempt = _hook_attempt(row)
         if attempt:
-            thread, rule, at = attempt
-            threads_by_rule[rule][thread] += weight
-            if at is not None and start <= at < start + 86400:
-                attempts[(thread, rule)].append((at, _sample_rate(row)))
-        if type(row.get('ok')) is bool:
-            observed += weight
-            oks += weight * row['ok']
-            failed += weight * (not row['ok'])
+            thread, rule, decision, at = attempt
+            refusal_weight = _hook_weight(row)
+            if thread.startswith('unknown:'):
+                unattributed[(rule, thread)][decision] += refusal_weight
+                if refusal_weight > 1:
+                    sampled_unknown.add((rule, thread))
+            elif _attributed_thread(thread):
+                threads_by_rule[rule][thread] += refusal_weight
+                thread_decisions[(rule, thread)][decision] += refusal_weight
+                if refusal_weight > 1:
+                    sampled_threads.add((rule, thread))
+                if at is not None and start <= at < start + 86400:
+                    attempts[(thread, rule, decision)].append((at, refusal_weight))
+                    if refusal_weight > 1:
+                        sampled_attempts.add((thread, rule, decision))
+            else:
+                unrecognized += refusal_weight
+                unrecognized_sampled |= refusal_weight > 1
+        row_ok = row['_rollup_ok'] if aggregate else weight * (row.get('ok') is True)
+        row_failed = row['_rollup_failed'] if aggregate else weight * (row.get('ok') is False)
+        observed += row_ok + row_failed
+        oks += row_ok
+        failed += row_failed
         errors += weight * (kind == 'error')
         duration = row.get('durationMs')
-        if type(duration) in (int, float) and math.isfinite(duration) and duration >= 0:
-            durations[name].append((duration, weight))
+        values = row['_rollup_histogram'] if aggregate else ([(duration, weight)]
+            if type(duration) in (int, float) and math.isfinite(duration) and duration >= 0 else [])
+        if values:
+            durations[name].extend(values)
+        if board == 'imessage':
+            component = row.get('component', 'unknown')
+            call = row.get('_rollup_call') if aggregate else _imessage_call_name(row)
+            for label in [name] + ([call] if name == 'turn.robob_call' and call else []):
+                stats = component_stats.setdefault((component, label), {'count': 0, 'ok': 0, 'failed': 0, 'histogram': []})
+                stats['count'] += weight
+                stats['ok'] += row_ok
+                stats['failed'] += row_failed
+                stats['histogram'].extend(values)
+        if board == 'orders':
+            component = row.get('component')
+            if not isinstance(component, str) or component not in {
+                    'commerce', 'order-watch', 'card_status', 'noon', 'careem',
+                    'amazon', 'uber', 'toollog', 'money-cases'}:
+                component = 'unknown'
+            component_totals[component] += weight
+            if type(duration) in (int, float) and math.isfinite(duration) and duration >= 0:
+                component_durations[f'{component}:{name}'].append((duration, weight))
+            merchant = (row.get('props') or {}).get('merchant')
+            if merchant not in {'noon', 'careem', 'amazon', 'uber', 'other'}:
+                merchant = 'unknown'
+            if name == 'track.poll' and type(duration) in (int, float) and math.isfinite(duration) and duration >= 0:
+                order_polls[merchant].append((duration, weight))
+            if kind == 'error':
+                error = row.get('error') or {}
+                status = (error.get('cause') or {}).get('httpStatus')
+                status = status if type(status) is int and 100 <= status <= 599 else None
+                code = error.get('tag') or 'OPERATION_FAILED'
+                component_errors[component][code] += weight
+                component_samples[component].setdefault(code, {
+                    'file': day + '.ndjson', 'line': line_number})
+                item = order_errors.setdefault((code, status, merchant), {
+                    'tag': code, 'httpStatus': status, 'merchant': merchant, 'count': 0,
+                    'sampleId': {'file': day + '.ndjson', 'line': line_number}})
+                item['count'] += weight
         tag = (row.get('error') or {}).get('tag')
         if isinstance(tag, str):
-            tags[tag] += weight
-            references.setdefault(tag, {'file': day + '.ndjson', 'line': line_number, 'ts': row.get('ts')})
+            key = tag
+            if board == 'imessage':
+                error_name = (row.get('error') or {}).get('name')
+                if not isinstance(error_name, str) or error_name not in _IMESSAGE_ERROR_NAMES:
+                    error_name = 'UnknownError'
+                key = (tag, error_name)
+            tags[key] += weight
+            references.setdefault(key, {'file': day + '.ndjson', 'line': line_number, 'ts': row.get('ts')})
             identity = row.get('ids')
             if isinstance(identity, dict) and identity:
-                samples.setdefault(tag, identity)
+                samples.setdefault(key, identity)
     def percentiles(values):
         values.sort()
         count = sum(weight for _, weight in values)
@@ -399,12 +576,15 @@ def rollup(board, day, top_n=20):
     for _, row in _read_records(board, (day_start - timedelta(days=1)).strftime('%Y-%m-%d')):
         attempt = _hook_attempt(row)
         if attempt:
-            thread, rule, at = attempt
-            if (thread, rule) in attempts and at is not None and start - 3600 <= at < start:
-                weight = _sample_rate(row)
+            thread, rule, decision, at = attempt
+            key = (thread, rule, decision)
+            if key in attempts and at is not None and start - 3600 <= at < start:
+                weight = _hook_weight(row)
                 sampled |= weight > 1
-                attempts[(thread, rule)].append((at, weight))
-    for (thread, rule), timestamps in sorted(attempts.items()):
+                attempts[key].append((at, weight))
+                if weight > 1:
+                    sampled_attempts.add(key)
+    for (thread, rule, decision), timestamps in sorted(attempts.items()):
         timestamps.sort()
         left = peak = window_count = 0
         for at, weight in timestamps:
@@ -415,19 +595,68 @@ def rollup(board, day, top_n=20):
             if at >= start:
                 peak = max(peak, window_count)
         if peak > 20:
-            loops.append({'threadId': thread, 'rule': rule, 'maxCountInHour': peak, 'repeatLoop': True})
-    return {'schemaVersion': 1, 'tool': board, 'day': day, 'total': total,
+            loops.append({'threadId': thread, 'rule': rule, 'decision': decision,
+                          'maxCountInHour': peak, 'repeatLoop': True,
+                          'sampled': (thread, rule, decision) in sampled_attempts})
+    result = {'schemaVersion': 1, 'tool': board, 'day': day, 'total': total,
             'recordedRows': recorded, 'sampled': sampled, 'logCaps': caps,
             'countsByName': dict(counts_name), 'countsByKind': dict(counts_kind),
             'okCount': oks, 'failedCount': failed, 'okRate': oks / observed if observed else None,
             'errorRate': errors / total if total else 0,
             'durationMsByName': {name: percentiles(values) for name, values in sorted(durations.items())},
-            'topThreadsByRule': {rule: [{'threadId': thread, 'count': count} for thread, count in
+            'topThreadsByRule': {rule: [{'threadId': thread, 'count': count, 'attributed': True,
+                                      'denied': thread_decisions[(rule, thread)]['denied'],
+                                      'rewritten': thread_decisions[(rule, thread)]['rewritten'],
+                                      'sampled': (rule, thread) in sampled_threads} for thread, count in
                                      sorted(threads.items(), key=lambda x: (-x[1], x[0]))[:top_n]]
                                  for rule, threads in sorted(threads_by_rule.items())},
             'repeatLoops': loops,
-            'topErrorTags': [{'tag': tag, 'count': count, 'sampleId': samples.get(tag, references[tag])}
-                             for tag, count in sorted(tags.items(), key=lambda x: (-x[1], x[0]))[:20]]}
+            'topErrorTags': [{**({'tag': key[0], 'name': key[1]} if board == 'imessage' else {'tag': key}),
+                              'count': count, 'sampleId': samples.get(key, references[key])}
+                             for key, count in sorted(tags.items(), key=lambda x: (-x[1], x[0]))[:20]]}
+    if board == 'agent-tools':
+        result['unattributedByRule'] = {rule: [
+                {'threadId': thread, 'count': sum(counts.values()), 'attributed': False,
+                 'denied': counts['denied'], 'rewritten': counts['rewritten'],
+                 'sampled': (rule, thread) in sampled_unknown}
+                for (entry_rule, thread), counts in sorted(unattributed.items()) if entry_rule == rule]
+                for rule in sorted({rule for rule, _ in unattributed})}
+        result['unrecognizedThreadIds'] = unrecognized
+        result['unrecognizedThreadIdsSampled'] = unrecognized_sampled
+    if board == 'orders':
+        result['durationsMs'] = {name: dict(values) for name, values in result['durationMsByName'].items()}
+        if order_polls:
+            result['durationsMs']['track.poll']['byMerchant'] = {
+                merchant: {**percentiles(values), 'count': sum(weight for _, weight in values)}
+                for merchant, values in sorted(order_polls.items())}
+        result['topErrors'] = sorted(order_errors.values(), key=lambda x: (
+            -x['count'], x['tag'], x['httpStatus'] or 0, x['merchant']))[:20]
+        result['durationsMs'].update({
+            key: {**percentiles(values), 'count': sum(weight for _, weight in values)}
+            for key, values in sorted(component_durations.items())
+            if key not in result['durationsMs']})
+        result['errorsByComponent'] = {
+            component: dict(sorted(component_errors[component].items()))
+            for component in sorted(component_totals)}
+        result['failureShare'] = {
+            component: sum(component_errors[component].values()) / component_totals[component]
+            for component in sorted(component_totals)}
+        # Match topErrorTags' frequency ranking, but never copy an IDs dictionary.
+        result['topErrorSamplesByComponent'] = {
+            component: [{'tag': code, 'count': count,
+                         'sampleId': component_samples[component][code]}
+                        for code, count in sorted(component_errors[component].items(),
+                                                  key=lambda item: (-item[1], item[0]))[:5]]
+            for component in sorted(component_totals)}
+    if board == 'imessage':
+        result['byComponent'] = {}
+        result['durationMs'] = result['durationMsByName']
+        for (component, name), stats in component_stats.items():
+            result['byComponent'].setdefault(component, {})[name] = {
+                'count': stats['count'], 'ok': stats['ok'], 'failed': stats['failed'],
+                'errorRate': stats['failed'] / stats['count'] if stats['count'] else 0,
+                **({'durationMs': percentiles(stats['histogram'])} if stats['histogram'] else {})}
+    return result
 
 
 def main(argv=None):

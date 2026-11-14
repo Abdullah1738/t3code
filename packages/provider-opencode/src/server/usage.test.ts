@@ -1,3 +1,4 @@
+import * as NodeWorkerThreads from "node:worker_threads";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import { DEFAULT_SERVER_SETTINGS, ProviderInstanceId } from "@t3tools/contracts";
@@ -12,6 +13,66 @@ import * as SqlClient from "effect/sql/SqlClient";
 import { vi } from "vite-plus/test";
 
 import { openCodeUsageReader, readOpenCodeUsage } from "./usage.ts";
+
+const statementReads = vi.hoisted(() => ({
+  current: undefined as Array<{ sql: string; size: number; window: number }> | undefined,
+}));
+vi.mock("node:worker_threads", async (importOriginal) => {
+  const actual = await importOriginal<typeof NodeWorkerThreads>();
+  class ObservedWorker extends actual.Worker {
+    readonly statements = new Map<number, { sql: string; window: number }>();
+    constructor(...args: ConstructorParameters<typeof actual.Worker>) {
+      super(...args);
+      this.on("message", (reply: unknown) => {
+        if (
+          typeof reply !== "object" ||
+          reply === null ||
+          !("id" in reply) ||
+          typeof reply.id !== "number"
+        )
+          return;
+        const statement = this.statements.get(reply.id);
+        this.statements.delete(reply.id);
+        if (statement === undefined || !("rows" in reply) || !Array.isArray(reply.rows)) return;
+        const size = reply.rows.reduce((total: number, row: unknown) => {
+          const data =
+            typeof row === "object" && row !== null && "data" in row ? row.data : undefined;
+          return total + (typeof data === "string" ? data.length : 0);
+        }, 0);
+        statementReads.current?.push({ ...statement, size });
+      });
+    }
+    override postMessage(...args: Parameters<NodeWorkerThreads.Worker["postMessage"]>) {
+      const [request] = args;
+      if (typeof request?.id === "number" && typeof request.sql === "string") {
+        const lower = request.params?.at(-2);
+        const upper = request.params?.at(-1);
+        const bounded = /rowid > \? AND rowid <= \?/.test(request.sql);
+        this.statements.set(request.id, {
+          sql: request.sql,
+          window:
+            bounded && typeof lower === "number" && typeof upper === "number"
+              ? upper - lower
+              : Infinity,
+        });
+      }
+      super.postMessage(...args);
+    }
+  }
+  return { ...actual, Worker: ObservedWorker };
+});
+
+const recordReads = Effect.acquireRelease(
+  Effect.sync(() => {
+    const reads: Array<{ sql: string; size: number; window: number }> = [];
+    statementReads.current = reads;
+    return reads;
+  }),
+  () =>
+    Effect.sync(() => {
+      statementReads.current = undefined;
+    }),
+);
 
 const openDatabase = (filename: string) =>
   Layer.build(NodeSqliteClient.layer({ filename })).pipe(
@@ -50,25 +111,7 @@ describe("readOpenCodeUsage", () => {
       yield* insert(302, "invalid", "{invalid");
       yield* insert(303, "msg-0", data);
 
-      let largestRawResult = 0;
-      const originalAll = NodeSqlite.StatementSync.prototype.all;
-      yield* Effect.acquireRelease(
-        Effect.sync(() =>
-          vi.spyOn(NodeSqlite.StatementSync.prototype, "all").mockImplementation(function (
-            this: NodeSqlite.StatementSync,
-            ...params
-          ) {
-            const rows = originalAll.apply(this, params);
-            const rawSize = rows.reduce(
-              (size, row) => size + (typeof row.data === "string" ? row.data.length : 0),
-              0,
-            );
-            largestRawResult = Math.max(largestRawResult, rawSize);
-            return rows;
-          }),
-        ),
-        (spy) => Effect.sync(() => spy.mockRestore()),
-      );
+      const reads = yield* recordReads;
       const result = yield* readOpenCodeUsage(dir, sinceMs);
       assert.isFalse(result.error);
       const records = result.files.flatMap((file) => file.records);
@@ -80,6 +123,7 @@ describe("readOpenCodeUsage", () => {
         records.reduce((total, record) => total + record.totals.uncachedInputTokens, 0),
         13000,
       );
+      const largestRawResult = Math.max(...reads.map((read) => read.size));
       assert.isAbove(largestRawResult, 0);
       assert.isBelow(largestRawResult, 6 * 1024 * 1024);
     }).pipe(Effect.provide(NodeServices.layer)),
@@ -111,32 +155,18 @@ describe("readOpenCodeUsage", () => {
       }
       yield* db.unsafe("COMMIT");
 
-      const spans: number[] = [];
-      const originalAll = NodeSqlite.StatementSync.prototype.all;
-      yield* Effect.acquireRelease(
-        Effect.sync(() =>
-          vi.spyOn(NodeSqlite.StatementSync.prototype, "all").mockImplementation(function (
-            this: NodeSqlite.StatementSync,
-            ...params
-          ) {
-            const rows = originalAll.apply(this, params);
-            if (this.sourceSQL.includes("FROM message WHERE")) {
-              const range = /rowid > (-?[\d.]+) AND rowid <= (-?[\d.]+)/.exec(this.expandedSQL);
-              spans.push(range ? Number(range[2]) - Number(range[1]) : Infinity);
-            }
-            return rows;
-          }),
-        ),
-        (spy) => Effect.sync(() => spy.mockRestore()),
-      );
+      const reads = yield* recordReads;
       const result = yield* readOpenCodeUsage(dir, sinceMs);
       assert.isFalse(result.error);
       assert.deepStrictEqual(
         result.files.flatMap((file) => file.records).map((record) => record.dedupeKey),
         Array.from({ length: 5 }, (_, index) => `opencode:msg-${index + 300}`),
       );
-      assert.isNotEmpty(spans);
-      assert.isAtMost(Math.max(...spans), 64);
+      const windows = reads
+        .filter((read) => read.sql.includes("FROM message WHERE"))
+        .map((read) => read.window);
+      assert.isNotEmpty(windows);
+      assert.isAtMost(Math.max(...windows), 64);
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 
@@ -323,7 +353,6 @@ describe("readOpenCodeUsage", () => {
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 });
-import * as NodeSqlite from "node:sqlite";
 
 describe("openCodeUsageReader", () => {
   it.effect("scans canonical instance roots once, including XDG and home defaults", () =>

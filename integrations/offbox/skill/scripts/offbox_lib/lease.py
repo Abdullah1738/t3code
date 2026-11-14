@@ -10,10 +10,11 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import api, capacity, ssh_sync
+from . import api, capacity, common, ssh_sync
 from .common import (SIZES, BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_CAP, EXIT_INFRA, RUN_TTL_S, TEMPLATES_DIR, TOO_BIG_NOTE, OffboxError, db, event,
                      SshHostKeyMismatch, file_lock, iso, kv_get, kv_set, log, mine, new_id, now, read_json, say, token_owner, write)
 from .identity import remote_dir_for
+from .home import StartWaitFailed
 
 # Direct (non-pool) callers only: pool callers skip an archiving box instead of waiting under the pool lock.
 ARCHIVING_WAIT_S = 120
@@ -400,6 +401,9 @@ def ensure_ttl(box_id: str, ttl: int, s: dict | None = None) -> bool:
         api.set_ttl(box_id, ttl)
         return True
     except OffboxError as e:
+        if isinstance(e, StartWaitFailed) or (api.BACKEND == "server" and getattr(e, 'status', None) == 503
+                and getattr(e, 'api_code', None) in ('server_not_ready', 'server_starting')):
+            raise
         say(f"warning: could not set auto-stop on {box_id}: {e}")
         return False
 
@@ -517,10 +521,8 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
             full = base if ":" in base else f"{rk}:{base}"
             brow = con.execute(f"SELECT * FROM bases WHERE name=? AND {mine()}", (full,)).fetchone()
             if not brow and home.only_on_home("bases", "name=?", (full,)):
-                # Saved on the home server, which is down: Boat never had it.
-                say(f"saved base '{full}' exists only on the home offbox server, which is down: "
-                    "using the repo template or recipe for this run")
-                base = None
+                raise home.base_down_error(full, os.environ.get(home.FAILOVER_ENV) or
+                                           'marked down by the health monitor')
             elif not brow:
                 from .base_catalog import missing
                 raise missing(full)
@@ -623,7 +625,7 @@ def run_recipe(box_id: str, name: str, box_held: bool = False) -> None:
             pid = r["processId"]
             event(db(), box_id, "lease_recipe_pid", str(pid))
             code = _follow_bounded(box_id, pid, log_path, RECIPE_TIMEOUT_S)
-    except SshHostKeyMismatch:
+    except (SshHostKeyMismatch, StartWaitFailed):
         raise
     except Exception as e:  # noqa: BLE001 - an upload/start/follow error is a failed recipe like any other
         code = f"error: {e}"
@@ -683,7 +685,7 @@ def _bring_up(box_id: str, fresh: bool = False, recipe: str | None = None, box_h
         try:
             ssh_sync.setup(box_id)
             ssh_sync.wait_ssh(box_id)
-        except (capacity.CapacityError, SshHostKeyMismatch):
+        except (capacity.CapacityError, SshHostKeyMismatch, StartWaitFailed):
             raise
         except OffboxError as e:
             raise BoxNotReady(box_id, s, e) from e
@@ -763,6 +765,29 @@ def acquire_private(me: dict, size: str | None = None, template: str | None = No
             owner_lock.__exit__(None, None, None)
 
 
+def _cmake_cache_cleanup_shell() -> str:
+    return r'''set -e
+removed=0
+failed=0
+while IFS= read -r -d '' cache; do
+  # Removing a parent's CMakeFiles can invalidate nested paths already queued by find.
+  [ -f "$cache" ] && [ ! -L "$cache" ] || continue
+  current=$(cd -- "${cache%/*}" && pwd -P) || { failed=1; continue; }
+  previous=$(sed -n 's/^CMAKE_CACHEFILE_DIR:INTERNAL=//p' "$cache") || { failed=1; continue; }
+  # Without an INTERNAL entry there is no evidence that this cache is stale.
+  if [ -n "$previous" ] && [ "$previous" != "$current" ]; then
+    if rm -rf -- "$cache" "${cache%/*}/CMakeFiles"; then
+      printf 'CMake cache removed: %s -> %s\n' "$previous" "$current"
+      removed=$((removed + 1))
+    else
+      failed=1
+    fi
+  fi
+done < <(find "$1" -type f -name CMakeCache.txt -not -path '*/node_modules/*' -print0)
+printf 'cmake_caches_removed=%s\n' "$removed"
+exit "$failed"'''
+
+
 def _relocate_base_checkout(con, box_id: str, base_dir: str, remote_dir: str, *, box_held: bool) -> None:
     guard = contextlib.nullcontext() if box_held else file_lock(f"box-{box_id}", timeout=120)
     with guard:
@@ -778,13 +803,34 @@ if [ -d "$src" ] && [ ! -e "$dst" ] && [ ! -L "$dst" ]; then
   mkdir -p "$(dirname "$dst")"
   mv -- "$src" "$dst"
   printf 'offbox-base-checkout-relocated\\n'
+  timeout -k 5 60 bash -c {shlex.quote(_cmake_cache_cleanup_shell())} offbox-cmake "$dst" ||
+    printf 'CMake cache cleanup failed (rc=%s); continuing lease\\n' "$?"
 fi'''
-        result = ssh_sync.ssh(box_id, command, timeout=120)
+        try:
+            result = ssh_sync.ssh(box_id, command, timeout=120)
+        except subprocess.TimeoutExpired as exc:
+            # Only a confirmed move makes a cleanup timeout non-fatal. Keep pre-move timeouts unchanged.
+            if b"offbox-base-checkout-relocated\n" not in (exc.stdout or b""):
+                raise
+            result = subprocess.CompletedProcess([], 0, exc.stdout,
+                                                 b"CMake cache cleanup SSH timed out; continuing lease")
         if result.returncode:
-            raise OffboxError(f"base checkout relocation failed on {box_id}: "
-                              f"{result.stderr.decode(errors='replace')[-300:]}")
+            if b"offbox-base-checkout-relocated\n" not in result.stdout:
+                raise OffboxError(f"base checkout relocation failed on {box_id}: "
+                                  f"{result.stderr.decode(errors='replace')[-300:]}")
+            say(f"CMake cache cleanup failed (rc={result.returncode}); continuing lease")
         if b"offbox-base-checkout-relocated\n" in result.stdout:
             event(con, box_id, "base_checkout_cleared", f"{base_dir} -> {remote_dir}: project .gradle metadata")
+            output = result.stdout.decode(errors="replace").splitlines()
+            for line in output:
+                if line != "offbox-base-checkout-relocated":
+                    say(line)
+            if result.stderr:
+                say(result.stderr.decode(errors="replace")[-1000:])
+            count = next((line.split("=", 1)[1] for line in reversed(output)
+                          if re.fullmatch(r"cmake_caches_removed=\d+", line)), "unknown")
+            event(con, box_id, "base_relocated",
+                  f"from={base_dir} to={remote_dir} cmake_caches_removed={count}\n" + "\n".join(output[1:]))
 
 
 def _create_row(con, me: dict, box_id: str, source: str, base_dir, sz, t, box_held: bool = False,
@@ -808,11 +854,13 @@ def _create_row(con, me: dict, box_id: str, source: str, base_dir, sz, t, box_he
                   recipe=source.split(":", 1)[1] if is_recipe else None, box_held=box_held, since=since)
         try:
             api.rename(box_id, box_name(me, me["repo_key"]))
+        except StartWaitFailed:
+            raise
         except OffboxError:
             pass
         if relocating:
             _relocate_base_checkout(con, box_id, base_dir, rdir, box_held=box_held)
-    except SshHostKeyMismatch:
+    except (SshHostKeyMismatch, StartWaitFailed):
         raise
     except api.SupplyOut as e:
         # boat never gave the box a machine: a plain box is dropped from our records; a recipe box is retired below.
@@ -966,7 +1014,7 @@ def _wait_unanswered_resume(con, box_id):
             budget_left = api.left()
             if budget_left is not None:
                 if budget_left <= 0.05:
-                    raise ResumeUnresolved(f"resume of {box_id} still needs confirmation; nothing ran. Retry later")
+                    raise api.BudgetExpired(f"client budget expired confirming resume of {box_id}; nothing ran. Retry later")
                 left = min(left, budget_left)
             if left <= 0:
                 con.execute("UPDATE leases SET state='resume_stalled' WHERE box_id=?", (box_id,))
@@ -975,6 +1023,8 @@ def _wait_unanswered_resume(con, box_id):
                                              "nothing ran; set aside and trying a new box")
             try:
                 state = api.readiness_get(box_id, deadline=time.time() + left)
+            except (api.BudgetExpired, StartWaitFailed):
+                raise
             except OffboxError as error:
                 network_failures = network_failures + 1 if isinstance(error, api.NetworkError) else 0
                 from . import home
@@ -1053,12 +1103,14 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
                 if budget_left <= 0.05:
                     from . import prepare
                     prepare.check(reserve=0.05)
-                    raise ResumeUnresolved(f"resume of {box_id} still needs confirmation; nothing ran. Retry later") from unanswered
+                    raise api.BudgetExpired(f"client budget expired confirming resume of {box_id}; nothing ran. Retry later") from unanswered
                 left = min(left, budget_left)
             if left <= 0:
                 break
             try:
                 last = api.readiness_get(box_id, deadline=time.time() + left)
+            except (api.BudgetExpired, StartWaitFailed):
+                raise
             except OffboxError as error:
                 network_failures = network_failures + 1 if isinstance(error, api.NetworkError) else 0
                 from . import home
@@ -1099,7 +1151,7 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
             budget_left = api.left()
             if budget_left is not None:
                 if budget_left <= 0.05:
-                    raise ResumeUnresolved(f"resume of {box_id} still needs confirmation; nothing ran. Retry later") from unanswered
+                    raise api.BudgetExpired(f"client budget expired confirming resume of {box_id}; nothing ran. Retry later") from unanswered
                 left = min(left, budget_left)
             if remaining is not None and remaining <= 0:
                 raise ResumeUnresolved(f"resume of {box_id} was unanswered; its state could not be confirmed; "
@@ -1203,9 +1255,12 @@ def _bring_up_resumed(con, box_id, confirmed, retried, request_resume=None, *, s
     except (allocation.Busy, allocation.Fenced) as error:
         error.resume_retry_box = box_id
         raise
-    except (api.SupplyOut, capacity.CapacityError, ArchivingSkip, ResumeProvisionStalled, BoxNotReady, SshHostKeyMismatch):
+    except (api.SupplyOut, capacity.CapacityError, ArchivingSkip, ResumeProvisionStalled, BoxNotReady,
+            SshHostKeyMismatch, StartWaitFailed):
         raise
     except OffboxError as e:
+        if isinstance(e, common.SourceGone):
+            raise
         raise ResumeUnresolved(f"{box_id} was resumed but did not become ready; nothing ran: {e}", e) from e
 
 
@@ -1340,6 +1395,8 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
         # archiving, or a box that bounces back to idle, must not hold the caller for 15 minutes.
         try:
             s = api.wait_state(box_id, api.STOPPED_STATES, timeout=ARCHIVING_WAIT_S)
+        except StartWaitFailed:
+            raise
         except OffboxError:
             s = api.get(box_id)
             st = s and s.get("state")
@@ -1419,7 +1476,7 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
     elif st in api.LIVE_STATES or st in api.STARTING_STATES:
         try:
             _bring_up(box_id)
-        except (BoxNotReady, SshHostKeyMismatch):
+        except (BoxNotReady, SshHostKeyMismatch, StartWaitFailed):
             raise
         except OffboxError as e:
             raise ResumeUnresolved(f"{box_id} did not become ready; nothing ran: {e}", e) from e

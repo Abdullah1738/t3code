@@ -425,15 +425,19 @@ class Failover(HomeFiles):
         with patch("urllib.request.urlopen", side_effect=OSError("timed out")):
             self.assertIn("no answer", home.probe())
 
-    def test_unreachable_before_the_command_was_sent_also_fails_over(self):
+    def test_unreachable_fails_over_but_starting_waits_at_home(self):
         gone = api.NetworkError("offbox server API unreachable (POST /sandboxes): timed out")
         with patch.object(home, "probe", return_value=None), patch.object(runs, "run_remote", side_effect=gone):
             rc, _ = self.run_cmd("--", "make", "test")
         self.assertEqual(rc, "exec")
         self.assertEqual(len(self.failures()), 1)
         starting = api.ApiError(503, "server_not_ready", "reconciling runs and boxes after start")
-        with patch.object(home, "probe", return_value=None), patch.object(runs, "run_remote", side_effect=starting):
-            self.assertEqual(self.run_cmd("--", "make", "test")[0], "exec")
+        before = len(self.failures())
+        with patch.object(home, "probe", return_value=None), patch.object(runs, "run_remote", side_effect=[starting, 0]), \
+                patch.object(home, "_health", side_effect=[{"ok": False, "reasons": [starting.message]}, {"ok": True}]), \
+                patch.object(home.time, "sleep"):
+            self.assertEqual(self.run_cmd("--", "make", "test")[0], 0)
+        self.assertEqual(len(self.failures()), before)
 
     def test_once_the_run_was_accepted_it_never_moves(self):
         lost = api.NetworkError("offbox server API unreachable")
@@ -516,6 +520,413 @@ class BoxReadinessFailover(Isolated):
     def stall(self, *args, **kwargs):
         self.clock.sleep(301)
         prepare.check()
+
+    def queued_resize(self, background):
+        self.box('own', member=True)
+        self.busy('own')
+        self.con.execute('INSERT INTO pool_callers VALUES (?,?,?,?)',
+                         (self.me['owner'], self.me['repo_root'], 'own', 'w/own'))
+        self.con.commit()
+        started = self.clock.t
+        stopped = resumed = None
+        resume_budgets = []
+        real_lock = common.file_lock
+
+        @contextlib.contextmanager
+        def lock(name, timeout=600):
+            if background and name == pool.lock_name('repo') and self.clock.t < started + 45:
+                self.clock.sleep(min(timeout, started + 45 - self.clock.t))
+                if self.clock.t < started + 45:
+                    raise common.OffboxError('timed out waiting for lock ' + name)
+            with real_lock(name, timeout=timeout):
+                yield
+
+        def sleep(seconds):
+            self.clock.t += seconds
+            if self.clock.t >= started + 45:
+                self.con.execute("UPDATE runs SET status='done' WHERE box_id='own'")
+                self.con.commit()
+
+        def get(bid, **kw):
+            if resumed is not None:
+                state = 'running' if self.clock.t >= resumed + 40 else 'provisioning'
+                return {'state': state, 'type': 'xlarge'}
+            return {'state': ('archived' if self.clock.t >= stopped + 10 else 'archiving')
+                    if stopped is not None else 'running', 'type': 'large'}
+
+        def stop(bid):
+            nonlocal stopped
+            stopped = self.clock.t
+
+        def resume(*args, **kw):
+            nonlocal resumed
+            resumed = self.clock.t
+            resume_budgets.append(api.left())
+
+        def remote(args, me):
+            self.assertEqual(args.bg, background)
+            got = pool.acquire(me, size='xlarge')
+            pool.release_guard(got)
+            self.assertEqual(got['size'], 'xlarge')
+            return 0
+
+        self.clock.time.sleep = sleep
+        with patch.dict(os.environ, {'OFFBOX_POOL_WAIT_SECONDS': '180', 'OFFBOX_POOL_SIZE': '1'}), \
+                patch.object(pool, 'file_lock', side_effect=lock), patch.object(api, 'get', side_effect=get), \
+                patch.object(api, 'stop', side_effect=stop), patch.object(api, 'resume', side_effect=resume), \
+                patch.object(lease, 'now', self.clock.now), patch.object(lease.ssh_sync, 'setup'), \
+                patch.object(lease.ssh_sync, 'wait_ssh'), patch.object(lease.ssh_sync, 'close_master'), \
+                patch.object(runs, 'run_remote', side_effect=remote), patch.object(lease, 'acquire_private') as create:
+            rc, err = self.run_cmd(*(['--bg'] if background else []), '--remote', '--', 'make', 'test')
+        self.assertEqual(rc, 0, err)
+        self.assertGreaterEqual(resumed - started, 55)
+        self.assertEqual(len(resume_budgets), 1)
+        self.assertGreaterEqual(resume_budgets[0], pool.AFFINITY_WAIT_S - 1)
+        self.assertEqual((self.execs, self.failures()), ([], []))
+        create.assert_not_called()
+
+    def test_foreground_busy_queue_then_resize_has_full_resume_window(self):
+        self.queued_resize(False)
+
+    def test_background_pool_lock_queue_then_resize_has_full_resume_window(self):
+        self.queued_resize(True)
+
+    def test_client_prepare_timeout_is_not_outage_evidence_or_alert(self):
+        def remote(*args):
+            with prepare.guard('slow'):
+                self.stall()
+        with patch.object(runs, 'run_remote', side_effect=remote), \
+                patch('offbox_lib.fallback.note_infra_failure') as alert:
+            rc, err = self.run_cmd('--bg', '--remote', '--', 'make', 'test')
+        self.assertEqual(rc, 90)
+        self.assertIn('could not get a box ready in 300s', err)
+        self.assertNotIn('server not reachable', err)
+        self.assertEqual((self.execs, self.failures()), ([], []))
+        alert.assert_not_called()
+
+    def ssh_client_timeout(self, peer, marker=None, actual_wait=False):
+        self.box('slow', member=True)
+        self.con.execute('INSERT INTO pool_callers VALUES (?,?,?,?)',
+                         (self.me['owner'], self.me['repo_root'], 'slow', 'w/slow'))
+        self.con.commit()
+        if peer:
+            self.box('peer', member=True)
+        def setup(box):
+            if box == 'slow':
+                if marker:
+                    self.con.execute('INSERT INTO kv VALUES (?,?,?)', (f'{marker}:slow', '', self.clock.t))
+                    self.con.commit()
+                if not actual_wait:
+                    raise api.BudgetExpired('client deadline passed before SSH setup')
+        def ssh(box, *args, **kwargs):
+            if box == 'slow':
+                self.clock.sleep(kwargs['timeout'])
+                raise subprocess.TimeoutExpired(args, kwargs['timeout'])
+            return subprocess.CompletedProcess(args, 0, b'', b'')
+        wait = lease.ssh_sync.wait_ssh if actual_wait else lambda box: None
+        def remote(*args):
+            got = pool.acquire(self.me)
+            pool.release_guard(got)
+            self.assertEqual(got['box_id'], 'peer')
+            return 0
+        with patch.dict(os.environ, {'OFFBOX_POOL_WAIT_SECONDS': '0', 'OFFBOX_POOL_SIZE': '2' if peer else '1'}), \
+                patch.object(api, 'get', return_value={'state': 'running', 'type': 'large'}), \
+                patch.object(lease.ssh_sync, 'setup', side_effect=setup), \
+                patch.object(lease.ssh_sync, 'wait_ssh', wait), \
+                patch.object(lease.ssh_sync, 'time', self.clock.time), \
+                patch.object(lease.ssh_sync, 'ssh', side_effect=ssh), patch.object(lease, 'ensure_ttl'), \
+                patch.object(runs, 'run_remote', side_effect=remote), \
+                patch('offbox_lib.fallback.note_infra_failure') as alert, \
+                patch.object(lease, 'acquire_private') as create:
+            rc, err = self.run_cmd('--bg', '--remote', '--', 'make', 'test')
+        self.assertEqual(rc, 0 if peer and not marker else 90, err)
+        self.assertEqual((self.execs, self.failures()), ([], []))
+        alert.assert_not_called()
+        create.assert_not_called()
+        if marker:
+            self.assertIsNotNone(self.con.execute('SELECT 1 FROM kv WHERE k=?', (f'{marker}:slow',)).fetchone())
+
+    def test_live_box_ssh_client_timeout_does_not_alert_without_peer(self):
+        self.ssh_client_timeout(False)
+
+    def test_live_box_ssh_client_timeout_still_uses_ready_peer(self):
+        self.ssh_client_timeout(True)
+
+    def test_real_ssh_wait_client_expiry_does_not_alert_without_peer(self):
+        self.ssh_client_timeout(False, actual_wait=True)
+
+    def test_real_ssh_wait_client_expiry_still_uses_ready_peer(self):
+        self.ssh_client_timeout(True, actual_wait=True)
+
+    def test_ssh_client_timeout_with_unanswered_marker_does_not_alert(self):
+        self.ssh_client_timeout(False, 'resume_unanswered')
+
+    def test_ssh_client_timeout_with_provision_marker_does_not_alert(self):
+        self.ssh_client_timeout(False, 'resume_provision')
+
+    def test_unanswered_ssh_client_timeout_keeps_fence_with_ready_peer(self):
+        self.ssh_client_timeout(True, 'resume_unanswered')
+
+    def test_provision_ssh_client_timeout_keeps_fence_with_ready_peer(self):
+        self.ssh_client_timeout(True, 'resume_provision')
+
+    def test_zero_queue_budget_before_resume_still_uses_ready_peer(self):
+        self.box('stopped', 'stopped', member=True)
+        self.box('peer', member=True)
+        self.con.execute('INSERT INTO pool_callers VALUES (?,?,?,?)',
+                         (self.me['owner'], self.me['repo_root'], 'stopped', 'w/stopped'))
+        self.con.commit()
+        def remote(*args):
+            got = pool.acquire(self.me)
+            pool.release_guard(got)
+            self.assertEqual(got['box_id'], 'peer')
+            return 0
+        with patch.dict(os.environ, {'OFFBOX_POOL_WAIT_SECONDS': '0', 'OFFBOX_POOL_SIZE': '2'}), \
+                patch.object(api, 'get', self.status_get), patch.object(api, '_key', return_value='fixture'), \
+                patch.object(api, '_open', side_effect=lambda *a, **k: io.BytesIO(
+                    b'{"sandbox":{"state":"running","type":"large"}}')) as send, \
+                patch.object(api, 'resume') as resume, patch.object(lease, 'acquire_private') as create, \
+                patch.object(lease.ssh_sync, 'setup'), patch.object(lease.ssh_sync, 'wait_ssh'), \
+                patch.object(lease, 'ensure_ttl'), patch.object(runs, 'run_remote', side_effect=remote), \
+                patch('offbox_lib.fallback.note_infra_failure') as alert:
+            rc, err = self.run_cmd('--bg', '--remote', '--', 'make', 'test')
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(send.called)
+        self.assertTrue(all(call.args[0].full_url.endswith('/sandboxes/peer') for call in send.call_args_list))
+        self.assertEqual((self.execs, self.failures()), ([], []))
+        resume.assert_not_called()
+        create.assert_not_called()
+        alert.assert_not_called()
+
+    def test_short_client_read_budget_is_not_a_network_outage(self):
+        def silent(req, timeout):
+            self.clock.sleep(timeout)
+            raise TimeoutError('read exceeded client budget')
+        # Shared budget, explicit deadline, expected outage, sends before expiry.
+        rows = ((0, None, False, 0), (.1, None, False, 1), (5, None, True, 1), (10, None, True, 1),
+                (None, 0, False, 0), (None, .1, False, 1), (60, .1, False, 1),
+                (.1, 60, False, 1), (.1, .1, False, 1), (60, 5, True, 1), (60, 10, True, 1),
+                (None, None, True, 1))
+        for seconds, explicit, outage, sends in rows:
+            deadline = None if explicit is None else self.clock.t + explicit
+            budget = contextlib.nullcontext() if seconds is None else api.budget(seconds)
+            with self.subTest(seconds=seconds, explicit=explicit), patch.object(api, 'get', self.status_get), \
+                    patch.object(api, '_key', return_value='fixture'), \
+                    patch.object(api, '_open', side_effect=silent) as send, budget:
+                with self.assertRaises(common.OffboxError) as caught:
+                    api.readiness_get('slow', deadline=deadline)
+                self.assertEqual(caught.exception.outage, outage)
+                self.assertEqual(home.unreachable(caught.exception), outage)
+                self.assertEqual(send.call_count, sends)
+
+    def test_readiness_budget_spent_in_key_lookup_does_not_send_or_alert(self):
+        def key():
+            self.clock.sleep(1)
+            return 'fixture'
+        def remote(*args):
+            with api.budget(.1):
+                lease._bring_up_resumed(self.con, 'slow', None, False)
+        with patch.object(api, 'get', self.status_get), patch.object(api, '_key', side_effect=key), \
+                patch.object(api, '_open') as send, patch.object(runs, 'run_remote', side_effect=remote), \
+                patch('offbox_lib.fallback.note_infra_failure') as alert:
+            rc, err = self.run_cmd('--bg', '--remote', '--', 'make', 'test')
+        self.assertEqual(rc, 90, err)
+        self.assertEqual((self.execs, self.failures()), ([], []))
+        send.assert_not_called()
+        alert.assert_not_called()
+
+    def test_ssh_key_client_budget_and_full_network_timeout_matrix(self):
+        def silent(req, timeout):
+            self.clock.sleep(timeout)
+            raise TimeoutError('SSH key authorization timed out')
+        for seconds, outage, sends in ((None, True, 1), (0, False, 0), (.1, False, 1),
+                                       (60, True, 1), (120, True, 1)):
+            budget = contextlib.nullcontext() if seconds is None else api.budget(seconds)
+            with self.subTest(seconds=seconds), patch.object(api, '_key', return_value='fixture'), \
+                    patch.object(api, '_open', side_effect=silent) as send, budget:
+                with self.assertRaises(common.OffboxError) as caught:
+                    api.sshkey('slow', 'ssh-ed25519 fixture')
+                self.assertEqual(caught.exception.outage, outage)
+                self.assertEqual(send.call_count, sends)
+
+    def test_real_ssh_key_client_expiry_does_not_record_failure_or_alert(self):
+        home.record_failure('fixture prior outage')
+        before = self.failures()
+        def silent(req, timeout):
+            self.clock.sleep(timeout)
+            raise TimeoutError('SSH key authorization timed out')
+        def remote(*args):
+            with api.budget(.1):
+                lease._bring_up('slow')
+        with patch.object(api, 'get', return_value={'state': 'running', 'type': 'large'}), \
+                patch.object(api, '_key', return_value='fixture'), patch.object(api, '_open', side_effect=silent) as send, \
+                patch.object(lease.ssh_sync, 'pubkey', return_value='ssh-ed25519 fixture'), \
+                patch.object(lease.ssh_sync, 'time', self.clock.time), patch.object(lease.ssh_sync, 'wait_ssh') as wait, \
+                patch.object(runs, 'run_remote', side_effect=remote), \
+                patch('offbox_lib.fallback.note_infra_failure') as alert:
+            rc, err = self.run_cmd('--bg', '--remote', '--', 'make', 'test')
+        self.assertEqual(rc, 90, err)
+        self.assertEqual((self.execs, self.failures()), ([], before))
+        self.assertEqual(send.call_count, 1)
+        self.assertTrue(send.call_args.args[0].full_url.endswith('/sandboxes/slow/sshkey'))
+        wait.assert_not_called()
+        alert.assert_not_called()
+
+    def test_ssh_key_retry_keeps_prior_full_network_failure(self):
+        def silent(req, timeout):
+            self.clock.sleep(timeout)
+            raise TimeoutError('SSH key authorization timed out')
+        with patch.object(api, '_key', return_value='fixture'), \
+                patch.object(api, '_open', side_effect=silent) as send, \
+                patch.object(lease.ssh_sync, 'pubkey', return_value='ssh-ed25519 fixture'), \
+                patch.object(lease.ssh_sync, 'time', self.clock.time), api.budget(120):
+            with self.assertRaises(api.NetworkError) as caught:
+                lease.ssh_sync.setup('slow')
+        self.assertTrue(caught.exception.outage)
+        self.assertFalse(api.client_budget_expired(caught.exception))
+        self.assertEqual(send.call_count, 2)
+
+    def guarded_key_setup(self, outcome):
+        home.record_failure('fixture prior outage')
+        before = self.failures()
+        root = Path(self.tmp.name) / 'guard-ssh'
+        root.mkdir()
+        calls = []
+        def response(req, timeout):
+            calls.append(timeout)
+            if outcome == 'recovered' and len(calls) == 2:
+                return io.BytesIO(b'{"sshEndpoint":"host.example:22","hostKey":"ssh-ed25519 fixture"}')
+            self.clock.sleep(timeout)
+            if outcome == 'alarm' and len(calls) == 2:
+                self.clock.sleep(prepare._ACTIVE.get().end - self.clock.t)
+                prepare._ACTIVE.get().tick()
+            raise TimeoutError('SSH key authorization timed out')
+        def remote(*args):
+            with prepare.guard('slow', seconds=300):
+                if outcome == 'client':
+                    self.clock.sleep(299.9)
+                lease.ssh_sync.setup('slow')
+                self.clock.sleep(300 - (self.clock.t - started))
+                prepare.check()
+        started = self.clock.t
+        with patch.object(api, '_key', return_value='fixture'), patch.object(api, '_open', side_effect=response), \
+                patch.object(lease.ssh_sync, 'pubkey', return_value='ssh-ed25519 fixture'), \
+                patch.object(lease.ssh_sync, 'SSH_DIR', root), patch.object(lease.ssh_sync, 'CM_DIR', root / 'cm'), \
+                patch.object(lease.ssh_sync, 'KEY_PATH', root / 'key'), \
+                patch.object(lease.ssh_sync, 'time', self.clock.time), \
+                patch.object(runs, 'run_remote', side_effect=remote), \
+                patch('offbox_lib.fallback.note_infra_failure') as alert:
+            rc, err = self.run_cmd('--bg', '--remote', '--', 'make', 'test')
+        if outcome in ('network', 'alarm'):
+            self.assertEqual(rc, 'exec', err)
+            self.assertEqual(len(self.failures()), len(before) + 1)
+            self.assertIn('last outage:', self.failures()[-1]['reason'])
+            self.assertIn('/sshkey', self.failures()[-1]['reason'])
+        else:
+            self.assertEqual(rc, 90, err)
+            self.assertEqual((self.execs, self.failures()), ([], before))
+        alert.assert_not_called()
+        self.command.assert_not_called()
+
+    def test_prepare_guard_retains_full_ssh_key_network_failures(self):
+        self.guarded_key_setup('network')
+
+    def test_prepare_alarm_retains_full_ssh_key_network_failures(self):
+        self.guarded_key_setup('alarm')
+
+    def test_prepare_guard_clipped_first_key_request_is_client_expiry(self):
+        self.guarded_key_setup('client')
+
+    def test_prepare_guard_drops_outage_evidence_after_key_recovery(self):
+        self.guarded_key_setup('recovered')
+
+    def test_two_client_prepare_timeouts_do_not_become_outage_evidence(self):
+        def remote(*args):
+            with prepare.attempts():
+                prepare.move_once(prepare.Stalled('first', 'bring_up', 300))
+                prepare.move_once(prepare.Stalled('second', 'bring_up', 300))
+        with patch.object(runs, 'run_remote', side_effect=remote), \
+                patch('offbox_lib.fallback.note_infra_failure') as alert:
+            rc, err = self.run_cmd('--bg', '--remote', '--', 'make', 'test')
+        self.assertEqual(rc, 90)
+        self.assertIn('Replacement failed after:', err)
+        self.assertEqual((self.execs, self.failures()), ([], []))
+        alert.assert_not_called()
+
+    def test_confirmation_partial_final_read_does_not_count_as_second_outage(self):
+        self.box('cold', 'stopped', member=True)
+        def silent(req, timeout):
+            self.clock.sleep(timeout)
+            raise TimeoutError('confirmation read timed out')
+        def remote(*args):
+            with api.budget(60):
+                lease._resume_confirmed(self.con, 'cold', 1800, None)
+        with patch.dict(os.environ, {'OFFBOX_RESUME_CONFIRM_SECONDS': '8'}), \
+                patch.object(lease, 'time', self.clock.time), \
+                patch.object(api, 'get', self.status_get), patch.object(api, '_key', return_value='fixture'), \
+                patch.object(api, '_open', side_effect=silent) as reads, \
+                patch.object(api, 'resume', side_effect=api.NetworkError('resume response lost')) as resume, \
+                patch.object(runs, 'run_remote', side_effect=remote), \
+                patch('offbox_lib.fallback.note_infra_failure') as alert:
+            rc, err = self.run_cmd('--bg', '--remote', '--', 'make', 'test')
+        self.assertEqual(rc, 90, err)
+        self.assertEqual(reads.call_count, 2)
+        resume.assert_called_once()
+        self.assertEqual((self.execs, self.failures()), ([], []))
+        self.assertIsNotNone(self.con.execute("SELECT 1 FROM kv WHERE k='resume_unanswered:cold'").fetchone())
+        alert.assert_not_called()
+
+    def test_client_timeout_on_replacement_allocation_is_not_alerted(self):
+        self.box('old', 'stopped', member=True)
+        with patch.object(lease, '_reuse', side_effect=self.stall), \
+                patch.object(lease, 'acquire_private', side_effect=api.BudgetExpired('replacement client deadline')), \
+                patch('offbox_lib.fallback.note_infra_failure') as alert:
+            rc, err = self.run_cmd('--bg', '--remote', '--', 'make', 'test')
+        self.assertEqual(rc, 90)
+        self.assertIn('Replacement allocation failed:', err)
+        self.assertEqual((self.execs, self.failures()), ([], []))
+        alert.assert_not_called()
+
+    def test_old_since_does_not_shorten_resume_readiness(self):
+        started = self.clock.t
+        def get(*args, **kwargs):
+            return {'state': 'running' if self.clock.t >= started + 40 else 'provisioning'}
+        with patch.object(api, 'get', side_effect=get), patch.object(lease.ssh_sync, 'setup'), \
+                patch.object(lease.ssh_sync, 'wait_ssh'), api.budget(60):
+            got = lease._bring_up_resumed(self.con, 'old', None, False, since=started - 10000)
+        self.assertEqual(got['state'], 'running')
+
+    def test_answering_box_readiness_timeout_is_not_an_infra_alert(self):
+        def remote(*args):
+            with api.budget(.1):
+                lease._bring_up_resumed(self.con, 'slow', None, False)
+        with patch.object(api, 'get', return_value={'state': 'provisioning'}), \
+                patch.object(runs, 'run_remote', side_effect=remote), \
+                patch('offbox_lib.fallback.note_infra_failure') as alert:
+            rc, err = self.run_cmd('--bg', '--remote', '--', 'make', 'test')
+        self.assertEqual(rc, 90)
+        self.assertNotIn('server not reachable', err)
+        self.assertEqual((self.execs, self.failures()), ([], []))
+        alert.assert_not_called()
+
+    def test_silent_resumed_box_still_fails_over_and_records_home_failure(self):
+        self.box('cold', 'stopped', member=True)
+        resumed = False
+        def resume(*args, **kwargs):
+            nonlocal resumed
+            resumed = True
+        def get(*args, **kwargs):
+            if resumed:
+                self.clock.sleep(5)
+                raise api.NetworkError('authenticated box API silent')
+            return {'state': 'archived', 'type': 'large'}
+        with patch.object(api, 'get', side_effect=get), patch.object(api, 'resume', side_effect=resume), \
+                patch.object(lease, 'acquire_private') as create:
+            rc, _ = self.run_cmd('--remote', '--', 'make', 'test')
+        self.assertEqual(rc, 'exec')
+        self.assertEqual(len(self.failures()), 1)
+        self.assertIn('authenticated box API silent', self.failures()[0]['reason'])
+        create.assert_not_called()
 
     def assert_failover(self, replacement=False):
         rc, err = self.run_cmd("--remote", "--", "make", "test")
@@ -731,12 +1142,15 @@ class BoxReadinessFailover(Isolated):
         self.command.assert_not_called()
         create.assert_not_called()
 
-    def test_two_fresh_bring_up_stalls_move_to_boat(self):
-        with patch.object(lease, "_bring_up", side_effect=self.stall) as ready:
-            self.assertEqual(self.run_cmd("--remote", "--", "make", "test")[0], "exec")
+    def test_two_fresh_client_bring_up_stalls_do_not_report_an_outage(self):
+        with patch.object(lease, "_bring_up", side_effect=self.stall) as ready, \
+                patch('offbox_lib.fallback.note_infra_failure') as alert:
+            rc, err = self.run_cmd("--remote", "--", "make", "test")
+        self.assertEqual(rc, 90)
         self.assertEqual(ready.call_count, 2)
-        self.assertEqual(len(self.failures()), 1)
-        self.assertIn("Replacement failed after", self.failures()[0]["reason"])
+        self.assertIn("Replacement failed after", err)
+        self.assertEqual((self.execs, self.failures()), ([], []))
+        alert.assert_not_called()
         self.command.assert_not_called()
 
     def test_stalled_resume_keeps_outage_when_replacement_is_unclassified(self):
@@ -795,7 +1209,7 @@ class BoxReadinessFailover(Isolated):
                     api.wait_state("new", api.LIVE_STATES)
                 self.assertEqual(caught.exception.outage, state == "error" and message in ("500 incus_failed", "599 internal"))
         for phase in ("lock_wait", "push", "ssh", "resume_request", "bring_up"):
-            self.assertEqual(prepare.Stalled("new", phase, 300).outage, phase == "bring_up", phase)
+            self.assertFalse(prepare.Stalled("new", phase, 300).outage, phase)
 
     def test_full_home_pool_failed_resume_archived_500_moves_to_boat(self):
         self.box("old", "stopped", member=True)
@@ -882,9 +1296,9 @@ class PersonNeverOnBoat(HomeFiles):
         self.stack.enter_context(patch.dict(os.environ, {"OFFBOX_THREAD": "person:moni"}))
         self.stack.enter_context(patch.object(os, "execve", side_effect=AssertionError("her work never goes to Boat")))
 
-    def test_marked_down_fails_fast_without_touching_the_network(self):
+    def test_marked_down_without_a_starting_answer_fails_fast(self):
         self.monitor_says("home_down", reason="no answer for 2 checks")
-        with patch("urllib.request.urlopen", side_effect=AssertionError("no network call")):
+        with patch.object(home, "_health", return_value="no answer (TimeoutError)"):
             with self.assertRaises(common.OffboxError) as cm:
                 home.person_gate()
         self.assertEqual(cm.exception.code, 93)

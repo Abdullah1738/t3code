@@ -109,6 +109,92 @@ with _fold_errors(), (_tl.run('meds-nag', _log_sys.argv[1:], name='watcher.run')
         path = os.path.join(D, "nagstate.json"); tmp = path + ".tmp"
         with open(tmp, "w") as f: json.dump(st, f)
         os.replace(tmp, path)
+    # Per-dose history stays beside the existing clocks, never in tool logs.
+    def outcome_slots(day, taken):
+        slots = [(key(label), day) for label in due(day)]
+        slots += [(key(label), date) for label, date in carried(day, taken)]
+        return slots
+    def outcome_state(st):
+        history = st.setdefault("outcomes", {"since": str(today), "slots": {}, "days": {}})
+        cutoff = str(today - dt.timedelta(days=30))
+        for field in ("slots", "days"):
+            history[field] = {d: value for d, value in history[field].items() if d >= cutoff}
+        return history
+    def outcome_sent(st, day, taken, left):
+        try:
+            history = outcome_state(st)
+            names = {key(label) for label in left}
+            for name, date in outcome_slots(day, taken):
+                if name not in names: continue
+                slot = history["slots"].setdefault(str(date), {}).setdefault(
+                    name, {"first": now.isoformat(), "nags": 0, "snoozes": 0})
+                slot.setdefault("first", now.isoformat())
+                slot["nags"] += 1
+            counts = history["days"].setdefault(str(today), {"nags": 0})
+            counts["nags"] += 1
+        except Exception:
+            pass
+    def outcome_emit(component, event, props, run_id):
+        try:
+            if _tl is not None: _tl.emit(component, event, props=props, run_id=run_id)
+        except BaseException:
+            pass
+    def outcome_day_end(st, taken):
+        try:
+            if not isinstance(st, dict): return
+            if "outcomes" not in st:
+                outcome_state(st)
+                write_nagstate(st)
+                return
+            history = st["outcomes"]
+            day = today - dt.timedelta(days=1)
+            if history.get("since", str(today)) > str(day) or history.get("ended", "") >= str(day): return
+            # Include carried slots that were closed on that day, as well as those still open.
+            before = dict(taken, **{str(day): []})
+            slots = set(outcome_slots(day, before))
+            opened = sum(not any(name in taken.get(str(date + dt.timedelta(days=n)), [])
+                                for n in range((day - date).days + 1)) for name, date in slots)
+            props = {"slotsDue": len(slots), "slotsTaken": len(slots) - opened,
+                     "slotsOpen": opened, "nagsSent": history["days"].get(str(day), {}).get("nags", 0)}
+            history["ended"] = str(day)
+            write_nagstate(st)
+            outcome_emit('meds-nag', 'nag.day_end', props, getattr(_watch_log, 'run_id', None))
+        except Exception:
+            pass
+    def outcome_action(action, day, names, taken, run_id=None):
+        # Confirmation/snooze commands must not wait for or change reminder delivery.
+        try:
+            if isinstance(day, str): day = dt.date.fromisoformat(day)
+            with open(os.path.join(D, "nagstate.lock"), "a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                st = load("nagstate.json", {}, strict=False)
+                if action == "resolve" and not st.get("outcomes"): return
+                history = outcome_state(st)
+                events = []
+                for name, date in outcome_slots(day, taken):
+                    if name not in names or name in taken.get(str(day), []): continue
+                    slots = history["slots"].setdefault(str(date), {})
+                    if action == "snooze":
+                        slot = slots.setdefault(name, {"nags": 0, "snoozes": 0})
+                        slot["snoozes"] += 1
+                        continue
+                    slot = slots.get(name, {})
+                    if not slot.get("nags") or slot.get("resolved"): continue
+                    first = dt.datetime.fromisoformat(slot["first"])
+                    scheduled = dt.datetime.combine(date, dt.time(9), DUBAI)
+                    # The current schedule has one morning slot per daily dose; non-daily
+                    # carry-forward slots use the weekly bucket. No labels leave this file.
+                    kind = "weekly" if name in CARRY_FORWARD else "morning"
+                    events.append({"slotKind": kind, "nagCount": slot["nags"],
+                        "firstNagToTookSeconds": max(0, int((now - first).total_seconds())),
+                        "snoozeCount": slot["snoozes"],
+                        "lateMinutes": max(0, int((now - scheduled).total_seconds() // 60))})
+                    slot["resolved"] = True
+                if not events and action == "resolve": return
+                write_nagstate(st)
+                for props in events: outcome_emit('took', 'nag.resolved', props, run_id)
+        except Exception:
+            pass
     def awake():
         # Mac in use in last 15 min, or owner sent an iMessage (not to Moni chat 45, where robob also sends) in last 20 min
         try:
@@ -124,6 +210,13 @@ with _fold_errors(), (_tl.run('meds-nag', _log_sys.argv[1:], name='watcher.run')
         except Exception: pass
         return False
     def main(fold=False):
+      if not fold:
+          try:
+              with open(os.path.join(D, "nagstate.lock"), "a") as lock:
+                  fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                  outcome_day_end(load("nagstate.json", {}, strict=False), load("taken.json", {}, strict=True))
+          except Exception:
+              pass
       if 9 <= now.hour <= 23: day = today
       elif now.hour < 5 and (fold or awake()): day = today - dt.timedelta(days=1)
       else: return
@@ -149,6 +242,7 @@ with _fold_errors(), (_tl.run('meds-nag', _log_sys.argv[1:], name='watcher.run')
           last = nag_time(st, "fold_last")
           if last and (now - last).total_seconds() < 1800: return
           st["fold_last"] = now.isoformat()
+          outcome_sent(st, day, taken, left)
           write_nagstate(st)
           print("💊 Still need: " + ", ".join(left) + ". Text me when done.")
           if _tl is not None: _tl.emit('meds-nag', 'nag.folded', props={'count': len(left)})
@@ -160,6 +254,7 @@ with _fold_errors(), (_tl.run('meds-nag', _log_sys.argv[1:], name='watcher.run')
           if _tl is not None: _tl.emit('meds-nag', 'nag.snoozed', props={'count': len(left)})
           raise SystemExit(0)
       st["last"] = now.isoformat()
+      outcome_sent(st, day, taken, left)
       write_nagstate(st)
       def site_hint():
           # last Test E pin side: health.db (hlog.py) first, then sites.json

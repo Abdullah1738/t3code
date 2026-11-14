@@ -14,8 +14,8 @@ def _load(name):
     module = importlib.util.module_from_spec(spec)
     path = sys.path[:]
     previous_capacity = sys.modules.get("test_capacity")
-    if name == "test_exit_and_queue":
-        # FakeClock's module imports Isolated by its original name; share the cached fixture.
+    if name in ("test_exit_and_queue", "test_bg_queue_detach"):
+        # Client modules import Isolated by its original name; share the cached fixture.
         sys.modules["test_capacity"] = _load("test_capacity")
     sys.modules[qualified] = module
     try:
@@ -25,7 +25,7 @@ def _load(name):
         raise
     finally:
         sys.path[:] = path
-        if name == "test_exit_and_queue":
+        if name in ("test_exit_and_queue", "test_bg_queue_detach"):
             if previous_capacity is None:
                 sys.modules.pop("test_capacity", None)
             else:
@@ -35,3 +35,4 @@ def _load(name):
 
 Isolated = _load("test_capacity").Isolated
 FakeClock = _load("test_exit_and_queue").FakeClock
+background_queue_tests = _load("test_bg_queue_detach")

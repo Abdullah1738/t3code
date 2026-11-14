@@ -73,6 +73,7 @@ export const makeFake = Effect.gen(function* () {
     KanbanThreads,
     KanbanThreads.of({
       pendingUserInputs: () => Effect.succeed([]),
+      claimContext: () => Effect.succeed(null),
       view,
       find: view,
       launch: (input) =>
@@ -109,6 +110,7 @@ export const makeFake = Effect.gen(function* () {
           const thread = all.get(threadId);
           return thread ? new Map(all).set(threadId, { ...thread, model }) : all;
         }),
+      queuedRuns: () => Effect.succeed([]),
       cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,
     }),

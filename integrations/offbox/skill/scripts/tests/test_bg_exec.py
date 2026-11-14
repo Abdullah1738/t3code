@@ -41,7 +41,7 @@ def setup(root, backend='boat'):
                 home.fail_over('fixture home unavailable', ['run', '--bg', '--env', 'PRIVATE=env-private-marker'])
             return acquire(*args, **kwargs)
         pool.acquire = failover_acquire
-        home.record_failure = lambda *args: None
+        home.record_failure = lambda *args, **kwargs: None
         api.probe_backend = lambda *args: None
     destination = root / 'synced'
     # Exercise the real snapshot and sync orchestration through an isolated local transport.
@@ -53,6 +53,11 @@ def setup(root, backend='boat'):
         shutil.copytree(gitdir, destination / '.git')
         return dict(files=1, sent=1)
     ssh_sync._push_files, ssh_sync._push_git = files, git
+    def ssh(box, command, input=None, timeout=120, check=False):
+        assert command.startswith('cd -- ')
+        return subprocess.run(['sh', '-c', command.split(' && ', 1)[1]], cwd=destination,
+                              input=input, capture_output=True, timeout=timeout, check=check)
+    ssh_sync.ssh = ssh
     ssh_sync.put_file = lambda *args, **kwargs: None
     def prepare(self, con, args, rdir, env_file, body):
         self._sync_box(con, args, rdir, env_file, body)

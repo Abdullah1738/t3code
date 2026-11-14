@@ -3,6 +3,7 @@ import * as McpTaskTrace from "../ardud/observability/McpTaskTrace.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import { readCallerIdentity } from "./callerIdentity.ts";
 import * as McpCallAnalytics from "../ardud/analytics/McpCall.ts";
+import { ProjectionStoreThreadNotFoundError } from "../orchestration-v2/ProjectionStore.ts";
 import type { CallerRow } from "../orchestration-v2/ProjectionStore.ts";
 import { claudeRecoveryResult } from "../orchestration-v2/launchRecovery.ts";
 import { stalledSummary } from "../orchestration-v2/delegatedTaskProgress.ts";
@@ -71,7 +72,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
-import { runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
+import { latestRootProviderFailure, runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
 import {
   normalizeThreadPullRequestKey,
   visibleThreadPullRequests,
@@ -244,6 +245,7 @@ export class OrchestratorMcpService extends Context.Service<
 type CallerParent = { readonly thread: CallerRow };
 
 const isThreadManagementError = Schema.is(ThreadManagementService.ThreadManagementError);
+const isProjectionStoreThreadNotFoundError = Schema.is(ProjectionStoreThreadNotFoundError);
 const isOrchestratorMcpFailure = Schema.is(OrchestratorMcpFailure);
 
 function failure(code: OrchestratorMcpFailure["code"], message: string): OrchestratorMcpFailure {
@@ -782,6 +784,29 @@ function delegationCommandId(
       stablePart(key),
     ].join(":"),
   );
+}
+
+function delegationTaskCommandId(taskId: NodeId): CommandId | undefined {
+  if (!taskId.startsWith("node:delegated-task:")) return undefined;
+  try {
+    const commandId = CommandId.make(
+      decodeURIComponent(taskId.slice("node:delegated-task:".length)),
+    );
+    const parts = commandId.split(":");
+    if (
+      parts[0] !== "command" ||
+      parts[1] !== "mcp" ||
+      !(
+        (parts.length === 6 && parts[2] === "delegate-task") ||
+        (parts.length === 5 && parts[3] === "delegate-task")
+      ) ||
+      IdAllocator.derive.delegatedTaskNode({ commandId }) !== taskId
+    )
+      return undefined;
+    return commandId;
+  } catch {
+    return undefined;
+  }
 }
 
 function threadCreationIds(namespace: string, requestKey: string, index: number) {
@@ -1934,15 +1959,51 @@ const make = Effect.gen(function* () {
         candidate.threadId === scope.thread.threadId,
     );
     if (task === undefined || task.childThreadId === null) {
+      let detail = "";
+      const commandId = delegationTaskCommandId(taskId);
+      if (commandId !== undefined) {
+        const state = yield* threadManagement.getDelegationCommandState(commandId).pipe(
+          NodeSqliteClient.readOnly,
+          NodeSqliteClient.foregroundReads,
+          Effect.mapError((error) => failure("orchestration_error", errorMessage(error))),
+          (effect) => McpTaskTrace.stage(effect, "command_receipt", "t3.task"),
+        );
+        if (
+          "threadId" in state &&
+          (state.threadId !== scope.thread.threadId ||
+            state.commandType !== "delegated_task.request")
+        ) {
+          return yield* failure(
+            "task_not_found",
+            `Delegated task ${taskId} does not belong to this thread.`,
+          );
+        }
+        yield* Effect.annotateCurrentSpan({ "t3.task.creation_state": state.status });
+        switch (state.status) {
+          case "accepted":
+            detail =
+              " This delegation was saved; its task projection is catching up. Retry task_status with this task id.";
+            break;
+          case "rejected":
+            detail = ` This delegation was rejected: ${state.error ?? "No reason was recorded."}`;
+            break;
+          case "pending":
+            detail =
+              " This delegation is still being created; retry task_status with this task id, or retry delegate_task with the same clientRequestId.";
+            break;
+          case "never_saved":
+            detail =
+              " This delegation was never saved. Retry delegate_task with the same clientRequestId.";
+            break;
+        }
+      }
       return yield* failure(
         "task_not_found",
-        `Delegated task ${taskId} does not belong to thread ${scope.thread.threadId}.` +
-          (taskId.startsWith("node:delegated-task:")
-            ? " Creation may still be in flight; retry task_status with this task id, or retry delegate_task only with the same clientRequestId."
-            : ""),
+        `Delegated task ${taskId} was not found for thread ${scope.thread.threadId}.${detail}`,
       );
     }
     onProgress?.({ childThreadId: task.childThreadId, childNodeId: task.id });
+    // Keep failures available if assistant-result hydration exceeds the status deadline.
     const childControls = yield* threadManagement
       .getThreadRecords(
         task.childThreadId,
@@ -1955,8 +2016,9 @@ const make = Effect.gen(function* () {
           "providerTurns",
           "runtimeRequests",
           "nodes",
+          "turnItems",
         ],
-        { messageRoles: ["user"], omitSettledLeafNodes: true },
+        { messageRoles: ["user"], turnItemTypes: ["error"], omitSettledLeafNodes: true },
         { projectionOnly: true },
       )
       .pipe(NodeSqliteClient.foregroundReads, Effect.mapError(threadManagementFailure), (effect) =>
@@ -2012,39 +2074,6 @@ const make = Effect.gen(function* () {
             : "result_available"
           : "working"
         : progress.state;
-    const resultTransfer = taskResultTransfer(parentProjection, childControls, task) ?? null;
-    const summaryRun =
-      task.result === null
-        ? taskResultRun
-        : (childControls.runs.find((run) => run.id === resultTransfer?.sourcePoint.runId) ??
-          childRun);
-    const resultRunIds = [
-      ...new Set(
-        [taskResultRun?.id, terminalRun?.id, childRun?.id, summaryRun?.id].filter(
-          (id): id is RunId => id !== undefined,
-        ),
-      ),
-    ];
-    const resultRecords = yield* threadManagement
-      .getThreadRecords(
-        task.childThreadId,
-        ["messages", "turnItems"],
-        {
-          messageRoles: ["assistant"],
-          messageRunIds: resultRunIds,
-          turnItemRunIds: resultRunIds,
-          turnItemTypes: ["assistant_message", "error"],
-        },
-        { projectionOnly: true },
-      )
-      .pipe(NodeSqliteClient.foregroundReads, Effect.mapError(threadManagementFailure), (effect) =>
-        McpTaskTrace.stage(effect, "result", "t3.task"),
-      );
-    const childProjection = {
-      ...childControls,
-      messages: [...childControls.messages, ...resultRecords.messages],
-      turnItems: resultRecords.turnItems,
-    };
     const heldForRestart =
       task.result === null &&
       taskWorkState === "result_available" &&
@@ -2076,6 +2105,62 @@ const make = Effect.gen(function* () {
     const resultRun = taskResultRun ?? childRun;
     const stall = isTerminalTaskStatus(reportedStatus) ? resultRun?.delegatedTaskStall : undefined;
     const status = stall === undefined ? reportedStatus : "failed";
+    const providerFailure =
+      status === "failed"
+        ? latestRootProviderFailure(resultRun ?? null, childControls.turnItems)
+        : null;
+    const taskFailure =
+      status !== "failed"
+        ? undefined
+        : providerFailure !== null
+          ? {
+              category: providerFailure.category ?? "unknown",
+              code: providerFailure.code,
+              message: providerFailure.message.slice(0, 2_000),
+              retryable: providerFailure.retryable,
+            }
+          : stall === undefined
+            ? undefined
+            : {
+                category: "unknown" as const,
+                code: null,
+                message: stalledSummary(stall, null).slice(0, 2_000),
+                retryable: null,
+              };
+    onProgress?.({ status, ...(taskFailure === undefined ? {} : { failure: taskFailure }) });
+    const resultTransfer = taskResultTransfer(parentProjection, childControls, task) ?? null;
+    const summaryRun =
+      task.result === null
+        ? taskResultRun
+        : (childControls.runs.find((run) => run.id === resultTransfer?.sourcePoint.runId) ??
+          childRun);
+    const resultRunIds = [
+      ...new Set(
+        [taskResultRun?.id, terminalRun?.id, childRun?.id, summaryRun?.id].filter(
+          (id): id is RunId => id !== undefined,
+        ),
+      ),
+    ];
+    const resultRecords = yield* threadManagement
+      .getThreadRecords(
+        task.childThreadId,
+        ["messages", "turnItems"],
+        {
+          messageRoles: ["assistant"],
+          messageRunIds: resultRunIds,
+          turnItemRunIds: resultRunIds,
+          turnItemTypes: ["assistant_message"],
+        },
+        { projectionOnly: true },
+      )
+      .pipe(NodeSqliteClient.foregroundReads, Effect.mapError(threadManagementFailure), (effect) =>
+        McpTaskTrace.stage(effect, "result", "t3.task"),
+      );
+    const childProjection = {
+      ...childControls,
+      messages: [...childControls.messages, ...resultRecords.messages],
+      turnItems: [...childControls.turnItems, ...resultRecords.turnItems],
+    };
     const resultText = (run: OrchestrationV2Run) => {
       const partial = subagentResultForRun(childProjection, run);
       return run.delegatedTaskStall === undefined
@@ -2169,6 +2254,7 @@ const make = Effect.gen(function* () {
       childRunId: childRun?.id ?? null,
       childNodeId: task.id,
       status,
+      ...(taskFailure === undefined ? {} : { failure: taskFailure }),
       startedAt: childRun?.startedAt == null ? null : DateTime.formatIso(childRun.startedAt),
       startPending:
         childRun?.startedAt == null &&
@@ -2770,6 +2856,7 @@ const make = Effect.gen(function* () {
                   : stage,
           ...(retryKey === undefined ? {} : { requestKey: retryKey }),
           ...(taskId === undefined ? {} : { taskId }),
+          ...(stage === "dispatch" ? { onTimeout: "detach" as const } : {}),
         }).pipe((bounded) => McpTaskTrace.stage(bounded, stage));
       const { scope, parent } = yield* bounded(
         "caller",
@@ -2882,10 +2969,46 @@ const make = Effect.gen(function* () {
         }
         workspaceStrategy = { type: "worktree", baseRef: base.commitSha, startFromOrigin: false };
       }
+      const dispatchAccepted = yield* Deferred.make<void, OrchestratorMcpFailure>();
+      const upgradeCompletionWake = Effect.fn("OrchestratorMcpService.upgradeCompletionWake")(
+        (taskId: NodeId) =>
+          threadManagement
+            .dispatch({
+              type: "delegated_task.wake-policy",
+              commandId: stableCommandId({
+                scope,
+                requestKey: key,
+                operation: "delegate-task-wake-policy",
+              }),
+              parentThreadId: scope.thread.threadId,
+              taskId,
+              completionWake: "always",
+            })
+            .pipe(
+              Effect.catch((error) =>
+                Effect.logWarning("orchestrator-mcp.delegate-task.wake-policy-failed", {
+                  taskId,
+                  outcome:
+                    error._tag === "OrchestratorCommandPreviouslyRejectedError"
+                      ? "previously_rejected"
+                      : "dispatch_failed",
+                  error,
+                }),
+              ),
+              Effect.catchCause((cause) =>
+                Effect.logWarning("orchestrator-mcp.delegate-task.wake-policy-failed", {
+                  taskId,
+                  outcome: "defect",
+                  cause,
+                }),
+              ),
+              Effect.asVoid,
+            ),
+      );
       // ThreadManagementService.dispatch is the chokepoint for this command
       // type's own enablement check, using the same command id and its
       // receipt-replay exemption, so no separate assert runs here.
-      const result = yield* threadManagement
+      const { result, preparation } = yield* threadManagement
         .dispatch({
           type: "delegated_task.request",
           createdBy: "agent",
@@ -2924,7 +3047,47 @@ const make = Effect.gen(function* () {
                   `Unable to create delegated task: ${errorMessage(error)}`,
                 ),
           ),
+          (dispatch) =>
+            Effect.uninterruptibleMask((restore) =>
+              Effect.gen(function* () {
+                const result = yield* restore(dispatch);
+                const createdRun = result.storedEvents.find(
+                  (stored) =>
+                    stored.event.type === "run.created" &&
+                    stored.event.payload.workspacePreparation !== undefined,
+                );
+                // A late commit must schedule preparation before its bounded waiter can leave.
+                const preparation =
+                  createdRun?.event.type === "run.created"
+                    ? yield* threadLaunch
+                        .prepareRun({
+                          commandId,
+                          threadId: createdRun.event.threadId,
+                          runId: createdRun.event.payload.id,
+                        })
+                        .pipe(Effect.forkIn(serviceScope, { uninterruptible: false }))
+                    : undefined;
+                return { result, preparation };
+              }),
+            ),
+          Effect.onExit((exit) =>
+            Deferred.done(
+              dispatchAccepted,
+              Exit.map(exit, () => undefined),
+            ),
+          ),
           (effect) => bounded("dispatch", effect, expectedTaskId),
+          Effect.onExit((exit) => {
+            if (input.mode !== "wait" || Exit.isSuccess(exit)) return Effect.void;
+            // The caller has no waiter after a dispatch timeout or disconnect.
+            // Await this create before upgrading, including when it already committed.
+            return Deferred.await(dispatchAccepted).pipe(
+              Effect.andThen(upgradeCompletionWake(expectedTaskId)),
+              Effect.catchCause(() => Effect.void),
+              Effect.forkIn(serviceScope, { uninterruptible: false }),
+              Effect.asVoid,
+            );
+          }),
         );
       const taskEvent = result.storedEvents.find(
         (stored) =>
@@ -2977,20 +3140,6 @@ const make = Effect.gen(function* () {
         pendingApproval: null,
         waitTimedOut: input.mode === "wait",
       });
-      // Preparation belongs to the service, not the transport request. A timed
-      // out caller must not cancel work whose command already committed.
-      const preparation =
-        childThreadId !== null &&
-        childRunEvent?.event.type === "run.created" &&
-        childRunEvent.event.payload.workspacePreparation !== undefined
-          ? yield* threadLaunch
-              .prepareRun({
-                commandId,
-                threadId: childThreadId,
-                runId: childRunEvent.event.payload.id,
-              })
-              .pipe(Effect.forkIn(serviceScope))
-          : undefined;
       const observe = (value: OrchestratorMcpDelegateTaskResult) => Ref.set(snapshot, value);
       const continuation = yield* Effect.gen(function* () {
         if (preparation !== undefined) yield* Fiber.join(preparation);
@@ -3019,41 +3168,9 @@ const make = Effect.gen(function* () {
             ...(yield* Ref.get(snapshot)),
             waitTimedOut: input.mode === "wait",
           };
-      // Upgrading delivery cannot be on the response deadline: a slow writer
-      // must not hide the identity of an already accepted task.
+      // A slow writer must not hide the identity of an already accepted task.
       if (input.mode === "wait" && (answer.waitTimedOut || !isTerminalTaskStatus(answer.status))) {
-        yield* threadManagement
-          .dispatch({
-            type: "delegated_task.wake-policy",
-            commandId: stableCommandId({
-              scope,
-              requestKey: key,
-              operation: "delegate-task-wake-policy",
-            }),
-            parentThreadId: scope.thread.threadId,
-            taskId,
-            completionWake: "always",
-          })
-          .pipe(
-            Effect.catch((error) =>
-              Effect.logWarning("orchestrator-mcp.delegate-task.wake-policy-failed", {
-                taskId,
-                outcome:
-                  error._tag === "OrchestratorCommandPreviouslyRejectedError"
-                    ? "previously_rejected"
-                    : "dispatch_failed",
-                error,
-              }),
-            ),
-            Effect.catchCause((cause) =>
-              Effect.logWarning("orchestrator-mcp.delegate-task.wake-policy-failed", {
-                taskId,
-                outcome: "defect",
-                cause,
-              }),
-            ),
-            Effect.forkIn(serviceScope),
-          );
+        yield* upgradeCompletionWake(taskId).pipe(Effect.forkIn(serviceScope));
       }
       yield* Effect.annotateCurrentSpan({
         "t3.delegate.outcome": answer.waitTimedOut
@@ -3659,7 +3776,10 @@ const make = Effect.gen(function* () {
       return yield* SendAcknowledgement.bounded(
         (clientRequestId) =>
           Effect.gen(function* () {
-            const { parent, limits, target } = yield* loadScopedThread(scope, input.threadId);
+            const { parent, limits, target } = yield* SendAcknowledgement.waitingOn(
+              loadScopedThread(scope, input.threadId),
+              `target thread read for thread ${input.threadId}`,
+            );
             yield* assertLiveCallerForOtherThread(scope, parent, target);
             yield* resolveRuntimeMode(limits.runtimeMode, target.thread.runtimeMode);
             yield* resolveInteractionMode(limits.interactionMode, target.thread.interactionMode);
@@ -3670,12 +3790,15 @@ const make = Effect.gen(function* () {
             const messages =
               scope.thread === undefined
                 ? []
-                : (yield* threadManagement
-                    .getThreadRecords(input.threadId, ["messages"], {
-                      messageRoles: ["user"],
-                      turnItemTypes: [],
-                    })
-                    .pipe(Effect.mapError(threadManagementFailure))).messages;
+                : (yield* SendAcknowledgement.waitingOn(
+                    threadManagement
+                      .getThreadRecords(input.threadId, ["messages"], {
+                        messageRoles: ["user"],
+                        turnItemTypes: [],
+                      })
+                      .pipe(Effect.mapError(threadManagementFailure)),
+                    `prior send read for thread ${input.threadId}`,
+                  )).messages;
             const prior =
               scope.thread === undefined
                 ? undefined
@@ -3703,29 +3826,32 @@ const make = Effect.gen(function* () {
                 : CommandId.make(
                     `command:mcp:${prior.id.split(":")[2]}:thread-send:${stablePart(key)}`,
                   );
-            const result = yield* threadManagement
-              .sendToThread({
-                projectId: target.thread.projectId,
-                commandId,
-                threadId: input.threadId,
-                ...(parent === undefined ? {} : { senderThreadId: parent.thread.id }),
-                messageId,
-                text: input.message,
-                attachments: [],
-                mode,
-                createdBy: "agent",
-                creationSource: "mcp",
-              })
-              .pipe(
-                Effect.mapError((error) =>
-                  isThreadManagementError(error)
-                    ? threadManagementFailure(error)
-                    : failure(
-                        "orchestration_error",
-                        `Unable to send to thread ${input.threadId}: ${errorMessage(error)}`,
-                      ),
+            const result = yield* SendAcknowledgement.waitingOn(
+              threadManagement
+                .sendToThread({
+                  projectId: target.thread.projectId,
+                  commandId,
+                  threadId: input.threadId,
+                  ...(parent === undefined ? {} : { senderThreadId: parent.thread.id }),
+                  messageId,
+                  text: input.message,
+                  attachments: [],
+                  mode,
+                  createdBy: "agent",
+                  creationSource: "mcp",
+                })
+                .pipe(
+                  Effect.mapError((error) =>
+                    isThreadManagementError(error)
+                      ? threadManagementFailure(error)
+                      : failure(
+                          "orchestration_error",
+                          `Unable to send to thread ${input.threadId}: ${errorMessage(error)}`,
+                        ),
+                  ),
                 ),
-              );
+              `message dispatch for thread ${input.threadId}`,
+            );
             // Delivery is the committed route, not provider acceptance. Claude's priority-next
             // steer may wait for a tool boundary; that wait must never hold the MCP reply.
             return {
@@ -3745,28 +3871,72 @@ const make = Effect.gen(function* () {
     }),
     waitForThread: Effect.fn("OrchestratorMcpService.waitForThread")(function* (scope, input) {
       const waitStartedAt = yield* Clock.monotonicTimeNanos;
+      const call = yield* Effect.serviceOption(McpCallAnalytics.McpCall);
+      if (Option.isSome(call)) call.value.waitStage = "lookup.caller";
       let snapshot: OrchestratorMcpThreadWaitResult | undefined;
       const waiting = Effect.gen(function* () {
-        const { target } = yield* loadScopedThread(scope, input.threadId);
-        const records = yield* loadProjection(input.threadId, ["runs"]);
-        const selected =
-          input.runId === undefined
-            ? records.runs.toSorted((a, b) => b.ordinal - a.ordinal)[0]
-            : records.runs.find((run) => run.id === input.runId);
+        yield* loadCaller(scope);
+        if (Option.isSome(call)) {
+          call.value.waitStage = "lookup.target";
+          call.value.readerLane = "foreground";
+        }
+        // This path needs one thread row and one run, never shell/history hydration.
+        const records = yield* threadManagement
+          .getThreadRecords(
+            input.threadId,
+            ["runs"],
+            input.runId === undefined ? { latestRunOnly: true } : { runIds: [input.runId] },
+            { projectionOnly: true },
+          )
+          .pipe(
+            NodeSqliteClient.foregroundReads,
+            Effect.mapError((cause) =>
+              NodeSqliteClient.readerLaneFailure(cause) !== undefined
+                ? failure(
+                    "lookup_timeout",
+                    `Robob could not acquire the foreground reader for thread ${input.threadId}. Nothing changed. Retry t3_thread_wait, or check the task with task_status.`,
+                  )
+                : cause._tag === "OrchestratorProjectionError" &&
+                    isProjectionStoreThreadNotFoundError(cause.cause)
+                  ? failure("thread_not_found", `Thread ${input.threadId} was not found.`)
+                  : threadManagementFailure(cause),
+            ),
+          );
+        if (records.thread.deletedAt !== null)
+          return yield* failure("thread_not_found", `Thread ${input.threadId} was not found.`);
+        const selected = records.runs[0];
+        if (input.runId !== undefined && selected === undefined)
+          return yield* failure(
+            "run_not_found",
+            `Run ${input.runId} was not found in thread ${input.threadId}.`,
+          );
         snapshot = {
           threadId: input.threadId,
           runId: selected?.id ?? null,
           status: selected === undefined ? "idle" : runOutcome(selected),
           timedOut: true,
         };
+        if (Option.isSome(call)) {
+          call.value.waitLookupMs = Number((yield* Clock.monotonicTimeNanos) - waitStartedAt) / 1e6;
+          call.value.waitStage = "waiting";
+          // Event-driven waiting still uses background history and restart-continuation reads.
+          call.value.readerLane = "background";
+        }
         const result = yield* threadManagement
           .waitForThread({
-            projectId: target.thread.projectId,
+            projectId: records.thread.projectId,
             threadId: input.threadId,
             ...(input.runId === undefined ? {} : { runId: input.runId }),
             timeoutMs: yield* remainingWaitMs(waitStartedAt, input.timeoutMs),
           })
-          .pipe(Effect.mapError(threadManagementFailure));
+          .pipe(
+            NodeSqliteClient.backgroundReads,
+            Effect.catchIf(
+              (cause) => NodeSqliteClient.readerLaneFailure(cause) !== undefined,
+              () => Effect.succeed({ run: selected ?? null, timedOut: true }),
+            ),
+            Effect.mapError(threadManagementFailure),
+          );
         return {
           threadId: input.threadId,
           runId: result.run?.id ?? null,
@@ -3779,13 +3949,20 @@ const make = Effect.gen(function* () {
         Effect.timeoutOption(
           Duration.millis(yield* remainingWaitMs(waitStartedAt, input.timeoutMs)),
         ),
+        Effect.ensuring(
+          Effect.gen(function* () {
+            if (Option.isSome(call) && call.value.waitLookupMs === undefined)
+              call.value.waitLookupMs =
+                Number((yield* Clock.monotonicTimeNanos) - waitStartedAt) / 1e6;
+          }),
+        ),
       );
       if (Option.isSome(result)) return result.value;
       return (
         snapshot ??
         (yield* failure(
-          "orchestration_error",
-          "Thread wait timed out during lookup. Retry t3_thread_wait after reconnecting.",
+          "lookup_timeout",
+          `Robob took longer than ${Math.min(MAX_WAIT_TIMEOUT_MS, Math.max(1, input.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS)) / 1000} s to read thread ${input.threadId}. Nothing changed. Retry t3_thread_wait, or check the task with task_status.`,
         ))
       );
     }, untilShutdown),

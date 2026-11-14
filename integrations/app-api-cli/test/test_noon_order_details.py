@@ -7,6 +7,29 @@ import order_tracker
 
 
 class DetailTests(unittest.TestCase):
+    def test_marketplace_cache_proof_requires_reconciled_delivery(self):
+        data={'orderNr':'NTEST','createdAt':'2026-11-01T12:00:00+04:00',
+              'shippingAddress':{},'trackActions':{},'shippingPreferences':{},'payment':{},
+              'metadata':{'pageRefreshSec':None},
+              'invoice':{'sections':[{'entries':[{'title':'Subtotal (1 item)'},
+                                                {'title':'Total (inc. VAT)','amount':'10.00'}],
+                                     'groups':[{'entries':[{'title':'Subtotal (1 item)'}]}]}]},
+              'itemGroups':[{'orderNr':'NTEST','itemNr':'NTEST-1','shipmentNr':'NTEST-S1',
+                             'subStatus':{'highStatusCode':'delivered'},
+                             'items':[{'itemNr':'NTEST-1','shipmentNr':'NTEST-S1','quantity':1}]}]}
+        with patch.object(d.vertical,'_headers',return_value={}), patch.object(d.vertical,'_read',return_value=data):
+            result=d.details('NTEST','marketplace')
+            self.assertTrue(result['whole_order_complete'])
+            self.assertEqual(result['status'],'delivered')
+            self.assertEqual(result['placed_at'],'2026-11-01T12:00:00+04:00')
+            data['itemGroups'][0]['subStatus']['highStatusCode']='cancelled'
+            result=d.details('NTEST','marketplace')
+            self.assertFalse(result['whole_order_complete'])
+            self.assertEqual(result['status'],'unknown')
+            data['itemGroups'][0]['subStatus']['highStatusCode']='delivered'
+            data['invoice']['sections'][0]['groups']=[]
+            self.assertFalse(d.details('NTEST','marketplace')['whole_order_complete'])
+
     def test_unknown_processing_cannot_render_cancelled(self):
         cfg={'app':'noon','order':'NTEST','vertical':'marketplace'}
         data={'status':'unknown','raw_status':'processing','status_text':'Cancelled',
@@ -68,7 +91,7 @@ class DetailTests(unittest.TestCase):
     def test_food_snapshot_choices_notes_and_secret_exclusion(self):
         raw=self.food();raw['createdAt']='2026-10-23T19:45:00Z'
         result=d.food(raw,'FTEST');line=result['items'][0]
-        self.assertEqual(result['placed_at'],'2026-10-23T19:45:00Z')
+        self.assertEqual(result['placed_at'],'2026-10-23T19:45:00+00:00')
         self.assertEqual((line['name'],line['qty'],line['line_total']),('Coffee',2,12))
         self.assertEqual(line['options'][0]['name'],'Oat milk')
         self.assertEqual(line['notes'],'Extra hot')
@@ -145,7 +168,7 @@ class MoneyOrderCoverageTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location('partial_money_cases', source)
         mc = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mc)
-        for stop, count, expected in [('detail_limit', 9, 8), ('marketplace_failure', 1, 1)]:
+        for stop, count, expected in [('multiple_details', 9, 9), ('marketplace_failure', 1, 1)]:
             with self.subTest(stop=stop):
                 detail_ids = []
                 def request(route, *args, **kwargs):
@@ -162,7 +185,8 @@ class MoneyOrderCoverageTests(unittest.TestCase):
                 with patch.object(core, 'verified_session', return_value={}), patch.object(core, 'request', request), \
                         patch.object(minutes, 'native_request', detail), \
                         patch.object(vertical, '_headers', return_value={}) as other_headers:
-                    result = mc.charges.order_lookup.native('noon', str(Path(__file__).resolve().parents[1]))
+                    result = mc.charges.order_lookup.native('noon', str(Path(__file__).resolve().parents[1]),
+                                                           services=('minutes', 'marketplace'))
                 self.assertFalse(result['complete'])
                 self.assertEqual(len(result['orders']), expected)
                 self.assertEqual(len(detail_ids), expected)

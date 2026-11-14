@@ -1,12 +1,12 @@
 // Synthetic homes only; invoked by the subprocess crash test, never by the CLI.
-import fs from "node:fs";
-import path from "node:path";
-import { createRequire } from "node:module";
-import { pathToFileURL } from "node:url";
+import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
+import * as NodeModule from "node:module";
+import * as NodeURL from "node:url";
 const root = process.cwd();
-const require = createRequire(path.join(root, "apps/server/package.json"));
-const load = (n) => import(pathToFileURL(require.resolve(n)));
-const app = (n) => import(pathToFileURL(path.join(root, "apps/server/src", n + ".ts")));
+const require = NodeModule.createRequire(NodePath.join(root, "apps/server/package.json"));
+const load = (n) => import(NodeURL.pathToFileURL(require.resolve(n)));
+const app = (n) => import(NodeURL.pathToFileURL(NodePath.join(root, "apps/server/src", n + ".ts")));
 const [Effect, Layer, DateTime, NodeServices, Sqlite, Projection, Projects] = await Promise.all([
   load("effect/Effect"),
   load("effect/Layer"),
@@ -17,7 +17,7 @@ const [Effect, Layer, DateTime, NodeServices, Sqlite, Projection, Projects] = aw
   app("orchestration-v2/ProjectStore"),
 ]);
 const [home, countArg, activeArg] = process.argv.slice(2);
-if (!home || !fs.existsSync(path.join(home, ".crash-sandbox")))
+if (!home || !NodeFS.existsSync(NodePath.join(home, ".crash-sandbox")))
   throw Error("Expected marked synthetic home");
 const count = Number(countArg ?? 38),
   active = Number(activeArg ?? 35);
@@ -126,23 +126,25 @@ await Effect.runPromise(
   }).pipe(
     Effect.provide(
       Layer.mergeAll(Projection.layer, Projects.layer).pipe(
-        Layer.provideMerge(Sqlite.layerFromPath(path.join(home, "userdata", "statev2.sqlite"))),
+        Layer.provideMerge(Sqlite.layerFromPath(NodePath.join(home, "userdata", "statev2.sqlite"))),
         Layer.provide(NodeServices.layer),
       ),
     ),
     Effect.scoped,
   ),
 );
-fs.writeFileSync(
-  path.join(home, "userdata", "settings.json"),
+NodeFS.writeFileSync(
+  NodePath.join(home, "userdata", "settings.json"),
   JSON.stringify({
     continueThreadsAfterServerUpdate: true,
+    // Measure recovery throughput and I7 here; restart pacing is tested separately.
+    restartPacing: { maxActive: 1000, spacingMs: 0, loadHigh: 1000 },
     providerInstances: {
       codex: {
         driver: "codex",
         enabled: true,
         config: {
-          binaryPath: path.join(
+          binaryPath: NodePath.join(
             root,
             "apps/server/src/ardud/fast-install/testing/codex-stub.fixture.mjs",
           ),

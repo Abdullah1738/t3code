@@ -1,19 +1,60 @@
 #!/Users/ardud/.local/android/venv/bin/python
 """ph: drive Abdullah's local Nothing (3a) Lite over ADB/uiautomator2. Run `ph help`."""
 import sys, os, re, time, subprocess, xml.etree.ElementTree as ET
+import argparse, base64, collections, datetime, json, signal
+from pathlib import Path
 SERIAL = os.environ.get("PH_SERIAL", "002473611000997")
 TMP = os.environ.get("PH_TMP", "/private/var/folders/vt/8qndzr_j44z70bh0rn2zyfkm0000gn/T/opencode/phone")
 os.makedirs(TMP, exist_ok=True)
 _d = None
+_action_sent = False
+_context = {}
+_private_values = ()
+STATE = Path.home() / ".local/state/ph"
+
+def single_send_device(u):
+    # u2 also retries HTTP RPCs and falls back to another text input method internally.
+    # Disable those replays here; ph captures evidence before any server restart.
+    class SingleSendDevice(u.Device):
+        def jsonrpc_call(self, method, params=None, timeout=10):
+            from uiautomator2.core import _jsonrpc_call
+            return _jsonrpc_call(self._dev, self._device_server_port, method, params, timeout, False)
+
+        def _must_broadcast(self, action, extras=None):
+            from uiautomator2.exceptions import AdbBroadcastError
+            result = self._broadcast(action, extras or {})
+            if result.code != -1:
+                raise AdbBroadcastError("input broadcast reply did not confirm success")
+
+        def send_keys(self, text, clear=False):
+            if self.is_input_ime_installed():
+                self.set_input_ime()
+                if clear: self._must_broadcast("ADB_KEYBOARD_CLEAR_TEXT")
+                self._must_broadcast("ADB_KEYBOARD_INPUT_TEXT", {
+                    "text": base64.b64encode(text.encode()).decode()})
+                self._must_broadcast("ADB_KEYBOARD_HIDE")
+            else:
+                if clear: u._Device.clear_text(self)
+                u._Device.send_keys(self, text)
+    return SingleSendDevice(SERIAL)
+
+def action(call, *args, **kwargs):
+    global _action_sent
+    _action_sent = True
+    return call(*args, **kwargs)
+
 def d():
     global _d
     if _d is None:
-        import uiautomator2 as u; _d = u.connect(SERIAL)
+        import uiautomator2 as u; _d = single_send_device(u)
     return _d
-def adb(*a): return subprocess.run(["adb", "-s", SERIAL, *a], capture_output=True, text=True).stdout
-def _run(args, t=5):
-    try: return subprocess.run(args, capture_output=True, text=True, timeout=t).stdout
-    except Exception: return ""
+def adb(*a): return subprocess.run(["adb", "-s", SERIAL, *a], capture_output=True, text=True, check=True).stdout
+def _run(args, t=5, strict=False):
+    try: return subprocess.run(args, capture_output=True, text=True, timeout=t, check=strict).stdout
+    except TimeoutError: raise
+    except Exception:
+        if strict: raise
+        return ""
 def doctor(as_json):
     import json
     st, detail, ask, code = "", "", None, 3
@@ -29,6 +70,8 @@ def doctor(as_json):
         pw = (_run(["adb", "-s", SERIAL, "shell", "dumpsys power | grep -m1 mWakefulness"]).strip().splitlines() or [""])[0]
         if echo == "ok":
             st, detail, code = "ok", f"adb reachable; {pw or 'screen state unknown'}", 0
+            if not re.search(r"\bmWakefulness=Awake\b", pw):
+                detail += "; phone not awake; run ph wake"
         else:
             st, detail, ask = "offline", "adb lists the phone but its shell did not answer", None
     elif s == "unauthorized":
@@ -53,13 +96,53 @@ def doctor(as_json):
         print(f"{st}: {detail}")
         if ask: print(f"ask: {ask}")
     sys.exit(code)
+def wake(timeout=6.0):
+    deadline = time.monotonic() + timeout
+    retry_at = deadline - timeout / 2
+    state = {"wakefulness": None, "keyguard": "unknown", "actions": []}
+    def run(*args, strict=False):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0: return ""
+        # Bound each adb call as well as polling; the outer step alarm defaults to 45s.
+        return _run(["adb", "-s", SERIAL, *args], t=min(1.0, remaining), strict=strict)
+    def act(name, *args):
+        if time.monotonic() < deadline:
+            state["actions"].append(name)
+            action(run, *args, strict=True)
+    def power():
+        match = re.search(r"\bmWakefulness=(\w+)", run("shell", "dumpsys power | grep -m1 mWakefulness"))
+        return match.group(1) if match else None
+    def wake_key():
+        act("KEYCODE_WAKEUP", "shell", "input", "keyevent", "KEYCODE_WAKEUP")
+    def dismiss():
+        act("dismiss-keyguard", "shell", "wm", "dismiss-keyguard")
+
+    state["wakefulness"] = power()
+    # ADB wakes Dozing directly; u2's screen_on() treats AOD as already on.
+    if state["wakefulness"] != "Awake": wake_key()
+    dismiss()
+    retried = False
+    while time.monotonic() < deadline:
+        state["wakefulness"] = power()
+        match = re.search(r"\bisKeyguardShowing=(true|false)\b", run("shell", "dumpsys window"))
+        # Missing keyguard data cannot prove the app is accessible.
+        state["keyguard"] = {"true": "showing", "false": "hidden"}.get(match.group(1) if match else None, "unknown")
+        if state["wakefulness"] == "Awake" and state["keyguard"] == "hidden":
+            return True, state
+        if not retried and time.monotonic() >= retry_at and state["wakefulness"] != "Awake":
+            wake_key()
+            dismiss()
+            retried = True
+        remaining = deadline - time.monotonic()
+        if remaining > 0: time.sleep(min(0.3, remaining))
+    return False, state
 def nodes():
     root = ET.fromstring(d().dump_hierarchy(compressed=False))
     out = []
     for n in root.iter("node"):
         a = n.attrib; t = a.get("text", "").strip(); c = a.get("content-desc", "").strip()
         rid = a.get("resource-id", "").split("/")[-1]
-        m = re.findall(r"\d+", a.get("bounds", "")); 
+        m = re.findall(r"\d+", a.get("bounds", ""));
         if len(m) != 4: continue
         x1, y1, x2, y2 = map(int, m)
         if x2 <= x1 or y2 <= y1: continue
@@ -109,6 +192,108 @@ def redact(text, field=""):
     if field and is_sensitive_field(field) and text:
         if re.fullmatch(r"\s*[0-9][0-9/ -]{0,6}\s*", text): return "••/••" if re.search(r"[/-]", text) else "•••"
     return redact_text(text)
+def diagnostic(text):
+    text = str(text)
+    # A fragment replacement can corrupt delimiters in nested or truncated payloads.
+    # Keep structured context in event fields; never persist quoted free-form data.
+    if "'" in text or '"' in text: return "[redacted payload]"
+    private = set()
+    for value in _private_values:
+        if value:
+            private.update((value, repr(value)[1:-1], ascii(value)[1:-1],
+                            json.dumps(value)[1:-1], json.dumps(value, ensure_ascii=False)[1:-1]))
+    for value in sorted(private, key=len, reverse=True):
+        text = text.replace(value, "[redacted]")
+    text = re.sub(r"(?i)\b(text|password|token|secret|clipboard|params|extras|args)\s*[:=].*",
+                  r"\1=[redacted]", text)
+    return redact_text(text)
+
+def token(value, fallback="unknown"):
+    return value if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:-]{0,63}", value) else fallback
+
+def component(value):
+    return value if re.fullmatch(r"(?:android|[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+)/\.?[A-Za-z_$][\w.$]*", value, re.A) else None
+
+def maintain_logs():
+    try:
+        STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+        events = STATE / "events.jsonl"
+        if events.exists() and events.stat().st_size > 5 * 1024 * 1024:
+            events.replace(STATE / "events.jsonl.1")
+        drops = STATE / "drops"
+        if drops.exists():
+            files = sorted(drops.glob("*.log"), key=lambda f: f.stat().st_mtime_ns)
+            for old in files[:-200]: old.unlink()
+    except Exception: pass
+
+def event(kind, exc=None, *, source="ph", cmd=None, phase=None, message=None):
+    # Diagnostics must not change a command result, even on a missing phone or full disk.
+    try:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        row = dict(ts=now.isoformat(), event=kind, source=token(source),
+                   cmd=token(cmd or _context.get("cmd", "unknown")),
+                   target_kind=_context.get("target_kind", "selector"),
+                   phase=phase or ("action" if _action_sent else "read"),
+                   exc_type=token(type(exc).__name__) if exc else None,
+                   exc_message=diagnostic(message if message is not None else str(exc) if exc else "")[:200],
+                   attempt=_context.get("attempt", 1),
+                   elapsed_ms=round((time.monotonic() - _context.get("started", time.monotonic())) * 1000),
+                   serial=SERIAL, ime=None, focused_window=None, drop_log=None)
+        row["ime"] = component(_run(["adb", "-s", SERIAL, "shell", "settings", "get", "secure", "default_input_method"], t=3).strip())
+        focus = _run(["adb", "-s", SERIAL, "shell", "dumpsys window | grep mCurrentFocus"], t=3)
+        match = re.search(r"mCurrentFocus=.*?\bu\d+\s+([^\s}]+)", focus)
+        row["focused_window"] = component(match.group(1)) if match else None
+        if kind in ("reconnect", "maybe_sent", "failed", "external_drop"):
+            raw = _run(["adb", "-s", SERIAL, "logcat", "-d", "-t", "300"], t=5)
+            lines = [diagnostic(line) for line in raw.splitlines() if re.search(
+                r"uiautomator|uia2|wetest|AndroidRuntime|lowmemorykiller|ActivityManager: Killing|InputMethod|ImeTracker|BiometricPrompt|FATAL", line, re.I)][-80:]
+            try:
+                drops = STATE / "drops"
+                drops.mkdir(parents=True, exist_ok=True, mode=0o700)
+                path = drops / (now.strftime("%Y%m%dT%H%M%S.%fZ") + "-" + row["cmd"] + ".log")
+                with path.open("x", encoding="utf-8") as out: out.write("\n".join(lines) + ("\n" if lines else ""))
+                row["drop_log"] = str(path)
+            except Exception: pass
+        STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(STATE / "events.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as out: out.write(json.dumps(row) + "\n")
+        maintain_logs()
+    except Exception: pass
+
+def note_drop(args):
+    parser = argparse.ArgumentParser(prog="ph note-drop")
+    for name in ("source", "cmd", "exc"): parser.add_argument("--" + name, required=True)
+    parser.add_argument("--msg", default="")
+    parser.add_argument("--phase", choices=("read", "action"), default="read")
+    opts = parser.parse_args(args)
+    event("external_drop", source=opts.source, cmd=opts.cmd, phase=opts.phase,
+          message=opts.msg, exc=type(token(opts.exc), (Exception,), {})(opts.msg))
+
+def show_log(n=20):
+    recent = collections.deque(maxlen=max(0, n))
+    types, sources = collections.Counter(), collections.Counter()
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)
+    for path in (STATE / "events.jsonl.1", STATE / "events.jsonl"):
+        try:
+            with path.open(encoding="utf-8") as inp:
+                for line in inp:
+                    try:
+                        row = json.loads(line)
+                        ts = datetime.datetime.fromisoformat(row["ts"])
+                        if ts.tzinfo is None: continue
+                        recent.append(row)
+                        if ts >= cutoff:
+                            types[token(row["event"])] += 1
+                            sources[token(row["source"])] += 1
+                    except (ValueError, TypeError, KeyError): continue
+        except OSError: pass
+    for row in recent:
+        print(diagnostic(f"{row['ts']} {row['event']} {row['source']} {row.get('cmd', '?')} "
+                         f"{row.get('phase', '?')} {row.get('exc_type') or '-'} "
+                         f"ime={row.get('ime')} focus={row.get('focused_window')} drop={row.get('drop_log')}"))
+    print("Last 7 days by event: " + (", ".join(f"{k}={v}" for k, v in sorted(types.items())) or "none"))
+    print("Last 7 days by source: " + (", ".join(f"{k}={v}" for k, v in sorted(sources.items())) or "none"))
+
 NOISE = re.compile(r"notification:|signal|Battery|clock|key_pos|Location requests active", re.I)
 def show(allnodes=False):
     ns = nodes()
@@ -146,33 +331,37 @@ cur                        current package/activity
 doctor [--json]            why the phone is unreachable (adb/USB state, read-only, <=5s steps); exit 0 ok, 3 otherwise
 wake                       wake + unlock (no PIN) screen
 sms [n]                    last n (default 4) incoming SMS/iMessages on the Mac (OTP codes land here)
-sh CMD...                  raw adb shell
+sh CMD...                  raw adb shell (treated as an action; never auto-repeated)
+log [n]                    last n events (default 20), counts by event/source over 7 days
+note-drop --source NAME --cmd VERB --exc TYPE [--msg TEXT] [--phase read|action]
+                           log a direct-u2 drop without connecting or resetting u2
+Exit codes: 0 success, 1 not found/timeout, 2 usage, 3 failed twice, 4 MAYBE_SENT (check ph ui before repeating)
 """); return
     c = a[0]
     if c == "ui": show("-a" in a)
     elif c == "tap":
-        if len(a) >= 3 and a[1].isdigit() and a[2].isdigit(): d().click(int(a[1]), int(a[2])); print("tapped", a[1], a[2])
+        if len(a) >= 3 and a[1].isdigit() and a[2].isdigit(): action(d().click, int(a[1]), int(a[2])); print("tapped", a[1], a[2])
         else:
             n = find(a[1], int(a[2]) if len(a) > 2 else 0)
-            if not n: print("NOT FOUND:", redact(a[1])); sys.exit(1)
-            d().click(n["x"], n["y"]); print("tapped", repr(redact(n["t"] or n["c"], field_ctx(n))), n["x"], n["y"])
+            if not n: event("not_found"); print("NOT FOUND:", redact(a[1])); sys.exit(1)
+            action(d().click, n["x"], n["y"]); print("tapped", repr(redact(n["t"] or n["c"], field_ctx(n))), n["x"], n["y"])
     elif c == "wait":
         end = time.time() + (float(a[2]) if len(a) > 2 else 15)
         while time.time() < end:
             hit = find(a[1])
             if hit: print("found", redact(a[1], field_ctx(hit))); return
             time.sleep(0.4)
-        print("TIMEOUT", redact(a[1])); sys.exit(1)
+        event("timeout"); print("TIMEOUT", redact(a[1])); sys.exit(1)
     elif c == "type":
         dv = d(); clear = "--clear" in a; txt = [x for x in a[1:] if x != "--clear"][0]
-        dv.send_keys(txt, clear=clear); print("typed", len(txt), "chars")
-    elif c == "key": d().press(a[1]); print("key", a[1])
-    elif c == "swipe": d().swipe_ext(a[1], scale=0.7); print("swiped", a[1])
-    elif c == "open": d().app_start(a[1]); print("opened", a[1])
-    elif c == "stop": d().app_stop(a[1]); print("stopped", a[1])
+        action(dv.send_keys, txt, clear=clear); print("typed", len(txt), "chars")
+    elif c == "key": action(d().press, a[1]); print("key", a[1])
+    elif c == "swipe": action(d().swipe_ext, a[1], scale=0.7); print("swiped", a[1])
+    elif c == "open": action(d().app_start, a[1]); print("opened", a[1])
+    elif c == "stop": action(d().app_stop, a[1]); print("stopped", a[1])
     elif c == "url":
         cmd = ["shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", a[1]] + (["-p", a[2]] if len(a) > 2 else [])
-        print(adb(*cmd).strip())
+        print(action(adb, *cmd).strip())
     elif c == "shot":
         f = f"{TMP}/{a[1] if len(a)>1 else 's'}-{time.strftime('%Y%m%d-%H%M%S')}.png"
         with open(f, "wb") as fh: fh.write(subprocess.run(["adb", "-s", SERIAL, "exec-out", "screencap", "-p"], capture_output=True).stdout)
@@ -180,30 +369,87 @@ sh CMD...                  raw adb shell
         img = Image.open(f); s = f[:-4] + "-s.png"
         img.resize((540, int(540 * img.height / img.width))).save(s); print(f); print(s)
     elif c == "cur":
-        out = subprocess.run(["adb","-s",SERIAL,"shell","dumpsys activity activities | grep -m1 topResumedActivity"],capture_output=True,text=True).stdout.strip()
-        print(out or d().app_current())
-    elif c == "wake": d().screen_on(); adb("shell", "wm", "dismiss-keyguard"); print("awake")
+        # adbutils.app_current() retries internally; keep recovery in ph's outer loop.
+        out = adb("shell", "dumpsys activity activities | grep -m1 -E 'topResumedActivity|mResumedActivity'").strip()
+        if not out: raise RuntimeError("current activity not reported")
+        print(out)
+    elif c == "wake":
+        ok, state = wake()
+        if "--json" in a:
+            import json
+            print(json.dumps({"ok": ok, **state}))
+        elif ok: print("awake")
+        elif state["wakefulness"] == "Awake" and state["keyguard"] == "showing":
+            print("locked: wakefulness=Awake keyguard=showing after dismiss (secure lock?)")
+        else:
+            print(f"not awake: wakefulness={state['wakefulness'] or 'unknown'} keyguard={state['keyguard']}")
+        if not ok: sys.exit(1)
     elif c == "sms":
         q = ("select datetime(date/1000000000+978307200,'unixepoch','localtime'), text from message "
              f"where is_from_me=0 and text is not null and text != '' order by date desc limit {int(a[1]) if len(a)>1 else 4}")
         print(subprocess.run(["sqlite3", os.path.expanduser("~/Library/Messages/chat.db"), q], capture_output=True, text=True).stdout, end="")
-    elif c == "sh": print(adb("shell", *a[1:]), end="")
+    elif c == "sh": print(action(adb, "shell", *a[1:]), end="")
+    elif c == "log": show_log(int(a[1]) if len(a) > 1 else 20)
+    elif c == "note-drop": note_drop(a[1:])
     elif c == "doctor": doctor("--json" in a)
     else: print("unknown; ph help"); sys.exit(2)
 def _alarm(*_): raise TimeoutError("ph: step timed out")
-if __name__ == "__main__":
-    import signal
-    signal.signal(signal.SIGALRM, _alarm)
+def reset_u2():
+    global _d
+    try:
+        _run(["adb", "-s", SERIAL, "shell", "pkill -f com.wetest.uia2; pkill -f uiautomator"], t=5)
+    except Exception: pass
+    finally: _d = None
+
+def run(argv):
+    global _action_sent, _context, _private_values
+    _action_sent = False
+    cmd = token(argv[0]) if argv else "help"
+    kind = "selector"
+    if cmd == "tap":
+        kind = "coords" if len(argv) >= 3 and argv[1].isdigit() and argv[2].isdigit() else "id" if len(argv) > 1 and argv[1].startswith("id=") else "text"
+    elif cmd in ("type", "wait"): kind = "text"
+    _context = dict(cmd=cmd, target_kind=kind, started=time.monotonic())
+    values = []
+    if cmd == "type": values = [v for v in argv[1:] if v != "--clear"]
+    elif cmd == "sh": values = argv[1:]
+    elif cmd in ("tap", "wait", "url") and len(argv) > 1 and kind != "coords": values = [argv[1]]
+    _private_values = tuple(values + [part for v in values for part in v.splitlines() if part] +
+                            [base64.b64encode(v.encode()).decode() for v in values])
+    maintain_logs()
+    # These local diagnostics have their own bounded adb calls and must never reset u2.
+    if cmd in ("log", "note-drop"):
+        main(argv)
+        return 0
+    previous = signal.signal(signal.SIGALRM, _alarm)
     lim = int(os.environ.get("PH_TIMEOUT", "45"))
-    if sys.argv[1:2] == ["wait"] and len(sys.argv) > 3: lim = int(float(sys.argv[3])) + 30
-    for attempt in (1, 2):
-        signal.alarm(lim)
-        try: main(sys.argv[1:]); break
-        except SystemExit: raise
-        except Exception as e:
-            signal.alarm(0)
-            if attempt == 2: print("ERROR:", type(e).__name__, str(e)[:200]); sys.exit(3)
-            # u2 server wedged: kill it and reconnect once
-            subprocess.run(["adb", "-s", SERIAL, "shell", "pkill -f com.wetest.uia2; pkill -f uiautomator"], capture_output=True, timeout=15)
-            _d = None; time.sleep(1)
-        finally: signal.alarm(0)
+    if cmd == "wait" and len(argv) > 2: lim = int(float(argv[2])) + 30
+    try:
+        for attempt in (1, 2):
+            _context["attempt"] = attempt
+            signal.alarm(lim)
+            try:
+                main(argv)
+                return 0
+            except SystemExit as exc:
+                return exc.code
+            except Exception as exc:
+                signal.alarm(0)
+                if _action_sent:
+                    event("maybe_sent", exc)
+                    reset_u2()
+                    print(f"MAYBE_SENT: {cmd} may have reached the phone ({type(exc).__name__}); run 'ph ui' to check before repeating")
+                    return 4
+                if isinstance(exc, TimeoutError): event("timeout", exc)
+                event("failed" if attempt == 2 else "reconnect", exc)
+                reset_u2()
+                if attempt == 2:
+                    print("ERROR:", type(exc).__name__, diagnostic(str(exc))[:200])
+                    return 3
+                time.sleep(1)
+            finally: signal.alarm(0)
+    finally:
+        signal.signal(signal.SIGALRM, previous)
+
+if __name__ == "__main__":
+    sys.exit(run(sys.argv[1:]))

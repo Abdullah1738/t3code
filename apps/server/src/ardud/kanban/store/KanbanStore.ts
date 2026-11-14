@@ -1,5 +1,3 @@
-// @effect-diagnostics nodeBuiltinImport:off - synchronous fingerprints avoid an Effect allocation on every cached row.
-import * as NodeCrypto from "node:crypto";
 import { reportSqliteError } from "@t3tools/shared/nodeSqliteErrors";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -7,6 +5,7 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as SavedWrite from "../engine/savedWrite.ts";
 
 import {
   KanbanAutomation,
@@ -23,6 +22,7 @@ import {
   KanbanThreadLink,
   KanbanWikiPage,
   type KanbanActor,
+  type KanbanScheduleCard,
   KanbanBoardId,
   ThreadId,
   KanbanCardId,
@@ -31,9 +31,11 @@ import {
   type KanbanStage,
 } from "@t3tools/contracts";
 
+import { makeDecodeCache } from "./decodeCache.ts";
 import { SummaryCard } from "./summaryCard.ts";
 import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
-import { kanbanDDL } from "../../persistence/kanbanSchema.ts";
+import { initializeKanbanSchema } from "../../persistence/kanbanSchema.ts";
+import { ensureKanbanCacheVersions } from "../../persistence/kanbanCacheVersions.ts";
 
 export class KanbanStoreError extends Schema.TaggedError<KanbanStoreError>()("KanbanStoreError", {
   operation: Schema.String,
@@ -55,6 +57,22 @@ const codec = <S extends Schema.Top>(schema: S) => {
 const Board = codec(KanbanBoard);
 const Card = codec(KanbanCard);
 const Summary = codec(SummaryCard);
+const SchedulingCard = codec(
+  Schema.Struct({
+    id: KanbanCard.fields.id,
+    number: KanbanCard.fields.number,
+    stage: KanbanCard.fields.stage,
+    settledAt: KanbanCard.fields.settledAt,
+    priority: KanbanCard.fields.priority,
+    blockedBy: KanbanCard.fields.blockedBy,
+    updatedAt: KanbanCard.fields.updatedAt,
+    movedAt: KanbanCard.fields.movedAt,
+    activeThreadId: KanbanCard.fields.activeThreadId,
+    subtasks: KanbanCard.fields.subtasks,
+    wait: KanbanCard.fields.wait,
+    deciding: KanbanCard.fields.deciding,
+  }),
+);
 const CardEvent = codec(
   KanbanCardEvent.mapFields((fields) => ({ ...fields, id: Schema.optionalKey(fields.id) })),
 );
@@ -76,21 +94,18 @@ const decodeTurn = Effect.callback<void>((resume) => {
   return Effect.sync(() => clearImmediate(immediate));
 });
 
-const freeze = (value: unknown): void => {
-  if (value === null || typeof value !== "object" || Object.isFrozen(value)) return;
-  for (const child of Object.values(value)) freeze(child);
-  Object.freeze(value);
-};
-
 interface JsonRow {
   readonly json: string;
 }
-interface EntityJsonRow extends JsonRow {
+interface EntityVersionRow {
   readonly id: string;
+  readonly cache_version: number;
 }
-interface KeyedJsonRow extends EntityJsonRow {
+interface EntityJsonRow extends EntityVersionRow, JsonRow {}
+interface KeyedVersionRow extends EntityVersionRow {
   readonly board_id: string;
 }
+interface KeyedJsonRow extends KeyedVersionRow, JsonRow {}
 interface IdJsonRow extends JsonRow {
   readonly id: number;
 }
@@ -100,7 +115,7 @@ const InstructionApplication = Schema.Struct({
   boardId: KanbanBoardId,
   boardSlug: Schema.String,
   cardId: KanbanCardId,
-  field: Schema.Literals(["escalation", "modelRouting", "reviewerRouting"]),
+  field: Schema.Literals(["escalation", "modelRouting", "reviewerRouting", "guessedGates"]),
   askId: Schema.String,
   threadId: ThreadId,
 });
@@ -169,6 +184,13 @@ export interface KanbanStoreShape {
   readonly cards: (
     boardId: KanbanBoardId,
   ) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanStoreError>;
+  readonly schedulingCards: (
+    boardId: KanbanBoardId,
+  ) => Effect.Effect<ReadonlyArray<KanbanScheduleCard>, KanbanStoreError>;
+  readonly claimCards: (
+    boardId: KanbanBoardId,
+    seeds: ReadonlyArray<string>,
+  ) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanStoreError>;
   readonly watchCardWrites: (
     boardId: KanbanBoardId,
   ) => Effect.Effect<Set<KanbanCardId>, never, Scope.Scope>;
@@ -199,6 +221,10 @@ export interface KanbanStoreShape {
   readonly cardsByThread: (
     threadId: string,
   ) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanStoreError>;
+  readonly poolThreadIds: (
+    boardId: KanbanBoardId,
+    pool: string,
+  ) => Effect.Effect<ReadonlyArray<string>, KanbanStoreError>;
   readonly cardsInStage: (
     stage: KanbanStage,
   ) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanStoreError>;
@@ -404,13 +430,20 @@ const make = Effect.gen(function* () {
   };
 
   yield* BoardsDatabase.initialize(
-    Effect.forEach(kanbanDDL, (statement) => sql.unsafe(statement), { discard: true }),
+    initializeKanbanSchema(sql).pipe(Effect.andThen(ensureKanbanCacheVersions(sql))),
   ).pipe(Effect.mapError(fail("create tables")));
 
   const readCounters = Context.Reference<
     Record<string, { hits: number; misses: number; evictions: number }>
   >("KanbanReadCounters", {
     defaultValue: () => ({}),
+  });
+
+  const jsonFetchCounters = Context.Reference<{
+    jsonRowsFetched: number;
+    jsonBytesFetched: number;
+  }>("KanbanJsonFetchCounters", {
+    defaultValue: () => ({ jsonRowsFetched: 0, jsonBytesFetched: 0 }),
   });
 
   // Observers exist only while a dispatch pass is alive; no card data or
@@ -437,80 +470,20 @@ const make = Effect.gen(function* () {
     for (const changed of cardWatches.get(card.boardId) ?? []) changed.add(card.id);
   };
 
-  // Fingerprint the row text, not updatedAt: rollbacks and other writers can keep
-  // timestamps unchanged. UTF-16 preserves every code unit; SHA-256 avoids keeping
-  // a second full copy of every id-keyed row alongside its decoded value.
+  // Revisions come from SQLite triggers, including writes outside this store.
   // Full collection reads reconcile deletions; subset reads never prune siblings.
-  const cached = <R extends JsonRow, A, E>(
+  const cached = <R extends EntityVersionRow, A, E>(
     name: string,
     decode: (json: string) => Effect.Effect<A, E>,
     key: (row: R) => string,
-  ) => {
-    const values = new Map<string, { identity: string; length: number; value: A; boardId?: string }>();
-    const counts = { hits: 0, misses: 0, evictions: 0 };
-    const drop = (id: string) => {
-      if (values.delete(id)) counts.evictions++;
-    };
-    return {
-      name,
-      stats: () => ({ ...counts, entries: values.size }),
-      drop: (id: string) =>
-        Effect.flatMap(readCounters, (read) =>
-          Effect.sync(() => {
-            const before = counts.evictions;
-            drop(id);
-            (read[name] ??= { hits: 0, misses: 0, evictions: 0 }).evictions +=
-              counts.evictions - before;
-          }),
-        ),
-      reconcile: (boardId: string | undefined, ids: ReadonlySet<string>) =>
-        Effect.flatMap(readCounters, (read) =>
-          Effect.sync(() => {
-            const before = counts.evictions;
-            for (const [id, entry] of values) {
-              if (entry.boardId === boardId && !ids.has(id)) drop(id);
-            }
-            (read[name] ??= { hits: 0, misses: 0, evictions: 0 }).evictions +=
-              counts.evictions - before;
-          }),
-        ),
-      decode: (row: R, read: typeof counts) =>
-        Effect.suspend(() => {
-          const id = key(row);
-          const identity =
-            row.json.length > 1024
-              ? NodeCrypto.createHash("sha256").update(row.json, "utf16le").digest("base64")
-              : row.json;
-          const entry = values.get(id);
-          if (entry?.length === row.json.length && entry.identity === identity) {
-            counts.hits++;
-            read.hits++;
-            return Effect.succeed(entry.value);
-          }
-          counts.misses++;
-          read.misses++;
-          return decode(row.json).pipe(
-            Effect.tap((value) =>
-              Effect.sync(() => {
-                if (process.env.VITEST) freeze(value);
-                values.set(id, {
-                  identity,
-                  length: row.json.length,
-                  value,
-                  ...("board_id" in row ? { boardId: String(row.board_id) } : {}),
-                });
-              }),
-            ),
-          );
-        }),
-    };
-  };
-  const rowKey = (row: EntityJsonRow) => row.id;
-  const poolKey = (row: KeyedJsonRow) => JSON.stringify([row.board_id, row.id]);
+  ) => makeDecodeCache(name, decode, key, readCounters);
+  const rowKey = (row: EntityVersionRow) => row.id;
+  const poolKey = (row: KeyedVersionRow) => JSON.stringify([row.board_id, row.id]);
   const decoders = {
     board: cached("board", Board.decode, rowKey),
     card: cached("card", Card.decode, rowKey),
     feed: cached("feed", Card.decode, rowKey),
+    scheduling: cached("scheduling", SchedulingCard.decode, rowKey),
     summary: cached("summary", Summary.decode, rowKey),
     goal: cached("goal", Goal.decode, rowKey),
     goalFeed: cached("goalFeed", Goal.decode, rowKey),
@@ -532,10 +505,19 @@ const make = Effect.gen(function* () {
           decode: (
             row: R,
             counts: { hits: number; misses: number; evictions: number },
+            shared?: boolean,
           ) => Effect.Effect<A, E>;
         }
       | ((json: string) => Effect.Effect<A, E>),
+    sharedOverride?: boolean,
   ) {
+    // A rolled-back revision can be allocated again; never publish uncommitted decodes.
+    const shared =
+      sharedOverride ??
+      (yield* Effect.map(Effect.serviceOption(sql.transactionService), (tx) => tx._tag === "None"));
+    const fetched = yield* jsonFetchCounters;
+    fetched.jsonRowsFetched += rows.length;
+    for (const row of rows) fetched.jsonBytesFetched += row.json.length;
     const counters = yield* readCounters;
     const counts =
       typeof decoder === "function"
@@ -543,7 +525,7 @@ const make = Effect.gen(function* () {
         : (counters[decoder.name] ??= { hits: 0, misses: 0, evictions: 0 });
     const result = yield* Effect.forEach(rows, (row, index) => {
       const decoded =
-        typeof decoder === "function" ? decoder(row.json) : decoder.decode(row, counts);
+        typeof decoder === "function" ? decoder(row.json) : decoder.decode(row, counts, shared);
       return index > 0 && index % 32 === 0 ? decodeTurn.pipe(Effect.andThen(decoded)) : decoded;
     });
     return result;
@@ -551,11 +533,60 @@ const make = Effect.gen(function* () {
   // Cache pruning shares the collection read span, including eviction counters.
   const reconcileCards = Effect.fnUntraced(function* (
     boardId: string,
-    rows: ReadonlyArray<KeyedJsonRow>,
+    rows: ReadonlyArray<KeyedVersionRow>,
   ) {
     const ids = new Set(rows.map((row) => row.id));
     for (const decoder of [decoders.card, decoders.feed, decoders.summary])
       yield* decoder.reconcile(boardId, ids);
+  });
+
+  // The read span already covers this helper. Pin both phases to one connection
+  // and snapshot; capture cache hits before yielding so concurrent eviction is harmless.
+  const readCollection = Effect.fnUntraced(function* <A, E, ME>(
+    metadata: Effect.Effect<ReadonlyArray<KeyedVersionRow>, ME>,
+    table: "ardud_kanban_cards" | "ardud_kanban_discussions",
+    decoder: {
+      name: string;
+      lookup: (
+        row: KeyedVersionRow,
+        counts: { hits: number; misses: number; evictions: number },
+        shared: boolean,
+      ) => { value: A } | undefined;
+      decode: (
+        row: KeyedJsonRow,
+        counts: { hits: number; misses: number; evictions: number },
+        shared?: boolean,
+      ) => Effect.Effect<A, E>;
+    },
+    reconcile?: (rows: ReadonlyArray<KeyedVersionRow>) => Effect.Effect<void>,
+  ) {
+    // Check before our read transaction: caller-owned transactions must neither
+    // consume nor publish shared revisions, since rollback can reuse a version.
+    const shared = (yield* Effect.serviceOption(sql.transactionService))._tag === "None";
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const rows = yield* metadata;
+        if (reconcile !== undefined) yield* reconcile(rows);
+        const counters = yield* readCounters;
+        const counts = (counters[decoder.name] ??= { hits: 0, misses: 0, evictions: 0 });
+        const values = new Map<string, A>();
+        const missing: string[] = [];
+        for (const row of rows) {
+          const hit = decoder.lookup(row, counts, shared);
+          if (hit === undefined) missing.push(row.id);
+          else values.set(row.id, hit.value);
+        }
+        for (let offset = 0; offset < missing.length; offset += 128) {
+          const ids = missing.slice(offset, offset + 128);
+          const fetched = yield* sql<KeyedJsonRow>`
+          SELECT id, board_id, cache_version, json FROM ${sql(table)} WHERE ${sql.in("id", ids)}
+        `;
+          const decoded = yield* decodeAll(fetched, decoder, shared);
+          for (let i = 0; i < fetched.length; i++) values.set(fetched[i]!.id, decoded[i]!);
+        }
+        return rows.map((row) => values.get(row.id)!);
+      }),
+    );
   });
 
   const first = <A>(items: ReadonlyArray<A>): A | null => items[0] ?? null;
@@ -569,12 +600,15 @@ const make = Effect.gen(function* () {
       operation,
       Effect.suspend(() => {
         const counters: Record<string, { hits: number; misses: number; evictions: number }> = {};
-        return NodeSqliteClient.readOnly(effect).pipe(
+        const fetched = { jsonRowsFetched: 0, jsonBytesFetched: 0 };
+        return SavedWrite.stage(NodeSqliteClient.readOnly(effect), "read").pipe(
           Effect.provideService(readCounters, counters),
+          Effect.provideService(jsonFetchCounters, fetched),
           Effect.ensuring(
             Effect.suspend(() =>
-              Effect.annotateCurrentSpan(
-                Object.fromEntries(
+              Effect.annotateCurrentSpan({
+                ...fetched,
+                ...Object.fromEntries(
                   Object.entries(counters).flatMap(([name, counts]) =>
                     Object.entries(counts).map(([kind, count]) => [
                       `kanban.decode.${name}.${kind}`,
@@ -582,7 +616,7 @@ const make = Effect.gen(function* () {
                     ]),
                   ),
                 ),
-              ),
+              }),
             ),
           ),
           Effect.withSpan("KanbanStore.read", { attributes: { "kanban.operation": operation } }),
@@ -594,7 +628,7 @@ const make = Effect.gen(function* () {
     "read boards",
     Effect.gen(function* () {
       const rows =
-        yield* sql<EntityJsonRow>`SELECT id, json FROM ardud_kanban_boards ORDER BY rowid`;
+        yield* sql<EntityJsonRow>`SELECT id, cache_version, json FROM ardud_kanban_boards ORDER BY rowid`;
       yield* decoders.board.reconcile(undefined, new Set(rows.map(rowKey)));
       return yield* decodeAll(rows, decoders.board);
     }),
@@ -603,7 +637,7 @@ const make = Effect.gen(function* () {
     runRead(
       "read board",
       Effect.flatMap(
-        sql<EntityJsonRow>`SELECT id, json FROM ardud_kanban_boards WHERE id = ${boardId}`,
+        sql<EntityJsonRow>`SELECT id, cache_version, json FROM ardud_kanban_boards WHERE id = ${boardId}`,
         (rows) =>
           rows.length === 0
             ? decoders.board.drop(boardId).pipe(Effect.as(null))
@@ -657,39 +691,51 @@ const make = Effect.gen(function* () {
   const cards = (boardId: KanbanBoardId) =>
     runRead(
       "read cards",
-      Effect.flatMap(
-        sql<KeyedJsonRow>`SELECT id, board_id, json FROM ardud_kanban_cards WHERE board_id = ${boardId} ORDER BY number`,
-        (rows) => {
-          return reconcileCards(boardId, rows).pipe(Effect.andThen(decodeAll(rows, decoders.card)));
-        },
+      readCollection(
+        sql<KeyedVersionRow>`SELECT id, board_id, cache_version FROM ardud_kanban_cards WHERE board_id = ${boardId} ORDER BY number`,
+        "ardud_kanban_cards",
+        decoders.card,
+        (rows) => reconcileCards(boardId, rows),
       ),
     );
   const openCards = (boardId: KanbanBoardId) =>
     runRead(
       "read open cards",
-      Effect.flatMap(
-        sql<KeyedJsonRow>`
-      SELECT id, board_id, json FROM ardud_kanban_cards
+      readCollection(
+        sql<KeyedVersionRow>`
+      SELECT id, board_id, cache_version FROM ardud_kanban_cards
       WHERE board_id = ${boardId} AND json_extract(json, '$.settledAt') IS NULL
       ORDER BY number
     `,
-        (rows) => decodeAll(rows, decoders.card),
+        "ardud_kanban_cards",
+        decoders.card,
       ),
     );
   const dispatchCards = (boardId: KanbanBoardId) =>
     runRead(
       "read dispatch cards",
-      Effect.flatMap(
-        sql<KeyedJsonRow>`
-          SELECT id, board_id, json FROM ardud_kanban_cards
-          WHERE board_id = ${boardId} AND json_extract(json, '$.settledAt') IS NULL
+      readCollection(
+        sql<KeyedVersionRow>`
+          SELECT id, board_id, cache_version, number
+          FROM ardud_kanban_cards INDEXED BY ardud_kanban_cards_dispatch
+          WHERE board_id = ${boardId}
             AND (stage IN ('todo', 'working', 'needs_review', 'in_review')
-              OR json_extract(json, '$.wait') IS NOT NULL
-              OR json_extract(json, '$.deciding') IS NOT NULL
               OR active_thread_id IS NOT NULL)
+            AND json_extract(json, '$.settledAt') IS NULL
+          UNION ALL
+          -- Waits/deciding exist only in JSON. Read those exceptions from the existing
+          -- open-card index, keeping settled history out of both the read and boot DDL.
+          SELECT id, board_id, cache_version, number
+          FROM ardud_kanban_cards INDEXED BY ardud_kanban_cards_open
+          WHERE board_id = ${boardId} AND json_extract(json, '$.settledAt') IS NULL
+            AND NOT (stage IN ('todo', 'working', 'needs_review', 'in_review')
+              OR active_thread_id IS NOT NULL)
+            AND (json_extract(json, '$.wait') IS NOT NULL
+              OR json_extract(json, '$.deciding') IS NOT NULL)
           ORDER BY number
         `,
-        (rows) => decodeAll(rows, decoders.card),
+        "ardud_kanban_cards",
+        decoders.card,
       ),
     );
   const feedCards: KanbanStoreShape["feedCards"] = (boardId, page) =>
@@ -697,7 +743,7 @@ const make = Effect.gen(function* () {
       "read feed cards",
       Effect.flatMap(
         sql<KeyedJsonRow>`
-          SELECT id, board_id, json_set(json,
+          SELECT id, board_id, cache_version, json_set(json,
             '$.prompt', '', '$.description', '', '$.wakeNote', CASE WHEN json_extract(json, '$.wakeNote') IS NULL THEN NULL ELSE 'pending' END,
             '$.title', substr(json_extract(json, '$.title'), 1, 512),
             '$.question', substr(json_extract(json, '$.question'), 1, 512),
@@ -723,14 +769,15 @@ const make = Effect.gen(function* () {
   const cardPage: KanbanStoreShape["cardPage"] = (boardId, page) =>
     runRead(
       "read card page",
-      Effect.flatMap(
-        sql<KeyedJsonRow>`
-          SELECT id, board_id, number, json FROM ardud_kanban_cards
+      readCollection(
+        sql<KeyedVersionRow>`
+          SELECT id, board_id, cache_version, number FROM ardud_kanban_cards
           WHERE board_id = ${boardId} AND number > ${page.after}
             ${page.open ? sql`AND json_extract(json, '$.settledAt') IS NULL` : sql``}
           ORDER BY number LIMIT ${page.limit}
         `,
-        (rows) => decodeAll(rows, decoders.card),
+        "ardud_kanban_cards",
+        decoders.card,
       ),
     );
   const summaryCards = (boardId: KanbanBoardId) =>
@@ -743,7 +790,7 @@ const make = Effect.gen(function* () {
         // the boards lane while SQLite parses every card's asks.
         while (true) {
           const rows = yield* sql<KeyedJsonRow & { number: number }>`
-            SELECT id, board_id, number, json_object(
+            SELECT id, board_id, cache_version, number, json_object(
               'id', id,
               'stage', stage,
               'settledAt', json_extract(json, '$.settledAt'),
@@ -780,7 +827,7 @@ const make = Effect.gen(function* () {
     runRead(
       "read card",
       Effect.flatMap(
-        sql<KeyedJsonRow>`SELECT id, board_id, json FROM ardud_kanban_cards WHERE id = ${cardId}`,
+        sql<KeyedJsonRow>`SELECT id, board_id, cache_version, json FROM ardud_kanban_cards WHERE id = ${cardId}`,
         (rows) =>
           Effect.gen(function* () {
             if (rows.length === 0)
@@ -794,24 +841,87 @@ const make = Effect.gen(function* () {
     runRead(
       "read card by number",
       Effect.flatMap(
-        sql<KeyedJsonRow>`SELECT id, board_id, json FROM ardud_kanban_cards WHERE board_id = ${boardId} AND number = ${number}`,
+        sql<KeyedJsonRow>`SELECT id, board_id, cache_version, json FROM ardud_kanban_cards WHERE board_id = ${boardId} AND number = ${number}`,
         (rows) => Effect.map(decodeAll(rows, decoders.card), first),
+      ),
+    );
+  const schedulingCards = (boardId: KanbanBoardId) =>
+    runRead(
+      "read scheduling cards",
+      Effect.gen(function* () {
+        const rows = yield* sql<KeyedJsonRow>`
+        SELECT id, board_id, cache_version, json_patch(json_object(
+          'id', id, 'number', number, 'stage', stage,
+          'settledAt', json_extract(json, '$.settledAt'),
+          'priority', json_extract(json, '$.priority'),
+          'blockedBy', json_extract(json, '$.blockedBy'),
+          'updatedAt', json_extract(json, '$.updatedAt'),
+          'movedAt', json_extract(json, '$.movedAt'),
+          'activeThreadId', active_thread_id,
+          'subtasks', CASE WHEN json_type(json, '$.subtasks') IS NULL THEN json('[]')
+              ELSE json_extract(json, '$.subtasks') END
+        ), json_object(
+          'wait', json_extract(json, '$.wait'),
+          'deciding', json_extract(json, '$.deciding')
+        )) AS json
+        FROM ardud_kanban_cards WHERE board_id = ${boardId} ORDER BY number
+      `;
+        yield* decoders.scheduling.reconcile(boardId, new Set(rows.map((row) => row.id)));
+        return yield* decodeAll(rows, decoders.scheduling);
+      }),
+    );
+  const claimCards: KanbanStoreShape["claimCards"] = (boardId, seeds) =>
+    runRead(
+      "read claim cards",
+      readCollection(
+        sql<KeyedVersionRow>`
+        WITH RECURSIVE relevant(id) AS (
+          SELECT id FROM ardud_kanban_cards WHERE board_id = ${boardId} AND stage = 'todo'
+          UNION
+          SELECT id FROM ardud_kanban_cards
+          WHERE board_id = ${boardId} AND id IN (SELECT value FROM json_each(${JSON.stringify(seeds)}))
+          UNION
+          SELECT blocker.value FROM relevant
+          JOIN ardud_kanban_cards AS card ON card.id = relevant.id AND card.board_id = ${boardId}
+          JOIN json_each(card.json, '$.blockedBy') AS blocker
+        )
+        SELECT id, board_id, cache_version FROM ardud_kanban_cards
+        WHERE board_id = ${boardId} AND id IN (SELECT id FROM relevant)
+        ORDER BY number
+      `,
+        "ardud_kanban_cards",
+        decoders.card,
+      ),
+    );
+  const poolThreadIds: KanbanStoreShape["poolThreadIds"] = (boardId, pool) =>
+    runRead(
+      "read pool thread ids",
+      Effect.map(
+        sql<{ readonly thread_id: string }>`
+        SELECT DISTINCT active_thread_id AS thread_id
+        FROM ardud_kanban_cards INDEXED BY ardud_kanban_cards_dispatch
+        WHERE board_id = ${boardId} AND active_thread_id IS NOT NULL
+          AND json_extract(json, '$.activePool') = ${pool}
+      `,
+        (rows) => rows.map((row) => row.thread_id),
       ),
     );
   const cardsByThread = (threadId: string) =>
     runRead(
       "read cards by thread",
-      Effect.flatMap(
-        sql<KeyedJsonRow>`SELECT id, board_id, json FROM ardud_kanban_cards WHERE active_thread_id = ${threadId} ORDER BY number`,
-        (rows) => decodeAll(rows, decoders.card),
+      readCollection(
+        sql<KeyedVersionRow>`SELECT id, board_id, cache_version FROM ardud_kanban_cards WHERE active_thread_id = ${threadId} ORDER BY number`,
+        "ardud_kanban_cards",
+        decoders.card,
       ),
     );
   const cardsInStage = (stage: KanbanStage) =>
     runRead(
       "read cards in stage",
-      Effect.flatMap(
-        sql<KeyedJsonRow>`SELECT id, board_id, json FROM ardud_kanban_cards WHERE stage = ${stage} ORDER BY board_id, number`,
-        (rows) => decodeAll(rows, decoders.card),
+      readCollection(
+        sql<KeyedVersionRow>`SELECT id, board_id, cache_version FROM ardud_kanban_cards WHERE stage = ${stage} ORDER BY board_id, number`,
+        "ardud_kanban_cards",
+        decoders.card,
       ),
     );
   const nextCardNumber = (boardId: KanbanBoardId) =>
@@ -998,7 +1108,7 @@ const make = Effect.gen(function* () {
       "read goals",
       Effect.gen(function* () {
         const rows =
-          yield* sql<KeyedJsonRow>`SELECT id, board_id, json FROM ardud_kanban_goals WHERE board_id = ${boardId} ORDER BY rowid`;
+          yield* sql<KeyedJsonRow>`SELECT id, board_id, cache_version, json FROM ardud_kanban_goals WHERE board_id = ${boardId} ORDER BY rowid`;
         const ids = new Set(rows.map(rowKey));
         yield* decoders.goal.reconcile(boardId, ids);
         yield* decoders.goalFeed.reconcile(boardId, ids);
@@ -1022,7 +1132,7 @@ const make = Effect.gen(function* () {
       "read pools",
       Effect.gen(function* () {
         const rows =
-          yield* sql<KeyedJsonRow>`SELECT key AS id, board_id, json FROM ardud_kanban_pools WHERE board_id = ${boardId} ORDER BY rowid`;
+          yield* sql<KeyedJsonRow>`SELECT key AS id, board_id, cache_version, json FROM ardud_kanban_pools WHERE board_id = ${boardId} ORDER BY rowid`;
         const ids = new Set(rows.map(poolKey));
         yield* decoders.pool.reconcile(boardId, ids);
         return yield* decodeAll(rows, decoders.pool);
@@ -1153,31 +1263,31 @@ const make = Effect.gen(function* () {
   const discussions = (boardId: KanbanBoardId) =>
     runRead(
       "read discussions",
-      Effect.gen(function* () {
-        const rows =
-          yield* sql<KeyedJsonRow>`SELECT id, board_id, json FROM ardud_kanban_discussions WHERE board_id = ${boardId} ORDER BY rowid`;
-        const ids = new Set(rows.map(rowKey));
-        yield* decoders.discussion.reconcile(boardId, ids);
-        return yield* decodeAll(rows, decoders.discussion);
-      }),
+      readCollection(
+        sql<KeyedVersionRow>`SELECT id, board_id, cache_version FROM ardud_kanban_discussions WHERE board_id = ${boardId} ORDER BY rowid`,
+        "ardud_kanban_discussions",
+        decoders.discussion,
+        (rows) => decoders.discussion.reconcile(boardId, new Set(rows.map(rowKey))),
+      ),
     );
   const openDiscussions = (boardId: KanbanBoardId) =>
     runRead(
       "read open discussions",
-      Effect.flatMap(
-        sql<KeyedJsonRow>`SELECT id, board_id, json FROM ardud_kanban_discussions
+      readCollection(
+        sql<KeyedVersionRow>`SELECT id, board_id, cache_version FROM ardud_kanban_discussions
           WHERE board_id = ${boardId}
             AND json_extract(json, '$.settledAt') IS NULL
             AND json_extract(json, '$.archivedAt') IS NULL
           ORDER BY rowid`,
-        (rows) => decodeAll(rows, decoders.discussion),
+        "ardud_kanban_discussions",
+        decoders.discussion,
       ),
     );
   const discussion = (id: KanbanDiscussionId) =>
     runRead(
       "read discussion",
       Effect.flatMap(
-        sql<KeyedJsonRow>`SELECT id, board_id, json FROM ardud_kanban_discussions WHERE id = ${id}`,
+        sql<KeyedJsonRow>`SELECT id, board_id, cache_version, json FROM ardud_kanban_discussions WHERE id = ${id}`,
         (rows) =>
           rows.length === 0
             ? decoders.discussion.drop(id).pipe(Effect.as(null))
@@ -1188,7 +1298,7 @@ const make = Effect.gen(function* () {
     runRead(
       "read latest system discussion",
       Effect.flatMap(
-        sql<KeyedJsonRow>`SELECT id, board_id, json FROM ardud_kanban_discussions
+        sql<KeyedJsonRow>`SELECT id, board_id, cache_version, json FROM ardud_kanban_discussions
           WHERE board_id = ${boardId} AND card_id IS NULL
             AND json_extract(json, '$.archivedAt') IS NULL
             AND json_extract(json, '$.createdBy._tag') = 'system'
@@ -1202,7 +1312,7 @@ const make = Effect.gen(function* () {
       "read discussion by evaluator",
       Effect.flatMap(
         sql<KeyedJsonRow>`
-          SELECT id, board_id, json FROM ardud_kanban_discussions WHERE evaluator_thread_id = ${threadId} LIMIT 1
+          SELECT id, board_id, cache_version, json FROM ardud_kanban_discussions WHERE evaluator_thread_id = ${threadId} LIMIT 1
         `,
         (rows) => Effect.map(decodeAll(rows, decoders.discussion), first),
       ),
@@ -1424,7 +1534,7 @@ const make = Effect.gen(function* () {
     runRead(
       "read thread link",
       Effect.flatMap(
-        sql<KeyedJsonRow>`SELECT thread_id AS id, board_id, json FROM ardud_kanban_threads WHERE thread_id = ${threadId}`,
+        sql<KeyedJsonRow>`SELECT thread_id AS id, board_id, cache_version, json FROM ardud_kanban_threads WHERE thread_id = ${threadId}`,
         (rows) =>
           Effect.gen(function* () {
             if (rows.length === 0) yield* decoders.thread.drop(threadId);
@@ -1438,7 +1548,7 @@ const make = Effect.gen(function* () {
       : runRead(
           "read thread links by ids",
           Effect.flatMap(
-            sql<KeyedJsonRow>`SELECT thread_id AS id, board_id, json FROM ardud_kanban_threads WHERE thread_id IN ${sql.in(threadIds)}`,
+            sql<KeyedJsonRow>`SELECT thread_id AS id, board_id, cache_version, json FROM ardud_kanban_threads WHERE thread_id IN ${sql.in(threadIds)}`,
             (rows) => decodeAll(rows, decoders.thread),
           ),
         );
@@ -1448,7 +1558,7 @@ const make = Effect.gen(function* () {
       Effect.flatMap(
         "cardId" in filter
           ? sql<KeyedJsonRow>`
-              SELECT thread_id AS id, board_id, json FROM ardud_kanban_threads
+              SELECT thread_id AS id, board_id, cache_version, json FROM ardud_kanban_threads
               WHERE card_id = ${filter.cardId}
                 OR thread_id IN (
                   SELECT thread_id FROM ardud_kanban_thread_cards WHERE card_id = ${filter.cardId}
@@ -1456,8 +1566,8 @@ const make = Effect.gen(function* () {
               ORDER BY rowid
             `
           : filter.open
-            ? sql<KeyedJsonRow>`SELECT thread_id AS id, board_id, json FROM ardud_kanban_threads WHERE board_id = ${filter.boardId} AND ended = 0 ORDER BY rowid`
-            : sql<KeyedJsonRow>`SELECT thread_id AS id, board_id, json FROM ardud_kanban_threads WHERE board_id = ${filter.boardId} ORDER BY rowid`,
+            ? sql<KeyedJsonRow>`SELECT thread_id AS id, board_id, cache_version, json FROM ardud_kanban_threads WHERE board_id = ${filter.boardId} AND ended = 0 ORDER BY rowid`
+            : sql<KeyedJsonRow>`SELECT thread_id AS id, board_id, cache_version, json FROM ardud_kanban_threads WHERE board_id = ${filter.boardId} ORDER BY rowid`,
         (rows) =>
           Effect.gen(function* () {
             if ("boardId" in filter && !filter.open)
@@ -1540,7 +1650,7 @@ const make = Effect.gen(function* () {
       runRead(
         "read feed goals",
         Effect.flatMap(
-          sql<KeyedJsonRow>`SELECT id, board_id, json_set(json, '$.story', json(COALESCE((
+          sql<KeyedJsonRow>`SELECT id, board_id, cache_version, json_set(json, '$.story', json(COALESCE((
         SELECT json_group_array(json(entry)) FROM (
           SELECT json_object('at', json_extract(story.value, '$.at'), 'text', substr(json_extract(story.value, '$.text'), 1, 512)) AS entry
           FROM (SELECT value FROM json_each(ardud_kanban_goals.json, '$.story') ORDER BY CAST(key AS INTEGER) DESC LIMIT 20) AS story
@@ -1553,6 +1663,9 @@ const make = Effect.gen(function* () {
     card,
     cardByNumber,
     cardsByThread,
+    poolThreadIds,
+    claimCards,
+    schedulingCards,
     cardsInStage,
     nextCardNumber,
     putCard,

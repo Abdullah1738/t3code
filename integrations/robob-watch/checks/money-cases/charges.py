@@ -32,7 +32,7 @@ RECEIPT_HITS = 60
 RECEIPT_READS = 12
 # A receipt under another name (Stripe's legal entity, a reseller) counts only this close to the
 # charge and only when it shows the same card's last four digits.
-SAME_TIME = dt.timedelta(minutes=15)
+SAME_TIME = order_lookup.SAME_TIME
 OWNER_AROUND = dt.timedelta(minutes=30)
 # Uber Eats receipts came 11 hours after their holds on 24 Oct.
 WAIT = dt.timedelta(hours=36)
@@ -109,6 +109,47 @@ class Lookup(Exception):
     """A source couldn't be read; the charge is then not explained by it."""
 
 
+class SourceLimit(Lookup):
+    def __init__(self, message, kinds):
+        self.kinds = kinds
+        super().__init__(message)
+
+
+OWNER_BUDGET = 4
+MSGS_BUDGET = 2
+
+
+@contextmanager
+def step_timing(stats, name, deadline=None):
+    started = time.monotonic()
+    alarm = signal.getitimer(signal.ITIMER_REAL)[0]
+    if alarm:
+        enclosing = time.time() + alarm
+        deadline = min(deadline, enclosing) if deadline is not None else enclosing
+    error = None
+    try:
+        yield
+    except BaseException as exc:
+        error = exc
+        raise
+    finally:
+        if stats is not None:
+            elapsed = round((time.monotonic() - started) * 1000)
+            key = name + '_ms'
+            stats[key] = stats.get(key, 0) + elapsed
+            if name == 'msgs':
+                stats['msgs_max_ms'] = max(stats.get('msgs_max_ms', 0), elapsed)
+            if deadline is not None and time.time() >= deadline:
+                stats['starved_by'] = name
+                if error is not None and not hasattr(error, '_money_cases_step'):
+                    error._money_cases_step = name
+
+
+def order_app(charge):
+    merchant = charge['merchant'].lower()
+    return 'careem' if 'careem' in merchant else 'noon' if 'noon' in merchant else None
+
+
 def card_owner(charge):
     path = Path(os.environ.get('MONEY_CASES_SETTINGS', Path(__file__).with_name('settings.json')))
     try:
@@ -120,13 +161,31 @@ def card_owner(charge):
         raise Lookup('card owners: settings unreadable') from e
 
 
-def order_receipt(charge, at, now, deadline=None, lookup=None):
-    merchant = charge['merchant'].lower()
-    app = 'careem' if 'careem' in merchant else 'noon' if 'noon' in merchant else None
+def order_receipt(charge, at, now, deadline=None, lookup=None, memo=None, stats=None):
+    app = order_app(charge)
     if not app:
         return None
     try:
-        result = (lookup or order_lookup.read)(app, deadline=deadline)
+        key = ('orders', app)
+        if memo is not None and key in memo:
+            result = memo[key]
+        else:
+            try:
+                options = {}
+                if lookup is None:
+                    options = {'since': (memo or {}).get(('orders_since', app), at - SAME_TIME)}
+                    if memo is not None and ('orders_cache',) in memo:
+                        options['cache_path'] = memo[('orders_cache',)]
+                with step_timing(stats, 'lookups', deadline):
+                    result = (lookup or order_lookup.read)(app, deadline=deadline, **options)
+            except (ValueError, OSError) as exc:
+                if isinstance(exc, order_lookup.OutOfTime):
+                    raise
+                result = exc
+            if memo is not None:
+                memo[key] = result
+        if isinstance(result, Exception):
+            raise result
         complete = result.get('complete') is True if isinstance(result, dict) else True
         rows = result.get('orders') if isinstance(result, dict) else result
         if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
@@ -148,8 +207,30 @@ def order_receipt(charge, at, now, deadline=None, lookup=None):
             return {'verdict': 'receipt', 'why': f'{app} order {next(iter(matches))}: amount and time match', 'errors': []}
         if len(matches) > 1:
             raise ValueError('ambiguous orders')
-        if not complete:
+        if app == 'noon' and isinstance(result, dict):
+            lanes = result.get('lanes') or {}
+            short = []
+            for name in order_lookup.LANES:
+                lane = lanes.get(name) or {}
+                if lane.get('exhaustive') is True:
+                    continue
+                covered = lane.get('covered_from')
+                # A tied timestamp can continue on the next page at the inclusive match edge.
+                if covered is not None and order_lookup.moment(covered) < at - SAME_TIME:
+                    continue
+                short.append((name, lane))
+            if short:
+                if all(lane.get('limit') == 'page-1 history only' and lane.get('covered_from')
+                       for name, lane in short):
+                    names = ', '.join(name for name, lane in short)
+                    raise SourceLimit(f'noon orders: {names} history does not reach '
+                                      f'{(at - SAME_TIME).date()} (source limit)',
+                                      [name + '_page_1' for name, lane in short])
+                raise ValueError('incomplete history cannot authorize an ask')
+        elif not complete:
             raise ValueError('incomplete history cannot authorize an ask')
+    except order_lookup.SourceLimit as e:
+        raise SourceLimit('careem orders: order list binding unverified (source limit)', [e.code]) from e
     except (ValueError, TypeError, KeyError, InvalidOperation, OSError) as e:
         raise Lookup(f'{app} orders: lookup unavailable or incomplete') from e
     return None
@@ -211,11 +292,12 @@ def msgs(argv, deadline, cap, memo=None, stats=None):
         if isinstance(result, Lookup):
             raise result
         return result
-    timeout = left(deadline, cap)
+    timeout = left(deadline, min(cap, MSGS_BUDGET))
     if stats is not None:
         stats['msgs_calls'] += 1
     try:
-        done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+        with step_timing(stats, 'msgs', time.time() + timeout):
+            done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
         if done.returncode:
             raise Lookup(f'msgs exit {done.returncode}: {done.stderr.strip()[:200]}')
     except (OSError, subprocess.TimeoutExpired, Lookup) as e:
@@ -476,14 +558,18 @@ def receipt(charge, at, now, find=None, deadline=None, read=None, memo=None, sta
     names = words(charge['merchant'])
     named = re.compile(r'\b(?:' + '|'.join(map(re.escape, names)) + r')\b', re.I) if names else None
     tries = []
+    integral = Decimal(charge['amount']) == Decimal(charge['amount']).to_integral_value()
+    # "$1" is just the common token "1" to FTS. For whole amounts, find candidates
+    # by merchant/card instead; the same currency/amount proof below still decides.
     if names:
         # Questions can remain unanswered indefinitely; a later recurring purchase's receipt
         # must not explain them merely because its merchant and amount happen to repeat.
-        tries.append((amount + ' ' + ' OR '.join(f'"{w}"' for w in names), *receipt_window(at, now, True),
+        named_query = ' OR '.join(f'"{w}"' for w in names)
+        tries.append(((named_query if integral else amount + ' ' + named_query), *receipt_window(at, now, True),
                       lambda text: named.search(text) and RECEIPT_WORDS.search(text)))
-    tries.append((amount, *receipt_window(at, now, False),
+    tries.append((f'"{charge["card"]}"' if integral else amount, *receipt_window(at, now, False),
                   lambda text: card.search(text) and RECEIPT_WORDS.search(text)))
-    reads, seen_bodies = 0, set()
+    reads, seen_bodies, incomplete = 0, set(), False
     for query, start, end, proves in tries:
         # Usage notices with the same amount and merchant can fill a page of hits, so the search goes
         # wider than one page. Reads are capped, and a body already read counts for nothing new: a
@@ -491,7 +577,9 @@ def receipt(charge, at, now, find=None, deadline=None, read=None, memo=None, sta
         # msgs accepts date bounds, with an exclusive until. Include the final day;
         # the exact shared timestamp window below filters the remaining partial day.
         until = day(end + dt.timedelta(days=1))
+        count = 0
         for row in find(query, day(start), until=until, source='email', n=RECEIPT_HITS, deadline=deadline):
+            count += 1
             ts = row.get('ts') or 0
             if not (start.timestamp() <= ts <= end.timestamp()) or row.get('from_me') \
                     or BANKS.search(str(row.get('sender') or '')):
@@ -501,7 +589,7 @@ def receipt(charge, at, now, find=None, deadline=None, read=None, memo=None, sta
             if key in seen_bodies:
                 continue
             if reads >= RECEIPT_READS:
-                return None
+                raise Lookup('receipt scan incomplete: read limit reached')
             reads += 1
             seen_bodies.add(key)
             if money.search(text) and proves(text):
@@ -510,6 +598,9 @@ def receipt(charge, at, now, find=None, deadline=None, read=None, memo=None, sta
                 # Identical receipt bodies can be sent for separate transactions. A rejected
                 # ambiguous copy must not hide an older, uniquely correlated receipt.
                 seen_bodies.discard(key)
+        incomplete = incomplete or count >= RECEIPT_HITS
+    if incomplete:
+        raise Lookup('receipt scan incomplete: search limit reached')
     return None
 
 
@@ -601,10 +692,12 @@ def owner_said(charge, at, now, said=None, deadline=None):
     return None
 
 
-def known(charge, at, find=None, deadline=None, read=None):
+def known(charge, at, find=None, deadline=None, read=None, stats=None):
     """How he already pays this merchant, from before the last half day: 'receipt' when a mail with
     a receipt from it came, 'bank' when an earlier bank alert was a charge from it, else None."""
-    find, read = find or search, read or show
+    options = {} if stats is None else {'stats': stats}
+    find = find or (lambda *a, **kw: search(*a, **kw, **options))
+    read = read or (lambda *a, **kw: show(*a, **kw, **options))
     names = words(charge['merchant'])
     if not names:
         return None
@@ -635,11 +728,18 @@ def known(charge, at, find=None, deadline=None, read=None):
     return None
 
 
-def found(charge, at, now, deadline=None, find=None, said=None, errors=None, memo=None, stats=None, receipt_ok=None):
+def found(charge, at, now, deadline=None, find=None, said=None, errors=None, memo=None, stats=None, receipt_ok=None, limits=None):
     """A receipt or his own words that explain the charge, or None."""
     errors = [] if errors is None else errors
+    limits = [] if limits is None else limits
     try:
-        row = receipt(charge, at, now, find, deadline, memo=memo, stats=stats, receipt_ok=receipt_ok)
+        # Mail must leave a slice for order history, including when a custom
+        # finder ignores its timeout. The enclosing question alarm stays earlier.
+        mail_end = time.time() + MSGS_BUDGET
+        if deadline is not None:
+            mail_end = min(mail_end, deadline)
+        with step_timing(stats, 'receipt', mail_end), within(mail_end, Lookup('receipt lookup over time')):
+            row = receipt(charge, at, now, find, mail_end, memo=memo, stats=stats, receipt_ok=receipt_ok)
         if row:
             when = dt.datetime.fromtimestamp(row['ts'], TZ).strftime('%a %d %b %H:%M')
             return {'verdict': 'receipt', 'why': f"receipt {when}: {row.get('sender', '')} - {row.get('subject', '')}"[:200],
@@ -647,9 +747,11 @@ def found(charge, at, now, deadline=None, find=None, said=None, errors=None, mem
     except Lookup as e:
         errors.append(f'receipt: {e}')
     try:
-        hit = order_receipt(charge, at, now, deadline)
+        hit = order_receipt(charge, at, now, deadline, memo=memo, stats=stats)
         if hit:
             return {**hit, 'errors': errors}
+    except SourceLimit as e:
+        limits.append({'why': str(e), 'kinds': e.kinds})
     except Lookup as e:
         errors.append(f'orders: {e}')
     if card_owner(charge) == 'moni':
@@ -670,24 +772,27 @@ def owner_found(charge, at, now, deadline=None, said=None, errors=None):
     return None
 
 
-def explain(charge, at, now, deadline=None, find=None, said=None, receipt_ok=None):
+def explain(charge, at, now, deadline=None, find=None, said=None, receipt_ok=None, *, memo=None, stats=None):
     """verdict receipt | owner | wait | ask, with why and any lookup errors."""
-    errors = []
+    errors, limits = [], []
     owner = card_owner(charge)
     if charge['kind'] != 'charge' and owner == 'moni':
         return {'verdict': 'held', 'why': 'held for Moni', 'errors': []}
     if charge['kind'] != 'charge':
         return {'verdict': 'ask', 'why': 'a declined payment goes to him', 'errors': errors}
-    hit = found(charge, at, now, deadline, find, said, errors, receipt_ok=receipt_ok)
+    hit = found(charge, at, now, deadline, find, said, errors, memo, stats, receipt_ok=receipt_ok, limits=limits)
     if hit:
         return hit
     if errors:
-        return {'verdict': 'unverified', 'why': 'sources unreadable; do not ask', 'errors': errors}
+        return {'verdict': 'unverified', 'why': 'sources unreadable; do not ask', 'errors': errors, 'limits': limits}
+    if limits:
+        return {'verdict': 'unverified', 'why': 'source limit: ' + '; '.join(l['why'] for l in limits) + '; do not ask',
+                'errors': [], 'limits': limits}
     if owner == 'moni':
         return {'verdict': 'held', 'why': 'held for Moni', 'errors': []}
     if now < at + WAIT:
         try:
-            how = known(charge, at, find, deadline)
+            how = known(charge, at, find, deadline, stats=stats)
             # A merchant that mails receipts gets its receipt waited for ("Wait for the email", 24 Oct);
             # one he only has bank alerts from is waited for when this is a pending hold.
             if how == 'receipt' or (how == 'bank' and charge['pending']):

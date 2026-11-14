@@ -137,6 +137,7 @@ export type ThreadManagementTerminalRunStatus = Extract<
 >;
 
 export interface ThreadManagementSendInput {
+  readonly isStale?: () => boolean;
   readonly projectId: ProjectId;
   readonly commandId: CommandId;
   readonly threadId: ThreadId;
@@ -336,6 +337,7 @@ export type ThreadManagementError = typeof ThreadManagementError.Type;
 type ThreadManagementFailure = ThreadManagementError | Orchestrator.OrchestratorV2Error;
 
 export interface ThreadManagementServiceShape {
+  readonly promoteQueuedMessages: Orchestrator.OrchestratorV2["Service"]["promoteQueuedMessages"];
   readonly searchThreadStream: (
     input: OrchestrationV2SearchThreadInput,
   ) => Stream.Stream<OrchestrationV2SearchThreadResult, Orchestrator.OrchestratorV2Error>;
@@ -347,6 +349,7 @@ export interface ThreadManagementServiceShape {
   ) => Effect.Effect<void, LegacyV1ThreadImporter.LegacyV1ThreadImportError>;
   readonly dispatch: (
     command: OrchestrationV2ServerCommand,
+    options?: Orchestrator.OrchestratorDispatchOptions,
   ) => Effect.Effect<
     Orchestrator.OrchestratorV2DispatchResult,
     Orchestrator.OrchestratorV2Error | ThreadManagementProviderInstanceDisabledError
@@ -389,6 +392,7 @@ export interface ThreadManagementServiceShape {
     readonly projectId: ProjectId;
     readonly threadId: ThreadId;
   }) => Effect.Effect<OrchestrationV2ThreadProjection, ThreadManagementError>;
+  readonly listActiveThreadIds: Orchestrator.OrchestratorV2["Service"]["listActiveThreadIds"];
   readonly getShellSnapshot: (options?: {
     readonly location?: "active" | "archive";
     /** Only these threads, read with one indexed IN list (control live lists). */
@@ -431,6 +435,12 @@ export interface ThreadManagementServiceShape {
    * just refuse a retry the project's settings no longer allow fresh.
    */
   readonly hasReceipt: (commandId: CommandId) => Effect.Effect<boolean>;
+  readonly getDelegationCommandState: (
+    commandId: CommandId,
+  ) => Effect.Effect<
+    CommandReceiptStore.CommandReceiptV2 | { readonly status: "pending" | "never_saved" },
+    CommandReceiptStore.CommandReceiptStoreV2Error
+  >;
   readonly getCommandReceipt: CommandReceiptStore.CommandReceiptStoreV2["Service"]["getByCommandId"];
   readonly findMcpThreadCreations: CommandReceiptStore.CommandReceiptStoreV2["Service"]["findMcpThreadCreations"];
   readonly waitForThread: (
@@ -558,6 +568,31 @@ const make = Effect.gen(function* () {
   // Orchestrator's lock is not reentrant. This separate lock covers the
   // preflight + selection update + send across callers of this service.
   const selectionDispatchLock = yield* KeyedLock.make<ThreadId>();
+  const delegationDispatchLock = yield* KeyedLock.make<CommandId>();
+  const pendingDelegations = yield* Ref.make<ReadonlyMap<CommandId, number>>(new Map());
+  const getDelegationCommandState = Effect.fn("ThreadManagementService.getDelegationCommandState")(
+    function* (commandId: CommandId) {
+      const receipt = yield* receipts.getByCommandId(commandId);
+      if (Option.isSome(receipt)) return receipt.value;
+      if ((yield* Ref.get(pendingDelegations)).has(commandId)) {
+        return { status: "pending" as const };
+      }
+      // Fence the second read against a create starting or finishing after the first read.
+      // The dispatch holds this key through commit and interruption cleanup.
+      return yield* delegationDispatchLock.withLock(
+        commandId,
+        Effect.gen(function* () {
+          const latest = yield* receipts.getByCommandId(commandId);
+          if (Option.isSome(latest)) return latest.value;
+          return {
+            status: (yield* Ref.get(pendingDelegations)).has(commandId)
+              ? ("pending" as const)
+              : ("never_saved" as const),
+          };
+        }),
+      );
+    },
+  );
 
   const assertProviderInstanceEnabled: ThreadManagementServiceShape["assertProviderInstanceEnabled"] =
     (input) =>
@@ -713,17 +748,30 @@ const make = Effect.gen(function* () {
     }
   };
 
-  const dispatchUnchanged = (command: OrchestrationV2ServerCommand) =>
+  const dispatchUnchanged = (
+    command: OrchestrationV2ServerCommand,
+    options?: Orchestrator.OrchestratorDispatchOptions,
+  ) =>
     ensureCommandTranscripts(command).pipe(
       Effect.andThen(assertDispatchTargetEnabled(command)),
-      Effect.andThen(orchestrator.dispatch(command)),
+      Effect.andThen(
+        SendAcknowledgement.waitingOn(
+          orchestrator.dispatch(command, options),
+          command.type === "message.dispatch"
+            ? `message command admission for thread ${command.threadId}`
+            : "command dispatch",
+        ),
+      ),
     );
 
   const dispatchWithSelectionMigration = Effect.fn(
     "orchestrationV2.threadManagement.dispatchWithSelectionMigration",
   )(function* (
     command: Extract<OrchestrationV2ServerCommand, { readonly type: "message.dispatch" }>,
-    options: { readonly migrate: boolean; readonly cutoverComplete: boolean },
+    options: {
+      readonly migrate: boolean;
+      readonly cutoverComplete: boolean;
+    } & Orchestrator.OrchestratorDispatchOptions,
   ) {
     // Neither an accepted nor a rejected command may acquire new side effects
     // on replay, including when its id belongs to a different aggregate.
@@ -740,12 +788,29 @@ const make = Effect.gen(function* () {
             }),
         ),
       );
-    const receipt = yield* readReceipt(receipts.getByCommandId(command.commandId));
-    if (Option.isSome(receipt)) return yield* orchestrator.dispatch(command);
-    const projectReceipt = yield* readReceipt(receipts.getProjectByCommandId(command.commandId));
-    if (Option.isSome(projectReceipt)) return yield* orchestrator.dispatch(command);
+    const receipt = yield* SendAcknowledgement.waitingOn(
+      readReceipt(receipts.getByCommandId(command.commandId)),
+      `command receipt read for thread ${command.threadId}`,
+    );
+    if (Option.isSome(receipt))
+      return yield* SendAcknowledgement.waitingOn(
+        orchestrator.dispatch(command, options),
+        `message replay dispatch for thread ${command.threadId}`,
+      );
+    const projectReceipt = yield* SendAcknowledgement.waitingOn(
+      readReceipt(receipts.getProjectByCommandId(command.commandId)),
+      `project command receipt read for thread ${command.threadId}`,
+    );
+    if (Option.isSome(projectReceipt))
+      return yield* SendAcknowledgement.waitingOn(
+        orchestrator.dispatch(command, options),
+        `message replay dispatch for thread ${command.threadId}`,
+      );
 
-    yield* ensureCommandTranscripts(command);
+    yield* SendAcknowledgement.waitingOn(
+      ensureCommandTranscripts(command),
+      `transcript readiness for thread ${command.threadId}`,
+    );
 
     if (options.cutoverComplete && command.modelSelection !== undefined) {
       const reason = postCutoverSelectionProblem(command.modelSelection);
@@ -766,9 +831,12 @@ const make = Effect.gen(function* () {
         });
       }
     }
-    if (!options.migrate) return yield* dispatchUnchanged(command);
+    if (!options.migrate) return yield* dispatchUnchanged(command, options);
 
-    const projection = yield* orchestrator.getThreadRecords(command.threadId, []);
+    const projection = yield* SendAcknowledgement.waitingOn(
+      orchestrator.getThreadRecords(command.threadId, []),
+      `provider selection read for thread ${command.threadId}`,
+    );
     const stored = projection.thread.modelSelection;
     const requested = command.modelSelection ?? stored;
     const canonicalize = (selection: ModelSelection) => {
@@ -860,7 +928,7 @@ const make = Effect.gen(function* () {
       ) {
         // ardud: after cutover a busy thread keeps working where it is; this turn runs (or
         // queues) on its current harness and the thread moves on its first turn that starts idle.
-        if (options.cutoverComplete) return yield* dispatchUnchanged(command);
+        if (options.cutoverComplete) return yield* dispatchUnchanged(command, options);
         return yield* new Orchestrator.OrchestratorCommandRejectedError({
           commandId: command.commandId,
           commandType: command.type,
@@ -868,12 +936,15 @@ const make = Effect.gen(function* () {
             "Cannot migrate an archived or deleted thread, or one with active or queued runs, pending requests or background work.",
         });
       }
-      yield* orchestrator.dispatch({
-        type: "thread.model-selection.set",
-        commandId: CommandId.make(`command:ardud:harness-migration:${NodeCrypto.randomUUID()}`),
-        threadId: command.threadId,
-        modelSelection: resolvedStored.selection,
-      });
+      yield* orchestrator.dispatch(
+        {
+          type: "thread.model-selection.set",
+          commandId: CommandId.make(`command:ardud:harness-migration:${NodeCrypto.randomUUID()}`),
+          threadId: command.threadId,
+          modelSelection: resolvedStored.selection,
+        },
+        options,
+      );
     }
 
     const nextCommand =
@@ -883,16 +954,38 @@ const make = Effect.gen(function* () {
     // Re-read the target after a selection update and check the actual send,
     // rather than allowing a disabled destination on an inherited command.
     yield* assertDispatchTargetEnabled(nextCommand);
-    return yield* orchestrator.dispatch(nextCommand);
+    return yield* SendAcknowledgement.waitingOn(
+      orchestrator.dispatch(nextCommand, options),
+      `message command admission for thread ${command.threadId}`,
+    );
   });
 
-  const dispatch: ThreadManagementServiceShape["dispatch"] = (command) => {
+  const dispatch: ThreadManagementServiceShape["dispatch"] = (command, options) => {
+    if (command.type === "delegated_task.request") {
+      return Effect.acquireUseRelease(
+        Ref.update(pendingDelegations, (current) => {
+          const next = new Map(current);
+          next.set(command.commandId, (current.get(command.commandId) ?? 0) + 1);
+          return next;
+        }),
+        () =>
+          delegationDispatchLock.withLock(command.commandId, dispatchUnchanged(command, options)),
+        () =>
+          Ref.update(pendingDelegations, (current) => {
+            const next = new Map(current);
+            const remaining = (current.get(command.commandId) ?? 1) - 1;
+            if (remaining === 0) next.delete(command.commandId);
+            else next.set(command.commandId, remaining);
+            return next;
+          }),
+      );
+    }
     if (
       command.type !== "message.dispatch" &&
       command.type !== "thread.model-selection.set" &&
       command.type !== "provider.switch"
     ) {
-      return dispatchUnchanged(command);
+      return dispatchUnchanged(command, options);
     }
     return serverSettings.getSettings.pipe(
       Effect.orDie,
@@ -902,13 +995,13 @@ const make = Effect.gen(function* () {
           settings.ardudHarnessMigration?.threadIds?.includes(command.threadId) === true;
         const cutoverComplete = settings.ardudHarnessMigration?.cutoverComplete === true;
         if (!migrate && !cutoverComplete) {
-          return dispatchUnchanged(command);
+          return dispatchUnchanged(command, options);
         }
         return selectionDispatchLock.withLock(
           command.threadId,
           command.type === "message.dispatch"
-            ? dispatchWithSelectionMigration(command, { migrate, cutoverComplete })
-            : dispatchUnchanged(command),
+            ? dispatchWithSelectionMigration(command, { ...options, migrate, cutoverComplete })
+            : dispatchUnchanged(command, options),
         );
       }),
     );
@@ -1006,6 +1099,7 @@ const make = Effect.gen(function* () {
   const sendToThread: ThreadManagementServiceShape["sendToThread"] = Effect.fn(
     "ThreadManagementService.sendToThread",
   )(function* (input) {
+    const guard = { isStale: () => input.isStale?.() === true };
     const target = yield* getProjectThreadRecords(
       input,
       input.mode === "restart"
@@ -1086,16 +1180,19 @@ const make = Effect.gen(function* () {
         capabilities.supportsInterrupt &&
         capabilities.supportsQueuedMessages
       ) {
-        yield* orchestrator.dispatch({
-          type: "run.interrupt",
-          commandId: interruptCommandId,
-          threadId: input.threadId,
-          runId: steerableRun.id,
-          fenced: true,
-          ...(steerableRun.activeAttemptId === null
-            ? {}
-            : { expectedAttemptId: steerableRun.activeAttemptId }),
-        });
+        yield* orchestrator.dispatch(
+          {
+            type: "run.interrupt",
+            commandId: interruptCommandId,
+            threadId: input.threadId,
+            runId: steerableRun.id,
+            fenced: true,
+            ...(steerableRun.activeAttemptId === null
+              ? {}
+              : { expectedAttemptId: steerableRun.activeAttemptId }),
+          },
+          guard,
+        );
         dispatchMode = { type: "queue_after_active" };
       } else {
         dispatchMode = {
@@ -1113,23 +1210,28 @@ const make = Effect.gen(function* () {
     }
 
     const dispatched = yield* SendAcknowledgement.observe(
-      dispatch({
-        type: "message.dispatch",
-        commandId: input.commandId,
-        threadId: input.threadId,
-        messageId: input.messageId,
-        ...(input.scheduledTaskId === undefined ? {} : { scheduledTaskId: input.scheduledTaskId }),
-        ...(input.senderThreadId === undefined ? {} : { senderThreadId: input.senderThreadId }),
-        text: input.text,
-        attachments: input.attachments,
-        ...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
-        dispatchMode,
-        createdBy: input.createdBy,
-        creationSource: input.creationSource,
-        ...(input.contextReset === true ? { contextReset: true } : {}),
-        // ardud:
-        ...(input.context === undefined ? {} : { context: input.context }),
-      }),
+      dispatch(
+        {
+          type: "message.dispatch",
+          commandId: input.commandId,
+          threadId: input.threadId,
+          messageId: input.messageId,
+          ...(input.scheduledTaskId === undefined
+            ? {}
+            : { scheduledTaskId: input.scheduledTaskId }),
+          ...(input.senderThreadId === undefined ? {} : { senderThreadId: input.senderThreadId }),
+          text: input.text,
+          attachments: input.attachments,
+          ...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
+          dispatchMode,
+          createdBy: input.createdBy,
+          creationSource: input.creationSource,
+          ...(input.contextReset === true ? { contextReset: true } : {}),
+          // ardud:
+          ...(input.context === undefined ? {} : { context: input.context }),
+        },
+        guard,
+      ),
       input,
     );
     const projection = yield* getProjectThreadRecords(input, ["runs", "messages", "turnItems"], {
@@ -1497,6 +1599,7 @@ const make = Effect.gen(function* () {
   });
 
   return ThreadManagementService.of({
+    promoteQueuedMessages: orchestrator.promoteQueuedMessages,
     ensureLegacyTranscript,
     searchThreadStream: (input) =>
       Stream.unwrap(
@@ -1539,6 +1642,7 @@ const make = Effect.gen(function* () {
     getThreadSnapshotWindow,
     getProjectThreadRecords,
     getProjectThread,
+    listActiveThreadIds: orchestrator.listActiveThreadIds,
     getShellSnapshot: orchestrator.getShellSnapshot,
     readShellSnapshot: orchestrator.readShellSnapshot,
     getCallerRow: orchestrator.getCallerRow,
@@ -1550,6 +1654,7 @@ const make = Effect.gen(function* () {
     assertProviderInstanceEnabled,
     isProviderInstanceEnabledForProject,
     hasReceipt,
+    getDelegationCommandState,
     findMcpThreadCreations: receipts.findMcpThreadCreations,
     getCommandReceipt: Effect.fn("ThreadManagementService.getCommandReceipt")(
       receipts.getByCommandId,

@@ -2,6 +2,7 @@
 import type * as NodeSqlite from "node:sqlite";
 import type * as NodeFS from "node:fs";
 import type * as NodePath from "node:path";
+import { resolveHistoryBasePath } from "./historySourceFiles.ts";
 
 export interface ReadonlyReplicaOptions {
   readonly sourcePath: string;
@@ -13,9 +14,37 @@ export interface ReadonlyReplicaOptions {
   readonly rebuildBackoffMs?: number;
   /** While a rebuild is held back, the failure is reported this often (default 1 h). */
   readonly rebuildNoticeMs?: number;
+  readonly onRebuildEvent?: (event: ReadonlyRebuildEvent) => void;
+}
+
+export interface ReadonlyRebuildEvent {
+  readonly event: "start" | "progress" | "publish" | "abort";
+  readonly kind: "additive" | "full";
+  readonly reason: string;
+  readonly generation: number;
+  readonly table: string;
+  readonly rows: number;
+  readonly pages: number;
+  readonly elapsedMs: number;
+  readonly bytes?: number;
+  readonly error?: string;
+}
+
+export interface LineageRepairBump {
+  readonly revision: number;
+  readonly cause:
+    | "fast_lane_insert"
+    | "fast_lane_update"
+    | "reconcile_change"
+    | "reconcile_delete"
+    | "reset";
+  readonly table: string;
+  readonly ids: number;
 }
 
 export interface ReadonlyExportMetrics {
+  readonly lineageRepairCounts: Record<string, number>;
+  readonly lineageRepairs: LineageRepairBump[];
   readonly phaseMs: Record<string, number>;
   readonly phaseSteps: Record<string, number>;
   readonly identityRows: number;
@@ -28,13 +57,23 @@ export function createReadonlyReplica(
   fs: typeof NodeFS,
   path: typeof NodePath,
   options: ReadonlyReplicaOptions,
+  resolveBasePath = resolveHistoryBasePath,
 ) {
-  let metrics: ReadonlyExportMetrics = {
+  const emptyMetrics = (): ReadonlyExportMetrics => ({
+    lineageRepairCounts: {
+      fast_lane_insert: 0,
+      fast_lane_update: 0,
+      reconcile_change: 0,
+      reconcile_delete: 0,
+      reset: 0,
+    },
+    lineageRepairs: [],
     phaseMs: {},
     phaseSteps: {},
     identityRows: 0,
     identityLagMaxMs: 0,
-  };
+  });
+  let metrics = emptyMetrics();
   const measure = <A>(phase: string, body: () => A): A => {
     const started = Date.now();
     try {
@@ -148,25 +187,21 @@ export function createReadonlyReplica(
       }
     };
     assertRedactionComplete();
-    const baseFilename = () => {
+    const readBasePath = () => {
       if (
         !source.prepare("SELECT 1 FROM sqlite_schema WHERE name='ardud_history_base_archive'").get()
       )
         return undefined;
-      const rows = source.prepare("SELECT filename FROM ardud_history_base_archive LIMIT 2").all();
-      if (rows.length === 0) return undefined;
-      const filename = rows[0]!.filename;
-      if (
-        rows.length !== 1 ||
-        typeof filename !== "string" ||
-        !/^statev2\.pre-shrink-[^/\\]+\.sqlite$/.test(filename) ||
-        path.basename(filename) !== filename
-      )
-        throw new Error("Invalid readonly history base filename");
-      return filename;
+      return resolveBasePath(
+        path,
+        options.sourcePath,
+        source
+          .prepare("SELECT filename FROM ardud_history_base_archive LIMIT 2")
+          .all()
+          .map((row) => ({ filename: row.filename })),
+      );
     };
-    const baseName = baseFilename();
-    const basePath = baseName ? path.join(path.dirname(options.sourcePath), baseName) : undefined;
+    const basePath = readBasePath();
     if (basePath) {
       if (!fs.existsSync(basePath)) throw new Error("Readonly history base unavailable");
       baseArchive = open(basePath, { readOnly: true }, "primary");
@@ -228,8 +263,13 @@ export function createReadonlyReplica(
     target.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=0;
       PRAGMA journal_size_limit=33554432; PRAGMA cache_size=-8192;
       CREATE TABLE IF NOT EXISTS ardud_readonly_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-      ${bookkeeping}`);
+      ${bookkeeping}
+      CREATE TABLE IF NOT EXISTS ardud_readonly_lineage_touches (
+        revision INTEGER PRIMARY KEY, table_name TEXT NOT NULL, id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('insert','update')), at TEXT NOT NULL
+      );`);
     const out = target;
+    const replicaStat = fs.statSync(replicaName);
     const meta = (key: string, value: string) =>
       out
         .prepare(
@@ -248,9 +288,35 @@ export function createReadonlyReplica(
       out.prepare("SELECT value FROM ardud_readonly_meta WHERE key=?").get(key)?.value as
         | string
         | undefined;
+    if (getMeta("lineage_touch_revision") === undefined) meta("lineage_touch_revision", "0");
+    if (getMeta("lineage_touch_min_revision") === undefined)
+      meta("lineage_touch_min_revision", "0");
+    const insertTouch = out.prepare(
+      "INSERT INTO ardud_readonly_lineage_touches VALUES (?,?,?,?,?)",
+    );
+    const touchIdentity = (
+      name: string,
+      id: NodeSqlite.SQLInputValue,
+      kind: "insert" | "update",
+    ) => {
+      const revision = Number(getMeta("lineage_touch_revision")) + 1;
+      insertTouch.run(revision, name, id, kind, new Date(Date.now()).toISOString());
+      meta("lineage_touch_revision", String(revision));
+    };
+    const pruneTouches = () => {
+      // Keep 20k touches so slow readers can overlay without unbounded replica growth.
+      const through = Math.max(0, Number(getMeta("lineage_touch_revision")) - 20_000);
+      out.prepare("DELETE FROM ardud_readonly_lineage_touches WHERE revision<=?").run(through);
+      const oldest = out
+        .prepare("SELECT min(revision) AS n FROM ardud_readonly_lineage_touches")
+        .get()?.n;
+      meta("lineage_touch_min_revision", String(oldest ?? 0));
+    };
     const nextGeneration = () => {
-      const n = Number(getMeta("generation") ?? 0) + 1;
-      meta("generation", String(n));
+      // Seen/prune epochs are not published generations. A bootstrap may page
+      // many tables or resume several times before publishing once.
+      const n = Number(getMeta("scan_generation") ?? getMeta("generation") ?? 0) + 1;
+      meta("scan_generation", String(n));
       return n;
     };
     const sequence = () =>
@@ -285,21 +351,39 @@ export function createReadonlyReplica(
     // Auxiliary pages are staged privately before the atomic publication transaction.
     // WAL readers keep the previous completed generation (ready=1, old
     // updated_at) until it commits, so readiness is not cleared per cycle.
+    let pendingRepairs: LineageRepairBump[] = [];
+    const flushRepairs = () => {
+      for (const bump of pendingRepairs) {
+        metrics.lineageRepairCounts[bump.cause] =
+          (metrics.lineageRepairCounts[bump.cause] ?? 0) + 1;
+        metrics.lineageRepairs.push(bump);
+      }
+      pendingRepairs = [];
+    };
+    const bumpRepair = (causes: ReadonlyArray<Omit<LineageRepairBump, "revision">>) => {
+      const revision = Number(getMeta("lineage_repair_revision") ?? 0) + 1;
+      meta("lineage_repair_revision", String(revision));
+      pendingRepairs.push(...causes.map((cause) => ({ ...cause, revision })));
+    };
     let cycleTransaction = false;
     let cycleSession: NodeSqlite.Session | undefined;
-    const beginCycle = () => {
-      out.exec("BEGIN IMMEDIATE");
+    const beginCycle = (trackChanges = true) => {
+      // Parent and child rows can change in either copy order. Every
+      // publication must satisfy its foreign keys at the atomic commit.
+      out.exec("BEGIN IMMEDIATE; PRAGMA defer_foreign_keys=ON");
       cycleTransaction = true;
-      cycleSession = out.createSession();
+      if (trackChanges) cycleSession = out.createSession();
     };
     const commitCycle = () => {
       cycleSession?.close();
       cycleSession = undefined;
       out.exec("COMMIT");
       cycleTransaction = false;
+      flushRepairs();
     };
     let invalidated: string | undefined;
     const transaction = <A>(body: () => A) => {
+      const pendingCount = pendingRepairs.length;
       if (cycleTransaction) {
         out.exec("SAVEPOINT readonly_page");
         try {
@@ -313,16 +397,19 @@ export function createReadonlyReplica(
           } catch {
             // The cycle transaction itself is gone; step() discards the cycle.
           }
+          pendingRepairs.length = pendingCount;
           throw error;
         }
       }
-      out.exec("BEGIN IMMEDIATE");
+      out.exec("BEGIN IMMEDIATE; PRAGMA defer_foreign_keys=ON");
       try {
         const result = body();
         out.exec("COMMIT");
+        flushRepairs();
         return result;
       } catch (error) {
         out.exec("ROLLBACK");
+        pendingRepairs.length = pendingCount;
         throw error;
       }
     };
@@ -331,6 +418,7 @@ export function createReadonlyReplica(
       cycleSession?.close();
       cycleSession = undefined;
       cycleTransaction = false;
+      pendingRepairs = [];
       try {
         out.exec("ROLLBACK");
       } catch {
@@ -338,11 +426,11 @@ export function createReadonlyReplica(
       }
       return true;
     };
-    /** Structural changes: drop any open cycle and refuse readers until rebuilt. */
-    const invalidate = (message: string) => {
+    /** Structural changes discard unpublished work; a completed generation survives. */
+    const invalidate = (message: string, keepPublished = false) => {
       invalidated = message;
       abortCycle();
-      meta("ready", "0");
+      if (!keepPublished || getMeta("ready") !== "1") meta("ready", "0");
       return new Error(message);
     };
     // Path and inode only. st_dev is not stable: an external volume gets a new
@@ -359,11 +447,6 @@ export function createReadonlyReplica(
         legacy !== null && legacy[1] === sourceRealPath && legacy[2] === String(sourceStat.ino)
       );
     };
-    const normalizeSchema = (value: string) =>
-      value
-        .replace(/\s+/g, "")
-        .replace(/IFNOTEXISTS/gi, "")
-        .toLowerCase();
     const sourceTables = [...projections, ...auxiliary].map((name) => {
       const db =
         boards &&
@@ -379,56 +462,321 @@ export function createReadonlyReplica(
         throw invalidate(`Readonly export source table missing: ${name}`);
       return { name, db, schema };
     });
-    // A replaced source, a changed table or a regressed event history cannot be
-    // caught up incrementally. Rebuild in place instead of refusing every open
-    // until someone deletes the file: readers see ready=0 until the fresh
-    // generation publishes, exactly as on a first bootstrap.
+    const copyIndexes = (name: string, db: NodeSqlite.DatabaseSync) => {
+      // These indexes touch the exported copy only; no live schema changes.
+      for (const row of db
+        .prepare(
+          "SELECT sql FROM sqlite_schema WHERE type='index' AND tbl_name=? AND sql IS NOT NULL",
+        )
+        .all(name)) {
+        out.exec(
+          String(row.sql).replace(
+            /^CREATE (UNIQUE )?INDEX\s+(?:IF NOT EXISTS\s+)?/i,
+            "CREATE $1INDEX IF NOT EXISTS ",
+          ),
+        );
+      }
+    };
+    const createExportedTable = ({ schema }: (typeof sourceTables)[number]) => {
+      out.exec(
+        schema.replace(/^CREATE TABLE\s+(?:IF NOT EXISTS\s+)?/i, "CREATE TABLE IF NOT EXISTS "),
+      );
+    };
+    const pendingAuxiliarySchemas = new Map<string, (typeof sourceTables)[number]>();
+    const refreshAuxiliarySchemas = (changed: typeof sourceTables) => {
+      // Schema, indexes, rows and markers switch inside the publication transaction.
+      for (const { name } of changed) out.exec(`DROP TABLE IF EXISTS ${q(name)}`);
+      for (const table of changed) createExportedTable(table);
+      for (const { name, db, schema } of changed) {
+        copyIndexes(name, db);
+        meta(`schema:${name}`, schema);
+      }
+      meta(
+        "last_aux_schema_refresh",
+        JSON.stringify({ tables: changed.map(({ name }) => name), at: new Date().toISOString() }),
+      );
+    };
+    // Compare complete column clauses, including constraints and quoted defaults.
+    // Splitting only at top-level commas keeps CHECK/default expressions intact.
+    const schemaParts = (sql: string) => {
+      const begin = sql.indexOf("(");
+      let depth = 0,
+        quote = "",
+        part = begin + 1;
+      const clauses: string[] = [];
+      for (let i = begin; i < sql.length; i++) {
+        const c = sql[i]!;
+        if (quote) {
+          if (c === quote) {
+            if (sql[i + 1] === quote) i++;
+            else quote = "";
+          }
+        } else if (c === "'" || c === '"' || c === "`" || c === "[") {
+          quote = c === "[" ? "]" : c;
+        } else if (c === "(") depth++;
+        else if (c === ")") {
+          if (--depth === 0) {
+            clauses.push(sql.slice(part, i).trim());
+            return { clauses, suffix: sql.slice(i + 1).trim() };
+          }
+        } else if (c === "," && depth === 1) {
+          clauses.push(sql.slice(part, i).trim());
+          part = i + 1;
+        }
+      }
+      throw new Error("Unsupported export schema");
+    };
+    const changedTables = sourceTables.filter(({ name, schema }) => {
+      const previous = getMeta(`schema:${name}`);
+      return previous !== undefined && previous !== schema;
+    });
+    const restrictiveIndexesChanged = (
+      left: NodeSqlite.DatabaseSync,
+      right: NodeSqlite.DatabaseSync,
+      name: string,
+    ) =>
+      left
+        .prepare(`PRAGMA index_list(${q(name)})`)
+        .all()
+        .some((index) => {
+          const needsCompleteRows =
+            Number(index.unique) === 1 ||
+            Number(index.partial) === 1 ||
+            left
+              .prepare(`PRAGMA index_xinfo(${q(String(index.name))})`)
+              .all()
+              .some((column) => Number(column.cid) === -2);
+          if (!needsCompleteRows) return false;
+          const previous = left
+            .prepare("SELECT sql FROM sqlite_schema WHERE type='index' AND name=?")
+            .get(index.name!);
+          const current = right
+            .prepare("SELECT sql FROM sqlite_schema WHERE type='index' AND name=?")
+            .get(index.name!);
+          return !current || previous?.sql !== current.sql;
+        });
+    // Index DDL does not change CREATE TABLE text, including when a later
+    // migration arrives while a persisted column backfill is unfinished.
+    const changedIndexes = new Set(
+      sourceTables
+        .filter(
+          ({ name, db }) =>
+            getMeta(`schema:${name}`) !== undefined &&
+            (restrictiveIndexesChanged(db, out, name) || restrictiveIndexesChanged(out, db, name)),
+        )
+        .map(({ name }) => name),
+    );
+    const additions = new Map<string, { clauses: string[]; columns: string[] }>();
+    for (const { name, db, schema } of changedTables) {
+      if (!projections.includes(name)) continue;
+      const before = schemaParts(getMeta(`schema:${name}`)!);
+      const after = schemaParts(schema);
+      const remaining = [...after.clauses];
+      for (const clause of before.clauses) {
+        const at = remaining.indexOf(clause);
+        if (at < 0) break;
+        remaining.splice(at, 1);
+      }
+      const oldInfo = out.prepare(`PRAGMA table_xinfo(${q(name)})`).all();
+      const newInfo = db.prepare(`PRAGMA table_xinfo(${q(name)})`).all();
+      if (
+        // These indexes need a complete generation: defaults can collide or
+        // fail an expression on rows awaiting an atomic update/deletion.
+        changedIndexes.has(name) ||
+        JSON.stringify(db.prepare(`PRAGMA foreign_key_list(${q(name)})`).all()) !==
+          JSON.stringify(out.prepare(`PRAGMA foreign_key_list(${q(name)})`).all()) ||
+        // A CHECK can depend on older columns that intentionally stay at the
+        // published snapshot during a column-only backfill.
+        remaining.some((clause) =>
+          /\bCHECK\b/i.test(clause.replace(/'(?:[^']|'')*'|"(?:[^"]|"")*"/g, "")),
+        ) ||
+        before.suffix !== after.suffix ||
+        after.clauses.length - remaining.length !== before.clauses.length ||
+        newInfo.length <= oldInfo.length ||
+        remaining.length !== newInfo.length - oldInfo.length ||
+        oldInfo.some((row, i) => JSON.stringify(row) !== JSON.stringify(newInfo[i])) ||
+        newInfo
+          .slice(oldInfo.length)
+          .some(
+            (row) =>
+              Number(row.pk) !== 0 ||
+              Number(row.hidden) !== 0 ||
+              (Number(row.notnull) === 1 &&
+                (row.dflt_value === null || String(row.dflt_value).toUpperCase() === "NULL")),
+          )
+      )
+        continue;
+      // SQLite's ADD rules are stricter than CREATE (e.g. CURRENT_TIMESTAMP
+      // defaults on populated tables). Let SQLite check them without exposing
+      // a schema change or guessing which default expressions are constant.
+      let supportsAlter = true;
+      out.exec("SAVEPOINT readonly_schema_probe");
+      try {
+        for (const clause of remaining) out.exec(`ALTER TABLE ${q(name)} ADD COLUMN ${clause}`);
+      } catch (error) {
+        if (!/^Cannot add /i.test(String((error as Error)?.message ?? error))) throw error;
+        supportsAlter = false;
+      } finally {
+        out.exec("ROLLBACK TO readonly_schema_probe; RELEASE readonly_schema_probe");
+      }
+      if (!supportsAlter) continue;
+      additions.set(name, {
+        clauses: remaining,
+        columns: newInfo.slice(oldInfo.length).map((row) => String(row.name)),
+      });
+    }
     const storedSource = getMeta("source");
     const storedSequence = getMeta("sequence");
-    const changedTable = sourceTables.find(({ name, schema }) => {
-      const previous = getMeta(`schema:${name}`);
-      return previous !== undefined && normalizeSchema(previous) !== normalizeSchema(schema);
-    });
+    const changedProjection =
+      changedTables.find(({ name }) => projections.includes(name) && !additions.has(name)) ??
+      sourceTables.find(({ name }) => projections.includes(name) && changedIndexes.has(name));
     const rebuildReason =
       storedSource !== undefined && !sameSource(storedSource)
         ? "source database was replaced"
-        : changedTable
-          ? `source schema changed: ${changedTable.name}`
+        : changedProjection
+          ? `source schema changed: ${changedProjection.name}`
           : storedSequence !== undefined && sequence() < Number(storedSequence)
             ? "source event sequence regressed"
             : undefined;
+    let rebuild:
+      | {
+          kind: "additive" | "full";
+          reason: string;
+          started: number;
+          rows: number;
+          pages: number;
+          table: string;
+          loggedAt: number;
+        }
+      | undefined;
+    const rebuildEvent = (event: ReadonlyRebuildEvent["event"], error?: unknown) => {
+      if (!rebuild) return;
+      const value: ReadonlyRebuildEvent = {
+        event,
+        kind: rebuild.kind,
+        reason: rebuild.reason,
+        generation:
+          Number(getMeta("generation") ?? 0) +
+          (rebuild.kind === "full" && event !== "publish" ? 1 : 0),
+        table: rebuild.table,
+        rows: rebuild.rows,
+        pages: rebuild.pages,
+        elapsedMs: Date.now() - rebuild.started,
+        ...(event === "publish"
+          ? {
+              bytes:
+                fs.statSync(options.replicaPath).size +
+                (fs.existsSync(options.replicaPath + "-wal")
+                  ? fs.statSync(options.replicaPath + "-wal").size
+                  : 0),
+            }
+          : {}),
+        ...(error === undefined
+          ? {}
+          : { error: String((error as Error)?.message ?? error).slice(0, 1000) }),
+      };
+      meta("rebuild_progress", JSON.stringify(value));
+      // A full rebuild holds the SQLite writer until publication. Commit
+      // diagnostics separately so mode=ro readers can see its latest page.
+      let diagnosticsDir: string | undefined;
+      try {
+        diagnosticsDir = fs.mkdtempSync(replicaName + ".diagnostics-");
+        const temporary = path.join(diagnosticsDir, "progress.json");
+        fs.writeFileSync(
+          temporary,
+          JSON.stringify({
+            replica_identity: [replicaStat.dev, replicaStat.ino],
+            rebuild_started_at: new Date(rebuild.started).toISOString(),
+            rebuild_finished_at: event === "publish" ? new Date(Date.now()).toISOString() : "",
+            rebuild_progress: JSON.stringify(value),
+          }),
+          { mode: 0o600 },
+        );
+        fs.renameSync(temporary, replicaName + ".rebuild.json");
+      } catch {
+        // Diagnostics must not prevent publication; meta and logs still work.
+      } finally {
+        try {
+          if (diagnosticsDir) fs.rmSync(diagnosticsDir, { recursive: true, force: true });
+        } catch {
+          // A cleanup failure must not turn diagnostics into an export failure.
+        }
+      }
+      options.onRebuildEvent?.(value);
+      rebuild.loggedAt = Date.now();
+    };
+    const startRebuild = (kind: "additive" | "full", reason: string) => {
+      rebuild = {
+        kind,
+        reason,
+        started: Date.now(),
+        rows: 0,
+        pages: 0,
+        table: "",
+        loggedAt: Date.now(),
+      };
+      meta("rebuild_started_at", new Date(rebuild.started).toISOString());
+      meta("rebuild_finished_at", "");
+      meta("rebuild_kind", kind);
+      rebuildEvent("start");
+    };
+    const oldRecordFailure = recordFailure;
+    recordFailure = (error) => {
+      oldRecordFailure(error);
+      if (rebuild) {
+        rebuildEvent("abort", error);
+        rebuild = undefined;
+      }
+    };
+    const notePage = (table: string, rows: number) => {
+      if (!rebuild) return;
+      rebuild.table = table;
+      rebuild.rows += rows;
+      rebuild.pages++;
+      if (Date.now() - rebuild.loggedAt >= 30_000) rebuildEvent("progress");
+    };
     if (rebuildReason) {
-      // A rebuild re-bootstraps the whole export (4.5 GB in production) by
-      // paging the live source. Never loop: the same reason may rebuild again
-      // only after the backoff window; until then stay unready and say why.
-      // The window lives in meta, so worker and server restarts keep it.
       const lastReason = getMeta("last_rebuild_reason");
       const lastAt = Date.parse(getMeta("last_rebuild_at") ?? "");
       const now = Date.now();
-      if (
-        lastReason === rebuildReason &&
-        Number.isFinite(lastAt) &&
-        now - lastAt < rebuildBackoffMs
-      ) {
+      const insideWindow =
+        lastReason === rebuildReason && Number.isFinite(lastAt) && now - lastAt < rebuildBackoffMs;
+      // Persist the single recovery allowance across worker/server restarts.
+      const immediateRetry =
+        insideWindow &&
+        getMeta("ready") !== "1" &&
+        rebuildReason.startsWith("source schema changed:") &&
+        getMeta("schema_retry_at") !== String(lastAt);
+      if (insideWindow && !immediateRetry) {
         const lastNotice = Date.parse(getMeta("rebuild_held_notice_at") ?? "");
         const notify = !(Number.isFinite(lastNotice) && now - lastNotice < rebuildNoticeMs);
         const until = new Date(lastAt + rebuildBackoffMs).toISOString();
-        meta("ready", "0");
         meta("rebuild_held_until", until);
         if (notify) meta("rebuild_held_notice_at", new Date(now).toISOString());
         throw Object.assign(
-          new Error(
-            `Automatic rebuild held back: ${rebuildReason} again within ${Math.round(rebuildBackoffMs / 60_000)} min of the last rebuild (${new Date(lastAt).toISOString()}); next allowed after ${until}`,
-          ),
+          new Error(`Automatic rebuild held back: ${rebuildReason}; next allowed after ${until}`),
           { code: "READONLY_REBUILD_HELD", notify },
         );
       }
-      const exported = [...projections, ...auxiliary].filter((name) =>
-        out.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?").get(name),
-      );
+      if (immediateRetry) meta("schema_retry_at", String(lastAt));
+      meta("last_rebuild_reason", rebuildReason);
+      if (!insideWindow) meta("last_rebuild_at", new Date(now).toISOString());
+      out
+        .prepare(
+          "DELETE FROM ardud_readonly_meta WHERE key IN ('rebuild_held_until','rebuild_held_notice_at')",
+        )
+        .run();
+      startRebuild("full", rebuildReason);
+      // SQLite WAL sidecars are tied to the pathname. Renaming just the main
+      // file beneath mode=ro readers can pair a new main with the old WAL/SHM.
+      // Publish by WAL commit instead: old snapshots stay valid on this inode.
+      // No reader lock protocol is shared with state.sqlite readers (the
+      // OpenCode .export.lock guards only that export's writer).
+      beginCycle(false);
       transaction(() => {
         for (const name of [
-          ...exported,
+          ...projections,
+          ...auxiliary,
           "ardud_readonly_progress",
           "orchestration_events",
           "ardud_readonly_seen",
@@ -439,23 +787,44 @@ export function createReadonlyReplica(
         out.exec(bookkeeping);
         out
           .prepare(
-            "DELETE FROM ardud_readonly_meta WHERE key LIKE 'schema:%' OR key LIKE 'identity_%' OR key IN ('archive_deletion_sequence','resetting_events')",
+            "DELETE FROM ardud_readonly_meta WHERE key LIKE 'schema:%' OR key LIKE 'identity_%' OR key LIKE 'additive:%' OR key IN ('archive_deletion_sequence','resetting_events')",
           )
           .run();
-        meta("ready", "0");
         meta("source", identity);
         meta("sequence", String(sequence()));
         meta("schema_version", "1");
-        meta("last_rebuild_reason", rebuildReason);
-        meta("last_rebuild_at", new Date(now).toISOString());
-        out
-          .prepare(
-            "DELETE FROM ardud_readonly_meta WHERE key IN ('rebuild_held_until','rebuild_held_notice_at')",
-          )
-          .run();
+        // Only the private, uncommitted generation is unready.
+        meta("ready", "0");
       });
-    } else if (storedSource !== undefined && storedSource !== identity) {
-      meta("source", identity);
+    } else {
+      for (const table of sourceTables) {
+        if (
+          auxiliary.includes(table.name) &&
+          (changedTables.some(({ name }) => name === table.name) || changedIndexes.has(table.name))
+        )
+          pendingAuxiliarySchemas.set(table.name, table);
+      }
+      if (storedSource !== undefined && storedSource !== identity) meta("source", identity);
+      if (additions.size) {
+        startRebuild("additive", `source schema added columns: ${[...additions.keys()].join(",")}`);
+        transaction(() => {
+          for (const { name, schema } of changedTables.filter(({ name }) => additions.has(name))) {
+            for (const clause of additions.get(name)!.clauses)
+              out.exec(`ALTER TABLE ${q(name)} ADD COLUMN ${clause}`);
+            meta(`schema:${name}`, schema);
+            const pending = getMeta(`additive:${name}`);
+            const previous =
+              pending === undefined ? [] : (JSON.parse(pending) as { columns: string[] }).columns;
+            meta(
+              `additive:${name}`,
+              JSON.stringify({
+                cursor: 0,
+                columns: [...previous, ...additions.get(name)!.columns],
+              }),
+            );
+          }
+        });
+      }
     }
     if (!getMeta("sequence"))
       transaction(() => {
@@ -472,7 +841,10 @@ export function createReadonlyReplica(
       projections.every((name) => progress(name).done);
     // Reopening (e.g. a worker restart) keeps a published replica readable;
     // updated_at only advances at completed cycles, so a stall still goes stale.
-    if (!published()) meta("ready", "0");
+    if (!published()) {
+      meta("ready", "0");
+      if (!rebuild) startRebuild("full", "bootstrap or interrupted bootstrap");
+    }
 
     const tables = new Map<
       string,
@@ -480,7 +852,7 @@ export function createReadonlyReplica(
         db: NodeSqlite.DatabaseSync;
         columns: string[];
         primary: string;
-        upsert: NodeSqlite.StatementSync;
+        upsert: NodeSqlite.StatementSync | undefined;
       }
     >();
     const sourceSchemas = new Map<string, string>();
@@ -514,13 +886,22 @@ export function createReadonlyReplica(
     const threadSequence = (threadId: NodeSqlite.SQLInputValue) =>
       // Journal fences must include events already moved out of main, too.
       Math.max(...threadEventSources.map((statement) => Number(statement.get(threadId)?.n ?? 0)));
-    for (const { name, db, schema } of sourceTables) {
-      // Any stored schema that differed was rebuilt above.
-      meta(`schema:${name}`, schema);
+    // All referenced tables must exist before SQLite prepares any upsert,
+    // even when foreign-key checks are deferred until publication.
+    for (const table of sourceTables) {
+      if (!pendingAuxiliarySchemas.has(table.name)) {
+        meta(`schema:${table.name}`, table.schema);
+        createExportedTable(table);
+      }
+    }
+    for (const { name, db } of sourceTables) {
+      // Expressions may be invalid for temporary defaults until backfilled.
+      if (!pendingAuxiliarySchemas.has(name) && getMeta(`additive:${name}`) === undefined)
+        copyIndexes(name, db);
+    }
+    const configureTable = ({ name, db, schema }: (typeof sourceTables)[number]) => {
+      // Pending auxiliary columns do not exist in main until their rows publish.
       sourceSchemas.set(name, schema);
-      out.exec(
-        schema.replace(/^CREATE TABLE\s+(?:IF NOT EXISTS\s+)?/i, "CREATE TABLE IF NOT EXISTS "),
-      );
       const info = db.prepare(`PRAGMA table_info(${q(name)})`).all();
       const columns = info.map((row) => String(row.name));
       const primary = String(info.find((row) => row.pk === 1)?.name ?? "");
@@ -531,29 +912,15 @@ export function createReadonlyReplica(
         db,
         columns,
         primary,
-        // Identical rows are left alone: each cycle re-reads the small tables
-        // (75 MB of kanban card JSON on 10 Nov), and rewriting every unchanged
-        // row turned that into 75 MB of replica WAL per cycle.
-        upsert: out.prepare(
-          `INSERT INTO ${q(name)} (${columns.map(q).join(",")}) VALUES (${columns.map(() => "?").join(",")}) ON CONFLICT(${q(primary)}) DO UPDATE SET ${values
-            .map((c) => `${q(c)}=excluded.${q(c)}`)
-            .join(",")} WHERE ${values.map((c) => `${q(c)} IS NOT excluded.${q(c)}`).join(" OR ")}`,
-        ),
+        // Auxiliary rows use staging. Projection upserts leave identical rows alone.
+        upsert: auxiliary.includes(name)
+          ? undefined
+          : out.prepare(
+              `INSERT INTO ${q(name)} (${columns.map(q).join(",")}) VALUES (${columns.map(() => "?").join(",")}) ON CONFLICT(${q(primary)}) ${values.length ? `DO UPDATE SET ${values.map((c) => `${q(c)}=excluded.${q(c)}`).join(",")} WHERE ${values.map((c) => `${q(c)} IS NOT excluded.${q(c)}`).join(" OR ")}` : "DO NOTHING"}`,
+            ),
       });
-      // These indexes touch the exported copy only; no live schema changes.
-      for (const row of db
-        .prepare(
-          "SELECT sql FROM sqlite_schema WHERE type='index' AND tbl_name=? AND sql IS NOT NULL",
-        )
-        .all(name)) {
-        out.exec(
-          String(row.sql).replace(
-            /^CREATE (UNIQUE )?INDEX\s+(?:IF NOT EXISTS\s+)?/i,
-            "CREATE $1INDEX IF NOT EXISTS ",
-          ),
-        );
-      }
-    }
+    };
+    for (const table of sourceTables) configureTable(table);
     out.exec(
       "CREATE INDEX IF NOT EXISTS ardud_readonly_items_thread ON orchestration_v2_projection_turn_items(thread_id)",
     );
@@ -564,7 +931,7 @@ export function createReadonlyReplica(
           .prepare(`DELETE FROM ${q(name)} WHERE ${q(table.primary)}=?`)
           .run(row[table.primary]!).changes;
       } else {
-        const changes = table.upsert.run(...table.columns.map((c) => row[c]!)).changes;
+        const changes = table.upsert!.run(...table.columns.map((c) => row[c]!)).changes;
         if (name.endsWith("_turn_items"))
           out
             .prepare(
@@ -575,7 +942,7 @@ export function createReadonlyReplica(
       }
     };
     // Match recall_core.py's cached identities and live subagent traversal.
-    // Early publications must fence final verification even before events export.
+    // Early publications advertise tuple changes through the touch log until events export.
     const lineageStatements = new Map([
       [
         "orchestration_v2_projection_threads",
@@ -626,37 +993,32 @@ export function createReadonlyReplica(
     };
     // TEMP staging keeps auxiliary page pacing outside the publication lock.
     // No partial auxiliary generation is visible to outside readers.
-    const auxiliaryStages = new Map(
-      auxiliary.map((name) => {
-        const table = tables.get(name)!;
-        const stage = `readonly_stage_${name}`;
-        out.exec(
-          sourceSchemas
-            .get(name)!
-            .replace(
-              /^CREATE TABLE\s+(?:IF NOT EXISTS\s+)?[^ (]+/i,
-              `CREATE TEMP TABLE ${q(stage)}`,
-            ),
-        );
-        return [
-          name,
-          {
-            stage,
-            insert: out.prepare(
-              `INSERT OR REPLACE INTO temp.${q(stage)} (${table.columns.map(q)}) VALUES (${table.columns.map(() => "?")})`,
-            ),
-          },
-        ];
-      }),
-    );
+    const createAuxiliaryStage = (name: string) => {
+      const table = tables.get(name)!;
+      const stage = `readonly_stage_${name}`;
+      // Pending columns may not exist in main. Untyped columns preserve source
+      // storage values, and TEMP foreign keys would incorrectly resolve in temp.
+      out.exec(`CREATE TEMP TABLE ${q(stage)} (${table.columns.map(q).join(",")})`);
+      out.exec(
+        `CREATE UNIQUE INDEX temp.${q(`${stage}_primary`)} ON ${q(stage)}(${q(table.primary)})`,
+      );
+      return {
+        stage,
+        insert: out.prepare(
+          `INSERT OR REPLACE INTO temp.${q(stage)} (${table.columns.map(q)}) VALUES (${table.columns.map(() => "?")})`,
+        ),
+      };
+    };
+    const auxiliaryStages = new Map(auxiliary.map((name) => [name, createAuxiliaryStage(name)]));
     const applyAuxiliary = () => {
+      if (pendingAuxiliarySchemas.size)
+        refreshAuxiliarySchemas([...pendingAuxiliarySchemas.values()]);
       for (const name of auxiliary) {
         const { stage } = auxiliaryStages.get(name)!;
         const { primary, columns } = tables.get(name)!;
         const values = columns.filter((c) => c !== primary);
         out.exec(`INSERT INTO main.${q(name)} (${columns.map(q)}) SELECT ${columns.map(q)} FROM temp.${q(stage)} WHERE 1
-          ON CONFLICT(${q(primary)}) DO UPDATE SET ${values.map((c) => `${q(c)}=excluded.${q(c)}`)}
-          WHERE ${values.map((c) => `${q(name)}.${q(c)} IS NOT excluded.${q(c)}`).join(" OR ")}`);
+          ON CONFLICT(${q(primary)}) ${values.length ? `DO UPDATE SET ${values.map((c) => `${q(c)}=excluded.${q(c)}`).join(",")} WHERE ${values.map((c) => `${q(name)}.${q(c)} IS NOT excluded.${q(c)}`).join(" OR ")}` : "DO NOTHING"}`);
         out.exec(
           `DELETE FROM main.${q(name)} WHERE NOT EXISTS (SELECT 1 FROM temp.${q(stage)} s WHERE s.${q(primary)}=main.${q(name)}.${q(primary)})`,
         );
@@ -673,14 +1035,20 @@ export function createReadonlyReplica(
     };
     let cycleTarget: number | undefined;
     let auxiliaryCapturedAt: number | undefined;
+    const pendingAdditions = () =>
+      projections.some((name) => getMeta(`additive:${name}`) !== undefined);
+    // Ordinary published reopens retain their existing generation allocation.
+    // Schema backfills and full rebuilds advance only when their work publishes.
+    if (published() && !pendingAdditions())
+      meta("generation", String(Number(getMeta("generation") ?? 0) + 1));
     nextGeneration();
     let auxiliaryIndex = 0,
       auxiliaryCursor = 0,
       reconcileIndex = 0,
       closed = false;
-    const sourceSchemaVersion = Number(
-      source.prepare("PRAGMA schema_version").get()?.schema_version,
-    );
+    const schemaVersion = (db: NodeSqlite.DatabaseSync) =>
+      Number(db.prepare("PRAGMA schema_version").get()?.schema_version);
+    const sourceSchemaVersions = new Map(sourceTables.map(({ db }) => [db, schemaVersion(db)]));
     const markSeen = (name: string, id: NodeSqlite.SQLInputValue, generation: number) =>
       out
         .prepare(
@@ -811,7 +1179,8 @@ export function createReadonlyReplica(
       return Number.isFinite(created) ? created : undefined;
     };
     const publishIdentities = (): boolean => {
-      if (!published() || Date.now() - identityCheckedAt < 1_000) return false;
+      if (!published() || pendingAdditions() || Date.now() - identityCheckedAt < 1_000)
+        return false;
       identityCheckedAt = Date.now();
       return measure("identity", () =>
         sourceRead(() => {
@@ -851,7 +1220,7 @@ export function createReadonlyReplica(
           let oldestCreated: number | undefined;
           transaction(() => {
             let changes = 0;
-            let lineageRepaired = false;
+
             const copyIdentityRow = (
               name: string,
               row: Record<string, NodeSqlite.SQLOutputValue>,
@@ -859,7 +1228,8 @@ export function createReadonlyReplica(
               const id = row[tables.get(name)!.primary]!;
               const before = lineageIdentity(name, id);
               changes += Number(copyRow(name, row));
-              if (before !== lineageIdentity(name, id)) lineageRepaired = true;
+              if (before !== lineageIdentity(name, id))
+                touchIdentity(name, id, before === undefined ? "insert" : "update");
             };
             const copyIdentity = (name: string, row: Record<string, NodeSqlite.SQLOutputValue>) => {
               // A provider/subagent page may outrun the thread page. Resolve its
@@ -901,17 +1271,9 @@ export function createReadonlyReplica(
                 if (row) copyIdentity(name, row);
               }
             }
-            // Identity can precede its run/messages: recall only needs the thread,
-            // provider binding and subagent lineage. Do not advance the full-cycle
-            // sequence/ready/updated_at markers. Fence cached lineage overlays since
-            // these rows are visible before their corresponding exported events.
-            if (lineageRepaired) {
-              meta(
-                "lineage_repair_revision",
-                String(Number(getMeta("lineage_repair_revision") ?? 0) + 1),
-              );
-              meta("lineage_repair_watermark", getMeta("updated_at")!);
-            }
+            // These rows precede their events; readers overlay touches without
+            // invalidating the full snapshot or advancing its publication markers.
+            pruneTouches();
             metrics = { ...metrics, identityRows: metrics.identityRows + changes };
             meta("identity_sequence", String(Number(events.at(-1)?.sequence ?? identitySequence)));
           });
@@ -951,7 +1313,7 @@ export function createReadonlyReplica(
     const validate = () => {
       if (closed) throw new Error("Readonly exporter is closed");
       if (invalidated) throw new Error(invalidated);
-      if (baseFilename() !== baseName)
+      if (readBasePath() !== basePath)
         throw invalidate("History base changed; reopen readonly sources");
       if (options.archivePath && !archive && fs.existsSync(options.archivePath))
         throw invalidate("History archive appeared; reopen readonly sources");
@@ -976,20 +1338,73 @@ export function createReadonlyReplica(
           throw invalidate("Board split completed; reopen readonly sources");
         }
       }
-      if (
-        Number(source.prepare("PRAGMA schema_version").get()?.schema_version) !==
-        sourceSchemaVersion
-      ) {
-        for (const [name, schema] of sourceSchemas) {
-          if (
-            tables.get(name)!.db.prepare("SELECT sql FROM sqlite_schema WHERE name=?").get(name)
-              ?.sql !== schema
-          )
-            throw invalidate("Readonly source schema changed; restart export");
+      if ([...sourceSchemaVersions].some(([db, version]) => schemaVersion(db) !== version)) {
+        const changed = sourceTables.flatMap(({ name, db }) => {
+          const schema = db.prepare("SELECT sql FROM sqlite_schema WHERE name=?").get(name)?.sql;
+          if (typeof schema !== "string")
+            throw invalidate(`Readonly export source table missing: ${name}`, true);
+          return schema === sourceSchemas.get(name) &&
+            !restrictiveIndexesChanged(db, out, name) &&
+            !restrictiveIndexesChanged(out, db, name)
+            ? []
+            : [{ name, db, schema }];
+        });
+        if (changed.some(({ name }) => projections.includes(name)))
+          throw invalidate("Readonly source schema changed; restart export", true);
+        if (changed.length) {
+          // Routine pending diffs must restart at the new auxiliary shape.
+          // A private full rebuild keeps its transaction and completed projection pages.
+          if (rebuild?.kind !== "full") abortCycle();
+          for (const table of changed) {
+            pendingAuxiliarySchemas.set(table.name, table);
+            configureTable(table);
+            out.exec(`DROP TABLE temp.${q(auxiliaryStages.get(table.name)!.stage)}`);
+            auxiliaryStages.set(table.name, createAuxiliaryStage(table.name));
+          }
+          auxiliaryIndex = 0;
+          auxiliaryCursor = 0;
+          auxiliaryCapturedAt = undefined;
+          cycleTarget = undefined;
         }
+        for (const db of sourceSchemaVersions.keys())
+          sourceSchemaVersions.set(db, schemaVersion(db));
       }
     };
     const stepOnce = (): boolean => {
+      for (const name of projections) {
+        const pending = getMeta(`additive:${name}`);
+        if (pending === undefined) continue;
+        if (!rebuild) startRebuild("additive", `resume column backfill: ${name}`);
+        const saved = JSON.parse(pending) as { cursor: number; columns: string[] };
+        const rows = page(name, saved.cursor);
+        const table = tables.get(name)!;
+        // Only the new columns may change outside a publication. Existing
+        // status/payload fields and new rows must wait for their events/Stop
+        // items to publish together through the normal refresh transaction.
+        const update = out.prepare(
+          `UPDATE ${q(name)} SET ${saved.columns.map((column) => `${q(column)}=?`).join(",")} WHERE ${q(table.primary)}=?`,
+        );
+        transaction(() => {
+          for (const row of rows)
+            update.run(...saved.columns.map((column) => row[column]!), row[table.primary]!);
+          if (rows.length < batchSize) {
+            copyIndexes(name, table.db);
+            out.prepare("DELETE FROM ardud_readonly_meta WHERE key=?").run(`additive:${name}`);
+          } else
+            meta(
+              `additive:${name}`,
+              JSON.stringify({ ...saved, cursor: Number(rows.at(-1)!.__rowid) }),
+            );
+        });
+        notePage(name, rows.length);
+        if (!pendingAdditions()) {
+          meta("rebuild_finished_at", new Date(Date.now()).toISOString());
+          rebuildEvent("publish");
+          rebuild = undefined;
+          return getMeta("ready") !== "1";
+        }
+        return true;
+      }
       // Only projection/event catch-up and the final staged auxiliary diff hold
       // the publication transaction. Bootstrap/reset pages remain resumable.
       if (!cycleTransaction && auxiliaryIndex >= auxiliary.length && published()) {
@@ -1001,17 +1416,19 @@ export function createReadonlyReplica(
             "DELETE FROM orchestration_events WHERE sequence IN (SELECT sequence FROM orchestration_events LIMIT ?)",
           )
           .run(batchSize);
+        notePage("orchestration_events", 0);
         resettingEvents = Number(result.changes) >= batchSize;
         if (!resettingEvents) meta("resetting_events", "0");
         return true;
       }
       if (sequence() < Number(getMeta("sequence")))
-        throw invalidate("Readonly event sequence regressed");
+        throw invalidate("Readonly event sequence regressed", true);
       for (const name of projections) {
         const saved = progress(name);
         if (saved.done) continue;
         const generation = saved.generation ?? nextGeneration();
         if (saved.pruning) {
+          notePage(name, 0);
           transaction(() =>
             checkpoint(name, { ...saved, ...prune(name, saved.pruneCursor ?? 0, generation) }),
           );
@@ -1020,6 +1437,7 @@ export function createReadonlyReplica(
         source.exec("BEGIN");
         try {
           const rows = page(name, saved.cursor);
+          notePage(name, rows.length);
           transaction(() => {
             for (const row of rows) {
               copyRow(name, row);
@@ -1053,6 +1471,7 @@ export function createReadonlyReplica(
           const stage = auxiliaryStages.get(name)!;
           if (auxiliaryCursor === 0) out.exec(`DELETE FROM temp.${q(stage.stage)}`);
           const rows = page(name, auxiliaryCursor);
+          notePage(name, rows.length);
           transaction(() => {
             for (const row of rows)
               stage.insert.run(...tables.get(name)!.columns.map((c) => row[c]!));
@@ -1095,6 +1514,7 @@ export function createReadonlyReplica(
           const rows = [...merged.values()]
             .sort((a, b) => Number(a.sequence) - Number(b.sequence))
             .slice(0, batchSize);
+          notePage("orchestration_events", rows.length);
           // Compaction may have removed changes while bootstrap was in flight.
           // Revisit the paged projections at a fresh watermark, failing closed.
           if (
@@ -1108,14 +1528,11 @@ export function createReadonlyReplica(
               meta("sequence", String(sequence()));
               out.prepare("DELETE FROM ardud_readonly_progress").run();
               meta("resetting_events", "1");
-              meta(
-                "lineage_repair_revision",
-                String(Number(getMeta("lineage_repair_revision") ?? 0) + 1),
-              );
+              bumpRepair([{ cause: "reset", table: "orchestration_events", ids: 0 }]);
             });
             // Publish the reset: readers must not keep using this replica
             // while projections are rebuilt and events are cleared.
-            if (cycleTransaction) {
+            if (cycleTransaction && rebuild?.kind !== "full") {
               commitCycle();
             }
             resettingEvents = true;
@@ -1279,19 +1696,21 @@ export function createReadonlyReplica(
         reconcileIndex++;
         transaction(() => {
           measure("auxiliaryCommit", applyAuxiliary);
-          let lineageRepaired = false;
+          const causes = new Map<string, Omit<LineageRepairBump, "revision">>();
           for (const row of rows) {
             const before = lineageIdentity(name, row.id!);
             refresh(name, row.id!);
-            if (before !== lineageIdentity(name, row.id!)) lineageRepaired = true;
+            const after = lineageIdentity(name, row.id!);
+            if (before !== undefined && before !== after) {
+              const cause = after === undefined ? "reconcile_delete" : "reconcile_change";
+              causes.set(cause, { cause, table: name, ids: (causes.get(cause)?.ids ?? 0) + 1 });
+            }
           }
           // Eventless repairs cannot be replayed from orchestration_events.
           // Readers invalidate only for those repairs, not ordinary publishes.
-          if (lineageRepaired || getMeta("lineage_repair_revision") === undefined)
-            meta(
-              "lineage_repair_revision",
-              String(Number(getMeta("lineage_repair_revision") ?? 0) + Number(lineageRepaired)),
-            );
+          if (causes.size) bumpRepair([...causes.values()]);
+          else if (getMeta("lineage_repair_revision") === undefined)
+            meta("lineage_repair_revision", "0");
           checkpoint(`reconcile:${name}`, {
             cursor: rows.length < batchSize ? 0 : Number(rows.at(-1)!.__rowid),
             done: false,
@@ -1326,6 +1745,11 @@ export function createReadonlyReplica(
           // leaves it behind, so readers safely fall back after a downgrade.
           meta("lineage_repair_watermark", getMeta("updated_at")!);
           meta("ready", "1");
+          meta("generation", String(Number(getMeta("generation") ?? 0) + 1));
+          if (rebuild) meta("rebuild_finished_at", new Date(Date.now()).toISOString());
+          // Full catch-up already copied every identity through this snapshot.
+          // Persist that scan progress so a restart cannot replay an old prefix.
+          meta("identity_sequence", String(Math.max(identitySequence, cycleTarget!)));
           out
             .prepare(
               "DELETE FROM ardud_readonly_meta WHERE key IN ('rebuild_held_until','rebuild_held_notice_at')",
@@ -1340,11 +1764,17 @@ export function createReadonlyReplica(
       if (cycleTransaction) {
         commitCycle();
       }
+      pendingAuxiliarySchemas.clear();
+      identitySequence = Math.max(identitySequence, cycleTarget!);
       cycleTarget = undefined;
       auxiliaryIndex = 0;
       auxiliaryCursor = 0;
       auxiliaryCapturedAt = undefined;
-      nextGeneration();
+      if (rebuild) {
+        meta("rebuild_finished_at", new Date(Date.now()).toISOString());
+        rebuildEvent("publish");
+        rebuild = undefined;
+      }
       return false;
     };
     return {
@@ -1361,7 +1791,7 @@ export function createReadonlyReplica(
       },
       takeMetrics() {
         const result = metrics;
-        metrics = { phaseMs: {}, phaseSteps: {}, identityRows: 0, identityLagMaxMs: 0 };
+        metrics = emptyMetrics();
         return result;
       },
       /** One bounded page; false means caught up, ready for the next interval. */
@@ -1385,6 +1815,10 @@ export function createReadonlyReplica(
           closed = true;
           // An unfinished cycle is discarded; readers keep the last generation.
           abortCycle();
+          if (rebuild) {
+            rebuildEvent("abort", new Error("exporter closed before publication"));
+            rebuild = undefined;
+          }
           out.close();
           boards?.close();
           archive?.close();

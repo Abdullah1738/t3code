@@ -469,6 +469,8 @@ export interface ProviderAdapterV2InterruptInput {
   readonly providerThread: OrchestrationV2ProviderThread;
   readonly providerTurnId: ProviderTurnId;
   readonly requestRuntimeRestart?: boolean;
+  /** Timeout cleanup must leave work from earlier turns running. */
+  readonly stopBackgroundWork?: boolean;
 }
 
 export interface ProviderAdapterV2RuntimeRequestResponseInput {
@@ -648,6 +650,7 @@ export interface ProviderAdapterV2SessionRuntime {
     readonly providerThread: OrchestrationV2ProviderThread;
     readonly runId: RunId;
     readonly attemptId: RunAttemptId;
+    readonly stopBackgroundWork?: boolean;
   }) => Effect.Effect<void, ProviderAdapterV2Error>;
   readonly interruptTurn: (
     input: ProviderAdapterV2InterruptInput,

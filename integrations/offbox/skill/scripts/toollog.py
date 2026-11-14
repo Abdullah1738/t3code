@@ -15,19 +15,27 @@ import tempfile
 import time
 
 CAP_BYTES = 50 * 1024 * 1024
-NUMBERS = set("bytes files skipped exitCode waitMs position ttlSeconds reasonLength busy idle stopped count flagsCount envCount pullCount includeCount stepCount attempt pid".split())
-BOOLEANS = set("queued fresh bg noSync git noFallback noRetry remote failed stale timeoutHit fallback dryRun baseGiven templateGiven sizeGiven".split())
+NUMBERS = set("bytes files skipped exitCode waitMs queueMs runMs position ttlSeconds reasonLength busy idle stopped count flagsCount envCount pullCount includeCount stepCount attempt pid timeoutSeconds commandLength cmd_bytes step_count".split())
+NUMBERS.update({'command_exit_code', 'wrapper_exit_code', 'disk_attempt'})
+NUMBERS.update(f'{fs}_{field}' for fs in ('tmp', 'var_tmp', 'home', 'workspace')
+               for field in ('free_bytes', 'size_bytes'))
+BOOLEANS = set("queued killed fresh bg noSync git noFallback noRetry remote failed stale timeoutHit fallback dryRun baseGiven templateGiven sizeGiven".split())
 ENUMS = {
+    "cmd_via": {"argv", "file"},
     "backend": {"home", "boat"}, "from": {"home", "boat"}, "to": {"home", "boat"},
-    "reason": {"pinned", "home_up", "home_down", "unreachable", "boat_only", "boat_only_base", "infra", "cap", "busy", "person_home_down"},
+    "reason": {"pinned", "home_up", "home_down", "unreachable", "boat_only", "boat_only_base", "infra", "cap", "busy", "person_home_down", "base_home_down"},
     "leaseKind": {"fresh", "reused", "saved-base"},
-    "decision": {"allowed", "denied", "local-override"},
+    "decision": {"allowed", "denied", "local-override", "boat", "wait_explicit_base", "wait_person", "wait_pinned"},
     "harness": {"opencode", "codex", "claudeAgent", "codex-cu"},
     "commandClass": {"cargo", "evm", "go-build", "go-test", "gradle", "js-test", "lint", "make-test", "pytest", "typecheck", "light", "heavy", "unknown", "test", "install", "build", "docker", "opaque", "cpu"},
     "action": {"stop", "delete", "forget", "settle", "keep", "other"},
     "linkType": {"wireguard", "residential", "down", "unknown"},
     "stage": {"ssh_setup", "ssh_drop", "readiness", "put_file", "sync", "pull", "command", "install_mid_run", "request", "reaper"},
+    "infra_failure": {"enospc"},
+    "infra_reason": {"low_space_gate", "disk_exhausted"},
 }
+ENUMS.update({f'{fs}_fstype': {'tmpfs', 'zfs', 'ext2', 'ext3', 'ext4', 'xfs', 'btrfs', 'overlay', 'unknown'}
+              for fs in ('tmp', 'var_tmp', 'home', 'workspace')})
 _DAYS = set()
 
 
@@ -46,7 +54,7 @@ def _atom(value):
 
 def _ids(values):
     return {k: v for k, v in (values or {}).items()
-            if k in {"run", "box", "thread", "card", "chat", "order"} and isinstance(v, str)
+            if k in {"run", "box", "thread", "card", "chat", "order", "owner"} and isinstance(v, str)
             and len(v) <= 200 and re.fullmatch(r"[A-Za-z0-9_:%.\-/]+", v)
             and not re.search(r"\d{13,}", v)}
 
@@ -63,6 +71,10 @@ def _props(values):
         elif k == "repo" and isinstance(v, str) and re.fullmatch(r"[a-f0-9]{16}", v):
             out[k] = v
         elif k == "size" and v in ("small", "default", "large", "xlarge"):
+            out[k] = v
+        elif k == "errorClass" and _atom(v):
+            out[k] = v
+        elif k == 'base' and (v is None or isinstance(v, str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,200}', v)):
             out[k] = v
         elif k == "exitRelay" and isinstance(v, str) and re.fullmatch(r"[a-z]{2}-[a-z]{3}-wg-\d{3}", v):
             out[k] = v

@@ -85,6 +85,22 @@ class LoggingTests(unittest.TestCase):
         self.assertTrue(keep.exists())
         self.assertEqual(rows[-1]['kind'], 'error')
 
+    def test_invalid_numeric_fields_do_not_discard_a_record(self):
+        for value in (10**400, -10**400, float('nan'), float('inf'), float('-inf'),
+                      True, None, '123', {}, []):
+            with self.subTest(value=value):
+                count = len(self.rows())
+                toollog.emit('disk', 'perf', 'disk.sample', duration_ms=value,
+                             props={'externalFreeGb': 737, 'inventorySourceErrors': value})
+                rows = self.rows()
+                self.assertEqual(len(rows), count+1)
+                self.assertEqual(rows[-1]['props'], {'externalFreeGb': 737})
+                self.assertNotIn('durationMs', rows[-1])
+        for value in (0, 1, -1, 1.5):
+            with self.subTest(valid=value):
+                toollog.emit('disk', 'event', 'disk.swing', props={'externalFreeGbDelta': value})
+                self.assertEqual(self.rows()[-1]['props']['externalFreeGbDelta'], value)
+
     def test_rollup_fixture_and_quantiles(self):
         now = dt.datetime(2026, 11, 13, tzinfo=dt.timezone.utc)
         for value in range(1, 21):
@@ -135,7 +151,8 @@ class LoggingTests(unittest.TestCase):
         self.assertEqual(a['props']['snapshotAgeS'],1)
         self.assertNotIn('snapshotAgeS', b['props'])
         self.assertEqual(b['props']['resticExitCode'],3)
-        self.assertNotIn('password',str(self.rows()))
+        self.assertNotIn('banned',str(self.rows()))
+        self.assertNotIn('failed with password',str(self.rows()))
 
     def test_cve_entrypoint_and_fix_success_failure_no_commands(self):
         cve=load('cve_test',REPO/'integrations/cve-sweep/cve-sweep')
@@ -164,7 +181,7 @@ class LoggingTests(unittest.TestCase):
         state=self.root/'worker';state.mkdir()
         resources=[dict(id='expo:1',kind='expo',candidate=True,age_s=7200),
                    dict(id='container:local',kind='container',candidate=True,age_s=7400,image='localstack/localstack')]
-        scan=dict(resources=resources,candidates=[r['id'] for r in resources])
+        scan=dict(ts=0,liveness_unavailable=None,processes=dict(candidates=[],problems=[],checked=0,skipped=0,budget_skipped=0),resources=resources,candidates=[r['id'] for r in resources])
         with patch.object(watcher,'STATE_DIR',state), patch.object(janitor,'scan',return_value=scan), \
              patch.object(janitor,'act',side_effect=[(True,'done'),(False,'password=secret')]), \
              patch.object(janitor,'audit'), patch.object(janitor,'sh',return_value=(1,'','')), \
@@ -187,10 +204,17 @@ class LoggingTests(unittest.TestCase):
             p=reports/name;p.write_text('{"app_name":"Finder","bug_type":"309"}\nprivate stack')
             os.utime(p,(now-100,now-100))
         reader=lambda a,b: {('restart','kernel'):1} if a==now-3600 else {}
+        toollog.emit('backup', 'perf', 'backup.run', ok=True,
+                     now=dt.datetime.fromtimestamp(now-86400, dt.timezone.utc),
+                     props={'target':'memory', 'skipped':1})
         self.assertTrue(collector.collect(now, [reports], reader))
         observed=[r for r in self.rows() if r['name']=='crash.observed']
         self.assertEqual(sum(r['props']['count'] for r in observed),4)
         self.assertTrue((self.logs/'rollup-2026-11-12.json').exists())
+        rollup_props = next(r['props'] for r in self.rows() if r['name']=='log.rollup')
+        self.assertEqual(rollup_props['backup.skipped_runs.memory'], 1)
+        self.assertEqual(rollup_props['backup.ok_runs.memory'], 0)
+        self.assertEqual(rollup_props['backup.skipped_runs.health'], 0)
         collector.collect(now+1,[reports],lambda a,b:{})
         self.assertEqual(len([r for r in self.rows() if r['name']=='crash.observed']),4)
         collector.collect(now+2,[reports],lambda a,b: (_ for _ in ()).throw(RuntimeError('secret')))
@@ -225,18 +249,28 @@ class LoggingTests(unittest.TestCase):
         from types import SimpleNamespace
         cache=self.root/'cache';cache.mkdir()
         worktree=self.root/'worktree';worktree.mkdir()
+        for root in (cache,worktree):
+            (root/'child').mkdir()
+        def make_due():
+            state=jobs.read_state('disk-inventory')
+            for children in state.get('childState',{}).values():
+                for value in children.values():
+                    value['at']-=86400
+            jobs.save_state('disk-inventory',state)
         value=[100]
         def run(cmd,**kwargs):
-            self.assertEqual(cmd[:2],['/usr/bin/du','-sk'])
+            self.assertEqual(cmd[:2],['/usr/bin/du','-skl'])
             return SimpleNamespace(returncode=0,stdout=str(value[0])+'\t'+cmd[-1])
         jobs.directory_inventory([cache,worktree],run)
         jobs.disk_sample(self.root,self.root,volumes=(self.root,self.root),paths=[])
         value[0]=200
+        make_due()
         jobs.directory_inventory([cache,worktree],run)
         jobs.disk_sample(self.root,self.root,volumes=(self.root,self.root),paths=[])
         row=self.rows()[-1]
         self.assertEqual(row['props']['count'],2)
         self.assertGreater(row['props']['grower1DeltaGb'],0)
+        make_due()
         jobs.directory_inventory([cache],lambda *a,**kw: SimpleNamespace(returncode=1,stdout='private error'))
         self.assertFalse(self.rows()[-1]['ok'])
         self.assertEqual(self.rows()[-1]['name'],'disk.inventory')
@@ -246,7 +280,7 @@ class LoggingTests(unittest.TestCase):
         import dev_janitor as janitor
         import janitor_watch as watcher
         resources=[dict(id='expo:1',kind='expo',candidate=True),dict(id='expo:2',kind='expo',candidate=True)]
-        scan=dict(resources=resources,candidates=['expo:1','expo:2'])
+        scan=dict(ts=0,liveness_unavailable=None,processes=dict(candidates=[],problems=[],checked=0,skipped=0,budget_skipped=0),resources=resources,candidates=['expo:1','expo:2'])
         for entry in ('cli','hourly'):
             with self.subTest(entry=entry), patch.object(janitor,'scan',return_value=scan), \
                  patch.object(janitor,'act',side_effect=[(True,'done'),RuntimeError('failed')]), \
@@ -665,7 +699,7 @@ class DiskProbeTests(unittest.TestCase):
             self.assertFalse(jobs.state_path('disk-tooling-pid').exists())
             if outcome == 'error':
                 self.assertTrue(self.child.reaped)
-        with patch.object(collector, 'directory_inventory'), patch.object(collector, 'collect') as collect, \
+        with patch.object(collector, 'disk_wait'), patch.object(collector, 'directory_inventory'), patch.object(collector, 'collect') as collect, \
              patch.object(collector, 'state_path', side_effect=OSError('private state failure')):
             collector.main()
             collect.assert_called_once()

@@ -152,15 +152,15 @@ export async function imessagePreferences(configRoot = openCodeConfigRoot): Prom
   if (typeof configRoot !== "string" || !configRoot.startsWith("/") || /[\x00-\x1f]/.test(configRoot)) return {};
   for (const name of ["opencode.jsonc", "opencode.json"]) {
     const path = join(configRoot, name);
-    const info = await lstat(path).catch(() => { toolError("preferred-model", "preferred-model.catch1"); return undefined; });
+    const info = await lstat(path).catch((caughtError) => { toolError("preferred-model", "preferred-model.catch1", caughtError); return undefined; });
     if (!info || !info.isFile()) continue;
     if (info.size > MAX_CONFIG_BYTES) return {};
-    const text = await readFile(path, "utf8").catch(() => { toolError("preferred-model", "preferred-model.catch2"); return undefined; });
+    const text = await readFile(path, "utf8").catch((caughtError) => { toolError("preferred-model", "preferred-model.catch2", caughtError); return undefined; });
     if (text === undefined) return {};
     let config: unknown;
     try {
       config = JSON.parse(stripJsonc(text));
-    } catch { toolError("preferred-model", "preferred-model.catch3");
+    } catch (caughtError) { toolError("preferred-model", "preferred-model.catch3", caughtError);
       return {};
     }
     const imessage = (config as { imessage?: unknown } | null | undefined)?.imessage;

@@ -38,6 +38,7 @@ import * as Tracer from "effect/Tracer";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Statement from "effect/sql/Statement";
 import { projectThreadAwarenessV2 } from "@t3tools/shared/agentAwareness";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import { liveColumns } from "../ardud/persistence/historyArchiveSql.ts";
@@ -2244,6 +2245,28 @@ it.effect("one shared session update carrier survives SQL rebuild and memory rep
 });
 
 it.layer(layerTest)("ProjectionStoreV2", (it) => {
+  it.effect("metadata-only record reads do not open a writer transaction", () =>
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const threadId = yield* addRolledBackRecoveryCandidate("metadata-only");
+      let commits = 0;
+      const read = yield* store.getThreadRecords(threadId, []).pipe(
+        Effect.provideService(NodeSqliteClient.TransactionCommitObserver, () => {
+          commits++;
+        }),
+      );
+      assert.deepEqual(read, { thread: yield* store.getThread(threadId) });
+      assert.equal(commits, 0);
+      const records = yield* store.getThreadRecords(threadId, ["runs"]).pipe(
+        Effect.provideService(NodeSqliteClient.TransactionCommitObserver, () => {
+          commits++;
+        }),
+      );
+      assert.isNotEmpty(records.runs);
+      assert.equal(commits, 1);
+    }),
+  );
+
   it.effect("returns a typed read error for malformed stored plan JSON", () =>
     Effect.gen(function* () {
       const store = yield* ProjectionStore.ProjectionStoreV2;
@@ -2351,6 +2374,13 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       // The unfinished first run stays; of the finished ones only the newest two.
       assert.deepEqual(yield* ordinals({ recentRunLimit: 2 }), [1, 4, 5]);
       assert.deepEqual(yield* ordinals({ recentRunLimit: 10 }), [1, 2, 3, 4, 5]);
+      assert.deepEqual(yield* ordinals({ latestRunOnly: true }), [5]);
+      assert.deepEqual(yield* ordinals({ latestRunOnly: true, runIds: [first.id] }), []);
+      assert.deepEqual(yield* ordinals({ latestRunOnly: true, runIds: [] }), []);
+      assert.deepEqual(
+        yield* ordinals({ latestRunOnly: true, runIds: [RunId.make("run:recent-run-limit:5")] }),
+        [5],
+      );
       assert.deepEqual(yield* ordinals({}), [1, 2, 3, 4, 5]);
     }),
   );

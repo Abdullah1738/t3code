@@ -188,6 +188,45 @@ describe("DesktopObservability", () => {
     ),
   );
 
+  it.effect(
+    "persists exporter lifecycle lines across chunk boundaries without a child failure",
+    () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "readonly-export-log-",
+        });
+        const layerEnvironment = layerEnvironmentFor(baseDir, false);
+        const logPath = yield* Effect.gen(function* () {
+          const environment = yield* DesktopEnvironment.DesktopEnvironment;
+          return environment.path.join(environment.logDir, "server-child.log");
+        }).pipe(Effect.provide(layerEnvironment));
+        yield* Effect.gen(function* () {
+          const factory = yield* DesktopObservability.DesktopBackendOutputLogFactory;
+          const output = yield* factory.forInstance("primary");
+          yield* output.beginSession({ details: "test" });
+          const encode = (value: string) => new TextEncoder().encode(value);
+          yield* output.writeOutputChunk("stdout", encode('noise\n{"type":"readonly-'));
+          yield* output.writeOutputChunk("stderr", encode("interleaved stderr\n"));
+          yield* output.writeOutputChunk(
+            "stdout",
+            encode('export","event":"start"}\n{"type":"readonly-export","event":"publish"}\n'),
+          );
+          yield* output.discardSession;
+        }).pipe(
+          Effect.provide(DesktopObservability.layer.pipe(Layer.provideMerge(layerEnvironment))),
+        );
+        const records = (yield* fileSystem.readFileString(logPath)).trim().split("\n");
+        assert.equal(records.length, 2);
+        assert.include(records[0]!, "start");
+        assert.include(records[1]!, "publish");
+        assert.isFalse(records.some((line) => line.includes("noise") || line.includes("stderr")));
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(Layer.mergeAll(NodeServices.layer, NodeHttpClient.layerUndici)),
+      ),
+  );
+
   it.effect("buffers backend child output and persists it only when a failure is reported", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -266,7 +305,7 @@ describe("DesktopObservability", () => {
     ),
   );
 
-  it.effect("keeps buffering output after a non-terminal failure snapshot", () =>
+  it.effect("persists only failure snapshots while the child keeps logging after a timeout", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
       const baseDir = yield* fileSystem.makeTempDirectoryScoped({
@@ -285,6 +324,9 @@ describe("DesktopObservability", () => {
         yield* outputLog.writeOutputChunk("stdout", new TextEncoder().encode("before timeout\n"));
         yield* outputLog.persistFailureSnapshot({ details: "readiness timeout" });
         yield* outputLog.writeOutputChunk("stderr", new TextEncoder().encode("after timeout\n"));
+        const snapshot = yield* fileSystem.readFileString(logPath);
+        assert.include(snapshot, "before timeout");
+        assert.notInclude(snapshot, "after timeout");
         yield* outputLog.persistFailure({ details: "code=1" });
       }).pipe(
         Effect.annotateLogs({ runId: "test-run" }),

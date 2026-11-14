@@ -3,6 +3,7 @@ import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import { failedPhase } from "../ardud/analytics/McpCall.ts";
 const isOrchestratorMcpFailure = Schema.is(OrchestratorMcpFailure);
@@ -24,14 +25,56 @@ export const waitingOn = Effect.fnUntraced(function* <A, E, R>(
   return yield* effect;
 });
 
+type DetachedOperation = {
+  readonly onTimeout: "detach";
+  readonly requestKey?: string;
+  readonly taskId?: string;
+};
+
 // Timeout waits must not join an uninterruptible database transaction during cleanup.
 export const awaitInterruptibly = Effect.fn("McpDeadline.awaitInterruptibly")(function* <A, E, R>(
   effect: Effect.Effect<A, E, R>,
+  detached?: DetachedOperation,
 ) {
-  const pending = yield* Effect.forkDetach(effect);
-  return yield* Fiber.join(pending).pipe(
-    Effect.ensuring(Fiber.interrupt(pending).pipe(Effect.forkDetach, Effect.asVoid)),
+  if (detached === undefined) {
+    const pending = yield* Effect.forkDetach(effect);
+    return yield* Fiber.join(pending).pipe(
+      Effect.ensuring(Fiber.interrupt(pending).pipe(Effect.forkDetach, Effect.asVoid)),
+    );
+  }
+  let capped = false;
+  const logOutcome = Effect.fn("McpDeadline.detachedOutcome")(
+    (outcome: "committed" | "failed" | "capped") =>
+      Effect.logInfo("MCP detached operation finished", {
+        outcome,
+        requestKey: detached.requestKey ?? "unknown",
+        taskId: detached.taskId ?? "unknown",
+        ...(outcome === "capped"
+          ? { cancellationPending: true }
+          : capped
+            ? { afterCap: true }
+            : {}),
+      }),
   );
+  // A create owns its lifetime after the waiter leaves, including client disconnects.
+  const pending = yield* Effect.forkDetach(
+    effect.pipe(
+      Effect.onExit((exit) => logOutcome(exit._tag === "Success" ? "committed" : "failed")),
+    ),
+  );
+  yield* Fiber.await(pending).pipe(
+    Effect.timeoutOption("2 minutes"),
+    Effect.flatMap((exit) => {
+      if (Option.isSome(exit)) return Effect.void;
+      capped = true;
+      // A masked commit can defer cancellation; report the cap without joining it.
+      return logOutcome("capped").pipe(
+        Effect.andThen(Fiber.interrupt(pending).pipe(Effect.forkDetach, Effect.asVoid)),
+      );
+    }),
+    Effect.forkDetach,
+  );
+  return yield* Fiber.join(pending);
 });
 
 // awaitInterruptibly owns the tracing boundary for every bounded operation.
@@ -44,6 +87,7 @@ export const withDeadline = Effect.fnUntraced(function* <A, E, R>(
     readonly wait?: string;
     readonly requestKey?: string;
     readonly taskId?: string;
+    readonly onTimeout?: "detach";
   },
 ) {
   const startedAt = yield* Clock.monotonicTimeNanos;
@@ -54,7 +98,11 @@ export const withDeadline = Effect.fnUntraced(function* <A, E, R>(
   return yield* effect.pipe(
     Effect.onError(() => failedPhase(input.stage)),
     Effect.provideService(PendingWait, pending),
-    awaitInterruptibly,
+    (operation) =>
+      awaitInterruptibly(
+        operation,
+        input.onTimeout === "detach" ? { ...input, onTimeout: "detach" } : undefined,
+      ),
     Effect.timeoutOrElse({
       duration: "10 seconds",
       orElse: Effect.fn("McpDeadline.expired")(function* () {
@@ -81,13 +129,16 @@ export const withDeadline = Effect.fnUntraced(function* <A, E, R>(
             message:
               `${input.code === "caller_unresolved" ? "Caller resolution" : "delegate_task"} timed out during ${input.stage} for thread ${input.threadId ?? "unknown"}.` +
               ((input.code === "caller_unresolved" && input.stage === "caller") ||
-              input.stage === "parent_records"
+              input.stage === "parent_records" ||
+              (input.code === "delegation_timeout" &&
+                input.taskId === undefined &&
+                input.stage !== "dispatch")
                 ? " Nothing was saved; retry the same call."
                 : "") +
               (input.stage === "dispatch"
                 ? input.taskId === undefined
                   ? " Creation may still complete."
-                  : ` Task ${input.taskId} may still be created; check it with task_status.`
+                  : ` Task ${input.taskId} may still be created; use task_status to check whether it was saved.`
                 : input.taskId === undefined
                   ? ""
                   : ` Task ${input.taskId} was accepted; use task_status to recover it.`) +

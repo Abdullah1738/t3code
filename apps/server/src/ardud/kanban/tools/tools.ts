@@ -5,6 +5,7 @@
  */
 import {
   CARD_ASK_TOOL_DESCRIPTION,
+  IsoDateTime,
   KanbanBlockInput,
   KanbanNightlyReviewTime,
   KanbanNightlyReviewTimeZone,
@@ -123,7 +124,25 @@ const SubtasksInput = describe(
           "Who does it: the worker, the reviewer (ticked when the review passes), an evaluator, or a board script (the script ticks it from its output; the evaluator hears about it only if the script hands it back). Required for a new subtask; omitted on an existing open id, keeps its owner. Done and skipped subtasks keep their owner.",
         ),
       ),
-      gate: Schema.optional(Schema.Literals(["deploy", "money", "secret"])),
+      gate: Schema.optional(Schema.NullOr(Schema.Literals(["deploy", "money", "secret"]))),
+      clearGate: Schema.optional(
+        describe(
+          TrimmedNonEmptyString,
+          "Evaluators: remove a gate the board guessed on this existing subtask, with the reason it is wrong. Abdullah gets a notice. A gate set on purpose can't be cleared this way; ask him naming the subtask id.",
+        ),
+      ),
+      interrupting: Schema.optional(
+        describe(
+          Schema.Boolean,
+          "Evaluator only: set on the install or restart subtask that interrupts running work; omit to preserve, false clears.",
+        ),
+      ),
+      ownerOnly: Schema.optional(
+        describe(
+          Schema.Boolean,
+          "Evaluator only: set on steps the board keeps with the owner (Robob/OpenCode restarts from tool boards, sudo/macOS, rule or prompt changes). Omit to preserve; false clears.",
+        ),
+      ),
       script: Schema.optional(
         describe(
           TrimmedNonEmptyString,
@@ -205,7 +224,9 @@ const BoardActivity = tool(
   "A board's activity in a window (default the last 24 hours, at most 72): every ask answered in the window with asked/answered times and minutes to answer (p50/p90/max), open asks and asks open over 6 hours, review rounds and verdicts per card, hours in each stage with dwell median/p95/max and the longest spans, open cards in one stage over 24 hours, stalls and how long they lasted, run failures (stalled, retried, fresh thread, reviewer without verdict) by kind and model, threads started, restarts and evaluator wakes, cards left in working or in_review with no thread, and an estimate of pool slots held per hour per model next to each pool's slots. Card numbers only, no titles or text. Read from the cards' stored history; long lists other than the answered asks are cut and say how many more.",
   {
     boardId: BoardRef,
-    since: Schema.optional(describe(TrimmedNonEmptyString, "ISO start; default 24 hours before until.")),
+    since: Schema.optional(
+      describe(TrimmedNonEmptyString, "ISO start; default 24 hours before until."),
+    ),
     until: Schema.optional(describe(TrimmedNonEmptyString, "ISO end; default now.")),
   },
   { activity: Record },
@@ -386,6 +407,7 @@ const AskFieldsInput = {
             label: Schema.String,
             detail: Schema.optional(Schema.String),
             recommended: Schema.optional(Schema.Boolean),
+            approves: Schema.optional(Schema.Array(Schema.String)),
             consequence: Schema.optional(Schema.String),
             block: Schema.optional(Schema.Finite),
           }),
@@ -477,14 +499,14 @@ const CardAsk = tool(
     blocking: Schema.optional(Schema.Boolean),
     ...AskFieldsInput,
   },
-  { card: Record },
+  { card: Record, warning: Schema.optional(Schema.String), note: Schema.optional(Schema.String) },
   { readonly: false },
 );
 
 const CardAskChange = tool(
   "card_ask_change",
   "Change an open ask",
-  'Change an open ask (q1, q2... on the card). Pass the fields to replace (question, title, context, options, draft, action, changes, respond...) with revisionNote saying what changed: he sees it as updated and it is his turn again. blocks replaces the evidence shown with it ([] removes it). Do this when he replied that the ask was unclear. Or pass action: "block" makes an async ask blocking, "drop" removes one no longer needed, "return" (evaluators) gives an ask that is with you back to him. A work thread changes only its own card\'s asks; while no thread is attached, its own work thread may drop asks in todo and block or drop asks in needs_owner.',
+  'Change an open ask (q1, q2... on the card). Pass the fields to replace (question, title, context, options, draft, action, changes, respond...) with revisionNote saying what changed: he sees it as updated and it is his turn again. blocks replaces the evidence shown with it ([] removes it). Do this when he replied that the ask was unclear. Or pass action: "block" makes an async ask blocking, "drop" removes one no longer needed, "return" (evaluators) gives an ask that is with you back to him. A work thread changes only its own card\'s asks; while no thread is attached, its own work thread may block or drop asks in todo (blocking moves the card to Needs Owner) and needs_owner.',
   {
     boardId: BoardRef,
     card: Schema.optional(CardRef),
@@ -508,7 +530,7 @@ const CardAskChange = tool(
       ),
     ),
   },
-  { card: Record },
+  { card: Record, warning: Schema.optional(Schema.String) },
   { readonly: false },
 );
 
@@ -557,6 +579,26 @@ const CardFlag = tool(
     reason: Schema.optional(Schema.String),
   },
   { card: Record },
+  { readonly: false },
+);
+
+const BoardStandingApproval = tool(
+  "board_standing_approval",
+  "Standing deploy approval",
+  "Evaluators only: grant a board standing deploy approval from a closed owner-approved ask naming every requested board slug. The ask may be on any board (use its card id). Quote the owner's words and source thread/time. Replaces active records, retaining history. Any evaluator can revoke with a reason. Returns open release asks to drop with card_ask_change; never answers them. Money, secret and ownerOnly steps still need on-card approval.",
+  {
+    boardId: BoardRef,
+    action: Schema.Literals(["grant", "revoke"]),
+    boards: Schema.optional(Schema.Array(TrimmedNonEmptyString)),
+    quote: Schema.optional(TrimmedNonEmptyString),
+    sourceThreadId: Schema.optional(TrimmedNonEmptyString),
+    saidAt: Schema.optional(IsoDateTime),
+    card: Schema.optional(CardRef),
+    ask: Schema.optional(TrimmedNonEmptyString),
+    id: Schema.optional(TrimmedNonEmptyString),
+    reason: Schema.optional(TrimmedNonEmptyString),
+  },
+  { boards: Records, openReleaseAsks: Records },
   { readonly: false },
 );
 
@@ -671,7 +713,10 @@ const DiscussionRead = tool(
     afterSeq: Schema.optional(NonNegativeInt),
     beforeSeq: Schema.optional(NonNegativeInt),
     limit: Schema.optional(
-      describe(PositiveInt, "At most this many messages (max 200), within about 50,000 characters."),
+      describe(
+        PositiveInt,
+        "At most this many messages (max 200), within about 50,000 characters.",
+      ),
     ),
     seq: Schema.optional(describe(PositiveInt, "Read only this message, in full.")),
   },
@@ -711,6 +756,17 @@ const WikiRead = tool(
   { readonly: true },
 );
 
+const GatedResult = {
+  gated: Schema.Array(
+    Schema.Struct({
+      id: Schema.String,
+      gate: Schema.Literals(["deploy", "money", "secret"]),
+      source: Schema.Literals(["guessed"]),
+    }),
+  ),
+  message: Schema.optional(Schema.String),
+};
+
 const CardCreate = tool(
   "card_create",
   "Create a card",
@@ -745,7 +801,7 @@ const CardCreate = tool(
     ),
     subtasks: Schema.optional(SubtasksInput),
   },
-  { card: Record, brief: Schema.optional(Schema.String) },
+  { card: Record, brief: Schema.optional(Schema.String), ...GatedResult },
   { readonly: false },
 );
 
@@ -795,14 +851,14 @@ const CardEdit = tool(
     subtasks: Schema.optional(SubtasksInput),
     comment: Schema.optional(Schema.String),
   },
-  { card: Record },
+  { card: Record, ...GatedResult },
   { readonly: false },
 );
 
 const SubtaskDone = tool(
   "subtask_done",
   "Mark a subtask",
-  "Mark a card subtask done (with a short note on what was done) or skipped (with why). Workers mark the worker's subtasks of their own card, in the step the card is on; the review's are ticked when it passes. Evaluators mark any, and can set one open again. Doing a subtask follows the board's other rules: a message that needs the owner's approval still goes to him first, and the subtask stays open until it's sent.",
+  "Mark a card subtask done (with a short note on what was done) or skipped (with why). Workers mark the worker's subtasks of their own card, in the step the card is on; the review's are ticked when it passes. Evaluators mark any, and can set one open again. Doing a subtask follows the board's other rules: a message that needs the owner's approval still goes to him first, and the subtask stays open until it's sent. Unless standing deploy approval covers it, a gated subtask needs the owner's answer on an ask naming its id; a refusal says which ask is missing. With a standing approval live, keep deploy steps worded honestly; don't reword them to dodge the gate. Evaluators may skip a deploy-, money- or secret-gated evaluator or script step without the owner's answer when the note gives the reason (10–300 characters); Abdullah gets a notice, and marking it done still needs his OK.",
   {
     boardId: BoardRef,
     card: Schema.optional(CardRef),
@@ -860,6 +916,21 @@ const BoardInstructionsSet = tool(
     text: Schema.String,
     card: CardRef,
     ask: TrimmedNonEmptyString,
+  },
+  { board: Record, applied: Schema.Boolean, reason: Schema.optional(Schema.String) },
+  { readonly: false, destructive: true },
+);
+
+const BoardSettingsSet = tool(
+  "board_settings_set",
+  "Apply approved board settings",
+  'Evaluators: set guessedGates to the value Abdullah approved in a closed change ask with an approved verdict. Its change/changes entry must label "<Board> guessed gates" (board slug or name; guessedGates also accepted), with before equal to the current setting and after equal to value: sort gates and join with ", " ("deploy, money, secret", "money, secret", "" for none; "(unset)" for an absent current setting).',
+  {
+    boardId: Schema.optional(TrimmedNonEmptyString),
+    card: CardRef,
+    ask: TrimmedNonEmptyString,
+    setting: Schema.Literals(["guessedGates"]),
+    value: Schema.Array(Schema.Literals(["deploy", "money", "secret"])),
   },
   { board: Record, applied: Schema.Boolean, reason: Schema.optional(Schema.String) },
   { readonly: false, destructive: true },
@@ -958,12 +1029,17 @@ const BoardOpen = tool(
 const ReportBug = tool(
   "report_bug",
   "Report a bug",
-  "Report a tooling bug from any thread. Pass cardHint (e.g. #722) when you already know its card (any stage until it is settled). A hint or strong title match appends a sighting without starting an evaluator; weak matches start a request evaluator, or queue it when the board's spawn limit is full. Identical evidence from this thread on the same card is deduped for 30 minutes. Search matches return up to three candidates, best first.",
+  "Report a tooling bug from any thread. Pass cardHint (e.g. #722, a card on boardId's board) when you already know its card there (any stage until it is settled). A hint or strong title match appends a sighting without starting an evaluator; weak matches start a request evaluator, or queue it when the board's spawn limit is full. Identical evidence from this thread on the same card is deduped for 30 minutes. Search matches return up to three candidates, best first.",
   {
     boardId: describe(TrimmedNonEmptyString, "Destination board id or slug."),
     title: describe(TrimmedNonEmptyString, "Short bug title to search for."),
     evidence: describe(TrimmedNonEmptyString, "What broke, with errors, run ids or log paths."),
-    cardHint: Schema.optional(describe(TrimmedNonEmptyString, "Known card number, e.g. #722.")),
+    cardHint: Schema.optional(
+      describe(
+        TrimmedNonEmptyString,
+        "A card on the destination board: its number (#722), boardslug#722, or its card id. Never your own card's number from another board.",
+      ),
+    ),
   },
   {
     appendedTo: Schema.optional(TrimmedNonEmptyString),
@@ -1059,6 +1135,7 @@ export const KanbanToolkit = Toolkit.make(
   CardAskAnswer,
   CardFlag,
   CardWait,
+  BoardStandingApproval,
   CardReviewResult,
   DiscussionPost,
   DiscussionRead,
@@ -1071,6 +1148,7 @@ export const KanbanToolkit = Toolkit.make(
   CardThread,
   PoolSet,
   BoardInstructionsSet,
+  BoardSettingsSet,
   PoolRemove,
   GoalSet,
   GroupSet,

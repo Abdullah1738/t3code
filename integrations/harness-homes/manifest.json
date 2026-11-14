@@ -28,7 +28,6 @@
   },
   "shellPathPrefix": [
     "/Users/ardud/.config/opencode/skills/remote-compute/scripts/blockers",
-    "/Users/ardud/.local/share/harness-hooks/coord-blockers",
     "/Users/ardud/.local/share/quint-guard/bin"
   ],
   "shellPath": ["/Users/ardud/.bun/bin", "/Users/ardud/.nvm/versions/node/v26.2.0/bin", "/Users/ardud/.cargo/bin", "/opt/homebrew/bin", "/opt/homebrew/sbin", "/Users/ardud/.local/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"],
@@ -90,6 +89,9 @@
       }
     ],
     "live-database": [
+      "../harness-hooks/bin/live-db-snapshot",
+      "../harness-hooks/src/live_db_snapshot.py",
+      "../harness-hooks/src/snapshot_guard.py",
       "../harness-hooks/src/statev2_guard.py",
       "../harness-hooks/src/engine.py",
       {
@@ -127,10 +129,6 @@
         "source": "../opencode-plugins/plugin/betterstack-scope.ts",
         "installed": "~/.config/opencode/plugin/betterstack-scope.ts"
       }
-    ],
-    "coord-haiku": [
-      "../harness-hooks/src/engine.py",
-      "../harness-hooks/src/coord_shim.py"
     ],
     "desktop-lease": [
       "../harness-hooks/src/desktop_lease.py"

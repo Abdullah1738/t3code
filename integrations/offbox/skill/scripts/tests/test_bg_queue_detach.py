@@ -47,7 +47,8 @@ def configure_fixture(root, backend):
     runs.new_checkout_hint = lambda *args: None
     runs.remote_script = lambda *args, **kwargs: 'proof'
     # A detached worker must exercise the shared startup loop without consulting the Mac's home configuration.
-    home.may_fail_over = home.on_standby = home.active = lambda: False
+    home.may_fail_over = lambda *args: False
+    home.on_standby = home.active = lambda: False
     if os.environ.get('OFFBOX_TEST_OLD_REGISTRATION'):
         register = runs.Runner.register_pending
         def aged(self):
@@ -224,6 +225,34 @@ class BackgroundQueueTests(Isolated):
             self.assertEqual(caught.exception.code, common.EXIT_WAIT_TIMEOUT)
         self.until(lambda: (root / 'ttl').exists())
         self.assertEqual(len((root / 'starts').read_text().splitlines()), 1)
+
+    def test_removed_cwd_before_adoption_settles_source_gone(self):
+        root = Path(self.tmp.name)
+        source_cwd = root / 'work'
+        source_cwd.mkdir()
+        with common.file_lock('fixture-handoff'):
+            proc = subprocess.Popen([sys.executable, '-I', str(Path(__file__).resolve()), '--fixture',
+                                     self.tmp.name, '1', 'boat'], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    start_new_session=True, cwd=source_cwd,
+                                    env=dict(os.environ, OFFBOX_TEST_HANDOFF='1'))
+            self.addCleanup(self.stop, proc)
+            self.until(lambda: (root / 'handoff').exists(), proc)
+            child = int((root / 'handoff').read_text())
+            self.addCleanup(self.stop_child, child, proc.pid)
+            source_cwd.rmdir()
+        self.until(lambda: (root / 'returned').exists(), proc)
+        row = self.con.execute('SELECT * FROM runs ORDER BY start_at DESC LIMIT 1').fetchone()
+        self.until(lambda: self.con.execute('SELECT status FROM runs WHERE run_id=?',
+                                            (row['run_id'],)).fetchone()[0] == 'source_gone', proc)
+        row = self.con.execute('SELECT * FROM runs WHERE run_id=?', (row['run_id'],)).fetchone()
+        self.assertEqual(row['exit_code'], 2)
+        self.assertIn(str(source_cwd), row['error'])
+        self.assertIsNone(row['box_id'])
+        self.assertGreater(Path(row['log_path']).stat().st_size, 0)
+        self.assertFalse((root / 'starts').exists())
+        self.assertFalse((root / 'waiting').exists())
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(misc.wait(row['run_id'], 1), 2)
 
     def test_foreground_term_in_pool_wait_still_settles_killed(self):
         with common.file_lock('fixture-slot'):
@@ -597,7 +626,7 @@ class BackgroundFailoverTests(Isolated):
                     row = self.con.execute('SELECT status FROM runs WHERE run_id=?', (rid,)).fetchone()
                     self.assertEqual(row[0], 'starting')
                 probe.assert_called_once_with('boat', home.PROBE_TIMEOUT_S)
-                record.assert_called_once_with('home unavailable', rid)
+                record.assert_called_once_with('home unavailable', rid, base=None, base_kept=False)
 
     def test_exact_and_suffix_lookup_both_filter_forwarded_rows(self):
         for status in ('starting', 'forwarded', None):

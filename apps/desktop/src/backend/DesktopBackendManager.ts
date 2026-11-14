@@ -47,7 +47,7 @@ const DEFAULT_BACKEND_READINESS_REQUEST_TIMEOUT = Duration.seconds(1);
 const DEFAULT_BACKEND_TERMINATE_GRACE = Duration.seconds(10);
 const DEFAULT_BACKEND_OUTPUT_DRAIN_TIMEOUT = Duration.seconds(5);
 const BACKEND_READINESS_PATH = "/.well-known/t3/environment";
-const { logWarning: logBackendProcessWarning } =
+const { logWarning: logBackendProcessWarning, logInfo: logBackendProcessInfo } =
   DesktopObservability.makeComponentLogger("desktop-backend-process");
 
 type BackendProcessLayerServices = ChildProcessSpawner.ChildProcessSpawner | HttpClient.HttpClient;
@@ -573,6 +573,18 @@ export const runBackendProcess = Effect.fn("runBackendProcess")(function* (
       readinessTimedOut && LogLevel.Order(minimumLogLevel, "Error") < 0 ? "Error" : minimumLogLevel;
     return yield* probe.pipe(
       Effect.provideService(References.MinimumLogLevel, probeLogLevel),
+      Effect.tap(() =>
+        readinessTimedOut
+          ? Clock.monotonicTimeNanos.pipe(
+              Effect.flatMap((now) =>
+                logBackendProcessInfo("backend readiness recovered after timeout", {
+                  pid: Number(handle.pid),
+                  elapsedMs: Number(now - startedAt) / 1_000_000,
+                }),
+              ),
+            )
+          : Effect.void,
+      ),
       Effect.flatMap(() => options.onReady?.() ?? Effect.void),
       Effect.as(true),
       Effect.catchTags({

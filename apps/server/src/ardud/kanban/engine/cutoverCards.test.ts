@@ -25,6 +25,7 @@ import * as ServerSettings from "../../../serverSettings.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
 import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
 import { kanbanDDL } from "../../persistence/kanbanSchema.ts";
+import { ensureKanbanCacheVersions } from "../../persistence/kanbanCacheVersions.ts";
 import * as KanbanStore from "../store/KanbanStore.ts";
 import { KanbanService, layer as kanbanLayer } from "./KanbanService.ts";
 import { planCutoverCardRestore } from "./cutoverCards.ts";
@@ -58,6 +59,33 @@ const board: KanbanBoard = {
   defaultCardModel: work,
   reviewChains: [{ name: "two-step", steps: [work, review] }],
   defaultReviewChain: "two-step",
+  standingApprovals: [
+    {
+      id: "standing-deploy",
+      gate: "deploy",
+      minIntervalHours: 4,
+      quote: "This board may release every four hours",
+      sourceThreadId: "approval-thread",
+      saidAt: at,
+      approvedAsk: { cardId: "approval-card", askId: "q1" },
+      recordedAt: at,
+      recordedBy: "evaluator",
+      revokedAt: null,
+      revokedBy: null,
+      revokeReason: null,
+    },
+  ],
+  releaseLedger: [
+    {
+      boardId: KanbanBoardId.make("cutover"),
+      cardId: KanbanCardId.make("previous-release"),
+      cardNumber: 1,
+      subtaskId: "s1",
+      at,
+      critical: null,
+      approvalId: "standing-deploy",
+    },
+  ],
   instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },
   setup: null,
   pause: { reason: "Harness cutover", keep: [], at, by: "owner" },
@@ -293,7 +321,7 @@ const threadView = (threadId: ThreadId): KanbanThreadView => ({
   updatedAt: at,
   quietSince: at,
   runStartedAt: null,
-            lastActivityAt: null,
+  lastActivityAt: null,
   backgroundWork: 0,
   prWatches: 0,
   prs: [],
@@ -304,6 +332,7 @@ const separateBoardsLayer = Layer.effect(
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     yield* Effect.forEach(kanbanDDL, (ddl) => sql.unsafe(ddl), { discard: true });
+    yield* ensureKanbanCacheVersions(sql);
     return BoardsDatabase.BoardsDatabase.of({ sql, ready: Effect.void, path: ":memory:boards" });
   }),
 ).pipe(Layer.provide(Layer.fresh(NodeSqliteClient.layer({ filename: ":memory:" }))));
@@ -332,20 +361,18 @@ const testLayer = (
                   )
                 : real.putThreadLink(value),
             addCardEvent: (event) =>
-              real
-                .addCardEvent(event)
-                .pipe(
-                  Effect.flatMap((saved) =>
-                    options.failEventWrite
-                      ? Effect.fail(
-                          new KanbanStore.KanbanStoreError({
-                            operation: "event fixture failure",
-                            cause: new Error("event write failed"),
-                          }),
-                        )
-                      : Effect.succeed(saved),
-                  ),
+              real.addCardEvent(event).pipe(
+                Effect.flatMap((saved) =>
+                  options.failEventWrite
+                    ? Effect.fail(
+                        new KanbanStore.KanbanStoreError({
+                          operation: "event fixture failure",
+                          cause: new Error("event write failed"),
+                        }),
+                      )
+                    : Effect.succeed(saved),
                 ),
+              ),
           })),
         ).pipe(Layer.provide(KanbanStore.layer))
       : KanbanStore.layer;
@@ -578,7 +605,6 @@ it("refuses worker cutover restoration while an evaluator step precedes work", (
   );
   assert.isFalse(result.ok);
 });
-
 
 it("cutover reconciliation re-stamps an existing wait with its restored move", () => {
   const wait = {

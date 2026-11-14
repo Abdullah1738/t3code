@@ -11,8 +11,8 @@ export type LogEntry = {
 };
 const token = /^[a-zA-Z][a-zA-Z0-9_.-]{0,79}$/;
 const idKeys = new Set(["watcher", "run", "thread", "chat", "key", "operation", "reminder", "update", "item", "helper"]);
-const numeric = new Set(["exitCode", "attempt", "count", "bytes", "queuedMs", "failedSources", "totalSources"]);
-const boolean = new Set(["deduped", "accepted", "timedOut"]);
+const numeric = new Set(["exitCode", "attempt", "count", "threshold", "failures", "bytes", "queuedMs", "failedSources", "totalSources", "events", "waitMs", "spanMs", "graceMs", "relays"]);
+const boolean = new Set(["deduped", "accepted", "timedOut", "notified", "batched", "urgent", "closing", "archived", "frozenContext", "batchOpen", "grace"]);
 const errnoCodes = new Set(Object.keys(constants.errno));
 const signals = new Set(Object.keys(constants.signals));
 const values: Record<string, readonly string[]> = {
@@ -23,6 +23,9 @@ const values: Record<string, readonly string[]> = {
   state: ["pending", "sending", "sent", "uncertain", "cancelled", "failed", "scheduled", "queued", "done", "expired", "paused", "active"],
   stderrClass: ["usage_error", "missing_file", "permission", "timeout", "python_traceback", "auth", "connect", "json", "unknown"],
   triggerKind: ["file", "wal"],
+  step: ["native", "status"],
+  route: ["person", "owner", "group", "creator", "other"],
+  via: ["wake", "thread", "imessage-send", "telegram", "none"],
 };
 let testRoot: string | undefined;
 export const logDirectory = () => {
@@ -54,6 +57,12 @@ function fields(entry: LogEntry, at: Date) {
     else if (key === "stderrHash" && typeof value === "string" && /^[a-f0-9]{16}$/.test(value)) props[key] = value;
     else if (key === "errnoCode" && typeof value === "string" && (errnoCodes.has(value) || value === "UNKNOWN")) props[key] = value;
     else if (key === "signal" && typeof value === "string" && signals.has(value)) props[key] = value;
+    else if ((entry.name === "watch.grace_ended" || entry.name === "watch.removed") && key === "reason" && typeof value === "string"
+      && ["expired", "resume", "now", "paused", "no_inflight_check"].includes(value)) props[key] = value;
+    else if (entry.name === "wake.creator_fallback" && key === "reason" && typeof value === "string"
+      && /^(?:timeout|invalid|archived|exit:\d{1,3})$/.test(value)) props[key] = value;
+    else if (entry.name === "wake.creator_fallback" && key === "durationMs" && typeof value === "number"
+      && Number.isFinite(value) && value >= 0) props[key] = value;
     else if (numeric.has(key) && typeof value === "number" && Number.isFinite(value)) props[key] = value;
     else if (boolean.has(key) && typeof value === "boolean") props[key] = value;
     else if (typeof value === "string" && values[key]?.includes(value)) props[key] = value;

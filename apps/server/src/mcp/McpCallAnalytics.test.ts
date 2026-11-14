@@ -20,6 +20,7 @@ import {
   DeviceBootError,
   DeviceHostId,
   DeviceId,
+  KanbanError,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
@@ -28,6 +29,9 @@ import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Scope from "effect/Scope";
 import * as TestClock from "effect/testing/TestClock";
+import * as Queue from "effect/Queue";
+import * as Tracer from "effect/Tracer";
+import { HttpServerRequest, HttpServerResponse } from "effect/http";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
@@ -37,6 +41,7 @@ import * as McpCallLedger from "../ardud/analytics/McpCallLedger.ts";
 import * as McpCall from "../ardud/analytics/McpCall.ts";
 import * as SavedWrite from "../ardud/kanban/engine/savedWrite.ts";
 import * as McpHttpServer from "./McpHttpServer.ts";
+import * as McpSessionRegistry from "./McpSessionRegistry.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpToolAccess from "./McpToolAccess.ts";
 import * as Testkit from "./McpToolAccess.testkit.ts";
@@ -83,6 +88,7 @@ const client = McpSchema.McpServerClient.of({
 });
 const ProbeFailure = Schema.Union([
   OrchestratorMcpFailure,
+  KanbanError,
   PreviewAutomationError,
   McpCapabilityUnavailableError,
   PreviewControlRequiredError,
@@ -109,7 +115,123 @@ const probe = (name: string) =>
       ],
     }),
   );
+const decodeAnalyticsEvent = Schema.decodeEffect(AnalyticsEvent);
 const args = { clientRequestId: "private retry id", boardId: "board-robob", card: "#1301" };
+const isAnalyticsEvent = Schema.is(AnalyticsEvent);
+
+it.effect.each(["provider", "oauth"] as const)(
+  "%s auth and dispatch are separate from handler duration, including caller_unresolved",
+  (credential) =>
+    Effect.gen(function* () {
+      const rows = yield* Queue.unbounded<AnalyticsEvent>();
+      const spans: Array<Tracer.NativeSpan> = [];
+      const tracer = Tracer.make({
+        span: (options) => {
+          const span = new Tracer.NativeSpan(options);
+          if (span.name === "tools/call") spans.push(span);
+          return span;
+        },
+      });
+      const scope = yield* McpInvocationContext.McpInvocationContext.pipe(
+        Effect.provide(invocation),
+      );
+      const entered = yield* Deferred.make<void>();
+      let unresolved = false;
+      const toolkit = probe("timing_probe");
+      const handlers = McpToolAccess.toLayer(toolkit, {
+        timing_probe: McpToolAccess.actsAsCaller(() =>
+          TestClock.adjust("40 millis").pipe(Effect.as({ ok: true })),
+        ),
+      });
+      const registration = McpHttpServer.toolkitRegistration(toolkit, handlers).pipe(
+        Layer.provideMerge(McpServer.McpServer.layer),
+        Layer.provide(
+          Layer.mock(ThreadManagement.ThreadManagementService)({
+            getCallerRow: (threadId) =>
+              unresolved
+                ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never))
+                : Effect.succeed(Testkit.liveThreadShell(threadId)),
+          }),
+        ),
+        Layer.provide(
+          Layer.mock(Analytics.Analytics)({
+            record: (event) =>
+              event.kind === "mcp.call"
+                ? Queue.offer(rows, event).pipe(Effect.asVoid)
+                : Effect.void,
+          }),
+        ),
+      );
+      const authenticate = yield* McpHttpServer.makeMcpAuthMiddleware.pipe(
+        Effect.provide(
+          Layer.mock(McpSessionRegistry.McpSessionRegistry)({
+            resolve: () =>
+              TestClock.adjust("7 millis").pipe(
+                Effect.as(
+                  credential === "provider" ? { ...scope, thread: scope.thread! } : undefined,
+                ),
+              ),
+          }),
+        ),
+        Effect.provideService(McpHttpServer.McpClientAuthenticator, {
+          authenticate: () => TestClock.adjust("13 millis").pipe(Effect.as(scope)),
+        }),
+      );
+      yield* Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        for (const failing of [false, true]) {
+          unresolved = failing;
+          const httpEffect = Effect.gen(function* () {
+            yield* TestClock.adjust("30 millis");
+            yield* server
+              .callTool({ name: "timing_probe", arguments: args })
+              .pipe(
+                Effect.provideService(McpSchema.McpServerClient, client),
+                Effect.withSpan("tools/call"),
+                Effect.orDie,
+              );
+            return HttpServerResponse.empty();
+          });
+          const pending = yield* authenticate(httpEffect).pipe(
+            Effect.provideService(
+              HttpServerRequest.HttpServerRequest,
+              HttpServerRequest.fromWeb(
+                new Request("http://localhost/mcp", {
+                  headers: { authorization: "Bearer timing-token" },
+                }),
+              ),
+            ),
+            Effect.forkChild,
+          );
+          if (unresolved) {
+            yield* Deferred.await(entered);
+            yield* TestClock.adjust("10 seconds");
+          }
+          yield* Fiber.join(pending);
+          const authMs = credential === "provider" ? 7 : 20;
+          const durationMs = unresolved ? 10_000 : 40;
+          const row = yield* Queue.take(rows);
+          expect(row).toMatchObject({
+            authMs,
+            dispatchMs: 30,
+            preHandlerMs: authMs + 30,
+            durationMs,
+            totalMs: authMs + 30 + durationMs,
+            outcome: unresolved ? "timeout" : "ok",
+            ...(unresolved ? { errorTag: "caller_unresolved", callerResolved: false } : {}),
+          });
+          expect(isAnalyticsEvent(row)).toBe(true);
+          expect(row.preHandlerMs).toBeGreaterThanOrEqual(row.authMs!);
+          expect(Object.fromEntries(spans.at(-1)!.attributes)).toMatchObject({
+            "mcp.auth_ms": authMs,
+            "mcp.dispatch_ms": 30,
+            "mcp.pre_handler_ms": authMs + 30,
+            "mcp.total_ms": authMs + 30 + durationMs,
+          });
+        }
+      }).pipe(Effect.provide(registration), Effect.withTracer(tracer));
+    }),
+);
 
 it.effect.each([
   { name: "shutdown before receipt", committed: false, shutdown: true, expected: "unknown" },
@@ -136,6 +258,11 @@ it.effect.each([
                 ? Deferred.succeed(checkingReceipt, undefined).pipe(Effect.andThen(Effect.never))
                 : Effect.succeed(committed),
             );
+            yield* McpCall.resolvedContext({
+              boardId: "board-robob",
+              id: "card-1301",
+              number: 1301,
+            });
             yield* Deferred.succeed(entered, undefined);
             return yield* Effect.never;
           }),
@@ -187,6 +314,14 @@ it.effect.each([
         callerThreadId: "caller-ledger",
         committed: expected,
         ...callIdentifiers(args, "caller-ledger"),
+        cardId: "card-1301",
+        props: {
+          code: "unknown",
+          cause: shutdown ? "shutdown" : "unknown",
+          boardId: "board-robob",
+          cardNumber: 1301,
+          saved: "unknown",
+        },
       });
       expect(rows[0]!.bootId).toBeTruthy();
       expect(rows[0]!.startedAt).toBe(rows[0]!.ts);
@@ -196,10 +331,20 @@ it.effect.each([
 );
 const failure = (code: OrchestratorMcpFailure["code"], message = "private error text") =>
   Effect.fail(new OrchestratorMcpFailure({ code, message }));
+const boardBusy = new KanbanError({
+  code: "conflict",
+  detail: "Board busy: not written (held 2m by private-operation). Safe to retry once.",
+  saved: false,
+});
 
 const outcomes = [
   ["interruption", Effect.interrupt, { outcome: "interrupted" }],
   ["ok", Effect.succeed({ privateResult: "secret body" }), { outcome: "ok", saved: "unknown" }],
+  [
+    "successful-error-like-message",
+    Effect.succeed({ message: "Board busy: not written" }),
+    { outcome: "ok", saved: "unknown" },
+  ],
   [
     "error",
     failure("orchestration_error"),
@@ -216,6 +361,21 @@ const outcomes = [
     failure("invalid_request", "Board busy: not written (held 2m). Safe to retry once."),
     { outcome: "refused", errorTag: "board_busy", saved: false },
   ],
+  ...(
+    [
+      ["encoded", failure("invalid_request", boardBusy.message)],
+      ["typed", Effect.fail(boardBusy)],
+      ["defect", Effect.die(boardBusy)],
+      ["legacy", failure("invalid_request", "Not saved (board busy). Safe to retry once.")],
+    ] as const
+  ).map(
+    ([name, handle]) =>
+      [
+        `board-busy-${name}`,
+        handle,
+        { outcome: "refused", errorTag: "board_busy", saved: false },
+      ] as const,
+  ),
   [
     "partial",
     Effect.succeed({ partial: true, taskId: "task" }),
@@ -376,14 +536,19 @@ const outcomeCases = [
     expected: { outcome: "error", errorPhase: "handler" },
     input: { ...args, timeoutMs: value },
   })),
-  ...["timeoutMs must be valid", "The text says timed out", "timeout in a parameter value"].map(
-    (message) => ({
-      name: `diagnostic-${message}`,
-      handle: failure("invalid_request", message),
-      expected: { outcome: "error", errorTag: "invalid_request" },
-      input: args,
-    }),
-  ),
+  ...[
+    "timeoutMs must be valid",
+    "The text says timed out",
+    "timeout in a parameter value",
+    "User said Board busy: not written",
+    "Board busy: may have applied",
+    "Missions board conflict: Board changed during this operation",
+  ].map((message) => ({
+    name: `diagnostic-${message}`,
+    handle: failure("invalid_request", message),
+    expected: { outcome: "error", errorTag: "invalid_request" },
+    input: args,
+  })),
   ...phases.map(({ stage, phase }) => ({
     name: `phase-${stage}`,
     handle: McpDeadline.withDeadline(failure("model_unavailable"), {
@@ -427,9 +592,10 @@ const outcomeCases = [
 ];
 it.effect.each(outcomeCases)(
   "records one MCP ledger row for $name without payloads",
-  ({ handle, expected, input }) =>
+  ({ name, handle, expected, input }) =>
     Effect.gen(function* () {
       const recorded = yield* Deferred.make<AnalyticsEvent>();
+      const compatibility = yield* Deferred.make<AnalyticsEvent>();
       const toolkit = probe("ledger_probe");
       const handlers = McpToolAccess.toLayer(toolkit, {
         ledger_probe: McpToolAccess.reads(
@@ -444,7 +610,9 @@ it.effect.each(outcomeCases)(
             record: (event) =>
               event.kind === "mcp.call"
                 ? Deferred.succeed(recorded, event).pipe(Effect.asVoid)
-                : Effect.void,
+                : event.kind === "server.mcp" || event.kind === "server.mcp.error"
+                  ? Deferred.succeed(compatibility, event).pipe(Effect.asVoid)
+                  : Effect.void,
           }),
         ),
         Layer.provideMerge(invocation),
@@ -463,6 +631,17 @@ it.effect.each(outcomeCases)(
           cardId: "#1301",
           ...expected,
         });
+        const generic = yield* Deferred.await(compatibility);
+        expect(generic.props?.code).toBe(row.props?.code);
+        if (name.startsWith("invalid-timeout-"))
+          expect(generic.props?.code).toBe("invalid_request");
+        if (name.startsWith("board-busy-")) expect(generic.props?.code).toBe("board_busy");
+        expect(generic.props?.saved).toBe(row.saved);
+        if ("errorTag" in expected && expected.errorTag === "orchestration_error")
+          expect(generic.props?.code).toBe("orchestration_error");
+        expect(JSON.stringify(generic)).not.toMatch(
+          /private|secret body|namespace-ledger|session-ledger/,
+        );
         expect(row.durationMs).toBeGreaterThanOrEqual(0);
         expect(row.clientRequestId).toMatch(/^[a-f0-9]{64}$/);
         expect(JSON.stringify(row)).not.toMatch(
@@ -584,6 +763,7 @@ it.effect("records resolved caller identity and a saved write whose reply fails"
         errorPhase: "result",
         callerResolved: true,
         readerLane: "foreground",
+        props: { phase: "caller" },
       });
     }).pipe(Effect.provide(registration));
   }),
@@ -885,6 +1065,104 @@ it.effect.each(shutdownCommitRaces)(
           ...callIdentifiers(args, "caller-ledger"),
         });
         expect(rows[0]!.taskId).toBeUndefined();
+      }).pipe(Effect.provide(registration));
+    }),
+);
+
+it.effect("card_next records interrupted calls with caller and duration", () =>
+  Effect.gen(function* () {
+    const rows: AnalyticsEvent[] = [];
+    const entered = yield* Deferred.make<void>();
+    const toolkit = probe("card_next");
+    const handlers = McpToolAccess.toLayer(toolkit, {
+      card_next: McpToolAccess.reads(() =>
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+      ),
+    });
+    const registration = McpHttpServer.toolkitRegistration(toolkit, handlers).pipe(
+      Layer.provideMerge(McpServer.McpServer.layer),
+      Layer.provide(Testkit.liveThreadsLayer),
+      Layer.provide(
+        Layer.mock(Analytics.Analytics)({
+          record: (event) =>
+            Effect.sync(() => {
+              if (event.kind === "mcp.call") rows.push(event);
+            }),
+          flush: Effect.void,
+        }),
+      ),
+    );
+    yield* Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      const request = yield* server
+        .callTool({ name: "card_next", arguments: args })
+        .pipe(
+          Effect.provideService(McpSchema.McpServerClient, client),
+          Effect.provide(invocation),
+          Effect.forkChild,
+        );
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust("3 seconds");
+      yield* Fiber.interrupt(request);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        kind: "mcp.call",
+        tool: "card_next",
+        callerThreadId: "caller-ledger",
+        outcome: "interrupted",
+      });
+      expect(rows[0]!.durationMs).toBeGreaterThanOrEqual(3000);
+    }).pipe(Effect.provide(registration));
+  }),
+);
+
+it.effect.each(["lookup.target", "waiting"] as const)(
+  "records thread wait stage %s beside its reader lane",
+  (waitStage) =>
+    Effect.gen(function* () {
+      const recorded = yield* Deferred.make<AnalyticsEvent>();
+      const toolkit = probe("t3_thread_wait");
+      const handlers = McpToolAccess.toLayer(toolkit, {
+        t3_thread_wait: McpToolAccess.reads(() =>
+          Effect.gen(function* () {
+            const context = yield* Effect.serviceOption(McpCall.McpCall);
+            if (context._tag === "None") return yield* Effect.die("Missing MCP analytics context");
+            const state = context.value;
+            state.waitStage = waitStage;
+            state.waitLookupMs = 600;
+            state.readerLane = waitStage === "waiting" ? "background" : "foreground";
+            if (waitStage === "lookup.target") return yield* failure("lookup_timeout");
+            return { status: "running", timedOut: true };
+          }),
+        ),
+      });
+      const registration = McpHttpServer.toolkitRegistration(toolkit, handlers).pipe(
+        Layer.provideMerge(McpServer.McpServer.layer),
+        Layer.provide(Testkit.liveThreadsLayer),
+        Layer.provide(
+          Layer.mock(Analytics.Analytics)({
+            record: (event) =>
+              event.kind === "mcp.call"
+                ? Deferred.succeed(recorded, event).pipe(Effect.asVoid)
+                : Effect.void,
+          }),
+        ),
+        Layer.provideMerge(invocation),
+      );
+      yield* Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        yield* server
+          .callTool({ name: "t3_thread_wait", arguments: args })
+          .pipe(Effect.provideService(McpSchema.McpServerClient, client));
+        const row = yield* Deferred.await(recorded);
+        expect(yield* decodeAnalyticsEvent(row)).toMatchObject({
+          tool: "t3_thread_wait",
+          outcome: "timeout",
+          waitStage,
+          waitLookupMs: 600,
+          readerLane: waitStage === "waiting" ? "background" : "foreground",
+          errorTag: waitStage === "waiting" ? "wait_timeout" : "lookup_timeout",
+        });
       }).pipe(Effect.provide(registration));
     }),
 );
