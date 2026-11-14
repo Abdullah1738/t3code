@@ -61,6 +61,7 @@ typeset -A live=(
   libexec/mail "$HOME/.local/libexec/mail"
   libexec/card-preview "$HOME/.local/libexec/card-preview"
   libexec/qcard "$HOME/.local/libexec/qcard"
+  libexec/vp "$HOME/.local/libexec/vp"
   juno-proxy "$HOME/.local/share/juno-proxy"
   lydia-ticks "$HOME/.local/share/lydia-ticks"
   bin "$HOME/.local/bin"
@@ -333,6 +334,8 @@ smoke env PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -c "import sys; sys.path[:0
 smoke env PYTHONDONTWRITEBYTECODE=1 "$HOME/.local/bin/qcard" templates
 for f in "${plists[@]}"; do smoke plutil -lint "$f"; done
 smoke sh -n "$HOME/.local/bin/himalaya-heal"
+smoke sh -n "$HOME/.local/bin/vp"
+smoke sh -c 'cd / && "$1" --version >/dev/null 2>&1; [ "$?" = 127 ]' sh "$HOME/.local/bin/vp"
 smoke zsh -n "$HOME/.local/share/lydia-ticks/tunnel.sh"
 for f in power-unplug-telegram.sh battery-low-telegram.sh cards-tunnel cards-tunnel-setup cards-health; do
   smoke zsh -n "$HOME/.local/bin/$f"
