@@ -9,6 +9,8 @@ import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { chatInfo, personFor, roleOf, slugFor } from "./access.ts";
 import { appContent } from "./api.ts";
+import { speakerName } from "./group-judge.ts";
+import { chatHistory } from "./history.ts";
 import type { Access, ChatContext, ChatInfo } from "./chats.ts";
 import { chatKey, GROUP_APP_REFUSAL, LineError, type ChatKey, type Line } from "./line.ts";
 import { askOwner, editAccess, location, locationRequest, type SbApiDeps, type SbApiResult } from "./sb-api.ts";
@@ -390,6 +392,29 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
           only(body, ["sessionId", "chat"]);
           if (!sessionId) throw new HttpError(400, "Invalid request");
           return result(await location(deps(), sessionId, locationTarget(body.chat)));
+        }
+        case "/messages": {
+          only(body, ["sessionId", "chat", "limit", "before", "id"]);
+          if (!sessionId) throw new HttpError(400, "Invalid request");
+          if (!caller) throw new HttpError(409, "No chat for this session");
+          let chat = caller;
+          if (body.chat !== undefined) {
+            if (!text(body.chat, 100) || !/^[a-z0-9][a-z0-9._-]{0,99}$/.test(body.chat)) throw new HttpError(400, "Invalid request");
+            const target = registry.bySlugName(body.chat);
+            if (!adminGroup(target)) ownerOnly(false);
+            if (!target) throw new HttpError(404, "Unknown chat");
+            chat = target;
+          }
+          const limit = body.limit === undefined ? 20 : body.limit;
+          const messageId = (value: unknown) => text(value, 200) && !/[\x00-\x1f\x7f-\x9f]/.test(value);
+          if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > 100
+            || (body.before !== undefined && !messageId(body.before)) || (body.id !== undefined && !messageId(body.id))
+            || (body.before !== undefined && body.id !== undefined)) throw new HttpError(400, "Invalid request");
+          const history = chatHistory(chat.store, address => speakerName(chat.context.roleOf(address), address),
+            chatKey.target(registry.ownerKey), typeof body.id === "string" ? { id: body.id }
+              : { limit, ...(typeof body.before === "string" ? { before: body.before } : {}) }, chat.info.kind === "owner");
+          if (!history) throw new HttpError(404, "Unknown message");
+          return reply(200, { chat: chat.info.slug, ...history });
         }
         case "/ask-owner": {
           only(body, ["text", "sessionId", "dedupeKey"]);

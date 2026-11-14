@@ -10,6 +10,24 @@ import { loadCommandPayload, MAX_FILE_BYTES, parseCommand } from "../src/cli.ts"
 const sendFile = ["send-file", "--file", "/nonexistent/report.pdf", "--key", "file-1", "--session", "session-1"];
 
 describe("parseCommand", () => {
+  test("messages reads recent, earlier, or individual messages", () => {
+    expect(parseCommand(["messages", "--session", "ses_1"])).toEqual({ method: "POST", path: "/messages", body: { sessionId: "ses_1" } });
+    expect(parseCommand(["messages", "--session", "ses_1", "--chat", "moni", "--limit", "5", "--before", "X"]).body)
+      .toEqual({ sessionId: "ses_1", chat: "moni", limit: 5, before: "X" });
+    expect(parseCommand(["messages", "--session", "ses_1", "--id", "X"]).body).toEqual({ sessionId: "ses_1", id: "X" });
+    expect(() => parseCommand(["messages"])).toThrow("--session");
+    expect(() => parseCommand(["messages", "--session", "ses_1", "--id", "X", "--before", "Y"])).toThrow("--id and --before");
+    for (const limit of ["0", "101", "abc", "1.5", "-1", "1e2", " 2", "1000"]) {
+      expect(() => parseCommand(["messages", "--session", "ses_1", `--limit=${limit}`])).toThrow("--limit must be 1 to 100");
+    }
+    for (const limit of ["1", "100", "005"]) expect(parseCommand(["messages", "--session", "ses_1", "--limit", limit]).body?.limit).toBe(Number(limit));
+    for (const key of ["id", "before"]) {
+      for (const value of ["", " ", "x".repeat(201), "x\ny", "x\x00y", "x\x7fy", "x\x85y"]) {
+        expect(() => parseCommand(["messages", "--session", "ses_1", `--${key}`, value])).toThrow(`Invalid --${key}`);
+      }
+      expect(parseCommand(["messages", "--session", "ses_1", `--${key}`, "x".repeat(200)]).body?.[key]).toBe("x".repeat(200));
+    }
+  });
   test("parses health without a body", () => {
     expect(parseCommand(["health"])).toEqual({ method: "GET", path: "/health" });
   });

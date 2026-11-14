@@ -143,7 +143,7 @@ type Options = {
   notifyFailure?: (text: string, key: string) => Promise<boolean>;
 };
 /** What a Sendblue swipe reply points at, kept per row. `unknown` is never guessed from neighbouring messages. */
-type Swipe =
+export type Swipe =
   | { kind: "robob"; text: string; at?: number; outboxId?: string }
   | { kind: "owner"; text: string; at?: number; thread?: { text: string; at?: number }[] }
   | { kind: "person"; sender: string; text: string; at?: number; thread?: { text: string; at?: number }[] }
@@ -219,6 +219,9 @@ export function sendblueContextPrompt(context: ChatContext, eyes: boolean, sende
   }
   // Turns nobody typed (wakes) carry no attachments and don't open Robob asks; guest wakes bring their own commands.
   if (!background) {
+    const other = chat.kind === "owner" ? " Add `--chat <slug>` for another chat."
+      : chat.kind === "dm" && context.roleOf(chatKey.target(chat.key)).role === "admin" ? " Add `--chat <slug>` for a group she has written in." : "";
+    lines.push("History: `messages --session CURRENT_SESSION_ID [--limit N] [--before ID]` lists this chat's recent messages, oldest first, with what each swipe-replied to; `--id ID` shows one. Use it when someone refers to an earlier message you can't see or a quote is missing." + other);
     lines.push("Files: images attach natively; other files (voice notes, PDFs, docs) are saved at the quoted paths. If you can't read them directly, work on them with tools (transcribe, extract text, convert).");
     if (chat.kind === "group") lines.push("Polls and app cards are not available in groups; ask in text and send links as text.");
     else lines.push("Polls are not available on this line; ask in text. App cards still work (`app`).");

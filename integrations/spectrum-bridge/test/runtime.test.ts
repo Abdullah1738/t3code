@@ -314,6 +314,40 @@ describe("Sendblue socket API", () => {
     return { ...env, chats, moniChat, handler, post };
   }
 
+  test("messages reads only the caller's chat or permitted cross-chat history", async () => {
+    const { post, chats, moniChat } = api();
+    chats.owner.store.acceptInbound("o-1", { text: "owner", receivedAt: 1 });
+    expect(await post("/messages", { sessionId: "ses_owner" })).toMatchObject({ status: 200, body: { chat: "owner", messages: [{ id: "o-1", from: "Abdullah" }], more: false } });
+    expect(await post("/messages", { sessionId: "ses_moni" })).toMatchObject({ status: 200, body: { chat: "moni", messages: [{ id: "m-1", from: "Someone" }] } });
+    expect(await post("/messages", { sessionId: "ses_owner", chat: "moni", id: "m-1" })).toMatchObject({ status: 200, body: { chat: "moni", messages: [{ id: "m-1" }] } });
+    expect(await post("/messages", { sessionId: "ses_moni", chat: "owner" })).toEqual({ status: 403, body: { error: "Only the owner's chat can do this" } });
+    const family = chats.open(chatKey.group("GRP-Allowed-123"), "Family Trip");
+    family.store.set("route", { id: "ses_group", generation: 1 });
+    family.store.acceptInbound("g-1", { text: "group", sender: " MONI@example.com", receivedAt: 2 });
+    expect((await post("/messages", { sessionId: "ses_moni", chat: family.info.slug })).status).toBe(200);
+    expect((await post("/messages", { sessionId: "ses_group" })).status).toBe(200);
+    expect((await post("/messages", { sessionId: "ses_group", chat: "owner" })).status).toBe(403);
+    const work = chats.open(chatKey.group("GRP-Work-456"), "Work");
+    expect((await post("/messages", { sessionId: "ses_moni", chat: work.info.slug })).status).toBe(403);
+    const guest = chats.open(chatKey.dm("+15555550188"));
+    guest.store.set("route", { id: "ses_guest", generation: 1 });
+    expect((await post("/messages", { sessionId: "ses_guest", chat: "moni" })).status).toBe(403);
+    expect((await post("/messages", { sessionId: "ses_guest" })).status).toBe(200);
+    expect(await post("/messages", { sessionId: "ses_owner", chat: "nobody" })).toEqual({ status: 404, body: { error: "Unknown chat" } });
+    expect(await post("/messages", { sessionId: "ses_gone" })).toEqual({ status: 409, body: { error: "No chat for this session" } });
+    expect((await post("/messages", {})).status).toBe(400);
+    for (const body of [{ limit: 0 }, { limit: 101 }, { limit: 1.5 }, { limit: "5" }, { id: "x", before: "y" },
+      { id: "" }, { before: "x".repeat(201) }, { id: "x\ny" }, { before: "x\x85y" }, { unknown: true }]) {
+      expect((await post("/messages", { sessionId: "ses_owner", ...body })).status).toBe(400);
+    }
+    for (const body of [{ id: "missing" }, { before: "missing" }, { id: "m-1" }]) {
+      expect(await post("/messages", { sessionId: "ses_owner", ...body })).toEqual({ status: 404, body: { error: "Unknown message" } });
+    }
+    expect(moniChat.store.pendingOutbox()).toEqual([]);
+    access.people[0]!.role = "person";
+    expect((await post("/messages", { sessionId: "ses_moni", chat: family.info.slug })).status).toBe(403);
+  });
+
   test("session-bound requests go to the chat that owns the session", async () => {
     const { post } = api();
     expect(await post("/send", { text: "hi", dedupeKey: "k", sessionId: "ses_moni@2" })).toEqual({ status: 200, body: { chat: "moni", path: "/send" } });
