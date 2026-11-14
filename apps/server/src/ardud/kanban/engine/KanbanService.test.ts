@@ -32524,7 +32524,7 @@ it.effect(
           yield* kanban.askOwner(
             card.id,
             {
-              question: "Skip s6 deploy?",
+              question: 'Can I close 9router #19\'s deploy step as "not needed"?',
               blocking: false,
               options: [
                 { id: "o1", label: "Skip deploy" },
@@ -32534,6 +32534,18 @@ it.effect(
             evaluator,
             "evaluator",
           );
+          yield* kanban.askOwner(
+            card.id,
+            { question: "OK to skip s6 (the deploy step)?", blocking: false },
+            evaluator,
+            "evaluator",
+          );
+          yield* kanban.changeAsk(card.id, "q3", "drop", evaluator, "evaluator");
+          const unanswered = yield* kanban
+            .markSubtask(card.id, "s6", "skipped", "Not needed", evaluator, "evaluator")
+            .pipe(Effect.flip);
+          assert.include(unanswered.detail, "the latest decision, q3, was dropped");
+          yield* TestClock.adjust("1 second");
           yield* kanban.answerAsk(
             card.id,
             "q2",
@@ -32573,7 +32585,7 @@ it.effect(
             );
             const returned = yield* kanban.answerAsk(
               card.id,
-              "q3",
+              "q4",
               { verdict: "answered", revision: 0, text: "Recorded" },
               owner,
             );
