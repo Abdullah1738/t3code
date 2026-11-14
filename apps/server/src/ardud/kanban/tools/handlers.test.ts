@@ -1470,6 +1470,9 @@ it.effect("compact reads: board_get since, card_get pages, discussion_read limit
     // The 60 comments plus the ask and its answer.
     assert.isAtLeast(view.cards[0]!.comments ?? 0, 60);
     assert.isFalse(view.page.hasMore);
+    const relativeCompact = yield* call(thread, "board_get", { since: "now-24h" });
+    assert.isFalse(relativeCompact.isError, relativeCompact.text);
+    assert.deepStrictEqual(relativeCompact.structured.board, compact.structured.board);
     const tooOld = yield* call(thread, "board_get", {
       since: DateTime.formatIso(DateTime.makeUnsafe(now - 80 * 60 * 60 * 1000)),
     });
@@ -1540,6 +1543,20 @@ it.effect("compact reads: board_get since, card_get pages, discussion_read limit
       id: "q1",
       minutes: 20,
     });
+    const relativeRollup = yield* call(thread, "board_activity", { since: "24h", until: "now" });
+    assert.isFalse(relativeRollup.isError, relativeRollup.text);
+    assert.deepStrictEqual(
+      (relativeRollup.structured.activity as { asks: unknown }).asks,
+      activity.asks,
+    );
+    const futureSince = DateTime.formatIso(DateTime.makeUnsafe(now + 60 * 60 * 1000));
+    for (const name of ["board_get", "board_activity"]) {
+      const future = yield* call(thread, name, { since: futureSince });
+      assert.isTrue(future.isError);
+      assert.include(future.text, futureSince);
+      assert.include(future.text, DateTime.formatIso(DateTime.makeUnsafe(now)));
+      assert.include(future.text, "now, server clock, UTC");
+    }
   }).pipe(Effect.provide(layer));
 });
 
