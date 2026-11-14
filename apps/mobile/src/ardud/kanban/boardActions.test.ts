@@ -28,11 +28,14 @@ it.each(["", " \t\n", "Robob", " Robob "])("does not save %j", (value) => {
   expect(updateBoard).not.toHaveBeenCalled();
 });
 
-it("shows a failed rename without retrying it", async () => {
-  updateBoard.mockRejectedValue(new Error("Connection closed"));
+it.each([
+  [new Error("Connection closed"), "Something went wrong. Try again."],
+  [{ detail: "Connection closed" }, "Connection closed"],
+])("shows a failed rename without retrying it: %j", async (error, message) => {
+  updateBoard.mockRejectedValue(error);
   renameBoard(KanbanBoardId.make("board-robob"), "Robob");
   vi.mocked(Dialog.prompt).mock.calls[0]![0].onConfirm("Board work");
   await Promise.resolve();
-  expect(Dialog.alert).toHaveBeenCalledWith("Could not rename", "Connection closed");
+  expect(Dialog.alert).toHaveBeenCalledWith("Could not rename", message);
   expect(updateBoard).toHaveBeenCalledTimes(1);
 });
