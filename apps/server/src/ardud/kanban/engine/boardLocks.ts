@@ -411,7 +411,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
           seen.set(boardId, version(held));
         yield* check(op);
       }),
-    );
+    ).pipe((effect) => SavedWrite.stage(effect, "admission"));
 
   const run = <A, E, R>(
     effect: Effect.Effect<A, E, R>,
@@ -515,8 +515,9 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
         }
         // Mark before entering masked SQL: a timeout must not promise a safe retry
         // while a transaction or its cleanup can still apply the write.
-        if (write) yield* SavedWrite.committing;
-        const result = yield* write ? effect : restore(effect);
+        const result = yield* write
+          ? SavedWrite.stage(SavedWrite.committing.pipe(Effect.andThen(effect)), "commit")
+          : restore(effect);
         if (write) {
           op.committed = true;
           const held = op.held!;
@@ -593,9 +594,14 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
         if (!readOnly) {
           op.committed = true;
           op.sideEffect = true;
-          yield* SavedWrite.committing;
         }
-        const result = yield* Effect.exit(restore(Effect.interruptible(effect)));
+        const external = restore(Effect.interruptible(effect));
+        const result = yield* Effect.exit(
+          SavedWrite.stage(
+            readOnly ? external : SavedWrite.committing.pipe(Effect.andThen(external)),
+            readOnly ? "read" : "commit",
+          ),
+        );
         // Re-acquire on failures too: a caller may catch one and continue changing state.
         if (held) {
           const resumed = yield* Effect.exit(

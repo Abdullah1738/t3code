@@ -2059,6 +2059,7 @@ const make = Effect.gen(function* () {
       ),
       Effect.provideService(BoardLocks.writeWaitMs, BoardLocks.WRITE_WAIT_MS),
       Effect.provideService(TickTimings.current, undefined),
+      SavedWrite.background,
       Effect.forkIn(scope),
       Effect.asVoid,
     );
@@ -3227,6 +3228,7 @@ const make = Effect.gen(function* () {
                     ),
                     Effect.provideService(BoardLocks.writeWaitMs, BoardLocks.WRITE_WAIT_MS),
                     Effect.provideService(TickTimings.current, undefined),
+                    SavedWrite.background,
                     Effect.forkIn(scope),
                   )
                 : Effect.void,
@@ -3287,6 +3289,7 @@ const make = Effect.gen(function* () {
       ),
       Effect.provideService(BoardLocks.writeWaitMs, BoardLocks.WRITE_WAIT_MS),
       Effect.provideService(TickTimings.current, undefined),
+      SavedWrite.background,
       Effect.forkIn(scope),
       Effect.asVoid,
     );
@@ -3374,6 +3377,7 @@ const make = Effect.gen(function* () {
       ),
       Effect.provideService(BoardLocks.writeWaitMs, BoardLocks.WRITE_WAIT_MS),
       Effect.provideService(TickTimings.current, undefined),
+      SavedWrite.background,
       Effect.forkIn(scope),
       Effect.asVoid,
     );
@@ -3444,6 +3448,7 @@ const make = Effect.gen(function* () {
       ),
       Effect.provideService(BoardLocks.writeWaitMs, BoardLocks.WRITE_WAIT_MS),
       Effect.provideService(TickTimings.current, undefined),
+      SavedWrite.background,
       Effect.forkIn(scope),
       Effect.asVoid,
     );
@@ -3581,6 +3586,7 @@ const make = Effect.gen(function* () {
       ),
       Effect.provideService(BoardLocks.writeWaitMs, BoardLocks.WRITE_WAIT_MS),
       Effect.provideService(TickTimings.current, undefined),
+      SavedWrite.background,
       Effect.forkIn(scope),
       Effect.asVoid,
     );
@@ -5522,6 +5528,7 @@ const make = Effect.gen(function* () {
               Effect.retry(Schedule.spaced("5 seconds")),
               Effect.provideService(BoardLocks.writeWaitMs, BoardLocks.WRITE_WAIT_MS),
               Effect.provideService(TickTimings.current, undefined),
+              SavedWrite.background,
               Effect.forkIn(scope),
             );
           }),
@@ -6307,6 +6314,7 @@ const make = Effect.gen(function* () {
         NodeSqliteClient.backgroundReads,
         Effect.provideService(BoardLocks.writeWaitMs, BoardLocks.WRITE_WAIT_MS),
         Effect.provideService(TickTimings.current, undefined),
+        SavedWrite.background,
         Effect.forkIn(scope),
       );
     return waiter;
@@ -14896,6 +14904,7 @@ const make = Effect.gen(function* () {
       ),
       Effect.provideService(BoardLocks.writeWaitMs, BoardLocks.WRITE_WAIT_MS),
       Effect.provideService(TickTimings.current, undefined),
+      SavedWrite.background,
       Effect.forkIn(scope),
       Effect.asVoid,
     );
@@ -15174,6 +15183,7 @@ const make = Effect.gen(function* () {
       ),
       Effect.provideService(BoardLocks.writeWaitMs, BoardLocks.WRITE_WAIT_MS),
       Effect.provideService(TickTimings.current, undefined),
+      SavedWrite.background,
       Effect.forkIn(scope),
     );
   }

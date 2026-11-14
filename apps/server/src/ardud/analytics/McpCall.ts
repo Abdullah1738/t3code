@@ -27,6 +27,7 @@ export class McpCall extends Context.Service<
     phase: Phase;
     saved: boolean | "unknown";
     replyFailure?: "reply_timeout" | "reply_error";
+    replyStage?: string;
     handlerErrorTag?: string;
     handlerOutcome?: "timeout" | "refused";
   }
@@ -253,6 +254,7 @@ export function callOutcome(
         : "ok",
     saved,
     props: {
+      ...(state.replyStage === undefined ? {} : { phase: state.replyStage }),
       code:
         state.replyFailure ??
         (busy

@@ -40,6 +40,7 @@ import { selectionRoutingEnabled } from "../engine/selectionSettings.ts";
 import { KanbanToolkit, type ModelInput } from "./tools.ts";
 import * as BoardReplies from "../engine/boardReplies.ts";
 import * as Activity from "../engine/activity.ts";
+import * as SavedWrite from "../engine/savedWrite.ts";
 
 const toolFailure = (error: KanbanError) =>
   new OrchestratorMcpFailure({
@@ -69,6 +70,7 @@ const withCaller = Effect.fn("KanbanTools.withCaller")(
       caller: Caller,
     ) => Effect.Effect<A, KanbanError | OrchestratorMcpFailure, R>,
   ) {
+    yield* SavedWrite.linkReply();
     const scope = yield* McpInvocationContext.McpInvocationContext;
     const thread = yield* McpInvocationContext.requireThreadScope(scope, "Missions board tools");
     const service = yield* KanbanService;
@@ -82,7 +84,7 @@ const withCaller = Effect.fn("KanbanTools.withCaller")(
           link !== null && link.role !== "evaluator"
             ? { _tag: "thread", threadId }
             : { _tag: "evaluator", threadId };
-        return yield* run(service, { threadId, link, actor });
+        return yield* SavedWrite.mutating(run(service, { threadId, link, actor }));
       }),
     );
   },

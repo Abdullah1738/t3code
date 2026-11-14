@@ -643,6 +643,7 @@ it.effect("records resolved caller identity and a saved write whose reply fails"
         errorPhase: "result",
         callerResolved: true,
         readerLane: "foreground",
+        props: { phase: "caller" },
       });
     }).pipe(Effect.provide(registration));
   }),
