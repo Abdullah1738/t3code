@@ -663,6 +663,15 @@ def read_json(path, default):
         return default
 
 
+if os.environ.get("WATCH_ATTEMPT"):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "helpers"))
+    from watch_admission import admitted_check
+else:
+    def admitted_check(fn):
+        return fn
+
+
+@admitted_check
 def write_json(path, obj, timing=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix='.' + path.name + '.', dir=path.parent)
@@ -2017,17 +2026,20 @@ def runner_fires(wd):
 
 
 def runner_owns(wd, out):
-    """Whether the runner has accepted this check's output: it is saved as the runner's pending event.
+    """Whether the runner saved this output in its pending delivery or person-chat batch.
 
-    The runner saves `pending` (with the event text) before it acks the run, so a match means it will retry
+    The runner saves the event text before it acks the run, so a match means it will retry
     the event itself. No match and no delivery means the output was lost before acknowledgement."""
     try:
-        pending = json.loads((wd / 'state.json').read_text()).get('pending') or {}
+        runner = json.loads((wd / 'state.json').read_text())
+        pending = runner.get('pending') or {}
     except (OSError, ValueError, AttributeError):
         return False
     # An outbox from before this field (or an empty one) has no event to match, so it is never owned.
     event = (out.get('event') or '').strip()
-    return bool(event) and (pending.get('event') or '').strip() == event
+    queued = (runner.get('batch') or {}).get('events') or []
+    return bool(event) and ((pending.get('event') or '').strip() == event
+                            or any(isinstance(item, str) and item.strip() == event for item in queued))
 
 
 def delivery_time(out, wd):
