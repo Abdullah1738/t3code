@@ -1,3 +1,10 @@
+import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
+import * as RunStartDeadline from "./RunStartDeadline.ts";
+import {
+  PROVIDER_START_CLEANUP_TIMEOUT_MS,
+  PROVIDER_START_TIMEOUT_CODE,
+  PROVIDER_START_TIMEOUT_MS,
+} from "./providerStartDeadlinePolicy.ts";
 import { nextLaunchRecovery, claudeRecoveryResult } from "./launchRecovery.ts";
 import {
   bootId,
@@ -39,6 +46,8 @@ import {
   ProviderThreadId,
   ProviderTurnId,
   RunId,
+  RunAttemptId,
+  KanbanBoardId,
   ScheduledTaskId,
   ThreadId,
 } from "@t3tools/contracts";
@@ -47,6 +56,12 @@ import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Context from "effect/Context";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as BoardsDatabase from "../ardud/persistence/BoardsDatabase.ts";
+import { kanbanDDL } from "../ardud/persistence/kanbanSchema.ts";
+import { ensureKanbanCacheVersions } from "../ardud/persistence/kanbanCacheVersions.ts";
+import { controlDDL } from "../ardud/persistence/boardsSchema.ts";
 import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
 import * as Option from "effect/Option";
@@ -292,25 +307,29 @@ const moveProject = (projectId: ProjectId, workspaceRoot: string, updatedAt: str
     }),
   );
 
-const layerTest = Layer.mergeAll(
-  RuntimeLayer.layer,
-  RuntimeLayer.layerEventSink,
-  ProjectStore.layer,
-  ProjectionStore.layer,
-  EffectOutbox.layer,
-  ThreadCommandExecutor.layer,
-).pipe(
-  Layer.provide(McpSessionRegistryTestkit.layer),
-  Layer.provide(McpProviderSessions.layer),
-  Layer.provide(SqlitePersistence.layerMemory),
-  Layer.provide(layerCheckpointStoreTest),
-  Layer.provide(layerServerConfig),
-  Layer.provide(ServerSettings.layerTest()),
-  Layer.provide(layerTestProviderInstanceRegistry),
-  Layer.provide(layerGitWorkflowTest),
-  Layer.provide(layerProjectServiceTest),
-  Layer.provide(layerPlatformTest),
-);
+const layerTestWithContinuation = (continueThreadsAfterServerUpdate = false) =>
+  Layer.mergeAll(
+    RuntimeLayer.layer,
+    RuntimeLayer.layerEventSink,
+    ProjectStore.layer,
+    ProjectionStore.layer,
+    EffectOutbox.layer,
+    ThreadCommandExecutor.layer,
+    KanbanStore.layer,
+  ).pipe(
+    Layer.provide(McpSessionRegistryTestkit.layer),
+    Layer.provide(McpProviderSessions.layer),
+    Layer.provide(SqlitePersistence.layerMemory),
+    Layer.provide(layerCheckpointStoreTest),
+    Layer.provide(layerServerConfig),
+    Layer.provide(ServerSettings.layerTest({ continueThreadsAfterServerUpdate })),
+    Layer.provide(layerTestProviderInstanceRegistry),
+    Layer.provide(layerGitWorkflowTest),
+    Layer.provide(layerProjectServiceTest),
+    Layer.provide(layerPlatformTest),
+  );
+
+const layerTest = layerTestWithContinuation(true);
 
 const layerLegacyImportTest = RuntimeLayer.layer.pipe(
   Layer.provide(McpSessionRegistryTestkit.layer),
@@ -9141,6 +9160,1826 @@ it.effect.each([
       assert.equal(admittedWait?.status, "completed");
     }).pipe(Effect.provide(layerRestartPacingTest(() => load)));
   },
+);
+
+it.effect.each(["start", "restart"] as const)(
+  "start deadline cancels only the expiring run while a different start waits: %s",
+  (effectType) =>
+    Effect.gen(function* () {
+      const engine = yield* Orchestrator.OrchestratorV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const { threadId, projection } = yield* createDeadlineThread("scoped-cancellation");
+      const old = projection.runs[1]!,
+        newer = projection.runs[2]!,
+        now = yield* DateTime.now;
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make(threadId + ":initial-completed"),
+            type: "run.updated",
+            threadId,
+            runId: projection.runs[0]!.id,
+            occurredAt: now,
+            payload: { ...projection.runs[0]!, status: "completed", completedAt: now },
+          },
+          {
+            id: EventId.make(threadId + ":newer-starting"),
+            type: "run.updated",
+            threadId,
+            runId: newer.id,
+            occurredAt: now,
+            payload: { ...newer, status: "starting", queuePosition: null },
+          },
+        ],
+      });
+      const effect = {
+        id: threadId + ":expired-start",
+        commandId: CommandId.make(threadId + ":expired-source"),
+        threadId,
+        request:
+          effectType === "start"
+            ? { type: "provider-turn.start" as const, runId: old.id }
+            : {
+                type: "provider-turn.restart" as const,
+                runId: old.id,
+                providerSessionId: ProviderSessionId.make(threadId + ":session"),
+                providerThreadId: ProviderThreadId.make(threadId + ":provider-thread"),
+                providerTurnId: ProviderTurnId.make(threadId + ":turn"),
+                interruptedAttemptId: RunAttemptId.make(threadId + ":attempt"),
+              },
+      };
+      const otherStart = {
+        ...effect,
+        id: threadId + ":newer-start",
+        request: { type: "provider-turn.start" as const, runId: newer.id },
+      };
+      yield* outbox.enqueue([effect, otherStart]);
+      yield* engine.dispatch({
+        type: "run.start-expire",
+        phase: "restart_admission",
+        commandId: CommandId.make(threadId + ":expire-queued"),
+        threadId,
+        runId: old.id,
+        expectedAttemptId: old.activeAttemptId,
+        deadline: now,
+      });
+      const after = yield* engine.getThreadProjection(threadId);
+      assert.equal(after.runs.find((run) => run.id === old.id)?.status, "failed");
+      assert.equal(after.runs.find((run) => run.id === newer.id)?.status, "starting");
+      assert.equal(Option.getOrThrow(yield* outbox.get(otherStart.id)).status, "pending");
+      assert.equal(Option.getOrThrow(yield* outbox.get(effect.id)).status, "cancelled");
+    }).pipe(Effect.provide(Layer.fresh(layerDeadlineTest))),
+);
+
+it.effect.each(["ordinary", "orphan", "held"] as const)(
+  "start deadline settles recovered queued sources after pre-run continuation expiry: %s",
+  (ownership) =>
+    Effect.gen(function* () {
+      const engine = yield* Orchestrator.OrchestratorV2;
+      const recovery = yield* ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService;
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const { threadId, projection } = yield* createDeadlineThread("pre-run-followup-" + ownership);
+      yield* recovery.reconcile("startup");
+      if (ownership === "orphan") {
+        const boards = yield* KanbanStore.KanbanStore;
+        yield* boards.putThreadLink({
+          threadId,
+          boardId: KanbanBoardId.make("old-board"),
+          cardId: null,
+          role: "work",
+          purpose: null,
+          discussionId: null,
+          model: null,
+          paused: null,
+          startedAt: "2026-11-13T06:46:00Z",
+          endedAt: null,
+        });
+      }
+      if (ownership === "held") {
+        const now = yield* DateTime.now;
+        yield* sink.write({
+          events: projection.runs.slice(1).map((run) => ({
+            id: EventId.make(run.id + ":hold"),
+            type: "run.updated" as const,
+            threadId,
+            runId: run.id,
+            occurredAt: now,
+            payload: { ...run, queueHeld: true },
+          })),
+        });
+      }
+      yield* TestClock.adjust(`${RestartPacing.RESTART_ADMISSION_TIMEOUT_MS} millis`);
+      const promoted = yield* Deferred.make<void>();
+      yield* engine.streamDomainEvents.pipe(
+        Stream.runForEach((event) =>
+          event.type === "run.updated" &&
+          event.payload.id === projection.runs[2]!.id &&
+          event.payload.status === "starting"
+            ? Deferred.succeed(promoted, undefined)
+            : Effect.void,
+        ),
+        Effect.forkScoped,
+      );
+      const spy = vi.spyOn(sessions, "open").mockImplementation(() =>
+        engine.getThreadRecords(threadId, ["runs"]).pipe(
+          Effect.orDie,
+          Effect.tap(({ runs }) =>
+            Effect.sync(() => {
+              assert.equal(
+                runs.find((run) => run.status === "starting")?.id,
+                projection.runs[2]!.id,
+              );
+            }),
+          ),
+          Effect.andThen(Effect.never),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const execution = yield* worker.drain().pipe(Effect.forkChild({ startImmediately: true }));
+        if (ownership === "ordinary") {
+          yield* Deferred.await(promoted);
+          yield* Fiber.interrupt(execution);
+        } else {
+          yield* Fiber.join(execution);
+          assert.equal(spy.mock.calls.length, 0);
+        }
+        const after = yield* engine.getThreadProjection(threadId);
+        assert.equal(
+          after.runs.find((run) => run.id === projection.runs[1]!.id)?.status,
+          ownership === "held" ? "queued" : "failed",
+        );
+        assert.equal(
+          after.runs.find((run) => run.id === projection.runs[2]!.id)?.status,
+          ownership === "ordinary" ? "starting" : "queued",
+        );
+        if (ownership !== "held")
+          for (const run of projection.runs.slice(1, 2))
+            assert.isTrue(
+              after.turnItems.some(
+                (item) =>
+                  item.type === "error" &&
+                  item.runId === run.id &&
+                  item.failure.message.includes("restart admission queue"),
+              ),
+            );
+      }).pipe(Effect.ensuring(Effect.sync(() => spy.mockRestore())));
+    }).pipe(
+      Effect.provide(
+        Layer.fresh(
+          layerTestWithContinuation(true).pipe(
+            Layer.provide(layerDeadlineBoards),
+            Layer.provide(Layer.succeed(RestartPacing.RestartLoad, () => 0)),
+          ),
+        ),
+      ),
+    ),
+);
+
+it.effect.each(["new turn", "session replacement"] as const)(
+  "start deadline replans cleanup registered during commit: %s",
+  (change) =>
+    Effect.gen(function* () {
+      const engine = yield* Orchestrator.OrchestratorV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const { threadId, projection } = yield* createDeadlineThread("cleanup-race-" + change);
+      const run = projection.runs[0]!,
+        owner = projection.providerThreads[0]!;
+      const now = yield* DateTime.now;
+      const turn = {
+        id: ProviderTurnId.make(threadId + ":turn"),
+        providerThreadId: owner.id,
+        nodeId: run.rootNodeId!,
+        runAttemptId: run.activeAttemptId,
+        nativeTurnRef: null,
+        ordinal: 1,
+        status: "running" as const,
+        startedAt: now,
+        completedAt: null,
+      };
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make(threadId + ":armed"),
+            type: "run.updated",
+            threadId,
+            runId: run.id,
+            occurredAt: now,
+            payload: { ...run, providerStartDeadlineAt: now },
+          },
+          ...(change === "session replacement"
+            ? [
+                {
+                  id: EventId.make(threadId + ":turn"),
+                  type: "provider-turn.updated" as const,
+                  threadId,
+                  runId: run.id,
+                  occurredAt: now,
+                  payload: turn,
+                },
+              ]
+            : []),
+        ],
+      });
+      const newSession = ProviderSessionId.make(threadId + ":replacement-session");
+      const write = sink.commitCommand;
+      let injected = false;
+      const spy = vi.spyOn(sink, "commitCommand").mockImplementation((input) => {
+        if (input.commandType !== "run.start-expire" || injected) return write(input);
+        injected = true;
+        return sink
+          .write({
+            events:
+              change === "new turn"
+                ? [
+                    {
+                      id: EventId.make(threadId + ":racing-turn"),
+                      type: "provider-turn.updated",
+                      threadId,
+                      runId: run.id,
+                      occurredAt: now,
+                      payload: turn,
+                    },
+                  ]
+                : [
+                    {
+                      id: EventId.make(threadId + ":racing-session"),
+                      type: "provider-thread.updated",
+                      threadId,
+                      occurredAt: now,
+                      payload: { ...owner, providerSessionId: newSession },
+                    },
+                  ],
+          })
+          .pipe(Effect.andThen(write(input)));
+      });
+      yield* Effect.addFinalizer(() => Effect.sync(() => spy.mockRestore()));
+      const command = {
+        type: "run.start-expire" as const,
+        phase: "provider" as const,
+        commandId: CommandId.make(threadId + ":expire"),
+        threadId,
+        runId: run.id,
+        expectedAttemptId: run.activeAttemptId,
+        deadline: now,
+      };
+      const first = yield* engine.dispatch(command).pipe(Effect.result);
+      assert.equal(first._tag, "Failure");
+      assert.equal((yield* engine.getThreadProjection(threadId)).runs[0]?.status, "starting");
+      yield* engine.dispatch(command);
+      assert.equal((yield* engine.getThreadProjection(threadId)).runs[0]?.status, "failed");
+      const stop = Option.getOrThrow(
+        yield* outbox.claimNext({
+          workerId: "cleanup-race",
+          threadId,
+          leaseDurationMs: 30_000,
+          onlyEffectTypes: ["provider-turn.interrupt"],
+        }),
+      );
+      assert.equal(stop.request.type, "provider-turn.interrupt");
+      if (stop.request.type === "provider-turn.interrupt") {
+        assert.equal(stop.request.providerTurnId, turn.id);
+        assert.equal(
+          stop.request.providerSessionId,
+          change === "new turn" ? owner.providerSessionId : newSession,
+        );
+      }
+    }).pipe(Effect.provide(Layer.fresh(layerDeadlineTest))),
+);
+
+it.effect.each([
+  "replacement",
+  "cancel",
+  "acceptance",
+  "running unaccepted",
+  "running accepted before",
+  "running accepted after",
+] as const)("start deadline bootstrap preserves intervening lifecycle events: %s", (change) =>
+  Effect.gen(function* () {
+    const engine = yield* Orchestrator.OrchestratorV2,
+      sink = yield* EventSink.EventSinkV2,
+      guard = yield* RunStartDeadline.RunStartDeadline;
+    const { threadId, projection } = yield* createDeadlineThread("bootstrap-race-" + change);
+    const run = projection.runs[0]!,
+      now = yield* DateTime.now;
+    yield* sink.write({
+      events: [
+        {
+          id: EventId.make(threadId + ":armed"),
+          type: "run.updated",
+          threadId,
+          runId: run.id,
+          occurredAt: now,
+          payload: { ...run, providerStartDeadlineAt: now },
+        },
+      ],
+    });
+    const entered = yield* Deferred.make<void>(),
+      release = yield* Deferred.make<void>();
+    const records = engine.getThreadRecords;
+    const readSpy = vi
+      .spyOn(engine, "getThreadRecords")
+      .mockImplementation((id, fields, filter) =>
+        records(id, fields, filter).pipe(
+          Effect.flatMap((result) =>
+            id === threadId && fields.some((field) => field === "providerTurns")
+              ? Deferred.succeed(entered, undefined).pipe(
+                  Effect.andThen(Deferred.await(release)),
+                  Effect.as(result),
+                )
+              : Effect.succeed(result),
+          ),
+        ),
+      );
+    yield* Effect.addFinalizer(() => Effect.sync(() => readSpy.mockRestore()));
+    const recovering = yield* Effect.forkChild(guard.recover());
+    yield* Deferred.await(entered);
+    const replacement = RunAttemptId.make(threadId + ":next");
+    const acceptedEvent: Parameters<typeof sink.write>[0]["events"][number] = {
+      id: EventId.make(threadId + ":accepted"),
+      type: "provider-turn.updated",
+      threadId,
+      runId: run.id,
+      occurredAt: now,
+      payload: {
+        id: ProviderTurnId.make(threadId + ":turn"),
+        providerThreadId: run.providerThreadId!,
+        nodeId: run.rootNodeId!,
+        runAttemptId: run.activeAttemptId,
+        nativeTurnRef: null,
+        ordinal: 1,
+        status: "running",
+        startedAt: now,
+        promptAcceptedAt: now,
+        completedAt: null,
+      },
+    };
+    const event: Parameters<typeof sink.write>[0]["events"][number] =
+      change === "acceptance"
+        ? acceptedEvent
+        : {
+            id: EventId.make(threadId + ":changed"),
+            type: "run.updated",
+            threadId,
+            runId: run.id,
+            occurredAt: now,
+            payload:
+              change === "cancel"
+                ? { ...run, status: "cancelled", completedAt: now }
+                : change.startsWith("running")
+                  ? { ...run, status: "running", startedAt: now, providerStartDeadlineAt: now }
+                  : {
+                      ...run,
+                      activeAttemptId: replacement,
+                      providerStartDeadlineAt: DateTime.makeUnsafe(
+                        DateTime.toEpochMillis(now) + PROVIDER_START_TIMEOUT_MS,
+                      ),
+                    },
+          };
+    yield* sink.write({
+      events: [
+        ...(change === "replacement"
+          ? [
+              {
+                id: EventId.make(threadId + ":attempt"),
+                type: "run-attempt.updated" as const,
+                threadId,
+                runId: run.id,
+                occurredAt: now,
+                payload: { ...projection.attempts[0]!, id: replacement, attemptOrdinal: 2 },
+              },
+            ]
+          : []),
+        ...(change === "running accepted before" ? [acceptedEvent] : []),
+        event,
+      ],
+    });
+    if (change === "running accepted before") {
+      yield* guard.handle(acceptedEvent);
+    }
+    yield* guard.handle(event);
+    if (change === "running accepted after") {
+      yield* sink.write({ events: [acceptedEvent] });
+      yield* guard.handle(acceptedEvent);
+    }
+    yield* Deferred.succeed(release, undefined);
+    yield* Fiber.join(recovering);
+    readSpy.mockRestore();
+    const dispatchSpy = vi.spyOn(engine, "dispatch");
+    yield* Effect.addFinalizer(() => Effect.sync(() => dispatchSpy.mockRestore()));
+    yield* guard.check();
+    assert.equal(dispatchSpy.mock.calls.length, change === "running unaccepted" ? 1 : 0);
+    if (change === "running unaccepted") {
+      const expired = yield* engine.getThreadProjection(threadId);
+      assert.equal(expired.runs[0]?.status, "failed");
+      assert.isTrue(
+        expired.turnItems.some(
+          (item) => item.type === "error" && item.failure.code === PROVIDER_START_TIMEOUT_CODE,
+        ),
+      );
+    }
+    if (change === "replacement") {
+      yield* TestClock.adjust(`${PROVIDER_START_TIMEOUT_MS} millis`);
+      yield* guard.check();
+      assert.equal((yield* engine.getThreadProjection(threadId)).runs[0]?.status, "failed");
+    }
+  }).pipe(Effect.provide(Layer.fresh(layerDeadlineTest))),
+);
+
+const createDeadlineThread = Effect.fn("test.createDeadlineThread")(function* (suffix: string) {
+  const engine = yield* Orchestrator.OrchestratorV2;
+  const threadId = ThreadId.make(`start-deadline-${suffix}`);
+  yield* engine.dispatch({
+    type: "thread.create",
+    commandId: CommandId.make(`${threadId}:create`),
+    threadId,
+    createdBy: "user",
+    creationSource: "web",
+    projectId: ProjectId.make(`${threadId}:project`),
+    title: "Start deadline",
+    modelSelection,
+    runtimeMode: "full-access",
+    interactionMode: "default",
+    branch: null,
+    worktreePath: process.cwd(),
+  });
+  for (let i = 0; i < 3; i++) {
+    yield* engine.dispatch({
+      type: "message.dispatch",
+      commandId: CommandId.make(`${threadId}:send:${i}`),
+      threadId,
+      createdBy: "user",
+      creationSource: "web",
+      messageId: MessageId.make(`${threadId}:message:${i}`),
+      text: `Message ${i}`,
+      attachments: [],
+      modelSelection,
+      dispatchMode: { type: i === 0 ? "start_immediately" : "queue_after_active" },
+    });
+  }
+  return { threadId, projection: yield* engine.getThreadProjection(threadId) };
+});
+
+const layerDeadlineBoards = Layer.effect(
+  BoardsDatabase.BoardsDatabase,
+  Effect.gen(function* () {
+    const context = yield* Layer.build(NodeSqliteClient.layer({ filename: ":memory:" }));
+    const sql = Context.get(context, SqlClient.SqlClient);
+    for (const ddl of [...kanbanDDL, ...controlDDL]) yield* sql.unsafe(ddl);
+    yield* ensureKanbanCacheVersions(sql);
+    return { sql, ready: Effect.void, path: ":memory:boards" };
+  }),
+);
+const layerDeadlineTest = layerTestWithContinuation().pipe(
+  Layer.provide(layerDeadlineBoards),
+  Layer.provide(Layer.succeed(RestartPacing.RestartLoad, () => 0)),
+);
+
+it.effect("start deadline serializes promotion against a separate boards writer", () =>
+  Effect.gen(function* () {
+    const engine = yield* Orchestrator.OrchestratorV2;
+    const sink = yield* EventSink.EventSinkV2;
+    const boards = yield* KanbanStore.KanbanStore;
+    const { threadId, projection } = yield* createDeadlineThread("boards-writer");
+    const run = projection.runs[0]!;
+    const now = yield* DateTime.now;
+    const startReset = yield* Deferred.make<void>();
+    const resetAttempted = yield* Deferred.make<void>();
+    const resetDone = yield* Deferred.make<void>();
+    const promoted = yield* Deferred.make<void>();
+    const reset = yield* Effect.forkChild(
+      Deferred.await(startReset).pipe(
+        Effect.andThen(Deferred.succeed(resetAttempted, undefined)),
+        Effect.andThen(
+          boards.putThreadLink({
+            threadId,
+            boardId: KanbanBoardId.make("reset-board"),
+            cardId: null,
+            role: "work",
+            purpose: null,
+            discussionId: null,
+            model: null,
+            paused: null,
+            startedAt: "2026-11-13T06:46:00Z",
+            endedAt: null,
+          }),
+        ),
+        Effect.andThen(Deferred.succeed(resetDone, undefined)),
+      ),
+    );
+    yield* engine.streamDomainEvents.pipe(
+      Stream.runForEach((event) =>
+        event.type === "run.updated" &&
+        event.payload.id === projection.runs[1]!.id &&
+        event.payload.status === "starting"
+          ? Deferred.succeed(promoted, undefined)
+          : Effect.void,
+      ),
+      Effect.forkScoped,
+    );
+    const write = sink.writeWithEffects;
+    const spy = vi.spyOn(sink, "writeWithEffects").mockImplementation((input) =>
+      input.effects.some(
+        (effect) =>
+          effect.request.type === "provider-turn.start" &&
+          effect.request.runId === projection.runs[1]!.id,
+      )
+        ? Effect.gen(function* () {
+            yield* Deferred.succeed(startReset, undefined);
+            yield* Deferred.await(resetAttempted);
+            assert.isFalse(yield* Deferred.isDone(resetDone));
+            const stored = yield* write(input);
+            assert.isFalse(yield* Deferred.isDone(resetDone));
+            return stored;
+          })
+        : write(input),
+    );
+    yield* Effect.addFinalizer(() => Effect.sync(() => spy.mockRestore()));
+    yield* engine.dispatch({
+      type: "run.start-expire",
+      phase: "restart_admission",
+      commandId: CommandId.make(`${threadId}:expire`),
+      threadId,
+      runId: run.id,
+      expectedAttemptId: run.activeAttemptId,
+      deadline: now,
+    });
+    yield* Deferred.await(promoted);
+    yield* Fiber.join(reset);
+    assert.isTrue(yield* Deferred.isDone(resetDone));
+    assert.equal((yield* engine.getThreadProjection(threadId)).runs[1]?.status, "starting");
+  }).pipe(Effect.provide(Layer.fresh(layerDeadlineTest))),
+);
+
+it.effect.each(["timeout", "cancel"])(
+  "start deadline releases the worker and FIFO queue after %s",
+  (outcome) =>
+    Effect.gen(function* () {
+      const engine = yield* Orchestrator.OrchestratorV2;
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const guard = yield* RunStartDeadline.RunStartDeadline;
+      const { threadId, projection } = yield* createDeadlineThread(outcome);
+      const run = projection.runs[0]!;
+      const entered = yield* Deferred.make<void>();
+      const released = yield* Deferred.make<void>();
+      const openSpy = vi
+        .spyOn(sessions, "open")
+        .mockImplementation(() =>
+          Deferred.succeed(entered, undefined).pipe(
+            Effect.andThen(Effect.never),
+            Effect.ensuring(Deferred.succeed(released, undefined)),
+          ),
+        );
+      yield* Effect.gen(function* () {
+        // Time before admission is an effect queue wait, not a provider timeout.
+        yield* TestClock.adjust("20 minutes");
+        yield* guard.check();
+        assert.equal((yield* engine.getThreadProjection(threadId)).runs[0]?.status, "starting");
+        const executing = yield* worker.runThreadOnce!(threadId).pipe(
+          Effect.forkChild({ startImmediately: true }),
+        );
+        yield* Effect.raceFirst(
+          Deferred.await(entered),
+          Fiber.join(executing).pipe(
+            Effect.andThen(Effect.die("Start effect ended before opening the provider")),
+          ),
+        );
+        const admitted = (yield* engine.getThreadProjection(threadId)).runs[0]!;
+        assert.isDefined(admitted.providerStartDeadlineAt);
+        const pacing = yield* RestartPacing.RestartPacing.pipe(
+          Effect.provide(
+            RestartPacing.layer.pipe(
+              Layer.provide(
+                Layer.mergeAll(
+                  ServerSettings.layerTest({ restartPacing: { maxActive: 1, spacingMs: 0 } }),
+                  Layer.succeed(RestartPacing.RestartLoad, () => 0),
+                  Layer.mock(RestartPacingState.RestartPacingState)({
+                    sourceForRun: (threadId, sourceRunId) =>
+                      Effect.succeed({ threadId, sourceRunId }),
+                    describe: () => Effect.succeed({ priority: 0, activityAt: 0 }),
+                    pending: () => Effect.succeed(true),
+                    status: () => Effect.succeed(true),
+                    active: () =>
+                      engine.getThreadProjection(threadId).pipe(
+                        Effect.map((projection) =>
+                          projection.runs.some(
+                            (candidate) =>
+                              candidate.id === run.id &&
+                              ["starting", "running", "preparing"].includes(candidate.status),
+                          ),
+                        ),
+                        Effect.mapError(
+                          (cause) => new RestartPacingState.RestartPacingStateError({ cause }),
+                        ),
+                      ),
+                  }),
+                ),
+              ),
+            ),
+          ),
+        );
+        const waiter = {
+          threadId: ThreadId.make(`${threadId}:waiter`),
+          sourceRunId: RunId.make(`${threadId}:waiter`),
+        };
+        assert.equal(yield* pacing.acquireRun(threadId, run.id), 0);
+        assert.isAbove(yield* pacing.acquire(waiter), 0);
+        yield* guard.handle({
+          id: EventId.make(`${threadId}:admitted`),
+          type: "run.updated",
+          threadId,
+          runId: run.id,
+          occurredAt: yield* DateTime.now,
+          payload: admitted,
+        });
+        const promoted = yield* Deferred.make<void>();
+        yield* engine.streamDomainEvents.pipe(
+          Stream.runForEach((event) =>
+            event.type === "run.updated" &&
+            event.payload.id === projection.runs[1]!.id &&
+            event.payload.status === "starting"
+              ? Deferred.succeed(promoted, undefined)
+              : Effect.void,
+          ),
+          Effect.forkScoped,
+        );
+        yield* Effect.yieldNow;
+        if (outcome === "timeout") {
+          yield* TestClock.adjust(`${PROVIDER_START_TIMEOUT_MS} millis`);
+          yield* guard.check();
+        } else
+          yield* engine.dispatch({
+            type: "run.interrupt",
+            commandId: CommandId.make(`${threadId}:stop`),
+            threadId,
+            runId: run.id,
+          });
+        yield* Deferred.await(released);
+        yield* Fiber.join(executing);
+        yield* Deferred.await(promoted);
+        const after = yield* engine.getThreadProjection(threadId);
+        assert.equal(after.runs[0]?.status, outcome === "timeout" ? "failed" : "interrupted");
+        assert.equal(after.runs[1]?.status, "starting");
+        assert.equal(after.runs[2]?.status, "queued");
+        assert.isNotTrue(after.runs[1]?.queueHeld);
+        yield* TestClock.adjust("10 seconds");
+        assert.equal(yield* pacing.acquire(waiter), 0);
+        if (outcome === "timeout")
+          assert.isTrue(
+            after.turnItems.some(
+              (item) =>
+                item.type === "error" &&
+                item.failure.code === PROVIDER_START_TIMEOUT_CODE &&
+                item.failure.message.includes("waited 10 min"),
+            ),
+          );
+        const effects = yield* outbox.listByCommandId(CommandId.make(`${threadId}:send:0`));
+        assert.isFalse(
+          effects.some(
+            (effect) =>
+              effect.status === "running" && effect.request.type === "provider-turn.start",
+          ),
+        );
+        // The released worker must be usable by the next start, not merely show a terminal run.
+        const sink = yield* EventSink.EventSinkV2;
+        const now = yield* DateTime.now;
+        const nextThread = after.providerThreads.find(
+          (thread) => thread.id === after.runs[1]!.providerThreadId,
+        )!;
+        openSpy.mockReturnValue(
+          Effect.succeed({
+            driver,
+            providerSession: {
+              id: nextThread.providerSessionId!,
+              driver,
+              providerInstanceId: modelSelection.instanceId,
+              status: "ready",
+              cwd: process.cwd(),
+              model: modelSelection.model,
+              capabilities: CodexProviderCapabilitiesV2,
+              createdAt: now,
+              updatedAt: now,
+              lastError: null,
+            },
+            ensureThread: () =>
+              Effect.succeed({
+                ...nextThread,
+                nativeThreadRef: { driver, nativeId: "next-native", strength: "strong" },
+              }),
+            resumeThread: () => Effect.succeed(nextThread),
+            events: Stream.never,
+            startTurn: (input: ProviderAdapter.ProviderAdapterV2TurnInput) =>
+              sink
+                .write({
+                  events: [
+                    {
+                      id: EventId.make(`${threadId}:next-native-start`),
+                      type: "provider-turn.updated",
+                      threadId,
+                      runId: input.runId,
+                      occurredAt: now,
+                      payload: {
+                        id: ProviderTurnId.make(`${threadId}:next-native-turn`),
+                        providerThreadId: input.providerThread.id,
+                        nodeId: input.rootNodeId,
+                        runAttemptId: input.attemptId,
+                        nativeTurnRef: { driver, nativeId: "next-native-turn", strength: "strong" },
+                        ordinal: 1,
+                        status: "running",
+                        promptAcceptedAt: now,
+                        startedAt: now,
+                        completedAt: null,
+                      },
+                    },
+                  ],
+                })
+                .pipe(Effect.asVoid),
+          } as never),
+        );
+        yield* worker.runThreadOnce!(threadId);
+        const started = yield* engine.getThreadProjection(threadId);
+        assert.equal(started.runs[1]?.status, "running");
+        yield* TestClock.adjust(`${PROVIDER_START_TIMEOUT_MS} millis`);
+        yield* guard.check();
+        assert.equal((yield* engine.getThreadProjection(threadId)).runs[1]?.status, "running");
+        assert.isTrue(
+          started.providerTurns.some(
+            (turn) => turn.runAttemptId === started.runs[1]?.activeAttemptId,
+          ),
+        );
+      }).pipe(Effect.ensuring(Effect.sync(() => openSpy.mockRestore())));
+    }).pipe(Effect.provide(Layer.fresh(layerDeadlineTest))),
+);
+
+it.effect.each(["early", "deadline", "commit race", "native output"])(
+  "start deadline preserves native acceptance at %s",
+  (timing) =>
+    Effect.gen(function* () {
+      const engine = yield* Orchestrator.OrchestratorV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const { threadId, projection } = yield* createDeadlineThread(`accept-${timing}`);
+      const run = projection.runs[0]!;
+      const now = yield* DateTime.now;
+      const deadline = DateTime.makeUnsafe(DateTime.toEpochMillis(now) + PROVIDER_START_TIMEOUT_MS);
+      const write = (events: Parameters<typeof sink.write>[0]["events"]) => sink.write({ events });
+      yield* write([
+        {
+          id: EventId.make(`${threadId}:armed`),
+          type: "run.updated",
+          threadId,
+          runId: run.id,
+          occurredAt: now,
+          payload: { ...run, providerStartDeadlineAt: deadline },
+        },
+      ]);
+      yield* TestClock.adjust(
+        `${timing === "early" ? PROVIDER_START_TIMEOUT_MS - 1 : PROVIDER_START_TIMEOUT_MS} millis`,
+      );
+      const acceptance: Parameters<typeof sink.write>[0]["events"][number] = {
+        id: EventId.make(`${threadId}:accepted`),
+        type: "provider-turn.updated",
+        threadId,
+        runId: run.id,
+        occurredAt: yield* DateTime.now,
+        payload: {
+          id: ProviderTurnId.make(`${threadId}:native-turn`),
+          providerThreadId: run.providerThreadId!,
+          nodeId: run.rootNodeId!,
+          runAttemptId: run.activeAttemptId,
+          nativeTurnRef: { driver, nativeId: "accepted", strength: "strong" },
+          ordinal: 1,
+          status: "running",
+          ...(timing === "native output" ? {} : { promptAcceptedAt: yield* DateTime.now }),
+          startedAt: yield* DateTime.now,
+          completedAt: null,
+        },
+      };
+      const originalCommit = sink.commitCommand;
+      const commitSpy = vi
+        .spyOn(sink, "commitCommand")
+        .mockImplementation((input) =>
+          timing === "commit race" && input.commandType === "run.start-expire"
+            ? write([acceptance]).pipe(Effect.andThen(originalCommit(input)))
+            : originalCommit(input),
+        );
+      if (timing !== "commit race") yield* write([acceptance]);
+      if (timing === "native output")
+        yield* write([
+          {
+            id: EventId.make(`${threadId}:native-output`),
+            type: "turn-item.updated",
+            threadId,
+            runId: run.id,
+            occurredAt: yield* DateTime.now,
+            payload: {
+              id: TurnItemId.make(`${threadId}:output`),
+              type: "reasoning",
+              threadId,
+              runId: run.id,
+              nodeId: run.rootNodeId!,
+              providerThreadId: run.providerThreadId!,
+              providerTurnId: acceptance.payload.id,
+              nativeItemRef: { driver, nativeId: "output", strength: "strong" },
+              parentItemId: null,
+              ordinal: 1,
+              status: "running",
+              title: null,
+              startedAt: now,
+              completedAt: null,
+              updatedAt: now,
+              text: "Working",
+              streaming: true,
+            },
+          },
+        ]);
+      if (timing === "early") yield* TestClock.adjust("1 millis");
+      const result = yield* engine
+        .dispatch({
+          type: "run.start-expire",
+          phase: "provider",
+          commandId: CommandId.make(`${threadId}:expire`),
+          threadId,
+          runId: run.id,
+          expectedAttemptId: run.activeAttemptId,
+          deadline,
+        })
+        .pipe(Effect.result, Effect.ensuring(Effect.sync(() => commitSpy.mockRestore())));
+      if (timing === "commit race") assert.equal(result._tag, "Failure");
+      else {
+        assert.equal(result._tag, "Success");
+        if (result._tag === "Success") assert.equal(result.success.storedEvents.length, 0);
+      }
+      assert.equal((yield* engine.getThreadProjection(threadId)).runs[0]?.status, "starting");
+    }).pipe(Effect.provide(Layer.fresh(layerDeadlineTest))),
+);
+
+it.effect("start deadline bounds a never-started run re-driven after a restart", () =>
+  Effect.gen(function* () {
+    const engine = yield* Orchestrator.OrchestratorV2;
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    const recovery = yield* ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService;
+    const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+    const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+    const guard = yield* RunStartDeadline.RunStartDeadline;
+    const { threadId, projection } = yield* createDeadlineThread("restart");
+    const source = projection.runs[0]!;
+    yield* recovery.reconcile("startup");
+    assert.equal((yield* engine.getThreadProjection(threadId)).runs[0]?.status, "cancelled");
+    const wakes = yield* outbox.listRestartContinuations;
+    assert.isTrue(
+      wakes.some(
+        (effect) =>
+          effect.threadId === threadId &&
+          effect.request.type === "provider-runtime.continue" &&
+          effect.request.sourceRunId === source.id,
+      ),
+    );
+    const entered = yield* Deferred.make<void>();
+    const openSpy = vi
+      .spyOn(sessions, "open")
+      .mockImplementation(() =>
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+      );
+    yield* Effect.gen(function* () {
+      const execution = yield* worker.drain().pipe(Effect.forkChild({ startImmediately: true }));
+      yield* Effect.raceFirst(
+        Deferred.await(entered),
+        Fiber.join(execution).pipe(
+          Effect.andThen(Effect.die("Restart effect ended before opening the provider")),
+        ),
+      );
+      const current = (yield* engine.getThreadProjection(threadId)).runs.find(
+        (run) => run.status === "starting",
+      )!;
+      assert.isDefined(current.providerStartDeadlineAt);
+      const failed = yield* Deferred.make<void>();
+      yield* engine.streamDomainEvents.pipe(
+        Stream.runForEach((event) =>
+          event.type === "run.updated" &&
+          event.payload.id === current.id &&
+          event.payload.status === "failed"
+            ? Deferred.succeed(failed, undefined)
+            : Effect.void,
+        ),
+        Effect.forkScoped,
+      );
+      yield* guard.start();
+      yield* TestClock.adjust(`${PROVIDER_START_TIMEOUT_MS} millis`);
+      yield* Deferred.await(failed);
+      yield* Fiber.interrupt(execution);
+      assert.equal(
+        (yield* engine.getThreadProjection(threadId)).runs.find((run) => run.id === current.id)
+          ?.status,
+        "failed",
+      );
+    }).pipe(Effect.ensuring(Effect.sync(() => openSpy.mockRestore())));
+  }).pipe(
+    Effect.provide(
+      Layer.fresh(
+        layerTestWithContinuation(true).pipe(
+          Layer.provide(layerDeadlineBoards),
+          Layer.provide(Layer.succeed(RestartPacing.RestartLoad, () => 0)),
+        ),
+      ),
+    ),
+  ),
+);
+
+it.effect.each(["ordinary", "orphan", "queued source"] as const)(
+  "start deadline visibly expires restart admission without a native admission marker: %s",
+  (ownership) =>
+    Effect.gen(function* () {
+      const engine = yield* Orchestrator.OrchestratorV2;
+      const { threadId, projection } = yield* createDeadlineThread("admission");
+      const boards = yield* KanbanStore.KanbanStore;
+      const orphan = Effect.gen(function* () {
+        yield* boards.putThreadLink({
+          threadId,
+          boardId: KanbanBoardId.make("old-board"),
+          cardId: null,
+          role: "work",
+          purpose: null,
+          discussionId: null,
+          model: null,
+          startedAt: "2026-11-13T06:46:00Z",
+          endedAt: null,
+          paused: null,
+        });
+      }).pipe(Effect.orDie);
+      if (ownership === "orphan") yield* orphan;
+      const run = projection.runs[0]!;
+      const sink = yield* EventSink.EventSinkV2;
+      const now = yield* DateTime.now;
+      if (ownership === "queued source")
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make(`${threadId}:queued-source`),
+              type: "run.updated",
+              threadId,
+              runId: run.id,
+              occurredAt: now,
+              payload: { ...run, status: "queued", queuePosition: 1 },
+            },
+          ],
+        });
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make(`${threadId}:old-queue-deadline`),
+            type: "run.updated",
+            threadId,
+            runId: projection.runs[1]!.id,
+            occurredAt: now,
+            payload: { ...projection.runs[1]!, providerStartDeadlineAt: now },
+          },
+        ],
+      });
+      const deadline = DateTime.makeUnsafe(
+        DateTime.toEpochMillis(yield* DateTime.now) + RestartPacing.RESTART_ADMISSION_TIMEOUT_MS,
+      );
+      yield* TestClock.adjust(`${RestartPacing.RESTART_ADMISSION_TIMEOUT_MS} millis`);
+      const promoted = yield* Deferred.make<void>();
+      yield* engine.streamDomainEvents.pipe(
+        Stream.runForEach((event) =>
+          event.type === "run.updated" &&
+          event.payload.id === projection.runs[1]!.id &&
+          event.payload.status === "starting"
+            ? Deferred.succeed(promoted, undefined)
+            : Effect.void,
+        ),
+        Effect.forkScoped,
+      );
+      yield* Effect.yieldNow;
+      yield* engine.dispatch({
+        type: "run.start-expire",
+        phase: "restart_admission",
+        commandId: CommandId.make(`${threadId}:expire`),
+        threadId,
+        runId: run.id,
+        expectedAttemptId: run.activeAttemptId,
+        deadline,
+      });
+      if (ownership !== "orphan") yield* Deferred.await(promoted);
+      else
+        yield* engine.dispatch({
+          type: "queue.resume",
+          threadId,
+          commandId: CommandId.make(`${threadId}:resume-orphan`),
+        });
+      const after = yield* engine.getThreadProjection(threadId);
+      assert.equal(after.runs[0]?.status, "failed");
+      assert.equal(after.runs[1]?.status, ownership !== "orphan" ? "starting" : "queued");
+      if (ownership !== "orphan") assert.isUndefined(after.runs[1]?.providerStartDeadlineAt);
+      assert.equal(after.runs[2]?.status, "queued");
+      assert.isTrue(
+        after.turnItems.some(
+          (item) =>
+            item.type === "error" &&
+            item.failure.message.includes("restart admission queue") &&
+            item.failure.message.includes("30 min"),
+        ),
+      );
+    }).pipe(Effect.provide(Layer.fresh(layerDeadlineTest))),
+);
+
+it.effect("start deadline renews admission for a new restart attempt", () =>
+  Effect.gen(function* () {
+    const engine = yield* Orchestrator.OrchestratorV2;
+    const sink = yield* EventSink.EventSinkV2;
+    const { threadId, projection } = yield* createDeadlineThread("new-attempt");
+    const run = projection.runs[0]!;
+    const now = yield* DateTime.now;
+    const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+    const getSpy = vi.spyOn(sessions, "get").mockReturnValue(
+      Effect.succeed(
+        Option.some({
+          providerSession: {
+            id: projection.providerThreads[0]!.providerSessionId!,
+            capabilities: CodexProviderCapabilitiesV2,
+          },
+        } as ProviderAdapter.ProviderAdapterV2SessionRuntime),
+      ),
+    );
+    yield* Effect.addFinalizer(() => Effect.sync(() => getSpy.mockRestore()));
+    yield* sink.write({
+      events: [
+        {
+          id: EventId.make(`${threadId}:armed`),
+          type: "run.updated",
+          threadId,
+          runId: run.id,
+          occurredAt: now,
+          payload: { ...run, status: "running", startedAt: now, providerStartDeadlineAt: now },
+        },
+        {
+          id: EventId.make(`${threadId}:registered`),
+          type: "provider-turn.updated",
+          threadId,
+          runId: run.id,
+          occurredAt: now,
+          payload: {
+            id: ProviderTurnId.make(`${threadId}:turn`),
+            providerThreadId: run.providerThreadId!,
+            nodeId: run.rootNodeId!,
+            runAttemptId: run.activeAttemptId,
+            ordinal: 1,
+            status: "running",
+            nativeTurnRef: { driver, nativeId: "local", strength: "strong" },
+            startedAt: now,
+            completedAt: null,
+          },
+        },
+      ],
+    });
+    yield* engine.dispatch({
+      type: "message.dispatch",
+      commandId: CommandId.make(`${threadId}:restart`),
+      threadId,
+      messageId: MessageId.make(`${threadId}:restart-message`),
+      createdBy: "user",
+      creationSource: "web",
+      text: "Restart with this input",
+      attachments: [],
+      modelSelection,
+      dispatchMode: { type: "restart_active", targetRunId: run.id },
+    });
+    const after = yield* engine.getThreadProjection(threadId);
+    const restarted = after.runs.find((candidate) => candidate.id === run.id)!;
+    assert.notEqual(restarted.activeAttemptId, run.activeAttemptId);
+    assert.equal(restarted.status, "starting");
+    assert.isUndefined(restarted.providerStartDeadlineAt);
+    yield* engine.dispatch({
+      type: "run.start-expire",
+      phase: "restart_admission",
+      threadId,
+      commandId: CommandId.make(`${threadId}:new-attempt-admission-expire`),
+      runId: run.id,
+      expectedAttemptId: restarted.activeAttemptId,
+      deadline: now,
+    });
+    assert.equal(
+      (yield* engine.getThreadProjection(threadId)).runs.find(
+        (candidate) => candidate.id === run.id,
+      )?.status,
+      "starting",
+    );
+  }).pipe(Effect.provide(Layer.fresh(layerDeadlineTest))),
+);
+
+it.effect.each([
+  { status: "pending", strength: null },
+  { status: "running", strength: null },
+  { status: "running", strength: "weak" },
+  { status: "running", strength: "strong" },
+  { status: "running", strength: "strong", bootstrap: true },
+  { status: "running", strength: "strong", replayedPi: true },
+  { status: "running", strength: "strong", replayedMuse: true },
+] as const)(
+  "start deadline expires local registration $status/$strength without native acceptance",
+  (row) =>
+    Effect.gen(function* () {
+      const { status, strength } = row;
+      const engine = yield* Orchestrator.OrchestratorV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const guard = yield* RunStartDeadline.RunStartDeadline;
+      const { threadId, projection } = yield* createDeadlineThread(
+        `registration-${status}-${strength}-${"bootstrap" in row}-${"replayedPi" in row}-${"replayedMuse" in row}`,
+      );
+      const run = projection.runs[0]!;
+      const now = yield* DateTime.now;
+      const deadline = DateTime.makeUnsafe(DateTime.toEpochMillis(now) + PROVIDER_START_TIMEOUT_MS);
+      const events: Array<Parameters<typeof sink.write>[0]["events"][number]> = [
+        {
+          id: EventId.make(`${threadId}:admitted`),
+          type: "run.updated",
+          threadId,
+          runId: run.id,
+          occurredAt: now,
+          payload: { ...run, providerStartDeadlineAt: deadline },
+        },
+        {
+          id: EventId.make(`${threadId}:armed`),
+          type: "run.updated",
+          threadId,
+          runId: run.id,
+          occurredAt: now,
+          payload: { ...run, status: "running", providerStartDeadlineAt: deadline },
+        },
+        {
+          id: EventId.make(`${threadId}:registered`),
+          type: "provider-turn.updated",
+          threadId,
+          runId: run.id,
+          occurredAt: now,
+          payload: {
+            id: ProviderTurnId.make(`${threadId}:turn`),
+            providerThreadId: run.providerThreadId!,
+            nodeId: run.rootNodeId!,
+            runAttemptId: run.activeAttemptId,
+            ordinal: 1,
+            status,
+            nativeTurnRef: strength === null ? null : { driver, nativeId: "local", strength },
+            startedAt: now,
+            completedAt: null,
+          },
+        },
+      ];
+      if ("replayedPi" in row || "replayedMuse" in row) {
+        events.push({
+          id: EventId.make(`${threadId}:prior-wake-output`),
+          type: "turn-item.updated",
+          threadId,
+          runId: run.id,
+          occurredAt: now,
+          payload: {
+            id: TurnItemId.make(`${threadId}:reasoning`),
+            type: "reasoning",
+            threadId,
+            runId: run.id,
+            nodeId: run.rootNodeId,
+            providerThreadId: run.providerThreadId,
+            providerTurnId: ProviderTurnId.make(`${threadId}:turn`),
+            nativeItemRef: {
+              driver: ProviderDriverKind.make("replayedPi" in row ? "pi" : "muse"),
+              nativeId: "old-wake",
+              strength: "strong",
+            },
+            parentItemId: null,
+            ordinal: 1,
+            status: "running",
+            title: null,
+            startedAt: now,
+            completedAt: null,
+            updatedAt: now,
+            text: "Previous wake",
+            streaming: true,
+          },
+        });
+      }
+      yield* sink.write({ events });
+      const promoted = yield* Deferred.make<void>();
+      yield* engine.streamDomainEvents.pipe(
+        Stream.runForEach((event) =>
+          event.type === "run.updated" &&
+          event.payload.id === projection.runs[1]!.id &&
+          event.payload.status === "starting"
+            ? Deferred.succeed(promoted, undefined)
+            : Effect.void,
+        ),
+        Effect.forkScoped,
+      );
+      if ("bootstrap" in row) {
+        const failed = yield* Deferred.make<void>();
+        yield* engine.streamDomainEvents.pipe(
+          Stream.runForEach((event) =>
+            event.type === "run.updated" &&
+            event.payload.id === run.id &&
+            event.payload.status === "failed"
+              ? Deferred.succeed(failed, undefined)
+              : Effect.void,
+          ),
+          Effect.forkScoped,
+        );
+        yield* guard.start();
+        yield* TestClock.adjust(`${PROVIDER_START_TIMEOUT_MS} millis`);
+        yield* Deferred.await(failed);
+      } else {
+        for (const event of events) yield* guard.handle(event);
+        yield* TestClock.adjust(`${PROVIDER_START_TIMEOUT_MS} millis`);
+        yield* guard.check();
+      }
+      yield* Deferred.await(promoted);
+      const after = yield* engine.getThreadProjection(threadId);
+      assert.equal(after.runs[0]?.status, "failed");
+      assert.equal(after.providerTurns[0]?.status, "failed");
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const stop = Option.getOrThrow(
+        yield* outbox.claimNext({
+          workerId: "expired-local-turn",
+          threadId,
+          leaseDurationMs: 30_000,
+          onlyEffectTypes: ["provider-turn.interrupt"],
+        }),
+      );
+      assert.equal(stop.request.type, "provider-turn.interrupt");
+      if (stop.request.type === "provider-turn.interrupt") {
+        assert.isTrue(stop.request.startTimeout);
+        assert.equal(stop.request.providerTurnId, after.providerTurns[0]!.id);
+      }
+      assert.equal(after.runs[1]?.status, "starting");
+    }).pipe(Effect.provide(Layer.fresh(layerDeadlineTest))),
+);
+
+it.effect(
+  "start deadline keeps a replacement attempt armed while an old expiry dispatch waits",
+  () =>
+    Effect.gen(function* () {
+      const engine = yield* Orchestrator.OrchestratorV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const guard = yield* RunStartDeadline.RunStartDeadline;
+      const { threadId, projection } = yield* createDeadlineThread("replacement-race");
+      const run = projection.runs[0]!;
+      const now = yield* DateTime.now;
+      const event: Parameters<typeof sink.write>[0]["events"][number] = {
+        id: EventId.make(`${threadId}:armed`),
+        type: "run.updated",
+        threadId,
+        runId: run.id,
+        occurredAt: now,
+        payload: { ...run, providerStartDeadlineAt: now },
+      };
+      yield* sink.write({ events: [event] });
+      yield* guard.handle(event);
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const dispatch = engine.dispatch;
+      const spy = vi
+        .spyOn(engine, "dispatch")
+        .mockImplementation((command) =>
+          command.type === "run.start-expire"
+            ? Deferred.succeed(entered, undefined).pipe(
+                Effect.andThen(Deferred.await(release)),
+                Effect.andThen(dispatch(command)),
+              )
+            : dispatch(command),
+        );
+      yield* Effect.gen(function* () {
+        const oldCheck = yield* Effect.forkChild(guard.check());
+        yield* Deferred.await(entered);
+        const replacement: typeof event = {
+          ...event,
+          id: EventId.make(`${threadId}:replacement`),
+          payload: {
+            ...run,
+            activeAttemptId: RunAttemptId.make(`${threadId}:new-attempt`),
+            providerStartDeadlineAt: DateTime.makeUnsafe(
+              DateTime.toEpochMillis(now) + PROVIDER_START_TIMEOUT_MS,
+            ),
+          },
+        };
+        const attempt = projection.attempts[0]!;
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make(`${threadId}:attempt`),
+              type: "run-attempt.updated",
+              threadId,
+              runId: run.id,
+              occurredAt: now,
+              payload: { ...attempt, id: replacement.payload.activeAttemptId!, attemptOrdinal: 2 },
+            },
+            replacement,
+          ],
+        });
+        yield* guard.handle(replacement);
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(oldCheck);
+        spy.mockRestore();
+        yield* TestClock.adjust(`${PROVIDER_START_TIMEOUT_MS} millis`);
+        yield* guard.check();
+        assert.equal((yield* engine.getThreadProjection(threadId)).runs[0]?.status, "failed");
+      }).pipe(Effect.ensuring(Effect.sync(() => spy.mockRestore())));
+    }).pipe(Effect.provide(Layer.fresh(layerDeadlineTest))),
+);
+
+it.effect.each(["rejected", "unanswered"] as const)(
+  "start deadline releases native cleanup and FIFO when cancellation is %s",
+  (cleanup) =>
+    Effect.gen(function* () {
+      const engine = yield* Orchestrator.OrchestratorV2;
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const guard = yield* RunStartDeadline.RunStartDeadline;
+      const { threadId, projection } = yield* createDeadlineThread(`cleanup-${cleanup}`);
+      const run = projection.runs[0]!;
+      const owner = projection.providerThreads.find(
+        (thread) => thread.id === run.providerThreadId,
+      )!;
+      const started = yield* Deferred.make<void>();
+      const stopping = yield* Deferred.make<void>();
+      const promoted = yield* Deferred.make<void>();
+      const cleanupInterrupted = yield* Deferred.make<void>();
+      const now = yield* DateTime.now;
+      const localTurnId = ProviderTurnId.make(`${threadId}:local-turn`);
+      const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
+        instanceId: modelSelection.instanceId,
+        driver,
+        providerSessionId: owner.providerSessionId!,
+        providerSession: {
+          id: owner.providerSessionId!,
+          driver,
+          providerInstanceId: modelSelection.instanceId,
+          status: "ready",
+          cwd: process.cwd(),
+          model: modelSelection.model,
+          capabilities: CodexProviderCapabilitiesV2,
+          createdAt: now,
+          updatedAt: now,
+          lastError: null,
+        },
+        ensureThread: ({ existingProviderThread }) =>
+          Effect.succeed({
+            ...(existingProviderThread ?? owner),
+            nativeThreadRef: { driver, nativeId: "cleanup-native", strength: "strong" },
+          }),
+        resumeThread: ({ providerThread }) => Effect.succeed(providerThread),
+        events: Stream.never,
+        startTurn: (input) =>
+          sink
+            .write({
+              events: [
+                {
+                  id: EventId.make(`${threadId}:registration:${input.runId}`),
+                  type: "provider-turn.updated",
+                  threadId,
+                  runId: input.runId,
+                  occurredAt: now,
+                  payload: {
+                    id:
+                      input.runId === run.id
+                        ? localTurnId
+                        : ProviderTurnId.make(`${threadId}:next-turn`),
+                    providerThreadId: input.providerThread.id,
+                    nodeId: input.rootNodeId,
+                    runAttemptId: input.attemptId,
+                    nativeTurnRef: {
+                      driver,
+                      nativeId: `${input.runId}:native-turn`,
+                      strength: "strong",
+                    },
+                    ordinal: input.providerTurnOrdinal,
+                    status: "running",
+                    startedAt: now,
+                    completedAt: null,
+                    ...(input.runId === run.id ? {} : { promptAcceptedAt: now }),
+                  },
+                },
+              ],
+            })
+            .pipe(
+              Effect.orDie,
+              Effect.andThen(
+                input.runId === run.id
+                  ? Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never))
+                  : Effect.void,
+              ),
+            ),
+        interruptStartingRun: (input) =>
+          Deferred.succeed(stopping, undefined).pipe(
+            Effect.andThen(
+              Effect.sync(() => {
+                assert.equal(input.runId, run.id);
+                assert.equal(input.attemptId, run.activeAttemptId);
+                assert.equal(input.stopBackgroundWork, false);
+              }),
+            ),
+            Effect.andThen(
+              cleanup === "unanswered"
+                ? Effect.never
+                : Effect.die("native cancellation unconfirmed"),
+            ),
+            Effect.onInterrupt(() => Deferred.succeed(cleanupInterrupted, undefined)),
+          ),
+        interruptTurn: () => Effect.void,
+        steerTurn: () => Effect.die("unused steer"),
+        respondToRuntimeRequest: () => Effect.die("unused response"),
+        readThreadSnapshot: () => Effect.die("unused snapshot"),
+        rollbackThread: () => Effect.die("unused rollback"),
+        forkThread: () => Effect.die("unused fork"),
+      };
+      const spy = vi.spyOn(sessions, "open").mockReturnValue(Effect.succeed(runtime));
+      yield* Effect.gen(function* () {
+        yield* engine.streamDomainEvents.pipe(
+          Stream.runForEach((event) =>
+            event.type === "run.updated" &&
+            event.payload.id === projection.runs[1]!.id &&
+            event.payload.status === "starting"
+              ? Deferred.succeed(promoted, undefined)
+              : Effect.void,
+          ),
+          Effect.forkScoped,
+        );
+        yield* Effect.yieldNow;
+        const executing = yield* worker.runThreadOnce!(threadId).pipe(
+          Effect.forkChild({ startImmediately: true }),
+        );
+        yield* Effect.raceFirst(
+          Deferred.await(started),
+          Fiber.join(executing).pipe(
+            Effect.andThen(Effect.die("worker ended before native submission")),
+          ),
+        );
+        yield* guard.recover();
+        yield* TestClock.adjust(PROVIDER_START_TIMEOUT_MS);
+        yield* guard.check();
+        yield* Deferred.await(stopping);
+        yield* Deferred.await(promoted);
+        yield* TestClock.adjust(PROVIDER_START_CLEANUP_TIMEOUT_MS);
+        yield* Fiber.join(executing);
+        if (cleanup === "unanswered") assert.isTrue(yield* Deferred.isDone(cleanupInterrupted));
+        const after = yield* engine.getThreadProjection(threadId);
+        assert.equal(after.runs[0]?.status, "failed");
+        assert.equal(after.runs[1]?.status, "starting");
+        assert.equal(after.runs[2]?.status, "queued");
+        const effects = yield* outbox.listByCommandId(
+          CommandId.make(
+            `run-start-expire:${run.id}:${run.activeAttemptId}:${DateTime.toEpochMillis(after.runs[0]!.providerStartDeadlineAt!)}`,
+          ),
+        );
+        // The durable cleanup target survives the cancelled start worker.
+        assert.isTrue(
+          effects.some(
+            (effect) =>
+              effect.status === "pending" &&
+              effect.request.type === "provider-turn.interrupt" &&
+              effect.request.startTimeout === true &&
+              effect.request.providerTurnId === localTurnId,
+          ),
+        );
+        assert.isTrue(yield* worker.runControlOnce);
+        assert.isTrue(yield* worker.runThreadOnce!(threadId));
+        const successor = (yield* engine.getThreadProjection(threadId)).runs[1]!;
+        assert.equal(successor.status, "running");
+        yield* TestClock.adjust(PROVIDER_START_TIMEOUT_MS);
+        yield* guard.check();
+        assert.equal((yield* engine.getThreadProjection(threadId)).runs[1]?.status, "running");
+      }).pipe(Effect.ensuring(Effect.sync(() => spy.mockRestore())));
+    }).pipe(Effect.provide(Layer.fresh(layerDeadlineTest))),
+);
+
+it.effect.each(["live", "bootstrap", "workspace"] as const)(
+  "start deadline bounds compound restart cleanup, scenario=%s",
+  (scenario) =>
+    Effect.gen(function* () {
+      const engine = yield* Orchestrator.OrchestratorV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      const guard = yield* RunStartDeadline.RunStartDeadline;
+      const cleanupCompleted = yield* Deferred.make<void>();
+      const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const openSpy = vi.spyOn(sessions, "open");
+      yield* Effect.addFinalizer(() => Effect.sync(() => openSpy.mockRestore()));
+      const { threadId, projection } = yield* createDeadlineThread("r10-restart-unbounded");
+      const run = projection.runs[0]!;
+      const owner = projection.providerThreads[0]!;
+      const now = yield* DateTime.now;
+      const entered = yield* Deferred.make<void>();
+      const runtime = {
+        providerSession: {
+          id: owner.providerSessionId!,
+          capabilities: CodexProviderCapabilitiesV2,
+          cwd: process.cwd(),
+        },
+        interruptTurn: () =>
+          scenario !== "workspace"
+            ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never))
+            : engine.getThreadRecords(threadId, ["providerTurns"]).pipe(
+                Effect.flatMap(({ providerTurns }) =>
+                  sink.write({
+                    events: [
+                      {
+                        id: EventId.make(threadId + ":old-native-stopped"),
+                        type: "provider-turn.updated",
+                        threadId,
+                        runId: run.id,
+                        occurredAt: now,
+                        payload: { ...providerTurns[0]!, status: "interrupted", completedAt: now },
+                      },
+                    ],
+                  }),
+                ),
+                Effect.asVoid,
+              ),
+      } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime;
+      const getSpy = vi.spyOn(sessions, "get").mockReturnValue(Effect.succeedSome(runtime));
+      yield* Effect.addFinalizer(() => Effect.sync(() => getSpy.mockRestore()));
+      const initialStart = Option.getOrThrow(
+        yield* outbox.claimNext({
+          workerId: "r10-initial-start",
+          threadId,
+          leaseDurationMs: 30000,
+          onlyEffectTypes: ["provider-turn.start"],
+        }),
+      );
+      yield* outbox.succeed({ effectId: initialStart.id, workerId: "r10-initial-start" });
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make(threadId + ":running"),
+            type: "run.updated",
+            threadId,
+            runId: run.id,
+            occurredAt: now,
+            payload: { ...run, status: "running", startedAt: now, providerStartDeadlineAt: now },
+          },
+          {
+            id: EventId.make(threadId + ":accepted"),
+            type: "provider-turn.updated",
+            threadId,
+            runId: run.id,
+            occurredAt: now,
+            payload: {
+              id: ProviderTurnId.make(threadId + ":native-turn"),
+              providerThreadId: owner.id,
+              nodeId: run.rootNodeId!,
+              runAttemptId: run.activeAttemptId,
+              ordinal: 1,
+              status: "running",
+              nativeTurnRef: { driver, nativeId: "r10-native", strength: "strong" },
+              startedAt: now,
+              promptAcceptedAt: now,
+              completedAt: null,
+            },
+          },
+        ],
+      });
+      yield* engine.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make(threadId + ":restart"),
+        threadId,
+        messageId: MessageId.make(threadId + ":restart-message"),
+        createdBy: "user",
+        creationSource: "web",
+        text: "Restart with new input",
+        attachments: [],
+        modelSelection,
+        dispatchMode: { type: "restart_active", targetRunId: run.id },
+      });
+      const promoted = yield* Deferred.make<void>();
+      yield* engine.streamDomainEvents.pipe(
+        Stream.runForEach((event) =>
+          event.type === "run.updated" &&
+          event.payload.id === run.id &&
+          event.payload.providerRestartCleanup?.completed === true
+            ? Deferred.succeed(cleanupCompleted, undefined)
+            : event.type === "run.updated" &&
+                event.payload.id === projection.runs[1]!.id &&
+                event.payload.status === "starting"
+              ? Deferred.succeed(promoted, undefined)
+              : Effect.void,
+        ),
+        Effect.forkScoped,
+      );
+      yield* Effect.yieldNow;
+      if (scenario === "workspace") {
+        const leased = yield* Deferred.make<void>();
+        yield* withWorkspaceLease(
+          process.cwd(),
+          Deferred.succeed(leased, undefined).pipe(Effect.andThen(Effect.never)),
+        ).pipe(Effect.forkScoped);
+        yield* Deferred.await(leased);
+      }
+      const execution = yield* worker.drain(1).pipe(Effect.forkScoped);
+      yield* Effect.raceFirst(
+        Deferred.await(scenario === "workspace" ? cleanupCompleted : entered),
+        Fiber.join(execution).pipe(
+          Effect.andThen(Effect.die("worker ended before restart interrupt")),
+        ),
+      );
+      if (scenario === "workspace") {
+        yield* guard.recover();
+        yield* TestClock.adjust("40 minutes");
+        yield* guard.check();
+        const before = (yield* engine.getThreadProjection(threadId)).runs.find(
+          (candidate) => candidate.id === run.id,
+        )!;
+        yield* engine.dispatch({
+          type: "run.start-expire",
+          phase: "restart_cleanup",
+          commandId: CommandId.make(threadId + ":stale-cleanup-expiry"),
+          threadId,
+          runId: run.id,
+          expectedAttemptId: before.activeAttemptId,
+          deadline: DateTime.makeUnsafe(
+            DateTime.toEpochMillis(now) + PROVIDER_START_CLEANUP_TIMEOUT_MS,
+          ),
+        });
+        const pending = (yield* engine.getThreadProjection(threadId)).runs.find(
+          (candidate) => candidate.id === run.id,
+        )!;
+        assert.equal(pending.status, "starting");
+        assert.equal(pending.providerRestartCleanup?.completed, true);
+        assert.isUndefined(pending.providerStartDeadlineAt);
+        assert.equal(openSpy.mock.calls.length, 0);
+        yield* Fiber.interrupt(execution);
+        return;
+      }
+      if (scenario === "bootstrap") yield* guard.recover();
+      else {
+        const admitted = (yield* engine.getThreadProjection(threadId)).runs.find(
+          (candidate) => candidate.id === run.id,
+        )!;
+        yield* guard.handle({
+          id: EventId.make(threadId + ":admitted-watch"),
+          type: "run.updated",
+          threadId,
+          runId: run.id,
+          occurredAt: yield* DateTime.now,
+          payload: admitted,
+        });
+      }
+      yield* TestClock.adjust(PROVIDER_START_CLEANUP_TIMEOUT_MS);
+      yield* guard.check();
+      yield* Fiber.join(execution);
+      yield* Deferred.await(promoted);
+      const after = yield* engine.getThreadProjection(threadId);
+      const restarted = after.runs.find((x) => x.id === run.id)!;
+      assert.isTrue(
+        after.turnItems.some(
+          (item) =>
+            item.type === "error" && item.failure.message.includes("The replacement was not sent"),
+        ),
+      );
+      assert.equal(openSpy.mock.calls.length, 0);
+      const effects = yield* outbox.listByCommandId(
+        CommandId.make(
+          `run-start-expire:${run.id}:${restarted.activeAttemptId}:${DateTime.toEpochMillis(restarted.providerStartDeadlineAt!)}`,
+        ),
+      );
+      assert.isTrue(
+        effects.some(
+          (effect) =>
+            effect.request.type === "provider-turn.interrupt" &&
+            effect.request.startTimeout === true &&
+            effect.request.providerTurnId === ProviderTurnId.make(threadId + ":native-turn") &&
+            effect.request.providerSessionId === owner.providerSessionId,
+        ),
+      );
+      const cleanupTarget = restarted.providerRestartCleanup!;
+      assert.equal(cleanupTarget.providerTurnId, ProviderTurnId.make(threadId + ":native-turn"));
+      assert.equal(cleanupTarget.providerSessionId, owner.providerSessionId);
+
+      assert.equal(after.runs[1]?.status, "starting");
+      assert.equal(after.runs[2]?.status, "queued");
+      assert.equal(
+        restarted.status,
+        "failed",
+        "replacement start must be bounded even if prior native interrupt never answers",
+      );
+    }).pipe(Effect.provide(Layer.fresh(layerDeadlineTest))),
+);
+
+it.effect("start deadline bootstrap replays admission committed before live attachment", () =>
+  Effect.gen(function* () {
+    const engine = yield* Orchestrator.OrchestratorV2;
+    const sink = yield* EventSink.EventSinkV2;
+    const guard = yield* RunStartDeadline.RunStartDeadline;
+    const { threadId, projection } = yield* createDeadlineThread("cursor-gap");
+    const run = projection.runs[0]!;
+    const attaching = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const cursorRead = yield* Deferred.make<void>();
+    const recoveryRead = yield* Deferred.make<void>();
+    const barrierSeen = yield* Deferred.make<void>();
+    const barrierId = EventId.make(`${threadId}:attachment-barrier`);
+    const originalDomainStream = engine.streamDomainEvents;
+    Object.defineProperty(engine, "streamDomainEvents", {
+      configurable: true,
+      value: Stream.unwrap(
+        Deferred.succeed(attaching, undefined).pipe(
+          Effect.andThen(Deferred.await(release)),
+          Effect.as(originalDomainStream),
+        ),
+      ),
+    });
+    const originalStream = sink.stream;
+    const streamSpy = vi
+      .spyOn(sink, "stream")
+      .mockImplementation((input) =>
+        Stream.unwrap(
+          Deferred.succeed(attaching, undefined).pipe(
+            Effect.andThen(Deferred.succeed(cursorRead, undefined)),
+            Effect.andThen(Deferred.await(release)),
+            Effect.as(originalStream(input)),
+          ),
+        ).pipe(
+          Stream.tap((stored) =>
+            stored.event.id === barrierId ? Deferred.succeed(barrierSeen, undefined) : Effect.void,
+          ),
+        ),
+      );
+    const originalRead = engine.getThreadRecords;
+    const readSpy = vi
+      .spyOn(engine, "getThreadRecords")
+      .mockImplementation((id, fields, filter) =>
+        originalRead(id, fields, filter).pipe(
+          Effect.tap((records) =>
+            id === threadId &&
+            fields.includes("runs") &&
+            records.runs?.find((candidate) => candidate.id === run.id)?.providerStartDeadlineAt ===
+              undefined
+              ? Deferred.succeed(recoveryRead, undefined)
+              : Effect.void,
+          ),
+        ),
+      );
+    yield* Effect.gen(function* () {
+      yield* guard.start();
+      yield* Deferred.await(attaching);
+      yield* Deferred.await(recoveryRead);
+      const now = yield* DateTime.now;
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make(`${threadId}:admitted-before-attachment`),
+            type: "run.updated",
+            threadId,
+            runId: run.id,
+            occurredAt: now,
+            payload: {
+              ...run,
+              providerStartDeadlineAt: DateTime.makeUnsafe(
+                DateTime.toEpochMillis(now) + PROVIDER_START_TIMEOUT_MS,
+              ),
+            },
+          },
+        ],
+      });
+      yield* Deferred.succeed(release, undefined);
+      yield* Deferred.await(cursorRead);
+      // This later event proves replay/live delivery has passed the admission.
+      yield* sink.write({
+        events: [
+          {
+            id: barrierId,
+            type: "run.updated",
+            threadId,
+            runId: projection.runs[2]!.id,
+            occurredAt: now,
+            payload: projection.runs[2]!,
+          },
+        ],
+      });
+      yield* Deferred.await(barrierSeen);
+      yield* TestClock.adjust(PROVIDER_START_TIMEOUT_MS);
+      yield* guard.check();
+      assert.equal(
+        (yield* engine.getThreadProjection(threadId)).runs[0]?.status,
+        "failed",
+        "admission between recovery and live attachment must remain bounded",
+      );
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          Object.defineProperty(engine, "streamDomainEvents", {
+            configurable: true,
+            value: originalDomainStream,
+          });
+          streamSpy.mockRestore();
+          readSpy.mockRestore();
+        }),
+      ),
+    );
+  }).pipe(Effect.provide(Layer.fresh(layerDeadlineTest))),
 );
 
 it.effect.each([

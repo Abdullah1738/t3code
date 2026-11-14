@@ -784,6 +784,75 @@ it.effect("a failed post-dispatch read cannot leave an in-flight reservation for
   }).pipe(Effect.provide(h.layer));
 });
 
+it.effect.each(["active capacity", "load"])(
+  "bounds a restart admission blocked by %s",
+  (holder) => {
+    const h = harness({ maxActive: 1, spacingMs: 0 });
+    const first = source(1);
+    const waiter = source(2);
+    h.runSources.set(first.sourceRunId, first);
+    h.runSources.set(waiter.sourceRunId, waiter);
+    h.running.add(first.sourceRunId);
+    return Effect.gen(function* () {
+      const pacing = yield* RestartPacing.RestartPacing;
+      assert.equal(yield* pacing.acquireRun(first.threadId, first.sourceRunId), 0);
+      if (holder === "load") {
+        h.running.clear();
+        h.setLoad(2);
+        yield* TestClock.adjust("10 seconds");
+      }
+      assert.isAbove(yield* pacing.acquireRun(waiter.threadId, waiter.sourceRunId), 0);
+      yield* TestClock.adjust(`${RestartPacing.RESTART_ADMISSION_TIMEOUT_MS} millis`);
+      const failure = yield* pacing
+        .acquireRun(waiter.threadId, waiter.sourceRunId)
+        .pipe(Effect.flip);
+      assert.instanceOf(failure, RestartPacing.RestartAdmissionTimeoutError);
+      assert.equal(h.positions.at(-1)?.position, null);
+      // A caller-requested fresh resume without a restart marker cannot inherit the retired registration.
+      h.runSources.delete(waiter.sourceRunId);
+      assert.equal(yield* pacing.acquireRun(waiter.threadId, waiter.sourceRunId), 0);
+    }).pipe(Effect.provide(h.layer));
+  },
+);
+
+it.effect(
+  "an expiry commit retry keeps its deadline but a new resume gets a fresh allowance",
+  () => {
+    const h = harness({ maxActive: 1, spacingMs: 0 });
+    const first = source(1);
+    const waiter = source(2);
+    h.running.add(first.sourceRunId);
+    h.runSources.set(first.sourceRunId, first);
+    h.runSources.set(waiter.sourceRunId, waiter);
+    return Effect.gen(function* () {
+      const pacing = yield* RestartPacing.RestartPacing;
+      yield* pacing.acquireRun(first.threadId, first.sourceRunId, "effect:first");
+      assert.isAbove(
+        yield* pacing.acquireRun(waiter.threadId, waiter.sourceRunId, "effect:waiter"),
+        0,
+      );
+      yield* TestClock.adjust(`${RestartPacing.RESTART_ADMISSION_TIMEOUT_MS} millis`);
+      // Main may recover the old slot; keep load admission closed for the fresh allowance.
+      h.setLoad(2);
+      assert.instanceOf(
+        yield* pacing
+          .acquireRun(waiter.threadId, waiter.sourceRunId, "effect:waiter")
+          .pipe(Effect.flip),
+        RestartPacing.RestartAdmissionTimeoutError,
+      );
+      assert.instanceOf(
+        yield* pacing
+          .acquireRun(waiter.threadId, waiter.sourceRunId, "effect:waiter")
+          .pipe(Effect.flip),
+        RestartPacing.RestartAdmissionTimeoutError,
+      );
+      assert.isAbove(
+        yield* pacing.acquireRun(waiter.threadId, waiter.sourceRunId, "effect:new-resume"),
+        0,
+      );
+    }).pipe(Effect.provide(h.layer));
+  },
+);
 it.effect("reclaims a lost dispatch settlement after the two minute grace", () => {
   const h = harness({ maxActive: 1, spacingMs: 0 });
   return Effect.gen(function* () {
@@ -1024,5 +1093,64 @@ it.effect.each(["new-admission", "transfer"] as const)(
     }).pipe(
       Effect.provide(Layer.merge(h.layer, Logger.layer([logger], { mergeWithExisting: false }))),
     );
+  },
+);
+
+it.effect.each([
+  "continuation",
+  "provider-start",
+  "refreshed-before-finalizer",
+  "expired-reservation",
+] as const)("admitted preparation does not spend the next admission deadline: %s", (exit) => {
+  const h = harness({ maxActive: 1, spacingMs: 0 });
+  h.setLoad(2);
+  const first = source(1);
+  h.runSources.set(first.sourceRunId, first);
+  return Effect.gen(function* () {
+    const pacing = yield* RestartPacing.RestartPacing;
+    const providerStart = exit === "provider-start" || exit === "refreshed-before-finalizer";
+    const acquire = providerStart
+      ? pacing.acquireRun(first.threadId, first.sourceRunId, "start:retry")
+      : pacing.acquire(first);
+    assert.isAbove(yield* acquire, 0);
+    yield* TestClock.adjust("20 minutes");
+    assert.equal(yield* acquire, 0);
+    // Workspace/preparation and the retry backoff are outside the waiting budget.
+    yield* TestClock.adjust("31 minutes");
+    if (exit === "refreshed-before-finalizer" || exit === "expired-reservation") {
+      assert.isAbove(yield* pacing.acquire(source(2)), 0);
+      h.cancelled.add(source(2).sourceRunId);
+    }
+    if (providerStart)
+      yield* pacing.releaseRun(first.threadId, first.sourceRunId, "start:retry", true);
+    else if (exit === "continuation") yield* pacing.release(first);
+    yield* TestClock.adjust("31 minutes");
+    const retried = yield* acquire.pipe(Effect.result);
+    assert.equal(retried._tag, "Success", "admitted time must not expire the new admission wait");
+    if (retried._tag === "Success")
+      assert.equal(retried.success, 0, "the retry keeps its spent load credit");
+  }).pipe(Effect.provide(h.layer));
+});
+
+it.effect.each(["deferred", "pruned"] as const)(
+  "a continuously waiting %s retry retains its admission deadline",
+  (exit) => {
+    const h = harness({ spacingMs: 0 });
+    h.setLoad(2);
+    const first = source(1);
+    h.runSources.set(first.sourceRunId, first);
+    return Effect.gen(function* () {
+      const pacing = yield* RestartPacing.RestartPacing;
+      const acquire = pacing.acquireRun(first.threadId, first.sourceRunId, "start:waiting");
+      assert.isAbove(yield* acquire, 0);
+      yield* TestClock.adjust("15 minutes");
+      if (exit === "pruned") {
+        h.cancelled.add("start:waiting");
+        assert.isAbove(yield* pacing.acquire(source(2)), 0);
+        h.cancelled.delete("start:waiting");
+      } else yield* pacing.releaseRun(first.threadId, first.sourceRunId, "start:waiting", true);
+      yield* TestClock.adjust("16 minutes");
+      assert.instanceOf(yield* acquire.pipe(Effect.flip), RestartPacing.RestartAdmissionTimeoutError);
+    }).pipe(Effect.provide(h.layer));
   },
 );
