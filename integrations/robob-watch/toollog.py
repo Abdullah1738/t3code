@@ -46,6 +46,9 @@ SCHEMAS = {
     'delivery.result': {'kind': {'card', 'nag', 'warning'}, 'ok': bool, 'errorTag': TAGS | {'none'}, 'runIdRef': 'run'},
     'brief.fresh': {'fresh': bool}, 'nag.sent': {'count': int}, 'nag.snoozed': {'count': int},
     'nag.stopped': {'count': int}, 'nag.folded': {'count': int}, 'validate.conflicts': {'conflictKind': CONFLICTS, 'count': int},
+    'nag.resolved': {'slotKind': {'morning', 'evening', 'weekly', 'other'}, 'nagCount': int,
+                     'firstNagToTookSeconds': int, 'snoozeCount': int, 'lateMinutes': int},
+    'nag.day_end': {'slotsDue': int, 'slotsTaken': int, 'slotsOpen': int, 'nagsSent': int},
     'log.cap': {}, 'rollup.run': {},
 }
 
@@ -322,6 +325,7 @@ def rollup(day=None):
         malformed = 0
         zero_sleep, last_scored = 0, None
         food_errors, delivered, expected = Counter(), {}, set()
+        nag_latency, open_slots = [], {}
         try:
             source_file = source.open()
         except FileNotFoundError:
@@ -345,6 +349,15 @@ def rollup(day=None):
                             if start <= timestamp < day_end and timestamp <= end:
                                 run_times[component].append(timestamp)
                     origin = r.get('ids', {}).get('run')
+                    if r['name'] == 'nag.resolved' and 'firstNagToTookSeconds' in props:
+                        nag_latency.append(props['firstNagToTookSeconds'])
+                    if r['name'] == 'nag.day_end' and 'slotsOpen' in props:
+                        stamp = iso_stamp(r.get('ts'))
+                        if stamp:
+                            # day_end is emitted on the first run after Dubai midnight.
+                            dubai = dt.timezone(dt.timedelta(hours=4))
+                            ended = dt.datetime.fromisoformat(stamp.replace('Z', '+00:00')).astimezone(dubai).date() - dt.timedelta(days=1)
+                            open_slots[str(ended)] = props['slotsOpen']
                     if r['name'] == 'sync.run':
                         saved = props.get('lastScoredSleep')
                         if saved:
@@ -389,6 +402,10 @@ def rollup(day=None):
                                  for component in sorted(set(run_times) | set(intervals))},
                   'whoop': {'lastScoredSleep': last_scored, 'zeroSleepRuns': zero_sleep},
                   'food': {'errorsBySubcommand': dict(food_errors)},
+                  'nag': {'firstNagToTookSeconds': {
+                      'median': statistics.median(nag_latency) if nag_latency else None,
+                      'p95': _percentile(sorted(nag_latency), .95) if nag_latency else None,
+                      'samples': len(nag_latency)}, 'openSlotsByDay': open_slots},
                   'delivery': {'sent': sum(v is True for v in delivered.values()),
                                'failed': sum(v is False for v in delivered.values()),
                                'unmarked': len(expected - set(delivered))}}
