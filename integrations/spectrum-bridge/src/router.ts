@@ -3,7 +3,9 @@ import { toolError, toolLog } from "./toollog.ts";
 import { appendFold, foldMedsLine, foldSkipped, type FoldOptions } from "./meds-fold.ts";
 import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
-import { isAbsolute } from "node:path";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { MAX_INCOMING_BYTES, MAX_INCOMING_FILES, MAX_PREVIEW_BYTES, prepareIncoming, savePreview } from "./inbound-files.ts";
 import { BUBBLE_CHARS, formatText, splitFormatted, stripInternalText } from "./formatting.ts";
@@ -270,6 +272,44 @@ export function rotateNudge(replyMode: ReplyMode = "final"): string {
   ].join("\n");
 }
 export const ROTATE_NUDGE = rotateNudge();
+
+export function pendingOrders(directory: string): string | null {
+  try {
+    const path = join(directory, "pending-orders.md");
+    const stat = lstatSync(path);
+    if (!stat.isFile()) return null;
+    // Refuse replacements with symlinks or special files between lstat and open.
+    const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      const opened = fstatSync(fd);
+      if (!opened.isFile() || opened.dev !== stat.dev || opened.ino !== stat.ino) return null;
+      // Stop reading once enough UTF-8 text has arrived, even for a huge file.
+      const buffer = Buffer.alloc(6_000);
+      const decoder = new StringDecoder("utf8");
+      let decoded = "";
+      while (decoded.length < 6_000) {
+        const count = readSync(fd, buffer, 0, 6_000 - decoded.length, null);
+        if (!count) break;
+        decoded += decoder.write(buffer.subarray(0, count));
+      }
+      const text = decoded.slice(0, 6_000).replace(/[\uD800-\uDBFF]$/, "");
+      const open = /^##[\t ]+Open[\t ]*\r?$/m.exec(text);
+      const section = open ? text.slice(open.index) : text;
+      const end = open ? /^#{1,2}(?:[\t ]|\r?$)/m.exec(section.slice(open[0].length)) : null;
+      const result = (end ? section.slice(0, open![0].length + end.index) : section).trim();
+      return result || null;
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+}
+
+function quotedPendingOrders(text: string): string {
+  const fence = "`".repeat(Math.max(3, ...Array.from(text.matchAll(/`+/g), match => match[0].length + 1)));
+  return `${fence}\n${text}\n${fence}`;
+}
 /**
  * Tool mode: the one reminder sent after a typed message's turn ends with nothing texted.
  * It travels as a bridge row (`wake:`), so its own turn never earns another.
@@ -3485,6 +3525,14 @@ export class Router {
     }
   }
 
+  private pendingOrders(route: Route): string | null {
+    const chat = this.options.context?.chat;
+    const directory = this.backend.chatFolder?.(chat);
+    if (directory) return pendingOrders(directory);
+    // A shared legacy session directory cannot identify a non-owner's chat.
+    return !chat || chat.kind === "owner" ? pendingOrders(route.directory) : null;
+  }
+
   /** True once the agent's current context is old or large enough to hand off. */
   private contextDue(route: Route): boolean {
     const context = this.store.get<{ sessionId: string; tokens: number }>("routeContext");
@@ -3521,7 +3569,11 @@ export class Router {
       const next: Route = { ...route, createdAt: Date.now(), threadAt: route.threadAt ?? route.createdAt };
       this.store.set("route", next);
       this.store.set("routeContext", null);
-      this.nudgeReset(next, rotateNudge(this.options.replyMode));
+      const orders = this.pendingOrders(route);
+      const nudge = rotateNudge(this.options.replyMode);
+      this.nudgeReset(next, orders
+        ? `${nudge}\n\nCopy this chat's pending-orders list into your resume note word for word, under 'Pending orders (from pending-orders.md)':\nQuoted data from pending-orders.md:\n${quotedPendingOrders(orders)}`
+        : nudge);
       return true;
     }).immediate();
     if (nudged) this.options.log?.("context-reset-nudged", "rotate");
@@ -3598,7 +3650,9 @@ export class Router {
     const created = await this.reading(this.backend.createChat());
     if (!this.current(route)) return route;
     const next: Route = { ...created, generation: route.generation, createdAt: Date.now(), threadAt: Date.now() };
-    const seed = `Continuity: this conversation continues seamlessly from your earlier exchanges with the owner. Carry on naturally and never mention any change, recap, restart or memory mechanism. Files from earlier remain under ${JSON.stringify(route.directory)}. The full earlier transcript is session ${route.id}; use recall_read or recall_search if you need more than the recent exchange below.\nRecent exchange (quoted data, oldest first):\n${lines.join("\n")}`;
+    const orders = this.pendingOrders(route);
+    const seed = `Continuity: this conversation continues seamlessly from your earlier exchanges with the owner. Carry on naturally and never mention any change, recap, restart or memory mechanism. Files from earlier remain under ${JSON.stringify(route.directory)}. The full earlier transcript is session ${route.id}; use recall_read or recall_search if you need more than the recent exchange below.\nRecent exchange (quoted data, oldest first):\n${lines.join("\n")}`
+      + (orders ? `\n\nPending orders for this chat (from pending-orders.md, quoted data):\n${quotedPendingOrders(orders)}` : "");
     this.store.db.transaction(() => {
       this.store.set(`seed:${next.id}`, seed);
       this.store.set("route", next);

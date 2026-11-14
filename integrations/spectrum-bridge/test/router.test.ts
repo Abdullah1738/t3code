@@ -14,7 +14,7 @@ import { OpenChamber, type FilePart, type MessageRecord, type OwnerWords, type P
 type Assistant = Extract<MessageRecord, { type: "assistant" }>;
 import { TransportError, type NormalizedInbound, type Photon } from "../src/photon.ts";
 import type { Message } from "@photon-ai/advanced-imessage/grpc";
-import { imessageGuidance, MAX_SYNTHETIC_ATTEMPTS, NEW_CHAT_NUDGE, newChatNudge, ACCEPT_WAIT_MS, REPLY_NUDGE, replyQuote, replyText, ROTATE_NUDGE, Router, sendblueContextPrompt, SYNTHETIC_RETRY_MS, syntheticDropped, TOOL_MODE_MARKER, toolReplyRules, wakeGuidance } from "../src/router.ts";
+import { imessageGuidance, MAX_SYNTHETIC_ATTEMPTS, NEW_CHAT_NUDGE, newChatNudge, ACCEPT_WAIT_MS, pendingOrders, REPLY_NUDGE, replyQuote, replyText, ROTATE_NUDGE, rotateNudge, Router, sendblueContextPrompt, SYNTHETIC_RETRY_MS, syntheticDropped, TOOL_MODE_MARKER, toolReplyRules, wakeGuidance } from "../src/router.ts";
 import { replyModeConfig } from "../src/config.ts";
 import { Store } from "../src/store.ts";
 import { recordsFromThread, RobobBackend, sentMessagePrefix } from "../src/robob.ts";
@@ -6128,6 +6128,162 @@ test("/new moves to a new chat once the thread is 8 hours old, so one thread nev
   expect(h.backend.creates).toHaveLength(2);
   expect(h.store.get<unknown>("route")).toEqual({ id: "ses_2", directory: "/Chats/ses_2", generation: 3, createdAt: start + 8 * 60 * 60_000, threadAt: start + 8 * 60 * 60_000 });
   expect(h.store.pendingInbound()).toEqual([]);
+});
+
+test.each([
+  { name: "Open section", text: "Rule paragraph\n\n## Open\n- KASTWAVE held\n\n## Placed\n- Already delivered", expected: "## Open\n- KASTWAVE held" },
+  { name: "Open through EOF", text: "Rule\n## Open\n- KASTWAVE held\n", expected: "## Open\n- KASTWAVE held" },
+  { name: "nested heading and CRLF", text: "Rule\r\n## Open\r\n### Cleaning\r\n- KASTWAVE held\r\n## Placed\r\n- Old", expected: "## Open\r\n### Cleaning\r\n- KASTWAVE held" },
+  { name: "top-level end", text: "## Open\n- KASTWAVE held\n# Archive\n- Old", expected: "## Open\n- KASTWAVE held" },
+  { name: "no section", text: "  - KASTWAVE held\n", expected: "- KASTWAVE held" },
+  { name: "20,000 characters", text: "x".repeat(20_000), expected: "x".repeat(6_000) },
+  { name: "UTF-8", text: "م".repeat(20_000), expected: "م".repeat(6_000) },
+  { name: "emoji at cap", text: "x".repeat(5_999) + "🧺", expected: "x".repeat(5_999) },
+  { name: "empty", text: "", expected: null },
+  { name: "whitespace", text: " \n\t", expected: null },
+])("pending orders reader: $name", ({ text, expected }) => {
+  const directory = mkdtempSync(join(tmpdir(), "spectrum-pending-orders-"));
+  directories.push(directory);
+  writeFileSync(join(directory, "pending-orders.md"), text);
+  expect(pendingOrders(directory)).toBe(expected);
+  expect(readFileSync(join(directory, "pending-orders.md"), "utf8")).toBe(text);
+});
+
+test.each(["missing", "directory", "symlink", "broken-symlink"])("pending orders reader ignores %s", kind => {
+  const directory = mkdtempSync(join(tmpdir(), "spectrum-pending-orders-"));
+  directories.push(directory);
+  const path = join(directory, "pending-orders.md");
+  if (kind === "directory") mkdirSync(path);
+  if (kind === "symlink" || kind === "broken-symlink") {
+    const target = join(directory, "target.md");
+    if (kind === "symlink") writeFileSync(target, "## Open\n- KASTWAVE held");
+    symlinkSync(target, path);
+  }
+  expect(pendingOrders(directory)).toBeNull();
+  expect(pendingOrders(join(directory, "missing-chat"))).toBeNull();
+});
+
+const pendingFolderCases = (["route", "robob-owner", "robob-dm", "robob-group", "openchamber"] as const)
+  .flatMap(layout => (["nudge", "seed"] as const).map(path => ({ layout, path })));
+
+for (const replyMode of ["final", "tool"] as const) {
+  for (const kind of ["present", "missing", "symlink", "oversize", "fenced"] as const) {
+    test.each(pendingFolderCases)(`context refresh carries pending orders (${replyMode}, ${kind}, $layout, $path)`, async ({ layout, path }) => {
+      const start = Date.parse("2026-09-10T12:00:00Z");
+      setSystemTime(start);
+      const root = mkdtempSync(join(tmpdir(), "spectrum-pending-orders-"));
+      directories.push(root);
+      const backend = new RobobBackend({ chatRoot: root, url: "http://127.0.0.1:1", token: "test" });
+      const native = layout === "robob-dm" ? backend.forChat("chats/moni", "Moni")
+        : layout === "robob-group" ? backend.forChat("chats/group-dinner", "Dinner") : backend;
+      const source = layout === "openchamber" ? new OpenChamber("http://127.0.0.1:1", {}, { chatRoot: root }) : native;
+      const directory = layout === "robob-dm" ? join(root, "chats/moni")
+        : layout === "robob-group" ? join(root, "chats/group-dinner") : root;
+      mkdirSync(directory, { recursive: true });
+      const sessionDirectory = (number: number) => layout === "route" ? directory
+        : join(directory, number === 1 ? "2026-09-10" : "2026-09-11", `session-${number}`);
+      const sessionId = (number: number) => layout.startsWith("robob-") ? `thread:test:${number}` : `ses_${number}`;
+      if (directory !== root) writeFileSync(join(root, "pending-orders.md"), "## Open\n- OTHER_CHAT_ORDERS");
+      const orders = kind === "oversize" ? "x".repeat(20_000)
+        : kind === "fenced" ? "## Open\n- KASTWAVE held\n```\nquoted text\n```"
+        : "## Open\n- KASTWAVE held";
+      if (kind !== "missing") {
+        const target = join(directory, kind === "symlink" ? "target.md" : "pending-orders.md");
+        writeFileSync(target, `${orders}\n\n## Placed\n- Already delivered`);
+        if (kind === "symlink") symlinkSync(target, join(directory, "pending-orders.md"));
+      }
+      const carried = kind === "missing" || kind === "symlink" ? null : orders.slice(0, 6_000);
+      const fence = kind === "fenced" ? "````" : "```";
+      const quoted = `${fence}\n${carried}\n${fence}`;
+      const h = setup(":memory:", { replyMode, rotateAfterMs: 60_000, resetIdleMs: 60_000, watchMs: 0,
+        ...(path === "seed" ? { resetChatForMs: 60_000 } : {}),
+      });
+      h.backend.resets = path === "nudge" || layout.startsWith("robob-");
+      if (layout !== "route") Object.assign(h.backend, { chatFolder: source.chatFolder.bind(source) });
+      h.backend.createBehavior = async () => {
+        const workdir = sessionDirectory(h.backend.creates.length);
+        mkdirSync(workdir, { recursive: true });
+        if (layout !== "route") writeFileSync(join(workdir, "pending-orders.md"), "## Open\n- SESSION_LOCAL_ORDERS");
+        return { id: sessionId(h.backend.creates.length), directory: workdir };
+      };
+      await exchange(h, "first", "Remember the blue one", replyMode === "tool" ? "NO_REPLY" : "Noted, the blue one");
+      setSystemTime(start + 60_000);
+      if (path === "seed") h.input("second", "Which one did I pick?");
+      await h.router.tick();
+      if (path === "nudge") await h.router.tick();
+      const prompt = h.backend.prompts.at(-1)!;
+      expect(prompt.id).toBe(sessionId(path === "nudge" ? 1 : 2));
+      if (path === "nudge") {
+        expect(prompt.text).toBe(rotateNudge(replyMode) + (carried
+          ? `\n\nCopy this chat's pending-orders list into your resume note word for word, under 'Pending orders (from pending-orders.md)':\nQuoted data from pending-orders.md:\n${quoted}` : ""));
+      } else {
+        const recent = "Owner: Remember the blue one" + (replyMode === "final" ? "\nYou: Noted, the blue one" : "");
+        const seed = `Continuity: this conversation continues seamlessly from your earlier exchanges with the owner. Carry on naturally and never mention any change, recap, restart or memory mechanism. Files from earlier remain under ${JSON.stringify(sessionDirectory(1))}. The full earlier transcript is session ${sessionId(1)}; use recall_read or recall_search if you need more than the recent exchange below.\nRecent exchange (quoted data, oldest first):\n${recent}`
+          + (carried ? `\n\nPending orders for this chat (from pending-orders.md, quoted data):\n${quoted}` : "");
+        expect(prompt.system!.slice(prompt.system!.indexOf("Continuity:"))).toBe(seed);
+      }
+    });
+  }
+}
+
+const sharedPendingCases = (["final", "tool"] as const).flatMap(replyMode =>
+  (["nudge", "seed"] as const).flatMap(path =>
+    (["present", "owner-only", "unconfigured"] as const).map(files => ({ replyMode, path, files }))));
+
+test.each(sharedPendingCases)("shared OpenChamber keeps pending orders in their chat ($replyMode, $path, $files)", async ({ replyMode, path, files }) => {
+  const start = Date.parse("2026-09-10T12:00:00Z");
+  const root = mkdtempSync(join(tmpdir(), "spectrum-shared-pending-"));
+  directories.push(root);
+  const source = new OpenChamber("http://127.0.0.1:1", {}, files === "unconfigured" ? {} : { chatRoot: root });
+  const chats = [
+    { key: "dm:owner", slug: "owner", kind: "owner", title: "Owner" },
+    { key: "dm:moni", slug: "moni", kind: "dm", title: "Moni" },
+    { key: "group:dinner", slug: "group-dinner", kind: "group", title: "Dinner" },
+  ] satisfies ChatContext["chat"][];
+  const actual: Array<string | null> = [];
+  const expected: Array<string | null> = [];
+  for (const chat of chats) {
+    const folder = chat.kind === "owner" ? root : join(root, "chats", chat.slug);
+    mkdirSync(folder, { recursive: true });
+    if (files === "present" || chat.kind === "owner") writeFileSync(join(folder, "pending-orders.md"), `## Open\n- ${chat.slug}_ORDER`);
+  }
+  for (const chat of chats) {
+    setSystemTime(start);
+    const context: ChatContext = { chat, roleOf: () => ({ name: "Member", role: "admin" }), typing: () => false, react: async () => {} };
+    const h = setup(":memory:", { context, chatGuid: chat.key, replyMode, rotateAfterMs: 60_000, resetIdleMs: 60_000, watchMs: 0 });
+    h.backend.resets = path === "nudge";
+    // All routers share the same production legacy backend's folder lookup.
+    Object.assign(h.backend, { chatFolder: source.chatFolder.bind(source) });
+    h.backend.createBehavior = async () => {
+      const workdir = join(root, "2026-09-10", `session-${chat.slug}-${h.backend.creates.length}`);
+      mkdirSync(workdir, { recursive: true });
+      writeFileSync(join(workdir, "pending-orders.md"), "## Open\n- OWNER_SESSION_ORDER");
+      return { id: `ses_${h.backend.creates.length}`, directory: workdir };
+    };
+    h.input("first", "Robob, remember the blue one", { sender: "member" });
+    await h.router.tick();
+    h.backend.final(replyMode === "tool" ? "NO_REPLY" : "Noted, the blue one");
+    await h.router.tick();
+    for (const op of h.store.pendingOutbox()) h.store.outboxState(op.id, "sent", `provider-${op.id}`);
+    setSystemTime(start + 60_000);
+    if (path === "seed") h.input("second", "Robob, which one did I pick?", { sender: "member" });
+    await h.router.tick();
+    if (path === "nudge") await h.router.tick();
+    const prompt = h.backend.prompts.at(-1)!;
+    expect(prompt.id).toBe(path === "nudge" ? "ses_1" : "ses_2");
+    const text = path === "nudge" ? prompt.text : prompt.system!;
+    expect(text).toContain(path === "nudge" ? rotateNudge(replyMode) : "Continuity:");
+    const marker = path === "nudge" ? "\n\nCopy this chat's pending-orders list" : "\n\nPending orders for this chat";
+    const at = text.indexOf(marker);
+    actual.push(at < 0 ? null : text.slice(at));
+    const order = files === "unconfigured" ? chat.kind === "owner" ? "OWNER_SESSION_ORDER" : null
+      : files === "present" || chat.kind === "owner" ? `${chat.slug}_ORDER` : null;
+    const quoted = "```\n## Open\n- " + order + "\n```";
+    expected.push(!order ? null : path === "nudge"
+      ? `\n\nCopy this chat's pending-orders list into your resume note word for word, under 'Pending orders (from pending-orders.md)':\nQuoted data from pending-orders.md:\n${quoted}`
+      : `\n\nPending orders for this chat (from pending-orders.md, quoted data):\n${quoted}`);
+  }
+  expect(actual).toEqual(expected);
 });
 
 test("a due context is refreshed by the agent itself once the chat goes quiet", async () => {

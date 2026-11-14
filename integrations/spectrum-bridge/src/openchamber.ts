@@ -1,5 +1,7 @@
 import { toolError } from "./toollog.ts";
 import assert from "node:assert/strict";
+import { join } from "node:path";
+import type { ChatInfo } from "./chats.ts";
 
 // JSON.parse establishes this representation; notification consumers decode its
 // event variants before using them as session/request identities.
@@ -305,6 +307,8 @@ export type SteerGuard = { signal: AbortSignal; beforeSend: () => Promise<boolea
 export interface ChatBackend {
   /** How owner-facing text names the app. Defaults to OpenChamber. */
   readonly brand?: { app: string };
+  /** Shared backends need the current chat to locate its persistent files. */
+  chatFolder?(chat?: ChatInfo): string | undefined;
   health(): Promise<{ status: string; openchamberVersion?: string; [key: string]: unknown } | undefined>;
   createChat(title?: string): Promise<{ id: string; directory: string }>;
   markImessageOrigin(id: string, directory?: string): Promise<"marked" | "already" | "missing">;
@@ -492,6 +496,11 @@ export class OpenChamber implements ChatBackend {
         id = session.parentID;
       }
     } catch (caughtError) { toolError("openchamber", "openchamber.catch6", caughtError); /* Keep pending permissions visible when the policy owner is unavailable. */ }
+  }
+
+  chatFolder(chat?: ChatInfo): string | undefined {
+    if (this.chatRoot === undefined) return;
+    return chat && chat.kind !== "owner" ? join(this.chatRoot, "chats", chat.slug) : this.chatRoot;
   }
 
   async createChat(title?: string): Promise<{ id: string; directory: string }> {
