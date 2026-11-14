@@ -2569,6 +2569,7 @@ const make = Effect.gen(function* () {
     incoming: KanbanCard,
     by?: KanbanActor,
     dispatchMetadata = false,
+    pruneQueuedWakes = true,
   ) {
     const actor: KanbanActor = analyticsActors.get(incoming) ??
       by ?? { _tag: "system", component: "dispatcher" };
@@ -2649,6 +2650,7 @@ const make = Effect.gen(function* () {
                 : (before.analyticsStageEnteredAt ?? before.movedAt),
           };
         if (
+          pruneQueuedWakes &&
           before !== null &&
           ((before.activeThreadId !== null && before.activeThreadId !== card.activeThreadId) ||
             (before.stage !== card.stage &&
@@ -6812,6 +6814,7 @@ const make = Effect.gen(function* () {
 
   const saveDispatchCard = Effect.fn("KanbanService.saveDispatchCard")(function* (
     card: KanbanCard,
+    undoAssignment = false,
   ) {
     const current = yield* cardOf(card.id);
     const saved = {
@@ -6820,7 +6823,7 @@ const make = Effect.gen(function* () {
       discussionId: current.discussionId,
       updatedAt: yield* nowIso,
     };
-    yield* saveCard(saved);
+    yield* saveCard(saved, undefined, false, !undoAssignment);
     return saved;
   });
 
@@ -7215,7 +7218,8 @@ const make = Effect.gen(function* () {
                     toStage: restored.stage,
                     body: "Assignment wake did not complete",
                   });
-                  destination.expectedCard = yield* saveDispatchCard(restored);
+                  // No consumer owns this assignment; interrupted rollback cannot wait on thread I/O.
+                  destination.expectedCard = yield* saveDispatchCard(restored, true);
                 }
                 return true;
               }),
