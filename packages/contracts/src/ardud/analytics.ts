@@ -45,7 +45,7 @@ const McpPhase = Schema.Literals(["caller", "dispatch", "result", "handler"]);
 // Pool identities include custom model slugs and provider suffixes such as [1m].
 const PoolKey = Schema.String.check(
   Schema.isMaxLength(4608),
-  Schema.isPattern(/^[a-zA-Z0-9_.:/#@%+!~'()*\[\],=-]*$/),
+  Schema.isPattern(/^[a-zA-Z0-9_.:/#@%+!~'()*[\],=-]*$/),
 );
 const PoolChangeFields = {
   poolKey: PoolKey,
