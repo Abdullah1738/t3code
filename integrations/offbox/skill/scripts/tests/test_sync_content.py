@@ -1,6 +1,7 @@
 """Tracked disk bytes, including rsync quick-check collisions, must reach the command."""
 import os
 import json
+import fnmatch
 import sqlite3
 from pathlib import Path
 import subprocess
@@ -54,6 +55,25 @@ class SyncContentTests(unittest.TestCase):
         self.assertEqual(len(self.calls), 1)
         self.assertEqual(len(self.fx.rsyncs), 2)  # normal and tracked-ignored pass, no repair
         self.events.assert_not_called()
+
+    def test_compiled_filter_matches_all_existing_rule_forms(self):
+        def previous(path):
+            parts = path.split("/")
+            if any(fnmatch.fnmatch(parts[-1], t) for t in ssh_sync.SAFE_ENV_TEMPLATES):
+                parts = parts[:-1]
+            pats = [p.rstrip("/") for p in ssh_sync.SECRET_EXCLUDES + ssh_sync.HEAVY_EXCLUDES]
+            if any(fnmatch.fnmatch(seg, pat) for seg in parts for pat in pats if "/" not in pat):
+                return True
+            joined = "/" + "/".join(parts)
+            return any(joined.endswith("/" + p) or ("/" + p + "/") in joined for p in pats if "/" in p)
+        cases = ["safe/file.txt", *ssh_sync.SAFE_ENV_TEMPLATES]
+        for rule in ssh_sync.SECRET_EXCLUDES + ssh_sync.HEAVY_EXCLUDES:
+            value = rule.rstrip("/").replace("*", "fixture")
+            for prefix in ("", "nested/"):
+                cases.extend([prefix + value, prefix + value + "/file", prefix + value + "/.env.example"])
+        for path in cases:
+            with self.subTest(path=path):
+                self.assertEqual(ssh_sync._offbox_skips(path), previous(path))
 
     def test_secret_filters_and_explicit_includes(self):
         st = self.fx.push()

@@ -554,6 +554,13 @@ def _seen(out: str) -> set[str]:
     return seen
 
 
+@lru_cache(maxsize=8)
+def _skip_component_pattern(patterns: tuple[str, ...]) -> re.Pattern:
+    import fnmatch
+    # One compiled match avoids a Python fnmatch loop over every rule for every path component.
+    return re.compile("|".join(fnmatch.translate(os.path.normcase(p)) for p in patterns))
+
+
 def _offbox_skips(path: str) -> bool:
     """True when the secret or heavy excludes cover the path (a dir rule covers everything below it)."""
     import fnmatch
@@ -561,7 +568,8 @@ def _offbox_skips(path: str) -> bool:
     if any(fnmatch.fnmatch(parts[-1], t) for t in SAFE_ENV_TEMPLATES):
         parts = parts[:-1]
     pats = [x.rstrip("/") for x in SECRET_EXCLUDES + HEAVY_EXCLUDES]
-    if any(fnmatch.fnmatch(seg, pat) for seg in parts for pat in pats if "/" not in pat):
+    pattern = _skip_component_pattern(tuple(p for p in pats if "/" not in p))
+    if any(pattern.match(os.path.normcase(seg)) for seg in parts):
         return True
     joined = "/" + "/".join(parts)
     return any(joined.endswith("/" + pat) or ("/" + pat + "/") in joined for pat in pats if "/" in pat)
@@ -744,7 +752,7 @@ def _tracked_content(root: Path, includes: list[str] | None) -> dict[str, tuple[
         if real == ".git" or real.startswith(".git/"):
             continue
         included = any(real == i or real.startswith(i + "/") for i in inc)
-        if (_offbox_skips(path) or _offbox_skips(real)) and not included:
+        if not included and (_offbox_skips(path) or (real != path and _offbox_skips(real))):
             continue
         try:
             sig = _content_signature(root / real)
