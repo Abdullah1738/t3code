@@ -480,6 +480,7 @@ it.effect.each([
       const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
         getThreadShell: () =>
           Effect.succeed({ projectId: ProjectId.make("project-1"), deletedAt: null } as never),
+        getThreadRecords: () => Effect.succeed({ runs: [] } as never),
         sendToThread: (input) =>
           Effect.sync(() => {
             sent.push(input.commandId);
@@ -1525,6 +1526,7 @@ it.effect.each([
         // A rejection other than the start race must never become a new send.
         const empty = yield* Effect.result(threads.send({ ...latest, text: "", key: "empty" }));
         expect(Result.isFailure(empty)).toBe(true);
+        if (Result.isFailure(empty)) expect(empty.failure.wakeMessageId).toBe(target.userMessageId);
         expect((yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs).toHaveLength(5);
         yield* threads.send({
           ...latest,

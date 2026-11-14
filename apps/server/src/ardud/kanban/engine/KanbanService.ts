@@ -1889,21 +1889,20 @@ const make = Effect.gen(function* () {
     { defaultValue: () => undefined },
   );
   const discardWake = Effect.fn("KanbanService.discardWake")(
-    function* (threadId: ThreadId, runId: string | void) {
-      if (runId === undefined) return;
-      const wake = queuedWakes(yield* threadIo.queuedRuns(threadId)).find(
-        (run) => run.id === runId,
+    function* (threadId: ThreadId, runId: string | void, wakeMessageId?: string) {
+      if (runId === undefined && wakeMessageId === undefined) return;
+      const wake = queuedWakes(yield* threadIo.queuedRuns(threadId)).find((run) =>
+        runId === undefined ? run.userMessageId === wakeMessageId : run.id === runId,
       );
       if (wake !== undefined) yield* touching(threadId, threadIo.cancelQueued(threadId, wake.id));
     },
-    Effect.catchCause((cause) =>
-      Effect.logWarning("kanban stale wake withdrawal failed", { cause }),
-    ),
+    Effect.retry({ times: 1 }),
+    Effect.tapError((error) => Effect.logWarning("kanban stale wake withdrawal failed", { error })),
   );
 
   const sendThread = Effect.fn("KanbanService.sendThread")(function* (
     input: Parameters<typeof threadIo.send>[0],
-    acknowledge = false,
+    acknowledge?: { failed: boolean },
   ) {
     const key = yield* ownerDeliveryKey;
     const delivered = yield* ownerDelivered;
@@ -1923,11 +1922,17 @@ const make = Effect.gen(function* () {
       threadIo
         .send({
           ...input,
+          ...(wake === undefined
+            ? {}
+            : { isStale: () => wake.stale || input.isStale?.() === true }),
           ...(key === undefined
             ? {}
             : { key: `${key}:${input.threadId}:${input.key ?? "answer"}` }),
         })
         .pipe(
+          Effect.tapError((error) =>
+            wake?.stale ? discardWake(input.threadId, undefined, error.wakeMessageId) : Effect.void,
+          ),
           Effect.flatMap((runId) =>
             wake?.stale
               ? discardWake(input.threadId, runId).pipe(Effect.asVoid)
@@ -1935,22 +1940,38 @@ const make = Effect.gen(function* () {
           ),
         ),
     );
+    const delivery = Effect.andThen(
+      runPendingStops(input.threadId),
+      input.model === undefined ? sent : withThreadModel(input.threadId, sent),
+    ).pipe(
+      Effect.tap(() =>
+        Effect.sync(() => {
+          if (answer && !wake?.stale) delivered?.add(input.threadId);
+        }),
+      ),
+    );
     return yield* trackSend(
       input.threadId,
       locks.outside(
-        Effect.andThen(
-          runPendingStops(input.threadId),
-          input.model === undefined ? sent : withThreadModel(input.threadId, sent),
-        ).pipe(
-          Effect.tap(() =>
-            Effect.sync(() => {
-              if (answer && !wake?.stale) delivered?.add(input.threadId);
-            }),
-          ),
-        ),
+        acknowledge
+          ? delivery.pipe(
+              Effect.catchCause(() =>
+                Effect.sync(() => {
+                  acknowledge.failed = true;
+                }),
+              ),
+            )
+          : delivery,
         wake === undefined
           ? undefined
-          : (runId) => (wake.stale ? discardWake(input.threadId, runId) : Effect.void),
+          : (runId) =>
+              wake.stale
+                ? discardWake(input.threadId, runId).pipe(
+                    Effect.catchCause((cause) =>
+                      Effect.logWarning("kanban abandoned wake withdrawal failed", { cause }),
+                    ),
+                  )
+                : Effect.void,
         false,
         acknowledge ? Effect.succeed(true) : undefined,
       ),
@@ -8085,10 +8106,17 @@ const make = Effect.gen(function* () {
     }
     // The send is accepted before the gate resumes. Acknowledge it on current rows,
     // like discussion delivery, so a concurrent edit cannot replay the same nudge.
-    const sent = yield* sendThread({ threadId, text, coalesce: "nudge" }, true).pipe(
-      Effect.map((runId) => runId !== undefined),
-      Effect.catchCause(() => Effect.succeed(false)),
+    // Errors can follow acceptance; a skipped send must leave the nudge attempt available.
+    const attempt = { failed: false };
+    const runId = yield* sendThread({ threadId, text, coalesce: "nudge" }, attempt).pipe(
+      Effect.catchCause(() =>
+        Effect.sync(() => {
+          attempt.failed = true;
+        }),
+      ),
     );
+    if (runId === undefined && !attempt.failed) return;
+    const sent = runId !== undefined;
     const at = yield* nowIso;
     for (const card of cards) {
       const current = yield* store.card(card.id);
