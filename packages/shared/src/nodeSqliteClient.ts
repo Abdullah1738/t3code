@@ -1324,6 +1324,9 @@ const makeWriterSetup = () => {
     get canRecover() {
       return canRecover;
     },
+    get globalMmap() {
+      return settings.find((entry) => entry.schema === "" && entry.name === "mmap_size")?.value;
+    },
     get entries(): ReadonlyArray<WriterSetupStatement> {
       const prerequisite = (entry: WriterPragma) =>
         entry.schema === "main" &&
@@ -1366,6 +1369,8 @@ let configurationDirty = false;
 let schemaDirty = false;
 let attachmentsDirty = false;
 let pendingAttachment;
+let globalMmap = workerData.globalMmap;
+let globalMmapPending = false;
 let openingFailed = false;
 let unsupportedConfiguration = false;
 let availablePragmas;
@@ -1402,6 +1407,7 @@ try {
     if (!activeClassification) return constants.SQLITE_OK;
     if (code === constants.SQLITE_ATTACH || code === constants.SQLITE_DETACH) {
       activeClassification.attachment = true;
+      if (code === constants.SQLITE_ATTACH) activeClassification.attachmentLiteral = action;
     }
     if (setupActions.includes(code) || memorySchemaActions.includes(code) || code === constants.SQLITE_ALTER_TABLE) {
       activeClassification.schema = true;
@@ -1412,6 +1418,7 @@ try {
     } else if (code === constants.SQLITE_PRAGMA) {
       const name = action?.toLowerCase();
       activeClassification.configuration ||= argument !== null && setupPragmas.has(name);
+      activeClassification.globalMmap ||= name === "mmap_size" && argument !== null && database === null;
       if (argument !== null && (name === "page_size" || name === "auto_vacuum")) {
         (activeClassification.pendingVacuum ??= new Map()).set((database ?? "main") + ":" + name,
           { schema: database ?? "main", name, value: argument });
@@ -1448,6 +1455,14 @@ const quoteIdentifier = name => '"' + name.replaceAll('"', '""') + '"';
 const databases = () => db.prepare("PRAGMA database_list").all();
 const connectionSettings = () => {
   const settings = [{ schema: "", name: "locking_mode", value: db.prepare("PRAGMA locking_mode").get().locking_mode }];
+  if (globalMmapPending) {
+    const statement = db.prepare("PRAGMA mmap_size");
+    statement.setReadBigInts(true);
+    const value = statement.get()?.mmap_size;
+    if (value !== undefined) globalMmap = value;
+    globalMmapPending = false;
+  }
+  if (globalMmap !== undefined) settings.push({ schema: "", name: "mmap_size", value: globalMmap });
   const names = new Set(["main", ...databases().map(entry => entry.name)]);
   for (const schema of names) for (const name of setupPragmas) {
     // The checkpoint controller owns this hook and restores SQLite's default on failure.
@@ -1485,8 +1500,19 @@ const observeConnectionState = () => {
     const current = databases();
     const present = new Set(current.filter(entry => entry.name !== "main" && entry.name !== "temp").map(entry => entry.name));
     for (const name of attachmentStatements.keys()) if (!present.has(name)) attachmentStatements.delete(name);
-    if (pendingAttachment) for (const name of present) {
-      if (!attachmentStatements.has(name)) attachmentStatements.set(name, { schema: name, filename: current.find(entry => entry.name === name).file, ...pendingAttachment });
+    if (pendingAttachment) {
+      const resolved = {};
+      const previous = activeClassification;
+      activeClassification = resolved;
+      try { db.prepare(pendingAttachment.expandedSql ?? pendingAttachment.sql); }
+      finally { activeClassification = previous; }
+      for (const name of present) if (!attachmentStatements.has(name)) {
+        const literal = resolved.attachmentLiteral;
+        attachmentStatements.set(name, { schema: name, filename: current.find(entry => entry.name === name).file,
+          ...(typeof literal === "string"
+            ? { sql: "ATTACH DATABASE ? AS " + quoteIdentifier(name), params: [literal], replaySafe: true }
+            : { sql: pendingAttachment.sql, params: pendingAttachment.params, replaySafe: false }) });
+      }
     }
     pendingAttachment = undefined;
     attachmentsDirty = false;
@@ -1513,15 +1539,16 @@ const observeConnectionState = () => {
 };
 let recoveryFailureReported = false;
 let recoveryFailureCause;
-const recoverySnapshot = (classification, sql, params) => {
-  configurationDirty ||= Boolean(classification?.configuration) || pendingVacuum.size > 0;
+const recoverySnapshot = (classification, sql, params, expandedSql) => {
+  globalMmapPending ||= Boolean(classification?.globalMmap);
+  configurationDirty ||= Boolean(classification?.configuration) || pendingVacuum.size > 0 || globalMmapPending;
   schemaDirty ||= Boolean(classification?.schema);
   for (const [key, setting] of classification?.pendingVacuum ?? []) pendingVacuum.set(key, setting);
   for (const name of classification?.unknownPragmas ?? []) pendingPragmas.add(name);
   if (classification?.attachment || typeof db.setAuthorizer !== "function") {
     attachmentsDirty = true;
     const head = sql?.replace(/^(?:[;\\s]|--[^\\n]*(?:\\n|$)|\\/\\*[\\s\\S]*?\\*\\/)+/, "");
-    if (/^ATTACH\\b/i.test(head ?? "")) pendingAttachment = { sql, params };
+    if (/^ATTACH\\b/i.test(head ?? "")) pendingAttachment = { sql, params, expandedSql };
   }
   // Introspection can itself end a read transaction. Preserve the flag as it
   // stood after the user's SQL, rather than letting metadata reads consume it.
@@ -1547,7 +1574,8 @@ const recoverySnapshot = (classification, sql, params) => {
     const observed = !attachmentsDirty && (!recoveryFailureReported || (!configurationDirty && !schemaDirty));
     if (observed) { recoveryFailureReported = false; recoveryFailureCause = undefined; }
     // Unreadable settings and missing classification cannot be reconstructed safely.
-    return { ...snapshot, recoveryReady: observed && pendingVacuum.size === 0 && !unsupportedConfiguration && typeof db.setAuthorizer === "function" };
+    return { ...snapshot, recoveryReady: observed && pendingVacuum.size === 0 && !globalMmapPending && !unsupportedConfiguration &&
+      [...attachmentStatements.values()].every(entry => entry.replaySafe !== false) && typeof db.setAuthorizer === "function" };
   } catch (cause) {
     // Metadata failure must not turn a successful COMMIT into a failed write.
     if (!recoveryFailureReported) parentPort.postMessage({ type: "recovery-error", error: {
@@ -1748,7 +1776,8 @@ parentPort.on("message", (request) => {
       return;
     }
     // Resolve an earlier attachment change before another statement can change its identity.
-    if (attachmentsDirty) priorRecovery = recoverySnapshot();
+    if (attachmentsDirty || globalMmapPending) priorRecovery = recoverySnapshot();
+    if (globalMmapPending) throw recoveryFailureCause ?? new Error("SQLite mmap default state unavailable");
     if (isCancelled(id)) throw new Error("SQLite request cancelled before execution");
     executionStarted = performance.now();
     const entry = cached ? statements.get(sql) : undefined;
@@ -1764,7 +1793,8 @@ parentPort.on("message", (request) => {
       }
     }
     classification = classifications.get(statement);
-    if (attachmentsDirty && (classifications.get(statement)?.attachment || typeof db.setAuthorizer !== "function")) throw recoveryFailureCause ?? new Error("SQLite attachment state unavailable");
+    if ((attachmentsDirty && (classification?.attachment || typeof db.setAuthorizer !== "function")) ||
+      (globalMmapPending && classification?.configuration)) throw recoveryFailureCause ?? new Error("SQLite connection state unavailable");
     observedWrite = Boolean(classifications.get(statement)?.write || classifications.get(statement)?.check);
     mayWrite = observedWrite || db.isTransaction;
     configurationDirty ||= Boolean(classifications.get(statement)?.configuration) || typeof db.setAuthorizer !== "function";
@@ -1796,7 +1826,7 @@ parentPort.on("message", (request) => {
     const committed = !db.isTransaction && /^\\s*(?:COMMIT|END|INSERT|UPDATE|DELETE|REPLACE)\\b/i.test(sql);
     parentPort.postMessage({ id, rows, committed, write: observedWrite, elapsedMs, controlMs,
       inTransaction: db.isTransaction,
-      ...priorRecovery, ...recoverySnapshot(classification, sql, params) });
+      ...priorRecovery, ...recoverySnapshot(classification, sql, params, statement.expandedSQL) });
   } catch (error) {
     activeClassification = undefined;
     const statementElapsed = executionStarted === undefined ? elapsedMs : (elapsedMs ?? 0) + performance.now() - executionStarted;
@@ -1836,6 +1866,7 @@ const makeWriterSession = Effect.fnUntraced(function* (
           setup: setup.entries,
           postSetup: setup.postSetup,
           attachments: setup.attachments,
+          globalMmap: setup.globalMmap,
           readonly: options.readonly ?? false,
           allowExtension: options.allowExtension ?? false,
           checkpoint: options.checkpointWorker ?? false,

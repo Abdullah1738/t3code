@@ -95,6 +95,7 @@ vi.mock("node:worker_threads", async (importOriginal) => {
             let metadataFailures = 0;
             let attachmentMetadataFailures = 0;
             let attachmentDeferralFailures = 0;
+            let globalMmapFailures = 0;
             let timedSql;
             let virtualClock;
             const nativeNow = performance.now.bind(performance);
@@ -106,6 +107,10 @@ vi.mock("node:worker_threads", async (importOriginal) => {
               if (virtualClock !== undefined) {
                 if (sql === timedSql) virtualClock += 100;
                 if (sql.startsWith("SELECT name AS name, type AS type, sql AS sql FROM ")) virtualClock += 5000;
+              }
+              if (globalMmapFailures > 0 && sql === "PRAGMA mmap_size") {
+                globalMmapFailures--;
+                throw new Error("test mmap default metadata failure");
               }
               if (attachmentDeferralFailures > 0 && sql === "PRAGMA defer_foreign_keys") {
                 attachmentDeferralFailures--;
@@ -136,6 +141,7 @@ vi.mock("node:worker_threads", async (importOriginal) => {
               if (message.kind === "fail-metadata") { metadataFailures = message.args[0]; return; }
               if (message.kind === "fail-attachments") { attachmentMetadataFailures = message.args[0]; return; }
               if (message.kind === "fail-attachment-deferral") { attachmentDeferralFailures = message.args[0]; return; }
+              if (message.kind === "fail-global-mmap") { globalMmapFailures = message.args[0]; return; }
               if (message.kind === "time-prepare") { timedSql = message.args[0]; virtualClock = 0; return; }
               if (message.kind === "resume") {
                 pausedStatements.get(message.args[0])?.();
@@ -4366,7 +4372,7 @@ it.effect.each([
 );
 
 it.effect.each([false, true])(
-  "checks the acknowledged identity of a computed attachment during recovery (bound=%s)",
+  "refuses unverified computed attachment options during recovery (bound=%s)",
   (bound) =>
     withFileClient((sql, filename) =>
       Effect.gen(function* () {
@@ -4389,15 +4395,104 @@ it.effect.each([false, true])(
         );
         yield* sql`UPDATE locations SET path=${b}`;
         assert.deepEqual(yield* sql`SELECT value FROM archive.entries`.values, [["A"]]);
+        const count = writerWorkers.length;
         yield* Effect.promise(() => writerWorkers.at(-1)!.terminate());
         const failed = yield* sql`SELECT value FROM archive.entries`.pipe(Effect.flip);
-        assert.equal(failed.reason.operation, "open");
-        assert.include(String(failed.reason.cause), "attachment identity changed");
+        assert.include(String(failed.reason.cause), "connection state could not be observed");
+        assert.equal(writerWorkers.length, count);
         const main = yield* openDatabase(filename);
         main.prepare("UPDATE locations SET path=?").run(a);
-        assert.deepEqual(yield* sql`SELECT value FROM archive.entries`.values, [["A"]]);
+        const stillUnsafe = yield* sql`SELECT value FROM archive.entries`.pipe(Effect.flip);
+        assert.include(String(stillUnsafe.reason.cause), "connection state could not be observed");
+        assert.equal(writerWorkers.length, count);
       }),
     ),
+);
+
+it.effect.each(["ro", "rw"].flatMap((mode) => [false, true].map((detach) => ({ mode, detach }))))(
+  "does not change computed URI $mode access on recovery (detach=$detach)",
+  ({ mode, detach }) =>
+    withFileClient(
+      (sql, filename) =>
+        Effect.gen(function* () {
+          const path = `${filename}.access`;
+          const native = yield* openDatabase(path);
+          native.exec("CREATE TABLE entries(value INTEGER); INSERT INTO entries VALUES (1)");
+          yield* sql`CREATE TABLE locations(uri TEXT)`;
+          yield* sql`INSERT INTO locations VALUES (${`file:${path}?mode=${mode}`})`;
+          yield* sql`ATTACH DATABASE (SELECT uri FROM locations) AS archive`;
+          if (mode === "ro") {
+            const failed = yield* sql`INSERT INTO archive.entries VALUES (2)`.pipe(Effect.flip);
+            assert.include(String(failed.reason.cause), "readonly");
+          } else yield* sql`INSERT INTO archive.entries VALUES (2)`;
+          yield* sql`UPDATE locations SET uri=${`file:${path}?mode=${mode === "ro" ? "rw" : "ro"}`}`;
+          if (detach) yield* sql`DETACH DATABASE archive`;
+          const count = writerWorkers.length;
+          yield* Effect.promise(() => writerWorkers.at(-1)!.terminate());
+          if (detach) {
+            const databases = yield* sql<{ name: string }>`PRAGMA database_list`;
+            assert.isFalse(databases.some((row) => row.name === "archive"));
+            assert.equal(writerWorkers.length, count + 1);
+          } else {
+            const failed = yield* sql`SELECT value FROM archive.entries`.pipe(Effect.flip);
+            assert.include(String(failed.reason.cause), "connection state could not be observed");
+            assert.equal(writerWorkers.length, count);
+          }
+          assert.deepEqual(
+            native
+              .prepare("SELECT value FROM entries ORDER BY value")
+              .all()
+              .map((row) => row.value),
+            mode === "ro" ? [1] : [1, 2],
+          );
+        }),
+      { readerWorker: false },
+    ),
+);
+
+it.effect.each(
+  [1048576, 2097152].flatMap((global) => [0, 524288].map((main) => ({ global, main }))),
+)("restores default mmap size $global separately from main $main", ({ global, main }) =>
+  withFileClient(
+    (sql, filename) =>
+      Effect.gen(function* () {
+        yield* sql.unsafe(`PRAGMA mmap_size=${global}`);
+        yield* sql`ATTACH DATABASE ${`${filename}.first`} AS first`;
+        const inherited = yield* sql`PRAGMA first.mmap_size`.values;
+        yield* sql.unsafe(`PRAGMA main.mmap_size=${main}`);
+        const current = yield* sql`PRAGMA main.mmap_size`.values;
+        yield* Effect.promise(() => writerWorkers.at(-1)!.terminate());
+        assert.deepEqual(yield* sql`PRAGMA main.mmap_size`.values, current);
+        assert.deepEqual(yield* sql`PRAGMA first.mmap_size`.values, inherited);
+        yield* sql`ATTACH DATABASE ${`${filename}.second`} AS second`;
+        assert.deepEqual(yield* sql`PRAGMA second.mmap_size`.values, inherited);
+      }),
+    { readerWorker: false },
+  ),
+);
+
+it.effect.each([1, 2])("retains an mmap default through %s observation failures", (failures) =>
+  withFileClient(
+    (sql, filename) =>
+      Effect.gen(function* () {
+        const writer = writerWorkers.at(-1)!;
+        // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
+        writer.postMessage({ testCheckpoint: true, kind: "fail-global-mmap", args: [failures] });
+        yield* writerBridgeBarrier(writer);
+        yield* sql`PRAGMA mmap_size=1048576`;
+        const override = sql`PRAGMA main.mmap_size=0`;
+        if (failures === 2) {
+          const blocked = yield* override.pipe(Effect.flip);
+          assert.include(String(blocked.reason.cause), "mmap default metadata failure");
+        }
+        yield* override;
+        yield* Effect.promise(() => writer.terminate());
+        assert.deepEqual(yield* sql`PRAGMA main.mmap_size`.values, [[0]]);
+        yield* sql`ATTACH DATABASE ${`${filename}.after`} AS after`;
+        assert.deepEqual(yield* sql`PRAGMA after.mmap_size`.values, [[1048576]]);
+      }),
+    { readerWorker: false },
+  ),
 );
 
 it.effect("preserves a read-only URI attachment when its identity is verified", () =>
