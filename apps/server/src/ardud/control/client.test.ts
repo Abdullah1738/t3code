@@ -46,6 +46,36 @@ const controlEnv = (url: string) => ({
 const runCli = (url: string, args: string[]) =>
   runCommand(process.execPath, [cli, ...args], controlEnv(url));
 
+describe("native owner lookup clients", () => {
+  it("passes driver and view through the client and CLI", async () => {
+    const seen: string[] = [];
+    const url = await listen((request, response) => {
+      seen.push(request.url!);
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({ ok: true, thread: { threadId: "owner" } }));
+    });
+    const client = new ControlClient({ url, token: "test" });
+    await client.threadByNativeSession("native/id", { driver: "claudeAgent", view: "owner" });
+    await client.threadByNativeSession("native/id");
+    await client.threadByNativeSession("native/id", { view: "" });
+    const result = await runCli(url, [
+      "native",
+      "native/id",
+      "--driver",
+      "codex",
+      "--view",
+      "owner",
+    ]);
+    expect(result.code).toBe(0);
+    expect(seen).toEqual([
+      "/api/ardud/control/threads/by-native/native%2Fid?driver=claudeAgent&view=owner",
+      "/api/ardud/control/threads/by-native/native%2Fid",
+      "/api/ardud/control/threads/by-native/native%2Fid?view=",
+      "/api/ardud/control/threads/by-native/native%2Fid?driver=codex&view=owner",
+    ]);
+  });
+});
+
 const runUsageCli = (url: string, args: string[]) =>
   execFile(process.execPath, [
     NodeURL.fileURLToPath(new URL("./t3ctl.mjs", import.meta.url)),

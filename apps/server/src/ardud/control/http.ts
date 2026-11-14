@@ -56,6 +56,7 @@ import * as ServerConfig from "../../config.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as ControlStore from "./ControlStore.ts";
 import * as ControlRequestAnalytics from "./ControlRequestAnalytics.ts";
+import * as ControlThreadRead from "./ControlThreadRead.ts";
 import * as Usage from "./usage.ts";
 import * as ExecutionIdentity from "../identity/ExecutionIdentity.ts";
 import * as RecoverySnapshot from "../recovery/RecoverySnapshot.ts";
@@ -74,11 +75,8 @@ import {
   modelSelectionFrom,
   parseSince,
   pendingRequestSummary,
-  runSummary,
-  runsNewestFirst,
   selectionMigrationApplies,
   selectionProblem,
-  shellSummary,
   stateFromRuns,
   stateFromShell,
   TERMINAL_RUN_STATUSES,
@@ -227,7 +225,6 @@ const chunkIds = (ids: ReadonlyArray<string>, size = 400): Array<ReadonlyArray<s
   return out;
 };
 
-const THREAD_DETAIL_RECENT_RUNS = 5;
 const READER_BUSY_MESSAGE = "The database reader is busy; retry shortly.";
 
 const errorResponse = (error: ControlError) => {
@@ -521,6 +518,7 @@ const makeRoutes = Effect.gen(function* () {
   const settingsService = yield* ServerSettings.ServerSettingsService;
   const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
   const store = yield* ControlStore.ControlStore;
+  const threadRead = yield* ControlThreadRead.ControlThreadRead;
   const usage = yield* Usage.Usage;
   const identities = yield* ExecutionIdentity.ExecutionIdentity;
   const observeControl = yield* ControlRequestAnalytics.make;
@@ -695,56 +693,10 @@ const makeRoutes = Effect.gen(function* () {
     });
   });
 
-  const summarize = Effect.fn("ControlHttp.summarize")(function* (
-    shells: ReadonlyArray<OrchestrationV2ThreadShell>,
-  ) {
-    const ids = shells.map((shell) => shell.id);
-    const [origins, natives, bindings] = yield* Effect.all([
-      store.getOrigins(ids),
-      store.nativeSessionIds(ids),
-      store.nativeBindings(ids),
-    ]).pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
-    // Children inherit the root's origin.
-    const rootIds = shells
-      .map((shell) => shell.lineage.rootThreadId)
-      .filter((rootId) => !origins.has(rootId));
-    const rootOrigins =
-      rootIds.length === 0
-        ? new Map<string, string>()
-        : yield* store
-            .getOrigins(rootIds)
-            .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
-    return shells.map((shell) => ({
-      ...shellSummary(shell, {
-        origin:
-          origins.get(shell.id) ??
-          origins.get(shell.lineage.rootThreadId) ??
-          rootOrigins.get(shell.lineage.rootThreadId) ??
-          null,
-        nativeSessionId: natives.get(shell.id) ?? null,
-      }),
-      native: bindings.get(shell.id) ?? null,
-    }));
-  });
-
-  const threadDetail = Effect.fn("ControlHttp.threadDetail")(function* (threadId: string) {
-    const shell = yield* getShell(threadId);
-    // ardud: the detail reports the current run and the newest five. Reading every
-    // run the thread ever had made this the slowest call on the iMessage reply path
-    // (p50 14.4 s on 11 Nov 2026, most aborted by the bridge's 15 s timeout).
-    const records = yield* readRecords(threadId, { recentRunLimit: THREAD_DETAIL_RECENT_RUNS });
-    const pending = records.runtimeRequests.filter((request) => request.status === "pending");
-    const { state, run } = stateFromRuns(records.runs, pending.length > 0);
-    const [summary] = yield* summarize([shell]);
-    return {
-      ...summary!,
-      state,
-      status: run?.status ?? "idle",
-      run: run === null ? null : runSummary(run),
-      recentRuns: runsNewestFirst(records.runs).slice(0, THREAD_DETAIL_RECENT_RUNS).map(runSummary),
-      pendingRequests: pending.map((request) => pendingRequestSummary(request, records.turnItems)),
-    };
-  });
+  const summarize = (shells: ReadonlyArray<OrchestrationV2ThreadShell>) =>
+    threadRead.summarize(shells).pipe(Effect.mapError((error) => fail(error.code, error.message)));
+  const threadDetail = (threadId: string) =>
+    threadRead.detail(threadId).pipe(Effect.mapError((error) => fail(error.code, error.message)));
 
   const listUsage = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
@@ -1209,14 +1161,18 @@ const makeRoutes = Effect.gen(function* () {
   const byNative = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
     const nativeId = yield* param("sessionId");
-    const driver = (yield* searchParams).get("driver") ?? undefined;
-    const threadId = yield* store
-      .threadIdForNativeSession(nativeId, driver)
-      .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
-    if (threadId === null) {
-      return yield* fail("not_found", `No thread maps to session ${nativeId}.`);
+    const params = yield* searchParams;
+    const view = params.get("view");
+    if (view !== null && view !== "owner") {
+      return yield* fail("invalid_request", "view must be owner when provided.");
     }
-    return json({ ok: true, nativeSessionId: nativeId, thread: yield* threadDetail(threadId) });
+    const thread = yield* threadRead
+      .byNative(nativeId, {
+        ...(params.has("driver") ? { driver: params.get("driver")! } : {}),
+        ...(view === "owner" ? { view } : {}),
+      })
+      .pipe(Effect.mapError((error) => fail(error.code, error.message)));
+    return json({ ok: true, nativeSessionId: nativeId, thread });
   });
 
   // Any native id a hook or tool sees, resolved to its Robob execution.
@@ -1967,6 +1923,7 @@ export const controlRouteLayer = HttpRouter.addAll(makeRoutes).pipe(
   Layer.provide(
     Layer.mergeAll(
       controlServices,
+      ControlThreadRead.layer.pipe(Layer.provide(controlServices)),
       Usage.layer,
       RecoverySnapshot.layer.pipe(Layer.provide(controlServices)),
     ),

@@ -48,7 +48,8 @@ const HELP = `t3ctl <command> [options]
          [--variant V] [--option K=V ...] [--mode full-access|approval-required|...] [--origin O] [--plan]
          [--wait] [--timeout SECONDS]
   status THREAD                        state, run, pending requests
-  native SES_ID [--driver D]           thread for an OpenCode session id (or any native id)
+  native SES_ID [--driver D] [--view owner]
+                                       thread for a native session id
   identity NATIVE_ID [--driver D] [--instance I] [--agent A]
                                        resolve any native id to its exact Robob execution
   messages THREAD [--limit N] [--last] [--role user|assistant]
@@ -269,6 +270,7 @@ async function main() {
       unsettle: { type: "boolean" },
       thread: { type: "string" },
       session: { type: "string" },
+      view: { type: "string" },
       "expect-run": { type: "string" },
       "expect-attempt": { type: "string" },
       reason: { type: "string" },
@@ -501,7 +503,10 @@ async function main() {
       return print(await client.thread(need(args[0], "THREAD")));
     case "native":
       return print(
-        await client.threadByNativeSession(need(args[0], "SES_ID"), { driver: flags.driver }),
+        await client.threadByNativeSession(need(args[0], "SES_ID"), {
+          driver: flags.driver,
+          view: flags.view,
+        }),
       );
     case "identity":
       return print(
