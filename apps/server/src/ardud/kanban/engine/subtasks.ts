@@ -294,6 +294,25 @@ const harmlessFollowup = (task: string, target: string): boolean => {
   return !/(?:[.!]|\b(?:a|an|the))$/i.test(action) && approvalAction(action) === target;
 };
 
+const subtaskApproval = (label: string) => {
+  const approval = /^(?:approve|go|ship|yes)(?:\s*[,.:;–—-]\s*|\s+)(.+)$/i.exec(
+    label
+      .trim()
+      .replace(/[.!]+$/, "")
+      .trim(),
+  );
+  if (!approval) return undefined;
+  const remainder = approval[1]!;
+  const startsWithId = /^s\d+\b/i.test(remainder);
+  const references =
+    /^(s\d+(?:(?:\s*,\s*(?:and\s+)?|\s*\+\s*|\s+and\s+)s\d+)*)(?:\s*:\s*(.+))?$/i.exec(remainder);
+  return {
+    ids: references?.[1]?.toLowerCase().match(/\bs\d+\b/g) ?? [],
+    step: startsWithId ? references?.[2] : remainder,
+    valid: !startsWithId || references !== null,
+  };
+};
+
 export const approvesGate = (
   label: string,
   gate: NonNullable<KanbanSubtask["gate"]>,
@@ -310,6 +329,23 @@ export const approvesGate = (
     /\b(?:if|unless|after|before|once|when|pending|first|then)\b/i.test(words)
   )
     return false;
+  if (scope === "subtask") {
+    const approval = subtaskApproval(words);
+    if (approval) {
+      if (!approval.valid) return false;
+      const step = approval.step;
+      const exactStep =
+        step !== undefined &&
+        !isNegativeOption(step) &&
+        !/\b(?:no|not|[a-z]+n[’']t|dont|never|cannot|without|except|only|instead|hold|skip|wait|stop|cancel)\b/i.test(
+          step,
+        ) &&
+        approvalAction(step) === approvalAction(task);
+      // An id list narrows the pick; arbitrary continuations must not reach the go/hold fallback.
+      if (approval.ids.length > 0) return step === undefined || exactStep;
+      if (exactStep) return true;
+    }
+  }
   const command = words
     .replace(/^(?:yes|ok|okay)(?:\s*[,.:;–—-]\s*|\s+)/i, "")
     .replace(/^(?:(?:please|go ahead and)\s+)+/i, "");
@@ -432,7 +468,8 @@ export const secretKindApprovalWarning = (
 const approvingAnswer = (
   ask: KanbanOwnerAsk,
   gate: NonNullable<KanbanSubtask["gate"]>,
-  task: string,
+  subtask: Pick<KanbanSubtask, "id" | "text">,
+  subtasks: readonly KanbanSubtask[],
 ): boolean => {
   const answer = ask.answer;
   if (answer?.verdict === "approved") return true;
@@ -443,12 +480,27 @@ const approvingAnswer = (
           .filter((option) => !answer.optionIds!.includes(option.id))
           .map((option) => option.label)
       : [];
+  const picked = (answer?.optionIds ?? []).map((id) =>
+    ask.options?.find((option) => option.id === id),
+  );
+  const named = picked.flatMap((option) =>
+    option ? (subtaskApproval(option.label)?.ids ?? []) : [],
+  );
   return (
     answer?.verdict === "picked" &&
-    Boolean(answer.optionIds?.length) &&
-    answer.optionIds!.every((id) => {
-      const option = ask.options?.find((entry) => entry.id === id);
-      return option !== undefined && approvesGate(option.label, gate, task, others, "subtask");
+    picked.length > 0 &&
+    (named.length === 0 || named.includes(subtask.id.toLowerCase())) &&
+    picked.every((option) => {
+      if (!option) return false;
+      const ids: readonly string[] = subtaskApproval(option.label)?.ids ?? [];
+      const targets =
+        ids.length > 0
+          ? subtasks.filter((entry) => ids.includes(entry.id.toLowerCase()))
+          : [subtask];
+      return (
+        targets.length > 0 &&
+        targets.every((target) => approvesGate(option.label, gate, target.text, others, "subtask"))
+      );
     })
   );
 };
@@ -527,7 +579,7 @@ export const approvalProblem = (
         !ask.respond?.ack &&
         ask.closedAt &&
         ask.answer !== undefined &&
-        approvingAnswer(ask, gate, subtask.text) &&
+        approvingAnswer(ask, gate, subtask, card.subtasks) &&
         ask.answer.by._tag === "owner" &&
         ask.answer.at >= since &&
         (answer === undefined || ask.answer.at > answer.at) &&
@@ -544,7 +596,7 @@ export const approvalProblem = (
       : `; for a guessed gate on an evaluator/script step, an evaluator can pass clearGate with a reason on ${subtask.id}; a gate set on purpose still needs Abdullah's answer naming ${subtask.id}`;
   const noDecisionReason = unnamedApproval
     ? `${unnamedApproval.id} was approved but doesn't name ${subtask.id}; ask again naming the subtask id (e.g. "Approve ${subtask.id}")`
-    : `no owner answer on a ${gate} ask since ${since}; ask with card_ask naming ${subtask.id} (e.g. "Approve ${subtask.id}: <step>")`;
+    : `no owner answer on a ${gate} ask since ${since}; ask with card_ask naming ${subtask.id} (e.g. "Approve ${subtask.id}")`;
   if (intent === "skip") {
     if (answer && answer.verdict !== "dropped" && answer.by._tag === "owner") return null;
     const reason =
@@ -556,7 +608,7 @@ export const approvalProblem = (
       " ",
     );
   }
-  const approved = latest !== undefined && approvingAnswer(latest, gate, subtask.text);
+  const approved = latest !== undefined && approvingAnswer(latest, gate, subtask, card.subtasks);
   if (
     approved &&
     (!window || (askWording(latest!).match(/\bs\d+\b/g) ?? []).some((id) => id === subtask.id))
@@ -580,7 +632,7 @@ export const approvalProblem = (
     reason = `the latest decision, ${latest.id}, was ${answer.verdict}`;
   }
   if (latest && unnamedApproval) {
-    reason += `; ${unnamedApproval.id} (approved later) doesn't name ${subtask.id}, so it doesn't count; ask again naming ${subtask.id} (e.g. "Approve ${subtask.id}: <step>")`;
+    reason += `; ${unnamedApproval.id} (approved later) doesn't name ${subtask.id}, so it doesn't count; ask again naming ${subtask.id} (e.g. "Approve ${subtask.id}")`;
   }
   return `card #${card.number} subtask ${subtask.id} (${gate}: ${subtask.text}) needs Abdullah's approval: ${reason}${standingReason}${clearGuidance}`.replace(
     /[\r\n]+/g,
