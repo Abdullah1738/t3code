@@ -30250,6 +30250,267 @@ it.effect("#1156 a queued setup discussion replacement inherits setup ownership"
   }),
 );
 
+const reportBugBoards = Effect.gen(function* () {
+  const { kanban, board } = yield* toyBoard;
+  const sql = yield* SqlClient.SqlClient;
+  const sourceBoard = yield* kanban.ensureBoard({
+    slug: "recall",
+    name: "Recall",
+    defaultProjectId: ProjectId.make("project-1"),
+  });
+  const store = yield* KanbanStore.KanbanStore;
+  const source = yield* kanban.createCard(
+    sourceBoard.id,
+    { title: "Source", prompt: "Fix" },
+    owner,
+  );
+  // Card numbers are immutable in putCard's upsert; fixture renumbering must update its index too.
+  yield* sql`UPDATE ardud_kanban_cards SET number = 41 WHERE id = ${source.id}`;
+  yield* store.putCard({ ...source, number: 41 });
+  yield* kanban.setPool(sourceBoard.id, sourceBoard.defaultCardModel, 1);
+  yield* kanban.dispatchNow;
+  const sourceCard = (yield* kanban.card(source.id)).card;
+  const threadId = sourceCard.activeThreadId!;
+  const unrelated = yield* kanban.createCard(
+    board.id,
+    { title: "Retire crw", prompt: "Retire" },
+    owner,
+  );
+  yield* sql`UPDATE ardud_kanban_cards SET number = 41 WHERE id = ${unrelated.id}`;
+  yield* store.putCard({ ...unrelated, number: 41 });
+  const target = yield* kanban.createCard(
+    board.id,
+    { title: "Kafka broker certificate expiry", prompt: "Fix cert" },
+    owner,
+  );
+  const targetCard = { ...target, number: 7 };
+  yield* sql`UPDATE ardud_kanban_cards SET number = 7 WHERE id = ${target.id}`;
+  yield* store.putCard(targetCard);
+  return {
+    sql,
+    kanban,
+    board,
+    sourceBoard,
+    store,
+    sourceCard,
+    threadId,
+    unrelated: { ...unrelated, number: 41 },
+    targetCard,
+  };
+});
+
+it.effect.each([
+  ["work", false, false, "#41"],
+  ["review", false, false, "#41"],
+  ["work", true, false, "#41"],
+  ["review", true, false, "#41"],
+  ["work", false, true, "#41"],
+  ["work", false, false, "41"],
+] as const)(
+  "reportBug ignores a cross-board reporter's own number (%s, title match %s, ended %s, hint %s)",
+  ([role, titleMatch, ended, hint]) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board, store, sourceCard, threadId, unrelated, targetCard } =
+          yield* reportBugBoards;
+        const link = (yield* store.threadLink(threadId))!;
+        yield* store.putThreadLink({ ...link, role });
+        if (ended) yield* store.putCard({ ...sourceCard, activeThreadId: null });
+        const before = (yield* Ref.get(fake.threads)).size;
+        const result = yield* kanban.reportBug({
+          boardId: board.id,
+          threadId,
+          title: titleMatch ? targetCard.title : "Novel parser failure",
+          evidence: "new failure",
+          cardHint: `  ${hint}  `,
+        });
+        assert.lengthOf(
+          (yield* kanban.card(unrelated.id)).events.filter((event) => event.kind === "comment"),
+          0,
+        );
+        assert.lengthOf(
+          (yield* kanban.card(sourceCard.id)).events.filter((event) => event.kind === "comment"),
+          0,
+        );
+        const threads = yield* Ref.get(fake.threads);
+        assert.strictEqual(threads.size, before + (titleMatch ? 0 : 1));
+        if (titleMatch) {
+          assert.strictEqual(result.appendedTo, "#7");
+          assert.lengthOf(
+            (yield* kanban.card(targetCard.id)).events.filter((event) => event.kind === "comment"),
+            1,
+          );
+        } else {
+          assert.isUndefined(result.appendedTo);
+          assert.isString(result.threadId);
+          assert.include(
+            threads.get(result.threadId!)!.messages[0]!,
+            `cardHint #41 is the reporter's own card on the "Recall" board, not a card on this board; ignored.`,
+          );
+        }
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect.each([
+  ["work", 7, 41, false],
+  ["review", 7, 41, false],
+  ["work", 7, 7, false],
+  ["work", 59, 59, false],
+  ["work", 7, 41, true],
+] as const)(
+  "reportBug protects all source cards (%s, carried #%s, hint #%s, original ended %s)",
+  ([role, carriedNumber, hintNumber, ended]) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board, sourceBoard, store, sourceCard, threadId, unrelated, sql } =
+          yield* reportBugBoards;
+        const carried = yield* kanban.createCard(
+          sourceBoard.id,
+          { title: "Carried source", prompt: "Fix" },
+          owner,
+        );
+        yield* sql`UPDATE ardud_kanban_cards SET number = ${carriedNumber} WHERE id = ${carried.id}`;
+        yield* store.putCard({ ...carried, number: carriedNumber });
+        yield* kanban.claimCard(threadId, carried.id);
+        assert.deepStrictEqual(
+          (yield* store.cardsByThread(threadId)).map((card) => card.number),
+          carriedNumber < 41 ? [carriedNumber, 41] : [41, carriedNumber],
+        );
+        const link = (yield* store.threadLink(threadId))!;
+        yield* store.putThreadLink({ ...link, role });
+        if (ended) yield* store.putCard({ ...sourceCard, activeThreadId: null });
+        if (hintNumber === 59) {
+          yield* sql`UPDATE ardud_kanban_cards SET number = 59 WHERE id = ${unrelated.id}`;
+          yield* store.putCard({ ...unrelated, number: 59 });
+        }
+        const before = (yield* Ref.get(fake.threads)).size;
+        const result = yield* kanban.reportBug({
+          boardId: board.id,
+          threadId,
+          title: "Novel parser failure",
+          evidence: "new failure",
+          cardHint: `#${hintNumber}`,
+        });
+        assert.isUndefined(result.appendedTo);
+        assert.isString(result.threadId);
+        const threads = yield* Ref.get(fake.threads);
+        assert.strictEqual(threads.size, before + 1);
+        assert.include(
+          threads.get(result.threadId!)!.messages[0]!,
+          `cardHint #${hintNumber} is the reporter's own card on the "Recall" board, not a card on this board; ignored.`,
+        );
+        for (const card of yield* kanban.cards(board.id))
+          assert.lengthOf(
+            (yield* kanban.card(card.id)).events.filter((event) => event.kind === "comment"),
+            0,
+          );
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect.each([
+  "bare hash",
+  "bare digits",
+  "card id",
+  "slug",
+  "board id",
+  "same board",
+  "explicit self-number",
+] as const)("reportBug appends a destination hint from a card thread: %s", (form) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board, sourceBoard, threadId, sourceCard, targetCard, unrelated } =
+        yield* reportBugBoards;
+      const sameBoard = form === "same board";
+      const hint = {
+        "bare hash": "#7",
+        "bare digits": "7",
+        "card id": targetCard.id.toUpperCase(),
+        slug: `${board.slug.toUpperCase()}#7`,
+        "board id": `${board.id.toUpperCase()}#7`,
+        "same board": "#41",
+        "explicit self-number": `${board.slug}#41`,
+      }[form];
+      const target = sameBoard
+        ? sourceCard
+        : form === "explicit self-number"
+          ? unrelated
+          : targetCard;
+      const before = (yield* Ref.get(fake.threads)).size;
+      const result = yield* kanban.reportBug({
+        boardId: sameBoard ? sourceBoard.id : board.id,
+        threadId,
+        title: "Different wording",
+        evidence: "new failure",
+        cardHint: `  ${hint}  `,
+      });
+      assert.deepStrictEqual(result, { appendedTo: `#${target.number}` });
+      assert.lengthOf(
+        (yield* kanban.card(target.id)).events.filter((event) => event.kind === "comment"),
+        1,
+      );
+      assert.strictEqual((yield* Ref.get(fake.threads)).size, before);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect.each([
+  "foreign card id",
+  "foreign slug",
+  "foreign board id",
+  "unknown slug",
+  "missing card id",
+  "settled card id",
+  "settled slug",
+  "malformed",
+] as const)("reportBug explains an unmatched explicit hint: %s", (form) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board, sourceBoard, store, threadId, sourceCard, targetCard, unrelated } =
+        yield* reportBugBoards;
+      const hint = {
+        "foreign card id": sourceCard.id,
+        "foreign slug": `${sourceBoard.slug.toUpperCase()}#7`,
+        "foreign board id": `${sourceBoard.id.toUpperCase()}#7`,
+        "unknown slug": "missing#7",
+        "missing card id": "card-00000000-0000-0000-0000-000000000000",
+        "settled card id": targetCard.id,
+        "settled slug": `${board.slug}#7`,
+        malformed: `${board.slug}#7foo`,
+      }[form];
+      if (form.startsWith("settled"))
+        yield* store.putCard({ ...targetCard, settledAt: "2026-11-01T00:00:00.000Z" });
+      const before = (yield* Ref.get(fake.threads)).size;
+      const result = yield* kanban.reportBug({
+        boardId: board.id,
+        threadId,
+        title: "Novel parser failure",
+        evidence: "new failure",
+        cardHint: hint,
+      });
+      assert.isUndefined(result.appendedTo);
+      assert.isString(result.threadId);
+      const threads = yield* Ref.get(fake.threads);
+      assert.strictEqual(threads.size, before + 1);
+      const note =
+        form === "foreign slug" || form === "foreign board id"
+          ? `cardHint ${hint} names a card on another board; ignored.`
+          : `cardHint ${hint} matched no unsettled card on this board.`;
+      assert.include(threads.get(result.threadId!)!.messages[0]!, note);
+      for (const card of [sourceCard, targetCard, unrelated])
+        assert.lengthOf(
+          (yield* kanban.card(card.id)).events.filter((event) => event.kind === "comment"),
+          0,
+        );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("reportBug appends a hinted sighting as the reporter without an evaluator", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
