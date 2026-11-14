@@ -250,6 +250,8 @@ def _pool_lock(key: str, deadline: float, wait: int, *, prepare_end: float | Non
                 except OffboxError as e:
                     if time.monotonic() < deadline:
                         continue
+                    if check_home is not None and wait > 0:
+                        check_home(force=True)
                     if timeout >= LOCK_WAIT_S and time.monotonic() - started >= LOCK_WAIT_S:
                         detail = f"other offbox runs kept its pool lock for {LOCK_WAIT_S}s"
                     else:
@@ -550,9 +552,9 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
     protected_base = bool(base and not fresh and home.active() and home.base_needs_home(source[5:]))
     next_home_probe = time.monotonic() + outage.PROBE_EVERY_S
 
-    def check_home():
+    def check_home(*, force=False):
         nonlocal next_home_probe
-        if not protected_base or time.monotonic() < next_home_probe:
+        if not protected_base or (not force and time.monotonic() < next_home_probe):
             return
         # Foreground pool holders never reach _refresh_background's API checks. Probe without a pool lock.
         why = home.preflight_reason()
@@ -1012,7 +1014,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
         t = time.monotonic()
         if last_error and not isinstance(last_error, (api.SupplyOut, api.BoatAtCapacity)):
             raise last_error
-        check_home()
+        check_home(force=wait > 0 and t >= deadline)
         if t >= deadline:
             if last_error:
                 raise last_error

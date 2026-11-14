@@ -273,10 +273,11 @@ class BaseRouting(unittest.TestCase):
 
     def test_healthy_preflight_then_outage_interrupts_named_base_queue_waits(self):
         self.full_home_pool()
-        for contention in ('full_pool', 'pool_lock'):
+        for contention, queue_wait in (('full_pool', '120'), ('pool_lock', '120'),
+                                       ('full_pool', '8'), ('pool_lock', '8')):
             for failure in ('health', 'authenticated_api'):
                 for flags in ([], ['--bg']):
-                    with self.subTest(contention=contention, failure=failure, flags=flags):
+                    with self.subTest(contention=contention, wait=queue_wait, failure=failure, flags=flags):
                         clock = [1000.0]
                         def advance(seconds):
                             clock[0] += seconds
@@ -302,7 +303,7 @@ class BaseRouting(unittest.TestCase):
                                 patch.object(outage, 'window_seconds', return_value=60), \
                                 patch.object(cli, 'time', fake_time), patch.object(outage, 'time', fake_time), \
                                 patch.object(pool, 'time', fake_time), patch.object(allocation, 'time', fake_time), \
-                                patch.dict(os.environ, OFFBOX_POOL_SIZE='1', OFFBOX_POOL_WAIT_SECONDS='120'), \
+                                patch.dict(os.environ, OFFBOX_POOL_SIZE='1', OFFBOX_POOL_WAIT_SECONDS=queue_wait), \
                                 patch.object(pool, 'file_lock', pool_lock), \
                                 patch.object(pool, '_refresh_background'), patch.object(pool, '_recheck_prune_holds'), \
                                 patch.object(pool, 'acquire', side_effect=self.real_acquire), \
