@@ -18,6 +18,8 @@ import * as DateTime from "effect/DateTime";
 
 import {
   applyReviewResult,
+  finishedReview,
+  reviewThreadToReuse,
   checkClaim,
   checkMove,
   confirmDispatch,
@@ -219,6 +221,33 @@ describe("reviewGate", () => {
     expect(reviewGate(card({ reviewStep: 0 }), 1)).not.toBeNull();
     expect(reviewGate(card({ reviewStep: 1 }), 1)).toBeNull();
     expect(reviewGate(card({ reviewStep: 1 }), 2)).not.toBeNull();
+  });
+});
+
+describe("finished review", () => {
+  it.each(["open", "merged", "closed", null] as const)(
+    "settles passed steps without crediting another verdict (PR %s)",
+    (state) => {
+      const passed = card({
+        stage: "needs_review",
+        reviewStep: 2,
+        reviewRound: 3,
+        links: [{ kind: "pr", url: "u", label: null, state, checkedAt: null }],
+      });
+      expect(finishedReview(passed)).toEqual({
+        stage: state === "open" ? "in_review" : "completed",
+        reviewStep: 2,
+        reviewRound: 3,
+        continueReview: false,
+      });
+    },
+  );
+
+  it("reuses only an unfinished queued review", () => {
+    const thread = ThreadId.make("reviewer");
+    const queued = card({ stage: "needs_review", reviewThreadId: thread });
+    expect(reviewThreadToReuse(board, queued)).toBe(thread);
+    expect(reviewThreadToReuse(board, { ...queued, reviewStep: 10 })).toBeNull();
   });
 });
 

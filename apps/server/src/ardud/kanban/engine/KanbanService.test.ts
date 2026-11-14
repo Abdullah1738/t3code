@@ -4038,7 +4038,10 @@ it.effect.each([
         updatedAt: _updated,
         ...rest
       }: typeof after) => rest;
-      assert.deepStrictEqual(metadata(after), metadata(changed));
+      const expected =
+        change === "review step" ? { ...changed, reviewFindingsPending: false } : changed;
+      assert.deepStrictEqual(metadata(after), metadata(expected));
+      if (change === "review step") assert.strictEqual(after.stage, "completed");
       assert.lengthOf(gate.withdrawals, 1);
       assert.strictEqual(gate.withdrawals[0]!.key, gate.fake.sends[before]!.key);
       assert.isFalse((yield* Ref.get(gate.fake.threads)).get(reviewThread)!.running);
@@ -5616,6 +5619,184 @@ const startReplayReview = Effect.gen(function* () {
   assert.notStrictEqual(reviewing.activeThreadId, workThread);
   return { kanban, card, worker, reviewThread: reviewing.activeThreadId! };
 });
+
+const chainEditFixture = Effect.gen(function* () {
+  const fixture = yield* startReplayReview;
+  const { kanban, card, reviewThread } = fixture;
+  const store = yield* KanbanStore.KanbanStore;
+  const board = (yield* store.boards).find((row) => row.id === card.boardId)!;
+  const three = { name: "Three", steps: Array.from({ length: 3 }, () => board.defaultCardModel) };
+  const one = { name: "One", steps: [board.defaultCardModel] };
+  const updated = yield* kanban.updateBoard(board.id, {
+    reviewChains: [three, one],
+    defaultReviewChain: "Three",
+  });
+  for (let step = 0; step < 2; step++) {
+    yield* kanban.reviewResult(reviewThread, "clear", []);
+    yield* kanban.dispatchNow;
+  }
+  const reviewing = (yield* kanban.card(card.id)).card;
+  assert.strictEqual(reviewing.reviewStep, 2);
+  assert.strictEqual(reviewing.activeThreadId, reviewThread);
+  return { ...fixture, board: updated, store, three, one };
+});
+
+it.effect.each(
+  (["board", "card", "default", "fallback"] as const).flatMap((path) =>
+    (["completed", "waiting for PR", "more work"] as const).map((result) => ({ path, result })),
+  ),
+)("#1387 $path chain edit applies the finished transition: $result", ({ path, result }) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, card, board, store, reviewThread, three, one } = yield* chainEditFixture;
+      const current = (yield* kanban.card(card.id)).card;
+      const review = {
+        id: "s1",
+        step: 1,
+        text: "Check behavior",
+        owner: "review" as const,
+        state: "open" as const,
+        note: null,
+        doneBy: null,
+        doneAt: null,
+      };
+      yield* store.putCard({
+        ...current,
+        wakeNote: "Old review note",
+        nudgedAt: current.updatedAt,
+        links:
+          result === "waiting for PR"
+            ? [
+                {
+                  kind: "pr",
+                  url: "https://github.com/a/b/pull/1",
+                  label: null,
+                  state: "open",
+                  checkedAt: null,
+                },
+              ]
+            : [],
+        subtasks:
+          result === "more work"
+            ? [review, { ...review, id: "s2", step: 2, text: "Follow up", owner: "work" }]
+            : [review],
+        subtaskSeq: result === "more work" ? 2 : 1,
+      });
+      const threadIds = [...(yield* Ref.get(fake.threads)).keys()];
+      const sends = fake.sends.length;
+      if (path === "card") yield* kanban.editCard(card.id, { reviewChain: "One" }, owner);
+      else if (path === "default")
+        yield* kanban.updateBoard(board.id, { defaultReviewChain: "One" });
+      else
+        yield* kanban.updateBoard(board.id, {
+          reviewChains: path === "fallback" ? [one] : [{ ...three, steps: one.steps }, one],
+        });
+      const finished = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(
+        finished.stage,
+        result === "completed" ? "completed" : result === "more work" ? "todo" : "in_review",
+      );
+      assert.strictEqual(finished.reviewStep, result === "more work" ? 0 : 2);
+      assert.strictEqual(finished.reviewRound, current.reviewRound);
+      assert.isNull(finished.activeThreadId);
+      assert.isNull(finished.activeRole);
+      assert.isNull(finished.activePool);
+      assert.isNull(finished.nudgedAt);
+      assert.strictEqual(finished.subtasks[0]!.state, "done");
+      assert.strictEqual(finished.reviewThreadId, reviewThread);
+      assert.isNotNull((yield* store.threadLink(reviewThread))!.endedAt);
+      // Late no-verdict events from the detached reviewer cannot reopen its review.
+      yield* kanban.turnEnded(reviewThread);
+      yield* kanban.turnEnded(reviewThread);
+      yield* kanban.dispatchNow;
+      assert.deepStrictEqual([...(yield* Ref.get(fake.threads)).keys()], threadIds);
+      assert.isFalse(fake.sends.slice(sends).some((send) => send.threadId === reviewThread));
+      assert.strictEqual((yield* kanban.card(card.id)).card.reviewThreadId, reviewThread);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect.each([
+  "unchanged",
+  "same length",
+  "longer",
+  "unrelated",
+  "same effective name",
+  "different name",
+] as const)("#1387 unfinished review retains its reviewer after %s chain edit", (kind) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, card, board, store, reviewThread, three, one } = yield* chainEditFixture;
+      const before = (yield* kanban.card(card.id)).card;
+      yield* store.putCard({ ...before, reviewStep: 1 });
+      if (kind === "same effective name")
+        yield* kanban.editCard(card.id, { reviewChain: "Three" }, owner);
+      else if (kind === "different name") {
+        yield* kanban.updateBoard(board.id, {
+          reviewChains: [three, { ...three, name: "Other" }, one],
+        });
+        yield* kanban.editCard(card.id, { reviewChain: "Other" }, owner);
+      } else if (kind !== "unchanged") {
+        yield* kanban.updateBoard(board.id, {
+          reviewChains: [
+            kind === "longer"
+              ? { ...three, steps: [...three.steps, board.defaultCardModel] }
+              : three,
+            kind === "unrelated" ? { ...one, steps: three.steps } : one,
+          ],
+        });
+      }
+      const after = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(after.reviewStep, kind === "different name" ? 0 : 1);
+      assert.strictEqual(after.activeThreadId, reviewThread);
+      assert.isNull((yield* store.threadLink(reviewThread))!.endedAt);
+      const threadIds = [...(yield* Ref.get(fake.threads)).keys()];
+      yield* kanban.turnEnded(reviewThread);
+      yield* kanban.turnEnded(reviewThread);
+      assert.strictEqual((yield* kanban.card(card.id)).card.stage, "needs_review");
+      yield* kanban.dispatchNow;
+      const resumed = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(resumed.activeThreadId, reviewThread);
+      assert.strictEqual(resumed.reviewStep, kind === "different name" ? 0 : 1);
+      assert.deepStrictEqual([...(yield* Ref.get(fake.threads)).keys()], threadIds);
+      assert.isNull((yield* store.threadLink(reviewThread))!.endedAt);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect.each([0, 2])("#1387 dispatcher settles a finished queued review with %s slots", (slots) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, card, board, store, reviewThread } = yield* chainEditFixture;
+      const current = (yield* kanban.card(card.id)).card;
+      yield* kanban.updateBoard(board.id, {
+        reviewChains: [{ name: "Three", steps: [board.defaultCardModel] }],
+      });
+      // A legacy/recovered queue entry that predates settling at edit time.
+      yield* store.putCard({
+        ...current,
+        stage: "needs_review",
+        activeThreadId: null,
+        activeRole: null,
+        activePool: null,
+      });
+      yield* kanban.setPool(board.id, board.defaultCardModel, slots);
+      const threadIds = [...(yield* Ref.get(fake.threads)).keys()];
+      const sends = fake.sends.length;
+      yield* kanban.dispatchNow;
+      const finished = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(finished.stage, "completed");
+      assert.strictEqual(finished.reviewStep, 2);
+      assert.isNull(finished.activeThreadId);
+      assert.isNotNull((yield* store.threadLink(reviewThread))!.endedAt);
+      assert.deepStrictEqual([...(yield* Ref.get(fake.threads)).keys()], threadIds);
+      assert.strictEqual(fake.sends.length, sends);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
 
 it.effect.each([
   "clear waiting to land",
@@ -25423,7 +25604,7 @@ it.effect.each(["grow", "replace"] as const)(
         yield* Fiber.join(ticking);
         const current = (yield* kanban.card(card.id)).card;
         assert.strictEqual(current.stage, "in_review");
-        assert.strictEqual(current.reviewStep, 1);
+        assert.strictEqual(current.reviewStep, change === "replace" ? 0 : 1);
       }).pipe(Effect.provide(testLayer(fake.layer)));
     }),
 );
