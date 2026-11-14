@@ -62,6 +62,11 @@ if __name__ == "__main__":
 
 
 class FieldContextTests(unittest.TestCase):
+    def setUp(self):
+        from unittest.mock import patch
+        p = patch.object(ph, "lock_event")
+        p.start(); self.addCleanup(p.stop)
+
     """Synthetic nodes with generic or absent IDs: the label/content-desc alone must carry the context."""
 
     def _node(self, t, c, rid, x=1, y=2):

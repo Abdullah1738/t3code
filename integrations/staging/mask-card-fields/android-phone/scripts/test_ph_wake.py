@@ -82,6 +82,7 @@ class WakeTests(unittest.TestCase):
     def setUp(self):
         self.phone = FakePhone()
         for target, replacement in [
+            ("lock_event", lambda *a, **kw: None),
             ("adb", self.phone.adb), ("_run", self.phone.run),
             ("d", self.phone.device), ("time.monotonic", lambda: self.phone.now),
             ("time.sleep", self.phone.sleep),
