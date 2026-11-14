@@ -528,7 +528,7 @@ def clone_wait(snapshot, run, deadline):
                     by_path.setdefault(path, set()).add(proc['pid'])
         shared = {path: pids for path, pids in by_path.items() if len(pids) >= 2}
         candidates = [p for p, clone, paths, exact in selected.values()
-                      if clone or any(path in shared for path in paths)]
+                      if clone or any(p['pid'] in shared.get(path, ()) for path in paths)]
         if candidates:
             observations, count, starts = sample_disk_wait(candidates, run, deadline, sample_count=3)
             props.update(sampleCount=count, sampling='full' if count == 3 else 'partial')
@@ -550,7 +550,7 @@ def clone_wait(snapshot, run, deadline):
                 if pid not in waiting:
                     continue
                 _, clone, paths, exact = selected[pid]
-                matched = [path for path in paths if path in shared]
+                matched = [path for path in paths if pid in shared.get(path, ())]
                 if not clone and not matched:
                     continue
                 procs.append(dict(pid=pid, path=(matched[0] if matched else paths[-1] if paths else ''),

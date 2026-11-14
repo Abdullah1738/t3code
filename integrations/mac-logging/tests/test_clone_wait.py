@@ -174,6 +174,52 @@ class CloneWaitTests(unittest.TestCase):
                 rows = [proc(100+index*2, 'stat', a), proc(101+index*2, 'stat', b)]
                 self.assertEqual(self.probe(rows)['props']['count'], count)
 
+    def test_mixed_exact_and_ambiguous_paths_keep_verified_group_membership(self):
+        cases = [
+            ('bare continuation', 'cp -c /db other-file /destination',
+             'stat /db other-file', '/destination', True),
+            ('relative destination', 'cp -c /db other-file destination.sqlite',
+             'stat /db other-file', 'destination.sqlite', True),
+            ('literal single quote', "cp -c /db owner's-copy /destination",
+             "stat /db owner's-copy", '/destination', True),
+            ('literal double quote', 'cp -c /db other"file" /destination',
+             'stat /db other"file"', '/destination', True),
+            ('literal escape', 'cp -c /db other\\file /destination',
+             'stat /db other\\file', '/destination', True),
+            ('verified member', 'cp -c /source /db',
+             'stat /db other-file', '/db', False),
+        ]
+        for index, (label, clone_args, ambiguous_args, path, separate) in enumerate(cases):
+            with self.subTest(form=label):
+                first = 700+index*10
+                exact = [proc(first, 'stat', 'stat /db'), proc(first+1, 'stat', 'stat /db')]
+                clone = proc(first+2, args=clone_args)
+                ambiguous = proc(first+3, 'stat', ambiguous_args)
+                before = len(self.notifications)
+                self.probe(exact)
+                self.assertEqual(len(self.notifications), before+1)
+                rows = exact+[clone, ambiguous]
+                sampled = []
+                base = self.runner()
+                def run(cmd, **kw):
+                    if cmd[:2] == ['/bin/ps', '-p'] and cmd[-1] == 'pid=,stat=,time=':
+                        sampled.append({int(pid) for pid in cmd[2].split(',')})
+                    return base(cmd, **kw)
+                collector.clone_wait(rows, run, time.monotonic()+30)
+                event = self.rows()[-1]
+                self.assertTrue(event['ok'])
+                expected = {first, first+1, first+2}
+                self.assertEqual(sampled, [expected]*3)
+                self.assertEqual({p['pid'] for p in event['props']['procs']}, expected)
+                clone_row = next(p for p in event['props']['procs'] if p['pid'] == clone['pid'])
+                self.assertEqual(clone_row['reason'], 'clone')
+                self.assertEqual(clone_row['path'], path)
+                self.assertEqual(len(self.notifications), before+1+int(separate))
+                if separate:
+                    self.assertIn(':clone-wait:%s:' % clone['pid'], self.notifications[-1][1])
+                self.probe(rows)
+                self.assertEqual(len(self.notifications), before+1+int(separate))
+
     def test_relative_redacted_and_truncated_paths_do_not_merge_incidents(self):
         for index, (a, b) in enumerate([
             ('backup.sqlite', 'backup.sqlite'),
