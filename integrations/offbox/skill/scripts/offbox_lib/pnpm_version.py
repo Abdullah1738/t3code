@@ -16,6 +16,7 @@ __offbox_pnpm_source=@SOURCE@
 __offbox_pnpm_fail() { __offbox_stop "pnpm $__offbox_pnpm_pin ($__offbox_pnpm_source; box ${__offbox_pnpm_current:-none}): $*"; }
 export COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 export npm_config_manage_package_manager_versions=false
+__offbox_pnpm_path=$PATH
 # A version probe must not let an unconfigured Corepack shim fetch its default/latest package manager.
 __offbox_pnpm_current=$(COREPACK_ENABLE_NETWORK=0 pnpm --version 2>/dev/null) || __offbox_pnpm_current=
 __offbox_pnpm_matches() {
@@ -92,7 +93,11 @@ if ! __offbox_pnpm_matches "$__offbox_pnpm_current"; then
   __offbox_pnpm_current=$(pnpm --version 2>/dev/null) || __offbox_pnpm_fail 'activated pnpm cannot execute'
 fi
 __offbox_pnpm_matches "$__offbox_pnpm_current" || __offbox_pnpm_fail 'activated pnpm does not match'
-__offbox_pin_command pnpm "$(command -v pnpm)"
+__offbox_pnpm_command=$(command -v pnpm)
+# Cache bins are only needed for the activation probes; the shim owns pnpm.
+export PATH=$__offbox_pnpm_path
+__offbox_pin_command pnpm "$__offbox_pnpm_command"
+unset __offbox_pnpm_path __offbox_pnpm_command
 echo "offbox: pnpm v$__offbox_pnpm_current ($__offbox_pnpm_source)" >&2
 unset -f __offbox_pnpm_fail __offbox_pnpm_matches
 unset __offbox_pnpm_pin __offbox_pnpm_base __offbox_pnpm_source __offbox_pnpm_current __offbox_pnpm_cache __offbox_pnpm_tmp __offbox_pnpm_version __offbox_pnpm_bin

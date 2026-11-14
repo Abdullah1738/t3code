@@ -25,11 +25,20 @@ __offbox_stop() {
   exit 99
 }
 __offbox_pin_command() {
+  local entry tail=$PATH rest= sep=
   export __offbox_toolchain_bin="$HOME/.offbox/toolchains/commands/${OFFBOX_RUN_ID:-current}"
   mkdir -p "$__offbox_toolchain_bin" || __offbox_stop "cannot create toolchain shim directory"
   if [ "$2" != "$__offbox_toolchain_bin/$1" ]; then
     ln -sf "$2" "$__offbox_toolchain_bin/$1" || __offbox_stop "cannot activate $1 shim"
   fi
-  export PATH="$__offbox_toolchain_bin:$PATH"
+  while :; do
+    entry=${tail%%:*}
+    if [ "$entry" != "$__offbox_toolchain_bin" ]; then
+      rest="$rest$sep$entry"; sep=:
+    fi
+    [[ $tail == *:* ]] || break
+    tail=${tail#*:}
+  done
+  export PATH="$__offbox_toolchain_bin${sep:+:}$rest"
 }
 '''

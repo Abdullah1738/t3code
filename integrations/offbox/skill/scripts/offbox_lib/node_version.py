@@ -100,10 +100,73 @@ else
 fi
 __offbox_actual=$(node --version 2>/dev/null) || __offbox_stop "$__offbox_want: selected Node cannot execute"
 [[ "$__offbox_actual" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && __offbox_in "$(__offbox_nk "$__offbox_actual")" || __offbox_stop "$__offbox_want: selected Node $__offbox_actual does not match"
-__offbox_pin_command node "$(command -v node)"
+# Keep a real nvm entry so nvm use can replace it in place.
+__offbox_node_executable=$(command -v node)
+if [ -n "${__offbox_node_commands:-}" ] && [ "$__offbox_node_executable" = "$__offbox_node_commands/node" ]; then
+  __offbox_node_executable=$(readlink "$__offbox_node_executable") || __offbox_stop 'cannot resolve selected Node'
+fi
+# Symlink targets must survive cd even when the original PATH entry was relative.
+__offbox_node_dir=$(CDPATH= builtin cd -L -- "$(dirname "$__offbox_node_executable")" && pwd -L) ||
+  __offbox_stop 'cannot resolve selected Node directory'
+__offbox_node_bin=$(CDPATH= builtin cd -P -- "$__offbox_node_dir" && pwd -P) ||
+  __offbox_stop 'cannot resolve selected Node directory'
+# nvm trims trailing slashes, and a relative root would stop working after cd.
+# Keep its logical spelling (including directory symlinks), but make it absolute.
+__offbox_original_nvm_dir=${NVM_DIR:-$HOME/.nvm}
+__offbox_nvm_dir=$(CDPATH= builtin cd -L -- "$__offbox_original_nvm_dir" 2>/dev/null && pwd -L) || __offbox_nvm_dir=
+__offbox_nvm_root=
+if [ -n "$__offbox_nvm_dir" ]; then
+  export NVM_DIR=$__offbox_nvm_dir
+  __offbox_nvm_root=$(CDPATH= builtin cd -P -- "$NVM_DIR" && pwd -P) || __offbox_nvm_root=
+fi
+# Use nvm's old-style bin shape so nvm use/deactivate can replace/remove
+# these links, while nvm current still identifies the selected Node correctly.
+__offbox_node_nvm_dir=${__offbox_node_dir%/versions/node/*/bin}
+__offbox_node_suffix=
+# A version or bin directory may link outside NVM_DIR. Check ownership from
+# the original path's nvm root before following those installation symlinks.
+if [ -n "$__offbox_nvm_root" ] && [ "$__offbox_node_nvm_dir" != "$__offbox_node_dir" ] &&
+   [ "$(CDPATH= builtin cd -P -- "$__offbox_node_nvm_dir" && pwd -P)" = "$__offbox_nvm_root" ]; then
+  __offbox_node_suffix=${__offbox_node_dir#"$__offbox_node_nvm_dir"}
+elif [ -n "$__offbox_nvm_root" ] && [[ "$__offbox_node_bin" == "$__offbox_nvm_root"/versions/node/*/bin ]]; then
+  __offbox_node_nvm_dir=
+  __offbox_node_suffix=${__offbox_node_bin#"$__offbox_nvm_root"}
+else
+  __offbox_node_nvm_dir=
+fi
+if [ -n "$__offbox_node_suffix" ]; then
+  # Keep nvm's own path spelling so use/deactivate can also strip the real bin.
+  __offbox_node_bin="$NVM_DIR$__offbox_node_suffix"
+  export __offbox_node_commands="${NVM_DIR:-$HOME/.nvm}/.offbox-${OFFBOX_RUN_ID:-current}/bin"
+else
+  export __offbox_node_commands="$HOME/.offbox/toolchains/node/${OFFBOX_RUN_ID:-current}/bin"
+fi
+__offbox_node_path=; __offbox_sep=; __offbox_tail=$PATH
+while :; do
+  __offbox_entry=${__offbox_tail%%:*}
+  case "$__offbox_entry" in
+    "$__offbox_node_bin"|"$__offbox_node_commands"|"${NVM_DIR:-$HOME/.nvm}"/versions/node/*/bin|"$__offbox_original_nvm_dir"/versions/node/*/bin|"$__offbox_nvm_root"/versions/node/*/bin|"$__offbox_node_nvm_dir"/versions/node/*/bin) ;;
+    *) __offbox_node_path="$__offbox_node_path$__offbox_sep$__offbox_entry"; __offbox_sep=: ;;
+  esac
+  [[ $__offbox_tail == *:* ]] || break
+  __offbox_tail=${__offbox_tail#*:}
+done
+export PATH="$__offbox_node_bin${__offbox_sep:+:}$__offbox_node_path"
+mkdir -p "$__offbox_node_commands" || __offbox_stop 'cannot create Node command directory'
+for __offbox_command in node npm npx corepack; do
+  if [ -x "$__offbox_node_bin/$__offbox_command" ]; then
+    ln -sf "$__offbox_node_bin/$__offbox_command" "$__offbox_node_commands/$__offbox_command" ||
+      __offbox_stop "cannot activate $__offbox_command"
+  else
+    rm -f "$__offbox_node_commands/$__offbox_command" || __offbox_stop "cannot clear $__offbox_command"
+  fi
+done
+export PATH="$__offbox_node_commands:$PATH"
+hash -r
 [ "${__offbox_installed:-}" = 1 ] || echo "offbox: node $__offbox_actual ($__offbox_want)" >&2
 unset -f __offbox_nk __offbox_in
 unset __offbox_want __offbox_best __offbox_bk __offbox_have __offbox_d __offbox_v __offbox_k __offbox_cur __offbox_actual __offbox_installed __offbox_install __offbox_reason __offbox_index __offbox_rest
+unset __offbox_original_nvm_dir __offbox_nvm_dir __offbox_nvm_root __offbox_node_executable __offbox_node_dir __offbox_node_bin __offbox_node_nvm_dir __offbox_node_suffix __offbox_node_path __offbox_sep __offbox_tail __offbox_entry __offbox_command
 """
 
 
@@ -267,7 +330,7 @@ def parse_nvmrc(text):
     p = _partial(line)
     if not p:
         return None
-    return [(_lower(p), _key(p[0] + 1))]
+    return [(_lower(p), _lower(p) + 1 if len(p) == 3 else _upper(p))]
 
 
 def _read(p):
@@ -316,7 +379,8 @@ def _want(root, cwd):
         if text is None and eng is None:
             continue
         nv = parse_nvmrc(text) if text is not None else None
-        nv_label = f"{prefix}{name} {_first_line(text)}" if nv else None
+        exact = bool(nv and len(nv) == 1 and nv[0][1] == nv[0][0] + 1)
+        nv_label = f"{prefix}{name} {_first_line(text)}" + (" (exact)" if exact else "") if nv else None
         en = parse_range(eng) if eng else None
         en_label = f"{prefix}package.json engines {eng}" if en is not None else None
         if nv is not None and en is not None:
