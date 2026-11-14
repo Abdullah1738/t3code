@@ -160,6 +160,12 @@ Missing worktree dirs are only reported, never pruned. Audit
 `~/.local/share/dev-janitor/worktree_reaper.jsonl`, status `worktree_reaper_last.json`,
 alerted by memory health check `worktree_reaper`.
 
+## ovnfs (deprecated, uninstalled 2026-11-12)
+
+ovnfs checkouts are gone; agents use git worktrees again. If `~/checkouts`,
+`ovnfs` or an `ovnfs-*` LaunchAgent reappears, report it instead of cleaning it.
+Salvaged checkout work is in `/Volumes/ExternalSSD/ovnfs-salvage-20261112/`; never delete it.
+
 ## Pitfalls
 
 - Never quit Docker Desktop while any container runs or while a session
