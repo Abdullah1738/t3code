@@ -163,6 +163,7 @@ def parallel_lanes(root, deadline, since, cache):
     context = multiprocessing.get_context('fork')
     end = min(deadline, time.time() + 8) if deadline is not None else time.time() + 8
     children, connections, results = [], [], []
+    services, failed = {}, set()
     try:
         for service in LANES:
             receive, send = context.Pipe(duplex=False)
@@ -171,13 +172,14 @@ def parallel_lanes(root, deadline, since, cache):
             send.close()
             children.append(process)
             connections.append(receive)
+            services[receive] = service
         while connections and end > time.time():
             ready = wait(connections, timeout=max(0, end - time.time()))
             for connection in ready:
                 try:
                     results.append(connection.recv())
                 except EOFError:
-                    pass
+                    failed.add(services[connection])
                 connections.remove(connection)
                 connection.close()
     finally:
@@ -188,8 +190,11 @@ def parallel_lanes(root, deadline, since, cache):
                 process.terminate()
             process.join(timeout=0.05)
     lanes = {name: {'exhaustive': False, 'covered_from': None, 'limit': None,
+                    'stop_reason': 'slice_out', 'coverage_cleared_rows': 0,
                     'fetched': 0, 'cached': 0, 'pages': 0, 'ms': round((time.monotonic() - started) * 1000)}
              for name in LANES}
+    for name in failed:
+        lanes[name]['stop_reason'] = 'reader_error'
     rows, invalidated = [], []
     for result in results:
         rows.extend(result['orders'])
@@ -221,16 +226,19 @@ def native(app, root, deadline=None, since=None, cache=None, services=None):
         lane_end = end
         rows = []
         lane = {'exhaustive': False, 'covered_from': None, 'limit': None,
-                'fetched': 0, 'cached': 0, 'pages': 0, 'ms': 0}
+                'fetched': 0, 'cached': 0, 'pages': 0, 'ms': 0,
+                'stop_reason': 'slice_out', 'coverage_cleared_rows': 0}
         previous, seen, page, broken, unordered = None, set(), 1, False, False
         cursor, page_ids, cursors = None, set(), set()
-        invalidated = set()
+        invalidated, cleared = set(), 0
+        gap_reason = None
         try:
             while lane_end - time.monotonic() > 0.05:
                 result = native_orders.orders('noon', service=service, page=page,
                                               timeout=lane_end - time.monotonic(),
                                               **({'cursor': cursor} if cursor is not None else {}))
                 if time.monotonic() >= lane_end or not result.get('ok') or result.get('partial'):
+                    lane['stop_reason'] = 'slice_out' if time.monotonic() >= lane_end else 'list_error'
                     break
                 lane['pages'] += 1
                 coverage = (result.get('coverage') or {}).get(service) or {}
@@ -263,6 +271,8 @@ def native(app, root, deadline=None, since=None, cache=None, services=None):
                     oid = order['order']
                     if service == 'marketplace' and oid in shipment_cancellations:
                         broken = True
+                        gap_reason = gap_reason or 'scoped_cancellation'
+                        cleared += 1
                         lane['covered_from'] = None
                         rows[:] = [row for row in rows if row['order'] != oid]
                         continue
@@ -271,9 +281,12 @@ def native(app, root, deadline=None, since=None, cache=None, services=None):
                             # A later scoped card can invalidate earlier terminal
                             # evidence. Do not retain its total as a positive match.
                             broken = True
+                            gap_reason = gap_reason or 'scoped_conflict'
+                            cleared += 1
                             rows[:] = [row for row in rows if row['order'] != oid]
                         continue
                     seen.add(oid)
+                    stage = 'unknown_time_row'
                     try:
                         list_time = (moment(order['placed_at'], service) if service == 'minutes' or
                                      (paging and coverage.get('ordered_by_placed_at') is True) else None)
@@ -285,6 +298,7 @@ def native(app, root, deadline=None, since=None, cache=None, services=None):
                                 page_done = False
                                 if list_time is None:
                                     lane['covered_from'] = None
+                                    cleared += 1
                                 break
                             row = known.get((service, oid))
                             if row is not None and terminal(row) and (
@@ -294,15 +308,20 @@ def native(app, root, deadline=None, since=None, cache=None, services=None):
                                 lane['cached'] += 1
                             else:
                                 lane['fetched'] += 1
+                                stage = 'detail_error'
                                 detail = details(oid, service, timeout=lane_end - time.monotonic())
                                 if time.monotonic() >= lane_end:
                                     page_done = False
                                     if list_time is None:
                                         lane['covered_from'] = None
+                                        cleared += 1
                                     break
                                 if (detail.get('ok') is not True or detail.get('account_verified') is not True
                                         or detail.get('order') != oid):
                                     raise ValueError('unverified detail')
+                                stage = 'unknown_time_row'
+                                moment(list_time.isoformat() if list_time else detail.get('placed_at'), service)
+                                stage = 'invalid_detail'
                                 row = projection({**detail, 'service': service,
                                                   'placed_at': list_time.isoformat() if list_time else detail.get('placed_at'),
                                                   'status': detail.get('status') if service == 'marketplace' else order.get('status'),
@@ -316,40 +335,51 @@ def native(app, root, deadline=None, since=None, cache=None, services=None):
                             rows.append(row)
                         if service != 'marketplace' and previous is not None and placed > previous:
                             unordered = True
+                            cleared += 1
                         previous = placed
                         if service != 'marketplace' and not broken and not unordered and page_verified:
                             lane['covered_from'] = placed.isoformat()
                     except Exception:
                         # Preserve earlier proof and later positive evidence, never bridge a gap.
                         broken = True
+                        gap_reason = gap_reason or ('slice_out' if time.monotonic() >= lane_end else stage)
                         # Marketplace lists active shipments before history. An unread
                         # row without a known time can be newer than the verified prefix.
                         try:
                             gap_time = moment(order.get('placed_at'), service)
                             if previous is None or gap_time > previous:
                                 lane['covered_from'] = None
+                                cleared += 1
                         except (ValueError, TypeError):
                             lane['covered_from'] = None
+                            cleared += 1
                 if unordered:
                     lane['covered_from'] = None
                 if not page_done or broken or unordered or repeated_page:
+                    lane['stop_reason'] = ('slice_out' if not page_done else
+                        gap_reason if broken else 'unordered' if unordered else 'repeated_page')
                     break
                 if paging and service != 'marketplace':
                     pages = coverage.get('total_pages')
                     valid = type(pages) is int and pages >= page and coverage.get('page') == page
                     lane['exhaustive'] = valid and page == pages and (page == 1 or bool(seen - before))
                     if not valid or lane['exhaustive'] or (since and previous and previous < since - SAME_TIME):
+                        lane['stop_reason'] = ('invalid_paging' if not valid else
+                            'end_of_history' if lane['exhaustive'] else 'covered')
                         break
                     # An empty or repeated page cannot advance proof of history.
                     if not listed or not (seen - before):
+                        lane['stop_reason'] = 'repeated_page'
                         break
                     page += 1
                 elif paging:
                     if not page_verified:
+                        lane['stop_reason'] = 'invalid_paging'
                         break
                     lane['exhaustive'] = coverage.get('exhaustive') is True
                     nxt = coverage.get('next_cursor')
                     if lane['exhaustive'] or not isinstance(nxt, str) or not nxt or nxt in cursors:
+                        lane['stop_reason'] = 'end_of_history' if lane['exhaustive'] else 'invalid_paging'
                         break
                     cursors.add(nxt)
                     cursor = nxt
@@ -359,9 +389,11 @@ def native(app, root, deadline=None, since=None, cache=None, services=None):
                     # Older installed readers still expose only the default page.
                     if not lane['exhaustive'] and (since is None or previous is None or previous >= since):
                         lane['limit'] = 'page-1 history only'
+                    lane['stop_reason'] = 'end_of_history' if lane['exhaustive'] else 'unproven_paging'
                     break
         except Exception:
-            pass
+            lane['stop_reason'] = 'slice_out' if time.monotonic() >= lane_end else 'list_error'
+        lane['coverage_cleared_rows'] = cleared
         lane['ms'] = round((time.monotonic() - start) * 1000)
         return rows, lane, [{'service': service, 'order': oid} for oid in sorted(invalidated)]
 

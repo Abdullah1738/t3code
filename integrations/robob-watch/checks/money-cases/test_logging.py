@@ -184,6 +184,23 @@ class Logging(Base):
         self.assertFalse(self.rows('check.run')[-1]['ok'])
         self.assertEqual(self.rows('check.run')[-1]['props']['fired'], 0)
 
+    def test_known_source_limits_alone_complete_ok_and_bad_reason_is_dropped(self):
+        def limited(*args, stats, **kw):
+            stats['question_limits'] = [{'why': 'private fixture',
+                'kinds': ['ORDER_LIST_HOST_BINDING_UNVERIFIED']}]
+            return []
+        with patch.object(mc, 'follow', side_effect=limited):
+            mc.run_check(self.wd, 'limit', self.data, self.root, at('2026-11-14T10:00'), finder(), nobody)
+        row = self.rows('check.run')[-1]
+        self.assertTrue(row['ok'])
+        self.assertEqual(row['props']['sourceLimits'], 1)
+        for bad in ('PRIVATE9999', ['PRIVATE9999'], {'private': 'PRIVATE9999'}):
+            mc.toollog.emit('money-cases', 'check.run', ok=True, props={
+                'orderCoverage': {'noon': {'food': {'stop_reason': bad}}}})
+            row = self.rows('check.run')[-1]
+            self.assertNotIn('stop_reason', row['props']['orderCoverage']['noon']['food'])
+            self.assertNotIn('PRIVATE', json.dumps(row))
+
     def test_raising_logger_preserves_commands_and_refusals(self):
         with patch.object(mc.toollog, 'emit', side_effect=OSError('disk full')):
             self.case()
@@ -215,7 +232,7 @@ class Logging(Base):
         row, = self.rows('check.run')
         self.assertFalse(row['ok'])
         self.assertEqual(row['durationMs'], 40000)
-        self.assertEqual(row['props'], {'budgetHit': True, 'openCases': 1, 'fired': 0, 'slowestPhase': 'follow', 'sourceLimits': 0, 'limitKinds': [], 'orderCoverage': {}})
+        self.assertEqual(row['props'], {'budgetHit': True, 'openCases': 1, 'fired': 0, 'slowestPhase': 'follow', 'sourceLimits': 0, 'limitKinds': [], 'orderCoverage': {}, 'chargeCensus': {}})
 
     def test_check_distinguishes_short_lock_timeout_from_work_deadline(self):
         self.case()
@@ -390,17 +407,24 @@ class Logging(Base):
     def test_order_coverage_and_source_limit_logs_drop_private_fields(self):
         mc.toollog.emit('money-cases', 'check.run', ok=True, props={
             'sourceLimits': 2, 'limitKinds': ['food_page_1', 'PRIVATE9999'],
+            'chargeCensus': {'noon': {'open': 5, 'matched': 1, 'proven_clean': 1, 'limited': 2,
+                'error': 1, 'not_checked': 1, 'PRIVATE9999': 7}, 'PRIVATE9999': {'open': 1}},
             'orderCoverage': {'noon': {'food': {'covered_from': '2026-11-10T12:00:00+00:00',
                 'pages': 1, 'fetched': 3, 'cached': 2, 'ms': 1000, 'exhaustive': False,
-                'limit': 'page-1 history only', 'address': 'PRIVATE9999', 'card': '9999'}},
+                'limit': 'page-1 history only', 'stop_reason': 'detail_error', 'coverage_cleared_rows': 2,
+                'address': 'PRIVATE9999', 'card': '9999'}},
                 'PRIVATE9999': {'food': {'covered_from': 'PRIVATE9999'}}},
             'card': '9999', 'address': 'PRIVATE9999'})
         run, = self.rows('check.run')
         self.assertEqual(run['props']['sourceLimits'], 2)
+        self.assertEqual(run['props']['chargeCensus'], {'noon': {'open': 5, 'matched': 1,
+            'proven_clean': 1, 'limited': 2, 'error': 1, 'not_checked': 1}})
         self.assertEqual(run['props']['limitKinds'], ['food_page_1'])
         lane = run['props']['orderCoverage']['noon']['food']
         self.assertEqual(lane['covered_from'], '2026-11-10T12:00:00+00:00')
         self.assertEqual((lane['fetched'], lane['cached']), (3, 2))
+        self.assertEqual(lane['stop_reason'], 'detail_error')
+        self.assertEqual(lane['coverage_cleared_rows'], 2)
         self.assertNotIn('PRIVATE', json.dumps(run))
         self.assertNotIn('9999', json.dumps(run))
 
