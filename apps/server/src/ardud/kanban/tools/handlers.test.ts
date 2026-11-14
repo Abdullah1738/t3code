@@ -392,6 +392,78 @@ const fakeThreads = (
 const owner: KanbanActor = { _tag: "owner" };
 const decodeMessage = Schema.decodeUnknownEffect(KanbanMessage);
 
+it.live("card_flag saves its stalled reason while the board background reader is held", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "board-flag-reader-" });
+    const state = Context.get(
+      yield* Layer.build(
+        NodeSqliteClient.layer({
+          filename: path.join(directory, "boards.sqlite"),
+          readerWorker: true,
+          foregroundReaderSlots: 1,
+          backgroundReaderSlots: 1,
+        }),
+      ),
+      SqlClient.SqlClient,
+    );
+    yield* state`PRAGMA journal_mode = WAL`;
+    yield* state`CREATE TABLE thread_link_probe (value INTEGER)`;
+    const fake = fakeThreads();
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "flag-reader",
+        name: "Flag reader",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+      const card = yield* kanban.createCard(board.id, { title: "Work", prompt: "Work" }, owner);
+      yield* kanban.dispatchNow;
+      const worker = (yield* kanban.card(card.id)).card.activeThreadId!;
+      const held = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const holder = yield* state
+        .withTransaction(
+          state`SELECT * FROM thread_link_probe`.pipe(
+            Effect.andThen(Deferred.succeed(held, undefined)),
+            Effect.andThen(Deferred.await(release)),
+          ),
+        )
+        .pipe(NodeSqliteClient.readOnly, Effect.forkChild);
+      yield* Deferred.await(held);
+      fake.storeControl.beforeThreadLink = () =>
+        state`SELECT * FROM thread_link_probe`.pipe(
+          NodeSqliteClient.readOnly,
+          Effect.orDie,
+          Effect.asVoid,
+        );
+      yield* Effect.gen(function* () {
+        const result = yield* call(worker, "card_flag", {
+          card: card.id,
+          stalled: true,
+          reason: "Waiting on the new head",
+        }).pipe(Effect.timeout("5 seconds"));
+        assert.isFalse(result.isError, result.text);
+        assert.strictEqual(
+          (yield* kanban.card(card.id)).card.stalled?.reason,
+          "Waiting on the new head",
+        );
+        assert.isUndefined(holder.pollUnsafe());
+      }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+      yield* Fiber.join(holder);
+    }).pipe(
+      Effect.provide(
+        fake.layer.pipe(
+          // The held reader may delay notifications after the production commit reply.
+          Layer.provide(Layer.succeed(KanbanService.OwnerRouteMode, "deferred")),
+        ),
+      ),
+    );
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
 it.effect.each(["subtask_done", "report_bug"] as const)(
   "%s saves an attached active worker's result while the state background reader is held",
   (tool) =>
