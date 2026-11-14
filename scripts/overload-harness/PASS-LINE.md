@@ -238,3 +238,42 @@ Everything else stands: q4's pressure gate, storage checks at both boundaries, t
 
 Evaluator's note, read this before you act:
 Box-held state between batches is limited to OS state, and each batch wipes its tmpfs directory. Mention this as a fidelity note in the report; it isn't a reason to invalidate.
+
+
+## Amendment written at 06:15Z, 14 Nov 2026, after batch 7
+
+Margins below come from A-vs-A spread only. The original scored FAIL is retained as history; this amendment authorizes the new score and one A/H batch.
+
+Release evaluator, 06:15Z: amended relative line for .11, and the decision.
+
+**Why the line changes.** Batch 7 failed by +0.56 ms of p99 and +45 ms/min of GC (+2.5%). Against that, the base arm A alone, on the same harness and tier, moved this much across batches 5/6/7:
+- p99: 30.95 → 27.46 → 22.94 ms (8.01 ms range);
+- GC: 2,452 → 2,364 → 1,816 ms/min (636 ms/min range);
+- busy: 23.54 → 23.08 → 20.24% (3.30 pp range).
+
+A zero-margin "C no worse than its A" test on single pairs fails on noise about half the time when the true difference is near zero, so it doesn't measure regression. Meanwhile C was less busy than its A in every batch (5, 6, 7: −4.44, −3.12, −0.03 pp). The tracker raised this at 06:04Z; I agree.
+
+**Amended line.** The margins come only from A-vs-A spread (base arm, batches 5–7 at the loaded tier). I set them before scoring and never derive them from C. Each counted batch passes when:
+- C busy ≤ A busy + 1.65 pp (half A's range);
+- C p99 ≤ A p99 + 4.0 ms, and ≤ 100 ms absolute;
+- C GC ms/min ≤ A GC + 318 ms/min;
+- logical work within ±10%, no backlog, no Warn, no stall ≥ 1 s (validity rules unchanged);
+- plus a sign rule: C−A busy ≤ 0 in a majority of counted batches.
+
+**Scoring what's already measured** (no reruns, no replacements):
+- Batch 5: PASS.
+- Batch 7: PASS. p99 +0.56 ≤ 4.0; GC +45 ≤ 318; busy −0.03.
+- Batch 6 stays INVALID (B-arm ELU skew), and batch 8 stays information only.
+
+That makes 2 of 3 counted batches.
+
+**Third counted batch = the release pin.** H = 960238bc5e67dc8d926ec4242c0baf6ca7ac2f1e (origin/main 06:09Z). It contains C plus #1392 (migration 068/boards indexes) and #1393 (scribe tests), and also #1397 and #1395 (24 server files changed vs C). Run one matched A/H batch now: A = dbc99fc3a4, same frozen harness, tmpfs and validity rules, scored on the amended line.
+- **PASS** with sign 3/3 or 2/3: the series is PASS and .11 ships at H.
+- **FAIL:** report the share that grew and I hold .11.
+
+#1364 rebuilds at H in parallel, so this batch costs no extra time. Put the amendment word for word in matched-suite/PASS-LINE and REPORT.md, labelled as written at 06:15Z after batch 7, with margins from A only.
+
+
+## Owner override 14 Nov 06:10Z, .11 only
+
+Release evaluator forwarded the owner's decision at06:20Z: Abdullah said "Agreed ship it" at06:10Z. Batch7 is accepted as noise for .11, and .11 ships without another comparison series. The A/H confirming batch was not released and is skipped. This is a release-specific override; it does not turn incomplete measured evidence into a three-batch PASS. The06:15Z amended numerical line, derived from A-vs-A spread only and written after batch7, is the standing line before the next overload-release series on#1396.
