@@ -14,7 +14,7 @@ import { OpenChamber, type FilePart, type MessageRecord, type OwnerWords, type P
 type Assistant = Extract<MessageRecord, { type: "assistant" }>;
 import { TransportError, type NormalizedInbound, type Photon } from "../src/photon.ts";
 import type { Message } from "@photon-ai/advanced-imessage/grpc";
-import { imessageGuidance, MAX_SYNTHETIC_ATTEMPTS, NEW_CHAT_NUDGE, newChatNudge, ACCEPT_WAIT_MS, REPLY_NUDGE, replyQuote, replyText, ROTATE_NUDGE, Router, sendblueContextPrompt, SYNTHETIC_RETRY_MS, syntheticDropped, TOOL_MODE_MARKER, toolReplyRules, wakeGuidance } from "../src/router.ts";
+import { imessageGuidance, MAX_SYNTHETIC_ATTEMPTS, NEW_CHAT_NUDGE, newChatNudge, ACCEPT_WAIT_MS, pendingOrders, REPLY_NUDGE, replyQuote, replyText, ROTATE_NUDGE, rotateNudge, Router, sendblueContextPrompt, SYNTHETIC_RETRY_MS, syntheticDropped, TOOL_MODE_MARKER, toolReplyRules, wakeGuidance } from "../src/router.ts";
 import { replyModeConfig } from "../src/config.ts";
 import { Store } from "../src/store.ts";
 import { recordsFromThread, RobobBackend, sentMessagePrefix } from "../src/robob.ts";
@@ -6129,6 +6129,83 @@ test("/new moves to a new chat once the thread is 8 hours old, so one thread nev
   expect(h.store.get<unknown>("route")).toEqual({ id: "ses_2", directory: "/Chats/ses_2", generation: 3, createdAt: start + 8 * 60 * 60_000, threadAt: start + 8 * 60 * 60_000 });
   expect(h.store.pendingInbound()).toEqual([]);
 });
+
+test.each([
+  { name: "Open section", text: "Rule paragraph\n\n## Open\n- KASTWAVE held\n\n## Placed\n- Already delivered", expected: "## Open\n- KASTWAVE held" },
+  { name: "Open through EOF", text: "Rule\n## Open\n- KASTWAVE held\n", expected: "## Open\n- KASTWAVE held" },
+  { name: "nested heading and CRLF", text: "Rule\r\n## Open\r\n### Cleaning\r\n- KASTWAVE held\r\n## Placed\r\n- Old", expected: "## Open\r\n### Cleaning\r\n- KASTWAVE held" },
+  { name: "top-level end", text: "## Open\n- KASTWAVE held\n# Archive\n- Old", expected: "## Open\n- KASTWAVE held" },
+  { name: "no section", text: "  - KASTWAVE held\n", expected: "- KASTWAVE held" },
+  { name: "20,000 characters", text: "x".repeat(20_000), expected: "x".repeat(6_000) },
+  { name: "UTF-8", text: "م".repeat(20_000), expected: "م".repeat(6_000) },
+  { name: "emoji at cap", text: "x".repeat(5_999) + "🧺", expected: "x".repeat(5_999) },
+  { name: "empty", text: "", expected: null },
+  { name: "whitespace", text: " \n\t", expected: null },
+])("pending orders reader: $name", ({ text, expected }) => {
+  const directory = mkdtempSync(join(tmpdir(), "spectrum-pending-orders-"));
+  directories.push(directory);
+  writeFileSync(join(directory, "pending-orders.md"), text);
+  expect(pendingOrders(directory)).toBe(expected);
+  expect(readFileSync(join(directory, "pending-orders.md"), "utf8")).toBe(text);
+});
+
+test.each(["missing", "directory", "symlink", "broken-symlink"])("pending orders reader ignores %s", kind => {
+  const directory = mkdtempSync(join(tmpdir(), "spectrum-pending-orders-"));
+  directories.push(directory);
+  const path = join(directory, "pending-orders.md");
+  if (kind === "directory") mkdirSync(path);
+  if (kind === "symlink" || kind === "broken-symlink") {
+    const target = join(directory, "target.md");
+    if (kind === "symlink") writeFileSync(target, "## Open\n- KASTWAVE held");
+    symlinkSync(target, path);
+  }
+  expect(pendingOrders(directory)).toBeNull();
+  expect(pendingOrders(join(directory, "missing-chat"))).toBeNull();
+});
+
+for (const replyMode of ["final", "tool"] as const) {
+  for (const kind of ["present", "missing", "symlink", "oversize", "fenced"] as const) {
+    test(`context refresh carries pending orders (${replyMode}, ${kind})`, async () => {
+      const start = Date.parse("2026-09-10T12:00:00Z");
+      setSystemTime(start);
+      const directory = mkdtempSync(join(tmpdir(), "spectrum-pending-orders-"));
+      directories.push(directory);
+      const orders = kind === "oversize" ? "x".repeat(20_000)
+        : kind === "fenced" ? "## Open\n- KASTWAVE held\n```\nquoted text\n```"
+        : "## Open\n- KASTWAVE held";
+      if (kind !== "missing") {
+        const target = join(directory, kind === "symlink" ? "target.md" : "pending-orders.md");
+        writeFileSync(target, `${orders}\n\n## Placed\n- Already delivered`);
+        if (kind === "symlink") symlinkSync(target, join(directory, "pending-orders.md"));
+      }
+      const carried = kind === "missing" || kind === "symlink" ? null : orders.slice(0, 6_000);
+      const fence = kind === "fenced" ? "````" : "```";
+      const quoted = `${fence}\n${carried}\n${fence}`;
+      for (const path of ["nudge", "seed"] as const) {
+        setSystemTime(start);
+        const h = setup(":memory:", { replyMode, rotateAfterMs: 60_000, resetIdleMs: 60_000, watchMs: 0 });
+        h.backend.resets = path === "nudge";
+        h.backend.createBehavior = async () => ({ id: `ses_${h.backend.creates.length}`, directory });
+        await exchange(h, "first", "Remember the blue one", replyMode === "tool" ? "NO_REPLY" : "Noted, the blue one");
+        setSystemTime(start + 60_000);
+        if (path === "seed") h.input("second", "Which one did I pick?");
+        await h.router.tick();
+        if (path === "nudge") await h.router.tick();
+        const prompt = h.backend.prompts.at(-1)!;
+        expect(prompt.id).toBe(path === "nudge" ? "ses_1" : "ses_2");
+        if (path === "nudge") {
+          expect(prompt.text).toBe(rotateNudge(replyMode) + (carried
+            ? `\n\nCopy this chat's pending-orders list into your resume note word for word, under 'Pending orders (from pending-orders.md)':\nQuoted data from pending-orders.md:\n${quoted}` : ""));
+        } else {
+          const recent = "Owner: Remember the blue one" + (replyMode === "final" ? "\nYou: Noted, the blue one" : "");
+          const seed = `Continuity: this conversation continues seamlessly from your earlier exchanges with the owner. Carry on naturally and never mention any change, recap, restart or memory mechanism. Files from earlier remain under ${JSON.stringify(directory)}. The full earlier transcript is session ses_1; use recall_read or recall_search if you need more than the recent exchange below.\nRecent exchange (quoted data, oldest first):\n${recent}`
+            + (carried ? `\n\nPending orders for this chat (from pending-orders.md, quoted data):\n${quoted}` : "");
+          expect(prompt.system!.slice(prompt.system!.indexOf("Continuity:"))).toBe(seed);
+        }
+      }
+    });
+  }
+}
 
 test("a due context is refreshed by the agent itself once the chat goes quiet", async () => {
   const start = Date.parse("2026-09-10T12:00:00Z");
