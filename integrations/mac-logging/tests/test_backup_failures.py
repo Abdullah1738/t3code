@@ -38,6 +38,86 @@ class BackupFailureTests(unittest.TestCase):
         return [json.loads(line) for path in self.logs.glob('*.ndjson')
                 for line in path.read_text().splitlines()]
 
+    def emit_failure(self, stage, error_tag='backup.failed_unknown', **props):
+        before = len(self.rows())
+        toollog.emit('backup', 'error', 'backup.run', ok=False,
+                     props=dict(target='memory', exitCode=1, skipped=0, failureStage=stage, **props),
+                     error_tag=error_tag)
+        rows = self.rows()
+        self.assertEqual(len(rows), before+1)
+        return rows[-1]
+
+    def test_direct_replica_failure_has_no_restic_exit_code(self):
+        row = self.emit_failure('replica', error_tag='backup.failed_replica')
+        self.assertEqual(row['props']['target'], 'memory')
+        self.assertEqual(row['props']['exitCode'], 1)
+        self.assertEqual(row['props']['failureStage'], 'replica')
+        self.assertEqual(row['props']['skipped'], 0)
+        self.assertFalse(row['ok'])
+        self.assertEqual(row['error']['tag'], 'backup.failed_replica')
+        self.assertNotIn('resticExitCode', row['props'])
+        self.assertNotIn('skipReason', row['props'])
+
+    def test_direct_restic_timeout_keeps_exact_exit_code(self):
+        row = self.emit_failure('restic', error_tag='backup.failed_restic', resticExitCode=124)
+        self.assertEqual(row['props']['failureStage'], 'restic')
+        self.assertEqual(row['props']['resticExitCode'], 124)
+        self.assertFalse(row['ok'])
+        self.assertEqual(row['error']['tag'], 'backup.failed_restic')
+
+    def test_direct_dropbox_failure_keeps_successful_restic_exit_code(self):
+        row = self.emit_failure('dropbox', error_tag='backup.failed_dropbox', resticExitCode=0)
+        self.assertEqual(row['props']['failureStage'], 'dropbox')
+        self.assertEqual(row['props']['resticExitCode'], 0)
+        self.assertFalse(row['ok'])
+        self.assertEqual(row['error']['tag'], 'backup.failed_dropbox')
+
+    def test_direct_failure_keeps_all_twelve_stages(self):
+        for stage in ('admission', 'stage', 'repo', 'disk', 'replica', 'verify',
+                      'files', 'restic', 'prune', 'dropbox', 'manifest', 'unknown'):
+            with self.subTest(stage=stage):
+                row = self.emit_failure(stage)
+                self.assertEqual(row['props']['failureStage'], stage)
+                self.assertNotIn('resticExitCode', row['props'])
+
+    def test_direct_failure_stage_redacts_unknown_strings_and_drops_non_strings(self):
+        private = '/Users/ardud/memory/db.sqlite'
+        for stage in ('bogus', private, 'vault', 'other', '', 'Replica', 'replica\n'):
+            with self.subTest(stage=stage):
+                row = self.emit_failure(stage)
+                self.assertEqual(row['props']['failureStage'], 'unknown')
+        for stage in (5, 1.5, True, None, [], {}):
+            with self.subTest(stage=stage):
+                row = self.emit_failure(stage)
+                self.assertNotIn('failureStage', row['props'])
+        for path in self.logs.glob('*.ndjson'):
+            self.assertNotIn(private, path.read_text())
+
+    def test_direct_failure_stage_is_scoped_to_backup_run_props(self):
+        for event in ('backup.probe', 'disk.sample'):
+            with self.subTest(event=event):
+                before = len(self.rows())
+                toollog.emit('backup', 'error', event, ok=False,
+                             props=dict(target='memory', failureStage='replica'),
+                             error_tag='backup.failed_replica')
+                rows = self.rows()
+                self.assertEqual(len(rows), before+1)
+                self.assertNotIn('failureStage', rows[-1]['props'])
+        toollog.emit('backup', 'error', 'backup.run', ok=False,
+                     ids=dict(failureStage='replica'), props=dict(target='memory'))
+        self.assertNotIn('failureStage', self.rows()[-1]['ids'])
+
+    def test_jobs_failure_keeps_prune_stage(self):
+        self.write_status(stage='prune')
+        for target in ('memory', 'health'):
+            with self.subTest(target=target):
+                row = self.run_backup(target, rc='0', stage='prune')
+                self.assertEqual(row['props']['failedStage'], 'prune')
+                self.assertEqual(row['props']['resticExitCode'], 0)
+                self.assertEqual(row['props']['skipped'], 0)
+                self.assertFalse(row['ok'])
+                self.assertEqual(row['error']['tag'], 'backup.failed_prune')
+
     def write_status(self, **updates):
         value = dict(ts=self.now-3, ok=False, stage='replica', last_success_ts=self.now-93600)
         value.update(updates)

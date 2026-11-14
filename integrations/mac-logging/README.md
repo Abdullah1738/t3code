@@ -54,6 +54,7 @@ Nonzero exits are failures with `failedStage` and `failReason`, including failur
 reasons passed through the legacy skip argument. Lock and load/boot deferrals
 retain their skip behavior. Memory failure stages use only fresh status metadata;
 unavailable stages are `unknown` and unrecognized stages are `other`.
+The memory-backup emitter sends `failureStage` on `backup.run`: `admission`, `stage`, `repo`, `disk`, `replica`, `verify`, `files`, `restic`, `prune`, `dropbox`, `manifest`, or `unknown`; other strings become `unknown` and non-strings are omitted.
 Daily rollups count `backup.skipped_runs`, `backup.ok_runs` and `backup.failed_runs` by target;
 `log.rollup` flattens them as e.g. `backup.skipped_runs.memory`. Healthy lock
 skips count only as skips.

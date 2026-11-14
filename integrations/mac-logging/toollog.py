@@ -29,7 +29,9 @@ for prefix in ('internal', 'external'):
     NUMBERS.add(prefix+'DeltaWindowS')
 SKIP_REASONS = {'lock_held', 'stale_lock', 'no_repo_access', 'password_unavailable', 'source_missing', 'dry_run', 'other', 'load_deferred', 'boot_grace'}
 BACKUP_STAGES = {'admission', 'stage', 'repo', 'disk', 'replica', 'verify', 'files',
-                 'restic', 'vault', 'dropbox', 'manifest', 'unknown', 'other'}
+                 'restic', 'prune', 'vault', 'dropbox', 'manifest', 'unknown', 'other'}
+FAILURE_STAGES = {'admission', 'stage', 'repo', 'disk', 'replica', 'verify', 'files',
+                  'restic', 'prune', 'dropbox', 'manifest', 'unknown'}
 NUMBERS.update(('loadPerCore', 'lastSuccessAgeS', 'deferredCount'))
 BACKUP_PROGRAMS = {'bash', 'zsh', 'sh', 'python', 'python3', 'restic', 'launchd',
                    'Robob', 'codex', 'claude', 'opencode', 'node', 'sleep', 'unknown'}
@@ -115,6 +117,8 @@ def safe_fields(values, event=None):
             result[key] = value
         elif key == 'failedStage' and isinstance(value, str) and value in BACKUP_STAGES:
             result[key] = value
+        elif event == 'backup.run' and key == 'failureStage' and isinstance(value, str):
+            result[key] = value if value in FAILURE_STAGES else 'unknown'
         elif key == 'failReason' and value in ('password_unavailable', 'no_repo_access', 'source_missing', 'other'):
             result[key] = value
         elif key == 'duMode' and value == 'links':
