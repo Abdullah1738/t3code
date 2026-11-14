@@ -194,8 +194,11 @@ def cmd_run(a, me) -> int:
         data["ok"] = code == 0
         data["props"].update(exitCode=code, fallback=a.log_fallback)
         if code in (90, 91, 92, 93):
+            reason = {90: "infra", 91: "cap", 92: "busy", 93: "person_home_down"}[code]
+            if code == EXIT_HOME_DOWN and a.base and not a.fresh and not common.person():
+                reason = "base_home_down"
             toollog.emit("run", "run.error", kind="error", ok=False, tag="exit_" + str(code),
-                         props={"exitCode": code, "reason": {90: "infra", 91: "cap", 92: "busy", 93: "person_home_down"}[code]})
+                         props={"exitCode": code, "reason": reason})
         return code
 
 
@@ -224,12 +227,16 @@ def _run_with_retries(a, me) -> int:
     # nothing. Every `offbox run` goes to a box; --remote stays as "never fall back to the Mac".
     log("remote")
     from . import home
+    from .base_catalog import full_name
+    explicit_base = full_name(a.base, me['repo_key']) if a.base and not a.fresh else None
+    wait_explicit_base = home.active() and home.base_needs_home(explicit_base)
     home.WAIT_STARTED = time.monotonic()
-    if home.may_fail_over():
-        home.before_run(getattr(a, "argv", None) or sys.argv[1:])
+    if home.may_fail_over(explicit_base):
+        home.before_run(getattr(a, "argv", None) or sys.argv[1:], explicit_base=explicit_base)
     elif (home.on_standby() and not os.environ.get(home.FAILOVER_ENV)
           and common._BACKEND_REASON != "boat-only-base"):
         st = common.home_state()
+        home.failover_decision('boat', 'home_down', explicit_base, os.environ.get(runs.BACKGROUND_RUN_ENV, ''))
         toollog.emit("backend", "backend.failover", duration_ms=0, ok=True, props={"from": "home", "to": "boat", "reason": "home_down", "waitMs": 0})
         say(f"home offbox server is down ({st.get('reason') or 'marked down by the health monitor'}); "
             "this run is on Boat")
@@ -265,12 +272,18 @@ def _run_with_retries(a, me) -> int:
                 if home.active() and home.unreachable(e):
                     # Nothing was accepted by the home server. Ordinary work goes to Boat for this one run; a
                     # person's work waits for the home server; a pinned backend keeps today's waiting.
-                    if home.may_fail_over():
+                    run_id = e.run_id or os.environ.get(runs.BACKGROUND_RUN_ENV, '')
+                    if home.may_fail_over(explicit_base):
                         if not reprobed and not home.recent_failure() and home.network_failure(e):
                             reprobed = True
                             if api.probe_backend("server", home.PROBE_TIMEOUT_S) is None:
                                 continue
-                        home.fail_over(str(e), getattr(a, "argv", None) or sys.argv[1:])
+                        home.fail_over(str(e), getattr(a, "argv", None) or sys.argv[1:], run_id,
+                                       explicit_base=explicit_base)
+                    else:
+                        decision = ('wait_person' if common.person() else 'wait_explicit_base'
+                                    if wait_explicit_base else 'wait_pinned')
+                        home.failover_decision(decision, 'unreachable', explicit_base, run_id)
                     if common.person():
                         raise OffboxError(f"the home offbox server is down ({e}); {common.person()}'s tasks wait "
                                           "until it is back. Nothing ran and nothing was sent to Boat",
@@ -280,7 +293,7 @@ def _run_with_retries(a, me) -> int:
                     if e.started or not (a.no_fallback or a.remote or a.bg or
                                          not fallback.allowed(a.cmd, e, os.getcwd())):
                         raise
-                elif not _outage_wait_applies(a, e):
+                elif not (wait_explicit_base and home.unreachable(e)) and not _outage_wait_applies(a, e):
                     raise
                 if waited_from is None:
                     waited_from = time.monotonic()
@@ -295,10 +308,15 @@ def _run_with_retries(a, me) -> int:
                         continue
                     raise
                 left = outage.window_seconds() - (time.monotonic() - waited_from)
-                if left > 0 and outage.wait_until_up(outage.reason_of(e), left):
+                service = {'service': 'home offbox server'} if wait_explicit_base else {}
+                if left > 0 and outage.wait_until_up(outage.reason_of(e), left, **service):
                     continue
+                if wait_explicit_base and home.unreachable(e):
+                    raise home.base_down_error(explicit_base, str(e)) from e
                 raise outage.down_error(e, time.monotonic() - waited_from) from e
     except OffboxError as e:
+        if wait_explicit_base and home.unreachable(e):
+            e = home.base_down_error(explicit_base, str(e))
         if e.code not in (EXIT_INFRA, EXIT_CAP, EXIT_BUSY):
             say(str(e))
             return e.code

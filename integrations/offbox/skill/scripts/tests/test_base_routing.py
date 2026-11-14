@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
-from offbox_lib import api, base_catalog, bases, cli, common, home, identity, pool
+from offbox_lib import api, base_catalog, bases, cli, common, home, identity, lease, outage, pool
 
 
 class BaseRouting(unittest.TestCase):
@@ -26,6 +26,7 @@ class BaseRouting(unittest.TestCase):
         self.stack.enter_context(patch.dict(os.environ, {k: v for k, v in os.environ.items()
                                                        if not k.startswith('OFFBOX_')}, clear=True))
         for name, value in [('STATE', self.root), ('SERVER_CFG', self.root / 'server.json'),
+                            ('HOME_FAILURES', self.root / 'home-failures.jsonl'),
                             ('BACKEND_STATE', self.root / 'backend-state.json'),
                             ('BACKEND_PATH', self.root / 'backend'), ('DB_PATH', self.root / 'offbox-home.db'), ('_BACKEND', None), ('_BACKEND_REASON', None)]:
             self.stack.enter_context(patch.object(common, name, value))
@@ -34,6 +35,7 @@ class BaseRouting(unittest.TestCase):
         self.cons = {}
         for backend in ('server', 'boat'):
             con = sqlite3.connect(common.db_path_for(backend))
+            con.row_factory = sqlite3.Row
             common.ensure_schema(con)
             self.cons[backend] = con
             self.addCleanup(con.close)
@@ -46,7 +48,149 @@ class BaseRouting(unittest.TestCase):
         self.stack.enter_context(patch.object(home, 'person_gate'))
         self.logs = []
         self.stack.enter_context(patch.object(cli, 'log', side_effect=self.logs.append))
+        self.real_emit = cli.toollog.emit
         self.events = self.stack.enter_context(patch.object(cli.toollog, 'emit'))
+
+    class Exec(BaseException):
+        pass
+
+    def run_outage(self, *args):
+        argv = ['run', *args, '--', 'true']
+        common.select_backend(common.entry_backend(argv))
+        error = api.ApiError(503, 'server_not_ready', 'fixture home down')
+        error.run_id = 'run-fixture'
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), patch.object(home, 'probe', return_value=None), \
+                patch.object(api, 'probe_backend', return_value=None), \
+                patch.object(cli, '_remote_once', side_effect=error) as remote, \
+                patch.object(outage, 'wait_until_up', return_value=False) as wait, \
+                patch.object(os, 'execve', side_effect=self.Exec) as execute:
+            try:
+                code = cli.main(argv)
+            except self.Exec:
+                code = 'exec'
+        return code, err.getvalue(), remote, wait, execute
+
+    def decisions(self):
+        return [c.kwargs for c in self.events.call_args_list
+                if c.args[:2] == ('home', 'home.failover_decision')]
+
+    def test_explicit_home_base_waits_then_exits_93_without_boat_or_local(self):
+        self.add('server', 'warm')
+        for args in (['--base', 'warm'], ['--base=torssh:warm'], ['--bas', 'warm'],
+                     ['--base', 'ignored', '--base', 'warm'], ['--base', 'warm', '--bg', '--no-fallback']):
+            with self.subTest(args=args):
+                self.events.reset_mock()
+                code, err, remote, wait, execute = self.run_outage(*args)
+                self.assertEqual(code, 93, err)
+                self.assertIn("saved base 'torssh:warm'", err)
+                self.assertIn('Nothing ran and nothing was sent to Boat', err)
+                self.assertNotIn('goes to Boat instead', err)
+                wait.assert_called_once()
+                execute.assert_not_called()
+                remote.assert_called_once()
+                decision, = self.decisions()
+                self.assertEqual(decision['props']['decision'], 'wait_explicit_base')
+                self.assertEqual(decision['props']['base'], 'torssh:warm')
+                self.assertEqual(decision['ids']['run'], 'run-fixture')
+        self.assert_no_allocations()
+
+    def test_monitor_down_still_routes_explicit_home_base_to_home(self):
+        self.add('server', 'warm')
+        common.BACKEND_STATE.write_text('{"state":"home_down"}')
+        self.assertEqual(common.entry_backend(['run', '--base', 'warm', '--', 'true']), 'server')
+        self.assertEqual(self.run_outage('--base', 'warm')[0], 93)
+
+    def test_implicit_default_still_fails_over_and_uses_recipe(self):
+        self.add('server', 'warm', default=True)
+        code, err, _, wait, execute = self.run_outage()
+        self.assertEqual(code, 'exec', err)
+        self.assertIn('this run goes to Boat instead', err)
+        wait.assert_not_called()
+        self.assertEqual(self.decisions()[0]['props']['decision'], 'boat')
+        self.assertIsNone(self.decisions()[0]['props']['base'])
+        with patch.dict(os.environ, execute.call_args.args[2]):
+            common.select_backend('boat')
+            output = io.StringIO()
+            with contextlib.redirect_stderr(output), patch.object(lease, '_fit_new', return_value='default'), \
+                    patch.object(lease, 'pick_template', return_value=(None, 'none')), \
+                    patch.object(lease, 'report_template'), patch.object(api, 'create', return_value={'id': 'new'}):
+                result = lease._new_box(self.cons['boat'], self.me, None, None, None, False)
+            self.assertEqual(result[1], 'fresh')
+            self.assertIn('using the repo template or recipe for this run', output.getvalue())
+
+    def test_explicit_base_on_both_backends_is_preserved_on_boat(self):
+        self.add('server', 'warm')
+        self.add('boat', 'warm')
+        code, err, _, wait, execute = self.run_outage('--base', 'warm')
+        self.assertEqual(code, 'exec', err)
+        wait.assert_not_called()
+        failure = json.loads(common.HOME_FAILURES.read_text().splitlines()[-1])
+        self.assertEqual((failure['base'], failure['base_kept']), ('torssh:warm', True))
+        with patch.dict(os.environ, execute.call_args.args[2]):
+            common.select_backend('boat')
+            with patch.object(lease, '_fit_new', return_value='default'), \
+                    patch.object(lease, '_start_from', return_value={'id': 'from-base'}) as start, \
+                    patch.object(lease, 'report_template'):
+                result = lease._new_box(self.cons['boat'], self.me, None, None, 'warm', False)
+            self.assertEqual(result[1], 'base:torssh:warm')
+            self.assertEqual(start.call_args.args[2]['name'], 'torssh:warm')
+
+    def test_new_box_cannot_drop_an_explicit_home_only_base_on_boat(self):
+        self.add('server', 'warm')
+        with patch.dict(os.environ, OFFBOX_BACKEND='boat', OFFBOX_FAILOVER='unreachable'):
+            common.select_backend('boat')
+            with self.assertRaises(common.OffboxError) as caught:
+                lease._new_box(self.cons['boat'], self.me, None, None, 'warm', False)
+        self.assertEqual(caught.exception.code, 93)
+        self.assertIn('torssh:warm', str(caught.exception))
+        self.assert_no_allocations()
+
+    def test_explicit_base_wait_retries_home_when_it_returns(self):
+        self.add('server', 'warm')
+        common.select_backend('server')
+        argv = ['run', '--base', 'warm', '--', 'true']
+        with patch.object(cli, '_remote_once', side_effect=[api.NetworkError('unreachable'), 7]) as remote, \
+                patch.object(outage, 'wait_until_up', return_value=True) as wait, \
+                patch.object(os, 'execve', side_effect=AssertionError('must stay home')):
+            self.assertEqual(cli.main(argv), 7)
+        self.assertEqual(remote.call_count, 2)
+        wait.assert_called_once()
+        self.assertEqual(wait.call_args.kwargs['service'], 'home offbox server')
+
+    def test_fresh_ignores_named_base_during_failover(self):
+        self.add('server', 'warm')
+        code, err, _, wait, _ = self.run_outage('--base', 'warm', '--fresh')
+        self.assertEqual(code, 'exec', err)
+        wait.assert_not_called()
+        self.assertIsNone(self.decisions()[0]['props']['base'])
+
+    def test_an_accepted_run_with_explicit_base_is_never_retried(self):
+        self.add('server', 'warm')
+        common.select_backend('server')
+        error = api.NetworkError('unreachable after accept')
+        error.started = True
+        with patch.object(cli, '_remote_once', side_effect=error), \
+                patch.object(outage, 'wait_until_up') as wait, \
+                patch.object(os, 'execve') as execute, patch('offbox_lib.fallback.note_infra_failure'), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(cli.main(['run', '--base', 'warm', '--', 'true']), 90)
+        wait.assert_not_called()
+        execute.assert_not_called()
+        self.assertEqual(self.decisions(), [])
+
+    def test_failover_decisions_reach_the_tool_log(self):
+        self.add('server', 'warm', default=True)
+        # Undo the fixture's emit mock: exercise the real event sanitizer and NDJSON sink.
+        with patch.object(home.toollog, 'emit', self.real_emit), \
+                patch.dict(os.environ, OFFBOX_TOOL_LOG_DIR=str(self.root / 'tool-logs')):
+            self.assertEqual(self.run_outage('--base', 'warm')[0], 93)
+            self.assertEqual(self.run_outage()[0], 'exec')
+        events = [json.loads(line) for path in (self.root / 'tool-logs').glob('*.ndjson')
+                  for line in path.read_text().splitlines()]
+        decisions = [row for row in events if row['name'] == 'home.failover_decision']
+        self.assertEqual([row['props']['decision'] for row in decisions], ['wait_explicit_base', 'boat'])
+        self.assertEqual([row['props']['base'] for row in decisions], ['torssh:warm', None])
 
     def add(self, backend, short, *, repo='torssh', default=False, expired=None, owner='ardud', saved='snapshot'):
         self.cons[backend].execute('''INSERT INTO bases
@@ -117,7 +261,7 @@ class BaseRouting(unittest.TestCase):
         self.assertFalse(any(call.args[:2] == ('backend', 'backend.failover') for call in self.events.call_args_list))
         self.assert_no_allocations()
 
-    def test_automatic_failover_keeps_home_base_recipe_fallback(self):
+    def test_forwarded_base_is_validated_before_allocation_safety_net(self):
         self.add('server', 'warm')
         argv = ['run', '--base', 'torssh:warm', '--', 'true']
         with patch.dict(os.environ, OFFBOX_BACKEND='boat', OFFBOX_FAILOVER='unreachable'):

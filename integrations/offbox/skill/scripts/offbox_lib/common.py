@@ -223,7 +223,7 @@ def entry_backend(argv: list[str]) -> str:
     if sub == "stats":
         return "server"
     first = default_backend()
-    if sub == "run" and first == "server" and person() is None:
+    if sub == "run" and person() is None:
         # The CLI parser has no backend-bound imports. Use it so equals, abbreviations, repeated options and
         # command arguments have exactly the same meaning here as when the run starts.
         from .cli import build_parser
@@ -232,8 +232,11 @@ def entry_backend(argv: list[str]) -> str:
             from . import base_catalog
             from .identity import repo_key, repo_root
             full = a.base if ":" in a.base else base_catalog.full_name(a.base, repo_key(repo_root()))
-            if (any(r["name"] == full for r in base_catalog.rows("boat"))
-                    and not any(r["name"] == full for r in base_catalog.rows("server"))):
+            on_boat = any(r["name"] == full for r in base_catalog.rows("boat"))
+            on_home = any(r["name"] == full for r in base_catalog.rows("server"))
+            if on_home and not on_boat:
+                return "server"
+            if first == "server" and on_boat and not on_home:
                 _BACKEND_REASON = "boat-only-base"
                 return "boat"
     if sub in ("logs", "wait", "kill", "release", "ssh", "ports", "keep", "exec"):
