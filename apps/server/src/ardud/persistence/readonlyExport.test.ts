@@ -275,13 +275,206 @@ test("reopening a published replica keeps it ready; an abandoned cycle is discar
   expect(out.prepare("SELECT count(*) AS n FROM scheduled_tasks").get()?.n).toBe(1);
 });
 
-test("a source schema change mid-cycle discards the cycle, then the reopen rebuilds", () => {
+const auxiliaryTables = [
+  { name: "scheduled_tasks", key: "task_id", row: "'task','a'" },
+  { name: "ardud_opencode_import", key: "native_session_id", row: "'task','a'" },
+  { name: "ardud_kanban_cards", key: "id", row: "'task','a','{}'" },
+  { name: "ardud_kanban_threads", key: "thread_id", row: "'task',0" },
+];
+
+for (const mode of ["reopen", "staging", "catchup"] as const) {
+  test.each(auxiliaryTables)(
+    `$name schema refresh preserves the published replica (${mode})`,
+    ({ name, key, row }) => {
+      const f = fixture();
+      f.source.exec(
+        `INSERT INTO ${name} VALUES (${row}); CREATE INDEX aux_lookup ON ${name}(${key})`,
+      );
+      f.finish();
+      const out = f.connect();
+      const rows = out.prepare("SELECT * FROM orchestration_v2_projection_threads").all();
+      const progress = out
+        .prepare(
+          "SELECT * FROM ardud_readonly_progress WHERE name NOT LIKE 'reconcile:%' ORDER BY name",
+        )
+        .all();
+      const events = out.prepare("SELECT * FROM orchestration_events ORDER BY sequence").all();
+      const revision = metaValue(out, "lineage_repair_revision");
+      const rebuild = metaValue(out, "last_rebuild_reason");
+      const generation = Number(metaValue(out, "generation"));
+      if (mode === "staging") f.exporter.step();
+      if (mode === "catchup") {
+        // More than one event page keeps the publication transaction open.
+        for (let i = 0; i < 40; i++)
+          f.source.exec(
+            "INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES ('thread.metadata-updated','a','{}')",
+          );
+        for (let i = 0; f.exporter.pollIdentities(); i++) {
+          if (i > 500) throw new Error("identity export did not converge");
+        }
+        for (let i = 0; i < 10; i++) expect(f.exporter.step()).toBe(true);
+      }
+      const identity = out
+        .prepare("SELECT * FROM ardud_readonly_meta WHERE key LIKE 'identity_%' ORDER BY key")
+        .all();
+      f.source.exec(`ALTER TABLE ${name} ADD COLUMN cache_version INTEGER NOT NULL DEFAULT 0;
+      UPDATE ${name} SET cache_version=7;
+      CREATE INDEX aux_version ON ${name}(cache_version)`);
+      if (mode === "reopen") f.restart();
+      else f.exporter.pollIdentities();
+      expect(metaValue(out, "ready")).toBe("1");
+      // Reopening and completing a cycle each allocate a normal generation.
+      const currentGeneration = generation + (mode === "reopen" ? 1 : 0);
+      expect(Number(metaValue(out, "generation"))).toBe(currentGeneration);
+      expect(metaValue(out, "lineage_repair_revision")).toBe(revision);
+      expect(metaValue(out, "last_rebuild_reason")).toBe(rebuild);
+      expect(out.prepare("SELECT * FROM orchestration_v2_projection_threads").all()).toEqual(rows);
+      expect(
+        out
+          .prepare(
+            "SELECT * FROM ardud_readonly_progress WHERE name NOT LIKE 'reconcile:%' ORDER BY name",
+          )
+          .all(),
+      ).toEqual(progress);
+      expect(out.prepare("SELECT * FROM orchestration_events ORDER BY sequence").all()).toEqual(
+        events,
+      );
+      expect(
+        out
+          .prepare("SELECT * FROM ardud_readonly_meta WHERE key LIKE 'identity_%' ORDER BY key")
+          .all(),
+      ).toEqual(identity);
+      expect(JSON.parse(String(metaValue(out, "last_aux_schema_refresh"))).tables).toEqual([name]);
+      let steps = 0;
+      while (f.exporter.step()) {
+        expect(metaValue(out, "ready")).toBe("1");
+        expect(Number(metaValue(out, "generation"))).toBe(currentGeneration);
+        expect(metaValue(out, "lineage_repair_revision")).toBe(revision);
+        if (++steps > 500) throw new Error("export did not converge");
+      }
+      expect(out.prepare(`SELECT ${key}, cache_version FROM ${name}`).all()).toEqual([
+        { [key]: "task", cache_version: 7 },
+      ]);
+      expect(
+        out
+          .prepare(
+            "SELECT name FROM sqlite_schema WHERE type='index' AND name IN ('aux_lookup','aux_version') ORDER BY name",
+          )
+          .all(),
+      ).toEqual([{ name: "aux_lookup" }, { name: "aux_version" }]);
+      expect(metaValue(out, "ready")).toBe("1");
+      expect(Number(metaValue(out, "generation"))).toBe(currentGeneration + 1);
+      expect(metaValue(out, "lineage_repair_revision")).toBe(revision);
+      expect(metaValue(out, "last_rebuild_reason")).toBe(rebuild);
+    },
+  );
+}
+
+test("auxiliary schemas in the split boards database refresh without a main schema change", () => {
+  const f = fixture();
+  f.exporter.close();
+  const boardPath = NodePath.join(NodePath.dirname(f.options.sourcePath), "boards.sqlite");
+  const boards = new NodeSqlite.DatabaseSync(boardPath);
+  cleanups.push(() => boards.close());
+  boards.exec(`PRAGMA journal_mode=WAL;
+    CREATE TABLE ardud_boards_migration(table_name TEXT PRIMARY KEY, completed INTEGER);
+    INSERT INTO ardud_boards_migration VALUES ('*',1);
+    CREATE TABLE ardud_kanban_cards (id TEXT PRIMARY KEY, active_thread_id TEXT, json TEXT);
+    CREATE TABLE ardud_kanban_threads (thread_id TEXT PRIMARY KEY, ended INTEGER);
+    INSERT INTO ardud_kanban_cards VALUES ('card','a','{}');
+    INSERT INTO ardud_kanban_threads VALUES ('a',0)`);
+  const exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, { ...f.options, boardPath });
+  cleanups.push(() => exporter.close());
+  drive(exporter);
+  const out = f.connect();
+  const generation = metaValue(out, "generation");
+  const revision = metaValue(out, "lineage_repair_revision");
+  const mainVersion = f.source.prepare("PRAGMA schema_version").get();
+  exporter.step();
+  boards.exec(`ALTER TABLE ardud_kanban_cards ADD COLUMN cache_version INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE ardud_kanban_threads ADD COLUMN cache_version INTEGER NOT NULL DEFAULT 0;
+    UPDATE ardud_kanban_cards SET cache_version=3;
+    UPDATE ardud_kanban_threads SET cache_version=4`);
+  exporter.pollIdentities();
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(metaValue(out, "generation")).toBe(generation);
+  expect(metaValue(out, "lineage_repair_revision")).toBe(revision);
+  expect(f.source.prepare("PRAGMA schema_version").get()).toEqual(mainVersion);
+  expect(JSON.parse(String(metaValue(out, "last_aux_schema_refresh"))).tables).toEqual([
+    "ardud_kanban_cards",
+    "ardud_kanban_threads",
+  ]);
+  drive(exporter);
+  expect(out.prepare("SELECT id,cache_version FROM ardud_kanban_cards").all()).toEqual([
+    { id: "card", cache_version: 3 },
+  ]);
+  expect(out.prepare("SELECT thread_id,cache_version FROM ardud_kanban_threads").all()).toEqual([
+    { thread_id: "a", cache_version: 4 },
+  ]);
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(metaValue(out, "last_rebuild_reason")).toBeUndefined();
+});
+
+test("a projection change alongside an auxiliary change still fully rebuilds", () => {
+  const f = fixture();
+  f.finish();
+  f.source.exec(`ALTER TABLE scheduled_tasks ADD COLUMN extra TEXT;
+    ALTER TABLE orchestration_v2_projection_turn_items ADD COLUMN extra TEXT`);
+  f.restart();
+  const out = f.connect();
+  expect(metaValue(out, "ready")).toBe("0");
+  expect(metaValue(out, "last_rebuild_reason")).toBe(
+    "source schema changed: orchestration_v2_projection_turn_items",
+  );
+  expect(metaValue(out, "last_aux_schema_refresh")).toBeUndefined();
+  f.finish();
+  expect(metaValue(out, "ready")).toBe("1");
+});
+
+test("successive auxiliary changes replace the current schema without a rebuild", () => {
+  const f = fixture();
+  f.source.exec("INSERT INTO scheduled_tasks VALUES ('task','a')");
+  f.finish();
+  const out = f.connect();
+  f.source.exec("ALTER TABLE scheduled_tasks ADD COLUMN extra TEXT DEFAULT 'new'");
+  f.finish();
+  expect(out.prepare("SELECT extra FROM scheduled_tasks").get()?.extra).toBe("new");
+  const generation = metaValue(out, "generation");
+  f.source.exec("ALTER TABLE scheduled_tasks DROP COLUMN extra");
+  f.exporter.pollIdentities();
+  expect(metaValue(out, "generation")).toBe(generation);
+  expect(metaValue(out, "ready")).toBe("1");
+  f.finish();
+  expect(
+    out
+      .prepare("PRAGMA table_info(scheduled_tasks)")
+      .all()
+      .map((row) => row.name),
+  ).toEqual(["task_id", "thread_id"]);
+  expect(out.prepare("SELECT task_id FROM scheduled_tasks").all()).toEqual([{ task_id: "task" }]);
+  expect(metaValue(out, "last_rebuild_reason")).toBeUndefined();
+});
+
+test("an auxiliary change does not hide a regressed event sequence", () => {
+  const f = fixture();
+  f.finish();
+  f.source.exec(`ALTER TABLE scheduled_tasks ADD COLUMN extra TEXT;
+    DELETE FROM orchestration_events`);
+  f.restart();
+  const out = f.connect();
+  expect(metaValue(out, "ready")).toBe("0");
+  expect(metaValue(out, "last_rebuild_reason")).toBe("source event sequence regressed");
+  f.finish();
+  expect(metaValue(out, "ready")).toBe("1");
+});
+
+test("a projection schema change mid-cycle discards the cycle, then the reopen rebuilds", () => {
   const f = fixture();
   f.finish();
   const out = f.connect();
   f.source.exec("INSERT INTO scheduled_tasks VALUES ('task','a')");
   expect(f.exporter.step()).toBe(true);
-  f.source.exec("ALTER TABLE scheduled_tasks ADD COLUMN extra TEXT");
+  f.source.exec("ALTER TABLE orchestration_v2_projection_turn_items ADD COLUMN extra TEXT");
   expect(() => f.exporter.step()).toThrow("schema changed");
   expect(metaValue(out, "ready")).toBe("0");
   expect(metaValue(out, "last_error")).toContain("schema changed");
@@ -289,13 +482,18 @@ test("a source schema change mid-cycle discards the cycle, then the reopen rebui
   expect(() => f.exporter.step()).toThrow("schema changed");
   // Before 2026-11-10 every reopen threw here until someone deleted the file.
   f.restart();
-  expect(metaValue(out, "last_rebuild_reason")).toBe("source schema changed: scheduled_tasks");
+  expect(metaValue(out, "last_rebuild_reason")).toBe(
+    "source schema changed: orchestration_v2_projection_turn_items",
+  );
   expect(metaValue(out, "ready")).toBe("0");
   f.finish();
   expect(metaValue(out, "ready")).toBe("1");
-  expect(f.connect().prepare("SELECT task_id, extra FROM scheduled_tasks").all()).toEqual([
-    { task_id: "task", extra: null },
-  ]);
+  expect(
+    f
+      .connect()
+      .prepare("SELECT turn_item_id, extra FROM orchestration_v2_projection_turn_items")
+      .all(),
+  ).toEqual([{ turn_item_id: "stop", extra: null }]);
   expect(
     f.connect().prepare("SELECT count(*) AS n FROM orchestration_v2_projection_threads").get()?.n,
   ).toBe(3);
@@ -751,6 +949,7 @@ test("replacing main rebuilds the replica from the new file", () => {
   const replacement = new NodeSqlite.DatabaseSync(f.options.sourcePath);
   cleanups.push(() => replacement.close());
   replacement.exec(`PRAGMA journal_mode=WAL;
+    ALTER TABLE scheduled_tasks ADD COLUMN extra TEXT;
     DELETE FROM orchestration_v2_projection_threads WHERE thread_id='c';
     INSERT INTO orchestration_v2_projection_threads VALUES ('new','{}');`);
   const exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, f.options);
@@ -937,6 +1136,24 @@ test("after the backoff window the same reason may rebuild once more", () => {
   expect(() => openExporter(f)).toThrow("Automatic rebuild held back");
 });
 
+test("projection schema rebuilds retain the six-hour backoff", () => {
+  const f = fixture();
+  f.finish();
+  f.source.exec("ALTER TABLE orchestration_v2_projection_turn_items ADD COLUMN extra TEXT");
+  f.restart();
+  const out = f.connect();
+  expect(metaValue(out, "ready")).toBe("0");
+  expect(
+    out.prepare("SELECT count(*) AS n FROM orchestration_v2_projection_threads").get()?.n,
+  ).toBe(0);
+  f.finish();
+  const rebuiltAt = metaValue(out, "last_rebuild_at");
+  f.source.exec("ALTER TABLE orchestration_v2_projection_turn_items ADD COLUMN second TEXT");
+  expect(() => f.restart()).toThrow(expect.objectContaining({ code: "READONLY_REBUILD_HELD" }));
+  expect(metaValue(out, "ready")).toBe("0");
+  expect(metaValue(out, "last_rebuild_at")).toBe(rebuiltAt);
+});
+
 test("a different rebuild reason is not held back by the window", () => {
   let now = Date.parse("2026-11-10T10:00:00.000Z");
   vi.spyOn(Date, "now").mockImplementation(() => now);
@@ -944,10 +1161,12 @@ test("a different rebuild reason is not held back by the window", () => {
   f.source.exec("DELETE FROM orchestration_events WHERE sequence>=3");
   drive(openExporter(f));
   now += HOUR;
-  f.source.exec("ALTER TABLE scheduled_tasks ADD COLUMN extra TEXT");
+  f.source.exec("ALTER TABLE orchestration_v2_projection_turn_items ADD COLUMN extra TEXT");
   drive(openExporter(f));
   const out = f.connect();
-  expect(metaValue(out, "last_rebuild_reason")).toBe("source schema changed: scheduled_tasks");
+  expect(metaValue(out, "last_rebuild_reason")).toBe(
+    "source schema changed: orchestration_v2_projection_turn_items",
+  );
   expect(metaValue(out, "ready")).toBe("1");
 });
 

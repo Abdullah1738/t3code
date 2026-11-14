@@ -447,21 +447,53 @@ export function createReadonlyReplica(
         throw invalidate(`Readonly export source table missing: ${name}`);
       return { name, db, schema };
     });
-    // A replaced source, a changed table or a regressed event history cannot be
+    const createExportedTable = ({ name, db, schema }: (typeof sourceTables)[number]) => {
+      out.exec(
+        schema.replace(/^CREATE TABLE\s+(?:IF NOT EXISTS\s+)?/i, "CREATE TABLE IF NOT EXISTS "),
+      );
+      // These indexes touch the exported copy only; no live schema changes.
+      for (const row of db
+        .prepare(
+          "SELECT sql FROM sqlite_schema WHERE type='index' AND tbl_name=? AND sql IS NOT NULL",
+        )
+        .all(name)) {
+        out.exec(
+          String(row.sql).replace(
+            /^CREATE (UNIQUE )?INDEX\s+(?:IF NOT EXISTS\s+)?/i,
+            "CREATE $1INDEX IF NOT EXISTS ",
+          ),
+        );
+      }
+    };
+    const refreshAuxiliarySchemas = (changed: typeof sourceTables) => {
+      transaction(() => {
+        for (const table of changed) {
+          out.exec(`DROP TABLE IF EXISTS ${q(table.name)}`);
+          createExportedTable(table);
+          meta(`schema:${table.name}`, table.schema);
+        }
+        meta(
+          "last_aux_schema_refresh",
+          JSON.stringify({ tables: changed.map(({ name }) => name), at: new Date().toISOString() }),
+        );
+      });
+    };
+    // A replaced source, a changed projection or a regressed event history cannot be
     // caught up incrementally. Rebuild in place instead of refusing every open
     // until someone deletes the file: readers see ready=0 until the fresh
     // generation publishes, exactly as on a first bootstrap.
     const storedSource = getMeta("source");
     const storedSequence = getMeta("sequence");
-    const changedTable = sourceTables.find(({ name, schema }) => {
+    const changedTables = sourceTables.filter(({ name, schema }) => {
       const previous = getMeta(`schema:${name}`);
       return previous !== undefined && normalizeSchema(previous) !== normalizeSchema(schema);
     });
+    const changedProjection = changedTables.find(({ name }) => !auxiliary.includes(name));
     const rebuildReason =
       storedSource !== undefined && !sameSource(storedSource)
         ? "source database was replaced"
-        : changedTable
-          ? `source schema changed: ${changedTable.name}`
+        : changedProjection
+          ? `source schema changed: ${changedProjection.name}`
           : storedSequence !== undefined && sequence() < Number(storedSequence)
             ? "source event sequence regressed"
             : undefined;
@@ -522,8 +554,9 @@ export function createReadonlyReplica(
           )
           .run();
       });
-    } else if (storedSource !== undefined && storedSource !== identity) {
-      meta("source", identity);
+    } else {
+      if (changedTables.length) refreshAuxiliarySchemas(changedTables);
+      if (storedSource !== undefined && storedSource !== identity) meta("source", identity);
     }
     if (!getMeta("sequence"))
       transaction(() => {
@@ -582,13 +615,10 @@ export function createReadonlyReplica(
     const threadSequence = (threadId: NodeSqlite.SQLInputValue) =>
       // Journal fences must include events already moved out of main, too.
       Math.max(...threadEventSources.map((statement) => Number(statement.get(threadId)?.n ?? 0)));
-    for (const { name, db, schema } of sourceTables) {
-      // Any stored schema that differed was rebuilt above.
+    const configureTable = ({ name, db, schema }: (typeof sourceTables)[number]) => {
       meta(`schema:${name}`, schema);
       sourceSchemas.set(name, schema);
-      out.exec(
-        schema.replace(/^CREATE TABLE\s+(?:IF NOT EXISTS\s+)?/i, "CREATE TABLE IF NOT EXISTS "),
-      );
+      createExportedTable({ name, db, schema });
       const info = db.prepare(`PRAGMA table_info(${q(name)})`).all();
       const columns = info.map((row) => String(row.name));
       const primary = String(info.find((row) => row.pk === 1)?.name ?? "");
@@ -608,20 +638,8 @@ export function createReadonlyReplica(
             .join(",")} WHERE ${values.map((c) => `${q(c)} IS NOT excluded.${q(c)}`).join(" OR ")}`,
         ),
       });
-      // These indexes touch the exported copy only; no live schema changes.
-      for (const row of db
-        .prepare(
-          "SELECT sql FROM sqlite_schema WHERE type='index' AND tbl_name=? AND sql IS NOT NULL",
-        )
-        .all(name)) {
-        out.exec(
-          String(row.sql).replace(
-            /^CREATE (UNIQUE )?INDEX\s+(?:IF NOT EXISTS\s+)?/i,
-            "CREATE $1INDEX IF NOT EXISTS ",
-          ),
-        );
-      }
-    }
+    };
+    for (const table of sourceTables) configureTable(table);
     out.exec(
       "CREATE INDEX IF NOT EXISTS ardud_readonly_items_thread ON orchestration_v2_projection_turn_items(thread_id)",
     );
@@ -694,29 +712,22 @@ export function createReadonlyReplica(
     };
     // TEMP staging keeps auxiliary page pacing outside the publication lock.
     // No partial auxiliary generation is visible to outside readers.
-    const auxiliaryStages = new Map(
-      auxiliary.map((name) => {
-        const table = tables.get(name)!;
-        const stage = `readonly_stage_${name}`;
-        out.exec(
-          sourceSchemas
-            .get(name)!
-            .replace(
-              /^CREATE TABLE\s+(?:IF NOT EXISTS\s+)?[^ (]+/i,
-              `CREATE TEMP TABLE ${q(stage)}`,
-            ),
-        );
-        return [
-          name,
-          {
-            stage,
-            insert: out.prepare(
-              `INSERT OR REPLACE INTO temp.${q(stage)} (${table.columns.map(q)}) VALUES (${table.columns.map(() => "?")})`,
-            ),
-          },
-        ];
-      }),
-    );
+    const createAuxiliaryStage = (name: string) => {
+      const table = tables.get(name)!;
+      const stage = `readonly_stage_${name}`;
+      out.exec(
+        sourceSchemas
+          .get(name)!
+          .replace(/^CREATE TABLE\s+(?:IF NOT EXISTS\s+)?[^ (]+/i, `CREATE TEMP TABLE ${q(stage)}`),
+      );
+      return {
+        stage,
+        insert: out.prepare(
+          `INSERT OR REPLACE INTO temp.${q(stage)} (${table.columns.map(q)}) VALUES (${table.columns.map(() => "?")})`,
+        ),
+      };
+    };
+    const auxiliaryStages = new Map(auxiliary.map((name) => [name, createAuxiliaryStage(name)]));
     const applyAuxiliary = () => {
       for (const name of auxiliary) {
         const { stage } = auxiliaryStages.get(name)!;
@@ -746,9 +757,9 @@ export function createReadonlyReplica(
       auxiliaryCursor = 0,
       reconcileIndex = 0,
       closed = false;
-    const sourceSchemaVersion = Number(
-      source.prepare("PRAGMA schema_version").get()?.schema_version,
-    );
+    const schemaVersion = (db: NodeSqlite.DatabaseSync) =>
+      Number(db.prepare("PRAGMA schema_version").get()?.schema_version);
+    const sourceSchemaVersions = new Map(sourceTables.map(({ db }) => [db, schemaVersion(db)]));
     const markSeen = (name: string, id: NodeSqlite.SQLInputValue, generation: number) =>
       out
         .prepare(
@@ -1037,17 +1048,34 @@ export function createReadonlyReplica(
           throw invalidate("Board split completed; reopen readonly sources");
         }
       }
-      if (
-        Number(source.prepare("PRAGMA schema_version").get()?.schema_version) !==
-        sourceSchemaVersion
-      ) {
-        for (const [name, schema] of sourceSchemas) {
-          if (
-            tables.get(name)!.db.prepare("SELECT sql FROM sqlite_schema WHERE name=?").get(name)
-              ?.sql !== schema
-          )
-            throw invalidate("Readonly source schema changed; restart export");
+      if ([...sourceSchemaVersions].some(([db, version]) => schemaVersion(db) !== version)) {
+        const changed = sourceTables.flatMap(({ name, db }) => {
+          const schema = db.prepare("SELECT sql FROM sqlite_schema WHERE name=?").get(name)?.sql;
+          if (typeof schema !== "string")
+            throw invalidate(`Readonly export source table missing: ${name}`);
+          return normalizeSchema(schema) === normalizeSchema(sourceSchemas.get(name)!)
+            ? []
+            : [{ name, db, schema }];
+        });
+        if (changed.some(({ name }) => !auxiliary.includes(name)))
+          throw invalidate("Readonly source schema changed; restart export");
+        if (changed.length) {
+          // Discard pending diffs before changing their table shapes. The last
+          // published projections and lineage stay readable while auxiliary pages refill.
+          abortCycle();
+          refreshAuxiliarySchemas(changed);
+          for (const table of changed) {
+            configureTable(table);
+            out.exec(`DROP TABLE temp.${q(auxiliaryStages.get(table.name)!.stage)}`);
+            auxiliaryStages.set(table.name, createAuxiliaryStage(table.name));
+          }
+          auxiliaryIndex = 0;
+          auxiliaryCursor = 0;
+          auxiliaryCapturedAt = undefined;
+          cycleTarget = undefined;
         }
+        for (const db of sourceSchemaVersions.keys())
+          sourceSchemaVersions.set(db, schemaVersion(db));
       }
     };
     const stepOnce = (): boolean => {
