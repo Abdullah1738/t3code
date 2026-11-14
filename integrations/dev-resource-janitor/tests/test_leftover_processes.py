@@ -155,6 +155,68 @@ class ProcessTests(unittest.TestCase):
                     command = f'node tool.js --dsn={quote}{source}{quote}'
                     self.assertEqual(lp.redact(command), f'node tool.js --dsn={quote}{expected}{quote}')
 
+    def test_command_path_shape_matrix(self):
+        paths = [
+            '/Users/ardud/.local/share/foo/serve.py',
+            '/opt/homebrew/Cellar/python@3.13/3.13.7/Frameworks/Python.framework/Versions/3.13/bin/python3.13',
+            '~/projects/long-project-directory/scripts/serve.py',
+            './projects/long-project-directory/scripts/serve.py',
+            'node_modules/.bin/long-development-server',
+            'project/packages/server/scripts/serve',
+            'scripts/' + 'long-script-name-' * 3 + '.py',
+            'a+b/long-module-directory/development-entrypoint.js',
+            'project/a+b/scripts/development-entrypoint.js',
+            'project/scripts/development+entrypoint.js',
+        ]
+        for path in paths:
+            for quote in ('', '"', "'"):
+                with self.subTest(path=path, quote=quote):
+                    command = f'python3 {quote}{path}{quote} serve'
+                    self.assertEqual(lp.redact(command), command)
+        command = 'python3 -m http.server 8461 --directory /Users/ardud/.local/share/foo/public'
+        self.assertEqual(lp.redact(command), command)
+
+    def test_opaque_tokens_still_redact(self):
+        tokens = ['0123456789abcdef' * 2 + '01234567',
+                  'AbC012xy' * 5, 'AbC+/012' * 5,
+                  'a' * 33 + '/bcdefg',
+                  'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.signature']
+        for token in tokens:
+            for quote in ('', '"', "'"):
+                with self.subTest(token=token, quote=quote):
+                    self.assertEqual(lp.redact(f'node tool.js {quote}{token}{quote}'),
+                                     f'node tool.js {quote}[REDACTED]{quote}')
+
+    def test_explicit_credentials_win_over_path_shape(self):
+        values = ['a' * 40, '/Users/ardud/.local/share/credential-file',
+                  '~/secrets/credential-file', './secrets/credential-file',
+                  'node_modules/.bin/credential-file']
+        for value in values:
+            for flag in ('--token', '--password', '--key', '--auth'):
+                for separator in ('=', ' '):
+                    for quote in ('', '"', "'"):
+                        with self.subTest(value=value, flag=flag, separator=separator, quote=quote):
+                            redacted = lp.redact(f'node tool.js {flag}{separator}{quote}{value}{quote}')
+                            self.assertNotIn(value, redacted)
+                            self.assertIn('[REDACTED]', redacted)
+        for prefix in ('sk-', 'ghp_', 'github_pat_', 'xoxb-', 'xoxa-', 'xoxp-', 'xoxr-', 'xoxs-'):
+            for base in ('/tmp/', '~/secrets/', './secrets/', 'project/secrets/',
+                         '/tmp/backup_', '~/secrets/backup_', './secrets/backup_',
+                         'project/secrets/backup_', '/tmp/backup-', '/tmp/backup.'):
+                with self.subTest(prefix=prefix, base=base):
+                    self.assertEqual(lp.redact(f'node {base}{prefix}abc123/file.js'),
+                                     f'node {base}[REDACTED]/file.js')
+
+    def test_shell_delimiters_cannot_extend_a_path_exemption(self):
+        token = '0123456789abcdef' * 2 + '01234567'
+        for delimiter in (';', ';;', '&', '&&', '|', '||', '(', ')', '<', '>', '>>',
+                          '`', '{', '}', '\n'):
+            for quote in ('', '"', "'"):
+                with self.subTest(delimiter=delimiter, quote=quote):
+                    command = f'sh -c {quote}/usr/bin/node{delimiter}{token}{quote}'
+                    self.assertEqual(lp.redact(command),
+                                     f'sh -c {quote}/usr/bin/node{delimiter}[REDACTED]{quote}')
+
     def test_saved_report_redacts_non_http_userinfo_in_kept_process_and_ancestors(self):
         import dev_janitor
         for scheme in ('postgres', 'postgresql', 'redis', 'rediss', 'mysql', 'mongodb'):
