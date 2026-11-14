@@ -421,6 +421,17 @@ export interface KanbanServiceShape {
     { readonly board: KanbanBoard; readonly applied: boolean; readonly reason?: string },
     KanbanError
   >;
+  readonly applyApprovedSettings: (
+    boardId: KanbanBoardId,
+    setting: "guessedGates",
+    value: NonNullable<KanbanBoard["guessedGates"]>,
+    cardId: KanbanCard["id"],
+    askId: string,
+    actor: KanbanActor,
+  ) => Effect.Effect<
+    { readonly board: KanbanBoard; readonly applied: boolean; readonly reason?: string },
+    KanbanError
+  >;
   readonly standingApproval: (
     boardId: KanbanBoard["id"],
     input: StandingApprovalInput,
@@ -2910,15 +2921,20 @@ const make = Effect.gen(function* () {
     return yield* Effect.uninterruptible(
       Effect.gen(function* () {
         const event = yield* write;
-        yield* Effect.logInfo("kanban board instructions applied", {
-          boardId: application.boardId,
-          board: application.boardSlug,
-          field: application.field,
-          cardId: application.cardId,
-          askId: application.askId,
-          threadId: application.threadId,
-          applicationId: application.id,
-        });
+        yield* Effect.logInfo(
+          application.field === "guessedGates"
+            ? "kanban board settings applied"
+            : "kanban board instructions applied",
+          {
+            boardId: application.boardId,
+            board: application.boardSlug,
+            field: application.field,
+            cardId: application.cardId,
+            askId: application.askId,
+            threadId: application.threadId,
+            applicationId: application.id,
+          },
+        );
         return event;
       }),
     );
@@ -11960,6 +11976,113 @@ const make = Effect.gen(function* () {
     return result;
   });
 
+  const applyApprovedSettings: KanbanServiceShape["applyApprovedSettings"] = Effect.fn(
+    "KanbanService.applyApprovedSettings",
+  )(function* (boardId, setting, value, cardId, askId, actor) {
+    if (actor._tag !== "evaluator") {
+      return yield* failWith("denied", "Only evaluators use this tool.");
+    }
+    const result = yield* guard(
+      "board.applyApprovedSettings",
+      Effect.gen(function* () {
+        const card = yield* cardOf(cardId);
+        const ask = card.asks.find((entry) => entry.id === askId);
+        if (!ask) return yield* failWith("not-found", `ask ${askId} on card #${card.number}`);
+        if (!ask.closedAt) return yield* failWith("denied", `ask ${askId} is still open`);
+        if (ask.answer?.verdict === "dropped") {
+          return yield* failWith("denied", `ask ${askId} was dropped`);
+        }
+        if (ask.answer?.verdict === "rejected") {
+          return yield* failWith("denied", `ask ${askId} was rejected`);
+        }
+        if (ask.answer?.by._tag !== "owner") {
+          return yield* failWith("denied", `ask ${askId} was not answered by the owner`);
+        }
+        if (ask.answer.verdict !== "approved") {
+          return yield* failWith("denied", `ask ${askId} does not have the owner's approval`);
+        }
+        const board = yield* boardOf(boardId);
+        const namesField = ["guessed gates", "guessedGates"];
+        const names = (label: string, name: string) => {
+          const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          return new RegExp(`(^|[^\\p{L}\\p{N}_])${escaped}($|[^\\p{L}\\p{N}_])`, "iu").test(label);
+        };
+        const changes = [ask.change, ...(ask.changes ?? [])]
+          .filter((entry) => entry !== undefined)
+          .filter(
+            (entry) =>
+              (names(entry.label, board.slug) || names(entry.label, board.name)) &&
+              namesField.some((name) => names(entry.label, name)),
+          );
+        if (changes.length === 0) {
+          return yield* failWith(
+            "denied",
+            `ask ${askId} has no change entry labelled for board ${board.slug} and setting ${setting}`,
+          );
+        }
+        const normalized = (value: string) => value.replace(/\r\n/g, "\n").trim();
+        const guessedGates = [...value].sort();
+        const text = guessedGates.join(", ");
+        const current =
+          board.guessedGates === undefined ? "(unset)" : [...board.guessedGates].sort().join(", ");
+        const approved = changes.filter((entry) => normalized(entry.after) === normalized(text));
+        if (approved.length === 0) {
+          return yield* failWith("denied", `value differs from the approved after in ask ${askId}`);
+        }
+        if (normalized(current) === normalized(text)) {
+          return { board, applied: false, reason: "already set" };
+        }
+        if (!approved.some((entry) => normalized(entry.before) === normalized(current))) {
+          return yield* failWith(
+            "denied",
+            "the board's setting changed since he approved it; ask again",
+          );
+        }
+        const application: InstructionApplication = {
+          id: NodeCrypto.randomUUID(),
+          boardId: board.id,
+          boardSlug: board.slug,
+          cardId,
+          field: setting,
+          askId,
+          threadId: actor.threadId,
+        };
+        const next = yield* updateBoardUnlocked(
+          board.id,
+          {
+            guessedGates,
+          },
+          application,
+        );
+        return { board: next, applied: true };
+      }),
+    );
+    // Receipts commit with the board write. A fresh card operation drains them
+    // independently, so failed audits can retry without hiding later applications.
+    yield* guard(
+      "board.auditApprovedSettings",
+      Effect.gen(function* () {
+        for (const application of yield* store.pendingInstructionApplications(
+          cardId,
+          boardId,
+          setting,
+          askId,
+        )) {
+          yield* editCard(
+            cardId,
+            {
+              comment: `Applied ${application.field} on board ${application.boardSlug} from ${application.askId} (by ${application.threadId})`,
+            },
+            { _tag: "evaluator", threadId: application.threadId },
+            application,
+          );
+        }
+      }),
+      cardId,
+    );
+    return result;
+  });
+
   const checkStandingEvaluator = Effect.fn("KanbanService.checkStandingEvaluator")(function* (
     actor: KanbanActor,
   ) {
@@ -16221,6 +16344,7 @@ const make = Effect.gen(function* () {
     createBoard,
     updateBoard,
     applyApprovedInstructions,
+    applyApprovedSettings,
     standingApproval,
     revokeStandingApproval,
     setNightlyReview: Effect.fn("KanbanService.setNightlyReview")(function* (boardId, input) {

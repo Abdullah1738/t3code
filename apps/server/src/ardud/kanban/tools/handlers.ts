@@ -1232,6 +1232,23 @@ const handlers = {
     ),
   ),
 
+  board_settings_set: McpToolAccess.actsAsCaller((input) =>
+    asEvaluator((service, caller) =>
+      Effect.gen(function* () {
+        const board = yield* boardFor(service, caller, input.boardId);
+        const card = yield* cardFor(service, caller, input.card);
+        return yield* service.applyApprovedSettings(
+          board.id,
+          input.setting,
+          input.value,
+          card.id,
+          input.ask,
+          caller.actor,
+        );
+      }),
+    ),
+  ),
+
   pool_remove: McpToolAccess.actsAsCaller((input) =>
     asEvaluator((service, caller) =>
       Effect.gen(function* () {

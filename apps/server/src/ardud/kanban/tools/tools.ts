@@ -903,6 +903,21 @@ const BoardInstructionsSet = tool(
   { readonly: false, destructive: true },
 );
 
+const BoardSettingsSet = tool(
+  "board_settings_set",
+  "Apply approved board settings",
+  'Evaluators: set guessedGates to the value Abdullah approved in a closed change ask with an approved verdict. Its change/changes entry must label "<Board> guessed gates" (board slug or name; guessedGates also accepted), with before equal to the current setting and after equal to value: sort gates and join with ", " ("deploy, money, secret", "money, secret", "" for none; "(unset)" for an absent current setting).',
+  {
+    boardId: Schema.optional(TrimmedNonEmptyString),
+    card: CardRef,
+    ask: TrimmedNonEmptyString,
+    setting: Schema.Literals(["guessedGates"]),
+    value: Schema.Array(Schema.Literals(["deploy", "money", "secret"])),
+  },
+  { board: Record, applied: Schema.Boolean, reason: Schema.optional(Schema.String) },
+  { readonly: false, destructive: true },
+);
+
 const PoolRemove = tool(
   "pool_remove",
   "Remove a model pool",
@@ -1115,6 +1130,7 @@ export const KanbanToolkit = Toolkit.make(
   CardThread,
   PoolSet,
   BoardInstructionsSet,
+  BoardSettingsSet,
   PoolRemove,
   GoalSet,
   GroupSet,
