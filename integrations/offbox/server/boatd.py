@@ -497,7 +497,7 @@ def health(fresh: bool = False) -> dict:
         out.update(ok=False, mode="degraded", reasons=[reason] + [r for r in out.get("reasons", []) if r != reason])
     age = max(0, now() - snapshot["ts"]) if cached else None
     refresh = dict(_HEALTH_REFRESH)
-    out.update(**status, boot_id=boot_id(), uptime_s=int(host_uptime()), boatd_uptime_s=int(now() - STARTED),
+    out.update(host=host_pressure(), **status, boot_id=boot_id(), uptime_s=int(host_uptime()), boatd_uptime_s=int(now() - STARTED),
                snapshot_age_s=round(age, 1) if age is not None else None,
                refresh_stage=refresh["stage"],
                refresh_stage_ms=round((time.monotonic() - refresh["since"]) * 1000, 1)
@@ -2345,9 +2345,21 @@ def host_cpu_busy() -> float | None:
 def psi(kind: str) -> float | None:
     try:
         line = Path(f"/proc/pressure/{kind}").read_text().splitlines()[0]
-        return float(line.split("avg10=")[1].split()[0])
+        value = float(line.split("avg10=")[1].split()[0])
+        return value if math.isfinite(value) and 0 <= value <= 100 else None
     except (OSError, IndexError, ValueError):
         return None
+
+
+def host_pressure() -> dict:
+    try:
+        loadavg = [float(v) for v in Path("/proc/loadavg").read_text().split()[:3]]
+        if len(loadavg) != 3 or any(not math.isfinite(v) or v < 0 for v in loadavg):
+            loadavg = None
+    except (OSError, ValueError):
+        loadavg = None
+    return {"loadavg": loadavg, "cores": os.cpu_count(),
+            "cpu_some_avg10": psi("cpu"), "io_some_avg10": psi("io")}
 
 
 def box_mem(box_id: str) -> int | None:

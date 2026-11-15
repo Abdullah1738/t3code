@@ -130,6 +130,27 @@ atomically, with the hook last. It runs no apt command, service restart/reload, 
 swap. Read back with `perl -c /etc/needrestart/conf.d/50-offbox.conf` and `needrestart -b -r l`.
 Batch output's `NEEDRESTART-SVC` lines list stale services regardless of their restart selection.
 
+## Control-plane CPU priority
+
+Full host provisioning gives `system.slice`, `boatd.service`, `tailscaled.service`, `ssh.service` and
+`incus.service` `CPUWeight=1000`. Incus payloads are root cgroups outside `system.slice`, so the parent
+slice needs the higher weight too. Command runners retain weight 100 within that slice; box priorities
+by size remain unchanged. These are relative shares under contention, not CPU quotas or reservations.
+I/O weights are unchanged: the pool uses ZFS writeback and NVMe's `none` scheduler without iocost.
+
+For an existing host, stage the reviewed `../install-host.sh` at `/root/offbox-server/install-host.sh`,
+then run `bash /root/offbox-server/install-host.sh cpu-priority` in the planned release window. This path
+only writes the CPU drop-ins, runs `systemctl daemon-reload`, and applies the five active weights with
+`systemctl set-property --runtime`. It restarts no service, changes no Incus profile and runs no apt
+command. The drop-ins persist across boots; the runtime properties apply immediately. Check the five
+units with `systemctl show -p ControlGroup -p CPUWeight`, then read each cgroup's `cpu.weight`.
+Updating boatd's `/health` code still needs its normal batched service restart.
+
+Before applying on an existing host, retain any previous `90-offbox-cpu-priority.conf` files from these
+six drop-in directories: the five units above and `boatd-cmd-.service.d`. Rollback restores those files
+(or removes only newly added files), reloads systemd, and sets each active unit's runtime `CPUWeight`
+back to its recorded value (100 on the inspected host). No service restart is needed for rollback.
+
 ## Box scratch space
 
 The `offbox` Incus profile mounts an executable tmpfs at `/tmp` when a box starts: mode `1777`,
