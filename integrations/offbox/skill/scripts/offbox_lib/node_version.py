@@ -76,21 +76,38 @@ else
       fi
       [ "${actual%% *}" = "$__offbox_sum" ]
     }
-    if ! __offbox_archive_ok "$__offbox_archive"; then
+    __offbox_verify_archive() {
+      if __offbox_archive_ok "$__offbox_archive"; then return 0; fi
       __offbox_curl -fsSL "https://nodejs.org/dist/$__offbox_install/$__offbox_slug.$__offbox_compression" -o "$__offbox_archive.tmp" || exit 1
       __offbox_archive_ok "$__offbox_archive.tmp" || { echo 'offbox: Node archive checksum mismatch' >&2; exit 1; }
       mv "$__offbox_archive.tmp" "$__offbox_archive" || exit 1
-    fi
+    }
+    __offbox_verify_archive
     # nvm 0.40.3 can fall through a checksum error. Supply only our independently verified archive.
     nvm_remote_version() { echo "$__offbox_install"; }
     nvm_download_artifact() { echo "$__offbox_archive"; }
     nvm_download() { return 1; }
     unset NVM_OFFLINE
-    nvm install -b "$__offbox_install" || exit 1
+    for __offbox_attempt in 1 2; do
+      __offbox_unpack_rc=0
+      __offbox_unpack_attempt "$__offbox_stage/install.log" nvm install -b "$__offbox_install" || __offbox_unpack_rc=$?
+      # nvm can return success after tar failed with a partially executable installation.
+      if ! __offbox_signature=$(__offbox_native_crash "$__offbox_stage/install.log" "$__offbox_unpack_rc"); then
+        [ "$__offbox_unpack_rc" = 0 ] && break
+        exit 1
+      fi
+      if [ "$__offbox_attempt" = 2 ]; then
+        __offbox_infra_stop native_crash toolchain_unpack_crash "box ${OFFBOX_BOX_ID:-<box>} crashed unpacking a checksum-verified Node $__offbox_install archive twice ($__offbox_signature); this is a box/host fault, not your repo."
+      fi
+      echo "offbox: Node $__offbox_install unpack crashed on this box ($__offbox_signature); retrying once" >&2
+      rm -rf -- "$NVM_DIR/versions/node/$__offbox_install" "$NVM_DIR/src" "$NVM_DIR/tmp" "$__offbox_cache/files" \
+        "$NVM_DIR/.cache/src/node-$__offbox_install" "$NVM_DIR/.cache/tmp/node-$__offbox_install" || exit 1
+      __offbox_verify_archive
+    done
     [ "$("$NVM_DIR/versions/node/$__offbox_install/bin/node" --version)" = "$__offbox_install" ] || exit 1
     mkdir -p "$__offbox_nvm_home/versions/node" || exit 1
     mv "$NVM_DIR/versions/node/$__offbox_install" "$__offbox_nvm_home/versions/node/$__offbox_install" || exit 1
-  ) >&2 || __offbox_stop "$__offbox_reason: nvm install $__offbox_install failed"
+  ) >&2 || { [ "$?" != 90 ] || exit 90; __offbox_stop "$__offbox_reason: nvm install $__offbox_install failed"; }
   export PATH="$NVM_DIR/versions/node/$__offbox_install/bin:$PATH"
   __offbox_actual=$(node --version 2>/dev/null) || __offbox_actual=
   [[ "$__offbox_actual" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && __offbox_in "$(__offbox_nk "$__offbox_actual")" ||

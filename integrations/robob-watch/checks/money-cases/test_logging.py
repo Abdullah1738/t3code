@@ -15,6 +15,7 @@ import unittest
 from unittest.mock import patch
 
 from test_cases import Base, ALERT, BANK, at, finder, nobody, mc
+from test_charges import ControlServer, summary
 
 
 HERE = Path(__file__).resolve().parent
@@ -22,6 +23,34 @@ SHARED = HERE.parents[2] / 'app-api-cli' / 'toollog.py'
 
 
 class Logging(Base):
+    def test_owner_cache_reset_diagnostics_wait_for_book_unlock(self):
+        path = self.data / 'owner-texts.json'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('corrupt private text')
+        held, seen = [], []
+        emit = mc.toollog.emit
+
+        def logging(*args, **kwargs):
+            if args[1] == 'cache_reset':
+                seen.append(bool(held))
+            return emit(*args, **kwargs)
+
+        @mc.log_scope
+        def lookup():
+            with mc.Locked(self.data, 'questions'):
+                held.append(True)
+                try:
+                    mc.explain_charge(self.data, mc.charges.parse(ALERT, BANK),
+                                      at('2026-10-24T04:10'), at('2026-10-24T04:20'), find=finder())
+                finally:
+                    held.clear()
+
+        with ControlServer([summary('I paid Acme')]), patch.object(mc.toollog, 'emit', logging):
+            lookup()
+        self.assertEqual(seen, [False])
+        self.assertEqual(len(self.rows('cache_reset')), 1)
+        self.assertNotIn('private', json.dumps(self.rows('cache_reset')))
+
     def rows(self, name=None):
         rows = [json.loads(line) for path in (self.tmp / 'tool-logs/orders').glob('*.ndjson')
                 for line in path.read_text().splitlines()]
@@ -517,6 +546,31 @@ class Logging(Base):
         self.assertEqual(stats['follow_ms'], 6750)
         self.assertEqual(stats['untimed_ms'], 250)
         self.assertIsNone(mc.charges.TIMING_STATS.get())
+
+    def test_write_count_logs_only_successful_follow_state_commits(self):
+        def follow(*args, **kwargs):
+            mc.write_json(self.data / 'first.json', {'fixture': True})
+            with patch.object(mc, 'atomic_write_json', side_effect=OSError('fixture write failed')):
+                with self.assertRaises(OSError):
+                    mc.write_json(self.data / 'failed.json', {})
+            mc.write_json(self.data / 'second.json', {'fixture': True})
+            return []
+        with patch.object(mc, 'follow', follow):
+            mc.run_check(self.wd, 'counts', self.data, self.root, at('2026-11-14T12:00'), finder(), nobody)
+        props = self.rows('check.run')[-1]['props']
+        self.assertEqual(props['writes_n'], 2)
+        timing = json.loads((self.wd / 'pings.json').read_text())['timing']
+        self.assertEqual(timing['writes_n'], 2)
+        self.assertFalse((self.data / 'failed.json').exists())
+
+    def test_write_count_accepts_only_bounded_nonnegative_integers(self):
+        forms = [(0, True), (1, True), (10**12, True), (-1, False), (-10**12, False),
+                 (10**12 + 1, False), (True, False), (False, False), (1.5, False),
+                 ('1', False), (None, False)]
+        for value, accepted in forms:
+            with self.subTest(value=value):
+                mc.toollog.emit('money-cases', 'check.run', props={'writes_n': value})
+                self.assertEqual(self.rows('check.run')[-1]['props'], {'writes_n': value} if accepted else {})
 
     def test_follow_timers_survive_interrupts_and_count_storage_redaction(self):
         stats, clock = {}, [1000.0]

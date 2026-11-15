@@ -31,6 +31,7 @@ import fcntl
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import secrets
@@ -96,7 +97,8 @@ DEFAULTS = {
     "state_dataset": "",              # e.g. offbox/boatd: boatd refuses to keep state anywhere else (set by install-host.sh)
     "owners": ["ardud", "moni"], "default_owner": "ardud",
     "person_owners": ["moni"],        # their boxes get hourly/daily/weekly snapshots
-    "max_running": 0,                 # hard cap on runs at once (0 = memory admission only)
+    "max_running": 0,                 # optional hard cap, in addition to resource admission
+    "cpu_pressure_limit": 50,         # host CPU some avg10 (%); 0 disables CPU admission
     "prune_unused_days": 30,          # stopped boxes untouched this long are deleted (not pinned, not saved)
     "sample_s": 10, "keep_samples_days": 90,
 }
@@ -192,6 +194,7 @@ def migrate(con) -> None:
                 "killed INTEGER NOT NULL DEFAULT 0"):
         if col.split()[0] not in have:
             con.execute(f"ALTER TABLE commands ADD COLUMN {col}")
+    con.execute("CREATE INDEX IF NOT EXISTS commands_cpu_start ON commands(sync, started_at)")
     if "owner" not in _cols(con, "saved"):
         # Saved states were global by name; they become per owner. The one owner so far keeps all of them.
         con.execute("BEGIN IMMEDIATE")
@@ -392,6 +395,22 @@ _HEALTH = {"ts": 0.0, "v": None}
 _HEALTH_LOCK = threading.Lock()
 
 
+RESTART_PENDING = Path("/var/lib/offbox/restart-pending.json")
+
+
+def restart_pending() -> dict:
+    try:
+        value = json.loads(RESTART_PENDING.read_text())
+        services, since = value["services"], value["checkedAt"]
+        if not isinstance(services, list) or not all(isinstance(s, str) and s for s in services):
+            raise ValueError("invalid pending services")
+        if not isinstance(since, str) or dt.datetime.fromisoformat(since).utcoffset() != dt.timedelta(0):
+            raise ValueError("invalid UTC timestamp")
+        return {"count": len(services), "since": since if services else None}
+    except (OSError, ValueError, KeyError, TypeError):
+        return {"count": 0, "since": None}
+
+
 def health(fresh: bool = False) -> dict:
     """GET /health: no auth, no data about boxes or owners. `ok` means runs can be accepted here."""
     with _HEALTH_LOCK:
@@ -432,6 +451,7 @@ def health(fresh: bool = False) -> dict:
         out = {"ok": ok, "up": True, "mode": "ok" if not reasons else "degraded", "reasons": reasons,
                "pool": {"name": CFG["zpool"], "state": pool}, "mdraid": md, "queue": queue, "running": running,
                "boot_id": boot_id(), "uptime_s": int(host_uptime()), "boatd_uptime_s": int(now() - STARTED),
+               "restartPending": restart_pending(),
                "version": VERSION, **status, "boot": STATE.get("boot"), "startupPhases": STATE.get("phases", {})}
         _HEALTH.update(ts=now(), v=out)
         return out
@@ -1045,6 +1065,25 @@ def admitted_bytes(con) -> int:
 ADMIT_LOCK = VAR / "admit.lock"
 
 
+def last_admission(con) -> float | None:
+    return con.execute("SELECT MAX(started_at) FROM commands WHERE sync=0").fetchone()[0]
+
+
+def admission_cpu_limit() -> float | None:
+    # A rollback must release existing waiters too, without restarting their runners.
+    try:
+        value = json.loads((ETC / "config.json").read_text()).get("cpu_pressure_limit", DEFAULTS["cpu_pressure_limit"])
+    except FileNotFoundError:
+        value = CFG["cpu_pressure_limit"]
+    except (OSError, ValueError, AttributeError):
+        return None
+    try:
+        limit = float(value)
+    except (TypeError, ValueError):
+        return None
+    return limit if not isinstance(value, bool) and math.isfinite(limit) and 0 <= limit <= 100 else None
+
+
 def admit(con, box_id: str, pid: int, kind: str, errf) -> float:
     with toollog.span("boatd", "run.queue", ids={"box": box_id}, props={"backend": "home"}, tag="queue_failed") as data:
         queued = _admit(con, box_id, pid, kind, errf)
@@ -1070,7 +1109,14 @@ def _admit(con, box_id: str, pid: int, kind: str, errf) -> float:
             mine = head is None or (head["box_id"] == box_id and head["pid"] == pid)
             cap = int(CFG.get("max_running") or 0)
             room = not cap or con.execute("SELECT COUNT(*) FROM commands WHERE sync=0 AND status='running'").fetchone()[0] < cap
-            if (mine and room and free >= need) or now() - t0 > 3600:
+            cpu_limit = admission_cpu_limit()
+            cpu = psi("cpu") if cpu_limit is not None and cpu_limit > 0 else None
+            cpu_known = cpu is not None and math.isfinite(cpu) and 0 <= cpu <= 100
+            last_start = last_admission(con)
+            # PSI is a moving average: let a new run show up before admitting its neighbour.
+            cpu_room = cpu_limit == 0 or (cpu_limit is not None and cpu_known and cpu < cpu_limit and
+                                        (last_start is None or now() - last_start >= 10))
+            if mine and room and free >= need and cpu_room:
                 con.execute("UPDATE commands SET status='running', started_at=?, queued_s=?, boot_id=? "
                             "WHERE box_id=? AND pid=?", (now(), now() - t0, boot_id(), box_id, pid))
                 return now() - t0
@@ -1081,9 +1127,19 @@ def _admit(con, box_id: str, pid: int, kind: str, errf) -> float:
                 position = None
             toollog.emit("boatd", "run.queue", ids={"box": box_id}, props={"backend": "home", "queued": True,
                          "waitMs": (now()-t0)*1000, "position": position})
-            why = "for earlier runs in the queue" if not (mine and room) else \
-                (f"for memory (this kind peaks ~{need / 2**30:.1f} GB, {max(0, free) / 2**30:.1f} GB free "
-                 "after reserve)")
+            if not (mine and room):
+                why = "for earlier runs in the queue"
+            elif free < need:
+                why = (f"for memory (this kind peaks ~{need / 2**30:.1f} GB, {max(0, free) / 2**30:.1f} GB free "
+                       "after reserve)")
+            elif cpu_limit is None:
+                why = "for a valid CPU admission setting"
+            elif not cpu_known and cpu_limit > 0:
+                why = "for a host CPU pressure reading"
+            elif cpu_limit > 0 and cpu >= cpu_limit:
+                why = f"for host CPU pressure ({cpu:.1f}%, limit {cpu_limit:g}%)"
+            else:
+                why = "for the previous run's CPU pressure to settle"
             errf.write(f"offbox-server: waiting {why}\n".encode())
             errf.flush()
             said = True

@@ -65,28 +65,42 @@ const compactWait = (card: KanbanCard, byId: ReadonlyMap<string, KanbanCard>) =>
   };
 };
 
-export const boardReleaseSummary = (board: KanbanBoard, at?: string) => ({
-  releaseLedger: (board.releaseLedger ?? []).slice(-5),
-  nextReleaseWindowAt:
-    at === undefined
-      ? null
-      : (releaseWindow({
-          approvals: board.standingApprovals,
-          ledger: board.releaseLedger ?? [],
-          boardId: board.id,
-          at,
-        })?.next ?? null),
-});
+export const boardReleaseSummary = (
+  board: KanbanBoard,
+  at?: string,
+  boards: ReadonlyArray<KanbanBoard> = [board],
+) => {
+  // The target snapshot can be newer than the cross-board inventory read.
+  const ledger = [...boards.filter((entry) => entry.id !== board.id), board].flatMap(
+    (entry) => entry.releaseLedger ?? [],
+  );
+  const context = { approvals: board.standingApprovals, ledger, boardId: board.id, at: at ?? "" };
+  const windows = new Map<string, string>();
+  if (at !== undefined) {
+    for (const service of new Set(
+      ledger.flatMap((entry) => (entry.service === undefined ? [] : [entry.service])),
+    )) {
+      const window = releaseWindow(context, service);
+      if (window) windows.set(service, window.next);
+    }
+  }
+  return {
+    releaseLedger: (board.releaseLedger ?? []).slice(-5),
+    nextReleaseWindowAt: at === undefined ? null : (releaseWindow(context)?.next ?? null),
+    nextReleaseWindowByService: Object.fromEntries(windows),
+  };
+};
 
 export const compactBoard = (
   snapshot: KanbanBoardSnapshot,
   byId = new Map(snapshot.cards.map((card) => [card.id as string, card])),
   at?: string,
+  boards?: ReadonlyArray<KanbanBoard>,
 ) => ({
   ...snapshot,
   board: {
     ...snapshot.board,
-    ...boardReleaseSummary(snapshot.board, at),
+    ...boardReleaseSummary(snapshot.board, at, boards),
     standingApprovals: snapshot.board.standingApprovals.map((entry) => ({
       ...entry,
       quote: entry.quote.slice(0, 200),

@@ -372,7 +372,7 @@ it.live("pins cold and hot snapshots before allowing a live shadow to be rearchi
 it("reads archive pacing from the environment with safe fallbacks", () => {
   assert.deepEqual(historyArchivePacing({}), {
     paused: false,
-    minIntervalMs: 250,
+    minIntervalMs: 5000,
     contentionMs: 1_000,
     backoffMs: 10_000,
     maxBackoffMs: 300_000,
@@ -398,7 +398,7 @@ it("reads archive pacing from the environment with safe fallbacks", () => {
     }),
     {
       paused: false,
-      minIntervalMs: 250,
+      minIntervalMs: 5000,
       contentionMs: 1_000,
       backoffMs: 20_000,
       maxBackoffMs: 20_000,
@@ -408,19 +408,38 @@ it("reads archive pacing from the environment with safe fallbacks", () => {
 
 it("never schedules passes back to back and doubles the backoff under contention", () => {
   const pacing = historyArchivePacing({});
-  // A quick pass waits the minimum gap; a long one waits at least its own duration.
-  assert.equal(nextHistoryArchiveDelayMs(pacing, { durationMs: 3, contendedStreak: 0 }), 250);
-  assert.equal(nextHistoryArchiveDelayMs(pacing, { durationMs: 4_000, contendedStreak: 0 }), 4_000);
+  // A quick pass waits the minimum gap; a long pass keeps a 10% duty cycle.
+  assert.equal(nextHistoryArchiveDelayMs(pacing, { durationMs: 3, contendedStreak: 0 }), 5000);
+  assert.equal(
+    nextHistoryArchiveDelayMs(pacing, { durationMs: 4_000, contendedStreak: 0 }),
+    36_000,
+  );
   assert.equal(nextHistoryArchiveDelayMs(pacing, { durationMs: 10, contendedStreak: 1 }), 10_000);
   assert.equal(nextHistoryArchiveDelayMs(pacing, { durationMs: 10, contendedStreak: 2 }), 20_000);
   assert.equal(nextHistoryArchiveDelayMs(pacing, { durationMs: 10, contendedStreak: 6 }), 300_000);
   assert.equal(nextHistoryArchiveDelayMs(pacing, { durationMs: 10, contendedStreak: 99 }), 300_000);
-  // The 140 s pass of 11 Nov 2026 would now be followed by at least 140 s of quiet.
+  // The 140 s pass of 11 Nov 2026 would now be followed by at least 1262 s of quiet.
   assert.equal(
     nextHistoryArchiveDelayMs(pacing, { durationMs: 140_237, contendedStreak: 1 }),
-    140_237,
+    1_262_133,
   );
 });
+
+it.effect("bounds each pass to four rows even when the row-work clock is fast", () =>
+  Effect.gen(function* () {
+    yield* seed;
+    const sql = yield* SqlClient.SqlClient;
+    for (let index = 5; index <= 30; index++) {
+      yield* sql`INSERT INTO orchestration_events
+        (event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at, actor_kind, payload_json, metadata_json, application_event_version)
+        VALUES (${`event:${index}`}, 'thread', 'old', ${index}, 'thread.metadata-updated', '2020-01-01', 'server', '{}', '{}', 2)`;
+    }
+    const pass = yield* runPass;
+    assert.equal(pass.moved, 4);
+    assert.deepEqual(yield* sql`SELECT COUNT(*) AS n FROM ardud_archive.ardud_events`, [{ n: 4 }]);
+    assert.deepEqual(yield* sql`SELECT COUNT(*) AS n FROM orchestration_events`, [{ n: 26 }]);
+  }).pipe(Effect.provide(Sqlite.layerMemory)),
+);
 
 const delayQuery =
   (pattern: RegExp, delay: Parameters<typeof Effect.sleep>[0]): Statement.Transformer =>
@@ -527,6 +546,9 @@ it.live("keeps hot rows until the worker reports the archive copy durable", () =
         // The live writer never runs F_FULLFSYNC for the archive (or main) itself.
         assert.deepEqual(yield* sql`PRAGMA fullfsync`, [{ fullfsync: 0 }]);
         assert.deepEqual(yield* sql`PRAGMA ardud_archive.synchronous`, [{ synchronous: 1 }]);
+        assert.deepEqual(yield* sql`PRAGMA ardud_archive.journal_size_limit`, [
+          { journal_size_limit: 33554432 },
+        ]);
         const real = yield* HistoryArchiveDurability;
         let barriers = 0;
         const refusing = HistoryArchiveDurability.of({

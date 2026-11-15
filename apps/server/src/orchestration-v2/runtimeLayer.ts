@@ -184,6 +184,7 @@ const layerRunExecutionServiceProvided = RunExecutionService.layer.pipe(
 const layerProviderTurnStartServiceProvided = ProviderTurnStartService.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
+      KanbanStore.layer,
       layerContextHandoffServiceProvided,
       layerEventSinkProvided,
       IdAllocator.layer,

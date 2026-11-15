@@ -108,7 +108,7 @@ ORDER_RESERVE = 12
 ORDER_SCREEN_BUDGET = 1
 FOLLOW_STEPS = ('merchants', 'order_charges', 'payments', 'questions', 'refunds',
                 'owner_threads', 'msgs', 'receipt', 'lookups', 'order_screen', 'census', 'loads', 'writes', 'locks')
-TIMING_KEYS = tuple(name + '_ms' for name in FOLLOW_STEPS) + ('msgs_max_ms', 'follow_ms', 'untimed_ms')
+TIMING_KEYS = tuple(name + '_ms' for name in FOLLOW_STEPS) + ('msgs_max_ms', 'follow_ms', 'untimed_ms', 'writes_n')
 FOLLOW_EACH = 6  # at most this many of them per question, least recently checked first
 DONT_ASK = 3
 # The runner clips an event at 6,000 characters; cases past this limit wait for the next check.
@@ -311,10 +311,13 @@ def redact(text):
     return LABELLED.sub('[secret removed]', text)
 
 
+_REDACTION_CACHE = contextvars.ContextVar('money_cases_redaction_cache', default=None)
+
+
 def redact_all(obj):
     """Redact every string in a stored row, so show and list --json print a hand-edited book safely."""
     if isinstance(obj, str):
-        return redact(obj)
+        return (_REDACTION_CACHE.get() or redact)(obj)
     if isinstance(obj, list):
         return [redact_all(x) for x in obj]
     if isinstance(obj, dict):
@@ -546,6 +549,8 @@ def receipt_for_question(data, charge, qid=None, questions=None, at=None):
 
 
 def explain_charge(data, charge, at, now, deadline=None, find=None, said=None, qid=None, *, purchases=True):
+    said = said or (lambda *a, **kw: charges.owner_texts(
+        *a, **kw, cache_path=Path(data or DATA) / 'owner-texts.json', cache_reset=lambda: record_event('cache_reset')))
     if charge['kind'] != 'charge':
         return charges.explain(charge, at, now, deadline, find, said)
     questions = load_questions(data)['questions']
@@ -677,9 +682,14 @@ def follow_timing(stats):
     started = time.monotonic()
     before = sum(stats.get(name + '_ms', 0) for name in FOLLOW_STEPS)
     token = charges.TIMING_STATS.set(stats)
+    # Cursor commits revisit the same immutable text; retain every durability checkpoint.
+    cache = functools.lru_cache(maxsize=8192)(redact)
+    redaction_token = _REDACTION_CACHE.set(cache)
     try:
         yield
     finally:
+        _REDACTION_CACHE.reset(redaction_token)
+        cache.cache_clear()
         charges.TIMING_STATS.reset(token)
         stats['follow_ms'] = round((time.monotonic() - started) * 1000)
         accounted = sum(stats.get(name + '_ms', 0) for name in FOLLOW_STEPS) - before
@@ -705,7 +715,11 @@ else:
 @admitted_check
 def write_json(path, obj, timing=None):
     with charges.step_timing(None, 'writes'):
-        return atomic_write_json(path, obj, timing)
+        result = atomic_write_json(path, obj, timing)
+        stats = charges.TIMING_STATS.get()
+        if stats is not None:
+            stats['writes_n'] = stats.get('writes_n', 0) + 1
+        return result
 
 
 def load(data=None):
@@ -2738,7 +2752,9 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
             # Coverage alone cannot authorize an ask: a negative order result
             # still needs the receipt/owner screen before census proven_clean.
             counted(q['id'], 'limited' if outcome == 'proven_clean' else outcome)
-    owner_source = said or (lambda *a, **kw: charges.owner_texts(*a, **kw, stats=stats))
+    owner_source = said or (lambda *a, **kw: charges.owner_texts(
+        *a, **kw, stats=stats, cache_path=Path(data) / 'owner-texts.json',
+        cache_reset=lambda: record_event('cache_reset')))
     source_error = None
 
     def source(*args, **kwargs):
@@ -2767,7 +2783,7 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
     charge_times = [at for _, at, q in todo if q.get('kind') == 'charge']
     owner_rows = None
     owner_error = None
-    if charge_times and now - (min(charge_times) - charges.OWNER_AROUND) <= dt.timedelta(days=2):
+    if charge_times:
         try:
             owner_end = min(deadline, time.time() + 4) if deadline is not None else time.time() + 4
             with within(owner_end, LookupTimeout('out of time')):
@@ -3743,6 +3759,7 @@ def brief(cases, now=None, root=None, cancelled=None):
         return ''
 
     due, changed = [], []
+    no_deadline = 0
     far = dt.datetime.max.replace(tzinfo=TZ)
     for case in sorted(open_cases, key=lambda c: (c.get('kind') != 'payment_deadline', due_of(c) or far)):
         deadline = deadline_of(case)
@@ -3766,7 +3783,7 @@ def brief(cases, now=None, root=None, cancelled=None):
         elif case.get('urgency') == 'overdue':
             due.append(f"{case['merchant']} {money(case)} ({case['state']}" + (f'; {date}' if date else '') + ')')
         elif due_date is None:
-            due.append(f"{case['merchant']} {money(case)} ({date or 'no valid deadline'})")
+            no_deadline += 1
         elif case.get('kind') == 'payment_deadline' or due_date <= now + BRIEF_DUE:
             if date:
                 due.append(f"{case['merchant']} {money(case)} {date}")
@@ -3778,10 +3795,18 @@ def brief(cases, now=None, root=None, cancelled=None):
             changed.append(f"{case['merchant']} {money(case)}" + (f' {date}' if date else ''))
     parts = [f'Money: {len(open_cases)} open']
     if due:
-        parts.append('due: ' + '; '.join(due))
+        shown = due[:6]
+        if len(due) > len(shown):
+            shown.append(f'+{len(due) - len(shown)} more')
+        parts.append('due: ' + '; '.join(shown))
+    if no_deadline:
+        parts.append(f'{no_deadline} with no deadline')
     if changed:
-        parts.append('changed: ' + '; '.join(changed))
-    if open_cases and not due and not changed:
+        shown = changed[:6]
+        if len(changed) > len(shown):
+            shown.append(f'+{len(changed) - len(shown)} more')
+        parts.append('changed: ' + '; '.join(shown))
+    if open_cases and not due and not changed and not no_deadline:
         parts.append('nothing due in 48h')
     if running:
         shown = running[:3]

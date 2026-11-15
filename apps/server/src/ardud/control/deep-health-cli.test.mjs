@@ -76,11 +76,11 @@ for (const stage of ["config", "connection", "roundTrip", "runtime", "listener",
             'if (path === "/health") { ' +
             (${JSON.stringify(stage)} === 'listener'
               ? 'throw new Error("fixture transport failure");'
-              : 'return {ok:true,status:"healthy",serverStartedAt:"2026-11-14T00:00:00Z"};') +
+              : 'return {ok:true,status:"healthy",bootId:"8d0efaf9-5dd4-400f-9db1-8308e5a591b0",serverStartedAt:"2026-11-14T00:00:00Z"};') +
             '} return {threads:[]};');
         } else if (url.endsWith('/deep-health.mjs')) {
           source = source.replace('readRuntime = readRuntimeState,',
-            'readRuntime = async () => ({origin:"http://127.0.0.1:1",pid:process.pid,startedAt:"2026-11-14T00:00:00Z"}),');
+            'readRuntime = async () => ({origin:"http://127.0.0.1:1",pid:process.pid,bootId:"8d0efaf9-5dd4-400f-9db1-8308e5a591b0",startedAt:"2026-11-14T00:00:00Z"}),');
           source = source.replace('onStage(name);',
             'onStage(name); if (name === ${JSON.stringify(stage)}) process.getBuiltinModule("node:fs").readFileSync(process.env.T3_TEST_NATIVE_FIFO);');
         }

@@ -1147,6 +1147,25 @@ it.effect.each([owner, evaluator])("$_tag clears guessed gates with an audit tra
         actor,
       );
       assert.lengthOf(retry.asks, edited.asks.length);
+      const beforeReword = (yield* kanban.card(card.id)).card;
+      const rewordedText = "Tell both reporters once installed";
+      const reworded = yield* kanban.editCard(
+        card.id,
+        { subtasks: [{ id: "s1", text: rewordedText }] },
+        actor,
+      );
+      assert.isUndefined(reworded.subtasks[0]!.gate);
+      assert.deepStrictEqual(reworded.subtasks[0]!.gateCleared, {
+        ...edited.subtasks[0]!.gateCleared,
+        text: rewordedText,
+      });
+      assert.deepStrictEqual(reworded.asks, beforeReword.asks);
+      assert.lengthOf(
+        (yield* kanban.card(card.id)).events.filter((event) =>
+          event.body?.startsWith("Cleared guessed"),
+        ),
+        1,
+      );
       const dropped = yield* kanban.editCard(card.id, { subtasks: [] }, evaluator);
       assert.lengthOf(dropped.subtasks, 0);
       // Exercise completion independently of removal on the same saved clear.
@@ -1162,6 +1181,224 @@ it.effect.each([owner, evaluator])("$_tag clears guessed gates with an audit tra
       assert.strictEqual(done.subtasks[0]!.state, "done");
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
+);
+
+it.effect.each(
+  (["done", "skipped"] as const).flatMap((state) =>
+    (["evaluator", "script"] as const).map((taskOwner) => ({ state, taskOwner })),
+  ),
+)("clearing a $state $taskOwner gate keeps history and emits one notice", ({ state, taskOwner }) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard();
+      const store = yield* KanbanStore.KanbanStore;
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Finished guessed gate",
+          prompt: "Work",
+          subtasks: [{ text: "Tell the reporter once installed", owner: taskOwner }],
+        },
+        owner,
+      );
+      const finished: KanbanSubtask = {
+        ...card.subtasks[0]!,
+        state,
+        note: "Reporter already told",
+        doneBy: evaluator,
+        doneAt: card.updatedAt,
+        ...(taskOwner === "script" ? { script: "readback" } : {}),
+      };
+      yield* store.putCard({ ...card, subtasks: [finished] });
+      const patch = {
+        subtasks: [{ id: "s1", clearGate: "Only reports the result; no live operation" }],
+      };
+      yield* TestClock.adjust("1 second");
+      const edited = yield* kanban.editCard(card.id, patch, evaluator);
+      const { gate: _gate, gateSource: _source, ...history } = finished;
+      assert.deepStrictEqual(edited.subtasks[0], {
+        ...history,
+        gateCleared: {
+          gate: "deploy",
+          reason: patch.subtasks[0]!.clearGate,
+          by: evaluator,
+          at: edited.updatedAt,
+          text: finished.text,
+        },
+      });
+      assert.lengthOf(
+        edited.asks.filter((ask) => ask.batchKey === "gate-cleared"),
+        1,
+      );
+      const beforeRetry = (yield* kanban.card(card.id)).card;
+      yield* TestClock.adjust("1 second");
+      const retry = yield* kanban.editCard(card.id, patch, evaluator);
+      assert.deepStrictEqual(retry.subtasks, edited.subtasks);
+      assert.deepStrictEqual(retry.asks, beforeRetry.asks);
+      assert.lengthOf(
+        (yield* kanban.card(card.id)).events.filter((event) =>
+          event.body?.startsWith("Cleared guessed"),
+        ),
+        1,
+      );
+      const verified = yield* kanban.moveCard(card.id, "verified", "evaluator", evaluator);
+      assert.strictEqual(verified.stage, "verified");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("sticky gate clears survive resaves, same-inference rewords and clear retries", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard();
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Sticky guess",
+          prompt: "Work",
+          subtasks: [{ text: "Restart the test helper", owner: "evaluator" }],
+        },
+        owner,
+      );
+      const text = "Pay attention to the test result";
+      const sticky = yield* kanban.editCard(card.id, { subtasks: [{ id: "s1", text }] }, evaluator);
+      assert.strictEqual(sticky.subtasks[0]!.gate, "deploy");
+      assert.strictEqual(inferGate(text), "money");
+      const cleared = yield* kanban.editCard(
+        card.id,
+        { subtasks: [{ id: "s1", clearGate: "This only discusses the test result" }] },
+        evaluator,
+      );
+      const reword = "Pay close attention to the test result";
+      yield* TestClock.adjust("1 second");
+      for (const input of [
+        { id: "s1", text, gate: null },
+        { id: "s1", clearGate: "This remains a fixture, no live operation" },
+        { id: "s1", text: reword },
+      ]) {
+        const saved = yield* kanban.editCard(card.id, { subtasks: [input] }, evaluator);
+        assert.isUndefined(saved.subtasks[0]!.gate);
+        assert.deepStrictEqual(saved.subtasks[0]!.gateCleared, {
+          ...cleared.subtasks[0]!.gateCleared,
+          text: saved.subtasks[0]!.text,
+        });
+        assert.lengthOf(saved.asks, 1);
+        assert.strictEqual(saved.asks[0]!.id, cleared.asks[0]!.id);
+      }
+      assert.lengthOf(
+        (yield* kanban.card(card.id)).events.filter((event) =>
+          event.body?.startsWith("Cleared guessed"),
+        ),
+        1,
+      );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect.each(["open", "done", "skipped"] as const)(
+  "a fresh %s clear supersedes only open unanswered notices for the same subtask",
+  (state) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard();
+        const store = yield* KanbanStore.KanbanStore;
+        const card = yield* kanban.createCard(
+          board.id,
+          {
+            title: "Repeated clears",
+            prompt: "Work",
+            subtasks: [
+              { text: "Tell the first reporter once installed", owner: "evaluator" },
+              { text: "Tell the other reporter once installed", owner: "evaluator" },
+            ],
+          },
+          owner,
+        );
+        const cleared = yield* kanban.editCard(
+          card.id,
+          {
+            subtasks: [
+              { id: "s1", clearGate: "Only tells the first reporter the result" },
+              { id: "s2", clearGate: "Only tells the other reporter the result" },
+            ],
+          },
+          evaluator,
+        );
+        const first = cleared.asks[0]!;
+        const preserved = [
+          cleared.asks[1]!,
+          { ...first, id: "q4", title: `Gate cleared on #${card.number} s10` },
+          { ...first, id: "q5", kind: "custom" },
+          { ...first, id: "q6", batchKey: "another-notice" },
+          { ...first, id: "q7", closedAt: cleared.updatedAt },
+          {
+            ...first,
+            id: "q8",
+            answer: { verdict: "approved" as const, by: owner, at: cleared.updatedAt },
+          },
+        ];
+        // Include duplicates left by older builds and lookalike asks that must survive.
+        yield* store.putCard({
+          ...cleared,
+          asks: [first, preserved[0]!, { ...first, id: "q3" }, ...preserved.slice(1)],
+        });
+        yield* TestClock.adjust("1 second");
+        const regated = yield* kanban.editCard(
+          card.id,
+          { subtasks: [{ id: "s1", text: "Share the API key" }, { id: "s2" }] },
+          evaluator,
+        );
+        assert.strictEqual(regated.subtasks[0]!.gate, "secret");
+        assert.isUndefined(regated.subtasks[0]!.gateCleared);
+        yield* store.putCard({
+          ...regated,
+          subtasks: regated.subtasks.map((task) => (task.id === "s1" ? { ...task, state } : task)),
+        });
+        const recleared = yield* kanban.editCard(
+          card.id,
+          {
+            subtasks: [
+              { id: "s1", clearGate: "Only discusses the key in a test fixture" },
+              { id: "s2" },
+            ],
+          },
+          evaluator,
+        );
+        for (const id of ["q1", "q3"]) {
+          const superseded = recleared.asks.find((ask) => ask.id === id)!;
+          assert.strictEqual(superseded.closedAt, recleared.updatedAt);
+          assert.isUndefined(superseded.answer);
+        }
+        for (const ask of preserved)
+          assert.deepStrictEqual(
+            recleared.asks.find((entry) => entry.id === ask.id),
+            ask,
+          );
+        const feed = yield* kanban.askFeed({ boardId: board.id });
+        assert.deepStrictEqual(
+          feed.open
+            .filter(
+              (item) =>
+                item.cardId === card.id &&
+                item.ask.title === first.title &&
+                item.ask.batchKey === "gate-cleared" &&
+                item.ask.answer === undefined &&
+                item.kind === "notice",
+            )
+            .map((item) => item.ask.id),
+          ["q9"],
+        );
+        assert.lengthOf(
+          (yield* kanban.card(card.id)).events.filter((event) =>
+            event.body?.startsWith("Cleared guessed"),
+          ),
+          3,
+        );
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
 );
 
 it.effect(
@@ -1194,7 +1431,7 @@ it.effect(
         yield* TestClock.adjust("1 second");
         const regated = yield* kanban.editCard(
           card.id,
-          { subtasks: [{ id: "s1", text: "Restart Robob now" }] },
+          { subtasks: [{ id: "s1", text: "Pay for the service" }] },
           evaluator,
         );
         const ack = {

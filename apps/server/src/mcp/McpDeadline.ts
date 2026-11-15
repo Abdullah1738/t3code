@@ -8,6 +8,8 @@ import * as Schema from "effect/Schema";
 import { failedPhase } from "../ardud/analytics/McpCall.ts";
 const isOrchestratorMcpFailure = Schema.is(OrchestratorMcpFailure);
 
+export const OPERATION_TIMEOUT = "10 seconds";
+
 class PendingWait extends Context.Service<PendingWait, { wait: string; since: bigint }>()(
   "t3/mcp/McpDeadline/PendingWait",
 ) {}
@@ -104,7 +106,7 @@ export const withDeadline = Effect.fnUntraced(function* <A, E, R>(
         input.onTimeout === "detach" ? { ...input, onTimeout: "detach" } : undefined,
       ),
     Effect.timeoutOrElse({
-      duration: "10 seconds",
+      duration: OPERATION_TIMEOUT,
       orElse: Effect.fn("McpDeadline.expired")(function* () {
         yield* failedPhase(input.stage);
         const now = yield* Clock.monotonicTimeNanos;

@@ -211,7 +211,8 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
       heldForMs: Math.max(0, now - holder.acquiredAtMs),
     }));
   const recordHold = Effect.fnUntraced(function* (holder: Holder, waiters: number) {
-    const heldMs = Math.max(0, (yield* Clock.currentTimeMillis) - holder.acquiredAtMs);
+    const now = yield* Clock.currentTimeMillis;
+    const heldMs = Math.max(0, now - holder.acquiredAtMs);
     yield* Metric.update(
       Metric.withAttributes(
         Metrics.kanbanBoardLockHoldDuration,
@@ -221,13 +222,25 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
     );
     if (heldMs < LONG_HOLD_MS) return;
     yield* Metrics.increment(Metrics.kanbanBoardLockLongHoldTotal, { name: holder.label });
-    yield* Effect.logWarning("kanban board lock long hold", {
-      name: holder.label,
-      boardId: holder.boardId,
-      cardId: holder.cardId ?? null,
-      heldMs,
-      waiters,
-    });
+    const fields = {
+      "board.observed_at_ms": now,
+      "board.id": holder.boardId,
+      "board.holder": holder.label,
+      "board.card_id": holder.cardId ?? null,
+      "board.lock": holder.lock,
+      "board.mode": holder.mode,
+      "board.acquired_at_ms": holder.acquiredAtMs,
+      "board.held_ms": heldMs,
+      "board.waiters": waiters,
+    };
+    yield* Effect.logWarning(
+      // Fixed internal diagnostic fields; encoding must not add a failure to lock release.
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
+      JSON.stringify({ event: "kanban board lock long hold", ...fields }),
+    ).pipe(
+      Effect.annotateLogs({ ...fields, "board.lock_log": true }),
+      Effect.provideService(References.MinimumLogLevel, "Warn"),
+    );
   }, Effect.ignoreCause());
   // Keep release bookkeeping constant-time; attribution is computed only for warnings.
   const recordRelease = (holder: Holder, releasedAtMs: number) => {
@@ -318,7 +331,10 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
         event: refused ? "kanban board write refused" : "kanban board lock held too long",
         ...fields,
       }),
-    ).pipe(Effect.annotateLogs(fields), Effect.provideService(References.MinimumLogLevel, "Warn"));
+    ).pipe(
+      Effect.annotateLogs({ ...fields, "board.lock_log": true }),
+      Effect.provideService(References.MinimumLogLevel, "Warn"),
+    );
     if (refused)
       yield* Metrics.increment(Metrics.kanbanBoardBusyRefusedTotal, { refused: op.label });
     return { blockers, waitedMs, waitByLabel };

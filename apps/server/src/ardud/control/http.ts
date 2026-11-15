@@ -1,5 +1,5 @@
 import * as DatabaseDiagnostics from "../../persistence/DatabaseDiagnostics.ts";
-import { continuationReport } from "../fast-install/report.ts";
+import { bootId, continuationReport } from "../fast-install/report.ts";
 import * as StartupPhaseLog from "../observability/StartupPhaseLog.ts";
 /**
  * Local control API for external integrations (iMessage and Telegram bridges,
@@ -47,6 +47,7 @@ import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
 import * as OrchestrationEventStore from "../../persistence/OrchestrationEventStore.ts";
 import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
 import * as ThreadMessageIntake from "../../orchestration-v2/ThreadMessageIntake.ts";
+import * as SendAcknowledgement from "../orchestration/ThreadSendAcknowledgement.ts";
 import { userFacingDispatchErrorMessage } from "../../orchestration-v2/UserFacingErrors.ts";
 import * as ManagedProjectFolders from "../../project/ManagedProjectFolders.ts";
 import * as ProjectService from "../../project/ProjectService.ts";
@@ -117,6 +118,29 @@ const decodeThreadListCursor = Effect.fn("ControlHttp.decodeThreadListCursor")(f
   });
   return yield* Schema.decodeEffect(ThreadListCursorJson, { onExcessProperty: "error" })(text).pipe(
     Effect.mapError(() => fail("invalid_request", "cursor must be a valid thread listing cursor.")),
+  );
+});
+
+const decodeUserMessageCursorJson = Schema.decodeEffect(ThreadListCursorJson, {
+  onExcessProperty: "error",
+});
+const encodeUserMessageCursorJson = Schema.encodeSync(ThreadListCursorJson);
+
+const decodeUserMessageCursor = Effect.fn("ControlHttp.decodeUserMessageCursor")(function* (
+  value: string | null,
+) {
+  if (value === null) return null;
+  const text = yield* Effect.try({
+    try: () => {
+      if (value.length > 8192 || !/^[A-Za-z0-9_-]+$/.test(value)) throw new Error();
+      const bytes = Buffer.from(value, "base64url");
+      if (bytes.toString("base64url") !== value) throw new Error();
+      return bytes.toString("utf8");
+    },
+    catch: () => fail("invalid_request", "cursor must be a valid user message cursor."),
+  });
+  return yield* decodeUserMessageCursorJson(text).pipe(
+    Effect.mapError(() => fail("invalid_request", "cursor must be a valid user message cursor.")),
   );
 });
 
@@ -517,6 +541,7 @@ const makeRoutes = Effect.gen(function* () {
   const providers = yield* ProviderRegistry.ProviderRegistry;
   const settingsService = yield* ServerSettings.ServerSettingsService;
   const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
+  const serviceScope = yield* Effect.scope;
   const store = yield* ControlStore.ControlStore;
   const threadRead = yield* ControlThreadRead.ControlThreadRead;
   const usage = yield* Usage.Usage;
@@ -640,7 +665,7 @@ const makeRoutes = Effect.gen(function* () {
     Effect.forEach(
       chunkIds([...new Set(threadIds)]),
       (ids) =>
-        threads.getShellSnapshot({ threadIds: ids, location }).pipe(
+        threads.getShellSnapshot({ threadIds: ids, location, summaryOnly: true }).pipe(
           Effect.map((snapshot) => [...snapshot.threads, ...snapshot.archivedThreads]),
           Effect.mapError((cause) => fail("internal", errorDetail(cause))),
         ),
@@ -1143,7 +1168,7 @@ const makeRoutes = Effect.gen(function* () {
       threads: summaries,
       nextCursor: nextThreadListCursor(page, limit),
     });
-  }).pipe(NodeSqliteClient.foregroundReads);
+  }).pipe(NodeSqliteClient.backgroundReads);
 
   const getThread = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
@@ -1203,6 +1228,49 @@ const makeRoutes = Effect.gen(function* () {
         ),
       );
     return json({ ok: true, identity });
+  });
+
+  const listUserMessages = Effect.gen(function* () {
+    yield* authenticate(AuthOrchestrationReadScope);
+    const params = yield* searchParams;
+    const since = parseSince(params.get("since"));
+    if (since === undefined || Math.abs(since) > 8_640_000_000_000_000) {
+      return yield* fail(
+        "invalid_request",
+        "since must be an ISO timestamp or epoch milliseconds.",
+      );
+    }
+    const cursor = yield* decodeUserMessageCursor(params.get("cursor"));
+    return yield* ReplyBuilders.bounded(
+      Effect.gen(function* () {
+        const page = yield* store
+          .userMessagesSince({
+            since,
+            cursor,
+            limit: clampInt(params.get("limit"), 200, 1000),
+          })
+          .pipe(
+            Effect.mapError((cause) =>
+              NodeSqliteClient.readerLaneFailure(cause) !== undefined
+                ? fail("unavailable", READER_BUSY_MESSAGE)
+                : fail("internal", errorDetail(cause)),
+            ),
+          );
+        return json({
+          ok: true,
+          total: page.total,
+          messages: page.messages.map(({ message, ...thread }) => ({
+            ...messageSummary(message),
+            ...thread,
+          })),
+          nextCursor:
+            page.next === null
+              ? null
+              : Buffer.from(encodeUserMessageCursorJson(page.next)).toString("base64url"),
+        });
+      }).pipe(NodeSqliteClient.foregroundReads),
+      "poll",
+    );
   });
 
   const getMessages = Effect.gen(function* () {
@@ -1308,69 +1376,92 @@ const makeRoutes = Effect.gen(function* () {
     const threadId = yield* param("threadId");
     const body = yield* decodeBody(decodeSendBody);
     yield* ControlRequestAnalytics.sendMode(body.mode ?? "auto");
-    const shell = yield* getShell(threadId);
-    const commandId = yield* commandIdFor(`send:${threadId}`, body.clientRequestId);
-    // ardud: channel guidance is framed as the bridge's, so only it may send some.
-    if (body.guidance !== undefined && !isBridgeSession(session)) {
-      return yield* fail("forbidden", "Only the iMessage bridge sends channel guidance.");
-    }
-    if (body.guidance !== undefined && !guidanceFits(body.guidance)) {
-      return yield* fail(
-        "invalid_request",
-        `Channel guidance is limited to ${GUIDANCE_MAX_CHARS} characters once encoded.`,
-      );
-    }
-    const context = guidanceContext(body.guidance);
-    const hasSelection =
-      body.model !== undefined ||
-      body.variant !== undefined ||
-      body.providerInstanceId !== undefined ||
-      body.options !== undefined;
-    const settings = yield* settingsService.getSettings.pipe(
-      Effect.mapError((cause) => fail("internal", errorDetail(cause))),
+    const result = yield* SendAcknowledgement.bounded(
+      (clientRequestId) =>
+        Effect.gen(function* () {
+          const shell = yield* getShell(threadId);
+          const commandId = yield* commandIdFor(`send:${threadId}`, clientRequestId);
+          // ardud: channel guidance is framed as the bridge's, so only it may send some.
+          if (body.guidance !== undefined && !isBridgeSession(session)) {
+            return yield* fail("forbidden", "Only the iMessage bridge sends channel guidance.");
+          }
+          if (body.guidance !== undefined && !guidanceFits(body.guidance)) {
+            return yield* fail(
+              "invalid_request",
+              `Channel guidance is limited to ${GUIDANCE_MAX_CHARS} characters once encoded.`,
+            );
+          }
+          const context = guidanceContext(body.guidance);
+          const hasSelection =
+            body.model !== undefined ||
+            body.variant !== undefined ||
+            body.providerInstanceId !== undefined ||
+            body.options !== undefined;
+          const settings = yield* settingsService.getSettings.pipe(
+            Effect.mapError((cause) => fail("internal", errorDetail(cause))),
+          );
+          const modelSelection =
+            hasSelection || selectionMigrationApplies(settings)
+              ? yield* resolveControlSelection({
+                  model: body.model,
+                  variant: body.variant,
+                  instanceId: body.providerInstanceId,
+                  options: body.options,
+                  base: shell.modelSelection,
+                  settings,
+                })
+              : undefined;
+          // Queue only a readiness marker: a cancelled send must never leave its
+          // message effect in the startup worker after the commit lease expires.
+          yield* startup
+            .enqueueCommand(Effect.void)
+            .pipe(Effect.mapError((cause) => fail("conflict", errorDetail(cause))));
+          const result = yield* ThreadMessageIntake.sendToThread({
+            projectId: shell.projectId,
+            commandId,
+            threadId: shell.id,
+            messageId: MessageId.make(commandId),
+            text: body.text,
+            attachments: toChatAttachments(body.attachments),
+            ...(modelSelection === undefined ? {} : { modelSelection }),
+            mode: body.mode ?? "auto",
+            // ardud: a bearer token is not the owner typing.
+            createdBy: CONTROL_ACTOR,
+            creationSource: "server",
+            ...(context === undefined ? {} : { context }),
+          }).pipe(
+            // The captured services can include the route's background reader lane.
+            NodeSqliteClient.foregroundReads,
+            Effect.provide(intakeContext),
+            Effect.mapError((cause) =>
+              isThreadManagementError(cause) && cause._tag === "ThreadManagementThreadNotFoundError"
+                ? fail("not_found", cause.message)
+                : fail("conflict", errorDetail(cause)),
+            ),
+          );
+          return {
+            threadId: shell.id,
+            messageId: result.message.id,
+            runId: result.run.id,
+            status: result.run.status,
+            delivery: result.delivery,
+          };
+        }),
+      serviceScope,
+      body.clientRequestId,
+    ).pipe(
+      Effect.provideService(Crypto.Crypto, crypto),
+      Effect.mapError((cause) =>
+        cause._tag === "ControlError" ? cause : fail("conflict", errorDetail(cause)),
+      ),
     );
-    const modelSelection =
-      hasSelection || selectionMigrationApplies(settings)
-        ? yield* resolveControlSelection({
-            model: body.model,
-            variant: body.variant,
-            instanceId: body.providerInstanceId,
-            options: body.options,
-            base: shell.modelSelection,
-            settings,
-          })
-        : undefined;
-    const result = yield* startup
-      .enqueueCommand(
-        ThreadMessageIntake.sendToThread({
-          projectId: shell.projectId,
-          commandId,
-          threadId: shell.id,
-          messageId: MessageId.make(commandId),
-          text: body.text,
-          attachments: toChatAttachments(body.attachments),
-          ...(modelSelection === undefined ? {} : { modelSelection }),
-          mode: body.mode ?? "auto",
-          // ardud: a bearer token is not the owner typing.
-          createdBy: CONTROL_ACTOR,
-          creationSource: "server",
-          ...(context === undefined ? {} : { context }),
-        }).pipe(Effect.provide(intakeContext)),
-      )
-      .pipe(
-        Effect.mapError((cause) =>
-          isThreadManagementError(cause) && cause._tag === "ThreadManagementThreadNotFoundError"
-            ? fail("not_found", cause.message)
-            : fail("conflict", errorDetail(cause)),
-        ),
-      );
     return json({
       ok: true,
-      threadId: shell.id,
-      messageId: result.message.id,
-      runId: result.run.id,
-      status: result.run.status,
-      delivery: result.delivery,
+      threadId: result.threadId,
+      messageId: result.messageId,
+      runId: result.runId,
+      status: result.status,
+      delivery: body.mode === "restart" ? "restarted" : result.delivery,
     });
   });
 
@@ -1713,6 +1804,7 @@ const makeRoutes = Effect.gen(function* () {
       time: DateTime.formatIso(yield* DateTime.now),
       buildCommit,
       serverStartedAt,
+      bootId,
     });
   });
 
@@ -1876,6 +1968,7 @@ const makeRoutes = Effect.gen(function* () {
     route("GET", `${p}/projects`, handle(listProjects.pipe(NodeSqliteClient.foregroundReads))),
     route("GET", `${p}/models`, handle(listModels)),
     route("GET", `${p}/usage`, handle(listUsage)),
+    route("GET", `${p}/messages`, handle(listUserMessages)),
     route("GET", `${p}/threads`, handle(listThreads)),
     route("POST", `${p}/threads`, handle(createThread)),
     route("GET", `${p}/threads/by-native/:sessionId`, handle(byNative)),

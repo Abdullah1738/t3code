@@ -13,6 +13,15 @@ export const ensureShellLookupIndexes = Effect.fn("ensureShellLookupIndexes")(fu
     ON orchestration_v2_projection_messages(thread_id, updated_at DESC, message_id DESC)
     WHERE role = 'user' AND json_extract(payload_json, '$.createdBy') = 'user'
   `;
+  // Cross-thread control polling ranges over epoch milliseconds, including imported
+  // ISO timestamps with equivalent offsets or fractional-second spellings.
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_control_user_messages_since_idx
+    ON orchestration_v2_projection_messages(
+      CAST(ROUND(unixepoch(updated_at, 'subsec') * 1000) AS INTEGER),
+      message_id, thread_id
+    ) WHERE role = 'user'
+  `;
   yield* sql`
     CREATE INDEX IF NOT EXISTS ardud_provider_turns_completed_idx
     ON orchestration_v2_projection_provider_turns(completed_at)

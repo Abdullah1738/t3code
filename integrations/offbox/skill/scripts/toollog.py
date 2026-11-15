@@ -16,7 +16,7 @@ import time
 
 CAP_BYTES = 50 * 1024 * 1024
 NUMBERS = set("bytes files skipped exitCode waitMs queueMs runMs position ttlSeconds reasonLength busy idle stopped count flagsCount envCount pullCount includeCount stepCount attempt pid timeoutSeconds commandLength cmd_bytes step_count".split())
-NUMBERS.update({'command_exit_code', 'wrapper_exit_code', 'disk_attempt'})
+NUMBERS.update({'command_exit_code', 'wrapper_exit_code', 'disk_attempt', 'client_started_at', 'disk_probe_module_mtime'})
 NUMBERS.update(f'{fs}_{field}' for fs in ('tmp', 'var_tmp', 'home', 'workspace')
                for field in ('free_bytes', 'size_bytes'))
 BOOLEANS = set("queued killed fresh bg noSync git noFallback noRetry remote failed stale timeoutHit fallback dryRun baseGiven templateGiven sizeGiven".split())
@@ -31,8 +31,8 @@ ENUMS = {
     "action": {"stop", "delete", "forget", "settle", "keep", "other"},
     "linkType": {"wireguard", "residential", "down", "unknown"},
     "stage": {"ssh_setup", "ssh_drop", "readiness", "put_file", "sync", "pull", "command", "install_mid_run", "request", "reaper"},
-    "infra_failure": {"enospc"},
-    "infra_reason": {"low_space_gate", "disk_exhausted"},
+    "infra_failure": {"enospc", "native_crash", "disk_probe"},
+    "infra_reason": {"low_space_gate", "disk_exhausted", "toolchain_unpack_crash", "probe_crashed"},
 }
 ENUMS.update({f'{fs}_fstype': {'tmpfs', 'zfs', 'ext2', 'ext3', 'ext4', 'xfs', 'btrfs', 'overlay', 'unknown'}
               for fs in ('tmp', 'var_tmp', 'home', 'workspace')})

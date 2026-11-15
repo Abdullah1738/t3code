@@ -65,9 +65,9 @@ export const observe = Effect.fnUntraced(function* <E, R>(
   const parent = yield* NodeSqliteClient.ReaderWaitObserver;
   return yield* effect.pipe(
     Effect.provideService(RequestMethod, request),
-    Effect.provideService(NodeSqliteClient.ReaderWaitObserver, (ms) => {
+    Effect.provideService(NodeSqliteClient.ReaderWaitObserver, (ms, lane) => {
       waitMs += ms;
-      parent?.(ms);
+      parent?.(ms, lane);
     }),
     Effect.onExit((exit) =>
       Effect.gen(function* () {

@@ -70,11 +70,15 @@ class DependencyAdviceTests(unittest.TestCase):
         self.assert_advice(result, hint)
 
     def test_real_js_failures_keep_marker_and_client_hint(self):
-        for cmd in ('vp test run x.test.ts', 'node_modules/.bin/vitest run'):
+        for cmd, code in (('vp test run x.test.ts', 2), ('node_modules/.bin/vitest run', 127)):
             with self.subTest(cmd=cmd):
                 result, hint = self.run_command(cmd)
-                self.assert_advice(result, hint, marker=True)
-                self.assertIn('Install deps and run the command in the same call', hint)
+                self.assertEqual(result.returncode, code)
+                self.assert_advice(result, hint, marker=code != 127)
+                if code == 127:
+                    self.assertIn('offbox: exit 127:', result.stderr)
+                else:
+                    self.assertIn('Install deps and run the command in the same call', hint)
 
     def test_non_js_failures_keep_real_error_without_hint(self):
         for cmd in ('COMMERCE_CARD_LAST4=2342 PYTHONPATH=a:b python3 -m unittest mod',

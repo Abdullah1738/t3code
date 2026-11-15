@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { appendFold, foldMedsLine } from "../src/meds-fold.ts";
 import { fakeFold, FOLD_VISIBILITY_CASES, LINE } from "./meds-fold-fixture.ts";
@@ -6,6 +6,25 @@ import { fakeFold, FOLD_VISIBILITY_CASES, LINE } from "./meds-fold-fixture.ts";
 const fixtures: ReturnType<typeof fakeFold>[] = [];
 const fixture = (body?: string) => { const f = fakeFold(body); fixtures.push(f); return f; };
 afterEach(() => { for (const f of fixtures.splice(0).reverse()) f.close(); });
+
+test.each([undefined, "production"])("test process fences the default command even with child NODE_ENV=%s", async nodeEnv => {
+  const f = fixture();
+  expect(process.env.NODE_ENV).toBe("test");
+  const spawn = spyOn(Bun, "spawn").mockImplementation(() => { throw new Error("Unexpected process spawn"); });
+  try {
+    const result = await foldMedsLine(nodeEnv === undefined ? {} : { env: { NODE_ENV: nodeEnv } });
+    expect(result.outcome).toBe("error");
+    expect(spawn).not.toHaveBeenCalled();
+    await Promise.resolve();
+    expect(f.logs()).toContainEqual(expect.objectContaining({ name: "meds.fold.error",
+      props: expect.objectContaining({ reason: "test_default_command" }) }));
+  } finally { spawn.mockRestore(); }
+});
+
+test.each(["main.ts", "sb-main.ts"])("%s explicitly opts production Routers into meds folding", file => {
+  const source = readFileSync(new URL(`../src/${file}`, import.meta.url), "utf8");
+  expect(source).toMatch(/new Router\([\s\S]*?medsFold:\s*\{\}/);
+});
 
 test("appendFold adds the trimmed line to only the last text without mutating input", () => {
   const texts = ["first", "last"];

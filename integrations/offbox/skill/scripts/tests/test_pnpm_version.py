@@ -92,10 +92,27 @@ class SelectionTests(unittest.TestCase):
 
 
 class ActivationTests(unittest.TestCase):
-    def run_fixture(self, version='10.26.2', pin=None, failure='once', corrupt=False, warm=False, corepack_cache=True):
+    def run_fixture(self, version='10.26.2', pin=None, failure='once', corrupt=False, warm=False, corepack_cache=True, unpack_failures=()):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             bindir = root / 'bin'; bindir.mkdir()
+            if unpack_failures:
+                tar = bindir / 'tar'
+                tar.write_text('''#!/bin/bash
+count=$(cat "$HOME/unpacks" 2>/dev/null || echo 0); count=$((count+1)); echo "$count" > "$HOME/unpacks"
+echo "UNPACK_ATTEMPT=$count" >&2
+[ ! -e "$4/package/partial" ] || exit 88
+set -- "$@" ''' + ' '.join(shlex.quote(s) for s in unpack_failures) + '''
+if [ "$count" -le "$(( $# - 4 ))" ]; then
+  mkdir -p "$4/package"; touch "$4/package/partial"
+  shift "$((count+3))"
+  case "$1" in
+    signal:*) exec @PYTHON@ -I -c 'import os,signal,sys; os.kill(os.getpid(), getattr(signal, "SIG"+sys.argv[1]))' "${1#signal:}" ;;
+  esac
+  echo "$1" >&2; exit 1
+fi
+'''.replace('@PYTHON@', shlex.quote(sys.executable)) + 'exec ' + shlex.quote(shutil.which('tar')) + ' "${@:1:4}"\n')
+                tar.chmod(0o755)
             node = Path(shutil.which('node')).resolve()
             (bindir / 'node').symlink_to(node)
             suffix = 'mjs' if version.startswith('11.') else 'cjs'
@@ -159,7 +176,7 @@ cp "$HOME/$src" "$out"
             (root / 'outside').mkdir()
             script += '\ncd ' + shlex.quote(str(root / 'outside')) + '\npnpm --version\nfor i in {1..10}; do cd .; done\n'
             script += 'node -e \'if(process.env.PATH.split(":").filter(x=>x===process.env.__offbox_toolchain_bin).length!==1)process.exit(91)\''
-            result = subprocess.run(['bash', '-c', script], env={'HOME': tmp, 'PATH': f'{bindir}:/usr/bin:/bin', 'FAIL': failure, 'COREPACK_HOME':str(root / 'corepack')},
+            result = subprocess.run(['bash', '-c', script], env={'HOME': tmp, 'PATH': f'{bindir}:/usr/bin:/bin', 'FAIL': failure, 'COREPACK_HOME':str(root / 'corepack'), 'OFFBOX_BOX_ID': 'bx_fixture'},
                                     capture_output=True, text=True, timeout=15)
             count = int((root / 'count').read_text()) if (root / 'count').exists() else 0
             if result.returncode == 0:
@@ -174,6 +191,20 @@ cp "$HOME/$src" "$out"
                 self.assertFalse(list((root / '.offbox/toolchains/pnpm').glob('.stage.*')))
                 self.assertFalse((root / '.offbox/toolchains/pnpm' / (pin or version)).exists())
             return result, count
+
+    def test_unpack_crashes_retry_once_then_report_infra(self):
+        for failures, expected in ((['Bus error'], 0), (['Aborted', 'Aborted'], 90),
+                                   (['signal:SEGV'], 0), (['signal:SEGV'] * 2, 90),
+                                   (['tar: Child died with signal 11'], 0), (['tar: Child died with signal 11'] * 2, 90),
+                                   (['tar: permission denied'], 99), (['Aborted', 'tar: permission denied'], 99)):
+            with self.subTest(failures=failures):
+                result, _ = self.run_fixture(failure='never', unpack_failures=failures)
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertEqual(result.stderr.count('UNPACK_ATTEMPT='), 1 if len(failures) == 1 and expected == 99 else 2)
+                self.assertEqual('COMMAND_MARKER' in result.stdout, expected == 0)
+                if expected == 90:
+                    self.assertIn('box bx_fixture crashed unpacking a checksum-verified pnpm', result.stderr)
+                    self.assertIn('"infra_failure":"native_crash"', result.stderr)
 
     def test_partial_transfer_retry_and_major_resolution(self):
         result, count = self.run_fixture(pin='10')

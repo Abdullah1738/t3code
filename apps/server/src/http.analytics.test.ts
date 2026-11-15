@@ -6,12 +6,114 @@ import * as Stream from "effect/Stream";
 import { HttpRouter, HttpServerResponse } from "effect/http";
 import * as Analytics from "./ardud/analytics/Analytics.ts";
 import { httpAnalyticsMiddleware } from "./http.ts";
+import * as ControlHttpTelemetry from "./observability/ControlHttpTelemetry.ts";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import { AnalyticsEvent as AnalyticsEventSchema } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
 
 const layerHttpAnalytics = Layer.unwrap(
   Effect.map(httpAnalyticsMiddleware, (middleware) =>
     HttpRouter.middleware((app) => middleware(app), { global: true }),
   ),
 );
+
+it("attributes control HTTP rows with safe query modes, clients and separate reader timings", async () => {
+  const events: AnalyticsEvent[] = [];
+  const app = Layer.mergeAll(
+    HttpRouter.add(
+      "GET",
+      "/api/ardud/control/threads",
+      Effect.gen(function* () {
+        const client = yield* ControlHttpTelemetry.AuthenticatedClientObserver;
+        client?.({ clientLabel: "Telegram bridge" });
+        const wait = yield* NodeSqliteClient.ReaderWaitObserver;
+        wait?.(27, "background");
+        const statements = yield* NodeSqliteClient.StatementTimingObserver;
+        statements?.({
+          connection: "reader",
+          lane: "background",
+          operation: "read",
+          durationMs: 13,
+          outcome: "success",
+        });
+        return HttpServerResponse.text("ok");
+      }),
+    ),
+    layerHttpAnalytics,
+  ).pipe(
+    Layer.provide(
+      Layer.mock(Analytics.Analytics)({
+        record: (event) =>
+          Effect.sync(() => {
+            events.push(event);
+          }),
+      }),
+    ),
+  );
+  const { handler, dispose } = HttpRouter.toWebHandler(app, { disableLogger: true });
+  try {
+    await handler(
+      new Request(
+        "http://test/api/ardud/control/threads?active=true&limit=500&includeSubagents=true&ids=private&token=secret",
+        { headers: { "User-Agent": "Python-urllib/3.14" } },
+      ),
+    );
+    assert.lengthOf(events, 1);
+    assert.equal(events[0]?.kind, "server.http");
+    assert.deepInclude(events[0]!.props!, {
+      queryShape: "active:true/ids/includeSubagents:true/limit:500/other",
+      controlClient: "telegram-bridge",
+      userAgent: "python-urllib/3.14",
+      readerLane: "background",
+      readerAcquireMs: 27,
+      readerQueryMs: 13,
+      readerStatements: 1,
+    });
+    Schema.decodeUnknownSync(AnalyticsEventSchema, { onExcessProperty: "error" })(events[0]);
+    assert.notInclude(JSON.stringify(events), "secret");
+    assert.notInclude(JSON.stringify(events), "private");
+  } finally {
+    await dispose();
+  }
+});
+
+it.effect("redacts arbitrary control metadata and bounds query shapes", () =>
+  Effect.gen(function* () {
+    const telemetry = yield* ControlHttpTelemetry.make(
+      "/api/ardud/control/threads?active=private&limit=secret&secret=value",
+      "Bearer private-secret",
+    );
+    yield* telemetry.observe(
+      Effect.gen(function* () {
+        (yield* ControlHttpTelemetry.AuthenticatedClientObserver)?.({
+          clientLabel: "private-secret",
+        });
+      }),
+    );
+    const props = telemetry.props();
+    assert.equal(props.queryShape, "active:other/limit:other/other");
+    assert.equal(props.userAgent, "other");
+    assert.match(props.controlClient!, /^sha256:[0-9a-f]{64}$/);
+    assert.notInclude(JSON.stringify(props), "private");
+    assert.notProperty(props, "readerLane");
+  }),
+);
+
+it.each([
+  ["active=true&limit=500", "active:true/limit:500"],
+  ["active=1&archived=0&limit=001", "active:1/archived:0/limit:1"],
+  ["active=true&active=false&limit=500&limit=1", "active:other/limit:other"],
+  ["limit=-1&includeSubagents=secret", "includeSubagents:other/limit:other"],
+  ["limit=501&private-key=value", "limit:other/other"],
+  ["ids=id&cursor=secret&updatedSince=secret", "cursor/ids/updatedSince"],
+  [
+    "after=secret&afterMessageId=secret&boardId=secret&drain=true&role=secret&runId=secret&threadId=secret&timeoutMs=secret&types=secret&until=secret",
+    "after/afterMessageId/boardId/drain:true/role/runId/threadId/timeoutMs/types/until",
+  ],
+  ["limit=1e2&origin=secret&state=secret", "limit:other/origin/state"],
+])("bounds query shape %s", (input, expected) => {
+  assert.equal(ControlHttpTelemetry.queryShape(`/api/ardud/control/threads?${input}`), expected);
+});
 
 it("records normalized HTTP routes, UTF-8/stream bytes and safe failures", async () => {
   const events: AnalyticsEvent[] = [];

@@ -619,6 +619,8 @@ describe("board analytics", () => {
         kind: "kanban.worker_failed",
         props: { errorClass: "variant_unavailable", poolKey: "sol" },
       },
+      { kind: "kanban.assignment_wake_failed", props: { count: 1 } },
+      { kind: "kanban.assignment_wake_failed", props: { count: 2 } },
       { kind: "kanban.worker_restarted", props: { phase: "fresh" } },
       { kind: "kanban.ask_snapshot", props: { count: 1 } },
       {
@@ -650,7 +652,7 @@ describe("board analytics", () => {
     assert.deepEqual(board.reviewRounds, [{ cardId: "a", rounds: 2, verdicts: 2 }]);
     assert.deepEqual(board.verdictCounts, { feedback: 1, clear: 1 });
     assert.deepInclude(board.stalls[0], { sets: 1, clears: 1, p50Ms: 300 });
-    assert.deepEqual(board.failureCounts, { variant_unavailable: 1 });
+    assert.deepEqual(board.failureCounts, { variant_unavailable: 1, assignment_wake: 2 });
     assert.equal(board.restarts, 1);
     assert.lengthOf(board.openAsks, 1);
     assert.deepInclude(board.openAsks[0], {
@@ -838,4 +840,40 @@ it("preserves all 25 groups until overflow requires an other row", () => {
     overflow.find((row) => row.span === "other")!,
     { count: 2, totalWaitMs: 5, p95Ms: 99, maxMs: 99 },
   );
+});
+
+it("#1490 counts evaluator starts by origin without treating steers and queued inputs as starts", () => {
+  const target = makeAccumulator();
+  for (const outcome of ["started", "reused", "merged", "queued_spawn_cap"] as const)
+    accumulate(
+      target,
+      event({
+        kind: "kanban.evaluator",
+        boardId: "board-offbox",
+        purposeKind: "discussion",
+        trigger: "discussion_post",
+        outcome,
+      }),
+    );
+  accumulate(
+    target,
+    event({
+      kind: "kanban.evaluator",
+      boardId: "board-offbox",
+      purposeKind: "request",
+      trigger: "report_bug",
+      outcome: "started",
+      reuseMissReason: "no_card_reuse_scope",
+    }),
+  );
+  const result = finishRollup(target, "2026-11-13", ts);
+  assert.deepEqual(result.evaluatorStartsByTrigger, [
+    { boardId: "board-offbox", trigger: "discussion_post", count: 1 },
+    { boardId: "board-offbox", trigger: "report_bug", count: 1 },
+  ]);
+  assert.equal(
+    result.evaluatorOutcomes!.reduce((n, row) => n + row.count, 0),
+    5,
+  );
+  assert.deepEqual(result.errorCounts, {});
 });

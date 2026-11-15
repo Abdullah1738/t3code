@@ -7133,6 +7133,13 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
         sourceMessages,
         (yield* projectionStore.getThreadProjection(sourceThreadId)).messages,
       );
+      const sourceAfterRollback = yield* projectionStore.getThreadProjection(sourceThreadId);
+      const sourceForward = yield* projectionStore.getTimelinePage(sourceThreadId, {
+        view: "activity",
+        limit: 1,
+      });
+      assert.deepEqual(sourceForward.items, sourceAfterRollback.visibleTurnItems.slice(0, 1));
+      assert.equal(sourceForward.totalItems, sourceAfterRollback.visibleTurnItems.length);
       const targetAfterRollback = yield* projectionStore.getThreadProjection(targetThreadId);
       const shellSnapshot = yield* projectionStore.getShellSnapshot();
       for (const shell of [

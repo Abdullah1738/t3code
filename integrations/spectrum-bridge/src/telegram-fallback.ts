@@ -63,6 +63,9 @@ const outcome = (status: number | undefined): "sent" | "skip" | "retry" =>
   // 409 means this key was already used, so an earlier attempt got through.
   status === 200 || status === 202 || status === 409 ? "sent" : status === 400 || status === 413 ? "skip" : "retry";
 
+/** A notification retry has an identical payload, so only a queue acknowledgement is success. */
+export const notificationAccepted = (status: number | undefined): boolean => status === 200 || status === 202;
+
 const text = (...parts: Array<string | undefined>) =>
   parts.map(part => part === undefined ? "" : stripInternalText(part).trim()).filter(Boolean).join("\n").slice(0, MAX_TEXT);
 
