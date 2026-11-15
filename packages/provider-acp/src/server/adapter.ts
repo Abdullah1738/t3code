@@ -7276,7 +7276,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               ? null
               : yield* resolvePromptParts(turnInput, requestedSessionId);
             const startedAt = yield* DateTime.now;
-            const nativeTurnId = `${requestedSessionId}:turn:${turnInput.providerTurnOrdinal}`;
+            // Wake turns and retries may reuse both the attempt and the ordinal,
+            // including after reopening the adapter on the same native session.
+            const startId = yield* crypto.randomUUIDv4().pipe(Effect.orDie);
+            const nativeTurnId = `${requestedSessionId}:attempt:${turnInput.attemptId}:start:${startId}`;
             const providerTurnId = deriveProviderTurnId(nativeTurnId);
             const completed = yield* Deferred.make<void, never>();
             const promptWireSettled = yield* Deferred.make<void, never>();
