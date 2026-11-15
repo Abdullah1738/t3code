@@ -156,6 +156,11 @@ const GeneralEvent = Schema.Struct({
       key: Schema.optionalKey(Label),
       reason: Schema.optionalKey(Label),
       phase: Schema.optionalKey(Label),
+      subSteps: Schema.optionalKey(
+        Schema.Array(Schema.Struct({ subStep: Label, ms: Measurement })).check(
+          Schema.isMaxLength(3),
+        ),
+      ),
       tickId: Schema.optionalKey(Id),
       activeTickId: Schema.optionalKey(Id),
       cardsScanned: Schema.optionalKey(Measurement),
