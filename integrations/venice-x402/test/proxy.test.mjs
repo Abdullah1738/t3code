@@ -43,6 +43,14 @@ test('estimate clamps output to the per-request cap and rejects huge inputs', ()
   const e2 = estimateAndClamp(big, price, 0.5);
   assert.ok(e2.clamped && big.max_tokens < 32768 && e2.estUsd <= 0.5 + 1e-9);
   assert.throws(() => estimateAndClamp({ messages: [{ content: 'x'.repeat(600_000) }] }, price, 0.5), CapError);
+  // small explicit max_tokens is honoured, not rejected (parent's 429 repro)
+  const small = { model: MODEL, max_tokens: 20, messages: [{ role: 'user', content: 'Say hi in five words or less.' }] };
+  const e3 = estimateAndClamp(small, price, 0.5);
+  assert.equal(small.max_tokens, 20);
+  assert.equal(e3.clamped, false);
+  assert.ok(e3.estUsd < 0.001);
+  // cap squeezes output under the floor -> rejected with a clear message
+  assert.throws(() => estimateAndClamp({ messages: [{ content: 'x'.repeat(499_000) }], max_tokens: 4096 }, price, 0.5), /of 4096 requested/);
 });
 
 test('actual cost uses cached rate for cached prompt tokens', () => {

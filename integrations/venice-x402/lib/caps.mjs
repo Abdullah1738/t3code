@@ -29,11 +29,14 @@ export function estimateAndClamp(body, price, maxRequestUsd) {
   const field = body.max_completion_tokens !== undefined ? 'max_completion_tokens' : body.max_tokens !== undefined ? 'max_tokens' : 'max_completion_tokens';
   const requested = Number(body[field] ?? price.maxOutput);
   const room = Math.floor((maxRequestUsd - inCost) / price.output);
-  const out = Math.min(requested > 0 ? requested : price.maxOutput, room, price.maxOutput);
-  if (out < 256) {
-    throw new CapError('request_cap', `only ${out} output tokens fit the per-request cap $${maxRequestUsd} after ~${inTokens} input tokens`);
+  const want = Math.min(requested > 0 ? requested : price.maxOutput, price.maxOutput);
+  const out = Math.min(want, room);
+  // Reject only when the cap forces output below what was asked AND below a
+  // useful floor; a client asking for fewer than 256 tokens is fine.
+  if (out < want && out < 256) {
+    throw new CapError('request_cap', `only ${Math.max(out, 0)} of ${want} requested output tokens fit the per-request cap $${maxRequestUsd} after ~${inTokens} input tokens`);
   }
-  const clamped = out < requested;
+  const clamped = out < want;
   body[field] = out;
   return { inTokens, outTokens: out, estUsd: round6(inCost + out * price.output), clamped, field };
 }
