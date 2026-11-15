@@ -1023,7 +1023,12 @@ export const KanbanCard = Schema.Struct({
   links: Schema.Array(KanbanLink),
   blockedBy: Schema.Array(KanbanCardId),
   stalled: Schema.NullOr(
-    Schema.Struct({ reason: Schema.String, by: KanbanActor, at: IsoDateTime }),
+    Schema.Struct({
+      reason: Schema.String,
+      by: KanbanActor,
+      at: IsoDateTime,
+      runFailure: Schema.optional(Schema.Struct({ threadId: ThreadId, runId: Schema.String })),
+    }),
   ),
   /** Set while the card sits in Needs Owner. */
   question: Schema.NullOr(Schema.String),

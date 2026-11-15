@@ -3,6 +3,7 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/sql/SqlClient";
 import type * as Scope from "effect/Scope";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as SavedWrite from "../engine/savedWrite.ts";
@@ -399,6 +400,7 @@ export const actorKey = (actor: KanbanActor): string => {
 
 const make = Effect.gen(function* () {
   const sql = yield* BoardsDatabase.client;
+  const stateSql = yield* SqlClient.SqlClient;
   const fail = (operation: string) => (cause: unknown) => {
     reportSqliteError(cause, `KanbanStore.${operation}`);
     return new KanbanStoreError({ operation, cause });
@@ -449,39 +451,66 @@ const make = Effect.gen(function* () {
     }
   >();
   const callerCards = new Map<string, { number: number; stage: string }>();
+  const hydrateCallerParents = Effect.fn("KanbanStore.hydrateCallerParents")(function* () {
+    const tables = yield* stateSql`
+      SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'orchestration_v2_projection_threads'
+    `;
+    if (tables.length === 0) return;
+    const parents = yield* stateSql<{ thread_id: string; parent_thread_id: string | null }>`
+      SELECT thread_id, CASE
+        WHEN json_extract(payload_json, '$.lineage.relationshipToParent') = 'subagent'
+          THEN COALESCE(json_extract(payload_json, '$.lineage.parentThreadId'), json_extract(payload_json, '$.lineage.rootThreadId'))
+        WHEN json_type(payload_json, '$.lineage') IS NULL
+          AND json_extract(payload_json, '$.forkedFrom.type') = 'run'
+          THEN json_extract(payload_json, '$.forkedFrom.threadId')
+        END AS parent_thread_id
+      FROM orchestration_v2_projection_threads
+      WHERE deleted_at IS NULL
+        AND (json_extract(payload_json, '$.lineage.relationshipToParent') = 'subagent'
+          OR (json_type(payload_json, '$.lineage') IS NULL
+            AND json_extract(payload_json, '$.forkedFrom.type') = 'run'))
+    `;
+    for (const row of parents)
+      if (row.parent_thread_id !== null && !callerParents.has(row.thread_id))
+        callerParents.set(row.thread_id, row.parent_thread_id);
+  });
   // Hydrate once after board migration; calls only consult these compact maps.
   // Writes observed during hydration win over its older snapshot.
   yield* BoardsDatabase.onReady(
-    sql
-      .withTransaction(
-        Effect.gen(function* () {
-          const links = yield* sql<{
-            thread_id: string;
-            board_id: string;
-            card_id: string | null;
-            role: "work" | "review" | "evaluator";
-            discussion_id: string | null;
-          }>`SELECT thread_id, board_id, card_id, json_extract(json, '$.role') AS role, json_extract(json, '$.discussionId') AS discussion_id FROM ardud_kanban_threads`;
-          const cards = yield* sql<{
-            id: string;
-            number: number;
-            stage: string;
-          }>`SELECT id, number, stage FROM ardud_kanban_cards`;
-          for (const row of links)
-            if (!callerLinks.has(row.thread_id))
-              callerLinks.set(row.thread_id, {
-                boardId: row.board_id,
-                cardId: row.card_id,
-                role: row.role,
-                discussionId: row.discussion_id,
-              });
-          for (const row of cards)
-            if (!callerCards.has(row.id))
-              callerCards.set(row.id, { number: row.number, stage: row.stage });
-          callerHydrated = true;
-        }),
-      )
-      .pipe(NodeSqliteClient.readOnly, Effect.mapError(fail("hydrate caller analytics"))),
+    hydrateCallerParents().pipe(
+      Effect.andThen(
+        sql.withTransaction(
+          Effect.gen(function* () {
+            const links = yield* sql<{
+              thread_id: string;
+              board_id: string;
+              card_id: string | null;
+              role: "work" | "review" | "evaluator";
+              discussion_id: string | null;
+            }>`SELECT thread_id, board_id, card_id, json_extract(json, '$.role') AS role, json_extract(json, '$.discussionId') AS discussion_id FROM ardud_kanban_threads`;
+            const cards = yield* sql<{
+              id: string;
+              number: number;
+              stage: string;
+            }>`SELECT id, number, stage FROM ardud_kanban_cards`;
+            for (const row of links)
+              if (!callerLinks.has(row.thread_id))
+                callerLinks.set(row.thread_id, {
+                  boardId: row.board_id,
+                  cardId: row.card_id,
+                  role: row.role,
+                  discussionId: row.discussion_id,
+                });
+            for (const row of cards)
+              if (!callerCards.has(row.id))
+                callerCards.set(row.id, { number: row.number, stage: row.stage });
+            callerHydrated = true;
+          }),
+        ),
+      ),
+      NodeSqliteClient.readOnly,
+      Effect.mapError(fail("hydrate caller analytics")),
+    ),
   );
   const callerAnalytics: NonNullable<KanbanStoreShape["callerAnalytics"]> = (threadId) => {
     const seen = new Set<string>();

@@ -1393,6 +1393,8 @@ const slotPacing = RestartPacing.layer.pipe(
       ServerSettings.layerTest({ restartPacing: { maxActive: 1, spacingMs: 0 } }),
       Layer.succeed(RestartPacing.RestartLoad, () => 0),
       Layer.succeed(RestartPacingState.RestartPacingState, {
+        wake: () => Effect.succeed(true),
+        hasSuccessor: () => Effect.succeed(false),
         describe: () => Effect.succeed({ priority: 3, activityAt: 0 }),
         pending: () => Effect.succeed(true),
         sourceForRun: (threadId, sourceRunId) => Effect.succeed({ threadId, sourceRunId }),
@@ -1836,4 +1838,121 @@ it.effect.each([
       ),
     );
   }),
+);
+
+it.effect.each(["owner message", "owner continuation", "agent wake"] as const)(
+  "a superseded recovery wake preserves distinct queued input: %s",
+  (kind) =>
+    Effect.gen(function* () {
+      const events = yield* Ref.make<ReadonlyArray<string>>([]);
+      const now = yield* DateTime.now;
+      const queuedId = RunId.make("run:thread:preserved:ordinal:3");
+      const newerId = RunId.make("run:thread:preserved:ordinal:12");
+      const queued = {
+        ...queuedProjection.runs[0]!,
+        id: queuedId,
+        ordinal: 3,
+        ...(kind === "owner continuation"
+          ? { restartContinuationOfRunId: RunId.make("run:thread:preserved:ordinal:2") }
+          : {}),
+      };
+      let projection = yield* decodeProjection({
+        ...queuedProjection,
+        runs: [
+          queued,
+          {
+            ...queued,
+            id: newerId,
+            ordinal: 12,
+            status: "interrupted",
+            userMessageId: MessageId.make("message:newer-interrupted"),
+          },
+        ],
+        messages: [
+          {
+            id: queued.userMessageId,
+            threadId,
+            runId: queuedId,
+            nodeId: null,
+            role: "user",
+            text: "Keep this distinct queued request",
+            attachments: [],
+            streaming: false,
+            createdAt: now,
+            updatedAt: now,
+            createdBy: kind === "agent wake" ? "agent" : "user",
+            creationSource: kind === "agent wake" ? "server" : "web",
+          },
+          {
+            id: MessageId.make("message:newer-interrupted"),
+            threadId,
+            runId: newerId,
+            nodeId: null,
+            role: "user",
+            text: "Unrelated work already in flight",
+            attachments: [],
+            streaming: false,
+            createdAt: now,
+            updatedAt: now,
+            createdBy: "agent",
+            creationSource: "server",
+          },
+        ],
+      });
+      const pacing = RestartPacing.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            ServerSettings.layerTest({ restartPacing: { spacingMs: 20_000 } }),
+            Layer.succeed(RestartPacing.RestartLoad, () => 2),
+            Layer.succeed(RestartPacingState.RestartPacingState, {
+              wake: () => Effect.succeed(true),
+              hasSuccessor: () => Effect.succeed(true),
+              describe: () => Effect.succeed({ priority: 0, activityAt: 0 }),
+              pending: () => Effect.succeed(true),
+              sourceForRun: () => Effect.succeed(undefined),
+              active: () => Effect.succeed(false),
+              status: () => Effect.succeed(true),
+            }),
+          ),
+        ),
+      );
+      const prepared = Layer.effect(
+        RestartPacing.RestartPacing,
+        Effect.gen(function* () {
+          const service = yield* RestartPacing.RestartPacing;
+          yield* service.register({ threadId, sourceRunId: newerId });
+          return service;
+        }),
+      ).pipe(Layer.provide(pacing), Layer.orDie);
+      const layer = layerExecutorFor({
+        events,
+        pacing: prepared,
+        continueAfterRestart: true,
+        projections: { getThreadRecords: () => Effect.succeed(projection) },
+        threads: {
+          getThreadRecords: () => Effect.succeed(projection),
+          dispatch: (command) =>
+            Effect.sync(() => {
+              if (command.type === "queued-run.cancel")
+                projection = {
+                  ...projection,
+                  runs: projection.runs.map((run) =>
+                    run.id === command.runId ? { ...run, status: "cancelled" as const } : run,
+                  ),
+                };
+              return { sequence: 0, storedEvents: [] };
+            }),
+        },
+      });
+      const executor = yield* EffectWorker.OrchestrationEffectExecutorV2.pipe(
+        Effect.provide(layer),
+      );
+      yield* executor.execute({
+        ...restartEffect(now, { type: "detach" }),
+        request: { type: "provider-runtime.continue", sourceRunId: queuedId, queued: true },
+      });
+      assert.equal(projection.runs.find((run) => run.id === queuedId)?.status, "queued");
+      assert.equal(projection.messages[0]?.text, "Keep this distinct queued request");
+      assert.deepEqual(yield* Ref.get(events), []);
+    }),
 );

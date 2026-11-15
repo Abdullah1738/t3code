@@ -42,6 +42,11 @@ export class RestartPacingState extends Context.Service<
   RestartPacingState,
   {
     readonly pending: (source: RestartSource) => Effect.Effect<boolean, RestartPacingStateError>;
+    readonly wake: (source: RestartSource) => Effect.Effect<boolean, RestartPacingStateError>;
+    readonly hasSuccessor: (
+      source: RestartSource,
+      runId?: RunId,
+    ) => Effect.Effect<boolean, RestartPacingStateError>;
     readonly sourceForRun: (
       threadId: ThreadId,
       runId: RunId,
@@ -53,7 +58,10 @@ export class RestartPacingState extends Context.Service<
       },
       RestartPacingStateError
     >;
-    readonly active: (source: RestartSource) => Effect.Effect<boolean, RestartPacingStateError>;
+    readonly active: (
+      source: RestartSource,
+      runId?: RunId,
+    ) => Effect.Effect<boolean, RestartPacingStateError>;
     readonly status: (
       source: RestartSource,
       position: number | null,
@@ -202,15 +210,17 @@ const make = Effect.gen(function* () {
     Effect.mapError((cause) => new RestartPacingStateError({ cause })),
   );
   const active = Effect.fn("RestartPacingState.active")(
-    function* (source: RestartSource) {
+    function* (source: RestartSource, runId?: RunId) {
       const projection = yield* projections.getThreadRecords(source.threadId, [
         "runs",
         "providerTurns",
       ]);
       const run =
-        projection.runs.find(
-          (candidate) => candidate.restartContinuationOfRunId === source.sourceRunId,
-        ) ?? projection.runs.find((candidate) => candidate.id === source.sourceRunId);
+        runId === undefined
+          ? (projection.runs.find(
+              (candidate) => candidate.restartContinuationOfRunId === source.sourceRunId,
+            ) ?? projection.runs.find((candidate) => candidate.id === source.sourceRunId))
+          : projection.runs.find((candidate) => candidate.id === runId);
       // startedAt precedes native acceptance; the startup finalizer owns
       // releasing live reservations.
       if (!run || !["preparing", "starting", "running"].includes(run.status)) return false;
@@ -326,6 +336,32 @@ const make = Effect.gen(function* () {
     (effect, source) => threadCommands.withLock(source.threadId, effect),
     Effect.mapError((cause) => new RestartPacingStateError({ cause })),
   );
-  return RestartPacingState.of({ pending, sourceForRun, describe, active, status });
+  const wake = Effect.fn("RestartPacingState.wake")(
+    (source: RestartSource) =>
+      source.effectId === undefined
+        ? Effect.succeed(true)
+        : outbox.wakeRestartEffect(source.effectId),
+    Effect.mapError((cause) => new RestartPacingStateError({ cause })),
+  );
+  const hasSuccessor = Effect.fn("RestartPacingState.hasSuccessor")(
+    function* (source: RestartSource, runId?: RunId) {
+      const { runs } = yield* projections.getThreadRecords(source.threadId, ["runs"]);
+      return runs.some(
+        (run) =>
+          run.id !== (runId ?? source.sourceRunId) &&
+          ["queued", "preparing", "starting", "running", "waiting"].includes(run.status),
+      );
+    },
+    Effect.mapError((cause) => new RestartPacingStateError({ cause })),
+  );
+  return RestartPacingState.of({
+    pending,
+    sourceForRun,
+    describe,
+    active,
+    status,
+    wake,
+    hasSuccessor,
+  });
 });
 export const layer = Layer.effect(RestartPacingState, make);

@@ -59,8 +59,8 @@ export function sendblueLine(config: Config, env: Record<string, string | undefi
   return new Sendblue({ keyId, secret, number, ...(config.cardApp ? { cardApp: config.cardApp } : {}) });
 }
 
-export function cardDeliveryOptions(line: Pick<Line, "upload">, live: boolean, fetchFn: typeof fetch = fetch) {
-  return { static: !live, previewImage: cardPreviewImage(file => line.upload(file), fetchFn) };
+export function cardDeliveryOptions(line: Pick<Line, "upload">, live: boolean, fetchFn: typeof fetch = fetch, chat?: string) {
+  return { static: !live, previewImage: cardPreviewImage(file => line.upload(file), fetchFn, chat) };
 }
 
 /**
@@ -212,7 +212,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
       ? backend.forChat(`chats/${chat.info.slug}`, chat.info.title) : backend;
     if (chatBackend instanceof RobobBackend) chatBackend.trackFirstTurns(chat.store);
     const liveCards = (config.liveCardChats ?? []).includes(chat.info.slug);
-    const transport = sbTransport(observed, chat.info.key, chat.store, undefined, cardDeliveryOptions(observed, liveCards));
+    const transport = sbTransport(observed, chat.info.key, chat.store, undefined, cardDeliveryOptions(observed, liveCards, fetch, chat.info.slug));
     // getMessage may resolve undefined for an unknown handle; the router's reply lookup already treats a throw there as unavailable.
     const router = new Router(chat.store, chatBackend, transport as unknown as ConstructorParameters<typeof Router>[2], {
       ...config, chatGuid: chat.info.key, skillPath, alertSkillPath, alertSocketPath: telegramBridgeSocket,

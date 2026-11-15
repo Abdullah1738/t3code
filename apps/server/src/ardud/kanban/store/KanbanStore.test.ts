@@ -2456,6 +2456,99 @@ it.effect("caller analytics is a memory lookup and follows card and link writes"
   }).pipe(Effect.provide(TestLayer)),
 );
 
+it.effect("reopened caller attribution follows nested subagents and stops at forks", () =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const sql = yield* SqlClient.SqlClient;
+    for (const [id, number] of [
+      ["worker", 4336],
+      ["own-fork", 4339],
+    ] as const) {
+      const current = card(number, "working");
+      yield* store.putCard(current);
+      yield* store.putThreadLink({
+        threadId: ThreadId.make(id),
+        boardId,
+        cardId: current.id,
+        role: "work",
+        purpose: null,
+        discussionId: null,
+        model,
+        startedAt: at,
+        endedAt: null,
+        paused: null,
+      });
+    }
+    for (const [id, parent, relationship, deleted] of [
+      ["child", "worker", "subagent", false],
+      ["grandchild", "child", "subagent", false],
+      ["plain-fork", "worker", "fork", false],
+      ["fork-child", "plain-fork", "subagent", false],
+      ["fork-grandchild", "fork-child", "subagent", false],
+      ["own-fork", "worker", "fork", false],
+      ["own-child", "own-fork", "subagent", false],
+      ["own-grandchild", "own-child", "subagent", false],
+      ["legacy", "worker", "legacy", false],
+      ["legacy-grandchild", "legacy", "subagent", false],
+      ["explicit-root", "worker", "root", false],
+      ["root-grandchild", "explicit-root", "subagent", false],
+      ["cycle-a", "cycle-b", "subagent", false],
+      ["cycle-b", "cycle-a", "subagent", false],
+      ["deleted-parent", "worker", "subagent", true],
+      ["deleted-grandchild", "deleted-parent", "subagent", false],
+    ] as const) {
+      const payload = {
+        ...(relationship === "legacy"
+          ? {}
+          : {
+              lineage: {
+                parentThreadId: relationship === "root" ? null : parent,
+                relationshipToParent: relationship === "root" ? null : relationship,
+                rootThreadId: "worker",
+              },
+            }),
+        forkedFrom: { type: "run", threadId: parent },
+      };
+      yield* sql`INSERT INTO orchestration_v2_projection_threads (
+        thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
+        created_at, updated_at, payload_json, deleted_at
+      ) VALUES (${id}, 'project', ${id}, 'codex', 'full-access', 'default',
+        ${at}, ${at}, ${JSON.stringify(payload)}, ${deleted ? "2026-11-14T00:00:00.000Z" : null})`;
+    }
+    const reopened = Context.get(
+      yield* Layer.build(
+        Layer.fresh(KanbanStore.layer).pipe(Layer.provide(Layer.succeed(SqlClient.SqlClient, sql))),
+      ),
+      KanbanStore.KanbanStore,
+    );
+    const queries: string[] = [];
+    const observe: Statement.Transformer = (statement) => {
+      queries.push(statement.compile()[0]);
+      return Effect.succeed(statement);
+    };
+    yield* Effect.sync(() => {
+      for (const [id, number] of [
+        ["grandchild", 4336],
+        ["fork-grandchild", undefined],
+        ["own-grandchild", 4339],
+        ["legacy-grandchild", 4336],
+        ["root-grandchild", undefined],
+        ["cycle-a", undefined],
+        ["deleted-grandchild", undefined],
+      ] as const) {
+        const context = reopened.callerAnalytics!(id);
+        assert.equal(context?.callerRole, "delegated", id);
+        assert.equal(context?.callerKind, "delegated_child", id);
+        assert.equal(context?.cardNumber, number, id);
+        assert.equal(context?.cardStage, number === undefined ? undefined : "working", id);
+      }
+      assert.equal(reopened.callerAnalytics!("plain-fork")?.callerRole, "none");
+      assert.equal(reopened.callerAnalytics!("own-fork")?.callerRole, "work");
+    }).pipe(Effect.provideService(Statement.CurrentTransformer, observe));
+    assert.deepEqual(queries, []);
+  }).pipe(Effect.provide(TestLayer)),
+);
+
 it.effect.each(["rekey", "selection"] as const)(
   "%s caller metadata waits for the enclosing commit",
   (mode) =>

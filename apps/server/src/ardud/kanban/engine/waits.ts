@@ -1160,7 +1160,7 @@ export function scriptCheckEveryMs(cards: ReadonlyArray<Pick<KanbanCard, "wait">
 }
 
 export type WaitCheck =
-  | { readonly ok: true }
+  | { readonly ok: true; readonly deferredUntilTurnEnds?: true }
   | {
       readonly ok: false;
       readonly code: "invalid" | "denied";
@@ -1220,27 +1220,27 @@ export function checkWait(
   if (card.settledAt !== null) return denied(`${n} is settled`, "card_settled");
   if (card.stage === "verified")
     return denied(`${n} is verified: nothing left to wait for`, "card_verified");
+  const ownWorker =
+    card.stage === "working" &&
+    actor._tag === "thread" &&
+    actor.threadId === card.activeThreadId &&
+    actor.threadId === card.workThreadId &&
+    card.activeRole === "work";
   if (card.activeThreadId !== null) {
-    if (
-      actor._tag === "thread" &&
-      actor.threadId === card.activeThreadId &&
-      actor.threadId === card.workThreadId &&
-      card.activeRole === "work"
-    ) {
+    if (ownWorker && request.on === "ci" && request.pr) {
       return denied(
-        (request.on === "ci" || request.on === "push" || request.on === "merge") && request.pr
-          ? "This card is yours and you are running, so the board can't park it. Waiting on CI for a PR: call watch_pull_request on it and end your turn; the board waits while the watch is on and the watch wakes you."
-          : "This card is yours and you are running, so the board can't park it. Ask your board evaluator to set this wait (card_ask with to: evaluator, giving on, until or target, and the note), then end your turn; the evaluator sets it once your run has ended.",
+        "This card is yours and you are running, so the board can't park it. Waiting on CI for a PR: call watch_pull_request on it and end your turn; the board waits while the watch is on and the watch wakes you.",
         "active_worker_cannot_wait",
       );
     }
-    if (activeThreadRunning) {
+    if (!ownWorker && activeThreadRunning) {
       return denied(
         `${n} has a running thread, so it isn't waiting. Set the wait once the thread has handed the card on`,
         "card_has_active_thread",
       );
     }
   }
+  const accepted: WaitCheck = ownWorker ? { ok: true, deferredUntilTurnEnds: true } : { ok: true };
   // A wait takes over a stalled flag, but only one its setter could clear (the card_flag rule).
   if (!mayClearFlag(card, actor)) {
     return denied(
@@ -1285,7 +1285,7 @@ export function checkWait(
           "a push wait needs head: the commit that was reviewed (the PR's head sha now), so the board can tell when it moves",
         );
       }
-      return { ok: true };
+      return accepted;
     }
     case "owner_go": {
       const open = kanbanOpenAsks(card);
@@ -1301,7 +1301,7 @@ export function checkWait(
           `${n} has no open question ${request.ask}: ask the owner with card_ask first, then wait on its id`,
         );
       }
-      return { ok: true };
+      return accepted;
     }
     case "card": {
       if (!request.card) return bad("say which card to wait on (waitsOn)");
@@ -1312,10 +1312,10 @@ export function checkWait(
       if (KANBAN_DONE_STAGES.has(request.card.stage) && !kanbanAwaitsMerge(request.card)) {
         return bad(`card #${request.card.number} is already done: nothing to wait for`);
       }
-      return { ok: true };
+      return accepted;
     }
     case "time":
-      return until === null ? bad("a time wait needs until") : { ok: true };
+      return until === null ? bad("a time wait needs until") : accepted;
     case "script": {
       const name = request.script?.name.trim() ?? "";
       if (!name) {
@@ -1339,7 +1339,7 @@ export function checkWait(
           return bad("args.everyMs is how often to check, in milliseconds: a number");
         }
       }
-      return { ok: true };
+      return accepted;
     }
   }
 }

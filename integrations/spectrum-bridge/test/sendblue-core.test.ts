@@ -30,7 +30,7 @@ const access: Access = {
   groups: [{ id: "grp-allowed", name: "Family" }],
 };
 const stores: Store[] = [];
-afterEach(() => { for (const store of stores.splice(0)) store.close(); });
+afterEach(() => { setSystemTime(); for (const store of stores.splice(0)) store.close(); });
 const store = () => { const s = new Store(":memory:"); stores.push(s); return s; };
 
 function inbound(overrides: Partial<LineInbound> = {}): LineInbound {

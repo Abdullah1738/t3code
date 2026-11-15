@@ -52,6 +52,7 @@ import * as SavedWrite from "../ardud/kanban/engine/savedWrite.ts";
 import * as McpHttpServer from "./McpHttpServer.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpToolAccess from "./McpToolAccess.ts";
+import { PullRequestWatchTimeoutError } from "./toolkits/pullRequests/tools.ts";
 import * as Testkit from "./McpToolAccess.testkit.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
@@ -96,6 +97,7 @@ const client = McpSchema.McpServerClient.of({
 });
 const ProbeFailure = Schema.Union([
   OrchestratorMcpFailure,
+  PullRequestWatchTimeoutError,
   KanbanError,
   PreviewAutomationError,
   McpCapabilityUnavailableError,
@@ -655,6 +657,7 @@ const boot = {
   cause: new Error("private error"),
 };
 const typedFailures = [
+  { error: new PullRequestWatchTimeoutError({ saved: "unknown" }), outcome: "timeout" },
   { error: new PreviewAutomationTimeoutError(browserRequest), outcome: "timeout" },
   {
     error: new PreviewAutomationRecordingDeadlineExpiredError({

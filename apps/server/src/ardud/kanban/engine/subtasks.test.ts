@@ -2466,8 +2466,39 @@ describe("clearing guessed gates", () => {
     }
   });
 
-  it.each(["Restart Robob now", "Read the result"])("reconsiders changed text: %s", (text) => {
-    const cleared = clear(make("Restart Robob"));
+  it.each(
+    (["evaluator", "script"] as const).flatMap((owner) =>
+      ["Restart Robob now", "Read the result"].map((text) => ({ owner, text })),
+    ),
+  )("carries the clear across a $owner reword: $text", ({ owner, text }) => {
+    const cleared = clear({ ...make("Restart Robob"), owner });
+    const plan = planSubtasks(
+      [cleared],
+      [{ id: cleared.id, text, gate: null }],
+      6,
+      "2026-11-13T19:00:00.000Z",
+      undefined,
+      evaluator,
+    );
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) return;
+    const saved = plan.subtasks[0]!;
+    expect(saved).not.toHaveProperty("gate");
+    expect(saved).not.toHaveProperty("gateSource");
+    expect(saved.gateCleared).toEqual({ ...cleared.gateCleared, text });
+    expect(saved.createdAt).toBe(cleared.createdAt);
+    expect(gateOf(saved)).toBeUndefined();
+    expect(
+      approvalProblem({ number: 21, asks: [], createdAt: at, subtasks: [saved] }, saved),
+    ).toBeNull();
+  });
+
+  it.each(
+    (["evaluator", "script"] as const).flatMap((owner) =>
+      ["Share the API key", "Pay for the service"].map((text) => ({ owner, text })),
+    ),
+  )("re-gates a $owner reword with a different guess: $text", ({ owner, text }) => {
+    const cleared = clear({ ...make("Restart Robob"), owner });
     const fresh = "2026-11-13T19:00:00.000Z";
     const plan = planSubtasks(
       [cleared],
@@ -2484,6 +2515,65 @@ describe("clearing guessed gates", () => {
     if (inferGate(text))
       expect(plan.subtasks[0]).toMatchObject({ createdAt: fresh, gateSource: "guessed" });
   });
+
+  const wording = [
+    { guess: "deploy", text: "Restart the test helper", reword: "Restart another test helper" },
+    {
+      guess: "money",
+      text: "Pay attention to the test result",
+      reword: "Pay close attention to the test result",
+    },
+    { guess: "secret", text: "Share the API key fixture", reword: "Share another API key fixture" },
+  ] as const;
+  const stickyClears = wording.flatMap((original) =>
+    wording
+      .filter((stored) => stored.guess !== original.guess)
+      .flatMap((stored) =>
+        (["evaluator", "script"] as const).map((owner) => ({
+          ...original,
+          gate: stored.guess,
+          owner,
+        })),
+      ),
+  );
+
+  it.each(stickyClears)(
+    "preserves a cleared sticky $gate on $owner wording that already guesses $guess",
+    ({ gate, owner, text, reword, guess }) => {
+      const cleared = clear({ ...make(text), owner, gate, gateSource: "guessed" });
+      for (const input of [
+        { id: cleared.id, text, gate: null },
+        { id: cleared.id, text: reword, gate: null },
+        { id: cleared.id, clearGate: "This remains a fixture, no live operation" },
+      ]) {
+        const plan = planSubtasks([cleared], [input], 6, "2026-11-13T19:00:00.000Z", undefined, {
+          _tag: "evaluator",
+          threadId: ThreadId.make("another-evaluator"),
+        });
+        expect(plan.ok).toBe(true);
+        if (!plan.ok) continue;
+        const saved = plan.subtasks[0]!;
+        expect(inferGate(saved.text)).toBe(guess);
+        expect(saved.gateCleared).toEqual({ ...cleared.gateCleared, text: saved.text });
+        expect(gateOf(saved)).toBeUndefined();
+        expect(saved.createdAt).toBe(cleared.createdAt);
+      }
+      const different = wording.find((entry) => entry.guess !== gate && entry.guess !== guess)!;
+      const plan = planSubtasks(
+        [cleared],
+        [{ id: cleared.id, text: different.text }],
+        6,
+        later,
+        undefined,
+        evaluator,
+      );
+      expect(plan.ok && plan.subtasks[0]).toMatchObject({
+        gate: different.guess,
+        gateSource: "guessed",
+      });
+      expect(plan.ok && plan.subtasks[0]).not.toHaveProperty("gateCleared");
+    },
+  );
 
   it("an explicit gate re-gates an unchanged cleared step", () => {
     const cleared = clear(make("Restart Robob"));
@@ -2525,6 +2615,23 @@ describe("clearing guessed gates", () => {
       reason: `subtask ${known.id} has a deploy gate set on purpose; only Abdullah's answer clears it (card_ask naming ${known.id})`,
     });
   });
+
+  it.each(["deploy", "money", "secret"] as const)(
+    "rewording keeps a deliberate %s gate",
+    (gate) => {
+      const known = make("Do the operation", gate);
+      const plan = planSubtasks(
+        [known],
+        [{ id: known.id, text: "Read the result", gate: null }],
+        6,
+        later,
+        undefined,
+        evaluator,
+      );
+      expect(plan.ok && plan.subtasks[0]).toMatchObject({ gate, gateSource: "set" });
+      expect(plan.ok && plan.subtasks[0]).not.toHaveProperty("gateCleared");
+    },
+  );
 
   it("clears a legacy 9router s6 gate with no recorded origin", () => {
     const { gateSource: _, ...legacy } = make(
@@ -2604,7 +2711,10 @@ it("board guess settings preserve stored clears and deliberate gates", () => {
     owner,
   );
   if (!changed.ok) throw new Error(changed.reason);
-  expect(changed.subtasks[0]).not.toHaveProperty("gateCleared");
+  expect(changed.subtasks[0]!.gateCleared).toEqual({
+    ...cleared.subtasks[0]!.gateCleared,
+    text: "Restart the helper",
+  });
   expect(changed.subtasks[0]).not.toHaveProperty("gate");
   const deliberate = planSubtasks(
     [],

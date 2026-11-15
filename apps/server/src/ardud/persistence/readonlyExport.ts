@@ -481,6 +481,70 @@ export function createReadonlyReplica(
         schema.replace(/^CREATE TABLE\s+(?:IF NOT EXISTS\s+)?/i, "CREATE TABLE IF NOT EXISTS "),
       );
     };
+    const ensureIdentityVersions = () => {
+      const covered = [
+        ["orchestration_v2_projection_threads", "thread_id", "threads"],
+        ["orchestration_v2_projection_provider_threads", "provider_thread_id", "providers"],
+        ["orchestration_v2_projection_provider_turns", "provider_turn_id", "turns"],
+        ["orchestration_v2_projection_subagents", "subagent_id", "subagents"],
+        ["ardud_opencode_import", "native_session_id", "imports"],
+      ] as const;
+      const installed = out
+        .prepare(
+          "SELECT type,name,tbl_name FROM sqlite_schema WHERE name LIKE 'ardud_identity_%' OR name='ardud_readonly_identity_versions'",
+        )
+        .all();
+      const certified =
+        getMeta("identity_versions_schema") === "1" &&
+        installed.some(
+          (row) => row.type === "table" && row.name === "ardud_readonly_identity_versions",
+        );
+      const repair = covered.filter(
+        ([name, , suffix]) =>
+          !certified ||
+          ["insert", "update", "delete"].some(
+            (action) =>
+              !installed.some(
+                (row) =>
+                  row.type === "trigger" &&
+                  row.tbl_name === name &&
+                  row.name === `ardud_identity_${suffix}_${action}`,
+              ),
+          ),
+      );
+      if (!repair.length) return;
+      const install = () => {
+        out.exec(`CREATE TABLE IF NOT EXISTS ardud_readonly_identity_versions (
+          version INTEGER PRIMARY KEY AUTOINCREMENT,
+          table_name TEXT NOT NULL,
+          row_id TEXT NOT NULL,
+          UNIQUE(table_name,row_id)
+        )`);
+        for (const [name, primary, suffix] of repair) {
+          for (const action of ["insert", "update", "delete"]) {
+            const trigger = q(`ardud_identity_${suffix}_${action}`);
+            out.exec(`DROP TRIGGER IF EXISTS ${trigger}`);
+            const keys =
+              action === "update"
+                ? `IN (OLD.${q(primary)},NEW.${q(primary)})`
+                : `=${action === "delete" ? "OLD" : "NEW"}.${q(primary)}`;
+            out.exec(`CREATE TRIGGER ${trigger} AFTER ${action.toUpperCase()} ON ${q(name)} FOR EACH ROW BEGIN
+              DELETE FROM ardud_readonly_identity_versions WHERE table_name='${name}' AND row_id ${keys};
+              ${action === "delete" ? "" : `INSERT INTO ardud_readonly_identity_versions(table_name,row_id) VALUES ('${name}',NEW.${q(primary)});`}
+            END`);
+          }
+          // A recreated table may reuse keys; retain the sequence but replace its census.
+          out.prepare("DELETE FROM ardud_readonly_identity_versions WHERE table_name=?").run(name);
+          out.exec(
+            `INSERT INTO ardud_readonly_identity_versions(table_name,row_id) SELECT '${name}',${q(primary)} FROM ${q(name)}`,
+          );
+        }
+        meta("identity_versions_schema", "1");
+      };
+      // Bootstrap/reset publications can own a transaction without a cycle session.
+      if (out.isTransaction) install();
+      else transaction(install);
+    };
     const pendingAuxiliarySchemas = new Map<string, (typeof sourceTables)[number]>();
     const refreshAuxiliarySchemas = (changed: typeof sourceTables) => {
       // Schema, indexes, rows and markers switch inside the publication transaction.
@@ -490,6 +554,7 @@ export function createReadonlyReplica(
         copyIndexes(name, db);
         meta(`schema:${name}`, schema);
       }
+      ensureIdentityVersions();
       meta(
         "last_aux_schema_refresh",
         JSON.stringify({ tables: changed.map(({ name }) => name), at: new Date().toISOString() }),
@@ -898,6 +963,7 @@ export function createReadonlyReplica(
       if (!pendingAuxiliarySchemas.has(name) && getMeta(`additive:${name}`) === undefined)
         copyIndexes(name, db);
     }
+    ensureIdentityVersions();
     const configureTable = ({ name, db, schema }: (typeof sourceTables)[number]) => {
       // Pending auxiliary columns do not exist in main until their rows publish.
       sourceSchemas.set(name, schema);
@@ -1016,11 +1082,13 @@ export function createReadonlyReplica(
         const { stage } = auxiliaryStages.get(name)!;
         const { primary, columns } = tables.get(name)!;
         const values = columns.filter((c) => c !== primary);
+        // Release obsolete unique owners before copying replacements. Import
+        // bindings can also swap owners while both session keys survive.
+        out.exec(
+          `DELETE FROM main.${q(name)} WHERE NOT EXISTS (SELECT 1 FROM temp.${q(stage)} s WHERE s.${q(primary)}=main.${q(name)}.${q(primary)}${name === "ardud_opencode_import" ? ` AND s.thread_id IS main.${q(name)}.thread_id` : ""})`,
+        );
         out.exec(`INSERT INTO main.${q(name)} (${columns.map(q)}) SELECT ${columns.map(q)} FROM temp.${q(stage)} WHERE 1
           ON CONFLICT(${q(primary)}) ${values.length ? `DO UPDATE SET ${values.map((c) => `${q(c)}=excluded.${q(c)}`).join(",")} WHERE ${values.map((c) => `${q(name)}.${q(c)} IS NOT excluded.${q(c)}`).join(" OR ")}` : "DO NOTHING"}`);
-        out.exec(
-          `DELETE FROM main.${q(name)} WHERE NOT EXISTS (SELECT 1 FROM temp.${q(stage)} s WHERE s.${q(primary)}=main.${q(name)}.${q(primary)})`,
-        );
       }
     };
     const upsertEvent = out.prepare("INSERT OR REPLACE INTO orchestration_events VALUES (?,?,?,?)");
@@ -1293,7 +1361,10 @@ export function createReadonlyReplica(
               // and publication markers still switch together at cycle end.
               if (
                 !out.applyChangeset(suspended, {
-                  filter: (name) => !identityNames.includes(name),
+                  // Replayed projection writes run the triggers again. Their old
+                  // versions can collide with the intervening identity commit.
+                  filter: (name) =>
+                    !identityNames.includes(name) && name !== "ardud_readonly_identity_versions",
                 }) ||
                 !out.applyChangeset(suspended, {
                   filter: (name) => identityNames.includes(name),
@@ -1743,6 +1814,7 @@ export function createReadonlyReplica(
           // Bind capability evidence to this publication. An older exporter
           // leaves it behind, so readers safely fall back after a downgrade.
           meta("lineage_repair_watermark", getMeta("updated_at")!);
+          ensureIdentityVersions();
           meta("ready", "1");
           meta("generation", String(Number(getMeta("generation") ?? 0) + 1));
           if (rebuild) meta("rebuild_finished_at", new Date(Date.now()).toISOString());
