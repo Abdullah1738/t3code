@@ -7,6 +7,7 @@ import { ControlClient } from "../src/control.ts";
 import { OpenChamber, type MessageRecord } from "../src/openchamber.ts";
 import { Router } from "../src/router.ts";
 import { Store } from "../src/store.ts";
+import { captureLogs } from "./log-fixture.ts";
 
 const day = "2026-11-13";
 const roots: string[] = [];
@@ -161,6 +162,31 @@ test.each([
     toolLog.write({ component: "process", kind: "event", name: "bridge.stop" }); toolLog.flush(); await toolLog.settled();
     if (previous === undefined) delete process.env.TOOLLOG_DIR; else process.env.TOOLLOG_DIR = previous;
   }
+});
+
+test.each(["upload", "stream"])("non-request %s failures retain cause keys and rollup causes after #40", async operation => {
+  const cause = Object.assign(new Error("PRIVATE +971501234567 /private/PRIVATE https://private.test/?token=PRIVATE"), { code: "ECONNRESET" });
+  const fake = Object.assign(async (url: string | URL | Request) => {
+    if (String(url).endsWith("/attachments")) return Response.json({ ok: true, attachmentId: "fixture", relativeUrl: "/signed" });
+    throw cause;
+  }, { preconnect: globalThis.fetch.preconnect });
+  const fetch = spyOn(globalThis, "fetch").mockImplementation(fake);
+  const tag = operation === "upload" ? "control.catch3" : "control.catch5";
+  try {
+    const records = await captureLogs(async () => {
+      const client = new ControlClient({ url: "http://127.0.0.1:3773", token: "PRIVATE_TOKEN" });
+      const action = operation === "upload" ? client.upload({ name: "PRIVATE", mimeType: "image/png", bytes: new Uint8Array([1]) })
+        : client.events({ signal: new AbortController().signal }).next();
+      await expect(action).rejects.toMatchObject({ status: 0 });
+      const result = await toolLog.rollup(new Date().toISOString().slice(0, 10));
+      expect(result?.topCauses).toContainEqual({ tag, causeKey: "code.ECONNRESET", count: 1 });
+    });
+    const catches = records.filter(row => row.name === "bridge.catch");
+    expect(catches).toHaveLength(1);
+    expect(catches[0]?.error).toMatchObject({ tag, causeKey: "code.ECONNRESET" });
+    expect(catches[0]?.site).toMatch(/^src\/control.ts:\d+$/);
+    expect(JSON.stringify(records)).not.toContain("PRIVATE");
+  } finally { fetch.mockRestore(); }
 });
 
 test("interleaved turns and calls completing after a new turn keep their captured run id", async () => {
