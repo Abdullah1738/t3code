@@ -4,6 +4,7 @@
 #   bash install-host.sh image      # (re)build the offbox-base image from base-image.sh
 #   bash install-host.sh tmp-profile # only configure /tmp for future box starts; no service restarts
 #   bash install-host.sh update-policy # config and pending-restart writer only; no service restart
+#   bash install-host.sh cpu-priority # relative control-plane CPU weights only; no restart
 #   bash install-host.sh cpu-admission # save old admission value and configure CPU backpressure; no restart
 #   bash install-host.sh cpu-admission-undo # restore the saved admission value; no restart
 # Everything that must outlive an OS reinstall is on the pool: boatd's state (dataset offbox/boatd at
@@ -21,6 +22,30 @@ MGMT_ASSETS=$HERE
 [ -f "$MGMT_ASSETS/offbox_mgmt_sshd_config" ] || MGMT_ASSETS=$HERE/../skill/templates/home
 POOL=offbox
 export DEBIAN_FRONTEND=noninteractive
+
+cpu_priority() {
+  local units_dir=${SYSTEMD_UNIT_DIR:-/etc/systemd/system} unit section weight target temporary
+  # Incus payloads are root cgroups, so service weights alone cannot escape system.slice's share.
+  for unit in system.slice boatd.service tailscaled.service ssh.service incus.service boatd-cmd-.service; do
+    section=Service
+    weight=1000
+    [ "$unit" != system.slice ] || section=Slice
+    [ "$unit" != boatd-cmd-.service ] || weight=100
+    target="$units_dir/$unit.d/90-offbox-cpu-priority.conf"
+    mkdir -p "$(dirname "$target")"
+    temporary=$(mktemp "${target}.XXXXXX")
+    printf '[%s]\nCPUWeight=%s\n' "$section" "$weight" > "$temporary"
+    chmod 0644 "$temporary"
+    if cmp -s "$temporary" "$target"; then rm -f "$temporary"; else mv -f "$temporary" "$target"; fi
+  done
+  systemctl daemon-reload
+  # Reapply to active cgroups now, without moving units, restarting services or imposing quotas.
+  for unit in system.slice boatd.service tailscaled.service ssh.service incus.service; do
+    systemctl set-property --runtime "$unit" CPUWeight=1000
+  done
+}
+
+if [ "${1:-}" = cpu-priority ]; then cpu_priority; exit 0; fi
 
 if [ "${1:-}" = cpu-admission ] || [ "${1:-}" = cpu-admission-undo ]; then
   python3 - "${BOATD_ETC:-/etc/boatd}" "$1" <<'PY'
@@ -458,7 +483,7 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
-systemctl daemon-reload
+cpu_priority
 systemctl enable boatd >/dev/null
 systemctl enable --now boatd-snap-hourly.timer boatd-snap-daily.timer boatd-snap-weekly.timer boatd-scrub.timer >/dev/null
 systemctl restart boatd
