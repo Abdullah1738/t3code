@@ -51,6 +51,7 @@ import {
 import { selectionRoutingEnabled } from "../engine/selectionSettings.ts";
 import { KanbanToolkit, type ModelInput } from "./tools.ts";
 import * as BoardReplies from "../engine/boardReplies.ts";
+import * as McpBoardReplies from "../engine/mcpBoardReplies.ts";
 import * as Activity from "../engine/activity.ts";
 import * as SavedWrite from "../engine/savedWrite.ts";
 
@@ -521,8 +522,8 @@ const handlers = {
             Activity.compactRow(card, byCard.get(card.id) ?? [], window),
           );
           const at = DateTime.formatIso(yield* DateTime.now);
-          return Activity.pageRowsInReply(rows, input.after ?? 0, limit, (cards, cursor) => ({
-            board: {
+          return McpBoardReplies.page(
+            {
               id: board.id,
               name: board.name,
               ...BoardReplies.boardReleaseSummary(board, at, releaseBoards),
@@ -530,30 +531,29 @@ const handlers = {
               legend: Activity.COMPACT_LEGEND,
               activeCards: rows.length,
               pools: read.pools.map((pool) => ({ key: pool.key, slots: pool.slots })),
-              cards,
-              page: { limit, ...cursor },
             },
-            prompts: "omitted; card_get returns a card's prompt",
-          }));
+            rows,
+            input.after ?? 0,
+            limit,
+          );
         }
         const snapshot = yield* service.replySnapshot(board.id, {
           after: input.after ?? 0,
           limit: limit + 1,
         });
-        const hasMore = snapshot.cards.length > limit;
-        const cards = snapshot.cards.slice(0, limit);
-        return {
-          board: {
-            ...BoardReplies.compactBoard(
-              { ...snapshot, cards },
-              undefined,
-              DateTime.formatIso(yield* DateTime.now),
-              releaseBoards,
-            ),
-            page: { limit, hasMore, nextAfter: hasMore ? cards.at(-1)!.number : null },
-          },
-          prompts: "omitted; card_get returns a card's prompt",
-        };
+        const { cards, threads, ...metadata } = BoardReplies.compactBoard(
+          snapshot,
+          undefined,
+          DateTime.formatIso(yield* DateTime.now),
+          releaseBoards,
+        );
+        return McpBoardReplies.page(
+          metadata,
+          cards.map(McpBoardReplies.cardRow),
+          input.after ?? 0,
+          limit,
+          threads,
+        );
       }),
     ),
   ),

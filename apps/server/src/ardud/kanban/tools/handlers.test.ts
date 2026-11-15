@@ -58,7 +58,9 @@ import * as KanbanStore from "../store/KanbanStore.ts";
 import { layer as providerRegistryLayer } from "../../../provider/testUtils/providerRegistryMock.ts";
 import { opencodeTestProvider } from "../engine/testProviders.ts";
 import * as KanbanHandlers from "./handlers.ts";
-import { boardReleaseSummary } from "../engine/boardReplies.ts";
+import { boardReleaseSummary, compactBoard } from "../engine/boardReplies.ts";
+import { COMPACT_READ_CHARS } from "../../compactRead.ts";
+import * as McpBoardReplies from "../engine/mcpBoardReplies.ts";
 import { KanbanToolkit } from "./tools.ts";
 import { ModelBody } from "../http.ts";
 
@@ -1445,14 +1447,271 @@ it.effect("nightly pages include early active cards among more than 500 settled 
     assert.isFalse(restarted.page.hasMore);
 
     const unfiltered = yield* read({ limit: 500 });
-    assert.lengthOf(unfiltered.cards, 500);
+    assert.isAbove(unfiltered.cards.length, 0);
+    assert.isBelow(unfiltered.cards.length, 500);
     assert.isTrue(unfiltered.page.hasMore);
-    const remainder = yield* read({ limit: 500, after: unfiltered.page.nextAfter });
+    const all = [...unfiltered.cards];
+    let cursor = unfiltered.page;
+    while (cursor.hasMore) {
+      const remainder = yield* read({ limit: 500, after: cursor.nextAfter });
+      all.push(...remainder.cards);
+      cursor = remainder.page;
+    }
     assert.deepStrictEqual(
-      [...unfiltered.cards, ...remainder.cards].map((row) => row.number),
+      all.map((row) => row.number),
       Array.from({ length: current.number }, (_, i) => i + 1),
     );
-    assert.isFalse(remainder.page.hasMore);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("board_get plain pages stay under 50k and cover 600 detailed cards exactly once", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const store = yield* KanbanStore.KanbanStore;
+    const board = yield* kanban.ensureBoard({
+      slug: "large-pages",
+      name: "Large pages",
+      defaultProjectId: null,
+    });
+    const seed = yield* kanban.createCard(board.id, { title: "Seed", prompt: "Details" }, owner);
+    const selection = {
+      instanceId: ProviderInstanceId.make("codex"),
+      model: "gpt-6.1-sol",
+      options: [
+        { id: "reasoningEffort", value: "xhigh" },
+        { id: "extra", value: "o".repeat(800) },
+      ],
+    };
+    const detailed = {
+      ...seed,
+      title: "Long title ".repeat(70),
+      question: "Question ".repeat(120),
+      stalled: { reason: "Stalled ".repeat(150), at: seed.createdAt, by: owner },
+      model: selection,
+      models: Array.from({ length: 3 }, (_, i) => ({ model: selection, weight: i + 1 })),
+      asks: Array.from({ length: 5 }, (_, i) => ({
+        id: `q${i + 1}`,
+        text: "Ask ".repeat(300),
+        blocking: false,
+        by: owner,
+        at: seed.createdAt,
+        seq: null,
+        closedAt: i < 3 ? seed.createdAt : null,
+      })),
+    };
+    for (let number = 1; number <= 600; number++) {
+      yield* store.putCard({
+        ...detailed,
+        id: number === 1 ? seed.id : KanbanCardId.make(`detailed-${number}`),
+        number,
+      });
+    }
+    // This is the old plain handler's complete 500-card reply, including its wrapper.
+    const snapshot = yield* kanban.replySnapshot(board.id, { after: 0, limit: 501 });
+    const before = JSON.stringify({
+      board: {
+        ...compactBoard({ ...snapshot, cards: snapshot.cards.slice(0, 500) }),
+        page: { limit: 500, hasMore: true, nextAfter: 500 },
+      },
+      prompts: "omitted; card_get returns a card's prompt",
+    }).length;
+    assert.isAbove(before, COMPACT_READ_CHARS);
+    const seen: number[] = [];
+    let after = 0;
+    let firstSize = 0;
+    for (let pages = 0; pages < 600; pages++) {
+      const reply = yield* call(ThreadId.make("reader"), "board_get", {
+        boardId: board.id,
+        limit: 500,
+        after,
+      });
+      assert.isFalse(reply.isError, reply.text);
+      const chars = JSON.stringify(reply.structured).length;
+      assert.isAtMost(chars, COMPACT_READ_CHARS);
+      assert.isAtMost(reply.text.length, COMPACT_READ_CHARS);
+      if (after === 0) firstSize = chars;
+      const page = reply.structured.board as {
+        cards: Array<ReturnType<typeof McpBoardReplies.cardRow>>;
+        page: { limit: number; hasMore: boolean; nextAfter: number | null };
+      };
+      assert.strictEqual(page.page.limit, 500);
+      assert.isAbove(page.cards.length, 0);
+      for (const row of page.cards) {
+        assert.deepStrictEqual(
+          row.asks.map((ask) => ask.id),
+          ["q4", "q5"],
+        );
+        assert.isTrue(row.asks.every((ask) => ask.closedAt === null && ask.text.length <= 513));
+        assert.isAtMost(row.question!.length, 513);
+        assert.isAtMost(row.stalled!.reason.length, 513);
+        assert.deepStrictEqual(row.model, { model: selection.model, variant: "xhigh" });
+        assert.deepStrictEqual(
+          row.models,
+          [1, 2, 3].map((weight) => ({ model: selection.model, variant: "xhigh", weight })),
+        );
+      }
+      seen.push(...page.cards.map((row) => row.number));
+      if (!page.page.hasMore) {
+        assert.isNull(page.page.nextAfter);
+        break;
+      }
+      assert.strictEqual(page.page.nextAfter, page.cards.at(-1)!.number);
+      assert.isAbove(page.page.nextAfter!, after);
+      after = page.page.nextAfter!;
+    }
+    assert.deepStrictEqual(
+      seen,
+      Array.from({ length: 600 }, (_, i) => i + 1),
+    );
+    yield* Effect.logInfo(
+      `board_get fixture: 500-card reply before=${before} chars; capped first page=${firstSize} chars`,
+    ).pipe(Effect.provideService(References.MinimumLogLevel, "Info"));
+    // The HTTP route still receives the original asks, question, stalled reason and model options.
+    const http = compactBoard({ ...snapshot, cards: [detailed] }).cards[0]!;
+    assert.lengthOf(http.asks, 5);
+    assert.strictEqual(http.question, detailed.question);
+    assert.deepStrictEqual(http.stalled, detailed.stalled);
+    assert.deepStrictEqual(http.models, detailed.models);
+    assert.deepStrictEqual(http.model, selection);
+    const mcp = McpBoardReplies.cardRow(http);
+    assert.deepStrictEqual(
+      mcp.asks.map((ask) => ask.id),
+      ["q4", "q5"],
+    );
+    assert.strictEqual(mcp.question?.length, 513);
+    assert.strictEqual(mcp.stalled?.reason.length, 513);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("board_get later pages retain their own live thread states", () => {
+  const fake = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const store = yield* KanbanStore.KanbanStore;
+    const board = yield* kanban.ensureBoard({
+      slug: "live-pages",
+      name: "Live pages",
+      defaultProjectId: null,
+    });
+    const seed = yield* kanban.createCard(board.id, { title: "Live", prompt: "Details" }, owner);
+    for (let number = 1; number <= 3; number++) {
+      const threadId = ThreadId.make(`live-${number}`);
+      fake.running.add(threadId);
+      yield* store.putCard({
+        ...seed,
+        id: number === 1 ? seed.id : KanbanCardId.make(`live-${number}`),
+        number,
+        stage: "working",
+        activeThreadId: threadId,
+      });
+    }
+    yield* store.putBoard({
+      ...board,
+      instructions: { ...board.instructions, modelRouting: "i".repeat(14_000) },
+    });
+    for (let after = 0; after < 3; after++) {
+      const reply = yield* call(ThreadId.make("reader"), "board_get", {
+        boardId: board.id,
+        limit: 1,
+        after,
+      });
+      assert.isFalse(reply.isError, reply.text);
+      assert.isAtMost(JSON.stringify(reply.structured).length, COMPACT_READ_CHARS);
+      const page = reply.structured.board as {
+        cards: Array<{ number: number }>;
+        threads: Array<{ threadId: string; running: boolean }>;
+      };
+      assert.deepStrictEqual(
+        page.cards.map((row) => row.number),
+        [after + 1],
+      );
+      assert.deepStrictEqual(
+        page.threads.map((thread) => [thread.threadId, thread.running]),
+        [[`live-${after + 1}`, true]],
+      );
+    }
+  }).pipe(Effect.provide(fake.layer));
+});
+
+it.effect("board_get fits a huge row and metadata and advances with and without since", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const store = yield* KanbanStore.KanbanStore;
+    const board = yield* kanban.ensureBoard({
+      slug: "huge-row",
+      name: "Huge row",
+      defaultProjectId: null,
+    });
+    const seed = yield* kanban.createCard(board.id, { title: "Huge", prompt: "Details" }, owner);
+    const asks = Array.from({ length: 3_000 }, (_, i) => ({
+      id: `q${i + 1}`,
+      text: "Ask ".repeat(300),
+      blocking: false,
+      by: owner,
+      at: seed.createdAt,
+      seq: null,
+      closedAt: null,
+    }));
+    yield* store.putCard({ ...seed, asks });
+    yield* store.putCard({
+      ...seed,
+      id: KanbanCardId.make("following"),
+      number: 2,
+      title: "Following",
+      asks: [{ ...asks[0]!, text: "Still open" }],
+    });
+    yield* store.putBoard({
+      ...board,
+      instructions: { ...board.instructions, modelRouting: "instructions ".repeat(20_000) },
+    });
+    for (const extra of [{}, { since: "now-24h" }]) {
+      const first = yield* call(ThreadId.make("reader"), "board_get", {
+        boardId: board.id,
+        limit: 1,
+        ...extra,
+      });
+      assert.isFalse(first.isError, first.text);
+      assert.isAtMost(JSON.stringify(first.structured).length, COMPACT_READ_CHARS);
+      assert.isAtMost(first.text.length, COMPACT_READ_CHARS);
+      const page = first.structured.board as {
+        cards: Array<{ id?: string; number: number; truncated?: boolean }>;
+        page: { hasMore: boolean; nextAfter: number | null };
+      };
+      assert.strictEqual(page.cards[0]?.number, 1);
+      assert.isTrue(page.cards[0]?.truncated);
+      if (!("since" in extra)) assert.strictEqual(page.cards[0]?.id, seed.id);
+      assert.isTrue(page.page.hasMore);
+      assert.strictEqual(page.page.nextAfter, 1);
+      const last = yield* call(ThreadId.make("reader"), "board_get", {
+        boardId: board.id,
+        limit: 1,
+        after: 1,
+        ...extra,
+      });
+      assert.isFalse(last.isError, last.text);
+      assert.isAtMost(JSON.stringify(last.structured).length, COMPACT_READ_CHARS);
+      if (!("since" in extra)) {
+        assert.include(String(first.structured.prompts), "oversized board metadata shortened");
+        assert.include(String(last.structured.prompts), "on the first page");
+      }
+      const end = last.structured.board as typeof page;
+      assert.deepStrictEqual(
+        end.cards.map((row) => row.number),
+        [2],
+      );
+      assert.isFalse(end.page.hasMore);
+      assert.isNull(end.page.nextAfter);
+      const empty = yield* call(ThreadId.make("reader"), "board_get", {
+        boardId: board.id,
+        after: 2,
+        ...extra,
+      });
+      assert.isFalse(empty.isError, empty.text);
+      assert.isAtMost(JSON.stringify(empty.structured).length, COMPACT_READ_CHARS);
+      assert.lengthOf((empty.structured.board as typeof page).cards, 0);
+    }
   }).pipe(Effect.provide(layer));
 });
 
