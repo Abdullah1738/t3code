@@ -2407,13 +2407,17 @@ const make = Effect.gen(function* () {
 
   // Admission can persist a job while another caller drains launches. Only the
   // drain needs the evaluator permit; the normal tick recovers the queued job.
-  const evaluatorAdmission = <A, E, R>(key: string, effect: Effect.Effect<A, E, R>) =>
+  const evaluatorAdmission = <A, E, R>(
+    key: string,
+    effect: Effect.Effect<A, E, R>,
+    enqueueWhenBusy = true,
+  ) =>
     serialEach(
       evaluating,
       key,
       effect,
       true,
-      effect.pipe(Effect.provideService(enqueueEvaluatorOnly, true)),
+      enqueueWhenBusy ? effect.pipe(Effect.provideService(enqueueEvaluatorOnly, true)) : undefined,
     );
 
   const changes = yield* PubSub.unbounded<BoardPublication>();
@@ -4946,8 +4950,7 @@ const make = Effect.gen(function* () {
       readonly seq?: number;
     } = {},
   ) =>
-    serial(
-      evaluating,
+    evaluatorAdmission(
       board.id,
       Effect.gen(function* () {
         const current = yield* boardOf(board.id);
@@ -5014,6 +5017,8 @@ const make = Effect.gen(function* () {
           ),
         );
       }),
+      // Packet/setup callers need the preceding launch's ownership before reuse.
+      purpose.kind === "discussion",
     );
 
   /**
