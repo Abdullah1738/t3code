@@ -68,6 +68,7 @@ if (process.env.HEALTH_DELIVERY_TEST_CHILD !== '1') {
   test('agent wakes remain unmarked; direct Telegram send counts; sink failure cannot fail delivery', async () => {
     const before=rows().filter(r=>r.name==='delivery.result').length;
     await recordHealthDelivery('nutrition-nudge', run, {ok:true,via:'wake'});
+    await recordHealthDelivery('nutrition-nudge', run, {ok:false,accepted:true,via:'thread:abcd1234'});
     await recordHealthDelivery('other', run, {ok:true,via:'telegram'});
     expect(rows().filter(r=>r.name==='delivery.result')).toHaveLength(before);
     await recordHealthDelivery('gym-nudge', 'b'.repeat(32), {ok:true,via:'telegram'});

@@ -7,6 +7,7 @@ import {
   OrchestratorMcpFailure,
   kanbanAskIsNotice,
   ProjectId,
+  ThreadId,
   type KanbanActor,
   type KanbanBoard,
   type KanbanBlock,
@@ -614,14 +615,14 @@ const handlers = {
       Effect.gen(function* () {
         const card = yield* cardFor(service, caller, input.card, input.boardId, true);
         const detail = yield* service.card(card.id);
+        const { id, number, title, stage, boardId } = detail.card;
+        const rest =
+          typeof input.events === "object" && input.events.before !== undefined
+            ? { card: { id, number, title, stage, boardId } }
+            : { card: detail.card, threads: detail.threads };
         return {
-          card: detail.card,
-          threads: detail.threads,
-          ...Activity.pageCardEvents(
-            { card: detail.card, threads: detail.threads },
-            detail.events,
-            input.events,
-          ),
+          ...rest,
+          ...Activity.pageCardEvents(rest, detail.events, input.events),
         };
       }),
     ),
@@ -1118,6 +1119,16 @@ const handlers = {
   card_create: McpToolAccess.actsAsCaller((input) =>
     withCaller((service, caller) =>
       Effect.gen(function* () {
+        if (input.forThread !== undefined) {
+          if (caller.link?.role !== "evaluator")
+            return yield* refuse("Only evaluators create cards with forThread. Nothing was saved.");
+          if (input.assignToSelf)
+            return yield* refuse("Use forThread or assignToSelf, not both. Nothing was saved.");
+          if (input.priority === KANBAN_BACKLOG || input.stage === "needs_owner")
+            return yield* refuse(
+              "forThread needs a todo card outside the backlog. Nothing was saved.",
+            );
+        }
         if (caller.link?.role === "review") {
           return yield* refuse("Review threads report findings; they don't create cards.");
         }
@@ -1153,6 +1164,13 @@ const handlers = {
           reviewChain: origin ? origin.reviewChain : (input.reviewChain ?? null),
           subtasks: input.subtasks,
         };
+        if (input.forThread !== undefined) {
+          const result = yield* service.createForThread(ThreadId.make(input.forThread), fields, {
+            boardId: board.id,
+            actor: { _tag: "evaluator", threadId: caller.threadId },
+          });
+          return { ...result, ...gatedResult(result.card, input.subtasks, board.guessedGates) };
+        }
         if (input.assignToSelf) {
           const result = yield* service.createForThread(caller.threadId, fields);
           return { ...result, ...gatedResult(result.card, input.subtasks, board.guessedGates) };

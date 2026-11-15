@@ -240,6 +240,24 @@ class UnifiedCatchupTests(unittest.TestCase):
         self.assertTrue(all(end-start <= 901 for start,end,_,_ in self.calls))
         self.assertEqual(jobs.read_state('crashes')['unified'], 10000)
 
+    def test_noisy_small_queries_do_not_jump_over_the_nominal_probe(self):
+        # The 15 Nov run took 7.636 s for 60 s, then 5.421 s for 120 s.
+        # That negative slope predicted a cheap hour, which timed out instead.
+        for second in (5.421, 7.636, 7.64):
+            with self.subTest(second=second), tempfile.TemporaryDirectory() as tmp, \
+                 patch.dict(os.environ, TOOLLOG_DIR=tmp), patch.object(self, 'logs', Path(tmp)):
+                jobs.save_state('crashes', {'unified': 6100, 'rollupDay': '1969-12-31'})
+                before = len(self.calls)
+                self.cost = lambda seconds: (7.636 if seconds <= 60 else second if seconds <= 120
+                                             else 5+12*(seconds/900)**2)
+                self.assertTrue(self.collect())
+                calls = self.calls[before:]
+                self.assertLessEqual(calls[2][1]-calls[2][0], 900)
+                self.assertTrue(all(c[3] for c in calls))
+                self.assertEqual(jobs.read_state('crashes')['unified'], 10000)
+                self.assertEqual(self.rows('crash.collect')[-1]['props']['skippedS'], 0)
+                self.assertLessEqual(self.clock, 135)
+
     def test_large_first_query_would_timeout_but_small_adaptive_chunks_finish(self):
         jobs.save_state('crashes', {'unified': 4600, 'rollupDay': '1969-12-31'})
         # A 900 s query costs 120 s; at most 450 s costs 10 s.

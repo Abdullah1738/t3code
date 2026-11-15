@@ -281,7 +281,7 @@ class Logging(Base):
         self.assertEqual(row['durationMs'], 40000)
         self.assertEqual(row['props'], {'budgetHit': True, 'openCases': 1, 'fired': 0, 'slowestPhase': 'follow', 'sourceLimits': 0, 'limitKinds': [], 'orderCoverage': {}, 'chargeCensus': {},
             **dict.fromkeys((*mc.TIMING_KEYS, *mc.charges.OWNER_TIMING_KEYS), 0), 'owner_result': 'ok', 'follow_ms': 40000, 'questions_ms': 40000,
-            'starved_by': 'questions'})
+            'starved_by': 'questions', **mc.charges.receipt_timing({})})
 
     def test_check_distinguishes_short_lock_timeout_from_work_deadline(self):
         self.case()

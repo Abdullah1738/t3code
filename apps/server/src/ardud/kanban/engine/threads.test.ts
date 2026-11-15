@@ -1969,6 +1969,16 @@ describe("coalesceTarget", () => {
     expect(coalesceTarget([candidate], "step:A")).toBeUndefined();
   });
 
+  it("coalesces an assignment without treating it as a disposable wake", () => {
+    const assignment = {
+      ...run(2, "unused"),
+      userMessageId: MessageId.make("kanban:assignment:card:id"),
+    };
+    expect(coalesceTarget([run(1, "assignment:card"), assignment], "assignment:card")).toBe(
+      assignment,
+    );
+  });
+
   it("has no target in an empty queue", () => {
     expect(coalesceTarget([], "step:A")).toBeUndefined();
   });
@@ -2313,6 +2323,19 @@ describe("queuedWakes", () => {
       ),
     ).toEqual([first, second]);
   });
+  it("withdraws only the selected card's assignment and leaves active runs alone", () => {
+    const assignment = run(2, "kanban:assignment:A:old");
+    const reminder = run(1, "kanban:wake:nudge:old");
+    const runs = [
+      assignment,
+      reminder,
+      run(3, "kanban:assignment:AB:other"),
+      run(4, "kanban:assignment:A:active", "running"),
+    ];
+    expect(queuedWakes(runs)).toEqual([reminder]);
+    expect(queuedWakes(runs, Infinity, ["assignment:A"])).toEqual([assignment]);
+  });
+
   it.each(["step:A", "plan:A", "owner:A", "owner:discussion-A", "nudge"])(
     "matches exact scope %s",
     (scope) => {
@@ -2509,6 +2532,82 @@ it.effect("recovery history chooses the most recent start instead of the latest 
         Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
         Layer.provide(Sqlite.layerMemory),
       ),
+    ),
+  );
+});
+
+it.effect("#1574 assignment queue preserves a busy run and replays once", () => {
+  const db = Sqlite.layerMemory;
+  const instanceId = ProviderInstanceId.make("codex");
+  const projectId = ProjectId.make("project:assignment");
+  const threadId = ThreadId.make("thread:assignment");
+  const adapter = {
+    instanceId,
+    driver: ProviderDriverKind.make("codex"),
+    getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
+    planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" as const }),
+    openSession: () => Effect.die("Provider execution is disabled in this test"),
+  } as ProviderAdapter.ProviderAdapterV2["Service"];
+  const registry = Layer.succeed(
+    ProviderAdapterRegistry.ProviderAdapterRegistryV2,
+    ProviderAdapterRegistry.ProviderAdapterRegistryV2.of({
+      get: () => Effect.succeed(adapter),
+      list: () => Effect.succeed([instanceId]),
+    }),
+  );
+  const receipts = CommandReceiptStore.layer.pipe(Layer.provide(db));
+  const runtime = ProviderReplayHarness.layerWithRegistry({ name: "kanban-assignment" }, registry, {
+    databaseLayer: db,
+    runEffectWorker: false,
+  });
+  const management = ThreadManagementService.layer.pipe(
+    Layer.provideMerge(Layer.mergeAll(runtime, receipts, ServerSettings.layerTest(), db)),
+  );
+  return Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("assignment:create"),
+      threadId,
+      projectId,
+      title: "Existing context",
+      modelSelection: { instanceId, model: "gpt-5.1-codex" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "system",
+      creationSource: "server",
+    });
+    yield* Effect.gen(function* () {
+      const threads = yield* KanbanThreads;
+      yield* threads.send({ threadId, text: "Current work" });
+      const before = yield* orchestrator.getThreadRecords(threadId, ["runs", "messages"]);
+      const assignment = {
+        threadId,
+        text: "New card brief",
+        coalesce: "assignment:card",
+        key: "assignment:card",
+        mode: "queue" as const,
+      };
+      const queued = yield* threads.send(assignment);
+      yield* threads.send(assignment);
+      const after = yield* orchestrator.getThreadRecords(threadId, ["runs", "messages"]);
+      expect(after.runs).toHaveLength(2);
+      expect(after.runs.find((run) => run.id === before.runs[0]!.id)).toEqual(before.runs[0]);
+      expect(after.runs.find((run) => run.id === queued)?.status).toBe("queued");
+      expect(after.messages.filter((message) => message.text === "New card brief")).toHaveLength(1);
+      yield* threads.send({ threadId, text: "Unrelated queued follow-up", mode: "queue" });
+      const followup = yield* orchestrator.getThreadRecords(threadId, ["runs", "messages"]);
+      expect(followup.runs.find((run) => run.id === queued)?.status).toBe("queued");
+      expect(queuedWakes(followup.runs)).toEqual([]);
+      expect(
+        queuedWakes(followup.runs, Infinity, ["assignment:card"]).map((run) => run.id),
+      ).toEqual([queued]);
+    }).pipe(Effect.provide(layer));
+  }).pipe(
+    Effect.provide(
+      Layer.mergeAll(management, receipts, Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
     ),
   );
 });

@@ -10,7 +10,7 @@ export type LogEntry = {
   error?: { tag: string; message?: string };
 };
 const token = /^[a-zA-Z][a-zA-Z0-9_.-]{0,79}$/;
-const idKeys = new Set(["watcher", "run", "thread", "chat", "key", "operation", "reminder", "update", "item", "helper"]);
+const idKeys = new Set(["watcher", "run", "thread", "chat", "key", "operation", "reminder", "update", "item", "helper", "meantFor"]);
 const numeric = new Set(["exitCode", "attempt", "count", "threshold", "failures", "bytes", "queuedMs", "failedSources", "totalSources", "events", "waitMs", "spanMs", "graceMs", "relays"]);
 const boolean = new Set(["deduped", "accepted", "timedOut", "notified", "batched", "urgent", "closing", "archived", "frozenContext", "batchOpen", "grace"]);
 const errnoCodes = new Set(Object.keys(constants.errno));
@@ -25,7 +25,8 @@ const values: Record<string, readonly string[]> = {
   triggerKind: ["file", "wal"],
   step: ["native", "status", "send"],
   route: ["person", "owner", "group", "creator", "other"],
-  via: ["wake", "thread", "imessage-send", "telegram", "none"],
+  via: ["wake", "thread", "imessage-send", "telegram", "none", "wake:owner-fallback", "native:pending"],
+  confirmed: ["pending", "n/a"],
 };
 let testRoot: string | undefined;
 export const logDirectory = () => {
@@ -65,6 +66,8 @@ function fields(entry: LogEntry, at: Date) {
       && /^(?:timeout|invalid|archived|error|exit:\d{1,3})$/.test(value)) props[key] = value;
     else if (entry.name === "wake.creator_fallback" && key === "durationMs" && typeof value === "number"
       && Number.isFinite(value) && value >= 0) props[key] = value;
+    else if (typeof value === "string" && (key === "via" && /^thread:[A-Za-z0-9%_-]{1,8}$/.test(value)
+      || key === "meant_for" && /^[A-Za-z0-9%_-]{1,8}$/.test(value))) props[key] = value;
     else if (numeric.has(key) && typeof value === "number" && Number.isFinite(value)) props[key] = value;
     else if (boolean.has(key) && typeof value === "boolean") props[key] = value;
     else if (typeof value === "string" && values[key]?.includes(value)) props[key] = value;
@@ -283,7 +286,11 @@ export async function rollup(selection: string | LogWindow, dir = logDirectory()
         if (row.name === "wake.sent") {
           wake.attempts++;
           if (row.ok === true) wake.sent++;
-          else if (row.ok === false) wake.failed++;
+          else if (row.ok === false && props.accepted !== true) wake.failed++;
+        } else if (row.name === "wake.confirmed") {
+          wake.sent++;
+        } else if (row.name === "wake.unconfirmed") {
+          wake.failed++;
         } else if (row.name === "wake.reply_guard") {
           wake.replyGuard.total++;
           if (props.accepted === false) wake.replyGuard.blocked++;

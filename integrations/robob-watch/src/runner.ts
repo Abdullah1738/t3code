@@ -5,7 +5,7 @@ import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   withRelayLock, watcherInstance, finalizeClosing, checking, pollingWatcher, checkEvent, PERSON_BATCH_MS, queueEvent, sealBatch, sameDestination, alert, deliver, ensureDirs, escalate, failureSources, hash, shouldEscalate, HEADSUP_GIVE_UP_MS, HEADSUP_MS, headsUpText, imessage,
-  inboundState, inQuiet, iso, listIds, loadState, loadWatcher, log, now, ROOT, RUN_OK_FILE, runCheck, saveState, type State, telegram, type TrackedWake,
+  trackConfirmation, confirmWakes, inboundState, inQuiet, iso, listIds, loadState, loadWatcher, log, now, ROOT, RUN_OK_FILE, runCheck, saveState, type State, telegram, type TrackedWake,
   heldByMaintenance, loadMaintenance, type Maintenance, shouldNotifyFailure, shouldPause, FAILURE_NOTICE_AFTER, triggerSig, type Watcher, wakeInboundId, watcherDir, SLOW_RUN_MS, TIMEOUT_BACKOFF_CAP_S,
 } from "./lib.ts";
 
@@ -71,19 +71,20 @@ async function deliverPending(watcher: Watcher, state: State): Promise<boolean> 
   const delivery = await deliver(accepted, pending.event, pending.key, state);
   for (const run of pending.healthRuns ?? [pending.healthRun]) await recordHealthDelivery(watcher.id, run, delivery);
   if (watcherInstance(watcher.id) !== instance) return false;
-  log(watcher.id, `deliver key=${pending.key} ok=${delivery.ok} via=${delivery.via} ${delivery.detail}`);
+  log(watcher.id, `deliver key=${pending.key} ok=${delivery.ok} via=${delivery.via}${delivery.meantFor ? ` meant_for=${delivery.meantFor.split(":").at(-1)!.slice(0, 8)}` : ""} confirmed=${delivery.confirmed ?? "n/a"} ${delivery.detail}`);
   const definition = loadWatcher(watcher.id);
   if (!definition) return false;
   const current = loadState(watcher.id);
   if (current.pending?.key !== pending.key) return false;
   state = current;
-  if (!delivery.ok) return false;
+  if (!delivery.ok && !delivery.accepted) return false;
   state.fires += pending.count ?? 1;
   if (state.status === "closing") state.closing_relays = (state.closing_relays ?? 0) + (pending.count ?? 1);
   toolLog({ component: "runner", kind: "event", name: "watch.fire", ok: true, ids: { watcher: watcher.id, key: wakeInboundId(pending.key) }, props: { count: state.fires, events: pending.count ?? 1, batched: pending.key.includes(":batch:"), urgent: pending.urgent === true, route: delivery.route ?? "other", waitMs: now() - Date.parse(pending.at), closing: state.status === "closing" } });
   state.last_fire_at = iso();
   state.last_delivery = delivery.via;
-  if (delivery.via === "wake") {
+  trackConfirmation(state, delivery);
+  if (delivery.via === "wake" || delivery.via === "wake:owner-fallback") {
     state.wakes = [...(state.wakes ?? []), { inbound: wakeInboundId(pending.key), key: pending.key, event: pending.event, delivered_at: now() }];
   }
   delete state.pending;
@@ -237,6 +238,9 @@ export async function tickOne(id: string): Promise<void> {
   }
   const initialPoller = pollingWatcher(initial, state);
   if (!initialPoller) return;
+  if (!held(initialPoller)) await confirmWakes(initialPoller);
+  if (!sameInstance()) return;
+  state = loadState(id);
   await headsUps(initialPoller, state);
   if (!sameInstance()) return;
   if (state.failure_paused_at) await pauseNotice(initialPoller, state);

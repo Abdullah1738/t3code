@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import {
-  retiredWatcher, pollingWatcher, heldByMaintenance, loadMaintenance, MAINTENANCE_FILE, validDepends, type Dependency, addStop, editContext, editWatcher, removeWatcher, contactKey, deliver, ensureDirs, family, iso, listIds, loadState, loadWatcher, log, normalize, relayCheck, runCheck,
+  trackConfirmation, watcherInstance, retiredWatcher, pollingWatcher, heldByMaintenance, loadMaintenance, MAINTENANCE_FILE, validDepends, type Dependency, addStop, editContext, editWatcher, removeWatcher, contactKey, deliver, ensureDirs, family, iso, listIds, loadState, loadWatcher, log, normalize, relayCheck, runCheck,
   saveState, sendNotes, type State, type Stop, stopFor, unscopedSender, validId, type Watcher, watcherDir, WATCHERS, withRelayLock, writeJson,
 } from "./lib.ts";
 
@@ -287,11 +287,18 @@ async function main(argv: string[]): Promise<void> {
     }
     case "fire-test": {
       const w = need(positionals[0]);
+      const instance = watcherInstance(w.id);
       const key = `robob-watch:${w.id}:test:${Date.now()}`;
       const result = await deliver(w, "This is a test fire of the watcher. No real event happened.", key, loadState(w.id), true);
-      log(w.id, `fire-test ok=${result.ok} via=${result.via} ${result.detail}`);
+      if (result.confirmation && loadWatcher(w.id) && watcherInstance(w.id) === instance) {
+        const state = loadState(w.id);
+        trackConfirmation(state, result);
+        state.last_delivery = result.via;
+        saveState(w.id, state);
+      }
+      log(w.id, `fire-test ok=${result.ok} via=${result.via} confirmed=${result.confirmed ?? "n/a"} ${result.detail}`);
       console.log(JSON.stringify(result, null, 2));
-      if (!result.ok) process.exitCode = 1;
+      if (!result.ok && !result.accepted) process.exitCode = 1;
       return;
     }
     case "pause":

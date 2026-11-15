@@ -986,10 +986,14 @@ export interface KanbanServiceShape {
     threadId: ThreadId,
     cardId: KanbanCard["id"],
   ) => Effect.Effect<ClaimResult, KanbanError>;
-  /** A work thread creates a card and takes it straight away. */
+  /** Creates and takes a card atomically; evaluator assignments also queue its brief. */
   readonly createForThread: (
     threadId: ThreadId,
     input: NewCard,
+    assignment?: {
+      readonly boardId: KanbanBoard["id"];
+      readonly actor: Extract<KanbanActor, { _tag: "evaluator" }>;
+    },
   ) => Effect.Effect<ClaimResult, KanbanError>;
   /** Related todo cards a work thread could take next, with why. */
   readonly nextCards: (threadId: ThreadId) => Effect.Effect<NextCards, KanbanError>;
@@ -1443,6 +1447,7 @@ type SentStopTarget =
   | { readonly runId: string; readonly messageId?: never }
   | { readonly messageId: string; readonly runId?: never };
 type BoardEffectBody =
+  | { readonly kind: "assignment"; readonly cardId: KanbanCardId; readonly threadId: string }
   | {
       readonly kind: "ownerWake";
       readonly cardId: KanbanCardId;
@@ -2099,8 +2104,10 @@ const make = Effect.gen(function* () {
   const discardWake = Effect.fn("KanbanService.discardWake")(
     function* (threadId: ThreadId, runId: string | void, wakeMessageId?: string) {
       if (runId === undefined && wakeMessageId === undefined) return;
-      const wake = queuedWakes(yield* threadIo.queuedRuns(threadId)).find((run) =>
-        runId === undefined ? run.userMessageId === wakeMessageId : run.id === runId,
+      const wake = (yield* threadIo.queuedRuns(threadId)).find(
+        (run) =>
+          run.status === "queued" &&
+          (runId === undefined ? run.userMessageId === wakeMessageId : run.id === runId),
       );
       if (wake !== undefined) yield* touching(threadId, threadIo.cancelQueued(threadId, wake.id));
     },
@@ -3507,6 +3514,7 @@ const make = Effect.gen(function* () {
     const scopes = [
       "nudge",
       `step:${cardId}`,
+      `assignment:${cardId}`,
       `plan:${cardId}`,
       `owner:${cardId}`,
       ...(discussionId === null ? [] : [`owner:${discussionId}`]),
@@ -7058,6 +7066,8 @@ const make = Effect.gen(function* () {
     switch (effect.kind) {
       case "ownerWake":
         return sendOwnerWake(effect);
+      case "assignment":
+        return sendCreatedAssignment(effect.cardId, ThreadId.make(effect.threadId), "effect");
       case "send":
         if (effect.planCardId !== undefined)
           return sendPlanChanged(effect.planCardId, ThreadId.make(effect.threadId), "effect");
@@ -14662,11 +14672,11 @@ const make = Effect.gen(function* () {
     pool: string,
     card: KanbanCard,
     how: string,
+    actor: KanbanActor = { _tag: "thread", threadId },
   ) {
     // Checked in `checkTake` before anything is written; again here, defensively.
     yield* refusePendingStop(threadId);
     const at = yield* nowIso;
-    const actor: KanbanActor = { _tag: "thread", threadId };
     const next: KanbanCard = {
       ...(yield* moveWait(card, "working", at, actor)),
       model: Rules.modelOnPool(card, pool, yield* store.pools(card.boardId)) ?? card.model,
@@ -14698,63 +14708,143 @@ const make = Effect.gen(function* () {
     } satisfies ClaimResult;
   });
 
-  const claimCard: KanbanServiceShape["claimCard"] = (threadId, cardId) => {
-    const claim = guard(
+  const claimCard: KanbanServiceShape["claimCard"] = (threadId, cardId) =>
+    guard(
       "card.claim",
       Effect.gen(function* () {
+        yield* reconcileRunFailureUnlocked(threadId);
         const thread = yield* workThreadOf(threadId);
         const card = (yield* upgradeFindings([yield* cardOf(cardId)]))[0]!;
         yield* checkTake(thread, threadId, card);
         return yield* takeCard(threadId, thread.pool, card, "Taken by its work thread");
       }),
     );
-    return reconcileRunFailure(threadId).pipe(Effect.andThen(claim));
-  };
+
+  const sendCreatedAssignment = Effect.fn("KanbanService.sendCreatedAssignment")(function* (
+    cardId: KanbanCardId,
+    threadId: ThreadId,
+    key: string,
+  ) {
+    const card = yield* cardOf(cardId);
+    if (card.stage !== "working" || card.activeThreadId !== threadId || card.activeRole !== "work")
+      return;
+    yield* refusePendingStop(threadId);
+    yield* sendThread(
+      {
+        threadId,
+        text: Briefs.claimBrief(card, yield* goalOf(card), card.wakeNote),
+        key,
+        mode: "queue",
+        coalesce: `assignment:${card.id}`,
+      },
+      undefined,
+      undefined,
+      true,
+    );
+  });
 
   // The card is checked as a draft first, so a refused take leaves nothing
   // behind for the dispatcher to start twice.
-  const createForThread: KanbanServiceShape["createForThread"] = (threadId, input) =>
-    guard(
+  const createForThread: KanbanServiceShape["createForThread"] = (threadId, input, assignment) =>
+    guardDeferred(
       "card.createForThread",
       Effect.gen(function* () {
-        yield* checkText(cardTextFields(input));
-        const thread = yield* workThreadOf(threadId);
-        // The thread's live model comes first: a switch moves the thread even after every
-        // card that carried the switch is released, and the held slot follows it.
-        const live = yield* threads.model(threadId);
-        const pools = yield* store.pools(thread.board.id);
-        const model = input.model
-          ? yield* poolModel(thread.board.id, input.model)
-          : (live ??
-            thread.carried[0]?.model ??
-            thread.link.model ??
-            pools.find((pool) => pool.key === thread.pool)?.model ??
-            thread.board.defaultCardModel);
-        // A weighted list is checked by the take: one of its models must run here.
-        if (!input.models && Rules.poolOf(pools, model) !== thread.pool) {
-          return yield* failWith(
-            "denied",
-            `this thread runs ${thread.pool}; create the card without assignToSelf to run it on ${Rules.poolOf(pools, model)}`,
-          );
-        }
-        const fields: NewCard = {
-          ...input,
-          model,
-          stage: "todo",
-          question: null,
-          projectId:
-            input.projectId ??
-            (thread.projectId === thread.board.defaultProjectId ? null : thread.projectId),
-          // Follow-up work keeps the scrutiny of the card it came from.
-          reviewChain: thread.origin ? thread.origin.reviewChain : (input.reviewChain ?? null),
-          goalId: input.goalId ?? thread.origin?.goalId ?? null,
-        };
-        const actor: KanbanActor = { _tag: "thread", threadId };
-        yield* refuseTwin(thread.board.id, fields, actor);
-        const draft = yield* draftCard(thread.board.id, fields, actor);
-        yield* checkTake(thread, threadId, draft);
+        const { thread, fields, draft, actor } = yield* Effect.gen(function* () {
+          yield* checkText(cardTextFields(input));
+          const thread = yield* workThreadOf(threadId);
+          if (assignment !== undefined) {
+            if (thread.board.id !== assignment.boardId)
+              return yield* failWith(
+                "denied",
+                "The target work thread is on another board. Nothing was saved.",
+              );
+            const view = yield* threads.find(threadId);
+            if (
+              thread.link.endedAt !== null ||
+              thread.link.paused !== null ||
+              !view ||
+              view.archived
+            )
+              return yield* failWith(
+                "denied",
+                "The target work thread is stopped, ended or missing. Nothing was saved.",
+              );
+            const latest = view.state === "idle" ? yield* threads.latestRun(threadId) : null;
+            if (latest?.status === "cancelled" || latest?.status === "interrupted")
+              return yield* failWith(
+                "denied",
+                "The target work thread was stopped. Nothing was saved.",
+              );
+            if (input.stage === "needs_owner" || input.priority === KANBAN_BACKLOG)
+              return yield* failWith(
+                "denied",
+                "forThread needs a todo card outside the backlog. Nothing was saved.",
+              );
+          }
+          // The thread's live model comes first: a switch moves the thread even after every
+          // card that carried the switch is released, and the held slot follows it.
+          const live = yield* threads.model(threadId);
+          const pools = yield* store.pools(thread.board.id);
+          const model = input.model
+            ? yield* poolModel(thread.board.id, input.model)
+            : (live ??
+              thread.carried[0]?.model ??
+              thread.link.model ??
+              pools.find((pool) => pool.key === thread.pool)?.model ??
+              thread.board.defaultCardModel);
+          // A weighted list is checked by the take: one of its models must run here.
+          if (!input.models && Rules.poolOf(pools, model) !== thread.pool) {
+            return yield* failWith(
+              "denied",
+              `this thread runs ${thread.pool}; the card runs on ${Rules.poolOf(pools, model)}. Nothing was saved.`,
+            );
+          }
+          const fields: NewCard = {
+            ...input,
+            model,
+            stage: "todo",
+            question: null,
+            projectId:
+              input.projectId ??
+              (thread.projectId === thread.board.defaultProjectId ? null : thread.projectId),
+            // Follow-up work keeps the scrutiny of the card it came from.
+            reviewChain: thread.origin ? thread.origin.reviewChain : (input.reviewChain ?? null),
+            goalId: input.goalId ?? thread.origin?.goalId ?? null,
+          };
+          const actor: KanbanActor = assignment?.actor ?? { _tag: "thread", threadId };
+          yield* refuseTwin(thread.board.id, fields, actor);
+          const draft = yield* draftCard(thread.board.id, fields, actor);
+          yield* checkTake(thread, threadId, draft);
+          return { thread, fields, draft, actor };
+        }).pipe(
+          Effect.mapError((cause) => {
+            const error = toKanbanError(cause);
+            return assignment === undefined || error.detail.endsWith("Nothing was saved.")
+              ? error
+              : new KanbanError({
+                  code: error.code,
+                  detail: `${error.detail}. Nothing was saved.`,
+                });
+          }),
+        );
         const card = yield* insertCard(draft, fields);
-        return yield* takeCard(threadId, thread.pool, card, "Created and taken by its work thread");
+        const result = yield* takeCard(
+          threadId,
+          thread.pool,
+          card,
+          assignment === undefined
+            ? "Created and taken by its work thread"
+            : `Assigned by evaluator ${assignment.actor.threadId} to work thread ${threadId}`,
+          actor,
+        );
+        if (assignment !== undefined)
+          yield* later(
+            card.boardId,
+            cardLane(result.card),
+            { kind: "assignment", cardId: card.id, threadId },
+            sendCreatedAssignment(card.id, threadId, `created:${card.id}`),
+          );
+        return result;
       }),
     );
 
@@ -18666,60 +18756,57 @@ const make = Effect.gen(function* () {
     );
   }, Effect.mapError(toKanbanError));
 
-  const reconcileRunFailure = Effect.fn("KanbanService.reconcileRunFailure")(function* (
+  // The caller owns the retry boundary: a nested guard would turn a safe
+  // conflict into a typed failure before the claim's retry loop sees it.
+  const reconcileRunFailureUnlocked = Effect.fn("KanbanService.reconcileRunFailure")(function* (
     threadId: ThreadId,
   ) {
-    yield* Deferred.await(startupReady);
-    // Discovery precedes the board operation; ownership is rechecked inside it.
+    // Discovery must not acquire a board permit; the locked read rechecks ownership.
     for (const id of yield* rawStore.threadCards(threadId)) {
       const initial = yield* rawStore.card(id);
       if (initial?.stalled?.runFailure?.threadId !== threadId) continue;
-      yield* guard(
-        "card.recoverRunFailure",
-        Effect.gen(function* () {
-          const card = yield* store.card(id);
-          const stalled = card?.stalled;
-          if (
-            card === null ||
-            stalled?.runFailure?.threadId !== threadId ||
-            stalled.by._tag !== "system" ||
-            stalled.by.component !== "dispatcher" ||
-            card.workThreadId !== threadId ||
-            card.stage !== "todo" ||
-            (card.activeThreadId !== null && card.activeThreadId !== threadId)
-          )
-            return;
-          const recovery = yield* freshThreads.laterStartedRun(threadId, stalled.runFailure.runId);
-          if (recovery === null) return;
-          const model = recovery.model ?? (yield* freshThreads.model(threadId));
-          const at = yield* nowIso;
-          const next: KanbanCard = {
-            ...card,
-            stalled: null,
-            stage: "working",
-            activeThreadId: threadId,
-            activeRole: "work",
-            activePool: Rules.poolOf(yield* store.pools(card.boardId), model ?? card.model),
-            nudgedAt: null,
-            movedAt: at,
-            updatedAt: at,
-          };
-          yield* logEvent(next, { _tag: "system", component: "dispatcher" }, "flagged", {
-            fromStage: card.stage,
-            toStage: "working",
-            body: `Cleared run-failed stall: work resumed in ${recovery.runId}`,
-          });
-          yield* saveCard(next);
-          yield* Effect.logInfo("restart-pacing.stall_auto_cleared", {
-            cardId: id,
-            threadId,
-            runId: recovery.runId,
-          });
-        }),
-        id,
-      );
+      const card = yield* store.card(id);
+      const stalled = card?.stalled;
+      if (
+        card === null ||
+        stalled?.runFailure?.threadId !== threadId ||
+        stalled.by._tag !== "system" ||
+        stalled.by.component !== "dispatcher" ||
+        card.workThreadId !== threadId ||
+        card.stage !== "todo" ||
+        (card.activeThreadId !== null && card.activeThreadId !== threadId)
+      )
+        continue;
+      const recovery = yield* freshThreads.laterStartedRun(threadId, stalled.runFailure.runId);
+      if (recovery === null) continue;
+      const model = recovery.model ?? (yield* freshThreads.model(threadId));
+      const at = yield* nowIso;
+      const next: KanbanCard = {
+        ...card,
+        stalled: null,
+        stage: "working",
+        activeThreadId: threadId,
+        activeRole: "work",
+        activePool: Rules.poolOf(yield* store.pools(card.boardId), model ?? card.model),
+        nudgedAt: null,
+        movedAt: at,
+        updatedAt: at,
+      };
+      yield* logEvent(next, { _tag: "system", component: "dispatcher" }, "flagged", {
+        fromStage: card.stage,
+        toStage: "working",
+        body: `Cleared run-failed stall: work resumed in ${recovery.runId}`,
+      });
+      yield* saveCard(next);
+      yield* Effect.logInfo("restart-pacing.stall_auto_cleared", {
+        cardId: id,
+        threadId,
+        runId: recovery.runId,
+      });
     }
   }, Effect.mapError(toKanbanError));
+  const reconcileRunFailure = (threadId: ThreadId) =>
+    guard("card.recoverRunFailure", reconcileRunFailureUnlocked(threadId));
   return KanbanService.of({
     ready: Deferred.await(startupReady),
     boards: readDb(store.boards),
