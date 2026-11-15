@@ -30,6 +30,7 @@ _NAMES = {
     'provider.track', 'provider.orders', 'provider.details', 'log.cap',
     'case.open', 'case.update', 'case.close', 'case.reopen', 'case.corroborate',
     'question.ask', 'check.run', 'cache_reset',
+    'order_watch.item_drop_check',
 }
 _ENUMS = {
     'lane': {'food', 'minutes', 'nownow', 'main', 'supermall', 'marketplace', 'careem', 'uber',
@@ -39,7 +40,7 @@ _ENUMS = {
     'outcome': {'success', 'failure', 'refused', 'ask_now', 'dont_ask', 'unverified', 'failed'},
     'kind': {'refund', 'dispute', 'decline', 'unasked_charge', 'charge', 'hold',
              'payment_deadline', 'autopay_expected', 'merchant_card'},
-    'starved_by': {'none', 'owner_threads', 'msgs', 'lookups', 'census', 'receipt',
+    'starved_by': {'none', 'owner_threads', 'msgs', 'lookups', 'census', 'receipt', 'history',
                    'reconcile', 'follow', 'attention', 'build_write', 'merchants', 'order_charges',
                    'payments', 'questions', 'refunds', 'order_screen', 'loads', 'writes', 'locks'},
     'owner_result': {'ok', 'incomplete', 'list_failed'},
@@ -50,9 +51,9 @@ _ENUMS = {
 _ENUMS['from'] = _ENUMS['to'] = _ENUMS['state']
 _BOOLS = {'prepareOnly', 'changed', 'fallback', 'budgetHit', 'unmatched', 'deadlineMoved', 'answered', 'polled'}
 _NUMBERS = {'exitCode', 'amountMinor', 'count', 'ageDays', 'openCases', 'fired', 'sourceLimits',
-            'msgs_timeouts', 'msgs_p50_ms',
+            'msgs_cpu_ms', 'msgs_concurrent_max', 'msgs_cache_hits', 'msgs_timeouts', 'msgs_p50_ms',
             'merchants_ms', 'order_charges_ms', 'payments_ms', 'questions_ms', 'refunds_ms',
-            'order_screen_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'writes_n', 'locks_ms', 'follow_ms', 'untimed_ms',
+            'order_screen_ms', 'history_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'writes_n', 'locks_ms', 'follow_ms', 'untimed_ms',
             'owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms',
             'owner_list_pages', 'owner_list_ms', 'owner_threads_selected', 'owner_threads_fresh',
             'owner_threads_needed', 'owner_threads_fetched', 'owner_fetch_ms_max', 'owner_timeouts', 'owner_cache_size'}
@@ -64,9 +65,9 @@ _MONEY_PROPS = {
     'case.close': {'kind', 'ageDays'},
     'question.ask': {'outcome'},
     'check.run': {'budgetHit', 'openCases', 'fired', 'slowestPhase', 'sourceLimits', 'limitKinds', 'orderCoverage', 'chargeCensus',
-                  'msgs_timeouts', 'msgs_p50_ms', 'msgs_by_kind', 'receipt_result',
+                  'msgs_cpu_ms', 'msgs_concurrent_max', 'msgs_cache_hits', 'msgs_timeouts', 'msgs_p50_ms', 'msgs_by_kind', 'receipt_result',
                   'merchants_ms', 'order_charges_ms', 'payments_ms', 'questions_ms', 'refunds_ms',
-                  'order_screen_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'writes_n', 'locks_ms', 'follow_ms', 'untimed_ms',
+                  'order_screen_ms', 'history_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'writes_n', 'locks_ms', 'follow_ms', 'untimed_ms',
                   'owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms', 'starved_by',
                   'owner_list_pages', 'owner_list_ms', 'owner_threads_selected', 'owner_threads_fresh',
                   'owner_threads_needed', 'owner_threads_fetched', 'owner_fetch_ms_max', 'owner_timeouts', 'owner_cache_size', 'owner_result'},
@@ -433,12 +434,14 @@ def _phases(scope, start, end):
 def _fields(props):
     result = {}
     for key, value in (props or {}).items():
-        if key in _ENUMS and type(value) is str and value in _ENUMS[key]:
+        if key == 'app' and type(value) is str:
+            result[key] = value if value in _ENUMS['merchant'] else 'other'
+        elif key in _ENUMS and type(value) is str and value in _ENUMS[key]:
             result[key] = value
         elif key in _BOOLS and type(value) is bool:
             result[key] = value
         elif key in _NUMBERS and type(value) is int and abs(value) <= 10**12 \
-                and (not (key.endswith('_ms') or key == 'writes_n' or key.startswith('owner_')) or value >= 0):
+                and (not (key.endswith('_ms') or key.startswith('msgs_') or key == 'writes_n' or key.startswith('owner_')) or value >= 0):
             result[key] = value
         elif key == 'limitKinds' and isinstance(value, list):
             result[key] = sorted({v for v in value if isinstance(v, str) and v in {
@@ -449,7 +452,7 @@ def _fields(props):
         elif key == 'msgs_by_kind' and isinstance(value, dict):
             result[key] = {kind: {k: v for k, v in bucket.items() if k in {'count', 'ms'}
                                   and type(v) is int and 0 <= v <= 10**9}
-                           for kind, bucket in value.items() if kind in {'receipt', 'order', 'other'}
+                           for kind, bucket in value.items() if kind in {'receipt', 'order', 'refund', 'history', 'other'}
                            and isinstance(bucket, dict)}
         elif key == 'chargeCensus' and isinstance(value, dict):
             result[key] = {app: {k: v for k, v in counts.items()
@@ -494,6 +497,15 @@ def _fields(props):
         elif key == 'last_success_at' and (value is None or (type(value) is str and re.fullmatch(
                 r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})', value))):
             result[key] = value
+        elif key in {'baseline_count', 'row_count', 'absent_count', 'emitted_count'} and type(value) is int and 0 <= value <= 10**9:
+            result[key] = value
+        elif key == 'complete' and type(value) is bool:
+            result[key] = value
+        elif key == 'matched_by' and isinstance(value, dict):
+            result[key] = {k: v for k, v in value.items() if k in {'item_id', 'item_code', 'sku', 'sku_config', 'name'}
+                           and type(v) is int and 0 <= v <= 10**9}
+        elif key == 'suppressed_reason' and value in (None, 'no_overlap'):
+            result[key] = value
     return result
 
 
@@ -501,7 +513,7 @@ def _ids(values):
     # Hash even syntactically valid IDs: input IDs can themselves contain a PAN/OTP.
     return {key: hashlib.sha256(str(value).encode()).hexdigest()[:16]
             for key, value in (values or {}).items()
-            if key in {'flowId', 'orderId', 'caseId'} and type(value) in (str, int) and value != ''}
+            if key in {'flowId', 'orderId', 'caseId', 'watcher'} and type(value) in (str, int) and value != ''}
 
 
 def _noon_lane(order):
