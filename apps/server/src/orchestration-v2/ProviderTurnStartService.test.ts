@@ -7,6 +7,8 @@ import { it as effectIt } from "@effect/vitest";
 import {
   KanbanBoardId,
   KanbanCardId,
+  KanbanDiscussionId,
+  type KanbanDiscussion,
   type ServerSettingsError,
   ContextHandoffId,
   CheckpointScopeId,
@@ -50,6 +52,7 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "../config.ts";
+import * as Sqlite from "../persistence/Sqlite.ts";
 import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
 import * as GitWorkflow from "../git/GitWorkflowService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
@@ -2857,6 +2860,102 @@ effectIt.effect.each(
       if (refused)
         expect(harness.projection().contextHandoffs.at(-1)?.delivery?.status).not.toBe("pending");
     }),
+);
+
+effectIt.effect.each(["keyed", "legacy", "answered by another evaluator", "still owed"] as const)(
+  "#1569 rechecks an owner reply wake before provider execution (%s)",
+  (kind) =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({
+        text: "The owner is waiting for your reply in discussion disc-1569. Post it with discussion_post.",
+        nativeDelivery: kind === "still owed",
+      });
+      const initial = harness.projection();
+      const messageId = MessageId.make(
+        kind === "keyed"
+          ? "kanban:wake:owner:card-1569:owner-reply:disc-1569:thread:action"
+          : "kanban:wake:owner:card-1569:old-uuid",
+      );
+      harness.setProjection({
+        ...initial,
+        runs: initial.runs.map((run) => ({ ...run, userMessageId: messageId })),
+        messages: initial.messages.map((message) => ({ ...message, id: messageId })),
+      });
+      const store = yield* KanbanStore.KanbanStore;
+      const evaluator = initial.runs[0]!.threadId;
+      const talk: KanbanDiscussion = {
+        id: KanbanDiscussionId.make("disc-1569"),
+        boardId: KanbanBoardId.make("robob"),
+        cardId: null,
+        title: "Owner reply",
+        evaluatorThreadId: evaluator,
+        participants: [
+          {
+            actor: { _tag: "evaluator", threadId: evaluator },
+            name: "Evaluator",
+            lastReadSeq: 1,
+            typingUntil: null,
+            owes: "asked",
+          },
+        ],
+        lastSeq: 1,
+        lastMessageAt: null,
+        createdBy: { _tag: "owner" },
+        createdAt: "2026-11-15T00:00:00Z",
+        archivedAt: null,
+        titleEditedAt: null,
+        settledAt: null,
+        snoozedUntil: null,
+        pinnedAt: null,
+        reopenedAt: null,
+      };
+      yield* store.putDiscussion(talk);
+      yield* store.putMessage({
+        discussionId: talk.id,
+        seq: 1,
+        author: { _tag: "owner" },
+        authorName: "Owner",
+        blocks: [{ _tag: "md", text: "Please reply" }],
+        answers: [],
+        createdAt: talk.createdAt,
+      });
+      // The reminder is already queued above; the reply lands before its provider start.
+      if (kind !== "still owed") {
+        yield* store.putMessage({
+          discussionId: talk.id,
+          seq: 2,
+          author: {
+            _tag: "evaluator",
+            threadId:
+              kind === "answered by another evaluator"
+                ? ThreadId.make("other-evaluator")
+                : evaluator,
+          },
+          authorName: "Evaluator",
+          blocks: [{ _tag: "md", text: "Answered" }],
+          answers: [],
+          createdAt: "2026-11-15T00:01:00Z",
+        });
+        yield* store.putDiscussion({
+          ...talk,
+          lastSeq: 2,
+          participants: talk.participants.map((p) => ({
+            ...p,
+            owes: kind === "answered by another evaluator" ? "asked" : null,
+          })),
+        });
+      }
+      yield* harness.start;
+      if (kind === "still owed") {
+        expect(harness.startRootRun).toHaveBeenCalledTimes(1);
+        expect(harness.open).toHaveBeenCalledTimes(1);
+        return;
+      }
+      expect(harness.startRootRun).not.toHaveBeenCalled();
+      expect(harness.open).not.toHaveBeenCalled();
+      expect(harness.projection().runs.at(-1)?.status).toBe("completed");
+      expect(harness.finishUsageBeforeStart).toHaveBeenCalledTimes(1);
+    }).pipe(Effect.provide(KanbanStore.layer.pipe(Layer.provide(Sqlite.layerMemory)))),
 );
 
 effectIt.effect("records usage when provider setup fails before run execution starts", () =>
