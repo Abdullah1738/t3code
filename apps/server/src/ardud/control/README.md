@@ -124,8 +124,8 @@ previous page with the same filters). The window is at most 72 hours; `until`
 defaults to the time of the first request and stays fixed across its pages.
 `limit` defaults to 1,000 and is capped at 5,000. Returns
 `{ ok: true, items: [...], nextCursor: string | null }`;
-`null` means there are no more pages. `client.usage({ since, until, boardId, limit, cursor })`
-fetches one page.
+`null` means there are no more pages. `client.usage({ since, until, boardId, limit, cursor }, { timeoutMs })`
+fetches one page with an optional request deadline (default 30 seconds).
 
 Items contain `threadId`, `rootThreadId`, `parentThreadId`, `boardId`, `cardId`,
 `workspace`, `providerInstanceId`, `driver`, `model`, `effort`, `startedAt`,
@@ -142,9 +142,13 @@ Pages are live reads, not a snapshot. A running turn may complete or move in the
 ordering while paging; consumers should periodically re-read overlapping windows
 and must not treat a partially paged result as a complete accounting snapshot.
 
-`t3ctl usage --since ISO|MS [--until ISO|MS] [--board ID] [--limit N] [--all-pages]`
+`t3ctl usage --since ISO|MS [--until ISO|MS] [--board ID] [--limit N] [--all-pages] [--cursor CURSOR] [--timeout-ms MS]`
 prints one JSON page by default. `--all-pages` follows every cursor and prints one
-JSON object with all `items` and `nextCursor: null`.
+JSON object with all `items` and `nextCursor: null`, using 1,000 rows per page unless
+`--limit` is given. `--timeout-ms` overrides the per-page deadline, including
+`--request-timeout`. On failure, stderr names the page, cursor and number of items
+read; stdout remains empty. Resume with `--cursor` and the same window and board
+filters. A resumed result contains only the remaining rows.
 
 ### GET /threads
 
