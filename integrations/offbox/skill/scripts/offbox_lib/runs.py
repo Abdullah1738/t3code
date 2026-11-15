@@ -3025,9 +3025,14 @@ def _background(a, me: dict) -> int:
         if interrupted:
             os.kill(os.getpid(), signal.SIGINT)
     print(rn.run_id, flush=True)
-    say(f"queued in background. Follow: offbox logs {rn.run_id} --follow ; wait: offbox wait {rn.run_id}; "
-        f"client log: {client_log}")
+    background_wait_hint(rn.run_id)
+    say(f"queued in background; client log: {client_log}")
     return 0
+
+
+def background_wait_hint(run_id: str) -> None:
+    say(f"Hand off `offbox wait {run_id}` using the remote-compute skill’s Waiting for a run route, "
+        "then end your turn; completion wakes you.")
 
 
 def background_queue(run_id: str, payload: dict) -> int:
@@ -3291,13 +3296,15 @@ def _run_remote(a, rn) -> int:
                                'start receipt recovered')
             finish(rn.run_id, rn.recovered_code)
             print(rn.run_id)
+            background_wait_hint(rn.run_id)
             return 0
         if a.bg:
             # Nobody stays attached to refresh the deadline: give the box a long one. The reaper stops it
             # IDLE_STOP_S after the process ends (it checks process status itself).
             lease.ensure_ttl(rn.box, BG_TTL_S, api.get(rn.box))
             print(rn.run_id)
-            say(f"started in background on {rn.box}. Follow: offbox logs {rn.run_id} --follow ; wait: offbox wait {rn.run_id}")
+            background_wait_hint(rn.run_id)
+            say(f"started in background on {rn.box}")
             return 0
         code = None
         try:

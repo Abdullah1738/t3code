@@ -454,7 +454,7 @@ def _main(argv: list[str] | None = None) -> int:
         if a.sub == "logs":
             return misc.logs(a.run_id, a.follow)
         if a.sub == "wait":
-            return misc.wait(a.run_id, a.timeout)
+            return misc.wait(a.run_id, a.timeout, summary=True)
         if a.sub == "local":
             misc.local_exempt(me, a.reason, a.ttl, a.list, a.clear)
         elif a.sub == "list":
