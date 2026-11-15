@@ -88,7 +88,9 @@ slices, `sleep` plus a log tail, queue-position checks. Wait like this instead.
   - **Codex threads** (board workers, reviewers, subagents): delegate a watcher and end your turn. Call
     `delegate_task` in async mode with target `providerInstanceId: "claudeAgent"`, `model: "claude-sonnet-5-5"`,
     `options: {effort: "medium"}` and the brief below. Its reply wakes you and is the run's result. While it runs,
-    do not sleep, do not call `task_status`, do not read the run's log.
+    do not sleep, do not call `task_status`, do not read the run's log. Medium is the owner's choice for watchers:
+    the delegation note "Standard mode only ... effort max" only rules out fast mode, it does not ask for max
+    here. These ids are current, so skip `orchestrator_capabilities` unless the call is rejected.
   - **Claude Code threads:** run `offbox wait <run-id> --timeout 1500` yourself as a background command and end
     your turn; you are re-invoked when it exits.
   - **Delegation is not available:** start `offbox wait <run-id> --timeout 1500` and check it at most once every
