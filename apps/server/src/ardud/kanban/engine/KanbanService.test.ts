@@ -1961,25 +1961,8 @@ it.effect.each(["missing-join", "missing-blocker", "failed-compact"] as const)(
           yield* store.putCard({
             ...sibling,
             workThreadId: work,
-            // A completed merge still blocks a fresh thread, but not its own reused thread.
-            ...(exit === "missing-blocker"
-              ? {
-                  stage: "completed" as const,
-                  subtasks: [
-                    {
-                      id: "s1",
-                      step: 1,
-                      text: "Merge the PR",
-                      owner: "evaluator" as const,
-                      state: "open" as const,
-                      createdAt: before.movedAt,
-                      note: null,
-                      doneBy: null,
-                      doneAt: null,
-                    },
-                  ],
-                }
-              : {}),
+            // Keep the blocker out of the todo queue so this card reaches the missing-thread recheck.
+            ...(exit === "missing-blocker" ? { stage: "working" as const } : {}),
             ...(exit === "missing-join"
               ? {
                   stage: "working" as const,
@@ -10377,6 +10360,39 @@ it.effect("card_thread reset clears a flagged card's dead thread", () =>
       const fresh = (yield* kanban.card(created.id)).card;
       assert.strictEqual(fresh.stage, "working");
       assert.notStrictEqual(fresh.activeThreadId, thread);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a worker cannot claim its blocked card during review, but can after deployment", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const blocker = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(blocker.id)).card.workThreadId!;
+      assert.strictEqual((yield* kanban.card(blocker.id)).card.stage, "working");
+      const waiting = yield* kanban.createCard(
+        board.id,
+        { prompt: "B", title: "B", blockedBy: [blocker.id] },
+        owner,
+      );
+      yield* kanban.moveCard(blocker.id, "needs_review", "cardThread", {
+        _tag: "thread",
+        threadId: thread,
+      });
+      const refused = yield* kanban.claimCard(thread, waiting.id).pipe(Effect.flip);
+      assert.strictEqual(refused.code, "denied");
+      assert.include(refused.detail, `waits on #${blocker.number} (needs_review)`);
+      const unclaimed = (yield* kanban.card(waiting.id)).card;
+      assert.strictEqual(unclaimed.stage, "todo");
+      assert.isNull(unclaimed.workThreadId);
+      yield* kanban.moveCard(blocker.id, "deployed", "owner", owner);
+      const claimed = yield* kanban.claimCard(thread, waiting.id);
+      assert.strictEqual(claimed.card.stage, "working");
+      assert.strictEqual(claimed.card.workThreadId, thread);
+      assert.strictEqual(claimed.card.activeThreadId, thread);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );

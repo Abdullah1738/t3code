@@ -1398,6 +1398,66 @@ describe("thread batching", () => {
     expect(checkClaim(board, card({ priority: KANBAN_BACKLOG }), ctx).ok).toBe(false);
   });
 
+  it("refuses a claim when its own thread's blocker is awaiting review, naming the stage", () => {
+    const blocker = card({ stage: "needs_review", workThreadId: t1 });
+    const waiting = card({ blockedBy: [blocker.id] });
+    expect(
+      checkClaim(board, waiting, {
+        threadId: t1,
+        pool: poolKey(opus),
+        projectId: null,
+        byId: new Map([[blocker.id, blocker]]),
+        carrying: 0,
+        slots: 1,
+      }),
+    ).toEqual({
+      ok: false,
+      reason: `card #${waiting.number} waits on #${blocker.number} (needs_review)`,
+    });
+  });
+
+  it("doesn't offer a blocked card to its blocker's work thread during review", () => {
+    const seed = card({ stage: "needs_review", workThreadId: t1 });
+    const waiting = card({ blockedBy: [seed.id] });
+    expect(
+      relatedCandidates({
+        board,
+        cards: [seed, waiting],
+        groups: [],
+        seeds: [seed],
+        threadId: t1,
+        pool: poolKey(opus),
+        projectId: null,
+        carrying: 0,
+        slots: 1,
+      }),
+    ).toEqual([]);
+  });
+
+  it("doesn't dispatch a todo card while its same-thread blocker is in review", () => {
+    const blocker = card({ stage: "in_review", workThreadId: t1 });
+    const waiting = card({ workThreadId: t1, blockedBy: [blocker.id] });
+    expect(planDispatch(board, [blocker, waiting], pools([[opus, 1]]))).toEqual([]);
+  });
+
+  it("rejects a planned claim if its same-thread blocker enters review before dispatch", () => {
+    const blocker = working();
+    const waiting = card({ workThreadId: t1, blockedBy: [blocker.id] });
+    const available = pools([[opus, 1]]);
+    const [dispatch] = planDispatch(board, [blocker, waiting], available);
+    expect(dispatch).toMatchObject({ cardId: waiting.id, joins: true });
+    expect(
+      confirmDispatch(
+        board,
+        waiting,
+        [{ ...blocker, stage: "needs_review" }, waiting],
+        available,
+        new Map(),
+        dispatch!,
+      ),
+    ).toBe(false);
+  });
+
   it("starts a card fresh when its old thread is busy in another pool", () => {
     const elsewhere = working({ model: haiku, activePool: poolKey(haiku) });
     const back = card({ workThreadId: t1 });
