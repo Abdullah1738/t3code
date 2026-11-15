@@ -31,11 +31,17 @@ class RetryTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        lock = ph.phonelock
+        for name, value in [('LOCK_DIR', Path(self.tmp.name)/'locks'),
+                            ('HOLD', Path(self.tmp.name)/'locks/priority-hold'),
+                            ('LEASE', Path(self.tmp.name)/'locks/lease.json')]:
+            p = patch.object(lock, name, value)
+            p.start(); self.addCleanup(p.stop)
         self.device = Mock()
         self.device.dump_hierarchy.return_value = TREE
         self.calls = []
         for name, value in [("STATE", Path(self.tmp.name)), ("d", Mock(return_value=self.device)),
-                            ("_run", self.adb), ("_d", None)]:
+                            ("_run", self.adb), ("_d", None), ("caller_chain", lambda: [])]:
             p = patch.object(ph, name, value)
             p.start()
             self.addCleanup(p.stop)
@@ -64,7 +70,7 @@ class RetryTests(unittest.TestCase):
 
     def events(self):
         p = ph.STATE / "events.jsonl"
-        return [json.loads(line) for line in p.read_text().splitlines()] if p.exists() else []
+        return [row for line in p.read_text().splitlines() if (row := json.loads(line))["event"] not in ("action", "unleased_action")] if p.exists() else []
 
     def test_read_phase_drop_retries_once_with_evidence_before_reset(self):
         self.device.dump_hierarchy.side_effect = [RemoteDisconnected("lost reply"), TREE]
@@ -411,7 +417,7 @@ class RetryTests(unittest.TestCase):
         self.assertIn("by event: external_drop=1, reconnect=2", out)
         self.assertIn("by source: ph=2, torssh=1", out)
         self.assertNotIn("failed", out)
-        self.assertEqual(len(out.splitlines()), 4)
+        self.assertEqual(len(out.splitlines()), 6)
         ph.d.assert_not_called()
 
     real_run = staticmethod(ph._run)

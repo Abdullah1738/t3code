@@ -158,12 +158,13 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
 - Source of a new lease: `--base N` > the repo's default saved base > the repo's template > `generic`. If boat has
   deleted a template's data, the run builds its box from the template's recipe instead (a few minutes; `offbox:`
   says so) and the reaper rebuilds the template. An expired default base falls back to the template.
-  Templates: `crpko-go` (Go 1.26 + FDB client + warm module cache, large), `crpko-node` (nvm Node 20, 22 (>=22.13) + 24, warm npm cache,
+  All templates and the home base include JDK 21 (with javac). Templates: `crpko-go` (Go 1.26 + FDB client + warm module cache, large), `crpko-node` (nvm Node 20, 22 (>=22.13) + 24, warm npm cache,
   large), `crpko-harness` (large, harness Docker images pre-pulled when the registry allows; rate-limited pulls retry, and
   a failed pre-pull doesn't stop the box, the images are then pulled on first use), `generic` (default).
   Auto-pick: crpko-devops → crpko-go; repo key containing `harness` or go.mod with testcontainers → crpko-harness; other
   go.mod → crpko-go; package.json → crpko-node; otherwise generic. A root compose file alone doesn't pick a template.
   Each run prints the template it picked and why; `--template` overrides it.
+- Java commands, Java project markers and harness runs select JDK 21 in the command session, repairing missing compilers once with a bounded apt install; a failed repair warns and lets the command run.
 - On each box, crpko-devops runs check Vector 0.50.0, `/usr/bin/ruby`, GitHub CLI (`gh`), AWS CLI v2, GNU time (`/usr/bin/time`), the Terraform version pinned in the checkout's `terraform-dev.yml` and a local Terraform provider mirror pre-filled from the repo's lock files and unpinned fixtures (`TERRAFORM_PROVIDER_MIRROR`). Missing or wrong versions are installed on the first run there (a few minutes); ready boxes only run a fast check. Binaries are installed on the runner PATH under `/usr/local/bin` (Ruby and gh are installed by apt under `/usr/bin`). It has no package-lock.json, so run tests directly or use `npm install`, not `npm ci`.
 - LocalStack calls must still point `aws` at its endpoint (`--endpoint-url` or `AWS_ENDPOINT_URL`). Box runs get no AWS credentials unless forwarded with `--env`.
 - Type-check runs (tsc, tsc-rs, `vp run typecheck`) in JS/TS repos get xlarge by default; large boxes run out of memory on the Robob server typecheck.
@@ -306,13 +307,13 @@ commands, same box model, no hourly price, no start limits, no spend cap). Boat 
   checks; nothing to switch by hand. `offbox status` shows which one is in use.
 - Marked up but not answering when your run starts (or while its box is being fetched): the run moves to Boat
   before it is sent, with one line (`... this run goes to Boat instead`). **Once the server accepted a run it
-  never moves**, so nothing runs twice.
+  never moves**, so nothing runs twice. A server that says it is starting is waited for (up to 600 s) instead of failing over.
 - A run naming `--base` saved only on home waits for home (exit **93** when the wait expires) and never runs on Boat's template.
 - The server restarts under an accepted run (power cut, reboot, boatd restart): the client reconnects for up to
   15 minutes and carries on from where the output stopped. If the machine itself restarted, the server runs the
   command **again from the start, once**, and you get one line saying so (`... running it again from the start
   (attempt 2)`). Runs the server had queued start after it. `--no-retry` turns the second run off; the run then
-  ends with **94**.
+  ends with **94**. An Incus restart or exec-stream drop on home counts as a server restart: a command still running is re-attached; otherwise it is retried once, or ends 94 with `--no-retry`, with the message saying whether processes remain on the box.
 - Each backend has its own boxes, saved states and templates. `offbox bases` lists both backends; expired bases
   are hidden unless `--all`. An unpinned run naming a base that exists only on Boat uses Boat and says so.
   `offbox list` shows the selected backend; `logs`, `wait`, `kill`, `release`, `ssh` find the right one from the
@@ -356,7 +357,7 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
 
 ## Fallback and exit codes
 
-- Remote command's own exit code is returned as is, and offbox's last stderr line is `offbox: remote exit N`.
+- Remote command's own exit code is returned as is, except disk exhaustion returns **90**; the original command exit remains in the run record. Offbox's last stderr line reports the command's own exit.
   Command strings automatically use bash pipefail, so a failed check piped through `tee` or `tail` returns nonzero.
   A simple single-line pipeline such as `yes | head -1` succeeds when only non-last stages exit with SIGPIPE (141);
   compound scripts and uncertain shell syntax keep strict pipefail so skipped checks cannot look successful.
@@ -379,8 +380,8 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
   runs held the pool's lock that long). Nothing ran, not an infra failure: just retry. A slow box resume or create no longer holds up other runs of the same repo.
 - **93** = person work (`offbox-person`) while the home server is down. Nothing ran and nothing went to Boat. It
   is not a failure of the command: the task waits for the server. Don't retry in a loop and don't route around it.
-- **94** = the home server restarted under the run and it was not run again (`--no-retry`, person work, or it
-  had already been retried once). The command ran partly: check what it did before running it again.
+- **94** = the home command was interrupted by a server/Incus restart or exec-stream loss and was not run again (`--no-retry`, person work, or it
+  had already been retried once). The command ran partly: check what it did before running it again; the message reports clean, stopped leftovers, or unknown cleanup.
 - **96** = local state DB failure. Before start: 'nothing ran, safe to retry'. After start: the message names the run and tells you to use `offbox wait <run>`; do not rerun the command. No automatic local fallback. A local bookkeeping failure after a known remote exit warns and returns that remote exit code.
 - **100** from `offbox wait` / `offbox logs` = the client ended before it got a box. The run never started; nothing ran, safe to rerun.
 - **124** from `offbox wait --timeout` = you stopped waiting; the run is still going. Wait again.
@@ -413,6 +414,14 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
   for a dead client's unrecorded start. Claims remain for the box's lifetime.
 
 - Three ordinary infra failures within an hour send one Telegram; start-limit alerts use the six-hour cooldown.
+
+## Disk space
+
+Offbox records /tmp, /var/tmp and workspace filesystem space before and after each run. Below 1 GiB free in /tmp it warns; below 256 MiB it refuses the command with **90**. On home boxes, an idle box first attempts safe cleanup of stale user-owned temp files. Critically full boxes with concurrent runs are refused without cleanup. The pool picker does not automatically move the run to another box.
+
+After a nonzero exit, ENOSPC output or less than 64 MiB free on a measured filesystem marks the result `infra_failure: "enospc"` and returns **90** from run/wait/logs. The command's original exit and the start/end measurements stay in the state record and analytics. These test results are invalid; rerun after space is available. Successful commands retain exit 0.
+
+The home reaper runs only below 50% temp space free. It preserves live-held files, recent trees, foreign-owned entries, sockets and every /tmp/offbox-run tree. Every removal is logged. Raising the tmpfs cap is a separate capacity change.
 
 ## Logs
 

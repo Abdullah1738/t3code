@@ -19,6 +19,7 @@ const worker: KanbanActor = { _tag: "thread", threadId: ThreadId.make("thread-1"
 const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("evaluator-1") };
 const AT = "2026-11-10T10:00:00.000Z";
 const LATER = "2026-11-10T11:00:00.000Z";
+const decodeStoredAsk = Schema.decodeSync(KanbanOwnerAsk);
 
 /** The ask as it is stored: what addAsk gives, plus the typed fields. */
 const ask = (fields: Asks.AskFieldsInput = {}, text = "Ship it?"): KanbanOwnerAsk => {
@@ -769,3 +770,279 @@ it.each([
   assert.notInclude(wake, "draft is approved");
   assert.notInclude(wake, "Post exactly");
 });
+
+describe("subtask approval options", () => {
+  const s4 = {
+    id: "s4",
+    step: 4,
+    owner: "evaluator" as const,
+    state: "open" as const,
+    text: "After his yes, move main; install any new dependency in live node_modules first.",
+    note: null,
+    doneBy: null,
+    doneAt: null,
+  };
+  const target = { number: 18, subtasks: [s4] };
+  const fields: Asks.AskFieldsInput = {
+    kind: "change",
+    title: "#18 go-live: Dia bridge stops before acting on a tab someone else navigated",
+    change: { label: "Tool wording", before: "Old", after: "New" },
+    options: [{ label: "Approve", recommended: true }, "Change", "Drop"],
+  };
+  const question =
+    "Put the outside-navigation guard live in the Dia bridge (move main to the reviewed branch), with the tool wording below?";
+  const diaAsk = () => ask(fields, question);
+
+  it("normalizes and stores approves through creation, revision and schema round-trip", () => {
+    const input = { options: [{ label: "Approve", approves: [" s4 "] }, "Change", "Drop"] };
+    const created = Asks.askFields(input, { blocking: false, card: target });
+    if (Asks.isAskProblem(created)) throw new Error(created.detail);
+    assert.deepStrictEqual(created.options?.[0]?.approves, ["s4"]);
+    const revised = Asks.reviseAsk(diaAsk(), input, LATER, target);
+    if (Asks.isAskProblem(revised)) throw new Error(revised.detail);
+    assert.deepStrictEqual(decodeStoredAsk(revised).options?.[0]?.approves, ["s4"]);
+    const kept = Asks.reviseAsk(revised, { context: "More detail" }, LATER, target);
+    if (Asks.isAskProblem(kept)) throw new Error(kept.detail);
+    assert.deepStrictEqual(kept.options?.[0]?.approves, ["s4"]);
+  });
+
+  it.each([
+    {
+      label: "Approve",
+      approves: ["s99"],
+      reason: "option o1 approves s99, which isn't a subtask on card #18",
+    },
+    { label: "Drop it", approves: ["s4"], reason: "hold or no option" },
+    { label: "Wait for #73, then run install.zsh", approves: ["s4"], reason: "hold or no option" },
+    ...[
+      "Yes, let's hold the deployment",
+      "Yes, let’s hold the deployment",
+      "Yes, put the deployment on hold",
+      "Yes! Hold the deployment",
+      "Yes, let's cancel the purchase",
+      "We should keep the purchase on hold",
+    ].map((label) => ({ label, approves: ["s4"], reason: "hold or no option" })),
+    ...[
+      "Yes, do not approve s4",
+      "Yes, don't approve s4",
+      "Yes, don’t approve s4",
+      "Approve s1, not s4",
+      "Approve s1 but not s4",
+      "Approve s1 except s4",
+      "Approve s1 without s4",
+      "Yes, no approval for s4",
+      "Yes, never approve s4",
+      "Yes, we won't approve s4",
+      "Yes, we can’t approve s4",
+      "Yes, we cannot approve s4",
+      "Approve s4 after the review",
+      "Approve s4 before the review",
+      "Approve s4 if reviewed",
+      "Approve s4 unless review fails",
+      "Approve s4 once reviewed",
+      "Approve s4 when reviewed",
+      "Approve s4 pending review",
+      "Approve s4, first review",
+      "Approve s4, then review",
+      "Approve s4 later",
+      "Approve s4 tomorrow",
+      "Approve s4 next week",
+      "Approve s4 next month",
+      "Approve s1; reject s4",
+      "Approve s1; hold s4",
+      "Approve s1; wait for s4",
+      "Approve s1, cancel s4",
+      "Approve s1, skip s4",
+      "Approve s1; decline s4",
+      "Yes, approve s4 only if needed",
+      "Approve s4 after review",
+      ...["refuse", "deny", "defer", "postpone", "delay", "pause", "suspend", "abort"].map(
+        (verb) => `Yes, we ${verb} approval for s4`,
+      ),
+    ].map((label) => ({ label, approves: ["s4"], reason: "hold or no option" })),
+    { label: "Approve", approves: [" "], reason: "non-empty subtask ids" },
+  ])("refuses $label / $approves on create and revise", ({ label, approves, reason }) => {
+    const input = { options: [{ label, approves }, "Change"] };
+    assert.include(
+      problem(Asks.askFields(input, { blocking: false, card: target })).detail,
+      reason,
+    );
+    assert.include(problem(Asks.reviseAsk(diaAsk(), input, LATER, target)).detail, reason);
+  });
+
+  it.each(["Deploy the on-hold build", "Purchase the hold service"])(
+    "keeps explicit approval for the exact action target: %s",
+    (label) => {
+      const exact = { ...target, subtasks: [{ ...s4, text: label }] };
+      const input = { options: [{ label, approves: ["s4"] }, "Wait"] };
+      const created = Asks.askFields(input, { blocking: false, card: exact });
+      if (Asks.isAskProblem(created)) throw new Error(created.detail);
+      assert.deepStrictEqual(created.options?.[0]?.approves, ["s4"]);
+      const revised = Asks.reviseAsk(diaAsk(), input, LATER, exact);
+      if (Asks.isAskProblem(revised)) throw new Error(revised.detail);
+      assert.deepStrictEqual(revised.options?.[0]?.approves, ["s4"]);
+    },
+  );
+
+  it("warns on the Dia #18 shape, including after revision", () => {
+    const expected =
+      "This ask won't approve s4 (deploy steps) when he picks a go option: name the id in the question or set approves: [s4] on the go option.";
+    assert.strictEqual(Asks.approvalWarning(target, diaAsk()), expected);
+    const revised = Asks.reviseAsk(diaAsk(), { context: "More detail" }, LATER, target);
+    if (Asks.isAskProblem(revised)) throw new Error(revised.detail);
+    assert.strictEqual(Asks.approvalWarning(target, revised), expected);
+  });
+
+  it("uses the board's guessed gates while keeping explicit gates and negation", () => {
+    assert.isUndefined(Asks.approvalWarning(target, diaAsk(), []));
+    assert.isUndefined(Asks.approvalWarning(target, diaAsk(), ["money"]));
+    assert.include(Asks.approvalWarning(target, diaAsk(), ["deploy"])!, "s4 (deploy steps)");
+    assert.include(
+      Asks.approvalWarning({ subtasks: [{ ...s4, gate: "deploy" }] }, diaAsk(), [])!,
+      "s4 (deploy steps)",
+    );
+    assert.isUndefined(
+      Asks.approvalWarning(
+        { subtasks: [{ ...s4, text: "No install; just inspect the guard" }] },
+        diaAsk(),
+        ["deploy"],
+      ),
+    );
+  });
+
+  it("doesn't warn when explicit scope, ids or gate wording give a match", () => {
+    const base = diaAsk();
+    for (const candidate of [
+      { ...base, options: [{ id: "o1", label: "Approve", approves: ["s4"] }] },
+      { ...base, options: [{ id: "o1", label: "Approve s4" }] },
+      { ...base, options: [{ id: "o1", label: "Yes, tick s4" }] },
+      { ...base, text: `${base.text} s4` },
+      { ...base, title: "s4 go-live" },
+      { ...base, action: { summary: "s4 go-live" } },
+      { ...base, text: `${base.text} deploy` },
+      { ...base, title: "Deploy guard" },
+      { ...base, action: { summary: "Install guard" } },
+      { ...base, to: "evaluator" as const },
+      { ...base, draft: { text: "Please post this", format: "markdown" as const } },
+      { ...base, respond: { ack: true } },
+      { ...base, options: [{ id: "o1", label: "Wait for a release" }] },
+    ])
+      assert.isUndefined(Asks.approvalWarning(target, candidate));
+  });
+
+  it("only warns for open gated evaluator or script steps", () => {
+    const base = diaAsk();
+    assert.isUndefined(Asks.approvalWarning({ subtasks: [] }, base));
+    for (const state of ["done", "skipped"] as const) {
+      assert.isUndefined(Asks.approvalWarning({ subtasks: [{ ...s4, state }] }, base));
+    }
+    for (const owner of ["work", "review"] as const) {
+      assert.isUndefined(
+        Asks.approvalWarning({ subtasks: [{ ...s4, owner, gate: "deploy" }] }, base),
+      );
+    }
+    assert.include(
+      Asks.approvalWarning(
+        { subtasks: [{ ...s4, owner: "script", text: "Put it live", gate: "money" }] },
+        base,
+      )!,
+      "s4 (money steps)",
+    );
+  });
+});
+
+it.each(
+  ["Deploy the pause worker", "Deploy the delay queue"].flatMap((label) =>
+    (["create", "revise"] as const).map((operation) => ({ label, operation })),
+  ),
+)("round 3 review regression: positive action name $operation $label", ({ label, operation }) => {
+  const target = {
+    number: 1325,
+    subtasks: [
+      {
+        id: "s4",
+        text: label,
+        step: 1,
+        owner: "evaluator" as const,
+        gate: "deploy" as const,
+        state: "open" as const,
+        note: null,
+        doneBy: null,
+        doneAt: null,
+      },
+    ],
+  };
+  const input = { options: [{ label, approves: ["s4"] }, "Wait"] };
+  const result =
+    operation === "create"
+      ? Asks.askFields(input, { blocking: false, card: target })
+      : Asks.reviseAsk(ask({ options: ["Approve", "Wait"] }), input, LATER, target);
+  assert.isFalse(Asks.isAskProblem(result), JSON.stringify(result));
+});
+
+it("round 3 review check: Recall #8 Close it choice warns about the money-gated step", () => {
+  const target = {
+    subtasks: [
+      {
+        id: "s6",
+        text: "Read back the saved result",
+        step: 6,
+        owner: "evaluator" as const,
+        gate: "money" as const,
+        state: "open" as const,
+        note: null,
+        doneBy: null,
+        doneAt: null,
+      },
+    ],
+  };
+  const closing = ask(
+    {
+      kind: "decision",
+      title: "Close #8: the old copy stays",
+      options: ["Close it", "Redact after all"],
+    },
+    "Can I close #8's last check? New results are masked; the old copy stays, as you chose.",
+  );
+  assert.include(Asks.approvalWarning(target, closing)!, "s6 (money steps)");
+  assert.isUndefined(Asks.approvalWarning(target, { ...closing, text: "Skip s6 on #8?" }));
+});
+
+it.each(
+  ["decline", "refuse", "deny", "defer", "postpone", "delay", "pause", "suspend", "abort"]
+    .flatMap((name) => [
+      { label: `Deploy the ${name} worker`, gate: "deploy" as const },
+      { label: `Purchase the ${name} service`, gate: "money" as const },
+      { label: `Use the ${name} secret`, gate: "secret" as const },
+    ])
+    .flatMap((entry) =>
+      (["create", "revise"] as const).map((operation) => ({ ...entry, operation })),
+    ),
+)(
+  "exact positive target names remain valid on $operation: $label",
+  ({ label, gate, operation }) => {
+    const target = {
+      number: 1325,
+      subtasks: [
+        {
+          id: "s4",
+          text: label,
+          step: 1,
+          owner: "evaluator" as const,
+          gate,
+          state: "open" as const,
+          note: null,
+          doneBy: null,
+          doneAt: null,
+        },
+      ],
+    };
+    const input = { options: [{ label, approves: ["s4"] }, "Wait"] };
+    const result =
+      operation === "create"
+        ? Asks.askFields(input, { blocking: false, card: target })
+        : Asks.reviseAsk(ask({ options: ["Approve", "Wait"] }), input, LATER, target);
+    if (Asks.isAskProblem(result)) throw new Error(result.detail);
+    assert.deepStrictEqual(result.options?.[0]?.approves, ["s4"]);
+  },
+);

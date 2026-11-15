@@ -81,6 +81,16 @@ test("sendText posts dm and group sends with reply_to and returns the handle", a
   expect(fake.calls[1]!.body).toEqual({ group_id: "grp9", from_number: LINE, content: "hi all", media_url: "https://cdn.example/x.png" });
 });
 
+test("setOptOut posts the contact and requested state", async () => {
+  const fake = fakeFetch(() => json(200, { status: "OK", number: "+15550001", opted_out: false }));
+  const client = makeClient(fake.fetch);
+  await client.setOptOut("+15550001", false);
+  expect(fake.calls[0]).toMatchObject({ method: "POST", body: { number: "+15550001", opted_out: false } });
+  expect(fake.calls[0]!.url.pathname).toBe("/api/v2/contacts/opt-out");
+  const failing = makeClient(fakeFetch(() => json(500, {})).fetch);
+  await expect(failing.setOptOut("+15550001", false)).rejects.toMatchObject({ retryable: true, uncertain: false });
+});
+
 test("sendApp posts the Spectrum identity and rejects groups", async () => {
   const fake = fakeFetch(() => json(202, { message_handle: "card1" }));
   const client = makeClient(fake.fetch);
@@ -423,6 +433,22 @@ test("events parses split frames, skips heartbeats, dedupes across reconnects an
   expect(fake.calls[0]!.headers.accept).toBe("text/event-stream");
 });
 
+test("status events normalize error keys without exposing free text as a code", async () => {
+  const frames = [
+    frame("s1", "message.updated", { message_handle: "h1", is_outbound: true, status: "ERROR", error_key: "OPTED_OUT" }),
+    frame("s2", "message.updated", { message_handle: "h2", is_outbound: true, status: "ERROR", error_key: "private text" }),
+    frame("s3", "message.updated", { message_handle: "h3", is_outbound: true, status: "ERROR", error_code: 5504 }),
+  ];
+  const fake = fakeFetch(call => sse(frames, true, call.signal));
+  const controller = new AbortController();
+  const codes: Array<string | undefined> = [];
+  for await (const event of makeClient(fake.fetch).events(controller.signal)) {
+    if (event.type === "status") codes.push(event.errorCode);
+    if (codes.length === 3) { controller.abort(); break; }
+  }
+  expect(codes).toEqual(["opted_out", undefined, "5504"]);
+});
+
 test("events returns immediately when the signal is already aborted", async () => {
   const fake = fakeFetch(() => sse([], false));
   const client = makeClient(fake.fetch);
@@ -445,6 +471,12 @@ test("errors are classified for retry and uncertainty", async () => {
     uncertain: false,
     code: "http_400:invalid_number",
   });
+  await expect(failing(400, { message: "private explanation", error_key: "OPTED_OUT" }).sendText("dm:+15550001", "x")).rejects.toMatchObject({
+    retryable: false, uncertain: false, code: "http_400:opted_out", message: "Sendblue POST /api/send-message returned 400",
+  });
+  for (const key of ["some private text", "X".repeat(41), "private@domain.test", "line\nbreak"]) {
+    await expect(failing(400, { error_key: key }).sendText("dm:+15550001", "x")).rejects.toMatchObject({ code: "http_400:provider_error" });
+  }
   await expect(failing(500).getMessage("h1")).rejects.toMatchObject({ retryable: true, uncertain: false });
   await expect(failing(200, {}).sendText("dm:+15550001", "x")).rejects.toMatchObject({ code: "no_handle", retryable: true, uncertain: true });
   await expect(failing(200, {}).upload({ data: new Uint8Array([1]), name: "a.png", mimeType: "image/png" }))

@@ -59,7 +59,33 @@ const board: KanbanBoard = {
   defaultCardModel: work,
   reviewChains: [{ name: "two-step", steps: [work, review] }],
   defaultReviewChain: "two-step",
-  standingApprovals: [],
+  standingApprovals: [
+    {
+      id: "standing-deploy",
+      gate: "deploy",
+      minIntervalHours: 4,
+      quote: "This board may release every four hours",
+      sourceThreadId: "approval-thread",
+      saidAt: at,
+      approvedAsk: { cardId: "approval-card", askId: "q1" },
+      recordedAt: at,
+      recordedBy: "evaluator",
+      revokedAt: null,
+      revokedBy: null,
+      revokeReason: null,
+    },
+  ],
+  releaseLedger: [
+    {
+      boardId: KanbanBoardId.make("cutover"),
+      cardId: KanbanCardId.make("previous-release"),
+      cardNumber: 1,
+      subtaskId: "s1",
+      at,
+      critical: null,
+      approvalId: "standing-deploy",
+    },
+  ],
   instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },
   setup: null,
   pause: { reason: "Harness cutover", keep: [], at, by: "owner" },
@@ -295,7 +321,7 @@ const threadView = (threadId: ThreadId): KanbanThreadView => ({
   updatedAt: at,
   quietSince: at,
   runStartedAt: null,
-            lastActivityAt: null,
+  lastActivityAt: null,
   backgroundWork: 0,
   prWatches: 0,
   prs: [],
@@ -335,20 +361,18 @@ const testLayer = (
                   )
                 : real.putThreadLink(value),
             addCardEvent: (event) =>
-              real
-                .addCardEvent(event)
-                .pipe(
-                  Effect.flatMap((saved) =>
-                    options.failEventWrite
-                      ? Effect.fail(
-                          new KanbanStore.KanbanStoreError({
-                            operation: "event fixture failure",
-                            cause: new Error("event write failed"),
-                          }),
-                        )
-                      : Effect.succeed(saved),
-                  ),
+              real.addCardEvent(event).pipe(
+                Effect.flatMap((saved) =>
+                  options.failEventWrite
+                    ? Effect.fail(
+                        new KanbanStore.KanbanStoreError({
+                          operation: "event fixture failure",
+                          cause: new Error("event write failed"),
+                        }),
+                      )
+                    : Effect.succeed(saved),
                 ),
+              ),
           })),
         ).pipe(Layer.provide(KanbanStore.layer))
       : KanbanStore.layer;
@@ -581,7 +605,6 @@ it("refuses worker cutover restoration while an evaluator step precedes work", (
   );
   assert.isFalse(result.ok);
 });
-
 
 it("cutover reconciliation re-stamps an existing wait with its restored move", () => {
   const wait = {

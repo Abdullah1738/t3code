@@ -59,8 +59,9 @@ describe("analytics ingest contract", () => {
         kind: "mcp.call",
         tool: "card_update",
         outcome: "timeout",
+        responseDelivery: "closed",
       }),
-    ).toMatchObject({ tool: "card_update", outcome: "timeout" });
+    ).toMatchObject({ tool: "card_update", outcome: "timeout", responseDelivery: "closed" });
     expect(() => decodeRead({ day: "2026-11-13", outcome: "maybe" })).toThrow();
   });
   it("accepts bounded batches and strips unrecognized content", () => {
@@ -188,3 +189,25 @@ it.each([
 ])("accepts provider-owned model identifiers: %s", (model) => {
   expect(Schema.decodeUnknownSync(RunUsageEvent)({ ...usage, model }).model).toBe(model);
 });
+
+it.each(["started", "reused", "merged", "queued_spawn_cap"] as const)(
+  "#1490 accepts evaluator outcome %s and bounded attribution labels",
+  (outcome) => {
+    const row = {
+      ...event,
+      kind: "kanban.evaluator",
+      surface: "server",
+      boardId: "board-offbox",
+      purposeKind: "request",
+      trigger: "report_bug",
+      outcome,
+      reuseMissReason: "no_card_reuse_scope",
+    };
+    expect(decodeEvent(row)).toEqual(row);
+    expect(
+      decodeRead({ day: "2026-11-14", boardId: "board-offbox", kind: row.kind, outcome }),
+    ).toMatchObject({ outcome });
+    for (const field of ["purposeKind", "trigger", "reuseMissReason"])
+      expect(() => decodeEvent({ ...row, [field]: "private words" })).toThrow();
+  },
+);

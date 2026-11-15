@@ -1601,7 +1601,7 @@ it.effect("system channel lookup uses its index and reuses the latest settled ch
 );
 
 it.live(
-  "keeps board, goal and board-scoped pool caches uncapped with separate goal projections",
+  "keeps board, goal and board-scoped pool working sets with separate goal projections",
   () =>
     Effect.gen(function* () {
       const store = yield* KanbanStore.KanbanStore;
@@ -2087,6 +2087,379 @@ it.live(
   30_000,
 );
 
+it.effect("slot event windows and open slots keep board, pool and thread identities separate", () =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const base = {
+      boardId: "b",
+      poolKey: "p",
+      threadId: "t",
+      cardId: null,
+      at,
+      why: "start" as const,
+    };
+    yield* store.addSlotEvent({ ...base, kind: "take" });
+    yield* store.addSlotEvent({ ...base, poolKey: "other", kind: "take" });
+    yield* store.addSlotEvent({ ...base, boardId: "other", kind: "take" });
+    yield* store.addSlotEvent({ ...base, kind: "release", why: "card_left" });
+    yield* store.addSlotEvent({ ...base, threadId: "other", kind: "take" });
+    assert.deepStrictEqual(
+      (yield* store.openSlots()).map((row) => row.id),
+      [2, 3, 5],
+    );
+    assert.deepStrictEqual(
+      (yield* store.openSlots("b")).map((row) => row.id),
+      [2, 5],
+    );
+    assert.deepStrictEqual(
+      (yield* store.slotEvents({ boardId: "b", from: at, to: "9999" })).map((row) => row.id),
+      [1, 2, 4, 5],
+    );
+    assert.deepStrictEqual(yield* store.slotEvents({ boardId: "b", from: "", to: at }), []);
+  }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect("readiness carry-in selects the latest wait and stall markers by board and cutoff", () =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    yield* store.putBoard(board);
+    const cutoff = "2026-11-12T02:00:00.000Z";
+    const cases = [
+      { kind: "edited", body: "Waiting for CI", wait: true, clears: true },
+      { kind: "edited", body: "Wait ended: cleared", wait: true, clears: false },
+      { kind: "edited", body: "Wait expired: CI", wait: true, clears: false },
+      { kind: "wait_set", body: null, wait: true, clears: true },
+      { kind: "wait_cleared", body: null, wait: true, clears: false },
+      { kind: "wait_expired", body: null, wait: true, clears: false },
+      { kind: "flagged", body: "Cleared", wait: false, clears: true },
+      { kind: "moved", body: null, wait: false, clears: true },
+      { kind: "review", body: null, wait: false, clears: true },
+      { kind: "thread", body: null, wait: false, clears: true },
+      { kind: "edited", body: "waiting for CI", wait: false, clears: false },
+      { kind: "edited", body: "Waitingfor CI", wait: false, clears: false },
+    ] as const;
+    const expected: number[] = [];
+    for (const [index, entry] of cases.entries()) {
+      const current = card(index + 1, "todo");
+      yield* store.putCard(current);
+      const base = {
+        cardId: current.id,
+        actor: { _tag: "owner" as const },
+        head: null,
+        fromStage: null,
+        toStage: null,
+      };
+      const flag = yield* store.addCardEvent({
+        ...base,
+        at: "2026-11-12T00:00:00.000Z",
+        kind: "flagged",
+        body: "Run failed: error",
+      });
+      const marker = yield* store.addCardEvent({
+        ...base,
+        at: "2026-11-12T01:00:00.000Z",
+        kind: entry.kind,
+        body: entry.body,
+        ...(entry.kind === "thread"
+          ? { fromStage: "todo" as const, toStage: "working" as const }
+          : {}),
+      });
+      yield* store.addCardEvent({
+        ...base,
+        at: "2026-11-12T01:30:00.000Z",
+        kind: "comment",
+        body: "Unrelated",
+      });
+      yield* store.addCardEvent({ ...base, at: cutoff, kind: "wait_set", body: null });
+      if (!entry.clears) expected.push(flag.id);
+      if (entry.wait || entry.clears) expected.push(marker.id);
+    }
+    const otherBoard = { ...board, id: KanbanBoardId.make("other"), slug: "other" };
+    yield* store.putBoard(otherBoard);
+    const other = { ...card(100, "todo"), boardId: otherBoard.id };
+    yield* store.putCard(other);
+    yield* store.addCardEvent({
+      cardId: other.id,
+      actor: { _tag: "owner" },
+      at: at,
+      kind: "wait_set",
+      body: null,
+      fromStage: null,
+      toStage: null,
+      head: null,
+    });
+    assert.deepStrictEqual(
+      (yield* store.activityHistory(boardId, { since: cutoff, until: "9999" })).map(
+        (event) => event.id,
+      ),
+      expected,
+    );
+    assert.deepStrictEqual(
+      yield* store.activityHistory(boardId, { since: "1900", until: "9999" }),
+      [],
+    );
+  }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect(
+  "activity history carries stages without window events and finds the first later transition",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      yield* store.putBoard(board);
+      const current = card(1, "working");
+      yield* store.putCard(current);
+      const base = {
+        cardId: current.id,
+        actor: { _tag: "owner" as const },
+        head: null,
+        body: null,
+      };
+      const prior = yield* store.addCardEvent({
+        ...base,
+        at: "2026-11-11T23:00:00.000Z",
+        kind: "created",
+        fromStage: null,
+        toStage: "todo",
+      });
+      const flag = yield* store.addCardEvent({
+        ...base,
+        at: "2026-11-11T23:30:00.000Z",
+        kind: "flagged",
+        fromStage: null,
+        toStage: null,
+        body: "Cleared",
+      });
+      const later = yield* store.addCardEvent({
+        ...base,
+        at: "2026-11-12T04:00:00.000Z",
+        kind: "moved",
+        fromStage: "todo",
+        toStage: "working",
+      });
+      yield* store.addCardEvent({
+        ...base,
+        at: "2026-11-12T05:00:00.000Z",
+        kind: "moved",
+        fromStage: "working",
+        toStage: "completed",
+      });
+      const window = { since: "2026-11-12T00:00:00.000Z", until: "2026-11-12T03:00:00.000Z" };
+      assert.deepStrictEqual(yield* store.boardEvents(boardId, window.since, window.until), []);
+      assert.deepStrictEqual(
+        (yield* store.activityHistory(boardId, window)).map((event) => event.id),
+        [prior.id, flag.id, later.id],
+      );
+      assert.deepStrictEqual(
+        (yield* store.activityHistory(boardId, { ...window, until: later.at })).map(
+          (event) => event.id,
+        ),
+        [prior.id, flag.id, later.id],
+      );
+    }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect("slot history reads carry-in and the window together, including closed slots", () =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const base = { boardId: "b", poolKey: "p", threadId: "t", cardId: null, why: "start" as const };
+    const add = (
+      patch: Partial<KanbanStore.SlotEvent> & Pick<KanbanStore.SlotEvent, "at" | "kind">,
+    ) => store.addSlotEvent({ ...base, ...patch });
+    const from = "2026-11-12T01:00:00.000Z",
+      to = "2026-11-12T03:00:00.000Z";
+    yield* add({ kind: "take", at: "2026-11-12T00:00:00.000Z" });
+    yield* add({ kind: "release", at: "2026-11-12T00:30:00.000Z" });
+    yield* add({ kind: "take", at: "2026-11-12T00:45:00.000Z", threadId: "held" });
+    yield* add({ kind: "take", at: "2026-11-12T00:00:00.000Z", boardId: "other" });
+    yield* add({ kind: "take", at: from });
+    yield* add({ kind: "release", at: from, threadId: "held" });
+    yield* add({ kind: "release", at: to });
+    const history = yield* store.slotHistory({ boardId: "b", from, to });
+    assert.deepStrictEqual(
+      history.events.map((event) => event.id),
+      [2, 3, 5, 6],
+    );
+    assert.strictEqual(history.recordedSince, "2026-11-12T00:00:00.000Z");
+    assert.deepStrictEqual(yield* store.slotHistory({ boardId: "absent", from, to }), {
+      events: [],
+      recordedSince: null,
+    });
+  }).pipe(Effect.provide(TestLayer)),
+);
+
+// Event counts use ledger order; boundary samples use the last count at that
+// instant, so a release on the hour cannot carry the previous hour's peak in.
+const hourlySlotQuery = `
+WITH RECURSIVE bounds(board,from_at,to_at) AS (VALUES (?,?,?)), hours(at) AS (SELECT from_at FROM bounds WHERE from_at<to_at UNION ALL SELECT strftime('%Y-%m-%dT%H:00:00.000Z',at,'+1 hour') FROM hours,bounds WHERE strftime('%Y-%m-%dT%H:00:00.000Z',at,'+1 hour')<to_at), counts AS (SELECT id,pool_key,at,SUM(CASE kind WHEN 'take' THEN 1 ELSE -1 END) OVER (PARTITION BY pool_key ORDER BY id ROWS UNBOUNDED PRECEDING) AS used FROM ardud_kanban_slot_events,bounds WHERE board_id=board AND at<to_at), samples AS (SELECT pool_key,at,used FROM counts,bounds WHERE at>=from_at UNION ALL SELECT p.pool_key,h.at,COALESCE((SELECT c.used FROM counts c WHERE c.pool_key=p.pool_key AND c.at<=h.at ORDER BY c.id DESC LIMIT 1),0) FROM (SELECT DISTINCT pool_key FROM counts) p CROSS JOIN hours h)
+SELECT strftime('%Y-%m-%dT%H:00:00.000Z',at) AS hour,pool_key,MAX(used) AS peak_slots FROM samples GROUP BY hour,pool_key ORDER BY hour,pool_key;
+`;
+
+const hourlySlotCases = [
+  {
+    name: "take before release at the same millisecond preserves peak two",
+    events: [
+      ["take", "t1", "00:00:00.000"],
+      ["take", "t2", "00:00:00.001"],
+      ["release", "t1", "00:00:00.001"],
+    ],
+    expected: [
+      [0, "p", 2],
+      [1, "p", 1],
+      [2, "p", 1],
+      [3, "p", 1],
+    ],
+  },
+  {
+    name: "release before take at the same millisecond stays at peak one",
+    events: [
+      ["take", "t1", "00:00:00.000"],
+      ["release", "t1", "00:00:00.001"],
+      ["take", "t2", "00:00:00.001"],
+    ],
+    expected: [
+      [0, "p", 1],
+      [1, "p", 1],
+      [2, "p", 1],
+      [3, "p", 1],
+    ],
+  },
+  {
+    name: "take and release at one instant still count in that hour",
+    events: [
+      ["take", "t1", "01:30:00.000"],
+      ["release", "t1", "01:30:00.000"],
+    ],
+    expected: [
+      [0, "p", 0],
+      [1, "p", 1],
+      [2, "p", 0],
+      [3, "p", 0],
+    ],
+  },
+  {
+    name: "multiple takes and releases sharing an hour boundary preserve every intermediate count",
+    events: [
+      ["take", "t1", "00:30:00.000"],
+      ["take", "t2", "01:00:00.000"],
+      ["take", "t3", "01:00:00.000"],
+      ["release", "t1", "01:00:00.000"],
+      ["release", "t2", "01:00:00.000"],
+    ],
+    expected: [
+      [0, "p", 1],
+      [1, "p", 3],
+      [2, "p", 1],
+      [3, "p", 1],
+    ],
+  },
+  {
+    name: "releases on an hour boundary do not carry the previous peak into the new hour",
+    events: [
+      ["take", "t1", "00:30:00.000"],
+      ["take", "t2", "00:30:00.001"],
+      ["release", "t1", "01:00:00.000"],
+      ["release", "t2", "01:00:00.000"],
+    ],
+    expected: [
+      [0, "p", 2],
+      [1, "p", 1],
+      [2, "p", 0],
+      [3, "p", 0],
+    ],
+  },
+  {
+    name: "carry-in uses the final event before the range and includes unchanged hours",
+    events: [
+      ["take", "t1", "00:00:00.000"],
+      ["take", "t2", "00:00:00.000"],
+      ["release", "t1", "00:00:00.000"],
+    ],
+    from: "01:00:00.000",
+    expected: [
+      [1, "p", 1],
+      [2, "p", 1],
+      [3, "p", 1],
+    ],
+  },
+  {
+    name: "range start is inclusive and end is exclusive",
+    events: [
+      ["take", "t1", "00:00:00.000"],
+      ["take", "t2", "04:00:00.000"],
+    ],
+    expected: [
+      [0, "p", 1],
+      [1, "p", 1],
+      [2, "p", 1],
+      [3, "p", 1],
+    ],
+  },
+  {
+    name: "pools stay separate and other boards do not affect carry-in or peaks",
+    events: [
+      ["take", "t1", "00:00:00.000"],
+      ["take", "t2", "00:00:00.000", "q"],
+      ["take", "t3", "00:00:00.000", "p", "other"],
+      ["take", "t4", "00:00:00.000", "unrelated", "other"],
+    ],
+    expected: [
+      [0, "p", 1],
+      [0, "q", 1],
+      [1, "p", 1],
+      [1, "q", 1],
+      [2, "p", 1],
+      [2, "q", 1],
+      [3, "p", 1],
+      [3, "q", 1],
+    ],
+  },
+  { name: "an empty ledger has no pools", events: [], expected: [] },
+] satisfies ReadonlyArray<{
+  readonly name: string;
+  readonly events: ReadonlyArray<
+    readonly [
+      kind: "take" | "release",
+      threadId: string,
+      at: string,
+      poolKey?: string,
+      boardId?: string,
+    ]
+  >;
+  readonly from?: string;
+  readonly expected: ReadonlyArray<readonly [hour: number, poolKey: string, peak: number]>;
+}>;
+
+it.effect.each(hourlySlotCases)("hourly slot peaks: $name", ({ events, expected, from }) =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const sql = yield* BoardsDatabase.client;
+    for (const [kind, threadId, time, poolKey = "p", boardId = "b"] of events) {
+      yield* store.addSlotEvent({
+        kind,
+        threadId,
+        at: `2026-11-13T${time}Z`,
+        poolKey,
+        boardId,
+        cardId: null,
+        why: kind === "take" ? "start" : "card_left",
+      });
+    }
+    const rows = yield* sql.unsafe<{ hour: string; pool_key: string; peak_slots: number }>(
+      hourlySlotQuery,
+      ["b", `2026-11-13T${from ?? "00:00:00.000"}Z`, "2026-11-13T04:00:00.000Z"],
+    );
+    assert.deepStrictEqual(
+      rows,
+      expected.map(([hour, pool_key, peak_slots]) => ({
+        hour: `2026-11-13T${String(hour).padStart(2, "0")}:00:00.000Z`,
+        pool_key,
+        peak_slots,
+      })),
+    );
+  }).pipe(Effect.provide(TestLayer)),
+);
+
 it.effect(
   "dispatch candidates use a partial index and retain waits, deciding and thread holders",
   () =>
@@ -2361,5 +2734,52 @@ it.effect.each([
     assert.notInclude(JSON.stringify(metadata), "prompt");
     assert.notInclude(JSON.stringify(metadata), "description");
     if (kind === "urgency") assert.equal(actual[0], blocker.id);
+  }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect("#1569 owner choices use their answer time, and a later evaluator clears them", () =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const talk = discussion(1569);
+    const evaluator = ThreadId.make("eval-1569");
+    const other = ThreadId.make("other-eval-1569");
+    const question: KanbanMessage = {
+      discussionId: talk.id,
+      seq: 1,
+      author: { _tag: "evaluator", threadId: evaluator },
+      authorName: "Evaluator",
+      blocks: [{ _tag: "md", text: "Ship?" }],
+      answers: [],
+      createdAt: at,
+    };
+    yield* store.putDiscussion(talk);
+    yield* store.putMessage(question);
+    assert.isNull(yield* store.ownerReply(talk.id, evaluator, true));
+    const answerAt = "2026-10-25T14:00:00.000Z";
+    yield* store.putMessage({
+      ...question,
+      answers: [{ blockId: "q1", by: { _tag: "owner" }, choice: ["o1"], text: null, at: answerAt }],
+    });
+    const action = yield* store.ownerReply(talk.id, evaluator, true);
+    assert.deepStrictEqual(action, {
+      key: `1:q1:${answerAt}`,
+      createdAt: answerAt,
+      answered: false,
+    });
+    yield* store.putMessage({
+      ...question,
+      seq: 2,
+      author: { _tag: "evaluator", threadId: other },
+      createdAt: answerAt,
+    });
+    assert.strictEqual((yield* store.ownerReply(talk.id, evaluator, true))?.answered, true);
+    assert.strictEqual((yield* store.ownerReply(talk.id, evaluator, false))?.answered, false);
+    yield* store.putMessage({
+      ...question,
+      seq: 3,
+      author: { _tag: "owner" },
+      createdAt: "2026-10-25T15:00:00.000Z",
+    });
+    assert.strictEqual((yield* store.ownerReply(talk.id, evaluator, true))?.answered, false);
   }).pipe(Effect.provide(TestLayer)),
 );

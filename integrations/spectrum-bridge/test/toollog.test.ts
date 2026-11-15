@@ -38,7 +38,7 @@ test("an entire message/error fixture cannot leak text, secrets, health values o
   for (const secret of [message.text, message.prompt, message.token, message.otp, "83.7", "PASSWORD_SENTINEL", "4111111111111111", "EMAIL_BODY_SENTINEL", "PRIVATE_CAPTION"]) expect(raw).not.toContain(secret);
   expect(JSON.parse(raw).ids.inboundId).toBe(message.id);
   expect(JSON.parse(raw).props).toEqual({ count: 2 });
-  expect(JSON.parse(raw).error).toEqual({ tag: "fixture.failed", name: "UnknownError", message: "[redacted]" });
+  expect(JSON.parse(raw).error).toEqual({ tag: "fixture.failed", name: "UnknownError", message: "[redacted]", causeKey: "callsite_failure" });
 });
 
 test("retention runs on the first write of each UTC day and touches only old log artifacts", () => {

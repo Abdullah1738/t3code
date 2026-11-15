@@ -2,6 +2,7 @@ import * as Effect from "effect/Effect";
 import * as Clock from "effect/Clock";
 import * as Option from "effect/Option";
 import { McpSchema } from "effect/ai";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 import * as BoardLocks from "../engine/boardLocks.ts";
 import * as SavedWrite from "../engine/savedWrite.ts";
@@ -70,6 +71,7 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
   const parent = yield* SavedWrite.observer;
   const parentCommitting = yield* SavedWrite.commitObserver;
   const call = yield* Effect.serviceOption(McpCall);
+  let slowSubSteps: ReadonlyArray<SavedWrite.SubStep> = [];
   let commitStarted = false;
   let receipt: SavedWrite.Saved | undefined;
   const attributes = () => ({
@@ -139,7 +141,14 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
     );
   };
   const work = effect.pipe(
+    // Interactive pre-write reads must not queue behind tick and maintenance scans.
+    NodeSqliteClient.foregroundReads,
     Effect.provideService(SavedWrite.traceObserver, { span, enter, mark }),
+    Effect.provideService(SavedWrite.subStepReporter, (steps) => {
+      slowSubSteps = [...slowSubSteps, ...steps].sort((a, b) => b.ms - a.ms).slice(0, 3);
+      span.attribute("kanban.reply.sub_steps", slowSubSteps);
+      if (call._tag === "Some") call.value.replySubSteps = slowSubSteps;
+    }),
     Effect.provideService(BoardLocks.writeWaitMs, ADMISSION_BUDGET_MS),
     Effect.provideService(SavedWrite.commitObserver, () => {
       commitStarted = true;

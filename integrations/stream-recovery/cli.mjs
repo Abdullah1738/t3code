@@ -8,11 +8,12 @@ import {
 } from './lib/detect.mjs';
 import { assertRecoveryActive, guardRecoveryIo, isRecoveryPaused, recoveryElapsed, recoveryFloor, controlStatus, pauseRecovery, resumeRecovery, parseDuration } from './lib/pause.mjs';
 import * as realIo from './lib/io.mjs';
-import { emit, observed, recoveryIo } from './lib/logging.mjs';
+import { deferThread, emit, observed, recoveryIo, timedScan } from './lib/logging.mjs';
 import { pathToFileURL } from 'node:url';
 import { openCodeSession, recoveryOwned } from './lib/harness.mjs';
 import { stallScan } from './lib/stallwatch.mjs';
 import { restartScan } from './lib/restartwatch.mjs';
+import { isReplicaUnavailable } from './lib/readonly-db.mjs';
 
 const SETTLE_MS = 90_000;
 const STALE_HELD_MS = 24 * 3600_000;
@@ -225,7 +226,7 @@ async function actImpl({ db, incident, g, dryRun, progress = {}, save = () => {}
       save();
     }
   } catch (err) {
-    if (err.code === 'REPLICA_UNAVAILABLE' || isRecoveryPaused(err)) throw err;
+    if (isReplicaUnavailable(err) || isRecoveryPaused(err)) throw err;
     res.ok = false;
     res.error = String(err?.message || err).slice(0, 300);
     if (res.queueOk === null && (plan.resumeQueue || g.staleHeld.length)) res.queueOk = false;
@@ -237,21 +238,31 @@ export async function recoveryScan({ opts, state, now }, io = realIo) {
   assertRecoveryActive(io);
   io = guardRecoveryIo(io);
   let db;
+  // Discovery rows are historical candidates. Each independent batch gets a
+  // new snapshot; a thread's gather + act still share one guarded snapshot.
+  const refreshDb = () => {
+    db?.close();
+    db = undefined;
+    db = io.openDb(io.PATHS.db);
+    return db;
+  };
   try {
     const report = [];
     const floor = recoveryFloor(io, now, opts.maxAgeHours * 3600_000);
     const last = state.lastScan ? recoveryFloor(io, Date.parse(state.lastScan), 60 * 60_000) : floor;
     const sinceMs = opts.since ? Date.parse(opts.since) : Math.max(floor, last);
     const sinceIso = new Date(sinceMs).toISOString();
-    db = io.openDb(io.PATHS.db);
+    refreshDb();
     // Restart recovery owns failures inside its window. Do it first so a
     // failed run cannot get both a stream-loss note and a restart note.
     const restartSince = opts.since ? sinceIso
       : new Date(Math.max(floor, state.lastScan ? recoveryFloor(io, Date.parse(state.lastScan), RESTART_LOOKBACK_MS) : floor)).toISOString();
     const restarts = await restartScan({
-      db, state, now, sinceIso: restartSince, floorMs: floor, dryRun: opts.dryRun, seed: opts.seed, verbose: opts.verbose, log,
+      db, refreshDb, state, now, sinceIso: restartSince, floorMs: floor, dryRun: opts.dryRun, seed: opts.seed, verbose: opts.verbose, log,
     }, io);
+    refreshDb();
     const runs = io.failedRunsSince(db, sinceIso);
+    refreshDb();
     const subs = io.failedSubagentsSince(db, sinceIso);
     const signals = [
       ...runs.filter((r) => !restarts.runIds.has(r.run_id)).map((r) => ({ ...r, kind: 'run', at: r.completed_at, threadId: r.thread_id })),
@@ -276,7 +287,10 @@ export async function recoveryScan({ opts, state, now }, io = realIo) {
         log(`${incident.id}: seeded (no action)`);
         continue;
       }
-      for (const s of incident.subagents) s.parentThreadId = topParent(io, db, s.thread_id);
+      for (const s of incident.subagents) {
+        refreshDb();
+        s.parentThreadId = topParent(io, db, s.thread_id);
+      }
       const threadIds = [...new Set([
         ...incident.runs.map((r) => r.thread_id),
         ...incident.subagents.map((s) => s.parentThreadId).filter(Boolean),
@@ -284,23 +298,32 @@ export async function recoveryScan({ opts, state, now }, io = realIo) {
       const active = await safe(() => io.activeSessions(), new Set());
       log(`${incident.id}: drop at ${hhmm(incident.failAllMs)}, ${incident.runs.length} runs, ${incident.subagents.length} subagents, ${threadIds.length} threads${opts.dryRun ? ' (dry run)' : ''}`);
       const results = [];
+      let deferred = false;
       const entry = { ...prev, incident, threads: { ...prev?.threads }, at: new Date(now).toISOString() };
       const save = () => { if (!opts.dryRun) { state.handled[incident.id] = entry; io.saveState(state, now); } };
       save();
       for (const threadId of threadIds) {
+        refreshDb();
         const progress = entry.threads[threadId] ??= {};
         if (progress.done) { results.push(progress.result); continue; }
         let g = null;
         try {
           g = await gatherThread({ db, incident, threadId, active, now, verbose: opts.verbose }, io);
         } catch (err) {
-          if (err.code === 'REPLICA_UNAVAILABLE' || isRecoveryPaused(err)) throw err;
+          if (deferThread(io, threadId, err)) { deferred = true; continue; }
+          if (isReplicaUnavailable(err) || isRecoveryPaused(err)) throw err;
           results.push({ plan: { threadId, title: threadId, action: 'skip', reason: 'error' }, ok: false, error: String(err?.message || err).slice(0, 300), lost: [], forms: [] });
           log(`  ${threadId}: gather failed: ${err?.message || err}`);
           continue;
         }
         if (!g) { if (opts.verbose) log(`  ${threadId}: not found in Robob`); continue; }
-        const res = await act({ db, incident, g, dryRun: opts.dryRun, progress, save }, io);
+        let res;
+        try {
+          res = await act({ db, incident, g, dryRun: opts.dryRun, progress, save }, io);
+        } catch (err) {
+          if (deferThread(io, threadId, err)) { deferred = true; continue; }
+          throw err;
+        }
         assertRecoveryActive(io);
         if (!opts.dryRun && res.ok) { progress.done = true; progress.result = res; save(); }
         results.push(res);
@@ -311,7 +334,12 @@ export async function recoveryScan({ opts, state, now }, io = realIo) {
           + `${g.reply ? ' | invisible reply' : ''}${res.error ? ` | ERROR ${res.error}` : ''}`);
       }
       assertRecoveryActive(io);
-      io.assertReplicaFresh(db);
+      refreshDb();
+      if (deferred) {
+        save();
+        report.push({ incident: { id: incident.id, startMs: incident.startMs, endMs: incident.endMs, failAllMs: incident.failAllMs }, results });
+        continue;
+      }
       const summary = buildSummary({ incident, results });
       if (opts.dryRun) {
         log(`summary (${summary.severity}):\n${summary.text}`);
@@ -330,7 +358,7 @@ export async function recoveryScan({ opts, state, now }, io = realIo) {
       }
       report.push({ incident: { id: incident.id, startMs: incident.startMs, endMs: incident.endMs, failAllMs: incident.failAllMs }, results });
     }
-    io.assertReplicaFresh(db);
+    refreshDb();
     return { incidents: report, restarts };
   } finally {
     db?.close();
@@ -338,7 +366,7 @@ export async function recoveryScan({ opts, state, now }, io = realIo) {
 }
 
 export async function scan(opts, io = realIo) {
-  return observed('stream-recovery', 'stream.scan', () => scanImpl(opts, io));
+  return timedScan('stream', io, timed => scanImpl(opts, timed));
 }
 
 async function scanImpl(opts, io) {

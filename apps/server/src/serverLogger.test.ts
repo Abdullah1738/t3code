@@ -16,6 +16,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Redactable from "effect/Redactable";
+import * as References from "effect/References";
 import * as Path from "effect/Path";
 import * as Tracer from "effect/Tracer";
 import * as HttpClient from "effect/http/HttpClient";
@@ -453,6 +454,67 @@ it.effect("persists board lock warnings without OTLP or a recorded span", () =>
   }).pipe(Effect.provide(NodeServices.layer)),
 );
 
+it.effect("persists holder JSON in both lock and server logs even with logging disabled", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const root = yield* fs.makeTempDirectoryScoped({ prefix: "board-hold-log-" });
+    yield* Effect.gen(function* () {
+      const unmarked = '{"event":"kanban board lock long hold","board.id":"unmarked"}';
+      yield* Effect.logWarning(unmarked).pipe(
+        Effect.provideService(References.MinimumLogLevel, "Warn"),
+      );
+      const locks = yield* BoardLocks.make();
+      const entered = yield* Deferred.make<void>();
+      const finish = yield* Deferred.make<void>();
+      const holder = yield* Effect.forkChild(
+        locks
+          .board(
+            "board-orders",
+            Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(finish))),
+          )
+          .pipe(Effect.provideService(BoardLocks.operationName, "card.reviewResult")),
+      );
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust(5_000);
+      yield* Deferred.succeed(finish, undefined);
+      yield* Fiber.join(holder);
+    }).pipe(
+      Effect.provide(
+        ServerLogger.layer.pipe(
+          Layer.provide(layerConfig({ logsDir: root, logLevel: "None", otlpLogsUrl: undefined })),
+          Layer.provide(layerCollector([])),
+        ),
+      ),
+    );
+    const text = yield* fs.readFileString(path.join(root, "board-locks.ndjson"));
+    assert.isTrue(text.endsWith("\n"));
+    const lines = text.trimEnd().split("\n");
+    assert.lengthOf(lines, 1);
+    const hold = JSON.parse(lines[0]!);
+    assert.deepStrictEqual(hold, {
+      event: "kanban board lock long hold",
+      "board.observed_at_ms": 5_000,
+      "board.id": "board-orders",
+      "board.holder": "card.reviewResult",
+      "board.card_id": null,
+      "board.lock": "gate",
+      "board.mode": "exclusive",
+      "board.acquired_at_ms": 0,
+      "board.held_ms": 5_000,
+      "board.waiters": 0,
+    });
+    const serverLines = (yield* fs.readFileString(path.join(root, "server.log")))
+      .trimEnd()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    const warning = serverLines.find((line) => String(line.message) === lines[0]);
+    assert.isDefined(warning);
+    assert.strictEqual(warning.level, "WARN");
+    assert.deepStrictEqual(JSON.parse(String(warning.message)), hold);
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
 it.effect(
   "a throwing diagnostic sink preserves the board admission timeout and retry response",
   () =>
@@ -483,8 +545,10 @@ it.effect(
           const error = Cause.squash(result.cause);
           assert.instanceOf(error, KanbanError);
           assert.strictEqual((error as KanbanError).saved, false);
-          assert.include(String(error), "Board busy: not written (held 2m0s by");
-          assert.include(String(error), "Safe to retry once.");
+          assert.strictEqual(
+            (error as KanbanError).detail,
+            "Board busy: not written (waited 120s behind 0; most time: KanbanBoardLocks.run 120s). Safe to retry once.",
+          );
         }
         yield* Fiber.interrupt(holder);
         assert.deepStrictEqual(yield* locks.holders, []);

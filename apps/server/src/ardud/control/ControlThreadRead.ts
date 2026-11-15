@@ -51,10 +51,11 @@ const make = Effect.gen(function* () {
     shells: ReadonlyArray<OrchestrationV2ThreadShell>,
   ) {
     const ids = shells.map((shell) => shell.id);
-    const [origins, natives, bindings] = yield* Effect.all([
+    const [origins, natives, bindings, markers] = yield* Effect.all([
       store.getOrigins(ids),
       store.nativeSessionIds(ids),
       store.nativeBindings(ids),
+      store.changeMarkers(ids),
     ]).pipe(Effect.mapError(readError));
     const rootIds = shells
       .map((shell) => shell.lineage.rootThreadId)
@@ -73,17 +74,24 @@ const make = Effect.gen(function* () {
         nativeSessionId: natives.get(shell.id) ?? null,
       }),
       native: bindings.get(shell.id) ?? null,
+      changeMarker: markers.get(shell.id) ?? 0,
     }));
   });
 
-  const readRecords = Effect.fn("ControlThreadRead.readRecords")((threadId: string) =>
-    threads
-      .getThreadRecords(ThreadId.make(threadId), ["runs", "runtimeRequests", "turnItems"], {
-        turnItemTypes: ["approval_request", "user_input_request"],
+  const readRecords = Effect.fn("ControlThreadRead.readRecords")(function* (threadId: string) {
+    // Settled approvals can dwarf the recent runs; only pending requests need bodies.
+    const [records, pending] = yield* Effect.all([
+      threads.getThreadRecords(ThreadId.make(threadId), ["runs"], {
         recentRunLimit: RECENT_RUNS,
-      })
-      .pipe(Effect.mapError(readError)),
-  );
+      }),
+      store.pendingRequestRecords([threadId]),
+    ]).pipe(Effect.mapError(readError));
+    return {
+      runs: records.runs,
+      runtimeRequests: pending.map(({ request }) => request),
+      turnItems: pending.flatMap(({ item }) => (item === null ? [] : [item])),
+    };
+  });
 
   const detail = Effect.fn("ControlHttp.threadDetail")(function* (threadId: string) {
     const shell = yield* getShell(threadId);

@@ -20,7 +20,7 @@ try:
     import toollog as _tl
 except Exception:
     _tl = None
-with (_tl.run('forge-workouts', _log_sys.argv[1:], name='watcher.run')
+with (_tl.run('forge-workouts', _log_sys.argv[1:], name='watcher.run', trigger=_tl.trigger())
       if _tl is not None and __name__ == '__main__' else _log_context.nullcontext()):
     import json
     import os

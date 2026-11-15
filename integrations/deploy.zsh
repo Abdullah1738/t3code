@@ -16,7 +16,8 @@ case "$name" in
   tail-gateway) exec "${0:A:h}/tail-gateway/install.zsh" "$@" ;;  # https://<name>.tail gateway, see tail-gateway/README.md
   robob-widgets) exec "${0:A:h}/robob-widgets/install.zsh" "$@" ;;
   harness-hooks) exec "${0:A:h}/harness-hooks/install.zsh" "$@" ;;
-  *) print -u2 "usage: deploy.zsh <9router-reauth|router-logging|agent-bridges|spectrum-bridge|telegram-bridge|robob-watch|memory-system|coord|app-api-cli|stream-recovery|catalog-guard|robob-guard|message-archive|offbox|local-helpers|harness-homes|harness-cli|tail-gateway|robob-widgets|harness-hooks> [--dry-run]"; exit 2 ;;
+  venice-x402) exec "${0:A:h}/venice-x402/install.zsh" "$@" ;;  # x402 Venice proxy + LaunchAgent, see venice-x402/README.md
+  *) print -u2 "usage: deploy.zsh <9router-reauth|router-logging|agent-bridges|spectrum-bridge|telegram-bridge|robob-watch|memory-system|coord|app-api-cli|stream-recovery|catalog-guard|robob-guard|message-archive|offbox|local-helpers|harness-homes|harness-cli|tail-gateway|robob-widgets|harness-hooks|venice-x402> [--dry-run]"; exit 2 ;;
 esac
 
 src="${0:A:h}/$name/"
@@ -92,5 +93,6 @@ fi
 if [[ "${1:-}" == "--dry-run" ]]; then
   print -r -- "dry run: $name"
 else
+  "$HOME/.bun/bin/bun" "${0:A:h}/robob-watch/src/cli.ts" log-marker --service "$name" --sha "$(git -C "${0:A:h}" rev-parse HEAD 2>/dev/null)" --step deploy.complete >/dev/null 2>&1 || true
   print -r -- "deployed $name to $dst"
 fi

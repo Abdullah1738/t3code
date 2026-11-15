@@ -22,6 +22,7 @@ import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import * as Tracer from "effect/Tracer";
 import { TestClock } from "effect/testing";
 import { ChildProcessSpawner } from "effect/process";
 import { expect } from "vite-plus/test";
@@ -1290,6 +1291,100 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
     }),
   );
 
+  it.effect("concurrent cold branch PR lookups share one git process per key", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      const remoteDir = yield* createBareRemote();
+      yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+      yield* runGit(repoDir, ["checkout", "-b", "feature/shared-pr"]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "feature/shared-pr"]);
+      const gitCommands: string[] = [];
+      const gate = {
+        matches: (args: ReadonlyArray<string>) => args.length === 1 && args[0] === "remote",
+        reached: yield* Deferred.make<void>(),
+        release: yield* Deferred.make<void>(),
+      };
+      const entered = yield* Deferred.make<void>();
+      let arrivals = 0;
+      const tracer = Tracer.make({
+        span: (options) => {
+          if (options.name === "GitManager.rememberPrLookupGitState" && ++arrivals === 8) {
+            Deferred.doneUnsafe(entered, Effect.void);
+          }
+          return new Tracer.NativeSpan(options);
+        },
+      });
+      const { manager, ghCalls } = yield* makeManager({ gitCommands, gitSpawnGate: gate });
+      const lookups = yield* Effect.forEach(
+        Array.from({ length: 8 }),
+        () => manager.branchPullRequest({ cwd: repoDir, branch: "feature/shared-pr" }),
+        { concurrency: "unbounded" },
+      ).pipe(Effect.withTracer(tracer), Effect.forkChild);
+      yield* Deferred.await(entered);
+      yield* Deferred.await(gate.reached);
+      yield* Deferred.succeed(gate.release, undefined);
+      const results = yield* Fiber.join(lookups);
+      expect(results).toEqual(Array.from({ length: 8 }, () => null));
+      expect(gitCommands.filter((command) => command === "remote")).toHaveLength(1);
+      expect(ghCalls.filter((call) => call.startsWith("pr list "))).toHaveLength(1);
+
+      yield* manager.invalidateStatus(repoDir);
+      yield* manager.branchPullRequest({ cwd: repoDir, branch: "feature/shared-pr" });
+      expect(gitCommands.filter((command) => command === "remote")).toHaveLength(2);
+    }),
+  );
+
+  it.effect("missing branches share raw remote refs and still select their own PR", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      const remoteDir = yield* createBareRemote();
+      yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+      const branches = Array.from({ length: 8 }, (_, index) => `feature/branch-${index}`);
+      for (const branch of branches) {
+        yield* runGit(repoDir, ["push", "origin", `HEAD:refs/heads/${branch}`]);
+      }
+      const gitCommands: string[] = [];
+      const { manager } = yield* makeManager({
+        gitCommands,
+        ghScenario: {
+          prListByHeadSelector: Object.fromEntries(
+            branches.map((branch, index) => [
+              branch,
+              encodeCliJson([
+                {
+                  number: 240 + index,
+                  title: branch,
+                  url: `https://github.com/pingdotgg/codething-mvp/pull/${240 + index}`,
+                  baseRefName: "main",
+                  headRefName: branch,
+                  state: "OPEN",
+                  updatedAt: "2026-04-07T15:00:00Z",
+                },
+              ]),
+            ]),
+          ),
+        },
+      });
+      const lookupAll = Effect.forEach(branches, (branch) =>
+        manager.branchPullRequest({ cwd: repoDir, branch }),
+      );
+      for (let sweep = 0; sweep < 3; sweep++) {
+        if (sweep > 0) yield* TestClock.adjust("5 minutes");
+        const results = yield* lookupAll;
+        expect(results.map((result) => result?.number)).toEqual(
+          branches.map((_, index) => 240 + index),
+        );
+      }
+      expect(
+        gitCommands.filter(
+          (command) => command === "for-each-ref --format=%(refname) refs/remotes",
+        ),
+      ).toHaveLength(3);
+    }),
+  );
+
   it.effect("a warm branch PR lookup starts no git process", () =>
     Effect.gen(function* () {
       const repoDir = yield* makeTempDir("t3code-git-manager-");
@@ -1438,6 +1533,59 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
       yield* Fiber.join(inFlight);
 
       expect((yield* lookup)?.number).toBe(238);
+    }),
+  );
+
+  it.effect("fresh PR git state bypasses an older read and survives its late completion", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      const remoteDir = yield* createBareRemote();
+      yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+      yield* runGit(repoDir, ["checkout", "-b", "feature/fresh-race"]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "feature/fresh-race"]);
+      yield* runGit(repoDir, ["push", "origin", "HEAD:refs/heads/feature/new-head"]);
+      let held = false;
+      const gate = {
+        matches: (args: ReadonlyArray<string>) => {
+          if (held || args[0] !== "for-each-ref" || args.at(-1) !== "refs/heads/feature/fresh-race")
+            return false;
+          held = true;
+          return true;
+        },
+        reached: yield* Deferred.make<void>(),
+        release: yield* Deferred.make<void>(),
+      };
+      const branches = ["feature/fresh-race", "feature/new-head"];
+      const { manager } = yield* makeManager({
+        gitSpawnGate: gate,
+        ghScenario: {
+          prListByHeadSelector: Object.fromEntries(
+            branches.map((branch, index) => [
+              branch,
+              encodeCliJson([
+                {
+                  number: 250 + index,
+                  title: branch,
+                  url: `https://github.com/pingdotgg/codething-mvp/pull/${250 + index}`,
+                  baseRefName: "main",
+                  headRefName: branch,
+                  state: "OPEN",
+                  updatedAt: "2026-04-07T15:00:00Z",
+                },
+              ]),
+            ]),
+          ),
+        },
+      });
+      const input = { cwd: repoDir, branch: "feature/fresh-race" };
+      const older = yield* Effect.forkChild(manager.branchPullRequest(input));
+      yield* Deferred.await(gate.reached);
+      yield* runGit(repoDir, ["branch", "--set-upstream-to=origin/feature/new-head"]);
+      expect((yield* manager.branchPullRequest(input, { freshGitState: true }))?.number).toBe(251);
+      yield* Deferred.succeed(gate.release, undefined);
+      yield* Fiber.join(older);
+      expect((yield* manager.branchPullRequest(input))?.number).toBe(251);
     }),
   );
 

@@ -111,3 +111,92 @@ it.live("benchmarks 10000 cached hits on 8 KB rows against the previous SHA-256 
     });
   }),
 );
+
+it.effect("bounds distinct entity keys and reloads the least recently used value", () =>
+  Effect.gen(function* () {
+    let decodes = 0;
+    const cache = makeDecodeCache(
+      "test",
+      (json) => Effect.sync(() => ({ text: json, decode: ++decodes })),
+      (value: typeof row) => value.id,
+      Effect.succeed({}),
+      { maxEntries: 3, maxBytes: 1024 },
+    );
+    const read = counts();
+    const entity = (id: string) => ({ id, cache_version: 1, json: id });
+    const hot = yield* cache.decode(entity("hot"), read);
+    yield* cache.decode(entity("cold"), read);
+    yield* cache.decode(entity("warm"), read);
+    assert.strictEqual(yield* cache.decode(entity("hot"), read), hot);
+    for (let i = 0; i < 30; i++) {
+      yield* cache.decode(entity(`new-${i}`), read);
+      assert.isAtMost(cache.stats().entries, 3);
+      assert.strictEqual(yield* cache.decode(entity("hot"), read), hot);
+    }
+    const before = decodes;
+    assert.strictEqual((yield* cache.decode(entity("cold"), read)).text, "cold");
+    assert.strictEqual(decodes, before + 1);
+    assert.strictEqual(read.evictions, cache.stats().evictions);
+  }),
+);
+
+it.effect(
+  "bounds source bytes, bypasses oversized rows, and accounts replacements and removals",
+  () =>
+    Effect.gen(function* () {
+      const cache = makeDecodeCache(
+        "test",
+        (json) => Effect.succeed({ text: json }),
+        (value: typeof row) => value.id,
+        Effect.succeed({}),
+        { maxEntries: 100, maxBytes: 40 },
+      );
+      const read = counts();
+      const entity = (id: string, json = "x".repeat(8), cache_version = 1, board_id = "a") => ({
+        id,
+        json,
+        cache_version,
+        board_id,
+      });
+      for (let i = 0; i < 30; i++) {
+        yield* cache.decode(entity(String(i)), read);
+        assert.isAtMost(cache.stats().sourceBytes, 40);
+        assert.isAtMost(cache.stats().entries, 2);
+      }
+      yield* cache.decode(entity("29", "short", 2), read);
+      assert.strictEqual(cache.stats().sourceBytes, 26);
+      const large = entity("29", "x".repeat(21), 3);
+      assert.strictEqual((yield* cache.decode(large, read)).text, large.json);
+      assert.strictEqual(cache.stats().sourceBytes, 16);
+      assert.isUndefined(cache.lookup(large, read));
+      yield* cache.drop("28");
+      assert.strictEqual(cache.stats().sourceBytes, 0);
+      yield* cache.decode(entity("a"), read);
+      yield* cache.decode(entity("b", "b", 1, "b"), read);
+      yield* cache.reconcile("a", new Set());
+      assert.strictEqual(cache.stats().sourceBytes, 2);
+      assert.isDefined(cache.lookup(entity("b", "b", 1, "b"), read));
+      yield* cache.reconcile("b", new Set());
+      assert.strictEqual(cache.stats().entries, 0);
+      assert.strictEqual(cache.stats().sourceBytes, 0);
+    }),
+);
+
+it.effect("bounds the default cache after more than its distinct-key capacity", () =>
+  Effect.gen(function* () {
+    const cache = makeDecodeCache(
+      "test",
+      (json) => Effect.succeed({ text: json }),
+      (value: typeof row) => value.id,
+      Effect.succeed({}),
+    );
+    const read = counts();
+    for (let i = 0; i < 10_000; i++) {
+      yield* cache.decode({ id: `row-${i}`, cache_version: 1, json: "small" }, read);
+      assert.isAtMost(cache.stats().entries, 8_192);
+    }
+    assert.strictEqual(cache.stats().entries, 8_192);
+    assert.isUndefined(cache.lookup({ ...row, id: "row-0" }, read));
+    assert.isDefined(cache.lookup({ ...row, id: "row-9999" }, read));
+  }),
+);

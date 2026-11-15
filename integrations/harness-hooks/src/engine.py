@@ -113,7 +113,8 @@ def _log(**record):
                      _log_enum(record.get("error"), _LOG_ERRORS),
                      ids={"threadId": record.get("robobThreadId"), "sessionId": record.get("sessionId"),
                           "nativeAgentId": record.get("nativeAgentId"),
-                          "cardNumber": record.get("cardNumber")}, cwd=record.get("cwd"), matched=record.get("matchedRoot"))
+                          "cardNumber": record.get("cardNumber")}, cwd=record.get("cwd"), matched=record.get("matchedRoot"),
+                     identity_source=_log_enum(record.get("identity_source"), {"cache", "control", "negative-cache"}))
         path = _state()
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         thread_id = record.get("robobThreadId")
@@ -140,7 +141,7 @@ def _log(**record):
             "cmd": None,
             "ms": record.get("ms") if type(record.get("ms")) in (int, float) else 0,
             "error": _log_enum(record.get("error"), _LOG_ERRORS),
-            "identity_source": _log_enum(record.get("identity_source"), {"cache", "control"}),
+            "identity_source": _log_enum(record.get("identity_source"), {"cache", "control", "negative-cache"}),
             "cause": record.get("cause")[:240] if record.get("rule") == "live-database-script-unresolved" and isinstance(record.get("cause"), str) else None,
             "audit_error": audit_error,
         }
@@ -246,7 +247,7 @@ def _get_unbounded(path, deadline, *, timeout=1.2):
 def _native(event, harness):
     session = event.get("session_id")
     agent = event.get("agent_id")
-    if harness == "codex":
+    if harness in {"codex", "codex-cu"}:
         # The hook inherits the app-server's environment, not the tool shell's.
         # Only payload IDs identify the executing agent; shim fallbacks pass
         # CODEX_THREAD_ID explicitly as their synthetic event's session_id.
@@ -466,7 +467,8 @@ def _command_with_context(command, identity):
 
 
 _IDENTITY_BINDING_TTL = 30 * 60
-_CLAUDE_IDENTITY_TTL = 12 * 60 * 60
+_IDENTITY_FALLBACK_TTL = 12 * 60 * 60
+_IDENTITY_UNAVAILABLE_TTL = 30
 _IDENTITY_LOOKUP_BUDGET = 4.5
 _IDENTITY_CALL_TIMEOUT = 3.0
 
@@ -477,7 +479,7 @@ def _identity_transport_error(error):
     return isinstance(error, (TimeoutError, ConnectionError, urllib.error.URLError))
 
 
-def _lookup_identity(path, harness):
+def _lookup_identity(path, harness, *, retry=True):
     # Leave room for the 3s classifier and 1.5s lineage walk in the 10s hook.
     deadline = time.monotonic() + _IDENTITY_LOOKUP_BUDGET
     for attempt in range(2):
@@ -485,8 +487,23 @@ def _lookup_identity(path, harness):
             return _get(path, deadline=min(deadline, time.monotonic() + _IDENTITY_CALL_TIMEOUT),
                         timeout=_IDENTITY_CALL_TIMEOUT)
         except Exception as error:
-            if attempt or not _identity_transport_error(error) or time.monotonic() >= deadline:
+            if not retry or attempt or not _identity_transport_error(error) or time.monotonic() >= deadline:
                 raise
+
+
+def _write_identity_state(path, value):
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix="identity-", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(value, f)
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+    except OSError:
+        pass
 
 
 def resolve_identity(event, harness, *, fresh=False):
@@ -494,8 +511,8 @@ def resolve_identity(event, harness, *, fresh=False):
 
     Claude children need the hook's agent_id. A shell with only the session id
     identifies the parent, not necessarily the shell's executing child.
-    During transport outages Claude can reuse a binding for 12h, but never its
-    model for a fresh policy check. Authoritative misses invalidate the binding.
+    During transport outages native hooks can reuse a binding for 12h, but never
+    its model for a fresh policy check. Authoritative misses invalidate the binding.
     """
     native, agent, driver = _native(event, harness)
     if not isinstance(native, str) or not native or (agent is not None and not isinstance(agent, str)):
@@ -505,6 +522,7 @@ def resolve_identity(event, harness, *, fresh=False):
         instance = os.environ.get("HARNESS_HOOKS_PROVIDER_INSTANCE", "")
         key = hashlib.sha256(json.dumps([base, driver, instance, native, agent], separators=(",", ":")).encode()).hexdigest()
         cache_file = _state() / "identity" / (key + ".json")
+        unavailable_file = cache_file.with_suffix(".unavailable")
         cached = _read_json(cache_file, {})
         at = cached.get("at") if isinstance(cached, dict) else None
         age = time.time() - at if type(at) in (int, float) else float("inf")
@@ -519,19 +537,27 @@ def resolve_identity(event, harness, *, fresh=False):
             if age >= 60:
                 binding.pop("model", None)
             return binding
+        fallback_cache = harness in {"claude", "codex", "codex-cu"} and valid_cache and 0 <= age < _IDENTITY_FALLBACK_TTL
+        unavailable = _read_json(unavailable_file, {})
+        failed_at = unavailable.get("at") if isinstance(unavailable, dict) else None
+        if not fallback_cache and type(failed_at) in (int, float) and 0 <= time.time() - failed_at < _IDENTITY_UNAVAILABLE_TTL:
+            return {"resolution": "unavailable", "identity_source": "negative-cache"}
         params = {"nativeId": native, "driver": driver}
         if agent:
             params["agentId"] = agent
         if instance:
             params["instance"] = instance
         try:
-            resolved = _lookup_identity("/identity/resolve?" + urllib.parse.urlencode(params), harness).get("identity")
+            resolved = _lookup_identity("/identity/resolve?" + urllib.parse.urlencode(params), harness,
+                                        retry=not fallback_cache).get("identity")
         except Exception as error:
             fallback_age = time.time() - at if type(at) in (int, float) else float("inf")
-            if harness == "claude" and _identity_transport_error(error) and valid_cache and 0 <= fallback_age < _CLAUDE_IDENTITY_TTL:
-                binding = {**identity, "identity_source": "cache"}
-                binding.pop("model", None)
-                return binding
+            if _identity_transport_error(error):
+                if fallback_cache and 0 <= fallback_age < _IDENTITY_FALLBACK_TTL:
+                    binding = {**identity, "identity_source": "cache"}
+                    binding.pop("model", None)
+                    return binding
+                _write_identity_state(unavailable_file, {"at": time.time()})
             raise
         if not isinstance(resolved, dict):
             raise ValueError("identity-response")
@@ -545,19 +571,12 @@ def resolve_identity(event, harness, *, fresh=False):
             raise ValueError("identity-driver-mismatch")
         if identity.get("resolution") == "resolved" and instance and identity.get("providerInstanceId") not in (None, instance):
             raise ValueError("identity-instance-mismatch")
+        try:
+            unavailable_file.unlink(missing_ok=True)
+        except OSError:
+            pass
         if identity.get("resolution") == "resolved" and identity.get("robobThreadId"):
-            try:
-                cache_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                fd, tmp = tempfile.mkstemp(prefix="identity-", dir=cache_file.parent)
-                try:
-                    with os.fdopen(fd, "w", encoding="utf-8") as f:
-                        json.dump({"at": time.time(), "identity": identity}, f)
-                    os.replace(tmp, cache_file)
-                finally:
-                    if os.path.exists(tmp):
-                        os.unlink(tmp)
-            except OSError:
-                pass
+            _write_identity_state(cache_file, {"at": time.time(), "identity": identity})
         else:
             cache_file.unlink(missing_ok=True)
         return {**identity, "identity_source": "control"}
@@ -832,8 +851,8 @@ def decide(event, harness):
             return result
         native, _, _ = _native(event, harness)
         if native:
-            # Claude shell calls need only the binding used to sign command context.
-            binding_only = (harness == "claude" and kind == "PreToolUse" and
+            # Shell calls need only the binding used to sign command context.
+            binding_only = (kind == "PreToolUse" and
                             _shell_input_field(event, harness) and _command(event))
             identity = resolve_identity(event, harness, fresh=not binding_only)
             if identity.get("resolution") != "resolved":

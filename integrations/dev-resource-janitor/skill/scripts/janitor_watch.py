@@ -13,7 +13,8 @@ import uuid
 
 
 STATE_DIR = Path(os.environ.get(
-    "DEV_JANITOR_WATCH_STATE", os.path.expanduser("~/.local/share/dev-janitor/hourly")
+    "DEV_JANITOR_WATCH_STATE", str(Path(os.environ.get(
+        "DEV_JANITOR_LOG_DIR", os.path.expanduser("~/.local/share/dev-janitor"))) / "hourly")
 ))
 STALE_SECONDS = 4 * 60 * 60
 ALERT_SECONDS = 6 * 60 * 60

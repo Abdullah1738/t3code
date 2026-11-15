@@ -140,6 +140,64 @@ class Base(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
 
+class StartupMonitorTests(Base):
+    def test_starting_persists_without_alert_and_logs_duration_on_ready(self):
+        sim = Sim(self)
+        sim.tick()
+        for _ in range(3):
+            result = sim.tick(ok=False, health={"starting": True, "phase": "reconcile"})
+            self.assertEqual(result["state"], "home_starting")
+        self.assertEqual(sim.backend()["state"], "home_starting")
+        self.assertEqual(sim.fx.telegrams, [])
+        self.assertEqual(sim.fx.created, [])
+        self.assertIn("state=home_starting", sim.log())
+        self.assertEqual(sim.tick()["state"], "home_up")
+        self.assertIn("startup_ready duration_s=", sim.log())
+
+    def test_legacy_starting_then_past_bound_alerts(self):
+        sim = Sim(self)
+        sim.tick()
+        with patch.dict(os.environ, OFFBOX_HOME_START_WAIT_S="120"):
+            for _ in range(4):
+                result = sim.tick(ok=False, health={"reasons": ["waiting for incus"]})
+        self.assertEqual(result["state"], "home_down")
+        self.assertEqual(len(sim.fx.telegrams), 1)
+        self.assertIn("home still starting after 120 s", sim.backend()["reason"])
+
+    def test_process_start_counts_time_before_first_observation(self):
+        sim = Sim(self)
+        sim.tick()
+        for _ in range(2):
+            result = sim.tick(ok=False, health={"starting": True, "phase": "pool", "startedAt": sim.now - 700})
+        self.assertEqual(result["state"], "home_down")
+        self.assertEqual(len(sim.fx.telegrams), 1)
+
+    def test_failed_reconcile_is_down_without_startup_grace(self):
+        sim = Sim(self)
+        sim.tick()
+        for _ in range(2):
+            result = sim.tick(ok=False, health={"reasons": ["start-up reconcile failed; retrying"]})
+        self.assertEqual(result["state"], "home_down")
+        self.assertNotIn("state=home_starting", sim.log())
+
+    def test_startup_after_an_alert_keeps_the_recovery_path(self):
+        sim = Sim(self)
+        sim.down()
+        self.assertEqual(len(sim.fx.telegrams), 1)
+        self.assertEqual(sim.tick(ok=False, health={"starting": True, "phase": "reconcile"})["state"], "home_starting")
+        self.assertEqual(len(sim.fx.telegrams), 1)
+        result = sim.up()
+        self.assertEqual(result["state"], "home_up")
+        self.assertIsNotNone(sim.state()["outage"]["recovered_at"])
+
+    def test_failed_startup_can_recover_without_sticking_in_starting(self):
+        sim = Sim(self)
+        sim.tick()
+        sim.tick(ok=False, health={"starting": True, "phase": "reconcile"})
+        sim.tick(ok=False, health={"reasons": ["start-up reconcile failed; retrying"]})
+        self.assertEqual(sim.tick()["state"], "home_up")
+
+
 class StateMachineTests(Base):
     def test_normal_up(self):
         sim = Sim(self)
@@ -660,7 +718,7 @@ class HttpTests(Base):
         self.assertEqual((result["ok"], result["error"]), (True, ""))
         self.assertEqual(result["health"], {"mode": "ok", "reasons": [], "pool": "ONLINE", "mdraid": "ok",
                                             "boot_id": "b-1", "version": "0.3", "uptime_s": 123,
-                                            "boatd_uptime_s": 45})
+                                            "boatd_uptime_s": 45, "starting": False, "phase": "", "startedAt": None})
         del full["boatd_uptime_s"]   # not in the contract: fine without it
         self.assertIsNone(hm.check_health(url)["health"]["boatd_uptime_s"])
         seen = server.seen[-1]

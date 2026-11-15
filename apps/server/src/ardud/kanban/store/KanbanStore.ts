@@ -125,6 +125,34 @@ const Application = codec(InstructionApplication);
 export type NewCardEvent = Omit<KanbanCardEvent, "id">;
 export type NewScriptRun = Omit<KanbanScriptRun, "id">;
 
+// Scoped by the migration lock; the service reconciles only these threads after
+// the caller's outer transaction commits or rolls back.
+export const cardWrites = Context.Reference<
+  ((cards: ReadonlyArray<KanbanCard>) => void) | undefined
+>("KanbanCardWrites", { defaultValue: () => undefined });
+
+export type SlotEventWhy =
+  | "start"
+  | "join"
+  | "hold"
+  | "hold_end"
+  | "card_left"
+  | "thread_stopped"
+  | "pool_moved"
+  | "restart"
+  | "restore";
+
+export interface SlotEvent {
+  readonly id: number;
+  readonly boardId: string;
+  readonly poolKey: string;
+  readonly threadId: string;
+  readonly cardId: string | null;
+  readonly kind: "take" | "release";
+  readonly at: string;
+  readonly why: SlotEventWhy;
+}
+
 export interface DecodeCacheStats {
   readonly hits: number;
   readonly misses: number;
@@ -133,6 +161,23 @@ export interface DecodeCacheStats {
 }
 
 export interface KanbanStoreShape {
+  readonly addSlotEvent: (row: Omit<SlotEvent, "id">) => Effect.Effect<void, KanbanStoreError>;
+  readonly slotEvents: (filter: {
+    readonly boardId: string;
+    readonly from: string;
+    readonly to: string;
+  }) => Effect.Effect<ReadonlyArray<SlotEvent>, KanbanStoreError>;
+  readonly slotHistory: (filter: {
+    readonly boardId: string;
+    readonly from: string;
+    readonly to: string;
+  }) => Effect.Effect<
+    { readonly events: ReadonlyArray<SlotEvent>; readonly recordedSince: string | null },
+    KanbanStoreError
+  >;
+  readonly openSlots: (
+    boardId?: string,
+  ) => Effect.Effect<ReadonlyArray<SlotEvent>, KanbanStoreError>;
   readonly decodeCacheStats: Effect.Effect<Readonly<Record<string, DecodeCacheStats>>>;
   readonly boards: Effect.Effect<ReadonlyArray<KanbanBoard>, KanbanStoreError>;
   readonly board: (boardId: KanbanBoardId) => Effect.Effect<KanbanBoard | null, KanbanStoreError>;
@@ -211,6 +256,10 @@ export interface KanbanStoreShape {
     boardId: KanbanBoardId,
     cardIds: ReadonlyArray<KanbanCardId>,
     beforeId: number,
+  ) => Effect.Effect<ReadonlyArray<KanbanCardEvent>, KanbanStoreError>;
+  readonly activityHistory: (
+    boardId: KanbanBoardId,
+    window: { readonly since: string; readonly until: string },
   ) => Effect.Effect<ReadonlyArray<KanbanCardEvent>, KanbanStoreError>;
   /** Every event on a board's cards with `since <= at < until`, oldest first. */
   readonly boardEvents: (
@@ -301,6 +350,14 @@ export interface KanbanStoreShape {
     id: KanbanDiscussionId,
   ) => Effect.Effect<
     { readonly seq: number; readonly createdAt: string; readonly answered: boolean } | null,
+    KanbanStoreError
+  >;
+  readonly ownerReply: (
+    id: KanbanDiscussionId,
+    threadId: ThreadId,
+    evaluator: boolean,
+  ) => Effect.Effect<
+    { readonly key: string; readonly createdAt: string; readonly answered: boolean } | null,
     KanbanStoreError
   >;
   /** Every message of a discussion, oldest first. */
@@ -901,6 +958,8 @@ const make = Effect.gen(function* () {
     run(
       "write card",
       Effect.gen(function* () {
+        const observe = yield* cardWrites;
+        const previous = observe === undefined ? null : yield* card(value.id);
         const json = yield* Card.encode(value);
         yield* sql`
           INSERT INTO ardud_kanban_cards (id, board_id, number, stage, active_thread_id, json)
@@ -910,9 +969,63 @@ const make = Effect.gen(function* () {
             active_thread_id = excluded.active_thread_id,
             json = excluded.json
         `;
+        observe?.(previous === null ? [value] : [previous, value]);
         cardWritten(value);
       }),
     );
+  const slotColumns = sql.literal(
+    'id, board_id AS "boardId", pool_key AS "poolKey", thread_id AS "threadId", card_id AS "cardId", kind, at, why',
+  );
+  const addSlotEvent = (row: Omit<SlotEvent, "id">) =>
+    run(
+      "write slot event",
+      sql`
+      INSERT INTO ardud_kanban_slot_events (board_id, pool_key, thread_id, card_id, kind, at, why)
+      VALUES (${row.boardId}, ${row.poolKey}, ${row.threadId}, ${row.cardId}, ${row.kind}, ${row.at}, ${row.why})
+    `.pipe(Effect.asVoid),
+    );
+  const slotEvents: KanbanStoreShape["slotEvents"] = ({ boardId, from, to }) =>
+    runRead(
+      "read slot events",
+      sql<SlotEvent>`
+      SELECT ${slotColumns} FROM ardud_kanban_slot_events
+      WHERE board_id = ${boardId} AND at >= ${from} AND at < ${to} ORDER BY id
+    `,
+    );
+  const slotHistory: KanbanStoreShape["slotHistory"] = ({ boardId, from, to }) =>
+    runRead(
+      "read slot history",
+      Effect.gen(function* () {
+        const rows = yield* sql<SlotEvent & { readonly recordedSince: string }>`
+        WITH carry AS (
+          SELECT MAX(id) AS id FROM ardud_kanban_slot_events
+          WHERE board_id = ${boardId} AND at < ${from}
+          GROUP BY pool_key, thread_id
+        ), selected AS (
+          SELECT * FROM ardud_kanban_slot_events WHERE id IN (SELECT id FROM carry)
+          UNION ALL SELECT * FROM ardud_kanban_slot_events
+          WHERE board_id = ${boardId} AND at >= ${from} AND at < ${to}
+        )
+        SELECT ${slotColumns},
+          (SELECT MIN(at) FROM ardud_kanban_slot_events WHERE board_id = ${boardId}) AS "recordedSince"
+        FROM selected ORDER BY id
+      `;
+        return { events: rows, recordedSince: rows[0]?.recordedSince ?? null };
+      }),
+    );
+  const openSlots: KanbanStoreShape["openSlots"] = (boardId) =>
+    runRead(
+      "read open slots",
+      sql<SlotEvent>`
+      SELECT ${slotColumns} FROM ardud_kanban_slot_events
+      WHERE id IN (
+        SELECT MAX(id) FROM ardud_kanban_slot_events
+        ${boardId === undefined ? sql.literal("") : sql`WHERE board_id = ${boardId}`}
+        GROUP BY board_id, pool_key, thread_id
+      ) AND kind = 'take' ORDER BY id
+    `,
+    );
+
   const pendingInstructionApplications: KanbanStoreShape["pendingInstructionApplications"] = (
     cardId,
     boardId,
@@ -989,6 +1102,47 @@ const make = Effect.gen(function* () {
           WHERE json_extract(e.json, '$.at') >= ${since} AND json_extract(e.json, '$.at') < ${until}
             AND c.board_id = ${boardId}
           ORDER BY e.id
+        `,
+        (rows) =>
+          Effect.forEach(rows, (row) =>
+            Effect.map(
+              CardEvent.decode(row.json),
+              (event) => ({ ...event, id: Number(row.id) }) as KanbanCardEvent,
+            ),
+          ),
+      ),
+    );
+
+  const activityHistory: KanbanStoreShape["activityHistory"] = (boardId, window) =>
+    runRead(
+      "read activity boundary history",
+      Effect.flatMap(
+        sql<IdJsonRow>`
+          WITH history AS (
+            SELECT e.id, e.card_id, json_extract(e.json, '$.at') AS at,
+              json_extract(e.json, '$.kind') AS kind,
+              substr(json_extract(e.json, '$.body'), 1, length('Wait expired: ')) AS body,
+              json_extract(e.json, '$.toStage') AS to_stage,
+              json_extract(e.json, '$.fromStage') AS from_stage
+            FROM ardud_kanban_cards c
+            JOIN ardud_kanban_card_events e INDEXED BY ardud_kanban_card_events_card ON e.card_id = c.id
+            WHERE c.board_id = ${boardId}
+              AND (json_extract(e.json, '$.at') < ${window.since} OR json_extract(e.json, '$.at') >= ${window.until})
+          ), markers AS (
+            SELECT *, (to_stage IS NOT NULL AND to_stage IS NOT from_stage) AS is_stage,
+              (kind IN ('wait_set', 'wait_cleared', 'wait_expired') OR
+                (kind = 'edited' AND (body GLOB 'Waiting *' OR body GLOB 'Wait ended: *' OR body GLOB 'Wait expired: *'))) AS is_wait,
+              (kind IN ('flagged', 'moved', 'review', 'wait_set') OR
+                (to_stage IS NOT NULL AND to_stage IS NOT from_stage) OR
+                (kind = 'edited' AND body GLOB 'Waiting *')) AS is_stall
+            FROM history
+          ), picked AS (
+            SELECT MAX(id) AS id FROM markers WHERE at < ${window.since} AND is_wait GROUP BY card_id
+            UNION SELECT MAX(id) AS id FROM markers WHERE at < ${window.since} AND is_stall GROUP BY card_id
+            UNION SELECT MAX(id) AS id FROM markers WHERE at < ${window.since} AND is_stage GROUP BY card_id
+            UNION SELECT MIN(id) AS id FROM markers WHERE at >= ${window.until} AND is_stage GROUP BY card_id
+          )
+          SELECT id, json FROM ardud_kanban_card_events WHERE id IN (SELECT id FROM picked) ORDER BY id
         `,
         (rows) =>
           Effect.forEach(rows, (row) =>
@@ -1142,13 +1296,16 @@ const make = Effect.gen(function* () {
             if (survivingKeys.has(key)) continue;
             yield* sql`DELETE FROM ardud_kanban_pools WHERE board_id = ${input.board.id} AND key = ${key}`;
           }
-          for (const card of input.cards) {
-            const json = yield* Card.encode(card);
+          const observe = yield* cardWrites;
+          for (const value of input.cards) {
+            const previous = observe === undefined ? null : yield* card(value.id);
+            const json = yield* Card.encode(value);
             yield* sql`
-              UPDATE ardud_kanban_cards SET json = ${json}, active_thread_id = ${card.activeThreadId}, stage = ${card.stage}
-              WHERE id = ${card.id}
+              UPDATE ardud_kanban_cards SET json = ${json}, active_thread_id = ${value.activeThreadId}, stage = ${value.stage}
+              WHERE id = ${value.id}
             `;
-            cardWritten(card);
+            observe?.(previous === null ? [value] : [previous, value]);
+            cardWritten(value);
           }
           for (const link of input.threadLinks) {
             const json = yield* ThreadLink.encode(link);
@@ -1316,6 +1473,43 @@ const make = Effect.gen(function* () {
         },
       ),
     );
+  const ownerReply: KanbanStoreShape["ownerReply"] = Effect.fn("KanbanStore.ownerReply")(
+    function* (id, threadId, evaluator) {
+      return yield* runRead(
+        "read owner reply obligation",
+        Effect.map(
+          sql<{ readonly key: string; readonly createdAt: string; readonly answered: number }>`
+            WITH actions AS (
+              SELECT seq, '' AS block, json_extract(json, '$.createdAt') AS at
+              FROM ardud_kanban_messages
+              WHERE discussion_id = ${id} AND json_extract(json, '$.author._tag') = 'owner'
+              UNION ALL
+              SELECT m.seq, json_extract(a.value, '$.blockId'), json_extract(a.value, '$.at')
+              FROM ardud_kanban_messages m, json_each(m.json, '$.answers') a
+              WHERE m.discussion_id = ${id} AND json_extract(a.value, '$.by._tag') = 'owner'
+            )
+            SELECT seq || ':' || block || ':' || at AS key, at AS createdAt, EXISTS (
+              SELECT 1 FROM ardud_kanban_messages reply
+              WHERE reply.discussion_id = ${id}
+                AND (json_extract(reply.json, '$.createdAt') > actions.at OR
+                  (json_extract(reply.json, '$.createdAt') = actions.at AND reply.seq > actions.seq))
+                AND ((${evaluator} AND json_extract(reply.json, '$.author._tag') = 'evaluator')
+                  OR json_extract(reply.json, '$.author.threadId') = ${threadId})
+            ) AS answered
+            FROM actions ORDER BY at DESC, seq DESC, block DESC LIMIT 1
+          `,
+          (rows) =>
+            rows[0]
+              ? {
+                  key: rows[0].key,
+                  createdAt: rows[0].createdAt,
+                  answered: Number(rows[0].answered) === 1,
+                }
+              : null,
+        ),
+      );
+    },
+  );
   const allMessages = (id: KanbanDiscussionId) =>
     runRead(
       "read all messages",
@@ -1594,10 +1788,15 @@ const make = Effect.gen(function* () {
     cardsInStage,
     nextCardNumber,
     putCard,
+    addSlotEvent,
+    slotEvents,
+    slotHistory,
+    openSlots,
     addCardEvent,
     pendingInstructionApplications,
     cardEvents,
     boardEvents,
+    activityHistory,
     lastTransitions,
     goals,
     putGoal,
@@ -1617,6 +1816,7 @@ const make = Effect.gen(function* () {
     putDiscussion,
     messages,
     ownerWait,
+    ownerReply,
     allMessages,
     message,
     putMessage,

@@ -3,9 +3,105 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { clean, emit, observed } from '../toollog.mjs';
+import { clean, emit, observed, tagFailurePhase } from '../toollog.mjs';
 
 import {fixture} from './support.mjs';
+test('replica diagnostics only retain finite numbers or unknown', async t => {
+  const {rows} = fixture(t);
+  for (const value of [42, 0, -5_001, 'unknown', 'sk-private', '/home/fixture@example.invalid', '42', NaN, Infinity, -Infinity, null, false, [], {}]) {
+    const error = Object.assign(new Error('Robob replica is not ready'), {
+      code:'REPLICA_BEHIND_THREAD', replicaGeneration:value, replicaAgeMs:value, threadAheadMs:value,
+      deferredThreads:value, maxThreadAheadMs:value,
+    });
+    await assert.rejects(observed('test', 'fixture.replica', () => { throw error; }), e => e === error);
+    const safe = Number.isFinite(value) ? value : 'unknown';
+    const expected = {replicaGeneration:safe,replicaAgeMs:safe,threadAheadMs:safe,deferredThreads:safe,maxThreadAheadMs:safe};
+    assert.deepEqual(rows().at(-1).props, expected);
+    assert.deepEqual(clean({component:'test',name:'fixture.replica',kind:'error',props:error}).props, expected);
+  }
+  assert.ok(!JSON.stringify(rows()).includes('sk-private'));
+  assert.ok(!JSON.stringify(rows()).includes('fixture@example.invalid'));
+});
+test('observed derives stable causes and only keeps fixed operational messages', async t => {
+  const {rows} = fixture(t);
+  const cases = [
+    [Object.assign(new Error('Robob replica is stale; recovery deferred'), {code:'REPLICA_UNAVAILABLE'}), 'REPLICA_UNAVAILABLE'],
+    [Object.assign(new Error('sk-private fixture@example.invalid /home/fixture@example.invalid/x'), {code:'ETIMEDOUT'}), 'ETIMEDOUT'],
+    [new TypeError('private prompt'), 'TypeError'],
+    [{code:'invalid code',name:'RangeError',message:'Bearer private'}, 'RangeError'],
+    [{code:'sk-private',name:'invalid name'}, 'operation_failed'],
+    [{code:'x'.repeat(65),name:'SyntaxError'}, 'SyntaxError'],
+    [{code:'',name:'Error/path@example.invalid'}, 'operation_failed'],
+    [new Error('Robob replica is stale; recovery deferred sk-private'), 'Error'],
+    [null, 'operation_failed'],
+  ];
+  for (const [error, tag] of cases) {
+    await assert.rejects(observed('test', 'fixture.failure', () => {throw error;}), value => value === error);
+    assert.equal(rows().at(-1).error.tag, tag);
+  }
+  assert.equal(rows()[0].error.message, 'Robob replica is stale; recovery deferred');
+  for (const [result, tag] of [[{ok:false,tag:'not_ready',code:'OTHER'},'not_ready'],
+    [{ok:false,code:'ECONNRESET'},'ECONNRESET'], [{ok:false,tag:'fixture@example.invalid'},'operation_failed']]) {
+    assert.equal(await observed('test','fixture.result',()=>result), result);
+    assert.equal(rows().at(-1).error.tag,tag);
+  }
+  const serialized = JSON.stringify(rows());
+  for (const secret of ['sk-private','fixture@example.invalid','private prompt','Bearer private']) assert.ok(!serialized.includes(secret));
+  assert.ok(rows().every(r => r.error.message.length <= 300));
+});
+
+test('hostile metadata and broken writes never replace results or errors', async t => {
+  fixture(t);
+  const hostile = new Proxy({}, {get(_target, key){if (key === 'then') return undefined; throw new Error('getter');},ownKeys(){throw new Error('keys');}});
+  assert.equal(await observed('test','fixture.result',()=>hostile),hostile);
+  assert.equal(await observed('test','fixture.result',()=>42,hostile),42);
+  await assert.rejects(observed('test','fixture.error',()=>{throw hostile;},hostile),e=>e===hostile);
+});
+test('fetch and abort causes keep safe codes and fixed messages without cause text', async t => {
+  const {rows} = fixture(t);
+  const privateMessage = 'connect https://user:password@example.invalid:3773/?token=sk-private';
+  const cases = [
+    ['TypeError', 'fetch failed', {code:'ECONNREFUSED'}, 'ECONNREFUSED'],
+    ['TypeError', 'fetch failed', {code:'UND_ERR_CONNECT_TIMEOUT'}, 'UND_ERR_CONNECT_TIMEOUT'],
+    ['TypeError', 'fetch failed', {code:'UND_ERR_SOCKET'}, 'UND_ERR_SOCKET'],
+    ['TypeError', 'fetch failed', {name:'AbortError'}, 'AbortError'],
+    ['TypeError', 'fetch failed', {name:'TimeoutError'}, 'TimeoutError'],
+    ['TypeError', 'fetch failed', undefined, 'FETCH_FAILED'],
+    ['TypeError', 'fetch failed', null, 'FETCH_FAILED'],
+    ['TypeError', 'fetch failed', {}, 'FETCH_FAILED'],
+    ['TypeError', 'fetch failed', {code:privateMessage,name:'TimeoutError'}, 'TimeoutError'],
+    ['TypeError', 'fetch failed', {code:'sk-private',name:privateMessage}, 'FETCH_FAILED'],
+    ['TypeError', 'fetch failed', {code:'x'.repeat(65),name:'AbortError'}, 'AbortError'],
+    ['TypeError', 'fetch failed', {code:20,name:'AbortError'}, 'AbortError'],
+    ['AbortError', 'The operation was aborted', {code:'ECONNRESET'}, 'ECONNRESET'],
+    ['TimeoutError', 'The operation was aborted due to timeout', {code:'UND_ERR_CONNECT_TIMEOUT'}, 'UND_ERR_CONNECT_TIMEOUT'],
+    ['AbortError', 'The operation was aborted', {name:'TimeoutError'}, 'TimeoutError'],
+    ['TimeoutError', 'The operation was aborted due to timeout', {code:privateMessage,name:privateMessage}, 'FETCH_FAILED'],
+    ['AbortError', 'The operation was aborted', undefined, 'AbortError'],
+    ['TimeoutError', 'The operation was aborted due to timeout', undefined, 'TimeoutError'],
+    ['TypeError', privateMessage, {code:'ECONNREFUSED'}, 'TypeError'],
+    ['Error', 'fetch failed', {code:'ECONNREFUSED'}, 'Error'],
+  ];
+  for (const [name, message, cause, tag] of cases) {
+    const error = Object.assign(new Error(message, {cause:cause && {...cause,message:privateMessage}}), {name});
+    await assert.rejects(observed('test', 'fixture.fetch', () => {throw error;}), value => value === error);
+    assert.deepEqual(rows().at(-1).error, {tag,message:message === privateMessage ? tag : message});
+  }
+  const cause = {code:'ECONNREFUSED',get message(){assert.fail('cause.message must not be read');}};
+  await assert.rejects(observed('test','fixture.fetch',()=>{throw new TypeError('fetch failed',{cause});}));
+  assert.deepEqual(rows().at(-1).error,{tag:'ECONNREFUSED',message:'fetch failed'});
+  for (const secret of ['example.invalid', 'password', 'sk-private', '?token=']) assert.ok(!JSON.stringify(rows()).includes(secret));
+});
+test('failure phases use validated private metadata and preserve frozen errors', async t => {
+  const {rows} = fixture(t);
+  for (const phase of ['activeSessions', 'bad phase', 'sk-private', 'https://user:password@example.invalid', '', 'x'.repeat(101)]) {
+    const error = Object.freeze(Object.assign(new Error('fetch failed'), {name:'TypeError',op:'untrusted',phase:'untrusted'}));
+    assert.equal(tagFailurePhase(error, phase), error);
+    await assert.rejects(observed('test','fixture.phase',()=>{throw error;}),value=>value===error);
+    assert.equal(rows().at(-1).props?.phase,phase === 'activeSessions' ? phase : undefined);
+  }
+  for (const error of [null, undefined, 'private', 42]) assert.equal(tagFailurePhase(error,'activeSessions'),error);
+});
 test('JS schema, privacy, errors, permissions and fail-open writes', async t => {
   const {root, rows} = fixture(t);
   emit('test','fixture.ok',{kind:'perf',ok:true,durationMs:1,ids:{account:'fixture@example.invalid',key:'sk-fixture-do-not-log'},props:{model:'cx/gpt-image-2',prompt:'private prompt',email:'fixture@example.invalid',tag:'sk-fixture-do-not-log'},error:{tag:'http_502',message:'private prompt fixture@example.invalid sk-fixture-do-not-log'}});

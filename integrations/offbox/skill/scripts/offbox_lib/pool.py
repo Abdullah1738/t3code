@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import hashlib
 import json
 import os
@@ -11,7 +12,7 @@ import traceback
 from pathlib import Path
 import time
 
-from . import common, capacity, prepare
+from . import common, capacity, prepare, home
 from .common import (BOX_WEDGED_NOTE, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_INFRA, EXIT_LOCAL, RUN_TTL_S, SIZES, TOO_BIG_NOTE, OffboxError, db, file_lock, new_id,
                      busy, db_retry, iso, kv_get, kv_set, local_error, log, now, say, write)
 from .common import backend, owner_scoped, token_owner
@@ -31,6 +32,24 @@ LOCK_WAIT_S = 30
 # once; the age bound only covers a reused pid (a recipe bring-up can take ~30 min).
 PENDING_MAX_S = 3600
 POLL_BUSY_MS = 150
+_PIN_SKIPS = contextvars.ContextVar('pool_pin_skips', default=None)
+
+
+def _pin_available(con, box_id, me=None, *, record=True):
+    from . import lease
+    pin = lease.foreign_pin(con, box_id, me)
+    if not pin:
+        return True
+    seen = _PIN_SKIPS.get()
+    if record and seen is not None and box_id not in seen['boxes']:
+        seen['boxes'].add(box_id)
+        detail = json.dumps(dict(run=seen['run'], owner=pin[0], until=iso(pin[1])))
+        if not seen['run'] or not con.execute(
+                "SELECT 1 FROM events WHERE box_id=? AND kind='pool_skip_pinned' "
+                "AND CASE WHEN json_valid(detail) THEN json_extract(detail, '$.run') END=?",
+                (box_id, seen['run'])).fetchone():
+            common.event(con, box_id, 'pool_skip_pinned', detail)
+    return False
 
 
 class PoolBusyError(capacity.CapacityError):
@@ -130,6 +149,11 @@ def _older(con, key, token, row=None):
     for waiter in _waiters(con, key):
         if waiter['token'] == token:
             return False
+        if row is not None:
+            from . import lease
+            owner = con.execute('SELECT owner FROM runs WHERE run_id=?', (waiter['run_id'],)).fetchone()
+            if lease.foreign_pin(con, row['box_id'], dict(owner=owner[0]) if owner else None):
+                continue
         if row is None or _matches(row, waiter['source']):
             return True
     return False
@@ -172,7 +196,7 @@ def _queue_snapshot(con, key, run_id, source, token):
         elif con.execute("SELECT 1 FROM prune_holds WHERE box_id=?", (bid,)).fetchone():
             held += 1
             unusable += 1
-        elif not _matches(row, source):
+        elif not _pin_available(con, bid, record=False) or not _matches(row, source):
             unusable += 1
         else:
             idle += 1
@@ -306,6 +330,7 @@ def members(con, key):
         WHERE p.pool_key=? AND {token_mine('l')} AND l.state IN ('running','stopped') AND COALESCE(l.note,'') NOT LIKE ?
         AND COALESCE(l.note,'') NOT LIKE ?
         AND COALESCE(l.note,'') NOT LIKE ?
+        AND NOT EXISTS (SELECT 1 FROM kv WHERE k='boot_dead:' || l.box_id)
         ORDER BY (l.state='running') DESC, l.last_used_at DESC""", (key, TOO_BIG_LIKE, DEAD_LIKE, WEDGED_LIKE)).fetchall()
 
 
@@ -329,6 +354,7 @@ def own_boxes(con, me):
 
 
 def candidates(con, key, size, source, me=None):
+    from . import lease
     # Existing boxes count toward the cap once adopted; surplus legacy boxes are left intact.
     rows = con.execute(f"""SELECT l.*, p.pool_key FROM leases l LEFT JOIN pool_members p USING(box_id)
         WHERE l.repo_key=? AND {token_mine('l')} AND l.state IN ('running','stopped')
@@ -346,6 +372,10 @@ def candidates(con, key, size, source, me=None):
     full = not _room(con, key)
     out = []
     for r in rows:
+        if not _pin_available(con, r['box_id'], me):
+            continue
+        if lease.boot_dead(con, r['box_id']):
+            continue
         if r["pool_key"] not in (None, key) or (full and r["pool_key"] is None):
             continue
         # A box built from a template's recipe (the template had expired) serves that template's runs too.
@@ -366,6 +396,8 @@ def candidates(con, key, size, source, me=None):
     def fit(r):
         have = rank.get(r["size"] or "default", 1)
         own = r["box_id"] in mine
+        if at_home():
+            return (int(r['state'] != 'running'), int(not own), int(have < want), have)
         oversized = have > max(want, rank.get(lease.natural_size(con, r), 1))
         if r["state"] == "running" and plentiful and oversized and (not own or r["size"] == "xlarge"):
             return (2, 0, have)
@@ -426,6 +458,14 @@ def _clear_queue_rows(con, me, run_id):
 
 
 def acquire(me, size=None, template=None, base=None, fresh=False, run_id=None, exclude=None, check_source=None):
+    token = _PIN_SKIPS.set(dict(run=run_id, boxes=set()))
+    try:
+        return _acquire_with_pins(me, size, template, base, fresh, run_id, exclude, check_source)
+    finally:
+        _PIN_SKIPS.reset(token)
+
+
+def _acquire_with_pins(me, size, template, base, fresh, run_id, exclude, check_source):
     import toollog
     with toollog.span("pool", "run.lease", ids={"run": run_id}, tag="lease_failed") as data:
         started = time.monotonic()
@@ -543,6 +583,34 @@ def _reuse_prepared(con, row, *args, **kwargs):
         return got
 
 
+def _reconcile_pinned(con, row):
+    """Observe an abandoned start without resuming, preparing or handing out its pinned disk."""
+    from . import allocation, api, lease
+    bid = row['box_id']
+    try:
+        guard = file_lock('box-' + bid, timeout=0)
+        guard.__enter__()
+    except OffboxError:
+        return
+    try:
+        with _lease_work(), prepare.guard(bid):
+            try:
+                confirmed, _ = lease._resume_confirmed(con, bid, RUN_TTL_S, None, pending=True, confirm_only=True)
+                if confirmed and confirmed.get('state') in api.STARTING_STATES:
+                    lease._wait_unanswered_resume(con, bid)
+            except api.BoxBootFailed as error:
+                lease._set_aside_boot(con, bid, error)
+            except lease.ResumeStopped:
+                pass  # Confirmed stopped; its pin and pool slot remain intact.
+            except (allocation.Busy, allocation.Fenced, lease.ArchivingSkip):
+                pass  # Another starter or a stopping box must not prevent use of a ready peer.
+            except lease.ResumeProvisionStalled as error:
+                con.execute("UPDATE leases SET state='resume_stalled', note=? WHERE box_id=?", (str(error), bid))
+                con.commit()
+    finally:
+        guard.__exit__(None, None, None)
+
+
 def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=None):
     from . import allocation, api, home, lease, outage
     from .identity import require_proven
@@ -617,6 +685,12 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
         if create_first or (pending and (pending['box_id'] in unusable or
                                             pending_busy.get(pending['box_id'], 0) > time.monotonic())):
             pending = None
+        if pending and not _pin_available(con, pending['box_id'], me):
+            if not allocation.resume_inflight(con, pending['box_id']):
+                _reconcile_pinned(con, pending)
+            pending = None
+        if pending and lease.boot_dead(con, pending['box_id']):
+            pending = None
         if pending and allocation.resume_inflight(con, pending['box_id']):
             pending = None
         bid = guard = None
@@ -653,9 +727,13 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                         except OffboxError:
                             pending = None  # the sender/another reconciler owns this box; choose a peer or queue
                         else:
-                            acquired = True
-                            con.execute("UPDATE pool_waiters SET reserved=1 WHERE token=?", (waiter,))
-                            con.commit()
+                            if not _pin_available(con, bid, me):
+                                guard.__exit__(None, None, None)
+                                pending = None
+                            else:
+                                acquired = True
+                                con.execute("UPDATE pool_waiters SET reserved=1 WHERE token=?", (waiter,))
+                                con.commit()
             except BaseException:
                 if acquired:
                     guard.__exit__(None, None, None)
@@ -809,6 +887,10 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                                     break
                                 continue
                             guard = g
+                            if not _pin_available(con, r['box_id'], me):
+                                g.__exit__(None, None, None)
+                                guard = None
+                                continue
                             if lease.active_runs(con, r["box_id"]):
                                 g.__exit__(None, None, None)
                                 guard = None
@@ -940,6 +1022,8 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                             f"offbox release {row['box_id']} --delete). Trying other pool boxes, then a fresh lease.")
                         continue
                     except OffboxError as e:
+                        if isinstance(e, home.StartWaitFailed):
+                            raise
                         if isinstance(e, api.BudgetExpired) and con.execute("SELECT 1 FROM kv WHERE k IN (?,?)",
                                 (f"resume_unanswered:{row['box_id']}", f"resume_provision:{row['box_id']}")).fetchone():
                             raise
@@ -982,10 +1066,9 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                         last_error = e
                         break
                     except OffboxError as e:
-                        if isinstance(e, common.SourceGone):
+                        if isinstance(e, (common.SourceGone, home.StartWaitFailed)):
                             raise
                         if resume_stall is not None:
-                            from . import home
                             refused = 400 <= (getattr(e, 'status', None) or 0) < 500
                             wrapped = OffboxError(f"{resume_stall}. Replacement allocation failed: {e}; nothing ran",
                                                   code=e.code, started=e.started or resume_stall.started,
@@ -1059,6 +1142,14 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
 
 
 def try_warm(me, size, source, exclude, run_id):
+    token = _PIN_SKIPS.set(dict(run=run_id, boxes=set()))
+    try:
+        return _try_warm(me, size, source, exclude, run_id)
+    finally:
+        _PIN_SKIPS.reset(token)
+
+
+def _try_warm(me, size, source, exclude, run_id):
     """Claim a free running peer once, without resuming, growing or creating a box."""
     from . import api, lease, ssh_sync
     con = db()
@@ -1112,7 +1203,7 @@ def try_warm(me, size, source, exclude, run_id):
                             return None
                         # A cached running lease and a successful TTL update can both outlive its machine.
                         peer = api.get(got['box_id'], deadline=time.time() + 10)
-                        if not peer or peer.get('state') not in api.LIVE_STATES or peer.get('dataExpiredAt') \
+                        if not peer or peer.get('state') not in api.LIVE_STATES or peer.get('dataExpiredAt') or peer.get('heldRuns') \
                                 or peer.get('type') != got['size']:
                             return None
                         left = api.left()
@@ -1122,6 +1213,8 @@ def try_warm(me, size, source, exclude, run_id):
                         if ready.returncode != 0:
                             return None
                 except common.SshHostKeyMismatch:
+                    raise
+                except home.StartWaitFailed:
                     raise
                 except Exception:  # noqa: BLE001 - malformed API responses also make this optional peer unusable
                     return None
@@ -1133,6 +1226,8 @@ def try_warm(me, size, source, exclude, run_id):
                 if not claimed:
                     release_guard(got)
     except common.SshHostKeyMismatch:
+        raise
+    except home.StartWaitFailed:
         raise
     except OffboxError:
         # A contended pool is optional here: keep the already-held cold box.
@@ -1188,7 +1283,8 @@ def _claim(con, me, row, run_id, *, pending_token=None):
     if last and last[0] != bid:
         old = con.execute("SELECT state, pinned_until FROM leases WHERE box_id=?", (last[0],)).fetchone()
         state = old[0] if old else "gone"
-        state = state if state in ("stopped", "archived") else "busy" if state == "running" else "gone"
+        state = ('set aside' if state == 'resume_stalled' or kv_get(con, 'boot_dead:' + last[0]) else
+                 state if state in ("stopped", "archived") else "busy" if state == "running" else "gone")
         if state == 'gone' and old and old['pinned_until']:
             deletion = con.execute("SELECT ts, kind, detail FROM events WHERE box_id=? AND kind IN "
                                    "('delete','reap_forget','reap_expired','lease_gone','lease_expired') "
@@ -1231,7 +1327,7 @@ def _refresh_background(con, key, pull_artifacts=True):
                 if runs.terminal_result(row):
                     runs.finish(row['run_id'], row['exit_code'], row['status'], run=row)
                     continue
-                runs.reconcile_lost(con, row['box_id'])
+                runs.reconcile_lost(con, row['box_id'], foreign=True)
                 row = runs.restore_run_state(con.execute('SELECT * FROM runs WHERE run_id=?', (row['run_id'],)).fetchone())
                 if row['status'] not in ('starting','running') and not (
                         row['status'] == 'infra' and start_check.recovery_marked(con, row)):
@@ -1250,7 +1346,8 @@ def _refresh_background(con, key, pull_artifacts=True):
                             continue
                         if result.code is not None or result.verdict == 'fenced':
                             start_check.settle(con, row, result, 'pool checked an unattached start',
-                                               until=None if api.left() is None else time.time() + api.left())
+                                               until=None if api.left() is None else time.time() + api.left(),
+                                               foreign=True)
                         else:
                             start_check.remember_wrapper(con, row, result.pid)
                             con.commit()
@@ -1279,7 +1376,7 @@ def _refresh_background(con, key, pull_artifacts=True):
                     if pulls:
                         if not pull_artifacts:
                             continue  # pulls keep the slot reserved until the normal follower/reaper finishes
-                        runs.do_pulls(row['box_id'], dict(row), pulls)
+                        runs.do_pulls(row['box_id'], dict(row), pulls, foreign=True)
                     status, code = runs.completed_result(row, {**st, 'exitCode':code})
                     runs.finish(row['run_id'], code, status, run=row)
         except OffboxError:

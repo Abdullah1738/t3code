@@ -4,6 +4,15 @@ One place for open money cases (refunds, disputes, failed or unexpected charges,
 
 The code lives here. The cases live in `~/Documents/assistant/money-cases/cases.json` (mode 600), never in git.
 
+Orders registered with `order-watch --amount ... --card LAST4` are checked on
+the first scheduled tick at least 15 minutes after placement. Missing bank
+evidence opens one `charge_unconfirmed` case per order, separate from unexplained
+charges. A matching bank SMS/email (merchant, card, currency, amount and placement
+window) closes it, including after tracker removal. Same-amount nearby orders
+remain unconfirmed when allocation is ambiguous. Archive failures retain the
+unconfirmed state; they never prove a payment failed. This needs both the
+app-api-cli deployment and the money-cases installer after approval.
+
 The check stops itself at 40 seconds, below the runner's 60-second timeout; `pings.json` records phase times, lookup and owner-query counts, msgs calls and the slowest phase in `timing`, also printed to stderr for runs over 20 seconds or when the final save times out (the previous pings file stays intact and no event is emitted). Timing in pings is sampled after the data fsync; stderr timing also includes the final timing-footer flush. The check uses null stdin for msgs and dumps a traceback and exits at 48 seconds if normal deadline handling cannot interrupt a hung C call (`MONEY_CASES_HARD_STOP` overrides this interval for subprocess tests). It reads owner messages through Robob's control API.
 
 ## Use
@@ -105,8 +114,12 @@ Owner-thread evidence comes from Robob's control API, using
 `~/.robob/ardud-control.json`. The server must supply message provenance
 (`automated` and `inboundMessageId`); an older server or a failed/timed-out
 lookup supplies no owner evidence and records a lookup error. There is no
-SQLite fallback. The per-check union-window fetch is capped at four seconds
-and the remaining check budget; `timing.owner_queries` counts HTTP requests.
+SQLite fallback. The per-check union-window fetch runs before receipt and order
+lookups in `follow()`, capped at ten seconds of the remaining check budget and
+three seconds per request. `timing.owner_queries` counts HTTP requests;
+`owner_result` reports complete coverage (`ok`), a partial refresh (`incomplete`),
+or a failed thread listing (`list_failed`). Partial refreshes save cache progress
+and supply no owner evidence.
 
 Inbox triage runs every card alert it sees through the same checks before its classifier, holds a fresh charge alert for five minutes in case its receipt comes with it, and sends every charge nothing explains on to the agent even when the classifier skips it. The SMS and the bank's mail copy of one charge are one question; two alerts of the same amount on the same channel are two. The check follows open questions each run, least recently checked first: it closes them when a receipt lands (and says so once if he was asked), routes expired waits to the daily list and retains asked questions as awaiting_answer without an age cutoff. Older linked money cases still accept receipt matches, closing a case nobody has touched when the receipt comes. Asked questions have no age cutoff. A receipt compatible with multiple distinct charge questions stays ambiguous; a historical receipt found later still counts when its timestamp uniquely matches the original charge window. Questions live in `questions.json` next to the cases. Runs outside the live watcher (`robob-watch test`, other `WATCH_DIR`s) work on a copy of the case, question and dead-card books in their own folder.
 

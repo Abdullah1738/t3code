@@ -64,6 +64,21 @@ class ClientDisk(unittest.TestCase):
     def test_full_health_even_with_ok_true_is_refused(self):
         self.assertIn('out of disk',disk_pressure.health_reason({'ok':True,'disk_full':True}))
 
+    def test_startup_probe_keeps_waiting_unless_disk_pressure_refuses_it(self):
+        for level, expected in [('ok',None),('full','out of disk'),('unknown','measurement unavailable')]:
+            data={'ok':False,'starting':True,'phase':'reconcile','disk':{'level':level}}
+            response=SimpleNamespace(read=lambda:json.dumps(data).encode())
+            with self.subTest(level=level),patch.object(home,'health_url',return_value='http://test'), \
+                 patch.object(home.urllib.request,'urlopen',return_value=contextlib.nullcontext(response)), \
+                 patch.object(home,'wait_while_starting',return_value=None) as wait:
+                reason=home._probe()
+                if expected:
+                    self.assertIn(expected,reason)
+                    wait.assert_not_called()
+                else:
+                    self.assertIsNone(reason)
+                    self.assertEqual(wait.call_args.args[0],'reconcile')
+
     def test_sync_rsync23_and_upload_enospc_are_infra90(self):
         for no_sync in (False,True):
             with self.subTest(no_sync=no_sync),contextlib.ExitStack() as stack:
@@ -89,6 +104,20 @@ class MonitorDisk(unittest.TestCase):
             data={'ok':True,'disk_low':True,'disk_full':full,'disk':{'level':'full' if full else 'low','disk_low':True,'disk_full':full}}
             with self.subTest(full=full),patch.object(monitor.urllib.request,'build_opener',return_value=self.response(data)):
                 result=monitor.check_health('http://test');self.assertEqual(result['error'],expected);self.assertEqual(result['ok'],ok)
+
+    def test_full_disk_does_not_receive_startup_grace(self):
+        for full in (False,True):
+            data={'ok':False,'starting':True,'phase':'reconcile','disk_full':full,
+                  'disk':{'level':'full' if full else 'ok','disk_full':full}}
+            with self.subTest(full=full),patch.object(monitor.urllib.request,'build_opener',return_value=self.response(data)):
+                result=monitor.check_health('http://test')
+                self.assertTrue(result['health']['starting'])
+                self.assertEqual(result['health']['phase'],'reconcile')
+                self.assertEqual(result['health']['disk']['disk_full'],full)
+                state=monitor.fresh_state(100)
+                for now in (100,160,220):
+                    monitor.step(state,{'check':result,'mac':{'online':True}},now)
+                self.assertEqual(state['state'],'home_down' if full else 'home_starting')
 
     def test_alert_once_stable_retry_key_and_status_disk_fields(self):
         state=monitor.fresh_state(100);state['disk']={'level':'low','disk_low':True,'filesystems':[{'filesystem':'offbox','free_bytes':1024**3,'free_pct':1,'level':'low'}]}

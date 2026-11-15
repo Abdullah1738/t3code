@@ -12,7 +12,7 @@ export const CARD_ASK_TOOL_DESCRIPTION = [
   "Use blocking only when work can't go on without the answer: the card waits in Needs Owner, freeing its Working slot; an unattached own worker may ask async/blocking from todo or blocking from needs_owner, and revise/reply on open asks in either stage.",
   "One thing per ask.",
   "He can give back: approve or reject, a pick, values he fills in (text, a number, a date, a file), an edit of your draft, a step he does himself, or nothing but having seen it.",
-  "Shortcuts: a bare question (free text); options (a pick: add details and mark yours recommended); draft (he may edit it; post exactly what comes back); action (what you run, with command, evidence, undo, and then for what you do after it: approve or reject); change or changes (before and after text).",
+  "Shortcuts set that up from what you pass: a bare question (free text); options (he picks: give each a detail and mark yours recommended; on an approval for a deploy, money or secret subtask, set approves: [its ids] on the go option); draft (a text you will post or send: he may edit it, and you post exactly what comes back); action (something you will run, with command, evidence and undo, and then for what you do after it: approve or reject); change or changes (texts you replace, before and after).",
   "For anything else say it with respond.",
   "Use kind notice for something he should only see; when nothing needs him, don't ask.",
   "Give title and context.",

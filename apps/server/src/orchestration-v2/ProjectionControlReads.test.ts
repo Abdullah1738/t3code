@@ -1,4 +1,6 @@
 import { assert, it } from "@effect/vitest";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import {
   EventId,
   MessageId,
@@ -16,9 +18,13 @@ import {
   type OrchestrationV2DomainEvent,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
@@ -193,6 +199,83 @@ const storageCases = (["sqlite", "memory"] as const).map((storage) => ({
       ? ProjectionStore.layer.pipe(Layer.provideMerge(SqlitePersistence.layerMemory))
       : ProjectionStore.layerMemory,
 }));
+
+it.live.each([false, true])(
+  "canonical record reads leave the writer available (metadata only=%s)",
+  (metadataOnly) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "projection-writer-bound-" });
+      const database = SqlitePersistence.layerFromPath(path.join(directory, "state.sqlite"));
+      const stores = ProjectionStore.layer.pipe(Layer.provideMerge(database));
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const store = yield* ProjectionStore.ProjectionStoreV2;
+        const now = yield* DateTime.now;
+        yield* Effect.forEach(fixtureEvents(now), (event) => store.apply(event), { discard: true });
+        yield* sql`CREATE TABLE unrelated_write(value INTEGER)`;
+        const entered = yield* Deferred.make<NodeSqliteClient.SqliteStatementObservation>();
+        const release = yield* Deferred.make<void>();
+        let paused = false;
+        const read = yield* store
+          .getThreadRecords(
+            threadId,
+            metadataOnly
+              ? []
+              : [
+                  "messages",
+                  "runs",
+                  "attempts",
+                  "nodes",
+                  "turnItems",
+                  "providerThreads",
+                  "checkpointScopes",
+                  "contextTransfers",
+                ],
+          )
+          .pipe(
+            Effect.provideService(NodeSqliteClient.StatementObserver, {
+              slowThresholdMs: 0,
+              record: (observation) =>
+                Effect.suspend(() => {
+                  if (paused) return Effect.void;
+                  paused = true;
+                  return Deferred.succeed(entered, observation).pipe(
+                    Effect.andThen(Deferred.await(release)),
+                  );
+                }),
+            }),
+            Effect.forkChild,
+          );
+        yield* Effect.gen(function* () {
+          assert.equal((yield* Deferred.await(entered)).connection, "reader");
+          yield* sql.withTransaction(sql`INSERT INTO unrelated_write VALUES (1)`);
+          assert.isUndefined(read.pollUnsafe());
+          assert.deepEqual(yield* sql`SELECT value FROM unrelated_write`, [{ value: 1 }]);
+        }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+        const result = yield* Fiber.join(read);
+        assert.equal(result.thread.id, threadId);
+        if ("messages" in result) assert.equal(result.messages[0]?.id, messageId);
+
+        yield* sql.withTransaction(
+          Effect.gen(function* () {
+            const thread = (yield* store.getThreadRecords(threadId, [])).thread;
+            yield* store.apply({
+              id: EventId.make("control:uncommitted-title"),
+              type: "thread.metadata-updated",
+              threadId,
+              occurredAt: now,
+              payload: { ...thread, title: "Uncommitted" },
+            });
+            const pinned = yield* store.getThreadRecords(threadId, ["messages"]);
+            assert.equal(pinned.thread.title, "Uncommitted");
+            assert.equal(pinned.messages[0]?.id, messageId);
+          }),
+        );
+      }).pipe(Effect.provide(stores));
+    }).pipe(Effect.provide(NodeServices.layer)),
+);
 
 it.effect.each(storageCases)(
   "$storage: finds the active root turn without an attempt reverse link",

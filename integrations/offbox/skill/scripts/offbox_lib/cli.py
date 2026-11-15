@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sqlite3
@@ -222,6 +223,12 @@ def _cmd_run(a, me) -> int:
 
 
 def _run_with_retries(a, me) -> int:
+    from . import home
+    with home.wait_budget():
+        return _run_with_wait_budget(a, me)
+
+
+def _run_with_wait_budget(a, me) -> int:
     from . import capacity, fallback, runs
     # No local-first lane any more (owner, 13 Nov 2026): it existed to save boat.dev minutes, and home boxes cost
     # nothing. Every `offbox run` goes to a box; --remote stays as "never fall back to the Mac".
@@ -240,6 +247,7 @@ def _run_with_retries(a, me) -> int:
             "this run is on Boat")
     from . import api, outage, pool
     waited_from = None
+    wait_end = None
     capacity_since = capacity_last_say = None
     capacity_round = None
     last_outage = None
@@ -254,14 +262,14 @@ def _run_with_retries(a, me) -> int:
                         preflight_done = True
                         home.before_run(getattr(a, "argv", None) or sys.argv[1:], explicit_base=explicit_base)
                     return _remote_once(a, me)
-                remaining = outage.window_seconds() - (time.monotonic() - waited_from)
+                remaining = wait_end - time.monotonic()
                 if remaining <= 0:
                     raise last_outage
                 if capacity_round is not None:
                     pause = outage.CAPACITY_RETRY_S - (time.monotonic() - capacity_round)
                     if pause > 0:
                         time.sleep(min(pause, remaining))
-                        remaining = outage.window_seconds() - (time.monotonic() - waited_from)
+                        remaining = wait_end - time.monotonic()
                         if remaining <= 0:
                             raise last_outage
                     capacity_round = time.monotonic()
@@ -269,20 +277,28 @@ def _run_with_retries(a, me) -> int:
                     return _remote_once(a, me)
             except OffboxError as e:
                 runs.retry_background(e)
+                run_id = e.run_id or os.environ.get(runs.BACKGROUND_RUN_ENV, '')
                 if isinstance(e, pool.PoolBusyError) and waited_from is not None and last_outage is not None and \
-                        time.monotonic() - waited_from >= outage.window_seconds() and not e.started:
+                        time.monotonic() >= wait_end and not e.started:
                     raise last_outage
                 if home.active() and home.unreachable(e):
                     last_home_outage = e
                     # Nothing was accepted by the home server. Ordinary work goes to Boat for this one run; a
                     # person's work waits for the home server; a pinned backend keeps today's waiting.
-                    run_id = e.run_id or os.environ.get(runs.BACKGROUND_RUN_ENV, '')
                     if home.may_fail_over(explicit_base):
                         if not reprobed and not home.recent_failure() and home.network_failure(e):
                             reprobed = True
                             if api.probe_backend("server", home.PROBE_TIMEOUT_S) is None:
                                 continue
-                        home.fail_over(str(e), getattr(a, "argv", None) or sys.argv[1:], run_id,
+                        phase = home.error_phase(e)
+                        if phase:
+                            why = home.wait_while_starting(phase, e.run_id or "", checkpoint="post", box=e.box)
+                            if why is None:
+                                continue
+                            e = home.StartWaitFailed(why, run_id, e.box)
+                        else:
+                            why = str(e)
+                        home.fail_over(why, getattr(a, "argv", None) or sys.argv[1:], run_id,
                                        explicit_base=explicit_base)
                     else:
                         decision = ('wait_person' if common.person() else 'wait_explicit_base'
@@ -292,6 +308,8 @@ def _run_with_retries(a, me) -> int:
                         raise OffboxError(f"the home offbox server is down ({e}); {common.person()}'s tasks wait "
                                           "until it is back. Nothing ran and nothing was sent to Boat",
                                           code=EXIT_HOME_DOWN) from e
+                    if isinstance(e, home.StartWaitFailed):
+                        raise
                 machine_capacity = isinstance(e, api.BoatAtCapacity)
                 if machine_capacity:
                     if e.started or not (a.no_fallback or a.remote or a.bg or
@@ -301,20 +319,23 @@ def _run_with_retries(a, me) -> int:
                     raise
                 if waited_from is None:
                     waited_from = time.monotonic()
+                    wait_end = (home.wait_deadline(min(outage.window_seconds(), home.wait_seconds()), clock=time.monotonic)
+                                if wait_explicit_base else waited_from + outage.window_seconds())
                 last_outage = e
                 if machine_capacity:
                     if capacity_since is None:
                         capacity_since = outage.now()
                         capacity_round = time.monotonic()
                     retry, capacity_last_say = outage.wait_for_capacity(
-                        waited_from, capacity_since, capacity_last_say, outage.window_seconds())
+                        waited_from, capacity_since, capacity_last_say, wait_end - waited_from)
                     if retry:
                         continue
                     raise
-                left = outage.window_seconds() - (time.monotonic() - waited_from)
+                left = wait_end - time.monotonic()
                 service = {'service': 'home offbox server'} if wait_explicit_base else {}
-                if left > 0 and outage.wait_until_up(outage.reason_of(e), left, **service):
-                    continue
+                with home.pre_start(run_id) if wait_explicit_base else contextlib.nullcontext():
+                    if left > 0 and outage.wait_until_up(outage.reason_of(e), left, **service):
+                        continue
                 if wait_explicit_base and home.unreachable(e):
                     raise home.base_down_error(explicit_base, str(e)) from e
                 raise outage.down_error(e, time.monotonic() - waited_from) from e
@@ -379,6 +400,12 @@ def _reap_other_backend(dry_run: bool) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from . import home
+    with home.wait_budget():
+        return _main_with_trace(argv)
+
+
+def _main_with_trace(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     name = argv[0] if argv else "help"
     if name not in {"wait", "logs", "kill", "save", "status", "ssh", "reap", "local", "log-rollup"}:

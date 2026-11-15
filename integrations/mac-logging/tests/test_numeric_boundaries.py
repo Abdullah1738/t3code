@@ -76,8 +76,8 @@ class NumericBoundaryTests(unittest.TestCase):
     def test_bad_memory_number_preserves_other_fields_and_rows(self):
         for value in INVALID + (-1,):
             with self.subTest(value=value):
-                good = dict(pid=2, command='git', memMb=10, cmprsMb=0, cpu=.5)
-                bad = dict(good, cpu=value)
+                good = dict(pid=2, command='git', memMb=10, cmprsMb=.5, cpu=0)
+                bad = dict(good, cmprsMb=value)
                 props = dict(swap=dict(totalMb=100, usedMb=value), vm=dict(pageSize=value, freePages=10),
                              io=dict(tps=10, mbPerS=value), top=[bad, good], watched=[bad, good],
                              counts=[dict(command='git', count=value, ppid1Count=1)],
@@ -86,7 +86,8 @@ class NumericBoundaryTests(unittest.TestCase):
                 if value is None:
                     self.assertIsNone(clean['swap']['usedMb'])
                     self.assertIsNone(clean['vm']['pageSize'])
-                    self.assertIsNone(clean['top'][0]['cpu'])
+                    self.assertIsNone(clean['top'][0]['cmprsMb'])
+                    self.assertNotIn('cpu', clean['top'][0])
                     self.assertIsNone(clean['pressure'])
                     self.assertEqual(clean['load'], [.5, 1])
                     continue
@@ -96,9 +97,11 @@ class NumericBoundaryTests(unittest.TestCase):
                 self.assertEqual(clean['io'], dict(tps=10))
                 for key in ('top', 'watched'):
                     self.assertEqual(len(clean[key]), 2)
+                    self.assertNotIn('cmprsMb', clean[key][0])
                     self.assertNotIn('cpu', clean[key][0])
                     self.assertEqual(clean[key][0]['pid'], 2)
-                    self.assertEqual(clean[key][1]['cpu'], .5)
+                    self.assertEqual(clean[key][1]['cmprsMb'], .5)
+                    self.assertNotIn('cpu', clean[key][1])
                 self.assertEqual(clean['counts'], [dict(command='git', ppid1Count=1)])
                 self.assertEqual(clean['load'], [.5, 1])
                 self.assertNotIn('pressure', clean)
@@ -119,6 +122,7 @@ class NumericBoundaryTests(unittest.TestCase):
                 self.status.write_text(json.dumps(dict(ts=self.now.timestamp(), ok=False,
                                                       stage='replica', last_success_ts=value)))
                 with patch.object(jobs.time, 'time', return_value=self.now.timestamp()), \
+                     patch.object(jobs, 'emit', side_effect=lambda *args, **kw: toollog.emit(*args, now=self.now, **kw)), \
                      patch.object(jobs, 'backup_processes', return_value={}), \
                      patch.object(jobs, 'backup_snapshot_age', return_value=(None, 'timeout')):
                     jobs.backup_run('memory', self.now.timestamp()-60, -1, 1, 0, '{}')

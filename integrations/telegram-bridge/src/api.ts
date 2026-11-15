@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { MAX_FILE_BYTES, parseCommand, validFileName, validMimeType } from "./cli.ts";
 import { redact } from "./redact.ts";
 import { enqueueNotice } from "./notification-policy.ts";
+import { BOARD_EVENT_KEY, BOARD_EVENT_KEY_LIMIT } from "./openchamber.ts";
 import type { ReminderRecord, Store } from "./store.ts";
 import { toolError, toolLog } from "./toollog.ts";
 
@@ -99,7 +100,7 @@ export function createApi({ store, enabled, chatId, timezone, health }: Options)
       if (request.method === "GET") {
         if (path === "/health") {
           const state = health();
-          // Project known scalar health fields, never config, errors, or credentials.
+          // Project known health fields, never config, errors, or credentials.
           const safe: Record<string, unknown> = {};
           for (const key of ["ok", "connected", "telegramConnected", "openchamberConnected"]) {
             if (typeof state[key] === "boolean") safe[key] = state[key];
@@ -109,6 +110,48 @@ export function createApi({ store, enabled, chatId, timezone, health }: Options)
             if (typeof value === "number" && Number.isFinite(value) && value >= 0) safe[key] = value;
           }
           if (["ok", "healthy", "degraded", "starting", "stopped"].includes(state.status as string)) safe.status = state.status;
+          if (state.board && typeof state.board === "object" && !Array.isArray(state.board)) {
+            const board = state.board as Record<string, unknown>;
+            const counters: Record<string, unknown> = {};
+            for (const key of ["boardFetches", "boardCacheHits", "boardFetchErrors", "boardBackoffMs", "lastFetchDurationMs"]) {
+              const value = board[key];
+              if (typeof value === "number" && Number.isFinite(value) && value >= 0) counters[key] = value;
+            }
+            if (board.lastFetchDurationMs === null) counters.lastFetchDurationMs = null;
+            if (board.lastFetchReason === null || ["dirty", "age", "cold"].includes(board.lastFetchReason as string)) {
+              counters.lastFetchReason = board.lastFetchReason;
+            }
+            const count = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+            for (const key of ["threadReads", "threadReadErrors"]) if (count(board[key])) counters[key] = board[key];
+            if (board.fetchesByReason && typeof board.fetchesByReason === "object" && !Array.isArray(board.fetchesByReason)) {
+              counters.fetchesByReason = Object.fromEntries(Object.entries(board.fetchesByReason)
+                .filter(([key, value]) => ["cold", "age", "hard", "soft"].includes(key) && count(value)));
+            }
+            if (board.threadReadsByReason && typeof board.threadReadsByReason === "object" && !Array.isArray(board.threadReadsByReason)) {
+              counters.threadReadsByReason = Object.fromEntries(Object.entries(board.threadReadsByReason)
+                .filter(([key, value]) => ["run", "state", "followup"].includes(key) && count(value)));
+            }
+            if (board.dirtyEventsByType && typeof board.dirtyEventsByType === "object" && !Array.isArray(board.dirtyEventsByType)) {
+              const events: Record<string, { hard: number; soft: number; local?: number }> = {};
+              let keys = 0;
+              for (const [key, value] of Object.entries(board.dirtyEventsByType)) {
+                if (key.length > 161 || !BOARD_EVENT_KEY.test(key) || !value || typeof value !== "object" || Array.isArray(value)) continue;
+                const { hard, soft, local } = value as Record<string, unknown>;
+                if (!count(hard) || !count(soft)) continue;
+                const bucket = key !== "other" && keys < BOARD_EVENT_KEY_LIMIT ? key : "other";
+                if (bucket !== "other") keys++;
+                if (!Object.hasOwn(events, bucket)) events[bucket] = { hard: 0, soft: 0 };
+                const entry = events[bucket]!;
+                entry.hard += hard;
+                entry.soft += soft;
+                if (count(local)) entry.local = (entry.local ?? 0) + local;
+              }
+              counters.dirtyEventsByType = events;
+            }
+            if (typeof board.windowStartedAt === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(board.windowStartedAt)
+              && Number.isFinite(Date.parse(board.windowStartedAt))) counters.windowStartedAt = board.windowStartedAt;
+            safe.board = counters;
+          }
           const active = enabled();
           const paired = chatId() !== undefined;
           return json({ ...safe, enabled: active, paired, ready: active && paired });

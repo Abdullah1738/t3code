@@ -18,10 +18,12 @@ import hashlib
 from html import unescape
 from html.parser import HTMLParser
 import json
+import math
 import os
 import re
 import subprocess
 import time
+import uuid
 from urllib.parse import parse_qs, unquote, urlsplit
 
 UTC = dt.timezone.utc
@@ -426,6 +428,74 @@ def _error(code, account=None, folder=None, uid=None):
             if v is not None}
 
 
+def _helper_phase(stderr, token, at):
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode('utf-8', 'replace')
+    if not isinstance(stderr, str):
+        return {}
+    slots = {}
+    for line in stderr.splitlines():
+        if not line.startswith('MAILSEARCH_PHASE ') or len(line) > 2048:
+            continue
+        try:
+            row = json.loads(line[len('MAILSEARCH_PHASE '):])
+        except (ValueError, RecursionError):
+            continue
+        if (not isinstance(row, dict) or row.get('token') != token
+                or type(row.get('slot')) is not int or not 0 <= row['slot'] < len(ACCOUNTS)
+                or row.get('state') not in ('active', 'failed', 'done')
+                or row.get('phase') not in ('session_open', 'order_list', 'order_detail', 'parse')
+                or type(row.get('startedAt')) not in (int, float)
+                or not 0 <= row['startedAt'] <= at or not math.isfinite(row['startedAt'])):
+            continue
+        elapsed = row.get('phaseElapsedMs')
+        if row['state'] == 'failed' and (type(elapsed) not in (int, float)
+                or not 0 <= elapsed <= 10**12 or not math.isfinite(elapsed)):
+            continue
+        if slots.get(row['slot'], {}).get('state') != 'failed':
+            slots[row['slot']] = row
+    pending = [row for row in slots.values() if row['state'] != 'done']
+    if not pending:
+        return {}
+    # A parent deadline belongs to the oldest still-running operation, not an
+    # account that already finished. After a helper deadline, prefer a timed-out
+    # worker to unrelated completed errors. Read helpers have exactly one slot.
+    row = min(pending, key=lambda item: (item['state'] != 'active', item.get('timedOut') is not True,
+                                         item['startedAt'], item['slot']))
+    return {'slot': row['slot'], 'phase': row['phase'], 'elapsed_ms': row['phaseElapsedMs'] if row['state'] == 'failed'
+            else max(0, at - row['startedAt']) * 1000,
+            'timed_out': row.get('timedOut') is True}
+
+
+def _run_mailsearch(runner, args, timeout, operation, phase):
+    token = uuid.uuid4().hex
+    try:
+        with operation(phase) as failed:
+            process = runner(args, capture_output=True, text=True, timeout=timeout,
+                             env={**_clean_env(), 'MAILSEARCH_PHASE_DIAGNOSTICS': '1',
+                                  'MAILSEARCH_PHASE_TOKEN': token})
+    except subprocess.TimeoutExpired as exc:
+        details = _helper_phase(exc.stderr, token, time.time())
+        details.pop('timed_out', None)
+        details.pop('slot', None)
+        failed(exc, **details)
+        raise
+    details = _helper_phase(getattr(process, 'stderr', None), token, time.time())
+    observed = bool(details)
+    selected_slot = details.pop('slot', None)
+    timed_out = details.pop('timed_out', False)
+    if process.returncode:
+        failed(TimeoutError() if timed_out else None, **details)
+    def record_status(*, upstream_code, slot, phase=None, elapsed_ms=None):
+        if observed and slot != selected_slot:
+            return
+        cause = details if observed else {'phase': phase, 'elapsed_ms': elapsed_ms}
+        upstream_code = 'account_timeout' if timed_out else upstream_code
+        failed(TimeoutError() if timed_out or upstream_code == 'account_timeout' else None,
+               upstream_code=upstream_code, **cause)
+    return process, record_status, observed
+
+
 def _scan(*, order_id=None, since=None, days=30, timeout=75, limit=150, max_reads=60,
           accounts=None, now=None, runner=None):
     """One bounded sender search, then reads only matching account/folder/UIDs.
@@ -434,7 +504,7 @@ def _scan(*, order_id=None, since=None, days=30, timeout=75, limit=150, max_read
     omit an order from indexed text although a trusted tracking link contains it.
     """
     measure = toollog.phase_recorder()
-    record_error = toollog.error_recorder()
+    operation = toollog.operation_recorder()
     runner = runner or subprocess.run
     now = now or dt.datetime.now(UTC)
     if now.tzinfo is None:
@@ -472,28 +542,28 @@ def _scan(*, order_id=None, since=None, days=30, timeout=75, limit=150, max_read
                                 'unrecognized_subjects_not_read', 'from_domain_is_not_dkim_verification']}
     try:
         with measure('fetch'):
-            process = runner(args + [query], capture_output=True, text=True,
-                             timeout=min(timeout, search_timeout + 3), env=_clean_env())
-        with measure('parse'):
+            process, search_failed, _ = _run_mailsearch(
+                runner, args + [query], min(timeout, search_timeout + 3), operation, 'order_list')
+        with measure('parse'), operation('parse'):
             data = json.loads(process.stdout)
         if not isinstance(data, dict) or not isinstance(data.get('hits'), list) or not isinstance(data.get('status'), dict):
             raise ValueError('invalid_search_response')
-        for account in requested:
+        for slot, account in enumerate(requested):
             status = data['status'].get(account, {})
             ok = status.get('ok') is True
             coverage['accounts'][account] = {'ok': ok}
             if not ok:
                 reason = str(status.get('error', '')).lower()
                 code = 'account_timeout' if 'timeout' in reason else 'account_unavailable'
+                search_failed(upstream_code=code, slot=slot, phase=status.get('phase'),
+                              elapsed_ms=status.get('phaseElapsedMs'))
                 errors.append(_error(code, account))
         if process.returncode and not errors:
             errors.append(_error('mailsearch_nonzero_exit'))
         hits = data['hits']
-    except subprocess.TimeoutExpired as exc:
-        record_error(exc)
+    except subprocess.TimeoutExpired:
         errors.append(_error('search_deadline_exceeded'))
-    except (OSError, ValueError, TypeError) as exc:
-        record_error(exc)
+    except (OSError, ValueError, TypeError):
         errors.append(_error('mailsearch_unavailable_or_invalid_response'))
     for account in requested:
         if account not in coverage['accounts']:
@@ -541,22 +611,23 @@ def _scan(*, order_id=None, since=None, days=30, timeout=75, limit=150, max_read
     def read_one(hit):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            with operation('order_detail') as failed:
+                failed(TimeoutError())
             return [], _error('overall_deadline_exceeded', hit['account']), False
         try:
             with measure('fetch'):
-                p = runner(['mailsearch', 'read', hit['account'], hit['folder'], str(hit['uid']), '--raw'],
-                           capture_output=True, text=True, timeout=min(12, remaining), env=_clean_env())
+                p, _, _ = _run_mailsearch(runner,
+                    ['mailsearch', 'read', hit['account'], hit['folder'], str(hit['uid']), '--raw'],
+                    min(12, remaining), operation, 'order_detail')
             if p.returncode:
                 return [], _error('message_read_failed', hit['account'], hit['folder'], hit['uid']), True
-            with measure('parse'):
+            with measure('parse'), operation('parse'):
                 events = parse_message(p.stdout, account=hit['account'], folder=hit['folder'],
                                        uid=hit['uid'], observed_at=iso())
             return events, None, True
-        except subprocess.TimeoutExpired as exc:
-            record_error(exc)
+        except subprocess.TimeoutExpired:
             return [], _error('message_read_timeout', hit['account'], hit['folder'], hit['uid']), True
-        except (OSError, ValueError, TypeError, AttributeError, IndexError) as exc:
-            record_error(exc)
+        except (OSError, ValueError, TypeError, AttributeError, IndexError):
             return [], _error('message_read_or_parse_failed', hit['account'], hit['folder'], hit['uid']), True
 
     with ThreadPoolExecutor(max_workers=4) as pool:

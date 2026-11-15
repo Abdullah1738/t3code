@@ -10,6 +10,9 @@ import type * as Exit from "effect/Exit";
 import { McpSchema } from "effect/ai";
 
 type Phase = NonNullable<AnalyticsEvent["errorPhase"]>;
+type ThreadReadStage = NonNullable<AnalyticsEvent["threadReadStages"]>[number];
+type MutableThreadReadStage = { -readonly [K in keyof ThreadReadStage]: ThreadReadStage[K] };
+
 export class McpCall extends Context.Service<
   McpCall,
   {
@@ -20,14 +23,33 @@ export class McpCall extends Context.Service<
       readonly taskId: string;
       readonly readCommitted: Effect.Effect<boolean | "unknown">;
     };
+    threadRead?: {
+      readerWaitMs: number;
+      queryMs: number;
+      renderMs: number;
+      threadReadStages: Array<MutableThreadReadStage>;
+      activeStage?: {
+        readonly row: MutableThreadReadStage;
+        readonly started: bigint;
+        readonly durationBefore: number;
+      };
+    };
     callerResolved: boolean;
     callerResolveMs: number;
+    requestTiming?: {
+      readonly authMs: number;
+      readonly dispatchMs: number;
+      readonly preHandlerMs: number;
+    };
     callerStarted?: bigint;
     readerLane: string;
+    waitStage?: "lookup.caller" | "lookup.target" | "waiting";
+    waitLookupMs?: number;
     phase: Phase;
     saved: boolean | "unknown";
     replyFailure?: "reply_timeout" | "reply_error";
     replyStage?: string;
+    replySubSteps?: ReadonlyArray<{ readonly subStep: string; readonly ms: number }>;
     handlerErrorTag?: string;
     handlerOutcome?: "timeout" | "refused";
   }
@@ -47,6 +69,9 @@ const BOARD_BUSY =
   /^(?:Missions board conflict: )?(?:Board busy: not written|Not saved \(board busy\))/;
 const TYPED_OUTCOMES = {
   TimeoutError: "timeout",
+  ThreadReadTimeoutError: "timeout",
+  PullRequestWatchTimeoutError: "timeout",
+  PullRequestToolTimeoutError: "timeout",
   PreviewAutomationTimeoutError: "timeout",
   PreviewAutomationRecordingDeadlineExpiredError: "timeout",
   PreviewAutomationUnavailableError: "refused",
@@ -138,6 +163,8 @@ export const trackDelegation = Effect.fnUntraced(function* (
 
 // The toolkit erases defects and some typed errors while encoding the MCP reply.
 export const handlerFailure = Effect.fnUntraced(function* <E>(cause: Cause.Cause<E>) {
+  // Detached cleanup after a deadline must not overwrite the returned timeout with "Failure".
+  if (Cause.hasInterruptsOnly(cause)) return;
   const call = yield* Effect.serviceOption(McpCall);
   if (call._tag === "None") return;
   const error = cause.reasons.flatMap((reason) =>
@@ -162,7 +189,11 @@ export function callOutcome(
       outcome: "interrupted",
       saved: state.saved,
       errorPhase: state.phase,
-      props: { code: "unknown", ...interruptionProps(exit.cause) },
+      props: {
+        code: "unknown",
+        ...interruptionProps(exit.cause),
+        ...(state.replySubSteps === undefined ? {} : { subSteps: state.replySubSteps }),
+      },
     };
   const output =
     exit._tag === "Success" && !(exit.value instanceof McpSchema.InputRequired)
@@ -220,7 +251,8 @@ export function callOutcome(
     state.replyFailure === "reply_timeout" ||
     code === "caller_unresolved" ||
     code === "delegation_timeout" ||
-    code === "send_timeout";
+    code === "send_timeout" ||
+    code === "lookup_timeout";
   const busy = code === "board_busy" || BOARD_BUSY.test(text);
   const refused =
     typedOutcome === "refused" ||
@@ -255,6 +287,7 @@ export function callOutcome(
     saved,
     props: {
       ...(state.replyStage === undefined ? {} : { phase: state.replyStage }),
+      ...(state.replySubSteps === undefined ? {} : { subSteps: state.replySubSteps }),
       code:
         state.replyFailure ??
         (busy

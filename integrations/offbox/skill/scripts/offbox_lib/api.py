@@ -21,7 +21,7 @@ import urllib.request
 import weakref
 
 from .common import (OffboxError, EXIT_INFRA, SERVER_CFG, backend, db, iso_ts, log, owner_scoped, require_mine,
-                     token_owner)
+                     token_owner, person)
 from . import capacity
 
 BACKEND = backend()
@@ -43,10 +43,33 @@ KEY_SERVICE = "offbox-server-api" if BACKEND == "server" else "boat-api"
 KEY_ACCOUNT = token_owner() if BACKEND == "server" else "ardud"
 _KEY: str | None = None
 LIVE_STATES = ("ready", "idle", "running")
+BOX_BOOT_CODES = frozenset(('boot_timeout', 'incus_failed', 'port_in_use'))
 STARTING_STATES = ("init", "provisioning", "provisioned", "cloning", "starting", "resuming")
 STOPPED_STATES = ("archived",)
 STOPPING_STATES = ("stopping",)
 REDACT_KEYS = ("url", "desktopUrl", "viewerUrl", "signedUrl")
+
+
+class BoxBootFailed(OffboxError):
+    """A terminal box response, distinct from an unreachable backend."""
+
+    def __init__(self, box_id, state, reason, status, api_code):
+        super().__init__(f"box {box_id} went to {state}: {reason}")
+        self.box_id, self.reason = box_id, reason
+        self.status, self.api_code = status, api_code
+
+
+def box_boot_failure(box_id, state, *, since=None):
+    from . import home
+    if not home.active() or state.get('state') not in (*STOPPED_STATES, 'error', 'cancelled'):
+        return None
+    reason = state.get('error') or ''
+    match = re.match(r'^(5\d{2})\s+(\w+)(?::|\s|$)', reason)
+    if not match:
+        return None
+    fresh = since is not None and (iso_ts(state.get('updatedAt')) or 0) >= since - .001
+    if match[2] in BOX_BOOT_CODES or fresh:
+        return BoxBootFailed(box_id, state['state'], reason, int(match[1]), match[2])
 
 
 def _key(timeout: float | None = None) -> str:
@@ -91,7 +114,10 @@ def probe_backend(name: str, timeout: float = 3) -> str | None:
                 with _open(req, timeout=max(.001, end - time.time())) as response:
                     json.loads(_read_response(response, end))
         return None
-    except (OffboxError, OSError, ValueError, subprocess.TimeoutExpired, http.client.HTTPException):
+    except (OffboxError, OSError, ValueError, subprocess.TimeoutExpired, http.client.HTTPException) as error:
+        from .home import StartWaitFailed
+        if isinstance(error, StartWaitFailed):
+            return str(error)
         return "authenticated API did not answer successfully"
 
 
@@ -126,7 +152,7 @@ class ApiError(OffboxError):
                 f"{NAME} API {status} {code}: {message}")
         super().__init__(text,
                          124 if status == 408 and code == "command_timeout" else EXIT_INFRA,
-                         outage=status in CF_OUTAGE or code == "server_not_ready" or full or low)
+                         outage=status in CF_OUTAGE or code in ("server_not_ready", "server_starting") or full or low)
         self.status, self.api_code, self.retryable = status, code, retryable
         self.message = message
         self.data = data or {}
@@ -351,10 +377,12 @@ def budget(seconds: float):
     prev = _DEADLINE
     mine = time.time() + seconds
     _DEADLINE = mine if prev is None else min(prev, mine)
+    initial = _DEADLINE
     try:
         yield
     finally:
-        _DEADLINE = prev
+        paused = max(0, _DEADLINE - initial) if _DEADLINE is not None else 0
+        _DEADLINE = None if prev is None else prev + paused
 
 
 def left() -> float | None:
@@ -404,7 +432,7 @@ def _read_response(response, deadline):
 
 def call(method: str, path: str, body=None, headers: dict | None = None, timeout: float = 60,
          retries: int = 2, ok404: bool = False, connect_retries: int | None = None, deadline: float | None = None):
-    from . import allocation, pool
+    from . import allocation, home, pool
     if method != "POST" or not (path == "/sandboxes" or path.endswith("/fork")):
         return _call(method, path, body, headers, timeout, retries, ok404, connect_retries, deadline)
     box_id = path.split("/")[2] if path != "/sandboxes" else None
@@ -425,7 +453,7 @@ def call(method: str, path: str, body=None, headers: dict | None = None, timeout
             con.commit()
         try:
             result = _call(method, path, body, headers, timeout, retries, ok404, connect_retries, deadline)
-        except (ApiError, BoatAtCapacity, capacity.CapacityError) as e:
+        except (ApiError, BoatAtCapacity, capacity.CapacityError, home.StartWaitFailed) as e:
             # _call wraps any refusal preceded by an uncertain send as a plain OffboxError.
             if pending and not isinstance(e, pool.PoolBusyError):
                 raise allocation.Unresolved("the retained create/fork is still unresolved; nothing ran. "
@@ -463,10 +491,37 @@ def _own_box(path: str) -> None:
 
 def _call(method: str, path: str, body=None, headers: dict | None = None, timeout: float = 60,
          retries: int = 2, ok404: bool = False, connect_retries: int | None = None, deadline: float | None = None):
+    global _DEADLINE
     _own_box(path)
+    from . import home
     scope = _REQUEST_SCOPE.get()
-    with scope.request() if scope is not None else contextlib.nullcontext():
-        return _request(method, path, body, headers, timeout, retries, ok404, connect_retries, deadline)
+    wait_end = None
+    while True:
+        try:
+            # A refusal ends this request. Startup has its own bound; a retry needs a fresh child timer.
+            with scope.request() if scope is not None else contextlib.nullcontext():
+                return _request(method, path, body, headers, timeout, retries, ok404, connect_retries, deadline)
+        except ApiError as error:
+            phase = home.error_phase(error)
+            if BACKEND != "server" or home.PRE_START.get() is None or not phase:
+                raise
+            box = path.split("/")[2] if path.startswith("/sandboxes/") else None
+            checkpoint = "person" if person() else (
+                "post" if path.endswith("/commands") else "autostop" if method == "PATCH" else "probe")
+            if wait_end is None:
+                wait_end = home.wait_deadline(home.wait_seconds())
+            began = time.monotonic()
+            why = home.wait_while_starting(phase, home.PRE_START.get(), checkpoint=checkpoint, box=box,
+                                           deadline=wait_end)
+            if why:
+                raise home.StartWaitFailed(why, home.PRE_START.get(), box) from error
+            elapsed = time.monotonic() - began
+            if deadline is not None:
+                deadline += elapsed
+            if _DEADLINE is not None:
+                _DEADLINE += elapsed
+            if scope is not None:
+                scope.end += elapsed
 
 
 def command_metadata(data: dict) -> dict:
@@ -486,7 +541,7 @@ def command_metadata(data: dict) -> dict:
 def _command_summary(status: int, code: str, data: dict) -> str:
     # Only protocol tags and numeric metadata are safe: backend messages can echo shell input.
     tags = {"command_timeout", "invalid_command", "machine_not_running", "spawn_failed", "incus_failed",
-            "server_not_ready", "not_found", "unauthorized", "admin_token", "internal", "sandbox_starting",
+            "server_not_ready", "server_starting", "not_found", "unauthorized", "admin_token", "internal", "sandbox_starting",
             "boat_starting", "rate_limited", "sandbox_direct_failed"}
     summary = str(status)
     if code:
@@ -657,6 +712,10 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
             retryable = bool((err.get("details") or {}).get("retryable")) or code in (
                 "sandbox_starting", "boat_starting", "idempotency_in_progress", "ssh_host_key_unavailable",
                 "rate_limited") or msg == "sandbox_restoring"
+            if BACKEND == "server" and e.code == 503 and code in ("server_not_ready", "server_starting"):
+                failure = ApiError(e.code, code, msg, retryable, data=d)
+                failure.starting, failure.phase = d.get("starting") is True, d.get("phase")
+                raise failure
             if e.code == 404 and ok404:
                 return None
             safe_method = method in ("GET", "DELETE", "PATCH") or "Idempotency-Key" in h
@@ -703,6 +762,7 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
 def probe(timeout: float = 15) -> str | None:
     """One cheap GET to see whether boat answers. None = it answers; else why not. No connect retries: each
     would add sends and sleeps, so a probe would outrun its interval."""
+    from .home import StartWaitFailed
     try:
         from . import disk_pressure
         if BACKEND == 'server' and disk_pressure.pending():
@@ -712,6 +772,8 @@ def probe(timeout: float = 15) -> str | None:
                 return why
         call("GET", "/limits", timeout=timeout, retries=0, connect_retries=0, deadline=time.time() + timeout)
         return None
+    except StartWaitFailed:
+        raise
     except ApiError as e:
         return None if not e.outage else f"HTTP {e.status}"
     except OffboxError:
@@ -1010,8 +1072,13 @@ def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7
         server_error = status is not None and status >= 500
         # Home clears the error before acknowledging a resume. A newer stopped error belongs to this attempt;
         # updatedAt is truncated to milliseconds by the server.
-        failed_resume = (home.may_fail_over() and st in STOPPED_STATES and server_error and since is not None
+        failed_resume = (home.active() and st in STOPPED_STATES and server_error and since is not None
                          and (iso_ts(s.get("updatedAt")) or 0) >= since - .001)
+        failure = box_boot_failure(box_id, s, since=since)
+        if failure and (failed_resume or since is None or st in ('error', 'cancelled')):
+            # Fresh allocation keeps its existing failover policy; lease reuse isolates the box against health.
+            failure.outage = (st == 'error' or failed_resume) and home.may_fail_over()
+            raise failure
         if st in ("error", "cancelled") or failed_resume:
             failed_start = server_error and (st == "error" or failed_resume)
             error = OffboxError(f"box {box_id} went to {st}: {s.get('error')}",
@@ -1067,6 +1134,8 @@ def remember_execution(box_id, status, *, pid=None, command_id=None):
                 counts = {
                     k: host.get(k) if type(host.get(k)) is int and host[k] >= 0 else None
                     for k in ('start', 'end')}
+                counts.update({k: host[k] if isinstance(host[k], str) else None
+                               for k in ('start_reason', 'end_reason') if k in host})
                 _COMMAND_HOST_BOXES[(box_id, 'command', cid)] = (cid, counts)
                 observed_pid = pid if pid is not None else data.get('processId')
                 if observed_pid is not None:

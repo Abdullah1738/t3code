@@ -1,4 +1,3 @@
-import { finishRollup, makeAccumulator } from "../ardud/analytics/rollup.ts";
 import { expect, it } from "@effect/vitest";
 import type { AnalyticsEvent } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -14,11 +13,7 @@ it.effect("records safe server error context without exception or log text", () 
       flush: Effect.void,
       record: (event) => Deferred.succeed(recorded, event).pipe(Effect.asVoid),
       ingest: () => Effect.void,
-      read: () =>
-        Effect.succeed({
-          rollup: finishRollup(makeAccumulator(), "2026-11-13", "2026-11-13T00:00:00.000Z"),
-          samples: [],
-        }),
+      read: () => Effect.die("unused"),
     });
     yield* Effect.logError("private prompt text", {
       _tag: "QueryTimeoutError",

@@ -38,6 +38,20 @@ class Logs(unittest.TestCase):
                          [{'cmd_bytes': 140111, 'cmd_via': mode, 'step_count': 39}
                           for mode in ('argv', 'file') for name in ('run.start', 'run.command')])
 
+    def test_disk_attempt_and_space_metadata_survive_the_logger_filter(self):
+        props = dict(tmp_free_bytes=123, tmp_size_bytes=456, tmp_fstype='tmpfs',
+                     workspace_free_bytes=789, workspace_size_bytes=1024, workspace_fstype='zfs',
+                     command_exit_code=2, wrapper_exit_code=2, disk_attempt=2,
+                     infra_failure='enospc', infra_reason='disk_exhausted')
+        toollog.emit('run', 'run.disk_space', props={**props, 'disk_space': {'path': '/private/secret'}})
+        self.assertEqual(self.rows()[0]['props'], props)
+
+    def test_toolchain_crash_metadata_survives_filter(self):
+        props = dict(infra_failure='native_crash', infra_reason='toolchain_unpack_crash', wrapper_exit_code=90)
+        toollog.emit('run', 'run.disk_space', ids={'box': 'bx_fixture'}, props=props)
+        self.assertEqual(self.rows()[0]['props'], props)
+        self.assertEqual(self.rows()[0]['ids'], {'box': 'bx_fixture'})
+
     def test_format_private_modes_and_only_allowed_metadata(self):
         secret = 'password=secret-1234567890123456'
         toollog.emit('run', 'run.request', ok=True, duration_ms=1.2345,

@@ -423,6 +423,7 @@ for (const [name, clientLayer] of [
         Effect.gen(function* () {
           const sql = yield* SqlClient.SqlClient;
           const observed: SqliteClient.SqliteStatementObservation[] = [];
+          const timings: SqliteClient.SqliteStatementObservation[] = [];
           const observer: SqliteClient.SqliteStatementObserver = {
             slowThresholdMs: 0,
             record: (entry) =>
@@ -439,7 +440,14 @@ for (const [name, clientLayer] of [
             );
           }).pipe(
             Effect.provideService(SqliteClient.StatementObserver, observer),
+            Effect.provideService(SqliteClient.StatementTimingObserver, (entry) => {
+              timings.push(entry);
+            }),
             Effect.withSpan("ObservedService.query"),
+          );
+          assert.deepEqual(
+            timings.map((entry) => [entry.operation, entry.connection, entry.outcome]),
+            observed.map((entry) => [entry.operation, entry.connection, entry.outcome]),
           );
           assert.deepEqual(
             observed.map((entry) => [entry.operation, entry.connection, entry.outcome]),
@@ -644,8 +652,17 @@ it.effect("observes worker-reader statements with their lane and no query conten
   withReaderClient((sql) =>
     Effect.gen(function* () {
       const observed: SqliteClient.SqliteStatementObservation[] = [];
+      const timings: SqliteClient.SqliteStatementObservation[] = [];
+      const acquiredLanes: Array<SqliteClient.ReaderLaneName | undefined> = [];
       const rows = yield* sql`SELECT name FROM entries`.pipe(
         SqliteClient.readOnly,
+        Effect.provideService(SqliteClient.StatementTimingObserver, (entry) => {
+          timings.push(entry);
+        }),
+        Effect.provideService(SqliteClient.ReaderWaitObserver, (ms, lane) => {
+          assert.isAtLeast(ms, 0);
+          acquiredLanes.push(lane);
+        }),
         Effect.provideService(SqliteClient.StatementObserver, {
           slowThresholdMs: 0,
           record: (entry) =>
@@ -659,6 +676,12 @@ it.effect("observes worker-reader statements with their lane and no query conten
         observed.map((entry) => [entry.operation, entry.connection, entry.lane]),
         [["read", "reader", "background"]],
       );
+      assert.deepEqual(acquiredLanes, ["background"]);
+      assert.deepEqual(
+        timings.map((entry) => [entry.operation, entry.connection, entry.lane]),
+        [["read", "reader", "background"]],
+      );
+      assert.equal(timings[0]?.durationMs, observed[0]?.durationMs);
       assert.isFalse(JSON.stringify(observed).includes("entries"));
     }),
   ),
@@ -934,6 +957,138 @@ it.effect("keeps read-only work inside a write transaction on the writer", () =>
   ),
 );
 
+it.effect.each(["reader", "writer", "writer worker"] as const)(
+  "labels each transaction statement on the %s without changing borrower attributes",
+  (connection) => {
+    const spans: Tracer.NativeSpan[] = [];
+    const writes = new Map<Tracer.NativeSpan, Array<[string, unknown]>>();
+    const tracer = Tracer.make({
+      span: (options) => {
+        const span = new Tracer.NativeSpan(options);
+        const recorded: Array<[string, unknown]> = [];
+        writes.set(span, recorded);
+        const attribute = span.attribute.bind(span);
+        span.attribute = (key, value) => {
+          recorded.push([key, value]);
+          attribute(key, value);
+        };
+        spans.push(span);
+        return span;
+      },
+    });
+    const run = (sql: SqlClient.SqlClient) =>
+      Effect.gen(function* () {
+        const transaction = sql.withTransaction(
+          Effect.gen(function* () {
+            assert.deepEqual(yield* sql`SELECT 1 AS value`, [{ value: 1 }]);
+            assert.deepEqual(yield* sql`SELECT 2 AS value`.values, [[2]]);
+          }),
+        );
+        yield* connection === "reader" ? transaction.pipe(SqliteClient.readOnly) : transaction;
+        yield* connection === "reader" ? sql`SELECT 3`.pipe(SqliteClient.readOnly) : sql`SELECT 3`;
+      }).pipe(
+        Effect.provideService(Statement.SpanPropagationEnabled, true),
+        Effect.withTracer(tracer),
+        Effect.map(() => {
+          assert.deepEqual(
+            spans
+              .filter((span) => !span.name.startsWith("sql.writer.pre_begin."))
+              .map((span) => span.name),
+            ["sql.transaction", "sqlite", "sqlite", "sqlite"],
+          );
+          const statements = spans.filter((span) => span.name === "sqlite");
+          const expected = connection === "reader" ? "reader" : "writer";
+          for (const span of statements) {
+            assert.equal(span.attributes.get("db.connection"), expected);
+            assert.equal(
+              span.attributes.get("db.reader.lane"),
+              connection === "reader" ? "background" : undefined,
+            );
+          }
+          for (const span of statements.slice(0, 2)) {
+            assert.equal(span.attributes.get("db.connection.reused"), true);
+            assert.equal(
+              span.attributes.get("db.reader.slot"),
+              spans[0]!.attributes.get("db.reader.slot"),
+            );
+            assert.deepEqual(
+              [...span.attributes].filter(
+                ([key]) =>
+                  (key.startsWith("db.reader.") && key !== "db.reader.slot") ||
+                  key === "db.lock_wait_ms",
+              ),
+              connection === "reader" ? [["db.reader.lane", "background"]] : [],
+            );
+            assert.deepEqual(
+              writes.get(span)!.filter(([key]) => key === "db.connection"),
+              [["db.connection", expected]],
+            );
+          }
+          const plain = statements[2]!;
+          assert.isFalse(plain.attributes.has("db.connection.reused"));
+          assert.isFalse(spans[0]!.attributes.has("db.connection.reused"));
+          assert.equal(plain.attributes.get("db.lock_wait_ms"), 0);
+          assert.equal(plain.attributes.get("db.reader.acquired"), true);
+          assert.equal(plain.attributes.get("db.reader.waiting"), false);
+          assert.equal(plain.attributes.get("db.reader.acquire_stage"), "slot");
+          assert.deepEqual(
+            writes
+              .get(plain)!
+              .filter(([key]) => key === "db.connection" || key === "db.reader.lane"),
+            connection === "reader"
+              ? [
+                  ["db.connection", "reader"],
+                  ["db.reader.lane", "background"],
+                  ["db.connection", "reader"],
+                  ["db.reader.lane", "background"],
+                ]
+              : [
+                  ["db.connection", "writer"],
+                  ["db.connection", "writer"],
+                ],
+          );
+        }),
+      );
+    return connection === "writer"
+      ? Effect.flatMap(SqlClient.SqlClient, run).pipe(
+          Effect.provide(SqliteClient.layer({ filename: ":memory:" })),
+        )
+      : withReaderClient(run);
+  },
+);
+
+it.effect.each(["tracer", "propagation"] as const)(
+  "leaves the parent span alone when statement %s is disabled",
+  (gate) => {
+    const spans: Tracer.NativeSpan[] = [];
+    const tracer = Tracer.make({
+      span: (options) => {
+        const span = new Tracer.NativeSpan(options);
+        spans.push(span);
+        return span;
+      },
+    });
+    return Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* gate === "tracer"
+        ? sql`SELECT 1`.pipe(Effect.withTracerEnabled(false))
+        : sql`SELECT 1`.pipe(Effect.provideService(Statement.SpanPropagationEnabled, false));
+    }).pipe(
+      Effect.withSpan("sqlite"),
+      Effect.provide(SqliteClient.layer({ filename: ":memory:" })),
+      Effect.provideService(Statement.SpanPropagationEnabled, true),
+      Effect.withTracer(tracer),
+      Effect.map(() => {
+        const parent = spans.find((span) => span.name === "sqlite")!;
+        assert.isDefined(parent);
+        assert.isFalse(parent.attributes.has("db.connection"));
+        assert.isFalse(parent.attributes.has("db.connection.reused"));
+        assert.isFalse(parent.attributes.has("db.reader.lane"));
+      }),
+    );
+  },
+);
+
 it.effect("labels SQL spans with their connection and how long they waited for its lock", () => {
   const spans: Array<Tracer.NativeSpan> = [];
   const tracer = Tracer.make({
@@ -969,7 +1124,10 @@ it.effect("labels SQL spans with their connection and how long they waited for i
     Effect.withTracer(tracer),
     Effect.map(() => {
       const labeled = spans
-        .filter((span) => span.attributes.has("db.connection"))
+        .filter(
+          (span) =>
+            span.attributes.has("db.connection") && !span.name.startsWith("sql.writer.pre_begin."),
+        )
         .map((span) => [
           span.name,
           span.attributes.get("db.connection"),
@@ -979,7 +1137,9 @@ it.effect("labels SQL spans with their connection and how long they waited for i
         ["sql.transaction", "writer", 0],
         ["sqlite", "writer", 25],
         ["sql.transaction", "writer", 25],
+        ["sqlite", "writer", undefined],
         ["sql.transaction", "reader", 0],
+        ["sqlite", "reader", undefined],
       ]);
     }),
   );
@@ -1707,6 +1867,161 @@ const readCheckpointState = (db: NodeSqlite.DatabaseSync) => {
   return { log: state.log, checkpointed: state.checkpointed };
 };
 
+it.effect.each([false, true])(
+  "names the acquired writer checkpoint wait and closes its spans (interrupted=%s)",
+  (interrupted) =>
+    withCheckpointClient((sql, filename) =>
+      Effect.gen(function* () {
+        const worker = startedWorkers.at(-1)!;
+        const { reader, checkpointRequests } = yield* blockCheckpointBehindReader(
+          sql,
+          filename,
+          worker,
+        );
+        const entered = yield* Deferred.make<void>();
+        const blocked = yield* Deferred.make<void>();
+        const spans: Tracer.NativeSpan[] = [];
+        const exported = new Map<Tracer.NativeSpan, ReadonlyMap<string, unknown>>();
+        const tracer = Tracer.make({
+          span: (options) => {
+            const span = new Tracer.NativeSpan(options);
+            spans.push(span);
+            if (options.name === "sql.transaction") {
+              const end = span.end.bind(span);
+              span.end = (time, exit) => {
+                exported.set(span, new Map(span.attributes));
+                end(time, exit);
+              };
+            }
+            const attribute = span.attribute.bind(span);
+            span.attribute = (key, value) => {
+              attribute(key, value);
+              if (key === "db.writer.wait_reason" && value === "checkpoint_blocked")
+                Deferred.doneUnsafe(blocked, Effect.void);
+            };
+            return span;
+          },
+        });
+        const transaction = yield* sql
+          .withTransaction(
+            Deferred.succeed(entered, undefined).pipe(
+              Effect.andThen(sql`INSERT INTO entries VALUES (1)`),
+              Effect.withTracerEnabled(false),
+            ),
+          )
+          .pipe(Effect.withTracer(tracer), Effect.forkChild);
+        yield* Deferred.await(blocked);
+        assert.isFalse(yield* Deferred.isDone(entered));
+        assert.isUndefined(transaction.pollUnsafe());
+        const wait = spans.find((span) => span.name === "sql.writer.pre_begin.checkpoint_blocked")!;
+        assert.equal(wait.status._tag, "Started");
+        assert.isAbove(
+          Number(wait.attributes.get("db.wal.log_frames")),
+          Number(wait.attributes.get("db.wal.checkpointed_frames")),
+        );
+        if (interrupted) yield* Fiber.interrupt(transaction);
+        reader.exec("ROLLBACK");
+        checkpointRequests.release();
+        yield* checkpointWorkerReply(worker);
+        if (!interrupted) yield* Fiber.join(transaction);
+        assert.equal(yield* Deferred.isDone(entered), !interrupted);
+        assert.deepEqual(yield* sql`SELECT value FROM entries`.values, interrupted ? [] : [[1]]);
+        yield* sql.withTransaction(sql`INSERT INTO entries VALUES (2)`);
+        const phases = spans.filter((span) => span.name.startsWith("sql.writer.pre_begin."));
+        const parent = spans.find((span) => span.name === "sql.transaction")!;
+        assert.isAbove(Number(parent.attributes.get("db.writer.pre_begin.total_ms")), 0);
+        assert.isAbove(Number(exported.get(parent)?.get("db.writer.pre_begin.total_ms")), 0);
+        const acquiredAt = parent.attributes.get("db.writer.acquired_at_unix_nano");
+        assert.isString(acquiredAt);
+        if (!interrupted) {
+          const beginAt = parent.attributes.get("db.writer.begin_at_unix_nano");
+          assert.isString(beginAt);
+          assert.equal(
+            Number(BigInt(String(beginAt)) - BigInt(String(acquiredAt))) / 1e6,
+            parent.attributes.get("db.writer.pre_begin_ms"),
+          );
+        }
+        for (let i = 0; i < phases.length; i++) {
+          const span = phases[i]!;
+          assert.equal(
+            span.parent._tag === "Some" ? span.parent.value.spanId : undefined,
+            parent.spanId,
+          );
+          assert(span.status._tag === "Ended");
+          assert.isTrue(span.status.endTime >= span.startTime);
+          if (i + 1 < phases.length) assert.equal(span.status.endTime, phases[i + 1]!.startTime);
+        }
+        assert.includeMembers(
+          phases.map((span) => span.attributes.get("db.writer.wait_reason")),
+          [
+            "permit_setup",
+            "connection_recovery",
+            "begin_dispatch",
+            "worker_queue",
+            "connection_state",
+            "statement_prepare",
+            "checkpoint_admission",
+            "checkpoint_blocked",
+            "effect_resume",
+          ],
+        );
+        if (!interrupted)
+          assert.includeMembers(
+            phases.map((span) => span.attributes.get("db.writer.wait_reason")),
+            ["sqlite_begin", "recovery_snapshot", "worker_reply"],
+          );
+      }),
+    ),
+  { skip: !supportsNoopCheckpoint },
+);
+
+it.effect("separates a queued BEGIN from checkpoint admission before the body starts", () =>
+  withCheckpointClient((sql) =>
+    Effect.gen(function* () {
+      const writer = writerWorkers.at(-1)!;
+      const queued = yield* Deferred.make<void>();
+      const entered = yield* Deferred.make<void>();
+      const spans: Tracer.NativeSpan[] = [];
+      let sendBegin: (() => void) | undefined;
+      const send = writer.postMessage.bind(writer);
+      const spy = vi.spyOn(writer, "postMessage").mockImplementation((...args) => {
+        const request = args[0] as { sql?: string; preBegin?: boolean };
+        if (request.preBegin && request.sql === "BEGIN IMMEDIATE") {
+          sendBegin = () => send(...args);
+          Deferred.doneUnsafe(queued, Effect.void);
+        } else send(...args);
+      });
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          spy.mockRestore();
+          sendBegin?.();
+        }),
+      );
+      const tracer = Tracer.make({
+        span: (options) => {
+          const span = new Tracer.NativeSpan(options);
+          spans.push(span);
+          return span;
+        },
+      });
+      const transaction = yield* sql
+        .withTransaction(Deferred.succeed(entered, undefined))
+        .pipe(Effect.withTracer(tracer), Effect.forkChild);
+      yield* Deferred.await(queued);
+      assert.isFalse(yield* Deferred.isDone(entered));
+      assert.equal(spans.at(-1)?.name, "sql.writer.pre_begin.worker_queue");
+      assert.equal(spans.at(-1)?.status._tag, "Started");
+      assert.isFalse(spans.some((span) => span.name === "sql.writer.pre_begin.sqlite_begin"));
+      spy.mockRestore();
+      sendBegin!();
+      sendBegin = undefined;
+      yield* Fiber.join(transaction);
+      assert.isTrue(yield* Deferred.isDone(entered));
+      assert.isTrue(spans.some((span) => span.name === "sql.writer.pre_begin.sqlite_begin"));
+    }),
+  ),
+);
+
 it.effect("defers routine checkpoints during startup and drains pending WAL on activation", () =>
   Effect.gen(function* () {
     const activated = yield* Deferred.make<void>();
@@ -1773,6 +2088,50 @@ it.effect("keeps WAL backpressure active before startup activation", () =>
       }),
     { checkpointWorkerStart: Effect.never },
   ),
+);
+
+it.effect(
+  "attributes a blocked pre-BEGIN checkpoint separately from transaction work",
+  () => {
+    const spans: Tracer.NativeSpan[] = [];
+    const tracer = Tracer.make({
+      span: (options) => {
+        const span = new Tracer.NativeSpan(options);
+        spans.push(span);
+        return span;
+      },
+    });
+    return withCheckpointClient((sql, filename) =>
+      Effect.gen(function* () {
+        const worker = startedWorkers.at(-1)!;
+        const { reader, checkpointRequests } = yield* blockCheckpointBehindReader(
+          sql,
+          filename,
+          worker,
+        );
+        const bodyEntered = yield* Deferred.make<void>();
+        const waiting = writerWaiting(writerWorkers.at(-1)!);
+        const transaction = yield* sql
+          .withTransaction(
+            Deferred.succeed(bodyEntered, undefined).pipe(
+              Effect.andThen(sql`INSERT INTO entries VALUES (1)`),
+            ),
+          )
+          .pipe(Effect.withTracer(tracer), Effect.forkChild);
+        yield* Effect.promise(() => waiting);
+        assert.isUndefined(transaction.pollUnsafe());
+        assert.isFalse(yield* Deferred.isDone(bodyEntered));
+        reader.exec("ROLLBACK");
+        checkpointRequests.release();
+        yield* Fiber.join(transaction);
+        assert.isTrue(yield* Deferred.isDone(bodyEntered));
+        const span = spans.find((span) => span.name === "sql.transaction")!;
+        assert.isAbove(Number(span.attributes.get("db.writer.checkpoint_wait_ms")), 0);
+        assert.deepEqual(yield* sql`SELECT value FROM entries`, [{ value: 1 }]);
+      }),
+    );
+  },
+  { skip: !supportsNoopCheckpoint },
 );
 
 it.effect("checkpoints the WAL on the worker instead of the writer", () =>

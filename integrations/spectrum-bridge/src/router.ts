@@ -26,6 +26,7 @@ import { appendObserved, classifyGroupMessage, GROUP_ENGAGED_MS, isTapback, ment
 import { groupLines, inboundTime, inboundWords, JEV_CHUNK, JEV_THRESHOLD, JudgeError, judgeState, replyTarget as judgeReplyTarget, speakerName, targetLine, type GroupJudge } from "./group-judge.ts";
 import type { Swipes, SwipeTarget } from "./swipe.ts";
 import { criticalWake, FAILED_INBOUND_ALERT_MAX_AGE_MS, FAILED_INBOUND_REPLAY_MAX_AGE_MS, failureMessage, wakeEventPreview } from "./inbound-failure.ts";
+import { isAgentBusWake } from "./agent-bus.ts";
 
 /**
  * `createdAt` is when the agent's current context started (a new thread or the
@@ -233,7 +234,13 @@ export function sendblueContextPrompt(context: ChatContext, eyes: boolean, sende
   }
   lines.push("Links you create: for the owner's own chat use `publish --app SLUG` (tailnet only). For Moni, any group or anyone else use `share --app SLUG [--days N]` (public Cloudflare link, 7 days by default; `unshare --app SLUG` ends it). Every page you send needs <title>, og:title, og:description and og:image so link previews show; fix any metadataWarnings before sending the link.");
   if (chat.kind === "owner") lines.push((tool ? "Other chats: `chats --session CURRENT_SESSION_ID` lists them; `imessage_send` with `to` set to the slug (or `send --to <slug> --session CURRENT_SESSION_ID --key UNIQUE_KEY --text ...`) messages one;" : "Other chats: `chats --session CURRENT_SESSION_ID` lists them; `send --to <slug> --session CURRENT_SESSION_ID --key UNIQUE_KEY --text ...` messages one;") + " `wake --chat <slug> --session CURRENT_SESSION_ID --key UNIQUE_KEY --text ...` passes the owner's decision to that chat's assistant. `allow --address A --name N [--admin]` and `allow-group --id G [--name N]` add people or groups when the owner asks.");
-  else if (chat.kind === "dm" && context.roleOf(chatKey.target(chat.key)).role === "admin") lines.push(`Groups: \`chats --session CURRENT_SESSION_ID\` lists the group chats ${chat.title} has written in; \`send --to <slug> --session CURRENT_SESSION_ID --key UNIQUE_KEY --text ...\` posts in one of them when ${chat.title} asks. Other chats can't be reached from here; for the owner use ask-owner.`);
+  else if (chat.kind === "dm" && context.roleOf(chatKey.target(chat.key)).role === "admin") lines.push(`Groups: \`chats --session CURRENT_SESSION_ID\` lists the group chats ${chat.title} has written in; \`send --to <slug> --session CURRENT_SESSION_ID --key UNIQUE_KEY --text ...\` posts in one of them when ${chat.title} asks. For work on the Mac (orders, rides, payments, the owner's Dia, Android phone, Keychain, calendar, mail, health or money), use agent-ask --to owner. For her own accounts, keep using offbox-person.`);
+  if (chat.kind === "owner" || (chat.kind === "dm" && context.roleOf(chatKey.target(chat.key)).role === "admin")) {
+    lines.push('Agent bus: `agent-ask --to <slug> --text "..." --session CURRENT_SESSION_ID --key UNIQUE_KEY` asks another assistant; add `--parent areq_...` while handling a request. Reply with `agent-answer --request areq_... --text "..." --session CURRENT_SESSION_ID [--status done|declined|pending]`. `agent-requests --session CURRENT_SESSION_ID` lists requests.');
+    lines.push("owner = Abdullah's assistant on his Mac: orders (noon/Careem/Amazon), Uber rides, payments and cards, Dia browser, his Android phone, his calendar, mail, health and money.");
+    lines.push("moni = Moni's assistant: her accounts, WhatsApp, files, preferences and browser on her own box.");
+    lines.push("groups = no private data.");
+  }
   if (chat.kind === "owner" && background) lines.push("Strangers who text the line are never answered by you directly; follow the bridge's own note.");
   // 27 Oct: Moni's blank-card report went from her chat straight to a fix agent and a deploy, with no card and no review.
   if (!background) {
@@ -760,7 +767,7 @@ export class Router {
   private async foldTexts(turn: Turn | null | undefined, texts: string[], operationId: string, replyMode: ReplyMode): Promise<string[]> {
     try {
       const chat = this.options.context?.chat;
-      if (chat?.kind !== "owner" || chat.slug === "moni" || this.options.medsFold === false
+      if (chat?.kind !== "owner" || chat.slug === "moni" || typeof this.options.medsFold !== "object" || this.options.medsFold === null
         || process.env.SPECTRUM_MEDS_FOLD_ENABLED === "0") return texts;
       if (!turn || turn.background || turn.origin || !turn.inboundId || synthetic(turn.inboundId)
         || !["running", "submitting", "unknown"].includes(turn.phase) || !this.current(turn)) {
@@ -879,12 +886,13 @@ export class Router {
   }
 
   /** Admission is a receipt, independent of whether the agent later succeeds. Call in a transaction. */
-  private delivered(leader: string, ids = this.store.get<NormalizedInbound | null>(`batch:${leader}`)?.batchIds ?? [leader]): void {
+  private delivered(leader: string, ids = this.store.get<NormalizedInbound | null>(`batch:${leader}`)?.batchIds ?? [leader], succeeded = false): void {
     const deliveredAt = Date.now();
     for (const id of ids) {
-      const row = this.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(id);
+      const row = this.store.db.query<{ payload: string; state: string }, [string]>("SELECT payload, state FROM inbound WHERE id = ?").get(id);
       if (!row) continue;
-      this.store.updateInbound(id, "done");
+      // A receipt proves admission, not successful execution.
+      if (succeeded || row.state !== "failed") this.store.updateInbound(id, "done");
       if (this.store.get<number>(`inbound-delivered:${id}`) !== undefined) continue;
       this.store.set(`inbound-delivered:${id}`, deliveredAt);
       const receivedAt = (JSON.parse(row.payload) as NormalizedInbound).receivedAt;
@@ -996,7 +1004,7 @@ export class Router {
         const live = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(row.id);
         if (live?.state === "done" || this.store.get(`inbound-delivered:${leader}`) !== undefined) continue;
       }
-      if (wake && retryAt !== undefined && now - retryAt >= 5 * 60_000
+      if (wake && !isAgentBusWake(row.id) && retryAt !== undefined && now - retryAt >= 5 * 60_000
         && !this.store.get<boolean>(`stuck-wake-alert:${row.id}`) && this.options.notifyFailure) {
         // Failed rows belong to #932. This path reports only an unadmitted wake still in the queue.
         const live = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(row.id);
@@ -1085,7 +1093,8 @@ export class Router {
   }
 
   private recordFailure(id: string, stage: string, error: unknown, route = this.store.get<Route | null>("route")): void {
-    const failure = { stage, message: failureMessage(error), threadId: route?.id ?? null, at: Date.now() };
+    const bus = isAgentBusWake(id) || this.store.get<NormalizedInbound | null>(`batch:${id}`)?.batchIds?.some(isAgentBusWake);
+    const failure = { stage, message: bus ? "Agent bus delivery failed" : failureMessage(error), threadId: route?.id ?? null, at: Date.now() };
     this.store.recordInboundFailure(id, failure);
     this.options.log?.("inbound-failed", JSON.stringify({ id, chat: this.options.context?.chat.slug ?? "owner", ...failure }));
   }
@@ -1095,18 +1104,16 @@ export class Router {
     const prior = this.store.inboundFailure(id);
     if (!prior || prior.stage !== stage) this.recordFailure(id, stage, error, route);
     const failure = this.store.inboundFailure(id)!;
+    this.store.updateInbound(id, "failed", undefined, { ...failure, at: Date.now() });
     if (this.store.get<number>(`inbound-delivered:${id}`) !== undefined || this.store.get(`batch-phase:${id}`) === "accepted") {
-      this.store.updateInbound(id, "done");
       const row = this.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(id);
       const input = row ? JSON.parse(row.payload) as NormalizedInbound : undefined;
-      // #932 still owns money/security execution alerts even though admission remains done.
+      // #932 owns money/security execution alerts even after admission.
       if (input && criticalWake(id, input.text) && !this.store.get(`failed-alert:${id}`)) {
         const time = new Date(input.sentAt ?? input.receivedAt ?? Date.now()).toLocaleString("en-GB", { timeZone: this.options.timezone });
         this.store.set(`failed-alert-pending:${id}`, `Missed money/security update at ${time}:\n${wakeEventPreview(input.text)}`);
       }
-      return;
     }
-    this.store.updateInbound(id, "failed", undefined, { ...failure, at: Date.now() });
   }
 
   private failedScanAt = -Infinity;
@@ -1175,6 +1182,7 @@ export class Router {
   }
 
   private async sendFailedAlert(id: string, text: string): Promise<void> {
+    if (isAgentBusWake(id)) return;
     // Pending notifications outlive failed rows, including successful recovery and restart.
     const row = this.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(id);
     if (row && this.skipStaleFailedInbound(id, JSON.parse(row.payload) as NormalizedInbound)) return;
@@ -1440,14 +1448,18 @@ export class Router {
       }
       this.store.set(key, { ...state, attempts, reason, nextAt: 0 } satisfies SyntheticRetry);
       this.queueDropped(id, text, reason);
-      const missed = (this.store.get<Missed[] | null>("missedSynthetic") ?? []).filter(m => m.id !== id);
-      this.store.set("missedSynthetic", [...missed, { id, text: text.slice(0, MAX_MISSED_TEXT) }].slice(-MAX_MISSED));
+      if (!isAgentBusWake(id)) {
+        const missed = (this.store.get<Missed[] | null>("missedSynthetic") ?? []).filter(m => m.id !== id);
+        this.store.set("missedSynthetic", [...missed, { id, text: text.slice(0, MAX_MISSED_TEXT) }].slice(-MAX_MISSED));
+      }
       this.failInbound(id, "synthetic", reason);
     }
   }
 
   /** Adds a dropped row to the combined notice list, once per id. Call inside a transaction. */
   private queueDropped(id: string, text: string, reason: DropReason): void {
+    // Bus failures stay between assistants; the bus timeout handles the asker's follow-up.
+    if (isAgentBusWake(id)) return;
     const list = this.store.get<DroppedNotice[] | null>("droppedNotices") ?? [];
     if (list.some(n => n.id === id)) return;
     this.store.set("droppedNotices", [...list, { id, label: syntheticLabel(id, text), reason, text: syntheticDropped(id, text, reason), at: Date.now() }]);
@@ -1509,6 +1521,7 @@ export class Router {
   }
 
   private notice(turn: Turn, key: string, text: string): void {
+    if (!this.typedInto(turn) && this.syntheticBatch(turn.inboundId)?.every(isAgentBusWake)) return;
     const id = `turn:${turn.generation}:${turn.messageId}:${key}`;
     if (!this.store.getOperation(id)) this.store.enqueue({
       id, kind: "control", text, sessionId: turn.id, generation: turn.generation, ...this.replyTarget(turn.inboundId),
@@ -4608,7 +4621,7 @@ export class Router {
       this.logTurnEnd(turn, said.length ? "replied" : "no_reply");
       if (said.length) this.noteGroupReply(turn.inboundId, said);
       if (turn.background && said.some(words => stripInternalText(words).trim())) this.store.set("deferredNotice", null);
-      if (turn.inboundId) this.delivered(turn.inboundId);
+      if (turn.inboundId) this.delivered(turn.inboundId, undefined, idle.outcome === "succeeded");
       // Readback must not adopt a steer whose answer this transaction has already delivered.
       const coveredSteers = new Set(scope.filter(record => record.type === "user").map(record => record.id));
       for (const row of this.store.pendingInbound()) {
@@ -4761,12 +4774,15 @@ export class Router {
     });
   }
 
-  private fail(turn: Turn, text: string, watermark?: string, reason: DropReason = "failed", immediate = false): void {
+  private fail(snapshot: Turn, text: string, watermark?: string, reason: DropReason = "failed", immediate = false): void {
+    // A steer can be confirmed while failure reads await the backend; retain that ownership across restart.
+    const turn = this.typedInto(snapshot) ? { ...snapshot, typed: true } : snapshot;
     this.logTurnEnd(turn, "failed");
     this.store.db.transaction(() => {
+      const ids = turn.inboundId ? this.store.get<NormalizedInbound | null>(`batch:${turn.inboundId}`)?.batchIds ?? [turn.inboundId] : [];
       if (immediate) {
         // A broken new chat or model needs repair, not automatic replay of a watcher wake.
-        for (const id of this.syntheticBatch(turn.inboundId) ?? (turn.inboundId ? [turn.inboundId] : [])) this.failInbound(id, "execution", text, turn);
+        for (const id of ids) this.failInbound(id, "execution", text, turn);
         this.notice(turn, "failed", text);
       }
       // Nobody typed a synthetic row: it is retried, and never answered with a request to resend.
@@ -4783,7 +4799,7 @@ export class Router {
       else {
         if (!turn.background && reason !== "undelivered") this.store.set("deferredNotice", { turn, text, at: Date.now(), outbox: this.outboxMark() } satisfies DeferredNotice);
         else if (!turn.background) this.notice(turn, "failed", text);
-        if (turn.inboundId) this.failInbound(turn.inboundId, reason === "undelivered" ? "dispatch" : "execution", text, turn);
+        for (const id of ids) this.failInbound(id, reason === "undelivered" ? "dispatch" : "execution", text, turn);
       }
       this.setTurn(turn.background ? null : { ...turn, phase: "failed" });
       this.store.set("resendBody", null);

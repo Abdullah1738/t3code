@@ -75,7 +75,7 @@ const workCases: ReadonlyArray<WorkCase> = [
 ];
 
 it.effect.each(callers.flatMap((caller) => workCases.map((work) => ({ ...caller, ...work }))))(
-  "$id ($status, $work) resolves without waiting for the held background lane unless capped",
+  "$id ($status, $work) resolves with all view readers held unless capped",
   ({
     id: rawId,
     status,
@@ -93,7 +93,8 @@ it.effect.each(callers.flatMap((caller) => workCases.map((work) => ({ ...caller,
       const sqlLayer = SqliteClient.layer({
         filename: path.join(dir, "state.sqlite"),
         readerWorker: true,
-        foregroundReaderSlots: 1,
+        identityReaderProcess: true,
+        foregroundReaderSlots: 2,
         backgroundReaderSlots: 1,
       });
       yield* Effect.gen(function* () {
@@ -235,6 +236,21 @@ it.effect.each(callers.flatMap((caller) => workCases.map((work) => ({ ...caller,
             )
             .pipe(SqliteClient.readOnly, Effect.forkChild);
           yield* Deferred.await(held);
+          const viewHolders = yield* Effect.forEach([0, 1], () =>
+            Effect.gen(function* () {
+              const entered = yield* Deferred.make<void>();
+              const fiber = yield* sql
+                .withTransaction(
+                  sql`SELECT 1`.pipe(
+                    Effect.andThen(Deferred.succeed(entered, undefined)),
+                    Effect.andThen(Deferred.await(release)),
+                  ),
+                )
+                .pipe(SqliteClient.readOnly, SqliteClient.foregroundReads, Effect.forkChild);
+              yield* Deferred.await(entered);
+              return fiber;
+            }),
+          );
           yield* Effect.gen(function* () {
             const caller = yield* ThreadAccess.loadCaller().pipe(
               Effect.provide(
@@ -299,6 +315,7 @@ it.effect.each(callers.flatMap((caller) => workCases.map((work) => ({ ...caller,
             assert.isFalse(yield* Deferred.isDone(release));
           }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
           yield* Fiber.join(holder);
+          yield* Effect.forEach(viewHolders, Fiber.join);
         }).pipe(Effect.provide(ProjectionStore.layer));
       }).pipe(Effect.provide(sqlLayer));
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),

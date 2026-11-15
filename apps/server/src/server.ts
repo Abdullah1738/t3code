@@ -211,6 +211,7 @@ import { openCodeImportRouteLayer } from "./ardud/opencode-import/http.ts";
 import { ArdudKanbanLive } from "./ardud/kanban/layer.ts";
 import { layer as KanbanWaitPrsLayer } from "./ardud/kanban/engine/waitPrs.ts";
 import * as ReadonlyReplica from "./ardud/persistence/ReadonlyReplica.ts";
+import * as BackupSnapshot from "./ardud/persistence/BackupSnapshot.ts";
 import { kanbanRouteLayer } from "./ardud/kanban/http.ts";
 import * as NetService from "@t3tools/shared/Net";
 import * as RelayClient from "@t3tools/shared/relayClient";
@@ -576,7 +577,7 @@ const layerThreadSettlementWorker = Layer.effectDiscard(
 
 const layerThreadPullRequestWorker = Layer.effectDiscard(
   ThreadPullRequestService.make.pipe(Effect.flatMap((service) => service.start())),
-).pipe(Layer.provide(layerPullRequestService));
+).pipe(Layer.provide(layerPullRequestService), Layer.provide(ProjectionStoreV2.layer));
 
 const layerProviderInstallationRefresh = Layer.effectDiscard(
   Effect.gen(function* () {
@@ -668,6 +669,7 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
     StartupPhaseLog.withStartupLayer("server.kanban"),
   ),
   ReadonlyReplica.layer.pipe(StartupPhaseLog.withStartupLayer("server.readonly-replica")),
+  BackupSnapshot.layer.pipe(StartupPhaseLog.withStartupLayer("server.backup-snapshot")),
   Layer.effectDiscard(ProjectSettingsOverrideSweep.sweep).pipe(
     StartupPhaseLog.withStartupLayer("server.project-settings-sweep"),
   ),

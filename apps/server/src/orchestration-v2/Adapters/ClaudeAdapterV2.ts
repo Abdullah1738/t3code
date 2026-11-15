@@ -1,4 +1,6 @@
 import * as ClaudeApiErrorTranscript from "./ClaudeApiErrorTranscript.ts";
+import * as ProviderStartProgress from "../../ardud/orchestration/ProviderStartProgress.ts";
+import { nativeOutputAcknowledgesStart } from "../providerStartDeadlinePolicy.ts";
 import {
   optionalMcpRegistration,
   mcpStartupTimeoutMs,
@@ -103,7 +105,9 @@ import {
   type ThreadId,
 } from "@t3tools/contracts";
 
+import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
+import * as Data from "effect/Data";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -128,10 +132,14 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { resolveClaudeSdkExecutablePath } from "../../provider/Drivers/ClaudeExecutable.ts";
 import {
+  hasClaudeSkillMention,
   planClaudeSkillDispatch,
   type ClaudeSkillTarget,
 } from "../../provider/Drivers/ClaudeSkillDispatch.ts";
-import { discoverClaudeSkills } from "../../provider/Drivers/ClaudeSkills.ts";
+import {
+  discoverClaudeSkills,
+  resolveClaudeConfigDirPath,
+} from "../../provider/Drivers/ClaudeSkills.ts";
 import {
   compileClaudeModelSelection,
   type CompiledClaudeModelSelection,
@@ -199,6 +207,8 @@ import {
   makeSubagentConversationArtifacts,
   subagentThreadTitle,
 } from "@t3tools/provider-core/server/subagentProjection";
+
+const isTurnNotActiveError = Schema.is(ProviderAdapter.ProviderAdapterTurnNotActiveError);
 
 export const CLAUDE_PROVIDER = ProviderDriverKind.make("claudeAgent");
 export const CLAUDE_AGENT_SDK_QUERY_PROTOCOL = "claude-agent-sdk.query" as const;
@@ -570,6 +580,11 @@ const CLAUDE_INTERRUPT_SETTLE_TIMEOUT = "10 seconds";
 // Stop waits for admission to release its lock. Native preparation requests
 // must not hold it forever before a turn exists for Stop to interrupt.
 const CLAUDE_TURN_PREPARATION_TIMEOUT = "15 seconds";
+
+class ClaudeSkillCacheKey extends Data.Class<{
+  readonly configDir: string;
+  readonly cwd: string | null;
+}> {}
 
 // Transcript enrichment must not hold native shutdown or replacement admission.
 const CLAUDE_TURN_FINALIZATION_TIMEOUT = "10 seconds";
@@ -4014,23 +4029,56 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
     offer: () => Effect.void,
   };
 
-  const userInvocableSkills = (cwd: string | null) =>
-    discoverClaudeSkills(
+  const skillCache = yield* Cache.makeWith(
+    Effect.fn("ClaudeAdapterV2.discoverPromptSkills")(function* (key: ClaudeSkillCacheKey) {
+      const startedAt = yield* Clock.currentTimeMillis;
+      return yield* discoverClaudeSkills(
+        { ...adapterOptions.settings, homePath: key.configDir },
+        key.cwd ?? undefined,
+        adapterOptions.environment,
+      ).pipe(
+        // The measured p90 is 5 s; leave the rest of the 15 s preparation budget for the SDK.
+        Effect.timeout("5 seconds"),
+        Effect.map(
+          (skills): ReadonlyMap<string, ClaudeSkillTarget> =>
+            new Map(
+              skills
+                .filter((skill) => skill.enabled && skill.userInvocable !== false)
+                .map((skill) => [skill.name, skill]),
+            ),
+        ),
+        Effect.catchCause((cause) =>
+          Cause.hasInterrupts(cause)
+            ? Effect.interrupt
+            : Effect.gen(function* () {
+                yield* Effect.logWarning("Claude prompt skill discovery unavailable", {
+                  durationMs: (yield* Clock.currentTimeMillis) - startedAt,
+                  reason: Cause.hasDies(cause) ? "defect" : "timeout",
+                });
+                return new Map<string, ClaudeSkillTarget>();
+              }),
+        ),
+        Effect.provideService(FileSystem.FileSystem, fileSystem),
+        Effect.provideService(Path.Path, path),
+      );
+    }),
+    { capacity: 128, timeToLive: () => "60 seconds" },
+  );
+  const userInvocableSkills = Effect.fn("ClaudeAdapterV2.userInvocableSkills")(function* (
+    text: string,
+    cwd: string | null,
+  ) {
+    if (!hasClaudeSkillMention(text)) return new Map<string, ClaudeSkillTarget>();
+    const resolvedCwd = cwd === null ? null : path.resolve(cwd);
+    const configDir = yield* resolveClaudeConfigDirPath(
       adapterOptions.settings,
-      cwd ?? undefined,
       adapterOptions.environment,
-    ).pipe(
-      Effect.map(
-        (skills) =>
-          new Map(
-            skills
-              .filter((skill) => skill.enabled && skill.userInvocable !== false)
-              .map((skill) => [skill.name, skill]),
-          ),
-      ),
-      Effect.provideService(FileSystem.FileSystem, fileSystem),
-      Effect.provideService(Path.Path, path),
-    );
+      resolvedCwd ?? undefined,
+    ).pipe(Effect.provideService(Path.Path, path));
+    const key = new ClaudeSkillCacheKey({ configDir, cwd: resolvedCwd });
+    yield* Effect.annotateCurrentSpan({ cacheHit: yield* Cache.has(skillCache, key) });
+    return yield* Cache.get(skillCache, key);
+  });
 
   return ProviderAdapter.ProviderAdapterV2.of({
     instanceId: adapterOptions.instanceId,
@@ -4040,6 +4088,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
     openSession: Effect.fn("ClaudeAdapterV2.openSession")(
       function* (input: ProviderAdapter.ProviderAdapterV2OpenSessionInput) {
         const sessionScope = yield* Effect.scope;
+        const startProgress = yield* Effect.serviceOption(
+          ProviderStartProgress.ProviderStartProgress,
+        );
         const now = yield* DateTime.now;
         const session = providerSession({
           providerSessionId: input.providerSessionId,
@@ -4360,8 +4411,44 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         const runtimeContext = yield* Effect.context<never>();
         const runPromise = Effect.runPromiseWith(runtimeContext);
 
-        const emitProviderEvent = (event: ProviderAdapter.ProviderAdapterV2Event) =>
-          Queue.offer(events, event).pipe(Effect.asVoid);
+        // Observe the SDK's acceptance before the session manager can block forwarding it.
+        const emitProviderEvent = Effect.fnUntraced(function* (
+          event: ProviderAdapter.ProviderAdapterV2Event,
+        ) {
+          if (
+            Option.isSome(startProgress) &&
+            ((event.type === "provider_turn.updated" &&
+              event.providerTurn.promptAcceptedAt !== undefined) ||
+              (event.type === "turn_item.updated" && nativeOutputAcknowledgesStart(event.turnItem)))
+          ) {
+            const context = yield* Ref.get(activeTurn);
+            if (
+              context !== null &&
+              (event.type === "provider_turn.updated"
+                ? context.input.attemptId === event.providerTurn.runAttemptId
+                : event.type === "turn_item.updated" &&
+                  event.turnItem.runId === context.input.runId &&
+                  event.turnItem.providerTurnId === context.providerTurnId)
+            ) {
+              const attempt = {
+                threadId: context.input.threadId,
+                runId: context.input.runId,
+                attemptId: context.input.attemptId,
+              };
+              yield* startProgress.value.observe(
+                attempt,
+                "native_accepted",
+                context.nativeThreadId,
+              );
+              yield* startProgress.value.observe(
+                attempt,
+                "adapter_emitted",
+                context.nativeThreadId,
+              );
+            }
+          }
+          yield* Queue.offer(events, event);
+        });
 
         // Reports one root request's usage as the current context. Usage
         // without input is a placeholder, never a measurement.
@@ -9374,6 +9461,16 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         ) {
           if (context.promptAcceptedAt !== undefined) return;
           context.promptAcceptedAt = yield* DateTime.now;
+          if (Option.isSome(startProgress))
+            yield* startProgress.value.observe(
+              {
+                threadId: context.input.threadId,
+                runId: context.input.runId,
+                attemptId: context.input.attemptId,
+              },
+              "native_accepted",
+              context.nativeThreadId,
+            );
           yield* emitProviderEvent({
             type: "provider_turn.updated",
             driver: CLAUDE_PROVIDER,
@@ -9404,6 +9501,16 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           const liveQuery = yield* Ref.get(queryContext);
           if (context !== null && liveQuery?.query === input.query) {
             context.lastSdkMessageAt = yield* Clock.currentTimeMillis;
+            if (Option.isSome(startProgress))
+              yield* startProgress.value.observe(
+                {
+                  threadId: context.input.threadId,
+                  runId: context.input.runId,
+                  attemptId: context.input.attemptId,
+                },
+                "sdk_received",
+                context.nativeThreadId,
+              );
           }
           if (
             context !== null &&
@@ -10209,6 +10316,13 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           function* (turnInput: ProviderAdapter.ProviderAdapterV2TurnInput) {
             const startedAt = yield* DateTime.now;
             const nativeThreadId = yield* getNativeThreadId(turnInput.providerThread);
+            const progressAttempt = {
+              threadId: turnInput.threadId,
+              runId: turnInput.runId,
+              attemptId: turnInput.attemptId,
+            };
+            if (Option.isSome(startProgress))
+              yield* startProgress.value.step(progressAttempt, "turn_preparation", nativeThreadId);
             const nativeTurnId = `turn:${turnInput.attemptId}`;
             // Fresh for every offer: Claude acks a prompt whose uuid its
             // transcript already holds without running a turn, and a session
@@ -10360,7 +10474,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                     attachments: turnInput.message.attachments,
                     attachmentsDir,
                     fileSystem,
-                    skills: yield* userInvocableSkills(turnInput.runtimePolicy.cwd),
+                    skills: yield* userInvocableSkills(
+                      turnInput.message.text,
+                      turnInput.runtimePolicy.cwd,
+                    ),
                     uuid: promptUuid,
                   });
             const querySession = yield* openQuery(turnInput, nativeThreadId);
@@ -10400,7 +10517,14 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               yield* attachTurn;
               yield* startUserTurnForWakeReports(nativeThreadId);
               // Preparation releases the control lock before native delivery runs.
-              return admitRecovery.pipe(Effect.andThen(querySession.query.offer(userMessage)));
+              return admitRecovery.pipe(
+                Effect.andThen(
+                  Option.isSome(startProgress)
+                    ? startProgress.value.step(progressAttempt, "start_send")
+                    : Effect.void,
+                ),
+                Effect.andThen(querySession.query.offer(userMessage)),
+              );
             }
             yield* Ref.set(pendingContinuation, { context, querySession });
             // Transcript reads suspend replay. Hold live SDK frames until the whole
@@ -10588,16 +10712,12 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               }
               return;
             }
-            if (existing === null) {
-              return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+            // No query means there is no native execution left to interrupt.
+            if (existing === null || currentTurn?.providerTurnId !== turnInput.providerTurnId) {
+              return yield* new ProviderAdapter.ProviderAdapterTurnNotActiveError({
                 driver: CLAUDE_PROVIDER,
-                detail: `Claude provider thread ${turnInput.providerThread.id} has no live query.`,
-              });
-            }
-            if (currentTurn?.providerTurnId !== turnInput.providerTurnId) {
-              return yield* new ProviderAdapter.ProviderAdapterProtocolError({
-                driver: CLAUDE_PROVIDER,
-                detail: `Claude provider turn ${turnInput.providerTurnId} is not the active turn.`,
+                providerThreadId: turnInput.providerThread.id,
+                providerTurnId: turnInput.providerTurnId,
               });
             }
             if (attached === null) {
@@ -10681,14 +10801,15 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           },
           (effect, turnInput) =>
             effect.pipe(
-              Effect.mapError(
-                (cause) =>
-                  new ProviderAdapter.ProviderAdapterInterruptError({
-                    driver: CLAUDE_PROVIDER,
-                    providerThreadId: turnInput.providerThread.id,
-                    providerTurnId: turnInput.providerTurnId,
-                    cause,
-                  }),
+              Effect.mapError((cause) =>
+                isTurnNotActiveError(cause)
+                  ? cause
+                  : new ProviderAdapter.ProviderAdapterInterruptError({
+                      driver: CLAUDE_PROVIDER,
+                      providerThreadId: turnInput.providerThread.id,
+                      providerTurnId: turnInput.providerTurnId,
+                      cause,
+                    }),
               ),
             ),
         );
@@ -10781,7 +10902,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               uuid: yield* crypto.randomUUIDv4().pipe(Effect.filterOrFail(isClaudePromptUuid)),
               attachmentsDir,
               fileSystem,
-              skills: yield* userInvocableSkills(currentTurn.input.runtimePolicy.cwd),
+              skills: yield* userInvocableSkills(
+                turnInput.message.text,
+                currentTurn.input.runtimePolicy.cwd,
+              ),
             });
             yield* backgroundForegroundSubagents(existing);
             yield* sdkMessageLock.withPermits(1)(

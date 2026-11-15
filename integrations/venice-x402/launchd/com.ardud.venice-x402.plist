@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ardud.venice-x402</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/ardud/.nvm/versions/node/v24.22.3/bin/node</string>
+    <string>/Users/ardud/.local/share/venice-x402/cli.mjs</string>
+    <string>serve</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/ardud/.local/share/venice-x402</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/ardud</string>
+    <key>PATH</key>
+    <string>/Users/ardud/.nvm/versions/node/v24.22.3/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>VENICE_X402_PORT</key>
+    <string>43402</string>
+    <key>VENICE_X402_MAX_REQUEST_USD</key>
+    <string>unlimited</string>
+    <key>VENICE_X402_MAX_DAILY_USD</key>
+    <string>1000</string>
+    <key>VENICE_X402_TOPUP_USD</key>
+    <string>5</string>
+    <key>VENICE_X402_MAX_TOPUP_USD</key>
+    <string>5</string>
+    <key>VENICE_X402_MAX_TOPUP_DAILY_USD</key>
+    <string>1000</string>
+    <key>VENICE_X402_AUTO_TOPUP</key>
+    <string>1</string>
+    <key>VENICE_X402_EGRESS_CHECK</key>
+    <string>/Users/ardud/.local/share/venice-x402/bin/egress-check</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>/Users/ardud/Library/Logs/venice-x402.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/ardud/Library/Logs/venice-x402.log</string>
+</dict>
+</plist>

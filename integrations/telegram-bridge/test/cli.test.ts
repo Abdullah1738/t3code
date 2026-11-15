@@ -6,6 +6,7 @@ import * as os from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadCommandPayload, MAX_FILE_BYTES, parseCommand, sanitizeSource } from "../src/cli.ts";
+import { SUBPROCESS_TEST_TIMEOUT_MS } from "./subprocess-timeout.ts";
 import { useToolLogFixture } from "./toollog-fixture.ts";
 
 const logs = useToolLogFixture();
@@ -390,7 +391,7 @@ describe("local file payloads (temporary fixtures only)", () => {
     } finally {
       await new Promise<void>(resolve => server.close(() => resolve()));
     }
-  });
+  }, SUBPROCESS_TEST_TIMEOUT_MS);
 });
 
 describe("CLI entry point (no live socket)", () => {
@@ -418,5 +419,5 @@ describe("CLI entry point (no live socket)", () => {
       tool: "watchers", kind: "error", ok: false, error: { tag: "tg.cli.commandFailed", message: "tg.cli.commandFailed" },
     });
     expect(logs.text()).not.toContain("private");
-  });
+  }, SUBPROCESS_TEST_TIMEOUT_MS);
 });

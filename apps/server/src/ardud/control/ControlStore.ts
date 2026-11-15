@@ -39,6 +39,32 @@ export interface ThreadOriginRow {
 
 export interface ControlStoreShape {
   readonly ownerShell: (threadId: string) => Effect.Effect<OwnerShell | null, ControlStoreError>;
+  readonly userMessagesSince: (input: {
+    readonly since: number;
+    readonly cursor: { readonly u: number; readonly id: string } | null;
+    readonly limit: number;
+    readonly role?: "user" | "assistant" | "system" | "all";
+    readonly threadIds?: ReadonlyArray<string>;
+  }) => Effect.Effect<
+    {
+      readonly total: number;
+      readonly messages: ReadonlyArray<{
+        readonly message: OrchestrationV2ConversationMessage;
+        readonly threadId: string;
+        readonly threadTitle: string;
+        readonly threadArchived: boolean;
+      }>;
+      readonly next: { readonly u: number; readonly id: string } | null;
+    },
+    ControlStoreError
+  >;
+  readonly changeMarkers: (
+    threadIds: ReadonlyArray<string>,
+  ) => Effect.Effect<ReadonlyMap<string, number>, ControlStoreError>;
+  readonly lastAssistant: (
+    threadId: string,
+    runId: string | null,
+  ) => Effect.Effect<ReturnType<typeof lastAssistantText>, ControlStoreError>;
   readonly messagePage: (input: {
     readonly threadId: string;
     readonly role: string | null;
@@ -519,6 +545,94 @@ export const make = Effect.gen(function* () {
   const decodeMessage = Schema.decodeUnknownEffect(
     Schema.fromJsonString(OrchestrationV2ConversationMessageJson),
   );
+  const userMessagesSince: ControlStoreShape["userMessagesSince"] = Effect.fn(
+    "ControlStore.userMessagesSince",
+  )(
+    function* ({ since, cursor, limit, role = "user", threadIds }) {
+      const index = sql.literal(
+        role === "user"
+          ? "ardud_control_user_messages_since_idx"
+          : "ardud_control_messages_since_idx",
+      );
+      const predicate = sql`${role === "all" ? sql`1 = 1` : role === "user" ? sql`m.role = 'user'` : sql`m.role = ${role}`}
+        ${threadIds === undefined ? sql`` : sql`AND m.thread_id IN (SELECT value FROM json_each(${encodeIds(threadIds)}))`}
+        AND CAST(ROUND(unixepoch(m.updated_at, 'subsec') * 1000) AS INTEGER) > ${since}
+        AND EXISTS (SELECT 1 FROM orchestration_v2_projection_threads t
+          WHERE t.thread_id = m.thread_id AND t.deleted_at IS NULL)`;
+      // Count only index entries and thread existence. Materialize the bounded
+      // page before reading thread metadata or decoding any message payloads.
+      const rows = yield* sql<{
+        readonly total: number;
+        readonly message_id: string | null;
+        readonly thread_id: string | null;
+        readonly u: number | null;
+        readonly payload_json: string | null;
+        readonly title: string | null;
+        readonly archived: number;
+      }>`
+        WITH total AS (
+          SELECT COUNT(*) AS total
+          FROM orchestration_v2_projection_messages m INDEXED BY ${index}
+          WHERE ${predicate}
+        ), page AS MATERIALIZED (
+          SELECT m.message_id, m.thread_id, m.payload_json,
+            CAST(ROUND(unixepoch(m.updated_at, 'subsec') * 1000) AS INTEGER) AS u
+          FROM orchestration_v2_projection_messages m INDEXED BY ${index}
+          WHERE ${predicate}
+            ${
+              cursor === null
+                ? sql``
+                : sql`AND CAST(ROUND(unixepoch(m.updated_at, 'subsec') * 1000) AS INTEGER) >= ${cursor.u}
+              AND (CAST(ROUND(unixepoch(m.updated_at, 'subsec') * 1000) AS INTEGER), m.message_id) > (${cursor.u}, ${cursor.id})`
+            }
+          ORDER BY CAST(ROUND(unixepoch(m.updated_at, 'subsec') * 1000) AS INTEGER), m.message_id
+          LIMIT ${limit + 1}
+        )
+        SELECT total.total, page.*, t.title,
+          json_extract(t.payload_json, '$.archivedAt') IS NOT NULL AS archived
+        FROM total LEFT JOIN page ON TRUE
+        LEFT JOIN orchestration_v2_projection_threads t ON t.thread_id = page.thread_id
+        ORDER BY page.u, page.message_id
+      `;
+      const page = rows.filter((row) => row.message_id !== null);
+      const messages = yield* Effect.forEach(page.slice(0, limit), (row) =>
+        decodeMessage(row.payload_json).pipe(
+          Effect.map((message) => ({
+            message,
+            threadId: row.thread_id!,
+            threadTitle: row.title!,
+            threadArchived: Boolean(row.archived),
+          })),
+        ),
+      );
+      const last = page[limit - 1];
+      return {
+        total: rows[0]?.total ?? 0,
+        messages,
+        next:
+          page.length > limit && last !== undefined ? { u: last.u!, id: last.message_id! } : null,
+      };
+    },
+    NodeSqliteClient.readOnly,
+    Effect.mapError(fail("read-user-messages-since")),
+  );
+  const changeMarkers: ControlStoreShape["changeMarkers"] = Effect.fn("ControlStore.changeMarkers")(
+    (threadIds) =>
+      Effect.forEach(
+        chunks(threadIds),
+        (ids) =>
+          sql<{ readonly thread_id: string; readonly marker: number }>`
+        SELECT value AS thread_id, COALESCE((
+          SELECT sequence FROM orchestration_events INDEXED BY idx_orchestration_events_agent_stream_sequence
+          WHERE application_event_version = 2 AND aggregate_kind = 'thread' AND stream_id = value
+          ORDER BY sequence DESC LIMIT 1
+        ), 0) AS marker FROM json_each(${encodeIds(ids)})`,
+      ).pipe(
+        Effect.map((pages) => new Map(pages.flat().map((row) => [row.thread_id, row.marker]))),
+      ),
+    NodeSqliteClient.readOnly,
+    Effect.mapError(fail("read-change-markers")),
+  );
   const compareMessageIds = (
     left: { readonly message_id: string; readonly created_at: string },
     right: { readonly message_id: string; readonly created_at: string },
@@ -546,6 +660,40 @@ export const make = Effect.gen(function* () {
       .slice(0, limit)
       .map((row) => row.message_id);
   });
+  const lastAssistant: ControlStoreShape["lastAssistant"] = Effect.fn("ControlStore.lastAssistant")(
+    (threadId, runId) =>
+      sql.withTransaction(
+        Effect.gen(function* () {
+          // Sort lightweight metadata using the same epoch/locale order as lastAssistantText.
+          // Keep payloads out of the predicate: even LIMIT 1 would parse the whole history.
+          const candidates = (yield* sql<{
+            readonly message_id: string;
+            readonly created_at: string;
+          }>`
+        SELECT message_id, created_at FROM orchestration_v2_projection_messages
+        WHERE thread_id = ${threadId} AND role = 'assistant'
+          ${runId === null ? sql`` : sql`AND run_id = ${runId}`}`).toSorted(compareMessageIds);
+          let offset = 0;
+          while (offset < candidates.length) {
+            const ids = candidates
+              .slice(offset, offset + (offset === 0 ? 1 : 32))
+              .map((row) => row.message_id);
+            const rows = yield* sql<{ readonly payload_json: string }>`SELECT payload_json
+          FROM orchestration_v2_projection_messages WHERE thread_id = ${threadId}
+            AND message_id IN (SELECT value FROM json_each(${encodeIds(ids)}))`;
+            const latest = lastAssistantText(
+              yield* Effect.forEach(rows, (row) => decodeMessage(row.payload_json)),
+              runId,
+            );
+            if (latest !== null) return latest;
+            offset += ids.length;
+          }
+          return null;
+        }),
+      ),
+    NodeSqliteClient.readOnly,
+    Effect.mapError(fail("read-last-assistant")),
+  );
   const messagePage: ControlStoreShape["messagePage"] = Effect.fn("ControlStore.messagePage")(
     (input) =>
       sql.withTransaction(
@@ -598,30 +746,7 @@ export const make = Effect.gen(function* () {
               DateTime.toEpochMillis(left.createdAt) - DateTime.toEpochMillis(right.createdAt) ||
               left.id.localeCompare(right.id),
           );
-          // Only assistant ids/timestamps are read up front. Text stays in bounded
-          // batches, preserving locale ties and JS trim's Unicode whitespace rules.
-          const assistantIds = (yield* sql<{
-            readonly message_id: string;
-            readonly created_at: string;
-          }>`
-        SELECT message_id, created_at FROM orchestration_v2_projection_messages
-        WHERE thread_id = ${threadId} AND role = 'assistant'
-          ${runId === null ? sql`` : sql`AND run_id = ${runId}`}`).toSorted(compareMessageIds);
-          let lastAssistant: ReturnType<typeof lastAssistantText> = null;
-          for (
-            let offset = 0;
-            offset < assistantIds.length && lastAssistant === null;
-            offset += 32
-          ) {
-            const ids = assistantIds.slice(offset, offset + 32).map((row) => row.message_id);
-            const candidates = yield* sql<{ readonly payload_json: string }>`SELECT payload_json
-          FROM orchestration_v2_projection_messages WHERE thread_id = ${threadId}
-            AND message_id IN (SELECT value FROM json_each(${encodeIds(ids)}))`;
-            lastAssistant = lastAssistantText(
-              yield* Effect.forEach(candidates, (row) => decodeMessage(row.payload_json)),
-              runId,
-            );
-          }
+          const latestAssistant = yield* lastAssistant(threadId, runId);
           const runs = yield* sql<{
             readonly run_id: string;
             readonly status: OrchestrationV2Run["status"];
@@ -636,7 +761,7 @@ export const make = Effect.gen(function* () {
           return {
             messages,
             total: count[0]?.total ?? 0,
-            lastAssistant,
+            lastAssistant: latestAssistant,
             state: stateFromRunStatus(run?.status ?? null, pending.length > 0),
             status: run?.status ?? ("idle" as const),
             runId: run?.run_id ?? null,
@@ -648,6 +773,9 @@ export const make = Effect.gen(function* () {
   );
 
   return ControlStore.of({
+    userMessagesSince,
+    lastAssistant,
+    changeMarkers,
     messagePage,
     threadCandidatePage,
     threadCandidateCount,
