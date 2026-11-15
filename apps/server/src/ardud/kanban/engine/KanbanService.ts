@@ -7865,6 +7865,7 @@ const make = Effect.gen(function* () {
 
   const workThreadHomes = Effect.fn("KanbanService.workThreadHomes")(function* (
     cards: ReadonlyArray<KanbanCard>,
+    fresh = false,
   ) {
     const ids = [
       ...new Set(
@@ -7873,10 +7874,12 @@ const make = Effect.gen(function* () {
         ),
       ),
     ];
+    const byId = fresh ? undefined : new Map(cards.map((card) => [card.id, card]));
     const homes = new Map<string, KanbanCard | null>();
     for (const link of yield* rawStore.threadLinksByIds(ids)) {
       // Finished home cards are absent from the dispatch snapshot.
-      if (link.cardId !== null) homes.set(link.threadId, yield* rawStore.card(link.cardId));
+      if (link.cardId !== null)
+        homes.set(link.threadId, byId?.get(link.cardId) ?? (yield* rawStore.card(link.cardId)));
     }
     return homes;
   });
@@ -8943,7 +8946,8 @@ const make = Effect.gen(function* () {
                                   [selected.id, yield* reviewEvidence(currentBoard, selected)],
                                 ])
                               : undefined,
-                            yield* workThreadHomes(cards),
+                            // The home can move after pass.read; validate persisted rows.
+                            yield* workThreadHomes(cards, true),
                           ).find((entry) => entry.cardId === card.id);
                           return (
                             eligible !== undefined &&
@@ -13142,11 +13146,14 @@ const make = Effect.gen(function* () {
   ) =>
     Effect.suspend(() => {
       let target = cardId;
-      return SavedWrite.recover(guardDeferred(name, effect, cardId), (saved) => {
-        if (saved.kind !== "card") return undefined;
-        target ??= saved.card.id;
-        return saved.card.id === target && isSaved(saved.card) ? saved.card : undefined;
-      });
+      return SavedWrite.subSteps(
+        name,
+        SavedWrite.recover(guardDeferred(name, effect, cardId), (saved) => {
+          if (saved.kind !== "card") return undefined;
+          target ??= saved.card.id;
+          return saved.card.id === target && isSaved(saved.card) ? saved.card : undefined;
+        }),
+      );
     });
   const read = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     Deferred.await(startupReady).pipe(Effect.andThen(effect), Effect.mapError(toKanbanError));
@@ -16770,6 +16777,7 @@ const make = Effect.gen(function* () {
             ),
           );
         }),
+        (effect) => SavedWrite.subSteps("card.reviewResult", effect),
       );
     });
 

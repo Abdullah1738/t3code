@@ -1201,7 +1201,7 @@ def confirmed_lost(box_id: str, run_id: str, timeout: float = 20, *, record: boo
 
 
 def reconcile_lost(con, box_id: str, timeout: float = 20, state: str | None = None,
-                   until: float | None = None) -> None:
+                   until: float | None = None, *, foreign: bool = False) -> None:
     """Under box-<id>: repair old lost rows before following or handing their box to another run."""
     rows = con.execute("SELECT * FROM runs WHERE box_id=? AND status='lost' AND exit_code IS NULL "
                        "AND NOT EXISTS (SELECT 1 FROM kv WHERE k='lost_confirmed:' || runs.run_id)",
@@ -1250,7 +1250,7 @@ def reconcile_lost(con, box_id: str, timeout: float = 20, state: str | None = No
                     say(wedged_message(box_id, *wedged))
                     continue
             if st and row['pulls']:
-                do_pulls(box_id, dict(row), json.loads(row['pulls']), until=until)
+                do_pulls(box_id, dict(row), json.loads(row['pulls']), until=until, foreign=foreign)
             if until is not None and now() >= until:
                 raise OffboxError(f"lost reconciliation timed out on {box_id}", code=EXIT_WAIT_TIMEOUT, started=True)
             if st:
@@ -2668,7 +2668,8 @@ def new_checkout_hint(row: dict, root: Path, usage: command_usage.Usage) -> None
     say(f"node_modules missing on new box {row['box_id']}; prefix your command with {install} &&" + package_manager.version_note(target))
 
 
-def do_pulls(box_id: str, row: dict, pulls: list[str], *, until: float | None = None) -> None:
+def do_pulls(box_id: str, row: dict, pulls: list[str], *, until: float | None = None,
+             foreign: bool = False) -> None:
     for p in pulls:
         opts = {}
         if until is not None:
@@ -2676,20 +2677,37 @@ def do_pulls(box_id: str, row: dict, pulls: list[str], *, until: float | None = 
             if remaining <= 0:
                 raise OffboxError("artifact pull deadline reached; wait again", code=EXIT_WAIT_TIMEOUT, started=True)
             opts['timeout'] = min(1800, remaining)
-        try:
-            st = ssh_sync.pull(box_id, row["remote_dir"], row["rel_cwd"] or ".", p, Path(row["local_cwd"]), **opts)
-        except subprocess.TimeoutExpired:
-            if until is None:
+        detail = f"{row.get('run_id', 'unknown')} {p} -> {row['local_cwd']}"
+        prefix = (f"settled background run {row['run_id']} (not this run): "
+                  f"pull {p} into {row['local_cwd']}" if foreign else f"pull {p}")
+        with contextlib.closing(db()) as con:
+            try:
+                st = ssh_sync.pull(box_id, row["remote_dir"], row["rel_cwd"] or ".", p, Path(row["local_cwd"]), **opts)
+            except Exception as error:
+                event(con, box_id, "run_pull_failed", f"{detail} error={error}")
+                if foreign:
+                    say(f"{prefix} failed: {error}")
+                if isinstance(error, subprocess.TimeoutExpired) and until is not None:
+                    raise OffboxError("artifact pull deadline reached; wait again", code=EXIT_WAIT_TIMEOUT, started=True) from None
                 raise
-            raise OffboxError("artifact pull deadline reached; wait again", code=EXIT_WAIT_TIMEOUT, started=True) from None
+            if st.get("missing"):
+                event(con, box_id, "run_pull_failed", f"{detail} error=not created on the box: {st.get('error')}")
+            elif st.get("ok"):
+                event(con, box_id, "run_pulled", f"{detail} files={st.get('files', 0)}")
+            else:
+                event(con, box_id, "run_pull_failed", f"{detail} error={st.get('error')}")
         if until is not None and now() >= until:
             raise OffboxError("artifact pull deadline reached; wait again", code=EXIT_WAIT_TIMEOUT, started=True)
         if st.get("missing"):
-            say(f"pull {p}: not created on the box")
+            say(f"{prefix}: not created on the box")
         elif st.get("ok"):
-            say(f"pulled {p} ({st.get('files', 0)} files)")
+            if foreign:
+                say(f"settled background run {row['run_id']} (not this run) and pulled {p} "
+                    f"into {row['local_cwd']} ({st.get('files', 0)} files)")
+            else:
+                say(f"pulled {p} ({st.get('files', 0)} files)")
         else:
-            say(f"pull {p} failed: {st.get('error')}")
+            say(f"{prefix} failed: {st.get('error')}")
 
 
 def go_std_glitch(box: str | None, run_id: str, log_path: Path | None, code: int | None) -> bool:

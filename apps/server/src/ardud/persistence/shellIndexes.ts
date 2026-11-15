@@ -56,6 +56,13 @@ export const ensureShellLookupIndexes = Effect.fn("ensureShellLookupIndexes")(fu
     ) WHERE role = 'user'
   `;
   yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_control_messages_since_idx
+    ON orchestration_v2_projection_messages(
+      CAST(ROUND(unixepoch(updated_at, 'subsec') * 1000) AS INTEGER),
+      message_id, thread_id, role
+    )
+  `;
+  yield* sql`
     CREATE INDEX IF NOT EXISTS ardud_provider_turns_completed_idx
     ON orchestration_v2_projection_provider_turns(completed_at)
   `;

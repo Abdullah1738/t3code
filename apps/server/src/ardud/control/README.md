@@ -92,7 +92,7 @@ All paths are under `/api/ardud/control`.
 | GET    | `/health`                                                | Token check plus the latest event sequence.                                                                                                                                                                                                                       |
 | GET    | `/projects`                                              | Registered projects (`projectId`, `title`, `workspaceRoot`, `scratch`).                                                                                                                                                                                           |
 | GET    | `/models`                                                | Default model and runtime mode, plus each provider's models, option descriptors and variants.                                                                                                                                                                     |
-| GET    | `/messages?since=<ISO or epoch ms>&cursor=&limit=`       | User messages across all non-deleted threads, including archived threads; default 200, maximum 1000 per page.                                                                                                                                                     |
+| GET    | `/messages?since=<ISO or epoch ms>&role=&threadIds=&cursor=&limit=`       | Messages across non-deleted threads, including archived threads; role defaults to user (also assistant, system, all); optional comma-separated threadIds (max 50); default 200, max 1000 per page.                                                                                                                                                     |
 | GET    | `/usage`                                                 | Usage records in a time range, with optional board filter and cursor pagination.                                                                                                                                                                                  |
 | GET    | `/threads`                                               | List threads (see filters below).                                                                                                                                                                                                                                 |
 | POST   | `/threads`                                               | Create a thread, optionally with a first prompt.                                                                                                                                                                                                                  |
@@ -249,6 +249,8 @@ given. Reasoning and tool output never count.
 JSON-quoted incoming message ID in an iMessage channel-guidance context record,
 or null. Synthetic bridge IDs (`wake:`, `reset:`, `secret:`) are preserved so
 callers can distinguish them from relayed owner messages.
+
+Thread summaries and details include `changeMarker`, the latest V2 thread event sequence (0 if none). Compare it for incremental polling; `updatedAt` and `updatedSince` can miss timestamp ties. Poll known ids without `updatedSince`, then read changed messages with an overlapping `since` watermark.
 
 ### GET /threads/:id/wait
 
