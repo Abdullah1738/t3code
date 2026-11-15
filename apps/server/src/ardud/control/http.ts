@@ -1145,7 +1145,7 @@ const makeRoutes = Effect.gen(function* () {
       threads: summaries,
       nextCursor: nextThreadListCursor(page, limit),
     });
-  }).pipe(NodeSqliteClient.foregroundReads);
+  }).pipe(NodeSqliteClient.backgroundReads);
 
   const getThread = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
