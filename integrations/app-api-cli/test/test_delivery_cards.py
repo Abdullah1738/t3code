@@ -983,12 +983,18 @@ class RenderLoggingTests(unittest.TestCase):
         with patch.object(c, '_build', return_value={'has_preview': False}), patch.object(c, 'log_render') as log:
             self.assertFalse(c.build({}, {})['has_preview'])
             self.assertFalse(log.call_args.args[1])
+            self.assertEqual(log.call_args.kwargs['outcome'], 'fallback')
+            self.assertEqual(log.call_args.kwargs['failure_code'], 'preview_missing')
         with patch.object(c, '_build', side_effect=ValueError('PRIVATE_CARD')), patch.object(c, 'log_render') as log:
             with self.assertRaises(ValueError):
                 c.build({}, {})
             self.assertFalse(log.call_args.args[1])
+            self.assertEqual(log.call_args.kwargs['outcome'], 'failed')
+            self.assertEqual(log.call_args.kwargs['failure_code'], 'render_exception')
         with patch.object(c.subprocess, 'Popen') as child, patch.object(c.threading, 'Thread'):
-            c.log_render(time.monotonic(), False)
+            c.log_render(time.monotonic(), False, chat='+971501234567 /private/PRIVATE https://private/?token=PRIVATE', failure_code='PRIVATE')
             self.assertEqual(child.call_args.args[0][2:5], ['log-card-render', '--kind', 'delivery'])
+            self.assertNotIn('PRIVATE', str(child.call_args))
+            self.assertIn('renderer_failed', child.call_args.args[0])
         with patch.object(c.subprocess, 'Popen', side_effect=OSError('unavailable')):
             c.log_render(time.monotonic(), True)
