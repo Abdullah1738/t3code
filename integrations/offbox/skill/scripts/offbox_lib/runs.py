@@ -809,7 +809,12 @@ def settled_steps_code(run, code: int | None, *, log_path: Path | None = None, p
         return code
     planned = planned_steps(run) if planned is None else planned
     remote_handle = any(run[k] for k in ('command_id', 'process_id', 'wrapper_pid') if k in run.keys())
-    recover_plain = not planned and code in (None, EXIT_INFRA) and remote_handle
+    history_identity = bool(run['box_id'] if 'box_id' in run.keys() else None) and bool(
+        (run['command_id'] if 'command_id' in run.keys() else None) or
+        (run['mode'] if 'mode' in run.keys() else None) == 'bg' and remote_handle)
+    unsettled = (run['status'] if 'status' in run.keys() else 'running') in ('starting', 'running')
+    recover_plain = (not planned and code == EXIT_INFRA and unsettled and history_identity and
+                     (catch_up or history_result is not None))
     if not planned and disk.get('infra_failure') != 'disk_probe' and not recover_plain:
         return 126 if code in (None, 126) and argument_list_failure(run, path, report=report and report_start_failure) else code
     known = run['known_exit_code'] if 'known_exit_code' in run.keys() else None
@@ -2741,10 +2746,13 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
         if planned_steps(prior):
             code = None
         disk = offbox_disk_space.result(LOGS_DIR / f'{run_id}.log', incoming)
-        code = incoming if disk.get('infra_failure') not in (None, 'disk_probe') else settled_steps_code(
+        known_infra = status == 'infra' and disk.get('infra_failure') != 'disk_probe'
+        code = incoming if known_infra or disk.get('infra_failure') not in (None, 'disk_probe') else settled_steps_code(
             prior, incoming, locked=True, until=until, catch_up=catch_up, report=report)
         disk = offbox_disk_space.result(LOGS_DIR / f'{run_id}.log', incoming)
-        if planned_steps(prior) and status in (None, 'done', 'failed', 'infra'):
+        if known_infra:
+            st = 'infra'
+        elif planned_steps(prior) and status in (None, 'done', 'failed', 'infra'):
             st = 'infra' if code is None else ('done' if code == 0 else 'failed')
         else:
             st = status or ("lost" if code is None else ("done" if code == 0 else "failed"))
