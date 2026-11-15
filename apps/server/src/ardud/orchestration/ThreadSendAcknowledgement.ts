@@ -80,19 +80,23 @@ export const observe = Effect.fn("ThreadSendAcknowledgement.observe")(function* 
     readonly commandId: CommandId;
     readonly messageId: MessageId;
     readonly mode: string;
+    readonly onAccepted?: () => void;
   },
 ) {
   const pending = yield* lease;
-  if (pending === undefined) return yield* effect;
+  if (pending === undefined && input.onAccepted === undefined) return yield* effect;
   let runs: ReadonlyArray<OrchestrationV2Run> = [];
   return yield* effect.pipe(
     Effect.provideService(command, {
       id: input.commandId,
-      check: pending.check,
+      check: pending?.check ?? (() => true),
       captureRuns: (snapshot) => {
         runs = snapshot;
       },
-      accept: pending.accept,
+      accept: (result) => {
+        input.onAccepted?.();
+        pending?.accept(result);
+      },
       result: (events) => {
         const message = events.findLast(
           ({ event }) => event.type === "message.updated" && event.payload.id === input.messageId,

@@ -88,6 +88,25 @@ class ServerPressure(Base):
         self.stack.enter_context(patch.object(disk,'inventory',return_value=({},[])))
         self.stack.enter_context(patch.object(disk,'cleanup_pressure',return_value={'freeing_bytes':0,'io_full_avg10':0,'io_some_avg10':0}))
 
+    def test_cached_health_keeps_disk_truth_without_waiting_for_slow_refresh(self):
+        boatd.READY.set()
+        for level in ('ok', 'full', 'unknown'):
+            value = dict(storage(), level=level, disk_full=level == 'full', disk_low=level != 'ok')
+            with self.subTest(level=level), patch.object(boatd, 'disk_state', return_value=value):
+                boatd.health(fresh=True)
+                boatd._HEALTH['ts'] = boatd.now() - 900
+                boatd._HEALTH_LOCK.acquire()
+                try:
+                    with patch.object(boatd, '_sh', side_effect=AssertionError('request must not refresh')), \
+                            patch.object(disk, 'sample', side_effect=AssertionError('request must not sample')):
+                        health = boatd.health()
+                finally:
+                    boatd._HEALTH_LOCK.release()
+            self.assertEqual(health['disk']['level'], level)
+            self.assertEqual(health['disk_full'], level == 'full')
+            self.assertEqual(health['ok'], level == 'ok')
+            self.assertGreaterEqual(health['snapshot_age_s'], 900)
+
     def test_all_protected_box_classes_survive(self):
         ids=[self.box('bx_'+str(i)*8,owner='moni' if i==1 else 'ardud') for i in range(9)]
         self.con.execute('UPDATE boxes SET pinned=1 WHERE id=?',(ids[0],))

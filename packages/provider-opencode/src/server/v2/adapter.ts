@@ -1560,7 +1560,9 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       if (subagent === undefined || child.active !== undefined) return;
       subagent.turns += 1;
       const startedAt = yield* DateTime.now;
-      const nativeTurnId = `${child.sessionId}:turn:${subagent.turns}`;
+      // A resumed child keeps its native session ID while this counter resets.
+      const startId = yield* crypto.randomUUIDv4().pipe(Effect.orDie);
+      const nativeTurnId = `${child.sessionId}:turn:${subagent.turns}:${startId}`;
       const rootNodeId = idAllocator.derive.nodeFromProviderItem({
         driver,
         nativeItemId: `${nativeTurnId}:root`,

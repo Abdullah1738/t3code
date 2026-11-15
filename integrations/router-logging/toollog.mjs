@@ -8,6 +8,7 @@ const seen = new Set();
 const failurePhases = new WeakMap();
 const props = new Set(['model','size','count','status','enabled','locked','limited','reloginNeeded','state','action','tag','dryRun','complete','cost','hour','exitCode','attempt','source','failed','total','fourxx','fivexx','phase','durationMaxMs','omitted']);
 const ids = new Set(['account','connection','thread','incident','request','session']);
+for (const prop of ['firstAttemptMs', 'retryAttemptMs', 'outcome', 'consecutive', 'sinceMs']) props.add(prop);
 const token = v => typeof v === 'string' && /^[A-Za-z0-9_.:/-]{1,100}$/.test(v) && !/(sk-|bearer|password|secret|token|api.?key|otp|cookie|prompt|@)/i.test(v) ? v : undefined;
 const errorTag = v => typeof v === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(v) ? token(v) : undefined;
 // Only fixed operational messages survive. Exception text can contain arbitrary

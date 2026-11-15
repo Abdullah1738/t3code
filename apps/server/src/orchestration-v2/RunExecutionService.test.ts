@@ -5432,6 +5432,8 @@ it.effect("keeps completed runs completed when pull request refresh fails", () =
 
 function captureRootRunTermination(input: {
   readonly key: string;
+  readonly cancelMetadata?: Pick<OrchestrationV2Run, "cancelReason" | "cancelDetail">;
+  readonly loadCancelMetadata?: RunExecutionService.RunExecutionServiceV2StartRootRunInput["loadRunCancelMetadata"];
   readonly unobservedProviderTurn?: boolean;
   readonly providerDriver?: ProviderDriverKind;
   readonly onTerminalRun?: Effect.Effect<void>;
@@ -5763,6 +5765,8 @@ function captureRootRunTermination(input: {
           ? {}
           : { loadDelegatedTask: input.loadDelegatedTask }),
         shouldFinalizeRun: input.shouldFinalizeRun,
+        loadRunCancelMetadata:
+          input.loadCancelMetadata ?? (() => Effect.succeed(input.cancelMetadata)),
         ...(input.durableRefusal === undefined && input.refusalRead === undefined
           ? {}
           : { loadClaudeRefusal: readRefusal }),
@@ -8020,6 +8024,155 @@ it.effect.each([
       if (!("runId" in row)) return assert.fail("missing usage");
       assert.equal(row.inputTokens, 123);
       assert.equal(row.outputTokens, 45);
+      assert.equal(row.endReason, status);
+    }),
+);
+
+it.effect.each([undefined, "server_shutdown", "task_cancel", "user_stop"] as const)(
+  "keeps cancellation provenance from the current run in the terminal event and analytics (%s)",
+  (cancelReason) =>
+    Effect.gen(function* () {
+      const usage: AnalyticsEvent[] = [];
+      const result = yield* captureRootRunTermination({
+        key: `cancel-provenance:${cancelReason ?? "provider"}`,
+        shouldFinalizeRun: () => Effect.succeed(true),
+        ...(cancelReason === undefined
+          ? {}
+          : {
+              cancelMetadata: {
+                cancelReason,
+                cancelDetail: "Cancellation source read at finalization.",
+              },
+            }),
+        recordUsage: (event) =>
+          Effect.sync(() => {
+            usage.push(event);
+          }),
+        events: (ids) => Stream.make(rootTerminalEvent(ids, "cancelled")),
+      });
+      const ended = result.finalEvents.find(
+        (event) => event.type === "run.updated" && event.payload.status === "cancelled",
+      );
+      assert.isDefined(ended);
+      if (ended?.type !== "run.updated") return;
+      assert.equal(ended.payload.cancelReason, cancelReason ?? "provider_cancelled");
+      assert.equal(
+        ended.payload.cancelDetail,
+        cancelReason === undefined ? undefined : "Cancellation source read at finalization.",
+      );
+      const row = usage.find((event) => event.kind === "run.usage");
+      if (row === undefined || !("runId" in row)) return assert.fail("Missing run usage event");
+      assert.equal(row.cancelReason, cancelReason ?? "provider_cancelled");
+    }),
+);
+
+it.effect.each(
+  (["cancelled", "interrupted"] as const).flatMap((status) =>
+    (["server_shutdown", "server_restart", "thread_delete"] as const).flatMap((cancelReason) =>
+      [undefined, "user_stop" as const].map((staleReason) => ({
+        status,
+        cancelReason,
+        staleReason,
+      })),
+    ),
+  ),
+)(
+  "a rejected provider $status write keeps committed analytics cause $cancelReason (stale=$staleReason)",
+  ({ status, cancelReason, staleReason }) =>
+    Effect.gen(function* () {
+      const admitted = yield* Deferred.make<void>();
+      const committed = yield* Deferred.make<void>();
+      const processed = yield* Deferred.make<void>();
+      const ids = backgroundScenarioIds(
+        `rejected-cancel:${status}:${cancelReason}:${staleReason ?? "missing"}`,
+      );
+      const rows: AnalyticsEvent[] = [];
+      const result = yield* captureRootRunTermination({
+        key: `rejected-cancel:${status}:${cancelReason}:${staleReason ?? "missing"}`,
+        shouldFinalizeRun: () => Effect.succeed(true),
+        rejectTerminalWriteForAttempt: ids.attemptId,
+        loadCancelMetadata: () =>
+          Deferred.succeed(committed, undefined).pipe(
+            Effect.andThen(Deferred.await(processed)),
+            Effect.as({ cancelReason: staleReason }),
+          ),
+        runUpdates: Stream.fromEffect(Deferred.await(committed)).pipe(
+          Stream.map(() => ({
+            sequence: 1,
+            commandId: null,
+            event: {
+              id: EventId.make("committed-cancellation"),
+              type: "run.updated" as const,
+              threadId: ids.threadId,
+              occurredAt: DateTime.makeUnsafe("2026-11-15T00:00:00Z"),
+              payload: { id: ids.runId, status, cancelReason } as OrchestrationV2Run,
+            },
+          })),
+          Stream.concat(
+            Stream.fromEffect(Deferred.succeed(processed, undefined)).pipe(Stream.drain),
+          ),
+        ),
+        recordUsage: (row) =>
+          Effect.sync(() => {
+            rows.push(row);
+          }),
+        startTurn: () => Deferred.succeed(admitted, undefined).pipe(Effect.asVoid),
+        events: (runtimeIds) =>
+          Stream.fromEffect(Deferred.await(admitted)).pipe(
+            Stream.flatMap(() => Stream.make(rootTerminalEvent(runtimeIds, status))),
+          ),
+      });
+      assert.isFalse(result.finalEvents.some((event) => event.type === "run.updated"));
+      const row = rows.find((event) => "runId" in event);
+      if (row === undefined || !("runId" in row)) return assert.fail("Missing usage event");
+      assert.equal(row.cancelReason, cancelReason);
+      assert.equal(row.endReason, status);
+    }),
+);
+
+it.effect.each(
+  (["cancelled", "interrupted"] as const).flatMap((status) =>
+    (
+      [
+        "user_stop",
+        "task_cancel",
+        "thread_reset",
+        "card_stop",
+        "delegated_parent_cancelled",
+        "superseded",
+        "thread_archive",
+      ] as const
+    ).map((cancelReason) => ({ status, cancelReason })),
+  ),
+)(
+  "successful $status finalization reloads committed $cancelReason for usage",
+  ({ status, cancelReason }) =>
+    Effect.gen(function* () {
+      let committed = false;
+      let reads = 0;
+      const rows: AnalyticsEvent[] = [];
+      const result = yield* captureRootRunTermination({
+        key: `successful-cancel:${status}:${cancelReason}`,
+        shouldFinalizeRun: () => Effect.succeed(true),
+        loadCancelMetadata: () =>
+          Effect.sync(() => {
+            reads += 1;
+            return committed ? { cancelReason } : undefined;
+          }),
+        onTerminalRun: Effect.sync(() => {
+          committed = true;
+        }),
+        recordUsage: (row) =>
+          Effect.sync(() => {
+            rows.push(row);
+          }),
+        events: (ids) => Stream.make(rootTerminalEvent(ids, status)),
+      });
+      assert.isTrue(result.finalEvents.some((event) => event.type === "run.updated"));
+      assert.isAtLeast(reads, 2);
+      const row = rows.find((event) => "runId" in event);
+      if (row === undefined || !("runId" in row)) return assert.fail("Missing usage event");
+      assert.equal(row.cancelReason, cancelReason);
       assert.equal(row.endReason, status);
     }),
 );

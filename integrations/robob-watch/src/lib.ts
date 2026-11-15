@@ -666,7 +666,7 @@ export async function liveSession(): Promise<string | undefined> {
   const result = await run(["/usr/bin/sqlite3", "-readonly", BRIDGE_DB, "select json_extract(value,'$.id') from kv where key='route'"], 10_000);
   const id = result.out.trim();
   // Robob routes are thread ids ("ardud-control:thread:<uuid>"); older OpenCode routes were "ses_...".
-  return result.ok && id && /^[A-Za-z0-9_][A-Za-z0-9_:.-]{0,199}$/.test(id) ? id : undefined;
+  return result.ok && id && /^[A-Za-z0-9_][A-Za-z0-9_%:.-]{0,199}$/.test(id) ? id : undefined;
 }
 
 /** The bridge names a wake's inbound row after the sha256 of its dedupe key (api.ts /wake). */
@@ -703,8 +703,8 @@ const spectrumCli = () => process.env.ROBOB_WATCH_SPECTRUM_CLI ?? join(HOME, ".l
 const telegramCli = () => process.env.ROBOB_WATCH_TELEGRAM_CLI ?? join(HOME, ".local/share/telegram-bridge/src/cli.ts");
 const t3ctlCli = () => process.env.ROBOB_WATCH_T3CTL ?? join(HOME, ".local/bin/t3ctl");
 
-type CreatorRoute = { kind: "owner" } | { kind: "native_failed"; transient?: boolean } | { kind: "thread"; thread: string; unverified?: boolean; reason?: string }
-  | { kind: "unreachable"; thread: string; reason: string } | { kind: "refused"; reason: string };
+type CreatorRoute = { kind: "owner"; reason?: string } | { kind: "native_failed"; transient?: boolean; failure?: string; reason?: string } | { kind: "thread"; thread: string; title?: string; unverified?: boolean; reason?: string }
+  | { kind: "unreachable"; thread: string; reason: string; failure: string } | { kind: "refused"; reason: string };
 const creatorRoutes = new Map<string, { session: string; cli: string; until: number; route: Promise<CreatorRoute> }>();
 const CREATOR_CACHE_MS = 3 * 60_000;
 const CREATOR_FAILURE_CACHE_MS = 30_000;
@@ -732,11 +732,16 @@ function creatorSendTimeout(): number {
   return underTest() && process.env.ROBOB_WATCH_T3CTL && Number.isInteger(override) && override > 0 && override < 20_000 ? override : 20_000;
 }
 
-async function creatorRoute(watcher: Watcher, session: string, cli: string): Promise<CreatorRoute> {
+const definiteRouteFailure = (out: string) => /\b(not_found|archived|invalid[_ ](?:id|thread|session))\b/i.exec(out)?.[1]?.toLowerCase().replaceAll(" ", "_");
+
+async function creatorRoute(watcher: Watcher, session: string, cli: string, diagnostics = true): Promise<CreatorRoute> {
+  const routeLog = (id: string | null, message: string) => { if (diagnostics) log(id, message); };
   const failed = (step: "native" | "status", reason: string, started: number) => {
-    log(null, `creator lookup failed watcher=${watcher.id} session=${session.slice(0, 12)} reason=${reason}`);
-    creatorFallback(watcher, step, reason, started);
+    routeLog(null, `creator lookup failed watcher=${watcher.id} session=${session.slice(0, 12)} reason=${reason}`);
+    if (diagnostics) creatorFallback(watcher, step, reason, started);
   };
+  const ownerSession = await liveSession().catch(() => undefined);
+  if (session === ownerSession) return { kind: "owner", reason: "live owner session" };
   let thread = session;
   if (session.startsWith("ses_")) {
     const started = now();
@@ -753,9 +758,9 @@ async function creatorRoute(watcher: Watcher, session: string, cli: string): Pro
       }
       if (!result.ok) {
         failed("native", exitReason(result), started);
-        log(watcher.id, `creator native lookup failed ${diagnostics.join(", ")}`);
-        if (timedOut) log(null, `creator native lookup failed watcher=${watcher.id} ${diagnostics.join(", ")}`);
-        return { kind: "native_failed", transient: timedOut && !/\b(?:not_found|invalid[_ ](?:id|session))\b/i.test(result.out) };
+        routeLog(watcher.id, `creator native lookup failed ${diagnostics.join(", ")}`);
+        if (timedOut) routeLog(null, `creator native lookup failed watcher=${watcher.id} ${diagnostics.join(", ")}`);
+        return { kind: "native_failed", transient: timedOut && !definiteRouteFailure(result.out), failure: definiteRouteFailure(result.out), reason: diagnostics.join(", ") };
       }
       try {
         const value: unknown = JSON.parse(result.out);
@@ -763,21 +768,21 @@ async function creatorRoute(watcher: Watcher, session: string, cli: string): Pro
         thread = value.thread.threadId;
       } catch {
         failed("native", "invalid", started);
-        return { kind: "native_failed", transient: timedOut };
+        return { kind: "native_failed", transient: timedOut, reason: "invalid native response" };
       }
     } catch {
       failed("native", "exit:127", started);
-      return { kind: "native_failed", transient: nativeTimedOut };
+      return { kind: "native_failed", transient: nativeTimedOut, reason: "native lookup unavailable" };
     }
   }
   let started = now();
-  const unreachable = (reason: string, detail: string): CreatorRoute => {
+  const unreachable = (reason: string, detail: string, failure = reason): CreatorRoute => {
     failed("status", reason, started);
-    log(null, `creator wake fallback watcher=${watcher.id} thread=${thread} ${detail}`);
-    return { kind: "unreachable", thread, reason: detail };
+    routeLog(null, `creator wake fallback watcher=${watcher.id} thread=${thread} ${detail}`);
+    return { kind: "unreachable", thread, reason: detail, failure };
   };
   try {
-    if (thread === await liveSession()) return { kind: "owner" };
+    if (thread === ownerSession) return { kind: "owner", reason: "live owner session" };
     started = now();
     const diagnostics: string[] = [];
     let result = await run([cli, "status", thread], creatorTimeout(), 100_000);
@@ -788,8 +793,8 @@ async function creatorRoute(watcher: Watcher, session: string, cli: string): Pro
       diagnostics.push(probeDetail("retry", result, retryStarted));
     }
     const detail = diagnostics.join(", ");
-    if (!result.ok && /\b(?:not_found|archived|invalid[_ ](?:id|thread))\b/i.test(result.out)) {
-      return unreachable(exitReason(result), detail);
+    if (!result.ok && definiteRouteFailure(result.out)) {
+      return unreachable(exitReason(result), detail, definiteRouteFailure(result.out)!);
     }
     let value: unknown;
     try { value = JSON.parse(result.out); } catch { /* An unavailable/malformed probe cannot prove absence. */ }
@@ -797,19 +802,62 @@ async function creatorRoute(watcher: Watcher, session: string, cli: string): Pro
       && typeof value.thread.archived === "boolean") {
       const status = value.thread;
       const project = typeof status.projectId === "string" ? status.projectId : "";
-      if (status.origin === "imessage" || /(?:^|[/:])imessage\/?$/i.test(project)) return { kind: "owner" };
-      return status.archived ? unreachable("archived", `thread is archived after ${((now() - started) / 1000).toFixed(1)}s`) : { kind: "thread", thread };
+      if (status.origin === "imessage" || /(?:^|[/:])imessage\/?$/i.test(project)) return { kind: "owner", reason: "iMessage thread" };
+      return status.archived ? unreachable("archived", `thread is archived after ${((now() - started) / 1000).toFixed(1)}s`) : { kind: "thread", thread, ...(typeof status.title === "string" ? { title: status.title } : {}) };
     }
     failed("status", result.ok ? "invalid" : exitReason(result), started);
-    log(watcher.id, `creator status unverified thread=${thread} ${detail}`);
+    routeLog(watcher.id, `creator status unverified thread=${thread} ${detail}`);
     // Without a successful probe an iMessage origin cannot be identified. Prefer the known
     // thread ID (including ardud-control:thread:) over silently routing a transient failure to the owner.
     return { kind: "thread", thread, unverified: true, reason: detail };
   } catch (error) {
     failed("status", "exit:127", started);
-    log(watcher.id, `creator status unverified thread=${thread} status error after ${((now() - started) / 1000).toFixed(1)}s: ${String(error).slice(0, 300)}`);
-    return { kind: "thread", thread, unverified: true };
+    routeLog(watcher.id, `creator status unverified thread=${thread} status error after ${((now() - started) / 1000).toFixed(1)}s: ${String(error).slice(0, 300)}`);
+    return { kind: "thread", thread, unverified: true, reason: "status lookup unavailable" };
   }
+}
+
+export type WakeRouteCheck = {
+  route: "thread" | "owner" | "unverified" | "refused";
+  reason: string;
+  durationMs: number;
+  thread?: string;
+  title?: string;
+  note: string;
+};
+
+/** Uses the delivery classifier without filling its watcher-id cache or writing delivery diagnostics. */
+export async function checkWakeRoute(watcher: Watcher): Promise<WakeRouteCheck | undefined> {
+  if (watcher.mode !== "wake" || watcher.chat) return undefined;
+  const started = now();
+  const session = watcher.created_by_session?.trim();
+  const result: CreatorRoute = !session ? { kind: "owner", reason: "no --session" }
+    : underTest() && !process.env.ROBOB_WATCH_T3CTL ? { kind: "thread", thread: session, unverified: true, reason: "lookup unavailable" }
+    : await creatorRoute(watcher, session, t3ctlCli(), false);
+  const durationMs = Math.max(0, now() - started);
+  let check: WakeRouteCheck;
+  if (result.kind === "owner") {
+    const reason = result.reason ?? "no --session";
+    check = { route: "owner", reason, durationMs, note: `wakes go to the owner chat (${reason})` };
+  } else if (result.kind === "thread" && !result.unverified) {
+    check = { route: "thread", reason: "live thread", durationMs, thread: result.thread, title: result.title,
+      note: `wakes go to thread ${result.thread}${result.title === undefined ? "" : ` (${JSON.stringify(result.title)})`}` };
+  } else if (result.kind === "unreachable" || result.kind === "native_failed" && result.failure) {
+    const reason = result.kind === "unreachable" ? result.failure : result.failure!;
+    check = { route: "refused", reason, durationMs,
+      note: `--session ${session} is not a live thread (${reason}); wakes would go to the owner chat. Pass the thread id from t3ctl, or omit --session for owner wakes.` };
+  } else {
+    const reason = result.kind === "refused" ? result.reason : result.reason ?? "lookup unavailable";
+    const deadline = `${WAKE_CONFIRM_MS / 60_000} minutes without confirmation`;
+    const fallback = result.kind === "native_failed" && !result.transient
+      ? `immediately if the native lookup still fails, or after ${deadline}`
+      : `on a definite delivery failure or after ${deadline}`;
+    check = { route: "unverified", reason, durationMs, thread: result.kind === "thread" ? result.thread : session,
+      note: `could not check thread ${shortThread(session!)} (${reason} after ${durationMs}ms); wakes will try it first and fall back to the owner chat ${fallback}.` };
+  }
+  toolLog({ component: "cli", kind: "event", name: "watch.route_checked", ok: check.route !== "refused", ids: { watcher: watcher.id },
+    durationMs, props: { route: check.route, reason: check.route === "unverified" ? "lookup unavailable" : check.reason, durationMs } });
+  return check;
 }
 
 function resolveCreator(watcher: Watcher, cli: string): Promise<CreatorRoute> {

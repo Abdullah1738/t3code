@@ -96,6 +96,28 @@ class GateTests(unittest.TestCase):
             journal.consume(flow, 'place', kind='place', payable_minor=201, **args)
         self.assertTrue(journal.consume(flow, 'place', kind='place', payable_minor=200, **args))
 
+    def test_delegated_record_passes_existing_financial_gate_and_journal_stays_at_most_once(self):
+        from agent_bus_support import REQUEST, create_bus
+        now = dt.datetime.now(go.UTC)
+        db = self.home / 'bus.sqlite'
+        create_bus(db, now)
+        delegate = self.ledger.delegate(principal='moni', channel='agent-bus', quote='Yes',
+            source='owner/test', at=now.isoformat(), now=now)
+        flow = str(uuid.uuid4())
+        journal.open_flow(flow_id=flow, app='noon', vertical='minutes',
+                          account_hash='a'*64, scope_hash='b'*64)
+        item = go.commerce_item(journal.binding(flow))
+        with patch.dict(os.environ, {'AGENT_BUS_DB': str(db)}):
+            record = self.ledger.record_delegated(principal='moni', bus_request=REQUEST,
+                vendor='noon', item=item, amount=200, currency='AED', now=now)
+        self.assertEqual(record['delegation'], delegate['id'])
+        args = dict(cart_hash='c'*64, review_hash='d'*64, request_hash='f'*64)
+        with self.assertRaisesRegex(journal.JournalError, 'OWNER_GO_REQUIRED'):
+            journal.consume(flow, 'financial', kind='place', payable_minor=201, **args)
+        self.assertTrue(journal.consume(flow, 'financial', kind='place', payable_minor=200, **args))
+        with self.assertRaises(journal.JournalError):
+            journal.consume(flow, 'financial', kind='place', payable_minor=200, **args)
+
     def test_food_preparation_returns_the_item_accepted_by_the_financial_gate(self):
         import commerce_cli as cli
         import commerce_food as food

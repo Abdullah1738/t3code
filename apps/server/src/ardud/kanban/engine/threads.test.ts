@@ -1,4 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
+import { vi } from "vite-plus/test";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -15,6 +16,7 @@ import {
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderThreadId,
   RunId,
   RuntimeRequestId,
   NodeId,
@@ -28,6 +30,8 @@ import {
 import * as Option from "effect/Option";
 import * as Result from "effect/Result";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+
+import { derivePendingBackgroundWork } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 
 import * as Sqlite from "../../../persistence/Sqlite.ts";
 import * as CommandReceipts from "../../../persistence/OrchestrationCommandReceipts.ts";
@@ -125,18 +129,61 @@ describe("viewStateOf", () => {
 });
 
 describe("backgroundWorkOf", () => {
-  it("counts subagents and background tasks, not commands or pull-request watches", () => {
+  it("counts commands alongside subagents and tasks, with PR watches counted separately", () => {
     expect(
       backgroundWorkOf({
         pendingBackgroundTasks: [
           { taskId: "a", kind: "subagent" },
           { taskId: "b", kind: "background_task" },
           { taskId: "c", kind: "command" },
+          { taskId: "d", kind: "monitor" },
           { taskId: "pull-request-watch:github.com/x/y#1", kind: "monitor" },
         ],
       }),
-    ).toBe(2);
+    ).toBe(4);
   });
+
+  it.each([
+    "pending",
+    "running",
+    "waiting",
+    "completed",
+    "failed",
+    "cancelled",
+    "interrupted",
+  ] as const)("counts a Codex shell item only while active: %s", (status) => {
+    const pendingBackgroundTasks = derivePendingBackgroundWork({
+      latestRun: { id: RunId.make("parent"), ordinal: 1, status: "completed" },
+      providerThreads: [],
+      turnItems: [{ id: "shell", type: "command_execution", title: "Check", status }],
+    });
+    expect(backgroundWorkOf({ pendingBackgroundTasks })).toBe(
+      status === "pending" || status === "running" || status === "waiting" ? 1 : 0,
+    );
+  });
+
+  it.each(["command", "background_task", "monitor"] as const)(
+    "counts a Claude %s until the provider removes it from its roster",
+    (kind) => {
+      const pendingBackgroundTasks = derivePendingBackgroundWork({
+        latestRun: { id: RunId.make("parent"), ordinal: 1, status: "completed" },
+        providerThreads: [
+          {
+            id: ProviderThreadId.make("claude"),
+            pendingBackgroundTasks: [{ taskId: "bash-or-task", kind }],
+          },
+        ],
+        turnItems: [],
+      });
+      expect(backgroundWorkOf({ pendingBackgroundTasks })).toBe(1);
+      const ended = derivePendingBackgroundWork({
+        latestRun: { id: RunId.make("parent"), ordinal: 1, status: "completed" },
+        providerThreads: [{ id: ProviderThreadId.make("claude"), pendingBackgroundTasks: [] }],
+        turnItems: [],
+      });
+      expect(backgroundWorkOf({ pendingBackgroundTasks: ended })).toBe(0);
+    },
+  );
 
   it("is zero for an empty roster", () => {
     expect(backgroundWorkOf({ pendingBackgroundTasks: [] })).toBe(0);
@@ -362,6 +409,7 @@ it.effect.each(
     Effect.gen(function* () {
       const threadId = ThreadId.make("restored-thread");
       const stopped: Array<string | undefined> = [];
+      const sources: Array<string | undefined> = [];
       const cancelled: Array<string> = [];
       let restoredRunning = true;
       let oldCancelled = false;
@@ -392,6 +440,7 @@ it.effect.each(
         interruptThread: (input) =>
           Effect.sync(() => {
             stopped.push(input.runId);
+            sources.push(input.cancelReason);
             if (input.runId === undefined || input.runId === "restored-run")
               restoredRunning = false;
           }).pipe(
@@ -411,6 +460,7 @@ it.effect.each(
             if (input.type === "thread.stop") restoredRunning = false;
             if (input.type === "queued-run.cancel") {
               cancelled.push(input.runId);
+              sources.push(input.reason);
               if (input.runId === "old-run") oldCancelled = true;
             }
             return { storedEvents: [] } as never;
@@ -420,10 +470,25 @@ it.effect.each(
         const threads = yield* KanbanThreads;
         if (mode === "run") {
           yield* threads.cancelQueued(threadId, "old-run");
-          yield* threads.interrupt(threadId, "Late archived send", false, "old-run");
+          yield* threads.interrupt(
+            threadId,
+            "Late archived send",
+            false,
+            "old-run",
+            undefined,
+            "superseded",
+          );
         } else
-          yield* threads.interrupt(threadId, "Late archived send", false, undefined, messageId);
+          yield* threads.interrupt(
+            threadId,
+            "Late archived send",
+            false,
+            undefined,
+            messageId,
+            "superseded",
+          );
         expect(restoredRunning).toBe(true);
+        expect(sources.every((source) => source === "superseded")).toBe(true);
         expect(stopped).toEqual(status === "missing" && mode !== "run" ? [] : ["old-run"]);
         expect(cancelled).toEqual(status === "queued" ? ["old-run"] : []);
       }).pipe(
@@ -991,6 +1056,7 @@ it.effect("a rejected keyed wake can retry with real orchestrator receipts", () 
   const recorded: Array<ThreadManagementService.ThreadManagementSendInput> = [];
   let failBeforeDispatch = false;
   let failAfterDispatch = false;
+  let receiptFailureAfterCommit = false;
   let queueWithdrawal = false;
   let startWithdrawal = false;
   let restartBeforeCleanup = false;
@@ -1007,6 +1073,7 @@ it.effect("a rejected keyed wake can retry with real orchestrator receipts", () 
   const dependencies = Layer.mergeAll(
     management,
     receipts,
+    CommandReceipts.layer.pipe(Layer.provide(db)),
     ProjectionStore.layer.pipe(Layer.provide(db)),
     Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
   );
@@ -1177,7 +1244,34 @@ it.effect("a rejected keyed wake can retry with real orchestrator receipts", () 
         true,
       );
       failAfterDispatch = true;
-      expect(Result.isFailure(yield* Effect.result(threads.send(wake)))).toBe(true);
+      let acknowledged = false;
+      const repository = yield* CommandReceipts.OrchestrationCommandReceiptRepository;
+      const originalRead = repository.getByCommandId;
+      const reads = vi
+        .spyOn(repository, "getByCommandId")
+        .mockImplementation((input) =>
+          receiptFailureAfterCommit
+            ? Effect.die("receipt read unavailable after accepted commit")
+            : originalRead(input),
+        );
+      let failed = false;
+      try {
+        const result = yield* Effect.exit(
+          threads.send({
+            ...wake,
+            onCommitted: () => {
+              acknowledged = true;
+              receiptFailureAfterCommit = true;
+            },
+          }),
+        );
+        failed = result._tag === "Failure";
+      } finally {
+        receiptFailureAfterCommit = false;
+        reads.mockRestore();
+      }
+      expect(failed).toBe(true);
+      expect(acknowledged).toBe(true);
       expect(recorded.at(-1)?.commandId).toBe("kanban:send:wake:real-receipt:retry:2");
       const accepted = yield* receiptStore.getByCommandId(recorded.at(-1)!.commandId);
       expect(Option.isSome(accepted) && accepted.value.status).toBe("accepted");
@@ -1200,14 +1294,12 @@ it.effect("a rejected keyed wake can retry with real orchestrator receipts", () 
         text: "The board changed while assigning this review",
       });
       const revoked = yield* orchestrator.getThreadRecords(threadId, ["runs", "messages"]);
-      expect(["interrupted", "cancelled"]).toContain(
-        revoked.runs.find((run) => run.id === acceptedWake.id)?.status,
+      expect(revoked.runs.find((run) => run.id === acceptedWake.id)?.status).toBe(
+        acceptedWake.status,
       );
-      expect(
-        revoked.messages.some(
-          (message) => message.text === "The board changed while assigning this review",
-        ),
-      ).toBe(false);
+      expect(revoked.runs.filter((run) => run.status === "queued")).toHaveLength(0);
+      // Finish this preserved turn explicitly before exercising the next withdrawal scenario.
+      yield* threads.interrupt(threadId, "Finish preserved turn", true);
       yield* threads.send({ threadId, key: "wake:next-worker", text: "Next valid work" });
       const original = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs.at(-1)!;
       const records = yield* orchestrator.getThreadRecords(threadId, [
@@ -1340,7 +1432,8 @@ it.effect("a rejected keyed wake can retry with real orchestrator receipts", () 
         text: "Stop only the original card",
       });
       nativeSteering = null;
-      expect(siblingBeforeInterrupt).toBe(false);
+      expect(siblingBeforeInterrupt).toBe(true);
+      siblingBeforeInterrupt = false;
       const lateShared = yield* orchestrator.getThreadRecords(threadId, ["runs"]);
       const latePreserved = lateShared.runs.find((run) => run.id === lateRoot.id)!;
       expect(latePreserved.status).toBe(lateRoot.status);
@@ -1363,7 +1456,7 @@ it.effect("#1490 observes accepted deliveries once and does not block on boards 
     Layer.mock(Analytics.Analytics)({
       record: (event) =>
         Effect.sync(() => {
-          measured.push(event);
+          if (event.kind === "kanban.evaluator") measured.push(event);
         }),
     }),
     Layer.effect(
@@ -1698,17 +1791,26 @@ it.effect("#1490 observes accepted deliveries once and does not block on boards 
   }).pipe(Effect.provide(dependencies));
 });
 
-it.effect.each([
-  "preparing",
-  "queued",
-  "shared queued",
-  "shared active",
-  "shared completed",
-  "shared failed",
-  "shared interrupted",
-] as const)(
-  "#566 stopping an abandoned %s launch prevents its pending turn from starting",
-  (state) => {
+it.effect.each(
+  (
+    [
+      "preparing",
+      "queued",
+      "shared queued",
+      "shared active",
+      "shared completed",
+      "shared failed",
+      "shared interrupted",
+    ] as const
+  ).flatMap((state) =>
+    ([undefined, "task_stalled", "superseded"] as const).map((cancelReason) => ({
+      state,
+      cancelReason,
+    })),
+  ),
+)(
+  "#566 stopping an abandoned $state launch prevents its pending turn from starting ($cancelReason)",
+  ({ state, cancelReason }) => {
     const db = Sqlite.layerMemory;
     const instanceId = ProviderInstanceId.make("codex");
     const projectId = ProjectId.make("project:abandoned");
@@ -1785,9 +1887,19 @@ it.effect.each([
         expect(after.at(-1)?.status).toBe(state === "shared queued" ? "cancelled" : "queued");
         return;
       }
-      yield* threads.interrupt(threadId, "Abandoned launch", true);
+      yield* threads.interrupt(
+        threadId,
+        "Abandoned launch",
+        true,
+        undefined,
+        undefined,
+        cancelReason,
+      );
       const after = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs;
       expect(after.every((run) => ["cancelled", "interrupted"].includes(run.status))).toBe(true);
+      expect(after.map((run) => run.cancelReason)).toEqual(
+        after.map(() => cancelReason ?? "card_stop"),
+      );
       yield* orchestrator.dispatch({
         type: "queue.resume",
         commandId: CommandId.make("abandon:resume"),

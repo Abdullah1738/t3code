@@ -129,3 +129,11 @@ test('JS cap keeps errors, emits one cap marker, and expires only day files', t=
   const fd=fs.openSync(path,'r'),buf=Buffer.alloc(4096);const n=fs.readSync(fd,buf,0,4096,50*1024*1024);fs.closeSync(fd);const tail=buf.subarray(0,n).toString();
   assert.equal(tail.split('log.cap').length-1,1);assert.ok(!tail.includes('fixture.drop'));assert.ok(tail.includes('fixture.error'));
 });
+
+test('provider availability analytics retain timings and counters but exclude private values', () => {
+  const row = clean({ component: 'reauth', name: 'providers.fetch.retry', kind: 'event', props: {
+    firstAttemptMs: 6000, retryAttemptMs: 15000, outcome: 'unavailable', consecutive: 3, sinceMs: 1_700_000_000_000,
+    url: 'https://private.example/auth', authorization: 'private',
+  } });
+  assert.deepEqual(row.props, { firstAttemptMs: 6000, retryAttemptMs: 15000, outcome: 'unavailable', consecutive: 3, sinceMs: 1_700_000_000_000 });
+});

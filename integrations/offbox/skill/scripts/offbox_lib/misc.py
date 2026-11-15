@@ -529,6 +529,22 @@ def ports(me: dict, remote: int, local: int | None, box_id: str | None, reverse:
 STATUS_CALL_S = 12   # `offbox status` answers fast even when boat's API hangs (each call gets its own budget)
 
 
+def _home_run_notices(me):
+    from . import common
+    from .home_run_observation import notice
+    path = common.db_path_for("server")
+    if common.home_state().get("state") not in ("home_down", "home_slow") or not path.exists():
+        return
+    try:
+        with contextlib.closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1)) as con:
+            con.row_factory = sqlite3.Row
+            for row in con.execute("SELECT * FROM runs WHERE owner=? AND repo_root=? AND status IN ('starting','running')",
+                                   (me["owner"], me["repo_root"])):
+                notice(row, backend="server", emit=print)
+    except sqlite3.Error:
+        pass
+
+
 def status(me: dict) -> None:
     from . import common, home
     con = db()
@@ -541,7 +557,13 @@ def status(me: dict) -> None:
         else:
             why = st.get("reason") or ("pinned to Boat" if common.backend_pinned() else "home unreachable")
             print(f"backend: Boat, standing in for the home offbox server ({st.get('state')}{since}: {why}). "
-                  "Runs go back home after three good health checks")
+                  "New submissions probe home before choosing Boat")
+        daily = st.get("flaps_today") or {}
+        if daily:
+            print(f"home flaps today ({daily.get('day')}): slow={daily.get('slow', 0)} "
+                  f"slow_max_s={daily.get('slow_max_s', 0)} starting={daily.get('starting', 0)} "
+                  f"starting_max_s={daily.get('starting_max_s', 0)} down={daily.get('down', 0)}")
+        _home_run_notices(me)
         if st.get("degraded"):
             print(f"home server degraded: {'; '.join(str(x) for x in st['degraded'][:3])}")
     for row in (st.get('disk') or {}).get('filesystems', []) if common.home_config() is not None else []:
@@ -947,6 +969,8 @@ def _report_never_started(r) -> int:
 def logs(run_id: str, do_follow: bool) -> int:
     r = _run_row(run_id)
     _require_my_run(r)
+    from .home_run_observation import notice
+    notice(r)
     if r['status'] == 'source_gone':
         say(r['error'])
         return 2
@@ -980,8 +1004,9 @@ def logs(run_id: str, do_follow: bool) -> int:
             st = p.stat() if p.exists() else None
             written = time.strftime('%H:%M:%S', time.localtime(st.st_mtime)) if st else 'never'
             say(f"{r['run_id']} is still running; this local copy ({st.st_size if st else 0} bytes, last written "
-                f"{written}) includes the output fetched so far. Use `offbox logs --follow {r['run_id']}` "
-                f"or `offbox wait {r['run_id']} --timeout <s>` for current output.")
+                f"{written}) includes the output fetched so far. For completion, hand off "
+                f"`offbox wait {r['run_id']}` using the remote-compute skill’s Waiting for a run route; "
+                "end your turn and do not poll logs.")
         return 0
     result = _catch_up_log(r, lock_wait=LOG_READ_WAIT_S)
     from . import resources
@@ -1010,14 +1035,54 @@ def logs(run_id: str, do_follow: bool) -> int:
     return 0
 
 
-def wait(run_id: str, timeout: float | None) -> int:
+def wait(run_id: str, timeout: float | None, *, summary: bool = False) -> int:
     r = _run_row(run_id)
     _require_my_run(r)
+    from .home_run_observation import notice
+    notice(r)
+    path = LOGS_DIR / f"{run_id}.log"
+    delivered = delivered_bytes(path) if summary else 0
     from . import start_check
+    from .runs import Interrupted
     unknown = r['status'] == 'infra' and start_check.recovery_marked(db(), r)
-    if (r["status"] not in ("starting", "running", "lost") and not unknown) or (r['status'] == 'lost' and (r['exit_code'] is not None or not r['box_id'])):
-        return _settled(r, show_failure=True, until=None if timeout is None else now() + timeout)
-    return _wait_locked(r, echo=False, timeout=timeout, show_failure=True)
+    try:
+        if (r["status"] not in ("starting", "running", "lost") and not unknown) or (r['status'] == 'lost' and (r['exit_code'] is not None or not r['box_id'])):
+            code = _settled(r, show_failure=True, until=None if timeout is None else now() + timeout)
+        else:
+            code = _wait_locked(r, echo=False, timeout=timeout, show_failure=True)
+    except Interrupted as error:
+        if summary:
+            _wait_summary(run_id, error.code, delivered)
+        raise
+    if summary:
+        # A forwarded wait is another CLI process on the destination backend; it prints its own summary.
+        try:
+            forwarded = _run_row(run_id)['status'] == 'forwarded'
+        except (sqlite3.Error, OffboxError):
+            forwarded = r['status'] == 'forwarded'
+        if not forwarded:
+            _wait_summary(run_id, code, delivered)
+    return code
+
+
+def _wait_summary(run_id: str, code: int, delivered: int) -> None:
+    path = LOGS_DIR / f"{run_id}.log"
+    out(f"{run_id}: backend={api.BACKEND} exit={code} log={path}")
+    # Keep the summary and preview within the harness's completion-notification tail. Already delivered output
+    # stays quiet, including failures shown by an earlier logs/follow/wait invocation.
+    try:
+        with path.open('rb') as stream:
+            size = os.fstat(stream.fileno()).st_size
+            pos = max(0, size - 4096, delivered if delivered <= size else 0)
+            stream.seek(pos)
+            tail = stream.read(4096).decode('utf-8', errors='replace').splitlines()[-8:]
+        text = '\n'.join(tail)[-640:]
+        if text:
+            out('Output tail:\n' + text)
+            if not is_silenced(sys.stdout):
+                record_delivery(path, size)
+    except OSError:
+        pass
 
 
 def _settled(r, echo=False, pos=0, *, locked=False, until=None, show_failure=False) -> int:

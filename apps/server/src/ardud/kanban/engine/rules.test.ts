@@ -498,6 +498,7 @@ describe("planDispatch", () => {
     expect(checkClaim(paused, held, ctx)).toEqual({
       ok: false,
       reason: "the board is paused: Ship the fix",
+      denyReason: "board_paused",
     });
     const reviewKept = { ...paused, pause: { ...paused.pause!, keep: [review.id] } };
     expect(
@@ -1380,6 +1381,7 @@ describe("thread batching", () => {
     expect(checkClaim(setupRunning, card(), ctx)).toEqual({
       ok: false,
       reason: "Setup is running",
+      denyReason: "board_setup_running",
     });
     expect(
       checkClaim(
@@ -1412,6 +1414,7 @@ describe("thread batching", () => {
       }),
     ).toEqual({
       ok: false,
+      denyReason: "dependency_blocked",
       reason: `card #${waiting.number} waits on #${blocker.number} (needs_review)`,
     });
   });
@@ -2406,4 +2409,27 @@ describe("failedTurnResumeDue", () => {
       ).toBe(expected);
     },
   );
+});
+
+it("#1553 assignment retry gates use the supplied clock and reset on a manual move", () => {
+  const waiting = card({ id: KanbanCardId.make("wake-retry"), stage: "todo", movedAt: iso(1000) });
+  const retries = new Map([
+    [waiting.id, { movedAt: waiting.movedAt, attempts: 1, retryAt: 31_000 }],
+  ]);
+  const plan = (row: KanbanCard, now: number) =>
+    planDispatch(
+      board,
+      [row],
+      pools([[opus, 1]]),
+      new Map(),
+      undefined,
+      now,
+      new Set(),
+      new Map(),
+      new Map(),
+      retries,
+    );
+  expect(plan(waiting, 30_999)).toHaveLength(0);
+  expect(plan(waiting, 31_000)).toHaveLength(1);
+  expect(plan({ ...waiting, movedAt: iso(2000) }, 2000)).toHaveLength(1);
 });

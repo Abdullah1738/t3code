@@ -242,13 +242,17 @@ export const pageRows = <R extends { readonly number: number }>(
   after: number,
   limit: number,
   maxChars = COMPACT_READ_CHARS,
+  fitRow?: (row: R, maxChars: number) => R,
 ) => {
   const out: Array<R> = [];
   let chars = 0;
   const rest = rows.filter((row) => row.number > after);
-  for (const row of rest) {
-    const size = JSON.stringify(row).length + 1;
-    if (out.length >= limit || (out.length > 0 && chars + size > maxChars)) break;
+  for (const source of rest) {
+    if (out.length >= limit) break;
+    const sourceSize = JSON.stringify(source).length + 1;
+    const row = fitRow && sourceSize > maxChars ? fitRow(source, maxChars) : source;
+    const size = row === source ? sourceSize : JSON.stringify(row).length + 1;
+    if (out.length > 0 && chars + size > maxChars) break;
     out.push(row);
     chars += size;
   }
@@ -268,11 +272,13 @@ export const pageRowsInReply = <R extends { readonly number: number }, Reply>(
     page: ReadonlyArray<R>,
     cursor: { readonly hasMore: boolean; readonly nextAfter: number | null },
   ) => Reply,
+  fitRow?: (row: R, maxChars: number) => R,
 ): Reply => {
   const wrapper = JSON.stringify(
     reply([], { hasMore: true, nextAfter: Number.MAX_SAFE_INTEGER }),
   ).length;
-  const page = pageRows(rows, after, limit, COMPACT_READ_CHARS - wrapper);
+  const maxChars = COMPACT_READ_CHARS - wrapper;
+  const page = pageRows(rows, after, limit, maxChars, fitRow);
   return reply(page.rows, { hasMore: page.hasMore, nextAfter: page.nextAfter });
 };
 

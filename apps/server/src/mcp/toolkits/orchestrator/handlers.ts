@@ -49,6 +49,7 @@ const handlers = Effect.gen(function* () {
             Effect.mapError(
               (cause) =>
                 new OrchestratorMcpFailure({
+                  reason: "invalid_args",
                   code:
                     cause.reason === "unavailable" || cause.reason === "stop-failed"
                       ? "orchestration_error"

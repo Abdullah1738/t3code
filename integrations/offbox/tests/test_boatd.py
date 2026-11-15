@@ -108,6 +108,7 @@ class Base(unittest.TestCase):
         boatd.CFG["cpu_pressure_limit"] = 0
         boatd.READY.clear()
         boatd._HEALTH.update(ts=0.0, v=None)
+        boatd._HEALTH_REFRESH.update(stage="idle", since=None, timings={})
         boatd._ZPOOL = "offbox/incus"
         boatd.init_db()
         self.con = boatd.db()
@@ -790,9 +791,12 @@ class Http(Base):
 
     def test_health_needs_no_token_and_carries_no_box_or_owner_data(self):
         self.make_box("moni")
+        boatd.health(fresh=True)
         st, d = self.call(None, "GET", "/health")
         self.assertEqual(st, 200)
-        self.assertEqual(sorted(d), ['boatd_uptime_s', 'boot', 'boot_id', 'disk', 'disk_full', 'disk_low', 'mdraid', 'mode', 'ok', 'phase', 'pool', 'queue', 'reasons', 'restartPending', 'running', 'startedAt', 'starting', 'startupPhases', 'up', 'uptime_s', 'version'])
+        self.assertEqual(sorted(d), ["boatd_uptime_s", "boot", "boot_id", "disk", "disk_full", "disk_low", "mdraid", "mode", "ok", "phase", "pool", "queue", "reasons",
+                                     "refresh_stage", "refresh_stage_ms", "refresh_timings_ms", "restartPending", "running", "snapshot_age_s",
+                                     "startedAt", "starting", "startupPhases", "up", "uptime_s", "version"])
         self.assertNotIn("moni", json.dumps(d))
         self.assertNotIn("bx_", json.dumps(d))
 
@@ -1201,6 +1205,35 @@ class Retention(Base):
         self.assertEqual(kinds, ["daily", "hourly", "hourly"])
         with self.assertRaises(boatd.Fail):
             boatd.snap_rotate(self.con, "yearly")
+
+
+
+
+class HealthSnapshot(Base):
+    def test_http_snapshot_does_not_wait_for_locked_or_stalled_refresh(self):
+        boatd.READY.set()
+        boatd.health(fresh=True)
+        boatd._HEALTH["ts"] = boatd.now() - 75
+        boatd._HEALTH_REFRESH.update(stage="incus", since=0)
+        boatd._HEALTH_LOCK.acquire()
+        try:
+            with patch.object(boatd, "_sh", side_effect=AssertionError("request must not refresh")):
+                health = boatd.health()
+        finally:
+            boatd._HEALTH_LOCK.release()
+        self.assertTrue(health["ok"])
+        self.assertGreaterEqual(health["snapshot_age_s"], 75)
+        self.assertEqual(health["refresh_stage"], "incus")
+        boatd.READY.clear()
+        boatd.STATE["problem"] = "reconciling runs and boxes after start"
+        health = boatd.health()
+        self.assertTrue(health["starting"])
+        self.assertEqual(health["phase"], "reconciling runs and boxes after start")
+
+    def test_slow_stage_logs_what_waited(self):
+        with patch.object(boatd.time, "monotonic", side_effect=[10, 12]), patch.object(boatd, "log") as log:
+            self.assertEqual(boatd.health_stage("incus", lambda: 7), 7)
+        self.assertIn("stage=incus ms=2000.0", log.call_args.args[0])
 
 
 if __name__ == "__main__":

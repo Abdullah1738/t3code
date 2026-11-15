@@ -1,6 +1,7 @@
 """Read-only process evidence. Unknown ownership or incomplete observations always keep."""
 import ctypes
 import datetime
+import math
 import os
 import re
 import shlex
@@ -15,6 +16,9 @@ IDLE_GRACE = 2 * 60 * 60
 NATIVE_KEYS = {"CLAUDE_CODE_SESSION_ID": "claudeAgent", "CODEX_THREAD_ID": "codex"}
 THREAD_KEYS = {"T3_THREAD_ID", "T3CODE_THREAD_ID", "ROBOB_THREAD_ID"}
 TERMINAL = {"completed", "cancelled", "failed", "interrupted"}
+OWNER_CALL_TIMEOUT = 20
+OBSERVATION_BUDGET = 10 * 60
+OWNER_ENDPOINTS = ("by_native", "detail", "recovery")
 
 
 def redact_opaque_token(match):
@@ -176,35 +180,71 @@ def probe(row):
             "binding": native_binding(row["pid"])}
 
 
-def control(path):
-    status, body = active_sessions._control_get(path, timeout=20)
-    if status != 200 or not isinstance(body, dict) or body.get("ok") is not True:
-        raise RuntimeError(f"owner api: status {status}")
-    return body
+def owner_call_summary(calls):
+    summary = {}
+    for kind in OWNER_ENDPOINTS:
+        samples = calls.get(kind, [])
+        durations = sorted(ms for ms, _ in samples)
+        failures = {}
+        for _, status in samples:
+            if status is not None:
+                failures[status] = failures.get(status, 0) + 1
+        summary[kind] = {
+            "count": len(samples),
+            "p50_ms": round(durations[math.ceil(len(durations) * .50) - 1], 3) if durations else None,
+            "p95_ms": round(durations[math.ceil(len(durations) * .95) - 1], 3) if durations else None,
+            "max_ms": round(durations[-1], 3) if durations else None,
+            "failures": failures,
+        }
+    return summary
 
 
-def owner(binding):
+def control(path, calls=None):
+    kind = ("by_native" if path.startswith("/threads/by-native/") else
+            "recovery" if path.startswith("/recovery/") else "detail")
+    started, status, failed = time.perf_counter(), 0, True
+    try:
+        status, body = active_sessions._control_get(path, timeout=OWNER_CALL_TIMEOUT)
+        if status != 200 or not isinstance(body, dict) or body.get("ok") is not True:
+            raise RuntimeError(f"owner api: status {status}")
+        failed = False
+        return body
+    finally:
+        if calls is not None:
+            calls.setdefault(kind, []).append(((time.perf_counter() - started) * 1000,
+                                              str(status) if failed else None))
+
+
+def owner(binding, calls=None):
     if not binding:
         return None
     tids = {value for key, value in binding.items() if key in THREAD_KEYS}
+    views = []
     for key, driver in NATIVE_KEYS.items():
         if key in binding:
-            body = control("/threads/by-native/" + urllib.parse.quote(binding[key], safe="") + "?driver=" + driver)
+            body = control("/threads/by-native/" + urllib.parse.quote(binding[key], safe="") +
+                           "?driver=" + driver + "&view=owner", calls=calls)
             thread = body.get("thread")
             if not isinstance(thread, dict) or not thread.get("threadId"):
                 return None
             tids.add(thread["threadId"])
+            views.append(thread)
     if len(tids) != 1:
         return None
     tid = tids.pop()
-    body = control("/threads/" + urllib.parse.quote(tid, safe=""))
+    # Resolve every binding before a keep marker, so conflicting ids stay unknown.
+    if any(view.get("deleted") is True for view in views):
+        return {"thread": {"threadId": tid}, "keep_reason": "owner_deleted"}
+    if any(view.get("state") != "idle" or view.get("status") not in TERMINAL for view in views):
+        return {"thread": {"threadId": tid}, "keep_reason": "owner_has_work_or_not_ended"}
+    body = control("/threads/" + urllib.parse.quote(tid, safe=""), calls=calls)
     detail = body.get("thread")
     if not isinstance(detail, dict) or detail.get("threadId") != tid:
         return None
     # Recovery pages are ordered by thread id. The strict prefix cursor starts
     # before this exact owner; never infer the owner's absence from a page.
     recovery = control("/recovery/snapshot?" + urllib.parse.urlencode({
-        "active": "false", "cursor": tid[:-1], "limit": 500}))
+        "active": "false", "cursor": tid[:-1], "limit": 500}), calls=calls)
     entries = recovery.get("threads")
     if not isinstance(entries, list):
         return None
@@ -331,6 +371,9 @@ def detect(rows, memory, labels, roster, keep=(), inspect=probe, resolve=owner,
            refresh=processes, refresh_roster=active_sessions.checked_snapshot, now=None, deadline=None, cursor=0, cwd_hints=None):
     report = {"report_only": True, "inventory": [], "candidates": [], "problems": [],
               "checked": 0, "skipped": 0, "budget_skipped": 0, "next_cursor": cursor}
+    calls = {}
+    if resolve is owner:
+        resolve = lambda binding: owner(binding, calls=calls)
     if not roster["complete"]:
         report["problems"] = ["liveness_unavailable: " + "; ".join(roster["problems"])]
     now = time.time() if now is None else now
@@ -373,6 +416,8 @@ def detect(rows, memory, labels, roster, keep=(), inspect=probe, resolve=owner,
                 item["owner"] = own["thread"]["threadId"] if own else None
                 if not own:
                     reason = "unknown_owner"
+                elif own.get("keep_reason"):
+                    reason = own["keep_reason"]
                 elif not owner_clear(own, roster):
                     reason = "owner_has_work_or_not_ended"
                 elif any(k == details["cwd"] for k in keep):
@@ -416,6 +461,7 @@ def detect(rows, memory, labels, roster, keep=(), inspect=probe, resolve=owner,
             if item.get("candidate"):
                 item.update(candidate=False, keep_reason="liveness_unavailable")
     report["skipped"] = len(report["inventory"]) - report["checked"]
+    report["owner_calls"] = owner_call_summary(calls)
     return report
 
 
@@ -428,9 +474,10 @@ def scan(roster, keep=(), cursor=0):
             hints = cwd_inventory(rows)
         except Exception:
             hints = {}
-        return detect(rows, memory, labels, roster, keep, deadline=time.monotonic() + 120,
+        return detect(rows, memory, labels, roster, keep, deadline=time.monotonic() + OBSERVATION_BUDGET,
                       cursor=cursor, cwd_hints=hints)
     except Exception as exc:
         return {"report_only": True, "inventory": [], "candidates": [],
                 "problems": ["process_inventory_unavailable: " + type(exc).__name__],
-                "checked": 0, "skipped": 0, "budget_skipped": 0, "next_cursor": cursor}
+                "checked": 0, "skipped": 0, "budget_skipped": 0, "next_cursor": cursor,
+                "owner_calls": owner_call_summary({})}

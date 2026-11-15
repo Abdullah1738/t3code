@@ -5,7 +5,7 @@ Rules (owner, 12 Nov 2026):
   started there yet), this one run goes to Boat instead and the failure is recorded for the health monitor.
 - An answering server that is starting is waited for up to 600 s, keeping its box and queue place.
 - After the run was accepted there is no failover, ever: it would run twice. The client reconnects (runs.follow).
-- Home marked down by the monitor: new runs go straight to Boat. It comes back by itself after three good checks.
+- Home marked down by the monitor: new runs probe live before routing. Alert recovery still needs three good checks.
 - Person-box work (OFFBOX_THREAD=person:<name>) never goes to Boat: it fails fast with EXIT_HOME_DOWN.
 With no home server configured none of this code does anything."""
 
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import fcntl
 import json
 import os
 import sqlite3
@@ -20,6 +21,8 @@ import sys
 import time
 import urllib.error
 import urllib.request
+
+from .health_reachability import tcp_connects, timed_out, slow_probe_seconds, slow_down_seconds
 
 import toollog
 
@@ -35,7 +38,37 @@ WAIT_BUDGET = contextvars.ContextVar("home_wait_budget", default=None)
 FAILOVER_ENV = "OFFBOX_FAILOVER"      # set in the re-executed process: why this run is on Boat ("unreachable: ...")
 MAX_FAILURE_LINES = 200
 RECENT_FAILURE_S = 180
+RUN_ID_ENV = "OFFBOX_PREFLIGHT_RUN"
+INVOCATION_RUN = contextvars.ContextVar("home_invocation_run", default="")
+QUEUE_WAIT = contextvars.ContextVar("home_queue_wait", default=0.0)
 WAIT_STARTED = None
+PROBE_FACTS = contextvars.ContextVar("home_probe_facts", default=None)
+
+
+@contextlib.contextmanager
+def run_identity():
+    token = INVOCATION_RUN.set(os.environ.get("OFFBOX_BACKGROUND_RUN") or os.environ.get(RUN_ID_ENV)
+                               or (common.new_id("run") if may_fail_over() else ""))
+    queue_token = QUEUE_WAIT.set(0.0)
+    try:
+        yield
+    finally:
+        QUEUE_WAIT.reset(queue_token)
+        INVOCATION_RUN.reset(token)
+
+
+def invocation_run():
+    return os.environ.get("OFFBOX_BACKGROUND_RUN") or INVOCATION_RUN.get() or os.environ.get(RUN_ID_ENV, "")
+
+
+def take_invocation_run():
+    background = os.environ.get("OFFBOX_BACKGROUND_RUN")
+    if background:
+        return background
+    candidate = INVOCATION_RUN.get() or os.environ.get(RUN_ID_ENV, "")
+    INVOCATION_RUN.set("")
+    os.environ.pop(RUN_ID_ENV, None)
+    return candidate
 
 
 def active() -> bool:
@@ -72,7 +105,8 @@ def health_url() -> str | None:
 
 def probe(timeout: float = PROBE_TIMEOUT_S) -> str | None:
     with toollog.span("health", "home.probe", tag="home_probe") as data:
-        result = _probe(timeout)
+        with wait_budget():
+            result = _probe(timeout)
         data["ok"] = result is None
         return result
 
@@ -130,16 +164,70 @@ def error_phase(error):
                            "phase": getattr(error, "phase", None)})
 
 
+def begin_transient(clock=None, began=None):
+    budget = WAIT_BUDGET.get()
+    if budget is not None:
+        budget.setdefault("transient_since", began if began is not None else (clock or time.monotonic)())
+
+
+def note_home_answer(clock=None, *, ready=True):
+    budget = WAIT_BUDGET.get()
+    if budget is not None:
+        budget["last_answer"] = (clock or time.monotonic)()
+        if ready:
+            budget.pop("transient_since", None)
+        budget.pop("slow_end", None)
+        budget.pop("slow_anchor", None)
+
+
+def slow_deadline(clock, fallback_end=None):
+    budget = WAIT_BUDGET.get()
+    start = clock()
+    answers = []
+    if budget.get("last_answer") is not None:
+        answers.append(budget["last_answer"])
+    monitor = common.home_state()
+    last_ok = monitor.get("last_answer") or monitor.get("last_ok")
+    if type(last_ok) in (float, int) and last_ok > 0:
+        answers.append(start - max(0, time.time() - last_ok))
+    anchor = max(answers) if answers else budget.get("slow_anchor", start)
+    if not answers and fallback_end is not None:
+        anchor = min(anchor, fallback_end - slow_down_seconds())
+    previous = budget.get("slow_anchor")
+    if previous is None or anchor > previous:
+        budget.update(slow_anchor=anchor, slow_end=anchor + slow_down_seconds())
+    return budget["slow_end"]
+
+
 def wait_while_starting(reason, run_id="", *, checkpoint="probe", box=None,
                         clock=None, sleep=None, read=None, deadline=None):
     clock, sleep, read = clock or time.monotonic, sleep or time.sleep, read or _health
+    if WAIT_BUDGET.get() is None:
+        with wait_budget():
+            return wait_while_starting(reason, run_id, checkpoint=checkpoint, box=box,
+                                       clock=clock, sleep=sleep, read=read, deadline=deadline)
     phase = reason if isinstance(reason, str) else starting_phase(reason)
-    limit = wait_seconds()
+    slow = phase == "slow"
     start = clock()
-    end = wait_deadline(limit, clock=clock)
-    if deadline is not None:
-        end = min(end, deadline)
-    say(f"home offbox server is starting ({phase}); waiting up to {limit:g} s, "
+    begin_transient(clock)
+    episode_end = WAIT_BUDGET.get()["transient_since"] + wait_seconds()
+    slow_cap = deadline if slow else None
+    startup_cap = None if slow else deadline
+
+    def end_for_mode():
+        if slow:
+            end = slow_deadline(clock, slow_cap)
+            inherited = wait_budget_end()
+            return min(end, inherited, episode_end) if inherited is not None else min(end, episode_end)
+        end = wait_deadline(wait_seconds(), clock=clock)
+        return min(end, startup_cap, episode_end) if startup_cap is not None else min(end, episode_end)
+
+    if not slow:
+        note_home_answer(clock, ready=False)
+    end = end_for_mode()
+    limit = slow_down_seconds() if slow else wait_seconds()
+    label = "slow to answer" if slow else "starting"
+    say(f"home offbox server is {label} ({phase}); waiting up to {limit:g} s, "
         + (f"keeping {box} and the queue place" if box else "keeping the queue place"))
     outcome = "failover"
     from . import prepare
@@ -148,20 +236,33 @@ def wait_while_starting(reason, run_id="", *, checkpoint="probe", box=None,
             while True:
                 left = end - clock()
                 if left <= 0:
-                    return f"home still starting after {limit:g} s ({phase})"
+                    bound = wait_seconds() if clock() >= episode_end else limit
+                    return f"home still {'slow' if slow else 'starting'} after {bound:g} s ({phase})"
                 sleep(min(5, left))
-                data = read(min(PROBE_TIMEOUT_S, max(.001, end - clock())))
+                data = read(min(slow_probe_seconds() if slow else PROBE_TIMEOUT_S, max(.001, end - clock())))
                 if isinstance(data, dict) and data.get("ok") is True:
+                    note_home_answer(clock)
                     outcome = "ready"
                     return None
                 next_phase = starting_phase(data)
-                if not next_phase:
+                if next_phase:
+                    note_home_answer(clock, ready=False)
+                    slow_cap = None
+                    if slow:
+                        say(f"home offbox server is starting ({next_phase}); waiting up to {wait_seconds():g} s")
+                    slow, phase, limit = False, next_phase, wait_seconds()
+                    end = end_for_mode()
+                elif timed_out(data) and tcp_connects(health_url() or ""):
+                    slow, phase, limit = True, "slow", slow_down_seconds()
+                    end = end_for_mode()
+                else:
                     return _health_reason(data)
-                phase = next_phase
         finally:
             toollog.emit("backend", "backend.start_wait", duration_ms=(clock()-start)*1000,
                          ids={"run": run_id, "box": box},
-                         props={"phase": phase, "checkpoint": checkpoint, "outcome": outcome})
+                         props={"phase": phase, "class": "slow" if slow else "starting",
+                                "checkpoint": checkpoint, "outcome": outcome})
+
 
 
 def _health_reason(data):
@@ -172,11 +273,35 @@ def _health_reason(data):
 
 
 def _probe(timeout: float = PROBE_TIMEOUT_S) -> str | None:
+    start = time.monotonic()
     data = _health(timeout)
+    if timed_out(data) or starting_phase(data):
+        begin_transient(began=start)
+    classification = "good" if isinstance(data, dict) and data.get("ok") is True else "hard"
+    reachable = tcp_connects(health_url() or "") if timed_out(data) else None
+    if reachable:
+        classification = "slow"
+        elapsed = (time.monotonic() - start) * 1000
+        say(f"home offbox server is slow to answer ({elapsed:.0f} ms); waiting up to "
+            f"{slow_probe_seconds():g} s instead of moving to Boat")
+        data = _health(slow_probe_seconds())
+        if isinstance(data, dict) and data.get("ok") is True:
+            classification = "good"
+        elif not timed_out(data):
+            classification = "hard"
     phase = starting_phase(data)
+    if isinstance(data, dict) and (data.get("ok") is True or phase):
+        note_home_answer(ready=data.get("ok") is True)
     if phase:
-        return wait_while_starting(phase, os.environ.get("OFFBOX_BACKGROUND_RUN", ""),
-                                   checkpoint="person" if common.person() else "probe")
+        classification = "starting"
+    PROBE_FACTS.set({"class": classification, "tcp": reachable, "ms": round((time.monotonic()-start)*1000, 1)})
+    if phase or classification == "slow":
+        result = wait_while_starting(phase or "slow", invocation_run(),
+                                    checkpoint="person" if common.person() else "probe",
+                                    deadline=start + slow_down_seconds() if classification == "slow" else None)
+        if result is None:
+            PROBE_FACTS.set({"class": "good", "ms": round((time.monotonic()-start)*1000, 1)})
+        return result
     return None if isinstance(data, dict) and data.get("ok") is True else _health_reason(data)
 
 
@@ -192,7 +317,8 @@ def _health(timeout: float = PROBE_TIMEOUT_S):
     except urllib.error.HTTPError as e:
         return f"health answered HTTP {e.code}"
     except (OSError, ValueError) as e:
-        return f"no answer ({type(e).__name__})"
+        kind = type(getattr(e, "reason", e)).__name__
+        return f"no answer ({kind})"
     if isinstance(d, dict):
         from . import disk_pressure
         why = disk_pressure.health_reason(d)
@@ -201,19 +327,162 @@ def _health(timeout: float = PROBE_TIMEOUT_S):
     return d
 
 
-def record_failure(reason: str, run_id: str = "", *, base: str | None = None, base_kept: bool = False) -> None:
+def slow_read_reachable(deadline=None):
+    from home_monitor import tailnet_facts
+    url = health_url() or ""
+    def remaining(limit):
+        return limit if deadline is None else max(0, min(limit, deadline - time.monotonic()))
+    if remaining(PROBE_TIMEOUT_S) <= 0:
+        return True
+    if not tcp_connects(url, timeout=remaining(PROBE_TIMEOUT_S)):
+        return False
+    if remaining(5) <= 0:
+        return True
+    if tailnet_facts(url, timeout=remaining(5)).get("peer_online") is False:
+        return False
+    if remaining(PROBE_TIMEOUT_S) <= 0:
+        return True
+    data = _health(remaining(PROBE_TIMEOUT_S))
+    expected = common.home_state().get("boot_id")
+    if isinstance(data, dict):
+        actual = data.get("boot_id")
+        if expected and actual and expected != actual:
+            return False
+        if data.get("ok") is not True and not starting_phase(data):
+            return False
+        note_home_answer(ready=False)
+    elif not timed_out(data):
+        return False
+    return True
+
+
+def recover_slow_read(error, read, *, box, deadline=None):
+    """Retry a timed-out box observation in place; no allocation send is repeated here."""
+    from . import api, allocation, prepare
+    if not active():
+        raise error
+    queue = allocation._QUEUE.get()
+    if queue is not None:
+        QUEUE_WAIT.set(queue.get("queue_wait_s", max(0, queue['wait'] - (queue['end'] - time.monotonic()))))
+    if not timed_out(error):
+        raise error
+    if WAIT_BUDGET.get() is None:
+        with wait_budget():
+            return recover_slow_read(error, read, box=box, deadline=deadline)
+    began = time.monotonic()
+    begin_transient(began=began)
+    caller_ends = [end for end in (deadline, api._DEADLINE) if end is not None]
+    caller_end = min(caller_ends, default=None)
+    home_ends = [WAIT_BUDGET.get()["transient_since"] + wait_seconds()]
+    if wait_budget_end() is not None:
+        home_ends.append(wait_budget_end())
+    home_end = min(home_ends)
+
+    def check_caller():
+        allocation.check_queue()
+        if caller_end is not None and time.time() >= caller_end:
+            raise api.BudgetExpired(f"client deadline passed while reading {box}; nothing ran")
+
+    def check_bounds():
+        check_caller()
+        if time.monotonic() >= home_end:
+            raise StartWaitFailed("home still slow after its inherited wait limit (box-read)", invocation_run(), box)
+
+    def remaining(*, silence=True):
+        ends = [home_end]
+        if silence:
+            ends.append(slow_deadline(time.monotonic, began + slow_down_seconds()))
+        if caller_end is not None:
+            ends.append(time.monotonic() + max(0, caller_end - time.time()))
+        queue_left = allocation.queue_left()
+        if queue_left is not None:
+            ends.append(time.monotonic() + queue_left)
+        return max(0, min(ends) - time.monotonic())
+
+    def reachable():
+        check_bounds()
+        good = slow_read_reachable(deadline=time.monotonic() + remaining(silence=False))
+        check_bounds()
+        return good
+
+    if not reachable():
+        raise error
+
+    say(f"home box {box} is slow to answer; waiting up to {slow_probe_seconds():g} s, keeping the box and queue place")
+    result = {}
+    def retry(timeout):
+        check_bounds()
+        timeout = min(timeout, remaining())
+        if timeout <= 0:
+            return "no answer (TimeoutError)"
+        try:
+            queue_left = allocation.queue_left()
+            ends = [end for end in (caller_end, time.time() + max(0, home_end - time.monotonic()),
+                                    time.time() + queue_left if queue_left is not None else None)
+                    if end is not None]
+            with pre_start(invocation_run()), api.RequestScope(timeout, parent=api._REQUEST_SCOPE.get(), network_timeout=True,
+                                                               caller_deadline=min(ends, default=None)).active():
+                result['box'] = read(time.time() + timeout)
+            check_bounds()
+            return {"ok": True}
+        except (StartWaitFailed, api.BudgetExpired):
+            check_bounds()
+            raise
+        except api.NetworkError as next_error:
+            check_bounds()
+            if not timed_out(next_error) or not reachable():
+                raise
+            return "no answer (TimeoutError)"
+
+    def sleep(seconds):
+        time.sleep(min(seconds, remaining()))
+        check_bounds()
+
+    caller_bounds = [home_end]
+    if caller_end is not None:
+        caller_bounds.append(time.monotonic() + max(0, caller_end - time.time()))
+    queue_left = allocation.queue_left()
+    if queue_left is not None:
+        caller_bounds.append(time.monotonic() + queue_left)
+    budget = WAIT_BUDGET.get()
+    enclosing_end = budget["end"]
+    try:
+        with wait_budget(min(caller_bounds)), prepare.pause_for_home_start():
+            first = retry(slow_probe_seconds())
+            if isinstance(first, dict) and first.get("ok") is True:
+                return result['box']
+            why = wait_while_starting("slow", invocation_run(), checkpoint="box-read", box=box, read=retry,
+                                       deadline=began + slow_down_seconds(), sleep=sleep)
+            check_bounds()
+            if why:
+                raise StartWaitFailed(why, invocation_run(), box)
+            return result['box']
+    finally:
+        budget["end"] = enclosing_end
+
+
+def failure_class(reason):
+    return "slow" if "home still slow" in reason else "starting" if "home still starting" in reason else "hard"
+
+
+def record_failure(reason: str, run_id: str = "", *, base: str | None = None, base_kept: bool = False, classification: str | None = None) -> None:
     """One line for the health monitor: a run could not reach home before it was accepted."""
     try:
         common.HOME_FAILURES.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            lines = common.HOME_FAILURES.read_text().splitlines()[-(MAX_FAILURE_LINES - 1):]
-        except OSError:
-            lines = []
-        lines.append(json.dumps({"ts": time.time(), "reason": reason[:300], "run": run_id,
-                                 "base": base, "base_kept": base_kept}))
-        tmp = common.HOME_FAILURES.with_name(common.HOME_FAILURES.name + f".{os.getpid()}.tmp")
-        tmp.write_text("\n".join(lines) + "\n")
-        os.replace(tmp, common.HOME_FAILURES)
+        with common.HOME_FAILURES.with_suffix(".lock").open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                lines = common.HOME_FAILURES.read_text().splitlines()[-(MAX_FAILURE_LINES - 1):]
+            except OSError:
+                lines = []
+            monitor = common.home_state()
+            classification = classification or failure_class(reason)
+            lines.append(json.dumps({"class": classification, "monitor_last_check": monitor.get("last_check"),
+                                     "monitor_last_outcome": monitor.get("last_outcome"), "queue_wait_s": round(QUEUE_WAIT.get(), 1), "ts": time.time(), "reason": reason[:300], "run": run_id,
+                                     "base": base, "base_kept": base_kept}))
+            tmp = common.HOME_FAILURES.with_name(common.HOME_FAILURES.name + f".{os.getpid()}.tmp")
+            tmp.write_text("\n".join(lines) + "\n")
+            os.replace(tmp, common.HOME_FAILURES)
     except OSError as e:
         log(f"home failure not recorded: {e}")
 
@@ -239,20 +508,45 @@ def recent_failure() -> bool:
 
 def preflight_reason() -> str | None:
     from . import api
-    from . import disk_pressure
+    if WAIT_BUDGET.get() is None:
+        with wait_budget():
+            return preflight_reason()
+    began = time.monotonic()
     recent = recent_failure()
-    why = None if recent and not disk_pressure.pending() else probe()
-    if why and ('disk' in why):
+    PROBE_FACTS.set(None)
+    why = probe()
+    if why and "disk" in why:
         return why
-    health_ok = not recent and why is None
+    health_ok = why is None
+    if why and (PROBE_FACTS.get() or {}).get("tcp") is False:
+        return why
+    auth_began = time.monotonic()
     if recent or health_ok or (why or "").startswith("no answer"):
         # /health can stay green while authenticated allocation reads stop answering.
-        with pre_start(os.environ.get("OFFBOX_BACKGROUND_RUN", "")):
+        with pre_start(invocation_run()):
             why = api.probe_backend("server", PROBE_TIMEOUT_S)
+            if timed_out(why):
+                begin_transient(began=auth_began)
             if why and health_ok and not why.startswith("home still starting after "):
-                why = api.probe_backend("server", PROBE_TIMEOUT_S)
+                timeout = PROBE_TIMEOUT_S
+                if timed_out(why) and tcp_connects(health_url() or ""):
+                    timeout = slow_probe_seconds()
+                    elapsed = (time.monotonic() - began) * 1000
+                    say(f"home offbox server is slow to answer ({elapsed:.0f} ms); waiting up to "
+                        f"{timeout:g} s instead of moving to Boat")
+                why = api.probe_backend("server", timeout)
+    if why and timed_out(why) and tcp_connects(health_url() or ""):
+        def read_api(timeout):
+            with pre_start(invocation_run()):
+                reason = api.probe_backend("server", timeout)
+            return reason if reason else {"ok": True}
+        why = wait_while_starting("slow", invocation_run(), read=read_api,
+                                  deadline=auth_began + slow_down_seconds())
+        PROBE_FACTS.set({"class": "slow" if why else "good"})
+    if why is None:
+        note_home_answer()
     if why and why.startswith("home still starting after "):
-        raise StartWaitFailed(why, os.environ.get("OFFBOX_BACKGROUND_RUN", ""))
+        raise StartWaitFailed(why, invocation_run())
     return why
 
 
@@ -260,11 +554,15 @@ def before_run(argv: list[str], *, explicit_base: str | None = None) -> None:
     wait_for_base = active() and common.person() is None and base_needs_home(explicit_base)
     if not may_fail_over(explicit_base) and not wait_for_base:
         return
+    monitor = common.home_state()
     why = preflight_reason()
+    if not why and monitor.get("state") == "home_down":
+        say(f"home offbox server answered again ({(PROBE_FACTS.get() or {}).get('ms', 0):g} ms) "
+            "while the monitor still says down; staying home")
     if why:
         if wait_for_base:
             raise OffboxError(f"home offbox server not reachable ({why})", outage=True)
-        fail_over(why, argv, os.environ.get("OFFBOX_BACKGROUND_RUN", ""), explicit_base=explicit_base)
+        fail_over(why, argv, invocation_run(), explicit_base=explicit_base)
 
 
 def person_gate() -> None:
@@ -272,15 +570,7 @@ def person_gate() -> None:
     who = common.person()
     if not who or common.home_config() is None or common.backend_pinned() is not None:
         return
-    st = common.home_state()
-    why = None
-    if st.get("state") == "home_down":
-        data = _health()
-        phase = starting_phase(data)
-        why = wait_while_starting(phase, checkpoint="person") if phase else (
-            st.get("reason") or "marked down by the health monitor")
-    else:
-        why = probe()
+    why = probe()
     if why:
         failover_decision('wait_person', 'home_down')
         raise OffboxError(f"the home offbox server is down ({why}); {who}'s tasks wait until it is back. "
@@ -309,7 +599,9 @@ def fail_over(reason: str, argv: list[str], run_id: str = "", *, explicit_base: 
     """Exec onto an answering Boat, or return False to keep waiting on home. Only before command start."""
     from . import api
     from .runs import BACKGROUND_RUN_ENV
-    run_id = run_id or os.environ.get(BACKGROUND_RUN_ENV, '')
+    run_id = run_id or invocation_run()
+    if common.person() is not None:
+        raise OffboxError("person work waits on home; nothing was sent to Boat", code=EXIT_HOME_DOWN)
     failover_decision('boat', 'unreachable', explicit_base, run_id)
     record_failure(reason, run_id, base=explicit_base, base_kept=explicit_base is not None)
     if api.probe_backend("boat", PROBE_TIMEOUT_S):
@@ -330,10 +622,21 @@ def fail_over(reason: str, argv: list[str], run_id: str = "", *, explicit_base: 
     elif 'out of disk' in reason:
         say('home server out of disk; this run is going to Boat')
     else:
-        say(f"home offbox server not reachable ({reason[:160]}); this run goes to Boat instead")
+        monitor = common.home_state()
+        classification = failure_class(reason)
+        say(f"home offbox server not reachable ({reason[:160]}); this run goes to Boat instead "
+            f"class={classification} run={run_id or '-'} monitor_last_check={monitor.get('last_check')} "
+            f"monitor_last_outcome={monitor.get('last_outcome')}")
     log(f"failover to boat: {reason[:300]}")
     env = dict(os.environ, OFFBOX_BACKEND="boat")
     env[FAILOVER_ENV] = reason[:200]
+    # Only an unregistered preflight ID can cross backends. Registered foreground attempts keep their own receipt.
+    with contextlib.closing(common.db()) as con:
+        registered = con.execute("SELECT 1 FROM runs WHERE run_id=?", (run_id,)).fetchone() is not None
+    if queued or not registered:
+        env[RUN_ID_ENV] = run_id
+    else:
+        env.pop(RUN_ID_ENV, None)
     if queued:
         from .runs import forward_background
         forward_background(env)

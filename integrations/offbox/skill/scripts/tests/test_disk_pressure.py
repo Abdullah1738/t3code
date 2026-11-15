@@ -93,6 +93,43 @@ class ClientDisk(unittest.TestCase):
                     runner._sync_box(None,SimpleNamespace(no_sync=no_sync,git=False),'/repo','/env',b'')
                 self.assertEqual(caught.exception.code,90);self.assertIn('home server out of disk',str(caught.exception));self.assertTrue(caught.exception.outage)
 
+    def test_slow_health_retry_distinguishes_disk_refusal_from_transport_delay(self):
+        for level, expected in [('ok', None), ('full', 'out of disk'), ('unknown', 'measurement unavailable')]:
+            data = {'ok': level == 'ok', 'snapshot_age_s': 900, 'refresh_stage': 'incus',
+                    'disk': {'level': level}}
+            response = SimpleNamespace(read=lambda: json.dumps(data).encode())
+            with self.subTest(level=level), patch.object(home, 'health_url', return_value='http://test'), \
+                    patch.object(home.urllib.request, 'urlopen', side_effect=[
+                        TimeoutError('health timed out'), contextlib.nullcontext(response)]), \
+                    patch.object(home, 'tcp_connects', return_value=True), \
+                    patch.object(home, 'wait_while_starting') as wait:
+                reason = home._probe()
+                if expected is None:
+                    self.assertIsNone(reason)
+                else:
+                    self.assertIn(expected, reason)
+                wait.assert_not_called()
+
+    def test_transport_timeouts_wait_without_becoming_disk_full(self):
+        with patch.object(home, 'health_url', return_value='http://test'), \
+                patch.object(home.urllib.request, 'urlopen', side_effect=TimeoutError('health timed out')), \
+                patch.object(home, 'tcp_connects', return_value=True), \
+                patch.object(home, 'wait_while_starting', return_value=None) as wait:
+            self.assertIsNone(home._probe())
+        self.assertEqual(wait.call_args.args[0], 'slow')
+        self.assertFalse(disk_pressure.pending())
+
+    def test_box_read_recovery_rejects_explicit_disk_failure_during_startup(self):
+        for level in ('full', 'unknown'):
+            data = {'ok': False, 'starting': True, 'phase': 'reconcile', 'disk': {'level': level}}
+            response = SimpleNamespace(read=lambda: json.dumps(data).encode())
+            with self.subTest(level=level), patch.object(home, 'health_url', return_value='http://test'), \
+                    patch.object(home.urllib.request, 'urlopen', return_value=contextlib.nullcontext(response)), \
+                    patch.object(home, 'tcp_connects', return_value=True), \
+                    patch('home_monitor.tailnet_facts', return_value={'peer_online': True}), \
+                    patch.object(common, 'home_state', return_value={}):
+                self.assertFalse(home.slow_read_reachable())
+
 class MonitorDisk(unittest.TestCase):
     def response(self,data):
         value=Mock();value.status=200;value.read.return_value=json.dumps(data).encode()
@@ -128,3 +165,47 @@ class MonitorDisk(unittest.TestCase):
         self.assertEqual(effects.telegram.call_count,2);self.assertEqual(effects.telegram.call_args_list[0],effects.telegram.call_args_list[1])
         self.assertEqual(first[0]['action'],'telegram-disk-low');self.assertEqual(second[0]['key'],'offbox-home-disk:100')
         effects.create_thread.assert_not_called();self.assertEqual(monitor.backend_view(state)['disk'],state['disk'])
+
+    def test_tick_full_disk_bypasses_startup_and_slow_retry_grace(self):
+        from tests.test_home_monitor import Sim, ONLINE
+        for after_timeout, boot in ((retry, boot) for retry in (False, True)
+                                    for boot in (None, 'boot-a', 'boot-b')):
+            sim = Sim(self)
+            sim.tick()
+            data = {'ok': False, 'starting': True, 'phase': 'reconcile', 'boot_id': boot,
+                    'disk': {'level': 'full', 'disk_full': True}}
+            with self.subTest(after_timeout=after_timeout, boot=boot), \
+                    patch.object(monitor.urllib.request, 'build_opener', return_value=self.response(data)):
+                full = monitor.check_health('http://test')
+                for _ in range(monitor.DOWN_AFTER):
+                    sim.now += 60
+                    monitor.tick(sim.dir, clock=lambda: sim.now, effects=sim.fx,
+                                 check=lambda u: {'ok': False, 'error': 'timeout', 'health': {}} if after_timeout else full,
+                                 retry=lambda u: full, mac=lambda u: dict(ONLINE, peer_online=True), tcp=lambda u: True)
+                    self.assertNotIn(sim.backend()['state'], ('home_starting', 'home_slow'))
+                self.assertEqual(sim.backend()['state'], 'home_down')
+                self.assertEqual(sim.backend()['class'], 'hard')
+                self.assertIn('error=disk_full', sim.log())
+
+    def test_stale_startup_snapshot_gets_grace_without_false_disk_full(self):
+        from tests.test_home_monitor import Sim
+        sim = Sim(self)
+        sim.tick()
+        for _ in range(3):
+            result = sim.tick(ok=False, error='not_ok', health={
+                'starting': True, 'phase': 'reconcile', 'snapshot_age_s': 900,
+                'refresh_stage': 'incus', 'disk': {'level': 'ok', 'disk_full': False}})
+            self.assertEqual(result['state'], 'home_starting')
+        self.assertEqual(sim.fx.calls, [])
+        self.assertFalse(sim.backend()['disk']['disk_full'])
+
+    def test_disk_warning_still_alerts_once_during_startup(self):
+        from tests.test_home_monitor import Sim
+        sim = Sim(self)
+        sim.tick()
+        for _ in range(2):
+            result = sim.tick(ok=False, error='not_ok', health={
+                'starting': True, 'phase': 'reconcile',
+                'disk': {'level': 'low', 'disk_low': True}})
+            self.assertEqual(result['state'], 'home_starting')
+        self.assertEqual(len(sim.fx.telegrams), 1)

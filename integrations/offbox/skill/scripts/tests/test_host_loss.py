@@ -125,8 +125,11 @@ class HostLossTests(Isolated):
             yield {'type': 'exit', 'exitCode': 0}
         with patch.object(misc, '_require_my_run'), patch.object(runs.api, 'stream', side_effect=frames), \
                 patch.object(runs, '_ttl_keeper'), patch.object(runs, 'do_pulls') as pulls, \
-                patch.object(misc, '_catch_up_finished'), contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(misc.wait(rn.run_id, None), 0)
+                patch.object(misc, '_catch_up_finished'), contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(misc.wait(rn.run_id, None, summary=True), 0)
+        self.assertIn(f"{rn.run_id}: backend=", output.getvalue())
+        self.assertIn(f"exit=0 log={rn.log_path}", output.getvalue())
+        self.assertIn('proof passed', output.getvalue())
         self.kill.assert_not_called()
         pulls.assert_called_once()
         self.assertIn('proof passed', rn.log_path.read_text())
@@ -209,8 +212,11 @@ class HostLossTests(Isolated):
         self.assertEqual(common.checkpoint(rn.log_path)['stdoutOffset'], 0)
         with patch.object(misc, '_require_my_run'), patch.object(api, 'stream', side_effect=frames), \
                 patch.object(runs, '_ttl_keeper'), patch.object(runs, 'do_pulls'), \
-                patch.object(misc, '_catch_up_finished'), contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(misc.wait(rn.run_id, None), 0)
+                patch.object(misc, '_catch_up_finished'), contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(misc.wait(rn.run_id, None, summary=True), 0)
+        self.assertIn(f"{rn.run_id}: backend=", output.getvalue())
+        self.assertIn(f"exit=0 log={rn.log_path}", output.getvalue())
+        self.assertIn('proof passed', output.getvalue())
         self.assertEqual(rn.log_path.read_text().count('proof passed'), 1)
         self.assertIn('client lost (SIGTERM)', rn.log_path.read_text())
         self.kill.assert_not_called()
