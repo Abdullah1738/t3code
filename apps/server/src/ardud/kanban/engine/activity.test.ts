@@ -1237,6 +1237,173 @@ describe("ledger pool activity", () => {
     expect(result.queueWait[pool]).toEqual(expected);
   });
 
+  const stageCases = [
+    {
+      name: "todo before later work",
+      prior: "todo",
+      current: "working",
+      created: before,
+      settled: null,
+      expected: [1, 1, 1],
+    },
+    {
+      name: "todo before later completion",
+      prior: "todo",
+      current: "completed",
+      created: before,
+      settled: null,
+      expected: [1, 1, 1],
+    },
+    {
+      name: "todo before later settlement",
+      prior: "todo",
+      current: "verified",
+      created: before,
+      settled: t("04:00"),
+      expected: [1, 1, 1],
+    },
+    {
+      name: "owner-held before later todo",
+      prior: "needs_owner",
+      current: "todo",
+      created: before,
+      settled: null,
+      expected: [0, 0, 0],
+    },
+    {
+      name: "working before later todo",
+      prior: "working",
+      current: "todo",
+      created: before,
+      settled: null,
+      expected: [0, 0, 0],
+    },
+    {
+      name: "not yet created",
+      prior: null,
+      current: "todo",
+      created: t("04:00"),
+      settled: null,
+      expected: [0, 0, 0],
+    },
+    {
+      name: "created on exclusive end",
+      prior: null,
+      current: "todo",
+      created: t("03:00"),
+      settled: null,
+      expected: [0, 0, 0],
+    },
+    {
+      name: "created within window",
+      prior: null,
+      current: "todo",
+      created: t("01:00"),
+      settled: null,
+      expected: [0, 1, 1],
+    },
+    {
+      name: "settled before window",
+      prior: "todo",
+      current: "verified",
+      created: before,
+      settled: before,
+      expected: [0, 0, 0],
+    },
+  ] as const;
+  it.each(stageCases)(
+    "uses historical stage: $name",
+    ({ prior, current, created, settled, expected }) => {
+      const result = run([slot(1, "take", "t1", before), slot(2, "take", "t2", before)], {
+        cards: [
+          card("history", {
+            stage: current,
+            createdAt: created,
+            settledAt: settled,
+            movedAt: t("04:00"),
+          }),
+        ],
+        prior: prior === null ? [] : [event("history", before, "moved", null, prior)],
+      });
+      expect(result.queueWait[pool] ?? [0, 0, 0]).toEqual(expected);
+    },
+  );
+
+  it.each(
+    (["todo", "needs_owner"] as const).flatMap((stage) =>
+      ["03:00", "04:00"].map((at) => ({ stage, at })),
+    ),
+  )("uses the first later transition without prior history ($stage at $at)", ({ stage, at }) => {
+    const result = run([slot(1, "take", "t1", before), slot(2, "take", "t2", before)], {
+      cards: [card("history", { stage: "working", movedAt: t(at) })],
+      after: [event("history", t(at), "moved", stage, "working")],
+    });
+    expect(result.queueWait[pool] ?? [0, 0, 0]).toEqual(stage === "todo" ? [1, 1, 1] : [0, 0, 0]);
+  });
+
+  it("clips stage and queue durations at settlement inside the window", () => {
+    const result = Activity.rollup({
+      window: hourly,
+      cards: [card("history", { stage: "verified", movedAt: t("01:00"), settledAt: t("02:00") })],
+      events: [
+        event("history", t("00:30"), "moved", "todo", "working"),
+        event("history", t("01:00"), "moved", "working", "verified"),
+      ],
+      threads: [],
+      pools: [{ key: pool, model: opus, slots: 2 }],
+      slotHistory: {
+        recordedSince: before,
+        events: [slot(1, "take", "t1", before), slot(2, "take", "t2", before)],
+      },
+      prior: [event("history", before, "created", null, "todo")],
+    });
+    expect(result.pools.queueWait[pool]).toEqual([0.5, 0, 0]);
+    expect(result.stages.hours.verified?.hours).toBe(1);
+  });
+
+  it("retains a window transition tail after later settlement", () => {
+    const result = Activity.rollup({
+      window: hourly,
+      cards: [card("history", { stage: "verified", settledAt: t("04:00") })],
+      events: [event("history", t("01:00"), "moved", "todo", "working")],
+      threads: [],
+      pools,
+      prior: [event("history", before, "created", null, "todo")],
+    });
+    expect(result.stages.hours.todo?.hours).toBe(1);
+    expect(result.stages.hours.working?.hours).toBe(2);
+    expect(result.stages.withoutThread.items).toEqual([]);
+  });
+
+  it.each([
+    { prior: "completed", current: "working", expected: [1, 1, 1] },
+    { prior: "working", current: "completed", expected: [0, 0, 0] },
+  ] as const)(
+    "uses historical blocker stages ($prior then $current)",
+    ({ prior, current, expected }) => {
+      const blocker = card("blocker", { stage: current, movedAt: t("04:00") });
+      const result = run([slot(1, "take", "t1", before), slot(2, "take", "t2", before)], {
+        cards: [blocker, card("waiter", { blockedBy: [blocker.id] })],
+        prior: [event("blocker", before, "moved", null, prior)],
+      });
+      expect(result.queueWait[pool] ?? [0, 0, 0]).toEqual(expected);
+    },
+  );
+
+  it("a historical blocker stays clear after settlement", () => {
+    const blocker = card("blocker", {
+      stage: "verified",
+      movedAt: t("01:00"),
+      settledAt: t("02:00"),
+    });
+    const result = run([slot(1, "take", "t1", before), slot(2, "take", "t2", before)], {
+      cards: [blocker, card("waiter", { blockedBy: [blocker.id] })],
+      prior: [event("blocker", before, "created", null, "working")],
+      events: [event("blocker", t("01:00"), "moved", "working", "verified")],
+    });
+    expect(result.queueWait[pool]).toEqual([0, 1, 1]);
+  });
+
   it("counts weighted alternatives once only when every enabled route is full", () => {
     const other = Rules.poolKey(sonnet);
     const weighted = card("weighted", {

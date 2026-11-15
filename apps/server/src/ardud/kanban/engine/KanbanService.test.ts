@@ -33403,6 +33403,33 @@ it.effect(
     }),
 );
 
+it.effect("a later start cannot erase an earlier window's pool queue", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const running = yield* kanban.createCard(board.id, { title: "Running", prompt: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const queued = yield* kanban.createCard(board.id, { title: "Queued", prompt: "B" }, owner);
+      yield* TestClock.adjust("1 day");
+      const since = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
+      yield* TestClock.adjust("3 hours");
+      const until = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
+      const window = { since, until };
+      const before = Activity.rollup({ window, ...(yield* kanban.activity(board.id, window)) });
+      yield* TestClock.adjust("1 hour");
+      yield* kanban.moveCard(running.id, "completed", "owner", owner);
+      yield* kanban.dispatchNow;
+      assert.strictEqual((yield* kanban.card(queued.id)).card.stage, "working");
+      const after = Activity.rollup({ window, ...(yield* kanban.activity(board.id, window)) });
+      const pool = Rules.poolKey(board.defaultCardModel);
+      assert.deepStrictEqual(before.pools.queueWait[pool], [1, 1, 1]);
+      assert.deepStrictEqual(after.pools.queueWait, before.pools.queueWait);
+      assert.deepStrictEqual(after.pools.used, before.pools.used);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 const slotRows = (boardId: string) =>
   Effect.flatMap(KanbanStore.KanbanStore, (store) =>
     store.slotEvents({ boardId, from: "", to: "9999" }),

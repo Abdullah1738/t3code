@@ -2189,11 +2189,74 @@ it.effect("readiness carry-in selects the latest wait and stall markers by board
       head: null,
     });
     assert.deepStrictEqual(
-      (yield* store.readinessBefore(boardId, cutoff)).map((event) => event.id),
+      (yield* store.activityHistory(boardId, { since: cutoff, until: "9999" })).map(
+        (event) => event.id,
+      ),
       expected,
     );
-    assert.deepStrictEqual(yield* store.readinessBefore(boardId, "1900"), []);
+    assert.deepStrictEqual(
+      yield* store.activityHistory(boardId, { since: "1900", until: "9999" }),
+      [],
+    );
   }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect(
+  "activity history carries stages without window events and finds the first later transition",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      yield* store.putBoard(board);
+      const current = card(1, "working");
+      yield* store.putCard(current);
+      const base = {
+        cardId: current.id,
+        actor: { _tag: "owner" as const },
+        head: null,
+        body: null,
+      };
+      const prior = yield* store.addCardEvent({
+        ...base,
+        at: "2026-11-11T23:00:00.000Z",
+        kind: "created",
+        fromStage: null,
+        toStage: "todo",
+      });
+      const flag = yield* store.addCardEvent({
+        ...base,
+        at: "2026-11-11T23:30:00.000Z",
+        kind: "flagged",
+        fromStage: null,
+        toStage: null,
+        body: "Cleared",
+      });
+      const later = yield* store.addCardEvent({
+        ...base,
+        at: "2026-11-12T04:00:00.000Z",
+        kind: "moved",
+        fromStage: "todo",
+        toStage: "working",
+      });
+      yield* store.addCardEvent({
+        ...base,
+        at: "2026-11-12T05:00:00.000Z",
+        kind: "moved",
+        fromStage: "working",
+        toStage: "completed",
+      });
+      const window = { since: "2026-11-12T00:00:00.000Z", until: "2026-11-12T03:00:00.000Z" };
+      assert.deepStrictEqual(yield* store.boardEvents(boardId, window.since, window.until), []);
+      assert.deepStrictEqual(
+        (yield* store.activityHistory(boardId, window)).map((event) => event.id),
+        [prior.id, flag.id, later.id],
+      );
+      assert.deepStrictEqual(
+        (yield* store.activityHistory(boardId, { ...window, until: later.at })).map(
+          (event) => event.id,
+        ),
+        [prior.id, flag.id, later.id],
+      );
+    }).pipe(Effect.provide(TestLayer)),
 );
 
 it.effect("slot history reads carry-in and the window together, including closed slots", () =>

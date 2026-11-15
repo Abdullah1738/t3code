@@ -302,35 +302,48 @@ export const stageSpans = (
   window: ActivityWindow,
   /** Each card's last stage change before the window, for the first span's real start. */
   prior: ReadonlyMap<string, KanbanCardEvent> = new Map(),
+  after: ReadonlyMap<string, KanbanCardEvent> = new Map(),
 ): Array<Span> => {
   const spans: Array<Span> = [];
   for (const card of cards) {
+    if (
+      card.createdAt >= window.until ||
+      (card.settledAt !== null && card.settledAt <= window.since)
+    )
+      continue;
     const transitions = (byCard.get(card.id) ?? []).filter(isTransition);
+    const before = prior.get(card.id);
+    const settled =
+      card.settledAt !== null && card.settledAt < window.until ? card.settledAt : null;
+    const limit = settled ?? window.until;
     if (transitions.length === 0) {
-      // Nothing moved it: it sat in one stage all window. Held and queue stages count then.
-      if (card.settledAt === null && card.createdAt < window.until && SAT_STAGES.has(card.stage))
+      const stage = before?.toStage ?? after.get(card.id)?.fromStage ?? card.stage;
+      if (SAT_STAGES.has(stage))
         spans.push({
           card,
-          stage: card.stage,
+          stage,
           from: card.createdAt > window.since ? card.createdAt : window.since,
-          to: null,
-          start: card.movedAt,
+          to: settled,
+          start: before?.at ?? (card.movedAt < window.until ? card.movedAt : null),
         });
       continue;
     }
     const first = transitions[0]!;
     let stage: KanbanStage | null = first.fromStage;
-    let from = window.since;
-    const before = prior.get(card.id);
+    let from = card.createdAt > window.since ? card.createdAt : window.since;
     let start: string | null = before !== undefined && before.toStage === stage ? before.at : null;
     for (const event of transitions) {
-      if (stage !== null && event.at > from) spans.push({ card, stage, from, to: event.at, start });
+      const to = event.at < limit ? event.at : limit;
+      if (stage !== null && to > from) spans.push({ card, stage, from, to, start });
+      if (event.at >= limit) {
+        from = limit;
+        break;
+      }
       stage = event.toStage;
       from = event.at;
       start = event.at;
     }
-    if (stage !== null && card.settledAt === null)
-      spans.push({ card, stage, from, to: null, start });
+    if (stage !== null && from < limit) spans.push({ card, stage, from, to: settled, start });
   }
   return spans;
 };
@@ -410,6 +423,8 @@ export interface RollupInput {
   /** Each active card's last stage change before the window (see stageSpans). */
   readonly prior?: ReadonlyArray<KanbanCardEvent> | undefined;
   readonly readinessBefore?: ReadonlyArray<KanbanCardEvent>;
+  /** First stage change at or after the window, for cards with no earlier stage history. */
+  readonly after?: ReadonlyArray<KanbanCardEvent>;
 }
 
 /** Replay thread identities, preserving ledger order even when timestamps tie. */
@@ -464,6 +479,7 @@ const ledgerUsage = (
     for (const at of [
       card.createdAt,
       card.movedAt,
+      card.settledAt,
       card.stalled?.at,
       card.wait?.at,
       card.wait?.expiredAt,
@@ -487,11 +503,21 @@ const ledgerUsage = (
     list.push(span);
     spansByCard.set(span.card.id, list);
   }
+  const beforeStages = new Map(
+    (input.prior ?? []).map((event) => [event.cardId as string, event.toStage]),
+  );
+  const afterStages = new Map(
+    (input.after ?? []).map((event) => [event.cardId as string, event.fromStage]),
+  );
   const atStage = (card: KanbanCard, at: number) =>
-    spansByCard
-      .get(card.id)
-      ?.find((span) => time(span.from) <= at && time(span.to ?? window.until) > at)?.stage ??
-    card.stage;
+    card.settledAt !== null && time(card.settledAt) <= at
+      ? "verified"
+      : (spansByCard
+          .get(card.id)
+          ?.find((span) => time(span.from) <= at && time(span.to ?? window.until) > at)?.stage ??
+        beforeStages.get(card.id) ??
+        afterStages.get(card.id) ??
+        card.stage);
   const currentById = new Map(input.cards.map((card) => [card.id as string, card]));
   const readiness = groupEvents([...(input.readinessBefore ?? []), ...input.events]);
   const todoSpans = spans
@@ -566,7 +592,8 @@ const ledgerUsage = (
       const blockers = new Map<string, KanbanCard>();
       for (const id of dependencies) {
         const blocker = currentById.get(id);
-        if (blocker) blockers.set(id, { ...blocker, stage: atStage(blocker, from) });
+        if (blocker && time(blocker.createdAt) <= from)
+          blockers.set(id, { ...blocker, stage: atStage(blocker, from) });
       }
       if (!Rules.cardFlow(candidate, blockers, new Map(), from).ready) continue;
       // A weighted alternative with room (or a reusable held thread) is not pool wait.
@@ -731,7 +758,8 @@ export const rollup = (input: RollupInput) => {
 
   // Stages and pool slot use
   const prior = new Map((input.prior ?? []).map((event) => [event.cardId as string, event]));
-  const spans = stageSpans(input.cards, byCard, window, prior);
+  const after = new Map((input.after ?? []).map((event) => [event.cardId as string, event]));
+  const spans = stageSpans(input.cards, byCard, window, prior, after);
   const stages: Record<
     string,
     {
@@ -760,7 +788,12 @@ export const rollup = (input: RollupInput) => {
       else dwells.set(span.stage, [ms]);
     }
     if (span.stage !== "working" && span.stage !== "in_review") continue;
-    if (span.to === null && span.card.activeThreadId === null)
+    if (
+      span.to === null &&
+      span.card.stage === span.stage &&
+      span.card.movedAt < until &&
+      span.card.activeThreadId === null
+    )
       idle.push({ card: span.card.number, stage: span.stage, since: stamp(span.card.movedAt) });
   }
   const poolUsage = ledgerUsage(input, hourStarts, spans);

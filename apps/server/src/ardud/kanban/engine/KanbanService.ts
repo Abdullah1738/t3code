@@ -519,6 +519,7 @@ export interface KanbanServiceShape {
       /** Each card with an event in the window: its last stage change before it. */
       readonly prior: ReadonlyArray<KanbanCardEvent>;
       readonly readinessBefore: ReadonlyArray<KanbanCardEvent>;
+      readonly after: ReadonlyArray<KanbanCardEvent>;
     },
     KanbanError
   >;
@@ -17080,26 +17081,21 @@ const make = Effect.gen(function* () {
     activity: (boardId, window) =>
       readDb(
         Effect.gen(function* () {
-          const read = yield* Effect.all({
+          const { history, ...read } = yield* Effect.all({
             board: store.board(boardId),
             cards: store.cards(boardId),
             events: store.boardEvents(boardId, window.since, window.until),
             threads: store.threadLinks({ boardId, open: false }),
             pools: store.pools(boardId),
             slotHistory: store.slotHistory({ boardId, from: window.since, to: window.until }),
-            readinessBefore: store.readinessBefore(boardId, window.since),
+            history: store.activityHistory(boardId, window),
           });
-          // Event ids grow with time, so the window's first id bounds "before the window".
-          const first = read.events[0];
-          const prior =
-            first === undefined
-              ? []
-              : yield* store.lastTransitions(
-                  boardId,
-                  [...new Set(read.events.map((event) => event.cardId))],
-                  first.id,
-                );
-          return { ...read, prior };
+          const readinessBefore = history.filter((event) => event.at < window.since);
+          const prior = readinessBefore.filter(
+            (event) => event.toStage !== null && event.fromStage !== event.toStage,
+          );
+          const after = history.filter((event) => event.at >= window.until);
+          return { ...read, prior, after, readinessBefore };
         }),
       ),
     cardByNumber: (boardId, number) => readDb(store.cardByNumber(boardId, number)),
