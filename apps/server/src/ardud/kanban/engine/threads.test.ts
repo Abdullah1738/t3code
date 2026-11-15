@@ -2512,3 +2512,72 @@ it.effect("recovery history chooses the most recent start instead of the latest 
     ),
   );
 });
+
+it.effect("#1574 assignment queue preserves a busy run and replays once", () => {
+  const db = Sqlite.layerMemory;
+  const instanceId = ProviderInstanceId.make("codex");
+  const projectId = ProjectId.make("project:assignment");
+  const threadId = ThreadId.make("thread:assignment");
+  const adapter = {
+    instanceId,
+    driver: ProviderDriverKind.make("codex"),
+    getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
+    planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" as const }),
+    openSession: () => Effect.die("Provider execution is disabled in this test"),
+  } as ProviderAdapter.ProviderAdapterV2["Service"];
+  const registry = Layer.succeed(
+    ProviderAdapterRegistry.ProviderAdapterRegistryV2,
+    ProviderAdapterRegistry.ProviderAdapterRegistryV2.of({
+      get: () => Effect.succeed(adapter),
+      list: () => Effect.succeed([instanceId]),
+    }),
+  );
+  const receipts = CommandReceiptStore.layer.pipe(Layer.provide(db));
+  const runtime = ProviderReplayHarness.layerWithRegistry({ name: "kanban-assignment" }, registry, {
+    databaseLayer: db,
+    runEffectWorker: false,
+  });
+  const management = ThreadManagementService.layer.pipe(
+    Layer.provideMerge(Layer.mergeAll(runtime, receipts, ServerSettings.layerTest(), db)),
+  );
+  return Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("assignment:create"),
+      threadId,
+      projectId,
+      title: "Existing context",
+      modelSelection: { instanceId, model: "gpt-5.1-codex" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "system",
+      creationSource: "server",
+    });
+    yield* Effect.gen(function* () {
+      const threads = yield* KanbanThreads;
+      yield* threads.send({ threadId, text: "Current work" });
+      const before = yield* orchestrator.getThreadRecords(threadId, ["runs", "messages"]);
+      const assignment = {
+        threadId,
+        text: "New card brief",
+        coalesce: "assignment:card",
+        key: "assignment:card",
+        mode: "queue" as const,
+      };
+      const queued = yield* threads.send(assignment);
+      expect(yield* threads.send(assignment)).toBe(queued);
+      const after = yield* orchestrator.getThreadRecords(threadId, ["runs", "messages"]);
+      expect(after.runs).toHaveLength(2);
+      expect(after.runs.find((run) => run.id === before.runs[0]!.id)).toEqual(before.runs[0]);
+      expect(after.runs.find((run) => run.id === queued)?.status).toBe("queued");
+      expect(after.messages.filter((message) => message.text === "New card brief")).toHaveLength(1);
+    }).pipe(Effect.provide(layer));
+  }).pipe(
+    Effect.provide(
+      Layer.mergeAll(management, receipts, Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+    ),
+  );
+});

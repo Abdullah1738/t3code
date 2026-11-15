@@ -123,6 +123,15 @@ const fakeThreads = (
   let launched = 0;
   const launches: Array<string> = [];
   const views: Array<string> = [];
+  const latestRuns = new Map<
+    ThreadId,
+    NonNullable<Effect.Success<ReturnType<KanbanThreads["Service"]["latestRun"]>>>
+  >();
+  const targetViews = new Map<
+    ThreadId,
+    Partial<import("../engine/threads.ts").KanbanThreadView> | null
+  >();
+  const interrupts: ThreadId[] = [];
   const viewControl = { beforeRead: (_threadId: ThreadId): Effect.Effect<void> => Effect.void };
   const callerControl = { beforeRead: (): Effect.Effect<void> => Effect.void };
   const storeControl: {
@@ -167,6 +176,7 @@ const fakeThreads = (
       Effect.andThen(
         Effect.sync(() => {
           views.push(threadId);
+          if (targetViews.get(threadId) === null) return null;
           return {
             threadId,
             projectId: ProjectId.make("project-1"),
@@ -180,6 +190,7 @@ const fakeThreads = (
             prWatches: 0,
             prs: [],
             archived: false,
+            ...targetViews.get(threadId),
           };
         }),
       ),
@@ -197,7 +208,7 @@ const fakeThreads = (
       find: delivery?.findExisting ? view : () => Effect.succeed(null),
       lastFailure: () => Effect.succeed(null),
       findLastFailure: () => Effect.succeed(null),
-      latestRun: () => Effect.succeed(null),
+      latestRun: (threadId) => Effect.sync(() => latestRuns.get(threadId) ?? null),
       runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       launch: (input) => {
@@ -229,7 +240,10 @@ const fakeThreads = (
       queuedRuns: (threadId) =>
         Effect.sync(() => (queued.has(threadId) ? [{ status: "queued" } as never] : [])),
       cancelQueued: () => Effect.succeed(false),
-      interrupt: () => Effect.void,
+      interrupt: (threadId) =>
+        Effect.sync(() => {
+          interrupts.push(threadId);
+        }),
     }),
   );
   const boardFilesLayer = ServerConfig.layerTest(process.cwd(), {
@@ -382,6 +396,9 @@ const fakeThreads = (
     unreadable,
     views,
     viewControl,
+    targetViews,
+    latestRuns,
+    interrupts,
     callerControl,
     storeControl,
     rejectSends,
@@ -391,6 +408,7 @@ const fakeThreads = (
 
 const owner: KanbanActor = { _tag: "owner" };
 const decodeMessage = Schema.decodeUnknownEffect(KanbanMessage);
+const decodeCard = Schema.decodeUnknownSync(KanbanCard);
 
 it.live("card_flag saves its stalled reason while the board background reader is held", () =>
   Effect.gen(function* () {
@@ -7947,4 +7965,176 @@ it.effect("a top-level board evaluator skips an explicit gate through subtask_do
     assert.isTrue(refused.isError);
     assert.include(refused.text, "needs Abdullah's approval");
   }).pipe(Effect.provide(layer));
+});
+
+it.effect.each(["idle", "busy", "home-moved-on"] as const)(
+  "evaluator forThread atomically assigns to an existing %s thread and queues its brief",
+  (state) => {
+    const sent: Array<Parameters<KanbanThreads["Service"]["send"]>[0]> = [];
+    const fake = fakeThreads(undefined, undefined, undefined, undefined, undefined, {
+      findExisting: true,
+      send: (input) =>
+        Effect.sync(() => {
+          sent.push(input);
+          return "assignment-run";
+        }),
+    });
+    return Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "handoff",
+        name: "Handoff",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+      const origin = yield* kanban.createCard(
+        board.id,
+        { title: "Origin", prompt: "Origin" },
+        owner,
+      );
+      const other = yield* kanban.createCard(board.id, { title: "Other", prompt: "Other" }, owner);
+      yield* kanban.dispatchNow;
+      const worker = (yield* kanban.card(origin.id)).card.workThreadId!;
+      const second = (yield* kanban.card(other.id)).card.workThreadId!;
+      if (state === "home-moved-on")
+        yield* kanban.moveCard(origin.id, "needs_review", "cardThread", {
+          _tag: "thread",
+          threadId: worker,
+        });
+      if (state === "busy") fake.running.add(worker);
+      const evaluator = yield* kanban.startEvaluator(board.id, { kind: "check" });
+      const launches = fake.launches.length;
+      sent.length = 0;
+      const created = yield* call(evaluator, "card_create", {
+        forThread: worker,
+        title: "Follow-up",
+        description: "Explicit",
+        prompt: "Use the existing context",
+      });
+      assert.isFalse(created.isError, created.text);
+      const card = decodeCard(created.structured.card);
+      assert.strictEqual(card.stage, "working");
+      assert.strictEqual(card.activeThreadId, worker);
+      assert.deepStrictEqual(card.createdBy, { _tag: "evaluator", threadId: evaluator });
+      assert.deepStrictEqual(card.model, board.defaultCardModel);
+      assert.strictEqual(sent.length, 1);
+      assert.strictEqual(sent[0]!.threadId, worker);
+      assert.strictEqual(sent[0]!.mode, "queue");
+      assert.include(sent[0]!.text, "Use the existing context");
+      assert.lengthOf(fake.interrupts, 0);
+      if (state === "busy") {
+        assert.isTrue(fake.running.has(worker));
+        assert.strictEqual((yield* kanban.card(origin.id)).card.stage, "working");
+      }
+      const stolen = yield* call(second, "card_claim", { card: card.id });
+      assert.isTrue(stolen.isError, stolen.text);
+      const events = (yield* kanban.card(card.id)).events;
+      assert.isTrue(
+        events.some((event) => event.actor._tag === "evaluator" && event.body?.includes(worker)),
+      );
+      // Keep the completed home card from starting its review during this tick.
+      if (state === "home-moved-on") yield* kanban.flagCard(origin.id, "Review later", owner);
+      yield* kanban.dispatchNow;
+      assert.strictEqual(fake.launches.length, launches);
+      assert.strictEqual((yield* kanban.card(card.id)).card.activeThreadId, worker);
+    }).pipe(Effect.provide(fake.layer));
+  },
+);
+
+it.effect.each([
+  "worker",
+  "reviewer",
+  "unlinked",
+  "both",
+  "foreign-board",
+  "missing",
+  "ended",
+  "paused",
+  "stopped",
+  "archived",
+  "model",
+  "project",
+  "backlog",
+  "needs-owner",
+  "full-batch",
+  "target-reviewer",
+] as const)("evaluator forThread refuses %s before inserting anything", (reason) => {
+  const fake = fakeThreads(undefined, undefined, undefined, undefined, undefined, {
+    findExisting: true,
+    send: () => Effect.void,
+  });
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const store = yield* KanbanStore.KanbanStore;
+    const board = yield* kanban.ensureBoard({
+      slug: "handoff-refusal",
+      name: "Refusal",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+    const origin = yield* kanban.createCard(board.id, { title: "Origin", prompt: "Origin" }, owner);
+    yield* kanban.dispatchNow;
+    const worker = (yield* kanban.card(origin.id)).card.workThreadId!;
+    const evaluator = yield* kanban.startEvaluator(board.id, { kind: "check" });
+    const link = (yield* store.threadLink(worker))!;
+    if (reason === "foreign-board") {
+      const other = yield* kanban.ensureBoard({
+        slug: "foreign",
+        name: "Foreign",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* store.putThreadLink({ ...link, boardId: other.id });
+    }
+    if (reason === "ended")
+      yield* store.putThreadLink({ ...link, endedAt: "2026-10-26T08:00:00.000Z" });
+    if (reason === "paused")
+      yield* store.putThreadLink({
+        ...link,
+        paused: { message: "Quota", at: "2026-10-26T08:00:00.000Z", runId: null },
+      });
+    if (reason === "missing") fake.targetViews.set(worker, null);
+    if (reason === "stopped")
+      fake.latestRuns.set(worker, { runId: "stopped-run", status: "interrupted", message: "Stop" });
+    if (reason === "archived") fake.targetViews.set(worker, { archived: true });
+    if (reason === "reviewer" || reason === "target-reviewer")
+      yield* store.putThreadLink({ ...link, role: "review" });
+    if (reason === "full-batch")
+      for (const n of [1, 2, 3])
+        yield* kanban.createForThread(worker, { title: `Extra ${n}`, prompt: `Extra ${n}` });
+    if (reason === "model")
+      yield* kanban.setPool(
+        board.id,
+        {
+          instanceId: ProviderInstanceId.make("opencode"),
+          model: "opus/gpt-6-astra",
+          options: [{ id: "variant", value: "xhigh" }],
+        },
+        1,
+      );
+    const before = yield* kanban.cards(board.id);
+    const result = yield* call(
+      reason === "worker" || reason === "reviewer"
+        ? worker
+        : reason === "unlinked"
+          ? ThreadId.make("outside")
+          : evaluator,
+      "card_create",
+      {
+        forThread: worker,
+        title: "Refused",
+        description: "Explicit",
+        prompt: "Must not be saved",
+        ...(reason === "both" ? { assignToSelf: true } : {}),
+        ...(reason === "backlog" ? { priority: 5 } : {}),
+        ...(reason === "needs-owner" ? { stage: "needs_owner", question: "Wait?" } : {}),
+        ...(reason === "project" ? { projectId: "another-project" } : {}),
+        ...(reason === "model"
+          ? { model: { instanceId: "opencode", model: "opus/gpt-6-astra#xhigh" } }
+          : {}),
+      },
+    );
+    assert.isTrue(result.isError, result.text);
+    assert.deepStrictEqual(yield* kanban.cards(board.id), before);
+    assert.include(result.text, "Nothing was saved");
+  }).pipe(Effect.provide(fake.layer));
 });

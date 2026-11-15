@@ -119,8 +119,8 @@ export interface KanbanSendInput {
   readonly isStale?: () => boolean;
   /** Switch the thread to this model for the turn the message starts. */
   readonly model?: ModelSelection;
-  /** Steer only an existing turn; never start an idle thread. */
-  readonly mode?: "steer";
+  /** Queue waits behind a live turn; steer only targets an existing turn. */
+  readonly mode?: "steer" | "queue";
 }
 
 type KanbanInterruptResult =
