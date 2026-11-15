@@ -23,6 +23,8 @@ export const FALLBACK_MODELS = {
     maxOutput: 32_768,
     // Venice: supportsReasoning true, supportsReasoningEffort false (always reasons).
     reasoningEffort: false,
+    // Venice adds ~1.5k hidden prompt tokens per request (measured 15 Nov: 7-word prompt billed 1,547).
+    promptOverheadTokens: 2000,
   },
 };
 

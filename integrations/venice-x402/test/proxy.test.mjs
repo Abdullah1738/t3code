@@ -48,9 +48,9 @@ test('estimate clamps output to the per-request cap and rejects huge inputs', ()
   const e3 = estimateAndClamp(small, price, 0.5);
   assert.equal(small.max_tokens, 20);
   assert.equal(e3.clamped, false);
-  assert.ok(e3.estUsd < 0.001);
+  assert.ok(e3.estUsd > 0.006 && e3.estUsd < 0.007); // includes Venice's hidden prompt overhead
   // cap squeezes output under the floor -> rejected with a clear message
-  assert.throws(() => estimateAndClamp({ messages: [{ content: 'x'.repeat(499_000) }], max_tokens: 4096 }, price, 0.5), /of 4096 requested/);
+  assert.throws(() => estimateAndClamp({ messages: [{ content: 'x'.repeat(493_000) }], max_tokens: 4096 }, price, 0.5), /of 4096 requested/);
 });
 
 test('actual cost uses cached rate for cached prompt tokens', () => {

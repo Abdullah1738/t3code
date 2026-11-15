@@ -21,7 +21,7 @@ const round6 = (n) => Math.round(n * 1e6) / 1e6;
 // fits the per-request cap; the clamp is written back into the body.
 export function estimateAndClamp(body, price, maxRequestUsd) {
   const bytes = Buffer.byteLength(JSON.stringify(body.messages ?? []) + JSON.stringify(body.tools ?? []), 'utf8');
-  const inTokens = Math.ceil(bytes / 3);
+  const inTokens = Math.ceil(bytes / 3) + (price.promptOverheadTokens ?? 0);
   const inCost = inTokens * price.input;
   if (inCost >= maxRequestUsd) {
     throw new CapError('request_cap', `input (~${inTokens} tokens, ~$${inCost.toFixed(4)}) exceeds the per-request cap $${maxRequestUsd}`);
