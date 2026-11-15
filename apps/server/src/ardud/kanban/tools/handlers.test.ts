@@ -1561,6 +1561,7 @@ it.effect(
       assert.isAtMost(page.length, 20);
       assert.strictEqual(page.at(-1)!.id, allEvents.at(-1)!.id);
       assert.strictEqual(latest.structured.olderEvents, page[0]!.id);
+      assert.isArray(latest.structured.threads);
       // Walk the cursor back to the first event: every event once, in order.
       const walked = [...page];
       let cursor = latest.structured.olderEvents as number | null;
@@ -1571,6 +1572,14 @@ it.effect(
         });
         assert.isFalse(older.isError, older.text);
         assert.isAtMost(JSON.stringify(older.structured).length, 60_000);
+        assert.deepStrictEqual(older.structured.card, {
+          id: busy.id,
+          number: busy.number,
+          title: busy.title,
+          stage: "working",
+          boardId: board.id,
+        });
+        assert.notProperty(older.structured, "threads");
         walked.unshift(...(older.structured.events as typeof page));
         cursor = older.structured.olderEvents as number | null;
       }
@@ -1628,6 +1637,63 @@ it.effect(
     }).pipe(Effect.provide(layer));
   },
 );
+
+it.effect("card_get pages a card whose prompt fills the first reply", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "toy",
+      name: "Toy",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+    const giant = yield* kanban.createCard(
+      board.id,
+      { prompt: "G".repeat(70_000), title: "Giant" },
+      owner,
+    );
+    yield* kanban.dispatchNow;
+    const detail = yield* kanban.card(giant.id);
+    const thread = detail.card.activeThreadId!;
+    const first = yield* call(thread, "card_get", { card: giant.id, events: { limit: 100 } });
+    assert.isFalse(first.isError, first.text);
+    assert.deepStrictEqual(first.structured.card, detail.card);
+    assert.deepStrictEqual(first.structured.threads, detail.threads);
+    assert.deepStrictEqual(first.structured.events, []);
+    let cursor = first.structured.olderEvents as number | null;
+    assert.isNotNull(cursor);
+    const seen: number[] = [];
+    const cursors = new Set<number>();
+    for (let count = 0; cursor !== null && count < 200; count++) {
+      assert.isFalse(cursors.has(cursor));
+      cursors.add(cursor);
+      const page = yield* call(thread, "card_get", {
+        card: giant.id,
+        events: { before: cursor, limit: 2 },
+      });
+      assert.isFalse(page.isError, page.text);
+      assert.deepStrictEqual(page.structured.card, {
+        id: giant.id,
+        number: giant.number,
+        title: giant.title,
+        stage: detail.card.stage,
+        boardId: board.id,
+      });
+      assert.notProperty(page.structured, "threads");
+      assert.isAtMost(JSON.stringify(page.structured).length, 60_000);
+      seen.unshift(...(page.structured.events as Array<{ id: number }>).map((event) => event.id));
+      const next = page.structured.olderEvents as number | null;
+      if (next !== null) assert.isBelow(next, cursor);
+      cursor = next;
+    }
+    assert.isNull(cursor);
+    assert.deepStrictEqual(
+      seen,
+      detail.events.map((event) => event.id),
+    );
+  }).pipe(Effect.provide(layer));
+});
 
 it.live("card and discussion tools answer while the SQLite writer is held", () =>
   Effect.gen(function* () {

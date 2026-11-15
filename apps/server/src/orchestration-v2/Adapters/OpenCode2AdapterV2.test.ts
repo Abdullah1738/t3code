@@ -3507,23 +3507,49 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
     replyAfterUnclearFailure(true),
   );
 
-  it.effect("does not report a Stop the server says did nothing", () =>
-    Effect.gen(function* () {
-      const { runtime, thread } = yield* resumed([
-        out("session.prompt", { sessionID: SESSION, text: "<any>" }),
-        promptAccepted,
-        out("session.interrupt", { sessionID: SESSION }),
-        reply("session.interrupt", { interrupted: false }),
-      ]);
-      yield* runtime.startTurn(turnInput(thread));
-      const failed = yield* runtime
-        .interruptTurn({
-          providerThread: thread,
-          providerTurnId: yield* providerTurnId,
-        })
-        .pipe(Effect.flip);
-      assert.equal(failed._tag, "ProviderAdapterProtocolError");
-    }).pipe(Effect.scoped),
+  it.effect(
+    "releases an inactive turn and ignores its late terminal after a successor starts",
+    () =>
+      Effect.gen(function* () {
+        const { runtime, thread } = yield* resumed([
+          out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+          promptAccepted,
+          out("session.interrupt", { sessionID: SESSION }),
+          reply("session.interrupt", { interrupted: false }),
+          out("session.active"),
+          replyData("session.active", {}),
+          out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+          promptAccepted,
+          event("session.execution.interrupted", { sessionID: SESSION }),
+          event("session.execution.started", { sessionID: SESSION }),
+          event("session.execution.succeeded", { sessionID: SESSION }),
+        ]);
+        const terminals = yield* runtime.events.pipe(
+          Stream.filter((event) => event.type === "turn.terminal"),
+          Stream.take(2),
+          Stream.runCollect,
+          Effect.forkScoped,
+        );
+        yield* runtime.startTurn(turnInput(thread));
+        const failed = yield* runtime
+          .interruptTurn({
+            providerThread: thread,
+            providerTurnId: yield* providerTurnId,
+          })
+          .pipe(Effect.flip);
+        assert.equal(failed._tag, "ProviderAdapterTurnNotActiveError");
+        if (failed._tag !== "ProviderAdapterTurnNotActiveError")
+          throw new Error("Expected not-active Stop");
+        assert.equal(failed.providerThreadId, thread.id);
+        assert.equal(failed.providerTurnId, yield* providerTurnId);
+        yield* runtime.startTurn(secondTurn(thread));
+        const ended = yield* Fiber.join(terminals);
+        assert.deepEqual(
+          ended.map((event) => event.status),
+          ["interrupted", "completed"],
+        );
+        assert.notEqual(ended[0]?.providerTurnId, ended[1]?.providerTurnId);
+      }).pipe(Effect.scoped),
   );
 
   it.effect("reports a turn as completed when its Stop request failed", () =>

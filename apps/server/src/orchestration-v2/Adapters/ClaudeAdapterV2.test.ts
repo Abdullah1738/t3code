@@ -107,6 +107,9 @@ import {
   projectionFor,
 } from "../testkit/fixtures/shared.ts";
 
+const isSteerRunError = Schema.is(ProviderAdapter.ProviderAdapterSteerRunError);
+const isTurnNotActiveError = Schema.is(ProviderAdapter.ProviderAdapterTurnNotActiveError);
+
 const decodeUserInputQuestions = Schema.decodeUnknownSync(
   Schema.Array(OrchestrationV2UserInputQuestion),
 );
@@ -3758,6 +3761,90 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           assert.isTrue(closed);
           assert.equal((yield* Queue.take(harness.terminalReceipts)).status, "interrupted");
           yield* Fiber.interrupt(start);
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
+        ),
+      ),
+  );
+
+  it.effect.each(["no-query", "idle-query", "healthy-successor"] as const)(
+    "reports typed not-active Stop without touching a live query: %s",
+    (scenario) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          let nativeInterrupts = 0;
+          let nativeCloses = 0;
+          const harness = yield* makeWakeHarnessWithOptions({
+            interrupt: Effect.sync(() => {
+              nativeInterrupts++;
+            }),
+            close: (queue) =>
+              Effect.sync(() => {
+                nativeCloses++;
+              }).pipe(Effect.andThen(Queue.shutdown(queue))),
+          });
+          const turn = makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("not-active-successor"),
+            text: "Keep working",
+            attachments: [],
+          });
+          if (scenario !== "no-query") yield* harness.runtime.startTurn(turn);
+          if (scenario === "idle-query") {
+            yield* harness.offerAndWait(
+              makeResultFrame({ uuid: "not-active-idle", result: "Done" }),
+            );
+            yield* Queue.take(harness.terminalReceipts);
+          }
+          const stale = ProviderTurnId.make("stale-turn");
+          const stopped = yield* harness.runtime
+            .interruptTurn({
+              providerThread: harness.providerThread,
+              providerTurnId: stale,
+              requestRuntimeRestart: false,
+              stopBackgroundWork: false,
+            })
+            .pipe(Effect.flip);
+          assert.instanceOf(stopped, ProviderAdapter.ProviderAdapterTurnNotActiveError);
+          if (!isTurnNotActiveError(stopped)) throw new Error("Expected not-active Stop");
+          assert.equal(stopped.providerThreadId, harness.providerThread.id);
+          assert.equal(stopped.providerTurnId, stale);
+          assert.equal(nativeInterrupts, 0);
+          assert.equal(nativeCloses, 0);
+          const steer = yield* harness.runtime
+            .steerTurn({
+              threadId: harness.threadId,
+              runId: turn.runId,
+              providerThread: harness.providerThread,
+              providerTurnId: stale,
+              message: turn.message,
+            })
+            .pipe(Effect.flip);
+          assert.isTrue(isSteerRunError(steer));
+          if (!isSteerRunError(steer)) throw new Error("Expected steer refusal");
+          assert.isTrue(isProtocolError(steer.cause));
+          if (scenario === "healthy-successor") {
+            const liveId = (yield* IdAllocator.IdAllocatorV2).derive.providerTurn({
+              driver: ClaudeAdapterV2.CLAUDE_PROVIDER,
+              nativeTurnId: `turn:${turn.attemptId}`,
+            });
+            yield* harness.runtime.steerTurn({
+              threadId: harness.threadId,
+              runId: turn.runId,
+              providerThread: harness.providerThread,
+              providerTurnId: liveId,
+              message: {
+                ...turn.message,
+                messageId: MessageId.make("successor-steer"),
+                text: "Continue",
+              },
+            });
+            assert.lengthOf(harness.terminalEvents(), 0);
+          }
         }).pipe(
           Effect.provide(
             Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
