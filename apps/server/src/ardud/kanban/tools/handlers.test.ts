@@ -49,6 +49,7 @@ import * as Sqlite from "../../../persistence/Sqlite.ts";
 import * as ProjectService from "../../../project/ProjectService.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
 import * as KanbanService from "../engine/KanbanService.ts";
+import * as Activity from "../engine/activity.ts";
 import * as KanbanModels from "../engine/models.ts";
 import { KanbanThreads, KanbanThreadError } from "../engine/threads.ts";
 import * as KanbanStore from "../store/KanbanStore.ts";
@@ -194,7 +195,8 @@ const fakeThreads = (
           model: models.get(threadId)!,
         })),
       view,
-      find: delivery?.findExisting ? view : () => Effect.succeed(null),
+      find: (id, options) =>
+        options?.lastAssistant || delivery?.findExisting ? view(id) : Effect.succeed(null),
       lastFailure: () => Effect.succeed(null),
       findLastFailure: () => Effect.succeed(null),
       latestRun: () => Effect.succeed(null),
@@ -1549,6 +1551,38 @@ it.effect("compact reads: board_get since, card_get pages, discussion_read limit
       (relativeRollup.structured.activity as { asks: unknown }).asks,
       activity.asks,
     );
+    const window = Activity.parseWindow(undefined, undefined, now);
+    assert.isNotString(window);
+    if (typeof window === "string") return;
+    const rawActivity = yield* kanban.activity(board.id, window);
+    assert.strictEqual(
+      JSON.stringify(rollup.structured),
+      JSON.stringify({
+        activity: { boardId: board.id, ...Activity.rollup({ window, ...rawActivity }) },
+      }),
+    );
+    const digest = yield* call(thread, "board_activity", { digest: "discussions", since });
+    assert.isFalse(digest.isError, digest.text);
+    assert.isBelow(digest.text.length, 30_000);
+    const discussionDigest = digest.structured.activity as {
+      rows: Array<{
+        discussionId: string;
+        ownerMessages: Array<{ text: string }>;
+        messagesInWindow: number;
+      }>;
+      page: { hasMore: boolean };
+    };
+    const busyDiscussion = (yield* kanban.card(busy.id)).card.discussionId!;
+    const row = discussionDigest.rows.find((row) => row.discussionId === busyDiscussion)!;
+    assert.isAbove(row.messagesInWindow, 60);
+    assert.isAtMost(row.ownerMessages[0]!.text.length, 300);
+    const threadDigest = yield* call(thread, "board_activity", { digest: "threads", since });
+    assert.isFalse(threadDigest.isError, threadDigest.text);
+    assert.include(JSON.stringify(threadDigest.structured), thread);
+    const invalidCursor = yield* Effect.result(
+      call(thread, "board_activity", { digest: "discussions", after: -1 }),
+    );
+    assert.isTrue(Result.isFailure(invalidCursor));
     const futureSince = DateTime.formatIso(DateTime.makeUnsafe(now + 60 * 60 * 1000));
     for (const name of ["board_get", "board_activity"]) {
       const future = yield* call(thread, name, { since: futureSince });
@@ -7729,4 +7763,52 @@ it.effect("a top-level board evaluator skips an explicit gate through subtask_do
     assert.isTrue(refused.isError);
     assert.include(refused.text, "needs Abdullah's approval");
   }).pipe(Effect.provide(layer));
+});
+
+it.effect("thread digests page at the service boundary without reading later pages", () => {
+  const fake = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const store = yield* KanbanStore.KanbanStore;
+    const board = yield* kanban.ensureBoard({
+      slug: "digests",
+      name: "Digests",
+      defaultProjectId: ProjectId.make("p1"),
+    });
+    const now = yield* Clock.currentTimeMillis;
+    const at = DateTime.formatIso(DateTime.makeUnsafe(now));
+    const window = {
+      since: DateTime.formatIso(DateTime.makeUnsafe(now - 86_400_000)),
+      until: DateTime.formatIso(DateTime.makeUnsafe(now + 1)),
+    };
+    for (let i = 0; i < 45; i++) {
+      const card = yield* kanban.createCard(
+        board.id,
+        { title: `Card ${i}`, prompt: "Read" },
+        owner,
+      );
+      yield* store.putThreadLink({
+        threadId: ThreadId.make(`digest-${i}`),
+        boardId: board.id,
+        cardId: card.id,
+        role: i % 2 === 0 ? "work" : "review",
+        purpose: null,
+        discussionId: null,
+        model: board.defaultCardModel,
+        startedAt: at,
+        endedAt: null,
+        paused: null,
+      });
+      if (i === 44) yield* kanban.flagCard(card.id, "Run failed: injected", owner);
+    }
+    const first = yield* kanban.activityDigest(board.id, window, "threads");
+    assert.lengthOf(first.rows, 40);
+    assert.strictEqual((first.rows[0] as { threadId: string }).threadId, "digest-44");
+    assert.isTrue(first.page.hasMore);
+    assert.lengthOf(fake.views, 40);
+    const second = yield* kanban.activityDigest(board.id, window, "threads", first.page.nextAfter!);
+    assert.lengthOf(second.rows, 5);
+    assert.isFalse(second.page.hasMore);
+    assert.lengthOf(fake.views, 45);
+  }).pipe(Effect.provide(fake.layer));
 });

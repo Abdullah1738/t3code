@@ -106,6 +106,7 @@ import * as AskFeed from "./askFeed.ts";
 import * as Asks from "./asks.ts";
 import { modelProblem } from "./modelCheck.ts";
 import * as Briefs from "./briefs.ts";
+import * as Activity from "./activity.ts";
 import { bugMatches } from "./bugMatches.ts";
 import { makeBoardAttachments } from "./attachments.ts";
 import * as ServerConfig from "../../../config.ts";
@@ -498,6 +499,12 @@ export interface KanbanServiceShape {
   >;
 
   readonly card: (cardId: KanbanCard["id"]) => Effect.Effect<CardDetail, KanbanError>;
+  readonly activityDigest: (
+    boardId: KanbanBoard["id"],
+    window: Activity.ActivityWindow,
+    digest: "discussions" | "threads",
+    after?: number,
+  ) => Effect.Effect<ReturnType<typeof Activity.digestPage>, KanbanError>;
   /** What board activity reads for a window: every card, the window's events, the board's threads and pools. */
   readonly activity: (
     boardId: KanbanBoard["id"],
@@ -2132,7 +2139,7 @@ const make = Effect.gen(function* () {
       ),
     queuedRuns: (id) => locks.outside(threadIo.queuedRuns(id), undefined, true),
     view: (id) => threadRead("view", id, threadIo.view(id)),
-    find: (id) => threadRead("find", id, threadIo.find(id)),
+    find: (id, options) => threadRead("find", id, threadIo.find(id, options)),
     model: (id, activeRun = false) =>
       threadRead(activeRun ? "activeModel" : "model", id, threadIo.model(id, activeRun)),
     lastFailure: (id) => threadRead("lastFailure", id, threadIo.lastFailure(id)),
@@ -4188,7 +4195,10 @@ const make = Effect.gen(function* () {
       purpose.kind === "nightly"
         ? (board.nightlyReview?.model ?? DEFAULT_NIGHTLY_REVIEW.model)
         : board.evaluatorModel;
-    const brief = Briefs.evaluatorBrief(board, purpose);
+    const brief = Briefs.evaluatorBrief(
+      board,
+      purpose.kind === "nightly" ? { ...purpose, lastRunAt: purpose.lastRunAt ?? at } : purpose,
+    );
     const title = Briefs.evaluatorTitle(purpose);
     const launchInput = (key: string) => ({
       key: `${board.id}:eval:${Briefs.purposeKey(purpose)}:${key}`,
@@ -4549,19 +4559,17 @@ const make = Effect.gen(function* () {
         },
         at,
       );
-      purpose = { ...purpose, discussionId: discussion.id, day };
+      purpose = { ...purpose, discussionId: discussion.id, day, lastRunAt: at };
       const since = Date.parse(at) - 24 * 60 * 60 * 1000;
-      const sources = (yield* store.discussions(board.id))
-        .filter(
-          (source) =>
-            source.id !== discussion.id &&
-            Date.parse(source.lastMessageAt ?? source.createdAt) >= since,
-        )
-        .map((source) => ({
-          id: source.id,
-          title: source.title,
-          lastMessageAt: source.lastMessageAt,
-        }));
+      const sources = Activity.discussionSources(
+        yield* store.discussions(board.id),
+        DateTime.formatIso(DateTime.makeUnsafe(since)),
+        discussion.id,
+      ).map((source) => ({
+        id: source.id,
+        title: source.title,
+        lastMessageAt: source.lastMessageAt,
+      }));
       const sourceText = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))(
         sources,
       ).pipe(Effect.orDie);
@@ -16840,6 +16848,119 @@ const make = Effect.gen(function* () {
           } satisfies CardDetail;
         }),
       ),
+    activityDigest: Effect.fn("KanbanService.activityDigest")(function* (
+      boardId,
+      window,
+      digest,
+      after = 0,
+    ) {
+      const cards = yield* readDb(store.cards(boardId));
+      if (digest === "discussions") {
+        const sources = Activity.discussionSources(
+          yield* readDb(store.discussions(boardId)),
+          window.since,
+        );
+        const byCard = new Map(cards.map((card) => [card.id, card]));
+        const rows = yield* Effect.forEach(
+          sources,
+          (source) =>
+            Effect.gen(function* () {
+              const messages: Array<KanbanMessage> = [];
+              let beforeSeq: number | undefined;
+              while (true) {
+                const page = yield* readDb(
+                  store.messages(source.id, {
+                    limit: 200,
+                    ...(beforeSeq === undefined ? {} : { beforeSeq }),
+                  }),
+                );
+                messages.unshift(
+                  ...page.filter(
+                    (message) =>
+                      message.createdAt >= window.since && message.createdAt < window.until,
+                  ),
+                );
+                const first = page[0];
+                if (page.length < 200 || first === undefined || first.createdAt < window.since)
+                  break;
+                beforeSeq = first.seq;
+              }
+              return Activity.discussionDigestRow(
+                source,
+                source.cardId === null ? undefined : byCard.get(source.cardId),
+                messages.map((message) => ({
+                  at: message.createdAt,
+                  author: message.author._tag,
+                  text: blocksText(message.blocks, () => null),
+                })),
+                window,
+              );
+            }),
+          { concurrency: 1 },
+        );
+        return Activity.digestPage(
+          Activity.discussionDigestRows(rows.filter((row) => row !== null)),
+          after,
+        );
+      }
+      const { events, links } = yield* readDb(
+        Effect.all({
+          events: store.boardEvents(boardId, window.since, window.until),
+          links: store.threadLinks({ boardId, open: false }),
+        }),
+      );
+      const candidates = Activity.threadDigestRows(cards, links, events, window);
+      const byNumber = new Map(cards.map((card) => [card.number, card.id]));
+      const byCard = Activity.groupEvents(events);
+      const rows: Array<
+        (typeof candidates)[number] & {
+          lastAssistant: { at: string; text: string; itemId?: string } | null;
+          turnsInWindow?: number;
+        }
+      > = [];
+      let index = after;
+      let chars = 0;
+      // Materialize assistant text only as this page consumes rows, never for later pages.
+      for (; index < candidates.length && rows.length < 40; index++) {
+        const row = candidates[index]!;
+        const view = yield* threadIo
+          .find(row.threadId, { lastAssistant: true, window })
+          .pipe(Effect.mapError(toKanbanError));
+        const lastAssistant = view?.lastAssistant ?? null;
+        const active =
+          view?.activeInWindow === true ||
+          [row.startedAt, row.endedAt, lastAssistant?.at].some(
+            (at) => at != null && at >= window.since && at < window.until,
+          ) ||
+          (view?.activeInWindow === undefined &&
+            [view?.lastActivityAt, view?.quietSince].some(
+              (at) => at != null && at >= window.since && at < window.until,
+            )) ||
+          (byCard.get(byNumber.get(row.card)!) ?? []).some(
+            (event) =>
+              event.at >= row.startedAt && (row.endedAt === null || event.at <= row.endedAt),
+          );
+        if (!active) continue;
+        const item = {
+          ...row,
+          ...(view?.turnsInWindow === undefined ? {} : { turnsInWindow: view.turnsInWindow }),
+          lastAssistant:
+            lastAssistant === null
+              ? null
+              : {
+                  ...lastAssistant,
+                  text: lastAssistant.text.slice(0, 300),
+                },
+        };
+        // @effect-diagnostics-next-line preferSchemaOverJson:off -- Measure the encoded size of this dynamic digest row.
+        const size = JSON.stringify(item).length + 1;
+        if (rows.length > 0 && chars + size > 29_000) break;
+        rows.push(item);
+        chars += size;
+      }
+      const hasMore = index < candidates.length;
+      return { rows, page: { limit: 40, hasMore, nextAfter: hasMore ? index : null } };
+    }),
     activity: (boardId, window) =>
       readDb(
         Effect.gen(function* () {

@@ -285,8 +285,9 @@ it("nightly review requires complete reads, a fresh cursor and recovery from fai
     "Keep since unchanged while paging",
     "continue until hasMore is false",
     "Do not choose a starting card number or skip early cards",
-    "Read every supplied active discussion through the window",
-    "skim each active card thread",
+    'digest:"discussions"',
+    'digest:"threads"',
+    "deep reads done/needed",
     "read the pages relevant to this review by slug or slugs",
     "retry the same read once",
     "continue the other reads either way",
@@ -297,5 +298,36 @@ it("nightly review requires complete reads, a fresh cursor and recovery from fai
   ]) {
     expect(brief).toContain(text);
   }
-  expect(brief.indexOf("Complete the read pass")).toBeLessThan(brief.indexOf("1. Information gaps"));
+  expect(brief.indexOf("Complete the read pass")).toBeLessThan(
+    brief.indexOf("1. Information gaps"),
+  );
+});
+
+it("nightly review pins the recorded run's ISO window and uses digest coverage", () => {
+  const recorded = {
+    ...board,
+    nightlyReview: {
+      enabled: true,
+      timeOfDay: "00:00",
+      timeZone: "Asia/Dubai",
+      model,
+      lastRunAt: "2026-11-15T20:00:00.000Z",
+      lastRunDay: "2026-11-16",
+      lastDiscussionId: null,
+    },
+  };
+  const brief = evaluatorBrief(recorded, { kind: "nightly" });
+  expect(brief).toContain('use since: "2026-11-14T20:00:00.000Z"');
+  expect(brief).toContain('until: "2026-11-15T20:00:00.000Z"');
+  expect(brief).toContain('digest:"discussions"');
+  expect(brief).toContain('digest:"threads"');
+  expect(brief).toContain("run_failed, restarted, stalled or refused_call");
+  expect(brief).toContain("Call it partial only if one of those required reads is missing");
+  expect(brief).not.toContain("Read every supplied active discussion");
+  const queued = evaluatorBrief(recorded, {
+    kind: "nightly",
+    lastRunAt: "2026-11-14T20:00:00.000Z",
+  });
+  expect(queued).toContain('use since: "2026-11-13T20:00:00.000Z"');
+  expect(brief.indexOf("2. Improvements")).toBeLessThan(brief.indexOf("3. Cross-board routing"));
 });

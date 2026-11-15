@@ -71,6 +71,13 @@ export interface KanbanThreadPr {
 }
 
 export interface KanbanThreadView {
+  readonly activeInWindow?: boolean;
+  readonly turnsInWindow?: number;
+  readonly lastAssistant?: {
+    readonly at: string;
+    readonly text: string;
+    readonly itemId?: string;
+  } | null;
   readonly threadId: ThreadId;
   readonly projectId: ProjectId;
   readonly title: string;
@@ -142,7 +149,13 @@ export interface KanbanThreadsShape {
   >;
   readonly view: (threadId: ThreadId) => Effect.Effect<KanbanThreadView | null>;
   /** Like view, but a failed read fails: null means the thread is gone. */
-  readonly find: (threadId: ThreadId) => Effect.Effect<KanbanThreadView | null, KanbanThreadError>;
+  readonly find: (
+    threadId: ThreadId,
+    options?: {
+      readonly lastAssistant: boolean;
+      readonly window?: { readonly since: string; readonly until: string };
+    },
+  ) => Effect.Effect<KanbanThreadView | null, KanbanThreadError>;
   /** The selected model, or the active run's recorded model when requested. */
   readonly model: (threadId: ThreadId, activeRun?: boolean) => Effect.Effect<ModelSelection | null>;
   /** The root provider failure of the thread's latest executed run, if that run failed. */
@@ -323,19 +336,63 @@ const make = Effect.gen(function* () {
   const receipts = yield* OrchestrationCommandReceipts.OrchestrationCommandReceiptRepository;
 
   const find: KanbanThreadsShape["find"] = Effect.fn("KanbanThreads.find")(
-    function* (threadId) {
+    function* (threadId, options) {
       const shell = yield* threads.getThreadShell(threadId);
       if (shell === null || shell.deletedAt !== null) return null;
       const runId = shell.activeRunId;
+      const digestRecords = options?.lastAssistant
+        ? yield* threads.getThreadRecords(threadId, ["runs", "turnItems"], {
+            turnItemTypes: ["assistant_message"],
+            recentTurnItemLimit: 1,
+          })
+        : null;
       const records =
-        runId === null
+        digestRecords ??
+        (runId === null
           ? null
-          : yield* threads.getThreadRecords(threadId, ["runs"], { runIds: [runId] });
-      const run = records?.runs[0];
+          : yield* threads.getThreadRecords(threadId, ["runs"], { runIds: [runId] }));
+      const run =
+        digestRecords === null
+          ? records?.runs[0]
+          : digestRecords.runs.find((entry) => entry.id === runId);
       const started = shell.activityRunStartedAt;
       const activity = run?.lastActivityAt;
+      const newest = digestRecords?.turnItems[0];
+      const window = options?.window;
+      const matchingRuns =
+        window === undefined
+          ? undefined
+          : (digestRecords?.runs ?? []).filter((entry) => {
+              const since = DateTime.toEpochMillis(DateTime.makeUnsafe(window.since));
+              const until = DateTime.toEpochMillis(DateTime.makeUnsafe(window.until));
+              const requested = DateTime.toEpochMillis(entry.requestedAt);
+              if (requested >= since && requested < until) return true;
+              if (entry.startedAt === null) return false;
+              const start = DateTime.toEpochMillis(entry.startedAt);
+              const end =
+                entry.completedAt ??
+                (["preparing", "starting", "running", "waiting"].includes(entry.status)
+                  ? null
+                  : (entry.lastActivityAt ?? entry.startedAt));
+              return start < until && (end === null || DateTime.toEpochMillis(end) >= since);
+            });
       return {
         threadId: shell.id,
+        ...(matchingRuns === undefined
+          ? {}
+          : { activeInWindow: matchingRuns.length > 0, turnsInWindow: matchingRuns.length }),
+        ...(options?.lastAssistant
+          ? {
+              lastAssistant:
+                newest?.type === "assistant_message"
+                  ? {
+                      at: DateTime.formatIso(newest.updatedAt),
+                      text: newest.text.slice(0, 300),
+                      itemId: newest.id,
+                    }
+                  : null,
+            }
+          : {}),
         projectId: shell.projectId,
         title: shell.title,
         state: viewStateOf(shell).state,

@@ -221,7 +221,7 @@ const BoardGet = tool(
 const BoardActivity = tool(
   "board_activity",
   "Board activity rollup",
-  "A board's activity in a window (default the last 24 hours, at most 72): every ask answered in the window with asked/answered times and minutes to answer (p50/p90/max), open asks and asks open over 6 hours, review rounds and verdicts per card, hours in each stage with dwell median/p95/max and the longest spans, open cards in one stage over 24 hours, stalls and how long they lasted, run failures (stalled, retried, fresh thread, reviewer without verdict) by kind and model, threads started, restarts and evaluator wakes, cards left in working or in_review with no thread, and an estimate of pool slots held per hour per model next to each pool's slots. Card numbers only, no titles or text. Read from the cards' stored history; long lists other than the answered asks are cut and say how many more.",
+  "A board's activity in a window (default the last 24 hours, at most 72): every ask answered in the window with asked/answered times and minutes to answer (p50/p90/max), open asks and asks open over 6 hours, review rounds and verdicts per card, hours in each stage with dwell median/p95/max and the longest spans, open cards in one stage over 24 hours, stalls and how long they lasted, run failures (stalled, retried, fresh thread, reviewer without verdict) by kind and model, threads started, restarts and evaluator wakes, cards left in working or in_review with no thread, and an estimate of pool slots held per hour per model next to each pool's slots. Without digest, card numbers only, no titles or text. Read from the cards' stored history; long lists other than the answered asks are cut and say how many more. digest: 'discussions' or 'threads' pages one short row per discussion or card thread active in the window (owner messages, open asks, last message; thread flags); follow page.nextAfter while hasMore. A discussion with too many owner messages continues at ownerMessagesOffset on the next page; count its discussionId once.",
   {
     boardId: BoardRef,
     since: Schema.optional(
@@ -230,6 +230,8 @@ const BoardActivity = tool(
         "ISO or relative start (now, now-24h, 24h, 90m, 2d); default 24 hours before until. Times are UTC; give a Z or offset for ISO times.",
       ),
     ),
+    digest: Schema.optional(Schema.Literals(["discussions", "threads"])),
+    after: Schema.optional(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
     until: Schema.optional(
       describe(
         TrimmedNonEmptyString,

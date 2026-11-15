@@ -1,7 +1,10 @@
 import {
   KanbanBoardId,
   KanbanCardId,
+  KanbanDiscussionId,
+  type KanbanDiscussion,
   ProviderInstanceId,
+  ProjectId,
   ThreadId,
   type KanbanCard,
   type KanbanCardEvent,
@@ -10,6 +13,12 @@ import {
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as Sqlite from "../../../persistence/Sqlite.ts";
+import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
+import * as ThreadLaunchService from "../../../orchestration-v2/ThreadLaunchService.ts";
+import { KanbanThreads, layer } from "./threads.ts";
 
 import * as Activity from "./activity.ts";
 import * as Rules from "./rules.ts";
@@ -1033,4 +1042,230 @@ it("reports a refused verdict separately from no verdict and ordinary flags", ()
     failures: 1,
     lastFailure: reason,
   });
+});
+
+const discussion = (id: string, lastMessageAt = t("12:00")): KanbanDiscussion => ({
+  id: KanbanDiscussionId.make(id),
+  boardId: KanbanBoardId.make("b1"),
+  cardId: null,
+  title: id,
+  evaluatorThreadId: null,
+  participants: [],
+  lastSeq: 1,
+  lastMessageAt,
+  createdBy: { _tag: "owner" },
+  createdAt: before,
+  archivedAt: null,
+  titleEditedAt: null,
+  settledAt: null,
+  snoozedUntil: null,
+  pinnedAt: null,
+  reopenedAt: null,
+});
+const digestRow = (id: string, at: string, author = "thread", asks: KanbanOwnerAsk[] = []) =>
+  Activity.discussionDigestRow(
+    discussion(id, at),
+    card(id, { asks }),
+    [{ at, author, text: "x".repeat(500) }],
+    window,
+  );
+
+it("discussion digest covers the window, prioritizes owner messages and open asks, and clips text", () => {
+  const rows = [
+    digestRow("quiet", t("23:00")),
+    digestRow("owner", t("21:00"), "owner"),
+    digestRow("ask", t("22:00"), "thread", [ask("q1", before)]),
+    digestRow("outside", before),
+    digestRow("exclusive-end", window.until),
+  ].filter((row) => row !== null);
+  const digest = Activity.digestPage(Activity.discussionDigestRows(rows));
+  expect(digest.rows.map((row) => row.discussionId)).toEqual(["ask", "owner", "quiet"]);
+  expect(digest.rows[0]!.openAsks).toEqual(["q1"]);
+  expect(digest.rows[1]!.ownerMessages[0]!.text.length).toBe(300);
+  expect(digest.rows[1]!.last.text.length).toBe(200);
+  expect(digest.rows[1]!.messagesInWindow).toBe(1);
+  expect(digest.page).toEqual({ limit: 40, hasMore: false, nextAfter: null });
+  expect(
+    Activity.discussionSources(
+      [discussion("outside", before), discussion("inside")],
+      window.since,
+    ).map((d) => d.id),
+  ).toEqual(["inside"]);
+});
+
+it("discussion digests page 45 discussions without skipping or repeating rows", () => {
+  const rows = Activity.discussionDigestRows(
+    Array.from({ length: 45 }, (_, i) => digestRow(`d${i}`, t("12:00"))!),
+  );
+  const first = Activity.digestPage(rows);
+  const second = Activity.digestPage(rows, first.page.nextAfter!);
+  expect(first.rows).toHaveLength(40);
+  expect(first.page.hasMore).toBe(true);
+  expect(second.rows).toHaveLength(5);
+  expect(second.page.hasMore).toBe(false);
+  expect(new Set([...first.rows, ...second.rows].map((r) => r.discussionId)).size).toBe(45);
+});
+
+it("digest pages stay below 30k even for a discussion with hundreds of owner messages", () => {
+  const row = Activity.discussionDigestRow(
+    discussion("busy"),
+    undefined,
+    Array.from({ length: 240 }, () => ({
+      at: t("12:00"),
+      author: "owner",
+      text: "\u0001".repeat(500),
+    })),
+    window,
+  )!;
+  const rows = Activity.discussionDigestRows([row]);
+  let after = 0;
+  let ownerMessages = 0;
+  do {
+    const page = Activity.digestPage(rows, after);
+    expect(
+      JSON.stringify({ activity: { boardId: "b1", window, digest: "discussions", ...page } })
+        .length,
+    ).toBeLessThan(30_000);
+    ownerMessages += page.rows.reduce((sum, r) => sum + r.ownerMessages.length, 0);
+    if (!page.page.hasMore) break;
+    expect(page.page.nextAfter).toBeGreaterThan(after);
+    after = page.page.nextAfter!;
+  } while (true);
+  expect(ownerMessages).toBe(240);
+});
+
+it("thread digest puts the run failure first and retains every card role", () => {
+  const cards = [card("quiet"), card("failed", { number: 2 })];
+  const links = [
+    thread("quiet", "quiet", "work", opus, t("15:00")),
+    thread("failed", "failed", "review", sonnet, t("10:00")),
+    thread("eval", "quiet", "evaluator", opus, t("14:00")),
+    thread("outside", "missing", "work", opus, before, before),
+  ];
+  const rows = Activity.threadDigestRows(
+    cards,
+    links,
+    [event("failed", t("11:00"), "flagged", "in_review", "todo", "Run failed: boom")],
+    window,
+  );
+  expect(rows.map((r) => r.threadId)).toEqual(["failed", "quiet", "eval"]);
+  expect(rows[0]!.flags).toEqual(["run_failed", "stalled"]);
+  expect(rows[0]!.model).toEqual(sonnet);
+});
+
+it.effect("digest reads only the newest assistant item and leaves ordinary views unchanged", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("digest-thread");
+    let reads = 0;
+    let runRecords: ReadonlyArray<unknown> = [];
+    let assistantAt = t("12:00");
+    const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+      getThreadShell: () =>
+        Effect.succeed({
+          status: "idle",
+          activityRunStatus: null,
+          pendingRuntimeRequest: null,
+          updatedAt: DateTime.makeUnsafe(t("12:00")),
+          latestRunCompletedAt: DateTime.makeUnsafe(t("12:00")),
+          pendingBackgroundTasks: [],
+          id: threadId,
+          projectId: ProjectId.make("p1"),
+          deletedAt: null,
+          activeRunId: null,
+          activityRunStartedAt: null,
+          archivedAt: null,
+          title: "Digest",
+          pullRequests: [],
+        } as never),
+      getThreadRecords: (_id, fields, filter) => {
+        expect(fields).toEqual(["runs", "turnItems"]);
+        expect(filter).toEqual({ turnItemTypes: ["assistant_message"], recentTurnItemLimit: 1 });
+        reads++;
+        return Effect.succeed({
+          runs: runRecords,
+          turnItems: [
+            {
+              type: "assistant_message",
+              id: "assistant-last",
+              updatedAt: DateTime.makeUnsafe(assistantAt),
+              text: "a".repeat(500),
+            },
+          ],
+        } as never);
+      },
+    });
+    yield* Effect.gen(function* () {
+      const threads = yield* KanbanThreads;
+      expect((yield* threads.find(threadId))?.lastAssistant).toBeUndefined();
+      expect(reads).toBe(0);
+      expect((yield* threads.find(threadId, { lastAssistant: true }))?.lastAssistant).toEqual({
+        at: t("12:00"),
+        text: "a".repeat(300),
+        itemId: "assistant-last",
+      });
+      expect(reads).toBe(1);
+      assistantAt = "2026-11-13T01:00:00.000Z";
+      for (const [start, end, status, expected] of [
+        [before, assistantAt, "completed", true],
+        [before, null, "waiting", true],
+        [before, "2026-11-11T23:59:59.999Z", "completed", false],
+        [window.until, assistantAt, "completed", false],
+      ] as const) {
+        runRecords = [
+          {
+            id: "run-1",
+            requestedAt: DateTime.makeUnsafe(start),
+            startedAt: DateTime.makeUnsafe(start),
+            completedAt: end === null ? null : DateTime.makeUnsafe(end),
+            lastActivityAt: DateTime.makeUnsafe(assistantAt),
+            status,
+          },
+        ];
+        const view = yield* threads.find(threadId, { lastAssistant: true, window });
+        expect(view?.activeInWindow).toBe(expected);
+        expect(view?.turnsInWindow).toBe(expected ? 1 : 0);
+      }
+      expect(reads).toBe(5);
+    }).pipe(
+      Effect.provide(
+        layer.pipe(
+          Layer.provide(management),
+          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+          Layer.provide(Sqlite.layerMemory),
+        ),
+      ),
+    );
+  }),
+);
+
+it.each([
+  ["flagged", "Run failed: provider boom", ["run_failed", "stalled"]],
+  ["flagged", "Provider stopped moving", ["stalled"]],
+  ["flagged", "Review verdict refused: unrelated head", ["run_failed", "stalled", "refused_call"]],
+  ["moved", "Run failed, retrying once: transient", ["run_failed"]],
+  ["moved", "Thread too long; the next run starts on a fresh thread", ["run_failed"]],
+  ["comment", "Review verdict refused: clear at abc: missing checks", ["refused_call"]],
+  ["flagged", "Cleared", []],
+] as const)("thread digest flags %s: %s", (kind, body, expected) => {
+  const rows = Activity.threadDigestRows(
+    [card("a")],
+    [thread("work", "a", "work", opus, t("10:00"))],
+    [event("a", t("11:00"), kind, "working", "todo", body)],
+    window,
+  );
+  expect(rows[0]!.flags).toEqual(expected);
+});
+
+it("thread digest names restarts against earlier links, including before the window", () => {
+  const rows = Activity.threadDigestRows(
+    [card("a")],
+    [
+      thread("old", "a", "work", opus, before, t("01:00")),
+      thread("new", "a", "work", opus, t("02:00")),
+    ],
+    [],
+    window,
+  );
+  expect(rows[0]!.threadId).toBe("new");
+  expect(rows[0]!.flags).toEqual(["restarted"]);
 });
