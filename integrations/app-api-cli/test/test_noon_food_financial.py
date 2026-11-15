@@ -529,5 +529,33 @@ class RegistrarTests(unittest.TestCase):
                 result.stdout=json.dumps(receipt).encode();config['order']='FOTHER';cfgpath.write_text(json.dumps(config))
                 with self.assertRaises(j.JournalError):registrar(ORDER,paid=True)
 
+    def test_moni_routing_survives_recovery_and_verifies_tracker_recipient(self):
+        with tempfile.TemporaryDirectory() as temp,patch.object(Path,'home',return_value=Path(temp)):
+            root=Path(temp);name='order-noon-'+ORDER.lower()
+            config={'app':'noon','order':ORDER,'watcher':name,'vertical':'food','for':'moni',
+                    'delivery_card':{'held':False}}
+            cfgpath=root/'.local/state/order-tracker/orders'/f'{name}.json'
+            watchpath=root/'.local/share/robob-watch/watchers'/name/'watcher.json'
+            cfgpath.parent.mkdir(parents=True);watchpath.parent.mkdir(parents=True)
+            cfgpath.write_text(json.dumps(config));watchpath.write_text(json.dumps({'id':name}))
+            reader=SimpleNamespace(flow_id='synthetic',state={'recipient':'moni','review':{'store':'Store'}})
+            # Default recovery must honor the persisted recipient.
+            registrar=recovery.TrackerRegistrar(reader)
+            receipt={'tracker_id':name,'watcher_registered':True,'moni_notified':'sent',
+                     'delivery_card':{'status':'sent'}}
+            result=SimpleNamespace(returncode=0,stdout=json.dumps(receipt).encode())
+            with patch.object(j,'inspect',return_value={'order_id':ORDER,'reserved_minor':4585}),\
+                 patch.object(recovery.subprocess,'run',return_value=result) as run:
+                registered=registrar(ORDER,paid=True)
+                command=run.call_args.args[0]
+                self.assertEqual(command[command.index('--for')+1],'moni')
+                self.assertEqual((registered['for'],registered['moni_notified']),('moni','sent'))
+                result.returncode=3
+                result.stdout=json.dumps({**receipt,'moni_notified':'failed:send'}).encode()
+                self.assertTrue(registrar(ORDER,paid=True)['moni_notice_failed'])
+                config['for']='owner';cfgpath.write_text(json.dumps(config))
+                with self.assertRaisesRegex(j.JournalError,'FOOD_TRACKER_REGISTRATION_UNVERIFIED'):
+                    registrar(ORDER,paid=True)
+
 
 if __name__=='__main__':unittest.main()

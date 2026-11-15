@@ -3,6 +3,9 @@
 
 Quotes and source references are caller attestations, not authentication. No
 command infers approval from an answer or from an agent's summary of a decision.
+Standing delegation authorizes records only against bridge-owned bus metadata.
+Revoking a delegation prevents new records; existing records keep their window
+until individually revoked or expired.
 """
 import argparse
 from contextlib import contextmanager
@@ -14,6 +17,9 @@ from pathlib import Path
 import re
 import sys
 import uuid
+
+from agent_bus_read import bus_request as checked_bus_request
+import toollog
 
 UTC = dt.timezone.utc
 MAX_AGE = dt.timedelta(hours=24)
@@ -54,6 +60,17 @@ def terms(vendor, item, amount, currency=None, recurring=None):
                 currency=currency, recurring=recurring)
 
 
+def delegation_pair(principal, channel):
+    if principal != 'moni' or channel != 'agent-bus':
+        raise ApprovalError('UNSUPPORTED_DELEGATION: only moni via agent-bus is supported')
+
+
+def standing_delegate(rows, principal, channel):
+    revoked = {r['target'] for r in rows if r['kind'] == 'revoke'}
+    return next((r for r in reversed(rows) if r['kind'] == 'delegate' and r['id'] not in revoked
+                 and r['principal'] == principal and r['channel'] == channel), None)
+
+
 class Ledger:
     def __init__(self, root=None):
         self.root = Path(root or Path.home() / '.local/state/owner-go')
@@ -88,7 +105,7 @@ class Ledger:
     def validate(rows):
         ids = set()
         for row in rows:
-            if row['id'] in ids or row['kind'] not in ('record', 'ask', 'answer', 'revoke'):
+            if row['id'] in ids or row['kind'] not in ('record', 'ask', 'answer', 'revoke', 'delegate'):
                 raise ApprovalError('invalid event')
             ids.add(row['id'])
             timestamp(row['logged_at'])
@@ -103,6 +120,9 @@ class Ledger:
                     raise ApprovalError('invalid approval lifetime')
             if row['kind'] == 'ask':
                 text(row['thread'])
+            if row['kind'] == 'delegate':
+                delegation_pair(row['principal'], row['channel'])
+                text(row['quote']); text(row['source'])
             if row['kind'] in ('answer', 'revoke'):
                 text(row['target']); text(row['quote']); text(row['source'])
 
@@ -150,6 +170,63 @@ class Ledger:
                 raise ApprovalError('amount exceeds approval')
             return candidates[-1]
 
+    def delegate(self, *, principal, channel, quote, source, at, now=None):
+        delegation_pair(principal, channel)
+        now = now or dt.datetime.now(UTC)
+        when = timestamp(at)
+        quote, source = text(quote), text(source)
+        if when > now:
+            raise ApprovalError('future delegation')
+        with self.events(True) as (rows, stream):
+            existing = standing_delegate(rows, principal, channel)
+            if existing:
+                return existing
+            row = self.append(stream, 'delegate', now, principal=principal, channel=channel,
+                              quote=quote, source=source, at=when.isoformat())
+        toollog.emit('owner-go', 'delegate.created', ok=True, ids={'delegationId': row['id']})
+        return row
+
+    def record_delegated(self, *, principal, bus_request, vendor, item, amount, currency,
+                         recurring=None, hours=2, now=None):
+        request_id = bus_request
+        try:
+            delegation_pair(principal, 'agent-bus')
+            if not 0 < hours <= 24:
+                raise ApprovalError('INVALID_LIFETIME: lifetime must be greater than 0 and at most 24 hours')
+            data = terms(vendor, item, amount, text(currency), recurring)
+            now = now or dt.datetime.now(UTC)
+            expires = now + dt.timedelta(hours=hours)
+            if not now < expires <= now + MAX_AGE:
+                raise ApprovalError('INVALID_LIFETIME: computed expiry is outside the approval window')
+            with self.events(True) as (rows, stream):
+                delegation = standing_delegate(rows, principal, 'agent-bus')
+                if delegation is None:
+                    raise ApprovalError('NO_STANDING_DELEGATION: no unrevoked delegation')
+                # Read under the ledger lock so revocation and duplicate checks
+                # cannot race another delegated record in this ledger.
+                checked_bus_request(request_id, now=now)
+                revoked = {r['target'] for r in rows if r['kind'] == 'revoke'}
+                if any(r['kind'] == 'record' and r['id'] not in revoked
+                       and r.get('bus_request') == request_id and r['vendor'] == data['vendor']
+                       and r['item'] == data['item'] for r in rows):
+                    raise ApprovalError('DUPLICATE_DELEGATED_RECORD: request already recorded for this item')
+                row = self.append(stream, 'record', now, **data, at=now.isoformat(),
+                    expires_at=expires.isoformat(),
+                    quote=f'delegated:moni:agent-bus:{request_id}', source=f'agent-bus:{request_id}',
+                    principal=principal, bus_request=request_id, delegation=delegation['id'])
+        except (ValueError, OSError) as exc:
+            code = getattr(exc, 'code', str(exc).split(':', 1)[0])
+            if code not in toollog.DELEGATION_REASONS:
+                code = 'DELEGATED_RECORD_INVALID'
+            toollog.emit('owner-go', 'delegated_record.refused', kind='error', ok=False,
+                         ids={'requestId': request_id}, props={'reason': code}, error=code)
+            raise ApprovalError(f'{code}: delegated approval refused') from exc
+        toollog.emit('owner-go', 'delegated_record.created', ok=True,
+                     ids={'requestId': request_id, 'delegationId': delegation['id']},
+                     props={'merchant': data['vendor'], 'amountMinor': amount,
+                            'currency': data['currency'], 'hours': hours})
+        return row
+
     def ask(self, *, vendor, item, amount, thread, currency='AED', recurring=None, now=None):
         now = now or dt.datetime.now(UTC)
         data = terms(vendor, item, amount, currency, recurring)
@@ -165,15 +242,18 @@ class Ledger:
         when = timestamp(at)
         if when > now:
             raise ApprovalError('future answer or revocation')
-        expected = 'ask' if kind == 'answer' else 'record'
+        expected = ('ask',) if kind == 'answer' else ('record', 'delegate')
         with self.events(True) as (rows, stream):
-            original = next((r for r in rows if r['id'] == target and r['kind'] == expected), None)
+            original = next((r for r in rows if r['id'] == target and r['kind'] in expected), None)
             if original is None or when < timestamp(original['at']):
                 raise ApprovalError('unknown target or answer predates it')
             if any(r['kind'] == kind and r['target'] == target for r in rows):
                 raise ApprovalError('already closed')
-            return self.append(stream, kind, now, target=target, quote=text(quote),
-                               source=text(source), at=when.isoformat())
+            row = self.append(stream, kind, now, target=target, quote=text(quote),
+                              source=text(source), at=when.isoformat())
+        if kind == 'revoke' and original['kind'] == 'delegate':
+            toollog.emit('owner-go', 'delegate.revoked', ok=True, ids={'delegationId': target})
+        return row
 
     def list(self, open_only=False):
         with self.events(missing_ok=False) as rows:
@@ -198,20 +278,27 @@ def commerce_item(binding):
 def main(argv=None):
     parser = argparse.ArgumentParser(prog='owner-go')
     commands = parser.add_subparsers(dest='command', required=True)
-    for name in ('record', 'verify', 'ask'):
+    for name in ('record', 'verify', 'ask', 'record-delegated'):
         command = commands.add_parser(name)
         for arg in ('vendor', 'item', 'amount'):
             command.add_argument('--' + arg, required=True, type=int if arg == 'amount' else str)
-        command.add_argument('--currency', required=name == 'record', default='AED' if name == 'ask' else None)
+        command.add_argument('--currency', required=name in ('record', 'record-delegated'), default='AED' if name == 'ask' else None)
         command.add_argument('--recurring', choices=('monthly', 'yearly', 'weekly', 'daily', 'hourly'))
         if name == 'record':
             command.add_argument('--hours', type=float, default=24)
         if name == 'ask':
             command.add_argument('--thread', required=True)
+        if name == 'record-delegated':
+            command.add_argument('--principal', required=True)
+            command.add_argument('--bus-request', required=True)
+            command.add_argument('--hours', type=float, default=2)
+    delegate = commands.add_parser('delegate')
+    delegate.add_argument('--principal', required=True)
+    delegate.add_argument('--channel', required=True)
     for name in ('answer', 'revoke'):
         command = commands.add_parser(name)
         command.add_argument('target')
-    for name in ('record', 'answer', 'revoke'):
+    for name in ('record', 'answer', 'revoke', 'delegate'):
         command = commands.choices[name]
         for arg in ('quote', 'source', 'at'):
             command.add_argument('--' + arg, required=True)
@@ -228,7 +315,7 @@ def main(argv=None):
         elif name in ('answer', 'revoke'):
             result = ledger.close(name, **args)
         else:
-            result = getattr(ledger, name)(**args)
+            result = getattr(ledger, name.replace('-', '_'))(**args)
         print(json.dumps(result, ensure_ascii=False))
         return 0
     except (ValueError, OSError) as exc:
