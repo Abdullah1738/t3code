@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { toolError } from "../src/toollog.ts";
 import { useToolLogFixture } from "./toollog-fixture.ts";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -116,7 +117,7 @@ test("JSON body failures preserve transport causes with signal and HTTP preceden
     { failure: new Error(secret), status: 200, signal: AbortSignal.abort(new DOMException(secret, "TimeoutError")), cause: "timeout" },
     { failure: Object.assign(new Error(secret), { code: "ECONNRESET" }), status: 503, cause: 503 },
     { failure: new Error(secret), status: 503, signal: AbortSignal.abort(new DOMException(secret, "TimeoutError")), cause: "timeout" },
-    { failure: Object.assign(new Error(secret), { code: "PRIVATE_CODE" }), status: 200, cause: "unknown" },
+    { failure: Object.assign(new Error(secret), { code: "PRIVATE_CODE" }), status: 200, cause: "unclassified" },
   ];
   try {
     for (const entry of cases) {
@@ -131,5 +132,46 @@ test("JSON body failures preserve transport causes with signal and HTTP preceden
   expect(logs.entries()).toHaveLength(cases.length);
   expect(logs.text()).not.toContain(secret);
   expect(logs.text()).not.toContain("PRIVATE_CODE");
+  expect(logs.text()).not.toContain("test-token");
+});
+
+
+test("control wrappers preserve bounded diagnostics for request, body, upload and events", async () => {
+  const original = globalThis.fetch;
+  const client = new ControlClient({ url: "http://127.0.0.1:1", token: "test-token" });
+  const secret = "thread-private-id Private title bearer-token-123 Message text";
+  const cases: Array<{ failure: unknown; props: Record<string, string> }> = [
+    { failure: new TypeError(secret), props: { cause: "unclassified", detail: "TypeError", errorClass: "TypeError" } },
+    { failure: { code: "ConnectionClosed", message: secret }, props: { cause: "socket_closed", detail: "ConnectionClosed" } },
+    { failure: { code: "ENOENT", path: secret }, props: { cause: "ENOENT", detail: "ENOENT" } },
+    { failure: { code: "ECONNREFUSED", path: secret }, props: { cause: "ECONNREFUSED", detail: "ECONNREFUSED" } },
+    { failure: secret, props: { cause: "non_error", detail: "String" } },
+  ];
+  try {
+    for (const { failure, props } of cases) {
+      for (const operation of ["request", "body", "upload", "events"]) {
+        globalThis.fetch = Object.assign(async (input: Parameters<typeof fetch>[0]) => {
+          if (operation === "upload" && String(input).endsWith("/attachments")) {
+            return Response.json({ ok: true, attachmentId: "fixture", relativeUrl: "/upload" });
+          }
+          if (operation === "body") return new Response(new ReadableStream({ start(controller) { controller.error(failure); } }));
+          throw failure;
+        }, { preconnect: original.preconnect });
+        let caught: unknown;
+        try {
+          if (operation === "events") await client.events({ signal: new AbortController().signal }).next();
+          else if (operation === "upload") await client.upload({ name: "fixture.txt", mimeType: "text/plain", bytes: new Uint8Array([1]) });
+          else await client.request("GET", "/requests");
+        } catch (error) { caught = error; }
+        expect(caught).toBeInstanceOf(Error);
+        toolError("telegram", "tg.attention.pendingRequests", undefined, caught);
+        expect(logs.entries().at(-1)?.props).toEqual(props);
+      }
+    }
+    globalThis.fetch = Object.assign(async () => Response.json({ ok: false, error: { code: secret } }), { preconnect: original.preconnect });
+    try { await client.request("GET", "/requests"); } catch (error) { toolError("telegram", "tg.attention.pendingRequests", undefined, error); }
+    expect(logs.entries().at(-1)?.props).toEqual({ cause: "decode", detail: "SchemaError" });
+  } finally { globalThis.fetch = original; }
+  for (const part of secret.split(" ")) expect(logs.text()).not.toContain(part);
   expect(logs.text()).not.toContain("test-token");
 });

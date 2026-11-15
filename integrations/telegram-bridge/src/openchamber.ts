@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { errorCause, toolError } from "./toollog.ts";
+import { errorInfo, toolError } from "./toollog.ts";
 
 // JSON.parse establishes this representation; notification consumers decode its
 // event variants before using them as session/request identities.
@@ -153,9 +153,11 @@ export function sessionOrigin(session: SessionRecord | undefined): string | unde
   return typeof origin === "string" && origin ? origin : undefined;
 }
 
-function requestError(status: number, signal?: AbortSignal, cause?: unknown): Error & { status: number } {
+function requestError(status: number, signal?: AbortSignal, ...causes: [] | [unknown]): Error & { status: number } {
   // Never expose response bodies, URLs, headers, parser errors, or abort reasons.
-  const error = Object.assign(new Error(`OpenChamber request failed (HTTP ${status})`), { status, causeClass: signal?.aborted ? errorCause(signal.reason) : cause === undefined ? status || "unknown" : errorCause(cause) });
+  // An explicitly thrown undefined is still a cause; omitted causes describe HTTP failures.
+  const diagnostic = errorInfo(signal?.aborted ? signal.reason : causes.length ? causes[0] : { status });
+  const error = Object.assign(new Error(`OpenChamber request failed (HTTP ${status})`), { status, causeClass: diagnostic.cause, diagnostic });
   if (signal?.aborted) error.name = "AbortError";
   return error;
 }
