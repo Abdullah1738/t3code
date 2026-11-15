@@ -346,6 +346,8 @@ def slow_read_reachable(deadline=None):
         if data.get("ok") is not True and not starting_phase(data):
             return False
         note_home_answer(ready=False)
+    elif not timed_out(data):
+        return False
     return True
 
 

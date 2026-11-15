@@ -112,6 +112,40 @@ class HomeBoxSlow(unittest.TestCase):
                     patch.object(common, "home_state", return_value={"state": "home_slow", "boot_id": "boot-a"}):
                 self.assertEqual(REAL_REACHABLE(), expected)
 
+    def test_queued_read_health_response_forms_preserve_hard_failures(self):
+        cases = [("HTTP 500", "health answered HTTP 500", False),
+                 ("HTTP 503", "health answered HTTP 503", False),
+                 ("HTTP 401", "health answered HTTP 401", False),
+                 ("invalid JSON", "no answer (JSONDecodeError)", False),
+                 ("refused", "no answer (ConnectionRefusedError)", False),
+                 ("no config", "no home server configured", False),
+                 ("empty", "", False), ("null", None, False), ("array", [], False),
+                 ("timeout", "no answer (TimeoutError)", True),
+                 ("ready", {"ok": True, "boot_id": "boot-a"}, True),
+                 ("starting", {"ok": False, "starting": True, "phase": "reconcile"}, True),
+                 ("not ok", {"ok": False, "reasons": ["incus failed"]}, False),
+                 ("reboot", {"ok": True, "boot_id": "boot-b"}, False)]
+        for label, response, retry in cases:
+            self.clock.t = 1000
+            error = api.NetworkError("deadline passed during GET /sandboxes/homebox: timed out")
+            with self.subTest(response=label), home.wait_budget(), \
+                    patch.object(home, "slow_read_reachable", side_effect=REAL_REACHABLE), \
+                    patch("home_monitor.tailnet_facts", return_value={"peer_online": True}), \
+                    patch.object(common, "home_state", return_value={"state": "home_slow", "boot_id": "boot-a"}), \
+                    patch.object(home, "_health", return_value=response), \
+                    patch.object(api, "readiness_get", side_effect=error), \
+                    patch.object(api, "get", return_value={"state": "running"}) as read:
+                if retry:
+                    self.assertEqual(lease._readiness_get("homebox"), {"state": "running"})
+                    read.assert_called_once()
+                else:
+                    with self.assertRaises(api.NetworkError) as caught:
+                        lease._readiness_get("homebox")
+                    self.assertIs(caught.exception, error)
+                    self.assertEqual(home.failure_class(str(caught.exception)), "hard")
+                    read.assert_not_called()
+                self.assertEqual(self.clock.t, 1000, "classification must not spend the slow grace on a refusal")
+
     def test_pending_resume_keeps_queue_deadline_and_marker_on_slow_read(self):
         self.f.box("homebox", "stopped", member=True)
         self.f.con.execute("INSERT INTO kv VALUES ('resume_unanswered:homebox','',?)", (self.clock.t,))
