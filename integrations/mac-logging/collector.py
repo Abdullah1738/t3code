@@ -170,6 +170,7 @@ def unified_command(command, capture_output=True, text=True, timeout=60, env=Non
 
 def next_unified_chunk(size, elapsed, model=None):
     model = dict(model or {})
+    spent = model.get('spent', 0)+elapsed
     previous = model.get('previous')
     limit = model.get('limit', UNIFIED_CHUNK_S)
     if previous and abs(size-previous[0]) > .000001:
@@ -193,15 +194,17 @@ def next_unified_chunk(size, elapsed, model=None):
         # Startup can hide curvature in two tiny probes. Sample the nominal
         # window before a large jump when the model leaves room for four calls.
         # Expensive startup may only afford three calls to clear the ceiling.
-        if (max(size, previous[0]) < UNIFIED_CHUNK_S and rate*UNIFIED_WINDOW_S > 1 and
-                4*overhead+rate*UNIFIED_WINDOW_S <= UNIFIED_BUDGET_S):
+        # Flat or decreasing tiny-query timings can be startup noise too;
+        # they do not establish that a full-window query is cheap.
+        if (max(size, previous[0]) < UNIFIED_CHUNK_S and
+                spent+2*overhead+rate*UNIFIED_WINDOW_S <= UNIFIED_BUDGET_S):
             size_next = min(size_next, UNIFIED_CHUNK_S)
     elif previous:
         size_next = max(UNIFIED_FIRST_CHUNK_S, min(limit,
                         size*max(UNIFIED_TARGET_S, previous[1])/max(.001, elapsed)))
     else:
         size_next = min(limit, max(UNIFIED_FIRST_CHUNK_S, size*2))
-    model.update(previous=(size, elapsed), limit=limit)
+    model.update(previous=(size, elapsed), limit=limit, spent=spent)
     return size_next, model
 
 

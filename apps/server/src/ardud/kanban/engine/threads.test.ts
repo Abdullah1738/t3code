@@ -1381,7 +1381,7 @@ it.effect("#1490 observes accepted deliveries once and does not block on boards 
     Layer.mock(Analytics.Analytics)({
       record: (event) =>
         Effect.sync(() => {
-          measured.push(event);
+          if (event.kind === "kanban.evaluator") measured.push(event);
         }),
     }),
     Layer.effect(

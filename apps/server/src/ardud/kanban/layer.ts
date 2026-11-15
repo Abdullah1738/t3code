@@ -34,6 +34,7 @@ export const startTimeoutOf = (event: OrchestrationV2DomainEvent) =>
   event.payload.type === "error" &&
   event.payload.status === "failed" &&
   (event.payload.failure.code === "provider_start_timeout" ||
+    event.payload.failure.code === "provider_events_lost" ||
     event.payload.failure.code === "restart_admission_timeout") &&
   event.payload.runId !== null
     ? {

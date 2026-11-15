@@ -363,6 +363,7 @@ export interface ProjectionRecordFilter {
   readonly providerSessionId?: ProviderSessionId;
   readonly providerThreadIds?: ReadonlyArray<string>;
   readonly pendingBackgroundTasksOnly?: boolean;
+  readonly providerTurnAttemptId?: RunAttemptId;
   readonly messageRoles?: ReadonlyArray<OrchestrationV2ConversationMessage["role"]>;
   readonly turnItemRunId?: RunId;
   readonly messageIds?: ReadonlyArray<MessageId>;
@@ -3871,11 +3872,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             SELECT payload_json
             FROM orchestration_v2_projection_provider_turns
             WHERE thread_id = ${threadId}
+              ${filter?.providerTurnAttemptId === undefined ? sql`` : sql`AND run_attempt_id = ${filter.providerTurnAttemptId}`}
             ORDER BY provider_thread_id ASC, ordinal ASC
           `
               : sql<PayloadRow>`
             SELECT payload_json FROM orchestration_v2_projection_provider_turns
             WHERE thread_id = ${threadId}
+              ${filter?.providerTurnAttemptId === undefined ? sql`` : sql`AND run_attempt_id = ${filter.providerTurnAttemptId}`}
               AND (status IN ('starting','running','waiting')
                 OR provider_turn_id IN (SELECT value FROM json_each(${cohortProviderTurnIds}))
                 OR node_id IN (SELECT value FROM json_each(${cohortNodeIds})))
@@ -8118,6 +8121,11 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
             : undefined;
           const selected = {
             ...projection,
+            providerTurns: projection.providerTurns.filter(
+              (turn) =>
+                filter?.providerTurnAttemptId === undefined ||
+                turn.runAttemptId === filter.providerTurnAttemptId,
+            ),
             messages: projection.messages.filter(
               (row) =>
                 (filter?.messageRunIds === undefined ||

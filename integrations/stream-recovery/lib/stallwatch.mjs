@@ -1,4 +1,4 @@
-import { emit, observed, recoveryIo } from './logging.mjs';
+import { emit, recoveryIo, timedScan } from './logging.mjs';
 // Stall watch: one pass over OpenCode's active sessions per scan. Spots
 // sessions that stay "running" with nothing changing, interrupts them, follows
 // up until they are clear, then reports once. The caller loads and saves state.
@@ -48,7 +48,7 @@ async function mapLimit(items, limit, fn) {
 const errText = (err) => String(err?.message || err).slice(0, 300);
 
 export async function stallScan(options, io = realIo) {
-  return observed('stream-recovery', 'stall.scan', () => stallScanImpl(options, io));
+  return timedScan('stall', io, timed => stallScanImpl(options, timed));
 }
 
 async function stallScanImpl({ state, now, dryRun = false, verbose = false, log }, io = realIo) {

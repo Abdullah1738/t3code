@@ -62,6 +62,7 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
+import * as ProviderStartProgress from "../ardud/orchestration/ProviderStartProgress.ts";
 import * as McpAppModelContext from "../mcpApps/McpAppModelContext.ts";
 import * as PreviewAgentActivity from "../preview/PreviewAgentActivity.ts";
 import * as Analytics from "../ardud/analytics/Analytics.ts";
@@ -5482,6 +5483,7 @@ function captureRootRunTermination(input: {
   readonly awaitSessionExit?: ProviderAdapter.ProviderAdapterV2SessionRuntime["awaitSessionExit"];
   readonly unsafeProcessStop?: Effect.Effect<void>;
   readonly sharedSessionId?: ProviderSessionId;
+  readonly nativeSessionId?: string;
   readonly ingestNormalized?: ProviderEventIngestor.ProviderEventIngestorV2Shape["ingestNormalized"];
   readonly refreshAfterTurn?: Effect.Effect<void>;
   readonly onSubscriptionClose?: Effect.Effect<void>;
@@ -5713,6 +5715,11 @@ function captureRootRunTermination(input: {
         providerThread: {
           id: ids.providerThreadId,
           driver,
+          ...(input.nativeSessionId === undefined
+            ? {}
+            : {
+                nativeThreadRef: { driver, nativeId: input.nativeSessionId, strength: "strong" },
+              }),
           ...(input.sessionRefused === undefined
             ? {}
             : { nativeMetadata: { claudeRefusalObserved: input.sessionRefused } }),
@@ -6133,6 +6140,97 @@ function rootTerminalEvent(
       }
     : { ...common, status, failure: null };
 }
+
+it.effect.each(["ack", "output"] as const)(
+  "retains non-Claude native %s evidence while ingestion is blocked",
+  (evidence) =>
+    Effect.gen(function* () {
+      const key = `blocked-native-${evidence}`;
+      const ids = backgroundScenarioIds(key);
+      const progress = yield* ProviderStartProgress.ProviderStartProgress;
+      const now = yield* DateTime.now;
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      yield* progress.begin({
+        threadId: ids.threadId,
+        runId: ids.runId,
+        attemptId: ids.attemptId,
+        attemptOrdinal: 1,
+        provider: ProviderInstanceId.make("codex"),
+        model: "gpt-5.4",
+        delegated: false,
+        providerSessionId: ProviderSessionId.make(`session:${key}`),
+      });
+      const turn = {
+        id: ids.rootProviderTurnId,
+        providerThreadId: ids.providerThreadId,
+        nodeId: ids.rootNodeId,
+        runAttemptId: ids.attemptId,
+        nativeTurnRef: null,
+        ordinal: 1,
+        status: "running" as const,
+        startedAt: now,
+        completedAt: null,
+      };
+      yield* captureRootRunTermination({
+        key,
+        nativeSessionId: "codex-native-session",
+        shouldFinalizeRun: () => Effect.succeed(true),
+        events: () =>
+          Stream.fromIterable([
+            { type: "provider_turn.updated", driver, providerTurn: turn },
+            evidence === "ack"
+              ? {
+                  type: "provider_turn.updated",
+                  driver,
+                  providerTurn: { ...turn, promptAcceptedAt: now },
+                }
+              : {
+                  type: "turn_item.updated",
+                  driver,
+                  turnItem: {
+                    id: ids.itemId,
+                    type: "reasoning",
+                    threadId: ids.threadId,
+                    runId: ids.runId,
+                    nodeId: ids.rootNodeId,
+                    providerThreadId: ids.providerThreadId,
+                    providerTurnId: ids.rootProviderTurnId,
+                    nativeItemRef: { driver, nativeId: "native-reasoning", strength: "strong" },
+                    parentItemId: null,
+                    ordinal: 1,
+                    status: "running",
+                    title: null,
+                    startedAt: now,
+                    completedAt: null,
+                    updatedAt: now,
+                    text: "Working",
+                    streaming: true,
+                  },
+                },
+            rootTerminalEvent(ids, "completed"),
+          ] satisfies ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>),
+        ingestNormalized: ({ event }) =>
+          event.type === "provider_turn.updated" &&
+          event.providerTurn.promptAcceptedAt !== undefined
+            ? Deferred.succeed(entered, undefined).pipe(
+                Effect.andThen(Deferred.await(release)),
+                Effect.as([]),
+              )
+            : Effect.succeed([]),
+        afterStart: () =>
+          Effect.gen(function* () {
+            yield* Deferred.await(entered);
+            const snapshot = progress.get(ids.runId, ids.attemptId)!;
+            assert.isNotNull(snapshot.nativeAcceptedAt);
+            assert.equal(snapshot.nativeSessionId, "codex-native-session");
+            assert.equal(snapshot.step, "run_ingestion_write");
+            assert.isFalse(yield* Deferred.isDone(release));
+            yield* Deferred.succeed(release, undefined);
+          }),
+      }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+    }).pipe(Effect.provide(ProviderStartProgress.layer)),
+);
 
 it.effect.each([
   { provider: "cursor", mode: "turn" },

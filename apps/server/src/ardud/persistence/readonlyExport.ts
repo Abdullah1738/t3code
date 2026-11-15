@@ -1756,6 +1756,7 @@ export function createReadonlyReplica(
      * bounded page of whichever is pending. False when caught up to cycleTarget.
      */
     const catchUpWork = (): boolean => {
+      heartbeatRebuild();
       const cursor = Number(getMeta("sequence"));
       if (cursor < cycleTarget!) {
         eventRead(() => {
