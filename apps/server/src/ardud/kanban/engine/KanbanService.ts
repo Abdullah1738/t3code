@@ -10779,8 +10779,15 @@ const make = Effect.gen(function* () {
                   if (board.pause && !board.pause.keep.includes(card.id)) return;
                   if ((yield* Ref.get(unresolvedTurnEnds)).has(threadId)) return;
                   if (discussionWakes.has(threadId)) return;
-                  // A paused worker waits for probeOutages, not a nudge.
-                  if ((yield* store.threadLink(threadId))?.paused) return;
+                  // Provider recovery owns nudges, but a deferred wait can park
+                  // once the work that held it after the outage has drained.
+                  if ((yield* store.threadLink(threadId))?.paused) {
+                    yield* parkWorkerWaits(threadId, [card]);
+                    const saved = yield* store.card(card.id);
+                    if (saved) updateCard(saved);
+                    else invalidateCards();
+                    return;
+                  }
                   const foundFailure = yield* Effect.result(threads.findLastFailure(threadId));
                   if (Result.isFailure(foundFailure)) {
                     yield* Ref.update(unresolvedTurnEnds, (all) => new Set(all).add(threadId));

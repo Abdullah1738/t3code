@@ -103,6 +103,7 @@ const makeWorld = (
   const background = new Set<string>();
   const failures = new Map<string, OrchestrationV2ProviderFailure & { runId: string }>();
   const statuses = new Map<string, string>();
+  const probe = { ready: false, calls: 0 };
   /** The PRs a work thread tracks, as its view reports them. */
   const prs = new Map<string, ReadonlyArray<KanbanThreadPr>>();
   /** What the host answers when the wait PR reader asks. A PR not listed could not be read. */
@@ -404,7 +405,17 @@ const makeWorld = (
               }),
           }),
     ),
-    Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
+    Layer.provideMerge(
+      Layer.mock(TextGeneration.TextGeneration)({
+        generateJson: (input) =>
+          Effect.suspend(() => {
+            probe.calls++;
+            return probe.ready
+              ? Schema.decodeUnknownEffect(input.outputSchema)({ ok: true }).pipe(Effect.orDie)
+              : Effect.die("provider is still down");
+          }),
+      }),
+    ),
     Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
     Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
     Layer.provideMerge(
@@ -426,6 +437,7 @@ const makeWorld = (
     background,
     failures,
     statuses,
+    probe,
     prs,
     host,
     gate,
@@ -692,6 +704,64 @@ it.effect.each(["queued", "background", "both"] as const)(
         );
       }),
     ),
+);
+
+it.effect.each(
+  (["quota", "transient", "auth_expired"] as const).flatMap((category) =>
+    (["queued", "background", "both"] as const).map((pending) => ({ category, pending })),
+  ),
+)("a $category-paused worker parks its wait after $pending work drains", ({ category, pending }) =>
+  inWorld((world) =>
+    Effect.gen(function* () {
+      const { kanban, store, card, worker } = yield* deferredWorker;
+      if (pending !== "background") world.queued.add(worker);
+      if (pending !== "queued") world.background.add(worker);
+      world.failures.set(worker, {
+        class: category === "quota" ? "usage_limit" : "provider_error",
+        category,
+        message: "provider unavailable",
+        code: null,
+        retryable: true,
+        runId: "run-1",
+      });
+      yield* kanban.turnEnded(worker);
+      assert.isNotNull((yield* store.threadLink(worker))?.paused);
+      yield* kanban.tick;
+      assert.strictEqual((yield* cardOf(card.id)).activeThreadId, worker);
+      world.queued.delete(worker);
+      world.background.delete(worker);
+      world.host.readings = [{ url: PR, state: "open", at: iso(T0) }];
+      yield* kanban.tick;
+      const parked = yield* cardOf(card.id);
+      assert.strictEqual(parked.stage, "todo");
+      assert.isNull(parked.activeThreadId);
+      assert.isNull(parked.activePool);
+      assert.strictEqual(parked.workThreadId, worker);
+      assert.isNull(parked.stalled);
+      assert.isDefined(parked.wait);
+      assert.strictEqual(world.said("still in Working"), 0);
+      assert.strictEqual(world.probe.calls, 0);
+      yield* TestClock.adjust(3 * MINUTE);
+      world.host.readings = [{ url: PR, state: "merged", at: iso(T0 + 3 * MINUTE) }];
+      yield* kanban.tick;
+      const ready = yield* cardOf(card.id);
+      assert.isUndefined(ready.wait);
+      assert.include(ready.wakeNote ?? "", "finish after the parent lands");
+      assert.strictEqual(ready.stage, "todo");
+      assert.strictEqual(world.probe.calls, 0);
+      // Parking and the merge answer do not declare the failed provider healthy.
+      world.probe.ready = true;
+      yield* TestClock.adjust(2 * MINUTE);
+      yield* kanban.probeOutages;
+      yield* kanban.dispatchNow;
+      assert.strictEqual((yield* cardOf(card.id)).activeThreadId, worker);
+      assert.isTrue(
+        world.threads
+          .get(worker)!
+          .messages.some((text) => text.includes("finish after the parent lands")),
+      );
+    }),
+  ),
 );
 
 it.effect("a PR merged before turn end wakes its worker only after the park", () =>
