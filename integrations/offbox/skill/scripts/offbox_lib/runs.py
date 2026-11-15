@@ -1408,7 +1408,9 @@ def report_exit(cmd: str, code: int | None, step_res: list[tuple[int, int]] | No
         say("exit 1 may be from the trailing grep (no match) or an earlier stage. Use --step for each command.")
     if code == 137 or any(rc == 137 for _, rc in (step_res or [])):
         say("exit 137 = the box killed the command for memory. Rerun with --size xlarge.")
-    if where == "remote" and deps_hint and (code not in (0, None) or any(rc != 0 for _, rc in (step_res or []))):
+    failed_code = next((rc for _, rc in (step_res or []) if rc), code)
+    if (where == "remote" and code != 127 and failed_code != 127 and deps_hint
+            and (code not in (0, None) or any(rc != 0 for _, rc in (step_res or [])))):
         say(deps_hint)
     if code is None:
         hint = f"; inspect with offbox ssh {box_id}" if box_id else ""
@@ -1475,8 +1477,11 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
         log_probe_error(run_id, offbox_disk_space.PROBE_PAYLOAD_ERROR)
     probe = '__obprobe'
     deps_check = (f'__offbox_exit=$?; {probe} end "$__obsw" || '
-                  '{ echo "offbox-space-probe-error: end probe failed (exit $?)" >&2; }; if [ "${__offbox_command_started:-0}" = 1 ] '
-                  f'&& [ "$__offbox_exit" -ne 0 ] && [ {int(usage.uses_js)} = 1 ] '
+                  '{ echo "offbox-space-probe-error: end probe failed (exit $?)" >&2; }; '
+                  'if [ "${__offbox_command_started:-0}" = 1 ] && [ "$__offbox_exit" = 127 ]; then '
+                  'printf \'%s\\n\' \'offbox: exit 127: a command was not found on this box (see the "…: command not found" line above)\' >&2; fi; '
+                  f'if [ "${{__offbox_command_started:-0}}" = 1 ] '
+                  f'&& [ "$__offbox_exit" -ne 0 ] && [ "$__offbox_exit" -ne 127 ] && [ {int(usage.uses_js)} = 1 ] '
                   f'&& [ -f {root}/package.json ] && [ ! -e {root}/node_modules ] '
                   f'; then __offbox_deps_context=; {missing}; '
                   f'if [ -n "$__offbox_deps_context" ]; then {advice}; fi; fi; '
@@ -2716,6 +2721,19 @@ def emit_terminal(row):
                      ids={'run': run_id, 'box': row['box_id']}, props={'exitCode': code, 'fallback': row['mode'] == 'local',
                             **read_json(LOGS_DIR / f'{run_id}.state.json', {})},
                      tag='run_failed' if code != 0 else None)
+        if code == 127 and row['mode'] != 'local':
+            # The remote shell has no readable output capture. Use only the received tail, without fetching logs.
+            name = None
+            try:
+                with (LOGS_DIR / f'{run_id}.log').open('rb') as stream:
+                    stream.seek(max(0, stream.seek(0, 2) - 65536))
+                    tail = stream.read().decode(errors='replace').splitlines()[-200:]
+                match = re.search(r'(?:^|\s)([A-Za-z0-9_./+-]+): command not found\s*$', '\n'.join(tail), re.M)
+                name = match[1] if match and len(match[1]) <= 256 else None
+            except OSError:
+                pass
+            with contextlib.closing(db()) as con:
+                event(con, row['box_id'], 'command_not_found', json.dumps({'run': run_id, 'name': name}))
         if row['process_id'] or row['wrapper_pid']:
             command_ms = api.command_execution_ms(row['box_id'], row['process_id'], row['command_id'])
             toollog.emit('run', 'run.command', kind='perf' if code == 0 else 'error', ok=code == 0,
