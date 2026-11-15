@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off - command ids only need a random UUID.
 import * as NodeCrypto from "node:crypto";
+import * as EvaluatorAnalytics from "./evaluatorAnalytics.ts";
 
 import {
   CommandId,
@@ -92,6 +93,7 @@ export interface KanbanThreadView {
 }
 
 export interface KanbanLaunchInput {
+  readonly onStarted?: (threadId: ThreadId) => Effect.Effect<void>;
   /** Stable per logical launch so a retry finds the same thread. */
   readonly key: string;
   readonly projectId: ProjectId;
@@ -101,6 +103,8 @@ export interface KanbanLaunchInput {
 }
 
 export interface KanbanSendInput {
+  /** Observes a newly accepted delivery, excluding receipt replays and coalesced no-ops. */
+  readonly onAccepted?: (identity: string) => Effect.Effect<void>;
   readonly flushQueued?: "wake" | "steer";
   readonly threadId: ThreadId;
   readonly text: string;
@@ -552,6 +556,7 @@ const make = Effect.gen(function* () {
         creationSource: "server",
       })
       .pipe(
+        Effect.provideService(EvaluatorAnalytics.startObserver, input.onStarted),
         Effect.map((launched) => launched.threadId),
         Effect.mapError(
           (error) => new KanbanThreadError({ operation: "launch", detail: detailOf(error) }),
@@ -871,7 +876,15 @@ const make = Effect.gen(function* () {
               ),
             )
           : deliver;
-      }).pipe(Effect.mapError((error) => sendError(error, acceptedMessageId, acceptedRunId)));
+      }).pipe(
+        Effect.provideService(
+          EvaluatorAnalytics.deliveryObserver,
+          input.onAccepted === undefined
+            ? undefined
+            : (commandId) => input.onAccepted!(commandId.replace(/^kanban:send:/, "")),
+        ),
+        Effect.mapError((error) => sendError(error, acceptedMessageId, acceptedRunId)),
+      );
     },
     Effect.mapError((error) => sendError(error)),
   );

@@ -839,3 +839,39 @@ it("preserves all 25 groups until overflow requires an other row", () => {
     { count: 2, totalWaitMs: 5, p95Ms: 99, maxMs: 99 },
   );
 });
+
+it("#1490 counts evaluator starts by origin without treating steers and queued inputs as starts", () => {
+  const target = makeAccumulator();
+  for (const outcome of ["started", "reused", "merged", "queued_spawn_cap"] as const)
+    accumulate(
+      target,
+      event({
+        kind: "kanban.evaluator",
+        boardId: "board-offbox",
+        purposeKind: "discussion",
+        trigger: "discussion_post",
+        outcome,
+      }),
+    );
+  accumulate(
+    target,
+    event({
+      kind: "kanban.evaluator",
+      boardId: "board-offbox",
+      purposeKind: "request",
+      trigger: "report_bug",
+      outcome: "started",
+      reuseMissReason: "no_card_reuse_scope",
+    }),
+  );
+  const result = finishRollup(target, "2026-11-13", ts);
+  assert.deepEqual(result.evaluatorStartsByTrigger, [
+    { boardId: "board-offbox", trigger: "discussion_post", count: 1 },
+    { boardId: "board-offbox", trigger: "report_bug", count: 1 },
+  ]);
+  assert.equal(
+    result.evaluatorOutcomes!.reduce((n, row) => n + row.count, 0),
+    5,
+  );
+  assert.deepEqual(result.errorCounts, {});
+});
