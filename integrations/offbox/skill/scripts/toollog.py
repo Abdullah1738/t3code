@@ -17,9 +17,11 @@ import time
 CAP_BYTES = 50 * 1024 * 1024
 NUMBERS = set("bytes files skipped exitCode waitMs queueMs runMs position ttlSeconds reasonLength busy idle stopped count flagsCount envCount pullCount includeCount stepCount attempt pid timeoutSeconds commandLength cmd_bytes step_count".split())
 NUMBERS.update({'command_exit_code', 'wrapper_exit_code', 'disk_attempt'})
+NUMBERS.update({'leftoverKilled', 'boxRc', 'incusRc', 'cgroupProcessCount'})
 NUMBERS.update(f'{fs}_{field}' for fs in ('tmp', 'var_tmp', 'home', 'workspace')
                for field in ('free_bytes', 'size_bytes'))
 BOOLEANS = set("queued killed fresh bg noSync git noFallback noRetry remote failed stale timeoutHit fallback dryRun baseGiven templateGiven sizeGiven".split())
+BOOLEANS.update({'retry', 'rcFilePresent', 'superseded'})
 ENUMS = {
     "cmd_via": {"argv", "file"},
     "backend": {"home", "boat"}, "from": {"home", "boat"}, "to": {"home", "boat"},
@@ -36,6 +38,10 @@ ENUMS = {
 }
 ENUMS.update({f'{fs}_fstype': {'tmpfs', 'zfs', 'ext2', 'ext3', 'ext4', 'xfs', 'btrfs', 'overlay', 'unknown'}
               for fs in ('tmp', 'var_tmp', 'home', 'workspace')})
+ENUMS.update(cause={'incus_unavailable', 'exec_stream_lost', 'host_restart', 'boatd_restart', 'runner_restart'},
+             phase={'before_spawn', 'running'}, cleanup={'clean', 'stopped', 'unknown'})
+ENUMS['reason'].update({'incus_unavailable', 'state_unavailable', 'box_unreadable', 'invalid_receipt',
+                        'cgroup_unverified', 'cgroup_kill_failed', 'cleanup_unconfirmed'})
 _DAYS = set()
 
 
@@ -62,7 +68,14 @@ def _ids(values):
 def _props(values):
     out = {}
     for k, v in (values or {}).items():
-        if k in NUMBERS and type(v) in (int, float) and math.isfinite(v):
+        if k in {'leftoverKilled', 'boxRc', 'cgroupProcessCount'} and v is None:
+            out[k] = None
+        elif k == 'stderrTail' and isinstance(v, str):
+            # Only Incus' fixed transport diagnostics belong here, never arbitrary command output.
+            markers = ('Lost connection to the event listener', 'websocket: close 1006',
+                       'unexpected EOF', 'Incus is shutting down')
+            out[k] = '; '.join(s for s in markers if s in v)
+        elif k in NUMBERS and type(v) in (int, float) and math.isfinite(v):
             out[k] = v
         elif k in BOOLEANS and type(v) is bool:
             out[k] = v

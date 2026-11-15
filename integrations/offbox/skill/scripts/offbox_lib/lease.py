@@ -1284,6 +1284,9 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
         return None
     box_id = row["box_id"]
     from . import allocation
+    def check_held(remote):
+        if remote and remote.get('heldRuns'):
+            raise allocation.Busy(f"{box_id} is held by an unfinished command: {', '.join(remote['heldRuns'])}")
     pending_grow = con.execute("SELECT v FROM kv WHERE k=?", (f"resize_size:{box_id}",)).fetchone()
     if pending_grow and _bigger(pending_grow[0], size):
         size = pending_grow[0]
@@ -1326,6 +1329,8 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
             if p.returncode == 255:
                 ssh_sync.check_host_key(box_id, p.stderr)
             if p.returncode == 0:
+                if api.BACKEND == 'server':
+                    check_held(api.get(box_id))
                 ensure_ttl(box_id, max(RUN_TTL_S, idle_for(con, box_id, row["size"])))
                 if pending_grow and not _bigger(pending_grow[0], row['size']):
                     con.execute("DELETE FROM kv WHERE k=?", (f"resize_size:{box_id}",))
@@ -1348,6 +1353,7 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
     if s is None or s.get("state") in ("error", "cancelled"):
         forget_box(con, box_id, "lease_gone", f"state={s and s.get('state')}")
         return None
+    check_held(s)
     if s.get("dataExpiredAt"):
         _forget_expired(con, box_id, f"boat deleted its data at {s['dataExpiredAt']}")
         return None

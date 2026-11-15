@@ -127,7 +127,12 @@ class Wire(Isolated):
                     boatd.reconcile(self.srv.con)
                 status=api.cmd_status(box,pid)
                 if name!='recovered':
-                    self.assertIsNone(status['metrics'])
+                    if name == 'interrupted':
+                        self.assertEqual(status['metrics']['interruption']['cleanup'], 'clean')
+                        self.assertNotIn('wall_s', status['metrics'])
+                    else:
+                        self.assertEqual(status['metrics']['kill']['cleanup'], 'clean')
+                        self.assertNotIn('wall_s', status['metrics'])
                     self.assertEqual(status['endedAt'],boatd.iso(3710))
                 # Both existing response paths must retain only an observed execution duration.
                 self.assertEqual(api.command_execution_ms(box,pid,f'cmd_{pid}'),duration)

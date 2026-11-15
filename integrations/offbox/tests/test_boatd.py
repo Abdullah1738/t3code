@@ -110,6 +110,11 @@ class Base(unittest.TestCase):
         boatd.init_db()
         self.con = boatd.db()
         self.addCleanup(self.con.close)
+        # The host fixtures have readable, empty run groups. Transport tests override this probe.
+        probe = patch.object(boatd, 'command_probe', return_value={
+            'readable': True, 'pids': [], 'box_rc': None, 'stopped': True})
+        probe.start()
+        self.addCleanup(probe.stop)
 
     def box(self, bid="bx_aaaaaaaa", state="ready", owner="ardud", running=True, **kw):
         t = boatd.now()
@@ -567,7 +572,7 @@ class Http(Base):
                         con.close()
                 def process(args, **kw):
                     kw["stdout"].write(b"ready\n")
-                    return subprocess.CompletedProcess(args, 0)
+                    return unittest.mock.Mock(wait=unittest.mock.Mock(return_value=0))
                 def spawn(bid, pid, attempt):
                     boatd.run_cmd(bid, pid)
                 stack.enter_context(patch.object(boatd, "load_cfg"))
@@ -575,7 +580,7 @@ class Http(Base):
                 stack.enter_context(patch.object(boatd.time, "sleep", side_effect=hold_admission))
                 stack.enter_context(patch.object(boatd, "spawn_runner", side_effect=spawn))
                 stack.enter_context(patch.object(boatd, "ct_exec"))
-                stack.enter_context(patch.object(boatd.subprocess, "run", side_effect=process))
+                stack.enter_context(patch.object(boatd.subprocess, "Popen", side_effect=process))
                 stack.enter_context(patch.object(boatd, "snapshot"))
                 stack.enter_context(patch.object(boatd, "prune_snaps"))
                 th = threading.Thread(target=wait_for_memory)

@@ -1083,6 +1083,8 @@ def remember_execution(box_id, status, *, pid=None, command_id=None):
                 counts = {
                     k: host.get(k) if type(host.get(k)) is int and host[k] >= 0 else None
                     for k in ('start', 'end')}
+                counts.update({k: host[k] if isinstance(host[k], str) else None
+                               for k in ('start_reason', 'end_reason') if k in host})
                 _COMMAND_HOST_BOXES[(box_id, 'command', cid)] = (cid, counts)
                 observed_pid = pid if pid is not None else data.get('processId')
                 if observed_pid is not None:

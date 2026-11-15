@@ -518,6 +518,14 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
                     code = st.get('exitCode') if st else None
                 except OffboxError:
                     continue
+                if st:
+                    if not dry:
+                        from .runs import remember_interruption
+                        remember_interruption(run['run_id'], st)
+                    if st.get('running') is True:
+                        continue
+                    if st.get('status') == 'interrupted':
+                        status, code = 'interrupted', EXIT_INTERRUPTED
         elif state not in api.LIVE_STATES:
             continue
         elif pid:
@@ -528,8 +536,11 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
             if st is None:
                 # Missing/unavailable status is not proof a process stopped.
                 continue
-            elif not st.get("running") and st.get('status') == 'interrupted':
-                # Our server restarted under the run and did not run it again (runs.Interrupted).
+            if not dry:
+                from .runs import remember_interruption
+                remember_interruption(run['run_id'], st)
+            if not st.get("running") and st.get('status') == 'interrupted':
+                # The server settled the interruption without retrying the command.
                 status, code = 'interrupted', EXIT_INTERRUPTED
             elif not st.get("running") and st.get('status') in ('exited','lost'):
                 if st.get('status') == 'lost':

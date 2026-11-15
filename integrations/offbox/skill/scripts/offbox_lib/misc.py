@@ -296,7 +296,9 @@ def kill_run(run_id: str, me: dict | None = None) -> int:
             raise OffboxError(f"run {rid} belongs to another caller; only its owner can kill it", code=2)
     if r['status'] == 'forwarded':
         return _follow_forwarded(r, 'kill')
-    if r["status"] not in ("starting", "running"):
+    settled_home = (api.BACKEND == 'server' and r['status'] not in ('starting', 'running')
+                    and r['process_id'] and r['mode'] != 'local')
+    if r["status"] not in ("starting", "running") and not settled_home:
         raise OffboxError(f"run {rid} is already {r['status']}; nothing to kill", code=2)
     if r["mode"] == "local":
         raise OffboxError(f"run {rid} is a local run (no box); kill its process on this Mac instead", code=2)
@@ -309,7 +311,7 @@ def kill_run(run_id: str, me: dict | None = None) -> int:
             return result
     from . import start_check
     con = db()
-    if not start_check.api_pid(con, r) and start_check.recovery_marked(con, r) and r['box_id']:
+    if not settled_home and not start_check.api_pid(con, r) and start_check.recovery_marked(con, r) and r['box_id']:
         with file_lock('box-' + r['box_id'], timeout=1):
             r = _run_row(rid)
             if r['status'] not in ('starting', 'running'):
@@ -346,6 +348,8 @@ def kill_run(run_id: str, me: dict | None = None) -> int:
             return 1
     if not r["box_id"]:
         raise OffboxError(f"run {rid} has process {r['process_id']} but no box; cannot stop it", code=2)
+    if settled_home:
+        return _cleanup_settled_home(r)
     box, pid = r["box_id"], r["process_id"]
     # DELETE may fail (timeout) while the process is already gone, so the GET is the authority. Only a 404 (None)
     # or an explicit running:false counts as stopped; a DELETE error alone, an error on the GET, or an empty/unknown
@@ -395,7 +399,16 @@ def kill_run(run_id: str, me: dict | None = None) -> int:
             + f". The box may still be stopping it: re-run `offbox kill {rid}` (safe to repeat), "
               f"or check `offbox logs {rid}`.")
         return 1
-    finish(rid, 143, "killed", catch_up=False)
+    from .runs import _status_code, remember_interruption
+    code, final_status = 143, 'killed'
+    if st and st.get('status') in ('exited', 'interrupted'):
+        observed = _status_code(st)
+        if observed is not None:
+            code = observed
+            final_status = 'interrupted' if st['status'] == 'interrupted' else \
+                ('killed' if st.get('signal') or code in (137, 143) else 'done' if code == 0 else 'failed')
+            remember_interruption(rid, st)
+    finish(rid, code, final_status, catch_up=False)
     con = None
     try:
         con = db()
@@ -409,9 +422,28 @@ def kill_run(run_id: str, me: dict | None = None) -> int:
     finally:
         if con:
             con.close()
-    print(f"killed run {rid} (process {pid} on box {box}). `offbox release [--delete]` works now."
+    outcome = f"killed run {rid}" if final_status == 'killed' else f"run {rid} ended {final_status} exit={code}"
+    print(f"{outcome} (process {pid} on box {box}). `offbox release [--delete]` works now."
           + (f" (kill request failed but boat reports the process gone: {kill_err})" if kill_err else ""))
+    if isinstance((st or {}).get('cleanup'), dict):
+        from .runs import cleanup_summary, save_run_state
+        save_run_state(rid, cleanup=st['cleanup'])
+        print(cleanup_summary(st['cleanup']))
     return 0
+
+
+def _cleanup_settled_home(r):
+    from .runs import cleanup_summary, save_run_state
+    result = api.cmd_kill(r['box_id'], r['process_id'])
+    info = result.get('cleanup') if isinstance(result, dict) else None
+    info = info if isinstance(info, dict) else {}
+    save_run_state(r['run_id'], cleanup=info)
+    summary = cleanup_summary(info) + (' (0 stopped)' if info.get('cleanup') == 'clean' else '')
+    print(f"run {r['run_id']} (process {r['process_id']} on box {r['box_id']}): {summary}")
+    remaining = info.get('remaining')
+    count = info.get('leftover_killed')
+    known = info.get('cleanup') == 'clean' or (info.get('cleanup') == 'stopped' and type(count) is int and count >= 0)
+    return 0 if known and type(remaining) is int and remaining == 0 else 1
 
 
 def resolve_box(me: dict, box_id: str | None) -> str:
@@ -686,6 +718,7 @@ def _preamble_first(dst, stdout_bytes, run_id):
 
 
 def _catch_up_log_locked(r, path, budget, *, live=False) -> str:
+    from .runs import remember_interruption
     started = time.time()
     deadline = started + (30 if budget is None else budget)
     tmp = None
@@ -724,6 +757,7 @@ def _catch_up_log_locked(r, path, budget, *, live=False) -> str:
                     page = api.history_logs(r['box_id'], r['command_id'], which, offsets[i], deadline=deadline)
                     if time.time() >= deadline:
                         return 'incomplete:timeout'
+                    remember_interruption(r['run_id'], page)
                     if page.get('size') is not None:
                         sizes[i] = max(sizes[i], int(page['size']) - ck[which + 'Offset'])
                         if snapshot is None:
@@ -941,6 +975,8 @@ def logs(run_id: str, do_follow: bool) -> int:
     from . import resources
     resources.finalize(r)
     _tail(p, 0, True)
+    from .runs import report_interruption
+    report_interruption(r)
     from .runs import settled_steps_code, planned_steps
     code = settled_steps_code(r, r['exit_code'], catch_up=False, history_result=result)
     _incomplete_log(_validated_step_row(r, code), result)
@@ -1017,6 +1053,8 @@ def _settled(r, echo=False, pos=0, *, locked=False, until=None, show_failure=Fal
                 con.close()
     if not echo and code == 0:
         resources.display(r['run_id'])
+    from .runs import report_interruption
+    report_interruption(r)
     out(f"{r['run_id']}: {status} exit={code}" + resources.failure_suffix(r['run_id'], code))
     if code is None:
         from .run_evidence import report
@@ -1206,7 +1244,7 @@ def _holder_stuck(r, st, log_path, pos: int, echo: bool, deadline=None, *, show_
     """boat says the process ended, but the client holding the box lock never recorded it. Report boat's exit code
     instead of waiting on that client for ever. The row is left to its holder (or the reaper once the holder is gone).
     A lost process's recovery reads the box, so it is bounded by the caller's deadline like the rest of the wait."""
-    from .runs import _status_code, settled_steps_code
+    from .runs import _status_code, settled_steps_code, interruption_info, interruption_message
     code, how = _status_code(st), "boat's process status"
     if code is None:
         code, how = _recover_by(r, log_path, deadline)
@@ -1218,6 +1256,8 @@ def _holder_stuck(r, st, log_path, pos: int, echo: bool, deadline=None, *, show_
     failure = show_failure and not echo and r['mode'] == 'bg' and code not in (0, None)
     if failure:
         _failure_tail(log_path)
+    if st.get('status') == 'interrupted':
+        say(interruption_message(r['run_id'], interruption_info(st) or {}))
     say(f"{r['run_id']} ended on {r['box_id']} over {_grace(r)}s ago, but the offbox process following it has not "
         f"recorded the end (it looks stuck); exit {code} taken from {how}. Full output: offbox logs {r['run_id']}")
     out(f"{r['run_id']}: {'failed ' if failure else ''}exit={code}" + resources.failure_suffix(r['run_id'], code))
@@ -1443,9 +1483,11 @@ def _resolve_exit(r, log_path, until, start_offsets, replay_path, echo=True, mir
                       mirror_keep=mirror_keep, receipt_locked=True)
     except Interrupted as e:
         # Final on the server: the run will not go on. Recorded here so a later wait answers at once.
+        from .runs import remember_interruption
+        remember_interruption(r['run_id'], {'interruption': e.interruption})
         code = finish(r["run_id"], e.code, "interrupted")
         if code is None:
-            raise OffboxError(f"{r['run_id']}: steps incomplete after the server restart; remote exit unknown",
+            raise OffboxError(f"{r['run_id']}: steps incomplete after the interruption; remote exit unknown",
                               code=EXIT_INFRA, started=True) from None
         raise
     if code is None:

@@ -499,4 +499,4 @@ class BackgroundStartTests(Isolated):
                 runs.finish(runner.run_id, 3)
                 self.assertEqual(misc.logs(runner.run_id, False), 0)
             self.assertEqual(runner.log_path.read_text(),
-                             'hello\nerror\n\noffbox: box pressure unavailable · host boxes ?→? running\n')
+                             'hello\nerror\n\noffbox: box pressure unavailable · host boxes unknown\n')
