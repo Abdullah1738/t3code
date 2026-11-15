@@ -20,6 +20,7 @@ import {
   ProviderOptionSelection,
   TrimmedNonEmptyString,
 } from "@t3tools/contracts";
+import { ExactEdits } from "../engine/exactEdits.ts";
 import { Tool, Toolkit } from "effect/ai";
 import * as Schema from "effect/Schema";
 
@@ -849,13 +850,15 @@ const CardNext = tool(
 const CardEdit = tool(
   "card_edit",
   "Edit a card",
-  "Evaluators: change any card field. Links are added by URL and removeLinks takes them off by URL (both in one call replace a link); blockedBy replaces the list.",
+  "Evaluators: change any card field. Links are added by URL and removeLinks takes them off by URL (both in one call replace a link); blockedBy replaces the list. promptEdits / subtaskEdits: exact find-and-replace on the prompt / open subtask texts; each oldString must appear exactly count times (default 1) in the text as left by the edits before it; all apply or none do. Not with prompt / subtasks in the same call.",
   {
     boardId: BoardRef,
     card: CardRef,
     title: Schema.optional(Schema.String),
     description: Schema.optional(Schema.String),
     prompt: Schema.optional(Schema.String),
+    promptEdits: Schema.optional(ExactEdits),
+    subtaskEdits: Schema.optional(ExactEdits),
     priority: Schema.optional(
       describe(
         KanbanPriority,
@@ -1027,15 +1030,7 @@ const WikiWrite = tool(
     slug: TrimmedNonEmptyString,
     title: Schema.optional(RawBoardText),
     body: Schema.optional(Schema.String),
-    edits: Schema.optional(
-      Schema.Array(
-        Schema.Struct({
-          oldString: Schema.String.check(Schema.isMinLength(1)),
-          newString: Schema.String,
-          count: Schema.optional(PositiveInt),
-        }),
-      ).check(Schema.isMinLength(1), Schema.isMaxLength(50)),
-    ),
+    edits: Schema.optional(ExactEdits),
   },
   { page: Record },
   { readonly: false },

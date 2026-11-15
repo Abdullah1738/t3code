@@ -123,6 +123,7 @@ import * as Retries from "./retries.ts";
 import * as Rules from "./rules.ts";
 import * as Scribe from "./scribe.ts";
 import * as Subtasks from "./subtasks.ts";
+import { applyExactEdits, type ExactEdits } from "./exactEdits.ts";
 import { KanbanWaitPrs } from "./waitPrs.ts";
 import * as Waits from "./waits.ts";
 import * as Summaries from "./summaries.ts";
@@ -265,6 +266,8 @@ export interface CardPatch {
   readonly title?: string | undefined;
   readonly description?: string | undefined;
   readonly prompt?: string | undefined;
+  readonly promptEdits?: typeof ExactEdits.Type | undefined;
+  readonly subtaskEdits?: typeof ExactEdits.Type | undefined;
   readonly priority?: number | undefined;
   readonly goalId?: KanbanGoal["id"] | null | undefined;
   readonly projects?: ReadonlyArray<string> | undefined;
@@ -14697,7 +14700,7 @@ const make = Effect.gen(function* () {
 
   const editCard = (
     cardId: KanbanCard["id"],
-    patch: CardPatch,
+    inputPatch: CardPatch,
     actor: KanbanActor,
     instructionApplication?: InstructionApplication,
   ): ReturnType<KanbanServiceShape["editCard"]> => {
@@ -14707,8 +14710,43 @@ const make = Effect.gen(function* () {
     const editing = savedCardGuard(
       "card.update",
       Effect.gen(function* () {
-        yield* checkText(cardTextFields(patch));
         const card = yield* cardOf(cardId);
+        const { promptEdits, subtaskEdits, ...fields } = inputPatch;
+        let patch: CardPatch = fields;
+        if (promptEdits !== undefined) {
+          if (patch.prompt !== undefined)
+            return yield* failWith("invalid", "pass prompt or promptEdits, not both");
+          const prompt = (yield* applyExactEdits([card.prompt], promptEdits))[0]!;
+          yield* checkText([["prompt", prompt]]);
+          if (!prompt.trim()) return yield* failWith("invalid", "a card needs a prompt");
+          if (prompt !== card.prompt && prompt.trim() !== card.prompt) patch = { ...patch, prompt };
+        }
+        if (subtaskEdits !== undefined) {
+          if (patch.subtasks !== undefined)
+            return yield* failWith("invalid", "pass subtasks or subtaskEdits, not both");
+          const open = card.subtasks.filter((subtask) => subtask.state === "open");
+          const texts = yield* applyExactEdits(
+            open.map((subtask) => subtask.text),
+            subtaskEdits,
+          );
+          yield* checkText(texts.map((text) => ["subtask text", text] as const));
+          const changed = new Map(
+            open.flatMap((subtask, index) =>
+              texts[index]!.trim() === subtask.text ? [] : [[subtask.id, texts[index]!] as const],
+            ),
+          );
+          if (changed.size > 0)
+            patch = {
+              ...patch,
+              subtasks: card.subtasks.map((subtask) => ({
+                id: subtask.id,
+                ...(changed.has(subtask.id)
+                  ? { text: changed.get(subtask.id)!, script: subtask.script }
+                  : {}),
+              })),
+            };
+        }
+        yield* checkText(cardTextFields(patch));
         const currentWork =
           (card.activeRole === "work" ? card.activeThreadId : null) ?? card.workThreadId;
         if ((patch.model || patch.models) && currentWork !== lockedWork) {
@@ -14982,15 +15020,22 @@ const make = Effect.gen(function* () {
         yield* kick;
         return saved;
       }),
-      Object.keys(patch).every((key) =>
-        ["title", "description", "comment", "links", "removeLinks", "prompt", "projects"].includes(
-          key,
-        ),
+      Object.keys(inputPatch).every((key) =>
+        [
+          "title",
+          "description",
+          "comment",
+          "links",
+          "removeLinks",
+          "prompt",
+          "promptEdits",
+          "projects",
+        ].includes(key),
       )
         ? cardId
         : undefined,
     );
-    if (!patch.model && !patch.models) return editing;
+    if (!inputPatch.model && !inputPatch.models) return editing;
     // Keep the model lock through confirmation, commit and any restoration. A newer
     // edit must not switch its thread before an older edit has finished restoring it.
     return Effect.gen(function* () {
@@ -18038,24 +18083,7 @@ const make = Effect.gen(function* () {
         if (page.edits !== undefined) {
           if (current === undefined)
             return yield* failWith("invalid", `no wiki page ${slug}; create it with body`);
-          if (page.edits.length < 1 || page.edits.length > 50)
-            return yield* failWith("invalid", "edits must contain 1–50 entries");
-          for (const [index, edit] of page.edits.entries()) {
-            const expected = edit.count ?? 1;
-            if (edit.oldString.length === 0 || !Number.isSafeInteger(expected) || expected < 1)
-              return yield* failWith(
-                "invalid",
-                `edit ${index + 1} needs a non-empty oldString and a positive integer count`,
-              );
-            const parts = body.split(edit.oldString);
-            const found = parts.length - 1;
-            if (found !== expected)
-              return yield* failWith(
-                "invalid",
-                `edit ${index + 1}: expected ${expected}, found ${found} occurrences of "${edit.oldString.slice(0, 80)}"`,
-              );
-            body = parts.join(edit.newString);
-          }
+          body = (yield* applyExactEdits([body], page.edits))[0]!;
         }
         yield* checkText([["wiki body", body]]);
         const next: KanbanWikiPage = {
