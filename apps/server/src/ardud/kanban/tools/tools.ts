@@ -137,6 +137,12 @@ const SubtasksInput = describe(
           "Evaluator only: set on the install or restart subtask that interrupts running work; omit to preserve, false clears.",
         ),
       ),
+      service: Schema.optional(
+        describe(
+          Schema.NullOr(Schema.String),
+          "Evaluator only: the service this step restarts, e.g. robob-watch, agent-bridges, telegram-bridge, robob; the 4 h release window is counted per service across all boards. Omit to preserve; null clears. Requires interrupting: true.",
+        ),
+      ),
       ownerOnly: Schema.optional(
         describe(
           Schema.Boolean,
@@ -876,6 +882,12 @@ const SubtaskDone = tool(
     ),
     state: Schema.Literals(["done", "skipped", "open"]),
     note: Schema.optional(Schema.String),
+    releasedAt: Schema.optional(
+      describe(
+        IsoDateTime,
+        "When the restart actually happened, for ticking a release after the fact; it records that time and does not start a new window.",
+      ),
+    ),
   },
   { card: Record },
   { readonly: false },
