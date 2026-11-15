@@ -657,6 +657,12 @@ export function poolThreads(
 
 export type ReviewEvidence = NonNullable<Parameters<typeof kanbanReviewAlreadyDone>[1]>;
 
+export interface AssignmentWakeRetry {
+  readonly movedAt: string;
+  readonly attempts: number;
+  readonly retryAt: number;
+}
+
 /**
  * Fill free pool slots by effective urgency, reviews before todos at the same rank.
  * Within each role, pick order uses rank, holds, then oldest first.
@@ -686,6 +692,7 @@ export function planDispatch(
   attempted: ReadonlySet<string> = new Set(),
   reviews: ReadonlyMap<string, ReviewEvidence> = new Map(),
   workThreadHomes: ReadonlyMap<string, KanbanCard | null> = new Map(),
+  assignmentWakeRetries: ReadonlyMap<string, AssignmentWakeRetry> = new Map(),
 ): ReadonlyArray<Dispatch> {
   // A board's first setup holds all card work and review until the setup evaluator ends it.
   if (board.setup?.status === "running") return [];
@@ -705,6 +712,10 @@ export function planDispatch(
   const waiting = cards.filter(
     (card) =>
       !attempted.has(card.id) &&
+      !(
+        assignmentWakeRetries.get(card.id)?.movedAt === card.movedAt &&
+        clock < assignmentWakeRetries.get(card.id)!.retryAt
+      ) &&
       (kept === null || kept.has(card.id)) &&
       card.settledAt === null &&
       card.activeThreadId === null &&
