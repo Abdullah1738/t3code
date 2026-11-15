@@ -505,23 +505,24 @@ class GuardTests(unittest.TestCase):
                     self.adapters(command, SCRIPT)
 
     def test_foreign_state_sqlite_direct_reader_operands(self):
-        for path in ['/Users/ardud/.robob/other/state.sqlite',
-                     '/Users/ardud/.local/share/opencode/state.sqlite',
-                     '~/.config/spectrum-bridge/state.sqlite',
-                     '$HOME/.config/tool/state.sqlite', '${HOME}/state.sqlite', '/state.sqlite']:
+        for path, expected in [('/Users/ardud/.robob/other/state.sqlite', SCRIPT),
+                               ('/Users/ardud/.local/share/opencode/state.sqlite', SCRIPT),
+                               ('~/.config/spectrum-bridge/state.sqlite', None),
+                               ('$HOME/.config/tool/state.sqlite', None),
+                               ('${HOME}/state.sqlite', None), ('/state.sqlite', None)]:
             imports = 'import { DatabaseSync } from "node:sqlite";\nimport fs from "node:fs";\n'
             for reader in ['new DatabaseSync', 'fs.readFileSync']:
                 with self.subTest(path=path, reader=reader):
                     source = imports + f'{reader}({json.dumps(path)});\n'
                     script = self.write('tmp/direct-foreign.mjs', source)
-                    self.assertIsNone(self.classify('node ' + shlex.quote(str(script))))
-                    self.assertIsNone(self.classify("node - <<'JS'\n" + source + 'JS'))
+                    self.assertEqual(self.classify('node ' + shlex.quote(str(script))), expected)
+                    self.assertEqual(self.classify("node - <<'JS'\n" + source + 'JS'), READ if expected else None)
             for operand in [path, '"' + path + '"']:
                 with self.subTest(path=path, operand=operand):
                     command = 'sqlite3 -readonly ' + operand + ' "select 1"'
                     self.assertIsNone(self.classify(command))
                     script = self.write('tmp/direct-foreign.sh', command)
-                    self.assertIsNone(self.classify('zsh ' + shlex.quote(str(script)) + ' owner'))
+                    self.assertEqual(self.classify('zsh ' + shlex.quote(str(script)) + ' owner'), expected)
         source = ("import os, sqlite3\n"
                   "sqlite3.connect(os.path.expanduser('~/.config/spectrum-bridge/state.sqlite'))\n")
         script = self.write('tmp/direct-foreign.py', source)
@@ -531,6 +532,98 @@ class GuardTests(unittest.TestCase):
         stdin = "python3 -I - <<'PY'\n" + source + 'PY'
         self.assertIsNone(self.classify(stdin))
         self.adapters(stdin)
+
+    def test_foreign_state_sqlite_round_three_findings(self):
+        rows = [
+            ('open wrapper', 'mjs', 'node', 'node -',
+             "import { DatabaseSync } from 'node:sqlite';\n"
+             "function open(file) { return new DatabaseSync(file.replace('/other/', '/userdata/')); }\n"
+             "open('/Users/ardud/.robob/other/state.sqlite');\n"),
+            ('sqlite3 wrapper', 'sh', 'bash', 'bash -s',
+             'sqlite3() { command /usr/bin/sqlite3 "${1/other/userdata}"; }\n'
+             "sqlite3 '/Users/ardud/.robob/other/state.sqlite'\n"),
+            ('Bun filename reuse', 'mjs', 'bun', 'bun -',
+             "import { Database } from 'bun:sqlite';\nimport path from 'node:path';\n"
+             "const foreign = new Database('/Users/ardud/.robob/other/state.sqlite');\n"
+             "new Database(path.join(path.dirname(path.dirname(foreign.filename)), 'userdata', path.basename(foreign.filename)));\n"),
+        ]
+        for label, extension, runner, stdin_runner, source in rows:
+            with self.subTest(case=label):
+                script = self.write('tmp/round-three.' + extension, source)
+                command = runner + ' ' + shlex.quote(str(script)) + ' owner'
+                self.assertEqual(self.classify(command), SCRIPT)
+                self.adapters(command, SCRIPT)
+                stdin = stdin_runner + " <<'BODY'\n" + source + 'BODY'
+                self.assertEqual(self.classify(stdin), READ)
+                self.adapters(stdin, READ)
+
+    def test_foreign_state_sqlite_shadowed_readers(self):
+        path = '~/.config/spectrum-bridge/state.sqlite'
+        rows = [
+            ('function', 'mjs', 'node', 'node -', 'function open(f) { return f; }'),
+            ('const', 'mjs', 'node', 'node -', 'const open = f => f;'),
+            ('let', 'mjs', 'node', 'node -', 'let open = f => f;'),
+            ('var', 'mjs', 'node', 'node -', 'var open = f => f;'),
+            ('assignment', 'mjs', 'node', 'node -', 'open = f => f;'),
+            ('destructure', 'mjs', 'node', 'node -', 'const { open } = helpers;'),
+            ('import-as', 'mjs', 'node', 'node -', "import { helper as open } from './helper.js';"),
+            ('import-default', 'mjs', 'node', 'node -', "import open from './helper.js';"),
+            ('parameter', 'mjs', 'node', 'node -', 'function wrapper(open) { return open; }'),
+            ('def', 'py', 'python3 -I', 'python3 -I -', 'def open(f):\n    return f'),
+            ('python import-as', 'py', 'python3 -I', 'python3 -I -', 'from helpers import helper as open'),
+            ('shell function', 'sh', 'bash', 'bash -s', 'sqlite3() { cat "$1"; }'),
+            ('alias', 'sh', 'bash', 'bash -s', "alias sqlite3='cat'"),
+        ]
+        for label, extension, runner, stdin_runner, declaration in rows:
+            call = 'sqlite3 "' + path + '"' if extension == 'sh' else 'open(' + repr(path) + ')'
+            source = declaration + '\n' + call + '\n'
+            with self.subTest(case=label):
+                self.assertIsNone(guard.PROTECTED_SOURCE_TOKEN.search(source))
+                script = self.write('tmp/shadowed.' + extension, source)
+                command = runner + ' ' + shlex.quote(str(script)) + ' owner'
+                self.assertEqual(self.classify(command), SCRIPT)
+                self.adapters(command, SCRIPT)
+                stdin = stdin_runner + " <<'BODY'\n" + source + 'BODY'
+                self.assertEqual(self.classify(stdin), READ)
+                self.adapters(stdin, READ)
+
+        for name in ['Database', 'DatabaseSync', 'connect', 'readFileSync']:
+            source = f'function {name}(f) {{ return f; }}\n{name}({path!r});\n'
+            with self.subTest(reader=name):
+                script = self.write('tmp/shadowed-reader.mjs', source)
+                command = 'node ' + shlex.quote(str(script))
+                self.assertEqual(self.classify(command), SCRIPT)
+                self.adapters(command, SCRIPT)
+                stdin = "node - <<'JS'\n" + source + 'JS'
+                self.assertEqual(self.classify(stdin), READ)
+                self.adapters(stdin, READ)
+
+    def test_foreign_state_sqlite_protected_source_gate(self):
+        for token in ['.robob', '.t3', 'robob-data', 'userdata', 'opencode']:
+            for text in [token, token.upper()]:
+                source = ('import { DatabaseSync } from "node:sqlite";\n'
+                          'const cli = "/Users/ardud/.local/share/tool/cli.ts";\n'
+                          f'// prefix-{text}-suffix\n'
+                          'new DatabaseSync("~/.config/spectrum-bridge/state.sqlite");\n')
+                with self.subTest(token=text):
+                    script = self.write('tmp/protected-token.mjs', source)
+                    self.assertEqual(self.classify('node ' + shlex.quote(str(script))), SCRIPT)
+                    self.assertEqual(self.classify("node - <<'JS'\n" + source + 'JS'), READ)
+
+    def test_flighty_notify_exact_owner_command(self):
+        fixture = Path(__file__).with_name('fixtures') / 'flighty_notify.sh'
+        self.assertIsNone(guard.PROTECTED_SOURCE_TOKEN.search(fixture.read_text()))
+        standin = self.write('opencode/skills/flighty/scripts/flighty_notify.sh', fixture.read_text())
+        owner_path = Path.home() / '.config/opencode/skills/flighty/scripts/flighty_notify.sh'
+        realpath = os.path.realpath
+        def fixture_path(path, *args, **kwargs):
+            if os.path.abspath(path) == str(owner_path):
+                return str(standin)
+            return realpath(path, *args, **kwargs)
+        command = '~/.config/opencode/skills/flighty/scripts/flighty_notify.sh owner "EK366@2026-11-16:belt-7" "test"'
+        with patch.object(os.path, 'realpath', side_effect=fixture_path):
+            self.assertIsNone(self.classify(command))
+            self.adapters(command)
 
     def test_readonly_replica_scripts_and_live_near_misses(self):
         rows = [

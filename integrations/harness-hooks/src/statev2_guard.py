@@ -24,6 +24,7 @@ LIVE = re.compile(
     rf"(?:{re.escape(str(Path.home()))}|~|\$HOME|\$\{{HOME\}})/\.t3/userdata/(?:statev2|(?:[\w.-]+/)*state\.sqlite))"
 )
 DATABASE_NAME = re.compile(r"statev2(?:[.-][\w-]+)?\.sqlite|state\.sqlite|opencode\.db")
+PROTECTED_SOURCE_TOKEN = re.compile(r"\.robob|\.t3|robob-data|userdata|opencode", re.IGNORECASE)
 # Preserve the existing hidden-home fixture; new subpaths use plain segments.
 SHELL_FIXTURE_DATABASE = (r"(?:\.robob/userdata/|(?:[A-Za-z0-9_][A-Za-z0-9._-]*/)+)"
                           r"statev2(?:\.sqlite)?(?:-(?:wal|shm|journal))?")
@@ -177,6 +178,18 @@ def source_touches_live(source: str) -> bool:
                    if (value := _path_expression(node, bindings, aliases, partial=True)) is not None)
     except (SyntaxError, ValueError):
         return False
+
+
+def _foreign_reader_shadowed(source):
+    names = r'(?:open(?:Sync)?|sqlite3?|Database(?:Sync)?|connect|readFile(?:Sync)?|createReadStream)'
+    return bool(re.search(
+        rf'\b(?:function\s*\*?|class|def|alias)\s+{names}\b|'
+        rf'\b(?:const|let|var)\s+[^;\n=]*\b{names}\b|'
+        rf'\b{names}\s*=(?!=|>)|\b{names}\s*\([^()\n]*\)\s*\{{|'
+        rf'\b(?:as|import)\s+{names}\b|'
+        rf'\b(?:function|def)\b[^\n(]*\([^)]*\b{names}\b|'
+        rf'\([^()]*\b{names}\b[^()]*\)\s*=>|\b{names}\s*=>|'
+        rf'\bcatch\s*\(\s*{names}\b', source))
 
 
 def _foreign_state_source(source, directory):
@@ -1489,6 +1502,10 @@ def _replica_reader_source(source):
 
 
 def _source_hit(source, directory, python=False, shell=False):
+    # Inspect the original body, including literals/comments, never its path or argv.
+    discount_foreign = not PROTECTED_SOURCE_TOKEN.search(source)
+    if discount_foreign and 'state.sqlite' in source and _foreign_reader_shadowed(source):
+        return True
     # Keep the root evidence so the replica cannot hide a second database name.
     replica = REPLICA.search(source)
     if python:
@@ -1528,9 +1545,10 @@ def _source_hit(source, directory, python=False, shell=False):
     home_userdata = (not shell and re.search(r"\buserdata\b", source) and
                      re.search(r"\b(?:homedir|HOME|T3CODE_HOME)\b|\bPath\.home\b|['\"`]~(?:/|['\"`])", source))
     # A foreign operand may still supply a root for another database operand.
-    source = _foreign_state_source(source, directory)
-    if re.search(r'''\bsqlite3?\s+(?:-[\w-]+\s+)*['"]?[^'"\s;]*state\.sqlite''', source):
-        return True
+    if discount_foreign:
+        source = _foreign_state_source(source, directory)
+        if re.search(r'''\bsqlite3?\s+(?:-[\w-]+\s+)*['"]?[^'"\s;]*state\.sqlite''', source):
+            return True
     # Shell fixture proofs above discharge statev2/opencode paths, not other
     # database names that their setup may also list as data.
     database = re.search(r"statev2\.sqlite|opencode\.db", source) if shell else DATABASE_NAME.search(source)
@@ -2815,6 +2833,9 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         return value
 
     def scan_child(source, directory, depth):
+        # The shell walker cannot prove how a local reader rewrites its argument.
+        if 'state.sqlite' in source and _foreign_reader_shadowed(source):
+            check_source(source, directory, rule='live-database-read')
         previous = {name: set(values) for name, values in script_values.items()}
         previous_fresh = set(fresh_variables)
         script_values.clear()
