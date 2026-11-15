@@ -276,7 +276,8 @@ class StatusTests(unittest.TestCase):
         old = dict(day='2026-11-15', tool='mac', total=1, countsByName={'disk.sample': 1},
                    countsByKind={'perf': 1}, outcomes=1, okRate=1, errorRate=0, failedRate=0,
                    durationMs={'disk.sample': dict(p50=42, p95=42, max=42)}, malformed=1,
-                   topErrors=[], diskTooling=dict(probes=0, timeouts=0, maxDurationMs=None, latestBlockedIn=None))
+                   topErrors=[], uEpisodes=[],
+                   diskTooling=dict(probes=0, timeouts=0, maxDurationMs=None, latestBlockedIn=None))
         old.update(backup={key: dict(memory=0, health=0, other=0)
                            for key in ('skipped_runs', 'ok_runs', 'failed_runs')},
                    diskInventory=dict(scans=0, rootsOk=0, rootsPartial=0, rootsTimeout=0, rootsDenied=0, scanMs=0),
