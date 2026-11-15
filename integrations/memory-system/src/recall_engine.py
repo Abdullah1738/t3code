@@ -118,7 +118,7 @@ class CheckEngine:
             result["recall_ran"] = bool(selected)
         # First-prompt/compaction history is strictly bounded. An outward call
         # always checks rules above, even when optional transcript work is shed.
-        if trigger != "tool" and time.monotonic() - started < 1.8 and body.get("session_id"):
+        if trigger != "tool" and not result["note"] and time.monotonic() - started < 1.8 and body.get("session_id"):
             prompt = str(body.get("prompt") or "")[:6000]
             if trigger == "tool":
                 prompt = "remember earlier owner corrections " + tool + " " + json.dumps(arguments, default=str)[:3000]

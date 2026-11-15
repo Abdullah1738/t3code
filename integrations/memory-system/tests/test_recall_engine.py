@@ -143,6 +143,41 @@ class EngineTest(unittest.TestCase):
         compaction = self.engine.check(dict(trigger="compaction", cwd="/work", prompt="messaging Moni"))
         self.assertIn("Moni", compaction["note"])
 
+    def test_prompt_rule_notes_keep_instructions_and_citations_without_unused_history(self):
+        import robob_readonly as ro
+        from recall_note import bounded_note
+        from recall_rules import RuleIndex
+        self.addCleanup(ro.reset_replica_warnings)
+        warning = ("replica as of 2026-11-14T22:33:50.385Z; rebuild in progress since "
+                   "2026-11-14T22:43:15.751Z (orchestration_v2_projection_turn_items, 100000 rows)")
+        for repeats in (24, 0):
+            instruction = "When messaging Moni, never say 'as requested'. " + "Keep the explicit wording constraints from the owner. " * repeats
+            index = RuleIndex(self.root / f"rules-{repeats}.sqlite")
+            index.remember(instruction, actions=["message"], recipient="Moni", source_session="owner")
+            engine = CheckEngine(index.path)
+            for trigger in ("first_prompt", "compaction"):
+                with self.subTest(trigger=trigger, rule="near-limit" if repeats else "short"):
+                    ro.reset_replica_warnings()
+                    body = dict(trigger=trigger, request_id=trigger, session_id="fixture", cwd="/work",
+                                prompt="remember earlier messaging Moni wording constraints")
+                    preflight = engine.preflight(body)
+                    def unused_history(*args, **kwargs):
+                        ro._warnings.snapshots = {"fixture": {"warning": warning}}
+                        return {"note": "optional history", "sources": ["history"]}
+                    with patch("recall_admission.cheap_note", side_effect=unused_history) as history:
+                        first = engine.cached_check(body, preflight)
+                        ro.reset_replica_warnings()
+                        cached = engine.cached_check(body, preflight)
+                    for result in (first, cached):
+                        self.assertIn(instruction, result["note"])
+                        self.assertEqual(result["sources"], ["owner"])
+                        self.assertIsNotNone(bounded_note(result["note"]))
+                        if repeats:
+                            self.assertGreater(len(result["note"].encode()), 1300)
+                        self.assertNotIn("replica_warnings", result)
+                    self.assertTrue(cached["cached"])
+                    history.assert_not_called()
+
     def test_trigger_fixture_latencies_and_log_schema(self):
         timings = {trigger: [] for trigger in ("first_prompt", "compaction", "tool")}
         for trigger in timings:
