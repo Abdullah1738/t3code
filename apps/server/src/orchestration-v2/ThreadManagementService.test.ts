@@ -2220,6 +2220,113 @@ it.effect("reports a delegation queued behind a receipt-read fence as pending", 
   }),
 );
 
+it.effect("bounds failed delegation diagnostics and forgets them on service restart", () =>
+  Effect.gen(function* () {
+    const parent = ThreadId.make("parent:abandoned-create");
+    const firstId = CommandId.make("command:abandoned:0");
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let hold = false;
+    let defect = false;
+    let saved = false;
+    const receipt: CommandReceiptStore.CommandReceiptV2 = {
+      commandId: firstId,
+      threadId: parent,
+      commandType: "delegated_task.request",
+      acceptedAt: DateTime.makeUnsafe(0),
+      resultSequence: 1,
+      status: "accepted",
+      error: null,
+    };
+    const layerTest = ThreadManagementService.layer.pipe(
+      Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+      Layer.provide(ServerSettings.layerTest()),
+      Layer.provide(
+        Layer.mock(Orchestrator.OrchestratorV2)({
+          getThreadRecords: () => Effect.succeed(idleThreadProjection(liveThreadShell(parent))),
+          dispatch: (command) =>
+            Effect.gen(function* () {
+              if (hold) {
+                yield* Deferred.succeed(entered, undefined);
+                yield* Deferred.await(release);
+              }
+              if (defect) return yield* Effect.die(new Error("create defect"));
+              return yield* new Orchestrator.OrchestratorDispatchError({
+                commandId: command.commandId,
+                commandType: command.type,
+                cause: "failed create",
+              });
+            }),
+        }),
+      ),
+      Layer.provide(
+        Layer.mock(CommandReceiptStore.CommandReceiptStoreV2)({
+          getByCommandId: () => Effect.succeed(saved ? Option.some(receipt) : Option.none()),
+        }),
+      ),
+    );
+    const command = (commandId: CommandId) => ({
+      type: "delegated_task.request" as const,
+      commandId,
+      parentThreadId: parent,
+      parentRunId: RunId.make("run:abandoned-create"),
+      parentNodeId: NodeId.make("node:abandoned-create"),
+      task: "Review",
+      modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+      runtimeMode: "full-access" as const,
+      interactionMode: "default" as const,
+      createdBy: "agent" as const,
+      creationSource: "mcp" as const,
+    });
+    yield* Effect.gen(function* () {
+      const service = yield* ThreadManagementService.ThreadManagementService;
+      yield* service.dispatch(command(firstId)).pipe(Effect.exit);
+      const failed = yield* service.getDelegationCommandState(firstId);
+      expect(failed.status).toBe("abandoned");
+      if (failed.status !== "abandoned") return;
+      expect(failed.reason).toContain("failure: OrchestratorDispatchError:");
+      expect(failed.elapsedSeconds).toBe(0);
+      defect = true;
+      yield* service.dispatch(command(firstId)).pipe(Effect.exit);
+      const died = yield* service.getDelegationCommandState(firstId);
+      expect(died.status).toBe("abandoned");
+      if (died.status === "abandoned") expect(died.reason).toBe("defect: Error: create defect");
+      defect = false;
+      hold = true;
+      const retry = yield* service.dispatch(command(firstId)).pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      expect(yield* service.getDelegationCommandState(firstId)).toEqual({ status: "pending" });
+      const queuedRetry = yield* service.dispatch(command(firstId)).pipe(Effect.forkChild);
+      yield* TestClock.adjust(0);
+      yield* Fiber.interrupt(retry);
+      expect(yield* service.getDelegationCommandState(firstId)).toEqual({ status: "pending" });
+      yield* Fiber.interrupt(queuedRetry);
+      const interrupted = yield* service.getDelegationCommandState(firstId);
+      expect(interrupted.status).toBe("abandoned");
+      if (interrupted.status === "abandoned") expect(interrupted.reason).toBe("interrupt");
+      hold = false;
+      for (let index = 1; index <= 500; index++) {
+        yield* service
+          .dispatch(command(CommandId.make(`command:abandoned:${index}`)))
+          .pipe(Effect.exit);
+      }
+      expect(yield* service.getDelegationCommandState(firstId)).toEqual({ status: "never_saved" });
+      expect(
+        (yield* service.getDelegationCommandState(CommandId.make("command:abandoned:500"))).status,
+      ).toBe("abandoned");
+      saved = true;
+      expect(yield* service.getDelegationCommandState(firstId)).toEqual(receipt);
+      saved = false;
+    }).pipe(Effect.provide(layerTest));
+    yield* Effect.gen(function* () {
+      const restarted = yield* ThreadManagementService.ThreadManagementService;
+      expect(
+        yield* restarted.getDelegationCommandState(CommandId.make("command:abandoned:500")),
+      ).toEqual({ status: "never_saved" });
+    }).pipe(Effect.provide(Layer.fresh(layerTest)));
+  }),
+);
+
 it.effect("preserves a saved selection when the final foreground pre-check fails", () => {
   const harness = migrationHarness({ mode: "apply", failPreflightAfterSelection: true });
   return Effect.gen(function* () {
