@@ -799,6 +799,9 @@ export function createReadonlyReplica(
       rebuild.pages++;
       if (Date.now() - rebuild.loggedAt >= 30_000) rebuildEvent("progress");
     };
+    const heartbeatRebuild = () => {
+      if (rebuild && Date.now() - rebuild.loggedAt >= 30_000) rebuildEvent("progress");
+    };
     if (rebuildReason) {
       const lastReason = getMeta("last_rebuild_reason");
       const lastAt = Date.parse(getMeta("last_rebuild_at") ?? "");
@@ -1563,6 +1566,7 @@ export function createReadonlyReplica(
      * bounded page of whichever is pending. False when caught up to cycleTarget.
      */
     const catchUpWork = (): boolean => {
+      heartbeatRebuild();
       const cursor = Number(getMeta("sequence"));
       if (cursor < cycleTarget!) {
         eventRead(() => {
@@ -1871,7 +1875,10 @@ export function createReadonlyReplica(
           assertRedactionComplete();
           validate();
           publishIdentities();
-          return stepOnce();
+          const more = stepOnce();
+          // Dirty-item and archive catch-up pages can outlast the table-copy phase.
+          heartbeatRebuild();
+          return more;
         } catch (error) {
           // Discarding a routine cycle leaves the in-memory cursors ahead of
           // the replica; this exporter must be reopened. Readers keep the last

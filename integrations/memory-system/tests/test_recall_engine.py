@@ -61,6 +61,32 @@ class RulePreflightOffTest(unittest.TestCase):
             body = dict(trigger="tool", tool="shell", arguments={"command": "git push origin HEAD:main"}, cwd=self.fixture.cwd)
             self.assertEqual("deny", self.engine.preflight(body)[2]["decision"])
 
+    def test_cached_prompt_notes_keep_replica_warning_and_native_budget(self):
+        import recall_core as rc
+        from recall_note import bounded_note, MAX_NOTE_BYTES, PREFIX, SUFFIX
+        warning = "replica as of old; rebuild in progress since started (threads, 250 rows)"
+        for trigger in ("first_prompt", "compaction"):
+            for note in ("short history", "é" * 740):
+                with self.subTest(trigger=trigger, bytes=len(note.encode())):
+                    rc.robob_readonly.reset_replica_warnings()
+                    body = dict(trigger=trigger, request_id=f"{trigger}:{len(note)}", prompt="remember earlier", session_id="fixture")
+                    def recalled(*args, **kwargs):
+                        rc.robob_readonly._warnings.snapshots = {"fixture": {"warning": warning}}
+                        return {"note": note, "sources": ["fixture"]}
+                    with patch("recall_admission.cheap_note", side_effect=recalled) as read:
+                        first = self.engine.cached_check(body)
+                        rc.robob_readonly.reset_replica_warnings()
+                        cached = self.engine.cached_check(body)
+                        self.assertEqual(read.call_count, 1)
+                    self.assertTrue(cached["cached"])
+                    self.assertEqual(first["note"], cached["note"])
+                    self.assertEqual(first["replica_warnings"], cached["replica_warnings"])
+                    self.assertIn(warning, cached["note"])
+                    self.assertIsNotNone(bounded_note(cached["note"]))
+                    self.assertLessEqual(len((PREFIX + cached["note"] + SUFFIX).encode()), MAX_NOTE_BYTES)
+                    self.assertEqual(rc.robob_readonly.annotate_result(cached)["note"], cached["note"])
+        rc.robob_readonly.reset_replica_warnings()
+
 
 class EngineTest(unittest.TestCase):
     """The rule index path, which is dormant unless RECALL_RULE_PREFLIGHT=1."""

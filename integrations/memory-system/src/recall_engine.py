@@ -203,6 +203,7 @@ class CheckEngine:
         return self._finish(result, str(body.get("tool") or "")[:300], time.monotonic())
 
     def _finish(self, result, tool, started):
+        result = rc.robob_readonly.annotate_result(result)
         result["note"] = bounded_note(result.get("note"))
         result["latency_ms"] = int((time.monotonic() - started) * 1000)
         record = {key: result.get(key) for key in ("trigger", "p", "cost", "latency_ms", "classifier", "recall_ran", "decision", "sources", "rules_error", "reason", "cwd")}
