@@ -47,7 +47,7 @@ _ENUMS = {
               'nearby', 'delivered', 'cancelled', 'pending confirmation'},
 }
 _ENUMS['from'] = _ENUMS['to'] = _ENUMS['state']
-_BOOLS = {'prepareOnly', 'changed', 'fallback', 'budgetHit', 'unmatched', 'deadlineMoved', 'answered'}
+_BOOLS = {'prepareOnly', 'changed', 'fallback', 'budgetHit', 'unmatched', 'deadlineMoved', 'answered', 'polled'}
 _NUMBERS = {'exitCode', 'amountMinor', 'count', 'ageDays', 'openCases', 'fired', 'sourceLimits',
             'merchants_ms', 'order_charges_ms', 'payments_ms', 'questions_ms', 'refunds_ms',
             'order_screen_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'locks_ms', 'follow_ms', 'untimed_ms',
@@ -197,6 +197,21 @@ OrderError'''.split())
 _SCHEMA_REASONS = frozenset('''SCHEMA_CHANGED RESPONSE_SCHEMA_CHANGED
 ORDER_MISMATCH_OR_SCHEMA_CHANGED ORDER_ITEM_SCHEMA_CHANGED ORDER_MISMATCH
 ORDER_IDENTITY_UNVERIFIED INCOMPLETE_MANIFEST DUPLICATE_JSON_KEY'''.split())
+_AMAZON_PHASES = {
+    'session_open': '/amazon/session/open',
+    'order_list': '/amazon/mail/search',
+    'order_detail': '/amazon/mail/read',
+    'parse': '/amazon/mail/parse',
+}
+_ENDPOINTS |= frozenset(_AMAZON_PHASES.values())
+
+
+def _phase_cause(cause, phase, elapsed_ms):
+    if (type(phase) is str and phase in _AMAZON_PHASES
+            and type(elapsed_ms) in (int, float) and math.isfinite(elapsed_ms)
+            and 0 <= elapsed_ms <= 10**12):
+        cause.update(phase=phase, phaseElapsedMs=round(elapsed_ms, 3))
+    return cause
 
 
 def _endpoint(value):
@@ -270,6 +285,7 @@ def _record_failure(scope, *, exc=None, result=None):
                        _body_code(result) if 'failure' not in scope else None))
     cause['exceptionClass'] = observed.get('exceptionClass') or cause['exceptionClass']
     cause['retryable'] |= observed.get('retryable') is True
+    _phase_cause(cause, observed.get('phase'), observed.get('phaseElapsedMs'))
     if 'reason' not in cause and observed.get('reason'):
         cause['reason'] = observed['reason']
     # Tracker rows are emitted after provider wrappers return or their errors
@@ -287,6 +303,39 @@ def error_recorder():
     return record
 
 
+def operation_recorder():
+    # Capture before mail workers start; their ContextVars do not inherit ours.
+    scopes = _SCOPES.get()
+    @contextlib.contextmanager
+    def operation(name):
+        start = perf_counter()
+        end = None
+        def failed(exc=None, *, upstream_code=None, phase=None, elapsed_ms=None):
+            # The mail helper may identify a session timeout inside the search.
+            safe_phase = _phase_cause({}, phase, elapsed_ms)
+            observed = safe_phase.get('phase', name)
+            elapsed = safe_phase.get('phaseElapsedMs',
+                                     ((end if end is not None else perf_counter()) - start) * 1000)
+            cause = _phase_cause(_cause(exc, endpoint=_AMAZON_PHASES.get(observed),
+                                       attempt=1, upstream_code=upstream_code),
+                                 observed, elapsed)
+            for scope in scopes:
+                scope['failure'] = cause
+        try:
+            yield failed
+        except Exception as exc:
+            failed(exc)
+            raise
+        finally:
+            end = perf_counter()
+    return operation
+
+
+def poll_observation(props):
+    if _SCOPES.get():
+        _SCOPES.get()[-1]['props'].update(_fields(props))
+
+
 def _error(code, cause):
     reason = cause.get('reason')
     reason = reason if type(reason) is str and reason in _SCHEMA_REASONS else None
@@ -294,17 +343,18 @@ def _error(code, cause):
                   attempt=cause.get('attempt'), upstream_code=cause.get('upstreamCode'))
     safe['exceptionClass'] = cause.get('exceptionClass') if cause.get('exceptionClass') in _EXCEPTIONS else None
     safe['retryable'] = cause.get('retryable') is True
+    _phase_cause(safe, cause.get('phase'), cause.get('phaseElapsedMs'))
     cause = safe
     message = code
     if cause['httpStatus'] is not None:
         message = 'HTTP ' + str(cause['httpStatus'])
         if reason or cause['upstreamCode']:
             message += ': ' + (reason or cause['upstreamCode'])
+    elif reason or cause['upstreamCode']:
+        message = reason or cause['upstreamCode']
     elif cause['retryable'] and cause['exceptionClass']:
         # Without an HTTP status, only a recognized timeout is retryable.
         message = 'Upstream request timed out'
-    elif reason or cause['upstreamCode']:
-        message = reason or cause['upstreamCode']
     return {'tag': code, 'message': message[:200], 'cause': cause}
 
 
@@ -424,6 +474,11 @@ def _fields(props):
             result[key] = {k: round(v, 3) for k, v in value.items()
                            if k in {'fetchMs', 'parseMs', 'otherMs'} and type(v) in (int, float)
                            and math.isfinite(v) and 0 <= v <= 10**12}
+        elif key in {'consecutive_failures', 'poll_interval_s'} and type(value) is int and 0 <= value <= 10**12:
+            result[key] = value
+        elif key == 'last_success_at' and (value is None or (type(value) is str and re.fullmatch(
+                r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})', value))):
+            result[key] = value
     return result
 
 
@@ -630,6 +685,7 @@ def rollup(day=None):
             return None
         counts, kinds, durations, errors, polls = {}, {}, {}, {}, {}
         component_totals, component_errors, component_samples, component_durations = {}, {}, {}, {}
+        order_failures, poll_counts = {}, {}
         total = oks = failures = error_lines = invalid = source_bytes = 0
         path = folder / (day + '.ndjson')
         if path.exists():
@@ -660,6 +716,20 @@ def rollup(day=None):
                     component_samples.setdefault(component, {})
                     value = row.get('durationMs')
                     merchant = _fields(row.get('props')).get('merchant', 'unknown')
+                    # Count the poll outcome once, not its provider and track.error rows.
+                    if (component == 'order-watch' and name == 'track.poll' and type(row.get('ok')) is bool
+                            and (row.get('props') or {}).get('polled') is not False):
+                        poll_merchant = merchant if merchant in {'noon', 'careem', 'amazon', 'uber', 'other'} else 'unknown'
+                        poll = poll_counts.setdefault(poll_merchant, {'count': 0, 'failed': 0})
+                        poll['count'] += 1
+                        poll['failed'] += row['ok'] is False
+                    identity = row.get('ids')
+                    order_id = identity.get('orderId') if isinstance(identity, dict) else None
+                    if (kind == 'error' and name in {'track.poll', 'provider.track', 'provider.details'}
+                            and (row.get('props') or {}).get('polled') is not False
+                            and type(order_id) is str and re.fullmatch(r'[a-f0-9]{16}', order_id)):
+                        orders = order_failures.setdefault(component, {})
+                        orders[order_id] = orders.get(order_id, 0) + 1
                     if type(value) in (float, int) and math.isfinite(value):
                         durations.setdefault(name, []).append(value)
                         if name == 'track.poll':
@@ -717,6 +787,13 @@ def rollup(day=None):
                         for code, count in sorted(component_errors[component].items(),
                                                   key=lambda item: (-item[1], item[0]))[:5]]
             for component in sorted(component_totals)}
+        result['topOrderFailuresByComponent'] = {
+            component: [{'orderId': order_id, 'count': count} for order_id, count in
+                        sorted(orders.items(), key=lambda item: (-item[1], item[0]))[:5]]
+            for component, orders in sorted(order_failures.items())}
+        result['pollsByMerchant'] = {
+            merchant: {**poll, 'failureShare': poll['failed'] / poll['count']}
+            for merchant, poll in sorted(poll_counts.items())}
         _private_directory(folder)
         target = folder / ('rollup-' + day + '.json')
         fd, temporary = tempfile.mkstemp(prefix='.rollup-', dir=folder)
@@ -750,7 +827,8 @@ def previous_day_rollup():
         if (not isinstance(previous, dict) or previous.get('sourceBytes') != size
                 or previous.get('schemaVersion') != 2
                 or not all(key in previous for key in (
-                    'errorsByComponent', 'failureShare', 'topErrorSamplesByComponent'))):
+                    'errorsByComponent', 'failureShare', 'topErrorSamplesByComponent',
+                    'topOrderFailuresByComponent', 'pollsByMerchant'))):
             rollup(day)
     except Exception:
         pass

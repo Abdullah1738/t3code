@@ -589,8 +589,19 @@ export const approvalProblem = (
       const answer = ask.answer;
       if (!ask.closedAt || !answer || answer.at < since) return false;
       if (answer.verdict !== "dropped") {
-        if (answer.by._tag !== "owner" || (ask.revisedAt ?? ask.at) < since) return false;
+        // Closing clears handedAt; direct-to-evaluator asks retain their `to` instead.
+        const handedSkip =
+          intent === "skip" &&
+          answer.verdict === "handed" &&
+          answer.by._tag === "evaluator" &&
+          ask.to !== "evaluator";
+        if ((answer.by._tag !== "owner" && !handedSkip) || (ask.revisedAt ?? ask.at) < since)
+          return false;
         if (ask.draft) return false;
+        if (handedSkip) {
+          const wording = `${askWording(ask)} ${answer.text ?? ""} ${answer.note ?? ""}`;
+          return new Set(wording.match(/\bs\d+\b/g) ?? []).has(subtask.id);
+        }
       }
       // Explicit scopes replace wording matching for the entire ask, including other options.
       if (ask.options?.some((option) => optionScopeIds(card, option) !== undefined)) {
@@ -636,12 +647,21 @@ export const approvalProblem = (
     ? `${unnamedApproval.id} was approved but doesn't name ${subtask.id}; ask again naming the subtask id (e.g. "Approve ${subtask.id}")`
     : `no owner answer on a ${gate} ask since ${since}; ask with card_ask naming ${subtask.id} (e.g. "Approve ${subtask.id}: <step>")`;
   if (intent === "skip") {
-    if (answer && answer.verdict !== "dropped" && answer.by._tag === "owner") return null;
+    if (
+      answer &&
+      answer.verdict !== "dropped" &&
+      (answer.by._tag === "owner" || answer.verdict === "handed")
+    )
+      return null;
     const reason =
       answer?.verdict === "dropped"
         ? `the latest decision, ${latest!.id}, was dropped (a dropped ask is not approval)`
         : `${noDecisionReason}; no owner answer on a ${gate} ask since ${since}; name the subtask id (e.g. s7) in the ask or set approves: [${subtask.id}] on the go option`;
-    return `card #${card.number} subtask ${subtask.id} (${gate}: ${subtask.text}) needs Abdullah's answer before it can be skipped: ${reason}${standingReason}${clearGuidance}`.replace(
+    const handedGuidance =
+      answer?.verdict !== "dropped" && card.asks.some((ask) => ask.answer?.verdict === "handed")
+        ? "; a handed answer must name the subtask id and come from an ask the owner handed to the evaluator"
+        : "";
+    return `card #${card.number} subtask ${subtask.id} (${gate}: ${subtask.text}) needs Abdullah's answer before it can be skipped: ${reason}${standingReason}${clearGuidance}${handedGuidance}`.replace(
       /[\r\n]+/g,
       " ",
     );
@@ -683,6 +703,16 @@ export const approvalProblem = (
 
 export const MAX_SUBTASKS = 30;
 export const MAX_TEXT = 500;
+
+// Only complete generic instructions have unambiguous sentence punctuation; arguments stay literal.
+const approvalProse =
+  /^(?:(?:deploy|install) the (?:build|release)|restart the (?:helper|service|server)|pay the invoice|rotate the API key)[.!;:]*$/;
+
+const approvalText = (text: string) => {
+  const normalized = text.trim().replace(/\s+/g, " ");
+  const prose = normalized.replace(/^\w+/, (verb) => verb.toLowerCase());
+  return approvalProse.test(prose) ? prose.replace(/[.!;:]+$/, "") : normalized;
+};
 
 export interface SubtaskInput {
   /** An existing id alone keeps the subtask unchanged; leave out for a new one. */
@@ -911,6 +941,12 @@ export function planSubtasks(
           : keepClear
             ? known.gateCleared
             : undefined;
+      // Cosmetic edits keep the approval's time bound, including its absence on legacy plans.
+      const approvalChanged =
+        gate !== previousGate ||
+        (input.gate != null && gateSource === "set" && known.gateSource !== "set") ||
+        script !== known.script ||
+        approvalText(text) !== approvalText(known.text);
       planned.push({
         ...rest,
         step,
@@ -920,16 +956,7 @@ export function planSubtasks(
         ...(interrupting === undefined ? {} : { interrupting }),
         ...(gate === undefined || clearing ? {} : { gate, gateSource }),
         ...(gateCleared ? { gateCleared } : {}),
-        ...((text !== known.text ||
-          script !== known.script ||
-          ownerOnly !== known.ownerOnly ||
-          interrupting !== known.interrupting ||
-          gate !== previousGate ||
-          !previousGate) &&
-        gate &&
-        at
-          ? { createdAt: at }
-          : {}),
+        ...(approvalChanged && gate && !clearing && at ? { createdAt: at } : {}),
         ...(script ? { script } : {}),
       });
     } else {

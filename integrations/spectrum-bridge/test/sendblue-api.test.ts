@@ -13,6 +13,7 @@ function deps(overrides: Partial<SbApiDeps> = {}): SbApiDeps & { wakes: string[]
   const line = {
     requestLocation: async (chat: string) => { requested.push(chat); },
     location: async () => ({ latitude: 25.2, longitude: 55.3, accuracy: 9 }),
+    setOptOut: async () => {},
   } as unknown as Line;
   const sessions: Record<string, ChatInfo> = { "ses-owner": owner, "ses-moni": moni, "ses-family": family };
   return {

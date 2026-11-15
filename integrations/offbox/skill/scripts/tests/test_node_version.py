@@ -19,14 +19,14 @@ TOP = node_version.TOP
 class ParserTests(unittest.TestCase):
     def test_nvmrc_cases(self):
         p = node_version.parse_nvmrc
-        self.assertEqual(p("22.13"), [(K(22, 13), K(23))])
-        self.assertEqual(p("v22.13.0"), [(K(22, 13), K(23))])
+        self.assertEqual(p("22.13"), [(K(22, 13), K(22, 14))])
+        self.assertEqual(p("v22.13.0"), [(K(22, 13), K(22, 13) + 1)])
         self.assertEqual(p("22"), [(K(22), K(23))])
         self.assertEqual(p("lts/jod"), [(K(22), K(23))])
         self.assertIsNone(p("lts/*"))
         self.assertIsNone(p("node"))
         self.assertIsNone(p(""))
-        self.assertEqual(p("# c\n20.11.1\n"), [(K(20, 11, 1), K(21))])
+        self.assertEqual(p("# c\n20.11.1\n"), [(K(20, 11, 1), K(20, 11, 1) + 1)])
         self.assertIsNone(p("abc"))
 
     def test_engines_cases(self):
@@ -80,14 +80,14 @@ class WantTests(unittest.TestCase):
         self.pkg('^24.13.1')
         self.write('sub/.nvmrc', '22.13\n')
         ranges, label = node_version.want(self.root, self.root / 'sub')
-        self.assertEqual(ranges, [(K(22, 13), K(23))])
+        self.assertEqual(ranges, [(K(22, 13), K(22, 14))])
         self.assertEqual(label, 'sub/.nvmrc 22.13')
 
     def test_nvmrc_and_engines_intersect(self):
         self.write('.nvmrc', '22.13.0\n')
         self.pkg('>=22.13 <23')
         ranges, label = node_version.want(self.root, self.root)
-        self.assertEqual(ranges, [(K(22, 13), K(23))])
+        self.assertEqual(ranges, [(K(22, 13), K(22, 13) + 1)])
         self.assertIn('.nvmrc 22.13.0', label)
         self.assertIn('package.json engines >=22.13 <23', label)
 
@@ -101,8 +101,8 @@ class WantTests(unittest.TestCase):
     def test_node_version_file_used_without_nvmrc(self):
         self.write('.node-version', '22.13.0\n')
         ranges, label = node_version.want(self.root, self.root)
-        self.assertEqual(ranges, [(K(22, 13), K(23))])
-        self.assertEqual(label, '.node-version 22.13.0')
+        self.assertEqual(ranges, [(K(22, 13), K(22, 13) + 1)])
+        self.assertEqual(label, '.node-version 22.13.0 (exact)')
 
     def test_unusable_inputs_give_none(self):
         self.write('package.json', '{not json')
@@ -407,7 +407,7 @@ class BlockRunTests(unittest.TestCase):
         self.assertEqual(r.returncode, 99)
 
 class ProvisionTests(unittest.TestCase):
-    def run_provision(self, pin='v20', engine='^20.19.0 || >=22.12.0 <23', installed=(), fail=False, retry='once', system='v24.22.1', checksum_bad=False, require_nvm=False, workflow=None):
+    def run_provision(self, pin='v20', engine='^20.19.0 || >=22.12.0 <23', installed=(), fail=False, retry='once', system='v24.22.1', checksum_bad=False, require_nvm=False, workflow=None, nvm_hook=''):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); repo = root / 'repo'; repo.mkdir()
             if workflow is None:
@@ -421,23 +421,24 @@ class ProvisionTests(unittest.TestCase):
             fake_nvm(tmp, installed)
             bindir = root / 'bin'; bindir.mkdir()
             node = bindir / 'node'; node.write_text(FAKE.format(v=system)); node.chmod(0o755)
-            (root / 'index.tab').write_text('version date\nv24.22.1 1\nv22.23.2 1\nv22.12.0 1\nv20.20.2 1\nv20.18.0 1\n')
+            (root / 'index.tab').write_text('version date\nv24.22.1 1\nv22.23.5 1\nv22.23.2 1\nv22.13.9 1\nv22.13.0 1\nv22.12.0 1\nv20.20.2 1\nv20.18.0 1\n')
             body = b'node archive fixture'
             (root / 'archive').write_bytes(body)
             digest = '0' * 64 if checksum_bad else hashlib.sha256(body).hexdigest()
-            (root / 'sums').write_text(''.join(f'{digest}  node-{v}-linux-x64.tar.xz\n' for v in ('v20.20.2', 'v22.23.2', 'v24.22.1')))
+            (root / 'sums').write_text(''.join(f'{digest}  node-{v}-linux-x64.tar.xz\n' for v in ('v20.20.2', 'v22.13.0', 'v22.13.9', 'v22.23.2', 'v22.23.5', 'v24.22.1')))
             (root / 'nvm-fixture.sh').write_text(r'''
 nvm_get_download_slug() { echo node-$3-linux-x64; }
 nvm_get_artifact_compression() { echo tar.xz; }
 nvm() {
   [ "$1" = install ] || return 88
   [ "$2" = -b ] || return 89
+  @NVM_HOOK@
   mkdir -p "$NVM_DIR/versions/node/$3/bin"
   [ "$NVM_FAIL" = 1 ] && return 1
   printf '#!/bin/sh\necho %s\n' "$3" > "$NVM_DIR/versions/node/$3/bin/node"
   chmod +x "$NVM_DIR/versions/node/$3/bin/node"
 }
-''')
+'''.replace('@NVM_HOOK@', nvm_hook))
             curl = bindir / 'curl'; curl.write_text(r'''#!/bin/bash
 count=$(cat "$HOME/count" 2>/dev/null || echo 0); count=$((count+1)); echo "$count" > "$HOME/count"
 case " $* " in *" --connect-timeout 20 --speed-limit 30720 --speed-time 60 --max-time 600 "*) ;; *) exit 88 ;; esac
@@ -450,7 +451,7 @@ case "$url" in */nvm.sh) cp "$HOME/nvm-fixture.sh" "$out" ;; */index.tab) cp "$H
 '''); curl.chmod(0o755)
             script = node_version.block(node_version.want(repo, repo), require_nvm=require_nvm) + '\necho COMMAND_MARKER\nnode --version'
             result = subprocess.run(['bash', '-c', script], env={'HOME': tmp, 'PATH': f'{bindir}:/usr/bin:/bin',
-                'NVM_FAIL': str(int(fail)), 'CURL_FAIL': retry}, capture_output=True, text=True, timeout=15)
+                'NVM_FAIL': str(int(fail)), 'CURL_FAIL': retry, 'OFFBOX_BOX_ID': 'bx_fixture'}, capture_output=True, text=True, timeout=15)
             count = int((root / 'count').read_text()) if (root / 'count').exists() else 0
             if fail:
                 self.assertFalse((root / '.nvm/versions/node/v20.20.2').exists())
@@ -461,7 +462,7 @@ case "$url" in */nvm.sh) cp "$HOME/nvm-fixture.sh" "$out" ;; */index.tab) cp "$H
         for pin, engine, installed, expected in [
             ('v20', '^20.19.0 || >=22.12.0 <23', ('v22.23.2', 'v24.22.1'), 'v20.20.2'),
             ('v20', '^20.19.0 || >=22.12.0 <23', (), 'v20.20.2'),
-            ('22.13', '>=22.13 <23', (), 'v22.23.2'),
+            ('22.13', '>=22.13 <23', (), 'v22.13.9'),
         ]:
             with self.subTest(pin=pin, installed=installed):
                 result, count = self.run_provision(pin, engine, installed)
@@ -472,11 +473,16 @@ case "$url" in */nvm.sh) cp "$HOME/nvm-fixture.sh" "$out" ;; */index.tab) cp "$H
                 self.assertEqual(count, 5)
 
     def test_crpko_devops_ci_only_provisions_22_over_box_24(self):
-        result, count = self.run_provision(workflow='jobs:\n  test:\n    steps:\n      - uses: actions/setup-node@v4\n        with:\n          node-version: 22\n')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('offbox: node v22.23.2 (installed: .github/workflows/terraform-dev.yml node-version 22)', result.stderr)
-        self.assertEqual(result.stdout.splitlines(), ['COMMAND_MARKER', 'v22.23.2'])
-        self.assertEqual(count, 5)
+        for pin, expected in [('22', 'v22.23.5'), ('22.23', 'v22.23.5'),
+                              ('22.13', 'v22.13.9'), ('22.13.0', 'v22.13.0')]:
+            with self.subTest(pin=pin):
+                result, count = self.run_provision(workflow='jobs:\n  test:\n    steps:\n'
+                    '      - uses: actions/setup-node@v4\n        with:\n'
+                    f'          node-version: {pin}\n')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f'offbox: node {expected} (installed: .github/workflows/terraform-dev.yml node-version {pin})', result.stderr)
+                self.assertEqual(result.stdout.splitlines(), ['COMMAND_MARKER', expected])
+                self.assertEqual(count, 5)
 
     def test_ci_unpublished_version_stops_before_command(self):
         result, _ = self.run_provision(workflow='node-version: 19')

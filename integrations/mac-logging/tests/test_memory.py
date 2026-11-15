@@ -17,7 +17,7 @@ import toollog
 FIXTURES = Path(__file__).parent / 'fixtures/memory'
 # Captured on 14 Nov; top-incident substitutes the reported fseventsd 38G/34G row.
 TOP = (FIXTURES / 'top-incident.txt').read_text()
-FULL_TOP = TOP + '42 Robob 100M 32M 0.0\n43 codex 100M 32M 0.0\n44 opencode 100M 32M 0.0\n'
+FULL_TOP = TOP + '42 Robob 100M 32M\n43 codex 100M 32M\n44 opencode 100M 32M\n'
 VM = (FIXTURES / 'vm_stat.txt').read_text()
 SWAP = (FIXTURES / 'swap.txt').read_text()
 IO = (FIXTURES / 'iostat.txt').read_text()
@@ -103,11 +103,11 @@ class MemoryTests(unittest.TestCase):
 
     def test_top_incident_and_spaced_truncated_names(self):
         rows = memory.parse_top(TOP)
-        self.assertEqual(rows[0], dict(pid=1227, command='fseventsd', memMb=38912, cmprsMb=34816, cpu=0))
-        text = 'PID COMMAND MEM CMPRS %CPU\n2 Robob Helper (Re 1024K+ 0B- 1.5\n'
-        self.assertEqual(memory.parse_top(text), [dict(pid=2, command='Robob Helper (Re', memMb=1, cmprsMb=0, cpu=1.5)])
-        for text in ('invalid', 'PID COMMAND MEM CMPRS %CPU\n2 Finder wrong 0B 0.0',
-                     'PID COMMAND MEM CMPRS %CPU\n2 Finder 1M 0B nan'):
+        self.assertEqual(rows[0], dict(pid=1227, command='fseventsd', memMb=38912, cmprsMb=34816))
+        text = 'PID COMMAND MEM CMPRS\n2 Robob Helper (Re 1024K+ 0B-\n'
+        self.assertEqual(memory.parse_top(text), [dict(pid=2, command='Robob Helper (Re', memMb=1, cmprsMb=0)])
+        for text in ('invalid', 'PID COMMAND MEM CMPRS\n2 Finder wrong 0B',
+                     'PID COMMAND MEM CMPRS\n2 Finder 1M nan'):
             with self.subTest(text=text), self.assertRaises(memory.ProbeError):
                 memory.parse_top(text)
         self.assertEqual(len(memory.parse_top((FIXTURES/'top.txt').read_text())), 15)
@@ -204,15 +204,15 @@ class MemoryTests(unittest.TestCase):
 
     def test_top15_and_watched_share_one_full_snapshot(self):
         # fseventsd is below all15 large holders and its label is truncated.
-        top='PID COMMAND MEM CMPRS %CPU\n'+''.join(
-            '%s big-holder 500M 10M 0.0\n' % pid for pid in range(100,115))
-        top+='1227 fsevents 6M 2M 1.5\n'
+        top='PID COMMAND MEM CMPRS\n'+''.join(
+            '%s big-holder 500M 10M\n' % pid for pid in range(100,115))
+        top+='1227 fsevents 6M 2M\n'
         memory.sample(self.runner(top=top,ps='1227 1 30:00 /System/fseventsd',
                       swap='total = 7168M used = 5788M'),now=1000)
         props=self.rows('memory.sample')[-1]['props']
         self.assertEqual([p['pid'] for p in props['top']],list(range(100,115)))
         self.assertEqual(props['watched'],[dict(pid=1227,command='fseventsd',memMb=6,
-                         cmprsMb=2,cpu=1.5,etime='30:00',error=None)])
+                         cmprsMb=2,etime='30:00',error=None)])
         self.assertEqual(len([c for c in self.commands if c[0]=='/usr/bin/top']),1)
         self.assertTrue(self.rows('memory.sample')[-1]['ok'])
 
@@ -234,7 +234,7 @@ class MemoryTests(unittest.TestCase):
             self.assertEqual(set(memory.alert_reasons(props)),expected)
 
     def test_evaluator_healthy_and_incident_swap_cases(self):
-        top='PID COMMAND MEM CMPRS %CPU\n1227 fseventsd 5.6M 2M 0.0\n'
+        top='PID COMMAND MEM CMPRS\n1227 fseventsd 5.6M 2M\n'
         memory.sample(self.runner(top=top,swap='total = 7168M used = 5788M',pressure=0,free=72),now=1000)
         self.assertEqual(self.notifications, [])
         memory.sample(self.runner(top=top,swap='total = 26.6G used = 25.3G',pressure=0,free=72),now=1300)
@@ -243,7 +243,7 @@ class MemoryTests(unittest.TestCase):
 
     def test_raw_pressure_counter_does_not_alert_or_reuse_old_streak(self):
         memory.save_state('memory',dict(pressure=dict(at=700,consecutive=2)))
-        top='PID COMMAND MEM CMPRS %CPU\n1227 fseventsd 6M 2M 0.0\n'
+        top='PID COMMAND MEM CMPRS\n1227 fseventsd 6M 2M\n'
         for i in range(2):
             memory.sample(self.runner(top=top,swap='total = 7168M used = 5788M',
                                       pressure=247,pressure_level=1,free=72),now=1000+300*i)
@@ -255,7 +255,7 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(self.notifications,[])
 
     def test_pressure_requires_consecutive_samples_and_resets(self):
-        top='PID COMMAND MEM CMPRS %CPU\n1227 fseventsd 5.6M 2M 0.0\n'
+        top='PID COMMAND MEM CMPRS\n1227 fseventsd 5.6M 2M\n'
         cases=[(1,15,None,0), (4,72,None,1), (1,14,None,2),
                (1,72,None,0), (4,72,None,1), (1,72,'/usr/bin/memory_pressure',0),
                (4,72,None,1), (4,72,None,2)]
@@ -274,7 +274,7 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(state['pressureLevel']['consecutive'],0)
 
     def test_pressure_level_matrix_and_old_critical_streak(self):
-        top='PID COMMAND MEM CMPRS %CPU\n1227 fseventsd 6M 2M 0.0\n'
+        top='PID COMMAND MEM CMPRS\n1227 fseventsd 6M 2M\n'
         for level,free,expected in [(1,72,0), (2,72,0), (4,72,2), (8,72,0),
                                     (247,72,0), (1,15,0), (1,14,2)]:
             with self.subTest(level=level,free=free):
@@ -298,7 +298,7 @@ class MemoryTests(unittest.TestCase):
     def fs_sample(self, mem, at, pid=1227, boot=100, age=None, fail=None, notify_fail=False):
         age=at if age is None else age
         ps='%s 1 %02d:%02d /System/fseventsd' % (pid,age//60,age%60)
-        top='PID COMMAND MEM CMPRS %%CPU\n%s fseventsd %sM 2M 0.0\n' % (pid,mem)
+        top='PID COMMAND MEM CMPRS\n%s fseventsd %sM 2M\n' % (pid,mem)
         memory.sample(self.runner(top=top,ps=ps,boot=boot,swap='total = 7168M used = 5788M',
                       pressure=247,pressure_level=1,free=72,fail=fail,notify_fail=notify_fail),now=at)
         return self.rows('memory.sample')[-1]['props']
@@ -361,7 +361,7 @@ class MemoryTests(unittest.TestCase):
                         {'age':100} if reset=='age' else {'fail':'/bin/ps'} if reset=='timeout' else {})
                 at=2301 if reset=='gap' else 1500 if reset=='rollback' else 1900
                 if reset=='absent':
-                    memory.sample(self.runner(top='PID COMMAND MEM CMPRS %CPU\n',ps='1 0 30:00 /sbin/launchd',
+                    memory.sample(self.runner(top='PID COMMAND MEM CMPRS\n',ps='1 0 30:00 /sbin/launchd',
                                   swap='total = 7168M used = 5788M'),now=at)
                     props=self.rows('memory.sample')[-1]['props']
                 else:
@@ -418,6 +418,7 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(len(row['top']),15)
         self.assertEqual(row['top'][0]['command'],'[redacted]')
         self.assertNotIn('args',row['top'][0])
+        self.assertNotIn('cpu',row['top'][0])
         self.assertNotIn('arbitrary',row)
         self.assertNotIn('private',json.dumps(row))
         self.assertEqual(toollog.safe_fields(props,'unrelated'),{})

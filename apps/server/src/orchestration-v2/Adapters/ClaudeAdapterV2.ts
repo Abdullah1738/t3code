@@ -103,7 +103,9 @@ import {
   type ThreadId,
 } from "@t3tools/contracts";
 
+import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
+import * as Data from "effect/Data";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -128,10 +130,14 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { resolveClaudeSdkExecutablePath } from "../../provider/Drivers/ClaudeExecutable.ts";
 import {
+  hasClaudeSkillMention,
   planClaudeSkillDispatch,
   type ClaudeSkillTarget,
 } from "../../provider/Drivers/ClaudeSkillDispatch.ts";
-import { discoverClaudeSkills } from "../../provider/Drivers/ClaudeSkills.ts";
+import {
+  discoverClaudeSkills,
+  resolveClaudeConfigDirPath,
+} from "../../provider/Drivers/ClaudeSkills.ts";
 import {
   compileClaudeModelSelection,
   type CompiledClaudeModelSelection,
@@ -570,6 +576,11 @@ const CLAUDE_INTERRUPT_SETTLE_TIMEOUT = "10 seconds";
 // Stop waits for admission to release its lock. Native preparation requests
 // must not hold it forever before a turn exists for Stop to interrupt.
 const CLAUDE_TURN_PREPARATION_TIMEOUT = "15 seconds";
+
+class ClaudeSkillCacheKey extends Data.Class<{
+  readonly configDir: string;
+  readonly cwd: string | null;
+}> {}
 
 // Transcript enrichment must not hold native shutdown or replacement admission.
 const CLAUDE_TURN_FINALIZATION_TIMEOUT = "10 seconds";
@@ -4014,23 +4025,56 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
     offer: () => Effect.void,
   };
 
-  const userInvocableSkills = (cwd: string | null) =>
-    discoverClaudeSkills(
+  const skillCache = yield* Cache.makeWith(
+    Effect.fn("ClaudeAdapterV2.discoverPromptSkills")(function* (key: ClaudeSkillCacheKey) {
+      const startedAt = yield* Clock.currentTimeMillis;
+      return yield* discoverClaudeSkills(
+        { ...adapterOptions.settings, homePath: key.configDir },
+        key.cwd ?? undefined,
+        adapterOptions.environment,
+      ).pipe(
+        // The measured p90 is 5 s; leave the rest of the 15 s preparation budget for the SDK.
+        Effect.timeout("5 seconds"),
+        Effect.map(
+          (skills): ReadonlyMap<string, ClaudeSkillTarget> =>
+            new Map(
+              skills
+                .filter((skill) => skill.enabled && skill.userInvocable !== false)
+                .map((skill) => [skill.name, skill]),
+            ),
+        ),
+        Effect.catchCause((cause) =>
+          Cause.hasInterrupts(cause)
+            ? Effect.interrupt
+            : Effect.gen(function* () {
+                yield* Effect.logWarning("Claude prompt skill discovery unavailable", {
+                  durationMs: (yield* Clock.currentTimeMillis) - startedAt,
+                  reason: Cause.hasDies(cause) ? "defect" : "timeout",
+                });
+                return new Map<string, ClaudeSkillTarget>();
+              }),
+        ),
+        Effect.provideService(FileSystem.FileSystem, fileSystem),
+        Effect.provideService(Path.Path, path),
+      );
+    }),
+    { capacity: 128, timeToLive: () => "60 seconds" },
+  );
+  const userInvocableSkills = Effect.fn("ClaudeAdapterV2.userInvocableSkills")(function* (
+    text: string,
+    cwd: string | null,
+  ) {
+    if (!hasClaudeSkillMention(text)) return new Map<string, ClaudeSkillTarget>();
+    const resolvedCwd = cwd === null ? null : path.resolve(cwd);
+    const configDir = yield* resolveClaudeConfigDirPath(
       adapterOptions.settings,
-      cwd ?? undefined,
       adapterOptions.environment,
-    ).pipe(
-      Effect.map(
-        (skills) =>
-          new Map(
-            skills
-              .filter((skill) => skill.enabled && skill.userInvocable !== false)
-              .map((skill) => [skill.name, skill]),
-          ),
-      ),
-      Effect.provideService(FileSystem.FileSystem, fileSystem),
-      Effect.provideService(Path.Path, path),
-    );
+      resolvedCwd ?? undefined,
+    ).pipe(Effect.provideService(Path.Path, path));
+    const key = new ClaudeSkillCacheKey({ configDir, cwd: resolvedCwd });
+    yield* Effect.annotateCurrentSpan({ cacheHit: yield* Cache.has(skillCache, key) });
+    return yield* Cache.get(skillCache, key);
+  });
 
   return ProviderAdapter.ProviderAdapterV2.of({
     instanceId: adapterOptions.instanceId,
@@ -10360,7 +10404,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                     attachments: turnInput.message.attachments,
                     attachmentsDir,
                     fileSystem,
-                    skills: yield* userInvocableSkills(turnInput.runtimePolicy.cwd),
+                    skills: yield* userInvocableSkills(
+                      turnInput.message.text,
+                      turnInput.runtimePolicy.cwd,
+                    ),
                     uuid: promptUuid,
                   });
             const querySession = yield* openQuery(turnInput, nativeThreadId);
@@ -10781,7 +10828,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               uuid: yield* crypto.randomUUIDv4().pipe(Effect.filterOrFail(isClaudePromptUuid)),
               attachmentsDir,
               fileSystem,
-              skills: yield* userInvocableSkills(currentTurn.input.runtimePolicy.cwd),
+              skills: yield* userInvocableSkills(
+                turnInput.message.text,
+                currentTurn.input.runtimePolicy.cwd,
+              ),
             });
             yield* backgroundForegroundSubagents(existing);
             yield* sdkMessageLock.withPermits(1)(

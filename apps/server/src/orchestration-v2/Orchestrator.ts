@@ -14186,9 +14186,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         .getThreadHistoryPage(threadId, cursor, throughEntryId, conversationOnly)
         .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause }))),
     getTimelinePage: (threadId, options) =>
-      projectionStore
-        .getTimelinePage(threadId, options)
-        .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause }))),
+      projectionStore.getTimelinePage(threadId, options).pipe(
+        NodeSqliteClient.readOnly,
+        Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })),
+      ),
     getMessageCount: (threadId) =>
       projectionStore
         .getMessageCount(threadId)

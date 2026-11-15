@@ -9,19 +9,19 @@ VM: 657T vsize, 57G framework vsize, 18530928(0) swapins, 25200889(0) swapouts.
 Networks: packets: 807195951/1341G in, 1510266061/2444G out.
 Disks: 2284705926/51T read, 1634470082/24T written.
 
-PID    COMMAND          MEM   CMPRS %CPU
-75214  Robob            3678M 225M  0.0
-45411  codex            2813M 916M  0.0
-176    WindowServer     1992M 324M  0.0
-6662   cua-driver       1892M 1875M 0.0
-85654  Robob Helper (Re 1677M 174M  0.0
-482    Finder           1588M 1433M 0.0
-49082  Browser Helper ( 1356M 78M   0.0
-86824  Python           1297M 0B    0.0
-49059  Dia              1221M 764M  0.0
-48677  Python           980M  356M  0.0
-440    Telegram         874M  765M  0.0
-39001  node             868M  127M  0.0
-25545  opencode         802M  299M  0.0
-74420  Robob Helper     772M  64M   0.0
-456    Terminal         629M  103M  0.0
+PID    COMMAND          MEM   CMPRS
+75214  Robob            3678M 225M
+45411  codex            2813M 916M
+176    WindowServer     1992M 324M
+6662   cua-driver       1892M 1875M
+85654  Robob Helper (Re 1677M 174M
+482    Finder           1588M 1433M
+49082  Browser Helper ( 1356M 78M
+86824  Python           1297M 0B
+49059  Dia              1221M 764M
+48677  Python           980M  356M
+440    Telegram         874M  765M
+39001  node             868M  127M
+25545  opencode         802M  299M
+74420  Robob Helper     772M  64M
+456    Terminal         629M  103M

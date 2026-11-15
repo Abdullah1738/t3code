@@ -866,6 +866,35 @@ unused devices: <none>
         self.assertEqual((h["ok"], h["mode"], h["reasons"], h["pool"]), (True, "ok", [], {"name": "offbox", "state": "ONLINE"}))
         self.assertEqual((h["queue"], h["running"], h["boot_id"], h["version"]), (1, 1, "boot-2", boatd.VERSION))
 
+    def test_pending_restarts_expose_only_count_and_utc_timestamp(self):
+        record = self.tmp / "restart-pending.json"
+        pending = {"checkedAt": "2026-11-15T03:00:00+00:00",
+                   "services": ["boatd-cmd-bx-private-1.service", "incus.service"]}
+        record.write_text(json.dumps(pending))
+        with patch.object(boatd, "RESTART_PENDING", record):
+            summary = boatd.health(fresh=True)["restartPending"]
+        self.assertEqual(summary, {"count": 2, "since": pending["checkedAt"]})
+        self.assertNotIn("private", json.dumps(summary))
+
+    def test_missing_unreadable_and_malformed_restart_records_are_harmless(self):
+        record = self.tmp / "restart-pending.json"
+        empty = {"count": 0, "since": None}
+        stamp = "2026-11-15T03:00:00Z"
+        with patch.object(boatd, "RESTART_PENDING", record):
+            self.assertEqual(boatd.health(fresh=True)["restartPending"], empty)
+            with patch.object(Path, "read_text", side_effect=PermissionError):
+                self.assertEqual(boatd.restart_pending(), empty)
+            for value in ("{", "[]", "null", "{}", '{"services":null}',
+                          json.dumps({"services": {}, "checkedAt": stamp}),
+                          json.dumps({"services": [1], "checkedAt": stamp}),
+                          json.dumps({"services": ["incus.service"], "checkedAt": None}),
+                          json.dumps({"services": ["incus.service"], "checkedAt": "invalid"}),
+                          json.dumps({"services": ["incus.service"], "checkedAt": "2026-11-15T03:00:00+04:00"}),
+                          json.dumps({"services": [], "checkedAt": stamp})):
+                with self.subTest(value=value):
+                    record.write_text(value)
+                    self.assertEqual(boatd.health(fresh=True)["restartPending"], empty)
+
     def test_degraded_mirror_still_serves_and_says_why(self):
         self.f.sh[("zpool", "list")] = (0, "DEGRADED")
         boatd.READY.set()

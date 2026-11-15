@@ -180,9 +180,15 @@ class RepoSetupTests(unittest.TestCase):
                                     wait_images=True, steps=['java -version'])
         result = subprocess.run(['bash', '-n', '-c', script], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        wrapped = runs.exit_recording_command(script, 'run-test')
-        # Linux MAX_ARG_STRLEN is 128 KiB, including the terminating NUL. Leave room for user commands.
-        self.assertLess(len(wrapped.encode()) + 1, 64 * 1024)
+        # The file transport now handles commands that outgrow the inline budget.
+        for payload, large in ((script, False), (script + '\n#' + 'x' * (128 * 1024), True)):
+            with self.subTest(large=large):
+                wrapped, path = runs.command_payload(payload, 'run-test')
+                self.assertLessEqual(len(wrapped.encode()), runs.COMMAND_INLINE_MAX)
+                if large:
+                    self.assertIsNotNone(path)
+                result = subprocess.run(['bash', '-n', '-c', wrapped], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_real_recipe_provisions_bare_home_then_skips_installed_pieces(self):
         self.assert_real_recipe_provisions()
@@ -273,11 +279,16 @@ class RepoSetupExitTests(Isolated):
         return self.con.execute("SELECT * FROM runs WHERE run_id='run-setup'").fetchone()
 
     def test_wait_finalizes_setup_failure_as_infra_without_pulls(self):
-        with patch.object(runs, 'do_pulls') as pull:
-            self.assertEqual(misc._finalize(self.row(), 98, self.log), 90)
-        pull.assert_not_called()
-        self.assertEqual(self.row()['status'], 'infra')
-        self.assertEqual(misc._settled(self.row()), 90)
+        for planned in (0, 1, 4):
+            with self.subTest(planned=planned):
+                self.con.execute("UPDATE runs SET status='running',exit_code=NULL,step_count=? WHERE run_id='run-setup'", (planned,))
+                self.con.commit()
+                with patch.object(runs, 'do_pulls') as pull:
+                    self.assertEqual(misc._finalize(self.row(), 98, self.log), 90)
+                pull.assert_not_called()
+                self.assertEqual(self.row()['status'], 'infra')
+                self.assertEqual(self.row()['exit_code'], 90)
+                self.assertEqual(misc._settled(self.row()), 90)
 
     def test_settled_legacy_failure_uses_marker_but_user_98_is_preserved(self):
         self.con.execute("UPDATE runs SET status='failed',exit_code=98 WHERE run_id='run-setup'")

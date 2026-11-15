@@ -15,7 +15,7 @@ try:
     import toollog as _tl
 except Exception:
     _tl = None
-with _fold_errors(), (_tl.run('meds-nag', _log_sys.argv[1:], name='watcher.run')
+with _fold_errors(), (_tl.run('meds-nag', _log_sys.argv[1:], name='watcher.run', trigger='chained' if _FOLD else _tl.trigger())
       if _tl is not None and __name__ == '__main__' else _log_context.nullcontext()) as _watch_log:
     # Nags owner hourly (09:00-23:45 Dubai) about meds due today until confirmed.
     # Confirm with: ./took.py [YYYY-MM-DD] all|name...   (state in taken.json)
@@ -209,6 +209,12 @@ with _fold_errors(), (_tl.run('meds-nag', _log_sys.argv[1:], name='watcher.run')
             if n: return True
         except Exception: pass
         return False
+    def log_snoozed(st, count):
+      try:
+          if _tl is not None and _tl.snoozed('meds-nag', count, st, now):
+              write_nagstate(st)
+      except Exception:
+          pass
     def main(fold=False):
       if not fold:
           try:
@@ -219,7 +225,14 @@ with _fold_errors(), (_tl.run('meds-nag', _log_sys.argv[1:], name='watcher.run')
               pass
       if 9 <= now.hour <= 23: day = today
       elif now.hour < 5 and (fold or awake()): day = today - dt.timedelta(days=1)
-      else: return
+      else:
+          try:
+              with open(os.path.join(D, "nagstate.lock"), "a") as lock:
+                  fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                  log_snoozed(load("nagstate.json", {}, strict=False), 0)
+          except Exception:
+              pass
+          return
       # Bridge replies and watcher ticks share a clock; skip rather than wait for a concurrent run.
       with open(os.path.join(D, "nagstate.lock"), "a") as lock:
           try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -231,16 +244,20 @@ with _fold_errors(), (_tl.run('meds-nag', _log_sys.argv[1:], name='watcher.run')
       if not isinstance(st, dict): st = {}
       left = outstanding(day, taken)
       if not left:
+          log_snoozed(st, 0)
           if _tl is not None: _tl.emit('meds-nag', 'nag.stopped', props={'count': 0})
           raise SystemExit(0)
       snoozed = active_snoozes()
       left = [i for i in left if "all" not in snoozed and key(i) not in snoozed]
       if not left:
-          if _tl is not None: _tl.emit('meds-nag', 'nag.snoozed', props={'count': 0})
+          log_snoozed(st, 0)
           raise SystemExit(0)
       if fold:
           last = nag_time(st, "fold_last")
-          if last and (now - last).total_seconds() < 1800: return
+          if last and (now - last).total_seconds() < 1800:
+              log_snoozed(st, len(left))
+              return
+          log_snoozed(st, 0)
           st["fold_last"] = now.isoformat()
           outcome_sent(st, day, taken, left)
           write_nagstate(st)
@@ -251,8 +268,9 @@ with _fold_errors(), (_tl.run('meds-nag', _log_sys.argv[1:], name='watcher.run')
       last = max(times) if times else None
       gap = 3600 if now.hour >= 9 else 1800
       if last and (now - last).total_seconds() < gap:
-          if _tl is not None: _tl.emit('meds-nag', 'nag.snoozed', props={'count': len(left)})
+          log_snoozed(st, len(left))
           raise SystemExit(0)
+      log_snoozed(st, 0)
       st["last"] = now.isoformat()
       outcome_sent(st, day, taken, left)
       write_nagstate(st)

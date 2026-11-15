@@ -176,7 +176,7 @@ for (const [name, cause, expected] of [
 
 test("observation, notify and detach can outlast the startup deadline", () => {
   assert.equal(installCommandTimeout(5000, 1000, false, 176_000), 5000);
-  assert.throws(() => installCommandTimeout(5000, 1000, false, 181_000), /3 minute limit/);
+  assert.throws(() => installCommandTimeout(5000, 1000, false, 181_000), /180 s readiness budget/);
   assert.equal(installCommandTimeout(1_840_000, 1000, true, 181_000), 1_840_000);
   assert.equal(installCommandTimeout(5000, 1000, true, 1_850_000), 5000);
   assert.equal(installCommandTimeout(20_000, 1000, true, 1_850_000), 20_000);

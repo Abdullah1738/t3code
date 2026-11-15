@@ -760,7 +760,7 @@ export class Router {
   private async foldTexts(turn: Turn | null | undefined, texts: string[], operationId: string, replyMode: ReplyMode): Promise<string[]> {
     try {
       const chat = this.options.context?.chat;
-      if (chat?.kind !== "owner" || chat.slug === "moni" || this.options.medsFold === false
+      if (chat?.kind !== "owner" || chat.slug === "moni" || typeof this.options.medsFold !== "object" || this.options.medsFold === null
         || process.env.SPECTRUM_MEDS_FOLD_ENABLED === "0") return texts;
       if (!turn || turn.background || turn.origin || !turn.inboundId || synthetic(turn.inboundId)
         || !["running", "submitting", "unknown"].includes(turn.phase) || !this.current(turn)) {
@@ -879,12 +879,13 @@ export class Router {
   }
 
   /** Admission is a receipt, independent of whether the agent later succeeds. Call in a transaction. */
-  private delivered(leader: string, ids = this.store.get<NormalizedInbound | null>(`batch:${leader}`)?.batchIds ?? [leader]): void {
+  private delivered(leader: string, ids = this.store.get<NormalizedInbound | null>(`batch:${leader}`)?.batchIds ?? [leader], succeeded = false): void {
     const deliveredAt = Date.now();
     for (const id of ids) {
-      const row = this.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(id);
+      const row = this.store.db.query<{ payload: string; state: string }, [string]>("SELECT payload, state FROM inbound WHERE id = ?").get(id);
       if (!row) continue;
-      this.store.updateInbound(id, "done");
+      // A receipt proves admission, not successful execution.
+      if (succeeded || row.state !== "failed") this.store.updateInbound(id, "done");
       if (this.store.get<number>(`inbound-delivered:${id}`) !== undefined) continue;
       this.store.set(`inbound-delivered:${id}`, deliveredAt);
       const receivedAt = (JSON.parse(row.payload) as NormalizedInbound).receivedAt;
@@ -1095,18 +1096,16 @@ export class Router {
     const prior = this.store.inboundFailure(id);
     if (!prior || prior.stage !== stage) this.recordFailure(id, stage, error, route);
     const failure = this.store.inboundFailure(id)!;
+    this.store.updateInbound(id, "failed", undefined, { ...failure, at: Date.now() });
     if (this.store.get<number>(`inbound-delivered:${id}`) !== undefined || this.store.get(`batch-phase:${id}`) === "accepted") {
-      this.store.updateInbound(id, "done");
       const row = this.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(id);
       const input = row ? JSON.parse(row.payload) as NormalizedInbound : undefined;
-      // #932 still owns money/security execution alerts even though admission remains done.
+      // #932 owns money/security execution alerts even after admission.
       if (input && criticalWake(id, input.text) && !this.store.get(`failed-alert:${id}`)) {
         const time = new Date(input.sentAt ?? input.receivedAt ?? Date.now()).toLocaleString("en-GB", { timeZone: this.options.timezone });
         this.store.set(`failed-alert-pending:${id}`, `Missed money/security update at ${time}:\n${wakeEventPreview(input.text)}`);
       }
-      return;
     }
-    this.store.updateInbound(id, "failed", undefined, { ...failure, at: Date.now() });
   }
 
   private failedScanAt = -Infinity;
@@ -4608,7 +4607,7 @@ export class Router {
       this.logTurnEnd(turn, said.length ? "replied" : "no_reply");
       if (said.length) this.noteGroupReply(turn.inboundId, said);
       if (turn.background && said.some(words => stripInternalText(words).trim())) this.store.set("deferredNotice", null);
-      if (turn.inboundId) this.delivered(turn.inboundId);
+      if (turn.inboundId) this.delivered(turn.inboundId, undefined, idle.outcome === "succeeded");
       // Readback must not adopt a steer whose answer this transaction has already delivered.
       const coveredSteers = new Set(scope.filter(record => record.type === "user").map(record => record.id));
       for (const row of this.store.pendingInbound()) {
@@ -4764,9 +4763,10 @@ export class Router {
   private fail(turn: Turn, text: string, watermark?: string, reason: DropReason = "failed", immediate = false): void {
     this.logTurnEnd(turn, "failed");
     this.store.db.transaction(() => {
+      const ids = turn.inboundId ? this.store.get<NormalizedInbound | null>(`batch:${turn.inboundId}`)?.batchIds ?? [turn.inboundId] : [];
       if (immediate) {
         // A broken new chat or model needs repair, not automatic replay of a watcher wake.
-        for (const id of this.syntheticBatch(turn.inboundId) ?? (turn.inboundId ? [turn.inboundId] : [])) this.failInbound(id, "execution", text, turn);
+        for (const id of ids) this.failInbound(id, "execution", text, turn);
         this.notice(turn, "failed", text);
       }
       // Nobody typed a synthetic row: it is retried, and never answered with a request to resend.
@@ -4783,7 +4783,7 @@ export class Router {
       else {
         if (!turn.background && reason !== "undelivered") this.store.set("deferredNotice", { turn, text, at: Date.now(), outbox: this.outboxMark() } satisfies DeferredNotice);
         else if (!turn.background) this.notice(turn, "failed", text);
-        if (turn.inboundId) this.failInbound(turn.inboundId, reason === "undelivered" ? "dispatch" : "execution", text, turn);
+        for (const id of ids) this.failInbound(id, reason === "undelivered" ? "dispatch" : "execution", text, turn);
       }
       this.setTurn(turn.background ? null : { ...turn, phase: "failed" });
       this.store.set("resendBody", null);

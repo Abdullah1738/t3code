@@ -805,16 +805,24 @@ def settled_steps_code(run, code: int | None, *, log_path: Path | None = None, p
     """
     path = log_path or LOGS_DIR / f"{run['run_id']}.log"
     disk = offbox_disk_space.result(path, code)
-    if disk.get('infra_failure'):
+    if disk.get('infra_failure') not in (None, 'disk_probe'):
         return code
     planned = planned_steps(run) if planned is None else planned
-    if not planned:
+    remote_handle = any(run[k] for k in ('command_id', 'process_id', 'wrapper_pid') if k in run.keys())
+    history_identity = bool(run['box_id'] if 'box_id' in run.keys() else None) and bool(
+        (run['command_id'] if 'command_id' in run.keys() else None) or
+        (run['mode'] if 'mode' in run.keys() else None) == 'bg' and remote_handle)
+    unsettled = (run['status'] if 'status' in run.keys() else 'running') in ('starting', 'running')
+    recover_plain = (not planned and code == EXIT_INFRA and unsettled and history_identity and
+                     (catch_up or history_result is not None))
+    if not planned and disk.get('infra_failure') != 'disk_probe' and not recover_plain:
         return 126 if code in (None, 126) and argument_list_failure(run, path, report=report and report_start_failure) else code
     known = run['known_exit_code'] if 'known_exit_code' in run.keys() else None
     if known not in (None, 0) and code in (None, 0):
         code = known
     result = history_result
-    if catch_up and (api.BACKEND == 'server' or missing_step_count(step_results(path), planned)):
+    if catch_up and (api.BACKEND == 'server' or missing_step_count(step_results(path), planned) or
+                     disk.get('infra_failure') == 'disk_probe' or recover_plain):
         from .misc import _catch_up_log
         budget = 10 if until is None else min(10, max(0, until - now()))
         result = _catch_up_log(dict(run, status='done'), budget=budget, locked=locked)
@@ -825,6 +833,22 @@ def settled_steps_code(run, code: int | None, *, log_path: Path | None = None, p
                           and result not in ('complete', 'caught_up'))
     if code in (None, 126) and not history_incomplete and argument_list_failure(run, path, report=report and report_start_failure):
         return 126
+    probe_record = offbox_disk_space.result(path, code)
+    probe_crashed = probe_record.get('infra_failure') == 'disk_probe'
+    if probe_crashed or recover_plain:
+        try:
+            with path.open(errors='replace') as output:
+                command_started = any(line.startswith(COMMAND_STARTED_MARKER) for line in output)
+        except OSError:
+            command_started = False
+        if (not command_started and 'disk_attempt' not in probe_record and
+                (result not in (None, 'complete', 'caught_up') or remote_handle and result is None)):
+            raise OffboxError(f"{run['run_id']}: disk probe evidence is incomplete; command execution is unknown. "
+                              f"Use offbox wait {run['run_id']}; do not rerun the command.", code=EXIT_INFRA)
+    if probe_crashed:
+        return EXIT_INFRA
+    if not planned:
+        return code
     checked = checked_steps_code(path, planned, code, report=report)
     if history_incomplete:
         if report and checked is not None:
@@ -854,7 +878,16 @@ def missing_deps_hint(root: Path, *, cwd: Path | None = None, repo_root: Path | 
     target = node_tools.install_root(root, repo_root)
     install = node_tools.install_from(root, cwd or root, repo_root)
     node = node_version.want(repo_root or root, root)
-    requirement = (f" Use Node matching {node[1]}." if node else "") + package_manager.version_note(target)
+    requirement = ""
+    if node:
+        ranges, label = node
+        if len(ranges) == 1 and ranges[0][1] == ranges[0][0] + 1:
+            version = ranges[0][0]
+            exact = f"{version // 1_000_000}.{version // 1_000 % 1_000}.{version % 1_000}"
+            requirement = f" Use Node v{exact} exactly ({label})."
+        else:
+            requirement = f" Use Node matching {label}."
+    requirement += package_manager.version_note(target)
     return ("no node_modules on this box yet (fresh or pruned box). Install deps and run the command in the same call: "
             f"offbox run -- {shlex.quote(install + ' && <command>')}; offbox save --default afterwards keeps them."
             + requirement + " Check the repo's CI install flags and manager version before running.")
@@ -1308,14 +1341,44 @@ def recover_lost_exit(box_id: str, run_id: str, log_path: Path | None, planned: 
     return None, ""
 
 
+def log_probe_error(run_id, reason):
+    metadata = offbox_disk_space.client_metadata()
+    saved = read_json(LOGS_DIR / f'{run_id}.state.json', {})
+    metadata['client_started_at'] = saved.get('client_started_at', metadata['client_started_at'])
+    detail = dict(event='run.disk_probe_error', run_id=run_id, disk_probe_error=reason, **metadata)
+    line = offbox_disk_space.PROBE_INVALID
+    # Recovery paths can read the same log repeatedly; one diagnosis per run is enough.
+    client = LOGS_DIR / f'{run_id}.client.log'
+    try:
+        if client.exists() and line in client.read_text(errors='replace'):
+            return
+        client.parent.mkdir(parents=True, exist_ok=True)
+        with client.open('a') as output:
+            output.write(line + '\n' + json.dumps(detail) + '\n')
+        log(line + ' ' + json.dumps(detail))
+        import toollog
+        toollog.emit('run', 'run.disk_probe_error', ids={'run': run_id},
+                     props=dict(metadata, infra_failure='disk_probe', infra_reason='probe_crashed',
+                                errorClass=reason.partition(':')[0] if ':' in reason else 'ProbeError'),
+                     kind='error', ok=False, tag='disk_probe')
+    except Exception:
+        pass
+
+
 def space_result(run_id, code, path=None, *, report=False):
     record = offbox_disk_space.result(path or LOGS_DIR / f'{run_id}.log', code)
+    if record.get('disk_probe_error'):
+        log_probe_error(run_id, record['disk_probe_error'])
     previous = read_json(LOGS_DIR / f'{run_id}.state.json', {})
     # A missing/incomplete local log must not erase disk evidence already recorded for this exit.
-    if (not record['disk_space'] and not record['infra_failure'] and 'disk_attempt' not in record and code is not None and
-            previous.get('wrapper_exit_code') == code):
+    same_exit = code is not None and previous.get('wrapper_exit_code') == code
+    probe_exit = code in (None, EXIT_INFRA) and previous.get('infra_failure') == 'disk_probe'
+    if (not record['disk_space'] and not record['infra_failure'] and 'disk_attempt' not in record and
+            (same_exit or probe_exit)):
         record.update({k: v for k, v in previous.items() if k in record or
-                       k.startswith(('tmp_', 'var_tmp_', 'home_', 'workspace_'))})
+                       k == 'disk_probe_error' or k.startswith(('tmp_', 'var_tmp_', 'home_', 'workspace_'))})
+    if previous.get('disk_probe_error') and 'disk_probe_error' not in record:
+        record['disk_probe_error'] = None
     if any(previous.get(k) != v for k, v in record.items()):
         try:
             save_run_state(run_id, **record)
@@ -1408,8 +1471,11 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
     probe_command = ('/usr/bin/python3 -I -c ' + shlex.quote(
         'import base64,zlib,sys;exec(zlib.decompress(base64.b64decode(sys.argv.pop(1))))')
         + ' "$__obsp" "$@"')
+    if offbox_disk_space.PROBE_PAYLOAD_ERROR:
+        log_probe_error(run_id, offbox_disk_space.PROBE_PAYLOAD_ERROR)
     probe = '__obprobe'
-    deps_check = (f'__offbox_exit=$?; {probe} end "$__obsw"; if [ "${{__offbox_command_started:-0}}" = 1 ] '
+    deps_check = (f'__offbox_exit=$?; {probe} end "$__obsw" || '
+                  '{ echo "offbox-space-probe-error: end probe failed (exit $?)" >&2; }; if [ "${__offbox_command_started:-0}" = 1 ] '
                   f'&& [ "$__offbox_exit" -ne 0 ] && [ {int(usage.uses_js)} = 1 ] '
                   f'&& [ -f {root}/package.json ] && [ ! -e {root}/node_modules ] '
                   f'; then __offbox_deps_context=; {missing}; '
@@ -1419,11 +1485,12 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
              f'export OFFBOX_RUN_ID={run_id}',
              f'export OFFBOX_BOX_ID={shlex.quote(box_id)}',
              '__obsp=' + shlex.quote(offbox_disk_space.probe_payload()),
-             '__obprobe() { ' + probe_command + '; }',
+             '__obprobe() { echo "offbox-space-probe: $1" >&2; ' + probe_command + '; }',
              f'__obsw="$HOME/{rdir}"',
               '__offbox_command_started=0',
               'trap ' + shlex.quote(deps_check) + ' EXIT',
-              probe + ' start "$__obsw" || exit 90',
+              probe + ' start "$__obsw" || { __obprobe_rc=$?; [ "$__obprobe_rc" != 90 ] || exit 90; '
+              'echo "offbox: disk-space probe failed (exit $__obprobe_rc); the command runs without disk evidence" >&2; }',
               userns.setup(api.BACKEND, box_id),
               DOCKER_REPAIR,
               LDCACHE_REPAIR,
@@ -1591,7 +1658,8 @@ class Runner:
             self.registered = True
             try:
                 save_run_state(self.run_id, resources=resources.unavailable(
-                    'not_started' if api.BACKEND == 'server' else 'boat'))
+                    'not_started' if api.BACKEND == 'server' else 'boat'),
+                    **offbox_disk_space.client_metadata())
             except Exception:
                 pass
             if a.bg:
@@ -2678,14 +2746,18 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
         if planned_steps(prior):
             code = None
         disk = offbox_disk_space.result(LOGS_DIR / f'{run_id}.log', incoming)
-        code = incoming if disk.get('infra_failure') else settled_steps_code(
+        known_infra = status == 'infra' and disk.get('infra_failure') != 'disk_probe'
+        code = incoming if known_infra or disk.get('infra_failure') not in (None, 'disk_probe') else settled_steps_code(
             prior, incoming, locked=True, until=until, catch_up=catch_up, report=report)
-        if planned_steps(prior) and status in (None, 'done', 'failed', 'infra'):
+        disk = offbox_disk_space.result(LOGS_DIR / f'{run_id}.log', incoming)
+        if known_infra:
+            st = 'infra'
+        elif planned_steps(prior) and status in (None, 'done', 'failed', 'infra'):
             st = 'infra' if code is None else ('done' if code == 0 else 'failed')
         else:
             st = status or ("lost" if code is None else ("done" if code == 0 else "failed"))
         if dict(prior).get('mode') != 'local':
-            space_result(run_id, code)
+            space_result(run_id, incoming if disk.get('infra_failure') == 'disk_probe' else code)
             if disk.get('infra_failure'):
                 st = 'infra'
     def persist():

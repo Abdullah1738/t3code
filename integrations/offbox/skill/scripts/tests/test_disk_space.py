@@ -28,6 +28,41 @@ class DiskSpaceTests(unittest.TestCase):
             with self.subTest(free=free):
                 self.assertEqual(bool(disk.warning(self.space(free), 'bx_test')), free < disk.WARN_BYTES)
 
+    def test_toolchain_crash_survives_authoritative_server_result(self):
+        marker = disk.MARKER + json.dumps(dict(phase='toolchain', infra_failure='native_crash',
+                                               infra_reason='toolchain_unpack_crash')) + '\n'
+        self.log.write_text(marker)
+        record = disk.result(self.log, 90)
+        self.assertEqual(record['infra_failure'], 'native_crash')
+        self.assertEqual(record['infra_reason'], 'toolchain_unpack_crash')
+        self.assertIsNone(record['command_exit_code'])
+        self.assertNotIn('ran out of disk', disk.message(record))
+        summary = disk.MARKER + json.dumps(dict(phase='result', attempt=1, record=record)) + '\n'
+        self.log.write_text(marker + summary)
+        self.assertEqual(disk.result(self.log, 90)['infra_failure'], 'native_crash')
+        legacy = dict(disk_space={}, infra_failure=None, infra_reason=None,
+                      command_exit_code=90, wrapper_exit_code=90)
+        self.log.write_text(disk.MARKER + json.dumps(dict(phase='attempt', attempt=1)) + '\n' + marker +
+                            disk.MARKER + json.dumps(dict(phase='result', attempt=1, record=legacy)) + '\n')
+        self.assertEqual(disk.result(self.log, 90)['infra_failure'], 'native_crash')
+        # A following server attempt owns its result, even if the previous marker is still in the log.
+        for code in (0, 1, 90, 99):
+            with self.subTest(code=code):
+                self.log.write_text(marker + summary + disk.MARKER + json.dumps(dict(phase='attempt', attempt=2)) + '\n' +
+                                    disk.MARKER + json.dumps(dict(phase='start', space=self.space(2*disk.GIB))) + '\n')
+                clean = disk.result(self.log, code)
+                self.assertIsNone(clean['infra_failure'])
+                self.log.write_text(self.log.read_text() + disk.MARKER + json.dumps(dict(phase='result', attempt=2, record=clean)) + '\n')
+                self.assertIsNone(disk.result(self.log, code)['infra_failure'])
+
+    def test_toolchain_marker_requires_infra_exit_and_known_reason(self):
+        for code, reason in ((0, 'toolchain_unpack_crash'), (99, 'toolchain_unpack_crash'),
+                             (90, 'unknown')):
+            with self.subTest(code=code, reason=reason):
+                self.log.write_text(disk.MARKER + json.dumps(dict(phase='toolchain', infra_failure='native_crash',
+                                                                 infra_reason=reason)) + '\n')
+                self.assertIsNone(disk.result(self.log, code)['infra_failure'])
+
     def preflight(self, before, after, live):
         lines, calls = [], []
         samples = iter([self.space(before), self.space(after)])

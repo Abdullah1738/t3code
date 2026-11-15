@@ -1529,6 +1529,16 @@ def _check(cfg, pending_only=False):
         path = folder / 'order-tracker-state.json'
         state = read(path)
         committed = deepcopy(state)
+        try:
+            watcher = read(folder / 'watcher.json')
+            interval = watcher.get('interval_s') if isinstance(watcher, dict) else None
+        except (OSError, ValueError):
+            interval = None
+        if type(interval) is not int or interval <= 0:
+            interval = poll_interval(cfg.get('eta'))
+        toollog.poll_observation({'polled': False, 'consecutive_failures': state.get('consecutive_failures', 0),
+                                 'last_success_at': state.get('last_success_at'),
+                                 'poll_interval_s': interval})
         # The watcher never delivers prime output; web notices must wait for a real check.
         if cfg.get('app') == 'web' and os.environ.get('WATCH_RUN', '').startswith('prime-'):
             return {'ok': True}
@@ -1561,7 +1571,13 @@ def _check(cfg, pending_only=False):
             return {'ok': not bool(state.get('retire_error') or state.get('card_error')),
                     'logProps': {'merchant': cfg.get('app'), 'state': state['status'], 'changed': False}}
         now = time.time()
-        result = fetch(cfg, deepcopy(state) if pending_only else state, now)
+        try:
+            result = fetch(cfg, deepcopy(state) if pending_only else state, now)
+        except Exception:
+            record_poll(state, False, now, interval)
+            write(path, state)
+            raise
+        record_poll(state, not bool(result.get('errors')), time.time(), interval)
         state['known_total_aed'] = str(order_total_aed(cfg, result, state))
         if pending_only:
             # Leave stage/delivery cursors untouched: their ordinary wake is still
@@ -1638,6 +1654,17 @@ def _check(cfg, pending_only=False):
 
     return {'ok': not bool(result.get('errors')), 'error': 'TRACK_POLL_SOURCE_ERROR' if result.get('errors') else None,
             'logProps': {'merchant':cfg.get('app'),'state':current,'changed':current != previous}}
+
+
+def record_poll(state, success, now, interval):
+    failures = state.get('consecutive_failures', 0)
+    failures = failures if type(failures) is int and failures >= 0 else 0
+    state['consecutive_failures'] = 0 if success else failures + 1
+    if success:
+        state['last_success_at'] = stamp(now)
+    toollog.poll_observation({'polled': True, 'consecutive_failures': state['consecutive_failures'],
+                             'last_success_at': state.get('last_success_at'),
+                             'poll_interval_s': interval})
 
 
 def retire_terminal(cfg, folder, path, state):

@@ -16,6 +16,9 @@ import {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 
+import { COMPACT_READ_CHARS } from "../../compactRead.ts";
+export { COMPACT_READ_CHARS } from "../../compactRead.ts";
+
 import * as Retries from "./retries.ts";
 import * as Rules from "./rules.ts";
 import { waitEventOf } from "./waits.ts";
@@ -24,8 +27,6 @@ import { waitEventOf } from "./waits.ts";
 export const ACTIVITY_MAX_WINDOW_MS = 72 * 60 * 60 * 1000;
 /** The default window: the last day. */
 export const ACTIVITY_DEFAULT_WINDOW_MS = 24 * 60 * 60 * 1000;
-/** Characters one compact read stays under, well below the agents' tool output limit. */
-export const COMPACT_READ_CHARS = 50_000;
 /** Events card_get returns when no events page is asked for. */
 export const CARD_EVENTS_DEFAULT = 20;
 export const CARD_EVENTS_MAX = 200;
@@ -612,6 +613,14 @@ export const rollup = (input: RollupInput) => {
       });
   }
   idle.sort((left, right) => left.since.localeCompare(right.since));
+  const evaluatorOnly = input.cards
+    .filter(Rules.inReviewEvaluatorStepsOnly)
+    .map((card) => ({
+      card: card.number,
+      hours: hours(Math.max(0, time(until) - time(card.movedAt))),
+      lastWake: card.nudgedAt === null ? null : stamp(card.nudgedAt),
+    }))
+    .toSorted((left, right) => right.hours - left.hours || left.card - right.card);
   for (const [stage, entry] of Object.entries(stages)) {
     entry.hours = hours(entry.hours * HOUR);
     const list = (dwells.get(stage) ?? []).toSorted((left, right) => left - right);
@@ -809,6 +818,10 @@ export const rollup = (input: RollupInput) => {
       longest,
       openOver24h: { count: longOpen.length, byStage: longOpenByStage, ...capped(longOpen, max) },
       withoutThread: { count: idle.length, ...capped(idle, max) },
+      inReviewNoThreadWithEvaluatorStepsOnly: {
+        count: evaluatorOnly.length,
+        ...capped(evaluatorOnly, max),
+      },
     },
     stalls: { count: stallItems.length, ...capped(stallItems, max) },
     failures: { count: failureCount, byKind: failuresByKind, byPool: failures },
@@ -905,18 +918,35 @@ export const pageCardEvents = (
   };
 };
 
-/** Parses since/until into a bounded window ending no later than now. */
+const parseTime = (value: string, now: number) => {
+  const trimmed = value.trim();
+  if (/^now$/i.test(trimmed)) return now;
+  const relative = /^(?:now-)?(\d{1,4})([mhd])$/i.exec(trimmed);
+  if (relative !== null) {
+    const unit = relative[2]!.toLowerCase();
+    const scale = unit === "m" ? MINUTE : unit === "h" ? HOUR : 24 * HOUR;
+    return now - Number(relative[1]) * scale;
+  }
+  return Date.parse(value);
+};
+
+/** Parses since/until into a window of at most 72 hours. */
 export const parseWindow = (
   since: string | undefined,
   until: string | undefined,
   now: number,
 ): ActivityWindow | string => {
+  const end = until === undefined ? now : parseTime(until, now);
+  if (!Number.isFinite(end))
+    return "until must be an ISO time or a relative time like now-24h or 24h.";
   // `until` is exclusive; by default it includes an event written in the same millisecond.
-  const end = until === undefined ? now + 1 : Date.parse(until);
-  if (!Number.isFinite(end)) return "until must be an ISO time.";
-  const start = since === undefined ? end - ACTIVITY_DEFAULT_WINDOW_MS : Date.parse(since);
-  if (!Number.isFinite(start)) return "since must be an ISO time.";
-  if (start >= end) return "since must be before until.";
-  if (end - start > ACTIVITY_MAX_WINDOW_MS) return "The window is at most 72 hours.";
-  return { since: isoOf(start), until: isoOf(end) };
+  const exclusiveEnd = until === undefined ? end + 1 : end;
+  const start =
+    since === undefined ? exclusiveEnd - ACTIVITY_DEFAULT_WINDOW_MS : parseTime(since, now);
+  if (!Number.isFinite(start))
+    return "since must be an ISO time or a relative time like now-24h or 24h.";
+  if (start >= end)
+    return `since ${isoOf(start)} is not before until ${isoOf(end)} (${until === undefined ? "now, server clock, UTC" : "explicit until, UTC"}).`;
+  if (exclusiveEnd - start > ACTIVITY_MAX_WINDOW_MS) return "The window is at most 72 hours.";
+  return { since: isoOf(start), until: isoOf(exclusiveEnd) };
 };

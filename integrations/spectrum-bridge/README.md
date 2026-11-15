@@ -180,8 +180,10 @@ under `~/.config/spectrum-bridge/`.
   The exact body, files and model remain in kv `resendBody` until acceptance.
   `delivery-watchdog` logs JSON decisions `retry`, `notice` and `replay` with
   chat, batch and prompt IDs, never message text.
-- Prompt acceptance marks every batch member `done`, repairing any earlier
-  `failed` status. `batched` identifies members only while acceptance is pending;
+- Prompt acceptance marks every batch member `done` unless it is already
+  `failed`. A failed turn keeps its batch members `failed` with their failure
+  reasons; later receipt reconciliation preserves that outcome until a recovered
+  turn succeeds. `batched` identifies members only while acceptance is pending;
   the aggregate remains in kv `batch:<leaderId>` for reply targets.
 
 ## Group chats (Sendblue mode)

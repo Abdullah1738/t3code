@@ -18,7 +18,7 @@ import { archiveCheckpointLayer, HistoryArchiveDurability } from "./archiveCheck
 vi.mock("node:worker_threads", () => ({ Worker: vi.fn() }));
 afterEach(() => vi.resetAllMocks());
 
-type Request = { id: number; operation: "checkpoint" | "flush-main" };
+type Request = { id: number; operation: "checkpoint" | "flush-main" | "maintenance" };
 class CheckpointWorker extends NodeEvents.EventEmitter {
   readonly requests: Request[] = [];
   readonly waiting: Array<(request: Request) => void> = [];
@@ -113,3 +113,39 @@ it.effect(
     );
   },
 );
+
+it.effect("parks maintenance until activation, then truncates at most once per minute", () => {
+  const worker = new CheckpointWorker();
+  vi.mocked(NodeWorkerThreads.Worker).mockImplementation(function () {
+    return worker as unknown as NodeWorkerThreads.Worker;
+  });
+  return Effect.gen(function* () {
+    const activation = yield* Deferred.make<void>();
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        yield* HistoryArchiveDurability;
+        yield* TestClock.adjust("5 minutes");
+        assert.equal(worker.requests.length, 0);
+        yield* Deferred.succeed(activation, undefined);
+        yield* TestClock.adjust("59999 millis");
+        assert.equal(worker.requests.length, 0);
+        yield* TestClock.adjust("1 millis");
+        const first = yield* worker.next();
+        assert.equal(first.operation, "maintenance");
+        worker.reply(first, true);
+        yield* Effect.yieldNow;
+        yield* TestClock.adjust("59999 millis");
+        assert.equal(worker.requests.length, 1);
+        yield* TestClock.adjust("1 millis");
+        const second = yield* worker.next();
+        worker.reply(second, true);
+        assert.equal(worker.requests.length, 2);
+      }).pipe(
+        Effect.provide(archiveCheckpointLayer("/isolated/statev2.sqlite")),
+        Effect.provideService(ErrorObserver, () => {}),
+        Effect.provideService(ServerActivation, Deferred.await(activation)),
+      ),
+    );
+    assert.isTrue(worker.terminated);
+  });
+});

@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { planClaudeSkillDispatch, type ClaudeSkillTarget } from "./ClaudeSkillDispatch.ts";
+import {
+  hasClaudeSkillMention,
+  planClaudeSkillDispatch,
+  type ClaudeSkillTarget,
+} from "./ClaudeSkillDispatch.ts";
 
 const skillPath = (name: string) => `/home/me/.claude/skills/${name}/SKILL.md`;
 
@@ -99,5 +103,27 @@ describe("planClaudeSkillDispatch", () => {
       commandText: "/implement the fixes",
       skillName: "implement",
     });
+  });
+});
+
+describe("hasClaudeSkillMention", () => {
+  it.each([
+    ["ordinary text", false],
+    ["read /workspace/file.ts and https://example.com/review", false],
+    ["/review the diff", false],
+    ["$review the diff", true],
+    ["please\n$review\tthen report", true],
+    ["$2spec for this", true],
+    ["£review then €implement", true],
+    ["𑿝review", true],
+    ["$plugin:review", true],
+    ["$review-2_test", true],
+    ["pay $20 $20k $100M $1e6", false],
+    ["5$review", false],
+    ["$review,", false],
+    ["$review/path", false],
+  ])("matches the dispatch tokenizer for %s", (prompt, expected) => {
+    expect(hasClaudeSkillMention(prompt)).toBe(expected);
+    expect(hasClaudeSkillMention(prompt)).toBe(expected);
   });
 });

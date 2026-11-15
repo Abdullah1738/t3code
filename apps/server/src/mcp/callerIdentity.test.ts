@@ -2,6 +2,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import { EnvironmentId, NodeId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import * as SqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -29,7 +30,7 @@ import { idleThreadProjection, liveThreadShell } from "./McpToolAccess.testkit.t
 const callerId = ThreadId.make("caller:foreground");
 
 it.effect.each(["board", "send", "status", "delegate"] as const)(
-  "%s fails safely with an unavailable foreground caller reader and background held",
+  "%s fails safely with an unavailable identity caller reader and foreground held",
   (operation) =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -39,6 +40,15 @@ it.effect.each(["board", "send", "status", "delegate"] as const)(
         const sql = yield* SqlClient.SqlClient;
         yield* sql`PRAGMA journal_mode = WAL`;
         yield* sql`CREATE TABLE entries(value INTEGER)`;
+        const callerServices = yield* Layer.build(
+          SqliteClient.layer({
+            filename: path.join(directory, "state.sqlite"),
+            readerWorker: true,
+            identityReaderProcess: true,
+            readerInitializationSql: ["SELECT * FROM missing_init_table"],
+          }),
+        );
+        const callerSql = Context.get(callerServices, SqlClient.SqlClient);
         const held = yield* Deferred.make<void>();
         const release = yield* Deferred.make<void>();
         const holder = yield* sql
@@ -48,13 +58,13 @@ it.effect.each(["board", "send", "status", "delegate"] as const)(
               Effect.andThen(Deferred.await(release)),
             ),
           )
-          .pipe(SqliteClient.readOnly, Effect.forkChild);
+          .pipe(SqliteClient.readOnly, SqliteClient.foregroundReads, Effect.forkChild);
         yield* Deferred.await(held);
         const threads = yield* ThreadManagement.ThreadManagementService.pipe(
           Effect.provide(
             Layer.mock(ThreadManagement.ThreadManagementService)({
               getCallerRow: (threadId) =>
-                sql.withTransaction(sql`SELECT * FROM entries`).pipe(
+                callerSql.withTransaction(callerSql`SELECT * FROM entries`).pipe(
                   SqliteClient.readOnly,
                   Effect.as(liveThreadShell(threadId)),
                   Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })),
@@ -104,7 +114,6 @@ it.effect.each(["board", "send", "status", "delegate"] as const)(
             filename: path.join(directory, "state.sqlite"),
             readerWorker: true,
             foregroundReaderSlots: 1,
-            foregroundReaderInitializationSql: ["SELECT * FROM missing_init_table"],
           }),
         ),
       );
@@ -134,7 +143,7 @@ it.effect(
         Layer.mock(ThreadManagement.ThreadManagementService)({
           getCallerRow: (id) =>
             Effect.gen(function* () {
-              assert.equal(yield* SqliteClient.ReaderLane, "foreground");
+              assert.equal(yield* SqliteClient.ReaderLane, "identity");
               return liveThreadShell(id);
             }),
           getThreadShell: (id) =>
@@ -158,7 +167,7 @@ it.effect.each(
     (["root", "delegated-codex", "delegated-claude"] as const).map((kind) => ({ operation, kind })),
   ),
 )(
-  "$operation resolves an active $kind caller with the real background reader pinned",
+  "$operation resolves an active $kind caller with every view reader pinned",
   ({ operation, kind }) =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -193,6 +202,21 @@ it.effect.each(
           )
           .pipe(SqliteClient.readOnly, Effect.forkChild);
         yield* Deferred.await(held);
+        const viewHolders = yield* Effect.forEach([0, 1], () =>
+          Effect.gen(function* () {
+            const entered = yield* Deferred.make<void>();
+            const fiber = yield* sql
+              .withTransaction(
+                sql`SELECT * FROM entries`.pipe(
+                  Effect.andThen(Deferred.succeed(entered, undefined)),
+                  Effect.andThen(Deferred.await(release)),
+                ),
+              )
+              .pipe(SqliteClient.readOnly, SqliteClient.foregroundReads, Effect.forkChild);
+            yield* Deferred.await(entered);
+            return fiber;
+          }),
+        );
         const lanes: string[] = [];
         const threads = Layer.mock(ThreadManagement.ThreadManagementService)({
           getCallerRow: () =>
@@ -268,7 +292,7 @@ it.effect.each(
               });
             } else yield* Fiber.interrupt(pending);
           }
-          assert.deepEqual(lanes, ["foreground"]);
+          assert.deepEqual(lanes, ["identity"]);
           assert.isFalse(yield* Deferred.isDone(release));
         }).pipe(
           Effect.provide(OrchestratorMcp.layer.pipe(Layer.provideMerge(deps))),
@@ -276,12 +300,14 @@ it.effect.each(
           Effect.ensuring(Deferred.succeed(release, undefined)),
         );
         yield* Fiber.join(holder);
+        yield* Effect.forEach(viewHolders, Fiber.join);
       }).pipe(
         Effect.provide(
           SqliteClient.layer({
             filename: path.join(directory, "state.sqlite"),
             readerWorker: true,
-            foregroundReaderSlots: 1,
+            identityReaderProcess: true,
+            foregroundReaderSlots: 2,
             backgroundReaderSlots: 1,
           }),
         ),
@@ -316,7 +342,7 @@ it.effect.each(["ended", "fork"] as const)(
           ...threads,
           getCallerRow: () =>
             Effect.gen(function* () {
-              assert.equal(yield* SqliteClient.ReaderLane, "foreground");
+              assert.equal(yield* SqliteClient.ReaderLane, "identity");
               return { ...shell, pendingBackgroundTasks: undefined };
             }),
           getThreadShell: () =>
