@@ -1,8 +1,7 @@
 """The janitor's active set: Robob threads plus OpenCode sessions, and "incomplete" whenever a source is missing.
 
-The control API has no cursor: it returns the newest `limit` threads (max 500) and reports the full count in
-`total`. So a result larger than one page is truncated, and truncated means incomplete (keep everything).
-Both sources are stubbed over real HTTP sockets.
+Cursor walks are mocked below; the HTTP stub retains the old single-page server contract
+to cover compatibility and incomplete-source behavior.
 """
 import json
 import os
@@ -560,6 +559,360 @@ class JanitorKeepsEverythingTests(unittest.TestCase):
         archive.assert_not_called()
 
 
+
+
+class ControlPaginationTests(unittest.TestCase):
+    query = '/threads?projectId=p&includeSubagents=true&limit=500&updatedSince=10'
+
+    def row(self, tid, updated='2026-11-01T00:00:00Z', **fields):
+        return dict(threadId=tid, state='idle', updatedAt=updated, **fields)
+
+    def page(self, ids=(), total=None, cursor=None):
+        rows = [self.row(tid) if isinstance(tid, str) else tid for tid in ids]
+        return 200, dict(ok=True, threads=rows, total=len(rows) if total is None else total, nextCursor=cursor)
+
+    def read(self, pages, **kwargs):
+        with patch.object(active, '_control_get', side_effect=pages) as api:
+            result = active._control_threads(self.query, 60, 'test', **kwargs)
+        return result, api
+
+    def test_three_pages_and_catch_up_merge_in_full(self):
+        stats = {}
+        with patch.object(active.time, 'time', return_value=NOW_MS / 1000):
+            (rows, error), api = self.read([self.page(['a'], 3, 'a&+'), self.page(['b'], 3, 'b'),
+                                          self.page(['c'], 3), self.page()], stats=stats)
+        self.assertIsNone(error)
+        self.assertEqual(set(rows), {'a', 'b', 'c'})
+        params = [parse_qs(urlparse(c.args[0]).query) for c in api.call_args_list]
+        self.assertEqual(params[1]['cursor'], ['a&+'])
+        self.assertEqual(params[2]['cursor'], ['b'])
+        self.assertNotIn('cursor', params[3])
+        self.assertEqual(params[3]['updatedSince'], [str(NOW_MS - 5000)])
+        for q in params:
+            self.assertEqual(q['limit'], ['500'])
+            self.assertEqual(q['projectId'], ['p'])
+            self.assertEqual(q['includeSubagents'], ['true'])
+        self.assertTrue(all(c.args[1] == 60 for c in api.call_args_list))
+        self.assertEqual({k: stats[k] for k in ('pages', 'rows', 'catch_up_rows', 'unique_rows', 'total')},
+                         dict(pages=4, rows=3, catch_up_rows=0, unique_rows=3, total=3))
+
+    def test_mid_walk_update_is_recovered_and_later_row_wins(self):
+        newer = self.row('a', '2026-11-15T00:00:00Z')
+        moved = self.row('moved', '2026-11-15T00:00:00Z')
+        (rows, error), _ = self.read([self.page(['a'], 3, 'a'), self.page(['b'], 3),
+                                    self.page([newer], 2, 'catch'), self.page([moved], 2)])
+        self.assertIsNone(error)
+        self.assertEqual(set(rows), {'a', 'b', 'moved'})
+        self.assertEqual(rows['a'], newer)
+
+    def test_duplicate_walk_rows_keep_newest_and_catch_up_can_add_extra_ids(self):
+        newer = self.row('a', '2026-11-02T00:00:00Z')
+        (rows, error), _ = self.read([self.page([newer], 2, 'one'), self.page(['a', 'b'], 2),
+                                    self.page(['new'])])
+        self.assertIsNone(error)
+        self.assertEqual(rows['a'], newer)
+        self.assertEqual(set(rows), {'a', 'b', 'new'})
+
+    def test_short_after_catch_up_returns_no_partial_map(self):
+        stats = {}
+        (rows, error), _ = self.read([self.page(['a'], 3), self.page(['b']),
+                                    self.page(['a'], 3), self.page(['b'])], stats=stats)
+        self.assertIsNone(rows)
+        self.assertIn('short by 1 after retry', error)
+        self.assertTrue(stats['retried'])
+
+    def test_growing_total_is_covered_by_catch_up(self):
+        stats = {}
+        (rows, error), _ = self.read([self.page(['a'], 2, 'next'), self.page(['b'], 3),
+                                    self.page(['new'])], stats=stats)
+        self.assertIsNone(error)
+        self.assertEqual(set(rows), {'a', 'b', 'new'})
+        self.assertEqual(stats['totals'], dict(first=2, last=3, min=2, max=3))
+        self.assertFalse(stats['retried'])
+
+    def test_shrinking_total_after_archival_is_not_a_gap(self):
+        for first_rows, first_total, last_total in [(['a'], 3, 2), (['a', 'archived'], 3, 2)]:
+            with self.subTest(first_rows=first_rows):
+                stats = {}
+                (rows, error), _ = self.read([self.page(first_rows, first_total, 'next'),
+                                            self.page(['b'], last_total), self.page()], stats=stats)
+                self.assertIsNone(error)
+                self.assertGreaterEqual(len(rows), last_total)
+                self.assertEqual(stats['totals'], dict(first=3, last=2, min=2, max=3))
+                self.assertFalse(stats['retried'])
+
+    def test_real_gap_retries_from_scratch_then_fails(self):
+        stats = {}
+        (rows, error), api = self.read([self.page(['a'], 2), self.page(),
+                                      self.page(['a'], 2), self.page()], stats=stats)
+        self.assertIsNone(rows)
+        self.assertEqual(error, 'control api test: short by 1 after retry')
+        self.assertEqual(api.call_count, 4)
+        self.assertTrue(stats['retried'])
+
+    def test_retry_closes_gap_and_uses_a_new_catch_up_window(self):
+        stats = {}
+        with patch.object(active.time, 'time', side_effect=[100, 110]):
+            (rows, error), api = self.read([self.page(['a'], 2), self.page(),
+                                          self.page(['a'], 2, 'next'), self.page(['b'], 2),
+                                          self.page()], stats=stats)
+        self.assertIsNone(error)
+        self.assertEqual(set(rows), {'a', 'b'})
+        self.assertTrue(stats['retried'])
+        self.assertNotIn('cursor', parse_qs(urlparse(api.call_args_list[2].args[0]).query))
+        self.assertEqual(parse_qs(urlparse(api.call_args_list[1].args[0]).query)['updatedSince'], ['95000'])
+        self.assertEqual(parse_qs(urlparse(api.call_args_list[-1].args[0]).query)['updatedSince'], ['105000'])
+
+    def test_catch_up_total_churn_uses_last_total(self):
+        for last_rows, last_total, expected in [(['new'], 3, {'a', 'b', 'new'}), ([], 1, {'a', 'b'})]:
+            with self.subTest(last_total=last_total):
+                stats = {}
+                (rows, error), _ = self.read([self.page(['a'], 2), self.page(['a', 'b'], 2, 'next'),
+                                            self.page(last_rows, last_total)], stats=stats)
+                self.assertIsNone(error)
+                self.assertEqual(set(rows), expected)
+                self.assertEqual(stats['catch_up_unique_rows'], len(expected))
+                self.assertEqual(stats['catch_up_totals'], dict(first=2, last=last_total,
+                                                              min=min(2, last_total), max=max(2, last_total)))
+                self.assertFalse(stats['retried'])
+
+    def test_retry_keeps_request_and_deadline_budgets_and_discards_first_partial_map(self):
+        with patch.object(active, 'CONTROL_MAX_PAGES', 2):
+            (rows, error), api = self.read([self.page(['a'], 2), self.page()])
+        self.assertIsNone(rows)
+        self.assertIn('page cap', error)
+        self.assertEqual(api.call_count, 2)
+        # The second attempt cannot fill its own gap with a discarded first-attempt row.
+        (rows, error), _ = self.read([self.page(['a'], 2), self.page(),
+                                    self.page(['b'], 2), self.page()])
+        self.assertIsNone(rows)
+        self.assertIn('short by 1 after retry', error)
+        with patch.object(active.time, 'monotonic', side_effect=[0, 0, 0, 0, 0, 0, 181, 182]):
+            (rows, error), api = self.read([self.page(['a'], 2), self.page()])
+        self.assertIsNone(rows)
+        self.assertIn('deadline exceeded', error)
+        self.assertEqual(api.call_count, 2)
+
+    def test_oscillating_totals_use_last_main_total_and_log_extrema(self):
+        stats = {}
+        (rows, error), _ = self.read([self.page(['a'], 2, 'one'), self.page(['b'], 4, 'two'),
+                                    self.page(['c'], 3), self.page()], stats=stats)
+        self.assertIsNone(error)
+        self.assertEqual(set(rows), {'a', 'b', 'c'})
+        self.assertEqual(stats['totals'], dict(first=2, last=3, min=2, max=4))
+        self.assertFalse(stats['retried'])
+
+    def test_new_id_cannot_mask_incomplete_catch_up_and_retry_recovers_moving_row(self):
+        ids = [f'A{i:03}' for i in range(500)]
+        # B jumps ahead of the main cursor, then both B and C precede the catch-up cursor.
+        incomplete = [self.page(ids, 501, 'walk'), self.page([], 501),
+                      self.page(['C'] + ids[:499], 502, 'catch-up'), self.page(ids[499:], 502)]
+        for closes_gap in (False, True):
+            with self.subTest(closes_gap=closes_gap):
+                updated_b = self.row('B', '2026-11-15T00:00:00Z', worktreePath='/new')
+                retry = ([self.page(['B', 'C'] + ids[:498], 502, 'retry'),
+                          self.page(ids[498:], 502), self.page([updated_b])] if closes_gap else incomplete)
+                stats = {}
+                (rows, error), api = self.read(incomplete + retry, stats=stats)
+                self.assertTrue(stats['retried'])
+                if closes_gap:
+                    self.assertIsNone(error)
+                    self.assertEqual(set(rows), set(ids) | {'B', 'C'})
+                    self.assertEqual(rows['B']['worktreePath'], '/new')
+                    self.assertEqual(api.call_count, 7)
+                else:
+                    self.assertIsNone(rows)
+                    self.assertIn('catch-up short by 1 after retry', error)
+                    self.assertEqual(stats['failure_phase'], 'catch-up')
+                    self.assertEqual(stats['catch_up_unique_rows'], 501)
+                    self.assertEqual(api.call_count, 8)
+
+    def test_complete_main_cannot_hide_missing_or_duplicate_catch_up_ids(self):
+        for fresh in (['a'], ['a', 'a']):
+            with self.subTest(fresh=fresh):
+                attempt = [self.page(['a', 'b'], 2), self.page(fresh, 2)]
+                stats = {}
+                (rows, error), api = self.read(attempt * 2, stats=stats)
+                self.assertIsNone(rows)
+                self.assertIn('catch-up short by 1 after retry', error)
+                self.assertEqual(stats['unique_rows'], 2)
+                self.assertEqual(stats['catch_up_unique_rows'], 1)
+                self.assertTrue(stats['retried'])
+                self.assertEqual(api.call_count, 4)
+
+    def test_short_catch_up_retry_keeps_shared_budgets(self):
+        pages = [self.page(['a', 'b'], 2), self.page(['a'], 2)]
+        with patch.object(active, 'CONTROL_MAX_PAGES', 2):
+            (rows, error), api = self.read(pages)
+        self.assertIsNone(rows)
+        self.assertIn('page cap exceeded', error)
+        self.assertEqual(api.call_count, 2)
+        with patch.object(active.time, 'monotonic', side_effect=[0, 0, 0, 0, 0, 0, 181, 182]):
+            (rows, error), api = self.read(pages)
+        self.assertIsNone(rows)
+        self.assertIn('deadline exceeded', error)
+        self.assertEqual(api.call_count, 2)
+
+    def test_legacy_server_behavior(self):
+        cases = [(['a'], 2, '2 threads, only 1 returned (truncated)'),
+                 (['a'], 1, None), (['a', 'a'], 2, 'duplicate thread ids'),
+                 (['a'], 0, 'malformed roster')]
+        for ids, total, expected in cases:
+            with self.subTest(ids=ids, total=total):
+                status, body = self.page(ids, total)
+                del body['nextCursor']
+                (rows, error), api = self.read([(status, body)])
+                self.assertEqual(api.call_count, 1)
+                if expected:
+                    self.assertIsNone(rows)
+                    self.assertEqual(error, 'control api test: ' + expected)
+                else:
+                    self.assertEqual(set(rows), {'a'})
+                    self.assertIsNone(error)
+
+    def test_failed_and_malformed_pages_never_return_partial_roster_in_either_pass(self):
+        invalid = [
+            ((503, None), 'status 503'), ((0, 'timed out'), 'timed out'),
+            ((200, []), 'malformed response'), ((200, {'ok': False}), 'malformed response'),
+            ((200, {'ok': True, 'threads': {}, 'total': 2}), 'unreadable thread list'),
+            ((200, {'ok': True, 'threads': [], 'total': True}), 'unreadable thread list'),
+            ((200, {'ok': True, 'threads': [], 'total': -1}), 'unreadable thread list'),
+            (self.page([{'threadId': '', 'state': 'idle'}], 2), 'malformed roster'),
+            (self.page([dict(threadId='b', state='unknown')], 2), 'malformed roster'),
+            (self.page([dict(threadId='b', state=[])], 2), 'malformed roster'),
+            (self.page([dict(threadId='b', state='idle')], 2), 'updatedAt unavailable'),
+            (self.page([self.row('b', 'invalid')], 2), 'updatedAt unavailable'),
+            (self.page([self.row('b', '2026-11-01')], 2), 'updatedAt unavailable'),
+            ((200, dict(ok=True, threads=[], total=2)), 'nextCursor missing during traversal'),
+        ]
+        for pass_name in ('walk', 'catch-up'):
+            for bad, expected in invalid:
+                with self.subTest(pass_name=pass_name, bad=bad):
+                    prefix = [] if pass_name == 'walk' else [self.page(['z'])]
+                    (rows, error), _ = self.read(prefix + [self.page(['a'], 2, 'next'), bad])
+                    self.assertIsNone(rows)
+                    self.assertIn(expected, error)
+
+    def test_cursor_shapes_and_repeats_fail_closed_in_either_pass(self):
+        for phase in ('walk', 'catch-up'):
+            for cursor in ('repeat', '', 1, False, [], {}):
+                with self.subTest(phase=phase, cursor=cursor):
+                    prefix = [] if phase == 'walk' else [self.page(['z'])]
+                    pages = prefix + [self.page(['a'], 2, 'repeat'), self.page(['b'], 2, cursor)]
+                    (rows, error), _ = self.read(pages)
+                    self.assertIsNone(rows)
+                    self.assertIn('repeated cursor' if cursor == 'repeat' else 'invalid nextCursor', error)
+
+    def test_page_budget_covers_catch_up_and_never_sends_page_401(self):
+        pages = [self.page([str(i)], 400, str(i)) for i in range(400)]
+        (rows, error), api = self.read(pages)
+        self.assertIsNone(rows)
+        self.assertIn('page cap exceeded (400)', error)
+        self.assertEqual(api.call_count, 400)
+        with patch.object(active, 'CONTROL_MAX_PAGES', 2):
+            (rows, error), api = self.read([self.page(['a']), self.page(['b'], 2, 'next')])
+        self.assertIsNone(rows)
+        self.assertIn('page cap', error)
+        self.assertEqual(api.call_count, 2)
+
+    def test_deadline_before_page_after_slow_page_and_during_catch_up(self):
+        for ticks, pages, expected_calls in [([0, 181], [], 0),
+                                            ([0, 0, 181], [self.page(['a'])], 1),
+                                            ([0, 0, 0, 181], [self.page(['a'])], 1),
+                                            ([0, 0, 0, 0, 181], [self.page(['a']), self.page()], 2)]:
+            with self.subTest(ticks=ticks), patch.object(active.time, 'monotonic', side_effect=ticks + [182]):
+                (rows, error), api = self.read(pages)
+            self.assertIsNone(rows)
+            self.assertIn('traversal deadline exceeded', error)
+            self.assertEqual(api.call_count, expected_calls)
+        with patch.object(active.time, 'monotonic', side_effect=[0, 2, 3]):
+            (rows, error), _ = self.read([], traversal_timeout=1)
+        self.assertIsNone(rows)
+        self.assertIn('deadline', error)
+
+    def test_legacy_catch_up_is_incomplete(self):
+        for page, expected in [((200, dict(ok=True, threads=[], total=0)), 'nextCursor missing')]:
+            with self.subTest(page=page):
+                (rows, error), _ = self.read([self.page(['a']), page])
+                self.assertIsNone(rows)
+                self.assertIn(expected, error)
+
+    def test_project_history_pages_both_listings_and_records_archival_activity(self):
+        archived = self.row('c', worktreePath='/tree', archivedAt='2026-11-14T00:00:00Z')
+        stats = {}
+        pages = [self.page(['a'], 2, 'live'), self.page(['b'], 2), self.page(),
+                 self.page([archived], 2, 'archive'), self.page(['d'], 2), self.page()]
+        with patch.object(active, '_control_get', side_effect=pages) as api:
+            paths, error = active.project_activity('p', '/root', 10, stats=stats)
+        self.assertIsNone(error)
+        import datetime
+        self.assertEqual(paths['/tree'], datetime.datetime(2026, 11, 14, tzinfo=datetime.timezone.utc).timestamp())
+        self.assertEqual(set(paths), {'/tree', '/root'})
+        queries = [parse_qs(urlparse(c.args[0]).query) for c in api.call_args_list]
+        self.assertEqual(queries[1]['cursor'], ['live'])
+        self.assertEqual(queries[4]['cursor'], ['archive'])
+        self.assertTrue(all(q.get('archived') == ['true'] for q in queries[3:]))
+        self.assertEqual({k: stats[k] for k in ('pages', 'rows', 'archived_rows', 'catch_up_rows')},
+                         dict(pages=6, rows=4, archived_rows=2, catch_up_rows=0))
+
+    def test_active_and_native_callers_paginate_without_changing_request_timeouts(self):
+        pages = [self.page(['a'], 2, 'active'), self.page(['b'], 2), self.page(),
+                 self.page(['c'], 2, 'native'), self.page(['d'], 2), self.page()]
+        with patch.object(active, '_control_get', side_effect=pages) as api:
+            rows, error = active.robob_active(timeout=7, now_ms=NOW_MS)
+        self.assertIsNone(error)
+        self.assertEqual(set(rows), {'a', 'b', 'c', 'd'})
+        queries = [parse_qs(urlparse(c.args[0]).query) for c in api.call_args_list]
+        self.assertTrue(all(q['active'] == ['true'] for q in queries[:3]))
+        self.assertTrue(all(q['creationSource'] == ['provider'] for q in queries[3:]))
+        self.assertEqual([c.args[1] for c in api.call_args_list], [7, 7, 7, 60, 60, 60])
+
+    def test_reaper_status_records_project_metrics_and_exact_failures(self):
+        import contextlib
+        import io
+        import worktree_reaper as reaper
+        for failed in (False, True):
+            with self.subTest(failed=failed):
+                history = reaper.Activity({}, {'p': '/repo'}, {}, None)
+                history.commons = {'p': '/repo.git'}
+                pages = ([self.page(['a'], 2, 'next'), (503, None)] if failed else
+                         [self.page(['a']), self.page(), self.page(), self.page()])
+                with patch.object(reaper, 'running_dirs', return_value=set()), \
+                        patch.object(reaper, 'session_activity', return_value=history), \
+                        patch.object(reaper, 'process_cwds', return_value=[]), \
+                        patch.object(reaper, 'keep_list', return_value=[]), \
+                        patch.object(reaper, 'discover', return_value=['/repo.git']), \
+                        patch.object(reaper, 'worktrees', return_value=([
+                            dict(main=True, common='/repo.git', worktree='/repo')], None)), \
+                        patch.object(active, '_control_get', side_effect=pages), \
+                        patch.object(sys, 'argv', ['reaper', '--dry-run']), \
+                        contextlib.redirect_stdout(io.StringIO()) as out:
+                    self.assertEqual(reaper.main(), 0)
+                status = json.loads(out.getvalue())
+                metrics = status['project_history_stats']['p']
+                self.assertEqual(metrics['pages'], 2 if failed else 4)
+                self.assertEqual(metrics['rows'], 1)
+                self.assertEqual(metrics['common'], '/repo.git')
+                if failed:
+                    reason = 'control api history p archived=False: status 503'
+                    self.assertEqual(status['activity_history_unavailable'], {'/repo.git': reason})
+                    self.assertEqual(metrics['error'], reason)
+                    self.assertEqual(status['repo_outcomes']['/repo.git']['history_error'], reason)
+                else:
+                    self.assertEqual(status['activity_history_unavailable'], {})
+                    self.assertEqual(status['repo_outcomes']['/repo.git']['kept'], {'main_worktree': 1})
+                self.assertEqual(status['removed'], [])
+
+    def test_project_failure_keeps_exact_reason_and_statistics(self):
+        stats = {}
+        with patch.object(active, '_control_get', side_effect=[self.page(['a'], 2, 'next'), (503, None)]):
+            paths, error = active.project_activity('p', '/root', 10, stats=stats)
+        self.assertIsNone(paths)
+        self.assertIn('status 503', error)
+        self.assertEqual(stats['error'], error)
+        self.assertEqual(stats['pages'], 2)
+        self.assertEqual(stats['rows'], 1)
+        self.assertIn('seconds', stats)
 
 
 if __name__ == "__main__":
