@@ -1,3 +1,4 @@
+import * as ThreadReadMetrics from "../ardud/analytics/ThreadReadMetrics.ts";
 import * as OwnerAnalytics from "../ardud/analytics/Analytics.ts";
 import * as McpCallLedger from "../ardud/analytics/McpCallLedger.ts";
 import * as McpResponseDelivery from "../ardud/http/McpResponseDelivery.ts";
@@ -183,7 +184,7 @@ type McpAuthMiddleware = (
 
 class McpReplyCapture extends Context.Service<
   McpReplyCapture,
-  McpReplySize.McpReplyCapture & { readonly arrivedAt: bigint; readonly authenticatedAt: bigint }
+  McpReplySize.McpReplyCapture & { readonly arrivedAt: bigint; readonly authenticatedAt: bigint; readonly sessionId: string | undefined }
 >()("t3/mcp/McpHttpServer/McpReplyCapture") {}
 
 export const normalizeMcpHttpResponse = (
@@ -252,6 +253,7 @@ export const makeMcpAuthMiddleware = Effect.gen(function* () {
     const capture: McpReplyCapture["Service"] = {
       arrivedAt,
       authenticatedAt,
+      sessionId: request.headers["mcp-session-id"],
       name: undefined,
       threadId: invocation.thread?.threadId,
     };
@@ -1041,6 +1043,9 @@ const withToolAnalytics =
               const invocation = Option.getOrUndefined(
                 yield* Effect.serviceOption(McpInvocationContext.McpInvocationContext),
               );
+              return yield* Effect.acquireUseRelease(
+                ledger.enter(JSON.stringify([invocation?.requestNamespace, Option.isSome(capture) ? capture.value.sessionId : undefined])),
+                (activity) => Effect.gen(function* () {
               // The shared tools/call span otherwise cannot be matched to a
               // reporter after concurrent requests enter different service fibers.
               yield* Effect.annotateCurrentSpan({
@@ -1056,6 +1061,9 @@ const withToolAnalytics =
                 if (invocation?.thread) delivery.value.callerThreadId = invocation.thread.threadId;
               }
               const callState: McpCallAnalytics.McpCall["Service"] = {
+                ...(options.tool.name === "t3_thread_read"
+                  ? { threadRead: { readerWaitMs: 0, queryMs: 0, renderMs: 0, threadReadStages: [] } }
+                  : {}),
                 ...(Option.isSome(capture)
                   ? {
                       requestTiming: {
@@ -1141,6 +1149,10 @@ const withToolAnalytics =
                     ? {}
                     : { waitLookupMs: callState.waitLookupMs }),
                   durationMs,
+                  ...(callState.threadRead === undefined ? {} : {
+                    ...ThreadReadMetrics.snapshot(callState.threadRead, ended),
+                    inFlightAtStart: activity.inFlightAtStart,
+                  }),
                   ...callState.requestTiming,
                   ...(totalMs === undefined ? {} : { totalMs }),
                   ...outcome,
@@ -1422,6 +1434,9 @@ const withToolAnalytics =
                     }).pipe(Effect.ignoreCause, Effect.forkDetach);
                   }).pipe(Effect.asVoid);
                 }),
+              );
+                }),
+                (activity) => activity.release,
               );
             }),
         }),

@@ -10,6 +10,9 @@ import type * as Exit from "effect/Exit";
 import { McpSchema } from "effect/ai";
 
 type Phase = NonNullable<AnalyticsEvent["errorPhase"]>;
+type ThreadReadStage = NonNullable<AnalyticsEvent["threadReadStages"]>[number];
+type MutableThreadReadStage = { -readonly [K in keyof ThreadReadStage]: ThreadReadStage[K] };
+
 export class McpCall extends Context.Service<
   McpCall,
   {
@@ -19,6 +22,17 @@ export class McpCall extends Context.Service<
     delegation?: {
       readonly taskId: string;
       readonly readCommitted: Effect.Effect<boolean | "unknown">;
+    };
+    threadRead?: {
+      readerWaitMs: number;
+      queryMs: number;
+      renderMs: number;
+      threadReadStages: Array<MutableThreadReadStage>;
+      activeStage?: {
+        readonly row: MutableThreadReadStage;
+        readonly started: bigint;
+        readonly durationBefore: number;
+      };
     };
     callerResolved: boolean;
     callerResolveMs: number;

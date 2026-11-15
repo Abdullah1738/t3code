@@ -1,3 +1,4 @@
+import * as ThreadReadMetrics from "../ardud/analytics/ThreadReadMetrics.ts";
 import * as McpDeadline from "./McpDeadline.ts";
 import * as McpTaskTrace from "../ardud/observability/McpTaskTrace.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -1459,20 +1460,20 @@ const make = Effect.gen(function* () {
     scope: McpInvocationScope,
     threadId: ThreadId,
   ) {
-    const { parent } = yield* loadCaller(scope);
-    const shell = yield* threadManagement
+    const { parent } = yield* ThreadReadMetrics.read("caller", loadCaller(scope));
+    const shell = yield* ThreadReadMetrics.read("shell", threadManagement
       .getThreadShell(threadId)
-      .pipe(Effect.mapError(threadManagementFailure));
+      .pipe(Effect.mapError(threadManagementFailure)));
     if (shell === null || shell.deletedAt !== null) {
       return yield* failure("thread_not_found", `Thread ${threadId} is no longer available.`);
     }
-    const target = yield* threadManagement
+    const target = yield* ThreadReadMetrics.read("records", threadManagement
       .getProjectThreadRecords({ projectId: shell.projectId, threadId }, [
         "runs",
         "runtimeRequests",
         "contextTransfers",
       ])
-      .pipe(Effect.mapError(threadManagementFailure));
+      .pipe(Effect.mapError(threadManagementFailure)));
     return { parent, target, shell } as const;
   });
 
@@ -3675,14 +3676,14 @@ const make = Effect.gen(function* () {
       const afterPosition = input.afterPosition ?? -1;
       const limit = input.limit ?? DEFAULT_THREAD_READ_LIMIT;
       const maxChars = input.maxCharsPerItem ?? DEFAULT_THREAD_ITEM_MAX_CHARS;
-      const timeline = yield* threadManagement
+      const timeline = yield* ThreadReadMetrics.read("timeline", threadManagement
         .getTimelinePage(input.threadId, {
           afterPosition,
           limit,
           view,
           ...(input.itemId === undefined ? {} : { itemId: input.itemId }),
         })
-        .pipe(Effect.mapError(threadManagementFailure));
+        .pipe(Effect.mapError(threadManagementFailure)));
       const page = timeline.items;
       const messageIdsByThread = new Map<ThreadId, Array<MessageId>>();
       for (const row of page) {
@@ -3691,7 +3692,7 @@ const make = Effect.gen(function* () {
         ids.push(row.item.messageId);
         messageIdsByThread.set(row.sourceThreadId, ids);
       }
-      const sourceMessages = yield* Effect.forEach(
+      const sourceMessages = yield* ThreadReadMetrics.read("messages", Effect.forEach(
         [...messageIdsByThread],
         ([threadId, messageIds]) =>
           threadManagement.getThreadRecords(threadId, ["messages"], { messageIds }).pipe(
@@ -3699,8 +3700,9 @@ const make = Effect.gen(function* () {
             Effect.mapError(threadManagementFailure),
           ),
         { concurrency: 1 },
-      );
+      ));
       const messagesByThreadId = new Map(sourceMessages);
+      yield* ThreadReadMetrics.read("acknowledgement", Effect.gen(function* () {
       const returnedRunIds = new Set(
         page.filter((row) => row.sourceThreadId === target.thread.id).map((row) => row.item.runId),
       );
@@ -3754,8 +3756,10 @@ const make = Effect.gen(function* () {
           }
         }
       }
-      return {
-        thread: threadDetail(target, timeline.totalItems, shell, yield* Clock.currentTimeMillis),
+      }));
+      const now = yield* Clock.currentTimeMillis;
+      return yield* ThreadReadMetrics.render(() => ({
+        thread: threadDetail(target, timeline.totalItems, shell, now),
         recentRuns: target.runs
           .toSorted((left, right) => right.ordinal - left.ordinal)
           .slice(0, input.runLimit ?? DEFAULT_THREAD_RUN_LIMIT)
@@ -3770,8 +3774,8 @@ const make = Effect.gen(function* () {
         ),
         nextPosition: page.at(-1)?.position ?? null,
         hasMore: timeline.hasMore,
-      } satisfies OrchestratorMcpThreadReadResult;
-    }),
+      } satisfies OrchestratorMcpThreadReadResult));
+    }, (effect) => effect.pipe(NodeSqliteClient.foregroundReads)),
     sendToThread: Effect.fn("OrchestratorMcpService.sendToThread")(function* (scope, input) {
       return yield* SendAcknowledgement.bounded(
         (clientRequestId) =>
