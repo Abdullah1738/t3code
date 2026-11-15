@@ -32,7 +32,7 @@ for (const publishing of [true, false]) test(`slow scan with replica publishing=
   const io = {
     PATHS: { db: path },
     openDb: path => { opens++; return openDb(path); },
-    assertReplicaFresh, serverRuntime: () => null, openCodeRuntime: () => null,
+    assertReplicaFresh, loadStallState: () => ({ stalls: {} }), serverRuntime: () => null, openCodeRuntime: () => null,
     cancelledSubagentsSince: slow, cancelledDelegatedTasksSince: slow, restartRunsSince: slow,
     failedRunsSince: slow, failedSubagentsSince: slow,
     telegram: () => assert.fail('must not notify'), sendToThread: () => assert.fail('must not send'),
@@ -65,7 +65,7 @@ for (const lane of ['restart', 'stream']) test(`${lane} resolves each slow ances
   let traversals = 0;
   const io = {
     PATHS:{db:'fixture'}, openDb:() => ({at:clock,close(){}}), assertReplicaFresh:check,
-    serverRuntime:() => null, openCodeRuntime:() => null,
+    loadStallState: () => ({ stalls: {} }), serverRuntime:() => null, openCodeRuntime:() => null,
     cancelledSubagentsSince:() => lane === 'restart' ? subs : [],
     cancelledDelegatedTasksSince:() => [], restartRunsSince:() => [],
     failedRunsSince:() => lane === 'stream' ? [{run_id:'failed',thread_id:'parent',completed_at:ended,

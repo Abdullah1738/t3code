@@ -158,7 +158,7 @@ function fakeIo({ subs = [], delegated = [], runs = [], threads, later = {}, oc 
     OC_URL: 'http://oc',
     assertReplicaFresh: () => {},
     assertThreadInReplica: () => {},
-    serverRuntime: () => ({ pid: 81615, procStartMs: Date.parse('2026-10-15T18:16:17Z'), readyMs: Date.parse('2026-10-15T18:17:53.316Z') }),
+    loadStallState: () => ({ stalls: {} }), serverRuntime: () => ({ pid: 81615, procStartMs: Date.parse('2026-10-15T18:16:17Z'), readyMs: Date.parse('2026-10-15T18:17:53.316Z') }),
     openCodeRuntime: () => null,
     restartRunsSince: () => runs,
     restartNoteRun: () => null,
@@ -407,7 +407,7 @@ test('stall-watch interrupts are not treated as lost delegated tasks', async () 
       { ses: 'ses_stalled', action: 'opencode', interruptedAt: T0 },
       { threadId: row.child_thread_id, action: 'robob', interruptedAt: T0 },
     ]) {
-      const report = await restartScan(scanArgs({ handled: {}, servers: [], stalls: { stall } }, { db }), io);
+      const report = await restartScan(scanArgs({ handled: {}, servers: [] }, { db }), { ...io, loadStallState: () => ({ stalls: { stall } }) });
       assert.equal(report.length, 0);
     }
     assert.equal(calls.send.length + calls.telegram.length, 0);
@@ -746,7 +746,7 @@ test('cancels from the stall watch interrupting a session are not a restart', as
   const subs = [sub('a', 'x', 0), sub('b', 'y', 10), sub('c', 'z', 20)];
   const stalls = Object.fromEntries(['a', 'b', 'c'].map((k) => [`st-${k}`, { ses: `ses_${k}`, action: 'opencode', interruptedAt: T0 - 2_000 }]));
   const { io, calls } = fakeIo({ subs, threads: {} });
-  const report = await restartScan(scanArgs({ handled: {}, servers: [], stalls }), io);
+  const report = await restartScan(scanArgs({ handled: {}, servers: [] }), { ...io, loadStallState: () => ({ stalls }) });
   assert.equal(report.length, 0);
   assert.equal(calls.telegram.length, 0);
 });
