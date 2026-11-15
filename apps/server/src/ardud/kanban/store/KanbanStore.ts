@@ -364,6 +364,7 @@ export interface KanbanStoreShape {
   /** Cards a work thread has carried, in the order it took them. */
   readonly threadCards: (
     threadId: string,
+    options?: { readonly before?: string },
   ) => Effect.Effect<ReadonlyArray<KanbanCardId>, KanbanStoreError>;
 }
 
@@ -1546,12 +1547,13 @@ const make = Effect.gen(function* () {
         ON CONFLICT (thread_id, card_id) DO NOTHING
       `.pipe(Effect.asVoid),
     );
-  const threadCards = (threadId: string) =>
+  const threadCards = (threadId: string, options?: { readonly before?: string }) =>
     runRead(
       "read thread cards",
       Effect.map(
         sql<{ readonly card_id: string }>`
           SELECT card_id FROM ardud_kanban_thread_cards WHERE thread_id = ${threadId}
+          ${options?.before === undefined ? sql`` : sql`AND joined_at < ${options.before}`}
           ORDER BY joined_at, rowid
         `,
         (rows) => rows.map((row) => KanbanCardId.make(row.card_id)),

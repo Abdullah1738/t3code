@@ -118,6 +118,28 @@ const card = (number: number, stage: KanbanCard["stage"]): KanbanCard => ({
   movedAt: at,
 });
 
+it.effect.each([
+  { name: "before the window", joinedAt: "2026-10-24T12:59:59.999Z", included: true },
+  { name: "at the window start", joinedAt: "2026-10-24T13:00:00.000Z", included: true },
+  { name: "just before the cutoff", joinedAt: "2026-10-25T12:59:59.999Z", included: true },
+  { name: "at the cutoff", joinedAt: at, included: false },
+  { name: "after the cutoff", joinedAt: "2026-10-25T13:00:00.001Z", included: false },
+])("thread cards joined $name respect an exclusive cutoff", ({ joinedAt, included }) =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const carried = card(1, "completed");
+    const unrelated = card(2, "completed");
+    yield* store.addThreadCard("worker", carried.id, joinedAt);
+    yield* store.addThreadCard("other-worker", unrelated.id, joinedAt);
+    assert.deepStrictEqual(
+      yield* store.threadCards("worker", { before: at }),
+      included ? [carried.id] : [],
+    );
+    assert.deepStrictEqual(yield* store.threadCards("worker"), [carried.id]);
+    assert.deepStrictEqual(yield* store.threadCards("worker", {}), [carried.id]);
+  }).pipe(Effect.provide(TestLayer)),
+);
+
 it.effect("loads open review links with their cards, including missing cards, in one read", () =>
   Effect.gen(function* () {
     const store = yield* KanbanStore.KanbanStore;

@@ -17507,7 +17507,7 @@ const make = Effect.gen(function* () {
           links: store.threadLinks({ boardId, open: false }),
         }),
       );
-      // Released cards leave the active set, but their window's events still belong to the worker.
+      // Keep released cards, but exclude later claims so priority stays pinned across pages.
       const threadCards = new Map(
         yield* readDb(
           Effect.forEach(
@@ -17518,7 +17518,10 @@ const make = Effect.gen(function* () {
                 (link.endedAt === null || link.endedAt >= window.since),
             ),
             (link) =>
-              Effect.map(store.threadCards(link.threadId), (ids) => [link.threadId, ids] as const),
+              Effect.map(
+                store.threadCards(link.threadId, { before: window.until }),
+                (ids) => [link.threadId, ids] as const,
+              ),
             { concurrency: 1 },
           ),
         ),
