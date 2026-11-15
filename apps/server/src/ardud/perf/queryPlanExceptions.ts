@@ -18,6 +18,10 @@ export const queryPlanExceptions = [
     route: "shell.selection",
     queryHash: "2ae357a3818c0e5fb4e0dff3177b6ce326a1c2318a2b57bb8349de773f250f73",
     pattern: "^Interactive\\ query\\ references\\ history/archive$",
+    historyTables: [
+      "ardud_archive.ardud_turn_items",
+      "ardud_base.orchestration_v2_projection_turn_items",
+    ],
     reason:
       "Existing M0 shell derivation; replace with indexed materialized views in M1/M3. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card",
   },
@@ -39,6 +43,10 @@ export const queryPlanExceptions = [
     route: "shell.client-selection",
     queryHash: "cee0d1252df0831198bb09470f638d1abd3c7b0e7a69b297b537354377530164",
     pattern: "^Interactive\\ query\\ references\\ history/archive$",
+    historyTables: [
+      "ardud_archive.ardud_turn_items",
+      "ardud_base.orchestration_v2_projection_turn_items",
+    ],
     reason:
       "The M0 shell derivation (same as shell.selection) with idle subagents dropped through the live-run partial indexes. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card",
   },
@@ -60,6 +68,10 @@ export const queryPlanExceptions = [
     route: "shell.recent-page",
     queryHash: "a95dd95f396ba7995c675ecca4467e4613f88c3c9c58b03d1f0fab3bd4c9acfd",
     pattern: "^Interactive\\ query\\ references\\ history/archive$",
+    historyTables: [
+      "ardud_archive.ardud_turn_items",
+      "ardud_base.orchestration_v2_projection_turn_items",
+    ],
     reason:
       "The M0 shell derivation (same as shell.selection) read in index order, newest first: the scan stops at the page limit and the sorts are the per-row subqueries'. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card",
   },
@@ -82,6 +94,10 @@ export const queryPlanExceptions = [
     route: "board.thread-state",
     queryHash: "569234241364e03255371b2a0c6dc0d1559655d9af8509b143cabee0b8c39fa6",
     pattern: "^Interactive\\ query\\ references\\ history/archive$",
+    historyTables: [
+      "ardud_archive.ardud_turn_items",
+      "ardud_base.orchestration_v2_projection_turn_items",
+    ],
     reason:
       "Existing M0 shell derivation; replace with indexed materialized views in M1/M3. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card",
   },
@@ -131,6 +147,7 @@ export const queryPlanExceptions = [
     route: "turn-start.history",
     queryHash: "9909f9aa617527a5bf630e848966cfad87762ee842e0d8e71df315244c2e1078",
     pattern: "^Interactive\\ query\\ references\\ history/archive$",
+    historyTables: ["ardud_history_turn_items"],
     reason:
       "Explicit history read across hot/delta/base; preserves existing transcript order and indexed thread/run selection.",
   },
