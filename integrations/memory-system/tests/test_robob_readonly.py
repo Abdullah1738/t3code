@@ -9,6 +9,7 @@ import time
 import unittest
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
+from itertools import product
 from pathlib import Path
 from unittest.mock import patch
 
@@ -260,8 +261,12 @@ class ReadonlyTest(unittest.TestCase):
             ("invalid progress", "invalid_rebuild_evidence", {}, {"rebuild_progress": "{"}, None),
             ("no progress", "invalid_rebuild_evidence", {}, {"rebuild_progress": None}, None),
         ]
-        for name, reason, metadata, diagnostic, mtime in cases:
-            with self.subTest(name=name):
+        for kind, (name, reason, metadata, diagnostic, mtime) in product(("full", "events_reset"), cases):
+            with self.subTest(kind=kind, name=name):
+                if kind == "events_reset" and ("rebuild_progress" not in diagnostic or name in ("abort", "publish")):
+                    diagnostic = {**diagnostic, "rebuild_progress": json.dumps({
+                        "kind": kind, "event": name if name in ("abort", "publish") else "progress",
+                    })}
                 with closing(sqlite3.connect(self.replica)) as con, con:
                     ready(con, updated_at=(datetime.now(timezone.utc) - timedelta(seconds=180)).isoformat())
                     con.executemany("INSERT OR REPLACE INTO ardud_readonly_meta VALUES (?,?)", [
@@ -280,6 +285,37 @@ class ReadonlyTest(unittest.TestCase):
         with self.assertRaises(ro.ReplicaNotReady), patch.object(ro, "_log_stale") as log:
             ro.state_ro(self.replica, allow_rebuild=True)
         self.assertEqual(log.call_args.kwargs["reason"], "sidecar_missing")
+
+    def test_nested_reset_requires_a_live_published_full_parent(self):
+        _, original, sidecar = self.rebuild_snapshot()
+        reset = {**original, "rebuild_progress": json.dumps({
+            "kind": "events_reset", "event": "progress", "table": "orchestration_events", "rows": 10,
+        })}
+        cases = [
+            ("full parent", "1", "full", None, True),
+            ("standalone reset", "1", "events_reset", None, False),
+            ("unknown parent", "1", None, None, False),
+            ("additive parent", "1", "additive", None, False),
+            ("unready parent", "0", "full", None, False),
+            ("expired heartbeat", "1", "full", time.time() - 301, False),
+        ]
+        for name, flag, parent, mtime, allowed in cases:
+            with self.subTest(name=name):
+                with closing(sqlite3.connect(self.replica)) as con, con:
+                    con.execute("UPDATE ardud_readonly_meta SET value=? WHERE key='ready'", (flag,))
+                    con.execute("DELETE FROM ardud_readonly_meta WHERE key='rebuild_kind'")
+                    if parent:
+                        con.execute("INSERT INTO ardud_readonly_meta VALUES ('rebuild_kind',?)", (parent,))
+                sidecar.write_text(json.dumps(reset))
+                if mtime:
+                    os.utime(sidecar, (mtime, mtime))
+                if allowed:
+                    with closing(ro.state_ro(self.replica, allow_rebuild=True)) as con:
+                        self.assertIn("orchestration_events, 10 rows", con.replica_warning)
+                        self.assertEqual(con.execute("SELECT value FROM marker").fetchone(), ("replica",))
+                else:
+                    with self.assertRaises(ro.ReplicaNotReady):
+                        ro.state_ro(self.replica, allow_rebuild=True)
 
     def test_stale_snapshot_is_logged_once_per_connection(self):
         self.rebuild_snapshot()

@@ -3707,9 +3707,15 @@ test.each(["published", "full", "bootstrap"])(
   (mode) => {
     const f = fixture(1);
     if (mode !== "bootstrap") f.finish();
+    const out = f.connect();
+    const generation = metaValue(out, "generation");
+    const updated = new Date(Date.now() - 10 * 60_000).toISOString();
     let exporter = f.exporter;
     if (mode === "full") {
       f.exporter.close();
+      const writer = new NodeSqlite.DatabaseSync(f.options.replicaPath);
+      writer.prepare("UPDATE ardud_readonly_meta SET value=? WHERE key='updated_at'").run(updated);
+      writer.close();
       f.source.exec(
         "ALTER TABLE orchestration_v2_projection_run_attempts RENAME COLUMN payload_json TO owner_payload_json",
       );
@@ -3719,13 +3725,61 @@ test.each(["published", "full", "bootstrap"])(
       });
       cleanups.push(() => exporter.close());
     }
+    const started = metaValue(out, "rebuild_started_at");
+    const readPreviousSnapshot = () => {
+      expect(metaValue(out, "rebuild_kind")).toBe("full");
+      expect(metaValue(out, "rebuild_started_at")).toBe(started);
+      const reader = NodeChildProcess.spawnSync(
+        "/usr/bin/python3",
+        [
+          "-I",
+          "-c",
+          `
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import robob_readonly as ro
+with ro.state_ro(sys.argv[2], allow_rebuild=True) as con:
+    meta = dict(con.execute("SELECT key,value FROM ardud_readonly_meta"))
+    assert meta["ready"] == "1"
+    assert meta["updated_at"] == sys.argv[3]
+    assert meta["generation"] == sys.argv[4]
+    assert meta["rebuild_started_at"] == sys.argv[5]
+    assert json.loads(con.execute("SELECT payload_json FROM orchestration_v2_projection_threads WHERE thread_id='a'").fetchone()[0])["title"] == "old"
+    assert sys.argv[3] in con.replica_warning
+    assert sys.argv[5] in con.replica_warning
+`,
+          NodePath.resolve(import.meta.dirname, "../../../../../integrations/memory-system/src"),
+          f.options.replicaPath,
+          updated,
+          String(generation),
+          String(started),
+        ],
+        { encoding: "utf8", timeout: 5000 },
+      );
+      expect(reader.error).toBeUndefined();
+      expect(reader.status, reader.stderr).toBe(0);
+    };
+    if (mode === "full") readPreviousSnapshot();
     f.rebuilds.length = 0;
     exporter.step();
     f.source.exec("INSERT INTO orchestration_events VALUES (3,'thread.metadata-updated','a','{}')");
     let addedGap = false;
-    const out = f.connect();
+    let verifiedResets = 0;
     for (let step = 0; exporter.step(); step++) {
       expect(metaValue(out, "ready")).toBe(mode === "bootstrap" ? "0" : "1");
+      if (mode === "full") {
+        const resets = f.rebuilds.filter(
+          (event) => event.kind === "events_reset" && event.event === "start",
+        ).length;
+        if (resets > verifiedResets) {
+          const sidecar = JSON.parse(
+            NodeFS.readFileSync(f.options.replicaPath + ".rebuild.json", "utf8"),
+          );
+          expect(JSON.parse(sidecar.rebuild_progress).kind).toBe("events_reset");
+          readPreviousSnapshot();
+          verifiedResets = resets;
+        }
+      }
       if (!addedGap && f.rebuilds.some((event) => event.kind === "events_reset")) {
         f.source.exec(
           "INSERT INTO orchestration_events VALUES (5,'thread.metadata-updated','a','{}')",
@@ -3738,6 +3792,7 @@ test.each(["published", "full", "bootstrap"])(
       (event) => event.kind === "events_reset" && event.event === "start",
     );
     expect(starts).toHaveLength(2);
+    if (mode === "full") expect(verifiedResets).toBe(2);
     expect(starts.map((event) => event.firstMissingSequence)).toEqual([2, 4]);
     expect(starts.map((event) => event.publishedReady)).toEqual(
       mode === "bootstrap" ? ["0", "0"] : ["1", "1"],

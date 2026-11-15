@@ -106,7 +106,9 @@ def _live_rebuild(con, metadata, age, now):
         if diagnostics.get("rebuild_finished_at") and _timestamp(diagnostics["rebuild_finished_at"]) >= start:
             return None, "rebuild_finished"
         progress = json.loads(diagnostics["rebuild_progress"])
-        if progress.get("kind") != "full" or metadata.get("rebuild_kind", "full") != "full":
+        # A private full build keeps its published parent metadata across gaps.
+        nested_reset = progress.get("kind") == "events_reset" and metadata.get("rebuild_kind") == "full"
+        if not nested_reset and (progress.get("kind") != "full" or metadata.get("rebuild_kind", "full") != "full"):
             return None, "not_full_rebuild"
         if progress.get("event") not in ("start", "progress"):
             return None, "not_in_progress"
