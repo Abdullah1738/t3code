@@ -817,6 +817,19 @@ function delegatedTaskTerminalStatus(
   }
 }
 
+function completionReceiverFailedBeforeAcceptance(
+  run: OrchestrationV2Run,
+  failureCode: string | null | undefined,
+): boolean {
+  return (
+    run.status === "failed" &&
+    (run.startedAt === null ||
+      failureCode === "provider_prompt_not_sent" ||
+      failureCode === PROVIDER_START_TIMEOUT_CODE ||
+      failureCode === "restart_admission_timeout")
+  );
+}
+
 function nextQueuedRun(
   projection: Pick<OrchestrationV2ThreadProjection, "runs" | "messages">,
 ): OrchestrationV2Run | undefined {
@@ -5963,14 +5976,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         : undefined;
     // A durable completion must not reset a failed provider startup's retry budget.
     // Keep it queued until an explicit send or Resume; admission timeouts can retry.
+    const completionFailureCode = latestRootProviderFailure(
+      latestRun ?? null,
+      projection.turnItems,
+    )?.code;
     const completionStartFailure =
       delegatedCompletion !== undefined &&
       activeRun === undefined &&
       latestRun?.status === "failed" &&
-      latestRun.startedAt === null &&
+      completionReceiverFailedBeforeAcceptance(latestRun, completionFailureCode) &&
       latestRun.providerInstanceId === modelSelection.instanceId &&
       ![PROVIDER_START_TIMEOUT_CODE, "restart_admission_timeout"].includes(
-        latestRootProviderFailure(latestRun, projection.turnItems)?.code ?? "",
+        completionFailureCode ?? "",
       )
         ? latestRun
         : undefined;
@@ -13241,6 +13258,78 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     },
   );
 
+  const settleDelegatedRestartWait = Effect.fn("Orchestrator.settleDelegatedRestartWait")(
+    function* (childThreadId: ThreadId, settledContinuationOf?: RunId) {
+      // Parent result publication and fresh child input must agree on who owns
+      // the wait. Parent-to-child is the same lock order as follow-up intake.
+      yield* threadDispatch.withLock(
+        childThreadId,
+        Effect.gen(function* () {
+          const child = yield* projectionStore.getThreadRecords(
+            childThreadId,
+            ["runs", "messages", "subagents", "providerThreads", "providerTurns", "turnItems"],
+            { messageRoles: ["user"], turnItemTypes: ["notification"] },
+          );
+          const progress = delegatedTaskProgress(child);
+          if (progress.state !== "result_available" || progress.resultRun === undefined) return;
+          if (
+            yield* childAwaitsRestartContinuation(
+              child.runs,
+              progress.resultRun,
+              settledContinuationOf,
+            )
+          )
+            return;
+          if (
+            yield* effectOutbox.hasPendingRunStart({
+              threadId: childThreadId,
+              runIds: child.runs.map((run) => run.id),
+            })
+          )
+            return;
+          const events: Array<Omit<OrchestrationV2DomainEvent, "id">> = [];
+          const now = yield* DateTime.now;
+          for (const wait of child.turnItems) {
+            if (wait.type !== "notification" || wait.status !== "waiting") continue;
+            const run = child.runs.find((candidate) => candidate.id === wait.runId);
+            if (
+              run === undefined ||
+              wait.id !== `turn-item:restart-pacing:${run.id}` ||
+              delegatedTaskTerminalStatus(runOutcome(run)) === null ||
+              runRanAfter(run, progress.resultRun)
+            )
+              continue;
+            const continuation =
+              run.id === settledContinuationOf
+                ? Option.none()
+                : yield* effectOutbox.get(`effect:restart-continuation:${run.id}`);
+            // An unsettled claim still owns its note; EffectWorker settles it
+            // after admission or decline, including replacement start effects.
+            if (
+              Option.isSome(continuation) &&
+              ["pending", "running"].includes(continuation.value.status)
+            )
+              continue;
+            events.push({
+              type: "turn-item.updated",
+              threadId: childThreadId,
+              runId: run.id,
+              occurredAt: now,
+              payload: {
+                ...wait,
+                status: "completed",
+                summary: "Restart wait ended",
+                completedAt: now,
+                updatedAt: now,
+              },
+            });
+          }
+          if (events.length > 0) yield* writeSystemEvents(events);
+        }),
+      );
+    },
+  );
+
   const finalizeAppOwnedSubagent = Effect.fn("Orchestrator.finalizeAppOwnedSubagent")(function* (
     childThreadId: ThreadId,
     options?: { readonly settledContinuationOf?: RunId; readonly syncRunId?: RunId },
@@ -13258,6 +13347,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     )
       return;
     const progress = delegatedTaskProgress(childControls);
+    if (progress.state === "result_available") {
+      yield* settleDelegatedRestartWait(childThreadId, options?.settledContinuationOf);
+    }
     const parent = yield* projectionStore.getThreadRecords(parentThreadId, [
       "subagents",
       "contextTransfers",
@@ -13404,8 +13496,20 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       return;
     }
 
-    const unstartedFailure = deliveryRun.status === "failed" && deliveryRun.startedAt === null;
-    if (unstartedFailure) {
+    // Local registration sets startedAt before native acceptance. Explicitly
+    // unsent failures also hold their replacement until an explicit Resume/send.
+    const failure =
+      deliveryRun.status === "failed" && deliveryRun.startedAt !== null
+        ? yield* projectionStore.getThreadRecords(threadId, ["turnItems"], {
+            turnItemRunId: deliveryRun.id,
+            turnItemTypes: ["error"],
+          })
+        : undefined;
+    const failedBeforeAcceptance = completionReceiverFailedBeforeAcceptance(
+      deliveryRun,
+      latestRootProviderFailure(deliveryRun, failure?.turnItems ?? [])?.code,
+    );
+    if (failedBeforeAcceptance) {
       yield* Effect.logWarning("delegated-task.completion_held", {
         parentThreadId: threadId,
         runId: deliveryRun.id,
