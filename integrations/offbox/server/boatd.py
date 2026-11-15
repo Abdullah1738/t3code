@@ -390,6 +390,7 @@ def record_boot():
 
 _HEALTH = {"ts": 0.0, "v": None}
 _HEALTH_LOCK = threading.Lock()
+_HEALTH_REFRESH = {"stage": "idle", "since": None, "timings": {}}
 
 
 RESTART_PENDING = Path("/var/lib/offbox/restart-pending.json")
@@ -408,14 +409,29 @@ def restart_pending() -> dict:
         return {"count": 0, "since": None}
 
 
-def health(fresh: bool = False) -> dict:
-    """GET /health: no auth, no data about boxes or owners. `ok` means runs can be accepted here."""
+def health_stage_done(stage):
+    elapsed = time.monotonic() - _HEALTH_REFRESH["since"]
+    _HEALTH_REFRESH["timings"][stage] = round(elapsed * 1000, 1)
+    if elapsed > 1:
+        log(f"health-refresh stage={stage} ms={elapsed * 1000:.1f}")
+
+
+def health_stage(stage, read):
+    _HEALTH_REFRESH.update(stage=stage, since=time.monotonic())
+    try:
+        return read()
+    finally:
+        health_stage_done(stage)
+
+
+def refresh_health(fresh: bool = False) -> dict:
+    """Only refreshers serialize; request threads read the published snapshot without this lock."""
     with _HEALTH_LOCK:
         cached = _HEALTH["v"]
         if not fresh and cached and now() - _HEALTH["ts"] < 5:
             return cached
         reasons = []
-        pool = pool_state()
+        pool = health_stage("zpool", pool_state)
         md = mdraid_state()
         ok = READY.is_set()
         if not ok:
@@ -425,23 +441,25 @@ def health(fresh: bool = False) -> dict:
         if md["state"] == "degraded":
             reasons.append("mdraid degraded: " + ", ".join(f"{k} {v}" for k, v in sorted(md["arrays"].items())))
         status = startup_status()
-        rc = 0 if status["starting"] else _sh(["incus", "query", "/1.0"], timeout=10)[0]
+        rc = 0 if status["starting"] else health_stage("incus", lambda: _sh(["incus", "query", "/1.0"], timeout=10))[0]
         if rc != 0:
             ok = False
             reasons.append("incus is not answering")
-        vpn = None if status["starting"] else vpn_problem()
+        vpn = None if status["starting"] else health_stage("mullvad", vpn_problem)
         if vpn:
             ok = False
             reasons.append(vpn)
         queue = running = None
         if READY.is_set():
             try:
-                con = db()
-                try:
-                    queue = con.execute("SELECT COUNT(*) FROM commands WHERE status='queued'").fetchone()[0]
-                    running = con.execute("SELECT COUNT(*) FROM commands WHERE status='running'").fetchone()[0]
-                finally:
-                    con.close()
+                def counts():
+                    con = db()
+                    try:
+                        return tuple(con.execute(f"SELECT COUNT(*) FROM commands WHERE status='{status}'").fetchone()[0]
+                                     for status in ("queued", "running"))
+                    finally:
+                        con.close()
+                queue, running = health_stage("sqlite", counts)
             except sqlite3.Error:
                 ok = False
                 reasons.append("state database is not readable")
@@ -451,7 +469,43 @@ def health(fresh: bool = False) -> dict:
                "restartPending": restart_pending(),
                "version": VERSION, **status, "boot": STATE.get("boot"), "startupPhases": STATE.get("phases", {})}
         _HEALTH.update(ts=now(), v=out)
+        _HEALTH_REFRESH.update(stage="idle", since=None)
         return out
+
+
+def health(fresh: bool = False) -> dict:
+    if fresh:
+        refresh_health(fresh=True)
+    # A reference swap publishes a complete snapshot. No reader waits for the refresh lock or subprocesses.
+    snapshot = dict(_HEALTH)
+    cached = snapshot["v"]
+    status = startup_status()
+    out = dict(cached or {"ok": False, "up": True, "mode": "degraded", "reasons": ["starting"],
+                          "pool": {"name": CFG["zpool"], "state": "UNKNOWN"}, "mdraid": {"state": "unknown", "arrays": {}},
+                          "queue": None, "running": None, "version": VERSION,
+                          "restartPending": {"count": 0, "since": None}, "boot": STATE.get("boot"),
+                          "startupPhases": STATE.get("phases", {})})
+    if not READY.is_set():
+        reason = STATE["problem"] or "starting"
+        out.update(ok=False, mode="degraded", reasons=[reason] + [r for r in out.get("reasons", []) if r != reason])
+    age = max(0, now() - snapshot["ts"]) if cached else None
+    refresh = dict(_HEALTH_REFRESH)
+    out.update(**status, boot_id=boot_id(), uptime_s=int(host_uptime()), boatd_uptime_s=int(now() - STARTED),
+               snapshot_age_s=round(age, 1) if age is not None else None,
+               refresh_stage=refresh["stage"],
+               refresh_stage_ms=round((time.monotonic() - refresh["since"]) * 1000, 1)
+               if refresh["since"] is not None else 0,
+               refresh_timings_ms=dict(refresh["timings"]), startupPhases=dict(STATE.get("phases") or {}))
+    return out
+
+
+def refresh_health_forever():
+    while True:
+        try:
+            refresh_health(fresh=True)
+        except Exception:
+            log(f"health-refresh failed stage={_HEALTH_REFRESH['stage']}: {traceback.format_exc()[-600:]}")
+        time.sleep(5)
 
 
 # ---------------------------------------------------------------- incus
@@ -1724,7 +1778,14 @@ class Handler(BaseHTTPRequestHandler):
         q = dict(urllib.parse.parse_qsl(u.query))
         path = u.path.removeprefix("/api/v1")
         if path == "/health":
-            return self._send(200, health())
+            began = time.monotonic()
+            try:
+                return self._send(200, health())
+            finally:
+                elapsed = time.monotonic() - began
+                if elapsed > 1:
+                    log(f"health-response ms={elapsed * 1000:.1f} waited_on=snapshot-read-or-socket-write "
+                        f"refresh_stage={_HEALTH_REFRESH['stage']}")
         if not READY.is_set():
             # No pool or still reconciling: nothing but /health is answered, so no caller sees half-settled runs.
             return self._err(503, "server_not_ready", STATE["problem"] or "starting", **startup_status())
@@ -2144,6 +2205,7 @@ def serve() -> None:
                 said = True
             time.sleep(5)
     srv.daemon_threads = True
+    threading.Thread(target=refresh_health_forever, daemon=True).start()
     threading.Thread(target=startup, daemon=True).start()
     log(f"boatd {VERSION} listening on {CFG['listen']}:{CFG['port']}")
     srv.serve_forever()
