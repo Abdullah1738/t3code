@@ -29,7 +29,7 @@ export type ReadonlyExportDiagnosticEvent =
 
 export interface ReadonlyRebuildEvent {
   readonly event: "start" | "progress" | "publish" | "abort";
-  readonly kind: "additive" | "full";
+  readonly kind: "additive" | "full" | "events_reset";
   readonly reason: string;
   readonly generation: number;
   readonly table: string;
@@ -40,6 +40,13 @@ export interface ReadonlyRebuildEvent {
   readonly sequence?: number;
   readonly identitySequence?: number;
   readonly error?: string;
+  readonly cursor?: number;
+  readonly cycleTarget?: number;
+  readonly firstMissingSequence?: number;
+  readonly rowsReturned?: number;
+  readonly rowsDone?: number;
+  readonly publishedReady?: string;
+  readonly readyReason?: string;
 }
 
 export interface LineageRepairBump {
@@ -330,9 +337,21 @@ export function createReadonlyReplica(
       meta("scan_generation", String(n));
       return n;
     };
+    const hasCompactedEvents = () =>
+      Boolean(
+        source
+          .prepare("SELECT 1 FROM sqlite_schema WHERE name='ardud_history_compacted_events'")
+          .get(),
+      );
     const sequence = () =>
       Math.max(
         Number(source.prepare("SELECT max(sequence) AS n FROM orchestration_events").get()?.n ?? 0),
+        hasCompactedEvents()
+          ? Number(
+              source.prepare("SELECT max(sequence) AS n FROM ardud_history_compacted_events").get()
+                ?.n ?? 0,
+            )
+          : 0,
         Number(archive?.prepare("SELECT max(sequence) AS n FROM ardud_events").get()?.n ?? 0),
         Number(
           baseArchive?.prepare("SELECT max(sequence) AS n FROM orchestration_events").get()?.n ?? 0,
@@ -377,6 +396,7 @@ export function createReadonlyReplica(
       pendingRepairs.push(...causes.map((cause) => ({ ...cause, revision })));
     };
     let cycleTransaction = false;
+    let privateSchemaRebuild = false;
     let cycleSession: NodeSqlite.Session | undefined;
     const beginCycle = (trackChanges = true) => {
       // Parent and child rows can change in either copy order. Every
@@ -390,6 +410,7 @@ export function createReadonlyReplica(
       cycleSession = undefined;
       out.exec("COMMIT");
       cycleTransaction = false;
+      privateSchemaRebuild = false;
       flushRepairs();
     };
     let invalidated: string | undefined;
@@ -429,6 +450,7 @@ export function createReadonlyReplica(
       cycleSession?.close();
       cycleSession = undefined;
       cycleTransaction = false;
+      privateSchemaRebuild = false;
       pendingRepairs = [];
       try {
         out.exec("ROLLBACK");
@@ -718,13 +740,24 @@ export function createReadonlyReplica(
             : undefined;
     let rebuild:
       | {
-          kind: "additive" | "full";
+          kind: ReadonlyRebuildEvent["kind"];
           reason: string;
           started: number;
           rows: number;
+          tableRows: number;
           pages: number;
           table: string;
           loggedAt: number;
+          cursor?: number;
+          details: Pick<
+            ReadonlyRebuildEvent,
+            | "cursor"
+            | "cycleTarget"
+            | "firstMissingSequence"
+            | "rowsReturned"
+            | "publishedReady"
+            | "readyReason"
+          >;
         }
       | undefined;
     const rebuildEvent = (event: ReadonlyRebuildEvent["event"], error?: unknown) => {
@@ -733,11 +766,14 @@ export function createReadonlyReplica(
         event,
         kind: rebuild.kind,
         reason: rebuild.reason,
+        ...rebuild.details,
+        ...(rebuild.cursor === undefined ? {} : { cursor: rebuild.cursor }),
         generation:
           Number(getMeta("generation") ?? 0) +
-          (rebuild.kind === "full" && event !== "publish" ? 1 : 0),
+          (rebuild.kind !== "additive" && event !== "publish" ? 1 : 0),
         table: rebuild.table,
         rows: rebuild.rows,
+        rowsDone: rebuild.tableRows,
         pages: rebuild.pages,
         elapsedMs: Date.now() - rebuild.started,
         ...(event === "publish"
@@ -785,15 +821,36 @@ export function createReadonlyReplica(
       options.onRebuildEvent?.(value);
       rebuild.loggedAt = Date.now();
     };
-    const startRebuild = (kind: "additive" | "full", reason: string) => {
+    const startRebuild = (
+      kind: ReadonlyRebuildEvent["kind"],
+      reason: string,
+      details: Pick<
+        ReadonlyRebuildEvent,
+        "cursor" | "cycleTarget" | "firstMissingSequence" | "rowsReturned" | "publishedReady"
+      > = {},
+      started = Date.now(),
+    ) => {
       rebuild = {
         kind,
         reason,
-        started: Date.now(),
+        started,
         rows: 0,
+        tableRows: 0,
         pages: 0,
         table: "",
         loggedAt: Date.now(),
+        details: {
+          publishedReady: getMeta("ready") ?? "0",
+          readyReason:
+            kind === "events_reset"
+              ? reason
+              : reason.startsWith("source schema")
+                ? "schema"
+                : reason.includes("bootstrap")
+                  ? "bootstrap"
+                  : reason,
+          ...details,
+        },
       };
       meta("rebuild_started_at", new Date(rebuild.started).toISOString());
       meta("rebuild_finished_at", "");
@@ -808,12 +865,18 @@ export function createReadonlyReplica(
         rebuild = undefined;
       }
     };
-    const notePage = (table: string, rows: number) => {
+    const heartbeatRebuild = () => {
+      if (rebuild && Date.now() - rebuild.loggedAt >= 30_000) rebuildEvent("progress");
+    };
+    const notePage = (table: string, rows: number, cursor?: number) => {
       if (!rebuild) return;
+      rebuild.tableRows = (rebuild.table === table ? rebuild.tableRows : 0) + rows;
       rebuild.table = table;
       rebuild.rows += rows;
       rebuild.pages++;
-      if (Date.now() - rebuild.loggedAt >= 30_000) rebuildEvent("progress");
+      if (cursor === undefined) delete rebuild.cursor;
+      else rebuild.cursor = cursor;
+      heartbeatRebuild();
     };
     if (rebuildReason) {
       const lastReason = getMeta("last_rebuild_reason");
@@ -853,6 +916,7 @@ export function createReadonlyReplica(
       // No reader lock protocol is shared with state.sqlite readers (the
       // OpenCode .export.lock guards only that export's writer).
       beginCycle(false);
+      privateSchemaRebuild = true;
       transaction(() => {
         for (const name of [
           ...projections,
@@ -867,7 +931,7 @@ export function createReadonlyReplica(
         out.exec(bookkeeping);
         out
           .prepare(
-            "DELETE FROM ardud_readonly_meta WHERE key LIKE 'schema:%' OR key LIKE 'identity_%' OR key LIKE 'additive:%' OR key IN ('archive_deletion_sequence','resetting_events')",
+            "DELETE FROM ardud_readonly_meta WHERE key LIKE 'schema:%' OR key LIKE 'identity_%' OR key LIKE 'additive:%' OR key IN ('archive_deletion_sequence','compaction_revision','resetting_events')",
           )
           .run();
         meta("source", identity);
@@ -1222,6 +1286,9 @@ export function createReadonlyReplica(
           { db: source, table: "orchestration_events" },
           ...(archive ? [{ db: archive, table: "ardud_events" }] : []),
           ...(baseArchive ? [{ db: baseArchive, table: "orchestration_events" }] : []),
+          ...(hasCompactedEvents()
+            ? [{ db: source, table: "ardud_history_compacted_events" }]
+            : []),
         ]) {
           const row = db
             .prepare(`SELECT sequence FROM ${q(table)} WHERE sequence>? ORDER BY sequence LIMIT 1`)
@@ -1473,7 +1540,7 @@ export function createReadonlyReplica(
         if (changed.length) {
           // Routine pending diffs must restart at the new auxiliary shape.
           // A private full rebuild keeps its transaction and completed projection pages.
-          if (rebuild?.kind !== "full") abortCycle();
+          if (!privateSchemaRebuild) abortCycle();
           for (const table of changed) {
             pendingAuxiliarySchemas.set(table.name, table);
             configureTable(table);
@@ -1515,7 +1582,7 @@ export function createReadonlyReplica(
               JSON.stringify({ ...saved, cursor: Number(rows.at(-1)!.__rowid) }),
             );
         });
-        notePage(name, rows.length);
+        notePage(name, rows.length, Number(rows.at(-1)?.__rowid ?? saved.cursor));
         if (!pendingAdditions()) {
           meta("rebuild_finished_at", new Date(Date.now()).toISOString());
           rebuildEvent("publish");
@@ -1530,50 +1597,54 @@ export function createReadonlyReplica(
         beginCycle();
       }
       if (resettingEvents) {
-        const result = out
-          .prepare(
-            "DELETE FROM orchestration_events WHERE sequence IN (SELECT sequence FROM orchestration_events LIMIT ?)",
-          )
-          .run(batchSize);
-        notePage("orchestration_events", 0);
-        resettingEvents = Number(result.changes) >= batchSize;
-        if (!resettingEvents) meta("resetting_events", "0");
-        return true;
+        return measure("resetDelete", () => {
+          const result = out
+            .prepare(
+              "DELETE FROM orchestration_events WHERE sequence IN (SELECT sequence FROM orchestration_events LIMIT ?)",
+            )
+            .run(batchSize);
+          notePage("orchestration_events", Number(result.changes));
+          resettingEvents = Number(result.changes) >= batchSize;
+          if (!resettingEvents) meta("resetting_events", "0");
+          return true;
+        });
       }
       if (sequence() < Number(getMeta("sequence")))
         throw invalidate("Readonly event sequence regressed", true);
       for (const name of projections) {
         const saved = progress(name);
         if (saved.done) continue;
-        const generation = saved.generation ?? nextGeneration();
-        if (saved.pruning) {
-          notePage(name, 0);
-          transaction(() =>
-            checkpoint(name, { ...saved, ...prune(name, saved.pruneCursor ?? 0, generation) }),
-          );
-          return true;
-        }
-        source.exec("BEGIN");
-        try {
-          const rows = page(name, saved.cursor);
-          notePage(name, rows.length);
-          transaction(() => {
-            for (const row of rows) {
-              copyRow(name, row);
-              if (!name.endsWith("_turn_items") || selectedItems.has(String(row.type)))
-                markSeen(name, row[tables.get(name)!.primary]!, generation);
-            }
-            checkpoint(name, {
-              cursor: Number(rows.at(-1)?.__rowid ?? saved.cursor),
-              done: false,
-              pruning: rows.length < batchSize,
-              generation,
+        return measure("resetScan", () => {
+          const generation = saved.generation ?? nextGeneration();
+          if (saved.pruning) {
+            notePage(name, 0, saved.pruneCursor ?? 0);
+            transaction(() =>
+              checkpoint(name, { ...saved, ...prune(name, saved.pruneCursor ?? 0, generation) }),
+            );
+            return true;
+          }
+          source.exec("BEGIN");
+          try {
+            const rows = page(name, saved.cursor);
+            notePage(name, rows.length, Number(rows.at(-1)?.__rowid ?? saved.cursor));
+            transaction(() => {
+              for (const row of rows) {
+                copyRow(name, row);
+                if (!name.endsWith("_turn_items") || selectedItems.has(String(row.type)))
+                  markSeen(name, row[tables.get(name)!.primary]!, generation);
+              }
+              checkpoint(name, {
+                cursor: Number(rows.at(-1)?.__rowid ?? saved.cursor),
+                done: false,
+                pruning: rows.length < batchSize,
+                generation,
+              });
             });
-          });
-        } finally {
-          source.exec("ROLLBACK");
-        }
-        return true;
+          } finally {
+            source.exec("ROLLBACK");
+          }
+          return true;
+        });
       }
       if (auxiliaryIndex === 0 && auxiliaryCursor === 0 && cycleTarget === undefined) {
         cycleTarget = sequence();
@@ -1590,7 +1661,7 @@ export function createReadonlyReplica(
           const stage = auxiliaryStages.get(name)!;
           if (auxiliaryCursor === 0) out.exec(`DELETE FROM temp.${q(stage.stage)}`);
           const rows = page(name, auxiliaryCursor);
-          notePage(name, rows.length);
+          notePage(name, rows.length, Number(rows.at(-1)?.__rowid ?? auxiliaryCursor));
           transaction(() => {
             for (const row of rows)
               stage.insert.run(...tables.get(name)!.columns.map((c) => row[c]!));
@@ -1630,18 +1701,52 @@ export function createReadonlyReplica(
           // Immutable base events never change; delta shadows base and main
           // shadows both. No cold mutable projection values are exported.
           for (const row of liveRows) merged.set(Number(row.sequence), row);
+          if (hasCompactedEvents()) {
+            for (const row of source
+              .prepare(
+                "SELECT sequence FROM ardud_history_compacted_events WHERE sequence>? AND sequence<=? ORDER BY sequence LIMIT ?",
+              )
+              .all(cursor, through, batchSize)) {
+              merged.set(Number(row.sequence), {
+                sequence: row.sequence!,
+                event_type: "readonly.compacted",
+                stream_id: "",
+                payload_json: "{}",
+              });
+            }
+          }
           const rows = [...merged.values()]
             .sort((a, b) => Number(a.sequence) - Number(b.sequence))
             .slice(0, batchSize);
-          notePage("orchestration_events", rows.length);
-          // Compaction may have removed changes while bootstrap was in flight.
-          // Revisit the paged projections at a fresh watermark, failing closed.
-          if (
-            !rows.length ||
-            rows.some(
-              (row, i) => Number(row.sequence) !== (i ? Number(rows[i - 1]!.sequence) : cursor) + 1,
-            )
-          ) {
+          notePage("orchestration_events", rows.length, Number(rows.at(-1)?.sequence ?? cursor));
+          // Only unjournalled holes require revisiting the projections.
+          const missingIndex = rows.findIndex(
+            (row, i) => Number(row.sequence) !== (i ? Number(rows[i - 1]!.sequence) : cursor) + 1,
+          );
+          if (!rows.length || missingIndex !== -1) {
+            const firstMissingSequence =
+              missingIndex > 0 ? Number(rows[missingIndex - 1]!.sequence) + 1 : cursor + 1;
+            const publishedReady = getMeta("ready") ?? "0";
+            // Discard a routine partial cycle before publishing diagnostics.
+            // A full rebuild owns unpublished schemas, so its transaction and
+            // already advertised start time must survive this reset.
+            const fullStarted = privateSchemaRebuild ? rebuild?.started : undefined;
+            if (fullStarted === undefined) abortCycle();
+            cycleSession?.close();
+            cycleSession = undefined;
+            startRebuild(
+              "events_reset",
+              rows.length ? "gap" : "empty_page",
+              {
+                cursor,
+                cycleTarget: through,
+                firstMissingSequence,
+                rowsReturned: rows.length,
+                publishedReady,
+              },
+              fullStarted,
+            );
+            if (!cycleTransaction) beginCycle(false);
             transaction(() => {
               meta("ready", "0");
               meta("sequence", String(sequence()));
@@ -1649,11 +1754,6 @@ export function createReadonlyReplica(
               meta("resetting_events", "1");
               bumpRepair([{ cause: "reset", table: "orchestration_events", ids: 0 }]);
             });
-            // Publish the reset: readers must not keep using this replica
-            // while projections are rebuilt and events are cleared.
-            if (cycleTransaction && rebuild?.kind !== "full") {
-              commitCycle();
-            }
             resettingEvents = true;
             cycleTarget = undefined;
             auxiliaryIndex = 0;
@@ -1664,6 +1764,10 @@ export function createReadonlyReplica(
           }
           transaction(() => {
             for (const row of rows) {
+              if (row.event_type === "readonly.compacted") {
+                out.prepare("DELETE FROM orchestration_events WHERE sequence=?").run(row.sequence!);
+                continue;
+              }
               const kind = String(row.event_type),
                 family = kind.split(".")[0]!;
               if (
@@ -1743,6 +1847,23 @@ export function createReadonlyReplica(
         return true;
       }
       return sourceRead(() => {
+        if (hasCompactedEvents()) {
+          const removals = source
+            .prepare(
+              "SELECT revision,sequence FROM ardud_history_compacted_events WHERE revision>? ORDER BY revision LIMIT ?",
+            )
+            .all(Number(getMeta("compaction_revision") ?? 0), batchSize);
+          if (removals.length) {
+            transaction(() => {
+              for (const removal of removals)
+                out
+                  .prepare("DELETE FROM orchestration_events WHERE sequence=?")
+                  .run(removal.sequence!);
+              meta("compaction_revision", String(removals.at(-1)!.revision));
+            });
+            return true;
+          }
+        }
         if (
           !source
             .prepare("SELECT 1 FROM sqlite_schema WHERE name='ardud_history_archive_deletions'")
@@ -1920,7 +2041,7 @@ export function createReadonlyReplica(
           assertRedactionComplete();
           validate();
           publishIdentities();
-          return stepOnce();
+          return measure("step", stepOnce);
         } catch (error) {
           // Discarding a routine cycle leaves the in-memory cursors ahead of
           // the replica; this exporter must be reopened. Readers keep the last
@@ -1928,6 +2049,8 @@ export function createReadonlyReplica(
           if (abortCycle()) invalidated ??= "Readonly refresh cycle aborted; reopen exporter";
           recordFailure(error);
           throw error;
+        } finally {
+          heartbeatRebuild();
         }
       },
       close() {

@@ -209,10 +209,31 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
   const rebuildEvents: ReadonlyRebuildEvent[] = [];
   const diagnosticEvents: ReadonlyExportDiagnosticEvent[] = [];
   const logRebuilds = Effect.gen(function* () {
-    for (const event of rebuildEvents.splice(0))
+    for (const event of rebuildEvents.splice(0)) {
       yield* (event.event === "abort" ? Effect.logWarning : Effect.logInfo)(
         "Readonly export rebuild",
       ).pipe(Effect.annotateLogs({ ...event }), Effect.withSpan("ardud.readonlyExport.rebuild"));
+      const message =
+        event.event === "start" && event.kind !== "additive"
+          ? "Readonly replica ready cleared"
+          : event.event === "progress" && event.kind === "events_reset"
+            ? "Readonly events reset progress"
+            : event.event === "publish" && event.kind !== "additive"
+              ? "Readonly replica ready restored"
+              : undefined;
+      if (message)
+        yield* Effect.logInfo(message).pipe(
+          Effect.annotateLogs({
+            ...event,
+            reason: event.readyReason ?? event.reason,
+            rowsDone: event.rowsDone ?? event.rows,
+            durationMs: event.elapsedMs,
+            // ready=0 is private when a completed generation survives the reset.
+            visibility:
+              event.event === "start" && event.publishedReady === "1" ? "unpublished" : "published",
+          }),
+        );
+    }
     for (const event of diagnosticEvents.splice(0))
       yield* Effect.logInfo("Readonly export diagnostics").pipe(
         Effect.annotateLogs({ component: "readonly-export", ...event }),
