@@ -399,6 +399,7 @@ const fakeThreads = (
   };
 };
 
+const decodeRelease = Schema.decodeUnknownSync(KanbanRelease);
 const owner: KanbanActor = { _tag: "owner" };
 const decodeMessage = Schema.decodeUnknownEffect(KanbanMessage);
 
@@ -7611,7 +7612,7 @@ const releasePeer = Effect.fn("test.releasePeer")(function* (
 it.effect("replays Watchers #66 versus telegram #64 and Health #22 across boards", () =>
   Effect.gen(function* () {
     const fixture = yield* releaseFixture;
-    const { kanban, store, board, actor, evaluator, create } = fixture;
+    const { kanban, store, board, evaluator, create } = fixture;
     const health = yield* releasePeer(fixture);
     const card = yield* create({ interrupting: true, service: " RoBoB-Watch " });
     assert.strictEqual(card.subtasks[0]!.service, "robob-watch");
@@ -7879,7 +7880,7 @@ it("old release receipts decode without service or postHoc", () => {
     critical: null,
     approvalId: null,
   };
-  assert.deepStrictEqual(Schema.decodeUnknownSync(KanbanRelease)(old), old);
+  assert.deepStrictEqual(decodeRelease(old), old);
 });
 
 it.effect("board readback reconciles a release committed after the board inventory read", () =>

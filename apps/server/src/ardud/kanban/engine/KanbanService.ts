@@ -15295,16 +15295,8 @@ const make = Effect.gen(function* () {
 
   // Board locks are independent; serialize release receipts so two boards cannot admit the same service together.
   const releaseTicks = yield* Semaphore.make(1);
-  const markSubtask: KanbanServiceShape["markSubtask"] = (
-    cardId,
-    subtaskId,
-    state,
-    note,
-    actor,
-    role,
-    releasedAt,
-  ) =>
-    Effect.gen(function* () {
+  const markSubtask: KanbanServiceShape["markSubtask"] = Effect.fn("KanbanService.markSubtask")(
+    function* (cardId, subtaskId, state, note, actor, role, releasedAt) {
       // Admission precedes board locks: completing a step can release them for thread I/O.
       const observed = yield* readDb(rawStore.card(cardId));
       const paced =
@@ -15562,7 +15554,8 @@ const make = Effect.gen(function* () {
       if (Option.isSome(immediate)) return immediate.value;
       yield* Effect.logDebug("kanban release admission waiting", { cardId, subtaskId });
       return yield* completing.pipe(releaseTicks.withPermits(1));
-    });
+    },
+  );
 
   /** Only a board script does a script's subtask, and only on its own board. */
   const scriptFor = Effect.fn("KanbanService.scriptFor")(function* (
