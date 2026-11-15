@@ -273,6 +273,20 @@ def cpu_fields(values):
 
 
 def safe_fields(values, event=None):
+    if event and event.startswith('tailnet.'):
+        result = {}
+        for key, value in (values or {}).items():
+            if key == 'backendState' and value in ('Running', 'Stopped', 'NeedsLogin', 'NeedsMachineAuth', 'Starting', 'NoState', 'Unknown'):
+                result[key] = value
+            elif key in ('statusError', 'extensionError', 'homeProbeError') and value in (None, 'timeout', 'exit', 'parse', 'unavailable'):
+                result[key] = value
+            elif key in ('up', 'selfOnline', 'timedOut', 'homeReachable') and (value is None or type(value) is bool):
+                result[key] = value
+            elif key in ('tailscaleIPsCount', 'exitCode', 'extensionPid', 'notUpChecks', 'outageStart') and (value is None or type(value) is int):
+                result[key] = value
+            elif key == 'extensionPids' and (value is None or isinstance(value, str) and re.fullmatch(r'[0-9 ]{1,180}', value)):
+                result[key] = value
+        return result
     if event in ('cpu.sample', 'cpu.spike'):
         return cpu_fields(values)
     if event == 'disk.clone_wedge':

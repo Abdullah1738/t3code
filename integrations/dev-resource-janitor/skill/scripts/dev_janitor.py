@@ -50,7 +50,7 @@ def log_run(started, found, killed, ok):
 
 
 IDLE_MIN = int(os.environ.get("DEV_JANITOR_IDLE_MIN", "60"))
-LOG_DIR = os.path.expanduser("~/.local/share/dev-janitor")
+LOG_DIR = os.path.expanduser(os.environ.get("DEV_JANITOR_LOG_DIR", "~/.local/share/dev-janitor"))
 AUDIT = os.path.join(LOG_DIR, "audit.jsonl")
 LAST = os.path.join(LOG_DIR, "last.json")
 KEEP_FILE = os.path.expanduser("~/.config/opencode/dev-janitor-keep.txt")

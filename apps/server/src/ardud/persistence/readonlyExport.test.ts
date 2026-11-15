@@ -40,6 +40,7 @@ function fixture(batchSize = 2, setup?: (source: NodeSqlite.DatabaseSync) => voi
     CREATE TABLE ardud_opencode_import (native_session_id TEXT PRIMARY KEY, thread_id TEXT);
     CREATE TABLE ardud_kanban_cards (id TEXT PRIMARY KEY, active_thread_id TEXT, json TEXT);
     CREATE TABLE ardud_kanban_threads (thread_id TEXT PRIMARY KEY, ended INTEGER);
+    CREATE TABLE ardud_kanban_slot_events (id INTEGER PRIMARY KEY AUTOINCREMENT, board_id TEXT NOT NULL, pool_key TEXT NOT NULL, thread_id TEXT NOT NULL, card_id TEXT, kind TEXT NOT NULL CHECK (kind IN ('take','release')), at TEXT NOT NULL, why TEXT NOT NULL);
     INSERT INTO orchestration_events VALUES (1,'thread.created','a','{"id":"a"}');
     INSERT INTO orchestration_v2_projection_threads VALUES ('a','{"title":"old"}');
     INSERT INTO orchestration_v2_projection_threads VALUES ('b','{}');
@@ -1733,28 +1734,23 @@ test("replacing main rebuilds the replica from the new file", () => {
   ).toEqual([{ thread_id: "a" }, { thread_id: "b" }, { thread_id: "new" }]);
 });
 
-test("slow catchup cannot make old auxiliary rows look fresh", () => {
+test("slow catchup refreshes old auxiliary rows before advancing their watermark", () => {
+  let now = Date.parse("2026-11-15T12:00:00Z");
+  vi.spyOn(Date, "now").mockImplementation(() => now);
   const f = fixture();
   f.finish();
-  let now = Date.now();
-  vi.spyOn(Date, "now").mockImplementation(() => now);
-  const started = now;
+  now += 1_000;
   f.source.exec("INSERT INTO scheduled_tasks VALUES ('task','a')");
   f.exporter.step();
   f.source.exec("UPDATE scheduled_tasks SET thread_id='b' WHERE task_id='task'");
   now += 180_000;
   f.source.exec(
-    "INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES ('thread.metadata-updated','a','{\"id\":\"a\"}')",
+    "INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES ('thread.metadata-updated','a','{}')",
   );
   f.finish();
   const out = f.connect();
-  expect(
-    Date.parse(
-      String(
-        out.prepare("SELECT value FROM ardud_readonly_meta WHERE key='updated_at'").get()?.value,
-      ),
-    ),
-  ).toBeLessThanOrEqual(started + 1);
+  expect(out.prepare("SELECT thread_id FROM scheduled_tasks").get()?.thread_id).toBe("b");
+  expect(Date.parse(String(metaValue(out, "updated_at")))).toBe(now);
 });
 
 test("reads split boards when supplied, never stale legacy board tables", () => {
@@ -2122,6 +2118,186 @@ test("a full rebuild heartbeats between archive pages inside one publish drain",
   expect(pages).toBe(4);
   expect(mostProgressInOneStep).toBe(4);
   expect(events.at(-1)).toMatchObject({ event: "publish", elapsedMs: 124_000 });
+});
+
+test("an auxiliary sweep delayed across many steps is refreshed at publication", () => {
+  let now = Date.parse("2026-11-15T12:00:00Z");
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const f = fixture(1);
+  f.finish();
+  const out = f.connect();
+  for (let i = 0; i < 20; i++)
+    f.source.prepare("INSERT INTO scheduled_tasks VALUES (?,'a')").run(`task${i}`);
+  now += 1_000;
+  f.exporter.takeMetrics();
+  let steps = 0;
+  while (f.exporter.step()) {
+    now += 3_000;
+    if (++steps > 100) throw new Error("export did not converge");
+  }
+  expect(steps).toBeGreaterThan(20);
+  expect(now - Date.parse(String(metaValue(out, "updated_at")))).toBeLessThanOrEqual(15_000);
+  expect(Date.parse(String(metaValue(out, "updated_at")))).toBeLessThanOrEqual(now);
+  expect(out.prepare("SELECT count(*) AS n FROM scheduled_tasks").get()?.n).toBe(20);
+  expect(f.exporter.takeMetrics()).toMatchObject({ updatedAtLagMs: 0, auxiliaryWindowMs: 0 });
+});
+
+test("a recent auxiliary capture remains the honest watermark after its row changes", () => {
+  let now = Date.parse("2026-11-15T12:00:00Z");
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const f = fixture();
+  f.finish();
+  const out = f.connect();
+  now += 1_000;
+  const capturedAt = now;
+  f.source.exec("INSERT INTO scheduled_tasks VALUES ('task','a')");
+  expect(f.exporter.step()).toBe(true);
+  now += 1_000;
+  f.source.exec("UPDATE scheduled_tasks SET thread_id='b'");
+  f.finish();
+  expect(out.prepare("SELECT thread_id FROM scheduled_tasks").get()?.thread_id).toBe("a");
+  expect(Date.parse(String(metaValue(out, "updated_at")))).toBe(capturedAt);
+});
+
+test.each([15_000, 15_001])(
+  "auxiliary capture age %i uses the bounded refresh threshold",
+  (age) => {
+    let now = Date.parse("2026-11-15T12:00:00Z");
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const f = fixture();
+    f.finish();
+    const out = f.connect();
+    now += 1_000;
+    const capturedAt = now;
+    f.source.exec("INSERT INTO scheduled_tasks VALUES ('task','a')");
+    f.exporter.step();
+    now += age;
+    f.source.exec("UPDATE scheduled_tasks SET thread_id='b'");
+    f.finish();
+    expect(out.prepare("SELECT thread_id FROM scheduled_tasks").get()?.thread_id).toBe(
+      age > 15_000 ? "b" : "a",
+    );
+    expect(Date.parse(String(metaValue(out, "updated_at")))).toBe(age > 15_000 ? now : capturedAt);
+  },
+);
+
+test("a refreshed auxiliary snapshot never covers a mutation after its capture", () => {
+  let now = Date.parse("2026-11-15T12:00:00Z");
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const f = fixture();
+  f.finish();
+  const out = f.connect();
+  now += 1_000;
+  f.source.exec("INSERT INTO scheduled_tasks VALUES ('task','a')");
+  f.exporter.step();
+  now += 60_000;
+  f.source.exec("UPDATE scheduled_tasks SET thread_id='b'");
+  const capturedAt = now;
+  const all = NodeSqlite.StatementSync.prototype.all;
+  let changed = false;
+  vi.spyOn(NodeSqlite.StatementSync.prototype, "all").mockImplementation(function (
+    this: NodeSqlite.StatementSync,
+    ...args: Parameters<typeof all>
+  ) {
+    const rows = all.apply(this, args);
+    if (!changed && rows.some((row) => row.task_id === "task")) {
+      changed = true;
+      now += 1_000;
+      f.source.exec("UPDATE scheduled_tasks SET thread_id='c'");
+    }
+    return rows;
+  });
+  f.finish();
+  expect(changed).toBe(true);
+  expect(out.prepare("SELECT thread_id FROM scheduled_tasks").get()?.thread_id).toBe("b");
+  expect(Date.parse(String(metaValue(out, "updated_at")))).toBe(capturedAt);
+  expect(f.exporter.takeMetrics()).toMatchObject({
+    updatedAtLagMs: 1_000,
+    auxiliaryWindowMs: 1_000,
+  });
+});
+
+test("a stale split-board sweep refreshes all auxiliary tables in a board snapshot", () => {
+  let now = Date.parse("2026-11-15T12:00:00Z");
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const f = fixture(1);
+  f.exporter.close();
+  const boardPath = NodePath.join(NodePath.dirname(f.options.sourcePath), "boards.sqlite");
+  const boards = new NodeSqlite.DatabaseSync(boardPath);
+  cleanups.push(() => boards.close());
+  boards.exec(`PRAGMA journal_mode=WAL;
+    CREATE TABLE ardud_boards_migration(table_name TEXT PRIMARY KEY, completed INTEGER);
+    INSERT INTO ardud_boards_migration VALUES ('*',1);
+    CREATE TABLE ardud_kanban_cards(id TEXT PRIMARY KEY, active_thread_id TEXT, json TEXT);
+    CREATE TABLE ardud_kanban_threads(thread_id TEXT PRIMARY KEY, ended INTEGER);
+    INSERT INTO ardud_kanban_cards VALUES ('card','a','old');
+    INSERT INTO ardud_kanban_threads VALUES ('a',0)`);
+  const exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, { ...f.options, boardPath });
+  cleanups.push(() => exporter.close());
+  drive(exporter);
+  now += 1_000;
+  f.source.exec(
+    "INSERT INTO scheduled_tasks VALUES ('task','a'); INSERT INTO ardud_opencode_import VALUES ('native','a')",
+  );
+  for (let i = 0; i < 6; i++) exporter.step();
+  now += 60_000;
+  f.source.exec(
+    "UPDATE scheduled_tasks SET thread_id='b'; UPDATE ardud_opencode_import SET thread_id='b'",
+  );
+  boards.exec(
+    "UPDATE ardud_kanban_cards SET json='fresh'; UPDATE ardud_kanban_threads SET ended=1",
+  );
+  const capturedAt = now;
+  const all = NodeSqlite.StatementSync.prototype.all;
+  let changed = false;
+  vi.spyOn(NodeSqlite.StatementSync.prototype, "all").mockImplementation(function (
+    this: NodeSqlite.StatementSync,
+    ...args: Parameters<typeof all>
+  ) {
+    const rows = all.apply(this, args);
+    if (!changed && rows.some((row) => row.id === "card" && row.json === "fresh")) {
+      changed = true;
+      now += 1_000;
+      boards.exec(
+        "UPDATE ardud_kanban_cards SET json='later'; UPDATE ardud_kanban_threads SET ended=2",
+      );
+    }
+    return rows;
+  });
+  drive(exporter);
+  const out = f.connect();
+  expect(changed).toBe(true);
+  expect(out.prepare("SELECT thread_id FROM scheduled_tasks").get()?.thread_id).toBe("b");
+  expect(out.prepare("SELECT thread_id FROM ardud_opencode_import").get()?.thread_id).toBe("b");
+  expect(out.prepare("SELECT json FROM ardud_kanban_cards").get()?.json).toBe("fresh");
+  expect(out.prepare("SELECT ended FROM ardud_kanban_threads").get()?.ended).toBe(1);
+  expect(Date.parse(String(metaValue(out, "updated_at")))).toBe(capturedAt);
+});
+
+test("a stale 36k-row auxiliary sweep converges without another paged cycle", () => {
+  let now = Date.parse("2026-11-15T12:00:00Z");
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const f = fixture(100);
+  f.finish();
+  const insert = f.source.prepare("INSERT INTO scheduled_tasks VALUES (?,'a')");
+  f.source.exec("BEGIN");
+  for (let i = 0; i < 36_200; i++) insert.run(`task${i}`);
+  f.source.exec("COMMIT");
+  now += 1_000;
+  f.exporter.step();
+  now += 60_000;
+  expect(f.finish()).toBeLessThan(370);
+  const out = f.connect();
+  expect(out.prepare("SELECT count(*) AS n FROM scheduled_tasks").get()?.n).toBe(36_200);
+  expect(Date.parse(String(metaValue(out, "updated_at")))).toBe(now);
+});
+
+test("repeated publications cannot advance updated_at past a frozen source clock", () => {
+  const now = Date.parse("2026-11-15T12:00:00Z");
+  vi.spyOn(Date, "now").mockReturnValue(now);
+  const f = fixture();
+  for (let i = 0; i < 5; i++) f.finish();
+  expect(Date.parse(String(metaValue(f.connect(), "updated_at")))).toBe(now);
 });
 
 test("identical rows are not rewritten into the replica", () => {
@@ -3078,6 +3254,27 @@ test("upgrading a published replica catches identities committed before the new 
       .get(),
   ).toBeDefined();
   expect(metaValue(out, "sequence")).toBe("1");
+});
+
+test("exports slot ledger appends across generations and exporter restarts", () => {
+  const f = fixture();
+  f.source.exec(
+    "INSERT INTO ardud_kanban_slot_events VALUES (1,'b','p','t','c','take','2026-11-13T01:00:00.000Z','start')",
+  );
+  f.finish();
+  const out = f.connect();
+  expect(out.prepare("SELECT kind FROM ardud_kanban_slot_events ORDER BY id").all()).toEqual([
+    { kind: "take" },
+  ]);
+  f.source.exec(
+    "INSERT INTO ardud_kanban_slot_events VALUES (2,'b','p','t',NULL,'release','2026-11-13T02:00:00.000Z','hold_end')",
+  );
+  f.restart();
+  f.finish();
+  expect(out.prepare("SELECT kind FROM ardud_kanban_slot_events ORDER BY id").all()).toEqual([
+    { kind: "take" },
+    { kind: "release" },
+  ]);
 });
 
 test.each([

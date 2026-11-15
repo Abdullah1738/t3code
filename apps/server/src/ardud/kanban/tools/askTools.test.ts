@@ -199,6 +199,67 @@ it.effect("card_ask warns when an ask cannot clear an open evaluator gate", () =
   }).pipe(Effect.provide(testLayer())),
 );
 
+it.effect.each(
+  (["evaluator", "worker"] as const).flatMap((role) =>
+    (["decision", "change", "action"] as const).map((kind) => ({ role, kind })),
+  ),
+)("#1580 $role gets gate notes on $kind ask creation and edits", ({ role, kind }) =>
+  Effect.gen(function* () {
+    const { kanban, card } = yield* setup;
+    yield* kanban.editCard(
+      card.id,
+      {
+        subtasks: [
+          { text: "Write code", owner: "work" },
+          { text: "Run paid image check", owner: "evaluator", gate: "money" },
+        ],
+      },
+      owner,
+    );
+    let caller = evaluator;
+    if (role === "worker") {
+      yield* kanban.dispatchNow;
+      caller = (yield* kanban.card(card.id)).card.activeThreadId!;
+      assert.isNotNull(caller);
+    }
+    const asked = yield* call(caller, "card_ask", {
+      card: card.id,
+      kind,
+      question: "May I run the check?",
+      title: "Approve s2: one paid test image (up to $4)",
+      ...(kind === "change" ? { changes: [{ label: "Text", before: "Old", after: "New" }] } : {}),
+      ...(kind === "action" ? { action: { summary: "Run one paid image check" } } : {}),
+      options: [
+        { id: "go", label: "Sounds good" },
+        { id: "drop", label: "Drop" },
+      ],
+    });
+    assert.isFalse(asked.isError, asked.text);
+    assert.include(asked.structured.note, "No option here clears s2 (money)");
+    const fixed = yield* call(caller, "card_ask_change", {
+      card: card.id,
+      ask: "q1",
+      options: [
+        { id: "go", label: "Approve both" },
+        { id: "drop", label: "Drop" },
+      ],
+    });
+    assert.isFalse(fixed.isError, fixed.text);
+    assert.notProperty(fixed.structured, "note");
+    const broken = yield* call(caller, "card_ask_change", {
+      card: card.id,
+      ask: "q1",
+      options: [
+        { id: "go", label: "Sounds good" },
+        { id: "drop", label: "Drop" },
+      ],
+    });
+    assert.isFalse(broken.isError, broken.text);
+    assert.include(broken.structured.note, "No option here clears s2 (money)");
+    assert.strictEqual((yield* kanban.card(card.id)).card.asks[0]!.kind, kind);
+  }).pipe(Effect.provide(testLayer())),
+);
+
 it.effect('#94: card_ask warns about kind "secret" for approval without changing its preset', () =>
   Effect.gen(function* () {
     const { kanban, board } = yield* setup;

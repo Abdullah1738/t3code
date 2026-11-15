@@ -18,6 +18,7 @@ import * as TestClock from "effect/testing/TestClock";
 
 import {
   KanbanError,
+  KanbanScriptId,
   kanbanRetryNotBefore,
   kanbanRetrying,
   kanbanWaiting,
@@ -48,6 +49,7 @@ import { effortOptionId } from "@t3tools/client-runtime/ardud/models/harnessRout
 import * as Waits from "./waits.ts";
 import { opencodeTestProvider } from "./testProviders.ts";
 import { KanbanThreads, type KanbanThreadView } from "./threads.ts";
+import { ownerReplyPending } from "./ownerReplyWake.ts";
 
 type Failure = OrchestrationV2ProviderFailure & {
   readonly runId?: string | null;
@@ -778,6 +780,40 @@ it.effect.each(["running", "idle"] as const)(
         }
       }).pipe(Effect.provide(testLayer(fake.layer)));
     }),
+);
+
+it.effect("a script post keeps its reply reminder without an owner message", () =>
+  Effect.gen(function* () {
+    const fake = makeFake();
+    yield* Effect.gen(function* () {
+      const { kanban, card, thread } = yield* workingCard;
+      const store = yield* KanbanStore.KanbanStore;
+      const discussion = yield* kanban.cardDiscussion(card.id);
+      const script = { _tag: "script" as const, scriptId: KanbanScriptId.make("script-reminder") };
+      yield* kanban.post(discussion.id, script, [{ _tag: "md", text: "Please check this result" }]);
+      assert.isNull(yield* store.ownerReply(discussion.id, thread, false));
+      const action = yield* ownerReplyPending(store, discussion.id, thread);
+      assert.isNotNull(action);
+      yield* kanban.post(discussion.id, { _tag: "system", component: "scribe" }, [
+        { _tag: "md", text: "Status" },
+      ]);
+      const sent = fake.messages(thread).length;
+      yield* kanban.turnEnded(thread);
+      assert.deepStrictEqual(fake.messages(thread).slice(sent), [
+        `The owner is waiting for your reply in discussion ${discussion.id}. Post it with discussion_post.`,
+      ]);
+      assert.strictEqual(yield* ownerReplyPending(store, discussion.id, thread), action);
+      yield* kanban.post(discussion.id, { _tag: "thread", threadId: thread }, [
+        { _tag: "md", text: "Checked" },
+      ]);
+      assert.isNull(yield* ownerReplyPending(store, discussion.id, thread));
+      yield* kanban.post(discussion.id, script, [
+        { _tag: "md", text: "Please check the next result" },
+      ]);
+      assert.isNotNull(yield* ownerReplyPending(store, discussion.id, thread));
+      assert.notStrictEqual(yield* ownerReplyPending(store, discussion.id, thread), action);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
 );
 
 it.effect.each(["retry", "wait"] as const)(

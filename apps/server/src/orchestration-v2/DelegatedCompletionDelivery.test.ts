@@ -2172,6 +2172,182 @@ it.layer(Layer.merge(layerTest, ProviderContinuationRequests.layer))(
 );
 
 it.layer(layerTest)("delegated tasks across a server restart", (it) => {
+  it.effect.each(["none", "answer", "error"] as const)(
+    "recovers a runtime-lost marker alongside %s child output",
+    (output) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const sink = yield* EventSink.EventSinkV2;
+        const now = yield* DateTime.now;
+        const name = `runtime-lost-${output}`;
+        const threadId = ThreadId.make(`thread:${name}:parent`);
+        const projectId = ProjectId.make(`project:${name}`);
+        const runId = RunId.make(`run:${name}:parent`);
+        const rootNodeId = NodeId.make(`node:${name}:parent`);
+        yield* seedParentWithTerminalTask({
+          threadId,
+          projectId,
+          runId,
+          rootNodeId,
+          taskId: NodeId.make(`node:${name}:seed`),
+          deliveryState: "delivered",
+          now,
+        });
+        const child = yield* seedRestartCancelledChild({
+          parentThreadId: threadId,
+          projectId,
+          parentRunId: runId,
+          rootNodeId,
+          name,
+          completionWake: "always",
+          continuationPending: true,
+          continuationCommandId: CommandId.make(`command:runtime-reconcile:startup:${name}`),
+          now,
+        });
+        const before = yield* orchestrator.getThreadProjection(child.childThreadId);
+        const source = { ...before.runs[0]!, rootNodeId: NodeId.make(`${name}:root`) };
+        const marker = {
+          id: TurnItemId.make(`turn-item:runtime-lost:${source.id}`),
+          threadId: child.childThreadId,
+          runId: source.id,
+          nodeId: source.rootNodeId,
+          providerThreadId: source.providerThreadId,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal: 0,
+          type: "error" as const,
+          title: "Provider runtime stopped",
+          status: "failed" as const,
+          startedAt: now,
+          completedAt: now,
+          updatedAt: now,
+          failure: {
+            class: "transport_error" as const,
+            category: "unknown" as const,
+            code: "provider.runtime_lost",
+            message: "Server restarted",
+            retryable: true,
+          },
+        };
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make(`${name}:source`),
+              type: "run.updated",
+              threadId: child.childThreadId,
+              occurredAt: now,
+              payload: source,
+            },
+            {
+              id: EventId.make(`${name}:marker`),
+              type: "turn-item.updated",
+              threadId: child.childThreadId,
+              occurredAt: now,
+              payload: marker,
+            },
+            ...(output === "none"
+              ? []
+              : [
+                  {
+                    id: EventId.make(`${name}:output`),
+                    type: "turn-item.updated" as const,
+                    threadId: child.childThreadId,
+                    occurredAt: now,
+                    payload:
+                      output === "answer"
+                        ? {
+                            ...marker,
+                            id: TurnItemId.make(`${name}:answer`),
+                            ordinal: 1,
+                            type: "assistant_message" as const,
+                            status: "completed" as const,
+                            messageId: MessageId.make(`${name}:answer`),
+                            text: "Original child answer",
+                            streaming: false,
+                            phase: "answer" as const,
+                          }
+                        : {
+                            ...marker,
+                            id: TurnItemId.make(`${name}:provider-error`),
+                            ordinal: 1,
+                            failure: {
+                              class: "provider_error" as const,
+                              code: null,
+                              message: "Provider failed",
+                              retryable: false,
+                            },
+                          },
+                  },
+                ]),
+          ],
+        });
+        yield* orchestrator.recoverDelegatedTasks;
+        const recovered = yield* orchestrator.getThreadProjection(threadId);
+        const task = recovered.subagents.find((row) => row.id === child.taskId)!;
+        if (output === "none") {
+          assert.equal(task.status, "running");
+          assert.isNull(task.result);
+          assert.isEmpty(recovered.contextTransfers);
+        } else if (output === "error") {
+          assert.equal(task.status, "cancelled");
+          assert.isNotNull(task.result);
+          assert.isFalse(yield* orchestrator.delegatedTaskResultPending(child.childThreadId));
+          assert.equal(
+            (yield* orchestrator.getThreadProjection(child.childThreadId)).runs.length,
+            1,
+          );
+        } else {
+          // A completed provider turn declines its retained restart effect.
+          const attemptId = RunAttemptId.make(`${name}:attempt`);
+          yield* sink.write({
+            events: [
+              {
+                id: EventId.make(`${name}:attempt`),
+                type: "run.updated",
+                threadId: child.childThreadId,
+                occurredAt: now,
+                payload: { ...source, activeAttemptId: attemptId },
+              },
+              {
+                id: EventId.make(`${name}:completed`),
+                type: "provider-turn.updated",
+                threadId: child.childThreadId,
+                occurredAt: now,
+                payload: {
+                  id: ProviderTurnId.make(`${name}:turn`),
+                  providerThreadId: ProviderThreadId.make(`${name}:provider`),
+                  nodeId: source.rootNodeId,
+                  runAttemptId: attemptId,
+                  nativeTurnRef: null,
+                  ordinal: 1,
+                  status: "completed",
+                  startedAt: now,
+                  completedAt: now,
+                  finish: "stop",
+                },
+              },
+            ],
+          });
+          yield* continueRestartedRun({
+            threadId: child.childThreadId,
+            sourceRunId: source.id,
+          }).pipe(
+            Effect.provide(ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true })),
+          );
+          const settled = (yield* orchestrator.getThreadProjection(threadId)).subagents.find(
+            (row) => row.id === child.taskId,
+          )!;
+          assert.equal(settled.status, "cancelled");
+          assert.equal(settled.result, "Original child answer");
+          assert.equal(
+            (yield* orchestrator.getThreadProjection(child.childThreadId)).runs.length,
+            1,
+          );
+        }
+      }),
+  );
+
   it.effect.each(["stop", "length"] as const)(
     "queues a child result with finish=%s without a provider history handoff",
     (finish) =>

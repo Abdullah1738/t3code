@@ -1,3 +1,4 @@
+import { normalizeSql, sqlFingerprint } from "./sqlDiagnostics.ts";
 // @effect-diagnostics nodeBuiltinImport:off -- private SQLite reader process transport.
 import * as NodeUtil from "node:util";
 import * as Context from "effect/Context";
@@ -119,9 +120,9 @@ const prepare = (sql, cached) => {
   return statement;
 };
 parentPort.on("message", ({ id, sql, params, cached, values, raw, safeIntegers }) => {
+  const executionStarted = performance.now();
   if (workerData.reportStarted) parentPort.postMessage({ started: id });
   let operation = "open";
-  const executionStarted = performance.now();
   try {
     if (db === undefined) throw new Error("database reader is unavailable");
     operation = "prepare";
@@ -255,7 +256,7 @@ export const makeAuthReader = Effect.fnUntraced(function* (
       allowExtension: options.allowExtension ?? false,
       prepareCacheSize: options.prepareCacheSize ?? 200,
       initializationSql: options.readerInitializationSql ?? [],
-      reportStarted: false,
+      reportStarted: true,
       // The child's own SIGKILL guard, which also bounds an orphan or a stalled
       // parent. Arming it at the statement limit for every statement killed each
       // slow autocommit read in-process ("exited with code null") whatever the
@@ -284,6 +285,7 @@ export const makeAuthReader = Effect.fnUntraced(function* (
       readonly sql: string;
       readonly resume: (reply: ReaderReply) => void;
       readonly reject: (error: SqlError) => void;
+      readonly recordExecutionLowerBound: () => void;
       /** A statement outside any transaction on this connection. */
       readonly autocommit: boolean;
       readonly enqueuedAt: number;
@@ -293,6 +295,8 @@ export const makeAuthReader = Effect.fnUntraced(function* (
       readonly post: () => void;
       /** When it was sent. Unset means the child never saw it: it ran nothing. */
       execAt?: number;
+      /** Parent observation of the child's execution start, separate from the deadline clock. */
+      startedAt?: number;
       reported?: boolean;
       /** The caller gave up; the child still finishes it and its reply is dropped. */
       abandoned?: boolean;
@@ -328,6 +332,7 @@ export const makeAuthReader = Effect.fnUntraced(function* (
       const sent = entry.execAt !== undefined;
       if (sent) abandonedCount++;
       else pending.delete(entry.id);
+      entry.recordExecutionLowerBound();
       entry.reject(readerBusy(`Reader lane busy: no answer within ${statementLimitMs} ms`, sent));
       entry.settle();
       if (pending.size === 0) worker.unref();
@@ -353,8 +358,10 @@ export const makeAuthReader = Effect.fnUntraced(function* (
       if (request?.execAt === undefined) return;
       const elapsedMs = Math.round(now - request.execAt);
       const limitMs = request.autocommit ? wedgeLimitMs : statementLimitMs;
+      const normalized = normalizeSql(request.sql);
       const details = {
-        sql: request.sql.replace(/\s+/g, " ").trim().slice(0, 2000),
+        sql: normalized.slice(0, 2000),
+        "sql.fingerprint": sqlFingerprint(normalized),
         elapsedMs,
         queued: pending.size - 1,
         abandoned: abandonedCount,
@@ -389,6 +396,7 @@ export const makeAuthReader = Effect.fnUntraced(function* (
           request.settle();
           continue;
         }
+        request.recordExecutionLowerBound();
         if (request.endsTransaction && !/^\s*COMMIT\b/i.test(request.sql)) {
           const reply: ReaderReply = { id, rows: [] };
           void retiring.then(() => {
@@ -417,8 +425,7 @@ export const makeAuthReader = Effect.fnUntraced(function* (
       }
       if ("started" in reply) {
         const request = pending.get(reply.started);
-        if (request !== undefined) request.execAt = performance.now();
-        running = reply.started;
+        if (request !== undefined) request.startedAt = performance.now();
         return;
       }
       if ("error" in reply) {
@@ -454,8 +461,23 @@ export const makeAuthReader = Effect.fnUntraced(function* (
     worker.on("error", (cause) => stop(`Database reader failed: ${cause.message}`));
     worker.on("exit", (code) => stop(`Database reader exited with code ${code}`));
 
-    const request = (input: ReaderRequest) =>
+    // Snapshot housekeeping shares the SQL span but must not replace its query timing.
+    const request = (input: ReaderRequest, annotateExecution = true) =>
       Effect.withFiber<ReadonlyArray<any>, SqlError>((fiber) => {
+        const span =
+          fiber.getRef(References.TracerEnabled) && fiber.getRef(Statement.SpanPropagationEnabled)
+            ? Context.getOrUndefined(fiber.context, Tracer.ParentSpan)
+            : undefined;
+        const recordExecution = (elapsedMs: number | undefined, lowerBound = false) => {
+          if (!annotateExecution || elapsedMs === undefined || span?._tag !== "Span") return;
+          if (span.status._tag !== "Started") return;
+          try {
+            span.attribute("db.statement.execution_ms", elapsedMs);
+            if (lowerBound) span.attribute("db.statement.execution_is_lower_bound", true);
+          } catch {
+            // Diagnostics cannot replace a transport failure.
+          }
+        };
         const endsTransaction = endsReadTransaction(input.sql);
         if (stoppedMessage !== undefined) {
           const result =
@@ -512,16 +534,12 @@ export const makeAuthReader = Effect.fnUntraced(function* (
             // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
             post: () => worker.postMessage({ id, safeIntegers, ...input, cached }),
             reject: (error) => resume(Effect.fail(error)),
+            recordExecutionLowerBound: () => {
+              if (entry.startedAt !== undefined)
+                recordExecution(Math.max(0, performance.now() - entry.startedAt), true);
+            },
             resume: (reply) => {
-              if (
-                reply.executionMs !== undefined &&
-                fiber.getRef(References.TracerEnabled) &&
-                fiber.getRef(Statement.SpanPropagationEnabled)
-              ) {
-                const span = Context.getOrUndefined(fiber.context, Tracer.ParentSpan);
-                if (span?._tag === "Span")
-                  span.attribute("db.statement.execution_ms", reply.executionMs);
-              }
+              recordExecution(reply.executionMs);
               if ("rows" in reply) {
                 resume(Effect.succeed(reply.rows));
                 return;
@@ -571,7 +589,7 @@ export const makeAuthReader = Effect.fnUntraced(function* (
     let snapshotTransaction = false;
     const pinSnapshots = Effect.forEach(
       options.readerSnapshotSql ?? [],
-      (sql) => request({ sql, params: [], cached: true, values: false, raw: false }),
+      (sql) => request({ sql, params: [], cached: true, values: false, raw: false }, false),
       { discard: true },
     );
     const withSnapshot = <A>(sql: string, effect: Effect.Effect<A, SqlError>) =>
@@ -590,7 +608,10 @@ export const makeAuthReader = Effect.fnUntraced(function* (
         return Effect.uninterruptibleMask((restore) =>
           snapshotLock
             .withPermits(1)(
-              request({ sql: "BEGIN", params: [], cached: false, values: false, raw: false }).pipe(
+              request(
+                { sql: "BEGIN", params: [], cached: false, values: false, raw: false },
+                false,
+              ).pipe(
                 Effect.tapError((error) =>
                   Effect.sync(() => {
                     if (readerLaneFailure(error) === "retryable") begun = false;
@@ -604,13 +625,16 @@ export const makeAuthReader = Effect.fnUntraced(function* (
               Effect.ensuring(
                 Effect.suspend(() =>
                   begun
-                    ? request({
-                        sql: "ROLLBACK",
-                        params: [],
-                        cached: false,
-                        values: false,
-                        raw: false,
-                      }).pipe(Effect.ignore)
+                    ? request(
+                        {
+                          sql: "ROLLBACK",
+                          params: [],
+                          cached: false,
+                          values: false,
+                          raw: false,
+                        },
+                        false,
+                      ).pipe(Effect.ignore)
                     : Effect.void,
                 ),
               ),

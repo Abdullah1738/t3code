@@ -159,6 +159,8 @@ import {
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
+const isTurnNotActiveError = Schema.is(ProviderAdapter.ProviderAdapterTurnNotActiveError);
+
 const CODEX_PROVIDER = ProviderDriverKind.make("codex");
 export const CODEX_DRIVER_KIND = CODEX_PROVIDER;
 export const CODEX_DEFAULT_INSTANCE_ID = defaultInstanceIdForDriver(CODEX_DRIVER_KIND);
@@ -7704,9 +7706,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 )
                   return;
                 if (turnInput.requestRuntimeRestart === true) return;
-                return yield* toProtocolError(
-                  `Provider turn ${turnInput.providerTurnId} is not active and cannot be interrupted.`,
-                );
+                return yield* new ProviderAdapter.ProviderAdapterTurnNotActiveError({
+                  driver: CODEX_PROVIDER,
+                  providerThreadId: turnInput.providerThread.id,
+                  providerTurnId: turnInput.providerTurnId,
+                });
               }
               const interruptTargets: Array<{
                 readonly context: ActiveCodexTurnContext;
@@ -8055,14 +8059,15 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             },
             (effect, requestedInput) =>
               effect.pipe(
-                Effect.mapError(
-                  (cause) =>
-                    new ProviderAdapter.ProviderAdapterInterruptError({
-                      driver: CODEX_PROVIDER,
-                      providerThreadId: requestedInput.providerThread.id,
-                      providerTurnId: requestedInput.providerTurnId,
-                      cause,
-                    }),
+                Effect.mapError((cause) =>
+                  isTurnNotActiveError(cause)
+                    ? cause
+                    : new ProviderAdapter.ProviderAdapterInterruptError({
+                        driver: CODEX_PROVIDER,
+                        providerThreadId: requestedInput.providerThread.id,
+                        providerTurnId: requestedInput.providerTurnId,
+                        cause,
+                      }),
                 ),
               ),
           ),
