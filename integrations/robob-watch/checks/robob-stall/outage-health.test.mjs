@@ -32,6 +32,7 @@ for (const row of cases) test(`outage evidence to alert: ${row.name}`, async () 
   const now = Date.now();
   const notificationNow = Date.parse("2026-11-13T10:30:00Z");
   const boot = new Date(now - 3_600_000).toISOString();
+  const bootId = "8d0efaf9-5dd4-400f-9db1-8308e5a591b0";
   const tail = {
     text: [4, 3, 2].map(minutes => JSON.stringify({ time: new Date(now - minutes * 60_000).toISOString(), delayMaxMs: 6000, rssMb: 3000 })).join("\n") + "\n",
     bytesRead: 300,
@@ -47,11 +48,11 @@ for (const row of cases) test(`outage evidence to alert: ${row.name}`, async () 
         if (outcome === "timeout") return new Promise(() => {});
         if (outcome === "error") throw new Error("fixture transport failure");
         return route === "/health"
-          ? { ok: true, status: "healthy", serverStartedAt: new Date(now - 7_200_000).toISOString() }
+          ? { ok: true, status: "healthy", serverStartedAt: boot, bootId: "f2493692-950c-4f64-9025-73e929d67f42" }
           : { threads: [] };
       },
     },
-    readRuntime: () => row.missingRuntime ? null : { origin: "http://127.0.0.1:3773", pid: process.pid, startedAt: boot, ...row.runtime },
+    readRuntime: () => row.missingRuntime ? null : { origin: "http://127.0.0.1:3773", pid: process.pid, bootId, startedAt: boot, ...row.runtime },
     checkListener: ({ pid, port }) => {
       ownershipChecks++;
       assert.deepEqual({ pid, port }, { pid: process.pid, port: 3773 });
