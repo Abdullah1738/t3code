@@ -1,5 +1,5 @@
 import { assert, it } from "@effect/vitest";
-import { ThreadId } from "@t3tools/contracts";
+import { KanbanBoardId, KanbanCardId, ThreadId } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -377,14 +377,25 @@ it.effect.each([...SavedReply.TOOLS])(
       const entered = yield* Deferred.make<void>();
       const call = yield* Effect.forkChild(
         SavedReply.protect(
-          locks
-            .board(
-              "a",
-              locks.outside(
-                Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
-              ),
-            )
-            .pipe(Effect.as(reply)),
+          (tool === "report_bug"
+            ? SavedWrite.locateReport({
+                kind: "evaluator",
+                boardId: KanbanBoardId.make("a"),
+                keyPrefix: "bug-report:pending:",
+              })
+            : Effect.void
+          ).pipe(
+            Effect.andThen(
+              locks
+                .board(
+                  "a",
+                  locks.outside(
+                    Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+                  ),
+                )
+                .pipe(Effect.as(reply)),
+            ),
+          ),
           tool,
         ),
       );
@@ -431,6 +442,54 @@ it.effect("commit state reached during interrupt cleanup is observed", () =>
       assert.isNull(data.saved);
     }
   }),
+);
+
+it.effect.each([
+  { name: "unprepared", lookup: undefined, saved: false, text: "Nothing was saved" },
+  {
+    name: "card",
+    lookup: {
+      kind: "card",
+      boardId: KanbanBoardId.make("board-a"),
+      cardId: KanbanCardId.make("card-a"),
+      number: 1480,
+    },
+    saved: null,
+    text: "card #1480 (card-a) on board board-a",
+  },
+  {
+    name: "evaluator",
+    lookup: {
+      kind: "evaluator",
+      boardId: KanbanBoardId.make("board-a"),
+      keyPrefix: "bug-report:pending:",
+    },
+    saved: null,
+    text: "evaluator key prefix bug-report:pending: on board board-a",
+  },
+] as const)(
+  "report_bug timeout with $name recovery target reports a proven or named outcome",
+  ({ lookup, saved, text }) =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const call = yield* SavedReply.protect(
+        (lookup === undefined ? Effect.void : SavedWrite.locateReport(lookup)).pipe(
+          Effect.andThen(SavedWrite.committing),
+          Effect.andThen(Deferred.succeed(entered, undefined)),
+          Effect.andThen(Effect.never),
+        ),
+        "report_bug",
+      ).pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust(SavedReply.REPLY_BUDGET_MS);
+      const result = callResult(yield* Fiber.join(call));
+      const data = replyData(result.structuredContent);
+      assert.isTrue(result.isError);
+      assert.strictEqual(data.saved, saved);
+      assert.include(data.message, text);
+      assert.match(data.message, /[Rr]etry with the same arguments/);
+      if (lookup !== undefined) assert.deepInclude(result.structuredContent, { lookup });
+    }),
 );
 
 it.effect("a saved receipt survives slow encoding as a non-error reply", () =>

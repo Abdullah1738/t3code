@@ -16661,6 +16661,12 @@ const make = Effect.gen(function* () {
             const ambiguous = best && !best.exact && matches[1]?.score === best.score;
             const target = hinted ?? (best?.strong && !ambiguous ? best.card : undefined);
             if (!target) return undefined;
+            yield* SavedWrite.locateReport({
+              kind: "card",
+              boardId: board.id,
+              cardId: target.id,
+              number: target.number,
+            });
             const candidates = matches.slice(0, 3).map(({ card, score }) => ({
               id: card.id,
               number: card.number,
@@ -16770,6 +16776,7 @@ const make = Effect.gen(function* () {
         ]),
       )
       .digest("hex")}:`;
+    yield* SavedWrite.locateReport({ kind: "evaluator", boardId: board.id, keyPrefix });
     let key = `${keyPrefix}${uuid()}`;
     // reportBug has already resolved its matches. Caller provenance in the
     // stamped text must not associate a novel report with the caller's own card.

@@ -62,6 +62,33 @@ export type Saved =
   | { readonly kind: "evaluator"; readonly threadId: ThreadId; readonly key?: string | undefined }
   | { readonly kind: "evaluatorQueue"; readonly key: string; readonly queueId: number };
 
+export type ReportLookup =
+  | {
+      readonly kind: "card";
+      readonly boardId: KanbanCard["boardId"];
+      readonly cardId: KanbanCard["id"];
+      readonly number: number;
+    }
+  | {
+      readonly kind: "evaluator";
+      readonly boardId: KanbanCard["boardId"];
+      readonly keyPrefix: string;
+    };
+
+// Published before a report can write; unlike a receipt, this does not prove a save.
+export const reportLookupObserver = Context.Reference<(lookup: ReportLookup) => void>(
+  "KanbanReportLookup",
+  {
+    defaultValue: () => () => {},
+  },
+);
+
+export const locateReport = Effect.fn("KanbanSavedWrite.locateReport")(function* (
+  lookup: ReportLookup,
+) {
+  (yield* reportLookupObserver)(lookup);
+});
+
 export const observer = Context.Reference<(saved: Saved) => void>("KanbanSavedWrite", {
   defaultValue: () => () => {},
 });

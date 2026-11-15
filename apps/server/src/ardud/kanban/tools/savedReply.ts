@@ -69,13 +69,24 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
   };
   const parent = yield* SavedWrite.observer;
   const parentCommitting = yield* SavedWrite.commitObserver;
+  const parentLookup = yield* SavedWrite.reportLookupObserver;
   const call = yield* Effect.serviceOption(McpCall);
   let commitStarted = false;
   let receipt: SavedWrite.Saved | undefined;
+  let reportLookup: SavedWrite.ReportLookup | undefined;
+  // reportBug publishes its target before any report write, so no target proves this call saved no report.
+  const savedState = () =>
+    receipt !== undefined
+      ? true
+      : tool === "report_bug" && reportLookup === undefined
+        ? false
+        : commitStarted
+          ? null
+          : false;
   const attributes = () => ({
     "kanban.reply.stage_at_timeout": stageAtTimeout,
     "kanban.reply.timed_out": timerLatenessMs !== null,
-    "kanban.reply.saved": receipt !== undefined ? true : commitStarted ? null : false,
+    "kanban.reply.saved": savedState(),
     "kanban.reply.commit_started": commitStarted,
     "kanban.reply.elapsed_ms": elapsed(),
     "kanban.reply.budget_ms": REPLY_BUDGET_MS,
@@ -98,8 +109,10 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
               ? {
                   message: { discussionId: receipt.message.discussionId, seq: receipt.message.seq },
                 }
-              : {};
-    const saved = receipt !== undefined ? true : commitStarted ? null : false;
+              : tool === "report_bug" && reportLookup !== undefined
+                ? { lookup: reportLookup }
+                : {};
+    const saved = savedState();
     const message =
       saved === false
         ? tool === "report_bug"
@@ -107,7 +120,13 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
           : "Not saved (board busy). Safe to retry."
         : tool === "report_bug"
           ? receipt === undefined
-            ? "Bug report reply timed out. Retry with the same arguments to recover the report or save it once."
+            ? reportLookup === undefined
+              ? "Nothing was saved; retry with the same arguments."
+              : `Bug report outcome unknown. ${
+                  reportLookup.kind === "card"
+                    ? `Look up card #${reportLookup.number} (${reportLookup.cardId}) on board ${reportLookup.boardId}.`
+                    : `Look up evaluator key prefix ${reportLookup.keyPrefix} on board ${reportLookup.boardId}.`
+                } Retry with the same arguments to recover the report or save it once.`
             : receipt.kind === "evaluator"
               ? "Saved; the returned threadId identifies the request evaluator. Do not submit another report."
               : receipt.kind === "evaluatorQueue"
@@ -149,6 +168,10 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
   const work = effect.pipe(
     Effect.provideService(SavedWrite.traceObserver, { span, enter, mark }),
     Effect.provideService(BoardLocks.writeWaitMs, ADMISSION_BUDGET_MS),
+    Effect.provideService(SavedWrite.reportLookupObserver, (lookup) => {
+      reportLookup = lookup;
+      parentLookup(lookup);
+    }),
     Effect.provideService(SavedWrite.commitObserver, () => {
       commitStarted = true;
       parentCommitting();

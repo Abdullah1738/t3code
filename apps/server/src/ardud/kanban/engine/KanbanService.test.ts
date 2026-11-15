@@ -108,7 +108,14 @@ import {
 
 const isMcpCallToolResult = Schema.is(McpSchema.CallToolResult);
 const decodeBugTimeoutReply = Schema.decodeUnknownSync(
-  Schema.Struct({ saved: Schema.NullOr(Schema.Boolean) }),
+  Schema.Struct({
+    saved: Schema.NullOr(Schema.Boolean),
+    lookup: Schema.Struct({
+      kind: Schema.Literal("evaluator"),
+      boardId: Schema.String,
+      keyPrefix: Schema.String,
+    }),
+  }),
 );
 
 interface FakeThread {
@@ -31950,7 +31957,13 @@ it.effect(
         const reply = yield* Fiber.join(call);
         if (!isMcpCallToolResult(reply)) return assert.fail("Expected a tool result");
         assert.isTrue(reply.isError);
-        assert.isNull(decodeBugTimeoutReply(reply.structuredContent).saved);
+        const data = decodeBugTimeoutReply(reply.structuredContent);
+        assert.isNull(data.saved);
+        assert.strictEqual(data.lookup.boardId, board.id);
+        assert.match(data.lookup.keyPrefix, /^bug-report:[0-9a-f]{64}:$/);
+        const message = reply.content.find((block) => block.type === "text")?.text ?? "";
+        assert.include(message, data.lookup.keyPrefix);
+        assert.include(message, board.id);
         assert.match(
           reply.content.find((block) => block.type === "text")?.text ?? "",
           /[Rr]etry with the same arguments/,
@@ -31961,7 +31974,11 @@ it.effect(
         assert.isDefined(first.threadId);
         assert.strictEqual((yield* Ref.get(fake.threads)).size, 1);
         const sql = yield* BoardsDatabase.client;
-        assert.lengthOf(yield* sql`SELECT id FROM ardud_kanban_evaluator_queue`, 1);
+        const admissions = yield* sql<{
+          job_key: string;
+        }>`SELECT job_key FROM ardud_kanban_evaluator_queue`;
+        assert.lengthOf(admissions, 1);
+        assert.isTrue(admissions[0]!.job_key.startsWith(data.lookup.keyPrefix));
         yield* TestClock.adjust(
           retryWindowMs - ((yield* Clock.currentTimeMillis) % retryWindowMs) + 1_000,
         );
