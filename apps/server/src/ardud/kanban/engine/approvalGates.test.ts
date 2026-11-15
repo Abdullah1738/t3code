@@ -1583,6 +1583,162 @@ const approvalCard = (
   asks,
 });
 
+it.each([
+  "Yes, do not approve s7",
+  "Yes, don't approve s7",
+  "Yes, we cannot approve s7",
+  "Yes, no approval for s7",
+  "Yes, we can't approve s7",
+  "Yes, we won’t approve s7",
+  "Please hold s7",
+  "Hold s7",
+  "Wait for s7",
+  "Approve s7 later",
+  "Please defer s7",
+  "Yes, if CI passes approve s7",
+])("a later refusal names its scope anywhere in the label: %s", (label) => {
+  const s7 = gatedStep("s7");
+  const s8 = gatedStep("s8");
+  const other = { ...pickedAsk("Put the other step live?", ["s8"]), id: "q0" };
+  const earlier = { ...pickedAsk("Put it live?", ["s7"]), id: "q1" };
+  const later: KanbanOwnerAsk = {
+    ...pickedAsk("Put the fix live?"),
+    id: "q6",
+    options: [
+      { id: "o1", label: "Approve" },
+      { id: "o2", label },
+    ],
+    closedAt: laterDecisionAt,
+    answer: { verdict: "picked", optionIds: ["o2"], by: owner, at: laterDecisionAt },
+  };
+  const base = approvalCard([s7, s8], [other, earlier]);
+  assert.isNull(approvalProblem(base, s7));
+  const card = { ...base, asks: [other, earlier, later] };
+  assert.include(approvalProblem(card, s7)!, "the latest decision, q6");
+  assert.include(approvalProblem(card, s7)!, label);
+  assert.isNull(approvalProblem(card, s8));
+});
+
+it.each(
+  (["text", "title", "summary"] as const).flatMap((field) => [
+    ...(["picked", "approved"] as const).flatMap((verdict) =>
+      ["Hold", "Approve after review", "Yes, if CI passes"].map((label) => ({
+        field,
+        verdict,
+        label,
+      })),
+    ),
+    { field, verdict: "rejected" as const, label: "Hold" },
+  ]),
+)(
+  "a $verdict $label refusal retains the step named in question $field",
+  ({ field, verdict, label }) => {
+    const s7 = gatedStep("s7");
+    const s8 = gatedStep("s8");
+    const s9 = gatedStep("s9");
+    const earlier = { ...pickedAsk("Put these live?", ["s7", "s8", "s9"]), id: "q1" };
+    const later: KanbanOwnerAsk = {
+      ...pickedAsk(field === "text" ? "Put s7 live?" : "Put the fix live?"),
+      id: "q6",
+      ...(field === "title" ? { title: "Decide on s7" } : {}),
+      ...(field === "summary" ? { action: { summary: "Decide on s7" } } : {}),
+      options: [
+        { id: "o1", label: "Approve", approves: ["s8"] },
+        { id: "o2", label },
+      ],
+      closedAt: laterDecisionAt,
+      answer: {
+        verdict,
+        optionIds: verdict === "rejected" ? [] : ["o2"],
+        by: owner,
+        at: laterDecisionAt,
+      },
+    };
+    const card = approvalCard([s7, s8, s9], [earlier, later]);
+    for (const subtask of [s7, s8]) {
+      assert.include(approvalProblem(card, subtask)!, "the latest decision, q6");
+    }
+    assert.isNull(approvalProblem(card, s9));
+  },
+);
+
+it.each(["hold", "decline", "cancel"])(
+  "a positive exact target containing %s does not gain refusal scope",
+  (word) => {
+    const s7 = gatedStep("s7", `Deploy the ${word} worker produced by s8`);
+    const s8 = gatedStep("s8");
+    const earlier = { ...pickedAsk("Put it live?", ["s8"]), id: "q1" };
+    const later: KanbanOwnerAsk = {
+      ...pickedAsk("Put the fix live?"),
+      id: "q6",
+      options: [
+        { id: "o1", label: s7.text, approves: ["s7"] },
+        { id: "o2", label: "Hold s8" },
+      ],
+      closedAt: laterDecisionAt,
+      answer: { verdict: "picked", optionIds: ["o1"], by: owner, at: laterDecisionAt },
+    };
+    const card = approvalCard([s7, s8], [earlier, later]);
+    for (const subtask of [s7, s8]) assert.isNull(approvalProblem(card, subtask));
+  },
+);
+
+it.each(
+  ["hold", "decline", "cancel"].flatMap((word) =>
+    ["Yes, do not approve s7", "Please hold s7", "Yes, we cannot approve s7"].map((label) => ({
+      word,
+      label,
+    })),
+  ),
+)(
+  "a negative explicit option cannot use a $word target as an exclusion: $label",
+  ({ word, label }) => {
+    const s7 = gatedStep("s7", `Deploy the ${word} worker`);
+    const earlier = { ...pickedAsk("Put it live?", ["s7"]), id: "q1" };
+    const later: KanbanOwnerAsk = {
+      ...pickedAsk("Put the fix live?"),
+      id: "q6",
+      options: [
+        { id: "o1", label, approves: ["s7"] },
+        { id: "o2", label: "Approve s7" },
+      ],
+      closedAt: laterDecisionAt,
+      answer: { verdict: "picked", optionIds: ["o1"], by: owner, at: laterDecisionAt },
+    };
+    const card = approvalCard([s7], [earlier, later]);
+    assert.include(approvalProblem(card, s7)!, "the latest decision, q6");
+  },
+);
+
+it.each([
+  { label: "Tick s4", ids: ["s4"] },
+  { label: "Tick: s4", ids: ["s4"] },
+  { label: "Approve: close s6 and s8", ids: ["s6", "s8"] },
+  { label: "Approve: close s6, s8", ids: ["s6", "s8"] },
+  { label: "Approve: close s6 + s8", ids: ["s6", "s8"] },
+  { label: "Don't tick s4", ids: [] },
+  { label: "don't tick s4", ids: [] },
+  { label: "Tick s4 later", ids: [] },
+  { label: "Tick s4 +", ids: [] },
+  { label: "Approve: close s6 or s8", ids: [] },
+  { label: "close s6 or s8", ids: [] },
+  { label: "Approve: close s6 and hold s8", ids: [] },
+  { label: "Approve: close s6 and s8 after review", ids: [] },
+])("reported go wording clears only its named steps: $label", ({ label, ids }) => {
+  const subtasks = [gatedStep("s4"), gatedStep("s6"), gatedStep("s8")];
+  const ask = {
+    ...pickedAsk("Close these steps?"),
+    options: [
+      { id: "o1", label },
+      { id: "o2", label: "Hold" },
+    ],
+  };
+  const card = approvalCard(subtasks, [ask]);
+  for (const subtask of subtasks) {
+    assert.strictEqual(approvalProblem(card, subtask) === null, ids.includes(subtask.id));
+  }
+});
+
 it.each([true, false])("Agent Tools #83 q4/q5/s9: explicit approval %s", (explicit) => {
   const s9 = gatedStep(
     "s9",

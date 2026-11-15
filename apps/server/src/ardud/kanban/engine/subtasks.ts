@@ -297,14 +297,14 @@ const harmlessFollowup = (task: string, target: string): boolean => {
 
 const subtaskApproval = (label: string) => {
   const approval =
-    /^(?:approve(?:d)?|go(?:\s+ahead)?|ship|yes|ok)(?:\s*[,.:;–—-]\s*|\s+)(.+)$/i.exec(
+    /^(?:approve(?:d)?|go(?:\s+ahead)?|ship|yes|ok|tick)(?:\s*[,.:;–—-]\s*|\s+)(.+)$/i.exec(
       label
         .trim()
         .replace(/[.!]+$/, "")
         .trim(),
     );
   if (!approval) return undefined;
-  const remainder = approval[1]!.replace(/^(?:tick|clear|do|approve)\s+(?=s\d+\b)/i, "");
+  const remainder = approval[1]!.replace(/^(?:tick|clear|do|approve|close)\s+(?=s\d+\b)/i, "");
   const startsWithId = /^s\d+\b/i.test(remainder);
   const references =
     /^(s\d+(?:(?:\s*[,;/&+]\s*(?:and\s+)?|\s+(?:and\s+)?)s\d+)*)(?:\s*:\s*(.+)|\s+now)?$/i.exec(
@@ -428,18 +428,14 @@ const optionScopeIds = (
 };
 
 const refusalWord = /\b(?:decline|refuse|deny|defer|postpone|delay|pause|suspend|abort)\b/i;
+const approvalQualifier =
+  /\b(?:if|unless|after|before|once|when|pending|first|then|not|no|[a-z]+n[’']t|dont|never|cannot|without|except|only|instead)\b/i;
 
 export const optionApprovalIds = (
   card: Pick<KanbanCard, "subtasks">,
   option: Pick<KanbanAskOption, "label" | "approves">,
 ): ReadonlyArray<string> | undefined => {
-  if (
-    isNegativeOption(option.label) ||
-    /\b(?:if|unless|after|before|once|when|pending|first|then|not|no|[a-z]+n[’']t|dont|never|cannot|without|except|only|instead)\b/i.test(
-      option.label,
-    )
-  )
-    return undefined;
+  if (isNegativeOption(option.label) || approvalQualifier.test(option.label)) return undefined;
   if (option.approves !== undefined) {
     if (!isNegativeChoice(option.label)) return option.approves;
     // Exact action targets can contain refusal words, such as an "on-hold build".
@@ -654,6 +650,27 @@ export const approvalProblem = (
         if (answer.by._tag !== "owner" || (ask.revisedAt ?? ask.at) < since) return false;
         if (ask.draft) return false;
       }
+      const refusals =
+        answer.verdict === "picked" || answer.verdict === "approved"
+          ? (ask.options ?? []).filter(
+              (option) =>
+                answer.optionIds?.includes(option.id) &&
+                (isNegativeChoice(option.label) || approvalQualifier.test(option.label)) &&
+                optionApprovalIds(card, option) === undefined,
+            )
+          : [];
+      // A refusal can name its target after the negation; positive scope remains leading-only.
+      if (
+        (answer.verdict === "rejected" || refusals.length > 0) &&
+        (askConcerns(card, ask, subtask, gate, guessedGates, answer.at) ||
+          refusals.some((option) =>
+            option.label
+              .toLowerCase()
+              .match(/\bs\d+\b/g)
+              ?.includes(subtask.id.toLowerCase()),
+          ))
+      )
+        return true;
       // Explicit scopes replace wording matching for the entire ask, including other options.
       if (ask.options?.some((option) => optionScopeIds(card, option) !== undefined)) {
         const selectedIds = pickedApprovalIds(card, ask);
