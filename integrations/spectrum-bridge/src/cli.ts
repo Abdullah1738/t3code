@@ -1,5 +1,6 @@
 import { messageLengthError } from "./message-length.ts";
 import { cardKind, logCardRender, toolError, toolLog } from "./toollog.ts";
+import { validNotifyId, validNotifyText } from "./agent-policy.ts";
 import { validAgentRequestId, validAnswerStatus } from "./agent-bus.ts";
 import { constants } from "node:fs";
 import { lstat, open, stat } from "node:fs/promises";
@@ -32,7 +33,7 @@ class RawOutput {
 }
 
 const COMMANDS_HELP = "Expected health, send, cancel-send, send-file, poll, app, react, wake, secret-request, secret, publish, unpublish, ban, unban, or bans."
-  + " Sendblue mode adds location-request, location, messages, ask-owner, agent-ask, agent-answer, agent-requests, chats, allow, allow-group,"
+  + " Sendblue mode adds location-request, location, messages, ask-owner, agent-ask, agent-answer, agent-requests, notify-rule, chats, allow, allow-group,"
   + " guest-allow, guest-revoke, guests, guest-send, share-contact, and opt-in."
   + " Logs: log-rollup [--day YYYY-MM-DD]."
   + " Public links: share, unshare, and shares."
@@ -78,6 +79,7 @@ const OPTIONS_BY_COMMAND: Record<string, string[]> = {
   "agent-ask": ["to", "text", "session", "key", "parent"],
   "agent-answer": ["request", "text", "session", "status"],
   "agent-requests": ["session"],
+  "notify-rule": ["session", "text", "id"],
   chats: ["session"],
   allow: ["address", "name", "admin", "session"],
   "allow-group": ["id", "name", "session"],
@@ -127,7 +129,9 @@ function parseOptions(args: string[]) {
     if (seen.has(token.name)) throw new CliError("Duplicate command option");
     seen.add(token.name);
   }
-  if (positionals.length !== 0) {
+  if (command === "notify-rule" && positionals.length === 1 && ["add", "list", "rm"].includes(positionals[0]!)) {
+    (parsed.values as Record<string, unknown>).action = positionals[0];
+  } else if (positionals.length !== 0) {
     throw new CliError("Unexpected positional arguments");
   }
   return {
@@ -377,6 +381,19 @@ export function parseCommand(args: string[]): Command {
       if (values.status !== undefined && !validAnswerStatus(values.status)) throw new CliError("Invalid --status");
       return { method: "POST", path: "/agent-answer", body: { text, request, sessionId: sessionOnly(values.session)!,
         ...(values.status === undefined ? {} : { status: values.status }) } };
+    }
+    case "notify-rule": {
+      const sessionId = sessionOnly(values.session)!;
+      if (values.action === "add" && validNotifyText(values.text) && values.id === undefined) {
+        return { method: "POST", path: "/notify-rule", body: { sessionId, action: "add", text: values.text } };
+      }
+      if (values.action === "list" && values.text === undefined && values.id === undefined) {
+        return { method: "POST", path: "/notify-rule", body: { sessionId, action: "list" } };
+      }
+      if (values.action === "rm" && values.text === undefined && /^[1-9][0-9]*$/.test(values.id ?? "") && validNotifyId(Number(values.id))) {
+        return { method: "POST", path: "/notify-rule", body: { sessionId, action: "rm", id: Number(values.id) } };
+      }
+      throw new CliError("Expected notify-rule add --text, list, or rm --id, with --session");
     }
     case "agent-requests":
       return { method: "POST", path: "/agent-requests", body: { sessionId: sessionOnly(values.session)! } };
