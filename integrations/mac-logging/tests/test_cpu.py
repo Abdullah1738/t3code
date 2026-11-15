@@ -151,11 +151,13 @@ class CpuTests(unittest.TestCase):
             helper.assert_called_once()
 
     def test_sample_first_baseline_then_cpu_line_and_private_state(self):
-        cpu.sample(self.runner(), clock=lambda: 100)
+        with patch.object(cpu.time, 'time', return_value=1_800_000_000):
+            cpu.sample(self.runner(), clock=lambda: 100)
         self.assertEqual(len(self.calls), 1)
         self.assertTrue(self.events()[0]['ok'])
         self.assertEqual(self.events()[0]['props']['top'], [])
-        cpu.sample(self.runner(text=line(cpu_time='0:31.23')), clock=lambda: 160)
+        with patch.object(cpu.time, 'time', return_value=1_800_000_060):
+            cpu.sample(self.runner(text=line(cpu_time='0:31.23')), clock=lambda: 160)
         event = self.events()[-1]
         self.assertEqual(event['props']['top'][0]['hint'], '9router/…/server.js')
         self.assertEqual(event['props']['totalCpuPct'], 50)
@@ -165,6 +167,36 @@ class CpuTests(unittest.TestCase):
         self.assertEqual(state.stat().st_mode & 0o777, 0o600)
         self.assertNotIn('/Users/', state.read_text())
         self.assertNotIn('private', json.dumps(self.events()))
+
+    def test_sample_window_survives_per_process_duration_clock_resets(self):
+        # Separate launchd invocations both start their duration clock near zero.
+        with patch.object(cpu.time, 'time', side_effect=[1_800_000_000, 1_800_000_060]):
+            first_clock = iter((.01, .20, .40))
+            first = cpu.sample(self.runner(), clock=lambda: next(first_clock))
+            second_clock = iter((.01, .21, .40))
+            second = cpu.sample(self.runner(text=line(cpu_time='0:31.23')),
+                                clock=lambda: next(second_clock))
+        self.assertTrue(first['baseline'])
+        self.assertFalse(second['baseline'])
+        self.assertEqual(second['windowS'], 60)
+        self.assertEqual(second['totalCpuPct'], 50)
+        self.assertLess(self.events()[-1]['durationMs'], 1000)
+
+    def test_legacy_tiny_timestamp_establishes_exactly_one_baseline(self):
+        _, old = cpu.deltas(cpu.parse_ps(line()), {}, .167)
+        cpu.save_state('cpu', old)
+        with patch.object(cpu.time, 'time', return_value=1_800_000_000):
+            migrated = cpu.sample(self.runner(text=line(cpu_time='0:31.23')), clock=lambda: .20)
+        self.assertTrue(migrated['baseline'])
+        self.assertIsNone(migrated['windowS'])
+        self.assertIsNone(migrated['totalCpuPct'])
+        self.assertEqual(migrated['top'], [])
+        self.assertEqual(cpu.read_state('cpu')['at'], 1_800_000_000)
+        with patch.object(cpu.time, 'time', return_value=1_800_000_060):
+            measured = cpu.sample(self.runner(text=line(cpu_time='1:01.23')), clock=lambda: .18)
+        self.assertFalse(measured['baseline'])
+        self.assertEqual(measured['windowS'], 60)
+        self.assertEqual(measured['totalCpuPct'], 50)
 
     def test_timeout_exit_parse_unavailable_do_not_advance_state(self):
         cpu.sample(self.runner(), clock=lambda: 100)

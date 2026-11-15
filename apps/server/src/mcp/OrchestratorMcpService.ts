@@ -786,27 +786,60 @@ function delegationCommandId(
   );
 }
 
-function delegationTaskCommandId(taskId: NodeId): CommandId | undefined {
+function delegationTaskIdentity(taskId: NodeId) {
   if (!taskId.startsWith("node:delegated-task:")) return undefined;
-  try {
-    const commandId = CommandId.make(
-      decodeURIComponent(taskId.slice("node:delegated-task:".length)),
-    );
-    const parts = commandId.split(":");
-    if (
-      parts[0] !== "command" ||
-      parts[1] !== "mcp" ||
-      !(
-        (parts.length === 6 && parts[2] === "delegate-task") ||
-        (parts.length === 5 && parts[3] === "delegate-task")
-      ) ||
-      IdAllocator.derive.delegatedTaskNode({ commandId }) !== taskId
-    )
+  let command = taskId.slice("node:delegated-task:".length);
+  // Also read a copied id with one extra/missing encoding layer, for request-key recovery only.
+  for (let depth = 0; depth <= 2; depth++) {
+    const parts = command.split(":");
+    // A decoded key can add fields or make a legacy operation look like a modern environment.
+    const modern =
+      parts.length === 6 && parts[2] === "delegate-task" && parts[3] !== "delegate-task";
+    const legacy = parts.length === 5 && parts[3] === "delegate-task";
+    if (parts[0] === "command" && parts[1] === "mcp" && (modern || legacy)) {
+      try {
+        const commandId = CommandId.make(command);
+        const key = decodeURIComponent(parts[modern ? 5 : 4]!);
+        return {
+          commandId,
+          key,
+          environment: modern ? parts[3] : undefined,
+          thread: modern ? parts[4] : undefined,
+          canonical:
+            IdAllocator.derive.delegatedTaskNode({ commandId }) === taskId &&
+            parts[modern ? 5 : 4] === stablePart(key),
+        };
+      } catch {
+        return undefined;
+      }
+    }
+    try {
+      command = decodeURIComponent(command);
+    } catch {
       return undefined;
-    return commandId;
-  } catch {
-    return undefined;
+    }
   }
+  return undefined;
+}
+
+function findDelegatedTask(
+  parent: Pick<OrchestrationV2ThreadProjection, "subagents">,
+  threadId: ThreadId,
+  taskId: NodeId,
+) {
+  const exact = parent.subagents.find(
+    (task) => task.id === taskId && task.origin === "app_owned" && task.threadId === threadId,
+  );
+  if (exact !== undefined) return exact;
+  const identity = delegationTaskIdentity(taskId);
+  return identity === undefined
+    ? undefined
+    : parent.subagents.find(
+        (task) =>
+          task.origin === "app_owned" &&
+          task.threadId === threadId &&
+          delegationTaskIdentity(task.id)?.key === identity.key,
+      );
 }
 
 function threadCreationIds(namespace: string, requestKey: string, index: number) {
@@ -1942,7 +1975,7 @@ const make = Effect.gen(function* () {
     observe?: (result: OrchestratorMcpDelegateTaskResult) => Effect.Effect<void>,
   ): Effect.fn.Return<OrchestratorMcpDelegateTaskResult, OrchestratorMcpFailure> {
     yield* requireCapability(scope);
-    const parentProjection = yield* threadManagement
+    let parentProjection = yield* threadManagement
       .getThreadRecords(
         scope.thread.threadId,
         ["runs", "subagents", "contextTransfers"],
@@ -1952,17 +1985,16 @@ const make = Effect.gen(function* () {
       .pipe(NodeSqliteClient.foregroundReads, Effect.mapError(threadManagementFailure), (effect) =>
         McpTaskTrace.stage(effect, "parent_records", "t3.task"),
       );
-    const task = parentProjection.subagents.find(
-      (candidate) =>
-        candidate.id === taskId &&
-        candidate.origin === "app_owned" &&
-        candidate.threadId === scope.thread.threadId,
-    );
+    let task = findDelegatedTask(parentProjection, scope.thread.threadId, taskId);
     if (task === undefined || task.childThreadId === null) {
+      const identity = delegationTaskIdentity(taskId);
+      const callerOwned =
+        identity?.canonical === true &&
+        identity.environment === stablePart(scope.environmentId) &&
+        identity.thread === stablePart(scope.thread.threadId);
       let detail = "";
-      const commandId = delegationTaskCommandId(taskId);
-      if (commandId !== undefined) {
-        const state = yield* threadManagement.getDelegationCommandState(commandId).pipe(
+      if (identity?.canonical && (callerOwned || identity.thread === undefined)) {
+        const state = yield* threadManagement.getDelegationCommandState(identity.commandId).pipe(
           NodeSqliteClient.readOnly,
           NodeSqliteClient.foregroundReads,
           Effect.mapError((error) => failure("orchestration_error", errorMessage(error))),
@@ -1975,7 +2007,7 @@ const make = Effect.gen(function* () {
         ) {
           return yield* failure(
             "task_not_found",
-            `Delegated task ${taskId} does not belong to this thread.`,
+            "No delegated task has this id. Check the id; copy it exactly from delegate_task.",
           );
         }
         yield* Effect.annotateCurrentSpan({ "t3.task.creation_state": state.status });
@@ -1988,20 +2020,42 @@ const make = Effect.gen(function* () {
             detail = ` This delegation was rejected: ${state.error ?? "No reason was recorded."}`;
             break;
           case "pending":
+            if (!callerOwned) break;
             detail =
               " This delegation is still being created; retry task_status with this task id, or retry delegate_task with the same clientRequestId.";
             break;
           case "never_saved":
-            detail =
-              " This delegation was never saved. Retry delegate_task with the same clientRequestId.";
+            if (!callerOwned) break;
+            // A task committed after the first projection read must win over a missing receipt.
+            parentProjection = yield* threadManagement
+              .getThreadRecords(
+                scope.thread.threadId,
+                ["runs", "subagents", "contextTransfers"],
+                undefined,
+                { projectionOnly: true },
+              )
+              .pipe(
+                NodeSqliteClient.foregroundReads,
+                Effect.mapError(threadManagementFailure),
+                (effect) => McpTaskTrace.stage(effect, "parent_records", "t3.task"),
+              );
+            task = findDelegatedTask(parentProjection, scope.thread.threadId, taskId);
+            if (task === undefined)
+              detail =
+                " This delegation was never saved. Retry delegate_task with the same clientRequestId.";
             break;
         }
       }
-      return yield* failure(
-        "task_not_found",
-        `Delegated task ${taskId} was not found for thread ${scope.thread.threadId}.${detail}`,
-      );
+      if (task === undefined || task.childThreadId === null) {
+        return yield* failure(
+          "task_not_found",
+          detail === ""
+            ? "No delegated task has this id. Check the id; copy it exactly from delegate_task."
+            : `Delegated task ${taskId} was not found for thread ${scope.thread.threadId}.${detail}`,
+        );
+      }
     }
+    taskId = task.id;
     onProgress?.({ childThreadId: task.childThreadId, childNodeId: task.id });
     // Keep failures available if assistant-result hydration exceeds the status deadline.
     const childControls = yield* threadManagement
@@ -3267,6 +3321,7 @@ const make = Effect.gen(function* () {
     cancelTask: Effect.fn("OrchestratorMcpService.cancelTask")(function* (callerScope, input) {
       const scope = yield* requireThreadScope(callerScope, "task_cancel");
       const current = yield* readTask(scope, input.taskId);
+      const taskId = current.taskId;
       const key = yield* requestKey(input.clientRequestId);
       const parentProjection = yield* loadProjection(scope.thread.threadId, ["subagents"]);
       // Cancelling stops the child and every task under it, each a write to a
@@ -3296,7 +3351,7 @@ const make = Effect.gen(function* () {
       });
       yield* assertStoppable(current.childThreadId);
       const parentTask = parentProjection.subagents.find(
-        (task) => task.id === input.taskId && task.origin === "app_owned",
+        (task) => task.id === taskId && task.origin === "app_owned",
       );
       const disposeCompletionDelivery =
         parentTask?.completionDelivery?.state === "disposed"
@@ -3310,14 +3365,14 @@ const make = Effect.gen(function* () {
                   operation: "cancel-task-completion-delivery",
                 }),
                 parentThreadId: scope.thread.threadId,
-                taskId: input.taskId,
+                taskId,
               })
               .pipe(
                 Effect.asVoid,
                 Effect.mapError((error) =>
                   failure(
                     "orchestration_error",
-                    `Unable to dispose delegated task ${input.taskId} completion delivery: ${errorMessage(error)}`,
+                    `Unable to dispose delegated task ${taskId} completion delivery: ${errorMessage(error)}`,
                   ),
                 ),
               );
@@ -3335,7 +3390,7 @@ const make = Effect.gen(function* () {
             Effect.mapError((error) =>
               failure(
                 "task_not_cancellable",
-                `Unable to stop delegated task ${input.taskId}: ${errorMessage(error)}`,
+                `Unable to stop delegated task ${taskId}: ${errorMessage(error)}`,
               ),
             ),
           );
@@ -3345,7 +3400,7 @@ const make = Effect.gen(function* () {
             Effect.mapError((error) =>
               failure(
                 "task_not_cancellable",
-                `Stopped delegated task ${input.taskId}, but not every task it delegated: ${errorMessage(error)}`,
+                `Stopped delegated task ${taskId}, but not every task it delegated: ${errorMessage(error)}`,
               ),
             ),
           );
@@ -3355,7 +3410,7 @@ const make = Effect.gen(function* () {
         for (const run of stopped.runs) {
           if (
             run.status !== "queued" ||
-            (run.delegatedTaskId !== input.taskId && run.id !== current.childRunId)
+            (run.delegatedTaskId !== taskId && run.id !== current.childRunId)
           )
             continue;
           // Stop preserves the queue for Resume. Cancelling a task must also
@@ -3402,28 +3457,28 @@ const make = Effect.gen(function* () {
         yield* stopWithinLimit;
         yield* disposeCompletionDelivery;
         return {
-          taskId: input.taskId,
+          taskId,
           status: current.status,
         } satisfies OrchestratorMcpTaskCancelResult;
       }
       if (current.childRunId === null && current.workState !== "waiting_for_children") {
         return yield* failure(
           "task_not_cancellable",
-          `Delegated task ${input.taskId} has no recorded child run to settle.`,
+          `Delegated task ${taskId} has no recorded child run to settle.`,
         );
       }
       yield* stopWithinLimit;
       yield* disposeCompletionDelivery.pipe(
         Effect.catchCause((cause) =>
           Effect.logWarning("orchestrator-mcp.cancel-task.delivery-dispose-failed", {
-            taskId: input.taskId,
+            taskId,
             cause,
           }),
         ),
       );
-      const stopped = yield* readTask(scope, input.taskId);
+      const stopped = yield* readTask(scope, taskId);
       return {
-        taskId: input.taskId,
+        taskId,
         status: isTerminalTaskStatus(stopped.status) ? stopped.status : "cancel_requested",
       };
     }),

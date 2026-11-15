@@ -135,7 +135,8 @@ def sample(run=subprocess.run, clock=time.monotonic):
             except BlockingIOError:
                 return None
             rows = parse_ps(command(PS, run))
-            observed = clock()
+            # Apple's Python 3.9 monotonic epoch is per process, unlike Unix time.
+            observed = time.time()
             props, state = deltas(rows, read_state('cpu'), observed)
             try:
                 props['load'] = list(os.getloadavg())

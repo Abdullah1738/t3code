@@ -46,6 +46,12 @@ class Logs(unittest.TestCase):
         toollog.emit('run', 'run.disk_space', props={**props, 'disk_space': {'path': '/private/secret'}})
         self.assertEqual(self.rows()[0]['props'], props)
 
+    def test_toolchain_crash_metadata_survives_filter(self):
+        props = dict(infra_failure='native_crash', infra_reason='toolchain_unpack_crash', wrapper_exit_code=90)
+        toollog.emit('run', 'run.disk_space', ids={'box': 'bx_fixture'}, props=props)
+        self.assertEqual(self.rows()[0]['props'], props)
+        self.assertEqual(self.rows()[0]['ids'], {'box': 'bx_fixture'})
+
     def test_format_private_modes_and_only_allowed_metadata(self):
         secret = 'password=secret-1234567890123456'
         toollog.emit('run', 'run.request', ok=True, duration_ms=1.2345,

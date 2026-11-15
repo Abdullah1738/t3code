@@ -379,7 +379,7 @@ class Pings(Base):
         (self.data / 'cases.json').write_text(json.dumps(book))
         self.assertIn('has no valid deadline', self.check('2026-10-20T10:00'))
         cases = mc.load(self.data)['cases']
-        self.assertIn('Acme AED 120.50 (no valid deadline)', mc.brief(cases, at('2026-10-20T10:00')))
+        self.assertIn('1 with no deadline', mc.brief(cases, at('2026-10-20T10:00')))
         self.assertIn("'soon' (not a valid deadline)", mc.table(cases))
 
     def test_old_sent_keys_are_dropped(self):
@@ -912,6 +912,65 @@ class DueDates(Base):
 
 class Brief(Base):
     PAN_LENGTHS = ((13, '6'), (14, '2'), (15, '6'), (16, '2'), (17, '6'), (18, '2'), (19, '6'))
+
+    def test_counts_cases_without_valid_deadlines_instead_of_naming_them(self):
+        case = self.case()
+        for deadline in (None, '', 'soon', '2026-02-30'):
+            with self.subTest(deadline=deadline):
+                cases = [dict(case, id=f'case-{n}', merchant=f'Merchant {n}', deadline=deadline)
+                         for n in range(10)]
+                line = mc.brief(cases, at('2026-10-24T10:00'), root=self.root)
+                self.assertEqual(line, 'Money: 10 open; 10 with no deadline.')
+                for row in cases:
+                    self.assertNotIn(row['merchant'], line)
+                self.assertNotIn('nothing due in 48h', line)
+
+    def test_due_names_are_capped_in_due_date_order(self):
+        case = self.case(when=at('2026-10-20T09:00'))
+        cases = [dict(case, merchant=f'Due {n}', deadline=f'2026-10-25T{n:02}:00:00+04:00')
+                 for n in range(9)]
+        line = mc.brief(list(reversed(cases)), at('2026-10-24T10:00'), root=self.root)
+        expected = '; '.join(f'Due {n} AED 120.50 (Sun 25 Oct {n:02}:00)' for n in range(6))
+        self.assertEqual(line, f'Money: 9 open; due: {expected}; +3 more.')
+
+    def test_changed_names_are_capped_in_due_date_order(self):
+        case = self.case(when=at('2026-10-24T09:00'))
+        cases = [dict(case, merchant=f'Changed {n}', deadline=f'2026-11-{n + 1:02}')
+                 for n in range(9)]
+        line = mc.brief(list(reversed(cases)), at('2026-10-24T10:00'), root=self.root)
+        expected = '; '.join(f'Changed {n} AED 120.50' for n in range(6))
+        self.assertEqual(line, f'Money: 9 open; changed: {expected}; +3 more.')
+
+    def test_attention_cases_without_deadlines_stay_named(self):
+        case = dict(self.case(), deadline=None)
+        for fields, expected in (
+                ({'status': 'awaiting_answer'}, 'Acme AED 120.50 (awaiting answer)'),
+                ({'urgency': 'overdue'}, 'Acme AED 120.50 (refund asked)'),
+                ({'kind': 'merchant_card', 'state': 'Bupa still holds cancelled card ••5542'},
+                 'Bupa still holds cancelled card ••5542')):
+            with self.subTest(fields=fields):
+                line = mc.brief([dict(case, **fields)], at('2026-10-24T10:00'), root=self.root)
+                self.assertEqual(line, f'Money: 1 open; due: {expected}.')
+                self.assertNotIn('with no deadline', line)
+
+    def test_no_deadline_count_follows_due_and_precedes_changed(self):
+        case = self.case()
+        cases = [case, dict(case, merchant='No deadline', deadline=None),
+                 dict(case, merchant='Changed', deadline='2026-11-01')]
+        line = mc.brief(cases, at('2026-10-24T10:00'), root=self.root)
+        self.assertEqual(line, 'Money: 3 open; due: Acme AED 120.50 (Sun 25 Oct); '
+                              '1 with no deadline; changed: Changed AED 120.50.')
+
+    def test_fifty_without_deadlines_and_two_due_fit_one_short_line(self):
+        case = self.case(when=at('2026-10-20T09:00'))
+        cases = [dict(case, id=f'case-{n}', merchant=f'Merchant {n}', deadline=None)
+                 for n in range(50)]
+        cases.extend([dict(case, merchant='Due A'), dict(case, merchant='Due B')])
+        line = mc.brief(cases, at('2026-10-24T10:00'), root=self.root)
+        self.assertEqual(line, 'Money: 52 open; due: Due A AED 120.50 (Sun 25 Oct); '
+                              'Due B AED 120.50 (Sun 25 Oct); 50 with no deadline.')
+        self.assertEqual(len(line.splitlines()), 1)
+        self.assertLess(len(line), 400)
 
     def test_lists_due_and_changed_only(self):
         self.assertEqual(mc.brief([], at('2026-10-24T08:00')), '')

@@ -522,6 +522,8 @@ function threadListCandidate(shell: OrchestrationV2ThreadShell): ThreadListCandi
 }
 
 export interface ShellSnapshotOptions {
+  /** Control summaries omit history counts, fork ancestors and background/provider detail. */
+  readonly summaryOnly?: boolean;
   readonly afterThreadId?: string;
   /** With `limit`: the most recently updated rows, newest first, instead of the first by id. */
   readonly recentFirst?: boolean;
@@ -5855,6 +5857,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       const read = readCanonicalProjection(threadId, undefined, fields, filter);
       // A metadata-only read is one SELECT and already has an atomic snapshot.
       return (fields.length === 0 ? read : sql.withTransaction(read)).pipe(
+        // Canonical history reads can take seconds; only a caller's existing
+        // write transaction needs to keep them on the writer connection.
+        NodeSqliteClient.readOnly,
         Effect.map(
           (projection) =>
             Object.fromEntries([
@@ -6246,6 +6251,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
     const selectShellThreadRows = Effect.fn("ProjectionStore.selectShellThreadRows")(function* (
       threadId?: ThreadId,
       {
+        summaryOnly = false,
         location,
         projectId,
         unsettledOnly = false,
@@ -6316,11 +6322,15 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             SELECT
               t.thread_id,
               t.payload_json,
-              CASE
+              ${
+                summaryOnly
+                  ? sql`NULL`
+                  : sql`CASE
                 WHEN json_extract(t.payload_json, '$.forkedFrom.type') = 'run'
                   THEN json_extract(t.payload_json, '$.forkedFrom.threadId')
                 ELSE NULL
-              END AS forked_from_run_source_thread_id,
+              END`
+              } AS forked_from_run_source_thread_id,
               presented.run_id AS latest_run_id,
               presented.status AS latest_run_status,
               presented.requested_at AS latest_run_requested_at,
@@ -6330,25 +6340,29 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               active.status AS active_run_status,
               (
                 SELECT r.status
-                FROM ${location === "archive" || listCandidatesOnly ? activityRuns : sql`shell_runs r`}
+                FROM ${location === "archive" || listCandidatesOnly || summaryOnly ? activityRuns : sql`shell_runs r`}
                 WHERE r.thread_id = t.thread_id
                   AND r.status IN ('preparing', 'starting', 'running', 'waiting')
                 ORDER BY r.ordinal DESC, r.run_id DESC
                 LIMIT 1
               ) AS activity_run_status,
-              (
+              ${
+                summaryOnly
+                  ? sql`NULL`
+                  : sql`(
                 -- Mirrors orchestrationV2RunWorkStartedAt.
                 SELECT COALESCE(
                   json_extract(r.payload_json, '$.workStartedAt'),
                   json_extract(r.payload_json, '$.startedAt'),
                   r.requested_at
                 )
-                FROM ${location === "archive" || listCandidatesOnly ? activityRuns : sql`shell_runs r`}
+                FROM ${location === "archive" || listCandidatesOnly || summaryOnly ? activityRuns : sql`shell_runs r`}
                 WHERE r.thread_id = t.thread_id
                   AND r.status IN ('preparing', 'starting', 'running', 'waiting')
                 ORDER BY r.ordinal DESC, r.run_id DESC
                 LIMIT 1
-              ) AS activity_run_started_at,
+              )`
+              } AS activity_run_started_at,
               (
                 SELECT json_extract(session.payload_json, '$.lastError')
                 -- Keep bindings outermost: one provider instance can hold every session.
@@ -6389,7 +6403,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               (
                 SELECT secret.payload_json
                 -- Keep runs outermost so completed history is never scanned for a pending secret.
-                FROM ${location === "archive" || listCandidatesOnly ? activityRuns : sql`shell_runs r`}
+                FROM ${location === "archive" || listCandidatesOnly || summaryOnly ? activityRuns : sql`shell_runs r`}
                 CROSS JOIN orchestration_v2_projection_turn_items secret
                   INDEXED BY orchestration_v2_projection_turn_items_thread_run_idx
                 WHERE r.thread_id = t.thread_id
@@ -6399,15 +6413,22 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 ORDER BY secret.updated_at DESC, secret.turn_item_id DESC
                 LIMIT 1
               ) AS pending_secret_request_payload_json,
-              (
+              ${
+                summaryOnly
+                  ? sql`NULL`
+                  : sql`(
                 SELECT message.updated_at
                 FROM orchestration_v2_projection_messages message
                 WHERE message.thread_id = t.thread_id
                   AND message.role = 'user'
                 ORDER BY message.updated_at DESC, message.message_id DESC
                 LIMIT 1
-              ) AS latest_user_message_at,
-              (
+              )`
+              } AS latest_user_message_at,
+              ${
+                summaryOnly
+                  ? sql`NULL`
+                  : sql`(
                 SELECT message.updated_at
                 FROM orchestration_v2_projection_messages message INDEXED BY ardud_v2_messages_latest_user_authored_idx
                 WHERE message.thread_id = t.thread_id
@@ -6415,18 +6436,23 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   AND json_extract(message.payload_json, '$.createdBy') = 'user'
                 ORDER BY message.updated_at DESC, message.message_id DESC
                 LIMIT 1
-              ) AS latest_user_authored_message_at,
-              EXISTS (
+              )`
+              } AS latest_user_authored_message_at,
+              ${
+                summaryOnly
+                  ? sql`0`
+                  : sql`EXISTS (
                 SELECT 1
                 FROM orchestration_v2_projection_plans plan
                 WHERE plan.thread_id = t.thread_id
                   AND plan.kind = 'proposed_plan'
                   AND plan.status = 'active'
-              ) AS has_actionable_proposed_plan,
+              )`
+              } AS has_actionable_proposed_plan,
               -- Counts follow the winning hot/delta/base identity transactionally.
               -- Do not correlate the history UNION: SQLite materializes all items.
               ${
-                listCandidatesOnly
+                listCandidatesOnly || summaryOnly
                   ? sql`0`
                   : sql`(
                 SELECT COALESCE(SUM(per_run.item_count), 0)
@@ -6441,7 +6467,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               )`
               } AS item_count,
               ${
-                listCandidatesOnly
+                listCandidatesOnly || summaryOnly
                   ? sql`0`
                   : sql`(
                 SELECT COALESCE(SUM(i.item_count), 0)
@@ -6460,7 +6486,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             }
             LEFT JOIN shell_runs active ON active.run_id = (
               SELECT r.run_id
-              FROM ${location === "archive" || listCandidatesOnly ? sql`orchestration_v2_projection_runs r INDEXED BY ardud_caller_active_run_idx` : sql`shell_runs r`}
+              FROM ${location === "archive" || listCandidatesOnly || summaryOnly ? sql`orchestration_v2_projection_runs r INDEXED BY ardud_caller_active_run_idx` : sql`shell_runs r`}
               WHERE r.thread_id = t.thread_id
                 AND r.status IN ('preparing', 'starting', 'running')
               ORDER BY r.ordinal DESC, r.run_id DESC
@@ -6955,6 +6981,18 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         : requested;
       const targetThreadRows = yield* selectShellThreadRows(undefined, options);
       const targetThreadIds = new Set(targetThreadRows.map((row) => ThreadId.make(row.thread_id)));
+      // Control serialization uses run/request state and thread payload only. Fork ancestors,
+      // provider rosters and history counts cannot change any field in that response.
+      if (options?.summaryOnly)
+        return {
+          targetThreadIds,
+          threadRows: targetThreadRows,
+          runRows: [],
+          itemCountRows: [],
+          sequenceRows: [],
+          providerThreadRows: [],
+          pendingTurnItemRows: [],
+        };
       const rowsByThreadId = new Map(
         targetThreadRows.map((row) => [ThreadId.make(row.thread_id), row] as const),
       );

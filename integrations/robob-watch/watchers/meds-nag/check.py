@@ -15,7 +15,7 @@ try:
     import toollog as _tl
 except Exception:
     _tl = None
-with _fold_errors(), (_tl.run('meds-nag', _log_sys.argv[1:], name='watcher.run')
+with _fold_errors(), (_tl.run('meds-nag', _log_sys.argv[1:], name='watcher.run', trigger='chained' if _FOLD else _tl.trigger())
       if _tl is not None and __name__ == '__main__' else _log_context.nullcontext()) as _watch_log:
     # Nags owner hourly (09:00-23:45 Dubai) about meds due today until confirmed.
     # Confirm with: ./took.py [YYYY-MM-DD] all|name...   (state in taken.json)
