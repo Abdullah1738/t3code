@@ -1193,6 +1193,15 @@ const make = Effect.gen(function* () {
                                                 "updated_at",
                                                 revisions.get(String(row.turn_item_id))!.at,
                                               ]);
+                                            else if (
+                                              !isTurnItemTable(table.name) &&
+                                              updates.length > 0 &&
+                                              table.fields.includes("updated_at")
+                                            )
+                                              updates.push([
+                                                "updated_at",
+                                                advanceRevision(row.updated_at, at),
+                                              ]);
                                             if (updates.length) {
                                               const keys = table.keys.length
                                                 ? table.keys

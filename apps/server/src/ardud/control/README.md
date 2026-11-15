@@ -92,7 +92,7 @@ All paths are under `/api/ardud/control`.
 | GET    | `/health`                                                | Token check plus the latest event sequence.                                                                                                                                                                                                                       |
 | GET    | `/projects`                                              | Registered projects (`projectId`, `title`, `workspaceRoot`, `scratch`).                                                                                                                                                                                           |
 | GET    | `/models`                                                | Default model and runtime mode, plus each provider's models, option descriptors and variants.                                                                                                                                                                     |
-| GET    | `/messages?since=<ISO or epoch ms>&cursor=&limit=`       | User messages across all non-deleted threads, including archived threads; default 200, maximum 1000 per page.                                                                                                                                                     |
+| GET    | `/messages?since=<ISO or epoch ms>&role=&threadIds=&cursor=&limit=`       | Messages across non-deleted threads, including archived threads; role defaults to user (also assistant, system, all); optional comma-separated threadIds (max 50); default 200, max 1000 per page.                                                                                                                                                     |
 | GET    | `/usage`                                                 | Usage records in a time range, with optional board filter and cursor pagination.                                                                                                                                                                                  |
 | GET    | `/threads`                                               | List threads (see filters below).                                                                                                                                                                                                                                 |
 | POST   | `/threads`                                               | Create a thread, optionally with a first prompt.                                                                                                                                                                                                                  |
@@ -124,8 +124,8 @@ previous page with the same filters). The window is at most 72 hours; `until`
 defaults to the time of the first request and stays fixed across its pages.
 `limit` defaults to 1,000 and is capped at 5,000. Returns
 `{ ok: true, items: [...], nextCursor: string | null }`;
-`null` means there are no more pages. `client.usage({ since, until, boardId, limit, cursor })`
-fetches one page.
+`null` means there are no more pages. `client.usage({ since, until, boardId, limit, cursor }, { timeoutMs })`
+fetches one page with an optional request deadline (default 30 seconds).
 
 Items contain `threadId`, `rootThreadId`, `parentThreadId`, `boardId`, `cardId`,
 `workspace`, `providerInstanceId`, `driver`, `model`, `effort`, `startedAt`,
@@ -142,9 +142,13 @@ Pages are live reads, not a snapshot. A running turn may complete or move in the
 ordering while paging; consumers should periodically re-read overlapping windows
 and must not treat a partially paged result as a complete accounting snapshot.
 
-`t3ctl usage --since ISO|MS [--until ISO|MS] [--board ID] [--limit N] [--all-pages]`
+`t3ctl usage --since ISO|MS [--until ISO|MS] [--board ID] [--limit N] [--all-pages] [--cursor CURSOR] [--timeout-ms MS]`
 prints one JSON page by default. `--all-pages` follows every cursor and prints one
-JSON object with all `items` and `nextCursor: null`.
+JSON object with all `items` and `nextCursor: null`, using 1,000 rows per page unless
+`--limit` is given. `--timeout-ms` overrides the per-page deadline, including
+`--request-timeout`. On failure, stderr names the page, cursor and number of items
+read; stdout remains empty. Resume with `--cursor` and the same window and board
+filters. A resumed result contains only the remaining rows.
 
 ### GET /threads
 
@@ -245,6 +249,8 @@ given. Reasoning and tool output never count.
 JSON-quoted incoming message ID in an iMessage channel-guidance context record,
 or null. Synthetic bridge IDs (`wake:`, `reset:`, `secret:`) are preserved so
 callers can distinguish them from relayed owner messages.
+
+Thread summaries and details include `changeMarker`, the latest V2 thread event sequence (0 if none). Compare it for incremental polling; `updatedAt` and `updatedSince` can miss timestamp ties. Poll known ids without `updatedSince`, then read changed messages with an overlapping `since` watermark.
 
 ### GET /threads/:id/wait
 

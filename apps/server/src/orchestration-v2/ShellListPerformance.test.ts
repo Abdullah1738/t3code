@@ -93,7 +93,6 @@ it.effect(
       yield* Deferred.succeed(lookupMigration!, undefined);
       assert.deepEqual(yield* projection.getThreadListCandidates(projectId), candidatesBefore);
       const beforeStart = performance.now();
-      // The unfiltered route retains the old materialized query: same fixture and wire derivation.
       const baseline = yield* projection.getShellSnapshot();
       const beforeMs = performance.now() - beforeStart;
       const statements: string[] = [];

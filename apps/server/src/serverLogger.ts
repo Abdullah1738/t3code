@@ -77,7 +77,9 @@ export const layer = Effect.gen(function* () {
     ),
   );
   const boardLockLogger = Logger.make(({ fiber, message }) => {
-    if (fiber.getRef(References.CurrentLogAnnotations)["board.waiting_on"] === undefined) return;
+    const annotations = fiber.getRef(References.CurrentLogAnnotations);
+    if (annotations["board.lock_log"] !== true && annotations["board.waiting_on"] === undefined)
+      return;
     const line = Array.isArray(message) ? message[0] : message;
     try {
       if (typeof line === "string") boardLockSink?.write(`${line}\n`);

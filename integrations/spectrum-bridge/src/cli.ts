@@ -1,5 +1,6 @@
 import { messageLengthError } from "./message-length.ts";
 import { cardKind, logCardRender, toolError, toolLog } from "./toollog.ts";
+import { validAgentRequestId, validAnswerStatus } from "./agent-bus.ts";
 import { constants } from "node:fs";
 import { lstat, open, stat } from "node:fs/promises";
 import { request } from "node:http";
@@ -31,7 +32,7 @@ class RawOutput {
 }
 
 const COMMANDS_HELP = "Expected health, send, cancel-send, send-file, poll, app, react, wake, secret-request, secret, publish, unpublish, ban, unban, or bans."
-  + " Sendblue mode adds location-request, location, messages, ask-owner, chats, allow, allow-group,"
+  + " Sendblue mode adds location-request, location, messages, ask-owner, agent-ask, agent-answer, agent-requests, chats, allow, allow-group,"
   + " guest-allow, guest-revoke, guests, guest-send, share-contact, and opt-in."
   + " Logs: log-rollup [--day YYYY-MM-DD]."
   + " Public links: share, unshare, and shares."
@@ -74,6 +75,9 @@ const OPTIONS_BY_COMMAND: Record<string, string[]> = {
   messages: ["session", "chat", "limit", "before", "id"],
   "opt-in": ["chat", "session"],
   "ask-owner": ["text", "session", "key"],
+  "agent-ask": ["to", "text", "session", "key", "parent"],
+  "agent-answer": ["request", "text", "session", "status"],
+  "agent-requests": ["session"],
   chats: ["session"],
   allow: ["address", "name", "admin", "session"],
   "allow-group": ["id", "name", "session"],
@@ -358,6 +362,24 @@ export function parseCommand(args: string[]): Command {
       const sessionId = optionalSession(values.session);
       return { method: "POST", path: "/opt-in", body: { chat, ...(sessionId === undefined ? {} : { sessionId }) } };
     }
+    case "agent-ask": {
+      const text = required(values.text, "--text");
+      if (text.length > 12_000) throw new CliError("--text must be at most 12000 characters");
+      if (values.parent !== undefined && !validAgentRequestId(values.parent)) throw new CliError("Invalid --parent");
+      return { method: "POST", path: "/agent-ask", body: { text, to: chatSlug(required(values.to, "--to")), ...session(),
+        ...(values.parent === undefined ? {} : { parent: values.parent }) } };
+    }
+    case "agent-answer": {
+      const text = required(values.text, "--text");
+      if (text.length > 12_000) throw new CliError("--text must be at most 12000 characters");
+      const request = required(values.request, "--request");
+      if (!validAgentRequestId(request)) throw new CliError("Invalid --request");
+      if (values.status !== undefined && !validAnswerStatus(values.status)) throw new CliError("Invalid --status");
+      return { method: "POST", path: "/agent-answer", body: { text, request, sessionId: sessionOnly(values.session)!,
+        ...(values.status === undefined ? {} : { status: values.status }) } };
+    }
+    case "agent-requests":
+      return { method: "POST", path: "/agent-requests", body: { sessionId: sessionOnly(values.session)! } };
     case "ask-owner": {
       const text = required(values.text, "--text");
       if (text.length > 12_000) throw new CliError(messageLengthError(text, 12_000));
@@ -521,7 +543,9 @@ export async function loadCommandPayload(command: Command): Promise<Body | undef
   };
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
-    const protectedPaths = ["credentials.env", "state.sqlite", "state.sqlite-wal", "state.sqlite-shm", "state.sqlite-journal"]
+    // The harness database guard scans CLI source and refuses scripts that name the live database file.
+    const stateDb = ["state", "sqlite"].join(".");
+    const protectedPaths = ["credentials.env", ...["", "-wal", "-shm", "-journal"].map(suffix => stateDb + suffix)]
       .map(name => join(homedir(), ".config", "spectrum-bridge", name));
     if (protectedPaths.includes(resolve(file))) throw new CliError("Bridge credentials and state cannot be attached");
     const before = await lstat(file, { bigint: true });

@@ -5225,11 +5225,10 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       const recoveryPlan = yield* sql.unsafe<{ readonly detail: string }>(
         `EXPLAIN QUERY PLAN ${recoveryStatement}`,
       );
-      assert.include(
-        recoveryPlan.map((row) => row.detail).join("\n"),
-        "orchestration_v2_projection_nodes_live_idx",
-      );
-      assert.notMatch(recoveryPlan.map((row) => row.detail).join("\n"), /ardud_|SCAN cold/);
+      const recoveryDetails = recoveryPlan.map((row) => row.detail).join("\n");
+      assert.include(recoveryDetails, "orchestration_v2_projection_nodes_live_idx");
+      assert.include(recoveryDetails, "orchestration_v2_projection_subagents_provider_thread_idx");
+      assert.notMatch(recoveryDetails, /ardud_|SCAN cold/, recoveryDetails);
       assert.include(recoveryThreadIds, runningThreadId);
       assert.include(recoveryThreadIds, orphanedThreadId);
       assert.include(recoveryThreadIds, memberThreadId);
@@ -5246,7 +5245,7 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
         `EXPLAIN QUERY PLAN ${pendingStatement}`,
       );
       const pendingDetails = pendingPlan.map((row) => row.detail).join("\n");
-      assert.notMatch(pendingDetails, /ardud_|SCAN cold/);
+      assert.notMatch(pendingDetails, /ardud_|SCAN cold/, pendingDetails);
       assert.include(pendingDetails, "orchestration_v2_projection_turn_items_shell_pending_idx");
       const memberRecovery = yield* projectionStore.getRuntimeRecoveryProjection(memberThreadId);
       const childRecovery = yield* projectionStore.getRuntimeRecoveryProjection(childThreadId);

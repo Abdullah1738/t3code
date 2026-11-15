@@ -551,6 +551,74 @@ describe("usage feed", () => {
     ),
   );
 
+  it.effect(
+    "keeps board-scoped rows identical across batches and selects the first running evidence",
+    () =>
+      run(
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          const usage = yield* Usage.Usage;
+          const baseline = (yield* usage.list({ since, until, boardId: "board-1" })).items;
+          yield* sql`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 850)
+          INSERT INTO orchestration_v2_projection_provider_turns
+            (provider_turn_id, thread_id, provider_thread_id, node_id, run_attempt_id, ordinal, status, started_at, completed_at, payload_json)
+          SELECT 'copy-' || i, thread_id, provider_thread_id, 'copy-node-' || i, run_attempt_id, i + 100,
+            status, started_at, completed_at, payload_json
+          FROM n CROSS JOIN orchestration_v2_projection_provider_turns WHERE provider_turn_id = 'a'`;
+          const originalEvent = (yield* sql<{
+            payload_json: string;
+          }>`SELECT payload_json FROM orchestration_events WHERE event_id = 'running-child'`)[0]!;
+          for (const [index, change] of [
+            { id: "wrong-run" },
+            { activeAttemptId: "attempt-other" },
+            { status: "starting" },
+            { modelSelection: { instanceId: "claudeAgent", model: "later-steered" } },
+          ].entries()) {
+            yield* sql`INSERT INTO orchestration_events ${sql.insert({
+              sequence: index < 3 ? index - 3 : 100,
+              event_id: `later-child-${index}`,
+              aggregate_kind: "thread",
+              stream_id: "child",
+              stream_version: index + 2,
+              event_type: "run.updated",
+              occurred_at: at(2),
+              actor_kind: "system",
+              metadata_json: "{}",
+              application_event_version: 2,
+              payload_json: JSON.stringify({
+                ...JSON.parse(originalEvent.payload_json),
+                modelSelection: { instanceId: "claudeAgent", model: "wrong-evidence" },
+                ...change,
+              }),
+            })}`;
+          }
+          const full = yield* usage.list({ since, until, boardId: "board-1", limit: "5000" });
+          assert.strictEqual(full.items.length, 852);
+          assert.isNull(full.nextCursor);
+          for (const item of full.items.slice(0, -1)) assert.deepStrictEqual(item, baseline[0]);
+          assert.deepStrictEqual(full.items.at(-1), baseline.at(-1));
+          const paged: Array<(typeof baseline)[number]> = [];
+          let cursor: string | null = null;
+          do {
+            const page: Effect.Success<ReturnType<typeof usage.list>> = yield* usage.list({
+              since,
+              until,
+              boardId: "board-1",
+              limit: "137",
+              cursor,
+            });
+            paged.push(...page.items);
+            cursor = page.nextCursor;
+          } while (cursor !== null);
+          assert.deepStrictEqual(full.items, paged);
+          yield* sql`UPDATE orchestration_events SET payload_json = json_remove(payload_json, '$.modelSelection')
+          WHERE event_id = 'running-child'`;
+          const missing = yield* usage.list({ since, until, boardId: "board-1", limit: "5000" });
+          assert.isTrue(missing.items.every((item) => item.model === null));
+        }),
+      ),
+  );
+
   it.effect("finds an attempt's selection through each history store's stream index", () =>
     run(
       Effect.gen(function* () {

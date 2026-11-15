@@ -393,6 +393,35 @@ export function workerQuietDue(
   return nowMs - since >= WORKER_QUIET_MS;
 }
 
+export const FAILED_TURN_RESUME_MS = 2 * 60 * 1000;
+
+export function isRuntimeFailure(failure: {
+  readonly class: string;
+  readonly category?: string | undefined;
+  readonly code: string | null;
+  readonly message: string;
+  readonly retryable?: boolean | null | undefined;
+}): boolean {
+  if (isOutage(failure)) return false;
+  if (failure.category !== undefined && failure.category !== "unknown") return false;
+  return failure.class === "transport_error" && failure.retryable === true;
+}
+
+/** Failure recovery ignores background work, but keeps the ordinary nudge window. */
+export function failedTurnResumeDue(
+  card: KanbanCard,
+  view: { readonly state: string; readonly quietSince: string },
+  nowMs: number,
+): boolean {
+  if (card.stage !== "working" || card.activeRole !== "work" || card.stalled !== null) return false;
+  if (view.state !== "idle") return false;
+  return (
+    nowMs - Math.max(Date.parse(view.quietSince), Date.parse(card.movedAt)) >=
+      FAILED_TURN_RESUME_MS &&
+    (card.nudgedAt === null || nowMs - Date.parse(card.nudgedAt) >= WORKER_QUIET_MS)
+  );
+}
+
 /** How long a thread whose turn ended may wait on its own background work before the board treats it as stopped. */
 export const BACKGROUND_GRACE_MS = 60 * 60 * 1000;
 
@@ -853,7 +882,7 @@ export interface ClaimContext {
 /**
  * A work thread may take a todo card that runs on its pool and project, isn't
  * running, stalled or kept for another work thread, and isn't blocked by work
- * outside the thread.
+ * outside the thread or awaiting review or merge.
  */
 export function checkClaim(board: KanbanBoard, card: KanbanCard, ctx: ClaimContext): MoveCheck {
   // Same hold as planDispatch: no card work starts while the board's setup runs.
@@ -897,9 +926,9 @@ export function checkClaim(board: KanbanBoard, card: KanbanCard, ctx: ClaimConte
   if ((card.projectId ?? board.defaultProjectId) !== ctx.projectId) {
     return no(`card #${card.number} runs in another project`);
   }
-  // The claim makes the card this thread's, so a block by the thread's own work doesn't count.
+  // A claim batches this thread's todo/working cards, but review and merge can still hold it up.
   const blocker = kanbanHeldUpBy(card, ctx.byId, ctx.threadId);
-  if (blocker) return no(`card #${card.number} waits on #${blocker.number}`);
+  if (blocker) return no(`card #${card.number} waits on #${blocker.number} (${blocker.stage})`);
   if (ctx.slots <= 0) return no(`the ${ctx.pool} pool is paused`);
   if (ctx.carrying >= MAX_BATCH) {
     return no(`this thread already carries ${ctx.carrying} cards (max ${MAX_BATCH})`);

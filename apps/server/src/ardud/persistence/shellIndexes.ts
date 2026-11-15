@@ -13,6 +13,39 @@ export const ensureShellLookupIndexes = Effect.fn("ensureShellLookupIndexes")(fu
     ON orchestration_v2_projection_messages(thread_id, updated_at DESC, message_id DESC)
     WHERE role = 'user' AND json_extract(payload_json, '$.createdBy') = 'user'
   `;
+  // Periodic session maintenance starts from loaded native IDs or nonempty rosters,
+  // never every provider thread accumulated by a long-lived application thread.
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_provider_threads_native_idx
+    ON orchestration_v2_projection_provider_threads(
+      provider_session_id, json_extract(payload_json, '$.nativeThreadRef.nativeId')
+    )
+  `;
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_provider_threads_background_idx
+    ON orchestration_v2_projection_provider_threads(provider_session_id)
+    WHERE json_array_length(payload_json, '$.pendingBackgroundTasks') > 0
+  `;
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_provider_thread_subagent_owner_idx
+    ON orchestration_v2_projection_subagents(provider_thread_id, thread_id)
+  `;
+  // Discovery order is internal. Stable keys avoid rewriting these two indexes
+  // every time streaming output advances a candidate's updated_at.
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_pr_sync_candidates_idx
+    ON orchestration_v2_projection_threads(thread_id)
+    WHERE deleted_at IS NULL AND json_extract(payload_json, '$.archivedAt') IS NULL
+      AND (json_extract(payload_json, '$.branch') IS NOT NULL OR json_extract(payload_json, '$.branchPullRequest') IS NOT NULL)
+  `;
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_pr_sync_unsettled_idx
+    ON orchestration_v2_projection_threads(thread_id)
+    WHERE deleted_at IS NULL AND json_extract(payload_json, '$.archivedAt') IS NULL
+      AND (json_extract(payload_json, '$.branch') IS NOT NULL OR json_extract(payload_json, '$.branchPullRequest') IS NOT NULL)
+      AND json_extract(payload_json, '$.settledAt') IS NULL
+      AND json_extract(payload_json, '$.settledOverride') IS NOT 'settled'
+  `;
   // Cross-thread control polling ranges over epoch milliseconds, including imported
   // ISO timestamps with equivalent offsets or fractional-second spellings.
   yield* sql`
@@ -21,6 +54,13 @@ export const ensureShellLookupIndexes = Effect.fn("ensureShellLookupIndexes")(fu
       CAST(ROUND(unixepoch(updated_at, 'subsec') * 1000) AS INTEGER),
       message_id, thread_id
     ) WHERE role = 'user'
+  `;
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_control_messages_since_idx
+    ON orchestration_v2_projection_messages(
+      CAST(ROUND(unixepoch(updated_at, 'subsec') * 1000) AS INTEGER),
+      message_id, thread_id, role
+    )
   `;
   yield* sql`
     CREATE INDEX IF NOT EXISTS ardud_provider_turns_completed_idx

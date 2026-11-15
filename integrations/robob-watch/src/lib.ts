@@ -699,20 +699,29 @@ const creatorRoutes = new Map<string, { session: string; cli: string; until: num
 const CREATOR_CACHE_MS = 3 * 60_000;
 const CREATOR_FAILURE_CACHE_MS = 30_000;
 const shortThread = (id: string) => id.split(":").at(-1)!.slice(0, 8);
+const exitReason = (result: { code: number; signal: NodeJS.Signals | null }) => result.signal === "SIGKILL" ? "timeout" : `exit:${result.code}`;
+
+function creatorFallback(watcher: Watcher, step: "native" | "status" | "send", reason: string, started: number): void {
+  const durationMs = Math.max(0, now() - started);
+  toolLog({ component: "wakes", kind: "error", name: "wake.creator_fallback", ok: false, ids: { watcher: watcher.id },
+    durationMs, props: { step, reason, durationMs } });
+}
 
 function creatorTimeout(): number {
   const override = Number(process.env.ROBOB_WATCH_TEST_CREATOR_TIMEOUT_MS);
   return underTest() && process.env.ROBOB_WATCH_T3CTL && Number.isInteger(override) && override > 0 && override < 10_000 ? override : 10_000;
 }
 
+function creatorSendTimeout(): number {
+  const override = Number(process.env.ROBOB_WATCH_TEST_CREATOR_SEND_TIMEOUT_MS);
+  return underTest() && process.env.ROBOB_WATCH_T3CTL && Number.isInteger(override) && override > 0 && override < 20_000 ? override : 20_000;
+}
+
 async function creatorRoute(watcher: Watcher, session: string, cli: string): Promise<CreatorRoute> {
   const failed = (step: "native" | "status", reason: string, started: number) => {
-    const durationMs = Math.max(0, now() - started);
     log(null, `creator lookup failed watcher=${watcher.id} session=${session.slice(0, 12)} reason=${reason}`);
-    toolLog({ component: "wakes", kind: "error", name: "wake.creator_fallback", ok: false, ids: { watcher: watcher.id },
-      durationMs, props: { step, reason, durationMs } });
+    creatorFallback(watcher, step, reason, started);
   };
-  const exitReason = (result: { code: number; signal: NodeJS.Signals | null }) => result.signal === "SIGKILL" ? "timeout" : `exit:${result.code}`;
   let thread = session;
   if (session.startsWith("ses_")) {
     const started = now();
@@ -778,9 +787,9 @@ function resolveCreator(watcher: Watcher, cli: string): Promise<CreatorRoute> {
   return entry.route;
 }
 
-function wakeThread(cli: string, thread: string, text: string, key: string): Promise<{ ok: boolean; out: string }> {
-  if (underTest() && !process.env.ROBOB_WATCH_T3CTL) return Promise.resolve(refused("t3ctl send"));
-  return run([cli, "send", thread, clip(text, MAX_WAKE), "--request-id", key, "--mode", "queue"], 20_000);
+function wakeThread(cli: string, thread: string, text: string, key: string) {
+  if (underTest() && !process.env.ROBOB_WATCH_T3CTL) return Promise.resolve({ ...refused("t3ctl send"), code: 127, signal: null });
+  return run([cli, "send", thread, clip(text, MAX_WAKE), "--request-id", key, "--mode", "queue"], creatorSendTimeout());
 }
 
 export function wake(source: string, text: string, key: string): Promise<{ ok: boolean; out: string }> {
@@ -1032,11 +1041,17 @@ export async function deliver(watcher: Watcher, event: string, key: string, stat
       let missed: { thread: string; reason: string } | undefined;
       if (creator.kind === "thread") {
         const prefix = `[Watcher event from robob-watch ${watcher.id}, not typed by anyone in this thread.]`;
+        const sendStarted = now();
+        let reason = "error";
         try {
           const result = await wakeThread(cli, creator.thread, `${prefix}\n${text}`, key);
           if (result.ok) { route = "creator"; return finish({ ok: true, via: `thread:${shortThread(creator.thread)}`, detail: result.out }); }
+          reason = exitReason(result);
           missed = { thread: creator.thread, reason: `send: ${result.out}` };
         } catch (error) { missed = { thread: creator.thread, reason: `send: ${String(error).slice(0, 500)}` }; }
+        creatorFallback(watcher, "send", reason, sendStarted);
+        // log(watcher.id, ...) below stays in the watcher archive; stdout reaches runner.log.
+        log(null, `creator wake fallback watcher=${watcher.id} thread=${creator.thread} reason=${reason}`);
       } else if (creator.kind === "unreachable") missed = creator;
       if (missed) {
         text = `(meant for thread ${shortThread(missed.thread)}, which could not be reached)\n${text}`;

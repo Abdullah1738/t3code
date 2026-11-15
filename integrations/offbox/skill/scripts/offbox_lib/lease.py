@@ -706,12 +706,19 @@ def _follow_bounded(box_id: str, pid: int, log_path, timeout_s: float):
 _FOLLOW_STOP_S = 160
 
 
+def _check_held(box_id, remote):
+    if remote and remote.get('heldRuns'):
+        from . import allocation
+        raise allocation.Busy(f"{box_id} is held by an unfinished command: {', '.join(remote['heldRuns'])}")
+
+
 def _bring_up(box_id: str, fresh: bool = False, recipe: str | None = None, box_held: bool = False,
               since: float | None = None, stale_error: str | None = None, on_state=None) -> dict:
     from . import outage, prepare
     options = {"on_state": on_state} if on_state is not None else {}
     with prepare.phase("bring_up", box_id), outage.accepted_machine():
         s = api.wait_state(box_id, api.LIVE_STATES, timeout=900, since=since, stale_error=stale_error, **options)
+        _check_held(box_id, s)
         try:
             ssh_sync.setup(box_id)
             ssh_sync.wait_ssh(box_id)
@@ -1257,6 +1264,7 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
 
 def _bring_up_resumed(con, box_id, confirmed, retried, request_resume=None, *, since=None, stale_error=None,
                       skip_archiving=False):
+    _check_held(box_id, confirmed)
     left_stopped = bool(confirmed)
     if confirmed and confirmed.get('state') in api.STARTING_STATES:
         _wait_unanswered_resume(con, box_id)
@@ -1378,6 +1386,8 @@ def _reuse_available(con, row, size, skip_archiving=False, retrying=False, befor
             if p.returncode == 255:
                 ssh_sync.check_host_key(box_id, p.stderr)
             if p.returncode == 0:
+                if api.BACKEND == 'server':
+                    _check_held(box_id, api.get(box_id))
                 ensure_ttl(box_id, max(RUN_TTL_S, idle_for(con, box_id, row["size"])))
                 if pending_grow and not _bigger(pending_grow[0], row['size']):
                     con.execute("DELETE FROM kv WHERE k=?", (f"resize_size:{box_id}",))
@@ -1400,6 +1410,7 @@ def _reuse_available(con, row, size, skip_archiving=False, retrying=False, befor
     if s is None or s.get("state") in ("error", "cancelled"):
         forget_box(con, box_id, "lease_gone", f"state={s and s.get('state')}")
         return None
+    _check_held(box_id, s)
     if s.get("dataExpiredAt"):
         _forget_expired(con, box_id, f"boat deleted its data at {s['dataExpiredAt']}")
         return None
@@ -1531,7 +1542,7 @@ def _reuse_available(con, row, size, skip_archiving=False, retrying=False, befor
     elif st in api.LIVE_STATES or st in api.STARTING_STATES:
         try:
             _bring_up(box_id)
-        except (api.BoxBootFailed, BoxNotReady, SshHostKeyMismatch, StartWaitFailed):
+        except (allocation.Busy, allocation.Fenced, api.BoxBootFailed, BoxNotReady, SshHostKeyMismatch, StartWaitFailed):
             raise
         except OffboxError as e:
             raise ResumeUnresolved(f"{box_id} did not become ready; nothing ran: {e}", e) from e

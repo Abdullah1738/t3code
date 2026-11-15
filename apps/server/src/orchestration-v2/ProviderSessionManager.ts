@@ -455,16 +455,25 @@ export const layerWithOptions = (
       );
       const sessions = yield* Ref.make(new Map<string, LiveSessionEntry>());
       const sessionUpdateObservers = yield* Ref.make<ReadonlyMap<ThreadId, number>>(new Map());
-      const sessionUpdateAudienceLock = yield* Semaphore.make(1);
+      // Register before audience selection, or wait for that session's in-flight
+      // fan-out before reading a snapshot. Refreshes share this per-session ordering.
+      const sessionUpdateLock = yield* KeyedLock.make<ProviderSessionId>();
       const observeThreadSessionUpdates = Effect.fn(
         "ProviderSessionManager.observeThreadSessionUpdates",
       )(function* (threadId: ThreadId) {
         yield* Effect.acquireRelease(
-          Ref.update(sessionUpdateObservers, (current) => {
-            const updated = new Map(current);
-            updated.set(threadId, (current.get(threadId) ?? 0) + 1);
-            return updated;
-          }).pipe(sessionUpdateAudienceLock.withPermits(1)),
+          Effect.gen(function* () {
+            yield* Ref.update(sessionUpdateObservers, (current) => {
+              const updated = new Map(current);
+              updated.set(threadId, (current.get(threadId) ?? 0) + 1);
+              return updated;
+            });
+            for (const entry of (yield* Ref.get(sessions)).values()) {
+              if (entry.attachedThreadIds.has(threadId)) {
+                yield* sessionUpdateLock.withLock(entry.runtime.providerSessionId, Effect.void);
+              }
+            }
+          }),
           () =>
             Ref.update(sessionUpdateObservers, (current) => {
               const updated = new Map(current);
@@ -472,7 +481,7 @@ export const layerWithOptions = (
               if (count <= 1) updated.delete(threadId);
               else updated.set(threadId, count - 1);
               return updated;
-            }).pipe(sessionUpdateAudienceLock.withPermits(1)),
+            }),
         );
       }, Effect.asVoid);
 
@@ -501,22 +510,27 @@ export const layerWithOptions = (
           );
           if (candidates.length === 0) return;
           const occurredAt = yield* DateTime.now;
-          const events = yield* Effect.forEach(candidates, (session) =>
-            Effect.gen(function* () {
-              return {
-                id: yield* idAllocator.allocate.event({ threadId, providerSessionId: session.id }),
-                type: "provider-session.updated",
-                threadId,
-                driver: session.driver,
-                providerInstanceId: session.providerInstanceId,
-                occurredAt,
-                payload: session,
-              } satisfies OrchestrationV2DomainEvent;
-            }),
+          yield* Effect.forEach(candidates, (session) =>
+            sessionUpdateLock.withLock(
+              session.id,
+              Effect.gen(function* () {
+                const event = {
+                  id: yield* idAllocator.allocate.event({
+                    threadId,
+                    providerSessionId: session.id,
+                  }),
+                  type: "provider-session.updated",
+                  threadId,
+                  driver: session.driver,
+                  providerInstanceId: session.providerInstanceId,
+                  occurredAt,
+                  payload: session,
+                } satisfies OrchestrationV2DomainEvent;
+                yield* eventSink.write({ events: [event], refreshBoundProviderSessions: true });
+              }),
+            ),
           );
-          yield* eventSink.write({ events, refreshBoundProviderSessions: true });
         },
-        sessionUpdateAudienceLock.withPermits(1),
         (effect, threadId) =>
           effect.pipe(
             Effect.mapError((cause) => new ProviderSessionRefreshError({ threadId, cause })),
@@ -899,9 +913,14 @@ export const layerWithOptions = (
           if (input.detachedThreadId !== undefined) threadIds.add(input.detachedThreadId);
           const released = [];
           for (const threadId of threadIds) {
-            const projection = yield* projectionStore.getThreadRecords(threadId, [
-              "providerThreads",
-            ]);
+            const projection = yield* projectionStore.getThreadRecords(
+              threadId,
+              ["providerThreads"],
+              {
+                providerSessionId,
+                pendingBackgroundTasksOnly: true,
+              },
+            );
             for (const providerThread of projection.providerThreads) {
               const tasks = providerThread.pendingBackgroundTasks ?? [];
               if (providerThread.providerSessionId !== providerSessionId || tasks.length === 0) {
@@ -941,9 +960,14 @@ export const layerWithOptions = (
           ({ threadId, providerSessionId, providerThreadId, taskIds }) =>
             Effect.gen(function* () {
               for (let attempt = 0; attempt < 3; attempt++) {
-                const projection = yield* projectionStore.getThreadRecords(threadId, [
-                  "providerThreads",
-                ]);
+                const projection = yield* projectionStore.getThreadRecords(
+                  threadId,
+                  ["providerThreads"],
+                  {
+                    providerSessionId,
+                    providerThreadIds: [providerThreadId],
+                  },
+                );
                 const providerThread = projection.providerThreads.find(
                   (candidate) => candidate.id === providerThreadId,
                 );
@@ -1837,7 +1861,7 @@ export const layerWithOptions = (
                 )
                   return "skipped" as const;
                 const records = yield* projectionStore
-                  .getThreadRecords(input.threadId, ["runs"])
+                  .getThreadRecords(input.threadId, ["runs"], { unfinishedRunsOnly: true })
                   .pipe(Effect.exit);
                 if (Exit.isFailure(records)) return "unknown" as const;
                 const now = yield* Clock.currentTimeMillis;
@@ -2007,36 +2031,36 @@ export const layerWithOptions = (
               providerThread: OrchestrationV2ProviderThread;
             }>
           >();
-          // Only attached Robob threads establish ownership. Native subagents or
-          // detached rows without an owner stay loaded rather than being guessed at.
-          for (const threadId of entry.attachedThreadIds) {
-            const records = yield* projectionStore
-              .getThreadRecords(threadId, ["providerThreads"])
-              .pipe(Effect.exit);
-            if (Exit.isFailure(records)) {
-              yield* Effect.logWarning("orchestration-v2.driver-session.orphan-sweep", {
-                providerSessionId,
-                ...counts,
-                skippedUnknown: loaded.size,
-                ownershipFailed: true,
-              });
-              return;
-            }
-            for (const providerThread of records.value.providerThreads) {
-              const ref = providerThread.nativeThreadRef;
-              if (
-                providerThread.appThreadId !== threadId ||
-                providerThread.providerInstanceId !== entry.runtime.instanceId ||
-                providerThread.providerSessionId !== providerSessionId ||
-                ref?.driver !== entry.runtime.driver ||
-                ref.nativeId === null ||
-                !loaded.has(ref.nativeId)
-              )
-                continue;
-              const candidates = owners.get(ref.nativeId) ?? [];
-              candidates.push({ threadId, providerThread });
-              owners.set(ref.nativeId, candidates);
-            }
+          // Native IDs are the bounded runtime roster. Resolve them once for the
+          // session, then accept only directly attached owners; never walk history.
+          const records = yield* projectionStore
+            .getProviderThreadsByNativeIds(providerSessionId, [...loaded])
+            .pipe(Effect.exit);
+          if (Exit.isFailure(records)) {
+            yield* Effect.logWarning("orchestration-v2.driver-session.orphan-sweep", {
+              providerSessionId,
+              ...counts,
+              skippedUnknown: loaded.size,
+              ownershipFailed: true,
+            });
+            return;
+          }
+          for (const providerThread of records.value) {
+            const threadId = providerThread.appThreadId;
+            const ref = providerThread.nativeThreadRef;
+            if (
+              threadId === null ||
+              !entry.attachedThreadIds.has(threadId) ||
+              providerThread.providerInstanceId !== entry.runtime.instanceId ||
+              providerThread.providerSessionId !== providerSessionId ||
+              ref?.driver !== entry.runtime.driver ||
+              ref.nativeId === null ||
+              !loaded.has(ref.nativeId)
+            )
+              continue;
+            const candidates = owners.get(ref.nativeId) ?? [];
+            candidates.push({ threadId, providerThread });
+            owners.set(ref.nativeId, candidates);
           }
           let attempts = 0;
           for (const nativeId of loaded) {
@@ -2482,7 +2506,7 @@ export const layerWithOptions = (
             return updated;
           });
         },
-        sessionUpdateAudienceLock.withPermits(1),
+        (effect, entry) => sessionUpdateLock.withLock(entry.runtime.providerSessionId, effect),
         (effect, entry, _event) =>
           effect.pipe(
             Effect.catchCause((cause) =>

@@ -470,7 +470,7 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
         con.commit()
         lease._release_locked(con, bid)
     if not dry:
-        reconcile_lost(con, bid, state=state)
+        reconcile_lost(con, bid, state=state, foreign=True)
     from .runs import EXIT_REPO_SETUP, REPO_SETUP_FAILED_MARKER
     for run in con.execute("SELECT * FROM runs WHERE box_id=? AND (status IN ('starting','running') OR "
                            "(status='infra' AND EXISTS (SELECT 1 FROM kv WHERE k='start_unknown:' || runs.run_id)))",
@@ -502,7 +502,8 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
                 # Legacy wrappers cannot be fenced; receipts are still authoritative.
                 if modern or result.code is not None:
                     start_check.settle(con, run, result, run['error'] or 'client ended before the command started',
-                                       until=None if api.left() is None else now() + max(0, api.left()))
+                                       until=None if api.left() is None else now() + max(0, api.left()),
+                                       foreign=True)
                     actions.append(f"settled run {run['run_id']} on {bid}: {result.verdict} exit={result.code}")
                     continue
             if state in api.LIVE_STATES and not pid:
@@ -518,6 +519,14 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
                     code = st.get('exitCode') if st else None
                 except OffboxError:
                     continue
+                if st:
+                    if not dry:
+                        from .runs import remember_interruption
+                        remember_interruption(run['run_id'], st)
+                    if st.get('running') is True:
+                        continue
+                    if st.get('status') == 'interrupted':
+                        status, code = 'interrupted', EXIT_INTERRUPTED
         elif state not in api.LIVE_STATES:
             continue
         elif pid:
@@ -528,8 +537,11 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
             if st is None:
                 # Missing/unavailable status is not proof a process stopped.
                 continue
-            elif not st.get("running") and st.get('status') == 'interrupted':
-                # Our server restarted under the run and did not run it again (runs.Interrupted).
+            if not dry:
+                from .runs import remember_interruption
+                remember_interruption(run['run_id'], st)
+            if not st.get("running") and st.get('status') == 'interrupted':
+                # The server settled the interruption without retrying the command.
                 status, code = 'interrupted', EXIT_INTERRUPTED
             elif not st.get("running") and st.get('status') in ('exited','lost'):
                 if st.get('status') == 'lost':
@@ -567,7 +579,7 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
                 if run['mode'] == 'bg' and status in ('done','failed') and run['pulls']:
                     import json
                     from .runs import do_pulls
-                    do_pulls(bid, dict(run), json.loads(run['pulls']))
+                    do_pulls(bid, dict(run), json.loads(run['pulls']), foreign=True)
                 from .runs import planned_steps
                 code = finish(run['run_id'], code, status, run=run, bookkeeping=False, report=True)
                 if planned_steps(run):
