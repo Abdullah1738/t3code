@@ -341,7 +341,7 @@ export async function tickOne(id: string): Promise<void> {
     startLoad = sampleLoad();
     timeoutMs = checkTimeout(current, startLoad);
     if (state.consecutive_failures || state.load_timeouts) toolLog({ component: "runner", kind: "event", name: "watch.retry", ids: { watcher: id, run: runId }, props: { action: "check", attempt: state.consecutive_failures + 1 } });
-    return runCheck(current, watcherDir(id), { WATCH_RUN: runId, WATCH_ATTEMPT: attemptId, WATCH_CLOSING: state.status === "closing" ? "1" : "0", ...(healthRun ? { HEALTH_TOOLLOG_RUN: healthRun } : {}) }, timeoutMs, instance);
+    return runCheck(current, watcherDir(id), { HEALTH_TOOLLOG_TRIGGER: state.consecutive_failures || state.load_timeouts ? "retry" : "schedule", WATCH_RUN: runId, WATCH_ATTEMPT: attemptId, WATCH_CLOSING: state.status === "closing" ? "1" : "0", ...(healthRun ? { HEALTH_TOOLLOG_RUN: healthRun } : {}) }, timeoutMs, instance);
   }));
   if (!result) return;
   const runTimedOut = result.timedOut && (result.code === null || result.code === 0);
