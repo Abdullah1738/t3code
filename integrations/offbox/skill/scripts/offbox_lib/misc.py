@@ -613,9 +613,9 @@ def _catch_up_log(r, budget: float | None = None, *, locked: bool = False, live:
         remaining = None if budget is None else max(0, budget - (time.time() - started))
         deadline = time.time() + (30 if remaining is None else remaining)
         history_budget = remaining
-        if (not live and api.BACKEND == 'boat' and r['mode'] == 'bg'
-                and (not _has_data(path) or _remote_copy(path) or _diagnostic_only(r, path))):
-            history_budget = (30 if remaining is None else max(0, remaining)) / 2
+        boat_bg = not live and api.BACKEND == 'boat' and r['mode'] == 'bg'
+        if boat_bg and remaining is not None:
+            history_budget = remaining / 2
         result = _catch_up_log_locked(r, path, history_budget, live=live) if r['command_id'] else 'n/a'
         if locked and not live and r['mode'] == 'bg' and api.BACKEND == 'boat':
             event(db(), r['box_id'], 'log_catchup_result', f"{r['run_id']} {result}")
@@ -623,7 +623,12 @@ def _catch_up_log(r, budget: float | None = None, *, locked: bool = False, live:
             ck = checkpoint(path)
             atomic_write_json(offsets_path(path), dict(ck, settledCommandId=r['command_id'], settledCheck=time.time_ns()))
         diagnostic_only = not live and api.BACKEND == 'boat' and _diagnostic_only(r, path)
-        if not live and r['mode'] == 'bg' and (not _has_data(path) or _remote_copy(path) or diagnostic_only):
+        incomplete_checkpoint = result not in ('complete', 'caught_up') and checkpoint(path) is not None
+        if not live and r['mode'] == 'bg' and (not _has_data(path) or _remote_copy(path)
+                                              or diagnostic_only or incomplete_checkpoint):
+            # Without a caller deadline history keeps its size-adaptive budget; SSH gets its own bounded attempt.
+            if boat_bg and budget is None:
+                deadline = time.time() + 10
             return _empty_log_fallback(r, path, deadline, result)
         return result
     except OSError as e:
@@ -802,8 +807,8 @@ def _catch_up_log_locked(r, path, budget, *, live=False) -> str:
         ck = checkpoint(path)
         length = path.stat().st_size
         remote = _remote_copy(path)
-        if remote:
-            ck, length = None, 0
+        if remote and ck is None:
+            length = 0
         if ck is None or (not length and r['mode'] == 'bg'):
             if length:
                 # Legacy bytes have no stream mapping. Equal lengths cannot prove that both streams are here.
@@ -812,7 +817,9 @@ def _catch_up_log_locked(r, path, budget, *, live=False) -> str:
         keep = ck['logBytes']
         if min(keep, ck['stdoutOffset'], ck['stderrOffset']) < 0 or length < keep:
             return 'incomplete:invalid checkpoint'
-        offsets = [ck['stdoutOffset'], ck['stderrOffset']]
+        # Verify a retained copy from stream zero without changing the checkpointed prefix's layout: readers may
+        # still hold delivery positions into its interleaved bytes. Append only bytes beyond those stream offsets.
+        offsets = [0, 0] if remote else [ck['stdoutOffset'], ck['stderrOffset']]
         sizes = [0, 0]
         digests = [hashlib.sha256(), hashlib.sha256()]
         copied = [0, 0]
@@ -840,7 +847,7 @@ def _catch_up_log_locked(r, path, budget, *, live=False) -> str:
                     if time.time() >= deadline:
                         return 'incomplete:timeout'
                     if page.get('size') is not None:
-                        sizes[i] = max(sizes[i], int(page['size']) - ck[which + 'Offset'])
+                        sizes[i] = max(sizes[i], int(page['size']) - (0 if remote else ck[which + 'Offset']))
                         if snapshot is None:
                             snapshot = int(page['size'])
                     if budget is None:
@@ -875,10 +882,11 @@ def _catch_up_log_locked(r, path, budget, *, live=False) -> str:
                         chunk = payload[:max(0, expected - copied[i])]
                         digests[i].update(chunk)
                         copied[i] += len(chunk)
-                    dst.write(data)
+                    skip = max(0, ck[which + 'Offset'] - offsets[i]) if remote else 0
+                    dst.write(data[skip:])
                     empty_pages = 0
                     offsets[i] = nxt
-                    if live and dst.tell() >= length:
+                    if live and not remote and dst.tell() >= length:
                         # Publish each validated page before fetching more: a later failure must keep this progress.
                         dst.flush()
                         if tmp is not None:
@@ -893,6 +901,8 @@ def _catch_up_log_locked(r, path, budget, *, live=False) -> str:
                             return 'incomplete:history ended early'
                         break
             if remote:
+                if any(offsets[i] < ck[which + 'Offset'] for i, which in enumerate(('stdout', 'stderr'))):
+                    return 'incomplete:history behind local log'
                 size = Path(str(path) + '.remote').stat().st_size
                 available = offsets[0]
                 if remote.get('lengths'):
@@ -1076,7 +1086,7 @@ def logs(run_id: str, do_follow: bool) -> int:
             return _wait_locked(r, echo=True)
         _refresh_running_ttl(r)
         result = _catch_up_log(r, budget=10, live=True) if r['status'] == 'running' else 'n/a'
-        _tail(p, 0, True)
+        _tail(_shown_log(p), 0, True)
         _incomplete_log(r, result)
         if r['mode'] != 'local':
             if not r['box_id'] or not r['process_id']:
@@ -1092,7 +1102,7 @@ def logs(run_id: str, do_follow: bool) -> int:
     result = _catch_up_log(r, lock_wait=LOG_READ_WAIT_S)
     from . import resources
     resources.finalize(r)
-    _tail(p, 0, True)
+    _tail(_shown_log(p), 0, True)
     from .runs import settled_steps_code, planned_steps
     code = settled_steps_code(r, r['exit_code'], catch_up=False, history_result=result)
     _incomplete_log(_validated_step_row(r, code), result)
@@ -1144,7 +1154,7 @@ def _settled(r, echo=False, pos=0, *, locked=False, until=None, show_failure=Fal
         _incomplete_log(checked, result)
         raise _wait_timeout(checked)
     if echo:
-        _tail(LOGS_DIR / f"{r['run_id']}.log", pos, True)
+        _tail_selected(LOGS_DIR / f"{r['run_id']}.log", pos, True)
     elif show_failure and r['mode'] == 'bg' and code not in (0, None):
         _failure_tail(LOGS_DIR / f"{r['run_id']}.log")
     if result in ('complete', 'caught_up') and r['mode'] == 'bg' and not _has_data(_shown_log(LOGS_DIR / f"{r['run_id']}.log")):
@@ -1193,10 +1203,15 @@ def _failure_tail(path) -> None:
     _tail(path, pos, True, limit=size)
 
 
+def _tail_selected(path, pos: int, echo: bool) -> int:
+    # The fallback copy has its own layout and delivery cursor, independent of the checkpointed log.
+    selected = _shown_log(path)
+    return _tail(selected, pos if selected == path else delivered_bytes(selected), echo)
+
+
 def _tail(path, pos: int, echo: bool, limit: int | None = None) -> int:
     """Consume the holder's local log from `pos`, up to `limit` bytes when given (the committed length: bytes past it
     are not yet checkpointed and must not be printed). Prints only when echoing. Returns the new position."""
-    path = _shown_log(path)
     decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
     echo = echo and not is_silenced(sys.stdout)
     delivered = 0
@@ -1368,7 +1383,7 @@ def _holder_stuck(r, st, log_path, pos: int, echo: bool, deadline=None, *, show_
     code = settled_steps_code(r, code, log_path=log_path, until=deadline)
     from . import resources
     resources.finalize(r)
-    _tail(log_path, pos, echo)
+    _tail_selected(log_path, pos, echo)
     failure = show_failure and not echo and r['mode'] == 'bg' and code not in (0, None)
     if failure:
         _failure_tail(log_path)
@@ -1633,7 +1648,7 @@ def _finalize(r, code, log_path, until=None, *, echo=False, show_failure=False) 
     if repo_setup_failed(code, log_path):
         finish(r['run_id'], EXIT_INFRA, 'infra', until=until)
         if echo:
-            _tail(log_path, delivered, True)
+            _tail_selected(log_path, delivered, True)
         elif show_failure:
             _failure_tail(log_path)
         say('repo toolchain setup failed (exit 98), not your command')
@@ -1674,7 +1689,7 @@ def _finalize(r, code, log_path, until=None, *, echo=False, show_failure=False) 
             raise _wait_timeout(_run_row(r['run_id']))
         # Catch-up must also drain bytes whose stream echo failed before recording later bytes as delivered.
         if echo:
-            _tail(log_path, delivered, True)
+            _tail_selected(log_path, delivered, True)
         elif show_failure and code not in (0, None):
             _failure_tail(log_path)
             failure_tail_shown = True
