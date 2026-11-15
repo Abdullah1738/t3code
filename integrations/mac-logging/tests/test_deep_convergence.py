@@ -356,8 +356,16 @@ class ConvergenceTests(unittest.TestCase):
                 deep.run_pass(roots,self.runner(lambda p:350 if p.name.startswith('part') else 700
                     if p==roots[1]/'0000' else 1,calls),budget=1200)
                 keys=[key for cmd,_ in calls for key in cmd[2:]]
-                self.assertLess(keys.index(str(roots[2]/'0000')),keys.index(str(roots[1]/'0000'/'part2')))
-                self.assertNotIn(str(roots[2]),jobs.read_state('disk-inventory')['partials'])
+                ordinary_index=keys.index(str(roots[2]/'0000'))
+                for root in roots[:2]:
+                    self.assertLessEqual(sum(Path(key).parent==root/'0000' for key in keys[:ordinary_index]),1)
+                self.assertNotIn(str(roots[1]/'0000'/'part2'),keys)
+                state=jobs.read_state('disk-inventory')
+                value=state['childState'][str(roots[1])][str(roots[1]/'0000')]
+                self.assertEqual((value['partsDone'],value['partsTotal']),(1,2))
+                self.assertTrue(value['partial'])
+                self.assertNotIn('bytes',value)
+                self.assertNotIn(str(roots[2]),state['partials'])
 
     def test_budget_truncated_probe_does_not_classify_an_ordinary_child_as_slow(self):
         for allowance in (.01,1,14.999,15):
