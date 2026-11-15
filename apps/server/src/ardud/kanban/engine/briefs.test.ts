@@ -154,6 +154,12 @@ describe("board briefs", () => {
       evaluatorBrief(board, { kind: "check" }),
     ]) {
       expect(brief).toContain("use T3 `delegate_task` with role `review`");
+      expect(brief).toContain("send later rounds with t3_thread_send to the same childThreadId");
+      expect(brief).toContain("with mode='queue'");
+      expect(brief).toContain(
+        "Start a new child only if the previous child failed, was cancelled or its model must change",
+      );
+      expect(brief).not.toContain("Use one new task per review round");
       expect(brief).toContain("Preserve the routed model and effort exactly in target.options");
       expect(brief).toContain("Do not pass an `agent` selector");
       expect(brief).toContain("The board review thread alone records card_review_result");
