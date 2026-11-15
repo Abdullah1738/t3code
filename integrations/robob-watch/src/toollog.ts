@@ -24,7 +24,7 @@ const values: Record<string, readonly string[]> = {
   stderrClass: ["usage_error", "missing_file", "permission", "timeout", "python_traceback", "auth", "connect", "json", "unknown"],
   triggerKind: ["file", "wal"],
   step: ["native", "status", "send"],
-  route: ["person", "owner", "group", "creator", "other"],
+  route: ["person", "owner", "group", "creator", "other", "thread", "unverified", "refused"],
   via: ["wake", "thread", "imessage-send", "telegram", "none", "wake:owner-fallback", "native:pending"],
   confirmed: ["pending", "n/a"],
 };
@@ -62,6 +62,10 @@ function fields(entry: LogEntry, at: Date) {
     else if (key === "signal" && typeof value === "string" && signals.has(value)) props[key] = value;
     else if ((entry.name === "watch.grace_ended" || entry.name === "watch.removed") && key === "reason" && typeof value === "string"
       && ["expired", "resume", "now", "paused", "no_inflight_check"].includes(value)) props[key] = value;
+    else if (entry.name === "watch.route_checked" && key === "reason" && typeof value === "string"
+      && ["no --session", "live owner session", "iMessage thread", "live thread", "not_found", "archived", "invalid_id", "invalid_thread", "invalid_session", "lookup unavailable"].includes(value)) props[key] = value;
+    else if (entry.name === "watch.route_checked" && key === "durationMs" && typeof value === "number"
+      && Number.isFinite(value) && value >= 0) props[key] = value;
     else if (entry.name === "wake.creator_fallback" && key === "reason" && typeof value === "string"
       && /^(?:timeout|invalid|archived|error|exit:\d{1,3})$/.test(value)) props[key] = value;
     else if (entry.name === "wake.creator_fallback" && key === "durationMs" && typeof value === "number"
