@@ -804,7 +804,8 @@ def settled_steps_code(run, code: int | None, *, log_path: Path | None = None, p
     row is still active. The caller has already established that the process ended.
     """
     path = log_path or LOGS_DIR / f"{run['run_id']}.log"
-    disk = offbox_disk_space.result(path, code)
+    from .misc import _raw_log
+    disk = offbox_disk_space.result(_raw_log(path), code)
     if disk.get('infra_failure') not in (None, 'disk_probe'):
         return code
     planned = planned_steps(run) if planned is None else planned
@@ -828,6 +829,7 @@ def settled_steps_code(run, code: int | None, *, log_path: Path | None = None, p
         result = _catch_up_log(dict(run, status='done'), budget=budget, locked=locked)
         if until is not None and now() >= until:
             raise OffboxError(f"--timeout reached; wait again: offbox wait {run['run_id']}", code=EXIT_WAIT_TIMEOUT)
+    path = _raw_log(path)
     # Complete old markers cannot prove the final attempt when the host's appended retry note is unread.
     history_incomplete = (api.BACKEND == 'server' and run['command_id'] and result is not None
                           and result not in ('complete', 'caught_up'))
@@ -1042,6 +1044,33 @@ def exit_recording_command(script: str, run_id: str, *, claim_id: str | None = N
     marker_block = ('python3 - "$$" <<\'OFFBOX_PID_RECORD\'\n' + BOUNDED_PROCESS
                     + f"\nrc, _ = bounded(['bash', '-c', {marker!r}, 'offbox-pid-record', sys.argv[1]], 2)\n"
                     + 'sys.exit(rc)\nOFFBOX_PID_RECORD')
+    execute = 'bash -l ' + shlex.quote(script_file) if script_file else 'bash -lc "$0"'
+    if api.BACKEND == 'boat':
+        # Retained command history can lag exit; keep both streams on the live box before its idle TTL changes.
+        execute = '\n'.join([
+            'mkdir -p "$HOME/.offbox/out"',
+            f'__offbox_output="$HOME/.offbox/out/{run_id}"',
+            ': > "$__offbox_output.stdout"; : > "$__offbox_output.stderr"',
+            'exec {__offbox_stdout}>&1 {__offbox_stderr}>&2',
+            'exec > >(tee -a "$__offbox_output.stdout"); __offbox_out_pid=$!',
+            'exec 2> >(tee -a "$__offbox_output.stderr" >&2); __offbox_err_pid=$!',
+            execute,
+            '__offbox_rc=$?',
+            'exec 1>&$__offbox_stdout 2>&$__offbox_stderr',
+            'exec {__offbox_stdout}>&- {__offbox_stderr}>&-',
+            # Close both pipes before waiting, so the receipt cannot race the last buffered stderr line.
+            '__offbox_drain() {',
+            '  for _ in 1 2 3 4 5 6 7 8 9 10; do',
+            '    kill -0 "$1" 2>/dev/null || return 0',
+            '    sleep 0.05',
+            '  done',
+            '  kill "$1" 2>/dev/null || :',
+            '}',
+            '__offbox_drain "$__offbox_out_pid"',
+            '__offbox_drain "$__offbox_err_pid"',
+        ])
+    else:
+        execute += '\n__offbox_rc=$?'
     outer = "\n".join([
         f'export OFFBOX_RUN_ID={shlex.quote(run_id)}',
         run_evidence.shell(BOUNDED_PROCESS),
@@ -1065,8 +1094,7 @@ def exit_recording_command(script: str, run_id: str, *, claim_id: str | None = N
           for name, code in (("HUP", 129), ("INT", 130), ("TERM", 143))],
         '__offbox_t0=$(date +%s)',
         '__offbox_evidence wrapper pid=$$',
-        'bash -l ' + shlex.quote(script_file) if script_file else 'bash -lc "$0"',
-        '__offbox_rc=$?',
+        execute,
         'fi',
         persist_block,
         # Whether a container started during the run (events, since testcontainers removes its own): only then
@@ -1367,7 +1395,8 @@ def log_probe_error(run_id, reason):
 
 
 def space_result(run_id, code, path=None, *, report=False):
-    record = offbox_disk_space.result(path or LOGS_DIR / f'{run_id}.log', code)
+    from .misc import _raw_log
+    record = offbox_disk_space.result(_raw_log(path or LOGS_DIR / f'{run_id}.log'), code)
     if record.get('disk_probe_error'):
         log_probe_error(run_id, record['disk_probe_error'])
     previous = read_json(LOGS_DIR / f'{run_id}.state.json', {})
@@ -1545,6 +1574,7 @@ class Runner:
     def __init__(self, a, me: dict):
         self.a, self.me = a, me
         self.run_id = home.take_invocation_run() or new_id("run")
+        home.flush_routing(self.run_id)
         self.root = Path(me["repo_root"])
         recorded_cwd = None
         if os.environ.get(BACKGROUND_RUN_ENV):
@@ -1643,7 +1673,8 @@ class Runner:
         existing = con.execute('SELECT client_pid,mode FROM runs WHERE run_id=?', (self.run_id,)).fetchone()
         if existing:
             con.close()
-            if not a.bg or existing['mode'] != 'bg' or existing['client_pid'] != os.getpid():
+            if existing['client_pid'] != os.getpid() or not (
+                    (a.bg and existing['mode'] == 'bg') or os.environ.get(home.RETURNED_HOME_ENV)):
                 raise OffboxError(f'{self.run_id}: queued run belongs to another client', code=EXIT_LOCAL)
             self.registered = True
             return
@@ -1661,6 +1692,8 @@ class Runner:
                              cmd_text[:4000], "bg" if a.bg else "fg", now(), str(self.log_path),
                              json.dumps(a.pull or []), self.rel, str(self.cwd), os.getpid(), len(steps)))
                 con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'start_claim:{self.run_id}', '1'))
+                if home.failed_over():
+                    con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'failover_queue:{self.run_id}', '1'))
         try:
             db_retry(register)
             self.registered = True
@@ -2846,9 +2879,11 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
            until: float | None = None, report: bool = False, run=None, bookkeeping: bool = True) -> int | None:
     incoming = code
     log_row = None
+    early_catchup = False
+    early_history = None
     st = status or ("lost" if code is None else ("done" if code == 0 else "failed"))
     def prepare_result():
-        nonlocal code, st
+        nonlocal code, st, early_catchup, early_history
         if status == 'source_gone':
             return  # No command or step ran; only the caller's source check failed.
         prior = run
@@ -2860,11 +2895,20 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
         # History can reach the server. An unvalidated wrapper result is never saved as terminal.
         if planned_steps(prior):
             code = None
-        disk = offbox_disk_space.result(LOGS_DIR / f'{run_id}.log', incoming)
+        from .misc import _raw_log, _catch_up_finished
+        disk = offbox_disk_space.result(_raw_log(LOGS_DIR / f'{run_id}.log'), incoming)
+        if (catch_up and api.BACKEND == 'boat' and dict(prior).get('mode') == 'bg'
+                and not planned_steps(prior) and disk.get('infra_failure') != 'disk_probe'):
+            with contextlib.closing(db()) as output_con:
+                early_history = _catch_up_finished(output_con, run_id, budget=10 if until is None else max(0, until-now()),
+                                   row=dict(prior, status=st, exit_code=incoming))
+            early_catchup = True
+            disk = offbox_disk_space.result(_raw_log(LOGS_DIR / f'{run_id}.log'), incoming)
         known_infra = status == 'infra' and disk.get('infra_failure') != 'disk_probe'
         code = incoming if known_infra or disk.get('infra_failure') not in (None, 'disk_probe') else settled_steps_code(
-            prior, incoming, locked=True, until=until, catch_up=catch_up, report=report)
-        disk = offbox_disk_space.result(LOGS_DIR / f'{run_id}.log', incoming)
+            prior, incoming, locked=True, until=until, catch_up=catch_up and not early_catchup, report=report,
+            history_result=early_history if isinstance(early_history, str) else None)
+        disk = offbox_disk_space.result(_raw_log(LOGS_DIR / f'{run_id}.log'), incoming)
         if known_infra:
             st = 'infra'
         elif planned_steps(prior) and status in (None, 'done', 'failed', 'infra'):
@@ -2917,7 +2961,7 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
     con = None
     try:
         con = db()
-        if catch_up and not planned_steps(r) and (r['mode'] == 'bg' or con.execute(
+        if catch_up and not early_catchup and not planned_steps(r) and (r['mode'] == 'bg' or con.execute(
                 'SELECT 1 FROM kv WHERE k=?', (f'lost_checked:{run_id}',)).fetchone()):
             from .misc import _catch_up_finished
             _catch_up_finished(con, run_id, budget=10 if until is None else max(0, until-now()))
@@ -3026,9 +3070,14 @@ def _background(a, me: dict) -> int:
         if interrupted:
             os.kill(os.getpid(), signal.SIGINT)
     print(rn.run_id, flush=True)
-    say(f"queued in background. Follow: offbox logs {rn.run_id} --follow ; wait: offbox wait {rn.run_id}; "
-        f"client log: {client_log}")
+    background_wait_hint(rn.run_id)
+    say(f"queued in background; client log: {client_log}")
     return 0
+
+
+def background_wait_hint(run_id: str) -> None:
+    say(f"Hand off `offbox wait {run_id}` using the remote-compute skill’s Waiting for a run route, "
+        "then end your turn; completion wakes you.")
 
 
 def background_queue(run_id: str, payload: dict) -> int:
@@ -3121,29 +3170,39 @@ def background_client(a, me: dict, ready=None, accept=None, signal_mask=None, so
                 signal.signal(s, handler)
 
 
-def forward_background(env: dict) -> None:
+def forward_background(env: dict, *, backend="boat") -> None:
     if _background_context is None:
         raise OffboxError('background failover has no queued run context', code=EXIT_LOCAL)
     # Reuse the stdin protocol on failover too: an exec of the original argv would expose --env values.
-    common.select_backend('boat')
+    common.select_backend(backend)
     os.environ.clear()
     os.environ.update(env)
     raise SystemExit(_background(*_background_context))
 
 
-def retry_background(error) -> None:
-    rid = os.environ.get(BACKGROUND_RUN_ENV)
+def retry_background(error, *, run_id=None) -> None:
+    rid = os.environ.get(BACKGROUND_RUN_ENV) or run_id
     if rid and not error.started:
+        returned = bool(run_id and os.environ.get(home.RETURNED_HOME_ENV))
         con = db()
         try:
             with write(con):
+                row = con.execute('SELECT * FROM runs WHERE run_id=?', (rid,)).fetchone()
                 fenced = con.execute("SELECT 1 FROM kv WHERE k=? AND v='fenced'", ('lost_confirmed:' + rid,)).fetchone()
+                if not row or row['process_id'] or (row['status'] != 'starting' and not (
+                        returned and fenced and row['status'] == 'lost' and row['exit_code'] is None)):
+                    return
+                if returned and row['mode'] == 'fg' and row['client_pid'] != os.getpid():
+                    return
                 if fenced:
                     # Keep the old fence forever: a late delivery must still lose its original claim.
                     con.execute('UPDATE kv SET v=? WHERE k=?', (new_id('claim'), 'start_claim:' + rid))
                     con.execute('DELETE FROM kv WHERE k=?', ('lost_confirmed:' + rid,))
-                con.execute("UPDATE runs SET box_id=NULL, error=?, end_at=NULL WHERE run_id=? "
-                            "AND status='starting' AND process_id IS NULL", (str(error)[:500], rid))
+                con.execute("UPDATE runs SET status='starting', box_id=NULL, error=?, end_at=NULL, "
+                            "logged_end_at=CASE WHEN ? THEN NULL ELSE logged_end_at END WHERE run_id=?",
+                            (str(error)[:500], returned, rid))
+            if returned:
+                save_run_state(rid, status='starting', box_id=None, process_id=None, exit_code=None, end_at=None)
         finally:
             con.close()
 
@@ -3279,7 +3338,8 @@ def _run_remote(a, rn) -> int:
                     rn.source_gone(e)
                 elif e.code == EXIT_LOCAL:
                     finish(rn.run_id, EXIT_LOCAL, "local_error")
-                elif not os.environ.get(BACKGROUND_RUN_ENV):
+                elif not os.environ.get(BACKGROUND_RUN_ENV) and not (
+                        os.environ.get(home.RETURNED_HOME_ENV) and home.unreachable(e)):
                     finish(rn.run_id, None, "busy" if e.code == EXIT_BUSY else "infra")
             if not isinstance(e, common.SourceGone):
                 rn.record(error=str(e)[:500])
@@ -3292,13 +3352,15 @@ def _run_remote(a, rn) -> int:
                                'start receipt recovered')
             finish(rn.run_id, rn.recovered_code)
             print(rn.run_id)
+            background_wait_hint(rn.run_id)
             return 0
         if a.bg:
             # Nobody stays attached to refresh the deadline: give the box a long one. The reaper stops it
             # IDLE_STOP_S after the process ends (it checks process status itself).
             lease.ensure_ttl(rn.box, BG_TTL_S, api.get(rn.box))
             print(rn.run_id)
-            say(f"started in background on {rn.box}. Follow: offbox logs {rn.run_id} --follow ; wait: offbox wait {rn.run_id}")
+            background_wait_hint(rn.run_id)
+            say(f"started in background on {rn.box}")
             return 0
         code = None
         try:

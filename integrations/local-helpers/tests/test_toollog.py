@@ -97,6 +97,45 @@ class ToolLogTests(unittest.TestCase):
         self.assertNotIn('PRIVATE', json.dumps(result))
         self.assertNotIn('971501234567', json.dumps(result))
 
+    def test_imessage_failure_formats_do_not_duplicate_legacy_diagnostics(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        def raw(batch, single=False):
+            return {'ts': self.day + 'T12:00:00Z', 'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_call',
+                    'ok': False, 'durationMs': 25000, 'ids': {'runId': 'same-run', 'callBatchId': batch},
+                    'props': {'method': 'GET', 'route': '/threads/:id/messages', **({'failureFormat': 'single'} if single else {})},
+                    'error': {'tag': 'control.request_failed', 'name': 'TimeoutError'}}
+        def summary(batch):
+            return {'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_calls',
+                    'ids': {'runId': 'same-run', 'callBatchId': batch},
+                    'calls': {'messages': {'ok': 9, 'failed': 1, 'histogram': [[10, 9], [25000, 1]]}}}
+        catch = {'component': 'control', 'kind': 'error', 'name': 'bridge.catch', 'ok': False,
+                 'ids': {'runId': 'same-run'}, 'error': {'tag': 'control.catch1', 'name': 'TimeoutError'}}
+        for shape in ['legacy', 'mixed', 'reversed', 'orphan', 'new_only', 'new_orphan', 'summary_only']:
+            with self.subTest(shape=shape):
+                rows = ([raw('new', True)] if shape == 'new_orphan' else
+                        [raw('new', True), summary('new')] if shape == 'new_only' else
+                        [summary('old')] if shape == 'summary_only' else
+                        [catch, raw('old'), raw('new', True)] if shape == 'orphan' else
+                        [catch, raw('old'), summary('old')] + ([] if shape == 'legacy' else [raw('new', True), summary('new')]))
+                if shape == 'mixed':
+                    for row in rows:
+                        if row.get('ids', {}).get('callBatchId') == 'new':
+                            row['ts'] = self.day + 'T13:00:00Z'
+                if shape == 'reversed':
+                    rows.reverse()
+                (directory / (self.day + '.ndjson')).write_text(''.join(json.dumps(row) + '\n' for row in rows))
+                result = toollog.rollup('imessage', self.day)
+                total = 1 if shape == 'new_orphan' else 11 if shape == 'legacy' else 3 if shape == 'orphan' else 10 if shape in {'new_only', 'summary_only'} else 21
+                new_only = shape in {'new_only', 'new_orphan'}
+                has_catch = not new_only and shape != 'summary_only'
+                call_failures = 1 if shape in {'legacy', 'summary_only'} or new_only else 2
+                diagnostics = 0 if shape == 'summary_only' else 1 if shape == 'legacy' or new_only else 2
+                self.assertEqual((result['total'], result['recordedRows'], result['errorRate'], result['failedCount']), (total, len(rows), diagnostics / total, call_failures + has_catch))
+                self.assertEqual(result['byComponent']['robob']['messages']['failed'], call_failures)
+                expected = ([] if not has_catch else [('control.catch1', 1)]) + ([] if shape in {'legacy', 'summary_only'} else [('control.request_failed', 1)])
+                self.assertEqual([(item['tag'], item['count']) for item in result['topErrorTags']], expected)
+
     def test_imessage_rollup_summary_appended_after_read_is_never_double_counted(self):
         directory = toollog.board_dir('imessage')
         directory.mkdir(parents=True)
@@ -129,7 +168,8 @@ class ToolLogTests(unittest.TestCase):
                  'histogram': [[10, 2], [1002, 1]]}
         call = {'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_call', 'ok': False,
                 'durationMs': 1002, 'ids': {'runId': 'run-fixture', 'callBatchId': 'batch-fixture'},
-                'props': {'method': 'GET', 'route': '/threads/:id'}}
+                'error': {'tag': 'control.request_failed', 'name': 'TimeoutError'},
+                'props': {'method': 'GET', 'route': '/threads/:id', 'failureFormat': 'single'}}
         rows = [{**call, 'name': 'turn.robob_calls', 'calls': {'thread': stats}}, call,
                 {**call, 'durationMs': 2000, 'ids': {'callBatchId': 'orphan'}},
                 {'component': 'router', 'kind': 'perf', 'name': 'turn.end', 'ok': True}]
@@ -137,6 +177,8 @@ class ToolLogTests(unittest.TestCase):
         result = toollog.rollup('imessage', self.day)
         self.assertEqual((result['total'], result['recordedRows'], result['okCount'], result['failedCount']), (5, 4, 3, 2))
         self.assertEqual(result['countsByName']['turn.robob_call'], 4)
+        self.assertEqual(result['errorRate'], 2 / 5)
+        self.assertEqual(result['topErrorTags'][0]['count'], 2)
         self.assertFalse(result['sampled'])
         self.assertEqual(result['byComponent']['robob']['thread'], {
             'count': 4, 'ok': 2, 'failed': 2, 'errorRate': .5, 'durationMs': {'p50': 10, 'p95': 2000, 'max': 2000}})

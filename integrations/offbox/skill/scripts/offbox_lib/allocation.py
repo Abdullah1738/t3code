@@ -68,11 +68,12 @@ def queue():
     parent = _QUEUE.get()
     retries = _QUEUE_RETRIES.get() if parent is None else None
     # Nested callers share the allocation deadline, but each must keep its own FIFO entry.
-    state = {k: parent[k] for k in ('end', 'wait', 'said')} if parent is not None else (
+    state = {k: parent[k] for k in ('end', 'wait', 'started', 'said')} if parent is not None else (
         retries.get('state') if retries is not None else None)
     if state is None:
-        wait = pool.wait_seconds()
-        state = {'end': pool.time.monotonic() + wait, 'wait': wait, 'said': False}
+        wait = float("inf") if pool.home.unlimited_queue() else pool.wait_seconds()
+        started = pool.time.monotonic()
+        state = {'end': started + wait, 'wait': wait, 'started': started, 'said': False}
     token = _QUEUE.set(state)
     try:
         yield state

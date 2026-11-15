@@ -206,7 +206,7 @@ async function actImpl({ db, incident, g, dryRun, progress = {}, save = () => {}
     if (!progress.queueOk && (plan.resumeQueue || g.staleHeld.length)) {
       for (const r of g.staleHeld) {
         io.assertReplicaFresh(db);
-        await io.dispatchCommand({ type: 'queued-run.cancel', commandId: `${incident.id}:cancel:${r.run_id}`, threadId: plan.threadId, runId: r.run_id });
+        await io.dispatchCommand({ type: 'queued-run.cancel', commandId: `${incident.id}:cancel:${r.run_id}`, threadId: plan.threadId, runId: r.run_id, reason: 'superseded', detail: 'Stale coordination pulse replaced during restart recovery.' });
       }
       if (g.held.length) {
         io.assertReplicaFresh(db);
@@ -240,10 +240,10 @@ export async function recoveryScan({ opts, state, now }, io = realIo) {
   let db;
   // Discovery rows are historical candidates. Each independent batch gets a
   // new snapshot; a thread's gather + act still share one guarded snapshot.
-  const refreshDb = () => {
+  const refreshDb = (batchIo = io) => {
     db?.close();
     db = undefined;
-    db = io.openDb(io.PATHS.db);
+    db = batchIo.openDb(batchIo.PATHS.db);
     return db;
   };
   try {

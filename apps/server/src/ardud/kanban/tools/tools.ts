@@ -20,6 +20,7 @@ import {
   ProviderOptionSelection,
   TrimmedNonEmptyString,
 } from "@t3tools/contracts";
+import { ExactEdits } from "../engine/exactEdits.ts";
 import { Tool, Toolkit } from "effect/ai";
 import * as Schema from "effect/Schema";
 
@@ -206,7 +207,7 @@ const tool = <
 const BoardGet = tool(
   "board_get",
   "Read the board",
-  "Compact Missions board: settings/instructions, goals, pools, groups, live thread states, unread counts and a page of card number/title/stage/owner/model/short status. No card descriptions, prompts, event histories, goal stories or wiki bodies; use card_get and wiki_read for detail. Default 200 cards, max 500; follow board.page.nextAfter with after while hasMore. With since, only cards active since then (an event, or an open or touched ask), one short row each: stage changes, review verdicts, run failures, stall, asks with asked/answered times; no settings, groups or unread; each page stays under 50,000 characters. boardId defaults to the board identified by this thread; when ambiguous, pass one of the candidate board ids in the error.",
+  "Compact Missions board: settings/instructions, goals, pools, groups, live thread states, unread counts and a page of card number/title/stage/owner/model/short status. No card descriptions, prompts, event histories, goal stories or wiki bodies; use card_get and wiki_read for detail. Default 200 cards, max 500. Every page stays under 50,000 characters and can hold fewer cards than limit when rows are large; follow board.page.nextAfter with after while hasMore. With since, only cards active since then (an event, or an open or touched ask), one short row each: stage changes, review verdicts, run failures, stall, asks with asked/answered times; no settings, groups or unread. boardId defaults to the board identified by this thread; when ambiguous, pass one of the candidate board ids in the error.",
   {
     boardId: BoardRef,
     after: Schema.optional(
@@ -532,7 +533,7 @@ const CardAskChange = tool(
     blocking: Schema.optional(
       describe(
         Schema.Boolean,
-        "true makes an async ask blocking. A blocking ask can't be made async.",
+        "true makes an async ask blocking. false is accepted only on an ask that is already async (no change); a blocking ask can't be made async.",
       ),
     ),
     revisionNote: Schema.optional(describe(Schema.String, "One line: what you changed and why.")),
@@ -849,13 +850,15 @@ const CardNext = tool(
 const CardEdit = tool(
   "card_edit",
   "Edit a card",
-  "Evaluators: change any card field. Links are added by URL and removeLinks takes them off by URL (both in one call replace a link); blockedBy replaces the list.",
+  "Evaluators: change any card field. Links are added by URL and removeLinks takes them off by URL (both in one call replace a link); blockedBy replaces the list. promptEdits / subtaskEdits: exact find-and-replace on the prompt / open subtask texts; each oldString must appear exactly count times (default 1) in the text as left by the edits before it; all apply or none do. Not with prompt / subtasks in the same call.",
   {
     boardId: BoardRef,
     card: CardRef,
     title: Schema.optional(Schema.String),
     description: Schema.optional(Schema.String),
     prompt: Schema.optional(Schema.String),
+    promptEdits: Schema.optional(ExactEdits),
+    subtaskEdits: Schema.optional(ExactEdits),
     priority: Schema.optional(
       describe(
         KanbanPriority,
@@ -1027,15 +1030,7 @@ const WikiWrite = tool(
     slug: TrimmedNonEmptyString,
     title: Schema.optional(RawBoardText),
     body: Schema.optional(Schema.String),
-    edits: Schema.optional(
-      Schema.Array(
-        Schema.Struct({
-          oldString: Schema.String.check(Schema.isMinLength(1)),
-          newString: Schema.String,
-          count: Schema.optional(PositiveInt),
-        }),
-      ).check(Schema.isMinLength(1), Schema.isMaxLength(50)),
-    ),
+    edits: Schema.optional(ExactEdits),
   },
   { page: Record },
   { readonly: false },

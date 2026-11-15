@@ -9,6 +9,7 @@ import {
   syncToolchain,
   ToolchainMismatch,
 } from "./toolchain-state.mjs";
+import { configSnapshot } from "./config-snapshot.mjs";
 
 const [root, ...input] = process.argv.slice(2);
 const candidates = [];
@@ -149,37 +150,8 @@ function argv() {
   return result;
 }
 
-function checkConfig() {
-  const configName =
-    /^(vite\.config\.|\.oxfmtrc|\.oxlintrc|oxfmt|oxlint|\.gitignore$|\.prettierignore$|\.eslintignore$)/;
-  const names = new Set(
-    [...fs.readdirSync(root), ...fs.readdirSync(main)].filter((name) => configName.test(name)),
-  );
-  for (const name of names) {
-    const a = path.join(root, name);
-    const b = path.join(main, name);
-    sameConfig(a, b, name);
-  }
-}
-
-function sameConfig(a, b, label) {
-  if (!fs.existsSync(a) || !fs.existsSync(b)) refuse(`config drift in ${label}`);
-  if (fs.statSync(a).isDirectory() && fs.statSync(b).isDirectory()) {
-    const names = new Set([...fs.readdirSync(a), ...fs.readdirSync(b)]);
-    for (const name of names) {
-      if (name !== "node_modules")
-        sameConfig(path.join(a, name), path.join(b, name), `${label}/${name}`);
-    }
-  } else if (
-    !fs.statSync(a).isFile() ||
-    !fs.statSync(b).isFile() ||
-    !fs.readFileSync(a).equals(fs.readFileSync(b))
-  ) {
-    refuse(`config drift in ${label}`);
-  }
-}
-
 let temporary;
+const snapshots = [];
 try {
   if (command !== "fmt" && command !== "lint") refuse("no node_modules in this worktree");
   const forwarded = argv();
@@ -191,34 +163,34 @@ try {
     if (main === root) continue;
     try {
       if (candidate.kind === "toolchain copy") syncToolchain(root, main);
-      checkConfig();
-      process.chdir(main);
-      const requireMain = createRequire(path.join(main, "package.json"));
-      const loaded = await loadToolchain(main);
+      process.chdir(root);
+      const snapshot = await configSnapshot(root, main);
+      snapshots.push(snapshot.directory);
+      const loaded = await loadToolchain(main, snapshot.directory);
       const config = loaded?.config[command];
-      if (!config) refuse(`main vite.config.ts has no ${command} config`);
-      checkToolchain(root, main, loaded);
-      // Imported config helpers and local lint plugins are configuration too.
-      const dependencies = [...loaded.dependencies];
-      if (command === "lint") {
-        config.jsPlugins = config.jsPlugins?.map((plugin) => {
+      if (!config) refuse(`worktree vite.config.ts has no ${command} config`);
+      // Validate local plugin dependencies at the corresponding installed package scope.
+      // The rules themselves come exclusively from the worktree snapshot.
+      const lint = loaded.config.lint;
+      if (lint?.jsPlugins) {
+        const requireWorktree = createRequire(path.join(root, "package.json"));
+        const plugins = [];
+        for (const plugin of lint.jsPlugins) {
           if (typeof plugin !== "string") refuse("unsupported JS plugin config");
-          const resolved = requireMain.resolve(plugin);
-          if (plugin.startsWith(".")) dependencies.push(resolved);
-          return resolved;
-        });
-      }
-      for (const file of dependencies) {
-        const relative = path.relative(main, file);
-        if (relative.startsWith("../") || relative.split(path.sep).includes("node_modules"))
-          continue;
-        const counterpart = path.join(root, relative);
-        if (
-          !fs.existsSync(counterpart) ||
-          !fs.readFileSync(file).equals(fs.readFileSync(counterpart))
-        ) {
-          refuse(`config drift in ${relative}`);
+          if (plugin.startsWith(".") || path.isAbsolute(plugin)) {
+            const file = path.resolve(root, plugin);
+            const original = file.startsWith(`${snapshot.directory}${path.sep}`)
+              ? path.join(root, path.relative(snapshot.directory, file))
+              : file;
+            plugins.push(await snapshot.stage(requireWorktree.resolve(original)));
+          } else plugins.push(plugin);
         }
+        lint.jsPlugins = plugins;
+      }
+      checkToolchain(root, main, loaded, snapshot.directory);
+      if (command === "lint") {
+        const requireConfig = createRequire(path.join(snapshot.directory, "package.json"));
+        config.jsPlugins = config.jsPlugins?.map((plugin) => requireConfig.resolve(plugin));
       }
       selectedConfig = config;
       break;
@@ -268,4 +240,5 @@ try {
   process.exitCode = 127;
 } finally {
   if (temporary) fs.unlinkSync(temporary);
+  for (const directory of snapshots) fs.rmSync(directory, { recursive: true, force: true });
 }

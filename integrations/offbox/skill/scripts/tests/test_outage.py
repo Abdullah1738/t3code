@@ -233,7 +233,7 @@ class QueuedOutageTests(OutageBase):
                    free_on_recovery=False, startup_blip=False, registration_delay=0, stay_down=False,
                    lock_delay=0, startup_down=False, deadline_error=None, selection_delay=0, resume_startup=False,
                    lock_wait_until=0, capacity_after_recovery=False, quick_capacity_retry=False,
-                   healthy_probe_seconds=0, release_after=900, busy_background_locks=False):
+                   healthy_probe_seconds=0, release_after=900, busy_background_locks=False, returned_home=False):
         start = self.clock.t
         snapshots = []
         recovered = False
@@ -360,6 +360,13 @@ class QueuedOutageTests(OutageBase):
             return 0
 
         with contextlib.ExitStack() as stack:
+            if returned_home:
+                def retry_returned(*args, **kwargs):
+                    nonlocal recovered
+                    self.assertEqual(self.con.execute("SELECT count(*) FROM pool_waiters WHERE run_id='run-A'").fetchone()[0], 0)
+                    recovered = True
+                stack.enter_context(patch.dict(os.environ, {home.RETURNED_HOME_ENV: 'previous outage'}))
+                stack.enter_context(patch.object(runs, 'retry_background', side_effect=retry_returned))
             if quick_capacity_retry:
                 def capacity_retry(*args):
                     self.clock.sleep(3)
@@ -373,7 +380,7 @@ class QueuedOutageTests(OutageBase):
             stack.enter_context(patch.object(home, 'preflight_reason', side_effect=None if pre_queue else preflight,
                                             return_value=None))
             stack.enter_context(patch.object(self.clock.time, 'sleep', side_effect=sleep))
-            if not stay_down:
+            if not stay_down and not returned_home:
                 stack.enter_context(patch.object(outage, 'wait_until_up', side_effect=recover))
             stack.enter_context(patch.object(api, 'probe', side_effect=probe))
             stack.enter_context(patch.object(runs, 'run_remote', side_effect=remote))
@@ -414,6 +421,30 @@ class QueuedOutageTests(OutageBase):
             self.assertEqual(queue['end'], start + 86400)
             self.assertGreater(left, 0)
         self.assertEqual(sum(c.args[:2] == ('pool', 'run.queue_resumed') for c in self.events.call_args_list), 2)
+
+    def test_returned_home_blips_keep_unlimited_fifo_and_finite_resume_events(self):
+        with patch.object(outage, 'wait_until_up') as recovery, patch.object(home, 'fail_over') as failover:
+            code, snapshots, start = self.run_queued(returned_home=True, blips=2)
+        self.assertEqual(code, 0, self.err.getvalue())
+        self.assertEqual(len(snapshots), 3)
+        first = snapshots[0][0]
+        for row, queue, state, _ in snapshots:
+            self.assertEqual((row['token'], row['queued_at']), (first['token'], first['queued_at']))
+            self.assertEqual((queue['started'], queue['end'], queue['wait']), (start, float('inf'), float('inf')))
+        for _, _, state, _ in snapshots[1:]:
+            self.assertEqual((state['place'], state['waiting']), (1, 3))
+        text = self.err.getvalue()
+        self.assertEqual(text.count('no time limit'), 1)
+        self.assertGreaterEqual(text.count('still queued'), 2)
+        self.assertNotIn('infs', text)
+        self.assertNotIn('nan', text)
+        self.assertNotIn('will wait up to', text)
+        resumed = [c.kwargs['props'] for c in self.events.call_args_list if c.args[:2] == ('pool', 'run.queue_resumed')]
+        self.assertEqual(len(resumed), 2)
+        self.assertTrue(all(p['deadlineKept'] and p['waitedMs'] > 0 and p['waitedMs'] < 1000000 for p in resumed))
+        self.assertTrue(all((p['placeBefore'], p['placeAfter']) == (1, 1) for p in resumed))
+        failover.assert_not_called()
+        recovery.assert_not_called()
 
     def test_real_queue_deadline_after_recovery_exits_92(self):
         code, snapshots, start = self.run_queued(timeout=True)

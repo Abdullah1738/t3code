@@ -117,7 +117,7 @@ test('first stall is recovered and persisted silently; a distinct later stall of
     let state = freshState();
     const first = watch(state, 'ses_a');
     await scan(state, fake, T0);
-    assert.deepEqual(fake.calls.interrupt, [{ id: 'thread:A', clientRequestId: first, reason: 'stall watch: waiting on the model', expectedRunId: 'run:ses_a' }]);
+    assert.deepEqual(fake.calls.interrupt, [{ id: 'thread:A', clientRequestId: first, reason: 'stall watch: waiting on the model', expectedRunId: 'run:ses_a', cancelReason: 'task_stalled' }]);
     fake.active([]);
     a.activeRunId = null;
     await scan(state, fake, T0 + MIN);

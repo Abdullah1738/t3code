@@ -1,6 +1,7 @@
 import { McpDenyReason } from "./mcpDenyReason.ts";
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
+import { OrchestrationV2CancelReason } from "../orchestrationV2.ts";
 
 const Timestamp = Schema.String.check(
   Schema.isPattern(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/),
@@ -190,6 +191,17 @@ const GeneralEvent = Schema.Struct({
   waitLookupMs: Schema.optionalKey(Measurement),
   writerWaitMs: Schema.optionalKey(Measurement),
   readerWaitMs: Schema.optionalKey(Measurement),
+  cardNextStages: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        stage: Schema.Literals(["caller", "occupancy", "cards", "ranking", "rules"]),
+        durationMs: Measurement,
+        readerWaitMs: Measurement,
+        queryMs: Measurement,
+        completed: Schema.Boolean,
+      }),
+    ).check(Schema.isMaxLength(5)),
+  ),
   queryMs: Schema.optionalKey(Measurement),
   renderMs: Schema.optionalKey(Measurement),
   inFlightAtStart: Schema.optionalKey(
@@ -232,6 +244,8 @@ const GeneralEvent = Schema.Struct({
       action: Schema.optionalKey(Schema.Literals(["set", "clear"])),
       reasonClass: Schema.optionalKey(Label),
       errorClass: Schema.optionalKey(Label),
+      cancelReason: Schema.optionalKey(OrchestrationV2CancelReason),
+      runId: Schema.optionalKey(DerivedId),
       model: Schema.optionalKey(Label),
       provider: Schema.optionalKey(Label),
       operation: Schema.optionalKey(Label),
@@ -358,6 +372,7 @@ export const RunUsageEvent = Schema.Struct({
   wallMs: Schema.NullOr(Measurement),
   turnCount: Measurement,
   endReason: Schema.Literals(["completed", "failed", "interrupted", "cancelled"]),
+  cancelReason: Schema.optionalKey(OrchestrationV2CancelReason),
   usageStatus: Schema.Literals(["complete", "partial", "unavailable"]),
   reviewRound: TokenCount,
 });

@@ -163,8 +163,10 @@ def project_order(data, order, flow, state):
 
 
 class TrackerRegistrar:
-    def __init__(self, reader):
+    def __init__(self, reader, *, recipient='owner'):
         self.reader=reader
+        self.recipient=reader.state.get('recipient',recipient)
+        require(self.recipient in order_watch_receipt.RECIPIENTS,'ORDER_RECIPIENT_INVALID')
 
     def __call__(self, order, *, paid):
         local=j.inspect(self.reader.flow_id)
@@ -172,7 +174,7 @@ class TrackerRegistrar:
         name='order-noon-'+order.lower()
         home=Path.home()
         command=[str(home/'.local/bin/order-watch'),'add','--app','noon','--order',order,
-                 '--vertical','food','--for','owner','--label',self.reader.state['review'].get('store') or 'noon Food',
+                 '--vertical','food','--for',self.recipient,'--label',self.reader.state['review'].get('store') or 'noon Food',
                  '--total',f"AED {local['reserved_minor']/100:.2f}",
                  '--payment-confirmed' if paid else '--hold-placed-text']
         env={k:v for k,v in os.environ.items() if k not in ('BUN_INSPECT','BUN_OPTIONS','NODE_OPTIONS')}
@@ -187,11 +189,12 @@ class TrackerRegistrar:
             try: row=json.loads(line)
             except ValueError: continue
             if isinstance(row,dict) and row.get('tracker_id')==name:receipt_rows.append(row)
-        require(result.returncode==0 and receipt_rows and receipt_rows[-1].get('watcher_registered') is True
+        exit_ok,receipt=order_watch_receipt.parse(result.stdout,result.returncode,self.recipient,name)
+        require(exit_ok and receipt_rows and receipt_rows[-1].get('watcher_registered') is True
                 and cfg.get('app')=='noon' and cfg.get('order')==order and cfg.get('watcher')==name
                 and cfg.get('vertical')=='food' and watcher.get('id')==name
+                and cfg.get('for','owner')==self.recipient
                 and cfg.get('delivery_card',{}).get('held') is (not paid),'FOOD_TRACKER_REGISTRATION_UNVERIFIED')
-        _,receipt=order_watch_receipt.parse(result.stdout,result.returncode,'owner',name)
         require(not paid or (receipt.get('delivery_card') or {}).get('status')=='sent',
                 'FOOD_DELIVERY_CARD_SEND_UNVERIFIED')
         return {'registered':True,'order':order,'held':not paid,**receipt}

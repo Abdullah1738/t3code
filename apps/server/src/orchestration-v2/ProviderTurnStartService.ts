@@ -205,6 +205,40 @@ export const layer: Layer.Layer<
     const startProgress = yield* Effect.serviceOption(ProviderStartProgress.ProviderStartProgress);
     const isManagedWorktreePath = yield* makeIsManagedWorktreePath;
 
+    const loadRunCancelMetadata = Effect.fn("ProviderTurnStartService.loadRunCancelMetadata")(
+      (threadId: ThreadId, runId: RunId) =>
+        projectionStore
+          .getThreadRecords(threadId, ["runs", "turnItems"], {
+            runIds: [runId],
+            turnItemRunIds: [runId],
+            turnItemTypes: ["run_interrupt_request"],
+          })
+          .pipe(
+            Effect.map(({ runs, turnItems }) => {
+              const recorded = runs[0];
+              if (
+                recorded?.cancelReason !== undefined &&
+                ["cancelled", "interrupted"].includes(recorded.status)
+              )
+                return {
+                  cancelReason: recorded.cancelReason,
+                  cancelDetail: recorded.cancelDetail,
+                };
+              const request = turnItems.findLast((item) => item.type === "run_interrupt_request");
+              return {
+                cancelReason: request?.cancelReason ?? runs[0]?.cancelReason,
+                cancelDetail:
+                  request?.cancelReason === undefined
+                    ? runs[0]?.cancelDetail
+                    : request.message === "Interrupt requested"
+                      ? undefined
+                      : request.message.slice(0, 500),
+              };
+            }),
+            Effect.catchCause(() => Effect.succeed(undefined)),
+          ),
+    );
+
     // These callbacks outlive startup while a run drains background work. Build
     // them outside start's scope so they cannot retain its full thread history.
     const makeRunControls = (input: {
@@ -288,6 +322,7 @@ export const layer: Layer.Layer<
             Effect.catchCause(() => Effect.succeed(input.inheritedBackgroundTurnItems)),
           ),
         shouldStartProviderTurn: () => isCurrentAttemptInStatus("running"),
+        loadRunCancelMetadata: () => loadRunCancelMetadata(input.threadId, input.runId),
         loadRunInterruptReason: () =>
           projectionStore
             .getThreadRecords(input.threadId, ["turnItems"], {
@@ -568,6 +603,7 @@ export const layer: Layer.Layer<
       }
       const progressAttempt = { threadId: input.threadId, runId, attemptId: attempt.id };
       const finishUsage = yield* runExecution.prepareUsageBeforeStart({
+        loadCancelMetadata: () => loadRunCancelMetadata(projection.thread.id, run.id),
         appThread: projection.thread,
         run,
         attempt,
@@ -2121,6 +2157,7 @@ export const layer: Layer.Layer<
             shouldFinalizeRun: runControls.shouldFinalizeRun,
             hasUnpairedRunInterruptRequest: runControls.hasUnpairedRunInterruptRequest,
             loadRunInterruptReason: runControls.loadRunInterruptReason,
+            loadRunCancelMetadata: runControls.loadRunCancelMetadata,
             message: {
               messageId: message.id,
               text:

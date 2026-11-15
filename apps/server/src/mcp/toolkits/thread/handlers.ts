@@ -272,6 +272,8 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
     dispatch(input.threadId, (common) => ({
       ...common,
       type: "queued-run.cancel",
+      reason: "queued_cancel",
+      detail: "Queued message cancelled through MCP.",
       runId: input.queuedRunId,
     })),
   ),

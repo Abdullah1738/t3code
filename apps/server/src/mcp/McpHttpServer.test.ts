@@ -666,6 +666,12 @@ it.effect.each([
       expect(span?.attributes.get("readinessWaitMs")).toBe(0);
       expect(span?.attributes.get("replyBytes")).toBe(Buffer.byteLength(JSON.stringify(result)));
       expect(span?.attributes.has("taskCount")).toBe(false);
+      if (name === "wiki_read") {
+        const savedReply = spans.find((span) => span.name === "KanbanTools.savedReply");
+        expect(savedReply?.attributes.get("kanban.reply.elapsed_ms")).toBe(25000);
+        expect(savedReply?.attributes.get("kanban.reply.timed_out")).toBe(false);
+        expect(savedReply?.parent).toMatchObject({ value: { spanId: span?.spanId } });
+      }
     }).pipe(Effect.provide(layer), Effect.withTracer(tracer));
   }),
 );

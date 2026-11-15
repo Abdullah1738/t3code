@@ -7,6 +7,7 @@ import { ControlClient } from "../src/control.ts";
 import { OpenChamber, type MessageRecord } from "../src/openchamber.ts";
 import { Router } from "../src/router.ts";
 import { Store } from "../src/store.ts";
+import { captureLogs } from "./log-fixture.ts";
 
 const day = "2026-11-13";
 const roots: string[] = [];
@@ -33,23 +34,165 @@ function setup(capBytes?: number) {
 test("one summary per completed turn retains slow/failed calls and exact millisecond percentiles", async () => {
   const { root, log, rows, turn, call } = setup();
   turn("turn.start");
-  for (const ms of [10, 20, 30, 900, 1_000, 1_001, 2_000]) call(ms);
+  for (const ms of [10, 20, 30, 900, 1_000, 1_500, 6_000]) call(ms);
   call(50, false);
   turn("turn.end");
   await log.settled();
-  expect(rows().filter(row => row.name === "turn.robob_call").map(row => row.durationMs)).toEqual([1_001, 2_000, 50]);
+  expect(rows().filter(row => row.name === "turn.robob_call").map(row => row.durationMs)).toEqual([6_000, 50]);
   const summary = rows().find(row => row.name === "turn.robob_calls")!;
-  expect(summary.calls?.thread).toMatchObject({ count: 8, ok: 7, failed: 1, p50: 50, p95: 2_000, max: 2_000 });
+  expect(summary.calls?.thread).toMatchObject({ count: 8, ok: 7, failed: 1, p50: 50, p95: 6_000, max: 6_000 });
   expect(new Set(rows().map(row => row.ids?.runId)).size).toBe(1);
   const result = JSON.parse(readFileSync(join(root, `rollup-${day}.json`), "utf8"));
-  expect(result).toMatchObject({ total: 10, recordedRows: 6, countsByName: { "turn.robob_call": 8 }, ok: 9, failed: 1 });
-  expect(result.byComponent.robob.thread).toMatchObject({ count: 8, ok: 7, failed: 1, errorRate: .125, durationMs: { p50: 50, p95: 2_000, max: 2_000 } });
+  expect(result).toMatchObject({ total: 10, recordedRows: 5, countsByName: { "turn.robob_call": 8 }, ok: 9, failed: 1 });
+  expect(result.byComponent.robob.thread).toMatchObject({ count: 8, ok: 7, failed: 1, errorRate: .125, durationMs: { p50: 50, p95: 6_000, max: 6_000 } });
 });
 
-test.each([1_000, 1_000.01, 1_001])("the one-second threshold uses the original timing %s", async ms => {
+test.each(["legacy", "mixed", "reversed", "orphan", "new_only", "new_orphan", "summary_only"])("failure format %s counts each diagnostic once", async shape => {
+  const { log, file } = setup();
+  const raw = (batch: string, single: boolean): LogLine => ({ ts: `${day}T12:00:00Z`, tool: "imessage", component: "robob",
+    kind: "perf", name: "turn.robob_call", ok: false, durationMs: 25_000, ids: { runId: "same-run", callBatchId: batch },
+    props: { method: "GET", route: "/threads/:id/messages", ...(single ? { failureFormat: "single" } : {}) },
+    error: { tag: "control.request_failed", name: "TimeoutError", message: "[redacted]" } });
+  const summary = (batch: string): LogLine => ({ ts: `${day}T12:00:00Z`, tool: "imessage", component: "robob", kind: "perf",
+    name: "turn.robob_calls", ids: { runId: "same-run", callBatchId: batch }, calls: { messages: {
+      count: 10, ok: 9, failed: 1, p50: 10, p95: 25_000, max: 25_000, histogram: [[10, 9], [25_000, 1]],
+    } } });
+  const legacy: LogLine = { ts: `${day}T12:00:00Z`, tool: "imessage", component: "control", kind: "error", name: "bridge.catch",
+    ok: false, ids: { runId: "same-run" }, error: { tag: "control.catch1", name: "TimeoutError", message: "[redacted]" } };
+  const records = shape === "new_orphan" ? [raw("new", true)]
+    : shape === "new_only" ? [raw("new", true), summary("new")]
+    : shape === "summary_only" ? [summary("old")]
+    : shape === "orphan" ? [legacy, raw("old", false), raw("new", true)]
+    : [legacy, raw("old", false), summary("old"), ...(shape === "legacy" ? [] : [raw("new", true), summary("new")])];
+  if (shape === "mixed") for (const row of records) if (row.ids?.callBatchId === "new") row.ts = `${day}T13:00:00Z`;
+  if (shape === "reversed") records.reverse();
+  writeFileSync(file(), records.map(row => JSON.stringify(row) + "\n").join(""));
+  const result = await log.rollup(day);
+  const total = shape === "new_orphan" ? 1 : shape === "legacy" ? 11 : shape === "orphan" ? 3 : shape === "new_only" || shape === "summary_only" ? 10 : 21;
+  const newOnly = shape === "new_only" || shape === "new_orphan";
+  const hasCatch = !newOnly && shape !== "summary_only";
+  const callFailures = shape === "legacy" || newOnly || shape === "summary_only" ? 1 : 2;
+  const diagnostics = shape === "legacy" || newOnly ? 1 : shape === "summary_only" ? 0 : 2;
+  expect(result).toMatchObject({ total, failed: callFailures + Number(hasCatch), recordedRows: records.length, errorRate: diagnostics / total });
+  expect(result?.countsByName["turn.robob_call"]).toBe(total - Number(hasCatch));
+  expect(result?.byComponent.robob.messages.failed).toBe(callFailures);
+  expect(result?.topErrorTags.map(({ tag, count }) => ({ tag, count }))).toEqual([
+    ...(!hasCatch ? [] : [{ tag: "control.catch1", count: 1 }]),
+    ...(shape === "legacy" || shape === "summary_only" ? [] : [{ tag: "control.request_failed", count: 1 }]),
+  ]);
+});
+
+test.each([1_500, 5_000, 5_000.01, 5_001, 6_000])("the five-second threshold uses the original timing %s", async ms => {
   const { log, rows, turn, call } = setup();
   turn("turn.start"); call(ms); turn("turn.end"); await log.settled();
-  expect(rows().filter(row => row.name === "turn.robob_call")).toHaveLength(ms > 1_000 ? 1 : 0);
+  expect(rows().filter(row => row.name === "turn.robob_call")).toHaveLength(ms > 5_000 ? 1 : 0);
+});
+
+test("slow-row limit survives summary flushes and never caps failures", async () => {
+  const { log, rows, turn, call } = setup();
+  turn("turn.start");
+  for (let i = 0; i < 50; i++) {
+    call(6_000);
+    if (i === 24) await log.rollup(day);
+  }
+  await log.rollup(day);
+  expect(rows().filter(row => row.name === "turn.robob_call")).toHaveLength(20);
+  expect(rows().flatMap(row => row.calls?.thread ? [row.calls.thread] : []).reduce((sum, stats) => sum + (stats.suppressedSlow ?? 0), 0)).toBe(30);
+  expect((await log.rollup(day))?.byComponent.robob.thread).toMatchObject({ count: 50, ok: 50, failed: 0 });
+  for (let i = 0; i < 25; i++) call(6_000, false);
+  turn("turn.end");
+  await log.rollup(day);
+  expect(rows().filter(row => row.name === "turn.robob_call" && row.ok === false)).toHaveLength(25);
+});
+
+test("sliding limits separate run and call name and expire at ten minutes", async () => {
+  const { log, rows, turn, call, time } = setup();
+  turn("turn.start");
+  for (let i = 0; i < 20; i++) call(6_000);
+  time(`${day}T12:09:59.999Z`); call(6_000);
+  call(6_000, true, "thread-a", "/threads/:id/messages");
+  turn("turn.start", "thread-b", "message-b"); call(6_000, true, "thread-b");
+  time(`${day}T12:10:00.000Z`); call(6_000);
+  await log.rollup(day);
+  const raw = rows().filter(row => row.name === "turn.robob_call");
+  expect(raw).toHaveLength(23);
+  expect(raw.filter(row => row.props?.route === "/threads/:id/messages")).toHaveLength(1);
+  expect(rows().find(row => row.calls?.thread?.suppressedSlow)?.calls?.thread.suppressedSlow).toBe(1);
+});
+
+test.each([
+  { name: "TimeoutError", code: undefined, response: "throw", status: 0 },
+  { name: "TypeError", code: "ECONNREFUSED", response: "throw", status: 0 },
+  { name: "SyntaxError", code: undefined, response: "json", status: 200 },
+  { name: "TimeoutError", code: undefined, response: "body", status: 200 },
+  { name: "AbortError", code: undefined, response: "body", status: 200 },
+  { name: "TypeError", code: "ECONNRESET", response: "body", status: 200 },
+  { name: "ControlError", code: undefined, response: "http", status: 503 },
+])("failed control $name requests retain one error row and one rollup failure", async fixture => {
+  const { root, rows } = setup();
+  const previous = process.env.TOOLLOG_DIR;
+  const prior = setup();
+  process.env.TOOLLOG_DIR = prior.root;
+  toolLog.write({ component: "robob", kind: "perf", name: "turn.robob_call", durationMs: 0, ok: true,
+    props: { method: "GET", route: "/threads/:id/messages" } });
+  toolLog.flush();
+  await toolLog.settled();
+  process.env.TOOLLOG_DIR = root;
+  const cause = Object.assign(new Error("PRIVATE +971501234567 /private/PRIVATE https://private.test/?token=PRIVATE"), fixture);
+  const fake = Object.assign(async () => {
+    if (fixture.response === "json") return new Response("PRIVATE", { status: fixture.status });
+    if (fixture.response === "body") return new Response(new ReadableStream({ start(controller) { controller.error(cause); } }), { status: fixture.status });
+    if (fixture.response === "http") return Response.json({ ok: false }, { status: fixture.status });
+    throw cause;
+  }, { preconnect: globalThis.fetch.preconnect });
+  const fetch = spyOn(globalThis, "fetch").mockImplementation(fake);
+  try {
+    toolLog.write({ component: "process", kind: "event", name: "bridge.stop" });
+    await expect(new ControlClient({ url: "http://127.0.0.1:3773", token: "PRIVATE_TOKEN" }).request("GET", "/threads/thread-a/messages?search=PRIVATE")).rejects.toMatchObject({ status: fixture.status });
+    const date = new Date().toISOString().slice(0, 10);
+    const result = await toolLog.rollup(date);
+    const records = rows(date);
+    expect(records.filter(row => row.error)).toHaveLength(1);
+    const failure = records.find(row => row.error)!;
+    const tag = fixture.response === "json" ? "control.invalid_json" : "control.request_failed";
+    expect(failure).toMatchObject({ name: "turn.robob_call", ok: false, props: { method: "GET", route: "/threads/:id/messages", failureFormat: "single" },
+      error: { tag, name: fixture.name } });
+    expect(failure.ids?.runId).toBeTruthy();
+    expect(result?.failed).toBe(1);
+    expect(result?.errorRate).toBe(1 / result!.total);
+    expect(result?.topErrorTags).toMatchObject([{ tag, count: 1 }]);
+    expect(result?.byComponent.robob.messages).toMatchObject({ count: 1, failed: 1, errorRate: 1 });
+    expect(JSON.stringify(records)).not.toContain("PRIVATE");
+  } finally {
+    fetch.mockRestore();
+    toolLog.write({ component: "process", kind: "event", name: "bridge.stop" }); toolLog.flush(); await toolLog.settled();
+    if (previous === undefined) delete process.env.TOOLLOG_DIR; else process.env.TOOLLOG_DIR = previous;
+  }
+});
+
+test.each(["upload", "stream"])("non-request %s failures retain cause keys and rollup causes after #40", async operation => {
+  const cause = Object.assign(new Error("PRIVATE +971501234567 /private/PRIVATE https://private.test/?token=PRIVATE"), { code: "ECONNRESET" });
+  const fake = Object.assign(async (url: string | URL | Request) => {
+    if (String(url).endsWith("/attachments")) return Response.json({ ok: true, attachmentId: "fixture", relativeUrl: "/signed" });
+    throw cause;
+  }, { preconnect: globalThis.fetch.preconnect });
+  const fetch = spyOn(globalThis, "fetch").mockImplementation(fake);
+  const tag = operation === "upload" ? "control.catch3" : "control.catch5";
+  try {
+    const records = await captureLogs(async () => {
+      const client = new ControlClient({ url: "http://127.0.0.1:3773", token: "PRIVATE_TOKEN" });
+      const action = operation === "upload" ? client.upload({ name: "PRIVATE", mimeType: "image/png", bytes: new Uint8Array([1]) })
+        : client.events({ signal: new AbortController().signal }).next();
+      await expect(action).rejects.toMatchObject({ status: 0 });
+      const result = await toolLog.rollup(new Date().toISOString().slice(0, 10));
+      expect(result?.topCauses).toContainEqual({ tag, causeKey: "code.ECONNRESET", count: 1 });
+    });
+    const catches = records.filter(row => row.name === "bridge.catch");
+    expect(catches).toHaveLength(1);
+    expect(catches[0]?.error).toMatchObject({ tag, causeKey: "code.ECONNRESET" });
+    expect(catches[0]?.site).toMatch(/^src\/control.ts:\d+$/);
+    expect(JSON.stringify(records)).not.toContain("PRIVATE");
+  } finally { fetch.mockRestore(); }
 });
 
 test("interleaved turns and calls completing after a new turn keep their captured run id", async () => {
@@ -192,7 +335,7 @@ test("degraded mode preserves errors, turn boundaries, summaries and slow/failed
   const { root, log, rows, turn, call } = setup(1);
   log.write({ component: "fixture", kind: "event", name: "before.cap" });
   log.write({ component: "fixture", kind: "perf", name: "card.render", durationMs: 10 });
-  turn("turn.start"); call(10); call(2_000); call(50, false); turn("turn.end");
+  turn("turn.start"); call(10); call(6_000); call(50, false); turn("turn.end");
   await log.settled();
   const second = createToolLog({ root, now: () => Date.parse(`${day}T12:00:00Z`), capBytes: 1 }); logs.push(second);
   second.write({ component: "fixture", kind: "event", name: "after.cap" });
@@ -204,7 +347,7 @@ test("aggregate metadata cannot carry message text, paths, query strings or arbi
   const { log, rows } = setup();
   log.write({ component: "robob", kind: "perf", name: "turn.robob_calls", calls: {
     PRIVATE_BODY: { count: 1, ok: 1, failed: 0, p50: 1, p95: 1, max: 1, histogram: [[1, 1]] },
-    thread: { count: 999, ok: 1, failed: 0, p50: 971501234567, p95: 971501234567, max: 971501234567, histogram: [[5, 1], [971501234567, 1]] },
+    thread: { count: 999, ok: 1, failed: 0, p50: 971501234567, p95: 971501234567, max: 971501234567, suppressedSlow: 971501234567, histogram: [[5, 1], [971501234567, 1]] },
   } });
   log.flush();
   const raw = JSON.stringify(rows());
@@ -238,7 +381,7 @@ test("the control client captures the turn before awaiting and leaves the respon
   let resolveFetch!: (response: Response) => void;
   const fakeFetch = Object.assign(() => new Promise<Response>(resolve => { resolveFetch = resolve; }), { preconnect: globalThis.fetch.preconnect });
   const fetch = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
-  const clock = spyOn(performance, "now").mockReturnValueOnce(0).mockReturnValue(2_000);
+  const clock = spyOn(performance, "now").mockReturnValueOnce(0).mockReturnValue(6_000);
   try {
     toolLog.write({ component: "router", kind: "event", name: "turn.start", ids: { threadId: "thread-a", messageId: "a" } });
     const first = toolLog.runIds("thread-a").runId;

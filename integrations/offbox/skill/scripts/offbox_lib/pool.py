@@ -482,21 +482,27 @@ def acquire(me, size=None, template=None, base=None, fresh=False, run_id=None, e
 
 def _acquire_with_pins(me, size, template, base, fresh, run_id, exclude, check_source):
     import toollog
+    handoff = None
     with toollog.span("pool", "run.lease", ids={"run": run_id}, tag="lease_failed") as data:
         started = time.monotonic()
         try:
             row = _acquire_logged(me, size, template, base, fresh, run_id, exclude, check_source)
+        except home.FailbackReady as ready:
+            handoff = ready
+            data["props"]["outcome"] = "ready"
         except BaseException:
             toollog.emit("pool", "run.queue", kind="error", ok=False, duration_ms=(time.monotonic()-started)*1000,
                          ids={"run": run_id}, props={"queued": True, "waitMs": (time.monotonic()-started)*1000}, tag="queue_failed")
             raise
-        data["ids"] = {"run": run_id, "box": row["box_id"]}
-        data["props"]["leaseKind"] = row.pop("_log_lease_kind", "reused")
-        data["props"]["size"] = row.get("size")
-        if data["props"]["leaseKind"] == "reused":
-            from . import lease
-            lease.report_reused_template(me, row, template)
-        return row
+        if handoff is None:
+            data["ids"] = {"run": run_id, "box": row["box_id"]}
+            data["props"]["leaseKind"] = row.pop("_log_lease_kind", "reused")
+            data["props"]["size"] = row.get("size")
+            if data["props"]["leaseKind"] == "reused":
+                from . import lease
+                lease.report_reused_template(me, row, template)
+            return row
+    raise handoff
 
 
 def _acquire_logged(me, size=None, template=None, base=None, fresh=False, run_id=None, exclude=None, check_source=None):
@@ -514,7 +520,7 @@ def _acquire_logged(me, size=None, template=None, base=None, fresh=False, run_id
             if 'queued_at' not in queue:
                 queue.update(token=token, queued_at=now())
             token = queue['token']
-            queue_start = queue['end'] - queue['wait']
+            queue_start = queue['started']
             queue['check_source'] = check_source
             allocation.check_queue()
             queue["log_setup_ms"] = 0
@@ -541,6 +547,10 @@ def _acquire_logged(me, size=None, template=None, base=None, fresh=False, run_id
                     got = _acquire(con, me, size, template, base, fresh, run_id, exclude, token)
                     poll.call(lambda: con.execute("UPDATE pool_cap_callers SET granted=1 WHERE token=?", (token,)))
                     granted = True
+                    if home.failed_over():
+                        import toollog
+                        toollog.emit("backend", "backend.failover_queue_done", ids={"run": run_id},
+                                     duration_ms=(time.monotonic()-queue_start)*1000, props={"outcome": "boat_box"})
                     if not run_id:
                         got['_pool_cap_token'] = token
                     import toollog
@@ -585,6 +595,8 @@ def _acquire_logged(me, size=None, template=None, base=None, fresh=False, run_id
             with write(con):
                 con.execute("DELETE FROM pool_waiters WHERE token=?", (token,))
                 if not granted:
+                    con.execute("DELETE FROM pool_pending WHERE pool_key=? AND pid=?", (_queue_key(key), os.getpid()))
+                if not granted:
                     con.execute("DELETE FROM pool_cap_callers WHERE token=?", (token,))
         try:
             db_retry(cleanup)
@@ -599,12 +611,14 @@ def _source(key, template, base, fresh):
 
 
 @contextlib.contextmanager
-def _lease_work():
+def _lease_work(*, selected=True):
     from . import allocation, home
     queue = allocation._QUEUE.get()
     started = time.monotonic()
     if queue is not None:
-        queue["queue_wait_s"] = max(0, started - (queue['end'] - queue['wait']) - queue.get('log_setup_ms', 0) / 1000)
+        if selected and home.failed_over():
+            home.BOAT_SELECTED.set(True)
+        queue["queue_wait_s"] = max(0, started - queue.get("started", queue["end"] - queue["wait"]) - queue.get('log_setup_ms', 0) / 1000)
         home.QUEUE_WAIT.set(queue["queue_wait_s"])
     try:
         yield
@@ -632,7 +646,7 @@ def _reconcile_pinned(con, row):
     except OffboxError:
         return
     try:
-        with _lease_work(), prepare.guard(bid):
+        with _lease_work(selected=False), prepare.guard(bid):
             try:
                 confirmed, _ = lease._resume_confirmed(con, bid, RUN_TTL_S, None, pending=True, confirm_only=True)
                 if confirmed and confirmed.get('state') in api.STARTING_STATES:
@@ -664,12 +678,26 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
     poll = _QueuePoll(con, wait, run_id, deadline=deadline)
     poll.call(lambda: capacity.schema(con))
     poll.call(lambda: allocation.recover_resumes(con, key))
-    started = deadline - wait
+    started = queue.get('started', deadline - wait)
     protected_base = bool(base and not fresh and home.active() and home.base_needs_home(source[5:]))
     next_home_probe = time.monotonic() + outage.PROBE_EVERY_S
+    failover = home.failed_over()
+    probe_every = home.failback_probe_seconds()
+    queue.setdefault("next_failback_probe", started + probe_every)
 
     def check_home(*, force=False):
         nonlocal next_home_probe
+        if failover and not home.BOAT_SELECTED.get() and time.monotonic() >= queue["next_failback_probe"]:
+            why = home.probe(timeout=min(5, home.PROBE_TIMEOUT_S), wait=False)
+            t = time.monotonic()
+            queue["next_failback_probe"] = t + probe_every
+            import toollog
+            toollog.emit("backend", "backend.failback_probe", ids={"run": run_id},
+                         props={"ok": why is None, "class": (home.PROBE_FACTS.get() or {}).get("class", "hard"),
+                                "waited_s": t-started})
+            if why is None:
+                state = poll.call(lambda: queue_state(con, key, run_id, source=source, size=size, token=waiter))
+                raise home.FailbackReady(run_id, t-started, state)
         if not protected_base or (not force and time.monotonic() < next_home_probe):
             return
         # Foreground pool holders never reach _refresh_background's API checks. Probe without a pool lock.
@@ -678,7 +706,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
         if why:
             raise OffboxError(f"home offbox server not reachable ({why})", outage=True, run_id=run_id)
 
-    lock_options = {'check_home': check_home} if protected_base else {}
+    lock_options = {'check_home': check_home} if protected_base or failover else {}
     said, last_error = queue.get('reported', False), None
     next_refresh = 0
     next_progress = 0
@@ -882,7 +910,9 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                         if con.execute("SELECT 1 FROM kv WHERE k=?", ("create_unanswered:" + key,)).fetchone():
                             # Replaying the retained key resolves the old allocation; it is not a new pool slot.
                             rows, can_create = [], True
-                        if source and not rows and not can_create and not pending and not _source_member(con, key, source):
+                        # A failed-over run can still use home when it recovers, even without a compatible Boat box.
+                        if (not failover and source and not rows and not can_create and not pending
+                                and not _source_member(con, key, source)):
                             cap = pool_cap(con, key)
                             raise OffboxError(
                                 f"this run needs a new {key} pool box ({source}), but the pool is full "
@@ -1095,12 +1125,17 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                 try:
                     shared = dict(me, owner="pool:"+key, thread=None, session=None, title="repository pool", manager=None)
                     creator = getattr(lease, 'acquire_private', lease.acquire)
+                    selected_before = home.BOAT_SELECTED.get()
                     try:
                         with _lease_work(), prepare.guard('new allocation') as budget:
                             got = creator(shared, size, template, base, fresh)
                             got['_prepare_end'] = budget.end
                             got['_log_lease_kind'] = 'saved-base' if str(got.get('source', '')).startswith('base:') else 'fresh'
-                    except (allocation.Busy, allocation.Fenced):
+                    except allocation.Busy:
+                        # The allocation lock rejected us before any create/resume request was sent.
+                        home.BOAT_SELECTED.set(selected_before)
+                        break
+                    except allocation.Fenced:
                         break
                     except capacity.CapacityError as e:
                         if resume_stall is not None:
@@ -1167,7 +1202,23 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
             toollog.emit("pool", "run.queue", ids={"run": run_id},
                          props={"queued": True, "position": state.get("place"), "waitMs": (t-started)*1000})
             detail = _queue_line(state, source)
-            if not said:
+            if failover:
+                if not said:
+                    say(f"queued for a {key} pool box on Boat (home is down): {detail}; waits until a Boat box "
+                        f"frees or home is back, no time limit; checking home every {probe_every} s. "
+                        "Run it with --bg or in a background shell if your tool call has a timeout")
+                    said = True
+                else:
+                    say(f"still queued for a {key} pool box on Boat: waited {int(t-started)} s, {detail}"
+                        f" · checking home every {probe_every} s")
+            elif home.unlimited_queue():
+                if not said:
+                    say(f"queued for a {key} pool box on home: {detail}; no time limit; "
+                        "leave it waiting with --bg and `offbox wait <run>`")
+                    said = True
+                else:
+                    say(f"still queued for a {key} pool box: waited {int(t-started)} s, {detail}")
+            elif not said:
                 say(f"queued for a {key} pool box: {detail}; will wait up to {_span(wait)}" +
                     (f" ({last_error})" if last_error else "") +
                     (". It starts by itself when a box is free: leave it waiting, do not retry or kill it. For a long "
@@ -1178,6 +1229,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
             else:
                 say(f"still queued for a {key} pool box: waited {_span(t-started)} of {_span(wait)}, {detail}" +
                     split_pool_notice(con, me))
+            queue['reported'] = said
             previous_state = state
             next_progress = t + PROGRESS_EVERY_S
         outage.queue_progress(healthy=last_error is None)

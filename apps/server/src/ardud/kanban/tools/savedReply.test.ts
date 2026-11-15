@@ -1,6 +1,6 @@
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { AnalyticsEvent, ThreadId } from "@t3tools/contracts";
+import { AnalyticsEvent, KanbanBoardId, KanbanCardId, ThreadId } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
@@ -423,8 +423,12 @@ it.effect.each([...SavedReply.TOOLS])("%s interrupted before commit is not saved
     {
       assert.isTrue(result.isError);
       assert.strictEqual(data.saved, false);
-      assert.include(String(data.message), "Not saved");
-      assert.include(String(data.message), "Safe to retry");
+      if (tool === "report_bug")
+        assert.include(String(data.message), "retry with the same arguments");
+      else {
+        assert.include(String(data.message), "Not saved");
+        assert.include(String(data.message), "Safe to retry");
+      }
     }
     yield* Deferred.succeed(release, undefined);
     yield* TestClock.adjust(BoardLocks.WRITE_WAIT_MS);
@@ -440,14 +444,25 @@ it.effect.each([...SavedReply.TOOLS])(
       const entered = yield* Deferred.make<void>();
       const call = yield* Effect.forkChild(
         SavedReply.protect(
-          locks
-            .board(
-              "a",
-              locks.outside(
-                Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
-              ),
-            )
-            .pipe(Effect.as(reply)),
+          (tool === "report_bug"
+            ? SavedWrite.locateReport({
+                kind: "evaluator",
+                boardId: KanbanBoardId.make("a"),
+                keyPrefix: "bug-report:pending:",
+              })
+            : Effect.void
+          ).pipe(
+            Effect.andThen(
+              locks
+                .board(
+                  "a",
+                  locks.outside(
+                    Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+                  ),
+                )
+                .pipe(Effect.as(reply)),
+            ),
+          ),
           tool,
         ),
       );
@@ -458,11 +473,15 @@ it.effect.each([...SavedReply.TOOLS])(
       {
         assert.isTrue(result.isError);
         assert.isNull(data.saved);
-        assert.include(String(data.message), "may have been saved");
-        assert.include(
-          String(data.message),
-          tool === "discussion_post" ? "discussion_read" : "card_get",
-        );
+        if (tool === "report_bug")
+          assert.include(String(data.message), "Retry with the same arguments");
+        else {
+          assert.include(String(data.message), "may have been saved");
+          assert.include(
+            String(data.message),
+            tool === "discussion_post" ? "discussion_read" : "card_get",
+          );
+        }
       }
     }),
 );
@@ -492,6 +511,54 @@ it.effect("commit state reached during interrupt cleanup is observed", () =>
   }),
 );
 
+it.effect.each([
+  { name: "unprepared", lookup: undefined, saved: false, text: "Nothing was saved" },
+  {
+    name: "card",
+    lookup: {
+      kind: "card",
+      boardId: KanbanBoardId.make("board-a"),
+      cardId: KanbanCardId.make("card-a"),
+      number: 1480,
+    },
+    saved: null,
+    text: "card #1480 (card-a) on board board-a",
+  },
+  {
+    name: "evaluator",
+    lookup: {
+      kind: "evaluator",
+      boardId: KanbanBoardId.make("board-a"),
+      keyPrefix: "bug-report:pending:",
+    },
+    saved: null,
+    text: "evaluator key prefix bug-report:pending: on board board-a",
+  },
+] as const)(
+  "report_bug timeout with $name recovery target reports a proven or named outcome",
+  ({ lookup, saved, text }) =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const call = yield* SavedReply.protect(
+        (lookup === undefined ? Effect.void : SavedWrite.locateReport(lookup)).pipe(
+          Effect.andThen(SavedWrite.committing),
+          Effect.andThen(Deferred.succeed(entered, undefined)),
+          Effect.andThen(Effect.never),
+        ),
+        "report_bug",
+      ).pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust(SavedReply.REPLY_BUDGET_MS);
+      const result = callResult(yield* Fiber.join(call));
+      const data = replyData(result.structuredContent);
+      assert.isTrue(result.isError);
+      assert.strictEqual(data.saved, saved);
+      assert.include(data.message, text);
+      assert.match(data.message, /[Rr]etry with the same arguments/);
+      if (lookup !== undefined) assert.deepInclude(result.structuredContent, { lookup });
+    }),
+);
+
 it.effect("a saved receipt survives slow encoding as a non-error reply", () =>
   Effect.gen(function* () {
     const saved = yield* Deferred.make<void>();
@@ -515,6 +582,27 @@ it.effect("a saved receipt survives slow encoding as a non-error reply", () =>
       assert.strictEqual(data.threadId, threadId);
       assert.include(String(data.message), "Saved");
     }
+  }),
+);
+
+it.effect("report_bug returns its saved evaluator queue after a reply failure", () =>
+  Effect.gen(function* () {
+    const result = callResult(
+      yield* SavedReply.protect(
+        SavedWrite.record({ kind: "evaluatorQueue", key: "report-1480", queueId: 1480 }).pipe(
+          Effect.andThen(Effect.die(new BoardLocks.BoardStateChanged(true))),
+        ),
+        "report_bug",
+      ),
+    );
+    assert.isFalse(result.isError);
+    assert.deepInclude(result.structuredContent, {
+      saved: true,
+      queued: true,
+      queueId: 1480,
+      evaluatorKey: "report-1480",
+    });
+    assert.notInclude(JSON.stringify(result), BoardLocks.MAY_HAVE_APPLIED);
   }),
 );
 

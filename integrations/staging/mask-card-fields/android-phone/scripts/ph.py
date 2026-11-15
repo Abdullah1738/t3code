@@ -65,9 +65,9 @@ def d():
 def adb(*a):
     guard_phone(False)
     return subprocess.run(["adb", "-s", SERIAL, *a], capture_output=True, text=True, check=True).stdout
-def _run(args, t=5, strict=False):
+def _run(args, t=5, strict=False, *, device_action=False):
     if args and args[0] == "adb":
-        guard_phone(len(args) > 1 and args[1] in ("kill-server", "start-server"))
+        guard_phone(device_action or (len(args) > 1 and args[1] in ("kill-server", "start-server")))
     try: return subprocess.run(args, capture_output=True, text=True, timeout=t, check=strict).stdout
     except TimeoutError: raise
     except Exception:
@@ -539,6 +539,35 @@ def lease_cli(args):
         return exc.code
 
 
+def group_running(child):
+    child.poll()  # Reap our leader; an exited leader does not imply an empty group.
+    try: os.killpg(child.pid, 0)
+    except ProcessLookupError: return False
+    try:
+        result = subprocess.run(['ps', '-axo', 'pgid=,stat='], capture_output=True,
+                                text=True, check=True, timeout=1)
+        states = [parts[1] for line in result.stdout.splitlines()
+                  if len(parts := line.split()) == 2 and parts[0] == str(child.pid)]
+        # Linux container init may retain orphan zombies. They cannot do device work.
+        return any(not state.startswith('Z') for state in states)
+    except (OSError, subprocess.SubprocessError):
+        return True
+
+
+def finish_group(child):
+    try: os.killpg(child.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        child.wait()
+        return
+    deadline = time.monotonic() + 2
+    while group_running(child):
+        if time.monotonic() >= deadline:
+            try: os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError: break
+        time.sleep(.1)
+    child.wait()
+
+
 def lease_run(owner, purpose, ttl, args):
     stop = threading.Event()
     child = None
@@ -547,6 +576,7 @@ def lease_run(owner, purpose, ttl, args):
     acquired = False
     lost_claim = []
     lease_id = None
+    group_finished = False
     def forward(signum, _frame):
         received.append((signum, time.monotonic()))
         if child is not None:
@@ -579,6 +609,8 @@ def lease_run(owner, purpose, ttl, args):
                 if received and time.monotonic() - received[0][1] >= 2:
                     try: os.killpg(child.pid, signal.SIGKILL)
                     except ProcessLookupError: pass
+        finish_group(child)
+        group_finished = True
         stop.set()
         worker.join()
         if lost_claim:
@@ -586,16 +618,10 @@ def lease_run(owner, purpose, ttl, args):
             return 5
         return code if code >= 0 else 128 - code
     finally:
+        if child is not None and not group_finished:
+            finish_group(child)
         stop.set()
         if 'worker' in locals(): worker.join()
-        if child is not None and child.poll() is None:
-            try: os.killpg(child.pid, signal.SIGTERM)
-            except ProcessLookupError: pass
-            try: child.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                try: os.killpg(child.pid, signal.SIGKILL)
-                except ProcessLookupError: pass
-                child.wait()
         if acquired:
             try: phonelock.release(owner, lease_id=lease_id)
             except (phonelock.Busy, OSError): pass
@@ -612,7 +638,7 @@ def reset_u2():
         _d = None
         return
     try:
-        _run(["adb", "-s", SERIAL, "shell", "pkill -f com.wetest.uia2; pkill -f uiautomator"], t=5)
+        _run(["adb", "-s", SERIAL, "shell", "pkill -f com.wetest.uia2; pkill -f uiautomator"], t=5, device_action=True)
     except Exception: pass
     finally: _d = None
 
