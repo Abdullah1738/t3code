@@ -182,6 +182,43 @@ def source_touches_live(source: str) -> bool:
 
 def _foreign_reader_shadowed(source):
     names = r'(?:open(?:Sync)?|sqlite3?|Database(?:Sync)?|connect|readFile(?:Sync)?|createReadStream)'
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        pass
+    else:
+        # sqlite3 imports establish real readers; later writes to their bindings
+        # or attributes still invalidate that trust, including renamed imports.
+        standard_names = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                standard_names.update(alias.asname or alias.name.split('.')[0] for alias in node.names
+                                      if alias.name.split('.')[0] == 'sqlite3')
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and (node.module or '').split('.')[0] == 'sqlite3':
+                standard_names.update(alias.asname or alias.name for alias in node.names)
+
+        def sensitive(name):
+            return bool(name and (name in standard_names or re.fullmatch(names, name)))
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                if any(alias.name.split('.')[0] != 'sqlite3' and sensitive(alias.asname or alias.name.split('.')[0]) for alias in node.names):
+                    return True
+            elif isinstance(node, ast.ImportFrom):
+                if (node.level != 0 or (node.module or '').split('.')[0] != 'sqlite3') and any(sensitive(alias.asname or alias.name) for alias in node.names):
+                    return True
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)) and sensitive(node.id):
+                return True
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.arg, ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+                if sensitive(node.arg if isinstance(node, ast.arg) else node.name):
+                    return True
+            elif isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                if sensitive(getattr(node, 'attr', None)) or _name(node.value).split('.')[0] in standard_names:
+                    return True
+            elif isinstance(node, ast.Call) and _name(node.func) in {'setattr', 'delattr'} and node.args:
+                if _name(node.args[0]).split('.')[0] in standard_names:
+                    return True
+        return False
     return bool(re.search(
         rf'\b(?:function\s*\*?|class|def|alias)\s+{names}\b|'
         rf'\b(?:const|let|var)\s+[^;\n=]*\b{names}\b|'

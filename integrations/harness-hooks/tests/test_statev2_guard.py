@@ -625,6 +625,78 @@ class GuardTests(unittest.TestCase):
             self.assertIsNone(self.classify(command))
             self.adapters(command)
 
+    def test_foreign_state_sqlite_python_import_variants(self):
+        imports = [
+            ('import sqlite3; import os', 'sqlite3.connect'),
+            ('import sqlite3 as sql; import os', 'sql.connect'),
+            ('import os, sqlite3', 'sqlite3.connect'),
+            ('import sqlite3, os', 'sqlite3.connect'),
+            ('import os, sqlite3 as sql', 'sql.connect'),
+            ('import sqlite3 as sql, os', 'sql.connect'),
+            ('from sqlite3 import connect; import os', 'connect'),
+            ('from sqlite3 import connect as db_connect; import os', 'db_connect'),
+            ('from sqlite3 import (connect as db_connect, Connection); import os', 'db_connect'),
+            ('from sqlite3 import *; import os', 'connect'),
+            ('import sqlite3 as open; import os', 'open.connect'),
+            ('from sqlite3 import connect as open; import os', 'open'),
+            ('import sqlite3.dbapi2 as sql; import os', 'sql.connect'),
+            ('from sqlite3.dbapi2 import connect; import os', 'connect'),
+        ]
+        paths = [
+            ('~/.config/spectrum-bridge/state.sqlite', None),
+            ('~/.robob/userdata/readonly/state.sqlite', None),
+            ('~/.robob/userdata/state.sqlite', SCRIPT),
+            ('~/.robob/userdata/statev2.sqlite', SCRIPT),
+            ('~/.t3/userdata/state.sqlite', SCRIPT),
+            ('~/.t3/userdata/statev2.sqlite', SCRIPT),
+            ('~/.local/share/opencode/opencode.db', SCRIPT),
+        ]
+        for declaration, connect in imports:
+            for path, expected in paths:
+                # These imports do not establish the replica's reader proof.
+                if path == '~/.robob/userdata/readonly/state.sqlite' and declaration in {
+                    'from sqlite3 import *; import os',
+                    'import sqlite3.dbapi2 as sql; import os',
+                    'from sqlite3.dbapi2 import connect; import os',
+                }:
+                    expected = SCRIPT
+                with self.subTest(declaration=declaration, path=path):
+                    source = declaration + f'\n{connect}(os.path.expanduser({path!r}))\n'
+                    script = self.write('tmp/python-imports.py', source)
+                    command = 'python3 -I ' + shlex.quote(str(script))
+                    self.assertEqual(self.classify(command), expected)
+                    self.adapters(command, expected)
+                    stdin = "python3 -I - <<'PY'\n" + source + 'PY'
+                    inline_expected = READ if expected else None
+                    self.assertEqual(self.classify(stdin), inline_expected)
+                    self.adapters(stdin, inline_expected)
+
+    def test_foreign_state_sqlite_python_reader_overrides(self):
+        for declaration, mutation, connect in [
+            ('import sqlite3', 'sqlite3 = helper', 'sqlite3.connect'),
+            ('import sqlite3 as sql', 'sql = helper', 'sql.connect'),
+            ('from sqlite3 import connect', 'connect = helper', 'connect'),
+            ('from sqlite3 import connect as db_connect', 'db_connect = helper', 'db_connect'),
+            ('import sqlite3', 'sqlite3.connect = helper', 'sqlite3.connect'),
+            ('import sqlite3 as sql', 'sql.connect = helper', 'sql.connect'),
+            ('import sqlite3 as sql', "setattr(sql, 'connect', helper)", 'sql.connect'),
+            ('import sqlite3 as sql', "sql.__dict__['connect'] = helper", 'sql.connect'),
+            ('from sqlite3 import connect as db_connect', 'def db_connect(f):\n    return f', 'db_connect'),
+            ('import sqlite3 as sql', 'import helpers as sql', 'sql.connect'),
+            ('from sqlite3 import connect as db_connect', 'from helpers import helper as db_connect', 'db_connect'),
+            ('from .sqlite3 import connect', '', 'connect'),
+        ]:
+            with self.subTest(declaration=declaration, mutation=mutation):
+                source = (declaration + '\nimport os\n' + mutation + '\n' +
+                          connect + "(os.path.expanduser('~/.config/spectrum-bridge/state.sqlite'))\n")
+                script = self.write('tmp/python-override.py', source)
+                command = 'python3 -I ' + shlex.quote(str(script))
+                self.assertEqual(self.classify(command), SCRIPT)
+                self.adapters(command, SCRIPT)
+                stdin = "python3 -I - <<'PY'\n" + source + 'PY'
+                self.assertEqual(self.classify(stdin), READ)
+                self.adapters(stdin, READ)
+
     def test_readonly_replica_scripts_and_live_near_misses(self):
         rows = [
             (".robob/userdata/readonly/state.sqlite", None),
