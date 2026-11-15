@@ -5,7 +5,9 @@ import { assert, it } from "@effect/vitest";
 import {
   EnvironmentId,
   KanbanCard,
+  KanbanRelease,
   KanbanCardId,
+  KanbanBoardId,
   KanbanDiscussionId,
   KanbanScriptId,
   KanbanError,
@@ -29,6 +31,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as Result from "effect/Result";
+import * as References from "effect/References";
 import * as Schema from "effect/Schema";
 import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -55,6 +58,7 @@ import * as KanbanStore from "../store/KanbanStore.ts";
 import { layer as providerRegistryLayer } from "../../../provider/testUtils/providerRegistryMock.ts";
 import { opencodeTestProvider } from "../engine/testProviders.ts";
 import * as KanbanHandlers from "./handlers.ts";
+import { boardReleaseSummary } from "../engine/boardReplies.ts";
 import { KanbanToolkit } from "./tools.ts";
 import { ModelBody } from "../http.ts";
 
@@ -124,6 +128,7 @@ const fakeThreads = (
   const launches: Array<string> = [];
   const views: Array<string> = [];
   const viewControl = { beforeRead: (_threadId: ThreadId): Effect.Effect<void> => Effect.void };
+  const queueControl = { beforeRead: (_threadId: ThreadId): Effect.Effect<void> => Effect.void };
   const callerControl = { beforeRead: (): Effect.Effect<void> => Effect.void };
   const storeControl: {
     afterBoardWrite?: () => Effect.Effect<void>;
@@ -227,7 +232,11 @@ const fakeThreads = (
         }),
       withdraw: () => Effect.void,
       queuedRuns: (threadId) =>
-        Effect.sync(() => (queued.has(threadId) ? [{ status: "queued" } as never] : [])),
+        Effect.suspend(() => queueControl.beforeRead(threadId)).pipe(
+          Effect.andThen(
+            Effect.sync(() => (queued.has(threadId) ? [{ status: "queued" } as never] : [])),
+          ),
+        ),
       cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,
     }),
@@ -382,6 +391,7 @@ const fakeThreads = (
     unreadable,
     views,
     viewControl,
+    queueControl,
     callerControl,
     storeControl,
     rejectSends,
@@ -7473,7 +7483,7 @@ const releaseFixture = Effect.gen(function* () {
   yield* store.putBoard({ ...board, standingApprovals: [approval] });
   let releaseNumber = 0;
   const create = (
-    patch: { interrupting?: boolean; ownerOnly?: boolean; gate?: "deploy" } = {
+    patch: { interrupting?: boolean; ownerOnly?: boolean; gate?: "deploy"; service?: string } = {
       interrupting: true,
     },
   ) =>
@@ -7581,6 +7591,454 @@ it.effect(
       }
     }).pipe(Effect.provide(fakeThreads().layer));
   },
+);
+
+const releasePeer = Effect.fn("test.releasePeer")(function* (
+  fixture: Effect.Success<typeof releaseFixture>,
+) {
+  const { kanban, store, board, approval } = fixture;
+  const health = yield* kanban.ensureBoard({
+    slug: "health",
+    name: "Health",
+    defaultProjectId: board.defaultProjectId,
+  });
+  const evaluator = yield* kanban.startEvaluator(health.id, { kind: "request", text: "Release" });
+  const actor = { _tag: "evaluator", threadId: evaluator } as const;
+  yield* store.putBoard({ ...health, standingApprovals: [approval] });
+  return { board: health, actor, evaluator };
+});
+
+it.effect("replays Watchers #66 versus telegram #64 and Health #22 across boards", () =>
+  Effect.gen(function* () {
+    const fixture = yield* releaseFixture;
+    const { kanban, store, board, actor, evaluator, create } = fixture;
+    const health = yield* releasePeer(fixture);
+    const card = yield* create({ interrupting: true, service: " RoBoB-Watch " });
+    assert.strictEqual(card.subtasks[0]!.service, "robob-watch");
+    const row = {
+      boardId: board.id,
+      cardId: card.id,
+      cardNumber: 64,
+      subtaskId: "s1",
+      at: "2026-11-15T08:07:00.000Z",
+      service: "telegram-bridge",
+      critical: null,
+      approvalId: "sa-pacing",
+    };
+    yield* store.putBoard({ ...(yield* kanban.snapshot(board.id)).board, releaseLedger: [row] });
+    yield* store.putBoard({
+      ...(yield* kanban.snapshot(health.board.id)).board,
+      releaseLedger: [
+        {
+          ...row,
+          boardId: health.board.id,
+          service: "robob-watch",
+          cardNumber: 22,
+          at: "2026-11-15T02:13:00.000Z",
+        },
+      ],
+    });
+    yield* TestClock.adjust(
+      Date.parse("2026-11-15T05:00:00.000Z") - (yield* Clock.currentTimeMillis),
+    );
+    const refused = yield* call(evaluator, "subtask_done", {
+      card: card.id,
+      subtask: "s1",
+      state: "done",
+    });
+    assert.isTrue(refused.isError);
+    assert.include(
+      refused.text,
+      "last robob-watch release Health #22 at 02:13Z, next window 06:13Z",
+    );
+    for (const extra of [{}, { since: "24h" }]) {
+      const read = yield* call(evaluator, "board_get", { ...extra, boardId: board.slug });
+      assert.isFalse(read.isError, read.text);
+      const summary = extra.since
+        ? read.structured.board
+        : (read.structured.board as { board: unknown }).board;
+      assert.deepStrictEqual(
+        (summary as { nextReleaseWindowByService: unknown }).nextReleaseWindowByService,
+        {
+          "robob-watch": "2026-11-15T06:13:00.000Z",
+          "telegram-bridge": "2026-11-15T12:07:00.000Z",
+        },
+      );
+    }
+    yield* TestClock.adjust(4 * 3_600_000 + 11 * 60_000);
+    const done = yield* call(evaluator, "subtask_done", {
+      card: card.id,
+      subtask: "s1",
+      state: "done",
+    });
+    assert.isFalse(done.isError, done.text);
+    const foreign = yield* kanban.createCard(
+      health.board.id,
+      {
+        title: "Apply build",
+        prompt: "Apply build",
+        subtasks: [
+          { text: "Apply build", owner: "evaluator", interrupting: true, service: "robob-watch" },
+        ],
+      },
+      health.actor,
+    );
+    const denied = yield* kanban
+      .markSubtask(foreign.id, "s1", "done", null, health.actor, "evaluator")
+      .pipe(Effect.flip);
+    assert.include(denied.detail, `last robob-watch release ${board.name} #${card.number}`);
+    assert.include(denied.detail, "next window 13:11Z");
+  }).pipe(Effect.provide(fakeThreads().layer)),
+);
+
+it.effect("post-hoc ticks keep restart time, ledger ordering and the original window", () =>
+  Effect.gen(function* () {
+    const { kanban, store, board, actor, evaluator, create } = yield* releaseFixture;
+    const card = yield* create({ interrupting: true, service: "robob-watch" });
+    const base = yield* Clock.currentTimeMillis;
+    const iso = (hours: number) =>
+      DateTime.formatIso(DateTime.makeUnsafe(base + hours * 3_600_000));
+    const row = {
+      boardId: board.id,
+      cardId: card.id,
+      cardNumber: 1,
+      subtaskId: "s1",
+      at: iso(1.5),
+      service: "robob-watch",
+      critical: null,
+      approvalId: "sa-pacing",
+    };
+    yield* store.putBoard({
+      ...(yield* kanban.snapshot(board.id)).board,
+      releaseLedger: [row, { ...row, at: iso(4), service: "telegram-bridge" }],
+    });
+    yield* TestClock.adjust("5 hours");
+    const done = yield* call(evaluator, "subtask_done", {
+      card: card.id,
+      subtask: "s1",
+      state: "done",
+      releasedAt: iso(2),
+    });
+    assert.isFalse(done.isError, done.text);
+    const ledger = (yield* kanban.snapshot(board.id)).board.releaseLedger!;
+    assert.deepStrictEqual(
+      ledger.map((entry) => entry.at),
+      [iso(1.5), iso(2), iso(4)],
+    );
+    assert.deepStrictEqual(ledger[1], {
+      ...row,
+      cardNumber: card.number,
+      at: iso(2),
+      postHoc: true,
+    });
+    const read = yield* call(evaluator, "board_get", { boardId: board.slug });
+    const summary = (
+      read.structured.board as {
+        board: { releaseLedger: unknown; nextReleaseWindowByService: unknown };
+      }
+    ).board;
+    assert.deepStrictEqual(summary.releaseLedger, ledger);
+    assert.deepStrictEqual(summary.nextReleaseWindowByService, {
+      "robob-watch": iso(6),
+      "telegram-bridge": iso(8),
+    });
+    const next = yield* create({ interrupting: true, service: "robob-watch" });
+    const refused = yield* kanban
+      .markSubtask(next.id, "s1", "done", null, actor, "evaluator")
+      .pipe(Effect.flip);
+    assert.include(refused.detail, `next window ${iso(6).slice(11, 16)}Z`);
+    yield* TestClock.adjust("1 hour");
+    yield* kanban.markSubtask(next.id, "s1", "done", null, actor, "evaluator");
+  }).pipe(Effect.provide(fakeThreads().layer)),
+);
+
+it.effect.each([
+  { name: "future", delta: 60_001, interrupting: true, state: "done" as const, message: "future" },
+  {
+    name: "before creation",
+    delta: -1,
+    interrupting: true,
+    state: "done" as const,
+    message: "createdAt",
+  },
+  {
+    name: "non-interrupting",
+    delta: 0,
+    interrupting: false,
+    state: "done" as const,
+    message: "interrupting",
+  },
+  { name: "skipped", delta: 0, interrupting: true, state: "skipped" as const, message: "done" },
+  { name: "open", delta: 0, interrupting: true, state: "open" as const, message: "done" },
+  {
+    name: "malformed",
+    delta: 0,
+    interrupting: true,
+    state: "done" as const,
+    message: "ISO datetime",
+  },
+  {
+    name: "calendar rollover",
+    delta: 0,
+    interrupting: true,
+    state: "done" as const,
+    message: "ISO datetime",
+  },
+  {
+    name: "midnight rollover",
+    delta: 0,
+    interrupting: true,
+    state: "done" as const,
+    message: "ISO datetime",
+  },
+])("refuses releasedAt $name", ({ name, delta, interrupting, state, message }) =>
+  Effect.gen(function* () {
+    const { kanban, board, actor, create } = yield* releaseFixture;
+    const card = yield* create({ interrupting });
+    const at =
+      new Map([
+        ["malformed", "yesterday"],
+        ["calendar rollover", "2026-02-30T12:00:00.000Z"],
+        ["midnight rollover", "2026-01-01T24:00:00.000Z"],
+      ]).get(name) ?? DateTime.formatIso(DateTime.makeUnsafe(Date.parse(card.createdAt) + delta));
+    const refused = yield* kanban
+      .markSubtask(card.id, "s1", state, null, actor, "evaluator", at)
+      .pipe(Effect.flip);
+    assert.include(refused.detail, message);
+    assert.lengthOf((yield* kanban.snapshot(board.id)).board.releaseLedger ?? [], 0);
+  }).pipe(Effect.provide(fakeThreads().layer)),
+);
+
+it.effect("accepts releasedAt within clock skew and canonicalizes timezone offsets", () =>
+  Effect.gen(function* () {
+    const { kanban, board, actor, create } = yield* releaseFixture;
+    const card = yield* create();
+    const at = DateTime.formatIso(DateTime.makeUnsafe(Date.parse(card.createdAt) + 60_000));
+    const offset = DateTime.formatIso(DateTime.makeUnsafe(Date.parse(at) + 4 * 3_600_000)).replace(
+      "Z",
+      "+04:00",
+    );
+    yield* kanban.markSubtask(card.id, "s1", "done", null, actor, "evaluator", offset);
+    assert.strictEqual((yield* kanban.snapshot(board.id)).board.releaseLedger![0]!.at, at);
+  }).pipe(Effect.provide(fakeThreads().layer)),
+);
+
+it.effect("only evaluators can set or clear service via create and edit", () =>
+  Effect.gen(function* () {
+    const { kanban, store, evaluator, create } = yield* releaseFixture;
+    const card = yield* create({ interrupting: true, service: "robob" });
+    const worker = ThreadId.make("service-worker");
+    yield* store.putThreadLink({
+      ...(yield* kanban.caller(evaluator))!,
+      threadId: worker,
+      role: "work",
+      cardId: card.id,
+    });
+    for (const service of ["robob", null]) {
+      for (const [tool, input] of [
+        [
+          "card_create",
+          {
+            title: "Apply",
+            prompt: "Apply",
+            subtasks: [{ text: "Apply build", owner: "evaluator", service }],
+          },
+        ],
+        ["card_edit", { card: card.id, subtasks: [{ id: "s1", service }] }],
+      ] as const) {
+        const refused = yield* call(worker, tool, input);
+        assert.isTrue(refused.isError);
+        assert.include(refused.text.toLowerCase(), "only evaluators");
+      }
+      const edit = yield* kanban
+        .editCard(
+          card.id,
+          { subtasks: [{ id: "s1", service }] },
+          { _tag: "thread", threadId: worker },
+        )
+        .pipe(Effect.flip);
+      assert.include(edit.detail, "only evaluators");
+      assert.include(edit.detail, "service");
+    }
+    const cleared = yield* call(evaluator, "card_edit", {
+      card: card.id,
+      subtasks: [{ id: "s1", service: null }],
+    });
+    assert.isFalse(cleared.isError, cleared.text);
+    assert.isUndefined((yield* kanban.card(card.id)).card.subtasks[0]!.service);
+  }).pipe(Effect.provide(fakeThreads().layer)),
+);
+
+it("old release receipts decode without service or postHoc", () => {
+  const old = {
+    boardId: KanbanBoardId.make("legacy"),
+    cardId: KanbanCardId.make("card-1"),
+    cardNumber: 1,
+    subtaskId: "s1",
+    at: "2026-11-15T02:13:00.000Z",
+    critical: null,
+    approvalId: null,
+  };
+  assert.deepStrictEqual(Schema.decodeUnknownSync(KanbanRelease)(old), old);
+});
+
+it.effect("board readback reconciles a release committed after the board inventory read", () =>
+  Effect.gen(function* () {
+    const { kanban, board, actor, create } = yield* releaseFixture;
+    const earlierBoards = yield* kanban.boards;
+    const card = yield* create({ interrupting: true, service: "robob-watch" });
+    yield* kanban.markSubtask(card.id, "s1", "done", null, actor, "evaluator");
+    const fresh = (yield* kanban.replySnapshot(board.id)).board;
+    const at = DateTime.formatIso(yield* DateTime.now);
+    const summary = boardReleaseSummary(fresh, at, earlierBoards);
+    const next = DateTime.formatIso(DateTime.add(DateTime.makeUnsafe(at), { hours: 4 }));
+    assert.lengthOf(summary.releaseLedger, 1);
+    assert.strictEqual(summary.nextReleaseWindowAt, next);
+    assert.deepStrictEqual(summary.nextReleaseWindowByService, { "robob-watch": next });
+  }).pipe(Effect.provide(fakeThreads().layer)),
+);
+
+it.effect("a stalled review tick does not block an ordinary tick on another board", () => {
+  const fake = fakeThreads();
+  return Effect.gen(function* () {
+    const fixture = yield* releaseFixture;
+    const { kanban, store, actor, create } = fixture;
+    const peer = yield* releasePeer(fixture);
+    const card = yield* create({});
+    const workThreadId = ThreadId.make("stalled-review-work");
+    yield* store.putCard({
+      ...card,
+      stage: "needs_review",
+      reviewFindingsPending: false,
+      workThreadId,
+      activeThreadId: null,
+      subtasks: [{ ...card.subtasks[0]!, owner: "review", text: "Review result" }],
+    });
+    const other = yield* kanban.createCard(
+      peer.board.id,
+      {
+        title: "Check result",
+        prompt: "Check result",
+        subtasks: [{ text: "Check result", owner: "evaluator" }],
+      },
+      peer.actor,
+    );
+    const entered = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    fake.viewControl.beforeRead = (id) =>
+      id === workThreadId
+        ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(resume)))
+        : Effect.void;
+    const review = yield* kanban
+      .markSubtask(card.id, "s1", "done", "Reviewed", actor, "evaluator")
+      .pipe(Effect.forkScoped);
+    yield* Deferred.await(entered);
+    const done = yield* kanban.markSubtask(
+      other.id,
+      "s1",
+      "done",
+      "Checked",
+      peer.actor,
+      "evaluator",
+    );
+    assert.strictEqual(done.subtasks[0]!.state, "done");
+    yield* Deferred.succeed(resume, undefined);
+    yield* Fiber.join(review);
+  }).pipe(Effect.provide(fake.layer));
+});
+
+it.effect("a second release cannot hold the board lock while the first prunes wakes", () => {
+  const fake = fakeThreads();
+  return Effect.gen(function* () {
+    const { kanban, store, board, actor, create } = yield* releaseFixture;
+    const first = yield* create({ interrupting: true, service: "robob-watch" });
+    const second = yield* create({ interrupting: true, service: "robob-watch" });
+    const threadId = ThreadId.make("prune-release-worker");
+    yield* store.putCard({
+      ...first,
+      stage: "needs_review",
+      workThreadId: threadId,
+      subtasks: [
+        ...first.subtasks,
+        {
+          ...first.subtasks[0]!,
+          id: "s2",
+          step: 2,
+          text: "Implement next change",
+          owner: "work",
+          interrupting: false,
+          service: undefined,
+          gate: undefined,
+        },
+      ],
+    });
+    const entered = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    const secondEntered = yield* Deferred.make<void>();
+    fake.queueControl.beforeRead = (id) =>
+      id === threadId
+        ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(resume)))
+        : Effect.void;
+    const initial = yield* kanban
+      .markSubtask(first.id, "s1", "done", null, actor, "evaluator")
+      .pipe(Effect.forkScoped);
+    yield* Deferred.await(entered);
+    const logger = Logger.make(({ message }) => {
+      if (Array.isArray(message) && message[0] === "kanban release admission waiting")
+        Deferred.doneUnsafe(secondEntered, Effect.void);
+    });
+    const later = yield* kanban
+      .markSubtask(second.id, "s1", "done", null, actor, "evaluator")
+      .pipe(
+        Effect.provideService(References.MinimumLogLevel, "Debug"),
+        Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+        Effect.result,
+        Effect.forkScoped,
+      );
+    yield* Deferred.await(secondEntered);
+    yield* Deferred.succeed(resume, undefined);
+    yield* Fiber.join(initial);
+    const denied = yield* Fiber.join(later);
+    assert.isTrue(Result.isFailure(denied));
+    if (Result.isFailure(denied))
+      assert.include(denied.failure.detail, "inside the 4 h release window");
+    assert.lengthOf((yield* kanban.snapshot(board.id)).board.releaseLedger!, 1);
+    assert.strictEqual((yield* kanban.card(first.id)).card.subtasks[0]!.state, "done");
+  }).pipe(Effect.provide(fake.layer));
+});
+
+it.effect("parallel same-service ticks on different boards admit one release", () =>
+  Effect.gen(function* () {
+    const fixture = yield* releaseFixture;
+    const { kanban, board, actor, create } = fixture;
+    const peer = yield* releasePeer(fixture);
+    const first = yield* create({ interrupting: true, service: "robob-watch" });
+    const second = yield* kanban.createCard(
+      peer.board.id,
+      {
+        title: "Apply",
+        prompt: "Apply",
+        subtasks: [
+          { text: "Apply build", owner: "evaluator", interrupting: true, service: "robob-watch" },
+        ],
+      },
+      peer.actor,
+    );
+    const results = yield* Effect.all(
+      [
+        kanban.markSubtask(first.id, "s1", "done", null, actor, "evaluator").pipe(Effect.result),
+        kanban
+          .markSubtask(second.id, "s1", "done", null, peer.actor, "evaluator")
+          .pipe(Effect.result),
+      ],
+      { concurrency: "unbounded" },
+    );
+    assert.lengthOf(results.filter(Result.isSuccess), 1);
+    const count =
+      ((yield* kanban.snapshot(board.id)).board.releaseLedger?.length ?? 0) +
+      ((yield* kanban.snapshot(peer.board.id)).board.releaseLedger?.length ?? 0);
+    assert.strictEqual(count, 1);
+  }).pipe(Effect.provide(fakeThreads().layer)),
 );
 
 it.effect(

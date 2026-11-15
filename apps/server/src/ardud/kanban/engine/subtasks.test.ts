@@ -3108,6 +3108,121 @@ describe("interrupting release pacing", () => {
   it.each(["2026-10-26T16:00:00.000Z", "2026-10-26T16:01:00.000Z"])("opens at %s", (now) => {
     expect(approvalProblem(card, subtask, { ...context, at: now })).toBeNull();
   });
+  it("replays Watchers #66 versus telegram #64 and Health #22 by service", () => {
+    const tagged = { ...subtask, id: "s4", service: "robob-watch" };
+    const replay = {
+      ...context,
+      ledger: [
+        {
+          ...ledger[0]!,
+          cardNumber: 64,
+          service: "telegram-bridge",
+          at: "2026-11-15T08:07:00.000Z",
+        },
+        {
+          ...ledger[0]!,
+          boardId: KanbanBoardId.make("health"),
+          cardNumber: 22,
+          service: "robob-watch",
+          at: "2026-11-15T02:13:00.000Z",
+        },
+      ],
+      boardNames: new Map([["health", "Health"]]),
+      at: "2026-11-15T09:11:00.000Z",
+    };
+    expect(approvalProblem({ ...card, number: 66 }, tagged, replay)).toBeNull();
+    expect(
+      approvalProblem({ ...card, number: 66 }, tagged, {
+        ...replay,
+        at: "2026-11-15T05:00:00.000Z",
+      }),
+    ).toContain(
+      "card #66 s4 (interrupting, robob-watch) is inside the 4 h release window: last robob-watch release Health #22 at 02:13Z, next window 06:13Z",
+    );
+    expect(
+      approvalProblem(card, tagged, {
+        ...replay,
+        ledger: [{ ...ledger[0]!, at: "2026-11-15T09:00:00.000Z" }],
+      }),
+    ).toBeNull();
+    expect(approvalProblem(card, subtask, replay)).toContain("set service on s1 (card_edit)");
+  });
+  it("post-hoc timestamps skip only pacing, preserving owner-only and other approval gates", () => {
+    const postHoc = { ...context, releasedAt: at };
+    expect(approvalProblem(card, subtask, postHoc)).toBeNull();
+    expect(approvalProblem(card, { ...subtask, ownerOnly: true }, postHoc)).toContain(
+      "marked owner-only",
+    );
+    expect(approvalProblem(card, subtask, { ...postHoc, approvals: [] })).toContain(
+      "no standing deploy approval",
+    );
+    expect(approvalProblem(card, { ...subtask, gate: "money" }, postHoc)).toContain(
+      "needs Abdullah's approval",
+    );
+  });
+  it.each([
+    { input: " RoBoB-Watch ", output: "robob-watch" },
+    { input: "a.b_c-9", output: "a.b_c-9" },
+    { input: "a".repeat(64), output: "a".repeat(64) },
+    { input: "", output: undefined },
+    { input: "  ", output: undefined },
+    { input: "a".repeat(65), output: undefined },
+    { input: "robob/watch", output: undefined },
+    { input: "robob watch", output: undefined },
+    { input: "röbob", output: undefined },
+  ])("normalizes or refuses service $input", ({ input, output }) => {
+    const plan = planSubtasks([subtask], [{ id: "s1", service: input }]);
+    expect(plan.ok).toBe(output !== undefined);
+    if (plan.ok) expect(plan.subtasks[0]!.service).toBe(output);
+    else expect(plan.reason).toContain("service must be");
+  });
+  it("retargeting a service needs a fresh owner answer; normalized cosmetic edits preserve it", () => {
+    const original = { ...subtask, service: "robob-watch", ownerOnly: true, createdAt: at };
+    const later = "2026-10-26T13:00:00.000Z";
+    const asks: KanbanOwnerAsk[] = [
+      {
+        id: "q1",
+        text: "Approve s1",
+        blocking: false,
+        by: owner,
+        at,
+        seq: null,
+        closedAt: at,
+        answer: { verdict: "approved", by: owner, at },
+      },
+    ];
+    for (const service of ["robob", null, " ROBOB-WATCH "]) {
+      const plan = planSubtasks([original], [{ id: "s1", service }], 1, later);
+      expect(plan.ok).toBe(true);
+      if (!plan.ok) throw new Error(plan.reason);
+      const changed = service !== " ROBOB-WATCH ";
+      const task = plan.subtasks[0]!;
+      expect(task.createdAt).toBe(changed ? later : at);
+      expect(approvalProblem({ ...card, asks, subtasks: [task] }, task, context) === null).toBe(
+        !changed,
+      );
+    }
+  });
+  it("preserves service on rewords, clears it with null or interrupting false, and requires interrupting", () => {
+    const tagged = { ...subtask, service: "robob-watch" };
+    for (const input of [{ id: "s1" }, { id: "s1", text: "Apply newer build" }]) {
+      const plan = planSubtasks([tagged], [input]);
+      expect(plan.ok && plan.subtasks[0]!.service).toBe("robob-watch");
+    }
+    for (const input of [
+      { id: "s1", service: null },
+      { id: "s1", interrupting: false },
+    ]) {
+      const plan = planSubtasks([tagged], [input]);
+      expect(plan.ok && plan.subtasks[0]!.service).toBeUndefined();
+    }
+    const invalid = planSubtasks(
+      [],
+      [{ text: "Apply build", owner: "evaluator", service: "robob" }],
+    );
+    expect(invalid.ok).toBe(false);
+    if (!invalid.ok) expect(invalid.reason).toContain("service requires interrupting: true");
+  });
   it("uses the record's interval and only this board's ledger", () => {
     expect(
       approvalProblem(card, subtask, {

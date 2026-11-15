@@ -159,6 +159,7 @@ export const KanbanSubtask = Schema.Struct({
   ),
   ownerOnly: Schema.optional(Schema.Boolean),
   interrupting: Schema.optional(Schema.Boolean),
+  service: Schema.optional(Schema.String),
   createdAt: Schema.optional(IsoDateTime),
   /** For a script's subtask: the name of the board script that does it. Absent: any script on the card's board. */
   script: Schema.optional(Schema.String),
@@ -2073,6 +2074,8 @@ export const KanbanStandingApproval = Schema.Struct({
 export type KanbanStandingApproval = typeof KanbanStandingApproval.Type;
 
 export const KanbanRelease = Schema.Struct({
+  service: Schema.optional(Schema.String),
+  postHoc: Schema.optional(Schema.Boolean),
   boardId: KanbanBoardId,
   cardId: KanbanCardId,
   cardNumber: Schema.Number,

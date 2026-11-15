@@ -729,6 +729,7 @@ export interface KanbanServiceShape {
     note: string | null,
     actor: KanbanActor,
     role: Subtasks.SubtaskRole,
+    releasedAt?: string,
   ) => Effect.Effect<KanbanCard, KanbanError>;
   /**
    * A board script hands its open subtask back to the card's evaluator with
@@ -13165,12 +13166,15 @@ const make = Effect.gen(function* () {
     if (
       actor._tag !== "evaluator" &&
       input.subtasks?.some(
-        (entry) => entry.ownerOnly !== undefined || entry.interrupting !== undefined,
+        (entry) =>
+          entry.ownerOnly !== undefined ||
+          entry.interrupting !== undefined ||
+          entry.service !== undefined,
       )
     )
       return yield* failWith(
         "denied",
-        "only evaluators may set or clear ownerOnly or interrupting",
+        "only evaluators may set or clear ownerOnly, interrupting or service",
       );
     const plan = Subtasks.planSubtasks([], input.subtasks ?? [], 0, at, board.guessedGates);
     if (!plan.ok) return yield* failWith("invalid", plan.reason);
@@ -13689,12 +13693,15 @@ const make = Effect.gen(function* () {
         if (
           actor._tag !== "evaluator" &&
           patch.subtasks?.some(
-            (entry) => entry.ownerOnly !== undefined || entry.interrupting !== undefined,
+            (entry) =>
+              entry.ownerOnly !== undefined ||
+              entry.interrupting !== undefined ||
+              entry.service !== undefined,
           )
         )
           return yield* failWith(
             "denied",
-            "only evaluators may set or clear ownerOnly or interrupting",
+            "only evaluators may set or clear ownerOnly, interrupting or service",
           );
         const plan = patch.subtasks
           ? Subtasks.planSubtasks(
@@ -15286,6 +15293,8 @@ const make = Effect.gen(function* () {
       }),
     );
 
+  // Board locks are independent; serialize release receipts so two boards cannot admit the same service together.
+  const releaseTicks = yield* Semaphore.make(1);
   const markSubtask: KanbanServiceShape["markSubtask"] = (
     cardId,
     subtaskId,
@@ -15293,212 +15302,267 @@ const make = Effect.gen(function* () {
     note,
     actor,
     role,
+    releasedAt,
   ) =>
-    savedCardGuard(
-      "subtask.done",
-      Effect.gen(function* () {
-        yield* checkText([["note", note]]);
-        const card = yield* cardOf(cardId);
-        const scriptName = role === "script" ? (yield* scriptFor(card, actor)).name : null;
-        const board = yield* boardOf(card.boardId);
-        const gated = card.subtasks.find((subtask) => subtask.id === subtaskId);
-        const at = yield* nowIso;
-        const standing = {
-          approvals: board.standingApprovals,
-          ledger: board.releaseLedger ?? [],
-          boardId: board.id,
-          at,
-          note,
-        };
-        const candidate = gated && {
-          ...gated,
-          state,
-          ...(state !== "skipped" ? { gateSkipped: undefined } : {}),
-        };
-        const missing =
-          candidate && state !== "open"
-            ? Subtasks.approvalProblem(
-                card,
-                candidate,
-                standing,
-                board.guessedGates,
-                state === "skipped" ? "skip" : "do",
-              )
-            : null;
-        const skipGate =
-          missing &&
-          state === "skipped" &&
-          actor._tag === "evaluator" &&
-          (gated?.owner === "evaluator" || gated?.owner === "script")
-            ? Subtasks.gateOf(gated, board.guessedGates)
-            : undefined;
-        const reason = note?.trim() ?? "";
-        if (skipGate && (reason.length < 10 || reason.length > 300)) {
-          return yield* failWith(
-            "invalid",
-            "skipping a gated step needs a reason of 10 to 300 characters in note",
+    Effect.gen(function* () {
+      // Admission precedes board locks: completing a step can release them for thread I/O.
+      const observed = yield* readDb(rawStore.card(cardId));
+      const paced =
+        state === "done" &&
+        observed?.subtasks.some((entry) => entry.id === subtaskId && entry.interrupting);
+      const completing = savedCardGuard(
+        "subtask.done",
+        Effect.gen(function* () {
+          yield* checkText([["note", note]]);
+          const card = yield* cardOf(cardId);
+          const scriptName = role === "script" ? (yield* scriptFor(card, actor)).name : null;
+          const gated = card.subtasks.find((subtask) => subtask.id === subtaskId);
+          if (state === "done" && gated?.interrupting && !paced)
+            return yield* failWith(
+              "conflict",
+              "The subtask became interrupting during admission; re-read the card and retry.",
+            );
+          const board = yield* boardOf(card.boardId);
+          const at = yield* nowIso;
+          let releaseAt: string | undefined;
+          if (releasedAt !== undefined) {
+            const millis = Date.parse(releasedAt);
+            if (
+              !/^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(
+                releasedAt,
+              ) ||
+              !Number.isFinite(millis) ||
+              DateTime.formatIso(
+                DateTime.makeUnsafe(`${releasedAt.slice(0, 10)}T00:00:00.000Z`),
+              ).slice(0, 10) !== releasedAt.slice(0, 10)
+            )
+              return yield* failWith("invalid", "releasedAt must be an ISO datetime");
+            if (state !== "done" || !gated?.interrupting)
+              return yield* failWith(
+                "invalid",
+                "releasedAt requires marking an interrupting subtask done",
+              );
+            if (millis > Date.parse(at) + 60_000)
+              return yield* failWith(
+                "invalid",
+                "releasedAt cannot be in the future (beyond 1 minute of clock skew)",
+              );
+            if (millis < Date.parse(card.createdAt))
+              return yield* failWith("invalid", "releasedAt cannot be before the card's createdAt");
+            releaseAt = DateTime.formatIso(DateTime.makeUnsafe(millis));
+          }
+          const releaseBoards =
+            gated?.interrupting && gated.service ? yield* store.boards : [board];
+          const standing = {
+            approvals: board.standingApprovals,
+            ledger: releaseBoards.flatMap((entry) => entry.releaseLedger ?? []),
+            boardNames: new Map(releaseBoards.map((entry) => [entry.id as string, entry.name])),
+            releasedAt: releaseAt,
+            boardId: board.id,
+            at,
+            note,
+          };
+          const candidate = gated && {
+            ...gated,
+            state,
+            ...(state !== "skipped" ? { gateSkipped: undefined } : {}),
+          };
+          const missing =
+            candidate && state !== "open"
+              ? Subtasks.approvalProblem(
+                  card,
+                  candidate,
+                  standing,
+                  board.guessedGates,
+                  state === "skipped" ? "skip" : "do",
+                )
+              : null;
+          const skipGate =
+            missing &&
+            state === "skipped" &&
+            actor._tag === "evaluator" &&
+            (gated?.owner === "evaluator" || gated?.owner === "script")
+              ? Subtasks.gateOf(gated, board.guessedGates)
+              : undefined;
+          const reason = note?.trim() ?? "";
+          if (skipGate && (reason.length < 10 || reason.length > 300)) {
+            return yield* failWith(
+              "invalid",
+              "skipping a gated step needs a reason of 10 to 300 characters in note",
+            );
+          }
+          const check = Subtasks.checkMark(card, subtaskId, state, role, note, scriptName);
+          if (!check.ok) return yield* failWith("denied", check.reason);
+          if (actor._tag !== "owner" && missing && !skipGate)
+            return yield* failWith("denied", missing);
+          const cleared =
+            candidate &&
+            state === "done" &&
+            actor._tag !== "owner" &&
+            Subtasks.gateOf(candidate, board.guessedGates) === "deploy" &&
+            !candidate.ownerOnly &&
+            Subtasks.approvalProblem(card, candidate, [], board.guessedGates) !== null
+              ? board.standingApprovals.find((entry) => entry.revokedAt === null)
+              : undefined;
+          const completionNote = cleared
+            ? [note?.trim(), `cleared by standing approval ${cleared.id}`]
+                .filter(Boolean)
+                .join("; ")
+            : note;
+          const subtasks = Subtasks.markSubtask(
+            card.subtasks,
+            subtaskId,
+            state,
+            completionNote,
+            actor,
+            at,
+          ).map((subtask) =>
+            subtask.id === subtaskId && skipGate
+              ? {
+                  ...subtask,
+                  gateSkipped: { gate: skipGate, reason, by: actor, at, text: subtask.text },
+                }
+              : subtask,
           );
-        }
-        const check = Subtasks.checkMark(card, subtaskId, state, role, note, scriptName);
-        if (!check.ok) return yield* failWith("denied", check.reason);
-        if (actor._tag !== "owner" && missing && !skipGate)
-          return yield* failWith("denied", missing);
-        const cleared =
-          candidate &&
-          state === "done" &&
-          actor._tag !== "owner" &&
-          Subtasks.gateOf(candidate, board.guessedGates) === "deploy" &&
-          !candidate.ownerOnly &&
-          Subtasks.approvalProblem(card, candidate, [], board.guessedGates) !== null
-            ? board.standingApprovals.find((entry) => entry.revokedAt === null)
-            : undefined;
-        const completionNote = cleared
-          ? [note?.trim(), `cleared by standing approval ${cleared.id}`].filter(Boolean).join("; ")
-          : note;
-        const subtasks = Subtasks.markSubtask(
-          card.subtasks,
-          subtaskId,
-          state,
-          completionNote,
-          actor,
-          at,
-        ).map((subtask) =>
-          subtask.id === subtaskId && skipGate
-            ? {
-                ...subtask,
-                gateSkipped: { gate: skipGate, reason, by: actor, at, text: subtask.text },
-              }
-            : subtask,
-        );
-        // The completed candidate is saved only with its release receipt below.
-        let marked = (yield* upgradeFindings(
-          [
-            {
-              ...card,
-              subtasks,
-              wakeNote: Subtasks.pendingWakeNote({ ...card, subtasks }),
-              updatedAt: at,
-            },
-          ],
-          false,
-        ))[0]!;
-        const text = card.subtasks.find((subtask) => subtask.id === subtaskId)?.text ?? "";
-        yield* logEvent(marked, actor, "subtask", {
-          body: `${subtaskId} ${state}: ${text}${completionNote?.trim() ? ` (${completionNote.trim()})` : ""}`,
-        });
-        if (skipGate) {
-          yield* logEvent(marked, actor, "comment", {
-            body: `Skipped ${skipGate}-gated ${subtaskId} ("${text}") without owner approval: ${reason}`,
+          // The completed candidate is saved only with its release receipt below.
+          let marked = (yield* upgradeFindings(
+            [
+              {
+                ...card,
+                subtasks,
+                wakeNote: Subtasks.pendingWakeNote({ ...card, subtasks }),
+                updatedAt: at,
+              },
+            ],
+            false,
+          ))[0]!;
+          const text = card.subtasks.find((subtask) => subtask.id === subtaskId)?.text ?? "";
+          yield* logEvent(marked, actor, "subtask", {
+            body: `${subtaskId} ${state}: ${text}${completionNote?.trim() ? ` (${completionNote.trim()})` : ""}`,
           });
-          const askId = Asks.nextAskId(marked);
-          marked = Asks.updateAsk(
-            Asks.addAsk(
-              marked,
-              `An evaluator skipped ${subtaskId}, a ${skipGate}-gated step, without your approval: "${text}". Reason: ${reason}. It was not done; marking it done still needs your OK.`,
-              false,
-              actor,
-              at,
-            ),
-            askId,
-            {
-              kind: "notice",
-              respond: { ack: true },
-              title: `Gate skipped on #${card.number} ${subtaskId}`,
-              batchKey: "gate-skipped",
-            },
+          if (skipGate) {
+            yield* logEvent(marked, actor, "comment", {
+              body: `Skipped ${skipGate}-gated ${subtaskId} ("${text}") without owner approval: ${reason}`,
+            });
+            const askId = Asks.nextAskId(marked);
+            marked = Asks.updateAsk(
+              Asks.addAsk(
+                marked,
+                `An evaluator skipped ${subtaskId}, a ${skipGate}-gated step, without your approval: "${text}". Reason: ${reason}. It was not done; marking it done still needs your OK.`,
+                false,
+                actor,
+                at,
+              ),
+              askId,
+              {
+                kind: "notice",
+                respond: { ack: true },
+                title: `Gate skipped on #${card.number} ${subtaskId}`,
+                batchKey: "gate-skipped",
+              },
+            );
+          }
+          if (
+            state !== "open" &&
+            gated?.owner === "review" &&
+            gated.step === kanbanOpenStep(card) &&
+            marked.activeThreadId === null &&
+            marked.settledAt === null &&
+            kanbanReviewAlreadyDone(marked)
+          ) {
+            analyticsActors.set(marked, actor);
+            yield* saveCard(marked);
+            const synced = yield* syncPrs(marked);
+            const evidence = yield* reviewEvidence(board, synced);
+            // Ticking the review explicitly answers a pending review request, but
+            // cannot reuse a verdict for a different known head.
+            const next = kanbanReviewAlreadyDone(synced, { ...evidence, requested: false })
+              ? yield* placeFinishedReview(board, synced, actor, subtaskId)
+              : synced;
+            yield* kick;
+            return next;
+          }
+          const idle =
+            (marked.stage === "todo" || Subtasks.BACK_TO_WORK_FROM.has(marked.stage)) &&
+            marked.activeThreadId === null &&
+            marked.settledAt === null;
+          const opened = (owner: "work" | "review") =>
+            kanbanStepSubtasks(card, owner).length === 0 &&
+            kanbanStepSubtasks(marked, owner).length > 0;
+          // A gate before a pending findings bounce exposes review subtasks,
+          // but the worker still owes fixes before that review can run again.
+          const to: KanbanStage | null = !idle
+            ? null
+            : opened("work") || (opened("review") && kanbanWorkStep(marked))
+              ? "todo"
+              : opened("review") &&
+                  kanbanStepSubtasks(marked, "work").length === 0 &&
+                  marked.stage !== "needs_review"
+                ? "needs_review"
+                : null;
+          const plan = Subtasks.nextStepNote();
+          const next: KanbanCard =
+            to === null
+              ? marked
+              : {
+                  ...(yield* moveWait(marked, to, at, actor)),
+                  stage: to,
+                  reviewStep: 0,
+                  // Findings or the owner's words already waiting stay ahead of the plan.
+                  wakeNote:
+                    to === "todo"
+                      ? [marked.wakeNote, plan].filter((part) => part !== null).join("\n\n")
+                      : marked.wakeNote,
+                  movedAt: at,
+                };
+          if (to !== null && card.stage !== to) {
+            yield* logEvent(next, actor, "moved", {
+              fromStage: card.stage,
+              toStage: to,
+              body: to === "todo" ? "Next step is the worker's" : "Next step is the review",
+            });
+          }
+          analyticsActors.set(next, actor);
+          // The actor goes with the save: a card a script's subtask moved is a move by that script.
+          const releaseBoard =
+            gated?.interrupting && state === "done"
+              ? {
+                  ...board,
+                  releaseLedger: [
+                    ...(board.releaseLedger ?? []),
+                    {
+                      boardId: board.id,
+                      cardId: card.id,
+                      cardNumber: card.number,
+                      subtaskId,
+                      at: releaseAt ?? at,
+                      ...(gated.service === undefined ? {} : { service: gated.service }),
+                      ...(releaseAt === undefined ? {} : { postHoc: true }),
+                      critical: Subtasks.criticalReleaseReason(note),
+                      approvalId: cleared?.id ?? null,
+                    },
+                  ]
+                    .toSorted((a, b) => a.at.localeCompare(b.at))
+                    .slice(-200),
+                }
+              : undefined;
+          yield* saveCard(
+            next,
+            to !== null && card.stage !== to ? actor : undefined,
+            false,
+            releaseBoard,
           );
-        }
-        if (
-          state !== "open" &&
-          gated?.owner === "review" &&
-          gated.step === kanbanOpenStep(card) &&
-          marked.activeThreadId === null &&
-          marked.settledAt === null &&
-          kanbanReviewAlreadyDone(marked)
-        ) {
-          analyticsActors.set(marked, actor);
-          yield* saveCard(marked);
-          const synced = yield* syncPrs(marked);
-          const evidence = yield* reviewEvidence(board, synced);
-          // Ticking the review explicitly answers a pending review request, but
-          // cannot reuse a verdict for a different known head.
-          const next = kanbanReviewAlreadyDone(synced, { ...evidence, requested: false })
-            ? yield* placeFinishedReview(board, synced, actor, subtaskId)
-            : synced;
+          yield* laterEvaluatorTurn(card, next, actor);
           yield* kick;
           return next;
-        }
-        const idle =
-          (marked.stage === "todo" || Subtasks.BACK_TO_WORK_FROM.has(marked.stage)) &&
-          marked.activeThreadId === null &&
-          marked.settledAt === null;
-        const opened = (owner: "work" | "review") =>
-          kanbanStepSubtasks(card, owner).length === 0 &&
-          kanbanStepSubtasks(marked, owner).length > 0;
-        // A gate before a pending findings bounce exposes review subtasks,
-        // but the worker still owes fixes before that review can run again.
-        const to: KanbanStage | null = !idle
-          ? null
-          : opened("work") || (opened("review") && kanbanWorkStep(marked))
-            ? "todo"
-            : opened("review") &&
-                kanbanStepSubtasks(marked, "work").length === 0 &&
-                marked.stage !== "needs_review"
-              ? "needs_review"
-              : null;
-        const plan = Subtasks.nextStepNote();
-        const next: KanbanCard =
-          to === null
-            ? marked
-            : {
-                ...(yield* moveWait(marked, to, at, actor)),
-                stage: to,
-                reviewStep: 0,
-                // Findings or the owner's words already waiting stay ahead of the plan.
-                wakeNote:
-                  to === "todo"
-                    ? [marked.wakeNote, plan].filter((part) => part !== null).join("\n\n")
-                    : marked.wakeNote,
-                movedAt: at,
-              };
-        if (to !== null && card.stage !== to) {
-          yield* logEvent(next, actor, "moved", {
-            fromStage: card.stage,
-            toStage: to,
-            body: to === "todo" ? "Next step is the worker's" : "Next step is the review",
-          });
-        }
-        analyticsActors.set(next, actor);
-        // The actor goes with the save: a card a script's subtask moved is a move by that script.
-        const releaseBoard =
-          gated?.interrupting && state === "done"
-            ? {
-                ...board,
-                releaseLedger: [
-                  ...(board.releaseLedger ?? []),
-                  {
-                    boardId: board.id,
-                    cardId: card.id,
-                    cardNumber: card.number,
-                    subtaskId,
-                    at,
-                    critical: Subtasks.criticalReleaseReason(note),
-                    approvalId: cleared?.id ?? null,
-                  },
-                ].slice(-200),
-              }
-            : undefined;
-        yield* saveCard(
-          next,
-          to !== null && card.stage !== to ? actor : undefined,
-          false,
-          releaseBoard,
-        );
-        yield* laterEvaluatorTurn(card, next, actor);
-        yield* kick;
-        return next;
-      }),
-    );
+        }),
+      );
+      if (!paced) return yield* completing;
+      const immediate = yield* completing.pipe(releaseTicks.withPermitsIfAvailable(1));
+      if (Option.isSome(immediate)) return immediate.value;
+      yield* Effect.logDebug("kanban release admission waiting", { cardId, subtaskId });
+      return yield* completing.pipe(releaseTicks.withPermits(1));
+    });
 
   /** Only a board script does a script's subtask, and only on its own board. */
   const scriptFor = Effect.fn("KanbanService.scriptFor")(function* (

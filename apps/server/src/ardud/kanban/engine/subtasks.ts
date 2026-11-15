@@ -536,6 +536,8 @@ export interface StandingReleaseContext {
   readonly boardId: string;
   readonly at: string;
   readonly note: string | null;
+  readonly releasedAt?: string | undefined;
+  readonly boardNames?: ReadonlyMap<string, string> | undefined;
 }
 
 export const criticalReleaseReason = (note: string | null): string | null => {
@@ -546,10 +548,13 @@ export const criticalReleaseReason = (note: string | null): string | null => {
 
 export const releaseWindow = (
   standing: Pick<StandingReleaseContext, "approvals" | "ledger" | "boardId" | "at">,
+  service?: string,
 ) => {
   const approval = standing.approvals.find((entry) => entry.revokedAt === null);
   const last = standing.ledger
-    .filter((entry) => entry.boardId === standing.boardId)
+    .filter((entry) =>
+      service === undefined ? entry.boardId === standing.boardId : entry.service === service,
+    )
     .toSorted((a, b) => a.at.localeCompare(b.at))
     .at(-1);
   if (!approval || !last) return null;
@@ -574,7 +579,9 @@ export const approvalProblem = (
   const cleared =
     gate === "deploy" && !subtask.ownerOnly && approvals.some((entry) => entry.revokedAt === null);
   const window =
-    cleared && subtask.interrupting && context && intent === "do" ? releaseWindow(context) : null;
+    cleared && subtask.interrupting && context && !context.releasedAt && intent === "do"
+      ? releaseWindow(context, subtask.service)
+      : null;
   if (cleared && (!window || criticalReleaseReason(context?.note ?? null))) return null;
   const standingReason =
     gate !== "deploy"
@@ -675,7 +682,16 @@ export const approvalProblem = (
     return null;
   if (window) {
     const time = (at: string) => `${at.slice(11, 16)}Z`;
-    return `card #${card.number} ${subtask.id} (interrupting) is inside the ${window.hours} h release window: last release #${window.last.cardNumber} at ${time(window.last.at)}, next window ${time(window.next)}; write "critical: <reason>" in the done note to override`;
+    const service = subtask.service;
+    const source =
+      window.last.boardId === context?.boardId
+        ? ""
+        : `${context?.boardNames?.get(window.last.boardId) ?? window.last.boardId} `;
+    const guidance =
+      service === undefined
+        ? `; set service on ${subtask.id} (card_edit) so only releases of the same service count`
+        : "";
+    return `card #${card.number} ${subtask.id} (interrupting${service ? `, ${service}` : ""}) is inside the ${window.hours} h release window: last ${service ? `${service} ` : ""}release ${source}#${window.last.cardNumber} at ${time(window.last.at)}, next window ${time(window.next)}; write "critical: <reason>" in the done note to override${guidance}`;
   }
   let reason: string;
   if (!latest || !answer) {
@@ -725,6 +741,7 @@ export interface SubtaskInput {
   readonly clearGate?: string | undefined;
   readonly ownerOnly?: boolean | undefined;
   readonly interrupting?: boolean | undefined;
+  readonly service?: string | null | undefined;
   /** For a script's subtask: the name of the board script that does it. Absent: any script on the card's board. */
   readonly script?: string | undefined;
 }
@@ -856,6 +873,7 @@ export function planSubtasks(
           input.clearGate === undefined &&
           input.ownerOnly === undefined &&
           input.interrupting === undefined &&
+          input.service === undefined &&
           input.script === undefined)
       ) {
         planned.push(known);
@@ -880,6 +898,17 @@ export function planSubtasks(
       };
     }
     const interrupting = input.interrupting ?? known?.interrupting;
+    const service =
+      input.service === null ? undefined : (input.service ?? known?.service)?.trim().toLowerCase();
+    if (service !== undefined && !/^[a-z0-9._-]{1,64}$/.test(service)) {
+      return {
+        ok: false,
+        reason: "service must be 1–64 characters using a-z, 0-9, dot, underscore or hyphen",
+      };
+    }
+    if (input.service != null && !interrupting) {
+      return { ok: false, reason: "service requires interrupting: true" };
+    }
     if (interrupting && (owner === "work" || owner === "review")) {
       return {
         ok: false,
@@ -913,6 +942,7 @@ export function planSubtasks(
     if (known) {
       const {
         script: _old,
+        service: _oldService,
         gate: _oldGate,
         gateSource: _oldSource,
         gateCleared: _oldClear,
@@ -948,6 +978,7 @@ export function planSubtasks(
       // Cosmetic edits keep the approval's time bound, including its absence on legacy plans.
       const approvalChanged =
         gate !== previousGate ||
+        (interrupting ? service : undefined) !== known.service ||
         (input.gate != null && gateSource === "set" && known.gateSource !== "set") ||
         script !== known.script ||
         approvalText(text) !== approvalText(known.text);
@@ -958,6 +989,7 @@ export function planSubtasks(
         owner,
         ...(ownerOnly === undefined ? {} : { ownerOnly }),
         ...(interrupting === undefined ? {} : { interrupting }),
+        ...(interrupting && service !== undefined ? { service } : {}),
         ...(gate === undefined || clearing ? {} : { gate, gateSource }),
         ...(gateCleared ? { gateCleared } : {}),
         ...(approvalChanged && gate && !clearing && at ? { createdAt: at } : {}),
@@ -972,6 +1004,7 @@ export function planSubtasks(
         owner,
         ...(ownerOnly === undefined ? {} : { ownerOnly }),
         ...(interrupting === undefined ? {} : { interrupting }),
+        ...(interrupting && service !== undefined ? { service } : {}),
         ...(gate === undefined ? {} : { gate, gateSource }),
         ...(at ? { createdAt: at } : {}),
         ...(script ? { script } : {}),
