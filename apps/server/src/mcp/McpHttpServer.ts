@@ -912,6 +912,29 @@ const handoffTargetIds = (
   return typeof threadId === "string" ? [threadId] : [];
 };
 
+export const withFailureStructuredContent = (
+  result: McpSchema.CallToolResult | McpSchema.InputRequired,
+) => {
+  if (
+    result instanceof McpSchema.InputRequired ||
+    result.isError !== true ||
+    result.structuredContent !== undefined
+  )
+    return result;
+  const part = result.content.find((part) => part.type === "text");
+  if (part?.type !== "text" || part.text.length > 8192) return result;
+  try {
+    const failure = JSON.parse(part.text) as Schema.Json;
+    if (failure !== null && typeof failure === "object" && !Array.isArray(failure)) {
+      // Effect drops structuredContent on failures, but scripted callers read it.
+      return new McpSchema.CallToolResult({ ...result, structuredContent: failure });
+    }
+  } catch {
+    /* Plain-text failures stay unchanged. */
+  }
+  return result;
+};
+
 /**
  * Runs a tool registration against a server that records one anonymous
  * `mcp.tool.invoked` event per call: the tool, the calling agent's provider,
@@ -1249,6 +1272,7 @@ const withToolAnalytics =
                     const result = readiness
                       .pipe(Effect.andThen(largeRead ? advance("handler") : Effect.void))
                       .pipe(Effect.andThen(options.handle(payload)))
+                      .pipe(Effect.map(withFailureStructuredContent))
                       .pipe(Effect.provideService(ReplyRejection, rejection));
                     // Large reads run on their own "mcp" lane (whole call, so at most
                     // PERMITS.mcp large results are built at once). They queue only behind
