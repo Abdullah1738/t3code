@@ -128,6 +128,26 @@ tmp_profile() {
   fi
 }
 
+disk_reservations() {
+  local dataset minimum current
+  # Separate datasets need their own guaranteed space. 2 GiB covers boatd's
+  # observed 0.5 GiB DB/WAL; 8 GiB covers Incus's 2.8 GiB state plus growth.
+  for spec in "boatd:2147483648" "incus-var:8589934592"; do
+    dataset="$POOL/${spec%%:*}"
+    minimum=${spec#*:}
+    current=$(zfs get -Hp -o value reservation "$dataset")
+    case "$current" in
+      none) current=0 ;;
+      ''|*[!0-9]*) echo "invalid reservation on $dataset: $current" >&2; return 1 ;;
+    esac
+    if [ "$current" -lt "$minimum" ]; then
+      zfs set "reservation=$minimum" "$dataset"
+    fi
+  done
+}
+
+if [ "${1:-}" = disk-reservations ]; then disk_reservations; exit 0; fi
+
 if [ "${1:-}" = tmp-profile ]; then tmp_profile; exit 0; fi
 
 image() {
@@ -294,6 +314,8 @@ else
   state_ds "$POOL/incus-var" /var/lib/incus "Incus state"
 fi
 if mountpoint -q /var/lib/incus; then
+  disk_reservations
+
   # Incus must never start on the bare directory under the mount point (it would create an empty world on the
   # OS disk): with the pool away it stays down, boatd says why in /health, and starts it once the pool is back.
   for u in incus.service incus.socket incus-startup.service incus-user.service incus-user.socket; do
@@ -406,6 +428,7 @@ systemctl restart incus  # re-adds its own NAT/DHCP rules after the flush
 install -d -m 700 /etc/boatd
 mkdir -p /opt/boatd
 install -m 0755 "$HERE/boatd.py" /opt/boatd/boatd.py
+install -m 0644 "$HERE/boatd_disk.py" /opt/boatd/boatd_disk.py
 install -m 0755 "$HERE/boatd-wrap" /opt/boatd/boatd-wrap
 install -m 0644 "$MGMT_ASSETS/offbox_mgmt_sshd_config" /opt/boatd/offbox_mgmt_sshd_config
 tool_log="$HERE/toollog.py"
