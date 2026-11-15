@@ -6803,7 +6803,7 @@ it.effect("report_bug is safe to retry if its reply times out before any write",
       const result = yield* Fiber.join(request);
       assert.isTrue(result.isError, result.text);
       assert.strictEqual(result.structured.saved, false);
-      assert.include(result.text, "Not saved (board busy). Safe to retry.");
+      assert.include(result.text, "Nothing was saved; retry with the same arguments.");
       assert.lengthOf(fake.launches, 0);
     }).pipe(Effect.provide(fake.layer));
   }),
@@ -6829,12 +6829,22 @@ it.effect("report_bug reconciles a request evaluator after launch starts without
       yield* Deferred.await(held);
       yield* TestClock.adjust("25 seconds");
       const result = yield* Fiber.join(request);
-      assert.isTrue(result.isError, result.text);
-      assert.isNull(result.structured.saved);
-      assert.include(result.text, "card_get and board threads before retrying");
+      assert.isFalse(result.isError, result.text);
+      assert.isTrue(result.structured.saved);
+      assert.isTrue(result.structured.queued);
+      assert.isNumber(result.structured.queueId);
+      assert.isString(result.structured.evaluatorKey);
+      assert.include(result.text, "Do not submit another report");
       assert.lengthOf(fake.launches, 0);
       yield* Deferred.succeed(release, undefined);
       assert.lengthOf(fake.launches, 0);
+      const input = { boardId: board.slug, title: "Novel parser crash", evidence: "failure" };
+      const retry = yield* call(ThreadId.make("outside"), "report_bug", input);
+      assert.isFalse(retry.isError, retry.text);
+      assert.isString(retry.structured.threadId);
+      const repeated = yield* call(ThreadId.make("outside"), "report_bug", input);
+      assert.strictEqual(repeated.structured.threadId, retry.structured.threadId);
+      assert.lengthOf(fake.launches, 1);
     }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)), Effect.provide(fake.layer));
   }),
 );
