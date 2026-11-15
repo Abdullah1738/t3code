@@ -43,9 +43,8 @@ export function rootRuntimeLoss(
       candidate.status === "failed" &&
       candidate.runId === run.id &&
       candidate.nodeId === run.rootNodeId &&
-      candidate.failure.code === "provider.runtime_lost" &&
-      candidate.failure.class === "transport_error" &&
-      candidate.failure.retryable === true,
+      // A classified outage keeps its original code/class in the startup marker.
+      candidate.id === `turn-item:runtime-lost:${run.id}`,
   );
   return item?.type === "error" ? item.failure : null;
 }

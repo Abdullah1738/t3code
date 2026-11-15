@@ -14,6 +14,8 @@ import {
   RuntimeRequestId,
   ThreadId,
   TurnItemId,
+  type OrchestrationV2ProviderFailure,
+  type OrchestrationV2TurnItem,
   type OrchestrationV2ThreadProjection,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -23,6 +25,7 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as Ref from "effect/Ref";
+import { isOutage, isRuntimeFailure } from "../ardud/kanban/engine/rules.ts";
 
 import * as EffectWorker from "./EffectWorker.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
@@ -2245,6 +2248,12 @@ it.effect(
       );
       assert.equal(rootRuntimeLoss(runEvent.payload, errors)?.code, "provider.runtime_lost");
       assert.isNull(rootRuntimeLoss(runEvent.payload, []));
+      assert.isNull(
+        rootRuntimeLoss(
+          runEvent.payload,
+          errors.map((item) => ({ ...item, id: TurnItemId.make("ordinary-error") })),
+        ),
+      );
       assert.isNull(rootRuntimeLoss({ ...runEvent.payload, status: "completed" }, errors));
       assert.isNull(
         rootRuntimeLoss({ ...runEvent.payload, id: RunId.make("another-run") }, errors),
@@ -2278,4 +2287,257 @@ it.effect("a planned shutdown does not become a runtime failure", () =>
         ),
     );
   }),
+);
+
+const retryFailure = {
+  class: "provider_error",
+  category: "unknown",
+  code: null,
+  message: "Provider retry interrupted",
+  retryable: true,
+} as const satisfies OrchestrationV2ProviderFailure;
+
+function retryRecoveryProjection(
+  failure: OrchestrationV2ProviderFailure,
+  status: OrchestrationV2TurnItem["status"],
+) {
+  const projection = staleRecoveryProjection("active-retry", { driver: "codex" });
+  const rootNodeId = NodeId.make("node:retry-root");
+  const run = { ...projection.runs[0]!, rootNodeId };
+  const retry = {
+    id: TurnItemId.make("turn-item:retry"),
+    threadId: projection.thread.id,
+    runId: run.id,
+    nodeId: rootNodeId,
+    providerThreadId: run.providerThreadId,
+    providerTurnId: null,
+    nativeItemRef: null,
+    parentItemId: null,
+    ordinal: 1,
+    type: "error",
+    title: "Provider retry",
+    status,
+    startedAt: run.startedAt,
+    completedAt: status === "failed" ? run.startedAt : null,
+    updatedAt: run.startedAt!,
+    failure,
+    retry: { attempt: 1, maxAttempts: null, retryDelayMs: 1000 },
+  } as const satisfies OrchestrationV2TurnItem;
+  return { ...projection, runs: [run], turnItems: [retry] };
+}
+
+const startupRetryCases = [
+  { name: "unknown provider", failure: retryFailure, preserve: false, outage: false },
+  {
+    name: "unknown transport",
+    failure: { ...retryFailure, class: "transport_error" },
+    preserve: false,
+    outage: false,
+  },
+  {
+    name: "unknown class",
+    failure: { ...retryFailure, class: "unknown", retryable: null },
+    preserve: false,
+    outage: false,
+  },
+  ...(
+    [
+      "quota",
+      "transient",
+      "auth_expired",
+      "config",
+      "model_invalid",
+      "context_exhausted",
+      "content_filter",
+    ] as const
+  ).map((category) => ({
+    name: category,
+    failure: { ...retryFailure, category, code: `provider.${category}` },
+    preserve: true,
+    outage: ["quota", "transient", "auth_expired"].includes(category),
+  })),
+  {
+    name: "usage limit",
+    failure: { ...retryFailure, class: "usage_limit", resetAt: "2026-11-16T00:00:00.000Z" },
+    preserve: true,
+    outage: true,
+  },
+  {
+    name: "permission",
+    failure: { ...retryFailure, class: "permission_error" },
+    preserve: true,
+    outage: false,
+  },
+  {
+    name: "validation",
+    failure: { ...retryFailure, class: "validation_error" },
+    preserve: true,
+    outage: false,
+  },
+  {
+    name: "nonretryable",
+    failure: { ...retryFailure, retryable: false },
+    preserve: true,
+    outage: false,
+  },
+  {
+    name: "legacy quota code",
+    failure: { ...retryFailure, code: "provider.quota" },
+    preserve: true,
+    outage: true,
+  },
+  {
+    name: "legacy rate code",
+    failure: { ...retryFailure, code: "provider.rate-limit" },
+    preserve: true,
+    outage: true,
+  },
+  {
+    name: "legacy outage text",
+    failure: { ...retryFailure, message: "rate limit" },
+    preserve: false,
+    outage: true,
+  },
+] satisfies ReadonlyArray<{
+  name: string;
+  failure: OrchestrationV2ProviderFailure;
+  preserve: boolean;
+  outage: boolean;
+}>;
+
+it.effect.each(
+  startupRetryCases.flatMap((entry) =>
+    (["pending", "running", "waiting", "failed"] as const).map((status) => ({ ...entry, status })),
+  ),
+)("startup retains $status root retry: $name", ({ failure, preserve, outage, status }) =>
+  Effect.gen(function* () {
+    const projection = retryRecoveryProjection(failure, status);
+    const commits: Array<RecoveryCommit> = [];
+    const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService.pipe(
+      Effect.provide(staleRecoveryLayer({ projections: [projection], commits })),
+    );
+    yield* recovery.reconcile("startup");
+    const events = commits[0]!.events;
+    const runEvent = events.find((event) => event.type === "run.updated");
+    assert.equal(runEvent?.type === "run.updated" ? runEvent.payload.status : null, "cancelled");
+    if (runEvent?.type !== "run.updated") return;
+    const errors = events.flatMap((event) =>
+      event.type === "turn-item.updated" && event.payload.type === "error" ? [event.payload] : [],
+    );
+    if (status !== "failed")
+      assert.equal(
+        errors.find((item) => item.id === projection.turnItems[0]!.id)?.status,
+        "cancelled",
+      );
+    const loss = rootRuntimeLoss(runEvent.payload, errors);
+    assert.isNotNull(loss, "Cancelling the retry must not hide the runtime loss");
+    if (loss === null) return;
+    assert.deepEqual(
+      loss,
+      preserve
+        ? failure
+        : {
+            class: "transport_error",
+            category: "unknown",
+            code: "provider.runtime_lost",
+            message: failure.message,
+            retryable: true,
+          },
+    );
+    assert.equal(isOutage(loss), outage);
+    assert.equal(isRuntimeFailure(loss), !preserve && !outage);
+  }),
+);
+
+it.effect.each(["idle", "completed", "cancelled", "interrupted"] as const)(
+  "startup does not revive a %s retry classification",
+  (status) =>
+    Effect.gen(function* () {
+      const projection = retryRecoveryProjection({ ...retryFailure, category: "quota" }, status);
+      const commits: Array<RecoveryCommit> = [];
+      const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService.pipe(
+        Effect.provide(staleRecoveryLayer({ projections: [projection], commits })),
+      );
+      yield* recovery.reconcile("startup");
+      const events = commits[0]!.events;
+      const runEvent = events.find((event) => event.type === "run.updated");
+      if (runEvent?.type !== "run.updated") return assert.fail("Missing cancelled run");
+      const items = events.flatMap((event) =>
+        event.type === "turn-item.updated" ? [event.payload] : [],
+      );
+      const loss = rootRuntimeLoss(runEvent.payload, items);
+      assert.isNotNull(loss);
+      assert.isTrue(loss !== null && isRuntimeFailure(loss));
+    }),
+);
+
+it.effect.each(
+  (["running", "failed"] as const).flatMap((status) =>
+    (["child", "other-run"] as const).map((scope) => ({ status, scope })),
+  ),
+)("startup ignores a $status $scope retry", ({ status, scope }) =>
+  Effect.gen(function* () {
+    const original = retryRecoveryProjection({ ...retryFailure, category: "quota" }, status);
+    const projection = {
+      ...original,
+      turnItems: original.turnItems.map((item) => ({
+        ...item,
+        ...(scope === "child"
+          ? { nodeId: NodeId.make("node:child") }
+          : { runId: RunId.make("run:other") }),
+      })),
+    };
+    const commits: Array<RecoveryCommit> = [];
+    const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService.pipe(
+      Effect.provide(staleRecoveryLayer({ projections: [projection], commits })),
+    );
+    yield* recovery.reconcile("startup");
+    const events = commits[0]!.events;
+    const runEvent = events.find((event) => event.type === "run.updated");
+    if (runEvent?.type !== "run.updated") return assert.fail("Missing cancelled run");
+    const items = events.flatMap((event) =>
+      event.type === "turn-item.updated" ? [event.payload] : [],
+    );
+    const loss = rootRuntimeLoss(runEvent.payload, items);
+    assert.isTrue(loss !== null && isRuntimeFailure(loss));
+  }),
+);
+
+it.effect.each(["timestamp", "ordinal", "id"] as const)(
+  "startup retains the latest root classification by %s",
+  (order) =>
+    Effect.gen(function* () {
+      const original = retryRecoveryProjection({ ...retryFailure, category: "quota" }, "failed");
+      const old = original.turnItems[0]!;
+      const failure = { ...retryFailure, category: "config" as const };
+      const newest = {
+        ...old,
+        id: TurnItemId.make(order === "id" ? "turn-item:z-latest" : "turn-item:a-latest"),
+        failure,
+        status: "running" as const,
+        updatedAt:
+          order === "timestamp"
+            ? DateTime.makeUnsafe(DateTime.toEpochMillis(old.updatedAt) + 1000)
+            : old.updatedAt,
+        ordinal:
+          order === "ordinal"
+            ? old.ordinal + 1
+            : order === "timestamp"
+              ? old.ordinal - 1
+              : old.ordinal,
+      };
+      const projection = { ...original, turnItems: [newest, old] };
+      const commits: Array<RecoveryCommit> = [];
+      const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService.pipe(
+        Effect.provide(staleRecoveryLayer({ projections: [projection], commits })),
+      );
+      yield* recovery.reconcile("startup");
+      const events = commits[0]!.events;
+      const runEvent = events.find((event) => event.type === "run.updated");
+      if (runEvent?.type !== "run.updated") return assert.fail("Missing cancelled run");
+      const items = events.flatMap((event) =>
+        event.type === "turn-item.updated" ? [event.payload] : [],
+      );
+      assert.deepEqual(rootRuntimeLoss(runEvent.payload, items), failure);
+    }),
 );

@@ -408,17 +408,31 @@ export const make = Effect.gen(function* () {
       for (const run of runs) {
         // Startup found a turn whose runtime vanished. Normal Stops and
         // planned shutdowns keep their existing recovery policy.
-        if (
-          trigger === "startup" &&
-          run.startedAt != null &&
-          !runtimeItems.some(
-            (item) =>
-              item.type === "error" &&
-              item.runId === run.id &&
-              item.nodeId === run.rootNodeId &&
-              (item.status === "failed" || item.status === "running"),
-          )
-        ) {
+        if (trigger === "startup" && run.startedAt != null) {
+          const previous = runtimeItems
+            .filter((item) => item.type === "error")
+            .filter(
+              (item) =>
+                item.runId === run.id &&
+                item.nodeId === run.rootNodeId &&
+                (item.status === "failed" ||
+                  item.status === "pending" ||
+                  item.status === "running" ||
+                  item.status === "waiting"),
+            )
+            .toSorted(
+              (a, b) =>
+                DateTime.toEpochMillis(b.updatedAt) - DateTime.toEpochMillis(a.updatedAt) ||
+                b.ordinal - a.ordinal ||
+                (a.id < b.id ? 1 : a.id > b.id ? -1 : 0),
+            )[0]?.failure;
+          const classified =
+            previous !== undefined &&
+            ((previous.category !== undefined && previous.category !== "unknown") ||
+              !["provider_error", "transport_error", "unknown"].includes(previous.class) ||
+              previous.code === "provider.quota" ||
+              previous.code === "provider.rate-limit" ||
+              previous.retryable === false);
           runtimeLossOrdinal += 1;
           events.push({
             id: yield* allocateEventId(),
@@ -444,13 +458,17 @@ export const make = Effect.gen(function* () {
               startedAt: now,
               completedAt: now,
               updatedAt: now,
-              failure: {
-                class: "transport_error",
-                category: "unknown",
-                code: "provider.runtime_lost",
-                message: detail,
-                retryable: true,
-              },
+              // The running retry item is cancelled below. Keep its classification
+              // in this terminal marker so startup cannot erase an outage.
+              failure: classified
+                ? previous
+                : {
+                    class: "transport_error",
+                    category: "unknown",
+                    code: "provider.runtime_lost",
+                    message: previous?.message ?? detail,
+                    retryable: true,
+                  },
             },
           });
         }

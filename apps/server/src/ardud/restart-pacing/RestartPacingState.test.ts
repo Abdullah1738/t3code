@@ -615,7 +615,7 @@ it.effect(
       f.working();
       assert.equal((yield* state.describe(source)).priority, 2);
       const failure = yield* decodeTurnItem({
-        id: "runtime-loss",
+        id: `turn-item:runtime-lost:${run.id}`,
         threadId: run.threadId,
         runId: run.id,
         nodeId: run.rootNodeId,
