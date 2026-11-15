@@ -47,6 +47,7 @@ export class Attention {
   private releaseBoardWait?: () => void;
   private directAttention = false;
   private boardRead?: Promise<BoardSnapshot | undefined>;
+  private completedBoard?: BoardSnapshot;
   private readonly boardReadVersions = new WeakMap<BoardSnapshot, ReadonlyMap<string, number>>();
 
   constructor(
@@ -244,19 +245,22 @@ export class Attention {
     // Direct attention events and known notices must not wait behind a slow
     // roster list. Its single-flight refresh continues for later quiet ticks.
     let release!: () => void;
-    const attentionEvent = new Promise<undefined>(resolve => { release = () => resolve(undefined); });
+    const attentionEvent = new Promise<"bypass">(resolve => { release = () => resolve("bypass"); });
     this.releaseBoardWait = release;
     if (this.directAttention || this.store.pendingSessionNotices().length) release();
     const read = this.boardRead ??= this.backend.sessionBoard()
       .then(board => {
         if (!this.boardReadVersions.has(board)) this.boardReadVersions.set(board, boardVersions);
+        this.completedBoard = board;
         return board;
       })
       .catch(error => { toolError("telegram", "tg.attention.board", undefined, error); return undefined; })
       .finally(() => { this.boardRead = undefined; });
-    const board = await Promise.race([read, attentionEvent]).finally(() => {
+    const result = await Promise.race([read, attentionEvent]).finally(() => {
       if (this.releaseBoardWait === release) this.releaseBoardWait = undefined;
     });
+    // Bypassing the wait must not discard folders from a completed read.
+    const board = result === "bypass" ? this.completedBoard : result;
     this.directAttention = false;
     if (epoch !== this.epoch || this.stopped) return;
     // Reusing a cached idle row must not erase a newer busy event.
