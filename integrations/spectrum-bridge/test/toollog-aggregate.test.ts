@@ -131,6 +131,12 @@ test.each([
 ])("failed control $name requests retain one error row and one rollup failure", async fixture => {
   const { root, rows } = setup();
   const previous = process.env.TOOLLOG_DIR;
+  const prior = setup();
+  process.env.TOOLLOG_DIR = prior.root;
+  toolLog.write({ component: "robob", kind: "perf", name: "turn.robob_call", durationMs: 0, ok: true,
+    props: { method: "GET", route: "/threads/:id/messages" } });
+  toolLog.flush();
+  await toolLog.settled();
   process.env.TOOLLOG_DIR = root;
   const cause = Object.assign(new Error("PRIVATE +971501234567 /private/PRIVATE https://private.test/?token=PRIVATE"), fixture);
   const fake = Object.assign(async () => {
