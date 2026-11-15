@@ -31,6 +31,7 @@ import type {
 import {
   latestExecutedRun,
   latestRootProviderFailure,
+  rootRuntimeLoss,
   runRanAfter,
   usageLimitBlockedRun,
 } from "@t3tools/shared/orchestrationV2ThreadError";
@@ -11884,7 +11885,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (
         resultChain.some((run) => run.ordinal === 1) &&
         !child.messages.some((message) => message.role === "assistant") &&
-        child.turnItems.length === 0 &&
+        // The startup marker explains the cut; it is not the child's answer.
+        child.turnItems.every((item) =>
+          resultChain.some((run) => rootRuntimeLoss(run, [item]) !== null),
+        ) &&
         continuations.some(
           (effect) =>
             effect.commandId.startsWith("command:runtime-reconcile:startup:") ||
