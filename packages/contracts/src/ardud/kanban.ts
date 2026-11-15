@@ -1918,6 +1918,10 @@ export const KanbanCardEvent = Schema.Struct({
   fromStage: Schema.NullOr(KanbanStage),
   toStage: Schema.NullOr(KanbanStage),
   body: Schema.NullOr(Schema.String),
+  /** Original delivery to reconcile when assignment inputs have since changed. */
+  assignmentWake: Schema.optionalKey(
+    Schema.Struct({ threadId: ThreadId, key: TrimmedNonEmptyString }),
+  ),
   /** Review events: the commit the reviewer reviewed, when it said. Null otherwise. */
   head: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
 });

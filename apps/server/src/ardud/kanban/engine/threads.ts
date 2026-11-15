@@ -110,6 +110,8 @@ export interface KanbanLaunchInput {
 export interface KanbanSendInput {
   /** Observes a newly accepted delivery, excluding receipt replays and coalesced no-ops. */
   readonly onAccepted?: (identity: string) => Effect.Effect<void>;
+  /** Called at the durable acceptance boundary, before any projection or board revalidation. */
+  readonly onCommitted?: () => void;
   readonly flushQueued?: "wake" | "steer";
   readonly threadId: ThreadId;
   readonly text: string;
@@ -586,6 +588,7 @@ const make = Effect.gen(function* () {
       threadId: ThreadId,
       id: string,
       reason = "Board withdrawal could not steer its original run",
+      interruptRunning = true,
     ) {
       const messageId = MessageId.make(`kanban:${id}`);
       // A queued withdrawal can start while cancellation is committing; reconcile that race once.
@@ -627,7 +630,8 @@ const make = Effect.gen(function* () {
                 threadId,
                 runId: run.id,
               }
-            : ["preparing", "starting", "running", "waiting"].includes(run.status)
+            : interruptRunning &&
+                ["preparing", "starting", "running", "waiting"].includes(run.status)
               ? {
                   type: "run.interrupt" as const,
                   commandId: CommandId.make(`kanban:send:${id}:interrupt`),
@@ -642,16 +646,15 @@ const make = Effect.gen(function* () {
                   reason,
                 }
               : null;
-        if (command === null) return true;
+        if (command === null)
+          return !["preparing", "starting", "running", "waiting"].includes(run.status);
         const stopped = yield* Effect.result(threads.dispatch(command));
         if (Result.isSuccess(stopped)) return true;
         if (attempt === 1) return yield* stopped.failure;
       }
     },
     Effect.catchCause((cause) =>
-      Effect.logWarning("kanban withdrawal cleanup failed", {
-        errorTag: analyticsErrorTag(cause),
-      }).pipe(Effect.as(true)),
+      Effect.logWarning("kanban withdrawal cleanup failed", { cause }).pipe(Effect.as(true)),
     ),
   );
 
@@ -727,12 +730,12 @@ const make = Effect.gen(function* () {
       // Native steering can share a run whose root message belongs to another card.
       // Its delivery is already stopped if that shared run finished before cleanup.
       if (yield* terminal) return true;
-      const stopped = yield* discardWithdrawal(projectId, threadId, id, text);
+      const stopped = yield* discardWithdrawal(projectId, threadId, id, text, false);
       if (!stopped && text !== undefined) {
         const steered = yield* Effect.result(
           send({ threadId, key: `${id}:state-changed`, text, mode: "steer" }),
         );
-        if (Result.isSuccess(steered)) return true;
+        if (Result.isSuccess(steered)) return yield* terminal;
         if (yield* terminal) return true;
         return yield* Effect.fail(steered.failure);
       }
@@ -750,6 +753,7 @@ const make = Effect.gen(function* () {
       | "retryWithdrawn"
       | "withdrawalText"
       | "withdrawalBefore"
+      | "onCommitted"
     >,
     onReplay?: (threadId: ThreadId, messageId: string) => ReturnType<typeof pruneMessageWakes>,
   ) {
@@ -847,6 +851,7 @@ const make = Effect.gen(function* () {
           }
         }
         if (receipt.value.status !== "rejected") {
+          if (receipt.value.status === "accepted") input.onCommitted?.();
           if (input.keyAcrossThreads && input.coalesce === undefined && onReplay !== undefined)
             yield* onReplay(ThreadId.make(receipt.value.aggregateId), `kanban:${id}`);
           if (
@@ -866,6 +871,13 @@ const make = Effect.gen(function* () {
     function* (input) {
       let acceptedMessageId: string | undefined;
       let acceptedRunId: string | undefined;
+      let deliveryCommandId: CommandId | undefined;
+      let acknowledged = false;
+      const accept = () => {
+        if (acknowledged) return;
+        acknowledged = true;
+        input.onCommitted?.();
+      };
       return yield* Effect.gen(function* () {
         const scope =
           input.mode === "steer" || input.model !== undefined ? undefined : input.coalesce;
@@ -875,7 +887,7 @@ const make = Effect.gen(function* () {
           return yield* new KanbanThreadError({ operation: "send", detail: "thread not found" });
         }
         if (scope === "nudge" && (yield* nudgeBlocked(input.threadId))) return;
-        let id = yield* sendId(input, pruneMessageWakes);
+        let id = yield* sendId({ ...input, onCommitted: accept }, pruneMessageWakes);
         if (id === undefined) return;
         // Queue edits cannot change a run's model selection or steer a live turn.
         if (input.flushQueued !== undefined) {
@@ -911,6 +923,7 @@ const make = Effect.gen(function* () {
             );
             if (Result.isSuccess(edited)) {
               acceptedRunId = target.id;
+              accept();
               if (
                 scope === "nudge" &&
                 (yield* nudgeBlocked(input.threadId, {
@@ -936,7 +949,7 @@ const make = Effect.gen(function* () {
               return yield* sendError(edited.failure, target.userMessageId);
             }
             // The rejected edit owns its command id. Walk its receipt before sending once.
-            id = yield* sendId({ ...input, key: input.key ?? id });
+            id = yield* sendId({ ...input, key: input.key ?? id, onCommitted: accept });
             if (id === undefined) return;
           }
         }
@@ -948,6 +961,7 @@ const make = Effect.gen(function* () {
           );
           acceptedMessageId = messageId;
           acceptedRunId = undefined;
+          deliveryCommandId = CommandId.make(`kanban:send:${id}`);
           const result = yield* Effect.result(
             threads.sendToThread({
               projectId: shell.projectId,
@@ -956,6 +970,7 @@ const make = Effect.gen(function* () {
               threadId: input.threadId,
               text: input.text,
               attachments: [],
+              onAccepted: accept,
               ...(input.model ? { modelSelection: input.model } : {}),
               mode: input.mode ?? "auto",
               ...(input.mode === "steer" ? { activeTurnOnly: true } : {}),
@@ -965,6 +980,10 @@ const make = Effect.gen(function* () {
             }),
           );
           if (Result.isFailure(result)) {
+            const receipt = yield* receipts.getByCommandId({
+              commandId: CommandId.make(`kanban:send:${id}`),
+            });
+            if (Option.isSome(receipt) && receipt.value.status === "accepted") accept();
             if (isCommandRejected(result.failure) && result.failure.revoked) {
               // No enqueue occurred; a future retry must not inherit cleanup for this id.
               acceptedMessageId = undefined;
@@ -990,6 +1009,7 @@ const make = Effect.gen(function* () {
           }
           const sent = result.success;
           acceptedRunId = sent.run.id;
+          accept();
           if (input.mode === "steer" && sent.delivery !== "steered") {
             return yield* new KanbanThreadError({
               operation: "send",
@@ -1022,6 +1042,18 @@ const make = Effect.gen(function* () {
             ? undefined
             : (commandId) => input.onAccepted!(commandId.replace(/^kanban:send:/, "")),
         ),
+        Effect.onError(() =>
+          deliveryCommandId === undefined || input.onCommitted === undefined
+            ? Effect.void
+            : receipts.getByCommandId({ commandId: deliveryCommandId }).pipe(
+                Effect.tap((receipt) =>
+                  Effect.sync(() => {
+                    if (Option.isSome(receipt) && receipt.value.status === "accepted") accept();
+                  }),
+                ),
+                Effect.ignore,
+              ),
+        ),
         Effect.mapError((error) => sendError(error, acceptedMessageId, acceptedRunId)),
       );
     },
@@ -1044,26 +1076,23 @@ const make = Effect.gen(function* () {
         Date.parse(receipt.value.acceptedAt) > Date.parse(input.withdrawalBefore)
       )
         return;
+      const commandId = CommandId.make(`kanban:send:${id}:withdrawn`);
       if (input.retryWithdrawn) {
-        // Intent precedes external cleanup, so a crash or an asynchronous stop
-        // cannot turn the next keyed retry into an old accepted-command replay.
-        const commandId = CommandId.make(`kanban:send:${id}:withdrawn`);
+        // Persist intent before cleanup so a crash cannot replay the old accepted command.
         yield* receipts.insertIfAbsent({
           ...receipt.value,
           commandId,
           commandType: "kanban.assignment.withdrawal_requested",
         });
-        if (!(yield* finishAssignmentWithdrawal(shell.projectId, input.threadId, id, input.text)))
-          return "pending" as const;
+      }
+      if (!(yield* finishAssignmentWithdrawal(shell.projectId, input.threadId, id, input.text)))
+        return "pending" as const;
+      if (input.retryWithdrawn)
         yield* receipts.upsert({
           ...receipt.value,
           commandId,
           commandType: "kanban.assignment.withdrawn",
         });
-      } else {
-        const stopped = yield* discardWithdrawal(shell.projectId, input.threadId, id, input.text);
-        if (!stopped) yield* send({ ...input, key: `${input.key}:state-changed`, mode: "steer" });
-      }
     },
     Effect.catchCause((cause) =>
       Effect.logWarning("kanban assignment withdrawal failed", {
