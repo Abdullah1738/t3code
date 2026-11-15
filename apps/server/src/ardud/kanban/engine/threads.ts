@@ -155,8 +155,11 @@ export interface KanbanThreadsShape {
       })
     | null
   >;
-  /** Strict read used to reconcile a released card after its maintenance turn. */
-  readonly latestRun: (threadId: ThreadId) => Effect.Effect<
+  /** With afterRunId, find the latest persisted start after that run, even if finished. */
+  readonly latestRun: (
+    threadId: ThreadId,
+    afterRunId?: string,
+  ) => Effect.Effect<
     {
       readonly runId: string;
       readonly status: string;
@@ -200,8 +203,10 @@ export interface KanbanThreadsShape {
     threadId: ThreadId,
     model: ModelSelection,
   ) => Effect.Effect<void, KanbanThreadError>;
+  /** Include live runs when a successor check needs one projection snapshot. */
   readonly queuedRuns: (
     threadId: ThreadId,
+    includeActive?: boolean,
   ) => Effect.Effect<ReadonlyArray<OrchestrationV2Run>, KanbanThreadError>;
   /** Cancels only this queued brief; false means it may already be acting. */
   readonly cancelQueued: (
@@ -447,10 +452,36 @@ const make = Effect.gen(function* () {
   const lastFailure: KanbanThreadsShape["lastFailure"] = (threadId) =>
     findLastFailure(threadId).pipe(Effect.catchCause(() => Effect.succeed(null)));
 
-  const latestRun: KanbanThreadsShape["latestRun"] = (threadId) =>
+  const latestRun: KanbanThreadsShape["latestRun"] = (threadId, afterRunId) =>
     threads.getThreadRecords(threadId, ["runs"]).pipe(
       Effect.flatMap((records) => {
-        const run = latestExecutedRun(records.runs);
+        const failed =
+          afterRunId === undefined ? undefined : records.runs.find((run) => run.id === afterRunId);
+        const startOrder = (run: OrchestrationV2Run) =>
+          DateTime.toEpochMillis(run.startedAt ?? run.requestedAt);
+        const laterStarts =
+          failed === undefined
+            ? []
+            : records.runs.filter(
+                (run) =>
+                  run.id !== failed.id &&
+                  run.startedAt !== null &&
+                  (startOrder(run) > startOrder(failed) ||
+                    (startOrder(run) === startOrder(failed) && run.ordinal > failed.ordinal)),
+              );
+        const run =
+          afterRunId === undefined
+            ? latestExecutedRun(records.runs)
+            : laterStarts.reduce<OrchestrationV2Run | null>(
+                (latest, candidate) =>
+                  latest === null ||
+                  startOrder(candidate) > startOrder(latest) ||
+                  (startOrder(candidate) === startOrder(latest) &&
+                    candidate.ordinal > latest.ordinal)
+                    ? candidate
+                    : latest,
+                null,
+              );
         if (run === null) return Effect.succeed(null);
         return threads
           .getThreadRecords(threadId, ["messages"], {
@@ -892,9 +923,11 @@ const make = Effect.gen(function* () {
   );
 
   const queuedRuns: KanbanThreadsShape["queuedRuns"] = Effect.fn("KanbanThreads.queuedRuns")(
-    function* (threadId) {
+    function* (threadId, includeActive = false) {
       return (yield* threads.getThreadRecords(threadId, ["runs"])).runs.filter(
-        (run) => run.status === "queued",
+        (run) =>
+          run.status === "queued" ||
+          (includeActive && ["preparing", "starting", "running", "waiting"].includes(run.status)),
       );
     },
     Effect.mapError(

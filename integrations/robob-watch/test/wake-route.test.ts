@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Delivery, State, Watcher } from "../src/lib.ts";
@@ -17,6 +17,8 @@ type Fixture = {
   statusError?: boolean;
   nativeError?: boolean;
   sendError?: boolean;
+  sendSleep?: boolean;
+  sendSpawnError?: boolean;
   wakeError?: boolean;
   imessageError?: boolean;
   telegramError?: boolean;
@@ -39,11 +41,12 @@ async function fixture(options: Fixture = {}, body = "await deliver(watcher, 'ev
     const stub = (cli: string) => {
       const file = join(dir, `${cli}.ts`);
       writeFileSync(file, `#!${process.execPath}
-import { appendFileSync, readFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, unlinkSync } from 'node:fs';
 const args = process.argv.slice(2);
 appendFileSync(${JSON.stringify(callsFile)}, JSON.stringify({ cli: ${JSON.stringify(cli)}, args }) + '\\n');
 const config = JSON.parse(readFileSync(${JSON.stringify(config)}, 'utf8'));
 if (${JSON.stringify(cli)} === 't3ctl') {
+  if (args[0] === 'status' && config.sendSpawnError) unlinkSync(import.meta.path);
   if (config[args[0] + 'Sleep']) await Bun.sleep(10_000);
   if (config[args[0] + 'Error']) { console.error(args[0] + ' stub failure'); process.exit(1); }
   console.log(config[args[0] + 'Output'] ?? JSON.stringify(args[0] === 'send' ? { ok: true, duplicate: false } : { ok: true, thread: config.status }));
@@ -81,10 +84,17 @@ console.log(JSON.stringify(await (async () => (${body}))()));`;
       ROBOB_WATCH_BRIDGE_DB: dbPath, ROBOB_WATCH_SPECTRUM_CLI: spectrum, ROBOB_WATCH_TELEGRAM_CLI: telegram,
       ROBOB_WATCH_T3CTL: options.noOverride ? undefined : options.missingCli ? join(dir, "missing-cli") : t3ctl,
       ROBOB_WATCH_TEST_CREATOR_TIMEOUT_MS: "2000",
+      ROBOB_WATCH_TEST_CREATOR_SEND_TIMEOUT_MS: "2000",
       ROBOB_WATCH_LOAD_OVERRIDE: "0.1", TOOLLOG_DIR: join(dir, "logs") };
-    const child = Bun.spawn([process.execPath, "-e", code], { env, stdout: "pipe", stderr: "pipe" });
-    const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
-    expect(exitCode, stderr).toBe(0);
+    // LaunchAgent sends stdout to runner.log; exercise that same file redirection.
+    const runnerLogPath = join(dir, "runner.log");
+    const fd = openSync(runnerLogPath, "w");
+    try {
+      const child = Bun.spawn([process.execPath, "-e", code], { env, stdout: fd, stderr: "pipe" });
+      const [stderr, exitCode] = await Promise.all([new Response(child.stderr).text(), child.exited]);
+      expect(exitCode, stderr).toBe(0);
+    } finally { closeSync(fd); }
+    const stdout = readFileSync(runnerLogPath, "utf8");
     const lines = stdout.trim().split("\n");
     const logsDir = join(dir, "logs");
     return { result: JSON.parse(lines.pop()!) as Delivery & { state: State; held: State; same: boolean; env: string; deliveries: Delivery[] },
@@ -103,7 +113,10 @@ console.log(JSON.stringify(await (async () => (${body}))()));`;
 const wakeText = (calls: Call[]) => calls.find(c => c.cli === "spectrum" && c.args[0] === "wake")!.args.find(a => a.startsWith("--text="))!.slice(7);
 
 test("a project creator gets one queued send with its event key, context and provenance, without a bridge wake", async () => {
-  const { result, calls } = await fixture({ status: { recentRuns: [{ data: "x".repeat(2000) }] } });
+  const { result, calls, fallbacks, runnerLog, log } = await fixture({ status: { recentRuns: [{ data: "x".repeat(2000) }] } });
+  expect(fallbacks).toHaveLength(0);
+  expect(runnerLog).not.toContain("creator wake fallback");
+  expect(log).not.toContain("creator wake fallback");
   expect(result).toMatchObject({ ok: true, via: "thread:abcd1234" });
   expect(calls.map(c => c.cli)).toEqual(["t3ctl", "t3ctl"]);
   expect(calls[0]!.args).toEqual(["status", projectThread]);
@@ -112,6 +125,30 @@ test("a project creator gets one queued send with its event key, context and pro
   expect(send!.args[2]).toStartWith("[Watcher event from robob-watch route-test, not typed by anyone in this thread.]\n");
   expect(send!.args[2]).toContain("event happened");
   expect(send!.args[2]).toContain("Handle this event in its work thread.");
+});
+
+test.each([
+  { name: "exit", sendError: true, reason: "exit:1" },
+  { name: "timeout", sendSleep: true, reason: "timeout" },
+  { name: "spawn error", sendSpawnError: true, reason: "error" },
+])("creator send $name logs one fallback and wakes the owner once", async ({ name, reason, ...options }) => {
+  const { result, calls, fallbacks, runnerLog, log } = await fixture(options);
+  expect(result).toMatchObject({ ok: true, via: "wake", route: "owner" });
+  expect(calls.filter(c => c.cli === "spectrum")).toHaveLength(1);
+  expect(calls.filter(c => c.cli === "telegram")).toHaveLength(0);
+  expect(calls.filter(c => c.cli === "t3ctl").map(c => c.args[0]))
+    .toEqual(options.sendSpawnError ? ["status"] : ["status", "send"]);
+  expect(wakeText(calls)).toStartWith("(meant for thread abcd1234, which could not be reached)\n");
+  expect(calls.find(c => c.cli === "spectrum")!.args).toContain("--key=robob-watch:route-test:1:stable-event");
+  expect(log).toContain(`creator wake fallback thread=${projectThread} send:`);
+  expect(runnerLog.split("\n")).toHaveLength(1);
+  expect(runnerLog).toContain(`creator wake fallback watcher=route-test thread=${projectThread} reason=${reason}`);
+  expect(fallbacks).toHaveLength(1);
+  expect(fallbacks[0]!.props!.durationMs).toBeGreaterThanOrEqual(0);
+  expect(fallbacks[0]!.durationMs).toBe(fallbacks[0]!.props!.durationMs);
+  if (options.sendSleep) expect(fallbacks[0]!.durationMs).toBeLessThan(5_000);
+  expect(fallbacks[0]).toMatchObject({ component: "wakes", kind: "error", ok: false, ids: { watcher: "route-test" },
+    props: { step: "send", reason, durationMs: expect.any(Number) } });
 });
 
 test.each([

@@ -15,6 +15,7 @@ import {
   kanbanScriptStep,
   kanbanDeciding,
   kanbanWaiting,
+  kanbanWaitStale,
   kanbanWaitsOnEvaluator,
   kanbanReviewAlreadyDone,
   type KanbanBoard,
@@ -361,6 +362,16 @@ export function runSilentDue(
   );
 }
 
+/** The worker saved this wait while it still owned the card. */
+export const workerWaitDeferred = (card: KanbanCard): boolean =>
+  card.stage === "working" &&
+  card.activeRole === "work" &&
+  card.activeThreadId !== null &&
+  card.activeThreadId === card.workThreadId &&
+  card.wait?.by._tag === "thread" &&
+  card.wait.by.threadId === card.workThreadId &&
+  !kanbanWaitStale(card);
+
 /** A Working card whose worker sat idle, or stuck on its own question, for WORKER_QUIET_MS. */
 export function workerQuietDue(
   card: KanbanCard,
@@ -368,7 +379,10 @@ export function workerQuietDue(
   nowMs: number,
 ): boolean {
   if (card.stage !== "working" || card.activeRole !== "work" || card.stalled !== null) return false;
-  if (card.wait !== undefined || card.asks.some((ask) => ask.closedAt === null && ask.blocking))
+  if (
+    (card.wait !== undefined && !workerWaitDeferred(card)) ||
+    card.asks.some((ask) => ask.closedAt === null && ask.blocking)
+  )
     return false;
   if (view.state !== "idle" && view.state !== "needs-input") return false;
   const since = Math.max(

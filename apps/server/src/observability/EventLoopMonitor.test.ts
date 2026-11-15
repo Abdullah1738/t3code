@@ -39,11 +39,16 @@ const quiet: EventLoopMonitor.EventLoopReadings = { ...stalled, delayMaxNs: ms(2
 const monitor = (
   samples: Array<EventLoopMonitor.EventLoopReadings>,
   stallLog: EventLoopMonitor.StallLogOptions = { filePath: "\0", maxBytes: 1 },
+  sampleArchiveWalBytes: Effect.Effect<number | null | undefined> = Effect.succeed(undefined),
 ) =>
   Layer.build(
     EventLoopMonitor.layerWith(
       Effect.succeed(Effect.sync(() => samples.shift() ?? quiet)),
       stallLog,
+      undefined,
+      undefined,
+      undefined,
+      sampleArchiveWalBytes,
     ),
   );
 
@@ -250,6 +255,33 @@ describe("EventLoopMonitor", () => {
       assert.strictEqual(rows[1].gcMajorMaxMs, 0);
       assert.strictEqual(rows[1].heapUsedMbPrev, 1100);
       assert.strictEqual(rows[1].heapUsedMb, 500);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("records archive WAL metadata on samples and stalls, including a missing WAL", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "archive-wal-telemetry-" });
+      const filePath = `${directory}/event-loop-stalls.ndjson`;
+      let archiveWalBytes: number | null = 5;
+      yield* monitor(
+        [quiet, quiet, stalled, quiet],
+        { filePath, maxBytes: 4096 },
+        Effect.sync(() => archiveWalBytes),
+      );
+      yield* TestClock.adjust("60 seconds");
+      yield* TestClock.adjust("30 seconds");
+      archiveWalBytes = null;
+      yield* TestClock.adjust("30 seconds");
+      const rows = (yield* fs.readFileString(filePath))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      assert.deepEqual(
+        rows.map((row) => row.archiveWalBytes),
+        [5, 5, null],
+      );
+      assert.equal(rows[1].delayMaxMs, 4950);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 

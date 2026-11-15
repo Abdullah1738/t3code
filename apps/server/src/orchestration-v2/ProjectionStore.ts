@@ -6145,10 +6145,75 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         )
         .pipe(Effect.mapError(controlReadError(threadId)));
 
+    const readLocalTimelinePage = Effect.fn("ProjectionStore.readLocalTimelinePage")(function* (
+      threadId: ThreadId,
+      options: ProjectionTimelinePageOptions,
+    ) {
+      // Keep visibility and global positions before the message filter. Only page ids
+      // cross the worker boundary; counts still inspect the visible index in SQLite.
+      const rows = yield* sql<{
+        total_items: number;
+        turn_item_id: string | null;
+        position: number | null;
+      }>`WITH visible AS MATERIALIZED (
+        SELECT i.turn_item_id, i.type,
+          ROW_NUMBER() OVER (ORDER BY i.ordinal ASC, i.turn_item_id ASC) - 1 AS position
+        FROM ardud_history_turn_items i
+        LEFT JOIN orchestration_v2_projection_runs r ON r.run_id = i.run_id AND r.thread_id = i.thread_id
+        WHERE i.thread_id = ${threadId}
+          AND COALESCE(r.status, '') != 'rolled_back'
+          AND NOT (i.type = 'user_message' AND COALESCE(r.status, '') = 'cancelled'
+            AND COALESCE(json_extract(i.payload_json, '$.inputIntent'), '') = 'queued_turn')
+          AND NOT (i.type = 'run_interrupt_result' AND i.run_id IS NOT NULL AND i.node_id IS NOT NULL
+            AND EXISTS (SELECT 1 FROM orchestration_v2_projection_run_attempts a
+              WHERE a.thread_id = i.thread_id AND a.run_id = i.run_id
+                AND a.root_node_id = i.node_id AND a.status = 'superseded')
+            AND NOT EXISTS (SELECT 1 FROM ardud_history_turn_items request
+              WHERE request.thread_id = i.thread_id AND request.run_id = i.run_id
+                AND request.type = 'run_interrupt_request'))
+      ), page AS (
+        SELECT turn_item_id, position FROM visible
+        WHERE ${
+          options.itemId === undefined
+            ? sql`position > ${options.afterPosition ?? -1}
+              ${options.view === "activity" ? sql`` : sql`AND type IN ('user_message', 'assistant_message', 'proposed_plan')`}`
+            : sql`turn_item_id = ${options.itemId}`
+        }
+        ORDER BY position ASC LIMIT ${options.limit + 1}
+      )
+      SELECT (SELECT COUNT(*) FROM visible) AS total_items, page.turn_item_id, page.position
+      FROM (SELECT 1) LEFT JOIN page ON 1 ORDER BY page.position ASC`;
+      const page = rows.filter((row) => row.turn_item_id !== null && row.position !== null);
+      const items = yield* Effect.forEach(page.slice(0, options.limit), (row) =>
+        Effect.gen(function* () {
+          const payloads = yield* sql<PayloadRow>`SELECT payload_json FROM ardud_history_turn_items
+            WHERE thread_id = ${threadId} AND turn_item_id = ${row.turn_item_id}`;
+          const decoded = yield* decodeRows(decodeTurnItemPayload, threadId)(payloads);
+          const item = decoded[0];
+          if (item === undefined)
+            return yield* new ProjectionStoreReadError({
+              threadId,
+              cause: "Timeline item disappeared during snapshot",
+            });
+          return {
+            position: row.position!,
+            sourceThreadId: threadId,
+            sourceItemId: TurnItemId.make(row.turn_item_id!),
+            visibility: "local" as const,
+            item,
+          };
+        }),
+      );
+      return { items, totalItems: rows[0]?.total_items ?? 0, hasMore: page.length > options.limit };
+    });
+
     const getTimelinePage: ProjectionStoreV2Shape["getTimelinePage"] = (threadId, options) =>
       sql
         .withTransaction(
           Effect.gen(function* () {
+            const records = yield* getThreadRecords(threadId, []);
+            if (records.thread.forkedFrom?.type !== "run")
+              return yield* readLocalTimelinePage(threadId, options);
             const index = yield* readTimelineIndex(threadId, new Set());
             const matching = index.visible
               .map((row, position) => ({ ...row, position }))

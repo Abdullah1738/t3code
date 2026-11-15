@@ -41,6 +41,41 @@ const evalWorker = (code: string, workerData?: unknown) => {
   return { worker: worker as unknown as ExportWorker, exited };
 };
 
+test("worker diagnostics use the lifecycle log envelope without posting rebuild state", () => {
+  const diagnostics = [
+    { event: "open", sequence: 60_001, identitySequence: 60_001, sourceSequence: 60_002 },
+    { event: "replay", replayEvents: 1, replayMs: 10 },
+  ];
+  const messages: unknown[] = [];
+  const lines: string[] = [];
+  NodeVM.runInNewContext(
+    exportWorkerSource(`(_sqlite, _fs, _path, options) => {
+      for (const event of workerData.diagnostics) options.onDiagnosticEvent(event);
+      return { step: () => false };
+    }`),
+    {
+      require: (name: string) =>
+        name === "node:worker_threads"
+          ? {
+              parentPort: { postMessage: (message: unknown) => messages.push(message) },
+              workerData: { diagnostics },
+            }
+          : {},
+      console: { log: (line: string) => lines.push(line) },
+      setTimeout: () => {},
+    },
+  );
+  assert.deepStrictEqual(
+    lines.map((line) => JSON.parse(line)),
+    diagnostics.map((event) => ({ type: "readonly-export", ...event })),
+  );
+  assert.deepStrictEqual(
+    JSON.parse(JSON.stringify(messages.slice(0, 2))),
+    diagnostics.map((diagnostic) => ({ type: "diagnostic", diagnostic })),
+  );
+  assert.isFalse(messages.some((message) => (message as { type: string }).type === "rebuild"));
+});
+
 it.live("a failing worker reports its stage and error message", () =>
   Effect.gen(function* () {
     const exit = yield* Effect.exit(

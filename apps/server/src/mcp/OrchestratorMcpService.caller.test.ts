@@ -590,10 +590,20 @@ it.effect.each(
     ] as const
   ).flatMap((testCase) =>
     [
-      "command:mcp:delegate-task:environment:caller:retry",
-      "command:mcp:delegate-task:env%3Aone:thread%3Aparent:review%2F%E9%9B%AA%3A1%25",
+      `command:mcp:delegate-task:${encodeURIComponent(scope.environmentId)}:${encodeURIComponent(callerId)}:retry`,
+      `command:mcp:delegate-task:${encodeURIComponent(scope.environmentId)}:${encodeURIComponent(callerId)}:review%2F%E9%9B%AA%3A1%25`,
       "command:mcp:old%3Acredential:delegate-task:review%2F%E9%9B%AA%3A1%25",
-    ].map((command) => ({ ...testCase, command })),
+      "command:mcp:delegate-task:environment:caller:retry",
+    ].map((command) => ({
+      ...testCase,
+      command,
+      message:
+        command === "command:mcp:delegate-task:environment:caller:retry" ||
+        (command.startsWith("command:mcp:old") &&
+          (testCase.state === "never_saved" || testCase.state === "pending"))
+          ? "No delegated task has this id. Check the id; copy it exactly from delegate_task."
+          : testCase.message,
+    })),
   ),
 )(
   "recovers a missing task from its $state command $command for status and cancel",

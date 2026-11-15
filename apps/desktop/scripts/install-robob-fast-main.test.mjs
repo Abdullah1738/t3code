@@ -49,6 +49,7 @@ for (const [reason, code, args] of [
     NodeAssert.equal(await NodeFSP.readFile(foreignHold, "utf8"), originalHold);
     NodeAssert.deepEqual(routes, ["/api/ardud/control/install-report"]);
     NodeAssert.deepEqual(events, [
+      { name: "install_started", readyBudgetS: 180 },
       { name: "failed", error: String(failure), swapped: false },
       { name: "prune_skipped", reason: "failed_before_quit" },
     ]);

@@ -789,9 +789,13 @@ export function planSubtasks(
     known?: KanbanSubtask,
   ) => {
     const previousGate = known && gateOf(known, guessedGates);
+    const inferredGate = inferGate(text);
+    // A sticky guess may differ from the wording that was cleared.
     const keepClear =
       known?.gateCleared !== undefined &&
-      text === known.text &&
+      (inferredGate === undefined ||
+        inferredGate === known.gateCleared.gate ||
+        inferredGate === inferGate(known.text)) &&
       input.gate == null &&
       input.ownerOnly !== true &&
       input.interrupting !== true;
@@ -939,7 +943,7 @@ export function planSubtasks(
         clearing && actor && at
           ? { gate: clearing, reason: reason!, by: actor, at, text }
           : keepClear
-            ? known.gateCleared
+            ? { ...known.gateCleared!, text }
             : undefined;
       // Cosmetic edits keep the approval's time bound, including its absence on legacy plans.
       const approvalChanged =
