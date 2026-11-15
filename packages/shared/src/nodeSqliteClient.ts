@@ -149,14 +149,17 @@ interface Acquired {
 }
 
 /** Request-local acquisition accounting, independent of tracing and statement sampling. */
-export const ReaderWaitObserver = Context.Reference<((waitMs: number) => void) | undefined>(
-  "@t3tools/shared/nodeSqliteClient/ReaderWaitObserver",
-  { defaultValue: () => undefined },
-);
+export const ReaderWaitObserver = Context.Reference<
+  ((waitMs: number, lane?: ReaderLaneName) => void) | undefined
+>("@t3tools/shared/nodeSqliteClient/ReaderWaitObserver", { defaultValue: () => undefined });
 
-const reportReaderWait = (fiber: Fiber.Fiber<unknown, unknown>, waitMs: number) => {
+const reportReaderWait = (
+  fiber: Fiber.Fiber<unknown, unknown>,
+  waitMs: number,
+  lane?: ReaderLaneName,
+) => {
   try {
-    fiber.getRef(ReaderWaitObserver)?.(waitMs);
+    fiber.getRef(ReaderWaitObserver)?.(waitMs, lane);
   } catch {
     // Observation must not change SQL acquisition or its exit.
   }
@@ -242,6 +245,11 @@ export interface SqliteStatementObservation {
   readonly waitMs?: number;
 }
 
+/** Request timing taps leave the client's configured slow-statement observer in place. */
+export const StatementTimingObserver = Context.Reference<
+  ((observation: SqliteStatementObservation) => void) | undefined
+>("@t3tools/shared/nodeSqliteClient/StatementTimingObserver", { defaultValue: () => undefined });
+
 export interface SqliteStatementObserver {
   readonly slowThresholdMs: number;
   readonly record: (observation: SqliteStatementObservation) => Effect.Effect<void>;
@@ -282,14 +290,34 @@ const observeStatement = <A, E, R>(
       }
     }
     const observer = fiber.getRef(StatementObserver) ?? fallback;
-    if (observer === undefined || fiber.getRef(observingStatement)) return effect;
+    const timingObserver = fiber.getRef(StatementTimingObserver);
+    if (
+      (observer === undefined && timingObserver === undefined) ||
+      fiber.getRef(observingStatement)
+    )
+      return effect;
     const clock = fiber.getRef(Clock.Clock);
     const started = clock.monotonicTimeNanosUnsafe();
     return effect.pipe(
       Effect.onExit((exit) =>
         Effect.suspend(() => {
           const durationMs = Math.max(0, Number(clock.monotonicTimeNanosUnsafe() - started) / 1e6);
-          if (durationMs < observer.slowThresholdMs) return Effect.void;
+          try {
+            timingObserver?.({
+              operation: operation(),
+              connection,
+              durationMs,
+              ...(lane === undefined ? {} : { lane }),
+              outcome: Exit.isSuccess(exit)
+                ? "success"
+                : Exit.hasInterrupts(exit)
+                  ? "interrupt"
+                  : "failure",
+            });
+          } catch {
+            // Timing cannot change a statement's exit or suppress the configured observer.
+          }
+          if (observer === undefined || durationMs < observer.slowThresholdMs) return Effect.void;
           const parent = Context.getOrUndefined(fiber.context, Tracer.ParentSpan);
           let current = parent;
           let span: string | undefined;
@@ -2885,7 +2913,8 @@ const make = Effect.fn("makeWithDatabase")(function* (
           const useConnection = Effect.suspend(() => {
             started = true;
             const grant = acquired(target, clock, start);
-            if (target.name === "reader") reportReaderWait(requestFiber, grant.lockWaitMs);
+            if (target.name === "reader")
+              reportReaderWait(requestFiber, grant.lockWaitMs, target.lane);
             if (traced) annotateAcquired(fiber, grant);
             if (target.name !== "reader")
               return Effect.andThen(connection.ensure, use(target.connection));
@@ -2953,7 +2982,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
         Effect.onExit(() =>
           Effect.sync(() => {
             if (!started && requestFiber.getRef(ReadOnly))
-              reportReaderWait(requestFiber, holdMs(clock, start));
+              reportReaderWait(requestFiber, holdMs(clock, start), requestFiber.getRef(ReaderLane));
           }),
         ),
       );
@@ -2980,7 +3009,8 @@ const make = Effect.fn("makeWithDatabase")(function* (
         const acquire = Effect.tap((pending?.restore ?? restore)(target.lock.take(1)), () => {
           const grant = acquired(target, clock, start);
           acquiredSlot = true;
-          if (target.name === "reader") reportReaderWait(requestFiber, grant.lockWaitMs);
+          if (target.name === "reader")
+            reportReaderWait(requestFiber, grant.lockWaitMs, target.lane);
           if (pending !== undefined) pending.acquired = grant;
           if (
             pending !== undefined &&
@@ -3025,7 +3055,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
       Effect.onExit(() =>
         Effect.sync(() => {
           if (!acquiredSlot && requestFiber.getRef(ReadOnly))
-            reportReaderWait(requestFiber, holdMs(clock, start));
+            reportReaderWait(requestFiber, holdMs(clock, start), requestFiber.getRef(ReaderLane));
         }),
       ),
     );

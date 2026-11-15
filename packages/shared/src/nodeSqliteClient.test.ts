@@ -423,6 +423,7 @@ for (const [name, clientLayer] of [
         Effect.gen(function* () {
           const sql = yield* SqlClient.SqlClient;
           const observed: SqliteClient.SqliteStatementObservation[] = [];
+          const timings: SqliteClient.SqliteStatementObservation[] = [];
           const observer: SqliteClient.SqliteStatementObserver = {
             slowThresholdMs: 0,
             record: (entry) =>
@@ -439,7 +440,14 @@ for (const [name, clientLayer] of [
             );
           }).pipe(
             Effect.provideService(SqliteClient.StatementObserver, observer),
+            Effect.provideService(SqliteClient.StatementTimingObserver, (entry) => {
+              timings.push(entry);
+            }),
             Effect.withSpan("ObservedService.query"),
+          );
+          assert.deepEqual(
+            timings.map((entry) => [entry.operation, entry.connection, entry.outcome]),
+            observed.map((entry) => [entry.operation, entry.connection, entry.outcome]),
           );
           assert.deepEqual(
             observed.map((entry) => [entry.operation, entry.connection, entry.outcome]),
@@ -644,8 +652,17 @@ it.effect("observes worker-reader statements with their lane and no query conten
   withReaderClient((sql) =>
     Effect.gen(function* () {
       const observed: SqliteClient.SqliteStatementObservation[] = [];
+      const timings: SqliteClient.SqliteStatementObservation[] = [];
+      const acquiredLanes: Array<SqliteClient.ReaderLaneName | undefined> = [];
       const rows = yield* sql`SELECT name FROM entries`.pipe(
         SqliteClient.readOnly,
+        Effect.provideService(SqliteClient.StatementTimingObserver, (entry) => {
+          timings.push(entry);
+        }),
+        Effect.provideService(SqliteClient.ReaderWaitObserver, (ms, lane) => {
+          assert.isAtLeast(ms, 0);
+          acquiredLanes.push(lane);
+        }),
         Effect.provideService(SqliteClient.StatementObserver, {
           slowThresholdMs: 0,
           record: (entry) =>
@@ -659,6 +676,12 @@ it.effect("observes worker-reader statements with their lane and no query conten
         observed.map((entry) => [entry.operation, entry.connection, entry.lane]),
         [["read", "reader", "background"]],
       );
+      assert.deepEqual(acquiredLanes, ["background"]);
+      assert.deepEqual(
+        timings.map((entry) => [entry.operation, entry.connection, entry.lane]),
+        [["read", "reader", "background"]],
+      );
+      assert.equal(timings[0]?.durationMs, observed[0]?.durationMs);
       assert.isFalse(JSON.stringify(observed).includes("entries"));
     }),
   ),

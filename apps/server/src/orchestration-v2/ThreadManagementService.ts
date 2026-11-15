@@ -408,6 +408,7 @@ export interface ThreadManagementServiceShape {
   }) => Effect.Effect<OrchestrationV2ThreadProjection, ThreadManagementError>;
   readonly listActiveThreadIds: Orchestrator.OrchestratorV2["Service"]["listActiveThreadIds"];
   readonly getShellSnapshot: (options?: {
+    readonly summaryOnly?: boolean;
     readonly location?: "active" | "archive";
     /** Only these threads, read with one indexed IN list (control live lists). */
     readonly threadIds?: ReadonlyArray<string>;
