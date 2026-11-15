@@ -1897,6 +1897,50 @@ it.effect("keeps WAL backpressure active before startup activation", () =>
   ),
 );
 
+it.effect(
+  "attributes a blocked pre-BEGIN checkpoint separately from transaction work",
+  () => {
+    const spans: Tracer.NativeSpan[] = [];
+    const tracer = Tracer.make({
+      span: (options) => {
+        const span = new Tracer.NativeSpan(options);
+        spans.push(span);
+        return span;
+      },
+    });
+    return withCheckpointClient((sql, filename) =>
+      Effect.gen(function* () {
+        const worker = startedWorkers.at(-1)!;
+        const { reader, checkpointRequests } = yield* blockCheckpointBehindReader(
+          sql,
+          filename,
+          worker,
+        );
+        const bodyEntered = yield* Deferred.make<void>();
+        const waiting = writerWaiting(writerWorkers.at(-1)!);
+        const transaction = yield* sql
+          .withTransaction(
+            Deferred.succeed(bodyEntered, undefined).pipe(
+              Effect.andThen(sql`INSERT INTO entries VALUES (1)`),
+            ),
+          )
+          .pipe(Effect.withTracer(tracer), Effect.forkChild);
+        yield* Effect.promise(() => waiting);
+        assert.isUndefined(transaction.pollUnsafe());
+        assert.isFalse(yield* Deferred.isDone(bodyEntered));
+        reader.exec("ROLLBACK");
+        checkpointRequests.release();
+        yield* Fiber.join(transaction);
+        assert.isTrue(yield* Deferred.isDone(bodyEntered));
+        const span = spans.find((span) => span.name === "sql.transaction")!;
+        assert.isAbove(Number(span.attributes.get("db.writer.checkpoint_wait_ms")), 0);
+        assert.deepEqual(yield* sql`SELECT value FROM entries`, [{ value: 1 }]);
+      }),
+    );
+  },
+  { skip: !supportsNoopCheckpoint },
+);
+
 it.effect("checkpoints the WAL on the worker instead of the writer", () =>
   withCheckpointClient((sql, filename) =>
     Effect.gen(function* () {

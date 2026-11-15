@@ -1755,6 +1755,7 @@ const startCheckpoint = () => {
   checkpoint = {
     check,
     async admit(id) {
+      const started = gated() ? performance.now() : undefined;
       while (gated()) {
         if (isCancelled(id)) throw new Error("SQLite request cancelled before execution");
         parentPort.postMessage({ waiting: id });
@@ -1762,6 +1763,7 @@ const startCheckpoint = () => {
         await new Promise(resolve => { wakeAdmission = resolve; request(true); if (!gated()) resolve(); });
       }
       child.unref();
+      return started === undefined ? 0 : performance.now() - started;
     },
     async close() { stopped = true; truncate = undefined; wakeAdmission(); await child.terminate(); },
   };
@@ -1794,6 +1796,7 @@ parentPort.on("message", (request) => {
   let elapsedMs;
   let controlStarted;
   let controlMs;
+  let checkpointWaitMs = 0;
   let priorRecovery = {};
   let classification;
   let executed = false;
@@ -1842,7 +1845,7 @@ parentPort.on("message", (request) => {
     schemaDirty ||= Boolean(classifications.get(statement)?.schema) || typeof db.setAuthorizer !== "function";
     elapsedMs = performance.now() - executionStarted;
     executionStarted = undefined;
-    if (classifications.get(statement)?.write) await checkpoint?.admit(id);
+    if (classifications.get(statement)?.write) checkpointWaitMs = await checkpoint?.admit(id) ?? 0;
     if (isCancelled(id)) throw new Error("SQLite request cancelled before execution");
     operation = "execute";
     statement.setReadBigInts(safeIntegers);
@@ -1867,7 +1870,7 @@ parentPort.on("message", (request) => {
     }
     const committed = !db.isTransaction && /^\\s*(?:COMMIT|END|INSERT|UPDATE|DELETE|REPLACE)\\b/i.test(statement.sourceSQL);
     const committedTransaction = committed && /^\\s*(?:COMMIT|END)\\s*;?\\s*$/i.test(statement.sourceSQL);
-    parentPort.postMessage({ id, rows, committed, committedTransaction, write: observedWrite, elapsedMs, controlMs,
+    parentPort.postMessage({ id, rows, committed, committedTransaction, write: observedWrite, elapsedMs, controlMs, checkpointWaitMs,
       inTransaction: db.isTransaction,
       ...priorRecovery, ...recoverySnapshot(classification, sql, params, statement.expandedSQL) });
   } catch (error) {
@@ -1875,7 +1878,7 @@ parentPort.on("message", (request) => {
     const statementElapsed = executionStarted === undefined ? elapsedMs : (elapsedMs ?? 0) + performance.now() - executionStarted;
     if (controlStarted !== undefined && controlMs === undefined) controlMs = performance.now() - controlStarted;
     const snapshot = db ? { ...priorRecovery, ...recoverySnapshot(classification && { ...classification, attachment: executed && classification.attachment }, sql, params) } : {};
-    errorReply(id, error, operation, { ...snapshot, inTransaction: db?.isTransaction ?? false, write: observedWrite, elapsedMs: statementElapsed, controlMs });
+    errorReply(id, error, operation, { ...snapshot, inTransaction: db?.isTransaction ?? false, write: observedWrite, elapsedMs: statementElapsed, controlMs, checkpointWaitMs });
   } finally {
     // Authorizer classification covers CTE/commented writes; transaction state
     // covers RELEASE/ROLLBACK. OR FAIL may persist rows despite throwing.
@@ -1933,6 +1936,7 @@ const makeWriterSession = Effect.fnUntraced(function* (
     readonly committedTransaction?: boolean;
     readonly elapsedMs?: number;
     readonly controlMs?: number;
+    readonly checkpointWaitMs?: number;
     readonly write?: boolean;
   } & (
       | { readonly rows: ReadonlyArray<any> }
@@ -2059,6 +2063,19 @@ const makeWriterSession = Effect.fnUntraced(function* (
           onClassification?.(reply.write ?? false);
           const currentSpan = Context.getOrUndefined(fiber.context, Tracer.ParentSpan);
           try {
+            // The writer permit includes pre-BEGIN WAL admission. Keep that wait
+            // distinct from SQLite execution and the transaction body's work.
+            if (reply.checkpointWaitMs !== undefined && reply.checkpointWaitMs > 0) {
+              const transactionSpan = fiber.getRef(TransactionAcquire)?.span;
+              for (const span of new Set([currentSpan, transactionSpan])) {
+                if (span?._tag === "Span")
+                  span.attribute(
+                    "db.writer.checkpoint_wait_ms",
+                    Number(span.attributes.get("db.writer.checkpoint_wait_ms") ?? 0) +
+                      reply.checkpointWaitMs,
+                  );
+              }
+            }
             if (
               fiber.getRef(References.TracerEnabled) &&
               fiber.getRef(Statement.SpanPropagationEnabled) &&
