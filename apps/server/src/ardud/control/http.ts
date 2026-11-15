@@ -1,5 +1,5 @@
 import * as DatabaseDiagnostics from "../../persistence/DatabaseDiagnostics.ts";
-import { continuationReport } from "../fast-install/report.ts";
+import { bootId, continuationReport } from "../fast-install/report.ts";
 import * as StartupPhaseLog from "../observability/StartupPhaseLog.ts";
 /**
  * Local control API for external integrations (iMessage and Telegram bridges,
@@ -1804,6 +1804,7 @@ const makeRoutes = Effect.gen(function* () {
       time: DateTime.formatIso(yield* DateTime.now),
       buildCommit,
       serverStartedAt,
+      bootId,
     });
   });
 

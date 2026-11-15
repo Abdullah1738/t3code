@@ -16,6 +16,74 @@ import * as BoardLocks from "./boardLocks.ts";
 import * as SavedReply from "../tools/savedReply.ts";
 import { McpSchema } from "effect/ai";
 
+it.effect.each(
+  (["gate", "card", "migration"] as const).flatMap((lock) =>
+    [4_900, 5_000, 8_195].map((heldMs) => ({ lock, heldMs })),
+  ),
+)("#1539 logs a $lock hold of $heldMs ms as a complete holder row", ({ lock, heldMs }) => {
+  const logs: Array<{ line: string; annotations: Readonly<Record<string, unknown>> }> = [];
+  const logger = Logger.make(({ fiber, message }) => {
+    if (String(message).includes('"event":"kanban board lock long hold"'))
+      logs.push({
+        line: String(message),
+        annotations: fiber.getRef(References.CurrentLogAnnotations),
+      });
+  });
+  return Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const entered = yield* Deferred.make<void>();
+    const finish = yield* Deferred.make<void>();
+    const body = Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(finish)));
+    const hold =
+      lock === "migration"
+        ? locks.exclusive(body)
+        : lock === "card"
+          ? locks.run(locks.access("robob", body), "card-1539")
+          : locks.board("robob", body);
+    const holder = yield* Effect.forkChild(
+      hold.pipe(Effect.provideService(BoardLocks.operationName, "card.reviewResult")),
+    );
+    yield* Deferred.await(entered);
+    const waiter = yield* Effect.forkChild(
+      lock === "card"
+        ? locks.run(locks.access("robob", Effect.void), "card-1539")
+        : locks.board("robob", Effect.void),
+    );
+    yield* TestClock.adjust(0);
+    assert.isUndefined(waiter.pollUnsafe());
+    yield* TestClock.adjust(heldMs);
+    yield* Deferred.succeed(finish, undefined);
+    yield* Fiber.join(holder);
+    yield* Fiber.join(waiter);
+    assert.deepStrictEqual(yield* locks.holders, []);
+    if (heldMs < 5_000) {
+      assert.lengthOf(logs, 0);
+      return;
+    }
+    assert.lengthOf(logs, 1);
+    const fields = {
+      "board.observed_at_ms": heldMs,
+      "board.id": lock === "migration" ? "*" : "robob",
+      "board.holder": "card.reviewResult",
+      "board.card_id": lock === "card" ? "card-1539" : null,
+      "board.lock": lock,
+      "board.mode": "exclusive",
+      "board.acquired_at_ms": 0,
+      "board.held_ms": heldMs,
+      "board.waiters": 1,
+    };
+    assert.deepStrictEqual(JSON.parse(logs[0]!.line), {
+      event: "kanban board lock long hold",
+      ...fields,
+    });
+    assert.deepInclude(logs[0]!.annotations, { ...fields, "board.lock_log": true });
+    assert.notProperty(logs[0]!.annotations, "board.waiting_on");
+  }).pipe(
+    Effect.provideService(References.MinimumLogLevel, "None"),
+    Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+  );
+});
+
 it.effect("#566 a committed re-acquire timeout never advertises a safe retry", () =>
   Effect.gen(function* () {
     const locks = yield* BoardLocks.make();

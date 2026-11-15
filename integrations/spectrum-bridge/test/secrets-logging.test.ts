@@ -184,6 +184,7 @@ test.each([
   { message: "database is locked", code: 123456, errno: 654321, status: 123 },
   { message: "out of memory", code: "tokenExpired", errno: "tokenExpired", status: 456 },
   { message: secret, code: "PRIVATE_CODE_SENTINEL", errno: "PRIVATE_ERRNO_SENTINEL", status: 599 },
+  { message: secret, code: "PRIVATE_YEAR_CODE_SENTINEL", errno: "PRIVATE_ERRNO_SENTINEL", status: new Date().getUTCFullYear() },
 ])("secret errors exclude prose and non-errno diagnostics: $code", async detail => {
   const cause = Object.assign(new TypeError(detail.message), detail, { path: "PRIVATE_PATH_SENTINEL" });
   cause.stack = `${cause.name}: ${cause.message}\n    at /private/PRIVATE_PATH_SENTINEL/spectrum-bridge/src/secrets.ts:42:5`;
@@ -192,8 +193,9 @@ test.each([
   const logged = await lines();
   expect(logged.map(line => line.error)).toEqual([{ tag: "secrets.catch9", name: "TypeError", message: "[redacted]", stack: ["src/secrets.ts:42"] }]);
   expect(logged[0]?.site).toMatch(/^src\/secrets\.ts:\d+$/);
-  for (const value of [String(detail.code), String(detail.errno), String(detail.status), detail.message, "PRIVATE_PATH_SENTINEL"]) {
-    expect(JSON.stringify(logged)).not.toContain(value);
+  // The exact error shape checks numeric diagnostics; their digits can occur in timestamps and UUIDs.
+  for (const value of [detail.code, detail.errno, detail.status, detail.message, "PRIVATE_PATH_SENTINEL"]) {
+    if (typeof value === "string") expect(JSON.stringify(logged)).not.toContain(value);
   }
 });
 
@@ -212,7 +214,7 @@ test("secret errors retain redacted external frames without the original paths",
   const fail = spyOn(fs, "readdir").mockRejectedValueOnce(cause);
   try { await sweepSecrets(deps()); } finally { fail.mockRestore(); }
   const logged = await lines();
-  expect(logged[0]?.error).toEqual({ tag: "secrets.catch9", name: "Error", message: "[redacted]", stack: ["<external>:12", "<external>:34"] });
+  expect(logged[0]?.error).toEqual({ tag: "secrets.catch9", name: "Error", message: "[redacted]", causeKey: "callsite_failure", stack: ["<external>:12", "<external>:34"] });
   for (const value of [secret, "PRIVATE_PATH_SENTINEL", "one.js", "two.js"]) expect(JSON.stringify(logged)).not.toContain(value);
 });
 

@@ -1,7 +1,7 @@
 #!/bin/zsh -f
 # Install a Robob desktop build and resume the threads that were running.
 #
-#   zsh install-robob-resume.zsh [--dmg PATH] [--exclude THREAD_ID]... [--restart-opencode]
+#   zsh install-robob-resume.zsh [--ready-budget-s N] [--dmg PATH] [--exclude THREAD_ID]... [--restart-opencode]
 #   zsh install-robob-resume.zsh --resume-only [SNAPSHOT.json]  # resend; defaults to pending.json
 #   zsh install-robob-resume.zsh --dry-run                      # only show what it would snapshot and resume
 #   zsh install-robob-resume.zsh --before-launch 'CMD'          # run CMD once Robob is closed, before the install
@@ -41,9 +41,14 @@ RESUME_FILE=""
 DRY_RUN=0
 RESTART_OPENCODE=0
 BEFORE_LAUNCH=""
+READY_BUDGET_S=180 READY_BUDGET_SET=0
+READINESS_JS=${0:A:h}/../../../apps/desktop/scripts/install-readiness.mjs
 typeset -a EXCLUDE
 while (( $# )); do
   case $1 in
+    --ready-budget-s)
+      (( $# >= 2 && ! READY_BUDGET_SET )) || { print -u2 -- '--ready-budget-s needs one value'; exit 2; }
+      READY_BUDGET_S=$2 READY_BUDGET_SET=1; shift 2 ;;
     --dmg) DMG=$2; shift 2 ;;
     --exclude) EXCLUDE+=($2); shift 2 ;;
     --resume-only)
@@ -58,15 +63,18 @@ while (( $# )); do
   esac
 done
 
+unset BUN_INSPECT
+if ! command -v node >/dev/null 2>&1; then
+  export NVM_DIR=${NVM_DIR:-$HOME/.nvm}
+  source "$NVM_DIR/nvm.sh" >/dev/null 2>&1 || true
+fi
+command -v node >/dev/null 2>&1 || { print -u2 "node not found"; exit 1; }
+
+READY_BUDGET_S=$(node "$READINESS_JS" validate "$READY_BUDGET_S") || exit 2
+
 OPEN_CLEAN=${0:A:h}/open-robob-clean.zsh
 [[ -f $OPEN_CLEAN ]] || { print -u2 "missing $OPEN_CLEAN (opens Robob with a clean environment)"; exit 1; }
 
-unset BUN_INSPECT
-if ! command -v node >/dev/null 2>&1; then
-  export NVM_DIR=$HOME/.nvm
-  source $NVM_DIR/nvm.sh >/dev/null 2>&1 || true
-fi
-command -v node >/dev/null 2>&1 || { print -u2 "node not found"; exit 1; }
 t3ctl() { node $T3CTL_JS "$@"; }
 py() { /usr/bin/python3 "$@"; }
 # A dry run must not add to the real pending list, or write anything under
@@ -275,6 +283,11 @@ fi
 
 # 1. Snapshot, merged into pending.json.
 STAMP=$(date +%Y%m%d-%H%M%S)
+if (( ! DRY_RUN )); then
+  OLD_BOOT_ID=$(node "$READINESS_JS" boot-id "$HOME/.robob/userdata/logs/boot.ndjson") || OLD_BOOT_ID=""
+  print -r -- "{\"phase\":\"install_started\",\"readyBudgetS\":$READY_BUDGET_S,\"at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" \
+    | tee -a "${ROBOB_INSTALL_LOG:-$HOME/.robob/install-$STAMP.ndjson}"
+fi
 RAW=$(mktemp $SNAP_DIR/.threads.XXXXXX)
 if t3ctl threads --active --limit 500 > $RAW 2>/dev/null \
   && py - $RAW $PENDING $SNAP_DIR/$STAMP.json ${EXCLUDE[@]} <<'PY'
@@ -376,14 +389,14 @@ wait_until_closed() {
     sleep 1
   done
   if (( UNATTENDED )); then
-    # Give them three more minutes, then TERM, then KILL whatever is left.
-    for i in {1..180}; do
+    # Give them the configured grace, then TERM, then KILL whatever is left.
+    for (( i=0; i<READY_BUDGET_S; i++ )); do
       pids=(${(f)"$($list_fn)"})
       (( ${#pids} == 0 )) && { print "All $what processes are closed."; return 0; }
       sleep 1
     done
     pids=(${(f)"$($list_fn)"})
-    print -u2 "Unattended: ${#pids} $what process(es) still running after 4+ minutes; stopping them:"
+    print -u2 "Unattended: ${#pids} $what process(es) still running after grace + $READY_BUDGET_S s; stopping them:"
     ps -o pid=,command= -p ${(j:,:)pids} 2>/dev/null | cut -c1-160 >&2 || true
     kill -TERM $pids 2>/dev/null || true
     sleep 20
@@ -470,7 +483,7 @@ if (( RESTART_OPENCODE )); then
   launchctl bootstrap gui/$UID $OC_PLIST 2>/dev/null || launchctl kickstart gui/$UID/$OC_LABEL 2>/dev/null || true
   PW=$(cat $HOME/.config/opencode-service/password)
   print -n "Waiting for OpenCode"
-  for i in {1..90}; do
+  for (( i=0; i<READY_BUDGET_S; i+=2 )); do
     if curl -fsS -u opencode:$PW http://127.0.0.1:49374/api/info >/dev/null 2>&1; then
       print " up."
       break
@@ -493,8 +506,17 @@ open_robob
 # before it answers (0.1.0 on the 75 GB database: about half an hour).
 print "Waiting for the Robob server (a first start after an upgrade can take 30 minutes or more)"
 WAIT_START=$SECONDS
+BUDGET_REPORTED=0
 until t3ctl health >/dev/null 2>&1; do
   sleep 5
+  if (( ! BUDGET_REPORTED && SECONDS - WAIT_START >= READY_BUDGET_S )); then
+    BUDGET_REPORTED=1
+    boot=$(node "$READINESS_JS" boot-phase "$HOME/.robob/userdata/logs/boot.ndjson" "$OLD_BOOT_ID") \
+      || boot='{"unavailable":"diagnostic_failed"}'
+    print -r -- "{\"phase\":\"recovery_waiting\",\"readyBudgetS\":$READY_BUDGET_S,\"boot\":$boot}" \
+      | tee -a "${ROBOB_INSTALL_LOG:-$HOME/.robob/install-$STAMP.ndjson}" \
+      || { print -u2 'Could not write recovery diagnostic; keeping the install heartbeat.' || true; }
+  fi
   if (( (SECONDS - WAIT_START) % 60 < 5 )); then
     print "  still starting, $(( (SECONDS - WAIT_START) / 60 )) min so far"
   fi

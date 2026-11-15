@@ -45,6 +45,7 @@ import {
   type KanbanBoard,
   type KanbanLink,
   type ModelSelection,
+  type OrchestrationV2ProviderFailure,
 } from "@t3tools/contracts";
 
 import * as ServerConfig from "../../../config.ts";
@@ -98,6 +99,11 @@ const makeWorld = (
   );
   const threads = new Map<string, FakeThread>();
   const rejectedAssignments = new Set<string>();
+  const queued = new Set<string>();
+  const background = new Set<string>();
+  const failures = new Map<string, OrchestrationV2ProviderFailure & { runId: string }>();
+  const statuses = new Map<string, string>();
+  const probe = { ready: false, calls: 0 };
   /** The PRs a work thread tracks, as its view reports them. */
   const prs = new Map<string, ReadonlyArray<KanbanThreadPr>>();
   /** What the host answers when the wait PR reader asks. A PR not listed could not be read. */
@@ -249,7 +255,7 @@ const makeWorld = (
         quietSince: iso(T0),
         runStartedAt: null,
         lastActivityAt: null,
-        backgroundWork: 0,
+        backgroundWork: background.has(threadId) ? 1 : 0,
         prWatches: 0,
         prs: prs.get(threadId) ?? [],
         archived: false,
@@ -263,9 +269,12 @@ const makeWorld = (
       claimContext: () => Effect.succeed(null),
       view,
       find: view,
-      lastFailure: () => Effect.succeed(null),
-      findLastFailure: () => Effect.succeed(null),
-      latestRun: () => Effect.succeed(null),
+      lastFailure: (id) => Effect.sync(() => failures.get(id) ?? null),
+      findLastFailure: (id) => Effect.sync(() => failures.get(id) ?? null),
+      latestRun: (id) =>
+        Effect.sync(() =>
+          statuses.has(id) ? { runId: "run-1", status: statuses.get(id)!, message: null } : null,
+        ),
       runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       launch: (input) =>
@@ -304,7 +313,8 @@ const makeWorld = (
           const thread = threads.get(threadId);
           if (thread) threads.set(threadId, { ...thread, model });
         }),
-      queuedRuns: () => Effect.succeed([]),
+      queuedRuns: (id) =>
+        Effect.sync(() => (queued.has(id) ? [{ status: "queued" } as never] : [])),
       cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,
     }),
@@ -395,7 +405,17 @@ const makeWorld = (
               }),
           }),
     ),
-    Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
+    Layer.provideMerge(
+      Layer.mock(TextGeneration.TextGeneration)({
+        generateJson: (input) =>
+          Effect.suspend(() => {
+            probe.calls++;
+            return probe.ready
+              ? Schema.decodeUnknownEffect(input.outputSchema)({ ok: true }).pipe(Effect.orDie)
+              : Effect.die("provider is still down");
+          }),
+      }),
+    ),
     Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
     Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
     Layer.provideMerge(
@@ -413,6 +433,11 @@ const makeWorld = (
   return {
     threads,
     rejectedAssignments,
+    queued,
+    background,
+    failures,
+    statuses,
+    probe,
     prs,
     host,
     gate,
@@ -557,6 +582,285 @@ it.effect("push: a new head after the wait was set sends the card back to its re
       );
       assert.include(briefOf(world, woken), "author to fix the rounding");
       assert.strictEqual(world.toldEvaluator("no longer waiting"), 0);
+    }),
+  ),
+);
+
+const deferredWorker = Effect.gen(function* () {
+  const { kanban, store, board } = yield* setup;
+  const card = yield* placed(board, "Wait for parent", { links: [tracked(PR)] });
+  yield* kanban.dispatchNow;
+  const worker = (yield* cardOf(card.id)).workThreadId!;
+  const actor: KanbanActor = { _tag: "thread", threadId: worker };
+  yield* kanban.waitCard(
+    card.id,
+    {
+      on: "merge",
+      pr: PR,
+      note: "finish after the parent lands",
+      wakeRole: "work",
+    },
+    actor,
+  );
+  return { kanban, store, board, card, worker, actor };
+});
+
+it.effect.each(["completed", "failed", "interrupted"] as const)(
+  "a worker's deferred merge wait parks after a %s turn and wakes the same worker",
+  (status) =>
+    inWorld((world) =>
+      Effect.gen(function* () {
+        const { kanban, card, worker } = yield* deferredWorker;
+        world.threads.get(worker)!.running = true;
+        const owned = yield* cardOf(card.id);
+        assert.strictEqual(owned.activeThreadId, worker);
+        assert.strictEqual(owned.stage, "working");
+        const refused = yield* kanban.answerWaits(
+          owned.boardId,
+          [{ card: card.id, answer: { result: "wake", note: "parent ready" }, script: null }],
+          owner,
+        );
+        assert.isFalse(refused[0]!.ok);
+        yield* kanban.tick;
+        assert.isDefined((yield* cardOf(card.id)).wait);
+        world.threads.get(worker)!.running = false;
+        world.statuses.set(worker, status);
+        if (status === "failed")
+          world.failures.set(worker, {
+            class: "provider_error",
+            message: "tool failed",
+            code: null,
+            retryable: false,
+            category: "unknown",
+            runId: "run-1",
+          });
+        yield* kanban.turnEnded(worker);
+        const parked = yield* cardOf(card.id);
+        assert.strictEqual(parked.stage, "todo");
+        assert.isNull(parked.activeThreadId);
+        assert.isNull(parked.activeRole);
+        assert.isNull(parked.activePool);
+        assert.strictEqual(parked.workThreadId, worker);
+        assert.isNull(parked.stalled);
+        assert.isDefined(parked.wait);
+        assert.strictEqual(world.said("still in Working"), 0);
+        world.failures.delete(worker);
+        world.host.readings = [{ url: PR, state: "merged", at: iso(T0) }];
+        yield* kanban.tick;
+        const woke = yield* cardOf(card.id);
+        assert.isUndefined(woke.wait);
+        assert.strictEqual(woke.activeThreadId, worker);
+        assert.strictEqual(world.cardThreads(), 1);
+        assert.isTrue(
+          world.threads
+            .get(worker)!
+            .messages.some((text) => text.includes("finish after the parent lands")),
+        );
+      }),
+    ),
+);
+
+it.effect.each(
+  (["queued", "background", "both"] as const).flatMap((pending) =>
+    (["provider", "runtime"] as const).map((failure) => ({ pending, failure })),
+  ),
+)(
+  "a $failure-failed worker keeps its deferred wait while $pending work is pending",
+  ({ pending, failure }) =>
+    inWorld((world) =>
+      Effect.gen(function* () {
+        const { kanban, card, worker } = yield* deferredWorker;
+        const work = pending === "background" ? world.background : world.queued;
+        work.add(worker);
+        if (pending === "both") world.background.add(worker);
+        world.failures.set(worker, {
+          class: failure === "runtime" ? "transport_error" : "provider_error",
+          category: "unknown",
+          message: "tool failed",
+          code: failure === "runtime" ? "codex.runtime_lost" : null,
+          retryable: failure === "runtime",
+          runId: "run-1",
+        });
+        yield* kanban.turnEnded(worker);
+        const held = yield* cardOf(card.id);
+        assert.strictEqual(held.stage, "working");
+        assert.strictEqual(held.activeThreadId, worker);
+        assert.isNull(held.stalled);
+        assert.isDefined(held.wait);
+        yield* TestClock.adjust(2 * MINUTE);
+        yield* kanban.tick;
+        assert.strictEqual((yield* cardOf(card.id)).activeThreadId, worker);
+        assert.strictEqual(world.said("still in Working"), 0);
+        assert.strictEqual(world.said("tool-host or provider-runtime failure"), 0);
+        work.delete(worker);
+        world.background.delete(worker);
+        yield* kanban.turnEnded(worker);
+        const parked = yield* cardOf(card.id);
+        assert.strictEqual(parked.stage, "todo");
+        assert.isNull(parked.activeThreadId);
+        assert.isNull(parked.stalled);
+        assert.isDefined(parked.wait);
+        world.failures.delete(worker);
+        world.host.readings = [{ url: PR, state: "merged", at: iso(T0) }];
+        yield* kanban.tick;
+        const woke = yield* cardOf(card.id);
+        assert.strictEqual(woke.activeThreadId, worker);
+        assert.isUndefined(woke.wait);
+        assert.isTrue(
+          world.threads
+            .get(worker)!
+            .messages.some((text) => text.includes("finish after the parent lands")),
+        );
+      }),
+    ),
+);
+
+it.effect.each(
+  (["quota", "transient", "auth_expired"] as const).flatMap((category) =>
+    (["queued", "background", "both"] as const).map((pending) => ({ category, pending })),
+  ),
+)("a $category-paused worker parks its wait after $pending work drains", ({ category, pending }) =>
+  inWorld((world) =>
+    Effect.gen(function* () {
+      const { kanban, store, card, worker } = yield* deferredWorker;
+      if (pending !== "background") world.queued.add(worker);
+      if (pending !== "queued") world.background.add(worker);
+      world.failures.set(worker, {
+        class: category === "quota" ? "usage_limit" : "provider_error",
+        category,
+        message: "provider unavailable",
+        code: null,
+        retryable: true,
+        runId: "run-1",
+      });
+      yield* kanban.turnEnded(worker);
+      assert.isNotNull((yield* store.threadLink(worker))?.paused);
+      yield* kanban.tick;
+      assert.strictEqual((yield* cardOf(card.id)).activeThreadId, worker);
+      world.queued.delete(worker);
+      world.background.delete(worker);
+      world.host.readings = [{ url: PR, state: "open", at: iso(T0) }];
+      yield* kanban.tick;
+      const parked = yield* cardOf(card.id);
+      assert.strictEqual(parked.stage, "todo");
+      assert.isNull(parked.activeThreadId);
+      assert.isNull(parked.activePool);
+      assert.strictEqual(parked.workThreadId, worker);
+      assert.isNull(parked.stalled);
+      assert.isDefined(parked.wait);
+      assert.strictEqual(world.said("still in Working"), 0);
+      assert.strictEqual(world.probe.calls, 0);
+      yield* TestClock.adjust(3 * MINUTE);
+      world.host.readings = [{ url: PR, state: "merged", at: iso(T0 + 3 * MINUTE) }];
+      yield* kanban.tick;
+      const ready = yield* cardOf(card.id);
+      assert.isUndefined(ready.wait);
+      assert.include(ready.wakeNote ?? "", "finish after the parent lands");
+      assert.strictEqual(ready.stage, "todo");
+      assert.strictEqual(world.probe.calls, 0);
+      // Parking and the merge answer do not declare the failed provider healthy.
+      world.probe.ready = true;
+      yield* TestClock.adjust(2 * MINUTE);
+      yield* kanban.probeOutages;
+      yield* kanban.dispatchNow;
+      assert.strictEqual((yield* cardOf(card.id)).activeThreadId, worker);
+      assert.isTrue(
+        world.threads
+          .get(worker)!
+          .messages.some((text) => text.includes("finish after the parent lands")),
+      );
+    }),
+  ),
+);
+
+it.effect("a PR merged before turn end wakes its worker only after the park", () =>
+  inWorld((world) =>
+    Effect.gen(function* () {
+      const { kanban, card, worker } = yield* deferredWorker;
+      world.threads.get(worker)!.running = true;
+      world.host.readings = [{ url: PR, state: "merged", at: iso(T0) }];
+      yield* kanban.tick;
+      assert.strictEqual((yield* cardOf(card.id)).activeThreadId, worker);
+      assert.isDefined((yield* cardOf(card.id)).wait);
+      world.threads.get(worker)!.running = false;
+      yield* kanban.turnEnded(worker);
+      assert.isNull((yield* cardOf(card.id)).activeThreadId);
+      yield* kanban.tick;
+      assert.isUndefined((yield* cardOf(card.id)).wait);
+      assert.strictEqual((yield* cardOf(card.id)).activeThreadId, worker);
+      assert.isTrue(
+        world.threads
+          .get(worker)!
+          .messages.some((text) => text.includes("finish after the parent lands")),
+      );
+    }),
+  ),
+);
+
+it.effect.each(["move", "flag", "ask", "clear"] as const)(
+  "a worker's %s cancels its deferred wait before turn end",
+  (action) =>
+    inWorld((world) =>
+      Effect.gen(function* () {
+        const { kanban, card, worker, actor } = yield* deferredWorker;
+        world.threads.get(worker)!.running = true;
+        if (action === "move") yield* kanban.moveCard(card.id, "needs_review", "cardThread", actor);
+        if (action === "flag") yield* kanban.flagCard(card.id, "cannot continue", actor);
+        if (action === "ask")
+          yield* kanban.askOwner(
+            card.id,
+            { question: "Can I continue?", blocking: true },
+            actor,
+            "cardThread",
+          );
+        if (action === "clear") yield* kanban.waitCard(card.id, null, actor);
+        assert.isUndefined((yield* cardOf(card.id)).wait);
+        world.threads.get(worker)!.running = false;
+        yield* kanban.turnEnded(worker);
+        assert.isFalse(
+          (yield* eventsOf(card.id)).some(
+            (event) => event.body === "Turn ended; parked on the worker's wait",
+          ),
+        );
+      }),
+    ),
+);
+
+it.effect("the existing idle-worker backstop parks a deferred wait after a missed turn end", () =>
+  inWorld((world) =>
+    Effect.gen(function* () {
+      const { kanban, card, worker } = yield* deferredWorker;
+      world.host.readings = [{ url: PR, state: "open", at: iso(T0) }];
+      yield* TestClock.adjust(31 * MINUTE);
+      yield* kanban.tick;
+      const parked = yield* cardOf(card.id);
+      assert.strictEqual(parked.stage, "todo");
+      assert.isNull(parked.activeThreadId);
+      assert.strictEqual(parked.workThreadId, worker);
+      assert.isDefined(parked.wait);
+      assert.strictEqual(world.said("still in Working"), 0);
+    }),
+  ),
+);
+
+it.effect("a replacement wait parks only after queued work ends", () =>
+  inWorld((world) =>
+    Effect.gen(function* () {
+      const { kanban, card, worker, actor } = yield* deferredWorker;
+      yield* kanban.waitCard(
+        card.id,
+        { on: "time", until: iso(T0 + HOUR), note: "try later", wakeRole: "work" },
+        actor,
+      );
+      world.queued.add(worker);
+      yield* kanban.turnEnded(worker);
+      assert.strictEqual((yield* cardOf(card.id)).activeThreadId, worker);
+      world.queued.delete(worker);
+      yield* kanban.turnEnded(worker);
+      const parked = yield* cardOf(card.id);
+      assert.isNull(parked.activeThreadId);
+      assert.strictEqual(parked.wait?.on, "time");
+      assert.strictEqual(parked.wait?.note, "try later");
     }),
   ),
 );

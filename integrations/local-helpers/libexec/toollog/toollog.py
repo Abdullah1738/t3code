@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import errno
+import contextlib
 import json
 import math
 import os
@@ -414,6 +416,99 @@ def _imessage_call_stats(row):
     return result
 
 
+# Fixed vocabulary from spectrum-bridge/log-error.ts; never accept arbitrary code-shaped tokens.
+_IMESSAGE_CAUSE_CODES = set("""
+ABORT_ERR Aborted AbortedBeforeConnecting ClientAborted CompressionFailed ConnectionClosed
+ConnectionRefused DNSResolutionFailed DNSResolveFailed EACCES EAI_AGAIN EBADF ECONNABORTED
+ECONNREFUSED ECONNRESET EEXIST EHOSTUNREACH EINVAL EIO EISDIR EMFILE ENETUNREACH ENFILE ENOENT
+ENOSPC ENOTDIR ENOTEMPTY ENOTFOUND EPERM EPIPE EROFS ERR_INVALID_ARG_TYPE ERR_INVALID_URL
+ERR_SOCKET_CLOSED ERR_STREAM_PREMATURE_CLOSE ERR_TLS_CERT_ALTNAME_INVALID ETIMEDOUT
+FailedToOpenSocket HPE_INVALID_CHUNK_SIZE HPE_INVALID_CONSTANT HTTP2CompressionError
+HTTP2ContentLengthMismatch HTTP2EnhanceYourCalm HTTP2FlowControlError HTTP2FrameSizeError
+HTTP2GoAway HTTP2HeaderListTooLarge HTTP2ProtocolError HTTP2RefusedStream HTTP2StreamReset
+HTTP2Unsupported HTTP3ContentLengthMismatch HTTP3HandshakeFailed HTTP3HeaderEncodingError
+HTTP3ProtocolError HTTP3StreamReset HTTP3Unsupported InvalidCRL InvalidContentLength
+InvalidHTTPResponse InvalidRedirectURL InvalidURL Malformed_HTTP_Response ProxyConnectFailed
+RedirectURLInvalid RedirectURLTooLong RequestBodyLengthMismatch RequestBodyNotReusable
+ResponseHeadersTooLarge SQLITE_BUSY SQLITE_CANTOPEN SQLITE_CONSTRAINT SQLITE_ERROR SQLITE_LOCKED
+SQLITE_READONLY ShortRead TLSHandshakeFailed Timeout TooManyRedirects UND_ERR_BODY_TIMEOUT
+UND_ERR_CONNECT_TIMEOUT UND_ERR_HEADERS_OVERFLOW UND_ERR_HEADERS_TIMEOUT
+UND_ERR_RES_CONTENT_LENGTH_MISMATCH UND_ERR_SOCKET UnexpectedData UnexpectedRedirect
+UnrequestedUpgrade UnsupportedProtocol UnsupportedProxyProtocol UnsupportedRedirectProtocol
+UnsupportedTransferEncoding WantRead WantWrite WriteFailed Z_DATA_ERROR ZlibError addressNotFound
+attachmentNotFound attachmentNotReady attachmentTimeout attachmentTooLarge audioTooLarge
+catchupIncomplete catchupTimeout chatNotFound closed contentDuplicateExceeded conversionFailed
+dailyLimitExceeded databaseError duplicateMessage emptyAudio endpointOverride groupIconNotFound
+internalError invalidApp invalidArgument invalidAttachment invalidAttachmentLimit invalidCredentials
+invalidEffect invalidOperationId invalidOwner invalidOwnerChat invalidPoll invalidResponse
+invalidServerUrl invalidTokenLifetime invalidTokenResponse jevFailed keyUnavailable messageNotFound
+networkError operationNotSupported pollNotFound preconditionFailed privateApiUnavailable
+recipientCoolingDown recipientLimitExceeded recipientLocked sendReceiveRatioExceeded
+serviceUnavailable sharedFriendLocationNotFound sharedPlanRequired timeout tokenBlocked tokenExpired
+tokenNetwork unauthenticated unauthorized unknownSendFailure uploadRateExceeded upload_failed
+upload_url
+""".split())
+_IMESSAGE_CAUSE_CODES.update(errno.errorcode.values())
+
+
+def _imessage_cause_key(value):
+    if not isinstance(value, str):
+        return None
+    if value in {'prompt_acceptance_probe', 'background_watch', 'callsite_failure', 'TimeoutError', 'AbortError'}:
+        return value
+    if re.fullmatch(r'http\.[1-5]xx', value):
+        return value
+    prefix, _, code = value.partition('.')
+    if prefix not in {'code', 'errno'}:
+        return None
+    if code in _IMESSAGE_CAUSE_CODES or re.fullmatch(r'(?:http|tokenHttp)[1-5]\d{2}', code):
+        return value
+    if re.fullmatch(r'-?(?:0|[1-9]\d{0,4})', code) and abs(int(code)) <= 65535:
+        return value
+    # Provider detail after an HTTP status is intentionally never copied.
+    if re.fullmatch(r'http_[1-5]\d{2}:(?:provider_error|unknown)', code):
+        return value
+    return None
+
+
+def _imessage_render_stats(row):
+    if row.get('name') != 'card.renders' or row.get('kind') != 'perf':
+        return None
+    stats = row.get('renders')
+    if not isinstance(stats, dict):
+        return None
+    count, histogram = stats.get('count'), stats.get('histogram')
+    if type(count) is not int or not 1 <= count <= 10_000_000 or not isinstance(histogram, list) or len(histogram) > 1001:
+        return None
+    values = [(p[0], p[1]) for p in histogram if isinstance(p, list) and len(p) == 2
+              and type(p[0]) is int and 0 <= p[0] <= 1000 and type(p[1]) is int and 1 <= p[1] <= 10_000_000]
+    return (count, values) if sum(n for _, n in values) == count else None
+
+
+def _imessage_shared_renders(board, day):
+    import sqlite3
+    path = board_dir(board) / f'renders-{day}.sqlite'
+    components = {'cards', 'card-file', 'quick-renderer', 'delivery-renderer', 'ride-renderer', 'nutrition-renderer'}
+    kinds = {'quick', 'delivery', 'ride', 'nutrition', 'secure_form', 'other'}
+    groups = {}
+    try:
+        if path.is_symlink():
+            return []
+        with contextlib.closing(sqlite3.connect(path.absolute().as_uri() + '?mode=ro', uri=True)) as db:
+            for component, kind, chat, ms, count in db.execute('SELECT component, cardKind, chat, ms, count FROM bins'):
+                if (component not in components or kind not in kinds or chat not in {'owner', 'moni', 'other', 'unknown'}
+                        or type(ms) is not int or not 0 <= ms <= 1000 or type(count) is not int or not 1 <= count <= 2**53 - 1):
+                    continue
+                row = groups.setdefault((component, kind, chat), {'component': component, 'kind': 'perf', 'name': 'card.render',
+                    '_rollup_count': 0, '_rollup_ok': 0, '_rollup_failed': 0, '_rollup_histogram': [], '_rollup_synthetic': True})
+                row['_rollup_count'] += count
+                row['_rollup_ok'] += count
+                row['_rollup_histogram'].append((ms, count))
+    except (OSError, sqlite3.Error):
+        return []
+    return list(groups.values())
+
+
 def _imessage_rollup_records(board, day):
     def batch(row):
         identity = row.get('ids')
@@ -423,8 +518,13 @@ def _imessage_rollup_records(board, day):
     pending = []
     for line, raw in _read_records(board, day):
         row = {key: value for key, value in raw.items() if not key.startswith('_rollup_')}
+        renders = _imessage_render_stats(row)
         calls = _imessage_call_stats(row)
-        if calls:
+        if renders:
+            count, histogram = renders
+            yield line, {**row, 'name': 'card.render', '_rollup_count': count, '_rollup_ok': count,
+                         '_rollup_failed': 0, '_rollup_histogram': histogram}
+        elif calls:
             for name, (oks, failed, histogram) in calls.items():
                 if batch(row) is not None:
                     represented.add((batch(row), name))
@@ -440,11 +540,14 @@ def _imessage_rollup_records(board, day):
     for line, row in pending:
         if (batch(row), _imessage_call_name(row)) not in represented:
             yield line, {**row, '_rollup_deferred': True}
+    for row in _imessage_shared_renders(board, day):
+        yield 0, row
 
 
 def rollup(board, day, top_n=20):
     from collections import Counter, defaultdict
     counts_name, counts_kind, tags = Counter(), Counter(), Counter()
+    causes, render_failures = Counter(), Counter()
     samples, references, durations = {}, {}, defaultdict(list)
     order_errors, order_polls = {}, defaultdict(list)
     component_totals, component_errors = Counter(), defaultdict(Counter)
@@ -465,7 +568,7 @@ def rollup(board, day, top_n=20):
     total = oks = failed = errors = observed = 0
     records = _imessage_rollup_records(board, day) if board == 'imessage' else _read_records(board, day)
     for line_number, row in records:
-        if not (board == 'imessage' and row.get('_rollup_deferred')):
+        if not (board == 'imessage' and (row.get('_rollup_deferred') or row.get('_rollup_synthetic'))):
             recorded += line_number != last_record
             last_record = line_number
         if board == 'imessage' and row.get('_rollup_skip'):
@@ -558,6 +661,14 @@ def rollup(board, day, top_n=20):
                     'tag': code, 'httpStatus': status, 'merchant': merchant, 'count': 0,
                     'sampleId': {'file': day + '.ndjson', 'line': line_number}})
                 item['count'] += weight
+        if board == 'imessage':
+            props = row.get('props') if isinstance(row.get('props'), dict) else {}
+            failure_code = props.get('failureCode')
+            if name == 'card.render' and row_failed and isinstance(failure_code, str) and failure_code in {
+                    'renderer_failed', 'preview_missing', 'render_exception', 'page_fetch', 'page_http', 'page_type',
+                    'page_body', 'image_fetch', 'image_http', 'image_type', 'image_body', 'upload', 'upload_url',
+                    'invalid_url', 'file_prepare'}:
+                render_failures[failure_code] += weight
         tag = (row.get('error') or {}).get('tag')
         if isinstance(tag, str):
             key = tag
@@ -566,6 +677,9 @@ def rollup(board, day, top_n=20):
                 if not isinstance(error_name, str) or error_name not in _IMESSAGE_ERROR_NAMES:
                     error_name = 'UnknownError'
                 key = (tag, error_name)
+                cause = _imessage_cause_key((row.get('error') or {}).get('causeKey'))
+                if cause:
+                    causes[(tag, cause)] += weight
             tags[key] += weight
             references.setdefault(key, {'file': day + '.ndjson', 'line': line_number, 'ts': row.get('ts')})
             identity = row.get('ids')
@@ -668,6 +782,9 @@ def rollup(board, day, top_n=20):
             merchant: {**poll, 'failureShare': poll['failed'] / poll['count']}
             for merchant, poll in sorted(poll_counts.items())}
     if board == 'imessage':
+        result['topCauses'] = [{'tag': tag, 'causeKey': cause, 'count': count}
+                               for (tag, cause), count in sorted(causes.items(), key=lambda x: (-x[1], x[0]))[:20]]
+        result['cardRenderFailures'] = dict(sorted(render_failures.items()))
         result['byComponent'] = {}
         result['durationMs'] = result['durationMsByName']
         for (component, name), stats in component_stats.items():

@@ -18,6 +18,11 @@ WARN_BYTES = GIB
 GATE_BYTES = 256 * 1024 ** 2
 FAIL_BYTES = 64 * 1024 ** 2
 MARKER = 'offbox-space: '
+CLIENT_STARTED_AT = time.time()
+PROBE_BEGIN_MARKER = 'offbox-space-probe: '
+PROBE_ERROR_MARKER = 'offbox-space-probe-error: '
+PROBE_FAILED = 'offbox: disk-space probe failed (exit '
+PROBE_INVALID = 'offbox: infra: disk probe payload invalid (client code changed on disk since start?)'
 ENOSPC = re.compile(r'No space left on device|\bENOSPC\b|os error 28|Errno 28', re.I)
 
 
@@ -223,6 +228,8 @@ def error_line(line):
 
 def result(path, code, *, offset=0):
     phases, matches, seen_attempt, final = {}, False, 0, None
+    probe_error, traceback_line, string_trace, command_started = None, None, 0, False
+    probe_errors, started_attempts = {}, set()
     native_crash = False
     native_attempts = set()
     try:
@@ -240,12 +247,15 @@ def result(path, code, *, offset=0):
                                 continue
                             if phase == 'attempt':
                                 seen_attempt = max(seen_attempt, attempt)
+                                probe_error, traceback_line, string_trace, command_started = None, None, 0, False
                             else:
                                 record = item.get('record')
                                 if (isinstance(record, dict) and isinstance(record.get('disk_space'), dict) and
                                         all(p in ('server_start', 'start', 'end', 'gate') and valid_space(s)
                                             for p, s in record['disk_space'].items()) and
-                                        record.get('infra_failure') in (None, 'enospc', 'native_crash') and
+                                        record.get('infra_failure') in (None, 'enospc', 'native_crash', 'disk_probe') and
+                                        (record.get('infra_failure') != 'disk_probe' or
+                                         record.get('infra_reason') == 'probe_crashed') and
                                         (record.get('infra_failure') != 'native_crash' or
                                          record.get('infra_reason') == 'toolchain_unpack_crash') and
                                         (final is None or attempt >= final[0])):
@@ -271,6 +281,21 @@ def result(path, code, *, offset=0):
                     except (ValueError, KeyError, TypeError):
                         pass
                 else:
+                    if line.startswith('offbox-command-started:'):
+                        command_started = True
+                        started_attempts.add(seen_attempt)
+                    if line.startswith(PROBE_BEGIN_MARKER):
+                        traceback_line, string_trace = None, 0
+                    if 'File "<string>"' in line:
+                        string_trace += 1
+                    if string_trace >= 2 and re.match(r'^(?:[\w.]*Error|[\w.]*Exception):', line):
+                        traceback_line = line.strip()
+                        if not command_started:
+                            probe_error = traceback_line
+                    if line.startswith((PROBE_ERROR_MARKER, PROBE_FAILED)):
+                        probe_error = traceback_line or line.strip()
+                    if probe_error:
+                        probe_errors[seen_attempt] = probe_error
                     matches |= error_line(line)
     except OSError:
         pass
@@ -284,6 +309,9 @@ def result(path, code, *, offset=0):
         # toolchain marker for that same attempt so a client-only install is enough.
         native_crash = (final[1].get('infra_failure') == 'native_crash' or
                         final[0] in native_attempts)
+    if authoritative:
+        probe_error = final[1].get('disk_probe_error') or probe_errors.get(final[0])
+        command_started = final[0] in started_attempts
     start, end = phases.get('start', phases.get('server_start', {})), phases.get('end', {})
     out = dict(disk_space=phases, command_exit_code=None if 'gate' in phases else code,
                wrapper_exit_code=code, infra_failure=None, infra_reason=None)
@@ -297,6 +325,13 @@ def result(path, code, *, offset=0):
     if code not in (0, None) and (matches or low or 'gate' in phases):
         out['infra_failure'] = 'enospc'
         out['infra_reason'] = 'low_space_gate' if 'gate' in phases else 'disk_exhausted'
+    if probe_error:
+        out['disk_probe_error'] = probe_error
+        probe_crashed = code in (None, 90) and not command_started and 'gate' not in phases
+        if authoritative and 'disk_probe_error' in final[1]:
+            probe_crashed = final[1].get('infra_failure') == 'disk_probe'
+        if probe_crashed:
+            out.update(infra_failure='disk_probe', infra_reason='probe_crashed', command_exit_code=None)
     if code == 90 and native_crash:
         out.update(infra_failure='native_crash', infra_reason='toolchain_unpack_crash', command_exit_code=None)
     return out
@@ -313,6 +348,8 @@ def command_result(stdout, stderr, code, *, stdout_offset=0, stderr_offset=0):
 
 
 def message(record):
+    if record.get('infra_failure') == 'disk_probe':
+        return 'infra: the offbox disk probe crashed before your command started; nothing ran. Rerun.'
     if record.get('infra_failure') == 'native_crash':
         return ('infra: the box crashed unpacking a checksum-verified toolchain archive twice; '
                 'this is a box/host fault, not your repo. Nothing ran (exit 90).')
@@ -339,12 +376,35 @@ def probe():
             sys.exit(90)
 
 
-def probe_payload():
+def _build_probe_payload():
     # Send only the probe, not the reaper; wrapped shell commands must remain below 64 KiB.
     source = ('import os,json,subprocess,sys\nfrom pathlib import Path\n'
               f'WARN_BYTES={WARN_BYTES}\nGATE_BYTES={GATE_BYTES}\nMARKER={MARKER!r}\n'
               + '\n'.join(inspect.getsource(f) for f in (snapshot, warning, probe)) + '\nprobe()\n')
+    compile(source, '<offbox disk probe>', 'exec')
     return base64.b64encode(zlib.compress(source.encode())).decode()
+
+
+# inspect uses on-disk line numbers. Capture before a queue wait can span an install.
+try:
+    _PROBE_PAYLOAD = _build_probe_payload()
+    PROBE_PAYLOAD_ERROR = None
+except Exception as error:
+    PROBE_PAYLOAD_ERROR = f'{type(error).__name__}: {error}'
+    _fallback = 'import sys\nprint(' + repr(PROBE_ERROR_MARKER + PROBE_PAYLOAD_ERROR) + ', file=sys.stderr)\n'
+    _PROBE_PAYLOAD = base64.b64encode(zlib.compress(_fallback.encode())).decode()
+
+
+def probe_payload():
+    return _PROBE_PAYLOAD
+
+
+def client_metadata():
+    try:
+        mtime = Path(__file__).stat().st_mtime
+    except OSError:
+        mtime = None
+    return dict(client_started_at=CLIENT_STARTED_AT, disk_probe_module_mtime=mtime)
 
 
 if __name__ == '__main__':

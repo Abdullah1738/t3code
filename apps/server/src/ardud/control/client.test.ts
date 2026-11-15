@@ -545,8 +545,68 @@ describe("ControlClient", () => {
     });
     const result = await runUsageCli(url, ["--since", "1000", "--all-pages"]);
     expect(JSON.parse(result.stdout)).toEqual({ items: [{ id: 1 }, { id: 2 }], nextCursor: null });
-    expect(seen).toEqual([{ since: "1000" }, { since: "1000", cursor: "next" }]);
+    expect(seen).toEqual([
+      { since: "1000", limit: "1000" },
+      { since: "1000", limit: "1000", cursor: "next" },
+    ]);
   });
+
+  it("usage applies a per-request deadline without putting it in the query", async () => {
+    let requested: string | undefined;
+    const url = await listen((request) => {
+      requested = request.url;
+    });
+    const client = new ControlClient({ url, token: "test", timeoutMs: 1 });
+    await expect(client.usage({ since: "0" }, { timeoutMs: 1000 })).rejects.toMatchObject({
+      name: "TimeoutError",
+    });
+    expect(requested).toBe("/api/ardud/control/usage?since=0");
+  });
+
+  it("usage CLI forwards a resume cursor and reports its per-page deadline", async () => {
+    let requested: URL | undefined;
+    const url = await listen((request) => {
+      requested = new URL(request.url!, "http://localhost");
+    });
+    await expect(
+      runUsageCli(url, [
+        "--since",
+        "0",
+        "--cursor",
+        "resume/+",
+        "--timeout-ms",
+        "1000",
+        "--all-pages",
+      ]),
+    ).rejects.toMatchObject({
+      code: 1,
+      stdout: "",
+      stderr: expect.stringContaining(
+        "usage page 1 timed out after 1000 ms; cursor resume/+; 0 items read; resume with --cursor 'resume/+'",
+      ),
+    });
+    expect(requested?.searchParams.get("cursor")).toBe("resume/+");
+    expect(requested?.searchParams.get("limit")).toBe("1000");
+    expect(requested?.searchParams.has("timeoutMs")).toBe(false);
+  });
+
+  it.each(["0", "-1", "NaN", "Infinity", "", "1.5", "2147483648"])(
+    "usage rejects invalid --timeout-ms=%s before sending",
+    async (value) => {
+      let requests = 0;
+      const url = await listen((_request, response) => {
+        requests++;
+        response.end();
+      });
+      await expect(
+        runUsageCli(url, ["--since", "0", `--timeout-ms=${value}`]),
+      ).rejects.toMatchObject({
+        code: 1,
+        stderr: expect.stringContaining("--timeout-ms must be a positive integer"),
+      });
+      expect(requests).toBe(0);
+    },
+  );
 
   it("t3ctl usage reports later page errors without printing partial results", async () => {
     let calls = 0;

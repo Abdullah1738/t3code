@@ -1203,7 +1203,7 @@ def _try_warm(me, size, source, exclude, run_id):
                             return None
                         # A cached running lease and a successful TTL update can both outlive its machine.
                         peer = api.get(got['box_id'], deadline=time.time() + 10)
-                        if not peer or peer.get('state') not in api.LIVE_STATES or peer.get('dataExpiredAt') \
+                        if not peer or peer.get('state') not in api.LIVE_STATES or peer.get('dataExpiredAt') or peer.get('heldRuns') \
                                 or peer.get('type') != got['size']:
                             return None
                         left = api.left()

@@ -16,6 +16,87 @@ import toollog
 
 
 class ToolLogTests(unittest.TestCase):
+    def test_shared_render_root_path_shapes_with_and_without_counters(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as temp:
+            cwd = Path(temp) / 'cwd'
+            cwd.mkdir()
+            cases = [('absolute', str(Path(temp) / 'absolute')), ('relative', 'logs'),
+                     ('dot-relative', './dot-logs'), ('parent-relative', '../parent-logs'),
+                     ('spaces', 'space logs'), ('uri-specials', 'logs?#%'), ('unicode', 'méta-logs')]
+            previous = Path.cwd()
+            try:
+                os.chdir(cwd)
+                for label, root in cases:
+                    with self.subTest(shape=label), patch.dict(os.environ, {'TOOLLOG_ROOT': root}):
+                        directory = toollog.board_dir('imessage')
+                        directory.mkdir(parents=True)
+                        (directory / (self.day + '.ndjson')).write_text(json.dumps({
+                            'component': 'fixture', 'name': 'fixture.start', 'kind': 'event'}) + '\n')
+                        self.assertEqual(toollog.rollup('imessage', self.day)['total'], 1)
+                        with sqlite3.connect(directory / f'renders-{self.day}.sqlite') as db:
+                            db.execute('CREATE TABLE bins (component TEXT, cardKind TEXT, chat TEXT, ms INTEGER, count INTEGER)')
+                            db.execute('INSERT INTO bins VALUES (?, ?, ?, ?, ?)', ('delivery-renderer', 'delivery', 'owner', 7, 3))
+                        result = toollog.rollup('imessage', self.day)
+                        self.assertEqual(result['total'], 4)
+                        self.assertEqual(result['recordedRows'], 1)
+                        self.assertEqual(result['byComponent']['delivery-renderer']['card.render']['count'], 3)
+            finally:
+                os.chdir(previous)
+
+    def test_shared_render_counters_merge_with_legacy_rows_without_counting_them_as_log_lines(self):
+        import sqlite3
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        with sqlite3.connect(directory / f'renders-{self.day}.sqlite') as db:
+            db.execute('CREATE TABLE bins (component TEXT, cardKind TEXT, chat TEXT, ms INTEGER, count INTEGER)')
+            db.executemany('INSERT INTO bins VALUES (?, ?, ?, ?, ?)', [
+                ('delivery-renderer', 'delivery', 'owner', 7, 3),
+                ('delivery-renderer', 'delivery', 'owner', 9, 2),
+                ('PRIVATE', 'delivery', 'owner', 1, 1),
+                ('delivery-renderer', 'PRIVATE', 'owner', 1, 1),
+                ('delivery-renderer', 'delivery', 'PRIVATE', 1, 1),
+                ('delivery-renderer', 'delivery', 'owner', 971501234567, 1),
+            ])
+        legacy = {'component': 'delivery-renderer', 'name': 'card.renders', 'kind': 'perf',
+                  'renders': {'count': 2, 'histogram': [[10, 2]]}}
+        failed = {'component': 'delivery-renderer', 'name': 'card.render', 'kind': 'perf', 'ok': False,
+                  'props': {'failureCode': 'preview_missing'}, 'durationMs': 11}
+        (directory / (self.day + '.ndjson')).write_text(json.dumps(legacy) + '\n' + json.dumps(failed) + '\n')
+        result = toollog.rollup('imessage', self.day)
+        self.assertEqual(result['recordedRows'], 2)
+        self.assertEqual(result['byComponent']['delivery-renderer']['card.render'], {
+            'count': 8, 'ok': 7, 'failed': 1, 'errorRate': 1 / 8,
+            'durationMs': {'p50': 9, 'p95': 11, 'max': 11}})
+        self.assertNotIn('PRIVATE', json.dumps(result))
+        self.assertNotIn('971501234567', json.dumps(result))
+
+    def test_imessage_causes_and_render_counters_are_reduced(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        rows = [
+            {'component': 'delivery-renderer', 'kind': 'perf', 'name': 'card.renders', 'ok': True,
+             'renders': {'count': 250, 'histogram': [[10, 250]]}},
+            {'component': 'delivery-renderer', 'kind': 'perf', 'name': 'card.render', 'ok': False,
+             'durationMs': 20, 'props': {'failureCode': 'preview_missing'}},
+        ]
+        for key in ['code.ECONNRESET', 'code.ECONNRESET', 'errno.-61', 'http.5xx', 'prompt_acceptance_probe',
+                    'PRIVATE_TOKEN', 'code.PRIVATE_TOKEN', 'code.971501234567',
+                    'errno./Users/private/PRIVATE', 'code.https://private/?token=PRIVATE']:
+            rows.append({'kind': 'error', 'name': 'bridge.catch', 'error': {
+                'tag': 'router.catch1', 'name': 'Error', 'causeKey': key}})
+        rows.append({'kind': 'error', 'name': 'bridge.catch', 'error': {
+            'tag': 'router.catch49', 'name': 'UnknownError', 'causeKey': 'background_watch'}})
+        (directory / (self.day + '.ndjson')).write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        result = toollog.rollup('imessage', self.day)
+        self.assertEqual(result['topCauses'][0], {'tag': 'router.catch1', 'causeKey': 'code.ECONNRESET', 'count': 2})
+        self.assertEqual(len(result['topCauses']), 5)
+        self.assertEqual(result['cardRenderFailures'], {'preview_missing': 1})
+        self.assertEqual(result['byComponent']['delivery-renderer']['card.render']['count'], 251)
+        self.assertEqual(result['byComponent']['delivery-renderer']['card.render']['failed'], 1)
+        self.assertNotIn('PRIVATE', json.dumps(result))
+        self.assertNotIn('971501234567', json.dumps(result))
+
     def test_imessage_rollup_summary_appended_after_read_is_never_double_counted(self):
         directory = toollog.board_dir('imessage')
         directory.mkdir(parents=True)

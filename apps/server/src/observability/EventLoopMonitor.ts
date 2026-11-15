@@ -1,6 +1,8 @@
 // @effect-diagnostics nodeBuiltinImport:off - native delay/GC observations require Node hooks and event-loop delivery.
 import * as NodePerfHooks from "node:perf_hooks";
 import * as NodeTimersPromises from "node:timers/promises";
+import * as NodeFSP from "node:fs/promises";
+import { archiveFilename } from "../ardud/persistence/historyArchiveSql.ts";
 import * as NodeV8 from "node:v8";
 
 import { RotatingFileSink } from "@t3tools/shared/logging";
@@ -208,6 +210,7 @@ export const layerWith = (
   readHeapSpaces: typeof NodeV8.getHeapSpaceStatistics = NodeV8.getHeapSpaceStatistics,
   heapLimitBytes: number = NodeV8.getHeapStatistics().heap_size_limit,
   sampleSockets: Effect.Effect<void> = Effect.void,
+  sampleArchiveWalBytes: Effect.Effect<number | null | undefined> = Effect.succeed(undefined),
 ) =>
   Layer.effectDiscard(
     Effect.gen(function* () {
@@ -234,6 +237,7 @@ export const layerWith = (
         heapUsedMbPrev = Math.round(readings.heapUsedBytes / 1024 / 1024);
         yield* recordGauges(readings);
         yield* sampleSockets;
+        const archiveWalBytes = yield* sampleArchiveWalBytes;
         if (
           readings.heapUsedBytes > Math.min(HIGH_HEAP_BYTES, heapLimitBytes * HIGH_HEAP_RATIO) &&
           stallSink !== undefined
@@ -270,6 +274,7 @@ export const layerWith = (
             yield* encodeStallLine({
               time,
               kind: "sample",
+              archiveWalBytes,
               gcTotalMs: readings.gc.totalMs,
               gcMajorMaxMs: readings.gc.majorMaxMs,
               rssMb: Math.round(readings.rssBytes / 1024 / 1024),
@@ -286,6 +291,7 @@ export const layerWith = (
         }
         const { utilization, usage, rssBytes } = readings;
         const attributes = {
+          ...(archiveWalBytes === undefined ? {} : { archiveWalBytes }),
           delayMaxMs,
           gcCount: readings.gc.count,
           gcTotalMs: readings.gc.totalMs,
@@ -341,7 +347,7 @@ export const layerWith = (
 
 export const layer = Layer.unwrap(
   Effect.gen(function* () {
-    const { serverTracePath } = yield* ServerConfig.ServerConfig;
+    const { serverTracePath, dbPath } = yield* ServerConfig.ServerConfig;
     const path = yield* Path.Path;
     const sockets = yield* HttpSocketTelemetry.HttpSocketTelemetry;
     return layerWith(
@@ -353,6 +359,9 @@ export const layer = Layer.unwrap(
       undefined,
       undefined,
       sockets.sample,
+      Effect.tryPromise(
+        async () => (await NodeFSP.stat(`${archiveFilename(dbPath)}-wal`)).size,
+      ).pipe(Effect.orElseSucceed(() => null)),
     );
   }),
 );

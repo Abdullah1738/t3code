@@ -466,7 +466,40 @@ test("nutrition's live-only renderer is observed at file preparation, on success
       await loadCommandPayload(parseCommand(["send-file", "--file", path, "--session", "fixture-session", "--key", "nutrition-fixture"]));
       await expect(loadCommandPayload(parseCommand(["send-file", "--file", join(root, "nutrition-missing.png"), "--session", "fixture-session", "--key", "missing-fixture"]))).rejects.toThrow();
     });
-    expect(logs.filter(l => l.name === "card.render").map(l => [l.component, l.ok, l.props?.cardKind])).toEqual([["card-file", true, "nutrition"], ["card-file", false, "nutrition"]]);
+    expect(logs.filter(l => l.name === "card.render" || l.name === "card.renders").map(l => [l.component, l.ok, l.props?.cardKind]).sort((a, b) => Number(b[1]) - Number(a[1]))).toEqual([["card-file", true, "nutrition"], ["card-file", false, "nutrition"]]);
     expect(JSON.stringify(logs)).not.toContain("PRIVATE_HEALTH_IMAGE");
   } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+describe("agent bus commands", () => {
+  const request = `areq_${"a".repeat(64)}`;
+  test("builds ask, parent ask, answer statuses and requests without changing text", () => {
+    const args = ["agent-ask", "--to", "moni", "--text", "  question\nline  ", "--session", "ses_1", "--key", "k"];
+    expect(parseCommand(args)).toEqual({ method: "POST", path: "/agent-ask",
+      body: { to: "moni", text: "  question\nline  ", sessionId: "ses_1", dedupeKey: "k" } });
+    expect(parseCommand([...args, "--parent", request]).body?.parent).toBe(request);
+    const answer = ["agent-answer", "--request", request, "--text", "answer", "--session", "ses_1"];
+    expect(parseCommand(answer)).toEqual({ method: "POST", path: "/agent-answer",
+      body: { request, text: "answer", sessionId: "ses_1" } });
+    for (const status of ["pending", "done", "declined"]) expect(parseCommand([...answer, "--status", status]).body?.status).toBe(status);
+    expect(parseCommand(["agent-requests", "--session", "ses_1"])).toEqual({ method: "POST", path: "/agent-requests", body: { sessionId: "ses_1" } });
+  });
+  test("requires sessions and ask keys; rejects invalid ids, status, slugs and lengths", () => {
+    for (const args of [
+      ["agent-ask", "--to", "owner", "--text", "q", "--key", "k"],
+      ["agent-ask", "--to", "owner", "--text", "q", "--session", "s"],
+      ["agent-answer", "--request", request, "--text", "a"], ["agent-requests"],
+      ["agent-ask", "--to", "Not A Slug", "--text", "q", "--session", "s", "--key", "k"],
+    ]) expect(() => parseCommand(args)).toThrow();
+    for (const command of ["agent-ask", "agent-answer"]) {
+      const base = command === "agent-ask" ? [command, "--to", "owner", "--key", "k"] : [command, "--request", request];
+      for (const text of ["", "  ", "x".repeat(12_001)]) expect(() => parseCommand([...base, "--text", text, "--session", "s"])).toThrow();
+      expect(parseCommand([...base, "--text", "x".repeat(12_000), "--session", "s"]).path).toBe(`/${command}`);
+    }
+    for (const bad of ["bad", "areq_", `areq_${"a".repeat(65)}`, `areq_${"A".repeat(64)}`, request + "\n"]) {
+      expect(() => parseCommand(["agent-answer", "--request", bad, "--text", "a", "--session", "s"])).toThrow("Invalid --request");
+      expect(() => parseCommand(["agent-ask", "--to", "owner", "--text", "a", "--session", "s", "--key", "k", "--parent", bad])).toThrow("Invalid --parent");
+    }
+    expect(() => parseCommand(["agent-answer", "--request", request, "--text", "a", "--session", "s", "--status", "timed_out"])).toThrow("Invalid --status");
+  });
 });

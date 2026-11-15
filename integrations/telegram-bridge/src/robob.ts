@@ -1,7 +1,7 @@
 import type { NotificationEvent } from "./notification-events.ts";
 import { toolError } from "./toollog.ts";
 import {
-  IMESSAGE_ORIGIN, type AlertBackend, type BoardEntry, type BoardSnapshot, type BoardTelemetry, type PermissionRequest,
+  BOARD_EVENT_KEY_LIMIT, boardEventKey, IMESSAGE_ORIGIN, type AlertBackend, type BoardEntry, type BoardSnapshot, type BoardTelemetry, type PermissionRequest,
   type QuestionRequest, type RequestReader, type SessionRecord,
 } from "./openchamber.ts";
 import {
@@ -14,7 +14,7 @@ const BUSY = new Set<ThreadState>(["running", "needs-input", "queued"]);
 /** Where attention finds busy folders: Robob's active thread list, or a stand-in in tests. */
 export interface ReviewBoard {
   snapshot(): Promise<BoardSnapshot>;
-  markDirty?(reason?: "hard" | "soft"): void;
+  markDirty?(reason?: "hard" | "soft", eventType?: string): void;
   status?(): BoardTelemetry;
 }
 
@@ -29,6 +29,7 @@ const HARD_BOARD_CHANGES = new Set([
   "thread.archived", "thread.unarchived", "thread.deleted", "thread.settled", "thread.unsettled",
   "thread.runtime-mode-updated", "run.created", "run.updated", "runtime-request.updated",
 ]);
+const BOARD_STATES = new Set<unknown>(["idle", "running", "waiting", "needs-input", "queued"]);
 
 /** The turn counter attention.ts uses as `workRevision`: the ordinal of the thread's newest run. */
 export function runOrdinal(runId: string | null | undefined): number {
@@ -73,19 +74,33 @@ export class ActiveThreadsBoard implements ReviewBoard {
   private readonly now: () => number;
   private readonly telemetry: BoardTelemetry = {
     boardFetches: 0, boardCacheHits: 0, boardFetchErrors: 0, boardBackoffMs: 0, lastFetchDurationMs: null, lastFetchReason: null,
+    fetchesByReason: { cold: 0, age: 0, hard: 0, soft: 0 }, dirtyEventsByType: {}, windowStartedAt: "",
   };
 
   constructor(
     private readonly client: Pick<ControlClient, "listThreads">,
     private readonly directories: Pick<ThreadDirectories, "of">,
     private readonly options: BoardOptions = {},
-  ) { this.now = options.now ?? Date.now; }
+  ) {
+    this.now = options.now ?? Date.now;
+    this.telemetry.windowStartedAt = new Date(this.now()).toISOString();
+  }
 
-  markDirty(reason: "hard" | "soft" = "hard"): void {
+  markDirty(reason: "hard" | "soft" = "hard", eventType?: string): void {
+    if (eventType !== undefined) {
+      const events = this.telemetry.dirtyEventsByType;
+      const key = Object.hasOwn(events, eventType) || (eventType !== "other" && Object.keys(events).filter(key => key !== "other").length < BOARD_EVENT_KEY_LIMIT)
+        ? eventType : "other";
+      if (!Object.hasOwn(events, key)) events[key] = { hard: 0, soft: 0 };
+      events[key]![reason]++;
+    }
     if (this.dirty !== "hard") this.dirty = reason;
   }
 
-  status(): BoardTelemetry { return { ...this.telemetry }; }
+  status(): BoardTelemetry {
+    return { ...this.telemetry, fetchesByReason: { ...this.telemetry.fetchesByReason },
+      dirtyEventsByType: Object.fromEntries(Object.entries(this.telemetry.dirtyEventsByType).map(([key, counts]) => [key, { ...counts }])) };
+  }
 
   snapshot(): Promise<BoardSnapshot> {
     if (this.fetching) {
@@ -104,18 +119,19 @@ export class ActiveThreadsBoard implements ReviewBoard {
       this.telemetry.boardCacheHits++;
       return Promise.resolve(this.cache);
     }
-    const reason = !this.cache ? "cold" : this.dirty ? "dirty" : "age";
+    const reason = !this.cache ? "cold" : this.dirty ?? "age";
     this.fetching = this.fetch(reason).finally(() => { this.fetching = undefined; });
     return this.fetching;
   }
 
-  private async fetch(reason: NonNullable<BoardTelemetry["lastFetchReason"]>): Promise<BoardSnapshot> {
+  private async fetch(reason: keyof BoardTelemetry["fetchesByReason"]): Promise<BoardSnapshot> {
     const startedAt = this.now();
     const dirty = this.dirty;
     // Events received during this fetch remain dirty after it completes.
     this.dirty = undefined;
     this.telemetry.boardFetches++;
-    this.telemetry.lastFetchReason = reason;
+    this.telemetry.fetchesByReason[reason]++;
+    this.telemetry.lastFetchReason = reason === "hard" || reason === "soft" ? "dirty" : reason;
     try {
       const { threads } = await this.client.listThreads({ active: true, limit: BOARD_LIMIT });
       if (threads.length === BOARD_LIMIT && this.now() - this.warnedAt >= BOARD_LIMIT_WARNING_GAP) {
@@ -199,7 +215,7 @@ export class RobobAlertBackend implements AlertBackend {
     return this.board.snapshot();
   }
 
-  markDirty(reason: "hard" | "soft" = "hard"): void { this.board.markDirty?.(reason); }
+  markDirty(reason: "hard" | "soft" = "hard", eventType?: string): void { this.board.markDirty?.(reason, eventType); }
 
   boardStatus(): BoardTelemetry | undefined { return this.board.status?.(); }
 
@@ -278,22 +294,20 @@ export class RobobAlertBackend implements AlertBackend {
    */
   async notification(data: Record<string, unknown>): Promise<NotificationEvent | undefined> {
     const type = data.type;
-    if (type === "ready") { this.markDirty(); return { type: "invalidate" }; }
+    const hard = type === "ready" || type === "thread.created" || type === "request.opened" || type === "request.resolved"
+      || (type === "thread.status" && BOARD_STATES.has(data.state))
+      || (type === "thread.updated" && typeof data.change === "string" && HARD_BOARD_CHANGES.has(data.change));
+    // Alerts bypass the board; unknown and non-roster events can wait for the soft gap.
+    this.markDirty(hard ? "hard" : "soft", boardEventKey(type, data.change));
+    if (type === "ready") return { type: "invalidate" };
     const threadId = typeof data.threadId === "string" && /^[^\p{Cc}]{1,4096}$/u.test(data.threadId) ? data.threadId : undefined;
     if (!threadId) return { type: "wake" };
     if (type === "thread.updated") {
-      // Metadata updates also include worktree changes; the stream
-      // does not say which fields changed, so refresh them subject to the gap.
-      if (data.change !== "thread.model-selection-updated" && data.change !== "thread.interaction-mode-updated"
-        && data.change !== "thread.renamed" && data.change !== "message.updated") {
-        this.markDirty(HARD_BOARD_CHANGES.has(String(data.change)) ? "hard" : "soft");
-      }
       return data.change === "thread.runtime-mode-updated" ? { type: "invalidate" } : { type: "wake" };
     }
-    if (type === "thread.created") { this.markDirty(); return { type: "wake" }; }
+    if (type === "thread.created") return { type: "wake" };
     if (type !== "request.opened" && type !== "request.resolved" && type !== "thread.status" && type !== "message.completed") return;
     if (type === "message.completed" && data.role !== "user") return;
-    if (type !== "message.completed") this.markDirty();
     const directory = await this.directoryOf(threadId).catch(error => {
       toolError("telegram", "tg.robob.eventDirectory", { thread: threadId }, error); return undefined;
     });

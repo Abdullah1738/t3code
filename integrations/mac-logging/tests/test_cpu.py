@@ -75,6 +75,90 @@ class CpuTests(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(cpu.ProbeError):
                 cpu.parse_ps(text)
 
+    def test_exiting_state_and_bracketed_comm_matrix(self):
+        for state in ('?', '?E', '?s', '?N'):
+            for comm, expected in (('(Python)', 'python'), ('(claude)', 'claude'),
+                                   ('(sleep)', 'sleep'), ('((Python))', '(Python)')):
+                with self.subTest(state=state, comm=comm):
+                    rows = cpu.parse_ps(line(state=state, command=comm, cpu_time='0:00.00', rss=0))
+                    self.assertEqual(rows[0]['family'], expected)
+                    props, _ = cpu.deltas(rows, {}, 100)
+                    self.assertEqual(props['exiting'], 1)
+                    self.assertEqual(props['cpuS'], None)
+
+    def test_bad_line_class_skips_individually_at_ten_percent(self):
+        good = ''.join(line(pid=i) for i in range(1, 10))
+        cases = [('fields', '10 0 missing\n'),
+                 ('pid', line(pid='bad')), ('ppid', line(pid=10).replace('10 0 ', '10 bad ')),
+                 ('rss', line(pid=10).replace('2048', '-1')),
+                 ('cpu', line(pid=10, cpu_time='NaN')), ('etime', line(pid=10, etime='1:60')),
+                 ('start', line(pid=10, start='bad')), ('state', line(pid=10, state='!')),
+                 ('duplicate', line(pid=1))]
+        for form, bad in cases:
+            with self.subTest(form=form):
+                diagnostics = {}
+                parsed = cpu.parse_ps(good+bad, diagnostics)
+                self.assertEqual(len(parsed), 9)
+                self.assertEqual(diagnostics, dict(skippedLines=1))
+                props = cpu.sample(self.runner(text=good+bad))
+                self.assertEqual(props['skippedLines'], 1)
+                self.assertTrue(self.events()[-1]['ok'])
+                self.assertEqual(self.events()[-1]['props']['skippedLines'], 1)
+
+    def test_bad_line_error_threshold_diagnostics_and_state_unchanged(self):
+        cpu.sample(self.runner())
+        before = (self.root/'state/cpu.json').read_bytes()
+        bad = line(pid=321, command='/Users/ardud/private/server.py --token=private', state='!')
+        for good_count, bad_count in ((8, 1), (9, 2), (0, 1), (0, 5)):
+            with self.subTest(good=good_count, bad=bad_count):
+                props = cpu.sample(self.runner(text=''.join(line(pid=i) for i in range(1, good_count+1))+bad*bad_count))
+                self.assertEqual(props['failure'], 'parse')
+                self.assertEqual(props['badLines'], bad_count)
+                self.assertEqual(props['lines'], good_count+bad_count)
+                self.assertEqual((self.root/'state/cpu.json').read_bytes(), before)
+                event = self.events()[-1]
+                self.assertFalse(event['ok'])
+                self.assertNotIn('/Users/', json.dumps(event))
+                self.assertNotIn('private', json.dumps(event))
+                self.assertNotIn('321', event['props']['badLine'] or '')
+        diagnostics = {}
+        with self.assertRaises(cpu.ProbeError):
+            cpu.parse_ps(line(pid=321, state='!', command='/bin/sleep'), diagnostics)
+        self.assertTrue(diagnostics['badLine'].startswith('PID PPID '))
+        self.assertIn('/bin/sleep', diagnostics['badLine'])
+        self.assertLessEqual(len(diagnostics['badLine']), 200)
+
+    def test_exiting_pid_cpu_reset_never_produces_negative_or_rebound_delta(self):
+        _, old = cpu.deltas(cpu.parse_ps(line(cpu_time='0:20.00')), {}, 100)
+        rows = cpu.parse_ps(line(state='?E', command='(Python)', cpu_time='0:00.00', rss=0))
+        props, state = cpu.deltas(rows, old, 160)
+        self.assertEqual(props['cpuS'], 0)
+        self.assertEqual(props['top'][0]['cpuS'], 0)
+        self.assertEqual(props['exiting'], 1)
+        self.assertEqual(state['processes'], {})
+        recovered, _ = cpu.deltas(cpu.parse_ps(line(cpu_time='0:21.00')), state, 220)
+        self.assertEqual(recovered['cpuS'], 0)
+        cpu.hints(props['top'], rows, self.runner())
+        self.assertEqual(self.calls, [])
+
+    def test_parse_diagnostics_share_redactor_and_remain_under_cpu_cap(self):
+        with patch('cpu_labels.janitor_redact', return_value='PID PPID bad [REDACTED]') as redact:
+            diagnostics = {}
+            with self.assertRaises(cpu.ProbeError):
+                cpu.parse_ps(line(pid=321, state='!', command='x'*1000), diagnostics)
+            redact.assert_called_once()
+            self.assertEqual(diagnostics['badLine'], 'PID PPID bad [REDACTED]')
+        with patch('cpu_labels.janitor_redact', side_effect=ImportError):
+            diagnostics = {}
+            with self.assertRaises(cpu.ProbeError):
+                cpu.parse_ps(line(state='!'), diagnostics)
+            self.assertIsNone(diagnostics['badLine'])
+        props = dict(badLine='PID PPID '+'界'*1000, badLines=5, lines=10, skippedLines=5, exiting=4)
+        event = toollog.record('cpu', 'error', 'cpu.sample', dt.datetime.now(dt.timezone.utc), props=props)
+        self.assertEqual(len(event['props']['badLine']), 200)
+        self.assertEqual(event['props']['exiting'], 4)
+        self.assertLessEqual(len(json.dumps(event).encode()), 8192)
+
     def test_delta_same_identity_even_same_etime(self):
         _, old = cpu.deltas(cpu.parse_ps(line(cpu_time='0:10.00')), {}, 100)
         props, new = cpu.deltas(cpu.parse_ps(line(cpu_time='0:40.00')), old, 160)
