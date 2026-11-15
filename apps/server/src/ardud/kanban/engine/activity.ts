@@ -520,6 +520,20 @@ const ledgerUsage = (
         card.stage);
   const currentById = new Map(input.cards.map((card) => [card.id as string, card]));
   const readiness = groupEvents([...(input.readinessBefore ?? []), ...input.events]);
+  const flags = new Map([...readiness].map(([id, events]) => [id, events.filter(endsStall)]));
+  const stalledAt = (card: KanbanCard, at: number) => {
+    const last = flags.get(card.id)?.findLast((event) => time(event.at) <= at);
+    const snapshot = card.stalled;
+    if (
+      snapshot !== null &&
+      time(snapshot.at) <= at &&
+      (last === undefined || snapshot.at > last.at)
+    )
+      return snapshot;
+    return last !== undefined && isStall(last)
+      ? { at: last.at, by: last.actor, reason: last.body ?? "" }
+      : null;
+  };
   const todoSpans = spans
     .filter((span) => span.stage === "todo")
     .map((span) => {
@@ -540,7 +554,6 @@ const ledgerUsage = (
       return {
         span,
         dependencies,
-        flags: ownEvents.filter(endsStall),
         waits: waitIntervals(card, ownEvents, window.since, window.until),
         routes,
       };
@@ -548,7 +561,7 @@ const ledgerUsage = (
   const configured = new Map(pools.map((pool) => [pool.key, pool.slots]));
   const queued = (from: number, to: number) => {
     if (input.board?.archivedAt != null || input.board?.setup?.status === "running") return;
-    for (const { span, flags, waits, routes, dependencies } of todoSpans) {
+    for (const { span, waits, routes, dependencies } of todoSpans) {
       const card = span.card;
       if (input.board?.pause && !input.board.pause.keep.includes(card.id)) continue;
       if (
@@ -557,15 +570,8 @@ const ledgerUsage = (
         time(card.createdAt) > from
       )
         continue;
-      const last = flags.findLast((event) => time(event.at) <= from);
-      const snapshot = card.stalled;
-      const stalled =
-        (snapshot !== null &&
-          time(snapshot.at) <= from &&
-          (last === undefined || snapshot.at > last.at)) ||
-        (last !== undefined && isStall(last));
       if (
-        stalled ||
+        stalledAt(card, from) !== null ||
         waits.some(([a, b]) => a <= from && b > from) ||
         card.asks.some(
           (ask) =>
@@ -593,7 +599,11 @@ const ledgerUsage = (
       for (const id of dependencies) {
         const blocker = currentById.get(id);
         if (blocker && time(blocker.createdAt) <= from)
-          blockers.set(id, { ...blocker, stage: atStage(blocker, from) });
+          blockers.set(id, {
+            ...blocker,
+            stage: atStage(blocker, from),
+            stalled: stalledAt(blocker, from),
+          });
       }
       if (!Rules.cardFlow(candidate, blockers, new Map(), from).ready) continue;
       // A weighted alternative with room (or a reusable held thread) is not pool wait.

@@ -1183,6 +1183,94 @@ describe("ledger pool activity", () => {
     },
   );
 
+  it.each(
+    flagStarts.flatMap((state) =>
+      (["shared", "chain", "separate", "done"] as const).map((topology) => ({
+        ...state,
+        topology,
+      })),
+    ),
+  )("replays blocker flags: $name ($topology)", ({ prior, kind, body, expected, topology }) => {
+    const shared = ThreadId.make("idle-shared");
+    const blocker = card("flagged-blocker", {
+      workThreadId: topology === "separate" ? ThreadId.make("other-idle") : shared,
+      stage: topology === "done" ? "completed" : "todo",
+    });
+    const middle = card("middle", { workThreadId: shared, blockedBy: [blocker.id] });
+    const waiter = card("dependent", {
+      workThreadId: shared,
+      blockedBy: [topology === "chain" ? middle.id : blocker.id],
+    });
+    const result = run([slot(1, "take", "t1", before), slot(2, "take", "t2", before)], {
+      cards: [blocker, ...(topology === "chain" ? [middle] : []), waiter],
+      readinessBefore:
+        prior === null ? [] : [event(blocker.id, before, "flagged", null, null, prior)],
+      events: [event(blocker.id, t("01:00"), kind, null, null, body)],
+    });
+    const multiplier = topology === "chain" ? 3 : topology === "shared" ? 2 : 1;
+    expect(result.queueWait[pool] ?? [0, 0, 0]).toEqual(
+      topology === "done" ? [1, 1, 1] : expected.map((value) => value * multiplier),
+    );
+  });
+
+  it.each([
+    {
+      name: "clear after the window",
+      snapshot: null,
+      prior: "Run failed: error",
+      marks: [],
+      expected: [0, 0, 0],
+    },
+    {
+      name: "flag after the window",
+      snapshot: "04:00",
+      prior: "Cleared",
+      marks: [],
+      expected: [2, 2, 2],
+    },
+    {
+      name: "snapshot after a prior clear",
+      snapshot: "00:30",
+      prior: "Cleared",
+      marks: [],
+      expected: [1, 0, 0],
+    },
+    {
+      name: "recorded clear after a snapshot",
+      snapshot: "00:30",
+      prior: "Cleared",
+      marks: ["Cleared"],
+      expected: [1, 2, 2],
+    },
+    {
+      name: "tied flag then clear",
+      snapshot: null,
+      prior: "Cleared",
+      marks: ["Run failed: error", "Cleared"],
+      expected: [2, 2, 2],
+    },
+    {
+      name: "tied clear then flag",
+      snapshot: null,
+      prior: "Cleared",
+      marks: ["Cleared", "Run failed: error"],
+      expected: [2, 0, 0],
+    },
+  ])("keeps blocker flag history stable: $name", ({ snapshot, prior, marks, expected }) => {
+    const shared = ThreadId.make("idle-shared");
+    const blocker = card("flagged-blocker", {
+      workThreadId: shared,
+      stalled:
+        snapshot === null ? null : { at: t(snapshot), reason: "flag", by: { _tag: "owner" } },
+    });
+    const result = run([slot(1, "take", "t1", before), slot(2, "take", "t2", before)], {
+      cards: [blocker, card("dependent", { workThreadId: shared, blockedBy: [blocker.id] })],
+      readinessBefore: [event(blocker.id, before, "flagged", null, null, prior)],
+      events: marks.map((body) => event(blocker.id, t("01:00"), "flagged", null, null, body)),
+    });
+    expect(result.queueWait[pool] ?? [0, 0, 0]).toEqual(expected);
+  });
+
   it.each([
     {
       name: "wait snapshot set after a prior end",
