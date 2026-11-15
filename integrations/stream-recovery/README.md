@@ -65,6 +65,8 @@ recovery retries if it expires. `BEGIN` precedes the metadata read, keeping data
 and readiness pinned to the same export. The next scan opens the next complete export.
 Before recovery actions, current control-API shell timestamps must not be newer
 than the export watermark; this also defers an idle Stop that kept the same run ID.
+That thread waits for the next export without using a recovery attempt; other
+threads continue recovering in the same scan.
 Both Robob homes (`~/.robob`, `~/.t3`, configured `ROBOB_HOME`/`T3CODE_HOME`)
 and native OpenCode default/XDG database paths are protected, including aliases;
 an arbitrary fixture basename is not blocked.

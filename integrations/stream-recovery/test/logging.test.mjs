@@ -1,7 +1,28 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { timedScan } from '../lib/logging.mjs';
+import { deferThread, timedScan } from '../lib/logging.mjs';
 import { fixture } from '../../router-logging/test/support.mjs';
+
+test('scan deferrals count distinct ancestry units and aggregate nested maxima', async t => {
+  const { rows } = fixture(t);
+  const behind = ahead => Object.assign(new Error('thread is newer than Robob replica; recovery deferred'), {
+    code:'REPLICA_BEHIND_THREAD',replicaGeneration:42,replicaAgeMs:1_000,threadAheadMs:ahead,
+  });
+  await timedScan('stream', {}, async outer => {
+    await timedScan('restart', outer, async inner => {
+      assert.equal(deferThread(inner, 'parent', behind(1_500)), true);
+      deferThread(inner, 'parent', behind(2_500));
+      deferThread(inner, 'other', behind('unknown'));
+    });
+    deferThread(outer, 'parent', behind(500));
+    assert.equal(deferThread(outer, 'stale', {code:'REPLICA_UNAVAILABLE'}), false);
+  });
+  for (const lane of ['stream','restart']) {
+    const row = rows().find(row => row.name === `${lane}.scan`);
+    assert.equal(row.ok, true);
+    assert.deepEqual(row.props, {deferredThreads:2,maxThreadAheadMs:2_500});
+  }
+});
 
 test('scan timings aggregate repeated IO, preserve sync results, and bound output', async t => {
   const { rows } = fixture(t);

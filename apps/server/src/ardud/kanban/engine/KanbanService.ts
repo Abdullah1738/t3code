@@ -4590,8 +4590,17 @@ const make = Effect.gen(function* () {
     return associated;
   });
 
+  const isBoardEvaluator = Effect.fn("KanbanService.isBoardEvaluator")(function* (
+    threadId: ThreadId,
+    boardId: KanbanBoardId,
+  ) {
+    const link = yield* store.threadLink(threadId);
+    return link?.role === "evaluator" && link.boardId === boardId;
+  });
+
   const eligibleDiscussionEvaluator = Effect.fn("KanbanService.eligibleDiscussionEvaluator")(
-    function* (threadId: ThreadId) {
+    function* (threadId: ThreadId, boardId: KanbanBoardId) {
+      if (!(yield* isBoardEvaluator(threadId, boardId))) return false;
       if ((yield* Ref.get(evaluatorFailures)).get(threadId)?.state === "gone") return false;
       const view = yield* threads.find(threadId);
       const now = yield* nowMillis;
@@ -4611,7 +4620,7 @@ const make = Effect.gen(function* () {
       const discussion = yield* discussionOf(discussionId);
       const owner = discussion.evaluatorThreadId;
       if (owner === null || owner === launched) return discussion;
-      const eligible = yield* eligibleDiscussionEvaluator(owner);
+      const eligible = yield* eligibleDiscussionEvaluator(owner, discussion.boardId);
       // The thread read releases the permit; a newly saved owner gets its own check.
       const current = yield* discussionOf(discussionId);
       if (current.evaluatorThreadId !== owner) continue;
@@ -4652,6 +4661,8 @@ const make = Effect.gen(function* () {
     const now = yield* nowMillis;
     const rejected = new Set<EvaluatorReuseMissReason>();
     for (const id of ids) {
+      // Ordinary tool callers also have evaluator actor tags; only board links prove the role.
+      if (!(yield* isBoardEvaluator(id, card.boardId))) continue;
       if ((yield* Ref.get(evaluatorFailures)).get(id)?.state === "gone") {
         rejected.add("failed");
         continue;
@@ -4994,7 +5005,7 @@ const make = Effect.gen(function* () {
         const owner = row.card_id
           ? yield* reusableEvaluator(yield* cardOf(KanbanCardId.make(row.card_id)))
           : discussion.evaluatorThreadId !== null &&
-              (yield* eligibleDiscussionEvaluator(discussion.evaluatorThreadId))
+              (yield* eligibleDiscussionEvaluator(discussion.evaluatorThreadId, discussion.boardId))
             ? discussion.evaluatorThreadId
             : null;
         if (owner) {
@@ -5399,6 +5410,7 @@ const make = Effect.gen(function* () {
     const ids: ThreadId[] = [];
     for (const ask of card.asks) {
       if (ask.by._tag !== "evaluator" || ids.includes(ask.by.threadId)) continue;
+      if (!(yield* isBoardEvaluator(ask.by.threadId, card.boardId))) continue;
       if (!(yield* liveEvaluator(ask.by.threadId))) continue;
       const view = yield* threads.find(ask.by.threadId);
       if (!view || view.state === "idle") continue;
@@ -5437,6 +5449,7 @@ const make = Effect.gen(function* () {
     ];
     for (const priorId of handoffPriors) {
       if (priorId === threadId) continue;
+      if (!(yield* isBoardEvaluator(priorId, card.boardId))) continue;
       const key = `discussion-handoff:${discussionId}:${priorId}`;
       if (handedOff.has(key)) continue;
       if ((yield* Ref.get(evaluatorFailures)).get(priorId)?.state === "gone") continue;
@@ -5594,7 +5607,7 @@ const make = Effect.gen(function* () {
       if (discussion.evaluatorThreadId !== null) {
         if (
           discussion.evaluatorThreadId !== originalOwner &&
-          (yield* eligibleDiscussionEvaluator(discussion.evaluatorThreadId))
+          (yield* eligibleDiscussionEvaluator(discussion.evaluatorThreadId, discussion.boardId))
         )
           return yield* deliverSaved(discussion, false);
         discussion = yield* saveDiscussion({ ...discussion, evaluatorThreadId: null });
@@ -6118,12 +6131,16 @@ const make = Effect.gen(function* () {
       const { text, note, answeredBy } = notice;
       let current = discussion;
       const told = new Set<string>(notice.told);
+      const evaluatorAskers = new Set<ThreadId>();
+      if (notice.singleEvaluator)
+        for (const ask of notice.answered)
+          if (
+            ask.by._tag === "evaluator" &&
+            (yield* isBoardEvaluator(ask.by.threadId, card.boardId))
+          )
+            evaluatorAskers.add(ask.by.threadId);
       const evaluatorOwner = notice.singleEvaluator ? yield* reusableEvaluator(card) : null;
-      if (
-        notice.singleEvaluator &&
-        !evaluatorOwner &&
-        notice.answered.some((ask) => ask.by._tag === "evaluator")
-      ) {
+      if (notice.singleEvaluator && !evaluatorOwner && evaluatorAskers.size > 0) {
         current = yield* toEvaluator(current, text, note);
         if (current.evaluatorThreadId) told.add(current.evaluatorThreadId);
       }
@@ -6146,9 +6163,10 @@ const make = Effect.gen(function* () {
         }
       }
       for (const ask of notice.answered) {
-        if (notice.singleEvaluator && ask.by._tag === "evaluator" && !evaluatorOwner) continue;
+        const collapse = ask.by._tag === "evaluator" && evaluatorAskers.has(ask.by.threadId);
+        if (collapse && !evaluatorOwner) continue;
         const by =
-          ask.by._tag === "evaluator" && evaluatorOwner
+          collapse && evaluatorOwner
             ? { _tag: "evaluator" as const, threadId: evaluatorOwner }
             : ask.by;
         // Whoever answers or drops their own question isn't told about it.
@@ -6564,7 +6582,12 @@ const make = Effect.gen(function* () {
         yield* route;
         for (const ask of asks) {
           const by = ask.by;
-          if (by._tag === "evaluator" && card && askId === undefined) {
+          if (
+            by._tag === "evaluator" &&
+            card &&
+            askId === undefined &&
+            (yield* isBoardEvaluator(by.threadId, card.boardId))
+          ) {
             const current = yield* discussionOf(discussionId);
             const target = yield* reusableEvaluator(card);
             if (target) {
