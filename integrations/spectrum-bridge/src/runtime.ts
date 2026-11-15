@@ -21,7 +21,7 @@ import { getSecretRequest, type SecretDeps } from "./secrets.ts";
 import { SHARE_ROUTES, shareRoute, type Shares } from "./share.ts";
 import { sessionMatches } from "./session.ts";
 import { Store } from "./store.ts";
-import { AgentBus, validAgentRequestId, validAnswerStatus, type AgentAnswerReceipt } from "./agent-bus.ts";
+import { AGENT_BUS_WAKE_PREFIX, AgentBus, validAgentRequestId, validAnswerStatus, type AgentAnswerReceipt } from "./agent-bus.ts";
 
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 
@@ -154,10 +154,10 @@ export class ChatRegistry<P> {
   }
 
   /** Machine input for a chat's agent (owner decisions, questions from other chats). Deduped by key. */
-  wake(chat: Chat<P>, text: string, dedupeKey: string, agentAnswer?: AgentAnswerReceipt): { id: string; created: boolean } {
-    const id = `wake:${hash(dedupeKey)}`;
+  wake(chat: Chat<P>, text: string, dedupeKey: string, metadata: { agentAnswer?: AgentAnswerReceipt; agentBus?: boolean } = {}): { id: string; created: boolean } {
+    const id = `${metadata.agentBus ? AGENT_BUS_WAKE_PREFIX : "wake:"}${hash(dedupeKey)}`;
     const created = chat.store.acceptInbound(id, { id, text, attachments: [], isAudioMessage: false, receivedAt: this.now(),
-      ...(agentAnswer ? { agentAnswer } : {}) });
+      ...(metadata.agentAnswer ? { agentAnswer: metadata.agentAnswer } : {}) });
     if (created) this.touch(chat);
     return { id, created };
   }
@@ -271,11 +271,11 @@ export function createAgentBus<P>(registry: ChatRegistry<P>, log: (event: string
     deliver: (target, text, key, receipt) => {
       const chat = registry.bySlugName(target.slug);
       if (!chat) throw new Error("Agent target unavailable");
-      registry.wake(chat, text, key, receipt);
+      registry.wake(chat, text, key, { agentAnswer: receipt, agentBus: true });
     },
     receipt: (target, key) => {
       const chat = registry.bySlugName(target.slug);
-      const row = chat?.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(`wake:${hash(key)}`);
+      const row = chat?.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(`${AGENT_BUS_WAKE_PREFIX}${hash(key)}`);
       const receipt = row ? (JSON.parse(row.payload) as { agentAnswer?: AgentAnswerReceipt }).agentAnswer : undefined;
       return receipt && validAnswerStatus(receipt.status) && Number.isSafeInteger(receipt.at)
         && Number.isSafeInteger(receipt.chars) && receipt.chars >= 0 ? receipt : undefined;

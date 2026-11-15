@@ -3,6 +3,9 @@ import { createHash } from "node:crypto";
 import type { ChatInfo } from "./chats.ts";
 import type { SbApiResult } from "./sb-api.ts";
 
+export const AGENT_BUS_WAKE_PREFIX = "wake:agent-bus:";
+export const isAgentBusWake = (id: string) => id.startsWith(AGENT_BUS_WAKE_PREFIX);
+
 export type AnswerStatus = "done" | "declined" | "pending";
 export type AgentAnswerReceipt = { status: AnswerStatus; chars: number; at: number };
 export const validAgentRequestId = (value: unknown): value is string => typeof value === "string"

@@ -760,3 +760,16 @@ test("a pending independent completion read is included when the consuming tick 
       .toMatchObject({ props: { route: "/threads/:id", slowestReadMs: 6_001, completionCheck: "unchecked" } });
   } finally { pending.resolve(); await producer.result; write.mockRestore(); clock.mockRestore(); }
 });
+
+test.each(["owner", "moni"].flatMap(slug => [true, false].map(bus => ({ slug, bus }))))(
+  "stuck-wake alerts stay quiet for agent-bus traffic ($slug, bus=$bus)", async ({ slug, bus }) => {
+    const h = setup(slug);
+    const id = bus ? "wake:agent-bus:stuck" : "wake:watcher-stuck";
+    h.input(id, 15 * 60_000);
+    h.store.set(`stuck-wake-retry:${id}`, now - 5 * 60_000);
+    h.store.set(`stuck-wake-attempt:${id}`, now - 5 * 60_000);
+    await h.router.checkInboundLatency();
+    expect(h.alerts).toEqual(bus ? [] : [`imessage-stuck-wake:${id}`]);
+    expect(h.backend.prompts).toEqual([]);
+  },
+);
