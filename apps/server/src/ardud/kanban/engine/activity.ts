@@ -15,6 +15,9 @@ import {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 
+import { COMPACT_READ_CHARS } from "../../compactRead.ts";
+export { COMPACT_READ_CHARS } from "../../compactRead.ts";
+
 import * as Retries from "./retries.ts";
 import * as Rules from "./rules.ts";
 import { waitEventOf } from "./waits.ts";
@@ -23,8 +26,6 @@ import { waitEventOf } from "./waits.ts";
 export const ACTIVITY_MAX_WINDOW_MS = 72 * 60 * 60 * 1000;
 /** The default window: the last day. */
 export const ACTIVITY_DEFAULT_WINDOW_MS = 24 * 60 * 60 * 1000;
-/** Characters one compact read stays under, well below the agents' tool output limit. */
-export const COMPACT_READ_CHARS = 50_000;
 /** Events card_get returns when no events page is asked for. */
 export const CARD_EVENTS_DEFAULT = 20;
 export const CARD_EVENTS_MAX = 200;
