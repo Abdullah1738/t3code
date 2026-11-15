@@ -90,6 +90,8 @@ test("a server without BUN_INSPECT leaves it alone", async () => {
 
 test('offbox decisions log both allowed and denied without command arguments', () => {
   const script = `
+    // The shared toollog samples allowed hook rows at 1/HOOK_SAMPLE_RATE.
+    Math.random=()=>0;
     const {default:plugin} = await import(${JSON.stringify(join(root,'plugin/offbox-gate.ts'))});
     for (const mode of ['observe','enforce']) {
       process.env.OFFBOX_GATE_MODE=mode;
