@@ -48,7 +48,7 @@ _ENUMS = {
     'outcome': {'success', 'failure', 'refused', 'ask_now', 'dont_ask', 'unverified', 'failed'},
     'kind': {'refund', 'dispute', 'decline', 'unasked_charge', 'charge', 'hold',
              'payment_deadline', 'autopay_expected', 'merchant_card'},
-    'starved_by': {'none', 'owner_threads', 'msgs', 'lookups', 'census', 'receipt',
+    'starved_by': {'none', 'owner_threads', 'msgs', 'lookups', 'census', 'receipt', 'history',
                    'reconcile', 'follow', 'attention', 'build_write', 'merchants', 'order_charges',
                    'payments', 'questions', 'refunds', 'order_screen', 'loads', 'writes', 'locks'},
     'owner_result': {'ok', 'incomplete', 'list_failed'},
@@ -59,9 +59,9 @@ _ENUMS = {
 _ENUMS['from'] = _ENUMS['to'] = _ENUMS['state']
 _BOOLS = {'prepareOnly', 'changed', 'fallback', 'budgetHit', 'unmatched', 'deadlineMoved', 'answered', 'polled'}
 _NUMBERS = {'exitCode', 'amountMinor', 'count', 'ageDays', 'openCases', 'fired', 'sourceLimits',
-            'msgs_timeouts', 'msgs_p50_ms',
+            'msgs_cpu_ms', 'msgs_concurrent_max', 'msgs_cache_hits', 'msgs_timeouts', 'msgs_p50_ms',
             'merchants_ms', 'order_charges_ms', 'payments_ms', 'questions_ms', 'refunds_ms',
-            'order_screen_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'writes_n', 'locks_ms', 'follow_ms', 'untimed_ms',
+            'order_screen_ms', 'history_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'writes_n', 'locks_ms', 'follow_ms', 'untimed_ms',
             'owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms',
             'owner_list_pages', 'owner_list_ms', 'owner_threads_selected', 'owner_threads_fresh',
             'owner_threads_needed', 'owner_threads_fetched', 'owner_fetch_ms_max', 'owner_timeouts', 'owner_cache_size'}
@@ -73,9 +73,9 @@ _MONEY_PROPS = {
     'case.close': {'kind', 'ageDays'},
     'question.ask': {'outcome'},
     'check.run': {'budgetHit', 'openCases', 'fired', 'slowestPhase', 'sourceLimits', 'limitKinds', 'orderCoverage', 'chargeCensus',
-                  'msgs_timeouts', 'msgs_p50_ms', 'msgs_by_kind', 'receipt_result',
+                  'msgs_cpu_ms', 'msgs_concurrent_max', 'msgs_cache_hits', 'msgs_timeouts', 'msgs_p50_ms', 'msgs_by_kind', 'receipt_result',
                   'merchants_ms', 'order_charges_ms', 'payments_ms', 'questions_ms', 'refunds_ms',
-                  'order_screen_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'writes_n', 'locks_ms', 'follow_ms', 'untimed_ms',
+                  'order_screen_ms', 'history_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'writes_n', 'locks_ms', 'follow_ms', 'untimed_ms',
                   'owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms', 'starved_by',
                   'owner_list_pages', 'owner_list_ms', 'owner_threads_selected', 'owner_threads_fresh',
                   'owner_threads_needed', 'owner_threads_fetched', 'owner_fetch_ms_max', 'owner_timeouts', 'owner_cache_size', 'owner_result'},
@@ -449,7 +449,7 @@ def _fields(props):
         elif key in _BOOLS and type(value) is bool:
             result[key] = value
         elif key in _NUMBERS and type(value) is int and abs(value) <= 10**12 \
-                and (not (key.endswith('_ms') or key == 'writes_n' or key.startswith('owner_')) or value >= 0):
+                and (not (key.endswith('_ms') or key.startswith('msgs_') or key == 'writes_n' or key.startswith('owner_')) or value >= 0):
             result[key] = value
         elif key == 'hours' and type(value) in (int, float) and math.isfinite(value) and 0 < value <= 24:
             result[key] = value
@@ -464,7 +464,7 @@ def _fields(props):
         elif key == 'msgs_by_kind' and isinstance(value, dict):
             result[key] = {kind: {k: v for k, v in bucket.items() if k in {'count', 'ms'}
                                   and type(v) is int and 0 <= v <= 10**9}
-                           for kind, bucket in value.items() if kind in {'receipt', 'order', 'other'}
+                           for kind, bucket in value.items() if kind in {'receipt', 'order', 'refund', 'history', 'other'}
                            and isinstance(bucket, dict)}
         elif key == 'chargeCensus' and isinstance(value, dict):
             result[key] = {app: {k: v for k, v in counts.items()
