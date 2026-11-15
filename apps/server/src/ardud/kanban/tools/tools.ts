@@ -206,7 +206,7 @@ const tool = <
 const BoardGet = tool(
   "board_get",
   "Read the board",
-  "Compact Missions board: settings/instructions, goals, pools, groups, live thread states, unread counts and a page of card number/title/stage/owner/model/short status. No card descriptions, prompts, event histories, goal stories or wiki bodies; use card_get and wiki_read for detail. Default 200 cards, max 500; follow board.page.nextAfter with after while hasMore. With since, only cards active since then (an event, or an open or touched ask), one short row each: stage changes, review verdicts, run failures, stall, asks with asked/answered times; no settings, groups or unread; each page stays under 50,000 characters. boardId defaults to the board identified by this thread; when ambiguous, pass one of the candidate board ids in the error.",
+  "Compact Missions board: settings/instructions, goals, pools, groups, live thread states, unread counts and a page of card number/title/stage/owner/model/short status. No card descriptions, prompts, event histories, goal stories or wiki bodies; use card_get and wiki_read for detail. Default 200 cards, max 500. Every page stays under 50,000 characters and can hold fewer cards than limit when rows are large; follow board.page.nextAfter with after while hasMore. With since, only cards active since then (an event, or an open or touched ask), one short row each: stage changes, review verdicts, run failures, stall, asks with asked/answered times; no settings, groups or unread. boardId defaults to the board identified by this thread; when ambiguous, pass one of the candidate board ids in the error.",
   {
     boardId: BoardRef,
     after: Schema.optional(
