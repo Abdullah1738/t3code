@@ -845,7 +845,7 @@ it("groups fixed denial reasons and roles and measures each timeout phase separa
   for (const [callerRole, denyReason] of [
     ["work", "not_card_owner"],
     ["work", "not_card_owner"],
-    ["delegated", "role_not_allowed"],
+    ["review", "role_not_allowed"],
   ] as const) {
     accumulate(
       target,
@@ -897,7 +897,7 @@ it("groups fixed denial reasons and roles and measures each timeout phase separa
   const rows = rollup.mcpFailureBreakdown!;
   const denied = rows.find((row) => row.tool === "subtask_done")!;
   assert.deepEqual(denied.byReason, { not_card_owner: 2, role_not_allowed: 1 });
-  assert.deepEqual(denied.byRole, { work: 2, delegated: 1 });
+  assert.deepEqual(denied.byRole, { work: 2, review: 1 });
   const timeout = rollup.mcpReplyTimeouts!.find((row) => row.tool === "card_edit")!;
   assert.equal(timeout.callerRole, "evaluator");
   assert.deepEqual(rows.find((row) => row.tool === "card_edit")!.byRole, { evaluator: 3 });

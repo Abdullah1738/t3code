@@ -4377,6 +4377,96 @@ it.effect(
   },
 );
 
+it.effect("card_edit analytics separates invalid subtask plans from approval refusals", () => {
+  const fake = fakeThreads();
+  let pending: Deferred.Deferred<AnalyticsEvent> | undefined;
+  const sink = Layer.mock(Analytics.Analytics)({
+    record: (event) =>
+      pending && event.kind === "mcp.call" && event.tool === "card_edit"
+        ? Deferred.succeed(pending, event).pipe(Effect.asVoid)
+        : Effect.void,
+  });
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "plan-reasons",
+      name: "Plan reasons",
+      defaultProjectId: null,
+    });
+    const card = yield* kanban.createCard(
+      board.id,
+      {
+        title: "Plan",
+        prompt: "Work",
+        subtasks: [
+          { text: "Implement", owner: "work" },
+          { text: "Pay the invoice", owner: "evaluator", gate: "money" },
+        ],
+      },
+      owner,
+    );
+    const cases = [
+      {
+        subtasks: [{ id: "s999" }],
+        reason: "subtask_not_found",
+        message: "the card has no subtask s999. Existing subtask ids: s1, s2",
+      },
+      {
+        subtasks: [{ id: "s1" }, { id: "s1" }],
+        reason: "invalid_args",
+        message: "subtask s1 is listed twice",
+      },
+      {
+        subtasks: [{ text: "New" }],
+        reason: "invalid_args",
+        message: "a new subtask needs text and owner",
+      },
+      {
+        subtasks: [{ owner: "work" }],
+        reason: "invalid_args",
+        message: "a new subtask needs text and owner",
+      },
+      {
+        subtasks: [{ text: " ", owner: "work" }],
+        reason: "invalid_args",
+        message: "Expected a non-blank string",
+      },
+      {
+        subtasks: [{ text: "Implement", owner: "work", gate: "money" }],
+        reason: "invalid_args",
+        message: "a deploy, money or secret step must be owned by the evaluator or a script",
+      },
+      {
+        subtasks: [{ id: "s2", clearGate: "This gate was added by mistake" }],
+        reason: "approval_required",
+        message: "only Abdullah's answer clears it",
+      },
+    ] as const;
+    for (const row of cases) {
+      pending = yield* Deferred.make<AnalyticsEvent>();
+      const result = yield* call(ThreadId.make("plan-evaluator"), "card_edit", {
+        card: card.id,
+        subtasks: row.subtasks,
+      }).pipe(Effect.result);
+      if (Result.isFailure(result)) {
+        assert.include(String(result.failure), row.message);
+      } else {
+        assert.isTrue(result.success.isError);
+        assert.include(result.success.text, row.message);
+      }
+      const recorded = yield* Deferred.await(pending);
+      assert.equal(recorded.denyReason, row.reason);
+      assert.equal(
+        recorded.errorTag,
+        row.reason === "approval_required" ? "capability_denied" : "invalid_request",
+      );
+      assert.equal(recorded.cardId, card.id);
+      assert.notInclude(JSON.stringify(recorded), row.message);
+      assert.deepStrictEqual((yield* kanban.card(card.id)).card.subtasks, card.subtasks);
+    }
+  }).pipe(Effect.provide(fake.layer.pipe(Layer.provide(sink))));
+});
+
 it.effect(
   "subtasks advertise their limit, reject long text in the schema and list existing ids",
   () => {
@@ -6223,6 +6313,16 @@ it.effect.each([
   Effect.gen(function* () {
     const saved = yield* Deferred.make<void>();
     let enabled = false;
+    const recorded = yield* Deferred.make<AnalyticsEvent>();
+    const initialRecorded = yield* Deferred.make<void>();
+    const sink = Layer.mock(Analytics.Analytics)({
+      record: (event) =>
+        event.kind === "mcp.call" && event.tool === "report_bug"
+          ? enabled
+            ? Deferred.succeed(recorded, event).pipe(Effect.asVoid)
+            : Deferred.succeed(initialRecorded, undefined).pipe(Effect.asVoid)
+          : Effect.void,
+    });
     const fake = fakeThreads(undefined, undefined, undefined, undefined, {
       mode,
       saved,
@@ -6250,6 +6350,7 @@ it.effect.each([
       if (outcome === "deduped sighting") {
         const first = yield* call(thread, "report_bug", input);
         assert.isFalse(first.isError, first.text);
+        yield* Deferred.await(initialRecorded);
       }
       enabled = true;
       const request = yield* call(thread, "report_bug", input).pipe(Effect.forkChild);
@@ -6258,6 +6359,14 @@ it.effect.each([
       const result = yield* Fiber.join(request);
       assert.isFalse(result.isError, result.text);
       assert.strictEqual(result.structured.saved, true);
+      const row = yield* Deferred.await(recorded);
+      assert.equal(row.errorTag, mode === "slow" ? "reply_timeout" : "reply_error");
+      assert.equal(row.saved, true);
+      if (outcome !== "evaluator") {
+        assert.equal(row.cardId, card.id);
+        assert.equal(row.cardNumber, card.number);
+        assert.equal(row.cardStage, card.stage);
+      }
       if (outcome === "evaluator") {
         assert.isString(result.structured.threadId);
         assert.lengthOf(fake.launches, 1);
@@ -6273,7 +6382,7 @@ it.effect.each([
         const retry = yield* call(thread, "report_bug", input);
         assert.isTrue(retry.structured.deduped);
       }
-    }).pipe(Effect.provide(fake.layer));
+    }).pipe(Effect.provide(fake.layer.pipe(Layer.provide(sink))));
   }),
 );
 
@@ -6804,6 +6913,7 @@ it.effect(
                 } else {
                   assert.equal(row.cardId, known.id);
                   assert.equal(row.props?.cardNumber, known.number);
+                  if (row.kind === "mcp.call") assert.equal(row.cardStage, known.stage);
                 }
               }
             }

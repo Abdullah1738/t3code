@@ -1394,18 +1394,18 @@ const provenanceCases = [
     name: "legacy run origin",
     origin: "legacy",
     own: false,
-    role: "delegated",
+    role: "work",
     kind: "delegated_child",
     number: 4336,
   },
-  {
-    name: "explicit subagent",
-    origin: "subagent",
+  ...(["work", "review", "evaluator", "discussion"] as const).map((role) => ({
+    name: `explicit subagent of ${role}`,
+    origin: "subagent" as const,
     own: false,
-    role: "delegated",
-    kind: "delegated_child",
+    role,
+    kind: "delegated_child" as const,
     number: 4336,
-  },
+  })),
   {
     name: "ordinary fork",
     origin: "fork",
@@ -1471,7 +1471,7 @@ it.effect.each([
       cardId: `card-${number}`,
       cardNumber: number,
       cardStage: "working",
-      callerRole: "work" as const,
+      callerRole: scenario.role === "none" ? ("work" as const) : scenario.role,
     });
     const registration = McpHttpServer.toolkitRegistration(toolkit, handlers).pipe(
       Layer.provideMerge(McpServer.McpServer.layer),
@@ -1641,7 +1641,7 @@ it("does not take refusal metadata from a successful result body", () => {
 
 it.each([
   ["work", "board_thread"],
-  ["delegated", "delegated_child"],
+  ["review", "delegated_child"],
 ] as const)("caller_unresolved preserves known %s caller context", (callerRole, callerKind) => {
   const state: McpCall.McpCall["Service"] = {
     callerResolved: false,

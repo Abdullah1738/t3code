@@ -13252,7 +13252,7 @@ const make = Effect.gen(function* () {
         "role_not_allowed",
       );
     const plan = Subtasks.planSubtasks([], input.subtasks ?? [], 0, at, board.guessedGates);
-    if (!plan.ok) return yield* failWith("invalid", plan.reason);
+    if (!plan.ok) return yield* failWith("invalid", plan.reason, plan.denyReason);
     yield* checkScriptNames(boardId, plan.subtasks);
     return {
       id: KanbanCardId.make(`card-${uuid()}`),
@@ -13802,7 +13802,7 @@ const make = Effect.gen(function* () {
             )
           : null;
         if (plan && !plan.ok)
-          return yield* failWith(plan.code ?? "invalid", plan.reason, "approval_required");
+          return yield* failWith(plan.code ?? "invalid", plan.reason, plan.denyReason);
         if (plan?.ok) {
           for (const subtask of card.subtasks) {
             if (subtask.state !== "open") continue;
@@ -17345,6 +17345,7 @@ const make = Effect.gen(function* () {
           const ambiguous = best && !best.exact && matches[1]?.score === best.score;
           const target = hinted ?? (best?.strong && !ambiguous ? best.card : undefined);
           if (!target) return undefined;
+          yield* resolvedContext(target);
           const candidates = matches.slice(0, 3).map(({ card, score }) => ({
             id: card.id,
             number: card.number,

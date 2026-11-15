@@ -753,7 +753,12 @@ export type SubtaskPlan =
       /** The card's counter after this plan; store it with the card. */
       readonly subtaskSeq: number;
     }
-  | { readonly ok: false; readonly reason: string; readonly code?: "denied" };
+  | {
+      readonly ok: false;
+      readonly reason: string;
+      readonly code?: "denied";
+      readonly denyReason: "invalid_args" | "subtask_not_found" | "approval_required";
+    };
 
 /**
  * Who is marking a subtask. Evaluators can mark any; a worker only its own
@@ -834,20 +839,35 @@ export function planSubtasks(
     const id = input.id?.trim();
     const reason = input.clearGate?.trim();
     if (reason !== undefined) {
-      if (!id) return { ok: false, reason: "clearGate needs an existing subtask id" };
+      if (!id)
+        return {
+          ok: false,
+          denyReason: "invalid_args",
+          reason: "clearGate needs an existing subtask id",
+        };
       if (input.gate != null)
-        return { ok: false, reason: "clearGate cannot be combined with an explicit gate" };
+        return {
+          ok: false,
+          denyReason: "invalid_args",
+          reason: "clearGate cannot be combined with an explicit gate",
+        };
       if (reason.length < 10 || reason.length > 300)
-        return { ok: false, reason: "clearGate needs a reason of 10–300 characters" };
+        return {
+          ok: false,
+          denyReason: "invalid_args",
+          reason: "clearGate needs a reason of 10–300 characters",
+        };
     }
     const known = id ? byId.get(id) : undefined;
     if (id) {
       if (!known)
         return {
           ok: false,
+          denyReason: "subtask_not_found",
           reason: `the card has no subtask ${id}. Existing subtask ids: ${subtaskIds(existing) || "none"}`,
         };
-      if (listed.has(id)) return { ok: false, reason: `subtask ${id} is listed twice` };
+      if (listed.has(id))
+        return { ok: false, denyReason: "invalid_args", reason: `subtask ${id} is listed twice` };
       listed.add(id);
       // An id alone also preserves script bindings and approval timestamps.
       if (
@@ -869,16 +889,26 @@ export function planSubtasks(
     const rawText = input.text ?? known?.text;
     const owner = input.owner ?? known?.owner;
     if (rawText === undefined || owner === undefined) {
-      return { ok: false, reason: "a new subtask needs text and owner" };
+      return {
+        ok: false,
+        denyReason: "invalid_args",
+        reason: "a new subtask needs text and owner",
+      };
     }
     const text = rawText.trim();
-    if (text.length === 0) return { ok: false, reason: "a subtask needs text" };
+    if (text.length === 0)
+      return { ok: false, denyReason: "invalid_args", reason: "a subtask needs text" };
     if (text.length > MAX_TEXT) {
-      return { ok: false, reason: `a subtask is at most ${MAX_TEXT} characters` };
+      return {
+        ok: false,
+        denyReason: "invalid_args",
+        reason: `a subtask is at most ${MAX_TEXT} characters`,
+      };
     }
     if (owner === "work" && input.gate != null) {
       return {
         ok: false,
+        denyReason: "invalid_args",
         reason: `subtask "${text}" is the worker's; a deploy, money or secret step must be owned by the evaluator or a script`,
       };
     }
@@ -886,12 +916,17 @@ export function planSubtasks(
     if (interrupting && (owner === "work" || owner === "review")) {
       return {
         ok: false,
+        denyReason: "invalid_args",
         reason: "an interrupting step must be owned by the evaluator or a script",
       };
     }
     const ownerOnly = input.ownerOnly ?? known?.ownerOnly;
     if (ownerOnly && (owner === "work" || owner === "review")) {
-      return { ok: false, reason: "an owner-only step must be owned by the evaluator or a script" };
+      return {
+        ok: false,
+        denyReason: "invalid_args",
+        reason: "an owner-only step must be owned by the evaluator or a script",
+      };
     }
     const { gate, gateSource, previousGate, keepClear } = planGate(
       input,
@@ -906,11 +941,16 @@ export function planSubtasks(
     if (script && owner !== "script") {
       return {
         ok: false,
+        denyReason: "invalid_args",
         reason: `subtask "${text}" names a script, so its owner must be "script"`,
       };
     }
     if (input.step !== undefined && (!Number.isInteger(input.step) || input.step < 1)) {
-      return { ok: false, reason: "a subtask's step is a whole number from 1" };
+      return {
+        ok: false,
+        denyReason: "invalid_args",
+        reason: "a subtask's step is a whole number from 1",
+      };
     }
     step = input.step ?? known?.step ?? step + 1;
     if (known) {
@@ -936,12 +976,17 @@ export function planSubtasks(
       ) {
         return {
           ok: false,
+          denyReason: "approval_required",
           code: "denied",
           reason: `subtask ${known.id} has a ${clearing} gate set on purpose; only Abdullah's answer clears it (card_ask naming ${known.id})`,
         };
       }
       if (clearing && (!actor || !at))
-        return { ok: false, reason: "clearGate needs the clearing actor and time" };
+        return {
+          ok: false,
+          denyReason: "invalid_args",
+          reason: "clearGate needs the clearing actor and time",
+        };
       const gateCleared =
         clearing && actor && at
           ? { gate: clearing, reason: reason!, by: actor, at, text }
@@ -994,7 +1039,11 @@ export function planSubtasks(
     });
   const subtasks = [...planned, ...kept].toSorted((a, b) => a.step - b.step);
   if (subtasks.length > MAX_SUBTASKS) {
-    return { ok: false, reason: `a card has at most ${MAX_SUBTASKS} subtasks` };
+    return {
+      ok: false,
+      denyReason: "invalid_args",
+      reason: `a card has at most ${MAX_SUBTASKS} subtasks`,
+    };
   }
   return { ok: true, subtasks, subtaskSeq: nextId };
 }

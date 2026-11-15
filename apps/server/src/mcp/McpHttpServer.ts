@@ -1131,9 +1131,7 @@ const withToolAnalytics =
                           : undefined;
                       const delegated =
                         parentThreadId !== undefined || context?.callerKind === "delegated_child";
-                      callState.callerRole = delegated
-                        ? "delegated"
-                        : (context?.callerRole ?? "none");
+                      callState.callerRole = context?.callerRole ?? "none";
                       callState.callerKind = delegated
                         ? "delegated_child"
                         : (context?.callerKind ?? (context?.boardId ? "board_thread" : "unknown"));
@@ -1453,6 +1451,7 @@ const withToolAnalytics =
                           callState.boardId = receipt.card.boardId;
                           callState.cardId = receipt.card.id;
                           callState.cardNumber = receipt.card.number;
+                          callState.cardStage = receipt.card.stage;
                         }
                         parentSaved(receipt);
                       }),

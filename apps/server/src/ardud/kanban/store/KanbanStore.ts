@@ -142,7 +142,7 @@ export interface KanbanStoreShape {
         cardId?: string;
         cardNumber?: number;
         cardStage?: string;
-        callerRole: "work" | "review" | "evaluator" | "discussion" | "delegated" | "none";
+        callerRole: "work" | "review" | "evaluator" | "discussion" | "none";
         callerKind?: "delegated_child" | "plain_thread" | "unknown";
       }
     | undefined;
@@ -523,16 +523,12 @@ const make = Effect.gen(function* () {
     }
     if (!link)
       return callerParents.has(threadId)
-        ? { callerRole: "delegated", callerKind: "delegated_child" }
+        ? { callerRole: "none", callerKind: "delegated_child" }
         : { callerRole: "none", callerKind: callerHydrated ? "plain_thread" : "unknown" };
     const card = link.cardId === null ? undefined : callerCards.get(link.cardId);
     return {
       boardId: link.boardId,
-      callerRole: callerParents.has(threadId)
-        ? "delegated"
-        : link.discussionId !== null
-          ? "discussion"
-          : link.role,
+      callerRole: link.discussionId !== null ? "discussion" : link.role,
       ...(callerParents.has(threadId) ? { callerKind: "delegated_child" as const } : {}),
       ...(link.cardId === null ? {} : { cardId: link.cardId }),
       ...(card === undefined ? {} : { cardNumber: card.number, cardStage: card.stage }),

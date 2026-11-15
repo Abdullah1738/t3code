@@ -1396,10 +1396,12 @@ describe("planSubtasks", () => {
     expect(plan.subtasks).toHaveLength(30);
     expect(planSubtasks([], [...inputs, { text: "Extra", owner: "work" }])).toEqual({
       ok: false,
+      denyReason: "invalid_args",
       reason: "a card has at most 30 subtasks",
     });
     expect(planSubtasks([], [{ text: "x".repeat(501), owner: "work" }])).toEqual({
       ok: false,
+      denyReason: "invalid_args",
       reason: "a subtask is at most 500 characters",
     });
     for (const text of [" ", "x".repeat(501)]) {
@@ -1414,6 +1416,7 @@ describe("planSubtasks", () => {
       const before = structuredClone(existing);
       expect(planSubtasks(existing, [{ id: "s1" }, input])).toEqual({
         ok: false,
+        denyReason: "invalid_args",
         reason: "a new subtask needs text and owner",
       });
       expect(existing).toEqual(before);
@@ -1477,6 +1480,7 @@ describe("planSubtasks", () => {
   it.each(["deploy", "money", "secret"] as const)("refuses explicit worker gate %s", (gate) => {
     expect(planSubtasks([], [{ text: "Test restart handling", owner: "work", gate }])).toEqual({
       ok: false,
+      denyReason: "invalid_args",
       reason:
         'subtask "Test restart handling" is the worker\'s; a deploy, money or secret step must be owned by the evaluator or a script',
     });
@@ -1598,11 +1602,13 @@ describe("planSubtasks", () => {
   it("refuses unknown or repeated ids and empty text", () => {
     expect(planSubtasks([], [{ id: "s9" }])).toMatchObject({
       ok: false,
+      denyReason: "subtask_not_found",
       reason: "the card has no subtask s9. Existing subtask ids: none",
     });
     const subtasks = planned();
     expect(planSubtasks(subtasks, [{ id: "s1" }, { id: "s1" }])).toMatchObject({
       ok: false,
+      denyReason: "invalid_args",
       reason: "subtask s1 is listed twice",
     });
     expect(planSubtasks([], [{ text: "  ", owner: "work" }])).toMatchObject({ ok: false });

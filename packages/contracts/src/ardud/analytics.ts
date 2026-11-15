@@ -30,7 +30,6 @@ const McpCallerRole = Schema.Literals([
   "review",
   "evaluator",
   "discussion",
-  "delegated",
   "owner",
   "unattached",
   "none",

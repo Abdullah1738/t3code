@@ -2400,13 +2400,13 @@ it.effect("caller analytics is a memory lookup and follows card and link writes"
     assert.deepEqual(queries, []);
     store.registerCallerParent!("plain-child", "plain-parent");
     assert.deepEqual(store.callerAnalytics!("plain-child"), {
-      callerRole: "delegated",
+      callerRole: "none",
       callerKind: "delegated_child",
     });
     store.registerCallerParent!("child", id);
     assert.deepEqual(store.callerAnalytics!("child"), {
       ...context,
-      callerRole: "delegated",
+      callerRole: "work",
       callerKind: "delegated_child",
     });
     const sql = yield* SqlClient.SqlClient;
@@ -2454,6 +2454,47 @@ it.effect("caller analytics is a memory lookup and follows card and link writes"
       callerKind: "unknown",
     });
   }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect.each(["work", "review", "evaluator", "discussion"] as const)(
+  "delegated children inherit the resolved %s role without queries",
+  (role) =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const current = card(4336, "working");
+      yield* store.putCard(current);
+      yield* store.putThreadLink({
+        threadId: ThreadId.make("parent"),
+        boardId,
+        cardId: current.id,
+        role: role === "discussion" ? "evaluator" : role,
+        purpose: null,
+        discussionId: role === "discussion" ? KanbanDiscussionId.make("card-discussion") : null,
+        model,
+        startedAt: at,
+        endedAt: null,
+        paused: null,
+      });
+      store.registerCallerParent!("child", "parent");
+      store.registerCallerParent!("grandchild", "child");
+      const queries: string[] = [];
+      const observe: Statement.Transformer = (statement) => {
+        queries.push(statement.compile()[0]);
+        return Effect.succeed(statement);
+      };
+      yield* Effect.sync(() => {
+        for (const id of ["child", "grandchild"])
+          assert.deepEqual(store.callerAnalytics!(id), {
+            boardId,
+            cardId: current.id,
+            cardNumber: current.number,
+            cardStage: current.stage,
+            callerRole: role,
+            callerKind: "delegated_child",
+          });
+      }).pipe(Effect.provideService(Statement.CurrentTransformer, observe));
+      assert.deepEqual(queries, []);
+    }).pipe(Effect.provide(TestLayer)),
 );
 
 it.effect("reopened caller attribution follows nested subagents and stops at forks", () =>
@@ -2537,7 +2578,7 @@ it.effect("reopened caller attribution follows nested subagents and stops at for
         ["deleted-grandchild", undefined],
       ] as const) {
         const context = reopened.callerAnalytics!(id);
-        assert.equal(context?.callerRole, "delegated", id);
+        assert.equal(context?.callerRole, number === undefined ? "none" : "work", id);
         assert.equal(context?.callerKind, "delegated_child", id);
         assert.equal(context?.cardNumber, number, id);
         assert.equal(context?.cardStage, number === undefined ? undefined : "working", id);
