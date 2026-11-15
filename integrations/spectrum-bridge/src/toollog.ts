@@ -9,7 +9,9 @@ import { createInterface } from "node:readline";
 import { cleanCalls, createCallAggregation, type CallSummary } from "./log-calls.ts";
 import { summarizeLog } from "./log-rollup.ts";
 import { createChainAggregation } from "./log-chains.ts";
-import { cleanSite, errorDetail, logSite, type ErrorDetail } from "./log-error.ts";
+import { recordRenderCounts, renderCounts } from "./log-render-store.ts";
+import { cleanRenders, createRenderAggregation, renderChat } from "./log-renders.ts";
+import { cleanSite, errorDetail, logSite, causeKey, type ErrorDetail } from "./log-error.ts";
 
 export type LogLine = {
   ts: string; tool: "imessage"; component: string; kind: "event" | "perf" | "error"; name: string;
@@ -17,6 +19,7 @@ export type LogLine = {
   site?: string;
   error?: { tag: string } & ErrorDetail;
   calls?: CallSummary;
+  renders?: { count: number; histogram: [number, number][] };
 };
 type Entry = Omit<LogLine, "ts" | "tool" | "error"> & { error?: { tag: string; cause?: unknown } & Partial<ErrorDetail> };
 const processRunId = randomUUID();
@@ -24,12 +27,13 @@ const DAY = /^\d{4}-\d{2}-\d{2}$/;
 const TAG = /^[a-zA-Z][a-zA-Z0-9_.:-]{0,99}$/;
 const LABEL = /^[a-zA-Z][a-zA-Z0-9_.-]{0,99}$/;
 const ID_KEYS = new Set(["chat", "messageId", "inboundId", "threadId", "fromThreadId", "toThreadId", "operationId", "formId", "runId", "callBatchId"]);
-const NUMBERS = new Set(["attachmentCount", "attachmentBytes", "receiveLagMs", "batchSize", "filesTaken", "waitMs", "outboxDelayMs", "parts", "files", "count", "status", "exitCode", "labels", "slowestReadMs", "completionLagMs", "seedChars", "recapLines", "pendingOrdersChars"]);
+const NUMBERS = new Set(["attachmentCount", "attachmentBytes", "receiveLagMs", "batchSize", "filesTaken", "waitMs", "outboxDelayMs", "parts", "files", "count", "status", "exitCode", "labels", "slowestReadMs", "completionLagMs", "seedChars", "recapLines", "pendingOrdersChars", "attempt"]);
 const ENUMS: Record<string, readonly string[]> = {
-  replyMode: ["final", "tool"], reason: ["background", "no_text", "already_folded", "exit", "stdout", "hook", "age", "contextSize", "providerRefusal"],
-  source: ["live", "backfill"], outcome: ["replied", "failed", "refused", "no_reply"],
-  cardKind: ["quick", "delivery", "ride", "nutrition", "other"], phase: ["start", "stop"],
+  replyMode: ["final", "tool"], reason: ["background", "no_text", "already_folded", "exit", "stdout", "hook", "test_default_command", "age", "contextSize", "providerRefusal"],
+  source: ["live", "backfill"], outcome: ["replied", "failed", "refused", "no_reply", "ok", "fallback"],
+  cardKind: ["quick", "delivery", "ride", "nutrition", "secure_form", "other"], phase: ["start", "stop"],
   method: ["GET", "POST", "PUT", "DELETE", "PATCH"],
+  failureCode: ["none", "renderer_failed", "preview_missing", "render_exception", "page_fetch", "page_http", "page_type", "page_body", "image_fetch", "image_http", "image_type", "image_body", "upload", "upload_url", "invalid_url", "file_prepare"],
   completionCheck: ["before", "after", "unchecked"],
 };
 
@@ -41,12 +45,14 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
   if (typeof entry.ok === "boolean") line.ok = entry.ok;
   const ids: Record<string, string> = runId ? { runId } : {};
   for (const [key, value] of Object.entries(entry.ids ?? {})) {
+    if (key === "chat" && entry.name.startsWith("card.render")) { ids.chat = renderChat(value); continue; }
     if (ID_KEYS.has(key) && typeof value === "string" && value.length <= 250 && /^[a-zA-Z0-9_:%.@-]+$/.test(value)
       && !/^\+?\d{6,}$/.test(value)) ids[key] = value;
   }
   if (Object.keys(ids).length) line.ids = ids;
   const props: NonNullable<LogLine["props"]> = {};
   for (const [key, value] of Object.entries(entry.props ?? {})) {
+    if (key === "attempt" && typeof value === "number" && (!Number.isSafeInteger(value) || value < 1 || value > 100)) continue;
     if (NUMBERS.has(key) && typeof value === "number" && Number.isFinite(value) && value >= 0) props[key] = value;
     else if (["queued", "inboundKnown", "bytesKnown", "pendingOrders"].includes(key) && typeof value === "boolean") props[key] = value;
     else if (typeof value === "string" && ENUMS[key]?.includes(value)) props[key] = value;
@@ -54,6 +60,7 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
     else if (key === "route" && typeof value === "string" && /^(?:\/(?:[a-z-]+|:id))*$/.test(value)) props[key] = value;
   }
   if (Object.keys(props).length) line.props = props;
+  if (entry.name === "card.renders" && entry.kind === "perf") line.renders = cleanRenders(entry.renders);
   if (entry.name === "turn.robob_calls" && entry.component === "robob" && entry.kind === "perf") line.calls = cleanCalls(entry.calls);
   if (entry.kind === "error" || entry.name === "turn.robob_call" && entry.ok === false) {
     let tag = entry.error?.tag ?? "";
@@ -65,6 +72,7 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
       name, ...entry.error, status: entry.error?.status ?? (status ? Number(status) : typeof props.status === "number" ? props.status : undefined),
       code: entry.error?.code ?? (status ? safeLineFailureCode(tag) : undefined),
     }) };
+    if (["Error", "UnknownError"].includes(line.error.name)) line.error.causeKey = causeKey(line.error, line.error.tag);
     const site = cleanSite(entry.site);
     if (site) line.site = site;
   }
@@ -108,6 +116,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   let rolledYesterday = "";
   let recovery: Promise<void> | undefined;
   const calls = createCallAggregation(processRunId);
+  const renders = createRenderAggregation();
   function append(entry: Entry, stamp?: string): void {
     let fd: number | undefined;
     try {
@@ -121,7 +130,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
       if (maintainedDay !== day || maintainedRoot !== dir) {
         const cutoff = new Date(Date.parse(`${day}T00:00:00Z`) - 30 * 86400_000).toISOString().slice(0, 10);
         for (const file of readdirSync(dir)) {
-          const date = /^(?:rollup-)?(\d{4}-\d{2}-\d{2})(?:\.ndjson|\.json|\.cap|\.degraded)$/.exec(file)?.[1];
+          const date = /^(?:rollup-|renders-)?(\d{4}-\d{2}-\d{2})(?:\.ndjson|\.json|\.cap|\.degraded|\.sqlite(?:-journal|-wal|-shm)?)$/.exec(file)?.[1];
           if (date && date < cutoff) { try { unlinkSync(join(dir, file)); } catch { /* Best effort. */ } }
         }
         maintainedDay = day; maintainedRoot = dir;
@@ -137,10 +146,12 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
           appendFileSync(fd, JSON.stringify(clean({ component: "logger", kind: "error", name: "log.degraded", error: { tag: "log.degraded", message: "" } }, ts, processRunId)) + "\n");
         } catch { /* Another process already wrote the cap notice. */ }
         finally { if (marker !== undefined) closeSync(marker); }
+        const renderDetail = line.name === "card.render" && (line.ok === false || (line.durationMs ?? 0) > 1_000);
         const slowOrFailedCall = line.name === "turn.robob_call" && ((line.durationMs ?? 0) > 1_000 || line.ok === false);
-        if (line.kind !== "error" && !["turn.start", "turn.end", "turn.robob_calls"].includes(line.name) && !slowOrFailedCall) return;
+        if (line.kind !== "error" && !["turn.start", "turn.end", "turn.robob_calls"].includes(line.name) && !slowOrFailedCall && !renderDetail) return;
       }
-      appendFileSync(fd, JSON.stringify(line) + "\n");
+      if (line.name === "card.renders" && line.renders) recordRenderCounts(dir, line);
+      else appendFileSync(fd, JSON.stringify(line) + "\n");
     } catch { /* Logging must never affect the caller. */ }
     finally { if (fd !== undefined) { try { closeSync(fd); } catch { /* Best effort. */ } } }
   }
@@ -161,7 +172,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
       if (entry.name === "form.fail" && entry.kind !== "error") entry = { ...entry, kind: "error", error: entry.error ?? { tag: "form.gone" } };
       const line = clean(entry, new Date(now()).toISOString(), processRunId);
       if (!line) return;
-      for (const record of calls.accept(line, entry.ids?.runId !== undefined)) enqueue(record);
+      for (const render of renders.accept(line)) for (const record of calls.accept(render, entry.ids?.runId !== undefined)) enqueue(record);
       if (entry.name === "turn.end") void scheduleRollup(line.ts.slice(0, 10));
       if (["turn.start", "reply.sent"].includes(line.name) && line.ids?.chat && line.ids.inboundId) {
         refreshChains(`${line.ids.chat}\0${line.ids.inboundId}`);
@@ -189,8 +200,9 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
       const sources = chainSources(logSources(dir), day);
       const sourceBytes = sources[day] ?? 0;
       const later = Object.fromEntries(Object.entries(sources).filter(([date]) => date > day));
-      const result = { day, tool: "imessage", sourceBytes, chainSources: sources,
-        ...await summarizeLog(records(dir, { [day]: sourceBytes }), records(dir, later)) };
+      const renders = renderCounts(dir, day);
+      const result = { day, tool: "imessage", sourceBytes, renderSourceCount: renders.count, chainSources: sources,
+        ...await summarizeLog(records(dir, { [day]: sourceBytes }), records(dir, later), renders.lines) };
       await saveRollup(dir, day, result);
       return result;
     } catch { return; }
@@ -252,6 +264,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
     });
   }
   function flushAll(): void {
+    for (const line of renders.flush()) enqueue(line);
     for (const line of calls.flush()) enqueue(line);
     flush();
   }
@@ -273,8 +286,8 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
     catch { return; }
   }
   function validOwnDay(saved: Rollup, day: string, bytes: number): saved is NonNullable<Rollup> {
-    return Boolean(saved?.day === day && saved.tool === "imessage" && saved.sourceBytes === bytes
-      && Number.isSafeInteger(saved.total) && saved.total >= 0 && saved.byComponent && saved.chains && Array.isArray(saved.topErrorTags));
+    return Boolean(saved?.day === day && saved.tool === "imessage" && saved.sourceBytes === bytes && saved.renderSourceCount === renderCounts(root(), day).count
+      && Number.isSafeInteger(saved.total) && saved.total >= 0 && saved.byComponent && saved.chains && Array.isArray(saved.topErrorTags) && Array.isArray(saved.topCauses));
   }
   function recoverRollups(at: number, hourly: boolean, yesterday?: string): Promise<void> {
     const precedingJobs = [...jobs.values()];
@@ -307,17 +320,22 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
       if (!stale.size) return;
       const chains = createChainAggregation();
       const summaries = new Map<string, Awaited<ReturnType<typeof summarizeLog>>>();
+      const renderSnapshots = new Map<string, ReturnType<typeof renderCounts>>();
       // Every file is streamed once for the entire sweep, including any daily counters needing a rebuild.
       for (const day of new Set([...Object.keys(sources), ...stale])) {
         async function* scan() {
           for await (const line of records(dir, { [day]: sources[day] ?? 0 })) { chains.accept(line); yield line; }
         }
-        if (stale.has(day) && !cached.has(day)) summaries.set(day, await summarizeLog(scan()));
+        if (stale.has(day) && !cached.has(day)) {
+          const renders = renderCounts(dir, day);
+          renderSnapshots.set(day, renders);
+          summaries.set(day, await summarizeLog(scan(), undefined, renders.lines));
+        }
         else for await (const _line of scan()) { /* Only chain milestones are needed for unchanged daily totals. */ }
       }
       for (const day of stale) {
         const base = cached.get(day) ?? summaries.get(day)!;
-        const result = { ...base, day, tool: "imessage", sourceBytes: sources[day] ?? 0,
+        const result = { ...base, day, tool: "imessage", sourceBytes: sources[day] ?? 0, renderSourceCount: cached.get(day)?.renderSourceCount ?? renderSnapshots.get(day)?.count ?? 0,
           chainSources: chainSources(sources, day), chains: chains.summary(day) };
         await saveRollup(dir, day, result);
       }
@@ -366,7 +384,15 @@ export function cardKind(value: string): string {
     if (/^(?:delivery-|order-)/i.test(segment)) return "delivery";
     if (/^(?:ride-|uber-)/i.test(segment)) return "ride";
     if (/^(?:nutrition|morning|recovery|body)(?:[/_.-]|$)/i.test(segment)) return "nutrition";
+    if (/^(?:_secret|secret|secure|forms?)(?:[_.-]|$)/i.test(segment)) return "secure_form";
     if (/^q-/i.test(segment)) return "quick";
   }
   return "other";
+}
+
+export function logCardRender(component: string, kind: string, durationMs: number, ok: boolean,
+  details: { chat?: string; outcome?: "ok" | "fallback" | "failed"; failureCode?: string; attempt?: number } = {}): void {
+  toolLog.capture(() => toolLog.write({ component, kind: "perf", name: "card.render", durationMs, ok,
+    ids: { chat: details.chat ?? "" }, props: { cardKind: kind, outcome: details.outcome ?? (ok ? "ok" : "failed"),
+      failureCode: details.failureCode ?? (ok ? "none" : "renderer_failed"), attempt: details.attempt ?? 1 } }));
 }

@@ -2,6 +2,7 @@ import * as NodeBuffer from "node:buffer";
 import { ModelSelection } from "@t3tools/contracts";
 import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -11,7 +12,6 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
-import { firstRunningSelectionSql } from "../persistence/historyArchiveSql.ts";
 
 const MAX_WINDOW_MS = 72 * 60 * 60 * 1000;
 const CANDIDATE_PAGE_SIZE = 400;
@@ -93,7 +93,10 @@ interface Row {
   readonly selection_json: string | null;
 }
 
-type CandidateRow = Omit<Row, "board_id" | "card_id">;
+interface CandidateRow extends Omit<Row, "board_id" | "card_id"> {
+  readonly attempt_id: string | null;
+  readonly run_id: string | null;
+}
 
 const itemFromRow = (row: Row) => {
   const parsed: unknown = JSON.parse(row.turn_json);
@@ -169,6 +172,7 @@ const make = Effect.gen(function* () {
   `);
 
   const list = Effect.fn("Usage.list")(function* (query: UsageQuery) {
+    const started = yield* Clock.currentTimeMillis;
     const since = timestamp(query.since);
     if (since === null) return yield* bad("since must be an ISO timestamp or epoch milliseconds.");
     const cursor = query.cursor ? decodeCursor(query.cursor) : null;
@@ -197,6 +201,8 @@ const make = Effect.gen(function* () {
     const candidateLimit =
       boardId === null ? Math.min(limit + 1, CANDIDATE_PAGE_SIZE) : CANDIDATE_PAGE_SIZE;
     const rows: Array<Row> = [];
+    const selections = new Map<string, string | null>();
+    let scannedRows = 0;
 
     // Board links live in a separate database. Keep scanning bounded candidate
     // pages until the filtered page has a lookahead row or the window is exhausted.
@@ -227,9 +233,9 @@ const make = Effect.gen(function* () {
         COALESCE(a.provider_instance_id, pt.provider_instance_id,
           CASE WHEN c.run_attempt_id IS NULL THEN json_extract(t.payload_json, '$.providerInstanceId') END) AS provider_instance_id,
         COALESCE(pt.driver, pt.provider, r.provider) AS driver,
+        a.attempt_id, a.run_id,
         CASE WHEN c.run_attempt_id IS NULL
-          THEN json_extract(t.payload_json, '$.modelSelection')
-          ELSE ${sql.literal(firstRunningSelectionSql("a"))} END AS selection_json
+          THEN json_extract(t.payload_json, '$.modelSelection') END AS selection_json
       FROM candidates c
       LEFT JOIN orchestration_v2_projection_threads t ON t.thread_id = c.thread_id
       LEFT JOIN projection_projects p ON p.project_id = t.project_id
@@ -243,6 +249,7 @@ const make = Effect.gen(function* () {
         Effect.mapError((cause) => new UsageReadError({ cause })),
       );
       if (candidates.length === 0) break;
+      scannedRows += candidates.length;
       const roots = [...new Set(candidates.map((row) => row.root_thread_id))];
       const links = yield* controlSql<{
         readonly thread_id: string;
@@ -256,11 +263,58 @@ const make = Effect.gen(function* () {
         Effect.mapError((cause) => new UsageReadError({ cause })),
       );
       const linksByRoot = new Map(links.map((link) => [link.thread_id, link]));
-      for (const candidate of candidates) {
+      const selected = candidates
+        .filter(
+          (candidate) =>
+            boardId === null || linksByRoot.get(candidate.root_thread_id)?.board_id === boardId,
+        )
+        .slice(0, limit + 1 - rows.length);
+      const wanted = new Map(
+        selected
+          .filter((row) => row.attempt_id !== null && !selections.has(row.attempt_id))
+          .map((row) => [row.attempt_id!, row]),
+      );
+      if (wanted.size > 0) {
+        const threads = [...new Set([...wanted.values()].map((row) => row.thread_id))];
+        // Constant IN ranges reach each store's stream index. Scan a thread's
+        // history once per batch, rather than once for every provider turn.
+        const matches = yield* sql<{
+          readonly thread_id: string;
+          readonly run_id: string;
+          readonly attempt_id: string;
+          readonly selection_json: string | null;
+        }>`
+          SELECT stream_id AS thread_id,
+            json_extract(payload_json, '$.id') AS run_id,
+            json_extract(payload_json, '$.activeAttemptId') AS attempt_id,
+            json_extract(payload_json, '$.modelSelection') AS selection_json
+          FROM ardud_thread_history_events
+          WHERE stream_id IN ${sql.in(threads)}
+            AND event_type = 'run.updated'
+            AND json_extract(payload_json, '$.status') = 'running'
+            AND json_extract(payload_json, '$.activeAttemptId') IN ${sql.in([...wanted.keys()])}
+          ORDER BY sequence
+        `.pipe(
+          NodeSqliteClient.readOnly,
+          Effect.mapError((cause) => new UsageReadError({ cause })),
+        );
+        for (const match of matches) {
+          const attempt = wanted.get(match.attempt_id);
+          if (!attempt || attempt.thread_id !== match.thread_id || attempt.run_id !== match.run_id)
+            continue;
+          if (!selections.has(match.attempt_id))
+            selections.set(match.attempt_id, match.selection_json);
+        }
+        for (const id of wanted.keys()) if (!selections.has(id)) selections.set(id, null);
+      }
+      for (const candidate of selected) {
         const link = linksByRoot.get(candidate.root_thread_id);
-        if (boardId !== null && link?.board_id !== boardId) continue;
         rows.push({
           ...candidate,
+          selection_json:
+            candidate.attempt_id === null
+              ? candidate.selection_json
+              : (selections.get(candidate.attempt_id) ?? null),
           board_id: link?.board_id ?? null,
           card_id: link?.card_id ?? null,
         });
@@ -281,7 +335,13 @@ const make = Effect.gen(function* () {
             encodeJson({ since, until, boardId, time: last.sort_at, id: last.provider_turn_id }),
           ).toString("base64url")
         : null;
-    return { items: page.map(itemFromRow), nextCursor };
+    const items = page.map(itemFromRow);
+    yield* Effect.annotateCurrentSpan({
+      rows: items.length,
+      scannedRows,
+      durationMs: (yield* Clock.currentTimeMillis) - started,
+    });
+    return { items, nextCursor };
   });
   return Usage.of({ list });
 });

@@ -34,6 +34,7 @@ BACKUP_STAGES = {'admission', 'stage', 'repo', 'disk', 'replica', 'verify', 'fil
 FAILURE_STAGES = {'admission', 'stage', 'repo', 'disk', 'replica', 'verify', 'files',
                   'restic', 'prune', 'dropbox', 'manifest', 'unknown'}
 NUMBERS.update(('durationMs', 'childrenMeasured', 'childrenPartial', 'childrenRemaining', 'bytesMeasured'))
+NUMBERS.update(('probeTimeouts', 'secondsInProbeTimeouts', 'probeAllowanceMedianS', 'allowanceS'))
 NUMBERS.update(('timeouts', 'secondsInTimeouts', 'childrenDescended', 'partsMeasured',
                 'childrenWithPartsInProgress', 'partsDone', 'partsTotal', 'partsFreshnessS'))
 NUMBERS.update(('loadPerCore', 'lastSuccessAgeS', 'deferredCount'))
@@ -165,7 +166,7 @@ def memory_fields(values, event):
         return result
     numbers = {'pageSize', 'freePages', 'activePages', 'inactivePages', 'wiredPages',
                'speculativePages', 'purgeablePages', 'compressorPages', 'totalMb', 'usedMb',
-               'mbPerS', 'tps', 'pid', 'memMb', 'cmprsMb', 'cpu', 'count', 'ppid1Count'}
+               'mbPerS', 'tps', 'pid', 'memMb', 'cmprsMb', 'count', 'ppid1Count'}
 
     def numeric(value):
         return finite_number(value) and value >= 0
@@ -193,7 +194,7 @@ def memory_fields(values, event):
                            'wiredPages', 'speculativePages', 'purgeablePages', 'compressorPages')}[key]
             result[key] = None if value is None else row(value, keys)
         elif key in ('top', 'watched', 'counts') and (value is None or isinstance(value, list)):
-            keys = ('command', 'count', 'ppid1Count') if key == 'counts' else ('pid', 'command', 'memMb', 'cmprsMb', 'cpu')
+            keys = ('command', 'count', 'ppid1Count') if key == 'counts' else ('pid', 'command', 'memMb', 'cmprsMb')
             if key == 'watched':
                 keys += ('etime', 'error')
             result[key] = None if value is None else [row(p, keys) for p in value[:{'top': 15, 'watched': 512, 'counts': 5}[key]]]
@@ -210,7 +211,57 @@ def memory_fields(values, event):
     return result
 
 
+def cpu_fields(values):
+    from cpu_labels import janitor_redact
+    result = {}
+    numeric = {'windowS', 'cpuS', 'totalCpuPct', 'ncpu', 'processCount', 'runnable',
+               'uninterruptible', 'pid', 'ppid', 'count', 'cpuPct', 'rssMb'}
+
+    def number(value):
+        return finite_number(value) and 0 <= value <= 1e15
+
+    def label(value, limit):
+        if not isinstance(value, str):
+            return None
+        try:
+            value = janitor_redact(value)
+        except (ImportError, OSError):
+            return None
+        if SECRET.search(value) or '/Users/' in value or '/home/' in value or value.startswith(('/', '~')):
+            return '[redacted]'
+        return ''.join(c if c.isprintable() else ' ' for c in value)[:limit]
+
+    for key, value in (values or {}).items():
+        if key in numeric and (value is None or number(value)):
+            result[key] = value
+        elif key == 'baseline' and type(value) is bool:
+            result[key] = value
+        elif key in ('failure', 'hintError') and (value is None or value in MEMORY_ERRORS):
+            result[key] = value
+        elif key == 'load' and (value is None or isinstance(value, list)):
+            result[key] = None if value is None else [n for n in value[:3] if number(n)]
+        elif key in ('top', 'families') and isinstance(value, list):
+            result[key] = []
+            for proc in value[:20 if key == 'top' else 15]:
+                if not isinstance(proc, dict):
+                    continue
+                keys = ('pid', 'ppid', 'family', 'hint', 'cpuS', 'cpuPct', 'rssMb', 'etime') if key == 'top' else ('family', 'count', 'cpuPct', 'rssMb')
+                clean = {}
+                for field in keys:
+                    item = proc.get(field)
+                    if field in numeric and number(item):
+                        clean[field] = item
+                    elif field in ('family', 'hint'):
+                        clean[field] = label(item, 40 if field == 'family' else 72)
+                    elif field == 'etime' and isinstance(item, str) and re.fullmatch(r'\d+(?:-\d+)?(?::\d+){1,2}', item):
+                        clean[field] = item[:32]
+                result[key].append(clean)
+    return result
+
+
 def safe_fields(values, event=None):
+    if event == 'cpu.sample':
+        return cpu_fields(values)
     if event == 'disk.clone_wedge':
         result = {k: v for k, v in disk_wait_fields(values).items()
                   if k in ('count', 'sampleCount', 'sampling', 'failure')}
@@ -311,6 +362,15 @@ def record(component, kind, name, now, duration_ms=None, ok=None, ids=None, prop
             if lines:
                 message = '[redacted]' if SECRET.search(lines[0]) else lines[0][:300]
         row['error'] = dict(tag=error_tag, message=message)
+    if name == 'cpu.sample':
+        # 1440 bounded lines/day stay below 12 MB, even with hostile labels.
+        while len((json.dumps(row, separators=(',', ':'), allow_nan=False)+'\n').encode()) > 8192:
+            props = row['props']
+            key = 'top' if props.get('top') else 'families'
+            if not props.get(key):
+                break
+            props[key].pop()
+            props[key+'Omitted'] = props.get(key+'Omitted', 0)+1
     return row
 
 
@@ -360,7 +420,8 @@ def emit(component, kind, name, *, duration_ms=None, ok=None, ids=None, props=No
                 if kind != 'error' and not coverage_gap:
                     return
             append(fd, row)
+            return True
         finally:
             os.close(fd)
     except Exception:
-        pass
+        return False

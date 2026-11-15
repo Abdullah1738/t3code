@@ -219,10 +219,17 @@ export class OrchestratorDispatchError extends Schema.TaggedError<OrchestratorDi
   {
     commandId: CommandId,
     commandType: Schema.String,
+    preflightReaderLane: Schema.optional(Schema.Literal("foreground")),
+    preflightWritesSaved: Schema.optional(Schema.Boolean),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {
   override get message(): string {
+    if (this.preflightReaderLane === "foreground") {
+      if (this.preflightWritesSaved)
+        return "Preflight changes were saved, but the requested message or task was not created. Retry the same call.";
+      return "Dispatch pre-check could not use the foreground reader. Nothing was saved; retry the same call.";
+    }
     return `Failed to dispatch orchestration command ${this.commandType} (${this.commandId}).`;
   }
 }
@@ -1621,14 +1628,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           : machineInstance !== undefined && !resolveProviderInstanceEnabled(machineInstance);
       };
       const instanceDisabledForProject = disabledForProject(nextRun.providerInstanceId);
+      const timeoutCode = latestRootProviderFailure(failedRun ?? null, projection.turnItems)?.code;
       const startTimedOut =
-        latestRootProviderFailure(failedRun ?? null, projection.turnItems)?.code ===
-        PROVIDER_START_TIMEOUT_CODE;
+        timeoutCode === PROVIDER_START_TIMEOUT_CODE || timeoutCode === "restart_admission_timeout";
       const failureHolds =
         failureClass !== undefined &&
         failureClass !== "validation_error" &&
-        latestRootProviderFailure(failedRun!, projection.turnItems)?.code !==
-          PROVIDER_START_TIMEOUT_CODE &&
+        !startTimedOut &&
         failedRun?.providerInstanceId === nextRun.providerInstanceId;
       // ardud: a context-reset note starts a fresh provider thread, so the
       // failure that ended the old one is no reason to hold it. It runs next;
@@ -9745,7 +9751,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         updatedAt: now,
         failure: makeProviderFailure({
           class: "provider_error",
-          code: PROVIDER_START_TIMEOUT_CODE,
+          code:
+            command.phase === "restart_admission"
+              ? "restart_admission_timeout"
+              : PROVIDER_START_TIMEOUT_CODE,
           message,
         }),
       },
@@ -13175,12 +13184,21 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       "orchestration_v2.thread_id": commandThreadId(command),
     });
 
-    const existingReceipt = yield* commandReceipts.getByCommandId(command.commandId).pipe(
+    const interactive =
+      command.type === "message.dispatch" || command.type === "delegated_task.request";
+    const receiptRead = commandReceipts.getByCommandId(command.commandId);
+    // This point lookup runs before planning/COMMIT, outside the writer transaction.
+    const existingReceipt = yield* (
+      interactive ? receiptRead.pipe(NodeSqliteClient.foregroundReads) : receiptRead
+    ).pipe(
       Effect.mapError(
         (cause) =>
           new OrchestratorDispatchError({
             commandId: command.commandId,
             commandType: command.type,
+            ...(interactive && NodeSqliteClient.readerLaneFailure(cause) !== undefined
+              ? { preflightReaderLane: "foreground" as const }
+              : {}),
             cause,
           }),
       ),
@@ -14170,9 +14188,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         .getThreadHistoryPage(threadId, cursor, throughEntryId, conversationOnly)
         .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause }))),
     getTimelinePage: (threadId, options) =>
-      projectionStore
-        .getTimelinePage(threadId, options)
-        .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause }))),
+      projectionStore.getTimelinePage(threadId, options).pipe(
+        NodeSqliteClient.readOnly,
+        Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })),
+      ),
     getMessageCount: (threadId) =>
       projectionStore
         .getMessageCount(threadId)

@@ -1,3 +1,4 @@
+import { AuthenticatedClientObserver } from "../observability/ControlHttpTelemetry.ts";
 import {
   AuthAccessTokenType,
   AuthAccessWriteScope,
@@ -1361,25 +1362,22 @@ export const make = Effect.gen(function* () {
     return yield* revokeSession(targetSessionId);
   });
 
-  const revokeOtherClientSessions: EnvironmentAuth["Service"]["revokeOtherClientSessions"] = Effect.fn("EnvironmentAuth.revokeOtherClientSessions")(
-    function* (currentSessionId) {
+  const revokeOtherClientSessions: EnvironmentAuth["Service"]["revokeOtherClientSessions"] =
+    Effect.fn("EnvironmentAuth.revokeOtherClientSessions")(function* (currentSessionId) {
       const owner = (sessionId: AuthSessionId) =>
         isOwnerSession(sessionId).pipe(
           Effect.mapError((cause) => new ServerAuthOtherSessionsRevocationError({ cause })),
         );
-      if (yield* owner(currentSessionId))
-        return yield* revokeOtherSessionsExcept(currentSessionId);
+      if (yield* owner(currentSessionId)) return yield* revokeOtherSessionsExcept(currentSessionId);
       // One at a time and not atomic: a failure stops partway, and a session
       // paired meanwhile is left alone. Owner sessions are never touched.
       let revoked = 0;
       for (const session of yield* listSessions()) {
-        if (session.sessionId === currentSessionId || (yield* owner(session.sessionId)))
-          continue;
+        if (session.sessionId === currentSessionId || (yield* owner(session.sessionId))) continue;
         if (yield* revokeSession(session.sessionId)) revoked += 1;
       }
       return revoked;
-    },
-  );
+    });
 
   const issueStartupPairingUrl: EnvironmentAuth["Service"]["issueStartupPairingUrl"] = (baseUrl) =>
     issueStartupPairingCredential().pipe(
@@ -1409,7 +1407,16 @@ export const make = Effect.gen(function* () {
   const authenticateHttpRequest: EnvironmentAuth["Service"]["authenticateHttpRequest"] = (
     request,
   ) =>
-    authenticateRequest(request).pipe(Effect.withSpan("EnvironmentAuth.authenticateHttpRequest"));
+    authenticateRequest(request).pipe(
+      Effect.tap((session) =>
+        Effect.withFiber((fiber) =>
+          Effect.sync(() => {
+            fiber.getRef(AuthenticatedClientObserver)?.(session);
+          }),
+        ).pipe(Effect.catchCause(() => Effect.void)),
+      ),
+      Effect.withSpan("EnvironmentAuth.authenticateHttpRequest"),
+    );
 
   const authenticateWebSocketUpgrade: EnvironmentAuth["Service"]["authenticateWebSocketUpgrade"] =
     Effect.fn("EnvironmentAuth.authenticateWebSocketUpgrade")(function* (request) {

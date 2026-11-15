@@ -1,0 +1,13 @@
+{"ts":"2026-11-13T17:29:59Z","tool":"watchers","component":"helper","kind":"error","name":"helper.run","ids":{"helper":"outside"},"error":{"tag":"helper.exit_failed"}}
+{"ts":"2026-11-13T17:30:00Z","tool":"watchers","component":"helper","kind":"error","name":"helper.run","ids":{"helper":"first-source"},"error":{"tag":"helper.exit_failed"}}
+{"ts":"2026-11-13T17:40:00Z","tool":"watchers","component":"helper","kind":"error","name":"helper.run","ids":{"helper":"ride-card","watcher":"parent"},"error":{"tag":"helper.exit_failed"}}
+{"ts":"2026-11-13T17:50:00Z","tool":"watchers","component":"helper","kind":"error","name":"helper.run","ids":{"helper":"ride-card"},"error":{"tag":"helper.exit_failed"}}
+{"ts":"2026-11-13T17:55:00Z","tool":"watchers","component":"runner","kind":"error","name":"watch.run","ok":false,"durationMs":10,"props":{"outcome":"fail"},"ids":{"watcher":"test-watch"},"error":{"tag":"watch.check_failed"}}
+{"ts":"2026-11-13T17:59:59Z","tool":"watchers","component":"runner","kind":"error","name":"watch.run","ok":false,"durationMs":100,"props":{"outcome":"timeout"},"ids":{"watcher":"test-watch"},"error":{"tag":"watch.timeout"}}
+{"ts":"2026-11-13T18:00:00Z","tool":"watchers","component":"deploy","kind":"event","name":"deploy.marker","props":{"service":"robob-watch","sha":"abcdef1","step":"restart.complete"}}
+{"ts":"2026-11-13T18:00:00Z","tool":"watchers","component":"telegram","kind":"error","name":"telegram.error","error":{"tag":"bridge.failed"}}
+{"ts":"2026-11-13T18:05:00Z","tool":"watchers","component":"runner","kind":"perf","name":"watch.run","ok":true,"durationMs":2,"props":{"outcome":"no_change"},"ids":{"watcher":"test-watch"}}
+{"ts":"2026-11-13T18:29:59Z","tool":"watchers","component":"telegram","kind":"error","name":"telegram.error","error":{"tag":"bridge.failed"}}
+{"ts":"2026-11-13T18:30:00Z","tool":"watchers","component":"telegram","kind":"error","name":"telegram.error","error":{"tag":"bridge.failed"}}
+{"ts":"bad","tool":"watchers","kind":"error","name":"malformed.time"}
+broken

@@ -1,5 +1,6 @@
 import { assert, it, vi } from "@effect/vitest";
 import * as Logger from "effect/Logger";
+import * as Metric from "effect/Metric";
 import * as References from "effect/References";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -1017,7 +1018,7 @@ it.effect("saved-reply admission expires before the reply budget and never write
     const result = yield* Fiber.join(waiter);
     assert.isTrue(Exit.isFailure(result));
     if (Exit.isFailure(result)) {
-      assert.include(String(Cause.squash(result.cause)), "Board busy: not written (held");
+      assert.include(String(Cause.squash(result.cause)), "Board busy: not written (waited");
     }
     assert.isFalse(written);
     yield* Deferred.succeed(release, undefined);
@@ -1120,7 +1121,7 @@ it.effect.each(["migration", "gate", "card"] as const)(
         assert.strictEqual((error as KanbanError).saved, false);
         assert.include(
           String(error),
-          "Board busy: not written (held 2m14s by test.longHolder). Safe to retry once.",
+          "Board busy: not written (waited 134s behind 0; most time: test.longHolder 134s). Safe to retry once.",
         );
       }
       const refusals = logs.filter((log) =>
@@ -1134,6 +1135,16 @@ it.effect.each(["migration", "gate", "card"] as const)(
         "board.waiting_on": lock,
         "board.waited_ms": 134_000,
         "board.waiters": 1,
+        "board.queue_ahead_at_admission": 0,
+        "board.wait_by_label": [
+          {
+            label: "test.longHolder",
+            lock: lock === "migration" ? "migration" : "gate",
+            ms: 134_000,
+            holds: 1,
+          },
+        ],
+        "board.wait_accounted_ms": 134_000,
       });
       const blockers = refusals[0]!.annotations["board.blockers"] as Array<Record<string, unknown>>;
       assert.lengthOf(blockers, 1);
@@ -1278,7 +1289,10 @@ it.effect(
       const result = yield* Fiber.join(waiter);
       assert.isTrue(Exit.isFailure(result));
       if (Exit.isFailure(result))
-        assert.include(String(Cause.squash(result.cause)), "by gate.first +1 more");
+        assert.include(
+          String(Cause.squash(result.cause)),
+          "most time: gate.first 0s, gate.second 0s",
+        );
       assert.lengthOf(messages, 1);
       assert.include(messages[0]!, '"event":"kanban board write refused"');
       assert.include(messages[0]!, '"board.waiting_on":"gate"');
@@ -1290,3 +1304,261 @@ it.effect(
     }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
   },
 );
+
+// McpCall.ts:49 keeps board-busy classification independent of the diagnostic suffix.
+const boardBusyPrefix =
+  /^(?:Missions board conflict: )?(?:Board busy: not written|Not saved \(board busy\))/;
+
+const captureWaitLogs = () => {
+  const logs: Array<Readonly<Record<string, unknown>>> = [];
+  const logger = Logger.make(({ fiber, message }) => {
+    if (/kanban board (write refused|lock held too long)/.test(String(message)))
+      logs.push(fiber.getRef(References.CurrentLogAnnotations));
+  });
+  return { logs, layer: Logger.layer([logger], { mergeWithExisting: false }) };
+};
+
+it.effect("#1472 attributes a queued refusal to sequential gate holders", () => {
+  const { logs, layer } = captureWaitLogs();
+  return Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const holders = [];
+    for (const label of [
+      "KanbanService.tick",
+      "KanbanService.wakeBoardNudges",
+      "KanbanService.tickStep:missingThread",
+    ]) {
+      const entered = yield* Deferred.make<void>();
+      const finish = yield* Deferred.make<void>();
+      const fiber = yield* Effect.forkChild(
+        locks
+          .board(
+            "robob",
+            Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(finish))),
+          )
+          .pipe(Effect.provideService(BoardLocks.operationName, label)),
+      );
+      holders.push({ fiber, entered, finish });
+      if (holders.length === 1) yield* Deferred.await(entered);
+      else yield* TestClock.adjust(0);
+    }
+    const waiter = yield* Effect.forkChild(
+      locks
+        .board("robob", Effect.die("must not write"))
+        .pipe(Effect.provideService(BoardLocks.writeWaitMs, 20_000), Effect.exit),
+    );
+    yield* TestClock.adjust(8_000);
+    yield* Deferred.succeed(holders[0]!.finish, undefined);
+    yield* Fiber.join(holders[0]!.fiber);
+    yield* Deferred.await(holders[1]!.entered);
+    yield* TestClock.adjust(5_000);
+    yield* Deferred.succeed(holders[1]!.finish, undefined);
+    yield* Fiber.join(holders[1]!.fiber);
+    yield* Deferred.await(holders[2]!.entered);
+    yield* TestClock.adjust(7_000);
+    const result = yield* Fiber.join(waiter);
+    assert.isTrue(Exit.isFailure(result));
+    if (Exit.isFailure(result)) {
+      const error = Cause.squash(result.cause) as KanbanError;
+      assert.strictEqual(
+        error.detail,
+        "Board busy: not written (waited 20s behind 2; most time: tick 8s, missingThread 7s, wakeBoardNudges 5s). Safe to retry once.",
+      );
+      assert.match(error.detail, boardBusyPrefix);
+    }
+    assert.lengthOf(logs, 1);
+    assert.deepInclude(logs[0], {
+      "board.queue_ahead_at_admission": 2,
+      "board.waiters": 1,
+      "board.wait_accounted_ms": 20_000,
+      "board.wait_by_label": [
+        { label: "tick", lock: "gate", ms: 8_000, holds: 1 },
+        { label: "missingThread", lock: "gate", ms: 7_000, holds: 1 },
+        { label: "wakeBoardNudges", lock: "gate", ms: 5_000, holds: 1 },
+      ],
+    });
+    yield* Deferred.succeed(holders[2]!.finish, undefined);
+    yield* Fiber.join(holders[2]!.fiber);
+    const snapshot = (yield* Metric.snapshot).find(
+      (metric) => metric.id === "kanban_board_gate_hold_ms" && metric.attributes?.label === "tick",
+    );
+    assert.strictEqual(snapshot?.type, "Histogram");
+    if (snapshot?.type === "Histogram") {
+      assert.strictEqual(snapshot.state.count, 1);
+      assert.strictEqual(snapshot.state.sum, 8_000);
+    }
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect.each(["gate", "migration"] as const)(
+  "#1472 clips a %s holder to the wait interval",
+  (lock) => {
+    const { logs, layer } = captureWaitLogs();
+    return Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      const entered = yield* Deferred.make<void>();
+      const hold = Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never));
+      const holder = yield* Effect.forkChild(
+        (lock === "migration" ? locks.exclusive(hold) : locks.board("robob", hold)).pipe(
+          Effect.provideService(BoardLocks.operationName, "KanbanService.tickStep:beforeWait"),
+        ),
+      );
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust(10_000);
+      const waiter = yield* Effect.forkChild(
+        locks
+          .board("robob", Effect.void)
+          .pipe(Effect.provideService(BoardLocks.writeWaitMs, 20_000), Effect.exit),
+      );
+      yield* TestClock.adjust(20_000);
+      yield* Fiber.join(waiter);
+      assert.deepInclude(logs[0], {
+        "board.wait_accounted_ms": 20_000,
+        "board.wait_by_label": [{ label: "beforeWait", lock, ms: 20_000, holds: 1 }],
+      });
+      yield* Fiber.interrupt(holder);
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+it.effect("#1472 the 257th gate release evicts the oldest, only on its own board", () => {
+  const { logs, layer } = captureWaitLogs();
+  return Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const entered = yield* Deferred.make<void>();
+    const holder = yield* Effect.forkChild(
+      locks
+        .run(
+          locks.access(
+            "robob",
+            Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+          ),
+          "blocked",
+        )
+        .pipe(Effect.provideService(BoardLocks.operationName, "KanbanService.blocker")),
+    );
+    yield* Deferred.await(entered);
+    const waiter = yield* Effect.forkChild(
+      locks.run(locks.access("robob", Effect.void), "blocked"),
+    );
+    yield* TestClock.adjust(0);
+    for (let i = 0; i < 256; i++) {
+      yield* locks
+        .run(locks.access("robob", TestClock.adjust(1)), "other")
+        .pipe(
+          Effect.provideService(
+            BoardLocks.operationName,
+            i === 0 ? "KanbanService.oldest" : "KanbanService.repeated",
+          ),
+        );
+    }
+    // Other boards' releases must not evict this board's history.
+    for (let i = 0; i < 257; i++) yield* locks.board("elsewhere", Effect.void);
+    yield* TestClock.adjust(60_000 - 256);
+    assert.deepInclude(logs[0], {
+      "board.queue_ahead_at_admission": 0,
+      "board.wait_accounted_ms": 60_256,
+      "board.wait_by_label": [
+        { label: "blocker", lock: "gate", ms: 60_000, holds: 1 },
+        { label: "repeated", lock: "gate", ms: 255, holds: 255 },
+        { label: "oldest", lock: "gate", ms: 1, holds: 1 },
+      ],
+    });
+    yield* locks
+      .run(locks.access("robob", TestClock.adjust(1)), "other")
+      .pipe(Effect.provideService(BoardLocks.operationName, "KanbanService.repeated"));
+    yield* TestClock.adjust(29_999);
+    assert.deepInclude(logs[1], {
+      "board.wait_accounted_ms": 90_256,
+      "board.wait_by_label": [
+        { label: "blocker", lock: "gate", ms: 90_000, holds: 1 },
+        { label: "repeated", lock: "gate", ms: 256, holds: 256 },
+      ],
+    });
+    yield* Fiber.interrupt(waiter);
+    yield* Fiber.interrupt(holder);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect(
+  "#1472 limits attribution to eight labels while accounting for all overlapping gate holds",
+  () => {
+    const { logs, layer } = captureWaitLogs();
+    return Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      const holders = [];
+      for (let i = 0; i < 10; i++) {
+        const entered = yield* Deferred.make<void>();
+        holders.push(
+          yield* Effect.forkChild(
+            locks
+              .run(
+                locks.access(
+                  "robob",
+                  Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+                ),
+                `card-${i}`,
+              )
+              .pipe(Effect.provideService(BoardLocks.operationName, `KanbanService.label${i}`)),
+          ),
+        );
+        yield* Deferred.await(entered);
+      }
+      const waiter = yield* Effect.forkChild(
+        locks
+          .board("robob", Effect.void)
+          .pipe(Effect.provideService(BoardLocks.writeWaitMs, 20_000), Effect.exit),
+      );
+      yield* TestClock.adjust(20_000);
+      const result = yield* Fiber.join(waiter);
+      if (Exit.isFailure(result))
+        assert.include(
+          String(Cause.squash(result.cause)),
+          "most time: label0 20s, label1 20s, label2 20s",
+        );
+      assert.deepInclude(logs[0], { "board.wait_accounted_ms": 200_000 });
+      assert.deepStrictEqual(
+        logs[0]!["board.wait_by_label"],
+        Array.from({ length: 8 }, (_, i) => ({
+          label: `label${i}`,
+          lock: "gate",
+          ms: 20_000,
+          holds: 1,
+        })),
+      );
+      for (const holder of holders) yield* Fiber.interrupt(holder);
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+it.effect("#1472 retains the holder fallback when the wait has no positive overlap", () => {
+  const { logs, layer } = captureWaitLogs();
+  return Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const entered = yield* Deferred.make<void>();
+    const holder = yield* Effect.forkChild(
+      locks
+        .board("robob", Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)))
+        .pipe(Effect.provideService(BoardLocks.operationName, "KanbanService.tick")),
+    );
+    yield* Deferred.await(entered);
+    const waiter = yield* Effect.forkChild(
+      locks
+        .board("robob", Effect.void)
+        .pipe(Effect.provideService(BoardLocks.writeWaitMs, 0), Effect.exit),
+    );
+    yield* TestClock.adjust(0);
+    const result = yield* Fiber.join(waiter);
+    assert.isTrue(Exit.isFailure(result));
+    if (Exit.isFailure(result)) {
+      const error = Cause.squash(result.cause) as KanbanError;
+      assert.strictEqual(
+        error.detail,
+        "Board busy: not written (held 0m0s by KanbanService.tick). Safe to retry once.",
+      );
+      assert.match(error.detail, boardBusyPrefix);
+    }
+    assert.deepInclude(logs[0], { "board.wait_accounted_ms": 0, "board.wait_by_label": [] });
+    yield* Fiber.interrupt(holder);
+  }).pipe(Effect.provide(layer));
+});

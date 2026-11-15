@@ -1022,7 +1022,12 @@ export const KanbanCard = Schema.Struct({
   links: Schema.Array(KanbanLink),
   blockedBy: Schema.Array(KanbanCardId),
   stalled: Schema.NullOr(
-    Schema.Struct({ reason: Schema.String, by: KanbanActor, at: IsoDateTime }),
+    Schema.Struct({
+      reason: Schema.String,
+      by: KanbanActor,
+      at: IsoDateTime,
+      runFailure: Schema.optional(Schema.Struct({ threadId: ThreadId, runId: Schema.String })),
+    }),
   ),
   /** Set while the card sits in Needs Owner. */
   question: Schema.NullOr(Schema.String),
@@ -1056,7 +1061,7 @@ export const KanbanCard = Schema.Struct({
    * not know the key drops it, and the card then carries on as it did before.
    */
   deciding: ForwardCompatibleOptional(KanbanCardDeciding),
-  /** Set when the server nudged the active thread after a turn ended without a card move. */
+  /** Last reminder to the active thread, or to its evaluator after a clear review. */
   nudgedAt: Schema.NullOr(IsoDateTime),
   /** A delivered steer can start the detached work thread while a newer wait remains. */
   detachedSteerAt: Schema.optional(IsoDateTime),

@@ -5,9 +5,23 @@ import { join } from 'node:path';
 
 const CAP = 50 * 1024 * 1024;
 const seen = new Set();
-const props = new Set(['model','size','count','status','enabled','locked','limited','reloginNeeded','state','action','tag','dryRun','complete','cost','hour','exitCode','attempt','source','failed','total','fourxx','fivexx']);
+const props = new Set(['model','size','count','status','enabled','locked','limited','reloginNeeded','state','action','tag','dryRun','complete','cost','hour','exitCode','attempt','source','failed','total','fourxx','fivexx','phase','durationMaxMs','omitted']);
 const ids = new Set(['account','connection','thread','incident','request','session']);
 const token = v => typeof v === 'string' && /^[A-Za-z0-9_.:/-]{1,100}$/.test(v) && !/(sk-|bearer|password|secret|token|api.?key|otp|cookie|prompt|@)/i.test(v) ? v : undefined;
+const errorTag = v => typeof v === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(v) ? token(v) : undefined;
+// Only fixed operational messages survive. Exception text can contain arbitrary
+// provider output, credentials or a filesystem path, even after regex redaction.
+const messages = new Set(['Robob replica is stale; recovery deferred', 'Robob replica is not ready',
+  'thread is newer than Robob replica; recovery deferred', 'unverified Robob replica',
+  'The operation was aborted due to timeout', 'The operation was aborted']);
+const errorMessage = (value, tag) => messages.has(value) ? value.slice(0, 300) : tag;
+function failure(value, result = false) {
+  try {
+    const tag = (result ? errorTag(value?.tag) : undefined) ?? errorTag(value?.code)
+      ?? (result ? undefined : errorTag(value?.name)) ?? 'operation_failed';
+    return { tag, message: errorMessage(value?.message, tag) };
+  } catch { return { tag: 'operation_failed', message: 'operation_failed' }; }
+}
 export function clean(event, now = new Date()) {
   const name = token(event.name), component = token(event.component);
   if (!name || !component || !['event','perf','error'].includes(event.kind)) return null;
@@ -18,7 +32,7 @@ export function clean(event, now = new Date()) {
   const safeProps = Object.fromEntries(Object.entries(event.props ?? {}).filter(([k,v]) => props.has(k) && (typeof v === 'boolean' || typeof v === 'number' && Number.isFinite(v) || token(v))));
   if (Object.keys(safeIds).length) row.ids = safeIds;
   if (Object.keys(safeProps).length) row.props = safeProps;
-  if (event.error) { const tag = token(event.error.tag) ?? 'unknown'; row.error = { tag, message: tag }; }
+  if (event.error) { const tag = token(event.error.tag) ?? 'unknown'; row.error = { tag, message: errorMessage(event.error.message, tag) }; }
   return row;
 }
 export function emit(component, name, fields = {}) {
@@ -57,13 +71,16 @@ export function emit(component, name, fields = {}) {
 }
 export async function observed(component, name, work, fields = {}) {
   const start = performance.now();
+  let result;
   try {
-    const result = await work();
-    const ok = result?.ok !== false && (!fields.exitCodeResult || result === 0);
-    emit(component, name, { ...fields, kind: ok ? 'perf' : 'error', ok, durationMs:performance.now()-start, ...(ok ? {} : { error: { tag: 'operation_failed' } }) });
-    return result;
+    result = await work();
   } catch (error) {
-    emit(component, name, { ...fields, kind:'error', ok:false, durationMs:performance.now()-start, error:{tag:'operation_failed'} });
+    try { emit(component, name, { ...fields, kind:'error', ok:false, durationMs:performance.now()-start, error:failure(error) }); } catch {}
     throw error;
   }
+  try {
+    const ok = result?.ok !== false && (!fields.exitCodeResult || result === 0);
+    emit(component, name, { ...fields, kind: ok ? 'perf' : 'error', ok, durationMs:performance.now()-start, ...(ok ? {} : { error: failure(result, true) }) });
+  } catch { /* Caller-owned metadata must not change a successful result. */ }
+  return result;
 }

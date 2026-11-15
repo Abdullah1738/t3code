@@ -2,7 +2,6 @@
 """Five-minute, read-only memory observations; no process arguments are collected."""
 import datetime as dt
 import fcntl
-import math
 import os
 from pathlib import Path
 import re
@@ -16,7 +15,7 @@ WATCHED = ('fseventsd', 'WindowServer', 'Finder', 'Robob', 'codex', 'opencode')
 COUNTED = ('cua-driver', 'node', 'claude', 'codex', 'python')
 COOLDOWN = 6 * 3600
 CARD = 'Mac Upkeep #38 (fseventsd: #36)'
-STATS = 'pid,command,mem,cmprs,cpu'
+STATS = 'pid,command,mem,cmprs'
 
 
 class ProbeError(Exception):
@@ -58,7 +57,7 @@ def parse_vm(text):
 
 
 def parse_top(text):
-    if not re.search(r'^PID\s+COMMAND\s+MEM\s+CMPRS\s+%CPU\s*$', text, re.M):
+    if not re.search(r'^PID\s+COMMAND\s+MEM\s+CMPRS\s*$', text, re.M):
         raise ProbeError('parse')
     rows = []
     for line in text.splitlines():
@@ -66,11 +65,8 @@ def parse_top(text):
             continue
         fields = line.split()
         try:
-            cpu = float(fields[-1])
-            if not math.isfinite(cpu) or cpu < 0:
-                raise ValueError()
-            rows.append(dict(pid=int(fields[0]), command=memory_command(' '.join(fields[1:-3])),
-                             memMb=number(fields[-3]), cmprsMb=number(fields[-2]), cpu=cpu))
+            rows.append(dict(pid=int(fields[0]), command=memory_command(' '.join(fields[1:-2])),
+                             memMb=number(fields[-2]), cmprsMb=number(fields[-1])))
         except (ValueError, IndexError):
             raise ProbeError('parse')
     return rows
@@ -207,8 +203,8 @@ def collect(run, previous, now):
         watched = watched[:512]
         observed = {p['pid']: p for p in snapshot or []}
         props['watched'] = [dict(pid=p['pid'], command=p['command'], etime=p['etime'],
-            **({k: observed[p['pid']][k] for k in ('memMb', 'cmprsMb', 'cpu')}
-               if p['pid'] in observed else dict(memMb=None, cmprsMb=None, cpu=None)),
+            **({k: observed[p['pid']][k] for k in ('memMb', 'cmprsMb')}
+               if p['pid'] in observed else dict(memMb=None, cmprsMb=None)),
             error=None if p['pid'] in observed else props['topError'] or 'gone') for p in watched]
     return props, baseline
 

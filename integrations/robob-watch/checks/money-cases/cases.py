@@ -38,6 +38,7 @@ An optional due date uses the same format; deadline remains the follow-up ping d
 import argparse
 import calendar
 import contextvars
+from contextlib import contextmanager
 import datetime as dt
 from decimal import Decimal, InvalidOperation
 from email.utils import parseaddr
@@ -101,6 +102,13 @@ FOLLOW_FOR = dt.timedelta(days=7)
 FOLLOW_CASE = dt.timedelta(days=30)
 CHECK_BUDGET = 40
 FOLLOW_BUDGET = 20  # seconds of archive lookups per check
+# Noon gets its full ten-second reader cap; Careem gets two seconds for its
+# current binding check. These shared reads precede optional per-question sources.
+ORDER_RESERVE = 12
+ORDER_SCREEN_BUDGET = 1
+FOLLOW_STEPS = ('merchants', 'order_charges', 'payments', 'questions', 'refunds',
+                'owner_threads', 'msgs', 'receipt', 'lookups', 'order_screen', 'census', 'loads', 'writes', 'locks')
+TIMING_KEYS = tuple(name + '_ms' for name in FOLLOW_STEPS) + ('msgs_max_ms', 'follow_ms', 'untimed_ms')
 FOLLOW_EACH = 6  # at most this many of them per question, least recently checked first
 DONT_ASK = 3
 # The runner clips an event at 6,000 characters; cases past this limit wait for the next check.
@@ -664,11 +672,26 @@ def when(t):
     return day(t) if (t.hour, t.minute) == (9, 0) else f'{day(t)} {t:%H:%M}'
 
 
-def read_json(path, default):
+@contextmanager
+def follow_timing(stats):
+    started = time.monotonic()
+    before = sum(stats.get(name + '_ms', 0) for name in FOLLOW_STEPS)
+    token = charges.TIMING_STATS.set(stats)
     try:
-        return json.loads(path.read_text())
-    except FileNotFoundError:
-        return default
+        yield
+    finally:
+        charges.TIMING_STATS.reset(token)
+        stats['follow_ms'] = round((time.monotonic() - started) * 1000)
+        accounted = sum(stats.get(name + '_ms', 0) for name in FOLLOW_STEPS) - before
+        stats['untimed_ms'] = max(0, stats['follow_ms'] - accounted)
+
+
+def read_json(path, default):
+    with charges.step_timing(None, 'loads'):
+        try:
+            return json.loads(path.read_text())
+        except FileNotFoundError:
+            return default
 
 
 if os.environ.get("WATCH_ATTEMPT"):
@@ -681,7 +704,8 @@ else:
 
 @admitted_check
 def write_json(path, obj, timing=None):
-    return atomic_write_json(path, obj, timing)
+    with charges.step_timing(None, 'writes'):
+        return atomic_write_json(path, obj, timing)
 
 
 def load(data=None):
@@ -991,7 +1015,7 @@ class Locked:
         self.lock = (self.data / f'{self.name}.lock').open('a')
 
         try:
-            with within(time.time() + self.wait, CheckTimeout(f'{self.name}.lock still held after {self.wait}s')):
+            with charges.step_timing(None, 'locks'), within(time.time() + self.wait, CheckTimeout(f'{self.name}.lock still held after {self.wait}s')):
                 fcntl.flock(self.lock, fcntl.LOCK_EX)
             self.book = {'cases': load, 'questions': load_questions, 'cards': load_cards,
                          'subscriptions': load_subscriptions}[self.name](self.data)
@@ -1004,8 +1028,9 @@ class Locked:
         try:
             if kind is None:
                 # Question rows quote alerts, receipts and his own words; nothing secret is stored.
-                book = self.book if self.name == 'cases' else redact_all(self.book)
-                write_json(self.data / f'{self.name}.json', book)
+                with charges.step_timing(None, 'writes'):
+                    book = self.book if self.name == 'cases' else redact_all(self.book)
+                    write_json(self.data / f'{self.name}.json', book)
         finally:
             self.lock.close()
 
@@ -2625,8 +2650,8 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
         if active(q) or (q.get('status') == 'case' and now - at <= FOLLOW_CASE):
             todo.append((q.get('checked') or '', at, q))
     stats = stats if stats is not None else {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
-    # Count the active input snapshot, including deferred questions. not_checked
-    # is a subset of limited; only completed, error-free screens are proven_clean.
+    # not_checked means neither order evidence nor a full screen ran. An
+    # order-only negative stays limited until the other required sources run.
     with charges.step_timing(stats, 'census'):
         census = stats['charge_census'] = {app: dict.fromkeys(
             ('open', 'matched', 'proven_clean', 'limited', 'error', 'not_checked'), 0)
@@ -2657,6 +2682,62 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
                  if q.get('kind') == 'charge' and charges.order_app(charge_of(q)) == app]
         if times:
             memo[('orders_since', app)] = min(times)
+    order_end = time.time() + ORDER_RESERVE
+    if deadline is not None:
+        order_end = min(order_end, deadline)
+    for app in ('noon', 'careem'):
+        candidates = [(at, q) for _, at, q in todo
+                      if q.get('kind') == 'charge' and charges.order_app(charge_of(q)) == app]
+        if not candidates or time.time() >= order_end:
+            continue
+        at, q = min(candidates, key=lambda pair: pair[0])
+        stop = min(order_end, time.time() + (10 if app == 'noon' else 2))
+        try:
+            # Populate the shared memo even if the first question's mail slice
+            # later expires. Each question still evaluates every required source.
+            with within(stop, charges.Lookup('order prefetch out of time')):
+                charges.order_receipt(charge_of(q), at, now, stop, memo=memo, stats=stats)
+        except charges.Lookup as exc:
+            # A prefetch alarm must also be replayed fail-closed, rather than
+            # starting the same failed reader again in a shortened question slice.
+            memo.setdefault(('orders', app), exc)
+        finally:
+            stats['order_coverage'] = {app: result['lanes'] for (kind, *rest), result in memo.items()
+                                       if kind == 'orders' and isinstance(result, dict) and 'lanes' in result
+                                       for app in rest}
+    order_outcomes, order_limits, order_errors = {}, {}, set()
+    screen_end = time.time() + ORDER_SCREEN_BUDGET
+    if end is not None:
+        screen_end = min(screen_end, end)
+    with charges.step_timing(stats, 'order_screen', screen_end):
+        for _, at, q in todo:
+            app = charges.order_app(charge_of(q)) if q.get('kind') == 'charge' else None
+            if app is None or ('orders', app) not in memo:
+                continue
+            if time.time() >= screen_end:
+                break
+            try:
+                # Only use the fetched memo: this pass must never start a reader,
+                # mail search or owner query, nor consume a per-question slice.
+                with within(screen_end, LookupTimeout('order evidence out of time')):
+                    hit = charges.order_receipt(charge_of(q), at, now, screen_end, memo=memo)
+                outcome = 'matched' if hit else 'proven_clean'
+                if hit:
+                    hits[q['id']] = hit
+            except charges.SourceLimit as exc:
+                outcome = 'limited'
+                order_limits[q['id']] = {'why': str(exc), 'kinds': exc.kinds}
+            except charges.Lookup:
+                outcome = 'limited' if isinstance(memo[('orders', app)], dict) else 'error'
+            except LookupTimeout:
+                break
+            if outcome == 'error' and app not in order_errors:
+                errors.append(f'{app} orders: lookup unavailable')
+                order_errors.add(app)
+            order_outcomes[q['id']] = {'at': stamp(now), 'outcome': outcome}
+            # Coverage alone cannot authorize an ask: a negative order result
+            # still needs the receipt/owner screen before census proven_clean.
+            counted(q['id'], 'limited' if outcome == 'proven_clean' else outcome)
     owner_source = said or (lambda *a, **kw: charges.owner_texts(*a, **kw, stats=stats))
     source_error = None
 
@@ -2710,6 +2791,8 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
     else:
         ordered.sort(key=lambda x: x[0])
     for _, at, q in ordered:
+        if q['id'] in hits:
+            continue
         # A shortened tail attempt can fail at the same point every cycle.
         if deadline is not None and deadline - time.time() < FOLLOW_EACH:
             errors.append('out of time; the rest next check')
@@ -2766,7 +2849,10 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
     stats['order_coverage'] = {app: result['lanes'] for (kind, *rest), result in memo.items()
                                if kind == 'orders' and isinstance(result, dict) and 'lanes' in result
                                for app in rest}
-    if not looked and not repaired:
+    for qid, limit in order_limits.items():
+        if qid not in looked:
+            stats.setdefault('question_limits', []).append(limit)
+    if not looked and not repaired and not order_outcomes:
         return errors
     with Locked(data, 'questions', wait=lock_wait(end)) as book:
         cases = load(data)['cases']
@@ -2784,7 +2870,7 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
                 continue
             verdicts[q['id']] = {k: v for k, v in hit.items() if k != 'purchase'}
         for q in book['questions']:
-            if q.get('kind') == 'charge' and active(q) and q['id'] not in looked:
+            if q.get('kind') == 'charge' and active(q) and q['id'] not in looked and q['id'] not in hits:
                 verdicts[q['id']] = {'verdict': 'unverified', 'why': 'alias not screened; recheck next run',
                                       'errors': ['alias not screened']}
             elif q['id'] in failed and (verdicts.get(q['id']) or {}).get('verdict', 'ask') == 'ask':
@@ -2806,6 +2892,8 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
                     break
         transactions = alert_verdicts(book['questions'], now, verdicts)
         for q in book['questions']:
+            if q['id'] in order_outcomes:
+                q['order_evidence'] = order_outcomes[q['id']]
             result = alert_verdict(transactions, q, now) if q.get('kind') == 'charge' else verdicts.get(q['id'])
             hit = result if result and result['verdict'] in ('receipt', 'owner', 'subscription', 'paid') else None
             if q['id'] not in looked and q['id'] not in repaired and not result:
@@ -2843,7 +2931,7 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
         # Reconcile from a snapshot: updating one alias must not propagate its
         # outcome through another alias to a distinct same-descriptor question.
         with charges.step_timing(stats, 'census', end):
-            attempted = census_outcomes.copy()
+            attempted = {qid: outcome for qid, outcome in census_outcomes.items() if qid in looked}
             for q in book['questions']:
                 if q['id'] not in census_questions:
                     continue
@@ -3381,8 +3469,7 @@ def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
                                 'limitKinds': diagnostic.get('limitKinds', []),
                                 'orderCoverage': diagnostic.get('order_coverage', {}),
                                 'chargeCensus': diagnostic.get('charge_census', {}),
-                                **{key: stats.get(key, 0) for key in (
-                                    'owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms')},
+                                **{key: stats.get(key, 0) for key in TIMING_KEYS},
                                 'starved_by': stats.get('starved_by', diagnostic.get('starved_by', 'none'))})
         except Exception:
             pass
@@ -3438,17 +3525,23 @@ def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *,
             phases[phase] = time.time() - phase_at
             phase, phase_at = 'follow', time.time()
             errors = []
-            try:
-                reconcile_merchants(data, now, end=work_end)
-            except CheckTimeout:
-                raise
-            except CaseError as exc:
-                errors.append(str(exc))
-            errors += follow_order_charges(data or DATA, now, min(end - 28, time.time() + 6), find, stats, end=work_end)
-            errors += follow_payments(data or DATA, now, min(end - 28, time.time() + 6), find, stats, end=work_end)
-            errors += follow(data or DATA, now, root, min(end - 8, time.time() + FOLLOW_BUDGET), find, said,
-                            end=work_end, stats=stats)
-            errors += refund_mails(data or DATA, now, time.time() + 8, find, stats=stats)
+            with follow_timing(stats):
+                try:
+                    with charges.step_timing(stats, 'merchants'):
+                        reconcile_merchants(data, now, end=work_end)
+                except CheckTimeout:
+                    raise
+                except CaseError as exc:
+                    errors.append(str(exc))
+                with charges.step_timing(stats, 'order_charges'):
+                    errors += follow_order_charges(data or DATA, now, min(end - 28, time.time() + 6), find, stats, end=work_end)
+                with charges.step_timing(stats, 'payments'):
+                    errors += follow_payments(data or DATA, now, min(end - 28, time.time() + 6), find, stats, end=work_end)
+                with charges.step_timing(stats, 'questions'):
+                    errors += follow(data or DATA, now, root, min(end - 8, time.time() + FOLLOW_BUDGET), find, said,
+                                     end=work_end, stats=stats)
+                with charges.step_timing(stats, 'refunds'):
+                    errors += refund_mails(data or DATA, now, time.time() + 8, find, stats=stats)
             phases[phase] = time.time() - phase_at
             phase, phase_at = 'attention', time.time()
             if errors:
@@ -3584,7 +3677,7 @@ def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *,
         return {'at': stamp(now), 'total_s': round(time.time() - started, 3),
                 **{f'{key}_s': round(value, 3) for key, value in phases.items()},
                 **{k: stats[k] for k in ('lookups', 'owner_queries', 'msgs_calls')},
-                **{k: stats.get(k, 0) for k in ('owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms')},
+                **{k: stats.get(k, 0) for k in TIMING_KEYS},
                 'starved_by': stats.get('starved_by', 'none'), 'slowest': max(phases, key=phases.get)}
 
     saved = False
@@ -3650,6 +3743,7 @@ def brief(cases, now=None, root=None, cancelled=None):
         return ''
 
     due, changed = [], []
+    no_deadline = 0
     far = dt.datetime.max.replace(tzinfo=TZ)
     for case in sorted(open_cases, key=lambda c: (c.get('kind') != 'payment_deadline', due_of(c) or far)):
         deadline = deadline_of(case)
@@ -3673,7 +3767,7 @@ def brief(cases, now=None, root=None, cancelled=None):
         elif case.get('urgency') == 'overdue':
             due.append(f"{case['merchant']} {money(case)} ({case['state']}" + (f'; {date}' if date else '') + ')')
         elif due_date is None:
-            due.append(f"{case['merchant']} {money(case)} ({date or 'no valid deadline'})")
+            no_deadline += 1
         elif case.get('kind') == 'payment_deadline' or due_date <= now + BRIEF_DUE:
             if date:
                 due.append(f"{case['merchant']} {money(case)} {date}")
@@ -3685,10 +3779,18 @@ def brief(cases, now=None, root=None, cancelled=None):
             changed.append(f"{case['merchant']} {money(case)}" + (f' {date}' if date else ''))
     parts = [f'Money: {len(open_cases)} open']
     if due:
-        parts.append('due: ' + '; '.join(due))
+        shown = due[:6]
+        if len(due) > len(shown):
+            shown.append(f'+{len(due) - len(shown)} more')
+        parts.append('due: ' + '; '.join(shown))
+    if no_deadline:
+        parts.append(f'{no_deadline} with no deadline')
     if changed:
-        parts.append('changed: ' + '; '.join(changed))
-    if open_cases and not due and not changed:
+        shown = changed[:6]
+        if len(changed) > len(shown):
+            shown.append(f'+{len(changed) - len(shown)} more')
+        parts.append('changed: ' + '; '.join(shown))
+    if open_cases and not due and not changed and not no_deadline:
         parts.append('nothing due in 48h')
     if running:
         shown = running[:3]

@@ -102,7 +102,13 @@ const spanAttributes = <A, E>(
         const span = new Tracer.NativeSpan(options);
         const attribute = span.attribute.bind(span);
         const end = span.end.bind(span);
-        const record: Record<string, unknown> = { name: options.name };
+        const record: Record<string, unknown> = {
+          name: options.name,
+          parentName:
+            span.parent._tag === "Some" && span.parent.value._tag === "Span"
+              ? span.parent.value.name
+              : undefined,
+        };
         span.attribute = (key, value) => {
           record[key] = value;
           attribute(key, value);
@@ -336,7 +342,10 @@ it.effect(
             foreground(sql.withTransaction(countEntries(sql))),
           ]).pipe(Effect.orDie),
         );
-        const reads = spans.filter((span) => span["db.connection"] === "reader");
+        const reads = spans.filter(
+          (span) => span["db.connection"] === "reader" && span["db.connection.reused"] !== true,
+        );
+        assert.lengthOf(reads, 3);
         const lanes = reads.map((span) => span["db.reader.lane"]);
         assert.include(lanes, "foreground");
         assert.include(lanes, "background");
@@ -358,12 +367,28 @@ it.effect(
           assert.isNumber(span["db.statement.execution_ms"]);
         }
         const transaction = spans.find((span) => span.name === "sql.transaction");
+        assert.equal(transaction?.["db.connection"], "reader");
+        assert.isUndefined(transaction?.["db.connection.reused"]);
+        assert.isNumber(transaction?.["db.lock_wait_ms"]);
+        assert.isNumber(transaction?.["db.reader.slot"]);
         assert.equal(transaction?.["db.reader.requested_lane"], "foreground");
         assert.equal(transaction?.["db.reader.effective_lane"], "foreground");
         assert.equal(transaction?.["db.reader.route_reason"], "requested");
         assert.equal(transaction?.["db.reader.waiting"], false);
         assert.equal(transaction?.["db.reader.lane"], "foreground");
         assert.isNumber(transaction?.["db.reader.hold_ms"]);
+        const reused = spans.filter((span) => span["db.connection.reused"] === true);
+        assert.lengthOf(reused, 1);
+        const statement = reused[0]!;
+        assert.equal(statement.name, "sqlite");
+        assert.equal(statement.parentName, "sql.transaction");
+        assert.equal(statement["db.connection"], "reader");
+        assert.equal(statement["db.reader.lane"], "foreground");
+        assert.equal(statement["db.reader.slot"], transaction?.["db.reader.slot"]);
+        assert.isUndefined(statement["db.lock_wait_ms"]);
+        assert.isUndefined(statement["db.reader.acquire_wait_ms"]);
+        assert.isUndefined(statement["db.reader.hold_ms"]);
+        assert.isNumber(statement["db.statement.execution_ms"]);
       }),
     ),
   30_000,

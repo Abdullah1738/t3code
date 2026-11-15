@@ -5,9 +5,9 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Delivery, OUTAGE_AFTER } from "../src/delivery.ts";
-import type { Photon, SendResult } from "../src/photon.ts";
+import { TransportError, type Photon, type SendResult } from "../src/photon.ts";
 import { Store, type OutboxOperation } from "../src/store.ts";
-import { telegramOutlet, type Post } from "../src/telegram-fallback.ts";
+import { notificationAccepted, telegramOutlet, type Post } from "../src/telegram-fallback.ts";
 
 const stores: Store[] = [];
 const directories: string[] = [];
@@ -158,6 +158,240 @@ test("a short blip that recovers within ten minutes never alerts", async () => {
   expect(h.store.get("deliveryHealth")).toBeUndefined();
 });
 
+test("opt-out alerts once per episode and a new accepted send clears it with recovery", async () => {
+  setSystemTime(now);
+  const notify = mock(async (_severity: "attention" | "info", _text: string, _key: string) => true);
+  const outage = mock(async () => true);
+  const h = setup({ notify: outage, optOut: { notify, title: "Moni", slug: "moni", timezone: "Asia/Dubai" } });
+  h.transport.sendText.mockImplementation(async () => { throw new TransportError("http_400:opted_out", false, false); });
+  h.enqueue("one");
+  await h.delivery.tick();
+  expect(h.store.get<unknown>("optedOut")).toEqual({ since: now, failures: 1, alertFailures: 1, alerted: true });
+  expect(h.log.mock.calls).toContainEqual(["outbound-failed", "http_400:opted_out"]);
+  expect(h.log.mock.calls.filter(([event]) => event === "chat-opted-out")).toHaveLength(1);
+  expect(notify.mock.calls).toEqual([["attention", "Moni can't get iMessages from the Robob line: they texted STOP, so Sendblue blocks every text to them (1 failed since 16:00). Reactions still go through. They can text START to turn it back on, or with your OK: cli.ts opt-in --chat moni.", `spectrum-optout:${now}`]]);
+
+  setSystemTime(now + 30_000);
+  h.enqueue("two");
+  await h.delivery.tick();
+  expect(h.store.get<unknown>("optedOut")).toEqual({ since: now, failures: 2, alertFailures: 1, alerted: true });
+  expect(notify.mock.calls).toHaveLength(1);
+  expect(h.log.mock.calls.filter(([event]) => event === "chat-opted-out")).toHaveLength(1);
+  expect(outage).not.toHaveBeenCalled();
+
+  h.transport.sendText.mockImplementation(async () => ({ providerId: "back" }));
+  h.enqueue("three");
+  await h.delivery.tick();
+  expect(h.store.get("optedOut")).toBeUndefined();
+  expect(notify.mock.calls.map(([severity, , key]) => [severity, key]))
+    .toEqual([["attention", `spectrum-optout:${now}`], ["info", `spectrum-optout:${now}:recovered`]]);
+  setSystemTime(now + 60_000);
+  h.transport.sendText.mockImplementation(async () => { throw new TransportError("http_400:opted_out", false, false); });
+  h.enqueue("four");
+  await h.delivery.tick();
+  expect(notify.mock.calls[2]?.[2]).toBe(`spectrum-optout:${now + 60_000}`);
+  expect(h.log.mock.calls.filter(([event]) => event === "chat-opted-out")).toHaveLength(2);
+});
+
+test("unrecognized HTTP failures do not trigger opt-out and an unaccepted alert is retried", async () => {
+  setSystemTime(now);
+  const notify = mock(async (_severity: "attention" | "info", _text: string, _key: string) => false);
+  const h = setup({ optOut: { notify, title: "Owner", slug: "owner" } });
+  h.transport.sendText.mockImplementation(async () => { throw new TransportError("http_400", false, false); });
+  h.enqueue("plain");
+  await h.delivery.tick();
+  expect(h.store.get("optedOut")).toBeUndefined();
+  expect(notify).not.toHaveBeenCalled();
+  h.transport.sendText.mockImplementation(async () => { throw new TransportError("http_403:opted_out", false, false); });
+  h.enqueue("opted-out");
+  setSystemTime(now + 30_000);
+  await h.delivery.tick();
+  expect(h.store.get<unknown>("optedOut")).toEqual({ since: now + 30_000, failures: 1, alertFailures: 1 });
+  h.enqueue("another-opt-out");
+  setSystemTime(now + 60_000);
+  await h.delivery.tick();
+  expect(notify.mock.calls[1]?.[1]).toBe(notify.mock.calls[0]?.[1]);
+  notify.mockImplementation(async () => true);
+  setSystemTime(now + 90_000);
+  await h.delivery.tick();
+  expect(notify.mock.calls.map(([, , key]) => key)).toEqual(Array(3).fill(`spectrum-optout:${now + 30_000}`));
+  expect(h.store.get<unknown>("optedOut")).toEqual({ since: now + 30_000, failures: 2, alertFailures: 1, alerted: true });
+});
+
+test("a reconciled old copy does not clear a later opt-out", async () => {
+  setSystemTime(now);
+  const h = setup();
+  h.store.set("optedOut", { since: now, failures: 1 });
+  h.transport.sendText.mockImplementation(async () => ({ providerId: "old", duplicate: true }));
+  h.enqueue("old");
+  await h.delivery.tick();
+  expect(h.store.get<unknown>("optedOut")).toEqual({ since: now, failures: 1 });
+});
+
+test("a pending opt-out alert stays recoverable if opt-in clears the flag", async () => {
+  setSystemTime(now);
+  let finish!: (value: boolean) => void;
+  const waiting = new Promise<boolean>(resolve => { finish = resolve; });
+  const notify = mock((_severity: "attention" | "info", _text: string, _key: string) => waiting);
+  const h = setup({ optOut: { notify, title: "Moni", slug: "moni" } });
+  h.transport.sendText.mockImplementation(async () => { throw new TransportError("http_400:opted_out", false, false); });
+  h.enqueue("one");
+  const tick = h.delivery.tick();
+  while (notify.mock.calls.length === 0) await Promise.resolve();
+  const episode = h.store.get("optedOut");
+  h.store.set("optOutAwaitingSend", [episode]);
+  h.store.db.query("DELETE FROM kv WHERE key = 'optedOut'").run();
+  finish(true);
+  await tick;
+  expect(h.store.get("optedOut")).toBeUndefined();
+  expect(notify.mock.calls).toHaveLength(1);
+  expect(h.store.get<unknown>("optOutAwaitingSend")).toEqual([{ since: now, failures: 1, alertFailures: 1, alerted: true }]);
+  h.transport.sendText.mockImplementation(async () => ({ providerId: "back" }));
+  h.enqueue("back");
+  await h.delivery.tick();
+  expect(notify.mock.calls.map(([severity]) => severity)).toEqual(["attention", "info"]);
+});
+
+test("recovery survives a temporary Telegram failure and a delivery restart", async () => {
+  setSystemTime(now);
+  const notify = mock(async (severity: "attention" | "info", _text: string, _key: string) => severity === "attention");
+  const options = { optOut: { notify, title: "Moni", slug: "moni" } };
+  const h = setup(options);
+  h.transport.sendText.mockImplementation(async () => { throw new TransportError("http_400:opted_out", false, false); });
+  h.enqueue("one");
+  await h.delivery.tick();
+  h.transport.sendText.mockImplementation(async () => ({ providerId: "back" }));
+  h.enqueue("back");
+  await h.delivery.tick();
+  expect(h.store.get("optedOut")).toBeUndefined();
+  expect(h.store.get<unknown>(`optOutRecovery:${now}`)).toBeDefined();
+  notify.mockImplementation(async () => true);
+  const restarted = new Delivery(h.store, h.transport, { projectScope, enabled: () => true, chatGuid: () => chatGuid, ...options });
+  setSystemTime(now + 30_000);
+  await restarted.tick();
+  expect(h.store.get(`optOutRecovery:${now}`)).toBeUndefined();
+  expect(notify.mock.calls.map(([severity]) => severity)).toEqual(["attention", "info", "info"]);
+});
+
+test("a newer opt-out supersedes an earlier queued recovery", async () => {
+  setSystemTime(now);
+  let telegramAvailable = false;
+  const notify = mock(async (severity: "attention" | "info", _text: string, _key: string) =>
+    severity === "attention" || telegramAvailable);
+  const h = setup({ optOut: { notify, title: "Moni", slug: "moni" } });
+  h.transport.sendText.mockImplementation(async () => { throw new TransportError("http_400:opted_out", false, false); });
+  h.enqueue("first-stop");
+  await h.delivery.tick();
+  h.transport.sendText.mockImplementation(async () => ({ providerId: "back" }));
+  h.enqueue("back");
+  await h.delivery.tick();
+  expect(h.store.get<unknown>(`optOutRecovery:${now}`)).toBeDefined();
+
+  setSystemTime(now + 30_000);
+  telegramAvailable = true;
+  h.transport.sendText.mockImplementation(async () => { throw new TransportError("http_400:opted_out", false, false); });
+  h.enqueue("second-stop");
+  await h.delivery.tick();
+  expect(notify.mock.calls.map(([severity, , key]) => [severity, key])).toEqual([
+    ["attention", `spectrum-optout:${now}`], ["info", `spectrum-optout:${now}:recovered`],
+    ["attention", `spectrum-optout:${now + 30_000}`],
+  ]);
+  expect(h.store.get(`optOutRecovery:${now}`)).toBeUndefined();
+  expect(h.store.get<unknown>("optedOut")).toMatchObject({ since: now + 30_000 });
+  setSystemTime(now + 60_000);
+  await h.delivery.tick();
+  expect(notify.mock.calls).toHaveLength(3);
+
+  h.transport.sendText.mockImplementation(async () => ({ providerId: "back-again" }));
+  h.enqueue("back-again");
+  await h.delivery.tick();
+  expect(h.store.get("optedOut")).toBeUndefined();
+  expect(notify.mock.calls.slice(3).map(([severity]) => severity)).toEqual(["info"]);
+});
+
+test("a lost attention acknowledgement still receives a recovery", async () => {
+  setSystemTime(now);
+  const notify = mock(async (severity: "attention" | "info", _text: string, _key: string) => severity === "info");
+  const h = setup({ optOut: { notify, title: "Moni", slug: "moni" } });
+  h.transport.sendText.mockImplementation(async () => { throw new TransportError("http_400:opted_out", false, false); });
+  h.enqueue("one");
+  await h.delivery.tick();
+  expect(h.store.get<unknown>("optedOut")).toEqual({ since: now, failures: 1, alertFailures: 1 });
+  h.transport.sendText.mockImplementation(async () => ({ providerId: "back" }));
+  h.enqueue("back");
+  await h.delivery.tick();
+  expect(notify.mock.calls.map(([severity]) => severity)).toEqual(["attention", "info"]);
+  expect(h.store.get(`optOutRecovery:${now}`)).toBeUndefined();
+});
+
+test("a send dispatched before opt-in cannot confirm its parked episode", async () => {
+  setSystemTime(now);
+  const notify = mock(async (_severity: "attention" | "info", _text: string, _key: string) => true);
+  const h = setup({ optOut: { notify, title: "Moni", slug: "moni" } });
+  h.store.set("optedOut", { since: now, failures: 1, alerted: true });
+  let finish!: (result: SendResult) => void;
+  let started!: () => void;
+  const entered = new Promise<void>(resolve => { started = resolve; });
+  h.transport.sendText.mockImplementation(() => {
+    started();
+    return new Promise<SendResult>(resolve => { finish = resolve; });
+  });
+  h.enqueue("before-opt-in");
+  const tick = h.delivery.tick();
+  await entered;
+  h.store.set("optOutAwaitingSend", [h.store.get("optedOut")]);
+  h.store.db.query("DELETE FROM kv WHERE key = 'optedOut'").run();
+  finish({ providerId: "first" });
+  await tick;
+  expect(h.store.get<unknown>("optOutAwaitingSend")).toEqual([{ since: now, failures: 1, alerted: true }]);
+  expect(notify).not.toHaveBeenCalled();
+  h.transport.sendText.mockImplementation(async () => ({ providerId: "after" }));
+  h.enqueue("after-opt-in");
+  await h.delivery.tick();
+  expect(h.store.get("optOutAwaitingSend")).toBeUndefined();
+  expect(notify.mock.calls.map(([severity]) => severity)).toEqual(["info"]);
+});
+
+test("a rejected in-flight send still marks the chat opted out after its session changes", async () => {
+  setSystemTime(now);
+  let rejectSend!: (error: Error) => void;
+  let started!: () => void;
+  const entered = new Promise<void>(resolve => { started = resolve; });
+  const h = setup();
+  h.transport.sendText.mockImplementation(() => {
+    started();
+    return new Promise<SendResult>((_resolve, reject) => { rejectSend = reject; });
+  });
+  h.enqueue("one");
+  const tick = h.delivery.tick();
+  await entered;
+  h.store.set("route", { id: "new-session", generation: 2 });
+  rejectSend(new TransportError("http_400:opted_out", false, false));
+  await tick;
+  expect(h.store.getOperation("one")?.state).toBe("cancelled");
+  expect(h.store.get<unknown>("optedOut")).toEqual({ since: now, failures: 1 });
+  expect(h.log.mock.calls).toContainEqual(["outbound-failed", "http_400:opted_out"]);
+});
+
+test("acceptance of a send dispatched before an opt-out does not clear it", async () => {
+  setSystemTime(now);
+  let finish!: (result: SendResult) => void;
+  let started!: () => void;
+  const entered = new Promise<void>(resolve => { started = resolve; });
+  const h = setup();
+  h.transport.sendText.mockImplementation(() => {
+    started();
+    return new Promise<SendResult>(resolve => { finish = resolve; });
+  });
+  h.enqueue("one");
+  const tick = h.delivery.tick();
+  await entered;
+  h.store.set("optedOut", { since: now + 1, failures: 1 });
+  finish({ providerId: "old" });
+  await tick;
+  expect(h.store.get<unknown>("optedOut")).toEqual({ since: now + 1, failures: 1 });
+});
+
 test("images iMessage refuses go to the fallback at once, ones still retrying after ten minutes, and stop retrying", async () => {
   setSystemTime(now);
   const fallback = mock(async (_item: unknown) => "sent" as const);
@@ -216,6 +450,9 @@ test("the telegram outlet sends files and cards, but never a secure form link", 
   expect(posts[1]![1]).toMatchObject({ mimeType: "text/html", base64: Buffer.from("<p>daily</p>").toString("base64") });
   expect(posts.every(([, body]) => !JSON.stringify(body).includes("_secret"))).toBe(true);
   expect(await outlet.notify("attention", "down", "key")).toBe(true);
+  const deduped = telegramOutlet({ post: async () => 409, appsRoot: root, appsUrl: () => undefined, blob: () => data });
+  expect(await deduped.notify("attention", "down", "key")).toBe(true);
+  expect([200, 202, 400, 409, 503, undefined].map(notificationAccepted)).toEqual([true, true, false, false, false, false]);
   const failing = telegramOutlet({ post: async () => undefined, appsRoot: root, appsUrl: () => undefined, blob: () => data });
   expect(await failing.notify("attention", "down", "key")).toBe(false);
   expect(await failing.fallback({ ...base, id: "file", text: "", attachment: { sha256, name: "a.png", mimeType: "image/png", size: 3 } }))

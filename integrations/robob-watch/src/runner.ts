@@ -341,7 +341,7 @@ export async function tickOne(id: string): Promise<void> {
     startLoad = sampleLoad();
     timeoutMs = checkTimeout(current, startLoad);
     if (state.consecutive_failures || state.load_timeouts) toolLog({ component: "runner", kind: "event", name: "watch.retry", ids: { watcher: id, run: runId }, props: { action: "check", attempt: state.consecutive_failures + 1 } });
-    return runCheck(current, watcherDir(id), { WATCH_RUN: runId, WATCH_ATTEMPT: attemptId, WATCH_CLOSING: state.status === "closing" ? "1" : "0", ...(healthRun ? { HEALTH_TOOLLOG_RUN: healthRun } : {}) }, timeoutMs, instance);
+    return runCheck(current, watcherDir(id), { HEALTH_TOOLLOG_TRIGGER: state.consecutive_failures || state.load_timeouts ? "retry" : "schedule", WATCH_RUN: runId, WATCH_ATTEMPT: attemptId, WATCH_CLOSING: state.status === "closing" ? "1" : "0", ...(healthRun ? { HEALTH_TOOLLOG_RUN: healthRun } : {}) }, timeoutMs, instance);
   }));
   if (!result) return;
   const runTimedOut = result.timedOut && (result.code === null || result.code === 0);
@@ -498,7 +498,8 @@ let previousMaintenance: Maintenance | undefined;
 let rollingDay: string | undefined;
 export function previousDayRollup(): void {
   const at = new Date();
-  if (at.getUTCHours() === 0 && at.getUTCMinutes() < 5) return;
+  // Late-day release markers need their full 30-minute post-release window.
+  if (at.getUTCHours() === 0 && at.getUTCMinutes() < 30) return;
   const day = new Date(at.getTime() - 86400_000).toISOString().slice(0, 10);
   if (rollingDay === day) return;
   rollingDay = day;

@@ -427,9 +427,11 @@ class CauseLogs(unittest.TestCase):
         result = amazon.track(OID, runner=runner, accounts=['gmail'], now=NOW)
         self.assertTrue(result['errors'])
         runner.assert_called_once()
-        self.assertEqual(self.rows()[-1]['error']['cause'], {
-            'httpStatus': None, 'endpoint': None, 'attempt': 1, 'retryable': True,
-            'upstreamCode': None, 'exceptionClass': 'TimeoutExpired'})
+        cause = self.rows()[-1]['error']['cause']
+        self.assertGreaterEqual(cause.pop('phaseElapsedMs'), 0)
+        self.assertEqual(cause, {
+            'httpStatus': None, 'endpoint': '/amazon/mail/search', 'attempt': 1, 'retryable': True,
+            'upstreamCode': None, 'exceptionClass': 'TimeoutExpired', 'phase': 'order_list'})
         self.assertNotIn(secret, self.lines())
 
     def test_structured_source_error_uses_safe_code_as_message(self):

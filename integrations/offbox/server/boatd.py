@@ -396,6 +396,22 @@ _HEALTH = {"ts": 0.0, "v": None}
 _HEALTH_LOCK = threading.Lock()
 
 
+RESTART_PENDING = Path("/var/lib/offbox/restart-pending.json")
+
+
+def restart_pending() -> dict:
+    try:
+        value = json.loads(RESTART_PENDING.read_text())
+        services, since = value["services"], value["checkedAt"]
+        if not isinstance(services, list) or not all(isinstance(s, str) and s for s in services):
+            raise ValueError("invalid pending services")
+        if not isinstance(since, str) or dt.datetime.fromisoformat(since).utcoffset() != dt.timedelta(0):
+            raise ValueError("invalid UTC timestamp")
+        return {"count": len(services), "since": since if services else None}
+    except (OSError, ValueError, KeyError, TypeError):
+        return {"count": 0, "since": None}
+
+
 def health(fresh: bool = False) -> dict:
     """GET /health: no auth, no data about boxes or owners. `ok` means runs can be accepted here."""
     with _HEALTH_LOCK:
@@ -436,6 +452,7 @@ def health(fresh: bool = False) -> dict:
         out = {"ok": ok, "up": True, "mode": "ok" if not reasons else "degraded", "reasons": reasons,
                "pool": {"name": CFG["zpool"], "state": pool}, "mdraid": md, "queue": queue, "running": running,
                "boot_id": boot_id(), "uptime_s": int(host_uptime()), "boatd_uptime_s": int(now() - STARTED),
+               "restartPending": restart_pending(),
                "version": VERSION, **status, "boot": STATE.get("boot"), "startupPhases": STATE.get("phases", {})}
         _HEALTH.update(ts=now(), v=out)
         return out

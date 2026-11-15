@@ -38,14 +38,14 @@ class RepoToolTests(unittest.TestCase):
         path.write_text('#!/bin/bash\nprintf "%s\\n" ' + shlex.quote(text) + '\n')
         path.chmod(0o755)
 
-    def run_script(self, command=None, *, steps=None, rel='.', node=''):
+    def run_script(self, command=None, *, steps=None, rel='.', node='', timeout=10):
         with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
                 patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs, 'WATCH_REPAIR', ':'), \
                 patch.object(runs.userns, 'setup', return_value=':'):
             script = runs.remote_script('w/repo with spaces', rel, command or [], None, 'r',
                                         steps=steps, node=node, repo_root=self.root)
         return subprocess.run([shutil.which('bash'), '-c', script], env=self.env, capture_output=True,
-                              text=True, timeout=10, cwd=self.home)
+                              text=True, timeout=timeout, cwd=self.home)
 
     def test_repo_vp_shadows_global_and_tsc_rs_resolves_from_root_and_subdir(self):
         self.tool(self.global_bin, 'vp', 'global')
@@ -130,11 +130,9 @@ class RepoToolTests(unittest.TestCase):
                 self.assertIn('is a repo-local tool', p.stderr)
                 self.assertIn("Run: offbox run -- sh -c 'corepack pnpm@11.10.0 install --frozen-lockfile && <your command>'", p.stderr)
                 self.assertNotIn('vp i &&', p.stderr)
-                if 'vp i' in ' '.join(command) or command == ['vp', 'i'] or steps:
-                    self.assertNotIn(runs.NO_NODE_MODULES_MARKER, p.stderr.splitlines())
-                    self.assertIn('its own install step (vp i)', p.stderr)
-                else:
-                    self.assertIn(runs.NO_NODE_MODULES_MARKER, p.stderr.splitlines())
+                self.assertNotIn(runs.NO_NODE_MODULES_MARKER, p.stderr.splitlines())
+                self.assertNotIn('its own install step', p.stderr)
+                self.assertIn('offbox: exit 127:', p.stderr)
                 self.assertFalse((self.root / 'node_modules').exists())
                 if steps:
                     self.assertIn('offbox step 2 rc=0', p.stderr)
@@ -421,7 +419,8 @@ class RepoToolTests(unittest.TestCase):
                     self.assertIn('vp is a repo-local tool (vite-plus)', p.stderr)
                     self.assertIn('corepack pnpm@11.10.0 install --frozen-lockfile', p.stderr)
                     self.assertNotIn(runs.NO_NODE_MODULES_MARKER, p.stderr.splitlines())
-                    self.assertIn('its own install step (vp i)', p.stderr)
+                    self.assertNotIn('its own install step', p.stderr)
+                    self.assertIn('offbox: exit 127:', p.stderr)
 
     def test_startup_bash_env_rewrites_keep_grandchild_initialization(self):
         self.tool(self.global_bin, 'vp', 'global')

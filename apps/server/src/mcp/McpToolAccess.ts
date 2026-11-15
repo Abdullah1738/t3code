@@ -186,6 +186,12 @@ export const writesThreads = <P, A, E, R>(
     }),
   );
 
+/** Keep permission reads inside a capability toolkit's operation budget. */
+export const bound = <P, A, E, R, EB, RB>(
+  declaration: Declaration<(params: P) => Effect.Effect<A, E, R>>,
+  budget: (operation: Effect.Effect<A, E, R>) => Effect.Effect<A, EB, RB>,
+) => declare((params: P) => budget(checkedHandler(declaration)(params)));
+
 /** Includes access reads in the send deadline without bypassing their checks. */
 export const boundedThreadSend = <
   P extends { readonly clientRequestId?: string | undefined },

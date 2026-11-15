@@ -75,6 +75,10 @@ def configure_fixture(root, backend):
 def fixture(root, bg, backend):
     a, me = configure_fixture(root, backend)
     a.bg = bg
+    def publish(name, value):
+        pending = root / (name + '.tmp')
+        pending.write_text(value)
+        pending.replace(root / name)
     if os.environ.get('OFFBOX_TEST_THREADED_CALLER'):
         threading.Thread(target=threading.Event().wait, daemon=True).start()
     masked = bool(os.environ.get('OFFBOX_TEST_MASKED_MAIN'))
@@ -83,15 +87,15 @@ def fixture(root, bg, backend):
         def interrupted(signum, frame):
             nonlocal interruptions
             interruptions += 1
-            (root / 'caller-interrupted').write_text(str(interruptions))
+            publish('caller-interrupted', str(interruptions))
         signal.signal(signal.SIGINT, interrupted)
         signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGINT,))
     if os.environ.get('OFFBOX_TEST_READY_TIMEOUT'):
         runs.BG_READY_TIMEOUT_S = float(os.environ['OFFBOX_TEST_READY_TIMEOUT'])
     code = runs.run_remote(a, me)
     if masked:
-        (root / 'mask-restored').write_text(str(signal.SIGINT in signal.pthread_sigmask(signal.SIG_BLOCK, ())))
-    (root / 'returned').write_text(str(code))
+        publish('mask-restored', str(signal.SIGINT in signal.pthread_sigmask(signal.SIG_BLOCK, ())))
+    publish('returned', str(code))
     while True:
         if masked:
             time.sleep(.01)
