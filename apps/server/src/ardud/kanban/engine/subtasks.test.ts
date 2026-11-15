@@ -1532,7 +1532,8 @@ describe("planSubtasks", () => {
       later,
     );
     if (!plan.ok) throw new Error(plan.reason);
-    expect(plan.subtasks[0]).toMatchObject({ gate: "deploy", createdAt: at });
+    // Rewording a retained gate requires a new approval, even with gate:null.
+    expect(plan.subtasks[0]).toMatchObject({ gate: "deploy", createdAt: later });
   });
 
   it.each([undefined, "secret", "deploy", "money"] as const)(
@@ -1649,7 +1650,73 @@ describe("planSubtasks approval clock", () => {
     return plan.subtasks[0]!;
   };
 
-  it("replays #621's read-back reword and a same-text gate:null edit after signoff", () => {
+  const literalChanges = [
+    { name: "case", text: "Release", replacement: "release" },
+    { name: "upper case", text: "Release", replacement: "RELEASE" },
+    { name: "path case", text: "/srv/Release", replacement: "/srv/release" },
+    { name: "quoted case", text: '"Release"', replacement: '"release"' },
+    { name: "quoted punctuation", text: '"alpha!"', replacement: '"alpha"' },
+    { name: "embedded punctuation", text: "alpha.beta", replacement: "alphabeta" },
+    { name: "prose as a value", text: "Restart the helper!", replacement: "Restart the helper" },
+    ...[".", "!", ";", ":"].flatMap((suffix) => [
+      { name: `remove ${suffix}`, text: `alpha${suffix}`, replacement: "alpha" },
+      { name: `add ${suffix}`, text: "alpha", replacement: `alpha${suffix}` },
+    ]),
+  ];
+
+  it.each(
+    (
+      [
+        { gate: "deploy", prefix: "Deploy branch " },
+        { gate: "money", prefix: "Pay invoice " },
+        { gate: "secret", prefix: "Set password to " },
+      ] as const
+    ).flatMap(({ gate, prefix }) =>
+      literalChanges.map(({ name, text, replacement }) => ({
+        gate,
+        name,
+        text: prefix + text,
+        replacement: prefix + replacement,
+      })),
+    ),
+  )(
+    "restarts $gate approval for literal $name: $text → $replacement",
+    ({ gate, text, replacement }) => {
+      for (const taskOwner of ["evaluator", "script"] as const) {
+        for (const gateSource of ["guessed", "set"] as const) {
+          const script = taskOwner === "script" ? "land" : undefined;
+          const known = { ...step, text, gate, owner: taskOwner, gateSource, script };
+          const saved = replan(known, { id: "s4", text: replacement, script });
+          expect(saved).toMatchObject({ gate, createdAt: edited });
+          const pending = {
+            ...signoff,
+            closedAt: edited,
+            answer: { verdict: "approved" as const, by: owner, at: edited },
+          };
+          expect(approvalProblem({ ...approvedCard(saved), asks: [pending] }, saved)).toContain(
+            `since ${edited}`,
+          );
+          expect(
+            approvalProblem({ ...approvedCard(saved), asks: [{ ...pending, at: edited }] }, saved),
+          ).toBeNull();
+        }
+      }
+    },
+  );
+
+  it.each([
+    { gate: "deploy", text: "Restart the Helper", replacement: "Restart the helper" },
+    { gate: "money", text: "Pay the Invoice", replacement: "Pay the invoice" },
+    { gate: "secret", text: "Rotate the API Key", replacement: "Rotate the API key" },
+  ] as const)(
+    "preserves object case in generic-looking $gate prose",
+    ({ gate, text, replacement }) => {
+      const saved = replan({ ...step, text, gate }, { id: "s4", text: replacement });
+      expect(saved.createdAt).toBe(edited);
+    },
+  );
+
+  it("requires fresh approval for #621's gated read-back reword, then preserves a same-text re-listing", () => {
     const known = {
       ...step,
       text: "Owner read-back on the installed desktop build: post in a board chat after a server stall without Cmd+R.",
@@ -1663,9 +1730,10 @@ describe("planSubtasks approval clock", () => {
       gate: null,
     });
     const relisted = replan(reworded, { id: "s4", text: readBack, gate: null });
-    expect(relisted.createdAt).toBe(before);
+    // The retained gate makes this reword a replacement, even for a read-back.
+    expect(relisted.createdAt).toBe(edited);
     expect(relisted.gate).toBe("deploy");
-    expect(approvalProblem(approvedCard(relisted), relisted)).toBeNull();
+    expect(approvalProblem(approvedCard(relisted), relisted)).toContain(`since ${edited}`);
   });
 
   it.each([
@@ -1675,12 +1743,100 @@ describe("planSubtasks approval clock", () => {
     { id: "s4", text: readBack, gate: null },
     { id: "s4", text: `  ${readBack}  ` },
     { id: "s4", step: 7 },
-    { id: "s4", text: "Read back the board chat result." },
   ])("preserves the clock and approval for an immaterial edit: %j", (input) => {
     const saved = replan(step, input);
     expect(saved.createdAt).toBe(before);
     expect(approvalProblem(approvedCard(saved), saved)).toBeNull();
   });
+
+  it.each([
+    { gate: "deploy", text: "Deploy build 41", replacement: "Deploy build 42" },
+    { gate: "deploy", text: "Deploy to host-a", replacement: "Deploy to host-b" },
+    {
+      gate: "money",
+      text: "Pay the invoice for AED 100",
+      replacement: "Pay the invoice for AED 200",
+    },
+    { gate: "money", text: "Pay the invoice to Alice", replacement: "Pay the invoice to Bob" },
+    {
+      gate: "secret",
+      text: "Rotate the API key for staging",
+      replacement: "Rotate the API key for production",
+    },
+    { gate: "deploy", text: readBack, replacement: "Read back the board chat result." },
+  ] as const)(
+    "restarts a same-kind $gate gate for $text → $replacement",
+    ({ gate, text, replacement }) => {
+      for (const taskOwner of ["evaluator", "script"] as const) {
+        const script = taskOwner === "script" ? "land" : undefined;
+        const known = { ...step, text, gate, owner: taskOwner, script };
+        expect(approvalProblem(approvedCard(known), known)).toBeNull();
+        expect(inferGate(replacement)).toBe(inferGate(text));
+        const saved = replan(known, { id: "s4", text: replacement, script });
+        expect(saved).toMatchObject({ gate, createdAt: edited });
+        expect(approvalProblem(approvedCard(saved), saved)).toContain(`since ${edited}`);
+        // An answer after the edit still cannot approve a question presented before it.
+        const pending = {
+          ...signoff,
+          answer: { verdict: "approved" as const, by: owner, at: edited },
+          closedAt: edited,
+        };
+        expect(approvalProblem({ ...approvedCard(saved), asks: [pending] }, saved)).toContain(
+          `since ${edited}`,
+        );
+        const fresh = { ...pending, at: edited };
+        expect(approvalProblem({ ...approvedCard(saved), asks: [fresh] }, saved)).toBeNull();
+      }
+    },
+  );
+
+  // Punctuation is cosmetic only when the complete instruction supplies no literal target/value.
+  it.each(["deploy", "money", "secret"] as const)("preserves cosmetic %s edits", (gate) => {
+    const text = {
+      deploy: "Restart the helper",
+      money: "Pay the invoice",
+      secret: "Rotate the API key",
+    }[gate];
+    for (const replacement of [
+      `  ${text}  `,
+      text.replaceAll(" ", " \t\n "),
+      text.replace(/^\w+/, (verb) => verb.toUpperCase()),
+      ...[".", "!", ";", ":"].map((suffix) => `${text}${suffix}`),
+    ]) {
+      const saved = replan({ ...step, text, gate }, { id: "s4", text: replacement });
+      expect(saved.createdAt).toBe(before);
+      expect(approvalProblem(approvedCard(saved), saved)).toBeNull();
+    }
+  });
+
+  it.each([
+    { gate: "deploy", text: "Deploy branch Release" },
+    { gate: "money", text: "Pay invoice Alpha" },
+    { gate: "secret", text: "Set password to alpha!" },
+  ] as const)(
+    "keeps whitespace-only $gate edits cosmetic with a literal value",
+    ({ gate, text }) => {
+      const saved = replan(
+        { ...step, text, gate },
+        { id: "s4", text: `  ${text.replaceAll(" ", " \t\n ")}  ` },
+      );
+      expect(saved.createdAt).toBe(before);
+    },
+  );
+
+  it.each(["ownerOnly", "interrupting"] as const)(
+    "keeps the clock for an existing gate's %s toggle",
+    (flag) => {
+      for (const gateSource of [undefined, "guessed", "set"] as const) {
+        for (const value of [false, true]) {
+          const known = { ...step, gateSource, [flag]: !value };
+          const saved = replan(known, { id: "s4", [flag]: value });
+          expect(saved.createdAt).toBe(before);
+          expect(approvalProblem(approvedCard(saved), saved)).toBeNull();
+        }
+      }
+    },
+  );
 
   it.each([
     ["deploy", "Deploy the helper after the read-back."],
@@ -1746,6 +1902,38 @@ describe("planSubtasks approval clock", () => {
     expect(saved.createdAt).toBe(edited);
   });
 
+  it("keeps an unstored inferred gate's clock when re-listing the same text", () => {
+    const { gate: _gate, gateSource: _source, ...legacy } = step;
+    const saved = replan(
+      { ...legacy, text: "Deploy build 41" },
+      { id: "s4", text: "Deploy build 41" },
+    );
+    expect(saved).toMatchObject({ gate: "deploy", createdAt: before });
+  });
+
+  it("allows an evaluator to clear a guessed gate while rewording a read-back", () => {
+    const plan = planSubtasks(
+      [step],
+      [
+        {
+          id: "s4",
+          text: "Read back the result.",
+          gate: null,
+          clearGate: "This step only reads the result; it changes no live service",
+        },
+      ],
+      4,
+      edited,
+      undefined,
+      { _tag: "evaluator", threadId: ThreadId.make("evaluator") },
+    );
+    if (!plan.ok) throw new Error(plan.reason);
+    const saved = plan.subtasks[0]!;
+    expect(gateOf(saved)).toBeUndefined();
+    expect(saved.gateCleared?.text).toBe("Read back the result.");
+    expect(approvalProblem({ ...approvedCard(saved), asks: [] }, saved)).toBeNull();
+  });
+
   it.each([
     { previous: undefined, script: "land" },
     { previous: "land", script: "land-v2" },
@@ -1766,7 +1954,7 @@ describe("planSubtasks approval clock", () => {
 
   it.each([
     { id: "s4", gate: null },
-    { id: "s4", text: "Read back the result" },
+    { id: "s4", text: `  ${readBack}  ` },
   ])("preserves an absent legacy createdAt: %j", (input) => {
     const { createdAt: _createdAt, ...legacy } = step;
     const saved = replan(legacy, input);
@@ -1774,7 +1962,15 @@ describe("planSubtasks approval clock", () => {
     expect(approvalProblem(approvedCard(saved), saved)).toBeNull();
   });
 
-  it("keeps the Offbox #133 approval through gate:null and a reword of read-back and tell-back steps", () => {
+  it("restarts an absent legacy clock for a meaningful gated reword", () => {
+    const { createdAt: _createdAt, ...legacy } = step;
+    const saved = replan(legacy, { id: "s4", text: "Read back the result" });
+    // Legacy plans need a new bound when the gated action changes too.
+    expect(saved.createdAt).toBe(edited);
+    expect(approvalProblem(approvedCard(saved), saved)).toContain(`since ${edited}`);
+  });
+
+  it("keeps Offbox #133's gate:null re-listing but requires fresh approval for gated rewords", () => {
     const tasks = ["s1", "s8", "s9"].map((id) => ({
       ...step,
       id,
@@ -1794,6 +1990,15 @@ describe("planSubtasks approval clock", () => {
       edited,
     );
     if (!sameText.ok) throw new Error(sameText.reason);
+    for (const saved of sameText.subtasks) {
+      expect(saved.createdAt).toBe(before);
+      expect(
+        approvalProblem(
+          { number: 133, createdAt: before, asks, subtasks: sameText.subtasks },
+          saved,
+        ),
+      ).toBeNull();
+    }
     const reworded = planSubtasks(
       sameText.subtasks,
       tasks.map((s) => ({ id: s.id, text: "Read back the result." })),
@@ -1802,13 +2007,14 @@ describe("planSubtasks approval clock", () => {
     );
     if (!reworded.ok) throw new Error(reworded.reason);
     for (const saved of reworded.subtasks) {
-      expect(saved.createdAt).toBe(before);
+      // A read-back reword still invalidates the go while its deploy gate remains.
+      expect(saved.createdAt).toBe(edited);
       expect(
         approvalProblem(
           { number: 133, createdAt: before, asks, subtasks: reworded.subtasks },
           saved,
         ),
-      ).toBeNull();
+      ).toContain(`since ${edited}`);
     }
   });
 });
@@ -2251,8 +2457,39 @@ describe("clearing guessed gates", () => {
     }
   });
 
-  it.each(["Restart Robob now", "Read the result"])("reconsiders changed text: %s", (text) => {
-    const cleared = clear(make("Restart Robob"));
+  it.each(
+    (["evaluator", "script"] as const).flatMap((owner) =>
+      ["Restart Robob now", "Read the result"].map((text) => ({ owner, text })),
+    ),
+  )("carries the clear across a $owner reword: $text", ({ owner, text }) => {
+    const cleared = clear({ ...make("Restart Robob"), owner });
+    const plan = planSubtasks(
+      [cleared],
+      [{ id: cleared.id, text, gate: null }],
+      6,
+      "2026-11-13T19:00:00.000Z",
+      undefined,
+      evaluator,
+    );
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) return;
+    const saved = plan.subtasks[0]!;
+    expect(saved).not.toHaveProperty("gate");
+    expect(saved).not.toHaveProperty("gateSource");
+    expect(saved.gateCleared).toEqual({ ...cleared.gateCleared, text });
+    expect(saved.createdAt).toBe(cleared.createdAt);
+    expect(gateOf(saved)).toBeUndefined();
+    expect(
+      approvalProblem({ number: 21, asks: [], createdAt: at, subtasks: [saved] }, saved),
+    ).toBeNull();
+  });
+
+  it.each(
+    (["evaluator", "script"] as const).flatMap((owner) =>
+      ["Share the API key", "Pay for the service"].map((text) => ({ owner, text })),
+    ),
+  )("re-gates a $owner reword with a different guess: $text", ({ owner, text }) => {
+    const cleared = clear({ ...make("Restart Robob"), owner });
     const fresh = "2026-11-13T19:00:00.000Z";
     const plan = planSubtasks(
       [cleared],
@@ -2269,6 +2506,65 @@ describe("clearing guessed gates", () => {
     if (inferGate(text))
       expect(plan.subtasks[0]).toMatchObject({ createdAt: fresh, gateSource: "guessed" });
   });
+
+  const wording = [
+    { guess: "deploy", text: "Restart the test helper", reword: "Restart another test helper" },
+    {
+      guess: "money",
+      text: "Pay attention to the test result",
+      reword: "Pay close attention to the test result",
+    },
+    { guess: "secret", text: "Share the API key fixture", reword: "Share another API key fixture" },
+  ] as const;
+  const stickyClears = wording.flatMap((original) =>
+    wording
+      .filter((stored) => stored.guess !== original.guess)
+      .flatMap((stored) =>
+        (["evaluator", "script"] as const).map((owner) => ({
+          ...original,
+          gate: stored.guess,
+          owner,
+        })),
+      ),
+  );
+
+  it.each(stickyClears)(
+    "preserves a cleared sticky $gate on $owner wording that already guesses $guess",
+    ({ gate, owner, text, reword, guess }) => {
+      const cleared = clear({ ...make(text), owner, gate, gateSource: "guessed" });
+      for (const input of [
+        { id: cleared.id, text, gate: null },
+        { id: cleared.id, text: reword, gate: null },
+        { id: cleared.id, clearGate: "This remains a fixture, no live operation" },
+      ]) {
+        const plan = planSubtasks([cleared], [input], 6, "2026-11-13T19:00:00.000Z", undefined, {
+          _tag: "evaluator",
+          threadId: ThreadId.make("another-evaluator"),
+        });
+        expect(plan.ok).toBe(true);
+        if (!plan.ok) continue;
+        const saved = plan.subtasks[0]!;
+        expect(inferGate(saved.text)).toBe(guess);
+        expect(saved.gateCleared).toEqual({ ...cleared.gateCleared, text: saved.text });
+        expect(gateOf(saved)).toBeUndefined();
+        expect(saved.createdAt).toBe(cleared.createdAt);
+      }
+      const different = wording.find((entry) => entry.guess !== gate && entry.guess !== guess)!;
+      const plan = planSubtasks(
+        [cleared],
+        [{ id: cleared.id, text: different.text }],
+        6,
+        later,
+        undefined,
+        evaluator,
+      );
+      expect(plan.ok && plan.subtasks[0]).toMatchObject({
+        gate: different.guess,
+        gateSource: "guessed",
+      });
+      expect(plan.ok && plan.subtasks[0]).not.toHaveProperty("gateCleared");
+    },
+  );
 
   it("an explicit gate re-gates an unchanged cleared step", () => {
     const cleared = clear(make("Restart Robob"));
@@ -2310,6 +2606,23 @@ describe("clearing guessed gates", () => {
       reason: `subtask ${known.id} has a deploy gate set on purpose; only Abdullah's answer clears it (card_ask naming ${known.id})`,
     });
   });
+
+  it.each(["deploy", "money", "secret"] as const)(
+    "rewording keeps a deliberate %s gate",
+    (gate) => {
+      const known = make("Do the operation", gate);
+      const plan = planSubtasks(
+        [known],
+        [{ id: known.id, text: "Read the result", gate: null }],
+        6,
+        later,
+        undefined,
+        evaluator,
+      );
+      expect(plan.ok && plan.subtasks[0]).toMatchObject({ gate, gateSource: "set" });
+      expect(plan.ok && plan.subtasks[0]).not.toHaveProperty("gateCleared");
+    },
+  );
 
   it("clears a legacy 9router s6 gate with no recorded origin", () => {
     const { gateSource: _, ...legacy } = make(
@@ -2389,7 +2702,10 @@ it("board guess settings preserve stored clears and deliberate gates", () => {
     owner,
   );
   if (!changed.ok) throw new Error(changed.reason);
-  expect(changed.subtasks[0]).not.toHaveProperty("gateCleared");
+  expect(changed.subtasks[0]!.gateCleared).toEqual({
+    ...cleared.subtasks[0]!.gateCleared,
+    text: "Restart the helper",
+  });
   expect(changed.subtasks[0]).not.toHaveProperty("gate");
   const deliberate = planSubtasks(
     [],

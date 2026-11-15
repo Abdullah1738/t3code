@@ -704,6 +704,16 @@ export const approvalProblem = (
 export const MAX_SUBTASKS = 30;
 export const MAX_TEXT = 500;
 
+// Only complete generic instructions have unambiguous sentence punctuation; arguments stay literal.
+const approvalProse =
+  /^(?:(?:deploy|install) the (?:build|release)|restart the (?:helper|service|server)|pay the invoice|rotate the API key)[.!;:]*$/;
+
+const approvalText = (text: string) => {
+  const normalized = text.trim().replace(/\s+/g, " ");
+  const prose = normalized.replace(/^\w+/, (verb) => verb.toLowerCase());
+  return approvalProse.test(prose) ? prose.replace(/[.!;:]+$/, "") : normalized;
+};
+
 export interface SubtaskInput {
   /** An existing id alone keeps the subtask unchanged; leave out for a new one. */
   readonly id?: string | undefined;
@@ -779,9 +789,13 @@ export function planSubtasks(
     known?: KanbanSubtask,
   ) => {
     const previousGate = known && gateOf(known, guessedGates);
+    const inferredGate = inferGate(text);
+    // A sticky guess may differ from the wording that was cleared.
     const keepClear =
       known?.gateCleared !== undefined &&
-      text === known.text &&
+      (inferredGate === undefined ||
+        inferredGate === known.gateCleared.gate ||
+        inferredGate === inferGate(known.text)) &&
       input.gate == null &&
       input.ownerOnly !== true &&
       input.interrupting !== true;
@@ -929,15 +943,14 @@ export function planSubtasks(
         clearing && actor && at
           ? { gate: clearing, reason: reason!, by: actor, at, text }
           : keepClear
-            ? known.gateCleared
+            ? { ...known.gateCleared!, text }
             : undefined;
       // Cosmetic edits keep the approval's time bound, including its absence on legacy plans.
-      const inferred = text !== known.text ? inferGate(text) : undefined;
       const approvalChanged =
         gate !== previousGate ||
-        (gateSource === "set" && known.gateSource !== "set") ||
+        (input.gate != null && gateSource === "set" && known.gateSource !== "set") ||
         script !== known.script ||
-        (inferred !== undefined && inferred !== inferGate(known.text));
+        approvalText(text) !== approvalText(known.text);
       planned.push({
         ...rest,
         step,

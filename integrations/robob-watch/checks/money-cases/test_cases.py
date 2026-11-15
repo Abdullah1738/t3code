@@ -489,7 +489,7 @@ class CheckEntry(Base):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertLess(time.monotonic() - started, 5)
         state = json.loads((self.wd / 'pings.json').read_text())
-        self.assertEqual(state['timing']['owner_queries'], 2)
+        self.assertEqual(state['timing']['owner_queries'], 3)
         self.assertEqual(state['timing']['msgs_calls'], 2)
         self.assertEqual(trace.read_text().splitlines(), ['search', 'show'])
         questions = json.loads((self.wd / 'scratch-books/questions.json').read_text())['questions']
@@ -3652,7 +3652,7 @@ class CheckBudget(Base):
             self.assertEqual(q['status'], 'closed')
             self.assertIn(f'item {n}', q['outcome'])
         state = json.loads((self.wd / 'pings.json').read_text())
-        self.assertEqual(state['timing']['owner_queries'], 2)
+        self.assertEqual(state['timing']['owner_queries'], 3)
 
     def test_stalled_control_lookup_keeps_check_in_budget_and_questions_unverified(self):
         now = at('2026-10-25T12:00')

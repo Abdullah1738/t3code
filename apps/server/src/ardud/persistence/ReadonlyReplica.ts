@@ -18,6 +18,7 @@ import {
   type ReadonlyReplicaOptions,
   type ReadonlyExportMetrics,
   type ReadonlyRebuildEvent,
+  type ReadonlyExportDiagnosticEvent,
 } from "./readonlyExport.ts";
 
 export class ReadonlyReplicaMaintenanceError extends Schema.TaggedError<ReadonlyReplicaMaintenanceError>()(
@@ -51,6 +52,7 @@ export class ReadonlyExportUnavailable extends Schema.TaggedError<ReadonlyExport
 /** Messages the export worker posts to its supervisor. */
 type WorkerMessage =
   | { readonly type: "rebuild"; readonly rebuild: ReadonlyRebuildEvent }
+  | { readonly type: "diagnostic"; readonly diagnostic: ReadonlyExportDiagnosticEvent }
   | { readonly type: "metrics"; readonly metrics: ReadonlyExportMetrics }
   | { readonly type: "opened" | "step" }
   | { readonly type: "published"; readonly cycleMs?: number }
@@ -147,6 +149,9 @@ try {
   replica = (${replicaFactory})(require('node:sqlite'), require('node:fs'), require('node:path'), { ...workerData, onRebuildEvent: (rebuild) => {
     console.log(JSON.stringify({ type: 'readonly-export', ...rebuild }));
     parentPort.postMessage({ type: 'rebuild', rebuild });
+  }, onDiagnosticEvent: (diagnostic) => {
+    console.log(JSON.stringify({ type: 'readonly-export', ...diagnostic }));
+    parentPort.postMessage({ type: 'diagnostic', diagnostic });
   } }, (${resolveHistoryBasePath.toString()}));
   beat('opened');
   const step = () => {
@@ -202,11 +207,17 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
     identityLagMaxMs: 0,
   };
   const rebuildEvents: ReadonlyRebuildEvent[] = [];
+  const diagnosticEvents: ReadonlyExportDiagnosticEvent[] = [];
   const logRebuilds = Effect.gen(function* () {
     for (const event of rebuildEvents.splice(0))
       yield* (event.event === "abort" ? Effect.logWarning : Effect.logInfo)(
         "Readonly export rebuild",
       ).pipe(Effect.annotateLogs({ ...event }), Effect.withSpan("ardud.readonlyExport.rebuild"));
+    for (const event of diagnosticEvents.splice(0))
+      yield* Effect.logInfo("Readonly export diagnostics").pipe(
+        Effect.annotateLogs({ component: "readonly-export", ...event }),
+        Effect.withSpan("ardud.readonlyExport.diagnostics"),
+      );
   });
   let metricsLoggedAt = Number.NEGATIVE_INFINITY;
   let slowCycleMs: number | undefined;
@@ -248,6 +259,7 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
         } else {
           lastBeat = clock.currentTimeMillisUnsafe();
           if (message?.type === "rebuild") rebuildEvents.push(message.rebuild);
+          if (message?.type === "diagnostic") diagnosticEvents.push(message.diagnostic);
           if (message?.type === "metrics") {
             for (const [cause, count] of Object.entries(message.metrics.lineageRepairCounts))
               metrics.lineageRepairCounts[cause] =

@@ -149,6 +149,8 @@ export const layerExecutor: Layer.Layer<
             return continueRestartedRun({ ...source, queued, beforeDispatch }).pipe(
               Effect.tap(() => (admitted ? Effect.void : pacing.dispatched(source, true))),
               Effect.catchTags({
+                // Retire the recovery wake, preserving any saved queued input.
+                RestartAdmissionSupersededError: () => Effect.void,
                 RestartAdmissionTimeoutError: (error) =>
                   queued === true
                     ? Effect.gen(function* () {

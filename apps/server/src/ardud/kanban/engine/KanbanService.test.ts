@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Clock from "effect/Clock";
+import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -31824,6 +31825,213 @@ it.effect.each(["submitEvaluator", "reportBug"] as const)(
         yield* kanban.tick;
         assert.lengthOf(yield* evaluators, 2);
       }).pipe(Effect.provide(inlineTestLayer(gated)));
+    }),
+);
+
+it.effect("#1516 packet starts still share the preceding in-flight launch", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const secondDone = yield* Deferred.make<void>();
+    let first = true;
+    const gated = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (real) =>
+        KanbanThreads.of({
+          ...real,
+          launch: (input) =>
+            Effect.gen(function* () {
+              if (first) {
+                first = false;
+                yield* Deferred.succeed(entered, undefined);
+                yield* Deferred.await(release);
+              }
+              return yield* real.launch(input);
+            }),
+        }),
+      ),
+    ).pipe(Layer.provide(fake.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const launching = yield* Effect.forkChild(
+        kanban.startEvaluator(board.id, { kind: "packets" }, "First card"),
+      );
+      yield* Deferred.await(entered);
+      const following = yield* Effect.forkChild(
+        kanban
+          .startEvaluator(board.id, { kind: "packets" }, "Second card")
+          .pipe(Effect.exit, Effect.ensuring(Deferred.succeed(secondDone, undefined))),
+      );
+      yield* TestClock.adjust("1 second");
+      assert.isFalse(yield* Deferred.isDone(secondDone));
+      yield* Deferred.succeed(release, undefined);
+      const threadId = yield* Fiber.join(launching);
+      const result = yield* Fiber.join(following);
+      if (Exit.isFailure(result)) return assert.fail(JSON.stringify(result));
+      assert.strictEqual(result.value, threadId);
+      const threads = yield* Ref.get(fake.threads);
+      assert.strictEqual(threads.size, 1);
+      assert.include(threads.get(threadId)!.messages[0]!, "First card");
+      assert.include(threads.get(threadId)!.messages.at(-1)!, "Second card");
+    }).pipe(
+      Effect.provide(inlineTestLayer(gated)),
+      Effect.ensuring(Deferred.succeed(release, undefined)),
+    );
+  }),
+);
+
+it.effect(
+  "#1516 a mass discussion wake admits every card while one evaluator launch is pending",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let first = true;
+      const gated = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (real) =>
+          KanbanThreads.of({
+            ...real,
+            launch: (input) =>
+              Effect.gen(function* () {
+                if (first) {
+                  first = false;
+                  yield* Deferred.succeed(entered, undefined);
+                  yield* Deferred.await(release);
+                }
+                return yield* real.launch(input);
+              }),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const cards = yield* Effect.forEach(
+          Array.from({ length: 6 }, (_, i) => i),
+          (i) =>
+            kanban.createCard(
+              board.id,
+              {
+                title: `Wake ${i}`,
+                prompt: `Incident ${i}`,
+                subtasks: [{ text: "Fix", owner: "work" }],
+              },
+              owner,
+            ),
+        );
+        const discussions = yield* Effect.forEach(cards, (card) => kanban.cardDiscussion(card.id));
+        const until = DateTime.formatIso(
+          DateTime.makeUnsafe((yield* Clock.currentTimeMillis) + 60_000),
+        );
+        yield* Effect.forEach(cards.slice(0, 5), (card) =>
+          kanban.waitCard(
+            card.id,
+            { on: "time", until, wakeRole: "evaluator", note: "Waiting" },
+            owner,
+          ),
+        );
+        const wake = (i: number) =>
+          kanban.answerWait(
+            cards[i]!.id,
+            { result: "wake", note: `Wake card ${i}` },
+            { script: null },
+            { _tag: "system", component: "wait" },
+          );
+        const launching = yield* Effect.forkChild(wake(0));
+        yield* Deferred.await(entered);
+        const beforeJoins = yield* Clock.currentTimeMillis;
+        const branches = yield* Effect.forEach(
+          [
+            ...[1, 2, 3, 4].map((i) => ({
+              label: `wake(${i})`,
+              effect: wake(i).pipe(Effect.asVoid),
+            })),
+            {
+              label: "editCard(cards[5])",
+              effect: kanban
+                .editCard(cards[5]!.id, { description: "Saved during mass wake" }, owner)
+                .pipe(Effect.asVoid),
+            },
+          ],
+          ({ label, effect }) =>
+            Effect.gen(function* () {
+              const completed = yield* Deferred.make<void>();
+              const fiber = yield* Effect.forkChild(
+                effect.pipe(Effect.tap(() => Deferred.succeed(completed, undefined))),
+              );
+              return { label, fiber, completed };
+            }),
+        );
+        const completions = yield* Effect.forEach(
+          branches,
+          ({ label, fiber, completed }) =>
+            Effect.gen(function* () {
+              // Only the join deadline uses wall time; service fibers keep their test clock.
+              const result = yield* TestClock.withLive(
+                Fiber.join(fiber).pipe(
+                  Effect.timeout("1 second"),
+                  Effect.as("Success"),
+                  Effect.catchTags({ TimeoutError: () => Effect.succeed("Timeout") }),
+                  Effect.exit,
+                ),
+              );
+              return {
+                label,
+                outcome: Exit.isSuccess(result) ? result.value : "Failure",
+                completed: yield* Deferred.isDone(completed),
+                ...(Exit.isFailure(result) ? { cause: Cause.pretty(result.cause) } : {}),
+              };
+            }),
+          { concurrency: "unbounded" },
+        );
+        assert.isFalse(yield* Deferred.isDone(release));
+        assert.strictEqual(yield* Clock.currentTimeMillis, beforeJoins);
+        assert.deepStrictEqual(
+          completions,
+          branches.map(({ label }) => ({ label, outcome: "Success", completed: true })),
+          `Before release: ${JSON.stringify(completions)}`,
+        );
+        assert.strictEqual(
+          (yield* kanban.card(cards[5]!.id)).card.description,
+          "Saved during mass wake",
+        );
+        const sql = yield* BoardsDatabase.client;
+        const pending = yield* sql<{ started_at: string | null }>`
+        SELECT started_at FROM ardud_kanban_evaluator_queue WHERE done_at IS NULL ORDER BY id
+      `;
+        assert.lengthOf(pending, 5);
+        assert.isNotNull(pending[0]!.started_at);
+        assert.isTrue(pending.slice(1).every((row) => row.started_at === null));
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(launching);
+        yield* kanban.tick;
+        const threads = yield* Ref.get(fake.threads);
+        assert.lengthOf(
+          [...threads.values()].filter((thread) => thread.title.startsWith("Evaluator")),
+          5,
+        );
+        for (let i = 0; i < 5; i++) {
+          const discussion = yield* kanban.discussion(discussions[i]!.id);
+          assert.isNotNull(discussion.evaluatorThreadId);
+          assert.strictEqual(
+            threads
+              .get(discussion.evaluatorThreadId!)!
+              .messages.filter((text) => text.includes(`Wake card ${i}`)).length,
+            1,
+          );
+        }
+        assert.lengthOf(
+          yield* sql`SELECT id FROM ardud_kanban_evaluator_queue WHERE done_at IS NULL`,
+          0,
+        );
+        assert.lengthOf(fake.interrupted, 0);
+      }).pipe(
+        // Await saved drains after the card commits, as in the incident; inline routing retains its caller snapshot.
+        Effect.provide(withOwnerRouteMode(testLayer(gated), "await")),
+        Effect.ensuring(Deferred.succeed(release, undefined)),
+      );
     }),
 );
 

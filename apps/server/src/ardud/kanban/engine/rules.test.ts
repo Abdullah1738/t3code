@@ -15,6 +15,7 @@ import {
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
+import { newWait } from "./waits.ts";
 
 import {
   applyReviewResult,
@@ -1799,6 +1800,29 @@ describe("workerQuietDue", () => {
     expect(workerQuietDue(working, view("needs-input"), at(31))).toBe(true);
     expect(workerQuietDue(working, view("running"), at(31))).toBe(false);
   });
+
+  it.each([
+    { setter: "t1", ownThread: "t1", stale: false, due: true },
+    { setter: "other", ownThread: "t1", stale: false, due: false },
+    { setter: "t1", ownThread: "other", stale: false, due: false },
+    { setter: "t1", ownThread: "t1", stale: true, due: false },
+  ])(
+    "only an own deferred wait reaches the idle backstop: %s",
+    ({ setter, ownThread, stale, due }) => {
+      const waiting = {
+        ...working,
+        workThreadId: ThreadId.make(ownThread),
+        wait: newWait(
+          { on: "time", until: "2026-10-26T00:00:00.000Z", note: "later" },
+          { _tag: "thread", threadId: ThreadId.make(setter) },
+          START_ISO,
+        ),
+        ...(stale ? { movedAt: "2026-10-25T00:00:01.000Z" } : {}),
+      };
+      expect(workerQuietDue(waiting, view("idle"), at(31))).toBe(due);
+      expect(workerQuietDue(waiting, view("running"), at(31))).toBe(false);
+    },
+  );
 
   it("counts from quietSince", () => {
     const quiet = { state: "idle", quietSince: "2026-10-25T00:20:00.000Z" };

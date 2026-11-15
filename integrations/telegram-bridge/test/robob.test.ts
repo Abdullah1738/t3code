@@ -1,6 +1,7 @@
 import { afterEach, expect, setSystemTime, test } from "bun:test";
 import { useToolLogFixture } from "./toollog-fixture.ts";
 import { Attention } from "../src/attention.ts";
+import { createApi } from "../src/api.ts";
 import { backendKind } from "../src/config.ts";
 import type { PendingRequest, ThreadSummary } from "../src/control.ts";
 import { ActiveThreadsBoard, boardEntry, RobobAlertBackend, runOrdinal, type RobobAlertOptions } from "../src/robob.ts";
@@ -101,21 +102,72 @@ function cachedBoard() {
   return { board, state, thread, warnings, calls: () => calls, time: (value: number) => { at = value; } };
 }
 
-test("board reads are cached until 30 seconds old, with numeric telemetry only", async () => {
+test("board reads are cached until 30 seconds old, with safe telemetry only", async () => {
   const h = cachedBoard();
-  expect(h.board.status()).toEqual({ boardFetches: 0, boardCacheHits: 0, boardFetchErrors: 0, boardBackoffMs: 0, lastFetchDurationMs: null, lastFetchReason: null });
+  const counters = { fetchesByReason: { cold: 0, age: 0, hard: 0, soft: 0 }, dirtyEventsByType: {}, windowStartedAt: new Date(0).toISOString() };
+  expect(h.board.status()).toEqual({ boardFetches: 0, boardCacheHits: 0, boardFetchErrors: 0, boardBackoffMs: 0, lastFetchDurationMs: null, lastFetchReason: null, ...counters });
   const first = await h.board.snapshot();
   for (const at of [1, 3_000, 10_000, 29_999]) {
     h.time(at);
     expect(await h.board.snapshot()).toBe(first);
   }
   expect(h.calls()).toBe(1);
-  expect(h.board.status()).toEqual({ boardFetches: 1, boardCacheHits: 4, boardFetchErrors: 0, boardBackoffMs: 0, lastFetchDurationMs: 0, lastFetchReason: "cold" });
+  expect(h.board.status()).toEqual({ boardFetches: 1, boardCacheHits: 4, boardFetchErrors: 0, boardBackoffMs: 0, lastFetchDurationMs: 0, lastFetchReason: "cold",
+    ...counters, fetchesByReason: { cold: 1, age: 0, hard: 0, soft: 0 } });
   h.time(30_000);
   expect(await h.board.snapshot()).not.toBe(first);
   expect(h.calls()).toBe(2);
   expect(h.board.status().lastFetchReason).toBe("age");
   expect(JSON.stringify(h.board.status())).not.toContain("Private title");
+});
+
+test("fetch counters split cold, age, hard and soft without changing the legacy reason", async () => {
+  const h = cachedBoard();
+  await h.board.snapshot();
+  h.time(30_000);
+  await h.board.snapshot();
+  h.time(33_000);
+  h.board.markDirty("hard", "request.opened");
+  h.board.markDirty("soft", "thread.updated:thread.metadata-updated");
+  await h.board.snapshot();
+  h.time(48_000);
+  h.board.markDirty("soft", "thread.updated:thread.metadata-updated");
+  await h.board.snapshot();
+  expect(h.board.status()).toMatchObject({ boardFetches: 4, lastFetchReason: "dirty",
+    fetchesByReason: { cold: 1, age: 1, hard: 1, soft: 1 }, dirtyEventsByType: {
+      "request.opened": { hard: 1, soft: 0 }, "thread.updated:thread.metadata-updated": { hard: 0, soft: 2 },
+    } });
+  const detached = h.board.status();
+  detached.fetchesByReason.cold = 100;
+  detached.dirtyEventsByType["request.opened"]!.hard = 100;
+  expect(h.board.status().fetchesByReason.cold).toBe(1);
+  expect(h.board.status().dirtyEventsByType["request.opened"]!.hard).toBe(1);
+});
+
+test("event counters cap at fifty names plus other and health contains no payload identities", async () => {
+  const control = fakeControl([], { now: () => now });
+  const threadId = "thread:PRIVATE_ID";
+  const title = "PRIVATE_TITLE";
+  control.add({ threadId, title, state: "running" });
+  await control.backend.sessionBoard();
+  await control.backend.notification({ type: "ready", threadId, title });
+  await control.backend.notification({ type: "__proto__", threadId });
+  for (let index = 0; index < 60; index++) {
+    await control.backend.notification({ type: `future.event-${index}`, threadId, title, text: "PRIVATE_TEXT", token: "PRIVATE_TOKEN" });
+  }
+  await control.backend.notification({ type: "ready" });
+  await control.backend.notification({ type: "thread.updated", change: title, threadId });
+  await control.backend.notification({ type: "request.opened", threadId, requestId: "PRIVATE_REQUEST_ID", kind: "approval" });
+  const store = new Store(":memory:");
+  stores.push(store);
+  const api = createApi({ store, enabled: () => true, chatId: () => 100, timezone: "UTC", health: () => ({ board: control.backend.boardStatus() }) });
+  const response = await api(new Request("http://bridge/health"));
+  const health = await response.json();
+  expect(Object.keys(health.board.dirtyEventsByType)).toHaveLength(51);
+  expect(health.board.dirtyEventsByType).toMatchObject({ ready: { hard: 2, soft: 0 }, other: { hard: 1, soft: 13 } });
+  expect(health.board.windowStartedAt).toBe(new Date(now).toISOString());
+  expect(JSON.stringify(health)).not.toContain("PRIVATE_");
+  expect(health.board).toEqual(control.backend.boardStatus());
 });
 
 test("dirty board bursts respect the 3 second gap and remain dirty until fetched", async () => {
@@ -162,6 +214,7 @@ test("a failed refresh serves the retained cache during backoff and then retries
   h.state.read = async () => { h.time(30_025); throw new Error("private failure"); };
   await expect(h.board.snapshot()).rejects.toThrow("private failure");
   expect(h.board.status()).toMatchObject({ boardFetches: 2, boardFetchErrors: 1, boardBackoffMs: 5_000, lastFetchDurationMs: 25, lastFetchReason: "age" });
+  expect(h.board.status().fetchesByReason).toEqual({ cold: 1, age: 1, hard: 0, soft: 0 });
   expect(await h.board.snapshot()).toBe(first);
   h.time(35_024);
   expect(await h.board.snapshot()).toBe(first);
@@ -175,6 +228,7 @@ test("a failed refresh serves the retained cache during backoff and then retries
   expect((await retry).entries).toEqual(first.entries);
   expect(h.board.status().lastFetchReason).toBe("dirty");
   expect(h.board.status().boardBackoffMs).toBe(0);
+  expect(h.board.status().fetchesByReason).toEqual({ cold: 1, age: 1, hard: 0, soft: 1 });
 });
 
 test("a cold failure does not strand the single-flight promise", async () => {
@@ -248,6 +302,22 @@ test.each([false, true])("steady idle/metadata-churn fetch count, churn=%j", asy
   expect(h.calls()).toBe(churn ? 12 : 6);
 });
 
+test.each([[30_000, 12], [20_000, 18]])("mixed unknown events each second and busy/idle flips every %i ms produce %i fetches in three minutes", async (flipGap, expected) => {
+  const h = cachedBoard();
+  const control = fakeControl([], { board: h.board });
+  control.add({ threadId: "t", state: "running" });
+  for (let at = 0; at < 180_000; at += 250) {
+    h.time(at);
+    if (at % 1_000 === 0) await control.backend.notification({ type: "future.event", threadId: "t" });
+    if (at > 0 && at % flipGap! === 0) {
+      await control.backend.notification({ type: "thread.status", threadId: "t", state: at % (flipGap! * 2) === 0 ? "running" : "idle" });
+    }
+    await control.backend.sessionBoard();
+  }
+  expect(h.calls()).toBe(expected!);
+  if (flipGap === 30_000) expect(h.calls() / 3).toBeLessThanOrEqual(4);
+});
+
 test("the full 500-row roster is mapped and warns once per ten minutes, before filtering iMessage", async () => {
   const h = cachedBoard();
   h.state.threads = Array.from({ length: 500 }, (_, index) => ({ ...h.thread, threadId: `t-${index}`, origin: index === 499 ? "imessage" : null }));
@@ -266,7 +336,7 @@ test("the full 500-row roster is mapped and warns once per ten minutes, before f
   expect(h.warnings).toEqual(["board-roster-at-limit", "board-roster-at-limit"]);
 });
 
-test("plain message wakes do not refetch; dirtying control events do, subject to the gap", async () => {
+test("plain message wakes wait for the soft gap; status events use the hard gap", async () => {
   let at = now;
   const control = fakeControl([], { now: () => at });
   control.add({ threadId: "t", state: "running" });
@@ -301,6 +371,9 @@ test.each<DirtyEvent>([
     "thread.runtime-mode-updated", "run.created", "run.updated", "runtime-request.updated"].map<DirtyEvent>(change => [{ type: "thread.updated", change }, true]),
   ...["thread.model-selection-updated", "thread.interaction-mode-updated", "thread.renamed", "message.updated"].map<DirtyEvent>(change => [{ type: "thread.updated", change }, false]),
   ...["user", "assistant"].map<DirtyEvent>(role => [{ type: "message.completed", role }, false]),
+  [{ type: "thread.status", state: "future-state" }, false],
+  [{ type: "future.event" }, false],
+  [{ type: "constructor" }, false],
 ])("board dirty classification: %j => %s", async (data, dirty) => {
   let at = now;
   const control = fakeControl([], { now: () => at });
@@ -308,8 +381,20 @@ test.each<DirtyEvent>([
   await control.backend.sessionBoard();
   at += 3_000;
   await control.backend.notification({ threadId: "t", ...data });
+  const eventKey = data.type === "thread.updated" ? `thread.updated:${data.change}` : String(data.type);
+  expect(control.backend.boardStatus()?.dirtyEventsByType).toEqual({ [eventKey]: { hard: dirty ? 1 : 0, soft: dirty ? 0 : 1 } });
   await control.backend.sessionBoard();
   expect(control.backend.boardStatus()?.boardFetches).toBe(dirty ? 2 : 1);
+  at += 11_999;
+  await control.backend.sessionBoard();
+  expect(control.backend.boardStatus()?.boardFetches).toBe(dirty ? 2 : 1);
+  if (!dirty) {
+    at++;
+    await control.backend.sessionBoard();
+    expect(control.backend.boardStatus()?.fetchesByReason).toEqual({ cold: 1, age: 0, hard: 0, soft: 1 });
+  } else {
+    expect(control.backend.boardStatus()?.fetchesByReason).toEqual({ cold: 1, age: 0, hard: 1, soft: 0 });
+  }
 });
 
 test.each(["thread.metadata-updated", "thread.provider-switched", "future-change", undefined])("ambiguous updates use the soft gap: %j", async change => {
