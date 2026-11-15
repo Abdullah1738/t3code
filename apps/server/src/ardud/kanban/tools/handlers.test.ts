@@ -6509,6 +6509,107 @@ it.effect("card_create and card_edit report guessed gates and expose clearGate",
   }).pipe(Effect.provide(layer));
 });
 
+it.effect(
+  "card_edit clears three finished guesses and card_move verifies without reopening",
+  () => {
+    const { layer } = fakeThreads();
+    return Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const store = yield* KanbanStore.KanbanStore;
+      const board = yield* kanban.ensureBoard({
+        slug: "finished-gates",
+        name: "Finished gates",
+        defaultProjectId: null,
+      });
+      const evaluator = ThreadId.make("finished-gate-evaluator");
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "9router finished steps",
+          prompt: "Work",
+          subtasks: [7, 8, 10].map((number) => ({
+            text: `Tell reporter ${number} once installed`,
+            owner: "evaluator" as const,
+          })),
+        },
+        { _tag: "owner" },
+      );
+      const finished = card.subtasks.map((subtask) => ({
+        ...subtask,
+        state: "done" as const,
+        note: "Reporter told",
+        doneBy: { _tag: "evaluator" as const, threadId: evaluator },
+        doneAt: card.updatedAt,
+      }));
+      yield* store.putCard({ ...card, subtasks: finished });
+      const refused = yield* call(evaluator, "card_move", { card: card.id, to: "verified" });
+      assert.isTrue(refused.isError, refused.text);
+      assert.include(refused.text, "clearGate");
+      const patch = {
+        card: card.id,
+        subtasks: finished.map(({ id }) => ({
+          id,
+          clearGate: "This only reports the result; nothing goes live",
+        })),
+      };
+      const edited = yield* call(evaluator, "card_edit", patch);
+      assert.isFalse(edited.isError, edited.text);
+      assert.deepStrictEqual(edited.structured.gated, []);
+      const saved = (yield* kanban.card(card.id)).card;
+      for (const [index, task] of saved.subtasks.entries()) {
+        const { gate: _gate, gateSource: _source, ...history } = finished[index]!;
+        const { gateCleared, ...rest } = task;
+        assert.deepStrictEqual(rest, history);
+        assert.strictEqual(gateCleared?.gate, "deploy");
+      }
+      assert.lengthOf(saved.asks, 3);
+      const retry = yield* call(evaluator, "card_edit", patch);
+      assert.isFalse(retry.isError, retry.text);
+      assert.deepStrictEqual(retry.structured.gated, []);
+      assert.lengthOf((yield* kanban.card(card.id)).card.asks, 3);
+      const moved = yield* call(evaluator, "card_move", { card: card.id, to: "verified" });
+      assert.isFalse(moved.isError, moved.text);
+      assert.strictEqual((yield* kanban.card(card.id)).card.stage, "verified");
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+it.effect.each(["open", "done", "skipped"] as const)(
+  "card_edit rejects a %s clear with no gate",
+  (state) => {
+    const { layer } = fakeThreads();
+    return Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const store = yield* KanbanStore.KanbanStore;
+      const board = yield* kanban.ensureBoard({
+        slug: "no-gate",
+        name: "No gate",
+        defaultProjectId: null,
+      });
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "No gate",
+          prompt: "Work",
+          subtasks: [{ text: "Read the result", owner: "evaluator" }],
+        },
+        { _tag: "owner" },
+      );
+      yield* store.putCard({
+        ...card,
+        subtasks: card.subtasks.map((subtask) => ({ ...subtask, state })),
+      });
+      const reply = yield* call(ThreadId.make("no-gate-evaluator"), "card_edit", {
+        card: card.id,
+        subtasks: [{ id: "s1", clearGate: "This only reads the result" }],
+      });
+      assert.isTrue(reply.isError, reply.text);
+      assert.include(reply.text, "subtask s1 has no gate to clear");
+      assert.lengthOf((yield* kanban.card(card.id)).card.asks, 0);
+    }).pipe(Effect.provide(layer));
+  },
+);
+
 it.effect("guessed gate results follow allocated ids even when plan steps are out of order", () => {
   const { layer } = fakeThreads();
   return Effect.gen(function* () {

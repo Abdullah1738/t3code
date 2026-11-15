@@ -104,6 +104,8 @@ class Base(unittest.TestCase):
         boatd.boot_id = lambda: "boot-2"
         boatd.log = lambda msg: None
         boatd.load_cfg()
+        # Resource inputs are explicit in admission tests, independent of the test runner's host.
+        boatd.CFG["cpu_pressure_limit"] = 0
         boatd.READY.clear()
         boatd._HEALTH.update(ts=0.0, v=None)
         boatd._ZPOOL = "offbox/incus"
@@ -373,6 +375,151 @@ class ReconcileBoxes(Base):
 
 
 class Queue(Base):
+    def test_last_admission_lookup_stays_bounded_as_history_grows(self):
+        self.assertIsNone(boatd.last_admission(self.con))
+        self.con.execute("BEGIN")
+        self.con.executemany("INSERT INTO commands(box_id,pid,sync,status,started_at) VALUES('history',?,0,'exited',?)",
+                             ((i, float(i)) for i in range(10000)))
+        self.con.execute("INSERT INTO commands(box_id,pid,sync,started_at) VALUES('sync',1,1,20000)")
+        self.con.commit()
+        steps = []
+        def bounded():
+            steps.append(1)
+            return len(steps) > 100
+        self.con.set_progress_handler(bounded, 1)
+        try:
+            self.assertEqual(boatd.last_admission(self.con), 9999)
+        finally:
+            self.con.set_progress_handler(None, 0)
+
+    def test_cpu_admission_config_accepts_only_finite_percentage_values(self):
+        config = boatd.ETC / "config.json"
+        for value, expected in ((0, 0), (0.0, 0), ("0", 0), (49.99, 49.99), ("50", 50), (100, 100),
+                                (None, None), (False, None), (True, None), (-1, None), (101, None),
+                                ("bad", None), ("nan", None), ("inf", None), ([], None), ({}, None)):
+            with self.subTest(value=value):
+                config.write_text(json.dumps({"cpu_pressure_limit": value}))
+                self.assertEqual(boatd.admission_cpu_limit(), expected)
+        for text in ("invalid", "[]", "null"):
+            with self.subTest(config=text):
+                config.write_text(text)
+                self.assertIsNone(boatd.admission_cpu_limit())
+        config.write_text('{}')
+        self.assertEqual(boatd.admission_cpu_limit(), boatd.DEFAULTS["cpu_pressure_limit"])
+
+    def test_installer_undo_releases_an_existing_cpu_waiter(self):
+        b = self.box()
+        q = self.cmd(b, status="queued")
+        boatd.CFG["cpu_pressure_limit"] = 50
+        (boatd.ETC / "config.json").write_text('{"cpu_pressure_limit":50}')
+        (boatd.ETC / "config.json.before-117").write_text('{}')
+        def undo(_):
+            self.assertEqual(self.status(b, q)["status"], "queued")
+            result = subprocess.run(["bash", str(SERVER / "install-host.sh"), "cpu-admission-undo"],
+                                    env={**os.environ, "BOATD_ETC": str(boatd.ETC)}, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        with patch.object(boatd, "mem_available", return_value=500 * 2**30), \
+             patch.object(boatd, "psi", return_value=80), \
+             patch.object(boatd.time, "sleep", side_effect=undo) as sleep:
+            boatd.admit(self.con, b, q, "k", io.BytesIO())
+        self.assertEqual(sleep.call_count, 1)
+        self.assertEqual(boatd.CFG["cpu_pressure_limit"], 50)
+        self.assertEqual(self.status(b, q)["status"], "running")
+
+    def test_cpu_pressure_holds_fifo_until_it_recovers(self):
+        for pressure in (50, 80, None, float("nan"), float("inf"), -1, 101):
+            with self.subTest(pressure=pressure):
+                b = self.box(bid="bx_cpuqueue")
+                q = self.cmd(b, status="queued")
+                boatd.CFG["cpu_pressure_limit"] = 50
+                err = io.BytesIO()
+                reading = [pressure]
+                clock = [10000.0]
+                waits = []
+                def recover(_):
+                    self.assertEqual(self.status(b, q)["status"], "queued")
+                    # Waiting an hour must not bypass resource checks or FIFO.
+                    clock[0] += 7200
+                    waits.append(1)
+                    if len(waits) == 2:
+                        reading[0] = 49.99
+                with patch.object(boatd, "mem_available", return_value=500 * 2**30), \
+                     patch.object(boatd, "psi", side_effect=lambda kind: reading[0]), \
+                     patch.object(boatd, "now", side_effect=lambda: clock[0]), \
+                     patch.object(boatd.time, "sleep", side_effect=recover) as sleep:
+                    boatd.admit(self.con, b, q, "k", err)
+                self.assertEqual(sleep.call_count, 2)
+                self.assertEqual(self.status(b, q)["status"], "running")
+                self.assertIn(b"CPU pressure", err.getvalue())
+                self.con.execute("DELETE FROM commands WHERE box_id=?", (b,))
+                self.con.execute("DELETE FROM boxes WHERE id=?", (b,))
+
+    def test_cpu_undo_disables_pressure_reads_and_spacing(self):
+        b = self.box()
+        first = self.cmd(b, pid=1001, status="queued", age=200)
+        second = self.cmd(b, pid=1002, status="queued", age=100)
+        boatd.CFG["cpu_pressure_limit"] = 0
+        with patch.object(boatd, "mem_available", return_value=500 * 2**30), \
+             patch.object(boatd, "psi", side_effect=AssertionError("disabled CPU probe")), \
+             patch.object(boatd.time, "sleep", side_effect=AssertionError("disabled spacing")):
+            boatd.admit(self.con, b, first, "k", io.BytesIO())
+            boatd.admit(self.con, b, second, "k", io.BytesIO())
+        self.assertEqual(self.status(b, second)["status"], "running")
+
+    def test_cancelled_cpu_wait_returns_without_admitting_or_touching_running_work(self):
+        b = self.box()
+        running = self.cmd(b, pid=1001, status="running", age=200)
+        queued = self.cmd(b, pid=1002, status="queued", age=100)
+        boatd.CFG["cpu_pressure_limit"] = 50
+        with patch.object(boatd, "mem_available", return_value=500 * 2**30), \
+             patch.object(boatd, "psi", return_value=80), \
+             patch.object(boatd.time, "sleep", side_effect=lambda _: (boatd.cmd_dir(b) / f"{queued}.kill").touch()):
+            boatd.admit(self.con, b, queued, "k", io.BytesIO())
+        self.assertEqual(self.status(b, queued)["status"], "queued")
+        self.assertEqual(self.status(b, running)["status"], "running")
+
+    def test_cpu_admission_waits_for_each_new_run_to_register(self):
+        b = self.box()
+        first = self.cmd(b, pid=1001, status="queued", age=200)
+        second = self.cmd(b, pid=1002, status="queued", age=100)
+        boatd.CFG["cpu_pressure_limit"] = 50
+        clock = [10000.0]
+        def settle(_):
+            self.assertEqual(self.status(b, second)["status"], "queued")
+            clock[0] += 10
+        with patch.object(boatd, "mem_available", return_value=500 * 2**30), \
+             patch.object(boatd, "psi", return_value=0), \
+             patch.object(boatd, "now", side_effect=lambda: clock[0]), \
+             patch.object(boatd.time, "sleep", side_effect=settle) as sleep:
+            boatd.admit(self.con, b, first, "k", io.BytesIO())
+            boatd.admit(self.con, b, second, "k", io.BytesIO())
+        self.assertEqual(sleep.call_count, 1)
+        self.assertEqual(self.status(b, second)["started_at"] - self.status(b, first)["started_at"], 10)
+
+    def test_long_wait_never_bypasses_memory_cap_or_fifo(self):
+        for blocked in ("memory", "cap", "fifo"):
+            with self.subTest(blocked=blocked):
+                b = self.box(bid="bx_longqueue")
+                earlier = self.cmd(b, pid=1001, status="queued" if blocked == "fifo" else "running", age=200)
+                q = self.cmd(b, pid=1002, status="queued", age=100)
+                boatd.CFG["max_running"] = 1 if blocked == "cap" else 0
+                clock = [0.0]
+                sleeps = []
+                def wait(_):
+                    self.assertEqual(self.status(b, q)["status"], "queued")
+                    sleeps.append(1)
+                    clock[0] += 7200
+                    if len(sleeps) == 2:
+                        raise RuntimeError("still waiting")
+                with patch.object(boatd, "mem_available", return_value=0 if blocked == "memory" else 500 * 2**30), \
+                     patch.object(boatd, "now", side_effect=lambda: clock[0]), \
+                     patch.object(boatd.time, "sleep", side_effect=wait):
+                    with self.assertRaisesRegex(RuntimeError, "still waiting"):
+                        boatd.admit(self.con, b, q, "k", io.BytesIO())
+                self.assertEqual(self.status(b, q)["status"], "queued")
+                self.con.execute("DELETE FROM commands WHERE box_id=?", (b,))
+                self.con.execute("DELETE FROM boxes WHERE id=?", (b,))
+
     def test_sync_rows_never_block_fifo_or_consume_admission_capacity(self):
         boatd.mem_available = lambda: 500 * 2**30
         boatd.CFG["max_running"] = 1
@@ -641,7 +788,7 @@ class Http(Base):
         st, d = self.call(None, "GET", "/health")
         self.assertEqual(st, 200)
         self.assertEqual(sorted(d), ["boatd_uptime_s", "boot", "boot_id", "mdraid", "mode", "ok", "phase", "pool", "queue", "reasons",
-                                     "running", "startedAt", "starting", "startupPhases", "up", "uptime_s", "version"])
+                                 "restartPending", "running", "startedAt", "starting", "startupPhases", "up", "uptime_s", "version"])
         self.assertNotIn("moni", json.dumps(d))
         self.assertNotIn("bx_", json.dumps(d))
 
