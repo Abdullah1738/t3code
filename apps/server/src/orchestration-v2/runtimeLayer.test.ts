@@ -9092,12 +9092,31 @@ it.effect.each([
         commandId: CommandId.make(`paced-last-promote:${creationSource}`),
       });
       assert.isAbove(yield* pacing.acquire({ threadId: otherThreadId, sourceRunId: other.id }), 0);
+      const waitCompleted = yield* sink
+        .stream({
+          threadId,
+          afterSequence: yield* sink.latestSequence({ threadId }),
+          eventType: "turn-item.updated",
+        })
+        .pipe(
+          Stream.filter(
+            (event) =>
+              event.event.type === "turn-item.updated" &&
+              event.event.payload.id === `turn-item:restart-pacing:${old.id}` &&
+              event.event.payload.status === "completed",
+          ),
+          Stream.runHead,
+          Effect.forkChild,
+        );
       yield* outbox.cancelUnsettled({
         threadId,
         effectTypes: ["provider-turn.start"],
         reason: "Stopped before admission",
       });
       assert.isAbove(yield* pacing.acquire({ threadId: otherThreadId, sourceRunId: other.id }), 0);
+      // Retired notes close outside the admission mutex once their replacement settles.
+      yield* TestClock.adjust("10 seconds");
+      yield* Fiber.join(waitCompleted);
       const cancelledWait = yield* (yield* ProjectionStore.ProjectionStoreV2).getTurnItem({
         threadId,
         itemId: TurnItemId.make(`turn-item:restart-pacing:${old.id}`),
