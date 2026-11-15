@@ -12,46 +12,41 @@ else:
 
 
 class TempPreflightTests(Base):
-    def test_runner_records_each_attempt_before_streams_are_merged(self):
-        disk = boatd.offbox_disk_space
-        box = self.box()
-        self.cmd(box)
-        space = dict(tmp=dict(free_bytes=2*disk.GIB, size_bytes=8*disk.GIB, fstype='tmpfs'))
-        def probe(phase):
-            return (disk.MARKER+json.dumps(dict(phase=phase, space=space))+'\n').encode()
-        def preflight(con, row, err):
-            err.write(probe('server_start')+probe('start'))
-            return 0
-
-        for current_error in (False, True):
+    def test_runner_records_current_disk_result_without_replaying_old_output(self):
+        disk=boatd.offbox_disk_space
+        factory=boatd.db
+        for i,current_error in enumerate((False,True)):
             with self.subTest(current_error=current_error):
-                errors = iter((True, current_error))
-                def run(*args, stdout, stderr, **kw):
-                    stdout.write('\N{SNOWMAN}\n'.encode())
-                    stdout.write(b'ENOSPC: write failed\n' if next(errors) else b'assertion failed\n')
-                    # The failing command's finally block has restored free space.
-                    stderr.write(probe('end'))
-                    return subprocess.CompletedProcess([], 2)
-                with patch.object(boatd, 'load_cfg'), patch.object(boatd, 'db', return_value=self.con), \
-                        patch.object(boatd, 'admit', return_value=0), patch.object(boatd, 'disk_preflight', preflight), \
-                        patch.object(boatd, 'ct_exec'), patch.object(boatd.subprocess, 'run', run), \
-                        patch.object(boatd, 'read_cg', return_value={}), \
-                        patch.object(boatd, 'cg_path', return_value=self.tmp/'cgroup'), \
-                        patch.object(boatd, 'ct_running', return_value=False):
-                    for attempt in (1, 2):
-                        self.con.execute('UPDATE commands SET attempt=?', (attempt,))
-                        self.assertEqual(boatd.run_cmd(box, 1001), 0)
-                row = self.status(box, 1001)
-                self.assertEqual(row['exit_code'], 2)
-                expected = 'enospc' if current_error else None
-                self.assertEqual(json.loads(row['metrics'])['infra_failure'], expected)
-                d = boatd.cmd_dir(box)
-                summary = json.loads((d/'1001.err').read_text().splitlines()[-1][len(disk.MARKER):])
-                self.assertEqual((summary['phase'], summary['attempt']), ('result', 2))
-                for parts in (('out', 'err'), ('err', 'out')):
-                    merged = self.tmp/'merged.log'
+                box=self.box(bid=f'bx_disk{i}')
+                self.cmd(box,status='queued')
+                d=boatd.cmd_dir(box)
+                (d/'1001.out').write_text('ENOSPC: prior attempt\n')
+                space=dict(tmp=dict(free_bytes=2*disk.GIB,size_bytes=8*disk.GIB,fstype='tmpfs'))
+                def probe(phase):
+                    return (disk.MARKER+json.dumps(dict(phase=phase,space=space))+'\n').encode()
+                def preflight(con,row,err):
+                    err.write(probe('server_start')+probe('start')); return 0
+                def complete(con,row,**kw):
+                    with (d/'1001.out').open('ab') as out:
+                        out.write(b'ENOSPC: write failed\n' if current_error else b'assertion failed\n')
+                    with (d/'1001.err').open('ab') as err: err.write(probe('end'))
+                    boatd.record_guest(con,row,{'state':'exited','exit_code':2})
+                with patch.object(boatd,'load_cfg'), patch.object(boatd,'db',side_effect=factory), \
+                        patch.object(boatd,'admit',return_value=0), patch.object(boatd,'disk_preflight',preflight), \
+                        patch.object(boatd,'ct_exec'), patch.object(boatd,'guest_command',return_value={'state':'absent'}), \
+                        patch.object(boatd,'follow_guest',complete), patch.object(boatd,'snapshot'), \
+                        patch.object(boatd,'prune_snaps'):
+                    self.assertEqual(boatd.run_cmd(box,1001),0)
+                row=self.status(box,1001)
+                self.assertEqual(row['exit_code'],2)
+                expected='enospc' if current_error else None
+                self.assertEqual(json.loads(row['metrics'])['infra_failure'],expected)
+                summary=json.loads((d/'1001.err').read_text().splitlines()[-1][len(disk.MARKER):])
+                self.assertEqual((summary['phase'],summary['attempt']),('result',1))
+                for parts in (('out','err'),('err','out')):
+                    merged=self.tmp/'merged.log'
                     merged.write_bytes(b''.join((d/f'1001.{part}').read_bytes() for part in parts))
-                    self.assertEqual(disk.result(merged, 2)['infra_failure'], expected)
+                    self.assertEqual(disk.result(merged,2)['infra_failure'],expected)
 
     def test_admission_lock_live_context_and_dual_logging(self):
         box = self.box()

@@ -414,6 +414,16 @@ def active_runs(con, box_id: str) -> int:
                        (box_id,)).fetchone()[0]
 
 
+def remote_commands_busy(box_id: str) -> bool:
+    if api.BACKEND != 'server':
+        return False
+    try:
+        result = api.call('GET', f'/sandboxes/{box_id}/commands/busy', timeout=30, retries=0)
+        return not isinstance(result, dict) or result.get('busy') is not False
+    except OffboxError:
+        return True
+
+
 def box_name(me: dict, repo_key: str) -> str:
     who = (me.get("title") or me.get("thread") or me.get("owner") or "local")[:50]
     return f"offbox {repo_key} | {who}"
@@ -1329,6 +1339,8 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
 
 def _reuse_available(con, row, size, skip_archiving=False, retrying=False, before_grow=None):
     check_deletion(con, row['box_id'])
+    if remote_commands_busy(row['box_id']):
+        return None
     # Selection may have preceded another holder's quarantine. Re-read after the caller acquired the box lock.
     current = con.execute('SELECT state, note FROM leases WHERE box_id=?', (row['box_id'],)).fetchone()
     if not current or current['state'] not in ('running', 'stopped') or \

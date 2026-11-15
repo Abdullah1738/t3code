@@ -2207,20 +2207,17 @@ class Interrupted(OffboxError):
     """Our server lost power (or was restarted hard) under the run, and the run is not being run again: it was
     started with retry off, or it had already been retried once. Its own exit code does not exist."""
 
-    def __init__(self, what: str):
-        super().__init__(f"the offbox server restarted while {what} was running, and the run was not run again. "
+    def __init__(self, what: str, restarted_at=None):
+        super().__init__((f"the offbox server restarted at {restarted_at} while {what} was running; nothing was re-run. " if restarted_at else
+                         f"the offbox server restarted while {what} was running, and the run was not run again. ") +
                          f"It did not finish; its output up to the restart is kept (offbox logs). "
                          f"Run it again if that is safe (exit {EXIT_INTERRUPTED})", code=EXIT_INTERRUPTED,
                          started=True)
 
 
 def retry_interrupted(a) -> bool:
-    """May the server run this command again by itself after a power cut? Yes for an ordinary `offbox run` (a
-    synced repo plus a test or build command: running it twice is harmless). No for person-box work (her
-    accounts, messages, logins: never twice without someone deciding), and no with --no-retry."""
-    if api.BACKEND != "server" or getattr(a, "no_retry", False):
-        return False
-    return person() is None
+    """Do not opt into replay on legacy servers. Started commands must be recovered in place."""
+    return False
 
 
 # A cold boot of the home server can take this long (it trains memory): after a dropped stream the client keeps
@@ -2420,7 +2417,7 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
         if until is not None and now() >= until:
             raise timed_out()
         if st is not None and st.get("status") == "interrupted":
-            raise Interrupted(what)
+            raise Interrupted(what, st.get('interruptedAt') or st.get('serverStartedAt'))
         if st is None or ended_again() < 2:
             return _RUNNING
         if st.get('status') == 'lost':
@@ -2500,7 +2497,7 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
                         new_attempt(fr.get("attempt"))
                     elif t == "exit":
                         if fr.get("status") == "interrupted":
-                            raise Interrupted(what)
+                            raise Interrupted(what, fr.get('interruptedAt') or seen['started'])
                         if fr.get('exitCode') is None and not fr.get('signal'):
                             return follow_lost()
                         return fr.get("exitCode") if fr.get("exitCode") is not None else (
@@ -2563,7 +2560,7 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
                     say(f"lost the connection to the offbox server; the run stays there. Reconnecting for up to "
                         f"{int(window // 60)} min")
                 if st and st.get("status") == "interrupted":
-                    raise Interrupted(what)
+                    raise Interrupted(what, st.get('interruptedAt') or st.get('serverStartedAt'))
                 if st and not st.get("running") and st.get("status") in ("exited", "lost"):
                     if st.get("status") == "lost":
                         return follow_lost()

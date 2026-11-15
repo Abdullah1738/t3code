@@ -1174,7 +1174,8 @@ def _try_warm(me, size, source, exclude, run_id):
                     # A prior holder may have changed the lease or marked it cold after our first scan.
                     current, _ = candidates(con, key, size, source, me)
                     row = next((r for r in current if r['box_id'] == bid), None)
-                    if row is None or row['state'] != 'running' or row['size'] != size or lease.active_runs(con, bid):
+                    if (row is None or row['state'] != 'running' or row['size'] != size or
+                            lease.active_runs(con, bid) or lease.remote_commands_busy(bid)):
                         continue
                     if con.execute("SELECT 1 FROM events WHERE box_id=? AND kind='cold_home' AND ts>? LIMIT 1",
                                    (bid, now() - 15 * 60)).fetchone():
