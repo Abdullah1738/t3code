@@ -6,6 +6,7 @@ import { writeFile, readFile, rename, unlink } from "node:fs/promises";
 import { logDirectory } from "./log-directory.ts";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
+import { createMessageReadAggregation } from "./log-message-reads.ts";
 import { cleanCalls, createCallAggregation, type CallSummary } from "./log-calls.ts";
 import { summarizeLog } from "./log-rollup.ts";
 import { createChainAggregation } from "./log-chains.ts";
@@ -27,8 +28,10 @@ const DAY = /^\d{4}-\d{2}-\d{2}$/;
 const TAG = /^[a-zA-Z][a-zA-Z0-9_.:-]{0,99}$/;
 const LABEL = /^[a-zA-Z][a-zA-Z0-9_.-]{0,99}$/;
 const ID_KEYS = new Set(["chat", "messageId", "inboundId", "threadId", "fromThreadId", "toThreadId", "operationId", "formId", "runId", "callBatchId"]);
-const NUMBERS = new Set(["attachmentCount", "attachmentBytes", "receiveLagMs", "batchSize", "filesTaken", "waitMs", "outboxDelayMs", "parts", "files", "count", "status", "exitCode", "labels", "slowestReadMs", "completionLagMs", "seedChars", "recapLines", "pendingOrdersChars", "attempt"]);
+const NUMBERS = new Set(["attachmentCount", "attachmentBytes", "receiveLagMs", "batchSize", "filesTaken", "waitMs", "outboxDelayMs", "parts", "files", "count", "status", "exitCode", "labels", "slowestReadMs", "completionLagMs", "seedChars", "recapLines", "pendingOrdersChars", "attempt", "rowsReturned", "bytesReturned", "fullReads", "incrementalReads", "cachedSkipReads", "sharedReads", "firstReads", "routeChanges", "missingUntils", "resyncs", "mergeConflicts", "clockSkews"]);
 const ENUMS: Record<string, readonly string[]> = {
+  readMode: ["full", "incremental", "cached-skip", "shared"],
+  fullReason: ["first-read", "route-change", "missing-until", "resync", "merge-conflict", "clock-skew"],
   replyMode: ["final", "tool"], reason: ["background", "no_text", "already_folded", "exit", "stdout", "hook", "test_default_command", "age", "contextSize", "providerRefusal"],
   source: ["live", "backfill"], outcome: ["replied", "failed", "refused", "no_reply", "ok", "fallback"],
   cardKind: ["quick", "delivery", "ride", "nutrition", "secure_form", "other"], phase: ["start", "stop"],
@@ -116,6 +119,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   let rolledYesterday = "";
   let recovery: Promise<void> | undefined;
   const calls = createCallAggregation(processRunId);
+  const messageReads = createMessageReadAggregation();
   const renders = createRenderAggregation();
   function append(entry: Entry, stamp?: string): void {
     let fd: number | undefined;
@@ -172,7 +176,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
       if (entry.name === "form.fail" && entry.kind !== "error") entry = { ...entry, kind: "error", error: entry.error ?? { tag: "form.gone" } };
       const line = clean(entry, new Date(now()).toISOString(), processRunId);
       if (!line) return;
-      for (const render of renders.accept(line)) for (const record of calls.accept(render, entry.ids?.runId !== undefined)) enqueue(record);
+      for (const messageRead of messageReads.accept(line)) for (const render of renders.accept(messageRead)) for (const record of calls.accept(render, entry.ids?.runId !== undefined)) enqueue(record);
       if (entry.name === "turn.end") void scheduleRollup(line.ts.slice(0, 10));
       if (["turn.start", "reply.sent"].includes(line.name) && line.ids?.chat && line.ids.inboundId) {
         refreshChains(`${line.ids.chat}\0${line.ids.inboundId}`);
@@ -264,6 +268,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
     });
   }
   function flushAll(): void {
+    for (const line of messageReads.flush()) enqueue(line);
     for (const line of renders.flush()) enqueue(line);
     for (const line of calls.flush()) enqueue(line);
     flush();
@@ -345,6 +350,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   async function tick(): Promise<void> {
     try {
       const at = now();
+      for (const line of messageReads.flush(Math.floor(at / 60_000) * 60_000)) enqueue(line);
       if (rolling) { await settled(); return; }
       const hour = Math.floor(at / 3_600_000);
       const hourly = hour !== rolledHour;

@@ -307,6 +307,8 @@ export type SteerGuard = { signal: AbortSignal; beforeSend: () => Promise<boolea
 export interface ChatBackend {
   /** How owner-facing text names the app. Defaults to OpenChamber. */
   readonly brand?: { app: string };
+  /** Share message reads within one router tick; later ticks always refresh. */
+  messageReadScope?<T>(body: () => Promise<T>): Promise<T>;
   /** Shared backends need the current chat to locate its persistent files. */
   chatFolder?(chat?: ChatInfo): string | undefined;
   health(): Promise<{ status: string; openchamberVersion?: string; [key: string]: unknown } | undefined>;
