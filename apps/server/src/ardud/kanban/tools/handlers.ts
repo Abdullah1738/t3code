@@ -15,6 +15,7 @@ import {
   type KanbanCardModel,
   type KanbanError,
   type KanbanMessage,
+  type KanbanOwnerAsk,
   type KanbanThreadLink,
   type ModelSelection,
 } from "@t3tools/contracts";
@@ -52,6 +53,15 @@ import { KanbanToolkit, type ModelInput } from "./tools.ts";
 import * as BoardReplies from "../engine/boardReplies.ts";
 import * as Activity from "../engine/activity.ts";
 import * as SavedWrite from "../engine/savedWrite.ts";
+
+const askGateNote = (
+  card: KanbanCard,
+  ask: KanbanOwnerAsk,
+  guessedGates?: KanbanBoard["guessedGates"],
+) =>
+  [askGateWarning(card, ask, guessedGates), secretKindApprovalWarning(card, ask, guessedGates)]
+    .filter((warning) => warning !== undefined)
+    .join(" ");
 
 const gatedResult = (
   card: KanbanCard,
@@ -724,14 +734,7 @@ const handlers = {
         // The newest ask is the one just added.
         const ask = asked.asks.at(-1);
         const warning = ask ? Asks.approvalWarning(asked, ask, board.guessedGates) : undefined;
-        const note = ask
-          ? [
-              askGateWarning(asked, ask, board?.guessedGates),
-              secretKindApprovalWarning(asked, ask, board?.guessedGates),
-            ]
-              .filter((warning) => warning !== undefined)
-              .join(" ")
-          : "";
+        const note = ask ? askGateNote(asked, ask, board.guessedGates) : "";
         return {
           card: Asks.askSummary(asked, ask?.id ?? ""),
           ...(warning === undefined ? {} : { warning }),
@@ -804,9 +807,11 @@ const handlers = {
           edits && revised
             ? Asks.approvalWarning(changed, revised, board?.guessedGates)
             : undefined;
+        const note = edits && revised ? askGateNote(changed, revised, board?.guessedGates) : "";
         return {
           card: Asks.askSummary(changed, askId),
           ...(warning === undefined ? {} : { warning }),
+          ...(note ? { note } : {}),
         };
       }),
     ),
