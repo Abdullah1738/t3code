@@ -9,7 +9,7 @@ import { Store } from "../src/store.ts";
 
 type Thread = {
   threadId: string; projectId: string; title: string; origin: string | null; runtimeMode: string; worktreePath: string | null;
-  parentThreadId: string | null; activeRunId?: string | null; state: string; latestRunId: string | null; settled?: boolean; archived?: boolean; pending: PendingRequest[];
+  parentThreadId: string | null; relationshipToParent?: string | null; activeRunId?: string | null; state: string; latestRunId: string | null; settled?: boolean; archived?: boolean; pending: PendingRequest[];
 };
 type Call = { method: string; path: string; body?: any };
 
@@ -53,7 +53,7 @@ function fakeControl(events: string[] = [], options: Pick<RobobAlertOptions, "no
     if (path === "/threads") {
       let list = [...threads.values()];
       if (searchParams.get("active") === "true") list = list.filter(thread => thread.state !== "idle");
-      if (searchParams.get("includeSubagents") !== "true") list = list.filter(thread => !thread.parentThreadId);
+      if (searchParams.get("includeSubagents") !== "true") list = list.filter(thread => thread.relationshipToParent !== "subagent");
       return ok({ total: list.length, threads: list.map(summary) });
     }
     const thread = threads.get(parts[1] ?? "");
@@ -67,7 +67,7 @@ function fakeControl(events: string[] = [], options: Pick<RobobAlertOptions, "no
   } });
   servers.push(server);
   const add = (thread: Partial<Thread> & { threadId: string }) => threads.set(thread.threadId, {
-    projectId: "p1", title: thread.threadId, origin: null, runtimeMode: "approval-required", worktreePath: null, parentThreadId: null,
+    projectId: "p1", title: thread.threadId, origin: null, runtimeMode: "approval-required", worktreePath: null, parentThreadId: null, relationshipToParent: null,
     state: "idle", latestRunId: null, pending: [], ...thread,
   });
   const backend = new RobobAlertBackend({ url: server.url.origin, token: "test-token", ...options });
@@ -486,6 +486,63 @@ test("status patches remain in the cached roster after an in-flight refresh fail
 
 const runA = "run:thread:t:ordinal:1";
 const runB = "run:thread:t:ordinal:2";
+
+const lineageCases = [
+  { label: "root", parentThreadId: null, relationshipToParent: null, listed: true },
+  { label: "fork", parentThreadId: "parent", relationshipToParent: "fork", listed: true },
+  { label: "legacy parented (missing relationship)", parentThreadId: "parent", relationshipToParent: undefined, listed: true },
+  { label: "legacy parented (null relationship)", parentThreadId: "parent", relationshipToParent: null, listed: true },
+  { label: "future relationship", parentThreadId: "parent", relationshipToParent: "future", listed: true },
+  { label: "subagent", parentThreadId: "parent", relationshipToParent: "subagent", listed: false },
+];
+
+test.each(lineageCases)("board roster and reconciliation follow the server lineage predicate: $label", async lineage => {
+  let at = 0;
+  const control = fakeControl([], { now: () => at });
+  control.add({ threadId: "t", state: "running", activeRunId: runA, latestRunId: runA,
+    parentThreadId: lineage.parentThreadId, relationshipToParent: lineage.relationshipToParent });
+  const first = await control.backend.sessionBoard();
+  expect(first.entries.map(entry => entry.sessionId)).toEqual(lineage.listed ? ["t"] : []);
+  control.threads.get("t")!.state = "waiting";
+  await control.backend.notification({ type: "thread.status", threadId: "t", runId: runA, state: "waiting" });
+  const next = await control.backend.sessionBoard();
+  expect(next.entries.map(entry => [entry.sessionId, entry.state, entry.status])).toEqual(lineage.listed ? [["t", "waiting", "idle"]] : []);
+  expect(control.backend.boardStatus()?.boardFetches).toBe(1);
+  if (lineage.listed) {
+    expect(control.backend.boardStatus()?.threadReads).toBe(1);
+    at = 15_000;
+    expect((await control.backend.sessionBoard()).entries).toHaveLength(1);
+    expect(control.backend.boardStatus()?.boardFetches).toBe(1);
+  }
+});
+
+test.each(lineageCases.filter(lineage => lineage.listed))("a deferred canonical $label missing from the cache schedules SOFT rediscovery", async lineage => {
+  const h = cachedBoard();
+  Object.assign(h.thread, { activeRunId: runA, latestRunId: runA,
+    parentThreadId: lineage.parentThreadId, relationshipToParent: lineage.relationshipToParent });
+  await h.board.snapshot();
+  h.time(1_000);
+  h.board.applyStatus("t", "waiting", runB);
+  await h.board.snapshot();
+  h.time(1_500);
+  h.board.applyStatus("t", "waiting", runB);
+  // A local leave can precede the already-scheduled canonical reconciliation.
+  h.board.applyStatus("t", "idle");
+  const canonical = { ...h.thread, state: "waiting" as const };
+  h.state.readThread = async () => ({ thread: canonical });
+  h.state.threads = [canonical];
+  h.time(4_000);
+  expect((await h.board.snapshot()).entries).toEqual([]);
+  expect(h.board.status().threadReads).toBe(2);
+  for (const at of [7_000, 14_999]) {
+    h.time(at);
+    expect((await h.board.snapshot()).entries).toEqual([]);
+    expect(h.calls()).toBe(1);
+  }
+  h.time(15_000);
+  expect((await h.board.snapshot()).entries).toEqual([boardEntry(canonical, "/repo")]);
+  expect(h.board.status().fetchesByReason).toEqual({ cold: 1, age: 0, hard: 0, soft: 1 });
+});
 
 test.each([
   ["completed", "idle"], ["failed", "idle"], ["cancelled", "idle"], ["interrupted", "idle"], ["rolled_back", "idle"],
@@ -1005,7 +1062,7 @@ test("while nothing is pending, requests are read once a minute; an open notice 
   setSystemTime(now);
   const control = fakeControl();
   control.add({ threadId: "a", title: "Build", state: "running" });
-  control.add({ threadId: "sub", title: "Helper", state: "running", parentThreadId: "a" });
+  control.add({ threadId: "sub", title: "Helper", state: "running", parentThreadId: "a", relationshipToParent: "subagent" });
   const reads = () => control.calls.filter(call => call.path === "/requests").length;
   const { store, attention: alerts } = attention(control.backend);
   await alerts.tick();
@@ -1031,7 +1088,7 @@ test("a request in a folder the board does not list is still found, such as a su
   setSystemTime(now);
   const control = fakeControl();
   control.add({ threadId: "a", title: "Build", state: "running" });
-  control.add({ threadId: "sub", title: "Helper", state: "running", parentThreadId: "a", worktreePath: "/repo/child",
+  control.add({ threadId: "sub", title: "Helper", state: "running", parentThreadId: "a", relationshipToParent: "subagent", worktreePath: "/repo/child",
     pending: [{ requestId: "perm-sub", kind: "approval", requestKind: "command", title: "bash", prompt: "ls", canRespond: true }] });
   const { store, attention: alerts } = attention(control.backend);
   await alerts.tick();

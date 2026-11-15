@@ -61,9 +61,9 @@ export function boardEntry(thread: ThreadSummary, directory: string): BoardEntry
 
 /**
  * The board attention reads each tick, built from `GET /threads?active=true`:
- * root threads that are not idle, iMessage chats left out (that bridge asks
- * them in-chat). Subagents are not listed; their requests are found through
- * the shared `/requests` read.
+ * non-idle conversations, including forks. iMessage chats are left out because
+ * that bridge asks in-chat. Subagents are not listed; their requests are found
+ * through the shared `/requests` read.
  */
 export class ActiveThreadsBoard implements ReviewBoard {
   private cache?: BoardSnapshot;
@@ -143,7 +143,7 @@ export class ActiveThreadsBoard implements ReviewBoard {
   private patchThread(snapshot: BoardSnapshot, thread: ThreadSummary): void {
     const entry = snapshot.entries.find(entry => entry.sessionId === thread.threadId);
     if (entry || this.states.has(thread.threadId)) this.runIds.set(thread.threadId, thread.activeRunId ?? thread.latestRunId);
-    if (thread.origin === IMESSAGE_ORIGIN || thread.parentThreadId) {
+    if (thread.origin === IMESSAGE_ORIGIN || thread.relationshipToParent === "subagent") {
       this.offboard.add(thread.threadId);
       this.patchStatus(snapshot, thread.threadId, "idle");
     } else {
@@ -178,7 +178,7 @@ export class ActiveThreadsBoard implements ReviewBoard {
       if (task.version !== 0) { this.deferredReads.add(threadId); return; }
       this.applyCachedStatus(threadId, thread.state, thread);
       if (!this.cache?.entries.some(entry => entry.sessionId === threadId) && thread.state !== "idle"
-        && thread.origin !== IMESSAGE_ORIGIN && !thread.parentThreadId) this.markDirty("soft");
+        && thread.origin !== IMESSAGE_ORIGIN && thread.relationshipToParent !== "subagent") this.markDirty("soft");
     })().catch(error => {
       this.telemetry.threadReadErrors++;
       this.markDirty("soft");
