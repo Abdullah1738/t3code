@@ -452,7 +452,7 @@ class ReasonRollupTests(unittest.TestCase):
         log.delivery('warning', 'd' * 32, ok=False)
         delivery = log.rollup(log.utcnow().date().isoformat())['delivery']
         self.assertEqual({k: v for k, v in delivery.items() if k != 'unmarkedMeaning'},
-                         {'sent': 2, 'failed': 1, 'unmarked': 4})
+                         {'sent': 2, 'failed': 1, 'unmarked': 4, 'autoReceipts': 0, 'manualReceipts': 3})
         self.assertEqual(delivery['unmarkedMeaning'], log.UNMARKED_MEANING)
         self.assertIn('including failed renders', delivery['unmarkedMeaning'])
         self.assertIn('UTC day file', delivery['unmarkedMeaning'])
