@@ -981,9 +981,16 @@ it.effect.each(["reader", "writer", "writer worker"] as const)(
             );
           }
           for (const span of statements.slice(0, 2)) {
+            assert.equal(span.attributes.get("db.connection.reused"), true);
+            assert.equal(
+              span.attributes.get("db.reader.slot"),
+              spans[0]!.attributes.get("db.reader.slot"),
+            );
             assert.deepEqual(
               [...span.attributes].filter(
-                ([key]) => key.startsWith("db.reader.") || key === "db.lock_wait_ms",
+                ([key]) =>
+                  (key.startsWith("db.reader.") && key !== "db.reader.slot") ||
+                  key === "db.lock_wait_ms",
               ),
               connection === "reader" ? [["db.reader.lane", "background"]] : [],
             );
@@ -993,6 +1000,8 @@ it.effect.each(["reader", "writer", "writer worker"] as const)(
             );
           }
           const plain = statements[2]!;
+          assert.isFalse(plain.attributes.has("db.connection.reused"));
+          assert.isFalse(spans[0]!.attributes.has("db.connection.reused"));
           assert.equal(plain.attributes.get("db.lock_wait_ms"), 0);
           assert.equal(plain.attributes.get("db.reader.acquired"), true);
           assert.equal(plain.attributes.get("db.reader.waiting"), false);
@@ -1048,6 +1057,7 @@ it.effect.each(["tracer", "propagation"] as const)(
         const parent = spans.find((span) => span.name === "sqlite")!;
         assert.isDefined(parent);
         assert.isFalse(parent.attributes.has("db.connection"));
+        assert.isFalse(parent.attributes.has("db.connection.reused"));
         assert.isFalse(parent.attributes.has("db.reader.lane"));
       }),
     );

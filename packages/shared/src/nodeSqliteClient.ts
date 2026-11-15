@@ -273,7 +273,18 @@ const observeStatement = <A, E, R>(
       for (let depth = 0; span?._tag === "Span" && depth < 32; depth++) {
         if (span.name === "sqlite") {
           // Transaction statements reuse their connection and bypass the borrower.
-          if (!span.attributes.has("db.connection")) span.attribute("db.connection", connection);
+          if (!span.attributes.has("db.connection")) {
+            span.attribute("db.connection", connection);
+            span.attribute("db.connection.reused", true);
+            const parent = Option.getOrUndefined(span.parent);
+            const slot =
+              parent?._tag === "Span" &&
+              parent.name === "sql.transaction" &&
+              parent.attributes.get("db.connection") === connection
+                ? parent.attributes.get("db.reader.slot")
+                : undefined;
+            if (typeof slot === "number") span.attribute("db.reader.slot", slot);
+          }
           if (lane !== undefined && !span.attributes.has("db.reader.lane"))
             span.attribute("db.reader.lane", lane);
           break;
