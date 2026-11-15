@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from offbox_lib import allocation, api, cli, common, home, lease, misc, outage, pool, runs
+from offbox_lib import allocation, api, cli, common, home, lease, misc, outage, pool, runs, start_check
 from test_capacity import Isolated
 
 
@@ -313,9 +313,12 @@ class FailbackTests(Isolated):
                 self.assertIn('server says it cannot take runs', first)
                 self.assertIn('this run goes to Boat instead', first)
 
-    def test_returned_foreground_outage_keeps_the_same_row_pending(self):
+    def test_returned_foreground_outage_releases_its_own_unstarted_box(self):
         self.pending()
         self.con.execute("UPDATE runs SET mode='fg' WHERE run_id='mine'")
+        self.box('one', member=True)
+        self.box('two', member=True)
+        self.busy('two')
         args = cli.build_parser().parse_args(['run', '--', 'true'])
         seen = []
         def start(runner):
@@ -323,10 +326,18 @@ class FailbackTests(Isolated):
             runner.require_pending(self.con)
             seen.append(runner.run_id)
             if len(seen) == 1:
+                self.con.execute("UPDATE runs SET box_id='one' WHERE run_id='mine'")
                 raise common.OffboxError('home down', outage=True, run_id=runner.run_id)
+            row = pool.acquire(self.me, run_id='mine')
+            self.assertEqual(row['box_id'], 'one')
+            pool.release_guard(row)
             raise SystemExit('pending again')
+        def no_self_wait(seconds):
+            raise AssertionError('retry waited on its own box reservation')
+        self.clock.time.sleep = no_self_wait
         with patch.dict(os.environ, {home.RETURNED_HOME_ENV: 'outage', home.RUN_ID_ENV: 'mine'}), \
                 patch.object(home, 'active', return_value=True), patch.object(runs.Runner, 'start', start), \
+                patch.object(lease, '_reuse', side_effect=lambda c, r, s, **kw: dict(r)), \
                 patch.object(cli.time, 'sleep'):
             with self.assertRaisesRegex(SystemExit, 'pending again'):
                 cli._run_with_retries(args, self.me)
@@ -334,6 +345,60 @@ class FailbackTests(Isolated):
         row = self.con.execute("SELECT * FROM runs WHERE run_id='mine'").fetchone()
         self.assertEqual(row['status'], 'starting')
         self.assertEqual(runs.restore_run_state(row)['status'], 'starting')
+
+    def test_returned_foreground_fenced_claim_is_rotated_before_retry(self):
+        self.pending()
+        self.con.execute("UPDATE runs SET mode='fg' WHERE run_id='mine'")
+        self.con.execute("INSERT INTO kv(k,v) VALUES ('start_claim:mine','old-claim')")
+        args = cli.build_parser().parse_args(['run', '--', 'true'])
+        attempts = []
+        def start(runner):
+            runner.register_pending()
+            runner.require_pending(self.con)
+            attempts.append(runner.run_id)
+            if len(attempts) == 1:
+                row = self.con.execute("SELECT * FROM runs WHERE run_id='mine'").fetchone()
+                start_check.settle(self.con, row, start_check.Result('fenced'), 'lost start response')
+                self.assertEqual(self.con.execute("SELECT status FROM runs WHERE run_id='mine'").fetchone()[0], 'lost')
+                raise common.OffboxError('home down', outage=True, run_id='mine')
+            self.assertNotEqual(common.kv_get(self.con, 'start_claim:mine'), 'old-claim')
+            row = self.con.execute("SELECT * FROM runs WHERE run_id='mine'").fetchone()
+            self.assertEqual(runs.restore_run_state(row)['status'], 'starting')
+            raise SystemExit('fence rotated')
+        with patch.dict(os.environ, {home.RETURNED_HOME_ENV: 'outage', home.RUN_ID_ENV: 'mine'}), \
+                patch.object(home, 'active', return_value=True), patch.object(runs.Runner, 'start', start), \
+                patch.object(cli.time, 'sleep'):
+            with self.assertRaisesRegex(SystemExit, 'fence rotated'):
+                cli._run_with_retries(args, self.me)
+        self.assertEqual(attempts, ['mine', 'mine'])
+        self.assertIsNone(common.kv_get(self.con, 'lost_confirmed:mine'))
+
+    def test_returned_retry_preserves_terminal_or_unconfirmed_start_rows(self):
+        self.pending()
+        for status, code, fenced, pid in [('lost', None, False, None), ('killed', 130, False, None),
+                                          ('done', 0, True, None), ('starting', None, False, 12)]:
+            with self.subTest(status=status, code=code, fenced=fenced, pid=pid), \
+                    patch.dict(os.environ, {home.RETURNED_HOME_ENV: 'outage'}):
+                self.con.execute("UPDATE runs SET status=?,exit_code=?,process_id=?,box_id='reserved' WHERE run_id='mine'",
+                                 (status, code, pid))
+                self.con.execute("DELETE FROM kv WHERE k='lost_confirmed:mine'")
+                if fenced:
+                    self.con.execute("INSERT INTO kv(k,v) VALUES ('lost_confirmed:mine','fenced')")
+                runs.retry_background(common.OffboxError('home down'), run_id='mine')
+                row = self.con.execute("SELECT status,exit_code,process_id,box_id FROM runs WHERE run_id='mine'").fetchone()
+                self.assertEqual(row[:], (status, code, pid, 'reserved'))
+
+    def test_unsent_allocation_contention_keeps_probing_home(self):
+        def handoff(*args):
+            self.assertFalse(home.BOAT_SELECTED.get())
+            raise SystemExit('home ready')
+        with patch.object(lease, 'acquire_private', side_effect=allocation.Busy('allocation lock busy')) as create, \
+                patch.object(home, 'probe', return_value=None) as probe, patch.object(home, 'fail_back', side_effect=handoff):
+            with self.assertRaisesRegex(SystemExit, 'home ready'):
+                self.acquire_through_cli()
+        self.assertGreater(create.call_count, 1)
+        probe.assert_called_once()
+        self.assertEqual(self.con.execute('SELECT COUNT(*) FROM pool_pending').fetchone()[0], 0)
 
     def test_background_handoff_unwinds_old_runner_before_acknowledging_child(self):
         self.full_pool()
@@ -452,6 +517,12 @@ class BoundedProbeTests(unittest.TestCase):
                 patch.object(api, '_open', return_value=Response()), patch.object(api, '_shut_at'), \
                 patch.object(api.time, 'time', side_effect=lambda: wall[0]):
             self.assertIn('TimeoutError', home._health(3, bounded=True))
+
+    def test_cancelled_connection_is_a_negative_probe_not_a_run_error(self):
+        with patch.object(home, 'health_url', return_value='http://fixture/health'), \
+                patch.object(api, '_open', side_effect=api.NetworkError('API request deadline passed')):
+            self.assertIn('no answer', home._health(3, bounded=True))
+            self.assertIsNotNone(home.probe(timeout=3, wait=False))
 
     def test_failback_analytics_fields_survive_serialization(self):
         import toollog

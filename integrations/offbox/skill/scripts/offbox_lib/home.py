@@ -329,7 +329,7 @@ def _health(timeout: float = PROBE_TIMEOUT_S, *, bounded=False):
                 d = json.loads(r.read() or b"{}")
     except urllib.error.HTTPError as e:
         return f"health answered HTTP {e.code}"
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, OffboxError) as e:
         kind = type(getattr(e, "reason", e)).__name__
         return f"no answer ({kind})"
     return d

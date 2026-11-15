@@ -3134,19 +3134,28 @@ def forward_background(env: dict, *, backend="boat") -> None:
     raise SystemExit(_background(*_background_context))
 
 
-def retry_background(error) -> None:
-    rid = os.environ.get(BACKGROUND_RUN_ENV)
+def retry_background(error, *, run_id=None) -> None:
+    rid = os.environ.get(BACKGROUND_RUN_ENV) or run_id
     if rid and not error.started:
+        returned = bool(run_id and os.environ.get(home.RETURNED_HOME_ENV))
         con = db()
         try:
             with write(con):
+                row = con.execute('SELECT * FROM runs WHERE run_id=?', (rid,)).fetchone()
                 fenced = con.execute("SELECT 1 FROM kv WHERE k=? AND v='fenced'", ('lost_confirmed:' + rid,)).fetchone()
+                if not row or row['process_id'] or (row['status'] != 'starting' and not (
+                        returned and fenced and row['status'] == 'lost' and row['exit_code'] is None)):
+                    return
+                if returned and row['mode'] == 'fg' and row['client_pid'] != os.getpid():
+                    return
                 if fenced:
                     # Keep the old fence forever: a late delivery must still lose its original claim.
                     con.execute('UPDATE kv SET v=? WHERE k=?', (new_id('claim'), 'start_claim:' + rid))
                     con.execute('DELETE FROM kv WHERE k=?', ('lost_confirmed:' + rid,))
-                con.execute("UPDATE runs SET box_id=NULL, error=?, end_at=NULL WHERE run_id=? "
-                            "AND status='starting' AND process_id IS NULL", (str(error)[:500], rid))
+                con.execute("UPDATE runs SET status='starting', box_id=NULL, error=?, end_at=NULL WHERE run_id=?",
+                            (str(error)[:500], rid))
+            if returned:
+                save_run_state(rid, status='starting', box_id=None, process_id=None, exit_code=None, end_at=None)
         finally:
             con.close()
 

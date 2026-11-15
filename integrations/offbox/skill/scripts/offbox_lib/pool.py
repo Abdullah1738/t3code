@@ -1082,12 +1082,17 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                 try:
                     shared = dict(me, owner="pool:"+key, thread=None, session=None, title="repository pool", manager=None)
                     creator = getattr(lease, 'acquire_private', lease.acquire)
+                    selected_before = home.BOAT_SELECTED.get()
                     try:
                         with _lease_work(), prepare.guard('new allocation') as budget:
                             got = creator(shared, size, template, base, fresh)
                             got['_prepare_end'] = budget.end
                             got['_log_lease_kind'] = 'saved-base' if str(got.get('source', '')).startswith('base:') else 'fresh'
-                    except (allocation.Busy, allocation.Fenced):
+                    except allocation.Busy:
+                        # The allocation lock rejected us before any create/resume request was sent.
+                        home.BOAT_SELECTED.set(selected_before)
+                        break
+                    except allocation.Fenced:
                         break
                     except capacity.CapacityError as e:
                         if resume_stall is not None:
