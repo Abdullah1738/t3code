@@ -63,6 +63,7 @@ import {
 } from "@t3tools/shared/sourceControl";
 import { parseChangeRequestUrl } from "@t3tools/shared/changeRequestUrl";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import {
   parseGitHubRepositorySelector,
   resolveGitHubRepository,
@@ -2372,39 +2373,49 @@ export const make = Effect.gen(function* () {
   // fresh reads (`freshGitState`) before it persists an answer.
   const prLookupGitStateByKey = new Map<
     string,
-    { readonly readAtMs: number; readonly value: string | null }
+    { readonly readAtMs: number; readonly sequence: number; readonly value: string | null }
   >();
+  let prLookupGitStateSequence = 0;
+  const prLookupGitStateLocks = yield* KeyedLock.make<string>();
   const rememberPrLookupGitState = Effect.fn("GitManager.rememberPrLookupGitState")(function* <E>(
     cwd: string,
     key: string,
     fresh: boolean,
     read: Effect.Effect<string | null, E>,
   ) {
+    yield* Effect.annotateCurrentSpan({ "git.cwd": cwd, "git.state_key": key, "git.fresh": fresh });
     const entryKey = `${cwd}\u0000${key}`;
-    const readAtMs = yield* Clock.currentTimeMillis;
-    const remembered = prLookupGitStateByKey.get(entryKey);
-    if (
-      !fresh &&
-      remembered !== undefined &&
-      readAtMs - remembered.readAtMs < Duration.toMillis(PR_LOOKUP_GIT_STATE_TTL)
-    ) {
-      return remembered.value;
-    }
-    // invalidateStatus bumps the epoch. A read that started before a T3 git
-    // action, or before a newer read finished, must not replace their state.
-    const epoch = prLookupEpoch(cwd);
-    const value = yield* read;
-    const latest = prLookupGitStateByKey.get(entryKey);
-    if (prLookupEpoch(cwd) !== epoch || (latest !== undefined && latest.readAtMs > readAtMs)) {
+    const readState = Effect.gen(function* () {
+      const readAtMs = yield* Clock.currentTimeMillis;
+      const remembered = prLookupGitStateByKey.get(entryKey);
+      if (
+        !fresh &&
+        remembered !== undefined &&
+        readAtMs - remembered.readAtMs < Duration.toMillis(PR_LOOKUP_GIT_STATE_TTL)
+      ) {
+        return remembered.value;
+      }
+      // invalidateStatus bumps the epoch. A read that started before a T3 git
+      // action, or before a newer read finished, must not replace their state.
+      const epoch = prLookupEpoch(cwd);
+      const sequence = ++prLookupGitStateSequence;
+      const value = yield* read;
+      const latest = prLookupGitStateByKey.get(entryKey);
+      if (prLookupEpoch(cwd) !== epoch || (latest !== undefined && latest.sequence > sequence)) {
+        return value;
+      }
+      prLookupGitStateByKey.delete(entryKey);
+      if (prLookupGitStateByKey.size >= PR_LOOKUP_CACHE_CAPACITY) {
+        const oldestKey = prLookupGitStateByKey.keys().next().value;
+        if (oldestKey !== undefined) prLookupGitStateByKey.delete(oldestKey);
+      }
+      prLookupGitStateByKey.set(entryKey, { readAtMs, sequence, value });
       return value;
-    }
-    prLookupGitStateByKey.delete(entryKey);
-    if (prLookupGitStateByKey.size >= PR_LOOKUP_CACHE_CAPACITY) {
-      const oldestKey = prLookupGitStateByKey.keys().next().value;
-      if (oldestKey !== undefined) prLookupGitStateByKey.delete(oldestKey);
-    }
-    prLookupGitStateByKey.set(entryKey, { readAtMs, value });
-    return value;
+    });
+    // Cold sweeps visit many branches in one worktree concurrently. Recheck the
+    // cache under the key's lock, but never let a freshness check wait for an old read.
+    if (fresh) return yield* readState;
+    return yield* prLookupGitStateLocks.withLock(entryKey, readState);
   });
   const forgetPrLookupGitState = (cwd: string) =>
     normalizeStatusCacheKey(cwd).pipe(
@@ -2507,28 +2518,25 @@ export const make = Effect.gen(function* () {
       const upstreamBranch = savedRemoteRef.replace(/^refs\/heads\//, "");
       upstreamRef = `${remoteName}/${upstreamBranch}`;
     } else if (!localBranchExists) {
-      const trackingRemotes = yield* remember(
-        `trackingRemotes\u0000${branch}`,
+      const trackingRefs = yield* remember(
+        "trackingRefs",
         gitCore
           .execute({
             operation: "GitManager.branchPullRequest.remoteTrackingRefs",
             cwd: cacheCwd,
             args: ["for-each-ref", "--format=%(refname)", "refs/remotes"],
           })
-          .pipe(
-            Effect.map((trackingRefs) => {
-              const refNames = new Set(
-                trackingRefs.stdout
-                  .split("\n")
-                  .map((remoteRef) => remoteRef.trim())
-                  .filter((remoteRef) => remoteRef.length > 0),
-              );
-              return remoteNames
-                .filter((candidate) => refNames.has(`refs/remotes/${candidate}/${branch}`))
-                .join("\n");
-            }),
-          ),
+          .pipe(Effect.map((result) => result.stdout)),
       );
+      const refNames = new Set(
+        (trackingRefs ?? "")
+          .split("\n")
+          .map((remoteRef) => remoteRef.trim())
+          .filter((remoteRef) => remoteRef.length > 0),
+      );
+      const trackingRemotes = remoteNames
+        .filter((candidate) => refNames.has(`refs/remotes/${candidate}/${branch}`))
+        .join("\n");
       const matchingRemoteNames = (trackingRemotes ?? "")
         .split("\n")
         .filter((candidate) => candidate.length > 0);
