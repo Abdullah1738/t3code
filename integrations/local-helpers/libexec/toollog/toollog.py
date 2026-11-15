@@ -540,6 +540,8 @@ def _imessage_rollup_records(board, day):
     for line, row in pending:
         if (batch(row), _imessage_call_name(row)) not in represented:
             yield line, {**row, '_rollup_deferred': True}
+        elif row.get('error'):
+            yield line, {**row, '_rollup_deferred': True, '_rollup_diagnostic': True}
     for row in _imessage_shared_renders(board, day):
         yield 0, row
 
@@ -566,12 +568,33 @@ def rollup(board, day, top_n=20):
     day_start = datetime.strptime(day, '%Y-%m-%d').replace(tzinfo=timezone.utc)
     start = day_start.timestamp()
     total = oks = failed = errors = observed = 0
+    def observe_error(row, line_number, weight=1):
+        tag = (row.get('error') or {}).get('tag')
+        if not isinstance(tag, str):
+            return
+        key = tag
+        if board == 'imessage':
+            error_name = (row.get('error') or {}).get('name')
+            if not isinstance(error_name, str) or error_name not in _IMESSAGE_ERROR_NAMES:
+                error_name = 'UnknownError'
+            key = (tag, error_name)
+            cause = _imessage_cause_key((row.get('error') or {}).get('causeKey'))
+            if cause:
+                causes[(tag, cause)] += weight
+        tags[key] += weight
+        references.setdefault(key, {'file': day + '.ndjson', 'line': line_number, 'ts': row.get('ts')})
+        identity = row.get('ids')
+        if isinstance(identity, dict) and identity:
+            samples.setdefault(key, identity)
     records = _imessage_rollup_records(board, day) if board == 'imessage' else _read_records(board, day)
     for line_number, row in records:
         if not (board == 'imessage' and (row.get('_rollup_deferred') or row.get('_rollup_synthetic'))):
             recorded += line_number != last_record
             last_record = line_number
         if board == 'imessage' and row.get('_rollup_skip'):
+            continue
+        if board == 'imessage' and row.get('_rollup_diagnostic'):
+            observe_error(row, line_number)
             continue
         aggregate = board == 'imessage' and '_rollup_count' in row
         weight = row['_rollup_count'] if aggregate else _sample_rate(row)
@@ -610,6 +633,8 @@ def rollup(board, day, top_n=20):
         oks += row_ok
         failed += row_failed
         errors += weight * (kind == 'error')
+        if board == 'imessage' and name == 'turn.robob_call' and kind != 'error':
+            errors += row_failed
         duration = row.get('durationMs')
         values = row['_rollup_histogram'] if aggregate else ([(duration, weight)]
             if type(duration) in (int, float) and math.isfinite(duration) and duration >= 0 else [])
@@ -669,22 +694,7 @@ def rollup(board, day, top_n=20):
                     'page_body', 'image_fetch', 'image_http', 'image_type', 'image_body', 'upload', 'upload_url',
                     'invalid_url', 'file_prepare'}:
                 render_failures[failure_code] += weight
-        tag = (row.get('error') or {}).get('tag')
-        if isinstance(tag, str):
-            key = tag
-            if board == 'imessage':
-                error_name = (row.get('error') or {}).get('name')
-                if not isinstance(error_name, str) or error_name not in _IMESSAGE_ERROR_NAMES:
-                    error_name = 'UnknownError'
-                key = (tag, error_name)
-                cause = _imessage_cause_key((row.get('error') or {}).get('causeKey'))
-                if cause:
-                    causes[(tag, cause)] += weight
-            tags[key] += weight
-            references.setdefault(key, {'file': day + '.ndjson', 'line': line_number, 'ts': row.get('ts')})
-            identity = row.get('ids')
-            if isinstance(identity, dict) and identity:
-                samples.setdefault(key, identity)
+        observe_error(row, line_number, weight)
     def percentiles(values):
         values.sort()
         count = sum(weight for _, weight in values)

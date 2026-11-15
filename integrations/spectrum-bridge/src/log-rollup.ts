@@ -13,7 +13,21 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
   const represented = new Set<string>();
   const individualCalls: LogLine[] = [];
   const chainAggregation = createChainAggregation();
-  let total = 0, ok = 0, failed = 0, recordedRows = 0;
+  let total = 0, ok = 0, failed = 0, recordedRows = 0, failedCalls = 0;
+  function observeError(line: LogLine) {
+    if (!line.error) return;
+    if (line.error.causeKey) {
+      const key = `${line.error.tag}\0${line.error.causeKey}`;
+      const item = causes.get(key) ?? { tag: line.error.tag, causeKey: line.error.causeKey, count: 0 };
+      item.count++; causes.set(key, item);
+    }
+    const name = line.error.name;
+    const key = `${line.error.tag}\0${name}`;
+    const item = errors.get(key) ?? { tag: line.error.tag, name, count: 0,
+      sampleId: line.ids?.messageId ?? line.ids?.operationId ?? line.ids?.threadId ?? line.ids?.formId ?? line.ids?.runId,
+      ...(line.site ? { site: line.site } : {}) };
+    item.count++; errors.set(key, item);
+  }
   function merge(target: Map<number, number>, values: Iterable<[number, number]>) {
     for (const [ms, count] of values) target.set(ms, (target.get(ms) ?? 0) + count);
   }
@@ -34,6 +48,7 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
     }
     component(line.component, line.name, count, oks, failures, values);
     if (line.name === "turn.robob_call") {
+      if (line.kind !== "error") failedCalls += failures;
       const name = callName(line);
       if (name) component("robob", name, count, oks, failures, values);
     }
@@ -41,19 +56,7 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
       const code = line.props.failureCode;
       renderFailures.set(code, (renderFailures.get(code) ?? 0) + count);
     }
-    if (line.error?.causeKey) {
-      const key = `${line.error.tag}\0${line.error.causeKey}`;
-      const item = causes.get(key) ?? { tag: line.error.tag, causeKey: line.error.causeKey, count: 0 };
-      item.count += count; causes.set(key, item);
-    }
-    if (line.error) {
-      const name = line.error.name;
-      const key = `${line.error.tag}\0${name}`;
-      const item = errors.get(key) ?? { tag: line.error.tag, name, count: 0,
-        sampleId: line.ids?.messageId ?? line.ids?.operationId ?? line.ids?.threadId ?? line.ids?.formId ?? line.ids?.runId,
-        ...(line.site ? { site: line.site } : {}) };
-      item.count++; errors.set(key, item);
-    }
+    observeError(line);
   }
   for await (const line of lines) {
     recordedRows++;
@@ -76,7 +79,10 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
   // Later days complete this day's receipts without moving their event counts into this day.
   if (laterLines) for await (const line of laterLines) chainAggregation.accept(line, true);
   // Slow/failed rows remain readable, but their batch histogram already counts them.
-  for (const line of individualCalls) if (!line.ids?.callBatchId || !represented.has(`${line.ids.callBatchId}\0${callName(line)}`)) consume(line);
+  for (const line of individualCalls) {
+    if (!line.ids?.callBatchId || !represented.has(`${line.ids.callBatchId}\0${callName(line)}`)) consume(line);
+    else observeError(line);
+  }
   const durationMs: Record<string, ReturnType<typeof percentiles>> = Object.create(null);
   for (const [name, histogram] of durations) durationMs[name] = percentiles(histogram);
   const byComponent: Record<string, Record<string, { count: number; ok: number; failed: number; errorRate: number; durationMs?: ReturnType<typeof percentiles> }>> = Object.create(null);
@@ -88,7 +94,7 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
     };
   }
   return { total, recordedRows, countsByName, countsByKind, ok, failed,
-    okRate: ok + failed ? ok / (ok + failed) : 0, errorRate: total ? countsByKind.error / total : 0,
+    okRate: ok + failed ? ok / (ok + failed) : 0, errorRate: total ? (countsByKind.error + failedCalls) / total : 0,
     durationMs, byComponent, cardRenderFailures: Object.fromEntries(renderFailures),
     topCauses: [...causes.values()].sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag) || a.causeKey.localeCompare(b.causeKey)).slice(0, 20), chains: chainAggregation.summary(),
     topErrorTags: [...errors.values()].sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag) || a.name.localeCompare(b.name)).slice(0, 20) };

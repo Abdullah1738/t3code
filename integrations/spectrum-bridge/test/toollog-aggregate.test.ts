@@ -33,23 +33,99 @@ function setup(capBytes?: number) {
 test("one summary per completed turn retains slow/failed calls and exact millisecond percentiles", async () => {
   const { root, log, rows, turn, call } = setup();
   turn("turn.start");
-  for (const ms of [10, 20, 30, 900, 1_000, 1_001, 2_000]) call(ms);
+  for (const ms of [10, 20, 30, 900, 1_000, 1_500, 6_000]) call(ms);
   call(50, false);
   turn("turn.end");
   await log.settled();
-  expect(rows().filter(row => row.name === "turn.robob_call").map(row => row.durationMs)).toEqual([1_001, 2_000, 50]);
+  expect(rows().filter(row => row.name === "turn.robob_call").map(row => row.durationMs)).toEqual([6_000, 50]);
   const summary = rows().find(row => row.name === "turn.robob_calls")!;
-  expect(summary.calls?.thread).toMatchObject({ count: 8, ok: 7, failed: 1, p50: 50, p95: 2_000, max: 2_000 });
+  expect(summary.calls?.thread).toMatchObject({ count: 8, ok: 7, failed: 1, p50: 50, p95: 6_000, max: 6_000 });
   expect(new Set(rows().map(row => row.ids?.runId)).size).toBe(1);
   const result = JSON.parse(readFileSync(join(root, `rollup-${day}.json`), "utf8"));
-  expect(result).toMatchObject({ total: 10, recordedRows: 6, countsByName: { "turn.robob_call": 8 }, ok: 9, failed: 1 });
-  expect(result.byComponent.robob.thread).toMatchObject({ count: 8, ok: 7, failed: 1, errorRate: .125, durationMs: { p50: 50, p95: 2_000, max: 2_000 } });
+  expect(result).toMatchObject({ total: 10, recordedRows: 5, countsByName: { "turn.robob_call": 8 }, ok: 9, failed: 1 });
+  expect(result.byComponent.robob.thread).toMatchObject({ count: 8, ok: 7, failed: 1, errorRate: .125, durationMs: { p50: 50, p95: 6_000, max: 6_000 } });
 });
 
-test.each([1_000, 1_000.01, 1_001])("the one-second threshold uses the original timing %s", async ms => {
+test.each([1_500, 5_000, 5_000.01, 5_001, 6_000])("the five-second threshold uses the original timing %s", async ms => {
   const { log, rows, turn, call } = setup();
   turn("turn.start"); call(ms); turn("turn.end"); await log.settled();
-  expect(rows().filter(row => row.name === "turn.robob_call")).toHaveLength(ms > 1_000 ? 1 : 0);
+  expect(rows().filter(row => row.name === "turn.robob_call")).toHaveLength(ms > 5_000 ? 1 : 0);
+});
+
+test("slow-row limit survives summary flushes and never caps failures", async () => {
+  const { log, rows, turn, call } = setup();
+  turn("turn.start");
+  for (let i = 0; i < 50; i++) {
+    call(6_000);
+    if (i === 24) await log.rollup(day);
+  }
+  await log.rollup(day);
+  expect(rows().filter(row => row.name === "turn.robob_call")).toHaveLength(20);
+  expect(rows().flatMap(row => row.calls?.thread ? [row.calls.thread] : []).reduce((sum, stats) => sum + (stats.suppressedSlow ?? 0), 0)).toBe(30);
+  expect((await log.rollup(day))?.byComponent.robob.thread).toMatchObject({ count: 50, ok: 50, failed: 0 });
+  for (let i = 0; i < 25; i++) call(6_000, false);
+  turn("turn.end");
+  await log.rollup(day);
+  expect(rows().filter(row => row.name === "turn.robob_call" && row.ok === false)).toHaveLength(25);
+});
+
+test("sliding limits separate run and call name and expire at ten minutes", async () => {
+  const { log, rows, turn, call, time } = setup();
+  turn("turn.start");
+  for (let i = 0; i < 20; i++) call(6_000);
+  time(`${day}T12:09:59.999Z`); call(6_000);
+  call(6_000, true, "thread-a", "/threads/:id/messages");
+  turn("turn.start", "thread-b", "message-b"); call(6_000, true, "thread-b");
+  time(`${day}T12:10:00.000Z`); call(6_000);
+  await log.rollup(day);
+  const raw = rows().filter(row => row.name === "turn.robob_call");
+  expect(raw).toHaveLength(23);
+  expect(raw.filter(row => row.props?.route === "/threads/:id/messages")).toHaveLength(1);
+  expect(rows().find(row => row.calls?.thread?.suppressedSlow)?.calls?.thread.suppressedSlow).toBe(1);
+});
+
+test.each([
+  { name: "TimeoutError", code: undefined, response: "throw", status: 0 },
+  { name: "TypeError", code: "ECONNREFUSED", response: "throw", status: 0 },
+  { name: "SyntaxError", code: undefined, response: "json", status: 200 },
+  { name: "TimeoutError", code: undefined, response: "body", status: 200 },
+  { name: "AbortError", code: undefined, response: "body", status: 200 },
+  { name: "TypeError", code: "ECONNRESET", response: "body", status: 200 },
+  { name: "ControlError", code: undefined, response: "http", status: 503 },
+])("failed control $name requests retain one error row and one rollup failure", async fixture => {
+  const { root, rows } = setup();
+  const previous = process.env.TOOLLOG_DIR;
+  process.env.TOOLLOG_DIR = root;
+  const cause = Object.assign(new Error("PRIVATE +971501234567 /private/PRIVATE https://private.test/?token=PRIVATE"), fixture);
+  const fake = Object.assign(async () => {
+    if (fixture.response === "json") return new Response("PRIVATE", { status: fixture.status });
+    if (fixture.response === "body") return new Response(new ReadableStream({ start(controller) { controller.error(cause); } }), { status: fixture.status });
+    if (fixture.response === "http") return Response.json({ ok: false }, { status: fixture.status });
+    throw cause;
+  }, { preconnect: globalThis.fetch.preconnect });
+  const fetch = spyOn(globalThis, "fetch").mockImplementation(fake);
+  try {
+    toolLog.write({ component: "process", kind: "event", name: "bridge.stop" });
+    await expect(new ControlClient({ url: "http://127.0.0.1:3773", token: "PRIVATE_TOKEN" }).request("GET", "/threads/thread-a/messages?search=PRIVATE")).rejects.toMatchObject({ status: fixture.status });
+    const date = new Date().toISOString().slice(0, 10);
+    const result = await toolLog.rollup(date);
+    const records = rows(date);
+    expect(records.filter(row => row.error)).toHaveLength(1);
+    const failure = records.find(row => row.error)!;
+    const tag = fixture.response === "json" ? "control.invalid_json" : "control.request_failed";
+    expect(failure).toMatchObject({ name: "turn.robob_call", ok: false, props: { method: "GET", route: "/threads/:id/messages" },
+      error: { tag, name: fixture.name } });
+    expect(failure.ids?.runId).toBeTruthy();
+    expect(result?.failed).toBe(1);
+    expect(result?.errorRate).toBe(1 / result!.total);
+    expect(result?.topErrorTags).toMatchObject([{ tag, count: 1 }]);
+    expect(result?.byComponent.robob.messages).toMatchObject({ count: 1, failed: 1, errorRate: 1 });
+    expect(JSON.stringify(records)).not.toContain("PRIVATE");
+  } finally {
+    fetch.mockRestore();
+    toolLog.write({ component: "process", kind: "event", name: "bridge.stop" }); toolLog.flush(); await toolLog.settled();
+    if (previous === undefined) delete process.env.TOOLLOG_DIR; else process.env.TOOLLOG_DIR = previous;
+  }
 });
 
 test("interleaved turns and calls completing after a new turn keep their captured run id", async () => {
@@ -192,7 +268,7 @@ test("degraded mode preserves errors, turn boundaries, summaries and slow/failed
   const { root, log, rows, turn, call } = setup(1);
   log.write({ component: "fixture", kind: "event", name: "before.cap" });
   log.write({ component: "fixture", kind: "perf", name: "card.render", durationMs: 10 });
-  turn("turn.start"); call(10); call(2_000); call(50, false); turn("turn.end");
+  turn("turn.start"); call(10); call(6_000); call(50, false); turn("turn.end");
   await log.settled();
   const second = createToolLog({ root, now: () => Date.parse(`${day}T12:00:00Z`), capBytes: 1 }); logs.push(second);
   second.write({ component: "fixture", kind: "event", name: "after.cap" });
@@ -204,7 +280,7 @@ test("aggregate metadata cannot carry message text, paths, query strings or arbi
   const { log, rows } = setup();
   log.write({ component: "robob", kind: "perf", name: "turn.robob_calls", calls: {
     PRIVATE_BODY: { count: 1, ok: 1, failed: 0, p50: 1, p95: 1, max: 1, histogram: [[1, 1]] },
-    thread: { count: 999, ok: 1, failed: 0, p50: 971501234567, p95: 971501234567, max: 971501234567, histogram: [[5, 1], [971501234567, 1]] },
+    thread: { count: 999, ok: 1, failed: 0, p50: 971501234567, p95: 971501234567, max: 971501234567, suppressedSlow: 971501234567, histogram: [[5, 1], [971501234567, 1]] },
   } });
   log.flush();
   const raw = JSON.stringify(rows());
@@ -238,7 +314,7 @@ test("the control client captures the turn before awaiting and leaves the respon
   let resolveFetch!: (response: Response) => void;
   const fakeFetch = Object.assign(() => new Promise<Response>(resolve => { resolveFetch = resolve; }), { preconnect: globalThis.fetch.preconnect });
   const fetch = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
-  const clock = spyOn(performance, "now").mockReturnValueOnce(0).mockReturnValue(2_000);
+  const clock = spyOn(performance, "now").mockReturnValueOnce(0).mockReturnValue(6_000);
   try {
     toolLog.write({ component: "router", kind: "event", name: "turn.start", ids: { threadId: "thread-a", messageId: "a" } });
     const first = toolLog.runIds("thread-a").runId;

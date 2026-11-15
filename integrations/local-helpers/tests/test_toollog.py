@@ -129,6 +129,7 @@ class ToolLogTests(unittest.TestCase):
                  'histogram': [[10, 2], [1002, 1]]}
         call = {'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_call', 'ok': False,
                 'durationMs': 1002, 'ids': {'runId': 'run-fixture', 'callBatchId': 'batch-fixture'},
+                'error': {'tag': 'control.request_failed', 'name': 'TimeoutError'},
                 'props': {'method': 'GET', 'route': '/threads/:id'}}
         rows = [{**call, 'name': 'turn.robob_calls', 'calls': {'thread': stats}}, call,
                 {**call, 'durationMs': 2000, 'ids': {'callBatchId': 'orphan'}},
@@ -137,6 +138,8 @@ class ToolLogTests(unittest.TestCase):
         result = toollog.rollup('imessage', self.day)
         self.assertEqual((result['total'], result['recordedRows'], result['okCount'], result['failedCount']), (5, 4, 3, 2))
         self.assertEqual(result['countsByName']['turn.robob_call'], 4)
+        self.assertEqual(result['errorRate'], 2 / 5)
+        self.assertEqual(result['topErrorTags'][0]['count'], 2)
         self.assertFalse(result['sampled'])
         self.assertEqual(result['byComponent']['robob']['thread'], {
             'count': 4, 'ok': 2, 'failed': 2, 'errorRate': .5, 'durationMs': {'p50': 10, 'p95': 2000, 'max': 2000}})
