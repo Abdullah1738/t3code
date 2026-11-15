@@ -1629,6 +1629,29 @@ it.effect("#1490 observes accepted deliveries once and does not block on boards 
       expect(measured.length, "direct orchestration notification").toBe(expected);
       yield* orchestrator.dispatch(direct);
       expect(measured.length, "direct notification replay").toBe(expected);
+      for (const [index, cardId] of ["card-current", null, undefined].entries()) {
+        const notification = {
+          ...direct,
+          commandId: CommandId.make(`direct:card-scope:${index}`),
+          messageId: MessageId.make(`direct:card-scope:${index}`),
+        };
+        const send = orchestrator.dispatch(notification);
+        const scoped =
+          cardId === undefined
+            ? send
+            : send.pipe(EvaluatorAnalytics.forCard("board-current", cardId));
+        yield* scoped;
+        expected++;
+        expect(measured.length).toBe(expected);
+        expect(measured.at(-1)?.boardId).toBe(
+          cardId === undefined ? "board-offbox" : "board-current",
+        );
+        expect(measured.at(-1)?.cardId).toBe(
+          cardId === undefined ? "card-one" : (cardId ?? undefined),
+        );
+        yield* scoped;
+        expect(measured.length, "card attribution does not defeat receipt replay").toBe(expected);
+      }
       const failingManagement = Layer.effect(
         ThreadManagementService.ThreadManagementService,
         Effect.map(ThreadManagementService.ThreadManagementService, (real) => {

@@ -14,6 +14,11 @@ import { recordServerAnalytics } from "../../../observability/RpcInstrumentation
 export const origin = Context.Reference<EvaluatorTrigger | undefined>("KanbanEvaluatorOrigin", {
   defaultValue: () => undefined,
 });
+export const attribution = Context.Reference<
+  { readonly boardId: string; readonly cardId: string | null } | undefined
+>("KanbanEvaluatorAttribution", { defaultValue: () => undefined });
+export const forCard = (boardId: string, cardId: string | null) =>
+  Effect.provideService(attribution, { boardId, cardId });
 export const startObserver = Context.Reference<
   ((threadId: ThreadId) => Effect.Effect<void>) | undefined
 >("KanbanEvaluatorStartObserver", {
@@ -49,13 +54,14 @@ export const make = Effect.gen(function* () {
   const recordGenericDelivery = Effect.fn("EvaluatorAnalytics.recordGenericDelivery")(
     function* (link: KanbanThreadLink) {
       if (Option.isNone(analytics)) return;
+      const current = (yield* attribution) ?? link;
       yield* recordServerAnalytics(analytics.value, {
         ts: DateTime.formatIso(yield* DateTime.now),
         surface: "server",
         route: "kanban",
         kind: "kanban.evaluator",
-        boardId: link.boardId,
-        ...(link.cardId ? { cardId: link.cardId } : {}),
+        boardId: current.boardId,
+        ...(current.cardId ? { cardId: current.cardId } : {}),
         threadId: link.threadId,
         purposeKind: purposeKind(link.purpose),
         trigger: (yield* origin) ?? "thread_send",
