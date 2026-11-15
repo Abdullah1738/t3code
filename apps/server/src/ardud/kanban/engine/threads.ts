@@ -28,7 +28,6 @@ import type {
   OrchestrationV2ThreadShell,
 } from "@t3tools/contracts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
-import { backgroundWorkHoldsCompletion } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import {
   latestExecutedRun,
   latestRootProviderFailure,
@@ -89,7 +88,7 @@ export interface KanbanThreadView {
   readonly runRequestedAt?: string | null;
   readonly runMessageId?: string | null;
   readonly runStatus?: string | null;
-  /** Its own subagents and background tasks still running after its turn ended. Pull-request watches are counted in prWatches instead. */
+  /** Its own subagents, commands and background tasks still running after its turn ended. Pull-request watches are counted in prWatches instead. */
   readonly backgroundWork: number;
   /** Pull requests this thread watches (watch_pull_request) that are still open or draft. The watch wakes it on CI and review changes. */
   readonly prWatches: number;
@@ -332,8 +331,8 @@ export const backgroundWorkOf = (
   shell: Pick<OrchestrationV2ThreadShell, "pendingBackgroundTasks">,
 ): number =>
   (shell.pendingBackgroundTasks ?? []).filter(
-    (task) =>
-      !task.taskId.startsWith("pull-request-watch:") && backgroundWorkHoldsCompletion([task]),
+    // Commands may finish the turn, but their completion still wakes an idle worker.
+    (task) => !task.taskId.startsWith("pull-request-watch:"),
   ).length;
 
 export const prWatchesOf = (shell: Pick<OrchestrationV2ThreadShell, "pullRequests">): number =>

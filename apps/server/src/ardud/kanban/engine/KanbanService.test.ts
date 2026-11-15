@@ -112,6 +112,7 @@ import type { KanbanScriptsShape } from "./ScriptService.ts";
 import { opencodeTestProvider } from "./testProviders.ts";
 import { mapCodexModelCapabilities } from "../../../provider/CodexProvider.ts";
 import {
+  backgroundWorkOf,
   KanbanThreadError,
   KanbanThreads,
   type KanbanThreadPr,
@@ -24167,6 +24168,51 @@ it.effect("a worker waiting on its own subagents isn't nudged", () =>
       assert.strictEqual(yield* nudgesTo(fake, thread), 0);
       yield* TestClock.adjust("30 minutes");
       yield* kanban.tick;
+      assert.strictEqual(yield* nudgesTo(fake, thread), 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect.each(
+  (
+    [
+      { source: "Codex shell", kind: "command" },
+      { source: "Claude background Bash", kind: "command" },
+      { source: "Claude background task", kind: "background_task" },
+      { source: "Claude monitor", kind: "monitor" },
+    ] as const
+  ).flatMap((task) =>
+    (["completion", "grace expiry"] as const).map((ending) => ({ ...task, ending })),
+  ),
+)("a pending $source holds nudges until $ending", ({ kind, ending }) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+      yield* setBackground(
+        fake,
+        thread,
+        backgroundWorkOf({
+          pendingBackgroundTasks: [{ taskId: "check", kind }],
+        }),
+      );
+      yield* kanban.turnEnded(thread);
+      assert.strictEqual(yield* nudgesTo(fake, thread), 0);
+      yield* TestClock.adjust("31 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* nudgesTo(fake, thread), 0);
+      if (ending === "completion") {
+        // Completion without a wake must release the hold on the very next turn end.
+        yield* setBackground(fake, thread, backgroundWorkOf({ pendingBackgroundTasks: [] }));
+        yield* kanban.turnEnded(thread);
+      } else {
+        yield* TestClock.adjust("30 minutes");
+        yield* kanban.tick;
+      }
       assert.strictEqual(yield* nudgesTo(fake, thread), 1);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
