@@ -7,6 +7,7 @@ import { acknowledgeReceived, notifyFailedInbound } from "./inbound-failure.ts";
 import { chmod, mkdir } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
+import { agentPolicyPath } from "./agent-policy.ts";
 import { accessPath, accessReloader, emptyAccess } from "./access.ts";
 import { createApi } from "./api.ts";
 import { startAppsServer } from "./apps.ts";
@@ -275,7 +276,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     note: async (address, text) => { await post("/notify", { source: "iMessage bridge", severity: "info", text, dedupeKey: `sb-guest:${address}` }); },
   });
 
-  const agentBus = createAgentBus(chats, log);
+  const agentBus = createAgentBus(chats, log, agentPolicyPath(accessFile));
   api = createSbApi({
     agentBus,
     registry: chats, line, accessPath: accessFile, enabled: ready, reloadAccess: refreshAccess, guests: guestDesk, shares,
