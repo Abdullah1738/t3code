@@ -354,6 +354,68 @@ class Round2(Base):
             boatd.disk_maintenance(self.con)
         self.assertEqual(len(self.deletes()),1)
 
+    def stop_with_cleanup_failure(self, failure, during_prune=False):
+        bid=self.box('bx_stop0000')
+        other=self.box('bx_cleanup0')
+        self.install_rows(snaps(other),{})
+        original=self.f.incus
+        inventory=disk.inventory
+        attempted=[]
+        def remove(*a, **kw):
+            if a[:2]==('snapshot','delete'):
+                attempted.append(a)
+                if failure=='delete_timeout':
+                    self.f.calls.append(a)
+                    self.clock+=120
+                    raise subprocess.TimeoutExpired(a,120)
+            return original(*a, **kw)
+        def measured(*a):
+            if attempted and failure=='post_delete_inventory':
+                raise OSError('ZFS inventory unavailable')
+            return inventory(*a)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(boatd,'incus',side_effect=remove))
+            stack.enter_context(patch.object(disk,'inventory',side_effect=measured))
+            emit=stack.enter_context(patch.object(boatd.toollog,'emit'))
+            if during_prune:
+                stack.enter_context(patch.object(boatd,'snapshot',return_value=None))
+            boatd.stop_box(self.con,bid,'idle')
+        self.assertNotIn(bid,self.f.running)
+        self.assertEqual(self.state(bid)['state'],'archived')
+        self.assertEqual(self.state(bid)['stopped_at'],self.clock)
+        self.assertEqual(self.state(other)['state'],'ready')
+        self.assertIn(other,self.f.running)
+        self.assertEqual([(a[2],a[3]) for a in attempted],[(boatd.ct(other),'auto-0')])
+        fence=json.loads(self.con.execute("SELECT v FROM meta WHERE k='disk_cleanup'").fetchone()[0])
+        self.assertEqual(fence['last_delete_at'],self.clock)
+        events=[c for c in emit.call_args_list if c.args[1]=='snapshot.defer']
+        self.assertEqual(len(events),1)
+        self.assertFalse(events[0].kwargs['ok'])
+        self.assertEqual(events[0].kwargs['ids'],{'box':bid})
+        self.assertEqual(events[0].kwargs['props']['reason'],'cleanup_failed')
+        self.assertIn('timed out' if failure=='delete_timeout' else 'inventory unavailable',events[0].kwargs['props']['error'])
+        boatd.disk_maintenance(self.con)
+        self.assertEqual(len(self.deletes()),1)
+
+    def test_stop_archives_when_unrelated_delete_times_out_and_keeps_fence(self):
+        self.stop_with_cleanup_failure('delete_timeout')
+
+    def test_stop_archives_when_post_delete_inventory_fails_and_keeps_fence(self):
+        self.stop_with_cleanup_failure('post_delete_inventory')
+
+    def test_stop_archives_when_count_cleanup_delete_times_out_and_keeps_fence(self):
+        self.stop_with_cleanup_failure('delete_timeout',during_prune=True)
+
+    def test_container_stop_failure_still_propagates_without_archiving(self):
+        bid=self.box()
+        with patch.object(boatd,'incus',side_effect=subprocess.TimeoutExpired(['incus','stop'],120)), \
+             patch.object(boatd.toollog,'emit') as emit:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                boatd.stop_box(self.con,bid,'idle')
+        self.assertIn(bid,self.f.running)
+        self.assertEqual(self.state(bid)['state'],'stopping')
+        self.assertFalse(any(c.args[1]=='snapshot.defer' for c in emit.call_args_list))
+
 
 class CleanupMeasurements(unittest.TestCase):
     def test_zfs_freeing_and_both_live_psi_lines_are_read(self):

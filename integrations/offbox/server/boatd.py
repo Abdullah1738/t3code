@@ -941,8 +941,16 @@ def stop_box(con, box_id: str, why: str) -> None:
         incus("stop", ct(box_id), "--timeout", "60", timeout=120, check=False)
         if ct_running(box_id):
             incus("stop", ct(box_id), "--force", timeout=60)
-    snapshot(con, box_id, "stop")
-    prune_snaps(con, box_id)
+    # Cleanup may touch another box or time out after a delete. Its persisted
+    # pacing fence must survive, but cannot leave this stopped box in 'stopping'.
+    try:
+        snapshot(con, box_id, "stop")
+        prune_snaps(con, box_id)
+    except Exception as e:  # noqa: BLE001
+        log(f"snapshot cleanup deferred for {box_id}: {e}")
+        toollog.emit('boatd', 'snapshot.defer', kind='error', ok=False, ids={'box': box_id},
+                     props={'snapshot': 'stop', 'reason': 'cleanup_failed', 'error': str(e)[:300]},
+                     tag='snapshot_cleanup')
     set_box(con, box_id, state="archived", stopped_at=now())
     log(f"box {box_id} stopped ({why})")
 
