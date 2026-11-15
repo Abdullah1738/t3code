@@ -239,8 +239,10 @@ and plist; the evaluator must load `com.abdullah.mac-cpu` after review.
 ## Minute disk-wait samples
 
 The existing `com.abdullah.mac-cpu` 60-second schedule runs `u_sample.py`
-before the CPU probe, using one `ps -axo pid,ppid,lstart,etime,time,stat,comm,args`
-call capped at five seconds. It never reads a volume or invokes lsof. Errors
+before the CPU probe, using one wide `ps` snapshot of PID, parent, start/elapsed/
+CPU times, state, executable and argv, capped at five seconds. A 1,024-column
+executable field preserves Darwin paths before taking their basename; argv
+stays last. It never reads a volume or invokes lsof. Errors
 leave CPU sampling running and retain the last U state. Exiting `?` states
 are accepted; isolated torn rows are skipped with a `proc.u_parse` diagnostic
 (argv omitted). More than five bad rows and over 10% bad fails the probe.

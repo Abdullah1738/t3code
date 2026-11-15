@@ -13,7 +13,10 @@ from cpu import ProbeError, command, seconds
 from jobs import read_state, save_state, state_path
 from toollog import emit, finite_number, u_episode_fields, u_sample_fields, u_text
 
-PS = ['/bin/ps', '-axo', 'pid,ppid,lstart,etime,time,stat,comm,args']
+# Darwin truncates non-final comm to its header width (normally 16), even
+# with -ww. Reserve MAXPATHLEN before taking the basename; keep argv last.
+COMM_HEADER = 'COMM'+'_'*1020
+PS = ['/bin/ps', '-ww', '-axo', 'pid,ppid,lstart,etime,time,stat,comm='+COMM_HEADER+',args']
 MAX_GAP_S = 180
 
 
@@ -21,7 +24,7 @@ def parse_ps(text, diagnostics=None):
     diagnostics = diagnostics if diagnostics is not None else {}
     lines = text.splitlines()
     if not lines or not re.fullmatch(
-            r'\s*PID\s+PPID\s+STARTED\s+ELAPSED\s+TIME\s+STAT\s+COMM\s+ARGS\s*', lines[0]):
+            r'\s*PID\s+PPID\s+STARTED\s+ELAPSED\s+TIME\s+STAT\s+'+COMM_HEADER+r'\s+ARGS\s*', lines[0]):
         raise ProbeError('parse')
     comm_at, args_at = lines[0].index('COMM'), lines[0].index('ARGS')
     rows, bad = {}, []

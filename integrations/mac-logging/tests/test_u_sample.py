@@ -22,18 +22,27 @@ from rollup import rollup
 
 NOW = dt.datetime(2026, 11, 15, 10, tzinfo=dt.timezone.utc)
 START = 'Sun Nov 15 09:00:00 2026'
-HEADER = f'{"PID":>5} {"PPID":>5} {"STARTED":>28} {"ELAPSED":>11} {"TIME":>14} {"STAT":4} {"COMM":60}ARGS'
-COMM_AT, ARGS_AT = HEADER.index('COMM'), HEADER.index('ARGS')
+PREFIX_HEADER = f'{"PID":>5} {"PPID":>5} {"STARTED":>28} {"ELAPSED":>11} {"TIME":>14} {"STAT":4} '
+
+
+def header():
+    comm_field = u_sample.PS[-1].split(',')[-2]
+    assert comm_field.split('=')[0] == 'comm'
+    caption = comm_field.partition('=')[2] or 'COMM'
+    # Darwin ps gives a non-final comm 16 columns unless its header is wider.
+    return PREFIX_HEADER+caption.ljust(max(16, len(caption)))+' ARGS'
 
 
 def row(pid=10, ppid=1, age='10:00', stat='U', comm='/usr/bin/lsof', args='lsof -nP', start=START, cpu_time='0:01.23'):
     prefix = f'{pid:5} {ppid:5} {start:>28} {age:>11} {cpu_time:>14} {stat:4} '
-    assert len(prefix) == COMM_AT
-    return prefix+comm.ljust(ARGS_AT-COMM_AT)+args
+    comm_at, args_at = header().index('COMM'), header().index('ARGS')
+    assert len(prefix) == comm_at
+    width = args_at-comm_at-1
+    return prefix+comm[:width].ljust(width)+' '+args
 
 
 def snapshot(*rows):
-    return HEADER+'\n'+'\n'.join(rows or [row(stat='S')])+'\n'
+    return header()+'\n'+'\n'.join(rows or [row(stat='S')])+'\n'
 
 
 class USampleTests(unittest.TestCase):
@@ -120,6 +129,49 @@ class USampleTests(unittest.TestCase):
         self.assertEqual(proc['volume'], '/Volumes/ExternalSSD')
         self.assertIsNone(proc['parentComm'])
         self.assertIsNone(proc['parentArgs'])
+
+    def test_darwin_comm_width_preserves_basename_attribution(self):
+        cases = [
+            ('short path', '/usr/bin/lsof', 'lsof', 'U'),
+            ('16 characters', '/bin/abcdefghijk', 'abcdefghijk', 'U'),
+            ('17 characters', '/bin/abcdefghijkl', 'abcdefghijkl', 'U'),
+            ('Xcode Python', '/Applications/Xcode.app/Contents/Developer/Library/Frameworks/'
+             'Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python', 'Python', 'U'),
+            ('Homebrew', '/opt/homebrew/Cellar/python@3.14/3.14.0/bin/python3.14', 'python3.14', 'U'),
+            ('Robob spaces', '/Applications/Robob.app/Contents/Frameworks/Robob Helper (Renderer).app/'
+             'Contents/MacOS/Robob Helper (Renderer)', 'Robob Helper (Renderer)', 'U'),
+            ('empty argv', '/Applications/Robob.app/Contents/MacOS/Robob', 'Robob', 'U'),
+            ('exiting', '(Python)', 'Python', '?E'),
+            ('path limit', '/'+('segment/'*126)+'abcdefg/Python', 'Python', 'U'),
+        ]
+        self.assertEqual(len(cases[-1][1].encode()), 1023)
+        for i, (name, comm, expected, stat) in enumerate(cases):
+            with self.subTest(form=name):
+                # argv[0] is deliberately different from the executable name.
+                args = '' if name == 'empty argv' else 'alias '+'x'*220+' /Volumes/ExternalSSD/path'
+                parent = row(pid=100, stat='S', comm=comm, args=args)
+                child = row(pid=200, ppid=100, stat=stat, comm=comm, args=args)
+                text = snapshot(parent, child)
+                proc = u_sample.parse_ps(text)[200]
+                self.assertEqual(proc['comm'], expected)
+                self.assertEqual(proc['args'], args)
+                props = self.qualify(text, i*300)
+                if stat.startswith('?'):
+                    self.assertIsNone(props)
+                    continue
+                self.assertEqual(props['byComm'], {expected: 1})
+                self.assertEqual(props['procs'][0]['comm'], expected)
+                self.assertEqual(props['procs'][0]['parentComm'], expected)
+                self.assertEqual(props['procs'][0]['args'], args[:200])
+                self.assertEqual(props['procs'][0]['parentArgs'], args[:200])
+                self.assertEqual(props['procs'][0]['volume'], '/Volumes/ExternalSSD' if args else None)
+                self.assertIn(dict(comm=expected, count=1), props['episode']['topComms'])
+        # The old command's real Darwin width cannot yield Python's basename.
+        with patch.object(u_sample, 'PS', ['/bin/ps', '-axo', 'pid,ppid,lstart,etime,time,stat,comm,args']):
+            old_row = row(comm=cases[3][1])
+            self.assertIn('/Applications/Xc ', old_row)
+            with self.assertRaises(cpu.ProbeError):
+                u_sample.parse_ps(snapshot(old_row))
 
     def test_known_umount_once_per_utc_day_including_restart(self):
         text = snapshot(row(pid=99184, comm='/sbin/umount', age='4-00:00:00', args='umount -f /Users/ardud/checkouts'))
