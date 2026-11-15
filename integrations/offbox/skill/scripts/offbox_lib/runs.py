@@ -804,7 +804,8 @@ def settled_steps_code(run, code: int | None, *, log_path: Path | None = None, p
     row is still active. The caller has already established that the process ended.
     """
     path = log_path or LOGS_DIR / f"{run['run_id']}.log"
-    disk = offbox_disk_space.result(path, code)
+    from .misc import _raw_log
+    disk = offbox_disk_space.result(_raw_log(path), code)
     if disk.get('infra_failure') not in (None, 'disk_probe'):
         return code
     planned = planned_steps(run) if planned is None else planned
@@ -828,6 +829,7 @@ def settled_steps_code(run, code: int | None, *, log_path: Path | None = None, p
         result = _catch_up_log(dict(run, status='done'), budget=budget, locked=locked)
         if until is not None and now() >= until:
             raise OffboxError(f"--timeout reached; wait again: offbox wait {run['run_id']}", code=EXIT_WAIT_TIMEOUT)
+    path = _raw_log(path)
     # Complete old markers cannot prove the final attempt when the host's appended retry note is unread.
     history_incomplete = (api.BACKEND == 'server' and run['command_id'] and result is not None
                           and result not in ('complete', 'caught_up'))
@@ -1042,6 +1044,33 @@ def exit_recording_command(script: str, run_id: str, *, claim_id: str | None = N
     marker_block = ('python3 - "$$" <<\'OFFBOX_PID_RECORD\'\n' + BOUNDED_PROCESS
                     + f"\nrc, _ = bounded(['bash', '-c', {marker!r}, 'offbox-pid-record', sys.argv[1]], 2)\n"
                     + 'sys.exit(rc)\nOFFBOX_PID_RECORD')
+    execute = 'bash -l ' + shlex.quote(script_file) if script_file else 'bash -lc "$0"'
+    if api.BACKEND == 'boat':
+        # Retained command history can lag exit; keep both streams on the live box before its idle TTL changes.
+        execute = '\n'.join([
+            'mkdir -p "$HOME/.offbox/out"',
+            f'__offbox_output="$HOME/.offbox/out/{run_id}"',
+            ': > "$__offbox_output.stdout"; : > "$__offbox_output.stderr"',
+            'exec {__offbox_stdout}>&1 {__offbox_stderr}>&2',
+            'exec > >(tee -a "$__offbox_output.stdout"); __offbox_out_pid=$!',
+            'exec 2> >(tee -a "$__offbox_output.stderr" >&2); __offbox_err_pid=$!',
+            execute,
+            '__offbox_rc=$?',
+            'exec 1>&$__offbox_stdout 2>&$__offbox_stderr',
+            'exec {__offbox_stdout}>&- {__offbox_stderr}>&-',
+            # Close both pipes before waiting, so the receipt cannot race the last buffered stderr line.
+            '__offbox_drain() {',
+            '  for _ in 1 2 3 4 5 6 7 8 9 10; do',
+            '    kill -0 "$1" 2>/dev/null || return 0',
+            '    sleep 0.05',
+            '  done',
+            '  kill "$1" 2>/dev/null || :',
+            '}',
+            '__offbox_drain "$__offbox_out_pid"',
+            '__offbox_drain "$__offbox_err_pid"',
+        ])
+    else:
+        execute += '\n__offbox_rc=$?'
     outer = "\n".join([
         f'export OFFBOX_RUN_ID={shlex.quote(run_id)}',
         run_evidence.shell(BOUNDED_PROCESS),
@@ -1065,8 +1094,7 @@ def exit_recording_command(script: str, run_id: str, *, claim_id: str | None = N
           for name, code in (("HUP", 129), ("INT", 130), ("TERM", 143))],
         '__offbox_t0=$(date +%s)',
         '__offbox_evidence wrapper pid=$$',
-        'bash -l ' + shlex.quote(script_file) if script_file else 'bash -lc "$0"',
-        '__offbox_rc=$?',
+        execute,
         'fi',
         persist_block,
         # Whether a container started during the run (events, since testcontainers removes its own): only then
@@ -1366,7 +1394,8 @@ def log_probe_error(run_id, reason):
 
 
 def space_result(run_id, code, path=None, *, report=False):
-    record = offbox_disk_space.result(path or LOGS_DIR / f'{run_id}.log', code)
+    from .misc import _raw_log
+    record = offbox_disk_space.result(_raw_log(path or LOGS_DIR / f'{run_id}.log'), code)
     if record.get('disk_probe_error'):
         log_probe_error(run_id, record['disk_probe_error'])
     previous = read_json(LOGS_DIR / f'{run_id}.state.json', {})
@@ -2731,9 +2760,11 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
            until: float | None = None, report: bool = False, run=None, bookkeeping: bool = True) -> int | None:
     incoming = code
     log_row = None
+    early_catchup = False
+    early_history = None
     st = status or ("lost" if code is None else ("done" if code == 0 else "failed"))
     def prepare_result():
-        nonlocal code, st
+        nonlocal code, st, early_catchup, early_history
         if status == 'source_gone':
             return  # No command or step ran; only the caller's source check failed.
         prior = run
@@ -2745,11 +2776,20 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
         # History can reach the server. An unvalidated wrapper result is never saved as terminal.
         if planned_steps(prior):
             code = None
-        disk = offbox_disk_space.result(LOGS_DIR / f'{run_id}.log', incoming)
+        from .misc import _raw_log, _catch_up_finished
+        disk = offbox_disk_space.result(_raw_log(LOGS_DIR / f'{run_id}.log'), incoming)
+        if (catch_up and api.BACKEND == 'boat' and dict(prior).get('mode') == 'bg'
+                and not planned_steps(prior) and disk.get('infra_failure') != 'disk_probe'):
+            with contextlib.closing(db()) as output_con:
+                early_history = _catch_up_finished(output_con, run_id, budget=10 if until is None else max(0, until-now()),
+                                   row=dict(prior, status=st, exit_code=incoming))
+            early_catchup = True
+            disk = offbox_disk_space.result(_raw_log(LOGS_DIR / f'{run_id}.log'), incoming)
         known_infra = status == 'infra' and disk.get('infra_failure') != 'disk_probe'
         code = incoming if known_infra or disk.get('infra_failure') not in (None, 'disk_probe') else settled_steps_code(
-            prior, incoming, locked=True, until=until, catch_up=catch_up, report=report)
-        disk = offbox_disk_space.result(LOGS_DIR / f'{run_id}.log', incoming)
+            prior, incoming, locked=True, until=until, catch_up=catch_up and not early_catchup, report=report,
+            history_result=early_history if isinstance(early_history, str) else None)
+        disk = offbox_disk_space.result(_raw_log(LOGS_DIR / f'{run_id}.log'), incoming)
         if known_infra:
             st = 'infra'
         elif planned_steps(prior) and status in (None, 'done', 'failed', 'infra'):
@@ -2802,7 +2842,7 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
     con = None
     try:
         con = db()
-        if catch_up and not planned_steps(r) and (r['mode'] == 'bg' or con.execute(
+        if catch_up and not early_catchup and not planned_steps(r) and (r['mode'] == 'bg' or con.execute(
                 'SELECT 1 FROM kv WHERE k=?', (f'lost_checked:{run_id}',)).fetchone()):
             from .misc import _catch_up_finished
             _catch_up_finished(con, run_id, budget=10 if until is None else max(0, until-now()))

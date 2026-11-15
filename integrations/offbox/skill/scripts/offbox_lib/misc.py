@@ -5,6 +5,7 @@ from __future__ import annotations
 import codecs
 import contextlib
 import json
+import hashlib
 import os
 import shutil
 import sqlite3
@@ -18,6 +19,8 @@ import tempfile
 import time
 from pathlib import Path
 from time import monotonic, sleep
+
+import toollog
 
 from . import api, capacity, lease, outage, pool, ssh_sync
 from .common import (BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXEMPTIONS, EXIT_INFRA, EXIT_NOT_STARTED, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TOO_BIG_NOTE,
@@ -601,18 +604,26 @@ def _catch_up_log(r, budget: float | None = None, *, locked: bool = False, live:
         # since a server can publish more retained output after settlement.
         if (waited and r['command_id'] and isinstance(ck, dict) and ck != before and ck.get('settledCheck')
                 and ck.get('settledCommandId') == r['command_id']
-                and checkpoint(path) is not None and path.exists() and path.stat().st_size == ck['logBytes']):
+                and checkpoint(path) is not None and not _remote_copy(path)
+                and path.exists() and path.stat().st_size == ck['logBytes']):
             return 'complete'
         if not path.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
             path.touch()
         remaining = None if budget is None else max(0, budget - (time.time() - started))
         deadline = time.time() + (30 if remaining is None else remaining)
-        result = _catch_up_log_locked(r, path, remaining, live=live) if r['command_id'] else 'n/a'
+        history_budget = remaining
+        if (not live and api.BACKEND == 'boat' and r['mode'] == 'bg'
+                and (not _has_data(path) or _remote_copy(path) or _diagnostic_only(r, path))):
+            history_budget = (30 if remaining is None else max(0, remaining)) / 2
+        result = _catch_up_log_locked(r, path, history_budget, live=live) if r['command_id'] else 'n/a'
+        if locked and not live and r['mode'] == 'bg' and api.BACKEND == 'boat':
+            event(db(), r['box_id'], 'log_catchup_result', f"{r['run_id']} {result}")
         if not live and result in ('complete', 'caught_up'):
             ck = checkpoint(path)
             atomic_write_json(offsets_path(path), dict(ck, settledCommandId=r['command_id'], settledCheck=time.time_ns()))
-        if not live and r['mode'] == 'bg' and not _has_data(path):
+        diagnostic_only = not live and api.BACKEND == 'boat' and _diagnostic_only(r, path)
+        if not live and r['mode'] == 'bg' and (not _has_data(path) or _remote_copy(path) or diagnostic_only):
             return _empty_log_fallback(r, path, deadline, result)
         return result
     except OSError as e:
@@ -621,11 +632,79 @@ def _catch_up_log(r, budget: float | None = None, *, locked: bool = False, live:
         guard.close()
 
 
+def _diagnostic_only(r, path):
+    if checkpoint(path) is None:
+        return False
+    wrapper = False
+    marker = f"offbox-command-started: {r['run_id']}\n".encode()
+    with path.open('rb') as src:
+        while line := src.readline(4096):
+            if line == marker:
+                return False
+            wrapper |= line.startswith(b'offbox evidence wrapper pid=')
+    return wrapper
+
+
+def _remote_copy(path):
+    meta = read_json(Path(str(path) + '.remote.json'), {})
+    return meta if Path(str(path) + '.remote').is_file() else {}
+
+
+def _remote_result(r, path, result):
+    meta = _remote_copy(path)
+    reason = ' '.join((result.removeprefix('incomplete:') if result != 'n/a' else 'history unavailable').splitlines())
+    if result in ('complete', 'caught_up'):
+        reason = 'history empty'
+    view = Path(str(path) + '.remote.view')
+    result = f"incomplete:box copy {meta['source']}; history: {reason}"
+    if view.exists() and meta.get('exit_code') == r['exit_code']:
+        return result
+    meta.update(reason=reason, exit_code=r['exit_code'])
+    notice = ''
+    if not meta.get('merged'):
+        notice = f"offbox: stderr for this run could not be fetched ({reason}); output shows stdout only\n"
+        reason_tag = {'history empty': 'history_empty', 'timeout': 'history_timeout',
+                      'no progress': 'history_no_progress'}.get(reason, 'history_unavailable')
+        toollog.emit('run', 'run.log_stream_missing', kind='error', ok=False, ids={'run': r['run_id']},
+                     props={'stream': 'stderr', 'backend': api.BACKEND, 'reason': reason_tag})
+    from . import resources
+    saved = read_json(LOGS_DIR / f"{r['run_id']}.state.json", {})
+    footer = resources.summary(saved.get('resources') or resources.unavailable('boat', 1))
+    raw = Path(str(path) + '.remote')
+    view = Path(str(path) + '.remote.view')
+    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=path.name + '.view.', delete=False) as dst:
+        tmp = dst.name
+        try:
+            with raw.open('rb') as src:
+                shutil.copyfileobj(src, dst, 64 * 1024)
+            code = r['exit_code']
+            exit_line = f'remote exit {code}' if code is not None else 'remote exit unknown'
+            dst.write(('\n' + notice + footer + f"\noffbox: {exit_line}\n").encode())
+            dst.flush()
+            os.replace(tmp, view)
+        finally:
+            Path(tmp).unlink(missing_ok=True)
+    atomic_write_json(Path(str(path) + '.remote.json'), meta)
+    return result
+
+
+
+def _raw_log(path):
+    return Path(str(path) + '.remote') if _remote_copy(path) else path
+
+
+def _shown_log(path):
+    view = Path(str(path) + '.remote.view')
+    return view if _remote_copy(path) and view.exists() else path
+
+
 def _empty_log_fallback(r, path, deadline, result) -> str:
-    """Only replace an empty settled log, under the run lock; never wake a box to read it."""
+    """Keep the optional box copy separate from checkpointed history; never wake a box to read it."""
     # boatd's history reads its full host-side logs; the container has no additional copy to recover over SSH.
     if api.BACKEND == 'server':
         return result
+    if _remote_copy(path):
+        return _remote_result(r, path, result)
     tmp = None
     try:
         with api.budget(max(0, deadline - time.time())):
@@ -634,11 +713,16 @@ def _empty_log_fallback(r, path, deadline, result) -> str:
                 return result
             # The wrapper copy is optional on older runs; boat also keeps a process log on its live machine.
             paths = [f'.offbox/out/{r["run_id"]}.log']
+            prefix = f'.offbox/out/{r["run_id"]}'
             wrapper_pid = r['wrapper_pid'] or r['process_id']
             if wrapper_pid:
                 paths.append(f'.ascii/processes/{int(wrapper_pid)}.log')
-            command = 'for f in ' + ' '.join(shlex.quote(p) for p in paths) + '; do '
-            command += 'if test -s "$HOME/$f"; then cat "$HOME/$f"; exit $?; fi; done; exit 44'
+            command = (f'p={shlex.quote(prefix)}; '
+                       'if test -f "$HOME/$p.stdout" && test -f "$HOME/$p.stderr"; then '
+                       'printf "streams %s %s\\n" "$(wc -c < "$HOME/$p.stdout")" "$(wc -c < "$HOME/$p.stderr")" >&2; '
+                       'cat "$HOME/$p.stdout" "$HOME/$p.stderr"; exit $?; fi; ')
+            command += 'for f in ' + ' '.join(shlex.quote(p) for p in paths) + '; do '
+            command += 'if test -s "$HOME/$f"; then printf "%s\\n" "$f" >&2; cat "$HOME/$f"; exit $?; fi; done; exit 44'
             remaining = api.left()
             left = min(10, deadline - time.time(), 10 if remaining is None else remaining)
             if left <= 0:
@@ -646,14 +730,32 @@ def _empty_log_fallback(r, path, deadline, result) -> str:
             with tempfile.NamedTemporaryFile(dir=path.parent, prefix=path.name + '.remote.', delete=False) as dst:
                 tmp = dst.name
                 proc = subprocess.run(ssh_sync.ssh_base(r['box_id']) + [r['box_id'], command],
-                                      stdout=dst, stderr=subprocess.DEVNULL, timeout=left)
+                                      stdout=dst, stderr=subprocess.PIPE, timeout=left)
             if proc.returncode == 0 and os.path.getsize(tmp):
-                os.replace(tmp, path)
+                source = (proc.stderr or b'').decode(errors='replace').strip() or 'remote process log'
+                streams = re.fullmatch(r'streams (\d+) (\d+)', source)
+                meta = dict(source=f'{prefix}.stdout + {prefix}.stderr' if streams else source, merged=bool(streams))
+                if streams:
+                    lengths = [int(streams[1]), int(streams[2])]
+                    if sum(lengths) != os.path.getsize(tmp):
+                        return 'incomplete:box streams changed during fetch'
+                    hashes = []
+                    with open(tmp, 'rb') as src:
+                        for length in lengths:
+                            digest = hashlib.sha256()
+                            left = length
+                            while left:
+                                chunk = src.read(min(left, 64 * 1024))
+                                digest.update(chunk)
+                                left -= len(chunk)
+                            hashes.append(digest.hexdigest())
+                    meta.update(lengths=lengths, hashes=hashes)
+                atomic_write_json(Path(str(path) + '.remote.json'), meta)
+                size = os.path.getsize(tmp)
+                os.replace(tmp, Path(str(path) + ".remote"))
                 tmp = None
-                # A merged remote log has no per-stream offsets. Do not invent a checkpoint for history.
-                offsets_path(path).unlink(missing_ok=True)
-                event(db(), r['box_id'], 'output_recovered', f"{r['run_id']} remote log bytes={path.stat().st_size}")
-                return 'incomplete:remote log has no stream checkpoint'
+                event(db(), r['box_id'], 'output_recovered', f"{r['run_id']} remote log bytes={size}")
+                return _remote_result(r, path, result)
     except (OffboxError, OSError, subprocess.TimeoutExpired, ValueError):
         pass
     finally:
@@ -699,6 +801,9 @@ def _catch_up_log_locked(r, path, budget, *, live=False) -> str:
     try:
         ck = checkpoint(path)
         length = path.stat().st_size
+        remote = _remote_copy(path)
+        if remote:
+            ck, length = None, 0
         if ck is None or (not length and r['mode'] == 'bg'):
             if length:
                 # Legacy bytes have no stream mapping. Equal lengths cannot prove that both streams are here.
@@ -709,6 +814,8 @@ def _catch_up_log_locked(r, path, budget, *, live=False) -> str:
             return 'incomplete:invalid checkpoint'
         offsets = [ck['stdoutOffset'], ck['stderrOffset']]
         sizes = [0, 0]
+        digests = [hashlib.sha256(), hashlib.sha256()]
+        copied = [0, 0]
         with tempfile.NamedTemporaryFile(mode='w+b', dir=path.parent, prefix=path.name + '.catchup.',
                                          delete=False) as dst:
             tmp = dst.name
@@ -723,6 +830,7 @@ def _catch_up_log_locked(r, path, budget, *, live=False) -> str:
                     dst.write(chunk)
                     left -= len(chunk)
             for i, which in enumerate(('stdout', 'stderr')):
+                header, trimming = bytearray(), which == 'stderr'
                 snapshot = None
                 empty_pages = 0
                 while True:
@@ -750,6 +858,23 @@ def _catch_up_log_locked(r, path, budget, *, live=False) -> str:
                         return 'incomplete:no progress'
                     if nxt != offsets[i] + len(data):
                         return 'incomplete:invalid history offset'
+                    if remote.get('lengths'):
+                        # stdout matches its prefix; stderr also has the outer wrapper's PID diagnostic first.
+                        expected = remote['lengths'][i]
+                        payload = data
+                        if trimming:
+                            header.extend(payload)
+                            if b'\n' not in header and len(header) <= 256:
+                                payload = b''
+                            else:
+                                payload = bytes(header)
+                                match = re.match(rb'offbox evidence wrapper pid=\d+\n', payload)
+                                if match:
+                                    payload = payload[match.end():]
+                                trimming = False
+                        chunk = payload[:max(0, expected - copied[i])]
+                        digests[i].update(chunk)
+                        copied[i] += len(chunk)
                     dst.write(data)
                     empty_pages = 0
                     offsets[i] = nxt
@@ -767,6 +892,17 @@ def _catch_up_log_locked(r, path, budget, *, live=False) -> str:
                         if page.get('size') is not None and nxt < int(page['size']):
                             return 'incomplete:history ended early'
                         break
+            if remote:
+                size = Path(str(path) + '.remote').stat().st_size
+                available = offsets[0]
+                if remote.get('lengths'):
+                    if copied != remote['lengths'] or [d.hexdigest() for d in digests] != remote['hashes']:
+                        return 'incomplete:history behind box copy'
+                    available = sum(offsets)
+                if not sum(offsets):
+                    return 'incomplete:history empty'
+                if available < size:
+                    return 'incomplete:history behind box copy'
             if not keep and not live:
                 _preamble_first(dst, offsets[0], r['run_id'])
             log_bytes = dst.tell()
@@ -775,12 +911,18 @@ def _catch_up_log_locked(r, path, budget, *, live=False) -> str:
         if live and log_bytes < length:
             return 'incomplete:history behind local log'
         if offsets == [ck['stdoutOffset'], ck['stderrOffset']] and length == keep and checkpoint(path) is not None:
+            if remote:
+                Path(str(path) + '.remote.json').unlink(missing_ok=True)
             return 'complete'
+        if remote and not log_bytes:
+            return 'incomplete:history empty'
         if tmp is not None:
             os.replace(tmp, path)
             tmp = None
         atomic_write_json(offsets_path(path),
                           dict(stdoutOffset=offsets[0], stderrOffset=offsets[1], logBytes=log_bytes))
+        if remote:
+            Path(str(path) + '.remote.json').unlink(missing_ok=True)
         # No follower can own these under the run lock. Discard abandoned replay files so a stale replay cannot
         # later replace the completed log with the prefix captured before the run settled.
         takeover = path.with_name(path.name + '.takeover')
@@ -795,11 +937,11 @@ def _catch_up_log_locked(r, path, budget, *, live=False) -> str:
                 os.unlink(tmp)
 
 
-def _catch_up_finished(con, run_id, budget: float = 10) -> None:
+def _catch_up_finished(con, run_id, budget: float = 10, *, row=None) -> str | None:
     """Best effort under the maintenance caller's box lock; history errors cannot undo settlement."""
     from .runs import planned_steps
     try:
-        r = con.execute('SELECT * FROM runs WHERE run_id=?', (run_id,)).fetchone()
+        r = row if row is not None else con.execute('SELECT * FROM runs WHERE run_id=?', (run_id,)).fetchone()
         # Step settlement fetched and validated its output before commit. Replacing it here could invalidate the exit.
         if planned_steps(r):
             return
@@ -809,8 +951,10 @@ def _catch_up_finished(con, run_id, budget: float = 10) -> None:
         if result == 'n/a' or result.startswith('incomplete:'):
             reason = result.split(':', 1)[1] if ':' in result else 'run log lock held'
             event(con, r['box_id'], 'log_catchup_failed', f"{run_id} {reason}")
+        return result
     except Exception as e:
         event(con, None, 'log_catchup_failed', f"{run_id} {e}")
+        return 'incomplete:' + str(e)
 
 
 def _incomplete_log(r, result) -> None:
@@ -818,6 +962,7 @@ def _incomplete_log(r, result) -> None:
         return
     settled = r['status'] not in ('starting', 'running')
     p = LOGS_DIR / f"{r['run_id']}.log"
+    p = _shown_log(p)
     size = p.stat().st_size if p.exists() else 0
     if result == 'n/a' and settled and r['mode'] != 'local':
         reason = ("another reader is fetching this run's log" if r['box_id'] and r['command_id']
@@ -850,7 +995,7 @@ def _refresh_running_ttl(r, until=None) -> None:
 
 def _validated_step_row(r, code):
     import offbox_disk_space
-    if dict(r).get('mode') != 'local' and offbox_disk_space.result(LOGS_DIR / f"{r['run_id']}.log", code).get('infra_failure'):
+    if dict(r).get('mode') != 'local' and offbox_disk_space.result(_raw_log(LOGS_DIR / f"{r['run_id']}.log"), code).get('infra_failure'):
         return dict(r, status='infra', exit_code=code)
     from .runs import planned_steps
     if not planned_steps(r):
@@ -957,12 +1102,12 @@ def logs(run_id: str, do_follow: bool) -> int:
     from .runs import space_result
     effective = space_result(r['run_id'], code, p, report=True)
     import offbox_disk_space
-    if (offbox_disk_space.result(p, code).get('infra_failure') or
+    if (offbox_disk_space.result(_raw_log(p), code).get('infra_failure') or
             read_json(LOGS_DIR / f"{r['run_id']}.state.json", {}).get('infra_failure')):
         return EXIT_INFRA
     if planned_steps(r) and code is None:
         return EXIT_INFRA
-    if r['mode'] == 'bg' and not _has_data(p):
+    if r['mode'] == 'bg' and not _has_data(_shown_log(p)):
         if result in ('complete', 'caught_up'):
             say(f"no output recorded for {r['run_id']} (server history checked)")
         return 1
@@ -1002,7 +1147,7 @@ def _settled(r, echo=False, pos=0, *, locked=False, until=None, show_failure=Fal
         _tail(LOGS_DIR / f"{r['run_id']}.log", pos, True)
     elif show_failure and r['mode'] == 'bg' and code not in (0, None):
         _failure_tail(LOGS_DIR / f"{r['run_id']}.log")
-    if result in ('complete', 'caught_up') and r['mode'] == 'bg' and not _has_data(LOGS_DIR / f"{r['run_id']}.log"):
+    if result in ('complete', 'caught_up') and r['mode'] == 'bg' and not _has_data(_shown_log(LOGS_DIR / f"{r['run_id']}.log")):
         say(f"{r['run_id']} settled with no output on record")
     else:
         _incomplete_log(checked, result)
@@ -1037,6 +1182,7 @@ def _settled(r, echo=False, pos=0, *, locked=False, until=None, show_failure=Fal
 
 
 def _failure_tail(path) -> None:
+    path = _shown_log(path)
     # Repeated waits and waits after a follower must not replay output already delivered by another invocation.
     try:
         size = os.path.getsize(path)
@@ -1050,6 +1196,7 @@ def _failure_tail(path) -> None:
 def _tail(path, pos: int, echo: bool, limit: int | None = None) -> int:
     """Consume the holder's local log from `pos`, up to `limit` bytes when given (the committed length: bytes past it
     are not yet checkpointed and must not be printed). Prints only when echoing. Returns the new position."""
+    path = _shown_log(path)
     decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
     echo = echo and not is_silenced(sys.stdout)
     delivered = 0
