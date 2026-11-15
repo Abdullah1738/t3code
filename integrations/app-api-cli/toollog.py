@@ -30,6 +30,7 @@ _NAMES = {
     'provider.track', 'provider.orders', 'provider.details', 'log.cap',
     'case.open', 'case.update', 'case.close', 'case.reopen', 'case.corroborate',
     'question.ask', 'check.run', 'cache_reset',
+    'order_watch.item_drop_check',
 }
 _ENUMS = {
     'lane': {'food', 'minutes', 'nownow', 'main', 'supermall', 'marketplace', 'careem', 'uber',
@@ -431,7 +432,9 @@ def _phases(scope, start, end):
 def _fields(props):
     result = {}
     for key, value in (props or {}).items():
-        if key in _ENUMS and type(value) is str and value in _ENUMS[key]:
+        if key == 'app' and type(value) is str:
+            result[key] = value if value in _ENUMS['merchant'] else 'other'
+        elif key in _ENUMS and type(value) is str and value in _ENUMS[key]:
             result[key] = value
         elif key in _BOOLS and type(value) is bool:
             result[key] = value
@@ -484,6 +487,15 @@ def _fields(props):
         elif key == 'last_success_at' and (value is None or (type(value) is str and re.fullmatch(
                 r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})', value))):
             result[key] = value
+        elif key in {'baseline_count', 'row_count', 'absent_count', 'emitted_count'} and type(value) is int and 0 <= value <= 10**9:
+            result[key] = value
+        elif key == 'complete' and type(value) is bool:
+            result[key] = value
+        elif key == 'matched_by' and isinstance(value, dict):
+            result[key] = {k: v for k, v in value.items() if k in {'item_id', 'item_code', 'sku', 'sku_config', 'name'}
+                           and type(v) is int and 0 <= v <= 10**9}
+        elif key == 'suppressed_reason' and value in (None, 'no_overlap'):
+            result[key] = value
     return result
 
 
@@ -491,7 +503,7 @@ def _ids(values):
     # Hash even syntactically valid IDs: input IDs can themselves contain a PAN/OTP.
     return {key: hashlib.sha256(str(value).encode()).hexdigest()[:16]
             for key, value in (values or {}).items()
-            if key in {'flowId', 'orderId', 'caseId'} and type(value) in (str, int) and value != ''}
+            if key in {'flowId', 'orderId', 'caseId', 'watcher'} and type(value) in (str, int) and value != ''}
 
 
 def _noon_lane(order):
