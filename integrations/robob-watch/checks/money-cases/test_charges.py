@@ -734,6 +734,85 @@ class OwnerTexts(unittest.TestCase):
     def message_calls(self, server):
         return [(path, params) for path, params, _ in server.calls if path.endswith('/messages')]
 
+    def test_one_slow_request_is_capped_and_other_progress_is_saved(self):
+        threads = [{'threadId': tid, 'title': 'App'} for tid in ('slow', 'a', 'b')]
+        with ControlServer(threads=threads, stall='/slow/messages') as server:
+            stats = Counter()
+            started = time.monotonic()
+            with self.assertRaisesRegex(ch.Lookup, r'incomplete \(2 of 3 threads\)'):
+                self.read(stats=stats)
+            elapsed = time.monotonic() - started
+            self.assertGreater(elapsed, ch.OWNER_REQUEST_TIMEOUT - 0.2)
+            self.assertLess(elapsed, ch.OWNER_REQUEST_TIMEOUT + 0.7)
+            self.assertEqual(stats['owner_timeouts'], 1)
+            self.assertEqual(stats['owner_threads_fetched'], 2)
+            self.assertEqual(stats['owner_result'], 'incomplete')
+            self.assertEqual(stats['owner_cache_size'], 2)
+            cache = json.loads((Path(server.tmp.name) / 'owner-texts.json').read_text())
+            self.assertEqual(set(cache), {'a', 'b'})
+            self.assertGreaterEqual(stats['owner_fetch_ms_max'], 2800)
+
+    def test_stalled_list_counts_attempt_and_reports_list_failed(self):
+        with ControlServer(stall='/threads'):
+            stats = Counter()
+            with self.assertRaises(ch.Lookup):
+                self.read(stats=stats)
+            self.assertEqual(stats['owner_result'], 'list_failed')
+            self.assertEqual(stats['owner_list_pages'], 1)
+            self.assertEqual(stats['owner_queries'], 1)
+            self.assertEqual(stats['owner_timeouts'], 1)
+            self.assertGreaterEqual(stats['owner_list_ms'], 2800)
+            self.assertEqual(stats['owner_threads_fetched'], 0)
+
+    def test_ninety_five_threads_converge_with_ten_changes_per_call(self):
+        until = at('2026-10-24T05:00')
+        since = until - dt.timedelta(days=7)
+        threads = [{'threadId': str(n), 'title': 'Private title never in stats',
+                    'updatedAt': ch.iso(until - dt.timedelta(hours=n))} for n in range(95)]
+        with ControlServer(threads=threads) as server:
+            for n in range(95):
+                server.rows[str(n)] = [summary('Private text never in stats', messageId=str(n))]
+            for call, (fresh, needed, fetched, result) in enumerate((
+                    (0, 95, 62, 'incomplete'), (52, 43, 43, 'ok'), (85, 10, 10, 'ok'))):
+                if call:
+                    for thread in server.threads[:10]:
+                        thread['updatedAt'] = ch.iso(until + dt.timedelta(minutes=call))
+                server.calls.clear()
+                stats = Counter()
+                if result == 'incomplete':
+                    with self.assertRaises(ch.Lookup):
+                        ch.owner_texts(since, until, stats=stats)
+                else:
+                    self.assertEqual(len(ch.owner_texts(since, until, stats=stats)), 95)
+                self.assertEqual(stats['owner_result'], result)
+                self.assertEqual(stats['owner_list_pages'], 2)
+                self.assertEqual(stats['owner_threads_selected'], 95)
+                self.assertEqual(stats['owner_threads_fresh'], fresh)
+                self.assertEqual(stats['owner_threads_needed'], needed)
+                self.assertEqual(stats['owner_threads_fetched'], fetched)
+                self.assertEqual(stats['owner_queries'], fetched + 2)
+                self.assertLessEqual(stats['owner_queries'], 64)
+                self.assertEqual(stats['owner_timeouts'], 0)
+                self.assertEqual(stats['owner_cache_size'], 62 if not call else 95)
+                self.assertEqual(len(self.message_calls(server)), fetched)
+                self.assertNotIn('Private', json.dumps(stats))
+                self.assertNotIn('test-secret', json.dumps(stats))
+
+    def test_cold_and_changed_threads_share_the_request_limit(self):
+        threads = [{'threadId': str(n), 'title': 'App',
+                    'updatedAt': ch.iso(at('2026-10-24T05:00') - dt.timedelta(minutes=n))}
+                   for n in range(95)]
+        with ControlServer(threads=threads) as server:
+            with self.assertRaises(ch.Lookup):
+                self.read()
+            for thread in server.threads[:10]:
+                thread['updatedAt'] = '2026-10-24T02:00:00Z'
+            server.calls.clear()
+            with patch.object(ch, 'OWNER_REQUEST_LIMIT', 8), self.assertRaises(ch.Lookup):
+                self.read()
+            fetched = {path.split('/')[-2] for path, _ in self.message_calls(server)}
+            self.assertEqual(fetched, {'62', '63', '64', '0', '1', '2'})
+
     def test_changed_threads_reconcile_mutations_missing_from_strict_deltas(self):
         cases = [
             ('redacted', [summary('[REDACTED]', messageId='old')], ['[REDACTED]']),
@@ -972,7 +1051,7 @@ class OwnerTexts(unittest.TestCase):
         save = ch.save_owner_cache
         def late(*args):
             result = save(*args)
-            clock[0] += 5
+            clock[0] += ch.OWNER_BUDGET + 1
             return result
         with ControlServer([summary('owner')]), patch.object(ch.time, 'time', lambda: clock[0]), \
                 patch.object(ch, 'save_owner_cache', late), self.assertRaisesRegex(ch.Lookup, 'out of time'):
@@ -1150,10 +1229,16 @@ class OwnerTexts(unittest.TestCase):
         run = ch.subprocess.run
         def stuck(*args, **kwargs):
             return run(['/usr/bin/python3', '-I', '-c', 'import time; time.sleep(10)'], **kwargs)
-        started = time.time()
-        with patch.object(ch.subprocess, 'run', side_effect=stuck), self.assertRaises(ch.Lookup):
-            ch.control_get(('http://127.0.0.1', 'test-secret-never-print'), '/threads', {}, started + 1.2)
-        self.assertLess(time.time() - started, 2.2)
+        for budget in (1.2, 10):
+            with self.subTest(budget=budget), ControlServer() as server:
+                stats = Counter()
+                started = time.monotonic()
+                with patch.object(ch.subprocess, 'run', side_effect=stuck), self.assertRaises(ch.Lookup):
+                    ch.control_get(ch.control_config(), '/threads', {}, time.time() + budget, stats)
+                self.assertLess(time.monotonic() - started, min(budget, ch.OWNER_REQUEST_TIMEOUT) + 0.7)
+                self.assertEqual(stats['owner_timeouts'], 1)
+                self.assertEqual(stats['owner_queries'], 1)
+                self.assertEqual(stats['owner_list_pages'], 1)
 
     def test_twenty_threads_fit_the_cap_with_at_most_six_concurrent_requests(self):
         threads = [{'threadId': str(n), 'title': 'App'} for n in range(20)]

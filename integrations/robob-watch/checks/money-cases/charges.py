@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as
 import datetime as dt
 from decimal import Decimal, InvalidOperation
 import importlib.util
+import itertools
 import json
 import os
 from pathlib import Path
@@ -122,7 +123,11 @@ class SourceLimit(Lookup):
         super().__init__(message)
 
 
-OWNER_BUDGET = 4
+OWNER_BUDGET = 10
+OWNER_REQUEST_TIMEOUT = 3
+OWNER_TIMING_KEYS = (
+    'owner_list_pages', 'owner_list_ms', 'owner_threads_selected', 'owner_threads_fresh',
+    'owner_threads_needed', 'owner_threads_fetched', 'owner_fetch_ms_max', 'owner_timeouts', 'owner_cache_size')
 OWNER_REQUEST_LIMIT = 64
 OWNER_CACHE_VERSION = 2
 _OWNER_STATS_LOCK = threading.Lock()
@@ -432,11 +437,15 @@ def control_config():
 
 def control_get(config, path, params, deadline, stats=None):
     url, token = config
+    timeout = left(deadline, OWNER_REQUEST_TIMEOUT)
+    listed = path == '/threads'
+    started = time.monotonic()
+    if stats is not None:
+        with _OWNER_STATS_LOCK:
+            stats['owner_queries'] = stats.get('owner_queries', 0) + 1
+            if listed:
+                stats['owner_list_pages'] = stats.get('owner_list_pages', 0) + 1
     try:
-        timeout = left(deadline, 3)
-        if stats is not None:
-            with _OWNER_STATS_LOCK:
-                stats['owner_queries'] += 1
         # Curl's wall-clock limit covers DNS, connect/TLS, headers and body. The
         # subprocess timeout also kills and reaps it if its resolver gets stuck.
         # Disable curlrc and pass the credential on stdin, never in argv or errors.
@@ -444,16 +453,31 @@ def control_get(config, path, params, deadline, stats=None):
                                '--proto', '=http,https', '--max-time', str(timeout),
                                '--url', url + path + '?' + urllib.parse.urlencode(params)],
                               input=('header = ' + json.dumps('Authorization: Bearer ' + token) + '\n').encode(),
-                              capture_output=True, timeout=max(0.001, deadline - time.time()))
+                              capture_output=True, timeout=timeout)
+        if done.returncode == 28:
+            raise subprocess.TimeoutExpired('Robob control', timeout)
         if done.returncode:
             raise Lookup('Robob control: request failed or timed out')
         result = json.loads(done.stdout)
         if not isinstance(result, dict) or result.get('ok') is not True:
             raise Lookup('Robob control: invalid response')
         return result
-    except (OSError, subprocess.TimeoutExpired, ValueError):
+    except subprocess.TimeoutExpired:
+        if stats is not None:
+            with _OWNER_STATS_LOCK:
+                stats['owner_timeouts'] = stats.get('owner_timeouts', 0) + 1
+        raise Lookup('Robob control: request failed or timed out') from None
+    except (OSError, ValueError):
         # Neither a server error body nor a request/credential repr belongs in pings.json.
         raise Lookup('Robob control: request failed or timed out') from None
+    finally:
+        if stats is not None:
+            elapsed = round((time.monotonic() - started) * 1000)
+            with _OWNER_STATS_LOCK:
+                if listed:
+                    stats['owner_list_ms'] = stats.get('owner_list_ms', 0) + elapsed
+                else:
+                    stats['owner_fetch_ms_max'] = max(stats.get('owner_fetch_ms_max', 0), elapsed)
 
 
 def owner_time(value):
@@ -507,12 +531,17 @@ def save_owner_cache(path, cache, since, until):
                      'texts': [row for row in entry['texts'] if owner_time(row['createdAt']) >= cutoff]}
     try:
         write_json(path, kept)
+        return len(kept)
     except OSError:
         raise Lookup('Robob control: owner cache save failed') from None
 
 
 def owner_texts(since, until, deadline=None, stats=None, cache_path=None, cache_reset=None):
-    """His app/iMessage typing, fetched once per check within a four-second total cap."""
+    """His app/iMessage typing, fetched once per check within its own total cap."""
+    if stats is not None:
+        for key in OWNER_TIMING_KEYS:
+            stats.setdefault(key, 0)
+        stats['owner_result'] = 'list_failed'
     stop = time.time() + (OWNER_BUDGET if deadline is None
                           else min(OWNER_BUDGET, left(deadline, OWNER_BUDGET) - 0.5))
     alarm = signal.getitimer(signal.ITIMER_REAL)[0]
@@ -525,6 +554,8 @@ def owner_texts(since, until, deadline=None, stats=None, cache_path=None, cache_
         rows = _owner_texts(since, until, stats, cache_path, cache_reset, stop - 0.25)
         if time.time() >= stop:
             raise error
+        if stats is not None:
+            stats['owner_result'] = 'ok'
         return rows
 
 
@@ -569,9 +600,13 @@ def _owner_texts(since, until, stats, cache_path, cache_reset, stop):
                 cursors.add(cursor)
                 params['cursor'] = cursor
 
+    if stats is not None:
+        stats['owner_result'] = 'incomplete'
     path = Path(cache_path) if cache_path is not None else Path(os.environ.get(
         'MONEY_CASES_DIR', '~/Documents/assistant/money-cases')).expanduser() / 'owner-texts.json'
     cache = owner_cache(path, cache_reset)
+    if stats is not None:
+        stats['owner_cache_size'] = len(cache)
 
     def read_thread(thread):
         title = str(thread.get('title') or '')
@@ -637,6 +672,17 @@ def _owner_texts(since, until, stats, cache_path, cache_reset, stop):
             covered.add(thread['threadId'])
         else:
             needed.append(thread)
+    # Give uncached spans and changed threads a share of every request window.
+    # Each queue retains newest-first order; churn cannot starve older cold spans.
+    full, changed = [], []
+    for thread in needed:
+        prior = cache.get(thread['threadId'])
+        (full if prior is None or owner_time(prior['coveredFrom']) > since else changed).append(thread)
+    needed = [thread for pair in itertools.zip_longest(full, changed) for thread in pair if thread is not None]
+    if stats is not None:
+        stats['owner_threads_selected'] = len(selected)
+        stats['owner_threads_fresh'] = len(covered)
+        stats['owner_threads_needed'] = len(needed)
     errors = []
     pool = ThreadPoolExecutor(max_workers=6)
     futures = {}
@@ -661,9 +707,13 @@ def _owner_texts(since, until, stats, cache_path, cache_reset, stop):
         try:
             cache[tid] = future.result()
             covered.add(tid)
+            if stats is not None:
+                stats['owner_threads_fetched'] += 1
         except Lookup as exc:
             errors.append(exc)
-    save_owner_cache(path, cache, since, until)
+    size = save_owner_cache(path, cache, since, until)
+    if stats is not None:
+        stats['owner_cache_size'] = size
     if len(covered) != len(selected):
         detail = ': ' + str(errors[0]) if errors else ''
         raise Lookup(f'Robob control: owner read incomplete ({len(covered)} of {len(selected)} threads); '
