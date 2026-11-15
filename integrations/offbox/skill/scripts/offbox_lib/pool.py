@@ -564,9 +564,12 @@ def _source(key, template, base, fresh):
 
 @contextlib.contextmanager
 def _lease_work():
-    from . import allocation
+    from . import allocation, home
     queue = allocation._QUEUE.get()
     started = time.monotonic()
+    if queue is not None:
+        queue["queue_wait_s"] = max(0, started - (queue['end'] - queue['wait']) - queue.get('log_setup_ms', 0) / 1000)
+        home.QUEUE_WAIT.set(queue["queue_wait_s"])
     try:
         yield
     finally:

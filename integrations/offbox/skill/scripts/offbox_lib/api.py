@@ -273,10 +273,12 @@ _REQUEST_SCOPE = contextvars.ContextVar('boat_request_scope', default=None)
 class RequestScope:
     """Cancel a worker's requests without changing another thread's API budget."""
 
-    def __init__(self, seconds: float, parent=None, network_timeout=False):
+    def __init__(self, seconds: float, parent=None, network_timeout=False, caller_deadline=None):
         self.seconds = seconds
         self.end = time.time() + seconds
         self.parent = parent
+        ends = [end for end in (caller_deadline, getattr(parent, 'caller_deadline', None)) if end is not None]
+        self.caller_deadline = min(ends, default=None)
         self.network_timeout = network_timeout or bool(parent and parent.network_timeout)
         self.stopped = threading.Event()
         self.lock = threading.Lock()
@@ -549,6 +551,9 @@ def _call(method: str, path: str, body=None, headers: dict | None = None, timeou
                 _DEADLINE += elapsed
             if scope is not None:
                 scope.end += elapsed
+                if scope.caller_deadline is not None:
+                    deadline = scope.caller_deadline if deadline is None else min(deadline, scope.caller_deadline)
+                    scope.end = min(scope.end, scope.caller_deadline)
 
 
 def command_metadata(data: dict) -> dict:
@@ -601,6 +606,8 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
     if scope is not None:
         scope.check()
         end = scope.end
+        if scope.caller_deadline is not None:
+            end = min(end, scope.caller_deadline)
         deadline = end if deadline is None else min(end, deadline)
         retries = connect_retries = 0
     if _DEADLINE is not None:
@@ -1068,13 +1075,17 @@ def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7
     network_failures = 0
     while True:
         try:
-            s = readiness_get(box_id)
-        except NetworkError:
-            network_failures += 1
-            if not home.may_fail_over() or network_failures >= HOME_NETWORK_FAILURES:
-                raise
-            time.sleep(poll)
-            continue
+            s = readiness_get(box_id, deadline=deadline)
+        except NetworkError as error:
+            try:
+                s = home.recover_slow_read(error, lambda end: get(box_id, deadline=end), box=box_id,
+                                           deadline=deadline)
+            except NetworkError:
+                network_failures += 1
+                if not home.may_fail_over() or network_failures >= HOME_NETWORK_FAILURES:
+                    raise
+                time.sleep(poll)
+                continue
         network_failures = 0
         if s is None:
             raise OffboxError(f"box {box_id} disappeared")

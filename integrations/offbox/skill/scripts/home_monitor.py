@@ -214,16 +214,20 @@ def _run(args, timeout):
         return None
 
 
-def tailnet_facts(url=None):
+def tailnet_facts(url=None, *, timeout=5):
     """Is this Mac on the tailnet (BackendState Running and Self.Online), and what it knows of the box."""
     host = urllib.parse.urlsplit(url).hostname if url else None
     paths = ([os.environ["OFFBOX_TAILSCALE"]] if os.environ.get("OFFBOX_TAILSCALE") else []) + list(TAILSCALE_PATHS)
     seen = False
+    end = time.monotonic() + timeout
     for path in paths:
         if not os.access(path, os.X_OK):
             continue
+        left = end - time.monotonic()
+        if left <= 0:
+            break
         seen = True
-        result = _run([path, "status", "--json"], 5)
+        result = _run([path, "status", "--json"], left)
         try:
             data = json.loads(result.stdout) if result is not None else None
         except ValueError:
@@ -363,7 +367,7 @@ def backend_view(state):
             "reason": state["reason"] if down else "",
             "outage_id": (state.get("outage") or {}).get("id", "") if down else "",
             "degraded": list(state.get("degraded") or []), "last_outcome": state.get("last_verdict"),
-            "class": state.get("last_class"), "last_answer": state.get("last_answer"), "slow_since": state.get("slow_since"),
+            "class": state.get("last_class"), "last_answer": state.get("last_answer"), "boot_id": (state.get("last_ok_health") or {}).get("boot_id"), "slow_since": state.get("slow_since"),
             "flaps_today": state.get("flaps_today", {})}
 
 

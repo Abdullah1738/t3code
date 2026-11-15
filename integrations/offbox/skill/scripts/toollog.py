@@ -26,7 +26,7 @@ ENUMS = {
     "outcome": {"good", "bad", "indeterminate", "slow", "starting", "ready", "failover"},
     "peer_path": {"direct", "relay", "unknown"},
     "refresh_stage": {"idle", "zpool", "incus", "mullvad", "sqlite"},
-    "checkpoint": {"probe", "person", "post", "auto-stop", "request"},
+    "checkpoint": {"probe", "person", "post", "auto-stop", "request", "box-read"},
     "cmd_via": {"argv", "file"},
     "backend": {"home", "boat"}, "from": {"home", "boat"}, "to": {"home", "boat"},
     "reason": {"pinned", "home_up", "home_down", "unreachable", "boat_only", "boat_only_base", "infra", "cap", "busy", "person_home_down", "base_home_down"},

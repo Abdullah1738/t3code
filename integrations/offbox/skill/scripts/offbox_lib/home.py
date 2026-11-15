@@ -40,6 +40,7 @@ MAX_FAILURE_LINES = 200
 RECENT_FAILURE_S = 180
 RUN_ID_ENV = "OFFBOX_PREFLIGHT_RUN"
 INVOCATION_RUN = contextvars.ContextVar("home_invocation_run", default="")
+QUEUE_WAIT = contextvars.ContextVar("home_queue_wait", default=0.0)
 WAIT_STARTED = None
 PROBE_FACTS = contextvars.ContextVar("home_probe_facts", default=None)
 
@@ -48,9 +49,11 @@ PROBE_FACTS = contextvars.ContextVar("home_probe_facts", default=None)
 def run_identity():
     token = INVOCATION_RUN.set(os.environ.get("OFFBOX_BACKGROUND_RUN") or os.environ.get(RUN_ID_ENV)
                                or (common.new_id("run") if may_fail_over() else ""))
+    queue_token = QUEUE_WAIT.set(0.0)
     try:
         yield
     finally:
+        QUEUE_WAIT.reset(queue_token)
         INVOCATION_RUN.reset(token)
 
 
@@ -319,6 +322,138 @@ def _health(timeout: float = PROBE_TIMEOUT_S):
     return d
 
 
+def slow_read_reachable(deadline=None):
+    from home_monitor import tailnet_facts
+    url = health_url() or ""
+    def remaining(limit):
+        return limit if deadline is None else max(0, min(limit, deadline - time.monotonic()))
+    if remaining(PROBE_TIMEOUT_S) <= 0:
+        return True
+    if not tcp_connects(url, timeout=remaining(PROBE_TIMEOUT_S)):
+        return False
+    if remaining(5) <= 0:
+        return True
+    if tailnet_facts(url, timeout=remaining(5)).get("peer_online") is False:
+        return False
+    if remaining(PROBE_TIMEOUT_S) <= 0:
+        return True
+    data = _health(remaining(PROBE_TIMEOUT_S))
+    expected = common.home_state().get("boot_id")
+    if isinstance(data, dict):
+        actual = data.get("boot_id")
+        if expected and actual and expected != actual:
+            return False
+        if data.get("ok") is not True and not starting_phase(data):
+            return False
+        note_home_answer(ready=False)
+    return True
+
+
+def recover_slow_read(error, read, *, box, deadline=None):
+    """Retry a timed-out box observation in place; no allocation send is repeated here."""
+    from . import api, allocation, prepare
+    if not active():
+        raise error
+    queue = allocation._QUEUE.get()
+    if queue is not None:
+        QUEUE_WAIT.set(queue.get("queue_wait_s", max(0, queue['wait'] - (queue['end'] - time.monotonic()))))
+    if not timed_out(error):
+        raise error
+    if WAIT_BUDGET.get() is None:
+        with wait_budget():
+            return recover_slow_read(error, read, box=box, deadline=deadline)
+    began = time.monotonic()
+    begin_transient(began=began)
+    caller_ends = [end for end in (deadline, api._DEADLINE) if end is not None]
+    caller_end = min(caller_ends, default=None)
+    home_ends = [WAIT_BUDGET.get()["transient_since"] + wait_seconds()]
+    if wait_budget_end() is not None:
+        home_ends.append(wait_budget_end())
+    home_end = min(home_ends)
+
+    def check_caller():
+        allocation.check_queue()
+        if caller_end is not None and time.time() >= caller_end:
+            raise api.BudgetExpired(f"client deadline passed while reading {box}; nothing ran")
+
+    def check_bounds():
+        check_caller()
+        if time.monotonic() >= home_end:
+            raise StartWaitFailed("home still slow after its inherited wait limit (box-read)", invocation_run(), box)
+
+    def remaining(*, silence=True):
+        ends = [home_end]
+        if silence:
+            ends.append(slow_deadline(time.monotonic, began + slow_down_seconds()))
+        if caller_end is not None:
+            ends.append(time.monotonic() + max(0, caller_end - time.time()))
+        queue_left = allocation.queue_left()
+        if queue_left is not None:
+            ends.append(time.monotonic() + queue_left)
+        return max(0, min(ends) - time.monotonic())
+
+    def reachable():
+        check_bounds()
+        good = slow_read_reachable(deadline=time.monotonic() + remaining(silence=False))
+        check_bounds()
+        return good
+
+    if not reachable():
+        raise error
+
+    say(f"home box {box} is slow to answer; waiting up to {slow_probe_seconds():g} s, keeping the box and queue place")
+    result = {}
+    def retry(timeout):
+        check_bounds()
+        timeout = min(timeout, remaining())
+        if timeout <= 0:
+            return "no answer (TimeoutError)"
+        try:
+            queue_left = allocation.queue_left()
+            ends = [end for end in (caller_end, time.time() + max(0, home_end - time.monotonic()),
+                                    time.time() + queue_left if queue_left is not None else None)
+                    if end is not None]
+            with pre_start(invocation_run()), api.RequestScope(timeout, parent=api._REQUEST_SCOPE.get(), network_timeout=True,
+                                                               caller_deadline=min(ends, default=None)).active():
+                result['box'] = read(time.time() + timeout)
+            check_bounds()
+            return {"ok": True}
+        except (StartWaitFailed, api.BudgetExpired):
+            check_bounds()
+            raise
+        except api.NetworkError as next_error:
+            check_bounds()
+            if not timed_out(next_error) or not reachable():
+                raise
+            return "no answer (TimeoutError)"
+
+    def sleep(seconds):
+        time.sleep(min(seconds, remaining()))
+        check_bounds()
+
+    caller_bounds = [home_end]
+    if caller_end is not None:
+        caller_bounds.append(time.monotonic() + max(0, caller_end - time.time()))
+    queue_left = allocation.queue_left()
+    if queue_left is not None:
+        caller_bounds.append(time.monotonic() + queue_left)
+    budget = WAIT_BUDGET.get()
+    enclosing_end = budget["end"]
+    try:
+        with wait_budget(min(caller_bounds)), prepare.pause_for_home_start():
+            first = retry(slow_probe_seconds())
+            if isinstance(first, dict) and first.get("ok") is True:
+                return result['box']
+            why = wait_while_starting("slow", invocation_run(), checkpoint="box-read", box=box, read=retry,
+                                       deadline=began + slow_down_seconds(), sleep=sleep)
+            check_bounds()
+            if why:
+                raise StartWaitFailed(why, invocation_run(), box)
+            return result['box']
+    finally:
+        budget["end"] = enclosing_end
+
+
 def failure_class(reason):
     return "slow" if "home still slow" in reason else "starting" if "home still starting" in reason else "hard"
 
@@ -336,7 +471,7 @@ def record_failure(reason: str, run_id: str = "", *, base: str | None = None, ba
             monitor = common.home_state()
             classification = classification or failure_class(reason)
             lines.append(json.dumps({"class": classification, "monitor_last_check": monitor.get("last_check"),
-                                     "monitor_last_outcome": monitor.get("last_outcome"), "ts": time.time(), "reason": reason[:300], "run": run_id,
+                                     "monitor_last_outcome": monitor.get("last_outcome"), "queue_wait_s": round(QUEUE_WAIT.get(), 1), "ts": time.time(), "reason": reason[:300], "run": run_id,
                                      "base": base, "base_kept": base_kept}))
             tmp = common.HOME_FAILURES.with_name(common.HOME_FAILURES.name + f".{os.getpid()}.tmp")
             tmp.write_text("\n".join(lines) + "\n")
