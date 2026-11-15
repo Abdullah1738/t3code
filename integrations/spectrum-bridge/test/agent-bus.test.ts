@@ -26,6 +26,7 @@ function setup() {
     db: store.db, forSession: session => infos.find(chat => session === `session-${chat.slug}`),
     bySlug: slug => infos.find(chat => chat.slug === slug), isAdmin: chat => chat.slug === "moni",
     adminGroup: (caller, target) => caller.slug === "moni" && target.slug === "group-family",
+    groupMembers: () => ["Abdullah", "Moni", "Sam"],
     deliver: (target, text, key, receipt) => {
       if (fail || target.slug === failedSlug) throw new Error("delivery unavailable");
       if (!wakes.some(wake => wake.key === key)) wakes.push({ slug: target.slug, text, key, receipt });
@@ -59,6 +60,43 @@ test("missing sessions/targets are refused without logging supplied values", () 
   expect(env.ask("PRIVATE_SESSION").status).toBe(409);
   expect(env.ask("owner", "PRIVATE_TARGET").status).toBe(404);
   expect(JSON.stringify(env.logs)).not.toContain("PRIVATE");
+});
+
+test.each(["owner", "moni"])("group requests tell %s the audience and return the answer only to the group assistant", to => {
+  const env = setup();
+  const id = env.id(env.ask("group-family", to));
+  expect(env.wakes[0]?.text).toContain('This answer will be posted in the group "Family" (members: Abdullah, Moni, Sam).');
+  expect(env.wakes[0]?.text).toContain("Share only what is fine for everyone there to read.");
+  expect(env.wakes[0]?.text).toContain("If it's private and the person it belongs to isn't the one asking, say what can be shared instead.");
+  expect(env.answer(id, "done", to).status).toBe(202);
+  expect(env.wakes.map(wake => wake.slug)).toEqual([to, "group-family"]);
+  expect(env.wakes[1]?.text).toEndWith("\nPRIVATE_ANSWER");
+  expect(env.logs[0]).toEqual(["agent-ask", `group-family>${to} hop=1 group=1`]);
+  expect(JSON.stringify(env.logs)).not.toMatch(/PRIVATE|Family|Abdullah|Moni|Sam/);
+});
+
+test.each(["owner", "moni", "sam"])("%s DM requests have no group audience or group log flag", from => {
+  const env = setup();
+  env.ask(from, from === "owner" ? "moni" : "owner");
+  expect(env.wakes[0]?.text).not.toContain("This answer will be posted in the group");
+  expect(env.wakes[0]?.text).not.toContain("members:");
+  expect(env.logs[0]?.[1]).not.toContain("group=1");
+});
+
+test("unknown group members are explicit and group audience survives a second hop", () => {
+  const env = setup();
+  env.deps.groupMembers = () => [];
+  const root = env.id(env.ask("group-family", "owner"));
+  expect(env.wakes[0]?.text).toContain('(members: unknown)');
+  env.ask("owner", "moni", "forwarded", root);
+  expect(env.wakes[1]?.text).toContain('This answer will be posted in the group "Family" (members: unknown).');
+});
+
+test("a group answering a DM request still supplies its own audience when it asks another assistant", () => {
+  const env = setup();
+  const root = env.id(env.ask("owner", "group-family"));
+  env.ask("group-family", "moni", "followup", root);
+  expect(env.wakes[1]?.text).toContain('This answer will be posted in the group "Family" (members: Abdullah, Moni, Sam).');
 });
 
 test("dedupe is caller scoped and survives a new bus; changed payload does not redeliver", () => {

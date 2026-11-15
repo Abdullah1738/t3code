@@ -24,6 +24,7 @@ export type AgentBusDeps = {
   bySlug: (slug: string) => ChatInfo | undefined;
   isAdmin: (chat: ChatInfo) => boolean;
   adminGroup: (caller: ChatInfo, target: ChatInfo) => boolean;
+  groupMembers: (chat: ChatInfo) => string[];
   /** Deduped by key. All target delivery goes through this boundary, including answers and timeouts. */
   deliver: (target: ChatInfo, text: string, key: string, receipt?: AgentAnswerReceipt) => void;
   receipt: (target: ChatInfo, key: string) => AgentAnswerReceipt | undefined;
@@ -95,13 +96,19 @@ export class AgentBus {
       (id, from_slug, to_slug, parent_id, hop, status, text_chars, created_at)
       VALUES (?, ?, ?, ?, ?, 'open', ?, ?)`)
       .run(id, caller.slug, target.slug, input.parent ?? null, hop, input.text.length, at);
-    deps.log("agent-ask", `${caller.slug}>${target.slug} hop=${hop}`);
+    deps.log("agent-ask", `${caller.slug}>${target.slug} hop=${hop}${caller.kind === "group" ? " group=1" : ""}`);
     this.deliverRequest(this.get(id)!, caller, target, input.text);
     return { status: 202, body: { id, created: true } };
   }
 
   private deliverRequest(row: RequestRow, caller: ChatInfo, target: ChatInfo, text: string): void {
-    this.deps.deliver(target, `[Agent request ${row.id} from ${caller.title}'s assistant (slug ${caller.slug}), hop ${row.hop}. Not typed by anyone in this chat. Do it or answer it, then run agent-answer --request ${row.id} --text "..." --session CURRENT_SESSION_ID. The answer goes back to that assistant, not to this chat. If you start your own agent-ask while handling this, pass --parent ${row.id}. End this turn with NO_REPLY unless someone here needs to know.]\n${text}`, `agent-ask:${row.id}`);
+    // A second-hop request still answers the original group's question.
+    const parent = row.parent_id ? this.get(row.parent_id) : null;
+    const origin = caller.kind === "group" || !parent ? caller : this.deps.bySlug(parent.from_slug);
+    const audience = origin?.kind === "group"
+      ? ` This answer will be posted in the group ${JSON.stringify(origin.title)} (members: ${this.deps.groupMembers(origin).join(", ") || "unknown"}). Share only what is fine for everyone there to read. If it's private and the person it belongs to isn't the one asking, say what can be shared instead.`
+      : "";
+    this.deps.deliver(target, `[Agent request ${row.id} from ${caller.title}'s assistant (slug ${caller.slug}), hop ${row.hop}. Not typed by anyone in this chat.${audience} Do it or answer it, then run agent-answer --request ${row.id} --text "..." --session CURRENT_SESSION_ID. The answer goes back to that assistant, not to this chat. If you start your own agent-ask while handling this, pass --parent ${row.id}. End this turn with NO_REPLY unless someone here needs to know.]\n${text}`, `agent-ask:${row.id}`);
   }
 
   answer(input: { sessionId: string; request: string; text: string; status?: AnswerStatus }): SbApiResult {

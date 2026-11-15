@@ -621,6 +621,33 @@ describe("Sendblue socket API", () => {
     expect((await post("/agent-ask", { sessionId: "ses_group", to: "moni", text: "q", dedupeKey: "group" })).status).toBe(202);
   });
 
+  test.each(["roster", "seen-senders", "blank-roster", "unknown"])("group bus audience uses %s from that group's store", async source => {
+    const { post, chats, moniChat, line, ownerStore } = api();
+    const key = chatKey.group("GRP-Allowed-123");
+    const family = chats.open(key, "Family Trip");
+    const sink = chats.sink(async () => {});
+    const deps = { line, owner, ownerStore, access: async () => access, sink };
+    if (source !== "unknown") {
+      for (const [handle, from] of [["first", owner], ["second", "moni@example.com"], ["third", moni]] as const) {
+        await handleInbound(deps, message({ handle, chat: key, from,
+          participants: source === "roster" ? [owner, moni, "silent@example.com"] : source === "blank-roster" ? [" "] : [] }));
+      }
+    }
+    const other = chats.open(chatKey.group("other"));
+    other.store.acceptInbound("unrelated", { sender: "OTHER_GROUP_SECRET" });
+    family.store.set("route", { id: "ses_group", generation: 1 });
+    expect((await post("/agent-ask", { sessionId: "ses_group", to: "moni", text: "question", dedupeKey: "audience" })).status).toBe(202);
+    const wake = moniChat.store.pendingInbound().find(row => row.id.startsWith("wake:agent-bus:"))!.payload as { text: string };
+    expect(wake.text).toContain('This answer will be posted in the group "Family Trip"');
+    if (source === "unknown") expect(wake.text).toContain("members: unknown");
+    else {
+      expect(wake.text).toContain("Abdullah");
+      expect(wake.text.match(/Moni/g)).toHaveLength(1);
+      expect(wake.text.includes("silent@example.com")).toBe(source === "roster");
+    }
+    expect(wake.text).not.toContain("OTHER_GROUP_SECRET");
+  });
+
   test("agent routes validate bodies, reject missing/stale sessions, and respect readiness", async () => {
     const { post } = api(); const disabled = api(false).post;
     const request = `areq_${"a".repeat(64)}`;
