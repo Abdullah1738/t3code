@@ -9163,6 +9163,7 @@ const make = Effect.gen(function* () {
   const nudgeWorker = Effect.fn("KanbanService.nudgeWorker")(function* (
     threadId: ThreadId,
     planned: ReadonlyArray<KanbanCard>,
+    runtimeFailureRunId: string | null = null,
   ) {
     if (waking(threadId)) return;
     yield* parkWorkerWaits(threadId, planned);
@@ -9212,7 +9213,11 @@ const make = Effect.gen(function* () {
     if ((yield* threads.queuedRuns(threadId)).length > 0) return;
     const view = yield* freshThreads.find(threadId);
     const now = yield* nowMillis;
-    if (view?.state !== "idle" || Rules.waitingOnBackground(view, now)) return;
+    if (view?.state !== "idle") return;
+    if (runtimeFailureRunId !== null) {
+      const failure = yield* freshThreads.findLastFailure(threadId);
+      if (failure?.runId !== runtimeFailureRunId || !Rules.isRuntimeFailure(failure)) return;
+    } else if (Rules.waitingOnBackground(view, now)) return;
     const latestBoard = board ? yield* boardOf(board.id) : null;
     if ((yield* store.threadLink(threadId))?.paused || waking(threadId)) return;
     const latestCarried = yield* store.cardsByThread(threadId);
@@ -9239,6 +9244,10 @@ const make = Effect.gen(function* () {
         card.stalled !== null
       )
         continue;
+      if (runtimeFailureRunId !== null) {
+        if (Rules.failedTurnResumeDue(card, view, now)) first.push(card);
+        continue;
+      }
       const nudged =
         card.nudgedAt !== null && Rules.workerHandoffNudged(card, yield* store.cardEvents(card.id));
       // An evaluator-only step still gets its normal chance to advance before
@@ -9302,7 +9311,12 @@ const make = Effect.gen(function* () {
       if (!done) released.push(next);
       yield* kick;
     }
-    if (first.length > 0) yield* nudgeThread(threadId, first, Briefs.nudgeWorkText(first));
+    const recovery =
+      runtimeFailureRunId !== null
+        ? "Your turn ended on a tool-host or provider-runtime failure. Reconcile running commands and offbox runs first: use offbox wait <run> for the existing run. Never start a duplicate run or kill a running command as recovery. Then continue.\n\n"
+        : "";
+    if (first.length > 0)
+      yield* nudgeThread(threadId, first, recovery + Briefs.nudgeWorkText(first));
     for (const card of released)
       yield* noteDiscussion(card, `Card #${card.number}: Work thread idle; slot freed`).pipe(
         Effect.provideService(EvaluatorAnalytics.origin, "stall_run_failure"),
@@ -10019,6 +10033,16 @@ const make = Effect.gen(function* () {
       }
       // Paused: the card keeps its thread until probeOutages wakes it.
       if (outage !== null) return;
+      if (failure !== null && Rules.isRuntimeFailure(failure)) {
+        const fresh = yield* freshThreads.find(threadId);
+        if (fresh?.state !== "idle" || !(yield* failedRunIsCurrent())) return;
+        const latestFailure = yield* freshThreads.findLastFailure(threadId);
+        if (failure.runId == null || latestFailure?.runId !== failure.runId) return;
+        const now = yield* nowMillis;
+        const due = carried.filter((entry) => Rules.failedTurnResumeDue(entry, fresh, now));
+        if (due.length > 0) yield* nudgeWorker(threadId, due, failure.runId);
+        return;
+      }
       if (failure !== null) {
         // Pending work keeps a deferred wait owned until a later idle turn end.
         const recovering = carried.filter((entry) => !Rules.workerWaitDeferred(entry));
@@ -17593,8 +17617,9 @@ const make = Effect.gen(function* () {
     threadId: ThreadId,
   ) {
     yield* Deferred.await(startupReady);
-    for (const id of yield* store.threadCards(threadId)) {
-      const initial = yield* store.card(id);
+    // Discovery precedes the board operation; ownership is rechecked inside it.
+    for (const id of yield* rawStore.threadCards(threadId)) {
+      const initial = yield* rawStore.card(id);
       if (initial?.stalled?.runFailure?.threadId !== threadId) continue;
       yield* guard(
         "card.recoverRunFailure",

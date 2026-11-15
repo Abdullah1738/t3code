@@ -1,3 +1,14 @@
+import * as CheckpointRollbackService from "../../orchestration-v2/CheckpointRollbackService.ts";
+import * as RunFinalizationService from "../../orchestration-v2/RunFinalizationService.ts";
+import * as ProviderSessionManager from "../../orchestration-v2/ProviderSessionManager.ts";
+import * as ProviderTurnControlService from "../../orchestration-v2/ProviderTurnControlService.ts";
+import * as ProviderTurnStartService from "../../orchestration-v2/ProviderTurnStartService.ts";
+import * as RuntimeRequestService from "../../orchestration-v2/RuntimeRequestService.ts";
+import * as ThreadTitleRegenerationService from "../../orchestration-v2/ThreadTitleRegenerationService.ts";
+import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
+import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
+import * as EventSink from "../../orchestration-v2/EventSink.ts";
+import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { CommandId, RunId, ThreadId, type ServerSettingsError } from "@t3tools/contracts";
@@ -1408,6 +1419,72 @@ it.effect("failed decline cleanup retains ownership until its note can be closed
     );
   }).pipe(Effect.provide(h.layer));
 });
+
+it.effect(
+  "runtime recovery reaches provider start two minutes after death despite a routine restart backlog",
+  () => {
+    const h = harness({ maxActive: 4, spacingMs: 20000 });
+    const recovery = source(0);
+    h.runSources.set(recovery.sourceRunId, recovery);
+    h.priorities.set(recovery.sourceRunId, 0.5);
+    return Effect.gen(function* () {
+      const pacing = yield* RestartPacing.RestartPacing;
+      const death = yield* Clock.currentTimeMillis;
+      for (let id = 1; id <= 50; id++) {
+        h.priorities.set(source(id).sourceRunId, 2);
+        yield* pacing.register(source(id));
+      }
+      yield* TestClock.adjust("2 minutes");
+      const started = yield* Deferred.make<number>();
+      const executor = yield* EffectWorker.OrchestrationEffectExecutorV2.pipe(
+        Effect.provide(
+          EffectWorker.layerExecutor.pipe(
+            Layer.provide(
+              Layer.mergeAll(
+                Layer.mock(RunFinalizationService.RunFinalizationService)({}),
+                Layer.mock(CheckpointRollbackService.CheckpointRollbackServiceV2)({}),
+                Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({}),
+                Layer.mock(ProviderTurnControlService.ProviderTurnControlServiceV2)({}),
+                Layer.mock(RuntimeRequestService.RuntimeRequestServiceV2)({}),
+                Layer.mock(ThreadTitleRegenerationService.ThreadTitleRegenerationService)({}),
+                Layer.mock(ThreadManagementService.ThreadManagementService)({}),
+                Layer.mock(McpSessionRegistry.McpSessionRegistry)({}),
+                Layer.mock(EventSink.EventSinkV2)({}),
+                Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
+                ServerSettings.layerTest(),
+                Layer.mock(ProviderTurnStartService.ProviderTurnStartServiceV2)({
+                  start: () =>
+                    Clock.currentTimeMillis.pipe(
+                      Effect.flatMap((at) => Deferred.succeed(started, at)),
+                      Effect.asVoid,
+                    ),
+                }),
+              ),
+            ),
+          ),
+        ),
+      );
+      const at = DateTime.formatIso(yield* DateTime.now);
+      yield* executor.execute({
+        id: "runtime-resume",
+        commandId: CommandId.make("command:runtime-resume"),
+        threadId: recovery.threadId,
+        request: { type: "provider-turn.start", runId: recovery.sourceRunId },
+        status: "running",
+        attemptCount: 1,
+        availableAt: at,
+        leaseOwner: "test-worker",
+        leaseExpiresAt: at,
+        createdAt: at,
+        updatedAt: at,
+        completedAt: null,
+        lastError: null,
+      });
+      const providerStartedAt = yield* Deferred.await(started);
+      assert.equal(providerStartedAt - death, 120000);
+    }).pipe(Effect.provide(h.layer));
+  },
+);
 
 it.effect(
   "ten durable waiters drain at twenty second spacing, including sleeping successors",

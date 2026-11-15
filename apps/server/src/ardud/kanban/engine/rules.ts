@@ -393,6 +393,35 @@ export function workerQuietDue(
   return nowMs - since >= WORKER_QUIET_MS;
 }
 
+export const FAILED_TURN_RESUME_MS = 2 * 60 * 1000;
+
+export function isRuntimeFailure(failure: {
+  readonly class: string;
+  readonly category?: string | undefined;
+  readonly code: string | null;
+  readonly message: string;
+  readonly retryable?: boolean | null | undefined;
+}): boolean {
+  if (isOutage(failure)) return false;
+  if (failure.category !== undefined && failure.category !== "unknown") return false;
+  return failure.class === "transport_error" && failure.retryable === true;
+}
+
+/** Failure recovery ignores background work, but keeps the ordinary nudge window. */
+export function failedTurnResumeDue(
+  card: KanbanCard,
+  view: { readonly state: string; readonly quietSince: string },
+  nowMs: number,
+): boolean {
+  if (card.stage !== "working" || card.activeRole !== "work" || card.stalled !== null) return false;
+  if (view.state !== "idle") return false;
+  return (
+    nowMs - Math.max(Date.parse(view.quietSince), Date.parse(card.movedAt)) >=
+      FAILED_TURN_RESUME_MS &&
+    (card.nudgedAt === null || nowMs - Date.parse(card.nudgedAt) >= WORKER_QUIET_MS)
+  );
+}
+
 /** How long a thread whose turn ended may wait on its own background work before the board treats it as stopped. */
 export const BACKGROUND_GRACE_MS = 60 * 60 * 1000;
 
