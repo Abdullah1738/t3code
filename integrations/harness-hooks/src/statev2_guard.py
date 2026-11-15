@@ -1550,6 +1550,52 @@ def _strip_config_dir_db_names(source, directory):
     database = r'''(?:"state\.sqlite(?:-(?:wal|shm|journal))?"|'state\.sqlite(?:-(?:wal|shm|journal))?')'''
     join = r'(?<![\w$.])(?:path\.join|join|resolve)\s*\(\s*(?:os\.)?homedir\s*\(\s*\)\s*,\s*'
     config = r'''(?:"\.config"|'\.config')\s*,\s*(?P<tool>''' + string + r')\s*,\s*'
+    quoted = r'''//[^\n]*|/\*[\s\S]*?\*/|"(?:[^"\\]|\\[\s\S])*"|'(?:[^'\\]|\\[\s\S])*'|`(?:[^`\\]|\\[\s\S])*`'''
+    identifier = r'[A-Za-z_$][\w$]*'
+
+    def fixed_uses(match, array=False):
+        # Stored names retain evidence unless every use keeps the fixed config path.
+        declaration = re.search(r'\bconst\s+(' + identifier + r')\s*=\s*$', code[:match.start()])
+        if not declaration or not re.match(r'\s*;', code[match.end():]):
+            return False
+        for use in re.finditer(r'(?<![\w$])' + re.escape(declaration[1]) + r'(?![\w$])', source):
+            if use.span() == declaration.span(1):
+                continue
+            if not array:
+                return False
+            if re.match(r'\s*\.\s*includes\s*\(', code[use.end():]):
+                continue
+            loop = re.search(r'\bfor\s*\(\s*const\s+(' + identifier + r')\s+of\s*$', code[:use.start()])
+            opening = re.match(r'\s*\)\s*\{', code[use.end():])
+            if not loop or not opening or not fixed_stat():
+                return False
+            start = end = use.end() + opening.end()
+            depth = 1
+            while end < len(code) and depth:
+                depth += (code[end] == '{') - (code[end] == '}')
+                end += 1
+            if depth:
+                return False
+            for item in re.finditer(r'(?<![\w$])' + re.escape(loop[1]) + r'(?![\w$])', source[start:end - 1]):
+                at, after = start + item.start(), start + item.end()
+                if (not re.search(r'(?<![\w$.])stat\s*\(\s*$', code[start:at]) or
+                        not re.match(r'\s*[,)]', code[after:])):
+                    return False
+        return True
+
+    def fixed_stat():
+        imports = [item for item in re.finditer(r'''\bimport\s*\{[^{}]*\bstat\b[^{}]*\}\s*from\s*(["'])node:fs/promises\1''', source)
+                   if code[item.start():].startswith('import')]
+        for use in re.finditer(r'\bstat\b', source):
+            if any(item.start() <= use.start() < item.end() and
+                   re.search(r'(?:\{|,)\s*stat\s*(?:,|\})', item[0]) for item in imports):
+                continue
+            if code[:use.start()].rstrip().endswith('.') and re.match(r'\s*\(', code[use.end():]):
+                continue
+            if (not imports or not re.match(r'\s*\(', code[use.end():]) or
+                    re.search(r'\bfunction\s*\*?\s*$', code[:use.start()])):
+                return False
+        return bool(imports)
 
     def safe_tool(value):
         return (bool(re.fullmatch(r'[A-Za-z0-9_.-]+', value)) and value not in {'.', '..'} and
@@ -1558,7 +1604,8 @@ def _strip_config_dir_db_names(source, directory):
     def operand(match):
         if match['names'] is None:
             return literal(match)
-        if not safe_tool(match['tool'][1:-1]) or LIVE.search(match[0]):
+        if (not safe_tool(match['tool'][1:-1]) or LIVE.search(match[0]) or
+                not fixed_uses(match, array=match[0].startswith('['))):
             return match[0]
         start, end = match.span('names')
         names = re.sub(string, lambda item: "''" if re.fullmatch(database, item[0]) else item[0], match['names'])
@@ -1575,12 +1622,16 @@ def _strip_config_dir_db_names(source, directory):
         path = re.fullmatch(r'(?:~/|/(?:[^/]+/)*)\.config/([^/]+)/state\.sqlite(?:-(?:wal|shm|journal))?', value)
         if (path and safe_tool(path[1]) and '..' not in value.split('/') and
                 not any(char in value for char in ('\\', '$', '*', '?', '[')) and not LIVE.search(value) and
-                re.search(r'\b(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*$', source[:match.start()])):
+                fixed_uses(match)):
             return "''"
         return match[0]
 
-    quoted = r'''//[^\n]*|/\*[\s\S]*?\*/|"(?:[^"\\]|\\[\s\S])*"|'(?:[^'\\]|\\[\s\S])*'|`(?:[^`\\]|\\[\s\S])*`'''
+    # Prototype access can replace membership checks or iteration with a reader.
+    if re.search(r'\b(?:prototype|__proto__|getPrototypeOf|setPrototypeOf)\b', source):
+        return source
+    code = re.sub(quoted, lambda match: ' ' * len(match[0]), source)
     source = re.sub(array + '|' + quoted, operand, source)
+    code = re.sub(quoted, lambda match: ' ' * len(match[0]), source)
     return re.sub(join + config + r'(?P<names>' + database + r')\s*\)|' + quoted, operand, source)
 
 
