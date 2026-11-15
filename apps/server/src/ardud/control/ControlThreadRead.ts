@@ -78,14 +78,20 @@ const make = Effect.gen(function* () {
     }));
   });
 
-  const readRecords = Effect.fn("ControlThreadRead.readRecords")((threadId: string) =>
-    threads
-      .getThreadRecords(ThreadId.make(threadId), ["runs", "runtimeRequests", "turnItems"], {
-        turnItemTypes: ["approval_request", "user_input_request"],
+  const readRecords = Effect.fn("ControlThreadRead.readRecords")(function* (threadId: string) {
+    // Settled approvals can dwarf the recent runs; only pending requests need bodies.
+    const [records, pending] = yield* Effect.all([
+      threads.getThreadRecords(ThreadId.make(threadId), ["runs"], {
         recentRunLimit: RECENT_RUNS,
-      })
-      .pipe(Effect.mapError(readError)),
-  );
+      }),
+      store.pendingRequestRecords([threadId]),
+    ]).pipe(Effect.mapError(readError));
+    return {
+      runs: records.runs,
+      runtimeRequests: pending.map(({ request }) => request),
+      turnItems: pending.flatMap(({ item }) => (item === null ? [] : [item])),
+    };
+  });
 
   const detail = Effect.fn("ControlHttp.threadDetail")(function* (threadId: string) {
     const shell = yield* getShell(threadId);
