@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import errno
+import contextlib
 import json
 import math
 import os
@@ -484,6 +485,30 @@ def _imessage_render_stats(row):
     return (count, values) if sum(n for _, n in values) == count else None
 
 
+def _imessage_shared_renders(board, day):
+    import sqlite3
+    path = board_dir(board) / f'renders-{day}.sqlite'
+    components = {'cards', 'card-file', 'quick-renderer', 'delivery-renderer', 'ride-renderer', 'nutrition-renderer'}
+    kinds = {'quick', 'delivery', 'ride', 'nutrition', 'secure_form', 'other'}
+    groups = {}
+    try:
+        if path.is_symlink():
+            return []
+        with contextlib.closing(sqlite3.connect(path.absolute().as_uri() + '?mode=ro', uri=True)) as db:
+            for component, kind, chat, ms, count in db.execute('SELECT component, cardKind, chat, ms, count FROM bins'):
+                if (component not in components or kind not in kinds or chat not in {'owner', 'moni', 'other', 'unknown'}
+                        or type(ms) is not int or not 0 <= ms <= 1000 or type(count) is not int or not 1 <= count <= 2**53 - 1):
+                    continue
+                row = groups.setdefault((component, kind, chat), {'component': component, 'kind': 'perf', 'name': 'card.render',
+                    '_rollup_count': 0, '_rollup_ok': 0, '_rollup_failed': 0, '_rollup_histogram': [], '_rollup_synthetic': True})
+                row['_rollup_count'] += count
+                row['_rollup_ok'] += count
+                row['_rollup_histogram'].append((ms, count))
+    except (OSError, sqlite3.Error):
+        return []
+    return list(groups.values())
+
+
 def _imessage_rollup_records(board, day):
     def batch(row):
         identity = row.get('ids')
@@ -515,6 +540,8 @@ def _imessage_rollup_records(board, day):
     for line, row in pending:
         if (batch(row), _imessage_call_name(row)) not in represented:
             yield line, {**row, '_rollup_deferred': True}
+    for row in _imessage_shared_renders(board, day):
+        yield 0, row
 
 
 def rollup(board, day, top_n=20):
@@ -540,7 +567,7 @@ def rollup(board, day, top_n=20):
     total = oks = failed = errors = observed = 0
     records = _imessage_rollup_records(board, day) if board == 'imessage' else _read_records(board, day)
     for line_number, row in records:
-        if not (board == 'imessage' and row.get('_rollup_deferred')):
+        if not (board == 'imessage' and (row.get('_rollup_deferred') or row.get('_rollup_synthetic'))):
             recorded += line_number != last_record
             last_record = line_number
         if board == 'imessage' and row.get('_rollup_skip'):

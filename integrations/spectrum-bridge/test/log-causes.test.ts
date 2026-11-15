@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createToolLog, cardKind, logCardRender } from "../src/toollog.ts";
+import { renderCounts } from "../src/log-render-store.ts";
 import { captureLogs } from "./log-fixture.ts";
 import { parseLocalCommand, runLocalCommand } from "../src/cli.ts";
 
@@ -55,7 +56,8 @@ test("fast renders aggregate exactly; fallback, failed and slow renders retain c
     log.flush();
     const rows = readFileSync(join(root, `${day}.ndjson`), "utf8").trim().split("\n").map(row => JSON.parse(row));
     expect(rows.filter(row => row.name === "card.render")).toHaveLength(3);
-    expect(rows.filter(row => row.name === "card.renders").map(row => row.renders.count)).toEqual([100, 100, 50]);
+    expect(rows.filter(row => row.name === "card.renders")).toHaveLength(0);
+    expect(renderCounts(root, day).count).toBe(250);
     const result = await log.rollup(day);
     expect(result?.byComponent["delivery-renderer"]["card.render"]).toMatchObject({ count: 253, ok: 251, failed: 2, durationMs: { p50: 10, max: 1501 } });
     expect(result?.cardRenderFailures).toEqual({ preview_missing: 1, render_exception: 1 });
@@ -89,7 +91,8 @@ test.each(["turn.end", "bridge.stop"])("%s drains fast render counts before auto
     log.write({ component: "router", kind: "event", name });
     await log.settled();
     const rows = readFileSync(join(root, `${day}.ndjson`), "utf8").trim().split("\n").map(row => JSON.parse(row));
-    expect(rows[0]).toMatchObject({ name: "card.renders", renders: { count: 1 } });
+    expect(rows[0].name).toBe(name);
+    expect(renderCounts(root, day).count).toBe(1);
     if (name === "turn.end") expect(JSON.parse(readFileSync(join(root, `rollup-${day}.json`), "utf8")).countsByName["card.render"]).toBe(1);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

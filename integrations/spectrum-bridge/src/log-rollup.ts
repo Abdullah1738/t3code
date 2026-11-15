@@ -2,7 +2,7 @@ import type { LogLine } from "./toollog.ts";
 import { callName, percentiles } from "./log-calls.ts";
 import { createChainAggregation } from "./log-chains.ts";
 
-export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: AsyncIterable<LogLine>) {
+export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: AsyncIterable<LogLine>, renderLines: LogLine[] = []) {
   const countsByName: Record<string, number> = Object.create(null);
   const countsByKind: Record<string, number> = { event: 0, perf: 0, error: 0 };
   const durations = new Map<string, Map<number, number>>();
@@ -68,6 +68,10 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
       }
     } else if (line.name === "turn.robob_call" && line.kind === "perf") individualCalls.push(line);
     else consume(line);
+  }
+  // Shared counters represent fast renders without adding one NDJSON row per CLI process.
+  for (const line of renderLines) if (line.renders) {
+    consume({ ...line, name: "card.render", renders: undefined }, line.renders.count, line.renders.count, 0, line.renders.histogram);
   }
   // Later days complete this day's receipts without moving their event counts into this day.
   if (laterLines) for await (const line of laterLines) chainAggregation.accept(line, true);

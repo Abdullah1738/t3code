@@ -9,6 +9,7 @@ import { createInterface } from "node:readline";
 import { cleanCalls, createCallAggregation, type CallSummary } from "./log-calls.ts";
 import { summarizeLog } from "./log-rollup.ts";
 import { createChainAggregation } from "./log-chains.ts";
+import { recordRenderCounts, renderCounts } from "./log-render-store.ts";
 import { cleanRenders, createRenderAggregation, renderChat } from "./log-renders.ts";
 import { cleanSite, errorDetail, logSite, causeKey, type ErrorDetail } from "./log-error.ts";
 
@@ -129,7 +130,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
       if (maintainedDay !== day || maintainedRoot !== dir) {
         const cutoff = new Date(Date.parse(`${day}T00:00:00Z`) - 30 * 86400_000).toISOString().slice(0, 10);
         for (const file of readdirSync(dir)) {
-          const date = /^(?:rollup-)?(\d{4}-\d{2}-\d{2})(?:\.ndjson|\.json|\.cap|\.degraded)$/.exec(file)?.[1];
+          const date = /^(?:rollup-|renders-)?(\d{4}-\d{2}-\d{2})(?:\.ndjson|\.json|\.cap|\.degraded|\.sqlite(?:-journal|-wal|-shm)?)$/.exec(file)?.[1];
           if (date && date < cutoff) { try { unlinkSync(join(dir, file)); } catch { /* Best effort. */ } }
         }
         maintainedDay = day; maintainedRoot = dir;
@@ -149,7 +150,8 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
         const slowOrFailedCall = line.name === "turn.robob_call" && ((line.durationMs ?? 0) > 1_000 || line.ok === false);
         if (line.kind !== "error" && !["turn.start", "turn.end", "turn.robob_calls"].includes(line.name) && !slowOrFailedCall && !renderDetail) return;
       }
-      appendFileSync(fd, JSON.stringify(line) + "\n");
+      if (line.name === "card.renders" && line.renders) recordRenderCounts(dir, line);
+      else appendFileSync(fd, JSON.stringify(line) + "\n");
     } catch { /* Logging must never affect the caller. */ }
     finally { if (fd !== undefined) { try { closeSync(fd); } catch { /* Best effort. */ } } }
   }
@@ -198,8 +200,9 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
       const sources = chainSources(logSources(dir), day);
       const sourceBytes = sources[day] ?? 0;
       const later = Object.fromEntries(Object.entries(sources).filter(([date]) => date > day));
-      const result = { day, tool: "imessage", sourceBytes, chainSources: sources,
-        ...await summarizeLog(records(dir, { [day]: sourceBytes }), records(dir, later)) };
+      const renders = renderCounts(dir, day);
+      const result = { day, tool: "imessage", sourceBytes, renderSourceCount: renders.count, chainSources: sources,
+        ...await summarizeLog(records(dir, { [day]: sourceBytes }), records(dir, later), renders.lines) };
       await saveRollup(dir, day, result);
       return result;
     } catch { return; }
@@ -283,7 +286,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
     catch { return; }
   }
   function validOwnDay(saved: Rollup, day: string, bytes: number): saved is NonNullable<Rollup> {
-    return Boolean(saved?.day === day && saved.tool === "imessage" && saved.sourceBytes === bytes
+    return Boolean(saved?.day === day && saved.tool === "imessage" && saved.sourceBytes === bytes && saved.renderSourceCount === renderCounts(root(), day).count
       && Number.isSafeInteger(saved.total) && saved.total >= 0 && saved.byComponent && saved.chains && Array.isArray(saved.topErrorTags) && Array.isArray(saved.topCauses));
   }
   function recoverRollups(at: number, hourly: boolean, yesterday?: string): Promise<void> {
@@ -317,17 +320,22 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
       if (!stale.size) return;
       const chains = createChainAggregation();
       const summaries = new Map<string, Awaited<ReturnType<typeof summarizeLog>>>();
+      const renderSnapshots = new Map<string, ReturnType<typeof renderCounts>>();
       // Every file is streamed once for the entire sweep, including any daily counters needing a rebuild.
       for (const day of new Set([...Object.keys(sources), ...stale])) {
         async function* scan() {
           for await (const line of records(dir, { [day]: sources[day] ?? 0 })) { chains.accept(line); yield line; }
         }
-        if (stale.has(day) && !cached.has(day)) summaries.set(day, await summarizeLog(scan()));
+        if (stale.has(day) && !cached.has(day)) {
+          const renders = renderCounts(dir, day);
+          renderSnapshots.set(day, renders);
+          summaries.set(day, await summarizeLog(scan(), undefined, renders.lines));
+        }
         else for await (const _line of scan()) { /* Only chain milestones are needed for unchanged daily totals. */ }
       }
       for (const day of stale) {
         const base = cached.get(day) ?? summaries.get(day)!;
-        const result = { ...base, day, tool: "imessage", sourceBytes: sources[day] ?? 0,
+        const result = { ...base, day, tool: "imessage", sourceBytes: sources[day] ?? 0, renderSourceCount: cached.get(day)?.renderSourceCount ?? renderSnapshots.get(day)?.count ?? 0,
           chainSources: chainSources(sources, day), chains: chains.summary(day) };
         await saveRollup(dir, day, result);
       }

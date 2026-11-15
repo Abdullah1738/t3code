@@ -1,6 +1,7 @@
 import { appendFileSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { renderCounts } from "../src/log-render-store.ts";
 import { toolLog, type LogLine } from "../src/toollog.ts";
 
 export async function captureLogs(action: () => Promise<void>): Promise<LogLine[]> {
@@ -13,8 +14,9 @@ export async function captureLogs(action: () => Promise<void>): Promise<LogLine[
     await action();
     toolLog.flush();
     await toolLog.settled();
-    const lines = readdirSync(root).filter(file => file.endsWith(".ndjson")).flatMap(file =>
-      readFileSync(join(root, file), "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as LogLine));
+    const files = readdirSync(root).filter(file => file.endsWith(".ndjson"));
+    const lines = files.flatMap(file =>
+      readFileSync(join(root, file), "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as LogLine)).concat(files.flatMap(file => renderCounts(root, file.slice(0, 10)).lines));
     if (process.env.TOOLLOG_SAMPLE_FILE) appendFileSync(process.env.TOOLLOG_SAMPLE_FILE, lines.map(line => JSON.stringify(line) + "\n").join(""));
     return lines;
   } finally {
