@@ -6,7 +6,11 @@ import * as NodeSqlite from "node:sqlite";
 import * as NodeWorkerThreads from "node:worker_threads";
 import * as NodeChildProcess from "node:child_process";
 import { afterEach, expect, test, vi } from "vite-plus/test";
-import { createReadonlyReplica } from "./readonlyExport.ts";
+import {
+  createReadonlyReplica,
+  type ReadonlyExportDiagnosticEvent,
+  type ReadonlyRebuildEvent,
+} from "./readonlyExport.ts";
 import { resolveHistoryBasePath } from "./historySourceFiles.ts";
 
 const cleanups: Array<() => void> = [];
@@ -46,8 +50,14 @@ function fixture(batchSize = 2, setup?: (source: NodeSqlite.DatabaseSync) => voi
     if (source.isOpen) source.close();
   });
   setup?.(source);
+  const diagnostics: ReadonlyExportDiagnosticEvent[] = [];
   const options = { sourcePath, replicaPath, batchSize };
-  let exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, options);
+  const open = () =>
+    createReadonlyReplica(NodeSqlite, NodeFS, NodePath, {
+      ...options,
+      onDiagnosticEvent: (event) => diagnostics.push(event),
+    });
+  let exporter = open();
   cleanups.push(() => exporter.close());
   const connect = () => {
     const db = new NodeSqlite.DatabaseSync(replicaPath, { readOnly: true });
@@ -64,6 +74,7 @@ function fixture(batchSize = 2, setup?: (source: NodeSqlite.DatabaseSync) => voi
   return {
     source,
     options,
+    diagnostics,
     connect,
     finish,
     get exporter() {
@@ -71,7 +82,7 @@ function fixture(batchSize = 2, setup?: (source: NodeSqlite.DatabaseSync) => voi
     },
     restart() {
       exporter.close();
-      exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, options);
+      exporter = open();
     },
   };
 }
@@ -2677,7 +2688,18 @@ test.each([60_000, 60_001])(
     // Empty idle polls must not lose the completed scan high-water either.
     now += 1_000;
     expect(f.exporter.pollIdentities()).toBe(false);
+    const rebuildProgress = metaValue(out, "rebuild_progress");
+    f.diagnostics.length = 0;
     f.restart();
+    expect(f.diagnostics).toEqual([
+      {
+        event: "open",
+        sequence: events + 1,
+        identitySequence: events + 1,
+        sourceSequence: events + 1,
+      },
+    ]);
+    expect(metaValue(out, "rebuild_progress")).toBe(rebuildProgress);
     f.source
       .exec(`UPDATE orchestration_v2_projection_provider_threads SET payload_json='{"nativeThreadRef":{"nativeId":"after-restart"}}' WHERE provider_thread_id='binding';
       INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES ('provider-thread.updated','a','{"id":"binding"}');`);
@@ -2691,8 +2713,28 @@ test.each([60_000, 60_001])(
     ).toContain('"after-restart"');
     expect(metaValue(out, "sequence")).toBe(String(events + 1));
     expect(metaValue(out, "identity_sequence")).toBe(String(events + 2));
+    expect(f.diagnostics).toContainEqual({ event: "replay", replayEvents: 1, replayMs: 0 });
+    now += 1_000;
+    f.exporter.pollIdentities();
+    expect(f.diagnostics.filter(({ event }) => event === "replay")).toHaveLength(1);
   },
 );
+
+test("an idle restart reports an empty replay once without changing rebuild diagnostics", () => {
+  const f = fixture();
+  f.finish();
+  const out = f.connect();
+  const rebuildProgress = metaValue(out, "rebuild_progress");
+  f.diagnostics.length = 0;
+  f.restart();
+  expect(f.exporter.pollIdentities()).toBe(false);
+  expect(f.exporter.pollIdentities()).toBe(false);
+  expect(f.diagnostics).toEqual([
+    { event: "open", sequence: 1, identitySequence: 1, sourceSequence: 1 },
+    { event: "replay", replayEvents: 0, replayMs: expect.any(Number) },
+  ]);
+  expect(metaValue(out, "rebuild_progress")).toBe(rebuildProgress);
+});
 
 test("an abandoned cycle retains the committed identity cursor and replays a pending binding on restart", () => {
   const f = fixture(2);
@@ -2721,8 +2763,18 @@ test("an abandoned cycle retains the committed identity cursor and replays a pen
   f.exporter.pollIdentities();
   expect(metaValue(out, "identity_sequence")).toBe(cursor);
   expect(metaValue(out, "sequence")).toBe("1");
+  f.diagnostics.length = 0;
   f.restart();
-  for (let page = 0; page < 22; page++) f.exporter.pollIdentities();
+  expect(f.diagnostics).toEqual([
+    { event: "open", sequence: 1, identitySequence: Number(cursor), sourceSequence: 42 },
+  ]);
+  for (let page = 0; page < 22; page++) {
+    now += 10;
+    f.exporter.pollIdentities();
+    if (page < 20) expect(f.diagnostics).toHaveLength(1);
+  }
+  expect(f.diagnostics).toContainEqual({ event: "replay", replayEvents: 41, replayMs: 210 });
+  expect(f.diagnostics.filter(({ event }) => event === "replay")).toHaveLength(1);
   expect(
     out
       .prepare(
@@ -2927,12 +2979,26 @@ test.each([
   f.source.exec(
     `DROP TABLE orchestration_v2_projection_run_attempts; CREATE TABLE orchestration_v2_projection_run_attempts (${definition})`,
   );
-  const events: Array<{ kind: string; event: string }> = [];
+  f.source.exec(
+    "INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES ('thread.metadata-updated','a','{}')",
+  );
+  f.diagnostics.length = 0;
+  const events: ReadonlyRebuildEvent[] = [];
   const exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, {
     ...f.options,
-    onRebuildEvent: (event) => events.push(event),
+    onDiagnosticEvent: (event) => f.diagnostics.push(event),
+    onRebuildEvent: (event) => {
+      events.push(event);
+      if (event.event === "publish") {
+        expect(event.sequence).toBe(Number(metaValue(out, "sequence")));
+        expect(event.identitySequence).toBe(Number(metaValue(out, "identity_sequence")));
+      }
+    },
   });
   cleanups.push(() => exporter.close());
+  expect(f.diagnostics).toEqual([
+    { event: "open", sequence: 1, identitySequence: 1, sourceSequence: 2 },
+  ]);
   drive(exporter);
   expect(events.map(({ kind, event }) => [kind, event])).toEqual([
     ["full", "start"],
@@ -2940,6 +3006,7 @@ test.each([
   ]);
   expect(metaValue(out, "ready")).toBe("1");
   expect(Number(metaValue(out, "generation"))).toBe(generation + 1);
+  expect(events.at(-1)).toMatchObject({ sequence: 2, identitySequence: 2 });
 });
 
 test("a column backfill resumes after a worker restart without changing generation", () => {
