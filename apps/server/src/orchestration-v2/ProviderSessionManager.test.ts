@@ -6485,6 +6485,9 @@ function runIdleThreadUnloadScenario(
     ) => Effect.Effect<void>;
     readonly endTurn: (threadId: ThreadId, ordinal: number) => Effect.Effect<void>;
     readonly resume: (threadId: ThreadId) => Effect.Effect<void>;
+    readonly setRunStatus: (
+      status: "preparing" | "queued" | "starting" | "running" | "waiting" | "completed",
+    ) => Effect.Effect<void>;
     readonly subscribe: NonNullable<
       ProviderAdapter.ProviderAdapterV2SessionRuntime["subscribeEvents"]
     >;
@@ -6567,6 +6570,46 @@ function runIdleThreadUnloadScenario(
             runtimePolicy,
           });
         }).pipe(Effect.orDie);
+      const setRunStatus = Effect.fn("test.setRunStatus")(function* (
+        status: "preparing" | "queued" | "starting" | "running" | "waiting" | "completed",
+      ) {
+        const threadId = threadA;
+        const runId = idAllocator.derive.run({ threadId, ordinal: 1 });
+        yield* eventSink.write({
+          events: [
+            {
+              id: yield* idAllocator.allocate.event({ threadId }),
+              type: "provider-thread.updated",
+              threadId,
+              occurredAt: now,
+              payload: providerThreadOf(threadId),
+            },
+            {
+              id: yield* idAllocator.allocate.event({ threadId }),
+              type: "run.updated",
+              threadId,
+              occurredAt: now,
+              payload: {
+                id: runId,
+                threadId,
+                ordinal: 1,
+                providerInstanceId: modelSelection.instanceId,
+                modelSelection,
+                providerThreadId: providerThreadOf(threadId).id,
+                userMessageId: yield* idAllocator.allocate.message({ threadId, ordinal: 1 }),
+                rootNodeId: idAllocator.derive.rootNode({ runId }),
+                activeAttemptId: idAllocator.derive.runAttempt({ runId, attemptOrdinal: 1 }),
+                status,
+                requestedAt: now,
+                startedAt: null,
+                completedAt: status === "completed" ? now : null,
+                checkpointId: null,
+                contextHandoffId: null,
+              },
+            },
+          ],
+        });
+      }, Effect.orDie);
       const subscribe = runtime.subscribeEvents;
       assert.isDefined(subscribe);
       const endTurn = (threadId: ThreadId, ordinal: number) =>
@@ -6608,6 +6651,7 @@ function runIdleThreadUnloadScenario(
         endTurn,
         resume,
         subscribe: subscribe!,
+        setRunStatus,
       }).pipe(Effect.scoped);
     }).pipe(
       Effect.provide(
@@ -6626,6 +6670,29 @@ function runIdleThreadUnloadScenario(
     );
   });
 }
+
+it.effect.each(["preparing", "queued", "starting", "running", "waiting"] as const)(
+  "ProviderSessionManagerV2 keeps never-turned native state during %s preparation",
+  (status) =>
+    runIdleThreadUnloadScenario(
+      `pending-${status}`,
+      ({ state, threadA, resume, startTurn, endTurn, setRunStatus }) =>
+        Effect.gen(function* () {
+          yield* setRunStatus(status);
+          yield* resume(threadA);
+          // TestClock crosses the unload timer while the first native offer is still pending.
+          yield* TestClock.adjust("3 seconds");
+          assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+          const resumed = (yield* Ref.get(state)).resumeCount;
+          yield* startTurn(threadA, 1, { resume: false });
+          assert.equal((yield* Ref.get(state)).resumeCount, resumed);
+          yield* setRunStatus("completed");
+          yield* endTurn(threadA, 1);
+          yield* TestClock.adjust("1 second");
+          assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, [`native-${threadA}`]);
+        }),
+    ),
+);
 
 it.effect(
   "ProviderSessionManagerV2 unloads a shared-runtime thread left idle, and reloads it on its next turn",
