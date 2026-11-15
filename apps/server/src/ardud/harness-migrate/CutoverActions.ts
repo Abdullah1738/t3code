@@ -650,6 +650,7 @@ export const layer = Layer.effect(
                 runId: active.id,
                 commandId: command(item, `interrupt:${active.id}`),
                 reason: "Harness cutover",
+                cancelReason: "superseded",
               })
               .pipe(Effect.mapError(fail("interrupt")));
             return yield* new CutoverDeferred({

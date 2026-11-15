@@ -1045,6 +1045,8 @@ test('held queues drop only stale coordination pulses and keep old owner message
   assert.deepEqual(calls.commands.map((c) => [c.type, c.runId]), [
     ['queued-run.cancel', 'run:20'], ['queue.resume', undefined],
   ]);
+  assert.equal(calls.commands[0].reason, 'superseded');
+  assert.match(calls.commands[0].detail, /Stale coordination pulse/);
   assert.match(calls.send[0].text, /run:20, queued/);
   assert.match(calls.send[0].text, /held 3 queued message/);
   assert.equal(result.results[0].queueOk, true);

@@ -167,6 +167,7 @@ const make = Effect.gen(function* () {
             threadId,
             commandId: CommandId.make(`${stopCommandId}:delegated`),
             reason: "Context reset.",
+            cancelReason: "thread_reset",
           })
           .pipe(Effect.catchCause(stopFailed));
       }
@@ -180,6 +181,7 @@ const make = Effect.gen(function* () {
             commandId: CommandId.make(`${stopCommandId}:interrupt`),
             threadId,
             reason: "Context reset: stopping background work.",
+            cancelReason: "thread_reset",
           })
           .pipe(Effect.catchCause(stopFailed));
       }
@@ -192,6 +194,7 @@ const make = Effect.gen(function* () {
         threadId,
         providerSessionId: ProviderSessionId.make(scope.thread.providerSessionId),
         reason: "Context reset.",
+        cancelReason: "thread_reset",
       })
       .pipe(
         Effect.as(true),

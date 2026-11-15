@@ -2466,7 +2466,7 @@ export class Router {
     await this.updateTyping(false);
     if (old && turn && turn.id === old.id && turn.generation === old.generation && turn.directory === old.directory) {
       // A turn that won't stop can't take the nudge, so that /new escapes to a new thread.
-      await this.reading(this.backend.abort(old.id, old.directory), false).catch((caughtError) => { toolError("router", "router.catch19", caughtError); inPlace = false; });
+      await this.reading(this.backend.abort(old.id, old.directory, "thread_reset"), false).catch((caughtError) => { toolError("router", "router.catch19", caughtError); inPlace = false; });
     }
     if (old && inPlace) {
       this.store.db.transaction(() => {

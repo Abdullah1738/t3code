@@ -255,7 +255,7 @@ async function handleThread({ io, db, incident, threadId, subs, getActive, dryRu
     save();
     for (const r of staleHeld.filter((s) => queued.some((q) => q.run_id === s.run_id))) {
       io.assertReplicaFresh(db);
-      await io.dispatchCommand({ type: 'queued-run.cancel', commandId: `${incident.id}:cancel:${r.run_id}`, threadId, runId: r.run_id });
+      await io.dispatchCommand({ type: 'queued-run.cancel', commandId: `${incident.id}:cancel:${r.run_id}`, threadId, runId: r.run_id, reason: 'superseded', detail: 'Stale coordination pulse replaced during restart recovery.' });
     }
     if (sending) {
       // queue is also safe if a turn starts between the read and the send:

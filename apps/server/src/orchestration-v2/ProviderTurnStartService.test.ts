@@ -3414,12 +3414,29 @@ effectIt.effect.each(
           .filter(
             (cancelStartup) => !cancelStartup || (status !== "failed" && phase !== "registration"),
           )
-          .map((cancelStartup) => ({ phase, status, cancelStartup })),
+          .flatMap((cancelStartup) =>
+            (status === "failed"
+              ? [undefined]
+              : phase === "registration"
+                ? status === "cancelled"
+                  ? (["server_shutdown", "server_restart", "thread_delete"] as const)
+                  : ([
+                      "user_stop",
+                      "task_cancel",
+                      "thread_reset",
+                      "card_stop",
+                      "delegated_parent_cancelled",
+                      "superseded",
+                      "task_stalled",
+                    ] as const)
+                : ([status === "cancelled" ? "server_shutdown" : "user_stop"] as const)
+            ).map((cancelReason) => ({ phase, status, cancelStartup, cancelReason })),
+          ),
       ),
   ),
 )(
-  "records setup usage during $phase ending $status (cancel startup: $cancelStartup)",
-  ({ phase, status, cancelStartup }) =>
+  "records setup usage during $phase ending $status (cancel startup: $cancelStartup / $cancelReason)",
+  ({ phase, status, cancelStartup, cancelReason }) =>
     Effect.gen(function* () {
       const rows: AnalyticsEvent[] = [];
       const stopCommitted = yield* Deferred.make<void>();
@@ -3496,7 +3513,7 @@ effectIt.effect.each(
                 const current = harness.projection();
                 harness.setProjection({
                   ...current,
-                  runs: current.runs.map((run) => ({ ...run, status })),
+                  runs: current.runs.map((run) => ({ ...run, status, cancelReason })),
                 });
                 yield* Deferred.succeed(stopCommitted, undefined);
                 yield* Deferred.await(stopProcessed);
@@ -3513,7 +3530,7 @@ effectIt.effect.each(
                 const current = harness.projection();
                 harness.setProjection({
                   ...current,
-                  runs: current.runs.map((run) => ({ ...run, status })),
+                  runs: current.runs.map((run) => ({ ...run, status, cancelReason })),
                 });
                 yield* Deferred.succeed(stopCommitted, undefined);
                 yield* Deferred.await(stopProcessed);
@@ -3543,6 +3560,7 @@ effectIt.effect.each(
       const row = rows[0]!;
       if (!("runId" in row)) throw new Error("Missing usage");
       expect(row.endReason).toBe(status);
+      expect(row.cancelReason).toBe(cancelReason);
       expect(row.inputTokens).toBeNull();
       expect(row.wallMs).toBe(phase === "registration" ? 0 : 200);
       expect(row.turnCount).toBe(0);
