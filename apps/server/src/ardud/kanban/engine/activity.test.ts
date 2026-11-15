@@ -856,8 +856,82 @@ describe("card_get events page", () => {
     const giant = { card: card("g", { prompt: "G".repeat(70_000) }), threads: [] };
     const page = Activity.pageCardEvents(giant, events, undefined);
     expect(page.events).toEqual([]);
-    expect(page.note).toContain('events: "all"');
+    expect(page.note).toContain("before: olderEvents");
   });
+
+  it.each(["prompt", "threads"])("pages all 91 events when %s fills the first reply", (field) => {
+    const giant = {
+      card: card("g", { prompt: field === "prompt" ? "G".repeat(70_000) : "G" }),
+      threads:
+        field === "threads"
+          ? Array.from({ length: 1_000 }, () => ({ threadId: "t".repeat(80) }))
+          : [],
+    };
+    const history = Array.from({ length: 91 }, (_, index) =>
+      event("g", t("01:00"), "comment", null, null, `c${index}`),
+    );
+    const first = Activity.pageCardEvents(giant, history, { limit: 100 });
+    expect(first.events).toEqual([]);
+    expect(first.olderEvents).toBe(history.at(-1)!.id + 1);
+    const { id, number, title, stage, boardId } = giant.card;
+    const header = { card: { id, number, title, stage, boardId } };
+    const seen = [...first.events];
+    const cursors = new Set<number>();
+    let cursor = first.olderEvents;
+    for (let count = 0; cursor !== null && count < 200; count++) {
+      expect(cursors.has(cursor)).toBe(false);
+      cursors.add(cursor);
+      const page = Activity.pageCardEvents(header, history, { before: cursor, limit: 20 });
+      expect(JSON.stringify({ ...header, ...page }).length).toBeLessThanOrEqual(
+        Activity.CARD_GET_CHARS,
+      );
+      expect(page.eventsTotal).toBe(91);
+      if (page.olderEvents !== null) expect(page.olderEvents).toBeLessThan(cursor);
+      seen.unshift(...page.events);
+      cursor = page.olderEvents;
+    }
+    expect(cursor).toBeNull();
+    expect(seen.map((entry) => entry.id)).toEqual(history.map((entry) => entry.id));
+    expect(new Set(seen.map((entry) => entry.id)).size).toBe(91);
+  });
+
+  it.each([0, 2, 4])(
+    "skips an oversized event at index %i and reads every other event",
+    (index) => {
+      const history = Array.from({ length: 5 }, (_, i) =>
+        event("z", t("01:00"), "comment", null, null, i === index ? "H".repeat(70_000) : `c${i}`),
+      );
+      const seen: number[] = [];
+      const notes: string[] = [];
+      let cursor: number | undefined;
+      for (let count = 0; count < 20; count++) {
+        const page = Activity.pageCardEvents(rest, history, { before: cursor, limit: 2 });
+        seen.unshift(...page.events.map((entry) => entry.id));
+        if (page.note !== undefined) notes.push(page.note);
+        if (page.olderEvents === null) break;
+        if (cursor !== undefined) expect(page.olderEvents).toBeLessThan(cursor);
+        cursor = page.olderEvents;
+        expect(count).toBeLessThan(19);
+      }
+      expect(seen).toEqual(history.filter((_, i) => i !== index).map((entry) => entry.id));
+      expect(notes.join(" ")).toContain(`Event ${history[index]!.id}`);
+      expect(notes.join(" ")).toContain('events: "all"');
+      expect(Activity.pageCardEvents(rest, history, "all").events).toEqual(history);
+    },
+  );
+
+  it.each([1, 0.5])(
+    "stops instead of repeating or increasing a cursor with offset %s",
+    (offset) => {
+      const giant = { card: card("g", { prompt: "G".repeat(70_000) }), threads: [] };
+      const before = events.at(-1)!.id + offset;
+      const page = Activity.pageCardEvents(giant, events, { before });
+      expect(page.events).toEqual([]);
+      expect(page.olderEvents).toBeNull();
+      expect(page.note).toContain("cursor");
+      expect(page.note).toContain('events: "all"');
+    },
+  );
 
   it("a card with no events", () => {
     expect(Activity.pageCardEvents(rest, [], undefined)).toEqual({
