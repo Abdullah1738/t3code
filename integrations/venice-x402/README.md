@@ -39,7 +39,7 @@ OpenCode, funded from a dedicated wallet, sent through his Mullvad split tunnel.
 
 | Env | Default | Meaning |
 | --- | --- | --- |
-| `VENICE_X402_MAX_REQUEST_USD` | 0.50 | Worst-case cost per request. Input is over-estimated as body bytes/3 plus 2,000 tokens for the prompt Venice adds itself. `max_completion_tokens` is clamped to fit, and oversized requests get a 429 |
+| `VENICE_X402_MAX_REQUEST_USD` | unlimited | `unlimited`, `none` or `0` = no per-request limit (owner, 15 Nov 2026); a number caps the Worst-case cost per request. Input is over-estimated as body bytes/3 plus 2,000 tokens for the prompt Venice adds itself. `max_completion_tokens` is clamped to fit, and oversized requests get a 429 |
 | `VENICE_X402_MAX_DAILY_USD` | 1000 | Booked cost plus in-flight worst cases per Asia/Dubai day |
 | `VENICE_X402_TOPUP_USD` | 5 | Auto top-up size (Venice minimum is $5) |
 | `VENICE_X402_MAX_TOPUP_USD` | 5 | Per top-up payment |

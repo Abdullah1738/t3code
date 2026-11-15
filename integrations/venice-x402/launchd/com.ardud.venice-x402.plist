@@ -21,7 +21,7 @@
     <key>VENICE_X402_PORT</key>
     <string>43402</string>
     <key>VENICE_X402_MAX_REQUEST_USD</key>
-    <string>0.50</string>
+    <string>unlimited</string>
     <key>VENICE_X402_MAX_DAILY_USD</key>
     <string>1000</string>
     <key>VENICE_X402_TOPUP_USD</key>

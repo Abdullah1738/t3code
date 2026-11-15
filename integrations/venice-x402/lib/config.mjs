@@ -11,6 +11,14 @@ const num = (v, d) => {
   return n;
 };
 
+// Per-request cap: "unlimited", "none" or 0 means no per-request limit (owner, 15 Nov 2026).
+const capOrUnlimited = (v, d) => {
+  if (v === undefined || v === '') return d;
+  if (/^(unlimited|none|off|inf(inity)?)$/i.test(String(v).trim())) return Infinity;
+  const n = num(v, d);
+  return n === 0 ? Infinity : n;
+};
+
 // Fallback prices (USD per token) used when the live /models catalog is not
 // reachable. Live prices win only when they are higher (we never under-estimate).
 export const FALLBACK_MODELS = {
@@ -45,7 +53,7 @@ export function loadConfig(env = process.env) {
     ledgerFile: join(dataDir, 'ledger.jsonl'),
     timeZone: env.VENICE_X402_TZ || 'Asia/Dubai',
     // Spend caps (USD).
-    maxRequestUsd: num(env.VENICE_X402_MAX_REQUEST_USD, 0.5),
+    maxRequestUsd: capOrUnlimited(env.VENICE_X402_MAX_REQUEST_USD, Infinity),
     maxDailyUsd: num(env.VENICE_X402_MAX_DAILY_USD, 1000),
     // Top-ups move USDC from the wallet into Venice credit. Venice minimum is $5.
     autoTopUp: (env.VENICE_X402_AUTO_TOPUP ?? '1') !== '0',

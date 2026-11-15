@@ -53,6 +53,22 @@ test('estimate clamps output to the per-request cap and rejects huge inputs', ()
   assert.throws(() => estimateAndClamp({ messages: [{ content: 'x'.repeat(493_000) }], max_tokens: 4096 }, price, 0.5), /of 4096 requested/);
 });
 
+test('unlimited per-request cap never rejects or clamps', () => {
+  const big = { model: MODEL, messages: [{ role: 'user', content: 'x'.repeat(1_500_000) }], max_tokens: 32768 };
+  const e = estimateAndClamp(big, price, Infinity);
+  assert.equal(big.max_tokens, 32768);
+  assert.equal(e.clamped, false);
+  assert.ok(Number.isFinite(e.estUsd) && e.estUsd > 1);
+  const prev = process.env.VENICE_X402_MAX_REQUEST_USD;
+  for (const v of ['unlimited', 'none', '0']) {
+    process.env.VENICE_X402_MAX_REQUEST_USD = v;
+    assert.equal(loadConfig(process.env).maxRequestUsd, Infinity, v);
+  }
+  process.env.VENICE_X402_MAX_REQUEST_USD = '2.5';
+  assert.equal(loadConfig(process.env).maxRequestUsd, 2.5);
+  if (prev === undefined) delete process.env.VENICE_X402_MAX_REQUEST_USD; else process.env.VENICE_X402_MAX_REQUEST_USD = prev;
+});
+
 test('actual cost uses cached rate for cached prompt tokens', () => {
   const c = actualCost({ prompt_tokens: 1_000_000, completion_tokens: 1_000_000, prompt_tokens_details: { cached_tokens: 500_000 } }, price);
   assert.equal(c.costUsd, 1.5 + 0.15 + 5);
