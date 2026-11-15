@@ -52,7 +52,7 @@ import {
   type KanbanOwnerAsk,
   type KanbanParticipant,
   type KanbanPool,
-  type KanbanPoolChange,
+  KanbanPoolChange,
   type KanbanStage,
   type KanbanThreadLink,
   type KanbanWait,
@@ -367,6 +367,13 @@ export type WaitAnswerOutcome =
     };
 
 const decodeStandingApproval = Schema.decodeUnknownEffect(KanbanStandingApproval);
+const decodePoolChange = Schema.decodeUnknownEffect(KanbanPoolChange);
+const decodeBoardPoolChanges = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    boardId: KanbanBoardId,
+    poolChanges: Schema.optionalKey(Schema.Array(KanbanPoolChange)),
+  }),
+);
 
 export interface StandingApprovalInput {
   readonly action: "grant" | "revoke";
@@ -17488,19 +17495,38 @@ const make = Effect.gen(function* () {
                 at < end;
                 at += 86_400_000
               ) {
-                const result = yield* analytics.value.read({
-                  day: DateTime.formatIsoDateUtc(DateTime.makeUnsafe(at)),
-                  boardId,
-                  kind: "kanban.pool_change",
-                  limit: 1,
-                });
-                for (const board of result.rollup.boards)
-                  if (board.boardId === boardId)
+                let cursor: string | undefined;
+                do {
+                  const result = yield* analytics.value.read({
+                    day: DateTime.formatIsoDateUtc(DateTime.makeUnsafe(at)),
+                    boardId,
+                    kind: "kanban.pool_change",
+                    section: "boards",
+                    limit: 500,
+                    ...(cursor === undefined ? {} : { cursor }),
+                  });
+                  // A section contains whole small boards or nested rows of a large board.
+                  // The summary's rollup is only a preview, even when hasMore is false.
+                  for (const row of result.rows ?? []) {
+                    if (row.truncated)
+                      return yield* failWith(
+                        "invalid",
+                        "Pool change history contains a truncated row",
+                      );
+                    const changes =
+                      row.path.length === 1
+                        ? ((yield* decodeBoardPoolChanges(row.value)).poolChanges ?? [])
+                        : row.path.length === 3 && row.path[1] === "poolChanges"
+                          ? [yield* decodePoolChange(row.value)]
+                          : [];
                     poolChanges.push(
-                      ...(board.poolChanges ?? []).filter(
-                        (row) => row.at >= window.since && row.at < window.until,
-                      ),
+                      ...changes.filter((row) => row.at >= window.since && row.at < window.until),
                     );
+                  }
+                  if (result.hasMore && (result.cursor === undefined || result.cursor === cursor))
+                    return yield* failWith("invalid", "Pool change history cursor did not advance");
+                  cursor = result.hasMore ? result.cursor : undefined;
+                } while (cursor !== undefined);
               }
             }
             return { ...read, poolChanges };

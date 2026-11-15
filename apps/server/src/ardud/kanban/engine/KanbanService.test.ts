@@ -22720,38 +22720,44 @@ it.effect("a fully qualified model with a refused variant is named even with no 
   }),
 );
 
+const poolAnalyticsLayer = (events: AnalyticsEvent[]) => {
+  const pager = makeReadPager();
+  return Layer.mock(Analytics.Analytics)({
+    record: (event) =>
+      decodeAnalyticsEvent(event).pipe(
+        Effect.orDie,
+        Effect.andThen(
+          Effect.sync(() => {
+            events.push(event);
+          }),
+        ),
+      ),
+    flush: Effect.void,
+    read: (input) =>
+      Effect.sync(() => {
+        if (input.cursor !== undefined) {
+          const page = pager.resume(input);
+          assert.isDefined(page);
+          return page!;
+        }
+        const target = makeAccumulator();
+        for (const event of events)
+          if (
+            event.ts.startsWith(input.day) &&
+            event.boardId === input.boardId &&
+            event.kind === input.kind
+          )
+            accumulate(target, event);
+        return pager.read(input, finishRollup(target, input.day, `${input.day}T23:59:59.000Z`), []);
+      }),
+  });
+};
+
 it.effect("pool config changes record actors once, skip no-ops, and appear in activity", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
     const events: AnalyticsEvent[] = [];
-    const analyticsLayer = Layer.mock(Analytics.Analytics)({
-      record: (event) =>
-        decodeAnalyticsEvent(event).pipe(
-          Effect.orDie,
-          Effect.andThen(
-            Effect.sync(() => {
-              events.push(event);
-            }),
-          ),
-        ),
-      flush: Effect.void,
-      read: (input) =>
-        Effect.sync(() => {
-          const target = makeAccumulator();
-          for (const event of events)
-            if (
-              event.ts.startsWith(input.day) &&
-              event.boardId === input.boardId &&
-              event.kind === input.kind
-            )
-              accumulate(target, event);
-          return makeReadPager().read(
-            input,
-            finishRollup(target, input.day, `${input.day}T23:59:59.000Z`),
-            [],
-          );
-        }),
-    });
+    const analyticsLayer = poolAnalyticsLayer(events);
     yield* Effect.gen(function* () {
       const { kanban, board } = yield* toyBoard;
       events.length = 0;
@@ -22859,6 +22865,93 @@ it.effect("pool config changes record actors once, skip no-ops, and appear in ac
       );
     }).pipe(Effect.provide(testLayer(fake.layer).pipe(Layer.provide(analyticsLayer))));
   }),
+);
+
+it.effect.each([
+  { label: "empty", count: 0, crossesDay: false },
+  { label: "compact board", count: 1, crossesDay: false },
+  { label: "nested board", count: 60, crossesDay: false },
+  { label: "multiple pages beyond the preview", count: 501, crossesDay: false },
+  { label: "multiple days", count: 501, crossesDay: true },
+])(
+  "pool activity reads complete $label history before filtering its window",
+  ({ count, crossesDay }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const events: AnalyticsEvent[] = [];
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const analytics = yield* Analytics.Analytics;
+        events.length = 0;
+        const midnight = Date.parse("2026-11-14T00:00:00.000Z");
+        const start = crossesDay ? midnight - 500_000 : midnight;
+        const stamp = (at: number) => DateTime.formatIso(DateTime.makeUnsafe(at));
+        const expected = Array.from({ length: count }, (_, index) => ({
+          at: stamp(start + index * 1000),
+          poolKey: "codex/gpt-6.1-sol#xhigh",
+          fromSlots: index,
+          toSlots: index + 1,
+          op: "set" as const,
+          actorKind: "evaluator" as const,
+          actorId: "thread-evaluator",
+        }));
+        for (const { at, ...props } of expected)
+          yield* analytics.record({
+            ts: at,
+            kind: "kanban.pool_change",
+            boardId: board.id,
+            route: "kanban",
+            surface: "server",
+            props,
+          });
+        // Another board's change has the same timestamp and must never enter this history.
+        yield* analytics.record({
+          ts: stamp(start),
+          kind: "kanban.pool_change",
+          boardId: "board-other",
+          route: "kanban",
+          surface: "server",
+          props: {
+            poolKey: "codex/other#max",
+            fromSlots: 1,
+            toSlots: 2,
+            op: "set",
+            actorKind: "owner",
+            actorId: null,
+          },
+        });
+        const last = start + Math.max(0, count - 1) * 1000;
+        const all = yield* kanban.activity(board.id, {
+          since: stamp(start),
+          until: stamp(last + 1),
+        });
+        assert.deepEqual(all.poolChanges, expected);
+        const narrow = yield* kanban.activity(board.id, {
+          since: stamp(last),
+          until: stamp(last + 1),
+        });
+        assert.deepEqual(narrow.poolChanges, expected.slice(-1));
+        const empty = yield* kanban.activity(board.id, {
+          since: stamp(last + 1),
+          until: stamp(last + 2),
+        });
+        assert.deepEqual(empty.poolChanges, []);
+        if (count === 501 && !crossesDay) {
+          const preview = yield* analytics.read({
+            day: "2026-11-14",
+            boardId: board.id,
+            kind: "kanban.pool_change",
+          });
+          assert.isTrue(preview.truncated);
+          assert.isBelow(preview.rollup.boards[0]!.poolChanges!.length, count);
+          assert.isFalse(
+            preview.rollup.boards[0]!.poolChanges!.some((row) => row.at === expected.at(-1)!.at),
+          );
+        }
+      }).pipe(
+        Effect.provide(testLayer(fake.layer).pipe(Layer.provideMerge(poolAnalyticsLayer(events)))),
+      );
+    }),
 );
 
 it.effect("a pool whose model leaves the composer's list drops to 0 slots on the second tick", () =>
