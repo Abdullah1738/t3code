@@ -1663,8 +1663,26 @@ def _js_fixture_source(source):
         value = os.path.normpath(match[1])
         if value in live_parents or re.fullmatch(r'/(?:Users|home)/[^/]+|/root', value):
             return source
-    token = re.compile(r'''//[^\n]*|/\*[\s\S]*?\*/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|/(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\\n\[])+/[dgimsuvy]*|[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*|===|!==|==|!=|=>|(?:>>>|<<|>>|\*\*|&&|\|\||\?\?|[+*/%&|^-])=|\+\+|--|[^\s]''')
-    matches = [m for m in token.finditer(source) if not m[0].startswith(('//', '/*'))]
+    token = re.compile(r'''//[^\n]*|/\*[\s\S]*?\*/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*|===|!==|==|!=|=>|(?:>>>|<<|>>|\*\*|&&|\|\||\?\?|[+*/%&|^-])=|\+\+|--|[^\s]''')
+    regexp = re.compile(r'''/(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\\n\[])+/[dgimsuvy]*''')
+    regex_prefixes = {'(', '[', '=', ',', ':', ';', '?', '~', '+', '-', '*', '/', '%', '&', '|', '^',
+                      '==', '!=', '===', '!==', '=>', 'return', 'throw', 'case', 'typeof', 'void', 'delete', 'in', 'instanceof'}
+    matches, position = [], 0
+    while (match := token.search(source, position)) is not None:
+        if match[0] == '/':
+            previous = re.sub(r'\s+', '', matches[-1][0]) if matches else ''
+            # A division sign must not swallow the following assignments as a
+            # regex. Block/control endings need a parser, so retain the scan.
+            if not previous or previous in regex_prefixes or re.fullmatch(r'(?:>>>|<<|>>|\*\*|&&|\|\||\?\?|[+*/%&|^-])?=', previous):
+                match = regexp.match(source, match.start())
+                if match is None:
+                    return source
+            elif previous in {')', '}', '!', '<', '>', 'of', 'yield', 'await'} or not (re.fullmatch(r'[\w$]+(?:\.[\w$]+)*', previous) or
+                    previous[:1] in {'"', "'", '`', '/'} or previous in {']', '++', '--'}):
+                return source
+        position = match.end()
+        if not match[0].startswith(('//', '/*')):
+            matches.append(match)
     words = [re.sub(r'\s+', '', m[0]) if m[0][0] not in "\"'`" else m[0] for m in matches]
     scopes, parents, stack = [], {0: None}, [0]
     for i, word in enumerate(words):
@@ -1719,7 +1737,8 @@ def _js_fixture_source(source):
             brackets.append(i)
         elif word in {']', '}', ')'} and brackets:
             openings[i] = brackets.pop()
-        if word in {']', '}', ')', '!'} and words[i + 1:i + 2] and re.fullmatch(r'(?:>>>|<<|>>|\*\*|&&|\|\||\?\?|[+*/%&|^-])?=', words[i + 1]):
+        if word in {']', '}', ')', '!'} and words[i + 1:i + 2] and (
+                words[i + 1] in {'of', 'in'} or re.fullmatch(r'(?:>>>|<<|>>|\*\*|&&|\|\||\?\?|[+*/%&|^-])?=', words[i + 1])):
             start = openings.get(i, i)
             for n in range(max(0, start - 1), i):
                 invalid.add(binding(words[n], n))

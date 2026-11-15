@@ -2181,6 +2181,60 @@ import {join} from 'node:path';
             ('computed override', f'const fixture = {{root: mkdtempSync(tmpdir()), [key]: {home}}};'),
         ))
 
+    def test_js_temp_database_iteration_pattern_writes(self):
+        home = "['', 'Users', 'ardud'].join('/')"
+        setup = "let root = mkdtempSync(join(tmpdir(), 'guard95-')); "
+        read = "readFileSync(join(root, '.robob/userdata/statev2.sqlite'));"
+        patterns = [('[root]', f'[[{home}]]'),
+                    ('{value: root}', f'[{{value: {home}}}]'),
+                    ('{nested: [root]}', f'[{{nested: [{home}]}}]'),
+                    ('[{value: root}]', f'[[{{value: {home}}}]]'),
+                    ('[...root]', f'[[{home}]]'),
+                    (f'{{value: root = {home}}}', '[{}]')]
+        self.js_mutation_cases((form + ' ' + pattern,
+            setup + f'{form} ({pattern} of {values}) {{}}' + read)
+            for pattern, values in patterns for form in ('for', 'for await'))
+        self.js_mutation_cases(('for-in ' + pattern,
+            setup + f'for ({pattern} in {{[{home}]: 1}}) {{}}' + read)
+            for pattern in ('[root]', '{value: root}', '{nested: [root]}'))
+        self.js_mutation_cases(('property loop ' + pattern,
+            'const fixture = {root: mkdtempSync(tmpdir())}; ' +
+            f'for ({pattern} of {values}) {{}}' +
+            "readFileSync(join(fixture.root, '.robob/userdata/statev2.sqlite'));")
+            for pattern, values in (('[fixture.root]', f'[[{home}]]'),
+                                    ('{value: fixture.root}', f'[{{value: {home}}}]')))
+
+    def test_js_temp_database_slash_lexing(self):
+        home = "const homeRoot = ['', 'Users', 'ardud'].join('/'); "
+        scalar = "let root = mkdtempSync(tmpdir()); " + home
+        receiver = "const fixture = {root: mkdtempSync(tmpdir())}; " + home
+        read = "readFileSync(join(root, '.robob/userdata/statev2.sqlite'));"
+        divisions = ('1 / 2', 'numerator / denominator', 'getValue() / 2',
+                     'values[0] / 2', '1 / /value/.test(value)', '1 /\n2',
+                     '1 / /* comment */ 2', 'of / 2', 'value! / 2', 'value<number> / 2')
+        self.js_mutation_cases((value + ' ' + label,
+            setup + f'let fraction = {value}; {write}; fraction = {value};' + tail)
+            for value in divisions for label, setup, write, tail in (
+                ('scalar', scalar, 'root = homeRoot', read),
+                ('receiver', receiver, 'Object.assign(fixture, {root: homeRoot})',
+                 read.replace('root,', 'fixture.root,'))))
+        imports = ("import {mkdtempSync} from 'node:fs'; import {tmpdir} from 'node:os'; "
+                   "import {join} from 'node:path'; ")
+        # Regexes in known expression positions and ordinary arithmetic do not
+        # mutate the fixture. Control-flow slashes keep the original scan.
+        for expression in ('const regex = /root = live; \\/ [a-z]/gi;',
+                           'check(/root = live/);', 'function pattern() { return /root = live/; }',
+                           'let fraction = 1 / 2; fraction /= 2;'):
+            self.write('slash.test.ts', imports + 'const root = mkdtempSync(tmpdir()); ' +
+                       expression + "const path = join(root, 'state.sqlite');")
+            for command in ('node --test slash.test.ts', 'bun test slash.test.ts'):
+                with self.subTest(expression=expression, command=command):
+                    self.assertIsNone(self.classify(command))
+        self.js_mutation_cases((label, setup + code + tail) for label, setup, code, tail in (
+            ('control regex', scalar, 'if (ready) /root = live/.test(value); root = homeRoot;', read),
+            ('block regex', receiver, '{} /value/.test(value); Object.assign(fixture, {root: homeRoot});',
+             read.replace('root,', 'fixture.root,'))))
+
     def test_js_temp_database_parameter_bindings_shadow_outer_roots(self):
         imports = '''import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
