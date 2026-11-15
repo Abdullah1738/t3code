@@ -155,6 +155,33 @@ export class PullRequestWatchTimeoutError extends Schema.TaggedError<PullRequest
   }
 }
 
+export class PullRequestToolTimeoutError extends Schema.TaggedError<PullRequestToolTimeoutError>()(
+  "PullRequestToolTimeoutError",
+  {
+    tool: Schema.Literals([
+      "link_pull_request",
+      "unlink_pull_request",
+      "list_thread_pull_requests",
+      "write_pull_request_guides",
+      "read_pull_request_guide",
+    ]),
+    saved: Schema.Union([Schema.Boolean, Schema.Literal("unknown")]),
+  },
+) {
+  override get message(): string {
+    if (this.tool === "list_thread_pull_requests" || this.tool === "read_pull_request_guide")
+      return `${this.tool} timed out. Server busy, nothing changed; retry shortly.`;
+    if (this.tool === "write_pull_request_guides")
+      return this.saved === false
+        ? "Writing pull request guides timed out. Nothing was started; retry shortly."
+        : "Writing pull request guides timed out. Some runs may have started; call read_pull_request_guide for each pull request before retrying.";
+    const status = this.saved === false ? "Nothing was saved." : "The change may have been saved.";
+    const action = this.tool === "link_pull_request" ? "link" : "unlink";
+    const noop = action === "link" ? "already linked" : "already unlinked";
+    return `${this.tool} timed out. ${status} Call list_thread_pull_requests to check before retrying; retrying ${action} is safe (it is a no-op when ${noop}).`;
+  }
+}
+
 export class PullRequestNotOpenError extends Schema.TaggedError<PullRequestNotOpenError>()(
   "PullRequestNotOpenError",
   { state: Schema.String },
@@ -213,6 +240,7 @@ export const PullRequestToolError = Schema.Union([
   PullRequestListFailedError,
   PullRequestWatchFailedError,
   PullRequestWatchTimeoutError,
+  PullRequestToolTimeoutError,
   PullRequestNotOpenError,
   PullRequestWatchFromSubagentError,
   PullRequestProjectNotFoundError,
@@ -295,7 +323,7 @@ export const ListThreadPullRequestsResult = Schema.Struct({
 export type ListThreadPullRequestsResult = typeof ListThreadPullRequestsResult.Type;
 
 const LinkPullRequestTool = Tool.make("link_pull_request", {
-  description: `${REGISTER_EVERY_PR} Links a pull request to this thread so T3 Code tracks it, shows its status beside the thread, and settles the thread when it merges. Pass the URL, or repository plus number. Linking an already-linked pull request succeeds with alreadyLinked=true.`,
+  description: `${REGISTER_EVERY_PR} Links a pull request to this thread so T3 Code tracks it, shows its status beside the thread, and settles the thread when it merges. Pass the URL, or repository plus number. Linking an already-linked pull request succeeds with alreadyLinked=true. On timeout, check with list_thread_pull_requests before retrying.`,
   parameters: PullRequestTargetInput,
   success: LinkPullRequestResult,
   failure: PullRequestToolError,
@@ -309,7 +337,7 @@ const LinkPullRequestTool = Tool.make("link_pull_request", {
 
 const UnlinkPullRequestTool = Tool.make("unlink_pull_request", {
   description:
-    "Remove a pull request link from this thread, for example after closing a pull request you opened by mistake. Pass the URL, or repository plus number. Unlinking a pull request that is not linked succeeds with wasLinked=false.",
+    "Remove a pull request link from this thread, for example after closing a pull request you opened by mistake. Pass the URL, or repository plus number. Unlinking a pull request that is not linked succeeds with wasLinked=false. On timeout, check with list_thread_pull_requests before retrying.",
   parameters: PullRequestTargetInput,
   success: UnlinkPullRequestResult,
   failure: PullRequestToolError,
@@ -322,7 +350,7 @@ const UnlinkPullRequestTool = Tool.make("unlink_pull_request", {
   .annotate(Tool.OpenWorld, false);
 
 const ListThreadPullRequestsTool = Tool.make("list_thread_pull_requests", {
-  description: `List the pull requests linked to a thread (omit threadId for this thread) with their last known host state, and how they chain into stacks (bottom to top). ${REGISTER_EVERY_PR}`,
+  description: `List the pull requests linked to a thread (omit threadId for this thread) with their last known host state, and how they chain into stacks (bottom to top). ${REGISTER_EVERY_PR} On timeout, retry shortly.`,
   parameters: Schema.Struct({
     threadId: Schema.optional(
       ThreadId.annotate({ description: "Thread to list. Omit for this thread." }),
@@ -401,7 +429,7 @@ export type ReadPullRequestGuideResult = typeof ReadPullRequestGuideResult.Type;
 
 const WritePullRequestGuidesTool = Tool.make("write_pull_request_guides", {
   description:
-    "Write review guides for up to 20 pull requests, the tour a maintainer reads in a pull request's Guide tab. Each run reads its change in a temporary checkout and takes minutes, so this returns once the runs are under way; read a guide with read_pull_request_guide to see when it is written. A guide for the same head that is already running is joined, not restarted; a pull request whose guide is current is written again. Each pull request is read through the project in this environment whose checkout has that repository. Fails while review guides are off on this server.",
+    "Write review guides for up to 20 pull requests, the tour a maintainer reads in a pull request's Guide tab. Each run reads its change in a temporary checkout and takes minutes, so this returns once the runs are under way; read a guide with read_pull_request_guide to see when it is written. A guide for the same head that is already running is joined, not restarted; a pull request whose guide is current is written again. Each pull request is read through the project in this environment whose checkout has that repository. Fails while review guides are off on this server. On timeout, check each PR with read_pull_request_guide before retrying.",
   parameters: Schema.Struct({
     pullRequests: Schema.Array(GuideTarget).check(Schema.isMinLength(1), Schema.isMaxLength(20)),
   }),
@@ -417,7 +445,7 @@ const WritePullRequestGuidesTool = Tool.make("write_pull_request_guides", {
 
 const ReadPullRequestGuideTool = Tool.make("read_pull_request_guide", {
   description:
-    "Read a pull request's stored review guide and its run: run.Running while one is being written, run.Failed with the reason when the last one failed, guide null when none was written. stale is true after a push the guide has not caught up with. Never starts a run.",
+    "Read a pull request's stored review guide and its run: run.Running while one is being written, run.Failed with the reason when the last one failed, guide null when none was written. stale is true after a push the guide has not caught up with. Never starts a run. On timeout, retry shortly.",
   parameters: GuideTarget,
   success: ReadPullRequestGuideResult,
   failure: PullRequestToolError,

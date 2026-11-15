@@ -212,11 +212,12 @@ def memory_fields(values, event):
 
 
 def cpu_fields(values):
-    from cpu_labels import janitor_redact
+    from cpu_labels import janitor_redact, SystemFamily, SECRET_LABEL, command_label
     result = {}
     numeric = {'windowS', 'cpuS', 'totalCpuPct', 'ncpu', 'processCount', 'runnable',
                'uninterruptible', 'pid', 'ppid', 'count', 'cpuPct', 'rssMb',
-               'skippedLines', 'badLines', 'lines', 'exiting'}
+               'skippedLines', 'badLines', 'lines', 'exiting', 'systemCpuPct',
+               'userPct', 'sysPct', 'unattributedCpuPct', 'spawned', 'exited'}
 
     def number(value):
         return finite_number(value) and 0 <= value <= 1e15
@@ -224,6 +225,8 @@ def cpu_fields(values):
     def label(value, limit):
         if not isinstance(value, str):
             return None
+        if isinstance(value, SystemFamily) and '/' not in value and not SECRET_LABEL.search(value):
+            return str(value)[:limit]
         try:
             value = janitor_redact(value)
         except (ImportError, OSError):
@@ -239,23 +242,30 @@ def cpu_fields(values):
             result[key] = value
         elif key == 'badLine':
             result[key] = label(value, 200)
-        elif key in ('failure', 'hintError') and (value is None or value in MEMORY_ERRORS):
+        elif key in ('failure', 'hintError', 'systemCpuError', 'commandError', 'threadError') and (value is None or value in MEMORY_ERRORS):
             result[key] = value
         elif key == 'load' and (value is None or isinstance(value, list)):
             result[key] = None if value is None else [n for n in value[:3] if number(n)]
-        elif key in ('top', 'families') and isinstance(value, list):
+        elif key in ('top', 'families', 'spawnedFamilies', 'runnableThreadsByFamily') and isinstance(value, list):
             result[key] = []
-            for proc in value[:20 if key == 'top' else 15]:
+            for proc in value[:{'top': 20, 'families': 15, 'spawnedFamilies': 8, 'runnableThreadsByFamily': 8}[key]]:
                 if not isinstance(proc, dict):
                     continue
-                keys = ('pid', 'ppid', 'family', 'hint', 'cpuS', 'cpuPct', 'rssMb', 'etime') if key == 'top' else ('family', 'count', 'cpuPct', 'rssMb')
+                keys = (('pid', 'ppid', 'family', 'parentFamily', 'state', 'hint', 'cpuS', 'cpuPct', 'rssMb', 'etime', 'cmd', 'parentCmd')
+                        if key == 'top' else ('family', 'count', 'cpuPct', 'parentFamily')
+                        if key == 'spawnedFamilies' else ('family', 'count')
+                        if key == 'runnableThreadsByFamily' else ('family', 'count', 'cpuPct', 'rssMb'))
                 clean = {}
                 for field in keys:
                     item = proc.get(field)
                     if field in numeric and number(item):
                         clean[field] = item
-                    elif field in ('family', 'hint'):
-                        clean[field] = label(item, 40 if field == 'family' else 72)
+                    elif field in ('family', 'parentFamily', 'hint'):
+                        clean[field] = label(item, 72 if field == 'hint' else 64)
+                    elif field in ('cmd', 'parentCmd') and field in proc:
+                        clean[field] = command_label(item) if isinstance(item, str) else None
+                    elif field == 'state' and isinstance(item, str) and re.fullmatch(r'[A-Za-z?+<>-]{1,16}', item):
+                        clean[field] = item
                     elif field == 'etime' and isinstance(item, str) and re.fullmatch(r'\d+(?:-\d+)?(?::\d+){1,2}', item):
                         clean[field] = item[:32]
                 result[key].append(clean)
@@ -263,7 +273,21 @@ def cpu_fields(values):
 
 
 def safe_fields(values, event=None):
-    if event == 'cpu.sample':
+    if event and event.startswith('tailnet.'):
+        result = {}
+        for key, value in (values or {}).items():
+            if key == 'backendState' and value in ('Running', 'Stopped', 'NeedsLogin', 'NeedsMachineAuth', 'Starting', 'NoState', 'Unknown'):
+                result[key] = value
+            elif key in ('statusError', 'extensionError', 'homeProbeError') and value in (None, 'timeout', 'exit', 'parse', 'unavailable'):
+                result[key] = value
+            elif key in ('up', 'selfOnline', 'timedOut', 'homeReachable') and (value is None or type(value) is bool):
+                result[key] = value
+            elif key in ('tailscaleIPsCount', 'exitCode', 'extensionPid', 'notUpChecks', 'outageStart') and (value is None or type(value) is int):
+                result[key] = value
+            elif key == 'extensionPids' and (value is None or isinstance(value, str) and re.fullmatch(r'[0-9 ]{1,180}', value)):
+                result[key] = value
+        return result
+    if event in ('cpu.sample', 'cpu.spike'):
         return cpu_fields(values)
     if event == 'disk.clone_wedge':
         result = {k: v for k, v in disk_wait_fields(values).items()
@@ -365,11 +389,12 @@ def record(component, kind, name, now, duration_ms=None, ok=None, ids=None, prop
             if lines:
                 message = '[redacted]' if SECRET.search(lines[0]) else lines[0][:300]
         row['error'] = dict(tag=error_tag, message=message)
-    if name == 'cpu.sample':
-        # 1440 bounded lines/day stay below 12 MB, even with hostile labels.
-        while len((json.dumps(row, separators=(',', ':'), allow_nan=False)+'\n').encode()) > 8192:
+    if name in ('cpu.sample', 'cpu.spike'):
+        # Leave room for 240 spike lines and the other jobs in the daily file.
+        limit = 7000 if name == 'cpu.sample' else 8192
+        while len((json.dumps(row, separators=(',', ':'), allow_nan=False)+'\n').encode()) > limit:
             props = row['props']
-            key = 'top' if props.get('top') else 'families'
+            key = next((k for k in ('top', 'families', 'spawnedFamilies', 'runnableThreadsByFamily') if props.get(k)), None)
             if not props.get(key):
                 break
             props[key].pop()

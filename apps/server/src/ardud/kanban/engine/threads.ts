@@ -127,8 +127,8 @@ export interface KanbanSendInput {
   readonly isStale?: () => boolean;
   /** Switch the thread to this model for the turn the message starts. */
   readonly model?: ModelSelection;
-  /** Steer only an existing turn; never start an idle thread. */
-  readonly mode?: "steer";
+  /** Queue waits behind a live turn; steer only targets an existing turn. */
+  readonly mode?: "steer" | "queue";
 }
 
 type KanbanInterruptResult =
@@ -248,13 +248,17 @@ export class KanbanThreads extends Context.Service<KanbanThreads, KanbanThreadsS
   "t3/ardud/kanban/engine/threads/KanbanThreads",
 ) {}
 
+// Assignment briefs carry new work and must survive input that supersedes reminder snapshots.
+const scopedMessagePrefix = (scope: string) =>
+  scope.startsWith("assignment:") ? `kanban:${scope}:` : `kanban:wake:${scope}:`;
+
 export const coalesceTarget = <
   R extends Pick<OrchestrationV2Run, "ordinal" | "status" | "userMessageId">,
 >(
   runs: ReadonlyArray<R>,
   scope: string,
 ): R | undefined => {
-  const prefix = `kanban:wake:${scope}:`;
+  const prefix = scopedMessagePrefix(scope);
   let oldest: R | undefined;
   for (const run of runs) {
     if (
@@ -279,9 +283,9 @@ export const queuedWakes = <
       (run) =>
         run.status === "queued" &&
         run.ordinal < beforeOrdinal &&
-        run.userMessageId.startsWith("kanban:wake:") &&
-        (scopes === undefined ||
-          scopes.some((scope) => run.userMessageId.startsWith(`kanban:wake:${scope}:`))),
+        (scopes === undefined
+          ? run.userMessageId.startsWith("kanban:wake:")
+          : scopes.some((scope) => run.userMessageId.startsWith(scopedMessagePrefix(scope)))),
     )
     .toSorted((a, b) => a.ordinal - b.ordinal);
 
@@ -957,7 +961,7 @@ const make = Effect.gen(function* () {
           if (input.isStale?.()) return;
           // A post-dispatch projection failure still needs an identity for stale-wake withdrawal.
           const messageId = MessageId.make(
-            scope === undefined ? `kanban:${id}` : `kanban:wake:${scope}:${id}`,
+            scope === undefined ? `kanban:${id}` : `${scopedMessagePrefix(scope)}${id}`,
           );
           acceptedMessageId = messageId;
           acceptedRunId = undefined;

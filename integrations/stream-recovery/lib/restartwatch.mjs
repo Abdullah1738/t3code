@@ -1,4 +1,4 @@
-import { emit, observed, recoveryIo, timedScan } from './logging.mjs';
+import { deferThread, emit, observed, recoveryIo, timedScan } from './logging.mjs';
 import { isReplicaUnavailable } from './readonly-db.mjs';
 // Restart watch: spot interrupted native subagents, delegated tasks and turns,
 // tell each parent thread what it lost (once), and send one summary per restart.
@@ -441,6 +441,7 @@ async function restartScanImpl({ db, refreshDb, state, now, sinceIso, floorMs, d
         const pendingTasks = list.filter((s) => s.kind === 'delegated' && !seen.has(s.subagent_id));
         let failed = null;
         let failedTask = null;
+        let replicaDeferred = false;
         for (const sub of pendingTasks) {
           try {
             freshBatch();
@@ -448,6 +449,7 @@ async function restartScanImpl({ db, refreshDb, state, now, sinceIso, floorMs, d
             assertRecoveryActive(io);
             if (!dryRun) progress.lateFailures = 0;
           } catch (err) {
+            if (deferThread(io, threadId, err)) { replicaDeferred = true; break; }
             if (isReplicaUnavailable(err) || isRecoveryPaused(err)) throw err;
             failed = errText(err);
             failedTask = sub;
@@ -455,6 +457,10 @@ async function restartScanImpl({ db, refreshDb, state, now, sinceIso, floorMs, d
           }
         }
         assertRecoveryActive(io);
+        if (replicaDeferred) {
+          if (!dryRun) { progress.done = false; progress.lateOnly = true; save(); }
+          continue;
+        }
         if (failed) {
           if (!dryRun) {
             progress.done = false;
@@ -497,6 +503,7 @@ async function restartScanImpl({ db, refreshDb, state, now, sinceIso, floorMs, d
           }
         }
       } catch (err) {
+        if (deferThread(io, threadId, err)) continue;
         if (isReplicaUnavailable(err) || isRecoveryPaused(err)) throw err;
         assertRecoveryActive(io);
         res = { plan: { threadId, title: threadId, action: "skip", reason: "error" }, ok: false, error: errText(err), lostSubs: [] };

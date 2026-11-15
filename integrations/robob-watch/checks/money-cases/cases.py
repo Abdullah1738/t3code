@@ -2664,6 +2664,59 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
         if active(q) or (q.get('status') == 'case' and now - at <= FOLLOW_CASE):
             todo.append((q.get('checked') or '', at, q))
     stats = stats if stats is not None else {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+    owner_source = said or (lambda *a, **kw: charges.owner_texts(
+        *a, **kw, stats=stats, cache_path=Path(data) / 'owner-texts.json',
+        cache_reset=lambda: record_event('cache_reset')))
+    source_error = None
+
+    def source(*args, **kwargs):
+        nonlocal source_error
+        if source_error is not None:
+            raise source_error
+        try:
+            # Old questions query separate windows; all windows share this cap.
+            remaining = charges.OWNER_BUDGET - stats.get('owner_threads_ms', 0) / 1000
+            if remaining <= 0:
+                raise charges.Lookup('Robob control: lookup over time')
+            stop = time.time() + remaining
+            if kwargs.get('deadline') is not None:
+                stop = min(stop, kwargs['deadline'])
+            kwargs['deadline'] = stop
+            with charges.step_timing(stats, 'owner_threads', stop), within(
+                    stop, charges.Lookup('Robob control: lookup over time')):
+                rows = owner_source(*args, **kwargs)
+                if time.time() >= stop:
+                    raise charges.Lookup('Robob control: lookup over time')
+                return rows
+        except charges.Lookup as exc:
+            if str(exc) != 'out of time':
+                source_error = exc
+            raise
+    charge_times = [at for _, at, q in todo if q.get('kind') == 'charge']
+    owner_rows = None
+    owner_error = None
+    if charge_times:
+        try:
+            owner_end = time.time() + charges.OWNER_BUDGET
+            if deadline is not None:
+                owner_end = min(deadline, owner_end)
+            with within(owner_end, LookupTimeout('out of time')):
+                owner_rows = source(min(charge_times) - charges.OWNER_AROUND, now, deadline=owner_end)
+        except (charges.Lookup, LookupTimeout) as e:
+            stats.setdefault('owner_result', 'incomplete')
+            # The signal can arrive just before step_timing's sampled wall clock.
+            # These exceptions identify our owner deadline without relying on that sample.
+            if isinstance(e, LookupTimeout) or str(e) == 'Robob control: lookup over time':
+                stats['starved_by'] = 'owner_threads'
+            owner_error = f'his threads: {e}'
+            errors.append(owner_error)
+            owner_rows = []
+
+    def owner(since, until, deadline=None):
+        if owner_rows is None:
+            return source(since, until, deadline=deadline)
+        return [row for row in owner_rows if since <= parse_time(row[0]) <= until]
+
     # not_checked means neither order evidence nor a full screen ran. An
     # order-only negative stays limited until the other required sources run.
     with charges.step_timing(stats, 'census'):
@@ -2752,52 +2805,6 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
             # Coverage alone cannot authorize an ask: a negative order result
             # still needs the receipt/owner screen before census proven_clean.
             counted(q['id'], 'limited' if outcome == 'proven_clean' else outcome)
-    owner_source = said or (lambda *a, **kw: charges.owner_texts(
-        *a, **kw, stats=stats, cache_path=Path(data) / 'owner-texts.json',
-        cache_reset=lambda: record_event('cache_reset')))
-    source_error = None
-
-    def source(*args, **kwargs):
-        nonlocal source_error
-        if source_error is not None:
-            raise source_error
-        try:
-            # Old questions query separate windows; all windows share this cap.
-            remaining = charges.OWNER_BUDGET - stats.get('owner_threads_ms', 0) / 1000
-            if remaining <= 0:
-                raise charges.Lookup('Robob control: lookup over time')
-            stop = time.time() + remaining
-            if kwargs.get('deadline') is not None:
-                stop = min(stop, kwargs['deadline'])
-            kwargs['deadline'] = stop
-            with charges.step_timing(stats, 'owner_threads', stop), within(
-                    stop, charges.Lookup('Robob control: lookup over time')):
-                rows = owner_source(*args, **kwargs)
-                if time.time() >= stop:
-                    raise charges.Lookup('Robob control: lookup over time')
-                return rows
-        except charges.Lookup as exc:
-            if str(exc) != 'out of time':
-                source_error = exc
-            raise
-    charge_times = [at for _, at, q in todo if q.get('kind') == 'charge']
-    owner_rows = None
-    owner_error = None
-    if charge_times:
-        try:
-            owner_end = min(deadline, time.time() + 4) if deadline is not None else time.time() + 4
-            with within(owner_end, LookupTimeout('out of time')):
-                owner_rows = source(min(charge_times) - charges.OWNER_AROUND, now, deadline=owner_end)
-        except (charges.Lookup, LookupTimeout) as e:
-            owner_error = f'his threads: {e}'
-            errors.append(owner_error)
-            owner_rows = []
-
-    def owner(since, until, deadline=None):
-        if owner_rows is None:
-            return source(since, until, deadline=deadline)
-        return [row for row in owner_rows if since <= parse_time(row[0]) <= until]
-
     ordered = sorted(todo, key=lambda x: (x[1], x[2]['id']))
     cursor = question_book.get('follow_cursor')
     if cursor:
@@ -3485,7 +3492,9 @@ def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
                                 'limitKinds': diagnostic.get('limitKinds', []),
                                 'orderCoverage': diagnostic.get('order_coverage', {}),
                                 'chargeCensus': diagnostic.get('charge_census', {}),
-                                **{key: stats.get(key, 0) for key in TIMING_KEYS},
+                                **{key: stats.get(key, 0) for key in (*TIMING_KEYS, *charges.OWNER_TIMING_KEYS)},
+                                'owner_result': stats.get('owner_result', 'ok'),
+                                **charges.receipt_timing(stats),
                                 'starved_by': stats.get('starved_by', diagnostic.get('starved_by', 'none'))})
         except Exception:
             pass
@@ -3693,7 +3702,9 @@ def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *,
         return {'at': stamp(now), 'total_s': round(time.time() - started, 3),
                 **{f'{key}_s': round(value, 3) for key, value in phases.items()},
                 **{k: stats[k] for k in ('lookups', 'owner_queries', 'msgs_calls')},
-                **{k: stats.get(k, 0) for k in TIMING_KEYS},
+                **{k: stats.get(k, 0) for k in (*TIMING_KEYS, *charges.OWNER_TIMING_KEYS)},
+                'owner_result': stats.get('owner_result', 'ok'),
+                **charges.receipt_timing(stats),
                 'starved_by': stats.get('starved_by', 'none'), 'slowest': max(phases, key=phases.get)}
 
     saved = False

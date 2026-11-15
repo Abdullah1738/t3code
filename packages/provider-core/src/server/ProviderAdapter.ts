@@ -400,6 +400,19 @@ export class ProviderAdapterProtocolError extends Schema.TaggedError<ProviderAda
   }
 }
 
+export class ProviderAdapterTurnNotActiveError extends Schema.TaggedError<ProviderAdapterTurnNotActiveError>()(
+  "ProviderAdapterTurnNotActiveError",
+  {
+    driver: ProviderDriverKind,
+    providerThreadId: ProviderThreadId,
+    providerTurnId: ProviderTurnId,
+  },
+) {
+  override get message(): string {
+    return `${this.driver} provider turn ${this.providerTurnId} is no longer active.`;
+  }
+}
+
 export const ProviderAdapterV2Error = Schema.Union([
   ProviderAdapterCapabilitiesError,
   ProviderAdapterOpenSessionError,
@@ -416,6 +429,7 @@ export const ProviderAdapterV2Error = Schema.Union([
   ProviderAdapterRuntimeRequestResponseError,
   ProviderAdapterEventStreamError,
   ProviderAdapterProtocolError,
+  ProviderAdapterTurnNotActiveError,
 ]);
 export type ProviderAdapterV2Error = typeof ProviderAdapterV2Error.Type;
 

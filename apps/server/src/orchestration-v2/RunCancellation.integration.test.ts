@@ -2,6 +2,7 @@ import { assert, it } from "@effect/vitest";
 import {
   type AnalyticsEvent,
   CommandId,
+  EnvironmentId,
   MessageId,
   ProjectId,
   ProviderDriverKind,
@@ -18,13 +19,25 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
 import * as Stream from "effect/Stream";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 
 import * as Analytics from "../ardud/analytics/Analytics.ts";
+import * as OrchestratorMcpService from "../mcp/OrchestratorMcpService.ts";
+import * as ProjectService from "../project/ProjectService.ts";
+import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
+import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
+import * as SecretRequests from "../secrets/SecretRequests.ts";
+import * as ServerSettings from "../serverSettings.ts";
+import * as Sqlite from "../persistence/Sqlite.ts";
+import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
+import * as CommandReceiptStore from "./CommandReceiptStore.ts";
 import * as EffectWorker from "./EffectWorker.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
+import * as ThreadLaunchService from "./ThreadLaunchService.ts";
+import * as ThreadManagementService from "./ThreadManagementService.ts";
 
 const instanceId = ProviderInstanceId.make("codex");
 const driver = ProviderDriverKind.make("codex");
@@ -171,6 +184,31 @@ it.effect.each(
           }),
         ),
       );
+      const layerMcp = OrchestratorMcpService.layer.pipe(
+        Layer.provideMerge(
+          Layer.mergeAll(
+            layer,
+            ThreadManagementService.layer.pipe(
+              Layer.provide(layer),
+              Layer.provide(ServerSettings.layerTest()),
+              Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(Sqlite.layerMemory))),
+            ),
+          ),
+        ),
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+            Layer.mock(GitVcsDriver.GitVcsDriver)({}),
+            ProviderAdapterRegistry.layerFromAdapters([adapter]),
+            Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+            Layer.mock(ProjectService.ProjectService)({}),
+            Layer.mock(SecretRequests.SecretRequests)({}),
+            Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+            ServerSettings.layerTest(),
+            NodeServices.layer,
+          ),
+        ),
+      );
       yield* Effect.gen(function* () {
         const engine = yield* Orchestrator.OrchestratorV2;
         const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
@@ -214,18 +252,39 @@ it.effect.each(
         const run = before.runs[0]!;
         assert.equal(run.status, "running");
         assert.equal(before.providerTurns.length, archive ? 1 : 0);
-        yield* engine.dispatch(
-          archive
-            ? { type: "thread.archive", commandId: CommandId.make(`${key}:archive`), threadId }
-            : {
-                type: "run.interrupt",
-                commandId: CommandId.make(`${key}:stop`),
-                threadId,
-                runId: run.id,
-                cancelReason,
-                reason: "Requested by the caller.",
-              },
-        );
+        if (cancelReason === "user_stop") {
+          const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const response = yield* mcp.interruptThread(
+            {
+              environmentId: EnvironmentId.make(`environment:${key}`),
+              requestNamespace: key,
+              thread: { threadId, providerSessionId: key, providerInstanceId: instanceId },
+              client: undefined,
+              capabilities: new Set(["orchestration"]),
+              issuedAt: 1,
+            },
+            { threadId, runId: run.id, reason: "Requested by the caller." },
+          );
+          assert.deepInclude(response, {
+            runId: run.id,
+            status: "interrupt_requested",
+            cancelReason: "user_stop",
+            cancelDetail: "Requested by the caller.",
+          });
+          assert.isTrue(yield* Deferred.isDone(usageEmitted));
+        } else
+          yield* engine.dispatch(
+            archive
+              ? { type: "thread.archive", commandId: CommandId.make(`${key}:archive`), threadId }
+              : {
+                  type: "run.interrupt",
+                  commandId: CommandId.make(`${key}:stop`),
+                  threadId,
+                  runId: run.id,
+                  cancelReason,
+                  reason: "Requested by the caller.",
+                },
+          );
         yield* worker.drain();
         yield* Deferred.await(usageEmitted);
         const after = yield* engine.getThreadProjection(threadId);
@@ -238,7 +297,7 @@ it.effect.each(
         if (!("runId" in row)) return assert.fail("Missing usage event");
         assert.equal(row.cancelReason, cancelReason);
         assert.equal(row.endReason, status);
-      }).pipe(Effect.provide(layer));
+      }).pipe(Effect.provide(layerMcp));
     }),
   ),
 );

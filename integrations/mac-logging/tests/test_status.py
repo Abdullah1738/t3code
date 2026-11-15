@@ -41,7 +41,7 @@ class StatusTests(unittest.TestCase):
 
     def seed(self, overrides=None):
         for key in status.CADENCES:
-            at = (overrides or {}).get(key, NOW - dt.timedelta(minutes=1 if key == 'cpu.sample' else 5))
+            at = (overrides or {}).get(key, NOW - dt.timedelta(minutes=1 if key in ('cpu.sample', 'tailnet.sample') else 5))
             if at is not None:
                 self.write(key, at)
 
@@ -59,6 +59,32 @@ class StatusTests(unittest.TestCase):
         self.assertFalse(row['lastOk'])
         self.assertEqual(row['lines'], 2)
         self.assertEqual(row['ageMin'], 1)
+
+    def test_spikes_are_conditional_and_roll_up_highest_five(self):
+        self.seed()
+        self.assertNotIn('cpu.spike', self.report()['jobs'])
+        self.assertNotIn('cpu.spike', self.report()['missingJobs'])
+        daemon = 'com.apple.DriverKit-AppleBCMWLAN'
+        for i in range(7):
+            props = dict(load=[40+i, 30, 20], systemCpuPct=1200+i, unattributedCpuPct=400+i,
+                         top=[dict(pid=1, family=daemon, cpuPct=10), dict(pid=2, family='Xcode', cpuPct=100),
+                              dict(pid=3, family='Xcode', cpuPct=50), dict(pid=4, family='python', cpuPct=30),
+                              dict(pid=5, family='git', cpuPct=5)],
+                         spawnedFamilies=[dict(family='git', count=3), dict(family='clang', count=20),
+                                          dict(family='python', count=5), dict(family='true', count=1)])
+            row = dict(ts=status.stamp(NOW+dt.timedelta(minutes=i)), tool='mac', name='cpu.spike', kind='event', props=props)
+            with (self.root/'2026-11-15.ndjson').open('a') as stream:
+                stream.write(json.dumps(row)+'\n')
+        daily = rollup('2026-11-15', self.root)
+        summary = daily['cpuSpikes']
+        self.assertEqual(summary['minutes'], 7)
+        self.assertEqual([p['load1'] for p in summary['highestLoad']], [46, 45, 44, 43, 42])
+        highest = summary['highestLoad'][0]
+        self.assertEqual(highest['ts'], '2026-11-15T12:06:00.000Z')
+        self.assertEqual((highest['systemCpuPct'], highest['unattributedCpuPct']), (1206, 406))
+        self.assertEqual(highest['families'], [dict(family='Xcode', cpuPct=150), dict(family='python', cpuPct=30), dict(family=daemon, cpuPct=10)])
+        self.assertEqual(highest['spawnedFamilies'], [dict(family='clang', count=20), dict(family='python', count=5), dict(family='git', count=3)])
+        self.assertNotIn('cpu.spike', daily['missingJobs'])
 
     def test_one_late_job_others_fine(self):
         self.seed({'disk.sample': NOW - dt.timedelta(hours=6)})
@@ -184,7 +210,7 @@ class StatusTests(unittest.TestCase):
         representable = ['0001-01-01T04:00:00+04:00', '0001-01-01T00:00:00Z',
                          '9999-12-31T19:59:59-04:00', '9999-12-31T23:59:59Z']
         for key in status.CADENCES:
-            self.write(key, NOW.replace(hour=23, minute=59 if key == 'cpu.sample' else 45))
+            self.write(key, NOW.replace(hour=23, minute=59 if key in ('cpu.sample', 'tailnet.sample') else 45))
         end = NOW + dt.timedelta(hours=12)
         baseline = status.report(end, self.root, day=NOW.date())
         for index, value in enumerate(overflowing + representable):
@@ -282,7 +308,8 @@ class StatusTests(unittest.TestCase):
                    diskInventory=dict(scans=0, rootsOk=0, rootsPartial=0, rootsTimeout=0, rootsDenied=0, scanMs=0),
                    diskWait=dict(runs=0, maxStuckForS=None, latestStuckUnmountMountPoint=None,
                                  busyRuns=0, topBusyComms=[]))
-        self.assertEqual({k: v for k, v in result.items() if k not in ('jobs', 'missingJobs')}, old)
+        self.assertEqual({k: v for k, v in result.items() if k not in ('jobs', 'missingJobs', 'cpuSpikes')}, old)
+        self.assertEqual(result['cpuSpikes'], dict(minutes=0, highestLoad=[]))
         health = result['jobs']['backup.run:health']
         self.assertEqual(health['lastSeen'], '2026-11-14T16:00:00.000Z')
         self.assertFalse(health['lastOk'])
@@ -357,7 +384,7 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(result['jobs']['cpu.sample']['gapMaxMin'], 3)
         # CPU and memory each become late at their own allowance.
         later = self.report(NOW + dt.timedelta(minutes=11))
-        self.assertEqual(later['missingJobs'], ['memory.sample', 'cpu.sample'])
+        self.assertEqual(later['missingJobs'], ['memory.sample', 'cpu.sample', 'tailnet.sample'])
         self.assertEqual(later['jobs']['memory.sample']['status'], 'LATE')
 
     def test_cpu_three_minute_cadence_and_failed_probe_liveness(self):
@@ -366,6 +393,15 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(self.report(NOW + dt.timedelta(minutes=2, seconds=1))['jobs']['cpu.sample']['status'], 'LATE')
         self.write('cpu.sample', NOW + dt.timedelta(minutes=3), False)
         row = self.report(NOW + dt.timedelta(minutes=4))['jobs']['cpu.sample']
+        self.assertEqual(row['status'], 'OK')
+        self.assertFalse(row['lastOk'])
+
+    def test_tailnet_three_minute_cadence_and_failed_check_liveness(self):
+        self.seed()
+        self.assertEqual(self.report(NOW + dt.timedelta(minutes=2))['jobs']['tailnet.sample']['status'], 'OK')
+        self.assertEqual(self.report(NOW + dt.timedelta(minutes=2, seconds=1))['jobs']['tailnet.sample']['status'], 'LATE')
+        self.write('tailnet.sample', NOW + dt.timedelta(minutes=3), False)
+        row = self.report(NOW + dt.timedelta(minutes=4))['jobs']['tailnet.sample']
         self.assertEqual(row['status'], 'OK')
         self.assertFalse(row['lastOk'])
 

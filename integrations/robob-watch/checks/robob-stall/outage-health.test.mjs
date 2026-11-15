@@ -40,7 +40,8 @@ for (const row of cases) test(`outage evidence to alert: ${row.name}`, async () 
   let tailRead = false;
   let ownershipChecks = 0;
   const report = await deepHealth({
-    timeoutMs: 20,
+    // Reserve 200 ms after probe timeouts for local evidence under CPU contention.
+    timeoutMs: 1000,
     client: {
       url: row.url ?? "http://127.0.0.1:3773",
       request: async (_method, route) => {

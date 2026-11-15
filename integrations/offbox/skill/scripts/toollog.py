@@ -23,6 +23,9 @@ NUMBERS.update(f'{fs}_{field}' for fs in ('tmp', 'var_tmp', 'home', 'workspace')
 BOOLEANS = set("queued killed fresh bg noSync git noFallback noRetry remote failed stale timeoutHit fallback dryRun baseGiven templateGiven sizeGiven".split())
 BOOLEANS.update({'retry', 'rcFilePresent', 'superseded'})
 ENUMS = {
+    "jdk_phase": {"check", "install", "result"},
+    "jdk_result": {"pending", "present", "installed", "compiler-missing", "apt-failed"},
+    "jdk_trigger": {"command", "repo-marker", "harness"},
     "cmd_via": {"argv", "file"},
     "backend": {"home", "boat"}, "from": {"home", "boat"}, "to": {"home", "boat"},
     "reason": {"pinned", "home_up", "home_down", "unreachable", "boat_only", "boat_only_base", "infra", "cap", "busy", "person_home_down", "base_home_down"},

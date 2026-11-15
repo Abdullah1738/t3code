@@ -2862,13 +2862,21 @@ effectIt.effect.each(
     }),
 );
 
-effectIt.effect.each(["keyed", "legacy", "answered by another evaluator", "still owed"] as const)(
-  "#1569 rechecks an owner reply wake before provider execution (%s)",
+effectIt.effect.each([
+  "keyed",
+  "legacy",
+  "answered by another evaluator",
+  "still owed",
+  "non-owner still owed",
+  "non-owner answered",
+] as const)(
+  "#1569/#1596 rechecks an owner or discussion reply wake before provider execution (%s)",
   (kind) =>
     Effect.gen(function* () {
+      const stillOwed = kind === "still owed" || kind === "non-owner still owed";
       const harness = makeLocalCommandHarness({
         text: "The owner is waiting for your reply in discussion disc-1569. Post it with discussion_post.",
-        nativeDelivery: kind === "still owed",
+        nativeDelivery: stillOwed,
       });
       const initial = harness.projection();
       const messageId = MessageId.make(
@@ -2913,14 +2921,16 @@ effectIt.effect.each(["keyed", "legacy", "answered by another evaluator", "still
       yield* store.putMessage({
         discussionId: talk.id,
         seq: 1,
-        author: { _tag: "owner" },
+        author: kind.startsWith("non-owner")
+          ? { _tag: "system", component: "dispatcher" }
+          : { _tag: "owner" },
         authorName: "Owner",
         blocks: [{ _tag: "md", text: "Please reply" }],
         answers: [],
         createdAt: talk.createdAt,
       });
       // The reminder is already queued above; the reply lands before its provider start.
-      if (kind !== "still owed") {
+      if (!stillOwed) {
         yield* store.putMessage({
           discussionId: talk.id,
           seq: 2,
@@ -2946,7 +2956,7 @@ effectIt.effect.each(["keyed", "legacy", "answered by another evaluator", "still
         });
       }
       yield* harness.start;
-      if (kind === "still owed") {
+      if (stillOwed) {
         expect(harness.startRootRun).toHaveBeenCalledTimes(1);
         expect(harness.open).toHaveBeenCalledTimes(1);
         return;

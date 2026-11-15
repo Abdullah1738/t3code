@@ -213,6 +213,23 @@ class Logging(Base):
         self.assertFalse(self.rows('check.run')[-1]['ok'])
         self.assertEqual(self.rows('check.run')[-1]['props']['fired'], 0)
 
+    def test_owner_refresh_metadata_is_logged_and_private_values_are_dropped(self):
+        stats = {key: n for n, key in enumerate(mc.charges.OWNER_TIMING_KEYS)}
+        def followed(*args, **kwargs):
+            kwargs['stats'].update(stats, owner_result='incomplete')
+            return ['his threads: fixture incomplete']
+        with patch.object(mc, 'follow', side_effect=followed):
+            mc.run_check(self.wd, 'owner', self.data, self.root, at('2026-11-14T10:00'), finder(), nobody)
+        row = self.rows('check.run')[-1]
+        self.assertFalse(row['ok'])
+        for key, value in stats.items():
+            self.assertEqual(row['props'][key], value)
+        self.assertEqual(row['props']['owner_result'], 'incomplete')
+        for bad in ('PRIVATE-TEXT', -1, True, 1.5, 10**13):
+            mc.toollog.emit('money-cases', 'check.run', props={
+                **dict.fromkeys(mc.charges.OWNER_TIMING_KEYS, bad), 'owner_result': 'PRIVATE-TEXT'})
+            self.assertEqual(self.rows('check.run')[-1]['props'], {})
+
     def test_known_source_limits_alone_complete_ok_and_bad_reason_is_dropped(self):
         def limited(*args, stats, **kw):
             stats['question_limits'] = [{'why': 'private fixture',
@@ -263,8 +280,8 @@ class Logging(Base):
         self.assertFalse(row['ok'])
         self.assertEqual(row['durationMs'], 40000)
         self.assertEqual(row['props'], {'budgetHit': True, 'openCases': 1, 'fired': 0, 'slowestPhase': 'follow', 'sourceLimits': 0, 'limitKinds': [], 'orderCoverage': {}, 'chargeCensus': {},
-            **dict.fromkeys(mc.TIMING_KEYS, 0), 'follow_ms': 40000, 'questions_ms': 40000,
-            'starved_by': 'questions'})
+            **dict.fromkeys((*mc.TIMING_KEYS, *mc.charges.OWNER_TIMING_KEYS), 0), 'owner_result': 'ok', 'follow_ms': 40000, 'questions_ms': 40000,
+            'starved_by': 'questions', **mc.charges.receipt_timing({})})
 
     def test_check_distinguishes_short_lock_timeout_from_work_deadline(self):
         self.case()

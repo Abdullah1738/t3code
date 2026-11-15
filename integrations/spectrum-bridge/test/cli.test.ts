@@ -356,6 +356,14 @@ describe("CLI entry point (no live socket)", () => {
   const cli = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
   const directory = fileURLToPath(new URL("../src", import.meta.url));
 
+  test("keeps database filename markers out of CLI source", async () => {
+    // The harness statev2 guard scans script source, even when the command never opens a database.
+    const source = await fs.readFile(cli, "utf8");
+    for (const marker of ["state.sqlite", "statev2", "opencode.db"]) {
+      expect(source).not.toContain(marker);
+    }
+  });
+
   test.each([
     { args: ["health", "--private-value"], socket: cli, error: "Invalid command arguments" },
     { args: ["health"], socket: cli, error: "Bridge socket must be a Unix socket, not a file or symlink" },

@@ -8,7 +8,7 @@ import {
 } from './lib/detect.mjs';
 import { assertRecoveryActive, guardRecoveryIo, isRecoveryPaused, recoveryElapsed, recoveryFloor, controlStatus, pauseRecovery, resumeRecovery, parseDuration } from './lib/pause.mjs';
 import * as realIo from './lib/io.mjs';
-import { emit, observed, recoveryIo, timedScan } from './lib/logging.mjs';
+import { deferThread, emit, observed, recoveryIo, timedScan } from './lib/logging.mjs';
 import { pathToFileURL } from 'node:url';
 import { openCodeSession, recoveryOwned } from './lib/harness.mjs';
 import { stallScan } from './lib/stallwatch.mjs';
@@ -298,6 +298,7 @@ export async function recoveryScan({ opts, state, now }, io = realIo) {
       const active = await safe(() => io.activeSessions(), new Set());
       log(`${incident.id}: drop at ${hhmm(incident.failAllMs)}, ${incident.runs.length} runs, ${incident.subagents.length} subagents, ${threadIds.length} threads${opts.dryRun ? ' (dry run)' : ''}`);
       const results = [];
+      let deferred = false;
       const entry = { ...prev, incident, threads: { ...prev?.threads }, at: new Date(now).toISOString() };
       const save = () => { if (!opts.dryRun) { state.handled[incident.id] = entry; io.saveState(state, now); } };
       save();
@@ -309,13 +310,20 @@ export async function recoveryScan({ opts, state, now }, io = realIo) {
         try {
           g = await gatherThread({ db, incident, threadId, active, now, verbose: opts.verbose }, io);
         } catch (err) {
+          if (deferThread(io, threadId, err)) { deferred = true; continue; }
           if (isReplicaUnavailable(err) || isRecoveryPaused(err)) throw err;
           results.push({ plan: { threadId, title: threadId, action: 'skip', reason: 'error' }, ok: false, error: String(err?.message || err).slice(0, 300), lost: [], forms: [] });
           log(`  ${threadId}: gather failed: ${err?.message || err}`);
           continue;
         }
         if (!g) { if (opts.verbose) log(`  ${threadId}: not found in Robob`); continue; }
-        const res = await act({ db, incident, g, dryRun: opts.dryRun, progress, save }, io);
+        let res;
+        try {
+          res = await act({ db, incident, g, dryRun: opts.dryRun, progress, save }, io);
+        } catch (err) {
+          if (deferThread(io, threadId, err)) { deferred = true; continue; }
+          throw err;
+        }
         assertRecoveryActive(io);
         if (!opts.dryRun && res.ok) { progress.done = true; progress.result = res; save(); }
         results.push(res);
@@ -327,6 +335,11 @@ export async function recoveryScan({ opts, state, now }, io = realIo) {
       }
       assertRecoveryActive(io);
       refreshDb();
+      if (deferred) {
+        save();
+        report.push({ incident: { id: incident.id, startMs: incident.startMs, endMs: incident.endMs, failAllMs: incident.failAllMs }, results });
+        continue;
+      }
       const summary = buildSummary({ incident, results });
       if (opts.dryRun) {
         log(`summary (${summary.severity}):\n${summary.text}`);

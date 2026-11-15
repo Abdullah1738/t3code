@@ -72,6 +72,7 @@ import { DispatchModeLimit, exceededDispatchModeLimit } from "./DispatchModeLimi
 import { projectTurnItemForDetail } from "./WireProjection.ts";
 import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
 import * as SendAcknowledgement from "../ardud/orchestration/ThreadSendAcknowledgement.ts";
+import { delegationCreateFailure } from "../ardud/orchestration/delegationCreateFailure.ts";
 import * as ServerSettings from "../serverSettings.ts";
 
 const isDispatchError = Schema.is(Orchestrator.OrchestratorDispatchError);
@@ -351,6 +352,13 @@ export type ThreadManagementError = typeof ThreadManagementError.Type;
 
 type ThreadManagementFailure = ThreadManagementError | Orchestrator.OrchestratorV2Error;
 
+interface AbandonedDelegation {
+  readonly status: "abandoned";
+  readonly reason: string;
+  readonly elapsedSeconds: number;
+  readonly at: DateTime.Utc;
+}
+
 export interface ThreadManagementServiceShape {
   readonly promoteQueuedMessages: Orchestrator.OrchestratorV2["Service"]["promoteQueuedMessages"];
   readonly searchThreadStream: (
@@ -457,7 +465,9 @@ export interface ThreadManagementServiceShape {
   readonly getDelegationCommandState: (
     commandId: CommandId,
   ) => Effect.Effect<
-    CommandReceiptStore.CommandReceiptV2 | { readonly status: "pending" | "never_saved" },
+    | CommandReceiptStore.CommandReceiptV2
+    | { readonly status: "pending" | "never_saved" }
+    | AbandonedDelegation,
     CommandReceiptStore.CommandReceiptStoreV2Error
   >;
   readonly getCommandReceipt: CommandReceiptStore.CommandReceiptStoreV2["Service"]["getByCommandId"];
@@ -590,6 +600,8 @@ const make = Effect.gen(function* () {
   const selectionDispatchLock = yield* KeyedLock.make<ThreadId>();
   const delegationDispatchLock = yield* KeyedLock.make<CommandId>();
   const pendingDelegations = yield* Ref.make<ReadonlyMap<CommandId, number>>(new Map());
+  // Only diagnostics are retained: receipts and active retries always take precedence.
+  const abandonedDelegations = new Map<CommandId, AbandonedDelegation>();
   const getDelegationCommandState = Effect.fn("ThreadManagementService.getDelegationCommandState")(
     function* (commandId: CommandId) {
       const receipt = yield* receipts.getByCommandId(commandId);
@@ -604,11 +616,9 @@ const make = Effect.gen(function* () {
         Effect.gen(function* () {
           const latest = yield* receipts.getByCommandId(commandId);
           if (Option.isSome(latest)) return latest.value;
-          return {
-            status: (yield* Ref.get(pendingDelegations)).has(commandId)
-              ? ("pending" as const)
-              : ("never_saved" as const),
-          };
+          if ((yield* Ref.get(pendingDelegations)).has(commandId))
+            return { status: "pending" as const };
+          return abandonedDelegations.get(commandId) ?? { status: "never_saved" as const };
         }),
       );
     },
@@ -1058,16 +1068,33 @@ const make = Effect.gen(function* () {
           const next = new Map(current);
           next.set(command.commandId, (current.get(command.commandId) ?? 0) + 1);
           return next;
-        }),
+        }).pipe(Effect.andThen(Clock.monotonicTimeNanos)),
         () =>
           delegationDispatchLock.withLock(command.commandId, dispatchUnchanged(command, options)),
-        () =>
-          Ref.update(pendingDelegations, (current) => {
-            const next = new Map(current);
-            const remaining = (current.get(command.commandId) ?? 1) - 1;
-            if (remaining === 0) next.delete(command.commandId);
-            else next.set(command.commandId, remaining);
-            return next;
+        (startedAt, exit) =>
+          Effect.gen(function* () {
+            if (exit._tag === "Failure") {
+              const now = yield* Clock.monotonicTimeNanos;
+              const at = yield* DateTime.now;
+              abandonedDelegations.delete(command.commandId);
+              abandonedDelegations.set(command.commandId, {
+                status: "abandoned",
+                reason: delegationCreateFailure(exit.cause),
+                elapsedSeconds: Math.round(Number(now - startedAt) / 1_000_000_000),
+                at,
+              });
+              if (abandonedDelegations.size > 500)
+                abandonedDelegations.delete(abandonedDelegations.keys().next().value!);
+            } else {
+              abandonedDelegations.delete(command.commandId);
+            }
+            yield* Ref.update(pendingDelegations, (current) => {
+              const next = new Map(current);
+              const remaining = (current.get(command.commandId) ?? 1) - 1;
+              if (remaining === 0) next.delete(command.commandId);
+              else next.set(command.commandId, remaining);
+              return next;
+            });
           }),
       );
     }

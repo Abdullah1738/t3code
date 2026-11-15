@@ -1767,46 +1767,85 @@ export const layer: Layer.Layer<
         let orphanRecovery: Fiber.Fiber<void, ProviderAdapter.ProviderAdapterV2Error> | undefined;
         const stopOrphanedProviderTurn = Effect.fn("RunExecutionService.stopOrphanedProviderTurn")(
           function* (providerThread: OrchestrationV2ProviderThread) {
-            while (!(yield* nativeEndConfirmed) && !(yield* Ref.get(orphanStopConfirmed))) {
-              if (input.shouldFinalizeRun !== undefined) {
-                const current = yield* input
-                  .shouldFinalizeRun()
-                  .pipe(Effect.timeout("10 seconds"), Effect.exit);
-                if (Exit.isSuccess(current) && !current.value) return;
+            let attempts = 0;
+            let providerTurnId: ProviderTurnId | null = null;
+            let lastCause: unknown = "provider turn id not yet observed";
+            // Ten attempts bound quick failures; the deadline also bounds slow probes and Stops.
+            const stopped = yield* Effect.gen(function* () {
+              while (attempts < 10) {
+                if ((yield* nativeEndConfirmed) || (yield* Ref.get(orphanStopConfirmed)))
+                  return true;
+                attempts++;
+                providerTurnId = (yield* Ref.get(eventRouting)).rootProviderTurnId;
+                const current = yield* (input.shouldFinalizeRun?.() ?? Effect.succeed(true)).pipe(
+                  Effect.timeout("10 seconds"),
+                  Effect.exit,
+                );
+                if (Exit.isSuccess(current) && !current.value) return true;
                 if (Exit.isFailure(current)) {
-                  yield* Effect.sleep("1 second");
-                  continue;
+                  lastCause = current.cause;
+                } else if (providerTurnId === null) {
+                  lastCause = "provider turn id not yet observed";
+                } else {
+                  const stop = yield* input.session
+                    .interruptTurn({
+                      providerThread,
+                      providerTurnId,
+                      requestRuntimeRestart: false,
+                      stopBackgroundWork: false,
+                    })
+                    .pipe(
+                      Effect.catchTags({
+                        ProviderAdapterTurnNotActiveError: () =>
+                          Effect.logInfo(
+                            "orchestration V2 orphaned provider turn already stopped",
+                            {
+                              runId: input.run.id,
+                              threadId: input.run.threadId,
+                              providerTurnId,
+                              reason: "turn no longer active",
+                            },
+                          ),
+                      }),
+                      Effect.timeout("30 seconds"),
+                      Effect.exit,
+                    );
+                  if (Exit.isSuccess(stop)) {
+                    yield* Ref.set(orphanStopConfirmed, true);
+                    return true;
+                  }
+                  lastCause = stop.cause;
                 }
+                if (attempts === 1) {
+                  yield* Effect.logWarning(
+                    "orchestration V2 could not stop an orphaned provider turn",
+                    {
+                      runId: input.run.id,
+                      threadId: input.run.threadId,
+                      providerTurnId,
+                      cause: lastCause,
+                    },
+                  );
+                }
+                // Recovery is lineage-scoped: killing the shared app-server would also
+                // terminate unrelated threads that still own healthy turns.
+                if (attempts < 10)
+                  yield* Effect.sleep(Math.min(1000 * 2 ** (attempts - 1), 30_000));
               }
-              const providerTurnId = (yield* Ref.get(eventRouting)).rootProviderTurnId;
-              if (providerTurnId === null) {
-                yield* Effect.sleep("1 second");
-                continue;
-              }
-              const stopped = yield* input.session
-                .interruptTurn({
-                  providerThread,
-                  providerTurnId,
-                  requestRuntimeRestart: false,
-                  stopBackgroundWork: false,
-                })
-                .pipe(Effect.timeout("30 seconds"), Effect.exit);
-              if (Exit.isSuccess(stopped)) {
-                yield* Ref.set(orphanStopConfirmed, true);
-                return;
-              }
-              yield* Effect.logWarning(
-                "orchestration V2 could not stop an orphaned provider turn",
+              return false;
+            }).pipe(Effect.timeoutOption("5 minutes"));
+            if (Option.isNone(stopped) || !stopped.value) {
+              yield* Effect.logError(
+                "orchestration V2 gave up stopping an orphaned provider turn",
                 {
                   runId: input.run.id,
                   threadId: input.run.threadId,
                   providerTurnId,
-                  cause: stopped.cause,
+                  attempts,
+                  reason: Option.isNone(stopped) ? "deadline reached" : "attempt limit reached",
+                  cause: lastCause,
                 },
               );
-              // Recovery is lineage-scoped: killing the shared app-server would also
-              // terminate unrelated threads that still own healthy turns.
-              yield* Effect.sleep("1 second");
             }
           },
           (effect) =>

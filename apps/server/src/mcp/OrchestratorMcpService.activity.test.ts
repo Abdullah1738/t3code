@@ -33,6 +33,7 @@ import { CommandPolicyCapabilityUnsupportedError } from "../orchestration-v2/Com
 import {
   OrchestratorCommandPreviouslyRejectedError,
   OrchestratorDispatchError,
+  OrchestratorProjectionError,
 } from "../orchestration-v2/Orchestrator.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import type * as McpInvocationContext from "./McpInvocationContext.ts";
@@ -192,6 +193,88 @@ function makeRun(input: {
     completedAt: input.status === "cancelled" || input.status === "completed" ? now : null,
   };
 }
+
+it.effect.each(["committed", "without detail", "missing", "unreadable"] as const)(
+  "interrupt response reads committed provenance for its exact run (%s)",
+  (form) =>
+    Effect.gen(function* () {
+      let dispatched = false;
+      const shell = liveThreadShell(parentThreadId);
+      const stale = {
+        ...makeRun({ id: activeRunId, ordinal: 1, status: "running" }),
+        cancelReason: "provider_interrupted",
+        cancelDetail: "Stale detail.",
+      };
+      const before = {
+        ...idleThreadProjection(shell),
+        runs: [stale],
+      } as unknown as OrchestrationV2ThreadProjection;
+      const after = {
+        ...before,
+        runs: [
+          {
+            ...makeRun({ id: cancelledRunId, ordinal: 2, status: "cancelled" }),
+            cancelReason: "thread_reset",
+            cancelDetail: "Unrelated detail.",
+          },
+          ...(form === "missing"
+            ? []
+            : [
+                {
+                  ...stale,
+                  status: "interrupted",
+                  cancelReason: "user_stop",
+                  cancelDetail: form === "without detail" ? undefined : "Caller stopped.",
+                },
+              ]),
+        ],
+      } as unknown as OrchestrationV2ThreadProjection;
+      const layer = layerOrchestratorService.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.mock(ThreadManagementService.ThreadManagementService)({
+              getCallerRow: () => Effect.succeed(shell),
+              getThreadRecords: () =>
+                dispatched && form === "unreadable"
+                  ? Effect.fail(
+                      new OrchestratorProjectionError({
+                        threadId: parentThreadId,
+                        cause: "read failed",
+                      }),
+                    )
+                  : Effect.succeed(dispatched ? after : before),
+              interruptThread: () =>
+                Effect.sync(() => {
+                  dispatched = true;
+                  return {
+                    type: "interrupt_requested",
+                    run: before.runs[0]!,
+                    dispatch: { sequence: 1, storedEvents: [] },
+                  } as const;
+                }),
+            }),
+            ServerSettings.layerTest(),
+            Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+            Layer.mock(ProjectService.ProjectService)({}),
+            Layer.mock(SecretRequests.SecretRequests)({}),
+            Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+            Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({}),
+            NodeCrypto.layer,
+          ),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        const response = yield* service.interruptThread(makeScope(), { threadId: parentThreadId });
+        expect(response.runId).toBe(activeRunId);
+        expect(response.status).toBe("interrupt_requested");
+        expect(response.cancelReason).toBe(
+          form === "missing" || form === "unreadable" ? undefined : "user_stop",
+        );
+        expect(response.cancelDetail).toBe(form === "committed" ? "Caller stopped." : undefined);
+      }).pipe(Effect.provide(layer));
+    }),
+);
 
 it("readThread prefers activity-run status over a newer cancelled queued run", async () => {
   const projection = {

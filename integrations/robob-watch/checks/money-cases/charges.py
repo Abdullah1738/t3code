@@ -10,11 +10,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as
 import datetime as dt
 from decimal import Decimal, InvalidOperation
 import importlib.util
+import itertools
 import json
 import os
 from pathlib import Path
 import re
 import signal
+import statistics
 import subprocess
 import threading
 import time
@@ -122,11 +124,16 @@ class SourceLimit(Lookup):
         super().__init__(message)
 
 
-OWNER_BUDGET = 4
+OWNER_BUDGET = 10
+OWNER_REQUEST_TIMEOUT = 3
+OWNER_TIMING_KEYS = (
+    'owner_list_pages', 'owner_list_ms', 'owner_threads_selected', 'owner_threads_fresh',
+    'owner_threads_needed', 'owner_threads_fetched', 'owner_fetch_ms_max', 'owner_timeouts', 'owner_cache_size')
 OWNER_REQUEST_LIMIT = 64
 OWNER_CACHE_VERSION = 2
 _OWNER_STATS_LOCK = threading.Lock()
 MSGS_BUDGET = 2
+RECEIPT_BUDGET = 4
 
 
 TIMING_STATS = contextvars.ContextVar('money_cases_timing_stats', default=None)
@@ -137,22 +144,26 @@ _TIMING_STACK = contextvars.ContextVar('money_cases_timing_stack', default=())
 def step_timing(stats, name, deadline=None):
     stats = stats if stats is not None else TIMING_STATS.get()
     started = time.monotonic()
-    stack = _TIMING_STACK.get()
-    frame = {'stats': stats, 'children': 0.0}
-    token = _TIMING_STACK.set((*stack, frame))
-    alarm = signal.getitimer(signal.ITIMER_REAL)[0]
-    if alarm:
-        enclosing = time.time() + alarm
-        deadline = min(deadline, enclosing) if deadline is not None else enclosing
+    stack = tuple(frame for frame in _TIMING_STACK.get() if frame.get('active'))
+    frame = {'stats': stats, 'children': 0.0, 'name': name, 'active': True, 'deadline': deadline}
     error = None
     try:
+        _TIMING_STACK.set((*stack, frame))
+        alarm = signal.getitimer(signal.ITIMER_REAL)[0]
+        if alarm:
+            enclosing = time.time() + alarm
+            deadline = min(deadline, enclosing) if deadline is not None else enclosing
+        frame['deadline'] = deadline
         yield
     except BaseException as exc:
         error = exc
         raise
     finally:
+        # A signal can interrupt setup or even the final clock sample. Restore
+        # the source context first so later calls cannot inherit a dead frame.
+        frame['active'] = False
+        _TIMING_STACK.set(stack)
         elapsed = (time.monotonic() - started) * 1000
-        _TIMING_STACK.reset(token)
         if stack and stack[-1]['stats'] is stats:
             stack[-1]['children'] += elapsed
         if stats is not None:
@@ -310,6 +321,7 @@ def left(deadline, cap):
 
 
 def msgs(argv, deadline, cap, memo=None, stats=None):
+    stats = stats if stats is not None else TIMING_STATS.get()
     key = tuple(argv)
     if memo is not None and key in memo:
         result = memo[key]
@@ -319,19 +331,55 @@ def msgs(argv, deadline, cap, memo=None, stats=None):
     timeout = left(deadline, min(cap, MSGS_BUDGET))
     if stats is not None:
         stats['msgs_calls'] += 1
+    started = time.monotonic()
+    called_at = time.time()
+    stop = called_at + timeout
+    alarm = signal.getitimer(signal.ITIMER_REAL)[0]
+    if alarm:
+        stop = min(stop, time.time() + alarm)
+    timed_out = False
     try:
         with step_timing(stats, 'msgs', time.time() + timeout):
             done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
         if done.returncode:
             raise Lookup(f'msgs exit {done.returncode}: {done.stderr.strip()[:200]}')
     except (OSError, subprocess.TimeoutExpired, Lookup) as e:
+        timed_out = isinstance(e, subprocess.TimeoutExpired) or getattr(e, '_money_cases_timeout', False)
         error = e if isinstance(e, Lookup) else Lookup(f'msgs: {e}')
         if memo is not None:
             memo[key] = error
         raise error from e
+    except BaseException as exc:
+        timed_out = getattr(exc, '_money_cases_timeout', False)
+        raise
+    finally:
+        if stats is not None:
+            elapsed = round((time.monotonic() - started) * 1000)
+            stats.setdefault('_msgs_samples_ms', []).append(elapsed)
+            stats['msgs_timeouts'] = stats.get('msgs_timeouts', 0) + int(
+                timed_out or time.time() >= stop)
+            names = {frame['name'] for frame in _TIMING_STACK.get()
+                     if frame.get('active') and frame['stats'] is stats
+                     and (frame['deadline'] is None or called_at < frame['deadline'])}
+            kind = 'receipt' if 'receipt' in names else 'order' if names & {
+                'order_charges', 'lookups', 'order_screen'} else 'other'
+            bucket = stats.setdefault('msgs_by_kind', {}).setdefault(kind, {'count': 0, 'ms': 0})
+            bucket['count'] += 1
+            bucket['ms'] += elapsed
     if memo is not None:
         memo[key] = done
     return done
+
+
+def receipt_timing(stats):
+    """Bounded metadata only, including defaults for checks without archive work."""
+    samples = stats.get('_msgs_samples_ms', [])
+    return {'msgs_timeouts': stats.get('msgs_timeouts', 0),
+            'msgs_p50_ms': round(statistics.median(samples)) if samples else 0,
+            'msgs_by_kind': {kind: {key: stats.get('msgs_by_kind', {}).get(kind, {}).get(key, 0)
+                                    for key in ('count', 'ms')} for kind in ('receipt', 'order', 'other')},
+            'receipt_result': {key: stats.get('receipt_result', {}).get(key, 0)
+                               for key in ('found', 'none', 'out_of_time', 'error')}}
 
 
 def day(t):
@@ -383,6 +431,7 @@ def within(deadline, error):
     started = time.monotonic()
 
     def expired(*_):
+        error._money_cases_timeout = True
         raise error
 
     signal.signal(signal.SIGALRM, expired)
@@ -432,11 +481,15 @@ def control_config():
 
 def control_get(config, path, params, deadline, stats=None):
     url, token = config
+    timeout = left(deadline, OWNER_REQUEST_TIMEOUT)
+    listed = path == '/threads'
+    started = time.monotonic()
+    if stats is not None:
+        with _OWNER_STATS_LOCK:
+            stats['owner_queries'] = stats.get('owner_queries', 0) + 1
+            if listed:
+                stats['owner_list_pages'] = stats.get('owner_list_pages', 0) + 1
     try:
-        timeout = left(deadline, 3)
-        if stats is not None:
-            with _OWNER_STATS_LOCK:
-                stats['owner_queries'] += 1
         # Curl's wall-clock limit covers DNS, connect/TLS, headers and body. The
         # subprocess timeout also kills and reaps it if its resolver gets stuck.
         # Disable curlrc and pass the credential on stdin, never in argv or errors.
@@ -444,16 +497,31 @@ def control_get(config, path, params, deadline, stats=None):
                                '--proto', '=http,https', '--max-time', str(timeout),
                                '--url', url + path + '?' + urllib.parse.urlencode(params)],
                               input=('header = ' + json.dumps('Authorization: Bearer ' + token) + '\n').encode(),
-                              capture_output=True, timeout=max(0.001, deadline - time.time()))
+                              capture_output=True, timeout=timeout)
+        if done.returncode == 28:
+            raise subprocess.TimeoutExpired('Robob control', timeout)
         if done.returncode:
             raise Lookup('Robob control: request failed or timed out')
         result = json.loads(done.stdout)
         if not isinstance(result, dict) or result.get('ok') is not True:
             raise Lookup('Robob control: invalid response')
         return result
-    except (OSError, subprocess.TimeoutExpired, ValueError):
+    except subprocess.TimeoutExpired:
+        if stats is not None:
+            with _OWNER_STATS_LOCK:
+                stats['owner_timeouts'] = stats.get('owner_timeouts', 0) + 1
+        raise Lookup('Robob control: request failed or timed out') from None
+    except (OSError, ValueError):
         # Neither a server error body nor a request/credential repr belongs in pings.json.
         raise Lookup('Robob control: request failed or timed out') from None
+    finally:
+        if stats is not None:
+            elapsed = round((time.monotonic() - started) * 1000)
+            with _OWNER_STATS_LOCK:
+                if listed:
+                    stats['owner_list_ms'] = stats.get('owner_list_ms', 0) + elapsed
+                else:
+                    stats['owner_fetch_ms_max'] = max(stats.get('owner_fetch_ms_max', 0), elapsed)
 
 
 def owner_time(value):
@@ -507,12 +575,17 @@ def save_owner_cache(path, cache, since, until):
                      'texts': [row for row in entry['texts'] if owner_time(row['createdAt']) >= cutoff]}
     try:
         write_json(path, kept)
+        return len(kept)
     except OSError:
         raise Lookup('Robob control: owner cache save failed') from None
 
 
 def owner_texts(since, until, deadline=None, stats=None, cache_path=None, cache_reset=None):
-    """His app/iMessage typing, fetched once per check within a four-second total cap."""
+    """His app/iMessage typing, fetched once per check within its own total cap."""
+    if stats is not None:
+        for key in OWNER_TIMING_KEYS:
+            stats.setdefault(key, 0)
+        stats['owner_result'] = 'list_failed'
     stop = time.time() + (OWNER_BUDGET if deadline is None
                           else min(OWNER_BUDGET, left(deadline, OWNER_BUDGET) - 0.5))
     alarm = signal.getitimer(signal.ITIMER_REAL)[0]
@@ -525,6 +598,8 @@ def owner_texts(since, until, deadline=None, stats=None, cache_path=None, cache_
         rows = _owner_texts(since, until, stats, cache_path, cache_reset, stop - 0.25)
         if time.time() >= stop:
             raise error
+        if stats is not None:
+            stats['owner_result'] = 'ok'
         return rows
 
 
@@ -569,9 +644,13 @@ def _owner_texts(since, until, stats, cache_path, cache_reset, stop):
                 cursors.add(cursor)
                 params['cursor'] = cursor
 
+    if stats is not None:
+        stats['owner_result'] = 'incomplete'
     path = Path(cache_path) if cache_path is not None else Path(os.environ.get(
         'MONEY_CASES_DIR', '~/Documents/assistant/money-cases')).expanduser() / 'owner-texts.json'
     cache = owner_cache(path, cache_reset)
+    if stats is not None:
+        stats['owner_cache_size'] = len(cache)
 
     def read_thread(thread):
         title = str(thread.get('title') or '')
@@ -637,6 +716,17 @@ def _owner_texts(since, until, stats, cache_path, cache_reset, stop):
             covered.add(thread['threadId'])
         else:
             needed.append(thread)
+    # Give uncached spans and changed threads a share of every request window.
+    # Each queue retains newest-first order; churn cannot starve older cold spans.
+    full, changed = [], []
+    for thread in needed:
+        prior = cache.get(thread['threadId'])
+        (full if prior is None or owner_time(prior['coveredFrom']) > since else changed).append(thread)
+    needed = [thread for pair in itertools.zip_longest(full, changed) for thread in pair if thread is not None]
+    if stats is not None:
+        stats['owner_threads_selected'] = len(selected)
+        stats['owner_threads_fresh'] = len(covered)
+        stats['owner_threads_needed'] = len(needed)
     errors = []
     pool = ThreadPoolExecutor(max_workers=6)
     futures = {}
@@ -661,9 +751,13 @@ def _owner_texts(since, until, stats, cache_path, cache_reset, stop):
         try:
             cache[tid] = future.result()
             covered.add(tid)
+            if stats is not None:
+                stats['owner_threads_fetched'] += 1
         except Lookup as exc:
             errors.append(exc)
-    save_owner_cache(path, cache, since, until)
+    size = save_owner_cache(path, cache, since, until)
+    if stats is not None:
+        stats['owner_cache_size'] = size
     if len(covered) != len(selected):
         detail = ': ' + str(errors[0]) if errors else ''
         raise Lookup(f'Robob control: owner read incomplete ({len(covered)} of {len(selected)} threads); '
@@ -741,7 +835,11 @@ def receipt(charge, at, now, find=None, deadline=None, read=None, memo=None, sta
     and reads as a receipt, and either names the merchant (from two hours before to 36 hours after) or,
     under another name, shows the card's last four digits within 15 minutes of it. Search hits are
     checked against the mail itself."""
-    options = {'memo': memo, 'stats': stats} if memo is not None else {}
+    options = {}
+    if memo is not None:
+        options['memo'] = memo
+    if stats is not None:
+        options['stats'] = stats
     find = find or (lambda *a, **kw: search(*a, **kw, **options))
     read = read or (lambda row, deadline: show(row, deadline, **options))
     amount = ' OR '.join(f'"{v}"' for v in amounts(charge))
@@ -923,20 +1021,40 @@ def found(charge, at, now, deadline=None, find=None, said=None, errors=None, mem
     """A receipt or his own words that explain the charge, or None."""
     errors = [] if errors is None else errors
     limits = [] if limits is None else limits
+    receipt_result = 'error'
+    receipt_end = time.time()
     try:
-        # Mail must leave a slice for order history, including when a custom
-        # finder ignores its timeout. The enclosing question alarm stays earlier.
-        mail_end = time.time() + MSGS_BUDGET
+        # Several fast searches/reads can exhaust a two-second scan. Keep the
+        # per-process cap, but allow four seconds inside the six-second question,
+        # leaving two for order history even when a finder ignores its timeout.
+        mail_end = time.time() + RECEIPT_BUDGET
         if deadline is not None:
             mail_end = min(mail_end, deadline)
+        receipt_end = mail_end
+        alarm = signal.getitimer(signal.ITIMER_REAL)[0]
+        if alarm:
+            receipt_end = min(receipt_end, time.time() + alarm)
         with step_timing(stats, 'receipt', mail_end), within(mail_end, Lookup('receipt lookup over time')):
             row = receipt(charge, at, now, find, mail_end, memo=memo, stats=stats, receipt_ok=receipt_ok)
+        receipt_result = 'found' if row else 'none'
         if row:
             when = dt.datetime.fromtimestamp(row['ts'], TZ).strftime('%a %d %b %H:%M')
             return {'verdict': 'receipt', 'why': f"receipt {when}: {row.get('sender', '')} - {row.get('subject', '')}"[:200],
                     'msgs': row.get('id'), 'errors': errors}
     except Lookup as e:
+        receipt_result = 'out_of_time' if getattr(e, '_money_cases_timeout', False) or \
+            time.time() >= receipt_end or 'out of time' in str(e) or \
+            'over time' in str(e) or isinstance(e.__cause__, subprocess.TimeoutExpired) else 'error'
         errors.append(f'receipt: {e}')
+    except BaseException as exc:
+        if getattr(exc, '_money_cases_timeout', False) or time.time() >= receipt_end:
+            receipt_result = 'out_of_time'
+        raise
+    finally:
+        target = stats if stats is not None else TIMING_STATS.get()
+        if target is not None:
+            counts = target.setdefault('receipt_result', {})
+            counts[receipt_result] = counts.get(receipt_result, 0) + 1
     try:
         hit = order_receipt(charge, at, now, deadline, memo=memo, stats=stats)
         if hit:
