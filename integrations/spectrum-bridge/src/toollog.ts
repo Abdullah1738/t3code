@@ -6,7 +6,7 @@ import { writeFile, readFile, rename, unlink } from "node:fs/promises";
 import { logDirectory } from "./log-directory.ts";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
-import { cleanCalls, createCallAggregation, type CallSummary } from "./log-calls.ts";
+import { cleanCalls, createCallAggregation, SLOW_CALL_MS, type CallSummary } from "./log-calls.ts";
 import { summarizeLog } from "./log-rollup.ts";
 import { createChainAggregation } from "./log-chains.ts";
 import { recordRenderCounts, renderCounts } from "./log-render-store.ts";
@@ -35,6 +35,7 @@ const ENUMS: Record<string, readonly string[]> = {
   method: ["GET", "POST", "PUT", "DELETE", "PATCH"],
   failureCode: ["none", "renderer_failed", "preview_missing", "render_exception", "page_fetch", "page_http", "page_type", "page_body", "image_fetch", "image_http", "image_type", "image_body", "upload", "upload_url", "invalid_url", "file_prepare"],
   completionCheck: ["before", "after", "unchecked"],
+  failureFormat: ["single"],
 };
 
 // Only reduced diagnostics cross this boundary; input objects can contain prompts or credentials.
@@ -147,7 +148,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
         } catch { /* Another process already wrote the cap notice. */ }
         finally { if (marker !== undefined) closeSync(marker); }
         const renderDetail = line.name === "card.render" && (line.ok === false || (line.durationMs ?? 0) > 1_000);
-        const slowOrFailedCall = line.name === "turn.robob_call" && ((line.durationMs ?? 0) > 1_000 || line.ok === false);
+        const slowOrFailedCall = line.name === "turn.robob_call" && ((line.durationMs ?? 0) > SLOW_CALL_MS || line.ok === false);
         if (line.kind !== "error" && !["turn.start", "turn.end", "turn.robob_calls"].includes(line.name) && !slowOrFailedCall && !renderDetail) return;
       }
       if (line.name === "card.renders" && line.renders) recordRenderCounts(dir, line);
@@ -168,7 +169,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   }
   function write(entry: Entry): void {
     try {
-      if (entry.kind === "error" || entry.name === "form.fail") entry = { ...entry, site: entry.site ?? logSite() };
+      if (entry.kind === "error" || entry.name === "form.fail" || entry.name === "turn.robob_call" && entry.ok === false) entry = { ...entry, site: entry.site ?? logSite() };
       if (entry.name === "form.fail" && entry.kind !== "error") entry = { ...entry, kind: "error", error: entry.error ?? { tag: "form.gone" } };
       const line = clean(entry, new Date(now()).toISOString(), processRunId);
       if (!line) return;

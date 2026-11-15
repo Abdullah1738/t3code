@@ -613,14 +613,23 @@ export interface RunExecutionServiceV2StartRootRunInput {
   readonly loadDelegatedTask?: DelegatedTaskRecoveryService.LoadDelegatedTask;
   readonly hasUnpairedRunInterruptRequest?: () => Effect.Effect<boolean, never>;
   readonly loadRunInterruptReason?: () => Effect.Effect<string | undefined>;
+  readonly loadRunCancelMetadata?: () => Effect.Effect<
+    Pick<OrchestrationV2Run, "cancelReason" | "cancelDetail"> | undefined
+  >;
   readonly message: ProviderAdapter.ProviderAdapterV2TurnMessage;
   readonly modelSelection: ModelSelection;
   readonly runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
 }
 
 export interface RunExecutionServiceV2Shape {
+  readonly noteCancellation: (
+    runId: OrchestrationV2Run["id"],
+    reason: NonNullable<OrchestrationV2Run["cancelReason"]>,
+  ) => Effect.Effect<void>;
   readonly prepareUsageBeforeStart: (
-    input: RunUsageInput,
+    input: RunUsageInput & {
+      readonly loadCancelMetadata?: RunExecutionServiceV2StartRootRunInput["loadRunCancelMetadata"];
+    },
   ) => Effect.Effect<
     (status: "completed" | "failed" | "interrupted" | "cancelled") => Effect.Effect<void>
   >;
@@ -752,13 +761,18 @@ export const layer: Layer.Layer<
         .stream({ eventType: "run.updated", afterSequence: usageStreamStart.value })
         .pipe(
           Stream.runForEach(({ event }) => {
-            if (
-              event.type !== "run.updated" ||
-              (event.payload.status !== "interrupted" && event.payload.status !== "cancelled")
-            )
-              return Effect.void;
+            if (event.type !== "run.updated") return Effect.void;
             const entry = usageByRun.get(event.payload.id);
             if (!entry) return Effect.void;
+            if (
+              event.payload.cancelReason !== undefined &&
+              ((event.payload.cancelReason !== "provider_cancelled" &&
+                event.payload.cancelReason !== "provider_interrupted") ||
+                entry.measurements.cancelReason === undefined)
+            )
+              entry.measurements.cancelReason = event.payload.cancelReason;
+            if (event.payload.status !== "interrupted" && event.payload.status !== "cancelled")
+              return Effect.void;
             entry.ended = event.payload.status;
             return usageFallbacks.get(event.payload.id)?.(event.payload.status) ?? Effect.void;
           }),
@@ -779,6 +793,7 @@ export const layer: Layer.Layer<
         readonly shouldFinalizeRun?: () => Effect.Effect<boolean, ProjectionStoreV2Error>;
         readonly hasUnpairedRunInterruptRequest?: () => Effect.Effect<boolean, never>;
         readonly loadRunInterruptReason?: () => Effect.Effect<string | undefined>;
+        readonly loadRunCancelMetadata?: RunExecutionServiceV2StartRootRunInput["loadRunCancelMetadata"];
         readonly openRunOwnedSubagents?: OpenRunOwnedSubagentProjection;
         readonly terminal: ProviderTerminalEvent;
         readonly failureItemPersisted: boolean;
@@ -789,6 +804,10 @@ export const layer: Layer.Layer<
         };
       }) {
         const completedAt = yield* DateTime.now;
+        const cancelMetadata =
+          input.terminal.status === "cancelled" || input.terminal.status === "interrupted"
+            ? yield* input.loadRunCancelMetadata?.() ?? Effect.succeed(undefined)
+            : undefined;
         const interruptReason =
           input.terminal.status === "interrupted"
             ? yield* input.loadRunInterruptReason?.() ?? Effect.succeed(undefined)
@@ -877,6 +896,15 @@ export const layer: Layer.Layer<
         const finalizedRun: OrchestrationV2Run = {
           ...runWithoutDelegatedCompletion,
           status: persistedStatus,
+          ...(persistedStatus === "cancelled" || persistedStatus === "interrupted"
+            ? {
+                cancelReason:
+                  cancelMetadata?.cancelReason ??
+                  input.run.cancelReason ??
+                  (persistedStatus === "cancelled" ? "provider_cancelled" : "provider_interrupted"),
+                cancelDetail: cancelMetadata?.cancelDetail ?? input.run.cancelDetail,
+              }
+            : {}),
           completedAt: input.terminal.status === "completed" ? null : completedAt,
         };
         const finalizedRootNode: OrchestrationV2ExecutionNode = {
@@ -1023,6 +1051,19 @@ export const layer: Layer.Layer<
           } else {
             yield* eventSink.writeWithEffects(finalization);
           }
+          const committedMetadata =
+            persistedStatus === "cancelled" || persistedStatus === "interrupted"
+              ? yield* input.loadRunCancelMetadata?.() ?? Effect.succeed(undefined)
+              : undefined;
+          const usage = usageByRun.get(input.run.id);
+          const reason = committedMetadata?.cancelReason ?? finalizedRun.cancelReason;
+          if (
+            usage?.activeAttemptId === input.attempt.id &&
+            reason !== undefined &&
+            (usage.measurements.cancelReason === undefined ||
+              (reason !== "provider_cancelled" && reason !== "provider_interrupted"))
+          )
+            usage.measurements.cancelReason = reason;
           yield* input.recordUsage(input.terminal);
           return true;
         }).pipe(Effect.uninterruptible);
@@ -1050,6 +1091,13 @@ export const layer: Layer.Layer<
       return { ...observer, entry };
     });
     return RunExecutionServiceV2.of({
+      noteCancellation: Effect.fn("RunExecutionService.noteCancellation")((runId, reason) =>
+        Effect.sync(() => {
+          const entry = usageByRun.get(runId);
+          if (entry !== undefined && !entry.measurements.finished && entry.ended === undefined)
+            entry.measurements.cancelReason = reason;
+        }),
+      ),
       prepareUsageBeforeStart: Effect.fn("RunExecutionService.prepareUsageBeforeStart")(function* (
         input,
       ) {
@@ -1058,20 +1106,30 @@ export const layer: Layer.Layer<
           ...input,
           run: { ...input.run, startedAt: input.run.startedAt ?? (yield* DateTime.now) },
         });
-        const finish = (status: "completed" | "failed" | "interrupted" | "cancelled") =>
-          Effect.suspend(() =>
-            usage.entry.activeAttemptId !== input.attempt.id
-              ? Effect.void
-              : usage.finish(status).pipe(
-                  Effect.ensuring(
-                    Effect.sync(() => {
-                      if (usageByRun.get(input.run.id) !== usage.entry) return;
-                      usageByRun.delete(input.run.id);
-                      usageFallbacks.delete(input.run.id);
-                    }),
-                  ),
-                ),
+        const finish = Effect.fn("RunExecutionService.finishPreparedUsage")(function* (
+          status: "completed" | "failed" | "interrupted" | "cancelled",
+        ) {
+          if (usage.entry.activeAttemptId !== input.attempt.id) return;
+          if (status === "interrupted" || status === "cancelled") {
+            const metadata = yield* input.loadCancelMetadata?.() ?? Effect.succeed(undefined);
+            const current = usage.entry.measurements.cancelReason;
+            if (
+              current === undefined ||
+              current === "provider_cancelled" ||
+              current === "provider_interrupted"
+            )
+              usage.entry.measurements.cancelReason = metadata?.cancelReason ?? current;
+          }
+          yield* usage.finish(status).pipe(
+            Effect.ensuring(
+              Effect.sync(() => {
+                if (usageByRun.get(input.run.id) !== usage.entry) return;
+                usageByRun.delete(input.run.id);
+                usageFallbacks.delete(input.run.id);
+              }),
+            ),
           );
+        });
         if (
           usage.entry.activeAttemptId === input.attempt.id &&
           !usage.entry.measurements.finished
@@ -1204,6 +1262,7 @@ export const layer: Layer.Layer<
                 cause,
               });
               yield* writeFinalRunEvents({
+                loadRunCancelMetadata: input.loadRunCancelMetadata,
                 deferUsage: deferUsage(),
                 recordUsage,
                 run: input.run,
@@ -1461,6 +1520,7 @@ export const layer: Layer.Layer<
           const providerThread = yield* currentProviderThread;
           const openSubagents = yield* Ref.get(openRunOwnedSubagents);
           yield* writeFinalRunEvents({
+            loadRunCancelMetadata: input.loadRunCancelMetadata,
             deferUsage: deferUsage(),
             recordUsage,
             run: input.run,
@@ -2156,6 +2216,7 @@ export const layer: Layer.Layer<
                 else if (!(yield* nativeEndConfirmed))
                   yield* stopOrphanedProviderTurn(providerThread);
                 yield* writeFinalRunEvents({
+                  loadRunCancelMetadata: input.loadRunCancelMetadata,
                   deferUsage: deferUsage(),
                   recordUsage,
                   run: input.run,
@@ -2296,6 +2357,7 @@ export const layer: Layer.Layer<
         if (refused) {
           yield* stopProviderEventIngestion;
           yield* writeFinalRunEvents({
+            loadRunCancelMetadata: input.loadRunCancelMetadata,
             deferUsage: deferUsage(),
             recordUsage,
             run: input.run,
@@ -2427,6 +2489,7 @@ export const layer: Layer.Layer<
                         Ref.get(openRunOwnedSubagents).pipe(
                           Effect.flatMap((openSubagents) =>
                             writeFinalRunEvents({
+                              loadRunCancelMetadata: input.loadRunCancelMetadata,
                               deferUsage: deferUsage(),
                               recordUsage,
                               run: input.run,

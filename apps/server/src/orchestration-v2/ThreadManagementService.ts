@@ -207,6 +207,7 @@ export interface ThreadManagementInterruptInput {
   readonly attemptId?: RunAttemptId;
   readonly delegatedTaskStall?: NonNullable<OrchestrationV2Run["delegatedTaskStall"]>;
   readonly reason?: string;
+  readonly cancelReason?: OrchestrationV2Run["cancelReason"];
 }
 
 export type ThreadManagementInterruptResult =
@@ -505,6 +506,7 @@ export interface ThreadManagementServiceShape {
     readonly threadId: ThreadId;
     readonly commandId: CommandId;
     readonly reason?: string | undefined;
+    readonly cancelReason?: OrchestrationV2Run["cancelReason"];
   }) => Effect.Effect<
     void,
     Orchestrator.OrchestratorV2Error | ThreadManagementProviderInstanceDisabledError
@@ -1317,6 +1319,7 @@ const make = Effect.gen(function* () {
           {
             type: "run.interrupt",
             commandId: interruptCommandId,
+            cancelReason: "superseded",
             threadId: input.threadId,
             runId: steerableRun.id,
             fenced: true,
@@ -1584,6 +1587,7 @@ const make = Effect.gen(function* () {
         commandId: input.commandId,
         threadId: input.threadId,
         runId: interruptibleRun.id,
+        cancelReason: input.cancelReason,
         ...(input.delegatedTaskStall === undefined
           ? {}
           : { delegatedTaskStall: input.delegatedTaskStall }),
@@ -1715,6 +1719,7 @@ const make = Effect.gen(function* () {
       yield* dispatch({
         type: "thread.stop",
         commandId: CommandId.make(`${input.commandId}:stop:${threadId}`),
+        cancelReason: input.cancelReason ?? "delegated_parent_cancelled",
         threadId,
         ...(input.reason === undefined ? {} : { reason: input.reason }),
       }).pipe(

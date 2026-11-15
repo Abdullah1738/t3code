@@ -9,6 +9,7 @@ import type { ThreadManagementTerminalRunStatus } from "../../../orchestration-v
 
 import {
   KANBAN_BACKLOG,
+  type OrchestrationV2Run,
   type KanbanMoveOptions,
   KANBAN_DONE_STAGES,
   KANBAN_THREAD_STAGES,
@@ -1012,6 +1013,11 @@ export interface KanbanServiceShape {
     threadId: ThreadId,
     startTimeout?: StartTimeout,
   ) => Effect.Effect<void, KanbanError>;
+  readonly reconcileRunCancellation: (
+    threadId: ThreadId,
+    runId: string,
+  ) => Effect.Effect<void, KanbanError>;
+  readonly notifyRunCancellation: (threadId: ThreadId, runId: string) => Effect.Effect<void>;
   /** Periodic upkeep: typing heartbeat, PR states, dispatch. */
   readonly tick: Effect.Effect<void, KanbanError>;
   /** Probes the models paused threads wait on and wakes them when one answers. */
@@ -1043,6 +1049,7 @@ interface StartTimeout {
 }
 type Job =
   | { readonly _tag: "kick" }
+  | { readonly _tag: "cancelReason"; readonly threadId: ThreadId; readonly runId: string }
   | { readonly _tag: "turnEnd"; readonly threadId: ThreadId; readonly startTimeout?: StartTimeout };
 
 /** A slot a work thread keeps between cards (see `holds`). */
@@ -1677,6 +1684,10 @@ const make = Effect.gen(function* () {
   const archivedThreads = new Map<ThreadId, KanbanBoardId>();
   const poolHours = new Map<string, number>();
   const failedRuns = new Set<string>();
+  const pendingCancelReasons = new Map<
+    string,
+    Map<KanbanCard["id"], Pick<KanbanCard, "id" | "boardId">>
+  >();
   const stoppedRunCards = new Map<
     string,
     { runId: string; card: Pick<KanbanCard, "id" | "boardId" | "activePool" | "model"> }
@@ -2039,9 +2050,17 @@ const make = Effect.gen(function* () {
       effect.pipe(
         Effect.ignore,
         Effect.ensuring(
-          touching(id, threadIo.interrupt(id, "Board state changed during launch", true)).pipe(
-            Effect.ignore,
-          ),
+          touching(
+            id,
+            threadIo.interrupt(
+              id,
+              "Board state changed during launch",
+              true,
+              undefined,
+              undefined,
+              "superseded",
+            ),
+          ).pipe(Effect.ignore),
         ),
       ),
   );
@@ -2052,6 +2071,7 @@ const make = Effect.gen(function* () {
       cancelQueued?: boolean,
       runId?: string,
       acknowledged: Effect.Effect<void, E> = Effect.void,
+      cancelReason: OrchestrationV2Run["cancelReason"] = "card_stop",
     ) =>
       Effect.acquireUseRelease(
         Effect.sync(() => {
@@ -2060,7 +2080,10 @@ const make = Effect.gen(function* () {
         }),
         () =>
           locks.outside(
-            touching(id, threadIo.interrupt(id, reason, cancelQueued, runId)).pipe(
+            touching(
+              id,
+              threadIo.interrupt(id, reason, cancelQueued, runId, undefined, cancelReason),
+            ).pipe(
               Effect.tap((result) =>
                 Effect.sync(() => {
                   observeStop(id, result);
@@ -2107,7 +2130,14 @@ const make = Effect.gen(function* () {
   ) {
     // A restored board may already own another run and queue in this thread.
     yield* touching(threadId, threadIo.cancelQueued(threadId, runId));
-    yield* interruptThread(threadId, "Board deleted while sending", false, runId);
+    yield* interruptThread(
+      threadId,
+      "Board deleted while sending",
+      false,
+      runId,
+      Effect.void,
+      "superseded",
+    );
   });
 
   const saveSendStop = Effect.fn("KanbanService.saveSendStop")(function* (
@@ -2359,10 +2389,13 @@ const make = Effect.gen(function* () {
     withdraw: (input) => locks.outside(touching(input.threadId, threadIo.withdraw(input))),
     setModel: (id, model) =>
       locks.outside(withThreadModel(id, touching(id, threadIo.setModel(id, model)))),
-    cancelQueued: (id, run) => locks.outside(touching(id, threadIo.cancelQueued(id, run))),
+    cancelQueued: (id, run, cancelReason) =>
+      locks.outside(touching(id, threadIo.cancelQueued(id, run, cancelReason))),
     // Best effort, as before, for the board's own inline stops; saved stops use `runPendingStops`.
-    interrupt: (id, reason, cancelQueued, runId) =>
-      interruptThread(id, reason, cancelQueued, runId).pipe(Effect.ignore),
+    interrupt: (id, reason, cancelQueued, runId, _messageId, cancelReason) =>
+      interruptThread(id, reason, cancelQueued, runId, Effect.void, cancelReason).pipe(
+        Effect.ignore,
+      ),
   };
   /** Thread reads that confirm the current run: always read, never replayed. */
   const freshThreads = {
@@ -4625,7 +4658,14 @@ const make = Effect.gen(function* () {
         // leaves the abandoned evaluator running. It must be seen stopped before the
         // next one starts with the same instruction; otherwise the route retries.
         else {
-          yield* threads.interrupt(launched, "Board state changed during launch", true);
+          yield* threads.interrupt(
+            launched,
+            "Board state changed during launch",
+            true,
+            undefined,
+            undefined,
+            "superseded",
+          );
           const run = yield* threads.latestRun(launched).pipe(Effect.mapError(toKanbanError));
           if (run !== null && !FINISHED_RUN_STATUSES.has(run.status)) {
             return yield* failWith("failed", `abandoned evaluator ${launched} is still running`);
@@ -5724,7 +5764,14 @@ const make = Effect.gen(function* () {
       if (originalOwner !== null) {
         const prior = yield* threads.find(originalOwner);
         if (prior?.archived) {
-          yield* threads.interrupt(originalOwner, `Replaced as evaluator of "${discussion.title}"`);
+          yield* threads.interrupt(
+            originalOwner,
+            `Replaced as evaluator of "${discussion.title}"`,
+            false,
+            undefined,
+            undefined,
+            "superseded",
+          );
           discussion = yield* discussionOf(discussion.id);
         }
       }
@@ -5764,7 +5811,14 @@ const make = Effect.gen(function* () {
         }
         reuse.reason = !view ? "missing" : view.archived ? "archived" : "idle_expired";
         if (view)
-          yield* threads.interrupt(ownerId, `Replaced as evaluator of "${discussion.title}"`);
+          yield* threads.interrupt(
+            ownerId,
+            `Replaced as evaluator of "${discussion.title}"`,
+            false,
+            undefined,
+            undefined,
+            "superseded",
+          );
       }
       discussion = yield* discussionOf(discussion.id);
       if (discussion.evaluatorThreadId !== null) {
@@ -6959,6 +7013,7 @@ const make = Effect.gen(function* () {
                   false,
                   undefined,
                   effect.messageId,
+                  "superseded",
                 ),
               ),
             );
@@ -10542,11 +10597,23 @@ const make = Effect.gen(function* () {
         failure === null || stopped !== undefined
           ? yield* threads.latestRun(threadId).pipe(Effect.orElseSucceed(() => null))
           : null;
+      const observedRun =
+        failure === null
+          ? lastRun
+          : failure.runId == null
+            ? null
+            : lastRun?.runId === failure.runId
+              ? lastRun
+              : yield* threads
+                  .compactRun(threadId, failure.runId)
+                  .pipe(Effect.orElseSucceed(() => null));
       const interrupted = lastRun?.status === "interrupted" || lastRun?.status === "cancelled";
       const observations: Array<{
         card: Pick<KanbanCard, "id" | "boardId" | "activePool" | "model">;
         runId: string;
         errorClass: string;
+        cancelReason?: OrchestrationV2Run["cancelReason"];
+        cancelDetail?: string | undefined;
         model: ModelSelection | null;
       }> = [];
       if (failure !== null || interrupted) {
@@ -10565,6 +10632,8 @@ const make = Effect.gen(function* () {
                 ? "interrupted"
                 : BoardAnalytics.reasonClass(failure.message, failure.category),
             model: failure?.model ?? lastRun?.model ?? null,
+            cancelReason: observedRun?.cancelReason,
+            cancelDetail: observedRun?.cancelDetail,
           });
       }
       if (stopped !== undefined) {
@@ -10581,6 +10650,8 @@ const make = Effect.gen(function* () {
             runId: stopped.runId,
             errorClass: "interrupted",
             model: terminal.model ?? null,
+            cancelReason: terminal.cancelReason,
+            cancelDetail: terminal.cancelDetail,
           });
         if (
           terminal !== null &&
@@ -10603,9 +10674,38 @@ const make = Effect.gen(function* () {
             poolKey: entry.activePool ?? (model === null ? "unknown" : Rules.poolKey(model)),
             model: model === null ? "unknown" : BoardAnalytics.label(model.model),
             errorClass,
+            runId,
+            ...(observation.cancelReason === undefined
+              ? {}
+              : { cancelReason: observation.cancelReason }),
           },
         });
+        if (observation.cancelReason !== undefined) {
+          yield* store.addCardEvent({
+            cardId: entry.id,
+            at: yield* nowIso,
+            actor: { _tag: "system", component: "dispatcher" },
+            kind: "comment",
+            fromStage: null,
+            toStage: null,
+            head: null,
+            body: `Run ${runId} ended (${observation.cancelReason}${observation.cancelDetail === undefined ? "" : `: ${observation.cancelDetail}`})`,
+          });
+        }
         failedRuns.add(identity);
+        if (
+          errorClass === "interrupted" &&
+          (observation.cancelReason === undefined ||
+            observation.cancelReason === "provider_cancelled" ||
+            observation.cancelReason === "provider_interrupted")
+        ) {
+          const key = `${threadId}:${runId}`;
+          const cards = pendingCancelReasons.get(key) ?? new Map();
+          cards.set(entry.id, { id: entry.id, boardId: entry.boardId });
+          pendingCancelReasons.set(key, cards);
+          if (pendingCancelReasons.size > 4096)
+            pendingCancelReasons.delete(pendingCancelReasons.keys().next().value!);
+        }
         if (failedRuns.size > 4096) failedRuns.delete(failedRuns.values().next().value!);
       }
     }
@@ -12016,6 +12116,7 @@ const make = Effect.gen(function* () {
                         current.id,
                       ),
                     ),
+                    "task_stalled",
                   ).pipe(
                     Effect.ensuring(
                       Effect.sync(() => {
@@ -12230,6 +12331,10 @@ const make = Effect.gen(function* () {
                     yield* threads.interrupt(
                       threadId,
                       "Stuck on its own question; the board nudges it",
+                      false,
+                      undefined,
+                      undefined,
+                      "task_stalled",
                     );
                     const at = yield* nowIso;
                     yield* logEvent(
@@ -18606,15 +18711,63 @@ const make = Effect.gen(function* () {
     );
   }
 
+  const reconcileRunCancellationUnlocked = Effect.fn("KanbanService.reconcileRunCancellation")(
+    function* (threadId: ThreadId, runId: string) {
+      const key = `${threadId}:${runId}`;
+      const cards = pendingCancelReasons.get(key);
+      if (cards === undefined) return;
+      const run = yield* locks.outside(threadIo.compactRun(threadId, runId), undefined, true);
+      if (
+        run === null ||
+        (run.status !== "cancelled" && run.status !== "interrupted") ||
+        run.cancelReason === undefined ||
+        run.cancelReason === "provider_cancelled" ||
+        run.cancelReason === "provider_interrupted"
+      )
+        return;
+      // Early provider cleanup can publish a terminal before Stop commits its source.
+      for (const [id, card] of cards) {
+        yield* store.addCardEvent({
+          cardId: id,
+          at: yield* nowIso,
+          actor: { _tag: "system", component: "dispatcher" },
+          kind: "comment",
+          fromStage: null,
+          toStage: null,
+          head: null,
+          body: `Run ${runId} cancellation reason corrected (${run.cancelReason}${run.cancelDetail === undefined ? "" : `: ${run.cancelDetail}`})`,
+        });
+        cards.delete(id);
+        yield* recordAnalytics({
+          kind: "kanban.cancel_reason_updated",
+          boardId: card.boardId,
+          cardId: id,
+          threadId,
+          props: { runId, cancelReason: run.cancelReason },
+        });
+      }
+      pendingCancelReasons.delete(key);
+    },
+  );
+
+  const reconcileRunCancellation = (threadId: ThreadId, runId: string) =>
+    serial(turnEnding, threadId, reconcileRunCancellationUnlocked(threadId, runId));
+
   const runJob = (job: Job) =>
     read(
       job._tag === "kick"
         ? dispatchUnlocked()
-        : turnEndedUnlocked(job.threadId, undefined, false, job.startTimeout),
+        : job._tag === "cancelReason"
+          ? reconcileRunCancellation(job.threadId, job.runId)
+          : turnEndedUnlocked(job.threadId, undefined, false, job.startTimeout),
     ).pipe(
       Effect.provideService(
         BoardLocks.operationName,
-        job._tag === "kick" ? "dispatchNow" : "turnEnded",
+        job._tag === "kick"
+          ? "dispatchNow"
+          : job._tag === "cancelReason"
+            ? "reconcileRunCancellation"
+            : "turnEnded",
       ),
       NodeSqliteClient.backgroundReads,
       Effect.catchCause((cause) =>
@@ -19472,6 +19625,10 @@ const make = Effect.gen(function* () {
     ),
     turnEnded: (threadId, startTimeout) =>
       guard("turnEnded", turnEndedUnlocked(threadId, undefined, false, startTimeout)),
+    reconcileRunCancellation: (threadId, runId) =>
+      guard("reconcileRunCancellation", reconcileRunCancellation(threadId, runId)),
+    notifyRunCancellation: (threadId, runId) =>
+      Queue.offer(jobs, { _tag: "cancelReason", threadId, runId }).pipe(Effect.asVoid),
     tick: read(tickUnlocked()).pipe(
       NodeSqliteClient.backgroundReads,
       Effect.provideService(BoardLocks.operationName, "tick"),
