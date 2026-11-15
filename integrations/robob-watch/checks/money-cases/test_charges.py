@@ -836,7 +836,7 @@ class OwnerTexts(unittest.TestCase):
             kept = json.loads(path.read_text())
             self.assertEqual(set(kept), {'a'})
             self.assertEqual([r['text'] for r in kept['a']['texts']], ['recent'])
-            self.assertEqual(kept['a']['coveredFrom'], ch.iso(cutoff))
+            self.assertEqual(ch.owner_time(kept['a']['coveredFrom']), cutoff)
             # An old followed question extends retention without reading cases.json.
             path.write_text(json.dumps(cached))
             ch.owner_texts(cutoff - dt.timedelta(days=2), until)
@@ -856,6 +856,15 @@ class OwnerTexts(unittest.TestCase):
             server.responses.clear()
             server.calls.clear()
             self.assertEqual(len(self.read()), 3)
+            self.assertEqual(len(self.message_calls(server)), 1)
+
+    def test_coverage_preserves_fractional_millisecond_boundaries(self):
+        since = at('2026-10-24T03:00:00.000500')
+        until = at('2026-10-24T05:00')
+        with ControlServer([summary('boundary', createdAt=ch.iso(since))]) as server:
+            self.assertEqual(ch.owner_texts(since, until), [])
+            server.calls.clear()
+            self.assertEqual(len(ch.owner_texts(since - dt.timedelta(microseconds=500), until)), 1)
             self.assertEqual(len(self.message_calls(server)), 1)
 
     def test_renamed_archived_and_nonowner_threads_do_not_reuse_cached_texts(self):

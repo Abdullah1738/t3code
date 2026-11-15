@@ -499,7 +499,7 @@ def save_owner_cache(path, cache, since, until):
     for tid, entry in cache.items():
         if owner_time(entry['updatedAt']) < cutoff:
             continue
-        kept[tid] = {**entry, 'coveredFrom': iso(max(cutoff, owner_time(entry['coveredFrom']))),
+        kept[tid] = {**entry, 'coveredFrom': max(cutoff, owner_time(entry['coveredFrom'])).isoformat(),
                      'texts': [row for row in entry['texts'] if owner_time(row['createdAt']) >= cutoff]}
     try:
         write_json(path, kept)
@@ -600,7 +600,9 @@ def owner_texts(since, until, deadline=None, stats=None, cache_path=None, cache_
             out.pop(mid, None)
             if created >= covered_from and typed and not text.startswith('[Forwarded by'):
                 out[mid] = {'messageId': mid, 'createdAt': iso(created), 'text': text, 'title': title}
-        return {'updatedAt': thread['updatedAt'], 'coveredFrom': iso(since) if full else prior['coveredFrom'],
+        # Preserve the caller's precision: rounding down would claim an unread
+        # fractional millisecond when a later call moves its window earlier.
+        return {'updatedAt': thread['updatedAt'], 'coveredFrom': since.isoformat() if full else prior['coveredFrom'],
                 'title': title, 'texts': list(out.values())}
 
     selected = []
