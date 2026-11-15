@@ -400,3 +400,60 @@ it.effect("start-only deadlines ignore other due types and retain future start r
     }).pipe(Effect.provide(workerLayer(outbox, () => Effect.void)));
   }).pipe(Effect.provide(Layer.merge(layerOutbox, TestClock.layer()))),
 );
+
+it.effect(
+  "idle start notifications and liveness probes skip write claims until a start is due",
+  () =>
+    Effect.gen(function* () {
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const occupied = yield* Queue.unbounded<void>();
+      const release = yield* Deferred.make<void>();
+      const ran = yield* Deferred.make<void>();
+      const startClaims = yield* Ref.make(0);
+      const observed: EffectOutbox.EffectOutboxV2Shape = {
+        ...outbox,
+        claimNext: (input) =>
+          (input.onlyEffectTypes?.includes("provider-turn.start")
+            ? Ref.update(startClaims, (n) => n + 1)
+            : Effect.void
+          ).pipe(Effect.andThen(outbox.claimNext(input))),
+      };
+      const busy = Array.from({ length: 4 }, (_, i) => slow(`idle-busy-${i}`));
+      yield* outbox.enqueue(busy);
+      yield* Effect.gen(function* () {
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        yield* EffectWorker.runDaemonWithOptions({ livenessPollIntervalMs: 100 }).pipe(
+          Effect.forkScoped,
+        );
+        for (const _ of busy) yield* Queue.take(occupied);
+        yield* TestClock.adjust("0 millis");
+        assert.equal(yield* Ref.get(startClaims), 0);
+        yield* outbox.enqueue([
+          {
+            ...start("not-yet-due"),
+            availableAt: DateTime.add(yield* DateTime.now, { seconds: 1 }),
+          },
+        ]);
+        yield* outbox.notifyAvailable(64);
+        yield* TestClock.adjust("500 millis");
+        assert.equal(yield* Ref.get(startClaims), 0);
+        assert.isFalse(yield* Deferred.isDone(ran));
+        yield* TestClock.adjust("500 millis");
+        yield* Deferred.await(ran);
+        yield* outbox.awaitSettled("not-yet-due");
+        assert.equal(Option.getOrThrow(yield* outbox.get("not-yet-due")).attemptCount, 1);
+        yield* Deferred.succeed(release, undefined);
+        for (const { id } of busy) yield* outbox.awaitSettled(id);
+        assert.equal(yield* worker.drain(), 0);
+      }).pipe(
+        Effect.provide(
+          workerLayer(observed, (effect) =>
+            effect.request.type === "provider-turn.start"
+              ? Deferred.succeed(ran, undefined).pipe(Effect.asVoid)
+              : Queue.offer(occupied, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          ),
+        ),
+        Effect.scoped,
+      );
+    }).pipe(Effect.provide(Layer.merge(layerOutbox, TestClock.layer()))),
+);

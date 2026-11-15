@@ -1068,6 +1068,16 @@ export const layerWithOptions = (
           lane: "general" | "control" | "start" = "general",
           threadId?: ThreadId,
         ) {
+          if (lane === "start") {
+            // Idle lane probes must not queue write claims behind useful work.
+            // The claim remains authoritative if another worker wins after this read.
+            const next = yield* outbox.nextStartClaimableAt;
+            if (
+              Option.isNone(next) ||
+              DateTime.toEpochMillis(next.value) > DateTime.toEpochMillis(yield* DateTime.now)
+            )
+              return false;
+          }
           const claimExit = yield* Effect.exit(
             outbox.claimNext({
               workerId,

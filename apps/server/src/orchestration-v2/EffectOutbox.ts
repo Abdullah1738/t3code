@@ -27,6 +27,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import { forkParked } from "../serverActivation.ts";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 const StoppedRunAttempts = Schema.Array(
   Schema.Struct({ runId: RunId, attemptId: Schema.NullOr(RunAttemptId) }),
@@ -774,7 +775,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
           FROM orchestration_v2_effect_outbox AS candidate
           WHERE ${claimableCandidatePredicate()}
             AND candidate.effect_type IN ${sql.in(START_LANE_EFFECT_TYPES)}
-        `.pipe(Effect.withTracerEnabled(false));
+        `.pipe(NodeSqliteClient.readOnly, Effect.withTracerEnabled(false));
         const availableAt = rows[0]?.available_at;
         if (availableAt === undefined || availableAt === null) return Option.none();
         const parsed = DateTime.make(availableAt);
