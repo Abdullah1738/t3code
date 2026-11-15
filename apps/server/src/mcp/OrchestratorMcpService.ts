@@ -606,6 +606,7 @@ function taskResultTransfer(
           transferredRunIds.has(run.id),
       ),
       messages: [],
+      contextTransfers: parent.contextTransfers,
     },
     task.id,
     originalRun,
@@ -2162,7 +2163,17 @@ const make = Effect.gen(function* () {
         McpTaskTrace.stage(effect, "child_records", "t3.task"),
       );
     const childRun = delegatedTaskRun(childControls, task);
-    const terminalRun = latestTerminalResultRun(childControls, childRun);
+    const progress = delegatedTaskProgress(childControls);
+    const taskResultRun =
+      childRun?.delegatedTaskId === task.id
+        ? delegatedTaskResultRun(childControls, task.id, childRun)
+        : progress.resultRun;
+    // Untagged notification wakes can be cancelled before starting; tagged
+    // restart recuts must still pass the started-run filter.
+    const terminalRun = latestTerminalResultRun(
+      childControls,
+      taskResultRun?.delegatedTaskId === undefined ? (taskResultRun ?? childRun) : childRun,
+    );
     const unfinishedRuns = childControls.runs
       .filter(
         (run) =>
@@ -2187,11 +2198,6 @@ const make = Effect.gen(function* () {
       hasPendingChildRuns: hasPendingChildRuns(childControls, childRun),
       ...startState(currentRun ?? childRun, childControls.providerTurns),
     });
-    const progress = delegatedTaskProgress(childControls);
-    const taskResultRun =
-      childRun?.delegatedTaskId === task.id
-        ? delegatedTaskResultRun(childControls, task.id, childRun)
-        : progress.resultRun;
     const resultRunAncestors = new Set<RunId>();
     let resultSource = taskResultRun;
     while (resultSource !== undefined && !resultRunAncestors.has(resultSource.id)) {

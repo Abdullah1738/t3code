@@ -3523,6 +3523,7 @@ describe("delegated background results", () => {
     "wake",
     "single",
     "cancelled_wake",
+    "cancelled_queued_wake",
     "foreign_task",
     "monitor_after_wake",
   ] as const)("delivers the task-scoped terminal result exactly once ($0)", (scenario) =>
@@ -3532,6 +3533,7 @@ describe("delegated background results", () => {
       const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
       const now = yield* DateTime.now;
       const id = (name: string) => `${name}:${scenario}`;
+      const cancelled = scenario === "cancelled_wake" || scenario === "cancelled_queued_wake";
       const threadId = ThreadId.make(id("background-result-parent"));
       const projectId = ProjectId.make(id("background-result-project"));
       const runId = RunId.make(id("background-result-parent"));
@@ -3646,10 +3648,51 @@ describe("delegated background results", () => {
           threadId: child.childThreadId,
           runId: RunId.make(id("background-result-wake")),
           ordinal: 2,
-          status: "running",
+          status: scenario === "cancelled_queued_wake" ? "queued" : "running",
           now,
         });
-        yield* sink.write({ events: [activeWake] });
+        yield* sink.write({
+          events: [
+            {
+              ...activeWake,
+              payload: {
+                ...activeWake.payload,
+                startedAt: scenario === "cancelled_queued_wake" ? null : now,
+                completedAt: null,
+              },
+            },
+            ...(scenario === "cancelled_queued_wake"
+              ? [
+                  {
+                    id: EventId.make(id("background-result-wake-notification")),
+                    type: "message.updated" as const,
+                    threadId: child.childThreadId,
+                    runId: activeWake.runId,
+                    occurredAt: now,
+                    payload: {
+                      id: activeWake.payload.userMessageId,
+                      threadId: child.childThreadId,
+                      runId: activeWake.runId,
+                      nodeId: null,
+                      role: "user" as const,
+                      text: "Background command completed",
+                      attachments: [],
+                      streaming: false,
+                      createdBy: "system" as const,
+                      creationSource: "server" as const,
+                      createdAt: now,
+                      updatedAt: now,
+                      notification: {
+                        source: { kind: "command" as const },
+                        outcome: "completed" as const,
+                        summary: "Background command completed",
+                      },
+                    },
+                  },
+                ]
+              : []),
+          ],
+        });
         yield* orchestrator.recoverDelegatedTasks;
         const active = yield* readStatus();
         assert.equal(active.workState, "working");
@@ -3661,18 +3704,17 @@ describe("delegated background results", () => {
       }
 
       const wakeRunId = RunId.make(id("background-result-wake"));
-      const finalText =
-        scenario === "cancelled_wake"
-          ? "Child task ended with status cancelled."
-          : scenario === "single" || scenario === "foreign_task"
-            ? "Single-turn result"
-            : "WATCH_DONE: exit 0, 18:48:10 / 18:51:30";
+      const finalText = cancelled
+        ? "Child task ended with status cancelled."
+        : scenario === "single" || scenario === "foreign_task"
+          ? "Single-turn result"
+          : "WATCH_DONE: exit 0, 18:48:10 / 18:51:30";
       if (scenario !== "single") {
         const wakeRun = runEvent({
           threadId: child.childThreadId,
           runId: wakeRunId,
           ordinal: 2,
-          status: scenario === "cancelled_wake" ? "cancelled" : "completed",
+          status: cancelled ? "cancelled" : "completed",
           now,
         });
         yield* sink.write({
@@ -3684,16 +3726,20 @@ describe("delegated background results", () => {
               occurredAt: now,
               payload: { ...providerThread, pendingBackgroundTasks: [] },
             },
-            {
-              ...wakeRun,
-              payload: {
-                ...wakeRun.payload,
-                ...(scenario === "foreign_task"
-                  ? { delegatedTaskId: NodeId.make("different-task") }
-                  : {}),
-              },
-            },
-            ...(scenario === "cancelled_wake"
+            ...(scenario === "cancelled_queued_wake"
+              ? []
+              : [
+                  {
+                    ...wakeRun,
+                    payload: {
+                      ...wakeRun.payload,
+                      ...(scenario === "foreign_task"
+                        ? { delegatedTaskId: NodeId.make("different-task") }
+                        : {}),
+                    },
+                  },
+                ]),
+            ...(cancelled
               ? []
               : [
                   {
@@ -3720,6 +3766,19 @@ describe("delegated background results", () => {
                 ]),
           ],
         });
+        if (scenario === "cancelled_queued_wake") {
+          yield* orchestrator.dispatch({
+            type: "queued-run.cancel",
+            commandId: CommandId.make(id("background-result-cancel-wake")),
+            threadId: child.childThreadId,
+            runId: wakeRunId,
+          });
+          const cancelledRun = (yield* orchestrator.getThreadProjection(
+            child.childThreadId,
+          )).runs.find((run) => run.id === wakeRunId)!;
+          assert.equal(cancelledRun.status, "cancelled");
+          assert.isNull(cancelledRun.startedAt);
+        }
       }
       yield* orchestrator.recoverDelegatedTasks;
       const completed = yield* orchestrator.getThreadProjection(threadId);
@@ -3798,7 +3857,7 @@ describe("delegated background results", () => {
         });
       }
       const status = yield* readStatus();
-      assert.equal(status.status, scenario === "cancelled_wake" ? "cancelled" : "completed");
+      assert.equal(status.status, cancelled ? "cancelled" : "completed");
       assert.equal(status.summary, finalText);
       assert.equal(
         status.latestTerminalSummary,

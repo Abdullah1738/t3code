@@ -16,6 +16,7 @@ import {
   type OrchestrationV2Run,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2AssistantPhase,
+  type OrchestrationV2Notification,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as DateTime from "effect/DateTime";
@@ -344,5 +345,79 @@ it.each([
     ["wake", "cancelled", "latest_tagged", "active_tagged"].includes(scenario)
       ? later.id
       : tagged.id,
+  );
+});
+
+it.each([
+  { source: "command", status: "cancelled", selected: true },
+  { source: "subagent", status: "cancelled", selected: true },
+  { source: "delegated_task", status: "cancelled", selected: true },
+  { source: "background_task", status: "cancelled", selected: true },
+  { source: "system", status: "cancelled", selected: false },
+  { source: "monitor", status: "cancelled", selected: false },
+  { source: undefined, status: "cancelled", selected: false },
+  { source: "command", status: "completed", selected: false },
+  { source: "command", status: "failed", selected: false },
+  { source: "command", status: "interrupted", selected: false },
+  { source: "command", status: "rolled_back", selected: false },
+] as const)("selects an unstarted $status continuation from $source: $selected", (entry) => {
+  const taskId = NodeId.make("result-task");
+  const tagged = { ...run, delegatedTaskId: taskId };
+  const later = {
+    ...run,
+    id: RunId.make("wake"),
+    ordinal: 2,
+    status: entry.status,
+    startedAt: null,
+  };
+  const source: OrchestrationV2Notification["source"] | undefined =
+    entry.source === "delegated_task"
+      ? { kind: entry.source, taskIds: [taskId] }
+      : entry.source === undefined
+        ? undefined
+        : { kind: entry.source };
+  const messages =
+    source === undefined
+      ? []
+      : [
+          {
+            id: later.userMessageId,
+            runId: later.id,
+            notification: { source, outcome: "completed", summary: "Background work completed" },
+          },
+        ];
+  const projection = { runs: [tagged, later], messages } as Pick<
+    OrchestrationV2ThreadProjection,
+    "runs" | "messages"
+  >;
+  assert.equal(
+    delegatedTaskResultRun(projection, taskId)?.id,
+    entry.selected ? later.id : tagged.id,
+  );
+  assert.equal(
+    delegatedTaskResultRun(
+      { ...projection, runs: [tagged, { ...later, delegatedTaskId: NodeId.make("other-task") }] },
+      taskId,
+    )?.id,
+    tagged.id,
+  );
+  assert.equal(
+    delegatedTaskResultRun(
+      {
+        ...projection,
+        runs: [
+          tagged,
+          {
+            ...run,
+            id: RunId.make("foreign"),
+            ordinal: 2,
+            delegatedTaskId: NodeId.make("other-task"),
+          },
+          { ...later, ordinal: 3 },
+        ],
+      },
+      taskId,
+    )?.id,
+    tagged.id,
   );
 });
