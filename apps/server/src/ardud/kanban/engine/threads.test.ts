@@ -1969,6 +1969,16 @@ describe("coalesceTarget", () => {
     expect(coalesceTarget([candidate], "step:A")).toBeUndefined();
   });
 
+  it("coalesces an assignment without treating it as a disposable wake", () => {
+    const assignment = {
+      ...run(2, "unused"),
+      userMessageId: MessageId.make("kanban:assignment:card:id"),
+    };
+    expect(coalesceTarget([run(1, "assignment:card"), assignment], "assignment:card")).toBe(
+      assignment,
+    );
+  });
+
   it("has no target in an empty queue", () => {
     expect(coalesceTarget([], "step:A")).toBeUndefined();
   });
@@ -2313,6 +2323,19 @@ describe("queuedWakes", () => {
       ),
     ).toEqual([first, second]);
   });
+  it("withdraws only the selected card's assignment and leaves active runs alone", () => {
+    const assignment = run(2, "kanban:assignment:A:old");
+    const reminder = run(1, "kanban:wake:nudge:old");
+    const runs = [
+      assignment,
+      reminder,
+      run(3, "kanban:assignment:AB:other"),
+      run(4, "kanban:assignment:A:active", "running"),
+    ];
+    expect(queuedWakes(runs)).toEqual([reminder]);
+    expect(queuedWakes(runs, Infinity, ["assignment:A"])).toEqual([assignment]);
+  });
+
   it.each(["step:A", "plan:A", "owner:A", "owner:discussion-A", "nudge"])(
     "matches exact scope %s",
     (scope) => {
@@ -2574,6 +2597,13 @@ it.effect("#1574 assignment queue preserves a busy run and replays once", () => 
       expect(after.runs.find((run) => run.id === before.runs[0]!.id)).toEqual(before.runs[0]);
       expect(after.runs.find((run) => run.id === queued)?.status).toBe("queued");
       expect(after.messages.filter((message) => message.text === "New card brief")).toHaveLength(1);
+      yield* threads.send({ threadId, text: "Unrelated queued follow-up", mode: "queue" });
+      const followup = yield* orchestrator.getThreadRecords(threadId, ["runs", "messages"]);
+      expect(followup.runs.find((run) => run.id === queued)?.status).toBe("queued");
+      expect(queuedWakes(followup.runs)).toEqual([]);
+      expect(
+        queuedWakes(followup.runs, Infinity, ["assignment:card"]).map((run) => run.id),
+      ).toEqual([queued]);
     }).pipe(Effect.provide(layer));
   }).pipe(
     Effect.provide(

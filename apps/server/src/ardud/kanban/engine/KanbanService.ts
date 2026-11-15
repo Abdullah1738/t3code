@@ -2036,8 +2036,10 @@ const make = Effect.gen(function* () {
   const discardWake = Effect.fn("KanbanService.discardWake")(
     function* (threadId: ThreadId, runId: string | void, wakeMessageId?: string) {
       if (runId === undefined && wakeMessageId === undefined) return;
-      const wake = queuedWakes(yield* threadIo.queuedRuns(threadId)).find((run) =>
-        runId === undefined ? run.userMessageId === wakeMessageId : run.id === runId,
+      const wake = (yield* threadIo.queuedRuns(threadId)).find(
+        (run) =>
+          run.status === "queued" &&
+          (runId === undefined ? run.userMessageId === wakeMessageId : run.id === runId),
       );
       if (wake !== undefined) yield* touching(threadId, threadIo.cancelQueued(threadId, wake.id));
     },

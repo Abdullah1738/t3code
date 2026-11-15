@@ -110,7 +110,12 @@ const fakeThreads = (
     saved: Deferred.Deferred<void>;
     enabled?: () => boolean;
   },
-  delivery?: { readonly findExisting: boolean; readonly send: KanbanThreads["Service"]["send"] },
+  delivery?: {
+    readonly findExisting: boolean;
+    readonly send: KanbanThreads["Service"]["send"];
+    readonly queuedRuns?: KanbanThreads["Service"]["queuedRuns"];
+    readonly cancelQueued?: KanbanThreads["Service"]["cancelQueued"];
+  },
 ) => {
   const running = new Set<string>();
   const queued = new Set<string>();
@@ -237,9 +242,11 @@ const fakeThreads = (
           models.set(threadId, model);
         }),
       withdraw: () => Effect.void,
-      queuedRuns: (threadId) =>
-        Effect.sync(() => (queued.has(threadId) ? [{ status: "queued" } as never] : [])),
-      cancelQueued: () => Effect.succeed(false),
+      queuedRuns:
+        delivery?.queuedRuns ??
+        ((threadId) =>
+          Effect.sync(() => (queued.has(threadId) ? [{ status: "queued" } as never] : []))),
+      cancelQueued: delivery?.cancelQueued ?? (() => Effect.succeed(false)),
       interrupt: (threadId) =>
         Effect.sync(() => {
           interrupts.push(threadId);
@@ -8138,3 +8145,97 @@ it.effect.each([
     assert.include(result.text, "Nothing was saved");
   }).pipe(Effect.provide(fake.layer));
 });
+
+it.effect.each(["queued", "in-flight"] as const)(
+  "#1574 releasing a card withdraws its %s assignment without dropping sibling work",
+  (timing) =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const resume = yield* Deferred.make<void>();
+      const enqueued = yield* Deferred.make<void>();
+      const withdrawn = yield* Deferred.make<void>();
+      const runs: Array<{
+        id: string;
+        userMessageId: string;
+        ordinal: number;
+        status: "queued" | "cancelled";
+      }> = [];
+      const cancelled: string[] = [];
+      const fake = fakeThreads(undefined, undefined, undefined, undefined, undefined, {
+        findExisting: true,
+        send: (input) =>
+          Effect.gen(function* () {
+            if (!input.coalesce?.startsWith("assignment:")) return;
+            yield* Deferred.succeed(entered, undefined);
+            if (timing === "in-flight") yield* Deferred.await(resume);
+            runs.push({
+              id: "assignment-run",
+              userMessageId: `kanban:${input.coalesce}:delivery`,
+              ordinal: 2,
+              status: "queued",
+            });
+            yield* Deferred.succeed(enqueued, undefined);
+            return "assignment-run";
+          }),
+        queuedRuns: () =>
+          Effect.sync(
+            () =>
+              runs as unknown as Effect.Success<ReturnType<KanbanThreads["Service"]["queuedRuns"]>>,
+          ),
+        cancelQueued: (_thread, id) =>
+          Effect.gen(function* () {
+            const run = runs.find((run) => run.id === id);
+            if (!run || run.status !== "queued") return false;
+            run.status = "cancelled";
+            cancelled.push(id);
+            yield* Deferred.succeed(withdrawn, undefined);
+            return true;
+          }),
+      });
+      yield* Effect.gen(function* () {
+        const kanban = yield* KanbanService.KanbanService;
+        const board = yield* kanban.ensureBoard({
+          slug: "assignment-release",
+          name: "Assignment release",
+          defaultProjectId: ProjectId.make("project-1"),
+        });
+        yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+        const origin = yield* kanban.createCard(
+          board.id,
+          { prompt: "Origin", title: "Origin" },
+          owner,
+        );
+        yield* kanban.dispatchNow;
+        const threadId = (yield* kanban.card(origin.id)).card.workThreadId!;
+        const evaluator = yield* kanban.startEvaluator(board.id, { kind: "check" });
+        const creating = yield* call(evaluator, "card_create", {
+          forThread: threadId,
+          prompt: "Follow-up",
+          title: "Follow-up",
+          description: "Explicit",
+        }).pipe(Effect.forkChild);
+        yield* Deferred.await(entered);
+        assert.isFalse((yield* Fiber.join(creating)).isError);
+        if (timing === "queued") yield* Deferred.await(enqueued);
+        const card = (yield* kanban.cards(board.id)).find((card) => card.id !== origin.id)!;
+        runs.push({
+          id: "sibling-assignment",
+          userMessageId: `kanban:assignment:${origin.id}:sibling`,
+          ordinal: 3,
+          status: "queued",
+        });
+        yield* kanban.moveCard(card.id, "needs_review", "cardThread", { _tag: "thread", threadId });
+        yield* Deferred.succeed(resume, undefined);
+        yield* Deferred.await(withdrawn);
+        assert.deepEqual(cancelled, ["assignment-run"]);
+        assert.equal(runs.find((run) => run.id === "sibling-assignment")?.status, "queued");
+        assert.equal((yield* kanban.card(origin.id)).card.activeThreadId, threadId);
+        assert.lengthOf(fake.interrupts, 0);
+      }).pipe(
+        Effect.provide(
+          fake.layer.pipe(Layer.provide(Layer.succeed(KanbanService.OwnerRouteMode, "deferred"))),
+        ),
+        Effect.ensuring(Deferred.succeed(resume, undefined)),
+      );
+    }),
+);
