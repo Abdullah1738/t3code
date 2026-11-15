@@ -1,3 +1,4 @@
+import { expectJsonRoundTrip } from "./McpJson.testkit.ts";
 import {
   EnvironmentId,
   NodeId,
@@ -194,6 +195,81 @@ function makeRun(input: {
   };
 }
 
+it.effect.each(
+  (["send", "wait", "wait timeout"] as const).flatMap((operation) =>
+    (["absent", "reason only", "with detail", "detail only"] as const).map((form) => ({
+      operation,
+      form,
+    })),
+  ),
+)("$operation returns JSON cancellation fields ($form)", ({ operation, form }) =>
+  Effect.gen(function* () {
+    const shell = liveThreadShell(parentThreadId);
+    const run = {
+      ...makeRun({ id: cancelledRunId, ordinal: 1, status: "cancelled" }),
+      ...(form === "reason only" || form === "with detail"
+        ? { cancelReason: "task_cancel" as const }
+        : {}),
+      ...(form === "with detail" || form === "detail only"
+        ? { cancelDetail: "Caller cancelled." }
+        : {}),
+    };
+    const projection = {
+      ...idleThreadProjection(shell),
+      runs: [run],
+    } as unknown as OrchestrationV2ThreadProjection;
+    const waiting = yield* Deferred.make<void>();
+    const layer = layerOrchestratorService.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getCallerRow: () => Effect.succeed(shell),
+            getThreadShell: () => Effect.succeed(shell),
+            getThreadRecords: () => Effect.succeed(projection),
+            getProjectThreadRecords: () => Effect.succeed(projection),
+            sendToThread: () =>
+              Effect.succeed({
+                run: projection.runs[0]!,
+                delivery: "started",
+                dispatch: { sequence: 1, storedEvents: [] },
+              }),
+            waitForThread: () =>
+              operation === "wait timeout"
+                ? Deferred.succeed(waiting, undefined).pipe(Effect.andThen(Effect.never))
+                : Effect.succeed({ run: projection.runs[0]!, timedOut: false }),
+          }),
+          ServerSettings.layerTest(),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+          Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({}),
+          NodeCrypto.layer,
+        ),
+      ),
+    );
+    yield* Effect.gen(function* () {
+      const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+      const response = yield* operation === "send"
+        ? service.sendToThread(makeScope(), { threadId: parentThreadId, message: "Follow up" })
+        : Effect.gen(function* () {
+            const fiber = yield* service
+              .waitForThread(makeScope(), { threadId: parentThreadId, timeoutMs: 1_000 })
+              .pipe(Effect.forkChild);
+            if (operation === "wait timeout") {
+              yield* Deferred.await(waiting);
+              yield* TestClock.adjust("1 second");
+            }
+            return yield* Fiber.join(fiber);
+          });
+      expectJsonRoundTrip(response);
+      expect(response.cancelReason).toBe(run.cancelReason);
+      expect(response.cancelDetail).toBe(run.cancelDetail);
+      if (operation === "wait timeout") expect(response).toMatchObject({ timedOut: true });
+    }).pipe(Effect.provide(layer));
+  }),
+);
+
 it.effect.each(["committed", "without detail", "missing", "unreadable"] as const)(
   "interrupt response reads committed provenance for its exact run (%s)",
   (form) =>
@@ -266,6 +342,7 @@ it.effect.each(["committed", "without detail", "missing", "unreadable"] as const
       yield* Effect.gen(function* () {
         const service = yield* OrchestratorMcpService.OrchestratorMcpService;
         const response = yield* service.interruptThread(makeScope(), { threadId: parentThreadId });
+        expectJsonRoundTrip(response);
         expect(response.runId).toBe(activeRunId);
         expect(response.status).toBe("interrupt_requested");
         expect(response.cancelReason).toBe(
@@ -346,6 +423,7 @@ it("readThread prefers activity-run status over a newer cancelled queued run", a
   await Effect.gen(function* () {
     const service = yield* OrchestratorMcpService.OrchestratorMcpService;
     const result = yield* service.readThread(makeScope(), { threadId: parentThreadId });
+    expectJsonRoundTrip(result);
     expect(result.thread.status).toBe("running");
     expect(result.thread.latestRunId).toBe(cancelledRunId);
     expect(result.recentRuns[0]?.cancelReason).toBe("server_shutdown");
@@ -731,6 +809,7 @@ it.each([
       controlsProjection = childProjection;
     }
     const result = yield* service.taskStatus(makeScope(), taskId);
+    expectJsonRoundTrip(result);
     expect(result.providerInstanceId).toBe(customCodexInstanceId);
     expect(result.providerInstanceId).not.toBe(ProviderInstanceId.make(String(codexDriver)));
     expect(result.status).toBe(
