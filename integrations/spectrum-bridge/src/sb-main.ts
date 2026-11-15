@@ -216,6 +216,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     // getMessage may resolve undefined for an unknown handle; the router's reply lookup already treats a throw there as unavailable.
     const router = new Router(chat.store, chatBackend, transport as unknown as ConstructorParameters<typeof Router>[2], {
       ...config, chatGuid: chat.info.key, skillPath, alertSkillPath, alertSocketPath: telegramBridgeSocket,
+      medsFold: {},
       transcribe: input => transcribe(input), notifyFailure: notifyFailedInbound, log, context: chat.context,
       ...(chat.info.kind === "group" ? { groupJudge } : {}),
       swipes: { find: swipes, line: config.sendblueNumber ?? "" },

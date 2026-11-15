@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { MAX_FILE_BYTES, parseCommand, validFileName, validMimeType } from "./cli.ts";
 import { redact } from "./redact.ts";
 import { enqueueNotice } from "./notification-policy.ts";
+import { BOARD_EVENT_KEY, BOARD_EVENT_KEY_LIMIT } from "./openchamber.ts";
 import type { ReminderRecord, Store } from "./store.ts";
 import { toolError, toolLog } from "./toollog.ts";
 
@@ -120,6 +121,29 @@ export function createApi({ store, enabled, chatId, timezone, health }: Options)
             if (board.lastFetchReason === null || ["dirty", "age", "cold"].includes(board.lastFetchReason as string)) {
               counters.lastFetchReason = board.lastFetchReason;
             }
+            const count = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+            if (board.fetchesByReason && typeof board.fetchesByReason === "object" && !Array.isArray(board.fetchesByReason)) {
+              counters.fetchesByReason = Object.fromEntries(Object.entries(board.fetchesByReason)
+                .filter(([key, value]) => ["cold", "age", "hard", "soft"].includes(key) && count(value)));
+            }
+            if (board.dirtyEventsByType && typeof board.dirtyEventsByType === "object" && !Array.isArray(board.dirtyEventsByType)) {
+              const events: Record<string, { hard: number; soft: number }> = {};
+              let keys = 0;
+              for (const [key, value] of Object.entries(board.dirtyEventsByType)) {
+                if (key.length > 161 || !BOARD_EVENT_KEY.test(key) || !value || typeof value !== "object" || Array.isArray(value)) continue;
+                const { hard, soft } = value as Record<string, unknown>;
+                if (!count(hard) || !count(soft)) continue;
+                const bucket = key !== "other" && keys < BOARD_EVENT_KEY_LIMIT ? key : "other";
+                if (bucket !== "other") keys++;
+                if (!Object.hasOwn(events, bucket)) events[bucket] = { hard: 0, soft: 0 };
+                const entry = events[bucket]!;
+                entry.hard += hard;
+                entry.soft += soft;
+              }
+              counters.dirtyEventsByType = events;
+            }
+            if (typeof board.windowStartedAt === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(board.windowStartedAt)
+              && Number.isFinite(Date.parse(board.windowStartedAt))) counters.windowStartedAt = board.windowStartedAt;
             safe.board = counters;
           }
           const active = enabled();

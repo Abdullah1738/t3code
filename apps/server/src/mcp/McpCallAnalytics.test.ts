@@ -46,6 +46,7 @@ import { McpSchema, McpServer, Tool, Toolkit } from "effect/ai";
 import * as Analytics from "../ardud/analytics/Analytics.ts";
 import * as McpCallLedger from "../ardud/analytics/McpCallLedger.ts";
 import * as McpCall from "../ardud/analytics/McpCall.ts";
+import * as ThreadReadMetrics from "../ardud/analytics/ThreadReadMetrics.ts";
 import * as McpResponseDelivery from "../ardud/http/McpResponseDelivery.ts";
 import * as SavedWrite from "../ardud/kanban/engine/savedWrite.ts";
 import * as McpHttpServer from "./McpHttpServer.ts";
@@ -1428,13 +1429,18 @@ const provenanceCases = [
   },
 ] as const;
 
-it.effect.each(provenanceCases)("attributes delegate_task: $name", (scenario) =>
+it.effect.each([
+  ...provenanceCases.map((scenario) => ({ ...scenario, tool: "delegate_task" as const })),
+  { ...provenanceCases[0], name: "card thread with read timings", tool: "t3_thread_read" as const },
+])("attributes $tool: $name", (scenario) =>
   Effect.gen(function* () {
     const recorded = yield* Deferred.make<AnalyticsEvent>();
-    const toolkit = probe("delegate_task");
+    const toolkit = probe(scenario.tool);
     const handlers = McpToolAccess.toLayer(toolkit, {
-      delegate_task: McpToolAccess.actsAsCaller(() =>
-        McpCall.failedPhase("dispatch").pipe(Effect.andThen(failure("delegation_timeout"))),
+      [scenario.tool]: McpToolAccess.actsAsCaller(() =>
+        scenario.tool === "t3_thread_read"
+          ? ThreadReadMetrics.read("shell", TestClock.adjust(7).pipe(Effect.as({ ok: true })))
+          : McpCall.failedPhase("dispatch").pipe(Effect.andThen(failure("delegation_timeout"))),
       ),
     });
     const callerId = ThreadId.make("caller-ledger");
@@ -1496,13 +1502,26 @@ it.effect.each(provenanceCases)("attributes delegate_task: $name", (scenario) =>
     yield* Effect.gen(function* () {
       const server = yield* McpServer.McpServer;
       yield* server
-        .callTool({ name: "delegate_task", arguments: args })
+        .callTool({ name: scenario.tool, arguments: args })
         .pipe(Effect.provideService(McpSchema.McpServerClient, client));
       const row = yield* Deferred.await(recorded);
       expect(row).toMatchObject({
         callerRole: scenario.role,
         callerKind: scenario.kind,
-        errorTag: "delegation_timeout",
+        ...(scenario.tool === "t3_thread_read"
+          ? {
+              outcome: "ok",
+              callerReaderLane: "identity",
+              readerLane: "identity",
+              readerWaitMs: 0,
+              queryMs: 0,
+              renderMs: 0,
+              inFlightAtStart: { session: 1, overall: 1 },
+              threadReadStages: [
+                { stage: "shell", durationMs: 7, completed: true, readerWaitMs: 0, queryMs: 0 },
+              ],
+            }
+          : { errorTag: "delegation_timeout" }),
       });
       expect(row.callerCardNumber).toBe(scenario.number ?? undefined);
       expect(row.cardNumber).toBe(scenario.number ?? undefined);

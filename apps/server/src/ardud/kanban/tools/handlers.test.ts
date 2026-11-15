@@ -477,6 +477,7 @@ it.effect.each(["subtask_done", "report_bug"] as const)(
             NodeSqliteClient.layer({
               filename: path.join(directory, "caller.sqlite"),
               readerWorker: true,
+              // Statev2 reserves an identity reader for caller lookups.
               identityReaderProcess: true,
               foregroundReaderSlots: 1,
               backgroundReaderSlots: 1,

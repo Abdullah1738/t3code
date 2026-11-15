@@ -74,6 +74,7 @@ import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
@@ -2421,13 +2422,17 @@ const make = Effect.gen(function* () {
 
   // Admission can persist a job while another caller drains launches. Only the
   // drain needs the evaluator permit; the normal tick recovers the queued job.
-  const evaluatorAdmission = <A, E, R>(key: string, effect: Effect.Effect<A, E, R>) =>
+  const evaluatorAdmission = <A, E, R>(
+    key: string,
+    effect: Effect.Effect<A, E, R>,
+    enqueueWhenBusy = true,
+  ) =>
     serialEach(
       evaluating,
       key,
       effect,
       true,
-      effect.pipe(Effect.provideService(enqueueEvaluatorOnly, true)),
+      enqueueWhenBusy ? effect.pipe(Effect.provideService(enqueueEvaluatorOnly, true)) : undefined,
     );
 
   const changes = yield* PubSub.unbounded<BoardPublication>();
@@ -3235,14 +3240,51 @@ const make = Effect.gen(function* () {
       `owner:${cardId}`,
       ...(discussionId === null ? [] : [`owner:${discussionId}`]),
     ];
-    // A send outside the gate can enqueue after this scan; it must withdraw its own stale result.
-    for (const pending of scopedWakeSends.get(threadId) ?? []) {
-      if (scopes.includes(pending.scope)) pending.stale = true;
-    }
-    // Keep the transition gate so a new assignment cannot overtake cleanup.
-    for (const wake of queuedWakes(yield* threadIo.queuedRuns(threadId), Infinity, scopes)) {
-      yield* touching(threadId, threadIo.cancelQueued(threadId, wake.id));
-    }
+    // Queue reads can wait on statev2's reader. Replay a fenced read after a
+    // concurrent board write; no card transition has been saved at this point.
+    const queued = yield* Effect.gen(function* () {
+      while (true) {
+        const fence = threadFences.get(threadId) ?? 0;
+        const runs = yield* threadRead("pruneWakes", threadId, threadIo.queuedRuns(threadId));
+        // A send still in flight must withdraw its own stale result. If it
+        // finished during the read, scan again to include what it enqueued.
+        for (const pending of scopedWakeSends.get(threadId) ?? []) {
+          if (scopes.includes(pending.scope)) pending.stale = true;
+        }
+        if (fence === (threadFences.get(threadId) ?? 0)) return runs;
+      }
+    });
+    const wakes = queuedWakes(queued, Infinity, scopes);
+    if (wakes.length === 0) return;
+    // Keep the transition gate so a new assignment cannot overtake cleanup,
+    // but refuse before mutating the card if statev2 cannot finish promptly.
+    const cancelling = yield* locks
+      .independent(
+        Effect.forEach(
+          wakes,
+          (wake) => touching(threadId, threadIo.cancelQueued(threadId, wake.id)),
+          {
+            discard: true,
+          },
+        ),
+      )
+      .pipe(Effect.interruptible, Effect.forkIn(scope));
+    yield* Fiber.join(cancelling).pipe(
+      Effect.interruptible,
+      Effect.timeout("5 seconds"),
+      // A dispatched cancellation may be finishing an uninterruptible commit.
+      // It only names old run IDs; don't keep the gate while it acknowledges.
+      Effect.ensuring(Effect.sync(() => cancelling.interruptUnsafe())),
+      Effect.catchTags({
+        TimeoutError: () =>
+          Effect.fail(
+            new KanbanThreadError({
+              operation: "cancel",
+              detail: "Wake cleanup exceeded 5 seconds; the card transition was not saved.",
+            }),
+          ),
+      }),
+    );
   });
 
   /**
@@ -4931,8 +4973,7 @@ const make = Effect.gen(function* () {
       readonly seq?: number;
     } = {},
   ) =>
-    serial(
-      evaluating,
+    evaluatorAdmission(
       board.id,
       Effect.gen(function* () {
         const current = yield* boardOf(board.id);
@@ -5000,6 +5041,8 @@ const make = Effect.gen(function* () {
           ),
         );
       }),
+      // Packet/setup callers need the preceding launch's ownership before reuse.
+      purpose.kind === "discussion",
     );
 
   /**
