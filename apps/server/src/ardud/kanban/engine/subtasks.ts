@@ -296,6 +296,16 @@ const harmlessFollowup = (task: string, target: string): boolean => {
 };
 
 const approvalVerb = String.raw`(?:approve(?:d)?|go(?:\s+ahead)?|ship|yes|ok|tick)`;
+const bareApprovalVerb = String.raw`(?:yes|approve|approved|sign off|sign-off|signoff|signed off|go|go ahead|go for it|ok|okay|do it|proceed)`;
+const bareApproval = new RegExp(`^${bareApprovalVerb}$`, "i");
+const referenceCommand = new RegExp(
+  String.raw`^${bareApprovalVerb}\s+(?:both|all|it|them|everything)\b`,
+  "i",
+);
+const referenceApproval = new RegExp(
+  String.raw`^${bareApprovalVerb}\s+(?:both|all(?:\s+of\s+(?:it|them))?|it|them|everything|(?:all|both)\s+(?:[1-9]|one|two|three|four|five|six|seven|eight|nine|ten))[.!?]*$`,
+  "i",
+);
 
 const subtaskApproval = (label: string) => {
   const approval = new RegExp(String.raw`^${approvalVerb}(?:\s*[,.:;–—-]\s*|\s+)(.+)$`, "i").exec(
@@ -336,6 +346,14 @@ const approvalCommand = (label: string): string =>
     .replace(/^(?:yes|ok|okay)(?:\s*[,.:;–—-]\s*|\s+)/i, "")
     .replace(/^(?:(?:please|go ahead and)\s+)+/i, "");
 
+const isReferenceApproval = (label: string): boolean => {
+  const words = label
+    .trim()
+    .replace(/[.!]+$/, "")
+    .trim();
+  return referenceApproval.test(words) || referenceApproval.test(approvalCommand(words));
+};
+
 // Extra prose around a refusal word requires an unambiguous ID-only approval instead.
 const exactResourceTarget = (label: string, task: string): boolean =>
   approvalAction(label) === approvalAction(task) &&
@@ -365,6 +383,8 @@ export const approvesGate = (
       (isNegativeChoice(words) && !exactResourceTarget(words, task))
     )
       return false;
+    if (referenceCommand.test(words) || referenceCommand.test(approvalCommand(words)))
+      return isReferenceApproval(words);
     const approval = subtaskApproval(words);
     if (approval) {
       if (!approval.valid) return false;
@@ -376,12 +396,7 @@ export const approvesGate = (
     }
   }
   const command = approvalCommand(words);
-  if (
-    /^(?:yes|approve|approved|sign off|sign-off|signoff|signed off|go|go ahead|go for it|ok|okay|do it|proceed)$/i.test(
-      command,
-    )
-  )
-    return true;
+  if (bareApproval.test(command)) return true;
   // Retaining one merge cannot grant permission for future deployments.
   if (
     scope === "subtask" &&
@@ -551,15 +566,33 @@ export const askGateWarning = (
     return subtask.state === "open" && gate !== undefined ? [{ subtask, gate }] : [];
   });
   const scoped = ask.options?.some((option) => optionScopeIds(card, option) !== undefined);
-  if (
-    gated.length === 0 ||
-    gated.some(({ subtask, gate }) =>
-      scoped
-        ? ask.options?.some((option) => optionApprovalIds(card, option)?.includes(subtask.id))
-        : askConcerns(card, ask, subtask, gate, guessedGates, ask.at),
-    )
-  )
-    return undefined;
+  if (gated.length === 0) return undefined;
+  const concerned = gated.filter(({ subtask, gate }) =>
+    scoped
+      ? ask.options?.some((option) => optionScopeIds(card, option)?.includes(subtask.id))
+      : askConcerns(card, ask, subtask, gate, guessedGates, ask.at),
+  );
+  if (concerned.length > 0) {
+    const options = ask.options;
+    if (!options?.length) return undefined;
+    const warnings = concerned.flatMap(({ subtask, gate }) => {
+      if (options.some((option) => approvingOption(card, ask, option, gate, subtask))) return [];
+      const labels = ["Approve", `Approve ${subtask.id}`].filter((label) => {
+        const option = { id: "gate-suggestion", label };
+        return approvingOption(
+          card,
+          { ...ask, options: [...options, option] },
+          option,
+          gate,
+          subtask,
+        );
+      });
+      return [
+        `No option here clears ${subtask.id} (${gate}); a go option labelled ${labels.map((label) => `"${label}"`).join(" or ")} or carrying approves: [${subtask.id}] would.`,
+      ];
+    });
+    return warnings.length > 0 ? warnings.join(" ") : undefined;
+  }
   const steps = gated.map(({ subtask, gate }) => `${subtask.id} (${gate})`).join(", ");
   const target = gated.length === 1 ? gated[0]!.subtask.id : "the intended subtask id";
   return `This ask won't clear ${steps}. Name ${target} in the text if it should.`;
@@ -589,6 +622,24 @@ const approvingLabel = (
   (approvesGate(label, gate, task, [], "subtask") ||
     (!isNegativeChoice(label) && approvesGate(label, gate, task, others, "subtask")));
 
+const approvingOption = (
+  card: Pick<KanbanCard, "subtasks">,
+  ask: KanbanOwnerAsk,
+  option: KanbanAskOption,
+  gate: NonNullable<KanbanSubtask["gate"]>,
+  subtask: KanbanSubtask,
+  singlePick = true,
+): boolean => {
+  if (ask.options?.some((entry) => optionScopeIds(card, entry) !== undefined))
+    return optionApprovalIds(card, option)?.includes(subtask.id) === true;
+  // A reference approves one choice, never a new combination of picks.
+  if (!singlePick && isReferenceApproval(option.label)) return false;
+  const others = singlePick
+    ? (ask.options ?? []).filter((entry) => entry.id !== option.id).map((entry) => entry.label)
+    : [];
+  return approvingLabel(option.label, gate, subtask.text, others);
+};
+
 const approvingAnswer = (
   card: Pick<KanbanCard, "subtasks">,
   ask: KanbanOwnerAsk,
@@ -596,22 +647,23 @@ const approvingAnswer = (
   subtask: KanbanSubtask,
 ): boolean => {
   const answer = ask.answer;
-  // Multiple picks keep the strict paths; the go/hold fallback needs a single choice.
-  const others =
-    answer?.optionIds?.length === 1
-      ? (ask.options ?? [])
-          .filter((option) => !answer.optionIds!.includes(option.id))
-          .map((option) => option.label)
-      : [];
   const scoped = ask.options?.some((option) => optionScopeIds(card, option) !== undefined);
   const approved = scoped
-    ? pickedApprovalIds(card, ask)?.includes(subtask.id)
+    ? pickedApprovalIds(card, ask) !== undefined &&
+      ask.options?.some(
+        (option) =>
+          answer?.optionIds?.includes(option.id) &&
+          approvingOption(card, ask, option, gate, subtask),
+      )
     : (answer?.verdict === "approved" && !answer.optionIds?.length) ||
       ((answer?.verdict === "picked" || answer?.verdict === "approved") &&
         Boolean(answer.optionIds?.length) &&
         answer.optionIds!.every((id) => {
           const option = ask.options?.find((entry) => entry.id === id);
-          return option !== undefined && approvingLabel(option.label, gate, subtask.text, others);
+          return (
+            option !== undefined &&
+            approvingOption(card, ask, option, gate, subtask, answer.optionIds!.length === 1)
+          );
         }));
   return Boolean(approved);
 };
