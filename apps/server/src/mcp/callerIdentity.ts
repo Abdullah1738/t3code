@@ -27,22 +27,22 @@ export const readCallerIdentity = Effect.fn("mcp.readCallerIdentity")(function* 
     call.value.callerStarted = started;
     call.value.callerResolved = false;
     call.value.phase = "caller";
-    call.value.readerLane = "foreground";
+    call.value.readerLane = "identity";
   }
-  // Bounded point reads gate every tool call, like foreground control thread detail.
+  // Caller liveness must not queue behind active-thread lists on the view readers.
   const row = yield* McpDeadline.waitingOn(
     threads.getCallerRow(threadId).pipe(
-      NodeSqliteClient.foregroundReads,
+      NodeSqliteClient.identityReadOnly,
       Effect.mapError((cause) =>
         NodeSqliteClient.readerLaneFailure(cause) === undefined
           ? cause
           : new OrchestratorMcpFailure({
               code: "caller_unresolved",
-              message: `Caller resolution could not acquire the foreground reader for thread ${threadId}. Nothing was saved; retry the same call.`,
+              message: `Caller resolution could not acquire the reserved identity reader for thread ${threadId}. Nothing was saved; retry the same call.`,
             }),
       ),
     ),
-    "statev2 foreground caller row",
+    "statev2 identity caller row",
   );
   if (row === null || row.deletedAt !== null) return null;
   if (

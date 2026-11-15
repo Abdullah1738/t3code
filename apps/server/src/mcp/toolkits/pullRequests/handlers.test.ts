@@ -265,7 +265,7 @@ describe("pull request toolkit handlers", () => {
           callerLayer: Layer.mock(ThreadManagement.ThreadManagementService)({
             getCallerRow: (id) =>
               Effect.gen(function* () {
-                expect(yield* SqliteClient.ReaderLane).toBe("foreground");
+                expect(yield* SqliteClient.ReaderLane).toBe("identity");
                 yield* sql
                   .withTransaction(sql`SELECT * FROM entries`)
                   .pipe(SqliteClient.readOnly, Effect.orDie);
@@ -299,6 +299,7 @@ describe("pull request toolkit handlers", () => {
           SqliteClient.layer({
             filename: path.join(directory, "state.sqlite"),
             readerWorker: true,
+            identityReaderProcess: true,
             foregroundReaderSlots: 1,
             backgroundReaderSlots: 1,
           }),
