@@ -124,6 +124,7 @@ class SourceLimit(Lookup):
 
 OWNER_BUDGET = 4
 OWNER_REQUEST_LIMIT = 64
+OWNER_CACHE_VERSION = 2
 _OWNER_STATS_LOCK = threading.Lock()
 MSGS_BUDGET = 2
 
@@ -470,6 +471,9 @@ def owner_cache(path, cache_reset=None):
         for tid, entry in cache.items():
             if not isinstance(tid, str) or not tid or not isinstance(entry, dict):
                 raise ValueError()
+            # Earlier delta caches could mark redacted text as current.
+            if type(entry.get('version')) is not int or entry['version'] != OWNER_CACHE_VERSION:
+                raise ValueError()
             owner_time(entry['updatedAt'])
             owner_time(entry['coveredFrom'])
             if not isinstance(entry['title'], str) or not isinstance(entry['texts'], list):
@@ -573,11 +577,12 @@ def _owner_texts(since, until, stats, cache_path, cache_reset, stop):
         title = str(thread.get('title') or '')
         tid = thread['threadId']
         prior = cache.get(tid)
-        # A title change can change whether a relayed turn passes owner_turn.
-        full = prior is None or owner_time(prior['coveredFrom']) > since or prior['title'] != title
-        read_from = since if full else owner_time(prior['updatedAt']) - dt.timedelta(minutes=1)
+        # Redaction can change text without advancing the message's updatedAt.
+        # A delta cannot validate retained texts, even when it contains new turns.
+        # Replace the covered span on every thread change; unchanged threads stay cheap.
+        read_from = min(since, owner_time(prior['coveredFrom'])) if prior else since
         result = control_get(config, '/threads/' + urllib.parse.quote(tid, safe='') + '/messages',
-                             {'since': iso(read_from - dt.timedelta(milliseconds=1)) if full else iso(read_from),
+                             {'since': iso(read_from - dt.timedelta(milliseconds=1)),
                               'role': 'user', 'all': 'true'}, stop, stats)
         messages = result.get('messages')
         if not isinstance(messages, list):
@@ -587,10 +592,7 @@ def _owner_texts(since, until, stats, cache_path, cache_reset, stop):
             raise Lookup('Robob control: invalid message count')
         if total != len(messages):
             raise Lookup('Robob control: incomplete message list')
-        # The API filters by updatedAt, so a delta can edit an older turn.
-        # Merge by ID before applying provenance and the covered creation span.
-        covered_from = since if full else owner_time(prior['coveredFrom'])
-        out = {} if full else {row['messageId']: row for row in prior['texts']}
+        out = {}
         for message in messages:
             if time.time() >= stop:
                 raise Lookup('Robob control: lookup over time')
@@ -609,11 +611,11 @@ def _owner_texts(since, until, stats, cache_path, cache_reset, stop):
             if not isinstance(mid, str) or not mid:
                 raise Lookup('Robob control: message id unavailable; server update required')
             out.pop(mid, None)
-            if created >= covered_from and typed and not text.startswith('[Forwarded by'):
+            if created >= read_from and typed and not text.startswith('[Forwarded by'):
                 out[mid] = {'messageId': mid, 'createdAt': iso(created), 'text': text, 'title': title}
         # Preserve the caller's precision: rounding down would claim an unread
         # fractional millisecond when a later call moves its window earlier.
-        return {'updatedAt': thread['updatedAt'], 'coveredFrom': since.isoformat() if full else prior['coveredFrom'],
+        return {'version': OWNER_CACHE_VERSION, 'updatedAt': thread['updatedAt'], 'coveredFrom': read_from.isoformat(),
                 'title': title, 'texts': list(out.values())}
 
     selected = []
@@ -650,6 +652,9 @@ def _owner_texts(since, until, stats, cache_path, cache_reset, stop):
         # SIGALRM during Thread.join can strand Python 3.9's thread-state lock.
         # Requests kill/reap themselves; reserve cleanup time before any enclosing alarm.
         pool.shutdown(wait=True, cancel_futures=True)
+    # If a changed thread fails, don't persist its unvalidated previous texts.
+    for thread in needed:
+        cache.pop(thread['threadId'], None)
     for future, tid in futures.items():
         if future.cancelled():
             continue

@@ -31,7 +31,7 @@ def summary(text, **extra):
 class ControlServer:
     """Loopback-only control fixtures. Never reads credentials or state from the real home."""
     def __init__(self, rows=None, threads=None, stall=None, drip=False, page_size=500,
-                 message_delay=0, stall_cursor=None):
+                 message_delay=0, stall_cursor=None, strict_since=False):
         self.rows = {'a': rows or []}
         self.threads = threads if threads is not None else [{'threadId': 'a', 'title': 'iMessage test',
                            'creationSource': 'server', 'origin': 'imessage'}]
@@ -39,6 +39,7 @@ class ControlServer:
         self.calls = []
         self.stall, self.drip = stall, drip
         self.page_size, self.message_delay, self.stall_cursor = page_size, message_delay, stall_cursor
+        self.strict_since = strict_since
         self.active_messages = self.max_active_messages = 0
         self.lock = threading.Lock()
         self.stop = threading.Event()
@@ -78,6 +79,10 @@ class ControlServer:
                         owner.max_active_messages = max(owner.max_active_messages, owner.active_messages)
                     owner.stop.wait(owner.message_delay)
                     rows = owner.rows.get(urllib.parse.unquote(path.path.split('/')[-2]), [])
+                    if owner.strict_since:
+                        rows = [row for row in rows if row.get('role') == params.get('role', [row.get('role')])[0]
+                                and ch.owner_time(row.get('updatedAt', row['createdAt']))
+                                > ch.owner_time(params['since'][0])]
                     data = {'ok': True, 'messages': rows, 'total': len(rows)}
                     with owner.lock:
                         owner.active_messages -= 1
@@ -729,6 +734,76 @@ class OwnerTexts(unittest.TestCase):
     def message_calls(self, server):
         return [(path, params) for path, params, _ in server.calls if path.endswith('/messages')]
 
+    def test_changed_threads_reconcile_mutations_missing_from_strict_deltas(self):
+        cases = [
+            ('redacted', [summary('[REDACTED]', messageId='old')], ['[REDACTED]']),
+            ('partially redacted', [summary('I paid [REDACTED]', messageId='old')], ['I paid [REDACTED]']),
+            ('deleted', [], []),
+            ('restamped automated', [summary('I paid Apple', messageId='old', automated=True)], []),
+            ('restamped agent', [summary('I paid Apple', messageId='old', createdBy='agent')], []),
+            ('forwarded', [summary('[Forwarded by owner] I paid Apple', messageId='old')], []),
+        ]
+        for mutation, changed, expected in cases:
+            for append in (False, True):
+                with self.subTest(mutation=mutation, append=append), \
+                        ControlServer([summary('I paid Apple', messageId='old')], strict_since=True) as server:
+                    self.assertEqual([row[1] for row in self.read()], ['I paid Apple'])
+                    server.threads[0]['updatedAt'] = '2026-10-24T01:01:00Z'
+                    server.rows['a'] = list(changed)
+                    if append:
+                        server.rows['a'].append(summary('new unrelated turn', messageId='new',
+                                                        createdAt='2026-10-24T01:00:00Z'))
+                    server.calls.clear()
+                    got = [row[1] for row in self.read()]
+                    self.assertCountEqual(got, expected + (['new unrelated turn'] if append else []))
+                    path = Path(server.tmp.name) / 'owner-texts.json'
+                    self.assertNotIn('I paid Apple', path.read_text())
+                    self.assertEqual(self.message_calls(server)[0][1]['since'], ['2026-10-23T22:59:59.999Z'])
+                    server.calls.clear()
+                    self.assertEqual([row[1] for row in self.read()], got)
+                    self.assertEqual(self.message_calls(server), [])
+
+    def test_legacy_delta_cache_is_not_reused_even_with_a_matching_thread_version(self):
+        for version in ('missing', 1, '2', True, None):
+            with self.subTest(version=version), \
+                    ControlServer([summary('I paid Apple', messageId='old')], strict_since=True) as server:
+                self.read()
+                path = Path(server.tmp.name) / 'owner-texts.json'
+                cache = json.loads(path.read_text())
+                if version == 'missing':
+                    cache['a'].pop('version')
+                else:
+                    cache['a']['version'] = version
+                path.write_text(json.dumps(cache))
+                server.rows['a'][0]['text'] = '[REDACTED]'
+                with patch.object(ch.toollog, 'emit') as log:
+                    self.assertEqual([row[1] for row in self.read()], ['[REDACTED]'])
+                log.assert_called_once_with('money-cases', 'cache_reset')
+                self.assertNotIn('I paid Apple', path.read_text())
+                self.assertEqual(json.loads(path.read_text())['a']['version'], ch.OWNER_CACHE_VERSION)
+
+    def test_failed_refresh_evicts_unvalidated_text_and_keeps_other_covered_threads(self):
+        threads = [{'threadId': tid, 'title': 'App'} for tid in ('a', 'b')]
+        with ControlServer([summary('I paid Apple', messageId='old')], threads=threads,
+                           strict_since=True) as server:
+            server.rows['b'] = [summary('unrelated')]
+            self.assertEqual(len(self.read()), 2)
+            server.threads[0]['updatedAt'] = '2026-10-24T01:01:00Z'
+            server.rows['a'][0]['text'] = '[REDACTED]'
+            server.responses['/api/ardud/control/threads/a/messages'] = {'ok': False}
+            with self.assertRaisesRegex(ch.Lookup, r'incomplete \(1 of 2 threads\)'):
+                self.read()
+            path = Path(server.tmp.name) / 'owner-texts.json'
+            self.assertEqual(set(json.loads(path.read_text())), {'b'})
+            self.assertNotIn('I paid Apple', path.read_text())
+            server.responses.clear()
+            server.calls.clear()
+            self.assertCountEqual([row[1] for row in self.read()], ['[REDACTED]', 'unrelated'])
+            self.assertEqual(len(self.message_calls(server)), 1)
+            server.calls.clear()
+            self.assertEqual(len(self.read()), 2)
+            self.assertEqual(self.message_calls(server), [])
+
     def test_ninety_threads_warm_across_checks_then_need_only_lists(self):
         until = at('2026-10-24T05:00')
         since = until - dt.timedelta(days=7)
@@ -750,7 +825,7 @@ class OwnerTexts(unittest.TestCase):
             self.assertEqual(self.message_calls(server), [])
             self.assertEqual(stats['owner_queries'], 2)
 
-    def test_changed_thread_merges_by_id_and_reclassifies_overlap(self):
+    def test_changed_thread_replaces_full_span_and_reclassifies_messages(self):
         with ControlServer([summary('old', createdAt='2026-10-24T00:00:00Z'),
                             summary('boundary', createdAt='2026-10-24T00:59:00Z'),
                             summary('overlap', createdAt='2026-10-24T00:59:30Z'),
@@ -758,23 +833,26 @@ class OwnerTexts(unittest.TestCase):
             self.read()
             server.calls.clear()
             server.threads[0]['updatedAt'] = '2026-10-24T01:00:30Z'
-            server.rows['a'] = [summary('overlap edited', messageId='overlap', createdAt='2026-10-24T00:59:30Z'),
+            server.rows['a'] = [summary('old', createdAt='2026-10-24T00:00:00Z'),
+                                summary('boundary', createdAt='2026-10-24T00:59:00Z'),
+                                summary('overlap edited', messageId='overlap', createdAt='2026-10-24T00:59:30Z'),
+                                summary('overlap edited', messageId='overlap', createdAt='2026-10-24T00:59:30Z'),
                                 summary('reclassified', messageId='removed', automated=True,
                                         createdAt='2026-10-24T00:59:40Z'),
                                 summary('new', createdAt='2026-10-24T01:00:00Z')]
             self.assertEqual([row[1] for row in self.read()], ['new', 'overlap edited', 'boundary', 'old'])
-            self.assertEqual(self.message_calls(server)[0][1]['since'], ['2026-10-24T00:59:00.000Z'])
+            self.assertEqual(self.message_calls(server)[0][1]['since'], ['2026-10-23T22:59:59.999Z'])
             server.calls.clear()
             self.assertEqual(len(self.read()), 4)
             self.assertEqual(self.message_calls(server), [])
 
-    def test_delta_edits_to_older_turns_replace_cached_text_by_id(self):
+    def test_edits_to_older_turns_replace_cached_text_by_id(self):
         cases = [(summary('edited owner words', messageId='old'), ['edited owner words']),
                  (summary('now automated', messageId='old', automated=True), []),
                  (summary('now agent', messageId='old', createdBy='agent'), []),
                  (summary('[Forwarded by owner] private', messageId='old'), [])]
         for edited, expected in cases:
-            with self.subTest(edited=edited['text']), ControlServer([summary('old')]) as server:
+            with self.subTest(edited=edited['text']), ControlServer([summary('old')], strict_since=True) as server:
                 self.read()
                 # A recent update can have an old createdAt. The real API's
                 # since filter is on updatedAt, not createdAt.
@@ -796,7 +874,7 @@ class OwnerTexts(unittest.TestCase):
             with self.assertRaisesRegex(ch.Lookup, r'incomplete \(0 of 1 threads\)'):
                 self.read()
             cached = json.loads((Path(server.tmp.name) / 'owner-texts.json').read_text())
-            self.assertEqual(cached['a']['updatedAt'], '2026-10-24T01:00:00.000Z')
+            self.assertNotIn('a', cached)
 
     def test_corrupt_cache_resets_once_and_is_replaced_privately(self):
         for raw in ('not json', '[]', '{"a": {}}'):
@@ -828,9 +906,9 @@ class OwnerTexts(unittest.TestCase):
         with ControlServer() as server:
             path = Path(server.tmp.name) / 'owner-texts.json'
             rows = [summary('ancient', createdAt=ch.iso(cutoff - dt.timedelta(days=1))), summary('recent')]
-            cached = {'a': {'updatedAt': server.threads[0]['updatedAt'], 'coveredFrom': ch.iso(cutoff - dt.timedelta(days=2)),
+            cached = {'a': {'version': ch.OWNER_CACHE_VERSION, 'updatedAt': server.threads[0]['updatedAt'], 'coveredFrom': ch.iso(cutoff - dt.timedelta(days=2)),
                             'title': 'iMessage test', 'texts': [{**row, 'title': 'iMessage test'} for row in rows]},
-                      'expired': {'updatedAt': ch.iso(cutoff - dt.timedelta(days=1)),
+                      'expired': {'version': ch.OWNER_CACHE_VERSION, 'updatedAt': ch.iso(cutoff - dt.timedelta(days=1)),
                                   'coveredFrom': ch.iso(cutoff - dt.timedelta(days=2)), 'title': 'App', 'texts': []}}
             path.write_text(json.dumps(cached))
             self.read()
