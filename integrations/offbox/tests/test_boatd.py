@@ -641,7 +641,7 @@ class Http(Base):
         st, d = self.call(None, "GET", "/health")
         self.assertEqual(st, 200)
         self.assertEqual(sorted(d), ["boatd_uptime_s", "boot", "boot_id", "mdraid", "mode", "ok", "phase", "pool", "queue", "reasons",
-                                     "running", "startedAt", "starting", "startupPhases", "up", "uptime_s", "version"])
+                                 "restartPending", "running", "startedAt", "starting", "startupPhases", "up", "uptime_s", "version"])
         self.assertNotIn("moni", json.dumps(d))
         self.assertNotIn("bx_", json.dumps(d))
 
