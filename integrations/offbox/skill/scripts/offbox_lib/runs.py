@@ -23,7 +23,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from . import home, api, capacity, identity, lease, node_tools, node_version, package_manager, pnpm_version, pool, ssh_sync, run_evidence
-from . import command_usage, common, containers, prune, prepare, userns
+from . import command_usage, common, containers, java_version, prune, prepare, userns
 from . import resources
 from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_LOCAL, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
                      RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError, atomic_write_json, db, db_retry, event, file_lock, local_error, log, new_id, now,
@@ -1299,6 +1299,7 @@ def containers_seen(box_id: str, run_id: str, timeout: float = 10) -> bool:
 def settle_docker(con, run, status: str, timeout: float = 10) -> None:
     """A run that only mentioned Docker (command or manifest) and started no container loses runs.docker, so its
     box gets the ordinary idle window. Runs that didn't end normally keep it."""
+    java_version.record(con, run, LOGS_DIR / (run["run_id"] + ".log"), api.BACKEND)
     started = time.monotonic()
     if status in ('done', 'failed', 'killed', 'lost', 'interrupted', 'infra'):
         containers.record(con, run, BOUNDED_PROCESS, timeout=timeout)
@@ -1443,7 +1444,7 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
                   steps: list[str] | None = None, node: str = "", wait_images: bool = False,
                   image_wait: int = 180, repo_key: str = "", repo_root: Path | None = None,
                   preserve_containers: str = 'private lease', box_id: str = "<box>",
-                  usage: command_usage.Usage | None = None) -> str:
+                  usage: command_usage.Usage | None = None, template: str = "") -> str:
     cmd = steps_block(steps) if steps else command_block(
         argv[0] if len(argv) == 1 else " ".join(shlex.quote(a) for a in argv))
     if api.BACKEND == 'server':
@@ -1509,6 +1510,8 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
               f"_offbox_needs_go={int(usage.needs_go)}\n{GO_REPAIR}",
               node,
               node_tools.block(rdir, repo_root),
+              java_version.block(java_version.trigger(repo_root or Path.cwd(), rel, argv, steps,
+                                                       repo_key=repo_key, template=template)),
               ('''for _offbox_tool in terraform aws ruby vector gh; do
   command -v "$_offbox_tool" >/dev/null || {
     echo "offbox: required tool missing on command PATH: $_offbox_tool" >&2
@@ -1701,11 +1704,12 @@ class Runner:
             node_block += "\n" + pnpm_version.block(pm)
         usage = command_usage.inspect(self.root, self.rel, a.cmd, steps)
 
-        def build_command(rdir, box, preserve):
+        def build_command(rdir, box, preserve, source=""):
+            template = a.template or (source.split(":", 1)[1] if source.startswith(("template:", "recipe:")) else "")
             script = remote_script(rdir, self.rel, a.cmd, env_file, self.run_id, steps=steps or None,
                                    node=node_block, wait_images=wait_images, image_wait=image_wait_seconds(),
                                    repo_key=me["repo_key"], repo_root=self.root,
-                                   preserve_containers=preserve, box_id=box, usage=usage)
+                                   preserve_containers=preserve, box_id=box, usage=usage, template=template)
             command, path = command_payload(script, self.run_id, claim_id=claim)
             return command, path, script.encode()
 
@@ -1730,7 +1734,7 @@ class Runner:
             self.record(box_id=self.box, size=row["size"], remote_dir=rdir, setup_s=round(now() - t0, 2),
                         docker=int(lease.uses_docker(cmd_text, me["repo_root"])))
             command, self.command_file, self.command_body = build_command(
-                rdir, self.box, containers.preserve_reason(con, row))
+                rdir, self.box, containers.preserve_reason(con, row), row.get("source", ""))
             self.record(cmd_bytes=len(command.encode()), cmd_via='file' if self.command_file else 'argv')
             keeper_scope = None
             if row.get('_prepare_end') is None:
