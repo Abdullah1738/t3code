@@ -66,6 +66,7 @@ class HomeFiles(unittest.TestCase):
         self.stack.enter_context(patch.dict(os.environ, env, clear=True))
         self.stack.enter_context(patch.object(common, "log", lambda m: None))
         self.stack.enter_context(patch.object(home, "log", lambda m: None))
+        self.stack.enter_context(patch.object(home, "tcp_connects", return_value=False))
 
     def configure(self, **kw):
         (self.dir / "server.json").write_text(json.dumps({"url": "http://100.64.0.9:8443/api/v1", **kw}))
@@ -158,14 +159,14 @@ class BackendChoice(HomeFiles):
                          ("server", "http://100.64.0.9:8443/api/v1", "offbox-server-api", "ardud", "offbox-home.db", True))
         self.assertGreater(got["windows"][0], 1000, "start limits are Boat's, not ours")
 
-    def test_marked_down_new_runs_go_straight_to_boat(self):
+    def test_marked_down_new_runs_start_on_home_for_live_preflight(self):
         self.configure()
         self.monitor_says("home_down", reason="no answer for 2 checks")
         self.assertEqual(common.default_backend(), "boat")
         self.assertTrue(common.standby())
         got = fresh_process(self.dir, "run", "--", "true")
-        self.assertEqual({**got, "standby": False}, BOAT)
-        self.assertTrue(got["standby"])
+        self.assertEqual(got["backend"], "server")
+        self.assertTrue(got["may_fail_over"])
 
     def test_back_home_as_soon_as_the_monitor_says_up(self):
         self.configure()
@@ -224,7 +225,7 @@ class BackendChoice(HomeFiles):
         self.assertEqual(common.entry_backend(["spend", "--check"]), "boat", "the meter is Boat's")
         self.assertEqual(common.entry_backend(["stats"]), "server")
         self.monitor_says("home_down")
-        self.assertEqual(common.entry_backend(["run", "--", "true"]), "boat")
+        self.assertEqual(common.entry_backend(["run", "--", "true"]), "server")
         self.assertEqual(common.entry_backend(["wait", "run-1112-020202-bbbb"]), "server", "a home run is still a home run")
 
     def test_wait_routes_by_run_id_not_timeout_values_in_either_failover_direction(self):
@@ -315,7 +316,7 @@ class Failover(HomeFiles):
             with self.subTest(answer=answer):
                 self.execs.clear()
                 home.record_failure("offbox server API unreachable: timed out", "previous")
-                with patch.object(home, "probe", side_effect=AssertionError("use authenticated probe")), \
+                with patch.object(home, "probe", return_value=None), \
                         patch.object(api, "probe_backend", side_effect=lambda name, timeout: answer if name == "server" else None) as probe, \
                         patch.object(runs, "run_remote", return_value=7) as run, patch.object(api, "resume") as resume:
                     self.assertEqual(self.run_cmd("--remote", "--", "make", "test")[0], "exec" if answer else 7)
@@ -466,14 +467,15 @@ class Failover(HomeFiles):
         self.assertIn("was not run again", err)
         self.assertEqual(self.execs, [])
 
-    def test_standby_run_says_once_why_it_is_on_boat(self):
-        self.monitor_says("home_down", reason="no answer for 2 checks")
-        with patch.object(common, "_BACKEND", "boat"), patch.object(runs, "run_remote", return_value=0), \
-                patch.object(home, "probe", side_effect=AssertionError("marked down: no probe, straight to Boat")):
-            rc, err = self.run_cmd("--", "make", "test")
-        self.assertEqual(rc, 0)
-        self.assertEqual(err.count("this run is on Boat"), 1)
-        self.assertIn("no answer for 2 checks", err)
+    def test_marked_down_routing_is_checked_live_before_any_box_call(self):
+        common.select_backend("server")
+        self.monitor_says("home_down", reason="timeout", last_check=123, last_outcome="good")
+        with patch.object(home, "probe", return_value=None), patch.object(api, "probe_backend", return_value=None), \
+                patch.object(runs, "run_remote", return_value=7):
+            code, err = self.run_cmd("--no-fallback", "--remote", "--", "true")
+        self.assertEqual(code, 7)
+        self.assertIn("while the monitor still says down; staying home", err)
+        self.assertEqual(self.execs, [])
 
 
 class BoxReadinessFailover(Isolated):
@@ -497,7 +499,7 @@ class BoxReadinessFailover(Isolated):
         self.auth_probe = api.probe_backend
         self.stack.enter_context(patch.object(api, "probe_backend", return_value=None))
         self.clock = Clock()
-        for mod in (pool, prepare, api):
+        for mod in (pool, prepare, api, home):
             self.stack.enter_context(patch.object(mod, "time", self.clock.time))
         self.stack.enter_context(patch.object(common, "_BACKEND", "server"))
         self.stack.enter_context(patch.object(home, "probe", return_value=None))
@@ -955,7 +957,7 @@ class BoxReadinessFailover(Isolated):
             self.clock.sleep(5)
             raise api.NetworkError("GET /sandboxes/cold timed out")
         with patch.object(api, "get", side_effect=silent) as get, \
-                patch.object(api, "probe_backend", side_effect=[None, "no answer", None]), \
+                patch.object(api, "probe_backend", side_effect=[None, "no answer", "no answer", None]), \
                 patch.object(lease, "acquire_private") as create:
             self.assertEqual(self.run_cmd("--remote", "--", "make", "test")[0], "exec")
         create.assert_not_called()
@@ -1705,6 +1707,226 @@ class HomePoolIsAQueue(unittest.TestCase):
             self.assertEqual((pool.wait_seconds(), pool.pool_size()), (30, 64))
         self.assertEqual((pool._span(59), pool._span(5400), pool._span(86400)), ("59s", "1h30m", "24h00m"))
         self.assertIsNone(importlib.util.find_spec("offbox_lib.localfirst"), "the local-first lane is retired")
+
+
+
+class SlowHomeClient(HomeFiles):
+    def setUp(self):
+        super().setUp()
+        self.configure()
+        common.select_backend("server")
+        self.stack.enter_context(patch.object(home, "say"))
+
+    def test_timeout_with_tcp_and_successful_long_probe_stays_home(self):
+        with patch.object(home, "_health", side_effect=["no answer (TimeoutError)", {"ok": True}]) as read, \
+                patch.object(home, "tcp_connects", return_value=True), patch.object(home, "record_failure") as fail:
+            self.assertIsNone(home.probe())
+        self.assertEqual([c.args for c in read.call_args_list], [(3.0,), (15,)])
+        fail.assert_not_called()
+
+    def test_two_timeouts_wait_on_old_server_until_it_answers(self):
+        clock = Clock()
+        with patch.object(home, "_health", side_effect=["no answer (TimeoutError)"] * 3 + [{"ok": True}]), \
+                patch.object(home, "tcp_connects", return_value=True), \
+                patch.object(home.time, "monotonic", clock.now), patch.object(home.time, "sleep", clock.sleep), \
+                patch.object(home, "fail_over", side_effect=AssertionError("short flap must stay home")):
+            self.assertIsNone(home.probe())
+        self.assertGreater(clock.t, 1000)
+        self.assertLess(clock.t, 1300)
+
+    def test_slow_expires_with_class_and_monitor_evidence(self):
+        clock = Clock()
+        self.monitor_says("home_slow", last_check=42, last_outcome="slow")
+        with patch.object(home.time, "monotonic", clock.now), patch.object(home.time, "sleep", clock.sleep), \
+                patch.object(home, "_health", return_value="no answer (TimeoutError)"), \
+                patch.object(home, "tcp_connects", return_value=True), home.wait_budget():
+            reason = home.probe()
+        self.assertIn("home still slow after 300 s", reason)
+        home.record_failure(reason, "run-test")
+        row = json.loads(common.HOME_FAILURES.read_text())
+        self.assertEqual((row["class"], row["run"], row["monitor_last_check"], row["monitor_last_outcome"]),
+                         ("slow", "run-test", 42, "slow"))
+
+    def test_refused_tcp_returns_without_wait(self):
+        with patch.object(home, "_health", return_value="no answer (TimeoutError)") as read, \
+                patch.object(home, "wait_while_starting", side_effect=AssertionError("hard failure must be fast")):
+            self.assertIsNotNone(home.probe())
+        read.assert_called_once()
+
+    def test_person_is_home_in_slow_and_down_states_even_at_failover_boundary(self):
+        with patch.dict(os.environ, OFFBOX_THREAD="person:moni"):
+            for state in ("home_slow", "home_down"):
+                self.monitor_says(state)
+                self.assertEqual(common.entry_backend(["run", "--", "true"]), "server")
+                with self.assertRaises(common.OffboxError) as raised:
+                    home.fail_over("timeout", ["run", "--", "true"])
+                self.assertEqual(raised.exception.code, 93)
+
+
+class SlowPreflight(Failover):
+    def test_slow_state_waits_for_old_handler_then_runs_without_failure_row(self):
+        self.monitor_says("home_slow")
+        clock = Clock()
+        with patch.object(home, "_health", side_effect=["no answer (TimeoutError)"] * 3 + [{"ok": True}]), \
+                patch.object(home, "tcp_connects", return_value=True), \
+                patch.object(home.time, "monotonic", clock.now), patch.object(home.time, "sleep", clock.sleep), \
+                patch.object(api, "probe_backend", return_value=None), patch.object(runs, "run_remote", return_value=7):
+            self.assertEqual(self.run_cmd("--no-fallback", "--", "true")[0], 7)
+        self.assertEqual((self.execs, self.failures()), ([], []))
+
+    def test_hard_failover_with_no_fallback_records_foreground_run_and_monitor_outcome(self):
+        self.monitor_says("home_down", last_check=123, last_outcome="good")
+        with patch.object(home, "probe", return_value="no answer (TimeoutError)"), \
+                patch.object(api, "probe_backend", side_effect=lambda backend, timeout: "no answer" if backend == "server" else None):
+            code, message = self.run_cmd("--no-fallback", "--", "true")
+        self.assertEqual(code, "exec")
+        row = self.failures()[-1]
+        self.assertTrue(row["run"].startswith("run-"))
+        self.assertEqual((row["class"], row["monitor_last_check"], row["monitor_last_outcome"]), ("hard", 123, "good"))
+        self.assertIn("monitor_last_outcome=good", message)
+
+
+class ReviewSlowRegressions(HomeFiles):
+    def setUp(self):
+        super().setUp()
+        self.configure()
+        common.select_backend("server")
+        self.stack.enter_context(patch.object(common, "STATE", self.dir))
+        self.stack.enter_context(patch.object(common, "DB_PATH", self.dir / "offbox-home.db"))
+        self.stack.enter_context(patch.object(api, "BACKEND", "server"))
+        self.stack.enter_context(patch.object(api, "_key", return_value="fixture"))
+        self.stack.enter_context(patch.object(home, "say"))
+
+    def test_authenticated_timeout_retains_its_class_and_waits_on_reachable_home(self):
+        clock = Clock()
+        with patch.object(home, "_health", return_value={"ok": True}), \
+                patch.object(api, "call", side_effect=[api.NetworkError("request timed out")] * 2 + [{}]) as call, \
+                patch.object(home, "tcp_connects", return_value=True), \
+                patch.object(home.time, "sleep", clock.sleep), patch.object(home.time, "monotonic", clock.now):
+            self.assertIsNone(home.preflight_reason())
+        self.assertEqual(call.call_count, 3)
+        self.assertGreater(clock.t, 1000)
+        self.assertFalse(common.HOME_FAILURES.exists())
+
+    def test_foreground_candidate_is_used_once_and_background_id_is_retained(self):
+        with home.run_identity():
+            candidate = home.invocation_run()
+            self.assertTrue(candidate.startswith("run-"))
+            self.assertEqual(home.take_invocation_run(), candidate)
+            self.assertEqual(home.take_invocation_run(), "")
+        with patch.dict(os.environ, OFFBOX_BACKGROUND_RUN="run-background"), home.run_identity():
+            self.assertEqual(home.take_invocation_run(), "run-background")
+            self.assertEqual(home.take_invocation_run(), "run-background")
+
+    def test_registered_foreground_failover_gets_a_new_boat_identity(self):
+        with contextlib.closing(common.db()) as con:
+            con.execute("INSERT INTO runs(run_id,status,mode) VALUES ('run-old','infra','fg')")
+            con.commit()
+        with patch.object(api, "probe_backend", return_value=None), \
+                patch.object(os, "execve", side_effect=RuntimeError("captured")) as execute:
+            with self.assertRaises(RuntimeError):
+                home.fail_over("refused", ["run", "--", "true"], "run-old")
+        self.assertNotIn(home.RUN_ID_ENV, execute.call_args.args[2])
+
+
+class HealthFailureForms(HomeFiles):
+    def test_explicit_not_ok_with_timeout_reason_is_hard(self):
+        self.configure()
+        with patch.object(home, "_health", return_value={"ok": False, "reasons": ["incus query timed out"]}) as read, \
+                patch.object(home, "tcp_connects", side_effect=AssertionError("explicit failure needs no TCP reclassification")):
+            self.assertIn("cannot take runs", home.probe())
+        read.assert_called_once()
+
+    def test_authenticated_error_forms_keep_timeout_distinct_from_hard(self):
+        import urllib.error
+        from offbox_lib.health_reachability import timed_out
+        self.stack.enter_context(patch.object(api, "BACKEND", "server"))
+        self.stack.enter_context(patch.object(api, "_key", return_value="fixture"))
+        cases = [(TimeoutError(), True), (urllib.error.URLError(TimeoutError()), True),
+                 (api.NetworkError("request timed out"), True),
+                 (urllib.error.URLError("timed out"), True),
+                 (api.ApiError(500, "internal", "timed out"), False),
+                 (api.ApiError(503, "incus_timeout", "incus query timed out"), False),
+                 (urllib.error.HTTPError("http://fixture", 500, "timed out", {}, None), False),
+                 (api.BudgetExpired("client deadline passed"), True),
+                 (ConnectionResetError(), False), (api.ApiError(500, "internal", "broken"), False),
+                 (common.OffboxError("API key missing"), False)]
+        for error, timeout in cases:
+            with self.subTest(error=type(error).__name__), patch.object(api, "call", side_effect=error):
+                self.assertEqual(timed_out(api.probe_backend("server")), timeout)
+
+
+class WaitTransitions(ReviewSlowRegressions):
+    def test_current_live_health_overrides_stale_monitor_time(self):
+        import time
+        self.monitor_says("home_down", last_ok=time.time() - 600)
+        clock = Clock()
+        with patch.object(home, "_health", return_value={"ok": True}), \
+                patch.object(api, "call", side_effect=[api.NetworkError("request timed out")] * 2 + [{}]), \
+                patch.object(home, "tcp_connects", return_value=True), \
+                patch.object(home.time, "monotonic", clock.now), patch.object(home.time, "sleep", clock.sleep):
+            self.assertIsNone(home.preflight_reason())
+        self.assertGreater(clock.t, 1000)
+
+    def test_authenticated_slow_retry_keeps_startup_context(self):
+        clock = Clock()
+        errors = [api.NetworkError("request timed out")] * 2 + [
+            api.ApiError(503, "server_not_ready", "reconciling runs and boxes after start"), {}]
+        with patch.object(home, "_health", return_value={"ok": True}), \
+                patch.object(api, "_request", side_effect=errors) as request, \
+                patch.object(home, "tcp_connects", return_value=True), \
+                patch.object(home.time, "monotonic", clock.now), patch.object(home.time, "sleep", clock.sleep):
+            self.assertIsNone(home.preflight_reason())
+        self.assertEqual(request.call_count, 4)
+        self.assertGreater(clock.t, 1005)
+
+    def test_wait_mode_transition_matrix(self):
+        starting = {"ok": False, "starting": True, "phase": "reconcile"}
+        cases = [("slow", starting, 30, "home still starting after 30 s"),
+                 ("reconcile", "no answer (TimeoutError)", 10, "home still slow after 10 s"),
+                 ("slow", {"ok": False, "reasons": ["incus broken"]}, 5, "cannot take runs"),
+                 ("slow", {"ok": True}, 5, None)]
+        for initial, reply, duration, expected in cases:
+            clock = Clock()
+            with self.subTest(initial=initial, reply=reply), home.wait_budget(), \
+                    patch.dict(os.environ, OFFBOX_HOME_START_WAIT_S="30", OFFBOX_HOME_SLOW_DOWN_AFTER_S="10"), \
+                    patch.object(home, "tcp_connects", return_value=True):
+                result = home.wait_while_starting(initial, clock=clock.now, sleep=clock.sleep, read=lambda timeout: reply)
+            self.assertEqual(clock.t, 1000 + duration)
+            if expected is None:
+                self.assertIsNone(result)
+            else:
+                self.assertIn(expected, result)
+
+
+class SlowRecheckReason(Failover):
+    def test_post_allocation_slow_expiry_keeps_slow_failure_class(self):
+        with patch.object(home, "preflight_reason", side_effect=[None, "home still slow after 300 s (slow)"]), \
+                patch.object(api, "probe_backend", return_value=None), \
+                patch.object(runs, "run_remote", side_effect=api.NetworkError("connection reset")):
+            self.assertEqual(self.run_cmd("--remote", "--", "true")[0], "exec")
+        self.assertEqual(self.failures()[-1]["class"], "slow")
+
+
+class LatestHomeEvidence(ReviewSlowRegressions):
+    def test_newer_monitor_answer_refreshes_an_older_client_silence_window(self):
+        clock = Clock()
+        self.monitor_says("home_slow", last_ok=9990)
+        with home.wait_budget(), patch.object(home.time, "time", return_value=10000):
+            home.WAIT_BUDGET.get()["last_answer"] = 500
+            self.assertEqual(home.slow_deadline(clock.now), 1290)
+            self.monitor_says("home_slow", last_ok=9990, last_answer=10000)
+            self.assertEqual(home.slow_deadline(clock.now), 1300)
+
+    def test_authenticated_success_refreshes_the_client_silence_window(self):
+        clock = Clock()
+        with home.wait_budget(), patch.object(home.time, "monotonic", clock.now), \
+                patch.object(api, "_request", return_value={}):
+            home.WAIT_BUDGET.get().update(last_answer=500, slow_anchor=500, slow_end=800)
+            api.call("GET", "/limits")
+            self.assertEqual(home.WAIT_BUDGET.get()["last_answer"], 1000)
+            self.assertNotIn("slow_end", home.WAIT_BUDGET.get())
+
 
 if __name__ == "__main__":
     unittest.main()

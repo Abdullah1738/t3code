@@ -660,9 +660,13 @@ it.effect.each(["completed", "failed", "interrupted"] as const)(
     ),
 );
 
-it.effect.each(["queued", "background", "both"] as const)(
-  "a failed worker keeps its deferred wait while %s work is pending",
-  (pending) =>
+it.effect.each(
+  (["queued", "background", "both"] as const).flatMap((pending) =>
+    (["provider", "runtime"] as const).map((failure) => ({ pending, failure })),
+  ),
+)(
+  "a $failure-failed worker keeps its deferred wait while $pending work is pending",
+  ({ pending, failure }) =>
     inWorld((world) =>
       Effect.gen(function* () {
         const { kanban, card, worker } = yield* deferredWorker;
@@ -670,11 +674,11 @@ it.effect.each(["queued", "background", "both"] as const)(
         work.add(worker);
         if (pending === "both") world.background.add(worker);
         world.failures.set(worker, {
-          class: "provider_error",
+          class: failure === "runtime" ? "transport_error" : "provider_error",
           category: "unknown",
           message: "tool failed",
-          code: null,
-          retryable: false,
+          code: failure === "runtime" ? "codex.runtime_lost" : null,
+          retryable: failure === "runtime",
           runId: "run-1",
         });
         yield* kanban.turnEnded(worker);
@@ -683,6 +687,11 @@ it.effect.each(["queued", "background", "both"] as const)(
         assert.strictEqual(held.activeThreadId, worker);
         assert.isNull(held.stalled);
         assert.isDefined(held.wait);
+        yield* TestClock.adjust(2 * MINUTE);
+        yield* kanban.tick;
+        assert.strictEqual((yield* cardOf(card.id)).activeThreadId, worker);
+        assert.strictEqual(world.said("still in Working"), 0);
+        assert.strictEqual(world.said("tool-host or provider-runtime failure"), 0);
         work.delete(worker);
         world.background.delete(worker);
         yield* kanban.turnEnded(worker);

@@ -4,6 +4,7 @@ import copy
 import os
 from pathlib import Path
 import signal
+import statistics
 import subprocess
 import time
 
@@ -84,7 +85,7 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
     started, wall_started = time.monotonic(), time.time()
     deadline, wall_deadline = started+budget, wall_started+budget
     measured = partial = bytes_measured = 0
-    metrics = dict(timeouts=0, secondsInTimeouts=0, childrenDescended=set(), partsMeasured=0)
+    metrics = dict(timeouts=0, secondsInTimeouts=0, probeTimeouts=0, secondsInProbeTimeouts=0, probeAllowances=[], childrenDescended=set(), partsMeasured=0)
     roots = list(jobs.DIRECTORY_ROOTS if paths is None else paths)
     priorities = {str(Path('/Volumes/ExternalSSD')/name): i for i, name in enumerate(SLOW_ROOTS)}
     roots.sort(key=lambda p: (priorities.get(str(p), len(priorities)), str(p)))
@@ -92,7 +93,8 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
         if lock_fd is False:
             jobs.inventory_skipped_logs(roots, jobs.read_state('disk-inventory'), 'lock_held')
             emit('disk', 'event', 'disk.deep.end', props=dict(duMode='links', skipReason='lock_held',
-                 timeouts=0, secondsInTimeouts=0, childrenDescended=0, partsMeasured=0,
+                 timeouts=0, secondsInTimeouts=0, probeTimeouts=0, secondsInProbeTimeouts=0,
+                 probeAllowanceMedianS=0, childrenDescended=0, partsMeasured=0,
                  spawnPolicy='nice-10-utility'))
             return
         state = jobs.read_state('disk-inventory')
@@ -114,12 +116,14 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
                 break
             key = str(path)
             jobs.inventory_clean_cache(child_state[key], time.time())
+            for value in child_state[key].values():
+                jobs.inventory_migrate_probe(value)
             listings[key] = jobs.inventory_listing(path, min(deadline, time.monotonic()+2,
                 time.monotonic()+max(0, wall_deadline-time.time())))
         stop_reason = 'done'
 
         def remaining():
-            return sum(sum(jobs.inventory_needs_measurement(cache.get(key), time.time()) for key in
+            return sum(sum(jobs.inventory_needs_measurement(cache.get(key), time.time(), root=root) for key in
                            ({e.path for e in entries} if listed else set(cache)))
                        for root, (entries, listed) in listings.items() for cache in [child_state[root]])
 
@@ -145,7 +149,7 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
                 present = {e.path for e in entries}
                 for child in set(child_state[key])-present:
                     child_state[key].pop(child)
-            store_root(key, *jobs.inventory_status(child_state[key], entries, listed, time.time()))
+            store_root(key, *jobs.inventory_status(child_state[key], entries, listed, time.time(), root=path))
         state['sourceErrors'] = len(state['partials'])
         jobs.save_state('disk-inventory', state)
         initial = copy.deepcopy(child_state)
@@ -156,6 +160,8 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
                         childrenRemaining=remaining(), bytesMeasured=bytes_measured, stopReason=stop_reason,
                         rootsPartial=sum(not listed for entries, listed in listings.values()),
                         timeouts=metrics['timeouts'], secondsInTimeouts=metrics['secondsInTimeouts'],
+                        probeTimeouts=metrics['probeTimeouts'], secondsInProbeTimeouts=metrics['secondsInProbeTimeouts'],
+                        probeAllowanceMedianS=statistics.median(metrics['probeAllowances']) if metrics['probeAllowances'] else 0,
                         childrenDescended=len(metrics['childrenDescended']), partsMeasured=metrics['partsMeasured'],
                         spawnPolicy='nice-10-utility', partsFreshnessS=jobs.INVENTORY_PARTS_FRESH_S)
 
@@ -166,7 +172,7 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
         part_work = {str(path): {} for path in roots}
         def needs_work(root, entry):
             return (entry.path not in attempted[root]
-                    and jobs.inventory_due(child_state[root].get(entry.path), time.time(), wall_deadline))
+                    and jobs.inventory_due(child_state[root].get(entry.path), time.time(), wall_deadline, root=root))
 
         def healthy_pending():
             return any(needs_work(root, entry)
@@ -214,9 +220,9 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
                                                      attempted=attempted[key], max_batches=4, turn_seconds=60,
                                                      single_paths=single_paths[key], metrics=metrics,
                                                      part_work=part_work[key], due_at=wall_deadline,
-                                                     # One early parts turn preserves daily progress;
-                                                     # then ordinary work due this pass takes priority.
-                                                     descend=not any(part_work.values()) or not healthy_pending(),
+                                                     # Each root gets one early part attempt; a
+                                                     # second waits for ordinary work in every root.
+                                                     descend=lambda: not part_work[key] or not healthy_pending(),
                                                      inventory_log=inventory_logs[key])
                 finally:
                     inventory_logs[key].elapsed_ms += max(0, (time.monotonic()-scan_started)*1000)
@@ -257,10 +263,10 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
                 entries, listed = listings[key]
                 # A root skipped early in the pass can cross its freshness
                 # boundary while another root is running. Recheck all roots.
-                total, status, children = jobs.inventory_status(cache, entries, listed, time.time())
+                total, status, children = jobs.inventory_status(cache, entries, listed, time.time(), root=path)
                 store_root(key, total, status, children)
                 inventory_logs[key].root_event(cache, total, status)
-                complete = sum(not jobs.inventory_needs_measurement(cache.get(e.path), time.time()) for e in entries)
+                complete = sum(not jobs.inventory_needs_measurement(cache.get(e.path), time.time(), root=path) for e in entries)
                 ages = [max(0, time.time()-v['at']) for v in cache.values() if jobs.number(v.get('at'))]
                 emit('disk', 'event', 'disk.deep.root', props=dict(duMode='links', source=key,
                      completedCount=complete, partial=not listed or complete != len(entries),

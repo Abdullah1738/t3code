@@ -1,9 +1,13 @@
 import { describe, expect, it } from "@effect/vitest";
+import { vi } from "vite-plus/test";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
+import type * as Statement from "effect/sql/Statement";
 import {
+  type AnalyticsEvent,
   CommandId,
   EventId,
   MessageId,
@@ -12,11 +16,13 @@ import {
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderThreadId,
   RunId,
   RuntimeRequestId,
   NodeId,
   type OrchestrationV2Run,
   type OrchestrationV2RuntimeRequest,
+  type OrchestrationV2ServerCommand,
   type OrchestrationV2TurnItem,
   ThreadId,
   type ThreadPullRequestLink,
@@ -24,6 +30,8 @@ import {
 import * as Option from "effect/Option";
 import * as Result from "effect/Result";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+
+import { derivePendingBackgroundWork } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 
 import * as Sqlite from "../../../persistence/Sqlite.ts";
 import * as CommandReceipts from "../../../persistence/OrchestrationCommandReceipts.ts";
@@ -48,6 +56,9 @@ import {
 } from "./threads.ts";
 
 import { liveThreadShell } from "../../../mcp/McpToolAccess.testkit.ts";
+import * as Analytics from "../../analytics/Analytics.ts";
+import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
+import * as EvaluatorAnalytics from "./evaluatorAnalytics.ts";
 
 const at = (iso: string) => DateTime.makeUnsafe(iso);
 const QUESTION_AT = "2026-10-25T00:10:00.000Z";
@@ -118,18 +129,61 @@ describe("viewStateOf", () => {
 });
 
 describe("backgroundWorkOf", () => {
-  it("counts subagents and background tasks, not commands or pull-request watches", () => {
+  it("counts commands alongside subagents and tasks, with PR watches counted separately", () => {
     expect(
       backgroundWorkOf({
         pendingBackgroundTasks: [
           { taskId: "a", kind: "subagent" },
           { taskId: "b", kind: "background_task" },
           { taskId: "c", kind: "command" },
+          { taskId: "d", kind: "monitor" },
           { taskId: "pull-request-watch:github.com/x/y#1", kind: "monitor" },
         ],
       }),
-    ).toBe(2);
+    ).toBe(4);
   });
+
+  it.each([
+    "pending",
+    "running",
+    "waiting",
+    "completed",
+    "failed",
+    "cancelled",
+    "interrupted",
+  ] as const)("counts a Codex shell item only while active: %s", (status) => {
+    const pendingBackgroundTasks = derivePendingBackgroundWork({
+      latestRun: { id: RunId.make("parent"), ordinal: 1, status: "completed" },
+      providerThreads: [],
+      turnItems: [{ id: "shell", type: "command_execution", title: "Check", status }],
+    });
+    expect(backgroundWorkOf({ pendingBackgroundTasks })).toBe(
+      status === "pending" || status === "running" || status === "waiting" ? 1 : 0,
+    );
+  });
+
+  it.each(["command", "background_task", "monitor"] as const)(
+    "counts a Claude %s until the provider removes it from its roster",
+    (kind) => {
+      const pendingBackgroundTasks = derivePendingBackgroundWork({
+        latestRun: { id: RunId.make("parent"), ordinal: 1, status: "completed" },
+        providerThreads: [
+          {
+            id: ProviderThreadId.make("claude"),
+            pendingBackgroundTasks: [{ taskId: "bash-or-task", kind }],
+          },
+        ],
+        turnItems: [],
+      });
+      expect(backgroundWorkOf({ pendingBackgroundTasks })).toBe(1);
+      const ended = derivePendingBackgroundWork({
+        latestRun: { id: RunId.make("parent"), ordinal: 1, status: "completed" },
+        providerThreads: [{ id: ProviderThreadId.make("claude"), pendingBackgroundTasks: [] }],
+        turnItems: [],
+      });
+      expect(backgroundWorkOf({ pendingBackgroundTasks: ended })).toBe(0);
+    },
+  );
 
   it("is zero for an empty roster", () => {
     expect(backgroundWorkOf({ pendingBackgroundTasks: [] })).toBe(0);
@@ -984,6 +1038,7 @@ it.effect("a rejected keyed wake can retry with real orchestrator receipts", () 
   const recorded: Array<ThreadManagementService.ThreadManagementSendInput> = [];
   let failBeforeDispatch = false;
   let failAfterDispatch = false;
+  let receiptFailureAfterCommit = false;
   let queueWithdrawal = false;
   let startWithdrawal = false;
   let restartBeforeCleanup = false;
@@ -1000,6 +1055,7 @@ it.effect("a rejected keyed wake can retry with real orchestrator receipts", () 
   const dependencies = Layer.mergeAll(
     management,
     receipts,
+    CommandReceipts.layer.pipe(Layer.provide(db)),
     ProjectionStore.layer.pipe(Layer.provide(db)),
     Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
   );
@@ -1170,7 +1226,34 @@ it.effect("a rejected keyed wake can retry with real orchestrator receipts", () 
         true,
       );
       failAfterDispatch = true;
-      expect(Result.isFailure(yield* Effect.result(threads.send(wake)))).toBe(true);
+      let acknowledged = false;
+      const repository = yield* CommandReceipts.OrchestrationCommandReceiptRepository;
+      const originalRead = repository.getByCommandId;
+      const reads = vi
+        .spyOn(repository, "getByCommandId")
+        .mockImplementation((input) =>
+          receiptFailureAfterCommit
+            ? Effect.die("receipt read unavailable after accepted commit")
+            : originalRead(input),
+        );
+      let failed = false;
+      try {
+        const result = yield* Effect.exit(
+          threads.send({
+            ...wake,
+            onCommitted: () => {
+              acknowledged = true;
+              receiptFailureAfterCommit = true;
+            },
+          }),
+        );
+        failed = result._tag === "Failure";
+      } finally {
+        receiptFailureAfterCommit = false;
+        reads.mockRestore();
+      }
+      expect(failed).toBe(true);
+      expect(acknowledged).toBe(true);
       expect(recorded.at(-1)?.commandId).toBe("kanban:send:wake:real-receipt:retry:2");
       const accepted = yield* receiptStore.getByCommandId(recorded.at(-1)!.commandId);
       expect(Option.isSome(accepted) && accepted.value.status).toBe("accepted");
@@ -1193,14 +1276,12 @@ it.effect("a rejected keyed wake can retry with real orchestrator receipts", () 
         text: "The board changed while assigning this review",
       });
       const revoked = yield* orchestrator.getThreadRecords(threadId, ["runs", "messages"]);
-      expect(["interrupted", "cancelled"]).toContain(
-        revoked.runs.find((run) => run.id === acceptedWake.id)?.status,
+      expect(revoked.runs.find((run) => run.id === acceptedWake.id)?.status).toBe(
+        acceptedWake.status,
       );
-      expect(
-        revoked.messages.some(
-          (message) => message.text === "The board changed while assigning this review",
-        ),
-      ).toBe(false);
+      expect(revoked.runs.filter((run) => run.status === "queued")).toHaveLength(0);
+      // Finish this preserved turn explicitly before exercising the next withdrawal scenario.
+      yield* threads.interrupt(threadId, "Finish preserved turn", true);
       yield* threads.send({ threadId, key: "wake:next-worker", text: "Next valid work" });
       const original = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs.at(-1)!;
       const records = yield* orchestrator.getThreadRecords(threadId, [
@@ -1333,7 +1414,8 @@ it.effect("a rejected keyed wake can retry with real orchestrator receipts", () 
         text: "Stop only the original card",
       });
       nativeSteering = null;
-      expect(siblingBeforeInterrupt).toBe(false);
+      expect(siblingBeforeInterrupt).toBe(true);
+      siblingBeforeInterrupt = false;
       const lateShared = yield* orchestrator.getThreadRecords(threadId, ["runs"]);
       const latePreserved = lateShared.runs.find((run) => run.id === lateRoot.id)!;
       expect(latePreserved.status).toBe(lateRoot.status);
@@ -1346,8 +1428,41 @@ it.effect("a rejected keyed wake can retry with real orchestrator receipts", () 
   }).pipe(Effect.provide(dependencies));
 });
 
-it.effect("an accepted keyed wake replays once but a new key sends another message", () => {
+it.effect("#1490 observes accepted deliveries once and does not block on boards migration", () => {
   const db = Sqlite.layerMemory;
+  const measured: AnalyticsEvent[] = [];
+  const migrationGate = Deferred.makeUnsafe<void>();
+  let migrationReady = false;
+  let blockedReads = 0;
+  const observation = Layer.mergeAll(
+    Layer.mock(Analytics.Analytics)({
+      record: (event) =>
+        Effect.sync(() => {
+          measured.push(event);
+        }),
+    }),
+    Layer.effect(
+      BoardsDatabase.BoardsDatabase,
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`CREATE TABLE ardud_kanban_threads (thread_id TEXT PRIMARY KEY, json TEXT NOT NULL)`;
+        const gatedSql = new Proxy(sql, {
+          apply(target, receiver, args) {
+            const statement = Reflect.apply(target, receiver, args) as Statement.Statement<unknown>;
+            if (migrationReady) return statement;
+            blockedReads++;
+            return Deferred.await(migrationGate).pipe(Effect.andThen(statement));
+          },
+        });
+        return {
+          sql: gatedSql,
+          ready: Deferred.await(migrationGate),
+          isReady: () => migrationReady,
+          path: ":memory:",
+        };
+      }),
+    ).pipe(Layer.provide(db)),
+  );
   const instanceId = ProviderInstanceId.make("codex");
   const projectId = ProjectId.make("project:wake-epochs");
   const threadId = ThreadId.make("thread:wake-epochs");
@@ -1370,9 +1485,11 @@ it.effect("an accepted keyed wake replays once but a new key sends another messa
     { name: "kanban-wake-epochs" },
     registry,
     { databaseLayer: db, runEffectWorker: false },
-  );
+  ).pipe(Layer.provide(observation));
   const management = ThreadManagementService.layer.pipe(
-    Layer.provideMerge(Layer.mergeAll(runtime, receipts, ServerSettings.layerTest(), db)),
+    Layer.provideMerge(
+      Layer.mergeAll(runtime, receipts, ServerSettings.layerTest(), db, observation),
+    ),
   );
   const dependencies = Layer.mergeAll(
     management,
@@ -1396,9 +1513,67 @@ it.effect("an accepted keyed wake replays once but a new key sends another messa
       createdBy: "system",
       creationSource: "server",
     });
+    const ordinary = ThreadId.make("thread:migration-independent");
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("migration:create"),
+      threadId: ordinary,
+      projectId,
+      title: "Ordinary thread",
+      modelSelection: { instanceId, model: "gpt-5.1-codex" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "user",
+      creationSource: "web",
+    });
+    yield* orchestrator.dispatch({
+      type: "message.dispatch",
+      commandId: CommandId.make("migration:send"),
+      threadId: ordinary,
+      messageId: MessageId.make("migration:message"),
+      text: "Unrelated work",
+      attachments: [],
+      dispatchMode: { type: "start_immediately" },
+      createdBy: "user",
+      creationSource: "web",
+    });
+    yield* orchestrator.dispatch({
+      type: "thread.stop",
+      commandId: CommandId.make("migration:stop"),
+      threadId: ordinary,
+    });
+    expect(blockedReads).toBe(0);
+    expect(measured).toEqual([]);
+    migrationReady = true;
+    yield* Deferred.succeed(migrationGate, undefined);
     yield* Effect.gen(function* () {
       const threads = yield* KanbanThreads;
-      const wake = { threadId, text: "Model answers again", key: "wake:k1" };
+      const boards = yield* BoardsDatabase.BoardsDatabase;
+      const link = JSON.stringify({
+        threadId,
+        boardId: "board-offbox",
+        cardId: "card-one",
+        role: "evaluator",
+        purpose: "discussion:disc-one",
+        discussionId: "disc-one",
+        model: null,
+        startedAt: "2026-11-14T00:00:00.000Z",
+        endedAt: null,
+        paused: null,
+      });
+      yield* boards.sql`INSERT INTO ardud_kanban_threads VALUES (${threadId}, ${link})`;
+      const observed: string[] = [];
+      const wake = {
+        threadId,
+        text: "Model answers again",
+        key: "wake:k1",
+        onAccepted: (identity: string) =>
+          Effect.sync(() => {
+            observed.push(identity);
+          }),
+      };
       yield* threads.send(wake);
       const receipt = yield* receiptStore.getByCommandId(CommandId.make("kanban:send:wake:k1"));
       expect(Option.isSome(receipt) && receipt.value.status).toBe("accepted");
@@ -1410,9 +1585,190 @@ it.effect("an accepted keyed wake replays once but a new key sends another messa
         1,
       );
       yield* threads.send({ ...wake, key: "wake:k2" });
+      expect(observed).toEqual(["wake:k1", "wake:k2"]);
       expect((yield* orchestrator.getThreadRecords(threadId, ["messages"])).messages).toHaveLength(
         2,
       );
+      expect(measured).toEqual([]);
+      const management = yield* ThreadManagementService.ThreadManagementService;
+      const command = {
+        type: "message.dispatch" as const,
+        commandId: CommandId.make("generic:send"),
+        threadId,
+        messageId: MessageId.make("generic:message"),
+        text: "An external steer",
+        attachments: [],
+        dispatchMode: { type: "queue_after_active" as const },
+        createdBy: "agent" as const,
+        creationSource: "mcp" as const,
+      };
+      yield* management.dispatch(command);
+      yield* management.dispatch(command);
+      expect(measured).toHaveLength(1);
+      expect(measured[0]).toMatchObject({
+        kind: "kanban.evaluator",
+        outcome: "reused",
+        trigger: "thread_send",
+        boardId: "board-offbox",
+        cardId: "card-one",
+        purposeKind: "discussion",
+        threadId,
+      });
+      const records = yield* orchestrator.getThreadRecords(threadId, ["runs"]);
+      const queued = records.runs.find((run) => run.userMessageId === command.messageId)!;
+      const edit = {
+        type: "queued-run.edit" as const,
+        threadId,
+        runId: queued.id,
+        commandId: CommandId.make("generic:edit"),
+        text: "Revised external steer",
+      };
+      const editEffect = management
+        .dispatch(edit)
+        .pipe(Effect.provideService(EvaluatorAnalytics.origin, "card_ask"));
+      yield* editEffect;
+      yield* editEffect;
+      expect(measured).toHaveLength(2);
+      expect(measured[1]).toMatchObject({ outcome: "reused", trigger: "card_ask" });
+      yield* management.dispatch({ ...edit, commandId: CommandId.make("generic:no-op") });
+      expect(measured).toHaveLength(2);
+      const attachment = {
+        type: "file" as const,
+        id: "file-measured",
+        name: "note.txt",
+        mimeType: "text/plain",
+        sizeBytes: 1,
+      };
+      const context = { version: 1 as const, records: [] };
+      const cases: ReadonlyArray<{
+        label: string;
+        changed: boolean;
+        edit: Partial<Extract<OrchestrationV2ServerCommand, { type: "queued-run.edit" }>>;
+      }> = [
+        { label: "text unchanged, optional fields absent", changed: false, edit: {} },
+        { label: "same empty attachment list", changed: false, edit: { attachments: [] } },
+        { label: "context added", changed: true, edit: { context } },
+        { label: "same context", changed: false, edit: { context } },
+        {
+          label: "attachment added with unchanged text",
+          changed: true,
+          edit: { attachments: [attachment] },
+        },
+        { label: "same attachment list", changed: false, edit: { attachments: [attachment] } },
+        { label: "attachment removed", changed: true, edit: { attachments: [] } },
+        { label: "text changed", changed: true, edit: { text: "New text" } },
+        {
+          label: "omitted context preserves existing context",
+          changed: false,
+          edit: { text: "New text" },
+        },
+      ];
+      let expected = measured.length;
+      for (const [index, row] of cases.entries()) {
+        const command = {
+          ...edit,
+          ...row.edit,
+          commandId: CommandId.make(`generic:matrix:${index}`),
+        };
+        yield* management.dispatch(command);
+        if (row.changed) expected++;
+        expect(measured.length, row.label).toBe(expected);
+        yield* management.dispatch(command);
+        expect(measured.length, `${row.label} receipt replay`).toBe(expected);
+      }
+      for (const continuation of ["restart", "usage-limit"] as const) {
+        const id = `generic:stale:${continuation}`;
+        const noop = yield* management.dispatch({
+          ...command,
+          commandId: CommandId.make(id),
+          messageId: MessageId.make(id),
+          ...(continuation === "restart"
+            ? { restartContinuationOfRunId: RunId.make("missing-source") }
+            : {
+                usageLimitContinuationOfRunId: RunId.make("missing-source"),
+                usageLimitRecoveryRequestId: CommandId.make("missing-recovery"),
+              }),
+        });
+        expect(
+          noop.storedEvents.every(({ event }) => event.type === "thread.metadata-updated"),
+        ).toBe(true);
+        expect(noop.storedEvents.length).toBeGreaterThan(0);
+        expect(measured.length, `${continuation} metadata-only admission`).toBe(expected);
+      }
+      const direct = {
+        ...command,
+        commandId: CommandId.make("direct:evaluator-question"),
+        messageId: MessageId.make("direct:evaluator-question"),
+      };
+      yield* orchestrator.dispatch(direct);
+      expected++;
+      expect(measured.length, "direct orchestration notification").toBe(expected);
+      yield* orchestrator.dispatch(direct);
+      expect(measured.length, "direct notification replay").toBe(expected);
+      for (const [index, cardId] of ["card-current", null, undefined].entries()) {
+        const notification = {
+          ...direct,
+          commandId: CommandId.make(`direct:card-scope:${index}`),
+          messageId: MessageId.make(`direct:card-scope:${index}`),
+        };
+        const send = orchestrator.dispatch(notification);
+        const scoped =
+          cardId === undefined
+            ? send
+            : send.pipe(EvaluatorAnalytics.forCard("board-current", cardId));
+        yield* scoped;
+        expected++;
+        expect(measured.length).toBe(expected);
+        expect(measured.at(-1)?.boardId).toBe(
+          cardId === undefined ? "board-offbox" : "board-current",
+        );
+        expect(measured.at(-1)?.cardId).toBe(
+          cardId === undefined ? "card-one" : (cardId ?? undefined),
+        );
+        yield* scoped;
+        expect(measured.length, "card attribution does not defeat receipt replay").toBe(expected);
+      }
+      const failingManagement = Layer.effect(
+        ThreadManagementService.ThreadManagementService,
+        Effect.map(ThreadManagementService.ThreadManagementService, (real) => {
+          let fail = true;
+          return ThreadManagementService.ThreadManagementService.of({
+            ...real,
+            sendToThread: (input) =>
+              real.sendToThread(input).pipe(
+                Effect.flatMap((sent) => {
+                  if (!fail) return Effect.succeed(sent);
+                  fail = false;
+                  return Effect.fail(
+                    new ThreadManagementService.ThreadManagementProjectionLoadError({
+                      projectId,
+                      threadId,
+                      cause: "post-admission fixture failure",
+                    }),
+                  );
+                }),
+              ),
+          });
+        }),
+      ).pipe(
+        Layer.provide(Layer.succeed(ThreadManagementService.ThreadManagementService, management)),
+      );
+      yield* Effect.gen(function* () {
+        const transport = yield* KanbanThreads;
+        const accepted: string[] = [];
+        const input = {
+          ...wake,
+          key: "partial-send",
+          onAccepted: (id: string) =>
+            Effect.sync(() => {
+              accepted.push(id);
+            }),
+        };
+        const failed = yield* Effect.result(transport.send(input));
+        expect(failed._tag).toBe("Failure");
+        yield* transport.send(input);
+        expect(accepted).toEqual(["partial-send"]);
+      }).pipe(Effect.provide(Layer.fresh(layer).pipe(Layer.provide(failingManagement))));
     }).pipe(Effect.provide(layer));
   }).pipe(Effect.provide(dependencies));
 });
@@ -1688,6 +2044,16 @@ describe("coalesceTarget", () => {
     expect(coalesceTarget([candidate], "step:A")).toBeUndefined();
   });
 
+  it("coalesces an assignment without treating it as a disposable wake", () => {
+    const assignment = {
+      ...run(2, "unused"),
+      userMessageId: MessageId.make("kanban:assignment:card:id"),
+    };
+    expect(coalesceTarget([run(1, "assignment:card"), assignment], "assignment:card")).toBe(
+      assignment,
+    );
+  });
+
   it("has no target in an empty queue", () => {
     expect(coalesceTarget([], "step:A")).toBeUndefined();
   });
@@ -1699,7 +2065,7 @@ it.effect.each([
   "race-keyed",
   "race-unkeyed",
   "race-after-rejection",
-] as const)("board wake coalescing preserves queue order ($mode)", (mode) => {
+] as const)("#1490 board wake coalescing preserves queue order ($mode)", (mode) => {
   const db = Sqlite.layerMemory;
   const instanceId = ProviderInstanceId.make("codex");
   const projectId = ProjectId.make("project:coalesce");
@@ -1830,8 +2196,13 @@ it.effect.each([
         });
       }
       race = mode.startsWith("race-");
+      const observed: string[] = [];
       const latest = {
         threadId,
+        onAccepted: (identity: string) =>
+          Effect.sync(() => {
+            observed.push(identity);
+          }),
         coalesce: wake.coalesce,
         text: "Newest snapshot",
         ...(keyed ? { key: "coalesce:latest" } : {}),
@@ -1858,11 +2229,18 @@ it.effect.each([
         // Retries of older accepted sends must not overwrite a newer snapshot.
         yield* threads.send(wake);
         yield* threads.send(latest);
+        yield* threads.send({ ...latest, key: "new-key-same-text" });
         yield* threads.send(same);
-        expect(yield* threads.send({ threadId, coalesce: wake.coalesce, text: latest.text })).toBe(
-          first,
-        );
-        expect(edits).toHaveLength(2);
+        expect(
+          yield* threads.send({
+            threadId,
+            coalesce: latest.coalesce,
+            text: latest.text,
+            onAccepted: latest.onAccepted,
+          }),
+        ).toBe(first);
+        expect(edits).toHaveLength(3);
+        expect(observed).toEqual(["coalesce:latest"]);
         expect(
           (yield* orchestrator.getThreadRecords(threadId, ["messages"])).messages.find(
             (message) => message.id === target.userMessageId,
@@ -2020,6 +2398,19 @@ describe("queuedWakes", () => {
       ),
     ).toEqual([first, second]);
   });
+  it("withdraws only the selected card's assignment and leaves active runs alone", () => {
+    const assignment = run(2, "kanban:assignment:A:old");
+    const reminder = run(1, "kanban:wake:nudge:old");
+    const runs = [
+      assignment,
+      reminder,
+      run(3, "kanban:assignment:AB:other"),
+      run(4, "kanban:assignment:A:active", "running"),
+    ];
+    expect(queuedWakes(runs)).toEqual([reminder]);
+    expect(queuedWakes(runs, Infinity, ["assignment:A"])).toEqual([assignment]);
+  });
+
   it.each(["step:A", "plan:A", "owner:A", "owner:discussion-A", "nudge"])(
     "matches exact scope %s",
     (scope) => {
@@ -2216,6 +2607,82 @@ it.effect("recovery history chooses the most recent start instead of the latest 
         Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
         Layer.provide(Sqlite.layerMemory),
       ),
+    ),
+  );
+});
+
+it.effect("#1574 assignment queue preserves a busy run and replays once", () => {
+  const db = Sqlite.layerMemory;
+  const instanceId = ProviderInstanceId.make("codex");
+  const projectId = ProjectId.make("project:assignment");
+  const threadId = ThreadId.make("thread:assignment");
+  const adapter = {
+    instanceId,
+    driver: ProviderDriverKind.make("codex"),
+    getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
+    planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" as const }),
+    openSession: () => Effect.die("Provider execution is disabled in this test"),
+  } as ProviderAdapter.ProviderAdapterV2["Service"];
+  const registry = Layer.succeed(
+    ProviderAdapterRegistry.ProviderAdapterRegistryV2,
+    ProviderAdapterRegistry.ProviderAdapterRegistryV2.of({
+      get: () => Effect.succeed(adapter),
+      list: () => Effect.succeed([instanceId]),
+    }),
+  );
+  const receipts = CommandReceiptStore.layer.pipe(Layer.provide(db));
+  const runtime = ProviderReplayHarness.layerWithRegistry({ name: "kanban-assignment" }, registry, {
+    databaseLayer: db,
+    runEffectWorker: false,
+  });
+  const management = ThreadManagementService.layer.pipe(
+    Layer.provideMerge(Layer.mergeAll(runtime, receipts, ServerSettings.layerTest(), db)),
+  );
+  return Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("assignment:create"),
+      threadId,
+      projectId,
+      title: "Existing context",
+      modelSelection: { instanceId, model: "gpt-5.1-codex" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "system",
+      creationSource: "server",
+    });
+    yield* Effect.gen(function* () {
+      const threads = yield* KanbanThreads;
+      yield* threads.send({ threadId, text: "Current work" });
+      const before = yield* orchestrator.getThreadRecords(threadId, ["runs", "messages"]);
+      const assignment = {
+        threadId,
+        text: "New card brief",
+        coalesce: "assignment:card",
+        key: "assignment:card",
+        mode: "queue" as const,
+      };
+      const queued = yield* threads.send(assignment);
+      yield* threads.send(assignment);
+      const after = yield* orchestrator.getThreadRecords(threadId, ["runs", "messages"]);
+      expect(after.runs).toHaveLength(2);
+      expect(after.runs.find((run) => run.id === before.runs[0]!.id)).toEqual(before.runs[0]);
+      expect(after.runs.find((run) => run.id === queued)?.status).toBe("queued");
+      expect(after.messages.filter((message) => message.text === "New card brief")).toHaveLength(1);
+      yield* threads.send({ threadId, text: "Unrelated queued follow-up", mode: "queue" });
+      const followup = yield* orchestrator.getThreadRecords(threadId, ["runs", "messages"]);
+      expect(followup.runs.find((run) => run.id === queued)?.status).toBe("queued");
+      expect(queuedWakes(followup.runs)).toEqual([]);
+      expect(
+        queuedWakes(followup.runs, Infinity, ["assignment:card"]).map((run) => run.id),
+      ).toEqual([queued]);
+    }).pipe(Effect.provide(layer));
+  }).pipe(
+    Effect.provide(
+      Layer.mergeAll(management, receipts, Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
     ),
   );
 });

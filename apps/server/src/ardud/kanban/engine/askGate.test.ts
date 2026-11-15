@@ -10,8 +10,16 @@ import * as TestClock from "effect/testing/TestClock";
 
 import { makeFake, owner, testLayer, workingCard } from "./askFlows.testkit.ts";
 import { KanbanThreads } from "./threads.ts";
+import * as SavedWrite from "./savedWrite.ts";
 
-it.effect.each(["ask", "make blocking", "review findings", "review clear"] as const)(
+it.effect.each([
+  "ask",
+  "make blocking",
+  "review findings",
+  "review clear",
+  "move to review",
+  "stalled flag",
+] as const)(
   "%s releases the board gate during a blocked wake read and saves once after a concurrent write",
   (action) =>
     Effect.gen(function* () {
@@ -67,14 +75,18 @@ it.effect.each(["ask", "make blocking", "review findings", "review clear"] as co
                   "abc1234",
                 )
                 .pipe(Effect.map((result) => result.card))
-            : action === "ask"
-              ? kanban.askOwner(
-                  card.id,
-                  { question: "Continue?", blocking: true },
-                  worker,
-                  "cardThread",
-                )
-              : kanban.changeAsk(card.id, "q1", "block", worker, "cardThread"),
+            : action === "move to review"
+              ? kanban.moveCard(card.id, "needs_review", "cardThread", worker)
+              : action === "stalled flag"
+                ? kanban.flagCard(card.id, "Waiting for tooling", worker)
+                : action === "ask"
+                  ? kanban.askOwner(
+                      card.id,
+                      { question: "Continue?", blocking: true },
+                      worker,
+                      "cardThread",
+                    )
+                  : kanban.changeAsk(card.id, "q1", "block", worker, "cardThread"),
         );
         yield* Deferred.await(entered);
         const saved = yield* kanban.editCard(
@@ -95,6 +107,22 @@ it.effect.each(["ask", "make blocking", "review findings", "review clear"] as co
             1,
           );
           assert.lengthOf(result.card.asks, 0);
+        } else if (action === "move to review") {
+          assert.equal(result.card.stage, "needs_review");
+          assert.isNull(result.card.activeThreadId);
+          assert.lengthOf(result.card.asks, 0);
+          assert.lengthOf(
+            result.events.filter((event) => event.toStage === "needs_review"),
+            1,
+          );
+        } else if (action === "stalled flag") {
+          assert.equal(result.card.stage, "todo");
+          assert.isNull(result.card.activeThreadId);
+          assert.equal(result.card.stalled?.reason, "Waiting for tooling");
+          assert.lengthOf(
+            result.events.filter((event) => event.kind === "flagged"),
+            1,
+          );
         } else {
           assert.equal(result.card.stage, "needs_owner");
           assert.lengthOf(result.card.asks, 1);
@@ -286,6 +314,79 @@ it.effect.each(["answer", "drop", "create"] as const)(
       }).pipe(
         Effect.provide(testLayer(slow)),
         Effect.ensuring(Deferred.succeed(resume, undefined)),
+      );
+    }),
+);
+
+it.effect.each(["clear", "findings"] as const)(
+  "%s review verdict attributes held wake cancellation to its sub-step",
+  (verdict) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const base = yield* KanbanThreads.pipe(Effect.provide(fake.layer));
+      let blocked: ThreadId | undefined;
+      let model: ModelSelection | undefined;
+      let steps: ReadonlyArray<SavedWrite.SubStep> | undefined;
+      const entered = yield* Deferred.make<void>();
+      const finish = yield* Deferred.make<void>();
+      const slow = Layer.succeed(KanbanThreads, {
+        ...base,
+        queuedRuns: (id) =>
+          Effect.succeed(
+            id === blocked
+              ? [
+                  {
+                    id: RunId.make("old-wake"),
+                    threadId: id,
+                    ordinal: 1,
+                    providerInstanceId: model!.instanceId,
+                    modelSelection: model!,
+                    providerThreadId: null,
+                    userMessageId: MessageId.make("kanban:wake:nudge:old"),
+                    rootNodeId: null,
+                    activeAttemptId: null,
+                    status: "queued" as const,
+                    requestedAt: DateTime.makeUnsafe("2026-11-15T00:00:00.000Z"),
+                    startedAt: null,
+                    completedAt: null,
+                    checkpointId: null,
+                    contextHandoffId: null,
+                  },
+                ]
+              : [],
+          ),
+        cancelQueued: () =>
+          Deferred.succeed(entered, undefined).pipe(
+            Effect.andThen(Deferred.await(finish)),
+            Effect.as(true),
+            Effect.uninterruptible,
+          ),
+      });
+      yield* Effect.gen(function* () {
+        const { kanban, card, worker, threadId, board } = yield* workingCard();
+        model = board.defaultCardModel;
+        yield* kanban.moveCard(card.id, "needs_review", "cardThread", worker);
+        yield* kanban.turnEnded(threadId);
+        yield* kanban.dispatchNow;
+        blocked = (yield* kanban.card(card.id)).card.activeThreadId!;
+        assert.equal((yield* kanban.card(card.id)).card.stage, "in_review");
+        const pending = yield* Effect.forkChild(
+          kanban.reviewResult(blocked, verdict, ["Fix queue"], "abc1234").pipe(
+            Effect.exit,
+            Effect.provideService(SavedWrite.subStepReporter, (value) => {
+              steps = value;
+            }),
+          ),
+        );
+        yield* Deferred.await(entered);
+        yield* TestClock.adjust(5_000);
+        assert.isTrue(Exit.isFailure(yield* Fiber.join(pending)));
+        assert.isDefined(steps);
+        assert.deepInclude(steps!, { subStep: "KanbanService.pruneWakes", ms: 5_000 });
+        assert.equal((yield* kanban.card(card.id)).card.stage, "in_review");
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(finish, undefined)),
+        Effect.provide(testLayer(slow)),
       );
     }),
 );

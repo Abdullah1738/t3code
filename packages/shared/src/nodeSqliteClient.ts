@@ -1,3 +1,4 @@
+import { normalizeSql, sqlFingerprint } from "./sqlDiagnostics.ts";
 import * as NodeSqlite from "node:sqlite";
 import * as NodeUtil from "node:util";
 import * as NodeWorkerThreads from "node:worker_threads";
@@ -77,7 +78,7 @@ export interface SqliteClientConfig {
   readonly prepareCacheSize?: number | undefined;
   readonly prepareCacheTTL?: Duration.Input | undefined;
   readonly spanAttributes?: Record<string, unknown> | undefined;
-  /** Diagnostic row counts and commit timestamps; off unless explicitly enabled. */
+  /** Additional row counts and commit timestamps; slow spans always include row counts. */
   readonly statementMetrics?: boolean | undefined;
   readonly transformResultNames?: ((str: string) => string) | undefined;
   readonly transformQueryNames?: ((str: string) => string) | undefined;
@@ -141,6 +142,17 @@ export const readOnly = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect
     restore(Effect.provideService(effect, ReadOnly, restore)),
   );
 
+const ReaderRequired = Context.Reference<boolean>(
+  "@t3tools/shared/nodeSqliteClient/ReaderRequired",
+  {
+    defaultValue: () => false,
+  },
+);
+
+/** Wrap the whole read transaction to fail acquisition rather than borrow the writer. */
+export const requireReader = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+  readOnly(Effect.provideService(effect, ReaderRequired, true));
+
 interface Acquired {
   readonly connection: "writer" | "reader";
   readonly lockWaitMs: number;
@@ -152,6 +164,31 @@ interface Acquired {
 export const ReaderWaitObserver = Context.Reference<
   ((waitMs: number, lane?: ReaderLaneName) => void) | undefined
 >("@t3tools/shared/nodeSqliteClient/ReaderWaitObserver", { defaultValue: () => undefined });
+
+/** Marks acquisition in flight so a deadline can report a wait before it finishes. */
+export const ReaderWaitStartedObserver = Context.Reference<
+  | ((
+      lane: ReaderLaneName,
+    ) => ((lane: ReaderLaneName | "writer", acquired: boolean) => void) | undefined)
+  | undefined
+>("@t3tools/shared/nodeSqliteClient/ReaderWaitStartedObserver", { defaultValue: () => undefined });
+
+const reportReaderWaitStarted = (fiber: Fiber.Fiber<unknown, unknown>) => {
+  try {
+    const observer = fiber.getRef(ReadOnly) ? fiber.getRef(ReaderWaitStartedObserver) : undefined;
+    if (observer === undefined) return undefined;
+    const finish = observer(effectiveLane(fiber.context));
+    return (lane: ReaderLaneName | "writer", acquired: boolean) => {
+      try {
+        finish?.(lane, acquired);
+      } catch {
+        // Observation must not change connection acquisition.
+      }
+    };
+  } catch {
+    return undefined;
+  }
+};
 
 const reportReaderWait = (
   fiber: Fiber.Fiber<unknown, unknown>,
@@ -373,16 +410,45 @@ const observeStatement = <A, E, R>(
         span = Option.getOrUndefined(span.parent);
       }
     }
+    const diagnosticSpan =
+      fiber.getRef(References.TracerEnabled) && fiber.getRef(Statement.SpanPropagationEnabled)
+        ? Context.getOrUndefined(fiber.context, Tracer.ParentSpan)
+        : undefined;
+    const measured =
+      diagnosticSpan?._tag === "Span" && diagnosticSpan.name === "sqlite"
+        ? effect.pipe(
+            Effect.onExit((exit) =>
+              Effect.sync(() => {
+                try {
+                  if (Number(diagnosticSpan.attributes.get("db.statement.execution_ms")) >= 1_000) {
+                    diagnosticSpan.attribute(
+                      "db.rows_returned",
+                      Exit.isSuccess(exit) && Array.isArray(exit.value) ? exit.value.length : 0,
+                    );
+                    // StatementSync exposes no VM-step or rows-read counter.
+                    diagnosticSpan.attribute("db.stmt_status.available", false);
+                  }
+                  diagnosticSpan.attribute(
+                    "db.statement.connection_wait_ms",
+                    diagnosticSpan.attributes.get("db.lock_wait_ms") ?? 0,
+                  );
+                } catch {
+                  // Diagnostics cannot change a statement's result.
+                }
+              }),
+            ),
+          )
+        : effect;
     const observer = fiber.getRef(StatementObserver) ?? fallback;
     const timingObserver = fiber.getRef(StatementTimingObserver);
     if (
       (observer === undefined && timingObserver === undefined) ||
       fiber.getRef(observingStatement)
     )
-      return effect;
+      return measured;
     const clock = fiber.getRef(Clock.Clock);
     const started = clock.monotonicTimeNanosUnsafe();
-    return effect.pipe(
+    return measured.pipe(
       Effect.onExit((exit) =>
         Effect.suspend(() => {
           const durationMs = Math.max(0, Number(clock.monotonicTimeNanosUnsafe() - started) / 1e6);
@@ -663,9 +729,9 @@ parentPort.on("message", ({ id, sql, params, cached, values, raw, safeIntegers }
     });
     return;
   }
+  const executionStarted = performance.now();
   parentPort.postMessage({ started: id });
   let operation = "open";
-  const executionStarted = performance.now();
   try {
     if (db === undefined) throw new Error("database reader is unavailable");
     operation = "prepare";
@@ -852,6 +918,7 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
         readonly endsTransaction: boolean;
         readonly sql: string;
         readonly resume: (reply: ReaderReply) => void;
+        readonly recordExecutionLowerBound: () => void;
         startedAt?: number;
         reported?: boolean;
         abandoned?: boolean;
@@ -868,8 +935,10 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
       const request = pending.get(running);
       if (request?.startedAt === undefined) return;
       const elapsedMs = Math.round(performance.now() - request.startedAt);
+      const normalized = normalizeSql(request.sql);
       const details = {
-        sql: request.sql.replace(/\s+/g, " ").trim().slice(0, 2000),
+        sql: normalized.slice(0, 2000),
+        "sql.fingerprint": sqlFingerprint(normalized),
         elapsedMs,
         queued: pending.size - 1,
       };
@@ -910,6 +979,7 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
       const entries = [...pending];
       pending.clear();
       for (const [id, request] of entries) {
+        request.recordExecutionLowerBound();
         if (request.endsTransaction) {
           request.resume({ id, rows: [] });
           continue;
@@ -950,8 +1020,23 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
     worker.on("error", (cause) => void stop(`Database reader failed: ${cause.message}`, "error"));
     worker.on("exit", (code) => void stop(`Database reader exited with code ${code}`, "exit"));
 
-    const request = (input: ReaderRequest) =>
+    // Snapshot housekeeping shares the SQL span but must not replace its query timing.
+    const request = (input: ReaderRequest, annotateExecution = true) =>
       Effect.withFiber<ReadonlyArray<any>, SqlError>((fiber) => {
+        const span =
+          fiber.getRef(References.TracerEnabled) && fiber.getRef(Statement.SpanPropagationEnabled)
+            ? Context.getOrUndefined(fiber.context, Tracer.ParentSpan)
+            : undefined;
+        const recordExecution = (elapsedMs: number | undefined, lowerBound = false) => {
+          if (!annotateExecution || elapsedMs === undefined || span?._tag !== "Span") return;
+          if (span.status._tag !== "Started") return;
+          try {
+            span.attribute("db.statement.execution_ms", elapsedMs);
+            if (lowerBound) span.attribute("db.statement.execution_is_lower_bound", true);
+          } catch {
+            // Diagnostics cannot replace a transport failure.
+          }
+        };
         const endsTransaction = endsReadTransaction(input.sql);
         if (stoppedMessage !== undefined) {
           if (endsTransaction) return Effect.succeed([]);
@@ -983,21 +1068,18 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
             readonly endsTransaction: boolean;
             readonly sql: string;
             readonly resume: (reply: ReaderReply) => void;
+            readonly recordExecutionLowerBound: () => void;
             startedAt?: number;
             abandoned?: boolean;
           } = {
             endsTransaction,
             sql: input.sql,
+            recordExecutionLowerBound: () => {
+              if (entry.startedAt !== undefined)
+                recordExecution(Math.max(0, performance.now() - entry.startedAt), true);
+            },
             resume: (reply) => {
-              if (
-                reply.executionMs !== undefined &&
-                fiber.getRef(References.TracerEnabled) &&
-                fiber.getRef(Statement.SpanPropagationEnabled)
-              ) {
-                const span = Context.getOrUndefined(fiber.context, Tracer.ParentSpan);
-                if (span?._tag === "Span")
-                  span.attribute("db.statement.execution_ms", reply.executionMs);
-              }
+              recordExecution(reply.executionMs);
               if ("rows" in reply) {
                 resume(Effect.succeed(reply.rows));
                 return;
@@ -1022,7 +1104,9 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
           // queued in the worker. Cancel it so the worker skips it if it has not
           // started; the entry stays until the worker answers.
           return Effect.sync(() => {
+            if (!pending.has(id)) return;
             if (!isTransactionControl(input.sql) && cancel(id)) entry.abandoned = true;
+            else entry.recordExecutionLowerBound();
           });
         });
       });
@@ -1030,7 +1114,7 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
     let snapshotTransaction = false;
     const pinSnapshots = Effect.forEach(
       options.readerSnapshotSql ?? [],
-      (sql) => request({ sql, params: [], cached: true, values: false, raw: false }),
+      (sql) => request({ sql, params: [], cached: true, values: false, raw: false }, false),
       { discard: true },
     );
     const withSnapshot = <A>(sql: string, effect: Effect.Effect<A, SqlError>) =>
@@ -1044,20 +1128,24 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
         return Effect.uninterruptibleMask((restore) =>
           snapshotLock
             .withPermits(1)(
-              request({ sql: "BEGIN", params: [], cached: false, values: false, raw: false }).pipe(
-                Effect.andThen(pinSnapshots),
-              ),
+              request(
+                { sql: "BEGIN", params: [], cached: false, values: false, raw: false },
+                false,
+              ).pipe(Effect.andThen(pinSnapshots)),
             )
             .pipe(
               Effect.andThen(restore(effect)),
               Effect.ensuring(
-                request({
-                  sql: "ROLLBACK",
-                  params: [],
-                  cached: false,
-                  values: false,
-                  raw: false,
-                }).pipe(Effect.ignore),
+                request(
+                  {
+                    sql: "ROLLBACK",
+                    params: [],
+                    cached: false,
+                    values: false,
+                    raw: false,
+                  },
+                  false,
+                ).pipe(Effect.ignore),
               ),
             ),
         );
@@ -2668,6 +2756,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
             .exec(statement.sourceSQL)?.[1]
             ?.toLowerCase();
           const execute = () => {
+            const executionStart = performance.now();
             const controlStart = control === undefined ? undefined : performance.now();
             let arrays = false;
             let result: Exit.Exit<ReadonlyArray<unknown>, SqlError>;
@@ -2725,6 +2814,18 @@ const make = Effect.fn("makeWithDatabase")(function* (
                 }),
               );
             } finally {
+              try {
+                const span = Context.getOrUndefined(fiber.context, Tracer.ParentSpan);
+                if (
+                  fiber.getRef(References.TracerEnabled) &&
+                  fiber.getRef(Statement.SpanPropagationEnabled) &&
+                  span?._tag === "Span" &&
+                  span.name === "sqlite"
+                )
+                  span.attribute("db.statement.execution_ms", performance.now() - executionStart);
+              } catch {
+                // Timing cannot replace SQLite's result or error.
+              }
               if (controlStart !== undefined)
                 try {
                   const span = Context.getOrUndefined(fiber.context, Tracer.ParentSpan);
@@ -2945,6 +3046,12 @@ const make = Effect.fn("makeWithDatabase")(function* (
       admission,
       Effect.withFiber<RouteTarget, SqlError>((fiber) => {
         if (!Context.get(fiber.context, ReadOnly)) return Effect.succeed(writer);
+        const writerFallback: Effect.Effect<RouteTarget, SqlError> = Context.get(
+          fiber.context,
+          ReaderRequired,
+        )
+          ? Effect.fail(readerBusy("Required SQLite reader unavailable", false))
+          : Effect.succeed(writer);
         const requestedLane = Context.get(fiber.context, ReaderLane);
         const lane = effectiveLane(fiber.context);
         const pending = pendingForClient(fiber);
@@ -2966,7 +3073,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
         if (background === undefined) {
           if (span?._tag === "Span")
             span.attribute("db.reader.route_reason", "reader_pool_unconfigured");
-          return Effect.succeed(writer);
+          return writerFallback;
         }
         if (isReservedLane(lane)) {
           const reserved = reservedReader(lane);
@@ -2979,13 +3086,13 @@ const make = Effect.fn("makeWithDatabase")(function* (
           if (span?._tag === "Span")
             span.attribute("db.reader.route_reason", "reserved_lane_unconfigured");
         }
-        // An unavailable reader falls back to the main connection, as before lanes.
+        // Ordinary reads retain writer fallback; long snapshots can require a reader.
         const viaBackground = viaPool(
           background,
-          Effect.sync(() => {
+          Effect.suspend(() => {
             if (span?._tag === "Span")
               span.attribute("db.reader.route_reason", "background_worker_unavailable");
-            return writer;
+            return writerFallback;
           }),
         );
         if (lane === "foreground" && foreground !== undefined) {
@@ -3056,13 +3163,16 @@ const make = Effect.fn("makeWithDatabase")(function* (
       const clock = requestFiber.getRef(Clock.Clock);
       const start = clock.monotonicTimeNanosUnsafe();
       let started = false;
+      const finishWait = reportReaderWaitStarted(requestFiber);
       const borrow = Effect.flatMap(route(span?._tag === "Span" ? span : undefined), (target) =>
         Effect.withFiber<A, E | SqlError, R>((fiber) => {
+          finishWait?.(target.lane ?? "writer", false);
           const traced =
             fiber.getRef(References.TracerEnabled) &&
             fiber.getRef(Statement.SpanPropagationEnabled);
           const useConnection = Effect.suspend(() => {
             started = true;
+            finishWait?.(target.lane ?? "writer", true);
             const grant = acquired(target, clock, start);
             if (target.name === "reader")
               reportReaderWait(requestFiber, grant.lockWaitMs, target.lane);
@@ -3142,8 +3252,10 @@ const make = Effect.fn("makeWithDatabase")(function* (
     const clock = requestFiber.getRef(Clock.Clock);
     const start = clock.monotonicTimeNanosUnsafe();
     let acquiredSlot = false;
-    const acquireReader = Effect.flatMap(route(), (target) =>
-      Effect.uninterruptibleMask((restore) => {
+    const finishWait = reportReaderWaitStarted(requestFiber);
+    const acquireReader = Effect.flatMap(route(), (target) => {
+      finishWait?.(target.lane ?? "writer", false);
+      return Effect.uninterruptibleMask((restore) => {
         const fiber = Fiber.getCurrent()!;
         const scope = Context.getUnsafe(fiber.context, Scope.Scope);
         const pending = pendingForClient(fiber);
@@ -3160,6 +3272,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
         const acquire = Effect.tap((pending?.restore ?? restore)(target.lock.take(1)), () => {
           const grant = acquired(target, clock, start);
           acquiredSlot = true;
+          finishWait?.(target.lane ?? "writer", true);
           if (target.name === "reader")
             reportReaderWait(requestFiber, grant.lockWaitMs, target.lane);
           if (pending !== undefined) {
@@ -3216,8 +3329,8 @@ const make = Effect.fn("makeWithDatabase")(function* (
           ),
           target.connection,
         );
-      }),
-    );
+      });
+    });
     if (requestFiber.getRef(ReaderWaitObserver) === undefined) return acquireReader;
     return acquireReader.pipe(
       Effect.onExit(() =>
@@ -3273,6 +3386,15 @@ const make = Effect.fn("makeWithDatabase")(function* (
     withTransaction: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       Effect.withFiber((fiber) =>
         Effect.uninterruptibleMask((restore) => {
+          // Nested transactions bypass route(); retain the outer reader context for deeper savepoints.
+          if (Context.getOption(fiber.context, client.transactionService)._tag === "Some") {
+            return fiber.getRef(ReaderRequired) &&
+              pendingForClient(fiber)?.acquired?.connection !== "reader"
+              ? Effect.fail(
+                  readerBusy("Required SQLite reader unavailable inside writer transaction", false),
+                )
+              : restore(withTransaction(effect));
+          }
           // SqlClient masks setup; acquisition must preserve the caller's interruptibility.
           const pending: TransactionPending = {
             owner: transactionOwner,

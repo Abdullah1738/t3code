@@ -1,3 +1,4 @@
+import { McpDenyReason } from "./ardud/mcpDenyReason.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as Struct from "effect/Struct";
@@ -11,6 +12,7 @@ import {
   NonNegativeInt,
   PositiveInt,
   ProjectId,
+  RunAttemptId,
   RunId,
   RuntimeRequestId,
   ScheduledTaskId,
@@ -120,7 +122,7 @@ export const OrchestratorMcpTarget = Schema.Struct({
   options: Schema.optional(
     OrchestratorMcpTargetOptions.annotate({
       description:
-        "Model options from orchestrator_capabilities. For the same provider instance and model, overrides individual inherited values; [] or {} clears them. Standard mode only: Claude {effort: 'max'}; Codex {reasoningEffort: 'max', serviceTier: 'default'}; never fast mode. Only use options advertised by the selected model.",
+        "Model options from orchestrator_capabilities. For the same provider instance and model, overrides individual inherited values; [] or {} clears them. Standard mode only: never fast mode (Claude fastMode false; Codex serviceTier 'default'). Set effort to exactly what the routing asks for, e.g. Claude {effort: 'medium'}; there is no default effort. Only use options advertised by the selected model.",
     }),
   ),
 });
@@ -203,6 +205,34 @@ export const OrchestratorMcpDelegateTaskInput = Schema.Struct({
 });
 export type OrchestratorMcpDelegateTaskInput = typeof OrchestratorMcpDelegateTaskInput.Type;
 
+export const OrchestratorMcpStartProgress = Schema.Struct({
+  runId: RunId,
+  attemptId: RunAttemptId,
+  step: Schema.Literals([
+    "workspace_preparation",
+    "awaiting_worker",
+    "awaiting_native_acceptance",
+    "admission",
+    "session_open",
+    "thread_ensure",
+    "turn_preparation",
+    "start_send",
+    "sdk_received",
+    "native_accepted",
+    "adapter_emitted",
+    "orchestration_ingestion",
+    "session_status_audience",
+    "session_status_write",
+    "run_ingestion_write",
+  ]),
+  since: IsoDateTime,
+  nativeSessionId: Schema.NullOr(Schema.String),
+  sdkReceivedAt: Schema.NullOr(IsoDateTime),
+  nativeAcceptedAt: Schema.NullOr(IsoDateTime),
+  adapterEmittedAt: Schema.NullOr(IsoDateTime),
+});
+export type OrchestratorMcpStartProgress = typeof OrchestratorMcpStartProgress.Type;
+
 export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   taskId: NodeId,
   childThreadId: ThreadId,
@@ -227,7 +257,7 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   }),
   startedAt: Schema.optional(Schema.NullOr(Schema.String)).annotate({
     description:
-      "The original child run's start time in ISO format, or null if it has not started.",
+      "The original child run's local registration time in ISO format. startPending reports whether native acceptance has been persisted.",
   }),
   retry: Schema.optional(
     Schema.NullOr(
@@ -243,8 +273,9 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   ),
   startPending: Schema.optional(Schema.Boolean).annotate({
     description:
-      "True means the child's provider turn has not been observed starting yet (including pending run creation, workspace preparation or a server worker); keep taskId for later status reads.",
+      "True until native acceptance is persisted for the child's active attempt, including workspace preparation and server workers. Local registration and in-memory native receipt alone do not clear it.",
   }),
+  startProgress: Schema.optional(Schema.NullOr(OrchestratorMcpStartProgress)),
   workState: Schema.Literals(["working", "waiting_for_children", "result_available"]),
   hasPendingChildRuns: Schema.Boolean,
   latestTerminalRunId: Schema.NullOr(RunId),
@@ -563,6 +594,8 @@ export const OrchestratorMcpThreadWaitResult = Schema.Struct({
   runId: Schema.NullOr(RunId),
   status: OrchestratorMcpThreadStatus,
   timedOut: Schema.Boolean,
+  startPending: Schema.optional(Schema.Boolean),
+  startProgress: Schema.optional(Schema.NullOr(OrchestratorMcpStartProgress)),
 });
 export type OrchestratorMcpThreadWaitResult = typeof OrchestratorMcpThreadWaitResult.Type;
 
@@ -778,5 +811,6 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
       "target_required",
     ]),
     message: Schema.String,
+    reason: Schema.optional(McpDenyReason),
   },
 ) {}

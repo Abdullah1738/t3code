@@ -619,6 +619,8 @@ describe("board analytics", () => {
         kind: "kanban.worker_failed",
         props: { errorClass: "variant_unavailable", poolKey: "sol" },
       },
+      { kind: "kanban.assignment_wake_failed", props: { count: 1 } },
+      { kind: "kanban.assignment_wake_failed", props: { count: 2 } },
       { kind: "kanban.worker_restarted", props: { phase: "fresh" } },
       { kind: "kanban.ask_snapshot", props: { count: 1 } },
       {
@@ -650,7 +652,7 @@ describe("board analytics", () => {
     assert.deepEqual(board.reviewRounds, [{ cardId: "a", rounds: 2, verdicts: 2 }]);
     assert.deepEqual(board.verdictCounts, { feedback: 1, clear: 1 });
     assert.deepInclude(board.stalls[0], { sets: 1, clears: 1, p50Ms: 300 });
-    assert.deepEqual(board.failureCounts, { variant_unavailable: 1 });
+    assert.deepEqual(board.failureCounts, { variant_unavailable: 1, assignment_wake: 2 });
     assert.equal(board.restarts, 1);
     assert.lengthOf(board.openAsks, 1);
     assert.deepInclude(board.openAsks[0], {
@@ -838,4 +840,160 @@ it("preserves all 25 groups until overflow requires an other row", () => {
     overflow.find((row) => row.span === "other")!,
     { count: 2, totalWaitMs: 5, p95Ms: 99, maxMs: 99 },
   );
+});
+
+it("groups fixed denial reasons and roles and measures each timeout phase separately", () => {
+  const target = makeAccumulator();
+  for (const [callerRole, denyReason] of [
+    ["work", "not_card_owner"],
+    ["work", "not_card_owner"],
+    ["review", "role_not_allowed"],
+  ] as const) {
+    accumulate(
+      target,
+      event({
+        kind: "mcp.call",
+        tool: "subtask_done",
+        outcome: "refused",
+        errorTag: "capability_denied",
+        callerRole,
+        denyReason,
+        durationMs: 20,
+      }),
+    );
+  }
+  for (const ms of [10, 20, 100])
+    accumulate(
+      target,
+      event({
+        kind: "mcp.call",
+        tool: "card_edit",
+        outcome: "timeout",
+        errorTag: "reply_timeout",
+        callerRole: "evaluator",
+        durationMs: 25000,
+        replyPhases: { admission: ms, read: 2, commit: 3, ack: 4 },
+        writePhases: { lockWait: ms, read: 2, write: 3, replyWait: 4 },
+      }),
+    );
+  for (const errorTag of ["Defect", "McpToolError"])
+    accumulate(
+      target,
+      event({
+        kind: "mcp.call",
+        tool: "probe",
+        outcome: "error",
+        errorTag,
+        props: { code: "unknown" },
+        durationMs: 1,
+      }),
+    );
+  const rollup = finishRollup(target, "2026-11-13", ts);
+  assert.deepEqual(
+    rollup
+      .mcpFailureContexts!.filter((row) => row.tool === "probe")
+      .map((row) => row.errorTag)
+      .sort(),
+    ["Defect", "McpToolError"],
+  );
+  const rows = rollup.mcpFailureBreakdown!;
+  const denied = rows.find((row) => row.tool === "subtask_done")!;
+  assert.deepEqual(denied.byReason, { not_card_owner: 2, role_not_allowed: 1 });
+  assert.deepEqual(denied.byRole, { work: 2, review: 1 });
+  const timeout = rollup.mcpReplyTimeouts!.find((row) => row.tool === "card_edit")!;
+  assert.equal(timeout.callerRole, "evaluator");
+  assert.deepEqual(rows.find((row) => row.tool === "card_edit")!.byRole, { evaluator: 3 });
+  assert.deepEqual(timeout.replyPhases.admission, {
+    count: 3,
+    p50Ms: 20,
+    p95Ms: 100,
+    maxMs: 100,
+    approximate: false,
+  });
+  assert.equal(timeout.replyPhases.ack?.p95Ms, 4);
+  assert.equal(timeout.writePhases.replyWait?.p95Ms, 4);
+  assert.equal(
+    rollup.mcpFailureContexts!.find((row) => row.tool === "card_edit")?.callerRole,
+    "evaluator",
+  );
+});
+
+it("keeps caller reader lanes separate from handler database lanes", () => {
+  const target = makeAccumulator();
+  const lanes = [
+    { callerReaderLane: "identity", readerLane: "identity" },
+    { callerReaderLane: "background", readerLane: "foreground" },
+    { readerLane: "foreground" },
+    { callerReaderLane: "foreground" },
+    {},
+  ] as const;
+  for (const lane of lanes)
+    accumulate(
+      target,
+      event({
+        kind: "mcp.call",
+        tool: "t3_thread_read",
+        outcome: "timeout",
+        errorTag: "lookup_timeout",
+        durationMs: 95550,
+        ...lane,
+      }),
+    );
+  accumulate(
+    target,
+    event({
+      kind: "db.slow",
+      durationMs: 65960,
+      props: { span: "loadReadableThread", key: "reader.background", phase: "slot", waitMs: 65960 },
+    }),
+  );
+  const rollup = finishRollup(target, "2026-11-13", ts);
+  assert.deepEqual(rollup.mcpFailureBreakdown![0]!.byCallerReaderLane, {
+    foreground: 2,
+    identity: 1,
+    background: 1,
+    unknown: 1,
+  });
+  assert.equal(rollup.mcpErrorsByCode[0]!.count, 5);
+  assert.deepInclude(rollup.dbSlowBySpan[0], {
+    key: "reader.background",
+    count: 1,
+    totalWaitMs: 65960,
+  });
+});
+
+it("#1490 counts evaluator starts by origin without treating steers and queued inputs as starts", () => {
+  const target = makeAccumulator();
+  for (const outcome of ["started", "reused", "merged", "queued_spawn_cap"] as const)
+    accumulate(
+      target,
+      event({
+        kind: "kanban.evaluator",
+        boardId: "board-offbox",
+        purposeKind: "discussion",
+        trigger: "discussion_post",
+        outcome,
+      }),
+    );
+  accumulate(
+    target,
+    event({
+      kind: "kanban.evaluator",
+      boardId: "board-offbox",
+      purposeKind: "request",
+      trigger: "report_bug",
+      outcome: "started",
+      reuseMissReason: "no_card_reuse_scope",
+    }),
+  );
+  const result = finishRollup(target, "2026-11-13", ts);
+  assert.deepEqual(result.evaluatorStartsByTrigger, [
+    { boardId: "board-offbox", trigger: "discussion_post", count: 1 },
+    { boardId: "board-offbox", trigger: "report_bug", count: 1 },
+  ]);
+  assert.equal(
+    result.evaluatorOutcomes!.reduce((n, row) => n + row.count, 0),
+    5,
+  );
+  assert.deepEqual(result.errorCounts, {});
 });

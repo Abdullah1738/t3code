@@ -14,6 +14,7 @@ import {
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
@@ -48,12 +49,14 @@ import { OrchestratorToolkit } from "./toolkits/orchestrator/tools.ts";
 import { ProjectToolkit } from "./toolkits/project/tools.ts";
 import * as ReplyBuilders from "../ardud/http/ReplyBuilders.ts";
 import { KanbanService } from "../ardud/kanban/engine/KanbanService.ts";
+import * as McpCallAnalytics from "../ardud/analytics/McpCall.ts";
 
 const environmentId = EnvironmentId.make("environment-mcp-test");
 const threadId = ThreadId.make("thread-mcp-test");
 const tabId = PreviewTabId.make("tab-mcp-test");
 const alternateTabId = PreviewTabId.make("tab-mcp-alternate");
 const decodeJsonText = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
+const encodeOrchestratorFailure = Schema.encodeSync(OrchestratorMcpFailure);
 const invocation = {
   environmentId,
   requestNamespace: "provider-session-mcp-test",
@@ -261,6 +264,105 @@ it("normalizes empty successful notification responses to accepted", () => {
     HttpServerResponse.jsonUnsafe({ jsonrpc: "2.0", id: 1, result: {} }),
   );
   expect(resultResponse.status).toBe(200);
+});
+
+it.effect("mirrors encoded typed handler failures without changing text or analytics", () => {
+  const failure = new OrchestratorMcpFailure({
+    code: "delegation_timeout",
+    message: "Dispatch timed out; taskId=task-1567. Retry the same clientRequestId.",
+  });
+  const toolkit = Toolkit.make(
+    Tool.make("typed_failure", {
+      success: Schema.Struct({ ready: Schema.Boolean }),
+      failure: OrchestratorMcpFailure,
+      failureMode: "return",
+    }),
+  );
+  const layer = McpHttpServer.toolkitRegistration(
+    toolkit,
+    McpToolAccess.toLayer(toolkit, {
+      typed_failure: McpToolAccess.reads(() => Effect.fail(failure)),
+    }),
+  ).pipe(Layer.provideMerge(McpServer.McpServer.layer));
+  return callTool("typed_failure", {}).pipe(
+    Effect.tap((result) =>
+      Effect.sync(() => {
+        const text = JSON.stringify(encodeOrchestratorFailure(failure));
+        expect(result.isError).toBe(true);
+        expect(result.content).toEqual([{ type: "text", text }]);
+        expect(result.structuredContent).toEqual(JSON.parse(text));
+        const state: McpCallAnalytics.McpCall["Service"] = {
+          callerResolved: true,
+          callerResolveMs: 0,
+          readerLane: "test",
+          phase: "handler",
+          saved: false,
+        };
+        const outcome = McpCallAnalytics.callOutcome(Exit.succeed(result), state);
+        const previous = new McpSchema.CallToolResult({ isError: true, content: result.content });
+        expect(outcome).toEqual(McpCallAnalytics.callOutcome(Exit.succeed(previous), state));
+        expect(outcome.props?.code).toBe("delegation_timeout");
+      }),
+    ),
+    Effect.provide(layer),
+  );
+});
+
+it.each([
+  '{ "code": "delegation_timeout", "taskId": "task-1567", "retryHint": "same key" }',
+  "{}",
+  JSON.stringify({ message: "x".repeat(8178) }),
+])("mirrors JSON object failures and preserves their original text: %.80s", (text) => {
+  const content = [
+    { type: "image" as const, data: new Uint8Array([112, 110, 103]), mimeType: "image/png" },
+    { type: "text" as const, text },
+    { type: "text" as const, text: "second part" },
+  ];
+  const result = McpHttpServer.withFailureStructuredContent(
+    new McpSchema.CallToolResult({ isError: true, content, _meta: { trace: "1567" } }),
+  );
+  if (result instanceof McpSchema.InputRequired) throw new Error("Expected a tool result.");
+  expect(result).toMatchObject({
+    isError: true,
+    structuredContent: JSON.parse(text),
+    _meta: { trace: "1567" },
+  });
+  expect(result.content).toEqual(content);
+});
+
+it.each([
+  "plain-text failure",
+  '{"code":',
+  "[]",
+  "null",
+  '"failure"',
+  "42",
+  "true",
+  JSON.stringify({ message: "x".repeat(8179) }),
+])("leaves non-object, invalid and oversized failures unchanged: %.80s", (text) => {
+  const original = new McpSchema.CallToolResult({
+    isError: true,
+    content: [{ type: "text", text }],
+  });
+  expect(McpHttpServer.withFailureStructuredContent(original)).toBe(original);
+  expect(original.structuredContent).toBeUndefined();
+});
+
+it("leaves success, existing structured failures, input requests and text-free failures unchanged", () => {
+  const content = [{ type: "text" as const, text: '{"code":"delegation_timeout"}' }];
+  for (const original of [
+    new McpSchema.CallToolResult({ content }),
+    new McpSchema.CallToolResult({ isError: false, content, structuredContent: { ready: true } }),
+    new McpSchema.CallToolResult({
+      isError: true,
+      content,
+      structuredContent: { reason: "server_busy" },
+    }),
+    new McpSchema.CallToolResult({ isError: true, content: [] }),
+    new McpSchema.InputRequired({ requestState: "retry" }),
+  ]) {
+    expect(McpHttpServer.withFailureStructuredContent(original)).toBe(original);
+  }
 });
 
 it.effect("returns a clear bounded tool error before serializing a giant result", () => {
@@ -564,6 +666,12 @@ it.effect.each([
       expect(span?.attributes.get("readinessWaitMs")).toBe(0);
       expect(span?.attributes.get("replyBytes")).toBe(Buffer.byteLength(JSON.stringify(result)));
       expect(span?.attributes.has("taskCount")).toBe(false);
+      if (name === "wiki_read") {
+        const savedReply = spans.find((span) => span.name === "KanbanTools.savedReply");
+        expect(savedReply?.attributes.get("kanban.reply.elapsed_ms")).toBe(25000);
+        expect(savedReply?.attributes.get("kanban.reply.timed_out")).toBe(false);
+        expect(savedReply?.parent).toMatchObject({ value: { spanId: span?.spanId } });
+      }
     }).pipe(Effect.provide(layer), Effect.withTracer(tracer));
   }),
 );

@@ -24,20 +24,22 @@ TZ = ch.TZ
 
 
 def summary(text, **extra):
-    return {'role': 'user', 'text': text, 'createdAt': '2026-10-24T00:10:00.000Z',
+    return {'role': 'user', 'messageId': text, 'text': text, 'createdAt': '2026-10-24T00:10:00.000Z',
             'createdBy': 'user', 'creationSource': 'web', 'automated': False, 'inboundMessageId': None, **extra}
 
 
 class ControlServer:
     """Loopback-only control fixtures. Never reads credentials or state from the real home."""
     def __init__(self, rows=None, threads=None, stall=None, drip=False, page_size=500,
-                 message_delay=0, stall_cursor=None):
+                 message_delay=0, stall_cursor=None, strict_since=False):
         self.rows = {'a': rows or []}
         self.threads = threads if threads is not None else [{'threadId': 'a', 'title': 'iMessage test',
                            'creationSource': 'server', 'origin': 'imessage'}]
+        self.threads = [{'updatedAt': '2026-10-24T01:00:00.000Z', **thread} for thread in self.threads]
         self.calls = []
         self.stall, self.drip = stall, drip
         self.page_size, self.message_delay, self.stall_cursor = page_size, message_delay, stall_cursor
+        self.strict_since = strict_since
         self.active_messages = self.max_active_messages = 0
         self.lock = threading.Lock()
         self.stop = threading.Event()
@@ -77,6 +79,10 @@ class ControlServer:
                         owner.max_active_messages = max(owner.max_active_messages, owner.active_messages)
                     owner.stop.wait(owner.message_delay)
                     rows = owner.rows.get(urllib.parse.unquote(path.path.split('/')[-2]), [])
+                    if owner.strict_since:
+                        rows = [row for row in rows if row.get('role') == params.get('role', [row.get('role')])[0]
+                                and ch.owner_time(row.get('updatedAt', row['createdAt']))
+                                > ch.owner_time(params['since'][0])]
                     data = {'ok': True, 'messages': rows, 'total': len(rows)}
                     with owner.lock:
                         owner.active_messages -= 1
@@ -118,7 +124,8 @@ class ControlServer:
         self.credentials.write_text(json.dumps({'url': f'http://127.0.0.1:{self.server.server_port}',
                                                 'token': 'test-secret-never-print'}))
         self.credentials.chmod(0o600)
-        self.env = patch.dict(os.environ, {'T3_CONTROL_TOKEN_FILE': str(self.credentials)})
+        self.env = patch.dict(os.environ, {'T3_CONTROL_TOKEN_FILE': str(self.credentials),
+                                          'MONEY_CASES_DIR': self.tmp.name})
         self.env.start()
         self.thread.start()
         return self
@@ -344,7 +351,7 @@ class Finder:
         return groups
 
 
-def nobody(since, until, deadline=None):
+def nobody(since, until, deadline=None, **kwargs):
     return []
 
 
@@ -724,6 +731,353 @@ class OwnerTexts(unittest.TestCase):
     def read(self, **kwargs):
         return ch.owner_texts(at('2026-10-24T03:00'), at('2026-10-24T05:00'), **kwargs)
 
+    def message_calls(self, server):
+        return [(path, params) for path, params, _ in server.calls if path.endswith('/messages')]
+
+    def test_one_slow_request_is_capped_and_other_progress_is_saved(self):
+        threads = [{'threadId': tid, 'title': 'App'} for tid in ('slow', 'a', 'b')]
+        with ControlServer(threads=threads, stall='/slow/messages') as server:
+            stats = Counter()
+            started = time.monotonic()
+            with self.assertRaisesRegex(ch.Lookup, r'incomplete \(2 of 3 threads\)'):
+                self.read(stats=stats)
+            elapsed = time.monotonic() - started
+            self.assertGreater(elapsed, ch.OWNER_REQUEST_TIMEOUT - 0.2)
+            self.assertLess(elapsed, ch.OWNER_REQUEST_TIMEOUT + 0.7)
+            self.assertEqual(stats['owner_timeouts'], 1)
+            self.assertEqual(stats['owner_threads_fetched'], 2)
+            self.assertEqual(stats['owner_result'], 'incomplete')
+            self.assertEqual(stats['owner_cache_size'], 2)
+            cache = json.loads((Path(server.tmp.name) / 'owner-texts.json').read_text())
+            self.assertEqual(set(cache), {'a', 'b'})
+            self.assertGreaterEqual(stats['owner_fetch_ms_max'], 2800)
+
+    def test_stalled_list_counts_attempt_and_reports_list_failed(self):
+        with ControlServer(stall='/threads'):
+            stats = Counter()
+            with self.assertRaises(ch.Lookup):
+                self.read(stats=stats)
+            self.assertEqual(stats['owner_result'], 'list_failed')
+            self.assertEqual(stats['owner_list_pages'], 1)
+            self.assertEqual(stats['owner_queries'], 1)
+            self.assertEqual(stats['owner_timeouts'], 1)
+            self.assertGreaterEqual(stats['owner_list_ms'], 2800)
+            self.assertEqual(stats['owner_threads_fetched'], 0)
+
+    def test_ninety_five_threads_converge_with_ten_changes_per_call(self):
+        until = at('2026-10-24T05:00')
+        since = until - dt.timedelta(days=7)
+        threads = [{'threadId': str(n), 'title': 'Private title never in stats',
+                    'updatedAt': ch.iso(until - dt.timedelta(hours=n))} for n in range(95)]
+        with ControlServer(threads=threads) as server:
+            for n in range(95):
+                server.rows[str(n)] = [summary('Private text never in stats', messageId=str(n))]
+            for call, (fresh, needed, fetched, result) in enumerate((
+                    (0, 95, 62, 'incomplete'), (52, 43, 43, 'ok'), (85, 10, 10, 'ok'))):
+                if call:
+                    for thread in server.threads[:10]:
+                        thread['updatedAt'] = ch.iso(until + dt.timedelta(minutes=call))
+                server.calls.clear()
+                stats = Counter()
+                if result == 'incomplete':
+                    with self.assertRaises(ch.Lookup):
+                        ch.owner_texts(since, until, stats=stats)
+                else:
+                    self.assertEqual(len(ch.owner_texts(since, until, stats=stats)), 95)
+                self.assertEqual(stats['owner_result'], result)
+                self.assertEqual(stats['owner_list_pages'], 2)
+                self.assertEqual(stats['owner_threads_selected'], 95)
+                self.assertEqual(stats['owner_threads_fresh'], fresh)
+                self.assertEqual(stats['owner_threads_needed'], needed)
+                self.assertEqual(stats['owner_threads_fetched'], fetched)
+                self.assertEqual(stats['owner_queries'], fetched + 2)
+                self.assertLessEqual(stats['owner_queries'], 64)
+                self.assertEqual(stats['owner_timeouts'], 0)
+                self.assertEqual(stats['owner_cache_size'], 62 if not call else 95)
+                self.assertEqual(len(self.message_calls(server)), fetched)
+                self.assertNotIn('Private', json.dumps(stats))
+                self.assertNotIn('test-secret', json.dumps(stats))
+
+    def test_cold_and_changed_threads_share_the_request_limit(self):
+        threads = [{'threadId': str(n), 'title': 'App',
+                    'updatedAt': ch.iso(at('2026-10-24T05:00') - dt.timedelta(minutes=n))}
+                   for n in range(95)]
+        with ControlServer(threads=threads) as server:
+            with self.assertRaises(ch.Lookup):
+                self.read()
+            for thread in server.threads[:10]:
+                thread['updatedAt'] = '2026-10-24T02:00:00Z'
+            server.calls.clear()
+            with patch.object(ch, 'OWNER_REQUEST_LIMIT', 8), self.assertRaises(ch.Lookup):
+                self.read()
+            fetched = {path.split('/')[-2] for path, _ in self.message_calls(server)}
+            self.assertEqual(fetched, {'62', '63', '64', '0', '1', '2'})
+
+    def test_changed_threads_reconcile_mutations_missing_from_strict_deltas(self):
+        cases = [
+            ('redacted', [summary('[REDACTED]', messageId='old')], ['[REDACTED]']),
+            ('partially redacted', [summary('I paid [REDACTED]', messageId='old')], ['I paid [REDACTED]']),
+            ('deleted', [], []),
+            ('restamped automated', [summary('I paid Apple', messageId='old', automated=True)], []),
+            ('restamped agent', [summary('I paid Apple', messageId='old', createdBy='agent')], []),
+            ('forwarded', [summary('[Forwarded by owner] I paid Apple', messageId='old')], []),
+        ]
+        for mutation, changed, expected in cases:
+            for append in (False, True):
+                with self.subTest(mutation=mutation, append=append), \
+                        ControlServer([summary('I paid Apple', messageId='old')], strict_since=True) as server:
+                    self.assertEqual([row[1] for row in self.read()], ['I paid Apple'])
+                    server.threads[0]['updatedAt'] = '2026-10-24T01:01:00Z'
+                    server.rows['a'] = list(changed)
+                    if append:
+                        server.rows['a'].append(summary('new unrelated turn', messageId='new',
+                                                        createdAt='2026-10-24T01:00:00Z'))
+                    server.calls.clear()
+                    got = [row[1] for row in self.read()]
+                    self.assertCountEqual(got, expected + (['new unrelated turn'] if append else []))
+                    path = Path(server.tmp.name) / 'owner-texts.json'
+                    self.assertNotIn('I paid Apple', path.read_text())
+                    self.assertEqual(self.message_calls(server)[0][1]['since'], ['2026-10-23T22:59:59.999Z'])
+                    server.calls.clear()
+                    self.assertEqual([row[1] for row in self.read()], got)
+                    self.assertEqual(self.message_calls(server), [])
+
+    def test_legacy_delta_cache_is_not_reused_even_with_a_matching_thread_version(self):
+        for version in ('missing', 1, '2', True, None):
+            with self.subTest(version=version), \
+                    ControlServer([summary('I paid Apple', messageId='old')], strict_since=True) as server:
+                self.read()
+                path = Path(server.tmp.name) / 'owner-texts.json'
+                cache = json.loads(path.read_text())
+                if version == 'missing':
+                    cache['a'].pop('version')
+                else:
+                    cache['a']['version'] = version
+                path.write_text(json.dumps(cache))
+                server.rows['a'][0]['text'] = '[REDACTED]'
+                with patch.object(ch.toollog, 'emit') as log:
+                    self.assertEqual([row[1] for row in self.read()], ['[REDACTED]'])
+                log.assert_called_once_with('money-cases', 'cache_reset')
+                self.assertNotIn('I paid Apple', path.read_text())
+                self.assertEqual(json.loads(path.read_text())['a']['version'], ch.OWNER_CACHE_VERSION)
+
+    def test_failed_refresh_evicts_unvalidated_text_and_keeps_other_covered_threads(self):
+        threads = [{'threadId': tid, 'title': 'App'} for tid in ('a', 'b')]
+        with ControlServer([summary('I paid Apple', messageId='old')], threads=threads,
+                           strict_since=True) as server:
+            server.rows['b'] = [summary('unrelated')]
+            self.assertEqual(len(self.read()), 2)
+            server.threads[0]['updatedAt'] = '2026-10-24T01:01:00Z'
+            server.rows['a'][0]['text'] = '[REDACTED]'
+            server.responses['/api/ardud/control/threads/a/messages'] = {'ok': False}
+            with self.assertRaisesRegex(ch.Lookup, r'incomplete \(1 of 2 threads\)'):
+                self.read()
+            path = Path(server.tmp.name) / 'owner-texts.json'
+            self.assertEqual(set(json.loads(path.read_text())), {'b'})
+            self.assertNotIn('I paid Apple', path.read_text())
+            server.responses.clear()
+            server.calls.clear()
+            self.assertCountEqual([row[1] for row in self.read()], ['[REDACTED]', 'unrelated'])
+            self.assertEqual(len(self.message_calls(server)), 1)
+            server.calls.clear()
+            self.assertEqual(len(self.read()), 2)
+            self.assertEqual(self.message_calls(server), [])
+
+    def test_ninety_threads_warm_across_checks_then_need_only_lists(self):
+        until = at('2026-10-24T05:00')
+        since = until - dt.timedelta(days=7)
+        threads = [{'threadId': str(n), 'title': 'App',
+                    'updatedAt': ch.iso(until - dt.timedelta(hours=n))} for n in range(90)]
+        with ControlServer(threads=threads) as server:
+            for n, thread in enumerate(threads):
+                server.rows[str(n)] = [summary(str(n), createdAt=thread['updatedAt'])]
+            with self.assertRaisesRegex(ch.Lookup, r'incomplete \(62 of 90 threads\)'):
+                ch.owner_texts(since, until)
+            cache = json.loads((Path(server.tmp.name) / 'owner-texts.json').read_text())
+            self.assertEqual(set(cache), {str(n) for n in range(62)})
+            server.calls.clear()
+            self.assertEqual(len(ch.owner_texts(since, until)), 90)
+            self.assertEqual(len(self.message_calls(server)), 28)
+            server.calls.clear()
+            stats = Counter()
+            self.assertEqual(len(ch.owner_texts(since, until, stats=stats)), 90)
+            self.assertEqual(self.message_calls(server), [])
+            self.assertEqual(stats['owner_queries'], 2)
+
+    def test_changed_thread_replaces_full_span_and_reclassifies_messages(self):
+        with ControlServer([summary('old', createdAt='2026-10-24T00:00:00Z'),
+                            summary('boundary', createdAt='2026-10-24T00:59:00Z'),
+                            summary('overlap', createdAt='2026-10-24T00:59:30Z'),
+                            summary('removed', createdAt='2026-10-24T00:59:40Z')]) as server:
+            self.read()
+            server.calls.clear()
+            server.threads[0]['updatedAt'] = '2026-10-24T01:00:30Z'
+            server.rows['a'] = [summary('old', createdAt='2026-10-24T00:00:00Z'),
+                                summary('boundary', createdAt='2026-10-24T00:59:00Z'),
+                                summary('overlap edited', messageId='overlap', createdAt='2026-10-24T00:59:30Z'),
+                                summary('overlap edited', messageId='overlap', createdAt='2026-10-24T00:59:30Z'),
+                                summary('reclassified', messageId='removed', automated=True,
+                                        createdAt='2026-10-24T00:59:40Z'),
+                                summary('new', createdAt='2026-10-24T01:00:00Z')]
+            self.assertEqual([row[1] for row in self.read()], ['new', 'overlap edited', 'boundary', 'old'])
+            self.assertEqual(self.message_calls(server)[0][1]['since'], ['2026-10-23T22:59:59.999Z'])
+            server.calls.clear()
+            self.assertEqual(len(self.read()), 4)
+            self.assertEqual(self.message_calls(server), [])
+
+    def test_edits_to_older_turns_replace_cached_text_by_id(self):
+        cases = [(summary('edited owner words', messageId='old'), ['edited owner words']),
+                 (summary('now automated', messageId='old', automated=True), []),
+                 (summary('now agent', messageId='old', createdBy='agent'), []),
+                 (summary('[Forwarded by owner] private', messageId='old'), [])]
+        for edited, expected in cases:
+            with self.subTest(edited=edited['text']), ControlServer([summary('old')], strict_since=True) as server:
+                self.read()
+                # A recent update can have an old createdAt. The real API's
+                # since filter is on updatedAt, not createdAt.
+                server.rows['a'] = [{**edited, 'updatedAt': '2026-10-24T01:01:00Z'}]
+                server.threads[0]['updatedAt'] = '2026-10-24T01:01:00Z'
+                self.assertEqual([row[1] for row in self.read()], expected)
+
+    def test_earlier_window_refetches_and_failed_change_cannot_use_stale_cache(self):
+        with ControlServer([summary('newer')]) as server:
+            self.read()
+            earlier = at('2026-10-23T03:00')
+            server.calls.clear()
+            server.rows['a'].append(summary('earlier', createdAt=ch.iso(earlier)))
+            self.assertEqual(len(ch.owner_texts(earlier, at('2026-10-24T05:00'))), 2)
+            self.assertEqual(self.message_calls(server)[0][1]['since'],
+                             [ch.iso(earlier - dt.timedelta(milliseconds=1))])
+            server.threads[0]['updatedAt'] = '2026-10-24T01:01:00Z'
+            server.responses['/api/ardud/control/threads/a/messages'] = {'ok': False}
+            with self.assertRaisesRegex(ch.Lookup, r'incomplete \(0 of 1 threads\)'):
+                self.read()
+            cached = json.loads((Path(server.tmp.name) / 'owner-texts.json').read_text())
+            self.assertNotIn('a', cached)
+
+    def test_corrupt_cache_resets_once_and_is_replaced_privately(self):
+        for raw in ('not json', '[]', '{"a": {}}'):
+            with self.subTest(raw=raw), ControlServer([summary('owner')]) as server:
+                path = Path(server.tmp.name) / 'owner-texts.json'
+                path.write_text(raw)
+                path.chmod(0o644)
+                with patch.object(ch.toollog, 'emit') as log:
+                    self.assertEqual(len(self.read()), 1)
+                log.assert_called_once_with('money-cases', 'cache_reset')
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(json.loads(path.read_text())['a']['texts'][0]['text'], 'owner')
+                self.assertEqual(list(path.parent.glob('.owner-texts.json.*')), [])
+
+    def test_unreadable_cache_is_empty(self):
+        read = Path.read_text
+        def unreadable(path, *args, **kwargs):
+            if path.name == 'owner-texts.json':
+                raise PermissionError()
+            return read(path, *args, **kwargs)
+        with ControlServer([summary('owner')]), patch.object(Path, 'read_text', unreadable), \
+                patch.object(ch.toollog, 'emit') as log:
+            self.assertEqual(len(self.read()), 1)
+        log.assert_called_once_with('money-cases', 'cache_reset')
+
+    def test_cache_prunes_threads_and_texts_but_keeps_an_older_requested_window(self):
+        until = at('2026-10-24T05:00')
+        cutoff = until - dt.timedelta(days=14)
+        with ControlServer() as server:
+            path = Path(server.tmp.name) / 'owner-texts.json'
+            rows = [summary('ancient', createdAt=ch.iso(cutoff - dt.timedelta(days=1))), summary('recent')]
+            cached = {'a': {'version': ch.OWNER_CACHE_VERSION, 'updatedAt': server.threads[0]['updatedAt'], 'coveredFrom': ch.iso(cutoff - dt.timedelta(days=2)),
+                            'title': 'iMessage test', 'texts': [{**row, 'title': 'iMessage test'} for row in rows]},
+                      'expired': {'version': ch.OWNER_CACHE_VERSION, 'updatedAt': ch.iso(cutoff - dt.timedelta(days=1)),
+                                  'coveredFrom': ch.iso(cutoff - dt.timedelta(days=2)), 'title': 'App', 'texts': []}}
+            path.write_text(json.dumps(cached))
+            self.read()
+            kept = json.loads(path.read_text())
+            self.assertEqual(set(kept), {'a'})
+            self.assertEqual([r['text'] for r in kept['a']['texts']], ['recent'])
+            self.assertEqual(ch.owner_time(kept['a']['coveredFrom']), cutoff)
+            # An old followed question extends retention without reading cases.json.
+            path.write_text(json.dumps(cached))
+            ch.owner_texts(cutoff - dt.timedelta(days=2), until)
+            self.assertEqual(set(json.loads(path.read_text())), {'a', 'expired'})
+            self.assertEqual(len(json.loads(path.read_text())['a']['texts']), 2)
+
+    def test_successes_after_a_failed_thread_are_saved_and_next_read_finishes(self):
+        threads = [{'threadId': tid, 'title': 'App'} for tid in ('bad', 'a', 'b')]
+        with ControlServer(threads=threads) as server:
+            for thread in threads:
+                server.rows[thread['threadId']] = [summary(thread['threadId'])]
+            server.responses['/api/ardud/control/threads/bad/messages'] = {'ok': False}
+            with self.assertRaisesRegex(ch.Lookup, r'incomplete \(2 of 3 threads\)'):
+                self.read()
+            path = Path(server.tmp.name) / 'owner-texts.json'
+            self.assertEqual(set(json.loads(path.read_text())), {'a', 'b'})
+            server.responses.clear()
+            server.calls.clear()
+            self.assertEqual(len(self.read()), 3)
+            self.assertEqual(len(self.message_calls(server)), 1)
+
+    def test_coverage_preserves_fractional_millisecond_boundaries(self):
+        since = at('2026-10-24T03:00:00.000500')
+        until = at('2026-10-24T05:00')
+        with ControlServer([summary('boundary', createdAt=ch.iso(since))]) as server:
+            self.assertEqual(ch.owner_texts(since, until), [])
+            server.calls.clear()
+            self.assertEqual(len(ch.owner_texts(since - dt.timedelta(microseconds=500), until)), 1)
+            self.assertEqual(len(self.message_calls(server)), 1)
+
+    def test_slow_cache_io_is_bounded_and_never_returns_success(self):
+        for operation in ('load', 'fsync'):
+            with self.subTest(operation=operation), ControlServer([summary('owner')]) as server:
+                self.read()
+                path = Path(server.tmp.name) / 'owner-texts.json'
+                before = path.read_bytes()
+                original = ch.owner_cache if operation == 'load' else ch.os.fsync
+
+                def slow(*args, **kwargs):
+                    time.sleep(2)
+                    return original(*args, **kwargs)
+
+                target, name = (ch, 'owner_cache') if operation == 'load' else (ch.os, 'fsync')
+                started = time.monotonic()
+                with patch.object(ch, 'OWNER_BUDGET', 1.6), patch.object(target, name, slow), \
+                        self.assertRaisesRegex(ch.Lookup, 'owner read incomplete'):
+                    self.read()
+                self.assertLess(time.monotonic() - started, 2)
+                self.assertEqual(path.read_bytes(), before)
+                self.assertEqual(list(path.parent.glob('.owner-texts.json.*')), [])
+
+    def test_save_that_consumes_deadline_cannot_return_success(self):
+        clock = [1000.0]
+        save = ch.save_owner_cache
+        def late(*args):
+            result = save(*args)
+            clock[0] += ch.OWNER_BUDGET + 1
+            return result
+        with ControlServer([summary('owner')]), patch.object(ch.time, 'time', lambda: clock[0]), \
+                patch.object(ch, 'save_owner_cache', late), self.assertRaisesRegex(ch.Lookup, 'out of time'):
+            self.read()
+
+    def test_renamed_archived_and_nonowner_threads_do_not_reuse_cached_texts(self):
+        with ControlServer([relayed('owner')]) as server:
+            self.assertEqual(len(self.read()), 1)
+            server.threads[0]['title'] = 'App'
+            self.assertEqual(self.read(), [])
+            for fields in ({'title': 'Moni'}, {'title': 'Group sb_gro'}, {'archived': True}):
+                server.threads[0].update(fields)
+                server.calls.clear()
+                self.assertEqual(self.read(), [])
+                self.assertEqual(self.message_calls(server), [])
+
+    def test_missing_thread_version_or_message_id_fails_closed(self):
+        with ControlServer([summary('owner')]) as server:
+            del server.threads[0]['updatedAt']
+            with self.assertRaisesRegex(ch.Lookup, 'updatedAt unavailable'):
+                self.read()
+            server.threads[0]['updatedAt'] = '2026-10-24T01:00:00Z'
+            del server.rows['a'][0]['messageId']
+            with self.assertRaisesRegex(ch.Lookup, 'message id unavailable'):
+                self.read()
+
     def test_only_what_he_typed_counts(self):
         cases = [
             (summary('web'), True),
@@ -841,16 +1195,23 @@ class OwnerTexts(unittest.TestCase):
                 with self.assertRaises(ch.Lookup):
                     self.read()
                 self.assertLessEqual(len(server.calls), ch.OWNER_REQUEST_LIMIT)
-                self.assertTrue(all(path.endswith('/threads') for path, _, _ in server.calls))
+                if page_size == 1:
+                    self.assertTrue(all(path.endswith('/threads') for path, _, _ in server.calls))
+                else:
+                    self.assertEqual(sum(path.endswith('/messages') for path, _, _ in server.calls), 62)
 
     def test_request_ceiling_is_shared_by_older_question_windows(self):
         threads = [{'threadId': str(n), 'title': 'App'} for n in range(20)]
         stats = Counter()
         with ControlServer(threads=threads) as server:
             self.read(stats=stats)
+            for thread in server.threads:
+                thread['updatedAt'] = '2026-10-24T01:01:00.000Z'
             self.read(stats=stats)
             self.assertEqual(stats['owner_queries'], 44)
-            with self.assertRaisesRegex(ch.Lookup, 'request limit'):
+            for thread in server.threads:
+                thread['updatedAt'] = '2026-10-24T01:02:00.000Z'
+            with self.assertRaisesRegex(ch.Lookup, 'owner read incomplete'):
                 self.read(stats=stats)
             self.assertEqual(stats['owner_queries'], len(server.calls))
             self.assertLessEqual(len(server.calls), ch.OWNER_REQUEST_LIMIT)
@@ -868,10 +1229,16 @@ class OwnerTexts(unittest.TestCase):
         run = ch.subprocess.run
         def stuck(*args, **kwargs):
             return run(['/usr/bin/python3', '-I', '-c', 'import time; time.sleep(10)'], **kwargs)
-        started = time.time()
-        with patch.object(ch.subprocess, 'run', side_effect=stuck), self.assertRaises(ch.Lookup):
-            ch.control_get(('http://127.0.0.1', 'test-secret-never-print'), '/threads', {}, started + 1.2)
-        self.assertLess(time.time() - started, 2.2)
+        for budget in (1.2, 10):
+            with self.subTest(budget=budget), ControlServer() as server:
+                stats = Counter()
+                started = time.monotonic()
+                with patch.object(ch.subprocess, 'run', side_effect=stuck), self.assertRaises(ch.Lookup):
+                    ch.control_get(ch.control_config(), '/threads', {}, time.time() + budget, stats)
+                self.assertLess(time.monotonic() - started, min(budget, ch.OWNER_REQUEST_TIMEOUT) + 0.7)
+                self.assertEqual(stats['owner_timeouts'], 1)
+                self.assertEqual(stats['owner_queries'], 1)
+                self.assertEqual(stats['owner_list_pages'], 1)
 
     def test_twenty_threads_fit_the_cap_with_at_most_six_concurrent_requests(self):
         threads = [{'threadId': str(n), 'title': 'App'} for n in range(20)]
@@ -1022,7 +1389,7 @@ print('finished', flush=True)
         for key in ('threads', 'messages'):
             for total, count, complete in cases:
                 with self.subTest(key=key, total=total, count=count), ControlServer() as server:
-                    row = {'threadId': 'a', 'title': 'iMessage test'} if key == 'threads' else summary('I paid Apple')
+                    row = server.threads[0] if key == 'threads' else summary('I paid Apple')
                     result = {'ok': True, key: [row] * count}
                     if total != 'missing':
                         result['total'] = total

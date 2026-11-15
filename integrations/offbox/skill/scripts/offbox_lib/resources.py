@@ -139,14 +139,19 @@ def labels(data):
 
 
 def summary(data):
-    def fmt(value):
+    def fmt(value, unknown='?'):
         n = number(value)
-        return f'{n:.1f}'.removesuffix('.0') if n is not None else '?'
+        return f'{n:.1f}'.removesuffix('.0') if n is not None else unknown
     def pair(kind, mode):
         p = data.get('psi', {}).get(kind, {}).get(mode, {})
         return f"{fmt(p.get('avg_pct'))}%/{fmt(p.get('peak_avg10_pct'))}%"
     host = data.get('host_boxes') or {}
-    suffix = f"host boxes {fmt(host.get('start'))}→{fmt(host.get('end'))} running"
+    if 'incus_unavailable' in (host.get('start_reason'), host.get('end_reason')):
+        suffix = 'host boxes unknown (Incus unavailable)'
+    elif all(number(host.get(k)) is None for k in ('start', 'end')):
+        suffix = 'host boxes unknown'
+    else:
+        suffix = f"host boxes {fmt(host.get('start'), 'unknown')}→{fmt(host.get('end'), 'unknown')} running"
     if data.get('status') != 'available':
         return SUMMARY + 'unavailable · ' + suffix
     cpu = data.get('cpu') or {}

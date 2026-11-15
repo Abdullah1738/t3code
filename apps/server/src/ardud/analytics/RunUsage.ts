@@ -45,6 +45,10 @@ export const makeRunUsageObserver = Effect.fn("RunUsage.observeRun")(function* (
   if (state.startedAt === undefined) state.startedAt = input.run.startedAt;
   const analytics = yield* Effect.serviceOption(Analytics.Analytics);
   const kanban = yield* Effect.serviceOption(KanbanStore.KanbanStore);
+  if (Option.isSome(kanban) && input.appThread.lineage?.relationshipToParent === "subagent") {
+    const parent = input.appThread.lineage.parentThreadId ?? input.appThread.lineage.rootThreadId;
+    kanban.value.registerCallerParent?.(input.run.threadId, parent);
+  }
   // Snapshot attribution before a worker hands its card off or a review round advances.
   const attribution: Effect.Effect<Attribution> =
     state.attribution ??

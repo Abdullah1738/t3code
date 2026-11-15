@@ -33,6 +33,8 @@ import {
   TurnItemId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
+import * as Logger from "effect/Logger";
 import * as Exit from "effect/Exit";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -60,6 +62,7 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
+import * as ProviderStartProgress from "../ardud/orchestration/ProviderStartProgress.ts";
 import * as McpAppModelContext from "../mcpApps/McpAppModelContext.ts";
 import * as PreviewAgentActivity from "../preview/PreviewAgentActivity.ts";
 import * as Analytics from "../ardud/analytics/Analytics.ts";
@@ -4305,6 +4308,197 @@ it.effect("stops the provider turn when ingestion fails the run before a termina
   }),
 );
 
+it.effect.each(["ended", "healthy-successor"] as const)(
+  "finalizes ingestion failure after one not-active Stop: %s",
+  (scenario) =>
+    Effect.gen(function* () {
+      const stale = ProviderTurnId.make(`provider-turn:orphan-not-active:${scenario}`);
+      const active =
+        scenario === "healthy-successor" ? ProviderTurnId.make("healthy-successor") : null;
+      const calls: ProviderTurnId[] = [];
+      const warnings: unknown[] = [];
+      const result = yield* captureRootRunTermination({
+        key: `orphan-not-active:${scenario}`,
+        shouldFinalizeRun: () => Effect.succeed(true),
+        events: () =>
+          Stream.fail(
+            new ProviderAdapter.ProviderAdapterEventStreamError({
+              driver,
+              providerSessionId: ProviderSessionId.make("session:orphan-not-active"),
+              cause: "reader unavailable",
+            }),
+          ),
+        interruptTurn: (turn) =>
+          Effect.gen(function* () {
+            calls.push(turn.providerTurnId);
+            assert.equal(turn.providerTurnId, stale);
+            assert.notEqual(turn.providerTurnId, active);
+            assert.isFalse(turn.requestRuntimeRestart);
+            assert.isFalse(turn.stopBackgroundWork);
+            return yield* new ProviderAdapter.ProviderAdapterTurnNotActiveError({
+              driver,
+              providerThreadId: turn.providerThread.id,
+              providerTurnId: turn.providerTurnId,
+            });
+          }),
+        onTerminalRun: Effect.sync(() => assert.deepEqual(calls, [stale])),
+      }).pipe(
+        Effect.provide(
+          Logger.layer([
+            Logger.make(({ message, logLevel }) => {
+              if (logLevel === "Warn") warnings.push(message);
+            }),
+          ]),
+        ),
+      );
+      assert.deepEqual(calls, [stale]);
+      assert.equal(
+        warnings.map(String).filter((m) => m.includes("could not stop an orphaned provider turn"))
+          .length,
+        0,
+      );
+      assert.deepEqual(result.observed, ["run:failed", "pull-requests-refreshed"]);
+    }),
+);
+
+it.effect("caps orphan Stop failures with exponential backoff and finalizes the run", () =>
+  Effect.gen(function* () {
+    const attempts = yield* Queue.unbounded<number>();
+    const timestamps: number[] = [];
+    const logs: unknown[] = [];
+    const result = yield* captureRootRunTermination({
+      key: "orphan-stop-cap",
+      shouldFinalizeRun: () => Effect.succeed(true),
+      events: () =>
+        Stream.fail(
+          new ProviderAdapter.ProviderAdapterEventStreamError({
+            driver,
+            providerSessionId: ProviderSessionId.make("session:orphan-stop-cap"),
+            cause: "reader unavailable",
+          }),
+        ),
+      interruptTurn: () =>
+        Effect.gen(function* () {
+          timestamps.push(yield* Clock.currentTimeMillis);
+          yield* Queue.offer(attempts, timestamps.length);
+          return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+            driver,
+            detail: "interrupt transport unavailable",
+          });
+        }),
+      onTerminalRun: Effect.sync(() => assert.lengthOf(timestamps, 10)),
+      afterStart: () =>
+        Effect.gen(function* () {
+          assert.equal(yield* Queue.take(attempts), 1);
+          for (const delay of [1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000, 30000]) {
+            yield* TestClock.adjust(delay);
+            yield* Queue.take(attempts);
+          }
+        }),
+    }).pipe(
+      Effect.provide(
+        Logger.layer([
+          Logger.make(({ message }) => {
+            logs.push(message);
+          }),
+        ]),
+      ),
+    );
+    assert.deepEqual(
+      timestamps.map((time) => time - timestamps[0]!),
+      [0, 1000, 3000, 7000, 15000, 31000, 61000, 91000, 121000, 151000],
+    );
+    const messages = logs.map(String);
+    assert.equal(
+      messages.filter((m) => m.includes("could not stop an orphaned provider turn")).length,
+      1,
+    );
+    assert.equal(
+      messages.filter((m) => m.includes("gave up stopping an orphaned provider turn")).length,
+      1,
+    );
+    assert.deepEqual(result.observed, ["run:failed", "pull-requests-refreshed"]);
+  }),
+);
+
+it.effect.each(["ownership-read", "missing-turn-id"] as const)(
+  "bounds orphan Stop prerequisite failures: %s",
+  (scenario) =>
+    Effect.gen(function* () {
+      const probes = yield* Queue.unbounded<void>();
+      let probeCount = 0;
+      let stops = 0;
+      const result = yield* captureRootRunTermination({
+        key: `orphan-prerequisite:${scenario}`,
+        unobservedProviderTurn: scenario === "missing-turn-id",
+        shouldFinalizeRun: () =>
+          Effect.gen(function* () {
+            probeCount++;
+            yield* Queue.offer(probes, undefined);
+            if (scenario === "ownership-read")
+              return yield* new ProjectionStore.ProjectionStoreReadError({
+                threadId: ThreadId.make(`thread:orphan-prerequisite:${scenario}`),
+                cause: "ownership read unavailable",
+              });
+            return true;
+          }),
+        events: () =>
+          Stream.fail(
+            new ProviderAdapter.ProviderAdapterEventStreamError({
+              driver,
+              providerSessionId: ProviderSessionId.make("session:orphan-prerequisite"),
+              cause: "reader unavailable",
+            }),
+          ),
+        interruptTurn: () =>
+          Effect.sync(() => {
+            stops++;
+          }),
+        afterStart: () =>
+          Effect.gen(function* () {
+            yield* Queue.take(probes);
+            for (const delay of [1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000, 30000]) {
+              yield* TestClock.adjust(delay);
+              yield* Queue.take(probes);
+            }
+          }),
+      });
+      assert.equal(probeCount, 10);
+      assert.equal(stops, 0);
+      assert.deepEqual(result.observed, ["run:failed", "pull-requests-refreshed"]);
+    }),
+);
+
+it.effect("bounds slow orphan Stops with a five-minute total deadline", () =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    let attempts = 0;
+    const start = yield* Clock.currentTimeMillis;
+    const result = yield* captureRootRunTermination({
+      key: "orphan-stop-deadline",
+      shouldFinalizeRun: () => Effect.succeed(true),
+      events: () =>
+        Stream.fail(
+          new ProviderAdapter.ProviderAdapterEventStreamError({
+            driver,
+            providerSessionId: ProviderSessionId.make("session:orphan-stop-deadline"),
+            cause: "reader unavailable",
+          }),
+        ),
+      interruptTurn: () =>
+        Effect.sync(() => {
+          attempts++;
+        }).pipe(Effect.andThen(Deferred.succeed(entered, undefined)), Effect.andThen(Effect.never)),
+      afterStart: () => Deferred.await(entered).pipe(Effect.andThen(TestClock.adjust("5 minutes"))),
+      onTerminalRun: Effect.gen(function* () {
+        assert.equal((yield* Clock.currentTimeMillis) - start, 300_000);
+        assert.equal(attempts, 7);
+      }),
+    });
+    assert.deepEqual(result.observed, ["run:failed", "pull-requests-refreshed"]);
+  }),
+);
+
 it.effect("stops a Claude query before publishing ingestion failure as a terminal run", () =>
   Effect.gen(function* () {
     const order: Array<string> = [];
@@ -5238,6 +5432,7 @@ it.effect("keeps completed runs completed when pull request refresh fails", () =
 
 function captureRootRunTermination(input: {
   readonly key: string;
+  readonly unobservedProviderTurn?: boolean;
   readonly providerDriver?: ProviderDriverKind;
   readonly onTerminalRun?: Effect.Effect<void>;
   readonly delegated?: boolean;
@@ -5286,6 +5481,7 @@ function captureRootRunTermination(input: {
   readonly awaitSessionExit?: ProviderAdapter.ProviderAdapterV2SessionRuntime["awaitSessionExit"];
   readonly unsafeProcessStop?: Effect.Effect<void>;
   readonly sharedSessionId?: ProviderSessionId;
+  readonly nativeSessionId?: string;
   readonly ingestNormalized?: ProviderEventIngestor.ProviderEventIngestorV2Shape["ingestNormalized"];
   readonly refreshAfterTurn?: Effect.Effect<void>;
   readonly onSubscriptionClose?: Effect.Effect<void>;
@@ -5517,6 +5713,11 @@ function captureRootRunTermination(input: {
         providerThread: {
           id: ids.providerThreadId,
           driver,
+          ...(input.nativeSessionId === undefined
+            ? {}
+            : {
+                nativeThreadRef: { driver, nativeId: input.nativeSessionId, strength: "strong" },
+              }),
           ...(input.sessionRefused === undefined
             ? {}
             : { nativeMetadata: { claudeRefusalObserved: input.sessionRefused } }),
@@ -5524,7 +5725,7 @@ function captureRootRunTermination(input: {
         attempt: {
           id: ids.attemptId,
           attemptOrdinal: 1,
-          providerTurnId: ids.rootProviderTurnId,
+          providerTurnId: input.unobservedProviderTurn ? null : ids.rootProviderTurnId,
         } as OrchestrationV2RunAttempt,
         attemptId: ids.attemptId,
         ...(input.legacyOwnership === undefined
@@ -5935,6 +6136,97 @@ function rootTerminalEvent(
       }
     : { ...common, status, failure: null };
 }
+
+it.effect.each(["ack", "output"] as const)(
+  "retains non-Claude native %s evidence while ingestion is blocked",
+  (evidence) =>
+    Effect.gen(function* () {
+      const key = `blocked-native-${evidence}`;
+      const ids = backgroundScenarioIds(key);
+      const progress = yield* ProviderStartProgress.ProviderStartProgress;
+      const now = yield* DateTime.now;
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      yield* progress.begin({
+        threadId: ids.threadId,
+        runId: ids.runId,
+        attemptId: ids.attemptId,
+        attemptOrdinal: 1,
+        provider: ProviderInstanceId.make("codex"),
+        model: "gpt-5.4",
+        delegated: false,
+        providerSessionId: ProviderSessionId.make(`session:${key}`),
+      });
+      const turn = {
+        id: ids.rootProviderTurnId,
+        providerThreadId: ids.providerThreadId,
+        nodeId: ids.rootNodeId,
+        runAttemptId: ids.attemptId,
+        nativeTurnRef: null,
+        ordinal: 1,
+        status: "running" as const,
+        startedAt: now,
+        completedAt: null,
+      };
+      yield* captureRootRunTermination({
+        key,
+        nativeSessionId: "codex-native-session",
+        shouldFinalizeRun: () => Effect.succeed(true),
+        events: () =>
+          Stream.fromIterable([
+            { type: "provider_turn.updated", driver, providerTurn: turn },
+            evidence === "ack"
+              ? {
+                  type: "provider_turn.updated",
+                  driver,
+                  providerTurn: { ...turn, promptAcceptedAt: now },
+                }
+              : {
+                  type: "turn_item.updated",
+                  driver,
+                  turnItem: {
+                    id: ids.itemId,
+                    type: "reasoning",
+                    threadId: ids.threadId,
+                    runId: ids.runId,
+                    nodeId: ids.rootNodeId,
+                    providerThreadId: ids.providerThreadId,
+                    providerTurnId: ids.rootProviderTurnId,
+                    nativeItemRef: { driver, nativeId: "native-reasoning", strength: "strong" },
+                    parentItemId: null,
+                    ordinal: 1,
+                    status: "running",
+                    title: null,
+                    startedAt: now,
+                    completedAt: null,
+                    updatedAt: now,
+                    text: "Working",
+                    streaming: true,
+                  },
+                },
+            rootTerminalEvent(ids, "completed"),
+          ] satisfies ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>),
+        ingestNormalized: ({ event }) =>
+          event.type === "provider_turn.updated" &&
+          event.providerTurn.promptAcceptedAt !== undefined
+            ? Deferred.succeed(entered, undefined).pipe(
+                Effect.andThen(Deferred.await(release)),
+                Effect.as([]),
+              )
+            : Effect.succeed([]),
+        afterStart: () =>
+          Effect.gen(function* () {
+            yield* Deferred.await(entered);
+            const snapshot = progress.get(ids.runId, ids.attemptId)!;
+            assert.isNotNull(snapshot.nativeAcceptedAt);
+            assert.equal(snapshot.nativeSessionId, "codex-native-session");
+            assert.equal(snapshot.step, "run_ingestion_write");
+            assert.isFalse(yield* Deferred.isDone(release));
+            yield* Deferred.succeed(release, undefined);
+          }),
+      }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+    }).pipe(Effect.provide(ProviderStartProgress.layer)),
+);
 
 it.effect.each([
   { provider: "cursor", mode: "turn" },

@@ -56,15 +56,15 @@ test("watcher and Telegram loggers share the same private, allowlisted format", 
   expect(statSync(join(dir, `${day()}.ndjson`)).mode & 0o777).toBe(0o600);
 });
 
-test("creator fallbacks retain stable lookup fields and discard arbitrary reasons", () => {
+test.each(["native", "status", "send"])("creator fallbacks retain stable %s fields and discard arbitrary reasons", step => {
   const dir = fixture();
-  for (const reason of ["timeout", "exit:1", "exit:127", "invalid", "archived", "private payload", "exit:1 secret"]) {
+  for (const reason of ["timeout", "exit:1", "exit:127", "invalid", "archived", "error", "private payload", "exit:1 secret"]) {
     toolLog({ component: "wakes", kind: "error", name: "wake.creator_fallback", ok: false,
-      ids: { watcher: "fixture" }, props: { step: "native", reason, durationMs: 12 } });
+      ids: { watcher: "fixture" }, props: { step, reason, durationMs: 12 } });
   }
   const all = rows(dir);
-  expect(all.map(row => row.props.reason)).toEqual(["timeout", "exit:1", "exit:127", "invalid", "archived", undefined, undefined]);
-  expect(all.every(row => row.props.step === "native" && row.props.durationMs === 12)).toBe(true);
+  expect(all.map(row => row.props.reason)).toEqual(["timeout", "exit:1", "exit:127", "invalid", "archived", "error", undefined, undefined]);
+  expect(all.every(row => row.props.step === step && row.props.durationMs === 12)).toBe(true);
 });
 
 test("logging drops IO and serialization failures without raising", () => {
@@ -241,4 +241,20 @@ test("relay metadata keeps bounded values and rejects text in every new field", 
   expect(rows(dir)[1].props).toEqual({ reason: "resume", relays: 1 });
   expect(rows(dir)[2].props).toBeUndefined();
   expect(JSON.stringify(rows(dir))).not.toContain(secret);
+});
+
+test('queued wakes retain route and confirmation metadata and count as sent only after confirmation', async () => {
+  const dir = fixture();
+  toolLog({ component: 'wakes', kind: 'event', name: 'wake.sent', ok: false,
+    props: { via: 'thread:abcd1234', confirmed: 'pending', accepted: true } });
+  toolLog({ component: 'wakes', kind: 'event', name: 'wake.sent', ok: false,
+    props: { via: 'wake:owner-fallback', meant_for: 'abcd1234', confirmed: 'pending', accepted: true } });
+  expect(rows(dir).map(row => row.props)).toEqual([
+    { via: 'thread:abcd1234', confirmed: 'pending', accepted: true },
+    { via: 'wake:owner-fallback', meant_for: 'abcd1234', confirmed: 'pending', accepted: true },
+  ]);
+  expect((await rollup(day(), dir))?.wake).toMatchObject({ attempts: 2, sent: 0, failed: 0 });
+  toolLog({ component: 'wakes', kind: 'event', name: 'wake.confirmed', ok: true, durationMs: 1_000 });
+  toolLog({ component: 'wakes', kind: 'error', name: 'wake.unconfirmed', ok: false, durationMs: 600_000 });
+  expect((await rollup(day(), dir))?.wake).toMatchObject({ attempts: 2, sent: 1, failed: 1 });
 });

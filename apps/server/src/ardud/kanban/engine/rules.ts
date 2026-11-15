@@ -1,3 +1,4 @@
+import type { McpDenyReason } from "@t3tools/contracts";
 import {
   KANBAN_AGING_MAX_STEPS,
   KANBAN_AGING_STEP_MS,
@@ -37,7 +38,9 @@ import { heldForRetry } from "./retries.ts";
  */
 export type MoveRole = "owner" | "evaluator" | "cardThread" | "dispatcher" | "system" | "script";
 
-export type MoveCheck = { readonly ok: true } | { readonly ok: false; readonly reason: string };
+export type MoveCheck =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly reason: string; readonly denyReason?: McpDenyReason };
 
 /** A model's reasoning level (its effort option for its driver), or null. */
 export const modelLevel = (model: ModelSelection): string | null => selectionEffort(model);
@@ -96,7 +99,11 @@ export function aliasPool(
 export const isDone = (stage: KanbanStage) => KANBAN_DONE_STAGES.has(stage);
 
 const ok: MoveCheck = { ok: true };
-const no = (reason: string): MoveCheck => ({ ok: false, reason });
+const no = (reason: string, denyReason: McpDenyReason = "transition_not_allowed"): MoveCheck => ({
+  ok: false,
+  reason,
+  ...(denyReason === undefined ? {} : { denyReason }),
+});
 
 /**
  * Only the dispatcher puts a card into a thread stage, because that is the
@@ -105,7 +112,7 @@ const no = (reason: string): MoveCheck => ({ ok: false, reason });
  */
 export function checkMove(role: MoveRole, card: KanbanCard, to: KanbanStage): MoveCheck {
   const from = card.stage;
-  if (from === to) return no(`card is already in ${to}`);
+  if (from === to) return no(`card is already in ${to}`, "stage_unchanged");
   if (
     KANBAN_THREAD_STAGES.includes(to) &&
     role !== "dispatcher" &&
@@ -116,7 +123,10 @@ export function checkMove(role: MoveRole, card: KanbanCard, to: KanbanStage): Mo
       card.activeThreadId === null
     )
   ) {
-    return no(`only the dispatcher moves a card into ${to}; move it to todo or needs_review`);
+    return no(
+      `only the dispatcher moves a card into ${to}; move it to todo or needs_review`,
+      "stage_owned_by_dispatcher",
+    );
   }
   switch (role) {
     case "dispatcher":
@@ -145,7 +155,7 @@ export function checkMove(role: MoveRole, card: KanbanCard, to: KanbanStage): Mo
         return ok;
       return no(`system cannot move ${from} -> ${to}`);
     case "script":
-      if (card.settledAt !== null) return no("card is settled");
+      if (card.settledAt !== null) return no("card is settled", "card_settled");
       if (KANBAN_THREAD_STAGES.includes(from)) {
         return no(`a script doesn't move a card a thread has (${from})`);
       }
@@ -155,7 +165,7 @@ export function checkMove(role: MoveRole, card: KanbanCard, to: KanbanStage): Mo
       return ok;
     case "evaluator":
     case "owner":
-      if (card.settledAt !== null) return no("card is settled");
+      if (card.settledAt !== null) return no("card is settled", "card_settled");
       return ok;
   }
 }
@@ -393,6 +403,35 @@ export function workerQuietDue(
   return nowMs - since >= WORKER_QUIET_MS;
 }
 
+export const FAILED_TURN_RESUME_MS = 2 * 60 * 1000;
+
+export function isRuntimeFailure(failure: {
+  readonly class: string;
+  readonly category?: string | undefined;
+  readonly code: string | null;
+  readonly message: string;
+  readonly retryable?: boolean | null | undefined;
+}): boolean {
+  if (isOutage(failure)) return false;
+  if (failure.category !== undefined && failure.category !== "unknown") return false;
+  return failure.class === "transport_error" && failure.retryable === true;
+}
+
+/** Failure recovery ignores background work, but keeps the ordinary nudge window. */
+export function failedTurnResumeDue(
+  card: KanbanCard,
+  view: { readonly state: string; readonly quietSince: string },
+  nowMs: number,
+): boolean {
+  if (card.stage !== "working" || card.activeRole !== "work" || card.stalled !== null) return false;
+  if (view.state !== "idle") return false;
+  return (
+    nowMs - Math.max(Date.parse(view.quietSince), Date.parse(card.movedAt)) >=
+      FAILED_TURN_RESUME_MS &&
+    (card.nudgedAt === null || nowMs - Date.parse(card.nudgedAt) >= WORKER_QUIET_MS)
+  );
+}
+
 /** How long a thread whose turn ended may wait on its own background work before the board treats it as stopped. */
 export const BACKGROUND_GRACE_MS = 60 * 60 * 1000;
 
@@ -628,6 +667,12 @@ export function poolThreads(
 
 export type ReviewEvidence = NonNullable<Parameters<typeof kanbanReviewAlreadyDone>[1]>;
 
+export interface AssignmentWakeRetry {
+  readonly movedAt: string;
+  readonly attempts: number;
+  readonly retryAt: number;
+}
+
 /**
  * Fill free pool slots by effective urgency, reviews before todos at the same rank.
  * Within each role, pick order uses rank, holds, then oldest first.
@@ -657,6 +702,7 @@ export function planDispatch(
   attempted: ReadonlySet<string> = new Set(),
   reviews: ReadonlyMap<string, ReviewEvidence> = new Map(),
   workThreadHomes: ReadonlyMap<string, KanbanCard | null> = new Map(),
+  assignmentWakeRetries: ReadonlyMap<string, AssignmentWakeRetry> = new Map(),
 ): ReadonlyArray<Dispatch> {
   // A board's first setup holds all card work and review until the setup evaluator ends it.
   if (board.setup?.status === "running") return [];
@@ -676,6 +722,10 @@ export function planDispatch(
   const waiting = cards.filter(
     (card) =>
       !attempted.has(card.id) &&
+      !(
+        assignmentWakeRetries.get(card.id)?.movedAt === card.movedAt &&
+        clock < assignmentWakeRetries.get(card.id)!.retryAt
+      ) &&
       (kept === null || kept.has(card.id)) &&
       card.settledAt === null &&
       card.activeThreadId === null &&
@@ -853,37 +903,43 @@ export interface ClaimContext {
 /**
  * A work thread may take a todo card that runs on its pool and project, isn't
  * running, stalled or kept for another work thread, and isn't blocked by work
- * outside the thread.
+ * outside the thread or awaiting review or merge.
  */
 export function checkClaim(board: KanbanBoard, card: KanbanCard, ctx: ClaimContext): MoveCheck {
   // Same hold as planDispatch: no card work starts while the board's setup runs.
-  if (board.setup?.status === "running") return no("Setup is running");
+  if (board.setup?.status === "running") return no("Setup is running", "board_setup_running");
   if (board.pause && !board.pause.keep.includes(card.id)) {
-    return no(`the board is paused: ${board.pause.reason}`);
+    return no(`the board is paused: ${board.pause.reason}`, "board_paused");
   }
-  if (card.stage !== "todo") return no(`card #${card.number} is in ${card.stage}, not todo`);
-  if (card.settledAt !== null) return no(`card #${card.number} is settled`);
-  if (card.activeThreadId !== null) return no(`card #${card.number} already has a thread`);
+  if (card.stage !== "todo")
+    return no(`card #${card.number} is in ${card.stage}, not todo`, "card_not_todo");
+  if (card.settledAt !== null) return no(`card #${card.number} is settled`, "card_settled");
+  if (card.activeThreadId !== null)
+    return no(`card #${card.number} already has a thread`, "card_has_active_thread");
   if (card.workThreadId !== null && card.workThreadId !== ctx.threadId) {
-    return no(`card #${card.number} goes back to its own work thread`);
+    return no(`card #${card.number} goes back to its own work thread`, "not_card_owner");
   }
   if (card.stalled !== null) {
-    return no(`card #${card.number} is flagged stalled: ${card.stalled.reason}`);
+    return no(`card #${card.number} is flagged stalled: ${card.stalled.reason}`, "card_stalled");
   }
-  if (card.priority === KANBAN_BACKLOG) return no(`card #${card.number} is in the backlog`);
+  if (card.priority === KANBAN_BACKLOG)
+    return no(`card #${card.number} is in the backlog`, "card_in_backlog");
   if (kanbanWaiting(card)) {
     return no(
       `card #${card.number} is waiting (${card.wait?.note.trim() || card.wait?.on}): the board wakes it when that ends; clear the wait with card_wait first to take it now`,
+      "card_waiting",
     );
   }
   if (kanbanDeciding(card, ctx.nowMs)) {
     return no(
       `card #${card.number} is held for its evaluator, who was told its wait ended (${card.deciding?.why}): it carries on when that evaluator's turn ends`,
+      "evaluator_decision_pending",
     );
   }
   if (kanbanWaitsOnEvaluator(card)) {
     return no(
       `card #${card.number} waits on ${kanbanScriptStep(card) ? "a script's" : "an evaluator's"} subtask first`,
+      "evaluator_step_pending",
     );
   }
   const pools = ctx.pools ?? [];
@@ -892,17 +948,27 @@ export function checkClaim(board: KanbanBoard, card: KanbanCard, ctx: ClaimConte
       ? kanbanCardModels(card).map((entry) => poolOf(pools, entry.model))
       : [poolOf(pools, card.model)];
   if (!runsOn.includes(ctx.pool)) {
-    return no(`card #${card.number} runs on ${runsOn.join(" or ")}; this thread runs ${ctx.pool}`);
+    return no(
+      `card #${card.number} runs on ${runsOn.join(" or ")}; this thread runs ${ctx.pool}`,
+      "model_pool_mismatch",
+    );
   }
   if ((card.projectId ?? board.defaultProjectId) !== ctx.projectId) {
-    return no(`card #${card.number} runs in another project`);
+    return no(`card #${card.number} runs in another project`, "project_mismatch");
   }
-  // The claim makes the card this thread's, so a block by the thread's own work doesn't count.
+  // A claim batches this thread's todo/working cards, but review and merge can still hold it up.
   const blocker = kanbanHeldUpBy(card, ctx.byId, ctx.threadId);
-  if (blocker) return no(`card #${card.number} waits on #${blocker.number}`);
-  if (ctx.slots <= 0) return no(`the ${ctx.pool} pool is paused`);
+  if (blocker)
+    return no(
+      `card #${card.number} waits on #${blocker.number} (${blocker.stage})`,
+      "dependency_blocked",
+    );
+  if (ctx.slots <= 0) return no(`the ${ctx.pool} pool is paused`, "pool_paused");
   if (ctx.carrying >= MAX_BATCH) {
-    return no(`this thread already carries ${ctx.carrying} cards (max ${MAX_BATCH})`);
+    return no(
+      `this thread already carries ${ctx.carrying} cards (max ${MAX_BATCH})`,
+      "thread_batch_full",
+    );
   }
   return ok;
 }

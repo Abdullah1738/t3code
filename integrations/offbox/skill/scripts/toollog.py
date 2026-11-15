@@ -16,11 +16,22 @@ import time
 
 CAP_BYTES = 50 * 1024 * 1024
 NUMBERS = set("bytes files skipped exitCode waitMs queueMs runMs position ttlSeconds reasonLength busy idle stopped count flagsCount envCount pullCount includeCount stepCount attempt pid timeoutSeconds commandLength cmd_bytes step_count".split())
+NUMBERS.update("ms slow_ms last_good_boatd_uptime_s snapshot_age_s boatd_uptime_s uptime_s slow slow_max_s slow_total_s starting starting_max_s down".split())
 NUMBERS.update({'command_exit_code', 'wrapper_exit_code', 'disk_attempt', 'client_started_at', 'disk_probe_module_mtime'})
+NUMBERS.update({'leftoverKilled', 'boxRc', 'incusRc', 'cgroupProcessCount'})
 NUMBERS.update(f'{fs}_{field}' for fs in ('tmp', 'var_tmp', 'home', 'workspace')
                for field in ('free_bytes', 'size_bytes'))
-BOOLEANS = set("queued killed fresh bg noSync git noFallback noRetry remote failed stale timeoutHit fallback dryRun baseGiven templateGiven sizeGiven".split())
+BOOLEANS = {"peer_online"} | set("queued killed fresh bg noSync git noFallback noRetry remote failed stale timeoutHit fallback dryRun baseGiven templateGiven sizeGiven".split())
+BOOLEANS.update({'retry', 'rcFilePresent', 'superseded'})
 ENUMS = {
+    "jdk_phase": {"check", "install", "result"},
+    "jdk_result": {"pending", "present", "installed", "compiler-missing", "apt-failed"},
+    "jdk_trigger": {"command", "repo-marker", "harness"},
+    "class": {"good", "hard", "slow", "starting"},
+    "outcome": {"good", "bad", "indeterminate", "slow", "starting", "ready", "failover"},
+    "peer_path": {"direct", "relay", "unknown"},
+    "refresh_stage": {"idle", "zpool", "incus", "mullvad", "sqlite"},
+    "checkpoint": {"probe", "person", "post", "auto-stop", "request", "box-read"},
     "cmd_via": {"argv", "file"},
     "backend": {"home", "boat"}, "from": {"home", "boat"}, "to": {"home", "boat"},
     "reason": {"pinned", "home_up", "home_down", "unreachable", "boat_only", "boat_only_base", "infra", "cap", "busy", "person_home_down", "base_home_down"},
@@ -36,6 +47,10 @@ ENUMS = {
 }
 ENUMS.update({f'{fs}_fstype': {'tmpfs', 'zfs', 'ext2', 'ext3', 'ext4', 'xfs', 'btrfs', 'overlay', 'unknown'}
               for fs in ('tmp', 'var_tmp', 'home', 'workspace')})
+ENUMS.update(cause={'incus_unavailable', 'exec_stream_lost', 'host_restart', 'boatd_restart', 'runner_restart'},
+             phase={'before_spawn', 'running'}, cleanup={'clean', 'stopped', 'unknown'})
+ENUMS['reason'].update({'incus_unavailable', 'state_unavailable', 'box_unreadable', 'invalid_receipt',
+                        'cgroup_unverified', 'cgroup_kill_failed', 'cleanup_unconfirmed'})
 _DAYS = set()
 
 
@@ -62,11 +77,22 @@ def _ids(values):
 def _props(values):
     out = {}
     for k, v in (values or {}).items():
-        if k in NUMBERS and type(v) in (int, float) and math.isfinite(v):
+        if k in {'leftoverKilled', 'boxRc', 'cgroupProcessCount'} and v is None:
+            out[k] = None
+        elif k == 'stderrTail' and isinstance(v, str):
+            # Only Incus' fixed transport diagnostics belong here, never arbitrary command output.
+            markers = ('Lost connection to the event listener', 'websocket: close 1006',
+                       'unexpected EOF', 'Incus is shutting down')
+            out[k] = '; '.join(s for s in markers if s in v)
+        elif k in NUMBERS and type(v) in (int, float) and math.isfinite(v):
             out[k] = v
         elif k in BOOLEANS and type(v) is bool:
             out[k] = v
         elif k in ENUMS and isinstance(v, str) and v in ENUMS[k]:
+            out[k] = v
+        elif k in ("boot_id", "last_good_boot_id") and isinstance(v, str) and re.fullmatch(r"[A-Za-z0-9-]{1,64}", v):
+            out[k] = v
+        elif k == "day" and isinstance(v, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
             out[k] = v
         elif k == "repo" and isinstance(v, str) and re.fullmatch(r"[a-f0-9]{16}", v):
             out[k] = v

@@ -224,7 +224,7 @@ def _cmd_run(a, me) -> int:
 
 def _run_with_retries(a, me) -> int:
     from . import home
-    with home.wait_budget():
+    with home.run_identity(), home.wait_budget():
         return _run_with_wait_budget(a, me)
 
 
@@ -238,13 +238,6 @@ def _run_with_wait_budget(a, me) -> int:
     explicit_base = full_name(a.base, me['repo_key']) if a.base and not a.fresh else None
     wait_explicit_base = home.active() and home.base_needs_home(explicit_base)
     home.WAIT_STARTED = time.monotonic()
-    if (home.on_standby() and not os.environ.get(home.FAILOVER_ENV)
-          and common._BACKEND_REASON != "boat-only-base"):
-        st = common.home_state()
-        home.failover_decision('boat', 'home_down', explicit_base, os.environ.get(runs.BACKGROUND_RUN_ENV, ''))
-        toollog.emit("backend", "backend.failover", duration_ms=0, ok=True, props={"from": "home", "to": "boat", "reason": "home_down", "waitMs": 0})
-        say(f"home offbox server is down ({st.get('reason') or 'marked down by the health monitor'}); "
-            "this run is on Boat")
     from . import api, outage, pool
     waited_from = None
     wait_end = None
@@ -286,18 +279,23 @@ def _run_with_wait_budget(a, me) -> int:
                     # Nothing was accepted by the home server. Ordinary work goes to Boat for this one run; a
                     # person's work waits for the home server; a pinned backend keeps today's waiting.
                     if home.may_fail_over(explicit_base):
-                        if not reprobed and not home.recent_failure() and home.network_failure(e):
+                        why = None
+                        if not reprobed and home.network_failure(e):
                             reprobed = True
-                            if api.probe_backend("server", home.PROBE_TIMEOUT_S) is None:
+                            try:
+                                why = home.preflight_reason()
+                            except home.StartWaitFailed as wait_error:
+                                e, why = wait_error, str(wait_error)
+                            if why is None:
                                 continue
-                        phase = home.error_phase(e)
+                        phase = home.error_phase(e) if why is None else None
                         if phase:
                             why = home.wait_while_starting(phase, e.run_id or "", checkpoint="post", box=e.box)
                             if why is None:
                                 continue
                             e = home.StartWaitFailed(why, run_id, e.box)
                         else:
-                            why = str(e)
+                            why = why or str(e)
                         home.fail_over(why, getattr(a, "argv", None) or sys.argv[1:], run_id,
                                        explicit_base=explicit_base)
                     else:
@@ -456,7 +454,7 @@ def _main(argv: list[str] | None = None) -> int:
         if a.sub == "logs":
             return misc.logs(a.run_id, a.follow)
         if a.sub == "wait":
-            return misc.wait(a.run_id, a.timeout)
+            return misc.wait(a.run_id, a.timeout, summary=True)
         if a.sub == "local":
             misc.local_exempt(me, a.reason, a.ttl, a.list, a.clear)
         elif a.sub == "list":

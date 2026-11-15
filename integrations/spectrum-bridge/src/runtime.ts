@@ -21,6 +21,7 @@ import { getSecretRequest, type SecretDeps } from "./secrets.ts";
 import { SHARE_ROUTES, shareRoute, type Shares } from "./share.ts";
 import { sessionMatches } from "./session.ts";
 import { Store } from "./store.ts";
+import { AGENT_BUS_WAKE_PREFIX, AgentBus, validAgentRequestId, validAnswerStatus, type AgentAnswerReceipt } from "./agent-bus.ts";
 
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 
@@ -153,9 +154,10 @@ export class ChatRegistry<P> {
   }
 
   /** Machine input for a chat's agent (owner decisions, questions from other chats). Deduped by key. */
-  wake(chat: Chat<P>, text: string, dedupeKey: string): { id: string; created: boolean } {
-    const id = `wake:${hash(dedupeKey)}`;
-    const created = chat.store.acceptInbound(id, { id, text, attachments: [], isAudioMessage: false, receivedAt: this.now() });
+  wake(chat: Chat<P>, text: string, dedupeKey: string, metadata: { agentAnswer?: AgentAnswerReceipt; agentBus?: boolean } = {}): { id: string; created: boolean } {
+    const id = `${metadata.agentBus ? AGENT_BUS_WAKE_PREFIX : "wake:"}${hash(dedupeKey)}`;
+    const created = chat.store.acceptInbound(id, { id, text, attachments: [], isAudioMessage: false, receivedAt: this.now(),
+      ...(metadata.agentAnswer ? { agentAnswer: metadata.agentAnswer } : {}) });
     if (created) this.touch(chat);
     return { id, created };
   }
@@ -211,6 +213,7 @@ type Handler = (request: Request) => Promise<Response>;
 
 export type SbApiOptions<P extends { api: Handler }> = {
   registry: ChatRegistry<P>;
+  agentBus?: AgentBus;
   line: Line;
   accessPath: string;
   enabled: () => boolean;
@@ -252,12 +255,42 @@ const askText = (from: ChatInfo, question: string) =>
 const relayText = (body: string) =>
   `[Relayed from the owner's chat, not typed by anyone here. Act on it and tell this chat what happened if they need to know.]\n${body}`;
 
+const isAdmin = <P>(chat: Chat<P>) => chat.info.kind === "dm"
+  && chat.context.roleOf(chatKey.target(chat.info.key)).role === "admin";
+const adminGroup = <P>(caller: Chat<P> | undefined, target: Chat<P> | undefined) => caller !== undefined
+  && isAdmin(caller) && target !== undefined && target.info.kind === "group"
+  && target.store.hasInboundFrom([chatKey.target(caller.info.key), ...(caller.info.person?.addresses ?? [])]);
+
+export function createAgentBus<P>(registry: ChatRegistry<P>, log: (event: string, code?: string) => void = () => {}): AgentBus {
+  return new AgentBus({
+    db: registry.owner.store.db,
+    forSession: id => registry.forSession(id)?.info,
+    bySlug: slug => registry.bySlugName(slug)?.info,
+    isAdmin: info => { const chat = registry.bySlugName(info.slug); return chat !== undefined && isAdmin(chat); },
+    adminGroup: (caller, target) => adminGroup(registry.bySlugName(caller.slug), registry.bySlugName(target.slug)),
+    deliver: (target, text, key, receipt) => {
+      const chat = registry.bySlugName(target.slug);
+      if (!chat) throw new Error("Agent target unavailable");
+      registry.wake(chat, text, key, { agentAnswer: receipt, agentBus: true });
+    },
+    receipt: (target, key) => {
+      const chat = registry.bySlugName(target.slug);
+      const row = chat?.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(`${AGENT_BUS_WAKE_PREFIX}${hash(key)}`);
+      const receipt = row ? (JSON.parse(row.payload) as { agentAnswer?: AgentAnswerReceipt }).agentAnswer : undefined;
+      return receipt && validAnswerStatus(receipt.status) && Number.isSafeInteger(receipt.at)
+        && Number.isSafeInteger(receipt.chars) && receipt.chars >= 0 ? receipt : undefined;
+    },
+    log,
+  });
+}
+
 /**
  * The bridge socket in Sendblue mode. `sessionId` picks the calling chat; Photon-era routes are
  * forwarded unchanged to that chat's own API, and the multi-chat routes are handled here.
  */
 export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>): Handler {
   const { registry } = options;
+  const bus = options.agentBus ?? createAgentBus(registry);
   const reply = (status: number, body: unknown) => Response.json(body, { status });
   const result = (outcome: SbApiResult) => reply(outcome.status, outcome.body);
   const pendingOptIns = new Set<string>();
@@ -309,9 +342,8 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
         if (caller.info.kind !== "owner") throw new HttpError(403, "Only the owner's chat can do this");
       };
       // An admin's own chat may post in groups the admin has written in; everything else cross-chat stays owner-only.
-      const adminCaller = caller !== undefined && caller.info.kind === "dm" && caller.context.roleOf(chatKey.target(caller.info.key)).role === "admin";
-      const adminGroup = (chat: Chat<P> | undefined) => adminCaller && caller !== undefined && chat !== undefined && chat.info.kind === "group"
-        && chat.store.hasInboundFrom([chatKey.target(caller.info.key), ...(caller.info.person?.addresses ?? [])]);
+      const adminCaller = caller !== undefined && isAdmin(caller);
+      const callerAdminGroup = (chat: Chat<P> | undefined) => adminGroup(caller, chat);
       const live = () => { if (!options.enabled()) throw new HttpError(503, "Bridge is not ready"); };
       /** `--chat <slug>`: only the owner's agent may ask after someone else's location. */
       const locationTarget = (chat: unknown): ChatInfo | undefined => {
@@ -331,6 +363,28 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
       });
 
       switch (path) {
+        case "/agent-ask": {
+          only(body, ["sessionId", "to", "text", "dedupeKey", "parent"]);
+          live();
+          if (!text(sessionId, 200) || !text(body.to, 100) || !/^[a-z0-9][a-z0-9._-]{0,99}$/.test(body.to)
+            || !text(body.text, 12_000) || !text(body.dedupeKey, 200)
+            || (body.parent !== undefined && !validAgentRequestId(body.parent))) throw new HttpError(400, "Invalid request");
+          return result(bus.ask({ sessionId, to: body.to, text: body.text, dedupeKey: body.dedupeKey,
+            ...(typeof body.parent === "string" ? { parent: body.parent } : {}) }));
+        }
+        case "/agent-answer": {
+          only(body, ["sessionId", "request", "text", "status"]);
+          live();
+          if (!text(sessionId, 200) || !validAgentRequestId(body.request)
+            || !text(body.text, 12_000) || (body.status !== undefined && !validAnswerStatus(body.status))) throw new HttpError(400, "Invalid request");
+          return result(bus.answer({ sessionId, request: body.request, text: body.text, status: body.status }));
+        }
+        case "/agent-requests": {
+          only(body, ["sessionId"]);
+          live();
+          if (!text(sessionId, 200)) throw new HttpError(400, "Invalid request");
+          return result(bus.requests(sessionId));
+        }
         case "/app": {
           if (request.headers.has("origin")) throw new HttpError(403, "Forbidden");
           only(body, ["url", "caption", "subcaption", "trailingCaption", "trailingSubcaption", "summary", "updateOf", "previewPage", "to", "dedupeKey", "sessionId"]);
@@ -353,7 +407,7 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
         }
         case "/send": {
           only(body, ["text", "to", "dedupeKey", "sessionId"]);
-          if (!adminGroup(typeof body.to === "string" ? registry.bySlugName(body.to) : undefined)) ownerOnly(false);
+          if (!callerAdminGroup(typeof body.to === "string" ? registry.bySlugName(body.to) : undefined)) ownerOnly(false);
           live();
           const { to, dedupeKey } = body;
           if (typeof body.text === "string" && body.text.length > 12_000) throw new HttpError(400, messageLengthError(body.text, 12_000));
@@ -415,7 +469,7 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
           if (body.chat !== undefined) {
             if (!text(body.chat, 100) || !/^[a-z0-9][a-z0-9._-]{0,99}$/.test(body.chat)) throw new HttpError(400, "Invalid request");
             const target = registry.bySlugName(body.chat);
-            if (!adminGroup(target)) ownerOnly(false);
+            if (!callerAdminGroup(target)) ownerOnly(false);
             if (!target) throw new HttpError(404, "Unknown chat");
             chat = target;
           }
@@ -542,7 +596,7 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
         case "/chats": {
           only(body, ["sessionId"]);
           if (!adminCaller) ownerOnly(true);
-          return reply(200, { chats: (adminCaller ? registry.all().filter(chat => adminGroup(chat)) : registry.all()).map(chat => ({
+          return reply(200, { chats: (adminCaller ? registry.all().filter(chat => callerAdminGroup(chat)) : registry.all()).map(chat => ({
             slug: chat.info.slug, title: chat.info.title, kind: chat.info.kind,
             ...(registry.lastActivity(chat) === undefined ? {} : { lastActivityAt: registry.lastActivity(chat) }),
           })) });

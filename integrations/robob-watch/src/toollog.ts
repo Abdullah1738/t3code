@@ -10,7 +10,7 @@ export type LogEntry = {
   error?: { tag: string; message?: string };
 };
 const token = /^[a-zA-Z][a-zA-Z0-9_.-]{0,79}$/;
-const idKeys = new Set(["watcher", "run", "thread", "chat", "key", "operation", "reminder", "update", "item", "helper"]);
+const idKeys = new Set(["watcher", "run", "thread", "chat", "key", "operation", "reminder", "update", "item", "helper", "meantFor"]);
 const numeric = new Set(["exitCode", "attempt", "count", "threshold", "failures", "bytes", "queuedMs", "failedSources", "totalSources", "events", "waitMs", "spanMs", "graceMs", "relays"]);
 const boolean = new Set(["deduped", "accepted", "timedOut", "notified", "batched", "urgent", "closing", "archived", "frozenContext", "batchOpen", "grace"]);
 const errnoCodes = new Set(Object.keys(constants.errno));
@@ -23,9 +23,10 @@ const values: Record<string, readonly string[]> = {
   state: ["pending", "sending", "sent", "uncertain", "cancelled", "failed", "scheduled", "queued", "done", "expired", "paused", "active"],
   stderrClass: ["usage_error", "missing_file", "permission", "timeout", "python_traceback", "auth", "connect", "json", "unknown"],
   triggerKind: ["file", "wal"],
-  step: ["native", "status"],
-  route: ["person", "owner", "group", "creator", "other"],
-  via: ["wake", "thread", "imessage-send", "telegram", "none"],
+  step: ["native", "status", "send"],
+  route: ["person", "owner", "group", "creator", "other", "thread", "unverified", "refused"],
+  via: ["wake", "thread", "imessage-send", "telegram", "none", "wake:owner-fallback", "native:pending"],
+  confirmed: ["pending", "n/a"],
 };
 let testRoot: string | undefined;
 export const logDirectory = () => {
@@ -61,10 +62,16 @@ function fields(entry: LogEntry, at: Date) {
     else if (key === "signal" && typeof value === "string" && signals.has(value)) props[key] = value;
     else if ((entry.name === "watch.grace_ended" || entry.name === "watch.removed") && key === "reason" && typeof value === "string"
       && ["expired", "resume", "now", "paused", "no_inflight_check"].includes(value)) props[key] = value;
+    else if (entry.name === "watch.route_checked" && key === "reason" && typeof value === "string"
+      && ["no --session", "live owner session", "iMessage thread", "live thread", "not_found", "archived", "invalid_id", "invalid_thread", "invalid_session", "lookup unavailable"].includes(value)) props[key] = value;
+    else if (entry.name === "watch.route_checked" && key === "durationMs" && typeof value === "number"
+      && Number.isFinite(value) && value >= 0) props[key] = value;
     else if (entry.name === "wake.creator_fallback" && key === "reason" && typeof value === "string"
-      && /^(?:timeout|invalid|archived|exit:\d{1,3})$/.test(value)) props[key] = value;
+      && /^(?:timeout|invalid|archived|error|exit:\d{1,3})$/.test(value)) props[key] = value;
     else if (entry.name === "wake.creator_fallback" && key === "durationMs" && typeof value === "number"
       && Number.isFinite(value) && value >= 0) props[key] = value;
+    else if (typeof value === "string" && (key === "via" && /^thread:[A-Za-z0-9%_-]{1,8}$/.test(value)
+      || key === "meant_for" && /^[A-Za-z0-9%_-]{1,8}$/.test(value))) props[key] = value;
     else if (numeric.has(key) && typeof value === "number" && Number.isFinite(value)) props[key] = value;
     else if (boolean.has(key) && typeof value === "boolean") props[key] = value;
     else if (typeof value === "string" && values[key]?.includes(value)) props[key] = value;
@@ -283,7 +290,11 @@ export async function rollup(selection: string | LogWindow, dir = logDirectory()
         if (row.name === "wake.sent") {
           wake.attempts++;
           if (row.ok === true) wake.sent++;
-          else if (row.ok === false) wake.failed++;
+          else if (row.ok === false && props.accepted !== true) wake.failed++;
+        } else if (row.name === "wake.confirmed") {
+          wake.sent++;
+        } else if (row.name === "wake.unconfirmed") {
+          wake.failed++;
         } else if (row.name === "wake.reply_guard") {
           wake.replyGuard.total++;
           if (props.accepted === false) wake.replyGuard.blocked++;

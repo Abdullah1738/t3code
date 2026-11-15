@@ -32,6 +32,7 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as Tracer from "effect/Tracer";
@@ -47,6 +48,7 @@ import * as EventSink from "./EventSink.ts";
 import * as EventStore from "./EventStore.ts";
 import * as ProjectionMaintenance from "./ProjectionMaintenance.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import { startState } from "../ardud/orchestration/ProviderStartProgress.ts";
 import {
   buildBoundedThreadProjection,
   decodeThreadHistoryCursor,
@@ -696,6 +698,103 @@ it.effect("memory activates a null-ref codex seed but not an ordinary queued pla
       targetRow,
     );
   }).pipe(Effect.provide(ProjectionStore.layerMemory)),
+);
+
+it.effect.each([
+  ["memory", ProjectionStore.layerMemory],
+  ["SQL", layerTest],
+] as const)(
+  "%s native-start reads select only the active attempt without scanning provider history",
+  ([kind, layer]) =>
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const threadId = yield* addRolledBackRecoveryCandidate("native-start-filter");
+      const now = yield* DateTime.now;
+      const older = RunAttemptId.make("native-start-older");
+      const replacement = RunAttemptId.make("native-start-replacement");
+      const run = {
+        ...(yield* store.getThreadProjection(threadId)).runs[0]!,
+        status: "running" as const,
+        activeAttemptId: replacement,
+      };
+      yield* store.apply({
+        id: EventId.make("native-start:run"),
+        type: "run.updated",
+        threadId,
+        runId: run.id,
+        occurredAt: now,
+        payload: run,
+      });
+      const turns: OrchestrationV2ProviderTurn[] = [older, replacement].map((attemptId, i) => ({
+        id: ProviderTurnId.make(`native-start-turn-${i}`),
+        providerThreadId: ProviderThreadId.make("native-start-provider-thread"),
+        nodeId: run.rootNodeId!,
+        runAttemptId: attemptId,
+        nativeTurnRef: null,
+        ordinal: i + 1,
+        status: "running",
+        startedAt: now,
+        completedAt: null,
+        ...(attemptId === older ? { promptAcceptedAt: now } : {}),
+      }));
+      for (const turn of turns)
+        yield* store.apply({
+          id: EventId.make(`native-start:${turn.id}`),
+          type: "provider-turn.updated",
+          threadId,
+          runId: run.id,
+          occurredAt: now,
+          payload: turn,
+        });
+      const selected = yield* store.getThreadRecords(threadId, ["providerTurns"], {
+        providerTurnAttemptId: replacement,
+      });
+      assert.deepEqual(
+        selected.providerTurns.map((turn) => turn.runAttemptId),
+        [replacement],
+      );
+      assert.isTrue(startState(run, selected.providerTurns, null).startPending);
+      const old = yield* store.getThreadRecords(threadId, ["providerTurns"], {
+        providerTurnAttemptId: older,
+      });
+      assert.deepEqual(
+        old.providerTurns.map((turn) => turn.runAttemptId),
+        [older],
+      );
+      assert.isTrue(startState(run, old.providerTurns, null).startPending);
+      assert.isEmpty(
+        (yield* store.getThreadRecords(threadId, ["providerTurns"], {
+          providerTurnAttemptId: RunAttemptId.make("absent"),
+        })).providerTurns,
+      );
+      yield* store.apply({
+        id: EventId.make("native-start:accepted"),
+        type: "provider-turn.updated",
+        threadId,
+        runId: run.id,
+        occurredAt: now,
+        payload: { ...turns[1]!, promptAcceptedAt: now },
+      });
+      const accepted = yield* store.getThreadRecords(threadId, ["providerTurns"], {
+        providerTurnAttemptId: replacement,
+      });
+      assert.isFalse(startState(run, accepted.providerTurns, null).startPending);
+      if (kind === "SQL") {
+        const sql = Option.getOrThrow(yield* Effect.serviceOption(SqlClient.SqlClient));
+        const plan = yield* sql<{ detail: string }>`EXPLAIN QUERY PLAN
+        SELECT payload_json FROM orchestration_v2_projection_provider_turns
+        WHERE thread_id = ${threadId} AND run_attempt_id = ${replacement}
+        ORDER BY provider_thread_id ASC, ordinal ASC`;
+        assert.isTrue(
+          plan.some((row) =>
+            /SEARCH.*ardud_provider_turns_attempt_idx.*thread_id=\?.*run_attempt_id=\?/.test(
+              row.detail,
+            ),
+          ),
+        );
+        assert.isFalse(plan.some((row) => /SCAN|TEMP B-TREE/.test(row.detail)));
+      }
+    }).pipe(Effect.provide(layer)),
 );
 
 it.effect.each([
@@ -5225,11 +5324,10 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       const recoveryPlan = yield* sql.unsafe<{ readonly detail: string }>(
         `EXPLAIN QUERY PLAN ${recoveryStatement}`,
       );
-      assert.include(
-        recoveryPlan.map((row) => row.detail).join("\n"),
-        "orchestration_v2_projection_nodes_live_idx",
-      );
-      assert.notMatch(recoveryPlan.map((row) => row.detail).join("\n"), /ardud_|SCAN cold/);
+      const recoveryDetails = recoveryPlan.map((row) => row.detail).join("\n");
+      assert.include(recoveryDetails, "orchestration_v2_projection_nodes_live_idx");
+      assert.include(recoveryDetails, "orchestration_v2_projection_subagents_provider_thread_idx");
+      assert.notMatch(recoveryDetails, /ardud_|SCAN cold/, recoveryDetails);
       assert.include(recoveryThreadIds, runningThreadId);
       assert.include(recoveryThreadIds, orphanedThreadId);
       assert.include(recoveryThreadIds, memberThreadId);
@@ -5246,7 +5344,7 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
         `EXPLAIN QUERY PLAN ${pendingStatement}`,
       );
       const pendingDetails = pendingPlan.map((row) => row.detail).join("\n");
-      assert.notMatch(pendingDetails, /ardud_|SCAN cold/);
+      assert.notMatch(pendingDetails, /ardud_|SCAN cold/, pendingDetails);
       assert.include(pendingDetails, "orchestration_v2_projection_turn_items_shell_pending_idx");
       const memberRecovery = yield* projectionStore.getRuntimeRecoveryProjection(memberThreadId);
       const childRecovery = yield* projectionStore.getRuntimeRecoveryProjection(childThreadId);

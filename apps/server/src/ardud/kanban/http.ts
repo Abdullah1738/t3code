@@ -67,7 +67,12 @@ const errorExtras = (error: KanbanError) => ({
   ...(error.revision === undefined ? {} : { revision: error.revision }),
 });
 
-const fail = (code: KanbanError["code"], detail: string) => new KanbanError({ code, detail });
+const fail = (code: KanbanError["code"], detail: string) =>
+  new KanbanError({
+    code,
+    detail,
+    reason: code === "denied" ? "role_not_allowed" : "invalid_args",
+  });
 
 const decodeJsonText = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 
@@ -428,6 +433,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
             { ...snapshot, cards },
             undefined,
             DateTime.formatIso(yield* DateTime.now),
+            yield* service.boards,
           ),
           page: { limit, hasMore, nextAfter: hasMore ? cards.at(-1)!.number : null },
         };

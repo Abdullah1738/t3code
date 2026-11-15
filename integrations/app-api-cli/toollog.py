@@ -21,7 +21,13 @@ _PENDING = contextvars.ContextVar('orders_log_pending', default=None)
 _SCOPES = contextvars.ContextVar('orders_log_scopes', default=())
 _REQUEST = contextvars.ContextVar('orders_log_request', default=None)
 _SEEN = set()
+DELEGATION_REASONS = {'NO_STANDING_DELEGATION', 'DUPLICATE_DELEGATED_RECORD',
+    'BUS_REQUEST_MISSING', 'BUS_WRONG_SENDER', 'BUS_WRONG_TARGET', 'BUS_REQUEST_CLOSED',
+    'BUS_REQUEST_STALE', 'BUS_UNREADABLE', 'INVALID_LIFETIME', 'UNSUPPORTED_DELEGATION',
+    'DELEGATED_RECORD_INVALID'}
 _NAMES = {
+    'delegate.created', 'delegate.revoked', 'delegated_record.created', 'delegated_record.refused',
+    'moni_go.bus_checked', 'moni_go.bus_refused',
     'cmd.start', 'cmd.end', 'cmd.error', 'guard.refused', 'payment.may_have_sent',
     'step.auth', 'step.cart_build', 'step.checkout', 'step.payment_submit',
     'step.bank_approval_wait', 'step.confirmation', 'flow.recover_payment',
@@ -29,9 +35,12 @@ _NAMES = {
     'track.eta_elapsed', 'track.delivered', 'track.error', 'card.assert',
     'provider.track', 'provider.orders', 'provider.details', 'log.cap',
     'case.open', 'case.update', 'case.close', 'case.reopen', 'case.corroborate',
-    'question.ask', 'check.run',
+    'question.ask', 'check.run', 'cache_reset',
+    'order_watch.item_drop_check',
 }
 _ENUMS = {
+    'reason': DELEGATION_REASONS,
+    'busStatus': {'open', 'pending', 'timed_out'},
     'lane': {'food', 'minutes', 'nownow', 'main', 'supermall', 'marketplace', 'careem', 'uber',
              'quik', 'shops', 'box', 'same-day'},
     'merchant': {'noon', 'careem', 'amazon', 'web', 'uber', 'other', 'unknown'},
@@ -42,6 +51,7 @@ _ENUMS = {
     'starved_by': {'none', 'owner_threads', 'msgs', 'lookups', 'census', 'receipt',
                    'reconcile', 'follow', 'attention', 'build_write', 'merchants', 'order_charges',
                    'payments', 'questions', 'refunds', 'order_screen', 'loads', 'writes', 'locks'},
+    'owner_result': {'ok', 'incomplete', 'list_failed'},
     'slowestPhase': {'reconcile', 'follow', 'attention', 'build_write'},
     'state': {'unknown', 'placed', 'ordered', 'shipped', 'preparing', 'picked up', 'out for delivery',
               'nearby', 'delivered', 'cancelled', 'pending confirmation'},
@@ -49,9 +59,12 @@ _ENUMS = {
 _ENUMS['from'] = _ENUMS['to'] = _ENUMS['state']
 _BOOLS = {'prepareOnly', 'changed', 'fallback', 'budgetHit', 'unmatched', 'deadlineMoved', 'answered', 'polled'}
 _NUMBERS = {'exitCode', 'amountMinor', 'count', 'ageDays', 'openCases', 'fired', 'sourceLimits',
+            'msgs_timeouts', 'msgs_p50_ms',
             'merchants_ms', 'order_charges_ms', 'payments_ms', 'questions_ms', 'refunds_ms',
-            'order_screen_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'locks_ms', 'follow_ms', 'untimed_ms',
-            'owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms'}
+            'order_screen_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'writes_n', 'locks_ms', 'follow_ms', 'untimed_ms',
+            'owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms',
+            'owner_list_pages', 'owner_list_ms', 'owner_threads_selected', 'owner_threads_fresh',
+            'owner_threads_needed', 'owner_threads_fetched', 'owner_fetch_ms_max', 'owner_timeouts', 'owner_cache_size'}
 _CASE_FIELDS = {'merchant', 'amount', 'currency', 'reference', 'state', 'next', 'deadline',
                 'due', 'why', 'who', 'watchers', 'note', 'because', 'reply', 'source'}
 _MONEY_PROPS = {
@@ -60,9 +73,12 @@ _MONEY_PROPS = {
     'case.close': {'kind', 'ageDays'},
     'question.ask': {'outcome'},
     'check.run': {'budgetHit', 'openCases', 'fired', 'slowestPhase', 'sourceLimits', 'limitKinds', 'orderCoverage', 'chargeCensus',
+                  'msgs_timeouts', 'msgs_p50_ms', 'msgs_by_kind', 'receipt_result',
                   'merchants_ms', 'order_charges_ms', 'payments_ms', 'questions_ms', 'refunds_ms',
-                  'order_screen_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'locks_ms', 'follow_ms', 'untimed_ms',
-                  'owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms', 'starved_by'},
+                  'order_screen_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'writes_n', 'locks_ms', 'follow_ms', 'untimed_ms',
+                  'owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms', 'starved_by',
+                  'owner_list_pages', 'owner_list_ms', 'owner_threads_selected', 'owner_threads_fresh',
+                  'owner_threads_needed', 'owner_threads_fetched', 'owner_fetch_ms_max', 'owner_timeouts', 'owner_cache_size', 'owner_result'},
 }
 _COMMANDS = {'test-talabat-shops', 'capabilities', 'restaurant-cart-contract', 'item-options', 'cart',
              'clear-cart', 'menu', 'choices', 'inspect', 'open-flows', 'recover-payment',
@@ -148,7 +164,7 @@ SUPERMALL_SILENT_DELIVERY_NOT_ACTIVE TALABAT_ADDRESS_CHECK_FAILED TALABAT_RETIRE
 UNSUPPORTED_NATIVE_MARKETPLACE_QUIET_DELIVERY UNSUPPORTED_QUIET_OPTION_SEMANTICS
 """.split())
 
-_KNOWN_TAGS = _GUARD_TAGS | frozenset("""
+_KNOWN_TAGS = _GUARD_TAGS | DELEGATION_REASONS | frozenset("""
 OPERATION_FAILED LOG_CAP TRACK_REGISTRATION_FAILED TRACK_POLL_SOURCE_ERROR
 AUTH_EXPIRED AUTH_FORBIDDEN ACCOUNT_CAPTURE_REQUIRED INVALID_ORDER_ID INVALID_ARGUMENTS
 DIA_BRIDGE_UNAVAILABLE DIA_INVALID_RESPONSE DIA_TRANSPORT_FAILED FAILED SOURCE_ERRORS
@@ -426,16 +442,30 @@ def _phases(scope, start, end):
 def _fields(props):
     result = {}
     for key, value in (props or {}).items():
-        if key in _ENUMS and type(value) is str and value in _ENUMS[key]:
+        if key == 'app' and type(value) is str:
+            result[key] = value if value in _ENUMS['merchant'] else 'other'
+        elif key in _ENUMS and type(value) is str and value in _ENUMS[key]:
             result[key] = value
         elif key in _BOOLS and type(value) is bool:
             result[key] = value
         elif key in _NUMBERS and type(value) is int and abs(value) <= 10**12 \
-                and (not key.endswith('_ms') or value >= 0):
+                and (not (key.endswith('_ms') or key == 'writes_n' or key.startswith('owner_')) or value >= 0):
+            result[key] = value
+        elif key == 'hours' and type(value) in (int, float) and math.isfinite(value) and 0 < value <= 24:
+            result[key] = value
+        elif key == 'currency' and type(value) is str and re.fullmatch(r'[A-Z]{3}', value):
             result[key] = value
         elif key == 'limitKinds' and isinstance(value, list):
             result[key] = sorted({v for v in value if isinstance(v, str) and v in {
                 'ORDER_LIST_HOST_BINDING_UNVERIFIED', 'food_page_1', 'nownow_page_1', 'marketplace_page_1'}})
+        elif key == 'receipt_result' and isinstance(value, dict):
+            result[key] = {k: v for k, v in value.items() if k in {'found', 'none', 'out_of_time', 'error'}
+                           and type(v) is int and 0 <= v <= 10**9}
+        elif key == 'msgs_by_kind' and isinstance(value, dict):
+            result[key] = {kind: {k: v for k, v in bucket.items() if k in {'count', 'ms'}
+                                  and type(v) is int and 0 <= v <= 10**9}
+                           for kind, bucket in value.items() if kind in {'receipt', 'order', 'other'}
+                           and isinstance(bucket, dict)}
         elif key == 'chargeCensus' and isinstance(value, dict):
             result[key] = {app: {k: v for k, v in counts.items()
                 if k in {'open', 'matched', 'proven_clean', 'limited', 'error', 'not_checked'}
@@ -479,6 +509,15 @@ def _fields(props):
         elif key == 'last_success_at' and (value is None or (type(value) is str and re.fullmatch(
                 r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})', value))):
             result[key] = value
+        elif key in {'baseline_count', 'row_count', 'absent_count', 'emitted_count'} and type(value) is int and 0 <= value <= 10**9:
+            result[key] = value
+        elif key == 'complete' and type(value) is bool:
+            result[key] = value
+        elif key == 'matched_by' and isinstance(value, dict):
+            result[key] = {k: v for k, v in value.items() if k in {'item_id', 'item_code', 'sku', 'sku_config', 'name'}
+                           and type(v) is int and 0 <= v <= 10**9}
+        elif key == 'suppressed_reason' and value in (None, 'no_overlap'):
+            result[key] = value
     return result
 
 
@@ -486,7 +525,7 @@ def _ids(values):
     # Hash even syntactically valid IDs: input IDs can themselves contain a PAN/OTP.
     return {key: hashlib.sha256(str(value).encode()).hexdigest()[:16]
             for key, value in (values or {}).items()
-            if key in {'flowId', 'orderId', 'caseId'} and type(value) in (str, int) and value != ''}
+            if key in {'flowId', 'orderId', 'caseId', 'requestId', 'delegationId', 'watcher'} and type(value) in (str, int) and value != ''}
 
 
 def _noon_lane(order):
@@ -499,7 +538,7 @@ def _noon_lane(order):
 
 def emit(component, name, *, kind='event', duration_ms=None, ok=None, ids=None, props=None, error=None, cause=None):
     try:
-        if component not in {'commerce', 'order-watch', 'card_status', 'noon', 'careem', 'amazon', 'uber', 'toollog', 'money-cases'}:
+        if component not in {'commerce', 'order-watch', 'card_status', 'noon', 'careem', 'amazon', 'uber', 'toollog', 'money-cases', 'owner-go'}:
             return
         if kind not in {'event', 'perf', 'error'} or name not in _NAMES:
             return
@@ -709,7 +748,7 @@ def rollup(day=None):
                     component = row.get('component')
                     if not isinstance(component, str) or component not in {
                             'commerce', 'order-watch', 'card_status', 'noon', 'careem',
-                            'amazon', 'uber', 'toollog', 'money-cases'}:
+                            'amazon', 'uber', 'toollog', 'money-cases', 'owner-go'}:
                         component = 'unknown'
                     component_totals[component] = component_totals.get(component, 0) + 1
                     component_errors.setdefault(component, {})

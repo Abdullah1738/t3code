@@ -8,6 +8,8 @@ import {
   NodeId,
   type OrchestrationV2AppThread,
   type OrchestrationV2Run,
+  type OrchestrationV2ProviderFailure,
+  type OrchestrationV2TurnItem,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -35,6 +37,8 @@ import * as EventStore from "./EventStore.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderRuntimeRecovery from "./ProviderRuntimeRecoveryService.ts";
 import { restartContinuationRun } from "./RestartContinuation.ts";
+import { rootRuntimeLoss } from "@t3tools/shared/orchestrationV2ThreadError";
+import { isOutage, isRuntimeFailure } from "../ardud/kanban/engine/rules.ts";
 
 const layerTest = Layer.mergeAll(ProjectionStore.layer, EffectOutbox.layer).pipe(
   Layer.provideMerge(SqlitePersistence.layerMemory),
@@ -135,6 +139,233 @@ const createRun = Effect.fn(function* (
   });
   return runId;
 });
+
+const persistRecoveryError = Effect.fn("ProjectionRecoveryTest.persistRecoveryError")(
+  function* (input: {
+    readonly threadId: ThreadId;
+    readonly runId: RunId | null;
+    readonly nodeId: NodeId | null;
+    readonly failure: OrchestrationV2ProviderFailure;
+    readonly status?: OrchestrationV2TurnItem["status"];
+    readonly ordinal?: number;
+    readonly name?: string;
+  }) {
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const now = yield* DateTime.now;
+    const item = {
+      id: TurnItemId.make(`error:${input.threadId}:${input.name ?? "root"}`),
+      threadId: input.threadId,
+      runId: input.runId,
+      nodeId: input.nodeId,
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal: input.ordinal ?? 1,
+      type: "error",
+      title: null,
+      status: input.status ?? "failed",
+      startedAt: now,
+      completedAt: input.status === undefined || input.status === "failed" ? now : null,
+      updatedAt: now,
+      failure: input.failure,
+    } as const satisfies OrchestrationV2TurnItem;
+    yield* projections.apply({
+      id: EventId.make(`event:${item.id}`),
+      type: "turn-item.updated",
+      threadId: input.threadId,
+      occurredAt: now,
+      payload: item,
+    });
+    return item;
+  },
+);
+
+const terminalRecoveryFailure = {
+  class: "provider_error",
+  category: "unknown",
+  code: null,
+  message: "Provider turn ended",
+  retryable: true,
+} as const satisfies OrchestrationV2ProviderFailure;
+
+const persistedFailureCases = [
+  {
+    name: "quota",
+    failure: {
+      ...terminalRecoveryFailure,
+      class: "usage_limit",
+      category: "quota",
+      code: "provider.quota",
+      resetAt: "2026-11-16T00:00:00.000Z",
+    },
+    preserve: true,
+    outage: true,
+  },
+  {
+    name: "transient",
+    failure: { ...terminalRecoveryFailure, category: "transient", code: "provider.unavailable" },
+    preserve: true,
+    outage: true,
+  },
+  {
+    name: "auth",
+    failure: { ...terminalRecoveryFailure, class: "permission_error", category: "auth_expired" },
+    preserve: true,
+    outage: true,
+  },
+  {
+    name: "config",
+    failure: { ...terminalRecoveryFailure, category: "config", retryable: false },
+    preserve: true,
+    outage: false,
+  },
+  {
+    name: "nonretryable",
+    failure: { ...terminalRecoveryFailure, retryable: false },
+    preserve: true,
+    outage: false,
+  },
+  { name: "unclassified", failure: terminalRecoveryFailure, preserve: false, outage: false },
+] satisfies ReadonlyArray<{
+  name: string;
+  failure: OrchestrationV2ProviderFailure;
+  preserve: boolean;
+  outage: boolean;
+}>;
+
+it.effect.each(
+  persistedFailureCases.flatMap((entry) =>
+    [false, true].map((nullRoot) => ({ ...entry, nullRoot })),
+  ),
+)(
+  "startup retains persisted $name before run finalization (null root=$nullRoot)",
+  ({ failure, preserve, outage, nullRoot, name }) =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService;
+      const threadId = yield* createThread(`terminal-error:${name}:${nullRoot}`);
+      const rootNodeId = nullRoot ? null : NodeId.make(`root:${threadId}`);
+      const runId = yield* createRun(threadId, "running", { rootNodeId });
+      const item = yield* persistRecoveryError({ threadId, runId, nodeId: rootNodeId, failure });
+      const before = yield* projections.getRuntimeRecoveryProjection(threadId);
+      assert.deepEqual(
+        before.turnItems.find((candidate) => candidate.id === item.id),
+        item,
+      );
+      assert.equal(before.runs[0]?.status, "running");
+
+      yield* recovery.reconcile("startup");
+
+      const after = yield* projections.getThreadProjection(threadId);
+      const run = after.runs.find((candidate) => candidate.id === runId);
+      if (run === undefined) return assert.fail("Missing recovered run");
+      assert.equal(run.status, "cancelled");
+      const loss = rootRuntimeLoss(run, after.turnItems);
+      assert.deepEqual(
+        loss,
+        preserve
+          ? failure
+          : { ...terminalRecoveryFailure, class: "transport_error", code: "provider.runtime_lost" },
+      );
+      if (loss === null) return assert.fail("Missing startup marker");
+      assert.equal(isOutage(loss), outage);
+      assert.equal(isRuntimeFailure(loss), !preserve);
+    }).pipe(Effect.provide(layerRecoveryTest)),
+);
+
+it.effect.each(
+  (
+    [
+      "preparing",
+      "queued",
+      "starting",
+      "running",
+      "waiting",
+      "completed",
+      "interrupted",
+      "failed",
+      "cancelled",
+      "rolled_back",
+    ] as const
+  ).flatMap((status) => [false, true].map((nullRoot) => ({ status, nullRoot }))),
+)(
+  "recovery error query stays scoped for $status runs (null root=$nullRoot)",
+  ({ status, nullRoot }) =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const now = yield* DateTime.now;
+      const threadId = yield* createThread(`error-scope:${status}:${nullRoot}`);
+      const rootNodeId = nullRoot ? null : NodeId.make(`root:${threadId}`);
+      const runId = yield* createRun(threadId, status, { rootNodeId });
+      const items = [];
+      for (const [ordinal, itemStatus] of (
+        [
+          "idle",
+          "pending",
+          "running",
+          "waiting",
+          "completed",
+          "failed",
+          "cancelled",
+          "interrupted",
+        ] as const
+      ).entries()) {
+        items.push(
+          yield* persistRecoveryError({
+            threadId,
+            runId,
+            nodeId: rootNodeId,
+            failure: terminalRecoveryFailure,
+            name: itemStatus,
+            status: itemStatus,
+            ordinal,
+          }),
+        );
+      }
+      yield* persistRecoveryError({
+        threadId,
+        runId,
+        nodeId: NodeId.make("child"),
+        failure: terminalRecoveryFailure,
+        name: "child",
+      });
+      yield* persistRecoveryError({
+        threadId,
+        runId: null,
+        nodeId: rootNodeId,
+        failure: terminalRecoveryFailure,
+        name: "orphan",
+      });
+      const { failure: _failure, ...base } = items[0]!;
+      yield* projections.apply({
+        id: EventId.make(`event:${threadId}:compaction`),
+        type: "turn-item.updated",
+        threadId,
+        occurredAt: now,
+        payload: {
+          ...base,
+          id: TurnItemId.make(`failed-compaction:${threadId}`),
+          type: "compaction",
+          driver: null,
+          status: "failed",
+          completedAt: now,
+        },
+      });
+      const state = yield* projections.getRuntimeRecoveryProjection(threadId);
+      const active = ["preparing", "starting", "running", "waiting"].includes(status);
+      const expected = items.filter(
+        (item) =>
+          ((active || status === "queued") &&
+            ["pending", "running", "waiting"].includes(item.status)) ||
+          (active && item.status === "failed"),
+      );
+      assert.deepEqual(
+        state.turnItems.map((item) => item.id),
+        expected.map((item) => item.id),
+      );
+    }).pipe(Effect.provide(layerTest)),
+);
 
 // ardud: exercise the real projection query and event outbox for a failed shared session.
 it.effect.each(["crash", "prepared"] as const)(

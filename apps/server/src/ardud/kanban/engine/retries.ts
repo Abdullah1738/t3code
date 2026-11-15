@@ -53,6 +53,41 @@ export const FRESH_START_EVENT = "Thread too long; the next run starts on a fres
 export const NO_VERDICT_RESTARTED_EVENT = "Reviewer stopped without a verdict, retrying once";
 export const NO_VERDICT_REASON = "Reviewer stopped without a verdict";
 export const REFUSED_VERDICT_PREFIX = "Review verdict refused: ";
+export const REVIEW_GATE_CHANGED_EVENT = "Review gate changed; recheck when reviewer stops";
+export const REVIEW_GATE_REQUEUED_EVENT = "Review gate cleared; review requeued";
+export const reviewGateBuildEvent = (build: string) => `Review gate checked for build ${build}`;
+
+/** Gate refusals only: conflicts and invalid verdicts still need evaluator attention. */
+export const gateRefusedVerdict = (
+  card: Pick<KanbanCard, "id" | "movedAt" | "reviewThreadId">,
+  events: ReadonlyArray<KanbanCardEvent>,
+) => {
+  const lastReview = events.findLast((event) => event.kind === "review");
+  const event = events.findLast(
+    (event) =>
+      event.cardId === card.id &&
+      event.kind === "comment" &&
+      event.actor._tag === "thread" &&
+      event.actor.threadId === card.reviewThreadId &&
+      event.at >= card.movedAt &&
+      event.id > (lastReview?.id ?? 0) &&
+      (event.body?.startsWith(REFUSED_VERDICT_PREFIX) ||
+        (/\bcard_review_result\b/.test(event.body ?? "") &&
+          /\bcapability_denied\b/.test(event.body ?? ""))),
+  );
+  if (!event?.body) return null;
+  const gate = event.body.startsWith(REFUSED_VERDICT_PREFIX)
+    ? /\bsubtask s\d+ \((?:deploy|money|secret)\b[\s\S]*\) needs Abdullah's (?:approval|answer)\b/.test(
+        event.body,
+      )
+    : /\b(?:gate|secret|deploy|money|approval)\b/i.test(event.body);
+  return gate ? event : null;
+};
+
+export const gateRefusalHead = (event: KanbanCardEvent) => {
+  const head = event.head ?? event.body?.match(/\b(?:at\s+|head\s*=\s*)([0-9a-f]{7,40})\b/i)?.[1];
+  return head && /^[0-9a-f]{7,40}$/i.test(head) ? head.toLowerCase() : null;
+};
 
 /** Only this review run's own refusal can replace its no-verdict recovery. */
 export const refusedVerdict = (

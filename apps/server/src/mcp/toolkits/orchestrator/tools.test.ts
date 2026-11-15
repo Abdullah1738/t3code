@@ -18,8 +18,27 @@ describe("orchestrator MCP tool guidance", () => {
     assert.include(DelegateTaskTool.description ?? "", "waitTimedOut");
     assert.include(DelegateTaskTool.description ?? "", "does not cancel the child");
     assert.include(DelegateTaskTool.description ?? "", "keep that taskId");
-    assert.include(DelegateTaskTool.description ?? "", "call delegate_task again");
-    assert.include(DelegateTaskTool.description ?? "", "childThreadId is backing storage");
+    for (const description of [
+      DelegateTaskTool.description ?? "",
+      OrchestratorToolkit.tools.t3_thread_send.description ?? "",
+    ]) {
+      assert.include(description, "later rounds");
+      assert.include(description, "childThreadId");
+      assert.include(description, "with mode='queue'");
+      assert.include(description, "new head SHA, responses to prior findings, and open objections");
+      assert.include(description, "retain its returned taskId");
+      assert.include(
+        description,
+        "only if the previous child failed, was cancelled, or its model must change",
+      );
+      assert.notInclude(description, "call delegate_task again");
+      assert.notInclude(description, "new clientRequestId for independent review rounds");
+    }
+    assert.include(
+      DelegateTaskTool.description ?? "",
+      "Start the first round with delegate_task, role review",
+    );
+    assert.include(DelegateTaskTool.description ?? "", "<card>-precommit-review");
     assert.include(
       OrchestratorToolkit.tools.t3_thread_send.description ?? "",
       "a requested follow-up creates a fresh task",
@@ -54,7 +73,7 @@ describe("orchestrator MCP tool guidance", () => {
       .filter((value) => typeof value === "string")
       .join(" ");
     assert.include(modeText, "Defaults to async");
-    assert.include(timeoutText, "does not cancel the child");
+    assert.include(timeoutText, "without cancelling the child");
   });
 
   it("publishes an actionable schedule schema and compatibility string branch", () => {

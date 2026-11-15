@@ -706,12 +706,19 @@ def _follow_bounded(box_id: str, pid: int, log_path, timeout_s: float):
 _FOLLOW_STOP_S = 160
 
 
+def _check_held(box_id, remote):
+    if remote and remote.get('heldRuns'):
+        from . import allocation
+        raise allocation.Busy(f"{box_id} is held by an unfinished command: {', '.join(remote['heldRuns'])}")
+
+
 def _bring_up(box_id: str, fresh: bool = False, recipe: str | None = None, box_held: bool = False,
               since: float | None = None, stale_error: str | None = None, on_state=None) -> dict:
     from . import outage, prepare
     options = {"on_state": on_state} if on_state is not None else {}
     with prepare.phase("bring_up", box_id), outage.accepted_machine():
         s = api.wait_state(box_id, api.LIVE_STATES, timeout=900, since=since, stale_error=stale_error, **options)
+        _check_held(box_id, s)
         try:
             ssh_sync.setup(box_id)
             ssh_sync.wait_ssh(box_id)
@@ -1028,8 +1035,17 @@ class ResumeProvisionStalled(OffboxError):
         super().__init__(message, outage=home.may_fail_over())
 
 
+def _readiness_get(box_id, *, deadline=None):
+    from . import home
+    try:
+        return api.readiness_get(box_id, deadline=deadline) if deadline is not None else api.readiness_get(box_id)
+    except api.NetworkError as error:
+        return home.recover_slow_read(error, lambda end: api.get(box_id, deadline=end), box=box_id, deadline=deadline)
+
+
 def _wait_unanswered_resume(con, box_id):
-    from . import outage
+    from . import outage, allocation
+    from .pool import PoolBusyError
     seconds = capacity.setting("OFFBOX_RESUME_PROVISION_SECONDS", 300, minimum=1, maximum=900)
     key = f'resume_provision:{box_id}'
     saved = con.execute('SELECT v FROM kv WHERE k=?', (key,)).fetchone()
@@ -1040,6 +1056,7 @@ def _wait_unanswered_resume(con, box_id):
     with outage.accepted_machine():
         network_failures = 0
         while True:
+            allocation.check_queue()
             left = end - time.time()
             budget_left = api.left()
             if budget_left is not None:
@@ -1052,8 +1069,8 @@ def _wait_unanswered_resume(con, box_id):
                 raise ResumeProvisionStalled(f"unanswered resume of {box_id} stayed provisioning for {seconds}s; "
                                              "nothing ran; set aside and trying a new box")
             try:
-                state = api.readiness_get(box_id, deadline=time.time() + left)
-            except (api.BudgetExpired, StartWaitFailed):
+                state = _readiness_get(box_id, deadline=time.time() + left)
+            except (api.BudgetExpired, StartWaitFailed, PoolBusyError):
                 raise
             except OffboxError as error:
                 network_failures = network_failures + 1 if isinstance(error, api.NetworkError) else 0
@@ -1141,7 +1158,7 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
             if left <= 0:
                 break
             try:
-                last = api.readiness_get(box_id, deadline=time.time() + left)
+                last = _readiness_get(box_id, deadline=time.time() + left)
             except (api.BudgetExpired, StartWaitFailed):
                 raise
             except OffboxError as error:
@@ -1257,6 +1274,7 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
 
 def _bring_up_resumed(con, box_id, confirmed, retried, request_resume=None, *, since=None, stale_error=None,
                       skip_archiving=False):
+    _check_held(box_id, confirmed)
     left_stopped = bool(confirmed)
     if confirmed and confirmed.get('state') in api.STARTING_STATES:
         _wait_unanswered_resume(con, box_id)
@@ -1378,6 +1396,8 @@ def _reuse_available(con, row, size, skip_archiving=False, retrying=False, befor
             if p.returncode == 255:
                 ssh_sync.check_host_key(box_id, p.stderr)
             if p.returncode == 0:
+                if api.BACKEND == 'server':
+                    _check_held(box_id, _readiness_get(box_id))
                 ensure_ttl(box_id, max(RUN_TTL_S, idle_for(con, box_id, row["size"])))
                 if pending_grow and not _bigger(pending_grow[0], row['size']):
                     con.execute("DELETE FROM kv WHERE k=?", (f"resize_size:{box_id}",))
@@ -1387,7 +1407,7 @@ def _reuse_available(con, row, size, skip_archiving=False, retrying=False, befor
         ssh_sync.close_master(box_id)
         event(con, box_id, "ssh_master_stale", reason)
     try:
-        s = api.readiness_get(box_id)
+        s = _readiness_get(box_id)
     except api.NetworkError as error:
         if allocation.in_queue() and pending_grow and api.left() is not None and api.left() <= 0:
             raise ArchivingSkip(f"{box_id} status read reached its affinity deadline; waiting in the pool queue",
@@ -1400,6 +1420,7 @@ def _reuse_available(con, row, size, skip_archiving=False, retrying=False, befor
     if s is None or s.get("state") in ("error", "cancelled"):
         forget_box(con, box_id, "lease_gone", f"state={s and s.get('state')}")
         return None
+    _check_held(box_id, s)
     if s.get("dataExpiredAt"):
         _forget_expired(con, box_id, f"boat deleted its data at {s['dataExpiredAt']}")
         return None
@@ -1531,7 +1552,7 @@ def _reuse_available(con, row, size, skip_archiving=False, retrying=False, befor
     elif st in api.LIVE_STATES or st in api.STARTING_STATES:
         try:
             _bring_up(box_id)
-        except (api.BoxBootFailed, BoxNotReady, SshHostKeyMismatch, StartWaitFailed):
+        except (allocation.Busy, allocation.Fenced, api.BoxBootFailed, BoxNotReady, SshHostKeyMismatch, StartWaitFailed):
             raise
         except OffboxError as e:
             raise ResumeUnresolved(f"{box_id} did not become ready; nothing ran: {e}", e) from e
