@@ -1690,8 +1690,9 @@ class Runner:
         self.wait_images = wait_images = needs_image_wait(cmd_text, me["repo_root"])
         t0 = now()
         size, why = lease.auto_size(con, cmd_text, me, a.size)
-        if why:
+        if why and why != getattr(a, '_size_notice', None):
             say(why)
+            a._size_notice = why
         env, explicit = build_env(a.env or [])
         from . import start_check
         claim = start_check.claim_id(con, self.run_id)

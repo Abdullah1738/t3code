@@ -887,16 +887,18 @@ def _create_row(con, me: dict, box_id: str, source: str, base_dir, sz, t, box_he
     con.commit()
     event(con, box_id, "lease_new", f"source={source} size={sz} owner={me['owner']} repo={me['repo_root']}")
     try:
-        _bring_up(box_id, fresh=(source == "fresh"),
-                  recipe=source.split(":", 1)[1] if is_recipe else None, box_held=box_held, since=since)
-        try:
-            api.rename(box_id, box_name(me, me["repo_key"]))
-        except StartWaitFailed:
-            raise
-        except OffboxError:
-            pass
-        if relocating:
-            _relocate_base_checkout(con, box_id, base_dir, rdir, box_held=box_held)
+        from . import outage
+        with outage.accepted_machine():
+            _bring_up(box_id, fresh=(source == "fresh"),
+                      recipe=source.split(":", 1)[1] if is_recipe else None, box_held=box_held, since=since)
+            try:
+                api.rename(box_id, box_name(me, me["repo_key"]))
+            except StartWaitFailed:
+                raise
+            except OffboxError:
+                pass
+            if relocating:
+                _relocate_base_checkout(con, box_id, base_dir, rdir, box_held=box_held)
     except (SshHostKeyMismatch, StartWaitFailed):
         raise
     except api.SupplyOut as e:

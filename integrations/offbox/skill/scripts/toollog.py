@@ -18,10 +18,12 @@ CAP_BYTES = 50 * 1024 * 1024
 NUMBERS = set("bytes files skipped exitCode waitMs queueMs runMs position ttlSeconds reasonLength busy idle stopped count flagsCount envCount pullCount includeCount stepCount attempt pid timeoutSeconds commandLength cmd_bytes step_count".split())
 NUMBERS.update({'command_exit_code', 'wrapper_exit_code', 'disk_attempt', 'client_started_at', 'disk_probe_module_mtime'})
 NUMBERS.update({'leftoverKilled', 'boxRc', 'incusRc', 'cgroupProcessCount'})
+NUMBERS.update({'outageS', 'waitedMs', 'placeBefore', 'placeAfter'})
 NUMBERS.update(f'{fs}_{field}' for fs in ('tmp', 'var_tmp', 'home', 'workspace')
                for field in ('free_bytes', 'size_bytes'))
 BOOLEANS = set("queued killed fresh bg noSync git noFallback noRetry remote failed stale timeoutHit fallback dryRun baseGiven templateGiven sizeGiven".split())
 BOOLEANS.update({'retry', 'rcFilePresent', 'superseded'})
+BOOLEANS.add('deadlineKept')
 ENUMS = {
     "jdk_phase": {"check", "install", "result"},
     "jdk_result": {"pending", "present", "installed", "compiler-missing", "apt-failed"},
@@ -71,7 +73,7 @@ def _ids(values):
 def _props(values):
     out = {}
     for k, v in (values or {}).items():
-        if k in {'leftoverKilled', 'boxRc', 'cgroupProcessCount'} and v is None:
+        if k in {'leftoverKilled', 'boxRc', 'cgroupProcessCount', 'placeBefore', 'placeAfter'} and v is None:
             out[k] = None
         elif k == 'stderrTail' and isinstance(v, str):
             # Only Incus' fixed transport diagnostics belong here, never arbitrary command output.

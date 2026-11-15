@@ -139,6 +139,11 @@ def wait_while_starting(reason, run_id="", *, checkpoint="probe", box=None,
     end = wait_deadline(limit, clock=clock)
     if deadline is not None:
         end = min(end, deadline)
+    from . import allocation, outage
+    if not outage.machine_accepted():
+        queued_left = allocation.queue_left() if allocation.in_queue() else allocation.retry_queue_left()
+        if queued_left is not None:
+            end = min(end, start + queued_left)
     say(f"home offbox server is starting ({phase}); waiting up to {limit:g} s, "
         + (f"keeping {box} and the queue place" if box else "keeping the queue place"))
     outcome = "failover"

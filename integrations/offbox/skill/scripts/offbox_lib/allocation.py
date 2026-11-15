@@ -42,6 +42,7 @@ def recover_resumes(con, key):
 _SCOPE = contextvars.ContextVar("allocation_scope", default=None)
 _HELD = contextvars.ContextVar("allocation_held", default=False)
 _QUEUE = contextvars.ContextVar("allocation_queue", default=None)
+_QUEUE_RETRIES = contextvars.ContextVar("allocation_queue_retries", default=None)
 LOCK_TAKE_S = 30
 
 
@@ -52,19 +53,39 @@ class Busy(OffboxError):
 
 
 @contextlib.contextmanager
+def queue_retries():
+    """Retain a pre-start queue across this CLI invocation's outage retries only."""
+    token = _QUEUE_RETRIES.set({})
+    try:
+        yield
+    finally:
+        _QUEUE_RETRIES.reset(token)
+
+
+@contextlib.contextmanager
 def queue():
-    from . import pool, outage
-    if _QUEUE.get() is not None:
-        yield _QUEUE.get()
-        return
-    wait = pool.wait_seconds()
-    left = outage.allocation_left()
-    if left is not None:
-        wait = min(wait, left)
-    state = {'end': pool.time.monotonic() + wait, 'wait': wait, 'said': False}
+    from . import pool
+    parent = _QUEUE.get()
+    retries = _QUEUE_RETRIES.get() if parent is None else None
+    # Nested callers share the allocation deadline, but each must keep its own FIFO entry.
+    state = {k: parent[k] for k in ('end', 'wait', 'said')} if parent is not None else (
+        retries.get('state') if retries is not None else None)
+    if state is None:
+        wait = pool.wait_seconds()
+        state = {'end': pool.time.monotonic() + wait, 'wait': wait, 'said': False}
     token = _QUEUE.set(state)
     try:
         yield state
+    except OffboxError as error:
+        if retries is not None and getattr(error, 'machine_accepted', False):
+            retries.clear()
+        elif retries is not None and error.outage and not error.started and 'queued_at' in state:
+            state['outage_at'] = pool.time.monotonic()
+            retries['state'] = state
+        raise
+    else:
+        if retries is not None:
+            retries.clear()
     finally:
         _QUEUE.reset(token)
 
@@ -76,6 +97,23 @@ def queue_left():
         return None
     from . import pool
     return max(0, state['end'] - pool.time.monotonic())
+
+
+def retry_queue_left():
+    retries = _QUEUE_RETRIES.get()
+    state = retries.get('state') if retries is not None else None
+    if state is None or state['wait'] == 0:
+        return None
+    from . import pool
+    return max(0, state['end'] - pool.time.monotonic())
+
+
+def check_retry_queue():
+    left = retry_queue_left()
+    if left == 0:
+        from .pool import PoolBusyError
+        raise PoolBusyError("allocation queue timed out; nothing ran", queue_expired=True)
+    return left
 
 
 def check_source():
