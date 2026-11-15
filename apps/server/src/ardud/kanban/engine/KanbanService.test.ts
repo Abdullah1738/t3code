@@ -11143,6 +11143,103 @@ it.effect.each(["evaluator", "script"] as const)(
     }),
 );
 
+it.effect.each(["none", "rejected send", "queued admission"] as const)(
+  "#1483 a wake failure does not skip later card maintenance ($0)",
+  (failure) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        const channel = yield* kanban.createDiscussion(board.id, "Owner waiting", owner);
+        yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Please answer" }]);
+        const ownerEvaluator = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+        yield* setRunStart(fake, ownerEvaluator, true, "2026-10-25T13:00:00.000Z");
+        yield* TestClock.adjust("16 minutes");
+        const packet: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("packet") };
+        for (const title of ["First orphan", "Second orphan"]) {
+          const card = yield* kanban.createCard(
+            board.id,
+            { title, prompt: title, subtasks: [{ owner: "evaluator", text: "Merge" }] },
+            packet,
+          );
+          yield* store.putCard({
+            ...card,
+            stage: "in_review",
+            reviewStep: 1,
+            links: [
+              {
+                kind: "pr",
+                url: "https://example.com/pull/1483",
+                label: null,
+                state: "open",
+                checkedAt: null,
+              },
+            ],
+          });
+        }
+        // Use the dispatcher's stored order so the failure precedes the healthy card.
+        const planned = yield* store.openCards(board.id);
+        assert.lengthOf(planned, 2);
+        const bad = planned[0]!;
+        const good = planned[1]!;
+        const goodEvaluator = yield* kanban.startEvaluator(board.id, {
+          kind: "request",
+          text: "Healthy",
+        });
+        const goodDiscussion = yield* kanban.cardDiscussion(good.id);
+        yield* store.putDiscussion({ ...goodDiscussion, evaluatorThreadId: goodEvaluator });
+        let badEvaluator: ThreadId | undefined;
+        const sql = yield* BoardsDatabase.client;
+        if (failure === "queued admission") {
+          yield* sql`INSERT INTO ardud_kanban_evaluator_spawns (launch_key, board_id, card_id, at)
+            VALUES ('1483:recent', ${board.id}, ${bad.id}, '2026-10-25T13:16:00.000Z')`;
+        } else {
+          badEvaluator = yield* kanban.startEvaluator(board.id, { kind: "request", text: "First" });
+          const discussion = yield* kanban.cardDiscussion(bad.id);
+          yield* store.putDiscussion({ ...discussion, evaluatorThreadId: badEvaluator });
+          if (failure === "rejected send") fake.rejectSends.add(badEvaluator);
+        }
+        const landed = yield* kanban.createCard(
+          board.id,
+          { title: "Landed", prompt: "Landed" },
+          packet,
+        );
+        yield* store.putCard({
+          ...landed,
+          stage: "in_review",
+          reviewStep: 1,
+          links: [
+            {
+              kind: "pr",
+              url: "https://example.com/pull/1484",
+              label: null,
+              state: "merged",
+              checkedAt: null,
+            },
+          ],
+        });
+        yield* kanban.tick;
+        const firstClock = (yield* store.card(bad.id))!.nudgedAt;
+        if (failure === "none") assert.isNotNull(firstClock);
+        else assert.isNull(firstClock);
+        const goodClock = (yield* store.card(good.id))!.nudgedAt;
+        assert.isNotNull(goodClock);
+        assert.strictEqual(yield* ownerWaitsTo(fake, ownerEvaluator), 1);
+        assert.strictEqual((yield* store.card(landed.id))!.stage, "completed");
+        const goodMessages = (yield* Ref.get(fake.threads)).get(goodEvaluator)!.messages.length;
+        if (badEvaluator) fake.rejectSends.delete(badEvaluator);
+        yield* sql`DELETE FROM ardud_kanban_evaluator_spawns WHERE launch_key = '1483:recent'`;
+        yield* kanban.tick;
+        assert.isNotNull((yield* store.card(bad.id))!.nudgedAt);
+        assert.strictEqual((yield* store.card(good.id))!.nudgedAt, goodClock);
+        assert.lengthOf((yield* Ref.get(fake.threads)).get(goodEvaluator)!.messages, goodMessages);
+        assert.strictEqual(yield* ownerWaitsTo(fake, ownerEvaluator), 1);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
 it.effect("#1483 recovery reuses an accepted transition wake after its clock save fails", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

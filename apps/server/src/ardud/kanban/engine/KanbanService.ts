@@ -10944,9 +10944,24 @@ const make = Effect.gen(function* () {
                 )
               )
                 continue;
-              yield* step("reviewEvaluatorStep", wakeReviewedEvaluator(initial.id), initial.id);
-              views.clear();
-              invalidateCards();
+              yield* step(
+                "reviewEvaluatorStep",
+                wakeReviewedEvaluator(initial.id),
+                initial.id,
+              ).pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("kanban reviewed evaluator step wake failed", {
+                    cardId: initial.id,
+                    cause,
+                  }),
+                ),
+                Effect.ensuring(
+                  Effect.sync(() => {
+                    views.clear();
+                    invalidateCards();
+                  }),
+                ),
+              );
             }
             // Evaluator-only steps get one wake; backlog cards are parked and never woken. An evaluator
             // flag means it is waiting outside the board, so there is nothing to do until the
