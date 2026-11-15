@@ -1530,7 +1530,11 @@ interface AnsweredNotice {
   readonly told: ReadonlyArray<string>;
   /** The evaluator whose blocking ask held the card, told first. */
   readonly unblockEvaluator: string | null;
-  readonly resumeThreadId?: ThreadId;
+  readonly resume?: {
+    readonly threadId: ThreadId;
+    readonly moveId: number;
+    readonly startedAt: string | null;
+  };
 }
 
 /**
@@ -4484,14 +4488,18 @@ const make = Effect.gen(function* () {
       text: string,
       note = false,
       key?: string,
+      wake?: Extract<BoardEffect, { readonly kind: "ownerWake" }>,
     ) {
       const seq = (yield* ownerPostSeq) ?? discussion.lastSeq;
-      yield* locks.outside(
-        threads.send({ threadId, text, ...(key ? { key } : {}) }),
-        undefined,
-        false,
-        Effect.succeed(true),
-      );
+      if (wake !== undefined) {
+        if (!(yield* sendOwnerWake(wake))) return yield* discussionOf(discussion.id);
+      } else
+        yield* locks.outside(
+          threads.send({ threadId, text, ...(key ? { key } : {}) }),
+          undefined,
+          false,
+          Effect.succeed(true),
+        );
       const current = yield* discussionOf(discussion.id);
       const progressed = current.participants.some(
         (p) => actorKey(p.actor) === actorKey(actor) && p.lastReadSeq > seq,
@@ -5926,6 +5934,16 @@ const make = Effect.gen(function* () {
     )
       return base;
     const threadId = parked.threadId;
+    const board = yield* boardOf(card.boardId);
+    if (
+      board.archivedAt !== null ||
+      (board.pause !== null &&
+        (!board.pause.keep.includes(card.id) ||
+          (yield* store.cardsByThread(threadId)).some(
+            (other) => !board.pause!.keep.includes(other.id),
+          )))
+    )
+      return base;
     const link = yield* store.threadLink(threadId);
     if (
       link?.role !== "work" ||
@@ -6019,16 +6037,26 @@ const make = Effect.gen(function* () {
         link.startedAt !== wake.startedAt
       )
         return false;
+      const board = yield* boardOf(card.boardId);
+      if (
+        board.archivedAt !== null ||
+        (board.pause !== null &&
+          (yield* store.cardsByThread(wake.threadId)).some(
+            (other) => !board.pause!.keep.includes(other.id),
+          ))
+      )
+        return false;
       const moved = (yield* store.cardEvents(card.id)).findLast((event) => event.kind === "moved");
       return moved?.id === wake.moveId;
     });
-    if (!(yield* current)) return;
+    if (!(yield* current)) return false;
     // The owner scope lets existing departure cleanup revoke an in-flight or queued send.
     yield* sendThread(
       { threadId: wake.threadId, text: wake.text, coalesce: `owner:${wake.cardId}`, key: "effect" },
       undefined,
       current.pipe(Effect.orElseSucceed(() => false)),
     );
+    return yield* current;
   });
 
   const wakeReviewedEvaluator = Effect.fn("KanbanService.wakeReviewedEvaluator")(function* (
@@ -6236,6 +6264,7 @@ const make = Effect.gen(function* () {
       answeredBy._tag === "thread" || answeredBy._tag === "evaluator" ? [answeredBy.threadId] : [],
     );
     let unblockEvaluator: string | null = null;
+    let resume: AnsweredNotice["resume"];
     const unblock =
       card.stage === "needs_owner" &&
       Asks.openBlockingAsk(next) === undefined &&
@@ -6288,11 +6317,17 @@ const make = Effect.gen(function* () {
         movedAt: at,
         updatedAt: at,
       };
-      yield* logEvent(next, answeredBy, "moved", {
+      const moved = yield* logEvent(next, answeredBy, "moved", {
         fromStage: card.stage,
         toStage: stage,
         body: record?.moved ?? (answeredBy._tag === "owner" ? "Owner replied" : "Question dropped"),
       });
+      if (next.stage === "working" && next.activeThreadId !== null)
+        resume = {
+          threadId: next.activeThreadId,
+          moveId: moved.id,
+          startedAt: card.ownerPark?.startedAt ?? null,
+        };
       if (wake && workThread !== null) {
         current = withParticipant(
           current,
@@ -6361,9 +6396,7 @@ const make = Effect.gen(function* () {
       answered,
       told: [...told],
       unblockEvaluator,
-      ...(next.stage === "working" && next.activeThreadId !== null && unblock
-        ? { resumeThreadId: next.activeThreadId }
-        : {}),
+      ...(resume === undefined ? {} : { resume }),
     };
     const deferred = yield* effectSink;
     if (deferred !== undefined && !deferred.closed) {
@@ -6429,20 +6462,19 @@ const make = Effect.gen(function* () {
           if (current.evaluatorThreadId !== null) told.add(current.evaluatorThreadId);
         }
       }
-      if (
-        notice.resumeThreadId !== undefined &&
-        !told.has(notice.resumeThreadId) &&
-        card.activeThreadId === notice.resumeThreadId
-      ) {
+      if (notice.resume !== undefined && !told.has(notice.resume.threadId)) {
         current = yield* deliver(
           current,
-          { _tag: "thread", threadId: notice.resumeThreadId },
+          { _tag: "thread", threadId: notice.resume.threadId },
           "Worker",
-          notice.resumeThreadId,
+          notice.resume.threadId,
           text,
           note,
+          undefined,
+          { kind: "ownerWake", cardId: card.id, ...notice.resume, text },
         );
-        told.add(notice.resumeThreadId);
+        // Obsolete restoration notices must not fall through to an unguarded asker send.
+        told.add(notice.resume.threadId);
       }
       for (const ask of notice.answered) {
         const collapse = ask.by._tag === "evaluator" && evaluatorAskers.has(ask.by.threadId);

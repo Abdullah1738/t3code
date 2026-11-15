@@ -26,6 +26,57 @@ import * as Rules from "./rules.ts";
 const decodeAnalytics = Schema.decodeUnknownEffect(AnalyticsEvent);
 
 it.effect.each(
+  (["answer", "drop", "wake"] as const).flatMap((close) =>
+    (["excluded", "kept", "shared excluded"] as const).map((hold) => ({ close, hold })),
+  ),
+)("a board pause ($hold) gates restoration on $close", ({ close, hold }) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board, card, threadId, worker } = yield* workingCard();
+      if (hold === "shared excluded")
+        yield* kanban.createForThread(threadId, { title: "Held sibling", prompt: "Held sibling" });
+      yield* kanban.askOwner(
+        card.id,
+        { question: "Paused owner resume 1615", blocking: true },
+        worker,
+        "cardThread",
+      );
+      yield* Ref.update(fake.threads, (all) =>
+        new Map(all).set(threadId, {
+          ...all.get(threadId)!,
+          state: "idle",
+          latestStatus: "completed",
+        }),
+      );
+      yield* kanban.pauseBoard(
+        board.id,
+        { reason: "Owner pause", keep: hold === "excluded" ? [] : [card.id] },
+        owner,
+      );
+      const before = (yield* fake.heard(threadId)).length;
+      if (close === "answer")
+        yield* kanban.answerAsk(
+          card.id,
+          "q1",
+          { verdict: "answered", text: "Paused owner resume 1615", revision: 0 },
+          owner,
+        );
+      else if (close === "drop") yield* kanban.changeAsk(card.id, "q1", "drop", owner, "owner");
+      else yield* kanban.cardThread(card.id, "wake", "Paused owner resume 1615", owner);
+      const result = (yield* kanban.card(card.id)).card;
+      assert.equal(result.stage, hold === "kept" ? "working" : "todo");
+      assert.equal(result.activeThreadId, hold === "kept" ? threadId : null);
+      assert.equal((yield* fake.heard(threadId)).length, before + (hold === "kept" ? 1 : 0));
+      assert.isNotNull(askOf(result).closedAt);
+      yield* kanban.dispatchNow;
+      assert.equal((yield* kanban.card(card.id)).card.stage, result.stage);
+      assert.equal((yield* fake.heard(threadId)).length, before + (hold === "kept" ? 1 : 0));
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect.each(
   (["ask", "change"] as const).flatMap((creation) =>
     (["answer", "drop", "wake"] as const).map((close) => ({ creation, close })),
   ),
@@ -538,63 +589,79 @@ it.effect(
     }),
 );
 
-it.effect.each(["stop", "reset"] as const)(
-  "a %s during a restored wake revokes the in-flight owner note",
-  (action) =>
-    Effect.gen(function* () {
-      const fake = yield* makeFake;
-      const entered = yield* Deferred.make<void>();
-      const release = yield* Deferred.make<void>();
-      const interrupted = yield* Deferred.make<void>();
-      const gated = Layer.effect(
-        KanbanThreads,
-        Effect.map(KanbanThreads, (real) =>
-          KanbanThreads.of({
-            ...real,
-            send: (input) =>
-              input.text === "Owner wake 1615"
-                ? Deferred.succeed(entered, undefined).pipe(
-                    Effect.andThen(Deferred.await(release)),
-                    Effect.andThen(
-                      Effect.suspend(() => (input.isStale?.() ? Effect.void : real.send(input))),
-                    ),
-                  )
-                : real.send(input),
-            interrupt: (...args) =>
-              real
-                .interrupt(...args)
-                .pipe(Effect.tap(() => Deferred.succeed(interrupted, undefined))),
-          }),
-        ),
-      ).pipe(Layer.provide(fake.layer));
-      yield* Effect.gen(function* () {
-        const { kanban, card, threadId, worker } = yield* workingCard();
-        yield* kanban.askOwner(
-          card.id,
-          { question: "Choose?", blocking: true },
-          worker,
-          "cardThread",
-        );
-        yield* kanban.cardThread(card.id, "wake", "Owner wake 1615", owner);
-        yield* Deferred.await(entered);
-        yield* kanban.cardThread(card.id, action, "Discard this attachment", owner);
-        assert.equal((yield* kanban.card(card.id)).card.activeThreadId, null);
-        yield* Deferred.succeed(release, undefined);
-        yield* Deferred.await(interrupted);
-        assert.notInclude(yield* fake.heard(threadId), "Owner wake 1615");
-      }).pipe(
-        Effect.provide(
-          testLayer(gated).pipe(
-            Layer.provide(Layer.succeed(KanbanService.OwnerRouteMode, "deferred")),
-          ),
-        ),
+it.effect.each(
+  (["stop", "reset"] as const).flatMap((action) =>
+    (["answer", "drop", "wake"] as const).map((close) => ({ action, close })),
+  ),
+)("$action during restored $close revokes the in-flight owner note", ({ action, close }) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const interrupted = yield* Deferred.make<void>();
+    const gated = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (real) =>
+        KanbanThreads.of({
+          ...real,
+          send: (input) =>
+            input.text.includes("Owner resume revocation 1615")
+              ? Deferred.succeed(entered, undefined).pipe(
+                  Effect.andThen(Deferred.await(release)),
+                  Effect.andThen(
+                    Effect.suspend(() => (input.isStale?.() ? Effect.void : real.send(input))),
+                  ),
+                )
+              : real.send(input),
+          interrupt: (...args) =>
+            real
+              .interrupt(...args)
+              .pipe(Effect.tap(() => Deferred.succeed(interrupted, undefined))),
+        }),
+      ),
+    ).pipe(Layer.provide(fake.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, card, threadId, worker } = yield* workingCard();
+      yield* kanban.askOwner(
+        card.id,
+        { question: "Owner resume revocation 1615", blocking: true },
+        worker,
+        "cardThread",
       );
-    }),
+      if (close === "answer")
+        yield* kanban.answerAsk(
+          card.id,
+          "q1",
+          { verdict: "answered", text: "Owner resume revocation 1615", revision: 0 },
+          owner,
+        );
+      else if (close === "drop") yield* kanban.changeAsk(card.id, "q1", "drop", owner, "owner");
+      else yield* kanban.cardThread(card.id, "wake", "Owner resume revocation 1615", owner);
+      yield* Deferred.await(entered);
+      yield* kanban.cardThread(card.id, action, "Discard this attachment", owner);
+      assert.equal((yield* kanban.card(card.id)).card.activeThreadId, null);
+      yield* Deferred.succeed(release, undefined);
+      yield* Deferred.await(interrupted);
+      assert.isFalse(
+        (yield* fake.heard(threadId)).some((text) => text.includes("Owner resume revocation 1615")),
+      );
+    }).pipe(
+      Effect.provide(
+        testLayer(gated).pipe(
+          Layer.provide(Layer.succeed(KanbanService.OwnerRouteMode, "deferred")),
+        ),
+      ),
+    );
+  }),
 );
 
-it.effect.each(["stop", "reset"] as const)(
-  "a saved restored wake is obsolete after %s across service recreation",
-  (action) =>
+it.effect.each(
+  (["stop", "reset"] as const).flatMap((action) =>
+    (["answer", "drop", "wake"] as const).map((close) => ({ action, close })),
+  ),
+)(
+  "a saved restored $close is obsolete after $action across service recreation",
+  ({ action, close }) =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const directory = yield* fs.makeTempDirectoryScoped({ prefix: "owner-wake-1615-" });
@@ -608,7 +675,7 @@ it.effect.each(["stop", "reset"] as const)(
           KanbanThreads.of({
             ...real,
             send: (input) =>
-              input.text === "Saved owner wake 1615"
+              input.text.includes("Saved owner resume 1615")
                 ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never))
                 : real.send(input),
           }),
@@ -619,11 +686,19 @@ it.effect.each(["stop", "reset"] as const)(
           const { kanban, card, threadId, worker } = yield* workingCard();
           yield* kanban.askOwner(
             card.id,
-            { question: "Choose?", blocking: true },
+            { question: "Saved owner resume 1615", blocking: true },
             worker,
             "cardThread",
           );
-          yield* kanban.cardThread(card.id, "wake", "Saved owner wake 1615", owner);
+          if (close === "answer")
+            yield* kanban.answerAsk(
+              card.id,
+              "q1",
+              { verdict: "answered", text: "Saved owner resume 1615", revision: 0 },
+              owner,
+            );
+          else if (close === "drop") yield* kanban.changeAsk(card.id, "q1", "drop", owner, "owner");
+          else yield* kanban.cardThread(card.id, "wake", "Saved owner resume 1615", owner);
           yield* Deferred.await(entered);
           yield* kanban.cardThread(card.id, action, "Discard this attachment", owner);
           const discussionId = (yield* kanban.cardDiscussion(card.id)).id;
@@ -653,7 +728,11 @@ it.effect.each(["stop", "reset"] as const)(
           const kanban = yield* KanbanService.KanbanService;
           yield* kanban.post(prior.discussionId, owner, [{ _tag: "md", text: "Replay barrier" }]);
           yield* Deferred.await(interrupted);
-          assert.notInclude(yield* fake.heard(prior.threadId), "Saved owner wake 1615");
+          assert.isFalse(
+            (yield* fake.heard(prior.threadId)).some((text) =>
+              text.includes("Saved owner resume 1615"),
+            ),
+          );
         }).pipe(Effect.provide(fileTestLayer(observed, db))),
       );
     }).pipe(Effect.provide(filesLayer)),
