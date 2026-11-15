@@ -1202,11 +1202,14 @@ const make = Effect.gen(function* () {
     const guard = { isStale: () => input.isStale?.() === true };
     const target = yield* getProjectThreadRecords(
       input,
-      input.mode === "restart"
-        ? ["runs", "providerTurns", "providerThreads", "providerSessions"]
-        : ["runs", "providerTurns"],
+      // Queueing never steers an existing run, so its preflight only needs the thread row.
+      input.mode === "queue"
+        ? []
+        : input.mode === "restart"
+          ? ["runs", "providerTurns", "providerThreads", "providerSessions"]
+          : ["runs", "providerTurns"],
     );
-    const steerableRun = latestSteerableRun(target);
+    const steerableRun = input.mode === "queue" ? undefined : latestSteerableRun(target);
     // Replays must reach the orchestrator even after the run finishes or the thread archives.
     const preflightError =
       target.thread.archivedAt !== null
@@ -1337,7 +1340,7 @@ const make = Effect.gen(function* () {
     const projection = yield* getProjectThreadRecords(input, ["runs", "messages", "turnItems"], {
       messageIds: [input.messageId],
       turnItemTypes: ["user_message"],
-    });
+    }).pipe(NodeSqliteClient.backgroundReads);
     const message = projection.messages.find((candidate) => candidate.id === input.messageId);
     const run =
       message?.runId === null || message?.runId === undefined
