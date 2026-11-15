@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import {
-  trackConfirmation, watcherInstance, retiredWatcher, pollingWatcher, heldByMaintenance, loadMaintenance, MAINTENANCE_FILE, validDepends, type Dependency, addStop, editContext, editWatcher, removeWatcher, contactKey, deliver, ensureDirs, family, iso, listIds, loadState, loadWatcher, log, normalize, relayCheck, runCheck,
+  checkWakeRoute, trackConfirmation, watcherInstance, retiredWatcher, pollingWatcher, heldByMaintenance, loadMaintenance, MAINTENANCE_FILE, validDepends, type Dependency, addStop, editContext, editWatcher, removeWatcher, contactKey, deliver, ensureDirs, family, iso, listIds, loadState, loadWatcher, log, normalize, relayCheck, runCheck,
   saveState, sendNotes, type State, type Stop, stopFor, unscopedSender, validId, type Watcher, watcherDir, WATCHERS, withRelayLock, writeJson,
 } from "./lib.ts";
 
@@ -159,22 +159,23 @@ async function main(argv: string[]): Promise<void> {
       if (input.expires_at === undefined) input.expires_at = duration("14d");
       if (values["owner-only"]) input.relays = [];
       if (values["inflight-check"] !== undefined) input.inflight_check = values["inflight-check"];
-      const { watcher, dir, replacingExisting } = withRelayLock(() => {
-        const previous = values.replace && validId(input.id) ? loadWatcher(input.id as string) : undefined;
+      const prepare = () => {
+        const candidate = { ...input };
+        const previous = values.replace && validId(candidate.id) ? loadWatcher(candidate.id as string) : undefined;
         // Flags can't express relays, so a flag --replace keeps the ones the owner already allowed. Stops live
         // outside watcher.json, so no replace can lift one.
-        if (values.json === undefined && previous?.relays && !values["owner-only"]) input.relays = previous.relays;
-        if (values.json === undefined && previous?.inflight_check && values["inflight-check"] === undefined) input.inflight_check = previous.inflight_check;
-        if (values.json === undefined && previous?.timeout_s !== undefined) input.timeout_s = previous.timeout_s;
-        if (values.json === undefined && previous?.pending_check !== undefined) input.pending_check = previous.pending_check;
-        if (values.json === undefined && previous?.depends) input.depends = previous.depends;
-        if (values.json === undefined && previous?.max_consecutive_failures !== undefined) input.max_consecutive_failures = previous.max_consecutive_failures;
-        if (values.json === undefined && previous?.failure_notice_after !== undefined) input.failure_notice_after = previous.failure_notice_after;
-        if (values.json === undefined && previous?.trip) input.trip = previous.trip;
-        if (values.json === undefined && previous?.chat && values.chat === undefined) input.chat = previous.chat;
-        if (values.depends !== undefined) input.depends = values.depends === "none" ? [] : dependencies(values.depends);
+        if (values.json === undefined && previous?.relays && !values["owner-only"]) candidate.relays = previous.relays;
+        if (values.json === undefined && previous?.inflight_check && values["inflight-check"] === undefined) candidate.inflight_check = previous.inflight_check;
+        if (values.json === undefined && previous?.timeout_s !== undefined) candidate.timeout_s = previous.timeout_s;
+        if (values.json === undefined && previous?.pending_check !== undefined) candidate.pending_check = previous.pending_check;
+        if (values.json === undefined && previous?.depends) candidate.depends = previous.depends;
+        if (values.json === undefined && previous?.max_consecutive_failures !== undefined) candidate.max_consecutive_failures = previous.max_consecutive_failures;
+        if (values.json === undefined && previous?.failure_notice_after !== undefined) candidate.failure_notice_after = previous.failure_notice_after;
+        if (values.json === undefined && previous?.trip) candidate.trip = previous.trip;
+        if (values.json === undefined && previous?.chat && values.chat === undefined) candidate.chat = previous.chat;
+        if (values.depends !== undefined) candidate.depends = values.depends === "none" ? [] : dependencies(values.depends);
         let watcher: Watcher;
-        try { watcher = normalize(input as Partial<Watcher> & Record<string, unknown>); } catch (error) { toolError("cli", "watch.invalid_definition", undefined, { stderrClass: "usage_error" }); throw new CliError((error as Error).message); }
+        try { watcher = normalize(candidate as Partial<Watcher> & Record<string, unknown>); } catch (error) { toolError("cli", "watch.invalid_definition", undefined, { stderrClass: "usage_error" }); throw new CliError((error as Error).message); }
         const dir = watcherDir(watcher.id);
         const replacingExisting = existsSync(join(dir, "watcher.json"));
         if (retiredWatcher(watcher.id)) throw new CliError(`Watcher ${watcher.id} was removed; use a new ID`);
@@ -185,15 +186,30 @@ async function main(argv: string[]): Promise<void> {
           if (existing.headsup && values.json === undefined) watcher.headsup = true;
           if (existing.quiet && values.json === undefined) watcher.quiet = existing.quiet;
         }
+        return { watcher, dir, replacingExisting };
+      };
+      const prepared = withRelayLock(prepare);
+      const wakeRoute = await checkWakeRoute(prepared.watcher);
+      if (wakeRoute?.route === "refused") {
+        toolError("cli", "watch.invalid_definition", { watcher: prepared.watcher.id }, { stderrClass: "usage_error" });
+        throw new CliError(wakeRoute.note);
+      }
+      const { watcher, dir, replacingExisting } = withRelayLock(() => {
+        const current = prepare();
+        const { watcher, dir } = current;
+        // A replacement may inherit a chat changed by another process while the route was checked.
+        if (watcher.mode !== prepared.watcher.mode || watcher.chat !== prepared.watcher.chat
+          || watcher.created_by_session !== prepared.watcher.created_by_session) throw new CliError("Watcher route changed during validation; retry add");
         Bun.spawnSync(["/bin/mkdir", "-p", dir]);
         writeJson(join(dir, "watcher.json"), watcher);
         const state = loadState(watcher.id);
         state.next_at = 0;
         saveState(watcher.id, state);
-        return { watcher, dir, replacingExisting };
+        return current;
       });
       log(watcher.id, `${values.replace ? "replaced" : "added"} by ${watcher.created_by_session ?? "unknown session"}`);
       for (const note of sendNotes(watcher)) process.stderr.write(`Note for ${watcher.id}: ${note}.\n`);
+      if (wakeRoute) process.stderr.write(`Note for ${watcher.id}: ${wakeRoute.note}\n`);
       let prime = "";
       // --replace keeps the existing baseline, so don't prime: a real reply landing during a prime run would be
       // recorded as "seen" and never delivered (Dynamic reply swallowed 1 Oct 2026 16:18). New watchers still prime.
@@ -208,7 +224,7 @@ async function main(argv: string[]): Promise<void> {
         log(watcher.id, prime);
       }
       console.log(JSON.stringify({ added: watcher.id, mode: watcher.mode, interval_s: watcher.interval_s, expires_at: watcher.expires_at,
-        max_fires: watcher.max_fires, serial: watcher.serial, dir, prime }, null, 2));
+        max_fires: watcher.max_fires, serial: watcher.serial, dir, prime, ...(wakeRoute ? { wake_route: wakeRoute } : {}) }, null, 2));
       return;
     }
     case "depends": {
@@ -252,7 +268,9 @@ async function main(argv: string[]): Promise<void> {
     case "show": {
       const w = need(positionals[0]);
       const s = loadState(w.id);
-      console.log(JSON.stringify({ watcher: w, state: s, status: statusLabel(w, s), dir: watcherDir(w.id) }, null, 2));
+      const wakeRoute = await checkWakeRoute(w);
+      if (wakeRoute) process.stderr.write(`Note for ${w.id}: ${wakeRoute.route === "refused" ? `wakes go to the owner chat (${wakeRoute.reason}; creator is not a live thread)` : wakeRoute.note}\n`);
+      console.log(JSON.stringify({ watcher: w, state: s, status: statusLabel(w, s), dir: watcherDir(w.id), ...(wakeRoute ? { wake_route: wakeRoute } : {}) }, null, 2));
       if (s.load_timeouts) console.log(`load-timeouts ${s.load_timeouts}`);
       console.log(`--- log (last 20)\n${tail(w.id, 20)}`);
       return;
