@@ -8,7 +8,6 @@ import hashlib
 import json
 import os
 import sqlite3
-import sys
 import traceback
 from pathlib import Path
 import time
@@ -461,33 +460,34 @@ def _clear_queue_rows(con, me, run_id):
 def acquire(me, size=None, template=None, base=None, fresh=False, run_id=None, exclude=None, check_source=None):
     token = _PIN_SKIPS.set(dict(run=run_id, boxes=set()))
     try:
-        try:
-            return _acquire_with_pins(me, size, template, base, fresh, run_id, exclude, check_source)
-        except home.FailbackReady as ready:
-            home.fail_back(ready, sys.argv[1:])
+        return _acquire_with_pins(me, size, template, base, fresh, run_id, exclude, check_source)
     finally:
         _PIN_SKIPS.reset(token)
 
 
 def _acquire_with_pins(me, size, template, base, fresh, run_id, exclude, check_source):
     import toollog
+    handoff = None
     with toollog.span("pool", "run.lease", ids={"run": run_id}, tag="lease_failed") as data:
         started = time.monotonic()
         try:
             row = _acquire_logged(me, size, template, base, fresh, run_id, exclude, check_source)
-        except home.FailbackReady:
-            raise
+        except home.FailbackReady as ready:
+            handoff = ready
+            data["props"]["outcome"] = "ready"
         except BaseException:
             toollog.emit("pool", "run.queue", kind="error", ok=False, duration_ms=(time.monotonic()-started)*1000,
                          ids={"run": run_id}, props={"queued": True, "waitMs": (time.monotonic()-started)*1000}, tag="queue_failed")
             raise
-        data["ids"] = {"run": run_id, "box": row["box_id"]}
-        data["props"]["leaseKind"] = row.pop("_log_lease_kind", "reused")
-        data["props"]["size"] = row.get("size")
-        if data["props"]["leaseKind"] == "reused":
-            from . import lease
-            lease.report_reused_template(me, row, template)
-        return row
+        if handoff is None:
+            data["ids"] = {"run": run_id, "box": row["box_id"]}
+            data["props"]["leaseKind"] = row.pop("_log_lease_kind", "reused")
+            data["props"]["size"] = row.get("size")
+            if data["props"]["leaseKind"] == "reused":
+                from . import lease
+                lease.report_reused_template(me, row, template)
+            return row
+    raise handoff
 
 
 def _acquire_logged(me, size=None, template=None, base=None, fresh=False, run_id=None, exclude=None, check_source=None):
@@ -575,12 +575,12 @@ def _source(key, template, base, fresh):
 
 
 @contextlib.contextmanager
-def _lease_work():
+def _lease_work(*, selected=True):
     from . import allocation, home
     queue = allocation._QUEUE.get()
     started = time.monotonic()
     if queue is not None:
-        if home.failed_over():
+        if selected and home.failed_over():
             home.BOAT_SELECTED.set(True)
         queue["queue_wait_s"] = max(0, started - queue.get("started", queue["end"] - queue["wait"]) - queue.get('log_setup_ms', 0) / 1000)
         home.QUEUE_WAIT.set(queue["queue_wait_s"])
@@ -610,7 +610,7 @@ def _reconcile_pinned(con, row):
     except OffboxError:
         return
     try:
-        with _lease_work(), prepare.guard(bid):
+        with _lease_work(selected=False), prepare.guard(bid):
             try:
                 confirmed, _ = lease._resume_confirmed(con, bid, RUN_TTL_S, None, pending=True, confirm_only=True)
                 if confirmed and confirmed.get('state') in api.STARTING_STATES:

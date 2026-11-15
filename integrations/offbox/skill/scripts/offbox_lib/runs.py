@@ -3282,7 +3282,8 @@ def _run_remote(a, rn) -> int:
                     rn.source_gone(e)
                 elif e.code == EXIT_LOCAL:
                     finish(rn.run_id, EXIT_LOCAL, "local_error")
-                elif not os.environ.get(BACKGROUND_RUN_ENV):
+                elif not os.environ.get(BACKGROUND_RUN_ENV) and not (
+                        os.environ.get(home.RETURNED_HOME_ENV) and home.unreachable(e)):
                     finish(rn.run_id, None, "busy" if e.code == EXIT_BUSY else "infra")
             if not isinstance(e, common.SourceGone):
                 rn.record(error=str(e)[:500])

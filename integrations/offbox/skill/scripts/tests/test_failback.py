@@ -4,6 +4,9 @@ import io
 import os
 from pathlib import Path
 import sqlite3
+import inspect
+import json
+import threading
 import sys
 import types
 import unittest
@@ -39,6 +42,11 @@ class FailbackTests(Isolated):
         self.stack.enter_context(contextlib.redirect_stderr(self.output))
         self.events = self.stack.enter_context(patch('toollog.emit'))
 
+    def acquire_through_cli(self):
+        args = cli.build_parser().parse_args(['run', '--', 'true'])
+        with patch.object(cli, '_remote_once', side_effect=lambda *a: pool.acquire(self.me, run_id='mine')):
+            return cli._run_with_retries(args, self.me)
+
     def full_pool(self):
         for bid in ('one', 'two'):
             self.box(bid, member=True)
@@ -67,7 +75,7 @@ class FailbackTests(Isolated):
         with patch.object(home, 'probe', side_effect=probe), patch.object(os, 'execve', side_effect=SystemExit) as execute, \
                 patch.object(lease, 'acquire_private') as acquire, patch.object(sys, 'argv', ['offbox.py', 'run', '--', 'true']):
             with self.assertRaises(SystemExit):
-                pool.acquire(self.me, run_id='mine')
+                self.acquire_through_cli()
         self.assertEqual([t for t, _ in checks], [1030, 1060])
         self.assertTrue(all(k == dict(timeout=3., wait=False) for _, k in checks))
         self.assertEqual(execute.call_args.args[1][2:], ['run', '--', 'true'])
@@ -121,7 +129,7 @@ class FailbackTests(Isolated):
         with patch.object(home, 'probe', side_effect=lambda **kw: None if self.clock.t >= 8200 else 'down'), \
                 patch.object(home, 'fail_back', side_effect=SystemExit) as back:
             with self.assertRaises(SystemExit):
-                pool.acquire(self.me, run_id='mine')
+                self.acquire_through_cli()
         self.assertEqual(back.call_args.args[0].waited, 7200)
         self.assertEqual(self.con.execute('SELECT COUNT(*) FROM pool_waiters').fetchone()[0], 0)
 
@@ -208,7 +216,7 @@ class FailbackTests(Isolated):
         with patch.object(pool, 'file_lock', side_effect=lock), patch.object(home, 'probe', return_value=None), \
                 patch.object(home, 'fail_back', side_effect=SystemExit):
             with self.assertRaises(SystemExit):
-                pool.acquire(self.me, run_id='mine')
+                self.acquire_through_cli()
         self.assertEqual(self.con.execute('SELECT COUNT(*) FROM pool_waiters').fetchone()[0], 0)
 
     def test_no_outage_budget_clamps_failover_queue(self):
@@ -305,6 +313,108 @@ class FailbackTests(Isolated):
                 self.assertIn('server says it cannot take runs', first)
                 self.assertIn('this run goes to Boat instead', first)
 
+    def test_returned_foreground_outage_keeps_the_same_row_pending(self):
+        self.pending()
+        self.con.execute("UPDATE runs SET mode='fg' WHERE run_id='mine'")
+        args = cli.build_parser().parse_args(['run', '--', 'true'])
+        seen = []
+        def start(runner):
+            runner.register_pending()
+            runner.require_pending(self.con)
+            seen.append(runner.run_id)
+            if len(seen) == 1:
+                raise common.OffboxError('home down', outage=True, run_id=runner.run_id)
+            raise SystemExit('pending again')
+        with patch.dict(os.environ, {home.RETURNED_HOME_ENV: 'outage', home.RUN_ID_ENV: 'mine'}), \
+                patch.object(home, 'active', return_value=True), patch.object(runs.Runner, 'start', start), \
+                patch.object(cli.time, 'sleep'):
+            with self.assertRaisesRegex(SystemExit, 'pending again'):
+                cli._run_with_retries(args, self.me)
+        self.assertEqual(seen, ['mine', 'mine'])
+        row = self.con.execute("SELECT * FROM runs WHERE run_id='mine'").fetchone()
+        self.assertEqual(row['status'], 'starting')
+        self.assertEqual(runs.restore_run_state(row)['status'], 'starting')
+
+    def test_background_handoff_unwinds_old_runner_before_acknowledging_child(self):
+        self.full_pool()
+        self.pending()
+        args = cli.build_parser().parse_args(['run', '--bg', '--', 'true'])
+        def start(runner):
+            runner.register_pending()
+            pool.acquire(self.me, run_id=runner.run_id)
+        def handoff(*args):
+            self.assertFalse({'_run_attempt', '_run_remote'} & {f.function for f in inspect.stack()})
+            self.con.execute("UPDATE runs SET client_pid=? WHERE run_id='mine'", (os.getpid()+1000,))
+            raise KeyboardInterrupt  # pending signal delivered after the child accepts the handoff
+        with patch.dict(os.environ, {runs.BACKGROUND_RUN_ENV: 'mine'}), \
+                patch.object(runs.Runner, 'start', start), patch.object(home, 'probe', return_value=None), \
+                patch.object(home, 'fail_back', side_effect=handoff):
+            self.assertEqual(runs.background_client(args, self.me), 130)
+        self.assertEqual(self.con.execute("SELECT status FROM runs WHERE run_id='mine'").fetchone()[0], 'starting')
+
+    def test_pinned_box_observation_does_not_disable_return(self):
+        with allocation.queue(), patch.object(lease, '_resume_confirmed', return_value=(None, None)):
+            pool._reconcile_pinned(self.con, {'box_id': 'unrelated'})
+        self.assertFalse(home.BOAT_SELECTED.get())
+        self.full_pool()
+        with patch.object(home, 'probe', return_value=None), patch.object(home, 'fail_back', side_effect=SystemExit):
+            with self.assertRaises(SystemExit):
+                self.acquire_through_cli()
+        failures = [c for c in self.events.call_args_list if c.args[:2] == ('pool', 'run.lease')
+                    and (c.kwargs.get('ok') is False or c.kwargs.get('tag'))]
+        self.assertEqual(failures, [])
+
+    def test_opposite_handoffs_serialize_before_taking_database_writers(self):
+        self.pending('down')
+        boat_path = common.DB_PATH
+        home_path = Path(self.tmp.name) / 'opposite-home.sqlite'
+        with contextlib.closing(sqlite3.connect(home_path)) as con, con:
+            common.ensure_schema(con)
+            con.execute("INSERT INTO runs(run_id,status) VALUES ('up','starting')")
+        entered, attempted, release = threading.Event(), threading.Event(), threading.Event()
+        forward, lock = home._forward_queued, common.file_lock
+        errors = []
+        def transfer(*args):
+            try:
+                home._forward_background(*args)
+            except BaseException as error:
+                errors.append(error)
+        def queued(*args):
+            if args[0] == 'up':
+                entered.set()
+                if not release.wait(5):
+                    raise AssertionError('test did not release first handoff')
+            forward(*args)
+        @contextlib.contextmanager
+        def locking(name, **kwargs):
+            if threading.current_thread().name == 'down':
+                attempted.set()
+            with lock(name, **kwargs):
+                yield
+        with patch.object(common, 'DB_PATH', home_path), \
+                patch.object(common, 'db_path_for', side_effect=lambda b: home_path if b == 'server' else boat_path), \
+                patch.object(home, '_forward_queued', side_effect=queued), patch.object(common, 'file_lock', locking):
+            up = threading.Thread(target=transfer, args=('up', 'server', 'boat'))
+            down = threading.Thread(name='down', target=transfer, args=('down', 'boat', 'server'))
+            up.start()
+            try:
+                self.assertTrue(entered.wait(5))
+                down.start()
+                self.assertTrue(attempted.wait(5))
+            finally:
+                release.set()
+                up.join(5)
+                if down.ident:
+                    down.join(5)
+            self.assertFalse(up.is_alive() or down.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(self.con.execute("SELECT status,error FROM runs WHERE run_id='down'").fetchone()[:],
+                         ('forwarded', 'server'))
+        with contextlib.closing(sqlite3.connect(home_path)) as con:
+            self.assertEqual(con.execute("SELECT status,error FROM runs WHERE run_id='up'").fetchone(),
+                             ('forwarded', 'boat'))
+            self.assertEqual(con.execute("SELECT status FROM runs WHERE run_id='down'").fetchone()[0], 'starting')
+
     def test_routing_is_first_line_for_preflight_and_post_time_ids(self):
         for run_id in ('preflight', 'post'):
             with self.subTest(run_id=run_id), patch.dict(os.environ, {home.ROUTING_ENV: '[]'}):
@@ -324,9 +434,32 @@ class BoundedProbeTests(unittest.TestCase):
                     patch.object(home, 'begin_transient'), patch.object(home, 'note_home_answer'), \
                     patch.object(home, 'wait_while_starting') as wait, patch.object(home, 'tcp_connects') as tcp:
                 self.assertEqual(home.probe(timeout=3, wait=False) is None, ready)
-                read.assert_called_once_with(3)
+                read.assert_called_once_with(3, bounded=True)
                 wait.assert_not_called()
                 tcp.assert_not_called()
+
+    def test_body_read_is_bounded_by_an_overall_deadline(self):
+        wall = [1000.]
+        class Response:
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+            def read(self):
+                wall[0] += 4  # a drip-fed body can outlast the per-socket timeout
+                return b'{"ok": true}'
+        with patch.object(home, 'health_url', return_value='http://fixture/health'), \
+                patch.object(api, '_open', return_value=Response()), patch.object(api, '_shut_at'), \
+                patch.object(api.time, 'time', side_effect=lambda: wall[0]):
+            self.assertIn('TimeoutError', home._health(3, bounded=True))
+
+    def test_failback_analytics_fields_survive_serialization(self):
+        import toollog
+        record = toollog._props({'reason': 'home unreachable', 'ok': False, 'waited_s': 7200,
+                                 'outcome': 'boat_box'}, name='backend.failback')
+        self.assertEqual(record, {'reason': 'home unreachable', 'ok': False, 'waited_s': 7200,
+                                  'outcome': 'boat_box'})
+        self.assertNotIn('reason', toollog._props({'reason': 'home unreachable'}, name='run.request'))
 
 
 if __name__ == '__main__':

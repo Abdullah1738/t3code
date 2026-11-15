@@ -268,6 +268,9 @@ def _run_with_wait_budget(a, me) -> int:
                     capacity_round = time.monotonic()
                 with outage.allocation_budget(remaining):
                     return _remote_once(a, me)
+            except home.FailbackReady as ready:
+                # Runner signal handlers and all queue/box scopes must unwind before transferring to a new client.
+                return home.fail_back(ready, getattr(a, "argv", None) or sys.argv[1:])
             except OffboxError as e:
                 if home.active() and os.environ.get(home.RETURNED_HOME_ENV) and home.unreachable(e):
                     # This invocation already left Boat's queue once. Remain at home through subsequent outages.

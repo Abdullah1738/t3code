@@ -280,7 +280,7 @@ def _health_reason(data):
 
 def _probe(timeout: float = PROBE_TIMEOUT_S, *, wait: bool = True) -> str | None:
     start = time.monotonic()
-    data = _health(timeout)
+    data = _health(timeout) if wait else _health(timeout, bounded=True)
     if timed_out(data) or starting_phase(data):
         begin_transient(began=start)
     classification = "good" if isinstance(data, dict) and data.get("ok") is True else "hard"
@@ -311,15 +311,22 @@ def _probe(timeout: float = PROBE_TIMEOUT_S, *, wait: bool = True) -> str | None
     return None if isinstance(data, dict) and data.get("ok") is True else _health_reason(data)
 
 
-def _health(timeout: float = PROBE_TIMEOUT_S):
+def _health(timeout: float = PROBE_TIMEOUT_S, *, bounded=False):
     """One GET /health (no token): its JSON body or a short transport failure reason."""
     url = health_url()
     if not url:
         return "no home server configured"
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, headers={"Accept": "application/json"}),
-                                    timeout=timeout) as r:
-            d = json.loads(r.read() or b"{}")
+        request = urllib.request.Request(url, headers={"Accept": "application/json"})
+        if bounded:
+            from . import api
+            scope = api.RequestScope(timeout, network_timeout=True)
+            with scope.active(), scope.request():
+                with api._open(request, timeout=timeout) as response:
+                    d = json.loads(api._read_response(response, scope.end) or b"{}")
+        else:
+            with urllib.request.urlopen(request, timeout=timeout) as r:
+                d = json.loads(r.read() or b"{}")
     except urllib.error.HTTPError as e:
         return f"health answered HTTP {e.code}"
     except (OSError, ValueError) as e:
@@ -642,6 +649,12 @@ def fail_over(reason: str, argv: list[str], run_id: str = "", *, explicit_base: 
 
 def _forward_background(run_id: str, source_backend="server", target_backend="boat") -> None:
     """Publish a queued ID at its destination before retiring the source; followers use status/error to route."""
+    # Opposite transfers share this lock so neither can hold one DB writer while waiting for the other.
+    with common.file_lock("backend-handoff", timeout=30):
+        _forward_queued(run_id, source_backend, target_backend)
+
+
+def _forward_queued(run_id, source_backend, target_backend):
     source = common.db() if source_backend == "server" and target_backend == "boat" else sqlite3.connect(
         common.db_path_for(source_backend), isolation_level=None)
     source.row_factory = sqlite3.Row
