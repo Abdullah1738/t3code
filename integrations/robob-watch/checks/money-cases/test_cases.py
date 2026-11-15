@@ -2749,6 +2749,78 @@ class UnmatchedCharges(Base):
 
 
 class CheckBudget(Base):
+    def test_follow_redacts_repeated_text_once_without_batching_cursor_commits(self):
+        from collections import Counter
+        now = at('2026-10-25T12:00')
+        for count in (1, 8, 32):
+            with self.subTest(questions=count):
+                self.data = self.tmp / str(count)
+                self.seed([now - dt.timedelta(days=3, hours=n) for n in range(count)])
+                result = {'verdict': 'unverified', 'why': 'fixture unavailable', 'errors': ['fixture unavailable']}
+                visited = []
+
+                def source(charge, when, *args, **kwargs):
+                    # The cursor must already be durable before the external lookup.
+                    saved = mc.load_questions(self.data)
+                    visited.append(saved['follow_cursor']['id'])
+                    self.assertEqual(mc.parse_time(saved['follow_cursor']['at']), when)
+                    return result
+
+                stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+                with patch.object(mc.charges, 'explain', source), \
+                        patch.object(mc, 'write_json', wraps=mc.write_json) as write, \
+                        patch.object(mc, 'redact', wraps=mc.redact) as redact:
+                    with mc.follow_timing(stats):
+                        mc.follow(self.data, now, self.root, find=finder(), said=nobody, stats=stats)
+                self.assertEqual(len(set(visited)), count)
+                writes = Counter(call.args[0].name for call in write.call_args_list)
+                # One durable cursor per attempted lookup and one final result commit.
+                self.assertEqual(writes, {'questions.json': count + 1})
+                self.assertEqual(stats['writes_n'], count + 1)
+                calls = Counter(call.args[0] for call in redact.call_args_list)
+                self.assertEqual(calls[ALERT], 1)
+                self.assertEqual(calls['q-budget0'], 1)
+
+    def test_follow_redaction_cache_matches_uncached_writes_and_expires_on_interrupt(self):
+        rows = ['password: fixture123!', 'OTP: 123456', 'received € — 東京', 'ordinary text']
+        now = at('2026-10-25T12:00')
+        original = self.seed([now - dt.timedelta(days=3, hours=n) for n in range(3)])
+        original['questions'][0]['notes'] = [{'text': text} for text in rows]
+        changed = json.loads(json.dumps(original))
+        changed['questions'][0]['notes'][0]['text'] = 'password: changed456!'
+        snapshots = [original, changed, original]
+        expected = [(json.dumps(mc.redact_all(book), ensure_ascii=False, indent=1) + '\n').encode()
+                    for book in snapshots]
+        stats = {}
+        with patch.object(mc, 'redact', wraps=mc.redact) as redact:
+            with self.assertRaises(mc.CheckTimeout):
+                with mc.follow_timing(stats):
+                    for snapshot, fresh in zip(snapshots, expected):
+                        with mc.Locked(self.data, 'questions') as book:
+                            book.update(snapshot)
+                        self.assertEqual((self.data / 'questions.json').read_bytes(), fresh)
+                    raise mc.CheckTimeout('interrupted')
+            self.assertEqual(sum(call.args[0] == 'password: changed456!'
+                                 for call in redact.call_args_list), 1)
+            def original_calls():
+                return sum(call.args[0] == rows[0] for call in redact.call_args_list)
+            before = original_calls()
+            mc.redact_all(original)
+            self.assertEqual(original_calls() - before, 1)
+            with mc.follow_timing({}):
+                before = original_calls()
+                mc.redact_all(original)
+                self.assertEqual(original_calls() - before, 1)
+        self.assertEqual(original['questions'][0]['notes'][0]['text'], rows[0])
+
+    def test_follow_redaction_cache_has_a_fixed_entry_limit(self):
+        with mc.follow_timing({}):
+            for n in range(8200):
+                text = f'ordinary fixture text {n}'
+                self.assertEqual(mc.redact_all(text), mc.redact(text))
+            self.assertEqual(mc._REDACTION_CACHE.get().cache_info().currsize, 8192)
+        self.assertIsNone(mc._REDACTION_CACHE.get())
+
     def test_follow_rotates_across_budgeted_runs_even_with_the_same_timestamp(self):
         now = at('2026-10-25T12:00')
         self.seed([now - dt.timedelta(days=3, hours=n) for n in range(5)])

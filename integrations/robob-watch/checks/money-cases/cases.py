@@ -108,7 +108,7 @@ ORDER_RESERVE = 12
 ORDER_SCREEN_BUDGET = 1
 FOLLOW_STEPS = ('merchants', 'order_charges', 'payments', 'questions', 'refunds',
                 'owner_threads', 'msgs', 'receipt', 'lookups', 'order_screen', 'census', 'loads', 'writes', 'locks')
-TIMING_KEYS = tuple(name + '_ms' for name in FOLLOW_STEPS) + ('msgs_max_ms', 'follow_ms', 'untimed_ms')
+TIMING_KEYS = tuple(name + '_ms' for name in FOLLOW_STEPS) + ('msgs_max_ms', 'follow_ms', 'untimed_ms', 'writes_n')
 FOLLOW_EACH = 6  # at most this many of them per question, least recently checked first
 DONT_ASK = 3
 # The runner clips an event at 6,000 characters; cases past this limit wait for the next check.
@@ -311,10 +311,13 @@ def redact(text):
     return LABELLED.sub('[secret removed]', text)
 
 
+_REDACTION_CACHE = contextvars.ContextVar('money_cases_redaction_cache', default=None)
+
+
 def redact_all(obj):
     """Redact every string in a stored row, so show and list --json print a hand-edited book safely."""
     if isinstance(obj, str):
-        return redact(obj)
+        return (_REDACTION_CACHE.get() or redact)(obj)
     if isinstance(obj, list):
         return [redact_all(x) for x in obj]
     if isinstance(obj, dict):
@@ -677,9 +680,14 @@ def follow_timing(stats):
     started = time.monotonic()
     before = sum(stats.get(name + '_ms', 0) for name in FOLLOW_STEPS)
     token = charges.TIMING_STATS.set(stats)
+    # Cursor commits revisit the same immutable text; retain every durability checkpoint.
+    cache = functools.lru_cache(maxsize=8192)(redact)
+    redaction_token = _REDACTION_CACHE.set(cache)
     try:
         yield
     finally:
+        _REDACTION_CACHE.reset(redaction_token)
+        cache.cache_clear()
         charges.TIMING_STATS.reset(token)
         stats['follow_ms'] = round((time.monotonic() - started) * 1000)
         accounted = sum(stats.get(name + '_ms', 0) for name in FOLLOW_STEPS) - before
@@ -705,7 +713,11 @@ else:
 @admitted_check
 def write_json(path, obj, timing=None):
     with charges.step_timing(None, 'writes'):
-        return atomic_write_json(path, obj, timing)
+        result = atomic_write_json(path, obj, timing)
+        stats = charges.TIMING_STATS.get()
+        if stats is not None:
+            stats['writes_n'] = stats.get('writes_n', 0) + 1
+        return result
 
 
 def load(data=None):
