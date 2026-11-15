@@ -121,6 +121,29 @@ const decodeThreadListCursor = Effect.fn("ControlHttp.decodeThreadListCursor")(f
   );
 });
 
+const decodeUserMessageCursorJson = Schema.decodeEffect(ThreadListCursorJson, {
+  onExcessProperty: "error",
+});
+const encodeUserMessageCursorJson = Schema.encodeSync(ThreadListCursorJson);
+
+const decodeUserMessageCursor = Effect.fn("ControlHttp.decodeUserMessageCursor")(function* (
+  value: string | null,
+) {
+  if (value === null) return null;
+  const text = yield* Effect.try({
+    try: () => {
+      if (value.length > 8192 || !/^[A-Za-z0-9_-]+$/.test(value)) throw new Error();
+      const bytes = Buffer.from(value, "base64url");
+      if (bytes.toString("base64url") !== value) throw new Error();
+      return bytes.toString("utf8");
+    },
+    catch: () => fail("invalid_request", "cursor must be a valid user message cursor."),
+  });
+  return yield* decodeUserMessageCursorJson(text).pipe(
+    Effect.mapError(() => fail("invalid_request", "cursor must be a valid user message cursor.")),
+  );
+});
+
 const afterThreadListCursor = (
   shell: OrchestrationV2ThreadShell,
   cursor: ThreadListCursor | null,
@@ -1207,6 +1230,49 @@ const makeRoutes = Effect.gen(function* () {
     return json({ ok: true, identity });
   });
 
+  const listUserMessages = Effect.gen(function* () {
+    yield* authenticate(AuthOrchestrationReadScope);
+    const params = yield* searchParams;
+    const since = parseSince(params.get("since"));
+    if (since === undefined || Math.abs(since) > 8_640_000_000_000_000) {
+      return yield* fail(
+        "invalid_request",
+        "since must be an ISO timestamp or epoch milliseconds.",
+      );
+    }
+    const cursor = yield* decodeUserMessageCursor(params.get("cursor"));
+    return yield* ReplyBuilders.bounded(
+      Effect.gen(function* () {
+        const page = yield* store
+          .userMessagesSince({
+            since,
+            cursor,
+            limit: clampInt(params.get("limit"), 200, 1000),
+          })
+          .pipe(
+            Effect.mapError((cause) =>
+              NodeSqliteClient.readerLaneFailure(cause) !== undefined
+                ? fail("unavailable", READER_BUSY_MESSAGE)
+                : fail("internal", errorDetail(cause)),
+            ),
+          );
+        return json({
+          ok: true,
+          total: page.total,
+          messages: page.messages.map(({ message, ...thread }) => ({
+            ...messageSummary(message),
+            ...thread,
+          })),
+          nextCursor:
+            page.next === null
+              ? null
+              : Buffer.from(encodeUserMessageCursorJson(page.next)).toString("base64url"),
+        });
+      }).pipe(NodeSqliteClient.foregroundReads),
+      "poll",
+    );
+  });
+
   const getMessages = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
     const threadId = yield* param("threadId");
@@ -1901,6 +1967,7 @@ const makeRoutes = Effect.gen(function* () {
     route("GET", `${p}/projects`, handle(listProjects.pipe(NodeSqliteClient.foregroundReads))),
     route("GET", `${p}/models`, handle(listModels)),
     route("GET", `${p}/usage`, handle(listUsage)),
+    route("GET", `${p}/messages`, handle(listUserMessages)),
     route("GET", `${p}/threads`, handle(listThreads)),
     route("POST", `${p}/threads`, handle(createThread)),
     route("GET", `${p}/threads/by-native/:sessionId`, handle(byNative)),
