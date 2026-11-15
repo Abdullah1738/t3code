@@ -175,6 +175,73 @@ describe("Analytics", () => {
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 
+  it.effect(
+    "keeps repeatedly drained mixes equivalent to disk rebuilds for every cached filter",
+    () =>
+      Effect.gen(function* () {
+        const setup = yield* fixture;
+        let scans = 0;
+        const tracked = FileSystem.FileSystem.of({
+          ...setup.fs,
+          stream: (file, options) => {
+            if (file.endsWith(".ndjson")) scans++;
+            return setup.fs.stream(file, options);
+          },
+        });
+        const analytics = yield* open(setup, {}, tracked);
+        const filters: AnalyticsReadInput[] = [
+          { day },
+          { day, boardId: "board-a" },
+          { day, kind: "kanban.hot" },
+          { day, boardId: "board-a", kind: "kanban.hot" },
+          { day, cardId: "card-a" },
+          { day, tool: "card_get" },
+          { day, outcome: "error" },
+          { day, responseDelivery: "finished" },
+        ];
+        for (const filter of filters) yield* readSamples(analytics, filter);
+        const before = scans;
+        for (let batch = 0; batch < 6; batch++) {
+          const events = Array.from({ length: 320 }, (_, index) =>
+            event({
+              kind:
+                index < 150
+                  ? ["kanban.hot", "ask.created", "performance.long-task", `client.k${index}`][
+                      index % 4
+                    ]!
+                  : "kanban.hot",
+              // Equal and out-of-order timestamps exercise ties and eviction in full groups.
+              ts: DateTime.formatIso(
+                DateTime.subtract(DateTime.makeUnsafe(ts), {
+                  milliseconds: (index * 17 + batch) % 7,
+                }),
+              ),
+              boardId: index % 2 ? "board-a" : "board-b",
+              cardId: index % 3 ? "card-a" : `batch-${batch}-${index}`,
+              tool: index % 3 ? "card_get" : "card_move",
+              outcome: index % 2 ? "error" : "ok",
+              responseDelivery: "finished",
+            }),
+          );
+          for (let start = 0; start < events.length; start += 100)
+            yield* analytics.ingest({ events: events.slice(start, start + 100) });
+          yield* analytics.flush;
+          for (const filter of filters) yield* readSamples(analytics, filter);
+        }
+        assert.equal(scans, before);
+        const rebuilt = yield* open(setup);
+        for (const filter of filters) {
+          const warm = yield* analytics.read({ ...filter, limit: 500 });
+          const cold = yield* rebuilt.read({ ...filter, limit: 500 });
+          assert.deepEqual(
+            yield* readSamples(analytics, filter),
+            yield* readSamples(rebuilt, filter),
+          );
+          assert.deepEqual(warm.rollup, cold.rollup);
+        }
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("reads tick phases and lifecycle rollups together and persists the complete day", () =>
     Effect.gen(function* () {
       const setup = yield* fixture;
