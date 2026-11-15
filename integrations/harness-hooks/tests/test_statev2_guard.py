@@ -3217,6 +3217,33 @@ class ConfigDirectoryDatabaseNamesTests(unittest.TestCase):
                 self.assert_source(f'const p = {value};\n'
                                    'open(join(homedir(), ".robob", "userdata", path.basename(p)));', SCRIPT)
 
+    def test_config_name_reuse_in_protected_cwd(self):
+        roots = (self.root / '.robob/userdata', self.root / '.robob/userdata/archive',
+                 self.root / 'robob-data/userdata', self.root / '.local/share/opencode',
+                 self.root / 'opencode-data', Path.home() / '.t3/userdata')
+        for root in roots:
+            if root.is_relative_to(self.root):
+                root.mkdir(parents=True, exist_ok=True)
+        alias = self.root / 'alias'
+        alias.symlink_to(roots[0], target_is_directory=True)
+        roots += (alias,)
+        imports = ('import path from "node:path";\n'
+                   'const { DatabaseSync } = await import("node:sqlite");\n')
+        for operand in ('"~/.config/mytool/state.sqlite"',
+                        'join(homedir(), ".config", "mytool", "state.sqlite")',
+                        '["state.sqlite"].map(n => join(homedir(), ".config", "mytool", n))[0]'):
+            source = imports + f'const p = {operand};\nnew DatabaseSync(path.basename(p));\n'
+            script = self.root / 'reuse.mjs'
+            script.write_text(source)
+            for cwd in roots:
+                with self.subTest(operand=operand, cwd=cwd):
+                    self.assertEqual(guard.classify_detail('node ' + shlex.quote(str(script)), str(cwd)), (SCRIPT, None))
+                    stdin = "node - <<'JS'\n" + source + 'JS'
+                    self.assertEqual(guard.classify_detail(stdin, str(cwd)), (READ, None))
+                    self.assertEqual(guard.classify_detail('bash -c ' + shlex.quote(stdin), str(cwd)), (READ, None))
+            with self.subTest(operand=operand, cwd='isolated'):
+                self.assertEqual(guard.classify_detail('node ' + shlex.quote(str(script)), str(self.root)), (None, None))
+
 
 class LiveDatabaseGuardTests(unittest.TestCase):
     def setUp(self):

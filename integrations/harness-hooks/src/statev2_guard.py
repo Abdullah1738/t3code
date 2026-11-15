@@ -1538,9 +1538,13 @@ def _replica_reader_source(source):
     return source
 
 
-def _strip_config_dir_db_names(source):
+def _strip_config_dir_db_names(source, directory):
     # A tool's own ~/.config/<tool>/state.sqlite deny list is not Robob's live state.
     if 'state.sqlite' not in source or '.config' not in source:
+        return source
+    # A config basename may still be opened relative to the live working directory.
+    if directory is not None and any(LIVE.search(str(Path(directory).resolve() / name))
+                                     for name in ('state.sqlite', 'statev2.sqlite', 'opencode.db')):
         return source
     string = r'''(?:"[^"\\\n]*"|'[^'\\\n]*')'''
     database = r'''(?:"state\.sqlite(?:-(?:wal|shm|journal))?"|'state\.sqlite(?:-(?:wal|shm|journal))?')'''
@@ -1583,7 +1587,7 @@ def _strip_config_dir_db_names(source):
 def _source_hit(source, directory, python=False, shell=False):
     # Inspect the original body, including literals/comments, never its path or argv.
     discount_foreign = not PROTECTED_SOURCE_TOKEN.search(source)
-    foreign_source = _strip_config_dir_db_names(source) if not python else source
+    foreign_source = _strip_config_dir_db_names(source, directory) if not python else source
     if discount_foreign and 'state.sqlite' in foreign_source and _foreign_reader_shadowed(source):
         return True
     # Keep the root evidence so the replica cannot hide a second database name.
@@ -2914,7 +2918,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
 
     def scan_child(source, directory, depth):
         # The shell walker cannot prove how a local reader rewrites its argument.
-        if 'state.sqlite' in _strip_config_dir_db_names(source) and _foreign_reader_shadowed(source):
+        if 'state.sqlite' in _strip_config_dir_db_names(source, directory) and _foreign_reader_shadowed(source):
             check_source(source, directory, rule='live-database-read')
         previous = {name: set(values) for name, values in script_values.items()}
         previous_fresh = set(fresh_variables)
