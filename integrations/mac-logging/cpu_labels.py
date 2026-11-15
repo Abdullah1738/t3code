@@ -1,8 +1,17 @@
-"""Process labels only; argv is never retained in state or emitted."""
+"""Bounded process labels and redacted spike commands; no argv in state."""
 from pathlib import Path
 import re
 import shlex
 import sys
+
+SYSTEM_ROOTS = ('/System/', '/usr/libexec/', '/usr/sbin/', '/usr/bin/', '/sbin/', '/Library/Apple/')
+SECRET_LABEL = re.compile(r'(?i)(password|secret|credential|token[=: ]|cookie|bearer |sk-|ghp_|github_pat_|xox[baprs]-)')
+
+
+class SystemFamily(str):
+    # Preserve provenance until the logger: long Apple executable basenames
+    # otherwise look like opaque credentials to the shared argv redactor.
+    pass
 
 
 def janitor_redact(value):
@@ -19,14 +28,40 @@ def janitor_redact(value):
 
 
 def family(command):
+    if ('/Users/' in command or '/home/' in command or str(Path.home()) in command
+            or command.startswith('~') or SECRET_LABEL.search(command)):
+        return '[redacted]'
     name = Path(command).name
     if re.fullmatch(r'[Pp]ython(?:\d+(?:\.\d+)*)?', name):
         return 'python'
     if name.startswith('mds'):
         return 'mds*'
+    if command.startswith(SYSTEM_ROOTS) and '..' not in Path(command).parts:
+        return SystemFamily(name)
     # Nested helper bundles have their own basename (including Renderer/GPU).
     bundle = re.findall(r'/([^/]+)\.app/', command)
-    return bundle[-1] if bundle else name
+    try:
+        return janitor_redact(bundle[-1] if bundle else name)
+    except (ImportError, OSError):
+        return '[redacted]'
+
+
+def command_label(args):
+    # The shared argv helper does not cover short cookie values or curl's
+    # overloaded short auth flags. Check before opaque-token redaction can
+    # erase the flag/header name but leave a short credential behind.
+    if (SECRET_LABEL.search(args)
+            or re.search(r'(?:^|[/\s\"\x27])curl\b', args)
+            and re.search(r'''(?:^|[\s"'])(?:-(?!-)[^\s]*[uUb]|--(?:proxy-)?user\b)''', args)):
+        return '[redacted]'
+    try:
+        value = janitor_redact(args)
+    except (ImportError, OSError):
+        return None
+    # Redact before truncation, including paths inside quoted/inline programs.
+    value = value.replace(str(Path.home()), '~')
+    value = re.sub(r'/(?:Users|home)/[^\s/\"\x27]+', '~', value)
+    return ''.join(c if c.isprintable() else ' ' for c in value)[:160]
 
 
 def script_hint(args):
