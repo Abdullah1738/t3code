@@ -3154,6 +3154,26 @@ class ConfigDirectoryDatabaseNamesTests(unittest.TestCase):
                            args=('send --text x', 'react --target X --kind like'))
         self.assert_source("// The bridge's own deny list.\n" + self.deny_list())
 
+    def test_bridge_deny_lists_from_thread_roots(self):
+        roots = ('/Users/ardud/.robob/imessage', '/Users/ardud/.robob/chats',
+                 '/Users/ardud/.robob/scratch', '/Users/ardud/.robob/projects/personal-finance',
+                 '/Users/ardud', '/Volumes/ExternalSSD/t3code-fork')
+        script = self.root / 'cli.ts'
+        for tool, parameter, args in (
+            ('telegram-bridge', 'item', ('notify --text x', '--help')),
+            ('spectrum-bridge', 'name', ('send --text x', 'react --target X --kind like')),
+        ):
+            source = self.IMPORTS + self.deny_list(json.dumps(tool), parameter)
+            script.write_text(source)
+            for cwd in roots:
+                for argv in args:
+                    with self.subTest(tool=tool, cwd=cwd, argv=argv):
+                        self.assertEqual(guard.classify_detail(f'bun {shlex.quote(str(script))} {argv}', cwd),
+                                         (None, None))
+                with self.subTest(tool=tool, cwd=cwd, stdin=True):
+                    self.assertEqual(guard.classify_detail("node - <<'JS'\n" + source + 'JS', cwd),
+                                     (None, None))
+
     def test_direct_config_database_operands(self):
         for home in ('homedir()', 'os.homedir()'):
             for join in ('join', 'path.join', 'resolve'):
