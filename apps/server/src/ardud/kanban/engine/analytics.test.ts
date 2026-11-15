@@ -3,6 +3,11 @@ import { reasonClass, elapsed, label } from "./analytics.ts";
 
 describe("board analytics privacy", () => {
   it.each([
+    ["Stale queued runs on the thread", "stale_queued_runs"],
+    ["Run went silent twice", "run_silent"],
+    ["No project set for this card", "missing_project"],
+    ["Thread model differs from card model: private", "thread_model_differs"],
+    ["Review verdict refused: private", "verdict_refused"],
     ["Variant unavailable for private model", "variant_unavailable"],
     ["Provider blocked the response: private prompt", "provider_blocked"],
     ["Interrupted by owner", "interrupted"],

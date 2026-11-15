@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { join } from "node:path";
 import { redact } from "../src/redact.ts";
+import { SUBPROCESS_TEST_TIMEOUT_MS } from "./subprocess-timeout.ts";
 import { urlRedactionCases } from "./url-redaction-cases.ts";
 import { useToolLogFixture } from "./toollog-fixture.ts";
 
@@ -22,4 +23,4 @@ test("URL matrix stays masked through CLI, API, delivery, and the final Telegram
   });
   expect(result.exitCode, result.stderr.toString()).toBe(0);
   expect(JSON.parse(result.stdout.toString()).cases).toBe(urlRedactionCases.length);
-});
+}, SUBPROCESS_TEST_TIMEOUT_MS);

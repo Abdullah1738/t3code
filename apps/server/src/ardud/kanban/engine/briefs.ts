@@ -9,7 +9,7 @@ import {
 } from "@t3tools/contracts";
 
 import { reviewRetryNote } from "./retries.ts";
-import { MAX_BATCH } from "./rules.ts";
+import { MAX_BATCH, workerWorkDone } from "./rules.ts";
 import { REVIEW_DELEGATION_GUIDANCE } from "./reviewerRouting.ts";
 import { pendingWakeNote, subtaskIds, subtaskLines, wakeLead } from "./subtasks.ts";
 
@@ -32,7 +32,12 @@ const cardFacts = (card: KanbanCard, goal: KanbanGoal | null) =>
 const LINKS_LINE =
   "- Links: to point at a card, write [#12 Title](t3-context://v1/kanban-card/<card id>), or kanban-discussion/<discussion id> for a discussion; the owner sees a chip. One may reach you like that, or as [Kanban card: #12 Title; ref=<card id>] (card_get, discussion_read). A thread is a plain [title](t3-thread://v1/<thread id>) link (t3_thread_read).";
 
-export const workBrief = (board: KanbanBoard, card: KanbanCard, goal: KanbanGoal | null) =>
+export const workBrief = (
+  board: KanbanBoard,
+  card: KanbanCard,
+  goal: KanbanGoal | null,
+  comments: ReadonlyArray<string> = [],
+) =>
   lines(
     `You are the worker for a card on the "${board.name}" Missions board.`,
     "",
@@ -41,9 +46,13 @@ export const workBrief = (board: KanbanBoard, card: KanbanCard, goal: KanbanGoal
     "Task:",
     card.prompt.trim() || card.description.trim() || card.title,
     pendingWakeNote(card) ? `\nWaiting for this card:\n${pendingWakeNote(card)}` : null,
+    card.workThreadId
+      ? `\nPrevious work thread: ${card.workThreadId} (t3_thread_read for earlier context).`
+      : null,
+    comments.length > 0 ? `\nCard comments and handoff notes:\n${comments.join("\n\n")}` : null,
     "",
     "How the board works:",
-    '- Your card tools: card_get, card_search, card_update, card_move, card_ask, card_flag, subtask_done, discussion_post, wiki_read, report_bug, evaluator_start (kind "request" only).',
+    '- Your card tools: card_get, card_search, card_update, card_move, card_ask, card_flag, subtask_done, discussion_post, wiki_read, report_bug, evaluator_start (kind "request" only). The ones that change things work only on your own cards. If your task says to post on or change another card, put what you have in your own card (card_update or its discussion) and leave carrying it over to the evaluator.',
     '- If a tool, CLI or Robob itself fails you, use a workaround and keep going, then call report_bug with boardId "robob", a short title, and evidence (error text, run ids, log paths). Pass cardHint (for example "#722") only when you know the bug\'s card on that board (any stage until it is settled); never your own card\'s number. It appends a sighting to a known or strong match and starts a request evaluator for uncertain or new bugs.',
     card.subtasks.length > 0
       ? "- Subtasks are the card's plan. Do the worker's subtasks of the step the card is on, and mark each with subtask_done (done with a short note, or skipped with why). The card can't go to needs_review while one is open. Later steps come back to you after the review if they are yours; the evaluator's and the reviewer's aren't yours to do."
@@ -299,7 +308,7 @@ export const nightlyBrief = (
   lines(
     `You run the nightly review of the "${board.name}" Missions board (boardId ${board.id}). Treat its tool as a product built for the owner.`,
     `Read and follow this board's instructions:\n${JSON.stringify(board.instructions)}`,
-    "Read the last 24 hours through paged calls, each small enough to read whole: board_activity first (each ask's minutes from asked to answered, review rounds and verdicts per card, time in each stage, stalls, run failures by model, thread restarts, cards left without a thread, slot use per hour); then board_get with since set to 24 hours ago for one short row per card active in the window, settled cards included (follow board.page.nextAfter with after while hasMore); card_get for the cards worth a closer look (latest 20 events; events {before: olderEvents} pages back); discussions and owner messages with discussion_read and limit: 40 (use the supplied discussion IDs; earlierBefore pages older messages). Quote ask-to-answer times and review rounds from board_activity. Read the wiki with wiki_read. Skim t3_thread_read for card threads active in this window; do not read whole transcripts. Read every log and analytics source available for this board's tool. On Robob use analytics_read; tool boards use their tool's own logs. If a source or read tool is unavailable, record that information gap, never invent evidence.",
+    "Read the last 24 hours through paged calls, each small enough to read whole: board_activity first (each ask's minutes from asked to answered, review rounds and verdicts per card, time in each stage, stalls, run failures by model, thread restarts, cards left without a thread, slot use per hour); then board_get with since set to 24 hours ago for one short row per card active in the window, settled cards included (follow board.page.nextAfter with after while hasMore); card_get for the cards worth a closer look (latest 20 events; events {before: olderEvents} pages back); discussions and owner messages with discussion_read and limit: 40 (use the supplied discussion IDs; earlierBefore pages older messages). Quote ask-to-answer times and review rounds from board_activity. Read the wiki with wiki_read. Skim t3_thread_read for card threads active in this window; do not read whole transcripts. Read every log and analytics source available for this board's tool. On Robob use analytics_read for the summary and section index, then fetch section by name and follow cursor with the same filters while hasMore; tool boards use their tool's own logs. If a source or read tool is unavailable, record that information gap, never invent evidence.",
     "Complete the read pass before filing findings. Start board_get without after (or after: 0); only use nextAfter returned by the preceding page for this same board and since. Keep since unchanged while paging, and continue until hasMore is false; a full page is not the whole day. Do not choose a starting card number or skip early cards. Read every supplied active discussion through the window, and skim each active card thread. wiki_read without a slug returns only the index: read the pages relevant to this review by slug or slugs. Keep calls and transcript excerpts small, but do not turn this review into a skim to save calls.",
     "For a transient read failure (ECONNRESET, timeout or connection reset), retry the same read once before calling the source unavailable; continue the other reads either way. If board_activity or since is unsupported on the running build, fall back to board_get without since, starting at after: 0 and paging to hasMore false, then use card_get histories for the window. Record the unsupported tool or argument as an information gap. A failed wiki read must not end the board, discussion or thread reads.",
     "Do the following in order:",
@@ -323,9 +332,9 @@ export const evaluatorBrief = (board: KanbanBoard, purpose: EvaluatorPurpose) =>
         "What you can do:",
         "- Read everything: board_get, card_search (cards by words or #number, settled ones too), card_get, discussions, the wiki, the cards' threads (t3_thread_read), past sessions (recall), the web, Dia for logged-in pages.",
         "- Cards: card_create, card_edit, card_move (any stage except working/in_review, which the dispatcher owns), card_flag, comments and links.",
-        "- Asking the owner: card_ask puts a question on a card; it shows in his Needs Owner list and the card's discussion, and his answer comes back to you. Async by default: the card and its thread go on. Make it blocking (blocking on card_ask, or card_ask_change later) only when nothing can move until he answers; the card then waits in Needs Owner and goes back where it was with his answer. Give options when the answers are known (an approval: Approve, Change, Drop). The owner can make an async ask blocking himself, and drop asks. Drop your own asks with card_ask_change once they no longer matter.",
+        "- Asking the owner: card_ask puts a question on a card; it shows in his Needs Owner list and the card's discussion, and his answer comes back to you. Async by default: the card and its thread go on. Make it blocking (blocking on card_ask, or card_ask_change later) only when nothing can move until he answers; the card then waits in Needs Owner and goes back where it was with his answer. Give options when the answers are known (an approval: Approve, Change, Drop) and set approves on the go option to the gated subtask ids it clears. The owner can make an async ask blocking himself, and drop asks. Drop your own asks with card_ask_change once they no longer matter.",
         "- Parking a card: card_wait says what a card with no running thread waits on (push, merge, ci, card, time, owner_go, or a board script's check), and the board wakes whoever is next when it ends. Use it instead of a stalled flag or a 'waiting for X' comment. Use a script wait when a program can check the thing and no built-in fits (a Linear issue's state, a deploy): name the script and pass args. Use a time wait with a recheck note only when nothing can check it for you, and set the next one when woken. If the same recheck comes up twice, ask for a script.",
-        "- Packets: a card's prompt is all its work thread gets, and the cheapest model may write the code from it. So every card you create gets a tight packet as its prompt: what to do and why, what you read for it (sessions, PRs, the code, the architecture) boiled down, the files and functions to touch, the steps, the tests to add or run, and when it's done. Detailed enough that the writer never has to guess or go looking. Cards a thread or a script makes start with your packet subtask: read what they point at, rewrite the prompt with card_edit, add the plan, then mark it done.",
+        "- Packets: a card's prompt is all its work thread gets, and the cheapest model may write the code from it. So every card you create gets a tight packet as its prompt: what to do and why, what you read for it (sessions, PRs, the code, the architecture) boiled down, the files and functions to touch, the steps, the tests to add or run, and when it's done. Detailed enough that the writer never has to guess or go looking. Cards a thread or a script makes start with your packet subtask: read what they point at, rewrite the prompt with card_edit, add the plan, then mark it done. A work thread can change and post only on its own cards (the server refuses the rest), so a packet never tells it to post on, tick, move or edit another card; make that an evaluator subtask.",
         "- Subtasks: every card you create, on your own or because the owner asked, gets its plan as subtasks (subtasks on card_create), so nobody has to guess what comes next. Lay out the whole flow: the work, its review, and what follows, such as merge and deploy, telling whoever reported it, updating linked tickets or pinging someone, a read-back. Leave out what isn't needed. Same step means any order. Add or change subtasks with card_edit when you learn more or the owner asks; give a plan to any card that has none. Anything outward (a message, a Linear or ticket update, a merge or deploy) is always an evaluator subtask, never the worker's. Do the evaluator's subtasks of the step a card is on and mark them with subtask_done; the dispatcher leaves a card alone while its step is only yours, and you are told when a card's step becomes yours. A subtask follows every other rule: if the board says a message needs the owner's approval, ask him with card_ask (blocking, with options); his answer comes back to you, and the card goes back where it was. The subtask stays open until it's sent. A card reaches verified only when every subtask is done or skipped.",
         "- Pick order: the dispatcher takes todo cards by priority (a card holding up a more urgent one counts as that urgent), then the one holding up the most other cards, and never a blocked one. Set each card's priority yourself, 1 (urgent) to 4 (low), and blockedBy from what it waits on.",
         "- Backlog: priority 5 is never picked up, and a card with a thread is paused there until it leaves. Move a card into the backlog, or out of it, only when the owner asks.",
@@ -336,18 +345,18 @@ export const evaluatorBrief = (board: KanbanBoard, purpose: EvaluatorPurpose) =>
         "- Discussions: discussion_create opens a channel, discussion_post writes to any discussion (markdown, collapse, html, choice, card blocks).",
         '- Reporter updates: one evaluator owns each card\'s reporter notifications. Before sending "fixed" or "workarounds no longer needed", read the card back and check the installed fix live; send only when its stage is deployed or verified. For each destination thread, check the card history for the same text, then use t3_thread_send with a stable clientRequestId made from the card id, destination thread id and hash of the exact text. Record each send on the card; never send the same text to the same thread twice.',
 
-    LINKS_LINE,
-    "- Shared lessons: wiki_read, wiki_write. Write down what future evaluators should know.",
-    "",
-    board.instructions.modelRouting.trim()
-      ? `Model routing:\n${board.instructions.modelRouting.trim()}\n`
-      : null,
-    REVIEW_DELEGATION_GUIDANCE,
-    board.instructions.escalation.trim()
-      ? `When to ask the owner:\n${board.instructions.escalation.trim()}\n`
-      : null,
-    "The owner never moves cards to In Review or Working himself and does not message threads directly. Ask him only through a discussion or a Needs Owner card.",
-  );
+        LINKS_LINE,
+        "- Shared lessons: wiki_read, wiki_write. Write down what future evaluators should know.",
+        "",
+        board.instructions.modelRouting.trim()
+          ? `Model routing:\n${board.instructions.modelRouting.trim()}\n`
+          : null,
+        REVIEW_DELEGATION_GUIDANCE,
+        board.instructions.escalation.trim()
+          ? `When to ask the owner:\n${board.instructions.escalation.trim()}\n`
+          : null,
+        "The owner never moves cards to In Review or Working himself and does not message threads directly. Ask him only through a discussion or a Needs Owner card.",
+      );
 
 /** Steer text for an owner message delivered to a card or evaluator thread. */
 export const ownerMessageText = (discussionTitle: string, discussionId: string, text: string) =>
@@ -396,7 +405,14 @@ export const nudgeWorkText = (cards: ReadonlyArray<KanbanCard>) => {
   return lines(
     instruction,
     ...cards.map((card) =>
-      lines(`Card #${card.number}:`, pendingWakeNote(card), subtaskLines(card)),
+      lines(
+        `Card #${card.number}:`,
+        workerWorkDone(card)
+          ? "Your work subtasks are done; card_move needs_review now. If a board call fails, say so in card_update and flag the card."
+          : null,
+        pendingWakeNote(card),
+        subtaskLines(card),
+      ),
     ),
   );
 };

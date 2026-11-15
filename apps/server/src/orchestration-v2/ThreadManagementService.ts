@@ -46,6 +46,8 @@ import {
   type TurnItemId,
 } from "@t3tools/contracts";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import { McpCall } from "../ardud/analytics/McpCall.ts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { threadTranscriptHeader } from "@t3tools/shared/threadTranscript";
 import { runningBackgroundWork } from "../ardud/context-reset/backgroundWork.ts";
@@ -71,6 +73,18 @@ import { projectTurnItemForDetail } from "./WireProjection.ts";
 import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
 import * as SendAcknowledgement from "../ardud/orchestration/ThreadSendAcknowledgement.ts";
 import * as ServerSettings from "../serverSettings.ts";
+
+const isDispatchError = Schema.is(Orchestrator.OrchestratorDispatchError);
+const afterPreflightWrites = <E>(cause: E, writesSaved: boolean) =>
+  writesSaved && isDispatchError(cause) && cause.preflightReaderLane === "foreground"
+    ? new Orchestrator.OrchestratorDispatchError({
+        commandId: cause.commandId,
+        commandType: cause.commandType,
+        preflightReaderLane: "foreground",
+        preflightWritesSaved: true,
+        cause: cause.cause,
+      })
+    : cause;
 
 export type ThreadManagementSendMode = "auto" | "queue" | "steer" | "restart";
 
@@ -394,6 +408,7 @@ export interface ThreadManagementServiceShape {
   }) => Effect.Effect<OrchestrationV2ThreadProjection, ThreadManagementError>;
   readonly listActiveThreadIds: Orchestrator.OrchestratorV2["Service"]["listActiveThreadIds"];
   readonly getShellSnapshot: (options?: {
+    readonly summaryOnly?: boolean;
     readonly location?: "active" | "archive";
     /** Only these threads, read with one indexed IN list (control live lists). */
     readonly threadIds?: ReadonlyArray<string>;
@@ -423,7 +438,10 @@ export interface ThreadManagementServiceShape {
     readonly projectId: ProjectId;
     readonly commandId: CommandId;
     readonly instanceId: ProviderInstanceId;
-  }) => Effect.Effect<void, ThreadManagementProviderInstanceDisabledError>;
+  }) => Effect.Effect<
+    void,
+    ThreadManagementProviderInstanceDisabledError | Orchestrator.OrchestratorDispatchError
+  >;
   readonly isProviderInstanceEnabledForProject: (input: {
     readonly projectId: ProjectId;
     readonly instanceId: ProviderInstanceId;
@@ -597,7 +615,21 @@ const make = Effect.gen(function* () {
   const assertProviderInstanceEnabled: ThreadManagementServiceShape["assertProviderInstanceEnabled"] =
     (input) =>
       receipts.getByCommandId(input.commandId).pipe(
-        Effect.orElseSucceed(() => Option.none()),
+        Effect.catch((cause) =>
+          Effect.gen(function* () {
+            if (
+              (yield* NodeSqliteClient.ReaderLane) !== "foreground" ||
+              NodeSqliteClient.readerLaneFailure(cause) === undefined
+            )
+              return Option.none();
+            return yield* new Orchestrator.OrchestratorDispatchError({
+              commandId: input.commandId,
+              commandType: "provider enablement pre-check",
+              preflightReaderLane: "foreground",
+              cause,
+            });
+          }),
+        ),
         Effect.flatMap((receipt) =>
           Option.isSome(receipt)
             ? Effect.void
@@ -633,7 +665,7 @@ const make = Effect.gen(function* () {
   const ensureLegacyTranscript = Effect.fn(
     "orchestrationV2.threadManagement.ensureLegacyTranscript",
   )(function* (threadId: ThreadId) {
-    yield* legacyImporter.ensureTranscript(threadId).pipe(
+    return yield* legacyImporter.ensureTranscript(threadId).pipe(
       Effect.tapError((cause) =>
         Effect.logWarning("Unable to hydrate migrated v1 thread transcript", {
           threadId,
@@ -657,19 +689,26 @@ const make = Effect.gen(function* () {
   const ensureCommandTranscripts = Effect.fn(
     "orchestrationV2.threadManagement.ensureCommandTranscripts",
   )(function* (command: OrchestrationV2ServerCommand) {
-    yield* Effect.forEach(
-      existingThreadIdsForCommand(command),
-      (threadId) => ensureLegacyTranscript(threadId),
-      { discard: true },
+    const imports = yield* Effect.forEach(existingThreadIdsForCommand(command), (threadId) =>
+      ensureLegacyTranscript(threadId),
     ).pipe(
       Effect.mapError(
         (cause) =>
           new Orchestrator.OrchestratorDispatchError({
             commandId: command.commandId,
             commandType: command.type,
+            ...((command.type === "message.dispatch" ||
+              command.type === "delegated_task.request") &&
+            cause.operation === "check transcript readiness for" &&
+            NodeSqliteClient.readerLaneFailure(cause) !== undefined
+              ? { preflightReaderLane: "foreground" as const }
+              : {}),
             cause,
           }),
       ),
+    );
+    return imports.some(
+      (result) => result.importedThreadCount > 0 || result.importedMessageCount > 0,
     );
   });
 
@@ -721,26 +760,53 @@ const make = Effect.gen(function* () {
       Effect.andThen(orchestrator.getThreadSnapshotWindow(threadId, options)),
     );
 
+  const foregroundPreflight = Effect.fn("orchestrationV2.threadManagement.foregroundPreflight")(
+    function* <A, E, R>(command: OrchestrationV2ServerCommand, read: Effect.Effect<A, E, R>) {
+      const call = yield* Effect.serviceOption(McpCall);
+      if (Option.isSome(call)) call.value.readerLane = "foreground";
+      return yield* read.pipe(
+        NodeSqliteClient.foregroundReads,
+        Effect.mapError((cause) => {
+          if (isDispatchError(cause)) return cause;
+          if (NodeSqliteClient.readerLaneFailure(cause) === undefined) return cause;
+          return new Orchestrator.OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            preflightReaderLane: "foreground",
+            cause,
+          });
+        }),
+      );
+    },
+  );
+
   const assertDispatchTargetEnabled = (command: OrchestrationV2ServerCommand) => {
+    // Empty fields reads one thread row by primary key, without history or lineage traversal.
     switch (command.type) {
       case "message.dispatch":
-        return orchestrator.getThreadRecords(command.threadId, []).pipe(
-          Effect.flatMap((projection) =>
-            assertProviderInstanceEnabled({
-              projectId: projection.thread.projectId,
-              commandId: command.commandId,
-              instanceId: (command.modelSelection ?? projection.thread.modelSelection).instanceId,
-            }),
+        return foregroundPreflight(
+          command,
+          orchestrator.getThreadRecords(command.threadId, []).pipe(
+            Effect.flatMap((projection) =>
+              assertProviderInstanceEnabled({
+                projectId: projection.thread.projectId,
+                commandId: command.commandId,
+                instanceId: (command.modelSelection ?? projection.thread.modelSelection).instanceId,
+              }),
+            ),
           ),
         );
       case "delegated_task.request":
-        return orchestrator.getThreadRecords(command.parentThreadId, []).pipe(
-          Effect.flatMap((parent) =>
-            assertProviderInstanceEnabled({
-              projectId: parent.thread.projectId,
-              commandId: command.commandId,
-              instanceId: command.modelSelection.instanceId,
-            }),
+        return foregroundPreflight(
+          command,
+          orchestrator.getThreadRecords(command.parentThreadId, []).pipe(
+            Effect.flatMap((parent) =>
+              assertProviderInstanceEnabled({
+                projectId: parent.thread.projectId,
+                commandId: command.commandId,
+                instanceId: command.modelSelection.instanceId,
+              }),
+            ),
           ),
         );
       default:
@@ -748,21 +814,28 @@ const make = Effect.gen(function* () {
     }
   };
 
-  const dispatchUnchanged = (
-    command: OrchestrationV2ServerCommand,
-    options?: Orchestrator.OrchestratorDispatchOptions,
-  ) =>
-    ensureCommandTranscripts(command).pipe(
-      Effect.andThen(assertDispatchTargetEnabled(command)),
-      Effect.andThen(
-        SendAcknowledgement.waitingOn(
-          orchestrator.dispatch(command, options),
-          command.type === "message.dispatch"
-            ? `message command admission for thread ${command.threadId}`
-            : "command dispatch",
+  const dispatchUnchanged = Effect.fn("orchestrationV2.threadManagement.dispatchUnchanged")(
+    function* (
+      command: OrchestrationV2ServerCommand,
+      options?: Orchestrator.OrchestratorDispatchOptions,
+    ) {
+      const writesSaved = yield* command.type === "message.dispatch" ||
+      command.type === "delegated_task.request"
+        ? foregroundPreflight(command, ensureCommandTranscripts(command))
+        : ensureCommandTranscripts(command);
+      return yield* assertDispatchTargetEnabled(command).pipe(
+        Effect.andThen(
+          SendAcknowledgement.waitingOn(
+            orchestrator.dispatch(command, options),
+            command.type === "message.dispatch"
+              ? `message command admission for thread ${command.threadId}`
+              : "command dispatch",
+          ),
         ),
-      ),
-    );
+        Effect.mapError((cause) => afterPreflightWrites(cause, writesSaved)),
+      );
+    },
+  );
 
   const dispatchWithSelectionMigration = Effect.fn(
     "orchestrationV2.threadManagement.dispatchWithSelectionMigration",
@@ -784,12 +857,15 @@ const make = Effect.gen(function* () {
             new Orchestrator.OrchestratorDispatchError({
               commandId: command.commandId,
               commandType: command.type,
+              ...(NodeSqliteClient.readerLaneFailure(cause) !== undefined
+                ? { preflightReaderLane: "foreground" as const }
+                : {}),
               cause,
             }),
         ),
       );
     const receipt = yield* SendAcknowledgement.waitingOn(
-      readReceipt(receipts.getByCommandId(command.commandId)),
+      foregroundPreflight(command, readReceipt(receipts.getByCommandId(command.commandId))),
       `command receipt read for thread ${command.threadId}`,
     );
     if (Option.isSome(receipt))
@@ -798,7 +874,7 @@ const make = Effect.gen(function* () {
         `message replay dispatch for thread ${command.threadId}`,
       );
     const projectReceipt = yield* SendAcknowledgement.waitingOn(
-      readReceipt(receipts.getProjectByCommandId(command.commandId)),
+      foregroundPreflight(command, readReceipt(receipts.getProjectByCommandId(command.commandId))),
       `project command receipt read for thread ${command.threadId}`,
     );
     if (Option.isSome(projectReceipt))
@@ -807,160 +883,173 @@ const make = Effect.gen(function* () {
         `message replay dispatch for thread ${command.threadId}`,
       );
 
-    yield* SendAcknowledgement.waitingOn(
-      ensureCommandTranscripts(command),
+    let writesSaved = yield* SendAcknowledgement.waitingOn(
+      foregroundPreflight(command, ensureCommandTranscripts(command)),
       `transcript readiness for thread ${command.threadId}`,
     );
 
-    if (options.cutoverComplete && command.modelSelection !== undefined) {
-      const reason = postCutoverSelectionProblem(command.modelSelection);
-      // ardud: idle threads keep their OpenCode selection until their next turn, and the composer
-      // sends the thread's own selection explicitly. That is the inherited case; migrate it below.
-      const ownSelection =
-        reason !== null &&
-        options.migrate &&
-        modelSelectionsEqual(
-          command.modelSelection,
-          (yield* orchestrator.getThreadRecords(command.threadId, [])).thread.modelSelection,
-        );
-      if (reason !== null && !ownSelection) {
-        return yield* new Orchestrator.OrchestratorCommandRejectedError({
-          commandId: command.commandId,
-          commandType: command.type,
-          cause: reason,
-        });
+    return yield* Effect.gen(function* () {
+      if (options.cutoverComplete && command.modelSelection !== undefined) {
+        const reason = postCutoverSelectionProblem(command.modelSelection);
+        // ardud: idle threads keep their OpenCode selection until their next turn, and the composer
+        // sends the thread's own selection explicitly. That is the inherited case; migrate it below.
+        const ownSelection =
+          reason !== null &&
+          options.migrate &&
+          modelSelectionsEqual(
+            command.modelSelection,
+            (yield* foregroundPreflight(
+              command,
+              orchestrator.getThreadRecords(command.threadId, []),
+            )).thread.modelSelection,
+          );
+        if (reason !== null && !ownSelection) {
+          return yield* new Orchestrator.OrchestratorCommandRejectedError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: reason,
+          });
+        }
       }
-    }
-    if (!options.migrate) return yield* dispatchUnchanged(command, options);
+      if (!options.migrate) return yield* dispatchUnchanged(command, options);
 
-    const projection = yield* SendAcknowledgement.waitingOn(
-      orchestrator.getThreadRecords(command.threadId, []),
-      `provider selection read for thread ${command.threadId}`,
-    );
-    const stored = projection.thread.modelSelection;
-    const requested = command.modelSelection ?? stored;
-    const canonicalize = (selection: ModelSelection) => {
-      const ids = new Set<string>();
-      for (const option of selection.options ?? []) {
-        if (ids.has(option.id))
+      const projection = yield* SendAcknowledgement.waitingOn(
+        foregroundPreflight(command, orchestrator.getThreadRecords(command.threadId, [])),
+        `provider selection read for thread ${command.threadId}`,
+      );
+      const stored = projection.thread.modelSelection;
+      const requested = command.modelSelection ?? stored;
+      const canonicalize = (selection: ModelSelection) => {
+        const ids = new Set<string>();
+        for (const option of selection.options ?? []) {
+          if (ids.has(option.id))
+            return {
+              kind: "conflict" as const,
+              reason: `Option ${option.id} occurs more than once.`,
+            };
+          ids.add(option.id);
+        }
+        const merged = mergeSelection(selection, {});
+        if (merged.kind === "conflict") return merged;
+        if (
+          (selection.instanceId === "claudeAgent" ||
+            selection.instanceId === "codex" ||
+            selection.instanceId === "codex-cu") &&
+          (merged.selection.options ?? []).some(
+            (option) =>
+              ["variant", "effort", "reasoningEffort"].includes(option.id) &&
+              option.id !== (selection.instanceId === "claudeAgent" ? "effort" : "reasoningEffort"),
+          )
+        ) {
           return {
             kind: "conflict" as const,
-            reason: `Option ${option.id} occurs more than once.`,
+            reason: `Model ${selection.model} has an incompatible reasoning option.`,
           };
-        ids.add(option.id);
-      }
-      const merged = mergeSelection(selection, {});
-      if (merged.kind === "conflict") return merged;
-      if (
-        (selection.instanceId === "claudeAgent" ||
-          selection.instanceId === "codex" ||
-          selection.instanceId === "codex-cu") &&
-        (merged.selection.options ?? []).some(
-          (option) =>
-            ["variant", "effort", "reasoningEffort"].includes(option.id) &&
-            option.id !== (selection.instanceId === "claudeAgent" ? "effort" : "reasoningEffort"),
-        )
-      ) {
-        return {
-          kind: "conflict" as const,
-          reason: `Model ${selection.model} has an incompatible reasoning option.`,
-        };
-      }
-      return resolveSelection(merged.selection);
-    };
-    const resolved = canonicalize(requested);
-    if (resolved.kind === "conflict") {
-      return yield* new Orchestrator.OrchestratorCommandRejectedError({
-        commandId: command.commandId,
-        commandType: command.type,
-        cause: `Model selection migration: ${resolved.reason}`,
-      });
-    }
-
-    // A caller may have already resolved an inherited selection. Treat it as
-    // inherited too, but never overwrite a genuinely different explicit pick.
-    const resolvedStored = canonicalize(stored);
-    const inherited =
-      command.modelSelection === undefined ||
-      modelSelectionsEqual(command.modelSelection, stored) ||
-      (resolvedStored.kind !== "conflict" &&
-        modelSelectionsEqual(resolved.selection, resolvedStored.selection));
-
-    yield* assertProviderInstanceEnabled({
-      projectId: projection.thread.projectId,
-      commandId: command.commandId,
-      instanceId: resolved.selection.instanceId,
-    });
-
-    if (
-      inherited &&
-      resolvedStored.kind !== "conflict" &&
-      !modelSelectionsEqual(stored, resolvedStored.selection)
-    ) {
-      const quiet = yield* orchestrator.getThreadRecords(command.threadId, [
-        "runs",
-        "runtimeRequests",
-        "providerThreads",
-        "subagents",
-      ]);
-      const { thread, runs } = quiet;
-      if (isProviderNativeSubagentThread(thread)) {
-        return yield* new Orchestrator.OrchestratorSubagentThreadReadOnlyError({
-          commandId: command.commandId,
-          threadId: command.threadId,
-        });
-      }
-      if (!modelSelectionsEqual(thread.modelSelection, stored)) {
+        }
+        return resolveSelection(merged.selection);
+      };
+      const resolved = canonicalize(requested);
+      if (resolved.kind === "conflict") {
         return yield* new Orchestrator.OrchestratorCommandRejectedError({
           commandId: command.commandId,
           commandType: command.type,
-          cause: "The thread's model selection changed during migration. Retry the send.",
+          cause: `Model selection migration: ${resolved.reason}`,
         });
       }
-      // A provider switch detaches the old session. Never interrupt active or
-      // queued work merely because a legacy selection was encountered.
-      if (
-        thread.deletedAt !== null ||
-        thread.archivedAt !== null ||
-        runs.some((run) => isActiveRun(run) || run.status === "queued") ||
-        quiet.runtimeRequests.some((request) => request.status === "pending") ||
-        runningBackgroundWork(quiet).length > 0
-      ) {
-        // ardud: after cutover a busy thread keeps working where it is; this turn runs (or
-        // queues) on its current harness and the thread moves on its first turn that starts idle.
-        if (options.cutoverComplete) return yield* dispatchUnchanged(command, options);
-        return yield* new Orchestrator.OrchestratorCommandRejectedError({
+
+      // A caller may have already resolved an inherited selection. Treat it as
+      // inherited too, but never overwrite a genuinely different explicit pick.
+      const resolvedStored = canonicalize(stored);
+      const inherited =
+        command.modelSelection === undefined ||
+        modelSelectionsEqual(command.modelSelection, stored) ||
+        (resolvedStored.kind !== "conflict" &&
+          modelSelectionsEqual(resolved.selection, resolvedStored.selection));
+
+      yield* foregroundPreflight(
+        command,
+        assertProviderInstanceEnabled({
+          projectId: projection.thread.projectId,
           commandId: command.commandId,
-          commandType: command.type,
-          cause:
-            "Cannot migrate an archived or deleted thread, or one with active or queued runs, pending requests or background work.",
-        });
-      }
-      yield* orchestrator.dispatch(
-        {
-          type: "thread.model-selection.set",
-          commandId: CommandId.make(`command:ardud:harness-migration:${NodeCrypto.randomUUID()}`),
-          threadId: command.threadId,
-          modelSelection: resolvedStored.selection,
-        },
-        options,
+          instanceId: resolved.selection.instanceId,
+        }),
       );
-    }
 
-    const nextCommand =
-      command.modelSelection === undefined || modelSelectionsEqual(requested, resolved.selection)
-        ? command
-        : { ...command, modelSelection: resolved.selection };
-    // Re-read the target after a selection update and check the actual send,
-    // rather than allowing a disabled destination on an inherited command.
-    yield* assertDispatchTargetEnabled(nextCommand);
-    return yield* SendAcknowledgement.waitingOn(
-      orchestrator.dispatch(nextCommand, options),
-      `message command admission for thread ${command.threadId}`,
-    );
+      if (
+        inherited &&
+        resolvedStored.kind !== "conflict" &&
+        !modelSelectionsEqual(stored, resolvedStored.selection)
+      ) {
+        // Migration needs the full liveness records; keep that history-sized read on background.
+        const quiet = yield* orchestrator.getThreadRecords(command.threadId, [
+          "runs",
+          "runtimeRequests",
+          "providerThreads",
+          "subagents",
+        ]);
+        const { thread, runs } = quiet;
+        if (isProviderNativeSubagentThread(thread)) {
+          return yield* new Orchestrator.OrchestratorSubagentThreadReadOnlyError({
+            commandId: command.commandId,
+            threadId: command.threadId,
+          });
+        }
+        if (!modelSelectionsEqual(thread.modelSelection, stored)) {
+          return yield* new Orchestrator.OrchestratorCommandRejectedError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: "The thread's model selection changed during migration. Retry the send.",
+          });
+        }
+        // A provider switch detaches the old session. Never interrupt active or
+        // queued work merely because a legacy selection was encountered.
+        if (
+          thread.deletedAt !== null ||
+          thread.archivedAt !== null ||
+          runs.some((run) => isActiveRun(run) || run.status === "queued") ||
+          quiet.runtimeRequests.some((request) => request.status === "pending") ||
+          runningBackgroundWork(quiet).length > 0
+        ) {
+          // ardud: after cutover a busy thread keeps working where it is; this turn runs (or
+          // queues) on its current harness and the thread moves on its first turn that starts idle.
+          if (options.cutoverComplete) return yield* dispatchUnchanged(command, options);
+          return yield* new Orchestrator.OrchestratorCommandRejectedError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause:
+              "Cannot migrate an archived or deleted thread, or one with active or queued runs, pending requests or background work.",
+          });
+        }
+        yield* orchestrator.dispatch(
+          {
+            type: "thread.model-selection.set",
+            commandId: CommandId.make(`command:ardud:harness-migration:${NodeCrypto.randomUUID()}`),
+            threadId: command.threadId,
+            modelSelection: resolvedStored.selection,
+          },
+          options,
+        );
+        writesSaved = true;
+      }
+
+      const nextCommand =
+        command.modelSelection === undefined || modelSelectionsEqual(requested, resolved.selection)
+          ? command
+          : { ...command, modelSelection: resolved.selection };
+      // Re-read the target after a selection update and check the actual send,
+      // rather than allowing a disabled destination on an inherited command.
+      return yield* assertDispatchTargetEnabled(nextCommand).pipe(
+        Effect.andThen(
+          SendAcknowledgement.waitingOn(
+            orchestrator.dispatch(nextCommand, options),
+            `message command admission for thread ${command.threadId}`,
+          ),
+        ),
+      );
+    }).pipe(Effect.mapError((cause) => afterPreflightWrites(cause, writesSaved)));
   });
 
-  const dispatch: ThreadManagementServiceShape["dispatch"] = (command, options) => {
+  const dispatchCommand: ThreadManagementServiceShape["dispatch"] = (command, options) => {
     if (command.type === "delegated_task.request") {
       return Effect.acquireUseRelease(
         Ref.update(pendingDelegations, (current) => {
@@ -1006,6 +1095,18 @@ const make = Effect.gen(function* () {
       }),
     );
   };
+
+  const dispatch: ThreadManagementServiceShape["dispatch"] = (command, options) =>
+    dispatchCommand(command, options).pipe(
+      Effect.tapError((cause) =>
+        Effect.gen(function* () {
+          if (!isDispatchError(cause) || cause.preflightReaderLane !== "foreground") return;
+          const call = yield* Effect.serviceOption(McpCall);
+          if (Option.isSome(call))
+            call.value.saved = cause.preflightWritesSaved ? "unknown" : false;
+        }),
+      ),
+    );
 
   const getProjectThread: ThreadManagementServiceShape["getProjectThread"] = (input) =>
     getThreadProjection(input.threadId).pipe(
@@ -1102,11 +1203,14 @@ const make = Effect.gen(function* () {
     const guard = { isStale: () => input.isStale?.() === true };
     const target = yield* getProjectThreadRecords(
       input,
-      input.mode === "restart"
-        ? ["runs", "providerTurns", "providerThreads", "providerSessions"]
-        : ["runs", "providerTurns"],
+      // Queueing never steers an existing run, so its preflight only needs the thread row.
+      input.mode === "queue"
+        ? []
+        : input.mode === "restart"
+          ? ["runs", "providerTurns", "providerThreads", "providerSessions"]
+          : ["runs", "providerTurns"],
     );
-    const steerableRun = latestSteerableRun(target);
+    const steerableRun = input.mode === "queue" ? undefined : latestSteerableRun(target);
     // Replays must reach the orchestrator even after the run finishes or the thread archives.
     const preflightError =
       target.thread.archivedAt !== null
@@ -1237,7 +1341,7 @@ const make = Effect.gen(function* () {
     const projection = yield* getProjectThreadRecords(input, ["runs", "messages", "turnItems"], {
       messageIds: [input.messageId],
       turnItemTypes: ["user_message"],
-    });
+    }).pipe(NodeSqliteClient.backgroundReads);
     const message = projection.messages.find((candidate) => candidate.id === input.messageId);
     const run =
       message?.runId === null || message?.runId === undefined
@@ -1600,7 +1704,7 @@ const make = Effect.gen(function* () {
 
   return ThreadManagementService.of({
     promoteQueuedMessages: orchestrator.promoteQueuedMessages,
-    ensureLegacyTranscript,
+    ensureLegacyTranscript: (threadId) => ensureLegacyTranscript(threadId).pipe(Effect.asVoid),
     searchThreadStream: (input) =>
       Stream.unwrap(
         ensureProjectionTranscript(input.threadId).pipe(

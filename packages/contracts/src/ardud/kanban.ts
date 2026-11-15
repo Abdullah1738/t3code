@@ -349,6 +349,8 @@ export const KanbanAskOption = Schema.Struct({
   /** What the option is. */
   detail: Schema.optional(Schema.String),
   recommended: Schema.optional(Schema.Boolean),
+  /** Subtask ids this option approves when the owner picks it alone (deploy, money or secret steps). */
+  approves: Schema.optional(Schema.Array(TrimmedNonEmptyString)),
   /** What happens once it is picked, when the label doesn't say. */
   consequence: Schema.optional(Schema.String),
   /** Index into the ask's `blocks`: the picture or page that shows this option. */
@@ -1054,7 +1056,7 @@ export const KanbanCard = Schema.Struct({
    * not know the key drops it, and the card then carries on as it did before.
    */
   deciding: ForwardCompatibleOptional(KanbanCardDeciding),
-  /** Set when the server nudged the active thread after a turn ended without a card move. */
+  /** Last reminder to the active thread, or to its evaluator after a clear review. */
   nudgedAt: Schema.NullOr(IsoDateTime),
   /** A delivered steer can start the detached work thread while a newer wait remains. */
   detachedSteerAt: Schema.optional(IsoDateTime),

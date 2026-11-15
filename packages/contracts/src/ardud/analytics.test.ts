@@ -59,8 +59,9 @@ describe("analytics ingest contract", () => {
         kind: "mcp.call",
         tool: "card_update",
         outcome: "timeout",
+        responseDelivery: "closed",
       }),
-    ).toMatchObject({ tool: "card_update", outcome: "timeout" });
+    ).toMatchObject({ tool: "card_update", outcome: "timeout", responseDelivery: "closed" });
     expect(() => decodeRead({ day: "2026-11-13", outcome: "maybe" })).toThrow();
   });
   it("accepts bounded batches and strips unrecognized content", () => {

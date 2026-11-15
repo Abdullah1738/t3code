@@ -11,3 +11,4 @@ usr/local/sbin/offbox-boot-report 0755
 etc/grub.d/01_offbox_trial 0755
 etc/kernel/postinst.d/zzz-offbox-kernel-trial 0755
 etc/netplan/01-offbox.yaml 0600
+usr/local/sbin/offbox-restart-pending 0755

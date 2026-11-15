@@ -6,6 +6,41 @@ import { join } from 'node:path';
 import { clean, emit, observed } from '../toollog.mjs';
 
 import {fixture} from './support.mjs';
+test('observed derives stable causes and only keeps fixed operational messages', async t => {
+  const {rows} = fixture(t);
+  const cases = [
+    [Object.assign(new Error('Robob replica is stale; recovery deferred'), {code:'REPLICA_UNAVAILABLE'}), 'REPLICA_UNAVAILABLE'],
+    [Object.assign(new Error('sk-private fixture@example.invalid /home/fixture@example.invalid/x'), {code:'ETIMEDOUT'}), 'ETIMEDOUT'],
+    [new TypeError('private prompt'), 'TypeError'],
+    [{code:'invalid code',name:'RangeError',message:'Bearer private'}, 'RangeError'],
+    [{code:'sk-private',name:'invalid name'}, 'operation_failed'],
+    [{code:'x'.repeat(65),name:'SyntaxError'}, 'SyntaxError'],
+    [{code:'',name:'Error/path@example.invalid'}, 'operation_failed'],
+    [new Error('Robob replica is stale; recovery deferred sk-private'), 'Error'],
+    [null, 'operation_failed'],
+  ];
+  for (const [error, tag] of cases) {
+    await assert.rejects(observed('test', 'fixture.failure', () => {throw error;}), value => value === error);
+    assert.equal(rows().at(-1).error.tag, tag);
+  }
+  assert.equal(rows()[0].error.message, 'Robob replica is stale; recovery deferred');
+  for (const [result, tag] of [[{ok:false,tag:'not_ready',code:'OTHER'},'not_ready'],
+    [{ok:false,code:'ECONNRESET'},'ECONNRESET'], [{ok:false,tag:'fixture@example.invalid'},'operation_failed']]) {
+    assert.equal(await observed('test','fixture.result',()=>result), result);
+    assert.equal(rows().at(-1).error.tag,tag);
+  }
+  const serialized = JSON.stringify(rows());
+  for (const secret of ['sk-private','fixture@example.invalid','private prompt','Bearer private']) assert.ok(!serialized.includes(secret));
+  assert.ok(rows().every(r => r.error.message.length <= 300));
+});
+
+test('hostile metadata and broken writes never replace results or errors', async t => {
+  fixture(t);
+  const hostile = new Proxy({}, {get(_target, key){if (key === 'then') return undefined; throw new Error('getter');},ownKeys(){throw new Error('keys');}});
+  assert.equal(await observed('test','fixture.result',()=>hostile),hostile);
+  assert.equal(await observed('test','fixture.result',()=>42,hostile),42);
+  await assert.rejects(observed('test','fixture.error',()=>{throw hostile;},hostile),e=>e===hostile);
+});
 test('JS schema, privacy, errors, permissions and fail-open writes', async t => {
   const {root, rows} = fixture(t);
   emit('test','fixture.ok',{kind:'perf',ok:true,durationMs:1,ids:{account:'fixture@example.invalid',key:'sk-fixture-do-not-log'},props:{model:'cx/gpt-image-2',prompt:'private prompt',email:'fixture@example.invalid',tag:'sk-fixture-do-not-log'},error:{tag:'http_502',message:'private prompt fixture@example.invalid sk-fixture-do-not-log'}});

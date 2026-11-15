@@ -594,3 +594,24 @@ test("relays: each watcher's ETA moves on its own, while one person still gets a
   expect(cli("remove", "fa").exitCode).toBe(0);
   expect(ok("fc", "2026-10-24T19:50:00Z")).toBe(3);
 });
+
+
+test("health run triggers distinguish CLI checks, scheduled ticks and retries", async () => {
+  const targets = ["fixture-schedule", "fixture-retry"];
+  for (const id of targets) {
+    const file = join(sandbox, id + ".triggers");
+    const check = 'printf "%s\\n" "${HEALTH_TOOLLOG_TRIGGER:-manual}" >> ' + JSON.stringify(file);
+    expect(cli("add", "--id", id, "--title", "Fixture", "--check", check,
+      "--interval", "3600", "--mode", "notify", "--context", "Fixture", "--max-fires", "0", "--no-prime").exitCode).toBe(0);
+    if (id.endsWith("retry")) {
+      const current = state(id);
+      current.consecutive_failures = 1;
+      writeFileSync(join(sandbox, "root/watchers", id, "state.json"), JSON.stringify(current));
+    }
+  }
+  expect(cli("test", "fixture-schedule").exitCode).toBe(0);
+  await runnerFor(2_500);
+  expect(readFileSync(join(sandbox, "fixture-schedule.triggers"), "utf8").trim().split("\n"))
+    .toEqual(["manual", "schedule"]);
+  expect(readFileSync(join(sandbox, "fixture-retry.triggers"), "utf8").trim()).toBe("retry");
+}, 20_000);

@@ -310,11 +310,14 @@ const cardFor = Effect.fn("KanbanTools.cardFor")(function* (
  * work thread on the cards it still works on (one moved to another thread is
  * no longer its own, even the one it started with).
  */
-const ownCard = (caller: Caller, card: KanbanCard) =>
+const isOwnCard = (caller: Caller, card: KanbanCard) =>
   !isCardThread(caller) ||
   (caller.link?.role === "work"
     ? card.workThreadId === caller.threadId
-    : caller.link?.cardId === card.id)
+    : caller.link?.cardId === card.id);
+
+const ownCard = (caller: Caller, card: KanbanCard) =>
+  isOwnCard(caller, card)
     ? Effect.void
     : refuse(
         `This thread works on other cards; it can't change card #${card.number}. A card you created without assignToSelf belongs to the thread that will work it; put details in card_create, or hand them to the board's evaluator.`,
@@ -428,6 +431,10 @@ const postTargetFor = Effect.fn("KanbanTools.postTargetFor")(function* (
       // Ownership applies to a card's own discussion; board channels keep their policy.
       if (discussion.cardId) {
         const { card } = yield* service.card(discussion.cardId);
+        if (!isOwnCard(caller, card))
+          return yield* refuse(
+            `This thread works on other cards; it can't post on card #${card.number}. Post it in your own card's discussion; the board's evaluator carries it over.`,
+          );
         yield* ownCard(caller, card);
       }
     }
@@ -435,6 +442,10 @@ const postTargetFor = Effect.fn("KanbanTools.postTargetFor")(function* (
   }
   if (cardRef?.trim()) {
     const card = yield* cardFor(service, caller, cardRef, boardId, true);
+    if (!isOwnCard(caller, card))
+      return yield* refuse(
+        `This thread works on other cards; it can't post on card #${card.number}. Post it in your own card's discussion; the board's evaluator carries it over.`,
+      );
     yield* ownCard(caller, card);
     return { kind: "card" as const, id: card.id };
   }
@@ -700,14 +711,16 @@ const handlers = {
         if (caller.link?.role === "review") {
           return yield* refuse("Review threads put questions in their findings.");
         }
-        const board = (yield* service.boards).find((entry) => entry.id === card.boardId);
+        const board = yield* service.resolveBoard(caller.threadId, { boardId: card.boardId });
         const asked = yield* service.askOwner(
           card.id,
           { ...askFieldsOf(input), question: input.question, blocking: input.blocking ?? false },
           caller.actor,
           isCardThread(caller) ? "cardThread" : "evaluator",
         );
+        // The newest ask is the one just added.
         const ask = asked.asks.at(-1);
+        const warning = ask ? Asks.approvalWarning(asked, ask, board.guessedGates) : undefined;
         const note = ask
           ? [
               askGateWarning(asked, ask, board?.guessedGates),
@@ -718,6 +731,7 @@ const handlers = {
           : "";
         return {
           card: Asks.askSummary(asked, ask?.id ?? ""),
+          ...(warning === undefined ? {} : { warning }),
           ...(note ? { note } : {}),
         };
       }),
@@ -767,6 +781,9 @@ const handlers = {
         if (!edits && action === undefined && blocking === undefined) {
           return yield* invalid("Pass the fields to change, or an action.");
         }
+        const board = edits
+          ? yield* service.resolveBoard(caller.threadId, { boardId: card.boardId })
+          : undefined;
         let changed = card;
         if (edits) changed = yield* service.editAsk(card.id, askId, edit, caller.actor, role);
         const open = changed.asks.find((entry) => entry.id === askId && entry.closedAt === null);
@@ -779,7 +796,15 @@ const handlers = {
           }
           changed = yield* service.changeAsk(card.id, askId, "block", caller.actor, role);
         }
-        return { card: Asks.askSummary(changed, askId) };
+        const revised = changed.asks.find((entry) => entry.id === askId);
+        const warning =
+          edits && revised
+            ? Asks.approvalWarning(changed, revised, board?.guessedGates)
+            : undefined;
+        return {
+          card: Asks.askSummary(changed, askId),
+          ...(warning === undefined ? {} : { warning }),
+        };
       }),
     ),
   ),

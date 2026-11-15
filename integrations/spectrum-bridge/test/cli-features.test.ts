@@ -9,6 +9,15 @@ import { EFFECTS } from "../src/photon.ts";
 
 const session = ["--session", "s-1", "--key", "k-1"];
 
+test("opt-in maps a required chat and optional session to the owner route", () => {
+  expect(parseCommand(["opt-in", "--chat", "moni"])).toEqual({ method: "POST", path: "/opt-in", body: { chat: "moni" } });
+  expect(parseCommand(["opt-in", "--chat", "moni", "--session", "s-1@2"]))
+    .toEqual({ method: "POST", path: "/opt-in", body: { chat: "moni", sessionId: "s-1@2" } });
+  expect(() => parseCommand(["opt-in"])).toThrow("--chat is required");
+  expect(() => parseCommand(["opt-in", "--chat", "../moni"])).toThrow("Invalid chat slug");
+  expect(() => parseCommand(["opt-in", "--chat", "moni", "--session", "invalid session"])).toThrow("Invalid --session");
+});
+
 describe("send, poll, and app commands", () => {
   test("CLI effect names match the SDK list", () => {
     expect([...EFFECT_NAMES]).toEqual(EFFECTS);

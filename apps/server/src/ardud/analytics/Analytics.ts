@@ -23,6 +23,7 @@ import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "../../config.ts";
+import { makeReadPager } from "./readPages.ts";
 import { sampleMix } from "./samples.ts";
 import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
@@ -100,6 +101,7 @@ class AnalyticsValidationError extends Schema.TaggedError<AnalyticsValidationErr
       "batch-size",
       "queue-full",
       "invalid-day",
+      "invalid-cursor",
     ]),
   },
 ) {}
@@ -159,6 +161,7 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
   const options = boundedOptions(input);
   const directory = path.join(config.logsDir, "analytics");
   const disk = yield* Semaphore.make(1);
+  const readPager = makeReadPager();
   const wakeups = yield* Queue.dropping<void, Cause.Done>(1);
   const retries = yield* Queue.dropping<void, Cause.Done>(1);
   const encoder = new TextEncoder();
@@ -185,7 +188,8 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
     (filter?.boardId === undefined || filter.boardId === event.boardId) &&
     (filter?.cardId === undefined || filter.cardId === event.cardId) &&
     (filter?.tool === undefined || filter.tool === event.tool) &&
-    (filter?.outcome === undefined || filter.outcome === event.outcome);
+    (filter?.outcome === undefined || filter.outcome === event.outcome) &&
+    (filter?.responseDelivery === undefined || filter.responseDelivery === event.responseDelivery);
   const viewKey = (day: string, filter?: AnalyticsReadInput) =>
     JSON.stringify([
       day,
@@ -194,6 +198,7 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
       filter?.cardId,
       filter?.tool,
       filter?.outcome,
+      filter?.responseDelivery,
     ]);
   const invalidate = (day: string) => {
     for (const [key, view] of views) if (view.day === day) views.delete(key);
@@ -628,6 +633,14 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
         cause: new AnalyticsValidationError({ reason: "invalid-day" }),
       });
     }
+    if (input.cursor !== undefined) {
+      const page = readPager.resume(input);
+      if (page) return page;
+      return yield* new AnalyticsError({
+        operation: "read",
+        cause: new AnalyticsValidationError({ reason: "invalid-cursor" }),
+      });
+    }
     const storedRows = yield* readAskRows(input.day).pipe(
       Effect.mapError((cause) => new AnalyticsError({ operation: "read", cause })),
     );
@@ -659,13 +672,11 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
             yield* persistRollup(
               withAskLatency(finishRollup(full.accumulator, input.day, generatedAt)),
             );
-          return {
-            rollup: withAskLatency(
-              finishRollup(view.accumulator, input.day, generatedAt),
-              input,
-            ),
-            samples: view.samples.slice(0, input.limit ?? 100).map((sample) => sample.event),
-          };
+          return readPager.read(
+            input,
+            withAskLatency(finishRollup(view.accumulator, input.day, generatedAt), input),
+            view.samples.map((sample) => sample.event),
+          );
         }),
       )
       .pipe(Effect.mapError((cause) => new AnalyticsError({ operation: "read", cause })));

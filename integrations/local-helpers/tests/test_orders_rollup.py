@@ -14,7 +14,8 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = Path(__file__).with_name('fixtures')
 DAY = '2026-11-12'
-NEW_FIELDS = ('errorsByComponent', 'failureShare', 'topErrorSamplesByComponent')
+NEW_FIELDS = ('errorsByComponent', 'failureShare', 'topErrorSamplesByComponent',
+              'topOrderFailuresByComponent', 'pollsByMerchant')
 
 
 def load(label, path):
@@ -163,6 +164,36 @@ class OrdersRollupTests(unittest.TestCase):
             result = self.rollup(reader)
             for key in NEW_FIELDS:
                 self.assertEqual(result[key], {})
+
+    def test_per_order_failure_top_five_and_amazon_poll_share_do_not_duplicate_errors(self):
+        def row(order, *, component='order-watch', name='track.poll', ok=False, **props):
+            return {'component': component, 'name': name, 'kind': 'perf' if ok else 'error',
+                    'ok': ok, 'ids': {'orderId': order},
+                    'props': {'merchant': 'amazon', **props}, 'durationMs': 100,
+                    **({'error': {'tag': 'TRACK_POLL_SOURCE_ERROR'}} if not ok else {})}
+        ids = [f'{i:016x}' for i in range(7)]
+        rows = [row(order) for order in ids] + [row(ids[6]), row(ids[6])]
+        rows += [row(ids[6], name='track.error') for _ in range(3)]
+        rows += [row(ids[6], component='amazon', name='provider.track') for _ in range(3)]
+        rows += [row('private-order'), row('private-order', ok=True), row(ids[6], ok=True)]
+        rows += [row(ids[6], ok=True, polled=False),
+                 row(ids[6], ok=True, component='amazon', name='provider.orders')]
+        self.write(rows)
+        for reader in READERS:
+            with self.subTest(reader=reader.__name__):
+                result = self.rollup(reader)
+                self.assertEqual(result['topOrderFailuresByComponent'], {
+                    'order-watch': [{'orderId': ids[6], 'count': 3}] +
+                                   [{'orderId': order, 'count': 1} for order in ids[:4]],
+                    'amazon': [{'orderId': ids[6], 'count': 3}]})
+                self.assertEqual(result['pollsByMerchant'], {
+                    'amazon': {'count': 12, 'failed': 10, 'failureShare': 10 / 12}})
+                self.assertNotIn('private-', json.dumps(result['topOrderFailuresByComponent']))
+        # The shared reader weights sampled successful polls, while errors are never sampled.
+        rows[-3]['props']['sampleRate'] = 4
+        self.write(rows)
+        self.assertEqual(self.rollup(SHARED)['pollsByMerchant']['amazon'],
+                         {'count': 15, 'failed': 10, 'failureShare': 10 / 15})
 
     def test_automatic_refresh_fills_additive_fields_without_schema_bump(self):
         class Clock(dt.datetime):

@@ -38,14 +38,14 @@ class RepoToolTests(unittest.TestCase):
         path.write_text('#!/bin/bash\nprintf "%s\\n" ' + shlex.quote(text) + '\n')
         path.chmod(0o755)
 
-    def run_script(self, command=None, *, steps=None, rel='.', node=''):
+    def run_script(self, command=None, *, steps=None, rel='.', node='', timeout=10):
         with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
                 patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs, 'WATCH_REPAIR', ':'), \
                 patch.object(runs.userns, 'setup', return_value=':'):
             script = runs.remote_script('w/repo with spaces', rel, command or [], None, 'r',
                                         steps=steps, node=node, repo_root=self.root)
         return subprocess.run([shutil.which('bash'), '-c', script], env=self.env, capture_output=True,
-                              text=True, timeout=10, cwd=self.home)
+                              text=True, timeout=timeout, cwd=self.home)
 
     def test_repo_vp_shadows_global_and_tsc_rs_resolves_from_root_and_subdir(self):
         self.tool(self.global_bin, 'vp', 'global')

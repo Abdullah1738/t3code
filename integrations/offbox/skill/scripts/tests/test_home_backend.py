@@ -425,15 +425,19 @@ class Failover(HomeFiles):
         with patch("urllib.request.urlopen", side_effect=OSError("timed out")):
             self.assertIn("no answer", home.probe())
 
-    def test_unreachable_before_the_command_was_sent_also_fails_over(self):
+    def test_unreachable_fails_over_but_starting_waits_at_home(self):
         gone = api.NetworkError("offbox server API unreachable (POST /sandboxes): timed out")
         with patch.object(home, "probe", return_value=None), patch.object(runs, "run_remote", side_effect=gone):
             rc, _ = self.run_cmd("--", "make", "test")
         self.assertEqual(rc, "exec")
         self.assertEqual(len(self.failures()), 1)
         starting = api.ApiError(503, "server_not_ready", "reconciling runs and boxes after start")
-        with patch.object(home, "probe", return_value=None), patch.object(runs, "run_remote", side_effect=starting):
-            self.assertEqual(self.run_cmd("--", "make", "test")[0], "exec")
+        before = len(self.failures())
+        with patch.object(home, "probe", return_value=None), patch.object(runs, "run_remote", side_effect=[starting, 0]), \
+                patch.object(home, "_health", side_effect=[{"ok": False, "reasons": [starting.message]}, {"ok": True}]), \
+                patch.object(home.time, "sleep"):
+            self.assertEqual(self.run_cmd("--", "make", "test")[0], 0)
+        self.assertEqual(len(self.failures()), before)
 
     def test_once_the_run_was_accepted_it_never_moves(self):
         lost = api.NetworkError("offbox server API unreachable")
@@ -1207,7 +1211,7 @@ class BoxReadinessFailover(Isolated):
         for phase in ("lock_wait", "push", "ssh", "resume_request", "bring_up"):
             self.assertFalse(prepare.Stalled("new", phase, 300).outage, phase)
 
-    def test_full_home_pool_failed_resume_archived_500_moves_to_boat(self):
+    def test_full_home_pool_failed_resume_archived_500_uses_another_home_box(self):
         self.box("old", "stopped", member=True)
         self.box("busy", member=True)
         self.busy("busy")
@@ -1221,10 +1225,18 @@ class BoxReadinessFailover(Isolated):
             return {"state": "archived", "type": "large",
                     "error": "500 incus_failed: incus start failed" if resumed else None,
                     "updatedAt": dt.datetime.fromtimestamp(self.clock.t, dt.timezone.utc).isoformat()}
+        def replacement(*args):
+            self.box('new')
+            return dict(self.con.execute("SELECT * FROM leases WHERE box_id='new'").fetchone())
         with patch.object(lease, "now", self.clock.now), patch.object(api, "get", side_effect=state), \
                 patch.object(api, "resume", side_effect=resume) as start, \
-                patch.object(lease, "acquire_private", side_effect=AssertionError("pool is full")):
-            self.assert_failover()
+                patch.object(lease, "acquire_private", side_effect=replacement) as create:
+            got = pool.acquire(self.me)
+        pool.release_guard(got)
+        self.assertEqual(got['box_id'], 'new')
+        create.assert_called_once()
+        self.assertEqual((self.execs, self.failures()), ([], []))
+        self.assertTrue(lease.boot_dead(self.con, 'old'))
         start.assert_called_once()
         self.assertLess(self.clock.t, 1100, "failed resume must not turn into a pool wait")
 
@@ -1237,7 +1249,7 @@ class BoxReadinessFailover(Isolated):
             ("millisecond truncation", "archived", error, 1000, 1000.0005, error, api.LIVE_STATES, True),
             ("stale failure", "archived", error, 999, 1000, error, api.LIVE_STATES, False),
             ("missing timestamp", "archived", error, None, 1000, error, api.LIVE_STATES, False),
-            ("missing attempt", "archived", error, 1001, None, error, api.LIVE_STATES, False),
+            ("missing attempt", "archived", error, 1001, None, error, api.LIVE_STATES, "box"),
             ("still resuming", "resuming", error, 1001, 1000, error, api.LIVE_STATES, False),
             ("unsupported state", "stopped", error, 1001, 1000, error, api.LIVE_STATES, False),
             ("refusal", "archived", "409 conflict", 1001, 1000, None, api.LIVE_STATES, False),
@@ -1249,19 +1261,25 @@ class BoxReadinessFailover(Isolated):
                 if failover:
                     with self.assertRaises(common.OffboxError) as caught:
                         api.wait_state("old", want, since=since, stale_error=stale)
-                    self.assertTrue(caught.exception.outage)
+                    self.assertIsInstance(caught.exception, api.BoxBootFailed)
+                    self.assertEqual(caught.exception.outage, failover is True)
                     self.assertFalse(caught.exception.started)
                 else:
                     self.assertIn(api.wait_state("old", want, since=since, stale_error=stale)["state"], want)
 
-    def test_archived_errors_do_not_change_other_backend_policies(self):
+    def test_archived_errors_are_typed_on_home_and_leave_boat_unchanged(self):
         for backend, env in (("boat", {}), ("server", {"OFFBOX_BACKEND": "server"}),
                              ("server", {"OFFBOX_THREAD": "person:moni"})):
             with self.subTest(backend=backend, env=env), patch.object(common, "_BACKEND", backend), \
                     patch.dict(os.environ, env), patch.object(api, "get", side_effect=[
                         {"state": "archived", "error": "500 incus_failed", "updatedAt": "1970-01-01T00:16:41Z"},
                         {"state": "running"}]):
-                self.assertEqual(api.wait_state("old", api.LIVE_STATES, since=1000)["state"], "running")
+                if backend == 'server':
+                    with self.assertRaises(api.BoxBootFailed) as caught:
+                        api.wait_state("old", api.LIVE_STATES, since=1000)
+                    self.assertFalse(caught.exception.outage)
+                else:
+                    self.assertEqual(api.wait_state("old", api.LIVE_STATES, since=1000)["state"], "running")
 
     def test_full_home_pool_waits_past_preparation_deadline_then_gets_a_slot(self):
         self.box("busy", member=True)
@@ -1292,9 +1310,9 @@ class PersonNeverOnBoat(HomeFiles):
         self.stack.enter_context(patch.dict(os.environ, {"OFFBOX_THREAD": "person:moni"}))
         self.stack.enter_context(patch.object(os, "execve", side_effect=AssertionError("her work never goes to Boat")))
 
-    def test_marked_down_fails_fast_without_touching_the_network(self):
+    def test_marked_down_without_a_starting_answer_fails_fast(self):
         self.monitor_says("home_down", reason="no answer for 2 checks")
-        with patch("urllib.request.urlopen", side_effect=AssertionError("no network call")):
+        with patch.object(home, "_health", return_value="no answer (TimeoutError)"):
             with self.assertRaises(common.OffboxError) as cm:
                 home.person_gate()
         self.assertEqual(cm.exception.code, 93)

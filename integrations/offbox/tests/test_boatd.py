@@ -640,8 +640,8 @@ class Http(Base):
         self.make_box("moni")
         st, d = self.call(None, "GET", "/health")
         self.assertEqual(st, 200)
-        self.assertEqual(sorted(d), ["boatd_uptime_s", "boot_id", "mdraid", "mode", "ok", "pool", "queue", "reasons",
-                                     "running", "up", "uptime_s", "version"])
+        self.assertEqual(sorted(d), ["boatd_uptime_s", "boot", "boot_id", "mdraid", "mode", "ok", "phase", "pool", "queue", "reasons",
+                                     "running", "startedAt", "starting", "startupPhases", "up", "uptime_s", "version"])
         self.assertNotIn("moni", json.dumps(d))
         self.assertNotIn("bx_", json.dumps(d))
 
@@ -809,6 +809,53 @@ unused devices: <none>
         self.assertEqual(boatd.mdraid_state(one)["arrays"]["md1"], "[U_]")
         self.assertEqual(boatd.mdraid_state("Personalities : \nunused devices: <none>\n"), {"state": "none", "arrays": {}})
 
+    def test_startup_health_and_mutation_body(self):
+        phases = ["starting", "waiting for incus", "reconciling runs and boxes after start",
+                  "state dataset offbox/boatd not found (pool offbox is MISSING)",
+                  "state dataset offbox/boatd is not mounted",
+                  "start-up reconcile failed; retrying (see the boatd journal)",
+                  "state dataset offbox/boatd is mounted at /wrong, expected /right"]
+        for phase in phases:
+            with self.subTest(phase=phase), patch.dict(boatd.STATE, problem=phase):
+                expected = "failed" not in phase and "expected" not in phase
+                health = boatd.health(fresh=True)
+                self.assertFalse(health["ok"])
+                self.assertEqual((health["starting"], health["phase"], health["startedAt"]),
+                                 (expected, phase, boatd.STARTED))
+                handler = object.__new__(boatd.Handler)
+                handler.path = "/api/v1/sandboxes/bx_one/commands"
+                with patch.object(handler, "_send") as send:
+                    handler._route("POST")
+                status, body = send.call_args.args
+                self.assertEqual(status, 503)
+                self.assertEqual((body["starting"], body["phase"], body["startedAt"]),
+                                 (expected, phase, boatd.STARTED))
+        boatd.READY.set()
+        self.assertFalse(boatd.startup_status()["starting"])
+
+    def test_startup_records_phase_durations(self):
+        with patch.dict(boatd.STATE, problem="starting", phases={}), \
+                patch.object(boatd, "record_boot"), patch.object(boatd, "state_problem", return_value=None), \
+                patch.object(boatd, "reconcile", return_value={}), patch.object(boatd.threading, "Thread"), \
+                patch.object(boatd.time, "monotonic", side_effect=[100, 104, 110, 149, 150]), \
+                patch.object(boatd, "log") as log:
+            boatd.startup()
+            self.assertEqual(boatd.STATE["phases"], {"pool": 4, "incus": 6, "reconcile": 39})
+            self.assertTrue(boatd.READY.is_set())
+            self.assertTrue(any("reconciled in 50.000 s" in c.args[0] for c in log.call_args_list))
+        boatd.READY.clear()
+
+    def test_boot_keeps_systemd_and_host_evidence(self):
+        self.f.sh[("systemctl", "show")] = (0, "NRestarts=2\nExecMainStatus=9\nInvocationID=test-id\n")
+        with patch.dict(os.environ, INVOCATION_ID="current-id", EXIT_STATUS="9"), patch.object(boatd, "host_uptime", return_value=86400):
+            boatd.record_boot()
+        boot = boatd.health(fresh=True)["boot"]
+        self.assertEqual(boot["exitStatus"], "9")
+        self.assertEqual(boot["invocationId"], "current-id")
+        self.assertEqual(boot["systemd"]["NRestarts"], "2")
+        self.assertEqual(boot["version"], boatd.VERSION)
+        self.assertEqual(boot["hostUptimeS"], 86400)
+
     def test_healthy(self):
         self.f.sh[("zpool", "list")] = (0, "ONLINE")
         boatd.READY.set()
@@ -818,6 +865,35 @@ unused devices: <none>
         h = boatd.health(fresh=True)
         self.assertEqual((h["ok"], h["mode"], h["reasons"], h["pool"]), (True, "ok", [], {"name": "offbox", "state": "ONLINE"}))
         self.assertEqual((h["queue"], h["running"], h["boot_id"], h["version"]), (1, 1, "boot-2", boatd.VERSION))
+
+    def test_pending_restarts_expose_only_count_and_utc_timestamp(self):
+        record = self.tmp / "restart-pending.json"
+        pending = {"checkedAt": "2026-11-15T03:00:00+00:00",
+                   "services": ["boatd-cmd-bx-private-1.service", "incus.service"]}
+        record.write_text(json.dumps(pending))
+        with patch.object(boatd, "RESTART_PENDING", record):
+            summary = boatd.health(fresh=True)["restartPending"]
+        self.assertEqual(summary, {"count": 2, "since": pending["checkedAt"]})
+        self.assertNotIn("private", json.dumps(summary))
+
+    def test_missing_unreadable_and_malformed_restart_records_are_harmless(self):
+        record = self.tmp / "restart-pending.json"
+        empty = {"count": 0, "since": None}
+        stamp = "2026-11-15T03:00:00Z"
+        with patch.object(boatd, "RESTART_PENDING", record):
+            self.assertEqual(boatd.health(fresh=True)["restartPending"], empty)
+            with patch.object(Path, "read_text", side_effect=PermissionError):
+                self.assertEqual(boatd.restart_pending(), empty)
+            for value in ("{", "[]", "null", "{}", '{"services":null}',
+                          json.dumps({"services": {}, "checkedAt": stamp}),
+                          json.dumps({"services": [1], "checkedAt": stamp}),
+                          json.dumps({"services": ["incus.service"], "checkedAt": None}),
+                          json.dumps({"services": ["incus.service"], "checkedAt": "invalid"}),
+                          json.dumps({"services": ["incus.service"], "checkedAt": "2026-11-15T03:00:00+04:00"}),
+                          json.dumps({"services": [], "checkedAt": stamp})):
+                with self.subTest(value=value):
+                    record.write_text(value)
+                    self.assertEqual(boatd.health(fresh=True)["restartPending"], empty)
 
     def test_degraded_mirror_still_serves_and_says_why(self):
         self.f.sh[("zpool", "list")] = (0, "DEGRADED")

@@ -320,7 +320,7 @@ test.each(["owner", "forChat"])("%s first-turn failures send one attention alert
   expect(store.pendingOutbox().filter(item => item.kind === "control").map(item => item.text)).toEqual([
     "The chat's model isn't available, so I couldn't process that message. Resending it won't fix this.",
   ]);
-  expect(inbounds(store)).toEqual([{ id: "first", state: "done" }]);
+  expect(inbounds(store)).toEqual([{ id: "first", state: "failed" }]);
   expect(store.inboundFailure("first")).toMatchObject({ stage: "execution" });
   expect(control.calls.filter(call => call.path.endsWith("/send"))).toHaveLength(1);
 });
@@ -1135,7 +1135,7 @@ test("an errored step classified between OpenCode's commits, before the native i
   db.close();
   const first = await failedWake(path, "ses_between", base, []);
   // No idle marker yet: the run is between OpenCode's commits, so it is unsettled and the wake is not retried.
-  expect(first.states).toEqual(["done"]);
+  expect(first.states).toEqual(["failed"]);
   expect(first.store.inboundFailure(first.wake)).toMatchObject({ stage: "execution" });
   expect(first.sends()).toBe(1);
   // Execution carries on: retry.scheduled lands, then a tool completes, then the run settles idle.
@@ -1155,7 +1155,7 @@ test("an error step with a pending native retry is never retried, even when that
   // OpenCode recorded the first call as an error with text and a pending retry: the execution is not settled.
   const { path, base } = nativeDb("ses_retry_run", [["msg_retry", { finish: "error", content: [{ type: "text", text: "partial" }], retry: { attempt: 2, at: Date.now() + 120_000 }, error: { type: "provider.internal" } }]]);
   const first = await failedWake(path, "ses_retry_run", base, []);
-  expect(first.states).toEqual(["done"]);
+  expect(first.states).toEqual(["failed"]);
   expect(first.store.inboundFailure(first.wake)).toMatchObject({ stage: "execution" });
   expect(first.sends()).toBe(1);
   // During the backoff the same execution carries on and completes a tool. A terminal step does not prove it stopped.
@@ -1174,7 +1174,7 @@ test("an unfinished native step is never retried, even when that run later compl
   const { path, base } = nativeDb("ses_cont_run", [["msg_open", { content: [] }]]);
   const first = await failedWake(path, "ses_cont_run", base, []);
   // Robob failed the run, but the native row is unfinished: the wake is reported and not retried.
-  expect(first.states).toEqual(["done"]);
+  expect(first.states).toEqual(["failed"]);
   expect(first.store.inboundFailure(first.wake)).toMatchObject({ stage: "execution" });
   expect(first.sends()).toBe(1);
   // The same native row keeps running and finishes with a tool call. The router must still not send again.
@@ -1191,7 +1191,7 @@ test("an unfinished native step is never retried, even when that run later compl
 test("a new chat's first-call error with text is reported without replaying the wake", async () => {
   const { path, base } = nativeDb("ses_text_400", [["msg_text", { finish: "error", content: [{ type: "text", text: "partial" }], error: { type: "aborted" } }]]);
   const run = await failedWake(path, "ses_text_400", base, [120_000]);
-  expect(run.states).toEqual(["done", "done"]);
+  expect(run.states).toEqual(["failed", "failed"]);
   expect(run.store.inboundFailure(run.wake)).toMatchObject({ stage: "execution" });
   expect(run.sends()).toBe(1);
   expect(run.store.pendingOutbox().filter(item => item.kind === "control").map(item => item.text)).toEqual([
@@ -1202,7 +1202,7 @@ test("a new chat's first-call error with text is reported without replaying the 
 test("a new chat's first-call error with reasoning is reported without replaying the wake", async () => {
   const { path, base } = nativeDb("ses_reason_400", [["msg_reason", { finish: "error", content: [{ type: "reasoning", text: "thinking" }], error: { type: "aborted" } }]]);
   const run = await failedWake(path, "ses_reason_400", base, [120_000]);
-  expect(run.states).toEqual(["done", "done"]);
+  expect(run.states).toEqual(["failed", "failed"]);
   expect(run.store.inboundFailure(run.wake)).toMatchObject({ stage: "execution" });
   expect(run.sends()).toBe(1);
 });
@@ -1242,7 +1242,7 @@ test("a run whose tool call sits past a truncated scan is never retried, through
   thread.nativeSessionId = "ses_native_long";
   thread.runs.at(-1)!.status = "interrupted";
   await router.tick();
-  expect(inbounds(store).find(row => row.id === wake)?.state).toBe("done");
+  expect(inbounds(store).find(row => row.id === wake)?.state).toBe("failed");
   expect(store.inboundFailure(wake)).toMatchObject({ stage: "synthetic" });
   setSystemTime(start + 120_000);
   await router.tick();

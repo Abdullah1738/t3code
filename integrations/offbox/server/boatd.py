@@ -368,16 +368,52 @@ def vpn_problem() -> str | None:
 
 
 READY = threading.Event()          # set once the state is there and the start-up reconcile has finished
-STATE = {"problem": "starting", "reconcile": None}
+STATE = {"problem": "starting", "reconcile": None, "boot": None, "phases": {}}
+
+
+def startup_status():
+    problem = STATE["problem"] or ""
+    starting = not READY.is_set() and (
+        problem in ("starting", "waiting for incus", "reconciling runs and boxes after start")
+        or bool(re.fullmatch(r"state dataset \S+ (?:not found \(pool \S+ is MISSING\)|is not mounted)", problem)))
+    return {"starting": starting, "phase": problem if not READY.is_set() else "ready", "startedAt": STARTED}
+
+
+def record_boot():
+    keys = ("NRestarts", "ExecMainCode", "ExecMainStatus", "Result", "InvocationID")
+    rc, out = _sh(["systemctl", "show", "boatd", *["--property=" + k for k in keys]], timeout=3)
+    systemd = dict(line.split("=", 1) for line in out.splitlines() if "=" in line) if rc == 0 else {}
+    STATE["boot"] = {"version": VERSION, "startedAt": STARTED, "hostUptimeS": host_uptime(),
+                     "bootId": boot_id(), "invocationId": os.environ.get("INVOCATION_ID") or systemd.get("InvocationID"),
+                     "exitStatus": os.environ.get("EXIT_STATUS"), "systemd": systemd}
+    log("boot: " + json.dumps(STATE["boot"], sort_keys=True))
+
 _HEALTH = {"ts": 0.0, "v": None}
 _HEALTH_LOCK = threading.Lock()
+
+
+RESTART_PENDING = Path("/var/lib/offbox/restart-pending.json")
+
+
+def restart_pending() -> dict:
+    try:
+        value = json.loads(RESTART_PENDING.read_text())
+        services, since = value["services"], value["checkedAt"]
+        if not isinstance(services, list) or not all(isinstance(s, str) and s for s in services):
+            raise ValueError("invalid pending services")
+        if not isinstance(since, str) or dt.datetime.fromisoformat(since).utcoffset() != dt.timedelta(0):
+            raise ValueError("invalid UTC timestamp")
+        return {"count": len(services), "since": since if services else None}
+    except (OSError, ValueError, KeyError, TypeError):
+        return {"count": 0, "since": None}
 
 
 def health(fresh: bool = False) -> dict:
     """GET /health: no auth, no data about boxes or owners. `ok` means runs can be accepted here."""
     with _HEALTH_LOCK:
-        if not fresh and _HEALTH["v"] and now() - _HEALTH["ts"] < 5:
-            return _HEALTH["v"]
+        cached = _HEALTH["v"]
+        if not fresh and cached and now() - _HEALTH["ts"] < 5:
+            return cached
         reasons = []
         pool = pool_state()
         md = mdraid_state()
@@ -388,11 +424,12 @@ def health(fresh: bool = False) -> dict:
             reasons.append(f"pool {CFG['zpool']} is {pool}")
         if md["state"] == "degraded":
             reasons.append("mdraid degraded: " + ", ".join(f"{k} {v}" for k, v in sorted(md["arrays"].items())))
-        rc, _ = _sh(["incus", "query", "/1.0"], timeout=10)
+        status = startup_status()
+        rc = 0 if status["starting"] else _sh(["incus", "query", "/1.0"], timeout=10)[0]
         if rc != 0:
             ok = False
             reasons.append("incus is not answering")
-        vpn = vpn_problem()
+        vpn = None if status["starting"] else vpn_problem()
         if vpn:
             ok = False
             reasons.append(vpn)
@@ -411,7 +448,8 @@ def health(fresh: bool = False) -> dict:
         out = {"ok": ok, "up": True, "mode": "ok" if not reasons else "degraded", "reasons": reasons,
                "pool": {"name": CFG["zpool"], "state": pool}, "mdraid": md, "queue": queue, "running": running,
                "boot_id": boot_id(), "uptime_s": int(host_uptime()), "boatd_uptime_s": int(now() - STARTED),
-               "version": VERSION}
+               "restartPending": restart_pending(),
+               "version": VERSION, **status, "boot": STATE.get("boot"), "startupPhases": STATE.get("phases", {})}
         _HEALTH.update(ts=now(), v=out)
         return out
 
@@ -1659,8 +1697,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
-    def _err(self, status: int, code: str, message: str, details: dict | None = None) -> None:
-        self._send(status, {**(details or {}), "ok": False, "code": code, "message": message,
+    def _err(self, status: int, code: str, message: str, details: dict | None = None, **extra) -> None:
+        self._send(status, {**(details or {}), **extra, "ok": False, "code": code, "message": message,
                             "error": {"code": code, "message": message}})
 
     def _body(self) -> dict:
@@ -1689,7 +1727,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, health())
         if not READY.is_set():
             # No pool or still reconciling: nothing but /health is answered, so no caller sees half-settled runs.
-            return self._err(503, "server_not_ready", STATE["problem"] or "starting")
+            return self._err(503, "server_not_ready", STATE["problem"] or "starting", **startup_status())
         con = db()
         try:
             who = token_auth(con, self.headers.get("Authorization"))
@@ -2032,6 +2070,16 @@ def _bg(fn, *args) -> None:
 def startup() -> None:
     """Wait for the state (the pool), then reconcile, then open the API. Never exits and never needs a person:
     without the pool boatd keeps answering /health with the reason and looks again every 10 s."""
+    began = phase_at = time.monotonic()
+    record_boot()
+    phase = "pool"
+    def next_phase(next_name):
+        nonlocal phase, phase_at
+        current = time.monotonic()
+        STATE["phases"][phase] = round(current - phase_at, 3)
+        log(f"startup phase={phase} duration_s={STATE['phases'][phase]:.3f}")
+        phase, phase_at = next_name, current
+        _HEALTH.update(ts=0, v=None)
     said = None
     while True:
         prob = state_problem()
@@ -2049,6 +2097,8 @@ def startup() -> None:
             _sh(["zfs", "mount", CFG["state_dataset"]], timeout=60)
         time.sleep(10)
     # Incus stays down while its state directory is not mounted (install-host.sh's drop-in); the pool is here now.
+    next_phase("incus")
+    STATE["problem"] = "waiting for incus"
     for i in range(60):
         if _sh(["incus", "query", "/1.0"], timeout=10)[0] == 0:
             break
@@ -2056,9 +2106,10 @@ def startup() -> None:
         if i % 10 == 0:
             _sh(["systemctl", "start", "incus.socket", "incus.service"], timeout=60)
         time.sleep(2)
+    next_phase("reconcile")
+    STATE["problem"] = "reconciling runs and boxes after start"
     while True:
         try:
-            STATE["problem"] = "reconciling runs and boxes after start"
             init_db()
             con = db()
             try:
@@ -2070,7 +2121,9 @@ def startup() -> None:
             STATE["problem"] = "start-up reconcile failed; retrying (see the boatd journal)"
             log(f"reconcile: {traceback.format_exc()[-1500:]}")
             time.sleep(15)
+    next_phase("ready")
     log(f"reconciled: {json.dumps(STATE['reconcile'])}")
+    log(f"reconciled in {time.monotonic() - began:.3f} s phases={json.dumps(STATE['phases'])}")
     STATE["problem"] = None
     READY.set()
     threading.Thread(target=loop, args=(reap_once, 15, "reaper"), daemon=True).start()
