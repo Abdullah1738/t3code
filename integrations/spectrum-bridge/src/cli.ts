@@ -1,3 +1,4 @@
+import { readHealthSidecar } from "./health-receipts.ts";
 import { messageLengthError } from "./message-length.ts";
 import { cardKind, logCardRender, toolError, toolLog } from "./toollog.ts";
 import { validAgentRequestId, validAnswerStatus } from "./agent-bus.ts";
@@ -574,7 +575,9 @@ export async function loadCommandPayload(command: Command): Promise<Body | undef
     if (size !== Number(before.size) || !unchanged(await handle.stat({ bigint: true }))
       || !unchanged(await lstat(file, { bigint: true }))) throw new CliError("Attachment changed while reading");
     prepared = true;
+    const healthReceipt = readHealthSidecar(file, data.subarray(0, size));
     return { base64: data.subarray(0, size).toString("base64"), name,
+      ...(healthReceipt ? { healthReceipt: JSON.stringify(healthReceipt) } : {}),
       mimeType: mimeType ?? mimeTypes[extname(name).toLowerCase()] ?? "application/octet-stream",
       text, dedupeKey, ...(sessionId === undefined ? {} : { sessionId }) };
   } catch (error) { toolError("cli", "cli.catch6", error);
