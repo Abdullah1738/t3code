@@ -13770,18 +13770,17 @@ const make = Effect.gen(function* () {
     } satisfies ClaimResult;
   });
 
-  const claimCard: KanbanServiceShape["claimCard"] = (threadId, cardId) => {
-    const claim = guard(
+  const claimCard: KanbanServiceShape["claimCard"] = (threadId, cardId) =>
+    guard(
       "card.claim",
       Effect.gen(function* () {
+        yield* reconcileRunFailureUnlocked(threadId);
         const thread = yield* workThreadOf(threadId);
         const card = (yield* upgradeFindings([yield* cardOf(cardId)]))[0]!;
         yield* checkTake(thread, threadId, card);
         return yield* takeCard(threadId, thread.pool, card, "Taken by its work thread");
       }),
     );
-    return reconcileRunFailure(threadId).pipe(Effect.andThen(claim));
-  };
 
   // The card is checked as a draft first, so a refused take leaves nothing
   // behind for the dispatcher to start twice.
@@ -17589,59 +17588,54 @@ const make = Effect.gen(function* () {
     );
   }, Effect.mapError(toKanbanError));
 
-  const reconcileRunFailure = Effect.fn("KanbanService.reconcileRunFailure")(function* (
+  // The caller owns the retry boundary: a nested guard would turn a safe
+  // conflict into a typed failure before the claim's retry loop sees it.
+  const reconcileRunFailureUnlocked = Effect.fn("KanbanService.reconcileRunFailure")(function* (
     threadId: ThreadId,
   ) {
-    yield* Deferred.await(startupReady);
     for (const id of yield* store.threadCards(threadId)) {
-      const initial = yield* store.card(id);
-      if (initial?.stalled?.runFailure?.threadId !== threadId) continue;
-      yield* guard(
-        "card.recoverRunFailure",
-        Effect.gen(function* () {
-          const card = yield* store.card(id);
-          const stalled = card?.stalled;
-          if (
-            card === null ||
-            stalled?.runFailure?.threadId !== threadId ||
-            stalled.by._tag !== "system" ||
-            stalled.by.component !== "dispatcher" ||
-            card.workThreadId !== threadId ||
-            card.stage !== "todo" ||
-            (card.activeThreadId !== null && card.activeThreadId !== threadId)
-          )
-            return;
-          const recovery = yield* freshThreads.laterStartedRun(threadId, stalled.runFailure.runId);
-          if (recovery === null) return;
-          const model = recovery.model ?? (yield* freshThreads.model(threadId));
-          const at = yield* nowIso;
-          const next: KanbanCard = {
-            ...card,
-            stalled: null,
-            stage: "working",
-            activeThreadId: threadId,
-            activeRole: "work",
-            activePool: Rules.poolOf(yield* store.pools(card.boardId), model ?? card.model),
-            nudgedAt: null,
-            movedAt: at,
-            updatedAt: at,
-          };
-          yield* logEvent(next, { _tag: "system", component: "dispatcher" }, "flagged", {
-            fromStage: card.stage,
-            toStage: "working",
-            body: `Cleared run-failed stall: work resumed in ${recovery.runId}`,
-          });
-          yield* saveCard(next);
-          yield* Effect.logInfo("restart-pacing.stall_auto_cleared", {
-            cardId: id,
-            threadId,
-            runId: recovery.runId,
-          });
-        }),
-        id,
-      );
+      const card = yield* store.card(id);
+      const stalled = card?.stalled;
+      if (
+        card === null ||
+        stalled?.runFailure?.threadId !== threadId ||
+        stalled.by._tag !== "system" ||
+        stalled.by.component !== "dispatcher" ||
+        card.workThreadId !== threadId ||
+        card.stage !== "todo" ||
+        (card.activeThreadId !== null && card.activeThreadId !== threadId)
+      )
+        continue;
+      const recovery = yield* freshThreads.laterStartedRun(threadId, stalled.runFailure.runId);
+      if (recovery === null) continue;
+      const model = recovery.model ?? (yield* freshThreads.model(threadId));
+      const at = yield* nowIso;
+      const next: KanbanCard = {
+        ...card,
+        stalled: null,
+        stage: "working",
+        activeThreadId: threadId,
+        activeRole: "work",
+        activePool: Rules.poolOf(yield* store.pools(card.boardId), model ?? card.model),
+        nudgedAt: null,
+        movedAt: at,
+        updatedAt: at,
+      };
+      yield* logEvent(next, { _tag: "system", component: "dispatcher" }, "flagged", {
+        fromStage: card.stage,
+        toStage: "working",
+        body: `Cleared run-failed stall: work resumed in ${recovery.runId}`,
+      });
+      yield* saveCard(next);
+      yield* Effect.logInfo("restart-pacing.stall_auto_cleared", {
+        cardId: id,
+        threadId,
+        runId: recovery.runId,
+      });
     }
   }, Effect.mapError(toKanbanError));
+  const reconcileRunFailure = (threadId: ThreadId) =>
+    guard("card.recoverRunFailure", reconcileRunFailureUnlocked(threadId));
   return KanbanService.of({
     ready: Deferred.await(startupReady),
     boards: readDb(store.boards),
