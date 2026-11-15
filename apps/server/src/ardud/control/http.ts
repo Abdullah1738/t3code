@@ -71,7 +71,6 @@ import {
 import { CONTROL_ACTOR, controlActor, telegramAnswerOwner } from "./actor.ts";
 import {
   formatModel,
-  lastAssistantText,
   messageSummary,
   modelSelectionFrom,
   parseSince,
@@ -700,11 +699,6 @@ const makeRoutes = Effect.gen(function* () {
       })
       .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
 
-  const readMessages = (threadId: string) =>
-    threads
-      .getThreadRecords(ThreadId.make(threadId), ["messages"])
-      .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
-
   const filterByOrigin = Effect.fn("ControlHttp.filterByOrigin")(function* (
     shells: ReadonlyArray<OrchestrationV2ThreadShell>,
     origin: string,
@@ -1240,6 +1234,22 @@ const makeRoutes = Effect.gen(function* () {
         "since must be an ISO timestamp or epoch milliseconds.",
       );
     }
+    const role = params.get("role") ?? "user";
+    if (role !== "user" && role !== "assistant" && role !== "system" && role !== "all") {
+      return yield* fail("invalid_request", "role must be user, assistant, system or all.");
+    }
+    const rawThreadIds = params.get("threadIds");
+    const threadIds =
+      rawThreadIds === null ? undefined : rawThreadIds.split(",").map((id) => id.trim());
+    if (
+      threadIds !== undefined &&
+      (threadIds.length > 50 || threadIds.some((id) => id.length === 0))
+    ) {
+      return yield* fail(
+        "invalid_request",
+        "threadIds must contain between 1 and 50 nonempty thread ids.",
+      );
+    }
     const cursor = yield* decodeUserMessageCursor(params.get("cursor"));
     return yield* ReplyBuilders.bounded(
       Effect.gen(function* () {
@@ -1247,6 +1257,8 @@ const makeRoutes = Effect.gen(function* () {
           .userMessagesSince({
             since,
             cursor,
+            role,
+            ...(threadIds === undefined ? {} : { threadIds }),
             limit: clampInt(params.get("limit"), 200, 1000),
           })
           .pipe(
@@ -1269,7 +1281,7 @@ const makeRoutes = Effect.gen(function* () {
               : Buffer.from(encodeUserMessageCursorJson(page.next)).toString("base64url"),
         });
       }).pipe(NodeSqliteClient.foregroundReads),
-      "poll",
+      "controlRead",
     );
   });
 
@@ -1277,8 +1289,8 @@ const makeRoutes = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
     const threadId = yield* param("threadId");
     const params = yield* searchParams;
-    // Bridge polls read one thread: they queue on the poll lane only, never
-    // behind thread lists, HTTP snapshots or MCP reads.
+    // Share the single foreground control permit with cross-thread messages;
+    // a burst must leave the second foreground reader available to the UI.
     const page = yield* ReplyBuilders.bounded(
       Effect.gen(function* () {
         yield* getShell(threadId);
@@ -1299,8 +1311,8 @@ const makeRoutes = Effect.gen(function* () {
                 : clampInt(params.get("limit"), DEFAULT_MESSAGE_LIMIT, 1000),
           })
           .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
-      }),
-      "poll",
+      }).pipe(NodeSqliteClient.foregroundReads),
+      "controlRead",
     );
     return yield* encoded({
       ok: true,
@@ -1755,12 +1767,14 @@ const makeRoutes = Effect.gen(function* () {
       }
     }).pipe(Effect.timeoutOption(Duration.millis(timeoutMs)));
     const detail = yield* threadDetail(shell.id);
-    const records = yield* readMessages(threadId);
+    const lastAssistant = yield* store
+      .lastAssistant(threadId, runIdParam ?? detail.run?.runId ?? null)
+      .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
     return json({
       ok: true,
       timedOut: Option.isNone(waited),
       thread: detail,
-      lastAssistant: lastAssistantText(records.messages, runIdParam ?? detail.run?.runId),
+      lastAssistant,
     });
   });
 

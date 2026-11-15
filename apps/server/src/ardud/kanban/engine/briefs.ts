@@ -189,6 +189,7 @@ export const reviewBrief = (
   priorFindings: ReadonlyArray<string>,
   /** A new thread has no earlier step in it, so it gets the whole brief even on a later step. */
   freshThread = false,
+  gateClearedHead: string | null = null,
 ) => {
   const steps = chain?.steps.length ?? 1;
   const step = Math.min(card.reviewStep, steps - 1) + 1;
@@ -196,6 +197,9 @@ export const reviewBrief = (
   // A review the board restarted after a failed run or a missing verdict says so first.
   const retried = freshThread ? null : reviewRetryNote(card);
   return lines(
+    gateClearedHead === null
+      ? null
+      : `Your earlier verdict at ${gateClearedHead} was refused by a gate that is now gone: re-check quickly and record it again if the head is unchanged.`,
     retried,
     retried === null ? null : "",
     continuing

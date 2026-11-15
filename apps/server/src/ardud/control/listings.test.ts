@@ -27,6 +27,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
+import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Etag from "effect/http/Etag";
 import * as HttpPlatform from "effect/http/HttpPlatform";
@@ -58,6 +59,7 @@ import * as Analytics from "../analytics/Analytics.ts";
 import { guidanceContext } from "../imessage/guidance.ts";
 import { accumulate, finishRollup, makeAccumulator } from "../analytics/rollup.ts";
 import * as StartupPhaseLog from "../observability/StartupPhaseLog.ts";
+import * as ReplyBuilders from "../http/ReplyBuilders.ts";
 
 const askedAt = DateTime.makeUnsafe("2026-01-01T00:05:00.000Z");
 const encodeThreadPayload = Schema.encodeEffect(
@@ -249,6 +251,7 @@ const makeHarness = (
   authFailures: Array<unknown> = [],
   realSnapshots = false,
   heldList?: { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
+  heldMessage?: { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
 ) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
@@ -284,6 +287,11 @@ const makeHarness = (
     const targetedReads = yield* Ref.make<Array<ReadonlyArray<string>>>([]);
     const shellReads = yield* Ref.make(0);
     const recordReads = yield* Ref.make(0);
+    const authenticated = yield* Queue.unbounded<void>();
+    const replyBuilders = yield* ReplyBuilders.ReplyBuilders.pipe(
+      Effect.provide(ReplyBuilders.layer),
+    );
+    const recordCollections = yield* Ref.make<Array<ReadonlyArray<string>>>([]);
     const config = yield* ServerConfig.ServerConfig.pipe(
       Effect.provide(
         ServerConfig.layerTest(process.cwd(), { prefix: "t3-control-listings" }).pipe(
@@ -332,7 +340,17 @@ const makeHarness = (
       },
       getThreadShell: (threadId) =>
         sql
-          .withTransaction(sql`SELECT 1`)
+          .withTransaction(
+            sql`SELECT 1`.pipe(
+              Effect.andThen(
+                heldMessage === undefined
+                  ? Effect.void
+                  : Deferred.succeed(heldMessage.entered, undefined).pipe(
+                      Effect.andThen(Deferred.await(heldMessage.release)),
+                    ),
+              ),
+            ),
+          )
           .pipe(
             Effect.orDie,
             Effect.andThen(Ref.update(shellReads, (count) => count + 1)),
@@ -343,8 +361,11 @@ const makeHarness = (
                     null),
             ),
           ),
-      getThreadRecords: (threadId) =>
-        Ref.update(recordReads, (n) => n + 1).pipe(Effect.as(projectionFor(threadId))),
+      getThreadRecords: (threadId, collections) =>
+        Ref.update(recordReads, (n) => n + 1).pipe(
+          Effect.andThen(Ref.update(recordCollections, (reads) => [...reads, collections ?? []])),
+          Effect.as(projectionFor(threadId)),
+        ),
     });
     const diagnostics = yield* Effect.serviceOption(DatabaseDiagnostics.DatabaseDiagnostics);
     const web = yield* Effect.acquireRelease(
@@ -365,6 +386,7 @@ const makeHarness = (
                         : sql`SELECT 1`.pipe(
                             NodeSqliteClient.authReadOnly,
                             Effect.orDie,
+                            Effect.andThen(Queue.offer(authenticated, undefined)),
                             Effect.as({
                               sessionId: AuthSessionId.make("session-cli"),
                               subject: "cli-issued-session",
@@ -436,6 +458,7 @@ const makeHarness = (
             disableLogger: true,
             middleware: (effect) =>
               effect.pipe(
+                Effect.provideService(ReplyBuilders.ReplyBuilders, replyBuilders),
                 Effect.provideService(Statement.CurrentTransformer, (statement) => {
                   statements.push(statement.compile());
                   return Effect.succeed(statement);
@@ -477,6 +500,8 @@ const makeHarness = (
       statements,
       shellReads,
       recordReads,
+      authenticated,
+      recordCollections,
       startupLog,
       sql,
     };
@@ -747,6 +772,183 @@ describe("control listings", () => {
       ),
   );
 
+  it.live("pages every role across selected threads using indexed ranges", () =>
+    run(({ get, sql, statements }) =>
+      Effect.gen(function* () {
+        const at = "2026-03-01T00:00:00.000Z";
+        for (const threadId of ["quiet", "live-archived", "live-deleted", "missing"]) {
+          for (const role of ["user", "assistant", "system"]) {
+            const id = `${threadId}:${role}`;
+            yield* sql`INSERT INTO orchestration_v2_projection_messages ${sql.insert({
+              message_id: id,
+              thread_id: threadId,
+              run_id: null,
+              node_id: null,
+              role,
+              streaming: 0,
+              created_at: at,
+              updated_at: at,
+              payload_json: JSON.stringify({
+                id,
+                threadId,
+                runId: null,
+                nodeId: null,
+                role,
+                text: id,
+                attachments: [],
+                streaming: false,
+                createdBy: "user",
+                creationSource: "web",
+                createdAt: at,
+                updatedAt: at,
+              }),
+            })}`;
+          }
+        }
+        const since = Date.parse(at) - 1;
+        for (const role of ["user", "assistant", "system", "all"]) {
+          for (const filter of [
+            "",
+            "&threadIds=quiet",
+            "&threadIds=quiet,live-archived",
+            "&threadIds=missing,live-deleted",
+          ]) {
+            const ids: string[] = [];
+            let cursor: string | null = null;
+            do {
+              const response: Effect.Success<ReturnType<typeof get>> = yield* get(
+                `/messages?since=${since}&role=${role}${filter}&limit=1${cursor === null ? "" : `&cursor=${cursor}`}`,
+              );
+              assert.equal(response.status, 200);
+              ids.push(...response.body.messages.map((m: { messageId: string }) => m.messageId));
+              cursor = response.body.nextCursor;
+            } while (cursor !== null);
+            const expectedThreads = filter.includes("missing")
+              ? []
+              : filter === "&threadIds=quiet"
+                ? ["quiet"]
+                : ["quiet", "live-archived"];
+            const expected = expectedThreads
+              .flatMap((id) =>
+                (role === "all" ? ["user", "assistant", "system"] : [role]).map(
+                  (r) => `${id}:${r}`,
+                ),
+              )
+              .sort();
+            assert.deepStrictEqual(ids, expected);
+          }
+        }
+        const fifty = Array.from({ length: 50 }, (_, n) => `unknown-${n}`).join(",");
+        assert.equal((yield* get(`/messages?since=${since}&threadIds=${fifty}`)).status, 200);
+        for (const [query, bindings] of statements.filter(([query]) =>
+          query.includes("WITH total AS"),
+        )) {
+          const plan = yield* sql.unsafe<{ detail: string }>(
+            `EXPLAIN QUERY PLAN ${query}`,
+            bindings as ReadonlyArray<string | number | null>,
+          );
+          assert.equal(
+            plan.filter((row) =>
+              /SEARCH m USING (?:COVERING )?INDEX ardud_control_(user_)?messages_since_idx/.test(
+                row.detail,
+              ),
+            ).length,
+            2,
+          );
+          assert.isFalse(plan.some((row) => /SCAN (m|t)($| )/.test(row.detail)));
+        }
+      }),
+    ),
+  );
+
+  it.live("list and detail expose the event marker even when updatedAt is unchanged", () =>
+    run(({ get, sql }) =>
+      Effect.gen(function* () {
+        let previous = 0;
+        for (let version = 0; version < 3; version++) {
+          yield* sql`INSERT INTO orchestration_events
+          (event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+           actor_kind, payload_json, metadata_json, application_event_version)
+          VALUES (${`marker:${version}`}, 'thread', 'quiet', ${version}, 'message.updated',
+            '2026-01-01T00:00:00.000Z', 'server', '{}', '{}', 2)`;
+          const list = yield* get("/threads?ids=quiet");
+          const detail = yield* get("/threads/quiet");
+          assert.equal(list.status, 200);
+          assert.equal(detail.status, 200);
+          const marker = list.body.threads[0].changeMarker;
+          assert.isAbove(marker, previous);
+          assert.equal(detail.body.thread.changeMarker, marker);
+          assert.equal(detail.body.thread.updatedAt, list.body.threads[0].updatedAt);
+          previous = marker;
+        }
+      }),
+    ),
+  );
+
+  it.live("wait returns the last nonblank assistant without reading message records", () =>
+    run(({ get, sql, statements, recordReads, recordCollections }) =>
+      Effect.gen(function* () {
+        const at = "2026-03-01T00:00:00.000Z";
+        for (const [id, role, text, createdAt] of [
+          ["older", "assistant", "old", "2026-02-28T00:00:00Z"],
+          ["A", "assistant", "upper", at],
+          ["a", "assistant", " lower ", at],
+          ["blank", "assistant", "\u00a0\u2003\ufeff", "2026-03-02T00:00:00Z"],
+          ["user", "user", "newer user", "2026-03-03T00:00:00Z"],
+          ["system", "system", "newer system", "2026-03-03T00:00:00Z"],
+        ]) {
+          yield* sql`INSERT INTO orchestration_v2_projection_messages ${sql.insert({
+            message_id: id,
+            thread_id: "quiet",
+            run_id: null,
+            node_id: null,
+            role,
+            streaming: 0,
+            created_at: createdAt,
+            updated_at: createdAt,
+            payload_json: JSON.stringify({
+              id,
+              threadId: "quiet",
+              runId: null,
+              nodeId: null,
+              role,
+              text,
+              createdBy: "agent",
+              creationSource: "provider",
+              attachments: [],
+              streaming: false,
+              createdAt,
+              updatedAt: createdAt,
+            }),
+          })}`;
+        }
+        const result = yield* get("/threads/quiet/wait");
+        assert.equal(result.status, 200);
+        assert.isFalse(result.body.timedOut);
+        assert.deepStrictEqual(result.body.lastAssistant, {
+          text: "upper",
+          messageId: "A",
+          runId: null,
+        });
+        assert.equal(yield* Ref.get(recordReads), 2);
+        assert.isTrue(
+          (yield* Ref.get(recordCollections)).every(
+            (collections) => !collections.includes("messages"),
+          ),
+        );
+        assert.isFalse(
+          statements.some(
+            ([q]) =>
+              /SELECT payload_json\s+FROM orchestration_v2_projection_messages/.test(q) &&
+              !q.includes("message_id IN"),
+          ),
+        );
+        yield* sql`DELETE FROM orchestration_v2_projection_messages WHERE thread_id = 'quiet'`;
+        assert.isNull((yield* get("/threads/quiet/wait")).body.lastAssistant);
+      }),
+    ),
+  );
+
   it.live("does not decode user payloads outside the bounded cross-thread page", () =>
     run(({ get, sql }) =>
       Effect.gen(function* () {
@@ -800,6 +1002,13 @@ describe("control listings", () => {
           "since=garbage",
           "since=Infinity",
           "since=8640000000000001",
+          "since=0&role=",
+          "since=0&role=bogus",
+          "since=0&role=USER",
+          "since=0&threadIds=",
+          "since=0&threadIds=quiet,",
+          "since=0&threadIds=quiet,,other",
+          `since=0&threadIds=${Array.from({ length: 51 }, () => "quiet").join(",")}`,
           "since=0&cursor=",
           "since=0&cursor=not!base64",
           "since=0&cursor=e30",
@@ -1376,6 +1585,76 @@ describe("control listings", () => {
           yield* Fiber.join(holder);
         }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live.each([
+    "/threads/quiet/messages",
+    "/threads/quiet/messages?since=0&role=user&all=true",
+    "/messages?since=0&limit=1000",
+  ])("GET %s completes while the background reader is held", (endpoint) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "control-message-lane-" });
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const harness = yield* makeHarness();
+        const expected = yield* harness.get(endpoint);
+        assert.equal(expected.status, 200);
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const holder = yield* sql
+          .withTransaction(
+            Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          )
+          .pipe(NodeSqliteClient.readOnly, NodeSqliteClient.backgroundReads, Effect.forkChild);
+        yield* Deferred.await(entered);
+        yield* Effect.gen(function* () {
+          const response = yield* harness.get(endpoint);
+          assert.equal(response.status, 200);
+          assert.deepEqual(response.body, expected.body);
+          assert.isUndefined(holder.pollUnsafe());
+        }).pipe(Effect.timeout("2 seconds"), Effect.ensuring(Deferred.succeed(release, undefined)));
+        yield* Fiber.join(holder);
+      }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("a control message burst leaves a foreground reader for the UI", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "control-message-ui-" });
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const harness = yield* makeHarness(undefined, [], new Set(), [], false, undefined, {
+          entered,
+          release,
+        });
+        const burst = yield* Effect.all(
+          Array.from({ length: 6 }, () => harness.get("/threads/quiet/messages?all=true")),
+          { concurrency: "unbounded" },
+        ).pipe(Effect.forkChild);
+        yield* Deferred.await(entered);
+        // Authentication precedes control admission, so every request has reached the burst.
+        yield* Effect.forEach(Array.from({ length: 6 }), () => Queue.take(harness.authenticated));
+        const crossThread = yield* harness.get("/messages?since=0").pipe(Effect.forkChild);
+        yield* Queue.take(harness.authenticated);
+        yield* Effect.gen(function* () {
+          const rows = yield* sql
+            .withTransaction(sql`SELECT 123 AS value`)
+            .pipe(NodeSqliteClient.readOnly, NodeSqliteClient.foregroundReads);
+          assert.equal(rows[0]!.value, 123);
+          assert.equal((yield* harness.get("/health")).status, 200);
+          assert.isUndefined(burst.pollUnsafe());
+          assert.isUndefined(crossThread.pollUnsafe());
+        }).pipe(Effect.timeout("2 seconds"), Effect.ensuring(Deferred.succeed(release, undefined)));
+        for (const response of yield* Fiber.join(burst)) assert.equal(response.status, 200);
+        assert.equal((yield* Fiber.join(crossThread)).status, 200);
+      }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
   it.live("a held list transaction leaves both foreground slots available", () =>

@@ -2047,6 +2047,7 @@ const make = Effect.gen(function* () {
             detail =
               " This delegation is still being created; retry task_status with this task id, or retry delegate_task with the same clientRequestId.";
             break;
+          case "abandoned":
           case "never_saved":
             if (!callerOwned) break;
             // A task committed after the first projection read must win over a missing receipt.
@@ -2065,7 +2066,9 @@ const make = Effect.gen(function* () {
             task = findDelegatedTask(parentProjection, scope.thread.threadId, taskId);
             if (task === undefined)
               detail =
-                " This delegation was never saved. Retry delegate_task with the same clientRequestId.";
+                state.status === "abandoned"
+                  ? ` This delegation was not created: the create stopped after ${state.elapsedSeconds} s waiting at dispatch/threadManagement.dispatch (${state.reason}). Nothing ran. Retry delegate_task with the same clientRequestId.`
+                  : " This delegation was never saved. Retry delegate_task with the same clientRequestId.";
             break;
         }
       }

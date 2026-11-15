@@ -170,15 +170,14 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
   let lastMaintenanceDay: string | undefined;
   let retryAt = 0;
   const dirtyDays = new Set<string>();
-  // Only recently read views are resident. Each owns bounded groups and 500 samples, never the day log.
+  // Only recently read views are resident. Each owns bounded per-kind samples, never the day log.
   const views = new Map<
     string,
     {
       day: string;
       filter: AnalyticsReadInput | undefined;
       accumulator: ReturnType<typeof makeAccumulator>;
-      samples: ReturnType<ReturnType<typeof sampleMix>["entries"]>;
-      kinds: string[];
+      samples: ReturnType<typeof sampleMix>;
       signature: string;
     }
   >();
@@ -287,8 +286,7 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
     }
     return {
       accumulator,
-      samples: samples.entries(),
-      kinds: samples.kinds(),
+      samples,
     };
   });
 
@@ -309,7 +307,6 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
       filter,
       accumulator: scan.accumulator,
       samples: scan.samples,
-      kinds: scan.kinds,
       signature: fingerprint,
     };
     // FIFO bounds cardinality across days and arbitrary filter combinations.
@@ -486,15 +483,11 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
         const fingerprint = yield* signature(first.day, yield* listFiles());
         for (const view of views.values()) {
           if (view.day !== first.day) continue;
-          const samples = sampleMix(500, view.filter?.kind, view.kinds);
-          for (const sample of view.samples) samples.add(sample.event, sample.order);
           for (const entry of attempted) {
             if (!matches(entry.event, view.filter)) continue;
             accumulate(view.accumulator, entry.event);
-            samples.add(entry.event);
+            view.samples.add(entry.event);
           }
-          view.samples = samples.entries();
-          view.kinds = samples.kinds();
           view.signature = fingerprint;
         }
         // Held entries remain in pending (and consume capacity) until append succeeds.
@@ -685,7 +678,7 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
           return readPager.read(
             input,
             withAskLatency(finishRollup(view.accumulator, input.day, generatedAt), input),
-            view.samples.map((sample) => sample.event),
+            view.samples.entries().map((sample) => sample.event),
           );
         }),
       )

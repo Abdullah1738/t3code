@@ -481,7 +481,9 @@ class CheckEntry(Base):
                'WATCH_ID': 'money-cases', 'MONEY_CASES_DIR': str(self.data),
                'MONEY_CASES_MSGS': str(fake), 'ROBOB_TOOL_LOG_DIR': str(self.tmp / 'runner-logs')}
         started = time.monotonic()
-        with ControlServer() as server:
+        with ControlServer(threads=[{'threadId': 'a', 'title': 'iMessage test',
+                                     'creationSource': 'server', 'origin': 'imessage',
+                                     'updatedAt': mc.charges.iso(now)}]) as server:
             env['T3_CONTROL_TOKEN_FILE'] = str(server.credentials)
             done = subprocess.run(['/usr/bin/python3', '-B', str(Path(__file__).with_name('cases.py')), 'check'],
                                   env=env, stdin=subprocess.DEVNULL, start_new_session=True,
@@ -490,6 +492,19 @@ class CheckEntry(Base):
         self.assertLess(time.monotonic() - started, 5)
         state = json.loads((self.wd / 'pings.json').read_text())
         self.assertEqual(state['timing']['owner_queries'], 3)
+        timing = state['timing']
+        expected = {'owner_list_pages': 2, 'owner_threads_selected': 1,
+                    'owner_threads_fresh': 0, 'owner_threads_needed': 1,
+                    'owner_threads_fetched': 1, 'owner_timeouts': 0, 'owner_cache_size': 1}
+        for key, value in expected.items():
+            self.assertEqual(timing[key], value, key)
+        for key in ('owner_list_ms', 'owner_fetch_ms_max'):
+            self.assertGreaterEqual(timing[key], 0)
+        self.assertEqual(timing['owner_result'], 'ok')
+        self.assertNotIn('I paid', json.dumps(timing))
+        self.assertNotIn('iMessage', json.dumps(timing))
+        self.assertNotIn('test-secret', json.dumps(timing))
+
         self.assertEqual(state['timing']['msgs_calls'], 2)
         self.assertEqual(trace.read_text().splitlines(), ['search', 'show'])
         questions = json.loads((self.wd / 'scratch-books/questions.json').read_text())['questions']
@@ -3023,7 +3038,7 @@ class CheckBudget(Base):
                 self.assertEqual(stats['charge_census']['noon'], dict(open=1, matched=0,
                     proven_clean=0, limited=1, error=0, not_checked=0))
 
-    def test_reserved_order_reads_precede_owner_and_have_independent_slices(self):
+    def test_owner_precedes_reserved_order_reads_with_independent_slices(self):
         now = at('2026-11-14T12:00')
         self.seed([now - dt.timedelta(days=3, hours=n) for n in range(2)])
         with mc.Locked(self.data, 'questions') as book:
@@ -3042,7 +3057,7 @@ class CheckBudget(Base):
         with patch.object(mc.time, 'time', lambda: clock[0]), \
                 patch.object(mc.charges.order_lookup, 'read', orders):
             mc.follow(self.data, now, self.root, 1030, finder(), owner)
-        self.assertEqual(calls[:2], [('noon', 10), ('careem', 2)])
+        self.assertEqual(calls[:3], [('owner', 0), ('noon', 10), ('careem', 2)])
         self.assertTrue(all(q['unverified'] for q in self.questions()))
 
     def test_slow_external_source_leaves_time_for_order_lanes(self):
@@ -3091,16 +3106,43 @@ class CheckBudget(Base):
         with patch.object(mc.time, 'time', lambda: clock[0]), \
                 patch.object(mc.time, 'monotonic', lambda: clock[0]):
             mc.follow(self.data, now, self.root, 1020, finder(), owner, stats=stats)
-        self.assertEqual(calls, [4])
+        self.assertEqual(calls, [mc.charges.OWNER_BUDGET])
         self.assertFalse(self.questions()[0].get('unverified'))
         self.assertEqual(stats['owner_threads_ms'], 2500)
+
+    def test_warm_owner_read_precedes_twenty_second_msgs_lookup(self):
+        now = at('2026-10-25T12:00')
+        self.seed([now - dt.timedelta(hours=1)])
+        with ControlServer() as server:
+            mc.charges.owner_texts(now - dt.timedelta(hours=2), now,
+                                   cache_path=self.data / 'owner-texts.json')
+            server.calls.clear()
+            clock, sequence = [1000.0], []
+            def owner(*args, deadline=None):
+                sequence.append('owner')
+                self.assertEqual(deadline - clock[0], mc.charges.OWNER_BUDGET)
+                return mc.charges.owner_texts(*args, deadline=deadline, stats=stats,
+                                              cache_path=self.data / 'owner-texts.json')
+            def msgs(*args, **kwargs):
+                sequence.append('msgs')
+                clock[0] += 20
+                raise mc.charges.Lookup('fixture: msgs consumed 20 seconds')
+            stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+            with patch.object(mc.time, 'time', lambda: clock[0]):
+                mc.follow(self.data, now, self.root, 1040, msgs, owner, stats=stats)
+            self.assertEqual(sequence[0], 'owner')
+            self.assertIn('msgs', sequence)
+            self.assertEqual(stats['owner_result'], 'ok')
+            self.assertEqual(stats['owner_threads_fresh'], 1)
+            self.assertEqual(stats['owner_threads_fetched'], 0)
+            self.assertEqual(stats['owner_queries'], 2)
 
     def test_owner_prefetch_leaves_budget_for_questions(self):
         now = at('2026-10-25T12:00')
         self.seed([now - dt.timedelta(hours=n) for n in range(3)])
 
         def unavailable(*args, deadline=None):
-            self.assertEqual(deadline, 1004)
+            self.assertEqual(deadline, 1000 + mc.charges.OWNER_BUDGET)
             raise mc.LookupTimeout('out of time')
 
         with patch.object(mc.time, 'time', return_value=1000):

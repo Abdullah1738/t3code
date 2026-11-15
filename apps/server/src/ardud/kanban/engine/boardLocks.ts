@@ -15,7 +15,7 @@ import * as Metrics from "../../../observability/Metrics.ts";
 
 // A board-wide writer excludes card writers; independent card writers share the gate.
 const BOARD_PERMITS = 1_000_000;
-const LONG_HOLD_MS = 5_000;
+const LONG_HOLD_MS = SavedWrite.LONG_HOLD_MS;
 const RELEASE_HISTORY_SIZE = 256;
 
 const shortLabel = (label: string) => label.replace(/^KanbanService\.(?:tickStep:)?/, "");
@@ -210,9 +210,14 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
       cardId: holder.cardId ?? null,
       heldForMs: Math.max(0, now - holder.acquiredAtMs),
     }));
-  const recordHold = Effect.fnUntraced(function* (holder: Holder, waiters: number) {
+  const recordHold = Effect.fnUntraced(function* (
+    holder: Holder,
+    waiters: number,
+    finish?: (long: boolean) => ReadonlyArray<SavedWrite.SubStep> | undefined,
+  ) {
     const now = yield* Clock.currentTimeMillis;
     const heldMs = Math.max(0, now - holder.acquiredAtMs);
+    const subSteps = finish?.(heldMs >= LONG_HOLD_MS);
     yield* Metric.update(
       Metric.withAttributes(
         Metrics.kanbanBoardLockHoldDuration,
@@ -221,6 +226,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
       Duration.millis(heldMs),
     );
     if (heldMs < LONG_HOLD_MS) return;
+    if (subSteps !== undefined) (yield* SavedWrite.subStepReporter)(subSteps);
     yield* Metrics.increment(Metrics.kanbanBoardLockLongHoldTotal, { name: holder.label });
     const fields = {
       "board.observed_at_ms": now,
@@ -232,6 +238,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
       "board.acquired_at_ms": holder.acquiredAtMs,
       "board.held_ms": heldMs,
       "board.waiters": waiters,
+      ...(subSteps === undefined ? {} : { subSteps }),
     };
     yield* Effect.logWarning(
       // Fixed internal diagnostic fields; encoding must not add a failure to lock release.
@@ -460,8 +467,13 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
           // existing release path owns all holder cleanup and permit ordering.
           const primary =
             target.lock === "card" || (target.lock === "gate" && op.cardId === undefined);
+          const finish = primary
+            ? (yield* SavedWrite.subStepObserver)?.hold(op.fiberId)
+            : undefined;
           return primary
-            ? Effect.suspend(() => recordHold(holder, board.waiters)).pipe(Effect.andThen(release))
+            ? Effect.suspend(() => recordHold(holder, board.waiters, finish)).pipe(
+                Effect.andThen(release),
+              )
             : release;
         }).pipe(
           Effect.ensuring(

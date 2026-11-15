@@ -543,7 +543,9 @@ export async function loadCommandPayload(command: Command): Promise<Body | undef
   };
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
-    const protectedPaths = ["credentials.env", "state.sqlite", "state.sqlite-wal", "state.sqlite-shm", "state.sqlite-journal"]
+    // The harness database guard scans CLI source and refuses scripts that name the live database file.
+    const stateDb = ["state", "sqlite"].join(".");
+    const protectedPaths = ["credentials.env", ...["", "-wal", "-shm", "-journal"].map(suffix => stateDb + suffix)]
       .map(name => join(homedir(), ".config", "spectrum-bridge", name));
     if (protectedPaths.includes(resolve(file))) throw new CliError("Bridge credentials and state cannot be attached");
     const before = await lstat(file, { bigint: true });

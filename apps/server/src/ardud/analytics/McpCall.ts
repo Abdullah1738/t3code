@@ -61,6 +61,7 @@ export class McpCall extends Context.Service<
     saved: boolean | "unknown";
     replyFailure?: "reply_timeout" | "reply_error";
     replyStage?: string;
+    replySubSteps?: ReadonlyArray<{ readonly subStep: string; readonly ms: number }>;
     handlerErrorTag?: string;
     handlerOutcome?: "timeout" | "refused";
   }
@@ -82,6 +83,7 @@ const BOARD_BUSY =
 const TYPED_OUTCOMES = {
   TimeoutError: "timeout",
   PullRequestWatchTimeoutError: "timeout",
+  PullRequestToolTimeoutError: "timeout",
   PreviewAutomationTimeoutError: "timeout",
   PreviewAutomationRecordingDeadlineExpiredError: "timeout",
   PreviewAutomationUnavailableError: "refused",
@@ -209,7 +211,11 @@ export function callOutcome(
       outcome: "interrupted",
       saved: state.saved,
       errorPhase: state.phase,
-      props: { code: "unknown", ...interruptionProps(exit.cause) },
+      props: {
+        code: "unknown",
+        ...interruptionProps(exit.cause),
+        ...(state.replySubSteps === undefined ? {} : { subSteps: state.replySubSteps }),
+      },
     };
   const output =
     exit._tag === "Success" && !(exit.value instanceof McpSchema.InputRequired)
@@ -312,6 +318,7 @@ export function callOutcome(
     saved,
     props: {
       ...(state.replyStage === undefined ? {} : { phase: state.replyStage }),
+      ...(state.replySubSteps === undefined ? {} : { subSteps: state.replySubSteps }),
       code:
         state.replyFailure ??
         (busy

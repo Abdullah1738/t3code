@@ -73,6 +73,7 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
   const parent = yield* SavedWrite.observer;
   const parentCommitting = yield* SavedWrite.commitObserver;
   const call = yield* Effect.serviceOption(McpCall);
+  let slowSubSteps: ReadonlyArray<SavedWrite.SubStep> = [];
   let commitStarted = false;
   let receipt: SavedWrite.Saved | undefined;
   const attributes = () => ({
@@ -147,6 +148,11 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
     // Interactive pre-write reads must not queue behind tick and maintenance scans.
     (effect) => (timingOnly ? effect : NodeSqliteClient.foregroundReads(effect)),
     Effect.provideService(SavedWrite.traceObserver, { span, enter, mark }),
+    Effect.provideService(SavedWrite.subStepReporter, (steps) => {
+      slowSubSteps = [...slowSubSteps, ...steps].sort((a, b) => b.ms - a.ms).slice(0, 3);
+      span.attribute("kanban.reply.sub_steps", slowSubSteps);
+      if (call._tag === "Some") call.value.replySubSteps = slowSubSteps;
+    }),
     Effect.provideService(
       BoardLocks.writeWaitMs,
       timingOnly ? yield* BoardLocks.writeWaitMs : ADMISSION_BUDGET_MS,
