@@ -1,5 +1,6 @@
 """Reading card alerts and finding what explains a charge: receipts, his own words, a merchant he pays."""
 import datetime as dt
+from collections import Counter
 import importlib.util
 import json
 import os
@@ -8,6 +9,7 @@ import http.server
 import threading
 import urllib.parse
 import sys
+import subprocess
 import tempfile
 import time
 import unittest
@@ -28,15 +30,22 @@ def summary(text, **extra):
 
 class ControlServer:
     """Loopback-only control fixtures. Never reads credentials or state from the real home."""
-    def __init__(self, rows=None, threads=None, stall=None, drip=False):
+    def __init__(self, rows=None, threads=None, stall=None, drip=False, page_size=500,
+                 message_delay=0, stall_cursor=None):
         self.rows = {'a': rows or []}
-        self.threads = threads if threads is not None else [{'threadId': 'a', 'title': 'iMessage test'}]
+        self.threads = threads if threads is not None else [{'threadId': 'a', 'title': 'iMessage test',
+                           'creationSource': 'server', 'origin': 'imessage'}]
         self.calls = []
         self.stall, self.drip = stall, drip
+        self.page_size, self.message_delay, self.stall_cursor = page_size, message_delay, stall_cursor
+        self.active_messages = self.max_active_messages = 0
+        self.lock = threading.Lock()
         self.stop = threading.Event()
         self.status = 200
         self.raw = None
         self.responses = {}
+        self.wire_mode = None
+        self.declared_extra = 0
         owner = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -45,20 +54,53 @@ class ControlServer:
 
             def do_GET(self):
                 path = urllib.parse.urlsplit(self.path)
-                owner.calls.append((path.path, urllib.parse.parse_qs(path.query), self.headers.get('Authorization')))
+                params = urllib.parse.parse_qs(path.query)
+                owner.calls.append((path.path, params, self.headers.get('Authorization')))
                 if owner.stall and owner.stall in path.path:
                     owner.stop.wait(5)
+                if owner.stall_cursor and params.get('cursor') == [owner.stall_cursor]:
+                    owner.stop.wait(5)
                 if path.path.endswith('/threads'):
-                    data = {'ok': True, 'threads': owner.threads, 'total': len(owner.threads)}
+                    threads = [t for t in owner.threads
+                               if ('creationSource' not in params or t.get('creationSource', 'web')
+                                   in params['creationSource'][0].split(','))
+                               and ('origin' not in params or t.get('origin') == params['origin'][0])
+                               and (params.get('includeSubagents') == ['true'] or not t.get('subagent'))]
+                    offset = int(params.get('cursor', ['0'])[0])
+                    limit = min(int(params.get('limit', ['50'])[0]), owner.page_size)
+                    page = threads[offset:offset + limit]
+                    cursor = str(offset + limit) if offset + limit < len(threads) else None
+                    data = {'ok': True, 'threads': page, 'total': len(threads), 'nextCursor': cursor}
                 else:
+                    with owner.lock:
+                        owner.active_messages += 1
+                        owner.max_active_messages = max(owner.max_active_messages, owner.active_messages)
+                    owner.stop.wait(owner.message_delay)
                     rows = owner.rows.get(urllib.parse.unquote(path.path.split('/')[-2]), [])
                     data = {'ok': True, 'messages': rows, 'total': len(rows)}
+                    with owner.lock:
+                        owner.active_messages -= 1
                 data = owner.responses.get(path.path, data)
                 body = owner.raw if owner.raw is not None else json.dumps(data).encode()
+                if owner.wire_mode and path.path.endswith('/messages'):
+                    try:
+                        self.wfile.write(b'HTTP/1.1 200 OK\r\n')
+                        if owner.wire_mode == 'chunk-framing':
+                            self.wfile.write(b'Transfer-Encoding: chunked\r\n\r\n')
+                        else:
+                            self.wfile.write(b'X-Slow: ')
+                        while not owner.stop.wait(0.05):
+                            self.wfile.write(b'F')
+                            self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                    return
                 self.send_response(owner.status)
+                if owner.declared_extra and path.path.endswith('/messages'):
+                    self.send_header('Content-Length', str(len(body) + owner.declared_extra))
                 self.end_headers()
                 try:
-                    if owner.drip:
+                    if owner.drip and (owner.drip is True or owner.drip in path.path):
                         while not owner.stop.wait(0.05):
                             self.wfile.write(b' ')
                             self.wfile.flush()
@@ -708,10 +750,10 @@ class OwnerTexts(unittest.TestCase):
             for row, wanted in cases:
                 with self.subTest(text=row['text']):
                     self.assertEqual(row['text'] in got, wanted)
-            self.assertEqual(len(server.calls), 2)
+            self.assertEqual(len(server.calls), 3)
             self.assertEqual(server.calls[0][1]['limit'], ['500'])
-            self.assertEqual(server.calls[1][1]['all'], ['true'])
-            self.assertEqual(server.calls[1][1]['role'], ['user'])
+            self.assertEqual(server.calls[2][1]['all'], ['true'])
+            self.assertEqual(server.calls[2][1]['role'], ['user'])
             self.assertTrue(all(call[2] == 'Bearer test-secret-never-print' for call in server.calls))
 
     def test_filters_threads_and_created_at_and_encodes_thread_ids(self):
@@ -728,7 +770,193 @@ class OwnerTexts(unittest.TestCase):
             self.assertEqual([text for _, text, _ in self.read()], ['until', 'since'])
             paths = [path for path, _, _ in server.calls]
             self.assertIn('/api/ardud/control/threads/a%3Awith%2Fslash/messages', paths)
-            self.assertEqual(len(paths), 3)
+            self.assertEqual(len(paths), 4)
+
+    def test_filtered_lists_ignore_thousands_of_workers_and_dedupe_owner_chats(self):
+        threads = [{'threadId': f'worker-{n}', 'title': 'Worker', 'creationSource': 'server'}
+                   for n in range(3500)]
+        threads += [{'threadId': source, 'title': source, 'creationSource': source}
+                    for source in ('web', 'mobile', 'desktop', 'mcp')]
+        threads += [{'threadId': 'bridge', 'title': 'iMessage owner', 'creationSource': 'server',
+                     'origin': 'imessage'},
+                    {'threadId': 'overlap', 'title': 'iMessage old', 'creationSource': 'mcp',
+                     'origin': 'imessage'},
+                    {'threadId': 'moni', 'title': 'Moni', 'creationSource': 'server', 'origin': 'imessage'},
+                    {'threadId': 'group', 'title': 'Group sb_gro', 'creationSource': 'server', 'origin': 'imessage'},
+                    {'threadId': 'archived', 'title': 'Old', 'creationSource': 'web', 'archived': True},
+                    {'threadId': 'child', 'title': 'Subagent', 'creationSource': 'mcp', 'subagent': True}]
+        stats = Counter()
+        with ControlServer(threads=threads) as server:
+            for tid in ('web', 'mobile', 'desktop', 'mcp', 'bridge', 'overlap'):
+                server.rows[tid] = [summary(tid)]
+            self.assertEqual({text for _, text, _ in self.read(stats=stats)},
+                             {'web', 'mobile', 'desktop', 'mcp', 'bridge', 'overlap'})
+            lists = [params for path, params, _ in server.calls if path.endswith('/threads')]
+            self.assertEqual(lists, [
+                {'updatedSince': ['2026-10-23T22:59:59.999Z'], 'limit': ['500'],
+                 'creationSource': ['web,mobile,desktop,mcp']},
+                {'updatedSince': ['2026-10-23T22:59:59.999Z'], 'limit': ['500'], 'origin': ['imessage']}])
+            reads = [urllib.parse.unquote(path.split('/')[-2]) for path, _, _ in server.calls
+                     if path.endswith('/messages')]
+            self.assertCountEqual(reads, ['web', 'mobile', 'desktop', 'mcp', 'bridge', 'overlap'])
+            self.assertEqual(stats['owner_queries'], len(server.calls))
+
+    def test_follows_all_filtered_pages_before_reading_messages(self):
+        threads = [{'threadId': str(n), 'title': 'App', 'creationSource': 'mcp'} for n in range(2)]
+        threads += [{'threadId': 'bridge-' + str(n), 'title': 'iMessage', 'creationSource': 'server',
+                     'origin': 'imessage'} for n in range(2)]
+        with ControlServer(threads=threads, page_size=1) as server:
+            for thread in threads:
+                server.rows[thread['threadId']] = [summary(thread['threadId'])]
+            stats = Counter()
+            self.assertEqual(len(self.read(stats=stats)), 4)
+            self.assertEqual([params.get('cursor') for _, params, _ in server.calls[:4]],
+                             [None, ['1'], None, ['1']])
+            self.assertEqual(stats['owner_queries'], 8)
+
+    def test_stalled_second_page_never_returns_partial_evidence(self):
+        threads = [{'threadId': str(n), 'title': 'App'} for n in range(2)]
+        with ControlServer(threads=threads, page_size=1, stall_cursor='1') as server:
+            started = time.time()
+            remaining = 2.2
+            with self.assertRaises(ch.Lookup):
+                self.read(deadline=started + remaining)
+            self.assertLess(time.time() - started, remaining + 1)
+            self.assertEqual(len(server.calls), 2)
+            self.assertTrue(all(path.endswith('/threads') for path, _, _ in server.calls))
+
+    def test_bad_or_repeated_cursors_fail_closed(self):
+        for cursor in ('', 1, False, '1'):
+            with self.subTest(cursor=cursor), ControlServer() as server:
+                server.responses['/api/ardud/control/threads'] = {
+                    'ok': True, 'threads': [{'threadId': 'a'}], 'total': 2, 'nextCursor': cursor}
+                with self.assertRaises(ch.Lookup):
+                    self.read()
+                self.assertLessEqual(len(server.calls), 2)
+
+    def test_total_requests_are_bounded_for_lists_and_messages(self):
+        threads = [{'threadId': str(n), 'title': 'App'} for n in range(70)]
+        for page_size in (1, 500):
+            with self.subTest(page_size=page_size), ControlServer(threads=threads, page_size=page_size) as server:
+                with self.assertRaises(ch.Lookup):
+                    self.read()
+                self.assertLessEqual(len(server.calls), ch.OWNER_REQUEST_LIMIT)
+                self.assertTrue(all(path.endswith('/threads') for path, _, _ in server.calls))
+
+    def test_request_ceiling_is_shared_by_older_question_windows(self):
+        threads = [{'threadId': str(n), 'title': 'App'} for n in range(20)]
+        stats = Counter()
+        with ControlServer(threads=threads) as server:
+            self.read(stats=stats)
+            self.read(stats=stats)
+            self.assertEqual(stats['owner_queries'], 44)
+            with self.assertRaisesRegex(ch.Lookup, 'request limit'):
+                self.read(stats=stats)
+            self.assertEqual(stats['owner_queries'], len(server.calls))
+            self.assertLessEqual(len(server.calls), ch.OWNER_REQUEST_LIMIT)
+
+    def test_control_credential_is_stdin_only_and_curlrc_is_disabled(self):
+        run = ch.subprocess.run
+        with ControlServer(), patch.object(ch.subprocess, 'run', wraps=run) as fetch:
+            self.read()
+        for call in fetch.call_args_list:
+            self.assertEqual(call.args[0][:2], ['/usr/bin/curl', '-q'])
+            self.assertNotIn('test-secret-never-print', repr(call.args))
+            self.assertIn(b'Authorization: Bearer test-secret-never-print', call.kwargs['input'])
+
+    def test_stuck_resolver_or_connect_process_is_killed_within_the_deadline(self):
+        run = ch.subprocess.run
+        def stuck(*args, **kwargs):
+            return run(['/usr/bin/python3', '-I', '-c', 'import time; time.sleep(10)'], **kwargs)
+        started = time.time()
+        with patch.object(ch.subprocess, 'run', side_effect=stuck), self.assertRaises(ch.Lookup):
+            ch.control_get(('http://127.0.0.1', 'test-secret-never-print'), '/threads', {}, started + 1.2)
+        self.assertLess(time.time() - started, 2.2)
+
+    def test_twenty_threads_fit_the_cap_with_at_most_six_concurrent_requests(self):
+        threads = [{'threadId': str(n), 'title': 'App'} for n in range(20)]
+        with ControlServer(threads=threads, message_delay=0.5) as server:
+            for n in range(20):
+                server.rows[str(n)] = [summary(str(n))]
+            stats = Counter()
+            started = time.time()
+            self.assertEqual(len(self.read(deadline=started + 40, stats=stats)), 20)
+            self.assertLess(time.time() - started, ch.OWNER_BUDGET)
+            self.assertGreater(server.max_active_messages, 1)
+            self.assertLessEqual(server.max_active_messages, 6)
+            self.assertEqual(stats['owner_queries'], 22)
+
+    def test_all_user_messages_are_read_even_beyond_the_newest_limit(self):
+        rows = [summary(str(n)) for n in range(1100)]
+        with ControlServer(rows) as server:
+            self.assertEqual(len(self.read()), len(rows))
+            params = server.calls[-1][1]
+            self.assertEqual(params['all'], ['true'])
+            self.assertEqual(params['role'], ['user'])
+            self.assertEqual(params['since'], ['2026-10-23T22:59:59.999Z'])
+
+    def test_one_failed_thread_discards_other_threads_owner_evidence(self):
+        threads = [{'threadId': tid, 'title': 'App'} for tid in ('a', 'bad')]
+        with ControlServer([summary('I paid Apple')], threads=threads) as server:
+            server.responses['/api/ardud/control/threads/bad/messages'] = {'ok': True, 'total': 1, 'messages': []}
+            with self.assertRaisesRegex(ch.Lookup, 'incomplete message list'):
+                self.read()
+
+    def test_incomplete_http_body_is_never_owner_evidence(self):
+        with ControlServer([summary('I paid Apple')]) as server:
+            server.declared_extra = 10
+            with self.assertRaisesRegex(ch.Lookup, 'Robob control: request failed'):
+                self.read()
+
+    def test_trickled_headers_and_chunk_framing_do_not_hold_cli_exit(self):
+        script = '''
+import datetime as dt, pathlib, sys, time
+sys.path.insert(0, sys.argv[1])
+import charges
+now = dt.datetime.now(dt.timezone.utc)
+try:
+    charges.owner_texts(now - dt.timedelta(days=1), now, deadline=time.time() + 2.2)
+except charges.Lookup:
+    pass
+else:
+    sys.exit(1)
+'''
+        for mode in ('headers', 'chunk-framing'):
+            with self.subTest(mode=mode), ControlServer() as server:
+                server.wire_mode = mode
+                started = time.time()
+                done = subprocess.run(['/usr/bin/python3', '-I', '-B', '-c', script,
+                                       str(Path(__file__).resolve().parent)],
+                                      capture_output=True, text=True, timeout=3.2)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertLess(time.time() - started, 3.2)
+                self.assertTrue(any(path.endswith('/messages') for path, _, _ in server.calls))
+
+    def test_failure_while_another_request_stalls_does_not_strand_cli_exit(self):
+        script = '''
+import datetime as dt, sys, time
+sys.path.insert(0, sys.argv[1])
+import charges
+now = dt.datetime.now(dt.timezone.utc)
+for _ in range(3):
+    try:
+        charges.owner_texts(now - dt.timedelta(days=1), now, deadline=time.time() + 2)
+    except charges.Lookup:
+        pass
+    else:
+        sys.exit(1)
+print('finished', flush=True)
+'''
+        threads = [{'threadId': tid, 'title': 'App'} for tid in ('a', 'slow')]
+        with ControlServer(threads=threads, stall='/slow/messages') as server:
+            server.responses['/api/ardud/control/threads/a/messages'] = {'ok': False}
+            started = time.time()
+            done = subprocess.run(['/usr/bin/python3', '-I', '-B', '-c', script,
+                                   str(Path(__file__).resolve().parent)],
+                                  capture_output=True, text=True, timeout=6.5)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertEqual(done.stdout.strip(), 'finished')
+            self.assertLess(time.time() - started, 6.5)
 
     def test_schedule_and_wake_cannot_explain_a_charge(self):
         rows = [summary('I paid Apple', automated=True), relayed('I paid Apple', inbound='wake:abc')]
@@ -821,7 +1049,7 @@ class OwnerTexts(unittest.TestCase):
             self.read()
 
     def test_stalled_headers_and_trickled_body_obey_remaining_budget(self):
-        for stall, drip in [('/threads', False), ('/messages', False), (None, True)]:
+        for stall, drip in [('/threads', False), ('/messages', False), (None, True), (None, '/messages')]:
             with self.subTest(stall=stall, drip=drip), ControlServer(stall=stall, drip=drip):
                 started = time.time()
                 remaining = 2.2
