@@ -217,9 +217,82 @@ interface TransactionPending {
   permitStarted?: bigint;
   restore: typeof Effect.interruptible | undefined;
   retire?: Effect.Effect<void>;
+  preBegin?: ReturnType<typeof writerPreBegin>;
   /** The transaction's span, annotated with the reader hold when the permit is released. */
   span?: Tracer.Span;
 }
+
+// Keep worker timestamps on the transaction clock without charging main-loop
+// delivery lag to SQLite. hrtime has the same origin across Node worker threads.
+const writerPreBegin = (fiber: Fiber.Fiber<unknown, unknown>, parent: Tracer.Span) => {
+  const tracer = fiber.getRef(Tracer.Tracer);
+  const origin = process.hrtime.bigint();
+  const started = fiber.getRef(Clock.Clock).currentTimeNanosUnsafe();
+  let active: Tracer.Span | undefined;
+  let finished = false;
+  let lastAt = origin;
+  const phase = (
+    reason: string,
+    attributes: Record<string, unknown> = {},
+    at = process.hrtime.bigint(),
+  ) => {
+    if (finished || at < lastAt) return;
+    lastAt = at;
+    try {
+      const time = started + at - origin;
+      if (reason === "permit_setup")
+        parent.attribute("db.writer.acquired_at_unix_nano", started.toString());
+      if (reason === "sqlite_begin") {
+        parent.attribute("db.writer.begin_at_unix_nano", time.toString());
+        parent.attribute("db.writer.pre_begin_ms", Number(at - origin) / 1e6);
+      }
+      active?.end(time, Exit.void);
+      active = undefined;
+      active = tracer.span({
+        name: `sql.writer.pre_begin.${reason}`,
+        parent: Option.some(parent),
+        annotations: Context.empty(),
+        links: [],
+        startTime: time,
+        kind: "internal",
+        root: false,
+        sampled: parent.sampled,
+      });
+      active.attribute("db.system.name", "sqlite");
+      active.attribute("db.connection", "writer");
+      active.attribute("db.name", parent.attributes.get("db.name") ?? "sqlite");
+      const service = parent.attributes.get("service.name");
+      if (service !== undefined) active.attribute("service.name", service);
+      for (const [key, value] of Object.entries(attributes)) active.attribute(key, value);
+      active.attribute("db.writer.wait_reason", reason);
+    } catch {
+      // Diagnostics cannot change acquisition, cancellation or a commit result.
+    }
+  };
+  const end = (exit: Exit.Exit<unknown, unknown>) => {
+    if (finished) return;
+    finished = true;
+    try {
+      const elapsed = process.hrtime.bigint() - origin;
+      active?.end(started + elapsed, exit);
+      parent.attribute("db.writer.pre_begin.total_ms", Number(elapsed) / 1e6);
+    } catch {
+      // Diagnostics cannot change acquisition, cancellation or a commit result.
+    }
+  };
+  // Failed acquisition never enters the body. Finish before the parent is exported.
+  try {
+    const endParent = parent.end.bind(parent);
+    parent.end = (time, exit) => {
+      end(exit);
+      endParent(time, exit);
+    };
+  } catch {
+    // The outer exit hook still closes phases for a read-only custom span.
+  }
+  phase("permit_setup");
+  return { phase, end };
+};
 
 const TransactionAcquire = Context.Reference<TransactionPending | undefined>(
   "@t3tools/shared/nodeSqliteClient/TransactionAcquire",
@@ -1754,9 +1827,15 @@ const startCheckpoint = () => {
   child.unref();
   checkpoint = {
     check,
-    async admit(id) {
+    async admit(id, phase) {
       while (gated()) {
         if (isCancelled(id)) throw new Error("SQLite request cancelled before execution");
+        phase(unknown ? "checkpoint_unknown" : truncate !== undefined ? "checkpoint_truncate" :
+          blocked ? "checkpoint_blocked" : "checkpoint_ceiling", {
+          "db.wal.log_frames": log, "db.wal.checkpointed_frames": checkpointed,
+          "db.wal.backpressure_frames": workerData.checkpointBackpressureFrames,
+          "db.wal.generation": generation, "db.wal.check_in_flight": inFlight !== undefined,
+        });
         parentPort.postMessage({ waiting: id });
         child.ref();
         await new Promise(resolve => { wakeAdmission = resolve; request(true); if (!gated()) resolve(); });
@@ -1797,6 +1876,13 @@ parentPort.on("message", (request) => {
   let priorRecovery = {};
   let classification;
   let executed = false;
+  let lastPhase;
+  const phase = (reason, attributes = {}) => {
+    if (!request.preBegin || reason === lastPhase) return;
+    lastPhase = reason;
+    try { parentPort.postMessage({ type: "pre-begin", id, reason, attributes, at: process.hrtime.bigint() }); } catch {}
+  };
+  phase("connection_state");
   try {
     if (close) {
       operation = "close";
@@ -1819,6 +1905,7 @@ parentPort.on("message", (request) => {
     // Resolve an earlier attachment change before another statement can change its identity.
     if (attachmentsDirty || globalMmapPending) priorRecovery = recoverySnapshot();
     if (globalMmapPending) throw recoveryFailureCause ?? new Error("SQLite mmap default state unavailable");
+    phase("statement_prepare");
     if (isCancelled(id)) throw new Error("SQLite request cancelled before execution");
     executionStarted = performance.now();
     const entry = cached ? statements.get(sql) : undefined;
@@ -1842,7 +1929,11 @@ parentPort.on("message", (request) => {
     schemaDirty ||= Boolean(classifications.get(statement)?.schema) || typeof db.setAuthorizer !== "function";
     elapsedMs = performance.now() - executionStarted;
     executionStarted = undefined;
-    if (classifications.get(statement)?.write) await checkpoint?.admit(id);
+    if (classifications.get(statement)?.write) {
+      phase("checkpoint_admission");
+      await checkpoint?.admit(id, phase);
+    }
+    phase("sqlite_begin");
     if (isCancelled(id)) throw new Error("SQLite request cancelled before execution");
     operation = "execute";
     statement.setReadBigInts(safeIntegers);
@@ -1860,6 +1951,7 @@ parentPort.on("message", (request) => {
     if (controlStarted !== undefined) controlMs = performance.now() - controlStarted;
     executionStarted = undefined;
     activeClassification = undefined;
+    phase("recovery_snapshot");
     observedWrite ||= Boolean(classifications.get(statement)?.write || classifications.get(statement)?.check);
     mayWrite ||= observedWrite;
     if (!checkpoint && classifications.get(statement)?.journalMode) {
@@ -1867,14 +1959,18 @@ parentPort.on("message", (request) => {
     }
     const committed = !db.isTransaction && /^\\s*(?:COMMIT|END|INSERT|UPDATE|DELETE|REPLACE)\\b/i.test(statement.sourceSQL);
     const committedTransaction = committed && /^\\s*(?:COMMIT|END)\\s*;?\\s*$/i.test(statement.sourceSQL);
+    const inTransaction = db.isTransaction;
+    const snapshot = recoverySnapshot(classification, sql, params, statement.expandedSQL);
+    phase("worker_reply");
     parentPort.postMessage({ id, rows, committed, committedTransaction, write: observedWrite, elapsedMs, controlMs,
-      inTransaction: db.isTransaction,
-      ...priorRecovery, ...recoverySnapshot(classification, sql, params, statement.expandedSQL) });
+      inTransaction, ...priorRecovery, ...snapshot });
   } catch (error) {
     activeClassification = undefined;
     const statementElapsed = executionStarted === undefined ? elapsedMs : (elapsedMs ?? 0) + performance.now() - executionStarted;
     if (controlStarted !== undefined && controlMs === undefined) controlMs = performance.now() - controlStarted;
+    phase("recovery_snapshot");
     const snapshot = db ? { ...priorRecovery, ...recoverySnapshot(classification && { ...classification, attachment: executed && classification.attachment }, sql, params) } : {};
+    phase("worker_reply");
     errorReply(id, error, operation, { ...snapshot, inTransaction: db?.isTransaction ?? false, write: observedWrite, elapsedMs: statementElapsed, controlMs });
   } finally {
     // Authorizer classification covers CTE/commented writes; transaction state
@@ -1947,6 +2043,7 @@ const makeWriterSession = Effect.fnUntraced(function* (
         }
     );
   const pending = new Map<number, (reply: Reply) => void>();
+  const preBegins = new Map<number, NonNullable<TransactionPending["preBegin"]>>();
   let nextId = 0;
   let stopped: string | undefined;
   let inTransaction = false;
@@ -1966,6 +2063,7 @@ const makeWriterSession = Effect.fnUntraced(function* (
     announce(new Error(message));
     for (const [id, resume] of pending) resume({ id, error: { operation: "execute", message } });
     pending.clear();
+    preBegins.clear();
   };
   worker.on(
     "message",
@@ -1976,7 +2074,14 @@ const makeWriterSession = Effect.fnUntraced(function* (
         | { type: "checkpoint-warning"; reason: string }
         | { type: "recovery-error"; error: unknown }
         | { type: "checkpoint-error"; connection: "writer" | "checkpoint"; error: unknown }
-        | { waiting: number },
+        | { waiting: number }
+        | {
+            type: "pre-begin";
+            id: number;
+            reason: string;
+            attributes: Record<string, unknown>;
+            at: bigint;
+          },
     ) => {
       if ("type" in reply && reply.type === "recovery-error") {
         classifyError(
@@ -2007,6 +2112,10 @@ const makeWriterSession = Effect.fnUntraced(function* (
         );
         return;
       }
+      if ("type" in reply && reply.type === "pre-begin") {
+        preBegins.get(reply.id)?.phase(reply.reason, reply.attributes, reply.at);
+        return;
+      }
       if ("waiting" in reply) return;
       if ("type" in reply && reply.type === "ready") {
         if (stopped !== undefined) return;
@@ -2023,6 +2132,7 @@ const makeWriterSession = Effect.fnUntraced(function* (
         return;
       }
       if (reply.inTransaction !== undefined) inTransaction = reply.inTransaction;
+      preBegins.delete(reply.id);
       const resume = pending.get(reply.id);
       pending.delete(reply.id);
       if (pending.size === 0) worker.unref();
@@ -2043,6 +2153,7 @@ const makeWriterSession = Effect.fnUntraced(function* (
     Effect.withFiber<ReadonlyArray<any>, SqlError>((fiber) => {
       const restore = fiber.getRef(TransactionAcquire)?.restore;
       const awaitingBegin = restore !== undefined && /^\s*BEGIN\b/i.test(input.sql ?? "");
+      const preBegin = awaitingBegin ? fiber.getRef(TransactionAcquire)?.preBegin : undefined;
       const execute = Effect.callback<ReadonlyArray<any>, SqlError>((resume) => {
         if (stopped !== undefined) {
           resume(Effect.fail(failed(new Error(stopped), "SQLite writer unavailable", "execute")));
@@ -2054,7 +2165,9 @@ const makeWriterSession = Effect.fnUntraced(function* (
         const acknowledged = new Promise<void>((resolve) => {
           acknowledge = resolve;
         });
+        if (preBegin !== undefined) preBegins.set(id, preBegin);
         pending.set(id, (reply) => {
+          preBegin?.phase("effect_resume");
           acknowledge();
           onClassification?.(reply.write ?? false);
           const currentSpan = Context.getOrUndefined(fiber.context, Tracer.ParentSpan);
@@ -2150,19 +2263,23 @@ const makeWriterSession = Effect.fnUntraced(function* (
                   ),
                 }),
             id,
+            preBegin: preBegin !== undefined,
             cancellation: cancellation.buffer,
             safeIntegers: Boolean(Context.get(fiber.context, Client.SafeIntegers)),
           };
+          preBegin?.phase("worker_queue", { "db.writer.pending_requests": pending.size });
           // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
           worker.postMessage(message);
         } catch (cause) {
           pending.delete(id);
+          preBegins.delete(id);
           if (pending.size === 0) worker.unref();
           acknowledge();
           resume(Effect.fail(failed(cause, "Failed to send SQLite request", "execute")));
         }
         // Retain the permit until the worker confirms it skipped or finished SQL.
         return Effect.promise(() => {
+          preBegin?.phase("cancellation_ack");
           Atomics.store(cancellation, 0, 1);
           try {
             // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
@@ -2172,13 +2289,16 @@ const makeWriterSession = Effect.fnUntraced(function* (
         }).pipe(
           Effect.andThen(
             awaitingBegin
-              ? request({
-                  sql: "ROLLBACK",
-                  params: [],
-                  cached: false,
-                  values: false,
-                  raw: false,
-                }).pipe(Effect.ignore)
+              ? Effect.andThen(
+                  Effect.sync(() => preBegin?.phase("cancellation_rollback")),
+                  request({
+                    sql: "ROLLBACK",
+                    params: [],
+                    cached: false,
+                    values: false,
+                    raw: false,
+                  }).pipe(Effect.ignore),
+                )
               : Effect.void,
           ),
         );
@@ -2292,10 +2412,12 @@ const makeWriter = Effect.fnUntraced(function* (
       Effect.provideService(Scope.Scope, sessionScope),
     );
   let session = yield* open();
-  const ensure = Effect.suspend(() =>
+  const ensure = Effect.withFiber((fiber) =>
     session.healthy()
       ? Effect.void
       : Effect.gen(function* () {
+          const preBegin = fiber.getRef(TransactionAcquire)?.preBegin;
+          preBegin?.phase("connection_recovery_close");
           yield* Scope.close(sessionScope, Exit.void);
           setup.reset();
           if (!setup.canRecover)
@@ -2308,6 +2430,7 @@ const makeWriter = Effect.fnUntraced(function* (
                 "writer",
               ),
             });
+          preBegin?.phase("connection_recovery_open");
           sessionScope = yield* Scope.fork(parentScope, "sequential");
           session = yield* open();
         }),
@@ -2981,7 +3104,16 @@ const make = Effect.fn("makeWithDatabase")(function* (
           const grant = acquired(target, clock, start);
           acquiredSlot = true;
           if (target.name === "reader") reportReaderWait(requestFiber, grant.lockWaitMs);
-          if (pending !== undefined) pending.acquired = grant;
+          if (pending !== undefined) {
+            pending.acquired = grant;
+            if (
+              target.name === "writer" &&
+              isFileDatabase &&
+              pending.span !== undefined &&
+              fiber.getRef(References.TracerEnabled)
+            )
+              pending.preBegin = writerPreBegin(fiber, pending.span);
+          }
           if (
             pending !== undefined &&
             fiber.getRef(References.TracerEnabled) &&
@@ -3014,7 +3146,15 @@ const make = Effect.fn("makeWithDatabase")(function* (
           // A scheduler yield after taking the permit must not precede its release finalizer.
           Effect.andThen(
             Effect.provideService(acquire, Scheduler.PreventSchedulerYield, true),
-            target.name === "writer" ? connection.ensure : Effect.void,
+            target.name === "writer"
+              ? Effect.andThen(
+                  Effect.sync(() => pending?.preBegin?.phase("connection_recovery")),
+                  Effect.andThen(
+                    connection.ensure,
+                    Effect.sync(() => pending?.preBegin?.phase("begin_dispatch")),
+                  ),
+                )
+              : Effect.void,
           ),
           target.connection,
         );
@@ -3111,6 +3251,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
             },
           };
           const body = Effect.withFiber<A, E | SqlError, R>((fiber) => {
+            pending.preBegin?.end(Exit.void);
             annotateAcquired(fiber, pending.acquired, pending.span);
             const span = Context.getOrUndefined(fiber.context, Tracer.ParentSpan);
             if (span?._tag === "Span") pending.span = span;
@@ -3140,6 +3281,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
             withTransaction(body).pipe(
               Effect.provideService(TransactionAcquire, pending),
               Effect.withTracer(transactionTracer),
+              Effect.onExit((exit) => Effect.sync(() => pending.preBegin?.end(exit))),
             ),
           );
         }),
