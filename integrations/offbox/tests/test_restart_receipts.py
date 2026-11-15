@@ -3,6 +3,8 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import fcntl
+import select
 from unittest.mock import patch
 
 if __package__:
@@ -12,6 +14,78 @@ else:
 
 
 class RestartReceipts(Base):
+    def test_wrapper_killed_after_claim_releases_initialization_ownership(self):
+        root=self.tmp/'guest-crashed-init'; root.mkdir()
+        os.mkfifo(root/'gate')
+        wrapper=(SERVER/'boatd-wrap').read_text().replace('/run/boatd/',str(root)+'/')
+        wrapper=wrapper.replace('mkdir -m 700 "$receipt" || exit 98',
+                                'mkdir -m 700 "$receipt" || exit 98\necho initializing\nread -r gate < '+str(root/'gate'))
+        process=subprocess.Popen(['bash','-c',wrapper,'boatd-wrap','1001',str(root)],
+                                 stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        self.addCleanup(lambda: process.kill() if process.poll() is None else None)
+        self.addCleanup(process.stdout.close)
+        self.addCleanup(process.stderr.close)
+        self.assertTrue(select.select([process.stdout],[],[],10)[0],'wrapper never claimed receipt')
+        self.assertEqual(process.stdout.readline(),b'initializing\n')
+        process.kill(); process.wait(timeout=10)
+        self.assertFalse((root/'1001.receipt/pid').exists())
+        b=self.box(); p=self.cmd(b,retry=1)
+        def guest_exec(box,command,**kw):
+            return subprocess.run(['bash','-c',command.replace('/run/boatd',str(root))],capture_output=True,check=True,timeout=10)
+        with patch.object(boatd,'ct_exec',side_effect=guest_exec):
+            self.assertEqual(boatd.reconcile(self.con)['interrupted'],1)
+        self.assertEqual(self.status(b,p)['exit_code'],94)
+        self.assertEqual(self.f.spawned,[])
+
+    def test_abandoned_initialization_receipts_settle_without_blocking_reconcile(self):
+        for i, marker in enumerate((None, '', '123', '123 bad-ticks', 'not-a-pid 123', '2147483647 123', 'pid.tmp')):
+            with self.subTest(marker=marker):
+                root=self.tmp/f'guest-init-{i}'; root.mkdir()
+                receipt=root/'1001.receipt'; receipt.mkdir()
+                if marker is not None:
+                    (receipt/('pid.tmp' if marker=='pid.tmp' else 'pid')).write_text('123' if marker=='pid.tmp' else marker)
+                b=self.box(bid=f'bx_init{i}'); p=self.cmd(b,retry=1)
+                def guest_exec(box,command,**kw):
+                    command=command.replace('/run/boatd',str(root))
+                    return subprocess.run(['bash','-c',command],input=kw.get('input'),capture_output=True,check=True,timeout=10)
+                with patch.object(boatd,'ct_exec',side_effect=guest_exec), patch.object(boatd,'_cg_pids',return_value=[]):
+                    self.assertEqual(boatd.reconcile(self.con)['interrupted'],1)
+                    self.assertEqual(boatd.reconcile(self.con)['interrupted'],0)
+                self.assertEqual((self.status(b,p)['status'],self.status(b,p)['exit_code']),('interrupted',94))
+                self.assertEqual(self.f.spawned,[])
+
+    def test_live_initialization_owner_is_not_settled_until_it_disappears(self):
+        for receipt_created in (False,True):
+            with self.subTest(receipt_created=receipt_created):
+                root=self.tmp/f'guest-initializing-{receipt_created}'; root.mkdir()
+                if receipt_created: (root/'1001.receipt').mkdir()
+                b=self.box(bid=f'bx_init_live{receipt_created}'); p=self.cmd(b,retry=1)
+                def guest_exec(box,command,**kw):
+                    return subprocess.run(['bash','-c',command.replace('/run/boatd',str(root))],
+                                          input=kw.get('input'),capture_output=True,check=True,timeout=10)
+                with (root/'1001.lock').open('w') as owner, patch.object(boatd,'ct_exec',side_effect=guest_exec):
+                    fcntl.flock(owner,fcntl.LOCK_EX)
+                    with self.assertRaises(boatd.Fail): boatd.reconcile(self.con)
+                    self.assertEqual(self.status(b,p)['status'],'running')
+                    # A settled row cannot hide a live initializer before its receipt directory exists.
+                    self.con.execute("UPDATE commands SET status='exited',exit_code=1 WHERE box_id=?",(b,))
+                    self.assertTrue(boatd.commands_busy(self.con,b))
+                    self.con.execute("UPDATE commands SET status='running',exit_code=NULL WHERE box_id=?",(b,))
+                    fcntl.flock(owner,fcntl.LOCK_UN)
+                    self.assertEqual(boatd.reconcile(self.con)['interrupted'],1)
+                self.assertEqual(self.status(b,p)['exit_code'],94)
+
+    def test_live_children_retaining_the_lock_are_reattached_when_wrapper_pid_is_gone(self):
+        b=self.box(); p=self.cmd(b,retry=1)
+        command_dir=self.tmp/'cgroup'/'boatd'/str(p); command_dir.mkdir(parents=True)
+        (command_dir/'cgroup.procs').write_text('129844\n')
+        with patch.object(boatd,'cg_path',return_value=command_dir.parents[1]), \
+                patch.object(boatd,'ct_exec',return_value=subprocess.CompletedProcess([],0,b'{"state":"unknown"}')):
+            self.assertEqual(boatd.reconcile(self.con)['reattached'],1)
+        self.assertEqual(self.status(b,p)['status'],'running')
+        self.assertEqual(self.status(b,p)['attempt'],1)
+
+
     def test_new_command_updates_old_box_wrapper_atomically_before_launch(self):
         b=self.box(); p=self.cmd(b,status='queued')
         def admit(con,bid,pid,*args):

@@ -1302,27 +1302,34 @@ def _run_cmd(box_id: str, pid: int) -> int:
 
 # This probe runs in the guest. PID start ticks prevent a reused PID from proving liveness.
 GUEST_PROBE = r'''
-import base64,json,sys
+import base64,fcntl,json,sys
 from pathlib import Path
 pid,oo,eo=sys.argv[1],int(sys.argv[2]),int(sys.argv[3])
 run=sys.argv[4]
 d=Path('/run/boatd')/(pid+'.receipt')
 r={'state':'absent','stdout':'','stderr':''}
-if sys.argv[5]=='fence' and not d.exists():
-    try:
+owner=None
+if d.exists() or d.with_suffix('.lock').exists() or sys.argv[5]=='fence':
+    d.parent.mkdir(parents=True,exist_ok=True)
+    owner=d.with_suffix('.lock').open('a')
+    try: fcntl.flock(owner,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    except BlockingIOError: owner.close(); owner=None; r['state']='unknown'
+    if owner and not d.exists():
         d.mkdir(mode=0o700)
         (d/'fenced').touch()
-    except FileExistsError: pass
 if d.is_dir():
-    r['state']='gone' if (d/'pid').exists() or (d/'fenced').exists() else 'unknown'
+    r['state']='gone' if owner else 'unknown'
     try:
         p,t=(d/'pid').read_text().split()
         stat=Path('/proc')/p/'stat'
         fields=stat.read_text().rsplit(')',1)[1].split()
         if fields[0]!='Z' and fields[19]==t: r['state']='alive'
-    except FileNotFoundError: pass
+    except (FileNotFoundError,ValueError,IndexError): pass
     if (d/'exit').exists():
         r.update(state='exited',exit_code=int((d/'exit').read_text()),ended_at=(d/'exit').stat().st_mtime)
+    elif r['state']=='gone':
+        # Fence a dead initializer before dropping its row; an unanswered launcher may still arrive later.
+        (d/'fenced').touch()
     for name,off,key in [('out',oo,'stdout'),('err',eo,'stderr')]:
         try:
             with (d/name).open('rb') as f:
@@ -1358,7 +1365,10 @@ def guest_command(c, fence=None) -> dict:
                     f' {pid} {offsets[0]} {offsets[1]} ' + shlex.quote(run) + (' fence' if fence else 'check'), timeout=30)
     result = json.loads(probe.stdout)
     if result['state'] == 'unknown':
-        raise Fail(503, 'command_probe_pending', f'{box_id}/{pid} guest claim is still being initialized')
+        if _cg_pids(box_id, pid):
+            result['state'] = 'alive'
+        else:
+            raise Fail(503, 'command_probe_pending', f'{box_id}/{pid} guest claim is still being initialized')
     for i, key in enumerate(('stdout', 'stderr')):
         data = base64.b64decode(result.get(key, ''), validate=True)
         if data:
@@ -1457,7 +1467,7 @@ def commands_busy(con, box_id: str) -> bool:
 
 
 GUEST_BUSY = r'''
-import json,sys
+import fcntl,json,sys
 from pathlib import Path
 busy=False
 for marker in Path('/run/boatd').glob('*.receipt/pid'):
@@ -1465,9 +1475,11 @@ for marker in Path('/run/boatd').glob('*.receipt/pid'):
         p,t=marker.read_text().split()
         fields=(Path('/proc')/p/'stat').read_text().rsplit(')',1)[1].split()
         if fields[0]!='Z' and fields[19]==t: busy=True
-    except FileNotFoundError: pass
-for receipt in Path('/run/boatd').glob('*.receipt'):
-    if not any((receipt/name).exists() for name in ('pid','exit','fenced')): busy=True
+    except (FileNotFoundError,ValueError,IndexError): pass
+for lock in Path('/run/boatd').glob('*.lock'):
+    with lock.open('a') as owner:
+        try: fcntl.flock(owner,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError: busy=True
 for run in json.load(sys.stdin):
     marker=Path('/home/user/.offbox/exit')/(run+'.pid')
     if marker.with_suffix('.rc').exists(): continue

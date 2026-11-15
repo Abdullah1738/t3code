@@ -14,7 +14,7 @@ from unittest.mock import patch
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(SCRIPTS / "tests"))
-from offbox_lib import api, cli, common, lease, misc, reap, runs, ssh_sync  # noqa: E402
+from offbox_lib import api, cli, common, lease, misc, pool, reap, runs, ssh_sync  # noqa: E402
 from test_capacity import Isolated  # noqa: E402
 
 # Keep server fixtures off sys.path: client discovery has same-named test modules.
@@ -25,9 +25,47 @@ sys.modules[_spec.name] = test_boatd
 _spec.loader.exec_module(test_boatd)
 
 boatd = test_boatd.boatd
+REMOTE_COMMANDS_BUSY = lease.remote_commands_busy
 
 
 class Wire(Isolated):
+    def test_settled_exit_one_with_live_cgroup_cannot_be_handed_to_another_run(self):
+        box=self.srv.box(bid='bx_c82zp7mb')
+        pid=self.srv.cmd(box,status='exited')
+        self.srv.con.execute('UPDATE commands SET exit_code=1,ended_at=? WHERE box_id=? AND pid=?',
+                             (boatd.now(),box,pid))
+        self.box(box,member=True)
+        self.con.execute("INSERT INTO runs(run_id,box_id,process_id,status,exit_code) VALUES (?,?,?,'failed',1)",
+                         ('run-1115-095002-ef55',box,pid))
+        self.con.commit()
+        cgroup=self.srv.tmp/'cgroup'
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(boatd,'cg_path',return_value=cgroup))
+            # Use the actual per-command cgroup layout, not a mocked liveness answer.
+            command_dir=cgroup/'boatd'/str(pid); command_dir.mkdir(parents=True)
+            (command_dir/'cgroup.procs').write_text('129844\n')
+            stack.enter_context(patch.object(lease,'remote_commands_busy',REMOTE_COMMANDS_BUSY))
+            stack.enter_context(patch.object(pool,'wait_seconds',return_value=0))
+            stack.enter_context(patch.dict('os.environ',OFFBOX_POOL_SIZE='1'))
+            stack.enter_context(patch.object(lease,'cap_check'))
+            create=stack.enter_context(patch.object(lease,'acquire_private',side_effect=AssertionError('pool must retain busy box')))
+            with self.assertRaises(common.OffboxError) as error:
+                pool.acquire(self.me,run_id='run-1115-101239-cf3b')
+            self.assertEqual(error.exception.code,common.EXIT_BUSY)
+            self.assertIsNone(pool.try_warm(self.me,'large',None,[], 'run-1115-101239-cf3b'))
+            create.assert_not_called()
+            self.assertEqual(lease.active_runs(self.con,box),0)
+            self.assertEqual(api.cmd_status(box,pid)['exitCode'],1)
+            self.assertTrue(api.call('GET',f'/sandboxes/{box}/commands/busy')['busy'])
+            with self.assertRaises(api.ApiError) as rejected:
+                api.cmd_start(box,'true',meta={'run_id':'run-1115-101239-cf3b'})
+            self.assertEqual(rejected.exception.api_code,'commands_busy')
+            (command_dir/'cgroup.procs').write_text('')
+            self.assertFalse(api.call('GET',f'/sandboxes/{box}/commands/busy')['busy'])
+            # Once the cgroup is empty, the same queued request can be admitted.
+            accepted=api.cmd_start(box,'true',meta={'run_id':'run-1115-101239-cf3b'})
+            self.assertNotEqual(accepted['processId'],pid)
+
     def setUp(self):
         super().setUp()
         self.srv = test_boatd.Http("call")      # used as a fixture: boatd with fakes behind a real HTTP server

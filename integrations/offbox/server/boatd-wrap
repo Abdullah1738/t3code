@@ -5,12 +5,16 @@
 set -u
 pid="$1"; cwd="${2:-/home/user}"
 receipt="/run/boatd/$pid.receipt"
+# The lock identifies initialization even before a complete PID record exists. A dead owner releases it.
+exec 9> "/run/boatd/$pid.lock" || exit 126
+flock -n 9 || exit 98
 # The claim survives every host-client disconnect. Never replace a command's receipts.
 mkdir -m 700 "$receipt" || exit 98
-trap '' HUP PIPE
-printf '%s %s\n' "$$" "$(awk '{print $22}' /proc/$$/stat)" > "$receipt/pid"
+trap '' HUP
 exec > "$receipt/out" 2> "$receipt/err"
 trap 'rc=$?; printf "%s\n" "$rc" > "$receipt/exit.tmp"; mv "$receipt/exit.tmp" "$receipt/exit"' EXIT
+printf '%s %s\n' "$$" "$(awk '{print $22}' /proc/$$/stat)" > "$receipt/pid.tmp" || exit 126
+mv "$receipt/pid.tmp" "$receipt/pid" || exit 126
 cg=/sys/fs/cgroup/boatd
 if [ -w /sys/fs/cgroup ]; then
   mkdir -p "$cg" 2>/dev/null && {

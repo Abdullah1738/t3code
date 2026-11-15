@@ -5,8 +5,28 @@ import subprocess
 import tempfile
 import unittest
 
+if __package__:
+    from .client_fixtures import command_block
+else:
+    from client_fixtures import command_block
+
 
 class WrapperTests(unittest.TestCase):
+    def test_user_pipeline_sigpipe_and_failures_keep_their_real_status(self):
+        wrapper=(Path(__file__).resolve().parents[1]/'server/boatd-wrap').read_text()
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)
+            wrapper=wrapper.replace('/run/boatd/',str(root)+'/').replace('/sys/fs/cgroup',str(root/'no-cgroup'))
+            wrapper=wrapper.replace('chown 1000:1000','true').replace('setpriv --reuid=1000 --regid=1000 --init-groups -- ','')
+            cases=(('yes | head -n 1',0),('yes | head -n 1 | cat',0),
+                   ('false | cat',1),('(exit 7) | head -n 1',7))
+            for pid,(command,expected) in enumerate(cases,10):
+                with self.subTest(command=command):
+                    (root/f'{pid}.sh').write_text(command_block(command))
+                    result=subprocess.run(['bash','-c',wrapper,'boatd-wrap',str(pid),d],stdin=subprocess.DEVNULL,capture_output=True,timeout=15)
+                    self.assertEqual(result.returncode,expected,(root/f'{pid}.receipt/err').read_text())
+                    self.assertEqual(int((root/f'{pid}.receipt/exit').read_text()),expected)
+
     def test_file_route_preserves_shell_arguments_environment_stdin_and_exit(self):
         wrapper = (Path(__file__).resolve().parents[1] / 'server/boatd-wrap').read_text()
         with tempfile.TemporaryDirectory() as d:
