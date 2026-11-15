@@ -2139,7 +2139,10 @@ const make = Effect.gen(function* () {
       threadRead(activeRun ? "activeModel" : "model", id, threadIo.model(id, activeRun)),
     lastFailure: (id) => threadRead("lastFailure", id, threadIo.lastFailure(id)),
     findLastFailure: (id) => threadRead("findLastFailure", id, threadIo.findLastFailure(id)),
-    latestRun: (id) => threadRead("latestRun", id, threadIo.latestRun(id)),
+    latestRun: (id, afterRunId) =>
+      afterRunId === undefined
+        ? threadRead("latestRun", id, threadIo.latestRun(id))
+        : locks.outside(threadIo.latestRun(id, afterRunId), undefined, true),
     compactRun: (id, run) => locks.outside(touching(id, threadIo.compactRun(id, run))),
     runSettled: (id, run) =>
       TickTimings.measure(
@@ -2225,6 +2228,8 @@ const make = Effect.gen(function* () {
   };
   /** Thread reads that confirm the current run: always read, never replayed. */
   const freshThreads = {
+    laterStartedRun: (threadId: ThreadId, failedRunId: string) =>
+      locks.outside(threadIo.latestRun(threadId, failedRunId), undefined, true),
     unsettledRuns: (threadId: ThreadId) =>
       locks.outside(threadIo.queuedRuns(threadId, true), undefined, true),
     model: (threadId: ThreadId) => locks.outside(threadIo.model(threadId), undefined, true),
@@ -9072,6 +9077,7 @@ const make = Effect.gen(function* () {
     if (startTimeout.restartAdmission) {
       const runs = yield* freshThreads.unsettledRuns(threadId);
       if (runs.some((run) => run.id !== startTimeout.runId)) return;
+      if (yield* freshThreads.laterStartedRun(threadId, startTimeout.runId)) return;
     }
     const ids =
       link.role === "work" ? yield* store.threadCards(threadId) : link.cardId ? [link.cardId] : [];
@@ -16879,15 +16885,9 @@ const make = Effect.gen(function* () {
             (card.activeThreadId !== null && card.activeThreadId !== threadId)
           )
             return;
-          const view = yield* freshThreads.find(threadId);
-          if (
-            view?.runId == null ||
-            view.runId === stalled.runFailure.runId ||
-            view.runStartedAt === null ||
-            view.state === "idle"
-          )
-            return;
-          const model = yield* freshThreads.model(threadId);
+          const recovery = yield* freshThreads.laterStartedRun(threadId, stalled.runFailure.runId);
+          if (recovery === null) return;
+          const model = recovery.model ?? (yield* freshThreads.model(threadId));
           const at = yield* nowIso;
           const next: KanbanCard = {
             ...card,
@@ -16903,13 +16903,13 @@ const make = Effect.gen(function* () {
           yield* logEvent(next, { _tag: "system", component: "dispatcher" }, "flagged", {
             fromStage: card.stage,
             toStage: "working",
-            body: `Cleared run-failed stall: work resumed in ${view.runId}`,
+            body: `Cleared run-failed stall: work resumed in ${recovery.runId}`,
           });
           yield* saveCard(next);
           yield* Effect.logInfo("restart-pacing.stall_auto_cleared", {
             cardId: id,
             threadId,
-            runId: view.runId,
+            runId: recovery.runId,
           });
         }),
         id,

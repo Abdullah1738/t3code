@@ -2015,3 +2015,118 @@ it.effect.each([false, true])(
     );
   },
 );
+
+it.effect.each([
+  { name: "completed later turn", ordinal: 3, start: 20, end: 30, expected: true },
+  { name: "older queued input starts later", ordinal: 1, start: 20, end: 30, expected: true },
+  { name: "old turn finishes later", ordinal: 1, start: 5, end: 40, expected: false },
+  { name: "higher ordinal never starts", ordinal: 3, start: null, end: 30, expected: false },
+  { name: "same timestamp later ordinal", ordinal: 3, start: 10, end: 30, expected: true },
+  { name: "same timestamp older ordinal", ordinal: 1, start: 10, end: 30, expected: false },
+  { name: "failed run missing", ordinal: 3, start: 20, end: 30, expected: false, missing: true },
+  {
+    name: "before the failed run's actual start",
+    ordinal: 3,
+    start: 15,
+    end: 40,
+    expected: false,
+    failedStart: 20,
+  },
+  {
+    name: "after the failed run's actual start",
+    ordinal: 1,
+    start: 30,
+    end: 40,
+    expected: true,
+    failedStart: 20,
+  },
+])("persisted recovery history distinguishes $name", (row) => {
+  const failedId = RunId.make("run:expired");
+  const recoveryId = RunId.make("run:recovery");
+  const model = { instanceId: ProviderInstanceId.make("codex"), model: "gpt-6.1-sol" };
+  const failed = {
+    id: failedId,
+    ordinal: 2,
+    requestedAt: DateTime.makeUnsafe(10),
+    startedAt: row.failedStart === undefined ? null : DateTime.makeUnsafe(row.failedStart),
+    completedAt: DateTime.makeUnsafe(15),
+    status: "failed",
+  };
+  const recovery = {
+    id: recoveryId,
+    ordinal: row.ordinal,
+    requestedAt: DateTime.makeUnsafe(0),
+    startedAt: row.start === null ? null : DateTime.makeUnsafe(row.start),
+    completedAt: DateTime.makeUnsafe(row.end),
+    status: "completed",
+    modelSelection: model,
+    userMessageId: MessageId.make("message:recovery"),
+  };
+  const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+    getThreadRecords: (_, sections) =>
+      Effect.succeed(
+        (sections.some((section) => section === "runs")
+          ? { runs: row.missing ? [recovery] : [failed, recovery] }
+          : { messages: [] }) as never,
+      ),
+  });
+  return Effect.gen(function* () {
+    const threads = yield* KanbanThreads;
+    const found = yield* threads.latestRun(ThreadId.make("thread:recovery"), failedId);
+    expect(found?.runId ?? null).toBe(row.expected ? recoveryId : null);
+    if (row.expected) expect(found?.model).toEqual(model);
+  }).pipe(
+    Effect.provide(
+      layer.pipe(
+        Layer.provide(management),
+        Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+        Layer.provide(Sqlite.layerMemory),
+      ),
+    ),
+  );
+});
+
+it.effect("recovery history chooses the most recent start instead of the latest completion", () => {
+  const failedId = RunId.make("run:expired");
+  const model = { instanceId: ProviderInstanceId.make("codex"), model: "gpt-6.1-sol" };
+  const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+    getThreadRecords: (_, sections) =>
+      Effect.succeed(
+        (sections.some((section) => section === "runs")
+          ? {
+              runs: [
+                { id: failedId, ordinal: 2, startedAt: null, requestedAt: DateTime.makeUnsafe(10) },
+                {
+                  id: RunId.make("run:first"),
+                  ordinal: 3,
+                  startedAt: DateTime.makeUnsafe(20),
+                  completedAt: DateTime.makeUnsafe(50),
+                  modelSelection: model,
+                },
+                {
+                  id: RunId.make("run:last"),
+                  ordinal: 1,
+                  startedAt: DateTime.makeUnsafe(30),
+                  completedAt: DateTime.makeUnsafe(40),
+                  modelSelection: model,
+                },
+              ],
+            }
+          : { messages: [] }) as never,
+      ),
+  });
+  return Effect.gen(function* () {
+    const threads = yield* KanbanThreads;
+    expect((yield* threads.latestRun(ThreadId.make("thread:recovery"), failedId))?.runId).toBe(
+      "run:last",
+    );
+  }).pipe(
+    Effect.provide(
+      layer.pipe(
+        Layer.provide(management),
+        Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+        Layer.provide(Sqlite.layerMemory),
+      ),
+    ),
+  );
+});
