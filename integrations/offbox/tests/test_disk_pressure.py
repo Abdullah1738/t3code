@@ -39,11 +39,14 @@ class Policy(unittest.TestCase):
         self.assertEqual(disk.level({'free_bytes': 5*G, 'total_bytes': 10*G, 'free_inodes': 0, 'total_inodes': 10}), 'full')
         self.assertEqual(disk.level({'free_bytes': 5*G, 'total_bytes': 10*G, 'free_inodes': 4, 'total_inodes': 100}), 'low')
 
-    def test_oldest_first_keeps_newest_three_and_clone_origins_and_all_other_kinds(self):
+    def test_oldest_first_keeps_newest_three_run_points_clone_origins_and_timer_kinds(self):
         rows = snaps('a') + snaps('b') + snaps('a', kind='stop') + snaps('a', kind='hourly')
         rows[0]['clones'] = True
         got = disk.candidates(rows, {'b'})
-        self.assertEqual([(r['box'],r['name']) for r in got], [('a','auto-1'),('a','auto-2')])
+        self.assertEqual(got, sorted(got,key=lambda r:(r['created_at'],r['name'])))
+        self.assertTrue(any(r['kind']=='stop' for r in got))
+        self.assertTrue(all(r['box']=='a' and r['kind'] in ('auto','stop') and not r['clones'] for r in got))
+        self.assertFalse({'auto-5','stop-5','stop-4'} & {r['name'] for r in got})
 
     def test_raw_free_does_not_hide_slop_or_full_dataset(self):
         def command(args):
@@ -83,6 +86,7 @@ class ServerPressure(Base):
         self.stack=contextlib.ExitStack();self.addCleanup(self.stack.close)
         self.stack.enter_context(patch.object(disk,'sample',return_value=storage()))
         self.stack.enter_context(patch.object(disk,'inventory',return_value=({},[])))
+        self.stack.enter_context(patch.object(disk,'cleanup_pressure',return_value={'freeing_bytes':0,'io_full_avg10':0,'io_some_avg10':0}))
 
     def test_all_protected_box_classes_survive(self):
         ids=[self.box('bx_'+str(i)*8,owner='moni' if i==1 else 'ardud') for i in range(9)]
@@ -166,3 +170,200 @@ class ServerPressure(Base):
             out=boatd.disk_maintenance(None)
         self.assertTrue(out['disk_full']);self.assertTrue(boatd.DISK['value']['disk_full'])
         self.assertTrue(any(c.args[1]=='disk.sample' for c in emit.call_args_list))
+
+
+class Round2(Base):
+    def setUp(self):
+        super().setUp()
+        boatd.CFG['state_dataset']='offbox/boatd'
+        self.stack=contextlib.ExitStack();self.addCleanup(self.stack.close)
+        self.clock = 2000
+        self.free = 15*G
+        self.pressure = {'freeing_bytes': 0, 'io_full_avg10': 0, 'io_some_avg10': 0}
+        self.stack.enter_context(patch.object(boatd, 'now', side_effect=lambda: self.clock))
+        self.stack.enter_context(patch.object(disk, 'cleanup_pressure', side_effect=lambda *_: dict(self.pressure), create=True))
+        self.stack.enter_context(patch.object(disk, 'sample', side_effect=lambda *_: storage(self.free)))
+        self.f.sh[('zfs','get')] = (0, '-')
+
+    def install_rows(self, rows, sizes):
+        for row in rows:
+            self.f.snapshots.setdefault(boatd.ct(row['box']), []).append({'name': row['name']})
+        self.stack.enter_context(patch.object(disk, 'inventory', side_effect=lambda *_: (sizes, [
+            r for r in rows if any(x['name'] == r['name'] for x in self.f.snapshots[boatd.ct(r['box'])]) ])))
+
+    def deletes(self):
+        return [c for c in self.f.calls if c[:2] == ('snapshot','delete')]
+
+    def test_freeing_and_live_io_pressure_yield_without_delete(self):
+        bid=self.box();self.install_rows(snaps(bid), {})
+        for pressure in ({'freeing_bytes': 6*G}, {'io_full_avg10': 15}):
+            with self.subTest(pressure=pressure), patch.object(boatd.toollog, 'emit') as emit:
+                self.pressure.update(freeing_bytes=0, io_full_avg10=0, io_some_avg10=0)
+                self.pressure.update(pressure)
+                boatd.disk_maintenance(self.con)
+                self.assertEqual(self.deletes(), [])
+                self.assertTrue(any(c.args[1] == 'snapshot.yield' for c in emit.call_args_list))
+
+    def test_unreadable_backpressure_yields_instead_of_deleting(self):
+        bid=self.box();self.install_rows(snaps(bid),{})
+        with patch.object(disk,'cleanup_pressure',side_effect=OSError('unavailable')),patch.object(boatd.toollog,'emit') as emit:
+            boatd.disk_maintenance(self.con)
+        self.assertEqual(self.deletes(),[])
+        self.assertTrue(any(c.args[1]=='snapshot.yield' and c.kwargs['props']['reason']=='pressure_unknown' for c in emit.call_args_list))
+
+    def test_async_freeing_and_pacing_prevent_delete_bursts_across_ticks(self):
+        bid=self.box();self.install_rows(snaps(bid), {})
+        original=self.f.incus
+        def remove(*a, **kw):
+            result=original(*a, **kw)
+            if a[:2] == ('snapshot','delete'):
+                self.pressure['freeing_bytes']=6*G
+            return result
+        with patch.object(boatd, 'incus', side_effect=remove):
+            boatd.disk_maintenance(self.con)
+            self.assertEqual(len(self.deletes()), 1)
+            self.clock+=60
+            boatd.disk_maintenance(self.con)
+            self.assertEqual(len(self.deletes()), 1)
+            self.pressure['freeing_bytes']=0
+            boatd.disk_maintenance(self.con)
+            self.assertEqual(len(self.deletes()), 2)
+            boatd.disk_maintenance(self.con)
+            self.assertEqual(len(self.deletes()), 2)
+
+    def test_budget_box_after_258_irrelevant_candidates_is_not_starved(self):
+        self.free=30*G
+        rows=[];sizes={}
+        for i in range(86):
+            bid=self.box('bx_'+str(i).zfill(8))
+            rows+=snaps(bid)
+            sizes[bid]={'snapshot_bytes':G, 'live_bytes':10*G}
+        target=self.box('bx_target00', name='offbox mission-control | repository pool')
+        newer=snaps(target)
+        for row in newer:row['created_at']+=1000
+        rows+=newer;sizes[target]={'snapshot_bytes':8*G,'live_bytes':10*G}
+        self.install_rows(rows,sizes)
+        boatd.disk_maintenance(self.con)
+        self.assertEqual([(c[2],c[3]) for c in self.deletes()], [(boatd.ct(target),'auto-0')])
+
+    def test_pressure_prioritizes_oversized_box_over_older_small_history(self):
+        small=self.box('bx_small000');large=self.box('bx_large000',name='offbox repository pool')
+        rows=snaps(small)+snaps(large)
+        for row in rows:
+            if row['box']==large:row['created_at']+=1000
+        self.install_rows(rows,{small:{'snapshot_bytes':G,'live_bytes':10*G},
+                                large:{'snapshot_bytes':8*G,'live_bytes':10*G}})
+        boatd.disk_maintenance(self.con)
+        self.assertEqual([(c[2],c[3]) for c in self.deletes()],[(boatd.ct(large),'auto-0')])
+
+    def test_byte_target_survives_warn_crossing_and_stop_snapshots_are_eligible(self):
+        bid=self.box();self.install_rows(snaps(bid,kind='stop'), {})
+        original=self.f.incus
+        def remove(*a, **kw):
+            result=original(*a, **kw)
+            if a[:2] == ('snapshot','delete'):self.free+=6*G
+            return result
+        with patch.object(boatd, 'incus', side_effect=remove):
+            boatd.disk_maintenance(self.con)
+            self.assertEqual(len(self.deletes()), 1)
+            self.assertEqual(self.free,21*G)
+            self.clock+=60
+            boatd.disk_maintenance(self.con)
+            self.assertEqual(len(self.deletes()), 2)
+            self.assertGreaterEqual(self.free,25*G)
+            self.clock+=60
+            boatd.disk_maintenance(self.con)
+            self.assertEqual(len(self.deletes()), 2)
+
+    def test_mixed_run_history_keeps_newest_three_and_protected_stop_snapshots(self):
+        rows=snaps('a', kind='stop')+snaps('a')+snaps('b',kind='stop')+snaps('a',kind='hourly')
+        rows[0]['clones']=True
+        got=disk.candidates(rows,{'b'})
+        self.assertTrue(any(r['kind']=='stop' for r in got))
+        self.assertTrue(all(r['box']=='a' and r['kind'] in ('auto','stop') and not r['clones'] for r in got))
+        newest=sorted([r for r in rows if r['box']=='a' and r['kind'] in ('auto','stop')],key=lambda r:(r['created_at'],r['name']),reverse=True)[:3]
+        self.assertFalse({r['name'] for r in newest}&{r['name'] for r in got})
+
+    def test_external_prune_and_delete_race_drop_stale_rows_without_freed_bytes(self):
+        bid=self.box();rows=snaps(bid)
+        self.install_rows(rows,{})
+        self.con.execute('INSERT INTO snaps VALUES (?,?,?,?)',(bid,'auto-already-gone','auto',-1))
+        self.con.execute('INSERT INTO snaps VALUES (?,?,?,?)',(bid,'auto-0','auto',0))
+        original=self.f.incus
+        def missing(*a, **kw):
+            if a[:2] == ('snapshot','delete'):
+                self.f.calls.append(a)
+                return subprocess.CompletedProcess(a,1,b'',b'Error: Snapshot not found')
+            return original(*a, **kw)
+        with patch.object(boatd,'incus',side_effect=missing),patch.object(boatd.toollog,'emit') as emit:
+            boatd.disk_maintenance(self.con)
+            self.clock+=60
+            boatd.disk_maintenance(self.con)
+        names=[c[3] for c in self.deletes()]
+        self.assertEqual(names.count('auto-0'),1)
+        self.assertEqual(self.con.execute('SELECT COUNT(*) FROM snaps').fetchone()[0],0)
+        events=[c for c in emit.call_args_list if c.args[1]=='snapshot.prune']
+        self.assertTrue(events)
+        self.assertTrue(all(c.kwargs['props']['reason']=='missing' and c.kwargs['props']['bytes_freed']==0 for c in events))
+        self.assertTrue(all(c.kwargs['ok'] for c in events))
+
+    def test_snapshot_created_during_inventory_is_not_removed_as_stale(self):
+        bid=self.box()
+        def inventory(*_):
+            self.con.execute('INSERT OR IGNORE INTO snaps VALUES (?,?,?,?)',(bid,'auto-new','auto',self.clock+1))
+            return {},[]
+        with patch.object(disk,'inventory',side_effect=inventory):
+            boatd.disk_maintenance(self.con)
+        self.assertIsNotNone(self.con.execute("SELECT * FROM snaps WHERE name='auto-new'").fetchone())
+
+    def test_protected_floor_exposes_byte_shortfall_and_skips_new_run_snapshots(self):
+        bid=self.box(name='offbox mission-control | repository pool')
+        self.install_rows(snaps(bid,count=3),{bid:{'snapshot_bytes':60*G,'live_bytes':100*G}})
+        value=boatd.disk_maintenance(self.con)
+        self.assertEqual(value['cleanup']['shortfall_bytes'],10*G)
+        self.assertEqual(value['cleanup']['budget_shortfall_bytes'],10*G)
+        self.assertEqual(value['snapshot_bytes_by_kind']['auto'],3*G)
+        self.assertEqual(self.deletes(),[])
+        for kind in ('auto','stop'):
+            self.assertIsNone(boatd.snapshot(self.con,bid,kind))
+        self.assertFalse(any(c[:2]==('snapshot','create') for c in self.f.calls))
+
+    def test_count_retention_cannot_bypass_pacing_or_pressure(self):
+        bid=self.box()
+        self.install_rows(snaps(bid,count=25),{})
+        self.con.executemany('INSERT INTO snaps VALUES (?,?,?,?)',[(bid,'auto-'+str(i),'auto',i) for i in range(25)])
+        boatd.CFG['retention']['run_daily_days']=0
+        self.pressure['io_full_avg10']=15
+        boatd.prune_snaps(self.con,bid)
+        self.assertEqual(self.deletes(),[])
+        self.pressure['io_full_avg10']=0
+        boatd.prune_snaps(self.con,bid)
+        self.assertEqual(len(self.deletes()),1)
+        boatd.prune_snaps(self.con,bid)
+        self.assertEqual(len(self.deletes()),1)
+
+    def test_delete_gap_starts_after_slow_delete_returns(self):
+        bid=self.box();self.install_rows(snaps(bid),{})
+        original=self.f.incus
+        def slow(*a, **kw):
+            result=original(*a, **kw)
+            if a[:2]==('snapshot','delete'):self.clock+=60
+            return result
+        with patch.object(boatd,'incus',side_effect=slow):
+            boatd.disk_maintenance(self.con)
+            boatd.disk_maintenance(self.con)
+        self.assertEqual(len(self.deletes()),1)
+
+
+class CleanupMeasurements(unittest.TestCase):
+    def test_zfs_freeing_and_both_live_psi_lines_are_read(self):
+        from unittest.mock import mock_open
+        with patch.object(disk,'command',return_value=str(6*G)),patch('builtins.open',mock_open(read_data=
+            'some avg10=22.0 avg60=0 avg300=0 total=100\nfull avg10=15.0 avg60=0 avg300=0 total=99\n')):
+            measured=disk.cleanup_pressure('offbox')
+        self.assertEqual(measured,{'freeing_bytes':6*G,'io_full_avg10':15.0,'io_some_avg10':22.0})
+        self.assertEqual(disk.yield_reason(measured),'zfs_freeing')
+        measured['freeing_bytes']=0
+        self.assertEqual(disk.yield_reason(measured),'io_pressure')
+        measured['io_full_avg10']=14.9
+        self.assertIsNone(disk.yield_reason(measured))

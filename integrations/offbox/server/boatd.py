@@ -124,6 +124,7 @@ def load_cfg() -> dict:
     if p.exists():
         c.update(json.loads(p.read_text()))
     c["retention"] = {**RETENTION, **(c.get("retention") or {})}
+    DISK.clear()
     DISK.update(ts=0, value=None, boxes={}, write_at=0, write_error=None)
     CFG.clear()
     CFG.update(c)
@@ -432,6 +433,9 @@ def disk_state(fresh=False, writer=False):
             return {**DISK['value'], 'level': 'full', 'disk_full': True, 'disk_low': True, 'write_ok': False}
         return DISK["value"]
     value = disk.sample(CFG["zpool"], VAR)
+    for key in ('cleanup', 'snapshot_bytes_by_kind'):
+        if key in DISK:
+            value[key] = DISK[key]
     value.update(write_ok=bool(DISK.get('write_at')) and not DISK.get('write_error'), written_at=DISK.get('write_at', 0))
     if DISK.get('write_error') and not writer:
         value.update(level='full', disk_full=True, disk_low=True)
@@ -473,6 +477,7 @@ def disk_maintenance(con, error=None):
             value.update(level='full', disk_full=True, disk_low=True, write_ok=False)
         return value
     try:
+        inventory_started = now()
         sizes, snaps = disk.inventory(zpool())
         previous = (DISK.get('boxes') or {})
         for bid, size in sizes.items():
@@ -491,52 +496,125 @@ def disk_maintenance(con, error=None):
     except (OSError, ValueError, subprocess.SubprocessError) as e:
         toollog.emit("boatd", "disk.sample", kind="error", ok=False, props={"error": str(e)[:200]}, tag="disk_inventory")
         return value
-    # flock spans sampler and command-runner processes. A busy cleanup must not block
-    # running command completion. Work per pass is bounded; the next sampler continues.
     with open(VAR / "disk.lock", "a") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return value
-        pressure = value["disk_low"]
-        deadline = now() + 30
-        for row in disk.candidates(snaps, snapshot_protected(con))[:256]:
-            if now() >= deadline:
-                break
-            pool = next((r for r in value['filesystems'] if r['filesystem'] == CFG['zpool']), None)
-            box = con.execute("SELECT name FROM boxes WHERE id=? AND deleted_at IS NULL", (row['box'],)).fetchone()
+        state = con.execute("SELECT v FROM meta WHERE k='disk_cleanup'").fetchone()
+        cleanup = json.loads(state[0]) if state else {}
+        pool = next((r for r in value['filesystems'] if r['filesystem'] == CFG['zpool']), None)
+        if pool and pool['free_bytes'] < pool['total_bytes'] * disk.WARN:
+            cleanup['target_bytes'] = int(pool['total_bytes'] * disk.TARGET)
+        if pool and pool['free_bytes'] >= cleanup.get('target_bytes', 0):
+            cleanup['target_bytes'] = 0
+        live = {(r['box'], r['name']) for r in snaps}
+        # External recovery can prune while boatd is up. The live ZFS inventory
+        # is authoritative; stale SQLite rows are not bytes available to reclaim.
+        for old in con.execute('SELECT box_id,name,created_at FROM snaps').fetchall():
+            if old['created_at'] < inventory_started and (old['box_id'], old['name']) not in live:
+                con.execute('DELETE FROM snaps WHERE box_id=? AND name=?', (old['box_id'], old['name']))
+                toollog.emit('boatd', 'snapshot.prune', ok=True, ids={'box': old['box_id']},
+                             props={'snapshot': old['name'], 'bytes_freed': 0, 'reason': 'missing'})
+        protected = snapshot_protected(con)
+        missing_snapshots = {tuple(key) for key in cleanup.get('missing_snapshots', [])}
+        missing_snapshots &= live
+        eligible = [r for r in disk.candidates(snaps, protected)
+                    if (r['box'], r['name']) not in missing_snapshots]
+        # Count-retention uses the same pacing gate. Otherwise run completion or
+        # personal timers could bypass sampler backpressure with a bulk delete.
+        count_gone = set()
+        for box in con.execute('SELECT id FROM boxes WHERE deleted_at IS NULL'):
+            if box['id'] in snapshot_protected(con, pressure=False):
+                continue
+            rows = con.execute('SELECT * FROM snaps WHERE box_id=? ORDER BY created_at DESC', (box['id'],)).fetchall()
+            count_gone.update((box['id'], name) for name in snaps_to_prune(rows, CFG['retention'], now()))
+        selected = {(r['box'], r['name']) for r in eligible}
+        eligible += [r for r in snaps if (r['box'], r['name']) in count_gone and not r['clones']
+                     and (r['box'], r['name']) not in selected and (r['box'], r['name']) not in missing_snapshots]
+        oversized = {}
+        for bid, usage in sizes.items():
+            box = con.execute("SELECT 1 FROM boxes WHERE id=? AND name LIKE '%repository pool%' AND deleted_at IS NULL", (bid,)).fetchone()
+            over = usage.get('snapshot_bytes', 0) - disk.SNAPSHOT_RATIO * usage.get('live_bytes', 0)
+            if box and usage.get('live_bytes', 0) > 0 and over > 0 and bid not in protected:
+                oversized[bid] = over
+        # Tackle the boxes causing growth first, oldest history within each
+        # budget tier. Small unrelated history must not consume the tick.
+        eligible.sort(key=lambda r: (0 if r['box'] in oversized else 1,
+                                     -oversized.get(r['box'], 0), r['created_at'], r['name']))
+        attempts = 0
+        for row in eligible:
+            box = con.execute('SELECT name FROM boxes WHERE id=? AND deleted_at IS NULL', (row['box'],)).fetchone()
             if box is None:
                 continue
             usage = sizes.get(row['box'], {})
             too_large = (box and 'repository pool' in (box['name'] or '') and usage.get('live_bytes', 0) > 0
                          and usage.get('snapshot_bytes', 0) > disk.SNAPSHOT_RATIO * usage['live_bytes'])
-            need_pool = pressure and pool and pool['free_bytes'] < pool['total_bytes'] * disk.TARGET
-            if not need_pool and not too_large:
+            need_pool = bool(pool and pool['free_bytes'] < cleanup.get('target_bytes', 0))
+            count = (row['box'], row['name']) in count_gone
+            reason = 'pool_pressure' if need_pool and row['box'] not in protected else 'box_snapshot_bytes' if too_large and row['box'] not in protected else 'count_retention' if count else None
+            if reason is None:
                 continue
-            if row['box'] in snapshot_protected(con):
+            if row['box'] in snapshot_protected(con, pressure=reason != 'count_retention'):
                 continue
-            # Recheck clone dependencies just before deleting. Incus performs the deletion
-            # so its own snapshot inventory stays consistent; never destroy ZFS directly.
+            # The bound applies to actionable candidates, never to unrelated
+            # under-budget boxes that happen to have older history.
+            attempts += 1
+            if attempts > 256:
+                break
+            if now() - cleanup.get('last_delete_at', 0) < disk.DELETE_GAP_S:
+                hold = 'delete_gap'
+                pressure = {}
+            else:
+                try:
+                    pressure = disk.cleanup_pressure(CFG['zpool'])
+                    hold = disk.yield_reason(pressure)
+                except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+                    pressure, hold = {}, 'pressure_unknown'
+            if hold:
+                toollog.emit('boatd', 'snapshot.yield', ok=True, ids={'box': row['box']},
+                             props={'snapshot': row['name'], 'reason': hold, **pressure})
+                break
             rc, clones = _sh(['zfs', 'get', '-Hp', '-o', 'value', 'clones', row['dataset']])
             if rc or clones.strip() != '-':
                 continue
-            before = pool['free_bytes'] if pool else 0
-            result = incus('snapshot', 'delete', ct(row['box']), row['name'], timeout=120, check=False)
-            reason = 'pool_pressure' if need_pool else 'box_snapshot_bytes'
-            if result.returncode:
+            before = pool_free(value)
+            # Persist before dispatch, so another process/crash cannot issue a
+            # burst while ZFS's asynchronously freed bytes are still pending.
+            cleanup['last_delete_at'] = now()
+            con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES ('disk_cleanup',?)", (json.dumps(cleanup),))
+            try:
+                result = incus('snapshot', 'delete', ct(row['box']), row['name'], timeout=120, check=False)
+            finally:
+                cleanup['last_delete_at'] = now()
+                con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES ('disk_cleanup',?)", (json.dumps(cleanup),))
+            missing = result.returncode != 0 and b'not found' in result.stderr.lower()
+            if missing:
+                missing_snapshots.add((row['box'], row['name']))
+            if result.returncode and not missing:
                 toollog.emit('boatd', 'snapshot.prune', kind='error', ok=False,
                              ids={'box': row['box']}, props={'snapshot': row['name'], 'reason': reason}, tag='snapshot_prune')
-                continue
+                break
             con.execute('DELETE FROM snaps WHERE box_id=? AND name=?', (row['box'], row['name']))
             value = disk_state(fresh=True)
-            sizes, _ = disk.inventory(zpool())
+            sizes, snaps = disk.inventory(zpool())
             value['boxes'] = sizes
-            after = next((r['free_bytes'] for r in value['filesystems'] if r['filesystem'] == CFG['zpool']), before)
             toollog.emit('boatd', 'snapshot.prune', ok=True, ids={'box': row['box']},
-                         props={'snapshot': row['name'], 'bytes': row['bytes'], 'bytes_freed': max(0, after-before),
-                                'snapshot_bytes': sizes.get(row['box'], {}).get('snapshot_bytes'), 'reason': reason})
-    DISK['boxes'] = sizes
-    con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES ('disk',?)", (json.dumps(value),))
+                         props={'snapshot': row['name'], 'bytes': row['bytes'],
+                                'bytes_freed': 0 if missing else max(0, pool_free(value)-before),
+                                'snapshot_bytes': sizes.get(row['box'], {}).get('snapshot_bytes'),
+                                'reason': 'missing' if missing else reason})
+            break
+        cleanup['shortfall_bytes'] = max(0, cleanup.get('target_bytes', 0) - pool_free(value))
+        cleanup['budget_shortfall_bytes'] = sum(max(0, int(u['snapshot_bytes'] - disk.SNAPSHOT_RATIO * u['live_bytes']))
+            for bid, u in sizes.items() if u.get('live_bytes', 0) > 0 and con.execute(
+                "SELECT 1 FROM boxes WHERE id=? AND name LIKE '%repository pool%' AND deleted_at IS NULL", (bid,)).fetchone())
+        value['cleanup'] = {k: v for k, v in cleanup.items() if k not in ('last_delete_at', 'missing_snapshots')}
+        cleanup['missing_snapshots'] = sorted(missing_snapshots)
+        value['snapshot_bytes_by_kind'] = disk.kind_bytes(snaps)
+        DISK.update(boxes=sizes, cleanup=value['cleanup'], snapshot_bytes_by_kind=value['snapshot_bytes_by_kind'])
+        con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES ('disk_cleanup',?)", (json.dumps(cleanup),))
+        con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES ('disk',?)", (json.dumps(value),))
     return value
 
 
@@ -786,11 +864,15 @@ def create_box(con, body: dict, idem: str | None, owner: str, src_box: str | Non
 
 
 def snapshot(con, box_id: str, kind: str) -> str | None:
-    if kind == 'auto':
+    if kind in RUN_KINDS:
         value = disk_maintenance(con)
-        if value['level'] in ('full', 'unknown'):
+        usage = (value.get('boxes') or DISK.get('boxes') or {}).get(box_id, {})
+        box = con.execute('SELECT name FROM boxes WHERE id=?', (box_id,)).fetchone()
+        over_budget = bool(box and 'repository pool' in (box['name'] or '') and usage.get('live_bytes', 0) > 0
+                           and usage.get('snapshot_bytes', 0) > disk.SNAPSHOT_RATIO * usage['live_bytes'])
+        if value['level'] in ('full', 'unknown') or (value.get('cleanup') or {}).get('shortfall_bytes', 0) or over_budget:
             toollog.emit('boatd', 'snapshot.skip', ok=True, ids={'box': box_id},
-                         props={'snapshot': 'auto', 'bytes_freed': 0, 'reason': 'server_disk_low', 'disk': value})
+                         props={'snapshot': kind, 'bytes_freed': 0, 'reason': 'snapshot_budget' if over_budget else 'server_disk_low', 'disk': value})
             return None
     name = f"{kind}-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%S%f')[:-3]}"
     p = incus("snapshot", "create", ct(box_id), name, timeout=120, check=False)
@@ -826,7 +908,8 @@ def snaps_to_prune(rows: list, ret: dict, t: float) -> list[str]:
 
 
 def prune_snaps(con, box_id: str) -> None:
-    if CFG.get('state_dataset') and box_id in snapshot_protected(con, pressure=False):
+    if CFG.get('state_dataset'):
+        disk_maintenance(con)
         return
     rows = con.execute("SELECT * FROM snaps WHERE box_id=? ORDER BY created_at DESC", (box_id,)).fetchall()
     gone = set(snaps_to_prune(rows, CFG["retention"], now()))

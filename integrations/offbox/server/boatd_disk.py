@@ -12,7 +12,7 @@ GIB = 1024 ** 3
 WARN = .20
 HARD = .10
 TARGET = .25
-KEEP_AUTO = 3
+KEEP_RUN = 3
 SNAPSHOT_RATIO = .50
 
 
@@ -85,15 +85,44 @@ def inventory(dataset):
     return boxes, snaps
 
 
-def candidates(snaps, protected, keep=KEEP_AUTO):
-    """Only older auto snapshots, globally oldest first. Clone origins always survive."""
+def candidates(snaps, protected, keep=KEEP_RUN):
+    """Older run restore points, globally oldest first; clone origins always survive."""
     newest = {}
     for row in sorted(snaps, key=lambda r: (r['created_at'], r['name']), reverse=True):
-        if row['kind'] == 'auto':
+        if row['kind'] in ('auto', 'stop'):
             newest.setdefault(row['box'], []).append(row['name'])
     keepers = {(bid, name) for bid, names in newest.items() for name in names[:keep]}
-    return sorted((r for r in snaps if r['kind'] == 'auto' and r['box'] not in protected and not r['clones']
+    return sorted((r for r in snaps if r['kind'] in ('auto', 'stop') and r['box'] not in protected and not r['clones']
                    and (r['box'], r['name']) not in keepers), key=lambda r: (r['created_at'], r['name']))
+
+
+# The repair loop on this pool held up at these values. Never wait inside a
+# sampler tick: issue at most one delete, then let ZFS and live jobs catch up.
+FREEING_LIMIT = 6 * GIB
+IO_FULL_LIMIT = 15
+DELETE_GAP_S = 10
+
+
+def cleanup_pressure(pool):
+    freeing = int(command(['zpool', 'get', '-Hp', '-o', 'value', 'freeing', pool]).strip())
+    lines = open('/proc/pressure/io').read().splitlines()
+    values = {line.split()[0]: float(line.split('avg10=')[1].split()[0]) for line in lines}
+    return {'freeing_bytes': freeing, 'io_full_avg10': values['full'], 'io_some_avg10': values['some']}
+
+
+def yield_reason(pressure):
+    if pressure['freeing_bytes'] >= FREEING_LIMIT:
+        return 'zfs_freeing'
+    if pressure['io_full_avg10'] >= IO_FULL_LIMIT:
+        return 'io_pressure'
+    return None
+
+
+def kind_bytes(snaps):
+    totals = {}
+    for row in snaps:
+        totals[row['kind']] = totals.get(row['kind'], 0) + row['bytes']
+    return totals
 
 
 def description(data):
