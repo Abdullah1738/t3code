@@ -3117,6 +3117,257 @@ class GuardTests(unittest.TestCase):
 SRC = Path(__file__).resolve().parents[1] / "src"
 
 
+class ConfigDirectoryDatabaseNamesTests(unittest.TestCase):
+    IMPORTS = ('import { open } from "node:fs/promises";\nimport { homedir } from "node:os";\n'
+               'let handle: Awaited<ReturnType<typeof open>> | undefined;\n')
+
+    def setUp(self):
+        clean = isolated_source_cases.fixture_environment_patch()
+        clean.start()
+        self.addCleanup(clean.stop)
+        self.temp = tempfile.TemporaryDirectory(prefix='config-db-guard-')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def deny_list(self, tool='"telegram-bridge"', parameter='item', names=None):
+        names = names or '["credentials.env", "state.sqlite", "state.sqlite-wal", "state.sqlite-shm", "state.sqlite-journal", "bridge.sock"]'
+        return (f'const protectedPaths = {names}\n'
+                f'  .map({parameter} => join(homedir(), ".config", {tool}, {parameter}));\n')
+
+    def assert_source(self, body, expected=None, args=('notify --text x', '--help')):
+        source = self.IMPORTS + body.rstrip() + '\n'
+        script = self.root / 'cli.ts'
+        script.write_text(source)
+        for argv in args:
+            with self.subTest(argv=argv):
+                self.assertEqual(guard.classify_detail(f'bun {shlex.quote(str(script))} {argv}', str(self.root)),
+                                 (expected, None))
+        for command in ("node - <<'JS'\n" + source + 'JS',
+                        'bash -c ' + shlex.quote("node - <<'JS'\n" + source + 'JS')):
+            with self.subTest(command=command):
+                self.assertEqual(guard.classify_detail(command, str(self.root)),
+                                 (READ if expected else None, None))
+
+    def test_bridge_deny_lists_with_open_import(self):
+        self.assert_source(self.deny_list())
+        self.assert_source(self.deny_list('"spectrum-bridge"', 'name'),
+                           args=('send --text x', 'react --target X --kind like'))
+        self.assert_source("// The bridge's own deny list.\n" + self.deny_list())
+
+    def test_bridge_deny_lists_from_thread_roots(self):
+        roots = ('/Users/ardud/.robob/imessage', '/Users/ardud/.robob/chats',
+                 '/Users/ardud/.robob/scratch', '/Users/ardud/.robob/projects/personal-finance',
+                 '/Users/ardud', '/Volumes/ExternalSSD/t3code-fork')
+        script = self.root / 'cli.ts'
+        for tool, parameter, args in (
+            ('telegram-bridge', 'item', ('notify --text x', '--help')),
+            ('spectrum-bridge', 'name', ('send --text x', 'react --target X --kind like')),
+        ):
+            source = self.IMPORTS + self.deny_list(json.dumps(tool), parameter)
+            script.write_text(source)
+            for cwd in roots:
+                for argv in args:
+                    with self.subTest(tool=tool, cwd=cwd, argv=argv):
+                        self.assertEqual(guard.classify_detail(f'bun {shlex.quote(str(script))} {argv}', cwd),
+                                         (None, None))
+                with self.subTest(tool=tool, cwd=cwd, stdin=True):
+                    self.assertEqual(guard.classify_detail("node - <<'JS'\n" + source + 'JS', cwd),
+                                     (None, None))
+
+    def test_bridge_deny_list_consumers(self):
+        for tool in ('telegram-bridge', 'spectrum-bridge'):
+            with self.subTest(tool=tool):
+                self.assert_source('import { stat } from "node:fs/promises";\n'
+                                   'const file = process.argv[2];\n' + self.deny_list(json.dumps(tool)) +
+                                   'if (protectedPaths.includes(resolve(file))) throw Error("protected");\n'
+                                   'for (const path of protectedPaths) {\n'
+                                   '  const secret = await stat(path, { bigint: true });\n'
+                                   '  if (secret.ino === 1n) throw Error("protected");\n}\n'
+                                   'const unrelatedName = basename(file);\n')
+
+    def test_config_names_rebased_under_unknown_directory(self):
+        imports = ('import path from "node:path";\nimport { homedir } from "node:os";\n'
+                   'const { DatabaseSync } = await import("node:sqlite");\n')
+        operands = ('"/Users/x/.config/mytool/state.sqlite"',
+                    '"~/.config/mytool/state.sqlite"',
+                    'path.join(homedir(), ".config", "mytool", "state.sqlite")',
+                    '["state.sqlite"].map(n => path.join(homedir(), ".config", "mytool", n))[0]')
+        transforms = ('path.basename(foreign)', 'path.parse(foreign).base',
+                      'foreign.split("/").pop()', 'foreign.slice(foreign.lastIndexOf("/") + 1)')
+        with patch.dict(os.environ, {'D': '/Users/x/.robob/userdata'}):
+            for operand in operands:
+                for transform in transforms:
+                    source = (imports + f'const foreign = {operand};\n'
+                              f'new DatabaseSync(path.join(process.env.D, {transform}));\n')
+                    script = self.root / 'rebase.mjs'
+                    script.write_text(source)
+                    stdin = "node - <<'JS'\n" + source + 'JS'
+                    commands = (('node ' + shlex.quote(str(script)), SCRIPT),
+                                ('env D=/Users/x/.robob/userdata node ' + shlex.quote(str(script)), SCRIPT),
+                                (stdin, READ), ('bash -c ' + shlex.quote(stdin), READ))
+                    for command, expected in commands:
+                        with self.subTest(operand=operand, transform=transform, command=command):
+                            self.assertEqual(guard.classify_detail(command, str(self.root)), (expected, None))
+            for operand in operands:
+                for use in ('new DatabaseSync(`${process.env.D}/${path.basename(foreign)}`);',
+                            'eval("new DatabaseSync(path.join(process.env.D, path.basename(foreign)))");'):
+                    source = imports + f'const foreign = {operand};\n' + use + '\n'
+                    with self.subTest(operand=operand, use=use):
+                        self.assertEqual(guard.classify_detail("node - <<'JS'\n" + source + 'JS', str(self.root)),
+                                         (READ, None))
+
+    def test_config_deny_list_unknown_consumers(self):
+        for consumer in (
+            'const foreign = protectedPaths[0];',
+            'const foreign = protectedPaths.at(0);',
+            'const foreign = protectedPaths.map(path => basename(path));',
+            'for (const path of protectedPaths) { new DatabaseSync(join(process.env.D, basename(path))); }',
+            'const alias = protectedPaths; new DatabaseSync(join(process.env.D, basename(alias[0])));',
+            'consume(protectedPaths);',
+            'for (const path of protectedPaths) { consume(path); }',
+            'for (const path of protectedPaths) { const alias = path; }',
+        ):
+            with self.subTest(consumer=consumer):
+                self.assert_source('const { DatabaseSync } = await import("node:sqlite");\n' +
+                                   self.deny_list() + consumer, SCRIPT)
+
+    def test_config_deny_list_metadata_reader_binding(self):
+        loop = 'for (const path of protectedPaths) { await stat(path); }\n'
+        for declarations in (
+            '',
+            'const stat = value => new DatabaseSync(join(process.env.D, basename(value)));\n',
+            'import { stat as other } from "node:fs/promises";\n',
+            'import { stat } from "node:fs/promises"; function f(stat) { ' + loop + '}\n',
+        ):
+            with self.subTest(declarations=declarations):
+                self.assert_source('const { DatabaseSync } = await import("node:sqlite");\n' +
+                                   self.deny_list() + declarations + loop, SCRIPT)
+
+    def assert_consumer_override(self, before, after):
+        source = ('import path from "node:path";\nimport { homedir } from "node:os";\n'
+                  'const { DatabaseSync } = await import("node:sqlite");\n' + before +
+                  'const protectedPaths = ["state.sqlite"].map(n => path.join(homedir(), ".config", "mytool", n));\n' + after + '\n')
+        script = self.root / 'override.mjs'
+        script.write_text(source)
+        stdin = "node - <<'JS'\n" + source + 'JS'
+        with patch.dict(os.environ, {'D': '/Users/ardud/.robob/userdata'}):
+            for command, expected in (
+                ('node ' + shlex.quote(str(script)), SCRIPT),
+                ('env D=/Users/ardud/.robob/userdata node ' + shlex.quote(str(script)), SCRIPT),
+                ('env D=/Users/ardud/.robob/userdata ' + stdin, READ),
+                ('env D=/Users/ardud/.robob/userdata bash -c ' + shlex.quote(stdin), READ),
+            ):
+                with self.subTest(command=command):
+                    self.assertEqual(guard.classify_detail(command, str(self.root)), (expected, None))
+
+    def test_config_deny_list_overridden_membership(self):
+        for receiver in ('Array.prototype', 'Array["prototype"]', 'Object.getPrototypeOf([])'):
+            with self.subTest(receiver=receiver):
+                self.assert_consumer_override(receiver + '.includes = function () {\n'
+                                              '  new DatabaseSync(path.join(process.env.D, path.basename(this[0])));\n'
+                                              '  return false;\n};\n',
+                                              'if (protectedPaths.includes("unused")) throw Error("protected");')
+
+    def test_config_deny_list_commented_metadata_import(self):
+        for fake_import in ('/* import { stat } from "node:fs/promises"; */\n',
+                            '// import { stat } from "node:fs/promises";\n',
+                            'const text = \'import { stat } from "node:fs/promises";\';\n'):
+            with self.subTest(fake_import=fake_import):
+                self.assert_consumer_override(fake_import +
+                                              'globalThis.stat = value => new DatabaseSync(path.join(process.env.D, path.basename(value)));\n',
+                                              'for (const file of protectedPaths) { await stat(file); }')
+
+    def test_direct_config_database_operands(self):
+        for home in ('homedir()', 'os.homedir()'):
+            for join in ('join', 'path.join', 'resolve'):
+                for quote in ('"', "'"):
+                    for suffix in ('', '-wal', '-shm', '-journal'):
+                        with self.subTest(home=home, join=join, quote=quote, suffix=suffix):
+                            self.assert_source(f'const p = {join}({home}, {quote}.config{quote}, '
+                                               f'{quote}mytool{quote}, {quote}state.sqlite{suffix}{quote});')
+        for path in ('~/.config/mytool/state.sqlite', '/Users/x/.config/mytool/state.sqlite-wal'):
+            for quote in ('"', "'"):
+                with self.subTest(path=path, quote=quote):
+                    self.assert_source(f'const p = {quote}{path}{quote};')
+
+    def test_reserved_tools_are_not_discharged(self):
+        for tool in ('robob', 't3', 'opencode', 'T3Code', 'robob-data', 'opencode-data'):
+            with self.subTest(tool=tool):
+                self.assert_source(self.deny_list(json.dumps(tool)), SCRIPT)
+                self.assert_source(f'const p = join(homedir(), ".config", "{tool}", "state.sqlite");', SCRIPT)
+                self.assert_source(f'const p = "~/.config/{tool}/state.sqlite"; const root = ".robob";', SCRIPT)
+
+    def test_nonliteral_and_unconfined_names_are_not_discharged(self):
+        for body in (
+            self.deny_list('dir'), self.deny_list('`my${tool}`'),
+            self.deny_list('"../mytool"'), self.deny_list('".."'), self.deny_list('"my*tool"'),
+            self.deny_list(names='["../state.sqlite"]'),
+            self.deny_list(names='[`state.sqlite${suffix}`]'),
+            self.deny_list(names='["state.sqlite", "../state.sqlite"]'),
+            self.deny_list(names='["prefix \'state.sqlite\' suffix"]'),
+            'const p = join(homedir(), ".config", dir, "state.sqlite");',
+            'const p = join(homedir(), ".config", "mytool", `state.sqlite${suffix}`);',
+            'const p = join(homedir(), ".config", "mytool", "../state.sqlite");',
+            'const p = `${h}/.config/mytool/state.sqlite`;',
+            'const p = `~/.config/mytool/state.sqlite`;',
+            'const p = "/Users/../x/.config/mytool/state.sqlite";',
+            'const p = "~/.config/mytool/state.sqlite?mode=ro";',
+            'const p = "~/.config/mytool/state.sqlite\\x";',
+            'const p = "~/.config/mytool/state.sqlite*";',
+            'const p = "~/.config/${tool}/state.sqlite";',
+            'const names = ["state.sqlite"];\nnames.map(n => join(homedir(), ".config", "mytool", n));',
+            '["state.sqlite"].map(n => join(homedir(), ".config", "mytool", other));',
+            '`join(homedir(), ".config", "mytool", "state.sqlite")`;',
+        ):
+            with self.subTest(body=body):
+                self.assert_source(body, SCRIPT)
+
+    def test_safe_deny_list_does_not_hide_another_database(self):
+        for body in (
+            'const n = "state.sqlite"; join(homedir(), ".robob", "userdata", n);',
+            'const p = join(homedir(), ".t3/userdata", "state.sqlite");',
+            'const p = join(homedir(), ".config", dir, "state.sqlite");',
+            'const p = "/Users/x/.robob/userdata/statev2.sqlite";',
+        ):
+            with self.subTest(body=body):
+                self.assert_source(self.deny_list() + body, SCRIPT)
+        self.assert_source('const n = "state.sqlite"; join(homedir(), ".robob", "userdata", n);', SCRIPT)
+
+    def test_config_basename_reuse_keeps_live_root_evidence(self):
+        for value in ('join(homedir(), ".config", "mytool", "state.sqlite")',
+                      '"~/.config/mytool/state.sqlite"'):
+            with self.subTest(value=value):
+                self.assert_source(f'const p = {value};\n'
+                                   'open(join(homedir(), ".robob", "userdata", path.basename(p)));', SCRIPT)
+
+    def test_config_name_reuse_in_protected_cwd(self):
+        roots = (self.root / '.robob/userdata', self.root / '.robob/userdata/archive',
+                 self.root / 'robob-data/userdata', self.root / '.local/share/opencode',
+                 self.root / 'opencode-data', Path.home() / '.t3/userdata')
+        for root in roots:
+            if root.is_relative_to(self.root):
+                root.mkdir(parents=True, exist_ok=True)
+        alias = self.root / 'alias'
+        alias.symlink_to(roots[0], target_is_directory=True)
+        roots += (alias,)
+        imports = ('import path from "node:path";\n'
+                   'const { DatabaseSync } = await import("node:sqlite");\n')
+        for operand in ('"~/.config/mytool/state.sqlite"',
+                        'join(homedir(), ".config", "mytool", "state.sqlite")',
+                        '["state.sqlite"].map(n => join(homedir(), ".config", "mytool", n))[0]'):
+            source = imports + f'const p = {operand};\nnew DatabaseSync(path.basename(p));\n'
+            script = self.root / 'reuse.mjs'
+            script.write_text(source)
+            for cwd in roots:
+                with self.subTest(operand=operand, cwd=cwd):
+                    self.assertEqual(guard.classify_detail('node ' + shlex.quote(str(script)), str(cwd)), (SCRIPT, None))
+                    stdin = "node - <<'JS'\n" + source + 'JS'
+                    self.assertEqual(guard.classify_detail(stdin, str(cwd)), (READ, None))
+                    self.assertEqual(guard.classify_detail('bash -c ' + shlex.quote(stdin), str(cwd)), (READ, None))
+            with self.subTest(operand=operand, cwd='isolated'):
+                self.assertEqual(guard.classify_detail('node ' + shlex.quote(str(script)), str(self.root)), (SCRIPT, None))
+
+
 class LiveDatabaseGuardTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="live-db-guard-")

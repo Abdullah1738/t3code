@@ -215,6 +215,7 @@ function runRulesCommand(command: RulesCommand, rulesPath: string): Promise<unkn
 export async function runLocalCommand(command: LocalCommand, options: { exec?: Exec; apps?: () => Promise<{ appsRoot: string; appsPort: number }>; rulesPath?: string } = {}): Promise<unknown> {
   if (command.command === "log-card-render") {
     logCardRender(`${command.kind}-renderer`, command.kind, command.durationMs, command.ok, command);
+    if (!toolLog.flush()) throw new CliError("Render log unavailable");
     return { logged: true };
   }
   if (command.command === "log-rollup") {
