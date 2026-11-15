@@ -76,6 +76,26 @@ describe("HTTP socket telemetry", () => {
     expect(server.keepAliveTimeout).toBeGreaterThanOrEqual(95_000);
     expect(server.headersTimeout).toBeGreaterThan(server.keepAliveTimeout);
     expect(server.keepAliveTimeoutBuffer).toBe(buffer);
+    expect(server.timeout).toBe(0);
+    expect(server.requestTimeout).toBe(300_000);
+  });
+
+  it("rescues a request dispatched between timeout scheduling and deferred close", () => {
+    vi.useFakeTimers();
+    const t = setup();
+    t.respond();
+    t.server.emit("timeout", t.socket);
+    const response = Object.assign(new NodeEvents.EventEmitter(), {
+      req: { socket: t.socket },
+      shouldKeepAlive: true,
+    });
+    t.server.emit("request", { socket: t.socket }, response);
+    vi.runAllTimers();
+    expect(t.socket.destroyed).toBe(false);
+    response.emit("finish");
+    t.server.emit("timeout", t.socket);
+    vi.runAllTimers();
+    expect(t.socket.destroyed).toBe(true);
   });
 
   it.each(["ECONNRESET", "EPIPE", "HPE_INVALID_METHOD"])(

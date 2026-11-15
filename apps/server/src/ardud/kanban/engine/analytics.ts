@@ -9,6 +9,11 @@ export const elapsed = (at: string, since: string) => {
 };
 
 export function reasonClass(text: string, category?: string): string {
+  if (text === "Stale queued runs on the thread") return "stale_queued_runs";
+  if (text === "Run went silent twice") return "run_silent";
+  if (text === "No project set for this card") return "missing_project";
+  if (text.startsWith("Thread model differs from card model:")) return "thread_model_differs";
+  if (text.startsWith("Review verdict refused:")) return "verdict_refused";
   if (/variant unavailable/i.test(text)) return "variant_unavailable";
   if (/provider blocked|content.filter|flagged.*cybersecurity/i.test(text))
     return "provider_blocked";
@@ -67,14 +72,19 @@ export function cardEvents(
     });
   if (
     before.stalled?.at !== after.stalled?.at ||
-    before.stalled?.reason !== after.stalled?.reason
+    before.stalled?.reason !== after.stalled?.reason ||
+    before.stalled?.by._tag !== after.stalled?.by._tag
   ) {
     if (before.stalled)
       events.push({
         ...common,
         kind: "kanban.stall",
+        durationMs: elapsed(after.updatedAt, before.stalled.at),
         props: {
           action: "clear",
+          number: after.number,
+          actor: before.stalled.by._tag,
+          from: before.stage,
           reasonClass: reasonClass(before.stalled.reason),
           ageMs: elapsed(after.updatedAt, before.stalled.at),
         },
@@ -83,7 +93,14 @@ export function cardEvents(
       events.push({
         ...common,
         kind: "kanban.stall",
-        props: { action: "set", reasonClass: reasonClass(after.stalled.reason), ageMs: 0 },
+        props: {
+          action: "set",
+          number: after.number,
+          actor: after.stalled.by._tag,
+          from: after.stage,
+          reasonClass: reasonClass(after.stalled.reason),
+          ageMs: 0,
+        },
       });
   }
   if (

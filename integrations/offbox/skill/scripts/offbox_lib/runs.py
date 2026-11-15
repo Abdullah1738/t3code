@@ -854,7 +854,16 @@ def missing_deps_hint(root: Path, *, cwd: Path | None = None, repo_root: Path | 
     target = node_tools.install_root(root, repo_root)
     install = node_tools.install_from(root, cwd or root, repo_root)
     node = node_version.want(repo_root or root, root)
-    requirement = (f" Use Node matching {node[1]}." if node else "") + package_manager.version_note(target)
+    requirement = ""
+    if node:
+        ranges, label = node
+        if len(ranges) == 1 and ranges[0][1] == ranges[0][0] + 1:
+            version = ranges[0][0]
+            exact = f"{version // 1_000_000}.{version // 1_000 % 1_000}.{version % 1_000}"
+            requirement = f" Use Node v{exact} exactly ({label})."
+        else:
+            requirement = f" Use Node matching {label}."
+    requirement += package_manager.version_note(target)
     return ("no node_modules on this box yet (fresh or pruned box). Install deps and run the command in the same call: "
             f"offbox run -- {shlex.quote(install + ' && <command>')}; offbox save --default afterwards keeps them."
             + requirement + " Check the repo's CI install flags and manager version before running.")

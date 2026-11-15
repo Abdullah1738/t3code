@@ -419,6 +419,43 @@ test("log-rollup is local, validates UTC dates and rolls up fixture input", asyn
   for (const ms of ["-1", "NaN", "Infinity", ""]) expect(() => parseLocalCommand(["log-card-render", "--kind", "quick", "--ms", ms, "--ok", "true"])).toThrow();
 });
 
+test("log-rollup excludes calls buffered before captureLogs", async () => {
+  const { parseLocalCommand, runLocalCommand } = await import("../src/cli.ts");
+  const { captureLogs } = await import("./log-fixture.ts");
+  const { toolLog } = await import("../src/toollog.ts");
+  toolLog.write({ component: "robob", kind: "perf", name: "turn.robob_call", durationMs: 5, ok: true,
+    props: { method: "GET", route: "/health" } });
+  const logs = await captureLogs(async () => {
+    toolLog.write({ component: "cli-fixture", kind: "event", name: "msg.received" });
+    const day = new Date().toISOString().slice(0, 10);
+    expect(await runLocalCommand(parseLocalCommand(["log-rollup", "--day", day]))).toMatchObject({ total: 1, day });
+  });
+  expect(logs.map(line => line.name)).toEqual(["msg.received"]);
+});
+
+test.each([false, true])("captureLogs drains action calls before restoring its directory (throws=%s)", async throws => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const { toolLog } = await import("../src/toollog.ts");
+  const failure = new Error("fixture action failed");
+  const outer = process.env.TOOLLOG_DIR;
+  const logs = await captureLogs(async () => {
+    const inner = captureLogs(async () => {
+      toolLog.write({ component: "robob", kind: "perf", name: "turn.robob_call", durationMs: 5, ok: true,
+        props: { method: "GET", route: "/health" } });
+      if (throws) throw failure;
+    });
+    if (throws) await expect(inner).rejects.toBe(failure);
+    else {
+      const captured = await inner;
+      expect(captured.map(line => line.name)).toEqual(["turn.robob_calls"]);
+      expect(captured[0]?.calls?.health.count).toBe(1);
+    }
+    toolLog.write({ component: "cli-fixture", kind: "event", name: "msg.received" });
+  });
+  expect(logs.map(line => line.name)).toEqual(["msg.received"]);
+  expect(process.env.TOOLLOG_DIR).toBe(outer);
+});
+
 test("nutrition's live-only renderer is observed at file preparation, on success and failure", async () => {
   const { captureLogs } = await import("./log-fixture.ts");
   const root = await fs.mkdtemp(join(os.tmpdir(), "nutrition-log-fixture-"));

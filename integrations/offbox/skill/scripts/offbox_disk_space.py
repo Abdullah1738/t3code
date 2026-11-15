@@ -223,6 +223,8 @@ def error_line(line):
 
 def result(path, code, *, offset=0):
     phases, matches, seen_attempt, final = {}, False, 0, None
+    native_crash = False
+    native_attempts = set()
     try:
         with open(path, 'rb') as f:
             f.seek(offset)
@@ -243,16 +245,26 @@ def result(path, code, *, offset=0):
                                 if (isinstance(record, dict) and isinstance(record.get('disk_space'), dict) and
                                         all(p in ('server_start', 'start', 'end', 'gate') and valid_space(s)
                                             for p, s in record['disk_space'].items()) and
-                                        record.get('infra_failure') in (None, 'enospc') and
+                                        record.get('infra_failure') in (None, 'enospc', 'native_crash') and
+                                        (record.get('infra_failure') != 'native_crash' or
+                                         record.get('infra_reason') == 'toolchain_unpack_crash') and
                                         (final is None or attempt >= final[0])):
                                     final = attempt, record
+                            continue
+                        if phase == 'toolchain':
+                            if (item.get('infra_failure') == 'native_crash' and
+                                    item.get('infra_reason') == 'toolchain_unpack_crash'):
+                                native_crash = True
+                                native_attempts.add(seen_attempt)
                             continue
                         space = item['space']
                         if phase not in ('server_start', 'start', 'end', 'gate') or not valid_space(space):
                             continue
                         if phase == 'server_start':
                             phases = {}
+                            native_crash = False
                         elif phase == 'start':
+                            native_crash = False
                             server_start = phases.get('server_start') if set(phases) == {'server_start'} else None
                             phases = {'server_start': server_start} if server_start is not None else {}
                         phases[phase] = space
@@ -268,6 +280,10 @@ def result(path, code, *, offset=0):
     if authoritative:
         phases = final[1]['disk_space']
         matches = final[1].get('infra_failure') == 'enospc'
+        # Older servers summarize disk failures only. Preserve the explicit stderr
+        # toolchain marker for that same attempt so a client-only install is enough.
+        native_crash = (final[1].get('infra_failure') == 'native_crash' or
+                        final[0] in native_attempts)
     start, end = phases.get('start', phases.get('server_start', {})), phases.get('end', {})
     out = dict(disk_space=phases, command_exit_code=None if 'gate' in phases else code,
                wrapper_exit_code=code, infra_failure=None, infra_reason=None)
@@ -281,6 +297,8 @@ def result(path, code, *, offset=0):
     if code not in (0, None) and (matches or low or 'gate' in phases):
         out['infra_failure'] = 'enospc'
         out['infra_reason'] = 'low_space_gate' if 'gate' in phases else 'disk_exhausted'
+    if code == 90 and native_crash:
+        out.update(infra_failure='native_crash', infra_reason='toolchain_unpack_crash', command_exit_code=None)
     return out
 
 
@@ -295,6 +313,9 @@ def command_result(stdout, stderr, code, *, stdout_offset=0, stderr_offset=0):
 
 
 def message(record):
+    if record.get('infra_failure') == 'native_crash':
+        return ('infra: the box crashed unpacking a checksum-verified toolchain archive twice; '
+                'this is a box/host fault, not your repo. Nothing ran (exit 90).')
     phases = record.get('disk_space', {})
     start = phases.get('start', phases.get('server_start', {}))
     end = phases.get('end', phases.get('gate', {}))

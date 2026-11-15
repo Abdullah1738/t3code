@@ -107,6 +107,7 @@ export interface EventSinkV2Shape {
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
     readonly effects: ReadonlyArray<EffectOutbox.PendingOrchestrationEffectV2>;
   }) => Effect.Effect<ReadonlyArray<OrchestrationV2StoredEvent>, EventSinkV2Error>;
+  /** Provider lifecycle writes preserve the orchestrator's completion cohort. */
   readonly writeIfRunCurrent: (input: {
     readonly unlessClaudeRefused?: ProviderThreadId;
     readonly guardPendingUserInputCancellations?: boolean;
@@ -915,12 +916,20 @@ const layerBase: Layer.Layer<
                 if (refused.length > 0) return { committed: false as const, storedEvents: [] };
               }
 
+              // A matching attempt can still carry a cohort captured before an
+              // acknowledgement, successor delivery, or Stop. Projection keeps
+              // the recorded cohort when a lifecycle event omits that field.
+              const lifecycleEvents = input.events.map((event) => {
+                if (event.type !== "run.updated" || event.payload.id !== input.runId) return event;
+                const { delegatedCompletion: _delegatedCompletion, ...payload } = event.payload;
+                return { ...event, payload };
+              });
               const normalized = yield* timing.measure(
                 "normalize",
                 normalizeEvents(
                   input.guardPendingUserInputCancellations === true
-                    ? yield* guardUserInputCancellations(input.events)
-                    : input.events,
+                    ? yield* guardUserInputCancellations(lifecycleEvents)
+                    : lifecycleEvents,
                 ),
               );
               const storedEvents = yield* timing.measure(

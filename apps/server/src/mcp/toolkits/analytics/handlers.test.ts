@@ -3,6 +3,7 @@ import * as Schema from "effect/Schema";
 import * as Deferred from "effect/Deferred";
 import { OrchestratorMcpFailure, type AnalyticsEvent } from "@t3tools/contracts";
 import * as McpHttpServer from "../../McpHttpServer.ts";
+import { makeReadPager } from "../../../ardud/analytics/readPages.ts";
 import { finishRollup, makeAccumulator } from "../../../ardud/analytics/rollup.ts";
 import { expect, it } from "@effect/vitest";
 import { EnvironmentId } from "@t3tools/contracts";
@@ -36,13 +37,14 @@ it.effect("reads a filtered day's rollup through the MCP service boundary", () =
         read: (input) =>
           Effect.sync(() => {
             calls.push(input);
-            return {
-              rollup: {
+            return makeReadPager().read(
+              input,
+              {
                 ...finishRollup(makeAccumulator(), "2026-11-13", "2026-11-13T00:00:00.000Z"),
                 kindCounts: { "ask.answered": 2 },
               },
-              samples: [],
-            };
+              [],
+            );
           }),
       }),
     );

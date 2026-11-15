@@ -8,6 +8,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
 import { deferIdleSocketClose } from "./deferIdleSocketClose.ts";
+import * as McpResponseDelivery from "./McpResponseDelivery.ts";
 
 export type SocketRecord = Readonly<Record<string, string | number | boolean>>;
 type Report = (name: string, fields: SocketRecord) => void;
@@ -22,10 +23,10 @@ interface SocketState {
   detachHttp: () => void;
   localPort: number;
   remotePort: number;
+  deliveries: Set<McpResponseDelivery.McpResponseDelivery["Service"]>;
 }
 
-// State and handlers are allocated per connection; requests only update the state and
-// attach the same finish handler to the response object Node already owns.
+// Observe response lifecycles without data/readable listeners so Node keeps its native parser.
 export function makeHttpSocketTelemetry(report: Report, now = Date.now) {
   const states = new Map<NodeStream.Duplex, SocketState>();
   let idleCloses = 0;
@@ -85,6 +86,7 @@ export function makeHttpSocketTelemetry(report: Report, now = Date.now) {
         detachHttp: () => {},
         localPort: socket.localPort ?? 0,
         remotePort: socket.remotePort ?? 0,
+        deliveries: new Set(),
       };
       states.set(socket, state);
       socket.on("close", () => states.delete(socket));
@@ -99,6 +101,8 @@ export function makeHttpSocketTelemetry(report: Report, now = Date.now) {
       };
       const onError = (error: NodeJS.ErrnoException) => {
         if (state.upgraded) return;
+        for (const delivery of state.deliveries)
+          if (delivery.closeReason === "unknown") delivery.closeReason = "socket_error";
         const recentReset =
           error.code === "ECONNRESET" &&
           state.lastResponseAt > 0 &&
@@ -112,6 +116,10 @@ export function makeHttpSocketTelemetry(report: Report, now = Date.now) {
       };
       socket.on("finish", onFinish);
       socket.on("error", onError);
+      socket.on("end", () => {
+        for (const delivery of state.deliveries)
+          if (delivery.closeReason === "unknown") delivery.closeReason = "peer_end";
+      });
       const destroy = socket.destroy;
       socket.destroy = function (error) {
         if (!this.destroyed && !state.upgraded && this.readableLength > 0)
@@ -131,6 +139,30 @@ export function makeHttpSocketTelemetry(report: Report, now = Date.now) {
       state.idle = false;
       state.requests++;
       response.on("finish", responseFinished);
+      if (request.url?.split("?", 1)[0] === "/mcp") {
+        const delivery = McpResponseDelivery.observe(
+          request,
+          response,
+          (closed) => {
+            report("server.http.socket.mcpResponseDropped", {
+              ...fields(request.socket, state),
+              activeRequests: state.requests,
+              headersSent: response.headersSent,
+              writableFinished: response.writableFinished,
+              ...closed.snapshot(),
+              ...(closed.tool === undefined ? {} : { tool: closed.tool }),
+              ...(closed.callerThreadId === undefined
+                ? {}
+                : { callerThreadId: closed.callerThreadId }),
+            });
+          },
+          now,
+        );
+        state.deliveries.add(delivery);
+        const remove = () => state.deliveries.delete(delivery);
+        response.once("finish", remove);
+        response.once("close", remove);
+      }
     });
     server.on("upgrade", (_request, socket) => {
       const state = states.get(socket);
@@ -140,6 +172,8 @@ export function makeHttpSocketTelemetry(report: Report, now = Date.now) {
       state.detachHttp();
     });
     server.on("clientError", (error: NodeJS.ErrnoException, socket: NodeNet.Socket) => {
+      for (const delivery of states.get(socket)?.deliveries ?? [])
+        delivery.closeReason = "client_error";
       report("server.http.socket.clientError", {
         ...fields(socket),
         code: error.code ?? "UNKNOWN",
@@ -164,10 +198,21 @@ export function makeHttpSocketTelemetry(report: Report, now = Date.now) {
       }
       socket.destroy(error);
     });
-    return deferIdleSocketClose(server, (socket, outcome) => {
-      if (outcome === "rescued") rescued++;
-      else if (isIdle(states.get(socket))) idleCloses++;
-    });
+    return deferIdleSocketClose(
+      server,
+      (socket, outcome) => {
+        if (outcome === "rescued") rescued++;
+        else {
+          if (isIdle(states.get(socket))) idleCloses++;
+          for (const delivery of states.get(socket)?.deliveries ?? [])
+            delivery.closeReason = "idle_timeout";
+        }
+      },
+      (socket) => {
+        const state = states.get(socket);
+        return state !== undefined && (state.requests > 0 || state.upgraded);
+      },
+    );
   }
 
   function sample() {

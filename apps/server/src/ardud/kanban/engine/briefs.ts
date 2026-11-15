@@ -9,7 +9,7 @@ import {
 } from "@t3tools/contracts";
 
 import { reviewRetryNote } from "./retries.ts";
-import { MAX_BATCH } from "./rules.ts";
+import { MAX_BATCH, workerWorkDone } from "./rules.ts";
 import { REVIEW_DELEGATION_GUIDANCE } from "./reviewerRouting.ts";
 import { pendingWakeNote, subtaskIds, subtaskLines, wakeLead } from "./subtasks.ts";
 
@@ -32,7 +32,12 @@ const cardFacts = (card: KanbanCard, goal: KanbanGoal | null) =>
 const LINKS_LINE =
   "- Links: to point at a card, write [#12 Title](t3-context://v1/kanban-card/<card id>), or kanban-discussion/<discussion id> for a discussion; the owner sees a chip. One may reach you like that, or as [Kanban card: #12 Title; ref=<card id>] (card_get, discussion_read). A thread is a plain [title](t3-thread://v1/<thread id>) link (t3_thread_read).";
 
-export const workBrief = (board: KanbanBoard, card: KanbanCard, goal: KanbanGoal | null) =>
+export const workBrief = (
+  board: KanbanBoard,
+  card: KanbanCard,
+  goal: KanbanGoal | null,
+  comments: ReadonlyArray<string> = [],
+) =>
   lines(
     `You are the worker for a card on the "${board.name}" Missions board.`,
     "",
@@ -41,6 +46,10 @@ export const workBrief = (board: KanbanBoard, card: KanbanCard, goal: KanbanGoal
     "Task:",
     card.prompt.trim() || card.description.trim() || card.title,
     pendingWakeNote(card) ? `\nWaiting for this card:\n${pendingWakeNote(card)}` : null,
+    card.workThreadId
+      ? `\nPrevious work thread: ${card.workThreadId} (t3_thread_read for earlier context).`
+      : null,
+    comments.length > 0 ? `\nCard comments and handoff notes:\n${comments.join("\n\n")}` : null,
     "",
     "How the board works:",
     '- Your card tools: card_get, card_search, card_update, card_move, card_ask, card_flag, subtask_done, discussion_post, wiki_read, report_bug, evaluator_start (kind "request" only). The ones that change things work only on your own cards. If your task says to post on or change another card, put what you have in your own card (card_update or its discussion) and leave carrying it over to the evaluator.',
@@ -299,7 +308,7 @@ export const nightlyBrief = (
   lines(
     `You run the nightly review of the "${board.name}" Missions board (boardId ${board.id}). Treat its tool as a product built for the owner.`,
     `Read and follow this board's instructions:\n${JSON.stringify(board.instructions)}`,
-    "Read the last 24 hours through paged calls, each small enough to read whole: board_activity first (each ask's minutes from asked to answered, review rounds and verdicts per card, time in each stage, stalls, run failures by model, thread restarts, cards left without a thread, slot use per hour); then board_get with since set to 24 hours ago for one short row per card active in the window, settled cards included (follow board.page.nextAfter with after while hasMore); card_get for the cards worth a closer look (latest 20 events; events {before: olderEvents} pages back); discussions and owner messages with discussion_read and limit: 40 (use the supplied discussion IDs; earlierBefore pages older messages). Quote ask-to-answer times and review rounds from board_activity. Read the wiki with wiki_read. Skim t3_thread_read for card threads active in this window; do not read whole transcripts. Read every log and analytics source available for this board's tool. On Robob use analytics_read; tool boards use their tool's own logs. If a source or read tool is unavailable, record that information gap, never invent evidence.",
+    "Read the last 24 hours through paged calls, each small enough to read whole: board_activity first (each ask's minutes from asked to answered, review rounds and verdicts per card, time in each stage, stalls, run failures by model, thread restarts, cards left without a thread, slot use per hour); then board_get with since set to 24 hours ago for one short row per card active in the window, settled cards included (follow board.page.nextAfter with after while hasMore); card_get for the cards worth a closer look (latest 20 events; events {before: olderEvents} pages back); discussions and owner messages with discussion_read and limit: 40 (use the supplied discussion IDs; earlierBefore pages older messages). Quote ask-to-answer times and review rounds from board_activity. Read the wiki with wiki_read. Skim t3_thread_read for card threads active in this window; do not read whole transcripts. Read every log and analytics source available for this board's tool. On Robob use analytics_read for the summary and section index, then fetch section by name and follow cursor with the same filters while hasMore; tool boards use their tool's own logs. If a source or read tool is unavailable, record that information gap, never invent evidence.",
     "Complete the read pass before filing findings. Start board_get without after (or after: 0); only use nextAfter returned by the preceding page for this same board and since. Keep since unchanged while paging, and continue until hasMore is false; a full page is not the whole day. Do not choose a starting card number or skip early cards. Read every supplied active discussion through the window, and skim each active card thread. wiki_read without a slug returns only the index: read the pages relevant to this review by slug or slugs. Keep calls and transcript excerpts small, but do not turn this review into a skim to save calls.",
     "For a transient read failure (ECONNRESET, timeout or connection reset), retry the same read once before calling the source unavailable; continue the other reads either way. If board_activity or since is unsupported on the running build, fall back to board_get without since, starting at after: 0 and paging to hasMore false, then use card_get histories for the window. Record the unsupported tool or argument as an information gap. A failed wiki read must not end the board, discussion or thread reads.",
     "Do the following in order:",
@@ -336,18 +345,18 @@ export const evaluatorBrief = (board: KanbanBoard, purpose: EvaluatorPurpose) =>
         "- Discussions: discussion_create opens a channel, discussion_post writes to any discussion (markdown, collapse, html, choice, card blocks).",
         '- Reporter updates: one evaluator owns each card\'s reporter notifications. Before sending "fixed" or "workarounds no longer needed", read the card back and check the installed fix live; send only when its stage is deployed or verified. For each destination thread, check the card history for the same text, then use t3_thread_send with a stable clientRequestId made from the card id, destination thread id and hash of the exact text. Record each send on the card; never send the same text to the same thread twice.',
 
-    LINKS_LINE,
-    "- Shared lessons: wiki_read, wiki_write. Write down what future evaluators should know.",
-    "",
-    board.instructions.modelRouting.trim()
-      ? `Model routing:\n${board.instructions.modelRouting.trim()}\n`
-      : null,
-    REVIEW_DELEGATION_GUIDANCE,
-    board.instructions.escalation.trim()
-      ? `When to ask the owner:\n${board.instructions.escalation.trim()}\n`
-      : null,
-    "The owner never moves cards to In Review or Working himself and does not message threads directly. Ask him only through a discussion or a Needs Owner card.",
-  );
+        LINKS_LINE,
+        "- Shared lessons: wiki_read, wiki_write. Write down what future evaluators should know.",
+        "",
+        board.instructions.modelRouting.trim()
+          ? `Model routing:\n${board.instructions.modelRouting.trim()}\n`
+          : null,
+        REVIEW_DELEGATION_GUIDANCE,
+        board.instructions.escalation.trim()
+          ? `When to ask the owner:\n${board.instructions.escalation.trim()}\n`
+          : null,
+        "The owner never moves cards to In Review or Working himself and does not message threads directly. Ask him only through a discussion or a Needs Owner card.",
+      );
 
 /** Steer text for an owner message delivered to a card or evaluator thread. */
 export const ownerMessageText = (discussionTitle: string, discussionId: string, text: string) =>
@@ -396,7 +405,14 @@ export const nudgeWorkText = (cards: ReadonlyArray<KanbanCard>) => {
   return lines(
     instruction,
     ...cards.map((card) =>
-      lines(`Card #${card.number}:`, pendingWakeNote(card), subtaskLines(card)),
+      lines(
+        `Card #${card.number}:`,
+        workerWorkDone(card)
+          ? "Your work subtasks are done; card_move needs_review now. If a board call fails, say so in card_update and flag the card."
+          : null,
+        pendingWakeNote(card),
+        subtaskLines(card),
+      ),
     ),
   );
 };

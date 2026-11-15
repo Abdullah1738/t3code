@@ -6,6 +6,47 @@ Source scripts use `toollog.py` (or the `toollog.sh` bridge) for local metadata 
 it rolls up yesterday. Quantiles use nearest rank. `okRate`/`failedRate` use
 lines with an explicit `ok`; `errorRate` is the share of error-kind lines.
 
+Run `mac-log-status` for last-seen times, ages, last outcomes and overdue jobs,
+or `mac-log-status --json` for the same report as JSON. `--now ISO` freezes the
+clock (include `Z` or an explicit UTC offset). The command always exits 0,
+including invalid arguments or unreadable input; inspect the report for errors.
+It reads the UTC day files covering the last 36 hours (three files before noon
+UTC, two from noon onward). Missing and unreadable files are listed separately.
+Malformed rows, including invalid timestamps and dates that overflow when
+converted to UTC, are skipped and counted. Future timestamps are ignored.
+It makes no network calls and creates no files or locks.
+
+The single cadence table is `CADENCES` in `status.py`, with schedule sources
+beside each row. Logging applies from 13 Nov 2026 UTC. Maximum gaps are two
+hours for disk sampling (guard every 30 minutes), inventory and crash collection
+(hourly collector), and janitor (hourly watcher); seven hours for health backup
+(every six), five hours for memory backup (every four), and 26 hours for the
+daily CVE sweep (09:00 Dubai / 05:00 UTC).
+The hourly collector's tooling, process-wait and clone-wedge probes also allow
+two hours. `memory.sample` runs every five minutes and allows 15 minutes;
+`cpu.sample` runs every minute and allows three minutes, from 15 Nov UTC;
+`disk.deep.end` completes the daily 03:30 Dubai pass and allows 26 hours.
+The memory, deep-pass and clone-wedge rows apply from 14 Nov UTC, when they
+first logged; the others apply from 13 Nov. Alerts and conditional detail
+events do not have independent cadence rows.
+
+`LATE` means the last line is older than the maximum gap. `SILENT` means that
+gap has elapsed and there is no matching line in the available 36-hour window.
+Before logging applies a row is `PENDING`; after that it gets one maximum gap
+of startup grace. A failed or skipped run still proves the job ran: `lastOk`
+reports the last line's boolean outcome (null if omitted), independently of
+cadence. Backups match `props.target` exactly (`health` or `memory`).
+An on-cadence `backup.failed_<stage>` line with `ok=false` and `skipped=0`
+sets `lastSeen` and `lastOk=false`; it is a failed run, not a skip. The separate
+daily `backup.failed_runs` counters count those same failed runs by target.
+
+Daily rollups add `jobs` and `missingJobs`, leaving all existing keys intact.
+The jobs view is frozen at the end of the requested UTC day and reads that day
+and its predecessor, capped to 36 hours. Each job has `lastSeen` (normalized
+UTC), `lastOk`, `lines` (matching lines in that window), `ageMin`, `gapMaxMin`,
+`since`, and `status`. `missingJobs` contains the `LATE` and `SILENT` job keys;
+backup keys are `backup.run:health` and `backup.run:memory`.
+
 The collector reads DiagnosticReports and a filtered `log show`, retaining a
 separate cursor per source so an unavailable source is retried. Its first run
 looks back one hour. Report cursors cover since their last successful read.
@@ -29,6 +70,15 @@ Boot observations include `observedAt` (Unix seconds) for the boot marker; dupli
 markers at the same instant count once. Other observations remain aggregated.
 It rolls up yesterday on the first hourly run after 00:05 UTC. It writes only
 its own state, day logs, rollups and probe samples, and never changes crash evidence.
+Before any job can create today's log, it checks today's and yesterday's files
+(from the logging start date). If either is absent it emits one `log.missing_day`
+error per UTC reporting day, with `ids.runId`, the missing dates in `props.source`
+and their count. This uses collector state to suppress repeats; status and rollup
+readers never append log lines. A failed append retains the missing dates for
+retry and advances the daily marker only after a successful append. `emit()`
+returns true on append and false on failure, while existing callers ignore it.
+A stopped collector is visible through status's
+missing-file report and silent jobs.
 
 Disk samples use `statvfs`, sizes of the known Robob/OpenCode/recall database
 and WAL files (metadata only), the guard's cached TMPDIR measurement, and an hourly cached directory inventory of worktrees, caches and backup repositories.
@@ -142,6 +192,50 @@ Partial inventories and older snapshots without that evidence remain unknown.
 An unknown directory baseline also makes the event incomplete.
 These events never alert or launch extra scans.
 
+## CPU samples
+
+`com.abdullah.mac-cpu` runs `cpu.py` every 60 seconds at normal priority,
+through `/bin/zsh` for launchd file access. One `/bin/ps` inventory reads PID,
+parent, cumulative CPU time, RSS, state, start time and elapsed time with a
+30-second timeout. It never invokes top or changes another process.
+
+`state/cpu.json` retains only PID, start time and cumulative CPU seconds, plus
+the Unix observation time, under its own nonblocking lock. CPU seconds
+and percentages compare successful inventories; 100% is one full core.
+New/reused PIDs and counter resets start at zero. Disappeared processes are
+dropped; their final CPU usage is unknown, so totals cover surviving processes.
+The first run, clock reset or gap over an hour establishes a baseline with
+null CPU totals and no top rows. Legacy monotonic timestamps establish one
+fresh baseline on upgrade. Monotonic time measures only each run's duration;
+Apple's Python 3.9 gives it a different epoch in each process, so it cannot
+measure intervals across minute invocations. Failed inventories emit a fixed `failure`
+code and `durationMs` without advancing state.
+
+`cpu.sample` includes `windowS`, `cpuS`, load averages, logical CPU count,
+total CPU percent, process count, runnable/uninterruptible counts, the top 15
+families (count, CPU, RSS MiB) and top 20 PIDs (parent, family, CPU seconds and
+percent, RSS MiB, elapsed time and optional script hint). Families use the
+innermost app bundle or executable basename; Python versions and mds variants
+are grouped. Only node/bun/python PIDs in that top 20 get a separate batched
+argv read with a five-second timeout and a start-time recheck. Hint failure
+sets `hintError` without losing numeric CPU evidence.
+
+Hints use the janitor's reviewed #45 `leftover_processes.redact` helper,
+loaded from the sibling source tree or the installed
+`~/.config/opencode/skills/dev-resource-janitor/scripts/` directory (including
+its `active_sessions.py` dependency). No janitor scan runs. Inline programs
+are omitted. Paths reduce to a basename, or the first directory after
+`ExternalSSD/` or `.local/share/` plus basename; intervening directories use
+`…`. Raw argv and paths never enter sampler state or logs. If the helper is
+missing, labels are omitted and the CPU measurements remain available.
+
+The logger bounds labels and lists and caps each encoded CPU line at 8192
+bytes, dropping lowest-ranked detail rows if necessary (`topOmitted` and
+`familiesOmitted`). At 1440 scheduled runs/day the maximum is 11.8 MB/day,
+so the minute cadence does not need a low-load fallback. The existing shared
+day-log cap and retention still apply. The installer copies the new helpers
+and plist; the evaluator must load `com.abdullah.mac-cpu` after review.
+
 ## Memory samples
 
 `com.abdullah.mac-memory` runs `memory.py` every 300 seconds independently of
@@ -150,7 +244,9 @@ swap MB, VM page counts and page size, raw pressure counter/level and free perce
 load averages,
 the top 15 footprints with compressed MB, watched daemons with elapsed time,
 process/parent-1 counts, and disk0's second iostat sample. MB/GB use powers of
-1024. `top` MEM already includes compressed pages. One full, memory-sorted top snapshot
+1024. `top` MEM already includes compressed pages. The single-snapshot CPU column
+is omitted because it reports zero without a preceding observation; use
+`cpu.sample` for CPU usage. One full, memory-sorted top snapshot
 supplies both the first15 holders and watched PIDs, including those below15.
 ps supplies exact command names/elapsed time and matches the snapshot by PID.
 At most512 watched PIDs are retained; excess

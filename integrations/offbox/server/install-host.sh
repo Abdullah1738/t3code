@@ -3,6 +3,7 @@
 #   bash install-host.sh            # packages, ZFS pool, state datasets, Incus, firewall, boatd service, timers
 #   bash install-host.sh image      # (re)build the offbox-base image from base-image.sh
 #   bash install-host.sh tmp-profile # only configure /tmp for future box starts; no service restarts
+#   bash install-host.sh update-policy # config and pending-restart writer only; no service restart
 # Everything that must outlive an OS reinstall is on the pool: boatd's state (dataset offbox/boatd at
 # /var/lib/boatd: database, run logs, hashed tokens) and Incus's own state (offbox/incus-var at /var/lib/incus:
 # its database of boxes, images, profiles). So this script handles both a fresh pool and one that already holds
@@ -70,13 +71,19 @@ image() {
 
 if [ "${1:-}" = image ]; then image; exit 0; fi
 
+if [ "${1:-}" = update-policy ]; then
+  bash "$HERE/home/install-update-policy.sh"
+  exit 0
+fi
+bash "$HERE/home/install-update-policy.sh"
+
 TS_IP=${OFFBOX_LISTEN_IP:-$(tailscale ip -4 2>/dev/null | head -1 || true)}
 [ -n "$TS_IP" ] || { echo "tailscale is not up; run: tailscale up --auth-key ... --hostname offbox-server" >&2; exit 1; }
 
 # ---- packages
 apt-get update -qq
 apt-get -y -qq full-upgrade
-apt-get install -y -qq zfsutils-linux nftables sqlite3 jq rsync curl gnupg unattended-upgrades \
+apt-get install -y -qq zfsutils-linux nftables sqlite3 jq rsync curl gnupg unattended-upgrades needrestart \
   linux-tools-common smartmontools >/dev/null
 # Incus itself is installed further down, after its state directory is on the pool.
 

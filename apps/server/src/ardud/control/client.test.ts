@@ -782,3 +782,34 @@ describe("ControlClient", () => {
     expect(seen).toEqual([undefined, "6"]);
   });
 });
+
+describe("cross-thread user messages", () => {
+  it("passes the since window and opaque cursor through the client", async () => {
+    const seen: string[] = [];
+    const url = await listen((request, response) => {
+      seen.push(request.url!);
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({ ok: true, total: 1, messages: [], nextCursor: null }));
+    });
+    const client = new ControlClient({ url, token: "test" });
+    expect(
+      await client.listUserMessages({ since: 0, cursor: "cursor/+?=&%", limit: 1000 }),
+    ).toEqual({
+      ok: true,
+      total: 1,
+      messages: [],
+      nextCursor: null,
+    });
+    await client.listUserMessages({ since: "2026-11-15T04:00:00+04:00" });
+    const first = new URL(seen[0]!, url);
+    expect(first.pathname).toBe("/api/ardud/control/messages");
+    expect(Object.fromEntries(first.searchParams)).toEqual({
+      since: "0",
+      cursor: "cursor/+?=&%",
+      limit: "1000",
+    });
+    expect(Object.fromEntries(new URL(seen[1]!, url).searchParams)).toEqual({
+      since: "2026-11-15T04:00:00+04:00",
+    });
+  });
+});

@@ -86,6 +86,23 @@ def snapshot(providers, logs, previous, now):
         state = c.get('testStatus')
         state = state if state in ('active', 'expired', 'error', 'disabled', 'limited', 'rate_limited', 'locked', 'unknown') else 'unknown'
         emit('poller', 'account.health', ok=True, ids={'account': c['id']}, props=dict(enabled=c.get('isActive') is True, state=state, locked=any(locked(v, now) for k, v in c.items() if k.startswith('modelLock_')), limited=locked(c.get('rateLimitedUntil'), now), reloginNeeded=bool(c.get('reauthRequiredAt'))))
+        for key, value in c.items():
+            if not (key.startswith('modelLock_') or key == 'rateLimitedUntil') or not locked(value, now):
+                continue
+            # Only canonical ISO deadlines leave this endpoint; never carry a raw value.
+            try:
+                if isinstance(value, bool):
+                    continue
+                deadline = dt.datetime.fromtimestamp(value / 1000, dt.timezone.utc) if isinstance(value, (int, float)) else dt.datetime.fromisoformat(value.replace('Z', '+00:00'))
+                until = deadline.astimezone(dt.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+            except (ValueError, TypeError, AttributeError, OverflowError, OSError):
+                continue
+            account_wide = key in ('modelLock___all', 'rateLimitedUntil')
+            model = 'account-wide' if account_wide else key[len('modelLock_'):]
+            metadata = c.get('modelLockCause_' + key[len('modelLock_'):], {}) if key.startswith('modelLock_') else {}
+            cause = metadata.get('cause') if isinstance(metadata, dict) and metadata.get('until') == value else None
+            cause = cause if cause in ('quota', 'rate_limit', 'overloaded', 'auth', 'monthly_usage', 'other') else 'other'
+            emit('poller', 'account.locked', ok=True, ids={'account': c['id']}, props=dict(provider=c.get('provider', 'unknown'), model=model, scope='account' if account_wide else 'model', cause=cause, until=until))
     current = Counter()
     counts = Counter()
     unresolved = 0

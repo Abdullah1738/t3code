@@ -51,6 +51,7 @@ function setup(slug: "owner" | "moni" = "owner") {
     sendText: async () => ({ handle: "sent-fixture" }), sendApp: async () => ({ handle: "app-fixture" }),
     upload: async () => "https://cdn.example/file", getMessage: async () => undefined,
     react: async () => {}, typing: async () => {}, read: async () => {}, requestLocation: async () => {},
+    setOptOut: async () => {},
     location: async () => undefined, download: async () => ({ data: new Uint8Array(), name: "file", mimeType: "text/plain" }),
   };
   const access = { people: [{ name: "Moni", role: "admin" as const, addresses: [moni] }], groups: [] };

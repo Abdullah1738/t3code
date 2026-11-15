@@ -34,15 +34,13 @@ PATH_BLOCK = r'''if [ -f "$HOME"/@ROOT@/package.json ]; then
   __offbox_repo_root=$(builtin cd -- "$HOME"/@ROOT@ && pwd -P)
   __offbox_repo_bins=
   __offbox_repo_path() {
-    local dir=$(pwd -P) bins= rest= entry tail=$PATH sep=
+    local dir=$(pwd -P) bins= rest= entry tail=$PATH sep= prefix= node_commands_seen=
     while :; do
       entry=${tail%%:*}
-      if [ -z "${__offbox_toolchain_bin:-}" ] || [ "$entry" != "$__offbox_toolchain_bin" ]; then
-        case ":$__offbox_repo_bins" in
-          *":$entry:"*) ;;
-          *) rest="$rest$sep$entry"; sep=: ;;
-        esac
-      fi
+      case ":$__offbox_repo_bins" in
+        *":$entry:"*) ;;
+        *) rest="$rest$sep$entry"; sep=: ;;
+      esac
       [[ $tail == *:* ]] || break
       tail=${tail#*:}
     done
@@ -55,7 +53,31 @@ PATH_BLOCK = r'''if [ -f "$HOME"/@ROOT@/package.json ]; then
         done ;;
     esac
     __offbox_repo_bins=$bins
-    export PATH="${__offbox_toolchain_bin:+$__offbox_toolchain_bin:}$bins$rest"
+    # Preserve the activated leading command directory, never move it back
+    # ahead of a caller's PATH override (including in BASH_ENV child shells).
+    tail=$rest
+    while [ -n "$tail" ]; do
+      entry=${tail%%:*}
+      if [ -n "${__offbox_toolchain_bin:-}" ] && [ "$entry" = "$__offbox_toolchain_bin" ]; then
+        prefix="$prefix$entry"
+        if [[ $tail == *:* ]]; then prefix="$prefix:"; tail=${tail#*:}; else tail=; break; fi
+      elif { [ -n "${__offbox_node_commands:-}" ] && [ "$entry" = "$__offbox_node_commands" ]; } ||
+           { [ -n "${__offbox_node_commands:-}" ] && [ -z "$node_commands_seen" ] &&
+             [ -n "${NVM_BIN:-}" ] && [ "$entry" = "$NVM_BIN" ]; }; then
+        # nvm may prepend a real bin when switching from system Node. That
+        # explicit selection keeps its position, just like a caller PATH edit.
+        prefix="$prefix$entry"
+        if [[ $tail == *:* ]]; then prefix="$prefix:"; tail=${tail#*:}; else tail=; fi
+        [ "$entry" != "${__offbox_node_commands:-}" ] || node_commands_seen=1
+      else
+        break
+      fi
+    done
+    if [ -n "$prefix" ] && [[ $prefix != *: ]] && [ -n "$bins" ]; then
+      export PATH="$prefix:${bins%:}"
+    else
+      export PATH="$prefix$bins$tail"
+    fi
     hash -r 2>/dev/null || :
     set +h
   }

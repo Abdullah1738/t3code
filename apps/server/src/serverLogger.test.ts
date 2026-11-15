@@ -483,8 +483,10 @@ it.effect(
           const error = Cause.squash(result.cause);
           assert.instanceOf(error, KanbanError);
           assert.strictEqual((error as KanbanError).saved, false);
-          assert.include(String(error), "Board busy: not written (held 2m0s by");
-          assert.include(String(error), "Safe to retry once.");
+          assert.strictEqual(
+            (error as KanbanError).detail,
+            "Board busy: not written (waited 120s behind 0; most time: KanbanBoardLocks.run 120s). Safe to retry once.",
+          );
         }
         yield* Fiber.interrupt(holder);
         assert.deepStrictEqual(yield* locks.holders, []);
