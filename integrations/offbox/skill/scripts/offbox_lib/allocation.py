@@ -57,11 +57,11 @@ def queue():
     if _QUEUE.get() is not None:
         yield _QUEUE.get()
         return
-    wait = pool.wait_seconds()
+    wait = float("inf") if pool.home.unlimited_queue() else pool.wait_seconds()
     left = outage.allocation_left()
-    if left is not None:
+    if left is not None and not pool.home.unlimited_queue():
         wait = min(wait, left)
-    state = {'end': pool.time.monotonic() + wait, 'wait': wait, 'said': False}
+    state = {'end': pool.time.monotonic() + wait, 'wait': wait, 'started': pool.time.monotonic(), 'said': False}
     token = _QUEUE.set(state)
     try:
         yield state

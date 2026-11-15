@@ -597,6 +597,9 @@ def status(me: dict) -> None:
             print(f"  {b['id']:<12} {b.get('state'):<9} {b.get('type'):<8} {(b.get('name') or '')[:60]}{held}")
     except OffboxError as e:
         print(f"boxes: boat API unreachable ({e})")
+    for row in con.execute("SELECT r.* FROM runs r JOIN kv k ON k.k='failover_queue:' || r.run_id "
+                           "WHERE r.status='starting' AND r.box_id IS NULL AND r.process_id IS NULL"):
+        print(_not_started(row))
     print(f"you: {me['owner']} repo {me['repo_root']}")
 
 
@@ -1370,9 +1373,19 @@ def _wait_timeout(r) -> OffboxError:
                        f"Wait again: offbox wait {r['run_id']}", code=EXIT_WAIT_TIMEOUT)
 
 
+def _failover_queued(r):
+    from . import common
+    if common.backend() != 'boat' or r['status'] != 'starting' or r['box_id'] or r['process_id']:
+        return False
+    with contextlib.closing(db()) as con:
+        return con.execute('SELECT 1 FROM kv WHERE k=?', ('failover_queue:' + r['run_id'],)).fetchone() is not None
+
+
 def _not_started(r) -> str:
     if r['mode'] == 'local':
         return f"{r['run_id']} runs on this Mac (local fallback), not on a box"
+    if _failover_queued(r):
+        return f"{r['run_id']} queued on Boat, waiting for a box or home"
     if not r['box_id']:
         return f"{r['run_id']} has no box yet (queued for a pool box)"
     return f"{r['run_id']} has {r['box_id']} but its command hasn't started yet"

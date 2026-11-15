@@ -1545,6 +1545,7 @@ class Runner:
     def __init__(self, a, me: dict):
         self.a, self.me = a, me
         self.run_id = home.take_invocation_run() or new_id("run")
+        home.flush_routing(self.run_id)
         self.root = Path(me["repo_root"])
         recorded_cwd = None
         if os.environ.get(BACKGROUND_RUN_ENV):
@@ -1643,7 +1644,8 @@ class Runner:
         existing = con.execute('SELECT client_pid,mode FROM runs WHERE run_id=?', (self.run_id,)).fetchone()
         if existing:
             con.close()
-            if not a.bg or existing['mode'] != 'bg' or existing['client_pid'] != os.getpid():
+            if existing['client_pid'] != os.getpid() or not (
+                    (a.bg and existing['mode'] == 'bg') or os.environ.get(home.RETURNED_HOME_ENV)):
                 raise OffboxError(f'{self.run_id}: queued run belongs to another client', code=EXIT_LOCAL)
             self.registered = True
             return
@@ -1661,6 +1663,8 @@ class Runner:
                              cmd_text[:4000], "bg" if a.bg else "fg", now(), str(self.log_path),
                              json.dumps(a.pull or []), self.rel, str(self.cwd), os.getpid(), len(steps)))
                 con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'start_claim:{self.run_id}', '1'))
+                if home.failed_over():
+                    con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'failover_queue:{self.run_id}', '1'))
         try:
             db_retry(register)
             self.registered = True
@@ -3125,29 +3129,39 @@ def background_client(a, me: dict, ready=None, accept=None, signal_mask=None, so
                 signal.signal(s, handler)
 
 
-def forward_background(env: dict) -> None:
+def forward_background(env: dict, *, backend="boat") -> None:
     if _background_context is None:
         raise OffboxError('background failover has no queued run context', code=EXIT_LOCAL)
     # Reuse the stdin protocol on failover too: an exec of the original argv would expose --env values.
-    common.select_backend('boat')
+    common.select_backend(backend)
     os.environ.clear()
     os.environ.update(env)
     raise SystemExit(_background(*_background_context))
 
 
-def retry_background(error) -> None:
-    rid = os.environ.get(BACKGROUND_RUN_ENV)
+def retry_background(error, *, run_id=None) -> None:
+    rid = os.environ.get(BACKGROUND_RUN_ENV) or run_id
     if rid and not error.started:
+        returned = bool(run_id and os.environ.get(home.RETURNED_HOME_ENV))
         con = db()
         try:
             with write(con):
+                row = con.execute('SELECT * FROM runs WHERE run_id=?', (rid,)).fetchone()
                 fenced = con.execute("SELECT 1 FROM kv WHERE k=? AND v='fenced'", ('lost_confirmed:' + rid,)).fetchone()
+                if not row or row['process_id'] or (row['status'] != 'starting' and not (
+                        returned and fenced and row['status'] == 'lost' and row['exit_code'] is None)):
+                    return
+                if returned and row['mode'] == 'fg' and row['client_pid'] != os.getpid():
+                    return
                 if fenced:
                     # Keep the old fence forever: a late delivery must still lose its original claim.
                     con.execute('UPDATE kv SET v=? WHERE k=?', (new_id('claim'), 'start_claim:' + rid))
                     con.execute('DELETE FROM kv WHERE k=?', ('lost_confirmed:' + rid,))
-                con.execute("UPDATE runs SET box_id=NULL, error=?, end_at=NULL WHERE run_id=? "
-                            "AND status='starting' AND process_id IS NULL", (str(error)[:500], rid))
+                con.execute("UPDATE runs SET status='starting', box_id=NULL, error=?, end_at=NULL, "
+                            "logged_end_at=CASE WHEN ? THEN NULL ELSE logged_end_at END WHERE run_id=?",
+                            (str(error)[:500], returned, rid))
+            if returned:
+                save_run_state(rid, status='starting', box_id=None, process_id=None, exit_code=None, end_at=None)
         finally:
             con.close()
 
@@ -3283,7 +3297,8 @@ def _run_remote(a, rn) -> int:
                     rn.source_gone(e)
                 elif e.code == EXIT_LOCAL:
                     finish(rn.run_id, EXIT_LOCAL, "local_error")
-                elif not os.environ.get(BACKGROUND_RUN_ENV):
+                elif not os.environ.get(BACKGROUND_RUN_ENV) and not (
+                        os.environ.get(home.RETURNED_HOME_ENV) and home.unreachable(e)):
                     finish(rn.run_id, None, "busy" if e.code == EXIT_BUSY else "infra")
             if not isinstance(e, common.SourceGone):
                 rn.record(error=str(e)[:500])

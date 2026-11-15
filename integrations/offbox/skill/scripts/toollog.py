@@ -18,17 +18,19 @@ CAP_BYTES = 50 * 1024 * 1024
 NUMBERS = set("bytes files skipped exitCode waitMs queueMs runMs position ttlSeconds reasonLength busy idle stopped count flagsCount envCount pullCount includeCount stepCount attempt pid timeoutSeconds commandLength cmd_bytes step_count".split())
 NUMBERS.update("ms slow_ms last_good_boatd_uptime_s snapshot_age_s boatd_uptime_s uptime_s slow slow_max_s slow_total_s starting starting_max_s down".split())
 NUMBERS.update({'command_exit_code', 'wrapper_exit_code', 'disk_attempt', 'client_started_at', 'disk_probe_module_mtime'})
+NUMBERS.add("waited_s")
 NUMBERS.update({'leftoverKilled', 'boxRc', 'incusRc', 'cgroupProcessCount'})
 NUMBERS.update(f'{fs}_{field}' for fs in ('tmp', 'var_tmp', 'home', 'workspace')
                for field in ('free_bytes', 'size_bytes'))
 BOOLEANS = {"peer_online"} | set("queued killed fresh bg noSync git noFallback noRetry remote failed stale timeoutHit fallback dryRun baseGiven templateGiven sizeGiven".split())
+BOOLEANS.add("ok")
 BOOLEANS.update({'retry', 'rcFilePresent', 'superseded'})
 ENUMS = {
     "jdk_phase": {"check", "install", "result"},
     "jdk_result": {"pending", "present", "installed", "compiler-missing", "apt-failed"},
     "jdk_trigger": {"command", "repo-marker", "harness"},
     "class": {"good", "hard", "slow", "starting"},
-    "outcome": {"good", "bad", "indeterminate", "slow", "starting", "ready", "failover"},
+    "outcome": {"boat_box", "good", "bad", "indeterminate", "slow", "starting", "ready", "failover"},
     "peer_path": {"direct", "relay", "unknown"},
     "refresh_stage": {"idle", "zpool", "incus", "mullvad", "sqlite"},
     "checkpoint": {"probe", "person", "post", "auto-stop", "request", "box-read"},
@@ -74,10 +76,12 @@ def _ids(values):
             and not re.search(r"\d{13,}", v)}
 
 
-def _props(values):
+def _props(values, *, name=None):
     out = {}
     for k, v in (values or {}).items():
-        if k in {'leftoverKilled', 'boxRc', 'cgroupProcessCount'} and v is None:
+        if k == "reason" and name == "backend.failback" and isinstance(v, str):
+            out[k] = v[:200]
+        elif k in {'leftoverKilled', 'boxRc', 'cgroupProcessCount'} and v is None:
             out[k] = None
         elif k == 'stderrTail' and isinstance(v, str):
             # Only Incus' fixed transport diagnostics belong here, never arbitrary command output.
@@ -141,7 +145,7 @@ def emit(component, name, *, kind="event", duration_ms=None, ok=None, ids=None, 
             line["ok"] = ok
         if clean := _ids(ids):
             line["ids"] = clean
-        if clean := _props(props):
+        if clean := _props(props, name=name):
             line["props"] = clean
         if _atom(tag):
             # Messages are stable labels, never str(exception), stderr, or API response text.

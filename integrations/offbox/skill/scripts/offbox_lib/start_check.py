@@ -134,7 +134,10 @@ def settle(con, row, result: Result, reason: str, *, until: float | None = None,
                                  (('done' if code == 0 else 'failed'), None))
             elif result.verdict == 'fenced':
                 from .runs import BACKGROUND_RUN_ENV
-                pending = row['mode'] == 'bg' and os.environ.get(BACKGROUND_RUN_ENV) == rid
+                from . import home
+                pending = (row['mode'] == 'bg' and os.environ.get(BACKGROUND_RUN_ENV) == rid) or (
+                    row['mode'] == 'fg' and os.environ.get(home.RETURNED_HOME_ENV)
+                    and home.PRE_START.get() == rid and row['client_pid'] == os.getpid())
                 status, error = ('starting' if pending else 'lost'), f'{reason}; never started, nothing ran'
                 con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'lost_confirmed:{rid}', 'fenced'))
             else:
