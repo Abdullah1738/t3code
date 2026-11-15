@@ -173,6 +173,7 @@ try {
       // The rules themselves come exclusively from the worktree snapshot.
       const lint = loaded.config.lint;
       if (lint?.jsPlugins) {
+        const requireWorktree = createRequire(path.join(root, "package.json"));
         const plugins = [];
         for (const plugin of lint.jsPlugins) {
           if (typeof plugin !== "string") refuse("unsupported JS plugin config");
@@ -181,7 +182,7 @@ try {
             const original = file.startsWith(`${snapshot.directory}${path.sep}`)
               ? path.join(root, path.relative(snapshot.directory, file))
               : file;
-            plugins.push(await snapshot.stage(original));
+            plugins.push(await snapshot.stage(requireWorktree.resolve(original)));
           } else plugins.push(plugin);
         }
         lint.jsPlugins = plugins;

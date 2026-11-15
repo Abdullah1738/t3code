@@ -1104,3 +1104,76 @@ for (const form of ["relative", "absolute", "import.meta.url"]) {
     assert.equal(fs.existsSync(path.join(f.wt, "node_modules")), false);
   });
 }
+
+const localPluginEntries = [
+  { name: "explicit JavaScript file", entry: "index.js", specifier: "index.js" },
+  { name: "extensionless JavaScript file", entry: "index.js", specifier: "index" },
+  { name: "directory index", entry: "index.js", specifier: "" },
+  { name: "directory index with slash", entry: "index.js", specifier: "/" },
+  {
+    name: "directory package main",
+    entry: "dist/entry.js",
+    main: "./dist/entry.js",
+    specifier: "",
+  },
+  {
+    name: "directory extensionless package main",
+    entry: "dist/entry.js",
+    main: "./dist/entry",
+    specifier: "",
+  },
+];
+for (const entry of localPluginEntries) {
+  for (const form of ["relative", "absolute", "import.meta.url"]) {
+    test(`native entry resolution: ${entry.name}, ${form}`, nativeConfigTest, (t) => {
+      const f = fixture(t, process.env.VP_TEST_NODE_MODULES);
+      for (const base of [f.main, f.wt]) {
+        const plugin = path.join(base, "oxlint-local");
+        fs.mkdirSync(path.dirname(path.join(plugin, entry.entry)), { recursive: true });
+        fs.writeFileSync(
+          path.join(plugin, "package.json"),
+          JSON.stringify({ type: "module", ...(entry.main ? { main: entry.main } : {}) }),
+        );
+        fs.writeFileSync(
+          path.join(plugin, entry.entry),
+          'export default {meta:{name:"entry"},rules:{check:{create(context){return {DebuggerStatement(node){context.report({node,message:"ENTRY RULE EXECUTED"});}};}}}};',
+        );
+        const relative = `./oxlint-local${entry.specifier && entry.specifier !== "/" ? "/" : ""}${entry.specifier}`;
+        const specifier =
+          form === "import.meta.url"
+            ? `new URL(${JSON.stringify(relative)}, import.meta.url).pathname`
+            : JSON.stringify(form === "relative" ? relative : path.resolve(base, relative));
+        fs.writeFileSync(
+          path.join(base, "vite.config.ts"),
+          `export default {fmt:{},lint:{jsPlugins:[${specifier}],rules:{"entry/check":"error"}}};`,
+        );
+        fs.writeFileSync(path.join(base, "sample.ts"), "debugger;\n");
+      }
+      const native = f.native(["lint", "sample.ts"]);
+      assert.equal(native.status, 1, native.stdout + native.stderr);
+      assert.match(native.stdout + native.stderr, /ENTRY RULE EXECUTED/);
+      const routed = f.run(["lint", "sample.ts"]);
+      assert.equal(routed.status, native.status, routed.stdout + routed.stderr);
+      assert.match(routed.stdout + routed.stderr, /ENTRY RULE EXECUTED/);
+      assert.equal(fs.existsSync(path.join(f.wt, "node_modules")), false);
+    });
+  }
+}
+
+for (const state of ["missing path", "empty directory", "missing package main"]) {
+  test(`unresolved local plugin entry refuses: ${state}`, (t) => {
+    const f = fixture(t);
+    const plugin = path.join(f.wt, "oxlint-local");
+    if (state !== "missing path") fs.mkdirSync(plugin);
+    if (state === "missing package main")
+      fs.writeFileSync(path.join(plugin, "package.json"), '{"main":"./missing.js"}');
+    writeConfig(f.wt, { fmt: {}, lint: { jsPlugins: ["./oxlint-local"] } });
+    for (const command of ["fmt", "lint"]) {
+      const result = f.run([command, "sample.ts"]);
+      assert.equal(result.status, 127, result.stdout + result.stderr);
+      assert.match(result.stderr, /Cannot find module/);
+      assert.match(result.stderr, new RegExp(`offbox run -- vp ${command}`));
+      assert.equal(result.stdout, "");
+    }
+  });
+}
