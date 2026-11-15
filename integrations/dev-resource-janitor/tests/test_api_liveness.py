@@ -102,7 +102,7 @@ class LivenessTests(JanitorTestCase):
                 patch.object(janitor, 'LOG_DIR', tmp), patch.object(janitor, 'audit') as audit:
             self.assertEqual(janitor.process_cursor(), 0)
             report = dict(ts=1, liveness_unavailable=None, processes=dict(next_cursor={"priority": 0, "pid": 30}, checked=1,
-                          skipped=2, budget_skipped=2, candidates=[], problems=[]))
+                          skipped=2, budget_skipped=2, candidates=[], problems=[], owner_calls={}))
             janitor.record_report(report)
             self.assertEqual(janitor.process_cursor(), {"priority": 0, "pid": 30})
             self.assertEqual(audit.call_args.args[0]['processes']['checked'], 1)
