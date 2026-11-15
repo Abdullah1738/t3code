@@ -10,6 +10,7 @@ import { timedScan } from '../lib/logging.mjs';
 import { act, recoveryScan, scan } from '../cli.mjs';
 import { restartScan } from '../lib/restartwatch.mjs';
 import { fixture } from '../../router-logging/test/support.mjs';
+import { assertScanProps } from './scan-props.mjs';
 
 const NOW = Date.parse('2026-11-15T10:00:00Z');
 const invalid = [
@@ -104,7 +105,7 @@ test('a not-ready export reopened mid-scan tags both lanes and leaves recovery p
   for (const lane of ['stream', 'restart']) {
     const row = rows().find(row => row.name === `${lane}.scan`);
     assert.equal(row.error.tag, 'REPLICA_NOT_READY');
-    assert.deepEqual(row.props, {replicaGeneration:42,replicaAgeMs:1_000,deferredThreads:0,maxThreadAheadMs:'unknown',phase:'openDb'});
+    assertScanProps(row.props, {replicaGeneration:42,replicaAgeMs:1_000,deferredThreads:0,maxThreadAheadMs:'unknown',phase:'openDb'});
   }
   assert.deepEqual(state, before);
 });
@@ -154,7 +155,7 @@ for (const [lane, stage] of [['stream','gather'], ['stream','act'], ['restart','
     const row = rows().filter(row => row.name === `${lane}.scan`).at(-1);
     assert.equal(row.ok, true);
     assert.equal(row.error, undefined);
-    assert.deepEqual(row.props, {deferredThreads:1,maxThreadAheadMs:ahead});
+    assertScanProps(row.props, {deferredThreads:1,maxThreadAheadMs:ahead});
     const deferral = rows().filter(row => row.name === 'thread.deferred').at(-1);
     assert.deepEqual(deferral.error, {tag:'REPLICA_BEHIND_THREAD',message:'thread is newer than Robob replica; recovery deferred'});
     assert.deepEqual(deferral.props, {replicaGeneration:42,replicaAgeMs:1_000,threadAheadMs:ahead});
@@ -170,7 +171,7 @@ for (const [lane, stage] of [['stream','gather'], ['stream','act'], ['restart','
   assert.deepEqual(sent, ['healthy','t']);
   assert.equal(state.handled[id].done, true);
   assert.equal(notifications.length, 1);
-  assert.deepEqual(rows().filter(row => row.name === `${lane}.scan`).at(-1).props,
+  assertScanProps(rows().filter(row => row.name === `${lane}.scan`).at(-1).props,
     {deferredThreads:0,maxThreadAheadMs:'unknown'});
 });
 

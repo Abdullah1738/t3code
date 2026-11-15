@@ -240,10 +240,10 @@ export async function recoveryScan({ opts, state, now }, io = realIo) {
   let db;
   // Discovery rows are historical candidates. Each independent batch gets a
   // new snapshot; a thread's gather + act still share one guarded snapshot.
-  const refreshDb = () => {
+  const refreshDb = (batchIo = io) => {
     db?.close();
     db = undefined;
-    db = io.openDb(io.PATHS.db);
+    db = batchIo.openDb(batchIo.PATHS.db);
     return db;
   };
   try {
