@@ -2072,9 +2072,12 @@ import path from 'node:path';
                             ('let root = mkdtempSync(tmpdir()); const child = join(root, "nested");', 'child')):
             self.write('temp.test.ts', imports + setup + f'new Database(join({name}, ".robob/userdata/statev2.sqlite"));')
             with self.subTest(setup=setup):
-                self.assertIsNone(self.classify('node --test temp.test.ts'))
+                self.assertEqual(self.classify('node --test temp.test.ts'), SCRIPT)
         self.write('temp.test.ts', imports + 'const fixture = {root: mkdtempSync(tmpdir())};\n' +
                    'readFileSync(`${fixture.root}/.robob/userdata/statev2.sqlite`);')
+        self.assertEqual(self.classify('bun test temp.test.ts'), SCRIPT)
+        self.write('temp.test.ts', imports + 'const root = mkdtempSync(tmpdir()); const child = join(root, "nested");' +
+                   'readFileSync(`${child}/.robob/userdata/statev2.sqlite`);')
         self.assertIsNone(self.classify('bun test temp.test.ts'))
 
     def test_js_temp_database_fixture_near_misses(self):
@@ -2114,17 +2117,17 @@ import { join, resolve } from 'node:path';
                 with self.subTest(source=source, command=command):
                     self.assertEqual(self.classify(command), SCRIPT)
 
-    def js_mutation_cases(self, cases):
+    def js_mutation_cases(self, cases, suffixes=('mjs', 'ts')):
         imports = '''import {mkdtempSync, readFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 '''
         for label, source in cases:
-            for suffix in ('mjs', 'ts'):
+            for suffix in suffixes:
                 target = 'mutation.test.' + suffix
                 self.write(target, imports + source)
                 for command in ('node --test ' + target, 'bun test ' + target,
-                                "offbox run -- 'bun test " + target + "'"):
+                                'offbox run -- bun test ' + target, "offbox run -- 'bun test " + target + "'"):
                     with self.subTest(case=label, command=command):
                         self.assertEqual(self.classify(command), SCRIPT)
                         self.adapters(command, SCRIPT)
@@ -2234,6 +2237,106 @@ import {join} from 'node:path';
             ('control regex', scalar, 'if (ready) /root = live/.test(value); root = homeRoot;', read),
             ('block regex', receiver, '{} /value/.test(value); Object.assign(fixture, {root: homeRoot});',
              read.replace('root,', 'fixture.root,'))))
+
+    def test_js_temp_database_const_binding_spans(self):
+        imports = ("import {mkdtempSync} from 'node:fs'; import {tmpdir} from 'node:os'; "
+                   "import {join} from 'node:path'; ")
+        fixture = "const root = mkdtempSync(tmpdir()); join(root, 'state.sqlite');"
+        self.write('sibling.test.ts', imports + f'test("a", () => {{{fixture}}}); test("b", () => {{{fixture}}});')
+        for command in ('node --test sibling.test.ts', 'bun test sibling.test.ts',
+                        'offbox run -- bun test sibling.test.ts', "offbox run -- 'bun test sibling.test.ts'"):
+            with self.subTest(command=command):
+                self.assertIsNone(self.classify(command))
+                self.adapters(command)
+        setup = "const root = mkdtempSync(tmpdir()); const homeRoot = ['', 'Users', 'ardud'].join('/'); "
+        read = "readFileSync(join(root, '.robob/userdata/statev2.sqlite'));"
+        bindings = (
+            'let root = homeRoot;', 'const root = homeRoot;', 'var root = homeRoot;',
+            'function root() {}', 'function * root() {}', 'class root {}',
+            'const {root} = value;', 'const {path: root} = value;', 'let [root] = value;',
+            'try {} catch (root) {}', 'const fn = (root) => root;', 'const fn = root => root;',
+            'function fn(root) {}', 'function fn<T>(root: string) {}',
+            'const fn = ({root}) => root;', 'const fn = ([root]) => root;',
+            'const fn = (root: string): string => root;',
+            'import {root} from "fixture";', 'import root from "fixture";',
+        )
+        self.js_mutation_cases((binding, setup + read + '{' + binding + '}') for binding in bindings)
+        self.js_mutation_cases((label, setup + body) for label, body in (
+            ('inner read', '{ let root = homeRoot; ' + read + '}'),
+            ('arrow read', 'const fn = (root) => {' + read + '}; fn(homeRoot);'),
+            ('catch read', 'try {throw homeRoot;} catch (root) {' + read + '}'),
+        ))
+
+    def test_js_temp_database_method_parameter_bindings(self):
+        setup = "const root = mkdtempSync(tmpdir()); const homeRoot = ['', 'Users', 'ardud'].join('/'); "
+        read = "readFileSync(join(root, '.robob/userdata/statev2.sqlite'));"
+        methods = ('with', 'if', 'while', 'for', 'switch', 'read', "'read'", '"read"',
+                   '[methodName]', '1', 'async read', '*read', 'set path', 'static read')
+        self.js_mutation_cases((container + ' ' + method, setup + (
+            'const reader = {' + method + '(root) {' + read + '}};' if container == 'object' else
+            'class Reader {' + method + '(root) {' + read + '}}'))
+            for container in ('object', 'class') for method in methods
+            if not (container == 'object' and method == 'static read'))
+
+    def test_js_temp_database_typed_return_parameter_bindings(self):
+        setup = "const root = mkdtempSync(tmpdir()); const homeRoot = ['', 'Users', 'ardud'].join('/'); "
+        read = "readFileSync(join(root, '.robob/userdata/statev2.sqlite'));"
+        types = ('Buffer', "ReadResult['bytes']", 'ReadResult[keyof ReadResult]',
+                 "Array<ReadResult['bytes']>", "ReadResult['bytes'][]", 'readonly Buffer[]',
+                 "'ok' | undefined", "Buffer & {tag: 'bytes'}", '{bytes: Buffer}',
+                 '() => Buffer', '[Buffer, number]', 'T extends string ? Buffer : never',
+                 'root is string')
+        self.js_mutation_cases(((header + ' ' + annotation, setup + source)
+            for annotation in types for header, source in (
+                ('class', 'class Reader { read<T>(root: string): ' + annotation + ' {' + read + '}}'),
+                ('object', 'const reader = { read(root: string): ' + annotation + ' {' + read + '}};'),
+                ('function', 'function read<T>(root: string): ' + annotation + ' {' + read + '}'),
+                ('arrow', 'const read = (root: string): ' + annotation + ' => {' + read + '};'),
+            )), suffixes=('ts',))
+
+    def test_js_temp_database_optional_member_divisions(self):
+        read = "readFileSync(join(root, '.robob/userdata/statev2.sqlite'));"
+        home = "const homeRoot = ['', 'Users', 'ardud'].join('/'); "
+        self.js_mutation_cases((keyword + ' ' + member + ' ' + declaration,
+            declaration + ' root = mkdtempSync(tmpdir()); ' + home +
+            f'const metrics = {{{keyword}: 1}}; let fraction = {member} / 2; ' +
+            ('root = homeRoot; ' + read if declaration == 'let' else '{ let root = homeRoot; ' + read + '}') +
+            f'fraction = {member} / 2;')
+            for keyword in ('return', 'throw', 'case', 'typeof', 'void', 'delete', 'in', 'instanceof', 'of', 'await', 'yield')
+            for member in (f'metrics?.{keyword}', f'metrics?. /* comment */ {keyword}', f'metrics.{keyword}')
+            for declaration in ('let', 'const'))
+
+    def test_js_temp_database_nested_template_fallback(self):
+        home = "const homeRoot = ['', 'Users', 'ardud'].join('/'); "
+        read = "readFileSync(join(root, '.robob/userdata/statev2.sqlite'));"
+        expressions = ('({ok: true}, root = homeRoot)',
+                       '(() => { const value = {}; root = homeRoot; return 1; })()',
+                       '(() => { const root = homeRoot; return root; })()',
+                       "('}', root = homeRoot)",
+                       '(root = homeRoot)', 'root++',
+                       '(function () { const root = homeRoot; return root; })()',
+                       '({value: `nested`}, root = homeRoot)',
+                       '({value: {nested: true}}, root = homeRoot)')
+        self.js_mutation_cases((expression + ' ' + declaration,
+            declaration + ' root = mkdtempSync(tmpdir()); ' + home + '`${' + expression + '}`; ' + read)
+            for expression in expressions for declaration in ('let', 'const'))
+        self.js_mutation_cases((label, 'const root = mkdtempSync(tmpdir()); ' + template + read)
+            for label, template in (
+                ('unclosed nested template', 'const id = `${encodeURIComponent(`nested`)}; '),
+                ('unbalanced interpolation', 'const id = `${encodeURIComponent(`nested`)`; '),
+                ('nested DB name', 'const id = `${encodeURIComponent(`state.sqlite`)}`; '),
+                ('ambiguous interpolation slash', 'const id = `${value / 2}`; '),
+            ))
+        imports = ("import {mkdtempSync} from 'node:fs'; import {tmpdir} from 'node:os'; "
+                   "import {join} from 'node:path'; ")
+        self.write('unrelated.test.ts', imports + 'const dir = mkdtempSync(tmpdir()); ' +
+                   'const db = join(dir, "opencode.db"); ' +
+                   'const id = `message:provider:opencode:native-item:${encodeURIComponent(`msg_${kind}:text:0`)}`;')
+        for command in ('node --test unrelated.test.ts', 'bun test unrelated.test.ts',
+                        'offbox run -- bun test unrelated.test.ts', "offbox run -- 'bun test unrelated.test.ts'"):
+            with self.subTest(command=command):
+                self.assertIsNone(self.classify(command))
+                self.adapters(command)
 
     def test_js_temp_database_parameter_bindings_shadow_outer_roots(self):
         imports = '''import { mkdtempSync, readFileSync } from 'node:fs';

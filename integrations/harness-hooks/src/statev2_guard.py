@@ -1652,8 +1652,8 @@ def _strip_config_dir_db_names(source, directory):
 
 
 def _js_fixture_source(source):
-    # This is a positive proof for a small expression grammar, not a JS reader
-    # graph. Any plainly live root or ambiguous write keeps the original scan.
+    # Only immutable strings in unshadowed const spans supply root evidence.
+    # Ambiguous syntax retains the original scan for the affected span.
     if re.search(r'\b(?:homedir|cwd)\b|\bHOME\b(?!\s*:)|\bprocess\s*(?:\[|\.\s*(?:env\s*\[|(?:chdir|cwd)\b))|[\'"`]~/(?:\.robob|\.t3|\.local/share/opencode)\b', source):
         return source
     if re.search(r'''['"`]/[^'"`\n]*/(?:\.robob|\.t3|\.local/share/opencode|robob-data|opencode-data)(?:/|['"`])''', source):
@@ -1665,36 +1665,93 @@ def _js_fixture_source(source):
             return source
     token = re.compile(r'''//[^\n]*|/\*[\s\S]*?\*/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*|===|!==|==|!=|=>|(?:>>>|<<|>>|\*\*|&&|\|\||\?\?|[+*/%&|^-])=|\+\+|--|[^\s]''')
     regexp = re.compile(r'''/(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\\n\[])+/[dgimsuvy]*''')
+    quoted = re.compile(r"//[^\n]*|/\*[\s\S]*?\*/|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'")
+
+    def template_end(start, nesting=0):
+        if nesting > 24:
+            return None, True
+        position, uncertain = start + 1, False
+        while position < len(source):
+            if source[position] == '\\':
+                position += 2
+            elif source[position] == '`':
+                return position + 1, uncertain
+            elif source.startswith('${', position):
+                position += 2
+                begin, groups = position, ['}']
+                while groups and position < len(source):
+                    string = quoted.match(source, position)
+                    if string:
+                        position = string.end()
+                        continue
+                    char = source[position]
+                    if char == '`':
+                        position, _ = template_end(position, nesting + 1)
+                        uncertain = True
+                        if position is None:
+                            return None, True
+                        continue
+                    if char == '/':
+                        return None, True
+                    if char in {'"', "'", '\\'}:
+                        return None, True
+                    if char in '{[(':
+                        groups.append({'{': '}', '[': ']', '(': ')'}[char])
+                        uncertain |= char == '{'
+                    elif char in '}])':
+                        if char != groups.pop():
+                            return None, True
+                    position += 1
+                if groups:
+                    return None, True
+                uncertain |= bool(re.search(r'\bfunction\b|=>|(?<![=!<>])=(?!=|>)|\+\+|--', source[begin:position - 1]))
+            else:
+                position += 1
+        return None, True
     regex_prefixes = {'(', '[', '=', ',', ':', ';', '?', '~', '+', '-', '*', '/', '%', '&', '|', '^',
                       '==', '!=', '===', '!==', '=>', 'return', 'throw', 'case', 'typeof', 'void', 'delete', 'in', 'instanceof'}
-    matches, position = [], 0
+    matches, position, uncertain_tokens = [], 0, set()
     while (match := token.search(source, position)) is not None:
+        if match[0].startswith('`'):
+            end, uncertain = template_end(match.start())
+            if end is None:
+                return source
+            if uncertain:
+                uncertain_tokens.add(len(matches))
+            match = re.compile(r'[\s\S]+').match(source, match.start(), end)
+        elif match[0] in {'"', "'"}:
+            return source
         if match[0] == '/':
             previous = re.sub(r'\s+', '', matches[-1][0]) if matches else ''
+            # Optional access can split a keyword property off its receiver.
+            member = len(matches) > 1 and matches[-2][0] == '.'
             # A division sign must not swallow the following assignments as a
             # regex. Block/control endings need a parser, so retain the scan.
-            if not previous or previous in regex_prefixes or re.fullmatch(r'(?:>>>|<<|>>|\*\*|&&|\|\||\?\?|[+*/%&|^-])?=', previous):
+            if not member and (not previous or previous in regex_prefixes or re.fullmatch(r'(?:>>>|<<|>>|\*\*|&&|\|\||\?\?|[+*/%&|^-])?=', previous)):
                 match = regexp.match(source, match.start())
                 if match is None:
                     return source
-            elif previous in {')', '}', '!', '<', '>', 'of', 'yield', 'await'} or not (re.fullmatch(r'[\w$]+(?:\.[\w$]+)*', previous) or
-                    previous[:1] in {'"', "'", '`', '/'} or previous in {']', '++', '--'}):
+            elif not member and (previous in {')', '}', '!', '<', '>', 'of', 'yield', 'await'} or not (re.fullmatch(r'[\w$]+(?:\.[\w$]+)*', previous) or
+                    previous[:1] in {'"', "'", '`', '/'} or previous in {']', '++', '--'})):
                 return source
         position = match.end()
         if not match[0].startswith(('//', '/*')):
             matches.append(match)
     words = [re.sub(r'\s+', '', m[0]) if m[0][0] not in "\"'`" else m[0] for m in matches]
-    scopes, parents, stack = [], {0: None}, [0]
+    scopes, parents, scope_ends, stack = [], {0: None}, {}, [0]
     for i, word in enumerate(words):
         scopes.append(stack[-1])
         if word == '{':
             parents[i + 1] = stack[-1]
             stack.append(i + 1)
-        elif word == '}' and len(stack) > 1:
-            stack.pop()
-    definitions, writes, members, property_writes = {}, [], {}, {}
-    for i, scope in enumerate(scopes):
-        members.setdefault(scope, []).append(i)
+        elif word == '}':
+            if len(stack) == 1:
+                return source
+            scope_ends[stack.pop()] = i
+    if len(stack) != 1:
+        return source
+    scope_ends[0] = len(words)
+    definitions, writes = {}, []
     for i in range(len(words) - 2):
         if words[i] in {'const', 'let'} and re.fullmatch(r'[A-Za-z_$][\w$]*', words[i + 1]) and words[i + 2] == '=':
             definitions.setdefault((scopes[i], words[i + 1]), []).append((i + 3, i + 1))
@@ -1702,8 +1759,6 @@ def _js_fixture_source(source):
                 re.fullmatch(r'(?:>>>|<<|>>|\*\*|&&|\|\||\?\?|[+*/%&|^-])?=', words[i + 1]) or
                 words[i + 1] in {'++', '--', 'of', 'in'} or words[i - 1:i] in (['++'], ['--'], ['delete'])):
             writes.append(i)
-            if '.' in words[i]:
-                property_writes.setdefault(words[i].split('.')[0], []).append(i)
 
     def binding(name, i):
         scope = scopes[i]
@@ -1714,16 +1769,6 @@ def _js_fixture_source(source):
             scope = parents[scope]
         return None
 
-    # Object properties are accepted only on a locally constructed object.
-    for key, values in list(definitions.items()):
-        start, _ = values[0]
-        if len(values) == 1 and words[start:start + 1] == ['{']:
-            for i in members.get(start + 1, ()):
-                if words[i + 1:i + 2] == [':'] and re.fullmatch(r'[A-Za-z_$][\w$]*', words[i]):
-                    definitions.setdefault((key[0], key[1] + '.' + words[i]), []).append((i + 2, i))
-            for i in property_writes.get(key[1], ()):
-                if words[i].startswith(key[1] + '.') and binding(key[1], i) == key:
-                    definitions.setdefault((key[0], words[i]), []).append((i + 2, i))
     invalid = set()
     for i in writes:
         key = binding(words[i], i)
@@ -1736,47 +1781,25 @@ def _js_fixture_source(source):
         if word in {'[', '{', '('}:
             brackets.append(i)
         elif word in {']', '}', ')'} and brackets:
+            if words[brackets[-1]] != {']': '[', '}': '{', ')': '('}[word]:
+                return source
             openings[i] = brackets.pop()
+        elif word in {']', '}', ')'}:
+            return source
         if word in {']', '}', ')', '!'} and words[i + 1:i + 2] and (
                 words[i + 1] in {'of', 'in'} or re.fullmatch(r'(?:>>>|<<|>>|\*\*|&&|\|\||\?\?|[+*/%&|^-])?=', words[i + 1])):
             start = openings.get(i, i)
             for n in range(max(0, start - 1), i):
                 invalid.add(binding(words[n], n))
                 invalid.add(binding(words[n].split('.')[0], n))
-    for i, word in enumerate(words):
-        if word.startswith('`'):
-            for part in re.findall(r'\$\{([^}]*)\}', word):
-                if re.search(r'(?<![=!<>])=(?!=|>)|\+\+|--', part):
-                    for name in re.findall(r'[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*', part):
-                        invalid.add(binding(name, i))
-                        invalid.add(binding(name.split('.')[0], i))
-    for key, values in list(definitions.items()):
-        if '.' not in key[1] or not values:
-            continue
-        base_key = (key[0], key[1].split('.')[0])
-        base_values = definitions.get(base_key, [])
-        if len(base_values) != 1:
-            invalid.add(base_key)
-            continue
-        start, declaration = base_values[0]
-        # A receiver may only be declared and accessed through its proved
-        # properties. Aliases, arguments, returns and indexed uses can mutate it.
-        for i, word in enumerate(words):
-            base = base_key[1]
-            if (word.startswith('`') and re.search(r'\$\{[^}]*(?<![\w$])' + re.escape(base) + r'(?![\w$])', word) and
-                    not re.fullmatch(r'`\$\{' + re.escape(base) + r'\.[\w$]+\}/[^`$\\]*`', word)):
-                invalid.add(base_key)
-            if (word == base or word.startswith(base + '.')) and binding(base, i) == base_key:
-                member = (base_key[0], word)
-                if i != declaration and (word == base or member not in definitions or words[i + 1:i + 2] == ['(']):
-                    invalid.add(base_key)
-        # Spreads, computed keys, quoted duplicate keys and accessors are not
-        # simple local property initializers.
-        top = members.get(start + 1, ())
-        if any(words[i] in {'.', '['} or words[i][:1] in {'"', "'", '`'} and words[i + 1:i + 2] == [':'] or
-               words[i] in {'get', 'set'} and words[i + 2:i + 3] == ['('] for i in top):
-            invalid.add(base_key)
+    if brackets:
+        return source
+    declarations = []
     for i, word in enumerate(words[:-2]):
+        if word in {'const', 'let', 'var', 'function', 'class'} and re.fullmatch(r'[A-Za-z_$][\w$]*', words[i + 1]):
+            declarations.append((words[i + 1], i + 1))
+        if word == 'function' and words[i + 1] == '*' and re.fullmatch(r'[A-Za-z_$][\w$]*', words[i + 2]):
+            declarations.append((words[i + 2], i + 2))
         if word in {'const', 'let', 'var'} and re.fullmatch(r'[A-Za-z_$][\w$]*', words[i + 1]) and words[i + 2] != '=':
             definitions[(scopes[i], words[i + 1])] = []
         if word in {'const', 'let', 'var'} and words[i + 1] in {'{', '['}:
@@ -1785,6 +1808,10 @@ def _js_fixture_source(source):
             for name in names:
                 if re.fullmatch(r'[A-Za-z_$][\w$]*', name):
                     definitions[(scopes[i], name)] = []
+                    declarations.append((name, i + 1))
+        if word == 'import' and words[i + 1] != '(':
+            end = next((n for n in range(i + 1, len(words)) if words[n] == 'from' or words[n][:1] in {'"', "'"}), len(words))
+            declarations.extend((words[n], n) for n in range(i + 1, end) if re.fullmatch(r'[A-Za-z_$][\w$]*', words[n]))
     # Parameter bindings shadow outer fixture names even without an assignment.
     # Unknown/destructured parameter syntax can only remove a proof.
     parameters, nesting = [], []
@@ -1803,19 +1830,17 @@ def _js_fixture_source(source):
                     prefix -= 1
             before = words[max(0, prefix - 2):prefix + 1]
             function = 'function' in before
-            typed_arrow = words[after:after + 1] == [':'] and prefix >= 0 and words[prefix] in {'=', 'async', '(', ',', ':', 'return'}
-            type_end = after + 1
+            # Return types do not affect parameter bindings. Unknown type
+            # syntax must not let a header borrow an enclosing const proof.
             if words[after:after + 1] == [':']:
-                while type_end < len(words) and (re.fullmatch(r'[\w$.]+', words[type_end]) or words[type_end] in {'<', '>', '[', ']', '|', '&', ','}):
-                    type_end += 1
-            typed_body = words[after:after + 1] == [':'] and words[type_end:type_end + 1] in (['=>'], ['{'])
-            if words[after:after + 1] == [':'] and (typed_arrow or typed_body or function):
                 parameters.append((start + 1, i, after))
                 continue
             arrow = words[after:after + 1] == ['=>']
             if arrow:
                 after += 1
-            method = words[after:after + 1] == ['{'] and prefix >= 0 and re.fullmatch(r'[\w$.]+', words[prefix]) and words[prefix] not in {'if', 'while', 'for', 'switch', 'with'}
+            # Method names can be keywords, literals or computed properties.
+            # Ambiguous control headers may only remove an outer root proof.
+            method = words[after:after + 1] == ['{']
             if arrow or function or method:
                 parameters.append((start + 1, i, after))
         elif word == '=>' and i and re.fullmatch(r'[\w$]+', words[i - 1]):
@@ -1824,6 +1849,7 @@ def _js_fixture_source(source):
     for start, end, body in parameters:
         names = {word for word in words[start:end] if re.fullmatch(r'[A-Za-z_$][\w$]*', word)}
         parameter_names.update(names)
+        declarations.extend((name, start) for name in names)
         if words[body:body + 1] == ['{']:
             for name in names:
                 definitions[(body + 1, name)] = []
@@ -1831,6 +1857,17 @@ def _js_fixture_source(source):
             # Concise arrows and typed returns need no expression-extent
             # inference: remove the enclosing binding's proof conservatively.
             invalid.update(binding(name, body) for name in names)
+    # Const strings cannot be redirected by missed writes. A different binding
+    # anywhere in the declaration's remaining block still voids that proof.
+    for key, values in definitions.items():
+        if len(values) != 1:
+            continue
+        _, declaration = values[0]
+        if (words[declaration - 1] != 'const' or
+                any(name == key[1] and declaration < i < scope_ends[key[0]] for name, i in declarations) or
+                any(declaration < i < scope_ends[key[0]] and
+                    (key[1] in words[i] or DATABASE_NAME.search(words[i])) for i in uncertain_tokens)):
+            invalid.add(key)
 
     def suffix(value):
         return bool(value) and not value.startswith(('/', '~')) and not re.search(r'[\\$`]', value) and '..' not in value.split('/')
@@ -1845,6 +1882,8 @@ def _js_fixture_source(source):
             value = word[1:-1]
             return ('part', value) if suffix(value) else None, i + 1
         if word.startswith('`'):
+            if i in uncertain_tokens:
+                return None, i + 1
             template = re.fullmatch(r'`\$\{([\w$.]+)\}/([^`]+)`', word)
             if template and suffix(template[2]):
                 root = reference(template[1], i, seen)
@@ -1877,16 +1916,11 @@ def _js_fixture_source(source):
 
     def reference(name, i, seen):
         key = binding(name, i)
-        if key is None or key in invalid or key in seen or len(definitions[key]) != 1:
+        if '.' in name or key is None or key in invalid or key in seen or len(definitions[key]) != 1:
             return None
         start, declaration = definitions[key][0]
         if declaration >= i:
             return None
-        base = name.split('.')[0]
-        if '.' in name:
-            base_key = binding(base, i)
-            if base_key is None or base_key[0] != key[0] or not definitions[base_key] or base_key in invalid or re.search(r'\b' + re.escape(base) + r'\s*\[', source):
-                return None
         value, end = expression(start, seen | {key})
         return value if words[end:end + 1] and words[end] in {';', ',', ')', '}'} else None
 
