@@ -26,6 +26,8 @@ def rollup(day, root=None):
     counts, kinds, tags = Counter(), Counter(), Counter()
     times, samples = defaultdict(list), {}
     proxy = {}
+    locks, lock_accounts = {}, Counter()
+    unlocks = 0
     ok = failed = total = malformed = 0
     source = root / (day + '.ndjson')
     if source.exists():
@@ -40,6 +42,11 @@ def rollup(day, root=None):
                         key = (props.get('model', 'unknown'), props.get('route', 'unknown'), props.get('stream'))
                         if not isinstance(key[0], str) or not isinstance(key[1], str) or not isinstance(key[2], bool):
                             raise ValueError('invalid proxy dimensions')
+                    if row['name'] == 'account.lock':
+                        props = row.get('props', {})
+                        dims = tuple(props.get(k, 'unknown') for k in ('provider', 'model', 'cause'))
+                        if not all(isinstance(v, str) for v in dims):
+                            raise ValueError('invalid lock dimensions')
                     total += 1
                     counts[row['name']] += 1
                     kinds[row['kind']] += 1
@@ -52,6 +59,18 @@ def rollup(day, root=None):
                     if tag:
                         tags[tag] += 1
                         samples.setdefault(tag, row.get('ids', {}))
+                    if row['name'] in ('account.lock', 'account.unlock'):
+                        props = row.get('props', {})
+                        if row['name'] == 'account.unlock':
+                            unlocks += 1
+                        else:
+                            group = locks.setdefault(dims, dict(count=0, durations=[]))
+                            group['count'] += 1
+                            if metric(props.get('lockMs')):
+                                group['durations'].append(props['lockMs'])
+                            account = row.get('ids', {}).get('account')
+                            if isinstance(account, str) and len(account) == 16 and all(c in '0123456789abcdef' for c in account):
+                                lock_accounts[account] += 1
                     if row['name'] == 'proxy.request':
                         group = proxy.setdefault(key, dict(count=0, aborted=0, durations=[], ttfb=[], errors=Counter(), samples={}))
                         group['count'] += 1
@@ -80,6 +99,11 @@ def rollup(day, root=None):
             ttfbMs=percentiles(group['ttfb']),
             topErrors=[dict(tag=tag, count=count, sampleReq=group['samples'][tag]) for tag, count in group['errors'].most_common(20)],
         ))
+    result['locks'] = dict(
+        count=sum(g['count'] for g in locks.values()), unlocks=unlocks,
+        byProviderModelCause=[dict(provider=p, model=m, cause=c, count=g['count'], lockMs=percentiles(g['durations'])) for (p, m, c), g in sorted(locks.items())],
+        topAccounts=[dict(account=a, count=n) for a, n in lock_accounts.most_common(5)],
+    )
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(root, 0o700)
     fd, tmp = tempfile.mkstemp(prefix='.rollup-', dir=root)
