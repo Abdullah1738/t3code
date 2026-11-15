@@ -61,6 +61,14 @@ test("cap suppresses event/perf, retains errors and emits one notice across writ
   expect(lines().map(l => l.name)).toEqual(["turn.robob_call", "log.degraded", "reply.failed"]);
 });
 
+test("degraded mode uses the five-second call threshold and retains every failure", () => {
+  const { log, lines } = setup({ capBytes: 1 });
+  log.write(entry);
+  for (const durationMs of [1_500, 5_000, 5_000.01]) log.write({ ...entry, durationMs });
+  log.write({ ...entry, durationMs: 2, ok: false, error: { tag: "control.request_failed" } });
+  expect(lines().filter(line => line.name === "turn.robob_call").map(line => line.durationMs)).toEqual([12, 5_000.01, 2]);
+});
+
 test("all logging failures, malformed input and optional attribution failures are swallowed", async () => {
   const { root } = setup(); const file = join(root, "file"); writeFileSync(file, "");
   const bad = createToolLog({ root: join(file, "child") });
