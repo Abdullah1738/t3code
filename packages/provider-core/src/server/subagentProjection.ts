@@ -244,6 +244,55 @@ export function subagentResultForRun(
   };
 }
 
+export function delegatedTaskResultRun(
+  projection: Pick<OrchestrationV2ThreadProjection, "runs" | "messages">,
+  taskId: NodeId,
+  fallbackRun?: OrchestrationV2Run,
+): OrchestrationV2Run | undefined {
+  const taggedRun = projection.runs
+    .filter((run) => run.delegatedTaskId === taskId)
+    .toSorted((a, b) => b.ordinal - a.ordinal)[0];
+  const anchor = taggedRun ?? fallbackRun;
+  if (anchor === undefined) return undefined;
+  const terminal = (run: OrchestrationV2Run) =>
+    ["completed", "failed", "cancelled", "interrupted", "rolled_back"].includes(run.status);
+  if (!terminal(anchor)) return anchor;
+  const monitorRuns = new Set(
+    projection.messages
+      .filter((message) => message.notification?.source.kind === "monitor")
+      .map((message) => message.runId),
+  );
+  const nextTaskOrdinal = Math.min(
+    ...projection.runs
+      .filter(
+        (run) =>
+          run.ordinal > anchor.ordinal &&
+          run.delegatedTaskId !== undefined &&
+          run.delegatedTaskId !== taskId,
+      )
+      .map((run) => run.ordinal),
+  );
+  // Background notifications start untagged turns. They still finish this task,
+  // until another explicitly delegated task takes ownership of the child.
+  return projection.runs
+    .filter(
+      (run) =>
+        terminal(run) &&
+        !monitorRuns.has(run.id) &&
+        (run.id === anchor.id || run.status !== "rolled_back") &&
+        (run.delegatedTaskId === taskId ||
+          run.id === anchor.id ||
+          (run.delegatedTaskId === undefined &&
+            run.ordinal > anchor.ordinal &&
+            run.ordinal < nextTaskOrdinal &&
+            run.startedAt !== null)),
+    )
+    .reduce<OrchestrationV2Run | undefined>(
+      (latest, run) => (latest === undefined || runRanAfter(run, latest) ? run : latest),
+      undefined,
+    );
+}
+
 export function delegatedTaskProgress(projection: {
   readonly runs: OrchestrationV2ThreadProjection["runs"];
   readonly messages: ReadonlyArray<

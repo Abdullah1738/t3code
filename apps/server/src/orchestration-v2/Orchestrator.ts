@@ -182,6 +182,7 @@ import {
   makeSubagentChildThread,
   subagentResultForRun,
   delegatedTaskProgress,
+  delegatedTaskResultRun,
   subagentThreadTitle,
 } from "@t3tools/provider-core/server/subagentProjection";
 import {
@@ -12221,12 +12222,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         return;
       }
       const taskRuns = childControls.runs.filter((run) => run.delegatedTaskId === options.task.id);
-      const childRun =
-        taskRuns.length === 0
-          ? options.task.id === forkedFrom.nodeId
-            ? options.resultRun
-            : undefined
-          : taskRuns.toSorted((a, b) => b.ordinal - a.ordinal)[0];
+      const taggedRun = taskRuns.toSorted((a, b) => b.ordinal - a.ordinal)[0];
+      const childRun = delegatedTaskResultRun(
+        childControls,
+        options.task.id,
+        options.task.id === forkedFrom.nodeId ? options.resultRun : undefined,
+      );
       if (childRun === undefined) return;
       const outcome = runOutcome(childRun);
       const terminalStatus =
@@ -12236,14 +12237,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             ? delegatedTaskTerminalStatus(outcome)
             : "failed";
       if (terminalStatus === null) {
-        if (childRun.delegatedTaskId === undefined || childRun.id !== options.syncRunId) return;
+        if (taggedRun === undefined || taggedRun.id !== options.syncRunId) return;
         const task = options.task;
         const status: OrchestrationV2Subagent["status"] =
-          childRun.status === "queued"
-            ? childRun.queueHeld === true
+          taggedRun.status === "queued"
+            ? taggedRun.queueHeld === true
               ? "idle"
               : "pending"
-            : childRun.status === "waiting"
+            : taggedRun.status === "waiting"
               ? "waiting"
               : "running";
         if (task.result !== null || task.status === status) return;
@@ -12293,7 +12294,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
       if (
         yield* childAwaitsRestartContinuation(
-          taskRuns.length === 0 ? childControls.runs : taskRuns,
+          childControls.runs,
           childRun,
           options?.settledContinuationOf,
         )
@@ -14218,10 +14219,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         { messageRoles: ["user"] },
       );
       if (taskId !== undefined) {
-        const runs = child.runs.filter((run) => run.delegatedTaskId === taskId);
-        const run = runs.toSorted((a, b) => b.ordinal - a.ordinal)[0];
+        if (
+          child.thread.forkedFrom?.type === "node" &&
+          child.thread.forkedFrom.nodeId === taskId &&
+          delegatedTaskProgress(child).state !== "result_available"
+        )
+          return true;
+        const run = delegatedTaskResultRun(child, taskId);
         if (run === undefined || delegatedTaskTerminalStatus(run.status) === null) return true;
-        return yield* childAwaitsRestartContinuation(runs, run);
+        return yield* childAwaitsRestartContinuation(child.runs, run);
       }
       const progress = delegatedTaskProgress(child);
       if (progress.state !== "result_available") return true;

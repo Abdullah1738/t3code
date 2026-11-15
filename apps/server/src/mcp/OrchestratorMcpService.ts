@@ -111,6 +111,7 @@ import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterReg
 import {
   subagentResultForRun,
   delegatedTaskProgress,
+  delegatedTaskResultRun,
 } from "@t3tools/provider-core/server/subagentProjection";
 import {
   DispatchModeLimit,
@@ -586,6 +587,29 @@ function taskResultTransfer(
   task: OrchestrationV2Subagent,
 ) {
   const originalRun = delegatedTaskRun(child, task);
+  const transferredRunIds = new Set(
+    parent.contextTransfers
+      .filter(
+        (transfer) =>
+          transfer.type === "subagent_result" &&
+          transfer.sourceThreadId === task.childThreadId &&
+          transfer.targetThreadId === parent.thread.id,
+      )
+      .map((transfer) => transfer.sourcePoint.runId),
+  );
+  const selectedResultRun = delegatedTaskResultRun(
+    {
+      runs: child.runs.filter(
+        (run) =>
+          run.delegatedTaskId !== undefined ||
+          run.id === originalRun?.id ||
+          transferredRunIds.has(run.id),
+      ),
+      messages: [],
+    },
+    task.id,
+    originalRun,
+  );
   const resultRunIds = new Set(
     child.runs
       .filter(
@@ -596,6 +620,7 @@ function taskResultTransfer(
       .map((run) => run.id),
   );
   if (originalRun !== undefined) resultRunIds.add(originalRun.id);
+  if (selectedResultRun !== undefined) resultRunIds.add(selectedResultRun.id);
   return parent.contextTransfers.find(
     (transfer) =>
       transfer.type === "subagent_result" &&
@@ -2165,9 +2190,7 @@ const make = Effect.gen(function* () {
     const progress = delegatedTaskProgress(childControls);
     const taskResultRun =
       childRun?.delegatedTaskId === task.id
-        ? childControls.runs
-            .filter((run) => run.delegatedTaskId === task.id)
-            .toSorted((a, b) => b.ordinal - a.ordinal)[0]
+        ? delegatedTaskResultRun(childControls, task.id, childRun)
         : progress.resultRun;
     const resultRunAncestors = new Set<RunId>();
     let resultSource = taskResultRun;
