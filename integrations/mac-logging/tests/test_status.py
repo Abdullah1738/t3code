@@ -41,7 +41,7 @@ class StatusTests(unittest.TestCase):
 
     def seed(self, overrides=None):
         for key in status.CADENCES:
-            at = (overrides or {}).get(key, NOW - dt.timedelta(minutes=5))
+            at = (overrides or {}).get(key, NOW - dt.timedelta(minutes=1 if key == 'cpu.sample' else 5))
             if at is not None:
                 self.write(key, at)
 
@@ -184,7 +184,7 @@ class StatusTests(unittest.TestCase):
         representable = ['0001-01-01T04:00:00+04:00', '0001-01-01T00:00:00Z',
                          '9999-12-31T19:59:59-04:00', '9999-12-31T23:59:59Z']
         for key in status.CADENCES:
-            self.write(key, NOW.replace(hour=23, minute=45))
+            self.write(key, NOW.replace(hour=23, minute=59 if key == 'cpu.sample' else 45))
         end = NOW + dt.timedelta(hours=12)
         baseline = status.report(end, self.root, day=NOW.date())
         for index, value in enumerate(overflowing + representable):
@@ -354,10 +354,20 @@ class StatusTests(unittest.TestCase):
         self.assertIsNone(result['jobs']['disk.deep.end']['lastOk'])
         self.assertEqual(result['jobs']['disk.deep.end']['status'], 'OK')
         self.assertEqual(result['jobs']['memory.sample']['gapMaxMin'], 15)
-        # Only memory becomes late after its three-sample allowance.
+        self.assertEqual(result['jobs']['cpu.sample']['gapMaxMin'], 3)
+        # CPU and memory each become late at their own allowance.
         later = self.report(NOW + dt.timedelta(minutes=11))
-        self.assertEqual(later['missingJobs'], ['memory.sample'])
+        self.assertEqual(later['missingJobs'], ['memory.sample', 'cpu.sample'])
         self.assertEqual(later['jobs']['memory.sample']['status'], 'LATE')
+
+    def test_cpu_three_minute_cadence_and_failed_probe_liveness(self):
+        self.seed()
+        self.assertEqual(self.report(NOW + dt.timedelta(minutes=2))['jobs']['cpu.sample']['status'], 'OK')
+        self.assertEqual(self.report(NOW + dt.timedelta(minutes=2, seconds=1))['jobs']['cpu.sample']['status'], 'LATE')
+        self.write('cpu.sample', NOW + dt.timedelta(minutes=3), False)
+        row = self.report(NOW + dt.timedelta(minutes=4))['jobs']['cpu.sample']
+        self.assertEqual(row['status'], 'OK')
+        self.assertFalse(row['lastOk'])
 
     def test_missing_day_emitted_once_daily_before_any_jobs(self):
         collector.missing_day(NOW)
