@@ -1345,6 +1345,8 @@ const handlers = {
             title: input.title,
             description: input.description,
             prompt: input.prompt,
+            promptEdits: input.promptEdits,
+            subtaskEdits: input.subtaskEdits,
             priority: input.priority,
             ...(input.goalId !== undefined
               ? { goalId: input.goalId === null ? null : KanbanGoalId.make(input.goalId) }
@@ -1365,7 +1367,17 @@ const handlers = {
           caller.actor,
         );
         const board = yield* boardFor(service, caller, card.boardId);
-        return { card: edited, ...gatedResult(edited, input.subtasks, board.guessedGates) };
+        const planInput =
+          input.subtasks ??
+          (input.subtaskEdits === undefined
+            ? undefined
+            : edited.subtasks
+                .filter(
+                  (entry) =>
+                    entry.text !== card.subtasks.find((previous) => previous.id === entry.id)?.text,
+                )
+                .map(({ id }) => ({ id })));
+        return { card: edited, ...gatedResult(edited, planInput, board.guessedGates) };
       }),
     ),
   ),
