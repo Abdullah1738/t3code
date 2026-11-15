@@ -1,5 +1,5 @@
 #!/bin/zsh -f
-# Usage: zsh install-robob-fast.zsh --dmg /absolute/build.dmg
+# Usage: zsh install-robob-fast.zsh --dmg /absolute/build.dmg [--ready-budget-s N]
 # --dry-run prints the plan; --rollback restores the previous bundle only.
 # Exit 75: installed, but reads did not stay healthy for 5 min. See the log; do not reinstall.
 set -euo pipefail
@@ -8,6 +8,8 @@ SCRIPT=${0:A}
 if (( ${argv[(Ie)--dry-run]} )); then
   exec node "${SCRIPT:h}/install-robob-fast.mjs" "$@"
 fi
+# Reject an invalid budget before detaching or announcing an install.
+node "${SCRIPT:h}/install-robob-fast.mjs" --dry-run "$@" >/dev/null
 if [[ -z ${TMUX:-} ]]; then
   stamp=$(date +%Y%m%d-%H%M%S)
   log=$HOME/.robob/install-$stamp.ndjson

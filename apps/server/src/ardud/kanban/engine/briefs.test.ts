@@ -78,9 +78,18 @@ const card: KanbanCard = {
 };
 
 describe("board briefs", () => {
-  it("tells workers to watch PR CI and end the turn, and wait inside it for other work", () => {
+  it("keeps cross-card packet handoffs with the evaluator", () => {
+    expect(evaluatorBrief(board, { kind: "check" })).toContain(
+      "then mark it done. A work thread can change and post only on its own cards (the server refuses the rest), so a packet never tells it to post on, tick, move or edit another card; make that an evaluator subtask.",
+    );
+    expect(workBrief(board, card, null)).toContain(
+      '(kind "request" only). The ones that change things work only on your own cards. If your task says to post on or change another card, put what you have in your own card (card_update or its discussion) and leave carrying it over to the evaluator.',
+    );
+  });
+
+  it("tells workers to watch PR CI and end the turn, and set card waits for other work", () => {
     expect(nudgeWorkText([card])).toContain(
-      "Waiting on CI for a PR: call watch_pull_request on it and end your turn; the board waits while the watch is on and the watch wakes you. For a deploy or anything else, wait inside your turn.",
+      "Waiting on CI for a PR: call watch_pull_request on it and end your turn; the board waits while the watch is on and the watch wakes you. Waiting on something else (a merge, a push, another card, a time): card_wait on it and end your turn.",
     );
   });
 
@@ -89,7 +98,9 @@ describe("board briefs", () => {
     expect(brief).toContain(
       "Waiting on CI for an open or draft PR: call watch_pull_request on it and end your turn; the watch wakes you on CI and review changes, and the board waits for up to 6 hours since your last run while the watch is on.",
     );
-    expect(brief).toContain("For a deploy or anything else, wait inside your turn.");
+    expect(brief).toContain(
+      "Waiting on something else (a merge, a push, another card, a time): card_wait on it and end your turn.",
+    );
     expect(brief).not.toContain("Never end a turn while a card of yours is in Working");
     expect(brief).not.toContain("Wait for CI or a deploy inside the turn");
     expect(brief).not.toContain("Each time you stop with a card in Working you are nudged");
@@ -288,5 +299,7 @@ it("nightly review requires complete reads, a fresh cursor and recovery from fai
   ]) {
     expect(brief).toContain(text);
   }
-  expect(brief.indexOf("Complete the read pass")).toBeLessThan(brief.indexOf("1. Information gaps"));
+  expect(brief.indexOf("Complete the read pass")).toBeLessThan(
+    brief.indexOf("1. Information gaps"),
+  );
 });

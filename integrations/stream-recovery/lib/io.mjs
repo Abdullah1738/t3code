@@ -28,7 +28,7 @@ const parse = (text) => {
   }
 };
 
-// ---------- Robob state DB (read-only, indexed lookups only) ----------
+// ---------- Robob replica (read-only; discovery scans and indexed row lookups) ----------
 
 export function openDb(path = PATHS.db) {
   const safePath = assertReplicaPath(path);

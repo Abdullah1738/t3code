@@ -310,11 +310,14 @@ const cardFor = Effect.fn("KanbanTools.cardFor")(function* (
  * work thread on the cards it still works on (one moved to another thread is
  * no longer its own, even the one it started with).
  */
-const ownCard = (caller: Caller, card: KanbanCard) =>
+const isOwnCard = (caller: Caller, card: KanbanCard) =>
   !isCardThread(caller) ||
   (caller.link?.role === "work"
     ? card.workThreadId === caller.threadId
-    : caller.link?.cardId === card.id)
+    : caller.link?.cardId === card.id);
+
+const ownCard = (caller: Caller, card: KanbanCard) =>
+  isOwnCard(caller, card)
     ? Effect.void
     : refuse(
         `This thread works on other cards; it can't change card #${card.number}. A card you created without assignToSelf belongs to the thread that will work it; put details in card_create, or hand them to the board's evaluator.`,
@@ -428,6 +431,10 @@ const postTargetFor = Effect.fn("KanbanTools.postTargetFor")(function* (
       // Ownership applies to a card's own discussion; board channels keep their policy.
       if (discussion.cardId) {
         const { card } = yield* service.card(discussion.cardId);
+        if (!isOwnCard(caller, card))
+          return yield* refuse(
+            `This thread works on other cards; it can't post on card #${card.number}. Post it in your own card's discussion; the board's evaluator carries it over.`,
+          );
         yield* ownCard(caller, card);
       }
     }
@@ -435,6 +442,10 @@ const postTargetFor = Effect.fn("KanbanTools.postTargetFor")(function* (
   }
   if (cardRef?.trim()) {
     const card = yield* cardFor(service, caller, cardRef, boardId, true);
+    if (!isOwnCard(caller, card))
+      return yield* refuse(
+        `This thread works on other cards; it can't post on card #${card.number}. Post it in your own card's discussion; the board's evaluator carries it over.`,
+      );
     yield* ownCard(caller, card);
     return { kind: "card" as const, id: card.id };
   }
@@ -481,6 +492,7 @@ const handlers = {
     withCaller((service, caller) =>
       Effect.gen(function* () {
         const board = yield* boardFor(service, caller, input.boardId, true);
+        const releaseBoards = yield* service.boards;
         const limit = Math.min(
           input.limit ?? BoardReplies.BOARD_PAGE_LIMIT,
           BoardReplies.BOARD_PAGE_MAX,
@@ -502,7 +514,7 @@ const handlers = {
             board: {
               id: board.id,
               name: board.name,
-              ...BoardReplies.boardReleaseSummary(board, at),
+              ...BoardReplies.boardReleaseSummary(board, at, releaseBoards),
               window,
               legend: Activity.COMPACT_LEGEND,
               activeCards: rows.length,
@@ -525,6 +537,7 @@ const handlers = {
               { ...snapshot, cards },
               undefined,
               DateTime.formatIso(yield* DateTime.now),
+              releaseBoards,
             ),
             page: { limit, hasMore, nextAfter: hasMore ? cards.at(-1)!.number : null },
           },
@@ -918,7 +931,14 @@ const handlers = {
           caller.actor,
         );
         return WAITS_ENGINE_WIRED
-          ? { card: waiting }
+          ? {
+              card: waiting,
+              ...(caller.actor._tag === "thread" &&
+              waiting.activeThreadId === caller.actor.threadId &&
+              waiting.activeRole === "work"
+                ? { note: "Wait set; it starts when your turn ends. End your turn now." }
+                : {}),
+            }
           : {
               card: waiting,
               note: "Saved and shown on the board. The board does not end waits by itself yet: keep your own check until it does.",
@@ -1260,6 +1280,7 @@ const handlers = {
             input.note ?? null,
             caller.actor,
             role,
+            input.releasedAt,
           ),
         };
       }),

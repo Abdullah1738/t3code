@@ -130,6 +130,7 @@ _ROBOB_RESTART_SOURCE_TEST_MODE=0
 SCRIPT=${0:A}
 INSTALLER=/Volumes/ExternalSSD/t3code-fork/tmp/memory/cutover/install-robob-resume.zsh
 DMG="" PING="" ALSO="" MOVE_TO_SSD=""
+READY_BUDGET_S=180 READY_BUDGET_SET=0
 EXTRA=()
 while (( $# )); do
   case $1 in
@@ -142,10 +143,23 @@ while (( $# )); do
         --move-to-ssd) MOVE_TO_SSD=$2 ;;
       esac
       shift 2 ;;
+    --ready-budget-s)
+      (( $# >= 2 && ! READY_BUDGET_SET )) || { print -u2 -- '--ready-budget-s needs one value'; exit 2; }
+      READY_BUDGET_S=$2 READY_BUDGET_SET=1; shift 2 ;;
     --restart-opencode) EXTRA+=(--restart-opencode); shift ;;
     *) print -u2 -- "unknown argument: $1"; exit 2 ;;
   esac
 done
+
+unset BUN_INSPECT
+if ! command -v node >/dev/null 2>&1; then
+  export NVM_DIR=${NVM_DIR:-$HOME/.nvm}
+  source "$NVM_DIR/nvm.sh" >/dev/null 2>&1 || true
+fi
+command -v node >/dev/null 2>&1 || { print -u2 "node not found"; exit 1; }
+
+READY_BUDGET_S=$(node "${SCRIPT:h}/../../../apps/desktop/scripts/install-readiness.mjs" validate "$READY_BUDGET_S") || exit 2
+EXTRA+=(--ready-budget-s "$READY_BUDGET_S")
 
 # The test mode only exercises this preflight and cannot reach the wait or
 # install. Outside it, inherited USERDATA/BROOT never configure the run.

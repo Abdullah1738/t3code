@@ -35,6 +35,8 @@ export async function foldMedsLine(opts: FoldOptions = {}): Promise<FoldResult> 
       ...(outcome === "error" ? { error: { tag: `meds.fold.${extra.reason}`, message: "" } } : {}) });
     return { outcome, durationMs, ...(extra.line ? { line: extra.line } : {}) };
   };
+  // Mac tests previously spawned the live watcher and polluted its health log and state.
+  if (!opts.cmd && process.env.NODE_ENV === "test") return result("error", { reason: "test_default_command" });
   let child: ReturnType<typeof Bun.spawn<"ignore", "pipe", "ignore">> | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {

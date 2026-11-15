@@ -70,7 +70,7 @@ test("card preparation logs render success/failure without page or caption text"
     }))("https://a.example/q-fixture/");
     await expect(cardPreviewImage(async () => "", fakeFetch({}))("https://a.example/delivery-fixture/")).rejects.toThrow();
   });
-  expect(logs.filter(l => l.name === "card.render").map(l => [l.ok, l.props?.cardKind])).toEqual([[true, "quick"], [false, "delivery"]]);
+  expect(logs.filter(l => l.name === "card.render" || l.name === "card.renders").map(l => [l.ok, l.props?.cardKind]).sort((a, b) => Number(b[0]) - Number(a[0]))).toEqual([[true, "quick"], [false, "delivery"]]);
   expect(logs.some(l => l.name === "bridge.catch")).toBe(true);
   expect(JSON.stringify(logs)).not.toContain("PRIVATE_CARD_TEXT");
 });

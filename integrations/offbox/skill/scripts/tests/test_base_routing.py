@@ -10,6 +10,7 @@ import sys
 import tempfile
 import types
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -79,6 +80,70 @@ class BaseRouting(unittest.TestCase):
     def decisions(self):
         return [c.kwargs for c in self.events.call_args_list
                 if c.args[:2] == ('home', 'home.failover_decision')]
+
+    def test_named_base_startup_and_outage_share_one_wait_bound(self):
+        from test_home_start_wait import Clock, STARTING, READY
+        self.add('server', 'warm')
+        # Both orders, plus refusals during allocation and while holding a pool queue place.
+        for checkpoint in ('preflight', 'allocation', 'queue', 'outage-probe', 'startup-then-outage'):
+            with self.subTest(checkpoint=checkpoint), contextlib.ExitStack() as stack:
+                clock = Clock()
+                clock.now = 1000
+                for name, replacement in (('monotonic', clock.time), ('time', clock.time), ('sleep', clock.sleep)):
+                    stack.enter_context(patch.object(home.time, name, replacement))
+                stack.enter_context(patch.dict(os.environ, OFFBOX_HOME_START_WAIT_S='10', OFFBOX_OUTAGE_WAIT_SECONDS='60'))
+                stack.enter_context(patch.object(api, 'BACKEND', 'server'))
+                stack.enter_context(patch.object(outage, 'PROBE_EVERY_S', 3))
+                stack.enter_context(patch.object(api, '_key', return_value='fixture'))
+                health = [STARTING, READY] if checkpoint == 'startup-then-outage' else []
+                def read(timeout):
+                    return health.pop(0) if health else STARTING
+                stack.enter_context(patch.object(home, '_health', side_effect=read))
+                if checkpoint in ('preflight', 'startup-then-outage'):
+                    stack.enter_context(patch.object(home, 'probe', side_effect=home._probe))
+                def refuse(request, **kwargs):
+                    raise urllib.error.HTTPError(request.full_url, 503, 'starting', {}, io.BytesIO(json.dumps({
+                        'code': 'server_not_ready', 'starting': True, 'phase': 'waiting for incus',
+                        'message': 'waiting for incus'}).encode()))
+                send = stack.enter_context(patch.object(api, '_open', side_effect=refuse))
+                if checkpoint == 'queue':
+                    self.cons['server'].execute("DELETE FROM bases WHERE name='torssh:warm'")
+                    self.cons['server'].commit()
+                    self.full_home_pool()
+                    stack.enter_context(patch.object(pool, 'acquire', side_effect=self.real_acquire))
+                    stack.enter_context(patch.dict(os.environ, OFFBOX_POOL_SIZE='1', OFFBOX_POOL_WAIT_SECONDS='120'))
+                    stack.enter_context(patch.object(pool, '_refresh_background'))
+                    stack.enter_context(patch.object(pool, '_recheck_prune_holds'))
+                    probes = [0]
+                    def probe():
+                        probes[0] += 1
+                        return None if probes[0] == 1 else home._probe()
+                    stack.enter_context(patch.object(home, 'probe', side_effect=probe))
+                def remote(a, me):
+                    if checkpoint == 'queue':
+                        return pool.acquire(me, base=a.base)
+                    if checkpoint == 'allocation':
+                        with home.pre_start('run-fixture'):
+                            return api.call('GET', '/limits', retries=0)
+                    raise api.NetworkError('home stopped answering')
+                attempt = stack.enter_context(patch.object(cli, '_remote_once', side_effect=remote))
+                execute = stack.enter_context(patch.object(os, 'execve'))
+                local = stack.enter_context(patch.object(fallback, 'run_local'))
+                output = stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+                self.assertEqual(cli.main(['run', '--base', 'warm', '--', 'true']), 93, output.getvalue())
+                if checkpoint == 'queue':
+                    self.assertGreaterEqual(clock.now - 1000, 10)
+                    self.assertLessEqual(clock.now - 1000, 10 + 2 * outage.PROBE_EVERY_S)
+                else:
+                    self.assertEqual(clock.now - 1000, 10)
+                self.assertIn('home still starting after 10 s', output.getvalue())
+                self.assertEqual(send.call_count, 1 if checkpoint in ('allocation', 'outage-probe', 'startup-then-outage') else 0)
+                self.assertEqual(attempt.call_count, 0 if checkpoint == 'preflight' else 1)
+                execute.assert_not_called()
+                local.assert_not_called()
+                self.assertIsNone(home.WAIT_BUDGET.get())
+                for table in ('pool_waiters', 'pool_pending', 'pool_cap_callers'):
+                    self.assertEqual(self.cons['server'].execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0], 0)
 
     def test_explicit_home_base_waits_then_exits_93_without_boat_or_local(self):
         self.add('server', 'warm')

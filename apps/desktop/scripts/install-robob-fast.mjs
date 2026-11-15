@@ -13,6 +13,14 @@ import * as NodeHttps from "node:https";
 import * as NodeURL from "node:url";
 
 import { acquireInstallHold, finishInstallHold } from "./robob-install-hold.mjs";
+import {
+  validateReadyBudget,
+  installCommandTimeout,
+  installBackupTimeout,
+  waitForInstallReadiness,
+  readBootPhase,
+} from "./install-readiness.mjs";
+export { installCommandTimeout } from "./install-readiness.mjs";
 
 // Exit 75: the bundle is installed, but sustained reads did not pass. Do not reinstall.
 export const READ_CHECK_FAILED = 75;
@@ -235,13 +243,6 @@ export function createBackupRetention({ backupRoot, currentStamp, phase, fs: io 
   };
 }
 
-export function installCommandTimeout(timeout, quitAt, startupComplete, now = Date.now()) {
-  const remaining =
-    quitAt === undefined || startupComplete ? timeout : Math.min(timeout, 180_000 - (now - quitAt));
-  if (remaining <= 0) throw new Error("Install exceeded the 3 minute limit");
-  return remaining;
-}
-
 export function createDmgStage({
   run = exec,
   phase,
@@ -251,7 +252,7 @@ export function createDmgStage({
   let mount;
   const detach = async () => {
     if (!mount) return;
-    // Cleanup must still run after the install's three-minute startup deadline.
+    // Cleanup must still run after the install's startup deadline.
     const options = { timeout: 30_000, killSignal: "SIGKILL", maxBuffer: 2 ** 20 };
     try {
       await run("/usr/bin/hdiutil", ["detach", "-quiet", mount], options);
@@ -703,6 +704,12 @@ export async function main(args, {
     console.log(JSON.stringify({ phase, at: new Date().toISOString(), ...extra })),
 } = {}) {
   const rollback = args.includes("--rollback");
+  const readyIndex = args.indexOf("--ready-budget-s");
+  if (args.filter((arg) => arg === "--ready-budget-s").length > 1)
+    throw new Error("--ready-budget-s must be given once");
+  if (readyIndex >= 0 && args[readyIndex + 1] === undefined)
+    throw new Error("--ready-budget-s requires a value");
+  const readyBudgetS = validateReadyBudget(readyIndex < 0 ? undefined : args[readyIndex + 1]);
   const dmgIndex = args.indexOf("--dmg");
   const skipIndex = args.indexOf("--skip-migration-check");
   // The pre-quit check clones the live database, and that clone stalls the running server's
@@ -715,7 +722,7 @@ export async function main(args, {
   if (rollback && skipMigrationCheck !== undefined)
     throw new Error("--skip-migration-check cannot be used with --rollback");
   for (let i = 0; i < args.length; i++) {
-    if ((args[i] === "--dmg" || args[i] === "--skip-migration-check") && args[i + 1]) {
+    if (["--dmg", "--skip-migration-check", "--ready-budget-s"].includes(args[i]) && args[i + 1]) {
       i++;
       continue;
     }
@@ -726,6 +733,7 @@ export async function main(args, {
     console.log(
       JSON.stringify({
         rollback,
+        readyBudgetS,
         skipMigrationCheck: skipMigrationCheck ?? null,
         steps: INSTALL_PLAN,
       }),
@@ -733,6 +741,7 @@ export async function main(args, {
     return;
   }
   if (!env.TMUX) throw new Error("Use the zsh wrapper: installs must run in tmux");
+  await phase("install_started", { readyBudgetS });
   const app = "/Applications/Robob.app";
   const next = "/Applications/.Robob.next.app";
   const prev = "/Applications/.Robob.prev.app";
@@ -746,7 +755,7 @@ export async function main(args, {
   let quitAt;
   let startupComplete = false;
   const run = (cmd, args, timeout = 20_000, commandEnv = env) => {
-    const remaining = installCommandTimeout(timeout, quitAt, startupComplete);
+    const remaining = installCommandTimeout(timeout, quitAt, startupComplete, Date.now(), readyBudgetS);
     return exec(cmd, args, { timeout: remaining, maxBuffer: 2 ** 20, env: commandEnv });
   };
   const exists = async (p) =>
@@ -788,15 +797,7 @@ export async function main(args, {
   let quitTree;
   let ownsStaging = false;
   let swapped = false;
-  const poll = async (fn) => {
-    for (;;) {
-      if (Date.now() - quitAt >= 180_000) throw new Error("Install exceeded the 3 minute limit");
-      try {
-        if (await fn()) return;
-      } catch {}
-      await sleep(200);
-    }
-  };
+  const poll = (fn) => waitForInstallReadiness(fn, { quitAt, readyBudgetS });
   const launch = () =>
     run(
       "/bin/zsh",
@@ -924,13 +925,10 @@ export async function main(args, {
     },
     backup: async () => {
       // No writer is left after the quit, so the clone only waits on APFS, not on the server.
-      // Leave at least 60 s of the 3 minute window for swap, launch and readiness: a backup that
+      // Leave at least 60 s of the readiness budget for swap, launch and readiness: a backup that
       // ate the window would fail the launch after the swap, where nothing relaunches either app.
-      const budget = () => {
-        const ms = Math.min(120_000, 180_000 - (Date.now() - quitAt) - 60_000);
-        if (ms <= 0) throw new Error("No time left for the backup before the swap");
-        return ms;
-      };
+      const backupDeadline = Date.now() + 120_000;
+      const budget = () => installBackupTimeout(quitAt, Date.now(), readyBudgetS, backupDeadline);
       await cloneBackup({ backupRoot, stamp, clone: (destination) => clone(destination, budget) });
       backupDone = true;
     },
@@ -1013,7 +1011,11 @@ export async function main(args, {
     await install(ops, { rollback });
   } catch (e) {
     installFailure = e;
-    await phase("failed", { error: String(e), swapped });
+    await phase("failed", { error: String(e), swapped,
+      ...(e.code === "READINESS_BUDGET_EXCEEDED" ? {
+        readyBudgetS, boot: await readBootPhase(NodePath.join(data, "logs/boot.ndjson"), oldBootId),
+      } : {}),
+    });
     if (swapped || backupDone) await retention.pin(e);
     // Before the swap no new binary has touched the data. Reopen the existing app,
     // but only once every old process is gone (its server holds the owner lock).
@@ -1033,7 +1035,7 @@ export async function main(args, {
                 ).stdout,
                 app,
               ),
-        // Not bounded by the 3 minute install clock: waiting for the old tree can outlast it.
+        // Waiting for the old tree can outlast the readiness budget.
         launch: () =>
           exec(
             "/bin/zsh",
@@ -1090,6 +1092,8 @@ export async function main(args, {
         onWaiting: async () => {
           await phase("recovery_waiting", {
             swapped,
+            readyBudgetS,
+            boot: await readBootPhase(NodePath.join(data, "logs/boot.ndjson"), oldBootId),
             message: "Keeping install heartbeat until Robob is healthy. Repair or complete a compatible rollback from another Terminal; keep this installer running.",
             holdBy: hold?.by,
             holdPid: hold?.pid,

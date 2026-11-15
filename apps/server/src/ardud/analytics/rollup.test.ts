@@ -15,6 +15,79 @@ const event = (input: Partial<AnalyticsEvent> = {}): AnalyticsEvent => ({
 });
 
 describe("analytics rollups", () => {
+  it("groups control routes by UTC hour and method, retaining statuses and deadline counts", () => {
+    const target = makeAccumulator();
+    const sample = (durationMs: number, status: number, hour = "12", method = "GET") =>
+      event({
+        kind: "rpc.request",
+        route: "/api/ardud/control/threads/:threadId",
+        ts: `2026-11-13T${hour}:00:00.000Z`,
+        durationMs,
+        props: {
+          method: "control.thread",
+          httpRoute: "/api/ardud/control/threads/:threadId",
+          httpMethod: method,
+          status,
+          waitMs: 4,
+        },
+      });
+    accumulate(target, sample(10, 200));
+    accumulate(target, sample(15000, 503));
+    accumulate(target, sample(30, 200, "13"));
+    accumulate(target, sample(40, 409, "12", "PATCH"));
+    accumulate(target, { ...sample(50, 200, "13"), startedAt: "2026-11-13T12:59:59.999Z" });
+    accumulate(
+      target,
+      event({
+        kind: "rpc.request",
+        route: "control.thread",
+        durationMs: 999,
+        props: { method: "control.thread" },
+      }),
+    );
+    const rows = finishRollup(target, "2026-11-13", ts).controlRoutes!;
+    assert.equal(rows.length, 3);
+    assert.deepInclude(
+      rows.find((row) => row.hour.endsWith("12") && row.method === "GET"),
+      {
+        count: 3,
+        p50Ms: 50,
+        p95Ms: 15000,
+        maxMs: 15000,
+        statuses: { "200": 2, "503": 1 },
+        totalWaitMs: 12,
+        deadlineExceeded: 1,
+      },
+    );
+    assert.equal(rows.find((row) => row.hour.endsWith("13"))!.p95Ms, 30);
+    assert.equal(rows.find((row) => row.method === "PATCH")!.p95Ms, 40);
+  });
+
+  it("bounds control route cardinality without dropping overflow durations", () => {
+    const target = makeAccumulator();
+    for (let i = 0; i < 4100; i++)
+      accumulate(
+        target,
+        event({
+          kind: "rpc.request",
+          route: `/api/ardud/control/route-${i}`,
+          durationMs: i,
+          props: {
+            httpMethod: "GET",
+            httpRoute: `/api/ardud/control/route-${i}`,
+            method: "control.test",
+            status: 200,
+          },
+        }),
+      );
+    const rows = finishRollup(target, "2026-11-13", ts).controlRoutes!;
+    assert.equal(rows.length, 4097);
+    assert.equal(
+      rows.reduce((sum, row) => sum + row.count, 0),
+      4100,
+    );
+    assert.equal(rows.find((row) => row.route === "__other__")!.maxMs, 4099);
+  });
   it("counts actual children separately from operations by provider, board and launch hour beyond the sample limit", () => {
     const target = makeAccumulator();
     for (let i = 0; i < 600; i++)
@@ -765,4 +838,40 @@ it("preserves all 25 groups until overflow requires an other row", () => {
     overflow.find((row) => row.span === "other")!,
     { count: 2, totalWaitMs: 5, p95Ms: 99, maxMs: 99 },
   );
+});
+
+it("#1490 counts evaluator starts by origin without treating steers and queued inputs as starts", () => {
+  const target = makeAccumulator();
+  for (const outcome of ["started", "reused", "merged", "queued_spawn_cap"] as const)
+    accumulate(
+      target,
+      event({
+        kind: "kanban.evaluator",
+        boardId: "board-offbox",
+        purposeKind: "discussion",
+        trigger: "discussion_post",
+        outcome,
+      }),
+    );
+  accumulate(
+    target,
+    event({
+      kind: "kanban.evaluator",
+      boardId: "board-offbox",
+      purposeKind: "request",
+      trigger: "report_bug",
+      outcome: "started",
+      reuseMissReason: "no_card_reuse_scope",
+    }),
+  );
+  const result = finishRollup(target, "2026-11-13", ts);
+  assert.deepEqual(result.evaluatorStartsByTrigger, [
+    { boardId: "board-offbox", trigger: "discussion_post", count: 1 },
+    { boardId: "board-offbox", trigger: "report_bug", count: 1 },
+  ]);
+  assert.equal(
+    result.evaluatorOutcomes!.reduce((n, row) => n + row.count, 0),
+    5,
+  );
+  assert.deepEqual(result.errorCounts, {});
 });

@@ -69,13 +69,23 @@ test("inbound latency sweep leaves other chats alone", async () => {
   expect(h.backend.prompts).toEqual([]); expect(h.states()).toEqual(["pending"]);
 });
 
-test("batch admission logs original receipt latency and later execution failure keeps all members done", async () => {
+test.each(["failed", "interrupted", "succeeded"] as const)("batch admission retains latency receipts and the turn's %s outcome after recovery", async outcome => {
   const h = setup(); for (const [i, id] of ["a", "b", "c"].entries()) h.input(id, 2000 - i * 500);
   await h.router.tick(); expect(h.states()).toEqual(["done", "done", "done"]);
   expect(h.logs.filter(l => l.startsWith("inbound-latency"))).toEqual(["a", "b", "c"].map((id, i) =>
     `inbound-latency id=${id} receivedAt=${new Date(now - 2000 + i * 500).toISOString()} deliveredAt=${new Date(now).toISOString()} ms=${2000 - i * 500}`));
-  h.backend.records.push({ id: "failure", type: "idle", outcome: "failed", firstTurnFailure: true, time: { created: now } });
-  await h.router.tick(); expect(h.states()).toEqual(["done", "done", "done"]);
+  h.backend.records.push({ id: "terminal", type: "idle", outcome, firstTurnFailure: outcome === "failed", time: { created: now } });
+  await h.router.tick();
+  const expected = outcome === "succeeded" ? "done" : "failed";
+  expect(h.states()).toEqual([expected, expected, expected]);
+  const failures = ["a", "b", "c"].map(id => h.store.inboundFailure(id));
+  if (outcome !== "succeeded") for (const failure of failures) expect(failure).toMatchObject({ stage: "execution", threadId: "ses_1" });
+  setSystemTime(now + 120_000);
+  await h.router.checkInboundLatency();
+  await h.router.checkFailedInbound();
+  expect(h.states()).toEqual([expected, expected, expected]);
+  expect(["a", "b", "c"].map(id => h.store.inboundFailure(id))).toEqual(failures);
+  expect(h.backend.prompts).toEqual([hash("a")]);
   expect(h.logs.filter(l => l.startsWith("inbound-latency"))).toHaveLength(3);
 });
 
@@ -109,7 +119,20 @@ test("admitted critical wake retains #932's alert without a stuck-wake duplicate
   await h.router.tick();
   setSystemTime(now + 120_000); await h.router.checkFailedInbound();
   setSystemTime(now + 21 * 60_000); await h.router.checkInboundLatency();
-  expect(h.states()).toEqual(["done"]); expect(h.alerts).toEqual(["bridge-failed:wake:critical"]);
+  expect(h.states()).toEqual(["failed"]); expect(h.alerts).toEqual(["bridge-failed:wake:critical"]);
+});
+
+test("latency receipt repair preserves an already failed batch member and its reason", async () => {
+  const h = setup(); h.input("leader"); h.input("member");
+  h.store.set("batch:leader", { batchIds: ["leader", "member"] });
+  h.store.set("batch-phase:leader", "accepted");
+  h.store.updateInbound("leader", "processing");
+  const failure = { stage: "execution", message: "provider failed", threadId: "ses_1", at: now };
+  h.store.updateInbound("member", "failed", undefined, failure);
+  await h.router.checkInboundLatency();
+  expect(h.states()).toEqual(["done", "failed"]);
+  expect(h.store.inboundFailure("member")).toEqual(failure);
+  expect(h.backend.prompts).toEqual([]);
 });
 
 test("three unaccepted wake members return to pending together on delivery failure", async () => {

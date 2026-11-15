@@ -622,6 +622,8 @@ export interface StandingReleaseContext {
   readonly boardId: string;
   readonly at: string;
   readonly note: string | null;
+  readonly releasedAt?: string | undefined;
+  readonly boardNames?: ReadonlyMap<string, string> | undefined;
 }
 
 export const criticalReleaseReason = (note: string | null): string | null => {
@@ -632,10 +634,13 @@ export const criticalReleaseReason = (note: string | null): string | null => {
 
 export const releaseWindow = (
   standing: Pick<StandingReleaseContext, "approvals" | "ledger" | "boardId" | "at">,
+  service?: string,
 ) => {
   const approval = standing.approvals.find((entry) => entry.revokedAt === null);
   const last = standing.ledger
-    .filter((entry) => entry.boardId === standing.boardId)
+    .filter((entry) =>
+      service === undefined ? entry.boardId === standing.boardId : entry.service === service,
+    )
     .toSorted((a, b) => a.at.localeCompare(b.at))
     .at(-1);
   if (!approval || !last) return null;
@@ -660,7 +665,9 @@ export const approvalProblem = (
   const cleared =
     gate === "deploy" && !subtask.ownerOnly && approvals.some((entry) => entry.revokedAt === null);
   const window =
-    cleared && subtask.interrupting && context && intent === "do" ? releaseWindow(context) : null;
+    cleared && subtask.interrupting && context && !context.releasedAt && intent === "do"
+      ? releaseWindow(context, subtask.service)
+      : null;
   if (cleared && (!window || criticalReleaseReason(context?.note ?? null))) return null;
   const standingReason =
     gate !== "deploy"
@@ -675,8 +682,21 @@ export const approvalProblem = (
       const answer = ask.answer;
       if (!ask.closedAt || !answer || answer.at < since) return [];
       if (answer.verdict !== "dropped") {
-        if (answer.by._tag !== "owner" || (ask.revisedAt ?? ask.at) < since) return [];
+        // Closing clears handedAt; direct-to-evaluator asks retain their `to` instead.
+        const handedSkip =
+          intent === "skip" &&
+          answer.verdict === "handed" &&
+          answer.by._tag === "evaluator" &&
+          ask.to !== "evaluator";
+        if ((answer.by._tag !== "owner" && !handedSkip) || (ask.revisedAt ?? ask.at) < since)
+          return [];
         if (ask.draft) return [];
+        if (handedSkip) {
+          const wording = `${askWording(ask)} ${answer.text ?? ""} ${answer.note ?? ""}`;
+          return new Set(wording.match(/\bs\d+\b/g) ?? []).has(subtask.id)
+            ? [{ ask, refusalOnly: false }]
+            : [];
+        }
       }
       const scoped = ask.options?.some((option) => optionScopeIds(card, option) !== undefined);
       const others =
@@ -765,12 +785,21 @@ export const approvalProblem = (
     ? `${unnamedApproval.id} was approved but doesn't name ${subtask.id}; ask again naming the subtask id (e.g. "Approve ${subtask.id}")`
     : `no owner answer on a ${gate} ask since ${since}; ask with card_ask naming ${subtask.id} (e.g. "Approve ${subtask.id}")`;
   if (intent === "skip") {
-    if (answer && answer.verdict !== "dropped" && answer.by._tag === "owner") return null;
+    if (
+      answer &&
+      answer.verdict !== "dropped" &&
+      (answer.by._tag === "owner" || answer.verdict === "handed")
+    )
+      return null;
     const reason =
       answer?.verdict === "dropped"
         ? `the latest decision, ${latest!.id}, was dropped (a dropped ask is not approval)`
         : `${noDecisionReason}; no owner answer on a ${gate} ask since ${since}; name the subtask id (e.g. s7) in the ask or set approves: [${subtask.id}] on the go option`;
-    return `card #${card.number} subtask ${subtask.id} (${gate}: ${subtask.text}) needs Abdullah's answer before it can be skipped: ${reason}${standingReason}${clearGuidance}`.replace(
+    const handedGuidance =
+      answer?.verdict !== "dropped" && card.asks.some((ask) => ask.answer?.verdict === "handed")
+        ? "; a handed answer must name the subtask id and come from an ask the owner handed to the evaluator"
+        : "";
+    return `card #${card.number} subtask ${subtask.id} (${gate}: ${subtask.text}) needs Abdullah's answer before it can be skipped: ${reason}${standingReason}${clearGuidance}${handedGuidance}`.replace(
       /[\r\n]+/g,
       " ",
     );
@@ -787,7 +816,16 @@ export const approvalProblem = (
     return null;
   if (window) {
     const time = (at: string) => `${at.slice(11, 16)}Z`;
-    return `card #${card.number} ${subtask.id} (interrupting) is inside the ${window.hours} h release window: last release #${window.last.cardNumber} at ${time(window.last.at)}, next window ${time(window.next)}; write "critical: <reason>" in the done note to override`;
+    const service = subtask.service;
+    const source =
+      window.last.boardId === context?.boardId
+        ? ""
+        : `${context?.boardNames?.get(window.last.boardId) ?? window.last.boardId} `;
+    const guidance =
+      service === undefined
+        ? `; set service on ${subtask.id} (card_edit) so only releases of the same service count`
+        : "";
+    return `card #${card.number} ${subtask.id} (interrupting${service ? `, ${service}` : ""}) is inside the ${window.hours} h release window: last ${service ? `${service} ` : ""}release ${source}#${window.last.cardNumber} at ${time(window.last.at)}, next window ${time(window.next)}; write "critical: <reason>" in the done note to override${guidance}`;
   }
   let reason: string;
   if (!latest || !answer) {
@@ -828,6 +866,16 @@ export const approvalProblem = (
 export const MAX_SUBTASKS = 30;
 export const MAX_TEXT = 500;
 
+// Only complete generic instructions have unambiguous sentence punctuation; arguments stay literal.
+const approvalProse =
+  /^(?:(?:deploy|install) the (?:build|release)|restart the (?:helper|service|server)|pay the invoice|rotate the API key)[.!;:]*$/;
+
+const approvalText = (text: string) => {
+  const normalized = text.trim().replace(/\s+/g, " ");
+  const prose = normalized.replace(/^\w+/, (verb) => verb.toLowerCase());
+  return approvalProse.test(prose) ? prose.replace(/[.!;:]+$/, "") : normalized;
+};
+
 export interface SubtaskInput {
   /** An existing id alone keeps the subtask unchanged; leave out for a new one. */
   readonly id?: string | undefined;
@@ -839,6 +887,7 @@ export interface SubtaskInput {
   readonly clearGate?: string | undefined;
   readonly ownerOnly?: boolean | undefined;
   readonly interrupting?: boolean | undefined;
+  readonly service?: string | null | undefined;
   /** For a script's subtask: the name of the board script that does it. Absent: any script on the card's board. */
   readonly script?: string | undefined;
 }
@@ -882,7 +931,7 @@ const idNumber = (id: string) => Number.parseInt(id.replace(/^s/, ""), 10) || 0;
  * Replaces a card's plan with `inputs`. An id alone keeps that subtask;
  * omitted text, owner and step on open ids keep their stored values. New
  * entries need text and owner and get the next id. Listed done and skipped
- * subtasks stay unchanged, and omitted ones stay: what happened isn't rewritten.
+ * subtasks keep their history (but may clear a guessed gate), and omitted ones stay.
  * `seq` is the card's counter of ids ever handed out, so an open subtask dropped
  * from the plan never has its id reused by a later entry.
  */
@@ -903,9 +952,13 @@ export function planSubtasks(
     known?: KanbanSubtask,
   ) => {
     const previousGate = known && gateOf(known, guessedGates);
+    const inferredGate = inferGate(text);
+    // A sticky guess may differ from the wording that was cleared.
     const keepClear =
       known?.gateCleared !== undefined &&
-      text === known.text &&
+      (inferredGate === undefined ||
+        inferredGate === known.gateCleared.gate ||
+        inferredGate === inferGate(known.text)) &&
       input.gate == null &&
       input.ownerOnly !== true &&
       input.interrupting !== true;
@@ -930,6 +983,54 @@ export function planSubtasks(
             ? (known?.gateSource ?? ("guessed" as const))
             : ("guessed" as const);
     return { gate, gateSource, previousGate, keepClear };
+  };
+  const planClear = (
+    known: KanbanSubtask,
+    reason: string,
+    owner: KanbanSubtask["owner"],
+    text: string,
+    ownerOnly: boolean | undefined,
+    interrupting: boolean | undefined,
+    gate: KanbanSubtask["gate"],
+  ):
+    | { readonly ok: true; readonly gateCleared: KanbanSubtask["gateCleared"] }
+    | Extract<SubtaskPlan, { ok: false }> => {
+    if (
+      owner === "work" ||
+      owner === "review" ||
+      known.owner === "work" ||
+      known.owner === "review"
+    )
+      return {
+        ok: false,
+        code: "denied",
+        reason: `subtask ${known.id} must be owned by the evaluator or a script to clear a guessed gate`,
+      };
+    if (
+      gate === undefined ||
+      (gateOf(known, guessedGates) === undefined &&
+        known.gate === undefined &&
+        known.gateCleared === undefined)
+    ) {
+      return known.gateCleared
+        ? { ok: true, gateCleared: { ...known.gateCleared, text } }
+        : { ok: false, reason: `subtask ${known.id} has no gate to clear` };
+    }
+    // Rewording in the same edit cannot turn a deliberate gate into a guessed one.
+    if (
+      known.gateSource === "set" ||
+      known.ownerOnly ||
+      known.interrupting ||
+      ownerOnly ||
+      interrupting
+    )
+      return {
+        ok: false,
+        code: "denied",
+        reason: `subtask ${known.id} has a ${gate} gate set on purpose; only Abdullah's answer clears it (card_ask naming ${known.id})`,
+      };
+    if (!actor || !at) return { ok: false, reason: "clearGate needs the clearing actor and time" };
+    return { ok: true, gateCleared: { gate, reason, by: actor, at, text } };
   };
   const byId = new Map(existing.map((subtask) => [subtask.id, subtask]));
   // Cards saved before the counter existed start from the highest id still on them.
@@ -956,6 +1057,22 @@ export function planSubtasks(
         };
       if (listed.has(id)) return { ok: false, reason: `subtask ${id} is listed twice` };
       listed.add(id);
+      if (known.state !== "open" && reason !== undefined) {
+        const clear = planClear(
+          known,
+          reason,
+          known.owner,
+          known.text,
+          known.ownerOnly,
+          known.interrupting,
+          gateOf(known, guessedGates),
+        );
+        if (!clear.ok) return clear;
+        const { gate: _gate, gateSource: _source, ...rest } = known;
+        planned.push({ ...rest, gateCleared: clear.gateCleared });
+        step = known.step;
+        continue;
+      }
       // An id alone also preserves script bindings and approval timestamps.
       if (
         known.state !== "open" ||
@@ -966,6 +1083,7 @@ export function planSubtasks(
           input.clearGate === undefined &&
           input.ownerOnly === undefined &&
           input.interrupting === undefined &&
+          input.service === undefined &&
           input.script === undefined)
       ) {
         planned.push(known);
@@ -990,6 +1108,17 @@ export function planSubtasks(
       };
     }
     const interrupting = input.interrupting ?? known?.interrupting;
+    const service =
+      input.service === null ? undefined : (input.service ?? known?.service)?.trim().toLowerCase();
+    if (service !== undefined && !/^[a-z0-9._-]{1,64}$/.test(service)) {
+      return {
+        ok: false,
+        reason: "service must be 1–64 characters using a-z, 0-9, dot, underscore or hyphen",
+      };
+    }
+    if (input.service != null && !interrupting) {
+      return { ok: false, reason: "service requires interrupting: true" };
+    }
     if (interrupting && (owner === "work" || owner === "review")) {
       return {
         ok: false,
@@ -1023,38 +1152,27 @@ export function planSubtasks(
     if (known) {
       const {
         script: _old,
+        service: _oldService,
         gate: _oldGate,
         gateSource: _oldSource,
         gateCleared: _oldClear,
         ...rest
       } = known;
-      // Rewording in the same edit cannot turn a deliberate gate into a guessed one.
-      const clearing =
-        reason !== undefined && owner !== "work" && owner !== "review"
-          ? (previousGate ?? gate)
-          : undefined;
-      if (
-        clearing &&
-        (known.gateSource === "set" ||
-          known.ownerOnly ||
-          known.interrupting ||
-          ownerOnly ||
-          interrupting)
-      ) {
-        return {
-          ok: false,
-          code: "denied",
-          reason: `subtask ${known.id} has a ${clearing} gate set on purpose; only Abdullah's answer clears it (card_ask naming ${known.id})`,
-        };
-      }
-      if (clearing && (!actor || !at))
-        return { ok: false, reason: "clearGate needs the clearing actor and time" };
+      const clear =
+        reason === undefined
+          ? undefined
+          : planClear(known, reason, owner, text, ownerOnly, interrupting, previousGate ?? gate);
+      if (clear && !clear.ok) return clear;
+      const clearing = reason !== undefined;
       const gateCleared =
-        clearing && actor && at
-          ? { gate: clearing, reason: reason!, by: actor, at, text }
-          : keepClear
-            ? known.gateCleared
-            : undefined;
+        clear?.gateCleared ?? (keepClear ? { ...known.gateCleared!, text } : undefined);
+      // Cosmetic edits keep the approval's time bound, including its absence on legacy plans.
+      const approvalChanged =
+        gate !== previousGate ||
+        (interrupting ? service : undefined) !== known.service ||
+        (input.gate != null && gateSource === "set" && known.gateSource !== "set") ||
+        script !== known.script ||
+        approvalText(text) !== approvalText(known.text);
       planned.push({
         ...rest,
         step,
@@ -1062,18 +1180,10 @@ export function planSubtasks(
         owner,
         ...(ownerOnly === undefined ? {} : { ownerOnly }),
         ...(interrupting === undefined ? {} : { interrupting }),
+        ...(interrupting && service !== undefined ? { service } : {}),
         ...(gate === undefined || clearing ? {} : { gate, gateSource }),
         ...(gateCleared ? { gateCleared } : {}),
-        ...((text !== known.text ||
-          script !== known.script ||
-          ownerOnly !== known.ownerOnly ||
-          interrupting !== known.interrupting ||
-          gate !== previousGate ||
-          !previousGate) &&
-        gate &&
-        at
-          ? { createdAt: at }
-          : {}),
+        ...(approvalChanged && gate && !clearing && at ? { createdAt: at } : {}),
         ...(script ? { script } : {}),
       });
     } else {
@@ -1085,6 +1195,7 @@ export function planSubtasks(
         owner,
         ...(ownerOnly === undefined ? {} : { ownerOnly }),
         ...(interrupting === undefined ? {} : { interrupting }),
+        ...(interrupting && service !== undefined ? { service } : {}),
         ...(gate === undefined ? {} : { gate, gateSource }),
         ...(at ? { createdAt: at } : {}),
         ...(script ? { script } : {}),

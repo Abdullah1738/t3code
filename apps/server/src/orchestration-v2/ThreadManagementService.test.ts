@@ -45,6 +45,7 @@ import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import { McpCall } from "../ardud/analytics/McpCall.ts";
 import { idleThreadProjection, liveThreadShell } from "../mcp/McpToolAccess.testkit.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import { DispatchModeLimit, type DispatchModeRefusal } from "./DispatchModeLimit.ts";
@@ -869,6 +870,7 @@ const migrationHarness = (input: {
   readonly sourceEnabled?: boolean;
   readonly runs?: ReadonlyArray<{ readonly status: OrchestrationV2Run["status"] }>;
   readonly failSelection?: boolean;
+  readonly failPreflightAfterSelection?: boolean;
   readonly failMessageOnce?: boolean;
   readonly pendingRequest?: boolean;
   readonly backgroundTask?: boolean;
@@ -891,31 +893,38 @@ const migrationHarness = (input: {
     Layer.provide(
       Layer.mock(Orchestrator.OrchestratorV2)({
         getThreadRecords: () =>
-          Effect.sync(
-            () =>
-              ({
-                thread: {
-                  id: migrationThreadId,
-                  projectId: migrationProjectId,
-                  deletedAt: null,
-                  archivedAt: null,
-                  lineage: { relationshipToParent: "root" },
-                  creationSource: "web",
-                  modelSelection: stored,
-                  activeProviderThreadId: input.backgroundTask ? "active" : null,
-                },
-                runs: input.runs ?? [],
-                runtimeRequests: input.pendingRequest ? [{ status: "pending" }] : [],
-                providerThreads: input.backgroundTask
-                  ? [
-                      {
-                        id: "active",
-                        pendingBackgroundTasks: [{ taskId: "task:live", kind: "subagent" }],
-                      },
-                    ]
-                  : [],
-                subagents: [],
-              }) as unknown as OrchestrationV2ThreadProjection,
+          Effect.suspend(() =>
+            input.failPreflightAfterSelection &&
+            calls.some((command) => command.type === "thread.model-selection.set")
+              ? Effect.fail(
+                  new Orchestrator.OrchestratorProjectionError({
+                    threadId: migrationThreadId,
+                    cause: new Error("Reader lane unavailable (foreground)"),
+                  }),
+                )
+              : Effect.succeed({
+                  thread: {
+                    id: migrationThreadId,
+                    projectId: migrationProjectId,
+                    deletedAt: null,
+                    archivedAt: null,
+                    lineage: { relationshipToParent: "root" },
+                    creationSource: "web",
+                    modelSelection: stored,
+                    activeProviderThreadId: input.backgroundTask ? "active" : null,
+                  },
+                  runs: input.runs ?? [],
+                  runtimeRequests: input.pendingRequest ? [{ status: "pending" }] : [],
+                  providerThreads: input.backgroundTask
+                    ? [
+                        {
+                          id: "active",
+                          pendingBackgroundTasks: [{ taskId: "task:live", kind: "subagent" }],
+                        },
+                      ]
+                    : [],
+                  subagents: [],
+                } as unknown as OrchestrationV2ThreadProjection),
           ),
         dispatch: (command) =>
           Effect.gen(function* () {
@@ -2210,3 +2219,25 @@ it.effect("reports a delegation queued behind a receipt-read fence as pending", 
     }).pipe(Effect.provide(layerTest));
   }),
 );
+
+it.effect("preserves a saved selection when the final foreground pre-check fails", () => {
+  const harness = migrationHarness({ mode: "apply", failPreflightAfterSelection: true });
+  return Effect.gen(function* () {
+    const threads = yield* ThreadManagementService.ThreadManagementService;
+    const call: McpCall["Service"] = {
+      callerResolved: true,
+      callerResolveMs: 0,
+      readerLane: "background",
+      phase: "handler",
+      saved: "unknown",
+    };
+    const error = yield* threads
+      .dispatch(migrationMessage("preflight-after-selection"))
+      .pipe(Effect.provideService(McpCall, call), Effect.flip);
+    expect(harness.getStored()).toEqual(mappedSelection);
+    expect(harness.calls.map((command) => command.type)).toEqual(["thread.model-selection.set"]);
+    expect(error.message).toContain("Preflight changes were saved");
+    expect(error.message).not.toContain("Nothing was saved");
+    expect(call.saved).toBe("unknown");
+  }).pipe(Effect.provide(harness.layerTest));
+});

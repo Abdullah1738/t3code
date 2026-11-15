@@ -6,6 +6,7 @@ import {
   type KanbanActor,
   type KanbanCard,
   type KanbanOwnerAsk,
+  type KanbanStandingApproval,
   type KanbanSubtask,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -19,7 +20,7 @@ import {
   isNegativeOption,
   secretKindApprovalWarning,
 } from "./subtasks.ts";
-import { makeFake, owner, testLayer, toyBoard } from "./askFlows.testkit.ts";
+import { makeFake, owner, testLayer, toyBoard, workingCard } from "./askFlows.testkit.ts";
 
 const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("asker") };
 const worker: KanbanActor = { _tag: "thread", threadId: ThreadId.make("worker") };
@@ -1341,6 +1342,25 @@ it.effect.each([owner, evaluator])("$_tag clears guessed gates with an audit tra
         actor,
       );
       assert.lengthOf(retry.asks, edited.asks.length);
+      const beforeReword = (yield* kanban.card(card.id)).card;
+      const rewordedText = "Tell both reporters once installed";
+      const reworded = yield* kanban.editCard(
+        card.id,
+        { subtasks: [{ id: "s1", text: rewordedText }] },
+        actor,
+      );
+      assert.isUndefined(reworded.subtasks[0]!.gate);
+      assert.deepStrictEqual(reworded.subtasks[0]!.gateCleared, {
+        ...edited.subtasks[0]!.gateCleared,
+        text: rewordedText,
+      });
+      assert.deepStrictEqual(reworded.asks, beforeReword.asks);
+      assert.lengthOf(
+        (yield* kanban.card(card.id)).events.filter((event) =>
+          event.body?.startsWith("Cleared guessed"),
+        ),
+        1,
+      );
       const dropped = yield* kanban.editCard(card.id, { subtasks: [] }, evaluator);
       assert.lengthOf(dropped.subtasks, 0);
       // Exercise completion independently of removal on the same saved clear.
@@ -1356,6 +1376,224 @@ it.effect.each([owner, evaluator])("$_tag clears guessed gates with an audit tra
       assert.strictEqual(done.subtasks[0]!.state, "done");
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
+);
+
+it.effect.each(
+  (["done", "skipped"] as const).flatMap((state) =>
+    (["evaluator", "script"] as const).map((taskOwner) => ({ state, taskOwner })),
+  ),
+)("clearing a $state $taskOwner gate keeps history and emits one notice", ({ state, taskOwner }) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard();
+      const store = yield* KanbanStore.KanbanStore;
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Finished guessed gate",
+          prompt: "Work",
+          subtasks: [{ text: "Tell the reporter once installed", owner: taskOwner }],
+        },
+        owner,
+      );
+      const finished: KanbanSubtask = {
+        ...card.subtasks[0]!,
+        state,
+        note: "Reporter already told",
+        doneBy: evaluator,
+        doneAt: card.updatedAt,
+        ...(taskOwner === "script" ? { script: "readback" } : {}),
+      };
+      yield* store.putCard({ ...card, subtasks: [finished] });
+      const patch = {
+        subtasks: [{ id: "s1", clearGate: "Only reports the result; no live operation" }],
+      };
+      yield* TestClock.adjust("1 second");
+      const edited = yield* kanban.editCard(card.id, patch, evaluator);
+      const { gate: _gate, gateSource: _source, ...history } = finished;
+      assert.deepStrictEqual(edited.subtasks[0], {
+        ...history,
+        gateCleared: {
+          gate: "deploy",
+          reason: patch.subtasks[0]!.clearGate,
+          by: evaluator,
+          at: edited.updatedAt,
+          text: finished.text,
+        },
+      });
+      assert.lengthOf(
+        edited.asks.filter((ask) => ask.batchKey === "gate-cleared"),
+        1,
+      );
+      const beforeRetry = (yield* kanban.card(card.id)).card;
+      yield* TestClock.adjust("1 second");
+      const retry = yield* kanban.editCard(card.id, patch, evaluator);
+      assert.deepStrictEqual(retry.subtasks, edited.subtasks);
+      assert.deepStrictEqual(retry.asks, beforeRetry.asks);
+      assert.lengthOf(
+        (yield* kanban.card(card.id)).events.filter((event) =>
+          event.body?.startsWith("Cleared guessed"),
+        ),
+        1,
+      );
+      const verified = yield* kanban.moveCard(card.id, "verified", "evaluator", evaluator);
+      assert.strictEqual(verified.stage, "verified");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("sticky gate clears survive resaves, same-inference rewords and clear retries", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard();
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Sticky guess",
+          prompt: "Work",
+          subtasks: [{ text: "Restart the test helper", owner: "evaluator" }],
+        },
+        owner,
+      );
+      const text = "Pay attention to the test result";
+      const sticky = yield* kanban.editCard(card.id, { subtasks: [{ id: "s1", text }] }, evaluator);
+      assert.strictEqual(sticky.subtasks[0]!.gate, "deploy");
+      assert.strictEqual(inferGate(text), "money");
+      const cleared = yield* kanban.editCard(
+        card.id,
+        { subtasks: [{ id: "s1", clearGate: "This only discusses the test result" }] },
+        evaluator,
+      );
+      const reword = "Pay close attention to the test result";
+      yield* TestClock.adjust("1 second");
+      for (const input of [
+        { id: "s1", text, gate: null },
+        { id: "s1", clearGate: "This remains a fixture, no live operation" },
+        { id: "s1", text: reword },
+      ]) {
+        const saved = yield* kanban.editCard(card.id, { subtasks: [input] }, evaluator);
+        assert.isUndefined(saved.subtasks[0]!.gate);
+        assert.deepStrictEqual(saved.subtasks[0]!.gateCleared, {
+          ...cleared.subtasks[0]!.gateCleared,
+          text: saved.subtasks[0]!.text,
+        });
+        assert.lengthOf(saved.asks, 1);
+        assert.strictEqual(saved.asks[0]!.id, cleared.asks[0]!.id);
+      }
+      assert.lengthOf(
+        (yield* kanban.card(card.id)).events.filter((event) =>
+          event.body?.startsWith("Cleared guessed"),
+        ),
+        1,
+      );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect.each(["open", "done", "skipped"] as const)(
+  "a fresh %s clear supersedes only open unanswered notices for the same subtask",
+  (state) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard();
+        const store = yield* KanbanStore.KanbanStore;
+        const card = yield* kanban.createCard(
+          board.id,
+          {
+            title: "Repeated clears",
+            prompt: "Work",
+            subtasks: [
+              { text: "Tell the first reporter once installed", owner: "evaluator" },
+              { text: "Tell the other reporter once installed", owner: "evaluator" },
+            ],
+          },
+          owner,
+        );
+        const cleared = yield* kanban.editCard(
+          card.id,
+          {
+            subtasks: [
+              { id: "s1", clearGate: "Only tells the first reporter the result" },
+              { id: "s2", clearGate: "Only tells the other reporter the result" },
+            ],
+          },
+          evaluator,
+        );
+        const first = cleared.asks[0]!;
+        const preserved = [
+          cleared.asks[1]!,
+          { ...first, id: "q4", title: `Gate cleared on #${card.number} s10` },
+          { ...first, id: "q5", kind: "custom" },
+          { ...first, id: "q6", batchKey: "another-notice" },
+          { ...first, id: "q7", closedAt: cleared.updatedAt },
+          {
+            ...first,
+            id: "q8",
+            answer: { verdict: "approved" as const, by: owner, at: cleared.updatedAt },
+          },
+        ];
+        // Include duplicates left by older builds and lookalike asks that must survive.
+        yield* store.putCard({
+          ...cleared,
+          asks: [first, preserved[0]!, { ...first, id: "q3" }, ...preserved.slice(1)],
+        });
+        yield* TestClock.adjust("1 second");
+        const regated = yield* kanban.editCard(
+          card.id,
+          { subtasks: [{ id: "s1", text: "Share the API key" }, { id: "s2" }] },
+          evaluator,
+        );
+        assert.strictEqual(regated.subtasks[0]!.gate, "secret");
+        assert.isUndefined(regated.subtasks[0]!.gateCleared);
+        yield* store.putCard({
+          ...regated,
+          subtasks: regated.subtasks.map((task) => (task.id === "s1" ? { ...task, state } : task)),
+        });
+        const recleared = yield* kanban.editCard(
+          card.id,
+          {
+            subtasks: [
+              { id: "s1", clearGate: "Only discusses the key in a test fixture" },
+              { id: "s2" },
+            ],
+          },
+          evaluator,
+        );
+        for (const id of ["q1", "q3"]) {
+          const superseded = recleared.asks.find((ask) => ask.id === id)!;
+          assert.strictEqual(superseded.closedAt, recleared.updatedAt);
+          assert.isUndefined(superseded.answer);
+        }
+        for (const ask of preserved)
+          assert.deepStrictEqual(
+            recleared.asks.find((entry) => entry.id === ask.id),
+            ask,
+          );
+        const feed = yield* kanban.askFeed({ boardId: board.id });
+        assert.deepStrictEqual(
+          feed.open
+            .filter(
+              (item) =>
+                item.cardId === card.id &&
+                item.ask.title === first.title &&
+                item.ask.batchKey === "gate-cleared" &&
+                item.ask.answer === undefined &&
+                item.kind === "notice",
+            )
+            .map((item) => item.ask.id),
+          ["q9"],
+        );
+        assert.lengthOf(
+          (yield* kanban.card(card.id)).events.filter((event) =>
+            event.body?.startsWith("Cleared guessed"),
+          ),
+          3,
+        );
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
 );
 
 it.effect(
@@ -1388,7 +1626,7 @@ it.effect(
         yield* TestClock.adjust("1 second");
         const regated = yield* kanban.editCard(
           card.id,
-          { subtasks: [{ id: "s1", text: "Restart Robob now" }] },
+          { subtasks: [{ id: "s1", text: "Pay for the service" }] },
           evaluator,
         );
         const ack = {
@@ -3255,6 +3493,303 @@ it("#4319: a later unnamed picked approval keeps the naming hint", () => {
     "q2 (approved later) doesn't name s1",
   );
 });
+
+const handedAsk = (overrides: Partial<KanbanOwnerAsk> = {}): KanbanOwnerAsk =>
+  relevanceAsk({
+    text: "Can I drop this copy?",
+    answer: {
+      verdict: "handed",
+      decision: "answered",
+      text: "Skip s5 and s6 here as passed on",
+      by: evaluator,
+      at: "2026-11-13T14:03:00.000Z",
+    },
+    ...overrides,
+  });
+
+it.each(["field", "label"] as const)(
+  "handed skip requires a textual id despite an option's %s scope",
+  (scope) => {
+    const base = handedAsk();
+    const ask = handedAsk({
+      options: [
+        {
+          id: "o1",
+          label: scope === "label" ? "Approve s5" : "Approve",
+          ...(scope === "field" ? { approves: ["s5"] } : {}),
+        },
+        { id: "o2", label: "Don't" },
+      ],
+      answer: { ...base.answer!, decision: "picked", optionIds: ["o1"], text: "Skip this copy" },
+    });
+    const card = relevanceCard([ask]);
+    assert.isNotNull(approvalProblem(card, relevanceSubtask, [], undefined, "skip"));
+    const named = { ...card, asks: [{ ...ask, answer: { ...ask.answer!, text: "Skip s5" } }] };
+    assert.isNull(approvalProblem(named, relevanceSubtask, [], undefined, "skip"));
+    assert.isNotNull(approvalProblem(named, relevanceSubtask));
+  },
+);
+
+it.each(["s5", "s6"])("a later scoped drop for %s preserves handed targeting", (id) => {
+  const ask = relevanceAsk({
+    id: "q5",
+    text: "Deploy this copy?",
+    options: [{ id: "o1", label: "Approve", approves: [id] }],
+    answer: { verdict: "dropped", by: evaluator, at: "2026-11-13T14:04:00.000Z" },
+  });
+  const card = relevanceCard([handedAsk(), ask]);
+  const problem = approvalProblem(card, relevanceSubtask, [], undefined, "skip");
+  if (id === "s5") assert.include(problem!, "the latest decision, q5, was dropped");
+  else assert.isNull(problem);
+});
+
+it.each([{ kind: "notice" as const }, { respond: { ack: true } }])(
+  "a handed notice or acknowledgement does not clear a skip: %j",
+  (fields) => {
+    assert.isNotNull(
+      approvalProblem(relevanceCard([handedAsk(fields)]), relevanceSubtask, [], undefined, "skip"),
+    );
+  },
+);
+
+it.each(
+  (["text", "title", "summary"] as const).flatMap((field) =>
+    ["s6", "s50"].flatMap((id) =>
+      (["do", "skip"] as const).map((intent) => ({ field, id, intent })),
+    ),
+  ),
+)("owner-only $intent stays refused for $id in $field", ({ field, id, intent }) => {
+  const subtask = { ...goChoiceSubtask, id: "s5", ownerOnly: true };
+  const ask = relevanceAsk({
+    text: field === "text" ? `Approve ${id}` : "Approve this change?",
+    ...(field === "title" ? { title: `Approve ${id}` } : {}),
+    ...(field === "summary" ? { action: { summary: `Approve ${id}` } } : {}),
+  });
+  const card = { ...relevanceCard([ask]), subtasks: [subtask] };
+  const problem = approvalProblem(card, subtask, [], undefined, intent)!;
+  assert.include(problem, "or set approves: [s5] on the go option");
+  assert.include(problem, "(marked owner-only)");
+});
+
+const standingDeployApproval: KanbanStandingApproval = {
+  id: "sa-deploy",
+  gate: "deploy",
+  quote: "Tool boards may release",
+  sourceThreadId: "owner-thread",
+  saidAt: "2026-11-13T13:00:00.000Z",
+  approvedAsk: { cardId: "card-1", askId: "q1" },
+  recordedAt: "2026-11-13T13:01:00.000Z",
+  recordedBy: "evaluator",
+  revokedAt: null,
+  revokedBy: null,
+  revokeReason: null,
+};
+
+it.each(
+  (
+    [
+      { gate: "deploy", standing: "absent", ownerOnly: false, independentlyApproved: false },
+      { gate: "deploy", standing: "active", ownerOnly: false, independentlyApproved: true },
+      { gate: "deploy", standing: "revoked", ownerOnly: false, independentlyApproved: false },
+      { gate: "deploy", standing: "active", ownerOnly: true, independentlyApproved: false },
+      { gate: "money", standing: "active", ownerOnly: false, independentlyApproved: false },
+      { gate: "secret", standing: "active", ownerOnly: false, independentlyApproved: false },
+    ] as const
+  ).flatMap((entry) => [false, true].map((named) => ({ ...entry, named }))),
+)(
+  "handed $gate id=$named with $standing standing approval (ownerOnly=$ownerOnly)",
+  ({ gate, standing, ownerOnly, independentlyApproved, named }) => {
+    const subtask = { ...relevanceSubtask, gate, ownerOnly };
+    const base = handedAsk();
+    const ask = handedAsk({
+      answer: { ...base.answer!, decision: "approved", text: named ? "Skip s5" : "Skip this copy" },
+    });
+    const card = { ...relevanceCard([ask]), subtasks: [subtask] };
+    const approvals =
+      standing === "absent"
+        ? []
+        : [
+            {
+              ...standingDeployApproval,
+              revokedAt: standing === "revoked" ? "2026-11-13T14:00:00.000Z" : null,
+            },
+          ];
+    const skip = approvalProblem(card, subtask, approvals, undefined, "skip");
+    assert.strictEqual(skip === null, named || independentlyApproved);
+    assert.strictEqual(approvalProblem(card, subtask, approvals) === null, independentlyApproved);
+    if (!named && !independentlyApproved) {
+      assert.include(skip!, "a handed answer must name the subtask id");
+      if (gate === "deploy") {
+        assert.include(
+          skip!,
+          ownerOnly ? "(marked owner-only)" : "(this board has no standing deploy approval)",
+        );
+      }
+    }
+  },
+);
+
+it.each(
+  (["deploy", "money", "secret"] as const).flatMap((gate) =>
+    (["text", "title", "summary", "answer", "note"] as const).map((field) => ({ gate, field })),
+  ),
+)("an owner-handed $field id permits skipping $gate, never doing it", ({ gate, field }) => {
+  const base = handedAsk();
+  const ask = handedAsk({
+    ...(field === "text" ? { text: "Skip s5" } : {}),
+    ...(field === "title" ? { title: "Skip s5" } : {}),
+    ...(field === "summary" ? { action: { summary: "Skip s5" } } : {}),
+    answer: {
+      ...base.answer!,
+      decision: "approved",
+      text: field === "answer" ? "Skip s5/s6" : "Passed on",
+      ...(field === "note" ? { note: "Skip deploy-gated s5/s6" } : {}),
+    },
+  });
+  const subtask = { ...relevanceSubtask, gate };
+  const card = { ...relevanceCard([ask]), subtasks: [subtask, { ...subtask, id: "s6" }] };
+  assert.isNull(approvalProblem(card, subtask, [], undefined, "skip"));
+  assert.isNotNull(approvalProblem(card, subtask, [], undefined, "do"));
+});
+
+it.each(["Skip it", "Skip s6", "Skip s50", "Skip xs5", "Skip s5x", "Skip s5_copy"])(
+  "a handed answer needs the exact id: %s",
+  (text) => {
+    const base = handedAsk();
+    const ask = handedAsk({
+      text: "Deploy this copy?",
+      answer: { ...base.answer!, text },
+    });
+    // Even a single matching gate must not infer the target for a handed answer.
+    const subtask = { ...relevanceSubtask, text: "Deploy", gate: "deploy" as const };
+    const card = { ...relevanceCard([ask]), subtasks: [subtask] };
+    const problem = approvalProblem(card, subtask, [], undefined, "skip")!;
+    assert.include(problem, "a handed answer must name the subtask id");
+  },
+);
+
+it.each([
+  { label: "asked directly to evaluator", ask: handedAsk({ to: "evaluator" }) },
+  {
+    label: "ordinary evaluator answer",
+    ask: handedAsk({ answer: { ...handedAsk().answer!, verdict: "answered" } }),
+  },
+  {
+    label: "thread answer",
+    ask: handedAsk({
+      answer: { ...handedAsk().answer!, by: { _tag: "thread", threadId: ThreadId.make("worker") } },
+    }),
+  },
+  { label: "old ask", ask: handedAsk({ at: "2026-11-13T13:59:00.000Z" }) },
+  {
+    label: "old answer",
+    ask: handedAsk({ answer: { ...handedAsk().answer!, at: "2026-11-13T13:59:00.000Z" } }),
+  },
+  { label: "open ask", ask: handedAsk({ closedAt: null }) },
+  { label: "draft ask", ask: handedAsk({ draft: { text: "Skip s5", format: "text" } }) },
+])("a $label does not authorize a skip", ({ ask }) => {
+  assert.isNotNull(approvalProblem(relevanceCard([ask]), relevanceSubtask, [], undefined, "skip"));
+});
+
+it.each([owner, evaluator])("a later $_tag drop blocks a handed skip", (dropper) => {
+  const card = relevanceCard([
+    relevanceAsk({
+      id: "q5",
+      answer: { verdict: "dropped", by: dropper, at: "2026-11-13T14:04:00.000Z" },
+    }),
+    handedAsk(),
+  ]);
+  assert.include(
+    approvalProblem(card, relevanceSubtask, [], undefined, "skip")!,
+    "the latest decision, q5, was dropped",
+  );
+});
+
+it.effect.each([true, false])(
+  "a persisted evaluator answer clears a skip only after an owner handoff: %s",
+  (ownerHanded) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, card, worker } = yield* workingCard();
+        yield* kanban.editCard(
+          card.id,
+          {
+            subtasks: [
+              { text: "Deploy copy", owner: "evaluator", gate: "deploy" },
+              { text: "Restart copy", owner: "evaluator", gate: "deploy" },
+            ],
+          },
+          owner,
+        );
+        yield* kanban.askOwner(
+          card.id,
+          {
+            question: "Can I drop this copy?",
+            blocking: false,
+            ...(ownerHanded ? {} : { to: "evaluator" }),
+          },
+          worker,
+          "cardThread",
+        );
+        if (ownerHanded) yield* kanban.handAsk(card.id, "q1", "hand", owner);
+        const [started] = yield* fake.evaluators;
+        const actor: KanbanActor = { _tag: "evaluator", threadId: started!.threadId };
+        const answered = yield* kanban.answerAsk(
+          card.id,
+          "q1",
+          {
+            verdict: "answered",
+            text: "Drop this copy; skip s1/s2 here as passed on",
+            revision: 0,
+          },
+          actor,
+        );
+        assert.strictEqual(answered.card.asks[0]?.answer?.verdict, "handed");
+        assert.isUndefined(answered.card.asks[0]?.handedAt);
+        const denied = yield* kanban
+          .markSubtask(card.id, "s1", "done", "Deploy", actor, "evaluator")
+          .pipe(Effect.flip);
+        assert.include(denied.detail, "needs Abdullah's approval");
+        const problem = approvalProblem(
+          answered.card,
+          answered.card.subtasks[0]!,
+          [],
+          undefined,
+          "skip",
+        );
+        if (ownerHanded) {
+          assert.isNull(problem);
+          for (const id of ["s1", "s2"]) {
+            const skipped = yield* kanban.markSubtask(
+              card.id,
+              id,
+              "skipped",
+              "Passed on to the other board",
+              actor,
+              "evaluator",
+            );
+            assert.strictEqual(skipped.subtasks.find((entry) => entry.id === id)?.state, "skipped");
+            assert.isUndefined(skipped.subtasks.find((entry) => entry.id === id)?.gateSkipped);
+          }
+        } else {
+          assert.include(problem!, "a handed answer must name the subtask id");
+          const skipped = yield* kanban.markSubtask(
+            card.id,
+            "s1",
+            "skipped",
+            "Passed on to the other board",
+            actor,
+            "evaluator",
+          );
+          assert.strictEqual(
+            skipped.subtasks[0]?.gateSkipped?.reason,
+            "Passed on to the other board",
+          );
+        }
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
 
 it.each(
   ["2026-11-13T14:02:00.000Z", "2026-11-13T14:04:00.000Z"].flatMap((at) =>

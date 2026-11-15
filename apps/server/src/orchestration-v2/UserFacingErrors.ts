@@ -128,6 +128,14 @@ function collectErrorMessages(value: unknown, seen: Set<unknown>): ReadonlyArray
   if (!Predicate.isObject(value)) {
     return message === undefined ? [] : [message];
   }
+  // The preflight knows no command was submitted; a nested SQL message loses
+  // the retry guarantee that callers need to keep the same request identity.
+  if (
+    value._tag === "OrchestratorDispatchError" &&
+    value.preflightReaderLane === "foreground" &&
+    message !== undefined
+  )
+    return [message];
 
   const nested = [
     ...collectErrorMessages(value.cause, seen),

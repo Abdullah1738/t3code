@@ -147,6 +147,7 @@ async function main(): Promise<void> {
   });
   const makeRouter = () => chatGuid ? new Router(store, backend, photon, {
     ...config, chatGuid, skillPath, alertSkillPath, alertSocketPath: telegramBridgeSocket,
+    medsFold: {},
     transcribe: input => transcribe(input), notifyFailure: notifyFailedInbound, log, recoverAttachment,
   }) : undefined;
   router = makeRouter();

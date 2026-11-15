@@ -15,6 +15,9 @@ import {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 
+import { COMPACT_READ_CHARS } from "../../compactRead.ts";
+export { COMPACT_READ_CHARS } from "../../compactRead.ts";
+
 import * as Retries from "./retries.ts";
 import * as Rules from "./rules.ts";
 import { waitEventOf } from "./waits.ts";
@@ -23,8 +26,6 @@ import { waitEventOf } from "./waits.ts";
 export const ACTIVITY_MAX_WINDOW_MS = 72 * 60 * 60 * 1000;
 /** The default window: the last day. */
 export const ACTIVITY_DEFAULT_WINDOW_MS = 24 * 60 * 60 * 1000;
-/** Characters one compact read stays under, well below the agents' tool output limit. */
-export const COMPACT_READ_CHARS = 50_000;
 /** Events card_get returns when no events page is asked for. */
 export const CARD_EVENTS_DEFAULT = 20;
 export const CARD_EVENTS_MAX = 200;
@@ -35,7 +36,7 @@ const LONG_OPEN_MS = 24 * 60 * 60 * 1000;
 /** Open asks older than this are listed. */
 const OLD_ASK_MS = 6 * 60 * 60 * 1000;
 /** Cards with at least this many evaluator wakes in the window are listed. */
-const EVALUATOR_WAKES_LISTED = 2;
+const EVALUATOR_STARTS_LISTED = 2;
 /** Rows per rollup list at most; lists shrink together until the rollup fits ROLLUP_CHARS. */
 const LIST_MAX = 150;
 const ROLLUP_CHARS = 55_000;
@@ -610,6 +611,14 @@ export const rollup = (input: RollupInput) => {
       });
   }
   idle.sort((left, right) => left.since.localeCompare(right.since));
+  const evaluatorOnly = input.cards
+    .filter(Rules.inReviewEvaluatorStepsOnly)
+    .map((card) => ({
+      card: card.number,
+      hours: hours(Math.max(0, time(until) - time(card.movedAt))),
+      lastWake: card.nudgedAt === null ? null : stamp(card.nudgedAt),
+    }))
+    .toSorted((left, right) => right.hours - left.hours || left.card - right.card);
   for (const [stage, entry] of Object.entries(stages)) {
     entry.hours = hours(entry.hours * HOUR);
     const list = (dwells.get(stage) ?? []).toSorted((left, right) => left - right);
@@ -742,18 +751,18 @@ export const rollup = (input: RollupInput) => {
   }
   restarts.sort((left, right) => right.threads - left.threads || left.card - right.card);
 
-  // Evaluator wakes: evaluator threads the board started for a card in the window.
-  const evaluatorWakes: Array<{ card: number; wakes: number }> = [];
-  let evaluatorWakeCount = 0;
+  // Counts card-linked starts; deliveries into existing evaluators have their own analytics.
+  const evaluatorStarts: Array<{ card: number; starts: number }> = [];
+  let evaluatorStartCount = 0;
   for (const [cardId, links] of threadsByCard) {
-    const wakes = links.filter(
+    const starts = links.filter(
       (link) => link.role === "evaluator" && inWindow(link.startedAt, window),
     ).length;
-    evaluatorWakeCount += wakes;
-    if (wakes >= EVALUATOR_WAKES_LISTED)
-      evaluatorWakes.push({ card: byNumber.get(cardId) ?? 0, wakes });
+    evaluatorStartCount += starts;
+    if (starts >= EVALUATOR_STARTS_LISTED)
+      evaluatorStarts.push({ card: byNumber.get(cardId) ?? 0, starts });
   }
-  evaluatorWakes.sort((left, right) => right.wakes - left.wakes || left.card - right.card);
+  evaluatorStarts.sort((left, right) => right.starts - left.starts || left.card - right.card);
 
   // Open asks older than 6 hours, oldest first.
   const oldAsks: Array<{
@@ -807,15 +816,27 @@ export const rollup = (input: RollupInput) => {
       longest,
       openOver24h: { count: longOpen.length, byStage: longOpenByStage, ...capped(longOpen, max) },
       withoutThread: { count: idle.length, ...capped(idle, max) },
+      inReviewNoThreadWithEvaluatorStepsOnly: {
+        count: evaluatorOnly.length,
+        ...capped(evaluatorOnly, max),
+      },
     },
     stalls: { count: stallItems.length, ...capped(stallItems, max) },
     failures: { count: failureCount, byKind: failuresByKind, byPool: failures },
     threads: {
       started,
       restarts: capped(restarts, max),
+      evaluatorStarts: {
+        count: evaluatorStartCount,
+        [`cardsWith${EVALUATOR_STARTS_LISTED}OrMore`]: capped(evaluatorStarts, max),
+      },
+      // Retained for one release for callers reading the old activity shape.
       evaluatorWakes: {
-        count: evaluatorWakeCount,
-        [`cardsWith${EVALUATOR_WAKES_LISTED}OrMore`]: capped(evaluatorWakes, max),
+        count: evaluatorStartCount,
+        [`cardsWith${EVALUATOR_STARTS_LISTED}OrMore`]: capped(
+          evaluatorStarts.map(({ card, starts }) => ({ card, wakes: starts })),
+          max,
+        ),
       },
     },
     pools: {
@@ -899,18 +920,35 @@ export const pageCardEvents = (
   };
 };
 
-/** Parses since/until into a bounded window ending no later than now. */
+const parseTime = (value: string, now: number) => {
+  const trimmed = value.trim();
+  if (/^now$/i.test(trimmed)) return now;
+  const relative = /^(?:now-)?(\d{1,4})([mhd])$/i.exec(trimmed);
+  if (relative !== null) {
+    const unit = relative[2]!.toLowerCase();
+    const scale = unit === "m" ? MINUTE : unit === "h" ? HOUR : 24 * HOUR;
+    return now - Number(relative[1]) * scale;
+  }
+  return Date.parse(value);
+};
+
+/** Parses since/until into a window of at most 72 hours. */
 export const parseWindow = (
   since: string | undefined,
   until: string | undefined,
   now: number,
 ): ActivityWindow | string => {
+  const end = until === undefined ? now : parseTime(until, now);
+  if (!Number.isFinite(end))
+    return "until must be an ISO time or a relative time like now-24h or 24h.";
   // `until` is exclusive; by default it includes an event written in the same millisecond.
-  const end = until === undefined ? now + 1 : Date.parse(until);
-  if (!Number.isFinite(end)) return "until must be an ISO time.";
-  const start = since === undefined ? end - ACTIVITY_DEFAULT_WINDOW_MS : Date.parse(since);
-  if (!Number.isFinite(start)) return "since must be an ISO time.";
-  if (start >= end) return "since must be before until.";
-  if (end - start > ACTIVITY_MAX_WINDOW_MS) return "The window is at most 72 hours.";
-  return { since: isoOf(start), until: isoOf(end) };
+  const exclusiveEnd = until === undefined ? end + 1 : end;
+  const start =
+    since === undefined ? exclusiveEnd - ACTIVITY_DEFAULT_WINDOW_MS : parseTime(since, now);
+  if (!Number.isFinite(start))
+    return "since must be an ISO time or a relative time like now-24h or 24h.";
+  if (start >= end)
+    return `since ${isoOf(start)} is not before until ${isoOf(end)} (${until === undefined ? "now, server clock, UTC" : "explicit until, UTC"}).`;
+  if (exclusiveEnd - start > ACTIVITY_MAX_WINDOW_MS) return "The window is at most 72 hours.";
+  return { since: isoOf(start), until: isoOf(exclusiveEnd) };
 };

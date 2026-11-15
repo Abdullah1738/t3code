@@ -137,6 +137,12 @@ const SubtasksInput = describe(
           "Evaluator only: set on the install or restart subtask that interrupts running work; omit to preserve, false clears.",
         ),
       ),
+      service: Schema.optional(
+        describe(
+          Schema.NullOr(Schema.String),
+          "Evaluator only: the service this step restarts, e.g. robob-watch, agent-bridges, telegram-bridge, robob; the 4 h release window is counted per service across all boards. Omit to preserve; null clears. Requires interrupting: true.",
+        ),
+      ),
       ownerOnly: Schema.optional(
         describe(
           Schema.Boolean,
@@ -210,7 +216,7 @@ const BoardGet = tool(
     since: Schema.optional(
       describe(
         TrimmedNonEmptyString,
-        "ISO time, at most 72 hours ago: only cards active since then, as short rows.",
+        "ISO time or relative (now, now-24h, 24h, 90m, 2d), at most 72 hours ago: only cards active since then, as short rows. Times are UTC; give a Z or offset for ISO times.",
       ),
     ),
   },
@@ -221,13 +227,21 @@ const BoardGet = tool(
 const BoardActivity = tool(
   "board_activity",
   "Board activity rollup",
-  "A board's activity in a window (default the last 24 hours, at most 72): every ask answered in the window with asked/answered times and minutes to answer (p50/p90/max), open asks and asks open over 6 hours, review rounds and verdicts per card, hours in each stage with dwell median/p95/max and the longest spans, open cards in one stage over 24 hours, stalls and how long they lasted, run failures (stalled, retried, fresh thread, reviewer without verdict) by kind and model, threads started, restarts and evaluator wakes, cards left in working or in_review with no thread, and an estimate of pool slots held per hour per model next to each pool's slots. Card numbers only, no titles or text. Read from the cards' stored history; long lists other than the answered asks are cut and say how many more.",
+  "A board's activity in a window (default the last 24 hours, at most 72): every ask answered in the window with asked/answered times and minutes to answer (p50/p90/max), open asks and asks open over 6 hours, review rounds and verdicts per card, hours in each stage with dwell median/p95/max and the longest spans, open cards in one stage over 24 hours, stalls and how long they lasted, run failures (stalled, retried, fresh thread, reviewer without verdict) by kind and model, threads started, restarts and evaluator starts (new threads; evaluatorWakes is a compatibility alias), cards left in working or in_review with no thread, and an estimate of pool slots held per hour per model next to each pool's slots. Card numbers only, no titles or text. Read from the cards' stored history; long lists other than the answered asks are cut and say how many more.",
   {
     boardId: BoardRef,
     since: Schema.optional(
-      describe(TrimmedNonEmptyString, "ISO start; default 24 hours before until."),
+      describe(
+        TrimmedNonEmptyString,
+        "ISO or relative start (now, now-24h, 24h, 90m, 2d); default 24 hours before until. Times are UTC; give a Z or offset for ISO times.",
+      ),
     ),
-    until: Schema.optional(describe(TrimmedNonEmptyString, "ISO end; default now.")),
+    until: Schema.optional(
+      describe(
+        TrimmedNonEmptyString,
+        "ISO or relative end (now, now-24h, 24h, 90m, 2d); default now. Relative times count back from the server clock. Times are UTC; give a Z or offset for ISO times.",
+      ),
+    ),
   },
   { activity: Record },
   { readonly: true },
@@ -605,7 +619,7 @@ const BoardStandingApproval = tool(
 const CardWait = tool(
   "card_wait",
   "Say what a card waits on",
-  "Park a card that has no running thread on the one thing it waits for, as data the board shows and checks, instead of writing \"waiting for the dev to push\" in a comment, a subtask or a stalled flag. on: push (new commits on pr; the reviewed commit is taken from the card's last review unless you pass head), merge (pr merged), ci (checks on pr finish), card (waitsOn is done), time (until passes), owner_go (the owner answers open question ask; ask it first with card_ask, and use a blocking card_ask instead when nothing can go on without him). When none of those fit (a Linear issue reaching a state, a deploy landing, a reply from a person), a board script can be the check: on script with script, the name of an enabled script on this board, and args for what it should look at. pr must be a PR link on the card: attach a parent or base PR with links first. One wait per card: a new one replaces the old, and takes over a stalled flag you could clear. When it ends the board clears it, logs why and wakes whoever acts next in the card's stage (wakeRole to choose; new commits on a card in review wake its reviewer for a fresh review); a wait that outlasts its limit (push 3d, merge 2d, ci 3h, card 7d, script 7d, owner_go 2d, or your until) shows the card as stuck. Several things to wait for: set the first, set the next when woken. clear:true removes it. Card threads use it on their own cards only, once they are not running (e.g. a card in review waiting on a push). A worker in Working waiting on a PR's CI calls watch_pull_request and ends its turn instead; for any other wait it asks its board evaluator to set it and ends its turn." +
+  "Set the one thing a card waits for, as data the board shows and checks, instead of writing \"waiting for the dev to push\" in a comment, a subtask or a stalled flag. on: push (new commits on pr; the reviewed commit is taken from the card's last review unless you pass head), merge (pr merged), ci (checks on pr finish), card (waitsOn is done), time (until passes), owner_go (the owner answers open question ask; ask it first with card_ask, and use a blocking card_ask instead when nothing can go on without him). When none of those fit (a Linear issue reaching a state, a deploy landing, a reply from a person), a board script can be the check: on script with script, the name of an enabled script on this board, and args for what it should look at. pr must be a PR link on the card: attach a parent or base PR with links first. One wait per card: a new one replaces the old, and takes over a stalled flag you could clear. When it ends the board clears it, logs why and wakes whoever acts next in the card's stage (wakeRole to choose; new commits on a card in review wake its reviewer for a fresh review); a wait that outlasts its limit (push 3d, merge 2d, ci 3h, card 7d, script 7d, owner_go 2d, or your until) shows the card as stuck. Several things to wait for: set the first, set the next when woken. clear:true removes it. Card threads use it on their own cards only. A worker can set a wait on its own card while running; it takes effect when the turn ends, so end the turn right after. For a PR's CI, call watch_pull_request and end the turn instead." +
     (WAITS_ENGINE_WIRED
       ? ""
       : " Not live yet: the wait is saved and shown, but the board does not end it or wake anyone until its tick checks waits, so keep your own check; it is accepted on cards in in_review, completed, deployed and needs_owner."),
@@ -868,6 +882,12 @@ const SubtaskDone = tool(
     ),
     state: Schema.Literals(["done", "skipped", "open"]),
     note: Schema.optional(Schema.String),
+    releasedAt: Schema.optional(
+      describe(
+        IsoDateTime,
+        "When the restart actually happened, for ticking a release after the fact; it records that time and does not start a new window.",
+      ),
+    ),
   },
   { card: Record },
   { readonly: false },

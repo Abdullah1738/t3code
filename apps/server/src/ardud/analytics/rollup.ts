@@ -125,13 +125,25 @@ export const makeAccumulator = () => ({
         operation: string;
         boardId: string | null;
         kind: "operation" | "child";
-        outcome: NonNullable<AnalyticsEvent["outcome"]>;
+        outcome: NonNullable<AnalyticsRollup["textGeneration"]>[number]["outcome"];
       };
       durations: Durations;
     }
   >(),
   errors: new Map<string, number>(),
   routes: new Map<string, Breakdown>(),
+  controlRoutes: new Map<
+    string,
+    {
+      route: string;
+      method: string;
+      hour: string;
+      durations: Durations;
+      statuses: Map<string, number>;
+      totalWaitMs: number;
+      deadlineExceeded: number;
+    }
+  >(),
   mcpCodes: new Map<string, Breakdown>(),
   dbSpans: new Map<string, Breakdown>(),
   rpcs: new Map<string, Durations & { totalWaitMs: number; outcomes: Map<string, number> }>(),
@@ -151,6 +163,18 @@ export const makeAccumulator = () => ({
   usage: makeUsageAccumulator(),
   boards: new Map<string, BoardGroup>(),
   tickPhases: new Map<string, { boardId: string; phase: string; durations: Durations }>(),
+  evaluatorOutcomes: new Map<
+    string,
+    {
+      boardId: string;
+      trigger: string;
+      purposeKind: string;
+      outcome: string;
+      reuseMissReason: string | null;
+      count: number;
+    }
+  >(),
+  evaluatorStartsByTrigger: new Map<string, { boardId: string; trigger: string; count: number }>(),
   mcp: new Map<string, McpGroup>(),
   retries: new Map<string, RetryAttempt[]>(),
   retryAttempts: 0,
@@ -388,7 +412,14 @@ export function accumulate(
       operation: event.props.operation,
       boardId: event.boardId ?? null,
       kind: event.kind === "text-generation.child" ? ("child" as const) : ("operation" as const),
-      outcome: event.outcome ?? "error",
+      outcome:
+        event.outcome === "ok" ||
+        event.outcome === "timeout" ||
+        event.outcome === "refused" ||
+        event.outcome === "interrupted" ||
+        event.outcome === "interrupted_by_shutdown"
+          ? event.outcome
+          : ("error" as const),
     };
     const key = JSON.stringify(labels);
     // Bound all dimensions together. Overflow remains visible in kindCounts and raw day files.
@@ -399,6 +430,36 @@ export function accumulate(
     } else target.textGenerationOverflow++;
   }
   increment(target.kinds, event.kind);
+  if (
+    event.kind === "rpc.request" &&
+    event.props?.httpRoute?.startsWith("/api/ardud/control/") &&
+    event.props?.httpMethod &&
+    event.durationMs !== undefined
+  ) {
+    const labels = {
+      route: event.props.httpRoute,
+      method: event.props.httpMethod,
+      hour: (event.startedAt ?? event.ts).slice(0, 13),
+    };
+    const identity = JSON.stringify(labels);
+    const key =
+      target.controlRoutes.has(identity) || target.controlRoutes.size < 4096 ? identity : OTHER;
+    let group = target.controlRoutes.get(key);
+    if (!group) {
+      group = {
+        ...(key === OTHER ? { route: OTHER, method: OTHER, hour: OTHER } : labels),
+        durations: durations(),
+        statuses: new Map(),
+        totalWaitMs: 0,
+        deadlineExceeded: 0,
+      };
+      target.controlRoutes.set(key, group);
+    }
+    addDuration(group.durations, event.durationMs);
+    increment(group.statuses, String(event.props.status ?? event.outcome ?? "unknown"));
+    group.totalWaitMs += event.props.waitMs ?? 0;
+    if (event.durationMs >= 15000) group.deadlineExceeded++;
+  }
   if (event.props?.errorTag) increment(target.errors, event.props.errorTag);
   else if (event.errorTag) increment(target.errors, event.errorTag);
   else if (/error|fail/i.test(event.kind)) increment(target.errors, event.kind);
@@ -475,6 +536,49 @@ export function accumulate(
         group.histogram.set(bucket, (group.histogram.get(bucket) ?? 0) + n);
       target.longTasks.set(key, group);
     }
+  }
+
+  if (
+    event.kind === "kanban.evaluator" &&
+    event.boardId &&
+    event.trigger &&
+    event.purposeKind &&
+    event.outcome
+  ) {
+    if (event.outcome === "started") {
+      const identity = JSON.stringify([event.boardId, event.trigger]);
+      const key = boundedKey(target.evaluatorStartsByTrigger, identity);
+      const group = target.evaluatorStartsByTrigger.get(key) ?? {
+        boardId: key === OTHER ? OTHER : event.boardId,
+        trigger: key === OTHER ? OTHER : event.trigger,
+        count: 0,
+      };
+      group.count++;
+      target.evaluatorStartsByTrigger.set(key, group);
+    }
+    const labels = {
+      boardId: event.boardId,
+      trigger: event.trigger,
+      purposeKind: event.purposeKind,
+      outcome: event.outcome,
+      reuseMissReason: event.reuseMissReason ?? null,
+    };
+    const identity = JSON.stringify(labels);
+    const key = boundedKey(target.evaluatorOutcomes, identity);
+    const group =
+      target.evaluatorOutcomes.get(key) ??
+      (key === OTHER
+        ? {
+            boardId: OTHER,
+            trigger: OTHER,
+            purposeKind: OTHER,
+            outcome: OTHER,
+            reuseMissReason: null,
+            count: 0,
+          }
+        : { ...labels, count: 0 });
+    group.count++;
+    target.evaluatorOutcomes.set(key, group);
   }
 
   if (
@@ -672,11 +776,28 @@ export function finishRollup(
     total: target.total,
     invalidLines: target.invalidLines,
     kindCounts: Object.fromEntries(target.kinds),
+    evaluatorOutcomes: [...target.evaluatorOutcomes.values()].sort((a, b) =>
+      JSON.stringify(a).localeCompare(JSON.stringify(b)),
+    ),
+    evaluatorStartsByTrigger: [...target.evaluatorStartsByTrigger.values()].sort((a, b) =>
+      JSON.stringify(a).localeCompare(JSON.stringify(b)),
+    ),
     textGenerationOverflow: target.textGenerationOverflow,
     textGeneration: [...target.textGeneration.values()]
       .map((group) => ({ ...group.labels, ...summarize(group.durations) }))
       .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
     errorCounts: Object.fromEntries(target.errors),
+    controlRoutes: [...target.controlRoutes.values()]
+      .map(({ durations, statuses, ...labels }) => ({
+        ...labels,
+        statuses: Object.fromEntries(statuses),
+        ...summarize(durations),
+      }))
+      .sort((a, b) =>
+        JSON.stringify([a.hour, a.route, a.method]).localeCompare(
+          JSON.stringify([b.hour, b.route, b.method]),
+        ),
+      ),
     errorsByRoute: finishBreakdown(target.routes).map((row) => ({
       route: String(row.labels.route),
       method: String(row.labels.method),

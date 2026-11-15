@@ -8,6 +8,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
+import * as ControlRequestAnalytics from "../control/ControlRequestAnalytics.ts";
 
 import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
@@ -170,7 +171,7 @@ export const desktopLeaseRoutes = HttpRouter.addAll(
       HttpRouter.route("POST", `${prefix}/call-end`, handle(endCall)),
       HttpRouter.route("POST", `${prefix}/reconcile`, handle(reconcile)),
     ] as const;
-  }),
+  }).pipe(Effect.flatMap(ControlRequestAnalytics.observeRoutes)),
 );
 
 export const desktopLeaseRouteLayer = desktopLeaseRoutes.pipe(

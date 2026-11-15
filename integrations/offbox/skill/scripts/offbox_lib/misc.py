@@ -113,7 +113,7 @@ def list_leases(me: dict, show_all: bool, as_json: bool) -> None:
         print("no leases" + ("" if show_all else " for this thread (use --all)"))
     for d in out:
         pin = " pinned" if (d.get("pinned_until") or 0) > now() else ""
-        note = f"  [{d['note']}]" if (d.get("note") or "").startswith((TOO_BIG_NOTE, DEAD_MOUNT_NOTE, BOX_WEDGED_NOTE)) else ""
+        note = f"  [{d['note']}]" if d['state'] == 'resume_stalled' or (d.get("note") or "").startswith((TOO_BIG_NOTE, DEAD_MOUNT_NOTE, BOX_WEDGED_NOTE)) else ""
         print(f"{d['box_id']:<12} {d['state']:<8} {d['size'] or '':<8} {d['repo_key']:<24} used {ago(d['last_used_at']):>6} "
               f"ago runs:{d['active_runs']}{pin}{note}  {d['source'] or ''}  {(d['thread_title'] or d['owner'])[:40]}")
 
@@ -152,7 +152,7 @@ def release(me: dict, box_id: str | None, mine: bool, delete: bool) -> None:
         # runs on that path too; the recheck under the lock still decides before any mutation.
         try:
             with file_lock('box-'+r['box_id'], timeout=1):
-                _release_one(con, r, delete)
+                _release_one(con, r, delete, me)
         except OffboxError as e:
             if "timed out waiting for lock" not in str(e):
                 raise
@@ -184,7 +184,7 @@ def _report_active_runs(con, box_id: str, lock_held: bool = False) -> bool:
     return True
 
 
-def _release_one(con, r, delete):
+def _release_one(con, r, delete, me=None):
         if _report_prune_hold(con, r["box_id"]):
             return
         if lease.active_runs(con, r["box_id"]):
@@ -198,6 +198,10 @@ def _release_one(con, r, delete):
                 lease.stop_box(con, r["box_id"], "release")
             if r['state'] == 'resume_stalled':
                 print(f"stop requested for {r['box_id']} (disk kept; remains set aside)")
+                return
+            pin = lease.foreign_pin(con, r['box_id'], me)
+            if pin:
+                print(f"stopped {r['box_id']} (disk kept; pinned by {pin[0]} until {iso(pin[1])}; other runs won't pick it)")
                 return
             print(f"stopped {r['box_id']} (free; disk kept; next offbox run resumes it)")
 
@@ -533,6 +537,9 @@ def status(me: dict) -> None:
         for b in boxes:
             hold = con.execute("SELECT created_at FROM prune_holds WHERE box_id=?", (b["id"],)).fetchone()
             held = f" prune-held since {time.strftime('%H:%M', time.localtime(hold['created_at']))}" if hold else ''
+            reason = lease.boot_dead(con, b['id'])
+            if reason:
+                held += f' set aside [{reason}]'
             print(f"  {b['id']:<12} {b.get('state'):<9} {b.get('type'):<8} {(b.get('name') or '')[:60]}{held}")
     except OffboxError as e:
         print(f"boxes: boat API unreachable ({e})")
@@ -1457,7 +1464,9 @@ def _resolve_exit(r, log_path, until, start_offsets, replay_path, echo=True, mir
 
 def _report_deps_hint(r, code, log_path) -> None:
     from .runs import box_deps_hint, step_results
-    if code not in (0, None) or any(rc != 0 for _, rc in step_results(log_path)):
+    results = step_results(log_path)
+    failed_code = next((rc for _, rc in results if rc), code)
+    if code != 127 and failed_code != 127 and (code not in (0, None) or any(rc != 0 for _, rc in results)):
         hint = box_deps_hint(Path(r['repo_root'] or '.'), log_path)
         if hint:
             say(hint)

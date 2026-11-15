@@ -44,9 +44,9 @@ test("ndjson rollup attributes watcher runs, helper failures, tags and wakes wit
   expect(result).toMatchObject({ total: 23, counts: { "watch.run": 9, "helper.run": 5, "watch.retry": 1, "wake.sent": 3, "watch.fire": 2, "wake.reply_guard": 3 },
     kinds: { perf: 9, error: 9, event: 5 }, ok: 14, failed: 9, okRate: 14 / 23, errorRate: 9 / 23,
     durations: { "watch.run": { count: 9, p50: 30, p95: 70, max: 70 } },
-    errors: [ { tag: "watch.check_failed", count: 2, sampleId: "ride-share-updates" }, { tag: "watch.timeout", count: 2, sampleId: "ride-share-updates" },
-      { tag: "helper.exit_failed", count: 2, sampleId: "ride-card" }, { tag: "wake.delivery_failed", count: 2, sampleId: "ride-share-updates" },
-      { tag: "helper.timeout", count: 1, sampleId: "convo-card" } ],
+    errors: [ { tag: "watch.check_failed", count: 2, topSources: [{ source: "watcher", id: "ride-share-updates", count: 2 }] }, { tag: "watch.timeout", count: 2, topSources: [{ source: "watcher", id: "flighty-bookings", count: 1 }, { source: "watcher", id: "ride-share-updates", count: 1 }] },
+      { tag: "helper.exit_failed", count: 2, topSources: [{ source: "helper", id: "ride-card", count: 2 }] }, { tag: "wake.delivery_failed", count: 2, topSources: [{ source: "watcher", id: "flighty-bookings", count: 1 }, { source: "watcher", id: "ride-share-updates", count: 1 }] },
+      { tag: "helper.timeout", count: 1, topSources: [{ source: "helper", id: "convo-card", count: 1 }] } ],
   });
   expect(JSON.parse(readFileSync(join(dir, `rollup-${day}.json`), "utf8"))).toEqual(result);
 });
@@ -144,7 +144,7 @@ test("a day with only empty and malformed lines still has empty aggregates", asy
   writeFileSync(join(dir, `${day}.ndjson`), '\nmalformed\nnull\n{}\n[]\n{"tool":"watchers","kind":"perf"}\n');
   expect(await rollup(day, dir)).toEqual({ day, tool: "watchers", total: 0, counts: {}, kinds: {}, ok: 0, failed: 0, okRate: null, errorRate: 0, durations: {}, errors: [],
     byWatcher: {}, watcherTotals: { watchers: 0, runs: 0, outcomes: { no_change: 0, fire: 0, fail: 0, timeout: 0 }, fires: 0 },
-    byHelper: {}, helperTotals: { helpers: 0, runs: 0, failures: 0, exitCodes: {} }, errorsByTagAndSource: [],
+    byHelper: {}, helperTotals: { helpers: 0, runs: 0, failures: 0, exitCodes: {} }, errorsByTagAndSource: [], hourly: [], markers: [],
     wake: { attempts: 0, sent: 0, failed: 0, replyGuard: { total: 0, accepted: 0, blocked: 0 } },
   });
 });

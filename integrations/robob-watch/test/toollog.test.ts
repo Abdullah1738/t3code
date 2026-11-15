@@ -22,7 +22,7 @@ const dirs: string[] = [];
 const fixture = () => { const dir = mkdtempSync(join(tmpdir(), "toollog-")); dirs.push(dir); process.env.TOOLLOG_DIR = dir; return dir; };
 const emptyBreakdown = {
   byWatcher: {}, watcherTotals: { watchers: 0, runs: 0, outcomes: { no_change: 0, fire: 0, fail: 0, timeout: 0 }, fires: 0 },
-  byHelper: {}, helperTotals: { helpers: 0, runs: 0, failures: 0, exitCodes: {} }, errorsByTagAndSource: [],
+  byHelper: {}, helperTotals: { helpers: 0, runs: 0, failures: 0, exitCodes: {} }, errorsByTagAndSource: [], hourly: [], markers: [],
   wake: { attempts: 0, sent: 0, failed: 0, replyGuard: { total: 0, blocked: 0, accepted: 0 } },
 };
 const day = () => new Date().toISOString().slice(0, 10);
@@ -56,15 +56,15 @@ test("watcher and Telegram loggers share the same private, allowlisted format", 
   expect(statSync(join(dir, `${day()}.ndjson`)).mode & 0o777).toBe(0o600);
 });
 
-test("creator fallbacks retain stable lookup fields and discard arbitrary reasons", () => {
+test.each(["native", "status", "send"])("creator fallbacks retain stable %s fields and discard arbitrary reasons", step => {
   const dir = fixture();
-  for (const reason of ["timeout", "exit:1", "exit:127", "invalid", "archived", "private payload", "exit:1 secret"]) {
+  for (const reason of ["timeout", "exit:1", "exit:127", "invalid", "archived", "error", "private payload", "exit:1 secret"]) {
     toolLog({ component: "wakes", kind: "error", name: "wake.creator_fallback", ok: false,
-      ids: { watcher: "fixture" }, props: { step: "native", reason, durationMs: 12 } });
+      ids: { watcher: "fixture" }, props: { step, reason, durationMs: 12 } });
   }
   const all = rows(dir);
-  expect(all.map(row => row.props.reason)).toEqual(["timeout", "exit:1", "exit:127", "invalid", "archived", undefined, undefined]);
-  expect(all.every(row => row.props.step === "native" && row.props.durationMs === 12)).toBe(true);
+  expect(all.map(row => row.props.reason)).toEqual(["timeout", "exit:1", "exit:127", "invalid", "archived", "error", undefined, undefined]);
+  expect(all.every(row => row.props.step === step && row.props.durationMs === 12)).toBe(true);
 });
 
 test("logging drops IO and serialization failures without raising", () => {
@@ -100,7 +100,7 @@ test("rollup counts fixture names/kinds, rates, percentiles and top error tags, 
   for (const ms of [1, 2, 3, 4, 100]) toolLog({ component: "runner", kind: "perf", name: "watch.run", durationMs: ms, ok: true });
   toolLog({ component: "runner", kind: "error", name: "watch.run", durationMs: 8, ok: false, ids: { watcher: "fixture" }, error: { tag: "watch.timeout" } });
   const result = await rollup(day());
-  expect(result).toMatchObject({ total: 6, counts: { "watch.run": 6 }, kinds: { perf: 5, error: 1 }, ok: 5, failed: 1, okRate: 5 / 6, errorRate: 1 / 6, durations: { "watch.run": { count: 6, p50: 3, p95: 100, max: 100 } }, errors: [{ tag: "watch.timeout", count: 1, sampleId: "fixture" }] });
+  expect(result).toMatchObject({ total: 6, counts: { "watch.run": 6 }, kinds: { perf: 5, error: 1 }, ok: 5, failed: 1, okRate: 5 / 6, errorRate: 1 / 6, durations: { "watch.run": { count: 6, p50: 3, p95: 100, max: 100 } }, errors: [{ tag: "watch.timeout", count: 1, topSources: [{ source: "watcher", id: "fixture", count: 1 }] }] });
   expect(statSync(join(dir, `rollup-${day()}.json`)).mode & 0o777).toBe(0o600);
   expect(await rollup("../../secret")).toBeUndefined();
   expect(await rollup("2026-02-30")).toBeUndefined();

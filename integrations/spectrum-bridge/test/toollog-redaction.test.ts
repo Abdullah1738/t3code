@@ -313,3 +313,18 @@ test.each([
     expect(JSON.stringify((await log.rollup(day))?.topErrorTags)).not.toContain(`:${number}`);
   }
 });
+
+test.each(["+971501234567", "/Users/private/PRIVATE.pdf", "https://private.test/?token=PRIVATE", "PRIVATE_TOKEN"])("render diagnostics reject private metadata shape %#", async privateValue => {
+  const log = createToolLog({ root, now: () => at, defer: true });
+  log.write({ component: "cards", kind: "perf", name: "card.render", ok: false, durationMs: 22,
+    ids: { chat: privateValue }, props: { cardKind: privateValue, outcome: "failed", failureCode: privateValue, attempt: 1 } });
+  log.write({ component: "router", kind: "error", name: "bridge.catch", error: {
+    tag: "router.catch49", cause: { name: "Error", message: privateValue, code: privateValue, causeKey: privateValue },
+  } });
+  log.flush();
+  expect(rows()[0]).toMatchObject({ ids: { chat: "other" }, props: { outcome: "failed", attempt: 1 } });
+  expect(rows()[0].props?.failureCode).toBeUndefined();
+  expect(rows()[1].error?.causeKey).toBe("background_watch");
+  expect(JSON.stringify(rows())).not.toContain(privateValue);
+  expect(JSON.stringify(await log.rollup(day))).not.toContain(privateValue);
+});
