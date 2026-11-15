@@ -257,6 +257,27 @@ const GeneralEvent = Schema.Struct({
       boardId: Schema.optionalKey(Id),
       cardNumber: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThan(0))),
       saved: Schema.optionalKey(Schema.Union([Schema.Boolean, Schema.Literal("unknown")])),
+      foundBy: Schema.optionalKey(
+        Schema.Literals(["subagents", "receipt", "request_key_recovery", "none"]),
+      ),
+      notFoundReason: Schema.optionalKey(
+        Schema.Literals([
+          "non_canonical_id",
+          "never_saved",
+          "not_a_delegation_id",
+          "other_thread",
+          "not_a_delegation_command",
+          "accepted",
+          "rejected",
+          "pending",
+          "abandoned",
+          "missing_child_thread",
+        ]),
+      ),
+      idCanonical: Schema.optionalKey(Schema.Boolean),
+      idShape: Schema.optionalKey(
+        Schema.Literals(["task_id", "thread_id", "child_thread_id", "empty", "other"]),
+      ),
       cause: Schema.optionalKey(
         Schema.Literals(["client_disconnect", "shutdown", "deadline", "stop", "unknown"]),
       ),
@@ -653,6 +674,9 @@ export const AnalyticsRollup = Schema.Struct({
       failureRate: Measurement,
       outcomes: Schema.Record(Label, Measurement),
       savedCounts: Schema.Record(Label, Measurement),
+      notFoundReasons: Schema.optionalKey(Schema.Record(Label, Measurement)),
+      foundByCounts: Schema.optionalKey(Schema.Record(Label, Measurement)),
+      idShapeCounts: Schema.optionalKey(Schema.Record(Label, Measurement)),
       errors: Schema.Array(
         Schema.Struct({ errorTag: Label, errorPhase: McpPhase, count: Measurement }),
       ),

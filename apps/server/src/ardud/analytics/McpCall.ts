@@ -12,6 +12,10 @@ import { McpSchema } from "effect/ai";
 type Phase = NonNullable<AnalyticsEvent["errorPhase"]>;
 type ThreadReadStage = NonNullable<AnalyticsEvent["threadReadStages"]>[number];
 type MutableThreadReadStage = { -readonly [K in keyof ThreadReadStage]: ThreadReadStage[K] };
+type TaskLookup = Pick<
+  NonNullable<AnalyticsEvent["props"]>,
+  "foundBy" | "notFoundReason" | "idCanonical" | "idShape"
+>;
 
 export class McpCall extends Context.Service<
   McpCall,
@@ -59,6 +63,7 @@ export class McpCall extends Context.Service<
     waitLookupMs?: number;
     phase: Phase;
     saved: boolean | "unknown";
+    taskLookup?: TaskLookup;
     replyFailure?: "reply_timeout" | "reply_error";
     replyStage?: string;
     replySubSteps?: ReadonlyArray<{ readonly subStep: string; readonly ms: number }>;
@@ -172,6 +177,28 @@ export const setSaved = Effect.fnUntraced(function* (saved: boolean) {
   if (call._tag === "Some") call.value.saved = saved;
 });
 
+// readTask owns the lookup span; retain only categories in the call ledger.
+export const setTaskLookup = Effect.fnUntraced(function* (
+  lookup: Required<Pick<TaskLookup, "foundBy" | "idCanonical">> & TaskLookup,
+) {
+  const call = yield* Effect.serviceOption(McpCall);
+  if (call._tag === "None") return;
+  // Internal status/cancel/ack reads must not erase evidence from the input lookup.
+  const previous = call.value.taskLookup;
+  call.value.taskLookup =
+    previous?.foundBy !== undefined && previous.foundBy !== "none"
+      ? {
+          ...previous,
+          ...lookup,
+          foundBy: previous.foundBy,
+          idCanonical: previous.idCanonical ?? lookup.idCanonical,
+        }
+      : { ...previous, ...lookup };
+  if (lookup.foundBy !== "none") call.value.saved = true;
+  else if (lookup.notFoundReason === "never_saved" && call.value.saved !== true)
+    call.value.saved = false;
+});
+
 // Capture the receipt lookup before dispatch so interruption cannot hide a committed command.
 export const trackDelegation = Effect.fnUntraced(function* (
   taskId: string,
@@ -209,12 +236,14 @@ export function callOutcome(
   exit: Exit.Exit<McpSchema.CallToolResult | McpSchema.InputRequired, unknown>,
   state: McpCall["Service"],
 ): Pick<AnalyticsEvent, "outcome" | "errorTag" | "errorPhase" | "saved" | "props"> {
+  const { notFoundReason, ...taskLookup } = state.taskLookup ?? {};
   if (exit._tag === "Failure" && Cause.hasInterruptsOnly(exit.cause))
     return {
       outcome: "interrupted",
       saved: state.saved,
       errorPhase: state.phase,
       props: {
+        ...taskLookup,
         code: "unknown",
         ...interruptionProps(exit.cause),
         ...(state.replySubSteps === undefined ? {} : { subSteps: state.replySubSteps }),
@@ -320,6 +349,8 @@ export function callOutcome(
         : "ok",
     saved,
     props: {
+      ...taskLookup,
+      ...(code === "task_not_found" && notFoundReason !== undefined ? { notFoundReason } : {}),
       ...(state.replyStage === undefined ? {} : { phase: state.replyStage }),
       ...(state.replySubSteps === undefined ? {} : { subSteps: state.replySubSteps }),
       code:

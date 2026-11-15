@@ -7,6 +7,7 @@ import * as ThreadReadDeadline from "./ThreadReadDeadline.ts";
 import * as StartupPhaseLog from "../ardud/observability/StartupPhaseLog.ts";
 import { bootId } from "../ardud/fast-install/report.ts";
 import * as McpCallAnalytics from "../ardud/analytics/McpCall.ts";
+import { delegationIdShape } from "./delegationTaskIdentity.ts";
 import * as SavedWrite from "../ardud/kanban/engine/savedWrite.ts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { analyticsErrorTag, recordServerAnalytics } from "../observability/RpcInstrumentation.ts";
@@ -1101,6 +1102,19 @@ const withToolAnalytics =
                     }
                     const initialReaderLane = yield* NodeSqliteClient.ReaderLane;
                     const callState: McpCallAnalytics.McpCall["Service"] = {
+                      ...(options.tool.name === "task_status" || options.tool.name === "task_cancel"
+                        ? {
+                            taskLookup: {
+                              idShape: delegationIdShape(
+                                typeof payload === "object" &&
+                                  payload !== null &&
+                                  "taskId" in payload
+                                  ? payload.taskId
+                                  : undefined,
+                              ),
+                            },
+                          }
+                        : {}),
                       ...(options.tool.name === "t3_thread_read"
                         ? {
                             threadRead: {
@@ -1303,7 +1317,19 @@ const withToolAnalytics =
                     const complete = yield* ledger.begin(() =>
                       row({
                         outcome: "interrupted_by_shutdown",
-                        props: { code: "unknown", cause: "shutdown" },
+                        props: {
+                          code: "unknown",
+                          cause: "shutdown",
+                          ...(callState.taskLookup?.foundBy === undefined
+                            ? {}
+                            : { foundBy: callState.taskLookup.foundBy }),
+                          ...(callState.taskLookup?.idCanonical === undefined
+                            ? {}
+                            : { idCanonical: callState.taskLookup.idCanonical }),
+                          ...(callState.taskLookup?.idShape === undefined
+                            ? {}
+                            : { idShape: callState.taskLookup.idShape }),
+                        },
                         saved: callState.saved,
                         errorPhase: callState.phase,
                       }),
