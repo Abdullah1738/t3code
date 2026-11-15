@@ -28,6 +28,12 @@ export class McpCall extends Context.Service<
       queryMs: number;
       renderMs: number;
       threadReadStages: Array<MutableThreadReadStage>;
+      acknowledgement?: "may_have_completed" | "completed";
+      phase?: {
+        name: "lane_wait" | "query" | "render";
+        started: bigint;
+        elapsed: { lane_wait: number; query: number; render: number };
+      };
       activeStage?: {
         readonly row: MutableThreadReadStage;
         readonly started: bigint;
@@ -139,7 +145,12 @@ export const failedPhase = Effect.fnUntraced(function* (phase: string) {
   const call = yield* Effect.serviceOption(McpCall);
   if (call._tag === "Some")
     call.value.phase =
-      phase === "caller" || phase === "dispatch" || phase === "result"
+      phase === "caller" ||
+      phase === "dispatch" ||
+      phase === "result" ||
+      phase === "lane_wait" ||
+      phase === "query" ||
+      phase === "render"
         ? phase
         : phase === "records"
           ? "result"
@@ -224,8 +235,12 @@ export function callOutcome(
         ? encodedError
         : content;
   const classified = classifyFailure(error);
-  const code = state.handlerErrorTag ?? classified?.tag;
-  const typedOutcome = state.handlerOutcome ?? classified?.outcome;
+  // The boundary deadline wins over a detached handler's cancellation/cleanup failure.
+  const readTimeout = classified?.tag === "ThreadReadTimeoutError";
+  const code = readTimeout ? classified.tag : (state.handlerErrorTag ?? classified?.tag);
+  const typedOutcome = readTimeout
+    ? classified.outcome
+    : (state.handlerOutcome ?? classified?.outcome);
   const inputRequired = exit._tag === "Success" && exit.value instanceof McpSchema.InputRequired;
   const failed =
     inputRequired ||
@@ -328,12 +343,15 @@ export function callOutcome(
                             ? "Defect"
                             : "McpToolError"))),
           errorPhase:
-            code === "caller_unresolved" ||
-            (partial && state.phase === "caller" && !state.callerResolved)
-              ? "caller"
-              : replyTooLarge || state.replyFailure || partial || waitTimedOut || requestTimedOut
-                ? "result"
-                : state.phase,
+            readTimeout &&
+            (error.phase === "lane_wait" || error.phase === "query" || error.phase === "render")
+              ? error.phase
+              : code === "caller_unresolved" ||
+                  (partial && state.phase === "caller" && !state.callerResolved)
+                ? "caller"
+                : replyTooLarge || state.replyFailure || partial || waitTimedOut || requestTimedOut
+                  ? "result"
+                  : state.phase,
         }
       : {}),
   };

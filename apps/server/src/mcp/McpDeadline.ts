@@ -11,6 +11,8 @@ import { delegationCreateFailure } from "../ardud/orchestration/delegationCreate
 const isOrchestratorMcpFailure = Schema.is(OrchestratorMcpFailure);
 
 export const OPERATION_TIMEOUT = "10 seconds";
+// Loaded reads exceed the write budget; leave time to reply before clients give up.
+export const READ_TIMEOUT = "45 seconds";
 
 class PendingWait extends Context.Service<PendingWait, { wait: string; since: bigint }>()(
   "t3/mcp/McpDeadline/PendingWait",

@@ -2450,7 +2450,9 @@ const make = Effect.gen(function* () {
         const delivery = yield* acknowledge.pipe(Effect.forkIn(serviceScope));
         yield* Fiber.join(delivery);
       } else {
-        yield* acknowledge;
+        yield* acknowledgementOperation === "thread-read-acknowledge"
+          ? ThreadReadMetrics.acknowledge(acknowledge)
+          : acknowledge;
       }
     }
     return response;

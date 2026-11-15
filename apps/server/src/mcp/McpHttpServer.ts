@@ -1274,7 +1274,21 @@ const withToolAnalytics =
                     });
                     const result = readiness
                       .pipe(Effect.andThen(largeRead ? advance("handler") : Effect.void))
+                      .pipe(
+                        Effect.andThen(
+                          options.tool.name === "t3_thread_read"
+                            ? ThreadReadMetrics.enterPhase("query")
+                            : Effect.void,
+                        ),
+                      )
                       .pipe(Effect.andThen(options.handle(payload)))
+                      .pipe(
+                        Effect.tap(() =>
+                          options.tool.name === "t3_thread_read"
+                            ? ThreadReadMetrics.enterPhase("render")
+                            : Effect.void,
+                        ),
+                      )
                       .pipe(Effect.map(withFailureStructuredContent))
                       .pipe(Effect.provideService(ReplyRejection, rejection));
                     // Large reads run on their own "mcp" lane (whole call, so at most
@@ -1306,7 +1320,15 @@ const withToolAnalytics =
                       (call) =>
                         largeRead
                           ? ReplyBuilders.bounded(
-                              advance("readiness").pipe(Effect.andThen(Effect.map(call, check))),
+                              advance("readiness").pipe(
+                                Effect.andThen(
+                                  options.tool.name === "t3_thread_read"
+                                    ? // Keep the permit outside the detached waiter so masked cleanup
+                                      // cannot retain admission after the read deadline or disconnect.
+                                      McpDeadline.awaitInterruptibly(Effect.map(call, check))
+                                    : Effect.map(call, check),
+                                ),
+                              ),
                               "mcp",
                             )
                           : Effect.map(call, check),
@@ -1335,31 +1357,31 @@ const withToolAnalytics =
                     );
                     // Reuse the bounded-read waiter so masked SQLite cleanup cannot hold the reply.
                     const boundedRead =
-                      options.tool.name === "list_scheduled_tasks"
-                        ? McpDeadline.awaitInterruptibly(completed).pipe(
-                            Effect.timeoutOrElse({
-                              duration: "20 seconds",
-                              orElse: Effect.fn("McpHttpServer.scheduledReadBusy")(function* () {
-                                const now = yield* Clock.monotonicTimeNanos;
-                                return new McpSchema.CallToolResult({
-                                  isError: true,
-                                  content: [
-                                    {
-                                      type: "text",
-                                      text: "Robob is busy; nothing was read. Retry the same call.",
+                      options.tool.name === "t3_thread_read"
+                        ? ThreadReadDeadline.withDeadline(completed)
+                        : options.tool.name === "list_scheduled_tasks"
+                          ? McpDeadline.awaitInterruptibly(completed).pipe(
+                              Effect.timeoutOrElse({
+                                duration: "20 seconds",
+                                orElse: Effect.fn("McpHttpServer.scheduledReadBusy")(function* () {
+                                  const now = yield* Clock.monotonicTimeNanos;
+                                  return new McpSchema.CallToolResult({
+                                    isError: true,
+                                    content: [
+                                      {
+                                        type: "text",
+                                        text: "Robob is busy; nothing was read. Retry the same call.",
+                                      },
+                                    ],
+                                    structuredContent: {
+                                      reason: "server_busy",
+                                      phase,
+                                      waitedMs: Number(now - readStarted) / 1e6,
                                     },
-                                  ],
-                                  structuredContent: {
-                                    reason: "server_busy",
-                                    phase,
-                                    waitedMs: Number(now - readStarted) / 1e6,
-                                  },
-                                });
+                                  });
+                                }),
                               }),
-                            }),
-                          )
-                        : options.tool.name === "t3_thread_read"
-                          ? ThreadReadDeadline.bound(completed)
+                            )
                           : completed;
                     const measuredRead = largeRead
                       ? boundedRead.pipe(

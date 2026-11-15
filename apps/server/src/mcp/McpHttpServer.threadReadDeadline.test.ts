@@ -21,6 +21,7 @@ import * as McpCallLedger from "../ardud/analytics/McpCallLedger.ts";
 import * as ThreadReadMetrics from "../ardud/analytics/ThreadReadMetrics.ts";
 import { makeHttpSocketTelemetry } from "../ardud/http/HttpSocketTelemetry.ts";
 import * as McpHttpServer from "./McpHttpServer.ts";
+import * as McpDeadline from "./McpDeadline.ts";
 import * as McpToolAccess from "./McpToolAccess.ts";
 import * as McpSessionRegistry from "./McpSessionRegistry.ts";
 
@@ -144,23 +145,24 @@ it.effect.each([
           Effect.forkChild,
         );
       yield* Deferred.await(entered);
-      yield* TestClock.adjust(mode === "deadline" ? "55 seconds" : "100 millis");
+      yield* TestClock.adjust(mode === "deadline" ? McpDeadline.READ_TIMEOUT : "100 millis");
       if (mode === "abort") yield* Fiber.interrupt(pending);
       else {
         const response = yield* Fiber.join(pending);
         expect(response).toContain('"isError":true');
         expect(response).toContain('"_tag":"ThreadReadTimeoutError"');
-        expect(response).toContain("No thread content was changed");
-        expect(response).toContain("smaller limit or runLimit");
+        expect(response).toContain("Read-only, nothing changed");
+        expect(response).toContain("smaller limit");
+        expect(response).toContain("task_status");
       }
       yield* Deferred.await(recorded);
       expect(rows).toHaveLength(1);
       expect(rows[0]).toMatchObject({
         tool: "t3_thread_read",
         callerThreadId: "thread:deadline",
-        durationMs: mode === "deadline" ? 55_000 : 100,
+        durationMs: mode === "deadline" ? 45_000 : 100,
         outcome: mode === "deadline" ? "timeout" : "interrupted",
-        errorPhase: "handler",
+        errorPhase: mode === "deadline" ? "query" : "handler",
         responseDelivery: mode === "abort" ? "closed" : "finished",
         ...(mode === "deadline" ? { errorTag: "ThreadReadTimeoutError" } : {}),
         ...(mode === "abort" ? { props: { cause: "client_disconnect" } } : {}),
