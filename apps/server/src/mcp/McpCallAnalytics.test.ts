@@ -946,7 +946,7 @@ it.effect("records resolved caller identity and a saved write whose reply fails"
         errorTag: "reply_error",
         errorPhase: "result",
         callerResolved: true,
-        readerLane: "foreground",
+        readerLane: "identity",
         props: { phase: "caller" },
       });
     }).pipe(Effect.provide(registration));
@@ -1008,7 +1008,7 @@ it.effect.each(["caller", "dispatch"] as const)("records the real %s deadline", 
         callerResolved: stage !== "caller",
         callerResolveMs: stage === "caller" ? 10_000 : 0,
         durationMs: 10_000,
-        readerLane: "foreground",
+        readerLane: "identity",
         saved: stage === "caller" ? false : "unknown",
       });
     }).pipe(Effect.provide(registration));
