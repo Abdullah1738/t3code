@@ -38,8 +38,8 @@ it), everything below is boat.dev, as it always was. With one, see "Home server,
 limits and no usage limit: use it as much as the work needs. When it is full, runs queue (first the repo's pool on
 the Mac, then the server's own memory queue) and start by themselves. A queued run prints `queued for a ... pool
 box` or `offbox-server: waiting for memory`: **leave it waiting**. Do not kill it, retry it, shrink the job or move
-it to the Mac because of a queue. For a wait that may outlast your tool call, start it with `--bg` and collect it
-with `offbox wait <run>`.
+it to the Mac because of a queue. For a wait that may outlast your tool call, start it with `--bg` and hand the
+wait off as "Waiting for a run" below says.
 
 **Every `offbox run` goes to a box.** The local-first lane (light Go checks on the Mac, 2026-10-19) is retired: it
 existed to save boat.dev minutes. `OFFBOX_LOCAL_FIRST` no longer does anything. A narrow check the gate allows can
@@ -75,6 +75,45 @@ cover its own Robob thread only, never the parent's or a sibling's. An inherited
 a child when it names the child itself.
 
 The monitor ignores apps opened by LaunchServices (XPC_SERVICE_NAME=application.*) that carry an agent's session id from the shell that opened them; reopen apps with a clean env anyway.
+
+## Waiting for a run
+
+Owner rule, 15 Nov 2026. Every model request resends your whole context, so each "is it done yet?" check costs as
+much as real work. On 15 Nov about 12B of 25B Codex input tokens went to such checks: 45-second `offbox wait`
+slices, `sleep` plus a log tail, queue-position checks. Wait like this instead.
+
+- **A run that finishes inside one tool call** (a few minutes, not queued): plain `offbox run -- <cmd>`.
+- **A long gate, or a run that is queued:** start it with `offbox run --bg -- <cmd>`, note the run id, hand the
+  wait off, and stop.
+  - **Codex threads** (board workers, reviewers, subagents): delegate a watcher and end your turn. Call
+    `delegate_task` in async mode with target `providerInstanceId: "claudeAgent"`, `model: "claude-sonnet-5-5"`,
+    `options: {effort: "medium"}` and the brief below. Its reply wakes you and is the run's result. While it runs,
+    do not sleep, do not call `task_status`, do not read the run's log.
+  - **Claude Code threads:** run `offbox wait <run-id> --timeout 1500` yourself as a background command and end
+    your turn; you are re-invoked when it exits.
+  - **Delegation is not available:** start `offbox wait <run-id> --timeout 1500` and check it at most once every
+    5 minutes (Codex: an empty `write_stdin` poll with `yield_time_ms: 300000`, the longest a single call waits).
+- Exit 124 from `offbox wait` means the run is still going: wait again the same way.
+- Never wait in short slices (`--timeout 45`), never `sleep` and tail `logs/<id>.client.log`, never check queue
+  position, and don't write card or progress updates that only say you are still waiting. A queued run starts by
+  itself.
+- If the board nudges you ("still in Working and your turn ended") while your watcher is still running, don't
+  re-check the run. Say in one line that the watcher holds it and end the turn again.
+
+Watcher brief (fill in the brackets; keep it this short):
+
+```text
+Watch offbox run <run-id>, started from <absolute repo dir> (<the command, one line>). Load the remote-compute
+skill. Wait from that directory with blocking calls: `offbox wait <run-id> --timeout 570`, with the shell tool's
+own timeout at 600000 ms. Exit 124 means it is still running: call it again, as often as needed. Do not end your
+turn and do not reply until the run has ended, because your reply is what wakes the worker. Do not poll in
+between, read logs while it runs or check queue position.
+When the run ends, reply once with: exit code, pass or fail in one line, the failing tests or error lines (30
+lines at most), and the log path. If the run never started or died from infrastructure (exit 100, 90, 94, 96, a
+lost box), follow the skill's "Fallback and exit codes" for that code, start the same command again once with
+`offbox run --bg` and watch the new run; report both run ids. Do not edit files, change the command or cancel
+other runs. If offbox itself is broken, call report_bug on the offbox board once and say so in your reply.
+```
 
 ## Install with the repo's package manager
 
@@ -206,7 +245,7 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
 | `--no-retry` | home server only: if the server restarts under this run, don't run it again (exit 94). For commands that are not safe to run twice (a deploy, a migration, anything that sends) |
 
 Runs longer than 10 minutes are fine (every run is a boat background command, reattached on network blips).
-For long gates, use `offbox run --bg …` followed by bounded `offbox wait <run-id> --timeout 45` calls; do not rely on setsid or detached tmux to protect a foreground client from interruption.
+For long gates, use `offbox run --bg …` and hand the wait off ("Waiting for a run" above); never wait in short `offbox wait --timeout 45` slices. Do not rely on setsid or detached tmux to protect a foreground client from interruption.
 If Robob restarts on the Mac during a foreground run (home box or Boat), the run detaches and keeps going; re-attach with `offbox wait <run-id>` (client exit 95). The home server itself restarting is a separate case (exit 94, below).
 Ctrl-C, Stop and SIGTERM-based timeouts still kill the run; a native SIGKILL cannot be caught by offbox.
 The reaper refreshes the box's deadline while the remote run is confirmed live, even if its starting client is gone, for up to 6 hours from run start.
