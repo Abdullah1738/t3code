@@ -150,6 +150,10 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
 ]);
 export type OrchestrationEffectRequestV2 = typeof OrchestrationEffectRequestV2.Type;
 
+export const START_LANE_EFFECT_TYPES = ["provider-turn.start"] as const satisfies ReadonlyArray<
+  OrchestrationEffectRequestV2["type"]
+>;
+
 export const CONTROL_LANE_EFFECT_TYPES = [
   "provider-turn.interrupt",
   "provider-turn.steer",
@@ -248,6 +252,7 @@ const isEffectOutboxError = Schema.is(EffectOutboxError);
 export interface EffectOutboxV2Shape {
   readonly awaitAvailable: Effect.Effect<void>;
   readonly awaitControlAvailable: Effect.Effect<void>;
+  readonly awaitStartAvailable: Effect.Effect<void>;
   readonly notifyAvailable: (count?: number) => Effect.Effect<void>;
   readonly wakeRestartEffect: (effectId: string) => Effect.Effect<boolean, EffectOutboxError>;
   /** Persist rows only. Notify workers after the surrounding transaction commits. */
@@ -300,6 +305,7 @@ export interface EffectOutboxV2Shape {
   }) => Effect.Effect<Option.Option<OrchestrationEffectV2>, EffectOutboxError>;
   readonly nextClaimableAt: Effect.Effect<Option.Option<DateTime.Utc>, EffectOutboxError>;
   readonly nextControlClaimableAt: Effect.Effect<Option.Option<DateTime.Utc>, EffectOutboxError>;
+  readonly nextStartClaimableAt: Effect.Effect<Option.Option<DateTime.Utc>, EffectOutboxError>;
   readonly succeed: (input: {
     readonly effectId: string;
     readonly workerId: string;
@@ -371,6 +377,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
     const sql = yield* SqlClient.SqlClient;
     const available = yield* Queue.dropping<void>(64);
     const controlAvailable = yield* Queue.dropping<void>(64);
+    const startAvailable = yield* Queue.dropping<void>(64);
     const cancellationSignals = new Map<string, Deferred.Deferred<void>>();
     const settledSignals = new Map<string, Deferred.Deferred<void>>();
     const signalSettled = (effectIds: ReadonlyArray<string>) =>
@@ -389,10 +396,11 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
         { length: Math.min(64, Math.max(0, Math.floor(count))) },
         () => undefined,
       );
-      // A control worker cannot claim starts; its wakeup must not steal the
-      // only notification from an idle general worker (or vice versa).
+      // Each lane needs its own notifications so a waiter in one lane cannot
+      // consume the only wakeup for work that another lane can claim.
       return Queue.offerAll(available, signals).pipe(
         Effect.andThen(Queue.offerAll(controlAvailable, signals)),
+        Effect.andThen(Queue.offerAll(startAvailable, signals)),
         Effect.asVoid,
       );
     };
@@ -505,6 +513,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
         ),
       awaitAvailable: Queue.take(available),
       awaitControlAvailable: Queue.take(controlAvailable),
+      awaitStartAvailable: Queue.take(startAvailable),
       notifyAvailable,
       hasPendingRunContinuation: Effect.fn("EffectOutbox.hasPendingRunContinuation")(
         function* (threadId) {
@@ -741,6 +750,30 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
           FROM orchestration_v2_effect_outbox AS candidate
           WHERE ${claimableCandidatePredicate()}
             AND candidate.effect_type IN ${sql.in(CONTROL_LANE_EFFECT_TYPES)}
+        `.pipe(Effect.withTracerEnabled(false));
+        const availableAt = rows[0]?.available_at;
+        if (availableAt === undefined || availableAt === null) return Option.none();
+        const parsed = DateTime.make(availableAt);
+        if (Option.isNone(parsed)) {
+          return yield* new EffectOutboxError({
+            operation: "next-claimable",
+            cause: `Invalid available_at timestamp: ${availableAt}`,
+          });
+        }
+        return parsed;
+      }).pipe(
+        Effect.mapError((cause) =>
+          isEffectOutboxError(cause)
+            ? cause
+            : new EffectOutboxError({ operation: "next-claimable", cause }),
+        ),
+      ),
+      nextStartClaimableAt: Effect.gen(function* () {
+        const rows = yield* sql<{ readonly available_at: string | null }>`
+          SELECT MIN(candidate.available_at) AS available_at
+          FROM orchestration_v2_effect_outbox AS candidate
+          WHERE ${claimableCandidatePredicate()}
+            AND candidate.effect_type IN ${sql.in(START_LANE_EFFECT_TYPES)}
         `.pipe(Effect.withTracerEnabled(false));
         const availableAt = rows[0]?.available_at;
         if (availableAt === undefined || availableAt === null) return Option.none();
