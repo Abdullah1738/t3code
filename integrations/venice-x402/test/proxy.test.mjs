@@ -141,9 +141,10 @@ test('proxy tops up once on 402, retries, and books the cost', async () => {
     assert.equal(snap.toppedUp, 5);
     assert.equal(snap.spent, 1000 * price.input + 100 * price.output);
     // stream: usage parsed from the final chunk, include_usage forced on
-    const s = await p.call('/chat/completions', { model: MODEL, stream: true, messages: [{ role: 'user', content: 'hi' }] });
+    const s = await p.call('/chat/completions', { model: MODEL, stream: true, reasoning_effort: 'high', messages: [{ role: 'user', content: 'hi' }] });
     assert.match(await s.text(), /\[DONE\]/);
     assert.equal(JSON.parse(mock.calls.at(-1).body).stream_options.include_usage, true);
+    assert.equal(JSON.parse(mock.calls.at(-1).body).reasoning_effort, undefined);
     assert.equal(p.ledger.snapshot().requests, 2);
     assert.equal((await p.call('/chat/completions', { model: 'other', messages: [] })).status, 400);
   } finally {

@@ -21,6 +21,8 @@ export const FALLBACK_MODELS = {
     output: 5 / 1e6,
     context: 1_000_000,
     maxOutput: 32_768,
+    // Venice: supportsReasoning true, supportsReasoningEffort false (always reasons).
+    reasoningEffort: false,
   },
 };
 

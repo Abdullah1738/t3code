@@ -97,6 +97,11 @@ export function createProxy({ cfg, venice, ledger, clientToken, log = () => {}, 
       }
       throw e;
     }
+    // Strip reasoning-effort knobs the model does not accept (OpenCode sends its variant).
+    if (price.reasoningEffort === false) {
+      delete body.reasoning_effort;
+      delete body.reasoning;
+    }
     if (body.stream) body.stream_options = { ...(body.stream_options || {}), include_usage: true };
 
     await acquire();
