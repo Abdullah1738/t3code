@@ -1113,8 +1113,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         return withId;
       });
 
-  // This runs inside the write transaction for every command, so finished leaf
-  // nodes of finished runs stay unread: busy threads hold thousands of them.
+  // Busy threads hold thousands of finished leaf nodes; omit them from command planning.
   const readCommandProjection = (threadId: ThreadId) =>
     projectionStore
       .getThreadRecords(
@@ -14182,7 +14181,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       awaitsRestartContinuation(run).pipe(Effect.orElseSucceed(() => false)),
     awaitRestartContinuation: (run) =>
       effectOutbox.awaitSettled(`effect:restart-continuation:${run.id}`).pipe(Effect.ignore),
-    dispatch: dispatchWithReceipt,
+    dispatch: (command, options) => {
+      const dispatch = dispatchWithReceipt(command, options);
+      // Planning precedes the writer transaction and must not queue behind background reads.
+      return command.type === "message.dispatch" || command.type === "delegated_task.request"
+        ? dispatch.pipe(NodeSqliteClient.foregroundReads)
+        : dispatch;
+    },
     autoArmLimitRecovery: (input) =>
       threadDispatch.withLock(
         input.threadId,
