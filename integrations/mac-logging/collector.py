@@ -1061,4 +1061,10 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    import sys
+    if sys.argv[1:] == ['--tailnet']:
+        from tailnet import check
+        missing_day()
+        check()
+    else:
+        main()
