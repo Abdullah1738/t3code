@@ -5961,11 +5961,27 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       projection.thread.worktreePath === null
         ? latestRun
         : undefined;
+    // A durable completion must not reset a failed provider startup's retry budget.
+    // Keep it queued until an explicit send or Resume; admission timeouts can retry.
+    const completionStartFailure =
+      delegatedCompletion !== undefined &&
+      activeRun === undefined &&
+      latestRun?.status === "failed" &&
+      latestRun.startedAt === null &&
+      latestRun.providerInstanceId === modelSelection.instanceId &&
+      ![PROVIDER_START_TIMEOUT_CODE, "restart_admission_timeout"].includes(
+        latestRootProviderFailure(latestRun, projection.turnItems)?.code ?? "",
+      )
+        ? latestRun
+        : undefined;
     const heldForCutover =
       !command.commandId.startsWith("harness-cutover:v1:") &&
       (yield* admissionHeld(command.threadId, modelSelection));
     const queueBehindRun =
-      activeRun ?? worktreeMissingRun ?? (heldForCutover ? (latestRun ?? undefined) : undefined);
+      activeRun ??
+      worktreeMissingRun ??
+      completionStartFailure ??
+      (heldForCutover ? (latestRun ?? undefined) : undefined);
     const pendingMergeBackTransfers = pendingMergeBackTransfersForThread(projection);
     // ardud: a pending fork or merge-back would carry another thread's context
     // into the run a context reset starts, so refuse and leave it pending.
@@ -6163,6 +6179,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         activeAttemptId: attemptId,
         status: "queued",
         ...(worktreeMissingRun !== undefined ||
+        completionStartFailure !== undefined ||
         stoppedBeforeWork ||
         (heldRunsToRelease.length === 0 && queueIsHeld && !wakeSkipsHold)
           ? { queueHeld: true }

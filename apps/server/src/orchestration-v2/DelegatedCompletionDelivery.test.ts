@@ -380,6 +380,169 @@ it.layer(layerTest)("delegated completion delivery repairs", (it) => {
     return { threadId, runId, taskId, deliveryRunId: notification.id, now };
   });
 
+  it.effect.each([
+    { name: "session-open", message: "DESCRIPTION is not valid ACP JSON", code: null, held: true },
+    { name: "thread-load", message: "Provider thread cannot be loaded", code: null, held: true },
+    { name: "missing-error-metadata", message: null, code: null, held: true },
+    {
+      name: "provider-timeout",
+      message: "Provider never started",
+      code: "provider_start_timeout",
+      held: false,
+    },
+    {
+      name: "admission-timeout",
+      message: "Restart admission expired",
+      code: "restart_admission_timeout",
+      held: false,
+    },
+  ])("retains failed-before-start completion after $name (held=$held)", (row) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const { threadId, runId, taskId, deliveryRunId, now } = yield* queuedCompletion(
+        `persistent-start-failure:${row.name}`,
+      );
+      const before = yield* orchestrator.getThreadProjection(threadId);
+      const parent = before.runs.find((run) => run.id === runId)!;
+      const receiver = before.runs.find((run) => run.id === deliveryRunId)!;
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make(`event:${row.name}:parent-completed`),
+            type: "run.updated",
+            threadId,
+            runId,
+            occurredAt: now,
+            payload: { ...parent, status: "completed", completedAt: now },
+          },
+          ...(row.message === null
+            ? []
+            : [
+                {
+                  id: EventId.make(`event:${row.name}:startup-error`),
+                  type: "turn-item.updated" as const,
+                  threadId,
+                  runId: receiver.id,
+                  occurredAt: now,
+                  payload: {
+                    id: TurnItemId.make(`turn-item:${row.name}:startup-error`),
+                    type: "error" as const,
+                    threadId,
+                    runId: receiver.id,
+                    nodeId: receiver.rootNodeId,
+                    providerThreadId: receiver.providerThreadId,
+                    providerTurnId: null,
+                    nativeItemRef: null,
+                    parentItemId: null,
+                    ordinal: 1,
+                    status: "failed" as const,
+                    title: "Provider session failed to open",
+                    startedAt: now,
+                    completedAt: now,
+                    updatedAt: now,
+                    failure: {
+                      class: "provider_error" as const,
+                      message: row.message,
+                      code: row.code,
+                      retryable: false,
+                    },
+                  },
+                },
+              ]),
+          {
+            id: EventId.make(`event:${row.name}:receiver-failed`),
+            type: "run.updated",
+            threadId,
+            runId: receiver.id,
+            occurredAt: now,
+            payload: { ...receiver, status: "failed", startedAt: null, completedAt: now },
+          },
+        ],
+      });
+      yield* orchestrator.recoverDelegatedTasks;
+      const recovered = yield* orchestrator.getThreadProjection(threadId);
+      const delivery = recovered.runs.find((run) => run.id === runId)!.delegatedCompletion!
+        .delivery!;
+      assert.notEqual(delivery.messageId, receiver.userMessageId);
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make(`command:${row.name}:retry`),
+        threadId,
+        messageId: delivery.messageId,
+        text: "Delegated task completed",
+        attachments: [],
+        createdBy: "agent",
+        creationSource: "server",
+        dispatchMode: { type: "queue_after_active" },
+        delegatedCompletion: {
+          parentRunId: runId,
+          generation: delivery.generation,
+          taskIds: delivery.taskIds,
+        },
+      });
+      const held = yield* orchestrator.getThreadProjection(threadId);
+      const retry = held.runs.find((run) => run.userMessageId === delivery.messageId)!;
+      assert.equal(retry.status, row.held ? "queued" : "starting");
+      assert.equal(retry.queueHeld === true, row.held);
+      assert.isNull(retry.startedAt);
+      assert.include(
+        held.messages.find((message) => message.id === delivery.messageId)!.text,
+        "child finished",
+      );
+      assert.equal(
+        held.subagents.find((task) => task.id === taskId)?.completionDelivery?.state,
+        "claimed",
+      );
+
+      if (row.held) {
+        yield* TestClock.adjust("2 minutes");
+        yield* orchestrator.recoverDelegatedTasks;
+        yield* orchestrator.recoverDelegatedTasks;
+        const stillHeld = yield* orchestrator.getThreadProjection(threadId);
+        assert.deepEqual(stillHeld.runs, held.runs);
+        assert.lengthOf(
+          stillHeld.messages.filter((message) => message.id === delivery.messageId),
+          1,
+        );
+
+        yield* orchestrator.dispatch({
+          type: "queue.resume",
+          commandId: CommandId.make(`command:${row.name}:resume`),
+          threadId,
+        });
+      }
+      const resumed = yield* orchestrator.getThreadProjection(threadId);
+      const resumedReceiver = resumed.runs.find((run) => run.id === retry.id)!;
+      assert.equal(resumedReceiver.status, "starting");
+      const later = yield* DateTime.now;
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make(`event:${row.name}:retry-completed`),
+            type: "run.updated",
+            threadId,
+            runId: retry.id,
+            occurredAt: later,
+            payload: {
+              ...resumedReceiver,
+              status: "completed",
+              startedAt: later,
+              completedAt: later,
+            },
+          },
+        ],
+      });
+      yield* orchestrator.recoverDelegatedTasks;
+      const delivered = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(
+        delivered.subagents.find((task) => task.id === taskId)?.completionDelivery?.state,
+        "delivered",
+      );
+      assert.isNull(delivered.runs.find((run) => run.id === runId)?.delegatedCompletion?.delivery);
+    }),
+  );
+
   it.effect.each(["acknowledge", "dispose"] as const)(
     "records the source when %s removes the last queued task result",
     (operation) =>
