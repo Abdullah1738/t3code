@@ -191,6 +191,7 @@ export interface KanbanThreadsShape {
     {
       readonly status: string;
       readonly message: string | null;
+      readonly messageId?: string;
       readonly model?: ModelSelection | null;
     } | null,
     KanbanThreadError
@@ -546,6 +547,7 @@ const make = Effect.gen(function* () {
           .pipe(
             Effect.map((messages) => ({
               status: run.status,
+              messageId: run.userMessageId,
               model: run.modelSelection,
               message: messages.messages[0]?.text ?? null,
             })),

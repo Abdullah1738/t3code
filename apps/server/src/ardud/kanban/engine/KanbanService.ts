@@ -1,4 +1,5 @@
 import { classifyReply } from "./ownerReplies.ts";
+import { ownerReplyDiscussion, ownerReplyKey, ownerReplyPending } from "./ownerReplyWake.ts";
 import { EVALUATOR_LIMITS, matchingCards, requestThreadIds } from "./evaluatorAdmission.ts";
 import * as NodeUtil from "node:util";
 // @effect-diagnostics nodeBuiltinImport:off - record ids only need a random UUID.
@@ -2565,6 +2566,7 @@ const make = Effect.gen(function* () {
         readonly message: string;
         readonly state: "retry" | "sent" | "gone" | "paused";
         readonly runId: string | null;
+        readonly ownerDiscussion?: KanbanDiscussionId;
       }
     >
   >(new Map());
@@ -2588,8 +2590,8 @@ const make = Effect.gen(function* () {
       next.delete(cardId);
       return next;
     });
-  // Discussions whose owner message was already reminded: discussion id -> its lastSeq then.
-  const ownerWaits = yield* Ref.make<ReadonlyMap<KanbanDiscussionId, number>>(new Map());
+  // One reminder per recipient and owner action, including answers on older messages.
+  const ownerWaits = yield* Ref.make<ReadonlyMap<string, string>>(new Map());
   const hold = (threadId: ThreadId, boardId: string, pool: string) =>
     Effect.flatMap(nowMillis, (at) =>
       Ref.update(holds, (all) => new Map(all).set(threadId, { boardId, pool, at })),
@@ -7628,16 +7630,14 @@ const make = Effect.gen(function* () {
           return false;
         }
       }
+      const action = yield* ownerReplyPending(store, discussion.id, threadId);
+      if (action === null) return false;
       const sent = yield* threads
         .send({
           threadId,
           text: Briefs.nudgeDiscussionText(discussion.id),
           coalesce: `owner:${discussion.cardId ?? discussion.id}`,
-          ...(participant.deferred
-            ? {
-                key: `discussion:${participant.deferredKey ?? `${discussion.id}:${threadId}:${participant.lastReadSeq}`}`,
-              }
-            : {}),
+          key: ownerReplyKey(discussion.id, threadId, action),
         })
         .pipe(
           Effect.provideService(EvaluatorAnalytics.origin, "discussion_nudge"),
@@ -8102,11 +8102,10 @@ const make = Effect.gen(function* () {
       }
       if (view?.state === "idle" && compactEvent !== undefined) {
         const compactRunId = compactEvent.body?.match(/\[compact-run ([^\]]+)\]$/)?.[1];
-        const latest = yield* Effect.result(
+        const latest =
           compactRunId === undefined
-            ? threads.latestRun(existing)
-            : threads.compactRun(existing, compactRunId),
-        );
+            ? yield* Effect.result(threads.latestRun(existing))
+            : yield* Effect.result(threads.compactRun(existing, compactRunId));
         // A failed read or the original failure is not proof that maintenance
         // finished; wait rather than silently abandon the thread.
         if (
@@ -10113,6 +10112,13 @@ const make = Effect.gen(function* () {
     } else if (link.paused !== null) yield* store.putThreadLink({ ...link, paused: null });
     // Discussions the thread evaluates, or is still typing or owing in after
     // being told something there (which the link and card don't name).
+    const failedRun =
+      link.role === "evaluator" && failure?.runId
+        ? yield* threads.compactRun(threadId, failure.runId)
+        : null;
+    const ownerDiscussion = failedRun
+      ? yield* ownerReplyDiscussion(store, failedRun.messageId ?? "", failedRun.message ?? "")
+      : null;
     let discussionAttempted = false;
     for (const discussion of yield* store.discussions(link.boardId)) {
       const participant = discussion.participants.find(
@@ -10139,7 +10145,12 @@ const make = Effect.gen(function* () {
             discussionAttempted,
           );
           discussionAttempted ||= attempted;
-        } else if (participant?.deferred && participant.owes === "asked") {
+        } else if (
+          (participant?.deferred && participant.owes === "asked") ||
+          (ownerDiscussion === discussion.id &&
+            participant !== undefined &&
+            participant.owes !== null)
+        ) {
           if (participant.typingUntil !== null) {
             yield* saveDiscussion(
               withParticipant(discussion, participant.actor, participant.name, {
@@ -10169,6 +10180,18 @@ const make = Effect.gen(function* () {
     }
 
     if (link.role === "evaluator") {
+      if (
+        failedRun?.messageId?.startsWith("kanban:wake:owner:") &&
+        (ownerDiscussion === null ||
+          (yield* ownerReplyPending(store, ownerDiscussion, threadId)) === null)
+      ) {
+        yield* Ref.update(evaluatorFailures, (all) => {
+          const next = new Map(all);
+          next.delete(threadId);
+          return next;
+        });
+        return;
+      }
       const entry = (yield* Ref.get(evaluatorFailures)).get(threadId);
       // A clean run clears the thread's failure state and frees its discussions for a fresh replacement.
       if (failure === null) {
@@ -10235,6 +10258,7 @@ const make = Effect.gen(function* () {
           message: failure.message,
           state: "retry",
           runId: failure.runId ?? null,
+          ...(ownerDiscussion === null ? {} : { ownerDiscussion }),
         }),
       );
       return;
@@ -11034,8 +11058,29 @@ const make = Effect.gen(function* () {
         (entry.runId !== null && failure.success.runId !== entry.runId)
       )
         continue;
+      const action =
+        entry.ownerDiscussion === undefined
+          ? undefined
+          : yield* ownerReplyPending(store, entry.ownerDiscussion, threadId);
+      if (action === null) {
+        yield* Ref.update(evaluatorFailures, (all) => {
+          const next = new Map(all);
+          next.delete(threadId);
+          return next;
+        });
+        continue;
+      }
       const sent = yield* threads
-        .send({ threadId, text: Briefs.evaluatorRetryText(entry.message) })
+        .send({
+          threadId,
+          text: Briefs.evaluatorRetryText(entry.message),
+          ...(entry.ownerDiscussion === undefined || action === undefined
+            ? {}
+            : {
+                key: `${ownerReplyKey(entry.ownerDiscussion, threadId, action)}:automatic-retry`,
+                coalesce: `owner:${entry.ownerDiscussion}`,
+              }),
+        })
         .pipe(
           Effect.provideService(EvaluatorAnalytics.origin, "stall_run_failure"),
           Effect.as(true),
@@ -12021,16 +12066,16 @@ const make = Effect.gen(function* () {
                   if (owing.length === 0) return;
                   // A failed read skips only this discussion, never the tick.
                   yield* Effect.gen(function* () {
-                    // The owner's latest message wherever it is, read without decoding the history.
-                    const ask = yield* store.ownerWait(discussion.id);
-                    if (ask === null || ask.answered) return;
-                    const idleMs = now - Date.parse(ask.createdAt);
-                    if (idleMs < OWNER_WAIT_MS) return;
-                    if ((yield* Ref.get(ownerWaits)).get(discussion.id) === ask.seq) return;
                     for (const participant of owing) {
                       const actor = participant.actor;
                       if (actor._tag !== "evaluator") continue;
                       const evaluatorId = actor.threadId;
+                      const reply = yield* store.ownerReply(discussion.id, evaluatorId, true);
+                      if (reply === null || reply.answered) continue;
+                      const idleMs = now - Date.parse(reply.createdAt);
+                      if (idleMs < OWNER_WAIT_MS) continue;
+                      const waitingKey = `${discussion.id}:${evaluatorId}`;
+                      if ((yield* Ref.get(ownerWaits)).get(waitingKey) === reply.key) continue;
                       const read = yield* planFind(evaluatorId);
                       if (Option.isNone(read) || read.value?.state !== "running") continue;
                       const fresh = yield* freshFind(evaluatorId);
@@ -12042,11 +12087,14 @@ const make = Effect.gen(function* () {
                         continue;
                       views.delete(evaluatorId);
                       const minutes = Math.round(idleMs / 60_000);
+                      const action = yield* ownerReplyPending(store, discussion.id, evaluatorId);
+                      if (action === null) continue;
                       const sent = yield* threads
                         .send({
                           threadId: evaluatorId,
                           text: Briefs.ownerWaitingText(discussion, minutes),
                           coalesce: `owner:${discussion.cardId ?? discussion.id}`,
+                          key: ownerReplyKey(discussion.id, evaluatorId, action),
                         })
                         .pipe(
                           Effect.provideService(EvaluatorAnalytics.origin, "discussion_nudge"),
@@ -12061,7 +12109,7 @@ const make = Effect.gen(function* () {
                         );
                       if (sent) {
                         yield* Ref.update(ownerWaits, (all) =>
-                          new Map(all).set(discussion.id, ask.seq),
+                          new Map(all).set(waitingKey, reply.key),
                         );
                       }
                     }

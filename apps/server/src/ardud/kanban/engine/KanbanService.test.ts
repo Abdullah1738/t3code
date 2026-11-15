@@ -97,6 +97,7 @@ import {
 } from "./defaults.ts";
 import * as Rules from "./rules.ts";
 import * as Briefs from "./briefs.ts";
+import { ownerReplyDiscussion, ownerReplyPending } from "./ownerReplyWake.ts";
 import * as BoardLocks from "./boardLocks.ts";
 import * as SavedWrite from "./savedWrite.ts";
 import * as SavedReply from "../tools/savedReply.ts";
@@ -152,7 +153,7 @@ const makeFake = Effect.gen(function* () {
   >();
   const runHistory = new Map<
     string,
-    { status: string; message: string | null; model?: ModelSelection | null }
+    { status: string; message: string | null; messageId?: string; model?: ModelSelection | null }
   >();
   // One run id per stored failure object (the same run reports the same id).
   const runIds = new WeakMap<object, string>();
@@ -12614,6 +12615,128 @@ it.effect("a packet wake never goes to a settled or archived card discussion", (
   }),
 );
 
+it.effect.each([false, true])(
+  "#1569 settle and sweep share one owner-answer reminder (committed conflict: %s)",
+  (conflict) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const card = yield* kanban.createCard(board.id, { title: "Answer", prompt: "Work" }, owner);
+        const talk = yield* kanban.cardDiscussion(card.id);
+        assert.strictEqual(
+          yield* ownerReplyDiscussion(
+            yield* KanbanStore.KanbanStore,
+            `kanban:wake:owner:${card.id}:old-uuid`,
+            Briefs.ownerWaitingText(talk, 16),
+          ),
+          talk.id,
+        );
+        yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Question" }]);
+        const evaluator = (yield* kanban.discussion(talk.id)).evaluatorThreadId!;
+        const actor = { _tag: "evaluator" as const, threadId: evaluator };
+        yield* kanban.askOwner(
+          card.id,
+          { question: "Ship?", blocking: false, options: ["Yes", "No"] },
+          actor,
+          "evaluator",
+        );
+        const ask = (yield* kanban.card(card.id)).card.asks.at(-1)!;
+        yield* TestClock.adjust("1 second");
+        yield* kanban.answerAsk(
+          card.id,
+          ask.id,
+          { verdict: "picked", revision: 0, optionIds: ["o1"] },
+          owner,
+        );
+        let rejected = false;
+        fake.sendControl.afterSend = (_thread, text) => {
+          if (
+            conflict &&
+            !rejected &&
+            (text === Briefs.nudgeDiscussionText(talk.id) || text.startsWith("Abdullah wrote in"))
+          ) {
+            rejected = true;
+            throw new BoardLocks.BoardStateChanged(true);
+          }
+        };
+        yield* setRunStart(fake, evaluator, true, "2026-10-25T13:00:00.000Z");
+        yield* TestClock.adjust("16 minutes");
+        yield* kanban.tick;
+        yield* setRunning(fake, evaluator, false);
+        yield* kanban.turnEnded(evaluator);
+        const reminders = fake.sends.filter(
+          (send) => send.threadId === evaluator && send.coalesce?.startsWith("owner:"),
+        );
+        assert.lengthOf(reminders, 2);
+        assert.lengthOf(
+          (yield* Ref.get(fake.threads))
+            .get(evaluator)!
+            .messages.filter(
+              (text) =>
+                text === Briefs.nudgeDiscussionText(talk.id) ||
+                text.startsWith("Abdullah wrote in"),
+            ),
+          1,
+        );
+        assert.lengthOf(new Set(reminders.map((send) => send.key)), 1);
+        assert.include(reminders[0]!.key!, "owner-reply:");
+      }).pipe(Effect.provide(inlineTestLayer(fake.layer)));
+    }),
+);
+
+it.effect.each(["before failure", "before retry", "still owed"] as const)(
+  "#1569 owner wake automatic retry: %s",
+  (cleared) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const talk = yield* kanban.createDiscussion(board.id, "Owner reply", owner);
+        yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Please answer" }]);
+        const evaluator = (yield* kanban.discussion(talk.id)).evaluatorThreadId!;
+        const post = kanban.post(talk.id, { _tag: "evaluator", threadId: evaluator }, [
+          { _tag: "md", text: "Answered" },
+        ]);
+        const failure = {
+          class: "provider_error" as const,
+          code: "provider.internal",
+          message: "Provider turn failed.",
+          retryable: true,
+        };
+        fake.failures.set(evaluator, failure);
+        const failed = yield* (yield* KanbanThreads).lastFailure(evaluator);
+        fake.runHistory.set(failed!.runId!, {
+          status: "failed",
+          message: Briefs.nudgeDiscussionText(talk.id),
+          messageId: "kanban:wake:owner:card:old-uuid",
+        });
+        yield* TestClock.adjust("1 second");
+        if (cleared === "before failure") yield* post;
+        yield* kanban.turnEnded(evaluator);
+        if (cleared === "before retry") yield* post;
+        yield* TestClock.adjust("2 minutes");
+        yield* kanban.tick;
+        const retries = (yield* Ref.get(fake.threads))
+          .get(evaluator)!
+          .messages.filter((text) => text.includes("one automatic retry"));
+        assert.lengthOf(retries, cleared === "still owed" ? 1 : 0);
+        if (cleared === "still owed") {
+          yield* kanban.tick;
+          assert.lengthOf(
+            (yield* Ref.get(fake.threads))
+              .get(evaluator)!
+              .messages.filter((text) => text.includes("one automatic retry")),
+            1,
+          );
+        }
+        const store = yield* KanbanStore.KanbanStore;
+        if (cleared !== "still owed")
+          assert.isNull(yield* ownerReplyPending(store, talk.id, evaluator));
+      }).pipe(Effect.provide(inlineTestLayer(fake.layer)));
+    }),
+);
+
 it.effect("an owner reminder is keyed to the owner's message, not later system posts", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
@@ -12649,7 +12772,7 @@ const failingAllReadStore = Layer.effect(
     return {
       ...real,
       allMessages: () => Effect.die("the tick read a whole discussion"),
-      ownerWait: (id) =>
+      ownerReply: (id, threadId, evaluator) =>
         allReadFailures.remaining > 0
           ? ((allReadFailures.remaining -= 1),
             Effect.fail(
@@ -12658,7 +12781,7 @@ const failingAllReadStore = Layer.effect(
                 cause: "injected",
               }),
             ))
-          : real.ownerWait(id),
+          : real.ownerReply(id, threadId, evaluator),
     };
   }),
 );
@@ -35712,6 +35835,57 @@ it.effect.each(
         );
       }
     }).pipe(Effect.provide(mode === "inline" ? inlineTestLayer(wrapped) : testLayer(wrapped)));
+  }).pipe(Effect.provide(unstartedLifecycleLayer())),
+);
+
+it.effect("#1569 a committed settlement conflict retains one persisted owner wake", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const lifecycle = yield* KanbanThreads.pipe(Effect.provide(KanbanThreadLifecycle.layer));
+    const fake = yield* makeFake;
+    const base = yield* KanbanThreads.pipe(Effect.provide(fake.layer));
+    let conflict = true;
+    const wrapped = Layer.succeed(KanbanThreads, {
+      ...base,
+      send: (input) =>
+        Effect.gen(function* () {
+          if (!input.coalesce?.startsWith("owner:")) return yield* base.send(input);
+          const { model: _model, ...message } = input;
+          const sent = yield* lifecycle.send(message);
+          if (conflict) {
+            conflict = false;
+            return yield* Effect.die(new BoardLocks.BoardStateChanged(true));
+          }
+          return sent;
+        }),
+    });
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const talk = yield* kanban.createDiscussion(board.id, "Owner reply", owner);
+      yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Please answer" }]);
+      const evaluator = (yield* kanban.discussion(talk.id)).evaluatorThreadId!;
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("1569:create"),
+        threadId: evaluator,
+        projectId: ProjectId.make("project-1"),
+        title: "Owner reply",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-6.1-sol" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdBy: "system",
+        creationSource: "server",
+      });
+      yield* lifecycle.send({ threadId: evaluator, text: "Current evaluator turn" });
+      yield* Effect.exit(kanban.turnEnded(evaluator));
+      yield* kanban.turnEnded(evaluator);
+      const queued = yield* lifecycle.queuedRuns(evaluator);
+      assert.lengthOf(queued, 1);
+      assert.isTrue(queued[0]!.userMessageId.startsWith("kanban:wake:owner:"));
+      assert.isFalse(conflict);
+    }).pipe(Effect.provide(inlineTestLayer(wrapped)));
   }).pipe(Effect.provide(unstartedLifecycleLayer())),
 );
 
