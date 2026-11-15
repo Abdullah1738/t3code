@@ -1663,7 +1663,7 @@ def _js_fixture_source(source):
         value = os.path.normpath(match[1])
         if value in live_parents or re.fullmatch(r'/(?:Users|home)/[^/]+|/root', value):
             return source
-    token = re.compile(r'''//[^\n]*|/\*[\s\S]*?\*/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|/(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\\n\[])+/[dgimsuvy]*|[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*|===|!==|==|!=|=>|\+=|-=|\+\+|--|[^\s]''')
+    token = re.compile(r'''//[^\n]*|/\*[\s\S]*?\*/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|/(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\\n\[])+/[dgimsuvy]*|[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*|===|!==|==|!=|=>|(?:>>>|<<|>>|\*\*|&&|\|\||\?\?|[+*/%&|^-])=|\+\+|--|[^\s]''')
     matches = [m for m in token.finditer(source) if not m[0].startswith(('//', '/*'))]
     words = [re.sub(r'\s+', '', m[0]) if m[0][0] not in "\"'`" else m[0] for m in matches]
     scopes, parents, stack = [], {0: None}, [0]
@@ -1680,7 +1680,9 @@ def _js_fixture_source(source):
     for i in range(len(words) - 2):
         if words[i] in {'const', 'let'} and re.fullmatch(r'[A-Za-z_$][\w$]*', words[i + 1]) and words[i + 2] == '=':
             definitions.setdefault((scopes[i], words[i + 1]), []).append((i + 3, i + 1))
-        if re.fullmatch(r'[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*', words[i]) and words[i + 1] in {'=', '+=', '-=', '++', '--'}:
+        if re.fullmatch(r'[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*', words[i]) and (
+                re.fullmatch(r'(?:>>>|<<|>>|\*\*|&&|\|\||\?\?|[+*/%&|^-])?=', words[i + 1]) or
+                words[i + 1] in {'++', '--', 'of', 'in'} or words[i - 1:i] in (['++'], ['--'], ['delete'])):
             writes.append(i)
             if '.' in words[i]:
                 property_writes.setdefault(words[i].split('.')[0], []).append(i)
@@ -1709,6 +1711,52 @@ def _js_fixture_source(source):
         key = binding(words[i], i)
         if key and (len(definitions[key]) != 1 or definitions[key][0][1] != i):
             invalid.add(key)
+    # A complex assignment target proves nothing about any name it contains.
+    # Include its receiver for indexed writes; unrelated fixture names survive.
+    brackets, openings = [], {}
+    for i, word in enumerate(words):
+        if word in {'[', '{', '('}:
+            brackets.append(i)
+        elif word in {']', '}', ')'} and brackets:
+            openings[i] = brackets.pop()
+        if word in {']', '}', ')', '!'} and words[i + 1:i + 2] and re.fullmatch(r'(?:>>>|<<|>>|\*\*|&&|\|\||\?\?|[+*/%&|^-])?=', words[i + 1]):
+            start = openings.get(i, i)
+            for n in range(max(0, start - 1), i):
+                invalid.add(binding(words[n], n))
+                invalid.add(binding(words[n].split('.')[0], n))
+    for i, word in enumerate(words):
+        if word.startswith('`'):
+            for part in re.findall(r'\$\{([^}]*)\}', word):
+                if re.search(r'(?<![=!<>])=(?!=|>)|\+\+|--', part):
+                    for name in re.findall(r'[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*', part):
+                        invalid.add(binding(name, i))
+                        invalid.add(binding(name.split('.')[0], i))
+    for key, values in list(definitions.items()):
+        if '.' not in key[1] or not values:
+            continue
+        base_key = (key[0], key[1].split('.')[0])
+        base_values = definitions.get(base_key, [])
+        if len(base_values) != 1:
+            invalid.add(base_key)
+            continue
+        start, declaration = base_values[0]
+        # A receiver may only be declared and accessed through its proved
+        # properties. Aliases, arguments, returns and indexed uses can mutate it.
+        for i, word in enumerate(words):
+            base = base_key[1]
+            if (word.startswith('`') and re.search(r'\$\{[^}]*(?<![\w$])' + re.escape(base) + r'(?![\w$])', word) and
+                    not re.fullmatch(r'`\$\{' + re.escape(base) + r'\.[\w$]+\}/[^`$\\]*`', word)):
+                invalid.add(base_key)
+            if (word == base or word.startswith(base + '.')) and binding(base, i) == base_key:
+                member = (base_key[0], word)
+                if i != declaration and (word == base or member not in definitions or words[i + 1:i + 2] == ['(']):
+                    invalid.add(base_key)
+        # Spreads, computed keys, quoted duplicate keys and accessors are not
+        # simple local property initializers.
+        top = members.get(start + 1, ())
+        if any(words[i] in {'.', '['} or words[i][:1] in {'"', "'", '`'} and words[i + 1:i + 2] == [':'] or
+               words[i] in {'get', 'set'} and words[i + 2:i + 3] == ['('] for i in top):
+            invalid.add(base_key)
     for i, word in enumerate(words[:-2]):
         if word in {'const', 'let', 'var'} and re.fullmatch(r'[A-Za-z_$][\w$]*', words[i + 1]) and words[i + 2] != '=':
             definitions[(scopes[i], words[i + 1])] = []

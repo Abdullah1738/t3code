@@ -2073,6 +2073,9 @@ import path from 'node:path';
             self.write('temp.test.ts', imports + setup + f'new Database(join({name}, ".robob/userdata/statev2.sqlite"));')
             with self.subTest(setup=setup):
                 self.assertIsNone(self.classify('node --test temp.test.ts'))
+        self.write('temp.test.ts', imports + 'const fixture = {root: mkdtempSync(tmpdir())};\n' +
+                   'readFileSync(`${fixture.root}/.robob/userdata/statev2.sqlite`);')
+        self.assertIsNone(self.classify('bun test temp.test.ts'))
 
     def test_js_temp_database_fixture_near_misses(self):
         imports = '''import { test } from 'bun:test';
@@ -2110,6 +2113,73 @@ import { join, resolve } from 'node:path';
             for command in ('bun test temp.test.ts', 'node --test temp.test.ts', 'offbox run -- bun test temp.test.ts'):
                 with self.subTest(source=source, command=command):
                     self.assertEqual(self.classify(command), SCRIPT)
+
+    def js_mutation_cases(self, cases):
+        imports = '''import {mkdtempSync, readFileSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+'''
+        for label, source in cases:
+            for suffix in ('mjs', 'ts'):
+                target = 'mutation.test.' + suffix
+                self.write(target, imports + source)
+                for command in ('node --test ' + target, 'bun test ' + target,
+                                "offbox run -- 'bun test " + target + "'"):
+                    with self.subTest(case=label, command=command):
+                        self.assertEqual(self.classify(command), SCRIPT)
+                        self.adapters(command, SCRIPT)
+
+    def test_js_temp_database_mutation_writes(self):
+        home = "['', 'Users', 'ardud'].join('/')"
+        setup = "let root = mkdtempSync(join(tmpdir(), 'guard95-')); "
+        read = "readFileSync(join(root, '.robob/userdata/statev2.sqlite'));"
+        writes = [(op, f'root {op} {home};') for op in
+                  ('=', '+=', '-=', '*=', '/=', '%=', '**=', '<<=', '>>=', '>>>=', '&=', '|=', '^=', '&&=', '||=', '??=')]
+        writes += [(form, form) for form in (
+            '++root;', '--root;', 'root++;', 'root--;',
+            f'({{root}} = {{root: {home}}});', f'[root] = [{home}];',
+            f'({{path: root}} = {{path: {home}}});', f'({{root = {home}}} = {{}});',
+            f'[...root] = [{home}];', f'({{nested: [root]}} = {{nested: [{home}]}});',
+            f'for (root of [{home}]) {{}}', f'for (root in {{[{home}]: 1}}) {{}}',
+            f'(root) = {home};', f'root! &&= {home};',
+            f'`${{root = {home}}}`;',
+        )]
+        self.js_mutation_cases((label, setup + write + read) for label, write in writes)
+        self.js_mutation_cases((label + ' property',
+            'const fixture = {root: mkdtempSync(tmpdir())}; ' +
+            write.replace('root', 'fixture.root') +
+            "readFileSync(join(fixture.root, '.robob/userdata/statev2.sqlite'));")
+            for label, write in writes if label in {'&&=', '||=', '??=', '*=', '++root;', 'root++;'})
+
+    def test_js_temp_database_object_escape_mutations(self):
+        home = "['', 'Users', 'ardud'].join('/')"
+        setup = "const fixture = {root: mkdtempSync(join(tmpdir(), 'guard95-'))}; "
+        read = "readFileSync(join(fixture.root, '.robob/userdata/statev2.sqlite'));"
+        mutations = [
+            ('alias', f'const other = fixture; other.root = {home};'),
+            ('alias chain', f'const other = fixture; const alias = other; alias.root = {home};'),
+            ('object alias', f'const other = {{fixture}}; other.fixture.root = {home};'),
+            ('array alias', f'const other = [fixture]; other[0].root = {home};'),
+            ('Object.assign', f'Object.assign(fixture, {{root: {home}}});'),
+            ('Object.defineProperty', f'Object.defineProperty(fixture, "root", {{value: {home}}});'),
+            ('Reflect.set', f'Reflect.set(fixture, "root", {home});'),
+            ('opaque call', f'mutate(fixture, {home});'),
+            ('return alias', f'function get() {{return fixture;}} get().root = {home};'),
+            ('closure alias', f'const get = () => fixture; get().root = {home};'),
+            ('computed property', f'fixture["root"] = {home};'),
+            ('delete property', 'delete fixture.root;'),
+            ('opaque method', 'fixture.mutate();'),
+            ('tagged template', f'mutate`${{fixture}}`;'),
+            ('second interpolation assign', f'`${{fixture.root}}/${{Object.assign(fixture, {{root: {home}}})}}`;'),
+            ('second interpolation call', f'`${{fixture.root}}/${{mutate(fixture)}}`;'),
+        ]
+        self.js_mutation_cases((label + ' ' + name, (setup + mutation + read).replace('fixture', name))
+            for label, mutation in mutations for name in ('fixture', '$fixture', 'fixture$', '$fixture$'))
+        self.js_mutation_cases((label, initializer + read) for label, initializer in (
+            ('spread override', f'const fixture = {{root: mkdtempSync(tmpdir()), ...{{root: {home}}}}};'),
+            ('quoted override', f'const fixture = {{root: mkdtempSync(tmpdir()), "root": {home}}};'),
+            ('computed override', f'const fixture = {{root: mkdtempSync(tmpdir()), [key]: {home}}};'),
+        ))
 
     def test_js_temp_database_parameter_bindings_shadow_outer_roots(self):
         imports = '''import { mkdtempSync, readFileSync } from 'node:fs';
