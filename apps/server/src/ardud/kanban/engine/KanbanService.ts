@@ -8838,12 +8838,50 @@ const make = Effect.gen(function* () {
     }
   });
 
+  const parkWorkerWaits = Effect.fn("KanbanService.parkWorkerWaits")(function* (
+    threadId: ThreadId,
+    cards: ReadonlyArray<KanbanCard>,
+  ) {
+    for (const card of cards) {
+      if (
+        !Rules.workerWaitDeferred(card) ||
+        card.workThreadId !== threadId ||
+        card.stalled !== null ||
+        (yield* activeWaitThreadRunning(card, threads))
+      )
+        continue;
+      const next = releaseToQueue(card, yield* nowIso);
+      // Cleanup can take turn admission itself; finish it before locking, then
+      // confirm idleness under the same lock used by evaluator parking.
+      yield* prepareTransition(next);
+      yield* turnAdmission.withLock(
+        threadId,
+        Effect.gen(function* () {
+          if (
+            !sameCardState(yield* store.card(card.id), card) ||
+            (yield* activeWaitThreadRunning(card, threadIo)) ||
+            Retries.heldByPause(yield* boardOf(card.boardId), card)
+          )
+            return;
+          yield* logEvent(next, { _tag: "system", component: "dispatcher" }, "moved", {
+            fromStage: card.stage,
+            toStage: next.stage,
+            body: "Turn ended; parked on the worker's wait",
+          });
+          yield* saveCard(next);
+          yield* kick;
+        }),
+      );
+    }
+  });
+
   /** Nudge a stopped worker once, then release cards still idle after the grace. */
   const nudgeWorker = Effect.fn("KanbanService.nudgeWorker")(function* (
     threadId: ThreadId,
     planned: ReadonlyArray<KanbanCard>,
   ) {
     if (waking(threadId)) return;
+    yield* parkWorkerWaits(threadId, planned);
     const cards: Array<KanbanCard> = [];
     for (const initial of planned) {
       const current = yield* store.card(initial.id);
@@ -9489,8 +9527,13 @@ const make = Effect.gen(function* () {
         if (failedRuns.size > 4096) failedRuns.delete(failedRuns.values().next().value!);
       }
     }
+    if (link.role === "work")
+      yield* parkWorkerWaits(threadId, yield* store.cardsByThread(threadId));
     const outage = failure !== null && Rules.isOutage(failure) ? failure : null;
-    if (outage !== null) {
+    if (
+      outage !== null &&
+      (link.role !== "work" || (yield* store.cardsByThread(threadId)).length > 0)
+    ) {
       // A card_edit switches the open thread's model without touching its link.
       // The failed run's own selection wins because that is the model that is down.
       const model =
@@ -9649,32 +9692,36 @@ const make = Effect.gen(function* () {
       // Paused: the card keeps its thread until probeOutages wakes it.
       if (outage !== null) return;
       if (failure !== null) {
+        // Pending work keeps a deferred wait owned until a later idle turn end.
+        const recovering = carried.filter((entry) => !Rules.workerWaitDeferred(entry));
+        if (recovering.length === 0) return;
         const reason = `Run failed: ${failure.message}`;
         const hasCurrentCarriedWork = Effect.fn("KanbanService.hasCurrentCarriedWork")(
           function* () {
             if (!(yield* failedRunIsCurrent())) return false;
             let eligible = false;
-            for (const entry of carried) {
+            for (const entry of recovering) {
               const current = yield* store.card(entry.id);
               if (
                 current !== null &&
                 current.stage === "working" &&
                 current.activeRole === "work" &&
                 current.activeThreadId === threadId &&
-                current.stalled === null
+                current.stalled === null &&
+                !Rules.workerWaitDeferred(current)
               )
                 eligible = true;
             }
             return eligible && (yield* failedRunIsCurrent());
           },
         );
-        const recentCompactions = yield* Effect.forEach(carried, (entry) =>
+        const recentCompactions = yield* Effect.forEach(recovering, (entry) =>
           compactedRecently(entry, at),
         );
         const hasRecentCompaction = recentCompactions.some(Boolean);
         const candidates =
           Rules.isContextFull(failure) && !Rules.isHandoffBudget(failure) && !hasRecentCompaction
-            ? yield* Effect.filter(carried, (entry) =>
+            ? yield* Effect.filter(recovering, (entry) =>
                 freshStartedRecently(entry, at).pipe(Effect.map((recent) => !recent)),
               )
             : [];
@@ -9691,7 +9738,7 @@ const make = Effect.gen(function* () {
           view?.state === "idle"
             ? yield* Effect.result(threads.send({ threadId, text: "/compact" }))
             : null;
-        for (const oldEntry of carried) {
+        for (const oldEntry of recovering) {
           if (
             expectedFailedWorkRunId === undefined &&
             !sameCardState(yield* store.card(oldEntry.id), oldEntry)
@@ -9705,7 +9752,8 @@ const make = Effect.gen(function* () {
               current.stage !== "working" ||
               current.activeRole !== "work" ||
               current.activeThreadId !== threadId ||
-              current.stalled !== null
+              current.stalled !== null ||
+              Rules.workerWaitDeferred(current)
             )
               continue;
             entry = current;
@@ -9752,7 +9800,8 @@ const make = Effect.gen(function* () {
               current.stage !== "working" ||
               current.activeRole !== "work" ||
               current.activeThreadId !== threadId ||
-              current.stalled !== null
+              current.stalled !== null ||
+              Rules.workerWaitDeferred(current)
             )
               continue;
             entry = current;
@@ -10933,8 +10982,15 @@ const make = Effect.gen(function* () {
                   if (board.pause && !board.pause.keep.includes(card.id)) return;
                   if ((yield* Ref.get(unresolvedTurnEnds)).has(threadId)) return;
                   if (discussionWakes.has(threadId)) return;
-                  // A paused worker waits for probeOutages, not a nudge.
-                  if ((yield* store.threadLink(threadId))?.paused) return;
+                  // Provider recovery owns nudges, but a deferred wait can park
+                  // once the work that held it after the outage has drained.
+                  if ((yield* store.threadLink(threadId))?.paused) {
+                    yield* parkWorkerWaits(threadId, [card]);
+                    const saved = yield* store.card(card.id);
+                    if (saved) updateCard(saved);
+                    else invalidateCards();
+                    return;
+                  }
                   const foundFailure = yield* Effect.result(threads.findLastFailure(threadId));
                   if (Result.isFailure(foundFailure)) {
                     yield* Ref.update(unresolvedTurnEnds, (all) => new Set(all).add(threadId));
@@ -14751,7 +14807,9 @@ const make = Effect.gen(function* () {
           });
         }
         const flagged: KanbanCard = {
-          ...card,
+          ...(reason !== null && card.activeThreadId !== null && Rules.workerWaitDeferred(card)
+            ? yield* moveWait(card, "todo", at, actor)
+            : card),
           stalled: reason === null ? null : { reason, by: actor, at },
           updatedAt: at,
         };
@@ -14888,7 +14946,11 @@ const make = Effect.gen(function* () {
         const wait = Waits.newWait(request, actor, at);
         // A new wait is a decision: a hold for the evaluator from the last one ends here.
         const next: KanbanCard = {
-          ...kanbanWithoutDeciding(card.activeThreadId === null ? card : releaseToQueue(card, at)),
+          ...kanbanWithoutDeciding(
+            card.activeThreadId === null || check.deferredUntilTurnEnds
+              ? card
+              : releaseToQueue(card, at),
+          ),
           wait,
           stalled: null,
           updatedAt: at,
@@ -14910,6 +14972,7 @@ const make = Effect.gen(function* () {
             toStage: card.stage === next.stage ? null : next.stage,
             body:
               Waits.waitSetBody(wait, known) +
+              (check.deferredUntilTurnEnds ? " (starts when your turn ends)" : "") +
               (card.stalled !== null ? ` (replaces the stalled flag: ${card.stalled.reason})` : ""),
           });
           yield* saveCard(next);

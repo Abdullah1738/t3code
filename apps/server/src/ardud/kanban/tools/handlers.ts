@@ -929,7 +929,14 @@ const handlers = {
           caller.actor,
         );
         return WAITS_ENGINE_WIRED
-          ? { card: waiting }
+          ? {
+              card: waiting,
+              ...(caller.actor._tag === "thread" &&
+              waiting.activeThreadId === caller.actor.threadId &&
+              waiting.activeRole === "work"
+                ? { note: "Wait set; it starts when your turn ends. End your turn now." }
+                : {}),
+            }
           : {
               card: waiting,
               note: "Saved and shown on the board. The board does not end waits by itself yet: keep your own check until it does.",

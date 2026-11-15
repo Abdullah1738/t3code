@@ -4911,7 +4911,7 @@ it.effect("card_wait validates the PR, the card, the time and the owner question
 });
 
 it.effect(
-  "card_wait takes over a stalled flag, holds a To-Do card back from the dispatcher, and refuses a running card",
+  "card_wait takes over a stalled flag, holds a To-Do card back from the dispatcher, and defers its running worker's wait",
   () => {
     const { layer, running: liveThreads } = fakeThreads();
     return Effect.gen(function* () {
@@ -4960,18 +4960,15 @@ it.effect(
       const running = (yield* kanban.card(other.id)).card;
       assert.isNotNull(running.activeThreadId);
       liveThreads.add(running.activeThreadId!);
-      // A card a thread is running isn't waiting; its own thread is told so.
+      // The wait must not free the slot while this worker still runs.
       const own = yield* call(running.activeThreadId!, "card_wait", {
         on: "time",
         until: "1970-01-02T00:00:00.000Z",
         note: "later",
       });
-      assert.isTrue(own.isError);
-      assert.include(
-        own.text,
-        "This card is yours and you are running, so the board can't park it. Ask your board evaluator to set this wait (card_ask with to: evaluator, giving on, until or target, and the note), then end your turn; the evaluator sets it once your run has ended.",
-      );
-      yield* store.putCard({ ...running, links: card.links });
+      assert.isFalse(own.isError, own.text);
+      assert.include(own.text, "Wait set; it starts when your turn ends. End your turn now.");
+      yield* store.putCard({ ...(yield* kanban.card(running.id)).card, links: card.links });
       const ci = yield* call(running.activeThreadId!, "card_wait", {
         on: "ci",
         pr: card.links[0]!.url,
@@ -4993,7 +4990,7 @@ it.effect(
         `card #${running.number} has a running thread, so it isn't waiting. Set the wait once the thread has handed the card on`,
       );
       const after = (yield* kanban.card(running.id)).card;
-      assert.isUndefined(after.wait);
+      assert.strictEqual(after.wait?.on, "time");
       assert.strictEqual(after.activeThreadId, running.activeThreadId);
       // And it can't touch another thread's card.
       const foreign = yield* call(running.activeThreadId!, "card_wait", {
@@ -5014,6 +5011,51 @@ const ownedWaitFixture = Effect.gen(function* () {
   const owned = (yield* fixture.kanban.card(fixture.other.id)).card;
   assert.isNotNull(owned.workThreadId);
   return { ...fixture, owned, worker: owned.workThreadId! };
+});
+
+it.effect("a worker's deferred wait is parked under turn admission", () => {
+  const fake = fakeThreads();
+  return Effect.gen(function* () {
+    const { kanban, store, owned, worker } = yield* ownedWaitFixture;
+    fake.running.add(worker);
+    const set = yield* call(worker, "card_wait", {
+      on: "time",
+      until: "1970-01-01T01:00:00.000Z",
+      note: "retry later",
+    });
+    assert.isFalse(set.isError, set.text);
+    fake.running.delete(worker);
+    const writing = yield* Deferred.make<void>();
+    const commit = yield* Deferred.make<void>();
+    const attempting = yield* Deferred.make<void>();
+    fake.storeControl.beforeCardEvent = (event) =>
+      event.body === "Turn ended; parked on the worker's wait"
+        ? Deferred.succeed(writing, undefined).pipe(Effect.andThen(Deferred.await(commit)))
+        : Effect.void;
+    const parking = yield* kanban.turnEnded(worker).pipe(Effect.forkChild);
+    yield* Deferred.await(writing);
+    const admission = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+    const starting = yield* Deferred.succeed(attempting, undefined).pipe(
+      Effect.andThen(
+        admission.withLock(
+          worker,
+          Effect.gen(function* () {
+            const parked = yield* store.card(owned.id);
+            assert.isNull(parked?.activeThreadId);
+            assert.strictEqual(parked?.workThreadId, worker);
+            fake.running.add(worker);
+          }),
+        ),
+      ),
+      Effect.forkChild,
+    );
+    yield* Deferred.await(attempting);
+    assert.isFalse(fake.running.has(worker));
+    yield* Deferred.succeed(commit, undefined);
+    yield* Fiber.join(parking);
+    yield* Fiber.join(starting);
+    assert.isTrue(fake.running.has(worker));
+  }).pipe(Effect.provide(fake.layer));
 });
 
 it.effect("#1462 evaluator parks an idle worker and expiry wakes that same thread", () => {
