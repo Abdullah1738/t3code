@@ -82,17 +82,30 @@ const GeneralEvent = Schema.Struct({
   readerWaitMs: Schema.optionalKey(Measurement),
   queryMs: Schema.optionalKey(Measurement),
   renderMs: Schema.optionalKey(Measurement),
-  inFlightAtStart: Schema.optionalKey(Schema.Struct({
-    session: Measurement,
-    overall: Measurement,
-  })),
-  threadReadStages: Schema.optionalKey(Schema.Array(Schema.Struct({
-    stage: Schema.Literals(["caller", "shell", "records", "timeline", "messages", "acknowledgement"]),
-    durationMs: Measurement,
-    completed: Schema.Boolean,
-    readerWaitMs: Measurement,
-    queryMs: Measurement,
-  })).check(Schema.isMaxLength(6))),
+  inFlightAtStart: Schema.optionalKey(
+    Schema.Struct({
+      session: Measurement,
+      overall: Measurement,
+    }),
+  ),
+  threadReadStages: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        stage: Schema.Literals([
+          "caller",
+          "shell",
+          "records",
+          "timeline",
+          "messages",
+          "acknowledgement",
+        ]),
+        durationMs: Measurement,
+        completed: Schema.Boolean,
+        readerWaitMs: Measurement,
+        queryMs: Measurement,
+      }),
+    ).check(Schema.isMaxLength(6)),
+  ),
   props: Schema.optionalKey(
     Schema.Struct({
       number: Schema.optionalKey(Measurement),

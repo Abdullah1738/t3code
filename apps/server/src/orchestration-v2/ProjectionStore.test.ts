@@ -7135,7 +7135,8 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       );
       const sourceAfterRollback = yield* projectionStore.getThreadProjection(sourceThreadId);
       const sourceForward = yield* projectionStore.getTimelinePage(sourceThreadId, {
-        view: "activity", limit: 1,
+        view: "activity",
+        limit: 1,
       });
       assert.deepEqual(sourceForward.items, sourceAfterRollback.visibleTurnItems.slice(0, 1));
       assert.equal(sourceForward.totalItems, sourceAfterRollback.visibleTurnItems.length);

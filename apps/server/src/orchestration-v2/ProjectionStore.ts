@@ -6155,10 +6155,12 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 AND request.type = 'run_interrupt_request'))
       ), page AS (
         SELECT turn_item_id, position FROM visible
-        WHERE ${options.itemId === undefined
-          ? sql`position > ${options.afterPosition ?? -1}
+        WHERE ${
+          options.itemId === undefined
+            ? sql`position > ${options.afterPosition ?? -1}
               ${options.view === "activity" ? sql`` : sql`AND type IN ('user_message', 'assistant_message', 'proposed_plan')`}`
-          : sql`turn_item_id = ${options.itemId}`}
+            : sql`turn_item_id = ${options.itemId}`
+        }
         ORDER BY position ASC LIMIT ${options.limit + 1}
       )
       SELECT (SELECT COUNT(*) FROM visible) AS total_items, page.turn_item_id, page.position
@@ -6170,9 +6172,11 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             WHERE thread_id = ${threadId} AND turn_item_id = ${row.turn_item_id}`;
           const decoded = yield* decodeRows(decodeTurnItemPayload, threadId)(payloads);
           const item = decoded[0];
-          if (item === undefined) return yield* new ProjectionStoreReadError({
-            threadId, cause: "Timeline item disappeared during snapshot",
-          });
+          if (item === undefined)
+            return yield* new ProjectionStoreReadError({
+              threadId,
+              cause: "Timeline item disappeared during snapshot",
+            });
           return {
             position: row.position!,
             sourceThreadId: threadId,

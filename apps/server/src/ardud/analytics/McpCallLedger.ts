@@ -28,23 +28,25 @@ const make = Effect.gen(function* () {
   let active = 0;
   const sessions = new Map<string, number>();
   // The tools/call request already owns this span boundary.
-  const enter = Effect.fnUntraced((session: string) => Effect.sync(() => {
-    active += 1;
-    const count = (sessions.get(session) ?? 0) + 1;
-    sessions.set(session, count);
-    let released = false;
-    return {
-      inFlightAtStart: { session: count, overall: active },
-      release: Effect.sync(() => {
-        if (released) return;
-        released = true;
-        active -= 1;
-        const remaining = (sessions.get(session) ?? 1) - 1;
-        if (remaining === 0) sessions.delete(session);
-        else sessions.set(session, remaining);
-      }),
-    };
-  }));
+  const enter = Effect.fnUntraced(function* (session: string) {
+    return yield* Effect.sync(() => {
+      active += 1;
+      const count = (sessions.get(session) ?? 0) + 1;
+      sessions.set(session, count);
+      let released = false;
+      return {
+        inFlightAtStart: { session: count, overall: active },
+        release: Effect.sync(() => {
+          if (released) return;
+          released = true;
+          active -= 1;
+          const remaining = (sessions.get(session) ?? 1) - 1;
+          if (remaining === 0) sessions.delete(session);
+          else sessions.set(session, remaining);
+        }),
+      };
+    });
+  });
   // The request already has a span. Tracking only changes bounded call metadata in memory.
   const begin = Effect.fnUntraced(function* (interrupted: () => Effect.Effect<AnalyticsEvent>) {
     return yield* Effect.sync(() => {

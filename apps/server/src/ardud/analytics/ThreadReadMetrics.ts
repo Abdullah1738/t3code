@@ -38,29 +38,36 @@ export const read = Effect.fnUntraced(function* <A, E, R>(
         // separate acquisition metadata and must not be subtracted again.
         target.queryMs += observation.durationMs;
         metrics.queryMs += observation.durationMs;
-        return parentStatements !== undefined && observation.durationMs >= parentStatements.slowThresholdMs
+        return parentStatements !== undefined &&
+          observation.durationMs >= parentStatements.slowThresholdMs
           ? parentStatements.record(observation)
           : Effect.void;
       },
     }),
-    Effect.ensuring(Effect.gen(function* () {
-      const elapsed = Number((yield* Clock.monotonicTimeNanos) - started) / 1e6;
-      target.durationMs += elapsed;
-      target.completed = true;
-      if (metrics.activeStage === activeStage) delete metrics.activeStage;
-    })),
+    Effect.ensuring(
+      Effect.gen(function* () {
+        const elapsed = Number((yield* Clock.monotonicTimeNanos) - started) / 1e6;
+        target.durationMs += elapsed;
+        target.completed = true;
+        if (metrics.activeStage === activeStage) delete metrics.activeStage;
+      }),
+    ),
   );
 });
 
 export const render = Effect.fnUntraced(function* <A>(build: () => A) {
   const call = yield* Effect.serviceOption(McpCall);
   const started = yield* Clock.monotonicTimeNanos;
-  return yield* Effect.sync(build).pipe(Effect.ensuring(Effect.gen(function* () {
-    if (Option.isSome(call) && call.value.threadRead !== undefined)
-      call.value.threadRead.renderMs += Number((yield* Clock.monotonicTimeNanos) - started) / 1e6;
-  })));
+  return yield* Effect.sync(build).pipe(
+    Effect.ensuring(
+      Effect.gen(function* () {
+        if (Option.isSome(call) && call.value.threadRead !== undefined)
+          call.value.threadRead.renderMs +=
+            Number((yield* Clock.monotonicTimeNanos) - started) / 1e6;
+      }),
+    ),
+  );
 });
-
 
 // Shutdown records the ledger before interrupting request fibers. Copy the active
 // duration now, without waiting for a database stage's finalizer to run.
@@ -71,9 +78,11 @@ export function snapshot(metrics: NonNullable<McpCall["Service"]["threadRead"]>,
     renderMs: metrics.renderMs,
     threadReadStages: metrics.threadReadStages.map((row) => ({
       ...row,
-      durationMs: metrics.activeStage?.row === row
-        ? metrics.activeStage.durationBefore + Math.max(0, Number(now - metrics.activeStage.started) / 1e6)
-        : row.durationMs,
+      durationMs:
+        metrics.activeStage?.row === row
+          ? metrics.activeStage.durationBefore +
+            Math.max(0, Number(now - metrics.activeStage.started) / 1e6)
+          : row.durationMs,
     })),
   };
 }

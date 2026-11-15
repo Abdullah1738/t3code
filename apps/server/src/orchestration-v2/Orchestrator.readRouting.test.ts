@@ -166,7 +166,10 @@ it.live(
           assert.equal(result.timeline.items[0]?.item.type, "user_message");
           assert.equal(result.timeline.totalItems, 1);
           const timelineItem = result.timeline.items[0]!.item;
-          assert.equal(timelineItem.type === "user_message" ? timelineItem.text : null, messageText);
+          assert.equal(
+            timelineItem.type === "user_message" ? timelineItem.text : null,
+            messageText,
+          );
           assert.deepEqual(
             result.records.messages.map((item) => item.text),
             [messageText],

@@ -22,109 +22,184 @@ import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 import { idleThreadProjection, liveThreadShell } from "./McpToolAccess.testkit.ts";
 
-it.effect.each(["same caller", "different callers"] as const)("reads three threads with background reader and writer held: %s", (mode) =>
-  Effect.gen(function* () {
-    const fs = yield* FileSystem.FileSystem;
-    const path = yield* Path.Path;
-    const dir = yield* fs.makeTempDirectoryScoped({ prefix: "thread-read-" });
-    yield* Effect.gen(function* () {
-      const sql = yield* SqlClient.SqlClient;
-      yield* sql`PRAGMA journal_mode=WAL`;
-      yield* sql`CREATE TABLE fixture (id INTEGER)`;
-      const backgroundHeld = yield* Deferred.make<void>();
-      const writerHeld = yield* Deferred.make<void>();
-      const release = yield* Deferred.make<void>();
-      const hold = (entered: Deferred.Deferred<void>) => sql.withTransaction(Effect.gen(function* () {
-        yield* sql`SELECT 1`;
-        yield* Deferred.succeed(entered, undefined);
-        yield* Deferred.await(release);
-      }));
-      const background = yield* hold(backgroundHeld).pipe(SqliteClient.readOnly, SqliteClient.backgroundReads, Effect.forkChild);
-      yield* Deferred.await(backgroundHeld);
-      const writer = yield* hold(writerHeld).pipe(Effect.forkChild);
-      yield* Deferred.await(writerHeld);
-      const target = ThreadId.make("thread:read-target");
-      const shell = liveThreadShell(target);
-      const message = {
-        id: MessageId.make("message:read"), threadId: target, runId: null, nodeId: null,
-        role: "user" as const, text: "read while lanes stay held", attachments: [], streaming: false,
-        createdBy: "user" as const, creationSource: "web" as const, createdAt: shell.createdAt, updatedAt: shell.updatedAt,
-      };
-      const item = {
-        id: TurnItemId.make("item:read"), threadId: target, runId: null, nodeId: null,
-        providerThreadId: null, providerTurnId: null, nativeItemRef: null, parentItemId: null,
-        ordinal: 0, status: "completed" as const, title: null,
-        startedAt: shell.createdAt, completedAt: shell.createdAt, updatedAt: shell.updatedAt,
-        type: "user_message" as const, inputIntent: "turn_start" as const,
-        createdBy: "user" as const, creationSource: "web" as const,
-        messageId: message.id, text: message.text, attachments: [],
-      };
-      const records = { ...idleThreadProjection(shell), messages: [message] };
-      const query = <A>(value: A) => sql.withTransaction(sql`SELECT 1`).pipe(
-        SqliteClient.readOnly, Effect.as(value), Effect.orDie,
-      );
-      const entered = yield* Deferred.make<void>();
-      const releaseReads = yield* Deferred.make<void>();
-      let timelineCount = 0;
-      const states = [0, 1, 2].map((): McpCall["Service"] => ({
-        callerResolved: false, callerResolveMs: 0, readerLane: "background", phase: "handler", saved: "unknown",
-        threadRead: { readerWaitMs: 0, queryMs: 0, renderMs: 0, threadReadStages: [] },
-      }));
-      const dependencies = Layer.mergeAll(
-        ServerSettings.layerTest(),
-        Layer.mock(ThreadManagement.ThreadManagementService)({
-          getCallerRow: (id) => Effect.succeed(liveThreadShell(id)),
-          getThreadShell: () => query(shell),
-          getProjectThreadRecords: () => query(records),
-          getThreadRecords: () => query(records),
-          getTimelinePage: () => query({
-            items: [{ position: 0, sourceThreadId: target, sourceItemId: item.id, visibility: "local" as const, item }],
-            totalItems: 1, hasMore: false,
-          }).pipe(
-            Effect.tap(() => Effect.gen(function* () {
-              timelineCount += 1;
-              if (timelineCount === 3) yield* Deferred.succeed(entered, undefined);
-              yield* Deferred.await(releaseReads);
-            })),
-          ),
-        }),
-        Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
-        Layer.mock(ProviderAdapters.ProviderAdapterRegistryV2)({}),
-        Layer.mock(ProjectService.ProjectService)({}),
-        Layer.mock(SecretRequests.SecretRequests)({}),
-        Layer.mock(ScheduledTasks.ScheduledTaskService)({}),
-        Layer.mock(ThreadLaunch.ThreadLaunchService)({}),
-        Layer.mock(GitVcsDriver.GitVcsDriver)({}),
-      );
+it.effect.each(["same caller", "different callers"] as const)(
+  "reads three threads with background reader and writer held: %s",
+  (mode) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "thread-read-" });
       yield* Effect.gen(function* () {
-        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
-        const reads = yield* Effect.forEach(states, (state, index) => service.readThread({
-          environmentId: EnvironmentId.make("env:read"),
-          requestNamespace: mode === "same caller" ? "read" : `read:${index}`,
-          thread: { threadId: ThreadId.make(mode === "same caller" ? "thread:caller" : `thread:caller:${index}`), providerInstanceId: shell.providerInstanceId, providerSessionId: "read" },
-          client: undefined, capabilities: new Set(["orchestration"]), issuedAt: 1,
-        }, { threadId: target, limit: 1, runLimit: 1 }).pipe(Effect.provideService(McpCall, state)),
-          { concurrency: "unbounded" }).pipe(Effect.forkChild);
-        yield* Deferred.await(entered);
-        assert.equal(timelineCount, 3);
-        yield* Deferred.succeed(releaseReads, undefined);
-        for (const result of yield* Fiber.join(reads)) {
-          assert.lengthOf(result.items, 1);
-          assert.equal(result.items[0]?.text, message.text);
-        }
-        assert.isUndefined(background.pollUnsafe());
-        assert.isUndefined(writer.pollUnsafe());
-        for (const state of states) assert.deepEqual(state.threadRead?.threadReadStages.map((row) => row.stage),
-          ["caller", "shell", "records", "timeline", "messages", "acknowledgement"]);
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`PRAGMA journal_mode=WAL`;
+        yield* sql`CREATE TABLE fixture (id INTEGER)`;
+        const backgroundHeld = yield* Deferred.make<void>();
+        const writerHeld = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const hold = (entered: Deferred.Deferred<void>) =>
+          sql.withTransaction(
+            Effect.gen(function* () {
+              yield* sql`SELECT 1`;
+              yield* Deferred.succeed(entered, undefined);
+              yield* Deferred.await(release);
+            }),
+          );
+        const background = yield* hold(backgroundHeld).pipe(
+          SqliteClient.readOnly,
+          SqliteClient.backgroundReads,
+          Effect.forkChild,
+        );
+        yield* Deferred.await(backgroundHeld);
+        const writer = yield* hold(writerHeld).pipe(Effect.forkChild);
+        yield* Deferred.await(writerHeld);
+        const target = ThreadId.make("thread:read-target");
+        const shell = liveThreadShell(target);
+        const message = {
+          id: MessageId.make("message:read"),
+          threadId: target,
+          runId: null,
+          nodeId: null,
+          role: "user" as const,
+          text: "read while lanes stay held",
+          attachments: [],
+          streaming: false,
+          createdBy: "user" as const,
+          creationSource: "web" as const,
+          createdAt: shell.createdAt,
+          updatedAt: shell.updatedAt,
+        };
+        const item = {
+          id: TurnItemId.make("item:read"),
+          threadId: target,
+          runId: null,
+          nodeId: null,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal: 0,
+          status: "completed" as const,
+          title: null,
+          startedAt: shell.createdAt,
+          completedAt: shell.createdAt,
+          updatedAt: shell.updatedAt,
+          type: "user_message" as const,
+          inputIntent: "turn_start" as const,
+          createdBy: "user" as const,
+          creationSource: "web" as const,
+          messageId: message.id,
+          text: message.text,
+          attachments: [],
+        };
+        const records = { ...idleThreadProjection(shell), messages: [message] };
+        const query = <A>(value: A) =>
+          sql
+            .withTransaction(sql`SELECT 1`)
+            .pipe(SqliteClient.readOnly, Effect.as(value), Effect.orDie);
+        const entered = yield* Deferred.make<void>();
+        const releaseReads = yield* Deferred.make<void>();
+        let timelineCount = 0;
+        const states = [0, 1, 2].map((): McpCall["Service"] => ({
+          callerResolved: false,
+          callerResolveMs: 0,
+          readerLane: "background",
+          phase: "handler",
+          saved: "unknown",
+          threadRead: { readerWaitMs: 0, queryMs: 0, renderMs: 0, threadReadStages: [] },
+        }));
+        const dependencies = Layer.mergeAll(
+          ServerSettings.layerTest(),
+          Layer.mock(ThreadManagement.ThreadManagementService)({
+            getCallerRow: (id) => Effect.succeed(liveThreadShell(id)),
+            getThreadShell: () => query(shell),
+            getProjectThreadRecords: () => query(records),
+            getThreadRecords: () => query(records),
+            getTimelinePage: () =>
+              query({
+                items: [
+                  {
+                    position: 0,
+                    sourceThreadId: target,
+                    sourceItemId: item.id,
+                    visibility: "local" as const,
+                    item,
+                  },
+                ],
+                totalItems: 1,
+                hasMore: false,
+              }).pipe(
+                Effect.tap(() =>
+                  Effect.gen(function* () {
+                    timelineCount += 1;
+                    if (timelineCount === 3) yield* Deferred.succeed(entered, undefined);
+                    yield* Deferred.await(releaseReads);
+                  }),
+                ),
+              ),
+          }),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+          Layer.mock(ProviderAdapters.ProviderAdapterRegistryV2)({}),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTasks.ScheduledTaskService)({}),
+          Layer.mock(ThreadLaunch.ThreadLaunchService)({}),
+          Layer.mock(GitVcsDriver.GitVcsDriver)({}),
+        );
+        yield* Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const reads = yield* Effect.forEach(
+            states,
+            (state, index) =>
+              service
+                .readThread(
+                  {
+                    environmentId: EnvironmentId.make("env:read"),
+                    requestNamespace: mode === "same caller" ? "read" : `read:${index}`,
+                    thread: {
+                      threadId: ThreadId.make(
+                        mode === "same caller" ? "thread:caller" : `thread:caller:${index}`,
+                      ),
+                      providerInstanceId: shell.providerInstanceId,
+                      providerSessionId: "read",
+                    },
+                    client: undefined,
+                    capabilities: new Set(["orchestration"]),
+                    issuedAt: 1,
+                  },
+                  { threadId: target, limit: 1, runLimit: 1 },
+                )
+                .pipe(Effect.provideService(McpCall, state)),
+            { concurrency: "unbounded" },
+          ).pipe(Effect.forkChild);
+          yield* Deferred.await(entered);
+          assert.equal(timelineCount, 3);
+          yield* Deferred.succeed(releaseReads, undefined);
+          for (const result of yield* Fiber.join(reads)) {
+            assert.lengthOf(result.items, 1);
+            assert.equal(result.items[0]?.text, message.text);
+          }
+          assert.isUndefined(background.pollUnsafe());
+          assert.isUndefined(writer.pollUnsafe());
+          for (const state of states)
+            assert.deepEqual(
+              state.threadRead?.threadReadStages.map((row) => row.stage),
+              ["caller", "shell", "records", "timeline", "messages", "acknowledgement"],
+            );
+        }).pipe(
+          Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(dependencies))),
+          Effect.ensuring(Deferred.succeed(release, undefined)),
+        );
+        yield* Fiber.join(background);
+        yield* Fiber.join(writer);
       }).pipe(
-        Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(dependencies))),
-        Effect.ensuring(Deferred.succeed(release, undefined)),
+        Effect.provide(
+          SqliteClient.layer({
+            filename: path.join(dir, "test.sqlite"),
+            readerWorker: true,
+            foregroundReaderSlots: 1,
+            backgroundReaderSlots: 1,
+          }),
+        ),
       );
-      yield* Fiber.join(background);
-      yield* Fiber.join(writer);
-    }).pipe(Effect.provide(SqliteClient.layer({
-      filename: path.join(dir, "test.sqlite"), readerWorker: true,
-      foregroundReaderSlots: 1, backgroundReaderSlots: 1,
-    })));
-  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
