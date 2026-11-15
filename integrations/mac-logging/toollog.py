@@ -215,7 +215,8 @@ def cpu_fields(values):
     from cpu_labels import janitor_redact
     result = {}
     numeric = {'windowS', 'cpuS', 'totalCpuPct', 'ncpu', 'processCount', 'runnable',
-               'uninterruptible', 'pid', 'ppid', 'count', 'cpuPct', 'rssMb'}
+               'uninterruptible', 'pid', 'ppid', 'count', 'cpuPct', 'rssMb',
+               'skippedLines', 'badLines', 'lines', 'exiting'}
 
     def number(value):
         return finite_number(value) and 0 <= value <= 1e15
@@ -236,6 +237,8 @@ def cpu_fields(values):
             result[key] = value
         elif key == 'baseline' and type(value) is bool:
             result[key] = value
+        elif key == 'badLine':
+            result[key] = label(value, 200)
         elif key in ('failure', 'hintError') and (value is None or value in MEMORY_ERRORS):
             result[key] = value
         elif key == 'load' and (value is None or isinstance(value, list)):

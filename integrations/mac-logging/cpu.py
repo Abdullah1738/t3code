@@ -8,7 +8,7 @@ import time
 
 from cpu_labels import family, script_hint
 from jobs import read_state, save_state, state_path
-from toollog import emit, finite_number
+from toollog import emit, finite_number, cpu_fields
 
 PS = ['/bin/ps', '-axo', 'pid=,ppid=,time=,rss=,state=,lstart=,etime=,comm=']
 
@@ -24,28 +24,42 @@ def seconds(value):
     return int(days or 0)*86400 + sum(float(part)*60**i for i, part in enumerate(reversed(clock.split(':'))))
 
 
-def parse_ps(text):
+def parse_ps(text, diagnostics=None):
+    diagnostics = diagnostics if diagnostics is not None else {}
     rows = []
     seen = set()
+    total = bad = 0
+    first_bad = None
     for line in text.splitlines():
         if not line.strip():
             continue
-        parts = line.split(None, 11)
-        if len(parts) != 12:
-            raise ProbeError('parse')
+        total += 1
         try:
+            parts = line.split(None, 11)
+            if len(parts) != 12:
+                raise ValueError()
             pid, ppid, rss = int(parts[0]), int(parts[1]), int(parts[3])
             start = ' '.join(parts[5:10])
             time.strptime(start, '%a %b %d %H:%M:%S %Y')
-            if min(pid, ppid, rss) < 0 or pid in seen or not re.fullmatch(r'[A-Za-z+<>-]{1,16}', parts[4]):
+            if min(pid, ppid, rss) < 0 or pid in seen or not re.fullmatch(r'[A-Za-z?+<>-]{1,16}', parts[4]):
                 raise ValueError()
             seconds(parts[10])
+            comm = parts[11]
+            if comm.startswith('(') and comm.endswith(')'):
+                comm = comm[1:-1]
             rows.append(dict(pid=pid, ppid=ppid, cpuS=seconds(parts[2]), rssMb=rss/1024,
-                             state=parts[4], start=start, etime=parts[10], family=family(parts[11])))
+                             state=parts[4], start=start, etime=parts[10], family=family(comm)))
             seen.add(pid)
-        except (ValueError, OverflowError):
-            raise ProbeError('parse')
-    if not rows:
+        except (ValueError, OverflowError, ProbeError):
+            bad += 1
+            if first_bad is None:
+                # Reuse the logger's janitor redaction before truncation. Never
+                # expose raw process identifiers or home paths in diagnostics.
+                tail = line.split(None, 2)
+                first_bad = cpu_fields(dict(badLine='PID PPID '+(tail[2] if len(tail) == 3 else '[incomplete]'))).get('badLine')
+    diagnostics.update(skippedLines=bad)
+    if not rows or bad*10 > total:
+        diagnostics.update(badLine=first_bad, badLines=bad, lines=total)
         raise ProbeError('parse')
     return rows
 
@@ -97,13 +111,17 @@ def deltas(rows, previous, now):
                  totalCpuPct=round(total/window*100, 3) if valid else None,
                  processCount=len(rows), runnable=sum(p['state'].startswith('R') for p in rows),
                  uninterruptible=sum(p['state'].startswith('U') for p in rows), families=groups,
+                 exiting=sum(p['state'].startswith('?') for p in rows),
                  top=sorted(top, key=lambda p: (-p['cpuPct'], p['pid']))[:20])
-    state = dict(at=now, processes={str(p['pid']): dict(start=p['start'], cpuS=p['cpuS']) for p in rows})
+    # Exiting rows have reset CPU counters; don't seed a later delta from zero.
+    state = dict(at=now, processes={str(p['pid']): dict(start=p['start'], cpuS=p['cpuS'])
+                                    for p in rows if not p['state'].startswith('?')})
     return props, state
 
 
 def hints(top, rows, run):
-    selected = {p['pid']: p for p in top if p['family'] in ('node', 'bun', 'python')}
+    live = {p['pid'] for p in rows if not p['state'].startswith('?')}
+    selected = {p['pid']: p for p in top if p['pid'] in live and p['family'] in ('node', 'bun', 'python')}
     if not selected:
         return None
     starts = {p['pid']: p['start'] for p in rows}
@@ -127,6 +145,7 @@ def hints(top, rows, run):
 
 def sample(run=subprocess.run, clock=time.monotonic):
     started = clock()
+    diagnostics = {}
     try:
         with state_path('cpu').with_suffix('.lock').open('a') as lock:
             os.chmod(lock.name, 0o600)
@@ -134,10 +153,11 @@ def sample(run=subprocess.run, clock=time.monotonic):
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return None
-            rows = parse_ps(command(PS, run))
+            rows = parse_ps(command(PS, run), diagnostics)
             # Apple's Python 3.9 monotonic epoch is per process, unlike Unix time.
             observed = time.time()
             props, state = deltas(rows, read_state('cpu'), observed)
+            props.update(diagnostics)
             try:
                 props['load'] = list(os.getloadavg())
             except OSError:
@@ -150,7 +170,7 @@ def sample(run=subprocess.run, clock=time.monotonic):
             return props
     except (ProbeError, OSError) as exc:
         failure = str(exc) if isinstance(exc, ProbeError) else 'unavailable'
-        props = dict(failure=failure)
+        props = dict(diagnostics, failure=failure)
         emit('cpu', 'error', 'cpu.sample', ok=False, duration_ms=(clock()-started)*1000,
              props=props, error_tag='cpu.'+failure)
         return props
