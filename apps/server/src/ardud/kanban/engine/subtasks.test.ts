@@ -1650,6 +1650,72 @@ describe("planSubtasks approval clock", () => {
     return plan.subtasks[0]!;
   };
 
+  const literalChanges = [
+    { name: "case", text: "Release", replacement: "release" },
+    { name: "upper case", text: "Release", replacement: "RELEASE" },
+    { name: "path case", text: "/srv/Release", replacement: "/srv/release" },
+    { name: "quoted case", text: '"Release"', replacement: '"release"' },
+    { name: "quoted punctuation", text: '"alpha!"', replacement: '"alpha"' },
+    { name: "embedded punctuation", text: "alpha.beta", replacement: "alphabeta" },
+    { name: "prose as a value", text: "Restart the helper!", replacement: "Restart the helper" },
+    ...[".", "!", ";", ":"].flatMap((suffix) => [
+      { name: `remove ${suffix}`, text: `alpha${suffix}`, replacement: "alpha" },
+      { name: `add ${suffix}`, text: "alpha", replacement: `alpha${suffix}` },
+    ]),
+  ];
+
+  it.each(
+    (
+      [
+        { gate: "deploy", prefix: "Deploy branch " },
+        { gate: "money", prefix: "Pay invoice " },
+        { gate: "secret", prefix: "Set password to " },
+      ] as const
+    ).flatMap(({ gate, prefix }) =>
+      literalChanges.map(({ name, text, replacement }) => ({
+        gate,
+        name,
+        text: prefix + text,
+        replacement: prefix + replacement,
+      })),
+    ),
+  )(
+    "restarts $gate approval for literal $name: $text → $replacement",
+    ({ gate, text, replacement }) => {
+      for (const taskOwner of ["evaluator", "script"] as const) {
+        for (const gateSource of ["guessed", "set"] as const) {
+          const script = taskOwner === "script" ? "land" : undefined;
+          const known = { ...step, text, gate, owner: taskOwner, gateSource, script };
+          const saved = replan(known, { id: "s4", text: replacement, script });
+          expect(saved).toMatchObject({ gate, createdAt: edited });
+          const pending = {
+            ...signoff,
+            closedAt: edited,
+            answer: { verdict: "approved" as const, by: owner, at: edited },
+          };
+          expect(approvalProblem({ ...approvedCard(saved), asks: [pending] }, saved)).toContain(
+            `since ${edited}`,
+          );
+          expect(
+            approvalProblem({ ...approvedCard(saved), asks: [{ ...pending, at: edited }] }, saved),
+          ).toBeNull();
+        }
+      }
+    },
+  );
+
+  it.each([
+    { gate: "deploy", text: "Restart the Helper", replacement: "Restart the helper" },
+    { gate: "money", text: "Pay the Invoice", replacement: "Pay the invoice" },
+    { gate: "secret", text: "Rotate the API Key", replacement: "Rotate the API key" },
+  ] as const)(
+    "preserves object case in generic-looking $gate prose",
+    ({ gate, text, replacement }) => {
+      const saved = replan({ ...step, text, gate }, { id: "s4", text: replacement });
+      expect(saved.createdAt).toBe(edited);
+    },
+  );
+
   it("requires fresh approval for #621's gated read-back reword, then preserves a same-text re-listing", () => {
     const known = {
       ...step,
@@ -1724,16 +1790,17 @@ describe("planSubtasks approval clock", () => {
     },
   );
 
+  // Punctuation is cosmetic only when the complete instruction supplies no literal target/value.
   it.each(["deploy", "money", "secret"] as const)("preserves cosmetic %s edits", (gate) => {
     const text = {
-      deploy: "Deploy build 41",
+      deploy: "Restart the helper",
       money: "Pay the invoice",
       secret: "Rotate the API key",
     }[gate];
     for (const replacement of [
       `  ${text}  `,
       text.replaceAll(" ", " \t\n "),
-      text.toUpperCase(),
+      text.replace(/^\w+/, (verb) => verb.toUpperCase()),
       ...[".", "!", ";", ":"].map((suffix) => `${text}${suffix}`),
     ]) {
       const saved = replan({ ...step, text, gate }, { id: "s4", text: replacement });
@@ -1741,6 +1808,21 @@ describe("planSubtasks approval clock", () => {
       expect(approvalProblem(approvedCard(saved), saved)).toBeNull();
     }
   });
+
+  it.each([
+    { gate: "deploy", text: "Deploy branch Release" },
+    { gate: "money", text: "Pay invoice Alpha" },
+    { gate: "secret", text: "Set password to alpha!" },
+  ] as const)(
+    "keeps whitespace-only $gate edits cosmetic with a literal value",
+    ({ gate, text }) => {
+      const saved = replan(
+        { ...step, text, gate },
+        { id: "s4", text: `  ${text.replaceAll(" ", " \t\n ")}  ` },
+      );
+      expect(saved.createdAt).toBe(before);
+    },
+  );
 
   it.each(["ownerOnly", "interrupting"] as const)(
     "keeps the clock for an existing gate's %s toggle",

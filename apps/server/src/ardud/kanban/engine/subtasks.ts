@@ -704,14 +704,15 @@ export const approvalProblem = (
 export const MAX_SUBTASKS = 30;
 export const MAX_TEXT = 500;
 
-// Only presentation changes may reuse approval for the previous wording.
-const approvalText = (text: string) =>
-  text
-    .trim()
-    .replace(/\s+/g, " ")
-    .replace(/[.!;:]+$/, "")
-    .trimEnd()
-    .toLowerCase();
+// Only complete generic instructions have unambiguous sentence punctuation; arguments stay literal.
+const approvalProse =
+  /^(?:(?:deploy|install) the (?:build|release)|restart the (?:helper|service|server)|pay the invoice|rotate the API key)[.!;:]*$/;
+
+const approvalText = (text: string) => {
+  const normalized = text.trim().replace(/\s+/g, " ");
+  const prose = normalized.replace(/^\w+/, (verb) => verb.toLowerCase());
+  return approvalProse.test(prose) ? prose.replace(/[.!;:]+$/, "") : normalized;
+};
 
 export interface SubtaskInput {
   /** An existing id alone keeps the subtask unchanged; leave out for a new one. */
