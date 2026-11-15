@@ -209,6 +209,8 @@ it.effect.each([
               runId: selected ?? RunId.make("run:12"),
               status: "running",
               timedOut: true,
+              startPending: true,
+              startProgress: null,
             });
             assert.equal(state.waitStage, "waiting");
             assert.equal(state.readerLane, "background");
@@ -256,7 +258,7 @@ it.effect.each([
   Effect.gen(function* () {
     const entered = yield* Deferred.make<void>();
     const release = yield* Deferred.make<void>();
-    const waiting = yield* Deferred.make<void>();
+    const waiting = yield* Deferred.make<number>();
     const row = idleThreadProjection(base);
     const state: McpCall["Service"] = {
       callerResolved: false,
@@ -311,8 +313,7 @@ it.effect.each([
             if (scenario === "idle") return { threadId: targetId, run: null, timedOut: false };
             if (scenario === "terminal")
               return { threadId: targetId, run: run(12, "completed"), timedOut: false };
-            assert.equal(timeoutMs, 400);
-            yield* Deferred.succeed(waiting, undefined);
+            yield* Deferred.succeed(waiting, timeoutMs);
             return yield* Effect.never;
           }),
       }),
@@ -339,8 +340,11 @@ it.effect.each([
         yield* Deferred.await(entered);
         yield* TestClock.adjust(600);
         yield* Deferred.succeed(release, undefined);
-        yield* Deferred.await(waiting);
-        yield* TestClock.adjust(400);
+        const timeoutMs = yield* Deferred.await(waiting);
+        const remaining = 1000 - 600;
+        // The event wait leaves part of the remaining budget for the final native-ACK read.
+        assert.equal(timeoutMs, Math.max(1, remaining - Math.min(250, remaining / 4)));
+        yield* TestClock.adjust(remaining);
         assert.isDefined(pending.pollUnsafe());
       }
       const result = yield* Fiber.join(pending);
