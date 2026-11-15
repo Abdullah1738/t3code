@@ -473,6 +473,65 @@ class GuardTests(unittest.TestCase):
                         if extension == 'mjs':
                             self.assertEqual(self.classify("node - <<'BODY'\n" + source + 'BODY'), READ)
 
+    def test_foreign_state_sqlite_basename_reuse(self):
+        foreign = '/Users/ardud/.robob/other/state.sqlite'
+        imports = 'import { DatabaseSync } from "node:sqlite";\nimport path from "node:path";\n'
+        for expression in [
+            'path.join(path.dirname(path.dirname(foreign)), "userdata", path.basename(foreign))',
+            'path.join(process.env.D, path.basename(foreign))',
+            'path.join(process.env.D, foreign.split("/").pop())',
+            'foreign.replace("/other/", "/userdata/")',
+            json.dumps(foreign) + '.replace("/other/", "/userdata/")',
+        ]:
+            with self.subTest(language='node', expression=expression):
+                source = imports + f'const foreign = "{foreign}";\nnew DatabaseSync({expression});\n'
+                script = self.write('tmp/basename.mjs', source)
+                command = 'node ' + shlex.quote(str(script))
+                self.assertEqual(self.classify(command), SCRIPT)
+                self.adapters(command, SCRIPT)
+                stdin = "node - <<'JS'\n" + source + 'JS'
+                self.assertEqual(self.classify(stdin), READ)
+                self.adapters(stdin, READ)
+        for target in [
+            '"$(dirname "$(dirname "$foreign")")/userdata/$(basename "$foreign")"',
+            '"$D/$(basename "$foreign")"',
+        ]:
+            source = f'foreign="{foreign}"\nsqlite3 -readonly {target} "select 1"\n'
+            script = self.write('tmp/basename.sh', source)
+            for runner in ['bash', 'zsh']:
+                with self.subTest(language='shell', runner=runner, target=target):
+                    command = runner + ' ' + shlex.quote(str(script)) + ' owner'
+                    self.assertEqual(self.classify(command), SCRIPT)
+                    self.adapters(command, SCRIPT)
+
+    def test_foreign_state_sqlite_direct_reader_operands(self):
+        for path in ['/Users/ardud/.robob/other/state.sqlite',
+                     '/Users/ardud/.local/share/opencode/state.sqlite',
+                     '~/.config/spectrum-bridge/state.sqlite',
+                     '$HOME/.config/tool/state.sqlite', '${HOME}/state.sqlite', '/state.sqlite']:
+            imports = 'import { DatabaseSync } from "node:sqlite";\nimport fs from "node:fs";\n'
+            for reader in ['new DatabaseSync', 'fs.readFileSync']:
+                with self.subTest(path=path, reader=reader):
+                    source = imports + f'{reader}({json.dumps(path)});\n'
+                    script = self.write('tmp/direct-foreign.mjs', source)
+                    self.assertIsNone(self.classify('node ' + shlex.quote(str(script))))
+                    self.assertIsNone(self.classify("node - <<'JS'\n" + source + 'JS'))
+            for operand in [path, '"' + path + '"']:
+                with self.subTest(path=path, operand=operand):
+                    command = 'sqlite3 -readonly ' + operand + ' "select 1"'
+                    self.assertIsNone(self.classify(command))
+                    script = self.write('tmp/direct-foreign.sh', command)
+                    self.assertIsNone(self.classify('zsh ' + shlex.quote(str(script)) + ' owner'))
+        source = ("import os, sqlite3\n"
+                  "sqlite3.connect(os.path.expanduser('~/.config/spectrum-bridge/state.sqlite'))\n")
+        script = self.write('tmp/direct-foreign.py', source)
+        command = 'python3 -I ' + shlex.quote(str(script))
+        self.assertIsNone(self.classify(command))
+        self.adapters(command)
+        stdin = "python3 -I - <<'PY'\n" + source + 'PY'
+        self.assertIsNone(self.classify(stdin))
+        self.adapters(stdin)
+
     def test_readonly_replica_scripts_and_live_near_misses(self):
         rows = [
             (".robob/userdata/readonly/state.sqlite", None),

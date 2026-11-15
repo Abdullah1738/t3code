@@ -180,10 +180,18 @@ def source_touches_live(source: str) -> bool:
 
 
 def _foreign_state_source(source, directory):
-    # Only a complete rooted literal discharges the ambiguous legacy basename.
-    # Keep variable/glob directories and split path expressions conservative.
+    # Discharge only fixed reader operands. Stored paths can have their basename
+    # transformed or rebased later, so they retain the original source evidence.
     def literal(match):
         value = match[0]
+        before, after = source[:match.start()], source[match.end():]
+        scalar = match.start() == 0 and match.end() == len(source)
+        reader = re.search(r'''\b(?:Database(?:Sync)?|readFile(?:Sync)?|open(?:Sync)?|createReadStream)\s*\(\s*(['"])$''', before)
+        direct_reader = reader and re.match(re.escape(reader[1]) + r'\s*[,)]', after)
+        shell = re.search(r'''(?:^|[\s;(])(?:[^\s;()]+/)?sqlite3?\s+(?:-[\w-]+\s+)*(['"]?)$''', before)
+        direct_shell = shell and re.match(re.escape(shell[1]) + r'(?=$|[\s;|&()<>])', after)
+        if not (scalar or direct_reader or direct_shell):
+            return value
         path = _literal_path(value, directory)
         if path is None or REPLICA.search(value) or LIVE.search(value) or LIVE.search(str(path)):
             return value
@@ -191,7 +199,7 @@ def _foreign_state_source(source, directory):
             if path.is_relative_to(root.resolve()):
                 return value
         return ' ' * len(value)
-    masked = re.sub(r'''(?<![^\s'"(=])(?:~|\$HOME|\$\{HOME\})?/[^\s'"`$*?\[\]();|&<>\\]*?/state\.sqlite(?:-(?:wal|shm|journal))?(?=$|[\s'"),;|&<>])''', literal, source)
+    masked = re.sub(r'''(?<![^\s'"(=])(?:~|\$HOME|\$\{HOME\})?/(?:[^\s'"`$*?\[\]();|&<>\\/]+/)*state\.sqlite(?:-(?:wal|shm|journal))?(?=$|[\s'"),;|&<>])''', literal, source)
     # A separate protected root may transform or rebase the foreign operand.
     if (re.search(r"\.robob\b|robob-data|\.t3\b|opencode-data|\.local/share/opencode|['\"]opencode['\"]", masked) or
             re.search(r'\buserdata\b', masked) and re.search(r'\b(?:homedir|HOME|T3CODE_HOME)\b|\bPath\.home\b', masked)):
