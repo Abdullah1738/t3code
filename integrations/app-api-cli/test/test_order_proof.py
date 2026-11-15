@@ -168,15 +168,26 @@ class OrderProof(unittest.TestCase):
         self.assertEqual(events[0]['message'], 'noon removed Fresh mint (AED 1.00); want me to get it elsewhere?')
 
     def test_identifier_forms_match_card_storage_with_an_overlapping_sibling(self):
+        forms = [
+            ('over cap', 'x' * 81), ('padded whitespace', '  item   code  '), ('numeric', 12345),
+            ('exact cap', 'x' * 80), ('space before cap', 'x' * 78 + ' yz'),
+            ('space at cap', 'x' * 79 + ' y'), ('space after cap', 'x' * 80 + ' y'),
+            ('tab at cap', 'x' * 79 + '\t y'), ('nbsp at cap', 'x' * 79 + '\u00a0y'),
+            ('repeated whitespace at cap', 'x' * 79 + '   y'),
+        ]
         for field in ('item_id', 'item_code', 'sku', 'sku_config'):
-            for raw in ('x' * 81, '  item   code  ', 12345):
-                with self.subTest(field=field, raw=raw):
+            for label, raw in forms:
+                with self.subTest(field=field, form=label):
                     original = {'name': 'Wrap', field: raw, 'price': 48}
                     sibling = {'name': 'Mint', field: 'sibling', 'price': 1}
                     cfg = dict(self.cfg, placed_items=delivery_cards.items([original, sibling]))
                     result = {'status': 'placed', 'items_complete': True, 'items': [original, sibling]}
                     self.assertEqual(tracker.transition(result, {}, cfg, self.now), [])
                     self.assertEqual(order_items.identity(original), order_items.identity(cfg['placed_items'][0]))
+                    canonical = order_items.match_fields(original)[field]
+                    self.assertEqual(order_items.match_fields({field: canonical})[field], canonical)
+                    cfg['placed_items'] = delivery_cards.items(cfg['placed_items'])
+                    self.assertEqual(tracker.transition(result, {}, cfg, self.now), [])
 
     def test_matched_item_explicit_removal_or_zero_price_still_fires(self):
         for change in ({'status': 'removed'}, {'status': 'cancelled'}, {'status': 'canceled'},

@@ -34,9 +34,10 @@ def normalized_name(item):
 
 
 def match_fields(item):
-    # Registration stores delivery_cards.text(value, 80); native reads must use the same form.
+    # Registration caps IDs at 80 characters. Strip any space left by truncation
+    # so native IDs and repeatedly projected card IDs normalize to the same value.
     fields = {field: value for field in ID_FIELDS
-              if (value := ' '.join(str(item.get(field) or '').split())[:80])}
+              if (value := ' '.join(str(item.get(field) or '').split())[:80].rstrip())}
     if name(item) and not item.get('unresolved'):
         fields['name'] = normalized_name(item)
     return fields
