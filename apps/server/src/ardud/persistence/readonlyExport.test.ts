@@ -475,76 +475,109 @@ const auxiliaryTables = [
 
 for (const phase of ["delete", "copy", "prune"] as const) {
   for (const terminal of ["publish", "close"] as const) {
-    test.each(auxiliaryTables)(
-      `$name auxiliary changes during reset ${phase} preserve the old generation until ${terminal}`,
-      ({ name, row }) => {
-        const f = fixture(1);
-        f.source.exec(`INSERT INTO ${name} VALUES (${row});
+    for (const gap of ["single", "nested"] as const) {
+      test.each(auxiliaryTables)(
+        `$name auxiliary changes during reset ${phase} preserve the old generation until ${terminal} (${gap})`,
+        ({ name, row }) => {
+          let now = Date.parse("2026-11-15T09:47:40Z");
+          vi.spyOn(Date, "now").mockImplementation(() => now);
+          const f = fixture(1);
+          const advance = () => {
+            now += 1_000;
+            return f.exporter.step();
+          };
+          f.source.exec(`INSERT INTO ${name} VALUES (${row});
           INSERT INTO orchestration_events VALUES
           (2,'thread.metadata-updated','a','{}'),(3,'thread.metadata-updated','a','{}'),
           (4,'thread.metadata-updated','a','{}'),(5,'thread.metadata-updated','a','{}'),
           (6,'thread.metadata-updated','a','{}')`);
-        f.finish();
-        const out = f.connect();
-        let generation = metaValue(out, "generation");
-        const watermark = metaValue(out, "updated_at");
-        const revision = metaValue(out, "lineage_repair_revision");
-        const events = out.prepare("SELECT * FROM orchestration_events ORDER BY sequence").all();
-        const schema = out.prepare("SELECT sql FROM sqlite_schema WHERE name=?").get(name)?.sql;
-        const checkPublished = () => {
+          f.finish();
+          const out = f.connect();
+          let generation = metaValue(out, "generation");
+          const watermark = metaValue(out, "updated_at");
+          const revision = metaValue(out, "lineage_repair_revision");
+          const events = out.prepare("SELECT * FROM orchestration_events ORDER BY sequence").all();
+          const schema = out.prepare("SELECT sql FROM sqlite_schema WHERE name=?").get(name)?.sql;
+          const checkPublished = () => {
+            expect(metaValue(out, "ready")).toBe("1");
+            expect(metaValue(out, "generation")).toBe(generation);
+            expect(metaValue(out, "updated_at")).toBe(watermark);
+            expect(metaValue(out, "lineage_repair_revision")).toBe(revision);
+            expect(
+              out.prepare("SELECT * FROM orchestration_events ORDER BY sequence").all(),
+            ).toEqual(events);
+            expect(out.prepare("SELECT sql FROM sqlite_schema WHERE name=?").get(name)?.sql).toBe(
+              schema,
+            );
+          };
+          f.exporter.takeMetrics();
+          f.source.exec(
+            "INSERT INTO orchestration_events VALUES (8,'thread.metadata-updated','a','{}')",
+          );
+          let scans = 0;
+          for (let step = 0; ; step++) {
+            expect(advance()).toBe(true);
+            const metrics = f.exporter.takeMetrics();
+            scans += metrics.phaseSteps.resetScan ?? 0;
+            if (
+              (phase === "delete" && metrics.phaseSteps.resetDelete) ||
+              (phase === "copy" && scans >= 1) ||
+              (phase === "prune" && scans >= 5)
+            )
+              break;
+            if (step > 100) throw new Error("reset phase was not reached");
+          }
+          checkPublished();
+          const started = metaValue(out, "rebuild_started_at");
+          f.source.exec(`ALTER TABLE ${name} ADD COLUMN cache_version INTEGER NOT NULL DEFAULT 7`);
+          expect(advance()).toBe(true);
+          checkPublished();
+          expect(
+            f.rebuilds.filter((event) => event.kind === "events_reset" && event.event === "start"),
+          ).toHaveLength(1);
+          if (gap === "nested") {
+            f.source.exec(
+              "INSERT INTO orchestration_events VALUES (10,'thread.metadata-updated','a','{}')",
+            );
+            for (let step = 0; ; step++) {
+              expect(advance()).toBe(true);
+              checkPublished();
+              const starts = f.rebuilds.filter(
+                (event) => event.kind === "events_reset" && event.event === "start",
+              );
+              if (starts.length === 2) {
+                expect(starts.map((event) => event.firstMissingSequence)).toEqual([7, 9]);
+                expect(metaValue(out, "rebuild_started_at")).toBe(started);
+                const sidecar = JSON.parse(
+                  NodeFS.readFileSync(f.options.replicaPath + ".rebuild.json", "utf8"),
+                );
+                expect(sidecar.rebuild_started_at).toBe(metaValue(out, "rebuild_started_at"));
+                break;
+              }
+              if (step > 500) throw new Error("nested gap was not reached");
+            }
+          }
+          if (terminal === "close") {
+            f.exporter.close();
+            checkPublished();
+            f.restart();
+            generation = metaValue(out, "generation");
+          }
+          for (let step = 0; advance(); step++) {
+            checkPublished();
+            if (step > 500) throw new Error("schema refresh reset did not converge");
+          }
           expect(metaValue(out, "ready")).toBe("1");
-          expect(metaValue(out, "generation")).toBe(generation);
-          expect(metaValue(out, "updated_at")).toBe(watermark);
-          expect(metaValue(out, "lineage_repair_revision")).toBe(revision);
-          expect(out.prepare("SELECT * FROM orchestration_events ORDER BY sequence").all()).toEqual(
-            events,
+          expect(metaValue(out, "sequence")).toBe(gap === "nested" ? "10" : "8");
+          expect(Number(metaValue(out, "lineage_repair_revision"))).toBe(
+            Number(revision) + (gap === "nested" && terminal === "publish" ? 2 : 1),
           );
-          expect(out.prepare("SELECT sql FROM sqlite_schema WHERE name=?").get(name)?.sql).toBe(
-            schema,
-          );
-        };
-        f.exporter.takeMetrics();
-        f.source.exec(
-          "INSERT INTO orchestration_events VALUES (8,'thread.metadata-updated','a','{}')",
-        );
-        let scans = 0;
-        for (let step = 0; ; step++) {
-          expect(f.exporter.step()).toBe(true);
-          const metrics = f.exporter.takeMetrics();
-          scans += metrics.phaseSteps.resetScan ?? 0;
-          if (
-            (phase === "delete" && metrics.phaseSteps.resetDelete) ||
-            (phase === "copy" && scans >= 1) ||
-            (phase === "prune" && scans >= 5)
-          )
-            break;
-          if (step > 100) throw new Error("reset phase was not reached");
-        }
-        checkPublished();
-        f.source.exec(`ALTER TABLE ${name} ADD COLUMN cache_version INTEGER NOT NULL DEFAULT 7`);
-        expect(f.exporter.step()).toBe(true);
-        checkPublished();
-        expect(
-          f.rebuilds.filter((event) => event.kind === "events_reset" && event.event === "start"),
-        ).toHaveLength(1);
-        if (terminal === "close") {
-          f.exporter.close();
-          checkPublished();
-          f.restart();
-          generation = metaValue(out, "generation");
-        }
-        for (let step = 0; f.exporter.step(); step++) {
-          checkPublished();
-          if (step > 500) throw new Error("schema refresh reset did not converge");
-        }
-        expect(metaValue(out, "ready")).toBe("1");
-        expect(metaValue(out, "sequence")).toBe("8");
-        expect(Number(metaValue(out, "lineage_repair_revision"))).toBe(Number(revision) + 1);
-        expect(out.prepare(`SELECT cache_version FROM ${name}`).all()).toEqual([
-          { cache_version: 7 },
-        ]);
-      },
-    );
+          expect(out.prepare(`SELECT cache_version FROM ${name}`).all()).toEqual([
+            { cache_version: 7 },
+          ]);
+        },
+      );
+    }
   }
 }
 

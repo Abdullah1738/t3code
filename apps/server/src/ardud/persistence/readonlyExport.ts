@@ -396,7 +396,6 @@ export function createReadonlyReplica(
       pendingRepairs.push(...causes.map((cause) => ({ ...cause, revision })));
     };
     let cycleTransaction = false;
-    let privateSchemaRebuild = false;
     let cycleSession: NodeSqlite.Session | undefined;
     const beginCycle = (trackChanges = true) => {
       // Parent and child rows can change in either copy order. Every
@@ -410,7 +409,6 @@ export function createReadonlyReplica(
       cycleSession = undefined;
       out.exec("COMMIT");
       cycleTransaction = false;
-      privateSchemaRebuild = false;
       flushRepairs();
     };
     let invalidated: string | undefined;
@@ -450,7 +448,6 @@ export function createReadonlyReplica(
       cycleSession?.close();
       cycleSession = undefined;
       cycleTransaction = false;
-      privateSchemaRebuild = false;
       pendingRepairs = [];
       try {
         out.exec("ROLLBACK");
@@ -916,7 +913,6 @@ export function createReadonlyReplica(
       // No reader lock protocol is shared with state.sqlite readers (the
       // OpenCode .export.lock guards only that export's writer).
       beginCycle(false);
-      privateSchemaRebuild = true;
       transaction(() => {
         for (const name of [
           ...projections,
@@ -1729,10 +1725,11 @@ export function createReadonlyReplica(
               missingIndex > 0 ? Number(rows[missingIndex - 1]!.sequence) + 1 : cursor + 1;
             const publishedReady = rebuild?.details.publishedReady ?? getMeta("ready") ?? "0";
             // Discard a routine partial cycle before publishing diagnostics.
-            // A full rebuild owns unpublished schemas, so its transaction and
-            // already advertised start time must survive this reset.
-            const fullStarted = privateSchemaRebuild ? rebuild?.started : undefined;
-            if (fullStarted === undefined) abortCycle();
+            // A private build can own main or TEMP schemas. Its transaction,
+            // prepared statements and advertised start survive nested resets.
+            const privateStarted =
+              cycleTransaction && getMeta("ready") === "0" ? rebuild?.started : undefined;
+            if (privateStarted === undefined) abortCycle();
             cycleSession?.close();
             cycleSession = undefined;
             startRebuild(
@@ -1745,7 +1742,7 @@ export function createReadonlyReplica(
                 rowsReturned: rows.length,
                 publishedReady,
               },
-              fullStarted,
+              privateStarted,
             );
             if (!cycleTransaction) beginCycle(false);
             transaction(() => {
