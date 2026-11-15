@@ -15,8 +15,10 @@ class RemoteCommandsBusy(unittest.TestCase):
 
     def test_reuse_cannot_hand_out_busy_box(self):
         con=Mock()
-        with patch.object(lease,'check_deletion'), patch.object(api,'BACKEND','server'), \
-                patch.object(api,'call',return_value={'busy':True}):
+        # boot_dead is a read-only set-aside check that runs before the busy guard; the guard must
+        # refuse before any lease read or write.
+        with patch.object(lease,'boot_dead',return_value=None), patch.object(lease,'check_deletion'), \
+                patch.object(api,'BACKEND','server'), patch.object(api,'call',return_value={'busy':True}):
             self.assertIsNone(lease._reuse(con,{'box_id':'bx_a'},None))
         con.execute.assert_not_called()
 
