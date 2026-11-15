@@ -595,6 +595,7 @@ it.effect.each(["complete", "timeout", "fail", "fast"] as const)(
           ),
           "card_move",
         ).pipe(
+          Effect.provideService(BoardLocks.operationName, "card.move"),
           Effect.exit,
           Effect.withTracer(tracer),
           Effect.provideService(McpCall, callState),
@@ -606,8 +607,8 @@ it.effect.each(["complete", "timeout", "fail", "fast"] as const)(
       yield* TestClock.adjust(ms);
       if (ending !== "timeout") yield* Deferred.succeed(finish, undefined);
       const result = yield* Fiber.join(pending);
-      const holds = warnings.filter(
-        (message) => Array.isArray(message) && message[0] === "kanban board lock long hold",
+      const holds = warnings.filter((message) =>
+        String(message).includes('"event":"kanban board lock long hold"'),
       );
       if (ending === "fast") {
         assert.lengthOf(holds, 0);
@@ -615,7 +616,19 @@ it.effect.each(["complete", "timeout", "fail", "fast"] as const)(
       } else {
         const steps = [{ subStep: "KanbanService.awaitQueue", ms }];
         assert.lengthOf(holds, 1);
-        assert.deepInclude((holds[0] as [string, object])[1], { subSteps: steps });
+        assert.deepInclude(JSON.parse(String(holds[0])), {
+          event: "kanban board lock long hold",
+          "board.observed_at_ms": ms,
+          "board.id": "a",
+          "board.holder": "card.move",
+          "board.card_id": null,
+          "board.lock": "gate",
+          "board.mode": "exclusive",
+          "board.acquired_at_ms": 0,
+          "board.held_ms": ms,
+          "board.waiters": 0,
+          subSteps: steps,
+        });
         assert.deepEqual(callState.replySubSteps, steps);
         const ledger = ledgerEvent({
           ts: "2026-11-15T08:10:15.231Z",
@@ -666,9 +679,7 @@ it.effect("saved-write sub-steps exclude waits after releasing the board permit"
     yield* Deferred.succeed(resume, undefined);
     yield* Fiber.join(pending);
     assert.isFalse(
-      warnings.some(
-        (message) => Array.isArray(message) && message[0] === "kanban board lock long hold",
-      ),
+      warnings.some((message) => String(message).includes('"event":"kanban board lock long hold"')),
     );
   }),
 );
@@ -766,12 +777,12 @@ it.effect("parallel saved-write fibers attribute only their own board hold", () 
     yield* TestClock.adjust(6_000);
     yield* Deferred.succeed(finish, undefined);
     yield* Fiber.join(pending);
-    const holds = warnings.filter(
-      (message) => Array.isArray(message) && message[0] === "kanban board lock long hold",
-    ) as Array<[string, { boardId: string; subSteps: unknown }]>;
+    const holds = warnings
+      .filter((message) => String(message).includes('"event":"kanban board lock long hold"'))
+      .map((message) => JSON.parse(String(message)) as Record<string, unknown>);
     assert.lengthOf(holds, 2);
     for (const board of ["a", "b"])
-      assert.deepEqual(holds.find(([, fields]) => fields.boardId === board)![1].subSteps, [
+      assert.deepEqual(holds.find((fields) => fields["board.id"] === board)!.subSteps, [
         { subStep: `move.await${board.toUpperCase()}`, ms: 6_000 },
       ]);
   }),

@@ -31,6 +31,7 @@ import * as EffectOutbox from "../orchestration-v2/EffectOutbox.ts";
 import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
+import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ThreadCommandExecutor from "../orchestration-v2/ThreadCommandExecutor.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
@@ -67,6 +68,9 @@ it.effect.each([
   "background reader",
   "background reader with paced continuation",
   "receipt replay",
+  "canonical reader running auto",
+  "canonical reader running steer",
+  "canonical reader completed auto",
 ] as const)(
   "acknowledges idle sends and bounds a blocked %s without duplicating a retry",
   (blocked) =>
@@ -167,9 +171,10 @@ it.effect.each([
             }),
         };
         const registry = ProviderAdapterRegistry.layerSingle(adapter);
-        const database = blocked.startsWith("background reader")
-          ? Sqlite.layerFromPath(`${cwd}/send.sqlite`).pipe(Layer.provide(NodeServices.layer))
-          : Sqlite.layerMemory;
+        const database =
+          blocked.startsWith("background reader") || blocked.startsWith("canonical reader")
+            ? Sqlite.layerFromPath(`${cwd}/send.sqlite`).pipe(Layer.provide(NodeServices.layer))
+            : Sqlite.layerMemory;
         const runtime = ProviderReplayHarness.layerWithRegistry(
           { name: `send-ack-${blocked}`, runtimePolicyOverride: { cwd } },
           registry,
@@ -200,9 +205,11 @@ it.effect.each([
           Layer.provideMerge(dispatchRuntime),
           Layer.provideMerge(settings),
           Layer.provideMerge(
-            Layer.mergeAll(CommandReceiptStore.layer, EffectOutbox.layer).pipe(
-              Layer.provide(database),
-            ),
+            Layer.mergeAll(
+              CommandReceiptStore.layer,
+              EffectOutbox.layer,
+              ProjectionStore.layer,
+            ).pipe(Layer.provide(database)),
           ),
           Layer.provideMerge(ThreadCommandExecutor.layer),
         );
@@ -242,6 +249,95 @@ it.effect.each([
             creationSource: "web",
           });
           const request = { threadId, message: "Start the idle child", clientRequestId: "idle" };
+          if (blocked.startsWith("canonical reader")) {
+            const initial = yield* service.sendToThread(scope, request);
+            const runningEvent = yield* orchestrator.streamDomainEvents.pipe(
+              Stream.filter(
+                (event) =>
+                  event.threadId === threadId &&
+                  event.type === "provider-turn.updated" &&
+                  event.payload.status === "running",
+              ),
+              Stream.take(1),
+              Stream.runDrain,
+              Effect.forkScoped,
+            );
+            yield* worker.drain();
+            yield* Fiber.join(runningEvent);
+            const store = yield* ProjectionStore.ProjectionStoreV2;
+            const sink = yield* EventSink.EventSinkV2;
+            const running = (yield* store.getThreadRecords(threadId, ["runs"])).runs.find(
+              (run) => run.id === initial.runId,
+            )!;
+            assert.equal(running.status, "running");
+            const completed = blocked === "canonical reader completed auto";
+            if (completed) {
+              const now = yield* DateTime.now;
+              yield* sink.write({
+                events: [
+                  {
+                    id: EventId.make("complete-before-canonical-read"),
+                    type: "run.updated",
+                    threadId,
+                    occurredAt: now,
+                    payload: { ...running, status: "completed", completedAt: now },
+                  },
+                ],
+              });
+            }
+            const entered = yield* Deferred.make<NodeSqliteClient.SqliteStatementObservation>();
+            const release = yield* Deferred.make<void>();
+            let paused = false;
+            // This is the orphan sweep's real read boundary, with its snapshot held open.
+            const reader = yield* store.getThreadRecords(threadId, ["providerThreads"]).pipe(
+              Effect.provideService(NodeSqliteClient.StatementObserver, {
+                slowThresholdMs: 0,
+                record: (observation) =>
+                  Effect.suspend(() => {
+                    if (paused) return Effect.void;
+                    paused = true;
+                    return Deferred.succeed(entered, observation).pipe(
+                      Effect.andThen(Deferred.await(release)),
+                    );
+                  }),
+              }),
+              Effect.forkChild,
+            );
+            yield* Effect.gen(function* () {
+              assert.equal((yield* Deferred.await(entered)).connection, "reader");
+              const followup = {
+                threadId,
+                message: "Follow up during a canonical snapshot",
+                mode:
+                  blocked === "canonical reader running steer"
+                    ? ("steer" as const)
+                    : ("auto" as const),
+                clientRequestId: "during-canonical-read",
+              };
+              const result = yield* service
+                .sendToThread(scope, followup)
+                .pipe(Effect.timeout("3 seconds"), TestClock.withLive);
+              assert.equal(result.delivery, completed ? "started" : "steered");
+              if (completed) assert.notEqual(result.runId, initial.runId);
+              else assert.equal(result.runId, initial.runId);
+              const repeated = yield* service
+                .sendToThread(scope, followup)
+                .pipe(Effect.timeout("3 seconds"), TestClock.withLive);
+              assert.equal(repeated.messageId, result.messageId);
+              assert.equal(repeated.runId, result.runId);
+              assert.isUndefined(reader.pollUnsafe());
+              const messages = yield* store
+                .getThreadRecords(threadId, ["messages"])
+                .pipe(NodeSqliteClient.foregroundReads);
+              assert.lengthOf(messages.messages, 2);
+              assert.lengthOf(
+                messages.messages.filter((message) => message.id === result.messageId),
+                1,
+              );
+            }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+            yield* Fiber.join(reader);
+            return;
+          }
           if (blocked.startsWith("background reader")) {
             let expectedMessages = 1;
             if (blocked === "background reader with paced continuation") {

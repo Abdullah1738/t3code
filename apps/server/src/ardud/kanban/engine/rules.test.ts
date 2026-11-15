@@ -41,6 +41,8 @@ import {
   relatedCandidates,
   reviewGate,
   workerQuietDue,
+  failedTurnResumeDue,
+  isRuntimeFailure,
   runSilentDue,
   reviewerQuietDue,
   waitingOnBackground,
@@ -1396,6 +1398,66 @@ describe("thread batching", () => {
     expect(checkClaim(board, card({ priority: KANBAN_BACKLOG }), ctx).ok).toBe(false);
   });
 
+  it("refuses a claim when its own thread's blocker is awaiting review, naming the stage", () => {
+    const blocker = card({ stage: "needs_review", workThreadId: t1 });
+    const waiting = card({ blockedBy: [blocker.id] });
+    expect(
+      checkClaim(board, waiting, {
+        threadId: t1,
+        pool: poolKey(opus),
+        projectId: null,
+        byId: new Map([[blocker.id, blocker]]),
+        carrying: 0,
+        slots: 1,
+      }),
+    ).toEqual({
+      ok: false,
+      reason: `card #${waiting.number} waits on #${blocker.number} (needs_review)`,
+    });
+  });
+
+  it("doesn't offer a blocked card to its blocker's work thread during review", () => {
+    const seed = card({ stage: "needs_review", workThreadId: t1 });
+    const waiting = card({ blockedBy: [seed.id] });
+    expect(
+      relatedCandidates({
+        board,
+        cards: [seed, waiting],
+        groups: [],
+        seeds: [seed],
+        threadId: t1,
+        pool: poolKey(opus),
+        projectId: null,
+        carrying: 0,
+        slots: 1,
+      }),
+    ).toEqual([]);
+  });
+
+  it("doesn't dispatch a todo card while its same-thread blocker is in review", () => {
+    const blocker = card({ stage: "in_review", workThreadId: t1 });
+    const waiting = card({ workThreadId: t1, blockedBy: [blocker.id] });
+    expect(planDispatch(board, [blocker, waiting], pools([[opus, 1]]))).toEqual([]);
+  });
+
+  it("rejects a planned claim if its same-thread blocker enters review before dispatch", () => {
+    const blocker = working();
+    const waiting = card({ workThreadId: t1, blockedBy: [blocker.id] });
+    const available = pools([[opus, 1]]);
+    const [dispatch] = planDispatch(board, [blocker, waiting], available);
+    expect(dispatch).toMatchObject({ cardId: waiting.id, joins: true });
+    expect(
+      confirmDispatch(
+        board,
+        waiting,
+        [{ ...blocker, stage: "needs_review" }, waiting],
+        available,
+        new Map(),
+        dispatch!,
+      ),
+    ).toBe(false);
+  });
+
   it("starts a card fresh when its old thread is busy in another pool", () => {
     const elsewhere = working({ model: haiku, activePool: poolKey(haiku) });
     const back = card({ workThreadId: t1 });
@@ -2303,4 +2365,45 @@ describe("runSilentDue", () => {
       ),
     ).toBe(true);
   });
+});
+
+describe("failedTurnResumeDue", () => {
+  const endedAt = "2026-11-14T22:34:07.000Z";
+  const start = Date.parse(endedAt);
+  const working = card({ stage: "working", activeRole: "work", movedAt: endedAt });
+  const view = { state: "idle", quietSince: endedAt, backgroundWork: 3 };
+  it("resumes after two minutes regardless of background work", () => {
+    expect(failedTurnResumeDue(working, view, start + 119999)).toBe(false);
+    expect(failedTurnResumeDue(working, view, start + 120000)).toBe(true);
+  });
+  it("keeps the existing thirty-minute nudge window", () => {
+    const nudged = { ...working, nudgedAt: iso(start + 120000) };
+    expect(failedTurnResumeDue(nudged, view, start + 240000)).toBe(false);
+    expect(failedTurnResumeDue(nudged, view, start + 32 * 60000)).toBe(true);
+  });
+  it.each(["running", "needs-input", "queued"])("does not wake %s", (state) => {
+    expect(failedTurnResumeDue(working, { ...view, state }, start + 120000)).toBe(false);
+  });
+  it.each([
+    ["transport_error", "unknown", true, true],
+    ["transport_error", "unknown", false, false],
+    ["transport_error", "transient", true, false],
+    ["transport_error", "quota", true, false],
+    ["transport_error", "config", true, false],
+    ["provider_error", "unknown", true, false],
+    ["validation_error", "unknown", true, false],
+  ] as const)(
+    "class=%s category=%s retryable=%s",
+    (failureClass, category, retryable, expected) => {
+      expect(
+        isRuntimeFailure({
+          class: failureClass,
+          category,
+          retryable,
+          code: null,
+          message: "failure",
+        }),
+      ).toBe(expected);
+    },
+  );
 });

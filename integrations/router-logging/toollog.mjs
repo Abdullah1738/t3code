@@ -15,6 +15,10 @@ const messages = new Set(['Robob replica is stale; recovery deferred', 'Robob re
   'thread is newer than Robob replica; recovery deferred', 'unverified Robob replica',
   'The operation was aborted due to timeout', 'The operation was aborted']);
 const errorMessage = (value, tag) => messages.has(value) ? value.slice(0, 300) : tag;
+// Replica metadata is untrusted. Only numbers or an explicit unknown survive.
+const replicaProps = value => Object.fromEntries(['replicaGeneration', 'replicaAgeMs']
+  .filter(key => typeof value?.[key] === 'number' && Number.isFinite(value[key]) || value?.[key] === 'unknown')
+  .map(key => [key, value[key]]));
 function failure(value, result = false) {
   try {
     const tag = (result ? errorTag(value?.tag) : undefined) ?? errorTag(value?.code)
@@ -30,6 +34,7 @@ export function clean(event, now = new Date()) {
   if (typeof event.ok === 'boolean') row.ok = event.ok;
   const safeIds = Object.fromEntries(Object.entries(event.ids ?? {}).filter(([k,v]) => ids.has(k) && ['string','number'].includes(typeof v)).map(([k,v]) => [k,createHash('sha256').update(String(v)).digest('hex').slice(0,16)]));
   const safeProps = Object.fromEntries(Object.entries(event.props ?? {}).filter(([k,v]) => props.has(k) && (typeof v === 'boolean' || typeof v === 'number' && Number.isFinite(v) || token(v))));
+  Object.assign(safeProps, replicaProps(event.props));
   if (Object.keys(safeIds).length) row.ids = safeIds;
   if (Object.keys(safeProps).length) row.props = safeProps;
   if (event.error) { const tag = token(event.error.tag) ?? 'unknown'; row.error = { tag, message: errorMessage(event.error.message, tag) }; }
@@ -75,7 +80,7 @@ export async function observed(component, name, work, fields = {}) {
   try {
     result = await work();
   } catch (error) {
-    try { emit(component, name, { ...fields, kind:'error', ok:false, durationMs:performance.now()-start, error:failure(error) }); } catch {}
+    try { emit(component, name, { ...fields, props:{...fields.props, ...replicaProps(error)}, kind:'error', ok:false, durationMs:performance.now()-start, error:failure(error) }); } catch {}
     throw error;
   }
   try {

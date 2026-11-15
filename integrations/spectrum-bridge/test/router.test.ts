@@ -17,6 +17,7 @@ import type { Message } from "@photon-ai/advanced-imessage/grpc";
 import { imessageGuidance, MAX_SYNTHETIC_ATTEMPTS, NEW_CHAT_NUDGE, newChatNudge, ACCEPT_WAIT_MS, OUTAGE_NOTICE_AFTER_MS, pendingOrders, REPLY_NUDGE, replyQuote, replyText, ROTATE_NUDGE, rotateNudge, Router, sendblueContextPrompt, SYNTHETIC_RETRY_MS, syntheticDropped, TOOL_MODE_MARKER, toolReplyRules, wakeGuidance } from "../src/router.ts";
 import { replyModeConfig } from "../src/config.ts";
 import { Store } from "../src/store.ts";
+import { ChatRegistry, createAgentBus } from "../src/runtime.ts";
 import { Delivery } from "../src/delivery.ts";
 import { ReplyGapMonitor } from "../src/reply-gap.ts";
 import { recordsFromThread, RobobBackend, sentMessagePrefix } from "../src/robob.ts";
@@ -9878,4 +9879,146 @@ test.each([
   else expect(h.backend.permissionReplies).toEqual([["p_child", "/Chats/ses_child", "once"]]);
   expect(h.backend.prompts).toHaveLength(1);
   expect(h.controls().some(item => item.text.includes("Couldn't check that question"))).toBeFalse();
+});
+
+
+const busFailureCases = (["final", "tool"] as const).flatMap(replyMode =>
+  (["request", "pending", "answer", "timeout"] as const).flatMap(kind =>
+    (["tools", "errored", "first-turn", "model-error", "undelivered"] as const).map(failure => ({ replyMode, kind, failure }))));
+
+test.each(busFailureCases)("agent-bus failures stay private ($kind, $replyMode, $failure)", async ({ replyMode, kind, failure }) => {
+  const start = Date.parse("2026-11-15T00:00:00Z");
+  setSystemTime(start);
+  const alerts: string[] = [];
+  const logs: string[] = [];
+  const h = setup(":memory:", { replyMode, droppedBatchMs: 0, failureNoticeMs: 0, chatGuid: "dm:owner",
+    notifyFailure: async text => { alerts.push(text); return true; }, log: (event, code) => { logs.push(`${event} ${code ?? ""}`); },
+    context: { chat: { key: "dm:owner", slug: "owner", title: "Abdullah", kind: "owner" },
+      roleOf: () => ({ name: "Abdullah", role: "owner" }), typing: () => false, react: async () => {} },
+  });
+  const stateRoot = mkdtempSync(join(tmpdir(), "agent-bus-router-"));
+  directories.push(stateRoot);
+  const chats = new ChatRegistry({ owner: options.owner, ownerStore: h.store, stateRoot,
+    line: { react: async () => {} },
+    access: () => ({ people: [{ name: "Moni", role: "admin", addresses: ["+15555550199"] }], groups: [] }),
+    build: chat => { if (chat.store !== h.store) stores.push(chat.store); return {}; },
+  });
+  chats.restore();
+  chats.owner.store.set("route", { id: "ses_owner", directory: "/Chats/owner", generation: 1 });
+  chats.open("dm:+15555550199").store.set("route", { id: "ses_moni", directory: "/Chats/moni", generation: 1 });
+  const bus = createAgentBus(chats, (event, code) => { logs.push(`${event} ${code ?? ""}`); });
+  const privateText = `PRIVATE_MONI_${kind.toUpperCase()}_DO_NOT_TEXT_OWNER`;
+  const asked = bus.ask({ sessionId: kind === "request" ? "ses_moni" : "ses_owner", to: kind === "request" ? "owner" : "moni",
+    text: privateText, dedupeKey: "failure" });
+  expect(asked.status).toBe(202);
+  if (kind === "pending" || kind === "answer") expect(bus.answer({ sessionId: "ses_moni", request: (asked.body as { id: string }).id,
+    text: privateText, status: kind === "pending" ? "pending" : "done" }).status).toBe(202);
+  if (kind === "timeout") { setSystemTime(start + 600_001); bus.sweep(); }
+  const wake = h.store.pendingInbound()[0]!;
+  expect(h.store.pendingInbound()).toHaveLength(1);
+  if (failure === "tools") Object.assign(h.backend, { runToolEvidence: async () => "unknown" as const });
+  if (failure === "undelivered") {
+    h.store.set("route", null);
+    h.backend.createBehavior = async () => { throw new Error(privateText); };
+    for (let attempt = 0; attempt < 12; attempt++) {
+      await h.router.tick();
+      setSystemTime(Date.now() + 120_001);
+    }
+  } else {
+    for (let attempt = 0; attempt < (failure === "errored" ? MAX_SYNTHETIC_ATTEMPTS : 1); attempt++) {
+      await h.router.tick();
+      const failed = h.backend.failed();
+      failed.error = { type: "ProviderError", message: privateText };
+      const idle = h.backend.records.at(-1)!;
+      if (idle.type === "idle") {
+        if (failure === "first-turn") idle.firstTurnFailure = true;
+        if (failure === "model-error") idle.modelError = true;
+      }
+      await h.router.tick();
+      const retryAt = h.store.get<{ nextAt: number }>(`synthetic-retry:${wake.id}`)?.nextAt;
+      if (retryAt) setSystemTime(retryAt);
+    }
+  }
+  expect(h.controls()).toEqual([]);
+  expect(h.conversations()).toEqual([]);
+  expect(h.store.get("droppedNotices") ?? []).toEqual([]);
+  expect(h.store.get("missedSynthetic") ?? []).toEqual([]);
+  setSystemTime(Date.now() + 1_200_001);
+  await new Router(h.store, h.backend, h.transport, h.routerOptions).tick();
+  expect(h.controls()).toEqual([]);
+  expect(h.backend.prompts).toHaveLength(failure === "undelivered" ? 0 : failure === "errored" ? MAX_SYNTHETIC_ATTEMPTS : 1);
+  expect(alerts).toEqual([]);
+  expect(logs.join("\n")).not.toContain(privateText);
+  expect(inbounds(h.store).find(row => row.id === wake.id)?.state).toBe("failed");
+});
+
+test("agent-bus failure still answers a human steered into the turn", async () => {
+  const h = toolSetup({ failureNoticeMs: 0, droppedBatchMs: 0 });
+  steering(h.backend);
+  h.input("wake:agent-bus:steered", "[Agent request, not typed by anyone here.]\nPRIVATE_BUS_REQUEST");
+  await h.router.tick();
+  h.input("typed", "Are you there?");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.store.get("activeTurn")).toMatchObject({ typed: true });
+  h.backend.step("checking", "tool-calls");
+  h.backend.failed();
+  for (let i = 0; i < 3; i++) await h.router.tick();
+  expect(h.controls().map(op => op.text)).toEqual(["Something went wrong on my end with that one. Mind trying again?"]);
+  expect(JSON.stringify(h.store.pendingOutbox())).not.toContain("PRIVATE_BUS_REQUEST");
+});
+
+
+test.each(["watcher", "bus"] as const)("mixed agent-bus/watcher failure preserves only watcher notice, leader=%s", async leader => {
+  const logs: string[] = [];
+  const h = toolSetup({ droppedBatchMs: 0, log: (event, code) => { logs.push(`${event} ${code ?? ""}`); } });
+  const bus = "wake:agent-bus:mixed";
+  const watcher = "wake:mixed-watcher";
+  const privateText = "PRIVATE_BUS_BODY_IN_MIXED_BATCH";
+  for (const id of leader === "watcher" ? [watcher, bus] : [bus, watcher]) {
+    h.input(id, id === bus ? `[Agent request, not typed by anyone here.]\n${privateText}` : wakeBody());
+  }
+  Object.assign(h.backend, { runToolEvidence: async () => "unknown" as const });
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(h.backend.prompts[0]!.text).toContain(privateText);
+  expect(h.backend.prompts[0]!.text).toContain("Daily board");
+  h.backend.failed().error = { type: "ProviderError", message: privateText };
+  await h.router.tick();
+  expect(h.controls().map(op => op.text)).toEqual([syntheticDropped(watcher, wakeBody(), "failed")]);
+  expect(logs.join("\n")).not.toContain(privateText);
+  expect(JSON.stringify(h.store.pendingOutbox())).not.toContain(privateText);
+});
+
+test.each([false, true])("late human steer confirmation survives agent-bus failure, restart=%s", async restart => {
+  const at = Date.parse("2026-11-15T00:00:00Z");
+  setSystemTime(at);
+  const h = toolSetup({ failureNoticeMs: 1_000, droppedBatchMs: 0 });
+  const steers = steering(h.backend, async () => { throw new Error("lost steer response"); });
+  h.input("wake:agent-bus:late-steer", "[Agent request, not typed by anyone here.]\nPRIVATE_BUS_REQUEST");
+  await h.router.tick();
+  h.input("late-human", "Are you there?", { source: "typed" });
+  await h.router.tick();
+  await h.router.tick();
+  expect(steers.length).toBeGreaterThan(0);
+  expect(h.store.get<{ typed?: boolean }>("activeTurn")?.typed).not.toBe(true);
+  h.backend.failed();
+  Object.assign(h.backend, { runToolEvidence: async () => {
+    const steer = steers[0]!;
+    h.backend.records.push({ id: steer.messageId, type: "user", text: steer.text, time: { created: Date.now() } });
+    setSystemTime(at + 120_001);
+    await h.router.checkInboundLatency();
+    expect(h.store.get("activeTurn")).toMatchObject({ typed: true });
+    expect(inbounds(h.store).find(row => row.id === "late-human")?.state).toBe("done");
+    return "unknown" as const;
+  } });
+  await h.router.tick();
+  expect(h.store.get("deferredNotice")).toMatchObject({ turn: { typed: true } });
+  expect(h.store.get("activeTurn")).toMatchObject({ typed: true, phase: "failed" });
+  expect(h.controls()).toEqual([]);
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  setSystemTime(at + 121_002);
+  await router.tick();
+  expect(h.controls().map(op => op.text)).toEqual(["Something went wrong on my end with that one. Mind trying again?"]);
+  expect(JSON.stringify(h.store.pendingOutbox())).not.toContain("PRIVATE_BUS_REQUEST");
 });

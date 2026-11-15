@@ -587,11 +587,29 @@ describe("kanbanHeldUpBy", () => {
     expect(kanbanHeldUpBy(waiter, byId(blocker))).toBeUndefined();
   });
 
-  it("doesn't hold a waiter on the same thread as a completed blocker awaiting merge", () => {
+  it.each([
+    ["todo", false],
+    ["working", false],
+    ["needs_review", true],
+    ["in_review", true],
+    ["needs_owner", true],
+    ["completed", true],
+    ["deployed", false],
+    ["verified", false],
+  ] as const)("same-thread blocker in %s: held = %s", (stage, held) => {
+    const blocker = card("b", {
+      stage,
+      workThreadId: "thread-w" as never,
+      subtasks: stage === "todo" || stage === "working" ? [] : [evaluatorSubtask(mergeText)],
+    });
+    expect(kanbanHeldUpBy(waiter, byId(blocker))).toBe(held ? blocker : undefined);
+  });
+
+  it("releases a same-thread completed blocker once its merge is done", () => {
     const blocker = card("b", {
       stage: "completed",
       workThreadId: "thread-w" as never,
-      subtasks: [evaluatorSubtask(mergeText)],
+      subtasks: [evaluatorSubtask(mergeText, "done")],
     });
     expect(kanbanHeldUpBy(waiter, byId(blocker))).toBeUndefined();
   });

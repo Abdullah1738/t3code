@@ -20,11 +20,13 @@ import {
   kanbanRetrying,
   kanbanWaiting,
   ProjectId,
+  RunId,
   ThreadId,
   type KanbanActor,
   type KanbanCard,
   type ModelSelection,
   type OrchestrationV2ProviderFailure,
+  type OrchestrationV2Run,
 } from "@t3tools/contracts";
 
 import * as ServerConfig from "../../../config.ts";
@@ -38,6 +40,7 @@ import * as KanbanModels from "./models.ts";
 import * as KanbanService from "./KanbanService.ts";
 import * as Retries from "./retries.ts";
 import * as Rules from "./rules.ts";
+import { effortOptionId } from "@t3tools/client-runtime/ardud/models/harnessRouting";
 import * as Waits from "./waits.ts";
 import { opencodeTestProvider } from "./testProviders.ts";
 import { KanbanThreads, type KanbanThreadView } from "./threads.ts";
@@ -57,6 +60,11 @@ interface FakeThread {
 /** Threads that are idle unless a test says otherwise; a failure stands until the test clears it. */
 const makeFake = () => {
   const threads = new Map<string, FakeThread>();
+  const queued = new Map<ThreadId, ReadonlyArray<OrchestrationV2Run>>();
+  const history = new Map<
+    string,
+    Array<{ id: string; ordinal: number; started: boolean; model: ModelSelection }>
+  >();
   /** Reads of each thread (its view or its last failure), for tests that count them. */
   const reads = new Map<string, number>();
   const counted = (threadId: string) => reads.set(threadId, (reads.get(threadId) ?? 0) + 1);
@@ -104,7 +112,23 @@ const makeFake = () => {
       model: (threadId) => Effect.sync(() => threads.get(threadId)?.model ?? null),
       lastFailure: failureOf,
       findLastFailure: failureOf,
-      latestRun: () => Effect.succeed(null),
+      latestRun: (threadId, afterRunId) =>
+        Effect.sync(() => {
+          if (afterRunId === undefined) return null;
+          const runs = history.get(threadId) ?? [];
+          const failed = runs.find((run) => run.id === afterRunId);
+          const later = runs.findLast(
+            (run) => run.started && run.id !== afterRunId && run.ordinal > (failed?.ordinal ?? 0),
+          );
+          return later === undefined
+            ? null
+            : {
+                runId: later.id,
+                status: threads.get(threadId)?.run?.id === later.id ? "running" : "completed",
+                message: null,
+                model: later.model,
+              };
+        }),
       runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       launch: (input) =>
@@ -135,7 +159,16 @@ const makeFake = () => {
           const thread = threads.get(threadId);
           if (thread) thread.model = model;
         }),
-      queuedRuns: () => Effect.succeed([]),
+      queuedRuns: (threadId, includeActive) =>
+        Effect.sync(() => {
+          const current = threads.get(threadId)?.run;
+          return [
+            ...(queued.get(threadId) ?? []),
+            ...(includeActive && current !== null && current !== undefined
+              ? [{ id: RunId.make(current.id), status: "running" } as OrchestrationV2Run]
+              : []),
+          ];
+        }),
       cancelQueued: () => Effect.succeed(false),
       interrupt: (threadId) =>
         Effect.sync(() => {
@@ -156,6 +189,15 @@ const makeFake = () => {
       runId: `run-${nextRun}`,
       ...patch,
     };
+    const runs = history.get(threadId) ?? [];
+    if (!runs.some((run) => run.id === threads.get(threadId)!.failure!.runId))
+      runs.push({
+        id: threads.get(threadId)!.failure!.runId!,
+        ordinal: nextRun,
+        started: false,
+        model: threads.get(threadId)!.model,
+      });
+    history.set(threadId, runs);
   };
   /** The thread's latest run is a good one again (the wake started a new run). */
   const recover = (threadId: string) => {
@@ -172,11 +214,34 @@ const makeFake = () => {
         id: `run-${nextRun}`,
         at: DateTime.formatIso(DateTime.makeUnsafe(nowMs)),
       };
+      const runs = history.get(threadId) ?? [];
+      runs.push({
+        id: `run-${nextRun}`,
+        ordinal: nextRun,
+        started: true,
+        model: threads.get(threadId)!.model,
+      });
+      history.set(threadId, runs);
     });
   const finish = (threadId: string) => {
     threads.get(threadId)!.run = null;
   };
-  return { layer, fail, recover, messages, readsOf, start, finish, interrupted, sendControl };
+  return {
+    layer,
+    fail,
+    recover,
+    messages,
+    readsOf,
+    start,
+    finish,
+    interrupted,
+    sendControl,
+    setQueued: (threadId: ThreadId) =>
+      queued.set(threadId, [
+        { id: RunId.make("successor"), status: "queued" } as OrchestrationV2Run,
+      ]),
+    clearQueued: (threadId: ThreadId) => queued.delete(threadId),
+  };
 };
 
 const testLayer = (fake: Layer.Layer<KanbanThreads>, storeLayer = KanbanStore.layer) =>
@@ -1651,4 +1716,295 @@ it.effect.each(["stale terminal view", "finished before send returned"] as const
         Effect.provide(testLayer(lagged)),
       );
     }),
+);
+
+it.effect.each(["queued", "running"] as const)(
+  "restart bound keeps working card with a %s successor",
+  (successor) => {
+    const fake = makeFake();
+    return Effect.gen(function* () {
+      const { kanban, thread, now } = yield* workingCard;
+      if (successor === "running") yield* fake.start(thread);
+      else fake.setQueued(thread);
+      fake.fail(thread, { code: "restart_admission_timeout", runId: "expired-run" });
+      yield* kanban.turnEnded(thread, {
+        runId: "expired-run",
+        reason: "Restart admission expired",
+        restartAdmission: true,
+      });
+      yield* kanban.turnEnded(thread);
+      const card = (yield* now).card;
+      assert.strictEqual(card.stage, "working");
+      assert.strictEqual(card.stalled, null);
+      assert.strictEqual(card.activeThreadId, thread);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  },
+);
+
+it.effect.each(["owner", "evaluator"] as const)(
+  "restart bound clears on later user recovery but preserves %s stalls",
+  (actor) => {
+    const fake = makeFake();
+    return Effect.gen(function* () {
+      const { kanban, card, thread, now } = yield* workingCard;
+      yield* kanban.turnEnded(thread, {
+        runId: "expired-run",
+        reason: "Restart admission expired",
+        restartAdmission: true,
+      });
+      const stalled = (yield* now).card;
+      assert.strictEqual(stalled.stage, "todo");
+      assert.deepStrictEqual(stalled.stalled?.runFailure, {
+        threadId: thread,
+        runId: "expired-run",
+      });
+      assert.include(stalled.stalled!.reason, "evaluator can clear");
+      yield* TestClock.adjust(60_000);
+      yield* fake.start(thread);
+      yield* kanban.notifyThreadChanged(thread);
+      const recovered = (yield* now).card;
+      assert.strictEqual(recovered.stalled, null);
+      assert.strictEqual(recovered.stage, "working");
+      assert.strictEqual(recovered.activeThreadId, thread);
+      assert.strictEqual(recovered.activeRole, "work");
+      yield* kanban.flagCard(
+        card.id,
+        "Investigation",
+        actor === "owner" ? owner : { _tag: "evaluator", threadId: ThreadId.make("evaluator-1") },
+      );
+      yield* fake.start(thread);
+      yield* kanban.notifyThreadChanged(thread);
+      assert.strictEqual((yield* now).card.stalled?.reason, "Investigation");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  },
+);
+
+it.effect("the card evaluator can clear an orphaned restart bound stall", () => {
+  const fake = makeFake();
+  return Effect.gen(function* () {
+    const { kanban, card, thread, now } = yield* workingCard;
+    yield* kanban.turnEnded(thread, {
+      runId: "expired",
+      reason: "Restart admission expired",
+      restartAdmission: true,
+    });
+    yield* kanban.flagCard(card.id, null, {
+      _tag: "evaluator",
+      threadId: ThreadId.make("evaluator-1"),
+    });
+    assert.strictEqual((yield* now).card.stalled, null);
+  }).pipe(Effect.provide(testLayer(fake.layer)));
+});
+
+it.effect(
+  "a recovered worker can clear its bound stall before the run-update follower catches up",
+  () => {
+    const fake = makeFake();
+    return Effect.gen(function* () {
+      const { kanban, card, thread, now } = yield* workingCard;
+      yield* kanban.turnEnded(thread, {
+        runId: "expired",
+        reason: "Restart admission expired",
+        restartAdmission: true,
+      });
+      yield* fake.start(thread);
+      yield* kanban.flagCard(card.id, null, { _tag: "thread", threadId: thread });
+      assert.strictEqual((yield* now).card.stalled, null);
+      assert.strictEqual((yield* now).card.stage, "working");
+      assert.strictEqual((yield* now).card.activeThreadId, thread);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  },
+);
+
+it.effect.each(["deadline notification", "duplicate terminal notification"] as const)(
+  "a successor promoted during %s cannot disappear between reads",
+  (edge) => {
+    const fake = makeFake();
+    let target: ThreadId | undefined;
+    let armed = false;
+    const racing = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (real) =>
+        KanbanThreads.of({
+          ...real,
+          queuedRuns: (id, includeActive) =>
+            Effect.gen(function* () {
+              if (armed && id === target) {
+                armed = false;
+                yield* fake.start(id);
+                fake.clearQueued(id);
+                fake.fail(id, { code: "restart_admission_timeout", runId: "expired-run" });
+              }
+              return yield* real.queuedRuns(id, includeActive);
+            }),
+        }),
+      ),
+    ).pipe(Layer.provide(fake.layer));
+    return Effect.gen(function* () {
+      const { kanban, thread, now } = yield* workingCard;
+      target = thread;
+      fake.setQueued(thread);
+      fake.fail(thread, { code: "restart_admission_timeout", runId: "expired-run" });
+      armed = true;
+      yield* kanban.turnEnded(
+        thread,
+        edge === "deadline notification"
+          ? { runId: "expired-run", reason: "Restart admission expired", restartAdmission: true }
+          : undefined,
+      );
+      assert.isFalse(armed);
+      const card = (yield* now).card;
+      assert.strictEqual(card.stage, "working");
+      assert.strictEqual(card.activeThreadId, thread);
+      assert.strictEqual(card.stalled, null);
+    }).pipe(Effect.provide(testLayer(racing)));
+  },
+);
+
+it.effect("recovery resolves a model without effort to its configured effort pool", () => {
+  const fake = makeFake();
+  return Effect.gen(function* () {
+    const { kanban, board, card, thread, now } = yield* workingCard;
+    const selected = {
+      ...card.model,
+      options: [{ id: effortOptionId(card.model.instanceId), value: "xhigh" }],
+    };
+    yield* kanban.setPool(board.id, selected, 1, { replaces: card.activePool! });
+    yield* kanban.turnEnded(thread, {
+      runId: "expired-run",
+      reason: "Restart admission expired",
+      restartAdmission: true,
+    });
+    const threads = yield* KanbanThreads;
+    yield* threads.setModel(thread, { instanceId: card.model.instanceId, model: card.model.model });
+    yield* fake.start(thread);
+    yield* kanban.notifyThreadChanged(thread);
+    assert.strictEqual((yield* now).card.activePool, Rules.poolKey(selected));
+    const other = yield* kanban.createCard(
+      board.id,
+      { prompt: "B", title: "B", model: selected },
+      owner,
+    );
+    yield* kanban.dispatchNow;
+    assert.strictEqual((yield* kanban.card(other.id)).card.stage, "todo");
+  }).pipe(Effect.provide(testLayer(fake.layer)));
+});
+
+it.effect.each(["ordinary notification", "tick"] as const)(
+  "persisted restart timeout handled by %s keeps the recovery marker",
+  (edge) => {
+    const fake = makeFake();
+    return Effect.gen(function* () {
+      const { kanban, thread, now } = yield* workingCard;
+      fake.fail(thread);
+      yield* kanban.turnEnded(thread);
+      yield* pastBackoff;
+      yield* kanban.tick;
+      assert.strictEqual((yield* now).card.stage, "working");
+      fake.fail(thread, { code: "restart_admission_timeout", runId: "persisted-timeout" });
+      if (edge === "ordinary notification") yield* kanban.turnEnded(thread);
+      else {
+        yield* TestClock.adjust("15 seconds");
+        yield* kanban.tick;
+      }
+      assert.deepStrictEqual((yield* now).card.stalled?.runFailure, {
+        threadId: thread,
+        runId: "persisted-timeout",
+      });
+      yield* kanban.turnEnded(thread, {
+        runId: "persisted-timeout",
+        reason: "Restart admission expired",
+        restartAdmission: true,
+      });
+      yield* fake.start(thread);
+      yield* kanban.notifyThreadChanged(thread);
+      assert.strictEqual((yield* now).card.stalled, null);
+      assert.strictEqual((yield* now).card.stage, "working");
+      assert.strictEqual((yield* now).card.activeThreadId, thread);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  },
+);
+
+it.effect("review1518: recovery finishes before its board event is consumed", () => {
+  const fake = makeFake();
+  return Effect.gen(function* () {
+    const { kanban, thread, now } = yield* workingCard;
+    yield* kanban.turnEnded(thread, {
+      runId: "expired-run",
+      reason: "Restart admission expired",
+      restartAdmission: true,
+    });
+    assert.isNotNull((yield* now).card.stalled);
+    yield* fake.start(thread);
+    fake.finish(thread);
+    yield* kanban.notifyThreadChanged(thread);
+    yield* kanban.turnEnded(thread);
+    assert.strictEqual((yield* now).card.stalled, null);
+  }).pipe(Effect.provide(testLayer(fake.layer)));
+});
+
+it.effect("review1518: delayed restart timeout cannot flag successful recovery", () => {
+  const fake = makeFake();
+  return Effect.gen(function* () {
+    const { kanban, thread, now } = yield* workingCard;
+    yield* fake.start(thread);
+    fake.finish(thread);
+    yield* kanban.turnEnded(thread, {
+      runId: "expired-run",
+      reason: "Restart admission expired",
+      restartAdmission: true,
+    });
+    assert.strictEqual((yield* now).card.stalled, null);
+  }).pipe(Effect.provide(testLayer(fake.layer)));
+});
+
+it.effect.each(["ordinary notification", "deadline notification"] as const)(
+  "completed recovery remains visible to a delayed %s",
+  (notification) => {
+    const fake = makeFake();
+    return Effect.gen(function* () {
+      const { kanban, thread, now } = yield* workingCard;
+      fake.fail(thread, { code: "restart_admission_timeout", runId: "expired-run" });
+      yield* fake.start(thread);
+      fake.finish(thread);
+      fake.fail(thread, { code: "restart_admission_timeout", runId: "expired-run" });
+      yield* kanban.turnEnded(
+        thread,
+        notification === "deadline notification"
+          ? {
+              runId: "expired-run",
+              reason: "Restart admission expired",
+              restartAdmission: true,
+            }
+          : undefined,
+      );
+      assert.strictEqual((yield* now).card.stalled, null);
+      assert.strictEqual((yield* now).card.stage, "working");
+      assert.strictEqual((yield* now).card.activeThreadId, thread);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  },
+);
+
+it.effect.each(["owner", "evaluator"] as const)(
+  "completed recovery does not clear a %s stall",
+  (actor) => {
+    const fake = makeFake();
+    return Effect.gen(function* () {
+      const { kanban, card, thread, now } = yield* workingCard;
+      yield* kanban.flagCard(
+        card.id,
+        "Investigation",
+        actor === "owner"
+          ? owner
+          : {
+              _tag: "evaluator",
+              threadId: ThreadId.make("evaluator-1"),
+            },
+      );
+      yield* fake.start(thread);
+      fake.finish(thread);
+      yield* kanban.notifyThreadChanged(thread);
+      assert.strictEqual((yield* now).card.stalled?.reason, "Investigation");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  },
 );

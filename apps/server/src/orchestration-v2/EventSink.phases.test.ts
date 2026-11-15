@@ -2,11 +2,13 @@ import { assert, it } from "@effect/vitest";
 import {
   CommandId,
   MessageId,
+  NodeId,
   EventId,
   ProjectId,
   ProviderInstanceId,
   ProviderDriverKind,
   ProviderThreadId,
+  ProviderTurnId,
   RunId,
   RunAttemptId,
   ThreadId,
@@ -173,6 +175,149 @@ const phase = (span: Tracer.Span, name: string) =>
   span.attributes.get(`orchestration_v2.phase.${name}`);
 const writeSpans = (spans: ReadonlyArray<Tracer.Span>) =>
   spans.filter((span) => span.name === "orchestrationV2.EventSink.write");
+
+const providerTurn = (id: string, ordinal: number) =>
+  ({
+    id: EventId.make(`event:provider-turn:${id}`),
+    type: "provider-turn.updated",
+    threadId,
+    occurredAt: now,
+    payload: {
+      id: ProviderTurnId.make(id),
+      providerThreadId: ProviderThreadId.make("provider-thread:ordinal"),
+      nodeId: NodeId.make("node:ordinal"),
+      runAttemptId: null,
+      nativeTurnRef: null,
+      ordinal,
+      status: "running",
+      startedAt: now,
+      completedAt: null,
+    },
+  }) satisfies OrchestrationV2DomainEvent;
+
+it.effect.each([false, true])(
+  "concurrent provider turn writes allocate without rollback (duplicate=%s)",
+  (duplicate) => {
+    const trace = capture();
+    return Effect.gen(function* () {
+      const sink = yield* EventSink.EventSinkV2;
+      const store = yield* EventStore.EventStoreV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const sql = yield* SqlClient.SqlClient;
+      yield* sink.write({ events: [created] });
+      const ready = [yield* Deferred.make<void>(), yield* Deferred.make<void>()];
+      const release = yield* Deferred.make<void>();
+      const starts = yield* Effect.forEach(
+        ["turn:first", duplicate ? "turn:first" : "turn:second"],
+        (id, index) =>
+          Effect.gen(function* () {
+            // Both starts observe the same preflight snapshot before either can write.
+            const rows = yield* sql<{
+              ordinal: number;
+            }>`SELECT COALESCE(MAX(ordinal), 0) + 1 AS ordinal
+          FROM orchestration_v2_projection_provider_turns
+          WHERE provider_thread_id = ${ProviderThreadId.make("provider-thread:ordinal")}`;
+            yield* Deferred.succeed(ready[index]!, undefined);
+            yield* Deferred.await(release);
+            return yield* sink
+              .write({
+                events: [
+                  {
+                    ...providerTurn(id, rows[0]!.ordinal),
+                    id: EventId.make(`event:start:${index}`),
+                  },
+                ],
+              })
+              .pipe(Effect.exit);
+          }).pipe(Effect.forkChild),
+      );
+      yield* Effect.all(ready.map(Deferred.await));
+      yield* Deferred.succeed(release, undefined);
+      const results = yield* Effect.all(starts.map(Fiber.join));
+      assert.isTrue(results.every(Exit.isSuccess));
+      const projection = yield* projections.getThreadRecords(threadId, ["providerTurns"]);
+      assert.deepEqual(
+        projection.providerTurns.map((turn) => turn.ordinal).toSorted(),
+        duplicate ? [1] : [1, 2],
+      );
+      const events = Array.from(yield* store.read().pipe(Stream.runCollect));
+      assert.deepEqual(
+        events.flatMap(({ event }) =>
+          event.type === "provider-turn.updated" ? [event.payload.ordinal] : [],
+        ),
+        duplicate ? [1, 1] : [1, 2],
+      );
+      // Native lifecycle updates retain each start's stale preflight ordinal.
+      const updateIds = ["turn:first", duplicate ? "turn:first" : "turn:second"];
+      yield* sink.write({
+        events: updateIds.map((id, index) => ({
+          ...providerTurn(id, 1),
+          id: EventId.make(`event:refresh:${index}`),
+        })),
+      });
+      const refreshed = Array.from(yield* store.read().pipe(Stream.runCollect));
+      assert.deepEqual(
+        refreshed.flatMap(({ event }) =>
+          event.type === "provider-turn.updated" ? [event.payload.ordinal] : [],
+        ),
+        [
+          ...(duplicate ? [1, 1] : [1, 2]),
+          ...updateIds.map(
+            (id) => projection.providerTurns.find((turn) => turn.id === id)?.ordinal,
+          ),
+        ],
+      );
+      assert.isTrue(
+        writeSpans(trace.spans).every(
+          (span) => span.status._tag === "Ended" && Exit.isSuccess(span.status.exit),
+        ),
+      );
+    }).pipe(Effect.provide(testLayer()), Effect.withTracer(trace.tracer));
+  },
+);
+
+it.effect(
+  "provider turn updates keep their allocation across stale snapshots and a single batch",
+  () =>
+    Effect.gen(function* () {
+      const sink = yield* EventSink.EventSinkV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const store = yield* EventStore.EventStoreV2;
+      yield* sink.write({
+        events: [created, providerTurn("turn:first", 1), providerTurn("turn:second", 1)],
+      });
+      const stale = providerTurn("turn:first", 99);
+      yield* sink.write({
+        events: [
+          {
+            ...stale,
+            id: EventId.make("event:stale"),
+            payload: {
+              ...stale.payload,
+              status: "completed",
+              completedAt: now,
+              tokenUsage: { usedTokens: 42, maxTokens: 100, updatedAt: DateTime.formatIso(now) },
+            },
+          },
+        ],
+      });
+      const projection = yield* projections.getThreadRecords(threadId, ["providerTurns"]);
+      assert.deepEqual(
+        projection.providerTurns.map(({ id, ordinal, status }) => ({ id, ordinal, status })),
+        [
+          { id: "turn:first", ordinal: 1, status: "completed" },
+          { id: "turn:second", ordinal: 2, status: "running" },
+        ],
+      );
+      const events = Array.from(yield* store.read().pipe(Stream.runCollect));
+      assert.deepEqual(
+        events.flatMap(({ event }) =>
+          event.type === "provider-turn.updated" ? [event.payload.ordinal] : [],
+        ),
+        [1, 2, 1],
+      );
+    }).pipe(Effect.provide(testLayer())),
+);
 
 it.effect(
   "records each phase and the slowest event on the enclosing span with body tracing disabled",

@@ -232,11 +232,17 @@ test("the admin role prompt says Moni acts like the owner; guests need ask-owner
   expect(admin).toContain("Anything special they ask for");
   expect(admin).toContain("group chats Moni has written in");
   expect(admin).toContain("send --to <slug>");
+  expect(admin).toContain("agent-ask --to owner");
+  expect(admin).not.toContain("Other chats can't be reached from here");
+  expect(admin).toContain("agent-answer --request");
+  expect(admin).toContain("groups = no private data.");
   const person = sendblueContextPrompt(context("dm", { roleOf: address => ({ name: address, role: "person" }) }), false, []);
   expect(person).not.toContain("send --to");
+  expect(person).not.toContain("Agent bus:");
   const guest = sendblueContextPrompt(context("group"), false, ["+447700900123"]);
   expect(guest).toContain("Tom (guest)");
   expect(guest).toContain("ask-owner");
+  expect(guest).not.toContain("Agent bus:");
   expect(guest).toContain("silent observer");
   expect(guest).toContain("send no tapback");
   expect(guest).not.toContain("A tapback (`react --kind like` or an emoji) plus NO_REPLY is a complete answer");
@@ -245,6 +251,10 @@ test("the admin role prompt says Moni acts like the owner; guests need ask-owner
   const owner = sendblueContextPrompt(context("owner"), false, []);
   expect(owner).toContain("send --to <slug>");
   expect(owner).not.toContain("ask-owner");
+  expect(owner).toContain("Agent bus:");
+  expect(owner).toContain("agent-requests --session CURRENT_SESSION_ID");
+  expect(owner).toContain("owner = Abdullah's assistant on his Mac:");
+  expect(owner).toContain("moni = Moni's assistant:");
 });
 
 test("other chats' prompts say who reads background replies and keep agent talk out of them", () => {

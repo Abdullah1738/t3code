@@ -37,6 +37,7 @@ import * as EventStore from "../../orchestration-v2/EventStore.ts";
 import * as Executor from "../../orchestration-v2/ThreadCommandExecutor.ts";
 import * as LegacyV1ThreadImporter from "../../orchestration-v2/legacy/LegacyV1ThreadImporter.ts";
 import * as ThreadRedaction from "./ThreadRedaction.ts";
+import * as ControlStore from "../control/ControlStore.ts";
 import * as ServerLogFile from "../observability/serverLogFile.ts";
 
 const writerHooks = vi.hoisted(() => ({
@@ -225,6 +226,118 @@ it.effect(
         expect(other[0]!.text).toBe("untouched");
       }),
     ),
+);
+
+it.effect("includes redacted older messages in both control delta reads", () =>
+  Effect.andThen(
+    TestClock.setTime(Date.parse("2026-01-04T00:00:00.000Z")),
+    run(
+      Effect.gen(function* () {
+        yield* seed;
+        const sql = yield* SqlClient.SqlClient;
+        const oldAt = "2026-01-01T00:00:00.000Z";
+        const newerAt = "2026-01-02T00:00:00.000Z";
+        const since = Date.parse("2026-01-03T00:00:00.000Z");
+        const redactedAt = "2026-01-04T00:00:00.000Z";
+        yield* sql`INSERT INTO orchestration_v2_projection_threads
+        (thread_id, project_id, title, default_provider, runtime_mode, interaction_mode, created_at, updated_at, payload_json)
+        VALUES (${threadId}, 'fixture', 'Fixture', 'codex', 'full-access', 'default', ${oldAt}, ${newerAt}, '{}')`;
+        for (const [id, text, at] of [
+          ["older-message", `quoted ${fake}`, oldAt],
+          ["newer-message", "untouched prompt", newerAt],
+        ] as const) {
+          yield* sql`INSERT INTO orchestration_v2_projection_messages ${sql.insert({
+            message_id: id,
+            thread_id: threadId,
+            run_id: null,
+            node_id: null,
+            role: "user",
+            streaming: 0,
+            created_at: at,
+            updated_at: at,
+            payload_json: JSON.stringify({
+              id,
+              threadId,
+              runId: null,
+              nodeId: null,
+              role: "user",
+              text,
+              phase: "answer",
+              attachments: [],
+              streaming: false,
+              createdBy: "user",
+              creationSource: "web",
+              createdAt: at,
+              updatedAt: at,
+            }),
+          })}`;
+        }
+        const store = yield* ControlStore.ControlStore;
+        const pageInput = {
+          threadId,
+          role: null,
+          runId: null,
+          since,
+          afterMessageId: null,
+          limit: 10,
+        };
+        const userInput = { since, cursor: null, limit: 10 };
+        expect((yield* store.messagePage(pageInput)).messages).toEqual([]);
+        expect((yield* store.userMessagesSince(userInput)).messages).toEqual([]);
+
+        const service = yield* ThreadRedaction.ThreadRedaction;
+        yield* service.redactItem({ threadId, itemId: "call-fixture", reason: "fixture" });
+
+        const rows = yield* sql<{ message_id: string; updated_at: string }>`
+        SELECT message_id, updated_at FROM orchestration_v2_projection_messages ORDER BY created_at`;
+        expect(rows).toEqual([
+          { message_id: "older-message", updated_at: redactedAt },
+          { message_id: "newer-message", updated_at: newerAt },
+        ]);
+        expect(Date.parse(rows[0]!.updated_at)).toBeGreaterThan(Date.parse(oldAt));
+        expect(Date.parse(rows[0]!.updated_at)).toBeGreaterThan(since);
+        const page = yield* store.messagePage(pageInput);
+        const users = yield* store.userMessagesSince(userInput);
+        for (const delta of [page, { ...users, messages: users.messages.map((m) => m.message) }]) {
+          expect(delta.total).toBe(1);
+          expect(delta.messages).toHaveLength(1);
+          expect(delta.messages[0]!.id).toBe("older-message");
+          expect(delta.messages[0]!.text).toBe(`quoted [redacted ${redactedAt}: fixture]`);
+          expect(delta.messages[0]!.text).not.toContain(fake);
+        }
+      }).pipe(Effect.provide(ControlStore.layer)),
+    ),
+  ),
+);
+
+it.effect.each([
+  { previous: "2026-01-01T00:00:00.000Z", expected: "2026-01-02T00:00:00.000Z" },
+  { previous: "2026-01-02T00:00:00.000Z", expected: "2026-01-02T00:00:00.001Z" },
+  { previous: "2026-01-03T00:00:00.000Z", expected: "2026-01-03T00:00:00.001Z" },
+])("advances non-turn-item revisions monotonically from $previous", ({ previous, expected }) =>
+  Effect.andThen(
+    TestClock.setTime(Date.parse("2026-01-02T00:00:00.000Z")),
+    run(
+      Effect.gen(function* () {
+        yield* seed;
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`UPDATE projection_thread_messages SET updated_at = ${previous} WHERE message_id = 'quote'`;
+        yield* sql`INSERT INTO orchestration_v2_effect_outbox
+        (effect_id, command_id, thread_id, effect_type, payload_json, status, available_at, created_at, updated_at)
+        VALUES ('effect-fixture', 'command-fixture', ${threadId}, 'fixture', ${JSON.stringify({ quote: fake })}, 'succeeded', ${previous}, ${previous}, ${previous})`;
+        const service = yield* ThreadRedaction.ThreadRedaction;
+        yield* service.redactItem({ threadId, itemId: "call-fixture", reason: "fixture" });
+        const messages = yield* sql<{ updated_at: string; text: string }>`
+        SELECT updated_at, text FROM projection_thread_messages WHERE message_id = 'quote'`;
+        const outbox = yield* sql<{ updated_at: string; payload_json: string }>`
+        SELECT updated_at, payload_json FROM orchestration_v2_effect_outbox WHERE effect_id = 'effect-fixture'`;
+        expect(messages[0]!.updated_at).toBe(expected);
+        expect(outbox[0]!.updated_at).toBe(expected);
+        expect(messages[0]!.text).toContain("[redacted ");
+        expect(outbox[0]!.payload_json).toContain("[redacted ");
+      }),
+    ),
+  ),
 );
 
 it.effect("scrubs retained V1 transcript rows and their imported V2 copies", () =>

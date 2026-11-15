@@ -22,6 +22,7 @@ export class BoardsDatabase extends Context.Service<
   {
     readonly sql: SqlClient.SqlClient;
     readonly ready: Effect.Effect<void>;
+    readonly isReady?: () => boolean;
     readonly path: string;
   }
 >()("t3/ardud/persistence/BoardsDatabase") {}
@@ -264,7 +265,12 @@ export const layerFromPaths = (dbPath: string, legacyPath: string) =>
         }
       });
       yield* withStartupPhase("boards.setup", setup).pipe(Effect.provideService(bypassReady, true));
-      return BoardsDatabase.of({ sql, ready: Deferred.await(ready), path: dbPath });
+      return BoardsDatabase.of({
+        sql,
+        ready: Deferred.await(ready),
+        isReady: () => Deferred.isDoneUnsafe(ready),
+        path: dbPath,
+      });
     }).pipe((effect) => withStartupPhase("boards.initialize", effect)),
   );
 
