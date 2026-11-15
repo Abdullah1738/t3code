@@ -200,12 +200,15 @@ parent, cumulative CPU time, RSS, state, start time and elapsed time with a
 30-second timeout. It never invokes top or changes another process.
 
 `state/cpu.json` retains only PID, start time and cumulative CPU seconds, plus
-the monotonic observation time, under its own nonblocking lock. CPU seconds
+the Unix observation time, under its own nonblocking lock. CPU seconds
 and percentages compare successful inventories; 100% is one full core.
 New/reused PIDs and counter resets start at zero. Disappeared processes are
 dropped; their final CPU usage is unknown, so totals cover surviving processes.
 The first run, clock reset or gap over an hour establishes a baseline with
-null CPU totals and no top rows. Failed inventories emit a fixed `failure`
+null CPU totals and no top rows. Legacy monotonic timestamps establish one
+fresh baseline on upgrade. Monotonic time measures only each run's duration;
+Apple's Python 3.9 gives it a different epoch in each process, so it cannot
+measure intervals across minute invocations. Failed inventories emit a fixed `failure`
 code and `durationMs` without advancing state.
 
 `cpu.sample` includes `windowS`, `cpuS`, load averages, logical CPU count,
