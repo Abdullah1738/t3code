@@ -18872,6 +18872,123 @@ it.effect("the scribe puts a goal-less card in a matching goal and writes the go
   }),
 );
 
+it.effect.each(["unassigned", "done", "active"] as const)(
+  "goal history checks stay on cooldown after unchanged %s history",
+  (historyGoal) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const asked: Array<string> = [];
+      const events: AnalyticsEvent[] = [];
+      const calls = yield* Queue.unbounded<ScribeCall>();
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        const sql = yield* SqlClient.SqlClient;
+        const login = yield* kanban.setGoal(board.id, { name: "Login" });
+        const done = yield* kanban.setGoal(board.id, { name: "Finished goal" });
+        yield* store.putGoal({ ...done, status: "done" });
+        const live = yield* Effect.forEach(
+          ["Login form", "Login errors", "Login button"],
+          (title) =>
+            kanban.createCard(
+              board.id,
+              { prompt: title, title, description: "Sign-in", goalId: login.id },
+              owner,
+            ),
+        );
+        const template = live[0]!;
+        const history = 500;
+        yield* sql.withTransaction(
+          Effect.forEach(
+            Array.from({ length: history }, (_, i) => i),
+            (i) =>
+              store.putCard({
+                ...template,
+                id: KanbanCardId.make(`goal-history-${i}`),
+                number: i + 4,
+                stage: "verified",
+                settledAt: template.createdAt,
+                goalId:
+                  historyGoal === "active" ? login.id : historyGoal === "done" ? done.id : null,
+              }),
+            { discard: true },
+          ),
+        );
+        yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+        yield* kanban.dispatchNow;
+        yield* Ref.update(
+          fake.threads,
+          (all) => new Map([...all].map(([id, thread]) => [id, { ...thread, running: true }])),
+        );
+        const tickStats = Effect.gen(function* () {
+          events.length = 0;
+          yield* kanban.tick;
+          const tick = events.find(
+            (event) => event.kind === "kanban.tick" && event.boardId === board.id,
+          )!;
+          const status = events.find(
+            (event) =>
+              event.kind === "kanban.tick_phase" &&
+              event.boardId === board.id &&
+              event.props?.phase === "thread_status",
+          )!;
+          assert.isAtMost(status.props!.count!, 12);
+          return tick.props!.cardsScanned!;
+        });
+        yield* tickStats;
+        yield* finishScribeCall(yield* Queue.take(calls));
+        yield* finishScribeCall(yield* Queue.take(calls));
+        assert.lengthOf(goalAsks(asked), 1);
+        const scheduledCards = historyGoal === "active" ? history + 3 : 3;
+
+        // The unchanged check must start a fresh cooldown even though no writer is launched.
+        yield* TestClock.adjust("10 minutes");
+        assert.strictEqual(yield* tickStats, scheduledCards);
+        for (let i = 0; i < 9; i++) {
+          yield* TestClock.adjust("1 minute");
+          assert.strictEqual(yield* tickStats, 3);
+        }
+        yield* TestClock.adjust("1 minute");
+        assert.strictEqual(yield* tickStats, scheduledCards);
+        assert.lengthOf(goalAsks(asked), 1);
+        assert.strictEqual(yield* Queue.size(calls), 0);
+
+        // A change during that next cooldown is still written when its scheduled check comes due.
+        yield* kanban.createCard(
+          board.id,
+          { prompt: "New work", title: "New work", description: "Sign-in", goalId: login.id },
+          owner,
+        );
+        yield* TestClock.adjust("1 minute");
+        assert.strictEqual(yield* tickStats, 4);
+        const grouping = yield* Queue.take(calls);
+        assert.isTrue(grouping.prompt.startsWith("You group"));
+        yield* finishScribeCall(grouping);
+        assert.lengthOf(goalAsks(asked), 1);
+        yield* TestClock.adjust("9 minutes");
+        assert.strictEqual(yield* tickStats, scheduledCards + 1);
+        const goals = yield* Queue.take(calls);
+        assert.isTrue(goals.prompt.startsWith("You keep a work board's goals"));
+        yield* finishScribeCall(goals);
+        assert.lengthOf(goalAsks(asked), 2);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          scribeLayer(fake.layer, asked, 0, calls).pipe(
+            Layer.provide(
+              Layer.mock(Analytics.Analytics)({
+                record: (event) =>
+                  Effect.sync(() => {
+                    events.push(event);
+                  }),
+              }),
+            ),
+          ),
+        ),
+      );
+    }),
+);
+
 it.effect("a failed goal scribe run is retried after the cooldown, even with cards unchanged", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

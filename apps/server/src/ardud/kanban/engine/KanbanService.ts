@@ -2508,15 +2508,16 @@ const make = Effect.gen(function* () {
   // Pools whose model was off the composer's list at the last tick, as
   // `${boardId}:${poolKey}`. A pool is zeroed only on the second miss in a row.
   const unlistedPools = yield* Ref.make<ReadonlySet<string>>(new Set());
-  // Per board: the open-card fingerprint of the scribe's last attempt, when it started,
-  // and whether that attempt grouped the board. A failed attempt is retried after the
-  // cooldown even when the cards did not change.
+  // Goal history is checked on the cooldown even when its fingerprint needs no new run.
   const goalsScribed = yield* Ref.make<
     ReadonlyMap<
       KanbanBoardId,
       { readonly fingerprint: string; readonly at: number; readonly done: boolean }
     >
   >(new Map());
+  // Per board: the open-card fingerprint of the scribe's last attempt, when it started,
+  // and whether that attempt grouped the board. A failed attempt is retried after the
+  // cooldown even when the cards did not change.
   const scribed = yield* Ref.make<
     ReadonlyMap<
       KanbanBoardId,
@@ -10262,6 +10263,10 @@ const make = Effect.gen(function* () {
                     );
                     yield* Ref.update(goalsRunning, (all) => new Set(all).add(board.id));
                     yield* forkGoals(board.id);
+                  } else {
+                    yield* Ref.update(goalsScribed, (all) =>
+                      new Map(all).set(board.id, { ...lastGoals, at: now }),
+                    );
                   }
                 }
                 // Goal ideas: checked every PROPOSAL_CHECK_MS per board, asked only when due.
