@@ -12,6 +12,8 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Exit from "effect/Exit";
+import * as SqlClient from "effect/sql/SqlClient";
 import * as TestClock from "effect/testing/TestClock";
 
 import {
@@ -19,6 +21,7 @@ import {
   kanbanRetryNotBefore,
   kanbanRetrying,
   kanbanWaiting,
+  type KanbanCardEvent,
   ProjectId,
   ThreadId,
   type KanbanActor,
@@ -34,6 +37,7 @@ import * as ProjectService from "../../../project/ProjectService.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
 import { layer as providerRegistryLayer } from "../../../provider/testUtils/providerRegistryMock.ts";
 import * as KanbanStore from "../store/KanbanStore.ts";
+import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
 import * as KanbanModels from "./models.ts";
 import * as KanbanService from "./KanbanService.ts";
 import * as Retries from "./retries.ts";
@@ -62,7 +66,10 @@ const makeFake = () => {
   const counted = (threadId: string) => reads.set(threadId, (reads.get(threadId) ?? 0) + 1);
   let nextThread = 0;
   let nextRun = 0;
-  const sendControl = { beforeSend: (_text: string): Effect.Effect<void> => Effect.void };
+  const sendControl = {
+    beforeSend: (_text: string): Effect.Effect<void> => Effect.void,
+    beforeLaunch: (_text: string): Effect.Effect<void> => Effect.void,
+  };
   const read = (threadId: ThreadId) =>
     Effect.map(Clock.currentTimeMillis, (nowMs): KanbanThreadView | null =>
       (counted(threadId), threads.has(threadId))
@@ -108,17 +115,21 @@ const makeFake = () => {
       runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       launch: (input) =>
-        Effect.sync(() => {
-          nextThread += 1;
-          const threadId = ThreadId.make(`thread-${nextThread}`);
-          threads.set(threadId, {
-            messages: [input.text],
-            model: input.model,
-            failure: null,
-            run: null,
-          });
-          return threadId;
-        }),
+        sendControl.beforeLaunch(input.text).pipe(
+          Effect.andThen(
+            Effect.sync(() => {
+              nextThread += 1;
+              const threadId = ThreadId.make(`thread-${nextThread}`);
+              threads.set(threadId, {
+                messages: [input.text],
+                model: input.model,
+                failure: null,
+                run: null,
+              });
+              return threadId;
+            }),
+          ),
+        ),
       send: (input) =>
         sendControl.beforeSend(input.text).pipe(
           Effect.andThen(
@@ -179,19 +190,33 @@ const makeFake = () => {
   return { layer, fail, recover, messages, readsOf, start, finish, interrupted, sendControl };
 };
 
-const testLayer = (fake: Layer.Layer<KanbanThreads>, storeLayer = KanbanStore.layer) =>
+const testLayer = (
+  fake: Layer.Layer<KanbanThreads>,
+  storeLayer = KanbanStore.layer,
+  sqlLayer = Sqlite.layerMemory,
+) =>
   KanbanService.layer.pipe(
     Layer.provideMerge(fake),
     Layer.provideMerge(KanbanModels.layerTest(null)),
     Layer.provideMerge(storeLayer),
-    Layer.provideMerge(Sqlite.layerMemory),
+    Layer.provideMerge(sqlLayer),
     Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
     Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
     Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
     Layer.provideMerge(
-      ServerConfig.layerTest(process.cwd(), { prefix: "t3-kanban-retries-" }).pipe(
-        Layer.provideMerge(NodeServices.layer),
-        Layer.provideMerge(ServerSettings.layerTest()),
+      Layer.effect(
+        ServerConfig.ServerConfig,
+        Effect.map(ServerConfig.ServerConfig, (config) => ({
+          ...config,
+          robobBuildCommit: "current-build",
+        })),
+      ).pipe(
+        Layer.provideMerge(
+          ServerConfig.layerTest(process.cwd(), { prefix: "t3-kanban-retries-" }).pipe(
+            Layer.provideMerge(NodeServices.layer),
+            Layer.provideMerge(ServerSettings.layerTest()),
+          ),
+        ),
       ),
     ),
   );
@@ -1355,6 +1380,12 @@ it.effect.each(["approval", "conflict", "early conflict"] as const)(
         );
         const store = yield* KanbanStore.KanbanStore;
         assert.isNotNull((yield* store.threadLink(reviewer))?.endedAt);
+        if (kind === "approval") {
+          const sql = yield* BoardsDatabase.client;
+          const routes =
+            yield* sql`SELECT id FROM ardud_kanban_owner_routes WHERE route_key LIKE ${`review-gate:${detail.card.id}:%`}`;
+          assert.lengthOf(routes, 1);
+        }
         // The evaluator can clear the flag and retry with the same reviewer.
         yield* kanban.flagCard(detail.card.id, null, owner);
         yield* TestClock.adjust("1 second");
@@ -1650,5 +1681,621 @@ it.effect.each(["stale terminal view", "finished before send returned"] as const
         Effect.ensuring(Deferred.succeed(delivered, undefined)),
         Effect.provide(testLayer(lagged)),
       );
+    }),
+);
+
+const GATE_HEAD = "d37243cdc055a1cb81d8deccefa943af6527f8e1";
+const gateFlaggedCard = Effect.gen(function* () {
+  const context = yield* reviewingCard;
+  const store = yield* KanbanStore.KanbanStore;
+  const current = (yield* context.now).card;
+  const card: KanbanCard = {
+    ...current,
+    stage: "needs_review",
+    activeThreadId: null,
+    activeRole: null,
+    activePool: null,
+    stalled: {
+      reason: `${Retries.REFUSED_VERDICT_PREFIX}subtask s1 (secret) needs Abdullah's approval`,
+      by: { _tag: "system", component: "dispatcher" },
+      at: current.movedAt,
+    },
+    subtasks: [
+      {
+        id: "s1",
+        step: 1,
+        owner: "review",
+        text: "Check secrets are absent from logs",
+        gate: "secret",
+        state: "open",
+        createdAt: current.movedAt,
+        note: null,
+        doneAt: null,
+        doneBy: null,
+      },
+    ],
+    subtaskSeq: 1,
+    retries: [
+      {
+        kind: "no_verdict",
+        role: "review",
+        state: "restarted",
+        at: current.movedAt,
+        reason: Retries.NO_VERDICT_REASON,
+        runId: null,
+      },
+    ],
+  };
+  yield* store.putCard(card);
+  yield* store.putThreadLink({
+    ...(yield* store.threadLink(context.reviewer))!,
+    endedAt: card.movedAt,
+  });
+  const refusal: Omit<KanbanCardEvent, "id"> = {
+    cardId: card.id,
+    actor: { _tag: "thread", threadId: context.reviewer },
+    at: card.movedAt,
+    kind: "comment",
+    fromStage: null,
+    toStage: null,
+    head: GATE_HEAD,
+    body: `${Retries.REFUSED_VERDICT_PREFIX}clear at ${GATE_HEAD.slice(0, 8)}: subtask s1 (secret) needs Abdullah's approval`,
+  };
+  yield* store.addCardEvent(refusal);
+  return { ...context, card, store, refusal };
+});
+
+const gateRequeues = (events: ReadonlyArray<KanbanCardEvent>) =>
+  events.filter((event) => event.body === Retries.REVIEW_GATE_REQUEUED_EVENT);
+
+it.effect(
+  "a subtask edit requeues a gate-refused review, retaining queue age, wait and retries",
+  () =>
+    Effect.gen(function* () {
+      const fake = makeFake();
+      yield* Effect.gen(function* () {
+        const { kanban, card, now, store, refusal } = yield* gateFlaggedCard;
+        yield* store.addCardEvent({
+          ...refusal,
+          actor: { _tag: "system", component: "dispatcher" },
+          body: Retries.reviewGateBuildEvent("current-build"),
+        });
+        yield* kanban.waitCard(
+          card.id,
+          {
+            on: "time",
+            until: "2026-11-11T10:00:00.000Z",
+            note: "Retain parked wait",
+            wakeRole: "review",
+          },
+          owner,
+        );
+        const wait = (yield* now).card.wait!;
+        yield* store.putCard({ ...card, wait });
+
+        yield* TestClock.adjust("1 second");
+        const edited = yield* kanban.editCard(
+          card.id,
+          { subtasks: [{ id: "s1", step: 1, owner: "review", text: "Check log redaction" }] },
+          owner,
+        );
+        assert.strictEqual(edited.stage, "needs_review");
+        assert.isNull(edited.stalled);
+        assert.strictEqual(edited.movedAt, card.movedAt);
+        assert.deepStrictEqual(edited.wait, wait);
+        assert.deepStrictEqual(edited.retries, card.retries);
+        assert.lengthOf(gateRequeues((yield* now).events), 1);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect("a new build requeues a historical gate refusal once, with a quick re-record brief", () =>
+  Effect.gen(function* () {
+    const fake = makeFake();
+    yield* Effect.gen(function* () {
+      const { kanban, card, now, reviewer, store, refusal } = yield* gateFlaggedCard;
+      yield* store.addCardEvent({
+        ...refusal,
+        actor: { _tag: "system", component: "dispatcher" },
+        body: Retries.reviewGateBuildEvent("old-build"),
+      });
+      yield* kanban.tick;
+      assert.isNull((yield* now).card.stalled);
+      assert.deepStrictEqual((yield* now).card.retries, card.retries);
+      assert.include(
+        fake.messages(reviewer).at(-1) ?? "",
+        `Your earlier verdict at ${GATE_HEAD} was refused by a gate that is now gone`,
+      );
+      yield* kanban.tick;
+      assert.lengthOf(gateRequeues((yield* now).events), 1);
+      // A second refusal in this build must not create an automatic retry loop.
+      const running = (yield* now).card;
+      yield* store.putCard({ ...card, movedAt: running.movedAt });
+      yield* store.addCardEvent({ ...refusal, at: running.movedAt });
+      yield* kanban.tick;
+      assert.isNotNull((yield* now).card.stalled);
+      assert.lengthOf(gateRequeues((yield* now).events), 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect.each(["deploy", "money", "secret"] as const)(
+  "an unanswered owner %s gate retains its flag and queues its evaluator notice once per build",
+  (gate) =>
+    Effect.gen(function* () {
+      const fake = makeFake();
+      yield* Effect.gen(function* () {
+        const { kanban, card, now, store } = yield* gateFlaggedCard;
+        const gated = {
+          ...card,
+          subtasks: card.subtasks.map((subtask) => ({
+            ...subtask,
+            owner: "evaluator" as const,
+            gate,
+            gateSource: "set" as const,
+            text: `Owner ${gate} action`,
+          })),
+        };
+        yield* store.putCard(gated);
+        yield* kanban.tick;
+        yield* kanban.tick;
+        const detail = yield* now;
+        assert.deepStrictEqual(detail.card.stalled, card.stalled);
+        assert.deepStrictEqual(detail.card.retries, card.retries);
+        assert.lengthOf(gateRequeues(detail.events), 0);
+        assert.lengthOf(
+          detail.events.filter(
+            (event) => event.body === Retries.reviewGateBuildEvent("current-build"),
+          ),
+          1,
+        );
+        const sql = yield* BoardsDatabase.client;
+        const notices = yield* sql<{
+          json: string;
+        }>`SELECT json FROM ardud_kanban_owner_routes WHERE route_key LIKE ${`review-gate:${card.id}:%`}`;
+        assert.lengthOf(notices, 1);
+        assert.include(notices[0]!.json, "needs Abdullah's approval");
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect.each(["approved", "picked"] as const)(
+  "an owner %s answer rechecks the refused verdict without a new build",
+  (answer) =>
+    Effect.gen(function* () {
+      const fake = makeFake();
+      yield* Effect.gen(function* () {
+        const { kanban, card, now, store } = yield* gateFlaggedCard;
+        yield* store.putCard({
+          ...card,
+          subtasks: card.subtasks.map((s) => ({
+            ...s,
+            owner: "evaluator" as const,
+            gate: "deploy" as const,
+            gateSource: "set" as const,
+            text: "Deploy this fix",
+          })),
+        });
+        yield* kanban.askOwner(
+          card.id,
+          {
+            question: "Approve s1: deploy this fix?",
+            blocking: false,
+            ...(answer === "picked"
+              ? { options: [{ id: "go", label: "Approve s1", approves: ["s1"] }] }
+              : {
+                  kind: "action" as const,
+                  action: { summary: "Deploy this fix for s1" },
+                  respond: { verdict: { approve: "Approve", reject: "Reject" } },
+                }),
+          },
+          owner,
+          "owner",
+        );
+        yield* kanban.tick;
+        assert.isNotNull((yield* now).card.stalled);
+        const ask = (yield* now).card.asks.at(-1)!;
+        yield* kanban.answerAsk(
+          card.id,
+          ask.id,
+          answer === "picked"
+            ? { verdict: "picked", optionIds: ["go"], revision: 0 }
+            : { verdict: "approved", revision: 0 },
+          owner,
+        );
+        assert.isNull((yield* now).card.stalled);
+        assert.strictEqual((yield* now).card.stage, "needs_review");
+        assert.deepStrictEqual((yield* now).card.retries, card.retries);
+        assert.lengthOf(gateRequeues((yield* now).events), 1);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect("changing guessedGates rechecks refused reviews on that board", () =>
+  Effect.gen(function* () {
+    const fake = makeFake();
+    yield* Effect.gen(function* () {
+      const { kanban, board, card, now, store } = yield* gateFlaggedCard;
+      yield* store.putCard({
+        ...card,
+        subtasks: card.subtasks.map(({ gate: _gate, ...s }) => ({
+          ...s,
+          owner: "evaluator" as const,
+          text: "Deploy this fix",
+        })),
+      });
+      yield* kanban.tick;
+      assert.isNotNull((yield* now).card.stalled);
+      yield* kanban.updateBoard(board.id, { guessedGates: [] }, owner);
+      assert.isNull((yield* now).card.stalled);
+      assert.deepStrictEqual((yield* now).card.retries, card.retries);
+      assert.lengthOf(gateRequeues((yield* now).events), 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect.each([
+  {
+    name: "legacy gate refusal",
+    body: `card_review_result clear at ${GATE_HEAD} rejected with capability_denied: secret-gate rejection on s1`,
+    own: true,
+    old: false,
+    recovers: true,
+  },
+  {
+    name: "plain no-verdict",
+    body: "I have not reviewed this yet",
+    own: true,
+    old: false,
+    recovers: false,
+  },
+  {
+    name: "another reviewer's refusal",
+    body: "card_review_result capability_denied secret gate",
+    own: false,
+    old: false,
+    recovers: false,
+  },
+  {
+    name: "stale refusal",
+    body: "card_review_result capability_denied secret gate",
+    own: true,
+    old: true,
+    recovers: false,
+  },
+  {
+    name: "conflict",
+    body: "Review verdict refused: clear at abcdef1: Board changed during this operation",
+    own: true,
+    old: false,
+    recovers: false,
+  },
+  {
+    name: "invalid verdict",
+    body: "Review verdict refused: findings at abcdef1: findings need at least one line",
+    own: true,
+    old: false,
+    recovers: false,
+  },
+])(
+  "only reliable gate evidence recovers NO_VERDICT_REASON: $name",
+  ({ body, own, old, recovers }) =>
+    Effect.gen(function* () {
+      const fake = makeFake();
+      yield* Effect.gen(function* () {
+        const { kanban, card, now, store, refusal } = yield* gateFlaggedCard;
+        yield* store.putCard({
+          ...card,
+          movedAt: old ? "2026-11-10T10:01:00.000Z" : card.movedAt,
+          reviewThreadId: own ? card.reviewThreadId : ThreadId.make("another-reviewer"),
+          stalled: { ...card.stalled!, reason: Retries.NO_VERDICT_REASON },
+        });
+        // Replace the modern evidence rather than letting it satisfy the legacy test.
+        yield* store.putCard({ ...(yield* now).card, movedAt: "2026-11-10T10:01:00.000Z" });
+        yield* store.addCardEvent({
+          ...refusal,
+          at: old ? card.movedAt : "2026-11-10T10:01:00.000Z",
+          body,
+          head: null,
+        });
+        yield* kanban.tick;
+        assert.strictEqual((yield* now).card.stalled === null, recovers);
+        assert.lengthOf(gateRequeues((yield* now).events), recovers ? 1 : 0);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect("a standing approval grant rechecks that board's refused reviews", () =>
+  Effect.gen(function* () {
+    const fake = makeFake();
+    yield* Effect.gen(function* () {
+      const { kanban, board, card, now, store } = yield* gateFlaggedCard;
+      const evaluator = {
+        _tag: "evaluator" as const,
+        threadId: yield* kanban.startEvaluator(board.id, {
+          kind: "request",
+          text: "Record board approval",
+        }),
+      };
+      yield* store.putCard({
+        ...card,
+        subtasks: card.subtasks.map((s) => ({
+          ...s,
+          owner: "evaluator" as const,
+          gate: "deploy" as const,
+          text: "Deploy this fix",
+        })),
+      });
+      yield* kanban.tick;
+      assert.isNotNull((yield* now).card.stalled);
+      const approval = yield* kanban.createCard(
+        board.id,
+        { title: "Standing approval", prompt: "Record approval" },
+        owner,
+      );
+      yield* kanban.askOwner(
+        approval.id,
+        {
+          question: `Approve deployments for the ${board.slug} board`,
+          blocking: false,
+          kind: "action",
+          action: { summary: `Approve deployments for the ${board.slug} board` },
+          respond: { verdict: { approve: "Approve", reject: "Reject" } },
+        },
+        owner,
+        "owner",
+      );
+      yield* kanban.answerAsk(approval.id, "q1", { verdict: "approved", revision: 0 }, owner);
+      yield* kanban.standingApproval(
+        board.id,
+        {
+          action: "grant",
+          cardId: approval.id,
+          ask: "q1",
+          quote: "Approve deployments",
+          sourceThreadId: "owner-thread",
+          saidAt: card.movedAt,
+        },
+        evaluator,
+      );
+      assert.isNull((yield* now).card.stalled);
+      assert.deepStrictEqual((yield* now).card.retries, card.retries);
+      assert.lengthOf(gateRequeues((yield* now).events), 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect.each(["build", "settings"] as const)(
+  "a failed %s recovery save rolls back its trigger, receipt and move",
+  (trigger) =>
+    Effect.gen(function* () {
+      const fake = makeFake();
+      let target: string | null = null;
+      let fail = false;
+      const storeLayer = Layer.effect(
+        KanbanStore.KanbanStore,
+        Effect.map(KanbanStore.KanbanStore, (real) =>
+          KanbanStore.KanbanStore.of({
+            ...real,
+            putCard: (card) =>
+              real
+                .putCard(card)
+                .pipe(
+                  Effect.andThen(
+                    Effect.suspend(() =>
+                      fail && card.id === target && card.stalled === null
+                        ? Effect.die(new Error("recovery card save failed"))
+                        : Effect.void,
+                    ),
+                  ),
+                ),
+          }),
+        ),
+      ).pipe(Layer.provide(KanbanStore.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, board, card, now, store } = yield* gateFlaggedCard;
+        if (trigger === "settings")
+          yield* store.putCard({
+            ...card,
+            subtasks: card.subtasks.map(({ gate: _gate, ...s }) => ({
+              ...s,
+              owner: "evaluator" as const,
+              text: "Deploy this fix",
+            })),
+          });
+        const recover =
+          trigger === "build"
+            ? kanban.tick
+            : kanban.updateBoard(board.id, { guessedGates: [] }, owner).pipe(Effect.asVoid);
+        target = card.id;
+        fail = true;
+        yield* Effect.exit(recover);
+        const failed = yield* now;
+        assert.deepStrictEqual(failed.card.stalled, card.stalled);
+        assert.lengthOf(gateRequeues(failed.events), 0);
+        assert.isFalse(
+          failed.events.some(
+            (event) => event.body === Retries.reviewGateBuildEvent("current-build"),
+          ),
+        );
+        assert.deepStrictEqual(
+          (yield* kanban.snapshot(board.id)).board.guessedGates,
+          board.guessedGates,
+        );
+        fail = false;
+        yield* recover;
+        assert.isNull((yield* now).card.stalled);
+        assert.lengthOf(gateRequeues((yield* now).events), 1);
+      }).pipe(Effect.provide(testLayer(fake.layer, storeLayer)));
+    }),
+);
+
+it.effect("a failed evaluator delivery retains its durable gate-notification obligation", () =>
+  Effect.gen(function* () {
+    const fake = makeFake();
+    const attempted = yield* Deferred.make<void>();
+    yield* Effect.gen(function* () {
+      const { kanban, card, now, store } = yield* gateFlaggedCard;
+      yield* store.putCard({
+        ...card,
+        subtasks: card.subtasks.map((s) => ({
+          ...s,
+          owner: "evaluator" as const,
+          gate: "secret" as const,
+        })),
+      });
+      const refuse = (text: string) =>
+        text.includes("needs Abdullah's approval")
+          ? Deferred.succeed(attempted, undefined).pipe(
+              Effect.andThen(Effect.die(new Error("evaluator delivery failed"))),
+            )
+          : Effect.void;
+      fake.sendControl.beforeLaunch = refuse;
+      fake.sendControl.beforeSend = refuse;
+      yield* kanban.tick;
+      yield* Deferred.await(attempted);
+      const sql = yield* BoardsDatabase.client;
+      const routes = yield* sql<{
+        done_at: string | null;
+      }>`SELECT done_at FROM ardud_kanban_owner_routes WHERE route_key LIKE ${`review-gate:${card.id}:%`}`;
+      assert.lengthOf(routes, 1);
+      assert.isNull(routes[0]!.done_at);
+      assert.isNotNull((yield* now).card.stalled);
+      assert.isTrue(
+        (yield* now).events.some(
+          (event) => event.body === Retries.reviewGateBuildEvent("current-build"),
+        ),
+      );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect.each(
+  (["plan", "answer", "settings"] as const).flatMap((trigger) =>
+    (["before", "after"] as const).map((order) => ({ trigger, order })),
+  ),
+)(
+  "a $trigger change $order refusal still requeues after an earlier build check",
+  ({ trigger, order }) =>
+    Effect.gen(function* () {
+      const fake = makeFake();
+      yield* Effect.gen(function* () {
+        const { kanban, board, card, now, store, reviewer, refusal } = yield* gateFlaggedCard;
+        yield* store.addCardEvent({
+          ...refusal,
+          actor: { _tag: "system", component: "dispatcher" },
+          body: Retries.reviewGateBuildEvent("current-build"),
+        });
+        if (order === "before") yield* TestClock.adjust("1 second");
+        const movedAt = order === "before" ? DateTime.formatIso(yield* DateTime.now) : card.movedAt;
+        yield* store.putCard({
+          ...card,
+          movedAt,
+          stage: "in_review",
+          activeThreadId: reviewer,
+          activeRole: "review",
+          activePool: Rules.poolKey(card.model),
+          stalled: null,
+        });
+        yield* store.putThreadLink({ ...(yield* store.threadLink(reviewer))!, endedAt: null });
+        if (trigger === "plan")
+          yield* kanban.editCard(
+            card.id,
+            { subtasks: [{ id: "s1", owner: "review", step: 1, text: "Check log redaction" }] },
+            owner,
+          );
+        else if (trigger === "settings")
+          yield* kanban.updateBoard(board.id, { guessedGates: [] }, owner);
+        else {
+          yield* kanban.askOwner(
+            card.id,
+            {
+              question: "Approve s1",
+              blocking: false,
+              kind: "action",
+              action: { summary: "Approve s1" },
+              respond: { verdict: { approve: "Approve", reject: "Reject" } },
+            },
+            owner,
+            "owner",
+          );
+          yield* kanban.answerAsk(card.id, "q1", { verdict: "approved", revision: 0 }, owner);
+        }
+        if (order === "before") yield* store.addCardEvent({ ...refusal, at: movedAt });
+        yield* kanban.turnEnded(reviewer);
+        assert.isNotNull((yield* now).card.stalled);
+        assert.lengthOf(
+          (yield* now).events.filter(
+            (event) => event.body === Retries.reviewGateBuildEvent("current-build"),
+          ),
+          1,
+        );
+        yield* kanban.tick;
+        assert.isNull((yield* now).card.stalled);
+        assert.lengthOf(gateRequeues((yield* now).events), 1);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect(
+  "an edit cannot report a recovered card when the SQL transaction fails after its save",
+  () =>
+    Effect.gen(function* () {
+      const fake = makeFake();
+      let fail = false;
+      let depth = 0;
+      const sqlLayer = Layer.effect(
+        SqlClient.SqlClient,
+        Effect.map(SqlClient.SqlClient, (sql) => {
+          const withTransaction: typeof sql.withTransaction = (effect) =>
+            Effect.suspend(() => {
+              const outer = depth++ === 0;
+              return sql
+                .withTransaction(
+                  effect.pipe(
+                    Effect.tap(() =>
+                      outer && fail
+                        ? Effect.die(new Error("commit failed after card write"))
+                        : Effect.void,
+                    ),
+                  ),
+                )
+                .pipe(
+                  Effect.ensuring(
+                    Effect.sync(() => {
+                      depth--;
+                    }),
+                  ),
+                );
+            });
+          return new Proxy(sql, {
+            get: (target, property, receiver) =>
+              property === "withTransaction"
+                ? withTransaction
+                : Reflect.get(target, property, receiver),
+          });
+        }),
+      ).pipe(Layer.provide(Sqlite.layerMemory));
+      yield* Effect.gen(function* () {
+        const { kanban, card, now } = yield* gateFlaggedCard;
+        fail = true;
+        const result = yield* Effect.exit(
+          kanban.editCard(
+            card.id,
+            { subtasks: [{ id: "s1", owner: "review", step: 1, text: "Check log redaction" }] },
+            owner,
+          ),
+        );
+        assert.isTrue(Exit.isFailure(result));
+        const detail = yield* now;
+        assert.deepStrictEqual(detail.card.stalled, card.stalled);
+        assert.deepStrictEqual(detail.card.subtasks, card.subtasks);
+        assert.lengthOf(gateRequeues(detail.events), 0);
+        assert.isFalse(
+          detail.events.some(
+            (event) => event.body === Retries.reviewGateBuildEvent("current-build"),
+          ),
+        );
+      }).pipe(Effect.provide(testLayer(fake.layer, KanbanStore.layer, sqlLayer)));
     }),
 );

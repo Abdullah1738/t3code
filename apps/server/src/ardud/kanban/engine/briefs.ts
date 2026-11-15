@@ -180,6 +180,7 @@ export const reviewBrief = (
   priorFindings: ReadonlyArray<string>,
   /** A new thread has no earlier step in it, so it gets the whole brief even on a later step. */
   freshThread = false,
+  gateClearedHead: string | null = null,
 ) => {
   const steps = chain?.steps.length ?? 1;
   const step = Math.min(card.reviewStep, steps - 1) + 1;
@@ -187,6 +188,9 @@ export const reviewBrief = (
   // A review the board restarted after a failed run or a missing verdict says so first.
   const retried = freshThread ? null : reviewRetryNote(card);
   return lines(
+    gateClearedHead === null
+      ? null
+      : `Your earlier verdict at ${gateClearedHead} was refused by a gate that is now gone: re-check quickly and record it again if the head is unchanged.`,
     retried,
     retried === null ? null : "",
     continuing
@@ -336,18 +340,18 @@ export const evaluatorBrief = (board: KanbanBoard, purpose: EvaluatorPurpose) =>
         "- Discussions: discussion_create opens a channel, discussion_post writes to any discussion (markdown, collapse, html, choice, card blocks).",
         '- Reporter updates: one evaluator owns each card\'s reporter notifications. Before sending "fixed" or "workarounds no longer needed", read the card back and check the installed fix live; send only when its stage is deployed or verified. For each destination thread, check the card history for the same text, then use t3_thread_send with a stable clientRequestId made from the card id, destination thread id and hash of the exact text. Record each send on the card; never send the same text to the same thread twice.',
 
-    LINKS_LINE,
-    "- Shared lessons: wiki_read, wiki_write. Write down what future evaluators should know.",
-    "",
-    board.instructions.modelRouting.trim()
-      ? `Model routing:\n${board.instructions.modelRouting.trim()}\n`
-      : null,
-    REVIEW_DELEGATION_GUIDANCE,
-    board.instructions.escalation.trim()
-      ? `When to ask the owner:\n${board.instructions.escalation.trim()}\n`
-      : null,
-    "The owner never moves cards to In Review or Working himself and does not message threads directly. Ask him only through a discussion or a Needs Owner card.",
-  );
+        LINKS_LINE,
+        "- Shared lessons: wiki_read, wiki_write. Write down what future evaluators should know.",
+        "",
+        board.instructions.modelRouting.trim()
+          ? `Model routing:\n${board.instructions.modelRouting.trim()}\n`
+          : null,
+        REVIEW_DELEGATION_GUIDANCE,
+        board.instructions.escalation.trim()
+          ? `When to ask the owner:\n${board.instructions.escalation.trim()}\n`
+          : null,
+        "The owner never moves cards to In Review or Working himself and does not message threads directly. Ask him only through a discussion or a Needs Owner card.",
+      );
 
 /** Steer text for an owner message delivered to a card or evaluator thread. */
 export const ownerMessageText = (discussionTitle: string, discussionId: string, text: string) =>

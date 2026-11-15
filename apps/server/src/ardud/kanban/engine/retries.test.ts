@@ -11,6 +11,8 @@ import * as DateTime from "effect/DateTime";
 import {
   decideRetry,
   refusedVerdict,
+  gateRefusedVerdict,
+  gateRefusalHead,
   REFUSED_VERDICT_PREFIX,
   heldByPause,
   noRetryReason,
@@ -359,5 +361,70 @@ describe("refusedVerdict", () => {
   );
   it("ignores a previous run's refusal from a reused reviewer", () => {
     expect(refusedVerdict({ ...card, movedAt: iso(start + 1) }, [refused], threadId)).toBeNull();
+  });
+});
+
+describe("gate refusal evidence", () => {
+  const threadId = ThreadId.make("reviewer");
+  const card = { id: KanbanCardId.make("card"), movedAt: iso(start), reviewThreadId: threadId };
+  const refused: KanbanCardEvent = {
+    id: 1,
+    cardId: card.id,
+    at: card.movedAt,
+    kind: "comment",
+    actor: { _tag: "thread", threadId },
+    fromStage: null,
+    toStage: null,
+    body: "Review verdict refused: clear at abcdef1: card #1 subtask s2 (secret: retrieve key) needs Abdullah's approval",
+    head: "abcdef1",
+  };
+
+  it.each([
+    "Check logs",
+    "Check logs (redaction)",
+    "Check logs (outer (nested))",
+    "Check logs ) redaction",
+    "Check (logs",
+    "Check logs: redaction",
+    "Check logs\n(redaction)",
+    "Check logs (redaction: key) and (diagnostics)",
+  ])("recognizes generated gate refusals with subtask text %j", (text) => {
+    for (const gate of ["deploy", "money", "secret"]) {
+      const event = {
+        ...refused,
+        body: `Review verdict refused: clear at abcdef1: card #1 subtask s2 (${gate}: ${text}) needs Abdullah's approval: no owner answer`,
+      };
+      expect(gateRefusedVerdict(card, [event])).toEqual(event);
+    }
+  });
+
+  it("does not reuse gate evidence after a newer conflict or a recorded verdict", () => {
+    expect(gateRefusedVerdict(card, [refused])).toEqual(refused);
+    expect(
+      gateRefusedVerdict(card, [
+        refused,
+        { ...refused, id: 2, body: "Review verdict refused: clear at abcdef1: Board changed" },
+      ]),
+    ).toBeNull();
+    expect(
+      gateRefusedVerdict(card, [refused, { ...refused, id: 2, kind: "review", body: "clear" }]),
+    ).toBeNull();
+  });
+
+  it.each([
+    {
+      body: "card_review_result(head=ABCDEF1234) capability_denied secret gate",
+      head: null,
+      expected: "abcdef1234",
+    },
+    {
+      body: "Review remains CLEAR at abcdef1234; card_review_result capability_denied secret gate",
+      head: null,
+      expected: "abcdef1234",
+    },
+    { body: "card_review_result capability_denied secret gate", head: null, expected: null },
+    { body: "card_review_result capability_denied secret gate", head: "bad-head", expected: null },
+  ])("reads only a valid head from refusal evidence: $body", ({ body, head, expected }) => {
+    expect(gateRefusalHead({ ...refused, body, head })).toBe(expected);
   });
 });

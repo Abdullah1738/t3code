@@ -87,6 +87,13 @@ describe("board briefs", () => {
     );
   });
 
+  it("asks for a quick re-record after a gate clears, conditional on the same head", () => {
+    const head = "d37243cdc055a1cb81d8deccefa943af6527f8e1";
+    expect(reviewBrief(board, card, null, null, [], false, head)).toContain(
+      `Your earlier verdict at ${head} was refused by a gate that is now gone: re-check quickly and record it again if the head is unchanged.`,
+    );
+    expect(reviewBrief(board, card, null, null, [])).not.toContain("was refused by a gate");
+  });
   it("tells workers to watch PR CI and end the turn, and wait inside it for other work", () => {
     expect(nudgeWorkText([card])).toContain(
       "Waiting on CI for a PR: call watch_pull_request on it and end your turn; the board waits while the watch is on and the watch wakes you. For a deploy or anything else, wait inside your turn.",
@@ -297,5 +304,7 @@ it("nightly review requires complete reads, a fresh cursor and recovery from fai
   ]) {
     expect(brief).toContain(text);
   }
-  expect(brief.indexOf("Complete the read pass")).toBeLessThan(brief.indexOf("1. Information gaps"));
+  expect(brief.indexOf("Complete the read pass")).toBeLessThan(
+    brief.indexOf("1. Information gaps"),
+  );
 });

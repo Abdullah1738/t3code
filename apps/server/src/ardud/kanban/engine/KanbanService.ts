@@ -1502,6 +1502,9 @@ interface BoardPublication {
   readonly boardId: KanbanBoard["id"];
   readonly change: KanbanChange;
 }
+const reviewGateDrains = Context.Reference<Set<string> | undefined>("KanbanReviewGateDrains", {
+  defaultValue: () => undefined,
+});
 const analyticsSink = Context.Reference<Array<AnalyticsEvent> | undefined>("KanbanAnalyticsSink", {
   defaultValue: () => undefined,
 });
@@ -2297,6 +2300,8 @@ const make = Effect.gen(function* () {
     getProviders: locks.outside(providerIo.getProviders, undefined, true),
   };
   const serverConfig = yield* ServerConfig.ServerConfig;
+  // Installed builds supply their commit; unversioned dev servers check once per boot.
+  const reviewGateBuild = serverConfig.robobBuildCommit ?? NodeCrypto.randomUUID();
   const attachmentIo = makeBoardAttachments(serverConfig, yield* FileSystem.FileSystem);
   const attachments: typeof attachmentIo = {
     ...attachmentIo,
@@ -5618,6 +5623,8 @@ const make = Effect.gen(function* () {
             : ask,
         ),
       };
+    if (answeredBy._tag === "owner" && answered.length > 0)
+      next = yield* recheckReviewGate(next, yield* boardOf(next.boardId), true);
     // Saved before anyone is told: the card's new state never waits on a thread.
     if (next !== card) {
       analyticsActors.set(next, answeredBy);
@@ -7615,6 +7622,7 @@ const make = Effect.gen(function* () {
             event.body !== "clear",
         )
         .map((event) => event.body ?? "");
+      const latestMove = events.findLast((event) => event.kind === "moved");
       text = Briefs.reviewBrief(
         board,
         synced,
@@ -7622,6 +7630,7 @@ const make = Effect.gen(function* () {
         Rules.chainFor(board, synced),
         findings,
         threadId === null,
+        latestMove?.body === Retries.REVIEW_GATE_REQUEUED_EVENT ? latestMove.head : null,
       );
     }
     const reused = threadId;
@@ -8682,6 +8691,186 @@ const make = Effect.gen(function* () {
     yield* nudgeThread(threadId, nudge, Briefs.nudgeWorkText(nudge));
   });
 
+  // A board setting can wrap several recoveries; publish and drain after its outer commit.
+  const commitReviewGate = Effect.fn("KanbanService.commitReviewGate")(function* <A, E, R>(
+    effect: Effect.Effect<A, E, R>,
+  ) {
+    const outerPublications = yield* publicationSink;
+    const outerMeasurements = yield* analyticsSink;
+    const outerDrains = yield* reviewGateDrains;
+    const drains = outerDrains ?? new Set<string>();
+    const publications = outerPublications ?? [];
+    const measurements = outerMeasurements ?? [];
+    const observer = yield* SavedWrite.observer;
+    const receipts: SavedWrite.Saved[] = [];
+    const result = yield* Effect.uninterruptible(
+      tickTransaction(
+        effect.pipe(
+          Effect.provideService(SavedWrite.observer, (saved) => {
+            receipts.push(saved);
+          }),
+          Effect.provideService(reviewGateDrains, drains),
+          Effect.provideService(publicationSink, publications),
+          Effect.provideService(analyticsSink, measurements),
+        ),
+      ).pipe(
+        Effect.tap(() =>
+          Effect.sync(() => {
+            for (const receipt of receipts) observer(receipt);
+          }),
+        ),
+      ),
+    );
+    if (outerMeasurements === undefined)
+      for (const measurement of measurements) yield* recordAnalytics(measurement);
+    if (outerPublications === undefined)
+      for (const publication of publications)
+        yield* publish(publication.boardId, publication.change);
+    if (outerDrains === undefined)
+      for (const lane of drains) yield* forkPostCommit(afterOwnerCommit(lane));
+    return result;
+  });
+
+  const saveReviewGateState = Effect.fn("KanbanService.saveReviewGateState")(function* (
+    before: KanbanCard,
+    next: KanbanCard,
+    options: {
+      readonly flagReason?: string;
+      readonly notice?: string;
+      readonly head?: string | null;
+    },
+  ) {
+    const system: KanbanActor = { _tag: "system", component: "dispatcher" };
+    yield* prepareTransition(next);
+    // The receipt must never survive a failed card save, and a retained flag
+    // must retain its evaluator notification across a process exit too.
+    yield* commitReviewGate(
+      Effect.gen(function* () {
+        const checked = yield* logEvent(
+          next,
+          system,
+          options.flagReason === undefined ? "comment" : "flagged",
+          {
+            body: options.flagReason ?? Retries.reviewGateBuildEvent(reviewGateBuild),
+            ...(options.flagReason === undefined
+              ? {}
+              : { fromStage: before.stage, toStage: next.stage }),
+          },
+        );
+        if (options.flagReason === undefined && next !== before)
+          yield* logEvent(next, system, "moved", {
+            fromStage: before.stage,
+            toStage: next.stage,
+            body: Retries.REVIEW_GATE_REQUEUED_EVENT,
+            head: options.head ?? null,
+          });
+        if (options.notice !== undefined) {
+          yield* saveOwnerRoute(
+            next.boardId,
+            KanbanDiscussionId.make(cardLane(next)),
+            `review-gate:${next.id}:${checked.id}`,
+            {
+              kind: "effect",
+              seq: -1,
+              effect: { kind: "noteDiscussion", cardId: next.id, text: options.notice },
+            },
+          );
+          (yield* reviewGateDrains)?.add(cardLane(next));
+        }
+        yield* saveCard(next);
+      }),
+    );
+  });
+
+  const recheckReviewGate = Effect.fn("KanbanService.recheckReviewGate")(function* (
+    card: KanbanCard,
+    board: KanbanBoard,
+    changed = false,
+  ) {
+    if (changed && card.stage === "in_review" && card.activeRole === "review") {
+      const events = yield* store.cardEvents(card.id);
+      if (
+        Retries.gateRefusedVerdict(card, events) !== null ||
+        events.some(
+          (event) =>
+            event.actor._tag === "system" &&
+            event.body === Retries.reviewGateBuildEvent(reviewGateBuild),
+        )
+      )
+        yield* logEvent(card, { _tag: "system", component: "dispatcher" }, "comment", {
+          body: Retries.REVIEW_GATE_CHANGED_EVENT,
+        });
+      return card;
+    }
+    if (
+      card.stage !== "needs_review" ||
+      card.activeThreadId !== null ||
+      card.stalled?.by._tag !== "system" ||
+      !(
+        card.stalled.reason.startsWith(Retries.REFUSED_VERDICT_PREFIX) ||
+        card.stalled.reason === Retries.NO_VERDICT_REASON
+      )
+    )
+      return card;
+    const events = yield* store.cardEvents(card.id);
+    const refused = Retries.gateRefusedVerdict(card, events);
+    if (refused === null) return card;
+    const receipt = Retries.reviewGateBuildEvent(reviewGateBuild);
+    const lastCheck = events.findLast(
+      (event) => event.actor._tag === "system" && event.body === receipt,
+    );
+    if (
+      !changed &&
+      lastCheck !== undefined &&
+      !events.some(
+        (event) =>
+          event.id > lastCheck.id &&
+          event.actor._tag === "system" &&
+          event.body === Retries.REVIEW_GATE_CHANGED_EVENT,
+      )
+    )
+      return card;
+    const currentStep = kanbanOpenStep(card);
+    // Use the verdict's approval check, also retaining a real owner gate in the
+    // current plan step if an edit changed who owns that step.
+    const relevant = new Set([
+      ...Subtasks.reviewSubtasksToPass(card),
+      ...card.subtasks.filter(
+        (subtask) => subtask.step === currentStep && subtask.state === "open",
+      ),
+    ]);
+    const missing = [...relevant]
+      .map((subtask) =>
+        Subtasks.approvalProblem(card, subtask, board.standingApprovals, board.guessedGates),
+      )
+      .find((problem) => problem !== null);
+    if (missing || Asks.openBlockingAsk(card) !== undefined) {
+      yield* saveReviewGateState(card, card, {
+        notice: Briefs.workerFlaggedText(card, missing ?? "An owner question is still unanswered"),
+      });
+      return card;
+    }
+    const next: KanbanCard = {
+      ...release(card),
+      stage: "needs_review",
+      stalled: null,
+      nudgedAt: null,
+      // Recovery retains queue age, parked waits, and every retry record.
+      updatedAt: yield* nowIso,
+    };
+    yield* saveReviewGateState(card, next, { head: Retries.gateRefusalHead(refused) });
+    yield* kick;
+    return next;
+  });
+
+  const recheckBoardReviewGates = Effect.fn("KanbanService.recheckBoardReviewGates")(function* (
+    board: KanbanBoard,
+  ) {
+    for (const card of yield* store.openCards(board.id)) {
+      yield* recheckReviewGate(card, board, true);
+    }
+  });
+
   /** Refused verdicts flag immediately; a missing verdict gets a nudge and one restart first. */
   const reviewerStopped = Effect.fn("KanbanService.reviewerStopped")(function* (
     planned: KanbanCard,
@@ -8762,6 +8951,14 @@ const make = Effect.gen(function* () {
       // Preserve queue age and any parked wait during recovery.
       updatedAt: at,
     };
+    if (Retries.gateRefusedVerdict(next, yield* store.cardEvents(card.id)) !== null) {
+      yield* saveReviewGateState(card, next, {
+        flagReason: reason,
+        notice: Briefs.workerFlaggedText(next, reason),
+      });
+      yield* kick;
+      return;
+    }
     yield* logEvent(next, system, "flagged", {
       fromStage: card.stage,
       toStage: next.stage,
@@ -10287,6 +10484,19 @@ const make = Effect.gen(function* () {
                   });
                   yield* saveCard(next);
                   updateCard(next);
+                }),
+                initial.id,
+              );
+            }
+            for (const initial of yield* cardsForPlan) {
+              if (initial.stalled === null) continue;
+              yield* step(
+                "recheckReviewGate",
+                Effect.gen(function* () {
+                  const current = yield* store.card(initial.id);
+                  if (current === null) return;
+                  const next = yield* recheckReviewGate(current, board);
+                  if (next !== current) updateCard(next);
                 }),
                 initial.id,
               );
@@ -12128,7 +12338,10 @@ const make = Effect.gen(function* () {
       for (const publication of publications)
         yield* publish(publication.boardId, publication.change);
     } else {
-      yield* store.putBoardWithPools(next, pools, application);
+      const write = store.putBoardWithPools(next, pools, application);
+      yield* !NodeUtil.isDeepStrictEqual(board.guessedGates, next.guessedGates)
+        ? commitReviewGate(write.pipe(Effect.andThen(recheckBoardReviewGates(next))))
+        : write;
     }
     if (pools.length > 0) {
       yield* publish(board.id, { _tag: "pools", pools: yield* store.pools(board.id) });
@@ -12387,7 +12600,9 @@ const make = Effect.gen(function* () {
     action: string,
   ) {
     const next = { ...board, standingApprovals };
-    yield* store.putBoard(next);
+    yield* commitReviewGate(
+      store.putBoard(next).pipe(Effect.andThen(recheckBoardReviewGates(next))),
+    );
     yield* publish(board.id, { _tag: "board", board: next });
     yield* Effect.logInfo("kanban.standing-approval", {
       boardId: board.id,
@@ -13312,6 +13527,7 @@ const make = Effect.gen(function* () {
             body: patch.comment.trim(),
             ...(instructionApplication === undefined ? {} : { instructionApplication }),
           });
+        if (plan?.ok) next = yield* recheckReviewGate(next, board, true);
         const paused = yield* pauseIfBacklog(card, next, actor, at);
         // An open work thread now runs the new model's pool, so the card's slot moves with it.
         const saved =
