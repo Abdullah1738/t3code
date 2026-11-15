@@ -42,6 +42,7 @@ export type StartupPhase =
   | "server.opencode-import"
   | "server.kanban"
   | "server.readonly-replica"
+  | "server.backup-snapshot"
   | "server.project-settings-sweep"
   | "server.workspace"
   | "server.vcs"
