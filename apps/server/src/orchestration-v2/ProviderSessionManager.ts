@@ -899,9 +899,14 @@ export const layerWithOptions = (
           if (input.detachedThreadId !== undefined) threadIds.add(input.detachedThreadId);
           const released = [];
           for (const threadId of threadIds) {
-            const projection = yield* projectionStore.getThreadRecords(threadId, [
-              "providerThreads",
-            ]);
+            const projection = yield* projectionStore.getThreadRecords(
+              threadId,
+              ["providerThreads"],
+              {
+                providerSessionId,
+                pendingBackgroundTasksOnly: true,
+              },
+            );
             for (const providerThread of projection.providerThreads) {
               const tasks = providerThread.pendingBackgroundTasks ?? [];
               if (providerThread.providerSessionId !== providerSessionId || tasks.length === 0) {
@@ -941,9 +946,14 @@ export const layerWithOptions = (
           ({ threadId, providerSessionId, providerThreadId, taskIds }) =>
             Effect.gen(function* () {
               for (let attempt = 0; attempt < 3; attempt++) {
-                const projection = yield* projectionStore.getThreadRecords(threadId, [
-                  "providerThreads",
-                ]);
+                const projection = yield* projectionStore.getThreadRecords(
+                  threadId,
+                  ["providerThreads"],
+                  {
+                    providerSessionId,
+                    providerThreadIds: [providerThreadId],
+                  },
+                );
                 const providerThread = projection.providerThreads.find(
                   (candidate) => candidate.id === providerThreadId,
                 );
@@ -1837,7 +1847,7 @@ export const layerWithOptions = (
                 )
                   return "skipped" as const;
                 const records = yield* projectionStore
-                  .getThreadRecords(input.threadId, ["runs"])
+                  .getThreadRecords(input.threadId, ["runs"], { unfinishedRunsOnly: true })
                   .pipe(Effect.exit);
                 if (Exit.isFailure(records)) return "unknown" as const;
                 const now = yield* Clock.currentTimeMillis;
@@ -2007,36 +2017,36 @@ export const layerWithOptions = (
               providerThread: OrchestrationV2ProviderThread;
             }>
           >();
-          // Only attached Robob threads establish ownership. Native subagents or
-          // detached rows without an owner stay loaded rather than being guessed at.
-          for (const threadId of entry.attachedThreadIds) {
-            const records = yield* projectionStore
-              .getThreadRecords(threadId, ["providerThreads"])
-              .pipe(Effect.exit);
-            if (Exit.isFailure(records)) {
-              yield* Effect.logWarning("orchestration-v2.driver-session.orphan-sweep", {
-                providerSessionId,
-                ...counts,
-                skippedUnknown: loaded.size,
-                ownershipFailed: true,
-              });
-              return;
-            }
-            for (const providerThread of records.value.providerThreads) {
-              const ref = providerThread.nativeThreadRef;
-              if (
-                providerThread.appThreadId !== threadId ||
-                providerThread.providerInstanceId !== entry.runtime.instanceId ||
-                providerThread.providerSessionId !== providerSessionId ||
-                ref?.driver !== entry.runtime.driver ||
-                ref.nativeId === null ||
-                !loaded.has(ref.nativeId)
-              )
-                continue;
-              const candidates = owners.get(ref.nativeId) ?? [];
-              candidates.push({ threadId, providerThread });
-              owners.set(ref.nativeId, candidates);
-            }
+          // Native IDs are the bounded runtime roster. Resolve them once for the
+          // session, then accept only directly attached owners; never walk history.
+          const records = yield* projectionStore
+            .getProviderThreadsByNativeIds(providerSessionId, [...loaded])
+            .pipe(Effect.exit);
+          if (Exit.isFailure(records)) {
+            yield* Effect.logWarning("orchestration-v2.driver-session.orphan-sweep", {
+              providerSessionId,
+              ...counts,
+              skippedUnknown: loaded.size,
+              ownershipFailed: true,
+            });
+            return;
+          }
+          for (const providerThread of records.value) {
+            const threadId = providerThread.appThreadId;
+            const ref = providerThread.nativeThreadRef;
+            if (
+              threadId === null ||
+              !entry.attachedThreadIds.has(threadId) ||
+              providerThread.providerInstanceId !== entry.runtime.instanceId ||
+              providerThread.providerSessionId !== providerSessionId ||
+              ref?.driver !== entry.runtime.driver ||
+              ref.nativeId === null ||
+              !loaded.has(ref.nativeId)
+            )
+              continue;
+            const candidates = owners.get(ref.nativeId) ?? [];
+            candidates.push({ threadId, providerThread });
+            owners.set(ref.nativeId, candidates);
           }
           let attempts = 0;
           for (const nativeId of loaded) {
