@@ -40,10 +40,10 @@ OpenCode, funded from a dedicated wallet, sent through his Mullvad split tunnel.
 | Env | Default | Meaning |
 | --- | --- | --- |
 | `VENICE_X402_MAX_REQUEST_USD` | 0.50 | Worst-case cost per request. Input is over-estimated as body bytes/3. `max_completion_tokens` is clamped to fit, and oversized requests get a 429 |
-| `VENICE_X402_MAX_DAILY_USD` | 10 | Booked cost plus in-flight worst cases per Asia/Dubai day |
+| `VENICE_X402_MAX_DAILY_USD` | 1000 | Booked cost plus in-flight worst cases per Asia/Dubai day |
 | `VENICE_X402_TOPUP_USD` | 5 | Auto top-up size (Venice minimum is $5) |
 | `VENICE_X402_MAX_TOPUP_USD` | 5 | Per top-up payment |
-| `VENICE_X402_MAX_TOPUP_DAILY_USD` | 10 | USDC moved into Venice credit per day. A signed top-up counts from the moment it is signed; it is released only on a definite failure (400 / `SETTLEMENT_FAILED`) |
+| `VENICE_X402_MAX_TOPUP_DAILY_USD` | 1000 | USDC moved into Venice credit per day. A signed top-up counts from the moment it is signed; it is released only on a definite failure (400 / `SETTLEMENT_FAILED`) |
 | `VENICE_X402_AUTO_TOPUP` | 1 | 0 = never top up by itself (402s go back to the client) |
 | `VENICE_X402_PAYTO_ALLOW` | Venice's documented Base receiver | Top-ups to any other `payTo` are refused |
 

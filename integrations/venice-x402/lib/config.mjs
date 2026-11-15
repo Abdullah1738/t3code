@@ -44,12 +44,12 @@ export function loadConfig(env = process.env) {
     timeZone: env.VENICE_X402_TZ || 'Asia/Dubai',
     // Spend caps (USD).
     maxRequestUsd: num(env.VENICE_X402_MAX_REQUEST_USD, 0.5),
-    maxDailyUsd: num(env.VENICE_X402_MAX_DAILY_USD, 10),
+    maxDailyUsd: num(env.VENICE_X402_MAX_DAILY_USD, 1000),
     // Top-ups move USDC from the wallet into Venice credit. Venice minimum is $5.
     autoTopUp: (env.VENICE_X402_AUTO_TOPUP ?? '1') !== '0',
     topUpUsd: num(env.VENICE_X402_TOPUP_USD, 5),
     maxTopUpPerPaymentUsd: num(env.VENICE_X402_MAX_TOPUP_USD, 5),
-    maxTopUpDailyUsd: num(env.VENICE_X402_MAX_TOPUP_DAILY_USD, 10),
+    maxTopUpDailyUsd: num(env.VENICE_X402_MAX_TOPUP_DAILY_USD, 1000),
     // Venice's documented Base receiver. Top-ups to any other payTo are refused.
     payToAllow: (env.VENICE_X402_PAYTO_ALLOW || '0x2670B922ef37C7Df47158725C0CC407b5382293F')
       .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean),

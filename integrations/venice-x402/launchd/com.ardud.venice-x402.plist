@@ -23,13 +23,13 @@
     <key>VENICE_X402_MAX_REQUEST_USD</key>
     <string>0.50</string>
     <key>VENICE_X402_MAX_DAILY_USD</key>
-    <string>10</string>
+    <string>1000</string>
     <key>VENICE_X402_TOPUP_USD</key>
     <string>5</string>
     <key>VENICE_X402_MAX_TOPUP_USD</key>
     <string>5</string>
     <key>VENICE_X402_MAX_TOPUP_DAILY_USD</key>
-    <string>10</string>
+    <string>1000</string>
     <key>VENICE_X402_AUTO_TOPUP</key>
     <string>1</string>
     <key>VENICE_X402_EGRESS_CHECK</key>
