@@ -18,6 +18,7 @@ import sys
 import subprocess
 import tempfile
 import time
+from types import SimpleNamespace
 from toollog import emit, directory, private_dir, finite_number, SKIP_REASONS, BACKUP_PROGRAMS, BACKUP_ARGS, BACKUP_STAGES
 
 
@@ -287,6 +288,7 @@ def inventory_expire_parts(value, now):
     value['partsDone'] = sum(not inventory_needs_measurement(v, now, INVENTORY_PARTS_FRESH_S)
                              for v in parts.values())
     if (inventory_needs_measurement(value, now)
+            or value.get('partsTotal', len(parts)) != len(parts)
             or any(inventory_needs_measurement(v, now, INVENTORY_PARTS_FRESH_S) for v in parts.values())):
         value['partial'] = True
         value.pop('bytes', None)
@@ -315,7 +317,12 @@ def inventory_clean_cache(cache, now):
                 'timeouts', 'lastTimeoutAt', 'parts', 'partsDone', 'partsTotal', 'elapsedMs',
                 'probeTimeouts', 'lastProbeS', 'lastTimeoutS') if k in value}
         if isinstance(cache[key].get('parts'), dict):
-            inventory_clean_cache(cache[key]['parts'], now)
+            parts = cache[key]['parts']
+            expected_parts = set(parts)
+            inventory_clean_cache(parts, now)
+            # Losing an invalid part cannot establish a complete, empty parent.
+            if expected_parts-set(parts):
+                cache[key]['partial'] = True
             inventory_expire_parts(cache[key], now)
 
 
@@ -409,14 +416,31 @@ class InventoryLog:
 
 
 def inventory_skipped_logs(roots, previous, reason):
+    now = time.time()
+    child_state, migrated = inventory_child_state(previous, roots)
+    old_sizes = previous.get('sizes', {})
+    old_partials = previous.get('partials', {})
+    sizes, flags = {}, {str(root): dict(partial=True) for root in roots}
     for root in roots:
         try:
-            cache = previous.get('childState', {}).get(str(root), {})
-            inventory_clean_cache(cache, time.time())
-            total, status, _ = inventory_status(cache, [], False, time.time(), root=root)
+            key = str(root)
+            cache = child_state[key]
+            # Cleanup can discard bad measurements after a clock rollback;
+            # their child keys must still count as expected, unmeasured work.
+            entries = [SimpleNamespace(path=path) for path in cache]
+            inventory_clean_cache(cache, now)
+            # A saved complete listing can be reused while locked, but its
+            # children must still be fresh now. Never scan or persist here.
+            listed = (not migrated and key in old_sizes and key not in old_partials
+                      and (bool(cache) or old_sizes[key] == 0))
+            total, status, children = inventory_status(cache, entries, listed, now, root=root)
+            flags[key] = status
+            if children or not status['partial']:
+                sizes[key] = total
             InventoryLog(root, cache).root_event(cache, total, status, reason)
         except Exception:
             pass
+    return sizes, flags
 
 
 def big_root_inventory(path, run, deadline, cache=None, listing=None, pending_only=False, refresh_only=False,
@@ -799,13 +823,12 @@ def directory_inventory(paths=None, run=subprocess.run, deadline=None):
             return _directory_inventory(paths, locked_run, deadline)
         previous = read_state('disk-inventory')
         roots = list(DIRECTORY_ROOTS if paths is None else paths)
-        sizes, partials = previous.get('sizes', {}), previous.get('partials', {})
-        inventory_skipped_logs(roots, previous, 'deep_pass_running')
+        sizes, flags = inventory_skipped_logs(roots, previous, 'deep_pass_running')
         emit('disk', 'perf', 'disk.inventory', duration_ms=(time.monotonic()-started)*1000,
              props=dict(duMode=previous.get('duMode'), skipReason='deep_pass_running',
                         count=len(sizes), bytes=sum(sizes.values()),
-                        rootsComplete=sum(str(p) in sizes and str(p) not in partials for p in roots),
-                        rootsPartial=sum(str(p) not in sizes or str(p) in partials for p in roots)))
+                        rootsComplete=sum(not flags[str(p)]['partial'] for p in roots),
+                        rootsPartial=sum(flags[str(p)]['partial'] for p in roots)))
 
 
 def _directory_inventory(paths=None, run=subprocess.run, deadline=None):

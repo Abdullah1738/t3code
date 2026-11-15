@@ -126,6 +126,141 @@ class ProbeTests(unittest.TestCase):
         errors = [r for r in self.rows('disk.inventory.source') if r['props'].get('failure') == 'timeout']
         self.assertEqual(errors[0]['props']['allowanceS'], 15)
 
+    def test_locked_hourly_summary_recomputes_freshness_boundaries(self):
+        # Every cache shape goes through the public collector with a real flock.
+        for shape, root, window in (
+                ('ordinary', Path('/Volumes/ExternalSSD/wt'), 172800),
+                ('ordinary', self.root/'hourly', 86400),
+                ('parts', Path('/Volumes/ExternalSSD/wt'), 259200),
+                ('old-part', Path('/Volumes/ExternalSSD/wt'), 259200),
+                ('old-parent', Path('/Volumes/ExternalSSD/wt'), 259200)):
+            for delta in (-1, 0, 1):
+                with self.subTest(shape=shape, root=root, delta=delta):
+                    at = self.now-window-delta
+                    value = dict(bytes=1024, at=at, partial=False)
+                    if shape != 'ordinary':
+                        value.update(isDirectory=True, partsDone=1, partsTotal=1,
+                            parts={str(root/'child'/'part'): dict(bytes=1024,
+                                at=self.now if shape == 'old-parent' else at, partial=False)})
+                        if shape == 'old-part':
+                            value['at'] = self.now
+                    state = dict(duMode='links', sizes={str(root): 1024}, partials={},
+                                 childState={str(root): {str(root/'child'): value}})
+                    jobs.save_state('disk-inventory', state)
+                    before = jobs.read_state('disk-inventory')
+                    with jobs.inventory_lock(), \
+                         patch.object(jobs, 'save_state', side_effect=AssertionError('locked write')), \
+                         patch.object(jobs, 'inventory_listing', side_effect=AssertionError('locked listing')):
+                        jobs.directory_inventory([root], lambda *a, **k: self.fail('locked du'))
+                    self.assertEqual(jobs.read_state('disk-inventory'), before)
+                    summary = self.rows('disk.inventory')[-1]['props']
+                    event = self.rows('disk.inventory.root')[-1]['props']
+                    self.assertEqual(summary['skipReason'], 'deep_pass_running')
+                    self.assertEqual(summary['rootsComplete'], int(delta < 0))
+                    self.assertEqual(summary['rootsPartial'], int(delta >= 0))
+                    self.assertEqual(event['partial'], delta >= 0)
+                    self.assertEqual(summary['bytes'], 0 if shape != 'ordinary' and delta >= 0 else 1024)
+
+    def test_locked_hourly_summary_requires_a_known_complete_cache(self):
+        root = Path('/Volumes/ExternalSSD/wt')
+        key = str(root)
+        good = {str(root/'child'): dict(bytes=1024, at=self.now, partial=False)}
+        for label, size, cache, partials, mode, complete, total in (
+                ('missing-cache', 1024, {}, {}, 'links', False, 0),
+                ('empty-root', 0, {}, {}, 'links', True, 0),
+                ('saved-partial', 1024, good, {key: dict(partial=True)}, 'links', False, 1024),
+                ('legacy-mode', 1024, good, {}, None, False, 0)):
+            with self.subTest(label=label):
+                state = dict(duMode=mode, sizes={key: size}, partials=partials, childState={key: cache})
+                with jobs.inventory_lock(), patch.object(jobs, 'read_state', return_value=copy.deepcopy(state)), \
+                     patch.object(jobs, 'save_state', side_effect=AssertionError('locked write')):
+                    jobs.directory_inventory([root], lambda *a, **k: self.fail('locked du'))
+                summary = self.rows('disk.inventory')[-1]['props']
+                event = self.rows('disk.inventory.root')[-1]['props']
+                self.assertEqual(summary['rootsComplete'], int(complete))
+                self.assertEqual(summary['rootsPartial'], int(not complete))
+                self.assertEqual(summary['bytes'], total)
+                self.assertEqual(event['partial'], not complete)
+
+    def test_locked_hourly_summary_keeps_invalid_children_unmeasured(self):
+        root = Path('/Volumes/ExternalSSD/wt')
+        key, child = str(root), str(root/'child')
+        forms = [dict(bytes=1024, at=self.now+1, partial=False),
+                 dict(bytes=1024, partial=False),
+                 dict(bytes=1024, at='invalid', partial=False),
+                 dict(at=self.now, partial=False),
+                 dict(bytes='invalid', at=self.now, partial=False),
+                 dict(bytes=-1, at=self.now, partial=False),
+                 dict(bytes=float('nan'), at=self.now, partial=False), None]
+        for value in forms:
+            with self.subTest(value=value):
+                state = dict(duMode='links', sizes={key: 1024}, partials={},
+                             childState={key: {child: value}})
+                with jobs.inventory_lock(), patch.object(jobs, 'read_state', return_value=copy.deepcopy(state)), \
+                     patch.object(jobs, 'save_state', side_effect=AssertionError('locked write')):
+                    jobs.directory_inventory([root], lambda *a, **k: self.fail('locked du'))
+                summary = self.rows('disk.inventory')[-1]['props']
+                event = self.rows('disk.inventory.root')[-1]['props']
+                self.assertEqual(summary['rootsComplete'], 0)
+                self.assertEqual(summary['rootsPartial'], 1)
+                self.assertEqual(summary['bytes'], 0)
+                self.assertTrue(event['partial'])
+                self.assertEqual(event['unmeasuredCount'], 1)
+
+    def test_locked_hourly_summary_keeps_invalid_parts_unmeasured_recursively(self):
+        root = Path('/Volumes/ExternalSSD/wt')
+        key, child = str(root), str(root/'child')
+        forms = [dict(bytes=1024, at=self.now+1, partial=False),
+                 dict(bytes=1024, partial=False),
+                 dict(bytes=1024, at='invalid', partial=False),
+                 dict(at=self.now, partial=False),
+                 dict(bytes='invalid', at=self.now, partial=False),
+                 dict(bytes=-1, at=self.now, partial=False),
+                 dict(bytes=float('nan'), at=self.now, partial=False), None]
+        for depth in (1, 2):
+            for bad in forms:
+                with self.subTest(depth=depth, bad=bad):
+                    value = bad
+                    for level in range(depth):
+                        value = dict(bytes=1024, at=self.now, partial=False, isDirectory=True,
+                                     partsTotal=1, partsDone=1, parts={child+'/part%d'%level: value})
+                    state = dict(duMode='links', sizes={key: 1024}, partials={},
+                                 childState={key: {child: value}})
+                    with jobs.inventory_lock(), patch.object(jobs, 'read_state', return_value=copy.deepcopy(state)), \
+                         patch.object(jobs, 'save_state', side_effect=AssertionError('locked write')):
+                        jobs.directory_inventory([root], lambda *a, **k: self.fail('locked du'))
+                    summary = self.rows('disk.inventory')[-1]['props']
+                    event = self.rows('disk.inventory.root')[-1]['props']
+                    self.assertEqual(summary['rootsComplete'], 0)
+                    self.assertEqual(summary['rootsPartial'], 1)
+                    self.assertEqual(summary['bytes'], 0)
+                    self.assertTrue(event['partial'])
+                    self.assertEqual(event['unmeasuredCount'], 1)
+
+    def test_locked_hourly_summary_checks_saved_part_membership(self):
+        root = Path('/Volumes/ExternalSSD/wt')
+        key, child = str(root), str(root/'child')
+        good = dict(bytes=1024, at=self.now, partial=False)
+        for total, members, complete in ((1, 0, False), (2, 1, False), (0, 1, False),
+                                          ('invalid', 1, False), (1, 1, True), (0, 0, True),
+                                          (None, 1, True)):
+            with self.subTest(total=total, members=members):
+                parent = dict(good, isDirectory=True, partsDone=members,
+                              parts={child+'/part': dict(good)} if members else {})
+                if total is not None:
+                    parent['partsTotal'] = total
+                state = dict(duMode='links', sizes={key: 1024}, partials={},
+                             childState={key: {child: parent}})
+                with jobs.inventory_lock(), patch.object(jobs, 'read_state', return_value=copy.deepcopy(state)), \
+                     patch.object(jobs, 'save_state', side_effect=AssertionError('locked write')):
+                    jobs.directory_inventory([root], lambda *a, **k: self.fail('locked du'))
+                summary = self.rows('disk.inventory')[-1]['props']
+                event = self.rows('disk.inventory.root')[-1]['props']
+                self.assertEqual(summary['rootsComplete'], int(complete))
+                self.assertEqual(summary['rootsPartial'], int(not complete))
+                self.assertEqual(summary['bytes'], 1024 if complete else 0)
+                self.assertEqual(event['partial'], not complete)
+
     def test_night_one_shape_four_daily_passes_with_hourly_freshness_checks(self):
         counts = [('wt', 66), ('t3code-wt', 281), ('board-wt', 932),
                   ('coord-wt', 129), ('crpko-devops/tmp', 3091)]
@@ -156,18 +291,31 @@ class ProbeTests(unittest.TestCase):
             if name == 'disk.deep.root' and not kwargs['props']['partial']:
                 completed_roots.add(kwargs['props']['source'])
         def observe(at, state):
-            partial_roots = []
+            events = {}
+            def hourly_log(component, kind, name, **kwargs):
+                if name == 'disk.inventory.root':
+                    events[kwargs['props']['source']] = kwargs['props']
+                elif name == 'disk.inventory':
+                    events['summary'] = kwargs['props']
+            with patch.object(jobs.time, 'time', return_value=at), \
+                 patch.object(jobs, 'read_state', side_effect=lambda n: copy.deepcopy(state)), \
+                 patch.object(jobs, 'save_state', side_effect=AssertionError('locked hourly write')), \
+                 patch.object(jobs, 'inventory_listing', side_effect=AssertionError('locked hourly listing')), \
+                 patch.object(jobs, 'emit', side_effect=hourly_log), jobs.inventory_lock():
+                jobs.directory_inventory(roots, lambda *a, **k: self.fail('locked hourly du'))
+            self.assertEqual(events['summary']['skipReason'], 'deep_pass_running')
+            self.assertEqual(set(events)-{'summary'}, set(map(str, roots)))
+            partial_roots = [str(root) for root in roots if events[str(root)]['partial']]
+            self.assertEqual(events['summary']['rootsComplete'], len(roots)-len(partial_roots))
+            self.assertEqual(events['summary']['rootsPartial'], len(partial_roots))
             for root in roots:
                 cache = copy.deepcopy(state['childState'][str(root)])
-                entries, listed = listing(root, None)
-                total, status, children = jobs.inventory_status(cache, entries, listed, at, root=root)
-                if status['partial']:
-                    partial_roots.append(str(root))
+                if str(root) in partial_roots:
                     if root not in {p.parent for p in giants}:
                         coverage_failures.append(dict(root=str(root), at=at))
                 for child in giants:
                     if child.parent == root and jobs.inventory_needs_measurement(cache.get(str(child)), at, root=root):
-                        self.assertTrue(status['partial'])
+                        self.assertIn(str(root), partial_roots)
             hourly.append(dict(at=at, partialRoots=partial_roots))
         with patch.object(jobs, 'inventory_listing', side_effect=listing), \
              patch.object(jobs.os, 'lstat', return_value=SimpleNamespace(st_mode=stat.S_IFDIR, st_blocks=0)), \
