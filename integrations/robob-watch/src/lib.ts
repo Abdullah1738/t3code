@@ -170,6 +170,8 @@ export type State = {
   wakes?: TrackedWake[];
   /** Trigger-file signature seen at the start of the last run. */
   trigger_sig?: string;
+  /** Persisted repeat window for one failing trigger; never stores the path. */
+  trigger_error?: { triggerPathHash: string; triggerKind: "file" | "wal"; errnoCode: string; missingSince: string; loggedAt: number; count: number };
 };
 export type TrackedWake = { inbound: string; key: string; event: string; delivered_at: number; attempts?: number };
 export type WakeConfirmation = {
@@ -458,15 +460,31 @@ function validRelays(value: unknown): value is Relay[] {
 
 export const watcherDir = (id: string) => join(WATCHERS, id);
 
+export class TriggerError extends Error {
+  readonly triggerPathHash: string;
+  readonly triggerKind: "file" | "wal";
+  readonly errnoCode: string;
+  constructor(path: string, error: unknown) {
+    const code = (error as NodeJS.ErrnoException).code;
+    const errnoCode = typeof code === "string" && /^[A-Z][A-Z0-9_]{0,39}$/.test(code) ? code : "UNKNOWN";
+    const triggerPathHash = hash(path).slice(0, 16);
+    super(`trigger ${triggerPathHash}: ${errnoCode}`);
+    this.triggerPathHash = triggerPathHash;
+    this.triggerKind = path.endsWith("-wal") ? "wal" : "file";
+    this.errnoCode = errnoCode;
+  }
+}
+
 /** Cheap change signature of a watcher's trigger files (a stat per file). */
 export function triggerSig(watcher: Watcher): string | undefined {
   if (!watcher.triggers?.length) return undefined;
   return watcher.triggers.map(path => {
-    try { const st = statSync(path); return `${st.mtimeMs}:${st.size}`; } catch (error) {
-      toolError("runner", "watch.trigger_stat_failed", { watcher: watcher.id }, {
-        errnoCode: (error as NodeJS.ErrnoException).code ?? "UNKNOWN", triggerKind: path.endsWith("-wal") ? "wal" : "file",
-      });
-      return "missing";
+    try { const st = statSync(path); return `${st.mtimeMs}:${st.size}`; }
+    catch (error) {
+      // SQLite removes a checkpointed WAL while the paired database remains a healthy trigger.
+      if ((error as NodeJS.ErrnoException).code === "ENOENT" && path.endsWith("-wal")
+        && watcher.triggers!.includes(path.slice(0, -4)) && existsSync(path.slice(0, -4))) return "missing";
+      throw new TriggerError(path, error);
     }
   }).join("|");
 }
