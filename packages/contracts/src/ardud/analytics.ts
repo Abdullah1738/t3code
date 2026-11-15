@@ -190,6 +190,17 @@ const GeneralEvent = Schema.Struct({
   waitLookupMs: Schema.optionalKey(Measurement),
   writerWaitMs: Schema.optionalKey(Measurement),
   readerWaitMs: Schema.optionalKey(Measurement),
+  cardNextStages: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        stage: Schema.Literals(["caller", "occupancy", "cards", "ranking", "rules"]),
+        durationMs: Measurement,
+        readerWaitMs: Measurement,
+        queryMs: Measurement,
+        completed: Schema.Boolean,
+      }),
+    ).check(Schema.isMaxLength(5)),
+  ),
   queryMs: Schema.optionalKey(Measurement),
   renderMs: Schema.optionalKey(Measurement),
   inFlightAtStart: Schema.optionalKey(

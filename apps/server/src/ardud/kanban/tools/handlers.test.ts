@@ -149,6 +149,7 @@ const fakeThreads = (
   const storeControl: {
     afterBoardWrite?: () => Effect.Effect<void>;
     beforeThreadLink?: () => Effect.Effect<void>;
+    beforeClaimContext?: () => Effect.Effect<void>;
     beforeCardWrite?: () => Effect.Effect<void, KanbanStore.KanbanStoreError>;
     beforeCardEvent?: (
       event: KanbanStore.NewCardEvent,
@@ -212,10 +213,14 @@ const fakeThreads = (
     KanbanThreads.of({
       pendingUserInputs: () => Effect.succeed([]),
       claimContext: (threadId) =>
-        Effect.sync(() => ({
-          projectId: ProjectId.make("project-1"),
-          model: models.get(threadId)!,
-        })),
+        Effect.suspend(() => storeControl.beforeClaimContext?.() ?? Effect.void).pipe(
+          Effect.andThen(
+            Effect.sync(() => ({
+              projectId: ProjectId.make("project-1"),
+              model: models.get(threadId)!,
+            })),
+          ),
+        ),
       view,
       find: delivery?.findExisting ? view : () => Effect.succeed(null),
       lastFailure: () => Effect.succeed(null),
@@ -7956,6 +7961,13 @@ it.effect.each(["normal", "released"] as const)(
   (state) =>
     Effect.gen(function* () {
       const { layer, running, viewControl } = fakeThreads();
+      const ledger = yield* Deferred.make<AnalyticsEvent>();
+      const sink = Layer.mock(Analytics.Analytics)({
+        record: (event) =>
+          event.kind === "mcp.call" && event.tool === "card_next"
+            ? Deferred.succeed(ledger, event).pipe(Effect.asVoid)
+            : Effect.void,
+      });
       yield* Effect.gen(function* () {
         const kanban = yield* KanbanService.KanbanService;
         const store = yield* KanbanStore.KanbanStore;
@@ -7995,31 +8007,79 @@ it.effect.each(["normal", "released"] as const)(
         assert.deepEqual(next.structured.carrying, []);
         assert.isArray(next.structured.candidates);
         assert.equal(typeof next.structured.holdsSlot, "boolean");
-      }).pipe(Effect.provide(layer));
+        const row = yield* Deferred.await(ledger);
+        assert.isTrue(row.callerResolved);
+        assert.equal(row.readerLane, "writer");
+        assert.deepEqual(
+          row.cardNextStages!.slice(0, 2).map((part) => part.stage),
+          ["caller", "occupancy"],
+        );
+        assert.isTrue(row.cardNextStages!.every((part) => part.completed));
+        assert.notInclude(JSON.stringify(row), "Finish");
+      }).pipe(Effect.provide(layer.pipe(Layer.provide(sink))));
     }),
 );
 
-it.effect("card_next refuses a stalled caller lookup within its deadline", () =>
-  Effect.gen(function* () {
-    const { layer, storeControl } = fakeThreads();
-    const entered = yield* Deferred.make<void>();
-    yield* Effect.gen(function* () {
-      storeControl.beforeThreadLink = () =>
-        Effect.gen(function* () {
-          assert.equal(yield* NodeSqliteClient.ReaderLane, "foreground");
-          yield* Deferred.succeed(entered, undefined);
-          return yield* Effect.never;
-        });
-      const request = yield* call(ThreadId.make("blocked-caller"), "card_next", {}).pipe(
-        Effect.forkChild,
-      );
-      yield* Deferred.await(entered);
-      yield* TestClock.adjust("2 seconds");
-      const result = yield* Fiber.join(request);
-      assert.isTrue(result.isError);
-      assert.include(result.text, "card_next is busy");
-    }).pipe(Effect.provide(layer));
-  }),
+it.effect.each(["foreground", "identity"] as const)(
+  "card_next records a stalled %s caller as a retryable timeout with partial timings",
+  (lane) =>
+    Effect.gen(function* () {
+      const { layer, storeControl } = fakeThreads();
+      const entered = yield* Deferred.make<void>();
+      const ledger = yield* Deferred.make<AnalyticsEvent>();
+      const sink = Layer.mock(Analytics.Analytics)({
+        record: (event) =>
+          event.kind === "mcp.call" && event.tool === "card_next"
+            ? Deferred.succeed(ledger, event).pipe(Effect.asVoid)
+            : Effect.void,
+      });
+      yield* Effect.gen(function* () {
+        let thread = ThreadId.make("blocked-caller");
+        if (lane === "identity") {
+          const kanban = yield* KanbanService.KanbanService;
+          const board = yield* kanban.ensureBoard({
+            slug: "identity-next",
+            name: "Identity next",
+            defaultProjectId: ProjectId.make("project-1"),
+          });
+          yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+          const card = yield* kanban.createCard(
+            board.id,
+            { title: "Lookup", prompt: "private-lookup" },
+            owner,
+          );
+          yield* kanban.dispatchNow;
+          thread = (yield* kanban.card(card.id)).card.workThreadId!;
+        }
+        const block = () =>
+          Effect.gen(function* () {
+            assert.equal(yield* NodeSqliteClient.ReaderLane, lane);
+            const start = yield* NodeSqliteClient.ReaderWaitStartedObserver;
+            start?.(lane);
+            yield* Deferred.succeed(entered, undefined);
+            return yield* Effect.never;
+          });
+        if (lane === "identity") storeControl.beforeClaimContext = block;
+        else storeControl.beforeThreadLink = block;
+        const request = yield* call(thread, "card_next", {}).pipe(Effect.forkChild);
+        yield* Deferred.await(entered);
+        yield* TestClock.adjust("2 seconds");
+        const result = yield* Fiber.join(request);
+        assert.isTrue(result.isError);
+        assert.include(result.text, "card_next is busy");
+        assert.equal(result.structured.code, "lookup_timeout");
+        const row = yield* Deferred.await(ledger);
+        assert.equal(row.outcome, "timeout");
+        assert.equal(row.errorTag, "lookup_timeout");
+        assert.equal(row.errorPhase, "caller");
+        assert.equal(row.readerLane, lane);
+        assert.isFalse(row.callerResolved);
+        assert.isAtLeast(row.callerResolveMs!, 2000);
+        assert.isAtLeast(row.cardNextStages![0]!.durationMs, 2000);
+        assert.isAtLeast(row.cardNextStages![0]!.readerWaitMs, 2000);
+        assert.isFalse(row.cardNextStages![0]!.completed);
+      }).pipe(Effect.provide(layer.pipe(Layer.provide(sink))));
+    }),
 );
 
 const releaseFixture = Effect.gen(function* () {
