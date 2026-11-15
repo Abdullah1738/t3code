@@ -2,6 +2,7 @@ import * as ThreadReadMetrics from "../ardud/analytics/ThreadReadMetrics.ts";
 import * as OwnerAnalytics from "../ardud/analytics/Analytics.ts";
 import * as McpCallLedger from "../ardud/analytics/McpCallLedger.ts";
 import * as McpResponseDelivery from "../ardud/http/McpResponseDelivery.ts";
+import * as ThreadReadDeadline from "./ThreadReadDeadline.ts";
 import * as StartupPhaseLog from "../ardud/observability/StartupPhaseLog.ts";
 import { bootId } from "../ardud/fast-install/report.ts";
 import * as McpCallAnalytics from "../ardud/analytics/McpCall.ts";
@@ -1108,6 +1109,7 @@ const withToolAnalytics =
                         "mcp.pre_handler_ms": callState.requestTiming.preHandlerMs,
                       });
                     let handlerEnded: bigint | undefined;
+                    let threadReadAtExit: ReturnType<typeof ThreadReadMetrics.snapshot> | undefined;
                     const parentSaved = yield* SavedWrite.observer;
                     const parentCommitting = yield* SavedWrite.commitObserver;
                     const identifiers = McpCallAnalytics.callIdentifiers(
@@ -1177,7 +1179,8 @@ const withToolAnalytics =
                         ...(callState.threadRead === undefined
                           ? {}
                           : {
-                              ...ThreadReadMetrics.snapshot(callState.threadRead, ended),
+                              ...(threadReadAtExit ??
+                                ThreadReadMetrics.snapshot(callState.threadRead, ended)),
                               inFlightAtStart: activity.inFlightAtStart,
                             }),
                         ...callState.requestTiming,
@@ -1331,7 +1334,9 @@ const withToolAnalytics =
                               }),
                             }),
                           )
-                        : completed;
+                        : options.tool.name === "t3_thread_read"
+                          ? ThreadReadDeadline.bound(completed)
+                          : completed;
                     const measuredRead = largeRead
                       ? boundedRead.pipe(
                           Effect.onExit((exit) =>
@@ -1392,6 +1397,12 @@ const withToolAnalytics =
                         return Effect.gen(function* () {
                           const endedAt = yield* Clock.currentTimeMillis;
                           handlerEnded = yield* Clock.monotonicTimeNanos;
+                          // Detached cancellation cleanup can finish before response delivery.
+                          if (callState.threadRead !== undefined)
+                            threadReadAtExit = ThreadReadMetrics.snapshot(
+                              callState.threadRead,
+                              handlerEnded,
+                            );
                           const resolved = {
                             ...(identifiers.boardId ? { boardId: identifiers.boardId } : {}),
                             ...(callState.boardId ? { boardId: callState.boardId } : {}),
