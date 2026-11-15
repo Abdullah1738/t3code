@@ -361,6 +361,7 @@ function makeLocalCommandHarness(input: {
   readonly writeFailure?: unknown;
   readonly failReadsAfterRunning?: boolean;
   readonly nativeDelivery?: boolean;
+  readonly allowRecoveryHandoff?: boolean;
   readonly providerDriver?: string;
   readonly beforeHandoffWrite?: Effect.Effect<void>;
 }) {
@@ -576,8 +577,8 @@ function makeLocalCommandHarness(input: {
     ),
   );
   const resumeFallbackEnsure = vi.fn(() => Effect.succeed(providerThread));
-  const resumeThread = vi.fn(
-    ({ providerThread: existing }: { providerThread: typeof providerThread }) =>
+  const resumeThread = vi.fn<ProviderAdapter.ProviderAdapterV2SessionRuntime["resumeThread"]>(
+    ({ providerThread: existing }) =>
       (input.beforeSetup?.("resume") ?? Effect.void).pipe(
         Effect.andThen(
           Effect.suspend(() =>
@@ -797,7 +798,24 @@ function makeLocalCommandHarness(input: {
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({
-          prepareProviderHandoff: () => Effect.die("history read must fail first"),
+          prepareProviderHandoff: (request) =>
+            input.allowRecoveryHandoff
+              ? Effect.succeed({
+                  id: ContextHandoffId.make("resume-recovery-handoff"),
+                  threadId: request.threadId,
+                  targetRunId: request.targetRunId,
+                  fromProviderThreadIds: request.fromProviderThreadIds,
+                  toProviderThreadId: request.toProviderThreadId,
+                  coveredRunOrdinals: request.coveredRunOrdinals,
+                  strategy: request.strategy,
+                  status: "ready" as const,
+                  summaryMessageId: null,
+                  summaryText: "Recovered thread history",
+                  createdByProviderInstanceId: null,
+                  createdAt: now,
+                  updatedAt: now,
+                })
+              : Effect.die("history read must fail first"),
         }),
         Layer.mock(EventSink.EventSinkV2)({
           writeIfRunCurrent,
@@ -929,6 +947,409 @@ const startPreparedTurn = (controls: RunExecutionService.RunExecutionServiceV2St
     modelSelection: controls.modelSelection,
     runtimePolicy: controls.runtimePolicy,
   });
+
+const noRolloutFailure = (thread: OrchestrationV2ThreadProjection["providerThreads"][number]) =>
+  new ProviderAdapter.ProviderAdapterResumeThreadError({
+    driver: thread.driver,
+    providerSessionId: thread.providerSessionId!,
+    providerThreadId: thread.id,
+    cause: {
+      _tag: "CodexAppServerRequestError",
+      code: -32600,
+      method: "thread/resume",
+      errorMessage: `no rollout found for thread id ${thread.nativeThreadRef?.nativeId}`,
+    },
+  });
+
+effectIt.effect.each(["early", "late", "late with history"] as const)(
+  "recovers an ordinal-1 no-rollout resume at %s and persists its new native identity",
+  (phase) =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({
+        text: "Review the patch",
+        nativeDelivery: true,
+        allowRecoveryHandoff: true,
+      });
+      const initial = harness.projection();
+      harness.setProjection({
+        ...initial,
+        runs: initial.runs.map((run) => ({ ...run, ordinal: 1 })),
+        providerThreads: initial.providerThreads.map((thread) => ({
+          ...thread,
+          firstRunOrdinal: 1,
+          lastRunOrdinal: 1,
+          ...(phase === "early"
+            ? {
+                nativeThreadRef: {
+                  driver: thread.driver,
+                  nativeId: "native-unsaved",
+                  strength: "strong" as const,
+                },
+              }
+            : {}),
+        })),
+        contextHandoffs:
+          phase === "late with history"
+            ? [
+                {
+                  id: ContextHandoffId.make("no-rollout-seed"),
+                  threadId: initial.thread.id,
+                  targetRunId: initial.runs[0]!.id,
+                  fromProviderThreadIds: [],
+                  toProviderThreadId: initial.providerThreads[0]!.id,
+                  coveredRunOrdinals: { from: 1, to: 1 },
+                  strategy: "manual_context",
+                  status: "ready",
+                  summaryMessageId: null,
+                  summaryText: "Keep the inherited review context",
+                  createdByProviderInstanceId: null,
+                  createdAt: initial.updatedAt,
+                  updatedAt: initial.updatedAt,
+                },
+              ]
+            : [],
+      });
+      if (phase === "early")
+        harness.resumeThread.mockImplementationOnce(({ providerThread }) =>
+          Effect.fail(noRolloutFailure(providerThread)),
+        );
+      yield* harness.start;
+      const controls = harness.startRootRun.mock.calls[0]![0];
+      if (phase !== "early") {
+        harness.retryableEnsureThread.mockImplementationOnce(() =>
+          Effect.succeed({
+            ...controls.providerThread,
+            nativeThreadRef: {
+              driver: controls.providerThread.driver,
+              nativeId: "native-replacement",
+              strength: "strong",
+            },
+          }),
+        );
+        harness.nativeStartTurn.mockImplementationOnce(() =>
+          Effect.fail(noRolloutFailure(controls.providerThread)),
+        );
+      }
+      yield* startPreparedTurn(controls);
+      const expectedNative = phase === "early" ? "native-fresh-cutover" : "native-replacement";
+      expect(
+        harness.nativeStartTurn.mock.calls.at(-1)![0].providerThread.nativeThreadRef?.nativeId,
+      ).toBe(expectedNative);
+      expect(harness.projection().providerThreads.at(-1)?.nativeThreadRef?.nativeId).toBe(
+        expectedNative,
+      );
+      expect(harness.projection().attempts.at(-1)?.nativeThreadId).toBe(expectedNative);
+      expect(harness.projection().runs.at(-1)?.ordinal).toBe(1);
+      if (phase === "late with history") {
+        expect(harness.injectHistory).toHaveBeenCalledTimes(2);
+        expect(
+          harness.injectHistory.mock.calls.at(-1)![0].providerThread.nativeThreadRef?.nativeId,
+        ).toBe(expectedNative);
+        expect(JSON.stringify(harness.injectHistory.mock.calls.at(-1)![0])).toContain(
+          "Keep the inherited review context",
+        );
+      }
+    }),
+);
+
+effectIt.effect.each(["accepted", "failed", "recovered", "recovery_failed"] as const)(
+  "limits startup resume recovery to one offer lifecycle: %s",
+  (outcome) =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({ text: "Continue", nativeDelivery: true });
+      yield* harness.start;
+      const controls = harness.startRootRun.mock.calls[0]![0];
+      const source = controls.providerThread;
+      if (outcome === "recovered" || outcome === "recovery_failed") {
+        harness.retryableEnsureThread.mockImplementationOnce(() =>
+          Effect.succeed({
+            ...source,
+            nativeThreadRef: {
+              driver: source.driver,
+              nativeId: "native-one-shot",
+              strength: "strong",
+            },
+          }),
+        );
+        harness.nativeStartTurn.mockImplementationOnce(() => Effect.fail(noRolloutFailure(source)));
+      }
+      if (outcome === "failed" || outcome === "recovery_failed")
+        harness.nativeStartTurn.mockImplementationOnce((turn) =>
+          Effect.fail(
+            new ProviderAdapter.ProviderAdapterTurnStartError({
+              driver: source.driver,
+              threadId: turn.threadId,
+              providerThreadId: source.id,
+              runId: turn.runId,
+              cause: "offer failed",
+            }),
+          ),
+        );
+      yield* startPreparedTurn(controls).pipe(Effect.result);
+      const allocations = harness.retryableEnsureThread.mock.calls.length;
+      const laterFailure = noRolloutFailure(controls.providerThread);
+      harness.nativeStartTurn.mockImplementationOnce(() => Effect.fail(laterFailure));
+      const later = yield* startPreparedTurn(controls).pipe(Effect.result);
+      expect(later._tag).toBe("Failure");
+      if (later._tag === "Failure") expect(later.failure).toBe(laterFailure);
+      expect(harness.retryableEnsureThread).toHaveBeenCalledTimes(allocations);
+    }),
+);
+
+effectIt.effect("keeps the replacement native identity through real run finalization", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({ text: "Continue", nativeDelivery: true });
+    yield* harness.start;
+    const controls = harness.startRootRun.mock.calls[0]![0];
+    const source = controls.providerThread;
+    harness.retryableEnsureThread.mockImplementationOnce(() =>
+      Effect.succeed({
+        ...source,
+        nativeThreadRef: {
+          driver: source.driver,
+          nativeId: "native-survives-finalization",
+          strength: "strong",
+        },
+      }),
+    );
+    harness.nativeStartTurn.mockImplementationOnce(() => Effect.fail(noRolloutFailure(source)));
+    harness.nativeStartTurn.mockImplementationOnce((turn) =>
+      Effect.fail(
+        new ProviderAdapter.ProviderAdapterTurnStartError({
+          driver: source.driver,
+          providerThreadId: source.id,
+          threadId: turn.threadId,
+          runId: turn.runId,
+          cause: "Turn failed after fresh native allocation",
+        }),
+      ),
+    );
+    yield* Effect.gen(function* () {
+      const execution = yield* RunExecutionService.RunExecutionServiceV2;
+      yield* execution.startRootRun({
+        ...controls,
+        get providerThread() {
+          return controls.providerThread;
+        },
+        get attempt() {
+          return controls.attempt;
+        },
+        session: { ...controls.session, events: Stream.never },
+      });
+    }).pipe(
+      Effect.provide(
+        RunExecutionService.layer.pipe(
+          Layer.provide(
+            Layer.mergeAll(
+              McpAppModelContext.layerEmpty,
+              PreviewAgentActivity.layer,
+              IdAllocator.layer,
+              ServerSettings.layerTest(),
+              Layer.mock(CheckpointService.CheckpointServiceV2)({
+                captureBaseline: () => Effect.void,
+              }),
+              Layer.mock(TurnItemPositionStore.TurnItemPositionStoreV2)({
+                allocate: () => Effect.succeed(1),
+              }),
+              Layer.mock(ProviderEventIngestor.ProviderEventIngestorV2)({
+                ingestNormalized: () => Effect.succeed([]),
+              }),
+              Layer.mock(EventSink.EventSinkV2)({ writeIfRunCurrent: harness.writeIfRunCurrent }),
+            ),
+          ),
+        ),
+      ),
+    );
+    expect(harness.nativeStartTurn).toHaveBeenCalledTimes(2);
+    expect(harness.projection().runs.at(-1)?.status).toBe("failed");
+    expect(harness.projection().providerThreads.at(-1)?.nativeThreadRef?.nativeId).toBe(
+      "native-survives-finalization",
+    );
+    expect(harness.projection().attempts.at(-1)?.nativeThreadId).toBe(
+      "native-survives-finalization",
+    );
+  }),
+);
+
+effectIt.effect.each([false, true])(
+  "replays staged Codex history on late no-rollout recovery (retry fails: %s)",
+  (retryFails) =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({ text: "Continue", nativeDelivery: true });
+      const initial = harness.projection();
+      const seed = {
+        source: "opencode" as const,
+        sourceSessionId: "seed-source",
+        digest: "sha256:seed",
+        mode: "codex-inject" as const,
+        stagedPath: "/staged/review-history",
+      };
+      harness.setProjection({
+        ...initial,
+        providerThreads: initial.providerThreads.map((thread) => ({
+          ...thread,
+          nativeMetadata: { seededHistory: seed },
+        })),
+      });
+      harness.retryableEnsureThread.mockImplementationOnce(({ existingProviderThread }) =>
+        Effect.succeed({
+          ...existingProviderThread!,
+          nativeThreadRef: {
+            driver: initial.providerThreads[0]!.driver,
+            nativeId: "native-seeded",
+            strength: "strong",
+          },
+          nativeMetadata: { seededHistory: { ...seed, injectedNativeId: "native-seeded" } },
+        }),
+      );
+      yield* harness.start;
+      const controls = harness.startRootRun.mock.calls[0]![0];
+      harness.retryableEnsureThread.mockImplementationOnce(({ existingProviderThread }) => {
+        expect(existingProviderThread?.nativeMetadata?.seededHistory).toMatchObject(seed);
+        expect(
+          existingProviderThread?.nativeMetadata?.seededHistory?.injectedNativeId,
+        ).toBeUndefined();
+        return Effect.succeed({
+          ...existingProviderThread!,
+          nativeThreadRef: {
+            driver: controls.providerThread.driver,
+            nativeId: "native-reseeded",
+            strength: "strong",
+          },
+          nativeMetadata: { seededHistory: { ...seed, injectedNativeId: "native-reseeded" } },
+        });
+      });
+      harness.nativeStartTurn.mockImplementationOnce(() =>
+        Effect.fail(noRolloutFailure(controls.providerThread)),
+      );
+      if (retryFails)
+        harness.nativeStartTurn.mockImplementationOnce((turn) =>
+          Effect.fail(noRolloutFailure(turn.providerThread)),
+        );
+      const result = yield* startPreparedTurn(controls).pipe(Effect.result);
+      expect(result._tag).toBe(retryFails ? "Failure" : "Success");
+      expect(harness.retryableEnsureThread).toHaveBeenCalledTimes(2);
+      expect(
+        harness.projection().providerThreads.at(-1)?.nativeMetadata?.seededHistory
+          ?.injectedNativeId,
+      ).toBe("native-reseeded");
+    }),
+);
+
+effectIt.effect.each(["early", "late", "late completed"] as const)(
+  "keeps no-rollout failures loud when native turns exist at %s",
+  (phase) =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({
+        text: "Continue",
+        nativeDelivery: true,
+        allowRecoveryHandoff: true,
+      });
+      if (phase === "early") {
+        const initial = harness.projection();
+        const thread = initial.providerThreads[0]!;
+        harness.setProjection({
+          ...initial,
+          providerThreads: [
+            {
+              ...thread,
+              nativeThreadRef: {
+                driver: thread.driver,
+                nativeId: "native-unsaved",
+                strength: "strong",
+              },
+            },
+          ],
+          providerTurns: [
+            {
+              id: ProviderTurnId.make("prior-native-turn"),
+              providerThreadId: thread.id,
+              nodeId: initial.nodes[0]!.id,
+              runAttemptId: null,
+              nativeTurnRef: null,
+              ordinal: 1,
+              status: "completed",
+              startedAt: initial.updatedAt,
+              completedAt: initial.updatedAt,
+            },
+          ],
+        });
+        harness.resumeThread.mockImplementationOnce(({ providerThread }) =>
+          Effect.fail(noRolloutFailure(providerThread)),
+        );
+        yield* harness.start;
+        expect(harness.retryableEnsureThread).not.toHaveBeenCalled();
+        expect(harness.projection().runs.at(-1)?.status).toBe("failed");
+        expect(harness.startRootRun).not.toHaveBeenCalled();
+      } else {
+        yield* harness.start;
+        const controls = harness.startRootRun.mock.calls[0]![0];
+        const records = harness.projection();
+        harness.setProjection({
+          ...records,
+          providerTurns: [
+            {
+              id: ProviderTurnId.make("started-native-turn"),
+              providerThreadId: controls.providerThread.id,
+              nodeId: records.nodes[0]!.id,
+              runAttemptId: records.attempts[0]!.id,
+              nativeTurnRef: null,
+              ordinal: 1,
+              status: phase === "late completed" ? "completed" : "running",
+              startedAt: records.updatedAt,
+              completedAt: phase === "late completed" ? records.updatedAt : null,
+            },
+          ],
+        });
+        const failure = noRolloutFailure(controls.providerThread);
+        harness.nativeStartTurn.mockImplementationOnce(() => Effect.fail(failure));
+        const result = yield* startPreparedTurn(controls).pipe(Effect.flip);
+        expect(result).toBe(failure);
+        expect(harness.retryableEnsureThread).toHaveBeenCalledTimes(1);
+      }
+    }),
+);
+
+effectIt.effect("retains ordinal-2 recovery for the existing thread-closing resume error", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      nativeDelivery: true,
+      allowRecoveryHandoff: true,
+    });
+    const initial = harness.projection();
+    harness.setProjection({
+      ...initial,
+      providerThreads: initial.providerThreads.map((thread) => ({
+        ...thread,
+        nativeThreadRef: {
+          driver: thread.driver,
+          nativeId: "native-closing",
+          strength: "strong" as const,
+        },
+      })),
+    });
+    harness.resumeThread.mockImplementationOnce(({ providerThread }) =>
+      Effect.fail(
+        new ProviderAdapter.ProviderAdapterResumeThreadError({
+          driver: providerThread.driver,
+          providerSessionId: providerThread.providerSessionId!,
+          providerThreadId: providerThread.id,
+          cause: {
+            _tag: "CodexAppServerRequestError",
+            code: -32600,
+            method: "thread/resume",
+            errorMessage: `thread ${providerThread.nativeThreadRef?.nativeId} is closing; retry thread/resume after the thread is closed`,
+          },
+        }),
+      ),
+    );
+    yield* harness.start;
+    expect(harness.resumeThread).toHaveBeenCalledOnce();
+    expect(harness.retryableEnsureThread).toHaveBeenCalledOnce();
+    expect(harness.projection().runs.at(-1)).toMatchObject({ ordinal: 2, status: "running" });
+  }),
+);
 
 effectIt.effect.each([
   "failed",
