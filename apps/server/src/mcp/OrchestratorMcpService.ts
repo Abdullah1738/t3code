@@ -1,3 +1,4 @@
+import * as ThreadReadMetrics from "../ardud/analytics/ThreadReadMetrics.ts";
 import * as McpDeadline from "./McpDeadline.ts";
 import * as McpTaskTrace from "../ardud/observability/McpTaskTrace.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -1492,20 +1493,24 @@ const make = Effect.gen(function* () {
     scope: McpInvocationScope,
     threadId: ThreadId,
   ) {
-    const { parent } = yield* loadCaller(scope);
-    const shell = yield* threadManagement
-      .getThreadShell(threadId)
-      .pipe(Effect.mapError(threadManagementFailure));
+    const { parent } = yield* ThreadReadMetrics.read("caller", loadCaller(scope));
+    const shell = yield* ThreadReadMetrics.read(
+      "shell",
+      threadManagement.getThreadShell(threadId).pipe(Effect.mapError(threadManagementFailure)),
+    );
     if (shell === null || shell.deletedAt !== null) {
       return yield* failure("thread_not_found", `Thread ${threadId} is no longer available.`);
     }
-    const target = yield* threadManagement
-      .getProjectThreadRecords({ projectId: shell.projectId, threadId }, [
-        "runs",
-        "runtimeRequests",
-        "contextTransfers",
-      ])
-      .pipe(Effect.mapError(threadManagementFailure));
+    const target = yield* ThreadReadMetrics.read(
+      "records",
+      threadManagement
+        .getProjectThreadRecords({ projectId: shell.projectId, threadId }, [
+          "runs",
+          "runtimeRequests",
+          "contextTransfers",
+        ])
+        .pipe(Effect.mapError(threadManagementFailure)),
+    );
     return { parent, target, shell } as const;
   });
 
@@ -3716,117 +3721,138 @@ const make = Effect.gen(function* () {
         total: filtered.length,
       } satisfies OrchestratorMcpThreadListResult;
     }),
-    readThread: Effect.fn("OrchestratorMcpService.readThread")(function* (scope, rawInput) {
-      const callerThreadId = scope.thread?.threadId;
-      if (rawInput.threadId === undefined && callerThreadId === undefined) {
-        return yield* failure(
-          "invalid_request",
-          "threadId is required when the caller is not a T3 thread.",
-        );
-      }
-      const input = { ...rawInput, threadId: (rawInput.threadId ?? callerThreadId)! };
-      const { parent, target, shell } = yield* loadReadableThread(scope, input.threadId);
-      const view = input.view ?? "messages";
-      const afterPosition = input.afterPosition ?? -1;
-      const limit = input.limit ?? DEFAULT_THREAD_READ_LIMIT;
-      const maxChars = input.maxCharsPerItem ?? DEFAULT_THREAD_ITEM_MAX_CHARS;
-      const timeline = yield* threadManagement
-        .getTimelinePage(input.threadId, {
-          afterPosition,
-          limit,
-          view,
-          ...(input.itemId === undefined ? {} : { itemId: input.itemId }),
-        })
-        .pipe(Effect.mapError(threadManagementFailure));
-      const page = timeline.items;
-      const messageIdsByThread = new Map<ThreadId, Array<MessageId>>();
-      for (const row of page) {
-        if (row.item.type !== "user_message" && row.item.type !== "assistant_message") continue;
-        const ids = messageIdsByThread.get(row.sourceThreadId) ?? [];
-        ids.push(row.item.messageId);
-        messageIdsByThread.set(row.sourceThreadId, ids);
-      }
-      const sourceMessages = yield* Effect.forEach(
-        [...messageIdsByThread],
-        ([threadId, messageIds]) =>
-          threadManagement.getThreadRecords(threadId, ["messages"], { messageIds }).pipe(
-            Effect.map((records) => [threadId, records.messages] as const),
-            Effect.mapError(threadManagementFailure),
-          ),
-        { concurrency: 1 },
-      );
-      const messagesByThreadId = new Map(sourceMessages);
-      const returnedRunIds = new Set(
-        page.filter((row) => row.sourceThreadId === target.thread.id).map((row) => row.item.runId),
-      );
-      const tasks =
-        parent === undefined ||
-        (input.textOffset ?? 0) !== 0 ||
-        !target.runs.some((run) => returnedRunIds.has(run.id)) ||
-        target.thread.lineage.parentThreadId !== parent.thread.id ||
-        target.thread.lineage.relationshipToParent !== "subagent"
-          ? []
-          : directAppOwnedChildTasks(
-              yield* loadProjection(parent.thread.id, ["subagents"]),
-              target,
-              returnedRunIds,
-            );
-      if (
-        parent !== undefined &&
-        scope.thread !== undefined &&
-        tasks.length > 0 &&
-        (input.textOffset ?? 0) === 0
-      ) {
-        const parentResults = yield* loadProjection(parent.thread.id, ["contextTransfers"]);
-        for (const task of tasks) {
-          const transfer = taskResultTransfer(parentResults, target, task);
-          const resultRunId = transfer?.sourcePoint.runId ?? delegatedTaskRun(target, task)?.id;
-          const resultRunIds = resultRunId === undefined ? [] : [resultRunId];
-          const resultRecords = yield* threadManagement
-            .getThreadRecords(target.thread.id, ["messages", "turnItems", "providerTurns"], {
-              messageRoles: ["assistant"],
-              messageRunIds: resultRunIds,
-              turnItemRunIds: resultRunIds,
-              turnItemTypes: ["assistant_message", "error"],
-            })
-            .pipe(Effect.mapError(threadManagementFailure));
-          if (
-            pageIncludesTerminalTaskResult({
-              parent: parentResults,
-              page,
-              task,
-              target: { ...target, ...resultRecords },
-              maxChars,
-            })
-          ) {
-            yield* readTask(
-              scope as McpThreadInvocationScope,
-              task.id,
-              false,
-              true,
-              "thread-read-acknowledge",
-            );
-          }
+    readThread: Effect.fn("OrchestratorMcpService.readThread")(
+      function* (scope, rawInput) {
+        const callerThreadId = scope.thread?.threadId;
+        if (rawInput.threadId === undefined && callerThreadId === undefined) {
+          return yield* failure(
+            "invalid_request",
+            "threadId is required when the caller is not a T3 thread.",
+          );
         }
-      }
-      return {
-        thread: threadDetail(target, timeline.totalItems, shell, yield* Clock.currentTimeMillis),
-        recentRuns: target.runs
-          .toSorted((left, right) => right.ordinal - left.ordinal)
-          .slice(0, input.runLimit ?? DEFAULT_THREAD_RUN_LIMIT)
-          .map(threadRun),
-        items: page.map((row) =>
-          timelineItem({
-            row,
-            maxChars,
-            messagesByThreadId,
-            ...(input.itemId === undefined ? {} : { textOffset: input.textOffset ?? 0 }),
+        const input = { ...rawInput, threadId: (rawInput.threadId ?? callerThreadId)! };
+        const { parent, target, shell } = yield* loadReadableThread(scope, input.threadId);
+        const view = input.view ?? "messages";
+        const afterPosition = input.afterPosition ?? -1;
+        const limit = input.limit ?? DEFAULT_THREAD_READ_LIMIT;
+        const maxChars = input.maxCharsPerItem ?? DEFAULT_THREAD_ITEM_MAX_CHARS;
+        const timeline = yield* ThreadReadMetrics.read(
+          "timeline",
+          threadManagement
+            .getTimelinePage(input.threadId, {
+              afterPosition,
+              limit,
+              view,
+              ...(input.itemId === undefined ? {} : { itemId: input.itemId }),
+            })
+            .pipe(Effect.mapError(threadManagementFailure)),
+        );
+        const page = timeline.items;
+        const messageIdsByThread = new Map<ThreadId, Array<MessageId>>();
+        for (const row of page) {
+          if (row.item.type !== "user_message" && row.item.type !== "assistant_message") continue;
+          const ids = messageIdsByThread.get(row.sourceThreadId) ?? [];
+          ids.push(row.item.messageId);
+          messageIdsByThread.set(row.sourceThreadId, ids);
+        }
+        const sourceMessages = yield* ThreadReadMetrics.read(
+          "messages",
+          Effect.forEach(
+            [...messageIdsByThread],
+            ([threadId, messageIds]) =>
+              threadManagement.getThreadRecords(threadId, ["messages"], { messageIds }).pipe(
+                Effect.map((records) => [threadId, records.messages] as const),
+                Effect.mapError(threadManagementFailure),
+              ),
+            { concurrency: 1 },
+          ),
+        );
+        const messagesByThreadId = new Map(sourceMessages);
+        yield* ThreadReadMetrics.read(
+          "acknowledgement",
+          Effect.gen(function* () {
+            const returnedRunIds = new Set(
+              page
+                .filter((row) => row.sourceThreadId === target.thread.id)
+                .map((row) => row.item.runId),
+            );
+            const tasks =
+              parent === undefined ||
+              (input.textOffset ?? 0) !== 0 ||
+              !target.runs.some((run) => returnedRunIds.has(run.id)) ||
+              target.thread.lineage.parentThreadId !== parent.thread.id ||
+              target.thread.lineage.relationshipToParent !== "subagent"
+                ? []
+                : directAppOwnedChildTasks(
+                    yield* loadProjection(parent.thread.id, ["subagents"]),
+                    target,
+                    returnedRunIds,
+                  );
+            if (
+              parent !== undefined &&
+              scope.thread !== undefined &&
+              tasks.length > 0 &&
+              (input.textOffset ?? 0) === 0
+            ) {
+              const parentResults = yield* loadProjection(parent.thread.id, ["contextTransfers"]);
+              for (const task of tasks) {
+                const transfer = taskResultTransfer(parentResults, target, task);
+                const resultRunId =
+                  transfer?.sourcePoint.runId ?? delegatedTaskRun(target, task)?.id;
+                const resultRunIds = resultRunId === undefined ? [] : [resultRunId];
+                const resultRecords = yield* threadManagement
+                  .getThreadRecords(target.thread.id, ["messages", "turnItems", "providerTurns"], {
+                    messageRoles: ["assistant"],
+                    messageRunIds: resultRunIds,
+                    turnItemRunIds: resultRunIds,
+                    turnItemTypes: ["assistant_message", "error"],
+                  })
+                  .pipe(Effect.mapError(threadManagementFailure));
+                if (
+                  pageIncludesTerminalTaskResult({
+                    parent: parentResults,
+                    page,
+                    task,
+                    target: { ...target, ...resultRecords },
+                    maxChars,
+                  })
+                ) {
+                  yield* readTask(
+                    scope as McpThreadInvocationScope,
+                    task.id,
+                    false,
+                    true,
+                    "thread-read-acknowledge",
+                  );
+                }
+              }
+            }
           }),
-        ),
-        nextPosition: page.at(-1)?.position ?? null,
-        hasMore: timeline.hasMore,
-      } satisfies OrchestratorMcpThreadReadResult;
-    }),
+        );
+        const now = yield* Clock.currentTimeMillis;
+        return yield* ThreadReadMetrics.render(
+          () =>
+            ({
+              thread: threadDetail(target, timeline.totalItems, shell, now),
+              recentRuns: target.runs
+                .toSorted((left, right) => right.ordinal - left.ordinal)
+                .slice(0, input.runLimit ?? DEFAULT_THREAD_RUN_LIMIT)
+                .map(threadRun),
+              items: page.map((row) =>
+                timelineItem({
+                  row,
+                  maxChars,
+                  messagesByThreadId,
+                  ...(input.itemId === undefined ? {} : { textOffset: input.textOffset ?? 0 }),
+                }),
+              ),
+              nextPosition: page.at(-1)?.position ?? null,
+              hasMore: timeline.hasMore,
+            }) satisfies OrchestratorMcpThreadReadResult,
+        );
+      },
+      (effect) => effect.pipe(NodeSqliteClient.foregroundReads),
+    ),
     sendToThread: Effect.fn("OrchestratorMcpService.sendToThread")(function* (scope, input) {
       return yield* SendAcknowledgement.bounded(
         (clientRequestId) =>
