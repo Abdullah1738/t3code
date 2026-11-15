@@ -5,7 +5,20 @@
 session; its exit 0 only confirms the launch. `--dry-run` prints the plan without
 installing.
 
-Startup and continuation readiness have a three-minute bound after quit. After
+`--ready-budget-s N` sets one startup budget, in integer seconds (minimum 180,
+default 180). It is logged as `readyBudgetS` at install start and covers command
+deadlines, the backup allowance (still capped at 120 s with 60 s reserved), listening
+and continuation readiness, measured from quit. Generated `run-install.zsh` release
+launchers must pass the packet's budget to `install-robob-fast.zsh`, for example
+`--ready-budget-s 780`; the wrapper preserves it across tmux. The legacy unattended
+restart and resume installers accept the same flag.
+
+An overrun logs the current phase from `userdata/logs/boot.ndjson`, pins the backup
+and keeps the recovery heartbeat until healthy. It never stops the new server.
+The legacy server-health wait remains unbounded; its budget marks a diagnostic,
+and also replaces its existing shutdown grace and optional OpenCode wait.
+
+After startup and continuation readiness,
 that, the `read-check` phase runs `~/.local/bin/robob-read-watchdog --sustain 300
 --every 30 --give-up 1800`. Success is reported only after five minutes of healthy
 reads, including installs with no interrupted threads and rollbacks. Automatic
