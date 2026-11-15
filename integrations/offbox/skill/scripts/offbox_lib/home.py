@@ -709,16 +709,19 @@ class FailbackReady(BaseException):
 
 
 def flush_routing(run_id):
-    lines = json.loads(os.environ.get(ROUTING_ENV, "[]"))
+    lines = list(dict.fromkeys(json.loads(os.environ.get(ROUTING_ENV, "[]"))))
     if not run_id or not lines:
         return
     path = common.LOGS_DIR / f"{run_id}.client.log"
     path.parent.mkdir(parents=True, exist_ok=True)
     existing = path.read_text(errors="replace") if path.exists() else ""
-    with open(path, "a", opener=lambda p, f: os.open(p, f, 0o600)) as output:
-        for line in lines:
-            if line not in existing:
-                output.write(line + "\n")
+    body = [line for line in existing.splitlines() if line not in lines]
+    updated = "\n".join([*lines, *body]) + "\n"
+    if updated != existing:
+        # Keep the inode: a detached client's append-only stderr still points at this file.
+        with open(path, "r+" if path.exists() else "w", opener=lambda p, f: os.open(p, f, 0o600)) as output:
+            output.write(updated)
+            output.truncate()
 
 
 def routing_line(message, run_id):
@@ -726,16 +729,8 @@ def routing_line(message, run_id):
     lines = json.loads(os.environ.get(ROUTING_ENV, "[]"))
     lines.append(line)
     os.environ[ROUTING_ENV] = json.dumps(lines)
-    # A detached client's stderr already is the append-only client log.
-    same_file = False
-    path = common.LOGS_DIR / f"{run_id}.client.log"
-    try:
-        same_file = os.path.samestat(os.fstat(sys.stderr.fileno()), path.stat())
-    except (OSError, ValueError, AttributeError):
-        pass
-    if not same_file:
-        flush_routing(run_id)
     say(message)
+    flush_routing(run_id)
 
 
 def fail_back(ready, argv):

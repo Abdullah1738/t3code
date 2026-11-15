@@ -513,6 +513,21 @@ class FailbackTests(Isolated):
                              ('forwarded', 'boat'))
             self.assertEqual(con.execute("SELECT status FROM runs WHERE run_id='down'").fetchone()[0], 'starting')
 
+    def test_background_routing_stays_first_after_progress_without_replacing_stderr_inode(self):
+        path = common.LOGS_DIR / 'mine.client.log'
+        with patch.dict(os.environ, {home.ROUTING_ENV: '[]'}), path.open('a') as output, \
+                contextlib.redirect_stderr(output):
+            output.write('earlier home progress\n')
+            output.flush()
+            home.routing_line('this run goes to Boat instead', 'mine')
+            common.say('queued on Boat')
+            home.routing_line('this run goes back to home', 'mine')
+            common.say('later home progress')
+        lines = path.read_text().splitlines()
+        self.assertEqual(lines[:2], ['offbox: this run goes to Boat instead', 'offbox: this run goes back to home'])
+        self.assertEqual(lines.count('offbox: this run goes back to home'), 1)
+        self.assertEqual(lines[2:], ['earlier home progress', 'offbox: queued on Boat', 'offbox: later home progress'])
+
     def test_routing_is_first_line_for_preflight_and_post_time_ids(self):
         for run_id in ('preflight', 'post'):
             with self.subTest(run_id=run_id), patch.dict(os.environ, {home.ROUTING_ENV: '[]'}):
