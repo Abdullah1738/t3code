@@ -1228,6 +1228,113 @@ describe("thread batching", () => {
     ).toMatchObject([{ cardId: back.id, joins: true }]);
   });
 
+  it.each([
+    "needs_review",
+    "in_review",
+    "completed",
+    "deployed",
+    "verified",
+    "needs_owner",
+  ] as const)("starts claimed rework fresh after its home card reaches %s", (stage) => {
+    const home = card({ stage, workThreadId: t1 });
+    const back = card({ workThreadId: t1 });
+    expect(
+      planDispatch(
+        board,
+        [back],
+        pools([[opus, 1]]),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        new Map([[t1, home]]),
+      ),
+    ).toMatchObject([
+      {
+        cardId: back.id,
+        role: "work",
+        fresh: true,
+        joins: false,
+        freshReason: `fresh work thread: previous thread ${t1} belongs to #${home.number} (${stage})`,
+      },
+    ]);
+  });
+
+  it.each(["working", "todo"] as const)(
+    "reuses claimed rework while its home card is %s on the thread",
+    (stage) => {
+      const home = working({ stage, workThreadId: t1 });
+      const back = card({ workThreadId: t1 });
+      expect(
+        planDispatch(
+          board,
+          [home, back],
+          pools([[opus, 1]]),
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          new Map([[t1, home]]),
+        ),
+      ).toMatchObject([{ cardId: back.id, fresh: false, joins: true }]);
+    },
+  );
+
+  it.each(["working", "todo"] as const)(
+    "starts claimed rework fresh when its %s home card changed threads",
+    (stage) => {
+      const home = card({ stage, workThreadId: ThreadId.make("replacement") });
+      const back = card({ workThreadId: t1 });
+      expect(
+        planDispatch(
+          board,
+          [back],
+          pools([[opus, 1]]),
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          new Map([[t1, home]]),
+        ),
+      ).toMatchObject([{ cardId: back.id, fresh: true, joins: false }]);
+    },
+  );
+
+  it("reuses its own thread and legacy threads, but not a linked missing home card", () => {
+    const back = card({ workThreadId: t1 });
+    for (const homes of [new Map(), new Map([[t1, back]])]) {
+      expect(
+        planDispatch(
+          board,
+          [back],
+          pools([[opus, 1]]),
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          homes,
+        ),
+      ).toMatchObject([{ cardId: back.id, fresh: false, joins: false }]);
+    }
+    expect(
+      planDispatch(
+        board,
+        [back],
+        pools([[opus, 1]]),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        new Map([[t1, null]]),
+      ),
+    ).toMatchObject([{ cardId: back.id, fresh: true, joins: false }]);
+  });
+
   it("keeps a held slot for a thread between cards", () => {
     const waiting = card();
     const holds = new Map([["t1", poolKey(opus)]]);

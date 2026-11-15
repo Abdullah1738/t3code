@@ -32,7 +32,12 @@ const cardFacts = (card: KanbanCard, goal: KanbanGoal | null) =>
 const LINKS_LINE =
   "- Links: to point at a card, write [#12 Title](t3-context://v1/kanban-card/<card id>), or kanban-discussion/<discussion id> for a discussion; the owner sees a chip. One may reach you like that, or as [Kanban card: #12 Title; ref=<card id>] (card_get, discussion_read). A thread is a plain [title](t3-thread://v1/<thread id>) link (t3_thread_read).";
 
-export const workBrief = (board: KanbanBoard, card: KanbanCard, goal: KanbanGoal | null) =>
+export const workBrief = (
+  board: KanbanBoard,
+  card: KanbanCard,
+  goal: KanbanGoal | null,
+  comments: ReadonlyArray<string> = [],
+) =>
   lines(
     `You are the worker for a card on the "${board.name}" Missions board.`,
     "",
@@ -41,6 +46,10 @@ export const workBrief = (board: KanbanBoard, card: KanbanCard, goal: KanbanGoal
     "Task:",
     card.prompt.trim() || card.description.trim() || card.title,
     pendingWakeNote(card) ? `\nWaiting for this card:\n${pendingWakeNote(card)}` : null,
+    card.workThreadId
+      ? `\nPrevious work thread: ${card.workThreadId} (t3_thread_read for earlier context).`
+      : null,
+    comments.length > 0 ? `\nCard comments and handoff notes:\n${comments.join("\n\n")}` : null,
     "",
     "How the board works:",
     '- Your card tools: card_get, card_search, card_update, card_move, card_ask, card_flag, subtask_done, discussion_post, wiki_read, report_bug, evaluator_start (kind "request" only). The ones that change things work only on your own cards. If your task says to post on or change another card, put what you have in your own card (card_update or its discussion) and leave carrying it over to the evaluator.',
