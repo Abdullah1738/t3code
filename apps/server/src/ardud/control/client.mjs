@@ -188,6 +188,18 @@ export class ControlClient {
   }
 
   /**
+   * User messages across all threads, ordered by updated time then message id.
+   * @param {{ since: string | number, cursor?: string, limit?: number }} filters
+   */
+  listUserMessages(filters) {
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries(filters)) {
+      if (value !== undefined && value !== null) query.set(key, String(value));
+    }
+    return this.request("GET", `/messages?${query}`);
+  }
+
+  /**
    * Starts a thread. `providerInstanceId`, `model`, and `options` select a provider
    * and its options; `variant` is the legacy effort input. Pick a folder with
    * scratch (default: scratch, a fresh folder per thread).
