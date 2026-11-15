@@ -41,6 +41,10 @@ export const FAIL_LAUNCH = "[fail-launch]";
 export const owner: KanbanActor = { _tag: "owner" };
 
 interface FakeThread {
+  readonly archived?: boolean;
+  readonly runStatus?: string;
+  readonly state?: KanbanThreadView["state"];
+  readonly runStartedAt?: string | null;
   readonly title: string;
   readonly model: ModelSelection;
   readonly messages: Array<string>;
@@ -57,15 +61,16 @@ export const makeFake = Effect.gen(function* () {
           threadId,
           projectId: ProjectId.make("project-1"),
           title: thread.title,
-          state: "idle",
+          state: thread.state ?? "idle",
           updatedAt: "2026-11-10T10:00:00.000Z",
           quietSince: "2026-11-10T10:00:00.000Z",
-          runStartedAt: null,
+          runStartedAt: thread.runStartedAt ?? null,
           lastActivityAt: null,
           backgroundWork: 0,
           prWatches: 0,
           prs: [],
-          archived: false,
+          archived: thread.archived ?? false,
+          ...(thread.runStatus === undefined ? {} : { runStatus: thread.runStatus }),
         };
       }),
     );

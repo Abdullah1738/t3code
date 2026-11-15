@@ -1044,6 +1044,15 @@ export const KanbanCard = Schema.Struct({
   activeRole: Schema.NullOr(Schema.Literals(["work", "review"])),
   /** Pool key (instance/model#level) the active thread holds a slot in. */
   activePool: Schema.NullOr(Schema.String),
+  /** Attachment released by a blocking owner ask; only this live thread may resume it. */
+  ownerPark: Schema.optional(
+    Schema.Struct({
+      stage: KanbanStage,
+      threadId: Schema.NullOr(ThreadId),
+      pool: Schema.NullOr(Schema.String),
+      startedAt: Schema.NullOr(IsoDateTime),
+    }),
+  ),
   workThreadId: Schema.NullOr(ThreadId),
   reviewThreadId: Schema.NullOr(ThreadId),
   discussionId: Schema.NullOr(KanbanDiscussionId),

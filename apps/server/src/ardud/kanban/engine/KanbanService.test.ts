@@ -6466,7 +6466,7 @@ it.effect.each(
         yield* kanban.markSubtask(card.id, "s1", "done", "Checked", evaluator, "evaluator");
         const resolved = yield* resolveOwnerWait(card.id, exit);
         if (exit === "owner answer" || exit === "drop") {
-          assert.strictEqual(resolved.stage, "todo");
+          assert.strictEqual(resolved.stage, origin === "working" ? "working" : "todo");
           yield* kanban.moveCard(card.id, "needs_review", "evaluator", evaluator);
         }
         assert.strictEqual((yield* kanban.card(card.id)).card.reviewStep, 0);
@@ -13903,8 +13903,13 @@ it.effect("only the owner answers a card waiting on him; a script post leaves it
 
       yield* kanban.post(discussion.id, owner, [{ _tag: "md", text: "Use 2%" }]);
       const answered = (yield* kanban.card(card.id)).card;
-      assert.notStrictEqual(answered.stage, "needs_owner");
-      assert.include(answered.wakeNote ?? "", "Use 2%");
+      assert.strictEqual(answered.stage, "working");
+      assert.strictEqual(answered.activeThreadId, thread);
+      assert.isTrue(
+        (yield* Ref.get(fake.threads))
+          .get(thread)!
+          .messages.some((text) => text.includes("Use 2%")),
+      );
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
@@ -15412,7 +15417,7 @@ it.effect.each([false, true])(
             .pipe(Effect.flip);
           assert.strictEqual(
             denied.detail,
-            `card #${created.number} has no thread attached: you can only move it to needs_review; use card_ask for an owner question`,
+            `card #${created.number} has no thread attached: use card_claim to return to working when a slot is available, or card_move to needs_review; use card_ask for an owner question`,
           );
         }
         assert.deepStrictEqual(yield* kanban.card(created.id), before);
@@ -15952,8 +15957,13 @@ it.effect("the worker's answer survives an evaluator's later blocking ask", () =
       const talk = yield* kanban.cardDiscussion(card.id);
       yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "2%, and yes" }]);
       const woken = (yield* kanban.card(card.id)).card;
-      assert.strictEqual(woken.stage, "todo");
-      assert.include(woken.wakeNote ?? "", "2%, and yes");
+      assert.strictEqual(woken.stage, "working");
+      assert.strictEqual(woken.activeThreadId, threadId);
+      assert.isTrue(
+        (yield* Ref.get(fake.threads))
+          .get(threadId)!
+          .messages.some((text) => text.includes("2%, and yes")),
+      );
       assert.isTrue(woken.asks.every((ask) => ask.closedAt !== null));
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),

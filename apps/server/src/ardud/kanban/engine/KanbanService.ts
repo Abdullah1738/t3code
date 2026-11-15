@@ -24,6 +24,7 @@ import {
   kanbanReviewAlreadyDone,
   kanbanDeciding,
   kanbanWaiting,
+  kanbanWaitsOnEvaluator,
   kanbanWithoutDeciding,
   kanbanWithoutWait,
   KanbanBoardId,
@@ -1521,6 +1522,7 @@ interface AnsweredNotice {
   readonly told: ReadonlyArray<string>;
   /** The evaluator whose blocking ask held the card, told first. */
   readonly unblockEvaluator: string | null;
+  readonly resumeThreadId?: ThreadId;
 }
 
 /**
@@ -1666,6 +1668,30 @@ const make = Effect.gen(function* () {
       stoppedRunCards.set(id, { ...pending, runId: result.runId });
     else if (result?.outcome === "noop") stoppedRunCards.delete(id);
   };
+  const dispatchSkips = new Map<
+    string,
+    { boardId: string; reason: string; movedAt: string; at: number }
+  >();
+  // The dispatch span already covers this measurement; repeated passes share its throttle.
+  const recordDispatchSkip = Effect.fnUntraced(function* (
+    card: KanbanCard,
+    reason: string,
+    at: number,
+  ) {
+    if (card.stage !== "todo" || card.workThreadId === null || Option.isNone(analytics)) return;
+    yield* Effect.annotateCurrentSpan("kanban.dispatch_skip_reason", reason);
+    const prior = dispatchSkips.get(card.id);
+    if (prior?.reason === reason && prior.movedAt === card.movedAt && at - prior.at < 60_000)
+      return;
+    dispatchSkips.set(card.id, { boardId: card.boardId, reason, movedAt: card.movedAt, at });
+    yield* recordAnalytics({
+      kind: "kanban.dispatch_skipped",
+      boardId: card.boardId,
+      cardId: card.id,
+      threadId: card.workThreadId,
+      props: { reason },
+    });
+  });
   const poolWaits = new Map<
     string,
     { boardId: string; pool: string; movedAt: string; at: number }
@@ -3703,6 +3729,20 @@ const make = Effect.gen(function* () {
                 ))),
         ),
       ),
+      ownerPark:
+        to === "needs_owner" && card.stage !== "needs_owner"
+          ? {
+              stage: card.stage,
+              threadId: card.activeThreadId,
+              pool: card.activePool,
+              startedAt:
+                card.activeThreadId === null
+                  ? null
+                  : ((yield* store.threadLink(card.activeThreadId))?.startedAt ?? null),
+            }
+          : to === "needs_owner"
+            ? card.ownerPark
+            : undefined,
       stage: to,
       ...(to === "needs_review" ? { reviewFindingsPending: false } : {}),
       movedAt: at,
@@ -5861,6 +5901,75 @@ const make = Effect.gen(function* () {
     return events.findLast((event) => event.kind === "moved" && event.toStage === "needs_owner");
   });
 
+  /** Reattach a parked worker without a dispatch or a second assignment wake. */
+  const restoreOwnerPark = Effect.fn("KanbanService.restoreOwnerPark")(function* (
+    card: KanbanCard,
+    fallback: KanbanStage,
+  ) {
+    const parked = card.ownerPark;
+    const base = { ...card, ownerPark: undefined, stage: fallback };
+    if (
+      parked?.stage !== "working" ||
+      parked.threadId === null ||
+      parked.pool === null ||
+      parked.threadId !== card.workThreadId ||
+      card.stalled !== null ||
+      card.settledAt !== null
+    )
+      return base;
+    const threadId = parked.threadId;
+    const link = yield* store.threadLink(threadId);
+    if (
+      link?.role !== "work" ||
+      link.boardId !== card.boardId ||
+      link.endedAt !== null ||
+      link.startedAt !== parked.startedAt ||
+      link.paused != null ||
+      inFlightStops.has(threadId) ||
+      pendingRunStops.has(threadId) ||
+      (pendingStops.get(threadId)?.size ?? 0) > 0
+    )
+      return base;
+    const view = yield* threads.view(threadId).pipe(Effect.orElseSucceed(() => null));
+    if (
+      view === null ||
+      view.archived ||
+      view.runStatus === "failed" ||
+      view.runStatus === "interrupted" ||
+      view.runStatus === "cancelled"
+    )
+      return base;
+    const cards = yield* store.openCards(card.boardId);
+    const pools = yield* store.pools(card.boardId);
+    const model = yield* threads.model(threadId).pipe(Effect.orElseSucceed(() => null));
+    // A model switch while parked owns its new pool; never put the same thread in two pools.
+    const pool =
+      cards.find((other) => other.activeThreadId === threadId)?.activePool ??
+      (model === null ? parked.pool : Rules.poolOf(pools, model));
+    const used = Rules.poolThreads(cards, yield* boardHolds(card.boardId)).get(pool) ?? new Set();
+    const slots = pools.find((entry) => entry.key === pool)?.slots ?? 0;
+    const admitted = used.size + (used.has(threadId) ? 0 : 1);
+    if (admitted > slots) {
+      yield* logEvent(card, { _tag: "system", component: "dispatcher" }, "thread", {
+        body: `Restored parked work thread over pool cap: ${pool} (${admitted}/${slots})`,
+      });
+      yield* recordAnalytics({
+        kind: "kanban.owner_restore_over_cap",
+        boardId: card.boardId,
+        cardId: card.id,
+        threadId,
+        props: { poolKey: pool, used: admitted, slots },
+      });
+    }
+    return {
+      ...base,
+      stage: "working" as const,
+      activeThreadId: threadId,
+      activeRole: "work" as const,
+      activePool: pool,
+    };
+  });
+
   const wakeReviewedEvaluator = Effect.fn("KanbanService.wakeReviewedEvaluator")(function* (
     cardId: KanbanCardId,
   ) {
@@ -6074,7 +6183,7 @@ const make = Effect.gen(function* () {
       const board = yield* boardOf(card.boardId);
       const asked = yield* askedBy(card);
       const asker = Asks.openBlockingAsk(card)?.by ?? asked?.actor;
-      const back = asked?.fromStage ?? "todo";
+      const back = card.ownerPark?.stage ?? asked?.fromStage ?? "todo";
       // A card asked about mid-review reruns its step; one whose chain already
       // passed was only waiting (on its PRs or the evaluator) and goes back to
       // waiting, so the last reviewer isn't woken for a step it cleared.
@@ -6093,7 +6202,7 @@ const make = Effect.gen(function* () {
               subtask.state === "skipped" ? "skip" : "do",
             ) !== null),
       );
-      const stage =
+      const fallback =
         back === "verified" && gated
           ? "completed"
           : back === "working"
@@ -6101,6 +6210,8 @@ const make = Effect.gen(function* () {
             : back === "in_review" && !reviewed
               ? "needs_review"
               : back;
+      next = yield* restoreOwnerPark(next, fallback);
+      const stage = next.stage;
       const workThread = card.workThreadId;
       const wake =
         workThread !== null &&
@@ -6164,7 +6275,9 @@ const make = Effect.gen(function* () {
     // Saved before anyone is told: the card's new state never waits on a thread.
     if (next !== card) {
       analyticsActors.set(next, answeredBy);
-      yield* saveCard(next);
+      const restored = unblock && next.stage === "working" && next.activeThreadId !== null;
+      yield* saveCard(next, undefined, false, restored ? "restore" : undefined);
+      if (restored) yield* dropHold(next.activeThreadId!, "join", next.id);
     }
     if (answeredBy._tag === "owner")
       for (const ask of next.asks) {
@@ -6187,6 +6300,9 @@ const make = Effect.gen(function* () {
       answered,
       told: [...told],
       unblockEvaluator,
+      ...(next.stage === "working" && next.activeThreadId !== null && unblock
+        ? { resumeThreadId: next.activeThreadId }
+        : {}),
     };
     const deferred = yield* effectSink;
     if (deferred !== undefined && !deferred.closed) {
@@ -6251,6 +6367,21 @@ const make = Effect.gen(function* () {
           current = yield* toEvaluator(current, text, note);
           if (current.evaluatorThreadId !== null) told.add(current.evaluatorThreadId);
         }
+      }
+      if (
+        notice.resumeThreadId !== undefined &&
+        !told.has(notice.resumeThreadId) &&
+        card.activeThreadId === notice.resumeThreadId
+      ) {
+        current = yield* deliver(
+          current,
+          { _tag: "thread", threadId: notice.resumeThreadId },
+          "Worker",
+          notice.resumeThreadId,
+          text,
+          note,
+        );
+        told.add(notice.resumeThreadId);
       }
       for (const ask of notice.answered) {
         const collapse = ask.by._tag === "evaluator" && evaluatorAskers.has(ask.by.threadId);
@@ -8228,15 +8359,19 @@ const make = Effect.gen(function* () {
               ownershipChange.actor.threadId !== existing) &&
             (view.runStartedAt === null ||
               Date.parse(view.runStartedAt) <= Date.parse(ownershipChange.at))
-          )
+          ) {
+            yield* recordDispatchSkip(card, "thread_stopping", yield* nowMillis);
             return;
+          }
           // A run predating a wake has not received its instructions yet.
           if (
             card.wakeNote !== null &&
             (view.runStartedAt === null ||
               !(Date.parse(view.runStartedAt) > Date.parse(card.movedAt)))
-          )
+          ) {
+            yield* recordDispatchSkip(card, "thread_running", yield* nowMillis);
             return;
+          }
           if (dispatch.role === "review") {
             const verdict = events.findLast(
               (event) =>
@@ -8675,6 +8810,56 @@ const make = Effect.gen(function* () {
     const waitingIds = new Set(waiting.map((entry) => entry.cardId as string));
     for (const [id, entry] of poolWaits)
       if (entry.boardId === board.id && !waitingIds.has(id)) poolWaits.delete(id);
+    const detached = cards.filter(
+      (card) =>
+        card.stage === "todo" &&
+        card.activeThreadId === null &&
+        card.workThreadId !== null &&
+        card.settledAt === null,
+    );
+    const links = new Map(
+      (yield* store.threadLinksByIds(detached.map((card) => card.workThreadId!))).map((link) => [
+        link.threadId,
+        link,
+      ]),
+    );
+    const byCard = new Map(cards.map((card) => [card.id as string, card]));
+    const liveIds = new Set<string>();
+    for (const card of detached) {
+      const link = links.get(card.workThreadId!);
+      if (link === undefined || link.endedAt !== null) continue;
+      liveIds.add(card.id);
+      const reason = kanbanWaiting(card)
+        ? `wait:${card.wait!.on}`
+        : Asks.openBlockingAsk(card) !== undefined
+          ? "owner_ask"
+          : Rules.isBlocked(card, byCard)
+            ? "blocked"
+            : board.pause !== null && !board.pause.keep.includes(card.id)
+              ? "paused"
+              : board.setup?.status === "running"
+                ? "setup"
+                : kanbanWaitsOnEvaluator(card) || kanbanDeciding(card, now)
+                  ? "evaluator_step"
+                  : card.stalled !== null
+                    ? `stalled:${BoardAnalytics.reasonClass(card.stalled.reason, undefined, card.stalled.by._tag)}`
+                    : card.priority === KANBAN_BACKLOG
+                      ? "backlog"
+                      : Retries.heldForRetry(card, now)
+                        ? "retry"
+                        : attempted.has(card.id)
+                          ? "attempted"
+                          : waitingIds.has(card.id)
+                            ? "pool_full"
+                            : "none";
+      const prior = dispatchSkips.get(card.id);
+      // startCard can give a more precise reason than the pass's attempted set.
+      if (attempted.has(card.id) && prior?.movedAt === card.movedAt && now - prior.at < 60_000)
+        continue;
+      yield* recordDispatchSkip(card, reason, now);
+    }
+    for (const [id, entry] of dispatchSkips)
+      if (entry.boardId === board.id && !liveIds.has(id)) dispatchSkips.delete(id);
     const hour = Math.floor(now / 3_600_000);
     if (poolHours.get(board.id) !== hour) {
       const usage = Rules.poolThreads(cards, holds);
@@ -14985,7 +15170,7 @@ const make = Effect.gen(function* () {
               if (ownReviewHandoff) yield* checkCardThread(card, actor, role, true);
               return yield* failWith(
                 "denied",
-                `card #${card.number} has no thread attached: you can only move it to needs_review; use card_ask for an owner question`,
+                `card #${card.number} has no thread attached: use card_claim to return to working when a slot is available, or card_move to needs_review; use card_ask for an owner question`,
               );
             }
           }
@@ -17173,23 +17358,26 @@ const make = Effect.gen(function* () {
           );
           return yield* cardOf(cardId);
         }
+        const restored =
+          card.stage === "needs_owner" ? yield* restoreOwnerPark(card, "todo") : card;
+        const stage =
+          restored.stage === "working"
+            ? "working"
+            : card.stage === "needs_review"
+              ? "needs_review"
+              : "todo";
         const next: KanbanCard = {
           // Woken out of Needs Owner: the wake text stands in for the answer.
           ...Asks.closeAsks(
-            yield* moveWait(
-              card,
-              card.stage === "needs_review" ? "needs_review" : "todo",
-              at,
-              actor,
-            ),
+            yield* moveWait(restored, stage, at, actor),
             at,
             (ask) => ask.blocking && card.stage === "needs_owner",
           ),
-          stage: card.stage === "needs_review" ? "needs_review" : "todo",
+          stage,
           stalled: null,
           question: null,
           settledAt: null,
-          wakeNote,
+          wakeNote: stage === "working" ? null : wakeNote,
           movedAt: card.stage === "todo" || card.stage === "needs_review" ? card.movedAt : at,
           updatedAt: at,
         };
@@ -17198,7 +17386,23 @@ const make = Effect.gen(function* () {
           toStage: next.stage,
           body: "Woken",
         });
-        yield* saveCard(next);
+        yield* saveCard(next, undefined, false, next.stage === "working" ? "restore" : undefined);
+        if (next.stage === "working" && next.activeThreadId !== null) {
+          yield* dropHold(next.activeThreadId, "join", next.id);
+          yield* later(
+            next.boardId,
+            cardLane(next),
+            {
+              kind: "send",
+              threadId: next.activeThreadId,
+              text: wakeNote ?? "Continue after the owner wait",
+            },
+            threads.send({
+              threadId: next.activeThreadId,
+              text: wakeNote ?? "Continue after the owner wait",
+            }),
+          );
+        }
         assignmentFailures.delete(card.id);
         if (card.settledAt !== null && card.discussionId !== null) {
           const discussion = yield* store.discussion(card.discussionId);
