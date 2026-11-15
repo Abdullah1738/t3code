@@ -213,6 +213,32 @@ export function applyReviewResult(
 export const reviewFinished = (card: KanbanCard, chainLength: number) =>
   card.reviewStep >= Math.max(chainLength, 1);
 
+const REVIEW_EVALUATOR_WAKE_MS = 6 * 60 * 60_000;
+
+/** All remaining steps, including later ones, must belong to the evaluator or scripts. */
+export const inReviewEvaluatorStepsOnly = (card: KanbanCard) => {
+  const open = card.subtasks.filter((subtask) => subtask.state === "open");
+  return (
+    card.stage === "in_review" &&
+    card.activeThreadId === null &&
+    card.settledAt === null &&
+    card.stalled === null &&
+    card.priority !== KANBAN_BACKLOG &&
+    card.reviewStep > 0 &&
+    card.reviewFindingsPending !== true &&
+    !kanbanWaiting(card) &&
+    !kanbanDeciding(card) &&
+    !card.asks.some((ask) => ask.closedAt === null && ask.blocking) &&
+    open.length > 0 &&
+    open.every((subtask) => subtask.owner === "evaluator" || subtask.owner === "script")
+  );
+};
+
+export const reviewEvaluatorWakeDue = (card: KanbanCard, chainLength: number, nowMs: number) =>
+  inReviewEvaluatorStepsOnly(card) &&
+  reviewFinished(card, chainLength) &&
+  (card.nudgedAt === null || nowMs - Date.parse(card.nudgedAt) >= REVIEW_EVALUATOR_WAKE_MS);
+
 /** A queued review keeps its thread identity, including between chain steps. */
 export const reviewThreadToReuse = (board: KanbanBoard, card: KanbanCard) =>
   card.settledAt === null &&

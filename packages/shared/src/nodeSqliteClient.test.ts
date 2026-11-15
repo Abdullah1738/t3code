@@ -423,6 +423,7 @@ for (const [name, clientLayer] of [
         Effect.gen(function* () {
           const sql = yield* SqlClient.SqlClient;
           const observed: SqliteClient.SqliteStatementObservation[] = [];
+          const timings: SqliteClient.SqliteStatementObservation[] = [];
           const observer: SqliteClient.SqliteStatementObserver = {
             slowThresholdMs: 0,
             record: (entry) =>
@@ -439,7 +440,14 @@ for (const [name, clientLayer] of [
             );
           }).pipe(
             Effect.provideService(SqliteClient.StatementObserver, observer),
+            Effect.provideService(SqliteClient.StatementTimingObserver, (entry) => {
+              timings.push(entry);
+            }),
             Effect.withSpan("ObservedService.query"),
+          );
+          assert.deepEqual(
+            timings.map((entry) => [entry.operation, entry.connection, entry.outcome]),
+            observed.map((entry) => [entry.operation, entry.connection, entry.outcome]),
           );
           assert.deepEqual(
             observed.map((entry) => [entry.operation, entry.connection, entry.outcome]),
@@ -644,8 +652,17 @@ it.effect("observes worker-reader statements with their lane and no query conten
   withReaderClient((sql) =>
     Effect.gen(function* () {
       const observed: SqliteClient.SqliteStatementObservation[] = [];
+      const timings: SqliteClient.SqliteStatementObservation[] = [];
+      const acquiredLanes: Array<SqliteClient.ReaderLaneName | undefined> = [];
       const rows = yield* sql`SELECT name FROM entries`.pipe(
         SqliteClient.readOnly,
+        Effect.provideService(SqliteClient.StatementTimingObserver, (entry) => {
+          timings.push(entry);
+        }),
+        Effect.provideService(SqliteClient.ReaderWaitObserver, (ms, lane) => {
+          assert.isAtLeast(ms, 0);
+          acquiredLanes.push(lane);
+        }),
         Effect.provideService(SqliteClient.StatementObserver, {
           slowThresholdMs: 0,
           record: (entry) =>
@@ -659,6 +676,12 @@ it.effect("observes worker-reader statements with their lane and no query conten
         observed.map((entry) => [entry.operation, entry.connection, entry.lane]),
         [["read", "reader", "background"]],
       );
+      assert.deepEqual(acquiredLanes, ["background"]);
+      assert.deepEqual(
+        timings.map((entry) => [entry.operation, entry.connection, entry.lane]),
+        [["read", "reader", "background"]],
+      );
+      assert.equal(timings[0]?.durationMs, observed[0]?.durationMs);
       assert.isFalse(JSON.stringify(observed).includes("entries"));
     }),
   ),
@@ -981,9 +1004,16 @@ it.effect.each(["reader", "writer", "writer worker"] as const)(
             );
           }
           for (const span of statements.slice(0, 2)) {
+            assert.equal(span.attributes.get("db.connection.reused"), true);
+            assert.equal(
+              span.attributes.get("db.reader.slot"),
+              spans[0]!.attributes.get("db.reader.slot"),
+            );
             assert.deepEqual(
               [...span.attributes].filter(
-                ([key]) => key.startsWith("db.reader.") || key === "db.lock_wait_ms",
+                ([key]) =>
+                  (key.startsWith("db.reader.") && key !== "db.reader.slot") ||
+                  key === "db.lock_wait_ms",
               ),
               connection === "reader" ? [["db.reader.lane", "background"]] : [],
             );
@@ -993,6 +1023,8 @@ it.effect.each(["reader", "writer", "writer worker"] as const)(
             );
           }
           const plain = statements[2]!;
+          assert.isFalse(plain.attributes.has("db.connection.reused"));
+          assert.isFalse(spans[0]!.attributes.has("db.connection.reused"));
           assert.equal(plain.attributes.get("db.lock_wait_ms"), 0);
           assert.equal(plain.attributes.get("db.reader.acquired"), true);
           assert.equal(plain.attributes.get("db.reader.waiting"), false);
@@ -1048,6 +1080,7 @@ it.effect.each(["tracer", "propagation"] as const)(
         const parent = spans.find((span) => span.name === "sqlite")!;
         assert.isDefined(parent);
         assert.isFalse(parent.attributes.has("db.connection"));
+        assert.isFalse(parent.attributes.has("db.connection.reused"));
         assert.isFalse(parent.attributes.has("db.reader.lane"));
       }),
     );
@@ -1895,6 +1928,50 @@ it.effect("keeps WAL backpressure active before startup activation", () =>
       }),
     { checkpointWorkerStart: Effect.never },
   ),
+);
+
+it.effect(
+  "attributes a blocked pre-BEGIN checkpoint separately from transaction work",
+  () => {
+    const spans: Tracer.NativeSpan[] = [];
+    const tracer = Tracer.make({
+      span: (options) => {
+        const span = new Tracer.NativeSpan(options);
+        spans.push(span);
+        return span;
+      },
+    });
+    return withCheckpointClient((sql, filename) =>
+      Effect.gen(function* () {
+        const worker = startedWorkers.at(-1)!;
+        const { reader, checkpointRequests } = yield* blockCheckpointBehindReader(
+          sql,
+          filename,
+          worker,
+        );
+        const bodyEntered = yield* Deferred.make<void>();
+        const waiting = writerWaiting(writerWorkers.at(-1)!);
+        const transaction = yield* sql
+          .withTransaction(
+            Deferred.succeed(bodyEntered, undefined).pipe(
+              Effect.andThen(sql`INSERT INTO entries VALUES (1)`),
+            ),
+          )
+          .pipe(Effect.withTracer(tracer), Effect.forkChild);
+        yield* Effect.promise(() => waiting);
+        assert.isUndefined(transaction.pollUnsafe());
+        assert.isFalse(yield* Deferred.isDone(bodyEntered));
+        reader.exec("ROLLBACK");
+        checkpointRequests.release();
+        yield* Fiber.join(transaction);
+        assert.isTrue(yield* Deferred.isDone(bodyEntered));
+        const span = spans.find((span) => span.name === "sql.transaction")!;
+        assert.isAbove(Number(span.attributes.get("db.writer.checkpoint_wait_ms")), 0);
+        assert.deepEqual(yield* sql`SELECT value FROM entries`, [{ value: 1 }]);
+      }),
+    );
+  },
+  { skip: !supportsNoopCheckpoint },
 );
 
 it.effect("checkpoints the WAL on the worker instead of the writer", () =>

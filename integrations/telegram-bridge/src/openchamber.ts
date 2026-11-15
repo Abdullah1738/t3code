@@ -108,6 +108,15 @@ export interface BoardSnapshot {
   syncError?: string | null;
 }
 
+export interface BoardTelemetry {
+  boardFetches: number;
+  boardCacheHits: number;
+  boardFetchErrors: number;
+  boardBackoffMs: number;
+  lastFetchDurationMs: number | null;
+  lastFetchReason: "dirty" | "age" | "cold" | null;
+}
+
 export interface AutoAcceptPolicy {
   defaultEnabled: boolean;
   sessions: Record<string, boolean>;
@@ -208,8 +217,8 @@ export interface AlertBackend {
   readonly brand?: { app: string; board: string };
   health(): Promise<{ status: string; openchamberVersion?: string; [key: string]: unknown } | undefined>;
   sessionBoard(): Promise<BoardSnapshot>;
+  boardStatus?(): BoardTelemetry | undefined;
   getSession(id: string, directory: string): Promise<SessionRecord | undefined>;
-  statuses(): Promise<Record<string, SessionStatus>>;
   permissions(directory: string): Promise<PermissionRequest[]>;
   questions(directory: string): Promise<QuestionRequest[]>;
   /**

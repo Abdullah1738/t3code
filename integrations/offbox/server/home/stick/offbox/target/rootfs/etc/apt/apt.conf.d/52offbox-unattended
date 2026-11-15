@@ -6,3 +6,4 @@ APT::Periodic::AutocleanInterval "7";
 Unattended-Upgrade::Automatic-Reboot "false";
 Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
 Dpkg::Options { "--force-confdef"; "--force-confold"; };
+// The pending-restart hook is in zz-offbox-restart-pending, after Ubuntu's 99needrestart.

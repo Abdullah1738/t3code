@@ -2,8 +2,8 @@ import { afterEach, expect, setSystemTime, test } from "bun:test";
 import { useToolLogFixture } from "./toollog-fixture.ts";
 import { Attention } from "../src/attention.ts";
 import { backendKind } from "../src/config.ts";
-import type { PendingRequest } from "../src/control.ts";
-import { boardEntry, RobobAlertBackend, runOrdinal } from "../src/robob.ts";
+import type { PendingRequest, ThreadSummary } from "../src/control.ts";
+import { ActiveThreadsBoard, boardEntry, RobobAlertBackend, runOrdinal, type RobobAlertOptions } from "../src/robob.ts";
 import { Store } from "../src/store.ts";
 
 type Thread = {
@@ -15,13 +15,15 @@ type Call = { method: string; path: string; body?: any };
 const now = Date.parse("2026-10-03T12:00:00Z");
 const servers: ReturnType<typeof Bun.serve>[] = [];
 const stores: Store[] = [];
+const attentions: Attention[] = [];
 afterEach(async () => {
+  for (const alerts of attentions.splice(0)) alerts.stop();
   setSystemTime();
   await Promise.all(servers.splice(0).map(server => server.stop(true)));
   for (const store of stores.splice(0)) store.db.close();
 });
 
-function fakeControl(events: string[] = []) {
+function fakeControl(events: string[] = [], options: Pick<RobobAlertOptions, "now" | "log" | "board"> = {}) {
   const threads = new Map<string, Thread>();
   const calls: Call[] = [];
   const summary = (thread: Thread) => ({
@@ -67,7 +69,7 @@ function fakeControl(events: string[] = []) {
     projectId: "p1", title: thread.threadId, origin: null, runtimeMode: "approval-required", worktreePath: null, parentThreadId: null,
     state: "idle", latestRunId: null, pending: [], ...thread,
   });
-  const backend = new RobobAlertBackend({ url: server.url.origin, token: "test-token" });
+  const backend = new RobobAlertBackend({ url: server.url.origin, token: "test-token", ...options });
   return { threads, calls, add, backend };
 }
 
@@ -75,8 +77,264 @@ function attention(backend: RobobAlertBackend) {
   const store = new Store(":memory:");
   stores.push(store);
   const transport = { async editMessageText() {}, async answerCallback() {} };
-  return { store, attention: new Attention(store, backend, transport, { chatId: () => 100, spectrumSocket: "/nonexistent/router.sock" }) };
+  const alerts = new Attention(store, backend, transport, { chatId: () => 100, spectrumSocket: "/nonexistent/router.sock" });
+  attentions.push(alerts);
+  return { store, attention: alerts };
 }
+
+function cachedBoard() {
+  let at = 0;
+  let calls = 0;
+  const thread: ThreadSummary = {
+    threadId: "t", projectId: "p", title: "Private title", state: "running", status: "running", origin: null,
+    nativeSessionId: null, runtimeMode: "approval-required", parentThreadId: null, rootThreadId: "t", worktreePath: "/repo",
+    latestRunId: null, pendingRequest: null, createdAt: null, updatedAt: null,
+  };
+  const state = { threads: [thread], read: async () => ({ total: state.threads.length, threads: state.threads }) };
+  const warnings: string[] = [];
+  const client = { listThreads: async (filters: unknown) => {
+    expect(filters).toEqual({ active: true, limit: 500 });
+    calls++;
+    return state.read();
+  } };
+  const board = new ActiveThreadsBoard(client, { of: async () => "/repo" }, { now: () => at, log: event => warnings.push(event) });
+  return { board, state, thread, warnings, calls: () => calls, time: (value: number) => { at = value; } };
+}
+
+test("board reads are cached until 30 seconds old, with numeric telemetry only", async () => {
+  const h = cachedBoard();
+  expect(h.board.status()).toEqual({ boardFetches: 0, boardCacheHits: 0, boardFetchErrors: 0, boardBackoffMs: 0, lastFetchDurationMs: null, lastFetchReason: null });
+  const first = await h.board.snapshot();
+  for (const at of [1, 3_000, 10_000, 29_999]) {
+    h.time(at);
+    expect(await h.board.snapshot()).toBe(first);
+  }
+  expect(h.calls()).toBe(1);
+  expect(h.board.status()).toEqual({ boardFetches: 1, boardCacheHits: 4, boardFetchErrors: 0, boardBackoffMs: 0, lastFetchDurationMs: 0, lastFetchReason: "cold" });
+  h.time(30_000);
+  expect(await h.board.snapshot()).not.toBe(first);
+  expect(h.calls()).toBe(2);
+  expect(h.board.status().lastFetchReason).toBe("age");
+  expect(JSON.stringify(h.board.status())).not.toContain("Private title");
+});
+
+test("dirty board bursts respect the 3 second gap and remain dirty until fetched", async () => {
+  const h = cachedBoard();
+  const first = await h.board.snapshot();
+  for (let index = 0; index < 20; index++) {
+    h.time(index * 100);
+    h.board.markDirty();
+    expect(await h.board.snapshot()).toBe(first);
+  }
+  expect(h.calls()).toBe(1);
+  h.time(3_000);
+  await h.board.snapshot();
+  expect(h.calls()).toBe(2);
+  expect(h.board.status().lastFetchReason).toBe("dirty");
+  await h.board.snapshot();
+  expect(h.calls()).toBe(2);
+});
+
+test("concurrent board readers share the same fetch, including events during the fetch", async () => {
+  const h = cachedBoard();
+  let resolve!: (value: { total: number; threads: ThreadSummary[] }) => void;
+  h.state.read = () => new Promise(done => { resolve = done; });
+  const first = h.board.snapshot();
+  const second = h.board.snapshot();
+  expect(first).toBe(second);
+  h.board.markDirty();
+  h.time(75);
+  resolve({ total: 1, threads: [h.thread] });
+  expect((await Promise.all([first, second]))[0]).toBe(await second);
+  expect(h.calls()).toBe(1);
+  expect(h.board.status().lastFetchDurationMs).toBe(75);
+  h.state.read = async () => ({ total: 0, threads: [] });
+  h.time(3_075);
+  expect((await h.board.snapshot()).entries).toEqual([]);
+  expect(h.calls()).toBe(2);
+  expect(h.board.status().lastFetchReason).toBe("dirty");
+});
+
+test("a failed refresh serves the retained cache during backoff and then retries dirty", async () => {
+  const h = cachedBoard();
+  const first = await h.board.snapshot();
+  h.time(30_000);
+  h.state.read = async () => { h.time(30_025); throw new Error("private failure"); };
+  await expect(h.board.snapshot()).rejects.toThrow("private failure");
+  expect(h.board.status()).toMatchObject({ boardFetches: 2, boardFetchErrors: 1, boardBackoffMs: 5_000, lastFetchDurationMs: 25, lastFetchReason: "age" });
+  expect(await h.board.snapshot()).toBe(first);
+  h.time(35_024);
+  expect(await h.board.snapshot()).toBe(first);
+  expect(h.calls()).toBe(2);
+  let resolve!: (value: { total: number; threads: ThreadSummary[] }) => void;
+  h.state.read = () => new Promise(done => { resolve = done; });
+  h.time(35_025);
+  const retry = h.board.snapshot();
+  expect(h.calls()).toBe(3);
+  resolve({ total: 1, threads: [h.thread] });
+  expect((await retry).entries).toEqual(first.entries);
+  expect(h.board.status().lastFetchReason).toBe("dirty");
+  expect(h.board.status().boardBackoffMs).toBe(0);
+});
+
+test("a cold failure does not strand the single-flight promise", async () => {
+  const h = cachedBoard();
+  h.state.read = async () => { throw new Error("unavailable"); };
+  await expect(h.board.snapshot()).rejects.toThrow();
+  await expect(h.board.snapshot()).rejects.toThrow();
+  expect(h.calls()).toBe(1);
+  h.state.read = async () => ({ total: 1, threads: [h.thread] });
+  h.time(5_000);
+  expect((await h.board.snapshot()).entries).toHaveLength(1);
+  expect(h.calls()).toBe(2);
+});
+
+test("consecutive failures back off 5, 10, 20, 40, 60 seconds and reset after success", async () => {
+  const h = cachedBoard();
+  const attempts: number[] = [];
+  let at = 0;
+  h.state.read = async () => { attempts.push(at); throw new Error("unavailable"); };
+  for (const [start, delay] of [[0, 5_000], [5_000, 10_000], [15_000, 20_000], [35_000, 40_000], [75_000, 60_000], [135_000, 60_000]]) {
+    at = start!;
+    h.time(at);
+    await expect(h.board.snapshot()).rejects.toThrow();
+    expect(h.board.status().boardBackoffMs).toBe(delay!);
+    at += delay! - 1;
+    h.time(at);
+    h.board.markDirty();
+    await expect(h.board.snapshot()).rejects.toThrow();
+    expect(h.calls()).toBe(attempts.length);
+  }
+  expect(attempts).toEqual([0, 5_000, 15_000, 35_000, 75_000, 135_000]);
+  h.time(195_000);
+  h.state.read = async () => ({ total: 1, threads: [h.thread] });
+  await h.board.snapshot();
+  expect(h.board.status().boardBackoffMs).toBe(0);
+  h.time(198_000);
+  h.board.markDirty();
+  h.state.read = async () => { throw new Error("unavailable"); };
+  await expect(h.board.snapshot()).rejects.toThrow();
+  expect(h.board.status().boardBackoffMs).toBe(5_000);
+});
+
+test("soft metadata churn waits fifteen seconds, and hard events override the soft wait", async () => {
+  const h = cachedBoard();
+  const first = await h.board.snapshot();
+  for (const at of [1_000, 3_000, 14_999]) {
+    h.time(at);
+    h.board.markDirty("soft");
+    expect(await h.board.snapshot()).toBe(first);
+  }
+  h.time(15_000);
+  await h.board.snapshot();
+  expect(h.calls()).toBe(2);
+  h.time(18_000);
+  h.board.markDirty("soft");
+  await h.board.snapshot();
+  expect(h.calls()).toBe(2);
+  h.board.markDirty("hard");
+  h.board.markDirty("soft");
+  await h.board.snapshot();
+  expect(h.calls()).toBe(3);
+});
+
+test.each([false, true])("steady idle/metadata-churn fetch count, churn=%j", async churn => {
+  const h = cachedBoard();
+  for (let at = 0; at < 180_000; at += 250) {
+    h.time(at);
+    if (churn) h.board.markDirty("soft");
+    await h.board.snapshot();
+  }
+  expect(h.calls()).toBe(churn ? 12 : 6);
+});
+
+test("the full 500-row roster is mapped and warns once per ten minutes, before filtering iMessage", async () => {
+  const h = cachedBoard();
+  h.state.threads = Array.from({ length: 500 }, (_, index) => ({ ...h.thread, threadId: `t-${index}`, origin: index === 499 ? "imessage" : null }));
+  const first = await h.board.snapshot();
+  expect(first.entries).toHaveLength(499);
+  expect(first.entries.at(-1)?.sessionId).toBe("t-498");
+  expect(h.warnings).toEqual(["board-roster-at-limit"]);
+  for (const at of [30_000, 599_999, 600_000, 602_998]) {
+    h.time(at);
+    h.board.markDirty();
+    await h.board.snapshot();
+  }
+  expect(h.warnings).toHaveLength(1);
+  h.time(602_999);
+  await h.board.snapshot();
+  expect(h.warnings).toEqual(["board-roster-at-limit", "board-roster-at-limit"]);
+});
+
+test("plain message wakes do not refetch; dirtying control events do, subject to the gap", async () => {
+  let at = now;
+  const control = fakeControl([], { now: () => at });
+  control.add({ threadId: "t", state: "running" });
+  await control.backend.sessionBoard();
+  const { attention: alerts } = attention(control.backend);
+  const reads = () => control.calls.filter(call => call.path.startsWith("/threads?")).length;
+  at += 4_000;
+  for (let index = 0; index < 20; index++) {
+    alerts.processNotification({ type: "wake" });
+    alerts.processNotification((await control.backend.notification({ type: "message.completed", threadId: "t", role: "user" }))!);
+    await alerts.tick();
+  }
+  expect(reads()).toBe(1);
+  for (let index = 0; index < 20; index++) {
+    at += 100;
+    await control.backend.notification({ type: "thread.status", threadId: "t", state: "queued" });
+    await control.backend.sessionBoard();
+  }
+  expect(reads()).toBe(2);
+  at += 3_000;
+  await control.backend.sessionBoard();
+  expect(reads()).toBe(3);
+});
+
+type DirtyEvent = [Record<string, unknown>, boolean];
+test.each<DirtyEvent>([
+  [{ type: "ready" }, true],
+  [{ type: "thread.created" }, true],
+  ...["running", "waiting", "idle", "queued", "needs-input"].map<DirtyEvent>(state => [{ type: "thread.status", state }, true]),
+  ...["request.opened", "request.resolved"].map<DirtyEvent>(type => [{ type, kind: "approval", requestId: "r" }, true]),
+  ...["thread.archived", "thread.unarchived", "thread.deleted", "thread.settled", "thread.unsettled",
+    "thread.runtime-mode-updated", "run.created", "run.updated", "runtime-request.updated"].map<DirtyEvent>(change => [{ type: "thread.updated", change }, true]),
+  ...["thread.model-selection-updated", "thread.interaction-mode-updated", "thread.renamed", "message.updated"].map<DirtyEvent>(change => [{ type: "thread.updated", change }, false]),
+  ...["user", "assistant"].map<DirtyEvent>(role => [{ type: "message.completed", role }, false]),
+])("board dirty classification: %j => %s", async (data, dirty) => {
+  let at = now;
+  const control = fakeControl([], { now: () => at });
+  control.add({ threadId: "t", state: "running" });
+  await control.backend.sessionBoard();
+  at += 3_000;
+  await control.backend.notification({ threadId: "t", ...data });
+  await control.backend.sessionBoard();
+  expect(control.backend.boardStatus()?.boardFetches).toBe(dirty ? 2 : 1);
+});
+
+test.each(["thread.metadata-updated", "thread.provider-switched", "future-change", undefined])("ambiguous updates use the soft gap: %j", async change => {
+  let at = now;
+  const control = fakeControl([], { now: () => at });
+  control.add({ threadId: "t", state: "running" });
+  await control.backend.sessionBoard();
+  for (let index = 1; index <= 59; index++) {
+    at = now + index * 250;
+    await control.backend.notification({ type: "thread.updated", threadId: "t", change });
+    await control.backend.sessionBoard();
+  }
+  expect(control.backend.boardStatus()?.boardFetches).toBe(1);
+  at = now + 15_000;
+  await control.backend.sessionBoard();
+  expect(control.backend.boardStatus()?.boardFetches).toBe(2);
+});
+
+test("a review board stand-in needs no dirty or telemetry hooks", async () => {
+  const h = cachedBoard();
+  const control = fakeControl([], { board: { snapshot: () => h.board.snapshot() } });
+  await control.backend.notification({ type: "ready" });
+  expect((await control.backend.sessionBoard()).entries).toHaveLength(1);
+  expect(control.backend.boardStatus()).toBeUndefined();
+});
 
 test("backend switch defaults to OpenChamber", () => {
   expect(backendKind({}, {})).toBe("openchamber");
@@ -279,6 +537,88 @@ test("a request in a folder the board does not list is still found, such as a su
   setSystemTime(now + 20_000);
   await alerts.tick();
   expect(store.pendingOutbox().map(entry => entry.text)).toEqual([expect.stringContaining("needs your approval")]);
+});
+
+test("an asked event outside the cached roster still sends a prompt after the usual five seconds", async () => {
+  setSystemTime(now);
+  const control = fakeControl([], { now: () => Date.now() });
+  const { store, attention: alerts } = attention(control.backend);
+  await alerts.tick();
+  control.add({ threadId: "hidden", state: "idle", pending: [{ requestId: "q-hidden", kind: "question", requestKind: "user_input",
+    canRespond: true, questions: [{ id: "ship", header: "Ship", question: "Ship?", options: [{ label: "yes", description: "" }] }] }] });
+  setSystemTime(now + 1_000);
+  const event = await control.backend.notification({ type: "request.opened", threadId: "hidden", requestId: "q-hidden", kind: "question" });
+  alerts.processNotification(event!);
+  await alerts.tick();
+  expect(control.backend.boardStatus()?.boardFetches).toBe(1);
+  expect(store.pendingSessionNotices()).toHaveLength(1);
+  setSystemTime(now + 6_000);
+  await alerts.tick();
+  expect(store.pendingOutbox().map(entry => entry.text)).toEqual([expect.stringContaining("Ship?")]);
+  expect(alerts.status().board).toEqual(control.backend.boardStatus());
+});
+
+test("a status event discovers requests inside the board gap even without an asked event", async () => {
+  setSystemTime(now);
+  const control = fakeControl([], { now: () => Date.now() });
+  control.add({ threadId: "t", state: "waiting" });
+  const { store, attention: alerts } = attention(control.backend);
+  await alerts.tick();
+  control.threads.get("t")!.pending = [{ requestId: "q-status", kind: "question", requestKind: "user_input", canRespond: true,
+    questions: [{ id: "env", header: "Env", question: "Where?", options: [{ label: "dev", description: "" }] }] }];
+  setSystemTime(now + 1_000);
+  alerts.processNotification((await control.backend.notification({ type: "thread.status", threadId: "t", state: "needs-input" }))!);
+  await alerts.tick();
+  expect(control.backend.boardStatus()?.boardFetches).toBe(1);
+  expect(control.calls.filter(call => call.path === "/requests")).toHaveLength(2);
+  expect(store.pendingSessionNotices().map(notice => [notice.requestId, notice.firstSeen])).toEqual([["q-status", now + 1_000]]);
+  setSystemTime(now + 6_000);
+  await alerts.tick();
+  expect(store.pendingOutbox().map(entry => entry.text)).toEqual([expect.stringContaining("Where?")]);
+});
+
+test("asked and resolved events record notices while the board fetch is still in flight", async () => {
+  const h = cachedBoard();
+  let resolve!: (value: { total: number; threads: ThreadSummary[] }) => void;
+  h.state.read = () => new Promise(done => { resolve = done; });
+  const control = fakeControl([], { board: h.board });
+  control.add({ threadId: "t" });
+  const { store, attention: alerts } = attention(control.backend);
+  const refresh = control.backend.sessionBoard();
+  alerts.processNotification((await control.backend.notification({ type: "request.opened", threadId: "t", requestId: "q", kind: "question" }))!);
+  const [notice] = store.pendingSessionNotices();
+  expect(notice).toMatchObject({ requestId: "q", state: "pending" });
+  alerts.processNotification((await control.backend.notification({ type: "request.resolved", threadId: "t", requestId: "q", kind: "question" }))!);
+  expect(store.sessionNotice(notice!.id)?.state).toBe("cancelled");
+  expect(h.calls()).toBe(1);
+  resolve({ total: 1, threads: [h.thread] });
+  await refresh;
+});
+
+test.each([
+  ["request.opened", "before"], ["request.opened", "during"], ["thread.status", "before"], ["thread.status", "during"],
+])("%s %s a slow board read still surfaces the prompt in five seconds", async (type, timing) => {
+  setSystemTime(now);
+  const h = cachedBoard();
+  let resolve!: (value: { total: number; threads: ThreadSummary[] }) => void;
+  h.state.read = () => new Promise(done => { resolve = done; });
+  const control = fakeControl([], { board: h.board });
+  control.add({ threadId: "t", state: "needs-input", pending: [{ requestId: "q-slow", kind: "question", requestKind: "user_input",
+    canRespond: true, questions: [{ id: "env", header: "Env", question: "Where?", options: [{ label: "dev", description: "" }] }] }] });
+  const { store, attention: alerts } = attention(control.backend);
+  const tick = timing === "during" ? alerts.tick() : undefined;
+  alerts.processNotification((await control.backend.notification({ type, threadId: "t", state: "needs-input", requestId: "q-slow", kind: "question" }))!);
+  await (tick ?? alerts.tick());
+  expect(store.pendingSessionNotices()).toHaveLength(1);
+  expect(store.pendingOutbox()).toEqual([]);
+  setSystemTime(now + 5_000);
+  await alerts.tick();
+  expect(store.pendingOutbox().map(entry => entry.text)).toEqual([expect.stringContaining("Where?")]);
+  expect(h.calls()).toBe(1);
+  alerts.processNotification((await control.backend.notification({ type: "request.resolved", threadId: "t", requestId: "q-slow", kind: "question" }))!);
+  expect(store.pendingOutbox()).toEqual([]);
+  resolve({ total: 1, threads: [h.thread] });
+  await control.backend.sessionBoard();
 });
 
 useToolLogFixture();

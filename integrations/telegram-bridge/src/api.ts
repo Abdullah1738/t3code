@@ -99,7 +99,7 @@ export function createApi({ store, enabled, chatId, timezone, health }: Options)
       if (request.method === "GET") {
         if (path === "/health") {
           const state = health();
-          // Project known scalar health fields, never config, errors, or credentials.
+          // Project known health fields, never config, errors, or credentials.
           const safe: Record<string, unknown> = {};
           for (const key of ["ok", "connected", "telegramConnected", "openchamberConnected"]) {
             if (typeof state[key] === "boolean") safe[key] = state[key];
@@ -109,6 +109,19 @@ export function createApi({ store, enabled, chatId, timezone, health }: Options)
             if (typeof value === "number" && Number.isFinite(value) && value >= 0) safe[key] = value;
           }
           if (["ok", "healthy", "degraded", "starting", "stopped"].includes(state.status as string)) safe.status = state.status;
+          if (state.board && typeof state.board === "object" && !Array.isArray(state.board)) {
+            const board = state.board as Record<string, unknown>;
+            const counters: Record<string, unknown> = {};
+            for (const key of ["boardFetches", "boardCacheHits", "boardFetchErrors", "boardBackoffMs", "lastFetchDurationMs"]) {
+              const value = board[key];
+              if (typeof value === "number" && Number.isFinite(value) && value >= 0) counters[key] = value;
+            }
+            if (board.lastFetchDurationMs === null) counters.lastFetchDurationMs = null;
+            if (board.lastFetchReason === null || ["dirty", "age", "cold"].includes(board.lastFetchReason as string)) {
+              counters.lastFetchReason = board.lastFetchReason;
+            }
+            safe.board = counters;
+          }
           const active = enabled();
           const paired = chatId() !== undefined;
           return json({ ...safe, enabled: active, paired, ready: active && paired });

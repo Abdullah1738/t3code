@@ -247,6 +247,7 @@ const makeHarness = (
   // Failures the session check returns, in order, before it succeeds.
   authFailures: Array<unknown> = [],
   realSnapshots = false,
+  heldList?: { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
 ) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
@@ -305,6 +306,17 @@ const makeHarness = (
           const keep = (candidate: OrchestrationV2ThreadShell) =>
             ids.includes(candidate.id) && !vanished.has(candidate.id);
           return Ref.update(targetedReads, (reads) => [...reads, ids]).pipe(
+            Effect.andThen(
+              heldList === undefined
+                ? Effect.void
+                : sql
+                    .withTransaction(
+                      Deferred.succeed(heldList.entered, undefined).pipe(
+                        Effect.andThen(Deferred.await(heldList.release)),
+                      ),
+                    )
+                    .pipe(NodeSqliteClient.readOnly, Effect.orDie),
+            ),
             Effect.as({
               ...full,
               snapshotSequence: 0,
@@ -1358,7 +1370,48 @@ describe("control listings", () => {
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
-  // All listing forms must keep candidate reads AND summary enrichment on the request lane.
+  it.live("a held list transaction leaves both foreground slots available", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "control-held-list-" });
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const harness = yield* makeHarness(undefined, [], new Set(), [], false, {
+          entered,
+          release,
+        });
+        // Initialize lazy route layers without entering the held shell read.
+        assert.equal((yield* harness.get("/projects")).status, 200);
+        const list = yield* harness.get("/threads?active=true&limit=500").pipe(Effect.forkChild);
+        yield* Deferred.await(entered);
+        const first = yield* Deferred.make<void>();
+        const second = yield* Deferred.make<void>();
+        const probe = (ready: Deferred.Deferred<void>) =>
+          sql
+            .withTransaction(
+              sql`SELECT 1`.pipe(
+                Effect.andThen(Deferred.succeed(ready, undefined)),
+                Effect.andThen(Deferred.await(release)),
+              ),
+            )
+            .pipe(NodeSqliteClient.readOnly, NodeSqliteClient.foregroundReads, Effect.forkChild);
+        const one = yield* probe(first);
+        const two = yield* probe(second);
+        yield* Effect.all([Deferred.await(first), Deferred.await(second)]).pipe(
+          Effect.timeout("2 seconds"),
+          Effect.ensuring(Deferred.succeed(release, undefined)),
+        );
+        assert.equal((yield* Fiber.join(list)).status, 200);
+        yield* Fiber.join(one);
+        yield* Fiber.join(two);
+      }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  // Every listing form stays off the interactive reader slots, including enrichment.
   it.live.each([
     "limit=1",
     "limit=1&active=true",
@@ -1369,7 +1422,7 @@ describe("control listings", () => {
     "limit=1&origin=none",
     "limit=1&archived=true",
     "limit=1&includeSubagents=true",
-  ])("GET threads %s completes during a long candidate scan and a writer", (query) =>
+  ])("GET threads %s completes while foreground slots and the writer are held", (query) =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
@@ -1380,10 +1433,11 @@ describe("control listings", () => {
         assert.equal((yield* harness.get(`/threads?${query}`)).status, 200);
         const readerHeld = yield* Deferred.make<void>();
         const writerHeld = yield* Deferred.make<void>();
+        const secondReaderHeld = yield* Deferred.make<void>();
         const release = yield* Deferred.make<void>();
         const hold = (signal: Deferred.Deferred<void>) =>
           Deferred.succeed(signal, undefined).pipe(Effect.andThen(Deferred.await(release)));
-        // Model the old unbounded candidate scan's held snapshot, without a sleep.
+        // Occupy both foreground slots so the old list routing cannot pass.
         const reader = yield* sql
           .withTransaction(
             sql`SELECT thread_id, json_extract(payload_json, '$.lineage.parentThreadId')
@@ -1391,9 +1445,13 @@ describe("control listings", () => {
               Effect.andThen(hold(readerHeld)),
             ),
           )
-          .pipe(NodeSqliteClient.readOnly, NodeSqliteClient.backgroundReads, Effect.forkChild);
+          .pipe(NodeSqliteClient.readOnly, NodeSqliteClient.foregroundReads, Effect.forkChild);
+        const secondReader = yield* sql
+          .withTransaction(hold(secondReaderHeld))
+          .pipe(NodeSqliteClient.readOnly, NodeSqliteClient.foregroundReads, Effect.forkChild);
         const writer = yield* sql.withTransaction(hold(writerHeld)).pipe(Effect.forkChild);
         yield* Deferred.await(readerHeld);
+        yield* Deferred.await(secondReaderHeld);
         yield* Deferred.await(writerHeld);
         yield* Effect.gen(function* () {
           const responses = yield* Effect.all(
@@ -1404,7 +1462,6 @@ describe("control listings", () => {
             assert.equal(response.status, 200);
             assert.lengthOf(response.body.threads, 1);
           }
-          yield* sql`SELECT 1`.pipe(NodeSqliteClient.readOnly, NodeSqliteClient.foregroundReads);
           assert.isUndefined(reader.pollUnsafe());
           assert.isUndefined(writer.pollUnsafe());
           assert.equal(yield* Ref.get(harness.snapshotReads), 0);
@@ -1414,6 +1471,7 @@ describe("control listings", () => {
           Effect.ensuring(Deferred.succeed(release, undefined)),
         );
         yield* Fiber.join(reader);
+        yield* Fiber.join(secondReader);
         yield* Fiber.join(writer);
       }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),

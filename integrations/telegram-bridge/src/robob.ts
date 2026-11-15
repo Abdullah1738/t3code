@@ -1,8 +1,8 @@
 import type { NotificationEvent } from "./notification-events.ts";
 import { toolError } from "./toollog.ts";
 import {
-  IMESSAGE_ORIGIN, type AlertBackend, type BoardEntry, type BoardSnapshot, type PermissionRequest,
-  type QuestionRequest, type RequestReader, type SessionRecord, type SessionStatus,
+  IMESSAGE_ORIGIN, type AlertBackend, type BoardEntry, type BoardSnapshot, type BoardTelemetry, type PermissionRequest,
+  type QuestionRequest, type RequestReader, type SessionRecord,
 } from "./openchamber.ts";
 import {
   ControlClient, ControlError, epoch, permissionFrom, questionFrom, ThreadDirectories,
@@ -14,7 +14,21 @@ const BUSY = new Set<ThreadState>(["running", "needs-input", "queued"]);
 /** Where attention finds busy folders: Robob's active thread list, or a stand-in in tests. */
 export interface ReviewBoard {
   snapshot(): Promise<BoardSnapshot>;
+  markDirty?(reason?: "hard" | "soft"): void;
+  status?(): BoardTelemetry;
 }
+
+const BOARD_MAX_AGE = 30_000;
+const BOARD_MIN_GAP = 3_000;
+const BOARD_SOFT_GAP = 15_000;
+const BOARD_BACKOFF_MAX = 60_000;
+const BOARD_LIMIT = 500;
+const BOARD_LIMIT_WARNING_GAP = 10 * 60_000;
+type BoardOptions = { now?: () => number; log?: (event: string) => void };
+const HARD_BOARD_CHANGES = new Set([
+  "thread.archived", "thread.unarchived", "thread.deleted", "thread.settled", "thread.unsettled",
+  "thread.runtime-mode-updated", "run.created", "run.updated", "runtime-request.updated",
+]);
 
 /** The turn counter attention.ts uses as `workRevision`: the ordinal of the thread's newest run. */
 export function runOrdinal(runId: string | null | undefined): number {
@@ -49,20 +63,90 @@ export function boardEntry(thread: ThreadSummary, directory: string): BoardEntry
  * the shared `/requests` read.
  */
 export class ActiveThreadsBoard implements ReviewBoard {
-  constructor(private readonly client: Pick<ControlClient, "listThreads">, private readonly directories: ThreadDirectories) {}
+  private cache?: BoardSnapshot;
+  private fetchedAt = 0;
+  private dirty: "hard" | "soft" | undefined = "hard";
+  private fetching?: Promise<BoardSnapshot>;
+  private retryAt = 0;
+  private failure?: unknown;
+  private warnedAt = -Infinity;
+  private readonly now: () => number;
+  private readonly telemetry: BoardTelemetry = {
+    boardFetches: 0, boardCacheHits: 0, boardFetchErrors: 0, boardBackoffMs: 0, lastFetchDurationMs: null, lastFetchReason: null,
+  };
 
-  async snapshot(): Promise<BoardSnapshot> {
-    const { threads } = await this.client.listThreads({ active: true, limit: 500 });
-    const entries: BoardEntry[] = [];
-    for (const thread of threads) {
-      if (thread.origin === IMESSAGE_ORIGIN) continue;
-      entries.push(boardEntry(thread, await this.directories.of(thread)));
+  constructor(
+    private readonly client: Pick<ControlClient, "listThreads">,
+    private readonly directories: Pick<ThreadDirectories, "of">,
+    private readonly options: BoardOptions = {},
+  ) { this.now = options.now ?? Date.now; }
+
+  markDirty(reason: "hard" | "soft" = "hard"): void {
+    if (this.dirty !== "hard") this.dirty = reason;
+  }
+
+  status(): BoardTelemetry { return { ...this.telemetry }; }
+
+  snapshot(): Promise<BoardSnapshot> {
+    if (this.fetching) {
+      this.telemetry.boardCacheHits++;
+      return this.fetching;
     }
-    return { version: 1, revision: 0, activatedAt: 0, migrationComplete: true, entries, syncError: null };
+    const now = this.now();
+    if (now < this.retryAt) {
+      if (!this.cache) return Promise.reject(this.failure);
+      this.telemetry.boardCacheHits++;
+      return Promise.resolve(this.cache);
+    }
+    const age = now - this.fetchedAt;
+    const gap = this.dirty === "soft" ? BOARD_SOFT_GAP : BOARD_MIN_GAP;
+    if (this.cache && (age < gap || (!this.dirty && age < BOARD_MAX_AGE))) {
+      this.telemetry.boardCacheHits++;
+      return Promise.resolve(this.cache);
+    }
+    const reason = !this.cache ? "cold" : this.dirty ? "dirty" : "age";
+    this.fetching = this.fetch(reason).finally(() => { this.fetching = undefined; });
+    return this.fetching;
+  }
+
+  private async fetch(reason: NonNullable<BoardTelemetry["lastFetchReason"]>): Promise<BoardSnapshot> {
+    const startedAt = this.now();
+    const dirty = this.dirty;
+    // Events received during this fetch remain dirty after it completes.
+    this.dirty = undefined;
+    this.telemetry.boardFetches++;
+    this.telemetry.lastFetchReason = reason;
+    try {
+      const { threads } = await this.client.listThreads({ active: true, limit: BOARD_LIMIT });
+      if (threads.length === BOARD_LIMIT && this.now() - this.warnedAt >= BOARD_LIMIT_WARNING_GAP) {
+        this.warnedAt = this.now();
+        (this.options.log ?? console.warn)("board-roster-at-limit");
+      }
+      const entries: BoardEntry[] = [];
+      for (const thread of threads) {
+        if (thread.origin === IMESSAGE_ORIGIN) continue;
+        entries.push(boardEntry(thread, await this.directories.of(thread)));
+      }
+      this.cache = { version: 1, revision: 0, activatedAt: 0, migrationComplete: true, entries, syncError: null };
+      this.fetchedAt = this.now();
+      this.retryAt = 0;
+      this.failure = undefined;
+      this.telemetry.boardBackoffMs = 0;
+      return this.cache;
+    } catch (error) {
+      this.telemetry.boardFetchErrors++;
+      this.markDirty(dirty ?? "soft");
+      this.failure = error;
+      this.telemetry.boardBackoffMs = Math.min((this.telemetry.boardBackoffMs || 2_500) * 2, BOARD_BACKOFF_MAX);
+      this.retryAt = this.now() + this.telemetry.boardBackoffMs;
+      throw error;
+    } finally {
+      this.telemetry.lastFetchDurationMs = Math.max(0, this.now() - startedAt);
+    }
   }
 }
 
-export interface RobobAlertOptions extends ControlConfigOptions {
+export interface RobobAlertOptions extends ControlConfigOptions, BoardOptions {
   client?: ControlClient;
   board?: ReviewBoard;
 }
@@ -80,7 +164,7 @@ export class RobobAlertBackend implements AlertBackend {
   constructor(options: RobobAlertOptions = {}) {
     this.client = options.client ?? new ControlClient(options);
     this.directories = new ThreadDirectories(this.client);
-    this.board = options.board ?? new ActiveThreadsBoard(this.client, this.directories);
+    this.board = options.board ?? new ActiveThreadsBoard(this.client, this.directories, options);
   }
 
   private async resolve(id: string): Promise<string> {
@@ -115,6 +199,10 @@ export class RobobAlertBackend implements AlertBackend {
     return this.board.snapshot();
   }
 
+  markDirty(reason: "hard" | "soft" = "hard"): void { this.board.markDirty?.(reason); }
+
+  boardStatus(): BoardTelemetry | undefined { return this.board.status?.(); }
+
   async getSession(id: string): Promise<SessionRecord | undefined> {
     const { thread } = await this.client.thread(await this.resolve(id));
     return {
@@ -124,13 +212,6 @@ export class RobobAlertBackend implements AlertBackend {
       // Children carry their root's origin, so the iMessage family check sees it directly.
       metadata: { openchamber: { ...(thread.origin ? { origin: thread.origin } : {}) } },
     };
-  }
-
-  async statuses(): Promise<Record<string, SessionStatus>> {
-    const { threads } = await this.client.listThreads({ active: true, includeSubagents: true, limit: 500 });
-    const statuses: Record<string, SessionStatus> = {};
-    for (const thread of threads) if (BUSY.has(thread.state)) statuses[thread.threadId] = { type: "busy" };
-    return statuses;
   }
 
   /**
@@ -197,13 +278,22 @@ export class RobobAlertBackend implements AlertBackend {
    */
   async notification(data: Record<string, unknown>): Promise<NotificationEvent | undefined> {
     const type = data.type;
-    if (type === "ready") return { type: "invalidate" };
+    if (type === "ready") { this.markDirty(); return { type: "invalidate" }; }
     const threadId = typeof data.threadId === "string" && /^[^\p{Cc}]{1,4096}$/u.test(data.threadId) ? data.threadId : undefined;
     if (!threadId) return { type: "wake" };
-    if (type === "thread.updated") return data.change === "thread.runtime-mode-updated" ? { type: "invalidate" } : { type: "wake" };
-    if (type === "thread.created") return { type: "wake" };
+    if (type === "thread.updated") {
+      // Metadata updates also include worktree changes; the stream
+      // does not say which fields changed, so refresh them subject to the gap.
+      if (data.change !== "thread.model-selection-updated" && data.change !== "thread.interaction-mode-updated"
+        && data.change !== "thread.renamed" && data.change !== "message.updated") {
+        this.markDirty(HARD_BOARD_CHANGES.has(String(data.change)) ? "hard" : "soft");
+      }
+      return data.change === "thread.runtime-mode-updated" ? { type: "invalidate" } : { type: "wake" };
+    }
+    if (type === "thread.created") { this.markDirty(); return { type: "wake" }; }
     if (type !== "request.opened" && type !== "request.resolved" && type !== "thread.status" && type !== "message.completed") return;
     if (type === "message.completed" && data.role !== "user") return;
+    if (type !== "message.completed") this.markDirty();
     const directory = await this.directoryOf(threadId).catch(error => {
       toolError("telegram", "tg.robob.eventDirectory", { thread: threadId }, error); return undefined;
     });

@@ -808,6 +808,14 @@ export const rollup = (input: RollupInput) => {
   }
   const poolUsage = ledgerUsage(input, hourStarts, spans);
   idle.sort((left, right) => left.since.localeCompare(right.since));
+  const evaluatorOnly = input.cards
+    .filter(Rules.inReviewEvaluatorStepsOnly)
+    .map((card) => ({
+      card: card.number,
+      hours: hours(Math.max(0, time(until) - time(card.movedAt))),
+      lastWake: card.nudgedAt === null ? null : stamp(card.nudgedAt),
+    }))
+    .toSorted((left, right) => right.hours - left.hours || left.card - right.card);
   for (const [stage, entry] of Object.entries(stages)) {
     entry.hours = hours(entry.hours * HOUR);
     const list = (dwells.get(stage) ?? []).toSorted((left, right) => left - right);
@@ -1005,6 +1013,10 @@ export const rollup = (input: RollupInput) => {
       longest,
       openOver24h: { count: longOpen.length, byStage: longOpenByStage, ...capped(longOpen, max) },
       withoutThread: { count: idle.length, ...capped(idle, max) },
+      inReviewNoThreadWithEvaluatorStepsOnly: {
+        count: evaluatorOnly.length,
+        ...capped(evaluatorOnly, max),
+      },
     },
     stalls: { count: stallItems.length, ...capped(stallItems, max) },
     failures: { count: failureCount, byKind: failuresByKind, byPool: failures },

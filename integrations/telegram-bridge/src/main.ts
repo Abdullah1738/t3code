@@ -54,7 +54,7 @@ async function main(): Promise<void> {
   const token = process.env.TELEGRAM_BOT_TOKEN ?? "";
   const telegram = new Telegram(token, config.owner);
   const kind = backendKind(process.env, config);
-  const backend: AlertBackend = kind === "robob" ? new RobobAlertBackend()
+  const backend: AlertBackend = kind === "robob" ? new RobobAlertBackend({ log })
     : await backendConnection().then(connection => new OpenChamber(connection.baseUrl, connection.headers));
   if (mode === "check" || mode === "pair") {
     try {
@@ -109,6 +109,7 @@ async function main(): Promise<void> {
     uptimeSeconds: Math.floor((Date.now() - health.startedAt) / 1_000),
     lastEventAt: health.telegramLastOk,
     lastError: health.lastError,
+    board: backend.boardStatus?.(),
   }) });
   const attention = new Attention(store, backend, telegram, {
     chatId: () => chatId,

@@ -665,7 +665,7 @@ const makeRoutes = Effect.gen(function* () {
     Effect.forEach(
       chunkIds([...new Set(threadIds)]),
       (ids) =>
-        threads.getShellSnapshot({ threadIds: ids, location }).pipe(
+        threads.getShellSnapshot({ threadIds: ids, location, summaryOnly: true }).pipe(
           Effect.map((snapshot) => [...snapshot.threads, ...snapshot.archivedThreads]),
           Effect.mapError((cause) => fail("internal", errorDetail(cause))),
         ),
@@ -1168,7 +1168,7 @@ const makeRoutes = Effect.gen(function* () {
       threads: summaries,
       nextCursor: nextThreadListCursor(page, limit),
     });
-  }).pipe(NodeSqliteClient.foregroundReads);
+  }).pipe(NodeSqliteClient.backgroundReads);
 
   const getThread = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
