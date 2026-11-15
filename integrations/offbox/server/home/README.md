@@ -102,6 +102,34 @@ The installed system finds the marker on its next boot, points the firmware at t
   and never restart the machine.
 - `offbox-status` prints the state of all of that in a dozen lines.
 
+## Daily updates and planned restarts
+
+Security updates keep installing daily. `50-offbox.conf` defers needrestart restarts of Incus, lxcfs,
+boatd (including command runners), ZFS, Mullvad and the offbox host helpers. The Zabbly Incus origin is
+not in unattended-upgrades' allowed origins; keep package upgrades that restart Incus in planned windows.
+Other services retain needrestart's normal behavior.
+
+The `zz-offbox-restart-pending` apt hook runs after Ubuntu's `99needrestart`, then scans in batch/list-only mode and atomically writes `checkedAt` (UTC) and `services` to
+`/var/lib/offbox/restart-pending.json`. A failed scan preserves the previous record and never fails dpkg.
+This is a snapshot at the recorded time, not a restart request. The board reads it at the next planned
+release and schedules those restarts. Exact unit names can contain command/box identifiers, so the record
+stays on the host. The unauthenticated `/health` response exposes only
+`restartPending: {"count": N, "since": "UTC timestamp or null"}`; missing or malformed records give zero/null.
+
+Fresh installs copy the policy from the stick rootfs. Full host provisioning also installs it before apt
+runs. For an existing host, stage the reviewed `install-host.sh`, `home/install-update-policy.sh`, and these
+rootfs files under `/root/offbox-server/`, keeping their relative paths:
+
+- `etc/needrestart/conf.d/50-offbox.conf`
+- `etc/apt/apt.conf.d/52offbox-unattended`
+- `etc/apt/apt.conf.d/zz-offbox-restart-pending`
+- `usr/local/sbin/offbox-restart-pending`
+
+Then run `bash /root/offbox-server/install-host.sh update-policy`. It only copies these four files
+atomically, with the hook last. It runs no apt command, service restart/reload, Incus action or daemon
+swap. Read back with `perl -c /etc/needrestart/conf.d/50-offbox.conf` and `needrestart -b -r l`.
+Batch output's `NEEDRESTART-SVC` lines list stale services regardless of their restart selection.
+
 ## Box scratch space
 
 The `offbox` Incus profile mounts an executable tmpfs at `/tmp` when a box starts: mode `1777`,
