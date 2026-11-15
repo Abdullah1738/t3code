@@ -2003,6 +2003,196 @@ describe("OrchestratorMcpService provider resolution", () => {
       }),
   );
 
+  const encodedTaskId = (threadId = parentThreadId, key = "review:%25/é") =>
+    NodeId.make(
+      `node:delegated-task:${encodeURIComponent(
+        `command:mcp:delegate-task:${encodeURIComponent(scope.environmentId)}:${encodeURIComponent(threadId)}:${encodeURIComponent(key)}`,
+      )}`,
+    );
+
+  const taskIdForms = [
+    { name: "exact", change: (id: string) => id },
+    { name: "projection appears after missing receipt", change: (id: string) => id, late: true },
+    {
+      name: "re-encoded",
+      change: (id: string) => `node:delegated-task:${encodeURIComponent(id.slice(20))}`,
+    },
+    {
+      name: "one-level decoded",
+      change: (id: string) => `node:delegated-task:${decodeURIComponent(id.slice(20))}`,
+    },
+    {
+      name: "caller separator loses an encoding level",
+      change: (id: string) => id.replace("thread%253A", "thread%3A"),
+    },
+    {
+      name: "caller separator gains an encoding level",
+      change: (id: string) => id.replace("thread%253A", "thread%25253A"),
+    },
+    {
+      name: "lowercase escape",
+      change: (id: string) => id.replace("%3A", "%3a"),
+    },
+  ];
+
+  it.effect.each(taskIdForms)("recovers the caller's saved task for $name", (testCase) =>
+    Effect.gen(function* () {
+      const { change } = testCase;
+      let parentReads = 0;
+      const realId = encodedTaskId();
+      const task = {
+        id: realId,
+        threadId: parentThreadId,
+        origin: "app_owned",
+        childThreadId,
+        providerInstanceId: codexInstanceId,
+        model: "gpt-5.4",
+        result: "Review complete.",
+        status: "completed",
+        completionDelivery: { state: "pending" },
+      } as const;
+      const distractions = [
+        { ...task, origin: "provider_native" },
+        { ...task, threadId: ThreadId.make("thread:other") },
+      ];
+      const dispatched: Array<{ type: string; taskId?: NodeId }> = [];
+      const dependencies = Layer.mergeAll(
+        NodeServices.layer,
+        Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getCallerRow: (id) => Effect.succeed(liveThreadShell(id)),
+          getThreadShell: (id) => Effect.succeed(liveThreadShell(id)),
+          getThreadRecords: (id) =>
+            Effect.succeed(
+              id === parentThreadId
+                ? parentProjection(
+                    "late" in testCase && parentReads++ === 0 ? [] : [...distractions, task],
+                  )
+                : childProjection,
+            ),
+          getDelegationCommandState: () => Effect.succeed({ status: "never_saved" }),
+          getThreadProjection: () => Effect.succeed(parentProjection([task])),
+          dispatch: (command) =>
+            Effect.sync(() => {
+              dispatched.push(command);
+            }) as never,
+          stopDelegatedTasks: () => Effect.void,
+        }),
+        ServerSettings.layerTest(),
+        providerRegistryLayer([]),
+        adapterRegistryLayer([]),
+        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(SecretRequests.SecretRequests)({}),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        const inputId = NodeId.make(change(realId));
+        const status = yield* service.taskStatus(scope, inputId);
+        assert.equal(status.taskId, realId);
+        assert.isFalse(status.partial);
+        const cancelled = yield* service.cancelTask(scope, { taskId: inputId });
+        assert.equal(cancelled.taskId, realId);
+        assert.equal(cancelled.status, "completed");
+        yield* Effect.yieldNow;
+        assert.isTrue(
+          dispatched.some(
+            (command) => command.type === "delegated_task.completion-delivery.dispose",
+          ),
+        );
+        for (const command of dispatched)
+          if (command.taskId !== undefined) assert.equal(command.taskId, realId);
+      }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
+    }),
+  );
+
+  it.effect.each([
+    {
+      name: "real unsaved",
+      id: encodedTaskId(),
+      state: "never_saved",
+      expected: "This delegation was never saved",
+    },
+    {
+      name: "saved receipt",
+      id: encodedTaskId(),
+      state: "accepted",
+      expected: "This delegation was saved",
+    },
+    { name: "pending", id: encodedTaskId(), state: "pending", expected: "still being created" },
+    { name: "rejected", id: encodedTaskId(), state: "rejected", expected: "was rejected" },
+    ...taskIdForms
+      .filter((row) => !("late" in row) && row.name !== "exact")
+      .map(({ name, change }) => ({
+        name,
+        id: NodeId.make(change(encodedTaskId())),
+        state: "never_saved",
+        expected: "Check the id; copy it exactly from delegate_task.",
+      })),
+    {
+      name: "foreign caller",
+      id: encodedTaskId(ThreadId.make("thread:other")),
+      state: "never_saved",
+      expected: "Check the id; copy it exactly from delegate_task.",
+    },
+    {
+      name: "unknown",
+      id: NodeId.make("unknown"),
+      state: "never_saved",
+      expected: "Check the id; copy it exactly from delegate_task.",
+    },
+    {
+      name: "invalid escape",
+      id: NodeId.make("node:delegated-task:%ZZ"),
+      state: "never_saved",
+      expected: "Check the id; copy it exactly from delegate_task.",
+    },
+    {
+      name: "legacy without owner evidence",
+      id: NodeId.make(
+        `node:delegated-task:${encodeURIComponent("command:mcp:credential:delegate-task:review")}`,
+      ),
+      state: "never_saved",
+      expected: "Check the id; copy it exactly from delegate_task.",
+    },
+  ] as const)("missing task diagnosis: $name", ({ id, state, expected }) =>
+    Effect.gen(function* () {
+      const dependencies = Layer.mergeAll(
+        NodeServices.layer,
+        Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getCallerRow: (id) => Effect.succeed(liveThreadShell(id)),
+          getThreadRecords: () => Effect.succeed(parentProjection([])),
+          getDelegationCommandState: () =>
+            Effect.succeed(
+              state === "accepted" || state === "rejected"
+                ? ({
+                    status: state,
+                    threadId: parentThreadId,
+                    commandType: "delegated_task.request",
+                    error: null,
+                  } as never)
+                : ({ status: state } as never),
+            ),
+        }),
+        ServerSettings.layerTest(),
+        providerRegistryLayer([]),
+        adapterRegistryLayer([]),
+        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(SecretRequests.SecretRequests)({}),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        const error = yield* service.taskStatus(scope, id).pipe(Effect.flip);
+        assert.equal(error.code, "task_not_found");
+        assert.include(error.message, expected);
+        if (expected.startsWith("Check")) {
+          assert.notInclude(error.message, "never saved");
+          assert.notInclude(error.message, "Retry delegate_task");
+        }
+      }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
+    }),
+  );
+
   it.effect("status and same-key delegation finish while the background reader is held", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -2191,7 +2381,7 @@ describe("OrchestratorMcpService provider resolution", () => {
         ]) {
           const error = yield* read.pipe(Effect.flip);
           assert.equal(error.code, "task_not_found");
-          assert.include(error.message, "was not found for thread");
+          assert.include(error.message, "Check the id; copy it exactly from delegate_task.");
           assert.notInclude(error.message, "does not belong");
           assert.notInclude(error.message, "about 30 seconds after the timeout");
           assert.notInclude(error.message, "same clientRequestId");
