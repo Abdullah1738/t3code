@@ -15,6 +15,7 @@ import unittest
 from unittest.mock import patch
 
 from test_cases import Base, ALERT, BANK, at, finder, nobody, mc
+from test_charges import ControlServer, summary
 
 
 HERE = Path(__file__).resolve().parent
@@ -22,6 +23,34 @@ SHARED = HERE.parents[2] / 'app-api-cli' / 'toollog.py'
 
 
 class Logging(Base):
+    def test_owner_cache_reset_diagnostics_wait_for_book_unlock(self):
+        path = self.data / 'owner-texts.json'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('corrupt private text')
+        held, seen = [], []
+        emit = mc.toollog.emit
+
+        def logging(*args, **kwargs):
+            if args[1] == 'cache_reset':
+                seen.append(bool(held))
+            return emit(*args, **kwargs)
+
+        @mc.log_scope
+        def lookup():
+            with mc.Locked(self.data, 'questions'):
+                held.append(True)
+                try:
+                    mc.explain_charge(self.data, mc.charges.parse(ALERT, BANK),
+                                      at('2026-10-24T04:10'), at('2026-10-24T04:20'), find=finder())
+                finally:
+                    held.clear()
+
+        with ControlServer([summary('I paid Acme')]), patch.object(mc.toollog, 'emit', logging):
+            lookup()
+        self.assertEqual(seen, [False])
+        self.assertEqual(len(self.rows('cache_reset')), 1)
+        self.assertNotIn('private', json.dumps(self.rows('cache_reset')))
+
     def rows(self, name=None):
         rows = [json.loads(line) for path in (self.tmp / 'tool-logs/orders').glob('*.ndjson')
                 for line in path.read_text().splitlines()]

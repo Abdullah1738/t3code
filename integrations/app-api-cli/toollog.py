@@ -29,7 +29,7 @@ _NAMES = {
     'track.eta_elapsed', 'track.delivered', 'track.error', 'card.assert',
     'provider.track', 'provider.orders', 'provider.details', 'log.cap',
     'case.open', 'case.update', 'case.close', 'case.reopen', 'case.corroborate',
-    'question.ask', 'check.run',
+    'question.ask', 'check.run', 'cache_reset',
 }
 _ENUMS = {
     'lane': {'food', 'minutes', 'nownow', 'main', 'supermall', 'marketplace', 'careem', 'uber',

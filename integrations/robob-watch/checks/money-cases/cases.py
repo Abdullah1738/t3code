@@ -546,6 +546,8 @@ def receipt_for_question(data, charge, qid=None, questions=None, at=None):
 
 
 def explain_charge(data, charge, at, now, deadline=None, find=None, said=None, qid=None, *, purchases=True):
+    said = said or (lambda *a, **kw: charges.owner_texts(
+        *a, **kw, cache_path=Path(data or DATA) / 'owner-texts.json', cache_reset=lambda: record_event('cache_reset')))
     if charge['kind'] != 'charge':
         return charges.explain(charge, at, now, deadline, find, said)
     questions = load_questions(data)['questions']
@@ -2738,7 +2740,9 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
             # Coverage alone cannot authorize an ask: a negative order result
             # still needs the receipt/owner screen before census proven_clean.
             counted(q['id'], 'limited' if outcome == 'proven_clean' else outcome)
-    owner_source = said or (lambda *a, **kw: charges.owner_texts(*a, **kw, stats=stats))
+    owner_source = said or (lambda *a, **kw: charges.owner_texts(
+        *a, **kw, stats=stats, cache_path=Path(data) / 'owner-texts.json',
+        cache_reset=lambda: record_event('cache_reset')))
     source_error = None
 
     def source(*args, **kwargs):
@@ -2767,7 +2771,7 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
     charge_times = [at for _, at, q in todo if q.get('kind') == 'charge']
     owner_rows = None
     owner_error = None
-    if charge_times and now - (min(charge_times) - charges.OWNER_AROUND) <= dt.timedelta(days=2):
+    if charge_times:
         try:
             owner_end = min(deadline, time.time() + 4) if deadline is not None else time.time() + 4
             with within(owner_end, LookupTimeout('out of time')):

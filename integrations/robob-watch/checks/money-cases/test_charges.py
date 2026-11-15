@@ -24,7 +24,7 @@ TZ = ch.TZ
 
 
 def summary(text, **extra):
-    return {'role': 'user', 'text': text, 'createdAt': '2026-10-24T00:10:00.000Z',
+    return {'role': 'user', 'messageId': text, 'text': text, 'createdAt': '2026-10-24T00:10:00.000Z',
             'createdBy': 'user', 'creationSource': 'web', 'automated': False, 'inboundMessageId': None, **extra}
 
 
@@ -35,6 +35,7 @@ class ControlServer:
         self.rows = {'a': rows or []}
         self.threads = threads if threads is not None else [{'threadId': 'a', 'title': 'iMessage test',
                            'creationSource': 'server', 'origin': 'imessage'}]
+        self.threads = [{'updatedAt': '2026-10-24T01:00:00.000Z', **thread} for thread in self.threads]
         self.calls = []
         self.stall, self.drip = stall, drip
         self.page_size, self.message_delay, self.stall_cursor = page_size, message_delay, stall_cursor
@@ -118,7 +119,8 @@ class ControlServer:
         self.credentials.write_text(json.dumps({'url': f'http://127.0.0.1:{self.server.server_port}',
                                                 'token': 'test-secret-never-print'}))
         self.credentials.chmod(0o600)
-        self.env = patch.dict(os.environ, {'T3_CONTROL_TOKEN_FILE': str(self.credentials)})
+        self.env = patch.dict(os.environ, {'T3_CONTROL_TOKEN_FILE': str(self.credentials),
+                                          'MONEY_CASES_DIR': self.tmp.name})
         self.env.start()
         self.thread.start()
         return self
@@ -344,7 +346,7 @@ class Finder:
         return groups
 
 
-def nobody(since, until, deadline=None):
+def nobody(since, until, deadline=None, **kwargs):
     return []
 
 
@@ -724,6 +726,143 @@ class OwnerTexts(unittest.TestCase):
     def read(self, **kwargs):
         return ch.owner_texts(at('2026-10-24T03:00'), at('2026-10-24T05:00'), **kwargs)
 
+    def message_calls(self, server):
+        return [(path, params) for path, params, _ in server.calls if path.endswith('/messages')]
+
+    def test_ninety_threads_warm_across_checks_then_need_only_lists(self):
+        until = at('2026-10-24T05:00')
+        since = until - dt.timedelta(days=7)
+        threads = [{'threadId': str(n), 'title': 'App',
+                    'updatedAt': ch.iso(until - dt.timedelta(hours=n))} for n in range(90)]
+        with ControlServer(threads=threads) as server:
+            for n, thread in enumerate(threads):
+                server.rows[str(n)] = [summary(str(n), createdAt=thread['updatedAt'])]
+            with self.assertRaisesRegex(ch.Lookup, r'incomplete \(62 of 90 threads\)'):
+                ch.owner_texts(since, until)
+            cache = json.loads((Path(server.tmp.name) / 'owner-texts.json').read_text())
+            self.assertEqual(set(cache), {str(n) for n in range(62)})
+            server.calls.clear()
+            self.assertEqual(len(ch.owner_texts(since, until)), 90)
+            self.assertEqual(len(self.message_calls(server)), 28)
+            server.calls.clear()
+            stats = Counter()
+            self.assertEqual(len(ch.owner_texts(since, until, stats=stats)), 90)
+            self.assertEqual(self.message_calls(server), [])
+            self.assertEqual(stats['owner_queries'], 2)
+
+    def test_changed_thread_merges_by_id_and_replaces_overlap(self):
+        with ControlServer([summary('old', createdAt='2026-10-24T00:00:00Z'),
+                            summary('overlap', createdAt='2026-10-24T00:59:30Z'),
+                            summary('removed', createdAt='2026-10-24T00:59:40Z')]) as server:
+            self.read()
+            server.calls.clear()
+            server.threads[0]['updatedAt'] = '2026-10-24T01:00:30Z'
+            server.rows['a'] = [summary('overlap edited', messageId='overlap', createdAt='2026-10-24T00:59:30Z'),
+                                summary('new', createdAt='2026-10-24T01:00:00Z')]
+            self.assertEqual([row[1] for row in self.read()], ['new', 'overlap edited', 'old'])
+            self.assertEqual(self.message_calls(server)[0][1]['since'], ['2026-10-24T00:59:00.000Z'])
+            server.calls.clear()
+            self.assertEqual(len(self.read()), 3)
+            self.assertEqual(self.message_calls(server), [])
+
+    def test_earlier_window_refetches_and_failed_change_cannot_use_stale_cache(self):
+        with ControlServer([summary('newer')]) as server:
+            self.read()
+            earlier = at('2026-10-23T03:00')
+            server.calls.clear()
+            server.rows['a'].append(summary('earlier', createdAt=ch.iso(earlier)))
+            self.assertEqual(len(ch.owner_texts(earlier, at('2026-10-24T05:00'))), 2)
+            self.assertEqual(self.message_calls(server)[0][1]['since'],
+                             [ch.iso(earlier - dt.timedelta(milliseconds=1))])
+            server.threads[0]['updatedAt'] = '2026-10-24T01:01:00Z'
+            server.responses['/api/ardud/control/threads/a/messages'] = {'ok': False}
+            with self.assertRaisesRegex(ch.Lookup, r'incomplete \(0 of 1 threads\)'):
+                self.read()
+            cached = json.loads((Path(server.tmp.name) / 'owner-texts.json').read_text())
+            self.assertEqual(cached['a']['updatedAt'], '2026-10-24T01:00:00.000Z')
+
+    def test_corrupt_cache_resets_once_and_is_replaced_privately(self):
+        for raw in ('not json', '[]', '{"a": {}}'):
+            with self.subTest(raw=raw), ControlServer([summary('owner')]) as server:
+                path = Path(server.tmp.name) / 'owner-texts.json'
+                path.write_text(raw)
+                path.chmod(0o644)
+                with patch.object(ch.toollog, 'emit') as log:
+                    self.assertEqual(len(self.read()), 1)
+                log.assert_called_once_with('money-cases', 'cache_reset')
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(json.loads(path.read_text())['a']['texts'][0]['text'], 'owner')
+                self.assertEqual(list(path.parent.glob('.owner-texts.json.*')), [])
+
+    def test_unreadable_cache_is_empty(self):
+        read = Path.read_text
+        def unreadable(path, *args, **kwargs):
+            if path.name == 'owner-texts.json':
+                raise PermissionError()
+            return read(path, *args, **kwargs)
+        with ControlServer([summary('owner')]), patch.object(Path, 'read_text', unreadable), \
+                patch.object(ch.toollog, 'emit') as log:
+            self.assertEqual(len(self.read()), 1)
+        log.assert_called_once_with('money-cases', 'cache_reset')
+
+    def test_cache_prunes_threads_and_texts_but_keeps_an_older_requested_window(self):
+        until = at('2026-10-24T05:00')
+        cutoff = until - dt.timedelta(days=14)
+        with ControlServer() as server:
+            path = Path(server.tmp.name) / 'owner-texts.json'
+            rows = [summary('ancient', createdAt=ch.iso(cutoff - dt.timedelta(days=1))), summary('recent')]
+            cached = {'a': {'updatedAt': server.threads[0]['updatedAt'], 'coveredFrom': ch.iso(cutoff - dt.timedelta(days=2)),
+                            'title': 'iMessage test', 'texts': [{**row, 'title': 'iMessage test'} for row in rows]},
+                      'expired': {'updatedAt': ch.iso(cutoff - dt.timedelta(days=1)),
+                                  'coveredFrom': ch.iso(cutoff - dt.timedelta(days=2)), 'title': 'App', 'texts': []}}
+            path.write_text(json.dumps(cached))
+            self.read()
+            kept = json.loads(path.read_text())
+            self.assertEqual(set(kept), {'a'})
+            self.assertEqual([r['text'] for r in kept['a']['texts']], ['recent'])
+            self.assertEqual(kept['a']['coveredFrom'], ch.iso(cutoff))
+            # An old followed question extends retention without reading cases.json.
+            path.write_text(json.dumps(cached))
+            ch.owner_texts(cutoff - dt.timedelta(days=2), until)
+            self.assertEqual(set(json.loads(path.read_text())), {'a', 'expired'})
+            self.assertEqual(len(json.loads(path.read_text())['a']['texts']), 2)
+
+    def test_successes_after_a_failed_thread_are_saved_and_next_read_finishes(self):
+        threads = [{'threadId': tid, 'title': 'App'} for tid in ('bad', 'a', 'b')]
+        with ControlServer(threads=threads) as server:
+            for thread in threads:
+                server.rows[thread['threadId']] = [summary(thread['threadId'])]
+            server.responses['/api/ardud/control/threads/bad/messages'] = {'ok': False}
+            with self.assertRaisesRegex(ch.Lookup, r'incomplete \(2 of 3 threads\)'):
+                self.read()
+            path = Path(server.tmp.name) / 'owner-texts.json'
+            self.assertEqual(set(json.loads(path.read_text())), {'a', 'b'})
+            server.responses.clear()
+            server.calls.clear()
+            self.assertEqual(len(self.read()), 3)
+            self.assertEqual(len(self.message_calls(server)), 1)
+
+    def test_renamed_archived_and_nonowner_threads_do_not_reuse_cached_texts(self):
+        with ControlServer([relayed('owner')]) as server:
+            self.assertEqual(len(self.read()), 1)
+            server.threads[0]['title'] = 'App'
+            self.assertEqual(self.read(), [])
+            for fields in ({'title': 'Moni'}, {'title': 'Group sb_gro'}, {'archived': True}):
+                server.threads[0].update(fields)
+                server.calls.clear()
+                self.assertEqual(self.read(), [])
+                self.assertEqual(self.message_calls(server), [])
+
+    def test_missing_thread_version_or_message_id_fails_closed(self):
+        with ControlServer([summary('owner')]) as server:
+            del server.threads[0]['updatedAt']
+            with self.assertRaisesRegex(ch.Lookup, 'updatedAt unavailable'):
+                self.read()
+            server.threads[0]['updatedAt'] = '2026-10-24T01:00:00Z'
+            del server.rows['a'][0]['messageId']
+            with self.assertRaisesRegex(ch.Lookup, 'message id unavailable'):
+                self.read()
+
     def test_only_what_he_typed_counts(self):
         cases = [
             (summary('web'), True),
@@ -841,16 +980,23 @@ class OwnerTexts(unittest.TestCase):
                 with self.assertRaises(ch.Lookup):
                     self.read()
                 self.assertLessEqual(len(server.calls), ch.OWNER_REQUEST_LIMIT)
-                self.assertTrue(all(path.endswith('/threads') for path, _, _ in server.calls))
+                if page_size == 1:
+                    self.assertTrue(all(path.endswith('/threads') for path, _, _ in server.calls))
+                else:
+                    self.assertEqual(sum(path.endswith('/messages') for path, _, _ in server.calls), 62)
 
     def test_request_ceiling_is_shared_by_older_question_windows(self):
         threads = [{'threadId': str(n), 'title': 'App'} for n in range(20)]
         stats = Counter()
         with ControlServer(threads=threads) as server:
             self.read(stats=stats)
+            for thread in server.threads:
+                thread['updatedAt'] = '2026-10-24T01:01:00.000Z'
             self.read(stats=stats)
             self.assertEqual(stats['owner_queries'], 44)
-            with self.assertRaisesRegex(ch.Lookup, 'request limit'):
+            for thread in server.threads:
+                thread['updatedAt'] = '2026-10-24T01:02:00.000Z'
+            with self.assertRaisesRegex(ch.Lookup, 'owner read incomplete'):
                 self.read(stats=stats)
             self.assertEqual(stats['owner_queries'], len(server.calls))
             self.assertLessEqual(len(server.calls), ch.OWNER_REQUEST_LIMIT)
@@ -1022,7 +1168,7 @@ print('finished', flush=True)
         for key in ('threads', 'messages'):
             for total, count, complete in cases:
                 with self.subTest(key=key, total=total, count=count), ControlServer() as server:
-                    row = {'threadId': 'a', 'title': 'iMessage test'} if key == 'threads' else summary('I paid Apple')
+                    row = server.threads[0] if key == 'threads' else summary('I paid Apple')
                     result = {'ok': True, key: [row] * count}
                     if total != 'missing':
                         result['total'] = total

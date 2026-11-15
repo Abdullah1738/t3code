@@ -1218,7 +1218,7 @@ def finder(*rows):
     return find
 
 
-def nobody(since, until, deadline=None):
+def nobody(since, until, deadline=None, **kwargs):
     return []
 
 
@@ -3019,9 +3019,9 @@ class CheckBudget(Base):
         with patch.object(mc.time, 'time', lambda: clock[0]), \
                 patch.object(mc.time, 'monotonic', lambda: clock[0]):
             mc.follow(self.data, now, self.root, 1020, finder(), owner, stats=stats)
-        self.assertEqual(calls, [4, 1.5])
-        self.assertTrue(self.questions()[0]['unverified'])
-        self.assertEqual(stats['starved_by'], 'owner_threads')
+        self.assertEqual(calls, [4])
+        self.assertFalse(self.questions()[0].get('unverified'))
+        self.assertEqual(stats['owner_threads_ms'], 2500)
 
     def test_owner_prefetch_leaves_budget_for_questions(self):
         now = at('2026-10-25T12:00')
@@ -3576,6 +3576,7 @@ class CheckBudget(Base):
         with ControlServer(rows), patch.object(mc.charges, 'owner_texts', wraps=mc.charges.owner_texts) as query:
             mc.run_check(self.wd, 'r', self.data, self.root, now, finder())
         self.assertEqual(query.call_count, 1)
+        self.assertTrue((self.data / 'owner-texts.json').exists())
         for n, q in enumerate(self.questions()):
             self.assertEqual(q['status'], 'closed')
             self.assertIn(f'item {n}', q['outcome'])
@@ -3605,14 +3606,14 @@ class CheckBudget(Base):
         self.assertEqual(str(state['question_errors']).count('test source failed'), 1)
         self.assertTrue(all(q['status'] == 'open' for q in self.questions()))
 
-    def test_long_union_falls_back_to_each_question(self):
+    def test_long_union_uses_one_owner_read_and_the_checks_data_dir(self):
         now = at('2026-10-25T12:00')
         self.seed([now, now - dt.timedelta(days=3)])
         with patch.object(mc.charges, 'owner_texts', return_value=[]) as query:
             mc.run_check(self.wd, 'r', self.data, self.root, now, finder())
-        self.assertEqual(query.call_count, 2)
-        self.assertTrue(all(call.args[1] - call.args[0] <= dt.timedelta(hours=1)
-                            for call in query.call_args_list))
+        self.assertEqual(query.call_count, 1)
+        self.assertEqual(query.call_args.args[:2], (now - dt.timedelta(days=3) - mc.charges.OWNER_AROUND, now))
+        self.assertEqual(query.call_args.kwargs['cache_path'], self.data / 'owner-texts.json')
 
     def test_msgs_cache_is_shared_by_ambiguous_questions_and_reset_each_run(self):
         now = at('2026-10-25T12:00')
