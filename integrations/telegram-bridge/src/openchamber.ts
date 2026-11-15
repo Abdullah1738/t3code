@@ -112,17 +112,21 @@ export interface BoardTelemetry {
   boardFetches: number;
   boardCacheHits: number;
   boardFetchErrors: number;
+  threadReads: number;
+  threadReadErrors: number;
+  threadReadsByReason: Record<"run" | "state" | "followup", number>;
   boardBackoffMs: number;
   lastFetchDurationMs: number | null;
   lastFetchReason: "dirty" | "age" | "cold" | null;
   fetchesByReason: Record<"cold" | "age" | "hard" | "soft", number>;
-  dirtyEventsByType: Record<string, { hard: number; soft: number }>;
+  /** local counts events handled without invalidating the cached roster. */
+  dirtyEventsByType: Record<string, { hard: number; soft: number; local?: number }>;
   windowStartedAt: string;
 }
 
 export const BOARD_EVENT_KEY_LIMIT = 50;
 // Only event/change names belong in telemetry, never arbitrary payload text.
-export const BOARD_EVENT_KEY = /^(?:thread\.updated:)?[a-z][a-z0-9-]*(?:\.[a-z][a-z0-9-]*)*$/;
+export const BOARD_EVENT_KEY = /^(?:message\.completed:assistant|thread\.status:(?:same|move|join|leave|offboard)|(?:thread\.updated:)?[a-z][a-z0-9-]*(?:\.[a-z][a-z0-9-]*)*)$/;
 export function boardEventKey(type: unknown, change?: unknown): string {
   const name = (value: unknown) => typeof value === "string" && value.length <= 80 && !value.includes(":") && BOARD_EVENT_KEY.test(value) ? value : "other";
   return type === "thread.updated" ? `thread.updated:${name(change)}` : name(type);

@@ -105,6 +105,33 @@ test("health bounds dirty event names, merges overflow and excludes malformed ne
   }
 });
 
+test("health exposes bounded status subkeys and local counts without payload identities", async () => {
+  const h = setup();
+  h.state.health = { board: { dirtyEventsByType: {
+    ...Object.fromEntries(["same", "move", "join", "leave", "offboard"].map(kind => [`thread.status:${kind}`, { hard: 0, soft: 0, local: 2, threadId: "PRIVATE_ID", title: "PRIVATE_TITLE" }])),
+    "thread.status:private-id": { hard: 1, soft: 0, local: 1 },
+    "thread.status:PRIVATE_TITLE": { hard: 1, soft: 0 },
+    "future.negative": { hard: 0, soft: 0, local: -1 },
+    "future.fraction": { hard: 0, soft: 0, local: 0.5 },
+    "future.string": { hard: 0, soft: 0, local: "PRIVATE_VALUE" },
+  } } };
+  const health = await (await h.get("/health")).json();
+  for (const kind of ["same", "move", "join", "leave", "offboard"]) expect(health.board.dirtyEventsByType[`thread.status:${kind}`]).toEqual({ hard: 0, soft: 0, local: 2 });
+  for (const kind of ["negative", "fraction", "string"]) expect(health.board.dirtyEventsByType[`future.${kind}`]).toEqual({ hard: 0, soft: 0 });
+  expect(health.board.dirtyEventsByType).not.toHaveProperty("thread.status:private-id");
+  expect(JSON.stringify(health)).not.toContain("PRIVATE_");
+});
+
+test("health allows only bounded single-thread read counters and reasons", async () => {
+  const h = setup();
+  h.state.health = { board: { threadReads: 5, threadReadErrors: 1,
+    threadReadsByReason: { run: 2, state: 2, followup: 1, threadId: "PRIVATE_ID", title: "PRIVATE_TITLE" } } };
+  expect((await (await h.get("/health")).json()).board).toEqual({ threadReads: 5, threadReadErrors: 1,
+    threadReadsByReason: { run: 2, state: 2, followup: 1 } });
+  h.state.health = { board: { threadReads: -1, threadReadErrors: 0.5, threadReadsByReason: { run: Infinity, state: "PRIVATE_ID", followup: -1 } } };
+  expect((await (await h.get("/health")).json()).board).toEqual({ threadReadsByReason: {} });
+});
+
 test("notify queues one stable operation and never touches reminders or session notices", async () => {
   const h = setup();
   const first = await h.post("/notify", notify);

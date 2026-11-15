@@ -3,13 +3,13 @@ import { useToolLogFixture } from "./toollog-fixture.ts";
 import { Attention } from "../src/attention.ts";
 import { createApi } from "../src/api.ts";
 import { backendKind } from "../src/config.ts";
-import type { PendingRequest, ThreadSummary } from "../src/control.ts";
+import type { PendingRequest, ThreadState, ThreadSummary } from "../src/control.ts";
 import { ActiveThreadsBoard, boardEntry, RobobAlertBackend, runOrdinal, type RobobAlertOptions } from "../src/robob.ts";
 import { Store } from "../src/store.ts";
 
 type Thread = {
   threadId: string; projectId: string; title: string; origin: string | null; runtimeMode: string; worktreePath: string | null;
-  parentThreadId: string | null; state: string; latestRunId: string | null; settled?: boolean; archived?: boolean; pending: PendingRequest[];
+  parentThreadId: string | null; activeRunId?: string | null; state: string; latestRunId: string | null; settled?: boolean; archived?: boolean; pending: PendingRequest[];
 };
 type Call = { method: string; path: string; body?: any };
 
@@ -91,20 +91,23 @@ function cachedBoard() {
     nativeSessionId: null, runtimeMode: "approval-required", parentThreadId: null, rootThreadId: "t", worktreePath: "/repo",
     latestRunId: null, pendingRequest: null, createdAt: null, updatedAt: null,
   };
-  const state = { threads: [thread], read: async () => ({ total: state.threads.length, threads: state.threads }) };
+  const state = { threads: [thread], read: async () => ({ total: state.threads.length, threads: state.threads }),
+    readThread: async (): Promise<{ thread: ThreadSummary }> => ({ thread }) };
+  const threadReads: number[] = [];
   const warnings: string[] = [];
   const client = { listThreads: async (filters: unknown) => {
     expect(filters).toEqual({ active: true, limit: 500 });
     calls++;
     return state.read();
-  } };
+  }, thread: async () => { threadReads.push(at); return state.readThread(); } };
   const board = new ActiveThreadsBoard(client, { of: async () => "/repo" }, { now: () => at, log: event => warnings.push(event) });
-  return { board, state, thread, warnings, calls: () => calls, time: (value: number) => { at = value; } };
+  return { board, state, thread, warnings, threadReads, calls: () => calls, time: (value: number) => { at = value; } };
 }
 
 test("board reads are cached until 30 seconds old, with safe telemetry only", async () => {
   const h = cachedBoard();
-  const counters = { fetchesByReason: { cold: 0, age: 0, hard: 0, soft: 0 }, dirtyEventsByType: {}, windowStartedAt: new Date(0).toISOString() };
+  const counters = { fetchesByReason: { cold: 0, age: 0, hard: 0, soft: 0 }, dirtyEventsByType: {}, windowStartedAt: new Date(0).toISOString(),
+    threadReads: 0, threadReadErrors: 0, threadReadsByReason: { run: 0, state: 0, followup: 0 } };
   expect(h.board.status()).toEqual({ boardFetches: 0, boardCacheHits: 0, boardFetchErrors: 0, boardBackoffMs: 0, lastFetchDurationMs: null, lastFetchReason: null, ...counters });
   const first = await h.board.snapshot();
   for (const at of [1, 3_000, 10_000, 29_999]) {
@@ -302,7 +305,7 @@ test.each([false, true])("steady idle/metadata-churn fetch count, churn=%j", asy
   expect(h.calls()).toBe(churn ? 12 : 6);
 });
 
-test.each([[30_000, 12], [20_000, 18]])("mixed unknown events each second and busy/idle flips every %i ms produce %i fetches in three minutes", async (flipGap, expected) => {
+test.each([[30_000, 12], [20_000, 12]])("mixed unknown events each second and busy/idle flips every %i ms produce %i fetches in three minutes", async (flipGap, expected) => {
   const h = cachedBoard();
   const control = fakeControl([], { board: h.board });
   control.add({ threadId: "t", state: "running" });
@@ -316,6 +319,396 @@ test.each([[30_000, 12], [20_000, 18]])("mixed unknown events each second and bu
   }
   expect(h.calls()).toBe(expected!);
   if (flipGap === 30_000) expect(h.calls() / 3).toBeLessThanOrEqual(4);
+});
+
+test.each<{ initial: ThreadState; state: ThreadState; kind: string }>([
+  { initial: "running", state: "running", kind: "same" },
+  { initial: "running", state: "waiting", kind: "move" },
+  { initial: "running", state: "queued", kind: "move" },
+  { initial: "queued", state: "needs-input", kind: "move" },
+  { initial: "waiting", state: "running", kind: "move" },
+  { initial: "running", state: "idle", kind: "leave" },
+  { initial: "idle", state: "running", kind: "join" },
+  { initial: "idle", state: "idle", kind: "offboard" },
+])("status cache matrix: $initial -> $state ($kind)", async ({ initial, state, kind }) => {
+  const h = cachedBoard();
+  h.thread.state = initial;
+  if (initial === "idle") h.state.threads = [];
+  const first = await h.board.snapshot();
+  h.time(1_000);
+  h.board.applyStatus("t", state);
+  expect(await h.board.snapshot()).toBe(first);
+  const present = initial !== "idle" && state !== "idle";
+  expect(first.entries).toEqual(present ? [boardEntry({ ...h.thread, state }, "/repo")] : []);
+  expect(h.board.status().dirtyEventsByType).toEqual({ [`thread.status:${kind}`]: {
+    hard: 0, soft: kind === "join" ? 1 : 0, ...(kind === "join" ? {} : { local: 1 }),
+  } });
+  h.state.threads = state === "idle" ? [] : [{ ...h.thread, state }];
+  for (const at of [3_000, 14_999]) {
+    h.time(at);
+    await h.board.snapshot();
+    expect(h.calls()).toBe(1);
+  }
+  for (const at of [15_000, 29_999]) {
+    h.time(at);
+    await h.board.snapshot();
+    expect(h.calls()).toBe(kind === "join" ? 2 : 1);
+  }
+  h.time(30_000);
+  expect((await h.board.snapshot()).entries).toEqual(state === "idle" ? [] : [boardEntry({ ...h.thread, state }, "/repo")]);
+  expect(h.calls()).toBe(2);
+  expect(h.board.status().fetchesByReason).toEqual({ cold: 1, age: kind === "join" ? 0 : 1, hard: 0, soft: kind === "join" ? 1 : 0 });
+});
+
+test("raw queued and needs-input states stay distinct from their running board projection", async () => {
+  const h = cachedBoard();
+  await h.board.snapshot();
+  for (const state of ["queued", "queued", "needs-input", "needs-input", "running", "running"] as const) h.board.applyStatus("t", state);
+  expect(h.board.status().dirtyEventsByType).toEqual({
+    "thread.status:move": { hard: 0, soft: 0, local: 3 }, "thread.status:same": { hard: 0, soft: 0, local: 3 },
+  });
+});
+
+test("known iMessage roots are offboard even for non-idle statuses", async () => {
+  const h = cachedBoard();
+  h.thread.origin = "imessage";
+  expect((await h.board.snapshot()).entries).toEqual([]);
+  h.board.applyStatus("t", "needs-input");
+  for (const at of [3_000, 15_000, 29_999]) {
+    h.time(at);
+    expect((await h.board.snapshot()).entries).toEqual([]);
+    expect(h.calls()).toBe(1);
+  }
+  expect(h.board.status().dirtyEventsByType).toEqual({ "thread.status:offboard": { hard: 0, soft: 0, local: 1 } });
+});
+
+test("cold status is HARD and the first read discovers its folder immediately", async () => {
+  const h = cachedBoard();
+  h.board.applyStatus("t", "running");
+  expect(h.board.status().dirtyEventsByType).toEqual({ "thread.status:join": { hard: 1, soft: 0 } });
+  expect((await h.board.snapshot()).entries).toEqual([boardEntry(h.thread, "/repo")]);
+  for (const at of [3_000, 15_000, 29_999, 30_000]) {
+    h.time(at);
+    await h.board.snapshot();
+    expect(h.calls()).toBe(at === 30_000 ? 2 : 1);
+  }
+});
+
+test.each([false, true])("in-flight status survives an old roster; warm=%j", async warm => {
+  const h = cachedBoard();
+  if (warm) await h.board.snapshot();
+  h.time(30_000);
+  let resolve!: (value: { total: number; threads: ThreadSummary[] }) => void;
+  h.state.read = () => new Promise(done => { resolve = done; });
+  const pending = h.board.snapshot();
+  h.board.applyStatus("t", "idle");
+  resolve({ total: 1, threads: [h.thread] });
+  expect((await pending).entries).toEqual([]);
+  expect(h.board.status().dirtyEventsByType).toEqual({ [`thread.status:${warm ? "leave" : "offboard"}`]: { hard: 1, soft: 0 } });
+  h.state.read = async () => ({ total: 0, threads: [] });
+  const calls = h.calls();
+  h.time(32_999);
+  expect((await h.board.snapshot()).entries).toEqual([]);
+  expect(h.calls()).toBe(calls);
+  for (const at of [33_000, 45_000, 60_000]) {
+    h.time(at);
+    expect((await h.board.snapshot()).entries).toEqual([]);
+    expect(h.calls()).toBe(calls + 1);
+  }
+});
+
+test("the latest in-flight status wins for moves and joins", async () => {
+  const h = cachedBoard();
+  await h.board.snapshot();
+  h.time(30_000);
+  let resolve!: (value: { total: number; threads: ThreadSummary[] }) => void;
+  h.state.read = () => new Promise(done => { resolve = done; });
+  const pending = h.board.snapshot();
+  h.board.applyStatus("t", "idle");
+  h.board.applyStatus("t", "queued");
+  h.board.applyStatus("t", "waiting");
+  h.board.applyStatus("new", "running");
+  h.board.applyStatus("new", "needs-input");
+  resolve({ total: 2, threads: [h.thread, { ...h.thread, threadId: "new", state: "waiting" }] });
+  expect((await pending).entries.map(entry => [entry.sessionId, entry.state, entry.status])).toEqual([
+    ["t", "waiting", "idle"], ["new", "running", "busy"],
+  ]);
+});
+
+test("unknown in-flight joins retain HARD refresh even when absent from the old roster", async () => {
+  const h = cachedBoard();
+  await h.board.snapshot();
+  h.time(30_000);
+  let resolve!: (value: { total: number; threads: ThreadSummary[] }) => void;
+  h.state.read = () => new Promise(done => { resolve = done; });
+  const pending = h.board.snapshot();
+  h.board.applyStatus("new", "queued");
+  resolve({ total: 1, threads: [h.thread] });
+  expect((await pending).entries.map(entry => entry.sessionId)).toEqual(["t"]);
+  h.state.read = async () => ({ total: 2, threads: [h.thread, { ...h.thread, threadId: "new", state: "queued" }] });
+  h.time(32_999);
+  expect((await h.board.snapshot()).entries).toHaveLength(1);
+  h.time(33_000);
+  expect((await h.board.snapshot()).entries.map(entry => entry.sessionId)).toEqual(["t", "new"]);
+});
+
+test("a status received while resolving folders is replayed before the snapshot is published", async () => {
+  const h = cachedBoard();
+  let entered!: () => void;
+  const loading = new Promise<void>(done => { entered = done; });
+  let release!: (value: string) => void;
+  const board = new ActiveThreadsBoard({ listThreads: async () => ({ total: 1, threads: [h.thread] }) }, {
+    of: () => { entered(); return new Promise(done => { release = done; }); },
+  });
+  const pending = board.snapshot();
+  await loading;
+  board.applyStatus("t", "idle");
+  release("/repo");
+  expect((await pending).entries).toEqual([]);
+});
+
+test("status patches remain in the cached roster after an in-flight refresh fails", async () => {
+  const h = cachedBoard();
+  const cached = await h.board.snapshot();
+  h.time(30_000);
+  let reject!: (error: Error) => void;
+  h.state.read = () => new Promise((_resolve, fail) => { reject = fail; });
+  const pending = h.board.snapshot();
+  h.board.applyStatus("t", "idle");
+  reject(new Error("unavailable"));
+  await expect(pending).rejects.toThrow("unavailable");
+  expect((await h.board.snapshot()).entries).toEqual([]);
+  expect(cached.entries).toEqual([]);
+  h.state.read = async () => ({ total: 1, threads: [{ ...h.thread, state: "running" }] });
+  h.time(35_000);
+  expect((await h.board.snapshot()).entries).toHaveLength(1);
+});
+
+const runA = "run:thread:t:ordinal:1";
+const runB = "run:thread:t:ordinal:2";
+
+test.each([
+  ["completed", "idle"], ["failed", "idle"], ["cancelled", "idle"], ["interrupted", "idle"], ["rolled_back", "idle"],
+  ["waiting", "waiting"], ["queued", "queued"], ["preparing", "running"], ["running", "running"],
+] as const)("foreign run %s cannot replace active run A with %s", async (_status, state) => {
+  const h = cachedBoard();
+  Object.assign(h.thread, { activeRunId: runA, latestRunId: runA });
+  await h.board.snapshot();
+  const canonical = { ...h.thread, latestRunId: runB };
+  h.state.readThread = async () => ({ thread: canonical });
+  h.board.applyStatus("t", state, runB);
+  expect((await h.board.snapshot()).entries).toEqual([boardEntry(canonical, "/repo")]);
+  expect(h.calls()).toBe(1);
+  expect(h.board.status()).toMatchObject({ threadReads: 1, threadReadErrors: 0, threadReadsByReason: { run: 1, state: 0, followup: 0 } });
+});
+
+test.each<ThreadState>(["running", "waiting", "queued", "needs-input", "idle"])("a finishing active run uses canonical thread state %s", async state => {
+  const h = cachedBoard();
+  Object.assign(h.thread, { activeRunId: runA, latestRunId: runA });
+  await h.board.snapshot();
+  const canonical = { ...h.thread, state, latestRunId: runB };
+  h.state.readThread = async () => ({ thread: canonical });
+  h.board.applyStatus("t", "idle", runA);
+  expect((await h.board.snapshot()).entries).toEqual(state === "idle" ? [] : [boardEntry(canonical, "/repo")]);
+  expect(h.calls()).toBe(1);
+});
+
+test.each(["before", "after"])("canonical run status received %s the old list wins the fetch race", async order => {
+  const h = cachedBoard();
+  Object.assign(h.thread, { activeRunId: runA, latestRunId: runA });
+  await h.board.snapshot();
+  h.time(30_000);
+  let list!: (value: { total: number; threads: ThreadSummary[] }) => void;
+  let read!: (value: { thread: ThreadSummary }) => void;
+  h.state.read = () => new Promise(done => { list = done; });
+  h.state.readThread = () => new Promise(done => { read = done; });
+  const pending = h.board.snapshot();
+  h.board.applyStatus("t", "idle", runB);
+  const canonical = { ...h.thread, latestRunId: runB };
+  if (order === "before") read({ thread: canonical });
+  list({ total: 1, threads: [{ ...h.thread }] });
+  if (order === "after") read({ thread: canonical });
+  expect((await pending).entries).toEqual([boardEntry(canonical, "/repo")]);
+});
+
+test("run reconciliation coalesces bursts and waits three seconds before a followup read", async () => {
+  const h = cachedBoard();
+  Object.assign(h.thread, { activeRunId: runA, latestRunId: runA });
+  await h.board.snapshot();
+  h.time(1_000);
+  let read!: (value: { thread: ThreadSummary }) => void;
+  h.state.readThread = () => new Promise(done => { read = done; });
+  for (let index = 0; index < 20; index++) h.board.applyStatus("t", "idle", runB);
+  expect(h.threadReads).toEqual([1_000]);
+  // A newer report invalidates this old read rather than allowing a stale leave.
+  h.board.applyStatus("t", "running", runA);
+  read({ thread: { ...h.thread, state: "idle" } });
+  expect((await h.board.snapshot()).entries).toHaveLength(1);
+  h.state.readThread = async () => ({ thread: { ...h.thread, latestRunId: runB } });
+  for (const at of [2_000, 3_999]) {
+    h.time(at);
+    h.board.applyStatus("t", "idle", runB);
+    expect((await h.board.snapshot()).entries).toHaveLength(1);
+    expect(h.threadReads).toEqual([1_000]);
+  }
+  h.time(4_000);
+  expect((await h.board.snapshot()).entries[0]?.workRevision).toBe(2);
+  expect(h.threadReads).toEqual([1_000, 4_000]);
+  expect(h.board.status().threadReadsByReason).toEqual({ run: 1, state: 0, followup: 1 });
+});
+
+test("state-only events preserve pending canonical run metadata over an old list", async () => {
+  const h = cachedBoard();
+  Object.assign(h.thread, { activeRunId: runA, latestRunId: runA });
+  const first = await h.board.snapshot();
+  h.time(30_000);
+  let list!: (value: { total: number; threads: ThreadSummary[] }) => void;
+  h.state.read = () => new Promise(done => { list = done; });
+  h.state.readThread = async () => ({ thread: { ...h.thread, latestRunId: runB } });
+  const control = fakeControl([], { board: h.board });
+  control.add({ threadId: "t", state: "running" });
+  const pending = h.board.snapshot();
+  // The directory read is an observable network milestone after reconciliation.
+  await control.backend.notification({ type: "thread.status", threadId: "t", runId: runB, state: "idle" });
+  expect(first.entries[0]?.workRevision).toBe(2);
+  await control.backend.notification({ type: "thread.status", threadId: "t", runId: runA, state: "running" });
+  expect(h.board.status().threadReads).toBe(1);
+  list({ total: 1, threads: [{ ...h.thread }] });
+  expect((await pending).entries[0]?.workRevision).toBe(2);
+});
+
+test("expiry preserves recent cooldowns and deferred followups after two thousand identities", async () => {
+  const h = cachedBoard();
+  Object.assign(h.thread, { activeRunId: runA, latestRunId: runA });
+  await h.board.snapshot();
+  h.state.readThread = async () => ({ thread: { ...h.thread, latestRunId: runB } });
+  h.board.applyStatus("t", "idle", runB);
+  await h.board.snapshot();
+  h.thread.latestRunId = runB;
+  for (let index = 1; index <= 1_999; index++) {
+    h.time(index * 4_000);
+    const thread = { ...h.thread, threadId: `old-${index}`, latestRunId: runA };
+    h.state.threads = [h.thread, thread];
+    h.board.markDirty();
+    await h.board.snapshot();
+    h.state.readThread = async () => ({ thread: { ...thread, latestRunId: runB } });
+    h.board.applyStatus(thread.threadId, "idle", runB);
+    await h.board.snapshot();
+  }
+  const recent = 1_999 * 4_000 + 3_000;
+  h.time(recent);
+  h.state.readThread = async () => ({ thread: h.thread });
+  h.board.applyStatus("t", "idle", runB);
+  await h.board.snapshot();
+  h.board.applyStatus("t", "idle", runB);
+  const before = h.board.status().threadReads;
+  h.time(recent + 100);
+  const next = { ...h.thread, threadId: "new", latestRunId: runA };
+  h.state.threads = [h.thread, next];
+  h.board.markDirty();
+  await h.board.snapshot();
+  h.state.readThread = async () => ({ thread: { ...next, latestRunId: runB } });
+  h.board.applyStatus("new", "idle", runB);
+  await h.board.snapshot();
+  h.board.applyStatus("t", "idle", runB);
+  await h.board.snapshot();
+  expect(h.board.status().threadReads).toBe(before + 1);
+  h.time(recent + 3_000);
+  h.state.readThread = async () => ({ thread: h.thread });
+  await h.board.snapshot();
+  expect(h.board.status().threadReads).toBe(before + 2);
+  expect(h.threadReads.slice(-3)).toEqual([recent, recent + 100, recent + 3_000]);
+});
+
+test("failed canonical reads fall back to SOFT and preserve the cached row", async () => {
+  const h = cachedBoard();
+  Object.assign(h.thread, { activeRunId: runA, latestRunId: runA });
+  await h.board.snapshot();
+  h.time(1_000);
+  h.state.readThread = async () => { throw new Error("unavailable"); };
+  h.board.applyStatus("t", "idle", runB);
+  for (const at of [3_000, 14_999]) {
+    h.time(at);
+    expect((await h.board.snapshot()).entries).toHaveLength(1);
+    expect(h.calls()).toBe(1);
+  }
+  h.time(15_000);
+  await h.board.snapshot();
+  expect(h.board.status()).toMatchObject({ threadReads: 1, threadReadErrors: 1,
+    fetchesByReason: { cold: 1, soft: 1, hard: 0, age: 0 } });
+});
+
+test("a slow canonical read does not delay status attention or its five second prompt", async () => {
+  setSystemTime(now);
+  const h = cachedBoard();
+  Object.assign(h.thread, { activeRunId: runA, latestRunId: runA });
+  await h.board.snapshot();
+  let read!: (value: { thread: ThreadSummary }) => void;
+  h.state.readThread = () => new Promise(done => { read = done; });
+  const control = fakeControl([], { board: h.board });
+  control.add({ threadId: "t", state: "needs-input", pending: [{ requestId: "q-run", kind: "question", requestKind: "user_input",
+    canRespond: true, questions: [{ id: "env", header: "Env", question: "Where?", options: [{ label: "dev" }] }] }] });
+  await control.backend.directoryOf("t");
+  const { store, attention: alerts } = attention(control.backend);
+  alerts.processNotification((await control.backend.notification({ type: "thread.status", threadId: "t", runId: runB, state: "running" }))!);
+  await alerts.tick();
+  expect(store.pendingSessionNotices()).toHaveLength(1);
+  setSystemTime(now + 5_000);
+  await alerts.tick();
+  expect(store.pendingOutbox().map(entry => entry.text)).toEqual([expect.stringContaining("Where?")]);
+  read({ thread: { ...h.thread, state: "needs-input", latestRunId: runB } });
+  await h.board.snapshot();
+});
+
+test.each([false, true])("live-shaped 180 s replay; retain assistant invalidation=%j", async retainAssistantInvalidation => {
+  let at = 0;
+  const control = fakeControl([], { now: () => at });
+  for (let index = 0; index < 10; index++) control.add({ threadId: `private-${index}`, title: "PRIVATE_TITLE", state: "running",
+    activeRunId: `run:thread:private-${index}:ordinal:1`, latestRunId: `run:thread:private-${index}:ordinal:1` });
+  let statuses = 0;
+  let messages = 0;
+  let created = 0;
+  for (at = 0; at < 180_000; at += 250) {
+    // 32 status reports/minute, 62 completions/minute, 2.5 creations/minute.
+    if (at >= (statuses + 1) * 60_000 / 32) {
+      const thread = control.threads.get(`private-${statuses % 10}`)!;
+      if (statuses % 3 === 0) thread.state = thread.state === "running" ? "waiting" : "running";
+      await control.backend.notification({ type: "thread.status", threadId: thread.threadId, state: thread.state, runId: thread.activeRunId });
+      statuses++;
+    }
+    if (at >= (messages + 1) * 60_000 / 62) {
+      if (retainAssistantInvalidation) control.backend.markDirty("soft");
+      await control.backend.notification({ type: "message.completed", threadId: "private-0", role: "assistant" });
+      messages++;
+    }
+    if (at > 0 && at % 24_000 === 0) {
+      const threadId = `created-${created++}`;
+      control.add({ threadId, state: "running" });
+      await control.backend.notification({ type: "thread.created", threadId });
+    }
+    if (at > 0 && at % 60_000 === 0) {
+      const thread = control.threads.get("private-9")!;
+      thread.state = thread.state === "idle" ? "running" : "idle";
+      await control.backend.notification({ type: "thread.status", threadId: thread.threadId, state: thread.state, runId: thread.activeRunId });
+    }
+    await control.backend.sessionBoard();
+  }
+  const telemetry = control.backend.boardStatus()!;
+  expect([statuses, messages, created]).toEqual([95, 185, 7]);
+  if (retainAssistantInvalidation) expect(telemetry.boardFetches / 3).toBe(5);
+  else {
+    expect(telemetry.boardFetches).toBe(10);
+    expect(telemetry.boardFetches / 3).toBeLessThanOrEqual(4);
+  }
+  expect(telemetry.dirtyEventsByType["message.completed:assistant"]).toEqual({ hard: 0, soft: 0, local: 185 });
+  expect(telemetry.boardFetchErrors).toBe(0);
+  expect(telemetry.threadReads).toBe(32);
+  expect(telemetry.threadReads / 3).toBeLessThanOrEqual(12);
+  expect(telemetry.threadReadErrors).toBe(0);
+  expect(telemetry.dirtyEventsByType["thread.status:same"]!.local).toBeGreaterThan(0);
+  expect(telemetry.dirtyEventsByType["thread.status:move"]!.local).toBeGreaterThan(0);
+  expect(telemetry.dirtyEventsByType["thread.status:leave"]!.local).toBeGreaterThan(0);
+  expect(JSON.stringify(telemetry)).not.toMatch(/private-|PRIVATE_TITLE|created-/);
 });
 
 test("the full 500-row roster is mapped and warns once per ten minutes, before filtering iMessage", async () => {
@@ -336,7 +729,7 @@ test("the full 500-row roster is mapped and warns once per ten minutes, before f
   expect(h.warnings).toEqual(["board-roster-at-limit", "board-roster-at-limit"]);
 });
 
-test("plain message wakes wait for the soft gap; status events use the hard gap", async () => {
+test("plain message wakes wait for the soft gap while cached status moves need no fetch", async () => {
   let at = now;
   const control = fakeControl([], { now: () => at });
   control.add({ threadId: "t", state: "running" });
@@ -355,22 +748,46 @@ test("plain message wakes wait for the soft gap; status events use the hard gap"
     await control.backend.notification({ type: "thread.status", threadId: "t", state: "queued" });
     await control.backend.sessionBoard();
   }
-  expect(reads()).toBe(2);
+  expect(reads()).toBe(1);
   at += 3_000;
   await control.backend.sessionBoard();
-  expect(reads()).toBe(3);
+  expect(reads()).toBe(1);
+  at = now + 15_000;
+  await control.backend.sessionBoard();
+  expect(reads()).toBe(2);
+});
+
+test("assistant completions are counted without fetching inside thirty seconds", async () => {
+  let at = 0;
+  const control = fakeControl([], { now: () => at });
+  control.add({ threadId: "private-thread", title: "PRIVATE_TITLE", state: "running" });
+  const first = await control.backend.sessionBoard();
+  for (const time of [1_000, 3_000, 15_000, 29_999]) {
+    at = time;
+    expect(await control.backend.notification({ type: "message.completed", threadId: "private-thread", role: "assistant" })).toBeUndefined();
+    expect(await control.backend.sessionBoard()).toBe(first);
+    expect(control.backend.boardStatus()?.boardFetches).toBe(1);
+  }
+  const store = new Store(":memory:");
+  stores.push(store);
+  const api = createApi({ store, enabled: () => true, chatId: () => 100, timezone: "UTC", health: () => ({ board: control.backend.boardStatus() }) });
+  const health = await (await api(new Request("http://bridge/health"))).json();
+  expect(health.board.dirtyEventsByType).toEqual({ "message.completed:assistant": { hard: 0, soft: 0, local: 4 } });
+  expect(JSON.stringify(health)).not.toMatch(/private-thread|PRIVATE_TITLE/);
+  at = 30_000;
+  expect(await control.backend.sessionBoard()).not.toBe(first);
+  expect(control.backend.boardStatus()?.fetchesByReason).toEqual({ cold: 1, age: 1, hard: 0, soft: 0 });
 });
 
 type DirtyEvent = [Record<string, unknown>, boolean];
 test.each<DirtyEvent>([
   [{ type: "ready" }, true],
   [{ type: "thread.created" }, true],
-  ...["running", "waiting", "idle", "queued", "needs-input"].map<DirtyEvent>(state => [{ type: "thread.status", state }, true]),
   ...["request.opened", "request.resolved"].map<DirtyEvent>(type => [{ type, kind: "approval", requestId: "r" }, true]),
   ...["thread.archived", "thread.unarchived", "thread.deleted", "thread.settled", "thread.unsettled",
     "thread.runtime-mode-updated", "run.created", "run.updated", "runtime-request.updated"].map<DirtyEvent>(change => [{ type: "thread.updated", change }, true]),
   ...["thread.model-selection-updated", "thread.interaction-mode-updated", "thread.renamed", "message.updated"].map<DirtyEvent>(change => [{ type: "thread.updated", change }, false]),
-  ...["user", "assistant"].map<DirtyEvent>(role => [{ type: "message.completed", role }, false]),
+  [{ type: "message.completed", role: "user" }, false],
   [{ type: "thread.status", state: "future-state" }, false],
   [{ type: "future.event" }, false],
   [{ type: "constructor" }, false],
