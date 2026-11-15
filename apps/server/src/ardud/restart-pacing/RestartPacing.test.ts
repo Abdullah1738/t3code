@@ -563,6 +563,47 @@ it.effect.each([false, true])(
   },
 );
 
+it.effect("a retired paced start completes its note when its replacement is cancelled", () => {
+  const h = harness({ spacingMs: 0 });
+  h.setLoad(2);
+  return Effect.gen(function* () {
+    const pacing = yield* RestartPacing.RestartPacing;
+    const original = { ...source(1), effectId: "start:retired" };
+    const other = source(2);
+    assert.isAbove(yield* pacing.acquire(original), 0);
+    h.cancelled.add(original.effectId);
+    h.protectedNotes.add(original.sourceRunId);
+    assert.isAbove(yield* pacing.acquire(other), 0);
+    assert.deepEqual(h.positions.at(-1), { id: other.sourceRunId, position: 1 });
+
+    h.positions.length = 0;
+    h.protectedNotes.delete(original.sourceRunId);
+    assert.isAbove(yield* pacing.acquire(other), 0);
+    assert.deepEqual(h.positions, [{ id: original.sourceRunId, position: null }]);
+  }).pipe(Effect.provide(h.layer));
+});
+
+it.effect("retired note cleanup continues after the admission queue empties", () => {
+  const h = harness({ spacingMs: 0 });
+  h.setLoad(2);
+  return Effect.gen(function* () {
+    const pacing = yield* RestartPacing.RestartPacing;
+    const original = { ...source(1), effectId: "start:retired" };
+    const replacement = { ...source(2), threadId: original.threadId, effectId: "start:new" };
+    assert.isAbove(yield* pacing.acquire(original), 0);
+    h.protectedNotes.add(original.sourceRunId);
+    assert.isAbove(yield* pacing.acquire(replacement), 0);
+    h.setLoad(0);
+    yield* TestClock.adjust("15 seconds");
+    assert.equal(yield* pacing.acquire(replacement), 0);
+
+    h.positions.length = 0;
+    h.protectedNotes.delete(original.sourceRunId);
+    yield* TestClock.adjust("10 seconds");
+    assert.deepEqual(h.positions, [{ id: original.sourceRunId, position: null }]);
+  }).pipe(Effect.provide(h.layer));
+});
+
 it.effect("load holds until the next check after load drops", () => {
   const h = harness();
   h.setLoad(2);
