@@ -13119,11 +13119,14 @@ const make = Effect.gen(function* () {
   ) =>
     Effect.suspend(() => {
       let target = cardId;
-      return SavedWrite.recover(guardDeferred(name, effect, cardId), (saved) => {
-        if (saved.kind !== "card") return undefined;
-        target ??= saved.card.id;
-        return saved.card.id === target && isSaved(saved.card) ? saved.card : undefined;
-      });
+      return SavedWrite.subSteps(
+        name,
+        SavedWrite.recover(guardDeferred(name, effect, cardId), (saved) => {
+          if (saved.kind !== "card") return undefined;
+          target ??= saved.card.id;
+          return saved.card.id === target && isSaved(saved.card) ? saved.card : undefined;
+        }),
+      );
     });
   const read = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     Deferred.await(startupReady).pipe(Effect.andThen(effect), Effect.mapError(toKanbanError));
@@ -16747,6 +16750,7 @@ const make = Effect.gen(function* () {
             ),
           );
         }),
+        (effect) => SavedWrite.subSteps("card.reviewResult", effect),
       );
     });
 
