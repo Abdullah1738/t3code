@@ -25503,6 +25503,44 @@ const reuseDeliveryFixture = Effect.fn("test.reuseDeliveryFixture")(function* (
   return { kanban, board, store, card, thread };
 });
 
+it.effect("dispatch does not reread a parked home card already in its snapshot", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const reads: string[] = [];
+    let watching = false;
+    const observed = Layer.effect(
+      KanbanStore.KanbanStore,
+      Effect.map(KanbanStore.KanbanStore, (store) =>
+        KanbanStore.KanbanStore.of({
+          ...store,
+          card: (id) =>
+            Effect.suspend(() => {
+              if (watching) reads.push(id);
+              return store.card(id);
+            }),
+        }),
+      ),
+    ).pipe(Layer.provide(KanbanStore.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, card } = yield* parkedWork;
+      const parked = yield* kanban.waitCard(
+        card.id,
+        {
+          on: "time",
+          until: DateTime.formatIso(DateTime.makeUnsafe((yield* Clock.currentTimeMillis) + 60_000)),
+          note: "Later",
+        },
+        owner,
+      );
+      watching = true;
+      yield* kanban.dispatchNow;
+      watching = false;
+      assert.deepStrictEqual(reads, []);
+      assert.deepStrictEqual((yield* kanban.card(card.id)).card, parked);
+    }).pipe(Effect.provide(testLayer(fake.layer, undefined, undefined, observed)));
+  }),
+);
+
 it.effect.each(["deployed", "working", "todo", "legacy"] as const)(
   "#1505 claimed rework checks its thread's %s home card",
   (homeStage) =>
@@ -25589,6 +25627,69 @@ it.effect.each(["deployed", "working", "todo", "legacy"] as const)(
           );
         }
       }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect.each(["deployed", "needs_review"] as const)(
+  "destination validation rereads a home that moved to %s after its snapshot",
+  (stage) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      let home: KanbanCard | null = null;
+      let reads = 0;
+      const changing = Layer.effect(
+        KanbanStore.KanbanStore,
+        Effect.map(KanbanStore.KanbanStore, (store) =>
+          KanbanStore.KanbanStore.of({
+            ...store,
+            threadLinksByIds: (ids) =>
+              Effect.gen(function* () {
+                if (home !== null && ++reads === 2)
+                  yield* store.putCard({
+                    ...home,
+                    stage,
+                    activeThreadId: null,
+                    activeRole: null,
+                    activePool: null,
+                  });
+                return yield* store.threadLinksByIds(ids);
+              }),
+          }),
+        ),
+      ).pipe(Layer.provide(KanbanStore.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+        const original = yield* kanban.createCard(board.id, { prompt: "Home" }, owner);
+        yield* kanban.dispatchNow;
+        const working = (yield* kanban.card(original.id)).card;
+        const thread = working.workThreadId!;
+        const claimed = yield* kanban.createCard(board.id, { prompt: "Claimed" }, owner);
+        yield* kanban.claimCard(thread, claimed.id);
+        const carried = (yield* kanban.card(claimed.id)).card;
+        yield* store.putCard({
+          ...carried,
+          stage: "todo",
+          activeThreadId: null,
+          activeRole: null,
+          activePool: null,
+        });
+        home = working;
+        const messages = (yield* Ref.get(fake.threads)).get(thread)!.messages.length;
+        yield* kanban.dispatchNow;
+        assert.isAtLeast(reads, 2);
+        assert.notStrictEqual((yield* store.card(original.id))?.stage, "working");
+        const deferred = (yield* kanban.card(claimed.id)).card;
+        assert.strictEqual(deferred.stage, "todo");
+        assert.isNull(deferred.activeThreadId);
+        assert.lengthOf((yield* Ref.get(fake.threads)).get(thread)!.messages, messages);
+        yield* kanban.dispatchNow;
+        const dispatched = (yield* kanban.card(claimed.id)).card;
+        assert.strictEqual(dispatched.stage, "working");
+        assert.notStrictEqual(dispatched.workThreadId, thread);
+        assert.strictEqual((yield* store.threadLink(dispatched.workThreadId!))?.cardId, claimed.id);
+      }).pipe(Effect.provide(testLayer(fake.layer, undefined, undefined, changing)));
     }),
 );
 
