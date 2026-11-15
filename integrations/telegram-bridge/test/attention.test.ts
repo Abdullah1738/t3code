@@ -709,6 +709,43 @@ test("settled sessions are never announced, and leftover review notices are with
   expect(h.store.sessionNotice(notice.id)?.state).toBe("cancelled");
 });
 
+test("a reused cached idle board cannot clear a newer busy event", async () => {
+  const h = setup();
+  const idle = { version: 1 as const, revision: 0, activatedAt: 0, migrationComplete: true,
+    entries: [{ sessionId: "ses_1", directory: "/Chats", title: "Deployment review", state: "waiting" as const,
+      status: "idle", workRevision: 0, updatedAt: now }] };
+  h.backend.board = idle;
+  await h.attention.tick();
+  expect(h.backend.permissionReads).toBe(0);
+  h.attention.processEvent(statusEvent("busy"));
+  await h.attention.tick();
+  await h.attention.tick();
+  expect(h.backend.permissionReads).toBe(2);
+  h.backend.board = { ...idle };
+  await h.attention.tick();
+  expect(h.backend.permissionReads).toBe(2);
+});
+
+test("a board read released by a busy event retains its original event versions", async () => {
+  const h = setup();
+  const idle: BoardSnapshot = { version: 1, revision: 0, activatedAt: 0, migrationComplete: true,
+    entries: [{ sessionId: "ses_1", directory: "/Chats", title: "Deployment review", state: "waiting", status: "idle", workRevision: 0, updatedAt: now }] };
+  let resolve!: (board: BoardSnapshot) => void;
+  const read = new Promise<BoardSnapshot>(done => { resolve = done; });
+  h.backend.sessionBoard = () => read;
+  const tick = h.attention.tick();
+  h.attention.processEvent(statusEvent("busy"));
+  await tick;
+  expect(h.backend.permissionReads).toBe(1);
+  resolve(idle);
+  await h.attention.tick();
+  await h.attention.tick();
+  expect(h.backend.permissionReads).toBe(3);
+  h.backend.sessionBoard = async () => ({ ...idle });
+  await h.attention.tick();
+  expect(h.backend.permissionReads).toBe(3);
+});
+
 test("iMessage conversations and their subagents never prompt on Telegram, even with the iMessage bridge down", async () => {
   const h = setup();
   const imessage = { openchamber: { origin: "imessage", assist: { recap: "r" } } };

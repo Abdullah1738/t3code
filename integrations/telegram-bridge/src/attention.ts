@@ -43,6 +43,11 @@ export class Attention {
   private stopped = false;
   private handling?: Promise<void>;
   private requestsReadAt = 0;
+  private observedBoard?: BoardSnapshot;
+  private releaseBoardWait?: () => void;
+  private directAttention = false;
+  private boardRead?: Promise<BoardSnapshot | undefined>;
+  private readonly boardReadVersions = new WeakMap<BoardSnapshot, ReadonlyMap<string, number>>();
 
   constructor(
     private readonly store: Store,
@@ -62,6 +67,7 @@ export class Attention {
 
   stop(): void {
     this.stopped = true;
+    this.releaseBoardWait?.();
     if (this.wakeTimer) clearTimeout(this.wakeTimer);
     this.wakeTimer = undefined;
     this.activeSessions.clear();
@@ -80,6 +86,11 @@ export class Attention {
     this.wakeTimer.unref?.();
   }
 
+  private prioritizeRequests(): void {
+    this.directAttention = true;
+    this.releaseBoardWait?.();
+  }
+
   status(): Record<string, unknown> {
     const notices = this.store.pendingSessionNotices();
     const reminders = this.store.listReminders();
@@ -90,6 +101,7 @@ export class Attention {
         return counts;
       }, {}),
       remindersScheduled: reminders.filter(reminder => reminder.status === "scheduled").length,
+      ...(this.backend.boardStatus ? { board: this.backend.boardStatus() } : {}),
     };
   }
 
@@ -125,13 +137,17 @@ export class Attention {
     if (event.type === "asked") {
       const entry: BoardEntry = { sessionId, directory, title: sessionId, state: "running", workRevision: 0, updatedAt: Date.now() };
       this.remember(entry, event.kind, event.requestId);
+      this.prioritizeRequests();
       this.wake();
       return;
     }
     if (event.type === "status") {
+      // The cached board can predate a request that this status would reveal.
+      this.requestsReadAt = 0;
       const status = event.status;
       if (status === "busy") this.activeSessions.add(sessionKey);
       else this.activeSessions.delete(sessionKey);
+      this.prioritizeRequests();
       this.wake();
       return;
     }
@@ -141,6 +157,7 @@ export class Attention {
       this.cancel(this.store.sessionNotice(noticeId) ?? {
         id: noticeId, kind, sessionId, directory, requestId, firstSeen: Date.now(), state: "pending",
       });
+      this.prioritizeRequests();
       this.wake();
       return;
     }
@@ -224,9 +241,29 @@ export class Attention {
   private async run(): Promise<void> {
     const epoch = this.epoch;
     const boardVersions = new Map(this.sessionEpochs);
-    const board = await this.backend.sessionBoard().catch(error => { toolError("telegram", "tg.attention.board", undefined, error); return undefined; });
+    // Direct attention events and known notices must not wait behind a slow
+    // roster list. Its single-flight refresh continues for later quiet ticks.
+    let release!: () => void;
+    const attentionEvent = new Promise<undefined>(resolve => { release = () => resolve(undefined); });
+    this.releaseBoardWait = release;
+    if (this.directAttention || this.store.pendingSessionNotices().length) release();
+    const read = this.boardRead ??= this.backend.sessionBoard()
+      .then(board => {
+        if (!this.boardReadVersions.has(board)) this.boardReadVersions.set(board, boardVersions);
+        return board;
+      })
+      .catch(error => { toolError("telegram", "tg.attention.board", undefined, error); return undefined; })
+      .finally(() => { this.boardRead = undefined; });
+    const board = await Promise.race([read, attentionEvent]).finally(() => {
+      if (this.releaseBoardWait === release) this.releaseBoardWait = undefined;
+    });
+    this.directAttention = false;
     if (epoch !== this.epoch || this.stopped) return;
-    if (board?.migrationComplete) this.observeBoard(board, boardVersions);
+    // Reusing a cached idle row must not erase a newer busy event.
+    if (board?.migrationComplete && board !== this.observedBoard) {
+      this.observeBoard(board, this.boardReadVersions.get(board) ?? boardVersions);
+      this.observedBoard = board;
+    }
     // Settled sessions are not announced: agents use `notify` when they need the owner.
     const directories = new Set((board?.entries ?? [])
       .filter(entry => entry.attention || entry.state === "running")
