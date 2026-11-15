@@ -604,14 +604,14 @@ const handlers = {
       Effect.gen(function* () {
         const card = yield* cardFor(service, caller, input.card, input.boardId, true);
         const detail = yield* service.card(card.id);
+        const { id, number, title, stage, boardId } = detail.card;
+        const rest =
+          typeof input.events === "object" && input.events.before !== undefined
+            ? { card: { id, number, title, stage, boardId } }
+            : { card: detail.card, threads: detail.threads };
         return {
-          card: detail.card,
-          threads: detail.threads,
-          ...Activity.pageCardEvents(
-            { card: detail.card, threads: detail.threads },
-            detail.events,
-            input.events,
-          ),
+          ...rest,
+          ...Activity.pageCardEvents(rest, detail.events, input.events),
         };
       }),
     ),

@@ -29,7 +29,7 @@ export const ACTIVITY_DEFAULT_WINDOW_MS = 24 * 60 * 60 * 1000;
 /** Events card_get returns when no events page is asked for. */
 export const CARD_EVENTS_DEFAULT = 20;
 export const CARD_EVENTS_MAX = 200;
-/** Characters one card_get reply stays under (oldest events are dropped whole to fit). */
+/** Character budget for event pages; the first read always keeps the full card and threads. */
 export const CARD_GET_CHARS = 60_000;
 /** Open cards over this long in one stage are listed. */
 const LONG_OPEN_MS = 24 * 60 * 60 * 1000;
@@ -866,19 +866,31 @@ export type CardEventsRequest =
 
 /**
  * card_get's events page: the newest `limit` (default 20) before `before`,
- * oldest first. Oldest events are dropped whole until the reply (card and
- * threads included, never trimmed) fits CARD_GET_CHARS; olderEvents is the
- * `before` that reads the page before, null at the start. "all" returns every
+ * oldest first. Oldest events are dropped whole until the reply (the full card
+ * and threads on first read, a card header when paging) fits CARD_GET_CHARS;
+ * olderEvents is the `before` that reads the page before, null at the start. "all" returns every
  * event, which can be more than a client takes.
  */
 export const pageCardEvents = (
   rest: unknown,
   events: ReadonlyArray<KanbanCardEvent>,
   request: CardEventsRequest,
-) => {
+): {
+  events: ReadonlyArray<KanbanCardEvent>;
+  eventsTotal: number;
+  olderEvents: number | null;
+  note?: string;
+} => {
   const total = events.length;
   if (request === "all") return { events, eventsTotal: total, olderEvents: null };
   const before = request?.before;
+  const cursor = (value: number | null) =>
+    before !== undefined && value !== null && value >= before
+      ? {
+          olderEvents: null,
+          note: 'Paging stopped because the cursor would not move backward; events: "all" returns every event.',
+        }
+      : { olderEvents: value };
   const limit = Math.min(Math.max(request?.limit ?? CARD_EVENTS_DEFAULT, 1), CARD_EVENTS_MAX);
   const older = before === undefined ? events : events.filter((event) => event.id < before);
   let page = older.slice(-limit);
@@ -900,7 +912,7 @@ export const pageCardEvents = (
     return {
       events: page,
       eventsTotal: total,
-      olderEvents: older.some((event) => event.id < first.id) ? first.id : null,
+      ...cursor(older.some((event) => event.id < first.id) ? first.id : null),
     };
   }
   const newest = older.at(-1);
@@ -909,14 +921,14 @@ export const pageCardEvents = (
     return {
       events: [],
       eventsTotal: total,
-      olderEvents: older.length > 1 ? newest.id : null,
       note: `Event ${newest.id} is too big to send with the card; events: "all" returns it.`,
+      ...cursor(older.length > 1 ? newest.id : null),
     };
   return {
     events: [],
     eventsTotal: total,
-    olderEvents: newest.id + 1,
-    note: 'The card alone fills the reply; events: "all" returns its events.',
+    note: "The card and threads fill the reply; use events {before: olderEvents} to read events with a short card header.",
+    ...cursor(newest.id + 1),
   };
 };
 
