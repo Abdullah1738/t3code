@@ -139,15 +139,22 @@ export class Store {
   }
 
   groupAudience(): string[] {
-    const roster = this.db.query<{ participants: string }, []>(`SELECT json_extract(payload, '$.participants') AS participants
+    const rosters = this.db.query<{ rowid: number; participants: string }, []>(`SELECT rowid, json_extract(payload, '$.participants') AS participants
       FROM inbound WHERE json_type(payload, '$.participants') = 'array'
-      AND json_array_length(payload, '$.participants') > 0 ORDER BY rowid DESC LIMIT 1`).get();
-    const members = roster ? (JSON.parse(roster.participants) as unknown[])
-      .filter((address): address is string => typeof address === "string").map(address => address.trim()).filter(Boolean) : [];
-    if (members.length) return members;
-    return this.db.query<{ sender: string }, []>(`SELECT DISTINCT trim(json_extract(payload, '$.sender')) AS sender
-      FROM inbound WHERE json_type(payload, '$.sender') = 'text' AND trim(json_extract(payload, '$.sender')) <> ''
-      ORDER BY sender`).all().map(row => row.sender);
+      AND json_array_length(payload, '$.participants') > 0 ORDER BY rowid DESC`);
+    let members: string[] = [];
+    let since = 0;
+    // Select and normalize in JS: SQLite TRIM does not recognize all JS whitespace.
+    for (const roster of rosters.iterate()) {
+      members = (JSON.parse(roster.participants) as unknown[])
+        .filter((address): address is string => typeof address === "string").map(address => address.trim()).filter(Boolean);
+      if (members.length) { since = roster.rowid; break; }
+    }
+    // Rosterless messages can reveal members added since the last reported roster.
+    const observed = this.db.query<{ sender: string }, [number]>(`SELECT DISTINCT json_extract(payload, '$.sender') AS sender
+      FROM inbound WHERE rowid >= ? AND json_type(payload, '$.sender') = 'text'
+      ORDER BY sender`).all(since).map(row => row.sender.trim()).filter(Boolean);
+    return [...new Set([...members, ...observed])];
   }
 
   pendingInbound(): InboundRecord[] {
