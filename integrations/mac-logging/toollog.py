@@ -258,7 +258,94 @@ def cpu_fields(values):
     return result
 
 
+def u_text(value, limit):
+    if not isinstance(value, str):
+        return None
+    if SECRET.search(value):
+        return '[redacted]'
+    return ''.join(c if c.isprintable() else ' ' for c in value)[:limit]
+
+
+def u_episode_fields(values):
+    if not isinstance(values, dict):
+        return {}
+    if any(not finite_number(values.get(k)) or not 0 <= values[k] <= 1e15
+           for k in ('start', 'lastSeen', 'peakCount')):
+        return {}
+    end = values.get('end')
+    if end is not None and (not finite_number(end) or not values['lastSeen'] <= end <= 1e15):
+        return {}
+    if values['start'] > values['lastSeen']:
+        return {}
+    result = {k: values[k] for k in ('start', 'lastSeen', 'peakCount')}
+    result['end'] = end
+    result['emptySamples'] = min(3, max(0, values.get('emptySamples', 0))) if type(values.get('emptySamples')) is int else 0
+    volumes, comms = values.get('volumes', []), values.get('topComms', [])
+    result['volumes'] = [u_text(v, 128) for v in volumes[:15] if isinstance(v, str)] if isinstance(volumes, list) else []
+    result['topComms'] = []
+    for proc in comms[:10] if isinstance(comms, list) else []:
+        if (isinstance(proc, dict) and isinstance(proc.get('comm'), str)
+                and type(proc.get('count')) is int and proc['count'] >= 0):
+            result['topComms'].append(dict(comm=u_text(proc['comm'], 80), count=proc['count']))
+    return result
+
+
+def u_sample_fields(values):
+    if not isinstance(values, dict):
+        return {}
+    result = {}
+    if values.get('failure') in ('timeout', 'exit', 'parse', 'unavailable'):
+        result['failure'] = values['failure']
+    for key in ('count', 'lsofStuck'):
+        if type(values.get(key)) is int and values[key] >= 0:
+            result[key] = values[key]
+    comms = values.get('byComm')
+    if isinstance(comms, dict):
+        result['byComm'] = {}
+        for comm, n in sorted(((c, n) for c, n in comms.items() if isinstance(c, str) and type(n) is int and n >= 0),
+                              key=lambda p: (-p[1], p[0]))[:50]:
+            label = u_text(comm, 80)
+            result['byComm'][label] = result['byComm'].get(label, 0)+n
+    procs = values.get('procs')
+    if isinstance(procs, list):
+        result['procs'] = []
+        for proc in procs[:15]:
+            if not isinstance(proc, dict):
+                continue
+            if any(not finite_number(proc.get(k)) or proc[k] < 0 for k in ('pid', 'ppid', 'ageS', 'cpuS')):
+                continue
+            if any(type(proc[k]) is not int for k in ('pid', 'ppid')):
+                continue
+            clean = {k: proc[k] for k in ('pid', 'ppid', 'ageS', 'cpuS')}
+            for key, limit in (('parentComm', 80), ('parentArgs', 200), ('stat', 16),
+                               ('comm', 80), ('args', 200), ('volume', 128)):
+                clean[key] = u_text(proc.get(key), limit)
+            result['procs'].append(clean)
+    callers = values.get('lsofCallers')
+    if isinstance(callers, list):
+        result['lsofCallers'] = []
+        for caller in callers[:5]:
+            if (isinstance(caller, dict) and all(type(caller.get(k)) is int and caller[k] >= 0 for k in ('parentPid', 'n'))):
+                result['lsofCallers'].append(dict(parentPid=caller['parentPid'], n=caller['n'],
+                                                 parentArgs=u_text(caller.get('parentArgs'), 200)))
+    if isinstance(values.get('episode'), dict):
+        result['episode'] = u_episode_fields(values['episode'])
+    return result
+
+
 def safe_fields(values, event=None):
+    if event == 'proc.u_parse':
+        result = {}
+        if isinstance(values, dict):
+            if type(values.get('skippedRows')) is int and values['skippedRows'] >= 0:
+                result['skippedRows'] = values['skippedRows']
+            if isinstance(values.get('firstBadRow'), str):
+                result['firstBadRow'] = u_text(values['firstBadRow'], 200)
+        return result
+    if event == 'proc.u_sample':
+        return u_sample_fields(values)
+    if event == 'proc.u_episode':
+        return u_episode_fields(values)
     if event == 'cpu.sample':
         return cpu_fields(values)
     if event == 'disk.clone_wedge':
@@ -370,6 +457,28 @@ def record(component, kind, name, now, duration_ms=None, ok=None, ids=None, prop
                 break
             props[key].pop()
             props[key+'Omitted'] = props.get(key+'Omitted', 0)+1
+    if name in ('proc.u_sample', 'proc.u_episode'):
+        # At most 23.6 MB/day even when every minute has a wedge and Unicode argv.
+        while len((json.dumps(row, separators=(',', ':'), allow_nan=False)+'\n').encode()) > 16384:
+            props = row['props']
+            # Keep one process row ahead of optional aggregate detail, so a
+            # once-daily umount marker always corresponds to a written row.
+            key = 'procs' if len(props.get('procs', [])) > 1 else next(
+                (k for k in ('byComm', 'lsofCallers') if props.get(k)), None)
+            target = props
+            if key is None:
+                target = props.get('episode', props)
+                key = next((k for k in ('volumes', 'topComms') if target.get(k)), None)
+            if key is None:
+                key = 'procs' if props.get('procs') else None
+                target = props
+            if key is None:
+                break
+            if isinstance(target[key], dict):
+                target[key].pop(next(reversed(target[key])))
+            else:
+                target[key].pop()
+            target[key+'Omitted'] = target.get(key+'Omitted', 0)+1
     return row
 
 

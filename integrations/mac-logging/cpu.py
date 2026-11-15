@@ -156,5 +156,15 @@ def sample(run=subprocess.run, clock=time.monotonic):
         return props
 
 
-if __name__ == '__main__':
+def main():
+    try:
+        from u_sample import sample as sample_u
+        sample_u()
+    except Exception:
+        emit('proc', 'error', 'proc.u_sample', ok=False,
+             props=dict(failure='unavailable'), error_tag='proc.u_unavailable')
     sample()
+
+
+if __name__ == '__main__':
+    main()
