@@ -43,6 +43,8 @@ export interface ControlStoreShape {
     readonly since: number;
     readonly cursor: { readonly u: number; readonly id: string } | null;
     readonly limit: number;
+    readonly role?: "user" | "assistant" | "system" | "all";
+    readonly threadIds?: ReadonlyArray<string>;
   }) => Effect.Effect<
     {
       readonly total: number;
@@ -56,6 +58,10 @@ export interface ControlStoreShape {
     },
     ControlStoreError
   >;
+  readonly lastAssistant: (
+    threadId: string,
+    runId: string | null,
+  ) => Effect.Effect<ReturnType<typeof lastAssistantText>, ControlStoreError>;
   readonly messagePage: (input: {
     readonly threadId: string;
     readonly role: string | null;
@@ -539,8 +545,14 @@ export const make = Effect.gen(function* () {
   const userMessagesSince: ControlStoreShape["userMessagesSince"] = Effect.fn(
     "ControlStore.userMessagesSince",
   )(
-    function* ({ since, cursor, limit }) {
-      const predicate = sql`m.role = 'user'
+    function* ({ since, cursor, limit, role = "user", threadIds }) {
+      const index = sql.literal(
+        role === "user"
+          ? "ardud_control_user_messages_since_idx"
+          : "ardud_control_messages_since_idx",
+      );
+      const predicate = sql`${role === "all" ? sql`1 = 1` : role === "user" ? sql`m.role = 'user'` : sql`m.role = ${role}`}
+        ${threadIds === undefined ? sql`` : sql`AND m.thread_id IN (SELECT value FROM json_each(${encodeIds(threadIds)}))`}
         AND CAST(ROUND(unixepoch(m.updated_at, 'subsec') * 1000) AS INTEGER) > ${since}
         AND EXISTS (SELECT 1 FROM orchestration_v2_projection_threads t
           WHERE t.thread_id = m.thread_id AND t.deleted_at IS NULL)`;
@@ -557,12 +569,12 @@ export const make = Effect.gen(function* () {
       }>`
         WITH total AS (
           SELECT COUNT(*) AS total
-          FROM orchestration_v2_projection_messages m INDEXED BY ardud_control_user_messages_since_idx
+          FROM orchestration_v2_projection_messages m INDEXED BY ${index}
           WHERE ${predicate}
         ), page AS MATERIALIZED (
           SELECT m.message_id, m.thread_id, m.payload_json,
             CAST(ROUND(unixepoch(m.updated_at, 'subsec') * 1000) AS INTEGER) AS u
-          FROM orchestration_v2_projection_messages m INDEXED BY ardud_control_user_messages_since_idx
+          FROM orchestration_v2_projection_messages m INDEXED BY ${index}
           WHERE ${predicate}
             ${
               cursor === null
@@ -628,6 +640,34 @@ export const make = Effect.gen(function* () {
       .slice(0, limit)
       .map((row) => row.message_id);
   });
+  const lastAssistant: ControlStoreShape["lastAssistant"] = Effect.fn("ControlStore.lastAssistant")(
+    function* (threadId, runId) {
+      // SQLite trim defaults to ASCII space. Match JS trim, including blank streaming
+      // messages and imported Unicode whitespace, before selecting one payload.
+      const whitespace =
+        "\u0009\u000a\u000b\u000c\u000d \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff";
+      return yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const ids = yield* newestMessageIds(
+            sql`thread_id = ${threadId} AND role = 'assistant'
+          ${runId === null ? sql`` : sql`AND run_id = ${runId}`}
+          AND trim(json_extract(payload_json, '$.text'), ${whitespace}) <> ''`,
+            1,
+          );
+          if (ids.length === 0) return null;
+          const rows = yield* sql<{ readonly payload_json: string }>`SELECT payload_json
+          FROM orchestration_v2_projection_messages WHERE thread_id = ${threadId}
+            AND message_id = ${ids[0]}`;
+          return lastAssistantText(
+            yield* Effect.forEach(rows, (row) => decodeMessage(row.payload_json)),
+            runId,
+          );
+        }),
+      );
+    },
+    NodeSqliteClient.readOnly,
+    Effect.mapError(fail("read-last-assistant")),
+  );
   const messagePage: ControlStoreShape["messagePage"] = Effect.fn("ControlStore.messagePage")(
     (input) =>
       sql.withTransaction(
@@ -731,6 +771,7 @@ export const make = Effect.gen(function* () {
 
   return ControlStore.of({
     userMessagesSince,
+    lastAssistant,
     messagePage,
     threadCandidatePage,
     threadCandidateCount,

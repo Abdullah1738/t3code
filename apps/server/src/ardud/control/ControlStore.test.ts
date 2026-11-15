@@ -811,11 +811,69 @@ describe("ControlStore message pages", () => {
           limit: 1,
         });
         assert.equal(page.total, 0);
+        assert.deepStrictEqual(
+          yield* store.lastAssistant("t-moved", "answer-run"),
+          page.lastAssistant,
+        );
+        assert.isNull(yield* store.lastAssistant("t-moved", "missing-run"));
         assert.deepStrictEqual(page.lastAssistant, {
           messageId: "msg_Z",
           runId: "answer-run",
           text: "msg_Z",
         });
+      }),
+    ),
+  );
+
+  it.effect("last-assistant SQL matches text, run and timestamp edge cases", () =>
+    run(
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const store = yield* ControlStore.ControlStore;
+        const fixtures = [
+          ["old", "answer-run", "old", "2026-03-01T00:00:00Z"],
+          ["A", "answer-run", " upper ", "2026-03-02T00:00:00Z"],
+          ["a", "answer-run", "lower", "2026-03-02T04:00:00+04:00"],
+          ["nul", "nul-run", "\u0000answer", "2026-03-03T00:00:00Z"],
+          ["blank", "answer-run", "\u00a0\u2003\ufeff", "2026-03-04T00:00:00Z"],
+        ];
+        for (const [id, runId, text, at] of fixtures) {
+          yield* sql`INSERT INTO orchestration_v2_projection_messages ${sql.insert({
+            message_id: id,
+            thread_id: "t-moved",
+            run_id: runId,
+            node_id: null,
+            role: "assistant",
+            streaming: 0,
+            created_at: at,
+            updated_at: at,
+            payload_json: JSON.stringify({
+              id,
+              threadId: "t-moved",
+              runId,
+              nodeId: null,
+              role: "assistant",
+              text,
+              createdBy: "agent",
+              creationSource: "provider",
+              attachments: [],
+              streaming: false,
+              createdAt: at,
+              updatedAt: at,
+            }),
+          })}`;
+        }
+        for (const runId of [null, "answer-run", "nul-run", "missing"]) {
+          const page = yield* store.messagePage({
+            threadId: "t-moved",
+            role: "user",
+            runId,
+            since: undefined,
+            afterMessageId: null,
+            limit: 1,
+          });
+          assert.deepStrictEqual(yield* store.lastAssistant("t-moved", runId), page.lastAssistant);
+        }
       }),
     ),
   );
