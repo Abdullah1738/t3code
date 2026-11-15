@@ -80,7 +80,7 @@ class FailbackTests(Isolated):
         self.assertEqual(self.con.execute('SELECT COUNT(*) FROM pool_pending').fetchone()[0], 0)
         self.assertEqual(self.con.execute("SELECT status,error FROM runs WHERE run_id='mine'").fetchone()[:],
                          ('forwarded', 'server'))
-        with sqlite3.connect(home_path) as con:
+        with contextlib.closing(sqlite3.connect(home_path)) as con, con:
             self.assertEqual(con.execute("SELECT run_id,status FROM runs").fetchone(), ('mine', 'starting'))
         acquire.assert_not_called()
         text = self.output.getvalue()
@@ -219,11 +219,11 @@ class FailbackTests(Isolated):
         self.pending()
         home_path = self.home_paths()
         home._forward_background('mine', 'boat', 'server')
-        with sqlite3.connect(home_path) as con:
+        with contextlib.closing(sqlite3.connect(home_path)) as con, con:
             con.execute("UPDATE runs SET status='forwarded',error='boat'")
         self.con.execute("UPDATE runs SET status='starting',error=NULL WHERE run_id='mine'")
         home._forward_background('mine', 'boat', 'server')
-        with sqlite3.connect(home_path) as con:
+        with contextlib.closing(sqlite3.connect(home_path)) as con, con:
             self.assertEqual(con.execute('SELECT status FROM runs').fetchone()[0], 'starting')
         for field in ('box_id', 'process_id'):
             with self.subTest(field=field):
@@ -250,7 +250,8 @@ class FailbackTests(Isolated):
                                         ('forwarded', 'other', None, None),
                                         ('forwarded', 'boat', 'box', None),
                                         ('forwarded', 'boat', None, 12)]:
-            with self.subTest(status=status, error=error, box=box, pid=pid), sqlite3.connect(home_path) as con:
+            with (self.subTest(status=status, error=error, box=box, pid=pid),
+                  contextlib.closing(sqlite3.connect(home_path)) as con, con):
                 common.ensure_schema(con)
                 con.execute('DELETE FROM runs')
                 con.execute('INSERT INTO runs(run_id,status,error,box_id,process_id) VALUES (?,?,?,?,?)',

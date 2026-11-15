@@ -647,14 +647,14 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
     next_home_probe = time.monotonic() + outage.PROBE_EVERY_S
     failover = home.failed_over()
     probe_every = home.failback_probe_seconds()
-    next_failback_probe = started + probe_every
+    queue.setdefault("next_failback_probe", started + probe_every)
 
     def check_home(*, force=False):
-        nonlocal next_home_probe, next_failback_probe
-        if failover and not home.BOAT_SELECTED.get() and time.monotonic() >= next_failback_probe:
+        nonlocal next_home_probe
+        if failover and not home.BOAT_SELECTED.get() and time.monotonic() >= queue["next_failback_probe"]:
             why = home.probe(timeout=min(5, home.PROBE_TIMEOUT_S), wait=False)
             t = time.monotonic()
-            next_failback_probe = t + probe_every
+            queue["next_failback_probe"] = t + probe_every
             import toollog
             toollog.emit("backend", "backend.failback_probe", ids={"run": run_id},
                          props={"ok": why is None, "class": (home.PROBE_FACTS.get() or {}).get("class", "hard"),

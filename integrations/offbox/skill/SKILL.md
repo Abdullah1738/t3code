@@ -300,7 +300,7 @@ On home boxes the stock ssh.service on port 22 is yours (stop, mask or replace i
 
 Once `bootstrap.zsh client` has written `server.json`, runs go to Abdullah's own server at home (boatd; same
 commands, same box model, no hourly price, no start limits, no spend cap). Boat stays as the standby. Each
-`offbox run` picks its backend once, when it starts:
+`offbox run` starts on the available backend:
 
 - A health monitor on the Mac checks the server every minute and writes `backend-state.json`. Up: the run goes
   home. A run double-checks a down state with a live probe before choosing Boat. Alerts recover after 3 good
