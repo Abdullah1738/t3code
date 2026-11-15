@@ -1928,6 +1928,76 @@ it.effect.each(["failure", "interruption"] as const)(
     }),
 );
 
+it.effect("a blocked session status write does not hold another session's native events", () =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    const hook = yield* Ref.make<SessionWriteHook>(() => Effect.void);
+    const paused = yield* Deferred.make<void>();
+    const commit = yield* Deferred.make<void>();
+    yield* Effect.gen(function* () {
+      const f = yield* makeSessionAudienceFixture(state, 1);
+      const otherThread = ThreadId.make("independent-claude-session");
+      yield* f.eventSink.write({
+        events: [
+          yield* makeThreadCreatedEvent({
+            idAllocator: f.idAllocator,
+            threadId: otherThread,
+            now: f.now,
+          }),
+        ],
+      });
+      const otherSessionId = yield* f.idAllocator.allocate.providerSession({
+        threadId: otherThread,
+        providerInstanceId: modelSelection.instanceId,
+      });
+      const other = yield* f.manager.open({
+        threadId: otherThread,
+        providerSessionId: otherSessionId,
+        modelSelection,
+        runtimePolicy,
+      });
+      const subscription = yield* Effect.acquireRelease(other.subscribeEvents!, (sub) => sub.close);
+      yield* Ref.set(hook, (input) =>
+        input.events.some(
+          (event) =>
+            event.type === "provider-session.updated" &&
+            event.payload.id === f.providerSessionId &&
+            event.payload.status === "running",
+        )
+          ? Deferred.succeed(paused, undefined).pipe(Effect.andThen(Deferred.await(commit)))
+          : Effect.void,
+      );
+      const queues = (yield* Ref.get(state)).eventQueues;
+      yield* Queue.offer(queues.get(String(f.providerSessionId))!, {
+        type: "provider_session.updated",
+        driver: f.runtime.driver,
+        providerSession: { ...f.runtime.providerSession, status: "running" },
+      });
+      yield* Deferred.await(paused);
+      const running = {
+        type: "provider_session.updated" as const,
+        driver: other.driver,
+        providerSession: { ...other.providerSession, status: "running" as const },
+      };
+      yield* Queue.offer(queues.get(String(otherSessionId))!, running);
+      assert.deepEqual(yield* subscription.events.pipe(Stream.runHead), Option.some(running));
+      assert.isFalse(yield* Deferred.isDone(commit));
+      const records = yield* f.projectionStore.getThreadRecords(otherThread, ["providerSessions"]);
+      assert.equal(records.providerSessions.at(-1)?.status, "running");
+    }).pipe(
+      Effect.ensuring(Deferred.succeed(commit, undefined)),
+      Effect.provide(
+        layerTest({
+          state,
+          idleTimeoutMs: 60_000,
+          driver: ProviderDriverKind.make("claudeAgent"),
+          sessionWriteHook: hook,
+        }),
+      ),
+    );
+  }),
+);
+
 it.effect(
   "interrupting a pump write releases the session permit for a different live session",
   () =>
@@ -6415,6 +6485,9 @@ function runIdleThreadUnloadScenario(
     ) => Effect.Effect<void>;
     readonly endTurn: (threadId: ThreadId, ordinal: number) => Effect.Effect<void>;
     readonly resume: (threadId: ThreadId) => Effect.Effect<void>;
+    readonly setRunStatus: (
+      status: "preparing" | "queued" | "starting" | "running" | "waiting" | "completed",
+    ) => Effect.Effect<void>;
     readonly subscribe: NonNullable<
       ProviderAdapter.ProviderAdapterV2SessionRuntime["subscribeEvents"]
     >;
@@ -6497,6 +6570,46 @@ function runIdleThreadUnloadScenario(
             runtimePolicy,
           });
         }).pipe(Effect.orDie);
+      const setRunStatus = Effect.fn("test.setRunStatus")(function* (
+        status: "preparing" | "queued" | "starting" | "running" | "waiting" | "completed",
+      ) {
+        const threadId = threadA;
+        const runId = idAllocator.derive.run({ threadId, ordinal: 1 });
+        yield* eventSink.write({
+          events: [
+            {
+              id: yield* idAllocator.allocate.event({ threadId }),
+              type: "provider-thread.updated",
+              threadId,
+              occurredAt: now,
+              payload: providerThreadOf(threadId),
+            },
+            {
+              id: yield* idAllocator.allocate.event({ threadId }),
+              type: "run.updated",
+              threadId,
+              occurredAt: now,
+              payload: {
+                id: runId,
+                threadId,
+                ordinal: 1,
+                providerInstanceId: modelSelection.instanceId,
+                modelSelection,
+                providerThreadId: providerThreadOf(threadId).id,
+                userMessageId: yield* idAllocator.allocate.message({ threadId, ordinal: 1 }),
+                rootNodeId: idAllocator.derive.rootNode({ runId }),
+                activeAttemptId: idAllocator.derive.runAttempt({ runId, attemptOrdinal: 1 }),
+                status,
+                requestedAt: now,
+                startedAt: null,
+                completedAt: status === "completed" ? now : null,
+                checkpointId: null,
+                contextHandoffId: null,
+              },
+            },
+          ],
+        });
+      }, Effect.orDie);
       const subscribe = runtime.subscribeEvents;
       assert.isDefined(subscribe);
       const endTurn = (threadId: ThreadId, ordinal: number) =>
@@ -6538,6 +6651,7 @@ function runIdleThreadUnloadScenario(
         endTurn,
         resume,
         subscribe: subscribe!,
+        setRunStatus,
       }).pipe(Effect.scoped);
     }).pipe(
       Effect.provide(
@@ -6556,6 +6670,29 @@ function runIdleThreadUnloadScenario(
     );
   });
 }
+
+it.effect.each(["preparing", "queued", "starting", "running", "waiting"] as const)(
+  "ProviderSessionManagerV2 keeps never-turned native state during %s preparation",
+  (status) =>
+    runIdleThreadUnloadScenario(
+      `pending-${status}`,
+      ({ state, threadA, resume, startTurn, endTurn, setRunStatus }) =>
+        Effect.gen(function* () {
+          yield* setRunStatus(status);
+          yield* resume(threadA);
+          // TestClock crosses the unload timer while the first native offer is still pending.
+          yield* TestClock.adjust("3 seconds");
+          assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+          const resumed = (yield* Ref.get(state)).resumeCount;
+          yield* startTurn(threadA, 1, { resume: false });
+          assert.equal((yield* Ref.get(state)).resumeCount, resumed);
+          yield* setRunStatus("completed");
+          yield* endTurn(threadA, 1);
+          yield* TestClock.adjust("1 second");
+          assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, [`native-${threadA}`]);
+        }),
+    ),
+);
 
 it.effect(
   "ProviderSessionManagerV2 unloads a shared-runtime thread left idle, and reloads it on its next turn",

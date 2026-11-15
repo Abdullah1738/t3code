@@ -294,6 +294,22 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
               metrics.phaseSteps[phase] = (metrics.phaseSteps[phase] ?? 0) + steps;
             metrics = {
               ...metrics,
+              ...(message.metrics.updatedAtLagMs === undefined
+                ? {}
+                : {
+                    updatedAtLagMs: Math.max(
+                      metrics.updatedAtLagMs ?? 0,
+                      message.metrics.updatedAtLagMs,
+                    ),
+                  }),
+              ...(message.metrics.auxiliaryWindowMs === undefined
+                ? {}
+                : {
+                    auxiliaryWindowMs: Math.max(
+                      metrics.auxiliaryWindowMs ?? 0,
+                      message.metrics.auxiliaryWindowMs,
+                    ),
+                  }),
               identityRows: metrics.identityRows + message.metrics.identityRows,
               identityLagMaxMs: Math.max(
                 metrics.identityLagMaxMs,
@@ -353,6 +369,8 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
             phaseMs: metrics.phaseMs,
             phaseSteps: metrics.phaseSteps,
             lineageRepairCounts: metrics.lineageRepairCounts,
+            updatedAtLagMs: metrics.updatedAtLagMs,
+            auxiliaryWindowMs: metrics.auxiliaryWindowMs,
           }),
           Effect.withSpan("ardud.readonlyExport.cyclePhases"),
         );

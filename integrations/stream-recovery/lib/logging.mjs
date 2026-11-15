@@ -1,4 +1,4 @@
-const { emit, observed } = await import('../../router-logging/toollog.mjs').catch(() => ({ emit: () => {}, observed: (_c, _n, work) => work() }));
+const { emit, observed, tagFailurePhase = error => error } = await import('../../router-logging/toollog.mjs').catch(() => ({ emit: () => {}, observed: (_c, _n, work) => work() }));
 export { emit, observed };
 
 export function deferThread(io, threadId, error) {
@@ -43,10 +43,10 @@ export async function timedScan(name, io, work) {
       try {
         const result = io[key](...args);
         if (result && typeof result.then === 'function') return result.then(
-          value => { finish(); return value; }, error => { finish(true); throw error; });
+          value => { finish(); return value; }, error => { finish(true); throw tagFailurePhase(error, key); });
         finish();
         return result;
-      } catch (error) { finish(true); throw error; }
+      } catch (error) { finish(true); throw tagFailurePhase(error, key); }
     };
   }
   try { return await observed('stream-recovery', `${name}.scan`, () => work(timed), {props}); }

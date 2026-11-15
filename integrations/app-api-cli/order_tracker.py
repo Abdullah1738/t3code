@@ -1848,7 +1848,7 @@ def main(argv=None, _locked=False):
     parser.add_argument('--store', help='store/restaurant name for the placement text (default: from label or app)')
     parser.add_argument('--total', help='order total for the placement text, e.g. "AED 47.25" (stored at first registration)')
     parser.add_argument('--vertical', help='card lane: minutes/nownow/supermall/main/food, restaurants/mart/shops, food/quik/shops/box, same-day')
-    parser.add_argument('--items-file', help='card display metadata or item array (name, qty, price, image_url); read-only')
+    parser.add_argument('--items-file', help='card display metadata or item array (name, qty, price, image_url; item_code/sku/sku_config help spot dropped items); read-only')
     parser.add_argument('--card-items-json', help=argparse.SUPPRESS)
     parser.add_argument('--chat', '--card-chat', dest='chat', help='bridge chat slug the order was placed from; the card and arrival texts go there. Default: $ORDER_WATCH_CHAT, then the iMessage chat folder this runs in, then owner/moni')
     parser.add_argument('--no-card-send', action='store_true', help='build and refresh the card without a placement message')

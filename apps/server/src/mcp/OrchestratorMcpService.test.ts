@@ -3149,6 +3149,134 @@ describe("OrchestratorMcpService provider resolution", () => {
     ),
   );
 
+  it.effect.each([
+    "pending",
+    "acknowledged",
+    "blocked",
+    "idle",
+    "late_ack",
+    "confirmed_then_blocked",
+    "replacement",
+  ] as const)("thread wait exposes native start progress within its total budget: %s", (state) =>
+    Effect.gen(function* () {
+      const parent = parentProjection([]);
+      const now = yield* DateTime.now;
+      const run = {
+        ...parent.runs[0]!,
+        threadId: parentThreadId,
+        activeAttemptId: RunAttemptId.make("wait-attempt"),
+        status: "running" as const,
+        startedAt: now,
+        requestedAt: now,
+      };
+      const waitedRun =
+        state === "replacement"
+          ? { ...run, activeAttemptId: RunAttemptId.make("replacement-wait-attempt") }
+          : run;
+      const target = {
+        ...parent,
+        thread: { ...parent.thread, deletedAt: null },
+        runs: state === "idle" ? [] : [run],
+        providerTurns: [
+          "acknowledged",
+          "late_ack",
+          "confirmed_then_blocked",
+          "replacement",
+        ].includes(state)
+          ? [
+              {
+                id: ProviderTurnId.make("wait-turn"),
+                providerThreadId: ProviderThreadId.make("wait-pt"),
+                nodeId: NodeId.make("wait-native-node"),
+                runAttemptId: run.activeAttemptId,
+                ordinal: 1,
+                status: "running" as const,
+                nativeTurnRef: null,
+                startedAt: now,
+                completedAt: null,
+                promptAcceptedAt: now,
+              },
+            ]
+          : [],
+      };
+      const entered = yield* Deferred.make<void>();
+      const waitingEntered = yield* Deferred.make<number>();
+      let providerReads = 0;
+      const dependencies = Layer.mergeAll(
+        NodeServices.layer,
+        Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getCallerRow: (id) => Effect.succeed({ ...liveThreadShell(id), ...parent.thread }),
+          getThreadShell: (id) => Effect.succeed({ ...liveThreadShell(id), ...parent.thread }),
+          getThreadRecords: (_id, fields, filter) => {
+            if (!fields.some((field) => field === "providerTurns")) return Effect.succeed(target);
+            providerReads++;
+            assert.equal(
+              filter?.providerTurnAttemptId,
+              providerReads === 1 ? run.activeAttemptId : waitedRun.activeAttemptId,
+            );
+            if (state === "late_ack" && providerReads === 1)
+              return Effect.succeed({ ...target, providerTurns: [] });
+            if (
+              (state === "confirmed_then_blocked" || state === "replacement") &&
+              providerReads === 1
+            )
+              return Effect.succeed(target);
+            return Deferred.succeed(entered, undefined).pipe(
+              Effect.andThen(
+                state === "blocked" || state === "confirmed_then_blocked" || state === "replacement"
+                  ? Effect.never
+                  : Effect.succeed(target),
+              ),
+            );
+          },
+          waitForThread: ({ timeoutMs }) =>
+            (state === "late_ack"
+              ? Deferred.succeed(waitingEntered, timeoutMs!).pipe(
+                  Effect.andThen(Effect.never.pipe(Effect.timeoutOption(timeoutMs!))),
+                )
+              : Effect.void
+            ).pipe(
+              Effect.as({
+                threadId: parentThreadId,
+                run: state === "idle" ? null : waitedRun,
+                timedOut: state !== "idle",
+              }),
+            ),
+        }),
+        ServerSettings.layerTest(),
+        providerRegistryLayer([]),
+        adapterRegistryLayer([]),
+        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(SecretRequests.SecretRequests)({}),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        const call = yield* service
+          .waitForThread(scope, { threadId: parentThreadId, timeoutMs: 1000 })
+          .pipe(Effect.forkScoped);
+        if (state === "blocked" || state === "confirmed_then_blocked" || state === "replacement") {
+          yield* Deferred.await(entered);
+          yield* TestClock.adjust(1000);
+        }
+        if (state === "late_ack") {
+          const budget = yield* Deferred.await(waitingEntered);
+          assert.isBelow(budget, 1000);
+          yield* TestClock.adjust(budget);
+        }
+        const result = yield* Fiber.join(call);
+        const pending = state === "pending" || state === "blocked" || state === "replacement";
+        assert.equal(result.startPending, pending);
+        assert.equal(
+          result.startProgress?.step ?? null,
+          pending ? "awaiting_native_acceptance" : null,
+        );
+        if (state === "blocked") assert.isTrue(result.timedOut);
+        if (state === "idle") assert.equal(providerReads, 0);
+      }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
+    }),
+  );
+
   it.effect("counts thread lookup against the thread wait budget", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -4362,6 +4490,9 @@ describe("OrchestratorMcpService provider resolution", () => {
           runs: [
             {
               id: RunId.make("run:mcp-providers-child"),
+              threadId: childThreadId,
+              activeAttemptId: RunAttemptId.make("attempt:mcp-providers-child"),
+              requestedAt: DateTime.makeUnsafe("2026-11-04T12:00:00Z"),
               delegatedTaskId: taskId,
               ordinal: 1,
               status: "starting",
@@ -4468,22 +4599,73 @@ describe("OrchestratorMcpService provider resolution", () => {
           };
           const started = yield* service.taskStatus(scope, taskId);
           assert.equal(started.status, "running");
-          assert.isFalse(started.startPending);
+          assert.isTrue(started.startPending);
+          assert.equal(started.startProgress?.step, "awaiting_native_acceptance");
           assert.equal(started.startedAt, "2026-11-04T12:00:00.000Z");
+          currentChild = {
+            ...currentChild,
+            providerTurns: [
+              {
+                id: ProviderTurnId.make("native-ack"),
+                providerThreadId: ProviderThreadId.make("pt"),
+                nodeId: NodeId.make("delegated-native-node"),
+                runAttemptId: originalRun.activeAttemptId,
+                ordinal: 1,
+                status: "running",
+                nativeTurnRef: null,
+                startedAt: DateTime.makeUnsafe("2026-11-04T12:00:00Z"),
+                completedAt: null,
+                promptAcceptedAt: DateTime.makeUnsafe("2026-11-04T12:00:01Z"),
+              },
+            ],
+          };
+          const acknowledged = yield* service.taskStatus(scope, taskId);
+          assert.isFalse(acknowledged.startPending);
+          assert.isNull(acknowledged.startProgress);
           for (const [status, expected] of [
             ["preparing", true],
             ["starting", true],
             ["queued", false],
-            ["running", false],
+            ["running", true],
             ["waiting", false],
           ] as const) {
             currentChild = {
               ...currentChild,
               runs: [{ ...originalRun, status, startedAt: null }],
+              providerTurns: [],
             };
             const pending = yield* service.taskStatus(scope, taskId);
             assert.equal(pending.startPending, expected, status);
             assert.isNull(pending.startedAt);
+          }
+          for (const status of ["starting", "running"] as const) {
+            const recovery = {
+              ...originalRun,
+              id: RunId.make("run:mcp-providers-recovery"),
+              activeAttemptId: RunAttemptId.make("attempt:mcp-providers-recovery"),
+              ordinal: 2,
+              status,
+            };
+            currentChild = {
+              ...currentChild,
+              runs: [
+                {
+                  ...originalRun,
+                  status: "interrupted",
+                  startedAt: DateTime.makeUnsafe("2026-11-04T12:00:00Z"),
+                },
+                recovery,
+              ],
+              providerTurns: [],
+            };
+            const pending = yield* service.taskStatus(scope, taskId);
+            assert.equal(pending.childRunId, originalRun.id);
+            assert.equal(pending.startedAt, "2026-11-04T12:00:00.000Z");
+            assert.equal(pending.currentRunId, recovery.id);
+            assert.equal(pending.currentRunStatus, status);
+            assert.isTrue(pending.startPending);
+            assert.equal(pending.startProgress?.runId, recovery.id);
+            assert.equal(pending.startProgress?.attemptId, recovery.activeAttemptId);
           }
           const commands = yield* Ref.get(dispatched);
           assert.equal(commands.length, 1);

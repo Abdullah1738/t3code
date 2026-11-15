@@ -108,7 +108,8 @@ def connect_ro(path: Path) -> sqlite3.Connection:
             reader = robob_readonly.state_ro
         else:
             reader = robob_readonly.connect_ro
-        con = reader(path, timeout=0.1, check_same_thread=False)
+        options = {"allow_rebuild": True} if path == STATE_DB else {}
+        con = reader(path, timeout=0.1, check_same_thread=False, **options)
     except OSError as exc:
         raise sqlite3.OperationalError(str(exc)) from exc
     con.execute("PRAGMA temp_store=MEMORY")
@@ -1161,8 +1162,8 @@ _STATE_REFRESH_SECONDS = 60
 def _state_generation():
     try:
         info = robob_readonly.safe_path(STATE_DB).stat()
-        with closing(robob_readonly.state_ro(STATE_DB, timeout=0.1)) as con:
-            updated = robob_readonly.ready_generation(con)
+        with closing(robob_readonly.state_ro(STATE_DB, timeout=0.1, allow_rebuild=True)) as con:
+            updated = robob_readonly.ready_generation(con, allow_rebuild=True)
     except OSError as exc:
         raise sqlite3.OperationalError("Robob read-only replica unavailable") from exc
     return info.st_dev, info.st_ino, updated
@@ -1714,10 +1715,12 @@ def validate_driver(ident: str, driver: str) -> None:
         ).fetchone()
         if not row and driver == "opencode":
             row = con.execute("SELECT 1 FROM ardud_opencode_import WHERE thread_id=? OR native_session_id=?", (ident, native)).fetchone()
-        if not row:
-            raise UnknownCaller("caller driver does not match")
     if _state_generation() != generation:
         raise UnknownCaller("read-only replica replaced while being read")
+    if not row:
+        if robob_readonly.replica_warning(STATE_DB):
+            lineage_exclusions(ident)
+        raise UnknownCaller("caller driver does not match")
 
 
 @bounded(0.8)
@@ -1803,6 +1806,8 @@ def _lineage_exclusions_once(canonical_or_native_id: str | None, *, fresh_legacy
             if not state_available or oc is None or not oc.execute(
                 "SELECT 1 FROM session_v2 WHERE id=?", (ident,)
             ).fetchone():
+                if robob_readonly.replica_warning(STATE_DB):
+                    raise UnknownCaller("thread newer than replica snapshot (rebuild in progress)")
                 raise UnknownCaller("caller identity is unknown")
             explicit = {ident} | _opencode_tree({ident}, edges) | _catalog_tree({ident})
             explicit_state = state_tree(explicit - expanded) if explicit - expanded else set()
@@ -1814,6 +1819,8 @@ def _lineage_exclusions_once(canonical_or_native_id: str | None, *, fresh_legacy
             aliases.update(anchor_state)
         if not state_anchor and not (ident.startswith("ses_") and oc is not None and oc.execute(
                 "SELECT 1 FROM session_v2 WHERE id=?", (ident,)).fetchone()):
+            if robob_readonly.replica_warning(STATE_DB):
+                raise UnknownCaller("thread newer than replica snapshot (rebuild in progress)")
             raise UnknownCaller("caller has no current identity anchor")
         aliases.add(ident)
         # A migration edge can reveal a later Robob binding, and that binding

@@ -1480,7 +1480,7 @@ describe("control listings", () => {
       suffix,
     })),
   );
-  it.live.each(["/health", "/projects"])(
+  it.live.each(["/health", "/projects", "/threads/live-running", "/threads/asks-waiting"])(
     "GET %s completes while the background reader is held",
     (endpoint) =>
       Effect.gen(function* () {
@@ -1504,7 +1504,20 @@ describe("control listings", () => {
             const response = yield* harness.get(endpoint);
             assert.equal(response.status, 200);
             if (endpoint === "/health") assert.equal(response.body.sequence, 42);
-            else assert.deepEqual(response.body.projects, expected.body.projects);
+            else if (endpoint === "/projects") {
+              assert.deepEqual(response.body.projects, expected.body.projects);
+            } else {
+              assert.deepEqual(response.body.thread, expected.body.thread);
+              assert.strictEqual(
+                response.body.thread.state,
+                endpoint === "/threads/asks-waiting" ? "needs-input" : "idle",
+              );
+              assert.strictEqual(response.body.thread.run, null);
+              assert.lengthOf(
+                response.body.thread.pendingRequests,
+                endpoint === "/threads/asks-waiting" ? 1 : 0,
+              );
+            }
             assert.equal(response.body.ok, true);
             assert.isUndefined(holder.pollUnsafe());
           }).pipe(
