@@ -1464,7 +1464,9 @@ def _resolve_exit(r, log_path, until, start_offsets, replay_path, echo=True, mir
 
 def _report_deps_hint(r, code, log_path) -> None:
     from .runs import box_deps_hint, step_results
-    if code not in (0, None) or any(rc != 0 for _, rc in step_results(log_path)):
+    results = step_results(log_path)
+    failed_code = next((rc for _, rc in results if rc), code)
+    if code != 127 and failed_code != 127 and (code not in (0, None) or any(rc != 0 for _, rc in results)):
         hint = box_deps_hint(Path(r['repo_root'] or '.'), log_path)
         if hint:
             say(hint)
