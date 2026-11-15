@@ -507,6 +507,56 @@ export function createReadonlyReplica(
         );
       }
     };
+    const exportIndexPrefix = "ardud_readonly_";
+    const ensureExportIndexes = () => {
+      // Match the discovery predicates in integrations/stream-recovery/lib/io.mjs exactly.
+      const definitions = [
+        ["items_thread", "turn_items", ["thread_id"], [], ""],
+        [
+          "runs_restart_completed",
+          "runs",
+          ["completed_at"],
+          ["status"],
+          "status IN ('cancelled','failed','interrupted')",
+        ],
+        ["runs_failed_completed", "runs", ["completed_at"], ["status"], "status='failed'"],
+        [
+          "subagents_cancelled_completed",
+          "subagents",
+          ["origin", "completed_at"],
+          ["status"],
+          "status IN ('cancelled','interrupted')",
+        ],
+        [
+          "subagents_failed_completed",
+          "subagents",
+          ["completed_at"],
+          ["status"],
+          "status='failed'",
+        ],
+        ["items_run_interrupt", "turn_items", ["run_id"], ["type"], "type='run_interrupt_request'"],
+        ["items_run_user_message", "turn_items", ["run_id"], ["type"], "type='user_message'"],
+        ["items_run_error", "turn_items", ["run_id"], ["type"], "type='error'"],
+      ] as const;
+      const columns = new Map<string, Set<string>>();
+      for (const [suffix, projection, indexed, predicateColumns, predicate] of definitions) {
+        const table = `orchestration_v2_projection_${projection}`;
+        const available =
+          columns.get(table) ??
+          new Set(
+            out
+              .prepare(`PRAGMA table_info(${q(table)})`)
+              .all()
+              .map((row) => String(row.name)),
+          );
+        columns.set(table, available);
+        // Older source schemas may not expose completion or run identity columns yet.
+        if (![...indexed, ...predicateColumns].every((column) => available.has(column))) continue;
+        out.exec(
+          `CREATE INDEX IF NOT EXISTS ${q(exportIndexPrefix + suffix)} ON ${q(table)}(${indexed.map(q).join(",")})${predicate ? ` WHERE ${predicate}` : ""}`,
+        );
+      }
+    };
     const createExportedTable = ({ schema }: (typeof sourceTables)[number]) => {
       out.exec(
         schema.replace(/^CREATE TABLE\s+(?:IF NOT EXISTS\s+)?/i, "CREATE TABLE IF NOT EXISTS "),
@@ -586,6 +636,7 @@ export function createReadonlyReplica(
         meta(`schema:${name}`, schema);
       }
       ensureIdentityVersions();
+      ensureExportIndexes();
       meta(
         "last_aux_schema_refresh",
         JSON.stringify({ tables: changed.map(({ name }) => name), at: new Date().toISOString() }),
@@ -634,6 +685,7 @@ export function createReadonlyReplica(
         .prepare(`PRAGMA index_list(${q(name)})`)
         .all()
         .some((index) => {
+          if (String(index.name).startsWith(exportIndexPrefix)) return false;
           const needsCompleteRows =
             Number(index.unique) === 1 ||
             Number(index.partial) === 1 ||
@@ -1062,9 +1114,7 @@ export function createReadonlyReplica(
       });
     };
     for (const table of sourceTables) configureTable(table);
-    out.exec(
-      "CREATE INDEX IF NOT EXISTS ardud_readonly_items_thread ON orchestration_v2_projection_turn_items(thread_id)",
-    );
+    ensureExportIndexes();
     const copyRow = (name: string, row: Record<string, NodeSqlite.SQLOutputValue>) => {
       const table = tables.get(name)!;
       if (name.endsWith("_turn_items") && !selectedItems.has(String(row.type))) {
