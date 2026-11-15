@@ -6,12 +6,30 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from offbox_lib import common, home
+from offbox_lib import api, common, home
 from test_home_backend import HomeFiles
 from test_wait_lock import Clock
 
 
 class PersonHomeStates(HomeFiles):
+    def test_wait_state_keeps_person_pinned_and_boat_read_contracts(self):
+        self.configure()
+        cases = [(f"person/{state}", {"OFFBOX_THREAD": "person:moni"}, state)
+                 for state in ("home_up", "home_slow", "home_starting", "home_down")]
+        cases += [("pinned", {"OFFBOX_BACKEND": "server"}, "home_down"),
+                  ("boat", {"OFFBOX_BACKEND": "boat"}, "home_down")]
+        for label, env, state in cases:
+            with self.subTest(case=label), patch.dict(os.environ, env), \
+                    patch.object(common, "_BACKEND", None), \
+                    patch.object(api, "get", return_value={"state": "running"}) as read, \
+                    patch.object(home, "recover_slow_read", side_effect=AssertionError("no home-routing recovery")):
+                self.monitor_says(state)
+                self.assertFalse(home.may_fail_over())
+                self.assertEqual(api.wait_state("selected", api.LIVE_STATES), {"state": "running"})
+                read.assert_called_once_with("selected")
+                if label.startswith("person/"):
+                    self.assertEqual(common.backend(), "server")
+
     def test_person_never_selects_boat_in_up_slow_starting_or_down(self):
         self.configure()
         ready = {"ok": True}

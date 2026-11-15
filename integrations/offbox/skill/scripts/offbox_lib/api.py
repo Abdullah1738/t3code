@@ -1075,7 +1075,7 @@ def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7
     network_failures = 0
     while True:
         try:
-            s = readiness_get(box_id, deadline=deadline)
+            s = readiness_get(box_id, deadline=deadline) if home.may_fail_over() else readiness_get(box_id)
         except NetworkError as error:
             try:
                 s = home.recover_slow_read(error, lambda end: get(box_id, deadline=end), box=box_id,
