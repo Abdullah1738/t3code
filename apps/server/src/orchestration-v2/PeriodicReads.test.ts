@@ -196,6 +196,10 @@ it.effect(
         )!;
         const plan = (yield* planOf(query)).map((r) => r.detail).join("\n");
         assert.include(plan, index!, name);
+        if (name === "pendingBackgroundTasks") {
+          assert.include(plan, "ardud_provider_thread_subagent_owner_idx");
+          assert.include(plan, "(provider_thread_id=? AND thread_id=?)");
+        }
         assert.notMatch(plan, /SCAN n\b|SCAN s\b|LIST SUBQUERY.*nodes/);
       }
       assert.isFalse(

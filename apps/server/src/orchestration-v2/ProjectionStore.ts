@@ -4494,7 +4494,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   ON nodes.node_id = pending_provider_threads.owner_node_id
                 UNION
                 SELECT subagents.thread_id FROM pending_provider_threads
+                -- Recovery needs provider-thread fanout; reserve the covering
+                -- ownership index for maintenance reads that also bind thread_id.
                 CROSS JOIN orchestration_v2_projection_subagents AS subagents
+                  INDEXED BY orchestration_v2_projection_subagents_provider_thread_idx
                   ON subagents.provider_thread_id = pending_provider_threads.provider_thread_id
                 UNION
                 -- Match the partial live-nodes index, retaining the original statuses.
