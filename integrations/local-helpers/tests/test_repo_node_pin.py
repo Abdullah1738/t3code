@@ -337,6 +337,23 @@ class SelectionTest(unittest.TestCase):
         self.assertNotIn('repo-node:', r.stdout)
         return r
 
+    def test_noninteractive_shells_load_safe_chain_and_keep_it_after_cd(self):
+        hooks = self.home / '.safe-chain/scripts/init-posix.sh'
+        hooks.parent.mkdir(parents=True)
+        hooks.write_text('npm() { echo "guard:npm"; return 17; }; '
+                         'python3() { echo "guard:python3"; return 17; }; '
+                         'pip() { echo "guard:pip"; return 17; }\n')
+        for shell in ['/bin/zsh', '/bin/bash']:
+            with self.subTest(shell=shell):
+                body = 'npm install example; cd ' + shlex.quote(str(self.repo)) + '; python3 -m pip install example; pip install example'
+                r = self.startup_shell(body, shell)
+                self.assertEqual(r.returncode, 17, r.stderr)
+                self.assertEqual(r.stdout.splitlines(), ['guard:npm', 'guard:python3', 'guard:pip'])
+                if shell == '/bin/bash':
+                    nested = self.startup_shell('/bin/bash -c ' + shlex.quote(body), shell)
+                    self.assertEqual(nested.returncode, 17, nested.stderr)
+                    self.assertEqual(nested.stdout, r.stdout)
+
     def directory_cases(self):
         (self.repo / '.nvmrc').write_text('22')
         missing = self.home / 'missing'
