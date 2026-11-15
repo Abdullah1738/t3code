@@ -1247,13 +1247,17 @@ it.each([
   ["comment", "Review verdict refused: clear at abc: missing checks", ["refused_call"]],
   ["flagged", "Cleared", []],
 ] as const)("thread digest flags %s: %s", (kind, body, expected) => {
-  const rows = Activity.threadDigestRows(
-    [card("a")],
-    [thread("work", "a", "work", opus, t("10:00"))],
-    [event("a", t("11:00"), kind, "working", "todo", body)],
-    window,
-  );
-  expect(rows[0]!.flags).toEqual(expected);
+  for (const target of ["a", "carried"] as const) {
+    const cards = [card("a"), card("carried", { number: 2, stage: "completed" })];
+    const rows = Activity.threadDigestRows(
+      cards,
+      [thread("work", "a", "work", opus, t("10:00"))],
+      [event(target, t("11:00"), kind, "working", "todo", body)],
+      window,
+      new Map([["work", cards.map((card) => card.id)]]),
+    );
+    expect(rows[0]!.flags).toEqual(expected);
+  }
 });
 
 it("thread digest names restarts against earlier links, including before the window", () => {
@@ -1268,4 +1272,63 @@ it("thread digest names restarts against earlier links, including before the win
   );
   expect(rows[0]!.threadId).toBe("new");
   expect(rows[0]!.flags).toEqual(["restarted"]);
+});
+
+it.each([
+  ["open before window", before, null, true],
+  ["opened in window", t("10:00"), null, true],
+  ["closed before window", before, "2026-11-11T23:59:59.999Z", false],
+  ["closed within window", before, t("23:00"), false],
+  ["closed just before cutoff", before, "2026-11-12T23:59:59.999Z", false],
+  ["closed at cutoff", before, window.until, true],
+  ["closed after cutoff", before, "2026-11-13T00:00:00.001Z", true],
+  ["opened at cutoff", window.until, null, false],
+  ["opened after cutoff", "2026-11-13T00:00:00.001Z", null, false],
+] as const)("discussion digest ask at pinned cutoff: %s", (_name, at, closedAt, open) => {
+  const row = digestRow("ask", t("12:00"), "thread", [ask("q1", at, { closedAt })])!;
+  expect(row.openAsks).toEqual(open ? ["q1"] : []);
+});
+
+it("pinned discussion pages retain all 45 IDs when an ask closes after the cutoff", () => {
+  let closedAt: string | null = null;
+  const rows = () =>
+    Activity.discussionDigestRows([
+      digestRow("old-ask", t("01:00"), "thread", [ask("q1", before, { closedAt })])!,
+      ...Array.from({ length: 44 }, (_, i) => digestRow(`quiet-${i}`, t("12:00"))!),
+    ]);
+  const first = Activity.digestPage(rows());
+  expect(first.rows[0]!.discussionId).toBe("old-ask");
+  expect(first.rows).toHaveLength(40);
+  closedAt = "2026-11-13T01:00:00.000Z";
+  const second = Activity.digestPage(rows(), first.page.nextAfter!);
+  const ids = [...first.rows, ...second.rows].map((row) => row.discussionId);
+  expect(second.rows).toHaveLength(5);
+  expect(second.page.hasMore).toBe(false);
+  expect(ids).toHaveLength(45);
+  expect(new Set(ids).size).toBe(45);
+});
+
+it("shared workers keep their origin and deduplicate persisted associations", () => {
+  const cards = [card("origin"), card("claimed", { number: 2 })];
+  const links = [thread("shared", "origin", "work", opus, t("02:00"))];
+  const rows = Activity.threadDigestRows(
+    cards,
+    links,
+    [],
+    window,
+    new Map([["shared", [cards[0]!.id, cards[0]!.id, cards[1]!.id, KanbanCardId.make("missing")]]]),
+  );
+  expect(rows[0]!).toMatchObject({ threadId: "shared", card: 1, cards: [1, 2], flags: [] });
+});
+
+it("a shared worker's persisted cards still supply flags when its origin is missing", () => {
+  const claimed = card("claimed", { number: 2, stage: "completed" });
+  const rows = Activity.threadDigestRows(
+    [claimed],
+    [thread("shared", "missing", "work", opus, before)],
+    [event("claimed", t("11:00"), "flagged", "working", "todo", "Run failed: claimed card")],
+    window,
+    new Map([["shared", [claimed.id]]]),
+  );
+  expect(rows[0]!).toMatchObject({ threadId: "shared", card: 2, flags: ["run_failed", "stalled"] });
 });

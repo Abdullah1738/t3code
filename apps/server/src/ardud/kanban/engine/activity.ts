@@ -97,8 +97,11 @@ export const discussionDigestRow = (
     ownerMessages: matching
       .filter((message) => message.author === "owner")
       .map((message) => ({ at: message.at, text: oneLine(message.text, 300) })),
+    // Pin priority to the cutoff so later ask closures cannot shift an index cursor.
     openAsks: (card?.asks ?? [])
-      .filter((ask) => ask.closedAt === null && ask.at < window.until)
+      .filter(
+        (ask) => ask.at < window.until && (ask.closedAt === null || ask.closedAt >= window.until),
+      )
       .map((ask) => ask.id),
     last: { at: last.at, author: last.author, text: oneLine(last.text, 200) },
   };
@@ -150,11 +153,27 @@ export const threadDigestRows = (
   threads: ReadonlyArray<KanbanThreadLink>,
   events: ReadonlyArray<KanbanCardEvent>,
   window: ActivityWindow,
+  threadCards: ReadonlyMap<string, ReadonlyArray<KanbanCard["id"]>> = new Map(),
 ) => {
   const byCard = new Map(cards.map((card) => [card.id, card]));
+  const associated = new Map(
+    threads.map((link) => [
+      link.threadId,
+      [
+        ...new Set([
+          ...(link.cardId === null ? [] : [link.cardId]),
+          ...(threadCards.get(link.threadId) ?? []),
+        ]),
+      ].flatMap((id) => {
+        const card = byCard.get(id);
+        return card === undefined ? [] : [card];
+      }),
+    ]),
+  );
   return threads
     .flatMap((link) => {
-      const card = link.cardId === null ? undefined : byCard.get(link.cardId);
+      const carried = associated.get(link.threadId) ?? [];
+      const card = carried[0];
       if (
         card === undefined ||
         link.startedAt >= window.until ||
@@ -163,7 +182,8 @@ export const threadDigestRows = (
         return [];
       const flags = new Set<ThreadDigestFlag>();
       for (const event of events) {
-        if (event.cardId !== card.id || !inWindow(event.at, window)) continue;
+        if (!carried.some((entry) => entry.id === event.cardId) || !inWindow(event.at, window))
+          continue;
         if (isFailure(event)) flags.add("run_failed");
         if (isStall(event)) flags.add("stalled");
         if (
@@ -176,7 +196,8 @@ export const threadDigestRows = (
         inWindow(link.startedAt, window) &&
         threads.some(
           (other) =>
-            other.cardId === card.id &&
+            link.cardId !== null &&
+            other.cardId === link.cardId &&
             other.role === link.role &&
             other.startedAt < link.startedAt,
         )
@@ -186,6 +207,7 @@ export const threadDigestRows = (
         {
           threadId: link.threadId,
           card: card.number,
+          ...(carried.length > 1 ? { cards: carried.map((entry) => entry.number) } : {}),
           role: link.role,
           model: link.model,
           startedAt: link.startedAt,

@@ -16909,7 +16909,23 @@ const make = Effect.gen(function* () {
           links: store.threadLinks({ boardId, open: false }),
         }),
       );
-      const candidates = Activity.threadDigestRows(cards, links, events, window);
+      // Released cards leave the active set, but their window's events still belong to the worker.
+      const threadCards = new Map(
+        yield* readDb(
+          Effect.forEach(
+            links.filter(
+              (link) =>
+                link.role === "work" &&
+                link.startedAt < window.until &&
+                (link.endedAt === null || link.endedAt >= window.since),
+            ),
+            (link) =>
+              Effect.map(store.threadCards(link.threadId), (ids) => [link.threadId, ids] as const),
+            { concurrency: 1 },
+          ),
+        ),
+      );
+      const candidates = Activity.threadDigestRows(cards, links, events, window, threadCards);
       const byNumber = new Map(cards.map((card) => [card.number, card.id]));
       const byCard = Activity.groupEvents(events);
       const rows: Array<
@@ -16936,9 +16952,11 @@ const make = Effect.gen(function* () {
             [view?.lastActivityAt, view?.quietSince].some(
               (at) => at != null && at >= window.since && at < window.until,
             )) ||
-          (byCard.get(byNumber.get(row.card)!) ?? []).some(
-            (event) =>
-              event.at >= row.startedAt && (row.endedAt === null || event.at <= row.endedAt),
+          (row.cards ?? [row.card]).some((number) =>
+            (byCard.get(byNumber.get(number)!) ?? []).some(
+              (event) =>
+                event.at >= row.startedAt && (row.endedAt === null || event.at <= row.endedAt),
+            ),
           );
         if (!active) continue;
         const item = {
