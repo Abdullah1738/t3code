@@ -133,6 +133,8 @@ class ExecBoundaryTests(Isolated):
             out, err = proc.communicate(timeout=25)
             self.assertEqual(proc.returncode, 0, err.decode())
             rid = out.decode().strip()
+            self.assertIn(f"Run `offbox wait {rid}` as a background command and end your turn; its completion wakes you.", err.decode())
+            self.assertNotIn('logs ' + rid + ' --follow', err.decode())
             row = self.con.execute('SELECT * FROM runs WHERE run_id=?', (rid,)).fetchone()
             self.assertIsNotNone(row)
             self.addCleanup(self.stop_child, row['client_pid'], proc.pid)

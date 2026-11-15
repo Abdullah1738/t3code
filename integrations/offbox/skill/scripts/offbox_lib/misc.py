@@ -999,8 +999,8 @@ def logs(run_id: str, do_follow: bool) -> int:
             st = p.stat() if p.exists() else None
             written = time.strftime('%H:%M:%S', time.localtime(st.st_mtime)) if st else 'never'
             say(f"{r['run_id']} is still running; this local copy ({st.st_size if st else 0} bytes, last written "
-                f"{written}) includes the output fetched so far. Use `offbox logs --follow {r['run_id']}` "
-                f"or `offbox wait {r['run_id']} --timeout <s>` for current output.")
+                f"{written}) includes the output fetched so far. For completion, start one "
+                f"`offbox wait {r['run_id']}` as a background command and end your turn; do not poll logs.")
         return 0
     result = _catch_up_log(r, lock_wait=LOG_READ_WAIT_S)
     from . import resources
@@ -1029,16 +1029,54 @@ def logs(run_id: str, do_follow: bool) -> int:
     return 0
 
 
-def wait(run_id: str, timeout: float | None) -> int:
+def wait(run_id: str, timeout: float | None, *, summary: bool = False) -> int:
     r = _run_row(run_id)
     _require_my_run(r)
     from .home_run_observation import notice
     notice(r)
+    path = LOGS_DIR / f"{run_id}.log"
+    delivered = delivered_bytes(path) if summary else 0
     from . import start_check
+    from .runs import Interrupted
     unknown = r['status'] == 'infra' and start_check.recovery_marked(db(), r)
-    if (r["status"] not in ("starting", "running", "lost") and not unknown) or (r['status'] == 'lost' and (r['exit_code'] is not None or not r['box_id'])):
-        return _settled(r, show_failure=True, until=None if timeout is None else now() + timeout)
-    return _wait_locked(r, echo=False, timeout=timeout, show_failure=True)
+    try:
+        if (r["status"] not in ("starting", "running", "lost") and not unknown) or (r['status'] == 'lost' and (r['exit_code'] is not None or not r['box_id'])):
+            code = _settled(r, show_failure=True, until=None if timeout is None else now() + timeout)
+        else:
+            code = _wait_locked(r, echo=False, timeout=timeout, show_failure=True)
+    except Interrupted as error:
+        if summary:
+            _wait_summary(run_id, error.code, delivered)
+        raise
+    if summary:
+        # A forwarded wait is another CLI process on the destination backend; it prints its own summary.
+        try:
+            forwarded = _run_row(run_id)['status'] == 'forwarded'
+        except (sqlite3.Error, OffboxError):
+            forwarded = r['status'] == 'forwarded'
+        if not forwarded:
+            _wait_summary(run_id, code, delivered)
+    return code
+
+
+def _wait_summary(run_id: str, code: int, delivered: int) -> None:
+    path = LOGS_DIR / f"{run_id}.log"
+    out(f"{run_id}: backend={api.BACKEND} exit={code} log={path}")
+    # Keep the summary and preview within the harness's completion-notification tail. Already delivered output
+    # stays quiet, including failures shown by an earlier logs/follow/wait invocation.
+    try:
+        with path.open('rb') as stream:
+            size = os.fstat(stream.fileno()).st_size
+            pos = max(0, size - 4096, delivered if delivered <= size else 0)
+            stream.seek(pos)
+            tail = stream.read(4096).decode('utf-8', errors='replace').splitlines()[-8:]
+        text = '\n'.join(tail)[-640:]
+        if text:
+            out('Output tail:\n' + text)
+            if not is_silenced(sys.stdout):
+                record_delivery(path, size)
+    except OSError:
+        pass
 
 
 def _settled(r, echo=False, pos=0, *, locked=False, until=None, show_failure=False) -> int:
