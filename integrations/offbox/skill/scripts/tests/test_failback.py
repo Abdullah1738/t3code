@@ -359,11 +359,13 @@ class FailbackTests(Isolated):
             if len(attempts) == 1:
                 row = self.con.execute("SELECT * FROM runs WHERE run_id='mine'").fetchone()
                 start_check.settle(self.con, row, start_check.Result('fenced'), 'lost start response')
-                self.assertEqual(self.con.execute("SELECT status FROM runs WHERE run_id='mine'").fetchone()[0], 'lost')
+                self.assertEqual(self.con.execute("SELECT status,logged_end_at FROM runs WHERE run_id='mine'").fetchone()[:],
+                                 ('starting', None))
                 raise common.OffboxError('home down', outage=True, run_id='mine')
             self.assertNotEqual(common.kv_get(self.con, 'start_claim:mine'), 'old-claim')
             row = self.con.execute("SELECT * FROM runs WHERE run_id='mine'").fetchone()
             self.assertEqual(runs.restore_run_state(row)['status'], 'starting')
+            self.assertEqual(runs.finish('mine', 0, catch_up=False, bookkeeping=False), 0)
             raise SystemExit('fence rotated')
         with patch.dict(os.environ, {home.RETURNED_HOME_ENV: 'outage', home.RUN_ID_ENV: 'mine'}), \
                 patch.object(home, 'active', return_value=True), patch.object(runs.Runner, 'start', start), \
@@ -372,6 +374,37 @@ class FailbackTests(Isolated):
                 cli._run_with_retries(args, self.me)
         self.assertEqual(attempts, ['mine', 'mine'])
         self.assertIsNone(common.kv_get(self.con, 'lost_confirmed:mine'))
+        ends = [c for c in self.events.call_args_list if c.args[:2] == ('run', 'run.end')]
+        self.assertEqual(len(ends), 1)
+        self.assertEqual(ends[0].kwargs['props']['exitCode'], 0)
+        self.assertTrue(ends[0].kwargs['ok'])
+
+    def test_only_this_active_returned_foreground_fence_stays_pending(self):
+        self.pending()
+        for returned, own, same_attempt in [(True, True, True), (False, True, True),
+                                            (True, False, True), (True, True, False)]:
+            with self.subTest(returned=returned, own=own, same_attempt=same_attempt), \
+                    patch.dict(os.environ, {home.RETURNED_HOME_ENV: 'outage' if returned else ''}), \
+                    home.pre_start('mine' if same_attempt else 'other'):
+                self.con.execute("UPDATE runs SET mode='fg',status='starting',exit_code=NULL,logged_end_at=NULL,client_pid=? "
+                                 "WHERE run_id='mine'", (os.getpid() if own else os.getpid()+1,))
+                row = self.con.execute("SELECT * FROM runs WHERE run_id='mine'").fetchone()
+                start_check.settle(self.con, row, start_check.Result('fenced'), 'lost response')
+                self.assertEqual(self.con.execute("SELECT status FROM runs WHERE run_id='mine'").fetchone()[0],
+                                 'starting' if returned and own and same_attempt else 'lost')
+
+    def test_revived_fenced_receipt_allows_a_final_success_event(self):
+        self.pending()
+        self.con.execute("UPDATE runs SET mode='fg',status='lost',logged_end_at=123 WHERE run_id='mine'")
+        self.con.execute("INSERT INTO kv(k,v) VALUES ('lost_confirmed:mine','fenced')")
+        self.con.execute("INSERT INTO kv(k,v) VALUES ('start_claim:mine','old')")
+        with patch.dict(os.environ, {home.RETURNED_HOME_ENV: 'outage'}):
+            runs.retry_background(common.OffboxError('home down'), run_id='mine')
+        self.assertIsNone(self.con.execute("SELECT logged_end_at FROM runs WHERE run_id='mine'").fetchone()[0])
+        runs.finish('mine', 0, catch_up=False, bookkeeping=False)
+        ends = [c for c in self.events.call_args_list if c.args[:2] == ('run', 'run.end')]
+        self.assertEqual(len(ends), 1)
+        self.assertEqual(ends[0].kwargs['props']['exitCode'], 0)
 
     def test_returned_retry_preserves_terminal_or_unconfirmed_start_rows(self):
         self.pending()

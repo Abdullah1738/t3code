@@ -3152,8 +3152,9 @@ def retry_background(error, *, run_id=None) -> None:
                     # Keep the old fence forever: a late delivery must still lose its original claim.
                     con.execute('UPDATE kv SET v=? WHERE k=?', (new_id('claim'), 'start_claim:' + rid))
                     con.execute('DELETE FROM kv WHERE k=?', ('lost_confirmed:' + rid,))
-                con.execute("UPDATE runs SET status='starting', box_id=NULL, error=?, end_at=NULL WHERE run_id=?",
-                            (str(error)[:500], rid))
+                con.execute("UPDATE runs SET status='starting', box_id=NULL, error=?, end_at=NULL, "
+                            "logged_end_at=CASE WHEN ? THEN NULL ELSE logged_end_at END WHERE run_id=?",
+                            (str(error)[:500], returned, rid))
             if returned:
                 save_run_state(rid, status='starting', box_id=None, process_id=None, exit_code=None, end_at=None)
         finally:
