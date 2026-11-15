@@ -438,6 +438,41 @@ class GuardTests(unittest.TestCase):
                 script = self.write('tmp/transformed.mjs', source)
                 self.assertEqual(self.classify('node ' + shlex.quote(str(script))), SCRIPT)
 
+    def test_foreign_state_sqlite_preserves_root_evidence(self):
+        imports = 'import { DatabaseSync } from "node:sqlite";\nimport path from "node:path";\n'
+        rows = [
+            ('opencode sibling', '/Users/ardud/.local/share/opencode/state.sqlite',
+             'path.join(path.dirname(foreign), "opencode.db")'),
+            ('robob sibling', '/Users/ardud/.robob/other/state.sqlite',
+             'path.join(path.dirname(path.dirname(foreign)), "userdata", "statev2.sqlite")'),
+        ]
+        for label, foreign, expression in rows:
+            with self.subTest(case=label):
+                source = imports + f'const foreign = "{foreign}";\nnew DatabaseSync({expression});\n'
+                script = self.write('tmp/sibling.mjs', source)
+                command = 'node ' + shlex.quote(str(script))
+                self.assertEqual(self.classify(command), SCRIPT)
+                self.adapters(command, SCRIPT)
+                self.assertEqual(self.classify("node - <<'JS'\n" + source + 'JS'), READ)
+        source = ('foreign=~/.config/spectrum-bridge/state.sqlite\n'
+                  'sqlite3 -readonly ~/.robob/userdata/state.sqlite "select 1"\n')
+        script = self.write('tmp/plain-live-operand.sh', source)
+        command = 'zsh ' + shlex.quote(str(script)) + ' owner'
+        self.assertEqual(self.classify(command), SCRIPT)
+        self.adapters(command, SCRIPT)
+        self.assertEqual(self.classify("zsh -s <<'BODY'\n" + source + 'BODY'), READ)
+        for foreign in ['/Users/ardud/.local/share/tool/state.sqlite', '~/.local/share/tool/state.sqlite',
+                        '$HOME/.local/share/tool/state.sqlite', '${HOME}/.local/share/tool/state.sqlite']:
+            for name in ['statev2.sqlite', 'opencode.db', 'state.sqlite']:
+                node = imports + f'const foreign = "{foreign}";\nconst name = "{name}";\nnew DatabaseSync(path.join(process.env.D, name));\n'
+                shell = f'foreign="{foreign}"\nsqlite3 "$D/{name}" "select 1"\n'
+                for extension, runner, source in [('mjs', 'node', node), ('sh', 'zsh', shell)]:
+                    with self.subTest(foreign=foreign, name=name, extension=extension):
+                        script = self.write('tmp/variable-operand.' + extension, source)
+                        self.assertEqual(self.classify(runner + ' ' + shlex.quote(str(script)) + ' owner'), SCRIPT)
+                        if extension == 'mjs':
+                            self.assertEqual(self.classify("node - <<'BODY'\n" + source + 'BODY'), READ)
+
     def test_readonly_replica_scripts_and_live_near_misses(self):
         rows = [
             (".robob/userdata/readonly/state.sqlite", None),

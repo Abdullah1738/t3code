@@ -1501,9 +1501,6 @@ def _source_hit(source, directory, python=False, shell=False):
                 return True
     if source_touches_live(source) or _relative_source_live(source, directory):
         return True
-    source = _foreign_state_source(source, directory)
-    if re.search(r'''\bsqlite3?\s+(?:-[\w-]+\s+)*['"]?[^'"\s;]*state\.sqlite''', source):
-        return True
     def isolated_literal(match):
         value = match[2]
         # A direct absolute argument stays fixed even if the program changes cwd.
@@ -1522,6 +1519,10 @@ def _source_hit(source, directory, python=False, shell=False):
     live_root = replica or re.search(r"(?<!\w)\.robob\b|robob-data|\.local/share|opencode-data|[\"']opencode[\"']", source)
     home_userdata = (not shell and re.search(r"\buserdata\b", source) and
                      re.search(r"\b(?:homedir|HOME|T3CODE_HOME)\b|\bPath\.home\b|['\"`]~(?:/|['\"`])", source))
+    # A foreign operand may still supply a root for another database operand.
+    source = _foreign_state_source(source, directory)
+    if re.search(r'''\bsqlite3?\s+(?:-[\w-]+\s+)*['"]?[^'"\s;]*state\.sqlite''', source):
+        return True
     # Shell fixture proofs above discharge statev2/opencode paths, not other
     # database names that their setup may also list as data.
     database = re.search(r"statev2\.sqlite|opencode\.db", source) if shell else DATABASE_NAME.search(source)
