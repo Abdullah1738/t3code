@@ -6,6 +6,7 @@ import * as ThreadReadDeadline from "./ThreadReadDeadline.ts";
 import * as StartupPhaseLog from "../ardud/observability/StartupPhaseLog.ts";
 import { bootId } from "../ardud/fast-install/report.ts";
 import * as McpCallAnalytics from "../ardud/analytics/McpCall.ts";
+import * as CardNextMetrics from "../ardud/analytics/CardNextMetrics.ts";
 import * as SavedWrite from "../ardud/kanban/engine/savedWrite.ts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { analyticsErrorTag, recordServerAnalytics } from "../observability/RpcInstrumentation.ts";
@@ -1133,6 +1134,13 @@ const withToolAnalytics =
                       });
                     let handlerEnded: bigint | undefined;
                     let threadReadAtExit: ReturnType<typeof ThreadReadMetrics.snapshot> | undefined;
+                    let cardNextAtExit:
+                      | (ReturnType<typeof CardNextMetrics.snapshot> &
+                          Pick<
+                            McpCallAnalytics.McpCall["Service"],
+                            "readerLane" | "callerResolved" | "callerResolveMs"
+                          >)
+                      | undefined;
                     const parentSaved = yield* SavedWrite.observer;
                     const parentCommitting = yield* SavedWrite.commitObserver;
                     const identifiers = McpCallAnalytics.callIdentifiers(
@@ -1192,6 +1200,10 @@ const withToolAnalytics =
                             ? 0
                             : Math.max(0, Number(ended - callState.callerStarted) / 1e6)),
                         readerLane: callState.readerLane,
+                        ...(callState.cardNext === undefined
+                          ? {}
+                          : (cardNextAtExit ??
+                            CardNextMetrics.snapshot(callState.cardNext, ended))),
                         ...(callState.waitStage === undefined
                           ? {}
                           : { waitStage: callState.waitStage }),
@@ -1427,6 +1439,20 @@ const withToolAnalytics =
                               callState.threadRead,
                               handlerEnded,
                             );
+                          if (callState.cardNext !== undefined) {
+                            const timings = CardNextMetrics.snapshot(
+                              callState.cardNext,
+                              handlerEnded,
+                            );
+                            cardNextAtExit = {
+                              ...timings,
+                              readerLane: callState.readerLane,
+                              callerResolved: callState.callerResolved,
+                              callerResolveMs:
+                                timings.cardNextStages.find((part) => part.stage === "caller")
+                                  ?.durationMs ?? 0,
+                            };
+                          }
                           const resolved = {
                             ...(identifiers.boardId ? { boardId: identifiers.boardId } : {}),
                             ...(callState.boardId ? { boardId: callState.boardId } : {}),

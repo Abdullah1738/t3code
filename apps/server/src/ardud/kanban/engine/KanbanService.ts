@@ -1,3 +1,4 @@
+import * as CardNextMetrics from "../../analytics/CardNextMetrics.ts";
 import { classifyReply } from "./ownerReplies.ts";
 import { ownerReplyDiscussion, ownerReplyKey, ownerReplyPending } from "./ownerReplyWake.ts";
 import { EVALUATOR_LIMITS, matchingCards, requestThreadIds } from "./evaluatorAdmission.ts";
@@ -14267,7 +14268,10 @@ const make = Effect.gen(function* () {
       return yield* failWith("denied", "only a card's work thread takes cards");
     }
     const board = yield* boardOf(link.boardId);
-    const context = compact ? yield* threads.claimContext(threadId) : null;
+    // A single caller row must not wait behind interactive state snapshots.
+    const context = compact
+      ? yield* threads.claimContext(threadId).pipe(NodeSqliteClient.identityReadOnly)
+      : null;
     const view = compact ? context : yield* threads.view(threadId);
     if (!view) return yield* failWith("not-found", `thread ${threadId}`);
     const carried = yield* reader.cardsByThread(threadId);
@@ -14606,49 +14610,76 @@ const make = Effect.gen(function* () {
       yield* Effect.annotateCurrentSpan("kanban.thread_id", threadId);
       return yield* readDb(
         Effect.gen(function* () {
-          const thread = yield* workThreadOf(threadId, true);
-          const pools = yield* store.pools(thread.board.id);
-          const slots = pools.find((pool) => pool.key === thread.pool)?.slots ?? 0;
+          const thread = yield* CardNextMetrics.stage("caller", workThreadOf(threadId, true));
+          const { pools, slots, eligible } = yield* CardNextMetrics.stage(
+            "occupancy",
+            Effect.gen(function* () {
+              const pools = yield* store.pools(thread.board.id);
+              const slots = pools.find((pool) => pool.key === thread.pool)?.slots ?? 0;
+              let eligible = slots > 0 && thread.carried.length < Rules.MAX_BATCH;
+              if (eligible && !thread.holdsSlot) {
+                const occupied = new Set(yield* store.poolThreadIds(thread.board.id, thread.pool));
+                for (const [id, pool] of yield* boardHolds(thread.board.id)) {
+                  if (pool === thread.pool) occupied.add(id);
+                }
+                eligible = occupied.size < slots;
+              }
+              return { pools, slots, eligible };
+            }),
+          );
           const empty = {
             carrying: thread.carried,
             candidates: [],
             holdsSlot: thread.holdsSlot,
           } satisfies NextCards;
-          if (slots <= 0 || thread.carried.length >= Rules.MAX_BATCH) return empty;
-          // Occupancy needs ids only; a released worker in a full pool cannot take more work.
-          if (!thread.holdsSlot) {
-            const occupied = new Set(yield* store.poolThreadIds(thread.board.id, thread.pool));
-            for (const [id, pool] of yield* boardHolds(thread.board.id)) {
-              if (pool === thread.pool) occupied.add(id);
-            }
-            if (occupied.size >= slots) return empty;
-          }
-          const carried = yield* carriedIds(threadId);
-          if (carried.size === 0) return empty;
-          // Include every blocker recursively: omitting an ancestor would make a held card look claimable.
-          const cards = yield* store.claimCards(thread.board.id, [...carried]);
-          const mine = new Set(
-            cards
-              .filter((card) => carried.has(card.id) && card.workThreadId === threadId)
-              .map((card) => card.id),
+          if (!eligible) return empty;
+          const { cards, seeds, groups } = yield* CardNextMetrics.stage(
+            "cards",
+            Effect.gen(function* () {
+              const carried = yield* carriedIds(threadId);
+              if (carried.size === 0) return { cards: [], seeds: [], groups: [] };
+              // Include every blocker recursively so a held card cannot look claimable.
+              const cards = yield* store.claimCards(thread.board.id, [...carried]);
+              return {
+                cards,
+                seeds: cards.filter(
+                  (card) => carried.has(card.id) && card.workThreadId === threadId,
+                ),
+                groups: yield* store.groups(thread.board.id),
+              };
+            }),
+          );
+          const input = {
+            board: thread.board,
+            cards,
+            groups,
+            seeds,
+            threadId,
+            pool: thread.pool,
+            projectId: thread.projectId,
+            carrying: thread.carried.length,
+            slots,
+            pools,
+          };
+          // Ranking the whole board cannot affect an empty or single-card answer.
+          const candidates = yield* CardNextMetrics.stage(
+            "rules",
+            Effect.sync(() =>
+              Rules.relatedCandidates({ ...input, rankingCards: [], limit: cards.length }),
+            ),
+          );
+          if (candidates.length <= 1) return { ...empty, candidates };
+          const rankingCards = yield* CardNextMetrics.stage(
+            "ranking",
+            store.schedulingCards(thread.board.id),
           );
           return {
-            carrying: thread.carried,
-            candidates: Rules.relatedCandidates({
-              board: thread.board,
-              cards,
-              rankingCards: yield* store.schedulingCards(thread.board.id),
-              groups: yield* store.groups(thread.board.id),
-              seeds: cards.filter((card) => mine.has(card.id)),
-              threadId,
-              pool: thread.pool,
-              projectId: thread.projectId,
-              carrying: thread.carried.length,
-              slots,
-              pools,
-            }),
-            holdsSlot: thread.holdsSlot,
-          } satisfies NextCards;
+            ...empty,
+            candidates: yield* CardNextMetrics.stage(
+              "rules",
+              Effect.sync(() => Rules.relatedCandidates({ ...input, rankingCards })),
+            ),
+          };
         }),
       ).pipe(NodeSqliteClient.foregroundReads);
     },

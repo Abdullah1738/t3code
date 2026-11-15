@@ -20,6 +20,7 @@ import {
   type ModelSelection,
 } from "@t3tools/contracts";
 import { resolvedContext } from "../../analytics/McpCall.ts";
+import * as CardNextMetrics from "../../analytics/CardNextMetrics.ts";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -128,7 +129,7 @@ const withCaller = Effect.fn("KanbanTools.withCaller")(
     return yield* service.agentCall(
       threadId,
       Effect.gen(function* () {
-        const link = yield* service.caller(threadId);
+        const link = yield* CardNextMetrics.stage("caller", service.caller(threadId));
         if (link?.boardId) yield* resolvedContext({ boardId: link.boardId });
         const actor: KanbanActor =
           link !== null && link.role !== "evaluator"
@@ -1223,11 +1224,18 @@ const handlers = {
         };
       }),
     ).pipe(
+      CardNextMetrics.observe,
       NodeSqliteClient.foregroundReads,
       McpDeadline.awaitInterruptibly,
       Effect.timeoutOrElse({
         duration: "2 seconds",
-        orElse: () => invalid("card_next is busy; retry shortly."),
+        orElse: () =>
+          Effect.fail(
+            new OrchestratorMcpFailure({
+              code: "lookup_timeout",
+              message: "card_next is busy; retry shortly.",
+            }),
+          ),
       }),
     ),
   ),

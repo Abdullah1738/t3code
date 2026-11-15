@@ -39603,3 +39603,109 @@ it.effect.each(["quota", "transient"] as const)(
       }).pipe(Effect.provide(testLayer(fake.layer)));
     }),
 );
+
+it.effect.each([0, 1, 3])(
+  "card_next only ranks the board for multiple claimable choices (%s)",
+  (count) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      let checking = false;
+      let rankingReads = 0;
+      let identityReads = 0;
+      const threadReads = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (real) =>
+          KanbanThreads.of({
+            ...real,
+            claimContext: (id) =>
+              Effect.gen(function* () {
+                if (checking) {
+                  identityReads++;
+                  assert.equal(yield* NodeSqliteClient.ReaderLane, "identity");
+                }
+                return yield* real.claimContext(id);
+              }),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      const observed = Layer.effect(
+        KanbanStore.KanbanStore,
+        Effect.map(KanbanStore.KanbanStore, (real) =>
+          KanbanStore.KanbanStore.of({
+            ...real,
+            cards: (id) => (checking ? Effect.die("full board scan") : real.cards(id)),
+            claimCards: (id, seeds) =>
+              real.claimCards(id, seeds).pipe(
+                Effect.tap((rows) => {
+                  if (!checking) return Effect.void;
+                  assert.equal(rows.length, count + 1);
+                  return Effect.gen(function* () {
+                    assert.equal(yield* NodeSqliteClient.ReaderLane, "foreground");
+                  });
+                }),
+              ),
+            schedulingCards: (id) => {
+              if (checking) rankingReads++;
+              return real.schedulingCards(id);
+            },
+          }),
+        ),
+      ).pipe(Layer.provide(KanbanStore.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        const card = yield* kanban.createCard(board.id, { title: "Seed", prompt: "Seed" }, owner);
+        yield* kanban.dispatchNow;
+        const started = (yield* store.card(card.id))!;
+        const thread = started.workThreadId!;
+        yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+          _tag: "thread",
+          threadId: thread,
+        });
+        const links = [
+          {
+            kind: "pr" as const,
+            url: "https://github.com/example/repo/pull/1",
+            label: null,
+            state: null,
+            checkedAt: null,
+          },
+        ];
+        yield* store.putCard({ ...(yield* store.card(card.id))!, links });
+        for (let i = 0; i < count; i++)
+          yield* store.putCard({
+            ...started,
+            id: KanbanCardId.make(`choice-${i}`),
+            number: 100 + i,
+            priority: 3 - i,
+            links,
+            stage: "todo",
+            activeThreadId: null,
+            activeRole: null,
+            activePool: null,
+            workThreadId: null,
+            reviewThreadId: null,
+          });
+        for (let i = 0; i < 40; i++)
+          yield* store.putCard({
+            ...started,
+            id: KanbanCardId.make(`done-${i}`),
+            number: 200 + i,
+            stage: "completed",
+            activeThreadId: null,
+            activeRole: null,
+            activePool: null,
+            workThreadId: null,
+          });
+        checking = true;
+        const next = yield* kanban.agentCall(thread, kanban.nextCards(thread));
+        assert.lengthOf(next.candidates, count);
+        assert.equal(identityReads, 1);
+        assert.equal(rankingReads, count > 1 ? 1 : 0);
+        assert.deepEqual(
+          next.candidates.map(({ card }) => card.number),
+          Array.from({ length: count }, (_, i) => 100 + count - i - 1),
+        );
+      }).pipe(Effect.provide(testLayer(threadReads, undefined, undefined, observed)));
+    }),
+);
