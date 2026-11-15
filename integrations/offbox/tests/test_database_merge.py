@@ -279,10 +279,10 @@ class DatabaseMerge(Isolated):
                 patch.object(common, 'home_config', return_value={'url':'https://unused.invalid/api/v1'}), \
                 patch.object(common, 'backend_pinned', return_value=None), \
                 patch.object(common, 'home_state', return_value={'state':'home_down'}), \
-                patch.object(home, 'probe') as probe, self.assertRaises(common.OffboxError) as error:
+                patch.object(home, 'probe', return_value='no answer (TimeoutError)') as probe, self.assertRaises(common.OffboxError) as error:
             home.person_gate()
         self.assertEqual(error.exception.code, 93)
-        probe.assert_not_called()
+        probe.assert_called_once_with()
         local = common.local_error(sqlite3.OperationalError('database is locked'))
         self.assertEqual(local.code, 96)
         self.assertIn('nothing ran, safe to retry', str(local))
