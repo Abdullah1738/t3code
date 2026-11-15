@@ -46,6 +46,7 @@ import {
   type PullRequestTargetInput,
   PullRequestWatchFailedError,
   PullRequestWatchTimeoutError,
+  PullRequestToolTimeoutError,
   PullRequestWatchFromSubagentError,
   PullRequestThreadNotFoundError,
   PullRequestThreadRequiredError,
@@ -62,29 +63,38 @@ interface ResolvedTarget {
   readonly url: string;
 }
 
-class WatchChangeState extends Context.Service<
-  WatchChangeState,
+class PullRequestOperationState extends Context.Service<
+  PullRequestOperationState,
   { saved: boolean | "unknown"; phase: string | undefined }
->()("t3/mcp/toolkits/pullRequests/handlers/WatchChangeState") {}
+>()("t3/mcp/toolkits/pullRequests/handlers/PullRequestOperationState") {}
 
-const watchDeadline = Effect.fn("PullRequestsToolkit.watchDeadline")(function* <A, E, R>(
-  operation: Effect.Effect<A, E, R>,
-) {
-  const state = WatchChangeState.of({ saved: false, phase: undefined });
-  return yield* operation.pipe(
-    Effect.provideService(WatchChangeState, state),
-    // A masked SQLite commit can outlive cancellation; never join its cleanup before replying.
-    McpDeadline.awaitInterruptibly,
-    Effect.timeoutOrElse({
-      duration: McpDeadline.OPERATION_TIMEOUT,
-      orElse: () =>
-        (state.phase === undefined ? Effect.void : McpCall.failedPhase(state.phase)).pipe(
-          Effect.andThen(state.saved === "unknown" ? Effect.void : McpCall.setSaved(state.saved)),
-          Effect.andThen(Effect.fail(new PullRequestWatchTimeoutError({ saved: state.saved }))),
-        ),
-    }),
-  );
-});
+const pullRequestDeadline = <Timeout>(
+  makeError: (saved: boolean | "unknown") => Timeout,
+  span = "PullRequestsToolkit.pullRequestDeadline",
+) =>
+  Effect.fn(span)(function* <A, E, R>(operation: Effect.Effect<A, E, R>) {
+    const state = PullRequestOperationState.of({ saved: false, phase: undefined });
+    return yield* operation.pipe(
+      Effect.provideService(PullRequestOperationState, state),
+      // A masked SQLite commit can outlive cancellation; never join its cleanup before replying.
+      McpDeadline.awaitInterruptibly,
+      Effect.timeoutOrElse({
+        duration: McpDeadline.OPERATION_TIMEOUT,
+        orElse: () =>
+          (state.phase === undefined ? Effect.void : McpCall.failedPhase(state.phase)).pipe(
+            Effect.andThen(state.saved === "unknown" ? Effect.void : McpCall.setSaved(state.saved)),
+            Effect.andThen(Effect.fail(makeError(state.saved))),
+          ),
+      }),
+    );
+  });
+
+const watchDeadline = pullRequestDeadline(
+  (saved) => new PullRequestWatchTimeoutError({ saved }),
+  "PullRequestsToolkit.watchDeadline",
+);
+const toolDeadline = (tool: PullRequestToolTimeoutError["tool"]) =>
+  pullRequestDeadline((saved) => new PullRequestToolTimeoutError({ tool, saved }));
 
 function projectHostAndProvider(project: OrchestrationProjectShell | undefined): {
   readonly host: string | null;
@@ -297,7 +307,7 @@ const make = Effect.gen(function* () {
     input: PullRequestTargetInput,
     watching: boolean,
   ) {
-    const state = yield* WatchChangeState;
+    const state = yield* PullRequestOperationState;
     state.phase = "handler";
     const thread = yield* requireThread(PullRequestWatchFailedError, input.threadId);
     const project = yield* projectOf(thread, PullRequestWatchFailedError);
@@ -353,6 +363,8 @@ const make = Effect.gen(function* () {
   const locateAll = Effect.fn("PullRequestsToolkit.locateAll")(function* (
     targets: ReadonlyArray<Omit<PullRequestTargetInput, "threadId">>,
   ) {
+    const state = yield* PullRequestOperationState;
+    state.phase = "handler";
     const scope = yield* McpInvocationContext.requireMcpCapability("pull-requests");
     const callerThread =
       scope.thread === undefined
@@ -398,73 +410,96 @@ const make = Effect.gen(function* () {
   ) => McpToolAccess.writesThreads((params: P) => [params.threadId], handle);
 
   return {
-    link_pull_request: writesThread((input) =>
-      Effect.gen(function* () {
-        const thread = yield* requireThread(PullRequestLinkFailedError, input.threadId);
-        const project = yield* projectOf(thread, PullRequestLinkFailedError);
-        const target = yield* resolveTarget(input, project);
-        const existing = threadPullRequestsOf(thread).find((link) =>
-          threadPullRequestKeysEqual(link, target),
-        );
-        if (existing && existing.source !== "stack-dismissed")
-          return { ...target, alreadyLinked: true };
-        const alreadyLinked = yield* engine
-          .dispatch({
-            type: "thread.pull-request.link",
-            commandId: yield* commandId("mcp-pr-link", thread.id),
-            threadId: thread.id,
-            host: target.host,
-            repository: target.repository,
-            number: target.number,
-            url: target.url,
-            source: "agent",
-          })
-          .pipe(
-            Effect.as(false),
-
-            Effect.catchCause(dispatchFailure(PullRequestLinkFailedError)),
+    link_pull_request: McpToolAccess.bound(
+      writesThread((input) =>
+        Effect.gen(function* () {
+          const state = yield* PullRequestOperationState;
+          state.phase = "handler";
+          const thread = yield* requireThread(PullRequestLinkFailedError, input.threadId);
+          const project = yield* projectOf(thread, PullRequestLinkFailedError);
+          const target = yield* resolveTarget(input, project);
+          const existing = threadPullRequestsOf(thread).find((link) =>
+            threadPullRequestKeysEqual(link, target),
           );
-        return { ...target, alreadyLinked };
-      }),
+          if (existing && existing.source !== "stack-dismissed")
+            return { ...target, alreadyLinked: true };
+          const id = yield* commandId("mcp-pr-link", thread.id);
+          state.phase = "dispatch";
+          state.saved = "unknown";
+          const alreadyLinked = yield* engine
+            .dispatch({
+              type: "thread.pull-request.link",
+              commandId: id,
+              threadId: thread.id,
+              host: target.host,
+              repository: target.repository,
+              number: target.number,
+              url: target.url,
+              source: "agent",
+            })
+            .pipe(
+              Effect.as(false),
+
+              Effect.catchCause(dispatchFailure(PullRequestLinkFailedError)),
+            );
+          state.saved = true;
+          return { ...target, alreadyLinked };
+        }),
+      ),
+      toolDeadline("link_pull_request"),
     ),
-    unlink_pull_request: writesThread((input) =>
-      Effect.gen(function* () {
-        const thread = yield* requireThread(PullRequestUnlinkFailedError, input.threadId);
-        const project = yield* projectOf(thread, PullRequestUnlinkFailedError);
-        const target = yield* resolveTarget(input, project);
-        if (!threadPullRequestsOf(thread).some((link) => threadPullRequestKeysEqual(link, target)))
+    unlink_pull_request: McpToolAccess.bound(
+      writesThread((input) =>
+        Effect.gen(function* () {
+          const state = yield* PullRequestOperationState;
+          state.phase = "handler";
+          const thread = yield* requireThread(PullRequestUnlinkFailedError, input.threadId);
+          const project = yield* projectOf(thread, PullRequestUnlinkFailedError);
+          const target = yield* resolveTarget(input, project);
+          if (
+            !threadPullRequestsOf(thread).some((link) => threadPullRequestKeysEqual(link, target))
+          )
+            return {
+              host: target.host,
+              repository: target.repository,
+              number: target.number,
+              wasLinked: false,
+            };
+          const id = yield* commandId("mcp-pr-unlink", thread.id);
+          state.phase = "dispatch";
+          state.saved = "unknown";
+          const wasLinked = yield* engine
+            .dispatch({
+              type: "thread.pull-request.unlink",
+              commandId: id,
+              threadId: thread.id,
+              host: target.host,
+              repository: target.repository,
+              number: target.number,
+            })
+            .pipe(
+              Effect.as(true),
+
+              Effect.catchCause(dispatchFailure(PullRequestUnlinkFailedError)),
+            );
+          state.saved = true;
           return {
             host: target.host,
             repository: target.repository,
             number: target.number,
-            wasLinked: false,
+            wasLinked,
           };
-        const wasLinked = yield* engine
-          .dispatch({
-            type: "thread.pull-request.unlink",
-            commandId: yield* commandId("mcp-pr-unlink", thread.id),
-            threadId: thread.id,
-            host: target.host,
-            repository: target.repository,
-            number: target.number,
-          })
-          .pipe(
-            Effect.as(true),
-
-            Effect.catchCause(dispatchFailure(PullRequestUnlinkFailedError)),
-          );
-        return {
-          host: target.host,
-          repository: target.repository,
-          number: target.number,
-          wasLinked,
-        };
-      }),
-    ),
-    list_thread_pull_requests: McpToolAccess.reads((input) =>
-      requireThread(PullRequestListFailedError, input.threadId).pipe(
-        Effect.map(listThreadPullRequests),
+        }),
       ),
+      toolDeadline("unlink_pull_request"),
+    ),
+    list_thread_pull_requests: McpToolAccess.bound(
+      McpToolAccess.reads((input) =>
+        requireThread(PullRequestListFailedError, input.threadId).pipe(
+          Effect.map(listThreadPullRequests),
+        ),
+      ),
+      toolDeadline("list_thread_pull_requests"),
     ),
     watch_pull_request: McpToolAccess.bound(
       writesThread((input) => setWatching(input, true)),
@@ -474,92 +509,103 @@ const make = Effect.gen(function* () {
       writesThread((input) => setWatching(input, false)),
       watchDeadline,
     ),
-    write_pull_request_guides: McpToolAccess.writesWithCapability((input) =>
-      Effect.gen(function* () {
-        const located = yield* locateAll(input.pullRequests);
-        const guides = yield* Effect.forEach(
-          located,
-          (entry) =>
-            Effect.gen(function* () {
-              if (entry.target === null) {
-                return {
-                  host: entry.input.host ?? "",
-                  repository: entry.input.repository ?? "",
-                  number: entry.input.number ?? 0,
-                  url: entry.input.url ?? "",
-                  outcome: "failed" as const,
-                  detail: entry.failure,
+    write_pull_request_guides: McpToolAccess.bound(
+      McpToolAccess.writesWithCapability((input) =>
+        Effect.gen(function* () {
+          const located = yield* locateAll(input.pullRequests);
+          const guides = yield* Effect.forEach(
+            located,
+            (entry) =>
+              Effect.gen(function* () {
+                if (entry.target === null) {
+                  return {
+                    host: entry.input.host ?? "",
+                    repository: entry.input.repository ?? "",
+                    number: entry.input.number ?? 0,
+                    url: entry.input.url ?? "",
+                    outcome: "failed" as const,
+                    detail: entry.failure,
+                  };
+                }
+                const identity = {
+                  host: entry.target.host,
+                  repository: entry.target.repository,
+                  number: entry.target.number,
+                  url: entry.target.url,
                 };
-              }
-              const identity = {
-                host: entry.target.host,
-                repository: entry.target.repository,
-                number: entry.target.number,
-                url: entry.target.url,
-              };
-              if (entry.project === undefined) {
-                return {
-                  ...identity,
-                  outcome: "failed" as const,
-                  detail: new PullRequestProjectNotFoundError({
-                    repository: entry.target.repository,
-                  }).message,
-                };
-              }
-              return yield* reviewGuides.generate(guideReference(entry.project, entry.target)).pipe(
-                Effect.map((result) => ({
-                  ...identity,
-                  outcome: result.started ? ("started" as const) : ("running" as const),
-                  detail: null,
-                })),
-                Effect.catch((error) =>
-                  Effect.succeed({
+                if (entry.project === undefined) {
+                  return {
                     ...identity,
                     outcome: "failed" as const,
-                    detail: guideFailureDetail(error),
-                  }),
-                ),
-              );
-            }),
-          { concurrency: 4 },
-        );
-        return { guides };
-      }),
-    ),
-    read_pull_request_guide: McpToolAccess.reads((input) =>
-      Effect.gen(function* () {
-        const [entry] = yield* locateAll([input]);
-        if (entry !== undefined && entry.target === null) {
-          return yield* new PullRequestGuideFailedError({ detail: entry.failure ?? "" });
-        }
-        if (entry === undefined || entry.target === null || entry.project === undefined) {
-          return yield* new PullRequestProjectNotFoundError({
-            repository: entry?.target.repository ?? input.repository ?? "",
-          });
-        }
-        const result = yield* reviewGuides.get(guideReference(entry.project, entry.target)).pipe(
-          Effect.mapError(
-            (error) =>
-              new PullRequestGuideFailedError({
-                detail: guideFailureDetail(error),
-                cause: error,
+                    detail: new PullRequestProjectNotFoundError({
+                      repository: entry.target.repository,
+                    }).message,
+                  };
+                }
+                const state = yield* PullRequestOperationState;
+                state.phase = "dispatch";
+                state.saved = "unknown";
+                return yield* reviewGuides
+                  .generate(guideReference(entry.project, entry.target))
+                  .pipe(
+                    Effect.map((result) => ({
+                      ...identity,
+                      outcome: result.started ? ("started" as const) : ("running" as const),
+                      detail: null,
+                    })),
+                    Effect.catch((error) =>
+                      Effect.succeed({
+                        ...identity,
+                        outcome: "failed" as const,
+                        detail: guideFailureDetail(error),
+                      }),
+                    ),
+                  );
               }),
-          ),
-        );
-        return {
-          host: entry.target.host,
-          repository: entry.target.repository,
-          number: entry.target.number,
-          url: entry.target.url,
-          guide: result.guide,
-          run: result.run,
-          currentHeadSha: result.currentHeadSha,
-          stale:
-            result.guide !== null &&
-            result.currentHeadSha !== null &&
-            result.guide.headSha !== result.currentHeadSha,
-        };
-      }),
+            { concurrency: 4 },
+          );
+          return { guides };
+        }),
+      ),
+      toolDeadline("write_pull_request_guides"),
+    ),
+    read_pull_request_guide: McpToolAccess.bound(
+      McpToolAccess.reads((input) =>
+        Effect.gen(function* () {
+          const [entry] = yield* locateAll([input]);
+          if (entry !== undefined && entry.target === null) {
+            return yield* new PullRequestGuideFailedError({ detail: entry.failure ?? "" });
+          }
+          if (entry === undefined || entry.target === null || entry.project === undefined) {
+            return yield* new PullRequestProjectNotFoundError({
+              repository: entry?.target.repository ?? input.repository ?? "",
+            });
+          }
+          const result = yield* reviewGuides.get(guideReference(entry.project, entry.target)).pipe(
+            Effect.mapError(
+              (error) =>
+                new PullRequestGuideFailedError({
+                  detail: guideFailureDetail(error),
+                  cause: error,
+                }),
+            ),
+          );
+          return {
+            host: entry.target.host,
+            repository: entry.target.repository,
+            number: entry.target.number,
+            url: entry.target.url,
+            guide: result.guide,
+            run: result.run,
+            currentHeadSha: result.currentHeadSha,
+            stale:
+              result.guide !== null &&
+              result.currentHeadSha !== null &&
+              result.guide.headSha !== result.currentHeadSha,
+          };
+        }),
+      ),
+      toolDeadline("read_pull_request_guide"),
     ),
   } satisfies McpToolAccess.Handlers<typeof PullRequestsToolkit.tools>;
 });

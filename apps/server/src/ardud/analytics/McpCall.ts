@@ -69,6 +69,7 @@ const BOARD_BUSY =
 const TYPED_OUTCOMES = {
   TimeoutError: "timeout",
   PullRequestWatchTimeoutError: "timeout",
+  PullRequestToolTimeoutError: "timeout",
   PreviewAutomationTimeoutError: "timeout",
   PreviewAutomationRecordingDeadlineExpiredError: "timeout",
   PreviewAutomationUnavailableError: "refused",
