@@ -208,7 +208,7 @@ export class ControlClient {
       toolLog.capture(() => {
       finishRead?.();
       toolLog.capture(() => toolLog.write({ component: "robob", kind: "perf", name: "turn.robob_call", durationMs: performance.now() - loggingAt,
-        ok: loggingOk, ids: loggingIds, props: { method, route },
+        ok: loggingOk, ids: loggingIds, props: { method, route, ...(!loggingOk ? { failureFormat: "single" } : {}) },
         ...(!loggingOk ? { error: { tag: loggingTag, cause: loggingError } } : {}) }));
       });
     }

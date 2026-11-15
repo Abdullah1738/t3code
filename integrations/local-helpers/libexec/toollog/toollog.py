@@ -568,7 +568,16 @@ def rollup(board, day, top_n=20):
     day_start = datetime.strptime(day, '%Y-%m-%d').replace(tzinfo=timezone.utc)
     start = day_start.timestamp()
     total = oks = failed = errors = observed = 0
+    single_failures = 0
     def observe_error(row, line_number, weight=1):
+        nonlocal single_failures
+        request_failure = (board == 'imessage' and row.get('component') == 'robob' and row.get('name') == 'turn.robob_call'
+                           and row.get('kind') == 'perf' and row.get('ok') is False)
+        single = (row.get('props') or {}).get('failureFormat') == 'single'
+        if request_failure and single:
+            single_failures += weight
+        if request_failure and not single and (row.get('error') or {}).get('tag') == 'control.request_failed':
+            return
         tag = (row.get('error') or {}).get('tag')
         if not isinstance(tag, str):
             return
@@ -633,8 +642,6 @@ def rollup(board, day, top_n=20):
         oks += row_ok
         failed += row_failed
         errors += weight * (kind == 'error')
-        if board == 'imessage' and name == 'turn.robob_call' and kind != 'error':
-            errors += row_failed
         duration = row.get('durationMs')
         values = row['_rollup_histogram'] if aggregate else ([(duration, weight)]
             if type(duration) in (int, float) and math.isfinite(duration) and duration >= 0 else [])
@@ -738,7 +745,7 @@ def rollup(board, day, top_n=20):
             'recordedRows': recorded, 'sampled': sampled, 'logCaps': caps,
             'countsByName': dict(counts_name), 'countsByKind': dict(counts_kind),
             'okCount': oks, 'failedCount': failed, 'okRate': oks / observed if observed else None,
-            'errorRate': errors / total if total else 0,
+            'errorRate': (errors + single_failures) / total if total else 0,
             'durationMsByName': {name: percentiles(values) for name, values in sorted(durations.items())},
             'topThreadsByRule': {rule: [{'threadId': thread, 'count': count, 'attributed': True,
                                       'denied': thread_decisions[(rule, thread)]['denied'],

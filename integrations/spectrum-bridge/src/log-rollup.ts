@@ -15,6 +15,10 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
   const chainAggregation = createChainAggregation();
   let total = 0, ok = 0, failed = 0, recordedRows = 0, failedCalls = 0;
   function observeError(line: LogLine) {
+    // Legacy request diagnostics are owned by control.catch1/2, including in mixed-version days.
+    const requestFailure = line.component === "robob" && line.name === "turn.robob_call" && line.kind === "perf" && line.ok === false;
+    if (requestFailure && line.props?.failureFormat === "single") failedCalls++;
+    if (requestFailure && line.props?.failureFormat !== "single" && line.error?.tag === "control.request_failed") return;
     if (!line.error) return;
     if (line.error.causeKey) {
       const key = `${line.error.tag}\0${line.error.causeKey}`;
@@ -48,7 +52,6 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
     }
     component(line.component, line.name, count, oks, failures, values);
     if (line.name === "turn.robob_call") {
-      if (line.kind !== "error") failedCalls += failures;
       const name = callName(line);
       if (name) component("robob", name, count, oks, failures, values);
     }

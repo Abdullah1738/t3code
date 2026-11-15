@@ -35,6 +35,7 @@ const ENUMS: Record<string, readonly string[]> = {
   method: ["GET", "POST", "PUT", "DELETE", "PATCH"],
   failureCode: ["none", "renderer_failed", "preview_missing", "render_exception", "page_fetch", "page_http", "page_type", "page_body", "image_fetch", "image_http", "image_type", "image_body", "upload", "upload_url", "invalid_url", "file_prepare"],
   completionCheck: ["before", "after", "unchecked"],
+  failureFormat: ["single"],
 };
 
 // Only reduced diagnostics cross this boundary; input objects can contain prompts or credentials.

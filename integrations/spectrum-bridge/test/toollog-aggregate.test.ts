@@ -46,6 +46,41 @@ test("one summary per completed turn retains slow/failed calls and exact millise
   expect(result.byComponent.robob.thread).toMatchObject({ count: 8, ok: 7, failed: 1, errorRate: .125, durationMs: { p50: 50, p95: 6_000, max: 6_000 } });
 });
 
+test.each(["legacy", "mixed", "reversed", "orphan", "new_only", "new_orphan", "summary_only"])("failure format %s counts each diagnostic once", async shape => {
+  const { log, file } = setup();
+  const raw = (batch: string, single: boolean): LogLine => ({ ts: `${day}T12:00:00Z`, tool: "imessage", component: "robob",
+    kind: "perf", name: "turn.robob_call", ok: false, durationMs: 25_000, ids: { runId: "same-run", callBatchId: batch },
+    props: { method: "GET", route: "/threads/:id/messages", ...(single ? { failureFormat: "single" } : {}) },
+    error: { tag: "control.request_failed", name: "TimeoutError", message: "[redacted]" } });
+  const summary = (batch: string): LogLine => ({ ts: `${day}T12:00:00Z`, tool: "imessage", component: "robob", kind: "perf",
+    name: "turn.robob_calls", ids: { runId: "same-run", callBatchId: batch }, calls: { messages: {
+      count: 10, ok: 9, failed: 1, p50: 10, p95: 25_000, max: 25_000, histogram: [[10, 9], [25_000, 1]],
+    } } });
+  const legacy: LogLine = { ts: `${day}T12:00:00Z`, tool: "imessage", component: "control", kind: "error", name: "bridge.catch",
+    ok: false, ids: { runId: "same-run" }, error: { tag: "control.catch1", name: "TimeoutError", message: "[redacted]" } };
+  const records = shape === "new_orphan" ? [raw("new", true)]
+    : shape === "new_only" ? [raw("new", true), summary("new")]
+    : shape === "summary_only" ? [summary("old")]
+    : shape === "orphan" ? [legacy, raw("old", false), raw("new", true)]
+    : [legacy, raw("old", false), summary("old"), ...(shape === "legacy" ? [] : [raw("new", true), summary("new")])];
+  if (shape === "mixed") for (const row of records) if (row.ids?.callBatchId === "new") row.ts = `${day}T13:00:00Z`;
+  if (shape === "reversed") records.reverse();
+  writeFileSync(file(), records.map(row => JSON.stringify(row) + "\n").join(""));
+  const result = await log.rollup(day);
+  const total = shape === "new_orphan" ? 1 : shape === "legacy" ? 11 : shape === "orphan" ? 3 : shape === "new_only" || shape === "summary_only" ? 10 : 21;
+  const newOnly = shape === "new_only" || shape === "new_orphan";
+  const hasCatch = !newOnly && shape !== "summary_only";
+  const callFailures = shape === "legacy" || newOnly || shape === "summary_only" ? 1 : 2;
+  const diagnostics = shape === "legacy" || newOnly ? 1 : shape === "summary_only" ? 0 : 2;
+  expect(result).toMatchObject({ total, failed: callFailures + Number(hasCatch), recordedRows: records.length, errorRate: diagnostics / total });
+  expect(result?.countsByName["turn.robob_call"]).toBe(total - Number(hasCatch));
+  expect(result?.byComponent.robob.messages.failed).toBe(callFailures);
+  expect(result?.topErrorTags.map(({ tag, count }) => ({ tag, count }))).toEqual([
+    ...(!hasCatch ? [] : [{ tag: "control.catch1", count: 1 }]),
+    ...(shape === "legacy" || shape === "summary_only" ? [] : [{ tag: "control.request_failed", count: 1 }]),
+  ]);
+});
+
 test.each([1_500, 5_000, 5_000.01, 5_001, 6_000])("the five-second threshold uses the original timing %s", async ms => {
   const { log, rows, turn, call } = setup();
   turn("turn.start"); call(ms); turn("turn.end"); await log.settled();
@@ -113,7 +148,7 @@ test.each([
     expect(records.filter(row => row.error)).toHaveLength(1);
     const failure = records.find(row => row.error)!;
     const tag = fixture.response === "json" ? "control.invalid_json" : "control.request_failed";
-    expect(failure).toMatchObject({ name: "turn.robob_call", ok: false, props: { method: "GET", route: "/threads/:id/messages" },
+    expect(failure).toMatchObject({ name: "turn.robob_call", ok: false, props: { method: "GET", route: "/threads/:id/messages", failureFormat: "single" },
       error: { tag, name: fixture.name } });
     expect(failure.ids?.runId).toBeTruthy();
     expect(result?.failed).toBe(1);
