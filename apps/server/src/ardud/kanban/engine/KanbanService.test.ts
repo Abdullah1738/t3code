@@ -813,7 +813,7 @@ it.effect(
             (event) =>
               event.kind === "kanban.stall" &&
               event.props?.action === "set" &&
-              event.props.reasonClass === "other",
+              event.props.reasonClass === "manual_flag",
           ),
         );
         assert.isTrue(
@@ -821,6 +821,7 @@ it.effect(
             (event) =>
               event.kind === "kanban.stall" &&
               event.props?.action === "clear" &&
+              event.props.reasonClass === "manual_flag" &&
               event.props.ageMs === 60_000,
           ),
         );
