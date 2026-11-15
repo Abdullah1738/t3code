@@ -27,9 +27,22 @@ COMMANDS = {
 CONFLICTS = {'status', 'amount', 'time', 'missing_in_new_export', 'backdated_in_new_export',
              'time_offset_systematic', 'not_taken_in_export', 'taken_not_confirmed_in_meds_nag',
              'probable_duplicate_log', 'other'}
-TAGS = {'exit_nonzero', 'invalid_arguments', 'not_authorized', 'reauth_needed', 'timeout',
+TAGS = {'exit_nonzero', 'invalid_arguments', 'food_not_resolved', 'not_authorized', 'reauth_needed', 'timeout',
         'subprocess_failed', 'renderer_failed', 'headless_chrome', 'database_error',
         'io_error', 'interrupted', 'internal_error', 'validate_failed', 'cap_reached'}
+# Static CLI outcomes; never derive these values from exception or user text.
+FOOD_EXIT_REASONS = {
+    'food_not_found', 'food_ambiguous', 'food_needs_data', 'food_exists',
+    'meal_not_found', 'recipe_not_found', 'source_required',
+    'order_fetch_failed', 'order_no_items', 'order_unmatched',
+    'order_bad_exclude', 'order_bad_portion', 'refused_duplicate',
+    'bad_flag', 'bad_arguments', 'help',
+}
+UNMARKED_MEANING = (
+    'Distinct (run ID, kind) obligations from card.render (including failed renders), '
+    'nag.sent, or food.warning with no matching delivery.result in this UTC day file; '
+    'rows without a valid run ID count separately. This does not establish whether a send occurred.'
+)
 # Static check-site IDs, never row identities, dates, labels, or source filenames.
 VALIDATE_CHECK_IDS = {
     'regimen.header_count', 'regimen.columns', 'regimen.row_count', 'regimen.row_present',
@@ -55,7 +68,8 @@ SCHEMAS = {
         'lines': int, 'unmatched': int, 'options_not_counted': int, 'fetch_ms': int},
     'food.warning': {'warning': {'no_time', 'macro_drift', 'unverified', 'assumed', 'option_not_counted', 'partial'}, 'count': int},
     'cli.run': {'command': set(COMMANDS), 'subcommand': set(' '.join(COMMANDS.values()).split()) | {'unknown', 'none', 'help'},
-                'failCount': int, 'failedCheckIds': 'check_ids'},
+                'failCount': int, 'failedCheckIds': 'check_ids',
+                'reason': FOOD_EXIT_REASONS, 'candidateCount': int, 'queryLen': int},
     'watcher.run': {'trigger': 'trigger'}, 'sync.run': {'trigger': 'trigger', 'sleepCount': int, 'recoveryCount': int, 'cycleCount': int,
         'lastScoredSleep': 'iso', 'bodyCount': int, 'tokenRefreshed': bool, 'notScoredYet': bool,
         **{k: ENDPOINT_SCHEMA for k in ('sleep', 'recovery', 'cycle', 'body')}},
@@ -285,7 +299,10 @@ class Span:
                 self.ok = False
                 if not (self.tag == 'validate_failed' and self.component == 'validate'
                         and isinstance(exc, SystemExit) and exc.code == 1):
-                    self.tag = error_tag(exc, self.name == 'card.render')
+                    self.tag = ('food_not_resolved' if self.component == 'food' and self.name == 'cli.run'
+                                and isinstance(exc, SystemExit)
+                                and self.props.get('reason') in ('food_not_found', 'food_ambiguous')
+                                else error_tag(exc, self.name == 'card.render'))
                 self.props['exceptionClass'] = type(exc).__name__
                 self.props['exitCode'] = ((int(exc.code) % 256 if isinstance(exc.code, int) else 1)
                                           if isinstance(exc, SystemExit) else
@@ -499,7 +516,7 @@ def rollup(day=None):
                         durations[r['name']].append(value)
                     tag = r.get('error', {}).get('tag')
                     if tag in TAGS:
-                        cause = (tag, props.get('exceptionClass'), props.get('exitCode'))
+                        cause = (tag, props.get('exceptionClass'), props.get('exitCode'), props.get('reason'))
                         tags[cause] += 1
                         candidate = r.get('ids', {}).get('run')
                         if isinstance(candidate, str) and len(candidate) == 32 and all(c in '0123456789abcdef' for c in candidate):
@@ -524,12 +541,14 @@ def rollup(day=None):
                       'samples': len(nag_latency)}, 'openSlotsByDay': open_slots},
                   'delivery': {'sent': sum(v is True for v in delivered.values()),
                                'failed': sum(v is False for v in delivered.values()),
-                               'unmarked': len(expected - set(delivered))}}
+                               # Missing same-day receipts, not a count of failed sends.
+                               'unmarked': len(expected - set(delivered)),
+                               'unmarkedMeaning': UNMARKED_MEANING}}
         for name, values in durations.items():
             values.sort()
             result['durationMs'][name] = {'p50': _percentile(values, .5), 'p95': _percentile(values, .95), 'max': values[-1]}
         result['topErrors'] = [{'tag': cause[0], 'count': count, 'sampleId': samples.get(cause),
-                                'exceptionClass': cause[1], 'exitCode': cause[2]}
+                                'exceptionClass': cause[1], 'exitCode': cause[2], 'reason': cause[3]}
                                for cause, count in tags.most_common(20)]
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         root.chmod(0o700)
