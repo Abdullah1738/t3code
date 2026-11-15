@@ -162,7 +162,7 @@ def worker(lock_fd):
         ok = True
         write_state({"status": "ok", "finished_at": time.time(),
                      "liveness_unavailable": scan.get("liveness_unavailable"),
-                     "processes": {key: scan.get("processes", {}).get(key, []) for key in ("candidates", "problems", "checked", "skipped", "budget_skipped")}})
+                     "processes": {key: scan.get("processes", {}).get(key, []) for key in ("candidates", "problems", "checked", "skipped", "budget_skipped", "owner_calls")}})
     except Exception as e:  # noqa: BLE001
         write_state({"status": "failed", "error": str(e)[:500], "finished_at": time.time()})
         return 1

@@ -292,6 +292,27 @@ class PhoneLockTests(unittest.TestCase):
                 with self.assertRaises(ph.PhoneBusy): PhoneLockTests.real_run(['adb', verb])
         ph.subprocess.run.assert_not_called()
 
+    def test_reset_claim_handoff_is_refused_at_final_subprocess(self):
+        real_check = lock.check
+        for claim in ('lease', 'hold'):
+            with self.subTest(claim=claim):
+                checks = []
+                def handoff(action):
+                    checks.append(action)
+                    if len(checks) == 2:
+                        if claim == 'lease': self.claim()
+                        else: lock.HOLD.write_text(HOLD_TOKEN)
+                    return real_check(action)
+                with patch.object(lock, 'check', side_effect=handoff), patch.object(ph, '_run', self.real_run):
+                    ph.reset_u2()
+                try:
+                    ph.subprocess.run.assert_not_called()
+                    self.assertEqual(checks, [True, True])
+                finally:
+                    ph.subprocess.run.reset_mock()
+                    if claim == 'lease': lock.release('holder')
+                    else: lock.HOLD.unlink()
+
     real_run = staticmethod(ph._run)
 
     def test_read_under_foreign_lease_succeeds_but_failure_never_resets(self):
@@ -388,7 +409,7 @@ class PhoneLockTests(unittest.TestCase):
         child.wait.side_effect = wait
         child.poll.return_value = 0
         out = io.StringIO()
-        with patch.object(ph.subprocess, 'Popen', return_value=child), patch.object(lock, 'refresh', side_effect=refresh), patch.object(threading.Thread, 'join', join), patch.object(ph.os, 'killpg'), contextlib.redirect_stdout(out):
+        with patch.object(ph.subprocess, 'Popen', return_value=child), patch.object(lock, 'refresh', side_effect=refresh), patch.object(threading.Thread, 'join', join), patch.object(ph.os, 'killpg'), patch.object(ph, 'finish_group'), contextlib.redirect_stdout(out):
             self.assertEqual(ph.lease_run('runner', 'qa', 1, ['dummy']), 5)
         self.assertIn('PHONE_BUSY:', out.getvalue())
         self.assertEqual(lock.status()['lease_owner'], 'successor')
@@ -448,7 +469,11 @@ class LeaseRunTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.env = {**os.environ, 'PH_LOCK_DIR': str(self.root), 'PH_TMP': str(self.root/'shots'),
                     'PHONE_HOLD_OWNER': '', 'PH_LEASE_OWNER': ''}
-        self.script = str(Path(__file__).with_name('ph.py'))
+        # Exercise the CLI entry with isolated telemetry as well as isolated claims.
+        wrapper=self.root/'ph_cli.py'
+        scripts=str(Path(__file__).resolve().parent)
+        wrapper.write_text(f"import sys\nfrom pathlib import Path\nsys.path.insert(0,{scripts!r})\nimport ph\nph.STATE=Path({str(self.root/'events')!r})\nsys.exit(ph.run(sys.argv[1:]))\n")
+        self.script = str(wrapper)
 
     def command(self, code):
         return [sys.executable, '-I', self.script, 'lease', 'run', '--owner', 'runner', '--purpose', 'qa',
@@ -534,6 +559,50 @@ class LeaseRunTests(unittest.TestCase):
         finally:
             if child.poll() is None: child.kill(); child.wait()
 
+    def test_group_descendants_stop_before_claim_release(self):
+        descendant_code = """
+import os, pathlib, signal, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))
+while True:
+    if not pathlib.Path(sys.argv[2]).exists(): pathlib.Path(sys.argv[3]).touch()
+    time.sleep(.002)
+"""
+        for trigger, expected in [('normal', 0), ('nonzero', 7), ('term', 143), ('int', 130), ('claim_loss', 5)]:
+            with self.subTest(trigger=trigger):
+                marker = self.root/'descendant'
+                violation = self.root/'ran-after-release'
+                marker.unlink(missing_ok=True); violation.unlink(missing_ok=True)
+                code = ('import os,pathlib,subprocess,sys,time; '
+                        f'p=subprocess.Popen([sys.executable,"-I","-c",{descendant_code!r},{str(marker)!r},{str(self.root/"lease.json")!r},{str(violation)!r}],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); '
+                        f'[(time.sleep(.01)) for _ in iter(lambda:pathlib.Path({str(marker)!r}).exists(),True)]; '
+                        + ('sys.exit(7)' if trigger=='nonzero' else 'sys.exit(0)' if trigger=='normal' else 'time.sleep(30)'))
+                args = self.command(code)
+                # Keep the TTL longer than the cancellation grace period.
+                args[args.index('--ttl')+1] = '12s'
+                child = subprocess.Popen(args, env=self.env, cwd=self.root, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                descendant = None
+                try:
+                    deadline=time.monotonic()+10
+                    while not marker.exists() and time.monotonic()<deadline: time.sleep(.01)
+                    self.assertTrue(marker.exists())
+                    descendant=int(marker.read_text())
+                    if trigger in ('term','int'): child.send_signal(signal.SIGTERM if trigger=='term' else signal.SIGINT)
+                    elif trigger=='claim_loss': (self.root/'priority-hold').write_text(HOLD_TOKEN)
+                    out,err=child.communicate(timeout=15)
+                    self.assertEqual(child.returncode,expected,(out,err))
+                    self.assertFalse((self.root/'lease.json').exists())
+                    status=subprocess.run(['ps','-o','stat=','-p',str(descendant)],capture_output=True,text=True,timeout=1).stdout.strip()
+                    self.assertTrue(not status or status.startswith('Z'),status)
+                    self.assertFalse(violation.exists(),'descendant did work after lease release')
+                finally:
+                    if child.poll() is None: child.kill(); child.wait()
+                    if descendant is not None:
+                        try: os.kill(descendant,signal.SIGKILL)
+                        except ProcessLookupError: pass
+                    (self.root/'priority-hold').unlink(missing_ok=True)
+
     def test_rewritten_argv_zero_is_not_logged_as_a_process_name(self):
         code = (f'import sys,os; sys.path.insert(0,{str(Path(__file__).resolve().parent)!r}); '
                 'import ph; print(ph.process_comm(os.getpid()))')
@@ -545,11 +614,15 @@ class LeaseRunTests(unittest.TestCase):
         self.assertNotIn('private input', result.stdout)
         self.assertNotIn('unknown', result.stdout)
 
-    def test_jevrun_typing_and_followup_summary_do_not_echo_private_input(self):
+    def fake_jevrun(self, secret, failure=None, operation="send_keys"):
         script = str(Path(__file__).with_name('jevrun.py'))
         bootstrap = """
 import pathlib, runpy, sys, types, time, xml.etree.ElementTree as ET
 from unittest.mock import patch
+try:
+    from uiautomator2.exceptions import RPCUnknownError
+except ImportError:
+    class RPCUnknownError(Exception): pass
 original_read = pathlib.Path.read_text
 patch.object(pathlib.Path, 'read_text', lambda p,*a,**kw: 'dummy' if p.name=='openrouter-key' else original_read(p,*a,**kw)).start()
 clock=[0.0]
@@ -567,16 +640,48 @@ sys.modules['requests']=types.SimpleNamespace(Session=lambda:types.SimpleNamespa
 sys.modules['uiautomator2']=types.SimpleNamespace(connect=lambda *a:Device())
 runpy.run_path(sys.argv[1],run_name='__main__')
 """
+        if failure:
+            if operation == 'send_keys':
+                bootstrap = bootstrap.replace("    def send_keys(self,text,**kwargs): self.value=text", failure)
+            elif operation == 'clear_text':
+                bootstrap = bootstrap.replace("    def clear_text(self): self.value=''", failure.replace('send_keys(self,text,**kwargs)', 'clear_text(self)').replace('        import threading', f'        text={secret!r}\n        import threading'))
+            else:
+                bootstrap = bootstrap.replace("    def dump_hierarchy(self, **kwargs):", failure.replace('send_keys(self,text,**kwargs)', 'dump_hierarchy(self,**kwargs)').replace('        import threading', f'        text={secret!r}\n        import threading')+'\n    def unused_hierarchy(self, **kwargs):')
+        plan = self.root/'plan.json'
+        plan.write_text(json.dumps(dict(app='dev.fixture', steps=[{'type':secret},{'print':'.'},{'verify':['\"'+secret+'\"']} ])))
+        code = bootstrap.replace("runpy.run_path(sys.argv[1],run_name='__main__')", "sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0],run_name='__main__')")
+        # exec preserves the actual runner's excepthook, unlike runpy's traceback printer.
+        code = code.replace("runpy.run_path(sys.argv[0],run_name='__main__')", "exec(compile(pathlib.Path(sys.argv[0]).read_text(),sys.argv[0],'exec'),dict(__name__='__main__',__file__=sys.argv[0]))")
+        return subprocess.run([sys.executable,'-I','-c',code,script,str(plan)], env=self.env,cwd=self.root,capture_output=True,text=True,timeout=15)
+
+    def test_jevrun_typing_and_followup_summary_do_not_echo_private_input(self):
         for secret in ["ONE\tPRIVATE_CANARY'", 'PRIVATE-PLAIN-CANARY', 'PRIVATE\'QUOTE\"TAIL', 'PRIVATE-LINE-ONE\nPRIVATE-LINE-TWO', 'سري-اختبار']:
             with self.subTest(secret=secret):
-                plan = self.root/'plan.json'
-                plan.write_text(json.dumps(dict(app='dev.fixture', steps=[{'type':secret},{'print':'.'},{'verify':['\"'+secret+'\"']}])))
-                code = bootstrap.replace("runpy.run_path(sys.argv[1],run_name='__main__')", "sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0],run_name='__main__')")
-                result = subprocess.run([sys.executable,'-I','-c',code,script,str(plan)], env=self.env,cwd=self.root,capture_output=True,text=True,timeout=15)
+                result=self.fake_jevrun(secret)
                 self.assertEqual(result.returncode,4,result.stderr)
                 self.assertIn('readback=ok',result.stdout)
                 for fragment in secret.replace('\"','\n').replace("'",'\n').splitlines():
-                    self.assertNotIn(fragment,result.stdout)
+                    self.assertNotIn(fragment,result.stdout+result.stderr)
+
+    def test_jevrun_rpc_errors_and_stderr_do_not_echo_private_input(self):
+        failure = """    def send_keys(self,text,**kwargs):
+        import threading
+        sys.stderr.write(text[:3]); sys.stderr.flush(); sys.stderr.write(text[3:]+chr(10)); sys.stderr.buffer.write(text.encode()); sys.stderr.buffer.flush()
+        def thread_error(): raise RPCUnknownError('thread error',[text],'stack')
+        worker=threading.Thread(target=thread_error);worker.start();worker.join()
+        try: raise ValueError(text)
+        except ValueError as exc: raise RPCUnknownError('device error',[text],'stack') from exc
+"""
+        cases=[(operation,secret) for operation in ('send_keys','clear_text','dump_hierarchy')
+               for secret in ['PRIVATE_CANARY', "ONE\tPRIVATE_CANARY'", 'PRIVATE_CANARY\nSECOND_CANARY', 'سري-اختبار']]
+        for operation,secret in cases:
+            with self.subTest(operation=operation,secret=secret):
+                result=self.fake_jevrun(secret,failure,operation)
+                self.assertNotEqual(result.returncode,0)
+                self.assertNotIn('PRIVATE_CANARY', result.stdout+result.stderr)
+                self.assertNotIn('SECOND_CANARY', result.stdout+result.stderr)
+                self.assertNotIn(secret, result.stdout+result.stderr)
+                self.assertIn('RPCUnknownError',result.stderr)
 
     def test_jevrun_subprocess_from_other_cwd(self):
         (self.root/'priority-hold').write_text(HOLD_TOKEN)

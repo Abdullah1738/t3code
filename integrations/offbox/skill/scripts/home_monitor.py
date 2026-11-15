@@ -28,6 +28,7 @@ import urllib.parse
 import urllib.request
 
 from offbox_lib.startup_health import starting_phase, wait_seconds
+from offbox_lib.health_reachability import tcp_connects, slow_probe_seconds, slow_down_seconds
 
 HOME = Path.home()
 
@@ -170,16 +171,18 @@ def health_facts(data):
             "boot_id": clean(data.get("boot_id"), 64), "version": clean(data.get("version"), 40),
             "uptime_s": number("uptime_s"), "boatd_uptime_s": number("boatd_uptime_s"),
             "starting": bool(starting_phase(data)), "phase": clean(starting_phase(data)),
-            "startedAt": number("startedAt")}
+            "startedAt": number("startedAt"), "snapshot_age_s": number("snapshot_age_s"),
+            "refresh_stage": clean(data.get("refresh_stage"))}
 
 
-def check_health(url):
+def check_health(url, timeout=None):
     """GET <url>/health. No auth header, ever. Good = HTTP 200, a JSON object, `ok` true."""
+    timeout = HEALTH_TIMEOUT_S if timeout is None else timeout
     request = urllib.request.Request(url.rstrip("/") + "/health", method="GET",
                                      headers={"Accept": "application/json"})
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with opener.open(request, timeout=HEALTH_TIMEOUT_S) as response:
+        with opener.open(request, timeout=timeout) as response:
             status = response.status
             raw = response.read(65536)
     except urllib.error.HTTPError as error:
@@ -211,16 +214,20 @@ def _run(args, timeout):
         return None
 
 
-def tailnet_facts(url=None):
+def tailnet_facts(url=None, *, timeout=5):
     """Is this Mac on the tailnet (BackendState Running and Self.Online), and what it knows of the box."""
     host = urllib.parse.urlsplit(url).hostname if url else None
     paths = ([os.environ["OFFBOX_TAILSCALE"]] if os.environ.get("OFFBOX_TAILSCALE") else []) + list(TAILSCALE_PATHS)
     seen = False
+    end = time.monotonic() + timeout
     for path in paths:
         if not os.access(path, os.X_OK):
             continue
+        left = end - time.monotonic()
+        if left <= 0:
+            break
         seen = True
-        result = _run([path, "status", "--json"], 5)
+        result = _run([path, "status", "--json"], left)
         try:
             data = json.loads(result.stdout) if result is not None else None
         except ValueError:
@@ -230,14 +237,16 @@ def tailnet_facts(url=None):
         own = data.get("Self") if isinstance(data.get("Self"), dict) else {}
         backend = clean(data.get("BackendState"), 20)
         online = own.get("Online") is True
-        peer = "not listed"
+        peer, peer_online, peer_path = "not listed", None, "unknown"
         for item in (data.get("Peer") or {}).values() if isinstance(data.get("Peer"), dict) else ():
             names = (str(item.get("HostName") or "").lower(), str(item.get("DNSName") or "").lower())
             if (host and host in (item.get("TailscaleIPs") or [])) or any(n.startswith("offbox-server") for n in names):
                 peer = "listed, online" if item.get("Online") else \
                     "listed, offline (last seen " + clean(item.get("LastSeen"), 30) + ")"
+                peer_online = item.get("Online")
+                peer_path = "direct" if item.get("CurAddr") else "relay" if item.get("Relay") else "unknown"
                 break
-        return {"up": backend == "Running" and online, "peer": peer,
+        return {"peer_online": peer_online, "peer_path": peer_path, "up": backend == "Running" and online, "peer": peer,
                 "detail": f"BackendState={backend} Self.Online={str(online).lower()}"}
     return {"up": False, "peer": "unknown",
             "detail": "tailscale CLI gave no status" if seen else "tailscale CLI not found"}
@@ -257,8 +266,9 @@ def internet_facts():
 
 def mac_online(url=None):
     tailnet, internet = tailnet_facts(url), internet_facts()
-    return {"online": tailnet["up"] and internet["ok"], "tailnet": tailnet["up"], "internet": internet["ok"],
-            "tailnet_detail": tailnet["detail"], "internet_detail": internet["detail"], "peer": tailnet["peer"]}
+    return {"online": internet["ok"] and (tailnet["up"] or tailnet["detail"] == "tailscale CLI not found"), "tailnet": tailnet["up"], "internet": internet["ok"],
+            "tailnet_detail": tailnet["detail"], "internet_detail": internet["detail"], "peer": tailnet["peer"], "peer_online": tailnet.get("peer_online"),
+            "peer_path": tailnet.get("peer_path", "unknown")}
 
 
 # ---------------------------------------------------------------- effects (the only things that send)
@@ -344,7 +354,7 @@ def fresh_state(now):
 def load_state(sdir, now):
     state = fresh_state(now)
     saved = read_json(Path(sdir) / "home-monitor.json", None)
-    if isinstance(saved, dict) and saved.get("state") in ("home_up", "home_down", "home_starting"):
+    if isinstance(saved, dict) and saved.get("state") in ("home_up", "home_down", "home_starting", "home_slow"):
         state.update(saved)
     return state
 
@@ -356,7 +366,9 @@ def backend_view(state):
             "bad_streak": state["bad_streak"], "last_check": state["last_check"], "last_ok": state["last_ok"],
             "reason": state["reason"] if down else "",
             "outage_id": (state.get("outage") or {}).get("id", "") if down else "",
-            "degraded": list(state.get("degraded") or [])}
+            "degraded": list(state.get("degraded") or []), "last_outcome": state.get("last_verdict"),
+            "class": state.get("last_class"), "last_answer": state.get("last_answer"), "boot_id": (state.get("last_ok_health") or {}).get("boot_id"), "slow_since": state.get("slow_since"),
+            "flaps_today": state.get("flaps_today", {})}
 
 
 def failure_text(check):
@@ -364,6 +376,50 @@ def failure_text(check):
     if check["error"] == "not_ok":
         return clean("health ok=false" + (": " + "; ".join(reasons) if reasons else ""), 160)
     return clean(check["error"], 160)
+
+
+def flap_counts(state, now, events):
+    day = dt.datetime.fromtimestamp(now, DUBAI).date().isoformat()
+    daily = state.get("flaps_today")
+    if daily and daily["day"] != day:
+        midnight = dt.datetime.fromtimestamp(now, DUBAI).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        for kind in ("slow", "starting"):
+            episode = state.get(kind + "_episode")
+            if episode:
+                daily[kind + "_max_s"] = max(daily[kind + "_max_s"], round(midnight - episode["start"], 1))
+                if kind == "slow":
+                    daily["slow_total_s"] = round(daily["slow_total_s"] + max(0, midnight - episode["accounted"]), 1)
+                episode["accounted"] = midnight
+        events.append("flap-summary " + " ".join(f"{k}={v}" for k, v in daily.items()))
+        daily = None
+    if daily is None:
+        daily = dict(day=day, slow=0, slow_max_s=0, slow_total_s=0, starting=0, starting_max_s=0, down=0)
+        state["flaps_today"] = daily
+        for kind in ("slow", "starting"):
+            if state.get(kind + "_episode"):
+                daily[kind] = 1
+    return daily
+
+
+def account_flap(state, kind, now, daily, events, active):
+    key = kind + "_episode"
+    episode = state.get(key)
+    if active and episode is None:
+        episode = {"start": now, "accounted": now}
+        state[key] = episode
+        daily[kind] += 1
+    if episode is None:
+        return
+    duration = max(0, now - episode["start"])
+    daily[kind + "_max_s"] = max(daily[kind + "_max_s"], round(duration, 1))
+    if kind == "slow":
+        # A midnight-spanning episode contributes only this day's elapsed time.
+        midnight = dt.datetime.fromtimestamp(now, DUBAI).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        daily["slow_total_s"] = round(daily["slow_total_s"] + max(0, now - max(midnight, episode["accounted"])), 1)
+    episode["accounted"] = now
+    if not active:
+        events.append(f"flap class={kind} lasted_s={duration:.1f}")
+        state.pop(key, None)
 
 
 def step(state, obs, now):
@@ -377,6 +433,7 @@ def step(state, obs, now):
     """
     check, mac = obs["check"], obs["mac"]
     events = []
+    daily = flap_counts(state, now, events)
     last = state.get("last_tick")
     warmup = last is None or now - last > GAP_S
     state["last_tick"] = now
@@ -396,6 +453,35 @@ def step(state, obs, now):
 
     health = check.get("health") or {}
     phase = starting_phase(health)
+    if check["ok"] or phase:
+        state["last_answer"] = now
+    classification = check.get("class", "good" if check["ok"] else "hard")
+    state["last_class"] = classification
+    if check["ok"]:
+        state.pop("transient_since", None)
+    elif classification in ("slow", "starting"):
+        state.setdefault("transient_since", now)
+    transient_expired = (classification in ("slow", "starting")
+                         and now - state["transient_since"] >= wait_seconds())
+    if transient_expired:
+        phase = None
+        check = dict(check, error="not_ok", health=dict(health, reasons=[
+            f"home still starting after {wait_seconds():g} s (overall starting/slow bound)"]))
+    account_flap(state, "starting", now, daily, events, bool(not check["ok"] and phase))
+    account_flap(state, "slow", now, daily, events, classification == "slow")
+    if classification == "slow" and not transient_expired and not warmup and mac.get("online"):
+        state.setdefault("slow_since", now)
+        silence = now - (state.get("last_answer") or state.get("last_ok") or state["slow_since"])
+        if silence < slow_down_seconds():
+            if state["state"] == "home_down" or state.pop("starting_from_down", False):
+                state["slow_from_down"] = True
+            state.update(state="home_slow", reason="", bad_streak=0, good_streak=0, last_check=now,
+                         last_verdict="slow")
+            return "slow", events + [f"state=home_slow silent_s={silence:.1f}"]
+    elif classification != "slow":
+        state.pop("slow_since", None)
+        if state["state"] == "home_slow":
+            state.update(state="home_down" if state.pop("slow_from_down", False) else "home_up", since=now)
     if not check["ok"] and phase:
         observed = state.get("starting_since")
         process_start = health.get("startedAt")
@@ -406,10 +492,11 @@ def step(state, obs, now):
         state["starting_since"] = observed
         duration = now - observed
         if duration < wait_seconds():
-            if state["state"] == "home_down":
+            if state["state"] == "home_down" or state.pop("slow_from_down", False):
                 state["starting_from_down"] = True
             state.update(state="home_starting", reason="", bad_streak=0, good_streak=0, last_check=now)
-            return "starting", [f"state=home_starting phase={clean(phase)} duration_s={duration:.1f}"]
+            state["last_verdict"] = "starting"
+            return "starting", events + [f"state=home_starting phase={clean(phase)} duration_s={duration:.1f}"]
         check = dict(check, error="not_ok", health=dict(health, reasons=[
             f"home still starting after {wait_seconds():g} s ({phase})"]))
     elif check["ok"] and state.get("starting_since") is not None:
@@ -430,6 +517,8 @@ def step(state, obs, now):
             outage = state.get("outage") or {}
             outage.update(recovered_at=now, up_health=health)
             state.update(state="home_up", since=now, reason="")
+            state.pop("starting_from_down", None)
+            state.pop("slow_from_down", None)
             events.append("up")
         if state["state"] == "home_up":
             state["fails"] = []
@@ -453,7 +542,7 @@ def step(state, obs, now):
                                                         "internet_detail", "peer")}
         if state["state"] == "home_down":
             state["reason"] = failure_text(check)
-        elif state["bad_streak"] >= DOWN_AFTER:
+        elif state["bad_streak"] >= DOWN_AFTER or classification == "slow" or transient_expired:
             state.update(state="home_down", since=now, reason=failure_text(check))
             previous = state.get("outage")
             if previous and now - max(previous.get("alerted_at") or previous["started"],
@@ -472,6 +561,8 @@ def step(state, obs, now):
                 outage = state["outage"]
             # The last good check before the failures: the recovery message compares boot_id against it.
             outage.update(before_ok=state.get("last_ok"), before_health=state.get("last_ok_health") or {})
+            if classification == "hard":
+                daily["down"] += 1
             events.append("down")
     state["last_verdict"] = verdict
     return verdict, events
@@ -503,8 +594,9 @@ def evidence(state, url):
     last_ok = state.get("last_ok")
     return "\n".join([
         "What the monitor saw (times are Asia/Dubai):",
-        f"- Health URL: {url}/health (no auth, {HEALTH_TIMEOUT_S} s timeout). Down = {DOWN_AFTER} failed checks "
-        "in a row, one minute apart, with this Mac online.",
+        f"- Health URL: {url}/health (no auth, {HEALTH_TIMEOUT_S} s initial timeout, {slow_probe_seconds():g} s slow retry). "
+        f"Down = {DOWN_AFTER} hard failures with this Mac online, or {slow_down_seconds():g} s without a good answer "
+        f"from a slow reachable host. Explicit startup waits up to {wait_seconds():g} s.",
         f"- Failed checks: {fails or 'none recorded'}",
         "- Last good check: " + (f"{stamp(last_ok)} ({health_line(state.get('last_ok_health'))})"
                                  if last_ok else "none on record"),
@@ -522,14 +614,19 @@ RULES = "\n".join([
     "- Never open, read or copy Moni's box data (owner `moni`), and never move her box or her work to Boat. "
     "Her tasks simply wait.",
     "- REINSTALL-OS only with Abdullah's explicit OK.",
-    "- Do not touch Boat boxes or the Boat plan. offbox already sends runs to Boat by itself and returns to "
-    f"home after {UP_AFTER} good checks: switch nothing by hand.",
+    "- Do not touch Boat boxes or the Boat plan. New submissions probe home before choosing Boat. "
+    f"{UP_AFTER} good health checks close the outage alert: switch nothing by hand.",
     "- Message Abdullah only when hands are needed (Telegram, `telegram-notifications` skill), with one "
     "specific action.",
     "- Standard mode only, never fast mode, for you and anything you start.",
     "- Finish with a short cause-and-fix note appended to ~/.local/share/offbox/home-incidents.md, and the "
     "same in this thread.",
 ])
+
+
+RUN_CONTINUITY = ("Running and queued home runs stay on home and keep going through a health-check flap. "
+                  "Only new submissions may fail over to Boat. Do not kill an existing run because of this alert; "
+                  "check it with offbox wait or offbox logs.")
 
 
 def down_text(state, url, new_thread):
@@ -545,7 +642,7 @@ def down_text(state, url, new_thread):
     else:
         head = (f"The home offbox server is down again: new outage {outage['id']}. This thread is reused "
                 "because it is still open. Find out what is broken and get it fixed, runbook in order.")
-    return "\n\n".join([PREFIX, head, "Runbook: " + RUNBOOK, evidence(state, url), RULES,
+    return "\n\n".join([PREFIX, head, RUN_CONTINUITY, "Runbook: " + RUNBOOK, evidence(state, url), RULES,
                         "The monitor writes here again when the box answers."])
 
 
@@ -582,7 +679,7 @@ def telegram_down_text(state, agent_started):
     agent = ("A repair agent is on it (Robob thread \"" + thread_title(outage) + "\")." if agent_started else
              "The repair agent could not be started yet (Robob control API); the monitor retries every minute.")
     return (f"Home offbox is down since {stamp(outage['started'])[11:16]} Dubai ({state['reason'] or 'no answer'}). "
-            f"Runs moved to Boat. {agent}")
+            f"{RUN_CONTINUITY} {agent}")
 
 
 def degraded_key(reasons):
@@ -598,6 +695,8 @@ def reconcile(state, url, effects, now, verdict, dry_run=False, note=lambda text
     With dry_run nothing is called and nothing is marked done: the actions are what a real tick would do.
     """
     actions = []
+    if state["state"] in ("home_slow", "home_starting"):
+        return actions
     outage = state.get("outage")
     if outage and state["state"] == "home_down":
         if outage["told_down"] < outage["down_count"]:
@@ -691,19 +790,16 @@ def reconcile(state, url, effects, now, verdict, dry_run=False, note=lambda text
 
 # ---------------------------------------------------------------- one tick
 
-def tick(sdir=None, dry_run=False, clock=time.time, check=check_health, mac=mac_online, effects=None):
+def tick(sdir=None, dry_run=False, clock=time.time, check=check_health, mac=mac_online, effects=None,
+         tcp=tcp_connects, retry=None):
     import toollog
     if configured_url(Path(sdir) if sdir is not None else state_dir()) is not None:
         toollog.rollup_previous()
-    def checked(url):
-        with toollog.span("monitor", "home.probe", tag="home_probe") as data:
-            result = check(url)
-            data["ok"] = result["ok"]
-            return result
-    return _tick(sdir, dry_run, clock, checked, mac, effects)
+    return _tick(sdir, dry_run, clock, check, mac, effects, tcp, retry)
 
 
-def _tick(sdir=None, dry_run=False, clock=time.time, check=check_health, mac=mac_online, effects=None):
+def _tick(sdir=None, dry_run=False, clock=time.time, check=check_health, mac=mac_online, effects=None,
+          tcp=tcp_connects, retry=None):
     sdir = Path(sdir) if sdir is not None else state_dir()
     url = configured_url(sdir)
     if url is None:
@@ -716,28 +812,76 @@ def _tick(sdir=None, dry_run=False, clock=time.time, check=check_health, mac=mac
             return {"configured": True, "skipped": "another tick holds the lock"}
         now = clock()
         state = load_state(sdir, now)
-        before = state["state"]
-        result = check(url)
+        began = time.monotonic()
+        result = dict(check(url))
+        latency_ms = (time.monotonic() - began) * 1000
         facts = mac(url)
+        previous_boot = state.get("observed_boot_id") or (state.get("last_ok_health") or {}).get("boot_id")
+        boot = (result.get("health") or {}).get("boot_id")
+        changed = previous_boot and boot and boot != previous_boot
+        if boot:
+            state["observed_boot_id"] = boot
+        classification = "good" if result["ok"] else "hard"
+        if changed:
+            result.update(ok=False, error="boot_changed")
+            classification = "hard"
+            # Observe the new identity once; subsequent healthy checks can recover normally.
+            state["observed_boot_id"] = boot
+        elif starting_phase(result.get("health")):
+            classification = "starting"
+        elif result.get("error") == "timeout" and facts.get("peer_online") is not False and tcp(url):
+            classification = "slow"
+            slow_began = time.monotonic()
+            result = dict((retry or (lambda url: check_health(url, slow_probe_seconds())))(url))
+            result["slow_ms"] = round((time.monotonic() - slow_began) * 1000, 1)
+            latency_ms += result["slow_ms"]
+            retry_boot = (result.get("health") or {}).get("boot_id")
+            if previous_boot and retry_boot and retry_boot != previous_boot:
+                result.update(ok=False, error="boot_changed")
+                state["observed_boot_id"] = retry_boot
+                classification = "hard"
+            elif result["ok"]:
+                classification = "good"
+            elif starting_phase(result.get("health")):
+                classification = "starting"
+            elif result.get("error") != "timeout":
+                classification = "hard"
+        if facts.get("peer_online") is False and not result["ok"]:
+            classification = "hard"
+        result.update(ms=round(latency_ms, 1), **{"class": classification})
         failures = read_client_failures(sdir, state.get("failures_seen") or now - 900)
-        quiet = state.get("last_verdict") == "good" and before == "home_up"
-        verdict, events = step(state, {"check": result, "mac": facts, "client_failures": failures}, now)
+        verdict, events = step(state, {"check": result, "mac": facts, "client_failures": failures}, max(now, clock()))
         if verdict != "indeterminate":
             write_json(sdir / "backend-state.json", backend_view(state))
         write_json(sdir / "home-monitor.json", state)
         outage_id = (state.get("outage") or {}).get("id", "")
         skipped = "".join(" " + e.replace(" ", "_") for e in events if e.startswith("skipped"))
-        if not result["ok"]:
-            log(sdir, f"check-fail class={result['error']} verdict={verdict} bad_streak={state['bad_streak']}"
-                      + skipped)
-        elif verdict == "indeterminate":
-            log(sdir, "check-good verdict=indeterminate" + skipped)
-        elif not quiet or events:
-            log(sdir, f"check-good good_streak={state['good_streak']} state={state['state']}"
-                      + (" degraded" if state["degraded"] else ""))
+        health = {**(state.get("last_ok_health") or {}), **(result.get("health") or {})}
+        fields = (f" class={classification} ms={result['ms']} peer={clean(facts.get('peer'))}"
+                  f" peer_path={facts.get('peer_path', 'unknown')} boot_id={health.get('boot_id', '?')}"
+                  f" boatd_uptime_s={health.get('boatd_uptime_s')}"
+                  f" last_good_boot_id={(state.get('last_ok_health') or {}).get('boot_id', '?')}"
+                  f" last_good_boatd_uptime_s={(state.get('last_ok_health') or {}).get('boatd_uptime_s')}"
+                  f" error={clean(result.get('error'))}"
+                  f" snapshot_age_s={(result.get('health') or {}).get('snapshot_age_s')}"
+                  f" refresh_stage={clean((result.get('health') or {}).get('refresh_stage'))}")
+        if "slow_ms" in result:
+            fields += f" slow_ms={result['slow_ms']}"
+        log(sdir, ("check-good" if result["ok"] else "check-fail") + fields
+            + f" verdict={verdict} state={state['state']} bad_streak={state['bad_streak']}" + skipped)
+        import toollog
+        toollog.emit("backend", "backend.health_check", duration_ms=result["ms"], ok=result["ok"],
+                     props={"ms": result["ms"], "class": classification, "outcome": verdict,
+                            "peer_online": facts.get("peer_online"), "peer_path": facts.get("peer_path"),
+                            "last_good_boot_id": (state.get("last_ok_health") or {}).get("boot_id"),
+                            "last_good_boatd_uptime_s": (state.get("last_ok_health") or {}).get("boatd_uptime_s"),
+                            "errorClass": result.get("error"), **health})
         for event in events:
-            if event.startswith(("state=home_starting", "startup_ready")):
+            if event.startswith(("state=home_", "startup_ready", "flap ", "flap-summary ")):
                 log(sdir, event)
+                if event.startswith("flap-summary "):
+                    toollog.emit("backend", "backend.home_flaps_daily", props=dict(
+                        (k, v if k == "day" else float(v)) for k, v in (part.split("=", 1) for part in event.split()[1:])))
             if event in ("down", "up"):
                 log(sdir, f"state={state['state']} outage={outage_id} "
                           f"down_count={(state.get('outage') or {}).get('down_count', 0)}")
@@ -762,6 +906,7 @@ def status(sdir=None):
     return {"configured": url is not None, "url": url or "",
             "backend_state": read_json(sdir / "backend-state.json", None),
             "last_tick": stamp(state.get("last_tick")), "last_ok": stamp(state.get("last_ok")),
+            "flaps_today": state.get("flaps_today", {}),
             "last_ok_health": state.get("last_ok_health") or {}, "recent_fails": (state.get("fails") or [])[-5:],
             "outage": {k: outage.get(k) for k in ("id", "started", "down_count", "recovered_at", "alerted_at",
                                                   "thread_id", "told_down", "told_up")} if outage else None,

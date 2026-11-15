@@ -152,6 +152,8 @@ export type ThreadManagementTerminalRunStatus = Extract<
 >;
 
 export interface ThreadManagementSendInput {
+  /** Internal observer notified by the atomic message commit before projection reads. */
+  readonly onAccepted?: () => void;
   readonly isStale?: () => boolean;
   readonly projectId: ProjectId;
   readonly commandId: CommandId;

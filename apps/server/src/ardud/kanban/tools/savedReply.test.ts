@@ -161,6 +161,8 @@ it.effect("a completed follow-up read does not replace a foreground admission st
     assert.strictEqual(span.attributes.get("kanban.reply.stage_ms.admission"), 25_000);
     assert.strictEqual(span.attributes.get("kanban.reply.stage_ms.mutate"), 0);
     assert.strictEqual(callState.replyStage, "admission");
+    assert.strictEqual(callState.replyPhases?.admission, 25_000);
+    assert.strictEqual(callState.replyPhases?.mutate, 0);
     assert.deepInclude(warnings, [
       "kanban saved write reply unavailable",
       {
@@ -644,6 +646,60 @@ it.effect("a masked write finishes cancellation before the timeout reply", () =>
       assert.isNull(data.saved);
     }
   }),
+);
+
+it.effect("a saved write stalled on acknowledgement has a dominant replyWait", () =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const state: McpCall["Service"] = {
+      callerResolved: true,
+      callerResolveMs: 0,
+      readerLane: "foreground",
+      phase: "handler",
+      saved: "unknown",
+    };
+    const pending = yield* SavedReply.protect(
+      SavedWrite.record({ kind: "evaluator", threadId: ThreadId.make("saved-ack") }).pipe(
+        Effect.andThen(Deferred.succeed(entered, undefined)),
+        Effect.andThen(Effect.never),
+      ),
+      "evaluator_start",
+    ).pipe(Effect.provideService(McpCall, state), Effect.forkChild);
+    yield* Deferred.await(entered);
+    yield* TestClock.adjust(25000);
+    yield* Fiber.join(pending);
+    assert.strictEqual(state.replyStage, "ack");
+    assert.deepEqual(state.writePhases, { lockWait: 0, read: 0, write: 0, replyWait: 25000 });
+    assert.strictEqual(state.replyPhases?.ack, 25000);
+  }),
+);
+
+it.effect.each(["card_create", "card_wait", "wiki_read"])(
+  "%s records timing without changing its reader lane or adding a deadline",
+  (tool) =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const finished = yield* Deferred.make<void>();
+      const pending = yield* SavedReply.protect(
+        Effect.gen(function* () {
+          assert.strictEqual(yield* NodeSqliteClient.ReaderLane, "background");
+          yield* Deferred.succeed(entered, undefined);
+          yield* Deferred.await(release);
+          return reply;
+        }),
+        tool,
+      ).pipe(
+        Effect.provideService(NodeSqliteClient.ReaderLane, "background"),
+        Effect.tap(() => Deferred.succeed(finished, undefined)),
+        Effect.forkChild,
+      );
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust(SavedReply.REPLY_BUDGET_MS * 2);
+      assert.isFalse(yield* Deferred.isDone(finished));
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(pending);
+    }),
 );
 
 // Named operation spans already surround the waits; diagnostics partition nested

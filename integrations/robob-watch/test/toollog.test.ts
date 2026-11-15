@@ -242,3 +242,19 @@ test("relay metadata keeps bounded values and rejects text in every new field", 
   expect(rows(dir)[2].props).toBeUndefined();
   expect(JSON.stringify(rows(dir))).not.toContain(secret);
 });
+
+test('queued wakes retain route and confirmation metadata and count as sent only after confirmation', async () => {
+  const dir = fixture();
+  toolLog({ component: 'wakes', kind: 'event', name: 'wake.sent', ok: false,
+    props: { via: 'thread:abcd1234', confirmed: 'pending', accepted: true } });
+  toolLog({ component: 'wakes', kind: 'event', name: 'wake.sent', ok: false,
+    props: { via: 'wake:owner-fallback', meant_for: 'abcd1234', confirmed: 'pending', accepted: true } });
+  expect(rows(dir).map(row => row.props)).toEqual([
+    { via: 'thread:abcd1234', confirmed: 'pending', accepted: true },
+    { via: 'wake:owner-fallback', meant_for: 'abcd1234', confirmed: 'pending', accepted: true },
+  ]);
+  expect((await rollup(day(), dir))?.wake).toMatchObject({ attempts: 2, sent: 0, failed: 0 });
+  toolLog({ component: 'wakes', kind: 'event', name: 'wake.confirmed', ok: true, durationMs: 1_000 });
+  toolLog({ component: 'wakes', kind: 'error', name: 'wake.unconfirmed', ok: false, durationMs: 600_000 });
+  expect((await rollup(day(), dir))?.wake).toMatchObject({ attempts: 2, sent: 1, failed: 1 });
+});

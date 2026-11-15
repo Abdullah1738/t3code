@@ -111,8 +111,13 @@ def items(rows, *, private_notes=False):
         if not isinstance(row, dict):
             continue
         name = text(row.get('name') or row.get('title') or row.get('productTitle') or row.get('product_name'))
-        ident = text(row.get('sku') or row.get('sku_config') or row.get('skuConfig') or
+        ident = text(row.get('item_code') or row.get('itemCode') or row.get('sku') or row.get('sku_config') or row.get('skuConfig') or
                      row.get('item_id') or row.get('product_code') or row.get('productCode'), 80)
+        identifiers = {key: value for key, raw in (
+            ('item_code', row.get('item_code') or row.get('itemCode')),
+            ('sku', row.get('sku')), ('sku_config', row.get('sku_config') or row.get('skuConfig')),
+            ('item_id', row.get('item_id')),
+        ) if (value := text(raw, 80))}
         qty = number(row.get('qty', row.get('quantity', 1)))
         if not qty or qty != int(qty):
             continue
@@ -127,7 +132,7 @@ def items(rows, *, private_notes=False):
                        if isinstance(row.get(k), str) and row[k].strip()), None)
         if private_notes and isinstance(row.get('notes'),str) and row['notes'].strip():
             detail=(detail+'; ' if detail else '')+'Note: '+text(row['notes'],500)
-        out.append({'name': name or (f'Item {ident}' if ident else 'Item details pending'),
+        out.append({**identifiers, 'name': name or (f'Item {ident}' if ident else 'Item details pending'),
                     'unresolved': bool(row.get('unresolved') or not name), 'detail': detail,
                     'qty': int(qty), 'price': price, 'line_total': amount(row.get('line_total')),
                     'image': image_url(row.get('image_url') or row.get('image') or row.get('imageUrl'))})

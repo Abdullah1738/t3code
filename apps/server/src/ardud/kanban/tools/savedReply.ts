@@ -23,12 +23,14 @@ export const TOOLS = new Set([
   "report_bug",
   "discussion_post",
 ]);
+export const TIMED_TOOLS = new Set([...TOOLS, "card_create", "card_wait", "wiki_read"]);
 
 /** Encloses encoding and the reply budget, not just the mutation handler. */
 export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
   effect: Effect.Effect<McpSchema.CallToolResult | McpSchema.InputRequired, E, R>,
   tool: string,
 ) {
+  const timingOnly = !TOOLS.has(tool);
   const span = yield* Effect.currentSpan.pipe(Effect.orDie);
   const clock = yield* Clock.Clock;
   const started = clock.monotonicTimeNanosUnsafe();
@@ -97,6 +99,8 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
   const fallback = (timedOut = false) => {
     if (call._tag === "Some") call.value.replyFailure = timedOut ? "reply_timeout" : "reply_error";
     if (call._tag === "Some") call.value.replyStage = stageAtTimeout ?? stage;
+    updateStage();
+    if (call._tag === "Some") call.value.replyPhases = Object.fromEntries(totals);
     const details =
       receipt?.kind === "card"
         ? {
@@ -169,14 +173,17 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
   };
   const work = effect.pipe(
     // Interactive pre-write reads must not queue behind tick and maintenance scans.
-    NodeSqliteClient.foregroundReads,
+    (effect) => (timingOnly ? effect : NodeSqliteClient.foregroundReads(effect)),
     Effect.provideService(SavedWrite.traceObserver, { span, enter, mark }),
     Effect.provideService(SavedWrite.subStepReporter, (steps) => {
       slowSubSteps = [...slowSubSteps, ...steps].sort((a, b) => b.ms - a.ms).slice(0, 3);
       span.attribute("kanban.reply.sub_steps", slowSubSteps);
       if (call._tag === "Some") call.value.replySubSteps = slowSubSteps;
     }),
-    Effect.provideService(BoardLocks.writeWaitMs, ADMISSION_BUDGET_MS),
+    Effect.provideService(
+      BoardLocks.writeWaitMs,
+      timingOnly ? yield* BoardLocks.writeWaitMs : ADMISSION_BUDGET_MS,
+    ),
     Effect.provideService(SavedWrite.reportLookupObserver, (lookup) => {
       reportLookup = lookup;
       parentLookup(lookup);
@@ -215,11 +222,16 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
       }
     }),
     Effect.flatMap((result) =>
-      !(result instanceof McpSchema.InputRequired) && result.isError && receipt !== undefined
+      !timingOnly &&
+      !(result instanceof McpSchema.InputRequired) &&
+      result.isError &&
+      receipt !== undefined
         ? fallback()
         : Effect.succeed(result),
     ),
-    Effect.catchCause((cause) => (receipt === undefined ? Effect.failCause(cause) : fallback())),
+    Effect.catchCause((cause) =>
+      timingOnly || receipt === undefined ? Effect.failCause(cause) : fallback(),
+    ),
   );
   // Capture the firing time before raceFirst joins cancellation finalizers. The
   // eventual reply can be late because of cleanup even when the timer was on time.
@@ -238,13 +250,22 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
   );
   return yield* work.pipe(
     Effect.map(Option.some),
-    Effect.raceFirst(timer),
+    (effect) => (timingOnly ? effect : effect.pipe(Effect.raceFirst(timer))),
     Effect.flatMap((result) =>
       Option.isSome(result) ? Effect.succeed(result.value) : fallback(true),
     ),
     Effect.ensuring(
       Effect.sync(() => {
         updateStage();
+        if (call._tag === "Some") {
+          call.value.replyPhases = Object.fromEntries(totals);
+          call.value.writePhases = {
+            lockWait: totals.get("admission") ?? 0,
+            read: totals.get("read") ?? 0,
+            write: totals.get("commit") ?? 0,
+            replyWait: totals.get("ack") ?? 0,
+          };
+        }
         closed = true;
         for (const [key, value] of Object.entries(attributes())) span.attribute(key, value);
       }),

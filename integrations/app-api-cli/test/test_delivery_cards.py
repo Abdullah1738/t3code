@@ -17,6 +17,49 @@ import order_tracker as t
 
 
 class CardTests(unittest.TestCase):
+    def test_items_preserve_separate_identifiers_and_aliases(self):
+        for aliases in ({'item_code': 'code', 'sku_config': 'config'},
+                        {'itemCode': 'code', 'skuConfig': 'config'}):
+            with self.subTest(aliases=aliases):
+                row = c.items([{'name': 'Wrap', 'sku': 'sku', 'item_id': 'id', **aliases}])[0]
+                self.assertEqual({key: row[key] for key in ('item_code', 'sku', 'sku_config', 'item_id')},
+                                 {'item_code': 'code', 'sku': 'sku', 'sku_config': 'config', 'item_id': 'id'})
+        plain = c.items([{'name': 'Wrap'}])[0]
+        self.assertFalse({'item_code', 'sku', 'sku_config', 'item_id'} & plain.keys())
+        for key in ('item_code', 'sku', 'sku_config', 'item_id'):
+            with self.subTest(key=key):
+                self.assertEqual(c.items([{'name': 'Wrap', key: ' x' * 100}])[0][key], c.text(' x' * 100, 80))
+        self.assertEqual(c.items([{'itemCode': 'code'}])[0]['name'], 'Item code')
+
+    def test_adding_item_ids_keeps_preview_hash_and_send_update_keys(self):
+        def preview(path, view):
+            path.write_bytes(b'fixture-preview')
+            return True
+
+        with patch.object(c, 'preview', side_effect=preview) as render, patch.object(c, 'log_render'):
+            path = self.owner_placement()
+            before = c.read(path)
+            folder = c.APPS / before['slug']
+            fingerprint = c.read(folder / 'preview-state.json')['hash']
+            send_args = before['send_args']
+            self.cfg['card_meta']['items'] = c.items([
+                {**self.cfg['card_meta']['items'][0], 'item_code': 'code', 'sku': 'sku',
+                 'sku_config': 'config', 'item_id': 'id'}])
+            calls = len(self.calls)
+            c.sync(self.cfg, self.data, send=True, update=True)
+            after = c.read(path)
+            self.assertEqual(c.read(folder / 'preview-state.json')['hash'], fingerprint)
+            self.assertEqual(render.call_count, 1)
+            self.assertEqual(after['send_args'], send_args)
+            self.assertEqual(after['bridge_id'], before['bridge_id'])
+            self.assertEqual(len(self.calls), calls)
+            self.data['status'] = 'preparing'
+            c.sync(self.cfg, self.data, update=True)
+            update = [args for args in self.calls if '--update-id' in args][-1]
+            key = send_args[send_args.index('--key') + 1]
+            self.assertEqual(update[update.index('--key') + 1],
+                             key + ':stage:' + hashlib.sha256(b'Preparing').hexdigest()[:24])
+
     def owner_placement(self, app='noon', vertical='food'):
         self.cfg.update(app=app, order='FTESTSTAGE1404', vertical=vertical, **{'for':'owner'})
         self.cfg['delivery_card']['chat'] = 'owner'
