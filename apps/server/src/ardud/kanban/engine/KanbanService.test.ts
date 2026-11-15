@@ -33,6 +33,7 @@ import {
   AuthOrchestrationOperateScope,
   clientRpcRequiredScopes,
   KANBAN_WS_METHODS,
+  KANBAN_BACKLOG,
   KANBAN_RETRY_BACKOFF_MS,
   KanbanBoard,
   KanbanDiscussionId,
@@ -23903,6 +23904,178 @@ const reuseDeliveryFixture = Effect.fn("test.reuseDeliveryFixture")(function* (
   });
   return { kanban, board, store, card, thread };
 });
+
+it.effect.each(["deployed", "working", "todo", "legacy"] as const)(
+  "#1505 claimed rework checks its thread's %s home card",
+  (homeStage) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+        const home = yield* kanban.createCard(
+          board.id,
+          { title: "Home card", prompt: "Home work" },
+          owner,
+        );
+        yield* kanban.dispatchNow;
+        const homeWorking = (yield* kanban.card(home.id)).card;
+        const previous = homeWorking.workThreadId!;
+        const claimed = yield* kanban.createCard(
+          board.id,
+          { title: "Claimed card", prompt: "Claimed work" },
+          owner,
+        );
+        yield* kanban.claimCard(previous, claimed.id);
+        yield* kanban.editCard(
+          claimed.id,
+          { comment: "Handoff: branch robob/example at abc123" },
+          owner,
+        );
+        yield* kanban.moveCard(
+          claimed.id,
+          "needs_review",
+          "cardThread",
+          { _tag: "thread", threadId: previous },
+          { note: "Move handoff: worktree /work/claimed, head def456" },
+        );
+        yield* kanban.dispatchNow;
+        const reviewing = (yield* kanban.card(claimed.id)).card;
+        yield* kanban.reviewResult(reviewing.activeThreadId!, "findings", [
+          "P2: preserve batch ownership",
+        ]);
+        if (homeStage === "legacy") {
+          const link = (yield* store.threadLink(previous))!;
+          yield* store.putThreadLink({ ...link, cardId: null });
+        } else if (homeStage !== "working") {
+          yield* store.putCard({
+            ...homeWorking,
+            stage: homeStage,
+            activeThreadId: null,
+            activeRole: null,
+            activePool: null,
+          });
+        }
+        const oldMessages = (yield* Ref.get(fake.threads)).get(previous)!.messages.length;
+        yield* kanban.dispatchNow;
+        const result = yield* kanban.card(claimed.id);
+        assert.strictEqual(result.card.stage, "working");
+        const current = result.card.workThreadId!;
+        assert.strictEqual(result.card.activeThreadId, current);
+        if (homeStage === "deployed") {
+          assert.notStrictEqual(current, previous);
+          assert.strictEqual((yield* store.threadLink(current))!.cardId, claimed.id);
+          assert.lengthOf((yield* Ref.get(fake.threads)).get(previous)!.messages, oldMessages);
+          assert.isTrue(
+            result.events.some(
+              (event) =>
+                event.kind === "thread" &&
+                event.body ===
+                  `fresh work thread: previous thread ${previous} belongs to #${home.number} (deployed)`,
+            ),
+          );
+          const brief = (yield* Ref.get(fake.threads)).get(current)!.messages[0]!;
+          assert.include(brief, `Previous work thread: ${previous}`);
+          assert.include(brief, "P2: preserve batch ownership");
+          assert.include(brief, "Handoff: branch robob/example at abc123");
+          assert.include(brief, "Move handoff: worktree /work/claimed, head def456");
+        } else {
+          assert.strictEqual(current, previous);
+          assert.isFalse(
+            result.events.some((event) => event.body?.startsWith("fresh work thread:")),
+          );
+          assert.include(
+            (yield* Ref.get(fake.threads)).get(current)!.messages.at(-1)!,
+            "P2: preserve batch ownership",
+          );
+        }
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect("#1505 a home reset during fresh launch keeps the source stop reservation", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const entered = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    const settled = yield* Ref.make(false);
+    let source: ThreadId | null = null;
+    let target: KanbanCardId | null = null;
+    let launched: ThreadId | null = null;
+    const delayed = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (threads) =>
+        KanbanThreads.of({
+          ...threads,
+          launch: (input) =>
+            threads.launch(input).pipe(
+              Effect.tap((id) => {
+                if (target === null || !input.key.startsWith(`${target}:`) || launched !== null)
+                  return Effect.void;
+                launched = id;
+                return Deferred.succeed(entered, undefined).pipe(
+                  Effect.andThen(Deferred.await(resume)),
+                );
+              }),
+            ),
+          interrupt: (id, reason, cancelQueued, runId) =>
+            id === source
+              ? Effect.succeed({ outcome: "requested" as const, runId: "old-home-run" })
+              : threads.interrupt(id, reason, cancelQueued, runId),
+          runSettled: () => Ref.get(settled),
+        }),
+      ),
+    ).pipe(Layer.provide(fake.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const store = yield* KanbanStore.KanbanStore;
+      yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+      const home = yield* kanban.createCard(board.id, { prompt: "Home" }, owner);
+      yield* kanban.dispatchNow;
+      const working = (yield* kanban.card(home.id)).card;
+      source = working.workThreadId!;
+      const claimed = yield* kanban.createCard(board.id, { prompt: "Claimed" }, owner);
+      yield* kanban.claimCard(source, claimed.id);
+      const carried = (yield* kanban.card(claimed.id)).card;
+      yield* store.putCard({
+        ...carried,
+        stage: "todo",
+        activeThreadId: null,
+        activeRole: null,
+        activePool: null,
+      });
+      yield* store.putCard({
+        ...working,
+        stage: "needs_review",
+        priority: KANBAN_BACKLOG,
+        activeThreadId: null,
+        activeRole: null,
+        activePool: null,
+      });
+      yield* setRunning(fake, source, true);
+      target = claimed.id;
+      const dispatch = yield* Effect.forkChild(kanban.dispatchNow);
+      yield* Deferred.await(entered);
+      yield* kanban.cardThread(home.id, "reset", "Reset home during launch", owner);
+      yield* Deferred.succeed(resume, undefined);
+      yield* Fiber.join(dispatch);
+      assert.isNull((yield* kanban.card(claimed.id)).card.activeThreadId);
+      assert.isNotNull(launched);
+      assert.include(fake.interrupted, launched!);
+      yield* Ref.set(settled, true);
+      yield* setRunning(fake, source, false);
+      yield* kanban.dispatchNow;
+      const resumed = (yield* kanban.card(claimed.id)).card;
+      assert.strictEqual(resumed.stage, "working");
+      assert.notStrictEqual(resumed.workThreadId, source);
+      assert.strictEqual((yield* store.threadLink(resumed.workThreadId!))!.cardId, claimed.id);
+    }).pipe(
+      Effect.provide(testLayer(delayed)),
+      Effect.ensuring(Deferred.succeed(resume, undefined)),
+    );
+  }),
+);
 
 it.effect("#681 a dedicated worker becoming shared during delivery keeps its sibling running", () =>
   Effect.gen(function* () {

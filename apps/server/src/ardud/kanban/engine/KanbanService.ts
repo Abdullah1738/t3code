@@ -7391,6 +7391,24 @@ const make = Effect.gen(function* () {
     return { read };
   };
 
+  const workThreadHomes = Effect.fn("KanbanService.workThreadHomes")(function* (
+    cards: ReadonlyArray<KanbanCard>,
+  ) {
+    const ids = [
+      ...new Set(
+        cards.flatMap((card) =>
+          card.stage === "todo" && card.workThreadId !== null ? [card.workThreadId] : [],
+        ),
+      ),
+    ];
+    const homes = new Map<string, KanbanCard | null>();
+    for (const link of yield* rawStore.threadLinksByIds(ids)) {
+      // Finished home cards are absent from the dispatch snapshot.
+      if (link.cardId !== null) homes.set(link.threadId, yield* rawStore.card(link.cardId));
+    }
+    return homes;
+  });
+
   /** Only this card's changes and relevant board writes invalidate its start. */
   const startCard = Effect.fn("KanbanService.startCard")(function* (
     boardId: KanbanBoard["id"],
@@ -7447,12 +7465,16 @@ const make = Effect.gen(function* () {
       return;
     }
     const goal = yield* goalOf(card);
-    // A fresh start leaves the old work thread to its cards in another pool.
+    // A fresh start leaves the old work thread with its own cards.
     const existing = dispatch.fresh
       ? null
       : dispatch.role === "work"
         ? card.workThreadId
         : Rules.reviewThreadToReuse(board, card);
+    // Reset releases the home card before its old run finishes stopping.
+    // Claimed cards must wait for that reservation even with a fresh destination.
+    if (dispatch.freshReason !== undefined && card.workThreadId !== null)
+      yield* refusePendingStop(card.workThreadId);
     let threadId: ThreadId | null = null;
     let adoptRunning = false;
     if (existing !== null) {
@@ -7603,7 +7625,17 @@ const make = Effect.gen(function* () {
     destination.expectedCard = synced;
     let text: string;
     if (dispatch.role === "work") {
-      text = threadId ? Briefs.wakeText(synced) : Briefs.workBrief(board, synced, goal);
+      const comments =
+        threadId === null && synced.workThreadId !== null
+          ? (yield* store.cardEvents(card.id)).flatMap((event) =>
+              event.body &&
+              (event.kind === "comment" ||
+                (event.kind === "moved" && event.toStage === "needs_review"))
+                ? [event.body]
+                : [],
+            )
+          : [];
+      text = threadId ? Briefs.wakeText(synced) : Briefs.workBrief(board, synced, goal, comments);
     } else {
       const events = yield* store.cardEvents(card.id);
       const findings = events
@@ -7658,6 +7690,8 @@ const make = Effect.gen(function* () {
         title,
       );
       yield* logEvent(card, system, "thread", { body: `${dispatch.role} thread ${threadId}` });
+      if (dispatch.freshReason !== undefined)
+        yield* logEvent(card, system, "thread", { body: dispatch.freshReason });
     }
     const priorHold = (yield* Ref.get(holds)).get(threadId);
     if (dispatch.role === "work") {
@@ -7855,6 +7889,7 @@ const make = Effect.gen(function* () {
     attempted: ReadonlySet<string>,
     now: number,
     reviews: ReadonlyMap<string, Rules.ReviewEvidence>,
+    homes: ReadonlyMap<string, KanbanCard | null>,
   ) {
     if (Option.isNone(analytics)) return;
     // Reuse the dispatcher's blockers, retry and pause gates, relaxing capacity alone.
@@ -7878,6 +7913,7 @@ const make = Effect.gen(function* () {
       now,
       attempted,
       reviews,
+      homes,
     );
     const waitingIds = new Set(waiting.map((entry) => entry.cardId as string));
     for (const [id, entry] of poolWaits)
@@ -8044,6 +8080,7 @@ const make = Effect.gen(function* () {
                       );
                       const held = yield* boardHolds(board.id);
                       const now = yield* nowMillis;
+                      const homes = yield* workThreadHomes(cards);
                       const dispatch = Rules.planDispatch(
                         board,
                         cards,
@@ -8053,11 +8090,21 @@ const make = Effect.gen(function* () {
                         now,
                         attempted,
                         reviews,
+                        homes,
                       )[0];
                       if (!dispatch) {
                         yield* TickTimings.measure(
                           "pool_accounting",
-                          recordPoolWaits(board, cards, pools, held, attempted, now, reviews),
+                          recordPoolWaits(
+                            board,
+                            cards,
+                            pools,
+                            held,
+                            attempted,
+                            now,
+                            reviews,
+                            homes,
+                          ),
                         );
                         return null;
                       }
@@ -8101,6 +8148,9 @@ const make = Effect.gen(function* () {
                         : dispatch.role === "work"
                           ? card.workThreadId
                           : card.reviewThreadId;
+                      const sourceThreadId =
+                        dispatch.freshReason === undefined ? null : card.workThreadId;
+                      const stopThreadId = sourceThreadId ?? wakeThreadId;
                       const assignmentState = ({
                         links,
                         updatedAt: _updatedAt,
@@ -8131,9 +8181,15 @@ const make = Effect.gen(function* () {
                         board.id,
                         [
                           `card:${card.id}`,
-                          ...(wakeThreadId === null ? [] : [interruptResource(wakeThreadId)]),
+                          ...(stopThreadId === null ? [] : [interruptResource(stopThreadId)]),
                         ],
                         Effect.gen(function* () {
+                          if (
+                            sourceThreadId !== null &&
+                            (yield* Effect.result(refusePendingStop(sourceThreadId)))._tag ===
+                              "Failure"
+                          )
+                            return false;
                           const currentBoard = (yield* rawStore.boards).find(
                             (row) => row.id === board.id,
                           );
@@ -8208,6 +8264,7 @@ const make = Effect.gen(function* () {
                                   [selected.id, yield* reviewEvidence(currentBoard, selected)],
                                 ])
                               : undefined,
+                            yield* workThreadHomes(cards),
                           ).find((entry) => entry.cardId === card.id);
                           return (
                             eligible !== undefined &&
