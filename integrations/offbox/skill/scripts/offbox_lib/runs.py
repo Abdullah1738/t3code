@@ -2172,6 +2172,8 @@ def _status_code(st: dict) -> int | None:
     and None (boat lost the process, or gave no code) sends the caller to recover_lost_exit."""
     if st.get("status") == "lost":
         return None
+    if st.get('status') == 'interrupted' and st.get('running') is not True:
+        return EXIT_INTERRUPTED
     if st.get("exitCode") is not None:
         return st.get("exitCode")
     return 128 + 15 if st.get("signal") else None
@@ -2192,6 +2194,7 @@ def _ended(box_id: str, pid: int, until: float | None, run_id: str | None = None
         st = api.cmd_status(box_id, pid, timeout=left, retries=0, deadline=until)
     except OffboxError:
         return None
+    remember_interruption(run_id, st)
     if st and not st.get("running") and st.get("status") in ("exited", "lost", "interrupted"):
         if st.get('status') == 'lost' and run_id:
             try:
@@ -2203,15 +2206,72 @@ def _ended(box_id: str, pid: int, until: float | None, run_id: str | None = None
     return None
 
 
-class Interrupted(OffboxError):
-    """Our server lost power (or was restarted hard) under the run, and the run is not being run again: it was
-    started with retry off, or it had already been retried once. Its own exit code does not exist."""
+def interruption_info(status):
+    if not isinstance(status, dict):
+        return None
+    data = status.get('command') if isinstance(status.get('command'), dict) else status
+    info = data.get('interruption')
+    if not isinstance(info, dict) or not info:
+        metrics = data.get('metrics')
+        info = metrics.get('interruption') if isinstance(metrics, dict) else None
+    return dict(info) if isinstance(info, dict) and info else None
 
-    def __init__(self, what: str):
-        super().__init__(f"the offbox server restarted while {what} was running, and the run was not run again. "
-                         f"It did not finish; its output up to the restart is kept (offbox logs). "
-                         f"Run it again if that is safe (exit {EXIT_INTERRUPTED})", code=EXIT_INTERRUPTED,
-                         started=True)
+
+def remember_interruption(run_id, status):
+    info = interruption_info(status)
+    if (run_id and info is not None and
+            read_json(LOGS_DIR / f'{run_id}.state.json', {}).get('interruption') != info):
+        try:
+            save_run_state(run_id, interruption=info)
+        except OSError as error:
+            say(f"warning: {run_id}: could not save interruption details ({error})")
+    return info
+
+
+def cleanup_summary(info):
+    if info.get('cleanup') == 'clean' and type(info.get('leftover_killed')) is int and info['leftover_killed'] == 0:
+        return 'cleanup: clean'
+    count = info.get('leftover_killed')
+    if info.get('cleanup') == 'stopped' and type(count) is int and count >= 0:
+        return f'cleanup: {count} stopped'
+    if type(count) is int and count > 0:
+        return f'cleanup: unknown; {count} leftover processes were stopped'
+    return 'cleanup: unknown'
+
+
+def interruption_message(what, info, box=None):
+    cause = info.get('cause') or 'server_restart'
+    box = box or info.get('box_id') or 'the box'
+    count = info.get('leftover_killed')
+    if info.get('cleanup') == 'clean' and count == 0:
+        cleanup = f'no process from this run is left on {box}; safe to start a clean rerun'
+    elif info.get('cleanup') == 'stopped' and type(count) is int and count > 0:
+        cleanup = f'{count} leftover processes were stopped'
+    else:
+        cleanup = f'process state on {box} could not be checked; cleanup is unknown'
+    detail = f" {info['message']}." if info.get('message') else ''
+    return (f"{what} was interrupted ({cause}); the command ran partly and was not run again. "
+            f"Check what it did before running it again.{detail} Output: offbox logs {what}\n"
+            + cleanup_summary(info) + '; ' + cleanup)
+
+
+def report_interruption(row):
+    if row['status'] == 'interrupted':
+        saved = read_json(LOGS_DIR / f"{row['run_id']}.state.json", {})
+        info = saved.get('interruption') or {}
+        cleanup = saved.get('cleanup')
+        if isinstance(cleanup, dict):
+            info = {**info, 'cleanup': cleanup.get('cleanup'), 'leftover_killed': cleanup.get('leftover_killed')}
+        say(interruption_message(row['run_id'], info, row['box_id']))
+
+
+class Interrupted(OffboxError):
+    """The server could not finish or retry the accepted command; its own exit code is unknown."""
+
+    def __init__(self, what: str, status=None):
+        self.interruption = interruption_info(status) or {}
+        super().__init__(interruption_message(what, self.interruption) + f"\nexit {EXIT_INTERRUPTED}",
+                         code=EXIT_INTERRUPTED, started=True)
 
 
 def retry_interrupted(a) -> bool:
@@ -2419,8 +2479,9 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
         # An answer that arrives past the caller's deadline is not accepted: the wait ends with --timeout (124).
         if until is not None and now() >= until:
             raise timed_out()
+        remember_interruption(run_id, st)
         if st is not None and st.get("status") == "interrupted":
-            raise Interrupted(what)
+            raise Interrupted(what, st)
         if st is None or ended_again() < 2:
             return _RUNNING
         if st.get('status') == 'lost':
@@ -2458,6 +2519,7 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
                     # Absolute: a frame that arrives after the deadline (even an exit) is not accepted.
                     if until is not None and now() >= until:
                         raise timed_out()
+                    remember_interruption(run_id, fr)
                     t = fr.get("type")
                     if t in ("stdout", "stderr"):
                         data = fr.get("data") or ""
@@ -2499,8 +2561,8 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
                     elif t == "attempt":
                         new_attempt(fr.get("attempt"))
                     elif t == "exit":
-                        if fr.get("status") == "interrupted":
-                            raise Interrupted(what)
+                        if fr.get("status") == "interrupted" and fr.get('running') is not True:
+                            raise Interrupted(what, fr)
                         if fr.get('exitCode') is None and not fr.get('signal'):
                             return follow_lost()
                         return fr.get("exitCode") if fr.get("exitCode") is not None else (
@@ -2555,6 +2617,7 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
                     pass
                 if until is not None and now() >= until:
                     raise timed_out()
+                remember_interruption(run_id, st)
                 down_from = (down_from or failed_at) if boat_down else None
                 if home_run and boat_down and not seen["lost"]:
                     # The run was accepted, so it is never sent anywhere else (it would run twice): wait for the
@@ -2562,8 +2625,8 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
                     seen["lost"] = True
                     say(f"lost the connection to the offbox server; the run stays there. Reconnecting for up to "
                         f"{int(window // 60)} min")
-                if st and st.get("status") == "interrupted":
-                    raise Interrupted(what)
+                if st and st.get("status") == "interrupted" and st.get('running') is not True:
+                    raise Interrupted(what, st)
                 if st and not st.get("running") and st.get("status") in ("exited", "lost"):
                     if st.get("status") == "lost":
                         return follow_lost()
@@ -3207,10 +3270,11 @@ def _run_remote(a, rn) -> int:
         try:
             code = rn.recovered_code if rn.recovered_code is not None else rn.stream()
             rn.remote_code = None if getattr(a, 'steps', None) else code
-        except Interrupted:
+        except Interrupted as error:
+            remember_interruption(rn.run_id, {'interruption': error.interruption})
             code = finish(rn.run_id, EXIT_INTERRUPTED, "interrupted")
             if code is None:
-                raise OffboxError(f"{rn.run_id}: steps incomplete after the server restart; remote exit unknown",
+                raise OffboxError(f"{rn.run_id}: steps incomplete after the interruption; remote exit unknown",
                                   code=EXIT_INFRA, started=True) from None
             raise
     except KeyboardInterrupt:

@@ -381,6 +381,7 @@ systemctl restart incus  # re-adds its own NAT/DHCP rules after the flush
 install -d -m 700 /etc/boatd
 mkdir -p /opt/boatd
 install -m 0755 "$HERE/boatd.py" /opt/boatd/boatd.py
+install -m 0755 "$HERE/boatd-wrap" /opt/boatd/boatd-wrap
 install -m 0644 "$MGMT_ASSETS/offbox_mgmt_sshd_config" /opt/boatd/offbox_mgmt_sshd_config
 tool_log="$HERE/toollog.py"
 [ -f "$tool_log" ] || tool_log="$HERE/../skill/scripts/toollog.py"
