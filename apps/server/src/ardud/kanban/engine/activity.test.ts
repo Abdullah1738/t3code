@@ -11,6 +11,8 @@ import {
 import { describe, expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
 
+import type { SlotEvent } from "../store/KanbanStore.ts";
+
 import * as Activity from "./activity.ts";
 import * as Rules from "./rules.ts";
 
@@ -187,12 +189,39 @@ const pools = [
   { key: Rules.poolKey(opus), model: opus, slots: 4 },
   { key: Rules.poolKey(sonnet), model: sonnet, slots: 2 },
 ];
+const slot = (
+  id: number,
+  kind: SlotEvent["kind"],
+  threadId: string,
+  at: string,
+  poolKey = Rules.poolKey(opus),
+): SlotEvent => ({
+  id,
+  boardId: "b1",
+  poolKey,
+  threadId,
+  cardId: null,
+  kind,
+  at,
+  why: kind === "take" ? "start" : "card_left",
+});
+const slotHistory = {
+  recordedSince: before,
+  events: [
+    slot(1, "take", "tb", before),
+    slot(2, "take", "tw", t("01:00")),
+    slot(3, "release", "tw", t("03:00")),
+    slot(4, "take", "tr1", t("03:10"), Rules.poolKey(sonnet)),
+    slot(5, "release", "tr1", t("04:10"), Rules.poolKey(sonnet)),
+  ],
+};
 const input = {
   window,
   cards: [busy, parked, old],
   events: busyEvents,
   threads,
   pools,
+  slotHistory,
 };
 
 describe("compact rows", () => {
@@ -342,8 +371,9 @@ describe("rollup", () => {
     expect(work[1]).toBe(2); // and #1 working
     expect(work[12]).toBe(1);
     const review = result.pools.used[Rules.poolKey(sonnet)]!;
-    expect(review[3]).toBeCloseTo(50 / 60, 2);
-    expect(review[8]).toBeCloseTo(59 / 60, 2);
+    expect(review[3]).toBe(1);
+    expect(review[8]).toBe(0);
+    expect(result.pools.slotHours[Rules.poolKey(sonnet)]![3]).toBeCloseTo(50 / 60, 2);
   });
 
   it("a card left in review with no thread holds no slot and is listed", () => {
@@ -358,88 +388,6 @@ describe("rollup", () => {
     expect(
       stuckRun.stages.hours.in_review!.hours - result.stages.hours.in_review!.hours,
     ).toBeCloseTo(24, 1);
-    // A thread that ended mid-span stops holding the slot then.
-    const released = { ...parked, activeThreadId: null, activePool: null };
-    const ended = Activity.rollup({
-      ...input,
-      cards: [busy, released, old],
-      threads: [
-        ...threads.filter((link) => link.threadId !== "tb"),
-        thread("tb", "b", "work", opus, before, t("06:00")),
-      ],
-    });
-    expect(ended.pools.used[Rules.poolKey(opus)]![5]).toBe(1);
-    expect(ended.pools.used[Rules.poolKey(opus)]![12]).toBe(0);
-    expect(ended.stages.withoutThread.items).toEqual([
-      { card: 2, stage: "working", since: "2026-11-10T00:00Z" },
-    ]);
-    // Never marked ended and no active thread: it held nothing after its last event (none here).
-    const unmarked = Activity.rollup({ ...input, cards: [busy, released, old] });
-    expect(unmarked.pools.used[Rules.poolKey(opus)]![0]).toBe(0);
-    expect(unmarked.pools.used[Rules.poolKey(opus)]![1]).toBe(1);
-  });
-
-  it("a card parked on a wait holds no slot while it waits, and a thread with two cards counts once", () => {
-    const waiting = card("w", {
-      number: 8,
-      stage: "working",
-      activeThreadId: ThreadId.make("tw2"),
-      activePool: Rules.poolKey(opus),
-    });
-    const sibling = card("x", {
-      number: 9,
-      stage: "working",
-      activeThreadId: ThreadId.make("tw2"),
-      activePool: Rules.poolKey(opus),
-    });
-    // Stored as waits are today: plain edits (WAIT_EVENT_KINDS_LIVE is off).
-    const waitEvents = [
-      event("w", t("02:00"), "edited", null, null, "Waiting for CI on app#12: ci"),
-      event("w", t("05:00"), "edited", null, null, "Wait ended: CI on app#12 passed"),
-    ];
-    const shared = thread("tw2", "w", "work", opus, before);
-    const run = Activity.rollup({
-      window,
-      cards: [waiting, sibling],
-      events: waitEvents,
-      threads: [shared, { ...shared, cardId: KanbanCardId.make("x") }],
-      pools,
-    });
-    const row = run.pools.used[Rules.poolKey(opus)]!;
-    // #9 (same thread) keeps the slot through #8's wait: one slot either way.
-    expect(row[0]).toBe(1);
-    expect(row[3]).toBe(1);
-    expect(row[12]).toBe(1);
-    const alone = Activity.rollup({
-      window,
-      cards: [waiting],
-      events: waitEvents,
-      threads: [shared],
-      pools,
-    });
-    expect(alone.pools.used[Rules.poolKey(opus)]![1]).toBe(1);
-    expect(alone.pools.used[Rules.poolKey(opus)]![3]).toBe(0);
-    expect(alone.pools.used[Rules.poolKey(opus)]![5]).toBe(1);
-    // The wait kinds, once live, read the same.
-    const kinds = [
-      event("w", t("02:00"), "wait_set", null, null, "Waiting for CI on app#12: ci"),
-      event("w", t("05:00"), "wait_cleared", null, null, "Wait ended: cleared by hand"),
-    ];
-    expect(
-      Activity.rollup({ window, cards: [waiting], events: kinds, threads: [shared], pools }).pools
-        .used,
-    ).toEqual(alone.pools.used);
-    // A wait set before the window, still set, holds nothing all window; one that expired counts.
-    const parkedWait = { ...waiting, wait: { ...waitOn, at: before } };
-    expect(
-      Activity.rollup({ window, cards: [parkedWait], events: [], threads: [shared], pools }).pools
-        .used,
-    ).toEqual({});
-    const expired = { ...waiting, wait: { ...waitOn, at: before, expiredAt: before } };
-    expect(
-      Activity.rollup({ window, cards: [expired], events: [], threads: [shared], pools }).pools
-        .used[Rules.poolKey(opus)]![0],
-    ).toBe(1);
   });
 
   it("gives median, p95 and max dwell per stage from each stage's real start", () => {
@@ -706,59 +654,6 @@ describe("rollup", () => {
       [51, "needs_owner"],
     ]);
     expect(run.pools.used).toEqual({});
-  });
-
-  it("an old thread never marked ended stops when the next one starts; only the active one runs on", () => {
-    const restarted = card("r", {
-      number: 60,
-      stage: "working",
-      activeThreadId: ThreadId.make("new"),
-      activePool: Rules.poolKey(opus),
-    });
-    const run = Activity.rollup({
-      window,
-      cards: [restarted],
-      events: [],
-      threads: [
-        thread("old1", "r", "work", opus, before),
-        thread("old2", "r", "work", opus, t("04:00")),
-        thread("new", "r", "work", opus, t("08:00")),
-      ],
-      pools,
-    });
-    // One slot all day, never two or three.
-    expect(run.pools.used[Rules.poolKey(opus)]!.every((value) => value === 1)).toBe(true);
-  });
-
-  it("a card left in review with a stale thread holds a slot only while that thread wrote events", () => {
-    const stale = card("s", { number: 61, stage: "in_review", movedAt: before });
-    const link = thread("rev-old", "s", "review", sonnet, before);
-    const byEvaluator = {
-      ...event("s", t("20:00"), "comment", null, null, "chasing"),
-      actor: { _tag: "evaluator" as const, threadId: ThreadId.make("ev") },
-    };
-    const quiet = Activity.rollup({
-      window,
-      cards: [stale],
-      events: [byEvaluator],
-      threads: [link],
-      pools,
-    });
-    expect(quiet.pools.used).toEqual({});
-    const byReviewer = {
-      ...event("s", t("05:00"), "comment", null, null, "still reading"),
-      actor: { _tag: "thread" as const, threadId: ThreadId.make("rev-old") },
-    };
-    const wrote = Activity.rollup({
-      window,
-      cards: [stale],
-      events: [byReviewer, byEvaluator],
-      threads: [link],
-      pools,
-    });
-    const row = wrote.pools.used[Rules.poolKey(sonnet)]!;
-    expect(row[4]).toBe(1);
-    expect(row[5]).toBe(0);
   });
 
   it("carries no card titles or text", () => {
@@ -1032,5 +927,666 @@ it("reports a refused verdict separately from no verdict and ordinary flags", ()
   expect(Activity.compactRow(reviewing, events, window)).toMatchObject({
     failures: 1,
     lastFailure: reason,
+  });
+});
+
+describe("ledger pool activity", () => {
+  const pool = Rules.poolKey(opus);
+  const hourly = { since: t("00:00"), until: t("03:00") };
+  const run = (events: SlotEvent[], patch: Partial<Activity.RollupInput> = {}) =>
+    Activity.rollup({
+      window: hourly,
+      cards: [],
+      events: [],
+      threads: [],
+      pools: [{ key: pool, model: opus, slots: 2 }],
+      slotHistory: { events, recordedSince: before },
+      ...patch,
+    }).pools;
+
+  it("replays carry-in, tied events and empty hours without exceeding configured slots", () => {
+    const events = [
+      slot(1, "take", "t1", before),
+      slot(2, "take", "t2", t("00:30")),
+      slot(3, "release", "t1", t("00:30")),
+      slot(4, "release", "t2", t("01:00")),
+    ];
+    const result = run(events, {
+      cards: [parked, { ...parked, id: KanbanCardId.make("sibling") }],
+      threads: Array.from({ length: 88 }, (_, i) =>
+        thread(`stale-${i}`, "b", "work", opus, before),
+      ),
+    });
+    expect(result.used[pool]).toEqual([2, 0, 0]);
+    expect(result.slotHours[pool]).toEqual([1, 0, 0]);
+    expect(result.used[pool]!.every((used) => used !== null && used <= result.slots[pool]!)).toBe(
+      true,
+    );
+    // Replay independently: one slot per identity, never one per card or link.
+    const open = new Set<string>();
+    for (const event of events) {
+      if (event.kind === "take") open.add(event.threadId);
+      else open.delete(event.threadId);
+    }
+    expect(open.size).toBe(0);
+  });
+
+  it("counts holds with no cards, ignores duplicate takes and splits pool moves", () => {
+    const other = Rules.poolKey(sonnet);
+    const result = run([
+      slot(1, "take", "held", before),
+      slot(2, "take", "held", t("00:15")),
+      slot(3, "release", "held", t("01:30")),
+      slot(4, "take", "held", t("01:30"), other),
+    ]);
+    expect(result.used[pool]).toEqual([1, 1, 0]);
+    expect(result.slotHours[pool]).toEqual([1, 0.5, 0]);
+    expect(result.used[other]).toEqual([0, 1, 1]);
+    expect(result.slotHours[other]).toEqual([0, 0.5, 1]);
+  });
+
+  it("marks hours before ledger collection unknown and clips partial windows", () => {
+    const events = [slot(1, "take", "t1", t("01:30"))];
+    const result = run(events, {
+      window: { since: t("00:15"), until: t("02:15") },
+      slotHistory: { events, recordedSince: t("01:30") },
+    });
+    expect(result.used[pool]).toEqual([null, 1, 1]);
+    expect(result.slotHours[pool]).toEqual([null, 0.5, 0.25]);
+    expect(result.recordedSince).toBe(t("01:30"));
+    expect(
+      run([], { slotHistory: { events: [], recordedSince: null }, cards: [parked], threads }).used,
+    ).toEqual({});
+  });
+
+  it("measures ready todo card-hours only while the routed pool is full", () => {
+    const full = [
+      slot(1, "take", "t1", before),
+      slot(2, "take", "t2", before),
+      slot(3, "release", "t1", t("01:30")),
+    ];
+    const eligible = card("ready");
+    const excluded = [
+      card("backlog", { priority: 5 }),
+      card("stalled", { stalled: { at: before, reason: "flag", by: { _tag: "owner" } } }),
+      card("waiting", { wait: waitOn }),
+      card("owner", { asks: [ask("q", before, { blocking: true })] }),
+      card("blocked", { blockedBy: [KanbanCardId.make("blocker")] }),
+      card("blocker", { stage: "working" }),
+      card("joining", { workThreadId: ThreadId.make("t1") }),
+      card("disabled", { model: sonnet }),
+    ];
+    const result = run(full, { cards: [eligible, ...excluded] });
+    expect(result.queueWait[pool]).toEqual([1, 0.5, 0]);
+    expect(result.queueWaitBasis).toContain("card-hours");
+  });
+
+  it("excludes cards outside the current board pause keep list", () => {
+    const full = [slot(1, "take", "t1", before), slot(2, "take", "t2", before)];
+    const ready = card("ready");
+    const board = {
+      archivedAt: null,
+      setup: null,
+      pause: { keep: [], reason: "Wait", by: "owner", at: before },
+    };
+    expect(run(full, { cards: [ready], board }).queueWait).toEqual({});
+    expect(
+      run(full, {
+        cards: [ready],
+        board: { ...board, pause: { ...board.pause, keep: [ready.id] } },
+      }).queueWait[pool],
+    ).toEqual([1, 1, 1]);
+  });
+
+  it("splits queue wait on recorded waits, flags, owner answers and blocker completion", () => {
+    const events = [slot(1, "take", "t1", before), slot(2, "take", "t2", before)];
+    const waiting = card("w");
+    const flags = card("f");
+    const owned = card("o", { asks: [ask("q", before, { blocking: true, closedAt: t("01:00") })] });
+    const blocker = card("b", { stage: "completed" });
+    const blocked = card("blocked", { blockedBy: [blocker.id] });
+    const result = run(events, {
+      cards: [waiting, flags, owned, blocker, blocked],
+      events: [
+        event("w", t("00:30"), "wait_set", null, null, "Waiting for CI"),
+        event("w", t("01:30"), "wait_cleared", null, null, "Wait ended: cleared"),
+        event("f", t("00:30"), "flagged", "todo", "todo", "Run failed: error"),
+        event("f", t("01:30"), "flagged", "todo", "todo", "Cleared"),
+        event("b", t("02:00"), "moved", "working", "completed"),
+      ],
+    });
+    expect(result.queueWait[pool]).toEqual([1, 2, 4]);
+  });
+
+  it.each([
+    {
+      name: "set before the window",
+      at: before,
+      expiredAt: null,
+      movedAt: before,
+      expected: [0, 0, 0],
+    },
+    {
+      name: "set inside the window",
+      at: t("00:30"),
+      expiredAt: null,
+      movedAt: before,
+      expected: [0.5, 0, 0],
+    },
+    {
+      name: "expired inside the window",
+      at: before,
+      expiredAt: t("01:30"),
+      movedAt: before,
+      expected: [0, 0.5, 1],
+    },
+    {
+      name: "made stale by a move",
+      at: before,
+      expiredAt: null,
+      movedAt: t("01:00"),
+      expected: [0, 1, 1],
+    },
+  ])(
+    "queue wait respects a persisted wait $name without wait events",
+    ({ at, expiredAt, movedAt, expected }) => {
+      const result = run([slot(1, "take", "t1", before), slot(2, "take", "t2", before)], {
+        cards: [card("w", { movedAt, wait: { ...waitOn, at, expiredAt } })],
+      });
+      expect(result.queueWait[pool] ?? [0, 0, 0]).toEqual(expected);
+    },
+  );
+
+  it.each(["edited", "wait_set"] as const)("queue wait reads %s wait markers", (kind) => {
+    const cleared = kind === "edited" ? "edited" : "wait_cleared";
+    const result = run([slot(1, "take", "t1", before), slot(2, "take", "t2", before)], {
+      cards: [card("w"), card("flag")],
+      events: [
+        event("w", t("00:30"), kind, null, null, "Waiting for CI on app#12: ci"),
+        event("w", t("01:30"), cleared, null, null, "Wait ended: cleared by hand"),
+        event("flag", t("01:00"), "flagged", "todo", "todo", "Cleared"),
+      ],
+    });
+    expect(result.queueWait[pool]).toEqual([1.5, 1.5, 2]);
+  });
+
+  const waitStyles = [
+    {
+      name: "legacy clear",
+      set: "edited",
+      endKind: "edited",
+      setBody: "Waiting for CI",
+      endBody: "Wait ended: cleared",
+    },
+    {
+      name: "legacy expiry",
+      set: "edited",
+      endKind: "edited",
+      setBody: "Waiting for CI",
+      endBody: "Wait expired: CI",
+    },
+    { name: "typed clear", set: "wait_set", endKind: "wait_cleared", setBody: null, endBody: null },
+    {
+      name: "typed expiry",
+      set: "wait_set",
+      endKind: "wait_expired",
+      setBody: null,
+      endBody: null,
+    },
+  ] as const;
+  const waitStarts = [
+    { name: "new wait", prior: null, replace: true, end: true, expected: [1, 0, 1] },
+    {
+      name: "replacement of carried wait",
+      prior: "set",
+      replace: true,
+      end: true,
+      expected: [0, 0, 1],
+    },
+    { name: "end carried wait", prior: "set", replace: false, end: true, expected: [0, 0, 1] },
+    {
+      name: "new wait after prior end",
+      prior: "end",
+      replace: true,
+      end: true,
+      expected: [1, 0, 1],
+    },
+    {
+      name: "carried replacement still open",
+      prior: "set",
+      replace: true,
+      end: false,
+      expected: [0, 0, 0],
+    },
+    {
+      name: "redundant end after prior end",
+      prior: "end",
+      replace: false,
+      end: true,
+      expected: [1, 1, 1],
+    },
+  ] as const;
+  it.each(
+    waitStyles.flatMap((style) =>
+      waitStarts.map((initial) => ({
+        ...style,
+        ...initial,
+        name: `${style.name}: ${initial.name}`,
+      })),
+    ),
+  )(
+    "replays wait state across the window: $name",
+    ({ prior, replace, end, expected, set, endKind, setBody, endBody }) => {
+      const marker = (state: "set" | "end", at: string) =>
+        event(
+          "w",
+          at,
+          state === "set" ? set : endKind,
+          null,
+          null,
+          state === "set" ? setBody : endBody,
+        );
+      const result = run([slot(1, "take", "t1", before), slot(2, "take", "t2", before)], {
+        cards: [card("w")],
+        readinessBefore: prior === null ? [] : [marker(prior, before)],
+        events: [
+          ...(replace ? [marker("set", t("01:00"))] : []),
+          ...(end ? [marker("end", t("02:00"))] : []),
+        ],
+      });
+      expect(result.queueWait[pool] ?? [0, 0, 0]).toEqual(expected);
+    },
+  );
+
+  const flagStarts = [
+    {
+      name: "redundant clear on ready card",
+      prior: null,
+      kind: "flagged",
+      body: "Cleared",
+      expected: [1, 1, 1],
+    },
+    {
+      name: "redundant clear after prior clear",
+      prior: "Cleared",
+      kind: "flagged",
+      body: "Cleared",
+      expected: [1, 1, 1],
+    },
+    {
+      name: "clear carried stall",
+      prior: "Run failed: error",
+      kind: "flagged",
+      body: "Cleared",
+      expected: [0, 1, 1],
+    },
+    {
+      name: "move clears carried stall",
+      prior: "Run failed: error",
+      kind: "moved",
+      body: null,
+      expected: [0, 1, 1],
+    },
+    {
+      name: "review clears carried stall",
+      prior: "Run failed: error",
+      kind: "review",
+      body: null,
+      expected: [0, 1, 1],
+    },
+    {
+      name: "new stall after prior clear",
+      prior: "Cleared",
+      kind: "flagged",
+      body: "Run failed: error",
+      expected: [1, 0, 0],
+    },
+  ] as const;
+  it.each(flagStarts)(
+    "replays flag state across the window: $name",
+    ({ prior, kind, body, expected }) => {
+      const result = run([slot(1, "take", "t1", before), slot(2, "take", "t2", before)], {
+        cards: [card("f")],
+        readinessBefore:
+          prior === null ? [] : [event("f", before, "flagged", "todo", "todo", prior)],
+        events: [event("f", t("01:00"), kind, "todo", "todo", body)],
+      });
+      expect(result.queueWait[pool] ?? [0, 0, 0]).toEqual(expected);
+    },
+  );
+
+  it.each(
+    flagStarts.flatMap((state) =>
+      (["shared", "chain", "separate", "done"] as const).map((topology) => ({
+        ...state,
+        topology,
+      })),
+    ),
+  )("replays blocker flags: $name ($topology)", ({ prior, kind, body, expected, topology }) => {
+    const shared = ThreadId.make("idle-shared");
+    const blocker = card("flagged-blocker", {
+      workThreadId: topology === "separate" ? ThreadId.make("other-idle") : shared,
+      stage: topology === "done" ? "completed" : "todo",
+    });
+    const middle = card("middle", { workThreadId: shared, blockedBy: [blocker.id] });
+    const waiter = card("dependent", {
+      workThreadId: shared,
+      blockedBy: [topology === "chain" ? middle.id : blocker.id],
+    });
+    const result = run([slot(1, "take", "t1", before), slot(2, "take", "t2", before)], {
+      cards: [blocker, ...(topology === "chain" ? [middle] : []), waiter],
+      readinessBefore:
+        prior === null ? [] : [event(blocker.id, before, "flagged", null, null, prior)],
+      events: [event(blocker.id, t("01:00"), kind, null, null, body)],
+    });
+    const multiplier = topology === "chain" ? 3 : topology === "shared" ? 2 : 1;
+    expect(result.queueWait[pool] ?? [0, 0, 0]).toEqual(
+      topology === "done" ? [1, 1, 1] : expected.map((value) => value * multiplier),
+    );
+  });
+
+  it.each([
+    {
+      name: "clear after the window",
+      snapshot: null,
+      prior: "Run failed: error",
+      marks: [],
+      expected: [0, 0, 0],
+    },
+    {
+      name: "flag after the window",
+      snapshot: "04:00",
+      prior: "Cleared",
+      marks: [],
+      expected: [2, 2, 2],
+    },
+    {
+      name: "snapshot after a prior clear",
+      snapshot: "00:30",
+      prior: "Cleared",
+      marks: [],
+      expected: [1, 0, 0],
+    },
+    {
+      name: "recorded clear after a snapshot",
+      snapshot: "00:30",
+      prior: "Cleared",
+      marks: ["Cleared"],
+      expected: [1, 2, 2],
+    },
+    {
+      name: "tied flag then clear",
+      snapshot: null,
+      prior: "Cleared",
+      marks: ["Run failed: error", "Cleared"],
+      expected: [2, 2, 2],
+    },
+    {
+      name: "tied clear then flag",
+      snapshot: null,
+      prior: "Cleared",
+      marks: ["Cleared", "Run failed: error"],
+      expected: [2, 0, 0],
+    },
+  ])("keeps blocker flag history stable: $name", ({ snapshot, prior, marks, expected }) => {
+    const shared = ThreadId.make("idle-shared");
+    const blocker = card("flagged-blocker", {
+      workThreadId: shared,
+      stalled:
+        snapshot === null ? null : { at: t(snapshot), reason: "flag", by: { _tag: "owner" } },
+    });
+    const result = run([slot(1, "take", "t1", before), slot(2, "take", "t2", before)], {
+      cards: [blocker, card("dependent", { workThreadId: shared, blockedBy: [blocker.id] })],
+      readinessBefore: [event(blocker.id, before, "flagged", null, null, prior)],
+      events: marks.map((body) => event(blocker.id, t("01:00"), "flagged", null, null, body)),
+    });
+    expect(result.queueWait[pool] ?? [0, 0, 0]).toEqual(expected);
+  });
+
+  it.each([
+    {
+      name: "wait snapshot set after a prior end",
+      kind: "wait",
+      clear: false,
+      expected: [0.5, 0, 0],
+    },
+    {
+      name: "wait snapshot followed by a recorded end",
+      kind: "wait",
+      clear: true,
+      expected: [0.5, 1, 1],
+    },
+    {
+      name: "stall snapshot set after a prior clear",
+      kind: "stall",
+      clear: false,
+      expected: [0.5, 0, 0],
+    },
+    {
+      name: "stall snapshot followed by a recorded clear",
+      kind: "stall",
+      clear: true,
+      expected: [0.5, 1, 1],
+    },
+  ] as const)("merges a persisted $name with recorded markers", ({ kind, clear, expected }) => {
+    const prior = event(
+      "s",
+      before,
+      kind === "wait" ? "wait_cleared" : "flagged",
+      null,
+      null,
+      "Cleared",
+    );
+    const ended = event(
+      "s",
+      t("01:00"),
+      kind === "wait" ? "wait_cleared" : "flagged",
+      null,
+      null,
+      "Cleared",
+    );
+    const snapshot =
+      kind === "wait"
+        ? { wait: { ...waitOn, at: t("00:30") } }
+        : { stalled: { reason: "flag", by: { _tag: "owner" as const }, at: t("00:30") } };
+    const result = run([slot(1, "take", "t1", before), slot(2, "take", "t2", before)], {
+      cards: [card("s", snapshot)],
+      readinessBefore: [prior],
+      events: clear ? [ended] : [],
+    });
+    expect(result.queueWait[pool]).toEqual(expected);
+  });
+
+  const stageCases = [
+    {
+      name: "todo before later work",
+      prior: "todo",
+      current: "working",
+      created: before,
+      settled: null,
+      expected: [1, 1, 1],
+    },
+    {
+      name: "todo before later completion",
+      prior: "todo",
+      current: "completed",
+      created: before,
+      settled: null,
+      expected: [1, 1, 1],
+    },
+    {
+      name: "todo before later settlement",
+      prior: "todo",
+      current: "verified",
+      created: before,
+      settled: t("04:00"),
+      expected: [1, 1, 1],
+    },
+    {
+      name: "owner-held before later todo",
+      prior: "needs_owner",
+      current: "todo",
+      created: before,
+      settled: null,
+      expected: [0, 0, 0],
+    },
+    {
+      name: "working before later todo",
+      prior: "working",
+      current: "todo",
+      created: before,
+      settled: null,
+      expected: [0, 0, 0],
+    },
+    {
+      name: "not yet created",
+      prior: null,
+      current: "todo",
+      created: t("04:00"),
+      settled: null,
+      expected: [0, 0, 0],
+    },
+    {
+      name: "created on exclusive end",
+      prior: null,
+      current: "todo",
+      created: t("03:00"),
+      settled: null,
+      expected: [0, 0, 0],
+    },
+    {
+      name: "created within window",
+      prior: null,
+      current: "todo",
+      created: t("01:00"),
+      settled: null,
+      expected: [0, 1, 1],
+    },
+    {
+      name: "settled before window",
+      prior: "todo",
+      current: "verified",
+      created: before,
+      settled: before,
+      expected: [0, 0, 0],
+    },
+  ] as const;
+  it.each(stageCases)(
+    "uses historical stage: $name",
+    ({ prior, current, created, settled, expected }) => {
+      const result = run([slot(1, "take", "t1", before), slot(2, "take", "t2", before)], {
+        cards: [
+          card("history", {
+            stage: current,
+            createdAt: created,
+            settledAt: settled,
+            movedAt: t("04:00"),
+          }),
+        ],
+        prior: prior === null ? [] : [event("history", before, "moved", null, prior)],
+      });
+      expect(result.queueWait[pool] ?? [0, 0, 0]).toEqual(expected);
+    },
+  );
+
+  it.each(
+    (["todo", "needs_owner"] as const).flatMap((stage) =>
+      ["03:00", "04:00"].map((at) => ({ stage, at })),
+    ),
+  )("uses the first later transition without prior history ($stage at $at)", ({ stage, at }) => {
+    const result = run([slot(1, "take", "t1", before), slot(2, "take", "t2", before)], {
+      cards: [card("history", { stage: "working", movedAt: t(at) })],
+      after: [event("history", t(at), "moved", stage, "working")],
+    });
+    expect(result.queueWait[pool] ?? [0, 0, 0]).toEqual(stage === "todo" ? [1, 1, 1] : [0, 0, 0]);
+  });
+
+  it("clips stage and queue durations at settlement inside the window", () => {
+    const result = Activity.rollup({
+      window: hourly,
+      cards: [card("history", { stage: "verified", movedAt: t("01:00"), settledAt: t("02:00") })],
+      events: [
+        event("history", t("00:30"), "moved", "todo", "working"),
+        event("history", t("01:00"), "moved", "working", "verified"),
+      ],
+      threads: [],
+      pools: [{ key: pool, model: opus, slots: 2 }],
+      slotHistory: {
+        recordedSince: before,
+        events: [slot(1, "take", "t1", before), slot(2, "take", "t2", before)],
+      },
+      prior: [event("history", before, "created", null, "todo")],
+    });
+    expect(result.pools.queueWait[pool]).toEqual([0.5, 0, 0]);
+    expect(result.stages.hours.verified?.hours).toBe(1);
+  });
+
+  it("retains a window transition tail after later settlement", () => {
+    const result = Activity.rollup({
+      window: hourly,
+      cards: [card("history", { stage: "verified", settledAt: t("04:00") })],
+      events: [event("history", t("01:00"), "moved", "todo", "working")],
+      threads: [],
+      pools,
+      prior: [event("history", before, "created", null, "todo")],
+    });
+    expect(result.stages.hours.todo?.hours).toBe(1);
+    expect(result.stages.hours.working?.hours).toBe(2);
+    expect(result.stages.withoutThread.items).toEqual([]);
+  });
+
+  it.each([
+    { prior: "completed", current: "working", expected: [1, 1, 1] },
+    { prior: "working", current: "completed", expected: [0, 0, 0] },
+  ] as const)(
+    "uses historical blocker stages ($prior then $current)",
+    ({ prior, current, expected }) => {
+      const blocker = card("blocker", { stage: current, movedAt: t("04:00") });
+      const result = run([slot(1, "take", "t1", before), slot(2, "take", "t2", before)], {
+        cards: [blocker, card("waiter", { blockedBy: [blocker.id] })],
+        prior: [event("blocker", before, "moved", null, prior)],
+      });
+      expect(result.queueWait[pool] ?? [0, 0, 0]).toEqual(expected);
+    },
+  );
+
+  it("a historical blocker stays clear after settlement", () => {
+    const blocker = card("blocker", {
+      stage: "verified",
+      movedAt: t("01:00"),
+      settledAt: t("02:00"),
+    });
+    const result = run([slot(1, "take", "t1", before), slot(2, "take", "t2", before)], {
+      cards: [blocker, card("waiter", { blockedBy: [blocker.id] })],
+      prior: [event("blocker", before, "created", null, "working")],
+      events: [event("blocker", t("01:00"), "moved", "working", "verified")],
+    });
+    expect(result.queueWait[pool]).toEqual([0, 1, 1]);
+  });
+
+  it("counts weighted alternatives once only when every enabled route is full", () => {
+    const other = Rules.poolKey(sonnet);
+    const weighted = card("weighted", {
+      models: [
+        { model: opus, weight: 2 },
+        { model: sonnet, weight: 1 },
+      ],
+    });
+    const result = run(
+      [
+        slot(1, "take", "t1", before),
+        slot(2, "take", "t2", before),
+        slot(3, "take", "s1", t("01:00"), other),
+      ],
+      {
+        cards: [weighted],
+        pools: [
+          { key: pool, model: opus, slots: 2 },
+          { key: other, model: sonnet, slots: 1 },
+        ],
+      },
+    );
+    expect(result.queueWait[pool]).toEqual([0, 1, 1]);
+    expect(result.queueWait[other]).toBeUndefined();
   });
 });

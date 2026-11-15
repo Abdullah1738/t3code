@@ -36,6 +36,7 @@ function fixture(batchSize = 2, setup?: (source: NodeSqlite.DatabaseSync) => voi
     CREATE TABLE ardud_opencode_import (native_session_id TEXT PRIMARY KEY, thread_id TEXT);
     CREATE TABLE ardud_kanban_cards (id TEXT PRIMARY KEY, active_thread_id TEXT, json TEXT);
     CREATE TABLE ardud_kanban_threads (thread_id TEXT PRIMARY KEY, ended INTEGER);
+    CREATE TABLE ardud_kanban_slot_events (id INTEGER PRIMARY KEY AUTOINCREMENT, board_id TEXT NOT NULL, pool_key TEXT NOT NULL, thread_id TEXT NOT NULL, card_id TEXT, kind TEXT NOT NULL CHECK (kind IN ('take','release')), at TEXT NOT NULL, why TEXT NOT NULL);
     INSERT INTO orchestration_events VALUES (1,'thread.created','a','{"id":"a"}');
     INSERT INTO orchestration_v2_projection_threads VALUES ('a','{"title":"old"}');
     INSERT INTO orchestration_v2_projection_threads VALUES ('b','{}');
@@ -2506,6 +2507,27 @@ test("upgrading a published replica catches identities committed before the new 
       .get(),
   ).toBeDefined();
   expect(metaValue(out, "sequence")).toBe("1");
+});
+
+test("exports slot ledger appends across generations and exporter restarts", () => {
+  const f = fixture();
+  f.source.exec(
+    "INSERT INTO ardud_kanban_slot_events VALUES (1,'b','p','t','c','take','2026-11-13T01:00:00.000Z','start')",
+  );
+  f.finish();
+  const out = f.connect();
+  expect(out.prepare("SELECT kind FROM ardud_kanban_slot_events ORDER BY id").all()).toEqual([
+    { kind: "take" },
+  ]);
+  f.source.exec(
+    "INSERT INTO ardud_kanban_slot_events VALUES (2,'b','p','t',NULL,'release','2026-11-13T02:00:00.000Z','hold_end')",
+  );
+  f.restart();
+  f.finish();
+  expect(out.prepare("SELECT kind FROM ardud_kanban_slot_events ORDER BY id").all()).toEqual([
+    { kind: "take" },
+    { kind: "release" },
+  ]);
 });
 
 test.each([

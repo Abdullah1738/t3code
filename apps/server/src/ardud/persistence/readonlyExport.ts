@@ -116,6 +116,7 @@ export function createReadonlyReplica(
     "ardud_opencode_import",
     "ardud_kanban_cards",
     "ardud_kanban_threads",
+    "ardud_kanban_slot_events",
   ];
   const selectedItems = new Set(["user_message", "error", "run_interrupt_request"]);
   const origin = (
