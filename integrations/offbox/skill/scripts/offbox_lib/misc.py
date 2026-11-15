@@ -660,47 +660,138 @@ def _remote_result(r, path, result):
     reason = ' '.join((result.removeprefix('incomplete:') if result != 'n/a' else 'history unavailable').splitlines())
     if result in ('complete', 'caught_up'):
         reason = 'history empty'
-    view = Path(str(path) + '.remote.view')
-    result = f"incomplete:box copy {meta['source']}; history: {reason}"
-    if view.exists() and meta.get('exit_code') == r['exit_code']:
+    raw, received_stderr, _ = _received_output(path, meta)
+    received = 'received output and ' if raw != Path(str(path) + '.remote') else ''
+    result = f"incomplete:{received}box copy {meta['source']}; history: {reason}"
+    if ('reason' in meta and meta.get('exit_code') == r['exit_code']
+            and _remote_view_current(path, raw, meta, received_stderr)):
         return result
     meta.update(reason=reason, exit_code=r['exit_code'])
-    notice = ''
     if not meta.get('merged'):
-        notice = f"offbox: stderr for this run could not be fetched ({reason}); output shows stdout only\n"
         reason_tag = {'history empty': 'history_empty', 'timeout': 'history_timeout',
                       'no progress': 'history_no_progress'}.get(reason, 'history_unavailable')
         toollog.emit('run', 'run.log_stream_missing', kind='error', ok=False, ids={'run': r['run_id']},
                      props={'stream': 'stderr', 'backend': api.BACKEND, 'reason': reason_tag})
-    from . import resources
-    saved = read_json(LOGS_DIR / f"{r['run_id']}.state.json", {})
-    footer = resources.summary(saved.get('resources') or resources.unavailable('boat', 1))
+    atomic_write_json(Path(str(path) + '.remote.json'), meta)
+    if raw == path:
+        return f"incomplete:received output only; could not combine box copy {meta['source']}; history: {reason}"
+    try:
+        _write_remote_view(path, raw, meta, received_stderr)
+    except OSError as e:
+        return result + f'; view unavailable: {e}'
+    return result
+
+
+def _received_output(path, meta):
     raw = Path(str(path) + '.remote')
-    view = Path(str(path) + '.remote.view')
+    ck = checkpoint(path)
+    if meta.get('merged') or not ck or not ck['logBytes']:
+        return raw, False, 0
+    received_stderr = bool(ck['stderrOffset'])
+    tmp = None
+    try:
+        with path.open('rb') as local, raw.open('rb') as remote:
+            local_info, remote_info = os.fstat(local.fileno()), os.fstat(remote.fileno())
+            if local_info.st_size < ck['logBytes']:
+                return path, received_stderr, 0
+            generation = repr((ck, tuple((s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns)
+                                        for s in (local_info, remote_info)))).encode()
+            combined = Path(str(raw) + '.received-' + hashlib.sha256(generation).hexdigest()[:20])
+            if combined.exists():
+                return combined, received_stderr, ck['logBytes']
+            with tempfile.NamedTemporaryFile(dir=path.parent, prefix=path.name + '.received.', delete=False) as dst:
+                tmp = dst.name
+                # Stream offsets cannot separate an interleaved prefix. Keep it whole alongside the box copy.
+                left = ck['logBytes']
+                while left:
+                    chunk = local.read(min(left, 64 * 1024))
+                    if not chunk:
+                        return path, received_stderr, 0
+                    dst.write(chunk)
+                    left -= len(chunk)
+                dst.write(b'\n')
+                shutil.copyfileobj(remote, dst, 64 * 1024)
+            os.replace(tmp, combined)
+            tmp = None
+            return combined, received_stderr, ck['logBytes']
+    except OSError:
+        return path, received_stderr, 0
+    finally:
+        if tmp is not None:
+            Path(tmp).unlink(missing_ok=True)
+
+
+def _remote_footer(path, meta, received_stderr):
+    notice = ''
+    if not meta.get('merged'):
+        reason = meta.get('reason', 'history unavailable')
+        notice = (f"offbox: remaining stderr for this run could not be fetched ({reason}); received stderr is included\n"
+                  if received_stderr else
+                  f"offbox: stderr for this run could not be fetched ({reason}); output shows stdout only\n")
+    from . import resources
+    saved = read_json(path.with_suffix('.state.json'), {})
+    footer = resources.summary(saved.get('resources') or resources.unavailable('boat', 1))
+    code = meta.get('exit_code')
+    exit_line = f'remote exit {code}' if code is not None else 'remote exit unknown'
+    return ('\n' + notice + footer + f"\noffbox: {exit_line}\n").encode()
+
+
+def _remote_view_current(path, raw, meta, received_stderr):
+    footer = _remote_footer(path, meta, received_stderr)
+    try:
+        with Path(str(raw) + '.view').open('rb') as src:
+            if os.fstat(src.fileno()).st_size != raw.stat().st_size + len(footer):
+                return False
+            src.seek(-len(footer), os.SEEK_END)
+            return src.read() == footer
+    except OSError:
+        return False
+
+
+def _write_remote_view(path, raw, meta, received_stderr):
+    footer = _remote_footer(path, meta, received_stderr)
+    view = Path(str(raw) + '.view')
     with tempfile.NamedTemporaryFile(dir=path.parent, prefix=path.name + '.view.', delete=False) as dst:
         tmp = dst.name
         try:
             with raw.open('rb') as src:
                 shutil.copyfileobj(src, dst, 64 * 1024)
-            code = r['exit_code']
-            exit_line = f'remote exit {code}' if code is not None else 'remote exit unknown'
-            dst.write(('\n' + notice + footer + f"\noffbox: {exit_line}\n").encode())
+            dst.write(footer)
             dst.flush()
             os.replace(tmp, view)
         finally:
             Path(tmp).unlink(missing_ok=True)
-    atomic_write_json(Path(str(path) + '.remote.json'), meta)
-    return result
-
 
 
 def _raw_log(path):
-    return Path(str(path) + '.remote') if _remote_copy(path) else path
+    meta = _remote_copy(path)
+    return _received_output(path, meta)[0] if meta else path
 
 
 def _shown_log(path):
-    view = Path(str(path) + '.remote.view')
-    return view if _remote_copy(path) and view.exists() else path
+    return _display_log(path)[0]
+
+
+def _display_log(path):
+    meta = _remote_copy(path)
+    if not meta:
+        return path, 0
+    raw, received_stderr, received_bytes = _received_output(path, meta)
+    if raw == path:
+        return path, 0
+    view = Path(str(raw) + '.view')
+    if received_bytes:
+        record_delivery(raw, min(delivered_bytes(path), received_bytes))
+    try:
+        # Raw and rendered files share the payload prefix even when rendering fails between reads.
+        payload_size = raw.stat().st_size
+        record_delivery(raw, min(delivered_bytes(view), payload_size))
+        if not _remote_view_current(path, raw, meta, received_stderr):
+            _write_remote_view(path, raw, meta, received_stderr)
+        record_delivery(view, min(delivered_bytes(raw), payload_size))
+    except OSError:
+        return raw, received_bytes
+    return view, received_bytes
 
 
 def _empty_log_fallback(r, path, deadline, result) -> str:
@@ -1192,13 +1283,18 @@ def _settled(r, echo=False, pos=0, *, locked=False, until=None, show_failure=Fal
 
 
 def _failure_tail(path) -> None:
-    path = _shown_log(path)
+    path, received_bytes = _display_log(path)
     # Repeated waits and waits after a follower must not replay output already delivered by another invocation.
     try:
         size = os.path.getsize(path)
     except OSError:
         return
     delivered = delivered_bytes(path)
+    delivered = delivered if delivered <= size else 0
+    if delivered < received_bytes:
+        # Keep the received source's own tail visible when the recovered copy is much larger.
+        _tail(path, max(delivered, received_bytes - 16384), True, limit=received_bytes)
+        delivered = delivered_bytes(path)
     pos = max(0, size - 16384, delivered if delivered <= size else 0)
     _tail(path, pos, True, limit=size)
 

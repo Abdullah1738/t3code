@@ -75,6 +75,7 @@ class BackgroundOutputTests(_BackgroundOutputFixture):
                 Path(str(self.path) + '.remote.json').unlink(missing_ok=True)
                 Path(str(self.path) + '.remote.view').unlink(missing_ok=True)
                 Path(str(self.path) + '.remote.view.delivered').unlink(missing_ok=True)
+                Path(str(self.path) + '.remote.delivered').unlink(missing_ok=True)
                 if create_empty:
                     self.path.touch()
                 common.atomic_write_json(common.offsets_path(self.path),
@@ -109,6 +110,7 @@ class BackgroundOutputTests(_BackgroundOutputFixture):
                     Path(str(self.path) + '.remote.json').unlink(missing_ok=True)
                     Path(str(self.path) + '.remote.view').unlink(missing_ok=True)
                     Path(str(self.path) + '.remote.view.delivered').unlink(missing_ok=True)
+                    Path(str(self.path) + '.remote.delivered').unlink(missing_ok=True)
                     common.offsets_path(self.path).unlink(missing_ok=True)
                     self.history.side_effect = common.OffboxError('history failed') if history_error else self.empty
                     remote = home / source
@@ -142,6 +144,7 @@ class BackgroundOutputTests(_BackgroundOutputFixture):
                     Path(str(self.path) + '.remote.json').unlink(missing_ok=True)
                     Path(str(self.path) + '.remote.view').unlink(missing_ok=True)
                     Path(str(self.path) + '.remote.view.delivered').unlink(missing_ok=True)
+                    Path(str(self.path) + '.remote.delivered').unlink(missing_ok=True)
                     self.con.execute('UPDATE runs SET process_id=?,wrapper_pid=? WHERE run_id=?',
                                      (process_id, wrapper_pid, 'run-x'))
                     self.con.commit()
@@ -200,6 +203,7 @@ class BackgroundOutputTests(_BackgroundOutputFixture):
                     Path(str(self.path) + '.remote.json').unlink(missing_ok=True)
                     Path(str(self.path) + '.remote.view').unlink(missing_ok=True)
                     Path(str(self.path) + '.remote.view.delivered').unlink(missing_ok=True)
+                    Path(str(self.path) + '.remote.delivered').unlink(missing_ok=True)
                     common.offsets_path(self.path).unlink(missing_ok=True)
                     self.streams()
                     self.con.execute("UPDATE runs SET status='running',exit_code=NULL WHERE run_id='run-x'")
@@ -235,6 +239,7 @@ class BackgroundOutputTests(_BackgroundOutputFixture):
                         Path(str(self.path) + '.remote.json').unlink(missing_ok=True)
                         Path(str(self.path) + '.remote.view').unlink(missing_ok=True)
                         Path(str(self.path) + '.remote.view.delivered').unlink(missing_ok=True)
+                        Path(str(self.path) + '.remote.delivered').unlink(missing_ok=True)
                         common.offsets_path(self.path).unlink(missing_ok=True)
                         Path(str(self.path) + '.delivered').unlink(missing_ok=True)
                         self.con.execute("UPDATE runs SET status='running',exit_code=NULL WHERE run_id='run-x'")
@@ -281,6 +286,7 @@ class BackgroundOutputTests(_BackgroundOutputFixture):
                 Path(str(self.path) + '.remote.json').unlink(missing_ok=True)
                 Path(str(self.path) + '.remote.view').unlink(missing_ok=True)
                 Path(str(self.path) + '.remote.view.delivered').unlink(missing_ok=True)
+                Path(str(self.path) + '.remote.delivered').unlink(missing_ok=True)
                 common.offsets_path(self.path).unlink(missing_ok=True)
                 Path(str(self.path) + '.delivered').unlink(missing_ok=True)
                 self.con.execute("UPDATE runs SET status='running',exit_code=NULL WHERE run_id='run-x'")
@@ -552,6 +558,7 @@ class BackgroundStreamRecoveryTests(_BackgroundOutputFixture):
                 Path(str(self.path) + '.remote.json').unlink(missing_ok=True)
                 Path(str(self.path) + '.remote.view').unlink(missing_ok=True)
                 Path(str(self.path) + '.remote.view.delivered').unlink(missing_ok=True)
+                Path(str(self.path) + '.remote.delivered').unlink(missing_ok=True)
                 common.offsets_path(self.path).unlink(missing_ok=True)
                 self.history.side_effect = self.empty
                 with patch.object(misc.subprocess, 'run', side_effect=self.copy):
@@ -846,6 +853,267 @@ class BackgroundStreamRecoveryTests(_BackgroundOutputFixture):
                 self.assertIn('out1', misc._shown_log(self.path).read_text())
 
 
+class KnownStderrFallbackTests(_BackgroundOutputFixture):
+    def setUp(self):
+        super().setUp()
+        self.box_get.return_value = dict(state='running')
+        self.con.execute("UPDATE runs SET status='failed',exit_code=7 WHERE run_id='run-x'")
+        self.con.commit()
+        self.history.side_effect = common.OffboxError('history unavailable')
+
+    def local(self, data, stdout=5):
+        self.path.write_bytes(data)
+        common.atomic_write_json(common.offsets_path(self.path),
+                                 dict(stdoutOffset=stdout, stderrOffset=len(data)-stdout, logBytes=len(data)))
+
+    def recover(self, data=b'out1\nout2\n'):
+        def copy(argv, **kw):
+            kw['stdout'].write(data)
+            return subprocess.CompletedProcess(argv, 0, stderr=b'.ascii/processes/7.log\n')
+        with patch.object(misc.subprocess, 'run', side_effect=copy):
+            return misc._catch_up_log(self.row())
+
+    def test_readers_keep_known_stderr_and_recovered_stdout(self):
+        error = b'actual failure already received\n'
+        for prefix in (error, b'out1\n'+error, error+b'out1\n'):
+            for copy in (b'out1\n', b'out1\nout2\n'):
+                for cached in (False, True):
+                    for reader in ('logs', 'follow', 'wait'):
+                        with self.subTest(prefix=prefix, copy=copy, cached=cached, reader=reader):
+                            for p in self.path.parent.glob('run-x.log*'):
+                                p.unlink()
+                            if cached:
+                                self.local(b'out1\n')
+                                self.recover(copy)
+                                with contextlib.redirect_stdout(io.StringIO()):
+                                    misc._tail(misc._shown_log(self.path), 0, True)
+                            self.local(prefix, 5 if b'out1' in prefix else 0)
+                            self.recover(copy)
+                            result = self.invoke(wait=reader=='wait', follow=reader=='follow')
+                            self.assertIn(error.decode(), result[1])
+                            self.assertIn(copy.decode(), result[1])
+                            self.assertNotIn('output shows stdout only', result[1])
+                            self.assertIn('remote exit 7', result[1])
+                            raw = misc._raw_log(self.path).read_bytes()
+                            self.assertIn(error, raw)
+                            self.assertIn(copy, raw)
+                            self.assertEqual(Path(str(self.path)+'.remote').read_bytes(), copy)
+                            self.assertEqual(self.path.read_bytes(), prefix)
+                            self.assertNotIn(error.decode(), self.invoke(wait=True)[1])
+
+    def test_classification_uses_both_sources_without_rendered_notices(self):
+        for disk in (False, True):
+            with self.subTest(disk=disk):
+                for p in self.path.parent.glob('run-x.log*'):
+                    p.unlink()
+                prefix = b'out1\noffbox step 1 rc=0: first\n'
+                if disk:
+                    prefix += b'write failed: No space left on device\n'
+                self.local(prefix)
+                self.recover(b'out1\noffbox step 2 rc=7: second\n')
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(runs.settled_steps_code(self.row(), 7, planned=2, catch_up=False), 7)
+                self.assertEqual(runs.space_result('run-x', 7), 90 if disk else 7)
+        for p in self.path.parent.glob('run-x.log*'):
+            p.unlink()
+        self.local(b'out1\nactual failure already received\n')
+        self.path.with_suffix('.state.json').unlink(missing_ok=True)
+        self.history.side_effect = common.OffboxError('transport: No space left on device')
+        self.recover()
+        self.assertNotIn(b'transport:', misc._raw_log(self.path).read_bytes())
+        self.assertEqual(runs.space_result('run-x', 7), 7)
+
+    def test_new_received_stderr_has_a_separate_delivery_position(self):
+        self.local(b'out1\nfirst error\n')
+        self.recover()
+        old = misc._shown_log(self.path)
+        old_bytes = old.read_bytes()
+        with contextlib.redirect_stdout(io.StringIO()):
+            misc._tail(old, 0, True)
+        self.local(b'out1\nfirst error\nsecond error\n')
+        # Direct selectors must preserve newly available evidence before another catch-up runs.
+        self.assertIn(b'second error\n', misc._raw_log(self.path).read_bytes())
+        new = misc._shown_log(self.path)
+        self.assertNotEqual(old, new)
+        with contextlib.redirect_stdout(io.StringIO()):
+            misc._tail(old, 0, True)
+        self.assertEqual(old.read_bytes(), old_bytes)
+        self.assertIn('second error\n', self.invoke(wait=True)[1])
+        self.assertNotIn('second error\n', self.invoke(wait=True)[1])
+
+    def test_short_legacy_copy_keeps_checkpointed_stdout_too(self):
+        prefix = b'out1\nout2 already received\n'
+        self.local(prefix, stdout=len(prefix))
+        self.recover(b'out1\n')
+        self.assertIn(prefix, misc._raw_log(self.path).read_bytes())
+        output = self.invoke()[1]
+        self.assertIn(prefix.decode(), output)
+        self.assertIn('output shows stdout only', output)
+
+    def test_failed_wait_keeps_both_source_tails_with_a_large_copy(self):
+        error = b'actual failure already received\n'
+        for padding in (b'', b'p' * 20000 + b'\n'):
+            with self.subTest(padding=len(padding)):
+                for p in self.path.parent.glob('run-x.log*'):
+                    p.unlink()
+                prefix = padding + error
+                self.local(prefix, stdout=len(padding))
+                self.recover(b'out1\n' + b'x' * 40000 + b'\nrecovered stdout tail\n')
+                result = self.invoke(wait=True)
+                self.assertEqual(result[0], 7)
+                self.assertIn(error.decode(), result[1])
+                self.assertIn('recovered stdout tail\n', result[1])
+                self.assertLess(len(result[1]), 33500)
+                self.assertNotIn(error.decode(), self.invoke(wait=True)[1])
+
+    def test_readers_survive_snapshot_and_view_write_failures(self):
+        real_temp = misc.tempfile.NamedTemporaryFile
+        error = b'actual failure already received\n'
+        for stage in ('received', 'view'):
+            for errno in (13, 28):
+                for reader in ('logs', 'follow', 'wait'):
+                    with self.subTest(stage=stage, errno=errno, reader=reader):
+                        for p in self.path.parent.glob('run-x.log*'):
+                            p.unlink()
+                        self.local(b'out1\n')
+                        self.recover()
+                        self.local(b'out1\n'+error)
+                        def temp(*args, **kw):
+                            if '.' + stage + '.' in kw.get('prefix', ''):
+                                raise OSError(errno, 'write unavailable')
+                            return real_temp(*args, **kw)
+                        with patch.object(misc.tempfile, 'NamedTemporaryFile', side_effect=temp):
+                            result = self.invoke(wait=reader=='wait', follow=reader=='follow')
+                            self.assertIn(error.decode(), result[1])
+                            self.assertEqual(result[0], 7 if reader=='wait' else 0)
+                            self.assertIn(error, misc._raw_log(self.path).read_bytes())
+                            self.assertIn(error, misc._shown_log(self.path).read_bytes())
+                        self.assertNotIn(error.decode(), self.invoke(wait=True)[1])
+                        # Losing the view again must also preserve delivery from the rendered file.
+                        view = misc._shown_log(self.path)
+                        view.unlink()
+                        with patch.object(misc.tempfile, 'NamedTemporaryFile', side_effect=OSError(errno, 'write unavailable')):
+                            repeated = self.invoke(wait=True)[1]
+                        self.assertNotIn(error.decode(), repeated)
+                        self.assertNotIn('out2', repeated)
+
+    def test_first_recovery_reports_missing_stderr_despite_write_failures(self):
+        real_temp = misc.tempfile.NamedTemporaryFile
+        for stage in ('received', 'view'):
+            for errno in (13, 28):
+                for stderr in (False, True):
+                    with self.subTest(stage=stage, errno=errno, stderr=stderr):
+                        for p in self.path.parent.glob('run-x.log*'):
+                            p.unlink()
+                        prefix = b'out1\n' + (b'actual failure already received\n' if stderr else b'')
+                        self.local(prefix)
+                        def temp(*args, **kw):
+                            if '.' + stage + '.' in kw.get('prefix', ''):
+                                raise OSError(errno, 'write unavailable')
+                            return real_temp(*args, **kw)
+                        with patch.object(misc.tempfile, 'NamedTemporaryFile', side_effect=temp), \
+                                patch.object(misc.toollog, 'emit') as emit:
+                            self.assertIn('incomplete:', self.recover())
+                        events = [c for c in emit.call_args_list if c.args[:2] == ('run', 'run.log_stream_missing')]
+                        self.assertEqual(len(events), 1)
+                        self.assertEqual(events[0].kwargs['ids'], {'run': 'run-x'})
+                        self.assertEqual(events[0].kwargs['props']['stream'], 'stderr')
+                        self.assertEqual(events[0].kwargs['props']['backend'], 'boat')
+                        self.assertEqual(events[0].kwargs['props']['reason'], 'history_unavailable')
+
+    def test_same_read_render_recovery_keeps_known_exit_and_reason(self):
+        real_temp = misc.tempfile.NamedTemporaryFile
+        for stage in ('received', 'view'):
+            for errno in (13, 28):
+                for cached in (False, True):
+                    with self.subTest(stage=stage, errno=errno, cached=cached):
+                        for p in self.path.parent.glob('run-x.log*'):
+                            p.unlink()
+                        if cached:
+                            self.con.execute("UPDATE runs SET exit_code=0 WHERE run_id='run-x'")
+                            self.con.commit()
+                            self.local(b'out1\n')
+                            self.recover()
+                        self.con.execute("UPDATE runs SET exit_code=7 WHERE run_id='run-x'")
+                        self.con.commit()
+                        self.local(b'out1\nactual failure already received\n')
+                        failed = []
+                        def temp(*args, **kw):
+                            if '.' + stage + '.' in kw.get('prefix', '') and not failed:
+                                failed.append(True)
+                                raise OSError(errno, 'transient write unavailable')
+                            return real_temp(*args, **kw)
+                        with patch.object(misc.tempfile, 'NamedTemporaryFile', side_effect=temp):
+                            self.assertIn('incomplete:', self.recover())
+                            # This selector does not perform another history fetch or refresh the result metadata.
+                            shown = misc._shown_log(self.path).read_text()
+                        self.assertEqual(failed, [True])
+                        self.assertIn('remote exit 7', shown)
+                        self.assertNotIn('remote exit unknown', shown)
+                        self.assertIn('history unavailable', shown)
+                        saved = common.read_json(Path(str(self.path) + '.remote.json'), {})
+                        self.assertEqual(saved['exit_code'], 7)
+                        self.assertEqual(saved['reason'], 'history unavailable')
+
+    def test_cached_view_retries_stale_footer_without_new_payload(self):
+        real_temp = misc.tempfile.NamedTemporaryFile
+        for initial_exit in (None, 0):
+            for received in (False, True):
+                for errno in (13, 28):
+                    for reader in ('selector', 'catch_up'):
+                        with self.subTest(initial_exit=initial_exit, received=received, errno=errno, reader=reader):
+                            for p in self.path.parent.glob('run-x.log*'):
+                                p.unlink()
+                            self.con.execute("UPDATE runs SET exit_code=? WHERE run_id='run-x'", (initial_exit,))
+                            self.con.commit()
+                            self.local(b'out1\nactual failure already received\n' if received else b'', stdout=5 if received else 0)
+                            self.recover()
+                            raw, view = misc._raw_log(self.path), misc._shown_log(self.path)
+                            identity = raw.stat()
+                            old_view = view.read_bytes()
+                            with contextlib.redirect_stdout(io.StringIO()):
+                                misc._tail(view, 0, True)
+                            self.con.execute("UPDATE runs SET exit_code=7 WHERE run_id='run-x'")
+                            self.con.commit()
+                            def temp(*args, **kw):
+                                if '.view.' in kw.get('prefix', ''):
+                                    raise OSError(errno, 'transient render failure')
+                                return real_temp(*args, **kw)
+                            with patch.object(misc.tempfile, 'NamedTemporaryFile', side_effect=temp):
+                                self.assertIn('view unavailable', misc._remote_result(self.row(), self.path, 'incomplete:timeout'))
+                                self.assertEqual(view.read_bytes(), old_view)
+                            if reader == 'catch_up':
+                                misc._catch_up_log(self.row())
+                            shown = misc._shown_log(self.path)
+                            self.assertEqual(shown, view)
+                            self.assertEqual(misc._raw_log(self.path), raw)
+                            self.assertEqual(raw.stat().st_ino, identity.st_ino)
+                            self.assertEqual(raw.stat().st_mtime_ns, identity.st_mtime_ns)
+                            content = shown.read_text()
+                            self.assertIn('remote exit 7', content)
+                            self.assertNotIn('remote exit unknown', content)
+                            self.assertIn('timeout' if reader == 'selector' else 'history unavailable', content)
+                            repeat = self.invoke(wait=True)[1]
+                            self.assertNotIn('actual failure already received', repeat)
+                            self.assertNotIn('out2', repeat)
+
+    def test_late_complete_history_retires_the_combined_evidence(self):
+        error = b'actual failure already received\n'
+        self.local(b'out1\n'+error)
+        self.recover()
+        def history(box, cmd, which, offset, **kw):
+            data = b'out1\nout2\n' if which == 'stdout' else error
+            return dict(data=data[offset:].decode(), nextOffset=len(data), size=len(data), done=True)
+        self.history.side_effect = history
+        result = self.invoke()
+        self.assertIn('out2\n', result[1])
+        self.assertIn(error.decode(), result[1])
+        self.assertNotIn('incomplete', result[2])
+        self.assertEqual(misc._shown_log(self.path), self.path)
+        self.assertEqual(misc._raw_log(self.path), self.path)
+        self.assertEqual(common.checkpoint(self.path)['stderrOffset'], len(error))
+
+
 class PartialHistoryReviewTests(_BackgroundOutputFixture):
     def setUp(self):
         super().setUp()
@@ -986,7 +1254,8 @@ class PartialHistoryReviewTests(_BackgroundOutputFixture):
                             return subprocess.CompletedProcess(argv, 0, stderr=source)
                         with patch.object(misc.subprocess, 'run', side_effect=copy):
                             self.assertIn('box copy', misc._catch_up_log(self.row()))
-                        self.assertEqual(common.delivered_bytes(misc._shown_log(self.path)), 0)
+                        shown = misc._shown_log(self.path)
+                        self.assertEqual(common.delivered_bytes(shown), 0 if verified else len(prefix))
                         def history(box, cmd, which, offset, **kw):
                             data = stdout if which == 'stdout' else stderr
                             nxt = min(len(data), offset + (3 if reader == 'late-reader' else len(data)))
