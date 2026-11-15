@@ -1630,8 +1630,117 @@ it.effect(
     }),
 );
 
+it.effect.each(["update", "refresh"] as const)(
+  "a blocked session %s does not stall another session's update or turn acceptance",
+  (blockedWrite) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const hook = yield* Ref.make<SessionWriteHook>(() => Effect.void);
+      const paused = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      yield* Effect.gen(function* () {
+        const f = yield* makeSessionAudienceFixture(state);
+        const otherThread = ThreadId.make("unblocked-session");
+        yield* f.eventSink.write({
+          events: [
+            yield* makeThreadCreatedEvent({
+              idAllocator: f.idAllocator,
+              threadId: otherThread,
+              now: f.now,
+            }),
+          ],
+        });
+        const otherSessionId = yield* f.idAllocator.allocate.providerSession({
+          threadId: otherThread,
+          providerInstanceId: modelSelection.instanceId,
+        });
+        const other = yield* f.manager.open({
+          threadId: otherThread,
+          providerSessionId: otherSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        yield* observeSessionUpdates(f.manager, otherThread);
+        yield* Ref.set(hook, (input) =>
+          input.events.some(
+            (event) =>
+              event.type === "provider-session.updated" && event.payload.id === f.providerSessionId,
+          )
+            ? Ref.set(hook, () => Effect.void).pipe(
+                Effect.andThen(Deferred.succeed(paused, undefined)),
+                Effect.andThen(Deferred.await(release)),
+              )
+            : Effect.void,
+        );
+        const blocked = yield* (
+          blockedWrite === "update"
+            ? f.emit({ ...f.runtime.providerSession, status: "running" })
+            : f.manager.refreshThreadSessionUpdates(f.threadIds[0]!)
+        ).pipe(Effect.forkScoped);
+        yield* Deferred.await(paused);
+        const unblocked = yield* Effect.gen(function* () {
+          const subscription = yield* Effect.acquireRelease(
+            other.subscribeEvents!,
+            (sub) => sub.close,
+          );
+          const queue = (yield* Ref.get(state)).eventQueues.get(String(otherSessionId))!;
+          const running = { ...other.providerSession, status: "running" as const };
+          const runId = f.idAllocator.derive.run({ threadId: otherThread, ordinal: 1 });
+          const accepted = {
+            type: "provider_turn.updated",
+            driver: other.driver,
+            threadId: otherThread,
+            providerTurn: {
+              id: f.idAllocator.derive.providerTurn({
+                driver: other.driver,
+                nativeTurnId: "accepted",
+              }),
+              providerThreadId: f.providerThreadOf(otherThread).id,
+              nodeId: f.idAllocator.derive.rootNode({ runId }),
+              runAttemptId: f.idAllocator.derive.runAttempt({ runId, attemptOrdinal: 1 }),
+              nativeTurnRef: null,
+              ordinal: 1,
+              status: "running",
+              startedAt: f.now,
+              completedAt: null,
+            },
+          } satisfies ProviderAdapter.ProviderAdapterV2Event;
+          const update = {
+            type: "provider_session.updated",
+            driver: other.driver,
+            providerSession: running,
+          } satisfies ProviderAdapter.ProviderAdapterV2Event;
+          const before = yield* f.eventStore.latestSequence();
+          yield* Queue.offer(queue, update);
+          yield* Queue.offer(queue, accepted);
+          assert.deepEqual(yield* subscription.events.pipe(Stream.take(2), Stream.runCollect), [
+            update,
+            accepted,
+          ]);
+          assertSessionRecipients(yield* f.updatesSince(before), [otherThread], running);
+          assert.isFalse(yield* Deferred.isDone(release));
+          yield* observeSessionUpdates(f.manager, otherThread);
+          yield* f.manager.refreshThreadSessionUpdates(otherThread);
+        }).pipe(Effect.forkScoped);
+        yield* Fiber.join(unblocked).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+        yield* Fiber.join(blocked);
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(release, undefined)),
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 60_000,
+            driver: OPENCODE_DRIVER,
+            sessionUpdateFanout: "interested_threads",
+            sessionWriteHook: hook,
+          }),
+        ),
+      );
+    }),
+);
+
 it.effect(
-  "audience selection holds its lock through commit while new attachments survive the persisted-session update",
+  "late observers wait for their session fan-out before snapshots and refreshes while new attachments survive bookkeeping",
   () =>
     Effect.gen(function* () {
       const state = yield* Ref.make(emptyState);
@@ -1724,7 +1833,7 @@ it.effect(
 );
 
 it.effect(
-  "failed pump writes release the audience lock without advancing the successful comparison baseline",
+  "failed pump writes release the session lock without advancing the successful comparison baseline",
   () =>
     Effect.gen(function* () {
       const state = yield* Ref.make(emptyState);
@@ -1762,7 +1871,7 @@ it.effect(
 );
 
 it.effect.each(["failure", "interruption"] as const)(
-  "a refresh %s releases the audience lock for subsequent leases and status writes",
+  "a refresh %s releases the session lock for subsequent leases and status writes",
   (outcome) =>
     Effect.gen(function* () {
       const state = yield* Ref.make(emptyState);
@@ -1890,7 +1999,7 @@ it.effect("a blocked session status write does not hold another session's native
 );
 
 it.effect(
-  "interrupting a pump write releases the audience permit for a different live session",
+  "interrupting a pump write releases the session permit for a different live session",
   () =>
     Effect.gen(function* () {
       const state = yield* Ref.make(emptyState);

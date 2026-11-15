@@ -107,7 +107,7 @@ def check(box: str, run: str, *, claim: bool = True, timeout: float = SSH_TIMEOU
     return Result('started', pid=wrapper_pid)
 
 
-def settle(con, row, result: Result, reason: str, *, until: float | None = None) -> None:
+def settle(con, row, result: Result, reason: str, *, until: float | None = None, foreign: bool = False) -> None:
     """End the row, retaining a separate reservation whenever execution is still possible."""
     rid, box = row['run_id'], row['box_id']
     code = result.code
@@ -115,7 +115,7 @@ def settle(con, row, result: Result, reason: str, *, until: float | None = None)
         from .runs import do_pulls
         pulls = json.loads(row['pulls'] or '[]')
         if pulls:
-            do_pulls(box, dict(row), pulls, until=until)
+            do_pulls(box, dict(row), pulls, until=until, foreign=foreign)
         from .runs import settled_steps_code
         code = settled_steps_code(row, code, locked=True, until=until)
     from .runs import claim_terminal_log, emit_terminal, save_run_state, state_warning, terminal_result

@@ -311,6 +311,10 @@ export const layer: Layer.Layer<
         });
 
         const scan = Effect.gen(function* () {
+          // Retain tombstones so an exporter resuming an older cursor can
+          // still distinguish compaction from an unexplained loss of events.
+          yield* sql`CREATE TABLE IF NOT EXISTS ardud_history_compacted_events (
+            revision INTEGER PRIMARY KEY AUTOINCREMENT, sequence INTEGER NOT NULL UNIQUE)`;
           const started = yield* Clock.monotonicTimeNanos;
           const withinBudget = Clock.monotonicTimeNanos.pipe(
             Effect.map((now) => Number(now - started) / 1_000_000 < maxDurationMs),
@@ -499,7 +503,19 @@ export const layer: Layer.Layer<
             for (const candidate of obsolete) {
               if (!(yield* withinBudget)) break;
               if (candidate.payloadBytes > maxDeletePayloadBytes) continue;
-              yield* sql`DELETE FROM orchestration_events WHERE sequence IN ${sql.in([candidate.sequence])}`;
+              // Replica catch-up must distinguish intentional holes from lost history.
+              // The tombstone and delete commit together, including on interruption.
+              const removed = yield* sql.withTransaction(
+                Effect.gen(function* () {
+                  const rows = yield* sql<{
+                    readonly sequence: number;
+                  }>`DELETE FROM orchestration_events WHERE sequence IN ${sql.in([candidate.sequence])} RETURNING sequence`;
+                  for (const row of rows)
+                    yield* sql`INSERT INTO ardud_history_compacted_events(sequence) VALUES (${row.sequence})`;
+                  return rows.length;
+                }),
+              );
+              if (!removed) continue;
               deletedEventCount++;
               if (candidate.textPayloadBytes !== null) {
                 deletedTextEventCount++;

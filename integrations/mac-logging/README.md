@@ -212,8 +212,8 @@ through `/bin/zsh` for launchd file access. One `/bin/ps` inventory reads PID,
 parent, cumulative CPU time, RSS, state, start time and elapsed time with a
 30-second timeout. It never invokes top or changes another process.
 
-`state/cpu.json` retains only PID, start time and cumulative CPU seconds, plus
-the Unix observation time, under its own nonblocking lock. CPU seconds
+`state/cpu.json` retains PID, start time, cumulative CPU seconds, host CPU ticks,
+the daily spike counter and Unix observation time under its own nonblocking lock. CPU seconds
 and percentages compare successful inventories; 100% is one full core.
 New/reused PIDs and counter resets start at zero. Disappeared processes are
 dropped; their final CPU usage is unknown, so totals cover surviving processes.
@@ -233,19 +233,29 @@ are grouped. Only node/bun/python PIDs in that top 20 get a separate batched
 argv read with a five-second timeout and a start-time recheck. Hint failure
 sets `hintError` without losing numeric CPU evidence.
 
-Hints use the janitor's reviewed #45 `leftover_processes.redact` helper,
+`cpu.spike` captures up to 15 PIDs with parent families and redacted 160-character commands when load1 > 2× logical CPUs, plus host/unattributed CPU, observed spawn families and runnable thread counts; it is capped at 240 records/day and 8192 bytes/record, and is conditional rather than a cadence job.
+
+Host tick deltas add `systemCpuPct`, `userPct`, `sysPct` and
+`unattributedCpuPct` on the same one-core=100% scale; a failed read sets
+`systemCpuError` without losing the sample. The first valid read is a baseline.
+`spawned`/`exited` compare PID + start time, and `spawnedFamilies` counts only
+new processes still visible at the next inventory. `pidAdvance` is omitted:
+long-lived high PIDs hid a real 200-process burst after allocator wrap on this Mac.
+The optional thread read has a two-second timeout.
+
+Hints and spike commands use the janitor's reviewed #45 `leftover_processes.redact` helper,
 loaded from the sibling source tree or the installed
 `~/.config/opencode/skills/dev-resource-janitor/scripts/` directory (including
-its `active_sessions.py` dependency). No janitor scan runs. Inline programs
-are omitted. Paths reduce to a basename, or the first directory after
+its `active_sessions.py` dependency). No janitor scan runs. Hints omit inline
+programs and reduce paths to a basename, or the first directory after
 `ExternalSSD/` or `.local/share/` plus basename; intervening directories use
-`…`. Raw argv and paths never enter sampler state or logs. If the helper is
+`…`. Spike commands replace home prefixes with `~`; argv never enters sampler state. If the helper is
 missing, labels are omitted and the CPU measurements remain available.
 
-The logger bounds labels and lists and caps each encoded CPU line at 8192
+The logger bounds labels and lists and caps samples at 7000 bytes and spikes at 8192
 bytes, dropping lowest-ranked detail rows if necessary (`topOmitted` and
-`familiesOmitted`). At 1440 scheduled runs/day the maximum is 11.8 MB/day,
-so the minute cadence does not need a low-load fallback. The existing shared
+`familiesOmitted`). At 1440 scheduled runs and 240 spikes/day, CPU records
+use at most 12.1 MB/day. The existing shared
 day-log cap and retention still apply. The installer copies the new helpers
 and plist; the evaluator must load `com.abdullah.mac-cpu` after review.
 

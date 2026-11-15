@@ -50,7 +50,10 @@ import * as SavedWrite from "../ardud/kanban/engine/savedWrite.ts";
 import * as McpHttpServer from "./McpHttpServer.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpToolAccess from "./McpToolAccess.ts";
-import { PullRequestWatchTimeoutError } from "./toolkits/pullRequests/tools.ts";
+import {
+  PullRequestToolTimeoutError,
+  PullRequestWatchTimeoutError,
+} from "./toolkits/pullRequests/tools.ts";
 import * as Testkit from "./McpToolAccess.testkit.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
@@ -96,6 +99,7 @@ const client = McpSchema.McpServerClient.of({
 const ProbeFailure = Schema.Union([
   OrchestratorMcpFailure,
   PullRequestWatchTimeoutError,
+  PullRequestToolTimeoutError,
   KanbanError,
   PreviewAutomationError,
   McpCapabilityUnavailableError,
@@ -655,6 +659,18 @@ const boot = {
   cause: new Error("private error"),
 };
 const typedFailures = [
+  ...(
+    [
+      "link_pull_request",
+      "unlink_pull_request",
+      "list_thread_pull_requests",
+      "write_pull_request_guides",
+      "read_pull_request_guide",
+    ] as const
+  ).map((tool) => ({
+    error: new PullRequestToolTimeoutError({ tool, saved: "unknown" }),
+    outcome: "timeout",
+  })),
   { error: new PullRequestWatchTimeoutError({ saved: "unknown" }), outcome: "timeout" },
   { error: new PreviewAutomationTimeoutError(browserRequest), outcome: "timeout" },
   {
@@ -747,7 +763,7 @@ const outcomeCases = [
     input: args,
   })),
   ...typedFailures.map(({ error, outcome }) => ({
-    name: `typed-${error._tag}-${"reason" in error ? error.reason : ""}`,
+    name: `typed-${error._tag}-${"reason" in error ? error.reason : "tool" in error ? error.tool : ""}`,
     handle: Effect.fail(error),
     expected: { outcome, errorTag: outcome === "error" ? "Failure" : error._tag },
     input: args,

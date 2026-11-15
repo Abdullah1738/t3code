@@ -3621,6 +3621,13 @@ describe("OrchestratorMcpService provider resolution", () => {
     { mode: "async", legacy: false, recoveryTimeout: true },
     { mode: "async", legacy: true, recoveryTimeout: true },
     { mode: "async", legacy: false, dispatchTimeout: "before commit", expireCreate: true },
+    {
+      mode: "async",
+      legacy: false,
+      dispatchTimeout: "before commit",
+      expireCreate: true,
+      failCreate: true,
+    },
     { mode: "async", legacy: false, dispatchTimeout: "before commit" },
     { mode: "async", legacy: false, dispatchTimeout: "after commit" },
     { mode: "async", legacy: false, dispatchTimeout: "before commit", worktree: true },
@@ -3678,7 +3685,7 @@ describe("OrchestratorMcpService provider resolution", () => {
     },
     { mode: "wait", legacy: true, dispatchTimeout: "before commit", noRetry: true },
   ] as const)(
-    "replays the same delegation across any namespace rebind ($mode, legacy=$legacy, stillRunning=$stillRunning, recoveryTimeout=$recoveryTimeout, dispatchTimeout=$dispatchTimeout, concurrentRetry=$concurrentRetry, worktree=$worktree, noRetry=$noRetry, finishBeforeRelease=$finishBeforeRelease)",
+    "replays the same delegation across any namespace rebind ($mode, legacy=$legacy, stillRunning=$stillRunning, recoveryTimeout=$recoveryTimeout, dispatchTimeout=$dispatchTimeout, concurrentRetry=$concurrentRetry, worktree=$worktree, noRetry=$noRetry, finishBeforeRelease=$finishBeforeRelease, expireCreate=$expireCreate, failCreate=$failCreate)",
     (testCase) => {
       const { mode, legacy } = testCase;
       const stillRunning = "stillRunning" in testCase;
@@ -3733,6 +3740,12 @@ describe("OrchestratorMcpService provider resolution", () => {
                       Effect.andThen(Deferred.await(dispatchRelease)),
                     );
                     if (dispatchTimeout === "before commit") yield* hold;
+                    if ("failCreate" in testCase)
+                      return yield* new Orchestrator.OrchestratorDispatchError({
+                        commandId: command.commandId,
+                        commandType: command.type,
+                        cause: "create failed before commit",
+                      });
                     const result = yield* real.dispatch(command);
                     if (dispatchTimeout === "after commit") yield* hold;
                     return result;
@@ -3951,7 +3964,8 @@ describe("OrchestratorMcpService provider resolution", () => {
                   (yield* orchestrator.getThreadProjection(parentThreadId)).subagents,
                   0,
                 );
-                yield* TestClock.adjust("110 seconds");
+                if ("failCreate" in testCase) yield* Deferred.succeed(dispatchRelease, undefined);
+                else yield* TestClock.adjust("110 seconds");
                 yield* Deferred.await(dispatchFinished);
                 assert.isTrue(Option.isNone(yield* threads.getCommandReceipt(commandId)));
                 assert.lengthOf(
@@ -3965,7 +3979,14 @@ describe("OrchestratorMcpService provider resolution", () => {
                   const missing = yield* read.pipe(Effect.flip);
                   assert.include(
                     missing.message,
-                    "This delegation was never saved. Retry delegate_task with the same clientRequestId.",
+                    "failCreate" in testCase
+                      ? "This delegation was not created: the create stopped after 10 s waiting at dispatch/threadManagement.dispatch (failure: OrchestratorDispatchError:"
+                      : "This delegation was not created: the create stopped after 120 s waiting at dispatch/threadManagement.dispatch (interrupt). Nothing ran. Retry delegate_task with the same clientRequestId.",
+                  );
+                  assert.notInclude(missing.message, "still being created");
+                  assert.include(
+                    missing.message,
+                    "Nothing ran. Retry delegate_task with the same clientRequestId.",
                   );
                 }
               }
@@ -4026,6 +4047,14 @@ describe("OrchestratorMcpService provider resolution", () => {
             }
             const first = yield* Fiber.join(firstCall);
             if (timeoutTaskId !== undefined) assert.equal(first.taskId, timeoutTaskId);
+            if ("expireCreate" in testCase) {
+              const recovered = yield* service.taskStatus(scope, first.taskId);
+              assert.equal(recovered.taskId, first.taskId);
+              assert.lengthOf(
+                (yield* orchestrator.getThreadProjection(parentThreadId)).subagents,
+                1,
+              );
+            }
             assert.equal(first.waitTimedOut, mode === "wait");
             if ("parentRestart" in testCase) {
               const parent = yield* orchestrator.getThreadProjection(parentThreadId);

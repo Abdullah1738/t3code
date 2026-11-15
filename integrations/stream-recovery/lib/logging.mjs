@@ -1,5 +1,14 @@
 const { emit, observed } = await import('../../router-logging/toollog.mjs').catch(() => ({ emit: () => {}, observed: (_c, _n, work) => work() }));
 export { emit, observed };
+
+export function deferThread(io, threadId, error) {
+  if (error?.code !== 'REPLICA_BEHIND_THREAD') return false;
+  io.recordThreadDeferral?.(threadId, error);
+  emit('stream-recovery', 'thread.deferred', { ids:{thread:threadId},
+    props:{replicaGeneration:error.replicaGeneration,replicaAgeMs:error.replicaAgeMs,threadAheadMs:error.threadAheadMs},
+    error:{tag:error.code,message:error.message} });
+  return true;
+}
 const phases = new Set(['acquireLock', 'loadState', 'saveState', 'openDb', 'serverRuntime', 'openCodeRuntime',
   'failedRunsSince', 'failedSubagentsSince', 'cancelledSubagentsSince', 'cancelledDelegatedTasksSince',
   'childRunOutcomeSince', 'delegatedStoppedSince', 'childNativeSession', 'restartRunsSince', 'stoppedSince',
@@ -11,6 +20,16 @@ const phases = new Set(['acquireLock', 'loadState', 'saveState', 'openDb', 'serv
 
 export async function timedScan(name, io, work) {
   const totals = new Map(), timed = { ...io };
+  const deferred = new Set();
+  const props = { deferredThreads:0, maxThreadAheadMs:'unknown' };
+  timed.recordThreadDeferral = (threadId, error) => {
+    deferred.add(threadId);
+    props.deferredThreads = deferred.size;
+    if (Number.isFinite(error.threadAheadMs)) props.maxThreadAheadMs =
+      Number.isFinite(props.maxThreadAheadMs) ? Math.max(props.maxThreadAheadMs, error.threadAheadMs) : error.threadAheadMs;
+    // Nested restart scans also contribute to the enclosing stream scan.
+    io.recordThreadDeferral?.(threadId, error);
+  };
   for (const key of phases) {
     if (typeof io[key] !== 'function') continue;
     timed[key] = (...args) => {
@@ -30,7 +49,7 @@ export async function timedScan(name, io, work) {
       } catch (error) { finish(true); throw error; }
     };
   }
-  try { return await observed('stream-recovery', `${name}.scan`, () => work(timed)); }
+  try { return await observed('stream-recovery', `${name}.scan`, () => work(timed), {props}); }
   finally {
     // Aggregate repeated calls and cap output, including on failed scans. No
     // SQL, call arguments or server responses are retained by the timer.

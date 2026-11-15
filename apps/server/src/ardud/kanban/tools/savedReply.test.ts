@@ -1,6 +1,6 @@
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { ThreadId } from "@t3tools/contracts";
+import { AnalyticsEvent, ThreadId } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
@@ -20,10 +20,11 @@ import { McpSchema } from "effect/ai";
 import * as BoardLocks from "../engine/boardLocks.ts";
 import * as SavedWrite from "../engine/savedWrite.ts";
 import * as SavedReply from "./savedReply.ts";
-import { McpCall } from "../../analytics/McpCall.ts";
+import { McpCall, callOutcome } from "../../analytics/McpCall.ts";
 
 const reply = new McpSchema.CallToolResult({ content: [] });
 const callResult = Schema.decodeUnknownSync(McpSchema.CallToolResult);
+const ledgerEvent = Schema.decodeUnknownSync(AnalyticsEvent);
 const replyData = Schema.decodeUnknownSync(
   Schema.Struct({
     saved: Schema.NullOr(Schema.Boolean),
@@ -554,5 +555,265 @@ it.effect("a masked write finishes cancellation before the timeout reply", () =>
       assert.isTrue(result.isError);
       assert.isNull(data.saved);
     }
+  }),
+);
+
+// Named operation spans already surround the waits; diagnostics partition nested
+// time instead of reporting the same hold once for every ancestor.
+it.effect.each(["complete", "timeout", "fail", "fast"] as const)(
+  "%s saved write attributes its board hold to the awaited sub-step",
+  (ending) =>
+    Effect.gen(function* () {
+      const { spans, tracer } = captureTrace();
+      const warnings: unknown[] = [];
+      const logger = Logger.make(({ message }) => warnings.push(message));
+      const callState: McpCall["Service"] = {
+        callerResolved: true,
+        callerResolveMs: 0,
+        readerLane: "foreground",
+        phase: "handler",
+        saved: false,
+      };
+      const entered = yield* Deferred.make<void>();
+      const finish = yield* Deferred.make<void>();
+      const locks = yield* BoardLocks.make();
+      const wait = Effect.fn("KanbanService.awaitQueue")(function* () {
+        yield* Deferred.succeed(entered, undefined);
+        yield* Deferred.await(finish).pipe(Effect.withSpan("sql.transaction"));
+        if (ending === "fail") return yield* Effect.fail("unavailable");
+      });
+      const pending = yield* Effect.forkChild(
+        SavedReply.protect(
+          SavedWrite.mutating(
+            SavedWrite.subSteps(
+              "card.move",
+              locks.board(
+                "a",
+                wait().pipe(Effect.withSpan("KanbanService.prepareTransition"), Effect.as(reply)),
+              ),
+            ),
+          ),
+          "card_move",
+        ).pipe(
+          Effect.provideService(BoardLocks.operationName, "card.move"),
+          Effect.exit,
+          Effect.withTracer(tracer),
+          Effect.provideService(McpCall, callState),
+          Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+        ),
+      );
+      yield* Deferred.await(entered);
+      const ms = ending === "timeout" ? 25_000 : ending === "fast" ? 4_999 : 5_000;
+      yield* TestClock.adjust(ms);
+      if (ending !== "timeout") yield* Deferred.succeed(finish, undefined);
+      const result = yield* Fiber.join(pending);
+      const holds = warnings.filter((message) =>
+        String(message).includes('"event":"kanban board lock long hold"'),
+      );
+      if (ending === "fast") {
+        assert.lengthOf(holds, 0);
+        assert.isUndefined(callState.replySubSteps);
+      } else {
+        const steps = [{ subStep: "KanbanService.awaitQueue", ms }];
+        assert.lengthOf(holds, 1);
+        assert.deepInclude(JSON.parse(String(holds[0])), {
+          event: "kanban board lock long hold",
+          "board.observed_at_ms": ms,
+          "board.id": "a",
+          "board.holder": "card.move",
+          "board.card_id": null,
+          "board.lock": "gate",
+          "board.mode": "exclusive",
+          "board.acquired_at_ms": 0,
+          "board.held_ms": ms,
+          "board.waiters": 0,
+          subSteps: steps,
+        });
+        assert.deepEqual(callState.replySubSteps, steps);
+        const ledger = ledgerEvent({
+          ts: "2026-11-15T08:10:15.231Z",
+          kind: "mcp.call",
+          surface: "server",
+          route: "mcp",
+          ...callOutcome(result, callState),
+        });
+        assert.deepEqual(ledger.props?.subSteps, steps);
+        assert.deepEqual(
+          spans
+            .find((span) => span.name === "KanbanTools.savedReply")!
+            .attributes.get("kanban.reply.sub_steps"),
+          steps,
+        );
+      }
+    }),
+);
+
+it.effect("saved-write sub-steps exclude waits after releasing the board permit", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const entered = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    const warnings: unknown[] = [];
+    const logger = Logger.make(({ message }) => warnings.push(message));
+    const pending = yield* Effect.forkChild(
+      SavedReply.protect(
+        SavedWrite.subSteps(
+          "card.move",
+          locks.board(
+            "a",
+            locks
+              .outside(
+                Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(resume))),
+                undefined,
+                true,
+              )
+              .pipe(Effect.as(reply)),
+          ),
+        ),
+        "card_move",
+      ).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false }))),
+    );
+    yield* Deferred.await(entered);
+    yield* TestClock.adjust(6_000);
+    yield* locks.board("a", Effect.void);
+    yield* Deferred.succeed(resume, undefined);
+    yield* Fiber.join(pending);
+    assert.isFalse(
+      warnings.some((message) => String(message).includes('"event":"kanban board lock long hold"')),
+    );
+  }),
+);
+
+it.effect("sub-step details keep only the three slowest steps and ignore detached work", () =>
+  Effect.gen(function* () {
+    const { spans, tracer } = captureTrace();
+    const locks = yield* BoardLocks.make();
+    const entered = yield* Effect.forEach([1, 2, 3, 4], () => Deferred.make<void>());
+    const resume = yield* Effect.forEach([1, 2, 3, 4], () => Deferred.make<void>());
+    const detached = yield* Deferred.make<void>();
+    const finishDetached = yield* Deferred.make<void>();
+    const scope = yield* Scope.Scope;
+    const pending = yield* Effect.forkChild(
+      SavedReply.protect(
+        SavedWrite.subSteps(
+          "card.move",
+          locks.board(
+            "a",
+            Effect.gen(function* () {
+              yield* Deferred.succeed(detached, undefined).pipe(
+                Effect.andThen(Deferred.await(finishDetached)),
+                Effect.withSpan("unrelated.background"),
+                SavedWrite.background,
+                Effect.forkIn(scope),
+              );
+              yield* Deferred.await(detached);
+              for (let index = 0; index < 4; index += 1) {
+                yield* Deferred.succeed(entered[index]!, undefined).pipe(
+                  Effect.andThen(Deferred.await(resume[index]!)),
+                  Effect.withSpan(`move.step${index}`),
+                );
+              }
+              return reply;
+            }),
+          ),
+        ),
+        "card_move",
+      ).pipe(Effect.withTracer(tracer)),
+    );
+    for (let index = 0; index < 4; index += 1) {
+      yield* Deferred.await(entered[index]!);
+      yield* TestClock.adjust((index + 1) * 1_000);
+      yield* Deferred.succeed(resume[index]!, undefined);
+    }
+    yield* Fiber.join(pending);
+    yield* Deferred.succeed(finishDetached, undefined);
+    assert.deepEqual(
+      spans
+        .find((span) => span.name === "KanbanTools.savedReply")!
+        .attributes.get("kanban.reply.sub_steps"),
+      [
+        { subStep: "move.step3", ms: 4_000 },
+        { subStep: "move.step2", ms: 3_000 },
+        { subStep: "move.step1", ms: 2_000 },
+      ],
+    );
+  }).pipe(Effect.scoped),
+);
+
+it.effect("parallel saved-write fibers attribute only their own board hold", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const warnings: unknown[] = [];
+    const logger = Logger.make(({ message }) => warnings.push(message));
+    const enteredA = yield* Deferred.make<void>();
+    const enteredB = yield* Deferred.make<void>();
+    const finish = yield* Deferred.make<void>();
+    const pending = yield* Effect.forkChild(
+      SavedWrite.subSteps(
+        "card.move",
+        Effect.all(
+          [
+            locks.board(
+              "a",
+              Deferred.succeed(enteredA, undefined).pipe(
+                Effect.andThen(Deferred.await(finish)),
+                Effect.withSpan("move.awaitA"),
+              ),
+            ),
+            locks.board(
+              "b",
+              Deferred.succeed(enteredB, undefined).pipe(
+                Effect.andThen(Deferred.await(finish)),
+                Effect.withSpan("move.awaitB"),
+              ),
+            ),
+          ],
+          { concurrency: "unbounded" },
+        ),
+      ).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false }))),
+    );
+    yield* Deferred.await(enteredA);
+    yield* Deferred.await(enteredB);
+    yield* TestClock.adjust(6_000);
+    yield* Deferred.succeed(finish, undefined);
+    yield* Fiber.join(pending);
+    const holds = warnings
+      .filter((message) => String(message).includes('"event":"kanban board lock long hold"'))
+      .map((message) => JSON.parse(String(message)) as Record<string, unknown>);
+    assert.lengthOf(holds, 2);
+    for (const board of ["a", "b"])
+      assert.deepEqual(holds.find((fields) => fields["board.id"] === board)!.subSteps, [
+        { subStep: `move.await${board.toUpperCase()}`, ms: 6_000 },
+      ]);
+  }),
+);
+
+it.effect("long-hold sub-step names stay within analytics metadata labels", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const entered = yield* Deferred.make<void>();
+    const finish = yield* Deferred.make<void>();
+    let steps: ReadonlyArray<SavedWrite.SubStep> | undefined;
+    const pending = yield* Effect.forkChild(
+      SavedWrite.subSteps(
+        "card.move",
+        locks.board(
+          "a",
+          Deferred.succeed(entered, undefined).pipe(
+            Effect.andThen(Deferred.await(finish)),
+            Effect.withSpan("private words"),
+          ),
+        ),
+      ).pipe(
+        Effect.provideService(SavedWrite.subStepReporter, (value) => {
+          steps = value;
+        }),
+      ),
+    );
+    yield* Deferred.await(entered);
+    yield* TestClock.adjust(5_000);
+    yield* Deferred.succeed(finish, undefined);
+    yield* Fiber.join(pending);
+    assert.deepEqual(steps, [{ subStep: "unknown", ms: 5_000 }]);
   }),
 );

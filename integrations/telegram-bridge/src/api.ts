@@ -122,16 +122,21 @@ export function createApi({ store, enabled, chatId, timezone, health }: Options)
               counters.lastFetchReason = board.lastFetchReason;
             }
             const count = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+            for (const key of ["threadReads", "threadReadErrors"]) if (count(board[key])) counters[key] = board[key];
             if (board.fetchesByReason && typeof board.fetchesByReason === "object" && !Array.isArray(board.fetchesByReason)) {
               counters.fetchesByReason = Object.fromEntries(Object.entries(board.fetchesByReason)
                 .filter(([key, value]) => ["cold", "age", "hard", "soft"].includes(key) && count(value)));
             }
+            if (board.threadReadsByReason && typeof board.threadReadsByReason === "object" && !Array.isArray(board.threadReadsByReason)) {
+              counters.threadReadsByReason = Object.fromEntries(Object.entries(board.threadReadsByReason)
+                .filter(([key, value]) => ["run", "state", "followup"].includes(key) && count(value)));
+            }
             if (board.dirtyEventsByType && typeof board.dirtyEventsByType === "object" && !Array.isArray(board.dirtyEventsByType)) {
-              const events: Record<string, { hard: number; soft: number }> = {};
+              const events: Record<string, { hard: number; soft: number; local?: number }> = {};
               let keys = 0;
               for (const [key, value] of Object.entries(board.dirtyEventsByType)) {
                 if (key.length > 161 || !BOARD_EVENT_KEY.test(key) || !value || typeof value !== "object" || Array.isArray(value)) continue;
-                const { hard, soft } = value as Record<string, unknown>;
+                const { hard, soft, local } = value as Record<string, unknown>;
                 if (!count(hard) || !count(soft)) continue;
                 const bucket = key !== "other" && keys < BOARD_EVENT_KEY_LIMIT ? key : "other";
                 if (bucket !== "other") keys++;
@@ -139,6 +144,7 @@ export function createApi({ store, enabled, chatId, timezone, health }: Options)
                 const entry = events[bucket]!;
                 entry.hard += hard;
                 entry.soft += soft;
+                if (count(local)) entry.local = (entry.local ?? 0) + local;
               }
               counters.dirtyEventsByType = events;
             }

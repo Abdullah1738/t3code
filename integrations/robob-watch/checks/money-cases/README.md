@@ -114,8 +114,12 @@ Owner-thread evidence comes from Robob's control API, using
 `~/.robob/ardud-control.json`. The server must supply message provenance
 (`automated` and `inboundMessageId`); an older server or a failed/timed-out
 lookup supplies no owner evidence and records a lookup error. There is no
-SQLite fallback. The per-check union-window fetch is capped at four seconds
-and the remaining check budget; `timing.owner_queries` counts HTTP requests.
+SQLite fallback. The per-check union-window fetch runs before receipt and order
+lookups in `follow()`, capped at ten seconds of the remaining check budget and
+three seconds per request. `timing.owner_queries` counts HTTP requests;
+`owner_result` reports complete coverage (`ok`), a partial refresh (`incomplete`),
+or a failed thread listing (`list_failed`). Partial refreshes save cache progress
+and supply no owner evidence.
 
 Inbox triage runs every card alert it sees through the same checks before its classifier, holds a fresh charge alert for five minutes in case its receipt comes with it, and sends every charge nothing explains on to the agent even when the classifier skips it. The SMS and the bank's mail copy of one charge are one question; two alerts of the same amount on the same channel are two. The check follows open questions each run, least recently checked first: it closes them when a receipt lands (and says so once if he was asked), routes expired waits to the daily list and retains asked questions as awaiting_answer without an age cutoff. Older linked money cases still accept receipt matches, closing a case nobody has touched when the receipt comes. Asked questions have no age cutoff. A receipt compatible with multiple distinct charge questions stays ambiguous; a historical receipt found later still counts when its timestamp uniquely matches the original charge window. Questions live in `questions.json` next to the cases. Runs outside the live watcher (`robob-watch test`, other `WATCH_DIR`s) work on a copy of the case, question and dead-card books in their own folder.
 

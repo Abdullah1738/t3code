@@ -459,17 +459,25 @@ export const layerWithOptions = (
       );
       const sessions = yield* Ref.make(new Map<string, LiveSessionEntry>());
       const sessionUpdateObservers = yield* Ref.make<ReadonlyMap<ThreadId, number>>(new Map());
-      const sessionUpdateAudienceLock = yield* Semaphore.make(1);
-      const sessionStatus = yield* KeyedLock.make<ProviderSessionId>();
+      // Register before audience selection, or wait for that session's in-flight
+      // fan-out before reading a snapshot. Refreshes share this per-session ordering.
+      const sessionUpdateLock = yield* KeyedLock.make<ProviderSessionId>();
       const observeThreadSessionUpdates = Effect.fn(
         "ProviderSessionManager.observeThreadSessionUpdates",
       )(function* (threadId: ThreadId) {
         yield* Effect.acquireRelease(
-          Ref.update(sessionUpdateObservers, (current) => {
-            const updated = new Map(current);
-            updated.set(threadId, (current.get(threadId) ?? 0) + 1);
-            return updated;
-          }).pipe(sessionUpdateAudienceLock.withPermits(1)),
+          Effect.gen(function* () {
+            yield* Ref.update(sessionUpdateObservers, (current) => {
+              const updated = new Map(current);
+              updated.set(threadId, (current.get(threadId) ?? 0) + 1);
+              return updated;
+            });
+            for (const entry of (yield* Ref.get(sessions)).values()) {
+              if (entry.attachedThreadIds.has(threadId)) {
+                yield* sessionUpdateLock.withLock(entry.runtime.providerSessionId, Effect.void);
+              }
+            }
+          }),
           () =>
             Ref.update(sessionUpdateObservers, (current) => {
               const updated = new Map(current);
@@ -477,7 +485,7 @@ export const layerWithOptions = (
               if (count <= 1) updated.delete(threadId);
               else updated.set(threadId, count - 1);
               return updated;
-            }).pipe(sessionUpdateAudienceLock.withPermits(1)),
+            }),
         );
       }, Effect.asVoid);
 
@@ -506,22 +514,27 @@ export const layerWithOptions = (
           );
           if (candidates.length === 0) return;
           const occurredAt = yield* DateTime.now;
-          const events = yield* Effect.forEach(candidates, (session) =>
-            Effect.gen(function* () {
-              return {
-                id: yield* idAllocator.allocate.event({ threadId, providerSessionId: session.id }),
-                type: "provider-session.updated",
-                threadId,
-                driver: session.driver,
-                providerInstanceId: session.providerInstanceId,
-                occurredAt,
-                payload: session,
-              } satisfies OrchestrationV2DomainEvent;
-            }),
+          yield* Effect.forEach(candidates, (session) =>
+            sessionUpdateLock.withLock(
+              session.id,
+              Effect.gen(function* () {
+                const event = {
+                  id: yield* idAllocator.allocate.event({
+                    threadId,
+                    providerSessionId: session.id,
+                  }),
+                  type: "provider-session.updated",
+                  threadId,
+                  driver: session.driver,
+                  providerInstanceId: session.providerInstanceId,
+                  occurredAt,
+                  payload: session,
+                } satisfies OrchestrationV2DomainEvent;
+                yield* eventSink.write({ events: [event], refreshBoundProviderSessions: true });
+              }),
+            ),
           );
-          yield* eventSink.write({ events, refreshBoundProviderSessions: true });
         },
-        sessionUpdateAudienceLock.withPermits(1),
         (effect, threadId) =>
           effect.pipe(
             Effect.mapError((cause) => new ProviderSessionRefreshError({ threadId, cause })),
@@ -2505,17 +2518,13 @@ export const layerWithOptions = (
           });
         },
         (effect, entry) => {
-          // Only an interested audience races viewer registration. Full fanout
-          // needs ordering across this session's generations, without holding
-          // unrelated native output behind every status write.
-          const interested = entry.runtime.sessionUpdateFanout === "interested_threads";
-          const locked = interested
-            ? sessionUpdateAudienceLock.withPermits(1)(effect)
-            : sessionStatus.withLock(entry.runtime.providerSessionId, effect);
+          const locked = sessionUpdateLock.withLock(entry.runtime.providerSessionId, effect);
           return Option.isSome(startProgress)
             ? startProgress.value.withSessionStep(
                 { providerSessionId: entry.runtime.providerSessionId },
-                interested ? "session_status_audience" : "session_status_write",
+                entry.runtime.sessionUpdateFanout === "interested_threads"
+                  ? "session_status_audience"
+                  : "session_status_write",
                 locked,
               )
             : locked;

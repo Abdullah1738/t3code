@@ -15,10 +15,10 @@ const messages = new Set(['Robob replica is stale; recovery deferred', 'Robob re
   'thread is newer than Robob replica; recovery deferred', 'unverified Robob replica',
   'The operation was aborted due to timeout', 'The operation was aborted']);
 const errorMessage = (value, tag) => messages.has(value) ? value.slice(0, 300) : tag;
-// Replica metadata is untrusted. Only numbers or an explicit unknown survive.
-const replicaProps = value => Object.fromEntries(['replicaGeneration', 'replicaAgeMs']
-  .filter(key => typeof value?.[key] === 'number' && Number.isFinite(value[key]) || value?.[key] === 'unknown')
-  .map(key => [key, value[key]]));
+// Replica metadata is untrusted. Invalid values become an explicit unknown.
+const replicaProps = value => Object.fromEntries(['replicaGeneration', 'replicaAgeMs', 'threadAheadMs', 'deferredThreads', 'maxThreadAheadMs']
+  .filter(key => value?.[key] !== undefined)
+  .map(key => [key, Number.isFinite(value[key]) ? value[key] : 'unknown']));
 function failure(value, result = false) {
   try {
     const tag = (result ? errorTag(value?.tag) : undefined) ?? errorTag(value?.code)
