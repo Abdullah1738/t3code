@@ -760,7 +760,7 @@ export class Router {
   private async foldTexts(turn: Turn | null | undefined, texts: string[], operationId: string, replyMode: ReplyMode): Promise<string[]> {
     try {
       const chat = this.options.context?.chat;
-      if (chat?.kind !== "owner" || chat.slug === "moni" || this.options.medsFold === false
+      if (chat?.kind !== "owner" || chat.slug === "moni" || typeof this.options.medsFold !== "object" || this.options.medsFold === null
         || process.env.SPECTRUM_MEDS_FOLD_ENABLED === "0") return texts;
       if (!turn || turn.background || turn.origin || !turn.inboundId || synthetic(turn.inboundId)
         || !["running", "submitting", "unknown"].includes(turn.phase) || !this.current(turn)) {
