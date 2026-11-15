@@ -797,7 +797,9 @@ def delete_box(con, box_id: str) -> None:
         raise Fail(409, "sandbox_pinned", f"{box_id} is pinned; unpin it first")
     for c in con.execute("SELECT pid FROM commands WHERE box_id=? AND status IN ('queued','running')", (box_id,)):
         kill_cmd(con, box_id, c["pid"], lost=True)
-    incus("delete", ct(box_id), "--force", timeout=300, check=False)
+    deleted = incus("delete", ct(box_id), "--force", timeout=300, check=False)
+    if deleted.returncode and not instance_missing(deleted):
+        raise Fail(500, 'incus_failed', 'Incus did not confirm instance deletion')
     con.execute("DELETE FROM snaps WHERE box_id=?", (box_id,))
     set_box(con, box_id, state="deleted", deleted_at=now())
     log(f"box {box_id} deleted")
@@ -1019,11 +1021,27 @@ def run_processes(box_id: str, pid: int) -> list[int] | None:
         return None
 
 
+def instance_missing(response) -> bool:
+    for value in (response.stdout, response.stderr):
+        text = value.decode(errors='replace').strip() if isinstance(value, bytes) else (value or '').strip()
+        if re.fullmatch(r'(?:Error: )?Instance not found', text, re.I):
+            return True
+        try:
+            data = json.loads(text)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(data, dict) and data.get('type') == 'error' and data.get('error_code') == 404:
+            return True
+    return False
+
+
 def command_probe(c) -> dict:
     """Inspect receipts without creating another exec session in the customer's box."""
     try:
         p = incus("query", f"/1.0/instances/{ct(c['box_id'])}/state", check=False, timeout=5)
         if p.returncode:
+            if instance_missing(p):
+                return {"readable": True, "pids": [], "box_rc": None, "stopped": True}
             return {"reason": "incus_unavailable"}
         state = json.loads(p.stdout)
         if not isinstance(state, dict):
@@ -1404,6 +1422,11 @@ def record_command_result(con, c, result, metrics, action, *, changes=None,
             return _kill_result_locked(con, latest, result if terminal_evidence else {}, cleanup,
                                        lost=lost, metrics=metrics)
         if terminal_result(prior) and not repair_legacy:
+            # A retry receipt is durable before its queued/attempt+1 DB transition. Replay that transition
+            # once on recovery; the current-attempt guard prevents replay after the next attempt exists.
+            if prior.get('status') == 'interrupted' and (prior.get('interruption') or {}).get('retry') is True and action in ('retry', 'following'):
+                _write_command_result(con, latest, result, metrics, changes)
+                return action
             if not terminal_result(result):
                 metrics = json.loads(latest['metrics'] or '{}')
                 metrics['host_boxes'] = prior.get('host_boxes')

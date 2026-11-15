@@ -53,6 +53,127 @@ class ExecLoss(Base):
         self.assertEqual(boatd.read_result(b,p,1)['reason'], 'before_spawn')
         self.assertFalse(self.f.spawned)
 
+    def test_retry_receipt_sql_gap_requeues_next_attempt_once(self):
+        for unavailable in (False,True):
+            with self.subTest(unavailable=unavailable):
+                self.retry_receipt_gap(unavailable)
+
+    def retry_receipt_gap(self,unavailable):
+        b=self.box(f'bx_retrygap{unavailable}');p=self.cmd(b,retry=1)
+        self.con.execute('UPDATE commands SET run_id=? WHERE box_id=? AND pid=?',('run-retrygap',b,p))
+        con=self.con
+        class InterruptedCommit:
+            def execute(self,sql,*args):
+                if sql.startswith('UPDATE commands SET status='):
+                    raise OSError('interrupted after retry receipt')
+                return con.execute(sql,*args)
+        c=self.status(b,p)
+        res=dict(attempt=1,interruption=boatd.interruption(c,'exec_stream_lost'))
+        with self.assertRaises(OSError):
+            boatd.settle_transport(InterruptedCommit(),c,res,view=self.clean(141))
+        self.assertTrue(boatd.read_result(b,p,1)['interruption']['retry'])
+        self.assertEqual((self.status(b,p)['status'],self.status(b,p)['attempt']),('running',1))
+        if unavailable:
+            with patch.object(boatd,'command_probe',return_value={'reason':'incus_unavailable'}):
+                for _ in range(2):
+                    self.assertEqual(boatd.settle_cmd(self.con,self.status(b,p)),'following')
+            self.assertEqual((self.status(b,p)['status'],self.status(b,p)['attempt']),('running',1))
+            self.assertEqual(boatd.held_runs(self.con,b),['run-retrygap'])
+            with self.assertRaises(boatd.Fail):
+                boatd.start_cmd(self.con,b,dict(command='true',detached=True))
+        previous=len(self.f.spawned)
+        with patch.object(boatd,'command_probe',return_value=self.clean(141)):
+            self.assertEqual(boatd.reconcile(self.con)['retry'],1)
+            boatd.reconcile(self.con)
+        self.assertEqual((self.status(b,p)['status'],self.status(b,p)['attempt']),('queued',2))
+        self.assertEqual(self.f.spawned[previous:],[(b,p,2)])
+
+    def test_ef55_settled_exit_one_with_live_group_is_held_until_killed_and_counted(self):
+        b,p=self.command(prior=True)
+        self.con.execute("UPDATE commands SET status='exited',exit_code=1,ended_at=? WHERE box_id=? AND pid=?",(boatd.now(),b,p))
+        (boatd.cmd_dir(b)/f'{p}.err').write_text('Error: Lost connection to the event listener: websocket: close 1006\n')
+        cg=self.tmp/'cg'
+        group=cg/'boatd'/str(p);group.mkdir(parents=True)
+        (group/'cgroup.procs').write_text('129844\n')
+        live=dict(readable=True,pids=[129844],box_rc=None,join_verified=True)
+        callbacks=[]
+        class CapturedThread:
+            def __init__(self, *, target, **kwargs): callbacks.append(target)
+            def start(self): pass
+        with patch.object(boatd,'command_probe',return_value=live):
+            self.assertEqual(boatd.reconcile(self.con)['following'],1)
+            self.assertEqual(boatd.held_runs(self.con,b),['run-fixture'])
+            with self.assertRaises(boatd.Fail):
+                boatd.start_cmd(self.con,b,dict(command='follow-up',detached=True))
+            with patch.object(boatd.threading,'Thread',CapturedThread),patch.object(boatd,'run_processes',return_value=[]):
+                self.assertEqual(boatd.kill_cmd(self.con,b,p)['cleanup'],'pending')
+            with self.assertRaises(boatd.Fail):
+                boatd.start_cmd(self.con,b,dict(command='follow-up',detached=True))
+            with patch.object(boatd.time,'sleep'),patch.object(boatd,'cg_path',return_value=cg), \
+                 patch.object(boatd,'run_processes',return_value=[]),patch.object(boatd.subprocess,'run'):
+                callbacks.pop()()
+        self.assertEqual((group/'cgroup.kill').read_text(),'1')
+        self.assertEqual(json.loads(self.status(b,p)['metrics'])['kill'],dict(cleanup='stopped',leftover_killed=1,remaining=0))
+        self.assertEqual(boatd.held_runs(self.con,b),[])
+        self.assertIsNotNone(boatd.start_cmd(self.con,b,dict(command='follow-up',detached=True))['processId'])
+
+    def test_deleted_instance_resolves_pending_kill_preserving_completion(self):
+        class CapturedThread:
+            def __init__(self, **kwargs): pass
+            def start(self): pass
+        for rc in (None,0,1):
+            with self.subTest(rc=rc):
+                b=self.box(f'bx_deleted{rc}');p=self.cmd(b)
+                if rc is not None:
+                    boatd.write_json(boatd.result_path(b,p),dict(attempt=1,status='exited',exit_code=rc,ended_at=110))
+                with patch.object(boatd.threading,'Thread',CapturedThread),patch.object(boatd,'run_processes',return_value=[]):
+                    boatd.delete_box(self.con,b)
+                missing=subprocess.CompletedProcess([],1,b'',b'Error: Instance not found\n')
+                def probe(c):
+                    with patch.object(boatd,'incus',return_value=missing):
+                        return REAL_PROBE(c)
+                with patch.object(boatd,'command_probe',side_effect=probe):
+                    boatd.settle_cmd(self.con,self.status(b,p))
+                    boatd.settle_cmd(self.con,self.status(b,p))
+                row=self.status(b,p)
+                self.assertEqual((row['status'],row['exit_code']),('lost',143) if rc is None else ('exited',rc))
+                self.assertEqual(json.loads(row['metrics'])['kill']['remaining'],0)
+                self.assertFalse(json.loads(row['metrics']).get('kill_request'))
+
+    def test_missing_instance_responses_are_distinct_from_unavailable_daemon(self):
+        b,p=self.command(prior=True)
+        cases=[
+            (b'',b'Error: Instance not found\n',True),
+            (b'',b'error: instance not found',True),
+            (b'{"type":"error","error_code":404,"error":"Instance not found"}',b'',True),
+            (b'',b'Error: Incus is shutting down',False),
+            (b'',b'Error: Failed to connect: socket not found',False),
+            (b'',b'Error: Instance not found while connecting to daemon',False),
+            (b'{"type":"error","error_code":500,"error":"unavailable"}',b'',False),
+        ]
+        for stdout,stderr,missing in cases:
+            with self.subTest(stderr=stderr,stdout=stdout),patch.object(boatd,'incus',return_value=subprocess.CompletedProcess([],1,stdout,stderr)):
+                view=REAL_PROBE(self.status(b,p))
+                self.assertEqual(view.get('readable',False),missing)
+                if missing:
+                    self.assertEqual(view['pids'],[])
+                else:
+                    self.assertEqual(view['reason'],'incus_unavailable')
+
+    def test_failed_delete_keeps_box_and_pending_kill_unconfirmed(self):
+        b,p=self.command(prior=True)
+        class CapturedThread:
+            def __init__(self, **kwargs): pass
+            def start(self): pass
+        with patch.object(boatd.threading,'Thread',CapturedThread),patch.object(boatd,'run_processes',return_value=[]), \
+             patch.object(boatd,'incus',return_value=subprocess.CompletedProcess([],1,b'',b'Error: Incus is shutting down')):
+            with self.assertRaises(boatd.Fail):
+                boatd.delete_box(self.con,b)
+        self.assertIsNone(self.state(b)['deleted_at'])
+        with patch.object(boatd,'command_probe',return_value={'reason':'incus_unavailable'}):
+            boatd.settle_cmd(self.con,self.status(b,p))
+        self.assertEqual(self.status(b,p)['status'],'running')
+
     def test_29bd_replacement_preserves_original_start_and_both_invocations(self):
         b,p = self.command(prior=True)
         started = 1794636298.0  # 06:04:58Z, not the replacement's 06:08:17Z.
