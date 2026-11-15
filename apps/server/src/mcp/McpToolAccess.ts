@@ -105,6 +105,7 @@ const refuseReadOnlyClient = McpInvocationContext.McpInvocationContext.pipe(
     scope.client?.access === "read-only"
       ? Effect.fail(
           new OrchestratorMcpFailure({
+            reason: "read_only_client",
             code: "capability_denied",
             message:
               "This tool changes the environment, and this MCP client was approved for read-only access.",
@@ -205,6 +206,7 @@ export const boundedThreadSend = <
 
 const escalationDenied = (refusal: DispatchModeRefusal) =>
   new OrchestratorMcpFailure({
+    reason: refusal.mode === "runtime" ? "runtime_mode_escalation" : "interaction_mode_escalation",
     code:
       refusal.mode === "runtime"
         ? "runtime_mode_escalation_denied"

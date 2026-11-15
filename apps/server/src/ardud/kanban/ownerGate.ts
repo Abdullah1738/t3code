@@ -35,6 +35,7 @@ export const ownerRefusal = (session: OwnerGateSession): KanbanError | null => {
   if (session.origin?._tag === "component") {
     return new KanbanError({
       code: "denied",
+      reason: "role_not_allowed",
       detail: `${NOT_OWNER_MESSAGE} This is the ${session.origin.component} component's session.`,
     });
   }
@@ -45,7 +46,7 @@ export const ownerRefusal = (session: OwnerGateSession): KanbanError | null => {
       reason: "not_owner_device",
     });
   }
-  return new KanbanError({ code: "denied", detail: NOT_OWNER_MESSAGE });
+  return new KanbanError({ code: "denied", reason: "role_not_allowed", detail: NOT_OWNER_MESSAGE });
 };
 
 /**

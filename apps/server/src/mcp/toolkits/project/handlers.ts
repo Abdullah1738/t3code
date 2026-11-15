@@ -21,7 +21,7 @@ function projectFailure(error: Project.ProjectServiceError) {
       : error._tag === "ProjectConflictError"
         ? "The workspace is already registered to a project."
         : "The project is not empty; force=true is required to delete it.";
-  return new OrchestratorMcpFailure({ code: "invalid_request", message });
+  return new OrchestratorMcpFailure({ reason: "invalid_args", code: "invalid_request", message });
 }
 
 /**
@@ -40,6 +40,7 @@ const assertProjectWorktree = Effect.fn("mcp.assertProjectWorktree")(function* (
   );
   if (!worktrees.includes(yield* real(worktreePath)))
     return yield* new OrchestratorMcpFailure({
+      reason: "invalid_args",
       code: "invalid_request",
       message:
         "worktreePath must be one of the project's git worktrees. t3_worktree_list shows them.",
@@ -63,6 +64,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
         const attachments = input.attachments ?? [];
         if (attachments.some((attachment) => !Claims.attachmentIsPendingUpload(attachment)))
           return yield* new OrchestratorMcpFailure({
+            reason: "invalid_args",
             code: "invalid_request",
             message: "A new thread accepts only pending attachment uploads.",
           });
@@ -71,6 +73,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
           (input.projectId !== undefined || input.workspaceStrategy !== undefined)
         )
           return yield* new OrchestratorMcpFailure({
+            reason: "invalid_args",
             code: "invalid_request",
             message:
               "scratch:true picks its own project and folder; omit projectId and workspaceStrategy.",
@@ -97,6 +100,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
           const project = yield* readProject;
           if (project === undefined)
             return yield* new OrchestratorMcpFailure({
+              reason: "invalid_args",
               code: "invalid_request",
               message: "The project was not found.",
             });
@@ -113,6 +117,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
             Effect.mapError(
               (error) =>
                 new OrchestratorMcpFailure({
+                  reason: "invalid_args",
                   code: "invalid_request",
                   message: `${error.message} No thread was created. Pass a branch, tag, or commit that exists there${
                     strategy.startFromOrigin === true
@@ -129,6 +134,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
           undefined;
         if (modelSelection === undefined)
           return yield* new OrchestratorMcpFailure({
+            reason: "invalid_args",
             code: "invalid_request",
             message:
               "Pass modelSelection: the project has no default model. orchestrator_capabilities lists providers and models.",
@@ -164,6 +170,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
             }
             if (error._tag === "ThreadManagementProviderInstanceDisabledError") {
               return new OrchestratorMcpFailure({
+                reason: "invalid_args",
                 code: "invalid_request",
                 message: error.message,
               });
@@ -198,6 +205,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
       const result = yield* projects.getById(input.projectId).pipe(Effect.mapError(unavailable));
       if (Option.isNone(result))
         return yield* new OrchestratorMcpFailure({
+          reason: "invalid_args",
           code: "invalid_request",
           message: "The project was not found.",
         });
@@ -216,6 +224,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
           input.defaultModelSelection !== undefined
         )
           return yield* new OrchestratorMcpFailure({
+            reason: "invalid_args",
             code: "invalid_request",
             message:
               "A project started from its title takes only a title; set scripts or defaultModelSelection afterwards with t3_project_update.",

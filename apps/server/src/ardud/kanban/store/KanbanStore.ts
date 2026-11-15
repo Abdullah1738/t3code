@@ -133,6 +133,18 @@ export interface DecodeCacheStats {
 }
 
 export interface KanbanStoreShape {
+  readonly observeCallerWrites: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
+  readonly registerCallerParent?: (threadId: string, parentThreadId: string) => void;
+  readonly callerAnalytics?: (threadId: string) =>
+    | {
+        boardId?: string;
+        cardId?: string;
+        cardNumber?: number;
+        cardStage?: string;
+        callerRole: "work" | "review" | "evaluator" | "discussion" | "delegated" | "none";
+        callerKind?: "delegated_child" | "plain_thread" | "unknown";
+      }
+    | undefined;
   readonly decodeCacheStats: Effect.Effect<Readonly<Record<string, DecodeCacheStats>>>;
   readonly boards: Effect.Effect<ReadonlyArray<KanbanBoard>, KanbanStoreError>;
   readonly board: (boardId: KanbanBoardId) => Effect.Effect<KanbanBoard | null, KanbanStoreError>;
@@ -396,6 +408,108 @@ const make = Effect.gen(function* () {
     initializeKanbanSchema(sql).pipe(Effect.andThen(ensureKanbanCacheVersions(sql))),
   ).pipe(Effect.mapError(fail("create tables")));
 
+  const callerWrites = Context.Reference<Array<() => void> | undefined>("KanbanCallerWrites", {
+    defaultValue: () => undefined,
+  });
+  // SQL success inside an outer transaction is not a commit. Publish its
+  // metadata only after that enclosing operation succeeds, including bulk writes.
+  const observeCallerWrites: KanbanStoreShape["observeCallerWrites"] = Effect.fnUntraced(
+    function* (effect) {
+      if ((yield* callerWrites) !== undefined) return yield* effect;
+      const updates: Array<() => void> = [];
+      const parent = yield* NodeSqliteClient.TransactionCommitObserver;
+      const apply = () => {
+        for (const update of updates) update();
+        updates.length = 0;
+      };
+      return yield* effect.pipe(
+        Effect.provideService(callerWrites, updates),
+        Effect.provideService(NodeSqliteClient.TransactionCommitObserver, () => {
+          apply();
+          parent?.();
+        }),
+        Effect.tap(() => Effect.sync(apply)),
+      );
+    },
+  );
+  const updateCaller = Effect.fnUntraced(function* (apply: () => void) {
+    const updates = yield* callerWrites;
+    if (updates !== undefined) updates.push(apply);
+    else if ((yield* Effect.serviceOption(sql.transactionService))._tag === "None") apply();
+  });
+  let callerHydrated = false;
+  const callerParents = new Map<string, string>();
+  const callerLinks = new Map<
+    string,
+    {
+      boardId: string;
+      cardId: string | null;
+      role: "work" | "review" | "evaluator";
+      discussionId: string | null;
+    }
+  >();
+  const callerCards = new Map<string, { number: number; stage: string }>();
+  // Hydrate once after board migration; calls only consult these compact maps.
+  // Writes observed during hydration win over its older snapshot.
+  yield* BoardsDatabase.onReady(
+    sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const links = yield* sql<{
+            thread_id: string;
+            board_id: string;
+            card_id: string | null;
+            role: "work" | "review" | "evaluator";
+            discussion_id: string | null;
+          }>`SELECT thread_id, board_id, card_id, json_extract(json, '$.role') AS role, json_extract(json, '$.discussionId') AS discussion_id FROM ardud_kanban_threads`;
+          const cards = yield* sql<{
+            id: string;
+            number: number;
+            stage: string;
+          }>`SELECT id, number, stage FROM ardud_kanban_cards`;
+          for (const row of links)
+            if (!callerLinks.has(row.thread_id))
+              callerLinks.set(row.thread_id, {
+                boardId: row.board_id,
+                cardId: row.card_id,
+                role: row.role,
+                discussionId: row.discussion_id,
+              });
+          for (const row of cards)
+            if (!callerCards.has(row.id))
+              callerCards.set(row.id, { number: row.number, stage: row.stage });
+          callerHydrated = true;
+        }),
+      )
+      .pipe(NodeSqliteClient.readOnly, Effect.mapError(fail("hydrate caller analytics"))),
+  );
+  const callerAnalytics: NonNullable<KanbanStoreShape["callerAnalytics"]> = (threadId) => {
+    const seen = new Set<string>();
+    let id = threadId;
+    let link = callerLinks.get(id);
+    while (!link && callerParents.has(id) && !seen.has(id)) {
+      seen.add(id);
+      id = callerParents.get(id)!;
+      link = callerLinks.get(id);
+    }
+    if (!link)
+      return callerParents.has(threadId)
+        ? { callerRole: "delegated", callerKind: "delegated_child" }
+        : { callerRole: "none", callerKind: callerHydrated ? "plain_thread" : "unknown" };
+    const card = link.cardId === null ? undefined : callerCards.get(link.cardId);
+    return {
+      boardId: link.boardId,
+      callerRole: callerParents.has(threadId)
+        ? "delegated"
+        : link.discussionId !== null
+          ? "discussion"
+          : link.role,
+      ...(callerParents.has(threadId) ? { callerKind: "delegated_child" as const } : {}),
+      ...(link.cardId === null ? {} : { cardId: link.cardId }),
+      ...(card === undefined ? {} : { cardNumber: card.number, cardStage: card.stage }),
+    };
+  };
+
   const readCounters = Context.Reference<
     Record<string, { hits: number; misses: number; evictions: number }>
   >("KanbanReadCounters", {
@@ -429,6 +543,7 @@ const make = Effect.gen(function* () {
         }),
     ),
   );
+  // Dirty-card watches track attempted writes; attribution publishes only on commit.
   const cardWritten = (card: KanbanCard) => {
     for (const changed of cardWatches.get(card.boardId) ?? []) changed.add(card.id);
   };
@@ -911,6 +1026,9 @@ const make = Effect.gen(function* () {
             json = excluded.json
         `;
         cardWritten(value);
+        yield* updateCaller(() =>
+          callerCards.set(value.id, { number: value.number, stage: value.stage }),
+        );
       }),
     );
   const pendingInstructionApplications: KanbanStoreShape["pendingInstructionApplications"] = (
@@ -1084,22 +1202,32 @@ const make = Effect.gen(function* () {
   ) =>
     run(
       "rekey board",
-      sql.withTransaction(
-        Effect.gen(function* () {
-          for (const { from, pool } of pools) {
-            const json = yield* Pool.encode(pool);
-            yield* sql`
+      sql
+        .withTransaction(
+          Effect.gen(function* () {
+            for (const { from, pool } of pools) {
+              const json = yield* Pool.encode(pool);
+              yield* sql`
               UPDATE ardud_kanban_pools SET key = ${pool.key}, json = ${json}
               WHERE board_id = ${boardId} AND key = ${from}
             `;
-          }
-          for (const card of cards) {
-            const json = yield* Card.encode(card);
-            yield* sql`UPDATE ardud_kanban_cards SET json = ${json} WHERE id = ${card.id}`;
-            cardWritten(card);
-          }
-        }),
-      ),
+            }
+            for (const card of cards) {
+              const json = yield* Card.encode(card);
+              yield* sql`UPDATE ardud_kanban_cards SET json = ${json} WHERE id = ${card.id}`;
+              cardWritten(card);
+            }
+          }),
+        )
+        .pipe(
+          Effect.tap(() =>
+            updateCaller(() => {
+              for (const card of cards) {
+                callerCards.set(card.id, { number: card.number, stage: card.stage });
+              }
+            }),
+          ),
+        ),
     );
   const migrateBoardSelections = (input: {
     readonly board: KanbanBoard;
@@ -1110,52 +1238,63 @@ const make = Effect.gen(function* () {
   }) =>
     run(
       "migrate board selections",
-      sql.withTransaction(
-        Effect.gen(function* () {
-          const boardJson = yield* Board.encode(input.board);
-          yield* sql`
+      sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const boardJson = yield* Board.encode(input.board);
+            yield* sql`
             INSERT INTO ardud_kanban_boards (id, slug, json) VALUES (${input.board.id}, ${input.board.slug}, ${boardJson})
             ON CONFLICT (id) DO UPDATE SET slug = excluded.slug, json = excluded.json
           `;
-          // The board reads its pools in insertion order (ORDER BY rowid), so a migrated pool keeps its row
-          // and its place: a key change is an in-place UPDATE, never a delete and re-insert. Only a key
-          // that leaves the board is deleted. `oldPoolKeys` and `pools` are paired by position.
-          // Re-keyed pools move first, so their rows are never deleted in the way; the removal pass that
-          // follows only sees keys that genuinely left the board.
-          const survivingKeys = new Set(input.pools.map((pool) => pool.key));
-          for (const [index, pool] of input.pools.entries()) {
-            const poolJson = yield* Pool.encode(pool);
-            const oldKey = input.oldPoolKeys[index];
-            if (oldKey !== undefined && oldKey !== pool.key) {
-              yield* sql`
+            // The board reads its pools in insertion order (ORDER BY rowid), so a migrated pool keeps its row
+            // and its place: a key change is an in-place UPDATE, never a delete and re-insert. Only a key
+            // that leaves the board is deleted. `oldPoolKeys` and `pools` are paired by position.
+            // Re-keyed pools move first, so their rows are never deleted in the way; the removal pass that
+            // follows only sees keys that genuinely left the board.
+            const survivingKeys = new Set(input.pools.map((pool) => pool.key));
+            for (const [index, pool] of input.pools.entries()) {
+              const poolJson = yield* Pool.encode(pool);
+              const oldKey = input.oldPoolKeys[index];
+              if (oldKey !== undefined && oldKey !== pool.key) {
+                yield* sql`
                 UPDATE ardud_kanban_pools SET key = ${pool.key}, json = ${poolJson}
                 WHERE board_id = ${input.board.id} AND key = ${oldKey}
               `;
-              continue;
-            }
-            yield* sql`
+                continue;
+              }
+              yield* sql`
               INSERT INTO ardud_kanban_pools (board_id, key, json) VALUES (${input.board.id}, ${pool.key}, ${poolJson})
               ON CONFLICT (board_id, key) DO UPDATE SET json = excluded.json
             `;
-          }
-          for (const key of input.oldPoolKeys) {
-            if (survivingKeys.has(key)) continue;
-            yield* sql`DELETE FROM ardud_kanban_pools WHERE board_id = ${input.board.id} AND key = ${key}`;
-          }
-          for (const card of input.cards) {
-            const json = yield* Card.encode(card);
-            yield* sql`
+            }
+            for (const key of input.oldPoolKeys) {
+              if (survivingKeys.has(key)) continue;
+              yield* sql`DELETE FROM ardud_kanban_pools WHERE board_id = ${input.board.id} AND key = ${key}`;
+            }
+            for (const card of input.cards) {
+              const json = yield* Card.encode(card);
+              yield* sql`
               UPDATE ardud_kanban_cards SET json = ${json}, active_thread_id = ${card.activeThreadId}, stage = ${card.stage}
               WHERE id = ${card.id}
             `;
-            cardWritten(card);
-          }
-          for (const link of input.threadLinks) {
-            const json = yield* ThreadLink.encode(link);
-            yield* sql`UPDATE ardud_kanban_threads SET json = ${json} WHERE thread_id = ${link.threadId}`;
-          }
-        }),
-      ),
+              cardWritten(card);
+            }
+            for (const link of input.threadLinks) {
+              const json = yield* ThreadLink.encode(link);
+              yield* sql`UPDATE ardud_kanban_threads SET json = ${json} WHERE thread_id = ${link.threadId}`;
+            }
+          }),
+        )
+        .pipe(
+          Effect.tap(() =>
+            updateCaller(() => {
+              for (const card of input.cards) {
+                callerCards.set(card.id, { number: card.number, stage: card.stage });
+              }
+              for (const link of input.threadLinks) callerLinks.set(link.threadId, link);
+            }),
+          ),
+        ),
     );
   const removePool = (boardId: KanbanBoardId, key: string) =>
     run(
@@ -1534,6 +1673,7 @@ const make = Effect.gen(function* () {
           ON CONFLICT (thread_id) DO UPDATE SET
             card_id = excluded.card_id, ended = excluded.ended, json = excluded.json
         `;
+        yield* updateCaller(() => callerLinks.set(link.threadId, link));
       }),
     );
 
@@ -1559,6 +1699,11 @@ const make = Effect.gen(function* () {
     );
 
   return KanbanStore.of({
+    callerAnalytics,
+    observeCallerWrites,
+    registerCallerParent: (threadId, parentThreadId) => {
+      callerParents.set(threadId, parentThreadId);
+    },
     decodeCacheStats,
     boards,
     board,

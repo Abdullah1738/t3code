@@ -34,7 +34,11 @@ export class ContextResetService extends Context.Service<
 >()("t3/ardud/context-reset/ContextResetService") {}
 
 const failure = (code: OrchestratorMcpFailure["code"], message: string) =>
-  new OrchestratorMcpFailure({ code, message });
+  new OrchestratorMcpFailure({
+    reason: code === "invalid_request" ? "invalid_args" : "capability_missing",
+    code,
+    message,
+  });
 
 const errorMessage = (error: unknown) =>
   typeof error === "object" && error !== null && "message" in error

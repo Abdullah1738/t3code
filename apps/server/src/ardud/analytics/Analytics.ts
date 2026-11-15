@@ -184,6 +184,10 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
     (filter?.kind === undefined || filter.kind === event.kind) &&
     (filter?.boardId === undefined || filter.boardId === event.boardId) &&
     (filter?.cardId === undefined || filter.cardId === event.cardId) &&
+    (filter?.cardNumber === undefined ||
+      filter.cardNumber === event.cardNumber ||
+      filter.cardNumber === event.callerCardNumber ||
+      filter.cardNumber === event.props?.cardNumber) &&
     (filter?.tool === undefined || filter.tool === event.tool) &&
     (filter?.outcome === undefined || filter.outcome === event.outcome) &&
     (filter?.responseDelivery === undefined || filter.responseDelivery === event.responseDelivery);
@@ -193,6 +197,7 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
       filter?.kind,
       filter?.boardId,
       filter?.cardId,
+      filter?.cardNumber,
       filter?.tool,
       filter?.outcome,
       filter?.responseDelivery,
@@ -662,10 +667,7 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
               withAskLatency(finishRollup(full.accumulator, input.day, generatedAt)),
             );
           return {
-            rollup: withAskLatency(
-              finishRollup(view.accumulator, input.day, generatedAt),
-              input,
-            ),
+            rollup: withAskLatency(finishRollup(view.accumulator, input.day, generatedAt), input),
             samples: view.samples.slice(0, input.limit ?? 100).map((sample) => sample.event),
           };
         }),

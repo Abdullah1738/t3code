@@ -3,7 +3,7 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import type * as Tracer from "effect/Tracer";
 
-export type Stage = "caller" | "admission" | "read" | "mutate" | "commit";
+export type Stage = "caller" | "admission" | "read" | "mutate" | "commit" | "ack";
 
 export const traceObserver = Context.Reference<
   | {
@@ -78,6 +78,8 @@ export const committing = Effect.gen(function* () {
 });
 
 export const record = Effect.fn("KanbanSavedWrite.record")(function* (saved: Saved) {
+  const trace = yield* traceObserver;
+  trace?.mark("ack", yield* Effect.fiberId);
   (yield* observer)(saved);
 });
 

@@ -2363,3 +2363,157 @@ it.effect.each([
     if (kind === "urgency") assert.equal(actual[0], blocker.id);
   }).pipe(Effect.provide(TestLayer)),
 );
+
+it.effect("caller analytics is a memory lookup and follows card and link writes", () =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const current = card(4336, "working");
+    const id = ThreadId.make("worker-4336");
+    yield* store.putCard(current);
+    yield* store.putThreadLink({
+      threadId: id,
+      boardId,
+      cardId: current.id,
+      role: "work",
+      purpose: null,
+      discussionId: null,
+      model,
+      startedAt: at,
+      endedAt: null,
+      paused: null,
+    });
+    const queries: string[] = [];
+    const observe: Statement.Transformer = (statement) => {
+      queries.push(statement.compile()[0]);
+      return Effect.succeed(statement);
+    };
+    const context = yield* Effect.sync(() => store.callerAnalytics!(id)).pipe(
+      Effect.provideService(Statement.CurrentTransformer, observe),
+    );
+    assert.deepEqual(context, {
+      boardId,
+      cardId: current.id,
+      cardNumber: 4336,
+      cardStage: "working",
+      callerRole: "work",
+    });
+    assert.deepEqual(queries, []);
+    store.registerCallerParent!("plain-child", "plain-parent");
+    assert.deepEqual(store.callerAnalytics!("plain-child"), {
+      callerRole: "delegated",
+      callerKind: "delegated_child",
+    });
+    store.registerCallerParent!("child", id);
+    assert.deepEqual(store.callerAnalytics!("child"), {
+      ...context,
+      callerRole: "delegated",
+      callerKind: "delegated_child",
+    });
+    const sql = yield* SqlClient.SqlClient;
+    yield* store
+      .observeCallerWrites(
+        sql.withTransaction(
+          store
+            .putCard({ ...current, stage: "needs_review" })
+            .pipe(Effect.andThen(Effect.fail("rollback"))),
+        ),
+      )
+      .pipe(Effect.exit);
+    assert.equal(store.callerAnalytics!(id)?.cardStage, "working");
+    yield* store.observeCallerWrites(
+      sql.withTransaction(store.putCard({ ...current, stage: "needs_review" })),
+    );
+    assert.equal(store.callerAnalytics!(id)?.cardStage, "needs_review");
+    const reopened = Context.get(
+      yield* Layer.build(
+        Layer.fresh(KanbanStore.layer).pipe(Layer.provide(Layer.succeed(SqlClient.SqlClient, sql))),
+      ),
+      KanbanStore.KanbanStore,
+    );
+    assert.equal(reopened.callerAnalytics!(id)?.cardStage, "needs_review");
+    assert.deepEqual(reopened.callerAnalytics!("plain"), {
+      callerRole: "none",
+      callerKind: "plain_thread",
+    });
+    const cold = Context.get(
+      yield* Layer.build(
+        Layer.fresh(KanbanStore.layer).pipe(
+          Layer.provide(
+            Layer.succeed(BoardsDatabase.BoardsDatabase, {
+              sql,
+              path: "cold-test",
+              ready: Effect.never,
+            }),
+          ),
+        ),
+      ),
+      KanbanStore.KanbanStore,
+    );
+    assert.deepEqual(cold.callerAnalytics!("not-loaded-yet"), {
+      callerRole: "none",
+      callerKind: "unknown",
+    });
+  }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect.each(["rekey", "selection"] as const)(
+  "%s caller metadata waits for the enclosing commit",
+  (mode) =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const sql = yield* SqlClient.SqlClient;
+      const current = card(4336, "working");
+      const id = ThreadId.make("bulk-worker");
+      const link = {
+        threadId: id,
+        boardId,
+        cardId: current.id,
+        role: "work" as const,
+        purpose: null,
+        discussionId: null,
+        model,
+        startedAt: at,
+        endedAt: null,
+        paused: null,
+      };
+      yield* store.putCard(current);
+      yield* store.putThreadLink(link);
+      const before = store.callerAnalytics!(id);
+      const watched = yield* store.watchCardWrites(boardId);
+      const changed = card(4336, "needs_review");
+      const bulk =
+        mode === "rekey"
+          ? store.rekeyBoard(boardId, [], [changed])
+          : store.migrateBoardSelections({
+              board,
+              pools: [],
+              oldPoolKeys: [],
+              cards: [changed],
+              threadLinks: [{ ...link, role: "review" }],
+            });
+      const rolledBack = yield* store
+        .observeCallerWrites(
+          sql.withTransaction(
+            bulk.pipe(
+              Effect.andThen(
+                Effect.sync(() => {
+                  assert.deepEqual(store.callerAnalytics!(id), before);
+                  assert.deepEqual([...watched], [current.id]);
+                }),
+              ),
+              Effect.andThen(Effect.fail("rollback")),
+            ),
+          ),
+        )
+        .pipe(Effect.exit);
+      assert.equal(rolledBack._tag, "Failure");
+      assert.deepEqual(store.callerAnalytics!(id), before);
+      assert.equal((yield* store.card(current.id))?.stage, "working");
+      assert.equal((yield* store.threadLink(id))?.role, "work");
+      if (mode === "selection") {
+        yield* store.observeCallerWrites(sql.withTransaction(bulk));
+        assert.equal(store.callerAnalytics!(id)?.cardStage, "needs_review");
+        assert.equal(store.callerAnalytics!(id)?.callerRole, "review");
+      }
+    }).pipe(Effect.scoped, Effect.provide(TestLayer)),
+);

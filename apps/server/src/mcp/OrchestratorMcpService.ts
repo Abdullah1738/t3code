@@ -248,8 +248,26 @@ const isThreadManagementError = Schema.is(ThreadManagementService.ThreadManageme
 const isProjectionStoreThreadNotFoundError = Schema.is(ProjectionStoreThreadNotFoundError);
 const isOrchestratorMcpFailure = Schema.is(OrchestratorMcpFailure);
 
-function failure(code: OrchestratorMcpFailure["code"], message: string): OrchestratorMcpFailure {
-  return new OrchestratorMcpFailure({ code, message });
+function failure(
+  code: OrchestratorMcpFailure["code"],
+  message: string,
+  reason?: OrchestratorMcpFailure["reason"],
+): OrchestratorMcpFailure {
+  return new OrchestratorMcpFailure({
+    reason:
+      reason ??
+      (code === "invalid_request"
+        ? "invalid_args"
+        : code === "runtime_mode_escalation_denied"
+          ? "runtime_mode_escalation"
+          : code === "interaction_mode_escalation_denied"
+            ? "interaction_mode_escalation"
+            : code === "capability_denied"
+              ? "capability_missing"
+              : undefined),
+    code,
+    message,
+  });
 }
 
 /**
@@ -3192,6 +3210,7 @@ const make = Effect.gen(function* () {
         return yield* failure(
           "capability_denied",
           "Task result acknowledgement requires write access.",
+          "read_only_client",
         );
       }
       const startedAt = yield* Clock.monotonicTimeNanos;

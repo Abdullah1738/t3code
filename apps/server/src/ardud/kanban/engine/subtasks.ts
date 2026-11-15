@@ -1,3 +1,4 @@
+import type { McpDenyReason } from "@t3tools/contracts";
 /**
  * A card's subtasks: its flow as steps (write the PR, review, merge and
  * deploy, tell the reporter, read back). Pure rules; KanbanService applies them.
@@ -750,7 +751,9 @@ export type SubtaskPlan =
  */
 export type SubtaskRole = "work" | "review" | "evaluator" | "script";
 
-export type MarkCheck = { readonly ok: true } | { readonly ok: false; readonly reason: string };
+export type MarkCheck =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly reason: string; readonly denyReason: McpDenyReason };
 
 const idNumber = (id: string) => Number.parseInt(id.replace(/^s/, ""), 10) || 0;
 
@@ -996,23 +999,40 @@ export function checkMark(
   if (!subtask)
     return {
       ok: false,
+      denyReason: "subtask_not_found",
       reason: `card #${card.number} has no subtask ${id}. Existing subtask ids: ${subtaskIds(card.subtasks) || "none"}`,
     };
-  if (subtask.state === state) return { ok: false, reason: `subtask ${id} is already ${state}` };
+  if (subtask.state === state)
+    return {
+      ok: false,
+      denyReason: "subtask_state_unchanged",
+      reason: `subtask ${id} is already ${state}`,
+    };
   if (state === "skipped" && !note?.trim()) {
-    return { ok: false, reason: "say why the subtask is skipped" };
+    return {
+      ok: false,
+      denyReason: "skip_note_required",
+      reason: "say why the subtask is skipped",
+    };
   }
   if (role === "evaluator") return { ok: true };
   if (role === "review") {
     return {
       ok: false,
+      denyReason: "review_verdict_required",
       reason: "a review ticks its subtasks with its verdict (card_review_result)",
     };
   }
-  if (state === "open") return { ok: false, reason: "only an evaluator reopens a subtask" };
+  if (state === "open")
+    return {
+      ok: false,
+      denyReason: "role_not_allowed",
+      reason: "only an evaluator reopens a subtask",
+    };
   if (subtask.owner !== role) {
     return {
       ok: false,
+      denyReason: "subtask_owner_mismatch",
       reason: `subtask ${id} is for the ${OWNER_NAMES[subtask.owner]}, not you`,
     };
   }
@@ -1021,11 +1041,16 @@ export function checkMark(
     subtask.script !== undefined &&
     subtask.script.toLowerCase() !== (scriptName ?? "").toLowerCase()
   ) {
-    return { ok: false, reason: `subtask ${id} is for the script "${subtask.script}"` };
+    return {
+      ok: false,
+      denyReason: "subtask_script_mismatch",
+      reason: `subtask ${id} is for the script "${subtask.script}"`,
+    };
   }
   if (subtask.step !== kanbanOpenStep(card)) {
     return {
       ok: false,
+      denyReason: "subtask_not_in_current_step",
       reason: `subtask ${id} is in step ${subtask.step}; finish step ${kanbanOpenStep(card)} first`,
     };
   }
@@ -1043,19 +1068,39 @@ export function checkHandBack(
   if (!subtask)
     return {
       ok: false,
+      denyReason: "subtask_not_found",
       reason: `card #${card.number} has no subtask ${id}. Existing subtask ids: ${subtaskIds(card.subtasks) || "none"}`,
     };
-  if (!note.trim()) return { ok: false, reason: "say what failed or didn't match" };
-  if (subtask.owner !== "script") return { ok: false, reason: `subtask ${id} isn't a script's` };
+  if (!note.trim())
+    return {
+      ok: false,
+      denyReason: "handoff_note_required",
+      reason: "say what failed or didn't match",
+    };
+  if (subtask.owner !== "script")
+    return {
+      ok: false,
+      denyReason: "subtask_owner_mismatch",
+      reason: `subtask ${id} isn't a script's`,
+    };
   if (subtask.state !== "open") {
-    return { ok: false, reason: `subtask ${id} is already ${subtask.state}` };
+    return {
+      ok: false,
+      denyReason: "subtask_not_open",
+      reason: `subtask ${id} is already ${subtask.state}`,
+    };
   }
   if (subtask.script !== undefined && subtask.script.toLowerCase() !== scriptName.toLowerCase()) {
-    return { ok: false, reason: `subtask ${id} is for the script "${subtask.script}"` };
+    return {
+      ok: false,
+      denyReason: "subtask_script_mismatch",
+      reason: `subtask ${id} is for the script "${subtask.script}"`,
+    };
   }
   if (subtask.step !== kanbanOpenStep(card)) {
     return {
       ok: false,
+      denyReason: "subtask_not_in_current_step",
       reason: `subtask ${id} is in step ${subtask.step}; finish step ${kanbanOpenStep(card)} first`,
     };
   }

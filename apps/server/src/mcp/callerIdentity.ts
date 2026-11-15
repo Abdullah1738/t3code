@@ -45,6 +45,14 @@ export const readCallerIdentity = Effect.fn("mcp.readCallerIdentity")(function* 
     "statev2 identity caller row",
   );
   if (row === null || row.deletedAt !== null) return null;
+  if (call._tag === "Some")
+    call.value.resolveCallerContext?.(
+      row.lineage?.relationshipToParent === "subagent"
+        ? (row.lineage.parentThreadId ?? row.lineage.rootThreadId)
+        : row.lineage === undefined && row.forkedFrom?.type === "run"
+          ? row.forkedFrom.threadId
+          : undefined,
+    );
   if (
     row.pendingBackgroundTasks !== undefined ||
     row.archivedAt !== null ||

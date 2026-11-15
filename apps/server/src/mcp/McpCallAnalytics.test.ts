@@ -1,3 +1,4 @@
+import { KanbanService } from "../ardud/kanban/engine/KanbanService.ts";
 import { expect, it } from "@effect/vitest";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- isolated loopback MCP integration.
 import * as NodeHttp from "node:http";
@@ -947,7 +948,8 @@ it.effect("records resolved caller identity and a saved write whose reply fails"
         errorPhase: "result",
         callerResolved: true,
         readerLane: "identity",
-        props: { phase: "caller" },
+        callerReaderLane: "identity",
+        props: { phase: "ack" },
       });
     }).pipe(Effect.provide(registration));
   }),
@@ -1006,6 +1008,7 @@ it.effect.each(["caller", "dispatch"] as const)("records the real %s deadline", 
         errorTag: stage === "caller" ? "caller_unresolved" : "delegation_timeout",
         errorPhase: stage,
         callerResolved: stage !== "caller",
+        ...(stage === "caller" ? { callerRole: "none", callerKind: "unknown" } : {}),
         callerResolveMs: stage === "caller" ? 10_000 : 0,
         durationMs: 10_000,
         readerLane: "identity",
@@ -1350,3 +1353,273 @@ it.effect.each(["lookup.target", "waiting"] as const)(
       }).pipe(Effect.provide(registration));
     }),
 );
+
+const provenanceCases = [
+  {
+    name: "card thread",
+    origin: "card",
+    own: true,
+    role: "work",
+    kind: "board_thread",
+    number: 4336,
+  },
+  {
+    name: "legacy run origin",
+    origin: "legacy",
+    own: false,
+    role: "delegated",
+    kind: "delegated_child",
+    number: 4336,
+  },
+  {
+    name: "explicit subagent",
+    origin: "subagent",
+    own: false,
+    role: "delegated",
+    kind: "delegated_child",
+    number: 4336,
+  },
+  {
+    name: "ordinary fork",
+    origin: "fork",
+    own: false,
+    role: "none",
+    kind: "plain_thread",
+    number: null,
+  },
+  {
+    name: "explicit root",
+    origin: "root",
+    own: false,
+    role: "none",
+    kind: "plain_thread",
+    number: null,
+  },
+  {
+    name: "ordinary fork with own card",
+    origin: "fork",
+    own: true,
+    role: "work",
+    kind: "board_thread",
+    number: 4339,
+  },
+] as const;
+
+it.effect.each(provenanceCases)("attributes delegate_task: $name", (scenario) =>
+  Effect.gen(function* () {
+    const recorded = yield* Deferred.make<AnalyticsEvent>();
+    const toolkit = probe("delegate_task");
+    const handlers = McpToolAccess.toLayer(toolkit, {
+      delegate_task: McpToolAccess.actsAsCaller(() =>
+        McpCall.failedPhase("dispatch").pipe(Effect.andThen(failure("delegation_timeout"))),
+      ),
+    });
+    const callerId = ThreadId.make("caller-ledger");
+    const parentId = ThreadId.make("card-parent");
+    const shell = Testkit.liveThreadShell(callerId);
+    const { lineage, ...legacyCaller } = shell;
+    const explicitLineage =
+      scenario.origin === "fork" || scenario.origin === "subagent"
+        ? ({
+            parentThreadId: parentId,
+            rootThreadId: parentId,
+            relationshipToParent: scenario.origin,
+          } as const)
+        : lineage;
+    const forkedFrom =
+      scenario.origin === "card"
+        ? null
+        : { type: "run" as const, threadId: parentId, runId: shell.activeRunId! };
+    const callerRow = {
+      ...(scenario.origin === "legacy" ? legacyCaller : { ...shell, lineage: explicitLineage }),
+      forkedFrom,
+    };
+    const cachedCard = (number: number) => ({
+      boardId: "board-crpko",
+      cardId: `card-${number}`,
+      cardNumber: number,
+      cardStage: "working",
+      callerRole: "work" as const,
+    });
+    const registration = McpHttpServer.toolkitRegistration(toolkit, handlers).pipe(
+      Layer.provideMerge(McpServer.McpServer.layer),
+      Layer.provide(
+        Layer.mock(ThreadManagement.ThreadManagementService)({
+          getCallerRow: () => Effect.succeed(callerRow),
+          getThreadShell: () => Effect.succeed({ ...shell, lineage: explicitLineage, forkedFrom }),
+        }),
+      ),
+      Layer.provide(
+        Layer.mock(KanbanService)({
+          attachmentPath: () => null,
+          callerAnalytics: (id) =>
+            id === parentId
+              ? cachedCard(4336)
+              : id === callerId && scenario.own
+                ? cachedCard(scenario.number!)
+                : { callerRole: "none" as const, callerKind: "plain_thread" as const },
+        }),
+      ),
+      Layer.provide(
+        Layer.mock(Analytics.Analytics)({
+          record: (row) =>
+            row.kind === "mcp.call"
+              ? Deferred.succeed(recorded, row).pipe(Effect.asVoid)
+              : Effect.void,
+        }),
+      ),
+      Layer.provideMerge(invocation),
+    );
+    yield* Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      yield* server
+        .callTool({ name: "delegate_task", arguments: args })
+        .pipe(Effect.provideService(McpSchema.McpServerClient, client));
+      const row = yield* Deferred.await(recorded);
+      expect(row).toMatchObject({
+        callerRole: scenario.role,
+        callerKind: scenario.kind,
+        errorTag: "delegation_timeout",
+      });
+      expect(row.callerCardNumber).toBe(scenario.number ?? undefined);
+      expect(row.cardNumber).toBe(scenario.number ?? undefined);
+      expect(row.callerCardStage).toBe(scenario.number === null ? undefined : "working");
+      if (scenario.number !== null)
+        expect(row).toMatchObject({
+          boardId: "board-crpko",
+          cardId: `card-${scenario.number}`,
+          cardStage: "working",
+        });
+    }).pipe(Effect.provide(registration));
+  }),
+);
+
+it.effect("retains a fixed denial reason after the toolkit encodes the failure", () =>
+  Effect.gen(function* () {
+    const recorded = yield* Deferred.make<AnalyticsEvent>();
+    const toolkit = probe("reason_probe");
+    const handlers = McpToolAccess.toLayer(toolkit, {
+      reason_probe: McpToolAccess.reads(() =>
+        Effect.fail(
+          new OrchestratorMcpFailure({
+            code: "capability_denied",
+            reason: "subtask_not_in_current_step",
+            message: "private refusal body",
+          }),
+        ),
+      ),
+    });
+    const registration = McpHttpServer.toolkitRegistration(toolkit, handlers).pipe(
+      Layer.provideMerge(McpServer.McpServer.layer),
+      Layer.provide(
+        Layer.mock(Analytics.Analytics)({
+          record: (row) =>
+            row.kind === "mcp.call"
+              ? Deferred.succeed(recorded, row).pipe(Effect.asVoid)
+              : Effect.void,
+        }),
+      ),
+      Layer.provideMerge(invocation),
+      Layer.provide(Testkit.liveThreadsLayer),
+    );
+    yield* Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      yield* server
+        .callTool({ name: "reason_probe", arguments: args })
+        .pipe(Effect.provideService(McpSchema.McpServerClient, client));
+      const row = yield* Deferred.await(recorded);
+      expect(row).toMatchObject({
+        errorTag: "capability_denied",
+        denyReason: "subtask_not_in_current_step",
+        outcome: "refused",
+      });
+      expect(JSON.stringify(row)).not.toContain("private refusal body");
+    }).pipe(Effect.provide(registration));
+  }),
+);
+
+it.effect("the canonical target replaces caller attribution and survives dependency reads", () =>
+  Effect.gen(function* () {
+    const state: McpCall.McpCall["Service"] = {
+      callerResolved: true,
+      callerResolveMs: 0,
+      phase: "handler",
+      readerLane: "foreground",
+      saved: "unknown",
+      cardId: "caller-card",
+      cardNumber: 4336,
+      callerCardNumber: 4336,
+      callerCardStage: "working",
+    };
+    yield* McpCall.resolvedContext({
+      boardId: "board-crpko",
+      id: "target-card",
+      number: 4339,
+      stage: "in_review",
+    }).pipe(Effect.provideService(McpCall.McpCall, state));
+    yield* McpCall.resolvedContext({
+      boardId: "board-crpko",
+      id: "dependency-card",
+      number: 4343,
+      stage: "todo",
+    }).pipe(Effect.provideService(McpCall.McpCall, state));
+    expect(state).toMatchObject({
+      cardId: "target-card",
+      cardNumber: 4339,
+      cardStage: "in_review",
+      callerCardNumber: 4336,
+      callerCardStage: "working",
+    });
+  }),
+);
+
+it("does not take refusal metadata from a successful result body", () => {
+  const state: McpCall.McpCall["Service"] = {
+    callerResolved: true,
+    callerResolveMs: 0,
+    readerLane: "foreground",
+    phase: "handler",
+    saved: "unknown",
+  };
+  const result = McpCall.callOutcome(
+    Exit.succeed(
+      new McpSchema.CallToolResult({
+        content: [],
+        structuredContent: { code: "invalid_request", reason: "invalid_args" },
+      }),
+    ),
+    state,
+  );
+  expect(result.outcome).toBe("ok");
+  expect(state.denyReason).toBeUndefined();
+});
+
+it.each([
+  ["work", "board_thread"],
+  ["delegated", "delegated_child"],
+] as const)("caller_unresolved preserves known %s caller context", (callerRole, callerKind) => {
+  const state: McpCall.McpCall["Service"] = {
+    callerResolved: false,
+    callerResolveMs: 10000,
+    readerLane: "foreground",
+    phase: "caller",
+    saved: "unknown",
+    callerRole,
+    callerKind,
+    callerCardNumber: 4336,
+    callerCardStage: "working",
+  };
+  const result = McpCall.callOutcome(
+    Exit.fail(
+      new OrchestratorMcpFailure({ code: "caller_unresolved", message: "Caller lookup timed out" }),
+    ),
+    state,
+  );
+  expect(result).toMatchObject({ outcome: "timeout", errorTag: "caller_unresolved" });
+  expect(state).toMatchObject({
+    callerRole,
+    callerKind,
+    callerCardNumber: 4336,
+    callerCardStage: "working",
+  });
+});

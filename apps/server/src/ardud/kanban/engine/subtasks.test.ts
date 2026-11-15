@@ -1936,11 +1936,13 @@ describe("marking subtasks", () => {
     expect(checkMark(card, "s3", "done", "work", null)).toMatchObject({
       ok: false,
       reason: "subtask s3 is for the evaluator, not you",
+      denyReason: "subtask_owner_mismatch",
     });
     const later = { number: 3, subtasks: planned().map((s) => ({ ...s, owner: "work" as const })) };
     expect(checkMark(later, "s2", "done", "work", null)).toMatchObject({
       ok: false,
       reason: "subtask s2 is in step 2; finish step 1 first",
+      denyReason: "subtask_not_in_current_step",
     });
     expect(checkMark(card, "s4", "done", "evaluator", null)).toEqual({ ok: true });
     expect(checkMark(card, "s1", "skipped", "work", " ")).toMatchObject({ ok: false });
@@ -2024,6 +2026,7 @@ describe("board script subtasks", () => {
     expect(checkMark(card, "s1", "done", "script", null, "other")).toEqual({
       ok: false,
       reason: 'subtask s1 is for the script "land"',
+      denyReason: "subtask_script_mismatch",
     });
     const unnamed = planSubtasks([], [{ text: "Anything", owner: "script" }]);
     if (!unnamed.ok) throw new Error(unnamed.reason);
@@ -2062,6 +2065,7 @@ describe("board script subtasks", () => {
     expect(checkMark(marked, "s1", "open", "script", null, "land")).toEqual({
       ok: false,
       reason: "only an evaluator reopens a subtask",
+      denyReason: "role_not_allowed",
     });
   });
 
@@ -2070,6 +2074,7 @@ describe("board script subtasks", () => {
     expect(checkHandBack(card, "s1", "land", "  ")).toEqual({
       ok: false,
       reason: "say what failed or didn't match",
+      denyReason: "handoff_note_required",
     });
     const evaluatorCard = {
       number: 4,
@@ -2089,6 +2094,7 @@ describe("board script subtasks", () => {
     expect(checkHandBack(evaluatorCard, "s1", "land", "x")).toEqual({
       ok: false,
       reason: "subtask s1 isn't a script's",
+      denyReason: "subtask_owner_mismatch",
     });
     const finished = {
       ...card,
@@ -2099,14 +2105,17 @@ describe("board script subtasks", () => {
     expect(checkHandBack(finished, "s1", "land", "x")).toEqual({
       ok: false,
       reason: "subtask s1 is already done",
+      denyReason: "subtask_not_open",
     });
     expect(checkHandBack(card, "s1", "other", "x")).toEqual({
       ok: false,
       reason: 'subtask s1 is for the script "land"',
+      denyReason: "subtask_script_mismatch",
     });
     expect(checkHandBack(card, "s2", "land", "x")).toEqual({
       ok: false,
       reason: "subtask s2 is in step 2; finish step 1 first",
+      denyReason: "subtask_not_in_current_step",
     });
   });
 
