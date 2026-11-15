@@ -873,7 +873,9 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                         if con.execute("SELECT 1 FROM kv WHERE k=?", ("create_unanswered:" + key,)).fetchone():
                             # Replaying the retained key resolves the old allocation; it is not a new pool slot.
                             rows, can_create = [], True
-                        if source and not rows and not can_create and not pending and not _source_member(con, key, source):
+                        # A failed-over run can still use home when it recovers, even without a compatible Boat box.
+                        if (not failover and source and not rows and not can_create and not pending
+                                and not _source_member(con, key, source)):
                             cap = pool_cap(con, key)
                             raise OffboxError(
                                 f"this run needs a new {key} pool box ({source}), but the pool is full "

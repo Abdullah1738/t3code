@@ -18,6 +18,14 @@ from offbox_lib import allocation, api, cli, common, home, lease, misc, outage, 
 from test_capacity import Isolated
 
 
+SOURCE_REQUESTS = (
+    ('fresh', dict(fresh=True)),
+    ('template', dict(template='other')),
+    ('base', dict(base='saved')),
+    ('qualified base', dict(base='other:saved')),
+)
+
+
 class Clock:
     def __init__(self):
         self.t = 1000.
@@ -141,6 +149,40 @@ class FailbackTests(Isolated):
         self.assertEqual(error.exception.code, 92)
         self.assertEqual(self.clock.t, 1600)
         probe.assert_not_called()
+
+    def test_missing_source_failover_waits_for_home(self):
+        self.full_pool()
+        for label, options in SOURCE_REQUESTS:
+            with self.subTest(source=label):
+                self.clock.t = 1000
+                self.output.seek(0)
+                self.output.truncate()
+                with patch.object(home, 'probe', side_effect=lambda **kw: None if self.clock.t >= 1060 else 'down') as probe, \
+                        patch.object(lease, 'acquire_private') as create, patch.object(lease, '_reuse') as reuse:
+                    with self.assertRaises(home.FailbackReady) as ready:
+                        pool.acquire(self.me, run_id='mine', **options)
+                self.assertEqual(ready.exception.run_id, 'mine')
+                self.assertEqual(ready.exception.waited, 60)
+                self.assertEqual(probe.call_count, 2)
+                create.assert_not_called()
+                reuse.assert_not_called()
+                for table in ('pool_waiters', 'pool_pending', 'pool_cap_callers'):
+                    self.assertEqual(self.con.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0], 0)
+                self.assertEqual(self.output.getvalue().count('no time limit'), 1)
+                self.assertNotIn('600s', self.output.getvalue())
+
+    def test_missing_source_pinned_boat_still_refuses_without_probing(self):
+        self.full_pool()
+        for label, options in SOURCE_REQUESTS:
+            with self.subTest(source=label), patch.dict(os.environ, {home.FAILOVER_ENV: ''}), \
+                    patch.object(home, 'probe') as probe, patch.object(lease, 'acquire_private') as create:
+                with self.assertRaisesRegex(common.OffboxError, "waiting can't help") as error:
+                    pool.acquire(self.me, run_id='mine', **options)
+                self.assertEqual(error.exception.code, 2)
+                self.assertEqual(self.clock.t, 1000)
+                probe.assert_not_called()
+                create.assert_not_called()
+                self.assertEqual(self.con.execute('SELECT COUNT(*) FROM pool_waiters').fetchone()[0], 0)
 
     def test_boat_granted_before_home_recovers_never_checks_back(self):
         self.box('one', member=True)
