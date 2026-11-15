@@ -2339,6 +2339,218 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       assert.deepEqual(recovery?.restartCancelledBackgroundWork, work);
     }),
   );
+  it.effect("keeps cancellation provenance through stale lifecycle updates in SQL and memory", () =>
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const threadId = yield* addRolledBackRecoveryCandidate("cancel-reason");
+      const initial = yield* store.getThreadProjection(threadId);
+      const run = initial.runs[0]!;
+      assert.isUndefined(run.cancelReason);
+      const now = yield* DateTime.now;
+      let memory = initial;
+      for (const [index, payload] of [
+        {
+          ...run,
+          status: "cancelled" as const,
+          cancelReason: "server_shutdown" as const,
+          cancelDetail: "Server shut down.",
+        },
+        { ...run, status: "cancelled" as const },
+        { ...run, status: "cancelled" as const, cancelReason: "provider_cancelled" as const },
+      ].entries()) {
+        const event = {
+          id: EventId.make(`event:cancel-reason:${index}`),
+          type: "run.updated" as const,
+          threadId,
+          runId: run.id,
+          providerInstanceId,
+          occurredAt: now,
+          payload,
+        };
+        yield* store.apply(event);
+        memory = ProjectionStore.applyToProjection(memory, event);
+        const stored = (yield* store.getThreadRecords(threadId, ["runs"])).runs[0]!;
+        assert.equal(stored.cancelReason, "server_shutdown");
+        assert.equal(stored.cancelDetail, "Server shut down.");
+        assert.equal(memory.runs[0]?.cancelReason, stored.cancelReason);
+        assert.equal(memory.runs[0]?.cancelDetail, stored.cancelDetail);
+      }
+    }),
+  );
+  it.effect.each(
+    (["interrupted", "cancelled"] as const).flatMap((status) =>
+      (
+        [undefined, "provider_cancelled", "provider_interrupted", "server_shutdown"] as const
+      ).flatMap((previous) =>
+        (
+          [
+            "user_stop",
+            "task_cancel",
+            "thread_reset",
+            "card_stop",
+            "delegated_parent_cancelled",
+            "superseded",
+            "task_stalled",
+          ] as const
+        ).map((cancelReason) => ({ status, previous, cancelReason })),
+      ),
+    ),
+  )(
+    "late Stop provenance patches only metadata in SQL and memory ($status / $previous / $cancelReason)",
+    ({ status, previous, cancelReason }) =>
+      Effect.gen(function* () {
+        const store = yield* ProjectionStore.ProjectionStoreV2;
+        const threadId = yield* addRolledBackRecoveryCandidate(
+          `late-stop:${status}:${previous ?? "missing"}:${cancelReason}`,
+        );
+        let memory = yield* store.getThreadProjection(threadId);
+        const run = memory.runs[0]!;
+        const now = yield* DateTime.now;
+        const terminal = {
+          id: EventId.make(`${threadId}:terminal`),
+          type: "run.updated" as const,
+          threadId,
+          runId: run.id,
+          occurredAt: now,
+          payload: {
+            ...run,
+            status,
+            cancelReason: previous,
+            cancelDetail: previous === "server_shutdown" ? "Server shut down." : undefined,
+            completedAt: now,
+          },
+        };
+        yield* store.apply(terminal);
+        memory = ProjectionStore.applyToProjection(memory, terminal);
+        const request = {
+          id: EventId.make(`${threadId}:stop`),
+          type: "turn-item.updated" as const,
+          threadId,
+          runId: run.id,
+          occurredAt: now,
+          payload: {
+            id: TurnItemId.make(`${threadId}:request`),
+            threadId,
+            runId: run.id,
+            nodeId: run.rootNodeId,
+            providerThreadId: run.providerThreadId,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 2,
+            status: "completed" as const,
+            title: "Interrupt requested",
+            startedAt: now,
+            completedAt: now,
+            updatedAt: now,
+            type: "run_interrupt_request" as const,
+            cancelReason,
+            message: "Stop before provider start.",
+          },
+        };
+        yield* store.apply(request);
+        memory = ProjectionStore.applyToProjection(memory, request);
+        const stale = { ...terminal, id: EventId.make(`${threadId}:stale-terminal`) };
+        yield* store.apply(stale);
+        memory = ProjectionStore.applyToProjection(memory, stale);
+        const stored = (yield* store.getThreadRecords(threadId, ["runs"])).runs[0]!;
+        const expectedReason = previous === "server_shutdown" ? previous : cancelReason;
+        const expectedDetail =
+          previous === "server_shutdown" ? "Server shut down." : "Stop before provider start.";
+        assert.equal(stored.status, status);
+        assert.equal(stored.cancelReason, expectedReason);
+        assert.equal(stored.cancelDetail, expectedDetail);
+        assert.equal(memory.runs[0]?.status, status);
+        assert.equal(memory.runs[0]?.cancelReason, expectedReason);
+        assert.equal(memory.runs[0]?.cancelDetail, expectedDetail);
+      }),
+  );
+  it.effect.each(
+    (
+      [
+        "thread_archive",
+        "thread_settle",
+        "thread_reset",
+        "workspace_change",
+        "runtime_mode_change",
+        "superseded",
+        "session_detach",
+      ] as const
+    ).flatMap((cancelReason) =>
+      (["running", "completed"] as const).flatMap((status) =>
+        [true, false].map((matches) => ({ cancelReason, status, matches })),
+      ),
+    ),
+  )(
+    "detach preserves lifecycle and stamps only bound active runs ($cancelReason / $status / $matches)",
+    ({ cancelReason, status, matches }) =>
+      Effect.gen(function* () {
+        const store = yield* ProjectionStore.ProjectionStoreV2;
+        const suffix = `detach:${cancelReason}:${status}:${matches}`;
+        const threadId = yield* addRolledBackRecoveryCandidate(suffix);
+        let memory = yield* store.getThreadProjection(threadId);
+        const at = yield* DateTime.now;
+        const sessionId = ProviderSessionId.make(`${suffix}:session`);
+        const providerThreadId = ProviderThreadId.make(`${suffix}:provider-thread`);
+        const providerEvent = {
+          id: EventId.make(`${suffix}:provider`),
+          type: "provider-thread.updated" as const,
+          threadId,
+          occurredAt: at,
+          payload: {
+            id: providerThreadId,
+            driver,
+            providerInstanceId,
+            providerSessionId: sessionId,
+            appThreadId: threadId,
+            ownerNodeId: null,
+            nativeThreadRef: null,
+            nativeConversationHeadRef: null,
+            status: "idle" as const,
+            firstRunOrdinal: null,
+            lastRunOrdinal: null,
+            handoffIds: [],
+            contextUsage: null,
+            forkedFrom: null,
+            createdAt: at,
+            updatedAt: at,
+          },
+        };
+        yield* store.apply(providerEvent);
+        memory = ProjectionStore.applyToProjection(memory, providerEvent);
+        const runEvent = {
+          id: EventId.make(`${suffix}:run`),
+          type: "run.updated" as const,
+          threadId,
+          occurredAt: at,
+          payload: { ...memory.runs[0]!, status, providerThreadId },
+        };
+        yield* store.apply(runEvent);
+        memory = ProjectionStore.applyToProjection(memory, runEvent);
+        const detached = {
+          id: EventId.make(`${suffix}:detach`),
+          type: "provider-session.detached" as const,
+          threadId,
+          occurredAt: at,
+          payload: {
+            providerSessionId: matches ? sessionId : ProviderSessionId.make(`${suffix}:other`),
+            detachedAt: at,
+            cancelReason,
+            reason: "D".repeat(501),
+          },
+        };
+        yield* store.apply(detached);
+        memory = ProjectionStore.applyToProjection(memory, detached);
+        const stored = (yield* store.getThreadRecords(threadId, ["runs"])).runs[0]!;
+        const stamps = matches && status === "running";
+        assert.equal(stored.status, status);
+        assert.equal(stored.cancelReason, stamps ? cancelReason : undefined);
+        assert.equal(stored.cancelDetail, stamps ? "D".repeat(500) : undefined);
+        assert.equal(memory.runs[0]?.status, stored.status);
+        assert.equal(memory.runs[0]?.cancelReason, stored.cancelReason);
+        assert.equal(memory.runs[0]?.cancelDetail, stored.cancelDetail);
+      }),
+  );
   it.effect("recentRunLimit keeps unfinished runs plus the newest N", () =>
     Effect.gen(function* () {
       const store = yield* ProjectionStore.ProjectionStoreV2;

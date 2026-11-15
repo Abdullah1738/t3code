@@ -373,6 +373,17 @@ export const OrchestratorV2Error = Schema.Union([
 export type OrchestratorV2Error = typeof OrchestratorV2Error.Type;
 const isThreadNotIdleError = Schema.is(OrchestratorThreadNotIdleError);
 
+const interruptCancelReason = (
+  command: Extract<
+    OrchestrationV2ServerCommand,
+    { readonly type: "run.interrupt" | "thread.stop" }
+  >,
+) =>
+  command.cancelReason ??
+  (command.type === "run.interrupt" && command.delegatedTaskStall !== undefined
+    ? "task_stalled"
+    : "user_stop");
+
 export interface OrchestratorV2DispatchResult {
   readonly sequence: number;
   readonly storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>;
@@ -1017,6 +1028,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const providerAdapters = yield* ProviderAdapterRegistryV2;
   const continuationRequests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
   const providerSessions = yield* ProviderSessionManagerV2;
+  const runExecution = yield* Effect.serviceOption(RunExecutionService.RunExecutionServiceV2);
   const providerSwitchService = yield* ProviderSwitchServiceV2;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const runtimePolicy = yield* RuntimePolicyV2;
@@ -1337,6 +1349,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
       readonly projection: Pick<OrchestrationV2ThreadProjection, "nodes" | "attempts">;
       readonly run: OrchestrationV2Run;
+      readonly reason: NonNullable<OrchestrationV2Run["cancelReason"]>;
+      readonly detail?: string | undefined;
       readonly now: DateTime.Utc;
     }) {
       const rootNode =
@@ -1360,6 +1374,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         payload: {
           ...input.run,
           status: "cancelled",
+          cancelReason: input.reason,
+          cancelDetail: input.detail,
           queuePosition: null,
           completedAt: input.now,
         },
@@ -1416,7 +1432,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         const refreshed = refreshPullRequestCheckWake(message, links);
         if (refreshed === undefined) continue;
         if (refreshed === null) {
-          yield* emitQueuedRunCancellation({ command, events, projection, run, now });
+          yield* emitQueuedRunCancellation({
+            command,
+            events,
+            projection,
+            run,
+            now,
+            reason: "superseded",
+            detail: "Pull request checks changed before this notification was delivered.",
+          });
         } else {
           // Mixed reports keep their remarks in the same queued run and delivery position.
           yield* emit(
@@ -2531,6 +2555,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           events,
           projection,
           run: deliveryRun,
+          reason:
+            command.type === "delegated_task.completion-delivery.acknowledge"
+              ? "superseded"
+              : "task_cancel",
+          detail: "No delegated task results remain in this delivery.",
           now,
         });
         return;
@@ -2636,6 +2665,20 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         events: input.events,
         projection: input.projection,
         run: deliveryRun,
+        reason:
+          input.command.type === "queued-run.cancel"
+            ? (input.command.reason ?? "queued_cancel")
+            : input.command.type === "thread.settle"
+              ? "thread_settle"
+              : input.command.type === "thread.archive"
+                ? "thread_archive"
+                : input.command.type === "run.interrupt" || input.command.type === "thread.stop"
+                  ? interruptCancelReason(input.command)
+                  : "superseded",
+        detail:
+          input.command.type === "queued-run.cancel"
+            ? input.command.detail
+            : "Delegated completion delivery disposed.",
         now: input.now,
       });
     }
@@ -3224,6 +3267,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             type: "queued-run.cancel",
             commandId: command.commandId,
             threadId: command.threadId,
+            reason: "thread_settle",
             runId: run.id,
           },
           events,
@@ -3910,7 +3954,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           runId: run.id,
           providerInstanceId: run.providerInstanceId,
           occurredAt: now,
-          payload: { ...run, status: "cancelled", queuePosition: null, completedAt: now },
+          payload: {
+            ...run,
+            status: "cancelled",
+            cancelReason: "thread_archive",
+            cancelDetail: "Thread archived before this run started.",
+            queuePosition: null,
+            completedAt: now,
+          },
         });
       }
       for (const run of preparingRuns) {
@@ -4025,6 +4076,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               payload: {
                 providerSessionId: session.id,
                 detachedAt: now,
+                cancelReason:
+                  command.type === "thread.archive"
+                    ? "thread_archive"
+                    : command.type === "thread.settle"
+                      ? "thread_settle"
+                      : command.type === "thread.metadata.update"
+                        ? "workspace_change"
+                        : command.type === "thread.runtime-mode.set"
+                          ? "runtime_mode_change"
+                          : "superseded",
                 reason:
                   command.type === "thread.archive"
                     ? "Thread archived."
@@ -4117,6 +4178,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         payload: {
           providerSessionId: session.id,
           detachedAt: now,
+          cancelReason: command.cancelReason ?? "session_detach",
           ...(command.reason === undefined ? {} : { reason: command.reason }),
         },
       });
@@ -4668,6 +4730,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 type: "queued-run.cancel",
                 commandId: input.command.commandId,
                 threadId: input.command.threadId,
+                reason: "superseded",
                 runId: wake.id,
               },
               input.events,
@@ -8864,6 +8927,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       payload: {
         ...queuedRun,
         status: "cancelled",
+        cancelReason: "promoted_to_steer",
+        cancelDetail: "Queued message promoted to steer an active run.",
         queuePosition: null,
         completedAt: now,
       },
@@ -9062,6 +9127,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       payload: {
         ...queuedRun,
         status: "cancelled",
+        cancelReason: command.reason ?? "queued_cancel",
+        cancelDetail: command.detail,
         queuePosition: null,
         completedAt: now,
       },
@@ -10190,6 +10257,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         },
       });
     }
+    let cancelReason =
+      input.command.type === "run.interrupt"
+        ? interruptCancelReason(input.command)
+        : run.cancelReason;
+    let cancelDetail =
+      input.command.type === "run.interrupt"
+        ? input.command.reason?.slice(0, 500)
+        : run.cancelDetail;
     if (providerThread !== undefined) {
       const recorded =
         input.command.type === "thread.background-work.settle"
@@ -10200,6 +10275,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               })
               .pipe(mapDispatchError(input.command))
           : undefined;
+      const request = recorded?.turnItems.find((item) => item.type === "run_interrupt_request");
+      cancelReason ??= request?.cancelReason;
+      cancelDetail ??=
+        request?.message === "Interrupt requested" ? undefined : request?.message.slice(0, 500);
       const reason =
         input.command.type === "run.interrupt"
           ? input.command.reason
@@ -10224,6 +10303,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       payload: {
         ...runWithoutDelegatedCompletion,
         status: "interrupted",
+        cancelReason: cancelReason ?? "provider_interrupted",
+        cancelDetail,
         completedAt: input.now,
       },
     });
@@ -10311,6 +10392,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         completedAt: now,
         updatedAt: now,
         type: "run_interrupt_request",
+        cancelReason: interruptCancelReason(command),
         message: command.reason ?? "Interrupt requested",
       },
     });
@@ -10402,6 +10484,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             type: "queued-run.cancel",
             commandId: input.command.commandId,
             threadId: thread.id,
+            reason: interruptCancelReason(input.command),
             runId: run.id,
           },
           input.events,
@@ -10823,6 +10906,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         payload: run,
       });
     }
+    if (run !== undefined && ["preparing", "starting", "running", "waiting"].includes(run.status)) {
+      run = {
+        ...run,
+        cancelReason: interruptCancelReason(command),
+        cancelDetail: command.reason?.slice(0, 500),
+      };
+    }
     const rootNode =
       run?.rootNodeId === null
         ? undefined
@@ -10998,6 +11088,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       completedAt: now,
       updatedAt: now,
       type: "run_interrupt_request",
+      cancelReason: interruptCancelReason(command),
       message: command.reason ?? "Interrupt requested",
     };
 
@@ -11074,6 +11165,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           .get(providerThread.providerSessionId)
           .pipe(mapDispatchError(command));
         if (Option.isSome(live) && live.value.interruptStartingRun !== undefined) {
+          // Provider cleanup can finish usage before the interrupt request commits.
+          if (Option.isSome(runExecution))
+            yield* runExecution.value.noteCancellation(run.id, interruptRequestItem.cancelReason!);
           yield* live.value
             .interruptStartingRun({ providerThread, runId: run.id, attemptId: attempt.id })
             .pipe(mapDispatchError(command));
@@ -11210,7 +11304,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           nodeId: rootNode.id,
           providerInstanceId: run.providerInstanceId,
           occurredAt: now,
-          payload: { ...latestRun, status: "interrupted", completedAt: now },
+          payload: {
+            ...latestRun,
+            status: "interrupted",
+            cancelReason: run.cancelReason,
+            cancelDetail: run.cancelDetail,
+            completedAt: now,
+          },
         });
       }
       yield* stopRemainingWork();
@@ -11469,6 +11569,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             threadId: command.threadId,
             runId: target.id,
             holdQueue: true,
+            cancelReason: interruptCancelReason(command),
             ...(command.reason === undefined ? {} : { reason: command.reason }),
           },
           interruptEvents,
@@ -12289,6 +12390,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...task,
         providerThreadId: childRun.providerThreadId,
         status: terminalStatus,
+        cancelReason: childRun.cancelReason,
+        cancelDetail: childRun.cancelDetail,
         ...(childRun.delegatedTaskStall === undefined ? {} : { failureReason: "stalled" as const }),
         ...(childRun.launchRecovery?.kind === "model_access"
           ? { model: childRun.modelSelection.model }
@@ -13760,6 +13863,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 type: "queued-run.cancel",
                 commandId: CommandId.make(`command:queue-steer:discard:${run.id}:${attemptId}`),
                 threadId,
+                reason: "superseded",
                 runId: run.id,
               });
               continue;

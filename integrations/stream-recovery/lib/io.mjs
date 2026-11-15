@@ -490,9 +490,9 @@ export async function threadByNative(ses) {
   }
 }
 
-export async function interruptThread(threadId, { clientRequestId, reason, expectedRunId } = {}) {
+export async function interruptThread(threadId, { clientRequestId, reason, expectedRunId, cancelReason } = {}) {
   assertRecoveryActive({ readControl });
-  return ctl("POST", `/threads/${encodeURIComponent(threadId)}/interrupt`, { clientRequestId, reason, expectedRunId });
+  return ctl("POST", `/threads/${encodeURIComponent(threadId)}/interrupt`, { clientRequestId, reason, expectedRunId, cancelReason });
 }
 
 // Live top-level threads (running, waiting, queued, needs-input).

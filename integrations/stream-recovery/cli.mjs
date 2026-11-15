@@ -205,7 +205,7 @@ async function actImpl({ db, incident, g, dryRun, progress = {}, save = () => {}
     if (!progress.queueOk && (plan.resumeQueue || g.staleHeld.length)) {
       for (const r of g.staleHeld) {
         io.assertReplicaFresh(db);
-        await io.dispatchCommand({ type: 'queued-run.cancel', commandId: `${incident.id}:cancel:${r.run_id}`, threadId: plan.threadId, runId: r.run_id });
+        await io.dispatchCommand({ type: 'queued-run.cancel', commandId: `${incident.id}:cancel:${r.run_id}`, threadId: plan.threadId, runId: r.run_id, reason: 'superseded', detail: 'Stale coordination pulse replaced during restart recovery.' });
       }
       if (g.held.length) {
         io.assertReplicaFresh(db);

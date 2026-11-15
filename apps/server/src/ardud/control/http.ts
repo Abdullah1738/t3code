@@ -15,6 +15,7 @@ import {
   MessageId,
   type ModelSelection,
   type OrchestrationV2Command,
+  OrchestrationV2CancelReason,
   type OrchestrationV2StoredEvent,
   type OrchestrationV2ThreadShell,
   ProjectId,
@@ -334,6 +335,7 @@ const SendBody = Schema.Struct({
 
 const InterruptBody = Schema.Struct({
   reason: OptionalString,
+  cancelReason: Schema.optional(OrchestrationV2CancelReason),
   clientRequestId: OptionalString,
   expectedRunId: OptionalString,
   expectedAttemptId: OptionalString,
@@ -1410,6 +1412,7 @@ const makeRoutes = Effect.gen(function* () {
           commandId: yield* commandIdFor(`interrupt:${threadId}`, body.clientRequestId),
           threadId: shell.id,
           ...(body.reason === undefined ? {} : { reason: body.reason }),
+          ...(body.cancelReason === undefined ? {} : { cancelReason: body.cancelReason }),
           ...(expectedRunId === undefined ? {} : { runId: RunId.make(expectedRunId) }),
           ...(body.expectedAttemptId === undefined
             ? {}

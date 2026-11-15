@@ -22,7 +22,7 @@ type Attribution = {
 export interface RunUsageInput {
   readonly run: Pick<
     OrchestrationV2Run,
-    "id" | "threadId" | "startedAt" | "providerInstanceId" | "delegatedTaskId"
+    "id" | "threadId" | "startedAt" | "providerInstanceId" | "delegatedTaskId" | "cancelReason"
   >;
   readonly attempt: Pick<OrchestrationV2RunAttempt, "id">;
   readonly appThread: Pick<OrchestrationV2AppThread, "lineage">;
@@ -32,6 +32,7 @@ export interface RunUsageInput {
 export const makeRunUsageState = () => ({
   turns: new Map<string, OrchestrationV2ProviderTurn>(),
   finished: false,
+  cancelReason: undefined as OrchestrationV2Run["cancelReason"],
   attribution: undefined as Effect.Effect<Attribution> | undefined,
   model: undefined as string | undefined,
   mixedModels: false,
@@ -135,6 +136,14 @@ export const makeRunUsageObserver = Effect.fn("RunUsage.observeRun")(function* (
       // Provider turns, including retry attempts, rather than inferred model response counts.
       turnCount: turns.length,
       endReason: status,
+      ...(status === "cancelled" || status === "interrupted"
+        ? {
+            cancelReason:
+              state.cancelReason ??
+              input.run.cancelReason ??
+              (status === "cancelled" ? "provider_cancelled" : "provider_interrupted"),
+          }
+        : {}),
       usageStatus:
         usage.length > 0 && usage.every((row) => row?.usageStatus === "complete")
           ? "complete"

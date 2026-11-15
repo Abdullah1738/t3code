@@ -307,6 +307,155 @@ const seedParentWithTerminalTask = (input: {
   });
 
 it.layer(layerTest)("delegated completion delivery repairs", (it) => {
+  const queuedCompletion = Effect.fn("test.queuedCompletion")(function* (
+    name: string,
+    delegated = false,
+  ) {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const sink = yield* EventSink.EventSinkV2;
+    const now = yield* DateTime.now;
+    const threadId = ThreadId.make(`thread:${name}`);
+    const runId = RunId.make(`run:${name}`);
+    const taskId = NodeId.make(`task:${name}`);
+    yield* seedParentWithTerminalTask({
+      threadId,
+      projectId: ProjectId.make(`project:${name}`),
+      runId,
+      rootNodeId: NodeId.make(`root:${name}`),
+      taskId,
+      deliveryState: "claimed",
+      deliveryTaskIds: [taskId],
+      completionWake: "always",
+      now,
+    });
+    const parent = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+    if (delegated)
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make(`event:${name}:delegated`),
+            type: "run.updated",
+            threadId,
+            runId,
+            occurredAt: now,
+            payload: { ...parent, delegatedTaskId: NodeId.make(`outer-task:${name}`) },
+          },
+        ],
+      });
+    const delivery = parent.delegatedCompletion!.delivery!;
+    yield* orchestrator.dispatch({
+      type: "message.dispatch",
+      createdBy: "agent",
+      creationSource: "server",
+      commandId: CommandId.make(`command:${name}:delivery`),
+      threadId,
+      messageId: delivery.messageId,
+      text: "Delegated task completed",
+      attachments: [],
+      modelSelection,
+      dispatchMode: { type: "queue_after_active" },
+      delegatedCompletion: {
+        parentRunId: runId,
+        generation: delivery.generation,
+        taskIds: delivery.taskIds,
+      },
+    });
+    const notification = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+      (run) => run.userMessageId === delivery.messageId,
+    )!;
+    assert.equal(notification.status, "queued");
+    return { threadId, runId, taskId, deliveryRunId: notification.id, now };
+  });
+
+  it.effect.each(["acknowledge", "dispose"] as const)(
+    "records the source when %s removes the last queued task result",
+    (operation) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const { threadId, runId, taskId, deliveryRunId } = yield* queuedCompletion(
+          `resolution-${operation}`,
+        );
+        yield* orchestrator.dispatch(
+          operation === "acknowledge"
+            ? {
+                type: "delegated_task.completion-delivery.acknowledge",
+                commandId: CommandId.make(`command:${operation}:result`),
+                parentThreadId: threadId,
+                taskId,
+                observedByRunId: runId,
+              }
+            : {
+                type: "delegated_task.completion-delivery.dispose",
+                commandId: CommandId.make(`command:${operation}:result`),
+                parentThreadId: threadId,
+                taskId,
+              },
+        );
+        const projection = yield* orchestrator.getThreadProjection(threadId);
+        const delivery = projection.runs.find((run) => run.id === deliveryRunId)!;
+        assert.equal(delivery.status, "cancelled");
+        assert.equal(
+          delivery.cancelReason,
+          operation === "acknowledge" ? "superseded" : "task_cancel",
+        );
+        assert.equal(projection.subagents.find((task) => task.id === taskId)?.status, "completed");
+        assert.equal(
+          projection.subagents.find((task) => task.id === taskId)?.result,
+          "child finished",
+        );
+        assert.equal(projection.runs.find((run) => run.id === runId)?.status, "running");
+      }),
+  );
+
+  it.effect.each(
+    (
+      [
+        undefined,
+        "user_stop",
+        "task_cancel",
+        "thread_reset",
+        "card_stop",
+        "delegated_parent_cancelled",
+        "superseded",
+        "task_stalled",
+      ] as const
+    ).flatMap((cancelReason) => [false, true].map((holdQueue) => ({ cancelReason, holdQueue }))),
+  )(
+    "stalled delegated cleanup preserves $cancelReason on its queued delivery (holdQueue=$holdQueue)",
+    ({ cancelReason, holdQueue }) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const { threadId, runId, deliveryRunId, now } = yield* queuedCompletion(
+          `stall-${cancelReason ?? "inferred"}-${holdQueue}`,
+          true,
+        );
+        yield* TestClock.adjust("1 minute");
+        yield* orchestrator.dispatch({
+          type: "run.interrupt",
+          commandId: CommandId.make(`command:${threadId}:stall`),
+          threadId,
+          runId,
+          fenced: true,
+          holdQueue,
+          ...(cancelReason === undefined ? {} : { cancelReason }),
+          delegatedTaskStall: {
+            idleTimeoutMs: 60_000,
+            lastProgressAt: now,
+            lastProgressKind: "run_started",
+          },
+        });
+        const projection = yield* orchestrator.getThreadProjection(threadId);
+        const delivery = projection.runs.find((run) => run.id === deliveryRunId)!;
+        assert.equal(delivery.status, "cancelled");
+        assert.equal(delivery.cancelReason, cancelReason ?? "task_stalled");
+        assert.equal(projection.runs.find((run) => run.id === runId)?.status, "interrupted");
+        assert.equal(
+          projection.runs.find((run) => run.id === runId)?.cancelReason,
+          cancelReason ?? "task_stalled",
+        );
+      }),
+  );
+
   it.effect(
     "interrupting a completion wake disposes both cohorts without reviving them on late results",
     () =>

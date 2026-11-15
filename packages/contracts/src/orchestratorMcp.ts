@@ -35,6 +35,7 @@ import {
 import { ThreadTitleRegeneration } from "./threadTitle.ts";
 import {
   OrchestrationV2Actor,
+  OrchestrationV2CancelReason,
   OrchestrationV2CreationSource,
   OrchestrationV2ProviderFailureCategory,
   OrchestrationV2RunStatus,
@@ -262,6 +263,8 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
     }),
   ),
   failureReason: Schema.optional(Schema.Literal("stalled")),
+  cancelReason: Schema.optional(OrchestrationV2CancelReason),
+  cancelDetail: Schema.optional(Schema.String),
   lastProgressAt: Schema.optional(Schema.NullOr(Schema.String)),
   lastProgressKind: Schema.optional(Schema.NullOr(Schema.String)),
   thinkingSince: Schema.optional(Schema.NullOr(Schema.String)),
@@ -486,9 +489,12 @@ export const OrchestratorMcpThreadDetail = Schema.Struct({
 export type OrchestratorMcpThreadDetail = typeof OrchestratorMcpThreadDetail.Type;
 
 export const OrchestratorMcpThreadRun = Schema.Struct({
+  statusSummary: Schema.optional(Schema.String),
   runId: RunId,
   ordinal: PositiveInt,
   status: OrchestrationV2RunStatus,
+  cancelReason: Schema.optional(OrchestrationV2CancelReason),
+  cancelDetail: Schema.optional(Schema.String),
   providerInstanceId: ProviderInstanceId,
   model: Schema.String,
   requestedAt: IsoDateTime,
@@ -539,6 +545,8 @@ export const OrchestratorMcpThreadSendInput = Schema.Struct({
 export type OrchestratorMcpThreadSendInput = typeof OrchestratorMcpThreadSendInput.Type;
 
 export const OrchestratorMcpThreadSendResult = Schema.Struct({
+  cancelReason: Schema.optional(OrchestrationV2CancelReason),
+  cancelDetail: Schema.optional(Schema.String),
   threadId: ThreadId,
   messageId: MessageId,
   runId: RunId,
@@ -559,6 +567,8 @@ export const OrchestratorMcpThreadWaitInput = Schema.Struct({
 export type OrchestratorMcpThreadWaitInput = typeof OrchestratorMcpThreadWaitInput.Type;
 
 export const OrchestratorMcpThreadWaitResult = Schema.Struct({
+  cancelReason: Schema.optional(OrchestrationV2CancelReason),
+  cancelDetail: Schema.optional(Schema.String),
   threadId: ThreadId,
   runId: Schema.NullOr(RunId),
   status: OrchestratorMcpThreadStatus,
@@ -575,6 +585,8 @@ export const OrchestratorMcpThreadInterruptInput = Schema.Struct({
 export type OrchestratorMcpThreadInterruptInput = typeof OrchestratorMcpThreadInterruptInput.Type;
 
 export const OrchestratorMcpThreadInterruptResult = Schema.Struct({
+  cancelReason: Schema.optional(OrchestrationV2CancelReason),
+  cancelDetail: Schema.optional(Schema.String),
   threadId: ThreadId,
   runId: Schema.NullOr(RunId),
   status: Schema.Union([

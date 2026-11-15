@@ -203,7 +203,11 @@ it("readThread prefers activity-run status over a newer cancelled queued run", a
     }),
     runs: [
       makeRun({ id: activeRunId, ordinal: 1, status: "running" }),
-      makeRun({ id: cancelledRunId, ordinal: 2, status: "cancelled" }),
+      {
+        ...makeRun({ id: cancelledRunId, ordinal: 2, status: "cancelled" }),
+        cancelReason: "server_shutdown",
+        cancelDetail: "Server shut down.",
+      },
     ],
     visibleTurnItems: [],
     runtimeRequests: [],
@@ -261,6 +265,12 @@ it("readThread prefers activity-run status over a newer cancelled queued run", a
     const result = yield* service.readThread(makeScope(), { threadId: parentThreadId });
     expect(result.thread.status).toBe("running");
     expect(result.thread.latestRunId).toBe(cancelledRunId);
+    expect(result.recentRuns[0]?.cancelReason).toBe("server_shutdown");
+    expect(result.recentRuns[0]?.cancelDetail).toBe("Server shut down.");
+    expect(result.recentRuns[0]?.statusSummary).toBe(
+      "cancelled (server_shutdown: Server shut down.)",
+    );
+    expect(JSON.stringify(result)).toContain("cancelled (server_shutdown: Server shut down.)");
     expect(result.thread.activeRunId).toBe(activeRunId);
     // Native harnesses don't know their own thread id: omitting it reads the caller's thread.
     const own = yield* service.readThread(makeScope(), {});
@@ -351,7 +361,49 @@ it.each([
   "interrupted",
   "fallback",
   "fallback-resumed",
+  "continuation-cancelled",
+  "continuation-interrupted",
+  "continuation-interrupted-mirrored",
+  "continuation-interrupted-mirrored-transfer",
+  "continuation-interrupted-mirrored-provider-interrupted-transfer",
+  "continuation-interrupted-mirrored-provider-cancelled-transfer",
+  "continuation-interrupted-mirrored-unknown-transfer",
+  "continuation-interrupted-mirrored-detail-only-transfer",
+  "continuation-interrupted-mirrored-specific-transfer",
+  "continuation-interrupted-mirrored-provider-interrupted-no-detail-transfer",
+  "continuation-interrupted-mirrored-legacy",
+  "continuation-interrupted-missing",
+  "continuation-interrupted-no-detail",
+  "continuation-completed",
+  "continuation-running",
 ])("taskStatus exposes live child state: %s", async (state) => {
+  const continuation = state === "fallback-resumed" || state.startsWith("continuation-");
+  const mirrored = state.includes("-mirrored");
+  const legacy = state.endsWith("-legacy");
+  const transferred = state.endsWith("-transfer");
+  const mirroredCause = state.includes("-provider-interrupted")
+    ? "provider_interrupted"
+    : state.includes("-provider-cancelled")
+      ? "provider_cancelled"
+      : state.includes("-unknown")
+        ? "unknown"
+        : state.includes("-specific")
+          ? "user_stop"
+          : legacy || transferred
+            ? undefined
+            : "task_cancel";
+  const noDetail = state.includes("-no-detail");
+  const continuationStatus = state.includes("interrupted")
+    ? "interrupted"
+    : state === "continuation-cancelled"
+      ? "cancelled"
+      : state === "continuation-running"
+        ? "running"
+        : "completed";
+  const continuationCause =
+    continuation &&
+    (continuationStatus === "interrupted" || continuationStatus === "cancelled") &&
+    !state.endsWith("-missing");
   const parentProjection = {
     thread: baseThread({
       threadId: parentThreadId,
@@ -378,7 +430,18 @@ it.each([
     visibleTurnItems: [],
     runtimeRequests: [],
     messages: [],
-    contextTransfers: [],
+    contextTransfers: transferred
+      ? [
+          {
+            id: "transfer:continued-result",
+            type: "subagent_result",
+            sourceThreadId: childThreadId,
+            targetThreadId: parentThreadId,
+            sourcePoint: { runId: RunId.make("run-mcp-resumed") },
+            targetPoint: { runId: activeRunId },
+          },
+        ]
+      : [],
     subagents: [
       {
         id: taskId,
@@ -398,6 +461,20 @@ it.each([
         model: "gpt-5.4",
         status: "running",
         result: null,
+        ...(mirrored
+          ? {
+              status: "interrupted",
+              result: "Task was cancelled.",
+              cancelReason: mirroredCause,
+              cancelDetail:
+                state.includes("-detail-only") ||
+                (mirroredCause !== undefined && mirroredCause !== "task_cancel")
+                  ? "Stale mirrored detail."
+                  : legacy || transferred
+                    ? undefined
+                    : "Task cancelled.",
+            }
+          : {}),
         startedAt: now,
         completedAt: null,
         updatedAt: now,
@@ -422,7 +499,7 @@ it.each([
       createdBy: "agent",
     },
     runs: [
-      ...(state === "fallback-resumed"
+      ...(continuation
         ? [
             {
               ...makeRun({
@@ -432,23 +509,33 @@ it.each([
                 instanceId: customCodexInstanceId,
               }),
               delegatedTaskId: taskId,
+              cancelReason: "server_shutdown",
+              cancelDetail: "Original run shut down.",
               modelSelection: { instanceId: customCodexInstanceId, model: "claude-haiku-5-5" },
             },
           ]
         : []),
       {
         ...makeRun({
-          id: state === "fallback-resumed" ? RunId.make("run-mcp-resumed") : childRunId,
-          ordinal: state === "fallback-resumed" ? 2 : 1,
-          status: ["fallback", "fallback-resumed"].includes(state)
-            ? "completed"
-            : state === "cancelled" || state === "interrupted"
-              ? state
-              : "running",
+          id: continuation ? RunId.make("run-mcp-resumed") : childRunId,
+          ordinal: continuation ? 2 : 1,
+          status: continuation
+            ? continuationStatus
+            : ["fallback", "fallback-resumed"].includes(state)
+              ? "completed"
+              : state === "cancelled" || state === "interrupted"
+                ? state
+                : "running",
           instanceId: customCodexInstanceId,
         }),
-        ...(state === "fallback-resumed"
+        ...(continuation
           ? { delegatedTaskId: taskId, restartContinuationOfRunId: childRunId }
+          : {}),
+        ...(continuationCause
+          ? {
+              cancelReason: "task_cancel",
+              cancelDetail: noDetail ? undefined : "Task cancelled.",
+            }
           : {}),
         ...(["fallback", "fallback-resumed"].includes(state)
           ? {
@@ -503,6 +590,24 @@ it.each([
     updatedAt: now,
   } as unknown as OrchestrationV2ThreadProjection;
 
+  const lateStop =
+    transferred &&
+    (state.includes("-provider-") || state.includes("-unknown") || state.includes("-detail-only"));
+  let controlsProjection: OrchestrationV2ThreadProjection = lateStop
+    ? {
+        ...childProjection,
+        runs: childProjection.runs.map((run) =>
+          run.id === RunId.make("run-mcp-resumed")
+            ? {
+                ...run,
+                cancelReason: mirroredCause ?? "provider_interrupted",
+                cancelDetail: "Provider finished first.",
+              }
+            : run,
+        ),
+      }
+    : childProjection;
+
   const layer = layerOrchestratorService.pipe(
     Layer.provide(
       Layer.mergeAll(
@@ -513,7 +618,7 @@ it.each([
           getTimelinePage: () => Effect.succeed({ items: [], totalItems: 0, hasMore: false }),
           getThreadRecords: (threadId) => {
             if (threadId === parentThreadId) return Effect.succeed(parentProjection);
-            if (threadId === childThreadId) return Effect.succeed(childProjection);
+            if (threadId === childThreadId) return Effect.succeed(controlsProjection);
             return Effect.die(`unexpected thread ${threadId}`);
           },
         } satisfies Partial<ThreadManagementService.ThreadManagementService["Service"]>),
@@ -536,22 +641,49 @@ it.each([
 
   await Effect.gen(function* () {
     const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+    if (lateStop) {
+      const before = yield* service.taskStatus(makeScope(), taskId);
+      expect(before.cancelReason).toBe(mirroredCause ?? "provider_interrupted");
+      // The typed late Stop repairs the run; the finalized result transfer prevents remirroring.
+      controlsProjection = childProjection;
+    }
     const result = yield* service.taskStatus(makeScope(), taskId);
     expect(result.providerInstanceId).toBe(customCodexInstanceId);
     expect(result.providerInstanceId).not.toBe(ProviderInstanceId.make(String(codexDriver)));
     expect(result.status).toBe(
-      ["fallback", "fallback-resumed"].includes(state)
-        ? "completed"
-        : state === "cancelled" || state === "interrupted"
-          ? state
-          : "running",
+      continuation
+        ? continuationStatus
+        : ["fallback", "fallback-resumed"].includes(state)
+          ? "completed"
+          : state === "cancelled" || state === "interrupted"
+            ? state
+            : "running",
     );
+    if (continuation) {
+      expect(result.cancelReason).toBe(
+        state.includes("-specific")
+          ? "user_stop"
+          : continuationCause && !legacy
+            ? "task_cancel"
+            : undefined,
+      );
+      expect(result.cancelDetail).toBe(
+        state.includes("-specific")
+          ? "Stale mirrored detail."
+          : continuationCause && !legacy && !noDetail
+            ? "Task cancelled."
+            : undefined,
+      );
+    }
     expect(result.taskId).toBe(taskId);
     expect(result.childThreadId).toBe(childThreadId);
     expect(result.finishedOn).toBe(
       ["fallback", "fallback-resumed"].includes(state) ? "claude-sonnet-5-5" : undefined,
     );
-    if (["working", "cancelled", "interrupted", "fallback", "fallback-resumed"].includes(state))
+    if (
+      continuation ||
+      ["working", "cancelled", "interrupted", "fallback", "fallback-resumed"].includes(state)
+    )
       expect(result.retry).toBeNull();
     else {
       expect(result.retry?.state).toBe(state);

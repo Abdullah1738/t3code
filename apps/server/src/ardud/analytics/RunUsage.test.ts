@@ -97,7 +97,10 @@ it.effect.each(["completed", "failed", "interrupted", "cancelled"] as const)(
     Effect.gen(function* () {
       const events: AnalyticsEvent[] = [];
       const now = yield* DateTime.now;
-      const observer = yield* makeRunUsageObserver(input(now)).pipe(
+      const observer = yield* makeRunUsageObserver({
+        ...input(now),
+        run: { ...input(now).run, cancelReason: "server_shutdown" },
+      }).pipe(
         Effect.provide(
           Layer.merge(
             Layer.mock(Analytics.Analytics)({
@@ -144,6 +147,10 @@ it.effect.each(["completed", "failed", "interrupted", "cancelled"] as const)(
       assert.equal(row.wallMs, 1000);
       assert.equal(row.turnCount, 1);
       assert.equal(row.endReason, status);
+      assert.equal(
+        row.cancelReason,
+        status === "cancelled" || status === "interrupted" ? "server_shutdown" : undefined,
+      );
       assert.equal(row.role, "work");
       assert.equal(row.cardId, "card:one");
       assert.equal(row.effort, "max");

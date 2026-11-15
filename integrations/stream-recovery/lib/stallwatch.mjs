@@ -256,7 +256,7 @@ async function stallScanImpl({ state, now, dryRun = false, verbose = false, log 
       }
     } else {
       try {
-        const res = await io.interruptThread(stall.threadId, { clientRequestId: id, reason: `stall watch: ${activity.label}`, expectedRunId: stall.runId ?? undefined });
+        const res = await io.interruptThread(stall.threadId, { clientRequestId: id, reason: `stall watch: ${activity.label}`, expectedRunId: stall.runId ?? undefined, cancelReason: 'task_stalled' });
         stall.robobResult = res.result ?? null;
         if (res.result === "interrupt_requested") {
           stall.runId = res.runId ?? stall.runId;
@@ -347,7 +347,7 @@ async function stallScanImpl({ state, now, dryRun = false, verbose = false, log 
         continue;
       }
       try {
-        const res = await io.interruptThread(t.threadId, { clientRequestId: id, reason: `stall watch: ${GHOST_LABEL}`, expectedRunId: t.activeRunId });
+        const res = await io.interruptThread(t.threadId, { clientRequestId: id, reason: `stall watch: ${GHOST_LABEL}`, expectedRunId: t.activeRunId, cancelReason: 'task_stalled' });
         stall.robobResult = res.result ?? null;
         if (res.result === "interrupt_requested") {
           // Track the run we verified, not whatever run the server reports back.

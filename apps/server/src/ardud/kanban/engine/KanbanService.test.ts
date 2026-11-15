@@ -57,6 +57,7 @@ import {
   type KanbanScript,
   type ModelSelection,
   type OrchestrationV2ProviderFailure,
+  type OrchestrationV2Run,
   type ServerProvider,
   AnalyticsEvent,
 } from "@t3tools/contracts";
@@ -128,6 +129,10 @@ interface FakeThread {
 const makeFake = Effect.gen(function* () {
   const threads = yield* Ref.make(new Map<string, FakeThread>());
   const interrupted: Array<string> = [];
+  const interruptSources: Array<{
+    threadId: ThreadId;
+    cancelReason: OrchestrationV2Run["cancelReason"];
+  }> = [];
   const questions = new Map<
     string,
     Effect.Success<ReturnType<KanbanThreadsShape["pendingUserInputs"]>>
@@ -142,11 +147,24 @@ const makeFake = Effect.gen(function* () {
   const missingFailureRunIds = new Set<string>();
   const lastRuns = new Map<
     string,
-    { runId: string; status: string; message: string | null; model?: ModelSelection | null }
+    {
+      runId: string;
+      status: string;
+      message: string | null;
+      model?: ModelSelection | null;
+      cancelReason?: OrchestrationV2Run["cancelReason"];
+      cancelDetail?: string;
+    }
   >();
   const runHistory = new Map<
     string,
-    { status: string; message: string | null; model?: ModelSelection | null }
+    {
+      status: string;
+      message: string | null;
+      model?: ModelSelection | null;
+      cancelReason?: OrchestrationV2Run["cancelReason"];
+      cancelDetail?: string;
+    }
   >();
   // One run id per stored failure object (the same run reports the same id).
   const runIds = new WeakMap<object, string>();
@@ -430,13 +448,25 @@ const makeFake = Effect.gen(function* () {
       compactRun: (_threadId, runId) => Effect.succeed(runHistory.get(runId) ?? null),
       queuedRuns: () => Effect.succeed([]),
       cancelQueued: () => Effect.succeed(false),
-      interrupt: (threadId) => Effect.sync(() => void interrupted.push(threadId)),
+      interrupt: (
+        threadId,
+        _reason,
+        _cancelQueued,
+        _runId,
+        _messageId,
+        cancelReason = "card_stop",
+      ) =>
+        Effect.sync(() => {
+          interrupted.push(threadId);
+          interruptSources.push({ threadId, cancelReason });
+        }),
     }),
   );
   return {
     threads,
     layer,
     interrupted,
+    interruptSources,
     questions,
     failQuestionReads,
     prs,
@@ -890,16 +920,31 @@ it.effect(
         const secondWorker = (yield* kanban.card(second.id)).card.activeThreadId!;
         fake.lastRuns.set(secondWorker, {
           runId: "interrupted-run",
-          status: "interrupted",
+          status: "cancelled",
+          cancelReason: "server_shutdown",
+          cancelDetail: "Server shut down.",
           message: "Private",
         });
         yield* kanban.turnEnded(secondWorker);
+        const cancelledActivity = (yield* kanban.card(second.id)).events.filter(
+          (event) =>
+            event.body === "Run interrupted-run ended (server_shutdown: Server shut down.)",
+        );
+        assert.lengthOf(cancelledActivity, 1);
+        yield* kanban.turnEnded(secondWorker);
+        assert.lengthOf(
+          (yield* kanban.card(second.id)).events.filter(
+            (event) => event.body === cancelledActivity[0]!.body,
+          ),
+          1,
+        );
         assert.isTrue(
           events.some(
             (event) =>
               event.cardId === second.id &&
               event.kind === "kanban.worker_failed" &&
-              event.props?.errorClass === "interrupted",
+              event.props?.errorClass === "interrupted" &&
+              event.props.cancelReason === "server_shutdown",
           ),
         );
         yield* kanban.moveCard(second.id, "needs_review", "owner", owner);
@@ -962,6 +1007,163 @@ it.effect(
                     Effect.tap((decoded) =>
                       Effect.sync(() => {
                         events.push(decoded);
+                      }),
+                    ),
+                    Effect.asVoid,
+                  ),
+              }),
+            ),
+          ),
+        ),
+      );
+    }),
+);
+
+it.effect.each(
+  (["cancelled", "interrupted"] as const).flatMap((status) =>
+    (
+      [
+        "user_stop",
+        "task_cancel",
+        "thread_reset",
+        "card_stop",
+        "delegated_parent_cancelled",
+        "superseded",
+        "task_stalled",
+      ] as const
+    ).flatMap((cancelReason) =>
+      (["missing", "provider", "specific"] as const).flatMap((prior) =>
+        [false, true].map((overlap) => ({
+          status,
+          cancelReason,
+          prior,
+          overlap,
+        })),
+      ),
+    ),
+  ),
+)(
+  "reconciles board cancellation after early $status ($prior -> $cancelReason, overlap=$overlap)",
+  ({ status, cancelReason, prior, overlap }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const events: AnalyticsEvent[] = [];
+      const correctionSeen = yield* Deferred.make<void>();
+      const terminalRead = yield* Deferred.make<void>();
+      const releaseTerminal = yield* Deferred.make<void>();
+      let holdTerminal = false;
+      const delayed = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (threads) =>
+          KanbanThreads.of({
+            ...threads,
+            latestRun: (id) =>
+              Effect.gen(function* () {
+                const snapshot = yield* threads.latestRun(id);
+                if (holdTerminal) {
+                  holdTerminal = false;
+                  yield* Deferred.succeed(terminalRead, undefined);
+                  yield* Deferred.await(releaseTerminal);
+                }
+                return snapshot;
+              }),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      yield* Effect.gen(function* () {
+        const kanban = yield* KanbanService.KanbanService;
+        const board = yield* kanban.ensureBoard({
+          slug: "early-stop",
+          name: "Early Stop",
+          defaultProjectId: ProjectId.make("project-1"),
+        });
+        yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+        const card = yield* kanban.createCard(
+          board.id,
+          { title: "Early Stop", prompt: "Work" },
+          owner,
+        );
+        yield* kanban.dispatchNow;
+        const threadId = (yield* kanban.card(card.id)).card.activeThreadId!;
+        const runId = "early-native-terminal";
+        const initial =
+          prior === "missing"
+            ? undefined
+            : prior === "specific"
+              ? "server_shutdown"
+              : status === "cancelled"
+                ? "provider_cancelled"
+                : "provider_interrupted";
+        fake.lastRuns.set(threadId, { runId, status, message: null, cancelReason: initial });
+        // The board consumes the provider terminal while Stop has not committed its request.
+        holdTerminal = overlap;
+        const terminal = overlap
+          ? yield* kanban.turnEnded(threadId).pipe(Effect.forkChild({ startImmediately: true }))
+          : undefined;
+        if (terminal !== undefined) yield* Deferred.await(terminalRead);
+        else yield* kanban.turnEnded(threadId);
+        const before = yield* kanban.card(card.id);
+        const sent = fake.sends.length;
+        const specific = prior === "specific";
+        fake.runHistory.set(runId, {
+          status,
+          message: null,
+          cancelReason: specific ? "server_shutdown" : cancelReason,
+          cancelDetail: "Caller source committed.",
+        });
+        // A newer run must not replace the terminal whose metadata just changed.
+        fake.lastRuns.set(threadId, { runId: "newer", status: "running", message: null });
+        if (terminal !== undefined) {
+          const corrections = yield* Effect.all(
+            [1, 2, 3].map(() =>
+              kanban
+                .reconcileRunCancellation(threadId, runId)
+                .pipe(Effect.forkChild({ startImmediately: true })),
+            ),
+          );
+          yield* TestClock.adjust(0);
+          yield* Deferred.succeed(releaseTerminal, undefined);
+          yield* Fiber.join(terminal);
+          yield* Effect.forEach(corrections, Fiber.join);
+        } else if (specific) yield* kanban.reconcileRunCancellation(threadId, runId);
+        else {
+          yield* kanban.worker.pipe(Effect.forkScoped);
+          yield* kanban.notifyRunCancellation(threadId, runId);
+          yield* Deferred.await(correctionSeen);
+        }
+        yield* kanban.reconcileRunCancellation(threadId, runId);
+        const after = yield* kanban.card(card.id);
+        if (!overlap) assert.deepEqual(after.card, before.card);
+        // The held terminal still performs its normal retry after the baseline was captured.
+        assert.equal(fake.sends.length, sent + (overlap ? 1 : 0));
+        assert.lengthOf(
+          events.filter((event) => event.kind === "kanban.worker_failed"),
+          1,
+        );
+        const corrections = events.filter((event) => event.kind === "kanban.cancel_reason_updated");
+        assert.lengthOf(corrections, specific ? 0 : 1);
+        if (!specific) assert.deepInclude(corrections[0]?.props, { runId, cancelReason });
+        assert.lengthOf(
+          after.events.filter(
+            (event) =>
+              event.body ===
+              `Run ${runId} cancellation reason corrected (${cancelReason}: Caller source committed.)`,
+          ),
+          specific ? 0 : 1,
+        );
+      }).pipe(
+        Effect.provide(
+          testLayer(delayed).pipe(
+            Layer.provide(
+              Layer.mock(Analytics.Analytics)({
+                record: (event) =>
+                  decodeAnalyticsEvent(event).pipe(
+                    Effect.orDie,
+                    Effect.tap((decoded) =>
+                      Effect.gen(function* () {
+                        events.push(decoded);
+                        if (decoded.kind === "kanban.cancel_reason_updated")
+                          yield* Deferred.succeed(correctionSeen, undefined);
                       }),
                     ),
                     Effect.asVoid,
@@ -5075,6 +5277,7 @@ it.effect("a start abandoned for its own card's edit still lets the rest of the 
       yield* Fiber.join(dispatch);
       // The stale start is undone exactly once; the next card still starts in the same pass.
       assert.strictEqual(fake.interrupted.length, 1);
+      assert.strictEqual(fake.interruptSources[0]?.cancelReason, "superseded");
       const a = (yield* kanban.card(first.id)).card;
       assert.strictEqual(a.stage, "todo");
       assert.isNull(a.activeThreadId);
@@ -12233,6 +12436,7 @@ it.effect("the tick nudges a quiet worker and interrupts one stuck on its own qu
       yield* TestClock.adjust("31 minutes");
       yield* kanban.tick;
       assert.isTrue(fake.interrupted.includes(thread));
+      assert.deepEqual(fake.interruptSources, [{ threadId: thread, cancelReason: "task_stalled" }]);
       assert.strictEqual(yield* nudgesTo(fake, thread), 1);
       yield* kanban.tick;
       assert.strictEqual(fake.interrupted.filter((id) => id === thread).length, 1);
@@ -12498,6 +12702,9 @@ it.effect(
         yield* TestClock.adjust("31 minutes");
         yield* kanban.tick;
         assert.isTrue(fake.interrupted.includes(thread));
+        assert.deepEqual(fake.interruptSources, [
+          { threadId: thread, cancelReason: "task_stalled" },
+        ]);
         const events = (yield* kanban.card(card.id)).events;
         assert.isTrue(
           events.some(
@@ -16748,6 +16955,9 @@ it.effect("an archived evaluator with no live one is replaced", () =>
       assert.isNotNull(next);
       assert.notStrictEqual(next, setup);
       assert.include(fake.interrupted, setup);
+      assert.includeDeepMembers(fake.interruptSources, [
+        { threadId: setup, cancelReason: "superseded" },
+      ]);
       const all = yield* Ref.get(fake.threads);
       assert.isFalse(all.get(setup)!.messages.some((text) => text.includes("Still there?")));
       assert.include(all.get(next!)!.messages.join("\n"), "Still there?");
@@ -29729,6 +29939,9 @@ it.effect.each(["working", "todo", "in_review", "needs_review"] as const)(
         yield* TestClock.adjust("31 minutes");
         yield* kanban.tick;
         assert.deepEqual(fake.interrupted, [thread]);
+        assert.deepEqual(fake.interruptSources, [
+          { threadId: thread, cancelReason: "task_stalled" },
+        ]);
         const stopped = yield* kanban.card(card.id);
         assert.equal(stopped.card.nudgedAt, "2026-10-25T13:31:00.000Z");
         assert.isTrue(

@@ -1,5 +1,6 @@
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
+import { OrchestrationV2CancelReason } from "../orchestrationV2.ts";
 
 const Timestamp = Schema.String.check(
   Schema.isPattern(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/),
@@ -95,6 +96,8 @@ const GeneralEvent = Schema.Struct({
       action: Schema.optionalKey(Schema.Literals(["set", "clear"])),
       reasonClass: Schema.optionalKey(Label),
       errorClass: Schema.optionalKey(Label),
+      cancelReason: Schema.optionalKey(OrchestrationV2CancelReason),
+      runId: Schema.optionalKey(DerivedId),
       model: Schema.optionalKey(Label),
       provider: Schema.optionalKey(Label),
       operation: Schema.optionalKey(Label),
@@ -205,6 +208,7 @@ export const RunUsageEvent = Schema.Struct({
   wallMs: Schema.NullOr(Measurement),
   turnCount: Measurement,
   endReason: Schema.Literals(["completed", "failed", "interrupted", "cancelled"]),
+  cancelReason: Schema.optional(OrchestrationV2CancelReason),
   usageStatus: Schema.Literals(["complete", "partial", "unavailable"]),
   reviewRound: TokenCount,
 });
