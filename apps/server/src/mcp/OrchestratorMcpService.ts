@@ -792,21 +792,22 @@ function delegationTaskIdentity(taskId: NodeId) {
   // Also read a copied id with one extra/missing encoding layer, for request-key recovery only.
   for (let depth = 0; depth <= 2; depth++) {
     const parts = command.split(":");
-    const modern = parts.length >= 6 && parts[2] === "delegate-task";
+    // A decoded key can add fields or make a legacy operation look like a modern environment.
+    const modern =
+      parts.length === 6 && parts[2] === "delegate-task" && parts[3] !== "delegate-task";
     const legacy = parts.length === 5 && parts[3] === "delegate-task";
     if (parts[0] === "command" && parts[1] === "mcp" && (modern || legacy)) {
       try {
         const commandId = CommandId.make(command);
-        const key = decodeURIComponent(parts.at(-1)!);
+        const key = decodeURIComponent(parts[modern ? 5 : 4]!);
         return {
           commandId,
           key,
           environment: modern ? parts[3] : undefined,
-          thread: modern ? parts.slice(4, -1).join(":") : undefined,
+          thread: modern ? parts[4] : undefined,
           canonical:
             IdAllocator.derive.delegatedTaskNode({ commandId }) === taskId &&
-            parts.at(-1) === stablePart(key) &&
-            (!modern || parts.length === 6),
+            parts[modern ? 5 : 4] === stablePart(key),
         };
       } catch {
         return undefined;

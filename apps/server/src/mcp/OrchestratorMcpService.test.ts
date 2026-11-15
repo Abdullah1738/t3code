@@ -2024,6 +2024,7 @@ describe("OrchestratorMcpService provider resolution", () => {
     {
       name: "caller separator loses an encoding level",
       change: (id: string) => id.replace("thread%253A", "thread%3A"),
+      ambiguous: true,
     },
     {
       name: "caller separator gains an encoding level",
@@ -2035,7 +2036,7 @@ describe("OrchestratorMcpService provider resolution", () => {
     },
   ];
 
-  it.effect.each(taskIdForms)("recovers the caller's saved task for $name", (testCase) =>
+  it.effect.each(taskIdForms)("handles the caller's copied task id for $name", (testCase) =>
     Effect.gen(function* () {
       const { change } = testCase;
       let parentReads = 0;
@@ -2087,6 +2088,20 @@ describe("OrchestratorMcpService provider resolution", () => {
       yield* Effect.gen(function* () {
         const service = yield* OrchestratorMcpService.OrchestratorMcpService;
         const inputId = NodeId.make(change(realId));
+        if ("ambiguous" in testCase) {
+          for (const operation of [
+            service.taskStatus(scope, inputId).pipe(Effect.asVoid),
+            service.cancelTask(scope, { taskId: inputId }).pipe(Effect.asVoid),
+          ]) {
+            const error = yield* operation.pipe(Effect.flip);
+            assert.equal(error.code, "task_not_found");
+            assert.include(error.message, "Check the id; copy it exactly from delegate_task.");
+            assert.notInclude(error.message, "never saved");
+          }
+          yield* Effect.yieldNow;
+          assert.deepEqual(dispatched, []);
+          return;
+        }
         const status = yield* service.taskStatus(scope, inputId);
         assert.equal(status.taskId, realId);
         assert.isFalse(status.partial);
@@ -2101,6 +2116,114 @@ describe("OrchestratorMcpService provider resolution", () => {
         );
         for (const command of dispatched)
           if (command.taskId !== undefined) assert.equal(command.taskId, realId);
+      }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
+    }),
+  );
+
+  it.effect.each([
+    { name: "modern key colon", key: "review:1", suffix: "1", modern: true },
+    { name: "modern key repeated colons", key: "review::1", suffix: "1", modern: true },
+    { name: "modern key multiple fields", key: "review:round:1", suffix: "1", modern: true },
+    { name: "legacy key colon", key: "review:1", suffix: "1", modern: false },
+    { name: "legacy key repeated colons", key: "review::1", suffix: "1", modern: false },
+    { name: "legacy key multiple fields", key: "review:round:1", suffix: "1", modern: false },
+    {
+      name: "legacy operation namespace colon",
+      key: "review:1",
+      suffix: "1",
+      modern: false,
+      namespace: "delegate-task",
+    },
+    {
+      name: "legacy operation namespace repeated colons",
+      key: "review::1",
+      suffix: ":1",
+      modern: false,
+      namespace: "delegate-task",
+      firstOnly: true,
+    },
+    {
+      name: "legacy operation namespace multiple fields",
+      key: "review:round:1",
+      suffix: "round:1",
+      modern: false,
+      namespace: "delegate-task",
+      firstOnly: true,
+    },
+  ])("rejects ambiguous $name without selecting its suffix task", (testCase) =>
+    Effect.gen(function* () {
+      const { key, suffix, modern } = testCase;
+      const namespace = "namespace" in testCase ? testCase.namespace : "credential";
+      const idFor = (requestKey: string) =>
+        modern
+          ? encodedTaskId(parentThreadId, requestKey)
+          : NodeId.make(
+              `node:delegated-task:${encodeURIComponent(`command:mcp:${namespace}:delegate-task:${encodeURIComponent(requestKey)}`)}`,
+            );
+      const realId = idFor(key);
+      const suffixId = idFor(suffix);
+      const encodedKey = encodeURIComponent(key);
+      const alteredKey = "firstOnly" in testCase ? encodedKey.replace("%3A", ":") : key;
+      const inputId = NodeId.make(
+        realId.replace(encodeURIComponent(encodedKey), encodeURIComponent(alteredKey)),
+      );
+      const task = (id: NodeId, child: ThreadId) => ({
+        id,
+        threadId: parentThreadId,
+        origin: "app_owned",
+        childThreadId: child,
+        providerInstanceId: codexInstanceId,
+        model: "gpt-5.4",
+        result: "Review complete.",
+        status: "completed",
+        completionDelivery: { state: "pending" },
+      });
+      const parent = parentProjection([
+        task(suffixId, ThreadId.make("thread:suffix-child")),
+        task(realId, childThreadId),
+      ]);
+      const dispatched: string[] = [];
+      const dependencies = Layer.mergeAll(
+        NodeServices.layer,
+        Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getCallerRow: (id) => Effect.succeed(liveThreadShell(id)),
+          getThreadShell: (id) => Effect.succeed(liveThreadShell(id)),
+          getThreadRecords: (id) =>
+            Effect.succeed(id === parentThreadId ? parent : childProjection),
+          getThreadProjection: () => Effect.succeed(parent),
+          dispatch: (command) =>
+            Effect.sync(() => {
+              dispatched.push(command.type);
+            }) as never,
+          stopDelegatedTasks: () =>
+            Effect.sync(() => {
+              dispatched.push("stopDelegatedTasks");
+            }),
+        }),
+        ServerSettings.layerTest(),
+        providerRegistryLayer([]),
+        adapterRegistryLayer([]),
+        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(SecretRequests.SecretRequests)({}),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        const outcomes = yield* Effect.all([
+          Effect.exit(service.cancelTask(scope, { taskId: inputId }).pipe(Effect.asVoid)),
+          Effect.exit(service.taskStatus(scope, inputId).pipe(Effect.asVoid)),
+        ]);
+        yield* Effect.yieldNow;
+        assert.deepEqual(dispatched, []);
+        for (const outcome of outcomes) {
+          assert.isTrue(Exit.isFailure(outcome));
+          if (Exit.isFailure(outcome)) {
+            const error = Cause.squash(outcome.cause) as OrchestratorMcpFailure;
+            assert.equal(error.code, "task_not_found");
+            assert.include(error.message, "Check the id; copy it exactly from delegate_task.");
+            assert.notInclude(error.message, "never saved");
+          }
+        }
       }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
     }),
   );
