@@ -19,6 +19,7 @@ import {
   kanbanReviewAlreadyDone,
   type KanbanBoard,
   type KanbanCard,
+  type KanbanCardEvent,
   type KanbanScheduleCard,
   type KanbanDiscussion,
   type KanbanGroup,
@@ -267,6 +268,39 @@ export function discussionSettleDue(
 
 export const WORKER_QUIET_MS = 30 * 60 * 1000;
 
+export const WORKER_NUDGE_EVENT = "Work thread handoff nudge attempted";
+
+export function workerHandoffNudged(
+  card: KanbanCard,
+  events: ReadonlyArray<KanbanCardEvent>,
+): boolean {
+  const nudgedAt = card.nudgedAt;
+  if (nudgedAt === null) return false;
+  const since = Date.parse(nudgedAt);
+  // Interrupts share nudgedAt with handoff reminders. Event order distinguishes
+  // a reminder sent after an interrupt even when both have the same timestamp.
+  const latest = events.findLast(
+    (event) =>
+      event.kind === "thread" &&
+      event.actor._tag === "system" &&
+      event.actor.component === "dispatcher" &&
+      Date.parse(event.at) >= since &&
+      (event.body === WORKER_NUDGE_EVENT ||
+        event.body === "Interrupted: stuck on its own question" ||
+        event.body?.startsWith("No activity for ")),
+  );
+  return latest === undefined || latest.body === WORKER_NUDGE_EVENT;
+}
+
+export function workerWorkDone(card: KanbanCard): boolean {
+  const work = card.subtasks.filter((subtask) => subtask.owner === "work");
+  return (
+    work.length > 0 &&
+    work.every((subtask) => subtask.state !== "open") &&
+    card.reviewFindingsPending !== true
+  );
+}
+
 export const RUN_SILENT_MS = 30 * 60 * 1000;
 
 export function runSilentDue(
@@ -308,6 +342,8 @@ export function workerQuietDue(
   nowMs: number,
 ): boolean {
   if (card.stage !== "working" || card.activeRole !== "work" || card.stalled !== null) return false;
+  if (card.wait !== undefined || card.asks.some((ask) => ask.closedAt === null && ask.blocking))
+    return false;
   if (view.state !== "idle" && view.state !== "needs-input") return false;
   const since = Math.max(
     Date.parse(view.quietSince),
