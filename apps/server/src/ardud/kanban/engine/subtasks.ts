@@ -768,7 +768,7 @@ const idNumber = (id: string) => Number.parseInt(id.replace(/^s/, ""), 10) || 0;
  * Replaces a card's plan with `inputs`. An id alone keeps that subtask;
  * omitted text, owner and step on open ids keep their stored values. New
  * entries need text and owner and get the next id. Listed done and skipped
- * subtasks stay unchanged, and omitted ones stay: what happened isn't rewritten.
+ * subtasks keep their history (but may clear a guessed gate), and omitted ones stay.
  * `seq` is the card's counter of ids ever handed out, so an open subtask dropped
  * from the plan never has its id reused by a later entry.
  */
@@ -821,6 +821,54 @@ export function planSubtasks(
             : ("guessed" as const);
     return { gate, gateSource, previousGate, keepClear };
   };
+  const planClear = (
+    known: KanbanSubtask,
+    reason: string,
+    owner: KanbanSubtask["owner"],
+    text: string,
+    ownerOnly: boolean | undefined,
+    interrupting: boolean | undefined,
+    gate: KanbanSubtask["gate"],
+  ):
+    | { readonly ok: true; readonly gateCleared: KanbanSubtask["gateCleared"] }
+    | Extract<SubtaskPlan, { ok: false }> => {
+    if (
+      owner === "work" ||
+      owner === "review" ||
+      known.owner === "work" ||
+      known.owner === "review"
+    )
+      return {
+        ok: false,
+        code: "denied",
+        reason: `subtask ${known.id} must be owned by the evaluator or a script to clear a guessed gate`,
+      };
+    if (
+      gate === undefined ||
+      (gateOf(known, guessedGates) === undefined &&
+        known.gate === undefined &&
+        known.gateCleared === undefined)
+    ) {
+      return known.gateCleared
+        ? { ok: true, gateCleared: { ...known.gateCleared, text } }
+        : { ok: false, reason: `subtask ${known.id} has no gate to clear` };
+    }
+    // Rewording in the same edit cannot turn a deliberate gate into a guessed one.
+    if (
+      known.gateSource === "set" ||
+      known.ownerOnly ||
+      known.interrupting ||
+      ownerOnly ||
+      interrupting
+    )
+      return {
+        ok: false,
+        code: "denied",
+        reason: `subtask ${known.id} has a ${gate} gate set on purpose; only Abdullah's answer clears it (card_ask naming ${known.id})`,
+      };
+    if (!actor || !at) return { ok: false, reason: "clearGate needs the clearing actor and time" };
+    return { ok: true, gateCleared: { gate, reason, by: actor, at, text } };
+  };
   const byId = new Map(existing.map((subtask) => [subtask.id, subtask]));
   // Cards saved before the counter existed start from the highest id still on them.
   let nextId = existing.reduce((max, subtask) => Math.max(max, idNumber(subtask.id)), seq);
@@ -846,6 +894,22 @@ export function planSubtasks(
         };
       if (listed.has(id)) return { ok: false, reason: `subtask ${id} is listed twice` };
       listed.add(id);
+      if (known.state !== "open" && reason !== undefined) {
+        const clear = planClear(
+          known,
+          reason,
+          known.owner,
+          known.text,
+          known.ownerOnly,
+          known.interrupting,
+          gateOf(known, guessedGates),
+        );
+        if (!clear.ok) return clear;
+        const { gate: _gate, gateSource: _source, ...rest } = known;
+        planned.push({ ...rest, gateCleared: clear.gateCleared });
+        step = known.step;
+        continue;
+      }
       // An id alone also preserves script bindings and approval timestamps.
       if (
         known.state !== "open" ||
@@ -918,33 +982,14 @@ export function planSubtasks(
         gateCleared: _oldClear,
         ...rest
       } = known;
-      // Rewording in the same edit cannot turn a deliberate gate into a guessed one.
-      const clearing =
-        reason !== undefined && owner !== "work" && owner !== "review"
-          ? (previousGate ?? gate)
-          : undefined;
-      if (
-        clearing &&
-        (known.gateSource === "set" ||
-          known.ownerOnly ||
-          known.interrupting ||
-          ownerOnly ||
-          interrupting)
-      ) {
-        return {
-          ok: false,
-          code: "denied",
-          reason: `subtask ${known.id} has a ${clearing} gate set on purpose; only Abdullah's answer clears it (card_ask naming ${known.id})`,
-        };
-      }
-      if (clearing && (!actor || !at))
-        return { ok: false, reason: "clearGate needs the clearing actor and time" };
+      const clear =
+        reason === undefined
+          ? undefined
+          : planClear(known, reason, owner, text, ownerOnly, interrupting, previousGate ?? gate);
+      if (clear && !clear.ok) return clear;
+      const clearing = reason !== undefined;
       const gateCleared =
-        clearing && actor && at
-          ? { gate: clearing, reason: reason!, by: actor, at, text }
-          : keepClear
-            ? { ...known.gateCleared!, text }
-            : undefined;
+        clear?.gateCleared ?? (keepClear ? { ...known.gateCleared!, text } : undefined);
       // Cosmetic edits keep the approval's time bound, including its absence on legacy plans.
       const approvalChanged =
         gate !== previousGate ||
