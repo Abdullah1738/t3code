@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from janitor_test_safety import JanitorTestCase
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skill/scripts'))
@@ -38,7 +39,7 @@ OPAQUE_RELATIVE_TOKENS = [
 ]
 
 
-class ProcessTests(unittest.TestCase):
+class ProcessTests(JanitorTestCase):
     def detect(self, rows=None, roster=None, owner=None, details=None, **kwargs):
         rows = lp.parse_ps(PS) if rows is None else rows
         return lp.detect(rows, lp.parse_top(TOP), {}, ROSTER if roster is None else roster,

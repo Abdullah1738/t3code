@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import sys
 import unittest
+from janitor_test_safety import JanitorTestCase
 from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skill/scripts'
@@ -15,7 +16,7 @@ import worktree_reaper as reaper
 GOOD = dict(complete=True, threads={}, opencode=set(), workspaces={'native': '/work/app'}, problems=[])
 
 
-class LivenessTests(unittest.TestCase):
+class LivenessTests(JanitorTestCase):
     def test_both_scripts_use_same_api_workspaces_and_service_directories(self):
         with patch.object(active, 'snapshot', return_value={**GOOD, 'opencode': {'ses_test'}}), \
                 patch.object(active, 'opencode_directories', return_value=({'ses_test': '/work/service'}, None)):
