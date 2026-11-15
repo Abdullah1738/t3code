@@ -5,6 +5,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import { writeFileStringAtomically } from "@t3tools/shared/atomicWrite";
+import { bootId } from "./ardud/fast-install/report.ts";
 import packageJson from "../package.json" with { type: "json" };
 import type * as ServerConfig from "./config.ts";
 import { formatHostForUrl, isWildcardHost } from "./startupAccess.ts";
@@ -12,6 +13,7 @@ import { formatHostForUrl, isWildcardHost } from "./startupAccess.ts";
 export const PersistedServerRuntimeState = Schema.Struct({
   version: Schema.Literal(1),
   pid: Schema.Int,
+  bootId: Schema.optional(Schema.String),
   ownerId: Schema.optional(Schema.String),
   host: Schema.optional(Schema.String),
   port: Schema.Int,
@@ -58,6 +60,7 @@ export const makePersistedServerRuntimeState = (input: {
   Effect.map(DateTime.now, (now) => ({
     version: 1,
     pid: process.pid,
+    bootId,
     ...(input.config.host ? { host: input.config.host } : {}),
     port: input.port,
     origin: runtimeOriginForConfig(input.config, input.port),

@@ -110,6 +110,7 @@ export function summarizeLag(tail, now = Date.now()) {
   return {
     status: reasons.length ? "unknown" : "complete",
     reasons,
+    sampleCount: recent.length,
     stalls1s: recent.filter((row) => row.delay >= 1000).length,
     stalls5s: severe.length,
     severeMinutes: new Set(severe.map((row) => Math.floor(row.time / 60_000))).size,
@@ -241,18 +242,26 @@ async function matchesLocalRuntime(url, connection, runtime, checkListener) {
     if (!Number.isFinite(recorded) || !Number.isInteger(runtime.pid) || runtime.pid <= 0)
       return false;
     process.kill(runtime.pid, 0);
-    // HTTP cannot identify its boot while blocked. Preserve local evidence only
-    // when the OS independently confirms the persisted process owns the listener.
-    if (connection.status !== "ok") {
-      const port = Number(expected.port || (expected.protocol === "https:" ? 443 : 80));
-      return (await checkListener({ pid: runtime.pid, port })) === true;
+    // Route initialization and ready-time publication can be minutes apart.
+    if (
+      connection.status === "ok" &&
+      connection.bootId !== undefined &&
+      runtime.bootId !== undefined
+    ) {
+      return validBootId(runtime.bootId) && connection.bootId === runtime.bootId;
     }
-    const started = Date.parse(connection.serverStartedAt);
-    return Number.isFinite(started) && Math.abs(started - recorded) <= 60_000;
+    // Older or blocked servers cannot identify their boot over HTTP. Confirm
+    // the persisted process owns the listener within the same deadline instead.
+    const port = Number(expected.port || (expected.protocol === "https:" ? 443 : 80));
+    return (await checkListener({ pid: runtime.pid, port })) === true;
   } catch {
     return false;
   }
 }
+
+const validBootId = (value) =>
+  typeof value === "string" &&
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
 
 export const deepHealthBudget = (timeoutMs = 10_000) => Math.max(1, Math.min(timeoutMs, 10_000));
 
@@ -329,6 +338,7 @@ export async function deepHealth({
             serverStartedAt: Number.isFinite(Date.parse(response.serverStartedAt))
               ? new Date(response.serverStartedAt).toISOString()
               : undefined,
+            bootId: validBootId(response.bootId) ? response.bootId : undefined,
           }
         : {}),
     };
