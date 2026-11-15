@@ -34,6 +34,14 @@ export const kanbanDDL = [
     ON ardud_kanban_slot_events (board_id, at)`,
   `CREATE INDEX IF NOT EXISTS ardud_kanban_slot_events_slot
     ON ardud_kanban_slot_events (board_id, pool_key, thread_id, id)`,
+  `CREATE TABLE IF NOT EXISTS ardud_kanban_evaluator_requests (
+    board_id TEXT NOT NULL, body TEXT NOT NULL, reporter_thread_id TEXT NOT NULL,
+    queue_id INTEGER NOT NULL, admitted_at TEXT NOT NULL,
+    PRIMARY KEY (board_id, body, reporter_thread_id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS ardud_kanban_evaluator_reminders (
+    card_id TEXT PRIMARY KEY, step_key TEXT NOT NULL, signature TEXT NOT NULL
+  )`,
   `CREATE TABLE IF NOT EXISTS ardud_kanban_evaluator_spawns (
     launch_key TEXT PRIMARY KEY, board_id TEXT NOT NULL, card_id TEXT, at TEXT NOT NULL
   )`,

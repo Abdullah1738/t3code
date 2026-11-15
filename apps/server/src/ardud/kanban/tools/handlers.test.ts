@@ -6652,7 +6652,7 @@ it.effect(
       const duplicate = yield* call(reporter, "report_bug", input);
       assert.isFalse(duplicate.isError, duplicate.text);
       assert.isTrue(duplicate.structured.deduped);
-      assert.strictEqual(launches.length, before);
+      assert.strictEqual(launches.length, before + 1);
       const fallback = yield* call(reporter, "report_bug", {
         boardId: "tools",
         title: "Novel parser crash",
@@ -6660,7 +6660,7 @@ it.effect(
       });
       assert.isFalse(fallback.isError, fallback.text);
       assert.isString(fallback.structured.threadId);
-      assert.strictEqual(launches.length, before + 1);
+      assert.strictEqual(launches.length, before + 2);
       assert.include(launches.at(-1)!, "Novel parser crash");
       assert.include(launches.at(-1)!, `kanban-card/${work.id}`);
       assert.include(launches.at(-1)!, 'the "Source" board');
@@ -6743,7 +6743,7 @@ it.effect.each([
           (event) => event.body === "sighting\n\nrun-1 failed",
         );
         assert.lengthOf(sightings, 1);
-        assert.lengthOf(fake.launches, 0);
+        assert.lengthOf(fake.launches, 1);
         enabled = false;
         const retry = yield* call(thread, "report_bug", input);
         assert.isTrue(retry.structured.deduped);
