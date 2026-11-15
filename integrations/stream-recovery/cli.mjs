@@ -13,6 +13,7 @@ import { pathToFileURL } from 'node:url';
 import { openCodeSession, recoveryOwned } from './lib/harness.mjs';
 import { stallScan } from './lib/stallwatch.mjs';
 import { restartScan } from './lib/restartwatch.mjs';
+import { isReplicaUnavailable } from './lib/readonly-db.mjs';
 
 const SETTLE_MS = 90_000;
 const STALE_HELD_MS = 24 * 3600_000;
@@ -225,7 +226,7 @@ async function actImpl({ db, incident, g, dryRun, progress = {}, save = () => {}
       save();
     }
   } catch (err) {
-    if (err.code === 'REPLICA_UNAVAILABLE' || isRecoveryPaused(err)) throw err;
+    if (isReplicaUnavailable(err) || isRecoveryPaused(err)) throw err;
     res.ok = false;
     res.error = String(err?.message || err).slice(0, 300);
     if (res.queueOk === null && (plan.resumeQueue || g.staleHeld.length)) res.queueOk = false;
@@ -308,7 +309,7 @@ export async function recoveryScan({ opts, state, now }, io = realIo) {
         try {
           g = await gatherThread({ db, incident, threadId, active, now, verbose: opts.verbose }, io);
         } catch (err) {
-          if (err.code === 'REPLICA_UNAVAILABLE' || isRecoveryPaused(err)) throw err;
+          if (isReplicaUnavailable(err) || isRecoveryPaused(err)) throw err;
           results.push({ plan: { threadId, title: threadId, action: 'skip', reason: 'error' }, ok: false, error: String(err?.message || err).slice(0, 300), lost: [], forms: [] });
           log(`  ${threadId}: gather failed: ${err?.message || err}`);
           continue;

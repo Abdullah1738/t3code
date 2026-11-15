@@ -107,7 +107,7 @@ test('missing metadata, not-ready, invalid, future and stale snapshots refuse', 
   const db = new DatabaseSync(path);
   db.exec('drop table ardud_readonly_meta');
   db.close();
-  assert.throws(() => openDb(path), /no such table/);
+  assert.throws(() => openDb(path), e => e.code === 'REPLICA_NOT_READY');
 });
 
 test('a connection cannot borrow freshness from a replacement export', (t) => {
