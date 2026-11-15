@@ -5062,7 +5062,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               ORDER BY message.created_at ASC, message.message_id ASC
             `,
             sql<PayloadRow>`
-              SELECT item.payload_json FROM orchestration_v2_projection_turn_items AS item
+              SELECT item.payload_json, item.ordinal, item.turn_item_id
+              FROM orchestration_v2_projection_turn_items AS item
               WHERE item.thread_id = ${threadId}
                 AND item.status IN ('pending', 'running', 'waiting')
                 AND (
@@ -5083,7 +5084,19 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                     )
                   )
                 )
-              ORDER BY item.ordinal ASC, item.turn_item_id ASC
+              UNION ALL
+              -- A terminal error can commit before its root run is finalized.
+              SELECT item.payload_json, item.ordinal, item.turn_item_id
+              FROM orchestration_v2_projection_runs AS run
+              -- Keep ordering from choosing an index that walks the thread's history.
+              CROSS JOIN orchestration_v2_projection_turn_items AS item
+                INDEXED BY orchestration_v2_projection_turn_items_failed_error_idx
+              WHERE run.thread_id = ${threadId}
+                AND run.status IN ('preparing', 'starting', 'running', 'waiting')
+                AND item.thread_id = run.thread_id AND item.run_id = run.run_id
+                AND item.node_id IS json_extract(run.payload_json, '$.rootNodeId')
+                AND item.type = 'error' AND item.status = 'failed'
+              ORDER BY ordinal ASC, turn_item_id ASC
             `,
           ]);
           const [
