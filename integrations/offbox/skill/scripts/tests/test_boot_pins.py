@@ -187,6 +187,60 @@ class BootPinsTests(Isolated):
                     finally:
                         pool.release_guard(got)
 
+    def test_pending_resume_held_state_is_not_prepared_or_claimed(self):
+        self.box('old', 'stopped', member=True)
+        for phase in ('confirmed', 'ready'):
+            for state in api.LIVE_STATES:
+                with self.subTest(phase=phase, state=state):
+                    self.con.execute("INSERT OR REPLACE INTO kv VALUES ('resume_unanswered:old','large',?)",
+                                     (common.now() - 301,))
+                    self.con.commit()
+                    clean = dict(id='old', state=state, type='large', heldRuns=[])
+                    held = dict(clean, heldRuns=['old-run'])
+                    observations = [clean, held] if phase == 'ready' else [held]
+
+                    def observe(*args, **kwargs):
+                        return observations.pop(0) if len(observations) > 1 else observations[0]
+
+                    with patch.dict(os.environ, {'OFFBOX_POOL_SIZE': '1'}), \
+                            patch.object(api, 'readiness_get', side_effect=observe), \
+                            patch.object(api, 'resume') as resume, patch.object(pool, '_claim') as claim, \
+                            patch.object(lease.ssh_sync, 'setup') as setup:
+                        with self.assertRaises(pool.PoolBusyError):
+                            self.take()
+                    resume.assert_not_called()
+                    claim.assert_not_called()
+                    setup.assert_not_called()
+                    self.assertEqual(self.row()['owner'], 'old-worker')
+                    self.assertIsNone(self.con.execute('SELECT 1 FROM pool_callers').fetchone())
+                    self.assertFalse(lease.boot_dead(self.con, 'old'))
+                    self.assertIn('old-run', self.err.getvalue())
+
+    def test_pending_resume_clean_ready_state_can_be_claimed(self):
+        self.box('old', 'stopped', member=True)
+        self.con.execute("INSERT INTO kv VALUES ('resume_unanswered:old','large',?)", (common.now() - 301,))
+        self.con.commit()
+        with patch.object(api, 'readiness_get', return_value=dict(id='old', state='running', type='large', heldRuns=[])), \
+                patch.object(api, 'resume') as resume:
+            self.assertEqual(self.take()['box_id'], 'old')
+        resume.assert_not_called()
+        self.assertEqual(self.con.execute('SELECT box_id FROM pool_callers WHERE owner=? AND repo_root=?',
+                                         (self.me['owner'], self.me['repo_root'])).fetchone()[0], 'old')
+
+    def test_reuse_propagates_hold_discovered_during_bring_up(self):
+        from offbox_lib import allocation
+        self.box('old', member=True)
+        for initial in ('running', 'archived'):
+            with self.subTest(initial=initial):
+                clean = dict(id='old', state=initial, type='large', heldRuns=[])
+                held = dict(clean, state='running', heldRuns=['old-run'])
+                with patch.object(api, 'readiness_get', side_effect=[clean, held]), \
+                        patch.object(api, 'resume'), patch.object(lease.ssh_sync, 'setup') as setup:
+                    with self.assertRaises(allocation.Busy):
+                        lease._reuse(self.con, self.row(), None)
+                setup.assert_not_called()
+                self.assertFalse(lease.boot_dead(self.con, 'old'))
+
     def test_running_member_beats_own_archived_member(self):
         self.box('old', 'stopped', member=True)
         self.box('warm', member=True)
