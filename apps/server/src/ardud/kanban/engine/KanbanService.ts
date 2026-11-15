@@ -536,6 +536,12 @@ export interface KanbanServiceShape {
       readonly events: ReadonlyArray<KanbanCardEvent>;
       readonly threads: ReadonlyArray<KanbanThreadLink>;
       readonly pools: ReadonlyArray<KanbanPool>;
+      readonly dispatchCards: ReadonlyArray<KanbanCard>;
+      readonly holds: ReadonlyMap<string, string>;
+      readonly dispatchPools: ReadonlyArray<KanbanPool>;
+      readonly reviews: ReadonlyMap<string, Rules.ReviewEvidence>;
+      readonly workThreadHomes: ReadonlyMap<string, KanbanCard | null>;
+      readonly assignmentWakeRetries: ReadonlyMap<string, Rules.AssignmentWakeRetry>;
       readonly slotHistory: {
         readonly events: ReadonlyArray<SlotEvent>;
         readonly recordedSince: string | null;
@@ -2679,9 +2685,7 @@ const make = Effect.gen(function* () {
     Effect.flatMap(nowMillis, (at) =>
       Ref.update(holds, (all) =>
         new Map(all).set(threadId, { ...all.get(threadId), boardId, pool, at }),
-      ).pipe(
-        Effect.andThen(syncSlot(boardId, threadId, "hold", cardId)),
-      ),
+      ).pipe(Effect.andThen(syncSlot(boardId, threadId, "hold", cardId))),
     );
   /** One board's held slots, thread id to pool, as the rules take them. `except`: a start's own key. */
   const boardHolds = (boardId: string, except?: string) =>
@@ -8554,9 +8558,7 @@ const make = Effect.gen(function* () {
       next.delete(reused);
       return next;
     }).pipe(
-      Effect.andThen(
-        reused === null ? Effect.void : syncSlot(board.id, reused, "join", card.id),
-      ),
+      Effect.andThen(reused === null ? Effect.void : syncSlot(board.id, reused, "join", card.id)),
     );
     let cleaned = false;
     let failureTag = "interrupted";
@@ -19360,7 +19362,25 @@ const make = Effect.gen(function* () {
             (event) => event.toStage !== null && event.fromStage !== event.toStage,
           );
           const after = history.filter((event) => event.at >= window.until);
-          return { ...read, prior, after, readinessBefore };
+          const dispatchCards = yield* dispatchCardPass(boardId, new Set()).read;
+          const reviews = new Map<string, Rules.ReviewEvidence>();
+          if (read.board)
+            for (const card of dispatchCards) {
+              if (card.settledAt === null && kanbanReviewAlreadyDone(card))
+                reviews.set(card.id, yield* reviewEvidence(read.board, card));
+            }
+          return {
+            ...read,
+            prior,
+            after,
+            readinessBefore,
+            dispatchCards,
+            holds: yield* boardHolds(boardId),
+            dispatchPools: Rules.maskDownPools(read.pools, new Set((yield* Ref.get(down)).keys())),
+            reviews,
+            workThreadHomes: yield* workThreadHomes(dispatchCards),
+            assignmentWakeRetries: new Map(assignmentWakeRetries),
+          };
         }),
       ),
     cardByNumber: (boardId, number) => readDb(store.cardByNumber(boardId, number)),
