@@ -10457,6 +10457,14 @@ const make = Effect.gen(function* () {
     return;
   });
 
+  const turnEndCard = Effect.fn("KanbanService.turnEndCard")(function* (
+    id: KanbanCard["id"],
+  ) {
+    // Reader admission can take minutes. The enclosing operation revalidates
+    // its board generation before using this snapshot after reacquiring the gate.
+    return yield* locks.outside(rawStore.card(id), undefined, true);
+  });
+
   const finishTurn = Effect.fn("KanbanService.turnEndedUnlocked")(function* (
     threadId: ThreadId,
     expectedFailedWorkRunId?: string,
@@ -10495,7 +10503,7 @@ const make = Effect.gen(function* () {
       },
     });
     let card = yield* settleDetachedSteer(
-      link.cardId ? yield* store.card(link.cardId) : null,
+      link.cardId ? yield* turnEndCard(link.cardId) : null,
       view,
       viewFence,
     );
@@ -10530,7 +10538,9 @@ const make = Effect.gen(function* () {
     if (card?.discussionId) discussionIds.add(card.discussionId);
     for (const id of carriedIds) {
       const other =
-        id === card?.id ? card : yield* settleDetachedSteer(yield* store.card(id), view, viewFence);
+        id === card?.id
+          ? card
+          : yield* settleDetachedSteer(yield* turnEndCard(id), view, viewFence);
       if (other?.discussionId) discussionIds.add(other.discussionId);
     }
     // A run that failed (the provider refused the model or variant, or a route is gone)
