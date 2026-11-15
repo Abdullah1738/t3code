@@ -528,6 +528,22 @@ class FailbackTests(Isolated):
         self.assertEqual(lines.count('offbox: this run goes back to home'), 1)
         self.assertEqual(lines[2:], ['earlier home progress', 'offbox: queued on Boat', 'offbox: later home progress'])
 
+    def test_correct_routing_header_never_rewrites_a_concurrent_handoff_append(self):
+        path = common.LOGS_DIR / 'mine.client.log'
+        route = 'offbox: this run goes back to home'
+        path.write_text(route+'\npartial')
+        read = Path.read_text
+        def append_after_read(target, *args, **kwargs):
+            content = read(target, *args, **kwargs)
+            if target == path:
+                with path.open('a') as output:
+                    output.write(' handoff print\n')
+            return content
+        with patch.dict(os.environ, {home.ROUTING_ENV: json.dumps([route])}), \
+                patch.object(Path, 'read_text', append_after_read):
+            home.flush_routing('mine')
+        self.assertEqual(path.read_text(), route+'\npartial handoff print\n')
+
     def test_routing_is_first_line_for_preflight_and_post_time_ids(self):
         for run_id in ('preflight', 'post'):
             with self.subTest(run_id=run_id), patch.dict(os.environ, {home.ROUTING_ENV: '[]'}):

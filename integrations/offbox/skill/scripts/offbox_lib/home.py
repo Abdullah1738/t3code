@@ -715,6 +715,10 @@ def flush_routing(run_id):
     path = common.LOGS_DIR / f"{run_id}.client.log"
     path.parent.mkdir(parents=True, exist_ok=True)
     existing = path.read_text(errors="replace") if path.exists() else ""
+    header = "\n".join(lines) + "\n"
+    # The predecessor can still be appending its handoff prints when the replacement Runner starts.
+    if existing.startswith(header):
+        return
     body = [line for line in existing.splitlines() if line not in lines]
     updated = "\n".join([*lines, *body]) + "\n"
     if updated != existing:
