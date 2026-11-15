@@ -1,3 +1,4 @@
+import { McpDenyReason } from "./ardud/mcpDenyReason.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as Struct from "effect/Struct";
@@ -810,5 +811,6 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
       "target_required",
     ]),
     message: Schema.String,
+    reason: Schema.optional(McpDenyReason),
   },
 ) {}

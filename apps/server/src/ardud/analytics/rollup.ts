@@ -50,6 +50,24 @@ interface Breakdown {
   durations: Durations;
   count: number;
   totalWaitMs: number;
+  byReason: Map<string, number>;
+  byRole: Map<string, number>;
+  byCallerReaderLane: Map<string, number>;
+  replyPhases: Map<string, Durations>;
+  writePhases: Map<string, Durations>;
+  contexts: Map<
+    string,
+    {
+      errorTag: string;
+      denyReason: string;
+      callerRole: string;
+      cardStage: string;
+      count: number;
+      durations: Durations;
+      replyPhases: Map<string, Durations>;
+      writePhases: Map<string, Durations>;
+    }
+  >;
 }
 
 // Fixed cardinality, including overflow. Keep all overflowing measurements, not just their count.
@@ -57,6 +75,7 @@ function breakdown(
   groups: Map<string, Breakdown>,
   labels: Breakdown["labels"],
   event: AnalyticsEvent,
+  phases = false,
 ) {
   const identity = JSON.stringify(labels);
   let key = identity;
@@ -90,8 +109,62 @@ function breakdown(
       durations: durations(),
       count: 0,
       totalWaitMs: 0,
+      byReason: new Map(),
+      byRole: new Map(),
+      byCallerReaderLane: new Map(),
+      replyPhases: new Map(),
+      writePhases: new Map(),
+      contexts: new Map(),
     };
     groups.set(key, group);
+  }
+  if (event.kind === "mcp.call") {
+    const reason = event.denyReason ?? "unknown";
+    const role = event.callerRole ?? "none";
+    group.byReason.set(reason, (group.byReason.get(reason) ?? 0) + 1);
+    group.byRole.set(role, (group.byRole.get(role) ?? 0) + 1);
+    const callerLane = event.callerReaderLane ?? event.readerLane ?? "unknown";
+    group.byCallerReaderLane.set(callerLane, (group.byCallerReaderLane.get(callerLane) ?? 0) + 1);
+    const cardStage = event.cardStage ?? "unknown";
+    const errorTag = event.errorTag ?? event.props?.code ?? "unknown";
+    const identity = JSON.stringify([errorTag, reason, role, cardStage]);
+    const key = group.contexts.has(identity) || group.contexts.size < MAX_GROUPS ? identity : OTHER;
+    let context = group.contexts.get(key);
+    if (!context) {
+      context = {
+        errorTag: key === OTHER ? "other" : errorTag,
+        denyReason: key === OTHER ? "other" : reason,
+        callerRole: key === OTHER ? "other" : role,
+        cardStage: key === OTHER ? "other" : cardStage,
+        count: 0,
+        durations: durations(),
+        replyPhases: new Map(),
+        writePhases: new Map(),
+      };
+      group.contexts.set(key, context);
+    }
+    context.count++;
+    if (event.durationMs !== undefined) addDuration(context.durations, event.durationMs);
+    if (phases && (event.errorTag === "reply_timeout" || event.props?.code === "reply_timeout")) {
+      for (const [phase, ms] of Object.entries(event.writePhases ?? {})) {
+        for (const phases of [group.writePhases, context.writePhases]) {
+          let times = phases.get(phase);
+          if (!times) phases.set(phase, (times = durations()));
+          addDuration(times, ms);
+        }
+      }
+    }
+
+    if (phases && (event.errorTag === "reply_timeout" || event.props?.code === "reply_timeout")) {
+      for (const [phase, ms] of Object.entries(event.replyPhases ?? {})) {
+        if (ms === undefined) continue;
+        for (const phases of [group.replyPhases, context.replyPhases]) {
+          let values = phases.get(phase);
+          if (!values) phases.set(phase, (values = durations()));
+          addDuration(values, ms);
+        }
+      }
+    }
   }
   group.count++;
   if (event.durationMs !== undefined) addDuration(group.durations, event.durationMs);
@@ -102,6 +175,29 @@ function finishBreakdown(groups: Map<string, Breakdown>) {
   return [...groups.values()]
     .map((group) => ({
       labels: group.labels,
+      byReason: Object.fromEntries(group.byReason),
+      byRole: Object.fromEntries(group.byRole),
+      byCallerReaderLane: Object.fromEntries(group.byCallerReaderLane),
+      replyPhases: Object.fromEntries(
+        [...group.replyPhases].map(([phase, times]) => [phase, summarize(times)]),
+      ),
+      writePhases: Object.fromEntries(
+        [...group.writePhases].map(([phase, times]) => [phase, summarize(times)]),
+      ),
+      contexts: [...group.contexts.values()].map((context) => ({
+        errorTag: context.errorTag,
+        denyReason: context.denyReason,
+        callerRole: context.callerRole,
+        cardStage: context.cardStage,
+        ...summarize(context.durations),
+        count: context.count,
+        replyPhases: Object.fromEntries(
+          [...context.replyPhases].map(([phase, times]) => [phase, summarize(times)]),
+        ),
+        writePhases: Object.fromEntries(
+          [...context.writePhases].map(([phase, times]) => [phase, summarize(times)]),
+        ),
+      })),
       ...summarize(group.durations),
       count: group.count,
       totalWaitMs: group.totalWaitMs,
@@ -145,6 +241,7 @@ export const makeAccumulator = () => ({
     }
   >(),
   mcpCodes: new Map<string, Breakdown>(),
+  mcpReplyTimeouts: new Map<string, Breakdown>(),
   dbSpans: new Map<string, Breakdown>(),
   rpcs: new Map<string, Durations & { totalWaitMs: number; outcomes: Map<string, number> }>(),
   longTasks: new Map<
@@ -491,6 +588,14 @@ export function accumulate(
       { tool: event.tool ?? "unknown", code: event.props?.code ?? event.errorTag ?? "unknown" },
       event,
     );
+    if (event.errorTag === "reply_timeout" || event.props?.code === "reply_timeout") {
+      breakdown(
+        target.mcpReplyTimeouts,
+        { tool: event.tool ?? "unknown", code: "reply_timeout" },
+        event,
+        true,
+      );
+    }
   }
   if (event.kind === "db.slow") {
     breakdown(
@@ -770,6 +875,7 @@ export function finishRollup(
       retries.set(previous.group, count);
     }
   }
+  const mcp = finishBreakdown(target.mcpCodes);
   return {
     day,
     generatedAt,
@@ -810,7 +916,7 @@ export function finishRollup(
       maxMs: row.maxMs,
       approximate: row.approximate,
     })),
-    mcpErrorsByCode: finishBreakdown(target.mcpCodes).map((row) => ({
+    mcpErrorsByCode: mcp.map((row) => ({
       tool: String(row.labels.tool),
       code: String(row.labels.code),
       count: row.count,
@@ -819,6 +925,52 @@ export function finishRollup(
       maxMs: row.maxMs,
       approximate: row.approximate,
     })),
+    mcpFailureBreakdown: mcp.map((row) => ({
+      tool: String(row.labels.tool),
+      code: String(row.labels.code),
+      count: row.count,
+      p50Ms: row.p50Ms,
+      p95Ms: row.p95Ms,
+      maxMs: row.maxMs,
+      approximate: row.approximate,
+      byReason: row.byReason,
+      byRole: row.byRole,
+      byCallerReaderLane: row.byCallerReaderLane,
+    })),
+    mcpFailureContexts: mcp.flatMap((row) =>
+      row.contexts.map(
+        ({
+          errorTag,
+          denyReason,
+          callerRole,
+          cardStage,
+          count,
+          p50Ms,
+          p95Ms,
+          maxMs,
+          approximate,
+        }) => ({
+          tool: String(row.labels.tool),
+          code: String(row.labels.code),
+          errorTag,
+          denyReason,
+          callerRole,
+          cardStage,
+          count,
+          p50Ms,
+          p95Ms,
+          maxMs,
+          approximate,
+        }),
+      ),
+    ),
+    mcpReplyTimeouts: finishBreakdown(target.mcpReplyTimeouts).flatMap((row) =>
+      row.contexts.map((context) => ({
+        tool: String(row.labels.tool),
+        code: "reply_timeout" as const,
+        ...context,
+      })),
+    ),
     dbSlowBySpan: finishBreakdown(target.dbSpans).map((row) => ({
       span: String(row.labels.span),
       key: String(row.labels.key),

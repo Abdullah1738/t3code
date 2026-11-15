@@ -133,6 +133,7 @@ it.effect.each([
         const state: McpCall["Service"] = {
           callerResolved: false,
           callerResolveMs: 0,
+          callerReaderLane: "background",
           readerLane: "background",
           phase: "handler",
           saved: "unknown",
@@ -221,6 +222,7 @@ it.effect.each([
             assert.equal(state.readerLane, "foreground");
           }
           assert.isNumber(state.waitLookupMs);
+          assert.equal(state.callerReaderLane, caller === "client" ? "background" : "identity");
         }).pipe(
           Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(dependencies))),
           Effect.provideService(McpCall, state),

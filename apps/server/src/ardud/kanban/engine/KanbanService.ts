@@ -978,6 +978,7 @@ export interface KanbanServiceShape {
     effect: Effect.Effect<A, E, R>,
   ) => Effect.Effect<A, E | KanbanError, R>;
   /** The board link of a calling thread, or null for threads the board did not start. */
+  readonly callerAnalytics?: NonNullable<KanbanStore["Service"]["callerAnalytics"]>;
   readonly caller: (threadId: string) => Effect.Effect<KanbanThreadLink | null, KanbanError>;
   /** Cards a work thread is working on right now. */
   readonly carried: (threadId: ThreadId) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanError>;
@@ -1120,8 +1121,17 @@ const ProbeOutput = Schema.Struct({ ok: Schema.Boolean });
 
 const uuid = () => NodeCrypto.randomUUID();
 
-const failWith = (code: KanbanError["code"], detail: string) =>
-  Effect.fail(new KanbanError({ code, detail }));
+const failWith = (
+  code: KanbanError["code"],
+  detail: string,
+  reason: NonNullable<KanbanError["reason"]> = code === "not-found"
+    ? "resource_not_found"
+    : code === "conflict"
+      ? "conflict"
+      : code === "failed"
+        ? "operation_failed"
+        : "invalid_args",
+) => Effect.fail(new KanbanError({ code, detail, reason }));
 
 /** A refused answer, with the revision the ask is at when that is why. */
 const failAnswer = (problem: Asks.AskProblem) =>
@@ -1129,6 +1139,7 @@ const failAnswer = (problem: Asks.AskProblem) =>
     new KanbanError({
       code: problem.code,
       detail: problem.detail,
+      reason: "invalid_args",
       ...(problem.revision === undefined ? {} : { revision: problem.revision }),
     }),
   );
@@ -1713,7 +1724,11 @@ const make = Effect.gen(function* () {
       true,
     );
   const tickTransaction: typeof boardSql.withTransaction = (effect) =>
-    TickTimings.measure("event_persistence", boardSql.withTransaction(effect), true);
+    TickTimings.measure(
+      "event_persistence",
+      rawStore.observeCallerWrites(boardSql.withTransaction(effect)),
+      true,
+    );
   const store = LockedStore.wrap(rawStore, locks);
   const threadIo = yield* KanbanThreads;
   const turnAdmission = yield* ThreadCommandExecutor.ThreadCommandExecutor;
@@ -2929,7 +2944,7 @@ const make = Effect.gen(function* () {
     yield* resolvedContext({
       boardId: discussion.boardId,
       ...(discussion.cardId === null ? {} : { id: discussion.cardId }),
-      ...(card === null ? {} : { number: card.number }),
+      ...(card === null ? {} : { number: card.number, stage: card.stage }),
     });
   });
 
@@ -3225,8 +3240,10 @@ const make = Effect.gen(function* () {
           };
         // A release completion and its pacing receipt must survive the same restart.
         const write = releaseBoard
-          ? boardSql.withTransaction(
-              store.putBoard(releaseBoard).pipe(Effect.andThen(store.putCard(card))),
+          ? rawStore.observeCallerWrites(
+              boardSql.withTransaction(
+                store.putBoard(releaseBoard).pipe(Effect.andThen(store.putCard(card))),
+              ),
             )
           : store.putCard(card);
         yield* dispatchMetadata ? locks.dispatchMetadata(write) : write;
@@ -3678,7 +3695,12 @@ const make = Effect.gen(function* () {
   ) {
     const board = yield* boardOf(card.boardId);
     const check = Rules.checkMove(role, card, to);
-    if (!check.ok) return yield* failWith("denied", check.reason);
+    if (!check.ok)
+      return yield* failWith(
+        "denied",
+        check.reason,
+        ("denyReason" in check ? check.denyReason : undefined) ?? "role_not_allowed",
+      );
     const waitFrom =
       card.stage === "needs_owner" && to === "needs_review"
         ? (yield* askedBy(card))?.fromStage
@@ -4489,7 +4511,8 @@ const make = Effect.gen(function* () {
     purpose: Briefs.EvaluatorPurpose,
     extra: EvaluatorJob["extra"] = {},
   ) {
-    if (board.archivedAt !== null) return yield* failWith("denied", "Board is deleted");
+    if (board.archivedAt !== null)
+      return yield* failWith("denied", "Board is deleted", "board_deleted");
     if (board.defaultProjectId === null) {
       return yield* failWith("invalid", `board ${board.slug} has no default project`);
     }
@@ -5341,7 +5364,8 @@ const make = Effect.gen(function* () {
       board.id,
       Effect.gen(function* () {
         const current = yield* boardOf(board.id);
-        if (current.archivedAt !== null) return yield* failWith("denied", "Board is deleted");
+        if (current.archivedAt !== null)
+          return yield* failWith("denied", "Board is deleted", "board_deleted");
         if (["stalled", "completed", "deployed", "check", "nightly"].includes(purpose.kind)) {
           const running = yield* runningSweep(board.id, purpose.kind);
           if (running)
@@ -5423,7 +5447,11 @@ const make = Effect.gen(function* () {
     }
     const isSetupThread = actor._tag === "evaluator" && actor.threadId === setup.threadId;
     if (actor._tag !== "owner" && !isSetupThread) {
-      return yield* failWith("denied", "only the owner or the setup evaluator ends setup");
+      return yield* failWith(
+        "denied",
+        "only the owner or the setup evaluator ends setup",
+        "role_not_allowed",
+      );
     }
     const at = yield* nowIso;
     const done: KanbanBoard = {
@@ -5451,7 +5479,11 @@ const make = Effect.gen(function* () {
     callerAncestors: ReadonlyArray<string>,
   ) {
     if (actor._tag !== "owner" && actor._tag !== "evaluator") {
-      return yield* failWith("denied", "only the owner or an evaluator pauses a board");
+      return yield* failWith(
+        "denied",
+        "only the owner or an evaluator pauses a board",
+        "role_not_allowed",
+      );
     }
     for (const id of callerAncestors) {
       const link = yield* store.threadLink(id);
@@ -5459,6 +5491,7 @@ const make = Effect.gen(function* () {
         return yield* failWith(
           "denied",
           "Only evaluators use this tool, not card threads or their children.",
+          "role_not_allowed",
         );
       }
     }
@@ -13533,7 +13566,11 @@ const make = Effect.gen(function* () {
     archiveLanes?: Set<string>,
   ) {
     if (patch.archived !== undefined && actor?._tag !== "owner")
-      return yield* failWith("denied", "Only the owner can delete or restore a board.");
+      return yield* failWith(
+        "denied",
+        "Only the owner can delete or restore a board.",
+        "role_not_allowed",
+      );
     const { archived, ...fields } = patch;
     if (patch.name !== undefined && patch.name.trim() === "") {
       return yield* failWith("invalid", "A board needs a name");
@@ -13751,7 +13788,7 @@ const make = Effect.gen(function* () {
     "KanbanService.applyApprovedInstructions",
   )(function* (boardId, field, text, cardId, askId, actor) {
     if (actor._tag !== "evaluator") {
-      return yield* failWith("denied", "Only evaluators use this tool.");
+      return yield* failWith("denied", "Only evaluators use this tool.", "role_not_allowed");
     }
     const result = yield* guard(
       "board.applyApprovedInstructions",
@@ -13759,18 +13796,27 @@ const make = Effect.gen(function* () {
         const card = yield* cardOf(cardId);
         const ask = card.asks.find((entry) => entry.id === askId);
         if (!ask) return yield* failWith("not-found", `ask ${askId} on card #${card.number}`);
-        if (!ask.closedAt) return yield* failWith("denied", `ask ${askId} is still open`);
+        if (!ask.closedAt)
+          return yield* failWith("denied", `ask ${askId} is still open`, "ask_open");
         if (ask.answer?.verdict === "dropped") {
-          return yield* failWith("denied", `ask ${askId} was dropped`);
+          return yield* failWith("denied", `ask ${askId} was dropped`, "ask_dropped");
         }
         if (ask.answer?.verdict === "rejected") {
-          return yield* failWith("denied", `ask ${askId} was rejected`);
+          return yield* failWith("denied", `ask ${askId} was rejected`, "ask_rejected");
         }
         if (ask.answer?.by._tag !== "owner") {
-          return yield* failWith("denied", `ask ${askId} was not answered by the owner`);
+          return yield* failWith(
+            "denied",
+            `ask ${askId} was not answered by the owner`,
+            "answer_not_owner",
+          );
         }
         if (ask.answer.verdict !== "approved") {
-          return yield* failWith("denied", `ask ${askId} does not have the owner's approval`);
+          return yield* failWith(
+            "denied",
+            `ask ${askId} does not have the owner's approval`,
+            "approval_required",
+          );
         }
         const board = yield* boardOf(boardId);
         const namesField = {
@@ -13793,12 +13839,17 @@ const make = Effect.gen(function* () {
           return yield* failWith(
             "denied",
             `ask ${askId} has no change entry labelled for board ${board.slug} and field ${field}`,
+            "approval_change_missing",
           );
         }
         const normalized = (value: string) => value.replace(/\r\n/g, "\n").trim();
         const approved = changes.filter((entry) => normalized(entry.after) === normalized(text));
         if (approved.length === 0) {
-          return yield* failWith("denied", `text differs from the approved after in ask ${askId}`);
+          return yield* failWith(
+            "denied",
+            `text differs from the approved after in ask ${askId}`,
+            "approved_payload_mismatch",
+          );
         }
         if (normalized(board.instructions[field]) === normalized(text)) {
           return { board, applied: false, reason: "already set" };
@@ -13811,6 +13862,7 @@ const make = Effect.gen(function* () {
           return yield* failWith(
             "denied",
             "the board's text changed since he approved it; ask again",
+            "approval_base_changed",
           );
         }
         const application: InstructionApplication = {
@@ -13862,7 +13914,7 @@ const make = Effect.gen(function* () {
     "KanbanService.applyApprovedSettings",
   )(function* (boardId, setting, value, cardId, askId, actor) {
     if (actor._tag !== "evaluator") {
-      return yield* failWith("denied", "Only evaluators use this tool.");
+      return yield* failWith("denied", "Only evaluators use this tool.", "role_not_allowed");
     }
     const result = yield* guard(
       "board.applyApprovedSettings",
@@ -13870,18 +13922,27 @@ const make = Effect.gen(function* () {
         const card = yield* cardOf(cardId);
         const ask = card.asks.find((entry) => entry.id === askId);
         if (!ask) return yield* failWith("not-found", `ask ${askId} on card #${card.number}`);
-        if (!ask.closedAt) return yield* failWith("denied", `ask ${askId} is still open`);
+        if (!ask.closedAt)
+          return yield* failWith("denied", `ask ${askId} is still open`, "ask_open");
         if (ask.answer?.verdict === "dropped") {
-          return yield* failWith("denied", `ask ${askId} was dropped`);
+          return yield* failWith("denied", `ask ${askId} was dropped`, "ask_dropped");
         }
         if (ask.answer?.verdict === "rejected") {
-          return yield* failWith("denied", `ask ${askId} was rejected`);
+          return yield* failWith("denied", `ask ${askId} was rejected`, "ask_rejected");
         }
         if (ask.answer?.by._tag !== "owner") {
-          return yield* failWith("denied", `ask ${askId} was not answered by the owner`);
+          return yield* failWith(
+            "denied",
+            `ask ${askId} was not answered by the owner`,
+            "answer_not_owner",
+          );
         }
         if (ask.answer.verdict !== "approved") {
-          return yield* failWith("denied", `ask ${askId} does not have the owner's approval`);
+          return yield* failWith(
+            "denied",
+            `ask ${askId} does not have the owner's approval`,
+            "approval_required",
+          );
         }
         const board = yield* boardOf(boardId);
         const namesField = ["guessed gates", "guessedGates"];
@@ -13900,6 +13961,7 @@ const make = Effect.gen(function* () {
           return yield* failWith(
             "denied",
             `ask ${askId} has no change entry labelled for board ${board.slug} and setting ${setting}`,
+            "approval_change_missing",
           );
         }
         const normalized = (value: string) => value.replace(/\r\n/g, "\n").trim();
@@ -13909,7 +13971,11 @@ const make = Effect.gen(function* () {
           board.guessedGates === undefined ? "(unset)" : [...board.guessedGates].sort().join(", ");
         const approved = changes.filter((entry) => normalized(entry.after) === normalized(text));
         if (approved.length === 0) {
-          return yield* failWith("denied", `value differs from the approved after in ask ${askId}`);
+          return yield* failWith(
+            "denied",
+            `value differs from the approved after in ask ${askId}`,
+            "approved_payload_mismatch",
+          );
         }
         if (normalized(current) === normalized(text)) {
           return { board, applied: false, reason: "already set" };
@@ -13918,6 +13984,7 @@ const make = Effect.gen(function* () {
           return yield* failWith(
             "denied",
             "the board's setting changed since he approved it; ask again",
+            "approval_base_changed",
           );
         }
         const application: InstructionApplication = {
@@ -13969,10 +14036,18 @@ const make = Effect.gen(function* () {
     actor: KanbanActor,
   ) {
     if (actor._tag !== "evaluator")
-      return yield* failWith("denied", "only evaluators may grant or revoke standing approvals");
+      return yield* failWith(
+        "denied",
+        "only evaluators may grant or revoke standing approvals",
+        "role_not_allowed",
+      );
     const link = yield* store.threadLink(actor.threadId);
     if (link?.role !== "evaluator")
-      return yield* failWith("denied", "only evaluators may grant or revoke standing approvals");
+      return yield* failWith(
+        "denied",
+        "only evaluators may grant or revoke standing approvals",
+        "role_not_allowed",
+      );
   });
 
   const saveStandingApprovals = Effect.fn("KanbanService.saveStandingApprovals")(function* (
@@ -14048,6 +14123,7 @@ const make = Effect.gen(function* () {
           return yield* failWith(
             "denied",
             "only evaluators may grant or revoke standing approvals",
+            "role_not_allowed",
           );
         const own = yield* boardOf(boardId);
         const slugs = [...new Set(input.boards ?? [own.slug])];
@@ -14115,6 +14191,7 @@ const make = Effect.gen(function* () {
           return yield* failWith(
             "denied",
             "grant needs a closed ask approved by the owner (not open, dropped or answered by an evaluator)",
+            "approval_required",
           );
         const words = `${ask.text} ${ask.title ?? ""} ${ask.action?.summary ?? ""} ${ask.action?.target ?? ""}`;
         for (const board of boards) {
@@ -14127,6 +14204,7 @@ const make = Effect.gen(function* () {
             return yield* failWith(
               "denied",
               `owner-approved ask must name board ${board.slug} as a whole word`,
+              "approval_board_not_named",
             );
         }
         const at = yield* nowIso;
@@ -14276,9 +14354,10 @@ const make = Effect.gen(function* () {
       return yield* failWith(
         "denied",
         "only evaluators may set or clear ownerOnly, interrupting or service",
+        "role_not_allowed",
       );
     const plan = Subtasks.planSubtasks([], input.subtasks ?? [], 0, at, board.guessedGates);
-    if (!plan.ok) return yield* failWith("invalid", plan.reason);
+    if (!plan.ok) return yield* failWith("invalid", plan.reason, plan.denyReason);
     yield* checkScriptNames(boardId, plan.subtasks);
     return {
       id: KanbanCardId.make(`card-${uuid()}`),
@@ -14383,7 +14462,7 @@ const make = Effect.gen(function* () {
     const reader = compact ? rawStore : store;
     const link = yield* reader.threadLink(threadId);
     if (!link || link.role !== "work") {
-      return yield* failWith("denied", "only a card's work thread takes cards");
+      return yield* failWith("denied", "only a card's work thread takes cards", "role_not_allowed");
     }
     const board = yield* boardOf(link.boardId);
     const context = compact ? yield* threads.claimContext(threadId) : null;
@@ -14508,9 +14587,10 @@ const make = Effect.gen(function* () {
         `card #${card.number} is starting; wait for its assignment`,
       );
     }
-    if (settingUp.has(card.boardId)) return yield* failWith("denied", "Setup is starting");
+    if (settingUp.has(card.boardId))
+      return yield* failWith("denied", "Setup is starting", "board_setup_starting");
     if (card.boardId !== thread.board.id) {
-      return yield* failWith("denied", `card #${card.number} is on another board`);
+      return yield* failWith("denied", `card #${card.number} is on another board`, "cross_board");
     }
     const cards = yield* store.openCards(card.boardId);
     const pools = yield* store.pools(card.boardId);
@@ -14527,12 +14607,21 @@ const make = Effect.gen(function* () {
       pools,
       nowMs: yield* nowMillis,
     });
-    if (!check.ok) return yield* failWith("denied", check.reason);
+    if (!check.ok)
+      return yield* failWith(
+        "denied",
+        check.reason,
+        ("denyReason" in check ? check.denyReason : undefined) ?? "role_not_allowed",
+      );
     if (!thread.holdsSlot) {
       const used =
         Rules.poolThreads(cards, yield* boardHolds(card.boardId)).get(thread.pool)?.size ?? 0;
       if (used >= slots) {
-        return yield* failWith("denied", `no free slot on ${thread.pool}; leave it in todo`);
+        return yield* failWith(
+          "denied",
+          `no free slot on ${thread.pool}; leave it in todo`,
+          "pool_full",
+        );
       }
     }
   });
@@ -14628,6 +14717,7 @@ const make = Effect.gen(function* () {
               return yield* failWith(
                 "denied",
                 "The target work thread is on another board. Nothing was saved.",
+                "cross_board",
               );
             const view = yield* threads.find(threadId);
             if (
@@ -14639,17 +14729,20 @@ const make = Effect.gen(function* () {
               return yield* failWith(
                 "denied",
                 "The target work thread is stopped, ended or missing. Nothing was saved.",
+                "target_thread_unavailable",
               );
             const latest = view.state === "idle" ? yield* threads.latestRun(threadId) : null;
             if (latest?.status === "cancelled" || latest?.status === "interrupted")
               return yield* failWith(
                 "denied",
                 "The target work thread was stopped. Nothing was saved.",
+                "target_thread_stopped",
               );
             if (input.stage === "needs_owner" || input.priority === KANBAN_BACKLOG)
               return yield* failWith(
                 "denied",
                 "forThread needs a todo card outside the backlog. Nothing was saved.",
+                "stage_not_allowed",
               );
           }
           // The thread's live model comes first: a switch moves the thread even after every
@@ -14668,6 +14761,7 @@ const make = Effect.gen(function* () {
             return yield* failWith(
               "denied",
               `this thread runs ${thread.pool}; the card runs on ${Rules.poolOf(pools, model)}. Nothing was saved.`,
+              "model_pool_mismatch",
             );
           }
           const fields: NewCard = {
@@ -14694,6 +14788,7 @@ const make = Effect.gen(function* () {
               ? error
               : new KanbanError({
                   code: error.code,
+                  reason: error.reason ?? "operation_failed",
                   detail: `${error.detail}. Nothing was saved.`,
                 });
           }),
@@ -14868,7 +14963,11 @@ const make = Effect.gen(function* () {
           actor._tag !== "evaluator" &&
           actor._tag !== "owner"
         ) {
-          return yield* failWith("denied", "only the board evaluator can clear a guessed gate");
+          return yield* failWith(
+            "denied",
+            "only the board evaluator can clear a guessed gate",
+            "role_not_allowed",
+          );
         }
         const board = yield* boardOf(card.boardId);
         if (
@@ -14883,6 +14982,7 @@ const make = Effect.gen(function* () {
           return yield* failWith(
             "denied",
             "only evaluators may set or clear ownerOnly, interrupting or service",
+            "role_not_allowed",
           );
         const plan = patch.subtasks
           ? Subtasks.planSubtasks(
@@ -14894,7 +14994,8 @@ const make = Effect.gen(function* () {
               actor,
             )
           : null;
-        if (plan && !plan.ok) return yield* failWith(plan.code ?? "invalid", plan.reason);
+        if (plan && !plan.ok)
+          return yield* failWith(plan.code ?? "invalid", plan.reason, plan.denyReason);
         if (plan?.ok) {
           for (const subtask of card.subtasks) {
             if (subtask.state !== "open") continue;
@@ -14910,7 +15011,8 @@ const make = Effect.gen(function* () {
               board.guessedGates,
               "skip",
             );
-            if (actor._tag !== "owner" && missing) return yield* failWith("denied", missing);
+            if (actor._tag !== "owner" && missing)
+              return yield* failWith("denied", missing, "approval_required");
           }
           yield* checkScriptNames(card.boardId, plan.subtasks);
         }
@@ -15195,6 +15297,7 @@ const make = Effect.gen(function* () {
               return yield* failWith(
                 "denied",
                 `card #${card.number} has no thread attached: you can only move it to needs_review; use card_ask for an owner question`,
+                "review_handoff_only",
               );
             }
           }
@@ -15214,6 +15317,7 @@ const make = Effect.gen(function* () {
             return yield* failWith(
               "denied",
               `card #${card.number} still has ${Subtasks.subtaskIds(work)} to do: mark each done (or skipped, with why) with subtask_done first`,
+              "work_subtasks_open",
             );
           }
         }
@@ -15233,14 +15337,18 @@ const make = Effect.gen(function* () {
             .find((problem) => problem !== null);
           if (open.length > 0) {
             const reason = `card #${card.number} still has ${Subtasks.subtaskIds(open)} open: mark each done or skipped first`;
-            return yield* failWith("denied", missing ? `${reason}; ${missing}` : reason);
+            return yield* failWith(
+              "denied",
+              missing ? `${reason}; ${missing}` : reason,
+              "subtasks_open",
+            );
           }
-          if (missing) return yield* failWith("denied", missing);
+          if (missing) return yield* failWith("denied", missing, "approval_required");
         }
         if ((to === "completed" || to === "deployed") && role !== "owner") {
           const board = yield* boardOf(card.boardId);
           const blocked = Rules.reviewGate(card, Rules.chainFor(board, card)?.steps.length ?? 1);
-          if (blocked !== null) return yield* failWith("denied", blocked);
+          if (blocked !== null) return yield* failWith("denied", blocked, "review_incomplete");
           if (role === "evaluator" && card.workThreadId !== null) {
             const reviewed = (yield* store.cardEvents(card.id)).findLast(
               (event) => event.kind === "review",
@@ -15258,6 +15366,7 @@ const make = Effect.gen(function* () {
                 return yield* failWith(
                   "denied",
                   `card #${card.number} was cleared at ${reviewed.slice(0, 7)} but its PR is now at ${changed.observedHead.slice(0, 7)}: send it back to needs_review`,
+                  "review_head_changed",
                 );
             }
           }
@@ -15266,6 +15375,7 @@ const make = Effect.gen(function* () {
           return yield* failWith(
             "denied",
             `card #${card.number}'s step is yours (${Subtasks.subtaskIds(kanbanStepSubtasks(card))}): do it, or add work subtasks with card_edit, before sending it back to todo`,
+            "evaluator_step_pending",
           );
         }
         let source = card;
@@ -15506,6 +15616,7 @@ const make = Effect.gen(function* () {
                   ? `card #${card.number} is in review with no thread; its work thread may only send it back with card_move to needs_review and a note naming the new head`
                   : `card #${card.number} is not assigned to this thread`
             : `card #${card.number} is not assigned to this thread`,
+          "not_card_owner",
         )
       : Effect.void;
 
@@ -15523,7 +15634,8 @@ const make = Effect.gen(function* () {
         const question = input.question.trim();
         if (!question) return yield* failWith("invalid", "an ask needs the question");
         const written = Asks.askFields(input, { blocking: input.blocking, card });
-        if (Asks.isAskProblem(written)) return yield* failWith(written.code, written.detail);
+        if (Asks.isAskProblem(written))
+          return yield* failWith(written.code, written.detail, "invalid_args");
         if (written.to === "evaluator" && actor._tag !== "thread") {
           return yield* failWith(
             "invalid",
@@ -15531,7 +15643,8 @@ const make = Effect.gen(function* () {
           );
         }
         const fields = yield* adoptAskFiles(card.boardId, written);
-        if (card.settledAt !== null) return yield* failWith("denied", "card is settled");
+        if (card.settledAt !== null)
+          return yield* failWith("denied", "card is settled", "card_settled");
         const at = yield* nowIso;
         let next: KanbanCard;
         if (!input.blocking) {
@@ -15653,7 +15766,8 @@ const make = Effect.gen(function* () {
         const ask = yield* openAskOf(card, askId);
         const at = yield* nowIso;
         const written = Asks.reviseAsk(ask, edit, at, card);
-        if (Asks.isAskProblem(written)) return yield* failWith(written.code, written.detail);
+        if (Asks.isAskProblem(written))
+          return yield* failWith(written.code, written.detail, "invalid_args");
         const { blocks: _blocks, ...revised } = written;
         // New blocks replace the old ones; otherwise the last version's come along whole.
         const kept = ask.blocks?.length ?? 0;
@@ -15703,7 +15817,8 @@ const make = Effect.gen(function* () {
         const ask = card.asks.find((entry) => entry.id === askId);
         if (!ask) return yield* failWith("not-found", `ask ${askId} on card #${card.number}`);
         const plan = Asks.secretPlan(card, ask, fieldIds);
-        if (Asks.isAskProblem(plan)) return yield* failWith(plan.code, plan.detail);
+        if (Asks.isAskProblem(plan))
+          return yield* failWith(plan.code, plan.detail, "approval_required");
         const projectId = card.projectId ?? (yield* boardOf(card.boardId)).defaultProjectId;
         return { ...plan, projectId };
       }),
@@ -15725,6 +15840,7 @@ const make = Effect.gen(function* () {
       return yield* failWith(
         "denied",
         `${ask.id} on card #${card.number} is with the evaluators of its own board: this thread is not one of them`,
+        "evaluator_board_mismatch",
       );
     }
   });
@@ -15770,6 +15886,7 @@ const make = Effect.gen(function* () {
           return yield* failWith(
             "denied",
             `${ask.id} on card #${card.number} was not handed to the evaluator: only the owner answers it`,
+            "ask_not_handed",
           );
         }
         if (!byOwner) yield* checkHandedTo(card, ask, actor);
@@ -15894,7 +16011,7 @@ const make = Effect.gen(function* () {
         const ask = yield* openAskOf(card, askId);
         // Read beside the ask, so held to the ask's sizes, whoever writes it.
         const tooBig = Asks.replyBlocksProblem(blocks);
-        if (tooBig) return yield* failWith(tooBig.code, tooBig.detail);
+        if (tooBig) return yield* failWith(tooBig.code, tooBig.detail, "invalid_args");
         const discussion = yield* cardDiscussionUnlocked(card.id);
         // Never routed as an owner reply: that would answer every open ask on the card.
         const message = yield* postUnlocked(
@@ -15940,6 +16057,7 @@ const make = Effect.gen(function* () {
             action === "return"
               ? "only an evaluator returns a handed ask"
               : "only the owner hands an ask over or takes it back",
+            "role_not_allowed",
           );
         }
         const at = yield* nowIso;
@@ -15962,7 +16080,7 @@ const make = Effect.gen(function* () {
           return yield* failWith("invalid", `${ref} is already with the evaluator`);
         }
         const unfit = Asks.handProblem(card, ask);
-        if (unfit) return yield* failWith(unfit.code, unfit.detail);
+        if (unfit) return yield* failWith(unfit.code, unfit.detail, "invalid_args");
         const discussion = yield* cardDiscussionUnlocked(card.id);
         const next = {
           ...Asks.markHanded(yield* cardOf(card.id), ask.id, at, always === true),
@@ -15994,14 +16112,15 @@ const make = Effect.gen(function* () {
       "ask.snooze",
       Effect.gen(function* () {
         if (actor._tag !== "owner") {
-          return yield* failWith("denied", "only the owner snoozes an ask");
+          return yield* failWith("denied", "only the owner snoozes an ask", "role_not_allowed");
         }
         const card = yield* cardOf(cardId);
         const ask = card.asks.find((entry) => entry.id === askId);
         if (!ask) return yield* failWith("not-found", `ask ${askId} on card #${card.number}`);
         const at = yield* nowIso;
         const snoozed = Asks.snoozeAsk(card, ask, until, at);
-        if (Asks.isAskProblem(snoozed)) return yield* failWith(snoozed.code, snoozed.detail);
+        if (Asks.isAskProblem(snoozed))
+          return yield* failWith(snoozed.code, snoozed.detail, "invalid_args");
         const next = { ...snoozed, updatedAt: at };
         yield* saveCard(next);
         return next;
@@ -16108,6 +16227,7 @@ const make = Effect.gen(function* () {
           return yield* failWith(
             "denied",
             `card #${card.number} was flagged by someone else; only they can change or clear it${hint}`,
+            "flag_owner_mismatch",
           );
         }
         const at = yield* nowIso;
@@ -16265,7 +16385,8 @@ const make = Effect.gen(function* () {
           Waits.WAITS_ENGINE_WIRED,
           yield* activeWaitThreadRunning(card, threads),
         );
-        if (!check.ok) return yield* failWith(check.code, check.reason);
+        if (!check.ok)
+          return yield* failWith(check.code, check.reason, check.denyReason ?? "invalid_args");
         const wait = Waits.newWait(request, actor, at);
         // A new wait is a decision: a hold for the evaluator from the last one ends here.
         const next: KanbanCard = {
@@ -16288,7 +16409,8 @@ const make = Effect.gen(function* () {
         const park = Effect.gen(function* () {
           if (yield* activeWaitThreadRunning(card, threadIo)) {
             const live = Waits.checkWait(card, request, actor, yield* nowMillis);
-            if (!live.ok) return yield* failWith(live.code, live.reason);
+            if (!live.ok)
+              return yield* failWith(live.code, live.reason, live.denyReason ?? "invalid_args");
           }
           yield* logEvent(next, actor, Waits.waitEventKind("wait_set"), {
             fromStage: card.stage === next.stage ? null : card.stage,
@@ -16519,7 +16641,9 @@ const make = Effect.gen(function* () {
         wired,
       );
       if (outcome === undefined) return yield* failWith("conflict", "nothing changed");
-      return outcome.ok ? outcome.text : yield* failWith(outcome.code, outcome.detail);
+      return outcome.ok
+        ? outcome.text
+        : yield* failWith(outcome.code, outcome.detail, "script_wait_owner_mismatch");
     },
   );
 
@@ -16529,7 +16653,11 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const card = yield* cardOf(cardId);
         if (card.stage !== "verified")
-          return yield* failWith("denied", "only verified cards can be settled");
+          return yield* failWith(
+            "denied",
+            "only verified cards can be settled",
+            "card_not_verified",
+          );
         const at = yield* nowIso;
         const next = { ...card, settledAt: at, updatedAt: at };
         yield* logEvent(next, { _tag: "owner" }, "edited", { body: "Settled" });
@@ -16639,9 +16767,9 @@ const make = Effect.gen(function* () {
             );
           }
           const check = Subtasks.checkMark(card, subtaskId, state, role, note, scriptName);
-          if (!check.ok) return yield* failWith("denied", check.reason);
+          if (!check.ok) return yield* failWith("denied", check.reason, check.denyReason);
           if (actor._tag !== "owner" && missing && !skipGate)
-            return yield* failWith("denied", missing);
+            return yield* failWith("denied", missing, "approval_required");
           const cleared =
             candidate &&
             state === "done" &&
@@ -16818,10 +16946,15 @@ const make = Effect.gen(function* () {
     card: KanbanCard,
     actor: KanbanActor,
   ) {
-    if (actor._tag !== "script") return yield* failWith("denied", "only a board script does this");
+    if (actor._tag !== "script")
+      return yield* failWith("denied", "only a board script does this", "role_not_allowed");
     const script = yield* store.script(actor.scriptId);
     if (script === null || script.boardId !== card.boardId) {
-      return yield* failWith("denied", `card #${card.number} isn't on this script's board`);
+      return yield* failWith(
+        "denied",
+        `card #${card.number} isn't on this script's board`,
+        "cross_board",
+      );
     }
     return script;
   });
@@ -16834,7 +16967,12 @@ const make = Effect.gen(function* () {
         const card = yield* cardOf(cardId);
         const script = yield* scriptFor(card, actor);
         const check = Subtasks.checkHandBack(card, subtaskId, script.name, note);
-        if (!check.ok) return yield* failWith("denied", check.reason);
+        if (!check.ok)
+          return yield* failWith(
+            "denied",
+            check.reason,
+            ("denyReason" in check ? check.denyReason : undefined) ?? "role_not_allowed",
+          );
         const at = yield* nowIso;
         const trimmed = note.trim();
         const text = card.subtasks.find((subtask) => subtask.id === subtaskId)?.text ?? "";
@@ -16926,6 +17064,7 @@ const make = Effect.gen(function* () {
               return yield* failWith(
                 "denied",
                 "only a card's review thread records a review result",
+                "role_not_allowed",
               );
             }
             const card = yield* cardOf(link.cardId);
@@ -17010,7 +17149,7 @@ const make = Effect.gen(function* () {
                   board.standingApprovals,
                   board.guessedGates,
                 );
-                if (missing) return yield* failWith("denied", missing);
+                if (missing) return yield* failWith("denied", missing, "approval_required");
               }
             }
             const subtasks = passed
@@ -17180,7 +17319,7 @@ const make = Effect.gen(function* () {
         yield* checkText([["note", text]]);
         const card = (yield* upgradeFindings([yield* cardOf(cardId)]))[0]!;
         if (action !== "stop" && (yield* boardOf(card.boardId)).archivedAt !== null)
-          return yield* failWith("denied", "Board is deleted");
+          return yield* failWith("denied", "Board is deleted", "board_deleted");
         const at = yield* nowIso;
         // Eligibility controls when the note is delivered, never whether newer
         // wake/reset text can discard context that has not reached the worker.
@@ -17209,7 +17348,11 @@ const make = Effect.gen(function* () {
             return yield* failWith("invalid", `card #${card.number} has no thread`);
           const board = yield* boardOf(card.boardId);
           if (board.pause && !board.pause.keep.includes(card.id)) {
-            return yield* failWith("denied", `the board is paused: ${board.pause.reason}`);
+            return yield* failWith(
+              "denied",
+              `the board is paused: ${board.pause.reason}`,
+              "board_paused",
+            );
           }
           if (
             board.pause &&
@@ -17217,7 +17360,11 @@ const make = Effect.gen(function* () {
               (entry) => !board.pause!.keep.includes(entry.id),
             )
           ) {
-            return yield* failWith("denied", `the board is paused: ${board.pause.reason}`);
+            return yield* failWith(
+              "denied",
+              `the board is paused: ${board.pause.reason}`,
+              "board_paused",
+            );
           }
           // A released sibling still points at the shared thread. The thread runs its own
           // current model (a switch moved it, and it survives every card's release), so a
@@ -17267,6 +17414,7 @@ const make = Effect.gen(function* () {
                 return yield* failWith(
                   "denied",
                   `Thread carries another attached card (#${others[0]!.number}); left it running`,
+                  "shared_thread_in_use",
                 );
             }
           }
@@ -17360,7 +17508,11 @@ const make = Effect.gen(function* () {
         if (card.activeThreadId !== null) {
           const board = yield* boardOf(card.boardId);
           if (board.pause && !board.pause.keep.includes(card.id)) {
-            return yield* failWith("denied", `the board is paused: ${board.pause.reason}`);
+            return yield* failWith(
+              "denied",
+              `the board is paused: ${board.pause.reason}`,
+              "board_paused",
+            );
           }
           if (
             board.pause &&
@@ -17368,7 +17520,11 @@ const make = Effect.gen(function* () {
               (entry) => !board.pause!.keep.includes(entry.id),
             )
           ) {
-            return yield* failWith("denied", `the board is paused: ${board.pause.reason}`);
+            return yield* failWith(
+              "denied",
+              `the board is paused: ${board.pause.reason}`,
+              "board_paused",
+            );
           }
           const model =
             card.activeRole === "review"
@@ -17806,7 +17962,11 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         yield* checkText([["title", patch.title]]);
         if (actor._tag !== "owner") {
-          return yield* failWith("denied", "only the owner renames, settles, snoozes or pins");
+          return yield* failWith(
+            "denied",
+            "only the owner renames, settles, snoozes or pins",
+            "role_not_allowed",
+          );
         }
         const discussion = yield* discussionOf(discussionId);
         const at = yield* nowIso;
@@ -18121,6 +18281,7 @@ const make = Effect.gen(function* () {
         return yield* failWith(
           "invalid",
           `no wiki section ${options.section}; headings: ${section.headings.join(", ")}`,
+          "wiki_section_unknown",
         );
       return [
         {
@@ -18542,6 +18703,7 @@ const make = Effect.gen(function* () {
           const ambiguous = best && !best.exact && matches[1]?.score === best.score;
           const target = hinted ?? (best?.strong && !ambiguous ? best.card : undefined);
           if (!target) return undefined;
+          yield* resolvedContext(target);
           const candidates = matches.slice(0, 3).map(({ card, score }) => ({
             id: card.id,
             number: card.number,
@@ -18672,7 +18834,7 @@ const make = Effect.gen(function* () {
             // committed result (or rollback) before giving up the exclusive permit.
             return locks
               .exclusive(
-                effect.pipe(
+                rawStore.observeCallerWrites(effect).pipe(
                   Effect.provideService(cardWrites, (cards) => {
                     for (const card of cards) {
                       if (card.activeThreadId === null) continue;
@@ -19104,6 +19266,9 @@ const make = Effect.gen(function* () {
       );
     }),
     agentCall,
+    ...(rawStore.callerAnalytics === undefined
+      ? {}
+      : { callerAnalytics: rawStore.callerAnalytics }),
     caller: (threadId) => readDb(store.threadLink(threadId)),
     carried: (threadId) => readDb(store.cardsByThread(threadId)),
     ownCards: (threadId) =>

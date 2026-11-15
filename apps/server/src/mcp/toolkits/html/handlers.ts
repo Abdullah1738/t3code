@@ -14,6 +14,7 @@ const INVALID_PAGE_ERRORS = new Set([
 
 const toFailure = (error: { readonly _tag: string; readonly message: string }) =>
   new OrchestratorMcpFailure({
+    reason: "invalid_args",
     code: INVALID_PAGE_ERRORS.has(error._tag) ? "invalid_request" : "orchestration_error",
     message: error.message,
   });

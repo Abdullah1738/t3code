@@ -498,6 +498,7 @@ describe("planDispatch", () => {
     expect(checkClaim(paused, held, ctx)).toEqual({
       ok: false,
       reason: "the board is paused: Ship the fix",
+      denyReason: "board_paused",
     });
     const reviewKept = { ...paused, pause: { ...paused.pause!, keep: [review.id] } };
     expect(
@@ -1380,6 +1381,7 @@ describe("thread batching", () => {
     expect(checkClaim(setupRunning, card(), ctx)).toEqual({
       ok: false,
       reason: "Setup is running",
+      denyReason: "board_setup_running",
     });
     expect(
       checkClaim(
@@ -1412,6 +1414,7 @@ describe("thread batching", () => {
       }),
     ).toEqual({
       ok: false,
+      denyReason: "dependency_blocked",
       reason: `card #${waiting.number} waits on #${blocker.number} (needs_review)`,
     });
   });

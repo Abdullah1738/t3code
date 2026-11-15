@@ -1,3 +1,4 @@
+import { McpDenyReason } from "./mcpDenyReason.ts";
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
 
@@ -24,9 +25,33 @@ const DerivedId = Schema.String.check(
   Schema.isMaxLength(8192),
   Schema.isPattern(/^[a-zA-Z0-9_.:/#@%+!~'()*-]*$/),
 );
+const McpCallerRole = Schema.Literals([
+  "work",
+  "review",
+  "evaluator",
+  "discussion",
+  "owner",
+  "unattached",
+  "none",
+]);
+const McpCallerKind = Schema.Literals([
+  "board_thread",
+  "plain_thread",
+  "delegated_child",
+  "cli",
+  "unknown",
+]);
 const Measurement = Schema.Number.check(
   Schema.isBetween({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
 );
+const McpReplyPhases = Schema.Struct({
+  caller: Schema.optionalKey(Measurement),
+  admission: Schema.optionalKey(Measurement),
+  read: Schema.optionalKey(Measurement),
+  mutate: Schema.optionalKey(Measurement),
+  commit: Schema.optionalKey(Measurement),
+  ack: Schema.optionalKey(Measurement),
+});
 // Mergeable, bounded duration distribution; bucket upper bounds have at most 2% error.
 export const LONG_TASK_HISTOGRAM_RATIO = 1.02;
 export const LONG_TASK_HISTOGRAM_BUCKETS = 1024;
@@ -119,6 +144,26 @@ const GeneralEvent = Schema.Struct({
   committed: Schema.optionalKey(Schema.Union([Schema.Boolean, Schema.Literal("unknown")])),
   taskId: Schema.optionalKey(DerivedId),
   callerThreadId: Schema.optionalKey(DerivedId),
+  callerRole: Schema.optionalKey(McpCallerRole),
+  callerKind: Schema.optionalKey(McpCallerKind),
+  cardNumber: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThan(0))),
+  callerCardNumber: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThan(0))),
+  callerCardStage: Schema.optionalKey(Label),
+  writePhases: Schema.optionalKey(
+    Schema.Struct({
+      lockWait: Measurement,
+      read: Measurement,
+      write: Measurement,
+      replyWait: Measurement,
+    }),
+  ),
+  cardStage: Schema.optionalKey(Label),
+  denyReason: Schema.optionalKey(McpDenyReason),
+  replyStage: Schema.optionalKey(Label),
+  replyPhases: Schema.optionalKey(McpReplyPhases),
+  requestTiming: Schema.optionalKey(
+    Schema.Struct({ authMs: Measurement, dispatchMs: Measurement, preHandlerMs: Measurement }),
+  ),
   callerResolved: Schema.optionalKey(Schema.Boolean),
   callerResolveMs: Schema.optionalKey(Measurement),
   authMs: Schema.optionalKey(Measurement),
@@ -138,6 +183,8 @@ const GeneralEvent = Schema.Struct({
   responseCloseReason: Schema.optionalKey(
     Schema.Literals(["idle_timeout", "client_error", "peer_end", "socket_error", "unknown"]),
   ),
+  callerReaderLane: Schema.optionalKey(Label),
+  /** Legacy caller-lookup lane; new rows emit this alias for one release. */
   readerLane: Schema.optionalKey(Label),
   waitStage: Schema.optionalKey(Schema.Literals(["lookup.caller", "lookup.target", "waiting"])),
   waitLookupMs: Schema.optionalKey(Measurement),
@@ -346,6 +393,7 @@ export const AnalyticsReadInput = Schema.Struct({
   kind: Schema.optionalKey(Label),
   boardId: Schema.optionalKey(Id),
   cardId: Schema.optionalKey(Id),
+  cardNumber: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThan(0))),
   tool: Schema.optionalKey(Label),
   outcome: Schema.optionalKey(EventOutcome),
   section: Schema.optionalKey(AnalyticsReadSection),
@@ -438,6 +486,46 @@ export const AnalyticsRollup = Schema.Struct({
     }),
   ),
   mcpErrorsByCode: Schema.Array(Schema.Struct({ tool: Label, code: Label, ...LatencyFields })),
+  mcpFailureBreakdown: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        tool: Label,
+        code: Label,
+        ...LatencyFields,
+        byReason: Schema.Record(Label, Measurement),
+        byRole: Schema.Record(Label, Measurement),
+        byCallerReaderLane: Schema.Record(Label, Measurement),
+      }),
+    ),
+  ),
+  mcpFailureContexts: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        tool: Label,
+        code: Label,
+        errorTag: Label,
+        denyReason: Label,
+        callerRole: Label,
+        cardStage: Label,
+        ...LatencyFields,
+      }),
+    ),
+  ),
+  mcpReplyTimeouts: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        tool: Label,
+        code: Schema.Literal("reply_timeout"),
+        errorTag: Label,
+        denyReason: Label,
+        callerRole: Label,
+        cardStage: Label,
+        ...LatencyFields,
+        replyPhases: Schema.Record(Label, Schema.Struct(LatencyFields)),
+        writePhases: Schema.Record(Label, Schema.Struct(LatencyFields)),
+      }),
+    ),
+  ),
   dbSlowBySpan: Schema.Array(
     Schema.Struct({
       span: Label,

@@ -1396,10 +1396,12 @@ describe("planSubtasks", () => {
     expect(plan.subtasks).toHaveLength(30);
     expect(planSubtasks([], [...inputs, { text: "Extra", owner: "work" }])).toEqual({
       ok: false,
+      denyReason: "invalid_args",
       reason: "a card has at most 30 subtasks",
     });
     expect(planSubtasks([], [{ text: "x".repeat(501), owner: "work" }])).toEqual({
       ok: false,
+      denyReason: "invalid_args",
       reason: "a subtask is at most 500 characters",
     });
     for (const text of [" ", "x".repeat(501)]) {
@@ -1414,6 +1416,7 @@ describe("planSubtasks", () => {
       const before = structuredClone(existing);
       expect(planSubtasks(existing, [{ id: "s1" }, input])).toEqual({
         ok: false,
+        denyReason: "invalid_args",
         reason: "a new subtask needs text and owner",
       });
       expect(existing).toEqual(before);
@@ -1477,6 +1480,7 @@ describe("planSubtasks", () => {
   it.each(["deploy", "money", "secret"] as const)("refuses explicit worker gate %s", (gate) => {
     expect(planSubtasks([], [{ text: "Test restart handling", owner: "work", gate }])).toEqual({
       ok: false,
+      denyReason: "invalid_args",
       reason:
         'subtask "Test restart handling" is the worker\'s; a deploy, money or secret step must be owned by the evaluator or a script',
     });
@@ -1598,11 +1602,13 @@ describe("planSubtasks", () => {
   it("refuses unknown or repeated ids and empty text", () => {
     expect(planSubtasks([], [{ id: "s9" }])).toMatchObject({
       ok: false,
+      denyReason: "subtask_not_found",
       reason: "the card has no subtask s9. Existing subtask ids: none",
     });
     const subtasks = planned();
     expect(planSubtasks(subtasks, [{ id: "s1" }, { id: "s1" }])).toMatchObject({
       ok: false,
+      denyReason: "invalid_args",
       reason: "subtask s1 is listed twice",
     });
     expect(planSubtasks([], [{ text: "  ", owner: "work" }])).toMatchObject({ ok: false });
@@ -2142,11 +2148,13 @@ describe("marking subtasks", () => {
     expect(checkMark(card, "s3", "done", "work", null)).toMatchObject({
       ok: false,
       reason: "subtask s3 is for the evaluator, not you",
+      denyReason: "subtask_owner_mismatch",
     });
     const later = { number: 3, subtasks: planned().map((s) => ({ ...s, owner: "work" as const })) };
     expect(checkMark(later, "s2", "done", "work", null)).toMatchObject({
       ok: false,
       reason: "subtask s2 is in step 2; finish step 1 first",
+      denyReason: "subtask_not_in_current_step",
     });
     expect(checkMark(card, "s4", "done", "evaluator", null)).toEqual({ ok: true });
     expect(checkMark(card, "s1", "skipped", "work", " ")).toMatchObject({ ok: false });
@@ -2230,6 +2238,7 @@ describe("board script subtasks", () => {
     expect(checkMark(card, "s1", "done", "script", null, "other")).toEqual({
       ok: false,
       reason: 'subtask s1 is for the script "land"',
+      denyReason: "subtask_script_mismatch",
     });
     const unnamed = planSubtasks([], [{ text: "Anything", owner: "script" }]);
     if (!unnamed.ok) throw new Error(unnamed.reason);
@@ -2268,6 +2277,7 @@ describe("board script subtasks", () => {
     expect(checkMark(marked, "s1", "open", "script", null, "land")).toEqual({
       ok: false,
       reason: "only an evaluator reopens a subtask",
+      denyReason: "role_not_allowed",
     });
   });
 
@@ -2276,6 +2286,7 @@ describe("board script subtasks", () => {
     expect(checkHandBack(card, "s1", "land", "  ")).toEqual({
       ok: false,
       reason: "say what failed or didn't match",
+      denyReason: "handoff_note_required",
     });
     const evaluatorCard = {
       number: 4,
@@ -2295,6 +2306,7 @@ describe("board script subtasks", () => {
     expect(checkHandBack(evaluatorCard, "s1", "land", "x")).toEqual({
       ok: false,
       reason: "subtask s1 isn't a script's",
+      denyReason: "subtask_owner_mismatch",
     });
     const finished = {
       ...card,
@@ -2305,14 +2317,17 @@ describe("board script subtasks", () => {
     expect(checkHandBack(finished, "s1", "land", "x")).toEqual({
       ok: false,
       reason: "subtask s1 is already done",
+      denyReason: "subtask_not_open",
     });
     expect(checkHandBack(card, "s1", "other", "x")).toEqual({
       ok: false,
       reason: 'subtask s1 is for the script "land"',
+      denyReason: "subtask_script_mismatch",
     });
     expect(checkHandBack(card, "s2", "land", "x")).toEqual({
       ok: false,
       reason: "subtask s2 is in step 2; finish step 1 first",
+      denyReason: "subtask_not_in_current_step",
     });
   });
 
@@ -2763,6 +2778,7 @@ describe("clearing guessed gates", () => {
     ])
       expect(planSubtasks([known], [input], 6, later, undefined, evaluator)).toEqual({
         ok: false,
+        denyReason: "invalid_args",
         reason: `subtask ${known.id} has no gate to clear`,
       });
     const cleared = { ...clear(make("Restart the helper")), state };
@@ -2780,6 +2796,7 @@ describe("clearing guessed gates", () => {
       planSubtasks([known], [{ id: known.id, clearGate: reason }], 6, timestamp, undefined, actor),
     ).toEqual({
       ok: false,
+      denyReason: "invalid_args",
       reason: "clearGate needs the clearing actor and time",
     });
   });
