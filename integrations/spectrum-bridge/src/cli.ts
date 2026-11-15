@@ -32,7 +32,7 @@ class RawOutput {
 
 const COMMANDS_HELP = "Expected health, send, cancel-send, send-file, poll, app, react, wake, secret-request, secret, publish, unpublish, ban, unban, or bans."
   + " Sendblue mode adds location-request, location, messages, ask-owner, chats, allow, allow-group,"
-  + " guest-allow, guest-revoke, guests, guest-send, and share-contact."
+  + " guest-allow, guest-revoke, guests, guest-send, share-contact, and opt-in."
   + " Logs: log-rollup [--day YYYY-MM-DD]."
   + " Public links: share, unshare, and shares."
   + " Alerts and reminders moved to the telegram bridge CLI.";
@@ -72,6 +72,7 @@ const OPTIONS_BY_COMMAND: Record<string, string[]> = {
   "location-request": ["session", "key", "chat"],
   location: ["session", "chat"],
   messages: ["session", "chat", "limit", "before", "id"],
+  "opt-in": ["chat", "session"],
   "ask-owner": ["text", "session", "key"],
   chats: ["session"],
   allow: ["address", "name", "admin", "session"],
@@ -345,6 +346,11 @@ export function parseCommand(args: string[]): Command {
     case "location":
       return { method: "POST", path: "/location",
         body: { sessionId: sessionOnly(values.session)!, ...(values.chat === undefined ? {} : { chat: chatSlug(values.chat) }) } };
+    case "opt-in": {
+      const chat = chatSlug(required(values.chat, "--chat"));
+      const sessionId = optionalSession(values.session);
+      return { method: "POST", path: "/opt-in", body: { chat, ...(sessionId === undefined ? {} : { sessionId }) } };
+    }
     case "ask-owner": {
       const text = required(values.text, "--text");
       if (text.length > 12_000) throw new CliError(messageLengthError(text, 12_000));

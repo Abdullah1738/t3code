@@ -123,6 +123,7 @@ class Activity(dict):
         super().__init__(paths or {})
         self.projects, self.stats, self.error = projects or {}, stats, error
         self.commons = None
+        self.project_stats = {}
 
 
 def session_activity(write_cache=False):
@@ -152,8 +153,12 @@ def activity_for_repo(common, history, now, worktree_paths=None):
         belongs = history.commons.get(pid) == common or any(inside(root, path) for path in worktree_paths)
         if not belongs:
             continue
-        paths, err = active_sessions.project_activity(pid, history.projects[pid], int((now - STALE_DAYS * 86400) * 1000))
+        stats = {'root': root, 'common': common}
+        history.project_stats[pid] = stats
+        paths, err = active_sessions.project_activity(pid, history.projects[pid],
+                                                     int((now - STALE_DAYS * 86400) * 1000), stats=stats)
         if err:
+            stats['error'] = err
             return None, err
         for path, updated in paths.items():
             activity[path] = max(activity.get(path, 0), updated)
@@ -318,6 +323,8 @@ def main():
         running = running_dirs()
         activity = session_activity(write_cache=not a.dry_run)
         st["history_stats"] = getattr(activity, "stats", {})
+        st["project_history_stats"] = getattr(activity, "project_stats", {})
+        st["repo_outcomes"] = {}
         st["activity_history_unavailable"] = {}
         cwds = process_cwds()
         keep = keep_list()
@@ -330,6 +337,8 @@ def main():
             repo_activity, history_error = activity_for_repo(common, activity, t0, [w["worktree"] for w in wts])
             if history_error:
                 st["activity_history_unavailable"][common] = history_error
+            outcome = {"kept": {}, "would_remove": [], "history_error": history_error}
+            st["repo_outcomes"][common] = outcome
             if err:
                 st["errors"].append(f"{common}: {err[:120]}")
             for w in wts:
@@ -340,6 +349,7 @@ def main():
                 for x in r["reasons"]:
                     k = x.split(":")[0]
                     st["kept"][k] = st["kept"].get(k, 0) + 1
+                    outcome["kept"][k] = outcome["kept"].get(k, 0) + 1
                 if not r["reasons"]:
                     cands.append(r)
         st["worktrees"] = total
@@ -351,6 +361,7 @@ def main():
             info["ignored_archived"] = len(r.get("ignored_keep") or [])
             if a.dry_run:
                 st["would_remove"].append(info)
+                st["repo_outcomes"][r["common"]]["would_remove"].append(r["path"])
                 continue
             # re-check right before removal
             again = evaluate({"worktree": r["path"], "common": r["common"], "main": False,

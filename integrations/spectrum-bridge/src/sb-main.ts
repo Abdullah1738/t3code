@@ -23,7 +23,7 @@ import type { Photon } from "./photon.ts";
 import { publish } from "./publish.ts";
 import { RobobBackend, retireUnresolvedRoute } from "./robob.ts";
 import { Router } from "./router.ts";
-import { ChatRegistry, createSbApi, type ChatCore } from "./runtime.ts";
+import { ChatRegistry, createSbApi, optOutHealth, type ChatCore } from "./runtime.ts";
 import { runIngress } from "./sb-ingress.ts";
 import { sbTransport } from "./sb-transport.ts";
 import { cardPreviewImage } from "./card-preview.ts";
@@ -38,7 +38,7 @@ import { Sendblue } from "./sendblue.ts";
 import { Store } from "./store.ts";
 import { chatDbSwipes } from "./swipe.ts";
 import { transcribe } from "./stt.ts";
-import { socketPost, telegramOutlet } from "./telegram-fallback.ts";
+import { notificationAccepted, socketPost, telegramOutlet } from "./telegram-fallback.ts";
 
 export type MainIo = {
   log: (event: string, code?: string) => void;
@@ -97,6 +97,7 @@ export function observedLine(line: Line, seen: { synchronized: boolean; lastEven
     read: chat => line.read(chat),
     requestLocation: chat => line.requestLocation(chat),
     location: address => line.location(address),
+    setOptOut: (address, optedOut) => line.setOptOut(address, optedOut),
     download: (url, maxBytes, timeoutMs) => line.download(url, maxBytes, timeoutMs),
   };
 }
@@ -226,6 +227,12 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
       enabled: () => ready() && !chat.controlsPending && !stopping, log,
       // Outage alerts only for the owner's chat; other chats must not page the owner per message.
       ...(config.enabled && isOwner ? outlet : {}),
+      ...(config.enabled ? { optOut: {
+        notify: async (severity: "attention" | "info", text: string, key: string) => notificationAccepted(await post("/notify", {
+          source: "iMessage bridge", severity, text, dedupeKey: `${key}:${chat.info.slug}`,
+        })),
+        title: chat.info.title, slug: chat.info.slug, timezone: config.timezone,
+      } } : {}),
     });
     delivery.recover();
     const chatApi = createApi({
@@ -273,7 +280,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
       const backendOk = Date.now() - health.backendLastOk < 60_000;
       // The event stream heartbeats below the Line API, so a quiet line is not a dead one; backfill success is the signal.
       return {
-        status: backendOk && seen.synchronized ? "healthy" : "degraded",
+        ...optOutHealth(chats.all(), backendOk && seen.synchronized),
         transport: "sendblue", line: line.number, chats: chats.all().length,
         lastEventAt: seen.lastEventAt, connected: seen.synchronized, openchamberConnected: backendOk,
         uptimeSeconds: Math.floor((Date.now() - health.startedAt) / 1000),
