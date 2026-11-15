@@ -756,7 +756,7 @@ const handlers = {
         const role = isCardThread(caller) ? "cardThread" : "evaluator";
         // `action` is an operation when it is a word, else the new body of an action ask.
         const action = typeof input.action === "string" ? input.action : undefined;
-        const blocking = input.blocking;
+        const blocking = input.blocking === false ? undefined : input.blocking;
         const edit: Asks.AskEdit = {
           ...askFieldsOf({
             ...input,
@@ -779,12 +779,16 @@ const handlers = {
           const dropped = yield* service.changeAsk(card.id, askId, "drop", caller.actor, role);
           return { card: Asks.askSummary(dropped, askId) };
         }
-        if (blocking === false) {
+        const current = card.asks.find((entry) => entry.id === askId && entry.closedAt === null);
+        if (input.blocking === false && current?.blocking === true) {
           return yield* invalid(
             "A blocking ask can't be made async: drop it, or leave it for the owner to answer.",
           );
         }
         if (!edits && action === undefined && blocking === undefined) {
+          if (input.blocking === false && current) {
+            return { card: Asks.askSummary(card, askId) };
+          }
           return yield* invalid("Pass the fields to change, or an action.");
         }
         const board = edits
