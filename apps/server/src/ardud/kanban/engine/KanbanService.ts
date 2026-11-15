@@ -1373,6 +1373,10 @@ const ownerDelivered = Context.Reference<Set<string> | undefined>("KanbanOwnerDe
 const ownerRouteRow = Context.Reference<number | undefined>("KanbanOwnerRouteRow", {
   defaultValue: () => undefined,
 });
+const ownerRestoredReply = Context.Reference<{ notice: AnsweredNotice | undefined } | undefined>(
+  "KanbanOwnerRestoredReply",
+  { defaultValue: () => undefined },
+);
 
 /**
  * How owner answers and posts reach their agents.
@@ -6376,24 +6380,6 @@ const make = Effect.gen(function* () {
       };
     if (answeredBy._tag === "owner" && answered.length > 0)
       next = yield* recheckReviewGate(next, yield* boardOf(next.boardId), true);
-    // Saved before anyone is told: the card's new state never waits on a thread.
-    if (next !== card) {
-      analyticsActors.set(next, answeredBy);
-      const restored = unblock && next.stage === "working" && next.activeThreadId !== null;
-      yield* saveCard(next, undefined, false, restored ? "restore" : undefined);
-      if (restored) yield* dropHold(next.activeThreadId!, "join", next.id);
-    }
-    if (answeredBy._tag === "owner")
-      for (const ask of next.asks) {
-        if (!answeredIds.has(ask.id) || ask.answer?.verdict === "dropped") continue;
-        yield* recordAnalytics({
-          kind: "ask.answered",
-          boardId: next.boardId,
-          cardId: next.id,
-          durationMs: Math.max(0, Date.parse(ask.answer?.at ?? at) - Date.parse(ask.at)),
-          props: askTimingProps(ask),
-        });
-      }
     const notice: AnsweredNotice = {
       singleEvaluator: yield* collapseEvaluatorReplies,
       discussionId: current.id,
@@ -6406,6 +6392,39 @@ const make = Effect.gen(function* () {
       unblockEvaluator,
       ...(resume === undefined ? {} : { resume }),
     };
+    // Saved before anyone is told: the card's new state never waits on a thread.
+    if (next !== card) {
+      analyticsActors.set(next, answeredBy);
+      const restored = unblock && next.stage === "working" && next.activeThreadId !== null;
+      const rowId = restored ? yield* ownerRouteRow : undefined;
+      const write = Effect.gen(function* () {
+        yield* saveCard(next, undefined, false, restored ? "restore" : undefined);
+        if (restored) yield* dropHold(next.activeThreadId!, "join", next.id);
+        if (rowId !== undefined) {
+          // A reply retry must retain the attachment it restored, even after its ask closed.
+          // @effect-diagnostics-next-line preferSchemaOverJson:off
+          const saved = JSON.stringify(notice);
+          yield* tickSql`
+            UPDATE ardud_kanban_owner_routes
+            SET json = json_set(json, '$.restoredReply', json(${saved})) WHERE id = ${rowId}
+          `;
+        }
+      });
+      yield* rowId === undefined ? write : tickTransaction(write);
+      const reply = yield* ownerRestoredReply;
+      if (restored && reply !== undefined) reply.notice = notice;
+    }
+    if (answeredBy._tag === "owner")
+      for (const ask of next.asks) {
+        if (!answeredIds.has(ask.id) || ask.answer?.verdict === "dropped") continue;
+        yield* recordAnalytics({
+          kind: "ask.answered",
+          boardId: next.boardId,
+          cardId: next.id,
+          durationMs: Math.max(0, Date.parse(ask.answer?.at ?? at) - Date.parse(ask.at)),
+          props: askTimingProps(ask),
+        });
+      }
     const deferred = yield* effectSink;
     if (deferred !== undefined && !deferred.closed) {
       if (answered.length > 0 || unblockEvaluator !== null)
@@ -6718,6 +6737,7 @@ const make = Effect.gen(function* () {
     readonly launched: ReadonlyArray<string>;
     /** The askers that hear this answer, fixed by its first delivery attempt. */
     readonly askers: { readonly ids: ReadonlyArray<string>; readonly needsOwner: boolean } | null;
+    readonly restoredReply?: AnsweredNotice;
     /** Run first inside the locked attempt: null when the route still stands. */
     readonly check?: Effect.Effect<OwnerRouteClosed | null, KanbanError>;
     /** Set when `check` closed the route instead of routing it. */
@@ -6740,14 +6760,24 @@ const make = Effect.gen(function* () {
     if (!delivered) ownerDeliveries.set(key, (delivered = new Set()));
     // Evaluators this route already started carried the text in their first message.
     for (const id of row?.launched ?? []) delivered.add(id);
+    const reply = { notice: row?.restoredReply };
+    const resume = Effect.gen(function* () {
+      const notice = reply.notice;
+      if (notice === undefined) return yield* route;
+      return yield* tellAnswered(
+        notice,
+        yield* discussionOf(KanbanDiscussionId.make(notice.discussionId)),
+        yield* cardOf(KanbanCardId.make(notice.cardId)),
+      );
+    });
     // A saved route checks that it still stands inside the same board operation
     // that routes it, so an answer changed meanwhile is seen before anything is sent.
     const body =
       row?.check === undefined
-        ? route
+        ? resume
         : row.check.pipe(
             Effect.flatMap((closed) =>
-              closed === null ? route : Effect.sync(() => (row.closed = closed)),
+              closed === null ? resume : Effect.sync(() => (row.closed = closed)),
             ),
           );
     const attempt = locks
@@ -6756,6 +6786,7 @@ const make = Effect.gen(function* () {
         Effect.provideService(ownerDeliveryKey, key),
         Effect.provideService(ownerDelivered, delivered),
         Effect.provideService(ownerRouteRow, row?.id),
+        Effect.provideService(ownerRestoredReply, reply),
         Effect.provideService(ownerRouteAsks, row === undefined ? undefined : asks),
       );
     if (row !== undefined) return attempt.pipe(Effect.asVoid);
@@ -7398,6 +7429,7 @@ const make = Effect.gen(function* () {
       // @effect-diagnostics-next-line preferSchemaOverJson:off
       launched: JSON.parse(record.launched) as ReadonlyArray<string>,
       askers: payload.askers ?? null,
+      ...(payload.restoredReply === undefined ? {} : { restoredReply: payload.restoredReply }),
       check: check(store.message).pipe(Effect.mapError(toKanbanError)),
     };
     if (payload.kind === "post") {
@@ -7434,6 +7466,7 @@ const make = Effect.gen(function* () {
   const ownerRoutePayload = (record: OwnerRouteRecord) =>
     JSON.parse(record.json) as OwnerRoutePayload & {
       readonly askers?: SavedOwnerRow["askers"];
+      readonly restoredReply?: AnsweredNotice;
     };
   // The client's first-line title stays when the writer fails or runs past its
   // deadline; the deadline keeps later routes in the discussion from waiting long.

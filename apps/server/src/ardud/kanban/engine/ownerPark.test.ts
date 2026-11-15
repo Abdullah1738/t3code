@@ -19,11 +19,165 @@ import {
   filesLayer,
 } from "./askFlows.testkit.ts";
 import * as KanbanService from "./KanbanService.ts";
-import { KanbanThreads } from "./threads.ts";
+import { KanbanThreadError, KanbanThreads } from "./threads.ts";
 import { modelSelectionOf } from "./defaults.ts";
 import * as Rules from "./rules.ts";
 
 const decodeAnalytics = Schema.decodeUnknownEffect(AnalyticsEvent);
+
+it.effect.each(
+  (["post", "pick"] as const).flatMap((reply) =>
+    (["delivered", "stop", "reset"] as const).map((outcome) => ({ reply, outcome })),
+  ),
+)("a restored $reply retry retains its guard ($outcome)", ({ reply, outcome }) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const finished = yield* Deferred.make<void>();
+    const interrupted = yield* Deferred.make<void>();
+    let attempts = 0;
+    const gated = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (real) =>
+        KanbanThreads.of({
+          ...real,
+          send: (input) =>
+            Effect.gen(function* () {
+              if (!input.text.includes("Owner retry 1615")) return yield* real.send(input);
+              attempts += 1;
+              if (attempts === 1)
+                return yield* new KanbanThreadError({ operation: "send", detail: "Retry once" });
+              yield* Deferred.succeed(entered, undefined);
+              yield* Deferred.await(release);
+              if (!input.isStale?.()) yield* real.send(input);
+              yield* Deferred.succeed(finished, undefined);
+            }),
+          interrupt: (...args) =>
+            real
+              .interrupt(...args)
+              .pipe(Effect.tap(() => Deferred.succeed(interrupted, undefined))),
+        }),
+      ),
+    ).pipe(Layer.provide(fake.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, card, threadId, worker } = yield* workingCard();
+      yield* kanban.askOwner(
+        card.id,
+        {
+          question: "Continue?",
+          blocking: true,
+          ...(reply === "pick" ? { options: ["Owner retry 1615", "No"] } : {}),
+        },
+        worker,
+        "cardThread",
+      );
+      const discussion = yield* kanban.cardDiscussion(card.id);
+      if (reply === "post")
+        yield* kanban.post(discussion.id, owner, [{ _tag: "md", text: "Owner retry 1615" }]);
+      else {
+        const ask = askOf((yield* kanban.card(card.id)).card);
+        yield* kanban.answer(discussion.id, ask.seq!, ask.id, [ask.options![0]!.id], owner);
+      }
+      yield* Deferred.await(entered);
+      assert.equal((yield* kanban.card(card.id)).card.stage, "working");
+      if (outcome !== "delivered")
+        yield* kanban.cardThread(card.id, outcome, "Discard retry", owner);
+      yield* Deferred.succeed(release, undefined);
+      yield* Deferred.await(finished);
+      if (outcome !== "delivered") yield* Deferred.await(interrupted);
+      assert.equal(
+        (yield* fake.heard(threadId)).filter((text) => text.includes("Owner retry 1615")).length,
+        outcome === "delivered" ? 1 : 0,
+      );
+      assert.equal(attempts, 2);
+    }).pipe(
+      Effect.provide(
+        testLayer(gated).pipe(
+          Layer.provide(Layer.succeed(KanbanService.OwnerRouteMode, "deferred")),
+        ),
+      ),
+    );
+  }),
+);
+
+it.effect.each(
+  (["post", "pick"] as const).flatMap((reply) =>
+    (["delivered", "stop", "reset"] as const).map((outcome) => ({ reply, outcome })),
+  ),
+)("a restored $reply retry retains its guard across restart ($outcome)", ({ reply, outcome }) =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "owner-retry-1615-" });
+    const db = `${directory}/state.sqlite`;
+    const fake = yield* makeFake;
+    const entered = yield* Deferred.make<void>();
+    let attempts = 0;
+    const cut = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (real) =>
+        KanbanThreads.of({
+          ...real,
+          send: (input) =>
+            Effect.gen(function* () {
+              if (!input.text.includes("Owner saved retry 1615")) return yield* real.send(input);
+              attempts += 1;
+              if (attempts === 1)
+                return yield* new KanbanThreadError({ operation: "send", detail: "Retry once" });
+              yield* Deferred.succeed(entered, undefined);
+              return yield* Effect.never;
+            }),
+        }),
+      ),
+    ).pipe(Layer.provide(fake.layer));
+    const prior = yield* Effect.scoped(
+      Effect.gen(function* () {
+        const { kanban, card, threadId, worker } = yield* workingCard();
+        yield* kanban.askOwner(
+          card.id,
+          {
+            question: "Continue?",
+            blocking: true,
+            ...(reply === "pick" ? { options: ["Owner saved retry 1615", "No"] } : {}),
+          },
+          worker,
+          "cardThread",
+        );
+        const discussion = yield* kanban.cardDiscussion(card.id);
+        if (reply === "post")
+          yield* kanban.post(discussion.id, owner, [
+            { _tag: "md", text: "Owner saved retry 1615" },
+          ]);
+        else {
+          const ask = askOf((yield* kanban.card(card.id)).card);
+          yield* kanban.answer(discussion.id, ask.seq!, ask.id, [ask.options![0]!.id], owner);
+        }
+        yield* Deferred.await(entered);
+        if (outcome !== "delivered")
+          yield* kanban.cardThread(card.id, outcome, "Discard saved retry", owner);
+        return { threadId, discussionId: discussion.id };
+      }).pipe(
+        Effect.provide(
+          fileTestLayer(cut, db).pipe(
+            Layer.provide(Layer.succeed(KanbanService.OwnerRouteMode, "deferred")),
+          ),
+        ),
+      ),
+    );
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        const kanban = yield* KanbanService.KanbanService;
+        yield* kanban.post(prior.discussionId, owner, [{ _tag: "md", text: "Replay barrier" }]);
+        assert.equal(
+          (yield* fake.heard(prior.threadId)).filter((text) =>
+            text.includes("Owner saved retry 1615"),
+          ).length,
+          outcome === "delivered" ? 1 : 0,
+        );
+      }).pipe(Effect.provide(fileTestLayer(fake.layer, db))),
+    );
+  }).pipe(Effect.provide(filesLayer)),
+);
 
 it.effect.each(
   (["answer", "drop", "wake"] as const).flatMap((close) =>
