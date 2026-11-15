@@ -5806,21 +5806,22 @@ it.effect("logs only board lock holds of at least five seconds", () =>
         );
         assert.strictEqual(duration?.state.count, 1);
       }
-      const holds = warnings.filter(
-        (entry) => Array.isArray(entry) && entry[0] === "kanban board lock long hold",
+      const holds = warnings.filter((entry) =>
+        String(entry).includes('"event":"kanban board lock long hold"'),
       );
-      assert.deepStrictEqual(holds, [
-        [
-          "kanban board lock long hold",
-          {
-            name: "hold.5000",
-            boardId: "timed-board",
-            cardId: null,
-            heldMs: 5_000,
-            waiters: 0,
-          },
-        ],
-      ]);
+      assert.lengthOf(holds, 1);
+      assert.deepStrictEqual(JSON.parse(String(holds[0])), {
+        event: "kanban board lock long hold",
+        "board.observed_at_ms": 9_999,
+        "board.id": "timed-board",
+        "board.holder": "hold.5000",
+        "board.card_id": null,
+        "board.lock": "gate",
+        "board.mode": "exclusive",
+        "board.acquired_at_ms": 4_999,
+        "board.held_ms": 5_000,
+        "board.waiters": 0,
+      });
     }).pipe(
       Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
       Effect.provideService(Metric.MetricRegistry, new Map()),
@@ -5886,11 +5887,13 @@ it.effect("clears failed and interrupted lock holders and cancelled waiters", ()
       const blockers = refusal!.annotations["board.blockers"] as Array<Record<string, unknown>>;
       assert.lengthOf(blockers, 1);
       assert.strictEqual(blockers[0]!.label, "current");
-      const hold = warnings.find(
-        (entry) =>
-          Array.isArray(entry.message) && entry.message[0] === "kanban board lock long hold",
+      const hold = warnings.find((entry) =>
+        String(entry.message).includes('"event":"kanban board lock long hold"'),
       );
-      assert.deepInclude((hold!.message as [string, object])[1], { name: "current", waiters: 0 });
+      assert.deepInclude(JSON.parse(String(hold!.message)), {
+        "board.holder": "current",
+        "board.waiters": 0,
+      });
     }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
   }),
 );
