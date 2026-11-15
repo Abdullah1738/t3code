@@ -3,6 +3,7 @@ import { assert, describe, it } from "@effect/vitest";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -821,6 +822,55 @@ describe("ControlStore message pages", () => {
           runId: "answer-run",
           text: "msg_Z",
         });
+      }),
+    ),
+  );
+
+  it.effect("last-assistant reads one newest payload and skips 200 older invalid payloads", () =>
+    run(
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const store = yield* ControlStore.ControlStore;
+        for (let n = 0; n < 201; n++) {
+          const id = `bounded-${n}`;
+          const at = DateTime.formatIso(
+            DateTime.makeUnsafe(Date.parse("2026-03-01T00:00:00Z") + n * 1000),
+          );
+          yield* sql`INSERT INTO orchestration_v2_projection_messages ${sql.insert({
+            message_id: id,
+            thread_id: "t-moved",
+            run_id: "bounded",
+            node_id: null,
+            role: "assistant",
+            streaming: 0,
+            created_at: at,
+            updated_at: at,
+            payload_json:
+              n === 200
+                ? JSON.stringify({
+                    id,
+                    threadId: "t-moved",
+                    runId: "bounded",
+                    nodeId: null,
+                    role: "assistant",
+                    text: "newest",
+                    attachments: [],
+                    streaming: false,
+                    createdBy: "agent",
+                    creationSource: "provider",
+                    createdAt: at,
+                    updatedAt: at,
+                  })
+                : "invalid older payload",
+          })}`;
+        }
+        for (const runId of [null, "bounded"]) {
+          assert.deepStrictEqual(yield* store.lastAssistant("t-moved", runId), {
+            text: "newest",
+            messageId: "bounded-200",
+            runId: "bounded",
+          });
+        }
       }),
     ),
   );

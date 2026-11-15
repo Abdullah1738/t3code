@@ -250,6 +250,8 @@ JSON-quoted incoming message ID in an iMessage channel-guidance context record,
 or null. Synthetic bridge IDs (`wake:`, `reset:`, `secret:`) are preserved so
 callers can distinguish them from relayed owner messages.
 
+Thread summaries and details include `changeMarker`, the latest V2 thread event sequence (0 if none). Compare it for incremental polling; `updatedAt` and `updatedSince` can miss timestamp ties. Poll known ids without `updatedSince`, then read changed messages with an overlapping `since` watermark.
+
 ### GET /threads/:id/wait
 
 Query: `timeoutMs` (default 10 min, max 60 min), `runId` (wait for that run),

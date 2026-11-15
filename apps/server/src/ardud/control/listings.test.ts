@@ -861,6 +861,30 @@ describe("control listings", () => {
     ),
   );
 
+  it.live("list and detail expose the event marker even when updatedAt is unchanged", () =>
+    run(({ get, sql }) =>
+      Effect.gen(function* () {
+        let previous = 0;
+        for (let version = 0; version < 3; version++) {
+          yield* sql`INSERT INTO orchestration_events
+          (event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+           actor_kind, payload_json, metadata_json, application_event_version)
+          VALUES (${`marker:${version}`}, 'thread', 'quiet', ${version}, 'message.updated',
+            '2026-01-01T00:00:00.000Z', 'server', '{}', '{}', 2)`;
+          const list = yield* get("/threads?ids=quiet");
+          const detail = yield* get("/threads/quiet");
+          assert.equal(list.status, 200);
+          assert.equal(detail.status, 200);
+          const marker = list.body.threads[0].changeMarker;
+          assert.isAbove(marker, previous);
+          assert.equal(detail.body.thread.changeMarker, marker);
+          assert.equal(detail.body.thread.updatedAt, list.body.threads[0].updatedAt);
+          previous = marker;
+        }
+      }),
+    ),
+  );
+
   it.live("wait returns the last nonblank assistant without reading message records", () =>
     run(({ get, sql, statements, recordReads, recordCollections }) =>
       Effect.gen(function* () {
@@ -916,7 +940,7 @@ describe("control listings", () => {
           statements.some(
             ([q]) =>
               /SELECT payload_json\s+FROM orchestration_v2_projection_messages/.test(q) &&
-              !q.includes("message_id ="),
+              !q.includes("message_id IN"),
           ),
         );
         yield* sql`DELETE FROM orchestration_v2_projection_messages WHERE thread_id = 'quiet'`;

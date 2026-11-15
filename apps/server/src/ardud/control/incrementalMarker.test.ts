@@ -14,18 +14,27 @@ import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
 import { idleThreadProjection, liveThreadShell } from "../../mcp/McpToolAccess.testkit.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
+import * as OrchestrationEventStore from "../../persistence/OrchestrationEventStore.ts";
 import * as Sqlite from "../../persistence/Sqlite.ts";
 import * as ControlStore from "./ControlStore.ts";
 
-it.effect("thread change marker covers inserts, streaming, completion and pending requests", () =>
+it.effect("event change marker covers tied and backward message, run and request timestamps", () =>
   Effect.gen(function* () {
     const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const events = yield* OrchestrationEventStore.OrchestrationEventStore;
     const control = yield* ControlStore.ControlStore;
     const sql = yield* SqlClient.SqlClient;
     const threadId = ThreadId.make("incremental-marker");
     const thread = idleThreadProjection(liveThreadShell(threadId)).thread;
     const epoch = DateTime.toEpochMillis(thread.updatedAt);
-    yield* projections.apply({
+    const persist = (event: OrchestrationV2DomainEvent) =>
+      sql.withTransaction(
+        Effect.gen(function* () {
+          yield* events.appendAgentEvents({ events: [event] });
+          yield* projections.apply(event);
+        }),
+      );
+    yield* persist({
       id: EventId.make("create"),
       type: "thread.created",
       threadId,
@@ -35,33 +44,37 @@ it.effect("thread change marker covers inserts, streaming, completion and pendin
     let tick = 0;
     const apply = (event: OrchestrationV2DomainEvent) =>
       Effect.gen(function* () {
-        const previous = epoch + tick * 1000;
+        const before = (yield* control.changeMarkers([threadId])).get(threadId)!;
+        // Exercise forward, equal and backward clocks on separately committed events.
+        const now = DateTime.makeUnsafe(epoch + [1000, 1000, 1000, 0][tick % 4]!);
         tick++;
-        const now = DateTime.makeUnsafe(epoch + tick * 1000);
-        yield* projections.apply({ ...event, occurredAt: now });
+        yield* persist(
+          event.type === "message.updated"
+            ? { ...event, occurredAt: now, payload: { ...event.payload, updatedAt: now } }
+            : { ...event, occurredAt: now },
+        );
+        const after = (yield* control.changeMarkers([threadId])).get(threadId)!;
+        assert.isAbove(after, before, event.id);
         assert.equal(
           DateTime.toEpochMillis((yield* projections.getThreadShell(threadId))!.updatedAt),
-          epoch + tick * 1000,
+          DateTime.toEpochMillis(now),
         );
-        const filter = {
-          since: previous,
-          location: "active" as const,
-          includeSubagents: true,
-          parentThreadId: null,
-          projectId: null,
-          limit: 10,
-        };
-        assert.deepStrictEqual(
-          (yield* control.threadCandidatePage(filter)).map((t) => t.threadId),
-          [threadId],
-        );
-        const rows = yield* sql<{
-          updated_at: string;
-          payload_at: string;
-        }>`SELECT updated_at, json_extract(payload_json, '$.updatedAt') AS payload_at FROM orchestration_v2_projection_threads WHERE thread_id = ${threadId}`;
-        assert.equal(rows[0]!.updated_at, DateTime.formatIso(now));
-        assert.equal(rows[0]!.payload_at, DateTime.formatIso(now));
       });
+    assert.equal((yield* control.changeMarkers(["missing"])).get("missing"), 0);
+    const markerPlan = yield* sql<{ detail: string }>`EXPLAIN QUERY PLAN
+      SELECT sequence FROM orchestration_events INDEXED BY idx_orchestration_events_agent_stream_sequence
+      WHERE application_event_version = 2 AND aggregate_kind = 'thread' AND stream_id = ${threadId}
+      ORDER BY sequence DESC LIMIT 1`;
+    assert.isTrue(
+      markerPlan.some((row) =>
+        /SEARCH orchestration_events USING (?:COVERING )?INDEX idx_orchestration_events_agent_stream_sequence/.test(
+          row.detail,
+        ),
+      ),
+    );
+    assert.isFalse(
+      markerPlan.some((row) => /SCAN orchestration_events|TEMP B-TREE/.test(row.detail)),
+    );
     const runId = RunId.make("run:marker");
     const nodeId = NodeId.make("node:marker");
     const common = { threadId, occurredAt: thread.updatedAt };
@@ -74,8 +87,8 @@ it.effect("thread change marker covers inserts, streaming, completion and pendin
         ["first", true],
         ["expanded", true],
         ["finished", false],
+        ["revised", false],
       ] as const) {
-        const updatedAt = DateTime.makeUnsafe(epoch + (tick + 1) * 1000);
         yield* apply({
           ...common,
           id: EventId.make(`${id}:${text}`),
@@ -92,7 +105,7 @@ it.effect("thread change marker covers inserts, streaming, completion and pendin
             attachments: [],
             streaming,
             createdAt: thread.createdAt,
-            updatedAt,
+            updatedAt: thread.updatedAt,
           },
         });
       }
@@ -141,9 +154,19 @@ it.effect("thread change marker covers inserts, streaming, completion and pendin
         resolvedAt: null,
       },
     });
+    const beforeUnrelated = (yield* control.changeMarkers([threadId])).get(threadId);
+    const other = idleThreadProjection(liveThreadShell(ThreadId.make("unrelated-marker"))).thread;
+    yield* persist({
+      id: EventId.make("other-create"),
+      type: "thread.created",
+      threadId: other.id,
+      occurredAt: other.updatedAt,
+      payload: other,
+    });
+    assert.equal((yield* control.changeMarkers([threadId])).get(threadId), beforeUnrelated);
   }).pipe(
     Effect.provide(
-      Layer.mergeAll(ProjectionStore.layer, ControlStore.layer).pipe(
+      Layer.mergeAll(ProjectionStore.layer, ControlStore.layer, OrchestrationEventStore.layer).pipe(
         Layer.provideMerge(Sqlite.layerMemory),
       ),
     ),

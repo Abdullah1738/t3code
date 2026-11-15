@@ -213,6 +213,7 @@ describe("native thread owner reads", () => {
       const expected = {
         ...shellSummary(shell!, { origin: null, nativeSessionId: null }),
         native: null,
+        changeMarker: 0,
         state: "idle",
         status: "completed",
         run: runSummary(h.runs.at(-1)!),
