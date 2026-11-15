@@ -78,5 +78,7 @@ chmod 600 "$token"
 
 cp "$here/launchd/$label.plist" "$plist"
 launchctl bootout "$domain/$label" 2>/dev/null || true
-launchctl bootstrap "$domain" "$plist"
+# bootout returns before the job is gone; wait, then bootstrap (retry once).
+for _ in {1..20}; do launchctl print "$domain/$label" >/dev/null 2>&1 || break; sleep 0.5; done
+launchctl bootstrap "$domain" "$plist" 2>/dev/null || { sleep 2; launchctl bootstrap "$domain" "$plist" }
 print "venice-x402: installed; LaunchAgent $label (re)loaded. Log: ~/Library/Logs/venice-x402.log"
