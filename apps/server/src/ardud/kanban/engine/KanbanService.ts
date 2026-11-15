@@ -5388,6 +5388,57 @@ const make = Effect.gen(function* () {
     return events.findLast((event) => event.kind === "moved" && event.toStage === "needs_owner");
   });
 
+  const wakeReviewedEvaluator = Effect.fn("KanbanService.wakeReviewedEvaluator")(function* (
+    cardId: KanbanCardId,
+  ) {
+    const discussion = yield* cardDiscussionUnlocked(cardId);
+    // Transition notifications and periodic recovery share the delivery lock and persisted clock.
+    yield* serial(
+      routing,
+      discussion.id,
+      Effect.gen(function* () {
+        const card = yield* cardOf(cardId);
+        const board = yield* boardOf(card.boardId);
+        const now = yield* nowMillis;
+        if (
+          board.archivedAt !== null ||
+          !Rules.reviewEvaluatorWakeDue(card, Rules.chainFor(board, card)?.steps.length ?? 1, now)
+        )
+          return;
+        const currentDiscussion = yield* discussionOf(discussion.id);
+        if (currentDiscussion.archivedAt !== null || currentDiscussion.settledAt !== null) return;
+        const at = DateTime.formatIso(DateTime.makeUnsafe(now));
+        const text = Briefs.evaluatorStepText(card);
+        // If delivery succeeds but saving its clock fails, retry the same provider message key.
+        const previous =
+          card.nudgedAt === null ? `first:${card.movedAt}` : `after:${card.nudgedAt}`;
+        const key = `review-step:${card.id}:${card.reviewRound}:${card.reviewStep}:${previous}`;
+        // Saved follow-ons and ticks must share this key without the saved effect's prefix.
+        yield* routeEvaluator(currentDiscussion, text, true, key, `step:${card.id}`).pipe(
+          Effect.provideService(ownerDeliveryKey, undefined),
+        );
+        const latest = yield* cardOf(card.id);
+        if (
+          latest.stage !== "in_review" ||
+          latest.activeThreadId !== null ||
+          latest.reviewStep !== card.reviewStep ||
+          latest.reviewRound !== card.reviewRound
+        )
+          return;
+        yield* saveCard({
+          ...latest,
+          nudgedAt: at,
+          updatedAt: at,
+          wakeNote: latest.wakeNote === card.wakeNote ? text : latest.wakeNote,
+        });
+        yield* logEvent(latest, { _tag: "system", component: "dispatcher" }, "thread", {
+          at,
+          body: "Evaluator review-step wake",
+        });
+      }),
+    );
+  });
+
   /**
    * A card whose step became the evaluator's (a new card waiting on its packet,
    * a review, an owner's move or a worker's last subtask) tells the card
@@ -5429,6 +5480,10 @@ const make = Effect.gen(function* () {
     after: KanbanCard,
     actor: KanbanActor,
   ) {
+    if (actor._tag !== "evaluator" && Rules.inReviewEvaluatorStepsOnly(after)) {
+      yield* wakeReviewedEvaluator(after.id);
+      return;
+    }
     const turn = stepTurn;
     const now = turn(after);
     if (now === null) return;
@@ -10879,6 +10934,19 @@ const make = Effect.gen(function* () {
                   }
                 }),
               );
+            }
+            for (const initial of yield* cardsForPlan) {
+              if (
+                !Rules.reviewEvaluatorWakeDue(
+                  initial,
+                  Rules.chainFor(board, initial)?.steps.length ?? 1,
+                  now,
+                )
+              )
+                continue;
+              yield* step("reviewEvaluatorStep", wakeReviewedEvaluator(initial.id), initial.id);
+              views.clear();
+              invalidateCards();
             }
             // Evaluator-only steps get one wake; backlog cards are parked and never woken. An evaluator
             // flag means it is waiting outside the board, so there is nothing to do until the

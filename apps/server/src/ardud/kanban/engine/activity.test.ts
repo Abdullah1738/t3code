@@ -79,6 +79,65 @@ const waitOn: NonNullable<KanbanCard["wait"]> = {
   problem: null,
 };
 
+it("#1483 lists evaluator-only orphaned reviews with full stage age and last wake", () => {
+  const reviewed = card("reviewed", {
+    stage: "in_review",
+    reviewStep: 1,
+    movedAt: "2026-11-10T00:00:00.000Z",
+    nudgedAt: t("18:00"),
+    subtasks: [
+      {
+        id: "s1",
+        step: 1,
+        owner: "evaluator",
+        text: "Merge",
+        state: "open",
+        createdAt: before,
+        note: null,
+        doneBy: null,
+        doneAt: null,
+      },
+    ],
+  });
+  const script = card("script", {
+    ...reviewed,
+    id: KanbanCardId.make("script"),
+    number: 2,
+    nudgedAt: null,
+    subtasks: reviewed.subtasks.map((s) => ({ ...s, owner: "script" })),
+  });
+  const excluded = [
+    card("wait", { ...reviewed, wait: waitOn }),
+    card("work", {
+      ...reviewed,
+      subtasks: [
+        ...reviewed.subtasks,
+        { ...reviewed.subtasks[0]!, id: "s2", owner: "work", step: 2 },
+      ],
+    }),
+    card("review", {
+      ...reviewed,
+      subtasks: reviewed.subtasks.map((s) => ({ ...s, owner: "review" })),
+    }),
+    card("not-passed", { ...reviewed, reviewStep: 0 }),
+    card("empty", { ...reviewed, subtasks: [] }),
+  ];
+  const result = Activity.rollup({
+    window,
+    cards: [reviewed, script, ...excluded],
+    events: [],
+    threads: [],
+    pools: [],
+  });
+  expect(result.stages.inReviewNoThreadWithEvaluatorStepsOnly).toEqual({
+    count: 2,
+    items: [
+      { card: 1, hours: 72, lastWake: "2026-11-12T18:00Z" },
+      { card: 2, hours: 72, lastWake: null },
+    ],
+  });
+});
+
 let nextId = 1;
 const event = (
   cardId: string,

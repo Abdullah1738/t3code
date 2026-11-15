@@ -11055,6 +11055,377 @@ const ownerWaitsTo = (fake: Effect.Success<typeof makeFake>, threadId: string) =
     ),
   );
 
+it.effect.each(["evaluator", "script"] as const)(
+  "#1483 clear orphaned reviews with %s steps wake once per six hours, including after service recreation",
+  (subtaskOwner) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      let failSend = false;
+      const delivery = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (threads) =>
+          KanbanThreads.of({
+            ...threads,
+            send: (input) =>
+              failSend
+                ? Effect.fail(
+                    new KanbanThreadError({ operation: "send", detail: "test send failure" }),
+                  )
+                : threads.send(input),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      yield* Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        const card = yield* kanban.createCard(
+          board.id,
+          {
+            title: "Reviewed orphan",
+            prompt: "Merge",
+            subtasks: [{ owner: subtaskOwner, text: "Merge" }],
+          },
+          { _tag: "evaluator", threadId: ThreadId.make("packet") },
+        );
+        yield* store.putCard({
+          ...card,
+          stage: "in_review",
+          reviewStep: 1,
+          links: [
+            {
+              kind: "pr",
+              url: "https://example.com/pull/1483",
+              label: null,
+              state: "open",
+              checkedAt: null,
+            },
+          ],
+        });
+        yield* kanban.tick;
+        const woke = yield* store.card(card.id);
+        assert.strictEqual(woke?.nudgedAt, "2026-10-25T13:00:00.000Z");
+        assert.include(woke?.wakeNote ?? "", "waiting on your subtasks");
+        const discussion = yield* kanban.cardDiscussion(card.id);
+        assert.isNotNull(discussion.evaluatorThreadId);
+        const count = () =>
+          Ref.get(fake.threads).pipe(
+            Effect.map(
+              (all) =>
+                [...all.values()]
+                  .flatMap((thread) => thread.messages)
+                  .filter((text) => text.includes("is waiting on your subtasks")).length,
+            ),
+          );
+        const first = yield* count();
+        // A new service uses the same persisted store, with empty in-memory wake caches.
+        yield* Effect.gen(function* () {
+          const restarted = yield* KanbanService.KanbanService;
+          yield* restarted.tick;
+          yield* TestClock.adjust("359 minutes");
+          yield* restarted.tick;
+          assert.strictEqual(yield* count(), first);
+          yield* TestClock.adjust("1 minute");
+          yield* restarted.tick;
+          assert.strictEqual(yield* count(), first + 1);
+          const previous = (yield* store.card(card.id))!.nudgedAt;
+          yield* TestClock.adjust("6 hours");
+          failSend = true;
+          yield* restarted.tick;
+          assert.strictEqual((yield* store.card(card.id))!.nudgedAt, previous);
+          failSend = false;
+          yield* restarted.tick;
+          assert.strictEqual(yield* count(), first + 2);
+          yield* restarted.tick;
+          assert.strictEqual(yield* count(), first + 2);
+        }).pipe(Effect.provide(KanbanService.layer));
+      }).pipe(Effect.provide(testLayer(delivery)));
+    }),
+);
+
+it.effect("#1483 recovery reuses an accepted transition wake after its clock save fails", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    let target: KanbanCardId | undefined;
+    let failClock = true;
+    const failedSave = yield* Deferred.make<void>();
+    const storeLayer = Layer.effect(
+      KanbanStore.KanbanStore,
+      Effect.map(KanbanStore.KanbanStore, (store) =>
+        KanbanStore.KanbanStore.of({
+          ...store,
+          putCard: (card) =>
+            card.id === target && failClock && card.nudgedAt !== null
+              ? Deferred.succeed(failedSave, undefined).pipe(
+                  Effect.andThen(Effect.die(new Error("wake clock save failed"))),
+                )
+              : store.putCard(card),
+        }),
+      ),
+    ).pipe(Layer.provide(KanbanStore.layer));
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+      const { kanban, card, reviewThread } = yield* startReplayReview;
+      const store = yield* KanbanStore.KanbanStore;
+      const current = (yield* kanban.card(card.id)).card;
+      const url = "https://example.com/pull/1483";
+      fake.prs.set(current.workThreadId!, [{ url, title: "Fix", state: "open" }]);
+      const step = { state: "open" as const, note: null, doneAt: null, doneBy: null };
+      yield* store.putCard({
+        ...current,
+        links: [{ kind: "pr", url, label: null, state: "open", checkedAt: null }],
+        subtasks: [
+          { ...step, id: "s1", step: 1, text: "Review", owner: "review" },
+          { ...step, id: "s2", step: 2, text: "Merge", owner: "evaluator" },
+        ],
+        subtaskSeq: 2,
+      });
+      const discussion = yield* kanban.cardDiscussion(card.id);
+      const evaluator = yield* kanban.startEvaluator(card.boardId, {
+        kind: "request",
+        text: "Context",
+      });
+      yield* store.putDiscussion({ ...discussion, evaluatorThreadId: evaluator });
+      fake.runOnSend.add(evaluator);
+      target = card.id;
+      yield* kanban.reviewResult(reviewThread, "clear", [], "abc1483");
+      yield* Deferred.await(failedSave);
+      const wakes = () =>
+        Ref.get(fake.threads).pipe(
+          Effect.map(
+            (all) =>
+              all
+                .get(evaluator)!
+                .messages.filter((text) => text.includes("is waiting on your subtasks")).length,
+          ),
+        );
+      assert.strictEqual(yield* wakes(), 1);
+      assert.isNull((yield* store.card(card.id))!.nudgedAt);
+      // A follow-on that exhausted its retries leaves recovery to the periodic tick.
+      const sql = yield* BoardsDatabase.client;
+      yield* sql`UPDATE ardud_kanban_owner_routes SET done_at = '2026-10-25T13:00:00.000Z'
+        WHERE json_extract(json, '$.effect.kind') = 'evaluatorTurn' AND done_at IS NULL`;
+      failClock = false;
+      yield* kanban.tick;
+      assert.strictEqual(yield* wakes(), 1);
+      assert.strictEqual((yield* store.card(card.id))!.nudgedAt, "2026-10-25T13:00:00.000Z");
+      yield* kanban.tick;
+      assert.strictEqual(yield* wakes(), 1);
+    }).pipe(Effect.provide(testLayer(fake.layer, undefined, undefined, storeLayer)));
+  }),
+);
+
+it.effect(
+  "#1483 recovery acknowledges an accepted edit after a failed clock save and evaluator replacement",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const io = yield* KanbanThreads.pipe(Effect.provide(fake.layer));
+      const lifecycle = yield* KanbanThreads.pipe(Effect.provide(KanbanThreadLifecycle.layer));
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
+      const attempts: Array<{ threadId: ThreadId; key: string }> = [];
+      const delivery = Layer.succeed(
+        KanbanThreads,
+        KanbanThreads.of({
+          ...io,
+          launch: (input) =>
+            Effect.gen(function* () {
+              const id = yield* io.launch(input);
+              yield* orchestrator
+                .dispatch({
+                  type: "thread.create",
+                  commandId: CommandId.make(`1483:create:${id}`),
+                  threadId: id,
+                  projectId: input.projectId,
+                  title: input.title,
+                  modelSelection: {
+                    instanceId: ProviderInstanceId.make("codex"),
+                    model: "gpt-6.1-sol",
+                  },
+                  runtimeMode: "full-access",
+                  interactionMode: "default",
+                  branch: null,
+                  worktreePath: null,
+                  createdBy: "system",
+                  creationSource: "server",
+                })
+                .pipe(Effect.orDie);
+              return id;
+            }),
+          send: (input) => {
+            if (!input.key?.startsWith("review-step:")) return io.send(input);
+            attempts.push({ threadId: input.threadId, key: input.key });
+            return lifecycle.send(input);
+          },
+        }),
+      );
+      let target: KanbanCardId | undefined;
+      let failClock = true;
+      const failedSave = yield* Deferred.make<void>();
+      const storeLayer = Layer.effect(
+        KanbanStore.KanbanStore,
+        Effect.map(KanbanStore.KanbanStore, (store) =>
+          KanbanStore.KanbanStore.of({
+            ...store,
+            putCard: (card) =>
+              card.id === target && failClock && card.nudgedAt !== null
+                ? Deferred.succeed(failedSave, undefined).pipe(
+                    Effect.andThen(Effect.die(new Error("wake clock save failed"))),
+                  )
+                : store.putCard(card),
+          }),
+        ),
+      ).pipe(Layer.provide(KanbanStore.layer));
+      yield* Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+        const { kanban, card, reviewThread } = yield* startReplayReview;
+        const store = yield* KanbanStore.KanbanStore;
+        const current = (yield* kanban.card(card.id)).card;
+        const url = "https://example.com/pull/1483";
+        fake.prs.set(current.workThreadId!, [{ url, title: "Fix", state: "open" }]);
+        const step = { state: "open" as const, note: null, doneAt: null, doneBy: null };
+        yield* store.putCard({
+          ...current,
+          links: [{ kind: "pr", url, label: null, state: "open", checkedAt: null }],
+          subtasks: [
+            { ...step, id: "s1", step: 1, text: "Review", owner: "review" },
+            { ...step, id: "s2", step: 2, text: "Merge", owner: "evaluator" },
+          ],
+          subtaskSeq: 2,
+        });
+        const discussion = yield* kanban.cardDiscussion(card.id);
+        const evaluator = yield* kanban.startEvaluator(card.boardId, {
+          kind: "request",
+          text: "Context",
+        });
+        yield* store.putDiscussion({ ...discussion, evaluatorThreadId: evaluator });
+        yield* lifecycle.send({ threadId: evaluator, text: "Unstarted active turn" });
+        const queued = yield* lifecycle.send({
+          threadId: evaluator,
+          text: "Previous step snapshot",
+          key: "1483:previous",
+          coalesce: `step:${card.id}`,
+        });
+        target = card.id;
+        yield* kanban.reviewResult(reviewThread, "clear", [], "abc1483");
+        yield* Deferred.await(failedSave);
+        const first = attempts[0]!;
+        const receipt = yield* receipts.getByCommandId(CommandId.make(`kanban:send:${first.key}`));
+        assert.isTrue(Option.isSome(receipt));
+        if (Option.isSome(receipt)) {
+          assert.equal(receipt.value.commandType, "queued-run.edit");
+          assert.equal(receipt.value.status, "accepted");
+        }
+        const before = yield* orchestrator.getThreadRecords(evaluator, ["runs", "messages"]);
+        assert.lengthOf(before.runs, 2);
+        assert.include(
+          before.messages.find(
+            (message) => message.id === before.runs.find((run) => run.id === queued)!.userMessageId,
+          )!.text,
+          "is waiting on your subtasks",
+        );
+        assert.isNull((yield* store.card(card.id))!.nudgedAt);
+        // Recovery must acknowledge the accepted edit even after its original recipient is gone.
+        yield* Ref.update(fake.threads, (all) => {
+          all.get(evaluator)!.archived = true;
+          return all;
+        });
+        const sql = yield* BoardsDatabase.client;
+        yield* sql`UPDATE ardud_kanban_owner_routes SET done_at = '2026-10-25T13:00:00.000Z'
+        WHERE json_extract(json, '$.effect.kind') = 'evaluatorTurn' AND done_at IS NULL`;
+        failClock = false;
+        yield* kanban.tick;
+        const replacement = (yield* kanban.cardDiscussion(card.id)).evaluatorThreadId!;
+        assert.isNotNull(replacement);
+        assert.notEqual(replacement, evaluator);
+        assert.isTrue(
+          attempts.some((attempt) => attempt.threadId === replacement && attempt.key === first.key),
+        );
+        assert.strictEqual((yield* store.card(card.id))!.nudgedAt, "2026-10-25T13:00:00.000Z");
+        assert.deepEqual(
+          yield* orchestrator.getThreadRecords(evaluator, ["runs", "messages"]),
+          before,
+        );
+        assert.lengthOf((yield* orchestrator.getThreadRecords(replacement, ["runs"])).runs, 0);
+        const count = attempts.length;
+        yield* kanban.tick;
+        assert.lengthOf(attempts, count);
+      }).pipe(Effect.provide(testLayer(delivery, undefined, undefined, storeLayer)));
+    }).pipe(Effect.provide(unstartedLifecycleLayer())),
+);
+
+it.effect.each(["work", "review", "later work", "partial chain", "flag", "wait"] as const)(
+  "#1483 does not wake a clear review with $0 open",
+  (shape) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        const card = yield* kanban.createCard(
+          board.id,
+          {
+            title: "Held",
+            prompt: "Held",
+            subtasks: [
+              { owner: "evaluator", text: "Merge", step: 1 },
+              ...(shape === "work" || shape === "review" || shape === "later work"
+                ? [
+                    {
+                      owner: shape === "review" ? ("review" as const) : ("work" as const),
+                      text: "Still open",
+                      step: shape === "later work" ? 2 : 1,
+                    },
+                  ]
+                : []),
+            ],
+          },
+          { _tag: "evaluator", threadId: ThreadId.make("packet") },
+        );
+        yield* store.putCard({
+          ...card,
+          stage: "in_review",
+          reviewStep: 1,
+          reviewChain: shape === "partial chain" ? "Critical" : null,
+          stalled:
+            shape === "flag"
+              ? {
+                  reason: "Held outside board",
+                  at: card.createdAt,
+                  by: { _tag: "evaluator", threadId: ThreadId.make("packet") },
+                }
+              : null,
+          links: [
+            {
+              kind: "pr",
+              url: "https://example.com/pull/1483",
+              label: null,
+              state: "open",
+              checkedAt: null,
+            },
+          ],
+        });
+        if (shape === "wait")
+          yield* kanban.waitCard(
+            card.id,
+            {
+              on: "time",
+              until: "2026-10-27T13:00:00.000Z",
+              note: "Intentional wait",
+            },
+            owner,
+          );
+        yield* kanban.tick;
+        yield* TestClock.adjust("7 hours");
+        yield* kanban.tick;
+        assert.isNull((yield* store.card(card.id))?.nudgedAt);
+        assert.strictEqual((yield* Ref.get(fake.threads)).size, 0);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
 it.effect(
   "a todo card waiting on its evaluator's packet wakes the card's evaluator once, after 15 minutes at P1",
   () =>

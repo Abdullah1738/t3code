@@ -556,13 +556,101 @@ it.effect(
 );
 
 it.effect.each([
-  { status: "rejected", cross: true, acceptedRetry: false, sends: 1 },
-  { status: "accepted", cross: true, acceptedRetry: false, sends: 0 },
-  { status: "rejected", cross: true, acceptedRetry: true, sends: 0 },
-  { status: "rejected", cross: false, acceptedRetry: false, sends: 0 },
-  { status: "accepted", cross: false, acceptedRetry: false, sends: 0 },
+  {
+    commandType: "message.dispatch",
+    status: "rejected",
+    cross: true,
+    acceptedRetry: false,
+    sends: 1,
+    ok: true,
+  },
+  {
+    commandType: "message.dispatch",
+    status: "accepted",
+    cross: true,
+    acceptedRetry: false,
+    sends: 0,
+    ok: true,
+  },
+  {
+    commandType: "message.dispatch",
+    status: "rejected",
+    cross: true,
+    acceptedRetry: true,
+    sends: 0,
+    ok: true,
+  },
+  {
+    commandType: "message.dispatch",
+    status: "rejected",
+    cross: false,
+    acceptedRetry: false,
+    sends: 0,
+    ok: false,
+  },
+  {
+    commandType: "message.dispatch",
+    status: "accepted",
+    cross: false,
+    acceptedRetry: false,
+    sends: 0,
+    ok: false,
+  },
+  {
+    commandType: "queued-run.edit",
+    status: "accepted",
+    cross: true,
+    acceptedRetry: false,
+    coalesce: "step:A",
+    sends: 0,
+    ok: true,
+  },
+  {
+    commandType: "queued-run.edit",
+    status: "accepted",
+    cross: false,
+    acceptedRetry: false,
+    coalesce: "step:A",
+    sends: 0,
+    ok: false,
+  },
+  {
+    commandType: "queued-run.edit",
+    status: "accepted",
+    cross: true,
+    acceptedRetry: false,
+    sends: 0,
+    ok: false,
+  },
+  {
+    commandType: "queued-run.edit",
+    status: "rejected",
+    cross: true,
+    acceptedRetry: false,
+    coalesce: "step:A",
+    sends: 0,
+    ok: false,
+  },
+  {
+    commandType: "queued-run.edit",
+    status: "rejected",
+    cross: true,
+    acceptedRetry: true,
+    coalesce: "step:A",
+    sends: 0,
+    ok: false,
+  },
+  {
+    commandType: "queued-run.cancel",
+    status: "accepted",
+    cross: true,
+    acceptedRetry: false,
+    coalesce: "step:A",
+    sends: 0,
+    ok: false,
+  },
 ] as const)(
-  "delivery replacement: prior=$status cross=$cross acceptedRetry=$acceptedRetry",
+  "delivery replacement: $commandType prior=$status cross=$cross acceptedRetry=$acceptedRetry coalesce=$coalesce",
   (row) =>
     Effect.gen(function* () {
       const old = ThreadId.make("old-evaluator");
@@ -584,7 +672,7 @@ it.effect.each([
           commandId: CommandId.make("kanban:send:question-key"),
           aggregateKind: "thread" as const,
           aggregateId: old,
-          commandType: "message.dispatch",
+          commandType: row.commandType,
           acceptedAt: QUESTION_AT,
           resultSequence: 1,
           status: row.status,
@@ -605,9 +693,10 @@ it.effect.each([
             text: "Same question",
             key: "question-key",
             keyAcrossThreads: row.cross,
+            ...("coalesce" in row ? { coalesce: row.coalesce } : {}),
           }),
         );
-        expect(Result.isSuccess(result)).toBe(row.cross);
+        expect(Result.isSuccess(result)).toBe(row.ok);
         expect(sent).toHaveLength(row.sends);
         if (row.sends) expect(sent[0]).toBe("kanban:send:question-key:retry:1");
       }).pipe(
