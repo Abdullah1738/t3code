@@ -3743,6 +3743,7 @@ def brief(cases, now=None, root=None, cancelled=None):
         return ''
 
     due, changed = [], []
+    no_deadline = 0
     far = dt.datetime.max.replace(tzinfo=TZ)
     for case in sorted(open_cases, key=lambda c: (c.get('kind') != 'payment_deadline', due_of(c) or far)):
         deadline = deadline_of(case)
@@ -3766,7 +3767,7 @@ def brief(cases, now=None, root=None, cancelled=None):
         elif case.get('urgency') == 'overdue':
             due.append(f"{case['merchant']} {money(case)} ({case['state']}" + (f'; {date}' if date else '') + ')')
         elif due_date is None:
-            due.append(f"{case['merchant']} {money(case)} ({date or 'no valid deadline'})")
+            no_deadline += 1
         elif case.get('kind') == 'payment_deadline' or due_date <= now + BRIEF_DUE:
             if date:
                 due.append(f"{case['merchant']} {money(case)} {date}")
@@ -3778,10 +3779,18 @@ def brief(cases, now=None, root=None, cancelled=None):
             changed.append(f"{case['merchant']} {money(case)}" + (f' {date}' if date else ''))
     parts = [f'Money: {len(open_cases)} open']
     if due:
-        parts.append('due: ' + '; '.join(due))
+        shown = due[:6]
+        if len(due) > len(shown):
+            shown.append(f'+{len(due) - len(shown)} more')
+        parts.append('due: ' + '; '.join(shown))
+    if no_deadline:
+        parts.append(f'{no_deadline} with no deadline')
     if changed:
-        parts.append('changed: ' + '; '.join(changed))
-    if open_cases and not due and not changed:
+        shown = changed[:6]
+        if len(changed) > len(shown):
+            shown.append(f'+{len(changed) - len(shown)} more')
+        parts.append('changed: ' + '; '.join(shown))
+    if open_cases and not due and not changed and not no_deadline:
         parts.append('nothing due in 48h')
     if running:
         shown = running[:3]

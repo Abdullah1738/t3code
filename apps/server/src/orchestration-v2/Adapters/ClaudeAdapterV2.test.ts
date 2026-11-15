@@ -3264,6 +3264,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
             event.type === "turn.terminal",
         );
       return {
+        adapter,
         attachmentsDir,
         runtime,
         providerThread,
@@ -3299,6 +3300,174 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       };
     });
   const makeWakeHarness = makeWakeHarnessWithOptions();
+
+  it.effect.each([false, true])(
+    "shares concurrent prompt skill discovery only for the same cwd (different cwd: %s)",
+    (differentCwd) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const home = yield* fs.makeTempDirectoryScoped({ prefix: "claude-shared-discovery-" });
+          const root = path.join(home, "skills");
+          const entered = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          let scans = 0;
+          const h = yield* makeWakeHarnessWithOptions({
+            settings: { ...DEFAULT_CLAUDE_SETTINGS, homePath: home },
+            fileSystem: {
+              ...fs,
+              exists: (file) => (file.endsWith("/.git") ? Effect.succeed(false) : fs.exists(file)),
+              readFileString: (file, options) =>
+                file.endsWith(".json") ? Effect.succeed("{}") : fs.readFileString(file, options),
+              readDirectory: (directory, options) =>
+                directory !== root
+                  ? fs.readDirectory(directory, options)
+                  : Effect.gen(function* () {
+                      scans++;
+                      yield* Deferred.succeed(entered, undefined);
+                      yield* Deferred.await(release);
+                      return [];
+                    }),
+            },
+          });
+          const input = makeClaudeTestTurnInput({
+            threadId: h.threadId,
+            providerThread: h.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("concurrent-discovery-first"),
+            text: "$review this",
+            attachments: [],
+          });
+          const first = yield* h.runtime.startTurn(input).pipe(Effect.forkScoped);
+          yield* Deferred.await(entered).pipe(Effect.raceFirst(Fiber.join(first)));
+          const threadId = ThreadId.make("concurrent-discovery-second");
+          const runtimePolicy = {
+            ...CLAUDE_TEST_RUNTIME_POLICY,
+            cwd: differentCwd ? "/other" : "/workspace",
+          };
+          const runtime = yield* h.adapter.openSession({
+            threadId,
+            providerSessionId: ProviderSessionId.make("concurrent-discovery-second"),
+            modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+            runtimePolicy,
+          });
+          const providerThread = yield* runtime.ensureThread({
+            threadId,
+            modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+            runtimePolicy,
+          });
+          const second = yield* runtime
+            .startTurn({
+              ...input,
+              threadId,
+              providerThread,
+              runtimePolicy,
+              runId: RunId.make("concurrent-discovery-second"),
+              attemptId: RunAttemptId.make("concurrent-discovery-second"),
+            })
+            .pipe(Effect.forkScoped);
+          yield* TestClock.adjust("1 second");
+          assert.equal(scans, differentCwd ? 2 : 1);
+          yield* Deferred.succeed(release, undefined);
+          yield* Fiber.join(first);
+          yield* Fiber.join(second);
+          assert.lengthOf(h.offeredMessages, 2);
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
+        ),
+      ),
+  );
+
+  it.effect.each(["no mention", "hung", "defect", "fast"] as const)(
+    "prompt skill discovery: %s still sends exactly one prompt",
+    (mode) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const home = yield* fs.makeTempDirectoryScoped({ prefix: "claude-discovery-" });
+          const skillsRoot = path.join(home, "skills");
+          yield* fs.makeDirectory(path.join(skillsRoot, "review"), { recursive: true });
+          yield* fs.writeFileString(path.join(skillsRoot, "review", "SKILL.md"), "Review it.");
+          const entered = yield* Deferred.make<void>();
+          let scans = 0;
+          const harness = yield* makeWakeHarnessWithOptions({
+            settings: { ...DEFAULT_CLAUDE_SETTINGS, homePath: home },
+            fileSystem: {
+              ...fs,
+              readDirectory: (directory, options) =>
+                directory !== skillsRoot
+                  ? fs.readDirectory(directory, options)
+                  : Effect.gen(function* () {
+                      scans++;
+                      yield* Deferred.succeed(entered, undefined);
+                      if (mode === "hung") return yield* Effect.never;
+                      if (mode === "defect") return yield* Effect.die("scan failed");
+                      return yield* fs.readDirectory(directory, options);
+                    }),
+            },
+          });
+          const prompt = mode === "no mention" ? "Read /workspace/file.ts" : "please $review this";
+          const input = makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("discovery-first"),
+            text: prompt,
+            attachments: [],
+          });
+          const start = yield* harness.runtime.startTurn(input).pipe(Effect.forkScoped);
+          if (mode === "hung") {
+            yield* Deferred.await(entered).pipe(Effect.raceFirst(Fiber.join(start)));
+            yield* TestClock.adjust("5 seconds");
+          }
+          yield* Fiber.join(start);
+          assert.lengthOf(harness.offeredMessages, 1);
+          assert.deepEqual(
+            harness.offeredMessages[0]?.message.content,
+            mode === "fast"
+              ? [
+                  { type: "text", text: "Ultrathink:\nplease /review this" },
+                  { type: "text", text: "/review this" },
+                ]
+              : `Ultrathink:\n${prompt}`,
+          );
+          assert.equal(scans, mode === "no mention" ? 0 : 1);
+          assert.lengthOf(harness.terminalEvents(), 0);
+          yield* harness.offerAndWait(turnOneResult);
+          yield* Queue.take(harness.terminalReceipts);
+          yield* harness.runtime.startTurn({
+            ...input,
+            runId: RunId.make("discovery-second"),
+            attemptId: RunAttemptId.make("discovery-second"),
+            providerTurnOrdinal: 2,
+          });
+          assert.lengthOf(harness.offeredMessages, 2);
+          assert.equal(scans, mode === "no mention" ? 0 : 1);
+          if (mode === "fast") {
+            yield* harness.offerAndWait(
+              makeResultFrame({ uuid: "discovery-second-result", result: "Done." }),
+            );
+            yield* Queue.take(harness.terminalReceipts);
+            yield* TestClock.adjust("61 seconds");
+            yield* harness.runtime.startTurn({
+              ...input,
+              runId: RunId.make("discovery-third"),
+              attemptId: RunAttemptId.make("discovery-third"),
+              providerTurnOrdinal: 3,
+            });
+            assert.equal(scans, 2);
+          }
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
+        ),
+      ),
+  );
 
   it.effect.each(
     (["model_refusal_no_fallback", "model_refusal_fallback"] as const).flatMap((refusalKind) =>

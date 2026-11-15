@@ -588,3 +588,61 @@ it.effect.each(["direct", "continuation"] as const)(
     }).pipe(Effect.provide(f.layer));
   },
 );
+
+it.effect.each([
+  "queued",
+  "preparing",
+  "starting",
+  "running",
+  "waiting",
+  "failed",
+  "completed",
+  "cancelled",
+] as const)("bound diagnostics find a %s successor", (status) => {
+  const f = makeFixture();
+  f.set({ ...f.get(), runs: [run, { ...run, id: RunId.make("successor"), ordinal: 2, status }] });
+  return Effect.gen(function* () {
+    const state = yield* RestartPacingState.RestartPacingState;
+    assert.equal(
+      yield* state.hasSuccessor(source),
+      ["queued", "preparing", "starting", "running", "waiting"].includes(status),
+    );
+  }).pipe(Effect.provide(f.layer));
+});
+
+it.effect(
+  "bound diagnostics exclude the actual starting run when its source is a predecessor",
+  () => {
+    const f = makeFixture();
+    const actual = { ...run, id: RunId.make("actual"), status: "starting" as const };
+    f.set({ ...f.get(), runs: [run, actual] });
+    return Effect.gen(function* () {
+      const state = yield* RestartPacingState.RestartPacingState;
+      assert.isFalse(yield* state.hasSuccessor(source, actual.id));
+    }).pipe(Effect.provide(f.layer));
+  },
+);
+
+it.effect("holder status uses its actual admitted run instead of a queued replacement", () => {
+  const f = makeFixture();
+  return Effect.gen(function* () {
+    const state = yield* RestartPacingState.RestartPacingState;
+    const actualId = RunId.make("run:actual-start");
+    f.set({
+      ...f.get(),
+      runs: [
+        { ...run, status: "queued" },
+        {
+          ...run,
+          id: actualId,
+          status: "starting",
+          restartContinuationOfRunId: RunId.make("run:older-source"),
+        },
+      ],
+    });
+    assert.isFalse(yield* state.active(source));
+    assert.isTrue(yield* state.active(source, actualId));
+    f.set({ ...f.get(), runs: [{ ...run, status: "queued" }] });
+    assert.isFalse(yield* state.active(source, actualId));
+  }).pipe(Effect.provide(f.layer));
+});

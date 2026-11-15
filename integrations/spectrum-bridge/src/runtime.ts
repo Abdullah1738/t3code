@@ -38,6 +38,11 @@ export type ChatCore = {
 };
 export type Chat<P> = ChatCore & { parts: P };
 
+export function optOutHealth(chats: Pick<ChatCore, "info" | "store">[], otherwiseHealthy: boolean) {
+  const optedOut = chats.filter(chat => chat.store.get("optedOut") !== undefined).map(chat => chat.info.slug);
+  return { status: otherwiseHealthy && optedOut.length === 0 ? "healthy" : "degraded", optedOut };
+}
+
 type Saved = Record<ChatKey, { slug: string; groupName?: string }>;
 const SAVED_KEY = "sbChats";
 
@@ -255,6 +260,7 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
   const { registry } = options;
   const reply = (status: number, body: unknown) => Response.json(body, { status });
   const result = (outcome: SbApiResult) => reply(outcome.status, outcome.body);
+  const pendingOptIns = new Set<string>();
 
   return async request => {
     const path = new URL(request.url).pathname;
@@ -423,6 +429,35 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
               : { limit, ...(typeof body.before === "string" ? { before: body.before } : {}) }, chat.info.kind === "owner");
           if (!history) throw new HttpError(404, "Unknown message");
           return reply(200, { chat: chat.info.slug, ...history });
+        }
+        case "/opt-in": {
+          only(body, ["chat", "sessionId"]);
+          if (body.sessionId !== undefined && !text(body.sessionId, 200)) throw new HttpError(400, "Invalid request");
+          ownerOnly(true);
+          live();
+          if (!text(body.chat, 100)) throw new HttpError(400, "Invalid request");
+          const target = registry.bySlugName(body.chat);
+          if (!target) throw new HttpError(404, "Unknown chat");
+          if (target.info.kind === "group") throw new HttpError(422, "Groups can't be opted in");
+          if (pendingOptIns.has(target.info.slug)) throw new HttpError(409, "Opt-in already in progress");
+          pendingOptIns.add(target.info.slug);
+          try {
+            const prior = target.store.get<{ since: number; failures: number }>("optedOut");
+            await options.line.setOptOut(chatKey.target(target.info.key), false);
+            target.store.db.transaction(() => {
+              target.store.set("optInRevision", (target.store.get<number>("optInRevision") ?? 0) + 1);
+              const current = target.store.get<{ since: number; failures: number }>("optedOut");
+              // A failure concurrent with the request must remain visible until a send succeeds.
+              if (prior && current?.since === prior.since && current.failures === prior.failures) {
+                const pending = target.store.get<Array<typeof current>>("optOutAwaitingSend") ?? [];
+                target.store.set("optOutAwaitingSend", [...pending, current]);
+                target.store.db.query("DELETE FROM kv WHERE key = 'optedOut'").run();
+              }
+            }).immediate();
+            return reply(200, { optedIn: true });
+          } finally {
+            pendingOptIns.delete(target.info.slug);
+          }
         }
         case "/ask-owner": {
           only(body, ["text", "sessionId", "dedupeKey"]);

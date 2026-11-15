@@ -15,6 +15,7 @@ import {
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
+import { newWait } from "./waits.ts";
 
 import {
   applyReviewResult,
@@ -1228,6 +1229,113 @@ describe("thread batching", () => {
     ).toMatchObject([{ cardId: back.id, joins: true }]);
   });
 
+  it.each([
+    "needs_review",
+    "in_review",
+    "completed",
+    "deployed",
+    "verified",
+    "needs_owner",
+  ] as const)("starts claimed rework fresh after its home card reaches %s", (stage) => {
+    const home = card({ stage, workThreadId: t1 });
+    const back = card({ workThreadId: t1 });
+    expect(
+      planDispatch(
+        board,
+        [back],
+        pools([[opus, 1]]),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        new Map([[t1, home]]),
+      ),
+    ).toMatchObject([
+      {
+        cardId: back.id,
+        role: "work",
+        fresh: true,
+        joins: false,
+        freshReason: `fresh work thread: previous thread ${t1} belongs to #${home.number} (${stage})`,
+      },
+    ]);
+  });
+
+  it.each(["working", "todo"] as const)(
+    "reuses claimed rework while its home card is %s on the thread",
+    (stage) => {
+      const home = working({ stage, workThreadId: t1 });
+      const back = card({ workThreadId: t1 });
+      expect(
+        planDispatch(
+          board,
+          [home, back],
+          pools([[opus, 1]]),
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          new Map([[t1, home]]),
+        ),
+      ).toMatchObject([{ cardId: back.id, fresh: false, joins: true }]);
+    },
+  );
+
+  it.each(["working", "todo"] as const)(
+    "starts claimed rework fresh when its %s home card changed threads",
+    (stage) => {
+      const home = card({ stage, workThreadId: ThreadId.make("replacement") });
+      const back = card({ workThreadId: t1 });
+      expect(
+        planDispatch(
+          board,
+          [back],
+          pools([[opus, 1]]),
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          new Map([[t1, home]]),
+        ),
+      ).toMatchObject([{ cardId: back.id, fresh: true, joins: false }]);
+    },
+  );
+
+  it("reuses its own thread and legacy threads, but not a linked missing home card", () => {
+    const back = card({ workThreadId: t1 });
+    for (const homes of [new Map(), new Map([[t1, back]])]) {
+      expect(
+        planDispatch(
+          board,
+          [back],
+          pools([[opus, 1]]),
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          homes,
+        ),
+      ).toMatchObject([{ cardId: back.id, fresh: false, joins: false }]);
+    }
+    expect(
+      planDispatch(
+        board,
+        [back],
+        pools([[opus, 1]]),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        new Map([[t1, null]]),
+      ),
+    ).toMatchObject([{ cardId: back.id, fresh: true, joins: false }]);
+  });
+
   it("keeps a held slot for a thread between cards", () => {
     const waiting = card();
     const holds = new Map([["t1", poolKey(opus)]]);
@@ -1692,6 +1800,29 @@ describe("workerQuietDue", () => {
     expect(workerQuietDue(working, view("needs-input"), at(31))).toBe(true);
     expect(workerQuietDue(working, view("running"), at(31))).toBe(false);
   });
+
+  it.each([
+    { setter: "t1", ownThread: "t1", stale: false, due: true },
+    { setter: "other", ownThread: "t1", stale: false, due: false },
+    { setter: "t1", ownThread: "other", stale: false, due: false },
+    { setter: "t1", ownThread: "t1", stale: true, due: false },
+  ])(
+    "only an own deferred wait reaches the idle backstop: %s",
+    ({ setter, ownThread, stale, due }) => {
+      const waiting = {
+        ...working,
+        workThreadId: ThreadId.make(ownThread),
+        wait: newWait(
+          { on: "time", until: "2026-10-26T00:00:00.000Z", note: "later" },
+          { _tag: "thread", threadId: ThreadId.make(setter) },
+          START_ISO,
+        ),
+        ...(stale ? { movedAt: "2026-10-25T00:00:01.000Z" } : {}),
+      };
+      expect(workerQuietDue(waiting, view("idle"), at(31))).toBe(due);
+      expect(workerQuietDue(waiting, view("running"), at(31))).toBe(false);
+    },
+  );
 
   it("counts from quietSince", () => {
     const quiet = { state: "idle", quietSince: "2026-10-25T00:20:00.000Z" };

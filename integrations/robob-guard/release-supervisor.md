@@ -57,7 +57,7 @@ supervisor is killed or crashes, its PID dies and the guard recovers Robob;
 there is no permanent hold switch.
 
 The fork installer also checks authenticated health before releasing its own
-hold after any quit, outside its three-minute attempt clock. Post-swap checks
+hold after any quit, outside its configured readiness budget (180 s by default). Post-swap checks
 require a new boot identity. If it is waiting after a failed launch, the log
 and Telegram alert request repair or compatible rollback from another
 Terminal while the installer remains alive. Pass the hold name/PID printed

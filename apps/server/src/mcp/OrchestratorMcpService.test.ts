@@ -2003,6 +2003,319 @@ describe("OrchestratorMcpService provider resolution", () => {
       }),
   );
 
+  const encodedTaskId = (threadId = parentThreadId, key = "review:%25/é") =>
+    NodeId.make(
+      `node:delegated-task:${encodeURIComponent(
+        `command:mcp:delegate-task:${encodeURIComponent(scope.environmentId)}:${encodeURIComponent(threadId)}:${encodeURIComponent(key)}`,
+      )}`,
+    );
+
+  const taskIdForms = [
+    { name: "exact", change: (id: string) => id },
+    { name: "projection appears after missing receipt", change: (id: string) => id, late: true },
+    {
+      name: "re-encoded",
+      change: (id: string) => `node:delegated-task:${encodeURIComponent(id.slice(20))}`,
+    },
+    {
+      name: "one-level decoded",
+      change: (id: string) => `node:delegated-task:${decodeURIComponent(id.slice(20))}`,
+    },
+    {
+      name: "caller separator loses an encoding level",
+      change: (id: string) => id.replace("thread%253A", "thread%3A"),
+      ambiguous: true,
+    },
+    {
+      name: "caller separator gains an encoding level",
+      change: (id: string) => id.replace("thread%253A", "thread%25253A"),
+    },
+    {
+      name: "lowercase escape",
+      change: (id: string) => id.replace("%3A", "%3a"),
+    },
+  ];
+
+  it.effect.each(taskIdForms)("handles the caller's copied task id for $name", (testCase) =>
+    Effect.gen(function* () {
+      const { change } = testCase;
+      let parentReads = 0;
+      const realId = encodedTaskId();
+      const task = {
+        id: realId,
+        threadId: parentThreadId,
+        origin: "app_owned",
+        childThreadId,
+        providerInstanceId: codexInstanceId,
+        model: "gpt-5.4",
+        result: "Review complete.",
+        status: "completed",
+        completionDelivery: { state: "pending" },
+      } as const;
+      const distractions = [
+        { ...task, origin: "provider_native" },
+        { ...task, threadId: ThreadId.make("thread:other") },
+      ];
+      const dispatched: Array<{ type: string; taskId?: NodeId }> = [];
+      const dependencies = Layer.mergeAll(
+        NodeServices.layer,
+        Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getCallerRow: (id) => Effect.succeed(liveThreadShell(id)),
+          getThreadShell: (id) => Effect.succeed(liveThreadShell(id)),
+          getThreadRecords: (id) =>
+            Effect.succeed(
+              id === parentThreadId
+                ? parentProjection(
+                    "late" in testCase && parentReads++ === 0 ? [] : [...distractions, task],
+                  )
+                : childProjection,
+            ),
+          getDelegationCommandState: () => Effect.succeed({ status: "never_saved" }),
+          getThreadProjection: () => Effect.succeed(parentProjection([task])),
+          dispatch: (command) =>
+            Effect.sync(() => {
+              dispatched.push(command);
+            }) as never,
+          stopDelegatedTasks: () => Effect.void,
+        }),
+        ServerSettings.layerTest(),
+        providerRegistryLayer([]),
+        adapterRegistryLayer([]),
+        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(SecretRequests.SecretRequests)({}),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        const inputId = NodeId.make(change(realId));
+        if ("ambiguous" in testCase) {
+          for (const operation of [
+            service.taskStatus(scope, inputId).pipe(Effect.asVoid),
+            service.cancelTask(scope, { taskId: inputId }).pipe(Effect.asVoid),
+          ]) {
+            const error = yield* operation.pipe(Effect.flip);
+            assert.equal(error.code, "task_not_found");
+            assert.include(error.message, "Check the id; copy it exactly from delegate_task.");
+            assert.notInclude(error.message, "never saved");
+          }
+          yield* Effect.yieldNow;
+          assert.deepEqual(dispatched, []);
+          return;
+        }
+        const status = yield* service.taskStatus(scope, inputId);
+        assert.equal(status.taskId, realId);
+        assert.isFalse(status.partial);
+        const cancelled = yield* service.cancelTask(scope, { taskId: inputId });
+        assert.equal(cancelled.taskId, realId);
+        assert.equal(cancelled.status, "completed");
+        yield* Effect.yieldNow;
+        assert.isTrue(
+          dispatched.some(
+            (command) => command.type === "delegated_task.completion-delivery.dispose",
+          ),
+        );
+        for (const command of dispatched)
+          if (command.taskId !== undefined) assert.equal(command.taskId, realId);
+      }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
+    }),
+  );
+
+  it.effect.each([
+    { name: "modern key colon", key: "review:1", suffix: "1", modern: true },
+    { name: "modern key repeated colons", key: "review::1", suffix: "1", modern: true },
+    { name: "modern key multiple fields", key: "review:round:1", suffix: "1", modern: true },
+    { name: "legacy key colon", key: "review:1", suffix: "1", modern: false },
+    { name: "legacy key repeated colons", key: "review::1", suffix: "1", modern: false },
+    { name: "legacy key multiple fields", key: "review:round:1", suffix: "1", modern: false },
+    {
+      name: "legacy operation namespace colon",
+      key: "review:1",
+      suffix: "1",
+      modern: false,
+      namespace: "delegate-task",
+    },
+    {
+      name: "legacy operation namespace repeated colons",
+      key: "review::1",
+      suffix: ":1",
+      modern: false,
+      namespace: "delegate-task",
+      firstOnly: true,
+    },
+    {
+      name: "legacy operation namespace multiple fields",
+      key: "review:round:1",
+      suffix: "round:1",
+      modern: false,
+      namespace: "delegate-task",
+      firstOnly: true,
+    },
+  ])("rejects ambiguous $name without selecting its suffix task", (testCase) =>
+    Effect.gen(function* () {
+      const { key, suffix, modern } = testCase;
+      const namespace = "namespace" in testCase ? testCase.namespace : "credential";
+      const idFor = (requestKey: string) =>
+        modern
+          ? encodedTaskId(parentThreadId, requestKey)
+          : NodeId.make(
+              `node:delegated-task:${encodeURIComponent(`command:mcp:${namespace}:delegate-task:${encodeURIComponent(requestKey)}`)}`,
+            );
+      const realId = idFor(key);
+      const suffixId = idFor(suffix);
+      const encodedKey = encodeURIComponent(key);
+      const alteredKey = "firstOnly" in testCase ? encodedKey.replace("%3A", ":") : key;
+      const inputId = NodeId.make(
+        realId.replace(encodeURIComponent(encodedKey), encodeURIComponent(alteredKey)),
+      );
+      const task = (id: NodeId, child: ThreadId) => ({
+        id,
+        threadId: parentThreadId,
+        origin: "app_owned",
+        childThreadId: child,
+        providerInstanceId: codexInstanceId,
+        model: "gpt-5.4",
+        result: "Review complete.",
+        status: "completed",
+        completionDelivery: { state: "pending" },
+      });
+      const parent = parentProjection([
+        task(suffixId, ThreadId.make("thread:suffix-child")),
+        task(realId, childThreadId),
+      ]);
+      const dispatched: string[] = [];
+      const dependencies = Layer.mergeAll(
+        NodeServices.layer,
+        Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getCallerRow: (id) => Effect.succeed(liveThreadShell(id)),
+          getThreadShell: (id) => Effect.succeed(liveThreadShell(id)),
+          getThreadRecords: (id) =>
+            Effect.succeed(id === parentThreadId ? parent : childProjection),
+          getThreadProjection: () => Effect.succeed(parent),
+          dispatch: (command) =>
+            Effect.sync(() => {
+              dispatched.push(command.type);
+            }) as never,
+          stopDelegatedTasks: () =>
+            Effect.sync(() => {
+              dispatched.push("stopDelegatedTasks");
+            }),
+        }),
+        ServerSettings.layerTest(),
+        providerRegistryLayer([]),
+        adapterRegistryLayer([]),
+        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(SecretRequests.SecretRequests)({}),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        const outcomes = yield* Effect.all([
+          Effect.exit(service.cancelTask(scope, { taskId: inputId }).pipe(Effect.asVoid)),
+          Effect.exit(service.taskStatus(scope, inputId).pipe(Effect.asVoid)),
+        ]);
+        yield* Effect.yieldNow;
+        assert.deepEqual(dispatched, []);
+        for (const outcome of outcomes) {
+          assert.isTrue(Exit.isFailure(outcome));
+          if (Exit.isFailure(outcome)) {
+            const error = Cause.squash(outcome.cause) as OrchestratorMcpFailure;
+            assert.equal(error.code, "task_not_found");
+            assert.include(error.message, "Check the id; copy it exactly from delegate_task.");
+            assert.notInclude(error.message, "never saved");
+          }
+        }
+      }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
+    }),
+  );
+
+  it.effect.each([
+    {
+      name: "real unsaved",
+      id: encodedTaskId(),
+      state: "never_saved",
+      expected: "This delegation was never saved",
+    },
+    {
+      name: "saved receipt",
+      id: encodedTaskId(),
+      state: "accepted",
+      expected: "This delegation was saved",
+    },
+    { name: "pending", id: encodedTaskId(), state: "pending", expected: "still being created" },
+    { name: "rejected", id: encodedTaskId(), state: "rejected", expected: "was rejected" },
+    ...taskIdForms
+      .filter((row) => !("late" in row) && row.name !== "exact")
+      .map(({ name, change }) => ({
+        name,
+        id: NodeId.make(change(encodedTaskId())),
+        state: "never_saved",
+        expected: "Check the id; copy it exactly from delegate_task.",
+      })),
+    {
+      name: "foreign caller",
+      id: encodedTaskId(ThreadId.make("thread:other")),
+      state: "never_saved",
+      expected: "Check the id; copy it exactly from delegate_task.",
+    },
+    {
+      name: "unknown",
+      id: NodeId.make("unknown"),
+      state: "never_saved",
+      expected: "Check the id; copy it exactly from delegate_task.",
+    },
+    {
+      name: "invalid escape",
+      id: NodeId.make("node:delegated-task:%ZZ"),
+      state: "never_saved",
+      expected: "Check the id; copy it exactly from delegate_task.",
+    },
+    {
+      name: "legacy without owner evidence",
+      id: NodeId.make(
+        `node:delegated-task:${encodeURIComponent("command:mcp:credential:delegate-task:review")}`,
+      ),
+      state: "never_saved",
+      expected: "Check the id; copy it exactly from delegate_task.",
+    },
+  ] as const)("missing task diagnosis: $name", ({ id, state, expected }) =>
+    Effect.gen(function* () {
+      const dependencies = Layer.mergeAll(
+        NodeServices.layer,
+        Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getCallerRow: (id) => Effect.succeed(liveThreadShell(id)),
+          getThreadRecords: () => Effect.succeed(parentProjection([])),
+          getDelegationCommandState: () =>
+            Effect.succeed(
+              state === "accepted" || state === "rejected"
+                ? ({
+                    status: state,
+                    threadId: parentThreadId,
+                    commandType: "delegated_task.request",
+                    error: null,
+                  } as never)
+                : ({ status: state } as never),
+            ),
+        }),
+        ServerSettings.layerTest(),
+        providerRegistryLayer([]),
+        adapterRegistryLayer([]),
+        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(SecretRequests.SecretRequests)({}),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        const error = yield* service.taskStatus(scope, id).pipe(Effect.flip);
+        assert.equal(error.code, "task_not_found");
+        assert.include(error.message, expected);
+        if (expected.startsWith("Check")) {
+          assert.notInclude(error.message, "never saved");
+          assert.notInclude(error.message, "Retry delegate_task");
+        }
+      }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
+    }),
+  );
+
   it.effect("status and same-key delegation finish while the background reader is held", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -2063,9 +2376,11 @@ describe("OrchestratorMcpService provider resolution", () => {
           ],
         } as unknown as OrchestrationV2ThreadProjection;
         const lanes: string[] = [];
-        const pointRead = <A>(value: A, readOnly = true) =>
+        const pointRead = <A>(value: A, readOnly = true, expectedLane = "foreground") =>
           Effect.gen(function* () {
-            lanes.push(yield* NodeSqliteClient.ReaderLane);
+            const lane = yield* NodeSqliteClient.ReaderLane;
+            lanes.push(lane);
+            assert.equal(lane, expectedLane);
             yield* sql
               .withTransaction(sql`SELECT * FROM entries`)
               .pipe(readOnly ? NodeSqliteClient.readOnly : (effect) => effect, Effect.orDie);
@@ -2075,7 +2390,8 @@ describe("OrchestratorMcpService provider resolution", () => {
         const dependencies = Layer.mergeAll(
           NodeServices.layer,
           Layer.mock(ThreadManagementService.ThreadManagementService)({
-            getCallerRow: (id) => pointRead({ ...liveThreadShell(id), ...parent.thread }),
+            getCallerRow: (id) =>
+              pointRead({ ...liveThreadShell(id), ...parent.thread }, true, "identity"),
             getThreadRecords: (id, _fields, _filter, options) => {
               assert.isTrue(options?.projectionOnly, "task reads must skip transcript hydration");
               return pointRead(id === parentThreadId ? parent : child);
@@ -2125,7 +2441,7 @@ describe("OrchestratorMcpService provider resolution", () => {
           assert.equal(retry.summary, "Review complete.");
           assert.deepEqual(commands, [commands[0], commands[0]]);
           assert.isTrue(lanes.length > 6);
-          assert.isTrue(lanes.every((lane) => lane === "foreground"));
+          assert.deepEqual([...new Set(lanes)].sort(), ["foreground", "identity"]);
           assert.isBelow(Number((yield* Clock.monotonicTimeNanos) - started) / 1_000_000, 10_000);
           assert.isUndefined(holder.pollUnsafe(), "the background slot stays held throughout");
           assert.isUndefined(writer.pollUnsafe(), "receipt probes must not require the writer");
@@ -2140,6 +2456,7 @@ describe("OrchestratorMcpService provider resolution", () => {
           NodeSqliteClient.layer({
             filename: path.join(directory, "state.sqlite"),
             readerWorker: true,
+            identityReaderProcess: true,
             foregroundReaderSlots: 1,
             backgroundReaderSlots: 1,
           }),
@@ -2191,7 +2508,7 @@ describe("OrchestratorMcpService provider resolution", () => {
         ]) {
           const error = yield* read.pipe(Effect.flip);
           assert.equal(error.code, "task_not_found");
-          assert.include(error.message, "was not found for thread");
+          assert.include(error.message, "Check the id; copy it exactly from delegate_task.");
           assert.notInclude(error.message, "does not belong");
           assert.notInclude(error.message, "about 30 seconds after the timeout");
           assert.notInclude(error.message, "same clientRequestId");

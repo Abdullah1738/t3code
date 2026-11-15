@@ -15,10 +15,12 @@ import {
   kanbanScriptStep,
   kanbanDeciding,
   kanbanWaiting,
+  kanbanWaitStale,
   kanbanWaitsOnEvaluator,
   kanbanReviewAlreadyDone,
   type KanbanBoard,
   type KanbanCard,
+  type KanbanCardEvent,
   type KanbanScheduleCard,
   type KanbanDiscussion,
   type KanbanGroup,
@@ -212,6 +214,32 @@ export function applyReviewResult(
 export const reviewFinished = (card: KanbanCard, chainLength: number) =>
   card.reviewStep >= Math.max(chainLength, 1);
 
+const REVIEW_EVALUATOR_WAKE_MS = 6 * 60 * 60_000;
+
+/** All remaining steps, including later ones, must belong to the evaluator or scripts. */
+export const inReviewEvaluatorStepsOnly = (card: KanbanCard) => {
+  const open = card.subtasks.filter((subtask) => subtask.state === "open");
+  return (
+    card.stage === "in_review" &&
+    card.activeThreadId === null &&
+    card.settledAt === null &&
+    card.stalled === null &&
+    card.priority !== KANBAN_BACKLOG &&
+    card.reviewStep > 0 &&
+    card.reviewFindingsPending !== true &&
+    !kanbanWaiting(card) &&
+    !kanbanDeciding(card) &&
+    !card.asks.some((ask) => ask.closedAt === null && ask.blocking) &&
+    open.length > 0 &&
+    open.every((subtask) => subtask.owner === "evaluator" || subtask.owner === "script")
+  );
+};
+
+export const reviewEvaluatorWakeDue = (card: KanbanCard, chainLength: number, nowMs: number) =>
+  inReviewEvaluatorStepsOnly(card) &&
+  reviewFinished(card, chainLength) &&
+  (card.nudgedAt === null || nowMs - Date.parse(card.nudgedAt) >= REVIEW_EVALUATOR_WAKE_MS);
+
 /** A queued review keeps its thread identity, including between chain steps. */
 export const reviewThreadToReuse = (board: KanbanBoard, card: KanbanCard) =>
   card.settledAt === null &&
@@ -267,6 +295,39 @@ export function discussionSettleDue(
 
 export const WORKER_QUIET_MS = 30 * 60 * 1000;
 
+export const WORKER_NUDGE_EVENT = "Work thread handoff nudge attempted";
+
+export function workerHandoffNudged(
+  card: KanbanCard,
+  events: ReadonlyArray<KanbanCardEvent>,
+): boolean {
+  const nudgedAt = card.nudgedAt;
+  if (nudgedAt === null) return false;
+  const since = Date.parse(nudgedAt);
+  // Interrupts share nudgedAt with handoff reminders. Event order distinguishes
+  // a reminder sent after an interrupt even when both have the same timestamp.
+  const latest = events.findLast(
+    (event) =>
+      event.kind === "thread" &&
+      event.actor._tag === "system" &&
+      event.actor.component === "dispatcher" &&
+      Date.parse(event.at) >= since &&
+      (event.body === WORKER_NUDGE_EVENT ||
+        event.body === "Interrupted: stuck on its own question" ||
+        event.body?.startsWith("No activity for ")),
+  );
+  return latest === undefined || latest.body === WORKER_NUDGE_EVENT;
+}
+
+export function workerWorkDone(card: KanbanCard): boolean {
+  const work = card.subtasks.filter((subtask) => subtask.owner === "work");
+  return (
+    work.length > 0 &&
+    work.every((subtask) => subtask.state !== "open") &&
+    card.reviewFindingsPending !== true
+  );
+}
+
 export const RUN_SILENT_MS = 30 * 60 * 1000;
 
 export function runSilentDue(
@@ -301,6 +362,16 @@ export function runSilentDue(
   );
 }
 
+/** The worker saved this wait while it still owned the card. */
+export const workerWaitDeferred = (card: KanbanCard): boolean =>
+  card.stage === "working" &&
+  card.activeRole === "work" &&
+  card.activeThreadId !== null &&
+  card.activeThreadId === card.workThreadId &&
+  card.wait?.by._tag === "thread" &&
+  card.wait.by.threadId === card.workThreadId &&
+  !kanbanWaitStale(card);
+
 /** A Working card whose worker sat idle, or stuck on its own question, for WORKER_QUIET_MS. */
 export function workerQuietDue(
   card: KanbanCard,
@@ -308,6 +379,11 @@ export function workerQuietDue(
   nowMs: number,
 ): boolean {
   if (card.stage !== "working" || card.activeRole !== "work" || card.stalled !== null) return false;
+  if (
+    (card.wait !== undefined && !workerWaitDeferred(card)) ||
+    card.asks.some((ask) => ask.closedAt === null && ask.blocking)
+  )
+    return false;
   if (view.state !== "idle" && view.state !== "needs-input") return false;
   const since = Math.max(
     Date.parse(view.quietSince),
@@ -517,8 +593,9 @@ export interface Dispatch {
   readonly model: ModelSelection;
   /** The card goes back to a work thread that already holds a slot in this pool. */
   readonly joins: boolean;
-  /** Start a new thread: the card's old work thread is busy in another pool. */
+  /** Start a new thread when the old thread is busy elsewhere or its home card moved on. */
   readonly fresh: boolean;
+  readonly freshReason?: string;
 }
 
 /** Most cards one work thread carries at once. */
@@ -579,6 +656,7 @@ export function planDispatch(
   nowMs?: number,
   attempted: ReadonlySet<string> = new Set(),
   reviews: ReadonlyMap<string, ReviewEvidence> = new Map(),
+  workThreadHomes: ReadonlyMap<string, KanbanCard | null> = new Map(),
 ): ReadonlyArray<Dispatch> {
   // A board's first setup holds all card work and review until the setup evaluator ends it.
   if (board.setup?.status === "running") return [];
@@ -642,7 +720,17 @@ export function planDispatch(
     const key = poolFor(pools, model)?.key;
     if (key === undefined || (slots.get(key) ?? 0) <= 0) continue;
     let thread = role === "work" ? card.workThreadId : null;
-    const fresh = thread !== null && busyElsewhere(thread, key);
+    // Missing links are legacy threads. A linked thread keeps claimed cards only
+    // while its home card is still part of that batch.
+    const home = thread === null ? undefined : workThreadHomes.get(thread);
+    const homeMovedOn =
+      home !== undefined &&
+      home?.id !== card.id &&
+      (home === null || !["working", "todo"].includes(home.stage) || home.workThreadId !== thread);
+    const freshReason = homeMovedOn
+      ? `fresh work thread: previous thread ${thread} ${home === null ? "has no home card" : `belongs to #${home.number} (${home.stage})`}`
+      : undefined;
+    const fresh = thread !== null && (homeMovedOn || busyElsewhere(thread, key));
     // A new thread can't take a card its old thread's own work still holds up.
     if (fresh && isBlocked(card, byId, null)) continue;
     if (fresh) thread = null;
@@ -665,7 +753,15 @@ export function planDispatch(
       set.add(thread);
       holding.set(key, set);
     }
-    plan.push({ cardId: card.id, role, pool: key, model, joins, fresh });
+    plan.push({
+      cardId: card.id,
+      role,
+      pool: key,
+      model,
+      joins,
+      fresh,
+      ...(freshReason === undefined ? {} : { freshReason }),
+    });
   }
   return plan;
 }

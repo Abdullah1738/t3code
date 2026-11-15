@@ -1,10 +1,12 @@
 """Exact pins and user-controlled PATH across nvm, cd and nested Bash."""
 from pathlib import Path
+import json
 import shlex
 import shutil
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from offbox_lib import node_version, pnpm_version, runs
@@ -12,6 +14,137 @@ import test_node_tools
 import test_node_version
 
 K = node_version._key
+
+
+class UnpackCrashTests(unittest.TestCase):
+    def provision(self, failures, *, corrupt=False, checksum_bad=False, masked=False):
+        outcomes = ' '.join(shlex.quote(s) for s in failures)
+        hook = r'''
+  count=$(cat "$HOME/installs" 2>/dev/null || echo 0); count=$((count+1))
+  echo "$count" > "$HOME/installs"
+  echo "INSTALL_ATTEMPT=$count" >&2
+  if [ "$count" = 2 ]; then
+    for partial in "$NVM_DIR/versions/node/$3" "$NVM_DIR/src/$3" "$NVM_DIR/tmp/$3" "$__offbox_cache/files"; do
+      [ ! -e "$partial" ] || return 88
+    done
+    __offbox_archive_ok "$__offbox_archive" || return 89
+    echo ARCHIVE_REVERIFIED >&2
+  fi
+  set -- "$1" "$2" "$3" @OUTCOMES@
+  if [ "$count" -le "$(( $# - 3 ))" ]; then
+    version=$3; shift "$((count+2))"
+    mkdir -p "$NVM_DIR/versions/node/$version" "$NVM_DIR/src/$version" "$NVM_DIR/tmp/$version" "$__offbox_cache/files"
+    @CORRUPT@
+    case "$1" in
+      signal:*) @PYTHON@ -I -c 'import os,signal,sys; os.kill(os.getpid(), getattr(signal, "SIG"+sys.argv[1]))' "${1#signal:}"; return $? ;;
+      status:*) return "${1#status:}" ;;
+      tar:*) echo "$1" >&2; return 2 ;;
+    esac
+    echo "$1" >&2
+    @FAILURE@
+  fi
+'''.replace('@OUTCOMES@', outcomes).replace('@CORRUPT@',
+            'echo corrupt > "$__offbox_archive"' if corrupt else ':').replace('@PYTHON@', shlex.quote(sys.executable)).replace(
+                '@FAILURE@', 'mkdir -p "$NVM_DIR/versions/node/$version/bin"; '
+                'printf \'#!/bin/sh\\necho %s\\n\' "$version" > "$NVM_DIR/versions/node/$version/bin/node"; '
+                'chmod +x "$NVM_DIR/versions/node/$version/bin/node"; return 0' if masked else 'return 1')
+        return test_node_version.ProvisionTests().run_provision(
+            pin='22.13.0', engine='>=22', retry='never', nvm_hook=hook, checksum_bad=checksum_bad)
+
+    def test_crash_then_success_retries_once_and_reverifies_archive(self):
+        for corrupt in (False, True):
+            with self.subTest(corrupt=corrupt):
+                p, downloads = self.provision(['*** stack smashing detected ***: terminated'], corrupt=corrupt)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertIn('COMMAND_MARKER', p.stdout)
+                self.assertEqual(p.stderr.count('INSTALL_ATTEMPT='), 2)
+                self.assertEqual(p.stderr.count('retrying once'), 1)
+                self.assertIn('ARCHIVE_REVERIFIED', p.stderr)
+                self.assertEqual(downloads, 5 if corrupt else 4)
+
+    def test_two_crashes_stop_and_persist_infra_fields(self):
+        p, _ = self.provision(['*** stack smashing detected ***: terminated'] * 2)
+        self.assertEqual(p.returncode, 90, p.stderr)
+        self.assertNotIn('COMMAND_MARKER', p.stdout)
+        self.assertEqual(p.stderr.count('INSTALL_ATTEMPT='), 2)
+        self.assertEqual(p.stderr.count('retrying once'), 1)
+        self.assertIn('box bx_fixture crashed unpacking a checksum-verified Node v22.13.0 archive twice', p.stderr)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(runs, 'LOGS_DIR', Path(tmp)):
+            log = Path(tmp) / 'run-fixture.log'
+            log.write_text(p.stderr)
+            runs.save_run_state('run-fixture', box_id='bx_fixture')
+            self.assertEqual(runs.space_result('run-fixture', 90, log, report=True), 90)
+            state = json.loads((Path(tmp) / 'run-fixture.state.json').read_text())
+            self.assertEqual(state['infra_failure'], 'native_crash')
+            self.assertEqual(state['infra_reason'], 'toolchain_unpack_crash')
+            self.assertEqual(state['box_id'], 'bx_fixture')
+
+    def test_native_crash_signature_table(self):
+        for signature in ('stack smashing detected', 'Segmentation fault', 'Illegal instruction',
+                          'Bus error', 'core dumped', 'Aborted', 'free(): invalid pointer',
+                          'malloc(): corrupted top size', 'tar: Unexpected EOF in archive'):
+            with self.subTest(signature=signature):
+                p, _ = self.provision([signature])
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertEqual(p.stderr.count('retrying once'), 1)
+
+    def test_masked_success_still_retries_or_stops_before_user_command(self):
+        for failures, expected in ((['Unexpected EOF in archive'], 0),
+                                   (['stack smashing detected'] * 2, 90)):
+            with self.subTest(failures=failures):
+                p, _ = self.provision(failures, masked=True)
+                self.assertEqual(p.returncode, expected, p.stderr)
+                self.assertEqual(p.stderr.count('INSTALL_ATTEMPT='), 2)
+                self.assertEqual(p.stderr.count('retrying once'), 1)
+                self.assertEqual('COMMAND_MARKER' in p.stdout, expected == 0)
+
+    def test_signal_exit_table_retries_once_then_stops_as_infra(self):
+        for signal, status in (('ILL', 132), ('ABRT', 134), ('BUS', 135), ('SEGV', 139)):
+            for failure in (f'signal:{signal}', f'status:{status}'):
+                for count, expected in ((1, 0), (2, 90)):
+                    with self.subTest(failure=failure, count=count):
+                        p, _ = self.provision([failure] * count)
+                        self.assertEqual(p.returncode, expected, p.stderr)
+                        self.assertEqual(p.stderr.count('INSTALL_ATTEMPT='), 2)
+                        self.assertEqual(p.stderr.count('retrying once'), 1)
+                        self.assertEqual('COMMAND_MARKER' in p.stdout, expected == 0)
+
+    def test_tar_child_signal_table(self):
+        for signal in (4, 6, 7, 11):
+            for ending in ('', ' (core dumped)'):
+                for count, expected in ((1, 0), (2, 90)):
+                    with self.subTest(signal=signal, ending=ending, count=count):
+                        p, _ = self.provision([f'tar: Child died with signal {signal}{ending}'] * count)
+                        self.assertEqual(p.returncode, expected, p.stderr)
+                        self.assertEqual(p.stderr.count('INSTALL_ATTEMPT='), 2)
+                        self.assertEqual(p.stderr.count('retrying once'), 1)
+                        self.assertEqual('COMMAND_MARKER' in p.stdout, expected == 0)
+        for signal in (1, 2, 9, 13, 15, 40, 60, 70, 110):
+            with self.subTest(non_native=signal):
+                p, _ = self.provision([f'tar: Child died with signal {signal}'])
+                self.assertEqual(p.returncode, 99, p.stderr)
+                self.assertNotIn('retrying once', p.stderr)
+                self.assertNotIn('COMMAND_MARKER', p.stdout)
+
+    def test_non_crash_failure_and_crash_then_non_crash_keep_exit_99(self):
+        failure = 'N/A: version "v22.99.0" is not yet installed.'
+        for failures in ([failure], ['Segmentation fault (core dumped)', failure]):
+            with self.subTest(failures=failures):
+                p, _ = self.provision(failures)
+                self.assertEqual(p.returncode, 99, p.stderr)
+                self.assertNotIn('COMMAND_MARKER', p.stdout)
+                self.assertEqual(p.stderr.count('INSTALL_ATTEMPT='), len(failures))
+                self.assertEqual(p.stderr.count('retrying once'), len(failures)-1)
+                self.assertIn('offbox: toolchain unavailable: .nvmrc 22.13.0 (exact), package.json engines >=22 '
+                              '(box default v24.22.1; nvm: none): nvm install v22.13.0 failed; nothing ran (exit 99)', p.stderr)
+
+    def test_checksum_mismatch_never_reaches_install_or_retry(self):
+        p, _ = self.provision(['stack smashing detected'], checksum_bad=True)
+        self.assertEqual(p.returncode, 99, p.stderr)
+        self.assertIn('Node archive checksum mismatch', p.stderr)
+        self.assertNotIn('INSTALL_ATTEMPT=', p.stderr)
+        self.assertNotIn('retrying once', p.stderr)
+        self.assertNotIn('COMMAND_MARKER', p.stdout)
 
 
 class PrecisionTests(unittest.TestCase):

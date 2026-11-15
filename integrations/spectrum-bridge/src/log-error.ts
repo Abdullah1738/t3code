@@ -3,7 +3,7 @@ import { constants as osConstants } from "node:os";
 import { builtinModules } from "node:module";
 
 export type ErrorDetail = {
-  name: string; message: string; code?: string | number; errno?: string | number; status?: number; stack?: string[];
+  name: string; message: string; code?: string | number; errno?: string | number; status?: number; stack?: string[]; causeKey?: string;
 };
 
 const NAMES = new Set([
@@ -66,7 +66,7 @@ const NODE_MODULES = new Set([...builtinModules.map(name => name.replace(/^node:
   "internal/streams/readable", "internal/streams/writable", "internal/process/execution",
 ]);
 
-function code(value: unknown): string | number | undefined {
+function safeErrorCode(value: unknown): string | number | undefined {
   if (typeof value === "number" && Number.isSafeInteger(value) && Math.abs(value) <= 65535) return value;
   if (typeof value !== "string") return;
   const fetchCode = FETCH_CODE_ALIASES.get(value);
@@ -140,9 +140,9 @@ export function errorDetail(cause: unknown, fallback: Partial<ErrorDetail> = {})
     if (result.name === "UnknownError" && name === "Error") result.name = "Error";
     result.message = message(source.message ?? fallback.message);
     const nested = source.cause && typeof source.cause === "object" ? source.cause as Record<string, unknown> : {};
-    const errorCode = code(source.code ?? nested.code ?? fallback.code);
+    const errorCode = [source.code, nested.code, fallback.code].map(safeErrorCode).find(value => value !== undefined);
     if (errorCode !== undefined) result.code = errorCode;
-    const errno = code(source.errno ?? nested.errno ?? fallback.errno);
+    const errno = [source.errno, nested.errno, fallback.errno].map(safeErrorCode).find(value => value !== undefined);
     if (errno !== undefined) result.errno = errno;
     const response = source.response && typeof source.response === "object" ? source.response as Record<string, unknown> : {};
     const codeStatus = typeof errorCode === "string" ? /^(?:http_?|tokenHttp)([1-5]\d{2})/.exec(errorCode)?.[1] : undefined;
@@ -161,4 +161,16 @@ export function errorDetail(cause: unknown, fallback: Partial<ErrorDetail> = {})
     if (frames.length) result.stack = frames;
   } catch { /* Hostile getters must not prevent the catch record or change caller behavior. */ }
   return result;
+}
+
+// Only reduced diagnostics, never an exception message, determine a cause bucket.
+export function causeKey(detail: ErrorDetail, tag: string): string {
+  const http = typeof detail.code === "string" ? /^(?:http_?|tokenHttp)([1-5])\d{2}/.exec(detail.code) : undefined;
+  if (http) return `http.${http[1]}xx`;
+  if (detail.code !== undefined) return `code.${detail.code}`;
+  if (detail.errno !== undefined) return `errno.${detail.errno}`;
+  if (detail.status !== undefined) return `http.${Math.floor(detail.status / 100)}xx`;
+  if (tag === "router.catch1") return "prompt_acceptance_probe";
+  if (tag === "router.catch49") return "background_watch";
+  return "callsite_failure";
 }

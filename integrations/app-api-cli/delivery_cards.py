@@ -562,11 +562,14 @@ def preview_chrome(path):
     return False
 
 
-def log_render(started, ok):
+def log_render(started, ok, *, chat=None, outcome=None, failure_code=None):
     try:
+        chat = chat if chat in ('owner', 'moni') else 'other' if chat else 'unknown'
+        outcome = outcome if outcome in ('ok', 'fallback', 'failed') else 'ok' if ok else 'failed'
+        failure_code = failure_code if failure_code in ('none', 'preview_missing', 'render_exception') else 'none' if ok else 'renderer_failed'
         env = {k: v for k, v in os.environ.items() if k != 'BUN_INSPECT'}
         child = subprocess.Popen([BUN, BRIDGE, 'log-card-render', '--kind', 'delivery',
-                                  '--ms', str(max(0, (time.monotonic() - started) * 1000)), '--ok', str(ok).lower()],
+                                  '--ms', str(max(0, (time.monotonic() - started) * 1000)), '--chat', chat, '--outcome', outcome, '--failure-code', failure_code, '--attempt', '1', '--ok', str(ok).lower()],
                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
         # Reap without holding the renderer or its per-order lock for logging.
         threading.Thread(target=child.wait, daemon=True).start()
@@ -577,12 +580,19 @@ def log_render(started, ok):
 def build(cfg, data, meta=None, outdir=None, url=None, *, public=False):
     started = time.monotonic()
     ok = False
+    completed = False
     try:
         result = _build(cfg, data, meta, outdir, url, public=public)
         ok = bool(result.get('has_preview'))
+        completed = True
         return result
     finally:
-        log_render(started, ok)
+        try:
+            log_render(started, ok, chat=(cfg.get('delivery_card') or {}).get('chat') or cfg.get('chat') or cfg.get('for'),
+                       outcome='ok' if ok else 'fallback' if completed else 'failed',
+                       failure_code='none' if ok else 'preview_missing' if completed else 'render_exception')
+        except Exception:
+            pass
 
 
 def _build(cfg, data, meta=None, outdir=None, url=None, *, public=False):
