@@ -145,7 +145,8 @@ export class Store {
     let members: string[] = [];
     let since = 0;
     // Select and normalize in JS: SQLite TRIM does not recognize all JS whitespace.
-    for (const roster of rosters.iterate()) {
+    // Exhaust the cached query before selecting a roster; Bun 1.4.1 leaves a broken-out iterator active.
+    for (const roster of rosters.all()) {
       members = (JSON.parse(roster.participants) as unknown[])
         .filter((address): address is string => typeof address === "string").map(address => address.trim()).filter(Boolean);
       if (members.length) { since = roster.rowid; break; }

@@ -672,15 +672,19 @@ describe("Sendblue socket API", () => {
     family.store.acceptInbound("blank-sender", { sender: "\t\n\u00a0" });
     const expected = refreshed ? [owner, moni, "new-silent@example.com", "moni@example.com"]
       : [owner, moni, "silent@example.com", sam, "moni@example.com"];
-    expect(family.store.groupAudience().sort()).toEqual(expected.sort());
+    for (let read = 0; read < 3; read++) expect(family.store.groupAudience().sort()).toEqual(expected.sort());
     family.store.set("route", { id: "ses_group", generation: 1 });
-    expect((await post("/agent-ask", { sessionId: "ses_group", to: "moni", text: "question", dedupeKey: "updated-audience" })).status).toBe(202);
-    const wake = moniChat.store.pendingInbound().find(row => row.id.startsWith("wake:agent-bus:"))!.payload as { text: string };
-    expect(wake.text).toContain('This answer will be posted in the group "Family Trip"');
-    expect(wake.text.match(/\(members: ([^)]+)\)\./)?.[1]?.split(", ").sort()).toEqual(
-      (refreshed ? ["Abdullah", "Moni", "new-silent@example.com"] : ["Abdullah", "Moni", "Sam", "silent@example.com"]).sort());
-    expect(wake.text).not.toContain("old@example.com");
-    expect(wake.text).toContain("Share only what is fine for everyone there to read.");
+    for (let request = 0; request < 2; request++) {
+      expect((await post("/agent-ask", { sessionId: "ses_group", to: "moni", text: "question", dedupeKey: `updated-audience-${request}` })).status).toBe(202);
+      const wakes = moniChat.store.pendingInbound().filter(row => row.id.startsWith("wake:agent-bus:"));
+      expect(wakes).toHaveLength(request + 1);
+      const wake = wakes[request]!.payload as { text: string };
+      expect(wake.text).toContain('This answer will be posted in the group "Family Trip"');
+      expect(wake.text.match(/\(members: ([^)]+)\)\./)?.[1]?.split(", ").sort()).toEqual(
+        (refreshed ? ["Abdullah", "Moni", "new-silent@example.com"] : ["Abdullah", "Moni", "Sam", "silent@example.com"]).sort());
+      expect(wake.text).not.toContain("old@example.com");
+      expect(wake.text).toContain("Share only what is fine for everyone there to read.");
+    }
   });
 
   test("agent routes validate bodies, reject missing/stale sessions, and respect readiness", async () => {

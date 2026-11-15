@@ -62,6 +62,16 @@ test("missing sessions/targets are refused without logging supplied values", () 
   expect(JSON.stringify(env.logs)).not.toContain("PRIVATE");
 });
 
+test.each(["single roster", "newer blank roster", "superseded roster"])("repeated audience reads preserve all members: %s", kind => {
+  const env = setup();
+  if (kind === "superseded roster") env.store.acceptInbound("old", { sender: "old", participants: ["old"] });
+  env.store.acceptInbound("roster", { sender: "owner", participants: ["owner", "moni", "silent"] });
+  env.store.acceptInbound("new-member", { sender: "sam" });
+  if (kind === "newer blank roster") env.store.acceptInbound("blank", { sender: "owner", participants: ["\t"] });
+  const expected = ["moni", "owner", "sam", "silent"];
+  for (let read = 0; read < 3; read++) expect(env.store.groupAudience().sort()).toEqual(expected);
+});
+
 test.each(["owner", "moni"])("group requests tell %s the audience and return the answer only to the group assistant", to => {
   const env = setup();
   const id = env.id(env.ask("group-family", to));
