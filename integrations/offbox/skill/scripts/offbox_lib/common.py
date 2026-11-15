@@ -67,7 +67,7 @@ def home_state() -> dict:
         s = json.loads(BACKEND_STATE.read_text())
     except (OSError, ValueError):
         return {"state": "home_up"}
-    return s if isinstance(s, dict) and s.get("state") in ("home_up", "home_down", "home_starting") else {"state": "home_up"}
+    return s if isinstance(s, dict) and s.get("state") in ("home_up", "home_down", "home_starting", "home_slow") else {"state": "home_up"}
 
 
 def person() -> str | None:
@@ -236,9 +236,12 @@ def entry_backend(argv: list[str]) -> str:
             on_home = any(r["name"] == full for r in base_catalog.rows("server"))
             if on_home and not on_boat:
                 return "server"
-            if first == "server" and on_boat and not on_home:
+            if on_boat and not on_home:
                 _BACKEND_REASON = "boat-only-base"
                 return "boat"
+    if sub == "run":
+        # Routing waits for a live preflight; alert hysteresis can lag behind recovery.
+        return "server"
     if sub in ("logs", "wait", "kill", "release", "ssh", "ports", "keep", "exec"):
         named = [x for x in argv if x.startswith(("run-", "bx_"))]
         if sub == "exec":

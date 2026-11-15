@@ -1536,7 +1536,7 @@ def _source_present(root: Path, cwd: Path) -> None:
 class Runner:
     def __init__(self, a, me: dict):
         self.a, self.me = a, me
-        self.run_id = os.environ.get(BACKGROUND_RUN_ENV) or new_id("run")
+        self.run_id = home.take_invocation_run() or new_id("run")
         self.root = Path(me["repo_root"])
         recorded_cwd = None
         if os.environ.get(BACKGROUND_RUN_ENV):
@@ -1847,6 +1847,8 @@ class Runner:
                                   started=True, run_id=self.run_id, box=self.box) from e
             raise
         self.pid = r["processId"]
+        from .home_run_observation import observe
+        observe(self.run_id, "accepted")
         self.started = True
         save_run_state(self.run_id, box_id=self.box, process_id=self.pid, command_id=r.get("commandId"))
         try:
@@ -2378,6 +2380,7 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
     ended = {"n": 0, "at": None}
     frames = None
     down_from = None  # since when boat's API has been unreachable during this follow
+    last_home_read = 0
 
     probed = {"at": now()}
 
@@ -2454,6 +2457,14 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
                     if until is not None and now() >= until:
                         raise timed_out()
                     t = fr.get("type")
+                    if t != "error" and run_id and (now() - last_home_read >= 5 or t == "exit"):
+                        from .home_run_observation import observe
+                        kind = {"hello": "stream connected", "heartbeat": "stream heartbeat",
+                                "reconnect": "stream connected", "attempt": "stream connected",
+                                "stdout": "output received", "stderr": "output received",
+                                "exit": fr.get("status", "exited")}.get(t)
+                        observe(run_id, kind)
+                        last_home_read = now()
                     if t in ("stdout", "stderr"):
                         data = fr.get("data") or ""
                         b = data.encode()

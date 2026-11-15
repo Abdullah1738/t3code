@@ -497,6 +497,22 @@ def ports(me: dict, remote: int, local: int | None, box_id: str | None, reverse:
 STATUS_CALL_S = 12   # `offbox status` answers fast even when boat's API hangs (each call gets its own budget)
 
 
+def _home_run_notices(me):
+    from . import common
+    from .home_run_observation import notice
+    path = common.db_path_for("server")
+    if common.home_state().get("state") not in ("home_down", "home_slow") or not path.exists():
+        return
+    try:
+        with contextlib.closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1)) as con:
+            con.row_factory = sqlite3.Row
+            for row in con.execute("SELECT * FROM runs WHERE owner=? AND repo_root=? AND status IN ('starting','running')",
+                                   (me["owner"], me["repo_root"])):
+                notice(row, backend="server", emit=print)
+    except sqlite3.Error:
+        pass
+
+
 def status(me: dict) -> None:
     from . import common, home
     con = db()
@@ -509,7 +525,13 @@ def status(me: dict) -> None:
         else:
             why = st.get("reason") or ("pinned to Boat" if common.backend_pinned() else "home unreachable")
             print(f"backend: Boat, standing in for the home offbox server ({st.get('state')}{since}: {why}). "
-                  "Runs go back home after three good health checks")
+                  "New submissions probe home before choosing Boat")
+        daily = st.get("flaps_today") or {}
+        if daily:
+            print(f"home flaps today ({daily.get('day')}): slow={daily.get('slow', 0)} "
+                  f"slow_max_s={daily.get('slow_max_s', 0)} starting={daily.get('starting', 0)} "
+                  f"starting_max_s={daily.get('starting_max_s', 0)} down={daily.get('down', 0)}")
+        _home_run_notices(me)
         if st.get("degraded"):
             print(f"home server degraded: {'; '.join(str(x) for x in st['degraded'][:3])}")
     d = outage.current()
@@ -908,6 +930,8 @@ def _report_never_started(r) -> int:
 def logs(run_id: str, do_follow: bool) -> int:
     r = _run_row(run_id)
     _require_my_run(r)
+    from .home_run_observation import notice
+    notice(r)
     if r['status'] == 'source_gone':
         say(r['error'])
         return 2
@@ -972,6 +996,8 @@ def logs(run_id: str, do_follow: bool) -> int:
 def wait(run_id: str, timeout: float | None) -> int:
     r = _run_row(run_id)
     _require_my_run(r)
+    from .home_run_observation import notice
+    notice(r)
     from . import start_check
     unknown = r['status'] == 'infra' and start_check.recovery_marked(db(), r)
     if (r["status"] not in ("starting", "running", "lost") and not unknown) or (r['status'] == 'lost' and (r['exit_code'] is not None or not r['box_id'])):

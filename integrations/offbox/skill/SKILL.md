@@ -302,11 +302,11 @@ commands, same box model, no hourly price, no start limits, no spend cap). Boat 
 `offbox run` picks its backend once, when it starts:
 
 - A health monitor on the Mac checks the server every minute and writes `backend-state.json`. Up: the run goes
-  home. Down (2 failed checks): the run goes straight to Boat and says so in one line. Home again after 3 good
+  home. A run double-checks a down state with a live probe before choosing Boat. Alerts recover after 3 good
   checks; nothing to switch by hand. `offbox status` shows which one is in use.
 - Marked up but not answering when your run starts (or while its box is being fetched): the run moves to Boat
   before it is sent, with one line (`... this run goes to Boat instead`). **Once the server accepted a run it
-  never moves**, so nothing runs twice. A server that says it is starting is waited for (up to 600 s) instead of failing over.
+  never moves**, so nothing runs twice. A server that says it is starting is waited for (up to 600 s) instead of failing over. A slow but reachable server is waited for; runs move to Boat only when home is offline or refusing work, or has not answered for 5 minutes.
 - A run naming `--base` saved only on home waits for home (exit **93** when the wait expires) and never runs on Boat's template.
 - The server restarts under an accepted run (power cut, reboot, boatd restart): the client reconnects for up to
   15 minutes and carries on from where the output stopped. If the machine itself restarted, the server runs the
