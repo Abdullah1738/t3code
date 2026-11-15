@@ -107,6 +107,8 @@ import {
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import {
   normalizeIdleTimeout,
+  parentTaskCancellationRequest,
+  restartInterrupted,
   stalledSummary,
   silentRecoveryStillSafe,
   supportsSilentRecovery,
@@ -1013,6 +1015,18 @@ function lastDeliveredRunForProviderThread(
         projection.providerTurns.some((turn) => turn.runAttemptId === run.activeAttemptId)),
   );
 }
+
+const encodeRestartInterruption = Schema.encodeSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      status: Schema.Literal("interrupted"),
+      cancelReason: Schema.optional(Schema.String),
+      resumable: Schema.Literal(true),
+      childThreadId: ThreadId,
+      resumeTool: Schema.Literal("t3_thread_send"),
+    }),
+  ),
+);
 
 const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(function* () {
   const startTimeoutQueueOwner = yield* StartTimeoutQueueOwner;
@@ -12908,7 +12922,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           messageRoles: ["assistant"],
           messageRunIds: [childRun.id],
           turnItemRunId: childRun.id,
-          turnItemTypes: ["assistant_message", "error"],
+          turnItemTypes: ["assistant_message", "error", "run_interrupt_request"],
         },
       );
       const lastTool = needsPartialResult({ ...childRun, status: outcome })
@@ -13006,6 +13020,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const parentTurnItem = parentProjection.turnItems.find(
         (candidate) => candidate.type === "subagent" && candidate.subagentId === task.id,
       );
+      const parentCancelRequest = parentTaskCancellationRequest(childRun.id, childResult.turnItems);
+      const parentCancelReason =
+        task.cancelReason === "task_cancel" || task.cancelReason === "delegated_parent_cancelled"
+          ? task.cancelReason
+          : parentCancelRequest?.cancelReason;
+      const parentCancelled = parentCancelReason !== undefined || parentCancelRequest !== undefined;
+      const restartCancelled = restartInterrupted(childRun) && parentCancelled;
+      const interruptedByRestart = restartInterrupted(childRun) && !parentCancelled;
+      const taskTerminalStatus = restartCancelled
+        ? "cancelled"
+        : interruptedByRestart
+          ? "interrupted"
+          : terminalStatus;
       const updatedTask: OrchestrationV2Subagent = {
         ...task,
         ...(isTerminalDelegatedTaskStatus(task.status) &&
@@ -13018,14 +13045,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             }
           : {}),
         providerThreadId: childRun.providerThreadId,
-        status: terminalStatus,
-        cancelReason: childRun.cancelReason,
-        cancelDetail: childRun.cancelDetail,
+        status: taskTerminalStatus,
+        cancelReason: restartCancelled ? parentCancelReason : childRun.cancelReason,
+        cancelDetail: restartCancelled
+          ? (task.cancelDetail ?? parentCancelRequest?.message.slice(0, 500))
+          : childRun.cancelDetail,
         ...(childRun.delegatedTaskStall === undefined ? {} : { failureReason: "stalled" as const }),
         ...(childRun.launchRecovery?.kind === "model_access"
           ? { model: childRun.modelSelection.model }
           : {}),
-        result: claudeRecoveryResult({ ...childRun, status: outcome }, result.text).text,
+        result: interruptedByRestart
+          ? `${encodeRestartInterruption({ status: "interrupted", cancelReason: childRun.cancelReason, resumable: true, childThreadId, resumeTool: "t3_thread_send" })}\nInterrupted by restart. Resume this same task with t3_thread_send using the childThreadId above; check preserved work before repeating actions.${partialResult.messageId === null && partialResult.turnItemId === null ? "" : `\n\nPartial assistant text:\n${result.text}`}`
+          : claudeRecoveryResult({ ...childRun, status: outcome }, result.text).text,
         completedAt: childRun.completedAt ?? now,
         updatedAt: now,
       };
@@ -13120,7 +13151,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 occurredAt: now,
                 payload: {
                   ...parentNode,
-                  status: terminalStatus,
+                  status: taskTerminalStatus,
                   providerThreadId: childRun.providerThreadId,
                   completedAt: now,
                 },
@@ -13138,8 +13169,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 occurredAt: now,
                 payload: {
                   ...parentTurnItem,
-                  status: terminalStatus,
-                  result: result.text,
+                  status: taskTerminalStatus,
+                  result: updatedTask.result,
                   completedAt: now,
                   updatedAt: now,
                 },
@@ -13174,6 +13205,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             childRun.delegatedTaskStall === undefined
               ? "child_terminal_reconciled"
               : "stalled_child_terminal_reconciled",
+        });
+      }
+
+      if (interruptedByRestart) {
+        yield* Effect.logInfo("delegated-task.restart_interrupted", {
+          taskId: task.id,
+          parentThreadId,
+          childThreadId,
+          runId: childRun.id,
+          action: "parent_notified",
         });
       }
 
@@ -13346,6 +13387,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       return;
     }
 
+    const unstartedFailure = deliveryRun.status === "failed" && deliveryRun.startedAt === null;
+    if (unstartedFailure) {
+      yield* Effect.logWarning("delegated-task.completion_held", {
+        parentThreadId: threadId,
+        runId: deliveryRun.id,
+        taskIds: delivery.taskIds,
+        reason: "parent_failed_before_start",
+      });
+    }
     const now = yield* DateTime.now;
     const nextTaskStates = new Map<
       OrchestrationV2Subagent["id"],
