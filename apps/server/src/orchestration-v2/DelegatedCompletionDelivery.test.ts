@@ -3507,3 +3507,151 @@ it.layer(layerTest)("unstarted task-owned follow-ups after restart", (it) => {
       }),
   );
 });
+
+it.layer(Layer.merge(layerTest, ProviderContinuationRequests.layer))(
+  "delegated background results",
+  (it) => {
+    it.effect("delivers the terminal background wake result exactly once", () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const sink = yield* EventSink.EventSinkV2;
+        const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+        const now = yield* DateTime.now;
+        const threadId = ThreadId.make("background-result-parent");
+        const projectId = ProjectId.make("background-result-project");
+        const runId = RunId.make("background-result-parent");
+        const rootNodeId = NodeId.make("background-result-root");
+        yield* seedParentWithTerminalTask({
+          threadId,
+          projectId,
+          runId,
+          rootNodeId,
+          taskId: NodeId.make("background-result-seed"),
+          deliveryState: "acknowledged",
+          now,
+        });
+        const child = yield* seedRestartCancelledChild({
+          parentThreadId: threadId,
+          projectId,
+          parentRunId: runId,
+          rootNodeId,
+          name: "background-result-child",
+          completionWake: "always",
+          continuationPending: false,
+          runStatus: "completed",
+          partialResult: "waiting for background command",
+          now,
+        });
+        const parent = yield* orchestrator.getThreadProjection(threadId);
+        const original = (yield* orchestrator.getThreadProjection(child.childThreadId)).runs[0]!;
+        const providerThread = {
+          ...parent.providerThreads[0]!,
+          id: ProviderThreadId.make("background-result-provider"),
+          appThreadId: child.childThreadId,
+          pendingBackgroundTasks: [{ taskId: "background-command", kind: "command" as const }],
+        };
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make("background-result-tag"),
+              type: "run.updated",
+              threadId: child.childThreadId,
+              occurredAt: now,
+              payload: { ...original, delegatedTaskId: child.taskId },
+            },
+            {
+              id: EventId.make("background-result-pending"),
+              type: "provider-thread.updated",
+              threadId: child.childThreadId,
+              occurredAt: now,
+              payload: providerThread,
+            },
+          ],
+        });
+        yield* orchestrator.recoverDelegatedTasks;
+        const held = yield* orchestrator.getThreadProjection(threadId);
+        assert.isNull(held.subagents.find((task) => task.id === child.taskId)!.result);
+        assert.isEmpty(held.contextTransfers);
+        assert.isNull(held.runs[0]!.delegatedCompletion!.delivery);
+
+        const wakeRunId = RunId.make("background-result-wake");
+        const finalText = "WATCH_DONE: exit 0, 18:48:10 / 18:51:30";
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make("background-result-cleared"),
+              type: "provider-thread.updated",
+              threadId: child.childThreadId,
+              occurredAt: now,
+              payload: { ...providerThread, pendingBackgroundTasks: [] },
+            },
+            runEvent({
+              threadId: child.childThreadId,
+              runId: wakeRunId,
+              ordinal: 2,
+              status: "completed",
+              now,
+            }),
+            {
+              id: EventId.make("background-result-answer"),
+              type: "message.updated",
+              threadId: child.childThreadId,
+              runId: wakeRunId,
+              occurredAt: now,
+              payload: {
+                id: MessageId.make("background-result-answer"),
+                threadId: child.childThreadId,
+                runId: wakeRunId,
+                nodeId: null,
+                role: "assistant",
+                text: finalText,
+                attachments: [],
+                streaming: false,
+                createdBy: "agent",
+                creationSource: "provider",
+                createdAt: now,
+                updatedAt: now,
+              },
+            },
+          ],
+        });
+        yield* orchestrator.recoverDelegatedTasks;
+        const completed = yield* orchestrator.getThreadProjection(threadId);
+        assert.equal(
+          completed.subagents.find((task) => task.id === child.taskId)!.result,
+          finalText,
+        );
+        assert.lengthOf(completed.contextTransfers, 1);
+        assert.equal(completed.contextTransfers[0]!.sourcePoint.runId, wakeRunId);
+        const wake = yield* requests.take;
+        const delivery = completed.runs[0]!.delegatedCompletion!.delivery!;
+        assert.equal(wake.delegatedCompletion?.messageId, delivery.messageId);
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make("background-result-delivery"),
+          threadId,
+          messageId: delivery.messageId,
+          text: "Delegated task completed.",
+          attachments: [],
+          dispatchMode: { type: "queue_after_active" },
+          createdBy: "agent",
+          creationSource: "server",
+          delegatedCompletion: {
+            parentRunId: runId,
+            generation: delivery.generation,
+            taskIds: delivery.taskIds,
+          },
+        });
+        yield* orchestrator.recoverDelegatedTasks;
+        const delivered = yield* orchestrator.getThreadProjection(threadId);
+        const notices = delivered.messages.filter(
+          (message) => message.delegatedCompletion !== undefined,
+        );
+        assert.lengthOf(notices, 1);
+        assert.include(notices[0]!.text, finalText);
+        assert.notInclude(notices[0]!.text, "waiting for background command");
+        assert.lengthOf(delivered.contextTransfers, 1);
+      }),
+    );
+  },
+);
