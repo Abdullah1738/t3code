@@ -8,6 +8,8 @@ import {
   TurnItemId,
   OrchestrationV2ProviderTurn,
   KanbanThreadLink,
+  KanbanCard,
+  KanbanCardId,
   RunId,
   ThreadId,
 } from "@t3tools/contracts";
@@ -33,6 +35,7 @@ const decodeProjection = Schema.decodeUnknownSync(OrchestrationV2ThreadProjectio
 const decodeLink = Schema.decodeUnknownSync(KanbanThreadLink);
 const decodeMessage = Schema.decodeUnknownEffect(OrchestrationV2ConversationMessage);
 const decodeTurn = Schema.decodeUnknownEffect(OrchestrationV2ProviderTurn);
+const decodeTurnItem = Schema.decodeUnknownEffect(OrchestrationV2TurnItem);
 const now = DateTime.makeUnsafe("2026-11-12T10:00:00Z");
 const source = {
   threadId: ThreadId.make("thread:pacing-state"),
@@ -100,6 +103,7 @@ const makeFixture = () => {
   let recorded: typeof OrchestrationV2TurnItem.Type | null = null;
   let origin: string | null = null;
   let link: typeof KanbanThreadLink.Type | null = null;
+  let card: typeof KanbanCard.Type | null = null;
   const commits: Parameters<EventSink.EventSinkV2["Service"]["commitCommand"]>[0][] = [];
   const layer = RestartPacingState.layer.pipe(
     Layer.provide(
@@ -113,6 +117,7 @@ const makeFixture = () => {
         Layer.mock(ControlStore.ControlStore)({ getOrigin: () => Effect.sync(() => origin) }),
         Layer.mock(KanbanStore.KanbanStore)({
           threadLink: () => Effect.sync(() => link),
+          cardsByThread: () => Effect.sync(() => (card === null ? [] : [card])),
           discussionByEvaluator: () => Effect.succeed(null),
         }),
         ThreadCommandExecutor.layer,
@@ -163,6 +168,17 @@ const makeFixture = () => {
     get: () => projection,
     set: (value: typeof projection) => {
       projection = value;
+    },
+    working: () => {
+      if (link === null) throw new Error("set role first");
+      link = { ...link, cardId: KanbanCardId.make("card:runtime-recovery") };
+      card = {
+        id: link.cardId,
+        stage: "working",
+        activeRole: "work",
+        activeThreadId: source.threadId,
+        stalled: null,
+      } as typeof KanbanCard.Type;
     },
     origin: (value: string) => {
       origin = value;
@@ -585,6 +601,54 @@ it.effect.each(["direct", "continuation"] as const)(
     return Effect.gen(function* () {
       const state = yield* RestartPacingState.RestartPacingState;
       assert.isTrue(yield* state.active(source));
+    }).pipe(Effect.provide(f.layer));
+  },
+);
+
+it.effect(
+  "runtime-loss Working cards precede routine restart work, with owner messages still first",
+  () => {
+    const f = makeFixture();
+    return Effect.gen(function* () {
+      const state = yield* RestartPacingState.RestartPacingState;
+      f.role("work");
+      f.working();
+      assert.equal((yield* state.describe(source)).priority, 2);
+      const failure = yield* decodeTurnItem({
+        id: "runtime-loss",
+        threadId: run.threadId,
+        runId: run.id,
+        nodeId: run.rootNodeId,
+        providerThreadId: run.providerThreadId,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: 1,
+        type: "error",
+        title: null,
+        status: "failed",
+        startedAt: now,
+        completedAt: now,
+        updatedAt: now,
+        failure: {
+          class: "transport_error",
+          category: "unknown",
+          code: "provider.runtime_lost",
+          retryable: true,
+          message: "Runtime lost",
+        },
+      });
+      f.set({ ...f.get(), turnItems: [failure] });
+      assert.equal((yield* state.describe(source)).priority, 0.5);
+      if (failure.type === "error") {
+        f.set({
+          ...f.get(),
+          turnItems: [{ ...failure, failure: { ...failure.failure, message: "rate limit" } }],
+        });
+        assert.equal((yield* state.describe(source)).priority, 2);
+      }
+      f.origin("imessage");
+      assert.equal((yield* state.describe(source)).priority, 0);
     }).pipe(Effect.provide(f.layer));
   },
 );

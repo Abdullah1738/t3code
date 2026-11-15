@@ -8634,6 +8634,7 @@ const make = Effect.gen(function* () {
   const nudgeWorker = Effect.fn("KanbanService.nudgeWorker")(function* (
     threadId: ThreadId,
     planned: ReadonlyArray<KanbanCard>,
+    runtimeFailure = false,
   ) {
     if (waking(threadId)) return;
     const cards: Array<KanbanCard> = [];
@@ -8679,7 +8680,10 @@ const make = Effect.gen(function* () {
       next.delete(threadId);
       return next;
     });
-    yield* nudgeThread(threadId, nudge, Briefs.nudgeWorkText(nudge));
+    const recovery = runtimeFailure
+      ? "Your turn ended on a tool-host or provider-runtime failure. Reconcile running commands and offbox runs first: use offbox wait <run> for the existing run. Never start a duplicate run or kill a running command as recovery. Then continue.\n\n"
+      : "";
+    yield* nudgeThread(threadId, nudge, recovery + Briefs.nudgeWorkText(nudge));
   });
 
   /** Refused verdicts flag immediately; a missing verdict gets a nudge and one restart first. */
@@ -9343,6 +9347,16 @@ const make = Effect.gen(function* () {
       }
       // Paused: the card keeps its thread until probeOutages wakes it.
       if (outage !== null) return;
+      if (failure !== null && Rules.isRuntimeFailure(failure)) {
+        const fresh = yield* freshThreads.find(threadId);
+        if (fresh?.state !== "idle" || !(yield* failedRunIsCurrent())) return;
+        const latestFailure = yield* freshThreads.findLastFailure(threadId);
+        if (failure.runId == null || latestFailure?.runId !== failure.runId) return;
+        const now = yield* nowMillis;
+        const due = carried.filter((entry) => Rules.failedTurnResumeDue(entry, fresh, now));
+        if (due.length > 0) yield* nudgeWorker(threadId, due, true);
+        return;
+      }
       if (failure !== null) {
         const reason = `Run failed: ${failure.message}`;
         const hasCurrentCarriedWork = Effect.fn("KanbanService.hasCurrentCarriedWork")(

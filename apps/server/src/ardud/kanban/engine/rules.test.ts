@@ -40,6 +40,8 @@ import {
   relatedCandidates,
   reviewGate,
   workerQuietDue,
+  failedTurnResumeDue,
+  isRuntimeFailure,
   runSilentDue,
   reviewerQuietDue,
   waitingOnBackground,
@@ -2172,4 +2174,45 @@ describe("runSilentDue", () => {
       ),
     ).toBe(true);
   });
+});
+
+describe("failedTurnResumeDue", () => {
+  const endedAt = "2026-11-14T22:34:07.000Z";
+  const start = Date.parse(endedAt);
+  const working = card({ stage: "working", activeRole: "work", movedAt: endedAt });
+  const view = { state: "idle", quietSince: endedAt, backgroundWork: 3 };
+  it("resumes after two minutes regardless of background work", () => {
+    expect(failedTurnResumeDue(working, view, start + 119999)).toBe(false);
+    expect(failedTurnResumeDue(working, view, start + 120000)).toBe(true);
+  });
+  it("keeps the existing thirty-minute nudge window", () => {
+    const nudged = { ...working, nudgedAt: iso(start + 120000) };
+    expect(failedTurnResumeDue(nudged, view, start + 240000)).toBe(false);
+    expect(failedTurnResumeDue(nudged, view, start + 32 * 60000)).toBe(true);
+  });
+  it.each(["running", "needs-input", "queued"])("does not wake %s", (state) => {
+    expect(failedTurnResumeDue(working, { ...view, state }, start + 120000)).toBe(false);
+  });
+  it.each([
+    ["transport_error", "unknown", true, true],
+    ["transport_error", "unknown", false, false],
+    ["transport_error", "transient", true, false],
+    ["transport_error", "quota", true, false],
+    ["transport_error", "config", true, false],
+    ["provider_error", "unknown", true, false],
+    ["validation_error", "unknown", true, false],
+  ] as const)(
+    "class=%s category=%s retryable=%s",
+    (failureClass, category, retryable, expected) => {
+      expect(
+        isRuntimeFailure({
+          class: failureClass,
+          category,
+          retryable,
+          code: null,
+          message: "failure",
+        }),
+      ).toBe(expected);
+    },
+  );
 });

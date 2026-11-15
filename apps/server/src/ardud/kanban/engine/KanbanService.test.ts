@@ -34628,3 +34628,76 @@ it.effect.each([
       }).pipe(Effect.provide(testLayer(fake.layer, undefined, undefined, observed)));
     }),
 );
+
+it.effect(
+  "a runtime-failed worker resumes in two minutes with background work and no duplicate nudge",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-11-14T22:34:07.000Z"));
+        const { kanban, board } = yield* toyBoard;
+        const created = yield* kanban.createCard(
+          board.id,
+          { prompt: "recover", title: "recover" },
+          owner,
+        );
+        yield* kanban.dispatchNow;
+        const thread = (yield* kanban.card(created.id)).card.activeThreadId!;
+        yield* setBackground(fake, thread, 3);
+        fake.failures.set(thread, {
+          class: "transport_error",
+          category: "unknown",
+          code: "codex.runtime_lost",
+          message: "provider runtime exited",
+          retryable: true,
+        });
+        yield* kanban.turnEnded(thread);
+        assert.strictEqual((yield* kanban.card(created.id)).card.stage, "working");
+        assert.strictEqual(yield* nudgesTo(fake, thread), 0);
+        yield* TestClock.adjust("119 seconds");
+        yield* kanban.tick;
+        assert.strictEqual(yield* nudgesTo(fake, thread), 0);
+        yield* TestClock.adjust("1 second");
+        yield* kanban.tick;
+        assert.strictEqual(yield* nudgesTo(fake, thread), 1);
+        const resumed = (yield* Ref.get(fake.threads)).get(thread)!;
+        assert.match(resumed.messages.at(-1)!, /tool-host or provider-runtime failure/);
+        assert.match(resumed.messages.at(-1)!, /offbox wait <run>/);
+        yield* kanban.turnEnded(thread);
+        yield* kanban.tick;
+        assert.strictEqual(yield* nudgesTo(fake, thread), 1);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect.each(["quota", "transient"] as const)(
+  "a runtime-shaped %s failure stays on the outage probe path",
+  (category) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const created = yield* kanban.createCard(
+          board.id,
+          { prompt: "recover", title: "recover" },
+          owner,
+        );
+        yield* kanban.dispatchNow;
+        const thread = (yield* kanban.card(created.id)).card.activeThreadId!;
+        yield* setBackground(fake, thread, 3);
+        fake.failures.set(thread, {
+          class: "transport_error",
+          code: "codex.runtime_lost",
+          category,
+          message: "runtime unavailable",
+          retryable: true,
+        });
+        yield* kanban.turnEnded(thread);
+        yield* TestClock.adjust("2 minutes");
+        yield* kanban.tick;
+        assert.strictEqual(yield* nudgesTo(fake, thread), 0);
+        assert.isNotNull((yield* kanban.caller(thread))?.paused);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);

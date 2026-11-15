@@ -15,6 +15,7 @@ import {
   type OrchestrationV2ThreadProjection,
   isOrchestrationV2WorkActive,
   ThreadId,
+  TurnItemId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
@@ -402,7 +403,57 @@ export const make = Effect.gen(function* () {
           },
         });
       }
+      const runtimeItems = projection.turnItems ?? [];
+      let runtimeLossOrdinal = runtimeItems.reduce((max, item) => Math.max(max, item.ordinal), -1);
       for (const run of runs) {
+        // Startup found a turn whose runtime vanished. Normal Stops and
+        // planned shutdowns keep their existing recovery policy.
+        if (
+          trigger === "startup" &&
+          run.startedAt != null &&
+          !runtimeItems.some(
+            (item) =>
+              item.type === "error" &&
+              item.runId === run.id &&
+              item.nodeId === run.rootNodeId &&
+              (item.status === "failed" || item.status === "running"),
+          )
+        ) {
+          runtimeLossOrdinal += 1;
+          events.push({
+            id: yield* allocateEventId(),
+            type: "turn-item.updated",
+            threadId: projection.thread.id,
+            runId: run.id,
+            ...(run.rootNodeId === null ? {} : { nodeId: run.rootNodeId }),
+            providerInstanceId: run.providerInstanceId,
+            occurredAt: now,
+            payload: {
+              id: TurnItemId.make(`turn-item:runtime-lost:${run.id}`),
+              threadId: projection.thread.id,
+              runId: run.id,
+              nodeId: run.rootNodeId,
+              providerThreadId: run.providerThreadId,
+              providerTurnId: null,
+              nativeItemRef: null,
+              parentItemId: null,
+              ordinal: runtimeLossOrdinal,
+              type: "error",
+              title: "Provider runtime stopped",
+              status: "failed",
+              startedAt: now,
+              completedAt: now,
+              updatedAt: now,
+              failure: {
+                class: "transport_error",
+                category: "unknown",
+                code: "provider.runtime_lost",
+                message: detail,
+                retryable: true,
+              },
+            },
+          });
+        }
         events.push({
           id: yield* allocateEventId(),
           type: "run.updated",

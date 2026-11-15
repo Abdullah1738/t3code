@@ -1,3 +1,9 @@
+import { isRuntimeFailure } from "../kanban/engine/rules.ts";
+import {
+  latestExecutedRun,
+  latestRootProviderFailure,
+  rootRuntimeLoss,
+} from "@t3tools/shared/orchestrationV2ThreadError";
 import { countsAsUserTurn } from "../control/turns.ts";
 import { isRecoveredQueueRun } from "../fast-install/report.ts";
 import { TurnItemId, type RunId, type ThreadId } from "@t3tools/contracts";
@@ -171,6 +177,41 @@ const make = Effect.gen(function* () {
       const discussion =
         link === null ? yield* boards.discussionByEvaluator(source.threadId) : null;
       const run = projection.runs.find((candidate) => candidate.id === source.sourceRunId);
+      let runtimeRecovery = false;
+      if (link?.role === "work") {
+        const cards = yield* boards.cardsByThread(source.threadId);
+        if (
+          cards.some(
+            (card) =>
+              card.stage === "working" &&
+              card.activeRole === "work" &&
+              card.activeThreadId === source.threadId &&
+              card.stalled === null,
+          )
+        ) {
+          const executed = latestExecutedRun(
+            projection.runs.filter(
+              (candidate) => candidate.status !== "starting" && candidate.status !== "preparing",
+            ),
+          );
+          if (executed?.status === "failed" || executed?.status === "cancelled") {
+            const { turnItems } = yield* projections.getThreadRecords(
+              source.threadId,
+              ["turnItems"],
+              { turnItemTypes: ["error"] },
+            );
+            const failure =
+              latestRootProviderFailure(executed, turnItems) ??
+              rootRuntimeLoss(executed, turnItems);
+            runtimeRecovery =
+              failure !== null &&
+              isRuntimeFailure(failure) &&
+              (failure.code === "provider.runtime_lost" ||
+                failure.code === "codex.runtime_lost" ||
+                failure.code === "codex.tool_host_lost");
+          }
+        }
+      }
       const pendingUser = relevant.some((candidate) =>
         messages.some(
           (message) =>
@@ -189,11 +230,13 @@ const make = Effect.gen(function* () {
           (Option.isSome(project) && project.value.title === "iMessage") ||
           pendingUser
             ? 0
-            : link?.role === "evaluator" || discussion !== null
-              ? 1
-              : link !== null
-                ? 2
-                : 3,
+            : runtimeRecovery
+              ? 0.5
+              : link?.role === "evaluator" || discussion !== null
+                ? 1
+                : link !== null
+                  ? 2
+                  : 3,
         activityAt:
           source.activityAt ??
           DateTime.toEpochMillis(run?.startedAt ?? run?.requestedAt ?? projection.thread.updatedAt),

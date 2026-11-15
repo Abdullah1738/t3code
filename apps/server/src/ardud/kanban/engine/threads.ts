@@ -31,6 +31,7 @@ import { backgroundWorkHoldsCompletion } from "@t3tools/shared/orchestrationV2Pe
 import {
   latestExecutedRun,
   latestRootProviderFailure,
+  rootRuntimeLoss,
 } from "@t3tools/shared/orchestrationV2ThreadError";
 
 import * as ThreadLaunchService from "../../../orchestration-v2/ThreadLaunchService.ts";
@@ -418,7 +419,9 @@ const make = Effect.gen(function* () {
     threads.getThreadRecords(threadId, ["runs", "turnItems"], { turnItemTypes: ["error"] }).pipe(
       Effect.map((records) => {
         const run = latestExecutedRun(records.runs);
-        const failure = latestRootProviderFailure(run, records.turnItems);
+        const failure =
+          latestRootProviderFailure(run, records.turnItems) ??
+          rootRuntimeLoss(run, records.turnItems);
         // A failed run can leave no error item on its root node; it still counts as failed.
         if (failure === null && run?.status === "failed") {
           return {

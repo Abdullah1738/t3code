@@ -4035,7 +4035,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       ),
   );
 
-  it.effect("review801r3: settles exactly once when exit overlaps Stop recovery", () =>
+  it.effect("confirms process exit settles exactly once during explicit Stop recovery", () =>
     Effect.gen(function* () {
       const nativeThreadId = "review801r3-stop-process-thread";
       const nativeTurnId = "review801r3-stop-process-turn";
@@ -4103,6 +4103,9 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       yield* Deferred.await(sessionStopped);
       assert.lengthOf(harness.terminalEvents(), 1);
       assert.equal(harness.terminalEvents()[0]?.status, "failed");
+      const stoppedTurn = harness.terminalEvents()[0];
+      if (stoppedTurn?.status === "failed")
+        assert.equal(stoppedTurn.failure.class, "provider_error");
       assert.lengthOf(
         harness.events.filter(
           (event) =>
@@ -4248,6 +4251,9 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         undefined,
         {},
         Deferred.succeed(stopping, undefined).pipe(Effect.andThen(Deferred.await(exited))),
+        undefined,
+        [],
+        new CodexError.CodexAppServerProcessExitedError({ pid: 815, code: 0, stderrTail: "" }),
       );
       for (const i of [1, 2]) {
         yield* harness.runtime.startTurn(
@@ -4268,6 +4274,12 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       yield* Deferred.await(sessionStopped);
       assert.lengthOf(harness.terminalEvents(), 2);
       assert.isTrue(harness.terminalEvents().every((event) => event.status === "failed"));
+      for (const event of harness.terminalEvents()) {
+        if (event.status !== "failed") continue;
+        assert.equal(event.failure.class, "transport_error");
+        assert.equal(event.failure.code, "codex.runtime_lost");
+        assert.equal(event.failure.retryable, true);
+      }
     }).pipe(
       Effect.scoped,
       Effect.provide(
@@ -9434,6 +9446,263 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     ),
   );
 
+  it.effect.each([
+    "code-mode host closed its stdout",
+    "code-mode host timed out waiting for wait response",
+  ])("preserves the tool-host signal on a native failed turn: %s", (message) =>
+    Effect.gen(function* () {
+      const nativeThreadId = "tool-host-thread";
+      const nativeTurnId = "tool-host-turn";
+      const harness = yield* makeCodexReplayHarness(
+        makeCodexReplayTranscript({
+          scenario: "tool-host-failed-turn",
+          entries: [
+            ...codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt: "Continue." }),
+            {
+              type: "emit_inbound",
+              label: "turn/completed",
+              frame: {
+                method: "turn/completed",
+                params: {
+                  threadId: nativeThreadId,
+                  turn: {
+                    ...makeCodexReplayTurn({ id: nativeTurnId, status: "failed" }),
+                    error: {
+                      message,
+                      codexErrorInfo: null,
+                      additionalDetails: "runtime diagnostic",
+                    },
+                  },
+                },
+              },
+            },
+            { type: "runtime_exit", status: "success" },
+          ],
+        }),
+      );
+      yield* harness.runtime.startTurn(
+        makeCodexTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          text: "Continue.",
+          attemptId: RunAttemptId.make("tool-host-attempt"),
+        }),
+      );
+      yield* harness.awaitInputEnd;
+      yield* harness.eventStreamExit;
+      const terminal = harness.terminalEvents()[0];
+      assert.equal(terminal?.status, "failed");
+      if (terminal?.status !== "failed") return;
+      assert.equal(terminal.failure.code, "codex.tool_host_lost");
+      assert.equal(terminal.failure.class, "transport_error");
+      assert.equal(terminal.failure.retryable, true);
+      assert.include(terminal.failure.message, "runtime diagnostic");
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
+  it.effect.each(["failed", "recovered", "background-completed", "interrupted"] as const)(
+    "preserves the tool-host signal on a completed tool result: %s",
+    (outcome) =>
+      Effect.gen(function* () {
+        const nativeThreadId = "completed-tool-host-thread";
+        const nativeTurnId = "completed-tool-host-turn";
+        const toolItem = {
+          type: "dynamicToolCall" as const,
+          id: "host-tool",
+          namespace: "functions",
+          tool: "exec",
+          arguments: {},
+          status: "failed",
+          success: false,
+          contentItems: [{ type: "inputText", text: "code-mode host closed its stdout" }],
+        };
+        const harness = yield* makeCodexReplayHarness(
+          makeCodexReplayTranscript({
+            scenario: `completed-tool-host-${outcome}`,
+            entries: [
+              ...codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt: "Continue." }),
+              {
+                type: "emit_inbound",
+                label: "host-tool",
+                frame: {
+                  method: "item/completed",
+                  params: { threadId: nativeThreadId, turnId: nativeTurnId, item: toolItem },
+                },
+              },
+              ...(outcome === "recovered"
+                ? [
+                    {
+                      type: "emit_inbound" as const,
+                      label: "new-tool-started",
+                      frame: {
+                        method: "item/started",
+                        params: {
+                          threadId: nativeThreadId,
+                          turnId: nativeTurnId,
+                          item: {
+                            ...toolItem,
+                            id: "recovered-tool",
+                            status: "inProgress",
+                            success: null,
+                            contentItems: [],
+                          },
+                        },
+                      },
+                    },
+                  ]
+                : []),
+              ...(outcome === "recovered" || outcome === "background-completed"
+                ? [
+                    {
+                      type: "emit_inbound" as const,
+                      label: "recovered-tool",
+                      frame: {
+                        method: "item/completed",
+                        params: {
+                          threadId: nativeThreadId,
+                          turnId: nativeTurnId,
+                          item: {
+                            ...toolItem,
+                            id: "recovered-tool",
+                            status: "completed",
+                            success: true,
+                            contentItems: [{ type: "inputText", text: "done" }],
+                          },
+                        },
+                      },
+                    },
+                  ]
+                : []),
+              {
+                type: "emit_inbound",
+                label: "turn/completed",
+                frame: {
+                  method: "turn/completed",
+                  params: {
+                    threadId: nativeThreadId,
+                    turn: makeCodexReplayTurn({
+                      id: nativeTurnId,
+                      status: outcome === "interrupted" ? "interrupted" : "completed",
+                    }),
+                  },
+                },
+              },
+              { type: "runtime_exit", status: "success" },
+            ],
+          }),
+        );
+        yield* harness.runtime.startTurn(
+          makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            text: "Continue.",
+            attemptId: RunAttemptId.make(`completed-host-${outcome}`),
+          }),
+        );
+        yield* harness.awaitInputEnd;
+        yield* harness.eventStreamExit;
+        const terminal = harness.terminalEvents()[0];
+        assert.equal(
+          terminal?.status,
+          outcome === "recovered"
+            ? "completed"
+            : outcome === "interrupted"
+              ? "interrupted"
+              : "failed",
+        );
+        if (terminal?.status === "failed")
+          assert.equal(terminal.failure.code, "codex.tool_host_lost");
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
+  it.effect.each(
+    (
+      [
+        { code: "usageLimitExceeded", category: "quota" },
+        { code: "serverOverloaded", category: "transient" },
+      ] as const
+    ).flatMap((failure) => [false, true].map((willRetry) => ({ ...failure, willRetry }))),
+  )(
+    "confirms process exit preserves $category classification (retry=$willRetry)",
+    ({ code, category, willRetry }) =>
+      Effect.gen(function* () {
+        const nativeThreadId = "classified-before-exit-thread";
+        const nativeTurnId = "classified-before-exit-turn";
+        const exited = yield* Deferred.make<void>();
+        const harness = yield* makeCodexReplayHarness(
+          makeCodexReplayTranscript({
+            scenario: `classified-before-exit-${code}-${willRetry}`,
+            entries: [
+              ...codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt: "Continue." }),
+              {
+                type: "emit_inbound",
+                label: "classified-error",
+                frame: {
+                  method: "error",
+                  params: {
+                    threadId: nativeThreadId,
+                    turnId: nativeTurnId,
+                    willRetry,
+                    error: {
+                      message: "Provider unavailable",
+                      codexErrorInfo: code,
+                      additionalDetails: null,
+                    },
+                  },
+                },
+              },
+              { type: "runtime_exit", status: "success" },
+            ],
+          }),
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          {},
+          Deferred.await(exited),
+          undefined,
+          [],
+          new CodexError.CodexAppServerProcessExitedError({ pid: 816, code: 0, stderrTail: "" }),
+        );
+        yield* harness.runtime.startTurn(
+          makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            text: "Continue.",
+            attemptId: RunAttemptId.make("classified-before-exit"),
+          }),
+        );
+        yield* harness.awaitInputEnd;
+        yield* Deferred.succeed(exited, undefined);
+        yield* harness.runtime.awaitSessionExit!;
+        yield* harness.eventStreamExit;
+        const terminal = harness.terminalEvents()[0];
+        assert.equal(terminal?.status, "failed");
+        if (terminal?.status === "failed") {
+          assert.equal(terminal.failure.category, category);
+          assert.equal(terminal.failure.code, code);
+        }
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
   it("maps each Codex app-server failure code to one normalized category", () => {
     const cases: ReadonlyArray<readonly [string, string | null, unknown, string]> = [
       ["usageLimitExceeded is quota", "usageLimitExceeded", undefined, "quota"],
@@ -13031,3 +13300,76 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     );
   });
 });
+
+it.each([
+  ["code-mode host closed its stdout", "unknown", true],
+  ["code-mode host timed out waiting for wait response", "unknown", true],
+  ["code-mode host closed its stdout", "transient", false],
+  ["code-mode host closed its stdout", "config", false],
+  ["Example: code-mode host closed its stdout", "unknown", false],
+  ["command exited with code 1", "unknown", false],
+] as const)("normalizes a Codex tool-host error: %s (%s)", (message, category, expected) => {
+  const original = makeProviderFailure({
+    message,
+    class: "provider_error",
+    category: category as "unknown" | "transient" | "config",
+  });
+  const failure = CodexAdapterV2.normalizeCodexToolHostFailure(original);
+  assert.equal(failure.code === "codex.tool_host_lost", expected);
+  if (expected) {
+    assert.equal(failure.class, "transport_error");
+    assert.equal(failure.retryable, true);
+  } else assert.strictEqual(failure, original);
+});
+
+it.each([
+  "usage_limit",
+  "transport_error",
+  "permission_error",
+  "validation_error",
+  "unknown",
+] as const)(
+  "normalizes a Codex tool-host error without overriding structured %s class",
+  (failureClass) => {
+    const original = makeProviderFailure({
+      message: "code-mode host closed its stdout",
+      class: failureClass,
+      category: "unknown",
+    });
+    assert.strictEqual(CodexAdapterV2.normalizeCodexToolHostFailure(original), original);
+  },
+);
+
+it("normalizes a Codex tool-host error without overriding explicit nonretryability", () => {
+  const original = makeProviderFailure({
+    message: "code-mode host closed its stdout",
+    class: "provider_error",
+    category: "unknown",
+    retryable: false,
+  });
+  assert.strictEqual(CodexAdapterV2.normalizeCodexToolHostFailure(original), original);
+});
+
+it.each([
+  ["functions", "exec", "failed", false, true],
+  ["functions", "wait", "failed", null, true],
+  [null, "functions.exec", "completed", false, true],
+  ["functions", "exec", "completed", true, false],
+  ["workspace", "exec", "failed", false, false],
+  ["functions", "exec", "inProgress", false, false],
+] as const)(
+  "normalizes a Codex tool-host result for %s/%s status=%s success=%s",
+  (namespace, tool, status, success, expected) => {
+    const failure = CodexAdapterV2.codexToolHostFailureOf({
+      type: "dynamicToolCall",
+      id: "host-tool",
+      namespace,
+      tool,
+      status,
+      success,
+      arguments: {},
+      contentItems: [{ type: "inputText", text: "code-mode host closed its stdout" }],
+    });
+    assert.equal(failure !== null, expected);
+  },
+);

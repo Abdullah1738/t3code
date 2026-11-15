@@ -1,3 +1,4 @@
+import { rootRuntimeLoss } from "@t3tools/shared/orchestrationV2ThreadError";
 import { assert, it, vi } from "@effect/vitest";
 import {
   MessageId,
@@ -2221,3 +2222,60 @@ it.effect("leaves delegated tasks to their own child threads after process loss"
     assert.deepEqual(noted, [`subagent ${nativeSubagentId}`]);
   }).pipe(Effect.provide(layer));
 });
+
+it.effect(
+  "runtime reconciliation records a structured loss, while a user cancellation has no loss",
+  () =>
+    Effect.gen(function* () {
+      const projection = staleRecoveryProjection("runtime-loss", { driver: "codex" });
+      const commits: Array<RecoveryCommit> = [];
+      const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService.pipe(
+        Effect.provide(staleRecoveryLayer({ projections: [projection], commits })),
+      );
+      yield* recovery.reconcile("startup");
+      const runEvent = commits[0]!.events.find((event) => event.type === "run.updated");
+      const errorEvents = commits[0]!.events.filter(
+        (event) => event.type === "turn-item.updated" && event.payload.type === "error",
+      );
+      assert.equal(runEvent?.type === "run.updated" ? runEvent.payload.status : null, "cancelled");
+      assert.lengthOf(errorEvents, 1);
+      if (runEvent?.type !== "run.updated") return;
+      const errors = errorEvents.flatMap((event) =>
+        event.type === "turn-item.updated" ? [event.payload] : [],
+      );
+      assert.equal(rootRuntimeLoss(runEvent.payload, errors)?.code, "provider.runtime_lost");
+      assert.isNull(rootRuntimeLoss(runEvent.payload, []));
+      assert.isNull(rootRuntimeLoss({ ...runEvent.payload, status: "completed" }, errors));
+      assert.isNull(
+        rootRuntimeLoss({ ...runEvent.payload, id: RunId.make("another-run") }, errors),
+      );
+      assert.isNull(
+        rootRuntimeLoss({ ...runEvent.payload, rootNodeId: NodeId.make("child-node") }, errors),
+      );
+    }),
+);
+
+it.effect("a planned shutdown does not become a runtime failure", () =>
+  Effect.gen(function* () {
+    const commits: Array<RecoveryCommit> = [];
+    const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService.pipe(
+      Effect.provide(
+        staleRecoveryLayer({
+          projections: [staleRecoveryProjection("planned-shutdown", { driver: "codex" })],
+          commits,
+        }),
+      ),
+    );
+    yield* recovery.reconcile("shutdown");
+    assert.isFalse(
+      commits
+        .flatMap((commit) => commit.events)
+        .some(
+          (event) =>
+            event.type === "turn-item.updated" &&
+            event.payload.type === "error" &&
+            event.payload.failure.code === "provider.runtime_lost",
+        ),
+    );
+  }),
+);
