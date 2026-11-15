@@ -14,6 +14,7 @@ if (import.meta.main) {
   if (!key) throw new Error("A stable operation key is required");
   const body = JSON.parse(await new Response(Bun.stdin.stream()).text());
   if (["events", "resolve"].includes(command)) { console.log(JSON.stringify(await runnerCommand(`/${command}`, body))); process.exit(0); }
+  if (command === "watch") { console.log(JSON.stringify(await runnerCommand("/watch", body))); process.exit(0); }
   if (!["send", "files", "react", "agent-ask", "agent-answer", "agent-requests", "share", "unshare", "shares"].includes(command)) throw new Error("Unknown command");
   const share = ["share", "unshare", "shares"].includes(command);
   console.log(JSON.stringify(await runnerCommand(share ? `/${command}` : "/action", share ? body : { id: opaqueId(`${command}:${key}`), path: `/${command}`, body })));

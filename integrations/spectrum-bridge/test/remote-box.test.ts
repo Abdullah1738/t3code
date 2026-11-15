@@ -95,6 +95,17 @@ test("callback send dedupe and ambiguous-send reconciliation store metadata only
   expect(files(s.mac)).not.toContain(secret);
 });
 
+test("box watcher canary stays out of Mac state, archives and logs; lease expiry pauses it", async () => {
+  const { BoxWatchers } = await import("../../moni-box-runner/src/watchers.ts");
+  const s = setup(), canary = randomUUID(); let checks = 0;
+  const watches = new BoxWatchers(s.runner, async () => { checks++; return { code: 0, stdout: canary }; });
+  watches.add({ id: "wa-existing", check: "wa new existing-cursor", interval: 5, expiresAt: 99999999, maxFires: 0, context: canary });
+  await watches.tick(); expect(checks).toBe(0);
+  await s.remote.tick(); await watches.tick(); await s.runner.tick();
+  expect(checks).toBe(1); expect(files(s.box)).toContain(canary); expect(files(s.mac)).not.toContain(canary); expect(s.logs.join()).not.toContain(canary);
+  s.rollback(); s.advance(); await watches.tick(); expect(checks).toBe(1);
+});
+
 test("bus answer acknowledgement is idempotent; owner relays refuse before writing a local outbox", async () => {
   const s = setup(), ownerStore = new Store(join(s.mac, "bus-owner.sqlite")); closes.push(() => ownerStore.close());
   const registry = new ChatRegistry({ owner: "+15555550123", ownerStore, stateRoot: s.mac, line: s.line,

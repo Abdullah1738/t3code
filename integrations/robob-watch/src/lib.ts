@@ -1,3 +1,4 @@
+import { assertMacWatcher } from "./person-box.ts";
 import { toolLog, toolError } from "./toollog.ts";
 import { StderrCause, stderrCause } from "./cause.ts";
 import { Database } from "bun:sqlite";
@@ -589,6 +590,7 @@ export type CheckResult = { code: number | null; signal: NodeJS.Signals | null; 
  */
 export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string, string> = {}, timeoutMs = watcher.timeout_s === undefined ? CHECK_TIMEOUT_MS : watcher.timeout_s * 1_000, instance = watcherInstance(watcher.id)): Promise<CheckResult> {
   const shell = watcher.serial ? ["/usr/bin/lockf", "-k", "-t", "120", WA_LOCK, "/bin/zsh", "-c", watcher.check] : ["/bin/zsh", "-c", watcher.check];
+  assertMacWatcher(watcher.chat);
   const started = now();
   return new Promise(resolve => {
     let done = false;

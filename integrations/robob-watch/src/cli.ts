@@ -1,3 +1,4 @@
+import { assertMacWatcher } from "./person-box.ts";
 import { toolLog, toolError, rollup, logMarker } from "./toollog.ts";
 import { stderrCause } from "./cause.ts";
 import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -155,12 +156,14 @@ async function main(argv: string[]): Promise<void> {
           ...(values["owner-only"] ? { relays: [] } : {}),
         };
       }
+      assertMacWatcher(input.chat);
       if (values.expires !== undefined) input.expires_at = duration(values.expires);
       if (input.expires_at === undefined) input.expires_at = duration("14d");
       if (values["owner-only"]) input.relays = [];
       if (values["inflight-check"] !== undefined) input.inflight_check = values["inflight-check"];
       const { watcher, dir, replacingExisting } = withRelayLock(() => {
         const previous = values.replace && validId(input.id) ? loadWatcher(input.id as string) : undefined;
+        assertMacWatcher(input.chat ?? previous?.chat);
         // Flags can't express relays, so a flag --replace keeps the ones the owner already allowed. Stops live
         // outside watcher.json, so no replace can lift one.
         if (values.json === undefined && previous?.relays && !values["owner-only"]) input.relays = previous.relays;

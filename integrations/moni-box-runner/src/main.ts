@@ -1,3 +1,4 @@
+import { BoxWatchers } from "./watchers.ts";
 import { readFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { Store } from "../../spectrum-bridge/src/store.ts";
@@ -26,6 +27,9 @@ if (import.meta.main) {
     log: (code, ms) => console.log(JSON.stringify({ code, ms })),
     share: async (path, body) => { const result = await shareRoute(shares, path, body); if (result.status >= 400) throw new Error("Share failed"); return result.body; },
   });
+  const watchers = new BoxWatchers(runner);
+  runner.watch = async (body) => { if (body.remove) watchers.remove(String(body.remove)); else watchers.add(body as unknown as import("./watchers.ts").BoxWatch); };
+  setInterval(() => void watchers.tick(), 1_000);
   Bun.serve({ hostname: "127.0.0.1", port: config.port, maxRequestBodySize: 28 * 1024 * 1024, fetch: runner.handle });
   setInterval(() => void runner.tick(), 1_000);
 }

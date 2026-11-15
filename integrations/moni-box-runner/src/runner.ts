@@ -13,6 +13,7 @@ class AttachmentFailure extends Error {
 const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024;
 export class BoxRunner {
   readonly db: Database;
+  watch?: (body: Record<string, unknown>) => Promise<void>;
   private working = false;
   private turnAbort?: AbortController;
   private flushing = false;
@@ -197,6 +198,7 @@ export class BoxRunner {
         })();
         return reply(200, { accepted: true });
       }
+      if (path === "/watch" && this.watch) { await this.watch(body); return reply(200, { accepted: true }); }
       if (path === "/action") return reply(200, { result: await this.action(String(body.id), String(body.path), object(body.body) ? body.body : {}) });
       if (["/share", "/unshare", "/shares"].includes(path) && this.io.share) return reply(200, await this.io.share(path, body));
       return reply(404, { error: "Not found" });
