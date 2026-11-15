@@ -1,3 +1,4 @@
+import ast
 import importlib.util
 from pathlib import Path
 import unittest
@@ -29,13 +30,14 @@ class Deps:
         self.events.append(('reverse' if reverse else 'forward', box))
         if self.fail and reverse: raise RuntimeError('failed')
         return Child()
+    def router_tunnel(self, box): self.events.append(('router-forward', box)); return Child()
     def both_ready(self): self.events.append(('both-ready', None))
 
 class Tests(unittest.TestCase):
     def test_stopped_box_recovery_never_allocates(self):
         deps = Deps(); supervisor = module.Supervisor({'boxId': 'bx_moni'}, deps)
         self.assertTrue(supervisor.connect())
-        self.assertEqual(deps.events, [('ensure', 'bx_moni'), ('resume', 'bx_moni'), ('ssh-setup', 'bx_moni'), ('runner-ready', 'bx_moni'), ('forward', 'bx_moni'), ('reverse', 'bx_moni'), ('both-ready', None)])
+        self.assertEqual(deps.events, [('ensure', 'bx_moni'), ('resume', 'bx_moni'), ('ssh-setup', 'bx_moni'), ('runner-ready', 'bx_moni'), ('forward', 'bx_moni'), ('reverse', 'bx_moni'), ('router-forward', 'bx_moni'), ('both-ready', None)])
         deps.stopped = True
         self.assertTrue(supervisor.connect())
         self.assertEqual(set(box for _, box in deps.events if box), {'bx_moni'})
@@ -66,6 +68,51 @@ class ColdStartupTests(unittest.TestCase):
         supervisor = module.Supervisor({'boxId': 'bx_moni'}, deps, clock=lambda: clock[0], sleep=lambda dt: clock.__setitem__(0, clock[0] + dt))
         self.assertTrue(supervisor.connect()); self.assertEqual(len(attempts), 3)
         self.assertTrue(all(not child.stopped for child in children))
+
+class RouterTunnelTests(unittest.TestCase):
+    def test_target_is_only_the_configured_mac_loopback_port(self):
+        for config, ports in [({}, (19465, 20128)), ({'boxRouterPort': 19475, 'macRouterPort': 20138}, (19475, 20138))]:
+            calls = []
+            deps = module.OffboxDeps.__new__(module.OffboxDeps)
+            deps.config = config
+            deps.ssh_sync = SimpleNamespace(tunnel=lambda *args: calls.append(args))
+            deps.router_tunnel('bx_moni')
+            self.assertEqual(calls, [('bx_moni', *ports, True)])
+        for value in (None, True, 0, 1023, 65536, '20128', '20128:localhost:22'):
+            for key in ('boxRouterPort', 'macRouterPort'):
+                with self.assertRaisesRegex(RuntimeError, 'invalid_router_port'): module.router_ports({key: value})
+
+    def test_real_ssh_builder_binds_box_loopback_and_forwards_only_to_mac_router(self):
+        source = Path(__file__).resolve().parents[2] / 'offbox/skill/scripts/offbox_lib/ssh_sync.py'
+        node = next(node for node in ast.parse(source.read_text()).body if isinstance(node, ast.FunctionDef) and node.name == 'tunnel')
+        calls = []
+        namespace = {'subprocess': SimpleNamespace(Popen=lambda args: calls.append(args)), 'ssh_base': lambda box: ['ssh', '-F', 'isolated-config']}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), 'exec'), namespace)
+        deps = module.OffboxDeps.__new__(module.OffboxDeps); deps.config = {}; deps.ssh_sync = SimpleNamespace(tunnel=namespace['tunnel'])
+        deps.router_tunnel('bx_moni')
+        self.assertEqual(calls, [['ssh', '-F', 'isolated-config', '-N', '-o', 'ExitOnForwardFailure=yes', '-o', 'ControlMaster=no', '-o', 'ControlPath=none', '-R', '127.0.0.1:19465:127.0.0.1:20128', 'bx_moni']])
+
+    def test_lost_router_tunnel_reconnects_without_resuming_a_running_box(self):
+        deps = Deps(); supervisor = module.Supervisor({'boxId': 'bx_moni'}, deps)
+        self.assertTrue(supervisor.connect()); first = supervisor.children.copy()
+        first[2].stopped = True
+        self.assertTrue(supervisor.connect())
+        self.assertTrue(all(child.stopped for child in first))
+        self.assertEqual(deps.events.count(('resume', 'bx_moni')), 1)
+        self.assertEqual(deps.events.count(('router-forward', 'bx_moni')), 2)
+        deps.enabled = False; supervisor.connect()
+        self.assertEqual(supervisor.children, [])
+
+    def test_router_tunnel_failure_cleans_both_existing_tunnels(self):
+        deps = Deps(); children = []
+        original = deps.tunnel
+        def tunnel(box, reverse):
+            child = original(box, reverse); children.append(child); return child
+        deps.tunnel = tunnel
+        deps.router_tunnel = lambda box: (_ for _ in ()).throw(RuntimeError('router'))
+        supervisor = module.Supervisor({'boxId': 'bx_moni'}, deps)
+        with self.assertRaisesRegex(RuntimeError, 'router'): supervisor.connect()
+        self.assertTrue(all(child.stopped for child in children)); self.assertEqual(supervisor.children, [])
 
 class ExactBoxTests(unittest.TestCase):
     def test_production_ensure_resumes_only_the_bound_box(self):

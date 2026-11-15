@@ -7,13 +7,14 @@ import type { AgentAnswerReceipt } from "./agent-bus.ts";
 import { LineError, type ChatKey, type Line } from "./line.ts";
 
 export type RemoteBoxConfig = { kind: "remote-box"; url: string; tokenFile: string; callbackTokenFile: string;
-  publicKeyFile: string; callbackPort: number; epoch: string; boxId: string };
+  publicKeyFile: string; boxRouterPort?: number; macRouterPort?: number; callbackPort: number; epoch: string; boxId: string };
 export function remoteBoxConfig(config: { chatBackends?: unknown }, slug: string): RemoteBoxConfig | undefined {
   const entries = config.chatBackends as Record<string, unknown> | undefined;
   const entry = entries?.[slug] as RemoteBoxConfig | undefined;
   if (entry === undefined || entry.kind === ("robob" as string)) return;
   if (slug !== "moni" || entry.kind !== "remote-box" || !/^http:\/\/127\.0\.0\.1:\d+$/.test(entry.url)
     || ![entry.tokenFile, entry.callbackTokenFile, entry.publicKeyFile].every(p => typeof p === "string" && p.startsWith("/"))
+    || [entry.boxRouterPort, entry.macRouterPort].some(p => p !== undefined && (!Number.isInteger(p) || p < 1024 || p > 65535))
     || !Number.isInteger(entry.callbackPort) || entry.callbackPort < 1024 || entry.callbackPort > 65535
     || !/^[a-zA-Z0-9_-]{1,64}$/.test(entry.epoch) || !/^bx_[a-zA-Z0-9]+$/.test(entry.boxId)) throw new Error("Invalid remote box configuration");
   return entry;

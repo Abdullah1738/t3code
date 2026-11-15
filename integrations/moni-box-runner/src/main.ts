@@ -5,12 +5,13 @@ import { Store } from "../../spectrum-bridge/src/store.ts";
 import { Shares, cloudflaredTunnel, shareRoute } from "../../spectrum-bridge/src/share.ts";
 import { BoxRunner, type RunnerConfig } from "./runner.ts";
 import { claudeHarness } from "./claude.ts";
+import { routerConfig, routerReachable } from "./router-auth.ts";
 
 export function loadRunnerConfig(path: string) {
   const config = JSON.parse(readFileSync(path, "utf8"));
   const secret = (key: string) => readFileSync(config[key], "utf8").trim();
-  return { ...config, token: secret("tokenFile"), callbackToken: secret("callbackTokenFile"),
-    privateKey: secret("privateKeyFile"), system: secret("systemFile") } as RunnerConfig & { port: number; claude: string; model: string; cloudflared: string };
+  return { ...config, ...routerConfig(config), model: config.model ?? "claude-opus-5-5", token: secret("tokenFile"), callbackToken: secret("callbackTokenFile"),
+    privateKey: secret("privateKeyFile"), system: secret("systemFile") } as RunnerConfig & ReturnType<typeof routerConfig> & { port: number; claude: string; model: string; cloudflared: string };
 }
 export async function startShareMaintenance(shares: Pick<Shares, "restore" | "sweep">, log: (code: string) => void,
   schedule: (tick: () => Promise<void>, ms: number) => unknown = (tick, ms) => setInterval(() => void tick(), ms)) {
@@ -23,8 +24,9 @@ if (import.meta.main) {
   const shares = new Shares({ store: new Store(join(config.root, "shares.sqlite")), appsRoot: join(config.root, "apps"), startTunnel: cloudflaredTunnel(config.cloudflared), log: () => {} });
   process.once("exit", () => shares.killAll());
   await startShareMaintenance(shares, code => console.log(JSON.stringify({ code })));
-  const runner = new BoxRunner(config, claudeHarness(config.root, config.claude, config.model), {
+  const runner = new BoxRunner(config, claudeHarness(config.root, config.claude, config.model, config, code => console.log(JSON.stringify({ code }))), {
     log: (code, ms) => console.log(JSON.stringify({ code, ms })),
+    modelReady: () => routerReachable(config),
     share: async (path, body) => { const result = await shareRoute(shares, path, body); if (result.status >= 400) throw new Error("Share failed"); return result.body; },
   });
   const watchers = new BoxWatchers(runner);

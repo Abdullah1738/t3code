@@ -15,6 +15,7 @@ bun_bin=$1
 agent_dir=$HOME/person/agent
 [[ -x $bun_bin && -r $agent_dir/config.json ]] || { echo 'Provide box config and pinned Bun before installing' >&2; exit 1; }
 "$bun_bin" -e 'const fs=require("fs");const c=JSON.parse(fs.readFileSync(process.env.HOME+"/person/agent/config.json","utf8"));for(const k of ["tokenFile","callbackTokenFile","privateKeyFile","systemFile"])fs.accessSync(c[k]);fs.accessSync(c.claude,fs.constants.X_OK)'
+"$bun_bin" "$agent_dir/code/integrations/moni-box-runner/src/router-auth.ts" --check-config "$agent_dir/config.json"
 mkdir -p "$HOME/.config/systemd/user" "$HOME/person/bin"
 cat > "$HOME/.config/systemd/user/moni-box-runner.service" <<UNIT
 [Unit]

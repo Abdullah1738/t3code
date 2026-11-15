@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keep the configured person box and its two loopback tunnels reachable. Never allocate."""
+"""Keep the configured person box and its loopback tunnels reachable. Never allocate."""
 from __future__ import annotations
 
 import json
@@ -9,6 +9,13 @@ import subprocess
 import sys
 import time
 import urllib.request
+
+
+def router_ports(config):
+    ports = (config.get('boxRouterPort', 19465), config.get('macRouterPort', 20128))
+    if any(type(port) is not int or not 1024 <= port <= 65535 for port in ports):
+        raise RuntimeError('invalid_router_port')
+    return ports
 
 
 class Supervisor:
@@ -38,6 +45,7 @@ class Supervisor:
         try:
             self.children = [self.deps.tunnel(box, False)]
             self.children.append(self.deps.tunnel(box, True))
+            self.children.append(self.deps.router_tunnel(box))
             deadline = self.clock() + 20
             while True:
                 if not self.deps.active() or any(p.poll() is not None for p in self.children):
@@ -57,6 +65,7 @@ class Supervisor:
 class OffboxDeps:
     def __init__(self, config, bridge_config, scripts):
         self.config, self.bridge_config = config, Path(bridge_config)
+        router_ports(config)
         # Resolve the same person identity as offbox-person. No pool selection, sync or fallback.
         os.environ['OFFBOX_THREAD'] = 'person:moni'
         os.environ['OFFBOX_BACKEND'] = 'server'
@@ -116,6 +125,11 @@ class OffboxDeps:
         local = self.config['callbackPort'] if reverse else int(self.config['url'].rsplit(':', 1)[1])
         return self.ssh_sync.tunnel(box, remote, local, reverse)
 
+    def router_tunnel(self, box):
+        box_port, mac_port = router_ports(self.config)
+        # SSH runs on the Mac; -R binds only the box loopback and targets only this Mac loopback port.
+        return self.ssh_sync.tunnel(box, box_port, mac_port, True)
+
     def post(self, base, token_file, path, body):
         token = Path(token_file).read_text().strip()
         req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
@@ -126,7 +140,7 @@ class OffboxDeps:
     def both_ready(self):
         self.lease.touch(self.config["boxId"])
         self.lease.ensure_ttl(self.config["boxId"], 1800)
-        # /lease checks callback readiness too; it cannot enable the watch loop through a one-way tunnel.
+        # /lease checks the box-to-router HTTP round trip and callback before granting the runner a lease.
         result = self.post(self.config['url'], self.config['tokenFile'], '/lease',
                            {'epoch': self.config['epoch'], 'boxId': self.config['boxId']})
         if result.get('boxId') != self.config['boxId'] or result.get('epoch') != self.config['epoch']:

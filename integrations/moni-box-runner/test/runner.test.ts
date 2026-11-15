@@ -35,15 +35,17 @@ test("fake harness replies are durably queued and callback payloads stay on the 
   expect(inputs).toEqual(["input"]); expect(s.calls.find(c => c.path.endsWith("/send"))?.body.text).toBe("reply");
   expect(s.runner.db.query<{ state: string }, []>("SELECT state FROM inbox").get()!.state).toBe("done");
 });
-test("Claude CLI uses the box home, direct provider environment and explicit resume id", async () => {
+test("Claude CLI uses the box home, router helper environment and explicit resume id", async () => {
   const s = setup({ run: async () => "" }); mkdirSync(join(s.root, "work"));
   const fake = join(s.root, "fake-claude");
   writeFileSync(fake, `#!/bin/sh\nprintf '%s\\n' "$@" > args.txt\ncat > input.txt\nprintf '%s' "$CLAUDE_CONFIG_DIR|$ANTHROPIC_BASE_URL" > env.txt\nprintf '{"result":"answer"}'\n`, { mode: 0o700 });
-  const harness = claudeHarness(s.root, fake, "claude-opus-5-5");
+  const routerKeyFile = join(s.root, "router-key"); writeFileSync(routerKeyFile, "test-router-key", { mode: 0o600 });
+  const harness = claudeHarness(s.root, fake, "claude-opus-5-5", { routerKeyFile });
   await harness.run({ id: opaqueId("x"), session: "session", resume: true, text: "prompt", system: "system" });
   expect(readFileSync(join(s.root, "work/args.txt"), "utf8")).toContain("--resume\nsession");
   expect(readFileSync(join(s.root, "work/input.txt"), "utf8")).toBe("prompt");
-  expect(readFileSync(join(s.root, "work/env.txt"), "utf8")).toBe(`${s.root}/claude|`);
+  const [configDir, base] = readFileSync(join(s.root, "work/env.txt"), "utf8").split("|");
+  expect(configDir).toBe(`${s.root}/claude`); expect(base).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
 });
 
 test("attachment preparation can retry without repeating a harness; swipe context includes raw handles", async () => {

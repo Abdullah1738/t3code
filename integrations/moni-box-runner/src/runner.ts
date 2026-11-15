@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { jsonBody, object, opaqueId, tokenMatches, unseal, validId, type Fetch, type Sealed } from "../../spectrum-bridge/src/remote-protocol.ts";
 
-export type Harness = { run(input: { id: string; session: string; resume: boolean; text: string; system: string; signal?: AbortSignal }): Promise<string> };
+export type Harness = { ready?(): boolean; run(input: { id: string; session: string; resume: boolean; text: string; system: string; signal?: AbortSignal }): Promise<string> };
 export type RunnerConfig = { root: string; boxId: string; epoch: string; token: string; privateKey: string;
   callbackToken: string; callbackUrl: string; system: string };
 class AttachmentFailure extends Error {
@@ -21,6 +21,7 @@ export class BoxRunner {
   constructor(readonly config: RunnerConfig, private readonly harness: Harness, private readonly io: {
     fetch?: Fetch; now?: () => number; log?: (code: string, ms?: number) => void;
     callbackReady?: () => Promise<boolean>;
+    modelReady?: () => Promise<boolean>;
     share?: (path: string, body: Record<string, unknown>) => Promise<unknown>;
   } = {}) {
     mkdirSync(config.root, { recursive: true, mode: 0o700 });
@@ -37,6 +38,12 @@ export class BoxRunner {
   now() { return (this.io.now ?? Date.now)(); }
   active() { return this.now() < this.leaseUntil; }
   pause() { this.leaseUntil = 0; this.turnAbort?.abort(); }
+  private async modelReady() {
+    let ready = false;
+    try { ready = !this.io.modelReady || await this.io.modelReady(); } catch { /* Remain paused on a failed readiness check. */ }
+    if (!ready) this.pause();
+    return ready;
+  }
   enqueue(id: string, payload: unknown): boolean {
     if (!validId(id)) throw new Error("Invalid event id");
     return this.db.query("INSERT OR IGNORE INTO inbox(id,payload,state) VALUES (?,?,'pending')").run(id, JSON.stringify(payload)).changes === 1;
@@ -88,6 +95,7 @@ export class BoxRunner {
       await this.flush();
       const row = this.db.query<{ id: string; payload: string; state: string }, []>("SELECT * FROM inbox WHERE state NOT IN ('done','attachment-failed') ORDER BY seq LIMIT 1").get();
       if (!row || row.state !== "pending") return;
+      if (this.harness.ready && !this.harness.ready()) return;
       const input = JSON.parse(row.payload);
       let text: string;
       try { text = await this.prepare(input); }
@@ -104,7 +112,8 @@ export class BoxRunner {
         } else this.io.log?.("attachment-error");
         return;
       }
-      if (!this.active()) return;
+      if (!this.active() || !await this.modelReady() || !this.active()) return;
+      if (this.harness.ready && !this.harness.ready()) return;
       this.db.query("UPDATE inbox SET state='running' WHERE id=?").run(row.id);
       const session = this.db.query<{ value: string }, []>("SELECT value FROM settings WHERE key='session'").get()!.value;
       const resume = !!this.db.query("SELECT 1 FROM settings WHERE key='started'").get();
@@ -169,13 +178,15 @@ export class BoxRunner {
       const body = await jsonBody(request); const path = new URL(request.url).pathname;
       if (path === "/lease") {
         if (body.epoch !== this.config.epoch || body.boxId !== this.config.boxId) return reply(409, { error: "Identity mismatch" });
-        const ready = this.io.callbackReady ? await this.io.callbackReady() : await (async () => {
+        if (!await this.modelReady()) return reply(503, { error: "Router unavailable" });
+        let ready = false;
+        try { ready = this.io.callbackReady ? await this.io.callbackReady() : await (async () => {
           const response = await (this.io.fetch ?? fetch)(this.config.callbackUrl + "/ready", { method: "POST", redirect: "error",
             headers: { authorization: `Bearer ${this.config.callbackToken}`, "content-type": "application/json" },
             body: JSON.stringify({ epoch: this.config.epoch }), signal: AbortSignal.timeout(5_000) });
           const ack = await jsonBody(response as unknown as Request); return response.ok && ack.epoch === this.config.epoch;
-        })();
-        if (!ready) return reply(503, { error: "Callback unavailable" });
+        })(); } catch { /* A failed callback check cannot renew the previous lease. */ }
+        if (!ready) { this.pause(); return reply(503, { error: "Callback unavailable" }); }
         this.leaseUntil = this.now() + 20_000;
         return reply(200, { boxId: this.config.boxId, epoch: this.config.epoch });
       }
