@@ -160,15 +160,16 @@ export class ControlClient {
   /**
    * @param {{ since: string | number, until?: string | number, cursor?: string,
    *   limit?: number | string, boardId?: string }} filters
+   * @param {{ timeoutMs?: number, signal?: AbortSignal }} [options]
    * @returns {Promise<{ items: unknown[], nextCursor: string | null }>}
    */
-  usage(filters) {
+  usage(filters, options = {}) {
     const query = new URLSearchParams();
     for (const [key, value] of Object.entries(filters)) {
       if (value !== undefined && value !== null) query.set(key, String(value));
     }
     const suffix = query.size > 0 ? `?${query}` : "";
-    return this.request("GET", `/usage${suffix}`);
+    return this.request("GET", `/usage${suffix}`, undefined, options);
   }
 
   /**
@@ -185,6 +186,18 @@ export class ControlClient {
     }
     const suffix = query.size > 0 ? `?${query}` : "";
     return this.request("GET", `/threads${suffix}`);
+  }
+
+  /**
+   * User messages across all threads, ordered by updated time then message id.
+   * @param {{ since: string | number, cursor?: string, limit?: number }} filters
+   */
+  listUserMessages(filters) {
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries(filters)) {
+      if (value !== undefined && value !== null) query.set(key, String(value));
+    }
+    return this.request("GET", `/messages?${query}`);
   }
 
   /**

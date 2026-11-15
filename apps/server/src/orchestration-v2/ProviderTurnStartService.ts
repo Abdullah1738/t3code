@@ -40,6 +40,8 @@ import * as ServerSettings from "../serverSettings.ts";
 // ardud: the restart note checks OpenCode children before it says they were cancelled.
 import { restartNoteText } from "../ardud/opencode-import/ChildSessions.ts";
 import { CodexHistoryNotSentError } from "../ardud/harness-migrate/CodexHistoryDeliveryError.ts";
+import * as KanbanStore from "../ardud/kanban/store/KanbanStore.ts";
+import { ownerReplyDiscussion, ownerReplyPending } from "../ardud/kanban/engine/ownerReplyWake.ts";
 // ardud: unconfirmed native history must not be replaced by a lossy handoff.
 import { isClaudeSeeded, seededUnconfirmed } from "../ardud/harness-migrate/seededGuard.ts";
 import { makeIsManagedWorktreePath } from "../worktreesDirectory.ts";
@@ -150,6 +152,7 @@ export const layer: Layer.Layer<
     const providerSessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
     const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
     const runtimePolicy = yield* RuntimePolicy.RuntimePolicyV2;
+    const kanban = yield* Effect.serviceOption(KanbanStore.KanbanStore);
     const isManagedWorktreePath = yield* makeIsManagedWorktreePath;
 
     const loadRunCancelMetadata = Effect.fn("ProviderTurnStartService.loadRunCancelMetadata")(
@@ -631,6 +634,35 @@ export const layer: Layer.Layer<
           }).pipe(Effect.uninterruptible);
         },
       );
+      const ownerDiscussion = Option.isSome(kanban)
+        ? yield* ownerReplyDiscussion(kanban.value, run.userMessageId, message.text).pipe(
+            Effect.mapError((cause) => new ProviderTurnStartError({ runId, cause })),
+          )
+        : null;
+      if (
+        run.userMessageId.startsWith("kanban:wake:owner:") &&
+        Option.isSome(kanban) &&
+        (ownerDiscussion === null ||
+          (yield* ownerReplyPending(kanban.value, ownerDiscussion, run.threadId).pipe(
+            Effect.mapError((cause) => new ProviderTurnStartError({ runId, cause })),
+          )) === null)
+      ) {
+        yield* settleRunBeforeStart({
+          signal: "stale-owner-reply",
+          status: "completed",
+          now: yield* DateTime.now,
+          providerInstanceId: run.providerInstanceId,
+          itemProviderThreadId: providerThread.id,
+          item: {
+            type: "command_execution",
+            title: "Owner reply already handled",
+            input: "",
+            output: "",
+            exitCode: 0,
+          },
+        });
+        return;
+      }
       if (
         isAutomaticClaudeRecovery(providerThread.driver, run) &&
         providerThread.nativeMetadata?.claudeRefusalObserved === true

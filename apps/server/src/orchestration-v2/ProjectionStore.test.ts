@@ -5437,11 +5437,10 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       const recoveryPlan = yield* sql.unsafe<{ readonly detail: string }>(
         `EXPLAIN QUERY PLAN ${recoveryStatement}`,
       );
-      assert.include(
-        recoveryPlan.map((row) => row.detail).join("\n"),
-        "orchestration_v2_projection_nodes_live_idx",
-      );
-      assert.notMatch(recoveryPlan.map((row) => row.detail).join("\n"), /ardud_|SCAN cold/);
+      const recoveryDetails = recoveryPlan.map((row) => row.detail).join("\n");
+      assert.include(recoveryDetails, "orchestration_v2_projection_nodes_live_idx");
+      assert.include(recoveryDetails, "orchestration_v2_projection_subagents_provider_thread_idx");
+      assert.notMatch(recoveryDetails, /ardud_|SCAN cold/, recoveryDetails);
       assert.include(recoveryThreadIds, runningThreadId);
       assert.include(recoveryThreadIds, orphanedThreadId);
       assert.include(recoveryThreadIds, memberThreadId);
@@ -5458,7 +5457,7 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
         `EXPLAIN QUERY PLAN ${pendingStatement}`,
       );
       const pendingDetails = pendingPlan.map((row) => row.detail).join("\n");
-      assert.notMatch(pendingDetails, /ardud_|SCAN cold/);
+      assert.notMatch(pendingDetails, /ardud_|SCAN cold/, pendingDetails);
       assert.include(pendingDetails, "orchestration_v2_projection_turn_items_shell_pending_idx");
       const memberRecovery = yield* projectionStore.getRuntimeRecoveryProjection(memberThreadId);
       const childRecovery = yield* projectionStore.getRuntimeRecoveryProjection(childThreadId);
@@ -7345,6 +7344,13 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
         sourceMessages,
         (yield* projectionStore.getThreadProjection(sourceThreadId)).messages,
       );
+      const sourceAfterRollback = yield* projectionStore.getThreadProjection(sourceThreadId);
+      const sourceForward = yield* projectionStore.getTimelinePage(sourceThreadId, {
+        view: "activity",
+        limit: 1,
+      });
+      assert.deepEqual(sourceForward.items, sourceAfterRollback.visibleTurnItems.slice(0, 1));
+      assert.equal(sourceForward.totalItems, sourceAfterRollback.visibleTurnItems.length);
       const targetAfterRollback = yield* projectionStore.getThreadProjection(targetThreadId);
       const shellSnapshot = yield* projectionStore.getShellSnapshot();
       for (const shell of [

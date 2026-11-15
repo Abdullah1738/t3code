@@ -20,6 +20,7 @@ import {
   visibleThreadPullRequests,
 } from "@t3tools/shared/threadPullRequests";
 import * as Cause from "effect/Cause";
+import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
@@ -30,6 +31,8 @@ import * as RepositoryIdentityResolver from "../../../project/RepositoryIdentity
 import * as PullRequestReviewGuideService from "../../../pullRequest/PullRequestReviewGuideService.ts";
 import { pullRequestSyncKey } from "../../../pullRequest/pullRequestSyncKey.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
+import * as McpDeadline from "../../McpDeadline.ts";
+import * as McpCall from "../../../ardud/analytics/McpCall.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import {
   type ListThreadPullRequestsResult,
@@ -42,6 +45,7 @@ import {
   PullRequestNotOpenError,
   type PullRequestTargetInput,
   PullRequestWatchFailedError,
+  PullRequestWatchTimeoutError,
   PullRequestWatchFromSubagentError,
   PullRequestThreadNotFoundError,
   PullRequestThreadRequiredError,
@@ -57,6 +61,30 @@ interface ResolvedTarget {
   readonly number: number;
   readonly url: string;
 }
+
+class WatchChangeState extends Context.Service<
+  WatchChangeState,
+  { saved: boolean | "unknown"; phase: string | undefined }
+>()("t3/mcp/toolkits/pullRequests/handlers/WatchChangeState") {}
+
+const watchDeadline = Effect.fn("PullRequestsToolkit.watchDeadline")(function* <A, E, R>(
+  operation: Effect.Effect<A, E, R>,
+) {
+  const state = WatchChangeState.of({ saved: false, phase: undefined });
+  return yield* operation.pipe(
+    Effect.provideService(WatchChangeState, state),
+    // A masked SQLite commit can outlive cancellation; never join its cleanup before replying.
+    McpDeadline.awaitInterruptibly,
+    Effect.timeoutOrElse({
+      duration: McpDeadline.OPERATION_TIMEOUT,
+      orElse: () =>
+        (state.phase === undefined ? Effect.void : McpCall.failedPhase(state.phase)).pipe(
+          Effect.andThen(state.saved === "unknown" ? Effect.void : McpCall.setSaved(state.saved)),
+          Effect.andThen(Effect.fail(new PullRequestWatchTimeoutError({ saved: state.saved }))),
+        ),
+    }),
+  );
+});
 
 function projectHostAndProvider(project: OrchestrationProjectShell | undefined): {
   readonly host: string | null;
@@ -269,6 +297,8 @@ const make = Effect.gen(function* () {
     input: PullRequestTargetInput,
     watching: boolean,
   ) {
+    const state = yield* WatchChangeState;
+    state.phase = "handler";
     const thread = yield* requireThread(PullRequestWatchFailedError, input.threadId);
     const project = yield* projectOf(thread, PullRequestWatchFailedError);
     const target = yield* resolveTarget(input, project);
@@ -283,10 +313,22 @@ const make = Effect.gen(function* () {
     if (watching && before?.snapshot?.state === "merged") {
       return yield* new PullRequestNotOpenError({ state: "merged" });
     }
+    const wasWatching = before?.watch !== undefined;
+    if (watching === wasWatching) {
+      return {
+        ...target,
+        watching,
+        wasWatching,
+        ...(watching ? { alreadyWatching: true } : { alreadyUnwatched: true }),
+      };
+    }
+    const id = yield* commandId("mcp-pr-watch", thread.id);
+    state.phase = "dispatch";
+    state.saved = "unknown";
     yield* engine
       .dispatch({
         type: "thread.pull-request.watch",
-        commandId: yield* commandId("mcp-pr-watch", thread.id),
+        commandId: id,
         threadId: thread.id,
         host: target.host,
         repository: target.repository,
@@ -295,6 +337,8 @@ const make = Effect.gen(function* () {
         ...(watching ? { link: { url: target.url, source: "agent" as const } } : {}),
       })
       .pipe(Effect.catchCause(dispatchFailure(PullRequestWatchFailedError)));
+    state.saved = true;
+    state.phase = "result";
     const after = yield* requireThread(PullRequestWatchFailedError, thread.id);
     return {
       host: target.host,
@@ -302,7 +346,7 @@ const make = Effect.gen(function* () {
       number: target.number,
       url: target.url,
       watching: watchedLink(after)?.watch !== undefined,
-      wasWatching: before?.watch !== undefined,
+      wasWatching,
     };
   });
 
@@ -422,8 +466,14 @@ const make = Effect.gen(function* () {
         Effect.map(listThreadPullRequests),
       ),
     ),
-    watch_pull_request: writesThread((input) => setWatching(input, true)),
-    unwatch_pull_request: writesThread((input) => setWatching(input, false)),
+    watch_pull_request: McpToolAccess.bound(
+      writesThread((input) => setWatching(input, true)),
+      watchDeadline,
+    ),
+    unwatch_pull_request: McpToolAccess.bound(
+      writesThread((input) => setWatching(input, false)),
+      watchDeadline,
+    ),
     write_pull_request_guides: McpToolAccess.writesWithCapability((input) =>
       Effect.gen(function* () {
         const located = yield* locateAll(input.pullRequests);

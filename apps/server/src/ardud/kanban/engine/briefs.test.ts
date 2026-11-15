@@ -87,9 +87,16 @@ describe("board briefs", () => {
     );
   });
 
-  it("tells workers to watch PR CI and end the turn, and wait inside it for other work", () => {
+  it("asks for a quick re-record after a gate clears, conditional on the same head", () => {
+    const head = "d37243cdc055a1cb81d8deccefa943af6527f8e1";
+    expect(reviewBrief(board, card, null, null, [], false, head)).toContain(
+      `Your earlier verdict at ${head} was refused by a gate that is now gone: re-check quickly and record it again if the head is unchanged.`,
+    );
+    expect(reviewBrief(board, card, null, null, [])).not.toContain("was refused by a gate");
+  });
+  it("tells workers to watch PR CI and end the turn, and set card waits for other work", () => {
     expect(nudgeWorkText([card])).toContain(
-      "Waiting on CI for a PR: call watch_pull_request on it and end your turn; the board waits while the watch is on and the watch wakes you. For a deploy or anything else, wait inside your turn.",
+      "Waiting on CI for a PR: call watch_pull_request on it and end your turn; the board waits while the watch is on and the watch wakes you. Waiting on something else (a merge, a push, another card, a time): card_wait on it and end your turn.",
     );
   });
 
@@ -98,7 +105,9 @@ describe("board briefs", () => {
     expect(brief).toContain(
       "Waiting on CI for an open or draft PR: call watch_pull_request on it and end your turn; the watch wakes you on CI and review changes, and the board waits for up to 6 hours since your last run while the watch is on.",
     );
-    expect(brief).toContain("For a deploy or anything else, wait inside your turn.");
+    expect(brief).toContain(
+      "Waiting on something else (a merge, a push, another card, a time): card_wait on it and end your turn.",
+    );
     expect(brief).not.toContain("Never end a turn while a card of yours is in Working");
     expect(brief).not.toContain("Wait for CI or a deploy inside the turn");
     expect(brief).not.toContain("Each time you stop with a card in Working you are nudged");
@@ -297,5 +306,7 @@ it("nightly review requires complete reads, a fresh cursor and recovery from fai
   ]) {
     expect(brief).toContain(text);
   }
-  expect(brief.indexOf("Complete the read pass")).toBeLessThan(brief.indexOf("1. Information gaps"));
+  expect(brief.indexOf("Complete the read pass")).toBeLessThan(
+    brief.indexOf("1. Information gaps"),
+  );
 });

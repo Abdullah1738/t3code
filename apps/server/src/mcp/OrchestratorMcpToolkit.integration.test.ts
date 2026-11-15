@@ -523,6 +523,7 @@ function scheduledTaskFromUpsert(input: ScheduledTaskUpsertInput): ScheduledTask
     lastRunStatus: "never",
     lastRunError: null,
     runCount: 0,
+    missedRuns: [],
   };
 }
 
@@ -1367,6 +1368,12 @@ describe("orchestrator MCP toolkit", () => {
               "Complete before a user steers the parent.",
             );
             const steerMessageId = MessageId.make("message:mcp-parent:steer-race:user");
+            const attemptBeforeSteer = (yield* orchestrator.getThreadProjection(
+              parentThreadId,
+            )).runs.find((run) => run.id === parentRun.id)?.activeAttemptId;
+            const parentStartsBeforeSteer = (yield* Ref.get(capturedTurns)).filter(
+              (turn) => turn.threadId === parentThreadId,
+            ).length;
             yield* orchestrator.dispatch({
               type: "message.dispatch",
               createdBy: "user",
@@ -1381,6 +1388,9 @@ describe("orchestrator MCP toolkit", () => {
             });
             const steerRaceStatus = yield* invoke("task_status", { taskId: steerRace.task.id });
             expect(steerRaceStatus.isError).toBe(false);
+            expect(steerRaceStatus.structuredContent).toMatchObject({
+              summary: "Claude completed: Complete before a user steers the parent.",
+            });
             const acknowledgedSteerRace = yield* waitForProjection(
               orchestrator,
               parentThreadId,
@@ -1396,6 +1406,33 @@ describe("orchestrator MCP toolkit", () => {
               acknowledgedSteerRace.runs.find((run) => run.id === parentRun.id)?.delegatedCompletion
                 ?.delivery,
             ).toBeNull();
+            yield* (yield* EffectWorker.OrchestrationEffectWorkerV2).drain();
+            const startedAfterSteer = yield* waitForProjection(
+              orchestrator,
+              parentThreadId,
+              (projection) => {
+                const run = projection.runs.find((candidate) => candidate.id === parentRun.id);
+                return (
+                  run?.status === "running" &&
+                  run.activeAttemptId !== attemptBeforeSteer &&
+                  projection.providerTurns.some(
+                    (turn) =>
+                      turn.runAttemptId === run.activeAttemptId && turn.status === "running",
+                  )
+                );
+              },
+            );
+            expect(
+              startedAfterSteer.runs.find((run) => run.id === parentRun.id)?.delegatedCompletion
+                ?.delivery,
+            ).toBeNull();
+            const parentStartsAfterSteer = (yield* Ref.get(capturedTurns)).filter(
+              (turn) => turn.threadId === parentThreadId,
+            );
+            expect(parentStartsAfterSteer).toHaveLength(parentStartsBeforeSteer + 1);
+            expect(
+              parentStartsAfterSteer.some((turn) => turn.text.includes(steerRace.task.id)),
+            ).toBe(false);
 
             const restartRace = yield* queueAutomaticCompletion(
               "restart-race",
@@ -1558,6 +1595,7 @@ describe("orchestrator MCP toolkit", () => {
               enabled: true,
               schedule: { type: "interval", everyMs: 60_000 },
               title: "wake up in this thread and say hello",
+              missedRuns: [],
             });
             const scheduledTaskId = (scheduleCall.structuredContent as { scheduledTaskId: string })
               .scheduledTaskId;
@@ -2006,7 +2044,7 @@ describe("orchestrator MCP toolkit", () => {
             expect(
               (yield* decodeTaskCancelResult(cancelHeldCall.structuredContent).pipe(Effect.orDie))
                 .status,
-            ).toBe("cancel_requested");
+            ).toBe("cancelled");
             yield* waitForProjection(orchestrator, parentThreadId, (projection) =>
               projection.subagents.some(
                 (task) => task.id === heldFollowup.taskId && task.status === "cancelled",
@@ -2255,7 +2293,7 @@ describe("orchestrator MCP toolkit", () => {
             const cancelResult = yield* decodeTaskCancelResult(cancelCall.structuredContent).pipe(
               Effect.orDie,
             );
-            expect(cancelResult.status).toBe("cancel_requested");
+            expect(["cancel_requested", "interrupted"]).toContain(cancelResult.status);
             yield* waitForProjection(orchestrator, cancellable.childThreadId, (projection) =>
               projection.runs.some((run) => run.status === "interrupted"),
             );

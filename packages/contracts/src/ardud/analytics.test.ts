@@ -131,6 +131,10 @@ const usage = {
 it("requires the metadata-only usage schema and preserves null measurements", () => {
   const decodeUsage = Schema.decodeUnknownSync(RunUsageEvent, { onExcessProperty: "error" });
   expect(decodeUsage(usage)).toEqual(usage);
+  expect(Object.hasOwn(decodeUsage(usage), "cancelReason")).toBe(false);
+  const cancelled = { ...usage, endReason: "cancelled", cancelReason: "server_shutdown" };
+  expect(decodeUsage(cancelled)).toEqual(cancelled);
+  expect(() => decodeUsage({ ...cancelled, cancelReason: "unclassified" })).toThrow();
   for (const key of ["prompt", "message", "text", "toolArgs", "toolOutput", "output"]) {
     expect(() => decodeUsage({ ...usage, [key]: "private" })).toThrow();
   }
@@ -189,3 +193,25 @@ it.each([
 ])("accepts provider-owned model identifiers: %s", (model) => {
   expect(Schema.decodeUnknownSync(RunUsageEvent)({ ...usage, model }).model).toBe(model);
 });
+
+it.each(["started", "reused", "merged", "queued_spawn_cap"] as const)(
+  "#1490 accepts evaluator outcome %s and bounded attribution labels",
+  (outcome) => {
+    const row = {
+      ...event,
+      kind: "kanban.evaluator",
+      surface: "server",
+      boardId: "board-offbox",
+      purposeKind: "request",
+      trigger: "report_bug",
+      outcome,
+      reuseMissReason: "no_card_reuse_scope",
+    };
+    expect(decodeEvent(row)).toEqual(row);
+    expect(
+      decodeRead({ day: "2026-11-14", boardId: "board-offbox", kind: row.kind, outcome }),
+    ).toMatchObject({ outcome });
+    for (const field of ["purposeKind", "trigger", "reuseMissReason"])
+      expect(() => decodeEvent({ ...row, [field]: "private words" })).toThrow();
+  },
+);

@@ -87,29 +87,30 @@ t3ctl's.
 
 All paths are under `/api/ardud/control`.
 
-| Method | Path                                                     | What it does                                                                                                                                                                                                                 |
-| ------ | -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| GET    | `/health`                                                | Token check plus the latest event sequence.                                                                                                                                                                                  |
-| GET    | `/projects`                                              | Registered projects (`projectId`, `title`, `workspaceRoot`, `scratch`).                                                                                                                                                      |
-| GET    | `/models`                                                | Default model and runtime mode, plus each provider's models, option descriptors and variants.                                                                                                                                |
-| GET    | `/usage`                                                 | Usage records in a time range, with optional board filter and cursor pagination.                                                                                                                                             |
-| GET    | `/threads`                                               | List threads (see filters below).                                                                                                                                                                                            |
-| POST   | `/threads`                                               | Create a thread, optionally with a first prompt.                                                                                                                                                                             |
-| GET    | `/threads/by-native/:sesId?driver=`                      | Thread for a native session id; `driver` qualifies it. `view=owner` returns `id`, `threadId`, `title`, `projectId`, `state`, `status`, `archived`, `deleted` (including deleted owners), without history; omit for full detail. Unknown/ambiguous ids return 404.                                                                                                                                       |
-| GET    | `/identity/resolve?nativeId=&driver=&instance=&agentId=` | Any native id (OpenCode, Claude child by `agentId`, Codex child) to its exact Robob execution. `t3ctl identity`.                                                                                                             |
-| GET    | `/recovery/snapshot?active=true\|false&cursor=&limit=`   | Read-only per-thread recovery view: current run and attempt, runtime `present`/`absent`/`unknown` (peek only, never loads or touches a session), held work, pending requests, children. Pages by thread id; `limit` max 500. |
-| GET    | `/threads/:id`                                           | Detail: state, current run, recent runs, pending requests.                                                                                                                                                                   |
-| PATCH  | `/threads/:id`                                           | Change `runtimeMode`, `interactionMode`, model selection, `title`, `archived`, `settled`.                                                                                                                                    |
-| POST   | `/threads/:id/archive-if-idle`                           | Archive only if the thread is still idle; otherwise refuse and leave it alone.                                                                                                                                               |
-| GET    | `/threads/:id/messages`                                  | Messages plus `lastAssistant`.                                                                                                                                                                                               |
-| GET    | `/threads/:id/wait`                                      | Long-poll until not running (or needs input).                                                                                                                                                                                |
-| POST   | `/threads/:id/send`                                      | Send a message.                                                                                                                                                                                                              |
-| POST   | `/threads/:id/interrupt`                                 | Stop the active turn; optional `expectedRunId` and `expectedAttemptId` reject a mismatch with 409.                                                                                                                           |
-| POST   | `/threads/:id/requests/:requestId/respond`               | Answer an approval or a question.                                                                                                                                                                                            |
-| PUT    | `/threads/:id/origin`                                    | Set or clear the origin.                                                                                                                                                                                                     |
-| GET    | `/requests`                                              | Every pending approval and question across active threads.                                                                                                                                                                   |
-| POST   | `/attachments`                                           | Get a signed upload URL for a file to attach.                                                                                                                                                                                |
-| GET    | `/events`                                                | Server-sent events (SSE).                                                                                                                                                                                                    |
+| Method | Path                                                     | What it does                                                                                                                                                                                                                                                      |
+| ------ | -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| GET    | `/health`                                                | Token check plus the latest event sequence.                                                                                                                                                                                                                       |
+| GET    | `/projects`                                              | Registered projects (`projectId`, `title`, `workspaceRoot`, `scratch`).                                                                                                                                                                                           |
+| GET    | `/models`                                                | Default model and runtime mode, plus each provider's models, option descriptors and variants.                                                                                                                                                                     |
+| GET    | `/messages?since=<ISO or epoch ms>&cursor=&limit=`       | User messages across all non-deleted threads, including archived threads; default 200, maximum 1000 per page.                                                                                                                                                     |
+| GET    | `/usage`                                                 | Usage records in a time range, with optional board filter and cursor pagination.                                                                                                                                                                                  |
+| GET    | `/threads`                                               | List threads (see filters below).                                                                                                                                                                                                                                 |
+| POST   | `/threads`                                               | Create a thread, optionally with a first prompt.                                                                                                                                                                                                                  |
+| GET    | `/threads/by-native/:sesId?driver=`                      | Thread for a native session id; `driver` qualifies it. `view=owner` returns `id`, `threadId`, `title`, `projectId`, `state`, `status`, `archived`, `deleted` (including deleted owners), without history; omit for full detail. Unknown/ambiguous ids return 404. |
+| GET    | `/identity/resolve?nativeId=&driver=&instance=&agentId=` | Any native id (OpenCode, Claude child by `agentId`, Codex child) to its exact Robob execution. `t3ctl identity`.                                                                                                                                                  |
+| GET    | `/recovery/snapshot?active=true\|false&cursor=&limit=`   | Read-only per-thread recovery view: current run and attempt, runtime `present`/`absent`/`unknown` (peek only, never loads or touches a session), held work, pending requests, children. Pages by thread id; `limit` max 500.                                      |
+| GET    | `/threads/:id`                                           | Detail: state, current run, recent runs, pending requests.                                                                                                                                                                                                        |
+| PATCH  | `/threads/:id`                                           | Change `runtimeMode`, `interactionMode`, model selection, `title`, `archived`, `settled`.                                                                                                                                                                         |
+| POST   | `/threads/:id/archive-if-idle`                           | Archive only if the thread is still idle; otherwise refuse and leave it alone.                                                                                                                                                                                    |
+| GET    | `/threads/:id/messages`                                  | Messages plus `lastAssistant`.                                                                                                                                                                                                                                    |
+| GET    | `/threads/:id/wait`                                      | Long-poll until not running (or needs input).                                                                                                                                                                                                                     |
+| POST   | `/threads/:id/send`                                      | Send a message.                                                                                                                                                                                                                                                   |
+| POST   | `/threads/:id/interrupt`                                 | Stop the active turn; optional `expectedRunId` and `expectedAttemptId` reject a mismatch with 409.                                                                                                                                                                |
+| POST   | `/threads/:id/requests/:requestId/respond`               | Answer an approval or a question.                                                                                                                                                                                                                                 |
+| PUT    | `/threads/:id/origin`                                    | Set or clear the origin.                                                                                                                                                                                                                                          |
+| GET    | `/requests`                                              | Every pending approval and question across active threads.                                                                                                                                                                                                        |
+| POST   | `/attachments`                                           | Get a signed upload URL for a file to attach.                                                                                                                                                                                                                     |
+| GET    | `/events`                                                | Server-sent events (SSE).                                                                                                                                                                                                                                         |
 
 `expectedAttemptId` requires `expectedRunId`. An expected run that is already terminal
 returns `already_terminal` without interrupting. Run and attempt checks happen before
@@ -123,8 +124,8 @@ previous page with the same filters). The window is at most 72 hours; `until`
 defaults to the time of the first request and stays fixed across its pages.
 `limit` defaults to 1,000 and is capped at 5,000. Returns
 `{ ok: true, items: [...], nextCursor: string | null }`;
-`null` means there are no more pages. `client.usage({ since, until, boardId, limit, cursor })`
-fetches one page.
+`null` means there are no more pages. `client.usage({ since, until, boardId, limit, cursor }, { timeoutMs })`
+fetches one page with an optional request deadline (default 30 seconds).
 
 Items contain `threadId`, `rootThreadId`, `parentThreadId`, `boardId`, `cardId`,
 `workspace`, `providerInstanceId`, `driver`, `model`, `effort`, `startedAt`,
@@ -141,9 +142,13 @@ Pages are live reads, not a snapshot. A running turn may complete or move in the
 ordering while paging; consumers should periodically re-read overlapping windows
 and must not treat a partially paged result as a complete accounting snapshot.
 
-`t3ctl usage --since ISO|MS [--until ISO|MS] [--board ID] [--limit N] [--all-pages]`
+`t3ctl usage --since ISO|MS [--until ISO|MS] [--board ID] [--limit N] [--all-pages] [--cursor CURSOR] [--timeout-ms MS]`
 prints one JSON page by default. `--all-pages` follows every cursor and prints one
-JSON object with all `items` and `nextCursor: null`.
+JSON object with all `items` and `nextCursor: null`, using 1,000 rows per page unless
+`--limit` is given. `--timeout-ms` overrides the per-page deadline, including
+`--request-timeout`. On failure, stderr names the page, cursor and number of items
+read; stdout remains empty. Resume with `--cursor` and the same window and board
+filters. A resumed result contains only the remaining rows.
 
 ### GET /threads
 
@@ -312,7 +317,7 @@ Filters: `threadId`, `origin` (or `none`), `types=a,b`.
 | `thread.updated`                      | `change`: archived, settled, renamed, runtime mode or model changed, ...                  |
 
 A turn is finished when `thread.status` arrives with `state` `waiting` or
-`idle`. Read the reply from `message.completed` or `/messages`.
+`idle`. Read the reply from `message.completed` or `/threads/:id/messages`.
 
 ### POST /attachments
 
@@ -322,6 +327,34 @@ A turn is finished when `thread.status` arrives with `state` `waiting` or
 (no auth; the URL is signed). Then pass
 `{ attachmentId, name, mimeType, sizeBytes, type }` in `attachments` on create
 or send. `client.upload({ name, mimeType, bytes })` does all of this.
+
+## Cross-thread user messages
+
+`GET /messages` requires `since` (ISO timestamp or epoch milliseconds) and
+`orchestration:read`. It returns messages with `role=user` and `updatedAt > since`,
+ordered by updated time ascending, then message id in SQLite binary order.
+Every row reuses the per-thread message summary, including `createdBy`,
+`creationSource`, `automated` and `inboundMessageId` (always present, possibly null),
+plus `threadId`, `threadTitle` and `threadArchived`.
+
+The response is `{ ok: true, total, messages, nextCursor }`. Pass the opaque
+`nextCursor` with the same `since` until it is null. `total` counts the whole
+window, ignoring the cursor; it remains constant while the underlying data is
+unchanged. Pages are live reads, not a snapshot: edits during paging can move a
+message later in the order, so callers can deduplicate by `messageId`.
+
+This read uses only persisted projections. It does not hydrate imported OpenCode
+transcripts per thread; those historical transcripts are outside recent polling
+windows. Use `/threads/:threadId/messages` when imported history is needed.
+
+```js
+let cursor;
+do {
+  const page = await client.listUserMessages({ since, cursor, limit: 1000 });
+  for (const message of page.messages) consume(message);
+  cursor = page.nextCursor;
+} while (cursor);
+```
 
 ## Client and CLI
 

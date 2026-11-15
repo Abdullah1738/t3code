@@ -492,6 +492,7 @@ const handlers = {
     withCaller((service, caller) =>
       Effect.gen(function* () {
         const board = yield* boardFor(service, caller, input.boardId, true);
+        const releaseBoards = yield* service.boards;
         const limit = Math.min(
           input.limit ?? BoardReplies.BOARD_PAGE_LIMIT,
           BoardReplies.BOARD_PAGE_MAX,
@@ -513,7 +514,7 @@ const handlers = {
             board: {
               id: board.id,
               name: board.name,
-              ...BoardReplies.boardReleaseSummary(board, at),
+              ...BoardReplies.boardReleaseSummary(board, at, releaseBoards),
               window,
               legend: Activity.COMPACT_LEGEND,
               activeCards: rows.length,
@@ -536,6 +537,7 @@ const handlers = {
               { ...snapshot, cards },
               undefined,
               DateTime.formatIso(yield* DateTime.now),
+              releaseBoards,
             ),
             page: { limit, hasMore, nextAfter: hasMore ? cards.at(-1)!.number : null },
           },
@@ -929,7 +931,14 @@ const handlers = {
           caller.actor,
         );
         return WAITS_ENGINE_WIRED
-          ? { card: waiting }
+          ? {
+              card: waiting,
+              ...(caller.actor._tag === "thread" &&
+              waiting.activeThreadId === caller.actor.threadId &&
+              waiting.activeRole === "work"
+                ? { note: "Wait set; it starts when your turn ends. End your turn now." }
+                : {}),
+            }
           : {
               card: waiting,
               note: "Saved and shown on the board. The board does not end waits by itself yet: keep your own check until it does.",
@@ -1271,6 +1280,7 @@ const handlers = {
             input.note ?? null,
             caller.actor,
             role,
+            input.releasedAt,
           ),
         };
       }),

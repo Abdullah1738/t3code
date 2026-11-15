@@ -2363,3 +2363,50 @@ it.effect.each([
     if (kind === "urgency") assert.equal(actual[0], blocker.id);
   }).pipe(Effect.provide(TestLayer)),
 );
+
+it.effect("#1569 owner choices use their answer time, and a later evaluator clears them", () =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const talk = discussion(1569);
+    const evaluator = ThreadId.make("eval-1569");
+    const other = ThreadId.make("other-eval-1569");
+    const question: KanbanMessage = {
+      discussionId: talk.id,
+      seq: 1,
+      author: { _tag: "evaluator", threadId: evaluator },
+      authorName: "Evaluator",
+      blocks: [{ _tag: "md", text: "Ship?" }],
+      answers: [],
+      createdAt: at,
+    };
+    yield* store.putDiscussion(talk);
+    yield* store.putMessage(question);
+    assert.isNull(yield* store.ownerReply(talk.id, evaluator, true));
+    const answerAt = "2026-10-25T14:00:00.000Z";
+    yield* store.putMessage({
+      ...question,
+      answers: [{ blockId: "q1", by: { _tag: "owner" }, choice: ["o1"], text: null, at: answerAt }],
+    });
+    const action = yield* store.ownerReply(talk.id, evaluator, true);
+    assert.deepStrictEqual(action, {
+      key: `1:q1:${answerAt}`,
+      createdAt: answerAt,
+      answered: false,
+    });
+    yield* store.putMessage({
+      ...question,
+      seq: 2,
+      author: { _tag: "evaluator", threadId: other },
+      createdAt: answerAt,
+    });
+    assert.strictEqual((yield* store.ownerReply(talk.id, evaluator, true))?.answered, true);
+    assert.strictEqual((yield* store.ownerReply(talk.id, evaluator, false))?.answered, false);
+    yield* store.putMessage({
+      ...question,
+      seq: 3,
+      author: { _tag: "owner" },
+      createdAt: "2026-10-25T15:00:00.000Z",
+    });
+    assert.strictEqual((yield* store.ownerReply(talk.id, evaluator, true))?.answered, false);
+  }).pipe(Effect.provide(TestLayer)),
+);

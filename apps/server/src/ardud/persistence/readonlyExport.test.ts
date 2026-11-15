@@ -6,7 +6,11 @@ import * as NodeSqlite from "node:sqlite";
 import * as NodeWorkerThreads from "node:worker_threads";
 import * as NodeChildProcess from "node:child_process";
 import { afterEach, expect, test, vi } from "vite-plus/test";
-import { createReadonlyReplica } from "./readonlyExport.ts";
+import {
+  createReadonlyReplica,
+  type ReadonlyExportDiagnosticEvent,
+  type ReadonlyRebuildEvent,
+} from "./readonlyExport.ts";
 import { resolveHistoryBasePath } from "./historySourceFiles.ts";
 
 const cleanups: Array<() => void> = [];
@@ -46,8 +50,16 @@ function fixture(batchSize = 2, setup?: (source: NodeSqlite.DatabaseSync) => voi
     if (source.isOpen) source.close();
   });
   setup?.(source);
+  const diagnostics: ReadonlyExportDiagnosticEvent[] = [];
+  const rebuilds: ReadonlyRebuildEvent[] = [];
   const options = { sourcePath, replicaPath, batchSize };
-  let exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, options);
+  const open = () =>
+    createReadonlyReplica(NodeSqlite, NodeFS, NodePath, {
+      ...options,
+      onDiagnosticEvent: (event) => diagnostics.push(event),
+      onRebuildEvent: (event) => rebuilds.push(event),
+    });
+  let exporter = open();
   cleanups.push(() => exporter.close());
   const connect = () => {
     const db = new NodeSqlite.DatabaseSync(replicaPath, { readOnly: true });
@@ -64,6 +76,8 @@ function fixture(batchSize = 2, setup?: (source: NodeSqlite.DatabaseSync) => voi
   return {
     source,
     options,
+    diagnostics,
+    rebuilds,
     connect,
     finish,
     get exporter() {
@@ -71,10 +85,184 @@ function fixture(batchSize = 2, setup?: (source: NodeSqlite.DatabaseSync) => voi
     },
     restart() {
       exporter.close();
-      exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, options);
+      exporter = open();
     },
   };
 }
+
+test.each(["gap", "empty_page"])(
+  "an unexplained %s preserves the published generation throughout reset",
+  (reason) => {
+    let now = Date.parse("2026-11-15T09:47:40Z");
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const f = fixture(1);
+    f.finish();
+    const out = f.connect();
+    const generation = metaValue(out, "generation");
+    const watermark = metaValue(out, "updated_at");
+    f.rebuilds.length = 0;
+    f.source
+      .exec(`UPDATE orchestration_v2_projection_threads SET payload_json='{"title":"after"}' WHERE thread_id='a';
+    INSERT INTO orchestration_events VALUES (2,'thread.metadata-updated','a','{}'),(3,'thread.metadata-updated','a','{}');
+    DELETE FROM orchestration_events WHERE sequence=2`);
+    if (reason === "empty_page") {
+      f.source.exec(
+        "INSERT INTO orchestration_events VALUES (2,'thread.metadata-updated','a','{}')",
+      );
+      f.exporter.step();
+      f.source.exec("DELETE FROM orchestration_events WHERE sequence>1");
+    }
+    for (let step = 0; ; step++) {
+      expect(metaValue(out, "ready")).toBe("1");
+      expect(metaValue(out, "generation")).toBe(generation);
+      expect(metaValue(out, "updated_at")).toBe(watermark);
+      expect(
+        out
+          .prepare(
+            "SELECT payload_json FROM orchestration_v2_projection_threads WHERE thread_id='a'",
+          )
+          .get()?.payload_json,
+      ).toBe('{"title":"old"}');
+      now += 30_000;
+      if (!f.exporter.step()) break;
+      if (f.rebuilds.length) {
+        const sidecar = JSON.parse(
+          NodeFS.readFileSync(f.options.replicaPath + ".rebuild.json", "utf8"),
+        );
+        expect(sidecar.rebuild_started_at).toBe(metaValue(out, "rebuild_started_at"));
+        const progress = JSON.parse(sidecar.rebuild_progress);
+        expect(progress.kind).toBe("events_reset");
+        expect(
+          now - Date.parse(sidecar.rebuild_started_at) - progress.elapsedMs,
+        ).toBeLessThanOrEqual(30_000);
+      }
+      if (step > 100) throw new Error("reset did not converge");
+    }
+    expect(metaValue(out, "ready")).toBe("1");
+    expect(Number(metaValue(out, "generation"))).toBe(Number(generation) + 1);
+    expect(metaValue(out, "sequence")).toBe(reason === "gap" ? "3" : "1");
+    expect(f.rebuilds[0]).toMatchObject({
+      event: "start",
+      kind: "events_reset",
+      reason,
+      cursor: 1,
+      cycleTarget: 3,
+      firstMissingSequence: 2,
+      rowsReturned: reason === "gap" ? 1 : 0,
+    });
+    expect(f.rebuilds.some((event) => event.event === "progress")).toBe(true);
+    const sidecar = JSON.parse(
+      NodeFS.readFileSync(f.options.replicaPath + ".rebuild.json", "utf8"),
+    );
+    expect(JSON.parse(sidecar.rebuild_progress)).toMatchObject({
+      event: "publish",
+      kind: "events_reset",
+    });
+    const phases = f.exporter.takeMetrics().phaseSteps;
+    expect(phases.resetDelete).toBeGreaterThan(0);
+    expect(phases.resetScan).toBeGreaterThan(0);
+  },
+);
+
+test("closing an events reset rolls back every partial page", () => {
+  const f = fixture(1);
+  f.finish();
+  const out = f.connect();
+  const generation = metaValue(out, "generation");
+  f.source.exec(`INSERT INTO orchestration_events VALUES (3,'thread.metadata-updated','a','{}');
+    UPDATE orchestration_v2_projection_threads SET payload_json='{"title":"after"}' WHERE thread_id='a'`);
+  for (let i = 0; i < 4; i++) f.exporter.step();
+  f.exporter.close();
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(metaValue(out, "generation")).toBe(generation);
+  expect(
+    out
+      .prepare("SELECT payload_json FROM orchestration_v2_projection_threads WHERE thread_id='a'")
+      .get()?.payload_json,
+  ).toBe('{"title":"old"}');
+  f.restart();
+  f.finish();
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(metaValue(out, "sequence")).toBe("3");
+});
+
+test("a journalled prefix cannot hide a later unexplained hole", () => {
+  const f = fixture(2, (source) =>
+    source.exec(`CREATE TABLE ardud_history_compacted_events (
+    revision INTEGER PRIMARY KEY AUTOINCREMENT, sequence INTEGER NOT NULL UNIQUE)`),
+  );
+  f.finish();
+  f.rebuilds.length = 0;
+  f.source
+    .exec(`INSERT INTO orchestration_events VALUES (4,'thread.metadata-updated','a','{}'),(5,'thread.metadata-updated','a','{}');
+    INSERT INTO ardud_history_compacted_events(sequence) VALUES (2)`);
+  const out = f.connect();
+  for (let i = 0; f.exporter.step(); i++) {
+    expect(metaValue(out, "ready")).toBe("1");
+    if (i > 100) throw new Error("reset did not converge");
+  }
+  expect(f.rebuilds[0]).toMatchObject({ reason: "gap", cursor: 1, firstMissingSequence: 3 });
+  expect(metaValue(out, "sequence")).toBe("5");
+});
+
+test("journalled compaction between target selection and page read needs no reset", () => {
+  const f = fixture(2, (source) =>
+    source.exec(`CREATE TABLE ardud_history_compacted_events (
+    revision INTEGER PRIMARY KEY AUTOINCREMENT, sequence INTEGER NOT NULL UNIQUE)`),
+  );
+  f.finish();
+  const out = f.connect();
+  f.rebuilds.length = 0;
+  f.source
+    .exec(`INSERT INTO orchestration_events VALUES (2,'thread.metadata-updated','a','{}'),(3,'thread.metadata-updated','a','{}');
+    UPDATE orchestration_v2_projection_threads SET payload_json='{"title":"after"}' WHERE thread_id='a'`);
+  f.exporter.step();
+  f.source.exec(`BEGIN; INSERT INTO ardud_history_compacted_events(sequence) VALUES (2);
+    DELETE FROM orchestration_events WHERE sequence=2; COMMIT`);
+  for (let step = 0; f.exporter.step(); step++) {
+    expect(metaValue(out, "ready")).toBe("1");
+    if (step > 100) throw new Error("catchup did not converge");
+  }
+  expect(metaValue(out, "sequence")).toBe("3");
+  expect(f.rebuilds).toEqual([]);
+  expect(
+    out.prepare("SELECT sequence FROM orchestration_events WHERE sequence=2").get(),
+  ).toBeUndefined();
+  expect(
+    out
+      .prepare("SELECT payload_json FROM orchestration_v2_projection_threads WHERE thread_id='a'")
+      .get()?.payload_json,
+  ).toBe('{"title":"after"}');
+});
+
+test("compaction journal revisions remove already exported events even in reverse sequence order", () => {
+  const f = fixture(2);
+  f.source.exec(
+    `INSERT INTO orchestration_events VALUES (2,'thread.metadata-updated','a','{}'),(3,'thread.metadata-updated','a','{}')`,
+  );
+  f.finish();
+  const out = f.connect();
+  f.source
+    .exec(`CREATE TABLE ardud_history_compacted_events (revision INTEGER PRIMARY KEY AUTOINCREMENT, sequence INTEGER NOT NULL UNIQUE);
+    INSERT INTO ardud_history_compacted_events(sequence) VALUES (3);
+    DELETE FROM orchestration_events WHERE sequence=3`);
+  f.finish();
+  expect(metaValue(out, "sequence")).toBe("3");
+  expect(
+    out
+      .prepare(
+        "SELECT sequence FROM orchestration_events WHERE sequence=3 AND event_type!='readonly.watermark'",
+      )
+      .get(),
+  ).toBeUndefined();
+  f.source.exec(`INSERT INTO ardud_history_compacted_events(sequence) VALUES (2);
+    DELETE FROM orchestration_events WHERE sequence=2`);
+  f.finish();
+  expect(
+    out.prepare("SELECT sequence FROM orchestration_events WHERE sequence=2").get(),
+  ).toBeUndefined();
+  expect(f.rebuilds.some((event) => event.kind === "events_reset")).toBe(false);
+});
 
 test("bootstrap is paged, resumable and never blocks the writer", () => {
   const f = fixture();
@@ -226,24 +414,25 @@ test("routine refresh cycles keep ready=1 and only advance updated_at at cycle e
   expect(metaValue(out, "updated_at")).toBe("2026-11-06T10:00:30.000Z");
 });
 
-test("a compacted event gap clears readiness until the reset and rebuild finish", () => {
+test("an unexplained event gap retains readiness across reset and worker restart", () => {
   const f = fixture();
   f.finish();
   const out = f.connect();
   const published = metaValue(out, "updated_at");
   const revision = Number(metaValue(out, "lineage_repair_revision"));
+  const resetting = metaValue(out, "resetting_events");
   f.source.exec("INSERT INTO orchestration_events VALUES (4,'thread.deleted','a','{}')");
   expect(f.exporter.step()).toBe(true);
-  expect(metaValue(out, "ready")).toBe("0");
-  expect(metaValue(out, "resetting_events")).toBe("1");
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(metaValue(out, "resetting_events")).toBe(resetting);
   expect(metaValue(out, "updated_at")).toBe(published);
-  expect(Number(metaValue(out, "lineage_repair_revision"))).toBe(revision + 1);
-  // A worker restart in the middle of the reset must not republish it.
+  expect(Number(metaValue(out, "lineage_repair_revision"))).toBe(revision);
+  // Restart discards the private pages; the completed generation stays readable.
   f.restart();
-  expect(metaValue(out, "ready")).toBe("0");
+  expect(metaValue(out, "ready")).toBe("1");
   let steps = 0;
   while (f.exporter.step()) {
-    expect(metaValue(out, "ready")).toBe("0");
+    expect(metaValue(out, "ready")).toBe("1");
     if (++steps > 500) throw new Error("export did not converge");
   }
   expect(metaValue(out, "ready")).toBe("1");
@@ -283,6 +472,114 @@ const auxiliaryTables = [
   { name: "ardud_kanban_cards", key: "id", row: "'task','a','{}'" },
   { name: "ardud_kanban_threads", key: "thread_id", row: "'task',0" },
 ];
+
+for (const phase of ["delete", "copy", "prune"] as const) {
+  for (const terminal of ["publish", "close"] as const) {
+    for (const gap of ["single", "nested"] as const) {
+      test.each(auxiliaryTables)(
+        `$name auxiliary changes during reset ${phase} preserve the old generation until ${terminal} (${gap})`,
+        ({ name, row }) => {
+          let now = Date.parse("2026-11-15T09:47:40Z");
+          vi.spyOn(Date, "now").mockImplementation(() => now);
+          const f = fixture(1);
+          const advance = () => {
+            now += 1_000;
+            return f.exporter.step();
+          };
+          f.source.exec(`INSERT INTO ${name} VALUES (${row});
+          INSERT INTO orchestration_events VALUES
+          (2,'thread.metadata-updated','a','{}'),(3,'thread.metadata-updated','a','{}'),
+          (4,'thread.metadata-updated','a','{}'),(5,'thread.metadata-updated','a','{}'),
+          (6,'thread.metadata-updated','a','{}')`);
+          f.finish();
+          const out = f.connect();
+          let generation = metaValue(out, "generation");
+          const watermark = metaValue(out, "updated_at");
+          const revision = metaValue(out, "lineage_repair_revision");
+          const events = out.prepare("SELECT * FROM orchestration_events ORDER BY sequence").all();
+          const schema = out.prepare("SELECT sql FROM sqlite_schema WHERE name=?").get(name)?.sql;
+          const checkPublished = () => {
+            expect(metaValue(out, "ready")).toBe("1");
+            expect(metaValue(out, "generation")).toBe(generation);
+            expect(metaValue(out, "updated_at")).toBe(watermark);
+            expect(metaValue(out, "lineage_repair_revision")).toBe(revision);
+            expect(
+              out.prepare("SELECT * FROM orchestration_events ORDER BY sequence").all(),
+            ).toEqual(events);
+            expect(out.prepare("SELECT sql FROM sqlite_schema WHERE name=?").get(name)?.sql).toBe(
+              schema,
+            );
+          };
+          f.exporter.takeMetrics();
+          f.source.exec(
+            "INSERT INTO orchestration_events VALUES (8,'thread.metadata-updated','a','{}')",
+          );
+          let scans = 0;
+          for (let step = 0; ; step++) {
+            expect(advance()).toBe(true);
+            const metrics = f.exporter.takeMetrics();
+            scans += metrics.phaseSteps.resetScan ?? 0;
+            if (
+              (phase === "delete" && metrics.phaseSteps.resetDelete) ||
+              (phase === "copy" && scans >= 1) ||
+              (phase === "prune" && scans >= 5)
+            )
+              break;
+            if (step > 100) throw new Error("reset phase was not reached");
+          }
+          checkPublished();
+          const started = metaValue(out, "rebuild_started_at");
+          f.source.exec(`ALTER TABLE ${name} ADD COLUMN cache_version INTEGER NOT NULL DEFAULT 7`);
+          expect(advance()).toBe(true);
+          checkPublished();
+          expect(
+            f.rebuilds.filter((event) => event.kind === "events_reset" && event.event === "start"),
+          ).toHaveLength(1);
+          if (gap === "nested") {
+            f.source.exec(
+              "INSERT INTO orchestration_events VALUES (10,'thread.metadata-updated','a','{}')",
+            );
+            for (let step = 0; ; step++) {
+              expect(advance()).toBe(true);
+              checkPublished();
+              const starts = f.rebuilds.filter(
+                (event) => event.kind === "events_reset" && event.event === "start",
+              );
+              if (starts.length === 2) {
+                expect(starts.map((event) => event.firstMissingSequence)).toEqual([7, 9]);
+                expect(metaValue(out, "rebuild_started_at")).toBe(started);
+                const sidecar = JSON.parse(
+                  NodeFS.readFileSync(f.options.replicaPath + ".rebuild.json", "utf8"),
+                );
+                expect(sidecar.rebuild_started_at).toBe(metaValue(out, "rebuild_started_at"));
+                break;
+              }
+              if (step > 500) throw new Error("nested gap was not reached");
+            }
+          }
+          if (terminal === "close") {
+            f.exporter.close();
+            checkPublished();
+            f.restart();
+            generation = metaValue(out, "generation");
+          }
+          for (let step = 0; advance(); step++) {
+            checkPublished();
+            if (step > 500) throw new Error("schema refresh reset did not converge");
+          }
+          expect(metaValue(out, "ready")).toBe("1");
+          expect(metaValue(out, "sequence")).toBe(gap === "nested" ? "10" : "8");
+          expect(Number(metaValue(out, "lineage_repair_revision"))).toBe(
+            Number(revision) + (gap === "nested" && terminal === "publish" ? 2 : 1),
+          );
+          expect(out.prepare(`SELECT cache_version FROM ${name}`).all()).toEqual([
+            { cache_version: 7 },
+          ]);
+        },
+      );
+    }
+  }
+}
 
 for (const mode of ["reopen", "staging", "catchup"] as const) {
   test.each(auxiliaryTables)(
@@ -398,12 +695,12 @@ test.each(["bootstrap", "reset"])(
       );
     expect(f.exporter.step()).toBe(true);
     const out = f.connect();
-    expect(metaValue(out, "ready")).toBe("0");
+    expect(metaValue(out, "ready")).toBe(mode === "reset" ? "1" : "0");
     // Pending schemas must also survive reopening an incomplete publication.
     f.restart();
     let steps = 0;
     while (f.exporter.step()) {
-      expect(metaValue(out, "ready")).toBe("0");
+      expect(metaValue(out, "ready")).toBe(mode === "reset" ? "1" : "0");
       if (++steps > 500) throw new Error("export did not converge");
     }
     expect(metaValue(out, "ready")).toBe("1");
@@ -833,7 +1130,7 @@ test("small table deletions and a compacted event gap converge without publishin
   f.exporter.step();
   expect(
     f.connect().prepare("SELECT value FROM ardud_readonly_meta WHERE key='ready'").get()?.value,
-  ).toBe("0");
+  ).toBe("1");
   f.finish();
   const out = f.connect();
   expect(out.prepare("SELECT count(*) AS n FROM scheduled_tasks").get()?.n).toBe(0);
@@ -945,7 +1242,7 @@ test("archive journal removes an old item but cannot erase its later update", ()
   ).toBe("2");
 });
 
-test("catchup merges archived events by sequence and keeps newer live duplicates", () => {
+test("archive movement after target selection keeps the contiguous prefix and live duplicates", () => {
   const f = fixture();
   f.finish();
   f.exporter.close();
@@ -954,21 +1251,29 @@ test("catchup merges archived events by sequence and keeps newer live duplicates
   cleanups.push(() => cold.close());
   cold.exec(`PRAGMA journal_mode=WAL; CREATE TABLE ardud_identity(identity TEXT PRIMARY KEY); INSERT INTO ardud_identity VALUES ('test');
     CREATE TABLE ardud_events(sequence INTEGER PRIMARY KEY,event_type TEXT,stream_id TEXT,payload_json TEXT);
-    INSERT INTO ardud_events VALUES (2,'thread.metadata-updated','a','{"id":"a","cold":true}');
     INSERT INTO ardud_events VALUES (3,'thread.metadata-updated','a','{"id":"a","cold":true}');`);
   f.source
     .exec(`CREATE TABLE ardud_history_archive_identity(identity TEXT PRIMARY KEY); INSERT INTO ardud_history_archive_identity VALUES ('test');
-    INSERT INTO orchestration_events VALUES (3,'thread.metadata-updated','a','{"id":"a","live":true}');
+    INSERT INTO orchestration_events VALUES (2,'thread.metadata-updated','a','{"id":"a","cold":true}'),(3,'thread.metadata-updated','a','{"id":"a","live":true}');
     UPDATE orchestration_v2_projection_threads SET payload_json='{"title":"new"}' WHERE thread_id='a'`);
+  f.rebuilds.length = 0;
   const exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, {
     ...f.options,
     archivePath,
+    onRebuildEvent: (event) => f.rebuilds.push(event),
   });
   cleanups.push(() => exporter.close());
+  exporter.step();
+  cold.exec(
+    "INSERT INTO ardud_events VALUES (2,'thread.metadata-updated','a','{\"id\":\"a\",\"cold\":true}')",
+  );
+  f.source.exec("DELETE FROM orchestration_events WHERE sequence=2");
+  const out = f.connect();
   for (let i = 0; exporter.step(); i++) {
+    expect(metaValue(out, "ready")).toBe("1");
     if (i > 500) throw Error("no converge");
   }
-  const out = f.connect();
+  expect(f.rebuilds).toEqual([]);
   expect(
     out.prepare("SELECT payload_json FROM orchestration_events WHERE sequence=3").get()
       ?.payload_json,
@@ -2677,7 +2982,18 @@ test.each([60_000, 60_001])(
     // Empty idle polls must not lose the completed scan high-water either.
     now += 1_000;
     expect(f.exporter.pollIdentities()).toBe(false);
+    const rebuildProgress = metaValue(out, "rebuild_progress");
+    f.diagnostics.length = 0;
     f.restart();
+    expect(f.diagnostics).toEqual([
+      {
+        event: "open",
+        sequence: events + 1,
+        identitySequence: events + 1,
+        sourceSequence: events + 1,
+      },
+    ]);
+    expect(metaValue(out, "rebuild_progress")).toBe(rebuildProgress);
     f.source
       .exec(`UPDATE orchestration_v2_projection_provider_threads SET payload_json='{"nativeThreadRef":{"nativeId":"after-restart"}}' WHERE provider_thread_id='binding';
       INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES ('provider-thread.updated','a','{"id":"binding"}');`);
@@ -2691,8 +3007,28 @@ test.each([60_000, 60_001])(
     ).toContain('"after-restart"');
     expect(metaValue(out, "sequence")).toBe(String(events + 1));
     expect(metaValue(out, "identity_sequence")).toBe(String(events + 2));
+    expect(f.diagnostics).toContainEqual({ event: "replay", replayEvents: 1, replayMs: 0 });
+    now += 1_000;
+    f.exporter.pollIdentities();
+    expect(f.diagnostics.filter(({ event }) => event === "replay")).toHaveLength(1);
   },
 );
+
+test("an idle restart reports an empty replay once without changing rebuild diagnostics", () => {
+  const f = fixture();
+  f.finish();
+  const out = f.connect();
+  const rebuildProgress = metaValue(out, "rebuild_progress");
+  f.diagnostics.length = 0;
+  f.restart();
+  expect(f.exporter.pollIdentities()).toBe(false);
+  expect(f.exporter.pollIdentities()).toBe(false);
+  expect(f.diagnostics).toEqual([
+    { event: "open", sequence: 1, identitySequence: 1, sourceSequence: 1 },
+    { event: "replay", replayEvents: 0, replayMs: expect.any(Number) },
+  ]);
+  expect(metaValue(out, "rebuild_progress")).toBe(rebuildProgress);
+});
 
 test("an abandoned cycle retains the committed identity cursor and replays a pending binding on restart", () => {
   const f = fixture(2);
@@ -2721,8 +3057,18 @@ test("an abandoned cycle retains the committed identity cursor and replays a pen
   f.exporter.pollIdentities();
   expect(metaValue(out, "identity_sequence")).toBe(cursor);
   expect(metaValue(out, "sequence")).toBe("1");
+  f.diagnostics.length = 0;
   f.restart();
-  for (let page = 0; page < 22; page++) f.exporter.pollIdentities();
+  expect(f.diagnostics).toEqual([
+    { event: "open", sequence: 1, identitySequence: Number(cursor), sourceSequence: 42 },
+  ]);
+  for (let page = 0; page < 22; page++) {
+    now += 10;
+    f.exporter.pollIdentities();
+    if (page < 20) expect(f.diagnostics).toHaveLength(1);
+  }
+  expect(f.diagnostics).toContainEqual({ event: "replay", replayEvents: 41, replayMs: 210 });
+  expect(f.diagnostics.filter(({ event }) => event === "replay")).toHaveLength(1);
   expect(
     out
       .prepare(
@@ -2927,12 +3273,26 @@ test.each([
   f.source.exec(
     `DROP TABLE orchestration_v2_projection_run_attempts; CREATE TABLE orchestration_v2_projection_run_attempts (${definition})`,
   );
-  const events: Array<{ kind: string; event: string }> = [];
+  f.source.exec(
+    "INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES ('thread.metadata-updated','a','{}')",
+  );
+  f.diagnostics.length = 0;
+  const events: ReadonlyRebuildEvent[] = [];
   const exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, {
     ...f.options,
-    onRebuildEvent: (event) => events.push(event),
+    onDiagnosticEvent: (event) => f.diagnostics.push(event),
+    onRebuildEvent: (event) => {
+      events.push(event);
+      if (event.event === "publish") {
+        expect(event.sequence).toBe(Number(metaValue(out, "sequence")));
+        expect(event.identitySequence).toBe(Number(metaValue(out, "identity_sequence")));
+      }
+    },
   });
   cleanups.push(() => exporter.close());
+  expect(f.diagnostics).toEqual([
+    { event: "open", sequence: 1, identitySequence: 1, sourceSequence: 2 },
+  ]);
   drive(exporter);
   expect(events.map(({ kind, event }) => [kind, event])).toEqual([
     ["full", "start"],
@@ -2940,6 +3300,7 @@ test.each([
   ]);
   expect(metaValue(out, "ready")).toBe("1");
   expect(Number(metaValue(out, "generation"))).toBe(generation + 1);
+  expect(events.at(-1)).toMatchObject({ sequence: 2, identitySequence: 2 });
 });
 
 test("a column backfill resumes after a worker restart without changing generation", () => {
@@ -2966,7 +3327,7 @@ test("a column backfill resumes after a worker restart without changing generati
   ).toEqual([{ extra: "a" }, { extra: "b" }]);
 });
 
-test("compaction during a full rebuild cannot publish a partial reset", () => {
+test("repeated gaps during a full schema rebuild cannot publish a partial reset", () => {
   const f = fixture(1);
   f.finish();
   f.exporter.close();
@@ -2977,13 +3338,63 @@ test("compaction during a full rebuild cannot publish a partial reset", () => {
   const exporter = openExporter(f);
   exporter.step();
   f.source.exec("INSERT INTO orchestration_events VALUES (3,'thread.metadata-updated','a','{}')");
+  let gaps = 0;
+  const stepMetrics = exporter.takeMetrics.bind(exporter);
   for (let i = 0; exporter.step(); i++) {
     expect(metaValue(out, "ready")).toBe("1");
+    if (stepMetrics().phaseSteps.resetDelete && gaps++ === 0)
+      f.source.exec(
+        "INSERT INTO orchestration_events VALUES (5,'thread.metadata-updated','a','{}')",
+      );
     if (i > 500) throw new Error("export did not converge");
   }
   expect(metaValue(out, "ready")).toBe("1");
-  expect(metaValue(out, "sequence")).toBe("3");
+  expect(metaValue(out, "sequence")).toBe("5");
 });
+
+test.each(["published", "full", "bootstrap"])(
+  "nested gaps during %s report the original published readiness",
+  (mode) => {
+    const f = fixture(1);
+    if (mode !== "bootstrap") f.finish();
+    let exporter = f.exporter;
+    if (mode === "full") {
+      f.exporter.close();
+      f.source.exec(
+        "ALTER TABLE orchestration_v2_projection_run_attempts RENAME COLUMN payload_json TO owner_payload_json",
+      );
+      exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, {
+        ...f.options,
+        onRebuildEvent: (event) => f.rebuilds.push(event),
+      });
+      cleanups.push(() => exporter.close());
+    }
+    f.rebuilds.length = 0;
+    exporter.step();
+    f.source.exec("INSERT INTO orchestration_events VALUES (3,'thread.metadata-updated','a','{}')");
+    let addedGap = false;
+    const out = f.connect();
+    for (let step = 0; exporter.step(); step++) {
+      expect(metaValue(out, "ready")).toBe(mode === "bootstrap" ? "0" : "1");
+      if (!addedGap && f.rebuilds.some((event) => event.kind === "events_reset")) {
+        f.source.exec(
+          "INSERT INTO orchestration_events VALUES (5,'thread.metadata-updated','a','{}')",
+        );
+        addedGap = true;
+      }
+      if (step > 500) throw new Error("nested resets did not converge");
+    }
+    const starts = f.rebuilds.filter(
+      (event) => event.kind === "events_reset" && event.event === "start",
+    );
+    expect(starts).toHaveLength(2);
+    expect(starts.map((event) => event.firstMissingSequence)).toEqual([2, 4]);
+    expect(starts.map((event) => event.publishedReady)).toEqual(
+      mode === "bootstrap" ? ["0", "0"] : ["1", "1"],
+    );
+    expect(metaValue(out, "ready")).toBe("1");
+  },
+);
 
 test("column backfill cannot publish a run transition without its matching Stop item", () => {
   const f = fixture(1);
@@ -3498,4 +3909,678 @@ test.each([
   exporter.close();
   drive(openExporter(f));
   expect(metaValue(out, "ready")).toBe("1");
+});
+
+const identityVersionTables = [
+  ["orchestration_v2_projection_threads", "thread_id", "threads"],
+  ["orchestration_v2_projection_provider_threads", "provider_thread_id", "providers"],
+  ["orchestration_v2_projection_provider_turns", "provider_turn_id", "turns"],
+  ["orchestration_v2_projection_subagents", "subagent_id", "subagents"],
+  ["ardud_opencode_import", "native_session_id", "imports"],
+] as const;
+
+function identityVersionFixture(batchSize = 100) {
+  return fixture(batchSize, (source) => {
+    for (const [name, primary] of identityVersionTables) {
+      if (name === "ardud_opencode_import")
+        source.exec(`DROP TABLE ${name}; CREATE TABLE ${name} (
+          native_session_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL UNIQUE,
+          imported_at TEXT NOT NULL, payload_json TEXT DEFAULT '{}'
+        )`);
+      source.exec(`ALTER TABLE ${name} ADD COLUMN identity_scalar TEXT DEFAULT 'before';
+        ALTER TABLE ${name} ADD COLUMN updated_at TEXT DEFAULT '2026-11-14T00:00:00Z';
+        ALTER TABLE ${name} ADD COLUMN deleted_at TEXT`);
+      if (name.endsWith("_provider_turns"))
+        source.exec(`ALTER TABLE ${name} ADD COLUMN thread_id TEXT;
+          ALTER TABLE ${name} ADD COLUMN node_id TEXT`);
+      for (const id of ["version-main", "version-peer"]) {
+        if (name === "ardud_opencode_import")
+          source
+            .prepare(
+              `INSERT INTO ${name}(native_session_id,thread_id,imported_at) VALUES (?,?,'2026-11-14T00:00:00Z')`,
+            )
+            .run(id, `${id}-owner`);
+        else source.prepare(`INSERT INTO ${name}(${primary},payload_json) VALUES (?,'{}')`).run(id);
+      }
+    }
+  });
+}
+
+const identityCensus = (db: NodeSqlite.DatabaseSync) =>
+  db
+    .prepare(
+      "SELECT table_name,row_id,version FROM ardud_readonly_identity_versions ORDER BY table_name,row_id",
+    )
+    .all();
+const identityVersion = (db: NodeSqlite.DatabaseSync, name: string, id = "version-main") =>
+  Number(
+    db
+      .prepare(
+        "SELECT version FROM ardud_readonly_identity_versions WHERE table_name=? AND row_id=?",
+      )
+      .get(name, id)?.version,
+  );
+const identitySequenceValue = (db: NodeSqlite.DatabaseSync) =>
+  Number(
+    db
+      .prepare("SELECT seq FROM sqlite_sequence WHERE name='ardud_readonly_identity_versions'")
+      .get()?.seq ?? 0,
+  );
+function expectIdentityCoverage(db: NodeSqlite.DatabaseSync) {
+  expect(metaValue(db, "identity_versions_schema")).toBe("1");
+  expect(
+    db
+      .prepare(
+        "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='ardud_readonly_identity_versions'",
+      )
+      .get(),
+  ).toBeDefined();
+  expect(
+    db
+      .prepare(
+        "SELECT name FROM sqlite_schema WHERE type='trigger' AND name GLOB 'ardud_identity_*' ORDER BY name",
+      )
+      .all()
+      .map((r) => r.name),
+  ).toEqual(
+    identityVersionTables
+      .flatMap(([, , suffix]) =>
+        ["insert", "update", "delete"].map((action) => `ardud_identity_${suffix}_${action}`),
+      )
+      .sort(),
+  );
+  expect(identityCensus(db).map(({ table_name, row_id }) => ({ table_name, row_id }))).toEqual(
+    identityVersionTables
+      .flatMap(([name, primary]) =>
+        db
+          .prepare(
+            `SELECT '${name}' AS table_name,${primary} AS row_id FROM ${name} ORDER BY ${primary}`,
+          )
+          .all(),
+      )
+      .sort(
+        (a, b) =>
+          String(a.table_name).localeCompare(String(b.table_name)) ||
+          String(a.row_id).localeCompare(String(b.row_id)),
+      ),
+  );
+}
+function emitIdentityEvent(source: NodeSqlite.DatabaseSync, suffix: string, id = "version-main") {
+  const event =
+    suffix === "threads"
+      ? "thread.metadata-updated"
+      : suffix === "providers"
+        ? "provider-thread.updated"
+        : suffix === "turns"
+          ? "provider-turn.updated"
+          : "subagent.updated";
+  source
+    .prepare("INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES (?,?,?)")
+    .run(event, id, JSON.stringify({ id }));
+}
+function writeReplica(f: ReturnType<typeof fixture>, body: (db: NodeSqlite.DatabaseSync) => void) {
+  const db = new NodeSqlite.DatabaseSync(f.options.replicaPath);
+  try {
+    body(db);
+  } finally {
+    db.close();
+  }
+}
+
+test("identity versions: fresh publication covers all five tables, including deleted and unbound rows", () => {
+  const f = identityVersionFixture();
+  f.source.exec(
+    "UPDATE orchestration_v2_projection_threads SET deleted_at='deleted' WHERE thread_id='version-main'",
+  );
+  f.finish();
+  const out = f.connect();
+  expectIdentityCoverage(out);
+  expect(identityCensus(out)).toHaveLength(13);
+  expect(
+    f.source
+      .prepare(
+        "SELECT name FROM sqlite_schema WHERE name LIKE 'ardud_identity_%' OR name='ardud_readonly_identity_versions'",
+      )
+      .all(),
+  ).toEqual([]);
+});
+
+test("identity versions: upgrade backfills existing rows without changing payloads or lineage metadata", () => {
+  const f = identityVersionFixture();
+  f.finish();
+  f.exporter.close();
+  const out = f.connect();
+  const payloads = identityVersionTables.map(([name]) =>
+    out.prepare(`SELECT * FROM ${name}`).all(),
+  );
+  const lineage = out
+    .prepare("SELECT * FROM ardud_readonly_meta WHERE key LIKE 'lineage_%' ORDER BY key")
+    .all();
+  writeReplica(f, (db) => {
+    for (const [, , suffix] of identityVersionTables)
+      for (const action of ["insert", "update", "delete"])
+        db.exec(`DROP TRIGGER ardud_identity_${suffix}_${action}`);
+    db.exec(
+      "DROP TABLE ardud_readonly_identity_versions; DELETE FROM ardud_readonly_meta WHERE key='identity_versions_schema'",
+    );
+  });
+  f.restart();
+  expectIdentityCoverage(out);
+  expect(identityVersionTables.map(([name]) => out.prepare(`SELECT * FROM ${name}`).all())).toEqual(
+    payloads,
+  );
+  expect(
+    out.prepare("SELECT * FROM ardud_readonly_meta WHERE key LIKE 'lineage_%' ORDER BY key").all(),
+  ).toEqual(lineage);
+});
+
+for (const [name, primary, suffix] of identityVersionTables) {
+  test.each(["identity_scalar", "payload_json"])(
+    `identity versions: same-timestamp ${suffix} %s edit changes only its row`,
+    (column) => {
+      const f = identityVersionFixture();
+      f.finish();
+      const out = f.connect();
+      const before = identityCensus(out);
+      const version = identityVersion(out, name);
+      f.source
+        .prepare(`UPDATE ${name} SET ${column}=? WHERE ${primary}='version-main'`)
+        .run(column === "payload_json" ? '{"edited":true}' : "after");
+      if (suffix !== "imports") emitIdentityEvent(f.source, suffix);
+      f.finish();
+      expect(identityVersion(out, name)).toBeGreaterThan(version);
+      expect(
+        identityCensus(out).filter(
+          (row) => row.table_name !== name || row.row_id !== "version-main",
+        ),
+      ).toEqual(before.filter((row) => row.table_name !== name || row.row_id !== "version-main"));
+      expect(
+        out.prepare(`SELECT updated_at FROM ${name} WHERE ${primary}='version-main'`).get()
+          ?.updated_at,
+      ).toBe("2026-11-14T00:00:00Z");
+      expectIdentityCoverage(out);
+    },
+  );
+}
+
+test("identity versions: mutable provider turn owner and node upsert gets a fresh version", () => {
+  const f = identityVersionFixture();
+  f.finish();
+  const out = f.connect();
+  const name = identityVersionTables[2][0];
+  const before = identityVersion(out, name);
+  f.source.exec(
+    `INSERT INTO ${name}(provider_turn_id,thread_id,node_id,payload_json) VALUES ('version-main','new-owner','new-node','{}') ON CONFLICT(provider_turn_id) DO UPDATE SET thread_id=excluded.thread_id,node_id=excluded.node_id`,
+  );
+  emitIdentityEvent(f.source, "turns");
+  f.finish();
+  expect(identityVersion(out, name)).toBeGreaterThan(before);
+  expect(
+    out
+      .prepare(`SELECT thread_id,node_id FROM ${name} WHERE provider_turn_id='version-main'`)
+      .get(),
+  ).toEqual({ thread_id: "new-owner", node_id: "new-node" });
+});
+
+test("identity versions: soft deletes advance and hard deletes reconcile away", () => {
+  const f = identityVersionFixture();
+  f.finish();
+  const out = f.connect();
+  const before = identityVersionTables.map(([name]) => identityVersion(out, name));
+  for (const [name, primary, suffix] of identityVersionTables) {
+    f.source.exec(`UPDATE ${name} SET deleted_at='deleted' WHERE ${primary}='version-main'`);
+    if (suffix !== "imports") emitIdentityEvent(f.source, suffix);
+  }
+  f.finish();
+  identityVersionTables.forEach(([name], i) =>
+    expect(identityVersion(out, name)).toBeGreaterThan(before[i]!),
+  );
+  for (const [name, primary] of identityVersionTables)
+    f.source.exec(`DELETE FROM ${name} WHERE ${primary}='version-main'`);
+  for (let i = 0; i < 8; i++) f.finish();
+  expectIdentityCoverage(out);
+  expect(identityCensus(out).some((row) => row.row_id === "version-main")).toBe(false);
+});
+
+test("identity versions: delete/reinsert and source rowid reuse keep the exact key set", () => {
+  const f = identityVersionFixture();
+  f.finish();
+  const out = f.connect();
+  const name = identityVersionTables[0][0];
+  const before = identityVersion(out, name);
+  const rowid = f.source
+    .prepare(`SELECT rowid FROM ${name} WHERE thread_id='version-main'`)
+    .get()?.rowid;
+  f.source.exec(`DELETE FROM ${name} WHERE thread_id='version-main'`);
+  emitIdentityEvent(f.source, "threads");
+  f.finish();
+  expect(Number.isNaN(identityVersion(out, name))).toBe(true);
+  f.source
+    .prepare(`INSERT INTO ${name}(rowid,thread_id,payload_json) VALUES (?,'version-main','{}')`)
+    .run(rowid!);
+  emitIdentityEvent(f.source, "threads");
+  f.finish();
+  expect(identityVersion(out, name)).toBeGreaterThan(before);
+  f.source.exec(`DELETE FROM ${name} WHERE thread_id='version-main'`);
+  f.source
+    .prepare(`INSERT INTO ${name}(rowid,thread_id,payload_json) VALUES (?,'reused','{}')`)
+    .run(rowid!);
+  emitIdentityEvent(f.source, "threads");
+  emitIdentityEvent(f.source, "threads", "reused");
+  f.finish();
+  expect(Number.isNaN(identityVersion(out, name))).toBe(true);
+  expect(identityVersion(out, name, "reused")).toBeGreaterThan(before);
+  expectIdentityCoverage(out);
+});
+
+test.each(identityVersionTables)(
+  "identity versions: %s primary key updates remove OLD and NEW stale keys",
+  (name, primary) => {
+    const f = identityVersionFixture();
+    f.finish();
+    const out = f.connect();
+    const before = identityVersion(out, name);
+    writeReplica(f, (db) => {
+      db.prepare(
+        "INSERT INTO ardud_readonly_identity_versions(table_name,row_id) VALUES (?,'renamed')",
+      ).run(name);
+      db.exec(`UPDATE ${name} SET ${primary}='renamed' WHERE ${primary}='version-main'`);
+    });
+    expect(Number.isNaN(identityVersion(out, name))).toBe(true);
+    expect(identityVersion(out, name, "renamed")).toBeGreaterThan(before);
+    expectIdentityCoverage(out);
+  },
+);
+
+test("identity versions: auxiliary replacement updates and deletes converge", () => {
+  const f = identityVersionFixture();
+  f.finish();
+  const out = f.connect();
+  const name = identityVersionTables[4][0];
+  const before = identityVersion(out, name);
+  f.source.exec(
+    `UPDATE ${name} SET payload_json='{"new":true}' WHERE native_session_id='version-main'; DELETE FROM ${name} WHERE native_session_id='version-peer'`,
+  );
+  f.finish();
+  expect(identityVersion(out, name)).toBeGreaterThan(before);
+  expect(Number.isNaN(identityVersion(out, name, "version-peer"))).toBe(true);
+  const updated = identityVersion(out, name);
+  f.source.exec(
+    `INSERT OR REPLACE INTO ${name}(native_session_id,thread_id,imported_at) VALUES ('version-main','replacement-owner','2026-11-14T00:00:00Z')`,
+  );
+  f.finish();
+  expect(identityVersion(out, name)).toBeGreaterThan(updated);
+  expectIdentityCoverage(out);
+});
+
+const importReplacements = [
+  {
+    kind: "new session takes an existing owner",
+    mutation:
+      "INSERT OR REPLACE INTO ardud_opencode_import(native_session_id,thread_id,imported_at) VALUES ('replacement','version-main-owner','2026-11-14T00:00:00Z')",
+    expected: [
+      ["replacement", "version-main-owner"],
+      ["version-peer", "version-peer-owner"],
+    ],
+    changed: ["replacement"],
+    removed: ["version-main"],
+  },
+  {
+    kind: "existing session takes another session's owner",
+    mutation:
+      "INSERT OR REPLACE INTO ardud_opencode_import(native_session_id,thread_id,imported_at) VALUES ('version-main','version-peer-owner','2026-11-14T00:00:00Z')",
+    expected: [["version-main", "version-peer-owner"]],
+    changed: ["version-main"],
+    removed: ["version-peer"],
+  },
+  {
+    kind: "existing session changes to an unused owner",
+    mutation:
+      "INSERT OR REPLACE INTO ardud_opencode_import(native_session_id,thread_id,imported_at) VALUES ('version-main','unused-owner','2026-11-14T00:00:00Z')",
+    expected: [
+      ["version-main", "unused-owner"],
+      ["version-peer", "version-peer-owner"],
+    ],
+    changed: ["version-main"],
+    removed: [],
+  },
+  {
+    kind: "existing session keeps its owner and changes payload",
+    mutation: `INSERT OR REPLACE INTO ardud_opencode_import(native_session_id,thread_id,imported_at,payload_json) VALUES ('version-main','version-main-owner','2026-11-14T00:00:00Z','{"replacement":true}')`,
+    expected: [
+      ["version-main", "version-main-owner"],
+      ["version-peer", "version-peer-owner"],
+    ],
+    changed: ["version-main"],
+    removed: [],
+  },
+  {
+    kind: "surviving sessions swap owners",
+    mutation:
+      "INSERT OR REPLACE INTO ardud_opencode_import(native_session_id,thread_id,imported_at) VALUES ('version-main','version-peer-owner','2026-11-14T00:00:00Z'); INSERT OR REPLACE INTO ardud_opencode_import(native_session_id,thread_id,imported_at) VALUES ('version-peer','version-main-owner','2026-11-14T00:00:00Z')",
+    expected: [
+      ["version-main", "version-peer-owner"],
+      ["version-peer", "version-main-owner"],
+    ],
+    changed: ["version-main", "version-peer"],
+    removed: [],
+  },
+  {
+    kind: "new session takes an owner released by a surviving session",
+    mutation:
+      "UPDATE ardud_opencode_import SET thread_id='unused-owner' WHERE native_session_id='version-main'; INSERT INTO ardud_opencode_import(native_session_id,thread_id,imported_at) VALUES ('replacement','version-main-owner','2026-11-14T00:00:00Z')",
+    expected: [
+      ["replacement", "version-main-owner"],
+      ["version-main", "unused-owner"],
+      ["version-peer", "version-peer-owner"],
+    ],
+    changed: ["replacement", "version-main"],
+    removed: [],
+  },
+];
+
+test.each(importReplacements)(
+  "identity versions: import replacement when $kind is atomic",
+  ({ mutation, expected, changed, removed }) => {
+    const f = identityVersionFixture(1);
+    const name = identityVersionTables[4][0];
+    f.source.exec(
+      "INSERT INTO ardud_opencode_import(native_session_id,thread_id,imported_at) VALUES ('stable','stable-owner','2026-11-14T00:00:00Z')",
+    );
+    f.finish();
+    const out = f.connect();
+    const pinned = f.connect();
+    pinned.exec("BEGIN");
+    const before = identityCensus(pinned);
+    const sequence = identitySequenceValue(pinned);
+    f.source.exec(mutation);
+    let steps = 0;
+    while (f.exporter.step()) {
+      expectIdentityCoverage(out);
+      expect(identityCensus(out)).toEqual(before);
+      if (++steps > 500) throw new Error("import replacement did not converge");
+    }
+    expect(steps).toBeGreaterThan(1);
+    expect(identityCensus(pinned)).toEqual(before);
+    pinned.exec("ROLLBACK");
+    expect(
+      out
+        .prepare(
+          "SELECT native_session_id,thread_id FROM ardud_opencode_import ORDER BY native_session_id",
+        )
+        .all(),
+    ).toEqual(
+      [...expected, ["stable", "stable-owner"]]
+        .sort(([a], [b]) => a!.localeCompare(b!))
+        .map(([native_session_id, thread_id]) => ({ native_session_id, thread_id })),
+    );
+    expectIdentityCoverage(out);
+    for (const id of changed) expect(identityVersion(out, name, id)).toBeGreaterThan(sequence);
+    for (const id of removed) expect(Number.isNaN(identityVersion(out, name, id))).toBe(true);
+    expect(
+      identityCensus(out).filter(
+        (r) =>
+          r.table_name !== name ||
+          (!changed.includes(String(r.row_id)) && !removed.includes(String(r.row_id))),
+      ),
+    ).toEqual(
+      before.filter(
+        (r) =>
+          r.table_name !== name ||
+          (!changed.includes(String(r.row_id)) && !removed.includes(String(r.row_id))),
+      ),
+    );
+    const committed = identityCensus(out);
+    f.restart();
+    f.finish();
+    expect(identityCensus(out)).toEqual(committed);
+  },
+);
+
+test("identity versions: a throwing exporter publication rolls back row versions and sequence together", () => {
+  const f = identityVersionFixture();
+  f.finish();
+  const out = f.connect();
+  const before = identityCensus(out);
+  const sequence = identitySequenceValue(out);
+  const imports = out
+    .prepare("SELECT * FROM ardud_opencode_import ORDER BY native_session_id")
+    .all();
+  writeReplica(f, (db) =>
+    db.exec(
+      "CREATE TRIGGER fail_import BEFORE INSERT ON ardud_opencode_import WHEN NEW.native_session_id='version-main' BEGIN SELECT RAISE(ABORT,'injected publication failure'); END",
+    ),
+  );
+  f.source.exec(
+    `UPDATE orchestration_v2_projection_threads SET payload_json='{"pending":true}' WHERE thread_id='version-main'; UPDATE ardud_opencode_import SET thread_id='fail' WHERE native_session_id='version-main'`,
+  );
+  emitIdentityEvent(f.source, "threads");
+  expect(() => f.finish()).toThrow("injected publication failure");
+  expect(identityCensus(out)).toEqual(before);
+  expect(identitySequenceValue(out)).toBe(sequence);
+  expect(
+    out.prepare("SELECT * FROM ardud_opencode_import ORDER BY native_session_id").all(),
+  ).toEqual(imports);
+  expectIdentityCoverage(out);
+  writeReplica(f, (db) => db.exec("DROP TRIGGER fail_import"));
+  f.restart();
+  f.finish();
+  expect(identityVersion(out, identityVersionTables[0][0])).toBeGreaterThan(
+    Number(
+      before.find(
+        (r) => r.table_name === identityVersionTables[0][0] && r.row_id === "version-main",
+      )?.version,
+    ),
+  );
+});
+
+test("identity versions: fast-lane companion copies and suspended cycle replay retain fresh exact versions", () => {
+  const f = identityVersionFixture(1);
+  let now = Date.now();
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  f.finish();
+  const out = f.connect();
+  const before = identityVersion(out, identityVersionTables[2][0]);
+  f.source.exec(
+    `UPDATE orchestration_v2_projection_provider_turns SET thread_id='pending' WHERE provider_turn_id='version-main'`,
+  );
+  emitIdentityEvent(f.source, "turns");
+  f.exporter.takeMetrics();
+  let caughtUp = false;
+  for (let i = 0; i < 40; i++) {
+    f.exporter.step();
+    if (f.exporter.takeMetrics().phaseSteps.eventCatchup) {
+      caughtUp = true;
+      break;
+    }
+  }
+  expect(caughtUp).toBe(true);
+  const stamp = metaValue(out, "updated_at");
+  for (const id of ["ahead1", "ahead2", "child"])
+    f.source
+      .prepare(
+        "INSERT INTO orchestration_v2_projection_threads(thread_id,payload_json) VALUES (?,'{}')",
+      )
+      .run(id);
+  f.source.exec(
+    "INSERT INTO orchestration_v2_projection_provider_threads(provider_thread_id,payload_json,thread_id) VALUES ('companion','{}','child')",
+  );
+  now += 1_000;
+  expect(f.exporter.pollIdentities()).toBe(true);
+  expect(identityVersion(out, identityVersionTables[0][0], "child")).toBeGreaterThan(0);
+  expect(identityVersion(out, identityVersionTables[1][0], "companion")).toBeGreaterThan(0);
+  const companionVersion = identityVersion(out, identityVersionTables[1][0], "companion");
+  expect(metaValue(out, "updated_at")).toBe(stamp);
+  f.finish();
+  expect(identityVersion(out, identityVersionTables[2][0])).toBeGreaterThan(before);
+  expect(identityVersion(out, identityVersionTables[1][0], "companion")).toBe(companionVersion);
+  expectIdentityCoverage(out);
+});
+
+test.each(["full", "additive"])(
+  "identity versions: %s rebuild publishes complete coverage and retains sequence history",
+  (kind) => {
+    const f = identityVersionFixture();
+    f.finish();
+    const out = f.connect();
+    const before = identityCensus(out);
+    const sequence = identitySequenceValue(out);
+    out.exec("BEGIN");
+    expectIdentityCoverage(out);
+    f.source.exec(
+      `ALTER TABLE orchestration_v2_projection_threads ADD COLUMN extra TEXT ${kind === "full" ? "CHECK(extra IS NULL)" : "DEFAULT 'backfill'"}`,
+    );
+    f.restart();
+    let steps = 0;
+    while (f.exporter.step()) {
+      expectIdentityCoverage(out);
+      expect(identityCensus(out)).toEqual(before);
+      if (++steps > 500) throw new Error("identity rebuild did not converge");
+    }
+    expect(identityCensus(out)).toEqual(before);
+    out.exec("ROLLBACK");
+    expect(metaValue(out, "ready")).toBe("1");
+    expectIdentityCoverage(out);
+    expect(identitySequenceValue(out)).toBeGreaterThanOrEqual(sequence);
+    if (kind === "full")
+      expect(identityVersion(out, identityVersionTables[0][0])).toBeGreaterThan(sequence);
+    else {
+      expect(identityVersion(out, identityVersionTables[1][0])).toBe(
+        identityVersionFrom(before, identityVersionTables[1][0]),
+      );
+      const version = identityVersion(out, identityVersionTables[0][0]);
+      f.source.exec(
+        "UPDATE orchestration_v2_projection_threads SET extra='edited' WHERE thread_id='version-main'",
+      );
+      emitIdentityEvent(f.source, "threads");
+      f.finish();
+      expect(identityVersion(out, identityVersionTables[0][0])).toBeGreaterThan(version);
+    }
+  },
+);
+const identityVersionFrom = (census: ReturnType<typeof identityCensus>, name: string) =>
+  Number(census.find((r) => r.table_name === name && r.row_id === "version-main")?.version);
+
+test.each(["reopen", "midrun"])(
+  "identity versions: covered auxiliary table recreation on %s replaces its census atomically",
+  (mode) => {
+    const f = identityVersionFixture();
+    f.finish();
+    const out = f.connect();
+    const before = identityCensus(out);
+    const sequence = identitySequenceValue(out);
+    f.source.exec(
+      "ALTER TABLE ardud_opencode_import ADD COLUMN extra TEXT; DELETE FROM ardud_opencode_import WHERE native_session_id='version-main'",
+    );
+    if (mode === "reopen") f.restart();
+    let steps = 0;
+    while (f.exporter.step()) {
+      expectIdentityCoverage(out);
+      expect(identityCensus(out)).toEqual(before);
+      if (++steps > 500) throw new Error("identity auxiliary refresh did not converge");
+    }
+    expectIdentityCoverage(out);
+    expect(identityVersion(out, identityVersionTables[4][0], "version-peer")).toBeGreaterThan(
+      sequence,
+    );
+    expect(Number.isNaN(identityVersion(out, identityVersionTables[4][0]))).toBe(true);
+    expect(identityVersion(out, identityVersionTables[0][0])).toBe(
+      identityVersionFrom(before, identityVersionTables[0][0]),
+    );
+  },
+);
+
+test("identity versions: reopen and no-op refresh keep versions and the sequence unchanged", () => {
+  const f = identityVersionFixture();
+  f.finish();
+  const out = f.connect();
+  const before = identityCensus(out);
+  const sequence = identitySequenceValue(out);
+  for (let i = 0; i < 3; i++) {
+    f.restart();
+    expect(identityCensus(out)).toEqual(before);
+    f.finish();
+    expectIdentityCoverage(out);
+    expect(identityCensus(out)).toEqual(before);
+    expect(identitySequenceValue(out)).toBe(sequence);
+  }
+});
+
+test("identity versions: reopen repairs a lost trigger and stale census without certifying partial coverage", () => {
+  const f = identityVersionFixture();
+  f.finish();
+  f.exporter.close();
+  const out = f.connect();
+  const before = identityCensus(out);
+  writeReplica(f, (db) =>
+    db.exec(
+      "DROP TRIGGER ardud_identity_threads_delete; DELETE FROM orchestration_v2_projection_threads WHERE thread_id='version-main'",
+    ),
+  );
+  out.exec("BEGIN");
+  expect(
+    out.prepare("SELECT name FROM sqlite_schema WHERE name='ardud_identity_threads_delete'").get(),
+  ).toBeUndefined();
+  f.restart();
+  expect(
+    out.prepare("SELECT name FROM sqlite_schema WHERE name='ardud_identity_threads_delete'").get(),
+  ).toBeUndefined();
+  out.exec("ROLLBACK");
+  expectIdentityCoverage(out);
+  expect(Number.isNaN(identityVersion(out, identityVersionTables[0][0]))).toBe(true);
+  expect(identityVersion(out, identityVersionTables[1][0])).toBe(
+    identityVersionFrom(before, identityVersionTables[1][0]),
+  );
+});
+
+test("identity versions: scalar census over thousands of rows uses the covering unique index", () => {
+  const f = identityVersionFixture(500);
+  f.source.exec(
+    "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<4000) INSERT INTO orchestration_v2_projection_threads(thread_id,payload_json) SELECT 'bulk-'||x,json_object('body',printf('%2000s','payload')) FROM n",
+  );
+  f.finish();
+  const out = f.connect();
+  expectIdentityCoverage(out);
+  const plan = out
+    .prepare(
+      "EXPLAIN QUERY PLAN SELECT row_id,version FROM ardud_readonly_identity_versions WHERE table_name=? ORDER BY row_id",
+    )
+    .all(identityVersionTables[0][0])
+    .map((row) => String(row.detail))
+    .join(" ");
+  expect(plan).toContain("USING COVERING INDEX");
+  expect(plan).not.toMatch(/SCAN |TEMP B-TREE/);
+  expect(
+    out
+      .prepare(
+        "SELECT row_id,version FROM ardud_readonly_identity_versions WHERE table_name=? ORDER BY row_id",
+      )
+      .all(identityVersionTables[0][0]),
+  ).toHaveLength(4005);
+});
+
+test("identity versions: reset sweep pruning removes versions for vanished source keys", () => {
+  const f = identityVersionFixture(1);
+  f.finish();
+  const out = f.connect();
+  const sequence = identitySequenceValue(out);
+  for (const [name, primary] of identityVersionTables)
+    f.source.exec(`DELETE FROM ${name} WHERE ${primary}='version-main'`);
+  f.source.exec("INSERT INTO orchestration_events VALUES (4,'thread.deleted','version-main','{}')");
+  f.finish();
+  expectIdentityCoverage(out);
+  expect(identityCensus(out).some((row) => row.row_id === "version-main")).toBe(false);
+  expect(identitySequenceValue(out)).toBeGreaterThanOrEqual(sequence);
+});
+
+test("identity versions: table loss reinstalls a complete census with a new schema epoch", () => {
+  const f = identityVersionFixture();
+  f.finish();
+  f.exporter.close();
+  const out = f.connect();
+  const epoch = out.prepare("PRAGMA schema_version").get()?.schema_version;
+  writeReplica(f, (db) => db.exec("DROP TABLE ardud_readonly_identity_versions"));
+  f.restart();
+  expectIdentityCoverage(out);
+  expect(out.prepare("PRAGMA schema_version").get()?.schema_version).not.toBe(epoch);
 });

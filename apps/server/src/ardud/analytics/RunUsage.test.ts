@@ -151,6 +151,10 @@ it.effect.each(["completed", "failed", "interrupted", "cancelled"] as const)(
         row.cancelReason,
         status === "cancelled" || status === "interrupted" ? "server_shutdown" : undefined,
       );
+      assert.equal(
+        Object.hasOwn(row, "cancelReason"),
+        status === "cancelled" || status === "interrupted",
+      );
       assert.equal(row.role, "work");
       assert.equal(row.cardId, "card:one");
       assert.equal(row.effort, "max");

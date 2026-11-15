@@ -27,6 +27,8 @@ CADENCES = {
     # launchd/com.abdullah.mac-memory.plist: StartInterval=300 (five minutes);
     # allow two missed samples (15 minutes). Emitter: memory.sample(), live 14 Nov.
     'memory.sample': dict(name='memory.sample', target=None, gapHours=.25, since='2026-11-14'),
+    # launchd/com.abdullah.mac-cpu.plist: StartInterval=60; allow three minutes.
+    'cpu.sample': dict(name='cpu.sample', target=None, gapHours=.05, since='2026-11-15'),
     # launchd/com.abdullah.mac-deep-inventory.plist: daily 03:30 local
     # (Asia/Dubai = previous day 23:30 UTC); allow daily plus two hours.
     # deep_inventory.run_pass() emits disk.deep.end; first live completion 14 Nov.

@@ -24,6 +24,7 @@ hours for disk sampling (guard every 30 minutes), inventory and crash collection
 daily CVE sweep (09:00 Dubai / 05:00 UTC).
 The hourly collector's tooling, process-wait and clone-wedge probes also allow
 two hours. `memory.sample` runs every five minutes and allows 15 minutes;
+`cpu.sample` runs every minute and allows three minutes, from 15 Nov UTC;
 `disk.deep.end` completes the daily 03:30 Dubai pass and allows 26 hours.
 The memory, deep-pass and clone-wedge rows apply from 14 Nov UTC, when they
 first logged; the others apply from 13 Nov. Alerts and conditional detail
@@ -91,13 +92,22 @@ A separate `com.abdullah.mac-deep-inventory` LaunchAgent runs daily at 03:30
 local time (Asia/Dubai on this Mac). It starts with the four SSD worktree farms
 and checkpoints the next root to visit, so interrupted passes rotate fairly.
 Cheap batches can share a turn; known timeouts follow healthy discovery and
-refresh work after one early parts turn. Ordinary children that will expire
+refresh work after one early part attempt per root. Ordinary children that will expire
 during the pass are refreshed before more parts work can crowd them out.
-Unknown children get a 15-second probe; a batch deadline falls
-back to individual probes. A timed-out child is split into immediate entries,
+Individual probes use 1.5 times the child's last successful duration, or twice
+its root's median successful duration, bounded to 15–120 seconds. Roots with
+no timing data start at 15 seconds. A short probe timeout doubles the next
+probe and keeps the child in ordinary discovery; only a full probe of at least
+60 seconds establishes a timeout for descent. Legacy timeouts with no recorded
+allowance or parts get one probe conversion. Batch deadlines fall back to
+individual probes. A confirmed timed-out child is split into immediate entries,
 with each completed part checkpointed and at most ten minutes per child per
-pass. Checkpointed parts and their parent have a 72-hour freshness window so
-three nightly passes can finish a child. Ordinary children keep 24 hours.
+pass. A part whose measured or sibling-estimated cost exceeds the time left
+is deferred to the next pass. Checkpointed parts and their parent have a 72-hour freshness window so
+three nightly passes can finish a child. Ordinary children of the SSD worktree
+farms and crpko-devops/tmp retain their real timestamps for 48 hours, so a
+sweep larger than one nightly budget can converge. Other roots keep 24 hours.
+An expired ordinary child makes its root partial until measured again.
 The child has no total until its listing and every part are complete and
 fresh; the total retains the oldest part's timestamp. At expiry it becomes
 partial with no total again. Its own directory allocation is included.
@@ -111,6 +121,10 @@ daily pass exits cleanly; a busy hourly scan logs `skipReason=deep_pass_running`
 and cached totals while crash collection continues. `disk.deep.start`,
 `disk.deep.root`, `disk.deep.parts` and `disk.deep.end` record coverage, ages,
 timeout time, parts progress, the parts freshness window and stop reason.
+Pass timeout totals include all command timeouts; `probeTimeouts` and
+`secondsInProbeTimeouts` report the short-probe subset, and
+`probeAllowanceMedianS` reports the median individual probe allowance.
+Timeout source events include `allowanceS`.
 `childrenRemaining` counts known eligible children; `rootsPartial` on pass
 summaries counts roots whose listing was unavailable, so zero remaining with
 unlisted roots is not complete coverage. All totals count hardlink occurrences,
@@ -191,6 +205,50 @@ Partial inventories and older snapshots without that evidence remain unknown.
 An unknown directory baseline also makes the event incomplete.
 These events never alert or launch extra scans.
 
+## CPU samples
+
+`com.abdullah.mac-cpu` runs `cpu.py` every 60 seconds at normal priority,
+through `/bin/zsh` for launchd file access. One `/bin/ps` inventory reads PID,
+parent, cumulative CPU time, RSS, state, start time and elapsed time with a
+30-second timeout. It never invokes top or changes another process.
+
+`state/cpu.json` retains only PID, start time and cumulative CPU seconds, plus
+the Unix observation time, under its own nonblocking lock. CPU seconds
+and percentages compare successful inventories; 100% is one full core.
+New/reused PIDs and counter resets start at zero. Disappeared processes are
+dropped; their final CPU usage is unknown, so totals cover surviving processes.
+The first run, clock reset or gap over an hour establishes a baseline with
+null CPU totals and no top rows. Legacy monotonic timestamps establish one
+fresh baseline on upgrade. Monotonic time measures only each run's duration;
+Apple's Python 3.9 gives it a different epoch in each process, so it cannot
+measure intervals across minute invocations. Failed inventories emit a fixed `failure`
+code and `durationMs` without advancing state.
+
+`cpu.sample` includes `windowS`, `cpuS`, load averages, logical CPU count,
+total CPU percent, process count, runnable/uninterruptible counts, the top 15
+families (count, CPU, RSS MiB) and top 20 PIDs (parent, family, CPU seconds and
+percent, RSS MiB, elapsed time and optional script hint). Families use the
+innermost app bundle or executable basename; Python versions and mds variants
+are grouped. Only node/bun/python PIDs in that top 20 get a separate batched
+argv read with a five-second timeout and a start-time recheck. Hint failure
+sets `hintError` without losing numeric CPU evidence.
+
+Hints use the janitor's reviewed #45 `leftover_processes.redact` helper,
+loaded from the sibling source tree or the installed
+`~/.config/opencode/skills/dev-resource-janitor/scripts/` directory (including
+its `active_sessions.py` dependency). No janitor scan runs. Inline programs
+are omitted. Paths reduce to a basename, or the first directory after
+`ExternalSSD/` or `.local/share/` plus basename; intervening directories use
+`…`. Raw argv and paths never enter sampler state or logs. If the helper is
+missing, labels are omitted and the CPU measurements remain available.
+
+The logger bounds labels and lists and caps each encoded CPU line at 8192
+bytes, dropping lowest-ranked detail rows if necessary (`topOmitted` and
+`familiesOmitted`). At 1440 scheduled runs/day the maximum is 11.8 MB/day,
+so the minute cadence does not need a low-load fallback. The existing shared
+day-log cap and retention still apply. The installer copies the new helpers
+and plist; the evaluator must load `com.abdullah.mac-cpu` after review.
+
 ## Memory samples
 
 `com.abdullah.mac-memory` runs `memory.py` every 300 seconds independently of
@@ -199,7 +257,9 @@ swap MB, VM page counts and page size, raw pressure counter/level and free perce
 load averages,
 the top 15 footprints with compressed MB, watched daemons with elapsed time,
 process/parent-1 counts, and disk0's second iostat sample. MB/GB use powers of
-1024. `top` MEM already includes compressed pages. One full, memory-sorted top snapshot
+1024. `top` MEM already includes compressed pages. The single-snapshot CPU column
+is omitted because it reports zero without a preceding observation; use
+`cpu.sample` for CPU usage. One full, memory-sorted top snapshot
 supplies both the first15 holders and watched PIDs, including those below15.
 ps supplies exact command names/elapsed time and matches the snapshot by PID.
 At most512 watched PIDs are retained; excess

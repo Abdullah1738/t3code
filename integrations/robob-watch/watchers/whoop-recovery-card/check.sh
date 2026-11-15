@@ -27,7 +27,7 @@ SENT=$CARDS/out/$D-recovery-sent
 if [[ -f $P || -f $HELD ]]; then BRIEF_HELD=1; else BRIEF_HELD=0; fi
 (( BRIEF_HELD == 1 || MINS >= 720 )) || exit 0
 if [[ -z ${NO_SYNC:-} ]]; then
-  (cd "$VAULT" && /usr/bin/python3 whoop/whoop.py sync --days 2 >/dev/null 2>&1) || true
+  (cd "$VAULT" && HEALTH_TOOLLOG_TRIGGER=chained /usr/bin/python3 whoop/whoop.py sync --days 2 >/dev/null 2>&1) || true
 fi
 # Dubai is UTC+4 all year: day D runs from 20:00Z the day before to 20:00Z on D.
 LO=$(/usr/bin/python3 -c "import datetime,sys;print((datetime.date.fromisoformat(sys.argv[1])-datetime.timedelta(days=1)).isoformat()+'T20:00:00')" "$D")

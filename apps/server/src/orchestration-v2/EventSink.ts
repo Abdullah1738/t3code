@@ -6,6 +6,7 @@ import {
   type ProviderSessionId,
   OrchestrationV2StoredEvent,
   ProviderThreadId,
+  type ProviderTurnId,
   RunAttemptId,
   RunId,
   RuntimeRequestId,
@@ -107,6 +108,7 @@ export interface EventSinkV2Shape {
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
     readonly effects: ReadonlyArray<EffectOutbox.PendingOrchestrationEffectV2>;
   }) => Effect.Effect<ReadonlyArray<OrchestrationV2StoredEvent>, EventSinkV2Error>;
+  /** Provider lifecycle writes preserve the orchestrator's completion cohort. */
   readonly writeIfRunCurrent: (input: {
     readonly unlessClaudeRefused?: ProviderThreadId;
     readonly guardPendingUserInputCancellations?: boolean;
@@ -485,6 +487,8 @@ const layerBase: Layer.Layer<
       });
 
     const normalizeEvents = (events: ReadonlyArray<OrchestrationV2DomainEvent>) => {
+      const providerTurnOrdinals = new Map<ProviderTurnId, number>();
+      const providerThreadMaxOrdinals = new Map<ProviderThreadId, number>();
       const providerSessions = new Map<
         ProviderThreadId,
         {
@@ -505,6 +509,35 @@ const layerBase: Layer.Layer<
         events,
         (event): Effect.Effect<OrchestrationV2DomainEvent, unknown> =>
           Effect.gen(function* () {
+            if (event.type === "provider-turn.updated") {
+              const turn = event.payload;
+              let ordinal = providerTurnOrdinals.get(turn.id);
+              if (ordinal === undefined) {
+                const existing = yield* sql<{ readonly ordinal: number }>`
+                  SELECT ordinal FROM orchestration_v2_projection_provider_turns
+                  WHERE provider_turn_id = ${turn.id} LIMIT 1
+                `;
+                ordinal = existing[0]?.ordinal;
+                if (ordinal === undefined) {
+                  // Starts and native continuations can carry the same stale ordinal.
+                  // Normalize before append inside the writer transaction, including
+                  // turns in this batch which have not reached the projection yet.
+                  let maximum = providerThreadMaxOrdinals.get(turn.providerThreadId);
+                  if (maximum === undefined) {
+                    const rows = yield* sql<{ readonly ordinal: number | null }>`
+                      SELECT MAX(ordinal) AS ordinal
+                      FROM orchestration_v2_projection_provider_turns
+                      WHERE provider_thread_id = ${turn.providerThreadId}
+                    `;
+                    maximum = rows[0]?.ordinal ?? 0;
+                  }
+                  ordinal = maximum + 1;
+                  providerThreadMaxOrdinals.set(turn.providerThreadId, ordinal);
+                }
+                providerTurnOrdinals.set(turn.id, ordinal);
+              }
+              return ordinal === turn.ordinal ? event : { ...event, payload: { ...turn, ordinal } };
+            }
             if (event.type === "provider-thread.updated") {
               const incoming = event.payload;
               if (incoming.driver !== "claudeAgent") {
@@ -915,12 +948,20 @@ const layerBase: Layer.Layer<
                 if (refused.length > 0) return { committed: false as const, storedEvents: [] };
               }
 
+              // A matching attempt can still carry a cohort captured before an
+              // acknowledgement, successor delivery, or Stop. Projection keeps
+              // the recorded cohort when a lifecycle event omits that field.
+              const lifecycleEvents = input.events.map((event) => {
+                if (event.type !== "run.updated" || event.payload.id !== input.runId) return event;
+                const { delegatedCompletion: _delegatedCompletion, ...payload } = event.payload;
+                return { ...event, payload };
+              });
               const normalized = yield* timing.measure(
                 "normalize",
                 normalizeEvents(
                   input.guardPendingUserInputCancellations === true
-                    ? yield* guardUserInputCancellations(input.events)
-                    : input.events,
+                    ? yield* guardUserInputCancellations(lifecycleEvents)
+                    : lifecycleEvents,
                 ),
               );
               const storedEvents = yield* timing.measure(

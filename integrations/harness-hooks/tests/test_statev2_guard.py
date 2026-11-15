@@ -368,6 +368,335 @@ class GuardTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertEqual(self.classify(command), expected)
 
+    def test_flighty_notify_foreign_database(self):
+        fixture = Path(__file__).with_name('fixtures') / 'flighty_notify.sh'
+        self.assertEqual(self.classify(f'{shlex.quote(str(fixture))} owner "EK366@2026-11-16:belt-7" "test"'), None)
+        self.adapters(f'{shlex.quote(str(fixture))} owner "EK366@2026-11-16:belt-7" "test"')
+
+    def test_foreign_state_sqlite_paths(self):
+        paths = [
+            '~/.config/spectrum-bridge/state.sqlite',
+            '$HOME/.config/telegram-bridge/state.sqlite',
+            '${HOME}/.config/telegram-bridge/state.sqlite',
+            '/Users/ardud/.local/share/example-tool/state.sqlite',
+        ]
+        for path in paths:
+            shell = f'CLI=/Users/ardud/.local/share/spectrum-bridge/src/cli.ts\nsqlite3 -readonly "{path}" "select 1"\n'
+            python = f'import os, sqlite3\nsqlite3.connect(os.path.expanduser({path!r}))\n'
+            node = f'import {{ DatabaseSync }} from "node:sqlite";\nconst cli = "/Users/ardud/.local/share/tool/cli.ts";\nnew DatabaseSync("{path}");\n'
+            for extension, runner, source in [('sh', 'zsh', shell), ('py', 'python3 -I', python), ('mjs', 'node', node)]:
+                with self.subTest(path=path, extension=extension):
+                    script = self.write('tmp/foreign.' + extension, source)
+                    self.assertEqual(self.classify(f'{runner} {shlex.quote(str(script))} owner'), None)
+            self.assertEqual(self.classify(f'sqlite3 -readonly "{path}" "select 1"'), None)
+
+    def test_foreign_state_sqlite_does_not_hide_live_database(self):
+        paths = [
+            '~/.robob/userdata/statev2.sqlite',
+            '~/.robob/userdata/state.sqlite',
+            '~/.robob/userdata/nested/state.sqlite',
+            '~/.t3/userdata/statev2.sqlite',
+            '~/.t3/userdata/state.sqlite',
+            '~/.local/share/opencode/opencode.db',
+        ]
+        fixture = (Path(__file__).with_name('fixtures') / 'flighty_notify.sh').read_text()
+        for path in paths:
+            shell = fixture.replace('~/.config/spectrum-bridge/state.sqlite', path)
+            python = f'import os, sqlite3\nsqlite3.connect(os.path.expanduser({path!r}))\n'
+            node = f'import {{ DatabaseSync }} from "node:sqlite";\nnew DatabaseSync("{path}");\n'
+            for extension, runner, source in [('sh', 'zsh', shell), ('py', 'python3 -I', python), ('mjs', 'node', node)]:
+                with self.subTest(path=path, extension=extension):
+                    script = self.write('tmp/protected.' + extension, source)
+                    self.assertEqual(self.classify(f'{runner} {shlex.quote(str(script))} owner'), SCRIPT)
+            with self.subTest(path=path, entry='sqlite3'):
+                self.assertEqual(self.classify(f'sqlite3 -readonly "{path}" "select 1"'), READ)
+
+    def test_unresolved_state_sqlite_directory(self):
+        for path in ['state.sqlite', '$D/state.sqlite', '${D}/state.sqlite', '~/$D/state.sqlite', '~/*/state.sqlite', '$(pwd)/state.sqlite']:
+            command = f'sqlite3 -readonly "{path}" "select 1"'
+            with self.subTest(path=path):
+                self.assertEqual(self.classify(command), READ)
+                script = self.write('tmp/unknown.sh', 'CLI=/Users/ardud/.local/share/tool/cli.ts\n' + command)
+                self.assertEqual(self.classify('zsh ' + shlex.quote(str(script))), SCRIPT)
+        for directory in ['~/.robob/userdata', '~/.t3/userdata']:
+            with self.subTest(directory=directory):
+                self.assertEqual(self.classify(f'cd {directory} && sqlite3 state.sqlite "select 1"'), READ)
+
+    def test_foreign_state_sqlite_keeps_other_live_references(self):
+        foreign = '/Users/ardud/.config/spectrum-bridge/state.sqlite'
+        for other in ['statev2.sqlite', 'statev2.pre-shrink.sqlite', 'opencode.db', 'state.sqlite']:
+            with self.subTest(other=other):
+                source = f'const foreign = "{foreign}";\nconst root = process.env.HOME + "/.robob/userdata";\nnew Database(root + "/{other}");\n'
+                script = self.write('tmp/mixed.mjs', source)
+                self.assertEqual(self.classify('node ' + shlex.quote(str(script))), SCRIPT)
+        for expression in ['foreign.replace(".config/spectrum-bridge", ".robob/userdata")',
+                           'path.join(process.env.HOME, ".robob", "userdata", path.basename(foreign))',
+                           'path.join(process.env.T3CODE_HOME, "userdata", path.basename(foreign))',
+                           'path.join(os.homedir(), "userdata", path.basename(foreign))']:
+            with self.subTest(expression=expression):
+                source = f'const foreign = "{foreign}";\nnew Database({expression});\n'
+                script = self.write('tmp/transformed.mjs', source)
+                self.assertEqual(self.classify('node ' + shlex.quote(str(script))), SCRIPT)
+
+    def test_foreign_state_sqlite_preserves_root_evidence(self):
+        imports = 'import { DatabaseSync } from "node:sqlite";\nimport path from "node:path";\n'
+        rows = [
+            ('opencode sibling', '/Users/ardud/.local/share/opencode/state.sqlite',
+             'path.join(path.dirname(foreign), "opencode.db")'),
+            ('robob sibling', '/Users/ardud/.robob/other/state.sqlite',
+             'path.join(path.dirname(path.dirname(foreign)), "userdata", "statev2.sqlite")'),
+        ]
+        for label, foreign, expression in rows:
+            with self.subTest(case=label):
+                source = imports + f'const foreign = "{foreign}";\nnew DatabaseSync({expression});\n'
+                script = self.write('tmp/sibling.mjs', source)
+                command = 'node ' + shlex.quote(str(script))
+                self.assertEqual(self.classify(command), SCRIPT)
+                self.adapters(command, SCRIPT)
+                self.assertEqual(self.classify("node - <<'JS'\n" + source + 'JS'), READ)
+        source = ('foreign=~/.config/spectrum-bridge/state.sqlite\n'
+                  'sqlite3 -readonly ~/.robob/userdata/state.sqlite "select 1"\n')
+        script = self.write('tmp/plain-live-operand.sh', source)
+        command = 'zsh ' + shlex.quote(str(script)) + ' owner'
+        self.assertEqual(self.classify(command), SCRIPT)
+        self.adapters(command, SCRIPT)
+        self.assertEqual(self.classify("zsh -s <<'BODY'\n" + source + 'BODY'), READ)
+        for foreign in ['/Users/ardud/.local/share/tool/state.sqlite', '~/.local/share/tool/state.sqlite',
+                        '$HOME/.local/share/tool/state.sqlite', '${HOME}/.local/share/tool/state.sqlite']:
+            for name in ['statev2.sqlite', 'opencode.db', 'state.sqlite']:
+                node = imports + f'const foreign = "{foreign}";\nconst name = "{name}";\nnew DatabaseSync(path.join(process.env.D, name));\n'
+                shell = f'foreign="{foreign}"\nsqlite3 "$D/{name}" "select 1"\n'
+                for extension, runner, source in [('mjs', 'node', node), ('sh', 'zsh', shell)]:
+                    with self.subTest(foreign=foreign, name=name, extension=extension):
+                        script = self.write('tmp/variable-operand.' + extension, source)
+                        self.assertEqual(self.classify(runner + ' ' + shlex.quote(str(script)) + ' owner'), SCRIPT)
+                        if extension == 'mjs':
+                            self.assertEqual(self.classify("node - <<'BODY'\n" + source + 'BODY'), READ)
+
+    def test_foreign_state_sqlite_basename_reuse(self):
+        foreign = '/Users/ardud/.robob/other/state.sqlite'
+        imports = 'import { DatabaseSync } from "node:sqlite";\nimport path from "node:path";\n'
+        for expression in [
+            'path.join(path.dirname(path.dirname(foreign)), "userdata", path.basename(foreign))',
+            'path.join(process.env.D, path.basename(foreign))',
+            'path.join(process.env.D, foreign.split("/").pop())',
+            'foreign.replace("/other/", "/userdata/")',
+            json.dumps(foreign) + '.replace("/other/", "/userdata/")',
+        ]:
+            with self.subTest(language='node', expression=expression):
+                source = imports + f'const foreign = "{foreign}";\nnew DatabaseSync({expression});\n'
+                script = self.write('tmp/basename.mjs', source)
+                command = 'node ' + shlex.quote(str(script))
+                self.assertEqual(self.classify(command), SCRIPT)
+                self.adapters(command, SCRIPT)
+                stdin = "node - <<'JS'\n" + source + 'JS'
+                self.assertEqual(self.classify(stdin), READ)
+                self.adapters(stdin, READ)
+        for target in [
+            '"$(dirname "$(dirname "$foreign")")/userdata/$(basename "$foreign")"',
+            '"$D/$(basename "$foreign")"',
+        ]:
+            source = f'foreign="{foreign}"\nsqlite3 -readonly {target} "select 1"\n'
+            script = self.write('tmp/basename.sh', source)
+            for runner in ['bash', 'zsh']:
+                with self.subTest(language='shell', runner=runner, target=target):
+                    command = runner + ' ' + shlex.quote(str(script)) + ' owner'
+                    self.assertEqual(self.classify(command), SCRIPT)
+                    self.adapters(command, SCRIPT)
+
+    def test_foreign_state_sqlite_direct_reader_operands(self):
+        for path, expected in [('/Users/ardud/.robob/other/state.sqlite', SCRIPT),
+                               ('/Users/ardud/.local/share/opencode/state.sqlite', SCRIPT),
+                               ('~/.config/spectrum-bridge/state.sqlite', None),
+                               ('$HOME/.config/tool/state.sqlite', None),
+                               ('${HOME}/state.sqlite', None), ('/state.sqlite', None)]:
+            imports = 'import { DatabaseSync } from "node:sqlite";\nimport fs from "node:fs";\n'
+            for reader in ['new DatabaseSync', 'fs.readFileSync']:
+                with self.subTest(path=path, reader=reader):
+                    source = imports + f'{reader}({json.dumps(path)});\n'
+                    script = self.write('tmp/direct-foreign.mjs', source)
+                    self.assertEqual(self.classify('node ' + shlex.quote(str(script))), expected)
+                    self.assertEqual(self.classify("node - <<'JS'\n" + source + 'JS'), READ if expected else None)
+            for operand in [path, '"' + path + '"']:
+                with self.subTest(path=path, operand=operand):
+                    command = 'sqlite3 -readonly ' + operand + ' "select 1"'
+                    self.assertIsNone(self.classify(command))
+                    script = self.write('tmp/direct-foreign.sh', command)
+                    self.assertEqual(self.classify('zsh ' + shlex.quote(str(script)) + ' owner'), expected)
+        source = ("import os, sqlite3\n"
+                  "sqlite3.connect(os.path.expanduser('~/.config/spectrum-bridge/state.sqlite'))\n")
+        script = self.write('tmp/direct-foreign.py', source)
+        command = 'python3 -I ' + shlex.quote(str(script))
+        self.assertIsNone(self.classify(command))
+        self.adapters(command)
+        stdin = "python3 -I - <<'PY'\n" + source + 'PY'
+        self.assertIsNone(self.classify(stdin))
+        self.adapters(stdin)
+
+    def test_foreign_state_sqlite_round_three_findings(self):
+        rows = [
+            ('open wrapper', 'mjs', 'node', 'node -',
+             "import { DatabaseSync } from 'node:sqlite';\n"
+             "function open(file) { return new DatabaseSync(file.replace('/other/', '/userdata/')); }\n"
+             "open('/Users/ardud/.robob/other/state.sqlite');\n"),
+            ('sqlite3 wrapper', 'sh', 'bash', 'bash -s',
+             'sqlite3() { command /usr/bin/sqlite3 "${1/other/userdata}"; }\n'
+             "sqlite3 '/Users/ardud/.robob/other/state.sqlite'\n"),
+            ('Bun filename reuse', 'mjs', 'bun', 'bun -',
+             "import { Database } from 'bun:sqlite';\nimport path from 'node:path';\n"
+             "const foreign = new Database('/Users/ardud/.robob/other/state.sqlite');\n"
+             "new Database(path.join(path.dirname(path.dirname(foreign.filename)), 'userdata', path.basename(foreign.filename)));\n"),
+        ]
+        for label, extension, runner, stdin_runner, source in rows:
+            with self.subTest(case=label):
+                script = self.write('tmp/round-three.' + extension, source)
+                command = runner + ' ' + shlex.quote(str(script)) + ' owner'
+                self.assertEqual(self.classify(command), SCRIPT)
+                self.adapters(command, SCRIPT)
+                stdin = stdin_runner + " <<'BODY'\n" + source + 'BODY'
+                self.assertEqual(self.classify(stdin), READ)
+                self.adapters(stdin, READ)
+
+    def test_foreign_state_sqlite_shadowed_readers(self):
+        path = '~/.config/spectrum-bridge/state.sqlite'
+        rows = [
+            ('function', 'mjs', 'node', 'node -', 'function open(f) { return f; }'),
+            ('const', 'mjs', 'node', 'node -', 'const open = f => f;'),
+            ('let', 'mjs', 'node', 'node -', 'let open = f => f;'),
+            ('var', 'mjs', 'node', 'node -', 'var open = f => f;'),
+            ('assignment', 'mjs', 'node', 'node -', 'open = f => f;'),
+            ('destructure', 'mjs', 'node', 'node -', 'const { open } = helpers;'),
+            ('import-as', 'mjs', 'node', 'node -', "import { helper as open } from './helper.js';"),
+            ('import-default', 'mjs', 'node', 'node -', "import open from './helper.js';"),
+            ('parameter', 'mjs', 'node', 'node -', 'function wrapper(open) { return open; }'),
+            ('def', 'py', 'python3 -I', 'python3 -I -', 'def open(f):\n    return f'),
+            ('python import-as', 'py', 'python3 -I', 'python3 -I -', 'from helpers import helper as open'),
+            ('shell function', 'sh', 'bash', 'bash -s', 'sqlite3() { cat "$1"; }'),
+            ('alias', 'sh', 'bash', 'bash -s', "alias sqlite3='cat'"),
+        ]
+        for label, extension, runner, stdin_runner, declaration in rows:
+            call = 'sqlite3 "' + path + '"' if extension == 'sh' else 'open(' + repr(path) + ')'
+            source = declaration + '\n' + call + '\n'
+            with self.subTest(case=label):
+                self.assertIsNone(guard.PROTECTED_SOURCE_TOKEN.search(source))
+                script = self.write('tmp/shadowed.' + extension, source)
+                command = runner + ' ' + shlex.quote(str(script)) + ' owner'
+                self.assertEqual(self.classify(command), SCRIPT)
+                self.adapters(command, SCRIPT)
+                stdin = stdin_runner + " <<'BODY'\n" + source + 'BODY'
+                self.assertEqual(self.classify(stdin), READ)
+                self.adapters(stdin, READ)
+
+        for name in ['Database', 'DatabaseSync', 'connect', 'readFileSync']:
+            source = f'function {name}(f) {{ return f; }}\n{name}({path!r});\n'
+            with self.subTest(reader=name):
+                script = self.write('tmp/shadowed-reader.mjs', source)
+                command = 'node ' + shlex.quote(str(script))
+                self.assertEqual(self.classify(command), SCRIPT)
+                self.adapters(command, SCRIPT)
+                stdin = "node - <<'JS'\n" + source + 'JS'
+                self.assertEqual(self.classify(stdin), READ)
+                self.adapters(stdin, READ)
+
+    def test_foreign_state_sqlite_protected_source_gate(self):
+        for token in ['.robob', '.t3', 'robob-data', 'userdata', 'opencode']:
+            for text in [token, token.upper()]:
+                source = ('import { DatabaseSync } from "node:sqlite";\n'
+                          'const cli = "/Users/ardud/.local/share/tool/cli.ts";\n'
+                          f'// prefix-{text}-suffix\n'
+                          'new DatabaseSync("~/.config/spectrum-bridge/state.sqlite");\n')
+                with self.subTest(token=text):
+                    script = self.write('tmp/protected-token.mjs', source)
+                    self.assertEqual(self.classify('node ' + shlex.quote(str(script))), SCRIPT)
+                    self.assertEqual(self.classify("node - <<'JS'\n" + source + 'JS'), READ)
+
+    def test_flighty_notify_exact_owner_command(self):
+        fixture = Path(__file__).with_name('fixtures') / 'flighty_notify.sh'
+        self.assertIsNone(guard.PROTECTED_SOURCE_TOKEN.search(fixture.read_text()))
+        standin = self.write('opencode/skills/flighty/scripts/flighty_notify.sh', fixture.read_text())
+        owner_path = Path.home() / '.config/opencode/skills/flighty/scripts/flighty_notify.sh'
+        realpath = os.path.realpath
+        def fixture_path(path, *args, **kwargs):
+            if os.path.abspath(path) == str(owner_path):
+                return str(standin)
+            return realpath(path, *args, **kwargs)
+        command = '~/.config/opencode/skills/flighty/scripts/flighty_notify.sh owner "EK366@2026-11-16:belt-7" "test"'
+        with patch.object(os.path, 'realpath', side_effect=fixture_path):
+            self.assertIsNone(self.classify(command))
+            self.adapters(command)
+
+    def test_foreign_state_sqlite_python_import_variants(self):
+        imports = [
+            ('import sqlite3; import os', 'sqlite3.connect'),
+            ('import sqlite3 as sql; import os', 'sql.connect'),
+            ('import os, sqlite3', 'sqlite3.connect'),
+            ('import sqlite3, os', 'sqlite3.connect'),
+            ('import os, sqlite3 as sql', 'sql.connect'),
+            ('import sqlite3 as sql, os', 'sql.connect'),
+            ('from sqlite3 import connect; import os', 'connect'),
+            ('from sqlite3 import connect as db_connect; import os', 'db_connect'),
+            ('from sqlite3 import (connect as db_connect, Connection); import os', 'db_connect'),
+            ('from sqlite3 import *; import os', 'connect'),
+            ('import sqlite3 as open; import os', 'open.connect'),
+            ('from sqlite3 import connect as open; import os', 'open'),
+            ('import sqlite3.dbapi2 as sql; import os', 'sql.connect'),
+            ('from sqlite3.dbapi2 import connect; import os', 'connect'),
+        ]
+        paths = [
+            ('~/.config/spectrum-bridge/state.sqlite', None),
+            ('~/.robob/userdata/readonly/state.sqlite', None),
+            ('~/.robob/userdata/state.sqlite', SCRIPT),
+            ('~/.robob/userdata/statev2.sqlite', SCRIPT),
+            ('~/.t3/userdata/state.sqlite', SCRIPT),
+            ('~/.t3/userdata/statev2.sqlite', SCRIPT),
+            ('~/.local/share/opencode/opencode.db', SCRIPT),
+        ]
+        for declaration, connect in imports:
+            for path, expected in paths:
+                # These imports do not establish the replica's reader proof.
+                if path == '~/.robob/userdata/readonly/state.sqlite' and declaration in {
+                    'from sqlite3 import *; import os',
+                    'import sqlite3.dbapi2 as sql; import os',
+                    'from sqlite3.dbapi2 import connect; import os',
+                }:
+                    expected = SCRIPT
+                with self.subTest(declaration=declaration, path=path):
+                    source = declaration + f'\n{connect}(os.path.expanduser({path!r}))\n'
+                    script = self.write('tmp/python-imports.py', source)
+                    command = 'python3 -I ' + shlex.quote(str(script))
+                    self.assertEqual(self.classify(command), expected)
+                    self.adapters(command, expected)
+                    stdin = "python3 -I - <<'PY'\n" + source + 'PY'
+                    inline_expected = READ if expected else None
+                    self.assertEqual(self.classify(stdin), inline_expected)
+                    self.adapters(stdin, inline_expected)
+
+    def test_foreign_state_sqlite_python_reader_overrides(self):
+        for declaration, mutation, connect in [
+            ('import sqlite3', 'sqlite3 = helper', 'sqlite3.connect'),
+            ('import sqlite3 as sql', 'sql = helper', 'sql.connect'),
+            ('from sqlite3 import connect', 'connect = helper', 'connect'),
+            ('from sqlite3 import connect as db_connect', 'db_connect = helper', 'db_connect'),
+            ('import sqlite3', 'sqlite3.connect = helper', 'sqlite3.connect'),
+            ('import sqlite3 as sql', 'sql.connect = helper', 'sql.connect'),
+            ('import sqlite3 as sql', "setattr(sql, 'connect', helper)", 'sql.connect'),
+            ('import sqlite3 as sql', "sql.__dict__['connect'] = helper", 'sql.connect'),
+            ('from sqlite3 import connect as db_connect', 'def db_connect(f):\n    return f', 'db_connect'),
+            ('import sqlite3 as sql', 'import helpers as sql', 'sql.connect'),
+            ('from sqlite3 import connect as db_connect', 'from helpers import helper as db_connect', 'db_connect'),
+            ('from .sqlite3 import connect', '', 'connect'),
+        ]:
+            with self.subTest(declaration=declaration, mutation=mutation):
+                source = (declaration + '\nimport os\n' + mutation + '\n' +
+                          connect + "(os.path.expanduser('~/.config/spectrum-bridge/state.sqlite'))\n")
+                script = self.write('tmp/python-override.py', source)
+                command = 'python3 -I ' + shlex.quote(str(script))
+                self.assertEqual(self.classify(command), SCRIPT)
+                self.adapters(command, SCRIPT)
+                stdin = "python3 -I - <<'PY'\n" + source + 'PY'
+                self.assertEqual(self.classify(stdin), READ)
+                self.adapters(stdin, READ)
+
     def test_readonly_replica_scripts_and_live_near_misses(self):
         rows = [
             (".robob/userdata/readonly/state.sqlite", None),

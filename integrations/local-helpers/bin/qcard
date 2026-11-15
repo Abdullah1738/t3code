@@ -31,11 +31,14 @@ TEMPLATES = ["price", "stat", "compare", "list", "timeline", "breakdown"]
 TIMEWORDS = re.compile(r"\b(today|tonight|tomorrow|yesterday|now|mon|tue|wed|thu|fri|sat|sun)[a-z]*\b|\d{1,2}:\d{2}|\b\d{1,2}\s?(am|pm)\b", re.I)
 
 
-def log_render(started, ok):
+def log_render(started, ok, *, chat=None, outcome=None, failure_code=None):
     try:
+        chat = chat if chat in ('owner', 'moni') else 'other' if chat else 'unknown'
+        outcome = outcome if outcome in ('ok', 'fallback', 'failed') else 'ok' if ok else 'failed'
+        failure_code = failure_code if failure_code in ('none', 'preview_missing', 'render_exception') else 'none' if ok else 'renderer_failed'
         env = {k: v for k, v in os.environ.items() if k != 'BUN_INSPECT'}
         child = subprocess.Popen([BUN, BRIDGE, 'log-card-render', '--kind', 'quick',
-                                  '--ms', str(max(0, (time.monotonic() - started) * 1000)), '--ok', str(ok).lower()],
+                                  '--ms', str(max(0, (time.monotonic() - started) * 1000)), '--chat', chat, '--outcome', outcome, '--failure-code', failure_code, '--attempt', '1', '--ok', str(ok).lower()],
                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
         # Reap without holding the renderer or its per-order lock for logging.
         threading.Thread(target=child.wait, daemon=True).start()
@@ -202,7 +205,11 @@ def main():
             os.unlink(og_html)
         render_ok = True
     finally:
-        log_render(render_started, render_ok)
+        try:
+            log_render(render_started, render_ok, chat=a.send,
+                       failure_code='none' if render_ok else 'render_exception')
+        except Exception:
+            pass
     caption = card_text(a.caption or meta["caption"])
     sub = card_text(a.subcaption or meta["subcaption"])
     res = dict(dir=out, page=os.path.join(out, "index.html"), og=og_png if not a.no_og else None, slug=slug,

@@ -293,8 +293,9 @@ class PinTests(Isolated):
                     self.assertFalse(any(x.startswith(('delete ', 'forget ', 'would delete ', 'would forget '))
                                          for x in actions), actions)
 
-    def test_pool_does_not_replace_pinned_box_after_transient_404(self):
+    def test_pool_does_not_replace_own_pinned_box_after_transient_404(self):
         self.pinned()
+        common.kv_set(self.con, 'pin_owner:bx_kept', self.me['owner'])
         with patch.object(api, 'get', return_value=None), \
                 patch.object(lease, 'acquire_private', return_value={'box_id': 'bx_new', 'size': 'large'}) as create:
             with self.assertRaisesRegex(common.OffboxError, 'pinned'):

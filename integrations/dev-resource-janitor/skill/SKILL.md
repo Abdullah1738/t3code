@@ -180,6 +180,7 @@ A linked worktree is removed only when all of these hold:
   notes) is tarred to `/Volumes/ExternalSSD/worktree-reaper-archive/<date>/` first.
   Nested repos or more than 500 MB of such data keep the worktree.
 
+Git timeouts skip (keep) that item instead of aborting the run, after one retry for read-only git calls.
 Removal is plain `git worktree remove` (no `--force`). Branches, stashes and commits
 stay, so restore is `git worktree add <path> <branch or sha>` (the audit line has it).
 Missing worktree dirs are only reported, never pruned. Audit

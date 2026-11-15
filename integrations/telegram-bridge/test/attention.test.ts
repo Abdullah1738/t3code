@@ -709,6 +709,95 @@ test("settled sessions are never announced, and leftover review notices are with
   expect(h.store.sessionNotice(notice.id)?.state).toBe("cancelled");
 });
 
+test("a reused cached idle board cannot clear a newer busy event", async () => {
+  const h = setup();
+  const idle = { version: 1 as const, revision: 0, activatedAt: 0, migrationComplete: true,
+    entries: [{ sessionId: "ses_1", directory: "/Chats", title: "Deployment review", state: "waiting" as const,
+      status: "idle", workRevision: 0, updatedAt: now }] };
+  h.backend.board = idle;
+  await h.attention.tick();
+  expect(h.backend.permissionReads).toBe(0);
+  h.attention.processEvent(statusEvent("busy"));
+  await h.attention.tick();
+  await h.attention.tick();
+  expect(h.backend.permissionReads).toBe(2);
+  h.backend.board = { ...idle };
+  await h.attention.tick();
+  expect(h.backend.permissionReads).toBe(2);
+});
+
+test("a board read released by a busy event retains its original event versions", async () => {
+  const h = setup();
+  const idle: BoardSnapshot = { version: 1, revision: 0, activatedAt: 0, migrationComplete: true,
+    entries: [{ sessionId: "ses_1", directory: "/Chats", title: "Deployment review", state: "waiting", status: "idle", workRevision: 0, updatedAt: now }] };
+  let resolve!: (board: BoardSnapshot) => void;
+  const read = new Promise<BoardSnapshot>(done => { resolve = done; });
+  h.backend.sessionBoard = () => read;
+  const tick = h.attention.tick();
+  h.attention.processEvent(statusEvent("busy"));
+  await tick;
+  expect(h.backend.permissionReads).toBe(1);
+  resolve(idle);
+  await h.attention.tick();
+  await h.attention.tick();
+  expect(h.backend.permissionReads).toBe(3);
+  h.backend.sessionBoard = async () => ({ ...idle });
+  await h.attention.tick();
+  expect(h.backend.permissionReads).toBe(3);
+});
+
+test.each([
+  ["pending", "immediate"], ["queued", "immediate"],
+  ["pending", "delayed"], ["queued", "delayed"],
+  ["pending", "in-flight"], ["queued", "in-flight"],
+  ["pending", "failed"], ["queued", "failed"],
+] as const)("a %s notice does not hide other board folders with a %s read", async (state, timing) => {
+  const h = setup();
+  const a = { sessionId: "ses_1", directory: "/Chats", title: "A", state: "running" as const, workRevision: 1, updatedAt: now };
+  const b = { ...a, sessionId: "ses_2", directory: "/Other", title: "B" };
+  const board: BoardSnapshot = { version: 1, revision: 1, activatedAt: 0, migrationComplete: true,
+    entries: timing === "in-flight" || timing === "failed" ? [a, b] : [a] };
+  h.backend.board = board;
+  h.backend.sessions.set("ses_2", { id: "ses_2", directory: "/Other", title: "B", time: { created: now, updated: now } });
+  const reads: string[] = [];
+  h.backend.permissions = async (directory = "/") => {
+    reads.push(directory);
+    return h.backend.permissionRequests.filter(request => h.backend.sessions.get(request.sessionID)?.directory === directory);
+  };
+  h.backend.permissionRequests = [permission()];
+  await h.attention.tick();
+  const [notice] = h.store.pendingSessionNotices();
+  expect(notice).toMatchObject({ sessionId: "ses_1", state: "pending" });
+  if (state === "queued") h.store.enqueueSessionNotice(notice!, "A needs approval");
+  h.backend.permissionRequests.push({ ...permission(), id: "perm_2", sessionID: "ses_2" });
+  const next = { ...board, revision: 2, entries: [a, b] };
+  let finish: (() => void) | undefined;
+  setSystemTime(now + 1_000);
+  if (timing === "immediate") {
+    h.backend.board = next;
+  } else if (timing === "failed") {
+    h.backend.sessionBoard = async () => { throw new Error("board unavailable"); };
+  } else {
+    let resolve!: (board: BoardSnapshot) => void;
+    const read = new Promise<BoardSnapshot>(done => { resolve = done; });
+    h.backend.sessionBoard = () => read;
+    if (timing === "delayed") {
+      await h.attention.tick();
+      expect(h.store.pendingSessionNotices()).toHaveLength(1);
+      resolve(next);
+      await read;
+    } else {
+      finish = () => resolve(next);
+    }
+  }
+  reads.length = 0;
+  await h.attention.tick();
+  expect(reads).toContain("/Other");
+  expect(Object.fromEntries(h.store.pendingSessionNotices().map(row => [row.sessionId, row.state])))
+    .toEqual({ ses_1: state, ses_2: "pending" });
+  finish?.();
+});
+
 test("iMessage conversations and their subagents never prompt on Telegram, even with the iMessage bridge down", async () => {
   const h = setup();
   const imessage = { openchamber: { origin: "imessage", assist: { recap: "r" } } };

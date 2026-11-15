@@ -6,6 +6,21 @@ import { join } from 'node:path';
 import { clean, emit, observed } from '../toollog.mjs';
 
 import {fixture} from './support.mjs';
+test('replica diagnostics only retain finite numbers or unknown', async t => {
+  const {rows} = fixture(t);
+  for (const value of [42, 0, -5_001, 'unknown', 'sk-private', '/home/fixture@example.invalid', '42', NaN, Infinity, null]) {
+    const error = Object.assign(new Error('Robob replica is not ready'), {
+      code:'REPLICA_NOT_READY', replicaGeneration:value, replicaAgeMs:value,
+    });
+    await assert.rejects(observed('test', 'fixture.replica', () => { throw error; }), e => e === error);
+    const expected = typeof value === 'number' && Number.isFinite(value) || value === 'unknown'
+      ? {replicaGeneration:value,replicaAgeMs:value} : undefined;
+    assert.deepEqual(rows().at(-1).props, expected);
+    assert.deepEqual(clean({component:'test',name:'fixture.replica',kind:'error',props:error}).props, expected);
+  }
+  assert.ok(!JSON.stringify(rows()).includes('sk-private'));
+  assert.ok(!JSON.stringify(rows()).includes('fixture@example.invalid'));
+});
 test('observed derives stable causes and only keeps fixed operational messages', async t => {
   const {rows} = fixture(t);
   const cases = [
