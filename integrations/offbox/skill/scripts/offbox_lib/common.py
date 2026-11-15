@@ -717,9 +717,10 @@ def _owner_columns(con) -> None:
         log(f"token owner backfill skipped: {e}")
 
 
-def event(con, box_id: str | None, kind: str, detail: str = "") -> None:
-    # Fetch summaries are bounded JSON; truncating them drops fields and makes analytics unreadable.
-    con.execute("INSERT INTO events VALUES (?,?,?,?)", (now(), box_id, kind, detail if kind == 'logs_fetch' else detail[:2000]))
+def event(con, box_id: str | None, kind: str, detail: str = "", *, limit: int | None = 2000) -> None:
+    # Fetch summaries are bounded JSON; truncating them makes analytics unreadable.
+    payload = detail if kind == 'logs_fetch' or limit is None else detail[:limit]
+    con.execute("INSERT INTO events VALUES (?,?,?,?)", (now(), box_id, kind, payload))
     con.commit()
     log(f"{kind} {box_id or '-'} {detail if kind == 'logs_fetch' else detail[:300]}")
 

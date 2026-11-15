@@ -75,10 +75,10 @@ def check_deletion(con, box_id: str) -> None:
 
 
 @contextlib.contextmanager
-def unpinned(con, box_id: str):
+def unpinned(con, box_id: str, *, locked: bool = False):
     # Separate from the run's box lock: keep must work during a run, and its acknowledgement must serialize
     # with deletion, including the network request. A stale pool/reaper selection cannot overrule a new pin.
-    with file_lock('pin-' + box_id, timeout=120):
+    with contextlib.nullcontext() if locked else file_lock('pin-' + box_id, timeout=120):
         until = pinned_until(con, box_id)
         if until > now():
             by = kv_get(con, 'pin_owner:' + box_id) or 'an unknown thread (legacy pin)'
@@ -87,8 +87,8 @@ def unpinned(con, box_id: str):
         yield
 
 
-def forget_box(con, box_id: str, kind: str, detail: str) -> None:
-    with unpinned(con, box_id):
+def forget_box(con, box_id: str, kind: str, detail: str, *, pin_locked: bool = False) -> None:
+    with unpinned(con, box_id, locked=pin_locked):
         con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
         from . import allocation
         allocation.clear_resume(con, box_id)
@@ -1694,9 +1694,11 @@ def release_hold_if_worker_gone(con, box_id: str) -> bool:
         return False
 
 
-def stop_box(con, box_id: str, reason: str, wait: bool = False, images: bool = True, locked: bool = False) -> bool:
+def stop_box(con, box_id: str, reason: str, wait: bool = False, images: bool = True, locked: bool = False,
+             pin_locked: bool = False) -> bool:
     """Stop a box. locked=True when the caller already holds 'box-<id>' (reap, release, save); then the hold is
-    released with _release_locked, since the lock is not reentrant."""
+    released with _release_locked, since the lock is not reentrant. pin_locked=True also requires 'pin-<id>'
+    held, including when a 404 settles the missing lease."""
     if images:
         keep_images(box_id)
     release = _release_locked if locked else release_if_confirmed
@@ -1710,7 +1712,7 @@ def stop_box(con, box_id: str, reason: str, wait: bool = False, images: bool = T
             # state and the hold, so the reaper revisits this box and releases it on a later pass.
             if release(con, box_id):
                 try:
-                    forget_box(con, box_id, "lease_gone", f"404 during stop: {reason}")
+                    forget_box(con, box_id, "lease_gone", f"404 during stop: {reason}", pin_locked=pin_locked)
                 except PinnedLeaseError as pin:
                     say(str(pin))
             return False

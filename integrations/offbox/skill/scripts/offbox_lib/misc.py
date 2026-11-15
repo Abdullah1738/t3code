@@ -117,7 +117,7 @@ def list_leases(me: dict, show_all: bool, as_json: bool) -> None:
         print("no leases" + ("" if show_all else " for this thread (use --all)"))
     for d in out:
         pin = " pinned" if (d.get("pinned_until") or 0) > now() else ""
-        note = f"  [{d['note']}]" if d['state'] == 'resume_stalled' or (d.get("note") or "").startswith((TOO_BIG_NOTE, DEAD_MOUNT_NOTE, BOX_WEDGED_NOTE)) else ""
+        note = f"  [{d['note']}]" if d['state'] == 'resume_stalled' or (d.get("note") or "").startswith((TOO_BIG_NOTE, DEAD_MOUNT_NOTE, BOX_WEDGED_NOTE, pool.RECYCLED_NOTE)) else ""
         print(f"{d['box_id']:<12} {d['state']:<8} {d['size'] or '':<8} {d['repo_key']:<24} used {ago(d['last_used_at']):>6} "
               f"ago runs:{d['active_runs']}{pin}{note}  {d['source'] or ''}  {(d['thread_title'] or d['owner'])[:40]}")
 
@@ -206,6 +206,9 @@ def _release_one(con, r, delete, me=None):
             pin = lease.foreign_pin(con, r['box_id'], me)
             if pin:
                 print(f"stopped {r['box_id']} (disk kept; pinned by {pin[0]} until {iso(pin[1])}; other runs won't pick it)")
+                return
+            if (r['note'] or '').startswith(pool.RECYCLED_NOTE):
+                print(f"stopped {r['box_id']} (disk kept; detached from the repository pool)")
                 return
             print(f"stopped {r['box_id']} (free; disk kept; next offbox run resumes it)")
 
@@ -625,6 +628,9 @@ def status(me: dict) -> None:
             reason = lease.boot_dead(con, b['id'])
             if reason:
                 held += f' set aside [{reason}]'
+            retained = con.execute('SELECT note FROM leases WHERE box_id=?', (b['id'],)).fetchone()
+            if retained and (retained['note'] or '').startswith(pool.RECYCLED_NOTE):
+                held += f" detached [{retained['note']}]"
             print(f"  {b['id']:<12} {b.get('state'):<9} {b.get('type'):<8} {(b.get('name') or '')[:60]}{held}")
     except OffboxError as e:
         print(f"boxes: boat API unreachable ({e})")
