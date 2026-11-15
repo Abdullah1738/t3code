@@ -23,7 +23,7 @@ const values: Record<string, readonly string[]> = {
   state: ["pending", "sending", "sent", "uncertain", "cancelled", "failed", "scheduled", "queued", "done", "expired", "paused", "active"],
   stderrClass: ["usage_error", "missing_file", "permission", "timeout", "python_traceback", "auth", "connect", "json", "unknown"],
   triggerKind: ["file", "wal"],
-  step: ["native", "status"],
+  step: ["native", "status", "send"],
   route: ["person", "owner", "group", "creator", "other"],
   via: ["wake", "thread", "imessage-send", "telegram", "none"],
 };
@@ -62,7 +62,7 @@ function fields(entry: LogEntry, at: Date) {
     else if ((entry.name === "watch.grace_ended" || entry.name === "watch.removed") && key === "reason" && typeof value === "string"
       && ["expired", "resume", "now", "paused", "no_inflight_check"].includes(value)) props[key] = value;
     else if (entry.name === "wake.creator_fallback" && key === "reason" && typeof value === "string"
-      && /^(?:timeout|invalid|archived|exit:\d{1,3})$/.test(value)) props[key] = value;
+      && /^(?:timeout|invalid|archived|error|exit:\d{1,3})$/.test(value)) props[key] = value;
     else if (entry.name === "wake.creator_fallback" && key === "durationMs" && typeof value === "number"
       && Number.isFinite(value) && value >= 0) props[key] = value;
     else if (numeric.has(key) && typeof value === "number" && Number.isFinite(value)) props[key] = value;
