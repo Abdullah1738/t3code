@@ -230,7 +230,9 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
             durationMs: event.elapsedMs,
             // ready=0 is private when a completed generation survives the reset.
             visibility:
-              event.event === "start" && event.publishedReady === "1" ? "unpublished" : "published",
+              event.event !== "publish" && event.publishedReady === "1"
+                ? "unpublished"
+                : "published",
           }),
         );
     }

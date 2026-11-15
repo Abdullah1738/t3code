@@ -154,10 +154,20 @@ it.effect("reset progress logs survive the watchdog interval without replacing t
     );
     assert.isTrue(logs.some((row) => row.message === "Readonly events reset progress"));
     assert.isTrue(
+      logs
+        .filter(
+          (row) =>
+            row.message === "Readonly replica ready cleared" ||
+            row.message === "Readonly events reset progress",
+        )
+        .every((row) => JSON.stringify(row.annotations).includes('"visibility":"unpublished"')),
+    );
+    assert.isTrue(
       logs.some(
         (row) =>
           row.message === "Readonly replica ready restored" &&
-          JSON.stringify(row.annotations).includes('"durationMs":720000'),
+          JSON.stringify(row.annotations).includes('"durationMs":720000') &&
+          JSON.stringify(row.annotations).includes('"visibility":"published"'),
       ),
     );
     assert.isAtLeast(

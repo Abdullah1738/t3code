@@ -473,6 +473,81 @@ const auxiliaryTables = [
   { name: "ardud_kanban_threads", key: "thread_id", row: "'task',0" },
 ];
 
+for (const phase of ["delete", "copy", "prune"] as const) {
+  for (const terminal of ["publish", "close"] as const) {
+    test.each(auxiliaryTables)(
+      `$name auxiliary changes during reset ${phase} preserve the old generation until ${terminal}`,
+      ({ name, row }) => {
+        const f = fixture(1);
+        f.source.exec(`INSERT INTO ${name} VALUES (${row});
+          INSERT INTO orchestration_events VALUES
+          (2,'thread.metadata-updated','a','{}'),(3,'thread.metadata-updated','a','{}'),
+          (4,'thread.metadata-updated','a','{}'),(5,'thread.metadata-updated','a','{}'),
+          (6,'thread.metadata-updated','a','{}')`);
+        f.finish();
+        const out = f.connect();
+        let generation = metaValue(out, "generation");
+        const watermark = metaValue(out, "updated_at");
+        const revision = metaValue(out, "lineage_repair_revision");
+        const events = out.prepare("SELECT * FROM orchestration_events ORDER BY sequence").all();
+        const schema = out.prepare("SELECT sql FROM sqlite_schema WHERE name=?").get(name)?.sql;
+        const checkPublished = () => {
+          expect(metaValue(out, "ready")).toBe("1");
+          expect(metaValue(out, "generation")).toBe(generation);
+          expect(metaValue(out, "updated_at")).toBe(watermark);
+          expect(metaValue(out, "lineage_repair_revision")).toBe(revision);
+          expect(out.prepare("SELECT * FROM orchestration_events ORDER BY sequence").all()).toEqual(
+            events,
+          );
+          expect(out.prepare("SELECT sql FROM sqlite_schema WHERE name=?").get(name)?.sql).toBe(
+            schema,
+          );
+        };
+        f.exporter.takeMetrics();
+        f.source.exec(
+          "INSERT INTO orchestration_events VALUES (8,'thread.metadata-updated','a','{}')",
+        );
+        let scans = 0;
+        for (let step = 0; ; step++) {
+          expect(f.exporter.step()).toBe(true);
+          const metrics = f.exporter.takeMetrics();
+          scans += metrics.phaseSteps.resetScan ?? 0;
+          if (
+            (phase === "delete" && metrics.phaseSteps.resetDelete) ||
+            (phase === "copy" && scans >= 1) ||
+            (phase === "prune" && scans >= 5)
+          )
+            break;
+          if (step > 100) throw new Error("reset phase was not reached");
+        }
+        checkPublished();
+        f.source.exec(`ALTER TABLE ${name} ADD COLUMN cache_version INTEGER NOT NULL DEFAULT 7`);
+        expect(f.exporter.step()).toBe(true);
+        checkPublished();
+        expect(
+          f.rebuilds.filter((event) => event.kind === "events_reset" && event.event === "start"),
+        ).toHaveLength(1);
+        if (terminal === "close") {
+          f.exporter.close();
+          checkPublished();
+          f.restart();
+          generation = metaValue(out, "generation");
+        }
+        for (let step = 0; f.exporter.step(); step++) {
+          checkPublished();
+          if (step > 500) throw new Error("schema refresh reset did not converge");
+        }
+        expect(metaValue(out, "ready")).toBe("1");
+        expect(metaValue(out, "sequence")).toBe("8");
+        expect(Number(metaValue(out, "lineage_repair_revision"))).toBe(Number(revision) + 1);
+        expect(out.prepare(`SELECT cache_version FROM ${name}`).all()).toEqual([
+          { cache_version: 7 },
+        ]);
+      },
+    );
+  }
+}
+
 for (const mode of ["reopen", "staging", "catchup"] as const) {
   test.each(auxiliaryTables)(
     `$name schema refresh preserves the published replica (${mode})`,
@@ -3243,6 +3318,50 @@ test("repeated gaps during a full schema rebuild cannot publish a partial reset"
   expect(metaValue(out, "ready")).toBe("1");
   expect(metaValue(out, "sequence")).toBe("5");
 });
+
+test.each(["published", "full", "bootstrap"])(
+  "nested gaps during %s report the original published readiness",
+  (mode) => {
+    const f = fixture(1);
+    if (mode !== "bootstrap") f.finish();
+    let exporter = f.exporter;
+    if (mode === "full") {
+      f.exporter.close();
+      f.source.exec(
+        "ALTER TABLE orchestration_v2_projection_run_attempts RENAME COLUMN payload_json TO owner_payload_json",
+      );
+      exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, {
+        ...f.options,
+        onRebuildEvent: (event) => f.rebuilds.push(event),
+      });
+      cleanups.push(() => exporter.close());
+    }
+    f.rebuilds.length = 0;
+    exporter.step();
+    f.source.exec("INSERT INTO orchestration_events VALUES (3,'thread.metadata-updated','a','{}')");
+    let addedGap = false;
+    const out = f.connect();
+    for (let step = 0; exporter.step(); step++) {
+      expect(metaValue(out, "ready")).toBe(mode === "bootstrap" ? "0" : "1");
+      if (!addedGap && f.rebuilds.some((event) => event.kind === "events_reset")) {
+        f.source.exec(
+          "INSERT INTO orchestration_events VALUES (5,'thread.metadata-updated','a','{}')",
+        );
+        addedGap = true;
+      }
+      if (step > 500) throw new Error("nested resets did not converge");
+    }
+    const starts = f.rebuilds.filter(
+      (event) => event.kind === "events_reset" && event.event === "start",
+    );
+    expect(starts).toHaveLength(2);
+    expect(starts.map((event) => event.firstMissingSequence)).toEqual([2, 4]);
+    expect(starts.map((event) => event.publishedReady)).toEqual(
+      mode === "bootstrap" ? ["0", "0"] : ["1", "1"],
+    );
+    expect(metaValue(out, "ready")).toBe("1");
+  },
+);
 
 test("column backfill cannot publish a run transition without its matching Stop item", () => {
   const f = fixture(1);

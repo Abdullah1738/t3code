@@ -1539,8 +1539,9 @@ export function createReadonlyReplica(
           throw invalidate("Readonly source schema changed; restart export", true);
         if (changed.length) {
           // Routine pending diffs must restart at the new auxiliary shape.
-          // A private full rebuild keeps its transaction and completed projection pages.
-          if (!privateSchemaRebuild) abortCycle();
+          // Private resets and full rebuilds keep their projection pages; aborting
+          // here would let the next reset step mutate the published generation.
+          if (getMeta("ready") === "1") abortCycle();
           for (const table of changed) {
             pendingAuxiliarySchemas.set(table.name, table);
             configureTable(table);
@@ -1726,7 +1727,7 @@ export function createReadonlyReplica(
           if (!rows.length || missingIndex !== -1) {
             const firstMissingSequence =
               missingIndex > 0 ? Number(rows[missingIndex - 1]!.sequence) + 1 : cursor + 1;
-            const publishedReady = getMeta("ready") ?? "0";
+            const publishedReady = rebuild?.details.publishedReady ?? getMeta("ready") ?? "0";
             // Discard a routine partial cycle before publishing diagnostics.
             // A full rebuild owns unpublished schemas, so its transaction and
             // already advertised start time must survive this reset.
