@@ -77,6 +77,46 @@ test("reset pages keep sending heartbeats across a twenty minute scan", () => {
   assert.isAtMost(Math.max(...beats.map((at, i) => at - (beats[i - 1] ?? 0))), 5_260);
 });
 
+it.effect("phase timings report maximum publication lag and auxiliary window", () =>
+  Effect.gen(function* () {
+    const worker = Object.assign(new NodeEvents.EventEmitter(), { terminate: async () => 0 });
+    const logs: Array<{ message: string; annotations: unknown }> = [];
+    const logger = Logger.map(Logger.formatStructured, ({ message, annotations }) =>
+      logs.push({ message: String(message), annotations }),
+    );
+    const fiber = yield* Effect.forkScoped(
+      superviseExportWorker(() => worker as unknown as ExportWorker).pipe(
+        Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+      ),
+      { startImmediately: true },
+    );
+    yield* Effect.yieldNow;
+    for (const [updatedAtLagMs, auxiliaryWindowMs] of [
+      [4_000, 3_000],
+      [2_000, 5_000],
+    ])
+      worker.emit("message", {
+        type: "metrics",
+        metrics: {
+          phaseMs: { auxiliary: 1 },
+          phaseSteps: { auxiliary: 1 },
+          lineageRepairs: [],
+          lineageRepairCounts: {},
+          identityRows: 0,
+          identityLagMaxMs: 0,
+          updatedAtLagMs,
+          auxiliaryWindowMs,
+        },
+      });
+    yield* TestClock.adjust("30 seconds");
+    const phases = logs.filter((row) => row.message === "Readonly export phase timings");
+    assert.lengthOf(phases, 1);
+    assert.include(JSON.stringify(phases[0]!.annotations), '"updatedAtLagMs":4000');
+    assert.include(JSON.stringify(phases[0]!.annotations), '"auxiliaryWindowMs":5000');
+    yield* Fiber.interrupt(fiber);
+  }),
+);
+
 it.effect("reset progress logs survive the watchdog interval without replacing the worker", () =>
   Effect.gen(function* () {
     let terminated = 0;
