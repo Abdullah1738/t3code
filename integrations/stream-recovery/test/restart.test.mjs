@@ -10,6 +10,7 @@ import {
 } from '../lib/detect.mjs';
 import { restartScan, RESTART_SETTLE_MS, RESTART_RESUME_WINDOW_MS } from '../lib/restartwatch.mjs';
 import { fixture as logFixture } from '../../router-logging/test/support.mjs';
+import { assertScanProps } from './scan-props.mjs';
 
 // Fixtures modelled on the 15 Oct 18:17Z restart (statev2 rows, OpenCode messages).
 const T0 = Date.parse('2026-10-15T18:17:44.747Z');
@@ -545,7 +546,7 @@ test('an ahead delegated child defers its initial parent note while another pare
   assert.equal(calls.telegram.length, 0);
   const row = rows().find(row => row.name === 'restart.scan');
   assert.equal(row.ok, true);
-  assert.deepEqual(row.props, {deferredThreads:1,maxThreadAheadMs:1_500});
+  assertScanProps(row.props, {deferredThreads:1,maxThreadAheadMs:1_500});
 });
 
 for (const target of ['parent', 'child']) test(`a late ${target} deferral leaves its tasks pending and recovers another parent`, async t => {
@@ -586,7 +587,7 @@ for (const target of ['parent', 'child']) test(`a late ${target} deferral leaves
     assert.deepEqual(calls.send.map(call => call.threadId), ['batch','healthy']);
     const row = rows().filter(row => row.name === 'restart.scan').at(-1);
     assert.equal(row.ok, true);
-    assert.deepEqual(row.props, {deferredThreads:1,maxThreadAheadMs:1_500});
+    assertScanProps(row.props, {deferredThreads:1,maxThreadAheadMs:1_500});
   }
   blocked = null;
   await restartScan(scanArgs(state, {now:T0+100_000}), io);

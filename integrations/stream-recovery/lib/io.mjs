@@ -5,6 +5,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { emit, failure } from './logging.mjs';
 import { assertRecoveryActive, loadControl, recoveryElapsed } from './pause.mjs';
 import { isOpenCodeSessionId, parseCutoverStatus } from './harness.mjs';
 import { assertReplicaPath, guardReplica, registerReplica, replicaPath } from './readonly-db.mjs';
@@ -393,15 +394,37 @@ export async function harnessCutoverStatus({ withClaims = false } = {}) {
   return parseCutoverStatus(await ctl('GET', `/harness-cutover/status${withClaims ? '?claims=1' : ''}`));
 }
 
+const staleSocketTags = new Set(['EPIPE', 'ECONNRESET', 'UND_ERR_SOCKET', 'UND_ERR_CLOSED']);
+
+export async function fetchIdempotent(target, url, init = {}, timeoutMs) {
+  // Keep fetch looked up at call time so node:test can replace it, as the other
+  // transport tests do. Each attempt owns a fresh timeout signal.
+  const attempt = () => fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+  try { return await attempt(); }
+  catch (error) {
+    if ((init.method ?? 'GET').toUpperCase() !== 'GET' || init.body != null
+      || !(error instanceof TypeError) || error.message !== 'fetch failed') throw error;
+    const tag = failure(error).tag;
+    if (!staleSocketTags.has(tag) || error.cause?.code !== tag) throw error;
+    let ok = false;
+    try {
+      const response = await attempt();
+      ok = response.ok;
+      return response;
+    } finally {
+      emit('stream-recovery', 'http.retry', { props:{target,tag,ok} });
+    }
+  }
+}
+
 async function api(method, path, body) {
   const { url, token } = control();
   if (method !== "GET") assertRecoveryActive({ readControl });
-  const res = await fetch(`${url}${path}`, {
+  const res = await fetchIdempotent('control', `${url}${path}`, {
     method,
     headers: { authorization: `Bearer ${token}`, ...(body ? { "content-type": "application/json" } : {}) },
     body: body ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(15_000),
-  });
+  }, 15_000);
   const data = parse(await res.text());
   if (!res.ok || data.ok === false) {
     const e = new Error(`control ${method} ${path}: ${res.status} ${data.error?.message || data.message || ""}`.trim());
@@ -551,11 +574,10 @@ async function oc(path, init = {}) {
   }
   ocAuth ??= "Basic " + Buffer.from(`opencode:${readFileSync(PATHS.ocPassword, "utf8").trim()}`).toString("base64");
   if (init.method && init.method !== "GET") assertRecoveryActive({ readControl });
-  const res = await fetch(`${OC_URL}${path}`, {
+  const res = await fetchIdempotent('opencode', `${OC_URL}${path}`, {
     ...init,
     headers: { authorization: ocAuth, ...(init.headers || {}) },
-    signal: AbortSignal.timeout(20_000),
-  });
+  }, 20_000);
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`opencode ${path}: ${res.status}`);
   return parse(await res.text());
