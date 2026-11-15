@@ -3512,15 +3512,25 @@ function identityVersionFixture(batchSize = 100) {
   return fixture(batchSize, (source) => {
     for (const [name, primary] of identityVersionTables) {
       if (name === "ardud_opencode_import")
-        source.exec(`ALTER TABLE ${name} ADD COLUMN payload_json TEXT DEFAULT '{}'`);
+        source.exec(`DROP TABLE ${name}; CREATE TABLE ${name} (
+          native_session_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL UNIQUE,
+          imported_at TEXT NOT NULL, payload_json TEXT DEFAULT '{}'
+        )`);
       source.exec(`ALTER TABLE ${name} ADD COLUMN identity_scalar TEXT DEFAULT 'before';
         ALTER TABLE ${name} ADD COLUMN updated_at TEXT DEFAULT '2026-11-14T00:00:00Z';
         ALTER TABLE ${name} ADD COLUMN deleted_at TEXT`);
       if (name.endsWith("_provider_turns"))
         source.exec(`ALTER TABLE ${name} ADD COLUMN thread_id TEXT;
           ALTER TABLE ${name} ADD COLUMN node_id TEXT`);
-      for (const id of ["version-main", "version-peer"])
-        source.prepare(`INSERT INTO ${name}(${primary},payload_json) VALUES (?,'{}')`).run(id);
+      for (const id of ["version-main", "version-peer"]) {
+        if (name === "ardud_opencode_import")
+          source
+            .prepare(
+              `INSERT INTO ${name}(native_session_id,thread_id,imported_at) VALUES (?,?,'2026-11-14T00:00:00Z')`,
+            )
+            .run(id, `${id}-owner`);
+        else source.prepare(`INSERT INTO ${name}(${primary},payload_json) VALUES (?,'{}')`).run(id);
+      }
     }
   });
 }
@@ -3785,12 +3795,136 @@ test("identity versions: auxiliary replacement updates and deletes converge", ()
   expect(Number.isNaN(identityVersion(out, name, "version-peer"))).toBe(true);
   const updated = identityVersion(out, name);
   f.source.exec(
-    `INSERT OR REPLACE INTO ${name}(native_session_id,thread_id) VALUES ('version-main','replacement-owner')`,
+    `INSERT OR REPLACE INTO ${name}(native_session_id,thread_id,imported_at) VALUES ('version-main','replacement-owner','2026-11-14T00:00:00Z')`,
   );
   f.finish();
   expect(identityVersion(out, name)).toBeGreaterThan(updated);
   expectIdentityCoverage(out);
 });
+
+const importReplacements = [
+  {
+    kind: "new session takes an existing owner",
+    mutation:
+      "INSERT OR REPLACE INTO ardud_opencode_import(native_session_id,thread_id,imported_at) VALUES ('replacement','version-main-owner','2026-11-14T00:00:00Z')",
+    expected: [
+      ["replacement", "version-main-owner"],
+      ["version-peer", "version-peer-owner"],
+    ],
+    changed: ["replacement"],
+    removed: ["version-main"],
+  },
+  {
+    kind: "existing session takes another session's owner",
+    mutation:
+      "INSERT OR REPLACE INTO ardud_opencode_import(native_session_id,thread_id,imported_at) VALUES ('version-main','version-peer-owner','2026-11-14T00:00:00Z')",
+    expected: [["version-main", "version-peer-owner"]],
+    changed: ["version-main"],
+    removed: ["version-peer"],
+  },
+  {
+    kind: "existing session changes to an unused owner",
+    mutation:
+      "INSERT OR REPLACE INTO ardud_opencode_import(native_session_id,thread_id,imported_at) VALUES ('version-main','unused-owner','2026-11-14T00:00:00Z')",
+    expected: [
+      ["version-main", "unused-owner"],
+      ["version-peer", "version-peer-owner"],
+    ],
+    changed: ["version-main"],
+    removed: [],
+  },
+  {
+    kind: "existing session keeps its owner and changes payload",
+    mutation: `INSERT OR REPLACE INTO ardud_opencode_import(native_session_id,thread_id,imported_at,payload_json) VALUES ('version-main','version-main-owner','2026-11-14T00:00:00Z','{"replacement":true}')`,
+    expected: [
+      ["version-main", "version-main-owner"],
+      ["version-peer", "version-peer-owner"],
+    ],
+    changed: ["version-main"],
+    removed: [],
+  },
+  {
+    kind: "surviving sessions swap owners",
+    mutation:
+      "INSERT OR REPLACE INTO ardud_opencode_import(native_session_id,thread_id,imported_at) VALUES ('version-main','version-peer-owner','2026-11-14T00:00:00Z'); INSERT OR REPLACE INTO ardud_opencode_import(native_session_id,thread_id,imported_at) VALUES ('version-peer','version-main-owner','2026-11-14T00:00:00Z')",
+    expected: [
+      ["version-main", "version-peer-owner"],
+      ["version-peer", "version-main-owner"],
+    ],
+    changed: ["version-main", "version-peer"],
+    removed: [],
+  },
+  {
+    kind: "new session takes an owner released by a surviving session",
+    mutation:
+      "UPDATE ardud_opencode_import SET thread_id='unused-owner' WHERE native_session_id='version-main'; INSERT INTO ardud_opencode_import(native_session_id,thread_id,imported_at) VALUES ('replacement','version-main-owner','2026-11-14T00:00:00Z')",
+    expected: [
+      ["replacement", "version-main-owner"],
+      ["version-main", "unused-owner"],
+      ["version-peer", "version-peer-owner"],
+    ],
+    changed: ["replacement", "version-main"],
+    removed: [],
+  },
+];
+
+test.each(importReplacements)(
+  "identity versions: import replacement when $kind is atomic",
+  ({ mutation, expected, changed, removed }) => {
+    const f = identityVersionFixture(1);
+    const name = identityVersionTables[4][0];
+    f.source.exec(
+      "INSERT INTO ardud_opencode_import(native_session_id,thread_id,imported_at) VALUES ('stable','stable-owner','2026-11-14T00:00:00Z')",
+    );
+    f.finish();
+    const out = f.connect();
+    const pinned = f.connect();
+    pinned.exec("BEGIN");
+    const before = identityCensus(pinned);
+    const sequence = identitySequenceValue(pinned);
+    f.source.exec(mutation);
+    let steps = 0;
+    while (f.exporter.step()) {
+      expectIdentityCoverage(out);
+      expect(identityCensus(out)).toEqual(before);
+      if (++steps > 500) throw new Error("import replacement did not converge");
+    }
+    expect(steps).toBeGreaterThan(1);
+    expect(identityCensus(pinned)).toEqual(before);
+    pinned.exec("ROLLBACK");
+    expect(
+      out
+        .prepare(
+          "SELECT native_session_id,thread_id FROM ardud_opencode_import ORDER BY native_session_id",
+        )
+        .all(),
+    ).toEqual(
+      [...expected, ["stable", "stable-owner"]]
+        .sort(([a], [b]) => a!.localeCompare(b!))
+        .map(([native_session_id, thread_id]) => ({ native_session_id, thread_id })),
+    );
+    expectIdentityCoverage(out);
+    for (const id of changed) expect(identityVersion(out, name, id)).toBeGreaterThan(sequence);
+    for (const id of removed) expect(Number.isNaN(identityVersion(out, name, id))).toBe(true);
+    expect(
+      identityCensus(out).filter(
+        (r) =>
+          r.table_name !== name ||
+          (!changed.includes(String(r.row_id)) && !removed.includes(String(r.row_id))),
+      ),
+    ).toEqual(
+      before.filter(
+        (r) =>
+          r.table_name !== name ||
+          (!changed.includes(String(r.row_id)) && !removed.includes(String(r.row_id))),
+      ),
+    );
+    const committed = identityCensus(out);
+    f.restart();
+    f.finish();
+    expect(identityCensus(out)).toEqual(committed);
+  },
+);
 
 test("identity versions: a throwing exporter publication rolls back row versions and sequence together", () => {
   const f = identityVersionFixture();
@@ -3798,9 +3932,12 @@ test("identity versions: a throwing exporter publication rolls back row versions
   const out = f.connect();
   const before = identityCensus(out);
   const sequence = identitySequenceValue(out);
+  const imports = out
+    .prepare("SELECT * FROM ardud_opencode_import ORDER BY native_session_id")
+    .all();
   writeReplica(f, (db) =>
     db.exec(
-      "CREATE TRIGGER fail_import BEFORE UPDATE ON ardud_opencode_import BEGIN SELECT RAISE(ABORT,'injected publication failure'); END",
+      "CREATE TRIGGER fail_import BEFORE INSERT ON ardud_opencode_import WHEN NEW.native_session_id='version-main' BEGIN SELECT RAISE(ABORT,'injected publication failure'); END",
     ),
   );
   f.source.exec(
@@ -3810,6 +3947,9 @@ test("identity versions: a throwing exporter publication rolls back row versions
   expect(() => f.finish()).toThrow("injected publication failure");
   expect(identityCensus(out)).toEqual(before);
   expect(identitySequenceValue(out)).toBe(sequence);
+  expect(
+    out.prepare("SELECT * FROM ardud_opencode_import ORDER BY native_session_id").all(),
+  ).toEqual(imports);
   expectIdentityCoverage(out);
   writeReplica(f, (db) => db.exec("DROP TRIGGER fail_import"));
   f.restart();

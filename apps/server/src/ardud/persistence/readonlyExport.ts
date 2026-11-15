@@ -1082,11 +1082,13 @@ export function createReadonlyReplica(
         const { stage } = auxiliaryStages.get(name)!;
         const { primary, columns } = tables.get(name)!;
         const values = columns.filter((c) => c !== primary);
+        // Release obsolete unique owners before copying replacements. Import
+        // bindings can also swap owners while both session keys survive.
+        out.exec(
+          `DELETE FROM main.${q(name)} WHERE NOT EXISTS (SELECT 1 FROM temp.${q(stage)} s WHERE s.${q(primary)}=main.${q(name)}.${q(primary)}${name === "ardud_opencode_import" ? ` AND s.thread_id IS main.${q(name)}.thread_id` : ""})`,
+        );
         out.exec(`INSERT INTO main.${q(name)} (${columns.map(q)}) SELECT ${columns.map(q)} FROM temp.${q(stage)} WHERE 1
           ON CONFLICT(${q(primary)}) ${values.length ? `DO UPDATE SET ${values.map((c) => `${q(c)}=excluded.${q(c)}`).join(",")} WHERE ${values.map((c) => `${q(name)}.${q(c)} IS NOT excluded.${q(c)}`).join(" OR ")}` : "DO NOTHING"}`);
-        out.exec(
-          `DELETE FROM main.${q(name)} WHERE NOT EXISTS (SELECT 1 FROM temp.${q(stage)} s WHERE s.${q(primary)}=main.${q(name)}.${q(primary)})`,
-        );
       }
     };
     const upsertEvent = out.prepare("INSERT OR REPLACE INTO orchestration_events VALUES (?,?,?,?)");
