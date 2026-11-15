@@ -1,3 +1,4 @@
+import * as SqlClient from "effect/sql/SqlClient";
 import * as NetAddress from "effect/net/NetAddress";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
@@ -652,6 +653,7 @@ function layerTest(input: {
     ),
   );
   return Layer.mergeAll(
+    layerTestDatabase,
     layerTestStores,
     layerConfiguredEventSink,
     EffectOutbox.layer.pipe(Layer.provide(layerTestDatabase)),
@@ -4366,7 +4368,9 @@ const openSessionWithBackgroundCommand = (fixtureName: string) =>
     yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
     const rosters = Effect.gen(function* () {
       const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
-      const projection = yield* projectionStore.getThreadProjection(threadId);
+      const projection = yield* projectionStore.getThreadRecords(threadId, ["providerThreads"], {
+        providerThreadIds: providerThreads.map((p) => p.id),
+      });
       return providerThreads.map((seeded) =>
         (
           projection.providerThreads.find((thread) => thread.id === seeded.id)
@@ -4384,10 +4388,10 @@ it.effect(
       const state = yield* Ref.make(emptyState);
       const effect = Effect.gen(function* () {
         const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
-        const { threadId, providerSessionId, rosters } = yield* openSessionWithBackgroundCommand(
-          "provider-session-manager-detach-roster",
-        );
+        const { threadId, providerSessionId, providerThreads, rosters } =
+          yield* openSessionWithBackgroundCommand("provider-session-manager-detach-roster");
         assert.deepStrictEqual(yield* rosters, [["dev-server"], ["dev-server"]]);
+        yield* seedUnreadProviderHistory(providerThreads[0]!.id);
 
         yield* manager.detach({ providerSessionId, threadId, detail: "Thread settled." });
 
@@ -7304,6 +7308,28 @@ it.effect(
     }),
 );
 
+const seedUnreadProviderHistory = Effect.fn("test.seedUnreadProviderHistory")(function* (
+  providerThreadId: string,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  yield* sql`INSERT INTO orchestration_v2_projection_provider_threads
+    (provider_thread_id, thread_id, owner_node_id, provider, provider_instance_id,
+      provider_session_id, status, first_run_ordinal, last_run_ordinal, updated_at, payload_json)
+    SELECT provider_thread_id || '-history-' || value, thread_id, NULL, provider, provider_instance_id,
+      provider_session_id, 'idle', NULL, NULL, updated_at,
+      json_object('nativeThreadRef', json_object('nativeId', 'old-' || value))
+    FROM orchestration_v2_projection_provider_threads
+    CROSS JOIN json_each(${JSON.stringify(Array.from({ length: 2000 }, (_, i) => i))})
+    WHERE provider_thread_id = ${providerThreadId}`;
+  yield* sql`INSERT INTO orchestration_v2_projection_runs
+    (run_id, thread_id, ordinal, provider, status, requested_at, completed_at, payload_json)
+    SELECT provider_thread_id || '-old-run-' || value, thread_id, value, provider, 'completed',
+      updated_at, updated_at, '{}'
+    FROM orchestration_v2_projection_provider_threads
+    CROSS JOIN json_each(${JSON.stringify(Array.from({ length: 2000 }, (_, i) => i + 1))})
+    WHERE provider_thread_id = ${providerThreadId}`;
+});
+
 const orphanSweepFixture = Effect.fn("test.orphanSweepFixture")(function* (count: number) {
   const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
   const eventSink = yield* EventSink.EventSinkV2;
@@ -7384,6 +7410,7 @@ it.effect("orphan sweep reaps missed registrations and keeps busy and unknown th
     const state = yield* Ref.make(emptyState);
     yield* Effect.gen(function* () {
       const fixture = yield* orphanSweepFixture(2);
+      yield* seedUnreadProviderHistory(fixture.threads[0]!.providerThread.id);
       yield* TestClock.adjust("1 second");
       yield* fixture.sweep;
       assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, ["orphan-native-0"]);
