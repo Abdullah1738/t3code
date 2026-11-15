@@ -1444,6 +1444,14 @@ type SentStopTarget =
   | { readonly messageId: string; readonly runId?: never };
 type BoardEffectBody =
   | {
+      readonly kind: "ownerWake";
+      readonly cardId: KanbanCardId;
+      readonly threadId: ThreadId;
+      readonly moveId: number;
+      readonly startedAt: string | null;
+      readonly text: string;
+    }
+  | {
       readonly kind: "send";
       readonly threadId: string;
       readonly text: string;
@@ -5927,7 +5935,7 @@ const make = Effect.gen(function* () {
       link.paused != null ||
       inFlightStops.has(threadId) ||
       pendingRunStops.has(threadId) ||
-      (pendingStops.get(threadId)?.size ?? 0) > 0
+      [...(pendingStops.get(threadId)?.values() ?? [])].some((entry) => entry.kind === "interrupt")
     )
       return base;
     const view = yield* threads.view(threadId).pipe(Effect.orElseSucceed(() => null));
@@ -5939,13 +5947,28 @@ const make = Effect.gen(function* () {
       view.runStatus === "cancelled"
     )
       return base;
+    // A terminal run disappears from the shell's activeRunId. Its persisted
+    // identity/status still distinguishes a stopped worker from a live idle one.
+    const latest = yield* Effect.result(threads.latestRun(threadId));
+    if (Result.isFailure(latest)) return base;
+    const status =
+      view.runId == null || latest.success?.runId === view.runId
+        ? (latest.success?.status ?? view.runStatus)
+        : view.runStatus;
+    if (
+      status !== undefined &&
+      status !== null &&
+      ["failed", "interrupted", "cancelled", "rolled_back"].includes(status)
+    )
+      return base;
     const cards = yield* store.openCards(card.boardId);
     const pools = yield* store.pools(card.boardId);
     const model = yield* threads.model(threadId).pipe(Effect.orElseSucceed(() => null));
+    if (model === null) return base;
     // A model switch while parked owns its new pool; never put the same thread in two pools.
     const pool =
       cards.find((other) => other.activeThreadId === threadId)?.activePool ??
-      (model === null ? parked.pool : Rules.poolOf(pools, model));
+      Rules.poolOf(pools, model);
     const used = Rules.poolThreads(cards, yield* boardHolds(card.boardId)).get(pool) ?? new Set();
     const slots = pools.find((entry) => entry.key === pool)?.slots ?? 0;
     const admitted = used.size + (used.has(threadId) ? 0 : 1);
@@ -5967,7 +5990,45 @@ const make = Effect.gen(function* () {
       activeThreadId: threadId,
       activeRole: "work" as const,
       activePool: pool,
+      model,
     };
+  });
+
+  const sendOwnerWake = Effect.fn("KanbanService.sendOwnerWake")(function* (
+    wake: Extract<BoardEffect, { readonly kind: "ownerWake" }>,
+  ) {
+    const current = Effect.gen(function* () {
+      if (
+        inFlightStops.has(wake.threadId) ||
+        pendingRunStops.has(wake.threadId) ||
+        [...(pendingStops.get(wake.threadId)?.values() ?? [])].some(
+          (entry) => entry.kind === "interrupt",
+        )
+      )
+        return false;
+      const card = yield* store.card(wake.cardId);
+      const link = yield* store.threadLink(wake.threadId);
+      if (
+        card?.stage !== "working" ||
+        card.activeRole !== "work" ||
+        card.activeThreadId !== wake.threadId ||
+        card.workThreadId !== wake.threadId ||
+        card.stalled !== null ||
+        link?.role !== "work" ||
+        link.endedAt !== null ||
+        link.startedAt !== wake.startedAt
+      )
+        return false;
+      const moved = (yield* store.cardEvents(card.id)).findLast((event) => event.kind === "moved");
+      return moved?.id === wake.moveId;
+    });
+    if (!(yield* current)) return;
+    // The owner scope lets existing departure cleanup revoke an in-flight or queued send.
+    yield* sendThread(
+      { threadId: wake.threadId, text: wake.text, coalesce: `owner:${wake.cardId}`, key: "effect" },
+      undefined,
+      current.pipe(Effect.orElseSucceed(() => false)),
+    );
   });
 
   const wakeReviewedEvaluator = Effect.fn("KanbanService.wakeReviewedEvaluator")(function* (
@@ -6995,6 +7056,8 @@ const make = Effect.gen(function* () {
     KanbanError | KanbanStoreError | KanbanThreadError | SqlError.SqlError
   > => {
     switch (effect.kind) {
+      case "ownerWake":
+        return sendOwnerWake(effect);
       case "send":
         if (effect.planCardId !== undefined)
           return sendPlanChanged(effect.planCardId, ThreadId.make(effect.threadId), "effect");
@@ -17361,7 +17424,9 @@ const make = Effect.gen(function* () {
         const restored =
           card.stage === "needs_owner" ? yield* restoreOwnerPark(card, "todo") : card;
         const stage =
-          restored.stage === "working"
+          card.stage === "needs_owner" &&
+          restored.stage === "working" &&
+          restored.activeThreadId !== null
             ? "working"
             : card.stage === "needs_review"
               ? "needs_review"
@@ -17381,7 +17446,7 @@ const make = Effect.gen(function* () {
           movedAt: card.stage === "todo" || card.stage === "needs_review" ? card.movedAt : at,
           updatedAt: at,
         };
-        yield* logEvent(next, actor, "moved", {
+        const moved = yield* logEvent(next, actor, "moved", {
           fromStage: card.stage,
           toStage: next.stage,
           body: "Woken",
@@ -17389,19 +17454,15 @@ const make = Effect.gen(function* () {
         yield* saveCard(next, undefined, false, next.stage === "working" ? "restore" : undefined);
         if (next.stage === "working" && next.activeThreadId !== null) {
           yield* dropHold(next.activeThreadId, "join", next.id);
-          yield* later(
-            next.boardId,
-            cardLane(next),
-            {
-              kind: "send",
-              threadId: next.activeThreadId,
-              text: wakeNote ?? "Continue after the owner wait",
-            },
-            threads.send({
-              threadId: next.activeThreadId,
-              text: wakeNote ?? "Continue after the owner wait",
-            }),
-          );
+          const wake: Extract<BoardEffect, { readonly kind: "ownerWake" }> = {
+            kind: "ownerWake",
+            cardId: next.id,
+            threadId: next.activeThreadId,
+            moveId: moved.id,
+            startedAt: card.ownerPark?.startedAt ?? null,
+            text: wakeNote ?? "Continue after the owner wait",
+          };
+          yield* later(next.boardId, cardLane(next), wake, sendOwnerWake(wake));
         }
         assignmentFailures.delete(card.id);
         if (card.settledAt !== null && card.discussionId !== null) {

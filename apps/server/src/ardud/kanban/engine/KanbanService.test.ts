@@ -26744,33 +26744,40 @@ it.effect.each(
             run === "equal" ? "2026-10-25T13:00:01Z" : "2026-10-25T12:00:00Z",
           );
         else yield* setRunning(fake, thread, true);
+        const beforeWake = (yield* Ref.get(fake.threads)).get(thread)!.messages.length;
         yield* kanban.cardThread(card.id, "wake", "Use 2%", owner);
+        if (role === "work") {
+          const restored = (yield* kanban.card(card.id)).card;
+          assert.strictEqual(restored.stage, "working");
+          assert.strictEqual(restored.activeThreadId, thread);
+          assert.isNull(restored.wakeNote);
+          assert.lengthOf((yield* Ref.get(fake.threads)).get(thread)!.messages, beforeWake + 1);
+          assert.include((yield* Ref.get(fake.threads)).get(thread)!.messages.at(-1)!, "Use 2%");
+          yield* kanban.dispatchNow;
+          assert.lengthOf((yield* Ref.get(fake.threads)).get(thread)!.messages, beforeWake + 1);
+          return;
+        }
         if (run === "newer") {
           yield* TestClock.adjust("1 second");
           yield* setRunStart(fake, thread, true, "2026-10-25T13:00:02Z");
           const threads = yield* KanbanThreads;
           yield* threads.send({ threadId: thread, text: "Use 2%" });
-          if (role === "review")
-            fake.activeModels.set(
-              thread,
-              Rules.nextModel(board, (yield* kanban.card(card.id)).card),
-            );
+          fake.activeModels.set(thread, Rules.nextModel(board, (yield* kanban.card(card.id)).card));
         }
         const messages = (yield* Ref.get(fake.threads)).get(thread)!.messages.length;
         yield* kanban.dispatchNow;
         assert.lengthOf((yield* Ref.get(fake.threads)).get(thread)!.messages, messages);
         if (run !== "newer") {
           const waiting = (yield* kanban.card(card.id)).card;
-          assert.strictEqual(waiting.stage, role === "work" ? "todo" : "needs_review");
+          assert.strictEqual(waiting.stage, "needs_review");
           assert.strictEqual(waiting.wakeNote, "Use 2%");
           yield* setRunning(fake, thread, false);
           yield* kanban.dispatchNow;
         }
         const claimed = (yield* kanban.card(card.id)).card;
         assert.strictEqual(claimed.activeThreadId, thread);
-        assert.strictEqual(claimed.wakeNote, role === "work" ? null : "Use 2%");
+        assert.strictEqual(claimed.wakeNote, "Use 2%");
         const texts = (yield* Ref.get(fake.threads)).get(thread)!.messages;
-        if (role === "work") assert.include(texts.at(-1)!, "Use 2%");
         assert.lengthOf(texts, run === "newer" ? messages : messages + 1);
       }).pipe(Effect.provide(testLayer(fake.layer)));
     }),
