@@ -309,6 +309,7 @@ function boardAccumulate(target: ReturnType<typeof makeAccumulator>, event: Anal
     board.stalls.set(key, stall);
   }
   if (event.kind === "kanban.worker_failed") increment(board.failures, p.errorClass ?? "other");
+  if (event.kind === "kanban.assignment_wake_failed") increment(board.failures, "assignment_wake");
   if (event.kind === "kanban.worker_restarted") board.restarts++;
   if (event.kind === "kanban.ask_snapshot" || event.kind === "kanban.ask_pending") {
     let snapshot = board.snapshots.get(event.ts);
