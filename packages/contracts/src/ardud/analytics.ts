@@ -142,6 +142,33 @@ const GeneralEvent = Schema.Struct({
   waitStage: Schema.optionalKey(Schema.Literals(["lookup.caller", "lookup.target", "waiting"])),
   waitLookupMs: Schema.optionalKey(Measurement),
   writerWaitMs: Schema.optionalKey(Measurement),
+  readerWaitMs: Schema.optionalKey(Measurement),
+  queryMs: Schema.optionalKey(Measurement),
+  renderMs: Schema.optionalKey(Measurement),
+  inFlightAtStart: Schema.optionalKey(
+    Schema.Struct({
+      session: Measurement,
+      overall: Measurement,
+    }),
+  ),
+  threadReadStages: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        stage: Schema.Literals([
+          "caller",
+          "shell",
+          "records",
+          "timeline",
+          "messages",
+          "acknowledgement",
+        ]),
+        durationMs: Measurement,
+        completed: Schema.Boolean,
+        readerWaitMs: Measurement,
+        queryMs: Measurement,
+      }),
+    ).check(Schema.isMaxLength(6)),
+  ),
   props: Schema.optionalKey(
     Schema.Struct({
       number: Schema.optionalKey(Measurement),
@@ -170,6 +197,13 @@ const GeneralEvent = Schema.Struct({
       method: Schema.optionalKey(Label),
       httpMethod: Schema.optionalKey(Label),
       httpRoute: Schema.optionalKey(Label),
+      queryShape: Schema.optionalKey(Label),
+      controlClient: Schema.optionalKey(Label),
+      userAgent: Schema.optionalKey(Label),
+      readerLane: Schema.optionalKey(Label),
+      readerAcquireMs: Schema.optionalKey(Measurement),
+      readerQueryMs: Schema.optionalKey(Measurement),
+      readerStatements: Schema.optionalKey(Measurement),
       span: Schema.optionalKey(Label),
       errorTag: Schema.optionalKey(Label),
       code: Schema.optionalKey(Label),
@@ -291,6 +325,13 @@ export class AnalyticsError extends Schema.TaggedError<AnalyticsError>()("Analyt
     return `Analytics ${this.operation} failed.`;
   }
 }
+export const AnalyticsReadSection = Schema.suspend(() =>
+  Schema.Literals([
+    ...(Object.keys(AnalyticsRollup.fields) as Array<keyof typeof AnalyticsRollup.fields>),
+    "samples",
+  ]),
+);
+export type AnalyticsReadSection = typeof AnalyticsReadSection.Type;
 export const AnalyticsReadInput = Schema.Struct({
   day: Schema.String.check(Schema.isPattern(/^\d{4}-\d{2}-\d{2}$/)),
   kind: Schema.optionalKey(Label),
@@ -298,6 +339,8 @@ export const AnalyticsReadInput = Schema.Struct({
   cardId: Schema.optionalKey(Id),
   tool: Schema.optionalKey(Label),
   outcome: Schema.optionalKey(EventOutcome),
+  section: Schema.optionalKey(AnalyticsReadSection),
+  cursor: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(160))),
   limit: Schema.optionalKey(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 500 }))),
   responseDelivery: Schema.optionalKey(Schema.Literals(["pending", "finished", "closed"])),
 });
@@ -342,7 +385,7 @@ export const AskLatencyRollup = Schema.Struct({
   byKind: Schema.Record(Label, AskLatencySplit),
 });
 export const AnalyticsRollup = Schema.Struct({
-  day: AnalyticsReadInput.fields.day,
+  day: Schema.String.check(Schema.isPattern(/^\d{4}-\d{2}-\d{2}$/)),
   generatedAt: Timestamp,
   scope: Schema.Literal("retained-events"),
   total: Measurement,
@@ -526,5 +569,33 @@ export type AnalyticsRollup = typeof AnalyticsRollup.Type;
 export const AnalyticsReadResult = Schema.Struct({
   rollup: AnalyticsRollup,
   samples: Schema.Array(AnalyticsEvent),
+  summary: Schema.Struct({
+    events: Measurement,
+    errors: Measurement,
+    mcpCalls: Measurement,
+    mcpFailures: Measurement,
+    boardMoves: Measurement,
+    reviewRounds: Measurement,
+    stalls: Measurement,
+    openAsks: Measurement,
+    runs: Measurement,
+  }),
+  sections: Schema.Array(
+    Schema.Struct({ name: AnalyticsReadSection, rows: Measurement, chars: Measurement }),
+  ),
+  section: Schema.optionalKey(AnalyticsReadSection),
+  rows: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        path: Schema.Array(Schema.Union([Schema.String, Schema.Int])),
+        value: Schema.Json,
+        truncated: Schema.optionalKey(Schema.Boolean),
+      }),
+    ),
+  ),
+  hasMore: Schema.Boolean,
+  cursor: Schema.optionalKey(Schema.String),
+  truncated: Schema.optionalKey(Schema.Boolean),
+  next: Schema.optionalKey(Schema.String),
 });
 export type AnalyticsReadResult = typeof AnalyticsReadResult.Type;

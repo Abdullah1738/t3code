@@ -149,14 +149,17 @@ interface Acquired {
 }
 
 /** Request-local acquisition accounting, independent of tracing and statement sampling. */
-export const ReaderWaitObserver = Context.Reference<((waitMs: number) => void) | undefined>(
-  "@t3tools/shared/nodeSqliteClient/ReaderWaitObserver",
-  { defaultValue: () => undefined },
-);
+export const ReaderWaitObserver = Context.Reference<
+  ((waitMs: number, lane?: ReaderLaneName) => void) | undefined
+>("@t3tools/shared/nodeSqliteClient/ReaderWaitObserver", { defaultValue: () => undefined });
 
-const reportReaderWait = (fiber: Fiber.Fiber<unknown, unknown>, waitMs: number) => {
+const reportReaderWait = (
+  fiber: Fiber.Fiber<unknown, unknown>,
+  waitMs: number,
+  lane?: ReaderLaneName,
+) => {
   try {
-    fiber.getRef(ReaderWaitObserver)?.(waitMs);
+    fiber.getRef(ReaderWaitObserver)?.(waitMs, lane);
   } catch {
     // Observation must not change SQL acquisition or its exit.
   }
@@ -242,6 +245,11 @@ export interface SqliteStatementObservation {
   readonly waitMs?: number;
 }
 
+/** Request timing taps leave the client's configured slow-statement observer in place. */
+export const StatementTimingObserver = Context.Reference<
+  ((observation: SqliteStatementObservation) => void) | undefined
+>("@t3tools/shared/nodeSqliteClient/StatementTimingObserver", { defaultValue: () => undefined });
+
 export interface SqliteStatementObserver {
   readonly slowThresholdMs: number;
   readonly record: (observation: SqliteStatementObservation) => Effect.Effect<void>;
@@ -273,7 +281,18 @@ const observeStatement = <A, E, R>(
       for (let depth = 0; span?._tag === "Span" && depth < 32; depth++) {
         if (span.name === "sqlite") {
           // Transaction statements reuse their connection and bypass the borrower.
-          if (!span.attributes.has("db.connection")) span.attribute("db.connection", connection);
+          if (!span.attributes.has("db.connection")) {
+            span.attribute("db.connection", connection);
+            span.attribute("db.connection.reused", true);
+            const parent = Option.getOrUndefined(span.parent);
+            const slot =
+              parent?._tag === "Span" &&
+              parent.name === "sql.transaction" &&
+              parent.attributes.get("db.connection") === connection
+                ? parent.attributes.get("db.reader.slot")
+                : undefined;
+            if (typeof slot === "number") span.attribute("db.reader.slot", slot);
+          }
           if (lane !== undefined && !span.attributes.has("db.reader.lane"))
             span.attribute("db.reader.lane", lane);
           break;
@@ -282,14 +301,34 @@ const observeStatement = <A, E, R>(
       }
     }
     const observer = fiber.getRef(StatementObserver) ?? fallback;
-    if (observer === undefined || fiber.getRef(observingStatement)) return effect;
+    const timingObserver = fiber.getRef(StatementTimingObserver);
+    if (
+      (observer === undefined && timingObserver === undefined) ||
+      fiber.getRef(observingStatement)
+    )
+      return effect;
     const clock = fiber.getRef(Clock.Clock);
     const started = clock.monotonicTimeNanosUnsafe();
     return effect.pipe(
       Effect.onExit((exit) =>
         Effect.suspend(() => {
           const durationMs = Math.max(0, Number(clock.monotonicTimeNanosUnsafe() - started) / 1e6);
-          if (durationMs < observer.slowThresholdMs) return Effect.void;
+          try {
+            timingObserver?.({
+              operation: operation(),
+              connection,
+              durationMs,
+              ...(lane === undefined ? {} : { lane }),
+              outcome: Exit.isSuccess(exit)
+                ? "success"
+                : Exit.hasInterrupts(exit)
+                  ? "interrupt"
+                  : "failure",
+            });
+          } catch {
+            // Timing cannot change a statement's exit or suppress the configured observer.
+          }
+          if (observer === undefined || durationMs < observer.slowThresholdMs) return Effect.void;
           const parent = Context.getOrUndefined(fiber.context, Tracer.ParentSpan);
           let current = parent;
           let span: string | undefined;
@@ -1755,6 +1794,7 @@ const startCheckpoint = () => {
   checkpoint = {
     check,
     async admit(id) {
+      const started = gated() ? performance.now() : undefined;
       while (gated()) {
         if (isCancelled(id)) throw new Error("SQLite request cancelled before execution");
         parentPort.postMessage({ waiting: id });
@@ -1762,6 +1802,7 @@ const startCheckpoint = () => {
         await new Promise(resolve => { wakeAdmission = resolve; request(true); if (!gated()) resolve(); });
       }
       child.unref();
+      return started === undefined ? 0 : performance.now() - started;
     },
     async close() { stopped = true; truncate = undefined; wakeAdmission(); await child.terminate(); },
   };
@@ -1794,6 +1835,7 @@ parentPort.on("message", (request) => {
   let elapsedMs;
   let controlStarted;
   let controlMs;
+  let checkpointWaitMs = 0;
   let priorRecovery = {};
   let classification;
   let executed = false;
@@ -1842,7 +1884,7 @@ parentPort.on("message", (request) => {
     schemaDirty ||= Boolean(classifications.get(statement)?.schema) || typeof db.setAuthorizer !== "function";
     elapsedMs = performance.now() - executionStarted;
     executionStarted = undefined;
-    if (classifications.get(statement)?.write) await checkpoint?.admit(id);
+    if (classifications.get(statement)?.write) checkpointWaitMs = await checkpoint?.admit(id) ?? 0;
     if (isCancelled(id)) throw new Error("SQLite request cancelled before execution");
     operation = "execute";
     statement.setReadBigInts(safeIntegers);
@@ -1867,7 +1909,7 @@ parentPort.on("message", (request) => {
     }
     const committed = !db.isTransaction && /^\\s*(?:COMMIT|END|INSERT|UPDATE|DELETE|REPLACE)\\b/i.test(statement.sourceSQL);
     const committedTransaction = committed && /^\\s*(?:COMMIT|END)\\s*;?\\s*$/i.test(statement.sourceSQL);
-    parentPort.postMessage({ id, rows, committed, committedTransaction, write: observedWrite, elapsedMs, controlMs,
+    parentPort.postMessage({ id, rows, committed, committedTransaction, write: observedWrite, elapsedMs, controlMs, checkpointWaitMs,
       inTransaction: db.isTransaction,
       ...priorRecovery, ...recoverySnapshot(classification, sql, params, statement.expandedSQL) });
   } catch (error) {
@@ -1875,7 +1917,7 @@ parentPort.on("message", (request) => {
     const statementElapsed = executionStarted === undefined ? elapsedMs : (elapsedMs ?? 0) + performance.now() - executionStarted;
     if (controlStarted !== undefined && controlMs === undefined) controlMs = performance.now() - controlStarted;
     const snapshot = db ? { ...priorRecovery, ...recoverySnapshot(classification && { ...classification, attachment: executed && classification.attachment }, sql, params) } : {};
-    errorReply(id, error, operation, { ...snapshot, inTransaction: db?.isTransaction ?? false, write: observedWrite, elapsedMs: statementElapsed, controlMs });
+    errorReply(id, error, operation, { ...snapshot, inTransaction: db?.isTransaction ?? false, write: observedWrite, elapsedMs: statementElapsed, controlMs, checkpointWaitMs });
   } finally {
     // Authorizer classification covers CTE/commented writes; transaction state
     // covers RELEASE/ROLLBACK. OR FAIL may persist rows despite throwing.
@@ -1933,6 +1975,7 @@ const makeWriterSession = Effect.fnUntraced(function* (
     readonly committedTransaction?: boolean;
     readonly elapsedMs?: number;
     readonly controlMs?: number;
+    readonly checkpointWaitMs?: number;
     readonly write?: boolean;
   } & (
       | { readonly rows: ReadonlyArray<any> }
@@ -2059,6 +2102,19 @@ const makeWriterSession = Effect.fnUntraced(function* (
           onClassification?.(reply.write ?? false);
           const currentSpan = Context.getOrUndefined(fiber.context, Tracer.ParentSpan);
           try {
+            // The writer permit includes pre-BEGIN WAL admission. Keep that wait
+            // distinct from SQLite execution and the transaction body's work.
+            if (reply.checkpointWaitMs !== undefined && reply.checkpointWaitMs > 0) {
+              const transactionSpan = fiber.getRef(TransactionAcquire)?.span;
+              for (const span of new Set([currentSpan, transactionSpan])) {
+                if (span?._tag === "Span")
+                  span.attribute(
+                    "db.writer.checkpoint_wait_ms",
+                    Number(span.attributes.get("db.writer.checkpoint_wait_ms") ?? 0) +
+                      reply.checkpointWaitMs,
+                  );
+              }
+            }
             if (
               fiber.getRef(References.TracerEnabled) &&
               fiber.getRef(Statement.SpanPropagationEnabled) &&
@@ -2885,7 +2941,8 @@ const make = Effect.fn("makeWithDatabase")(function* (
           const useConnection = Effect.suspend(() => {
             started = true;
             const grant = acquired(target, clock, start);
-            if (target.name === "reader") reportReaderWait(requestFiber, grant.lockWaitMs);
+            if (target.name === "reader")
+              reportReaderWait(requestFiber, grant.lockWaitMs, target.lane);
             if (traced) annotateAcquired(fiber, grant);
             if (target.name !== "reader")
               return Effect.andThen(connection.ensure, use(target.connection));
@@ -2953,7 +3010,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
         Effect.onExit(() =>
           Effect.sync(() => {
             if (!started && requestFiber.getRef(ReadOnly))
-              reportReaderWait(requestFiber, holdMs(clock, start));
+              reportReaderWait(requestFiber, holdMs(clock, start), requestFiber.getRef(ReaderLane));
           }),
         ),
       );
@@ -2980,7 +3037,8 @@ const make = Effect.fn("makeWithDatabase")(function* (
         const acquire = Effect.tap((pending?.restore ?? restore)(target.lock.take(1)), () => {
           const grant = acquired(target, clock, start);
           acquiredSlot = true;
-          if (target.name === "reader") reportReaderWait(requestFiber, grant.lockWaitMs);
+          if (target.name === "reader")
+            reportReaderWait(requestFiber, grant.lockWaitMs, target.lane);
           if (pending !== undefined) pending.acquired = grant;
           if (
             pending !== undefined &&
@@ -3025,7 +3083,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
       Effect.onExit(() =>
         Effect.sync(() => {
           if (!acquiredSlot && requestFiber.getRef(ReadOnly))
-            reportReaderWait(requestFiber, holdMs(clock, start));
+            reportReaderWait(requestFiber, holdMs(clock, start), requestFiber.getRef(ReaderLane));
         }),
       ),
     );

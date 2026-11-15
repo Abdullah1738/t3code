@@ -24,6 +24,28 @@ __offbox_stop() {
   echo "offbox: toolchain unavailable: $*; nothing ran (exit 99)" >&2
   exit 99
 }
+__offbox_native_crash() {
+  # EOF is a crash signal only at callers that already verified the archive checksum.
+  LC_ALL=C grep -m 1 -E 'stack smashing detected|Segmentation fault|Illegal instruction|Bus error|core dumped|Aborted|free\(\): invalid|malloc\(\): |Unexpected EOF in archive|Child died with signal[[:space:]]+(4|6|7|11)([^0-9]|$)' "$1" && return 0
+  case "${2:-0}" in
+    132|134|135|139) echo "native signal (exit $2)" ;;
+    *) return 1 ;;
+  esac
+}
+__offbox_unpack_attempt() {
+  local log=$1 statuses
+  shift
+  ( "$@" ) 2>&1 | tee "$log" >&2
+  statuses=("${PIPESTATUS[@]}")
+  [ "${statuses[0]}" = 0 ] || return "${statuses[0]}"
+  return "${statuses[1]}"
+}
+__offbox_infra_stop() {
+  printf 'offbox-space: {"phase":"toolchain","infra_failure":"%s","infra_reason":"%s"}\n' "$1" "$2" >&2
+  shift 2
+  echo "offbox: $* Nothing ran (exit 90)." >&2
+  exit 90
+}
 __offbox_pin_command() {
   local entry tail=$PATH rest= sep=
   export __offbox_toolchain_bin="$HOME/.offbox/toolchains/commands/${OFFBOX_RUN_ID:-current}"

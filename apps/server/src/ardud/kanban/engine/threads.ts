@@ -657,7 +657,8 @@ const make = Effect.gen(function* () {
           (receipt.value.commandType !== "message.dispatch" &&
             receipt.value.commandType !== "queued-run.edit") ||
           (receipt.value.commandType === "queued-run.edit" &&
-            receipt.value.aggregateId !== input.threadId) ||
+            receipt.value.aggregateId !== input.threadId &&
+            (receipt.value.status !== "accepted" || input.coalesce === undefined)) ||
           (receipt.value.aggregateId !== input.threadId && !input.keyAcrossThreads)
         ) {
           return yield* new KanbanThreadError({

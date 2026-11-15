@@ -213,6 +213,32 @@ export function applyReviewResult(
 export const reviewFinished = (card: KanbanCard, chainLength: number) =>
   card.reviewStep >= Math.max(chainLength, 1);
 
+const REVIEW_EVALUATOR_WAKE_MS = 6 * 60 * 60_000;
+
+/** All remaining steps, including later ones, must belong to the evaluator or scripts. */
+export const inReviewEvaluatorStepsOnly = (card: KanbanCard) => {
+  const open = card.subtasks.filter((subtask) => subtask.state === "open");
+  return (
+    card.stage === "in_review" &&
+    card.activeThreadId === null &&
+    card.settledAt === null &&
+    card.stalled === null &&
+    card.priority !== KANBAN_BACKLOG &&
+    card.reviewStep > 0 &&
+    card.reviewFindingsPending !== true &&
+    !kanbanWaiting(card) &&
+    !kanbanDeciding(card) &&
+    !card.asks.some((ask) => ask.closedAt === null && ask.blocking) &&
+    open.length > 0 &&
+    open.every((subtask) => subtask.owner === "evaluator" || subtask.owner === "script")
+  );
+};
+
+export const reviewEvaluatorWakeDue = (card: KanbanCard, chainLength: number, nowMs: number) =>
+  inReviewEvaluatorStepsOnly(card) &&
+  reviewFinished(card, chainLength) &&
+  (card.nudgedAt === null || nowMs - Date.parse(card.nudgedAt) >= REVIEW_EVALUATOR_WAKE_MS);
+
 /** A queued review keeps its thread identity, including between chain steps. */
 export const reviewThreadToReuse = (board: KanbanBoard, card: KanbanCard) =>
   card.settledAt === null &&
@@ -553,8 +579,9 @@ export interface Dispatch {
   readonly model: ModelSelection;
   /** The card goes back to a work thread that already holds a slot in this pool. */
   readonly joins: boolean;
-  /** Start a new thread: the card's old work thread is busy in another pool. */
+  /** Start a new thread when the old thread is busy elsewhere or its home card moved on. */
   readonly fresh: boolean;
+  readonly freshReason?: string;
 }
 
 /** Most cards one work thread carries at once. */
@@ -615,6 +642,7 @@ export function planDispatch(
   nowMs?: number,
   attempted: ReadonlySet<string> = new Set(),
   reviews: ReadonlyMap<string, ReviewEvidence> = new Map(),
+  workThreadHomes: ReadonlyMap<string, KanbanCard | null> = new Map(),
 ): ReadonlyArray<Dispatch> {
   // A board's first setup holds all card work and review until the setup evaluator ends it.
   if (board.setup?.status === "running") return [];
@@ -678,7 +706,17 @@ export function planDispatch(
     const key = poolFor(pools, model)?.key;
     if (key === undefined || (slots.get(key) ?? 0) <= 0) continue;
     let thread = role === "work" ? card.workThreadId : null;
-    const fresh = thread !== null && busyElsewhere(thread, key);
+    // Missing links are legacy threads. A linked thread keeps claimed cards only
+    // while its home card is still part of that batch.
+    const home = thread === null ? undefined : workThreadHomes.get(thread);
+    const homeMovedOn =
+      home !== undefined &&
+      home?.id !== card.id &&
+      (home === null || !["working", "todo"].includes(home.stage) || home.workThreadId !== thread);
+    const freshReason = homeMovedOn
+      ? `fresh work thread: previous thread ${thread} ${home === null ? "has no home card" : `belongs to #${home.number} (${home.stage})`}`
+      : undefined;
+    const fresh = thread !== null && (homeMovedOn || busyElsewhere(thread, key));
     // A new thread can't take a card its old thread's own work still holds up.
     if (fresh && isBlocked(card, byId, null)) continue;
     if (fresh) thread = null;
@@ -701,7 +739,15 @@ export function planDispatch(
       set.add(thread);
       holding.set(key, set);
     }
-    plan.push({ cardId: card.id, role, pool: key, model, joins, fresh });
+    plan.push({
+      cardId: card.id,
+      role,
+      pool: key,
+      model,
+      joins,
+      fresh,
+      ...(freshReason === undefined ? {} : { freshReason }),
+    });
   }
   return plan;
 }
