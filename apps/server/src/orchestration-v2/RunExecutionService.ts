@@ -10,6 +10,7 @@ import {
 } from "./launchRecovery.ts";
 import * as Random from "effect/Random";
 import * as DelegatedTaskRecoveryService from "./DelegatedTaskRecoveryService.ts";
+import * as ProviderStartProgress from "../ardud/orchestration/ProviderStartProgress.ts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { makeAssistantStreamingFilter } from "./assistantStreaming.ts";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
@@ -727,6 +728,7 @@ export const layer: Layer.Layer<
     const turnItemPositions = yield* TurnItemPositionStore.TurnItemPositionStoreV2;
     const finalizationObserver = yield* RunFinalizationService.RunFinalizationObserver;
     const analyticsContext = yield* Effect.context<never>();
+    const startProgress = yield* Effect.serviceOption(ProviderStartProgress.ProviderStartProgress);
 
     const usageByRun = new Map<
       string,
@@ -1093,6 +1095,15 @@ export const layer: Layer.Layer<
         },
       ),
       startRootRun: Effect.fn("RunExecutionService.startRootRun")(function* (input) {
+        const progressAttempt = {
+          threadId: input.run.threadId,
+          runId: input.run.id,
+          attemptId: input.attemptId,
+        };
+        const withIngestionStep = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+          Option.isSome(startProgress)
+            ? startProgress.value.withRunStep(progressAttempt, "run_ingestion_write", effect)
+            : effect;
         const observeFirstToken = yield* makeFirstTokenObserver(input.run, input.attempt.id).pipe(
           Effect.provideContext(analyticsContext),
         );
@@ -1885,6 +1896,22 @@ export const layer: Layer.Layer<
               yield* usage.observe(event);
               yield* observeNativeLifecycle(event);
               const rootTurnId = (yield* Ref.get(eventRouting)).rootProviderTurnId;
+              if (
+                Option.isSome(startProgress) &&
+                ((event.type === "provider_turn.updated" &&
+                  event.providerTurn.id === rootTurnId &&
+                  event.providerTurn.promptAcceptedAt !== undefined) ||
+                  (event.type === "turn_item.updated" &&
+                    event.turnItem.providerTurnId === rootTurnId &&
+                    nativeOutputAcknowledgesStart(event.turnItem)))
+              ) {
+                yield* startProgress.value.observe(
+                  progressAttempt,
+                  "native_accepted",
+                  input.providerThread.nativeThreadRef?.nativeId ?? undefined,
+                );
+                yield* startProgress.value.observe(progressAttempt, "orchestration_ingestion");
+              }
               if (event.type === "provider_turn.updated" && event.providerTurn.id === rootTurnId) {
                 observedRootTurn = {
                   ...event.providerTurn,
@@ -1903,28 +1930,30 @@ export const layer: Layer.Layer<
                 observedRootTurn.promptAcceptedAt === undefined
               ) {
                 const acknowledged = { ...observedRootTurn, promptAcceptedAt: yield* DateTime.now };
-                yield* providerEventIngestor.ingestNormalized({
-                  analyticsContext: {
-                    modelSelection: input.modelSelection,
-                    runtimeMode: input.runtimePolicy.runtimeMode,
-                    interactionMode: input.runtimePolicy.interactionMode,
-                  },
-                  providerSessionId: input.providerSessionId,
-                  providerInstanceId: input.run.providerInstanceId,
-                  threadId: input.run.threadId,
-                  runId: input.run.id,
-                  nodeId: input.rootNode.id,
-                  event: {
-                    type: "provider_turn.updated",
-                    driver: event.driver,
-                    providerTurn: acknowledged,
-                  },
-                  writeIfRunCurrent: {
+                yield* withIngestionStep(
+                  providerEventIngestor.ingestNormalized({
+                    analyticsContext: {
+                      modelSelection: input.modelSelection,
+                      runtimeMode: input.runtimePolicy.runtimeMode,
+                      interactionMode: input.runtimePolicy.interactionMode,
+                    },
+                    providerSessionId: input.providerSessionId,
+                    providerInstanceId: input.run.providerInstanceId,
+                    threadId: input.run.threadId,
                     runId: input.run.id,
-                    activeAttemptId: input.attempt.id,
-                    expectedStatus: "running",
-                  },
-                });
+                    nodeId: input.rootNode.id,
+                    event: {
+                      type: "provider_turn.updated",
+                      driver: event.driver,
+                      providerTurn: acknowledged,
+                    },
+                    writeIfRunCurrent: {
+                      runId: input.run.id,
+                      activeAttemptId: input.attempt.id,
+                      expectedStatus: "running",
+                    },
+                  }),
+                );
                 observedRootTurn = acknowledged;
               }
               // Native completion remains termination evidence even if persisting it fails.
@@ -1946,37 +1975,39 @@ export const layer: Layer.Layer<
                 const isRootProviderThreadUpdate =
                   event.type === "provider_thread.updated" &&
                   event.providerThread.id === input.providerThread.id;
-                const storedEvents = yield* providerEventIngestor.ingestNormalized({
-                  analyticsContext: {
-                    modelSelection: input.modelSelection,
-                    runtimeMode: input.runtimePolicy.runtimeMode,
-                    interactionMode: input.runtimePolicy.interactionMode,
-                  },
-                  providerSessionId: input.providerSessionId,
-                  providerInstanceId: input.run.providerInstanceId,
-                  threadId: input.run.threadId,
-                  runId: input.run.id,
-                  nodeId: input.rootNode.id,
-                  event: deliveredEvent,
-                  ...(isRootProviderThreadUpdate
-                    ? rootTerminalAlreadySeen
-                      ? {
-                          writeIfProviderThreadOwner: {
-                            providerThreadId: input.providerThread.id,
-                            runId: input.run.id,
-                            activeAttemptId: input.attempt.id,
-                            expectedLastRunOrdinal: input.run.ordinal,
-                          },
-                        }
-                      : {
-                          writeIfRunCurrent: {
-                            runId: input.run.id,
-                            activeAttemptId: input.attempt.id,
-                            expectedStatus: "running" as const,
-                          },
-                        }
-                    : {}),
-                });
+                const storedEvents = yield* withIngestionStep(
+                  providerEventIngestor.ingestNormalized({
+                    analyticsContext: {
+                      modelSelection: input.modelSelection,
+                      runtimeMode: input.runtimePolicy.runtimeMode,
+                      interactionMode: input.runtimePolicy.interactionMode,
+                    },
+                    providerSessionId: input.providerSessionId,
+                    providerInstanceId: input.run.providerInstanceId,
+                    threadId: input.run.threadId,
+                    runId: input.run.id,
+                    nodeId: input.rootNode.id,
+                    event: deliveredEvent,
+                    ...(isRootProviderThreadUpdate
+                      ? rootTerminalAlreadySeen
+                        ? {
+                            writeIfProviderThreadOwner: {
+                              providerThreadId: input.providerThread.id,
+                              runId: input.run.id,
+                              activeAttemptId: input.attempt.id,
+                              expectedLastRunOrdinal: input.run.ordinal,
+                            },
+                          }
+                        : {
+                            writeIfRunCurrent: {
+                              runId: input.run.id,
+                              activeAttemptId: input.attempt.id,
+                              expectedStatus: "running" as const,
+                            },
+                          }
+                      : {}),
+                  }),
+                );
                 storedEventCount = storedEvents.length;
                 if (
                   isRootProviderThreadUpdate &&
@@ -2350,6 +2381,11 @@ export const layer: Layer.Layer<
           ),
           // Wait for acceptance so abandoned startup cannot leave a refresher
           // on the already-detached ingestion fiber.
+          Effect.tap(() =>
+            Option.isSome(startProgress)
+              ? startProgress.value.step(progressAttempt, "awaiting_native_acceptance")
+              : Effect.void,
+          ),
           Effect.tap(() =>
             Fiber.await(providerEventFiber).pipe(
               Effect.raceFirst(touchMcpCredential.pipe(Effect.delay("1 hour"), Effect.forever)),

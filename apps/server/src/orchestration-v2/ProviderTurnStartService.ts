@@ -69,6 +69,7 @@ import {
 import { providerUserMessageText } from "./ProviderMessageText.ts";
 import * as RunExecutionService from "./RunExecutionService.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
+import * as ProviderStartProgress from "../ardud/orchestration/ProviderStartProgress.ts";
 import {
   isRestartNoteContinuation,
   pendingRestartCancelledBackgroundWork,
@@ -153,6 +154,7 @@ export const layer: Layer.Layer<
     const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
     const runtimePolicy = yield* RuntimePolicy.RuntimePolicyV2;
     const kanban = yield* Effect.serviceOption(KanbanStore.KanbanStore);
+    const startProgress = yield* Effect.serviceOption(ProviderStartProgress.ProviderStartProgress);
     const isManagedWorktreePath = yield* makeIsManagedWorktreePath;
 
     // These callbacks outlive startup while a run drains background work. Build
@@ -290,6 +292,15 @@ export const layer: Layer.Layer<
         compact = false,
       ) {
         const start = compact ? liveSession.compactThread! : liveSession.startTurn;
+        if (Option.isSome(startProgress))
+          yield* startProgress.value.step(
+            {
+              threadId: turnInput.threadId,
+              runId: turnInput.runId,
+              attemptId: turnInput.attemptId,
+            },
+            "start_send",
+          );
         const readFailure = (cause: unknown) =>
           new ProviderAdapter.ProviderAdapterTurnStartError({
             driver: liveSession.driver,
@@ -483,6 +494,7 @@ export const layer: Layer.Layer<
           cause: `Run ${runId} is missing its execution projection state.`,
         });
       }
+      const progressAttempt = { threadId: input.threadId, runId, attemptId: attempt.id };
       const finishUsage = yield* runExecution.prepareUsageBeforeStart({
         appThread: projection.thread,
         run,
@@ -502,6 +514,15 @@ export const layer: Layer.Layer<
         }
         if (current.activeAttemptId !== attempt.id || current.status !== "starting") return;
       }
+      if (Option.isSome(startProgress))
+        yield* startProgress.value.begin({
+          ...progressAttempt,
+          provider: run.providerInstanceId,
+          model: run.modelSelection.model,
+          delegated: projection.thread.lineage?.relationshipToParent === "subagent",
+          providerSessionId: providerThread.providerSessionId,
+          attemptOrdinal: attempt.attemptOrdinal,
+        });
       const settleRunBeforeStart = Effect.fn("orchestrationV2.providerTurnStart.settleBeforeStart")(
         function* (input: {
           readonly signal: string;
@@ -848,6 +869,8 @@ export const layer: Layer.Layer<
       const existingSessionProjection = projection.providerSessions.find(
         (candidate) => candidate.id === providerSessionId,
       );
+      if (Option.isSome(startProgress))
+        yield* startProgress.value.step(progressAttempt, "session_open");
       const sessionResult = yield* Effect.result(
         providerSessions.open({
           threadId: projection.thread.id,
@@ -1209,6 +1232,8 @@ export const layer: Layer.Layer<
       };
       let resumedRetryHandoff: ReadonlyArray<OrchestrationV2ContextHandoff> | undefined;
       let resumedHandoffContext: ReturnType<typeof handoffContextForThread> | undefined;
+      if (Option.isSome(startProgress))
+        yield* startProgress.value.step(progressAttempt, "thread_ensure");
       const loadedProviderThread = yield* Effect.gen(function* () {
         // ardud: a moved session is not safe to replace until it completes a turn.
         const seededGuard = seededUnconfirmed(providerThread, projection.providerTurns);
@@ -1552,6 +1577,12 @@ export const layer: Layer.Layer<
       if (!(yield* isCurrentAttemptInStatus("starting"))) {
         return;
       }
+      if (Option.isSome(startProgress))
+        yield* startProgress.value.step(
+          progressAttempt,
+          "turn_preparation",
+          loadedProviderThread.nativeThreadRef?.nativeId ?? undefined,
+        );
       const now = yield* DateTime.now;
       const handoffContext = resumedHandoffContext ?? handoffContextForThread(loadedProviderThread);
       const {

@@ -54,6 +54,7 @@ import * as EventSink from "./EventSink.ts";
 import * as CommandOutputHub from "./CommandOutputHub.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
+import * as ProviderStartProgress from "../ardud/orchestration/ProviderStartProgress.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
@@ -390,6 +391,9 @@ export const layerWithOptions = (
       const serverSettings = yield* Effect.serviceOption(ServerSettings.ServerSettingsService);
       const projectService = yield* Effect.serviceOption(ProjectService.ProjectService);
       const eventSink = yield* EventSink.EventSinkV2;
+      const startProgress = yield* Effect.serviceOption(
+        ProviderStartProgress.ProviderStartProgress,
+      );
       const commandOutput = yield* CommandOutputHub.CommandOutputHub;
       const idAllocator = yield* IdAllocator.IdAllocatorV2;
       const providerEventIngestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
@@ -2491,12 +2495,19 @@ export const layerWithOptions = (
             }
             threadIds = interested;
           }
-          yield* writeProviderSessionEvents({
+          const write = writeProviderSessionEvents({
             runtime: entry.runtime,
             threadIds,
             type: "provider-session.updated",
             payload: incoming,
           });
+          yield* Option.isSome(startProgress)
+            ? startProgress.value.withSessionStep(
+                { providerSessionId: entry.runtime.providerSessionId },
+                "session_status_write",
+                write,
+              )
+            : write;
           yield* Ref.update(sessions, (latest) => {
             const key = sessionKey(entry.runtime.providerSessionId);
             const latestEntry = latest.get(key);
@@ -2506,7 +2517,18 @@ export const layerWithOptions = (
             return updated;
           });
         },
-        (effect, entry) => sessionUpdateLock.withLock(entry.runtime.providerSessionId, effect),
+        (effect, entry) => {
+          const locked = sessionUpdateLock.withLock(entry.runtime.providerSessionId, effect);
+          return Option.isSome(startProgress)
+            ? startProgress.value.withSessionStep(
+                { providerSessionId: entry.runtime.providerSessionId },
+                entry.runtime.sessionUpdateFanout === "interested_threads"
+                  ? "session_status_audience"
+                  : "session_status_write",
+                locked,
+              )
+            : locked;
+        },
         (effect, entry, _event) =>
           effect.pipe(
             Effect.catchCause((cause) =>

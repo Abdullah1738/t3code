@@ -94,6 +94,7 @@ import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter"
 import type * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import * as ClaudeAdapterV2 from "./ClaudeAdapterV2.ts";
+import * as ProviderStartProgress from "../../ardud/orchestration/ProviderStartProgress.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import { ClaudeOrchestratorReplayHarness } from "./ClaudeAdapterV2.testkit.ts";
 import { provideDeterministicTestRuntime } from "../testkit/DeterministicRuntime.ts";
@@ -3303,6 +3304,86 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       };
     });
   const makeWakeHarness = makeWakeHarnessWithOptions();
+
+  it.effect.each(["lifecycle", "prompt_echo", "native_output"] as const)(
+    "records same-attempt native %s evidence before orchestration receives it",
+    (evidence) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const progress = yield* ProviderStartProgress.ProviderStartProgress;
+          const h = yield* makeWakeHarness;
+          const input = makeClaudeTestTurnInput({
+            threadId: h.threadId,
+            providerThread: h.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("native-progress"),
+            text: "Say hello",
+            attachments: [],
+          });
+          yield* progress.begin({
+            threadId: input.threadId,
+            runId: input.runId,
+            attemptId: input.attemptId,
+            attemptOrdinal: 1,
+            provider: input.modelSelection.instanceId,
+            model: input.modelSelection.model,
+            delegated: false,
+            providerSessionId: h.runtime.providerSessionId,
+          });
+          yield* h.runtime.startTurn(input);
+          assert.isNull(progress.get(input.runId, input.attemptId)?.nativeAcceptedAt);
+          yield* h.offerAndWait(
+            claudeSdkFrame({
+              type: "system",
+              subtype: "init",
+              uuid: "00000000-0000-4000-8000-000000009901",
+              session_id: WAKE_NATIVE_SESSION,
+            }),
+          );
+          yield* h.offerAndWait(
+            claudeSdkFrame({
+              type: "command_lifecycle",
+              command_uuid: "another-prompt",
+              state: "started",
+            }),
+          );
+          assert.isNotNull(progress.get(input.runId, input.attemptId)?.sdkReceivedAt);
+          assert.isNull(progress.get(input.runId, input.attemptId)?.nativeAcceptedAt);
+          assert.isNull(progress.get(input.runId, input.attemptId)?.adapterEmittedAt);
+          yield* h.offerAndWait(
+            evidence === "lifecycle"
+              ? claudeSdkFrame({
+                  type: "command_lifecycle",
+                  command_uuid: h.promptUuid(0),
+                  state: "started",
+                })
+              : claudeSdkFrame({
+                  ...makeAssistantTextFrame({
+                    uuid: "00000000-0000-4000-8000-000000009902",
+                    text: "Native output",
+                  }),
+                  ...(evidence === "prompt_echo" ? { user_message_uuid: h.promptUuid(0) } : {}),
+                }),
+          );
+          const snapshot = progress.get(input.runId, input.attemptId)!;
+          assert.equal(snapshot.nativeSessionId, WAKE_NATIVE_SESSION);
+          assert.isNotNull(snapshot.sdkReceivedAt);
+          assert.isNotNull(snapshot.nativeAcceptedAt);
+          assert.isNotNull(snapshot.adapterEmittedAt);
+          assert.equal(snapshot.step, "adapter_emitted");
+          assert.isNull(progress.get(input.runId, RunAttemptId.make("different-attempt")));
+        }),
+      ).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            ProviderStartProgress.layer,
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+          ),
+        ),
+      ),
+  );
 
   it.effect.each([false, true])(
     "shares concurrent prompt skill discovery only for the same cwd (different cwd: %s)",
