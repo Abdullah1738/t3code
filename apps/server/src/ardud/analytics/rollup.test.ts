@@ -619,6 +619,8 @@ describe("board analytics", () => {
         kind: "kanban.worker_failed",
         props: { errorClass: "variant_unavailable", poolKey: "sol" },
       },
+      { kind: "kanban.assignment_wake_failed", props: { count: 1 } },
+      { kind: "kanban.assignment_wake_failed", props: { count: 2 } },
       { kind: "kanban.worker_restarted", props: { phase: "fresh" } },
       { kind: "kanban.ask_snapshot", props: { count: 1 } },
       {
@@ -650,7 +652,7 @@ describe("board analytics", () => {
     assert.deepEqual(board.reviewRounds, [{ cardId: "a", rounds: 2, verdicts: 2 }]);
     assert.deepEqual(board.verdictCounts, { feedback: 1, clear: 1 });
     assert.deepInclude(board.stalls[0], { sets: 1, clears: 1, p50Ms: 300 });
-    assert.deepEqual(board.failureCounts, { variant_unavailable: 1 });
+    assert.deepEqual(board.failureCounts, { variant_unavailable: 1, assignment_wake: 2 });
     assert.equal(board.restarts, 1);
     assert.lengthOf(board.openAsks, 1);
     assert.deepInclude(board.openAsks[0], {
