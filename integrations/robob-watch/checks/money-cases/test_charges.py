@@ -752,6 +752,7 @@ class OwnerTexts(unittest.TestCase):
 
     def test_changed_thread_merges_by_id_and_reclassifies_overlap(self):
         with ControlServer([summary('old', createdAt='2026-10-24T00:00:00Z'),
+                            summary('boundary', createdAt='2026-10-24T00:59:00Z'),
                             summary('overlap', createdAt='2026-10-24T00:59:30Z'),
                             summary('removed', createdAt='2026-10-24T00:59:40Z')]) as server:
             self.read()
@@ -761,10 +762,10 @@ class OwnerTexts(unittest.TestCase):
                                 summary('reclassified', messageId='removed', automated=True,
                                         createdAt='2026-10-24T00:59:40Z'),
                                 summary('new', createdAt='2026-10-24T01:00:00Z')]
-            self.assertEqual([row[1] for row in self.read()], ['new', 'overlap edited', 'old'])
+            self.assertEqual([row[1] for row in self.read()], ['new', 'overlap edited', 'boundary', 'old'])
             self.assertEqual(self.message_calls(server)[0][1]['since'], ['2026-10-24T00:59:00.000Z'])
             server.calls.clear()
-            self.assertEqual(len(self.read()), 3)
+            self.assertEqual(len(self.read()), 4)
             self.assertEqual(self.message_calls(server), [])
 
     def test_delta_edits_to_older_turns_replace_cached_text_by_id(self):
@@ -866,6 +867,38 @@ class OwnerTexts(unittest.TestCase):
             server.calls.clear()
             self.assertEqual(len(ch.owner_texts(since - dt.timedelta(microseconds=500), until)), 1)
             self.assertEqual(len(self.message_calls(server)), 1)
+
+    def test_slow_cache_io_is_bounded_and_never_returns_success(self):
+        for operation in ('load', 'fsync'):
+            with self.subTest(operation=operation), ControlServer([summary('owner')]) as server:
+                self.read()
+                path = Path(server.tmp.name) / 'owner-texts.json'
+                before = path.read_bytes()
+                original = ch.owner_cache if operation == 'load' else ch.os.fsync
+
+                def slow(*args, **kwargs):
+                    time.sleep(2)
+                    return original(*args, **kwargs)
+
+                target, name = (ch, 'owner_cache') if operation == 'load' else (ch.os, 'fsync')
+                started = time.monotonic()
+                with patch.object(ch, 'OWNER_BUDGET', 1.6), patch.object(target, name, slow), \
+                        self.assertRaisesRegex(ch.Lookup, 'owner read incomplete'):
+                    self.read()
+                self.assertLess(time.monotonic() - started, 2)
+                self.assertEqual(path.read_bytes(), before)
+                self.assertEqual(list(path.parent.glob('.owner-texts.json.*')), [])
+
+    def test_save_that_consumes_deadline_cannot_return_success(self):
+        clock = [1000.0]
+        save = ch.save_owner_cache
+        def late(*args):
+            result = save(*args)
+            clock[0] += 5
+            return result
+        with ControlServer([summary('owner')]), patch.object(ch.time, 'time', lambda: clock[0]), \
+                patch.object(ch, 'save_owner_cache', late), self.assertRaisesRegex(ch.Lookup, 'out of time'):
+            self.read()
 
     def test_renamed_archived_and_nonowner_threads_do_not_reuse_cached_texts(self):
         with ControlServer([relayed('owner')]) as server:

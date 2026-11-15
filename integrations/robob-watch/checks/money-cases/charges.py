@@ -514,6 +514,17 @@ def owner_texts(since, until, deadline=None, stats=None, cache_path=None, cache_
     alarm = signal.getitimer(signal.ITIMER_REAL)[0]
     if alarm:
         stop = min(stop, time.time() + alarm - 0.5)
+    error = Lookup('Robob control: owner read incomplete; continuing next check (out of time)')
+    with within(stop, error):
+        # Stop network work early enough to persist completed threads. The outer
+        # deadline also bounds cache reads, fsync, pruning and result assembly.
+        rows = _owner_texts(since, until, stats, cache_path, cache_reset, stop - 0.25)
+        if time.time() >= stop:
+            raise error
+        return rows
+
+
+def _owner_texts(since, until, stats, cache_path, cache_reset, stop):
     with within(stop, Lookup('Robob control: incomplete thread list')):
         config = control_config()
         # The API's since filter is strict on updatedAt; include messages created exactly at since.
