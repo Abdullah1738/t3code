@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
 import { decide, slugFor, roleOf, chatInfo } from "../src/access.ts";
 import type { Access } from "../src/chats.ts";
@@ -868,4 +869,49 @@ test.each(providerFailureCases)("provider failure $field=$value stays private th
     expect(JSON.stringify(logs)).not.toContain(String(fixture.value));
     expect(rollup).not.toContain(String(fixture.value));
   }
+});
+
+
+test("line send errors keep main's safe diagnostics before transport classification", async () => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const logs = await captureLogs(async () => {
+    const line = fakeLine({ sendText: async () => {
+      throw Object.assign(new Error("connect ECONNRESET PRIVATE_PROVIDER_TEXT"), { code: "ECONNRESET" });
+    } });
+    await expect(sbTransport(line, chatKey.dm(owner), store()).sendText({ id: "diagnostic", chatGuid: "x", text: "test" }))
+      .rejects.toMatchObject({ code: "operationFailed" });
+  });
+  expect(logs.find(line => line.error?.tag === "sb-transport.catch1")?.error)
+    .toMatchObject({ code: "ECONNRESET", message: "connect ECONNRESET [redacted]" });
+  expect(JSON.stringify(logs)).not.toContain("PRIVATE_PROVIDER_TEXT");
+});
+
+test.each(["accepted", "opted_out"] as const)("card session update %s keeps dispatch snapshot and opt-in fencing", async outcome => {
+  const s = store();
+  const app = { url: "https://card.example/", caption: "Preparing" };
+  s.enqueue({ id: "original", kind: "conversation", text: "", app });
+  s.outboxState("original", "sent", "original-handle");
+  s.set("optInRevision", 2);
+  s.set("optOutAwaitingSend", [{ since: 100, failures: 1, alerted: true }]);
+  const updates: unknown[] = [];
+  const line = fakeLine({
+    getMessage: async () => ({ handle: "original-handle", chat: chatKey.dm(owner), text: "", status: "DELIVERED", sentAt: 1,
+      card: { url: app.url, layout: { caption: app.caption }, sessionIdentifier: "card-session" } }),
+    sendApp: async () => { throw new Error("Unexpected new card"); },
+    updateApp: async (...args) => {
+      updates.push(args);
+      if (outcome === "opted_out") throw new LineError("PRIVATE_PROVIDER_TEXT", "http_400:opted_out", false, false);
+      return { handle: "update-handle" };
+    },
+  });
+  const transport = sbTransport(line, chatKey.dm(owner), s);
+  const input = { id: "update", chatGuid: "x", updateOf: "original", url: app.url, caption: "Delivered", imageUrl: "https://cdn.example/stage.png" };
+  if (outcome === "accepted") {
+    expect(await transport.sendApp(input)).toEqual({ providerId: "update-handle", optOutAtDispatch: { since: undefined, awaiting: [100] } });
+    expect(await transport.sendApp(input)).toEqual({ providerId: "update-handle", duplicate: true });
+  } else {
+    await expect(transport.sendApp(input)).rejects.toMatchObject({ code: "http_400:opted_out", optInRevision: 2 });
+  }
+  expect(updates).toEqual([["original-handle", { url: app.url, caption: "Delivered", imageUrl: input.imageUrl, interactive: false }, createHash("sha256").update(input.id).digest("hex")]]);
+  expect(s.get<unknown>("app-session:original")).toEqual({ handle: "original-handle", sessionIdentifier: "card-session" });
 });

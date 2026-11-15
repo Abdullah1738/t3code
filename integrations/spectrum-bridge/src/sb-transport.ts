@@ -56,6 +56,7 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
       awaiting: (store.get<{ since: number }[]>("optOutAwaitingSend") ?? []).map(episode => episode.since),
     };
     try { return { ...await send(), optOutAtDispatch }; } catch (error) {
+      toolError("sb-transport", "sb-transport.catch1", error);
       const failure = classifyLineFailure(error);
       failure.optInRevision = revision;
       throw failure;

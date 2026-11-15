@@ -252,12 +252,12 @@ export class Delivery {
     }
     try {
       await this.alertOptOut();
-    } catch { toolError("delivery", "delivery.optout_alert");
+    } catch (error) { toolError("delivery", "delivery.optout_alert", error);
       this.options.log?.("optout-alert-failed");
     }
     try {
       await this.recoverOptOut();
-    } catch { toolError("delivery", "delivery.optout_recovery");
+    } catch (error) { toolError("delivery", "delivery.optout_recovery", error);
       this.options.log?.("optout-recovery-failed");
     }
     try {
@@ -737,7 +737,7 @@ export class Delivery {
         }
         if (confirmsOptOutRecovery) {
           try { await this.recoverOptOut(); }
-          catch { toolError("delivery", "delivery.optout_recovery"); this.options.log?.("optout-recovery-failed"); }
+          catch (error) { toolError("delivery", "delivery.optout_recovery", error); this.options.log?.("optout-recovery-failed"); }
         }
         await this.sleep(800);
         if (!active || index === steps - 1) continue operations;
