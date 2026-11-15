@@ -98,10 +98,10 @@ test("cause classes never retain arbitrary codes, messages or unapproved fields"
     [new DOMException(secret, "TimeoutError"), "timeout"],
     [new SyntaxError(secret), "decode"],
     [{ causeClass: "timeout", message: secret }, "timeout"],
-    [{ status: 0, code: secret, name: secret, causeClass: secret }, "unknown"],
-    [{ status: 999, code: "SECRET_TOKEN" }, "unknown"],
-    [undefined, "unknown"],
-    [Object.defineProperty({}, "status", { get() { throw new Error(secret); } }), "unknown"],
+    [{ status: 0, code: secret, name: secret, causeClass: secret }, "unclassified"],
+    [{ status: 999, code: "SECRET_TOKEN" }, "unclassified"],
+    [undefined, "non_error"],
+    [Object.defineProperty({}, "status", { get() { throw new Error(secret); } }), "unclassified"],
   ] as const;
   for (const [error] of cases) toolError("telegram", "fixture.failed", { directory: secret }, error);
   expect(rows(dir).map(row => row.props.cause)).toEqual(cases.map(([, cause]) => cause));
