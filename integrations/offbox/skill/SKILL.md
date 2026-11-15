@@ -128,7 +128,7 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
   checkouts are deleted at run start: a box keeps the 10 most recent used in the last 3 days plus any used in the
   last 12 h (`OFFBOX_PRUNE_KEEP`, `OFFBOX_PRUNE_DAYS`), so a worktree idle for days may sync and install deps again.
 - A busy pool is a queue (progress line every 60 s). At home the run waits for a free box for up to 24 h and then
-  starts; a repo pool has up to 8 boxes (`OFFBOX_POOL_SIZE`, 1-64). On the Boat standby it waits **up to 600 seconds**
+  starts; a repo pool has up to 8 boxes (`OFFBOX_POOL_SIZE`, 1-64). A run pinned to Boat waits **up to 600 seconds**
   and then returns **92** (nothing ran; retry), with 4 boxes (`OFFBOX_POOL_SIZE` 1-16; raised from 8 for TorSSH by
   Abdullah, 12 Nov 2026) and `OFFBOX_POOL_WAIT_SECONDS` 0-1200. Sizes are minimums on pooled boxes; a larger warm box is reused.
   Waiters are served in arrival order among callers that can use the same box or create slot; `OFFBOX_POOL_SIZE`
@@ -306,7 +306,7 @@ commands, same box model, no hourly price, no start limits, no spend cap). Boat 
   home. A run double-checks a down state with a live probe before choosing Boat. Alerts recover after 3 good
   checks; nothing to switch by hand. `offbox status` shows which one is in use.
 - Marked up but not answering when your run starts (or while its box is being fetched): the run moves to Boat
-  before it is sent, with one line (`... this run goes to Boat instead`). **Once the server accepted a run it
+  before it is sent, with one line (`... this run goes to Boat instead`). A run that moved to Boat waits with no time limit for a Boat box or for home, and goes back to home as soon as home is ready. **Once the server accepted a run it
   never moves**, so nothing runs twice. A server that says it is starting is waited for (up to 600 s) instead of failing over. A slow but reachable server is waited for; runs move to Boat only when home is offline or refusing work, or has not answered for 5 minutes.
 - A run naming `--base` saved only on home waits for home (exit **93** when the wait expires) and never runs on Boat's template.
 - The server restarts under an accepted run (power cut, reboot, boatd restart): the client reconnects for up to
@@ -376,8 +376,8 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
 - **97 + "box setup failed (exit 97), not your command"** = the box's toolchain setup failed before your command ran
   (18 Oct: `mv: cannot overwrite '/usr/local/go'`). Offbox turns it into 90 (infra) and the normal infra/fallback rules
   apply. A plain 97 without that line is your command's own exit code.
-- **92** = every pool box stayed busy for the whole queue wait (24 h at home, 10 min on the Boat standby; or other
-  runs held the pool's lock that long). Nothing ran, not an infra failure: just retry. A slow box resume or create no longer holds up other runs of the same repo.
+- **92** = every pool box stayed busy for the whole queue wait (24 h at home; 10 min only for runs pinned to Boat; or other
+  runs held the pool's lock that long). Runs that moved to Boat wait with no time limit for a Boat box or for home. Nothing ran, not an infra failure: just retry. A slow box resume or create no longer holds up other runs of the same repo.
 - **93** = person work (`offbox-person`) while the home server is down. Nothing ran and nothing went to Boat. It
   is not a failure of the command: the task waits for the server. Don't retry in a loop and don't route around it.
 - **94** = the home command was interrupted by a server/Incus restart or exec-stream loss and was not run again (`--no-retry`, person work, or it

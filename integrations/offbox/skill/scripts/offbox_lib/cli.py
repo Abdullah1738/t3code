@@ -269,6 +269,14 @@ def _run_with_wait_budget(a, me) -> int:
                 with outage.allocation_budget(remaining):
                     return _remote_once(a, me)
             except OffboxError as e:
+                if home.active() and os.environ.get(home.RETURNED_HOME_ENV) and home.unreachable(e):
+                    # This invocation already left Boat's queue once. Remain at home through subsequent outages.
+                    say("home offbox server is unavailable again; this run stays queued on home")
+                    runs.retry_background(e)
+                    if e.run_id:
+                        os.environ[home.RUN_ID_ENV] = e.run_id
+                    time.sleep(home.failback_probe_seconds())
+                    continue
                 runs.retry_background(e)
                 run_id = e.run_id or os.environ.get(runs.BACKGROUND_RUN_ENV, '')
                 if isinstance(e, pool.PoolBusyError) and waited_from is not None and last_outage is not None and \

@@ -1545,6 +1545,7 @@ class Runner:
     def __init__(self, a, me: dict):
         self.a, self.me = a, me
         self.run_id = home.take_invocation_run() or new_id("run")
+        home.flush_routing(self.run_id)
         self.root = Path(me["repo_root"])
         recorded_cwd = None
         if os.environ.get(BACKGROUND_RUN_ENV):
@@ -1643,7 +1644,8 @@ class Runner:
         existing = con.execute('SELECT client_pid,mode FROM runs WHERE run_id=?', (self.run_id,)).fetchone()
         if existing:
             con.close()
-            if not a.bg or existing['mode'] != 'bg' or existing['client_pid'] != os.getpid():
+            if existing['client_pid'] != os.getpid() or not (
+                    (a.bg and existing['mode'] == 'bg') or os.environ.get(home.RETURNED_HOME_ENV)):
                 raise OffboxError(f'{self.run_id}: queued run belongs to another client', code=EXIT_LOCAL)
             self.registered = True
             return
@@ -1661,6 +1663,8 @@ class Runner:
                              cmd_text[:4000], "bg" if a.bg else "fg", now(), str(self.log_path),
                              json.dumps(a.pull or []), self.rel, str(self.cwd), os.getpid(), len(steps)))
                 con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'start_claim:{self.run_id}', '1'))
+                if home.failed_over():
+                    con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'failover_queue:{self.run_id}', '1'))
         try:
             db_retry(register)
             self.registered = True
@@ -3120,11 +3124,11 @@ def background_client(a, me: dict, ready=None, accept=None, signal_mask=None, so
                 signal.signal(s, handler)
 
 
-def forward_background(env: dict) -> None:
+def forward_background(env: dict, *, backend="boat") -> None:
     if _background_context is None:
         raise OffboxError('background failover has no queued run context', code=EXIT_LOCAL)
     # Reuse the stdin protocol on failover too: an exec of the original argv would expose --env values.
-    common.select_backend('boat')
+    common.select_backend(backend)
     os.environ.clear()
     os.environ.update(env)
     raise SystemExit(_background(*_background_context))
