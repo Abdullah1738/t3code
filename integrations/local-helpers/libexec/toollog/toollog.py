@@ -449,6 +449,7 @@ def rollup(board, day, top_n=20):
     order_errors, order_polls = {}, defaultdict(list)
     component_totals, component_errors = Counter(), defaultdict(Counter)
     component_samples, component_durations = defaultdict(dict), defaultdict(list)
+    order_failures, poll_counts = defaultdict(Counter), {}
     threads_by_rule, attempts = defaultdict(Counter), defaultdict(list)
     thread_decisions, unattributed = defaultdict(Counter), defaultdict(Counter)
     sampled_threads, sampled_attempts, sampled_unknown = set(), set(), set()
@@ -532,6 +533,17 @@ def rollup(board, day, top_n=20):
             merchant = (row.get('props') or {}).get('merchant')
             if merchant not in {'noon', 'careem', 'amazon', 'uber', 'other'}:
                 merchant = 'unknown'
+            if (component == 'order-watch' and name == 'track.poll' and type(row.get('ok')) is bool
+                    and (row.get('props') or {}).get('polled') is not False):
+                poll = poll_counts.setdefault(merchant, {'count': 0, 'failed': 0})
+                poll['count'] += weight
+                poll['failed'] += weight * (row['ok'] is False)
+            identity = row.get('ids')
+            order_id = identity.get('orderId') if isinstance(identity, dict) else None
+            if (kind == 'error' and name in {'track.poll', 'provider.track', 'provider.details'}
+                    and (row.get('props') or {}).get('polled') is not False
+                    and type(order_id) is str and re.fullmatch(r'[a-f0-9]{16}', order_id)):
+                order_failures[component][order_id] += weight
             if name == 'track.poll' and type(duration) in (int, float) and math.isfinite(duration) and duration >= 0:
                 order_polls[merchant].append((duration, weight))
             if kind == 'error':
@@ -648,6 +660,13 @@ def rollup(board, day, top_n=20):
                         for code, count in sorted(component_errors[component].items(),
                                                   key=lambda item: (-item[1], item[0]))[:5]]
             for component in sorted(component_totals)}
+        result['topOrderFailuresByComponent'] = {
+            component: [{'orderId': order_id, 'count': count} for order_id, count in
+                        sorted(orders.items(), key=lambda item: (-item[1], item[0]))[:5]]
+            for component, orders in sorted(order_failures.items())}
+        result['pollsByMerchant'] = {
+            merchant: {**poll, 'failureShare': poll['failed'] / poll['count']}
+            for merchant, poll in sorted(poll_counts.items())}
     if board == 'imessage':
         result['byComponent'] = {}
         result['durationMs'] = result['durationMsByName']
