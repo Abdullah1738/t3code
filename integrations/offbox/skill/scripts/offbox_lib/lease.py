@@ -1397,7 +1397,7 @@ def _reuse_available(con, row, size, skip_archiving=False, retrying=False, befor
                 ssh_sync.check_host_key(box_id, p.stderr)
             if p.returncode == 0:
                 if api.BACKEND == 'server':
-                    _check_held(box_id, api.get(box_id))
+                    _check_held(box_id, _readiness_get(box_id))
                 ensure_ttl(box_id, max(RUN_TTL_S, idle_for(con, box_id, row["size"])))
                 if pending_grow and not _bigger(pending_grow[0], row['size']):
                     con.execute("DELETE FROM kv WHERE k=?", (f"resize_size:{box_id}",))

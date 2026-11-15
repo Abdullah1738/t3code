@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -30,6 +31,57 @@ class HomeBoxSlow(unittest.TestCase):
         self.addCleanup(lambda: home.QUEUE_WAIT.reset(token))
         self.stack.enter_context(patch.object(home, "slow_read_reachable", return_value=True))
         self.stack.enter_context(patch.object(home, "say"))
+
+    def warm_ssh_row(self):
+        self.f.box("homebox", member=True)
+        cfg = Path(self.f.tmp.name) / "ssh-cache"
+        cfg.touch()
+        self.stack.enter_context(patch.object(lease.ssh_sync, "cfg_path", return_value=cfg))
+        self.stack.enter_context(patch.object(lease.ssh_sync, "ssh_base", return_value=["ssh"]))
+        self.stack.enter_context(patch.object(lease.subprocess, "run", return_value=SimpleNamespace(returncode=0, stderr=b"")))
+        self.stack.enter_context(patch.object(lease, "ensure_ttl"))
+        return self.f.con.execute("SELECT * FROM leases WHERE box_id='homebox'").fetchone()
+
+    def test_warm_ssh_two_transport_timeouts_keep_home_box_after_healthy_preflight(self):
+        self.warm_ssh_row()
+        reads = []
+        def opening(request, timeout):
+            self.assertTrue(request.full_url.endswith("/sandboxes/homebox"))
+            reads.append(timeout)
+            if len(reads) <= 2:
+                self.clock.sleep(timeout)
+                raise TimeoutError("sandbox read timed out")
+            return io.BytesIO(json.dumps({"sandbox": {"id": "homebox", "state": "running", "type": "large", "heldRuns": []}}).encode())
+        with patch.dict(os.environ, OFFBOX_POOL_WAIT_SECONDS="5000", OFFBOX_POOL_SIZE="1"), \
+                patch.object(api, "get", self.f.status_get), patch.object(api, "_key", return_value="fixture"), \
+                patch.object(api, "_open", side_effect=opening), \
+                patch.object(home, "recover_slow_read", wraps=home.recover_slow_read) as recovery:
+            got, output = self.f.run_cmd("--remote", "--", "go", "test", "./...")
+        self.assertIsInstance(got, dict, output)
+        pool.release_guard(got)
+        self.assertEqual(got["box_id"], "homebox")
+        recovery.assert_called_once()
+        self.assertEqual(len(reads), 3)
+        self.assertAlmostEqual(reads[0], api.HOME_START_TIMEOUT_S)
+        self.assertAlmostEqual(reads[1], home.slow_probe_seconds())
+        self.assertLess(self.clock.t - 1000, home.slow_down_seconds())
+        self.assertEqual(self.f.execs, [])
+        self.assertFalse(common.HOME_FAILURES.exists())
+        self.assertTrue(api.probe_backend.called, "the authenticated home preflight must succeed first")
+
+    def test_warm_ssh_http_and_connection_refusals_remain_hard(self):
+        row = self.warm_ssh_row()
+        for error in (api.ApiError(500, "internal", "read refused"), api.NetworkError("connection refused")):
+            with self.subTest(error=type(error).__name__), patch.object(api, "get", side_effect=error) as read, \
+                    patch.object(lease, "_check_held") as check_held, home.wait_budget():
+                began = self.clock.t
+                with self.assertRaises(type(error)) as caught:
+                    lease._reuse(self.f.con, row, None)
+                self.assertIs(caught.exception, error)
+                self.assertEqual(home.failure_class(str(error)), "hard")
+                self.assertEqual(self.clock.t, began)
+                read.assert_called_once()
+                check_held.assert_not_called()
 
     def test_queued_41_min_timeout_keeps_the_same_box_and_grant(self):
         for sighting, seconds in (("9eaf", 2460), ("e0c7", 2460), ("70a7", 2460), ("d15b", 2545)):
