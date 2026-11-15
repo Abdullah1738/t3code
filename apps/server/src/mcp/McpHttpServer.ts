@@ -1445,8 +1445,12 @@ const withToolAnalytics =
                         : options.tool.name === "t3_thread_read"
                           ? ThreadReadDeadline.bound(completed)
                           : completed;
+                    const protectedRead = SavedBoardReply.TIMED_TOOLS.has(options.tool.name)
+                      ? SavedBoardReply.protect(boundedRead, options.tool.name)
+                      : boundedRead;
+                    // Keep read timings on tools/call, outside the saved-reply child span.
                     const measuredRead = largeRead
-                      ? boundedRead.pipe(
+                      ? protectedRead.pipe(
                           Effect.onExit((exit) =>
                             Effect.gen(function* () {
                               const now = yield* Clock.monotonicTimeNanos;
@@ -1480,11 +1484,8 @@ const withToolAnalytics =
                             }),
                           ),
                         )
-                      : boundedRead;
-                    const protectedCall = SavedBoardReply.TIMED_TOOLS.has(options.tool.name)
-                      ? SavedBoardReply.protect(measuredRead, options.tool.name)
-                      : measuredRead;
-                    return yield* protectedCall.pipe(
+                      : protectedRead;
+                    return yield* measuredRead.pipe(
                       Effect.provideService(McpCallAnalytics.McpCall, callState),
                       Effect.provideService(SavedWrite.observer, (receipt) => {
                         callState.saved = true;
