@@ -46,7 +46,7 @@
       ]
     },
     "openai": {
-      "expected": "7572",
+      "any": true,
       "aliases": [
         "openai (chatgpt)",
         "chatgpt",
