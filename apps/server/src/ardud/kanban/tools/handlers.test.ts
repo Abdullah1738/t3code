@@ -57,6 +57,7 @@ import * as ProjectService from "../../../project/ProjectService.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
 import * as KanbanService from "../engine/KanbanService.ts";
 import { PACKET_SUBTASK } from "../engine/subtasks.ts";
+import * as SavedWrite from "../engine/savedWrite.ts";
 import * as KanbanModels from "../engine/models.ts";
 import * as Activity from "../engine/activity.ts";
 import * as Rules from "../engine/rules.ts";
@@ -142,6 +143,7 @@ const fakeThreads = (
     readonly queuedRuns?: KanbanThreads["Service"]["queuedRuns"];
     readonly cancelQueued?: KanbanThreads["Service"]["cancelQueued"];
   },
+  markControl?: { beforeMark?: () => Effect.Effect<void, KanbanError> },
 ) => {
   const running = new Set<string>();
   const queued = new Set<string>();
@@ -335,7 +337,7 @@ const fakeThreads = (
           ),
         );
   const serviceLayer =
-    editCardError || postToCardError || replyControl
+    editCardError || postToCardError || replyControl || markControl
       ? Layer.effect(
           KanbanService.KanbanService,
           Effect.map(KanbanService.KanbanService, (service) =>
@@ -359,7 +361,11 @@ const fakeThreads = (
                   : service.submitEvaluator(...args).pipe(Effect.flatMap(reply)),
               moveCard: (...args) => service.moveCard(...args).pipe(Effect.flatMap(reply)),
               reviewResult: (...args) => service.reviewResult(...args).pipe(Effect.flatMap(reply)),
-              markSubtask: (...args) => service.markSubtask(...args).pipe(Effect.flatMap(reply)),
+              markSubtask: (...args) =>
+                Effect.suspend(() => markControl?.beforeMark?.() ?? Effect.void).pipe(
+                  Effect.andThen(service.markSubtask(...args)),
+                  Effect.flatMap(reply),
+                ),
               changeAsk: (...args) =>
                 service.changeAsk(...args).pipe(
                   Effect.flatMap(reply),
@@ -6435,103 +6441,111 @@ it.effect.each([
   }),
 );
 
-it.effect.each(["card_move", "card_review_result", "subtask_done", "subtask_done_repeat"] as const)(
-  "card-thread %s distinguishes a saved reply conflict from a refused repeat",
-  (tool) =>
-    Effect.gen(function* () {
-      const saved = yield* Deferred.make<void>();
-      let enabled = false;
-      const fake = fakeThreads(undefined, undefined, undefined, undefined, {
-        mode: "conflict",
-        saved,
-        enabled: () => enabled,
+it.effect.each([
+  "card_move",
+  "card_review_result",
+  "subtask_done",
+  "subtask_done_refresh",
+  "subtask_done_repeat",
+] as const)("card-thread %s distinguishes a saved reply conflict from a refused repeat", (tool) =>
+  Effect.gen(function* () {
+    const saved = yield* Deferred.make<void>();
+    let enabled = false;
+    const fake = fakeThreads(undefined, undefined, undefined, undefined, {
+      mode: "conflict",
+      saved,
+      enabled: () => enabled,
+    });
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "worker-reply",
+        name: "Worker reply",
+        defaultProjectId: ProjectId.make("project-1"),
       });
-      yield* Effect.gen(function* () {
-        const kanban = yield* KanbanService.KanbanService;
-        const board = yield* kanban.ensureBoard({
-          slug: "worker-reply",
-          name: "Worker reply",
-          defaultProjectId: ProjectId.make("project-1"),
-        });
-        yield* kanban.setPool(board.id, board.defaultCardModel, 3);
-        const card = yield* kanban.createCard(
-          board.id,
-          {
-            title: "Reply",
-            prompt: "Reply",
-            subtasks: [
-              { step: 1, owner: "work", text: "Implement" },
-              { step: 2, owner: "review", text: "Review" },
-            ],
-          },
-          owner,
+      yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Reply",
+          prompt: "Reply",
+          subtasks: [
+            { step: 1, owner: "work", text: "Implement" },
+            { step: 2, owner: "review", text: "Review" },
+          ],
+        },
+        owner,
+      );
+      yield* kanban.dispatchNow;
+      const worker = (yield* kanban.card(card.id)).card.workThreadId!;
+      if (tool !== "subtask_done") {
+        yield* kanban.markSubtask(
+          card.id,
+          "s1",
+          "done",
+          "Done",
+          { _tag: "thread", threadId: worker },
+          "work",
         );
+      }
+      let caller = worker;
+      if (tool === "card_review_result") {
+        yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+          _tag: "thread",
+          threadId: worker,
+        });
         yield* kanban.dispatchNow;
-        const worker = (yield* kanban.card(card.id)).card.workThreadId!;
-        if (tool !== "subtask_done") {
-          yield* kanban.markSubtask(
-            card.id,
-            "s1",
-            "done",
-            "Done",
-            { _tag: "thread", threadId: worker },
-            "work",
-          );
-        }
-        let caller = worker;
-        if (tool === "card_review_result") {
-          yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
-            _tag: "thread",
-            threadId: worker,
-          });
-          yield* kanban.dispatchNow;
-          caller = (yield* kanban.card(card.id)).card.reviewThreadId!;
-        }
-        enabled = true;
-        const result = yield* call(
-          caller,
-          tool === "subtask_done_repeat" ? "subtask_done" : tool,
-          tool === "card_move"
-            ? { card: card.id, to: "needs_review", note: "Saved once" }
-            : tool === "card_review_result"
-              ? { verdict: "clear", head: "27a1b1e0" }
-              : { card: card.id, subtask: "s1", state: "done", note: "Saved once" },
-        );
-        if (tool === "subtask_done_repeat") {
-          assert.isTrue(result.isError, result.text);
-          assert.include(result.text, "subtask s1 is already done");
-          assert.isUndefined(result.structured.saved);
-          const detail = yield* kanban.card(card.id);
-          assert.lengthOf(
-            detail.events.filter((event) => event.kind === "subtask"),
-            1,
-          );
-          assert.strictEqual(detail.card.subtasks[0]?.note, "Done");
-          return;
-        }
-        assert.isFalse(result.isError, result.text);
-        assert.strictEqual(result.structured.saved, true);
+        caller = (yield* kanban.card(card.id)).card.reviewThreadId!;
+      }
+      enabled = true;
+      const result = yield* call(
+        caller,
+        tool.startsWith("subtask_done") ? "subtask_done" : tool,
+        tool === "card_move"
+          ? { card: card.id, to: "needs_review", note: "Saved once" }
+          : tool === "card_review_result"
+            ? { verdict: "clear", head: "27a1b1e0" }
+            : {
+                card: card.id,
+                subtask: "s1",
+                state: "done",
+                note: tool === "subtask_done_repeat" ? "Done" : "Saved once",
+              },
+      );
+      if (tool === "subtask_done_repeat") {
+        assert.isTrue(result.isError, result.text);
+        assert.include(result.text, "subtask s1 is already done");
+        assert.isUndefined(result.structured.saved);
         const detail = yield* kanban.card(card.id);
-        assert.deepStrictEqual(result.structured.card, {
-          id: card.id,
-          number: card.number,
-          stage: detail.card.stage,
-        });
         assert.lengthOf(
-          detail.events.filter((event) =>
-            tool === "card_review_result"
-              ? event.kind === "review" && event.head === "27a1b1e0"
-              : event.body?.includes("Saved once"),
-          ),
+          detail.events.filter((event) => event.kind === "subtask"),
           1,
         );
-        if (tool === "card_move") assert.strictEqual(detail.card.stage, "needs_review");
-        if (tool === "card_review_result")
-          assert.strictEqual(detail.card.subtasks[1]?.state, "done");
-        if (tool.startsWith("subtask_done"))
-          assert.strictEqual(detail.card.subtasks[0]?.note, "Saved once");
-      }).pipe(Effect.provide(fake.layer));
-    }),
+        assert.strictEqual(detail.card.subtasks[0]?.note, "Done");
+        return;
+      }
+      assert.isFalse(result.isError, result.text);
+      assert.strictEqual(result.structured.saved, true);
+      const detail = yield* kanban.card(card.id);
+      assert.deepStrictEqual(result.structured.card, {
+        id: card.id,
+        number: card.number,
+        stage: detail.card.stage,
+      });
+      assert.lengthOf(
+        detail.events.filter((event) =>
+          tool === "card_review_result"
+            ? event.kind === "review" && event.head === "27a1b1e0"
+            : event.body?.includes("Saved once"),
+        ),
+        1,
+      );
+      if (tool === "card_move") assert.strictEqual(detail.card.stage, "needs_review");
+      if (tool === "card_review_result") assert.strictEqual(detail.card.subtasks[1]?.state, "done");
+      if (tool.startsWith("subtask_done"))
+        assert.strictEqual(detail.card.subtasks[0]?.note, "Saved once");
+    }).pipe(Effect.provide(fake.layer));
+  }),
 );
 
 it.effect.each(["card_move", "card_review_result"] as const)(
@@ -9644,6 +9658,74 @@ it.effect("interrupting completion keeps buildCommit metadata without a deploy g
   }).pipe(Effect.provide(fakeThreads().layer)),
 );
 
+it.effect.each([
+  { correction: false, note: "new" },
+  { correction: false, note: "same" },
+  { correction: false, note: "empty" },
+  { correction: true, note: "new" },
+  { correction: true, note: "same" },
+  { correction: true, note: "empty" },
+] as const)("finished release correction=$correction note=$note", ({ correction, note }) =>
+  Effect.gen(function* () {
+    const { kanban, board, actor, evaluator, create } = yield* releaseFixture;
+    const card = yield* create({ interrupting: true, service: "robob" });
+    const finished = yield* kanban.markSubtask(
+      card.id,
+      "s1",
+      "done",
+      "Installed; buildCommit: abcdef123456",
+      actor,
+      "evaluator",
+    );
+    const before = yield* kanban.card(card.id);
+    const boardBefore = (yield* kanban.snapshot(board.id)).board;
+    yield* TestClock.adjust("1 hour");
+    const restartedAt = DateTime.formatIso(
+      DateTime.add(DateTime.makeUnsafe(card.createdAt), { minutes: 30 }),
+    );
+    const newNote =
+      note === "new" ? "Final evidence" : note === "same" ? finished.subtasks[0]!.note! : undefined;
+    const result = yield* call(evaluator, "subtask_done", {
+      card: card.id,
+      subtask: "s1",
+      state: "done",
+      ...(newNote === undefined ? {} : { note: newNote }),
+      ...(correction ? { releasedAt: restartedAt } : {}),
+    });
+    const after = yield* kanban.card(card.id);
+    const boardAfter = (yield* kanban.snapshot(board.id)).board;
+    if (!correction && note !== "new") {
+      assert.isTrue(result.isError);
+      assert.include(result.text, note === "same" ? "with the same note" : "with the new note");
+      assert.deepStrictEqual(after.card, before.card);
+      assert.deepStrictEqual(after.events, before.events);
+      assert.deepStrictEqual(boardAfter.releaseLedger, boardBefore.releaseLedger);
+      return;
+    }
+    assert.isFalse(result.isError, result.text);
+    assert.strictEqual(after.card.subtasks[0]!.state, "done");
+    if (correction) {
+      assert.notStrictEqual(after.card.subtasks[0]!.doneAt, finished.subtasks[0]!.doneAt);
+      assert.strictEqual(boardAfter.releaseLedger![0]!.at, restartedAt);
+      assert.isTrue(boardAfter.releaseLedger![0]!.postHoc);
+      assert.strictEqual(boardAfter.releaseLedger![0]!.buildCommit, "abcdef123456");
+      assert.include(after.events.at(-1)!.body!, "s1 done:");
+    } else {
+      assert.deepStrictEqual(after.card, {
+        ...before.card,
+        updatedAt: after.card.updatedAt,
+        subtasks: [{ ...finished.subtasks[0]!, note: "Final evidence" }],
+      });
+      assert.deepStrictEqual(boardAfter.releaseLedger, boardBefore.releaseLedger);
+      assert.strictEqual(after.events.length, before.events.length + 1);
+      assert.strictEqual(
+        after.events.at(-1)!.body,
+        "s1 note updated: Apply build (Final evidence)",
+      );
+    }
+  }).pipe(Effect.provide(fakeThreads().layer)),
+);
+
 it.effect("replays Watchers #66 versus telegram #64 and Health #22 across boards", () =>
   Effect.gen(function* () {
     const fixture = yield* releaseFixture;
@@ -10559,50 +10641,141 @@ it.effect.each([
   },
 );
 
-it.effect("a top-level board evaluator skips an explicit gate through subtask_done", () => {
-  const { layer } = fakeThreads();
-  return Effect.gen(function* () {
-    const kanban = yield* KanbanService.KanbanService;
-    const board = yield* kanban.ensureBoard({
-      slug: "skip-root",
-      name: "Skip root",
-      defaultProjectId: ProjectId.make("project-1"),
-    });
-    const root = yield* kanban.startEvaluator(board.id, {
-      kind: "request",
-      text: "Review the gate",
-    });
-    const card = yield* kanban.createCard(
-      board.id,
-      {
-        title: "Misfiled gate",
-        prompt: "Work",
-        subtasks: [{ text: "Edit fork source", owner: "evaluator", gate: "deploy" }],
-      },
-      owner,
+it.effect(
+  "a top-level evaluator skips a gate and its child can refresh only the finished note",
+  () => {
+    const markControl: { beforeMark?: () => Effect.Effect<void, KanbanError> } = {};
+    const { layer, parents } = fakeThreads(
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      markControl,
     );
-    const skipped = yield* call(root, "subtask_done", {
-      card: card.id,
-      subtask: "s1",
-      state: "skipped",
-      note: "Only edits fork code",
-    });
-    assert.isFalse(skipped.isError, skipped.text);
-    const saved = (yield* kanban.card(card.id)).card;
-    assert.deepStrictEqual(saved.subtasks[0]!.gateSkipped?.by, {
-      _tag: "evaluator",
-      threadId: root,
-    });
-    const refused = yield* call(root, "subtask_done", {
-      card: card.id,
-      subtask: "s1",
-      state: "done",
-      note: "Did it",
-    });
-    assert.isTrue(refused.isError);
-    assert.include(refused.text, "needs Abdullah's approval");
-  }).pipe(Effect.provide(layer));
-});
+    return Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "skip-root",
+        name: "Skip root",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      const root = yield* kanban.startEvaluator(board.id, {
+        kind: "request",
+        text: "Review the gate",
+      });
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Misfiled gate",
+          prompt: "Work",
+          subtasks: [
+            { text: "Edit fork source", owner: "evaluator", gate: "deploy" },
+            { text: "Deploy", owner: "evaluator", gate: "deploy" },
+          ],
+        },
+        owner,
+      );
+      const skipped = yield* call(root, "subtask_done", {
+        card: card.id,
+        subtask: "s1",
+        state: "skipped",
+        note: "Only edits fork code",
+      });
+      assert.isFalse(skipped.isError, skipped.text);
+      const saved = (yield* kanban.card(card.id)).card;
+      assert.deepStrictEqual(saved.subtasks[0]!.gateSkipped?.by, {
+        _tag: "evaluator",
+        threadId: root,
+      });
+      const child = ThreadId.make("evaluator-child");
+      parents.set(child, root);
+      const unassigned = yield* call(child, "subtask_done", {
+        card: card.id,
+        subtask: "s1",
+        state: "skipped",
+        note: "Updated source evidence",
+      });
+      assert.isTrue(unassigned.isError);
+      assert.include(unassigned.text, "This delegated thread is not assigned to that card");
+      const store = yield* KanbanStore.KanbanStore;
+      yield* store.putThreadLink({
+        threadId: child,
+        boardId: board.id,
+        cardId: card.id,
+        role: "evaluator",
+        purpose: null,
+        discussionId: card.discussionId,
+        model: board.evaluatorModel,
+        startedAt: card.createdAt,
+        endedAt: null,
+        paused: null,
+      });
+      const refresh = yield* call(child, "subtask_done", {
+        card: card.id,
+        subtask: "s1",
+        state: "skipped",
+        note: "Updated source evidence",
+      });
+      assert.isFalse(refresh.isError, refresh.text);
+      const refreshed = (yield* kanban.card(card.id)).card;
+      assert.deepStrictEqual(refreshed.subtasks[0], {
+        ...saved.subtasks[0]!,
+        note: "Updated source evidence",
+      });
+      assert.deepStrictEqual(refreshed.asks, saved.asks);
+      const skip = yield* call(child, "subtask_done", {
+        card: card.id,
+        subtask: "s2",
+        state: "skipped",
+        note: "Skip a new gate",
+      });
+      assert.isTrue(skip.isError);
+      assert.include(skip.text, "only the board evaluator can skip a gated step");
+      const refused = yield* call(root, "subtask_done", {
+        card: card.id,
+        subtask: "s1",
+        state: "done",
+        note: "Did it",
+      });
+      assert.isTrue(refused.isError);
+      assert.include(refused.text, "needs Abdullah's approval");
+      // Reopen after the handler's read, before the service acquires its write lock.
+      markControl.beforeMark = () =>
+        Effect.gen(function* () {
+          delete markControl.beforeMark;
+          // A concurrent call has its own save receipt, outside the refresh's MCP reply.
+          yield* kanban
+            .markSubtask(
+              card.id,
+              "s1",
+              "open",
+              null,
+              { _tag: "evaluator", threadId: root },
+              "evaluator",
+            )
+            .pipe(
+              Effect.provideService(SavedWrite.observer, () => {}),
+              Effect.provideService(SavedWrite.commitObserver, () => {}),
+            );
+        });
+      const raced = yield* call(child, "subtask_done", {
+        card: card.id,
+        subtask: "s1",
+        state: "skipped",
+        note: "Raced refresh",
+      });
+      assert.isUndefined(markControl.beforeMark);
+      assert.isTrue(raced.isError, raced.text);
+      assert.include(raced.text, "only refreshing its finished note is allowed");
+      const reopened = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(reopened.subtasks[0]?.state, "open");
+      assert.isNull(reopened.subtasks[0]?.doneAt);
+      assert.deepStrictEqual(reopened.asks, refreshed.asks);
+    }).pipe(Effect.provide(layer));
+  },
+);
 
 it.effect("a worker's later-step subtask refusal keeps its message and fixed reason", () => {
   const { layer } = fakeThreads();

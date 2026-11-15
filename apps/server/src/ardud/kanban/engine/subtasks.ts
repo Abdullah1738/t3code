@@ -1007,7 +1007,7 @@ export type SubtaskPlan =
 export type SubtaskRole = "work" | "review" | "evaluator" | "script";
 
 export type MarkCheck =
-  | { readonly ok: true }
+  | { readonly ok: true; readonly refresh?: true }
   | { readonly ok: false; readonly reason: string; readonly denyReason: McpDenyReason };
 
 /** The number in an `s<N>` subtask id; 0 for anything else. */
@@ -1419,15 +1419,25 @@ export function checkMark(
       denyReason: "subtask_not_found",
       reason: `card #${card.number} has no subtask ${id}. Existing subtask ids: ${subtaskIds(card.subtasks) || "none"}`,
     };
-  if (
-    subtask.state === state &&
-    !(correctingRelease && role === "evaluator" && subtask.interrupting && state === "done")
-  )
-    return {
-      ok: false,
-      denyReason: "subtask_state_unchanged",
-      reason: `subtask ${id} is already ${state}`,
-    };
+  const correction =
+    correctingRelease && role === "evaluator" && subtask.interrupting && state === "done";
+  const refresh = subtask.state === state && state !== "open" && !correction;
+  if (subtask.state === state && !correction) {
+    if (!refresh)
+      return {
+        ok: false,
+        denyReason: "subtask_state_unchanged",
+        reason: `subtask ${id} is already ${state}`,
+      };
+    const newNote = note?.trim();
+    if (!newNote || newNote === subtask.note?.trim()) {
+      return {
+        ok: false,
+        denyReason: "subtask_state_unchanged",
+        reason: `subtask ${id} is already ${state}${newNote ? " with the same note" : ""}; to change its note, send state "${state}" with the new note`,
+      };
+    }
+  }
   if (state === "skipped" && !note?.trim()) {
     return {
       ok: false,
@@ -1435,7 +1445,7 @@ export function checkMark(
       reason: "say why the subtask is skipped",
     };
   }
-  if (role === "evaluator") return { ok: true };
+  if (role === "evaluator") return refresh ? { ok: true, refresh: true } : { ok: true };
   if (role === "review") {
     return {
       ok: false,
@@ -1467,6 +1477,7 @@ export function checkMark(
       reason: `subtask ${id} is for the script "${subtask.script}"`,
     };
   }
+  if (refresh) return { ok: true, refresh: true };
   if (subtask.step !== kanbanOpenStep(card)) {
     return {
       ok: false,
@@ -1561,6 +1572,14 @@ export const markSubtask = (
           doneAt: at,
         };
   });
+
+// Completion metadata also anchors approval checks and release pacing.
+export const refreshNote = (
+  subtasks: ReadonlyArray<KanbanSubtask>,
+  id: string,
+  note: string,
+): ReadonlyArray<KanbanSubtask> =>
+  subtasks.map((subtask) => (subtask.id === id ? { ...subtask, note: note.trim() } : subtask));
 
 export function reviewRoundStartedAt(events: ReadonlyArray<KanbanCardEvent>, reviewStep: number) {
   let remaining = reviewStep;
