@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import statistics
 import subprocess
 import threading
 import time
@@ -132,6 +133,7 @@ OWNER_REQUEST_LIMIT = 64
 OWNER_CACHE_VERSION = 2
 _OWNER_STATS_LOCK = threading.Lock()
 MSGS_BUDGET = 2
+RECEIPT_BUDGET = 4
 
 
 TIMING_STATS = contextvars.ContextVar('money_cases_timing_stats', default=None)
@@ -142,22 +144,26 @@ _TIMING_STACK = contextvars.ContextVar('money_cases_timing_stack', default=())
 def step_timing(stats, name, deadline=None):
     stats = stats if stats is not None else TIMING_STATS.get()
     started = time.monotonic()
-    stack = _TIMING_STACK.get()
-    frame = {'stats': stats, 'children': 0.0}
-    token = _TIMING_STACK.set((*stack, frame))
-    alarm = signal.getitimer(signal.ITIMER_REAL)[0]
-    if alarm:
-        enclosing = time.time() + alarm
-        deadline = min(deadline, enclosing) if deadline is not None else enclosing
+    stack = tuple(frame for frame in _TIMING_STACK.get() if frame.get('active'))
+    frame = {'stats': stats, 'children': 0.0, 'name': name, 'active': True, 'deadline': deadline}
     error = None
     try:
+        _TIMING_STACK.set((*stack, frame))
+        alarm = signal.getitimer(signal.ITIMER_REAL)[0]
+        if alarm:
+            enclosing = time.time() + alarm
+            deadline = min(deadline, enclosing) if deadline is not None else enclosing
+        frame['deadline'] = deadline
         yield
     except BaseException as exc:
         error = exc
         raise
     finally:
+        # A signal can interrupt setup or even the final clock sample. Restore
+        # the source context first so later calls cannot inherit a dead frame.
+        frame['active'] = False
+        _TIMING_STACK.set(stack)
         elapsed = (time.monotonic() - started) * 1000
-        _TIMING_STACK.reset(token)
         if stack and stack[-1]['stats'] is stats:
             stack[-1]['children'] += elapsed
         if stats is not None:
@@ -315,6 +321,7 @@ def left(deadline, cap):
 
 
 def msgs(argv, deadline, cap, memo=None, stats=None):
+    stats = stats if stats is not None else TIMING_STATS.get()
     key = tuple(argv)
     if memo is not None and key in memo:
         result = memo[key]
@@ -324,19 +331,55 @@ def msgs(argv, deadline, cap, memo=None, stats=None):
     timeout = left(deadline, min(cap, MSGS_BUDGET))
     if stats is not None:
         stats['msgs_calls'] += 1
+    started = time.monotonic()
+    called_at = time.time()
+    stop = called_at + timeout
+    alarm = signal.getitimer(signal.ITIMER_REAL)[0]
+    if alarm:
+        stop = min(stop, time.time() + alarm)
+    timed_out = False
     try:
         with step_timing(stats, 'msgs', time.time() + timeout):
             done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
         if done.returncode:
             raise Lookup(f'msgs exit {done.returncode}: {done.stderr.strip()[:200]}')
     except (OSError, subprocess.TimeoutExpired, Lookup) as e:
+        timed_out = isinstance(e, subprocess.TimeoutExpired) or getattr(e, '_money_cases_timeout', False)
         error = e if isinstance(e, Lookup) else Lookup(f'msgs: {e}')
         if memo is not None:
             memo[key] = error
         raise error from e
+    except BaseException as exc:
+        timed_out = getattr(exc, '_money_cases_timeout', False)
+        raise
+    finally:
+        if stats is not None:
+            elapsed = round((time.monotonic() - started) * 1000)
+            stats.setdefault('_msgs_samples_ms', []).append(elapsed)
+            stats['msgs_timeouts'] = stats.get('msgs_timeouts', 0) + int(
+                timed_out or time.time() >= stop)
+            names = {frame['name'] for frame in _TIMING_STACK.get()
+                     if frame.get('active') and frame['stats'] is stats
+                     and (frame['deadline'] is None or called_at < frame['deadline'])}
+            kind = 'receipt' if 'receipt' in names else 'order' if names & {
+                'order_charges', 'lookups', 'order_screen'} else 'other'
+            bucket = stats.setdefault('msgs_by_kind', {}).setdefault(kind, {'count': 0, 'ms': 0})
+            bucket['count'] += 1
+            bucket['ms'] += elapsed
     if memo is not None:
         memo[key] = done
     return done
+
+
+def receipt_timing(stats):
+    """Bounded metadata only, including defaults for checks without archive work."""
+    samples = stats.get('_msgs_samples_ms', [])
+    return {'msgs_timeouts': stats.get('msgs_timeouts', 0),
+            'msgs_p50_ms': round(statistics.median(samples)) if samples else 0,
+            'msgs_by_kind': {kind: {key: stats.get('msgs_by_kind', {}).get(kind, {}).get(key, 0)
+                                    for key in ('count', 'ms')} for kind in ('receipt', 'order', 'other')},
+            'receipt_result': {key: stats.get('receipt_result', {}).get(key, 0)
+                               for key in ('found', 'none', 'out_of_time', 'error')}}
 
 
 def day(t):
@@ -388,6 +431,7 @@ def within(deadline, error):
     started = time.monotonic()
 
     def expired(*_):
+        error._money_cases_timeout = True
         raise error
 
     signal.signal(signal.SIGALRM, expired)
@@ -791,7 +835,11 @@ def receipt(charge, at, now, find=None, deadline=None, read=None, memo=None, sta
     and reads as a receipt, and either names the merchant (from two hours before to 36 hours after) or,
     under another name, shows the card's last four digits within 15 minutes of it. Search hits are
     checked against the mail itself."""
-    options = {'memo': memo, 'stats': stats} if memo is not None else {}
+    options = {}
+    if memo is not None:
+        options['memo'] = memo
+    if stats is not None:
+        options['stats'] = stats
     find = find or (lambda *a, **kw: search(*a, **kw, **options))
     read = read or (lambda row, deadline: show(row, deadline, **options))
     amount = ' OR '.join(f'"{v}"' for v in amounts(charge))
@@ -973,20 +1021,40 @@ def found(charge, at, now, deadline=None, find=None, said=None, errors=None, mem
     """A receipt or his own words that explain the charge, or None."""
     errors = [] if errors is None else errors
     limits = [] if limits is None else limits
+    receipt_result = 'error'
+    receipt_end = time.time()
     try:
-        # Mail must leave a slice for order history, including when a custom
-        # finder ignores its timeout. The enclosing question alarm stays earlier.
-        mail_end = time.time() + MSGS_BUDGET
+        # Several fast searches/reads can exhaust a two-second scan. Keep the
+        # per-process cap, but allow four seconds inside the six-second question,
+        # leaving two for order history even when a finder ignores its timeout.
+        mail_end = time.time() + RECEIPT_BUDGET
         if deadline is not None:
             mail_end = min(mail_end, deadline)
+        receipt_end = mail_end
+        alarm = signal.getitimer(signal.ITIMER_REAL)[0]
+        if alarm:
+            receipt_end = min(receipt_end, time.time() + alarm)
         with step_timing(stats, 'receipt', mail_end), within(mail_end, Lookup('receipt lookup over time')):
             row = receipt(charge, at, now, find, mail_end, memo=memo, stats=stats, receipt_ok=receipt_ok)
+        receipt_result = 'found' if row else 'none'
         if row:
             when = dt.datetime.fromtimestamp(row['ts'], TZ).strftime('%a %d %b %H:%M')
             return {'verdict': 'receipt', 'why': f"receipt {when}: {row.get('sender', '')} - {row.get('subject', '')}"[:200],
                     'msgs': row.get('id'), 'errors': errors}
     except Lookup as e:
+        receipt_result = 'out_of_time' if getattr(e, '_money_cases_timeout', False) or \
+            time.time() >= receipt_end or 'out of time' in str(e) or \
+            'over time' in str(e) or isinstance(e.__cause__, subprocess.TimeoutExpired) else 'error'
         errors.append(f'receipt: {e}')
+    except BaseException as exc:
+        if getattr(exc, '_money_cases_timeout', False) or time.time() >= receipt_end:
+            receipt_result = 'out_of_time'
+        raise
+    finally:
+        target = stats if stats is not None else TIMING_STATS.get()
+        if target is not None:
+            counts = target.setdefault('receipt_result', {})
+            counts[receipt_result] = counts.get(receipt_result, 0) + 1
     try:
         hit = order_receipt(charge, at, now, deadline, memo=memo, stats=stats)
         if hit:
