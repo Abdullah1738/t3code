@@ -21,7 +21,7 @@ LIVE = re.compile(
     rf"(?!{REPLICA.pattern})\.robob/userdata/(?:[\w.-]+/)*state\.sqlite|"
     r"(?:\.local/share/opencode|opencode-data)/opencode\.db|"
     # The legacy home database is protected; workspace .t3 copies stay isolated.
-    rf"(?:{re.escape(str(Path.home()))}|~|\$HOME|\$\{{HOME\}})/\.t3/userdata/statev2)"
+    rf"(?:{re.escape(str(Path.home()))}|~|\$HOME|\$\{{HOME\}})/\.t3/userdata/(?:statev2|(?:[\w.-]+/)*state\.sqlite))"
 )
 DATABASE_NAME = re.compile(r"statev2(?:[.-][\w-]+)?\.sqlite|state\.sqlite|opencode\.db")
 # Preserve the existing hidden-home fixture; new subpaths use plain segments.
@@ -177,6 +177,26 @@ def source_touches_live(source: str) -> bool:
                    if (value := _path_expression(node, bindings, aliases, partial=True)) is not None)
     except (SyntaxError, ValueError):
         return False
+
+
+def _foreign_state_source(source, directory):
+    # Only a complete rooted literal discharges the ambiguous legacy basename.
+    # Keep variable/glob directories and split path expressions conservative.
+    def literal(match):
+        value = match[0]
+        path = _literal_path(value, directory)
+        if path is None or REPLICA.search(value) or LIVE.search(value) or LIVE.search(str(path)):
+            return value
+        for root in (Path.home() / '.robob/userdata', Path.home() / '.t3/userdata'):
+            if path.is_relative_to(root.resolve()):
+                return value
+        return ' ' * len(value)
+    masked = re.sub(r'''(?<![^\s'"(=])(?:~|\$HOME|\$\{HOME\})?/[^\s'"`$*?\[\]();|&<>\\]*?/state\.sqlite(?:-(?:wal|shm|journal))?(?=$|[\s'"),;|&<>])''', literal, source)
+    # A separate protected root may transform or rebase the foreign operand.
+    if (re.search(r"\.robob\b|robob-data|\.t3\b|opencode-data|\.local/share/opencode|['\"]opencode['\"]", masked) or
+            re.search(r'\buserdata\b', masked) and re.search(r'\b(?:homedir|HOME|T3CODE_HOME)\b|\bPath\.home\b', masked)):
+        return source
+    return masked
 
 
 def _relative_source_live(source, directory):
@@ -1481,6 +1501,9 @@ def _source_hit(source, directory, python=False, shell=False):
                 return True
     if source_touches_live(source) or _relative_source_live(source, directory):
         return True
+    source = _foreign_state_source(source, directory)
+    if re.search(r'''\bsqlite3?\s+(?:-[\w-]+\s+)*['"]?[^'"\s;]*state\.sqlite''', source):
+        return True
     def isolated_literal(match):
         value = match[2]
         # A direct absolute argument stays fixed even if the program changes cwd.
@@ -1996,6 +2019,10 @@ def _direct_read(words, directory):
         if path is not None and LIVE.search(str(path)):
             return True
         if LIVE.search(value):
+            return True
+        if (re.search(r'state\.sqlite(?:-(?:wal|shm|journal))?$', value) and
+                os.path.basename(words[0]) in {'sqlite', 'sqlite3'} and
+                not REPLICA.search(value) and 'state.sqlite' in _foreign_state_source(value, directory)):
             return True
     return False
 
