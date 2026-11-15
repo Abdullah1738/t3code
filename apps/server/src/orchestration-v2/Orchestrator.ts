@@ -13010,13 +13010,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         // The provider owns a native subagent's conversation, so a sent
         // message has nowhere to go. Answers to a subagent's questions never
         // target it either: adapters ask them on the top-level parent thread.
-        const thread = yield* projectionStore
-          .getThread(command.threadId)
-          .pipe(
-            Effect.mapError(
-              (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
-            ),
-          );
+        const thread = yield* projectionStore.getThread(command.threadId).pipe(
+          NodeSqliteClient.readOnly,
+          NodeSqliteClient.foregroundReads,
+          // A preceding group-commit command may have created the thread
+          // on the writer before its transaction is visible to readers.
+          Effect.catchTags({
+            ProjectionStoreThreadNotFoundError: () => projectionStore.getThread(command.threadId),
+          }),
+          Effect.mapError(
+            (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
+          ),
+        );
         if (isProviderNativeSubagentThread(thread)) {
           return yield* new OrchestratorSubagentThreadReadOnlyError({
             commandId: command.commandId,
