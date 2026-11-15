@@ -21,7 +21,13 @@ _PENDING = contextvars.ContextVar('orders_log_pending', default=None)
 _SCOPES = contextvars.ContextVar('orders_log_scopes', default=())
 _REQUEST = contextvars.ContextVar('orders_log_request', default=None)
 _SEEN = set()
+DELEGATION_REASONS = {'NO_STANDING_DELEGATION', 'DUPLICATE_DELEGATED_RECORD',
+    'BUS_REQUEST_MISSING', 'BUS_WRONG_SENDER', 'BUS_WRONG_TARGET', 'BUS_REQUEST_CLOSED',
+    'BUS_REQUEST_STALE', 'BUS_UNREADABLE', 'INVALID_LIFETIME', 'UNSUPPORTED_DELEGATION',
+    'DELEGATED_RECORD_INVALID'}
 _NAMES = {
+    'delegate.created', 'delegate.revoked', 'delegated_record.created', 'delegated_record.refused',
+    'moni_go.bus_checked', 'moni_go.bus_refused',
     'cmd.start', 'cmd.end', 'cmd.error', 'guard.refused', 'payment.may_have_sent',
     'step.auth', 'step.cart_build', 'step.checkout', 'step.payment_submit',
     'step.bank_approval_wait', 'step.confirmation', 'flow.recover_payment',
@@ -32,6 +38,8 @@ _NAMES = {
     'question.ask', 'check.run', 'cache_reset',
 }
 _ENUMS = {
+    'reason': DELEGATION_REASONS,
+    'busStatus': {'open', 'pending', 'timed_out'},
     'lane': {'food', 'minutes', 'nownow', 'main', 'supermall', 'marketplace', 'careem', 'uber',
              'quik', 'shops', 'box', 'same-day'},
     'merchant': {'noon', 'careem', 'amazon', 'web', 'uber', 'other', 'unknown'},
@@ -155,7 +163,7 @@ SUPERMALL_SILENT_DELIVERY_NOT_ACTIVE TALABAT_ADDRESS_CHECK_FAILED TALABAT_RETIRE
 UNSUPPORTED_NATIVE_MARKETPLACE_QUIET_DELIVERY UNSUPPORTED_QUIET_OPTION_SEMANTICS
 """.split())
 
-_KNOWN_TAGS = _GUARD_TAGS | frozenset("""
+_KNOWN_TAGS = _GUARD_TAGS | DELEGATION_REASONS | frozenset("""
 OPERATION_FAILED LOG_CAP TRACK_REGISTRATION_FAILED TRACK_POLL_SOURCE_ERROR
 AUTH_EXPIRED AUTH_FORBIDDEN ACCOUNT_CAPTURE_REQUIRED INVALID_ORDER_ID INVALID_ARGUMENTS
 DIA_BRIDGE_UNAVAILABLE DIA_INVALID_RESPONSE DIA_TRANSPORT_FAILED FAILED SOURCE_ERRORS
@@ -440,6 +448,10 @@ def _fields(props):
         elif key in _NUMBERS and type(value) is int and abs(value) <= 10**12 \
                 and (not (key.endswith('_ms') or key == 'writes_n' or key.startswith('owner_')) or value >= 0):
             result[key] = value
+        elif key == 'hours' and type(value) in (int, float) and math.isfinite(value) and 0 < value <= 24:
+            result[key] = value
+        elif key == 'currency' and type(value) is str and re.fullmatch(r'[A-Z]{3}', value):
+            result[key] = value
         elif key == 'limitKinds' and isinstance(value, list):
             result[key] = sorted({v for v in value if isinstance(v, str) and v in {
                 'ORDER_LIST_HOST_BINDING_UNVERIFIED', 'food_page_1', 'nownow_page_1', 'marketplace_page_1'}})
@@ -501,7 +513,7 @@ def _ids(values):
     # Hash even syntactically valid IDs: input IDs can themselves contain a PAN/OTP.
     return {key: hashlib.sha256(str(value).encode()).hexdigest()[:16]
             for key, value in (values or {}).items()
-            if key in {'flowId', 'orderId', 'caseId'} and type(value) in (str, int) and value != ''}
+            if key in {'flowId', 'orderId', 'caseId', 'requestId', 'delegationId'} and type(value) in (str, int) and value != ''}
 
 
 def _noon_lane(order):
@@ -514,7 +526,7 @@ def _noon_lane(order):
 
 def emit(component, name, *, kind='event', duration_ms=None, ok=None, ids=None, props=None, error=None, cause=None):
     try:
-        if component not in {'commerce', 'order-watch', 'card_status', 'noon', 'careem', 'amazon', 'uber', 'toollog', 'money-cases'}:
+        if component not in {'commerce', 'order-watch', 'card_status', 'noon', 'careem', 'amazon', 'uber', 'toollog', 'money-cases', 'owner-go'}:
             return
         if kind not in {'event', 'perf', 'error'} or name not in _NAMES:
             return
@@ -724,7 +736,7 @@ def rollup(day=None):
                     component = row.get('component')
                     if not isinstance(component, str) or component not in {
                             'commerce', 'order-watch', 'card_status', 'noon', 'careem',
-                            'amazon', 'uber', 'toollog', 'money-cases'}:
+                            'amazon', 'uber', 'toollog', 'money-cases', 'owner-go'}:
                         component = 'unknown'
                     component_totals[component] = component_totals.get(component, 0) + 1
                     component_errors.setdefault(component, {})
