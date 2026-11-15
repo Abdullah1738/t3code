@@ -27,6 +27,7 @@ export const readCallerIdentity = Effect.fn("mcp.readCallerIdentity")(function* 
     call.value.callerStarted = started;
     call.value.callerResolved = false;
     call.value.phase = "caller";
+    call.value.callerReaderLane = "identity";
     call.value.readerLane = "identity";
   }
   // Caller liveness must not queue behind active-thread lists on the view readers.
@@ -71,7 +72,10 @@ export const readCallerIdentity = Effect.fn("mcp.readCallerIdentity")(function* 
     } satisfies CallerIdentity;
   }
   // Only fork history or work exceeding the caller caps needs the exact shell.
-  if (call._tag === "Some") call.value.readerLane = "background";
+  if (call._tag === "Some") {
+    call.value.callerReaderLane = "background";
+    call.value.readerLane = "background";
+  }
   const shell = yield* McpDeadline.waitingOn(
     threads.getThreadShell(threadId).pipe(NodeSqliteClient.backgroundReads),
     "statev2 background caller shell",

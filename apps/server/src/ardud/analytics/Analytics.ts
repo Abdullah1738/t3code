@@ -23,6 +23,7 @@ import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "../../config.ts";
+import { makeReadPager } from "./readPages.ts";
 import { sampleMix } from "./samples.ts";
 import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
@@ -100,6 +101,7 @@ class AnalyticsValidationError extends Schema.TaggedError<AnalyticsValidationErr
       "batch-size",
       "queue-full",
       "invalid-day",
+      "invalid-cursor",
     ]),
   },
 ) {}
@@ -159,6 +161,7 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
   const options = boundedOptions(input);
   const directory = path.join(config.logsDir, "analytics");
   const disk = yield* Semaphore.make(1);
+  const readPager = makeReadPager();
   const wakeups = yield* Queue.dropping<void, Cause.Done>(1);
   const retries = yield* Queue.dropping<void, Cause.Done>(1);
   const encoder = new TextEncoder();
@@ -595,9 +598,13 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
     yield* boards.value.ready;
     const sql = boards.value.sql;
     const rows = yield* sql<
-      Omit<AskTimingRow, "kind"> & { kind: string | null; askJson: string | null }
+      Omit<AskTimingRow, "kind"> & {
+        cardNumber: number;
+        kind: string | null;
+        askJson: string | null;
+      }
     >`
-      SELECT c.board_id AS boardId, c.id AS cardId,
+      SELECT c.board_id AS boardId, c.id AS cardId, c.number AS cardNumber,
         json_extract(a.value, '$.id') AS askId,
         json_extract(a.value, '$.at') AS createdAt,
         json_extract(a.value, '$.closedAt') AS closedAt,
@@ -635,6 +642,14 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
         cause: new AnalyticsValidationError({ reason: "invalid-day" }),
       });
     }
+    if (input.cursor !== undefined) {
+      const page = readPager.resume(input);
+      if (page) return page;
+      return yield* new AnalyticsError({
+        operation: "read",
+        cause: new AnalyticsValidationError({ reason: "invalid-cursor" }),
+      });
+    }
     const storedRows = yield* readAskRows(input.day).pipe(
       Effect.mapError((cause) => new AnalyticsError({ operation: "read", cause })),
     );
@@ -656,7 +671,8 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
                     storedRows.filter(
                       (row) =>
                         (filter?.boardId === undefined || row.boardId === filter.boardId) &&
-                        (filter?.cardId === undefined || row.cardId === filter.cardId),
+                        (filter?.cardId === undefined || row.cardId === filter.cardId) &&
+                        (filter?.cardNumber === undefined || row.cardNumber === filter.cardNumber),
                     ),
                     input.day,
                     generatedAt,
@@ -666,10 +682,11 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
             yield* persistRollup(
               withAskLatency(finishRollup(full.accumulator, input.day, generatedAt)),
             );
-          return {
-            rollup: withAskLatency(finishRollup(view.accumulator, input.day, generatedAt), input),
-            samples: view.samples.slice(0, input.limit ?? 100).map((sample) => sample.event),
-          };
+          return readPager.read(
+            input,
+            withAskLatency(finishRollup(view.accumulator, input.day, generatedAt), input),
+            view.samples.map((sample) => sample.event),
+          );
         }),
       )
       .pipe(Effect.mapError((cause) => new AnalyticsError({ operation: "read", cause })));

@@ -1057,6 +1057,7 @@ const withToolAnalytics =
                 delivery.value.tool = options.tool.name;
                 if (invocation?.thread) delivery.value.callerThreadId = invocation.thread.threadId;
               }
+              const initialReaderLane = yield* NodeSqliteClient.ReaderLane;
               const callState: McpCallAnalytics.McpCall["Service"] = {
                 ...(Option.isSome(capture)
                   ? {
@@ -1070,7 +1071,8 @@ const withToolAnalytics =
                   : {}),
                 callerResolved: false,
                 callerResolveMs: 0,
-                readerLane: yield* NodeSqliteClient.ReaderLane,
+                callerReaderLane: initialReaderLane,
+                readerLane: initialReaderLane,
                 phase: "handler",
                 saved: "unknown",
               };
@@ -1153,6 +1155,7 @@ const withToolAnalytics =
                     : callState.requestTiming.preHandlerMs + durationMs;
                 if (totalMs !== undefined)
                   yield* Effect.annotateCurrentSpan({ "mcp.total_ms": totalMs });
+                const callerReaderLane = callState.callerReaderLane ?? initialReaderLane;
                 return {
                   ts: DateTime.formatIso(DateTime.makeUnsafe(startedAt)),
                   kind: "mcp.call" as const,
@@ -1199,8 +1202,8 @@ const withToolAnalytics =
                     (callState.callerStarted === undefined
                       ? 0
                       : Math.max(0, Number(ended - callState.callerStarted) / 1e6)),
-                  callerReaderLane: callState.readerLane,
-                  readerLane: callState.readerLane,
+                  callerReaderLane,
+                  readerLane: callerReaderLane,
                   ...(callState.waitStage === undefined ? {} : { waitStage: callState.waitStage }),
                   ...(callState.waitLookupMs === undefined
                     ? {}

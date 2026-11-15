@@ -1,0 +1,2 @@
+// Run after 99needrestart so services it restarted do not remain falsely pending.
+DPkg::Post-Invoke { "/usr/local/sbin/offbox-restart-pending || true"; };

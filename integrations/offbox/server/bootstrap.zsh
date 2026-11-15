@@ -81,6 +81,12 @@ EOF
       scp -q $SSHO $HERE/{boatd.py,boatd-wrap,base-image.sh,boatd.service,install-host.sh} root@$IP:/root/offbox-server/
       scp -q $SSHO $HERE/../skill/scripts/{toollog,offbox_disk_space}.py root@$IP:/root/offbox-server/
       scp -q $SSHO $HERE/../skill/templates/home/{offbox-mgmt-ssh.service,offbox_mgmt_sshd_config,offbox-ssh-runtime.conf} root@$IP:/root/offbox-server/
+      tar -C $HERE -cf - home/install-update-policy.sh \
+        home/stick/offbox/target/rootfs/etc/needrestart/conf.d/50-offbox.conf \
+        home/stick/offbox/target/rootfs/etc/apt/apt.conf.d/52offbox-unattended \
+        home/stick/offbox/target/rootfs/etc/apt/apt.conf.d/zz-offbox-restart-pending \
+        home/stick/offbox/target/rootfs/usr/local/sbin/offbox-restart-pending | \
+        r 'tar -xf - -C /root/offbox-server'
       r 'bash /root/offbox-server/install-host.sh' 2>&1 | tail -40
       ;;
     client)

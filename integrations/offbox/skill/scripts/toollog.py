@@ -31,8 +31,8 @@ ENUMS = {
     "action": {"stop", "delete", "forget", "settle", "keep", "other"},
     "linkType": {"wireguard", "residential", "down", "unknown"},
     "stage": {"ssh_setup", "ssh_drop", "readiness", "put_file", "sync", "pull", "command", "install_mid_run", "request", "reaper"},
-    "infra_failure": {"enospc"},
-    "infra_reason": {"low_space_gate", "disk_exhausted"},
+    "infra_failure": {"enospc", "native_crash"},
+    "infra_reason": {"low_space_gate", "disk_exhausted", "toolchain_unpack_crash"},
 }
 ENUMS.update({f'{fs}_fstype': {'tmpfs', 'zfs', 'ext2', 'ext3', 'ext4', 'xfs', 'btrfs', 'overlay', 'unknown'}
               for fs in ('tmp', 'var_tmp', 'home', 'workspace')})

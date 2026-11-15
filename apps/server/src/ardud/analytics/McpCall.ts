@@ -38,7 +38,8 @@ export class McpCall extends Context.Service<
       readonly preHandlerMs: number;
     };
     callerStarted?: bigint;
-    // Caller lookup only; handler reads can use different lanes.
+    // Handler waits can update readerLane after caller resolution has finished.
+    callerReaderLane?: string;
     readerLane: string;
     waitStage?: "lookup.caller" | "lookup.target" | "waiting";
     waitLookupMs?: number;

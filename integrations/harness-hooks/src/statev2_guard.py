@@ -21,9 +21,10 @@ LIVE = re.compile(
     rf"(?!{REPLICA.pattern})\.robob/userdata/(?:[\w.-]+/)*state\.sqlite|"
     r"(?:\.local/share/opencode|opencode-data)/opencode\.db|"
     # The legacy home database is protected; workspace .t3 copies stay isolated.
-    rf"(?:{re.escape(str(Path.home()))}|~|\$HOME|\$\{{HOME\}})/\.t3/userdata/statev2)"
+    rf"(?:{re.escape(str(Path.home()))}|~|\$HOME|\$\{{HOME\}})/\.t3/userdata/(?:statev2|(?:[\w.-]+/)*state\.sqlite))"
 )
 DATABASE_NAME = re.compile(r"statev2(?:[.-][\w-]+)?\.sqlite|state\.sqlite|opencode\.db")
+PROTECTED_SOURCE_TOKEN = re.compile(r"\.robob|\.t3|robob-data|userdata|opencode", re.IGNORECASE)
 # Preserve the existing hidden-home fixture; new subpaths use plain segments.
 SHELL_FIXTURE_DATABASE = (r"(?:\.robob/userdata/|(?:[A-Za-z0-9_][A-Za-z0-9._-]*/)+)"
                           r"statev2(?:\.sqlite)?(?:-(?:wal|shm|journal))?")
@@ -177,6 +178,83 @@ def source_touches_live(source: str) -> bool:
                    if (value := _path_expression(node, bindings, aliases, partial=True)) is not None)
     except (SyntaxError, ValueError):
         return False
+
+
+def _foreign_reader_shadowed(source):
+    names = r'(?:open(?:Sync)?|sqlite3?|Database(?:Sync)?|connect|readFile(?:Sync)?|createReadStream)'
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        pass
+    else:
+        # sqlite3 imports establish real readers; later writes to their bindings
+        # or attributes still invalidate that trust, including renamed imports.
+        standard_names = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                standard_names.update(alias.asname or alias.name.split('.')[0] for alias in node.names
+                                      if alias.name.split('.')[0] == 'sqlite3')
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and (node.module or '').split('.')[0] == 'sqlite3':
+                standard_names.update(alias.asname or alias.name for alias in node.names)
+
+        def sensitive(name):
+            return bool(name and (name in standard_names or re.fullmatch(names, name)))
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                if any(alias.name.split('.')[0] != 'sqlite3' and sensitive(alias.asname or alias.name.split('.')[0]) for alias in node.names):
+                    return True
+            elif isinstance(node, ast.ImportFrom):
+                if (node.level != 0 or (node.module or '').split('.')[0] != 'sqlite3') and any(sensitive(alias.asname or alias.name) for alias in node.names):
+                    return True
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)) and sensitive(node.id):
+                return True
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.arg, ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+                if sensitive(node.arg if isinstance(node, ast.arg) else node.name):
+                    return True
+            elif isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                if sensitive(getattr(node, 'attr', None)) or _name(node.value).split('.')[0] in standard_names:
+                    return True
+            elif isinstance(node, ast.Call) and _name(node.func) in {'setattr', 'delattr'} and node.args:
+                if _name(node.args[0]).split('.')[0] in standard_names:
+                    return True
+        return False
+    return bool(re.search(
+        rf'\b(?:function\s*\*?|class|def|alias)\s+{names}\b|'
+        rf'\b(?:const|let|var)\s+[^;\n=]*\b{names}\b|'
+        rf'\b{names}\s*=(?!=|>)|\b{names}\s*\([^()\n]*\)\s*\{{|'
+        rf'\b(?:as|import)\s+{names}\b|'
+        rf'\b(?:function|def)\b[^\n(]*\([^)]*\b{names}\b|'
+        rf'\([^()]*\b{names}\b[^()]*\)\s*=>|\b{names}\s*=>|'
+        rf'\bcatch\s*\(\s*{names}\b', source))
+
+
+def _foreign_state_source(source, directory):
+    # Discharge only fixed reader operands. Stored paths can have their basename
+    # transformed or rebased later, so they retain the original source evidence.
+    def literal(match):
+        value = match[0]
+        before, after = source[:match.start()], source[match.end():]
+        scalar = match.start() == 0 and match.end() == len(source)
+        reader = re.search(r'''\b(?:Database(?:Sync)?|readFile(?:Sync)?|open(?:Sync)?|createReadStream)\s*\(\s*(['"])$''', before)
+        direct_reader = reader and re.match(re.escape(reader[1]) + r'\s*[,)]', after)
+        shell = re.search(r'''(?:^|[\s;(])(?:[^\s;()]+/)?sqlite3?\s+(?:-[\w-]+\s+)*(['"]?)$''', before)
+        direct_shell = shell and re.match(re.escape(shell[1]) + r'(?=$|[\s;|&()<>])', after)
+        if not (scalar or direct_reader or direct_shell):
+            return value
+        path = _literal_path(value, directory)
+        if path is None or REPLICA.search(value) or LIVE.search(value) or LIVE.search(str(path)):
+            return value
+        for root in (Path.home() / '.robob/userdata', Path.home() / '.t3/userdata'):
+            if path.is_relative_to(root.resolve()):
+                return value
+        return ' ' * len(value)
+    masked = re.sub(r'''(?<![^\s'"(=])(?:~|\$HOME|\$\{HOME\})?/(?:[^\s'"`$*?\[\]();|&<>\\/]+/)*state\.sqlite(?:-(?:wal|shm|journal))?(?=$|[\s'"),;|&<>])''', literal, source)
+    # A separate protected root may transform or rebase the foreign operand.
+    if (re.search(r"\.robob\b|robob-data|\.t3\b|opencode-data|\.local/share/opencode|['\"]opencode['\"]", masked) or
+            re.search(r'\buserdata\b', masked) and re.search(r'\b(?:homedir|HOME|T3CODE_HOME)\b|\bPath\.home\b', masked)):
+        return source
+    return masked
 
 
 def _relative_source_live(source, directory):
@@ -1461,6 +1539,10 @@ def _replica_reader_source(source):
 
 
 def _source_hit(source, directory, python=False, shell=False):
+    # Inspect the original body, including literals/comments, never its path or argv.
+    discount_foreign = not PROTECTED_SOURCE_TOKEN.search(source)
+    if discount_foreign and 'state.sqlite' in source and _foreign_reader_shadowed(source):
+        return True
     # Keep the root evidence so the replica cannot hide a second database name.
     replica = REPLICA.search(source)
     if python:
@@ -1499,6 +1581,11 @@ def _source_hit(source, directory, python=False, shell=False):
     live_root = replica or re.search(r"(?<!\w)\.robob\b|robob-data|\.local/share|opencode-data|[\"']opencode[\"']", source)
     home_userdata = (not shell and re.search(r"\buserdata\b", source) and
                      re.search(r"\b(?:homedir|HOME|T3CODE_HOME)\b|\bPath\.home\b|['\"`]~(?:/|['\"`])", source))
+    # A foreign operand may still supply a root for another database operand.
+    if discount_foreign:
+        source = _foreign_state_source(source, directory)
+        if re.search(r'''\bsqlite3?\s+(?:-[\w-]+\s+)*['"]?[^'"\s;]*state\.sqlite''', source):
+            return True
     # Shell fixture proofs above discharge statev2/opencode paths, not other
     # database names that their setup may also list as data.
     database = re.search(r"statev2\.sqlite|opencode\.db", source) if shell else DATABASE_NAME.search(source)
@@ -1996,6 +2083,10 @@ def _direct_read(words, directory):
         if path is not None and LIVE.search(str(path)):
             return True
         if LIVE.search(value):
+            return True
+        if (re.search(r'state\.sqlite(?:-(?:wal|shm|journal))?$', value) and
+                os.path.basename(words[0]) in {'sqlite', 'sqlite3'} and
+                not REPLICA.search(value) and 'state.sqlite' in _foreign_state_source(value, directory)):
             return True
     return False
 
@@ -2779,6 +2870,9 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         return value
 
     def scan_child(source, directory, depth):
+        # The shell walker cannot prove how a local reader rewrites its argument.
+        if 'state.sqlite' in source and _foreign_reader_shadowed(source):
+            check_source(source, directory, rule='live-database-read')
         previous = {name: set(values) for name, values in script_values.items()}
         previous_fresh = set(fresh_variables)
         script_values.clear()

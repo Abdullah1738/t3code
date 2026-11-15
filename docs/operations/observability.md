@@ -75,12 +75,15 @@ cover full records only.
 The `TraceRecord`, `EffectTraceRecord`, and `OtlpTraceRecord` schemas live in
 `packages/shared/src/observability.ts`.
 
-SQL statement spans (named `sqlite`) and `sql.transaction` spans carry `db.connection` and
-`db.lock_wait_ms`. `db.connection` is `writer` for the main connection, which runs on the event loop,
+SQL statement spans (named `sqlite`) and `sql.transaction` spans carry `db.connection`.
+Spans that acquire a connection also carry `db.lock_wait_ms`.
+`db.connection` is `writer` for the main connection, which runs on the event loop,
 or `reader` for the read-only connection in a worker thread. `db.lock_wait_ms` is the part of the
 span spent waiting for that connection, behind other SQL. That wait does not block the event loop,
-so subtract it before you blame a slow span on the query. Statements inside a transaction use its
-connection and do not carry these attributes.
+so subtract it before you blame a slow span on the query. Statements inside a transaction carry
+`db.connection.reused=true`, retain their connection and reader lane, and copy the reader slot when
+available on their immediate transaction parent. They have no acquisition wait; the transaction
+span owns that wait. Exclude reused-connection spans from acquisition wait samples.
 
 DPoP proof failures include the safe `environment.dpop.failure_code` span
 attribute. A `time_window` failure means that a signed proof was too old or too

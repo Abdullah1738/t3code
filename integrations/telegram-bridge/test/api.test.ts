@@ -60,6 +60,22 @@ test("health projects safe fields and never exposes credentials, tokens, or chat
   expect(logs.text()).not.toContain("PRIVATE_");
 });
 
+test("health exposes only safe board counters and refresh reasons", async () => {
+  const h = setup();
+  const board = { boardFetches: 3, boardCacheHits: 40, boardFetchErrors: 1, boardBackoffMs: 10_000, lastFetchDurationMs: 25, lastFetchReason: "dirty" };
+  h.state.health = { board: { ...board, title: "PRIVATE_TITLE", token: "PRIVATE_TOKEN", error: "PRIVATE_ERROR" } };
+  expect((await (await h.get("/health")).json()).board).toEqual(board);
+  h.state.health = { board: { boardFetches: -1, boardCacheHits: Infinity, boardFetchErrors: "PRIVATE_VALUE", boardBackoffMs: -1,
+    lastFetchDurationMs: NaN, lastFetchReason: "PRIVATE_REASON" } };
+  expect((await (await h.get("/health")).json()).board).toEqual({});
+  h.state.health = { board: { boardFetches: 0, boardCacheHits: 0, boardFetchErrors: 0, boardBackoffMs: 0, lastFetchDurationMs: null, lastFetchReason: null } };
+  expect((await (await h.get("/health")).json()).board).toEqual(h.state.health.board);
+  for (const value of [null, [], "PRIVATE_VALUE"]) {
+    h.state.health = { board: value };
+    expect(await (await h.get("/health")).json()).not.toHaveProperty("board");
+  }
+});
+
 test("notify queues one stable operation and never touches reminders or session notices", async () => {
   const h = setup();
   const first = await h.post("/notify", notify);
