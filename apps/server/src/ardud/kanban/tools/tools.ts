@@ -544,7 +544,7 @@ const CardAskChange = tool(
       ),
     ),
   },
-  { card: Record, warning: Schema.optional(Schema.String) },
+  { card: Record, warning: Schema.optional(Schema.String), note: Schema.optional(Schema.String) },
   { readonly: false },
 );
 
