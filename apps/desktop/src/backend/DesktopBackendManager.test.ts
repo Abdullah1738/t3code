@@ -29,6 +29,8 @@ import * as DesktopBackendManager from "./DesktopBackendManager.ts";
 import * as DesktopApp from "../app/DesktopApp.ts";
 import * as DesktopBackendPool from "./DesktopBackendPool.ts";
 import * as DesktopObservability from "../app/DesktopObservability.ts";
+import * as DesktopQuit from "../app/DesktopQuit.ts";
+import * as DesktopState from "../app/DesktopState.ts";
 import * as DesktopTelemetryPublisher from "../telemetry/DesktopTelemetryPublisher.ts";
 import * as DesktopBrowserHost from "../preview/DesktopBrowserHost.ts";
 import * as DesktopWslEnvironment from "../wsl/DesktopWslEnvironment.ts";
@@ -456,6 +458,126 @@ describe("DesktopBackendManager", () => {
 
       assert.deepEqual(exit, { code: Option.none(), reason: "killed by SIGKILL" });
     }),
+  );
+
+  it.effect.each([
+    undefined,
+    { trigger: "before-quit" },
+    { trigger: "quitAndInstall" },
+    { trigger: "signal", signal: "SIGTERM" },
+    { trigger: "ipc-relaunch", reason: "localEnvironmentEnabled=false" },
+  ] satisfies Array<DesktopQuit.QuitTrigger | undefined>)(
+    "includes preceding app quit context on a signal death: %j",
+    (trigger) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          if (trigger !== undefined) yield* DesktopQuit.prepare(trigger);
+          yield* TestClock.adjust("2 seconds");
+          const exitCause = PlatformError.systemError({
+            _tag: "Unknown",
+            module: "ChildProcess",
+            method: "exitCode",
+            cause: new Error("Process interrupted due to receipt of signal: 'SIGKILL'"),
+          });
+          const failure = yield* Deferred.make<{
+            readonly details: string;
+            readonly annotations?: DesktopObservability.DesktopLogAnnotations;
+          }>();
+          const instance = yield* makeTestInstance({
+            spawnerLayer: Layer.succeed(
+              ChildProcessSpawner.ChildProcessSpawner,
+              ChildProcessSpawner.make(() =>
+                Effect.succeed(makeProcess({ exitCode: Effect.fail(exitCause) })),
+              ),
+            ),
+            backendOutputLog: {
+              persistFailure: (input) => Deferred.succeed(failure, input).pipe(Effect.asVoid),
+            },
+          });
+          yield* instance.start;
+          const logged = yield* Deferred.await(failure);
+          assert.equal(logged.details, "pid=123 killed by SIGKILL");
+          assert.equal(logged.annotations?.appQuitContextAvailable, true);
+          assert.equal(logged.annotations?.appQuitReceived, trigger !== undefined);
+          assert.equal(logged.annotations?.appQuitTrigger, trigger?.trigger);
+          assert.equal(logged.annotations?.appQuitAgeMs, trigger === undefined ? undefined : 2000);
+          if (trigger?.trigger === "signal")
+            assert.equal(logged.annotations?.appQuitSignal, trigger.signal);
+          if (trigger?.trigger === "ipc-relaunch")
+            assert.equal(logged.annotations?.appQuitReason, trigger.reason);
+        }),
+      ).pipe(Effect.provide(DesktopState.layer), Effect.provide(TestClock.layer())),
+  );
+
+  it.effect.each(["before-exit", "during-drain"] as const)(
+    "freezes quit receipt and age at exit observation: %s",
+    (timing) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const childExit = yield* Deferred.make<void>();
+          const outputStarted = yield* Deferred.make<void>();
+          const drain = yield* Deferred.make<void>();
+          const observed = yield* Deferred.make<void>();
+          const failure = yield* Deferred.make<{
+            readonly details: string;
+            readonly annotations?: DesktopObservability.DesktopLogAnnotations;
+          }>();
+          const logger = Logger.make(({ message }) => {
+            if (Array.isArray(message) && message[0] === "backend child signal exit observed")
+              Deferred.doneUnsafe(observed, Effect.void);
+          });
+          const exitCause = PlatformError.systemError({
+            _tag: "Unknown",
+            module: "ChildProcess",
+            method: "exitCode",
+            cause: new Error("Process interrupted due to receipt of signal: 'SIGKILL'"),
+          });
+          const instance = yield* makeTestInstance({
+            spawnerLayer: Layer.succeed(
+              ChildProcessSpawner.ChildProcessSpawner,
+              ChildProcessSpawner.make(() =>
+                Effect.succeed(
+                  makeProcess({
+                    stdout: Stream.fromEffect(
+                      Deferred.succeed(outputStarted, undefined).pipe(
+                        Effect.andThen(Deferred.await(drain)),
+                        Effect.as(new Uint8Array()),
+                      ),
+                    ),
+                    exitCode: Deferred.await(childExit).pipe(
+                      Effect.andThen(Effect.fail(exitCause)),
+                    ),
+                  }),
+                ),
+              ),
+            ),
+            backendOutputLog: {
+              persistFailure: (input) => Deferred.succeed(failure, input).pipe(Effect.asVoid),
+            },
+          });
+          yield* instance.start.pipe(Effect.provide(Logger.layer([logger])));
+          yield* Deferred.await(outputStarted);
+          if (timing === "before-exit") {
+            yield* DesktopQuit.prepare({ trigger: "before-quit" });
+            yield* TestClock.adjust("2 seconds");
+          }
+          yield* Deferred.succeed(childExit, undefined);
+          yield* Deferred.await(observed);
+          if (timing === "during-drain") yield* DesktopQuit.prepare({ trigger: "before-quit" });
+          yield* TestClock.adjust("2 seconds");
+          yield* Deferred.succeed(drain, undefined);
+          const logged = yield* Deferred.await(failure);
+          assert.equal(logged.annotations?.appQuitReceived, timing === "before-exit");
+          assert.equal(
+            logged.annotations?.appQuitAgeMs,
+            timing === "before-exit" ? 2000 : undefined,
+          );
+          assert.equal(
+            logged.annotations?.backendExitObservedAt,
+            timing === "before-exit" ? "1970-01-01T00:00:02.000Z" : "1970-01-01T00:00:00.000Z",
+          );
+        }),
+      ).pipe(Effect.provide(DesktopState.layer), Effect.provide(TestClock.layer())),
   );
 
   it.effect("reports output stream failures with process and stream context", () =>
