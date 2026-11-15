@@ -50,6 +50,7 @@ _ENUMS = {
 _ENUMS['from'] = _ENUMS['to'] = _ENUMS['state']
 _BOOLS = {'prepareOnly', 'changed', 'fallback', 'budgetHit', 'unmatched', 'deadlineMoved', 'answered', 'polled'}
 _NUMBERS = {'exitCode', 'amountMinor', 'count', 'ageDays', 'openCases', 'fired', 'sourceLimits',
+            'msgs_timeouts', 'msgs_p50_ms',
             'merchants_ms', 'order_charges_ms', 'payments_ms', 'questions_ms', 'refunds_ms',
             'order_screen_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'writes_n', 'locks_ms', 'follow_ms', 'untimed_ms',
             'owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms',
@@ -63,6 +64,7 @@ _MONEY_PROPS = {
     'case.close': {'kind', 'ageDays'},
     'question.ask': {'outcome'},
     'check.run': {'budgetHit', 'openCases', 'fired', 'slowestPhase', 'sourceLimits', 'limitKinds', 'orderCoverage', 'chargeCensus',
+                  'msgs_timeouts', 'msgs_p50_ms', 'msgs_by_kind', 'receipt_result',
                   'merchants_ms', 'order_charges_ms', 'payments_ms', 'questions_ms', 'refunds_ms',
                   'order_screen_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'writes_n', 'locks_ms', 'follow_ms', 'untimed_ms',
                   'owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms', 'starved_by',
@@ -441,6 +443,14 @@ def _fields(props):
         elif key == 'limitKinds' and isinstance(value, list):
             result[key] = sorted({v for v in value if isinstance(v, str) and v in {
                 'ORDER_LIST_HOST_BINDING_UNVERIFIED', 'food_page_1', 'nownow_page_1', 'marketplace_page_1'}})
+        elif key == 'receipt_result' and isinstance(value, dict):
+            result[key] = {k: v for k, v in value.items() if k in {'found', 'none', 'out_of_time', 'error'}
+                           and type(v) is int and 0 <= v <= 10**9}
+        elif key == 'msgs_by_kind' and isinstance(value, dict):
+            result[key] = {kind: {k: v for k, v in bucket.items() if k in {'count', 'ms'}
+                                  and type(v) is int and 0 <= v <= 10**9}
+                           for kind, bucket in value.items() if kind in {'receipt', 'order', 'other'}
+                           and isinstance(bucket, dict)}
         elif key == 'chargeCensus' and isinstance(value, dict):
             result[key] = {app: {k: v for k, v in counts.items()
                 if k in {'open', 'matched', 'proven_clean', 'limited', 'error', 'not_checked'}

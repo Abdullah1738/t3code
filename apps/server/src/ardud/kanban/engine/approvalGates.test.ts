@@ -71,6 +71,319 @@ const goChoiceCard = (
   ],
 });
 
+const imageMoneySubtask: KanbanSubtask = {
+  ...goChoiceSubtask,
+  id: "s3",
+  text: "card_ask Abdullah (blocking, Approve / Change / Drop): exact SKILL.md before/after, plus one paid read-back image up to USD 4 (forced 9router failure). Record his yes in owner-go.",
+  gate: "money",
+  gateSource: "set",
+};
+
+const imageMoneyAsk: KanbanOwnerAsk = {
+  id: "q2",
+  kind: "change",
+  title: "Approve s3: new image-generation skill text + one paid test image (up to $4)",
+  text: "Can I install the image script's automatic OpenRouter fallback with this new skill text, and pay for one test image (up to USD 4) to check that it switches to OpenRouter by itself when 9router is down?",
+  blocking: true,
+  by: evaluator,
+  at: "2026-11-15T09:44:37.130Z",
+  seq: 6,
+  closedAt: "2026-11-15T10:47:49.448Z",
+  options: [
+    {
+      id: "approve",
+      label: "Approve both",
+      detail: "New skill text plus one paid test image, up to $4.",
+      recommended: true,
+      consequence: "I merge, install, run the free and paid checks and tell USDT #159.",
+    },
+    {
+      id: "approve_free",
+      label: "Approve text, no paid image",
+      detail: "Install it, but only run the free check.",
+      consequence:
+        "The automatic switch to OpenRouter isn't tested live; the review and tests cover it.",
+    },
+    {
+      id: "change",
+      label: "Change",
+      detail: "Tell me what to change in the text or behaviour.",
+      consequence: "The card goes back for another round.",
+    },
+    {
+      id: "drop",
+      label: "Drop",
+      detail: "Don't ship the automatic paid fallback.",
+      consequence: "The script stays free-only, as it is today.",
+    },
+  ],
+  answer: {
+    verdict: "picked",
+    optionIds: ["approve"],
+    by: owner,
+    at: "2026-11-15T10:47:49.355Z",
+  },
+};
+
+const imageMoneyCard = (ask = imageMoneyAsk) => ({
+  number: 8,
+  createdAt: "2026-11-13T13:00:00.000Z",
+  subtasks: [imageMoneySubtask, { ...imageMoneySubtask, id: "s4" }],
+  asks: [ask],
+});
+
+it.each([
+  { pick: "approve", clears: true },
+  { pick: "approve_free", clears: false },
+])("#1580 replays 9router #8 q2: $pick clears money=$clears", ({ pick, clears }) => {
+  const ask = { ...imageMoneyAsk, answer: { ...imageMoneyAsk.answer!, optionIds: [pick] } };
+  const card = imageMoneyCard(ask);
+  assert.strictEqual(approvalProblem(card, imageMoneySubtask) === null, clears);
+  assert.isNotNull(approvalProblem(card, card.subtasks[1]!));
+  assert.isUndefined(askGateWarning(card, ask));
+});
+
+const wholeAskReferences = [
+  "both",
+  "all",
+  "all of it",
+  "all of them",
+  "it",
+  "them",
+  "everything",
+  "all   three",
+  "all\tof it",
+  "all of\tthem",
+  ...["all", "both"].flatMap((word) =>
+    [
+      "one",
+      "two",
+      "three",
+      "four",
+      "five",
+      "six",
+      "seven",
+      "eight",
+      "nine",
+      "ten",
+      "1",
+      "2",
+      "3",
+      "9",
+    ].map((n) => `${word} ${n}`),
+  ),
+];
+
+it.each(wholeAskReferences)(
+  "#1580 whole-ask reference %s stays within the named ids",
+  (reference) => {
+    for (const prefix of ["Approve", "Yes, approve", "OK, please approve", "Please approve"]) {
+      const label = `${prefix} ${reference}!`;
+      const ask = {
+        ...imageMoneyAsk,
+        options: [
+          { id: "approve", label },
+          { id: "hold", label: "Hold" },
+        ],
+      };
+      const card = imageMoneyCard(ask);
+      assert.isNull(approvalProblem(card, imageMoneySubtask), label);
+      assert.isNotNull(approvalProblem(card, card.subtasks[1]!), label);
+      assert.isFalse(
+        approvesGate(label, "money", imageMoneySubtask.text, ["Hold"], "standing"),
+        label,
+      );
+    }
+  },
+);
+
+it.each([
+  "Yes",
+  "Approved",
+  "Sign off",
+  "Sign-off",
+  "Signoff",
+  "Signed off",
+  "Go",
+  "Go ahead",
+  "Go for it",
+  "OK",
+  "Okay",
+  "Do it",
+  "Proceed",
+])("#1580 reuses the bare verb %s for a whole-ask reference", (verb) =>
+  assert.isTrue(approvesGate(`${verb} both?`, "money", imageMoneySubtask.text, [], "subtask")),
+);
+
+it.each([
+  "Approve both except the paid image",
+  "Approve all but s3",
+  "Approve both later",
+  "Approve both once tests pass",
+  "Approve both when tests pass",
+  "Approve both tomorrow",
+  "Approve both and wait",
+  "Approve both, hold s3",
+  "Do not approve both",
+  "Don't approve both",
+  "Approve text, no paid image",
+  "Approve only both",
+  "Approve all of these",
+  "Approve both images",
+  "Approve all 0",
+  "Approve all 11",
+  "Approve all three images",
+  "Approve bothish",
+  "Approve themself",
+  "Approve both and pay",
+  "Approve all, charge USD 4",
+  "Approve it and purchase",
+  "Approve them: refund",
+  "Approve everything and transfer now",
+  "Yes, approve both and pay",
+  "Please sign off all and charge USD 4",
+])("#1580 qualified or partial reference stays refused: %s", (label) => {
+  const ask = {
+    ...imageMoneyAsk,
+    options: [
+      { id: "approve", label },
+      { id: "hold", label: "Hold" },
+    ],
+  };
+  assert.isNotNull(approvalProblem(imageMoneyCard(ask), imageMoneySubtask));
+});
+
+it.each(["approve_free", "change", "drop"])(
+  "#1580 a reference pick mixed with %s stays refused",
+  (pick) => {
+    const ask = {
+      ...imageMoneyAsk,
+      answer: { ...imageMoneyAsk.answer!, optionIds: ["approve", pick] },
+    };
+    assert.isNotNull(approvalProblem(imageMoneyCard(ask), imageMoneySubtask));
+  },
+);
+
+it.each(["Approve", "Approve all", "Approve s3"])(
+  "#1580 a whole-ask reference cannot add a new multi-pick approval with %s",
+  (label) => {
+    const ask = {
+      ...imageMoneyAsk,
+      options: [...imageMoneyAsk.options!, { id: "extra", label }],
+      answer: { ...imageMoneyAsk.answer!, optionIds: ["approve", "extra"] },
+    };
+    assert.isNotNull(approvalProblem(imageMoneyCard(ask), imageMoneySubtask));
+  },
+);
+
+it("#1580 reference words cannot inherit another option's explicit scope", () => {
+  const ask = {
+    ...imageMoneyAsk,
+    options: [...imageMoneyAsk.options!, { id: "scoped", label: "Approve s4" }],
+  };
+  const card = imageMoneyCard(ask);
+  for (const subtask of card.subtasks) assert.isNotNull(approvalProblem(card, subtask));
+});
+
+it("#1580 option detail cannot turn a nonapproving label into approval", () => {
+  const ask = {
+    ...imageMoneyAsk,
+    options: [{ id: "approve", label: "Sounds good", detail: "Approve both" }],
+  };
+  assert.isNotNull(approvalProblem(imageMoneyCard(ask), imageMoneySubtask));
+  assert.include(askGateWarning(imageMoneyCard(ask), ask)!, "s3 (money)");
+});
+
+it.each(["decision", "change", "action"] as const)(
+  "#1580 %s warning suggestions round-trip through gate completion",
+  (kind) => {
+    const ask = {
+      ...imageMoneyAsk,
+      kind,
+      options: [
+        { id: "sounds", label: "Sounds good" },
+        { id: "drop", label: "Drop" },
+      ],
+    };
+    const card = imageMoneyCard(ask);
+    const warning = askGateWarning(card, ask)!;
+    assert.include(warning, "No option here clears s3 (money)");
+    const suggestions = [...warning.matchAll(/"([^"]+)"/g)].map((match) => match[1]!);
+    assert.deepStrictEqual(suggestions, ["Approve", "Approve s3"]);
+    for (const option of [
+      ...suggestions.map((label) => ({ id: "suggested", label })),
+      { id: "suggested", label: "Go", approves: ["s3"] },
+    ]) {
+      const revised = {
+        ...ask,
+        options: [...ask.options, option],
+        answer: { ...ask.answer!, optionIds: [option.id] },
+      };
+      assert.isNull(approvalProblem(imageMoneyCard(revised), imageMoneySubtask), option.label);
+      assert.isNotNull(approvalProblem(imageMoneyCard(revised), card.subtasks[1]!), option.label);
+      assert.isUndefined(askGateWarning(card, revised));
+    }
+  },
+);
+
+it("#1580 warns separately for each concerned gate with no approving option", () => {
+  const ask = {
+    ...imageMoneyAsk,
+    title: "Approve s3 and s4",
+    options: [{ id: "hold", label: "Hold" }],
+  };
+  const warning = askGateWarning(imageMoneyCard(ask), ask)!;
+  assert.include(warning, "s3 (money)");
+  assert.include(warning, "s4 (money)");
+});
+
+it.each(
+  ["Approve", "Approved", "Go", "Go ahead", "Ship", "Yes", "OK", "Tick"].flatMap((verb) =>
+    [
+      "later",
+      "if tests pass",
+      "unless tests fail",
+      "after tests",
+      "pending tests",
+      "except the paid image",
+      "and hold",
+      ": A different step",
+      "or s5",
+      "+",
+      ",",
+    ].map((suffix) => `${verb} s4 ${suffix}`),
+  ),
+)("#1580 a viable sibling cannot hide an unusable scoped option: %s", (label) => {
+  const ask = {
+    ...imageMoneyAsk,
+    title: "Approve s3 and s4",
+    options: [
+      { id: "approve", label: "Approve s3" },
+      { id: "other", label },
+    ],
+  };
+  const card = imageMoneyCard(ask);
+  const target = card.subtasks[1]!;
+  const warning = askGateWarning(card, ask)!;
+  assert.include(warning, "No option here clears s4 (money)");
+  assert.notInclude(warning, "clears s3");
+  const suggestions = [...warning.matchAll(/"([^"]+)"/g)].map((match) => match[1]!);
+  assert.deepStrictEqual(suggestions, ["Approve s4"]);
+  for (const option of [
+    ...suggestions.map((label) => ({ id: "suggested", label })),
+    { id: "suggested", label: "Go", approves: ["s4"] },
+  ]) {
+    const revised = {
+      ...ask,
+      options: [...ask.options, option],
+      answer: { ...ask.answer!, optionIds: [option.id] },
+    };
+    assert.isNull(approvalProblem(imageMoneyCard(revised), target));
+    assert.isNotNull(approvalProblem(imageMoneyCard(revised), imageMoneySubtask));
+    assert.isUndefined(askGateWarning(card, revised));
+  }
+});
+
 it("#1431 q3: an approval naming s7 and s8 reads as approving deploy", () => {
   assert.isTrue(
     approvesGate("Approve s7 and s8", "deploy", "Add the fix to the release", ["Hold"], "subtask"),

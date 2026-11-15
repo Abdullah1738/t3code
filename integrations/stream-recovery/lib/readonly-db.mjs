@@ -5,7 +5,8 @@ import { join, resolve } from 'node:path';
 export const MAX_REPLICA_AGE_MS = 45_000;
 
 export function isReplicaUnavailable(error) {
-  return error?.code === 'REPLICA_UNAVAILABLE' || error?.code === 'REPLICA_NOT_READY';
+  return error?.code === 'REPLICA_UNAVAILABLE' || error?.code === 'REPLICA_NOT_READY'
+    || error?.code === 'REPLICA_BEHIND_THREAD';
 }
 
 function replicaError(message, code, { generation, updatedMs } = {}, now = Date.now()) {
@@ -126,8 +127,12 @@ export function assertReplicaFresh(db, now = Date.now()) {
 // proves the replica cannot yet know whether that mutation was a Stop.
 export function assertThreadInReplica(db, thread) {
   assertReplicaFresh(db);
+  const snapshot = snapshots.get(db);
   const updatedMs = Date.parse(thread?.updatedAt);
-  if (!Number.isFinite(updatedMs) || updatedMs > snapshots.get(db).updatedMs) {
-    throw Object.assign(new Error('thread is newer than Robob replica; recovery deferred'), { code: 'REPLICA_UNAVAILABLE' });
+  if (!Number.isFinite(updatedMs) || updatedMs > snapshot.updatedMs) {
+    throw Object.assign(replicaError('thread is newer than Robob replica; recovery deferred',
+      'REPLICA_BEHIND_THREAD', snapshot), {
+      threadAheadMs: Number.isFinite(updatedMs) ? updatedMs - snapshot.updatedMs : 'unknown',
+    });
   }
 }

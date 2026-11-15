@@ -5,6 +5,7 @@ import { join } from 'node:path';
 
 const CAP = 50 * 1024 * 1024;
 const seen = new Set();
+const failurePhases = new WeakMap();
 const props = new Set(['model','size','count','status','enabled','locked','limited','reloginNeeded','state','action','tag','dryRun','complete','cost','hour','exitCode','attempt','source','failed','total','fourxx','fivexx','phase','durationMaxMs','omitted']);
 const ids = new Set(['account','connection','thread','incident','request','session']);
 const token = v => typeof v === 'string' && /^[A-Za-z0-9_.:/-]{1,100}$/.test(v) && !/(sk-|bearer|password|secret|token|api.?key|otp|cookie|prompt|@)/i.test(v) ? v : undefined;
@@ -13,18 +14,28 @@ const errorTag = v => typeof v === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.te
 // provider output, credentials or a filesystem path, even after regex redaction.
 const messages = new Set(['Robob replica is stale; recovery deferred', 'Robob replica is not ready',
   'thread is newer than Robob replica; recovery deferred', 'unverified Robob replica',
-  'The operation was aborted due to timeout', 'The operation was aborted']);
+  'The operation was aborted due to timeout', 'The operation was aborted', 'fetch failed']);
 const errorMessage = (value, tag) => messages.has(value) ? value.slice(0, 300) : tag;
-// Replica metadata is untrusted. Only numbers or an explicit unknown survive.
-const replicaProps = value => Object.fromEntries(['replicaGeneration', 'replicaAgeMs']
-  .filter(key => typeof value?.[key] === 'number' && Number.isFinite(value[key]) || value?.[key] === 'unknown')
-  .map(key => [key, value[key]]));
+// Replica metadata is untrusted. Invalid values become an explicit unknown.
+const replicaProps = value => Object.fromEntries(['replicaGeneration', 'replicaAgeMs', 'threadAheadMs', 'deferredThreads', 'maxThreadAheadMs']
+  .filter(key => value?.[key] !== undefined)
+  .map(key => [key, Number.isFinite(value[key]) ? value[key] : 'unknown']));
 function failure(value, result = false) {
   try {
-    const tag = (result ? errorTag(value?.tag) : undefined) ?? errorTag(value?.code)
+    const fetchFailed = !result && value?.name === 'TypeError' && value?.message === 'fetch failed';
+    const causedAbort = !result && ['AbortError', 'TimeoutError'].includes(value?.name) && value?.cause;
+    const causeTag = fetchFailed || causedAbort
+      ? errorTag(value?.cause?.code) ?? errorTag(value?.cause?.name) ?? 'FETCH_FAILED' : undefined;
+    const tag = causeTag ?? (result ? errorTag(value?.tag) : undefined) ?? errorTag(value?.code)
       ?? (result ? undefined : errorTag(value?.name)) ?? 'operation_failed';
     return { tag, message: errorMessage(value?.message, tag) };
   } catch { return { tag: 'operation_failed', message: 'operation_failed' }; }
+}
+// Keep metadata off caller-owned errors, including frozen errors. Only the
+// operation identifier is retained; arguments and exception text stay out.
+export function tagFailurePhase(error, phase) {
+  if (error !== null && ['object', 'function'].includes(typeof error) && token(phase)) failurePhases.set(error, phase);
+  return error;
 }
 export function clean(event, now = new Date()) {
   const name = token(event.name), component = token(event.component);
@@ -80,7 +91,7 @@ export async function observed(component, name, work, fields = {}) {
   try {
     result = await work();
   } catch (error) {
-    try { emit(component, name, { ...fields, props:{...fields.props, ...replicaProps(error)}, kind:'error', ok:false, durationMs:performance.now()-start, error:failure(error) }); } catch {}
+    try { emit(component, name, { ...fields, props:{...fields.props, ...replicaProps(error), ...(failurePhases.has(error) ? {phase:failurePhases.get(error)} : {})}, kind:'error', ok:false, durationMs:performance.now()-start, error:failure(error) }); } catch {}
     throw error;
   }
   try {

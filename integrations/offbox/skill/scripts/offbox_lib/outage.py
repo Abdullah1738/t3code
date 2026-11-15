@@ -75,8 +75,11 @@ def _exclude_queue_time(elapsed):
         _QUEUE_IDLE['cycle_at'] += elapsed
     from . import home
     budget = home.WAIT_BUDGET.get()
-    if budget is not None and budget['end'] is not None:
-        budget['end'] += elapsed
+    if budget is not None:
+        # The transient episode and startup deadline exclude the same healthy queue time.
+        for key in ('end', 'transient_since'):
+            if budget.get(key) is not None:
+                budget[key] += elapsed
 
 
 def allocation_left() -> float | None:

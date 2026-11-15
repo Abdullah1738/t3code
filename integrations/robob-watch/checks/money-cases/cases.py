@@ -3494,6 +3494,7 @@ def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
                                 'chargeCensus': diagnostic.get('charge_census', {}),
                                 **{key: stats.get(key, 0) for key in (*TIMING_KEYS, *charges.OWNER_TIMING_KEYS)},
                                 'owner_result': stats.get('owner_result', 'ok'),
+                                **charges.receipt_timing(stats),
                                 'starved_by': stats.get('starved_by', diagnostic.get('starved_by', 'none'))})
         except Exception:
             pass
@@ -3703,6 +3704,7 @@ def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *,
                 **{k: stats[k] for k in ('lookups', 'owner_queries', 'msgs_calls')},
                 **{k: stats.get(k, 0) for k in (*TIMING_KEYS, *charges.OWNER_TIMING_KEYS)},
                 'owner_result': stats.get('owner_result', 'ok'),
+                **charges.receipt_timing(stats),
                 'starved_by': stats.get('starved_by', 'none'), 'slowest': max(phases, key=phases.get)}
 
     saved = False

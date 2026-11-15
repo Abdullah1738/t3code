@@ -9,6 +9,7 @@ import {
   RESTART_RESUMED_REASON,
 } from '../lib/detect.mjs';
 import { restartScan, RESTART_SETTLE_MS, RESTART_RESUME_WINDOW_MS } from '../lib/restartwatch.mjs';
+import { fixture as logFixture } from '../../router-logging/test/support.mjs';
 
 // Fixtures modelled on the 15 Oct 18:17Z restart (statev2 rows, OpenCode messages).
 const T0 = Date.parse('2026-10-15T18:17:44.747Z');
@@ -494,7 +495,7 @@ test('restartScan sends one note per affected thread and one summary, then never
   assert.equal(calls.telegram.length, 1);
 });
 
-for (const code of ['REPLICA_UNAVAILABLE', 'REPLICA_NOT_READY']) test(`${code} never causes recovery or consumes retries`, async () => {
+for (const code of ['REPLICA_UNAVAILABLE', 'REPLICA_NOT_READY', 'REPLICA_BEHIND_THREAD']) test(`${code} never causes recovery or consumes retries`, async () => {
   const fake = fakeIo({ subs: restartBurst(), threads });
   const state = { handled: {}, servers: [] };
   const unavailable = () => { throw Object.assign(new Error('replica deferred'), { code }); };
@@ -513,12 +514,86 @@ for (const code of ['REPLICA_UNAVAILABLE', 'REPLICA_NOT_READY']) test(`${code} n
 test('a newer control thread defers recovery without sending or consuming failure retries', async () => {
   const fake = fakeIo({ subs: restartBurst(), threads });
   fake.io.assertThreadInReplica = () => {
-    throw Object.assign(new Error('thread newer than replica'), { code: 'REPLICA_UNAVAILABLE' });
+    throw Object.assign(new Error('thread newer than replica'), { code: 'REPLICA_BEHIND_THREAD' });
   };
   const state = { handled: {}, servers: [] };
-  await assert.rejects(restartScan(scanArgs(state), fake.io), /thread newer than replica/);
+  await restartScan(scanArgs(state), fake.io);
   assert.equal(fake.calls.send.length + fake.calls.commands.length, 0);
   assert.equal(Object.values(state.handled).some((entry) => entry.done || entry.failures), false);
+});
+
+test('an ahead delegated child defers its initial parent note while another parent recovers', async t => {
+  const { rows } = logFixture(t);
+  const { db, task } = delegatedFixture();
+  t.after(() => db.close());
+  const child = task('ahead-initial');
+  const childId = child.child_thread_id;
+  const { io, calls } = fakeIo({runs:[run('healthy')],delegated:dbIo.cancelledDelegatedTasksSince(db, iso(T0)),threads:{
+    batch:{threadId:'batch'}, healthy:{threadId:'healthy'}, [childId]:{threadId:childId},
+  }});
+  io.assertThreadInReplica = (_db, thread) => {
+    if (thread.threadId === childId) throw Object.assign(new Error('thread is newer than Robob replica; recovery deferred'), {
+      code:'REPLICA_BEHIND_THREAD',replicaGeneration:42,replicaAgeMs:1_000,threadAheadMs:1_500,
+    });
+  };
+  const state = {handled:{},servers:[]};
+  await restartScan(scanArgs(state), io);
+  assert.deepEqual(calls.send.map(call => call.threadId), ['healthy']);
+  const entry = Object.values(state.handled)[0];
+  assert.deepEqual(entry.threads.batch, {});
+  assert.equal(entry.done, false);
+  assert.equal(calls.telegram.length, 0);
+  const row = rows().find(row => row.name === 'restart.scan');
+  assert.equal(row.ok, true);
+  assert.deepEqual(row.props, {deferredThreads:1,maxThreadAheadMs:1_500});
+});
+
+for (const target of ['parent', 'child']) test(`a late ${target} deferral leaves its tasks pending and recovers another parent`, async t => {
+  const { rows } = logFixture(t);
+  const { db, task } = delegatedFixture();
+  t.after(() => db.close());
+  const delegated = [];
+  const childId = 'thread:delegated-task:ahead-late';
+  const { io, calls } = fakeIo({runs:[run('batch'),run('healthy')],delegated,threads:{
+    batch:{threadId:'batch',title:'Batch'}, healthy:{threadId:'healthy',title:'Healthy'},
+    [childId]:{threadId:childId},
+  }});
+  io.serverRuntime = () => ({pid:7,procStartMs:T0-30_000,readyMs:T0+10_000});
+  let blocked = 'healthy';
+  io.assertThreadInReplica = (_db, thread) => {
+    if (thread.threadId === blocked) throw Object.assign(new Error('thread is newer than Robob replica; recovery deferred'), {
+      code:'REPLICA_BEHIND_THREAD',replicaGeneration:42,replicaAgeMs:1_000,threadAheadMs:1_500,
+    });
+  };
+  const state = {handled:{},servers:[]};
+  await restartScan(scanArgs(state, {now:T0+30_000}), io);
+  assert.deepEqual(calls.send.map(call => call.threadId), ['batch']);
+  task('ahead-late');
+  const [late] = dbIo.cancelledDelegatedTasksSince(db, iso(T0));
+  delegated.push({...late,completed_at:iso(T0+40_000)});
+  const entry = Object.values(state.handled)[0];
+  entry.threads.batch.lateFailures = 2;
+  blocked = target === 'parent' ? 'batch' : childId;
+  for (const at of [65_000,70_000,95_000]) {
+    await restartScan(scanArgs(state, {now:T0+at}), io);
+    const progress = Object.values(state.handled)[0].threads.batch;
+    assert.equal(progress.done, false);
+    assert.equal(progress.lateOnly, true);
+    assert.equal(progress.lateFailures, 2);
+    assert.ok(!progress.lateExhausted);
+    assert.deepEqual(progress.deliveredDelegated, []);
+    assert.equal(calls.telegram.length, 0);
+    assert.deepEqual(calls.send.map(call => call.threadId), ['batch','healthy']);
+    const row = rows().filter(row => row.name === 'restart.scan').at(-1);
+    assert.equal(row.ok, true);
+    assert.deepEqual(row.props, {deferredThreads:1,maxThreadAheadMs:1_500});
+  }
+  blocked = null;
+  await restartScan(scanArgs(state, {now:T0+100_000}), io);
+  assert.deepEqual(calls.send.map(call => call.threadId), ['batch','healthy','batch']);
+  assert.match(calls.send.at(-1).text, /Task ahead-late/);
+  assert.equal(Object.values(state.handled)[0].done, true);
+  assert.equal(calls.telegram.length, 1);
 });
 
 test('restartScan waits only briefly to settle, never for the installer, and never acts on a dry run or seed', async () => {

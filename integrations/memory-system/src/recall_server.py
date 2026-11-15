@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import recall_ask as ra  # noqa: E402
 import recall_cli as cli  # noqa: E402
 import recall_core as rc  # noqa: E402
+import robob_readonly as ro  # noqa: E402
 from redact_lock import fence  # noqa: E402
 from recall_admission import OptionalLane, CheckLane, DirectToolLane, cheap_note  # noqa: E402
 from recall_engine import CheckEngine  # noqa: E402
@@ -68,6 +69,7 @@ def _fenced_work(work):
     # Executor work can outlive its HTTP timeout. Hold the fence in the worker
     # too so maintenance cannot race a late log write or cached result.
     with fence(rc.ROOT):
+        ro.reset_replica_warnings()
         rc.close_readers()
         generation_path = rc.ROOT / 'logs/state/redaction.generation'
         generation = generation_path.read_bytes() if generation_path.exists() else b''
@@ -77,7 +79,7 @@ def _fenced_work(work):
                 _engine.verdicts.clear()
                 rc._df_cache.clear()
                 _engine._redaction_generation = generation
-        return work()
+        return ro.annotate_result(work())
 
 
 def _async_tool(fn, lane):
@@ -407,13 +409,14 @@ async def api_ask(request: Request) -> Response:
         return JSONResponse({"error": "bad json"}, status_code=400)
 
     def work() -> dict:
+        ro.reset_replica_warnings()
         headers = request.headers
         recheck = lambda: _caller_exclusions(None, headers.get("x-robob-thread") or body.get("caller_thread") or "",
                                              headers.get("x-robob-native") or body.get("caller_native") or "",
                                              headers.get("x-robob-driver") or body.get("caller_driver") or "",
                                              headers.get("x-robob-agent") or body.get("caller_agent") or "")
         exclude = recheck()
-        return _answer(lambda: ra.ask(
+        return ro.annotate_result(_answer(lambda: ra.ask(
             str(body.get("question") or ""),
             cwd=body.get("cwd") or None,
             cwd_only=bool(body.get("cwd")),
@@ -424,7 +427,7 @@ async def api_ask(request: Request) -> Response:
             recheck_exclusions=recheck if exclude else None,
             timeout=max(8, min(float(body.get("timeout") or 30), 30)),
             here=str(body.get("here") or "")[:2000] or None,
-        ))
+        )))
 
     try:
         return JSONResponse(await run_in_threadpool(work))

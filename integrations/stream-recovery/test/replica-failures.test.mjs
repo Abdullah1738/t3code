@@ -4,10 +4,11 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { openDb, assertReplicaFresh } from '../lib/io.mjs';
+import { openDb, assertReplicaFresh, assertThreadInReplica } from '../lib/io.mjs';
 import { registerReplica, guardReplica, MAX_REPLICA_AGE_MS } from '../lib/readonly-db.mjs';
 import { timedScan } from '../lib/logging.mjs';
-import { act, recoveryScan } from '../cli.mjs';
+import { act, recoveryScan, scan } from '../cli.mjs';
+import { restartScan } from '../lib/restartwatch.mjs';
 import { fixture } from '../../router-logging/test/support.mjs';
 
 const NOW = Date.parse('2026-11-15T10:00:00Z');
@@ -103,12 +104,77 @@ test('a not-ready export reopened mid-scan tags both lanes and leaves recovery p
   for (const lane of ['stream', 'restart']) {
     const row = rows().find(row => row.name === `${lane}.scan`);
     assert.equal(row.error.tag, 'REPLICA_NOT_READY');
-    assert.deepEqual(row.props, {replicaGeneration:42,replicaAgeMs:1_000});
+    assert.deepEqual(row.props, {replicaGeneration:42,replicaAgeMs:1_000,deferredThreads:0,maxThreadAheadMs:'unknown',phase:'openDb'});
   }
   assert.deepEqual(state, before);
 });
 
-for (const code of ['REPLICA_UNAVAILABLE', 'REPLICA_NOT_READY']) test(`stream action defers ${code} without recording progress`, async t => {
+for (const [lane, stage] of [['stream','gather'], ['stream','act'], ['restart','act']]) for (const [updatedAt, ahead] of [
+  [new Date(NOW + 500).toISOString(), 1_500], [undefined, 'unknown'], ['not-a-date', 'unknown'],
+]) test(`${lane} ${stage} defers timestamp ${updatedAt}, recovers another thread and retries later`, async t => {
+  const { rows } = fixture(t);
+  const { path } = replica(t);
+  const at = NOW - 120_000;
+  const id = lane === 'restart' ? 'rs-fixture' : 'fixture';
+  const thread = { threadId:'t', model:{instanceId:'opencode'}, nativeSessionId:'ses_t',
+    latestRunId:'run:1', updatedAt };
+  const healthy = {...thread,threadId:'healthy',nativeSessionId:'ses_healthy',updatedAt:new Date(NOW-1_000).toISOString()};
+  const incident = { id, startMs:at, endMs:at, failAllMs:at, subagents:[],
+    runs:['t','healthy'].map(thread_id => ({thread_id,run_id:'run:1',ordinal:1,completed_at:new Date(at).toISOString()})) };
+  const state = { handled:{[id]:{incident, attempts:1, threads:{t:{failures:1}}}}, servers:[] };
+  state.lastStallScan = new Date(NOW).toISOString();
+  const sent = [];
+  const notifications = [];
+  const noMutation = () => assert.fail('replica deferral must not mutate or notify');
+  const io = {
+    PATHS:{db:path}, openDb, assertReplicaFresh, assertThreadInReplica,
+    harnessCutoverStatus:async () => ({active:false,completed:false,claimedThreadIds:[],claimedRunIds:[]}),
+    serverRuntime:() => null, openCodeRuntime:() => null,
+    cancelledSubagentsSince:() => [], cancelledDelegatedTasksSince:() => [], restartRunsSince:() => [],
+    failedRunsSince:() => [], failedSubagentsSince:() => [], laterRuns:() => [], queuedRuns:() => [],
+    activeSessions:async () => new Set(), getThread:async id => id === 't' ? thread : healthy,
+    ocSession:async () => null, ocMessages:async () => ({messages:[],complete:true}), ocForms:async () => [],
+    threadMessageIdsSince:() => [], runMessages:() => [],
+    robobHealthy:async () => true, restartNoteRun:() => null, stoppedSince:() => false,
+    now:() => NOW, acquireLock:() => () => {}, loadState:() => state,
+    saveState:() => {}, sendToThread:async id => { sent.push(id); }, dispatchCommand:noMutation,
+    telegram:args => { notifications.push(args); },
+  };
+  const db = openDb(path);
+  t.after(() => db.close());
+  if (stage === 'gather') io.laterRuns = (snapshot, id) => {
+    if (id === 't') assertThreadInReplica(snapshot, thread);
+    return [];
+  };
+  const run = lane === 'stream'
+      ? () => scan({maxAgeHours:6}, io)
+      : () => restartScan({db,state,now:NOW,sinceIso:new Date(at).toISOString(),floorMs:at-1,log:() => {}}, io);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await run();
+    const row = rows().filter(row => row.name === `${lane}.scan`).at(-1);
+    assert.equal(row.ok, true);
+    assert.equal(row.error, undefined);
+    assert.deepEqual(row.props, {deferredThreads:1,maxThreadAheadMs:ahead});
+    const deferral = rows().filter(row => row.name === 'thread.deferred').at(-1);
+    assert.deepEqual(deferral.error, {tag:'REPLICA_BEHIND_THREAD',message:'thread is newer than Robob replica; recovery deferred'});
+    assert.deepEqual(deferral.props, {replicaGeneration:42,replicaAgeMs:1_000,threadAheadMs:ahead});
+    const entry = state.handled[id];
+    assert.equal(entry.attempts, 1);
+    assert.deepEqual(entry.threads.t, {failures:1});
+    assert.ok(!entry.done);
+    assert.deepEqual(sent, ['healthy']);
+    assert.equal(notifications.length, 0);
+  }
+  thread.updatedAt = new Date(NOW-1_000).toISOString();
+  await run();
+  assert.deepEqual(sent, ['healthy','t']);
+  assert.equal(state.handled[id].done, true);
+  assert.equal(notifications.length, 1);
+  assert.deepEqual(rows().filter(row => row.name === `${lane}.scan`).at(-1).props,
+    {deferredThreads:0,maxThreadAheadMs:'unknown'});
+});
+
+for (const code of ['REPLICA_UNAVAILABLE', 'REPLICA_NOT_READY', 'REPLICA_BEHIND_THREAD']) test(`stream action defers ${code} without recording progress`, async t => {
   fixture(t);
   const progress = {};
   const g = { plan:{threadId:'t',action:'note'}, sourceRuns:[], lost:[], reply:null, forms:[] };

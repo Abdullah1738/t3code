@@ -443,3 +443,28 @@ it.effect("actsAsCaller returns caller_unresolved when the caller shell read sta
     expect(yield* Fiber.join(result)).toBe("caller_unresolved");
   }),
 );
+
+it.effect("read-only clients retain the refusal text and carry read_only_client", () =>
+  Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    const result = yield* server
+      .callTool({ name: "writes", arguments: {} })
+      .pipe(
+        Effect.provideService(McpInvocationContext.McpInvocationContext, readOnlyClient),
+        Effect.provideService(McpSchema.McpServerClient, mcpClient),
+      );
+    const text = result.content.map((part) => (part.type === "text" ? part.text : "")).join("");
+    expect(text).toContain("read_only_client");
+    expect(text).toContain(
+      "This tool changes the environment, and this MCP client was approved for read-only access.",
+    );
+  }).pipe(
+    Effect.provide(
+      probeServer(
+        Layer.mock(ThreadManagement.ThreadManagementService)({
+          getCallerRow: (id) => Effect.succeed(shells.get(id) ?? null),
+        }),
+      ),
+    ),
+  ),
+);

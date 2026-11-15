@@ -1,4 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
+import { vi } from "vite-plus/test";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -991,6 +992,7 @@ it.effect("a rejected keyed wake can retry with real orchestrator receipts", () 
   const recorded: Array<ThreadManagementService.ThreadManagementSendInput> = [];
   let failBeforeDispatch = false;
   let failAfterDispatch = false;
+  let receiptFailureAfterCommit = false;
   let queueWithdrawal = false;
   let startWithdrawal = false;
   let restartBeforeCleanup = false;
@@ -1007,6 +1009,7 @@ it.effect("a rejected keyed wake can retry with real orchestrator receipts", () 
   const dependencies = Layer.mergeAll(
     management,
     receipts,
+    CommandReceipts.layer.pipe(Layer.provide(db)),
     ProjectionStore.layer.pipe(Layer.provide(db)),
     Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
   );
@@ -1177,7 +1180,34 @@ it.effect("a rejected keyed wake can retry with real orchestrator receipts", () 
         true,
       );
       failAfterDispatch = true;
-      expect(Result.isFailure(yield* Effect.result(threads.send(wake)))).toBe(true);
+      let acknowledged = false;
+      const repository = yield* CommandReceipts.OrchestrationCommandReceiptRepository;
+      const originalRead = repository.getByCommandId;
+      const reads = vi
+        .spyOn(repository, "getByCommandId")
+        .mockImplementation((input) =>
+          receiptFailureAfterCommit
+            ? Effect.die("receipt read unavailable after accepted commit")
+            : originalRead(input),
+        );
+      let failed = false;
+      try {
+        const result = yield* Effect.exit(
+          threads.send({
+            ...wake,
+            onCommitted: () => {
+              acknowledged = true;
+              receiptFailureAfterCommit = true;
+            },
+          }),
+        );
+        failed = result._tag === "Failure";
+      } finally {
+        receiptFailureAfterCommit = false;
+        reads.mockRestore();
+      }
+      expect(failed).toBe(true);
+      expect(acknowledged).toBe(true);
       expect(recorded.at(-1)?.commandId).toBe("kanban:send:wake:real-receipt:retry:2");
       const accepted = yield* receiptStore.getByCommandId(recorded.at(-1)!.commandId);
       expect(Option.isSome(accepted) && accepted.value.status).toBe("accepted");
@@ -1200,14 +1230,12 @@ it.effect("a rejected keyed wake can retry with real orchestrator receipts", () 
         text: "The board changed while assigning this review",
       });
       const revoked = yield* orchestrator.getThreadRecords(threadId, ["runs", "messages"]);
-      expect(["interrupted", "cancelled"]).toContain(
-        revoked.runs.find((run) => run.id === acceptedWake.id)?.status,
+      expect(revoked.runs.find((run) => run.id === acceptedWake.id)?.status).toBe(
+        acceptedWake.status,
       );
-      expect(
-        revoked.messages.some(
-          (message) => message.text === "The board changed while assigning this review",
-        ),
-      ).toBe(false);
+      expect(revoked.runs.filter((run) => run.status === "queued")).toHaveLength(0);
+      // Finish this preserved turn explicitly before exercising the next withdrawal scenario.
+      yield* threads.interrupt(threadId, "Finish preserved turn", true);
       yield* threads.send({ threadId, key: "wake:next-worker", text: "Next valid work" });
       const original = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs.at(-1)!;
       const records = yield* orchestrator.getThreadRecords(threadId, [
@@ -1340,7 +1368,8 @@ it.effect("a rejected keyed wake can retry with real orchestrator receipts", () 
         text: "Stop only the original card",
       });
       nativeSteering = null;
-      expect(siblingBeforeInterrupt).toBe(false);
+      expect(siblingBeforeInterrupt).toBe(true);
+      siblingBeforeInterrupt = false;
       const lateShared = yield* orchestrator.getThreadRecords(threadId, ["runs"]);
       const latePreserved = lateShared.runs.find((run) => run.id === lateRoot.id)!;
       expect(latePreserved.status).toBe(lateRoot.status);
@@ -1969,6 +1998,16 @@ describe("coalesceTarget", () => {
     expect(coalesceTarget([candidate], "step:A")).toBeUndefined();
   });
 
+  it("coalesces an assignment without treating it as a disposable wake", () => {
+    const assignment = {
+      ...run(2, "unused"),
+      userMessageId: MessageId.make("kanban:assignment:card:id"),
+    };
+    expect(coalesceTarget([run(1, "assignment:card"), assignment], "assignment:card")).toBe(
+      assignment,
+    );
+  });
+
   it("has no target in an empty queue", () => {
     expect(coalesceTarget([], "step:A")).toBeUndefined();
   });
@@ -2313,6 +2352,19 @@ describe("queuedWakes", () => {
       ),
     ).toEqual([first, second]);
   });
+  it("withdraws only the selected card's assignment and leaves active runs alone", () => {
+    const assignment = run(2, "kanban:assignment:A:old");
+    const reminder = run(1, "kanban:wake:nudge:old");
+    const runs = [
+      assignment,
+      reminder,
+      run(3, "kanban:assignment:AB:other"),
+      run(4, "kanban:assignment:A:active", "running"),
+    ];
+    expect(queuedWakes(runs)).toEqual([reminder]);
+    expect(queuedWakes(runs, Infinity, ["assignment:A"])).toEqual([assignment]);
+  });
+
   it.each(["step:A", "plan:A", "owner:A", "owner:discussion-A", "nudge"])(
     "matches exact scope %s",
     (scope) => {
@@ -2509,6 +2561,82 @@ it.effect("recovery history chooses the most recent start instead of the latest 
         Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
         Layer.provide(Sqlite.layerMemory),
       ),
+    ),
+  );
+});
+
+it.effect("#1574 assignment queue preserves a busy run and replays once", () => {
+  const db = Sqlite.layerMemory;
+  const instanceId = ProviderInstanceId.make("codex");
+  const projectId = ProjectId.make("project:assignment");
+  const threadId = ThreadId.make("thread:assignment");
+  const adapter = {
+    instanceId,
+    driver: ProviderDriverKind.make("codex"),
+    getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
+    planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" as const }),
+    openSession: () => Effect.die("Provider execution is disabled in this test"),
+  } as ProviderAdapter.ProviderAdapterV2["Service"];
+  const registry = Layer.succeed(
+    ProviderAdapterRegistry.ProviderAdapterRegistryV2,
+    ProviderAdapterRegistry.ProviderAdapterRegistryV2.of({
+      get: () => Effect.succeed(adapter),
+      list: () => Effect.succeed([instanceId]),
+    }),
+  );
+  const receipts = CommandReceiptStore.layer.pipe(Layer.provide(db));
+  const runtime = ProviderReplayHarness.layerWithRegistry({ name: "kanban-assignment" }, registry, {
+    databaseLayer: db,
+    runEffectWorker: false,
+  });
+  const management = ThreadManagementService.layer.pipe(
+    Layer.provideMerge(Layer.mergeAll(runtime, receipts, ServerSettings.layerTest(), db)),
+  );
+  return Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("assignment:create"),
+      threadId,
+      projectId,
+      title: "Existing context",
+      modelSelection: { instanceId, model: "gpt-5.1-codex" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "system",
+      creationSource: "server",
+    });
+    yield* Effect.gen(function* () {
+      const threads = yield* KanbanThreads;
+      yield* threads.send({ threadId, text: "Current work" });
+      const before = yield* orchestrator.getThreadRecords(threadId, ["runs", "messages"]);
+      const assignment = {
+        threadId,
+        text: "New card brief",
+        coalesce: "assignment:card",
+        key: "assignment:card",
+        mode: "queue" as const,
+      };
+      const queued = yield* threads.send(assignment);
+      yield* threads.send(assignment);
+      const after = yield* orchestrator.getThreadRecords(threadId, ["runs", "messages"]);
+      expect(after.runs).toHaveLength(2);
+      expect(after.runs.find((run) => run.id === before.runs[0]!.id)).toEqual(before.runs[0]);
+      expect(after.runs.find((run) => run.id === queued)?.status).toBe("queued");
+      expect(after.messages.filter((message) => message.text === "New card brief")).toHaveLength(1);
+      yield* threads.send({ threadId, text: "Unrelated queued follow-up", mode: "queue" });
+      const followup = yield* orchestrator.getThreadRecords(threadId, ["runs", "messages"]);
+      expect(followup.runs.find((run) => run.id === queued)?.status).toBe("queued");
+      expect(queuedWakes(followup.runs)).toEqual([]);
+      expect(
+        queuedWakes(followup.runs, Infinity, ["assignment:card"]).map((run) => run.id),
+      ).toEqual([queued]);
+    }).pipe(Effect.provide(layer));
+  }).pipe(
+    Effect.provide(
+      Layer.mergeAll(management, receipts, Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
     ),
   );
 });

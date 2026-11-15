@@ -205,7 +205,17 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({'verify': False, 'errors': 1}), file=sys.stderr)
             return 2
 
-    out = lambda obj, text: print(json.dumps(obj, indent=1, default=str) if a.json else text)  # noqa: E731
+    rc.robob_readonly.reset_replica_warnings()
+
+    def out(obj, text):
+        if a.json:
+            annotated = rc.robob_readonly.annotate_result(obj)
+            if not isinstance(obj, dict):
+                for snapshot in rc.robob_readonly.replica_warnings():
+                    print(snapshot["warning"], file=sys.stderr)
+            print(json.dumps(annotated, indent=1, default=str))
+        else:
+            print(rc.robob_readonly.annotate_result(text))
 
     from redact_lock import fence
     lease = fence(rc.ROOT)

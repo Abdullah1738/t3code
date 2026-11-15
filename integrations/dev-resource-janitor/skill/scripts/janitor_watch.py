@@ -13,7 +13,8 @@ import uuid
 
 
 STATE_DIR = Path(os.environ.get(
-    "DEV_JANITOR_WATCH_STATE", os.path.expanduser("~/.local/share/dev-janitor/hourly")
+    "DEV_JANITOR_WATCH_STATE", str(Path(os.environ.get(
+        "DEV_JANITOR_LOG_DIR", os.path.expanduser("~/.local/share/dev-janitor"))) / "hourly")
 ))
 STALE_SECONDS = 4 * 60 * 60
 ALERT_SECONDS = 6 * 60 * 60
@@ -161,7 +162,7 @@ def worker(lock_fd):
         ok = True
         write_state({"status": "ok", "finished_at": time.time(),
                      "liveness_unavailable": scan.get("liveness_unavailable"),
-                     "processes": {key: scan.get("processes", {}).get(key, []) for key in ("candidates", "problems", "checked", "skipped", "budget_skipped")}})
+                     "processes": {key: scan.get("processes", {}).get(key, []) for key in ("candidates", "problems", "checked", "skipped", "budget_skipped", "owner_calls")}})
     except Exception as e:  # noqa: BLE001
         write_state({"status": "failed", "error": str(e)[:500], "finished_at": time.time()})
         return 1
