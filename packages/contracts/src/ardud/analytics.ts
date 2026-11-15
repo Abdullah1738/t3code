@@ -218,6 +218,10 @@ const GeneralEvent = Schema.Struct({
       poolKey: Schema.optionalKey(Label),
       key: Schema.optionalKey(Label),
       reason: Schema.optionalKey(Label),
+      headRunId: Schema.optionalKey(DerivedId),
+      headOrdinal: Schema.optionalKey(Measurement),
+      queuedCount: Schema.optionalKey(Measurement),
+      heldCount: Schema.optionalKey(Measurement),
       phase: Schema.optionalKey(Label),
       subSteps: Schema.optionalKey(
         Schema.Array(Schema.Struct({ subStep: Label, ms: Measurement })).check(

@@ -104,7 +104,7 @@ test('a not-ready export reopened mid-scan tags both lanes and leaves recovery p
   for (const lane of ['stream', 'restart']) {
     const row = rows().find(row => row.name === `${lane}.scan`);
     assert.equal(row.error.tag, 'REPLICA_NOT_READY');
-    assert.deepEqual(row.props, {replicaGeneration:42,replicaAgeMs:1_000,deferredThreads:0,maxThreadAheadMs:'unknown'});
+    assert.deepEqual(row.props, {replicaGeneration:42,replicaAgeMs:1_000,deferredThreads:0,maxThreadAheadMs:'unknown',phase:'openDb'});
   }
   assert.deepEqual(state, before);
 });
