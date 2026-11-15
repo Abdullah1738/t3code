@@ -178,6 +178,7 @@ class ProbeTests(unittest.TestCase):
                 self.clock[0] = night*86400
                 start, calls = self.clock[0], []
                 breakdown = {name: dict(count=0, seconds=0) for name in ('probe', 'realChild', 'batch', 'parts')}
+                batch_deadlines = []
                 run_du = self.runner(cost, calls)
                 def run(command, **kwargs):
                     command_started = self.clock[0]
@@ -186,6 +187,11 @@ class ProbeTests(unittest.TestCase):
                     except subprocess.TimeoutExpired:
                         name = ('parts' if Path(command[-1]).parent in giants else 'batch' if len(command) > 3
                                 else 'probe' if kwargs['timeout'] < 60 else 'realChild')
+                        if name == 'batch':
+                            batch_deadlines.append(dict(root=str(Path(command[2]).parent),
+                                first=Path(command[2]).name, last=Path(command[-1]).name, children=len(command)-2,
+                                expectedSeconds=round(sum(cost(Path(p)) for p in command[2:]), 3),
+                                allowanceS=kwargs['timeout']))
                         breakdown[name]['count'] += 1
                         breakdown[name]['seconds'] += self.clock[0]-command_started
                         raise
@@ -209,7 +215,7 @@ class ProbeTests(unittest.TestCase):
                 evidence.append(dict(night=night+1, seconds=round(self.clock[0]-start, 3),
                     remaining=end['childrenRemaining'], timeouts=end['timeouts'],
                     secondsInTimeouts=round(end['secondsInTimeouts'], 3),
-                    timeoutBreakdown=breakdown, probeTimeouts=end['probeTimeouts'], rootsComplete=len(roots)-len(state['partials']),
+                    batchDeadlines=batch_deadlines, timeoutBreakdown=breakdown, probeTimeouts=end['probeTimeouts'], rootsComplete=len(roots)-len(state['partials']),
                     giantsComplete=all(not state['childState'][str(p.parent)].get(str(p), {}).get('partial', True) for p in giants),
                     ordinaryRemaining=sum(jobs.inventory_needs_measurement(state['childState'][str(root)].get(str(p)),
                         self.now+self.clock[0], root=root) for root in roots for p in topology[root] if p not in giants),
@@ -232,6 +238,7 @@ class ProbeTests(unittest.TestCase):
               finalPartialRoots=sorted(state['partials']), hourly=hourly, ordinaryFailures=coverage_failures)))
         self.assertFalse(coverage_failures, '48 h ordinary steady state must hold; do not widen the window')
         self.assertTrue(evidence[2]['giantsComplete'])
+        self.assertEqual(evidence[2]['rootsComplete'], len(roots))
         self.assertTrue(all(row['secondsInTimeouts'] < .15*5400 for row in evidence[1:]))
         self.assertEqual(completed_roots, set(map(str, roots)))
         for child in giants:
@@ -348,3 +355,79 @@ class ProbeTests(unittest.TestCase):
         early = keys[:ordinary_index]
         self.assertEqual(early, [str(root/'0000'/'part') for root in roots[:2]])
         self.assertFalse(jobs.read_state('disk-inventory')['partials'])
+
+    def test_parts_defer_known_cost_without_timeout_or_fake_completion(self):
+        root = self.roots([('part-costs', 3)])[0]
+        keys = [str(root/('%04d'%i)) for i in range(3)]
+        for source in ('own', 'sibling', 'unknown', 'deleted-sibling'):
+            with self.subTest(source=source):
+                self.clock[0] = 0
+                cache = {keys[0]: dict(bytes=1024, at=self.now, partial=False, elapsedMs=350000)}
+                if source == 'own':
+                    cache[keys[1]] = dict(partial=True, elapsedMs=350000)
+                if source in ('unknown', 'deleted-sibling'):
+                    cache = {} if source == 'unknown' else {
+                        str(root/'deleted'): dict(bytes=1024, at=self.now, partial=False, elapsedMs=900000)}
+                attempted, calls = set(), []
+                metrics = dict(timeouts=0, secondsInTimeouts=0)
+                # A cheaper part can still fit after a deferred expensive one.
+                cache[keys[2]] = dict(partial=True, elapsedMs=100000)
+                if source == 'sibling':
+                    cache[keys[2]]['elapsedMs'] = 350000
+                _, status, _ = jobs.big_root_inventory(root, self.runner(lambda p: 100, calls),
+                    250, cache, deep=True, parts_mode=True, attempted=attempted, metrics=metrics)
+                self.assertTrue(status['partial'])
+                self.assertEqual(metrics['timeouts'], 0)
+                self.assertEqual(metrics['secondsInTimeouts'], 0)
+                if source in ('own', 'sibling'):
+                    self.assertFalse(any(keys[1] in cmd[2:] for cmd, timeout in calls))
+                    self.assertNotIn('bytes', cache.get(keys[1], {}))
+                    self.assertIn(keys[1], attempted)
+                else:
+                    self.assertTrue(any(keys[0] in cmd[2:] for cmd, timeout in calls))
+                if source == 'own':
+                    self.assertTrue(any(keys[2] in cmd[2:] for cmd, timeout in calls))
+
+    def test_parts_cost_admission_boundary(self):
+        root = self.roots([('part-boundary', 1)])[0]
+        key = str(root/'0000')
+        for left in (249.999, 250, 350, 350.001):
+            with self.subTest(left=left):
+                self.clock[0] = 0
+                cache = {key: dict(partial=True, elapsedMs=350000)}
+                calls = []
+                _, status, _ = jobs.big_root_inventory(root, self.runner(lambda p: 350, calls),
+                    left, cache, deep=True, parts_mode=True, attempted=set())
+                self.assertEqual(bool(calls), left >= 350)
+                self.assertEqual(status['partial'], left < 350)
+                self.assertEqual('bytes' in cache[key], left >= 350)
+
+    def test_known_part_cost_bounds_batches_as_well_as_single_attempts(self):
+        root = self.roots([('part-batch-cost', 128)])[0]
+        cache = {str(p): dict(partial=True, elapsedMs=350000) for p in root.iterdir()}
+        attempted, calls = set(), []
+        metrics = dict(timeouts=0, secondsInTimeouts=0)
+        run = self.runner(lambda p: 350, calls)
+        jobs.big_root_inventory(root, run, 600, cache, deep=True, parts_mode=True,
+                                attempted=attempted, metrics=metrics, max_batches=1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls[0][0]), 3)
+        self.assertEqual(self.clock[0], 350)
+        jobs.big_root_inventory(root, run, 600, cache, deep=True, parts_mode=True,
+                                attempted=attempted, metrics=metrics)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(attempted), 128)
+        self.assertEqual(sum('bytes' in v for v in cache.values()), 1)
+        self.assertEqual(metrics['timeouts'], 0)
+
+    def test_unknown_part_cost_can_still_timeout_without_fabricated_progress(self):
+        root = self.roots([('unknown-part-cost', 1)])[0]
+        cache, calls = {}, []
+        metrics = dict(timeouts=0, secondsInTimeouts=0)
+        _, status, _ = jobs.big_root_inventory(root, self.runner(lambda p: 350, calls), 250,
+            cache, deep=True, parts_mode=True, attempted=set(), metrics=metrics)
+        self.assertEqual(calls[0][1], 250)
+        self.assertEqual(metrics['timeouts'], 1)
+        self.assertEqual(metrics['secondsInTimeouts'], 250)
+        self.assertTrue(status['partial'])
+        self.assertNotIn('bytes', cache[str(root/'0000')])

@@ -438,14 +438,14 @@ def big_root_inventory(path, run, deadline, cache=None, listing=None, pending_on
     if deep and not parts_mode:
         for value in cache.values():
             inventory_migrate_probe(value)
-    successful_ms = {key: v['elapsedMs'] for key, v in cache.items()
-                     if number(v.get('elapsedMs')) and not inventory_has_parts(v)}
     entries, listed = (inventory_listing(path, deadline) if source_failures is None else
                        inventory_listing(path, deadline, source_failures)) if listing is None else listing
     present = {entry.path for entry in entries}
     if listed:
         for key in set(cache)-present:
             cache.pop(key)
+    successful_ms = {key: v['elapsedMs'] for key, v in cache.items()
+                     if number(v.get('elapsedMs')) and not inventory_has_parts(v)}
     completed, failures = 0, int(not listed)
     kinds = {}
     def kind(entry):
@@ -480,6 +480,9 @@ def big_root_inventory(path, run, deadline, cache=None, listing=None, pending_on
     else:
         selected = [entry for entry in selected if not cache.get(entry.path, {}).get('limited')
                     and not inventory_deep_owned(cache.get(entry.path, {}), now)]
+    def part_cost_ms(value):
+        elapsed = value.get('elapsedMs')
+        return elapsed if number(elapsed) else statistics.median(successful_ms.values()) if successful_ms else 0
     batches = 0
     while selected and time.monotonic() < deadline:
         first = selected[0]
@@ -500,20 +503,33 @@ def big_root_inventory(path, run, deadline, cache=None, listing=None, pending_on
         allowance = (DEEP_CHILD_CAP_S if parts_mode else inventory_probe_allowance(old, list(successful_ms.values()))
                      if deep else 60 if old.get('slow') else 15)
         timeout = min(allowance, deadline-time.monotonic())
+        if parts_mode:
+            cost_ms = part_cost_ms(old)
+            # After one 350 s part, a sibling cannot fit the 250 s left in
+            # the nightly child cap. Leave it pending instead of killing it.
+            if cost_ms > timeout*1000:
+                if attempted is not None:
+                    attempted.add(first.path)
+                selected = selected[1:]
+                continue
         # Limited children were excluded from the entire selection, including
         # later batch positions, until a measured replacement clears the hint.
         # Many-child roots use the same per-link accounting as du_total,
         # with bounded argv, rotating the first unfinished
         # child after a timeout instead of rescanning du -d 1's fixed prefix.
-        batch, argv_bytes = [], 0
+        batch, argv_bytes, batch_cost_ms = [], 0, 0
         for entry in selected[:128] if len(entries) >= 128 and not inventory_has_timeout(old) and first.path not in single_paths and not (deep and old.get('lastProbeS')) else selected[:1]:
             if deep and batch and (entry.path in single_paths or cache.get(entry.path, {}).get('lastProbeS') or inventory_has_timeout(cache.get(entry.path, {})) or 'parts' in cache.get(entry.path, {})):
+                break
+            cost_ms = part_cost_ms(cache.get(entry.path, {})) if parts_mode else 0
+            if batch and parts_mode and batch_cost_ms+cost_ms > timeout*1000:
                 break
             length = len(os.fsencode(entry.path))+1
             if batch and argv_bytes+length > 32768:
                 break
             batch.append(entry)
             argv_bytes += length
+            batch_cost_ms += cost_ms
         selected = selected[len(batch):]
         if deep and not parts_mode and len(batch) > 1:
             timeout = min(60, deadline-time.monotonic())

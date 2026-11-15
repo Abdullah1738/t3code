@@ -156,7 +156,7 @@ class InventoryLoggingTests(unittest.TestCase):
         for name in ('small', 'large'):
             (child/name).mkdir()
         jobs.save_state('disk-inventory', dict(duMode='links', childState={str(self.root): {
-            str(child): dict(partial=True, timeouts=1, attemptedAt=1)}}))
+            str(child): dict(partial=True, timeouts=1, lastTimeoutS=60, attemptedAt=1)}}))
         def run(cmd, **kw):
             self.clock += .01
             return SimpleNamespace(returncode=0, stderr='', stdout=''.join(
@@ -209,7 +209,7 @@ class InventoryLoggingTests(unittest.TestCase):
         child = self.root/'file'
         child.touch()
         jobs.save_state('disk-inventory', dict(duMode='links', childState={str(self.root): {
-            str(child): dict(partial=True, timeouts=1, attemptedAt=1)}}))
+            str(child): dict(partial=True, timeouts=1, lastTimeoutS=60, attemptedAt=1)}}))
         def run(cmd, **kw):
             self.clock += 40
             raise subprocess.TimeoutExpired(cmd, 40)

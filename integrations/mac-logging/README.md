@@ -102,7 +102,8 @@ probe and keeps the child in ordinary discovery; only a full probe of at least
 allowance or parts get one probe conversion. Batch deadlines fall back to
 individual probes. A confirmed timed-out child is split into immediate entries,
 with each completed part checkpointed and at most ten minutes per child per
-pass. Checkpointed parts and their parent have a 72-hour freshness window so
+pass. A part whose measured or sibling-estimated cost exceeds the time left
+is deferred to the next pass. Checkpointed parts and their parent have a 72-hour freshness window so
 three nightly passes can finish a child. Ordinary children of the SSD worktree
 farms and crpko-devops/tmp retain their real timestamps for 48 hours, so a
 sweep larger than one nightly budget can converge. Other roots keep 24 hours.
