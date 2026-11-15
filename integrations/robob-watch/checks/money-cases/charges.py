@@ -576,10 +576,10 @@ def owner_texts(since, until, deadline=None, stats=None, cache_path=None, cache_
             raise Lookup('Robob control: invalid message count')
         if total != len(messages):
             raise Lookup('Robob control: incomplete message list')
-        # Replace the overlap as well as deduping IDs: removed or reclassified
-        # turns in the authoritative response must not survive in the cache.
-        out = {} if full else {row['messageId']: row for row in prior['texts']
-                               if owner_time(row['createdAt']) < read_from}
+        # The API filters by updatedAt, so a delta can edit an older turn.
+        # Merge by ID before applying provenance and the covered creation span.
+        covered_from = since if full else owner_time(prior['coveredFrom'])
+        out = {} if full else {row['messageId']: row for row in prior['texts']}
         for message in messages:
             if time.time() >= stop:
                 raise Lookup('Robob control: lookup over time')
@@ -598,7 +598,7 @@ def owner_texts(since, until, deadline=None, stats=None, cache_path=None, cache_
             if not isinstance(mid, str) or not mid:
                 raise Lookup('Robob control: message id unavailable; server update required')
             out.pop(mid, None)
-            if created >= read_from and typed and not text.startswith('[Forwarded by'):
+            if created >= covered_from and typed and not text.startswith('[Forwarded by'):
                 out[mid] = {'messageId': mid, 'createdAt': iso(created), 'text': text, 'title': title}
         return {'updatedAt': thread['updatedAt'], 'coveredFrom': iso(since) if full else prior['coveredFrom'],
                 'title': title, 'texts': list(out.values())}

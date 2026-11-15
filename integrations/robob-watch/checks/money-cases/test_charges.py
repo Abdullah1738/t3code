@@ -750,7 +750,7 @@ class OwnerTexts(unittest.TestCase):
             self.assertEqual(self.message_calls(server), [])
             self.assertEqual(stats['owner_queries'], 2)
 
-    def test_changed_thread_merges_by_id_and_replaces_overlap(self):
+    def test_changed_thread_merges_by_id_and_reclassifies_overlap(self):
         with ControlServer([summary('old', createdAt='2026-10-24T00:00:00Z'),
                             summary('overlap', createdAt='2026-10-24T00:59:30Z'),
                             summary('removed', createdAt='2026-10-24T00:59:40Z')]) as server:
@@ -758,12 +758,28 @@ class OwnerTexts(unittest.TestCase):
             server.calls.clear()
             server.threads[0]['updatedAt'] = '2026-10-24T01:00:30Z'
             server.rows['a'] = [summary('overlap edited', messageId='overlap', createdAt='2026-10-24T00:59:30Z'),
+                                summary('reclassified', messageId='removed', automated=True,
+                                        createdAt='2026-10-24T00:59:40Z'),
                                 summary('new', createdAt='2026-10-24T01:00:00Z')]
             self.assertEqual([row[1] for row in self.read()], ['new', 'overlap edited', 'old'])
             self.assertEqual(self.message_calls(server)[0][1]['since'], ['2026-10-24T00:59:00.000Z'])
             server.calls.clear()
             self.assertEqual(len(self.read()), 3)
             self.assertEqual(self.message_calls(server), [])
+
+    def test_delta_edits_to_older_turns_replace_cached_text_by_id(self):
+        cases = [(summary('edited owner words', messageId='old'), ['edited owner words']),
+                 (summary('now automated', messageId='old', automated=True), []),
+                 (summary('now agent', messageId='old', createdBy='agent'), []),
+                 (summary('[Forwarded by owner] private', messageId='old'), [])]
+        for edited, expected in cases:
+            with self.subTest(edited=edited['text']), ControlServer([summary('old')]) as server:
+                self.read()
+                # A recent update can have an old createdAt. The real API's
+                # since filter is on updatedAt, not createdAt.
+                server.rows['a'] = [{**edited, 'updatedAt': '2026-10-24T01:01:00Z'}]
+                server.threads[0]['updatedAt'] = '2026-10-24T01:01:00Z'
+                self.assertEqual([row[1] for row in self.read()], expected)
 
     def test_earlier_window_refetches_and_failed_change_cannot_use_stale_cache(self):
         with ControlServer([summary('newer')]) as server:
