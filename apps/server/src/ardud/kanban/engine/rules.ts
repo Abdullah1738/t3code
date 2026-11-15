@@ -839,7 +839,7 @@ export interface ClaimContext {
 /**
  * A work thread may take a todo card that runs on its pool and project, isn't
  * running, stalled or kept for another work thread, and isn't blocked by work
- * outside the thread.
+ * outside the thread or awaiting review or merge.
  */
 export function checkClaim(board: KanbanBoard, card: KanbanCard, ctx: ClaimContext): MoveCheck {
   // Same hold as planDispatch: no card work starts while the board's setup runs.
@@ -883,9 +883,9 @@ export function checkClaim(board: KanbanBoard, card: KanbanCard, ctx: ClaimConte
   if ((card.projectId ?? board.defaultProjectId) !== ctx.projectId) {
     return no(`card #${card.number} runs in another project`);
   }
-  // The claim makes the card this thread's, so a block by the thread's own work doesn't count.
+  // A claim batches this thread's todo/working cards, but review and merge can still hold it up.
   const blocker = kanbanHeldUpBy(card, ctx.byId, ctx.threadId);
-  if (blocker) return no(`card #${card.number} waits on #${blocker.number}`);
+  if (blocker) return no(`card #${card.number} waits on #${blocker.number} (${blocker.stage})`);
   if (ctx.slots <= 0) return no(`the ${ctx.pool} pool is paused`);
   if (ctx.carrying >= MAX_BATCH) {
     return no(`this thread already carries ${ctx.carrying} cards (max ${MAX_BATCH})`);

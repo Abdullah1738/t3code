@@ -1403,10 +1403,11 @@ export const kanbanAwaitsMerge = (card: Pick<KanbanCard, "stage" | "subtasks">):
 
 /**
  * The first unfinished card holding `card` up, or undefined. A blocker on the
- * same work thread is no block, since that thread does both in order, unless
- * it can't go on itself: stalled, in the backlog, waiting on the owner or the
- * evaluator, or held up in turn. A completed blocker still holds while its
- * merge subtask is open; deployed and verified blockers never do.
+ * same work thread is waived only in todo or working: the thread does both
+ * in order unless stalled, in the backlog, waiting on the evaluator, or held
+ * up in turn. Once the blocker leaves for review, the thread's branch is
+ * unreviewed and rework can come back. A completed blocker still holds while
+ * its merge subtask is open; deployed and verified blockers never do.
  */
 export function kanbanHeldUpBy(
   card: KanbanCard,
@@ -1420,13 +1421,16 @@ export function kanbanHeldUpBy(
       if (blocker === undefined) continue;
       const done = KANBAN_DONE_STAGES.has(blocker.stage);
       if (done && !kanbanAwaitsMerge(blocker)) continue;
-      if (thread === null || blocker.workThreadId !== thread) return blocker;
-      // Same thread: it carries the blocker's commits on its own branch, so a finished blocker isn't held.
-      if (done) continue;
+      if (
+        thread === null ||
+        blocker.workThreadId !== thread ||
+        (blocker.stage !== "todo" && blocker.stage !== "working")
+      ) {
+        return blocker;
+      }
       if (
         blocker.stalled !== null ||
         blocker.priority === KANBAN_BACKLOG ||
-        blocker.stage === "needs_owner" ||
         kanbanWaitsOnEvaluator(blocker) ||
         path.has(blocker.id)
       ) {
