@@ -1,4 +1,6 @@
 import * as NodeUtil from "node:util";
+import * as MessageEditObservation from "./messageEditObservation.ts";
+import * as EvaluatorAnalytics from "../ardud/kanban/engine/evaluatorAnalytics.ts";
 import {
   PROVIDER_START_TIMEOUT_CODE,
   PROVIDER_START_TIMEOUT_MS,
@@ -985,6 +987,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const contextHandoffService = yield* ContextHandoffServiceV2;
   const eventSink = yield* EventSinkV2;
   const commandReceipts = yield* CommandReceiptStoreV2;
+  const evaluatorAnalytics = yield* EvaluatorAnalytics.make;
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
   const projects = yield* ProjectStore.ProjectStoreV2;
   const projectionStore = yield* ProjectionStoreV2;
@@ -5627,6 +5630,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         }
       }
     }
+    (yield* MessageEditObservation.current)?.push({
+      threadId: command.threadId,
+      messageId: command.messageId,
+      commandId: command.commandId,
+    });
     const dispatchText =
       delegatedCompletion === undefined
         ? command.text
@@ -9149,6 +9157,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
 
     const now = yield* DateTime.now;
     const emitEvent = emit(events, command);
+    const changed =
+      queuedMessage.text !== command.text ||
+      (command.attachments !== undefined &&
+        !NodeUtil.isDeepStrictEqual(command.attachments, queuedMessage.attachments)) ||
+      (command.context !== undefined &&
+        !NodeUtil.isDeepStrictEqual(command.context, queuedMessage.context));
+    if (changed)
+      (yield* MessageEditObservation.current)?.push({
+        threadId: command.threadId,
+        messageId: queuedMessage.id,
+        commandId: command.commandId,
+      });
     const editedAttachments =
       command.attachments === undefined ? {} : { attachments: command.attachments };
     yield* emitEvent({
@@ -13355,7 +13375,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             )
         : undefined;
 
+    const incoming: MessageEditObservation.Delivery[] = [];
     const plan = yield* dispatchOnce(command).pipe(
+      Effect.provideService(MessageEditObservation.current, incoming),
       Effect.flatMap((planned) =>
         planned.events.length > 0 ||
         command.type === "run.start-expire" ||
@@ -13603,6 +13625,20 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         receiptThreadId: committed.receipt.threadId,
         commandThreadId: dispatchThreadId,
       });
+    }
+    if (committed.committed) {
+      for (const delivery of incoming) {
+        if (
+          committed.storedEvents.some(
+            ({ event }) =>
+              event.type === "message.updated" &&
+              event.threadId === delivery.threadId &&
+              event.payload.id === delivery.messageId &&
+              event.payload.role === "user",
+          )
+        )
+          yield* evaluatorAnalytics.observe(delivery);
+      }
     }
     if (command.type === "queue.resume" || command.type === "queue.cutover-release") {
       yield* mapDispatchError(command)(

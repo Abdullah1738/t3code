@@ -35,7 +35,7 @@ const LONG_OPEN_MS = 24 * 60 * 60 * 1000;
 /** Open asks older than this are listed. */
 const OLD_ASK_MS = 6 * 60 * 60 * 1000;
 /** Cards with at least this many evaluator wakes in the window are listed. */
-const EVALUATOR_WAKES_LISTED = 2;
+const EVALUATOR_STARTS_LISTED = 2;
 /** Rows per rollup list at most; lists shrink together until the rollup fits ROLLUP_CHARS. */
 const LIST_MAX = 150;
 const ROLLUP_CHARS = 55_000;
@@ -742,18 +742,18 @@ export const rollup = (input: RollupInput) => {
   }
   restarts.sort((left, right) => right.threads - left.threads || left.card - right.card);
 
-  // Evaluator wakes: evaluator threads the board started for a card in the window.
-  const evaluatorWakes: Array<{ card: number; wakes: number }> = [];
-  let evaluatorWakeCount = 0;
+  // Counts card-linked starts; deliveries into existing evaluators have their own analytics.
+  const evaluatorStarts: Array<{ card: number; starts: number }> = [];
+  let evaluatorStartCount = 0;
   for (const [cardId, links] of threadsByCard) {
-    const wakes = links.filter(
+    const starts = links.filter(
       (link) => link.role === "evaluator" && inWindow(link.startedAt, window),
     ).length;
-    evaluatorWakeCount += wakes;
-    if (wakes >= EVALUATOR_WAKES_LISTED)
-      evaluatorWakes.push({ card: byNumber.get(cardId) ?? 0, wakes });
+    evaluatorStartCount += starts;
+    if (starts >= EVALUATOR_STARTS_LISTED)
+      evaluatorStarts.push({ card: byNumber.get(cardId) ?? 0, starts });
   }
-  evaluatorWakes.sort((left, right) => right.wakes - left.wakes || left.card - right.card);
+  evaluatorStarts.sort((left, right) => right.starts - left.starts || left.card - right.card);
 
   // Open asks older than 6 hours, oldest first.
   const oldAsks: Array<{
@@ -813,9 +813,17 @@ export const rollup = (input: RollupInput) => {
     threads: {
       started,
       restarts: capped(restarts, max),
+      evaluatorStarts: {
+        count: evaluatorStartCount,
+        [`cardsWith${EVALUATOR_STARTS_LISTED}OrMore`]: capped(evaluatorStarts, max),
+      },
+      // Retained for one release for callers reading the old activity shape.
       evaluatorWakes: {
-        count: evaluatorWakeCount,
-        [`cardsWith${EVALUATOR_WAKES_LISTED}OrMore`]: capped(evaluatorWakes, max),
+        count: evaluatorStartCount,
+        [`cardsWith${EVALUATOR_STARTS_LISTED}OrMore`]: capped(
+          evaluatorStarts.map(({ card, starts }) => ({ card, wakes: starts })),
+          max,
+        ),
       },
     },
     pools: {
