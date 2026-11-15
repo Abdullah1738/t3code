@@ -103,6 +103,7 @@ class RelativeScriptReporterTests(unittest.TestCase):
                             self.check(event, 'live-database-read', harness)
 
     def test_isolated_migration_and_heredoc_controls_through_hook(self):
+        isolated_source_cases.write_migration_helpers(self.root)
         source = ROOT.parents[1] / 'apps/server/scripts/migrate-dev-db.ts'
         self.write('apps/server/scripts/migrate-dev-db.ts', source.read_text())
         self.write('package.json', json.dumps({'scripts':{'migrate-dev-db':'node apps/server/scripts/migrate-dev-db.ts'}}))
@@ -153,6 +154,7 @@ class RelativeScriptReporterTests(unittest.TestCase):
                         self.check(event, expected, harness)
 
     def test_fixture_and_migration_review_corpus_through_hooks(self):
+        isolated_source_cases.write_migration_helpers(self.root)
         backup = ROOT.parents[1] / 'integrations/memory-system/tests/test_backup_replica.sh'
         migrate = ROOT.parents[1] / 'apps/server/scripts/migrate-dev-db.ts'
         rows = [('tmp/fixture.sh', 'bash tmp/fixture.sh', row) for row in isolated_source_cases.setup_control_cases(backup.read_text())]
