@@ -1343,37 +1343,53 @@ describe("checkWait", () => {
     activeRole: "work",
   });
 
-  it.each(["ci", "push", "merge"] as const)(
-    "points the own running worker's %s wait with a PR at watch_pull_request",
-    (on) => {
-      expect(reason(running, request({ on }), worker)).toBe(
-        "denied: This card is yours and you are running, so the board can't park it. Waiting on CI for a PR: call watch_pull_request on it and end your turn; the board waits while the watch is on and the watch wakes you.",
-      );
+  it("keeps CI on watch_pull_request", () => {
+    expect(reason(running, request({ on: "ci" }), worker, true)).toContain(
+      "Waiting on CI for a PR: call watch_pull_request",
+    );
+  });
+
+  it.each([
+    { on: "merge" },
+    { on: "push", sinceHead: "abc123" },
+    { on: "time", until: "2026-11-11T12:00:00.000Z" },
+    { on: "card", card: card(2) },
+    { on: "script", script: { name: "check", found: [{ name: "check", enabled: true }] } },
+  ] satisfies Partial<WaitRequest>[])("defers the own worker's $on wait", (patch) => {
+    expect(checkWait(running, request(patch), worker, NOW, true)).toEqual({
+      ok: true,
+      deferredUntilTurnEnds: true,
+    });
+  });
+
+  it.each([
+    { patch: { note: " " }, error: "needs a one-line note" },
+    { patch: { pr: OTHER_PR }, error: "has no pull request" },
+    { patch: { pr: null }, error: "say which pull request" },
+    { patch: { on: "push", sinceHead: null }, error: "a push wait needs head" },
+    { patch: { on: "time", until: "2027-01-10T11:00:00.000Z" }, error: "more than 30 days" },
+    { patch: { on: "time", until: null }, error: "a time wait needs until" },
+    { patch: { on: "card", card: null }, error: "say which card" },
+    { patch: { on: "owner_go", ask: null }, error: "ask it first" },
+    { patch: { on: "script", script: null }, error: "a script wait names" },
+    { patch: { on: "ci", pr: null }, error: "say which pull request" },
+  ] satisfies { patch: Partial<WaitRequest>; error: string }[])(
+    "validates the own worker's wait: $error",
+    ({ patch, error }) => {
+      expect(reason(running, request(patch), worker, true)).toContain(`invalid:`);
+      expect(reason(running, request(patch), worker, true)).toContain(error);
     },
   );
 
-  it.each([
-    { on: "time", pr: null },
-    { on: "card", pr: null },
-    { on: "owner_go", pr: null },
-    { on: "script", pr: null },
-    { on: "time", pr: PR },
-    { on: "card", pr: PR },
-    { on: "owner_go", pr: PR },
-    { on: "script", pr: PR },
-    { on: "ci", pr: null },
-    { on: "push", pr: null },
-    { on: "merge", pr: null },
-    { on: "ci", pr: undefined },
-    { on: "push", pr: undefined },
-    { on: "merge", pr: undefined },
-    { on: "ci", pr: "" },
-    { on: "push", pr: "" },
-    { on: "merge", pr: "" },
-  ] as const)("points the own running worker's $on wait (pr=$pr) at its evaluator", (patch) => {
-    expect(reason(running, request(patch), worker)).toBe(
-      "denied: This card is yours and you are running, so the board can't park it. Ask your board evaluator to set this wait (card_ask with to: evaluator, giving on, until or target, and the note), then end your turn; the evaluator sets it once your run has ended.",
-    );
+  it("cannot replace another actor's flag with a deferred wait", () => {
+    expect(
+      reason(
+        { ...running, stalled: { by: owner, at: AT as never, reason: "stop" } },
+        request(),
+        worker,
+        true,
+      ),
+    ).toContain("flagged stalled by someone else");
   });
 
   it.each([
@@ -1396,10 +1412,11 @@ describe("checkWait", () => {
     );
   });
 
-  it("keeps the own-worker refusal even when the supplied thread view lags its live tool call", () => {
-    expect(reason(running, request({ on: "time", pr: null }), worker, true, false)).toBe(
-      "denied: This card is yours and you are running, so the board can't park it. Ask your board evaluator to set this wait (card_ask with to: evaluator, giving on, until or target, and the note), then end your turn; the evaluator sets it once your run has ended.",
-    );
+  it("defers even when the thread view lags the worker's live tool call", () => {
+    expect(checkWait(running, request(), worker, NOW, true, false)).toEqual({
+      ok: true,
+      deferredUntilTurnEnds: true,
+    });
   });
 
   it.each(["time", "ci", "card"] as const)(
@@ -1503,6 +1520,10 @@ describe("checkWait", () => {
     });
     expect(reason(asked, go("q1"))).toBe("ok");
     expect(reason(asked, go(null))).toBe("invalid: say which open question: q1");
+    expect(checkWait({ ...running, asks: asked.asks }, go("q1"), worker, NOW, true)).toEqual({
+      ok: true,
+      deferredUntilTurnEnds: true,
+    });
   });
 
   it("needs a note", () => {

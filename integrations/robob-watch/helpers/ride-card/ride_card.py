@@ -649,11 +649,14 @@ def preview_pending(uuid):
     return meta.get("preview") != meta.get("sig") or not (d / "preview.png").exists()
 
 
-def log_render(started, ok):
+def log_render(started, ok, *, chat=None, outcome=None, failure_code=None):
     try:
+        chat = chat if chat in ('owner', 'moni') else 'other' if chat else 'unknown'
+        outcome = outcome if outcome in ('ok', 'fallback', 'failed') else 'ok' if ok else 'failed'
+        failure_code = failure_code if failure_code in ('none', 'preview_missing', 'render_exception') else 'none' if ok else 'renderer_failed'
         env = {k: v for k, v in os.environ.items() if k != 'BUN_INSPECT'}
         child = subprocess.Popen([str(HOME / '.bun/bin/bun'), str(HOME / '.local/share/spectrum-bridge/src/cli.ts'),
-                                  'log-card-render', '--kind', 'ride', '--ms', str(max(0, (time.monotonic() - started) * 1000)), '--ok', str(ok).lower()],
+                                  'log-card-render', '--kind', 'ride', '--ms', str(max(0, (time.monotonic() - started) * 1000)), '--chat', chat, '--outcome', outcome, '--failure-code', failure_code, '--attempt', '1', '--ok', str(ok).lower()],
                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
         threading.Thread(target=child.wait, daemon=True).start()
     except Exception:
@@ -667,7 +670,11 @@ def render_preview(c, d):
         ok = _render_preview(c, d)
         return ok
     finally:
-        log_render(started, ok)
+        try:
+            log_render(started, ok, chat=bridge_slug(c.get('rider')), outcome='ok' if ok else 'fallback',
+                       failure_code='none' if ok else 'preview_missing')
+        except Exception:
+            pass
 
 
 def _render_preview(c, d):

@@ -6,22 +6,30 @@ threads around the charge, and when it's a merchant he already pays, wait for th
 the email", 24 Oct). Only a charge none of these explain goes to him.
 """
 import contextvars
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeout
 import datetime as dt
 from decimal import Decimal, InvalidOperation
-import http.client
+import importlib.util
+import itertools
 import json
 import os
 from pathlib import Path
 import re
 import signal
+import statistics
 import subprocess
+import threading
 import time
 from contextlib import contextmanager
-import urllib.error
 import urllib.parse
-import urllib.request
 from zoneinfo import ZoneInfo
 import order_lookup
+from state_json import write_json
+
+# The watcher process can already have a different helper named toollog loaded.
+_log_spec = importlib.util.spec_from_file_location('owner_texts_orders_log', Path(__file__).with_name('toollog.py'))
+toollog = importlib.util.module_from_spec(_log_spec)
+_log_spec.loader.exec_module(toollog)
 
 TZ = ZoneInfo('Asia/Dubai')
 MSGS = os.environ.get('MONEY_CASES_MSGS', str(Path('~/.local/bin/msgs').expanduser()))
@@ -116,8 +124,16 @@ class SourceLimit(Lookup):
         super().__init__(message)
 
 
-OWNER_BUDGET = 4
+OWNER_BUDGET = 10
+OWNER_REQUEST_TIMEOUT = 3
+OWNER_TIMING_KEYS = (
+    'owner_list_pages', 'owner_list_ms', 'owner_threads_selected', 'owner_threads_fresh',
+    'owner_threads_needed', 'owner_threads_fetched', 'owner_fetch_ms_max', 'owner_timeouts', 'owner_cache_size')
+OWNER_REQUEST_LIMIT = 64
+OWNER_CACHE_VERSION = 2
+_OWNER_STATS_LOCK = threading.Lock()
 MSGS_BUDGET = 2
+RECEIPT_BUDGET = 4
 
 
 TIMING_STATS = contextvars.ContextVar('money_cases_timing_stats', default=None)
@@ -128,22 +144,26 @@ _TIMING_STACK = contextvars.ContextVar('money_cases_timing_stack', default=())
 def step_timing(stats, name, deadline=None):
     stats = stats if stats is not None else TIMING_STATS.get()
     started = time.monotonic()
-    stack = _TIMING_STACK.get()
-    frame = {'stats': stats, 'children': 0.0}
-    token = _TIMING_STACK.set((*stack, frame))
-    alarm = signal.getitimer(signal.ITIMER_REAL)[0]
-    if alarm:
-        enclosing = time.time() + alarm
-        deadline = min(deadline, enclosing) if deadline is not None else enclosing
+    stack = tuple(frame for frame in _TIMING_STACK.get() if frame.get('active'))
+    frame = {'stats': stats, 'children': 0.0, 'name': name, 'active': True, 'deadline': deadline}
     error = None
     try:
+        _TIMING_STACK.set((*stack, frame))
+        alarm = signal.getitimer(signal.ITIMER_REAL)[0]
+        if alarm:
+            enclosing = time.time() + alarm
+            deadline = min(deadline, enclosing) if deadline is not None else enclosing
+        frame['deadline'] = deadline
         yield
     except BaseException as exc:
         error = exc
         raise
     finally:
+        # A signal can interrupt setup or even the final clock sample. Restore
+        # the source context first so later calls cannot inherit a dead frame.
+        frame['active'] = False
+        _TIMING_STACK.set(stack)
         elapsed = (time.monotonic() - started) * 1000
-        _TIMING_STACK.reset(token)
         if stack and stack[-1]['stats'] is stats:
             stack[-1]['children'] += elapsed
         if stats is not None:
@@ -301,6 +321,7 @@ def left(deadline, cap):
 
 
 def msgs(argv, deadline, cap, memo=None, stats=None):
+    stats = stats if stats is not None else TIMING_STATS.get()
     key = tuple(argv)
     if memo is not None and key in memo:
         result = memo[key]
@@ -310,19 +331,55 @@ def msgs(argv, deadline, cap, memo=None, stats=None):
     timeout = left(deadline, min(cap, MSGS_BUDGET))
     if stats is not None:
         stats['msgs_calls'] += 1
+    started = time.monotonic()
+    called_at = time.time()
+    stop = called_at + timeout
+    alarm = signal.getitimer(signal.ITIMER_REAL)[0]
+    if alarm:
+        stop = min(stop, time.time() + alarm)
+    timed_out = False
     try:
         with step_timing(stats, 'msgs', time.time() + timeout):
             done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
         if done.returncode:
             raise Lookup(f'msgs exit {done.returncode}: {done.stderr.strip()[:200]}')
     except (OSError, subprocess.TimeoutExpired, Lookup) as e:
+        timed_out = isinstance(e, subprocess.TimeoutExpired) or getattr(e, '_money_cases_timeout', False)
         error = e if isinstance(e, Lookup) else Lookup(f'msgs: {e}')
         if memo is not None:
             memo[key] = error
         raise error from e
+    except BaseException as exc:
+        timed_out = getattr(exc, '_money_cases_timeout', False)
+        raise
+    finally:
+        if stats is not None:
+            elapsed = round((time.monotonic() - started) * 1000)
+            stats.setdefault('_msgs_samples_ms', []).append(elapsed)
+            stats['msgs_timeouts'] = stats.get('msgs_timeouts', 0) + int(
+                timed_out or time.time() >= stop)
+            names = {frame['name'] for frame in _TIMING_STACK.get()
+                     if frame.get('active') and frame['stats'] is stats
+                     and (frame['deadline'] is None or called_at < frame['deadline'])}
+            kind = 'receipt' if 'receipt' in names else 'order' if names & {
+                'order_charges', 'lookups', 'order_screen'} else 'other'
+            bucket = stats.setdefault('msgs_by_kind', {}).setdefault(kind, {'count': 0, 'ms': 0})
+            bucket['count'] += 1
+            bucket['ms'] += elapsed
     if memo is not None:
         memo[key] = done
     return done
+
+
+def receipt_timing(stats):
+    """Bounded metadata only, including defaults for checks without archive work."""
+    samples = stats.get('_msgs_samples_ms', [])
+    return {'msgs_timeouts': stats.get('msgs_timeouts', 0),
+            'msgs_p50_ms': round(statistics.median(samples)) if samples else 0,
+            'msgs_by_kind': {kind: {key: stats.get('msgs_by_kind', {}).get(kind, {}).get(key, 0)
+                                    for key in ('count', 'ms')} for kind in ('receipt', 'order', 'other')},
+            'receipt_result': {key: stats.get('receipt_result', {}).get(key, 0)
+                               for key in ('found', 'none', 'out_of_time', 'error')}}
 
 
 def day(t):
@@ -374,6 +431,7 @@ def within(deadline, error):
     started = time.monotonic()
 
     def expired(*_):
+        error._money_cases_timeout = True
         raise error
 
     signal.signal(signal.SIGALRM, expired)
@@ -423,78 +481,290 @@ def control_config():
 
 def control_get(config, path, params, deadline, stats=None):
     url, token = config
+    timeout = left(deadline, OWNER_REQUEST_TIMEOUT)
+    listed = path == '/threads'
+    started = time.monotonic()
+    if stats is not None:
+        with _OWNER_STATS_LOCK:
+            stats['owner_queries'] = stats.get('owner_queries', 0) + 1
+            if listed:
+                stats['owner_list_pages'] = stats.get('owner_list_pages', 0) + 1
     try:
-        timeout = left(deadline, 3)
-        request = urllib.request.Request(url + path + '?' + urllib.parse.urlencode(params),
-                                         headers={'Authorization': 'Bearer ' + token})
-        if stats is not None:
-            stats['owner_queries'] += 1
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            result = json.load(response)
+        # Curl's wall-clock limit covers DNS, connect/TLS, headers and body. The
+        # subprocess timeout also kills and reaps it if its resolver gets stuck.
+        # Disable curlrc and pass the credential on stdin, never in argv or errors.
+        done = subprocess.run(['/usr/bin/curl', '-q', '--config', '-', '--silent', '--fail',
+                               '--proto', '=http,https', '--max-time', str(timeout),
+                               '--url', url + path + '?' + urllib.parse.urlencode(params)],
+                              input=('header = ' + json.dumps('Authorization: Bearer ' + token) + '\n').encode(),
+                              capture_output=True, timeout=timeout)
+        if done.returncode == 28:
+            raise subprocess.TimeoutExpired('Robob control', timeout)
+        if done.returncode:
+            raise Lookup('Robob control: request failed or timed out')
+        result = json.loads(done.stdout)
         if not isinstance(result, dict) or result.get('ok') is not True:
             raise Lookup('Robob control: invalid response')
         return result
-    except urllib.error.HTTPError as e:
-        e.close()
-        raise Lookup(f'Robob control: HTTP {e.code}') from None
-    except (OSError, urllib.error.URLError, http.client.HTTPException, ValueError):
+    except subprocess.TimeoutExpired:
+        if stats is not None:
+            with _OWNER_STATS_LOCK:
+                stats['owner_timeouts'] = stats.get('owner_timeouts', 0) + 1
+        raise Lookup('Robob control: request failed or timed out') from None
+    except (OSError, ValueError):
         # Neither a server error body nor a request/credential repr belongs in pings.json.
         raise Lookup('Robob control: request failed or timed out') from None
+    finally:
+        if stats is not None:
+            elapsed = round((time.monotonic() - started) * 1000)
+            with _OWNER_STATS_LOCK:
+                if listed:
+                    stats['owner_list_ms'] = stats.get('owner_list_ms', 0) + elapsed
+                else:
+                    stats['owner_fetch_ms_max'] = max(stats.get('owner_fetch_ms_max', 0), elapsed)
 
 
-def owner_texts(since, until, deadline=None, stats=None):
-    """His app/iMessage typing, fetched once per check within a four-second total cap."""
-    stop = time.time() + (4 if deadline is None else min(4, left(deadline, 4) - 0.5))
-    with within(stop, Lookup('Robob control: lookup over time')):
+def owner_time(value):
+    parsed = dt.datetime.fromisoformat(value.replace('Z', '+00:00'))
+    if parsed.tzinfo is None:
+        raise ValueError('timestamp missing zone')
+    return parsed
+
+
+def owner_cache(path, cache_reset=None):
+    try:
+        cache = json.loads(path.read_text())
+        if not isinstance(cache, dict):
+            raise ValueError()
+        for tid, entry in cache.items():
+            if not isinstance(tid, str) or not tid or not isinstance(entry, dict):
+                raise ValueError()
+            # Earlier delta caches could mark redacted text as current.
+            if type(entry.get('version')) is not int or entry['version'] != OWNER_CACHE_VERSION:
+                raise ValueError()
+            owner_time(entry['updatedAt'])
+            owner_time(entry['coveredFrom'])
+            if not isinstance(entry['title'], str) or not isinstance(entry['texts'], list):
+                raise ValueError()
+            for row in entry['texts']:
+                if not isinstance(row['messageId'], str) or not row['messageId'] \
+                        or not isinstance(row['text'], str) or row['title'] != entry['title']:
+                    raise ValueError()
+                owner_time(row['createdAt'])
+        return cache
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        if cache_reset is not None:
+            cache_reset()
+        else:
+            toollog.emit('money-cases', 'cache_reset')
+        return {}
+
+
+def save_owner_cache(path, cache, since, until):
+    # Keep fourteen days, extending to this call's oldest followed question so
+    # unanswered older questions can warm up too. No cases-data lock is needed:
+    # this atomic private file is independent of cases.json/questions.json.
+    cutoff = min(since, until - dt.timedelta(days=14))
+    kept = {}
+    for tid, entry in cache.items():
+        if owner_time(entry['updatedAt']) < cutoff:
+            continue
+        kept[tid] = {**entry, 'coveredFrom': max(cutoff, owner_time(entry['coveredFrom'])).isoformat(),
+                     'texts': [row for row in entry['texts'] if owner_time(row['createdAt']) >= cutoff]}
+    try:
+        write_json(path, kept)
+        return len(kept)
+    except OSError:
+        raise Lookup('Robob control: owner cache save failed') from None
+
+
+def owner_texts(since, until, deadline=None, stats=None, cache_path=None, cache_reset=None):
+    """His app/iMessage typing, fetched once per check within its own total cap."""
+    if stats is not None:
+        for key in OWNER_TIMING_KEYS:
+            stats.setdefault(key, 0)
+        stats['owner_result'] = 'list_failed'
+    stop = time.time() + (OWNER_BUDGET if deadline is None
+                          else min(OWNER_BUDGET, left(deadline, OWNER_BUDGET) - 0.5))
+    alarm = signal.getitimer(signal.ITIMER_REAL)[0]
+    if alarm:
+        stop = min(stop, time.time() + alarm - 0.5)
+    error = Lookup('Robob control: owner read incomplete; continuing next check (out of time)')
+    with within(stop, error):
+        # Stop network work early enough to persist completed threads. The outer
+        # deadline also bounds cache reads, fsync, pruning and result assembly.
+        rows = _owner_texts(since, until, stats, cache_path, cache_reset, stop - 0.25)
+        if time.time() >= stop:
+            raise error
+        if stats is not None:
+            stats['owner_result'] = 'ok'
+        return rows
+
+
+def _owner_texts(since, until, stats, cache_path, cache_reset, stop):
+    with within(stop, Lookup('Robob control: incomplete thread list')):
         config = control_config()
         # The API's since filter is strict on updatedAt; include messages created exactly at since.
         start = iso(since - dt.timedelta(milliseconds=1))
-        result = control_get(config, '/threads', {'updatedSince': start, 'limit': 500,
-                             'includeSubagents': 'true'}, stop, stats)
-        threads = result.get('threads')
-        if not isinstance(threads, list):
-            raise Lookup('Robob control: invalid thread list')
+        threads = {}
+        requests = stats.get('owner_queries', 0) if stats is not None else 0
+        # He replies in app-created threads and MCP-launched top-level threads
+        # (t3_thread_launch/create_threads stamp mcp), plus the iMessage bridge.
+        # Server-created board workers/reviews and subagents are not owner chats.
+        for kind in ({'creationSource': ','.join((*APP_SOURCES, 'mcp'))}, {'origin': 'imessage'}):
+            params = {'updatedSince': start, 'limit': 500, **kind}
+            cursors, ids = set(), set()
+            while True:
+                if requests >= OWNER_REQUEST_LIMIT:
+                    raise Lookup('Robob control: incomplete thread list')
+                requests += 1
+                result = control_get(config, '/threads', params, stop, stats)
+                page, total = result.get('threads'), result.get('total')
+                if not isinstance(page, list):
+                    raise Lookup('Robob control: invalid thread list')
+                if type(total) is not int or total < len(page):
+                    raise Lookup('Robob control: invalid thread count')
+                for thread in page:
+                    if not isinstance(thread, dict):
+                        raise Lookup('Robob control: invalid thread')
+                    tid = thread.get('threadId')
+                    if not isinstance(tid, str) or not tid:
+                        raise Lookup('Robob control: missing thread id')
+                    ids.add(tid)
+                    threads[tid] = thread
+                cursor = result.get('nextCursor')
+                if cursor is None:
+                    if total != len(ids):
+                        raise Lookup('Robob control: incomplete thread list')
+                    break
+                if not isinstance(cursor, str) or not cursor or cursor in cursors or not page:
+                    raise Lookup('Robob control: incomplete thread list')
+                cursors.add(cursor)
+                params['cursor'] = cursor
+
+    if stats is not None:
+        stats['owner_result'] = 'incomplete'
+    path = Path(cache_path) if cache_path is not None else Path(os.environ.get(
+        'MONEY_CASES_DIR', '~/Documents/assistant/money-cases')).expanduser() / 'owner-texts.json'
+    cache = owner_cache(path, cache_reset)
+    if stats is not None:
+        stats['owner_cache_size'] = len(cache)
+
+    def read_thread(thread):
+        title = str(thread.get('title') or '')
+        tid = thread['threadId']
+        prior = cache.get(tid)
+        # Redaction can change text without advancing the message's updatedAt.
+        # A delta cannot validate retained texts, even when it contains new turns.
+        # Replace the covered span on every thread change; unchanged threads stay cheap.
+        read_from = min(since, owner_time(prior['coveredFrom'])) if prior else since
+        result = control_get(config, '/threads/' + urllib.parse.quote(tid, safe='') + '/messages',
+                             {'since': iso(read_from - dt.timedelta(milliseconds=1)),
+                              'role': 'user', 'all': 'true'}, stop, stats)
+        messages = result.get('messages')
+        if not isinstance(messages, list):
+            raise Lookup('Robob control: invalid message list')
         total = result.get('total')
         if type(total) is not int or total < 0:
-            raise Lookup('Robob control: invalid thread count')
-        if total != len(threads):
-            raise Lookup('Robob control: incomplete thread list')
-        out = []
-        for thread in threads:
-            if not isinstance(thread, dict):
-                raise Lookup('Robob control: invalid thread')
-            title = str(thread.get('title') or '')
-            if thread.get('archived') or re.match(r'(?:Moni|Group)\b', title):
+            raise Lookup('Robob control: invalid message count')
+        if total != len(messages):
+            raise Lookup('Robob control: incomplete message list')
+        out = {}
+        for message in messages:
+            if time.time() >= stop:
+                raise Lookup('Robob control: lookup over time')
+            if not isinstance(message, dict):
+                raise Lookup('Robob control: invalid message')
+            if message.get('role') != 'user':
                 continue
-            tid = thread.get('threadId')
-            if not isinstance(tid, str) or not tid:
-                raise Lookup('Robob control: missing thread id')
-            result = control_get(config, '/threads/' + urllib.parse.quote(tid, safe='') + '/messages',
-                                 {'since': start, 'role': 'user', 'all': 'true'}, stop, stats)
-            messages = result.get('messages')
-            if not isinstance(messages, list):
-                raise Lookup('Robob control: invalid message list')
-            total = result.get('total')
-            if type(total) is not int or total < 0:
-                raise Lookup('Robob control: invalid message count')
-            if total != len(messages):
-                raise Lookup('Robob control: incomplete message list')
-            for message in messages:
-                if not isinstance(message, dict):
-                    raise Lookup('Robob control: invalid message')
-                if message.get('role') != 'user':
-                    continue
-                # Reject old summaries before accepting any rows, including app-typed turns.
-                typed = owner_turn(message, title)
-                try:
-                    created = dt.datetime.fromisoformat(message['createdAt'].replace('Z', '+00:00'))
-                    in_window = since <= created <= until
-                except (KeyError, ValueError, TypeError, AttributeError):
-                    raise Lookup('Robob control: invalid message timestamp') from None
-                text = str(message.get('text') or '')
-                if in_window and typed and not text.startswith('[Forwarded by'):
-                    out.append((iso(created), text, title))
-        return sorted(out, key=lambda row: row[0], reverse=True)
+            # Reject old summaries before accepting any rows, including app-typed turns.
+            typed = owner_turn(message, title)
+            try:
+                created = owner_time(message['createdAt'])
+            except (KeyError, ValueError, TypeError, AttributeError):
+                raise Lookup('Robob control: invalid message timestamp') from None
+            text = str(message.get('text') or '')
+            mid = message.get('messageId')
+            if not isinstance(mid, str) or not mid:
+                raise Lookup('Robob control: message id unavailable; server update required')
+            out.pop(mid, None)
+            if created >= read_from and typed and not text.startswith('[Forwarded by'):
+                out[mid] = {'messageId': mid, 'createdAt': iso(created), 'text': text, 'title': title}
+        # Preserve the caller's precision: rounding down would claim an unread
+        # fractional millisecond when a later call moves its window earlier.
+        return {'version': OWNER_CACHE_VERSION, 'updatedAt': thread['updatedAt'], 'coveredFrom': read_from.isoformat(),
+                'title': title, 'texts': list(out.values())}
+
+    selected = []
+    for thread in threads.values():
+        title = str(thread.get('title') or '')
+        if thread.get('archived') or re.match(r'(?:Moni|Group)\b', title):
+            continue
+        try:
+            owner_time(thread['updatedAt'])
+        except (KeyError, ValueError, TypeError, AttributeError):
+            raise Lookup('Robob control: thread updatedAt unavailable; server update required') from None
+        selected.append(thread)
+    selected.sort(key=lambda thread: owner_time(thread['updatedAt']), reverse=True)
+    covered, needed = set(), []
+    for thread in selected:
+        prior = cache.get(thread['threadId'])
+        if prior and prior['updatedAt'] == thread['updatedAt'] and prior['title'] == str(thread.get('title') or '') \
+                and owner_time(prior['coveredFrom']) <= since:
+            covered.add(thread['threadId'])
+        else:
+            needed.append(thread)
+    # Give uncached spans and changed threads a share of every request window.
+    # Each queue retains newest-first order; churn cannot starve older cold spans.
+    full, changed = [], []
+    for thread in needed:
+        prior = cache.get(thread['threadId'])
+        (full if prior is None or owner_time(prior['coveredFrom']) > since else changed).append(thread)
+    needed = [thread for pair in itertools.zip_longest(full, changed) for thread in pair if thread is not None]
+    if stats is not None:
+        stats['owner_threads_selected'] = len(selected)
+        stats['owner_threads_fresh'] = len(covered)
+        stats['owner_threads_needed'] = len(needed)
+    errors = []
+    pool = ThreadPoolExecutor(max_workers=6)
+    futures = {}
+    try:
+        futures = {pool.submit(read_thread, thread): thread['threadId']
+                   for thread in needed[:max(0, OWNER_REQUEST_LIMIT - requests)]}
+        for future in as_completed(futures, timeout=max(0.001, stop - time.time())):
+            # Harvest after shutdown, including successes behind a stalled read.
+            pass
+    except FutureTimeout:
+        pass
+    finally:
+        # SIGALRM during Thread.join can strand Python 3.9's thread-state lock.
+        # Requests kill/reap themselves; reserve cleanup time before any enclosing alarm.
+        pool.shutdown(wait=True, cancel_futures=True)
+    # If a changed thread fails, don't persist its unvalidated previous texts.
+    for thread in needed:
+        cache.pop(thread['threadId'], None)
+    for future, tid in futures.items():
+        if future.cancelled():
+            continue
+        try:
+            cache[tid] = future.result()
+            covered.add(tid)
+            if stats is not None:
+                stats['owner_threads_fetched'] += 1
+        except Lookup as exc:
+            errors.append(exc)
+    size = save_owner_cache(path, cache, since, until)
+    if stats is not None:
+        stats['owner_cache_size'] = size
+    if len(covered) != len(selected):
+        detail = ': ' + str(errors[0]) if errors else ''
+        raise Lookup(f'Robob control: owner read incomplete ({len(covered)} of {len(selected)} threads); '
+                     f'continuing next check{detail}')
+    out = [(row['createdAt'], row['text'], row['title']) for thread in selected
+           for row in cache[thread['threadId']]['texts'] if since <= owner_time(row['createdAt']) <= until]
+    return sorted(out, key=lambda row: row[0], reverse=True)
 
 
 def show(row, deadline=None, memo=None, stats=None):
@@ -565,7 +835,11 @@ def receipt(charge, at, now, find=None, deadline=None, read=None, memo=None, sta
     and reads as a receipt, and either names the merchant (from two hours before to 36 hours after) or,
     under another name, shows the card's last four digits within 15 minutes of it. Search hits are
     checked against the mail itself."""
-    options = {'memo': memo, 'stats': stats} if memo is not None else {}
+    options = {}
+    if memo is not None:
+        options['memo'] = memo
+    if stats is not None:
+        options['stats'] = stats
     find = find or (lambda *a, **kw: search(*a, **kw, **options))
     read = read or (lambda row, deadline: show(row, deadline, **options))
     amount = ' OR '.join(f'"{v}"' for v in amounts(charge))
@@ -747,20 +1021,40 @@ def found(charge, at, now, deadline=None, find=None, said=None, errors=None, mem
     """A receipt or his own words that explain the charge, or None."""
     errors = [] if errors is None else errors
     limits = [] if limits is None else limits
+    receipt_result = 'error'
+    receipt_end = time.time()
     try:
-        # Mail must leave a slice for order history, including when a custom
-        # finder ignores its timeout. The enclosing question alarm stays earlier.
-        mail_end = time.time() + MSGS_BUDGET
+        # Several fast searches/reads can exhaust a two-second scan. Keep the
+        # per-process cap, but allow four seconds inside the six-second question,
+        # leaving two for order history even when a finder ignores its timeout.
+        mail_end = time.time() + RECEIPT_BUDGET
         if deadline is not None:
             mail_end = min(mail_end, deadline)
+        receipt_end = mail_end
+        alarm = signal.getitimer(signal.ITIMER_REAL)[0]
+        if alarm:
+            receipt_end = min(receipt_end, time.time() + alarm)
         with step_timing(stats, 'receipt', mail_end), within(mail_end, Lookup('receipt lookup over time')):
             row = receipt(charge, at, now, find, mail_end, memo=memo, stats=stats, receipt_ok=receipt_ok)
+        receipt_result = 'found' if row else 'none'
         if row:
             when = dt.datetime.fromtimestamp(row['ts'], TZ).strftime('%a %d %b %H:%M')
             return {'verdict': 'receipt', 'why': f"receipt {when}: {row.get('sender', '')} - {row.get('subject', '')}"[:200],
                     'msgs': row.get('id'), 'errors': errors}
     except Lookup as e:
+        receipt_result = 'out_of_time' if getattr(e, '_money_cases_timeout', False) or \
+            time.time() >= receipt_end or 'out of time' in str(e) or \
+            'over time' in str(e) or isinstance(e.__cause__, subprocess.TimeoutExpired) else 'error'
         errors.append(f'receipt: {e}')
+    except BaseException as exc:
+        if getattr(exc, '_money_cases_timeout', False) or time.time() >= receipt_end:
+            receipt_result = 'out_of_time'
+        raise
+    finally:
+        target = stats if stats is not None else TIMING_STATS.get()
+        if target is not None:
+            counts = target.setdefault('receipt_result', {})
+            counts[receipt_result] = counts.get(receipt_result, 0) + 1
     try:
         hit = order_receipt(charge, at, now, deadline, memo=memo, stats=stats)
         if hit:

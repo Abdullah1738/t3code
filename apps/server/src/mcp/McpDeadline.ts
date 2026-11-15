@@ -1,12 +1,16 @@
 import { OrchestratorMcpFailure, type ThreadId } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
+import type * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import { failedPhase } from "../ardud/analytics/McpCall.ts";
+import { delegationCreateFailure } from "../ardud/orchestration/delegationCreateFailure.ts";
 const isOrchestratorMcpFailure = Schema.is(OrchestratorMcpFailure);
+
+export const OPERATION_TIMEOUT = "10 seconds";
 
 class PendingWait extends Context.Service<PendingWait, { wait: string; since: bigint }>()(
   "t3/mcp/McpDeadline/PendingWait",
@@ -43,12 +47,19 @@ export const awaitInterruptibly = Effect.fn("McpDeadline.awaitInterruptibly")(fu
     );
   }
   let capped = false;
+  const wait = yield* Effect.serviceOption(PendingWait);
   const logOutcome = Effect.fn("McpDeadline.detachedOutcome")(
-    (outcome: "committed" | "failed" | "capped") =>
+    (outcome: "committed" | "failed" | "capped", cause?: Cause.Cause<E>) =>
       Effect.logInfo("MCP detached operation finished", {
         outcome,
         requestKey: detached.requestKey ?? "unknown",
         taskId: detached.taskId ?? "unknown",
+        ...(cause === undefined
+          ? {}
+          : {
+              cause: delegationCreateFailure(cause),
+              ...(Option.isSome(wait) ? { wait: wait.value.wait } : {}),
+            }),
         ...(outcome === "capped"
           ? { cancellationPending: true }
           : capped
@@ -59,7 +70,9 @@ export const awaitInterruptibly = Effect.fn("McpDeadline.awaitInterruptibly")(fu
   // A create owns its lifetime after the waiter leaves, including client disconnects.
   const pending = yield* Effect.forkDetach(
     effect.pipe(
-      Effect.onExit((exit) => logOutcome(exit._tag === "Success" ? "committed" : "failed")),
+      Effect.onExit((exit) =>
+        exit._tag === "Success" ? logOutcome("committed") : logOutcome("failed", exit.cause),
+      ),
     ),
   );
   yield* Fiber.await(pending).pipe(
@@ -97,14 +110,14 @@ export const withDeadline = Effect.fnUntraced(function* <A, E, R>(
     outer._tag === "Some" ? outer.value : { wait: input.wait ?? input.stage, since: startedAt };
   return yield* effect.pipe(
     Effect.onError(() => failedPhase(input.stage)),
-    Effect.provideService(PendingWait, pending),
     (operation) =>
       awaitInterruptibly(
         operation,
         input.onTimeout === "detach" ? { ...input, onTimeout: "detach" } : undefined,
       ),
+    Effect.provideService(PendingWait, pending),
     Effect.timeoutOrElse({
-      duration: "10 seconds",
+      duration: OPERATION_TIMEOUT,
       orElse: Effect.fn("McpDeadline.expired")(function* () {
         yield* failedPhase(input.stage);
         const now = yield* Clock.monotonicTimeNanos;

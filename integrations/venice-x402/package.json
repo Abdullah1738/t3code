@@ -1,0 +1,20 @@
+{
+  "name": "venice-x402",
+  "private": true,
+  "type": "module",
+  "description": "Local OpenAI-compatible proxy that pays Venice AI per request via x402 (USDC on Base)",
+  "bin": {
+    "venice-x402": "cli.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@x402/core": "2.30.0",
+    "@x402/evm": "2.30.0",
+    "viem": "2.57.16"
+  }
+}

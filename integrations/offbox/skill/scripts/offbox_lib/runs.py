@@ -23,7 +23,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from . import home, api, capacity, identity, lease, node_tools, node_version, package_manager, pnpm_version, pool, ssh_sync, run_evidence
-from . import command_usage, common, containers, prune, prepare, userns
+from . import command_usage, common, containers, java_version, prune, prepare, userns
 from . import resources
 from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_LOCAL, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
                      RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError, atomic_write_json, db, db_retry, event, file_lock, local_error, log, new_id, now,
@@ -1201,7 +1201,7 @@ def confirmed_lost(box_id: str, run_id: str, timeout: float = 20, *, record: boo
 
 
 def reconcile_lost(con, box_id: str, timeout: float = 20, state: str | None = None,
-                   until: float | None = None) -> None:
+                   until: float | None = None, *, foreign: bool = False) -> None:
     """Under box-<id>: repair old lost rows before following or handing their box to another run."""
     rows = con.execute("SELECT * FROM runs WHERE box_id=? AND status='lost' AND exit_code IS NULL "
                        "AND NOT EXISTS (SELECT 1 FROM kv WHERE k='lost_confirmed:' || runs.run_id)",
@@ -1250,7 +1250,7 @@ def reconcile_lost(con, box_id: str, timeout: float = 20, state: str | None = No
                     say(wedged_message(box_id, *wedged))
                     continue
             if st and row['pulls']:
-                do_pulls(box_id, dict(row), json.loads(row['pulls']), until=until)
+                do_pulls(box_id, dict(row), json.loads(row['pulls']), until=until, foreign=foreign)
             if until is not None and now() >= until:
                 raise OffboxError(f"lost reconciliation timed out on {box_id}", code=EXIT_WAIT_TIMEOUT, started=True)
             if st:
@@ -1299,6 +1299,7 @@ def containers_seen(box_id: str, run_id: str, timeout: float = 10) -> bool:
 def settle_docker(con, run, status: str, timeout: float = 10) -> None:
     """A run that only mentioned Docker (command or manifest) and started no container loses runs.docker, so its
     box gets the ordinary idle window. Runs that didn't end normally keep it."""
+    java_version.record(con, run, LOGS_DIR / (run["run_id"] + ".log"), api.BACKEND)
     started = time.monotonic()
     if status in ('done', 'failed', 'killed', 'lost', 'interrupted', 'infra'):
         containers.record(con, run, BOUNDED_PROCESS, timeout=timeout)
@@ -1408,7 +1409,9 @@ def report_exit(cmd: str, code: int | None, step_res: list[tuple[int, int]] | No
         say("exit 1 may be from the trailing grep (no match) or an earlier stage. Use --step for each command.")
     if code == 137 or any(rc == 137 for _, rc in (step_res or [])):
         say("exit 137 = the box killed the command for memory. Rerun with --size xlarge.")
-    if where == "remote" and deps_hint and (code not in (0, None) or any(rc != 0 for _, rc in (step_res or []))):
+    failed_code = next((rc for _, rc in (step_res or []) if rc), code)
+    if (where == "remote" and code != 127 and failed_code != 127 and deps_hint
+            and (code not in (0, None) or any(rc != 0 for _, rc in (step_res or [])))):
         say(deps_hint)
     if code is None:
         hint = f"; inspect with offbox ssh {box_id}" if box_id else ""
@@ -1441,7 +1444,7 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
                   steps: list[str] | None = None, node: str = "", wait_images: bool = False,
                   image_wait: int = 180, repo_key: str = "", repo_root: Path | None = None,
                   preserve_containers: str = 'private lease', box_id: str = "<box>",
-                  usage: command_usage.Usage | None = None) -> str:
+                  usage: command_usage.Usage | None = None, template: str = "") -> str:
     cmd = steps_block(steps) if steps else command_block(
         argv[0] if len(argv) == 1 else " ".join(shlex.quote(a) for a in argv))
     if api.BACKEND == 'server':
@@ -1475,8 +1478,11 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
         log_probe_error(run_id, offbox_disk_space.PROBE_PAYLOAD_ERROR)
     probe = '__obprobe'
     deps_check = (f'__offbox_exit=$?; {probe} end "$__obsw" || '
-                  '{ echo "offbox-space-probe-error: end probe failed (exit $?)" >&2; }; if [ "${__offbox_command_started:-0}" = 1 ] '
-                  f'&& [ "$__offbox_exit" -ne 0 ] && [ {int(usage.uses_js)} = 1 ] '
+                  '{ echo "offbox-space-probe-error: end probe failed (exit $?)" >&2; }; '
+                  'if [ "${__offbox_command_started:-0}" = 1 ] && [ "$__offbox_exit" = 127 ]; then '
+                  'printf \'%s\\n\' \'offbox: exit 127: a command was not found on this box (see the "…: command not found" line above)\' >&2; fi; '
+                  f'if [ "${{__offbox_command_started:-0}}" = 1 ] '
+                  f'&& [ "$__offbox_exit" -ne 0 ] && [ "$__offbox_exit" -ne 127 ] && [ {int(usage.uses_js)} = 1 ] '
                   f'&& [ -f {root}/package.json ] && [ ! -e {root}/node_modules ] '
                   f'; then __offbox_deps_context=; {missing}; '
                   f'if [ -n "$__offbox_deps_context" ]; then {advice}; fi; fi; '
@@ -1504,6 +1510,8 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
               f"_offbox_needs_go={int(usage.needs_go)}\n{GO_REPAIR}",
               node,
               node_tools.block(rdir, repo_root),
+              java_version.block(java_version.trigger(repo_root or Path.cwd(), rel, argv, steps,
+                                                       repo_key=repo_key, template=template)),
               ('''for _offbox_tool in terraform aws ruby vector gh; do
   command -v "$_offbox_tool" >/dev/null || {
     echo "offbox: required tool missing on command PATH: $_offbox_tool" >&2
@@ -1696,11 +1704,12 @@ class Runner:
             node_block += "\n" + pnpm_version.block(pm)
         usage = command_usage.inspect(self.root, self.rel, a.cmd, steps)
 
-        def build_command(rdir, box, preserve):
+        def build_command(rdir, box, preserve, source=""):
+            template = a.template or (source.split(":", 1)[1] if source.startswith(("template:", "recipe:")) else "")
             script = remote_script(rdir, self.rel, a.cmd, env_file, self.run_id, steps=steps or None,
                                    node=node_block, wait_images=wait_images, image_wait=image_wait_seconds(),
                                    repo_key=me["repo_key"], repo_root=self.root,
-                                   preserve_containers=preserve, box_id=box, usage=usage)
+                                   preserve_containers=preserve, box_id=box, usage=usage, template=template)
             command, path = command_payload(script, self.run_id, claim_id=claim)
             return command, path, script.encode()
 
@@ -1725,7 +1734,7 @@ class Runner:
             self.record(box_id=self.box, size=row["size"], remote_dir=rdir, setup_s=round(now() - t0, 2),
                         docker=int(lease.uses_docker(cmd_text, me["repo_root"])))
             command, self.command_file, self.command_body = build_command(
-                rdir, self.box, containers.preserve_reason(con, row))
+                rdir, self.box, containers.preserve_reason(con, row), row.get("source", ""))
             self.record(cmd_bytes=len(command.encode()), cmd_via='file' if self.command_file else 'argv')
             keeper_scope = None
             if row.get('_prepare_end') is None:
@@ -2167,6 +2176,8 @@ def _status_code(st: dict) -> int | None:
     and None (boat lost the process, or gave no code) sends the caller to recover_lost_exit."""
     if st.get("status") == "lost":
         return None
+    if st.get('status') == 'interrupted' and st.get('running') is not True:
+        return EXIT_INTERRUPTED
     if st.get("exitCode") is not None:
         return st.get("exitCode")
     return 128 + 15 if st.get("signal") else None
@@ -2187,6 +2198,7 @@ def _ended(box_id: str, pid: int, until: float | None, run_id: str | None = None
         st = api.cmd_status(box_id, pid, timeout=left, retries=0, deadline=until)
     except OffboxError:
         return None
+    remember_interruption(run_id, st)
     if st and not st.get("running") and st.get("status") in ("exited", "lost", "interrupted"):
         if st.get('status') == 'lost' and run_id:
             try:
@@ -2198,15 +2210,72 @@ def _ended(box_id: str, pid: int, until: float | None, run_id: str | None = None
     return None
 
 
-class Interrupted(OffboxError):
-    """Our server lost power (or was restarted hard) under the run, and the run is not being run again: it was
-    started with retry off, or it had already been retried once. Its own exit code does not exist."""
+def interruption_info(status):
+    if not isinstance(status, dict):
+        return None
+    data = status.get('command') if isinstance(status.get('command'), dict) else status
+    info = data.get('interruption')
+    if not isinstance(info, dict) or not info:
+        metrics = data.get('metrics')
+        info = metrics.get('interruption') if isinstance(metrics, dict) else None
+    return dict(info) if isinstance(info, dict) and info else None
 
-    def __init__(self, what: str):
-        super().__init__(f"the offbox server restarted while {what} was running, and the run was not run again. "
-                         f"It did not finish; its output up to the restart is kept (offbox logs). "
-                         f"Run it again if that is safe (exit {EXIT_INTERRUPTED})", code=EXIT_INTERRUPTED,
-                         started=True)
+
+def remember_interruption(run_id, status):
+    info = interruption_info(status)
+    if (run_id and info is not None and
+            read_json(LOGS_DIR / f'{run_id}.state.json', {}).get('interruption') != info):
+        try:
+            save_run_state(run_id, interruption=info)
+        except OSError as error:
+            say(f"warning: {run_id}: could not save interruption details ({error})")
+    return info
+
+
+def cleanup_summary(info):
+    if info.get('cleanup') == 'clean' and type(info.get('leftover_killed')) is int and info['leftover_killed'] == 0:
+        return 'cleanup: clean'
+    count = info.get('leftover_killed')
+    if info.get('cleanup') == 'stopped' and type(count) is int and count >= 0:
+        return f'cleanup: {count} stopped'
+    if type(count) is int and count > 0:
+        return f'cleanup: unknown; {count} leftover processes were stopped'
+    return 'cleanup: unknown'
+
+
+def interruption_message(what, info, box=None):
+    cause = info.get('cause') or 'server_restart'
+    box = box or info.get('box_id') or 'the box'
+    count = info.get('leftover_killed')
+    if info.get('cleanup') == 'clean' and count == 0:
+        cleanup = f'no process from this run is left on {box}; safe to start a clean rerun'
+    elif info.get('cleanup') == 'stopped' and type(count) is int and count > 0:
+        cleanup = f'{count} leftover processes were stopped'
+    else:
+        cleanup = f'process state on {box} could not be checked; cleanup is unknown'
+    detail = f" {info['message']}." if info.get('message') else ''
+    return (f"{what} was interrupted ({cause}); the command ran partly and was not run again. "
+            f"Check what it did before running it again.{detail} Output: offbox logs {what}\n"
+            + cleanup_summary(info) + '; ' + cleanup)
+
+
+def report_interruption(row):
+    if row['status'] == 'interrupted':
+        saved = read_json(LOGS_DIR / f"{row['run_id']}.state.json", {})
+        info = saved.get('interruption') or {}
+        cleanup = saved.get('cleanup')
+        if isinstance(cleanup, dict):
+            info = {**info, 'cleanup': cleanup.get('cleanup'), 'leftover_killed': cleanup.get('leftover_killed')}
+        say(interruption_message(row['run_id'], info, row['box_id']))
+
+
+class Interrupted(OffboxError):
+    """The server could not finish or retry the accepted command; its own exit code is unknown."""
+
+    def __init__(self, what: str, status=None):
+        self.interruption = interruption_info(status) or {}
+        super().__init__(interruption_message(what, self.interruption) + f"\nexit {EXIT_INTERRUPTED}",
+                         code=EXIT_INTERRUPTED, started=True)
 
 
 def retry_interrupted(a) -> bool:
@@ -2414,8 +2483,9 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
         # An answer that arrives past the caller's deadline is not accepted: the wait ends with --timeout (124).
         if until is not None and now() >= until:
             raise timed_out()
+        remember_interruption(run_id, st)
         if st is not None and st.get("status") == "interrupted":
-            raise Interrupted(what)
+            raise Interrupted(what, st)
         if st is None or ended_again() < 2:
             return _RUNNING
         if st.get('status') == 'lost':
@@ -2453,6 +2523,7 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
                     # Absolute: a frame that arrives after the deadline (even an exit) is not accepted.
                     if until is not None and now() >= until:
                         raise timed_out()
+                    remember_interruption(run_id, fr)
                     t = fr.get("type")
                     if t in ("stdout", "stderr"):
                         data = fr.get("data") or ""
@@ -2494,8 +2565,8 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
                     elif t == "attempt":
                         new_attempt(fr.get("attempt"))
                     elif t == "exit":
-                        if fr.get("status") == "interrupted":
-                            raise Interrupted(what)
+                        if fr.get("status") == "interrupted" and fr.get('running') is not True:
+                            raise Interrupted(what, fr)
                         if fr.get('exitCode') is None and not fr.get('signal'):
                             return follow_lost()
                         return fr.get("exitCode") if fr.get("exitCode") is not None else (
@@ -2550,6 +2621,7 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
                     pass
                 if until is not None and now() >= until:
                     raise timed_out()
+                remember_interruption(run_id, st)
                 down_from = (down_from or failed_at) if boat_down else None
                 if home_run and boat_down and not seen["lost"]:
                     # The run was accepted, so it is never sent anywhere else (it would run twice): wait for the
@@ -2557,8 +2629,8 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
                     seen["lost"] = True
                     say(f"lost the connection to the offbox server; the run stays there. Reconnecting for up to "
                         f"{int(window // 60)} min")
-                if st and st.get("status") == "interrupted":
-                    raise Interrupted(what)
+                if st and st.get("status") == "interrupted" and st.get('running') is not True:
+                    raise Interrupted(what, st)
                 if st and not st.get("running") and st.get("status") in ("exited", "lost"):
                     if st.get("status") == "lost":
                         return follow_lost()
@@ -2600,7 +2672,8 @@ def new_checkout_hint(row: dict, root: Path, usage: command_usage.Usage) -> None
     say(f"node_modules missing on new box {row['box_id']}; prefix your command with {install} &&" + package_manager.version_note(target))
 
 
-def do_pulls(box_id: str, row: dict, pulls: list[str], *, until: float | None = None) -> None:
+def do_pulls(box_id: str, row: dict, pulls: list[str], *, until: float | None = None,
+             foreign: bool = False) -> None:
     for p in pulls:
         opts = {}
         if until is not None:
@@ -2608,20 +2681,37 @@ def do_pulls(box_id: str, row: dict, pulls: list[str], *, until: float | None = 
             if remaining <= 0:
                 raise OffboxError("artifact pull deadline reached; wait again", code=EXIT_WAIT_TIMEOUT, started=True)
             opts['timeout'] = min(1800, remaining)
-        try:
-            st = ssh_sync.pull(box_id, row["remote_dir"], row["rel_cwd"] or ".", p, Path(row["local_cwd"]), **opts)
-        except subprocess.TimeoutExpired:
-            if until is None:
+        detail = f"{row.get('run_id', 'unknown')} {p} -> {row['local_cwd']}"
+        prefix = (f"settled background run {row['run_id']} (not this run): "
+                  f"pull {p} into {row['local_cwd']}" if foreign else f"pull {p}")
+        with contextlib.closing(db()) as con:
+            try:
+                st = ssh_sync.pull(box_id, row["remote_dir"], row["rel_cwd"] or ".", p, Path(row["local_cwd"]), **opts)
+            except Exception as error:
+                event(con, box_id, "run_pull_failed", f"{detail} error={error}")
+                if foreign:
+                    say(f"{prefix} failed: {error}")
+                if isinstance(error, subprocess.TimeoutExpired) and until is not None:
+                    raise OffboxError("artifact pull deadline reached; wait again", code=EXIT_WAIT_TIMEOUT, started=True) from None
                 raise
-            raise OffboxError("artifact pull deadline reached; wait again", code=EXIT_WAIT_TIMEOUT, started=True) from None
+            if st.get("missing"):
+                event(con, box_id, "run_pull_failed", f"{detail} error=not created on the box: {st.get('error')}")
+            elif st.get("ok"):
+                event(con, box_id, "run_pulled", f"{detail} files={st.get('files', 0)}")
+            else:
+                event(con, box_id, "run_pull_failed", f"{detail} error={st.get('error')}")
         if until is not None and now() >= until:
             raise OffboxError("artifact pull deadline reached; wait again", code=EXIT_WAIT_TIMEOUT, started=True)
         if st.get("missing"):
-            say(f"pull {p}: not created on the box")
+            say(f"{prefix}: not created on the box")
         elif st.get("ok"):
-            say(f"pulled {p} ({st.get('files', 0)} files)")
+            if foreign:
+                say(f"settled background run {row['run_id']} (not this run) and pulled {p} "
+                    f"into {row['local_cwd']} ({st.get('files', 0)} files)")
+            else:
+                say(f"pulled {p} ({st.get('files', 0)} files)")
         else:
-            say(f"pull {p} failed: {st.get('error')}")
+            say(f"{prefix} failed: {st.get('error')}")
 
 
 def go_std_glitch(box: str | None, run_id: str, log_path: Path | None, code: int | None) -> bool:
@@ -2716,6 +2806,19 @@ def emit_terminal(row):
                      ids={'run': run_id, 'box': row['box_id']}, props={'exitCode': code, 'fallback': row['mode'] == 'local',
                             **read_json(LOGS_DIR / f'{run_id}.state.json', {})},
                      tag='run_failed' if code != 0 else None)
+        if code == 127 and row['mode'] != 'local':
+            # The remote shell has no readable output capture. Use only the received tail, without fetching logs.
+            name = None
+            try:
+                with (LOGS_DIR / f'{run_id}.log').open('rb') as stream:
+                    stream.seek(max(0, stream.seek(0, 2) - 65536))
+                    tail = stream.read().decode(errors='replace').splitlines()[-200:]
+                match = re.search(r'(?:^|\s)([A-Za-z0-9_./+-]+): command not found\s*$', '\n'.join(tail), re.M)
+                name = match[1] if match and len(match[1]) <= 256 else None
+            except OSError:
+                pass
+            with contextlib.closing(db()) as con:
+                event(con, row['box_id'], 'command_not_found', json.dumps({'run': run_id, 'name': name}))
         if row['process_id'] or row['wrapper_pid']:
             command_ms = api.command_execution_ms(row['box_id'], row['process_id'], row['command_id'])
             toollog.emit('run', 'run.command', kind='perf' if code == 0 else 'error', ok=code == 0,
@@ -3189,10 +3292,11 @@ def _run_remote(a, rn) -> int:
         try:
             code = rn.recovered_code if rn.recovered_code is not None else rn.stream()
             rn.remote_code = None if getattr(a, 'steps', None) else code
-        except Interrupted:
+        except Interrupted as error:
+            remember_interruption(rn.run_id, {'interruption': error.interruption})
             code = finish(rn.run_id, EXIT_INTERRUPTED, "interrupted")
             if code is None:
-                raise OffboxError(f"{rn.run_id}: steps incomplete after the server restart; remote exit unknown",
+                raise OffboxError(f"{rn.run_id}: steps incomplete after the interruption; remote exit unknown",
                                   code=EXIT_INFRA, started=True) from None
             raise
     except KeyboardInterrupt:

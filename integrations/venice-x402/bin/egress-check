@@ -1,0 +1,34 @@
+#!/bin/zsh -f
+# Exit 0 only when Venice traffic provably leaves through the venice-mullvad
+# split tunnel (~/Documents/assistant/venice-mullvad):
+#   1. venice.ai and api.venice.ai resolve into sing-box's fake range 198.18.0.0/15
+#      (checked first, so nothing is sent to Venice outside the tunnel);
+#   2. the daemon reports healthy with a Mullvad exit IP;
+#   3. the IP Cloudflare sees for venice.ai (cdn-cgi/trace) equals that exit IP.
+# -v prints the reason. Used by the proxy before any Venice call (cached 5 min).
+set -u
+verbose=0; [[ "${1:-}" == -v ]] && verbose=1
+say() { (( verbose )) && print -r -- "$*"; return 0 }
+state=${VENICE_MULLVAD_STATE:-/usr/local/var/venice-mullvad/state.json}
+
+fake() {
+  local ip
+  ip=$(/usr/bin/dscacheutil -q host -a name "$1" 2>/dev/null | /usr/bin/awk '/^ip_address:/{print $2; exit}')
+  [[ "$ip" == 198.1[89].* ]] || { say "FAIL $1 resolves to '${ip:-nothing}', not the tunnel range"; return 1 }
+  say "ok   $1 -> $ip (tunnel)"
+}
+fake venice.ai || exit 1
+fake api.venice.ai || exit 1
+
+[[ -r "$state" ]] || { say "FAIL no tunnel state at $state"; exit 1 }
+exit_ip=$(/usr/bin/python3 -I -c '
+import json,sys,time
+s=json.load(open(sys.argv[1]))
+ok = s.get("healthy") and time.time()-s.get("healthy_at",0) < 900 and s.get("exit_ip")
+print(s.get("exit_ip","") if ok else "")' "$state" 2>/dev/null)
+[[ -n "$exit_ip" ]] || { say "FAIL tunnel not healthy (or health older than 15 min)"; exit 1 }
+
+seen=$(/usr/bin/curl -s -m 15 https://venice.ai/cdn-cgi/trace | /usr/bin/sed -n 's/^ip=//p')
+[[ -n "$seen" && "$seen" == "$exit_ip" ]] || { say "FAIL Venice sees '${seen:-nothing}', Mullvad exit is $exit_ip"; exit 1 }
+say "ok   Venice sees $seen = Mullvad exit"
+exit 0

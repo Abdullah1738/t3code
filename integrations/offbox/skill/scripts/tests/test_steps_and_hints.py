@@ -3,6 +3,8 @@ import contextlib
 import io
 import json
 import os
+import shlex
+import sqlite3
 from pathlib import Path
 import subprocess
 import sys
@@ -18,6 +20,7 @@ from offbox_lib import cli, lease, misc, runs  # noqa: E402
 from offbox_lib.common import EXIT_INFRA, OffboxError  # noqa: E402
 from offbox_lib.runs import GO_STD_GLITCH  # noqa: E402
 from test_capacity import Isolated  # noqa: E402
+from tests.test_command_usage import REPORTER_ARGVS
 
 
 class GoStdGlitchMatcherTests(unittest.TestCase):
@@ -104,6 +107,47 @@ def with_dependencies(text):
 
 
 class MissingDepsTests(unittest.TestCase):
+
+    def test_non_js_reporters_do_not_get_either_hint(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / 'package.json').write_text('{"dependencies":{"vitest":"1"}}')
+            for argv in REPORTER_ARGVS:
+                with self.subTest(argv=argv), patch.object(runs.api, 'BACKEND', 'boat'):
+                    usage = runs.command_usage.inspect(root, '.', argv)
+                    script = runs.remote_script('w/repo', '.', argv, None, 'r', repo_root=root, usage=usage)
+                    trap = next(line for line in script.splitlines() if line.startswith('trap '))
+                    self.assertIn('[ 0 = 1 ]', trap)
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err):
+                        runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root, usage)
+                    self.assertEqual(err.getvalue(), '')
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root,
+                                       runs.command_usage.inspect(root, '.', ['npm', 'test']))
+            self.assertIn('node_modules missing on new box B', err.getvalue())
+
+    def test_exit_127_tail_keeps_failure_and_never_advises_install(self):
+        with tempfile.TemporaryDirectory() as home:
+            root = Path(home) / 'w/repo'
+            root.mkdir(parents=True)
+            (root / 'package.json').write_text('{"dependencies":{"vitest":"1"}}')
+            with patch.object(runs.api, 'BACKEND', 'boat'):
+                script = runs.remote_script('w/repo', '.', ['npm', 'test'], None, 'r', repo_root=root)
+            trap = next(line for line in script.splitlines() if line.startswith('trap '))
+            self.assertIn('[ 1 = 1 ]', trap)
+            for output in ('rg: command not found', 'bash: line 1: vitest: command not found', ''):
+                with self.subTest(output=output):
+                    tail = ('__obprobe() { :; }; __obsw=; __offbox_command_started=1; ' + trap + '\n'
+                            + 'printf "%s\\n" ' + shlex.quote(output) + ' >&2; exit 127')
+                    p = subprocess.run(['bash', '-c', tail], env=clean_env(HOME=home),
+                                       capture_output=True, text=True, timeout=10)
+                    self.assertEqual(p.returncode, 127)
+                    self.assertEqual(p.stderr.count('offbox: exit 127:'), 1)
+                    self.assertIn(output, p.stderr)
+                    self.assertNotIn(runs.NO_NODE_MODULES_MARKER, p.stderr)
+                    self.assertNotIn('install', p.stderr)
 
     def test_install_selection(self):
         cases = [
@@ -827,7 +871,7 @@ class MissingDepsTests(unittest.TestCase):
                                        capture_output=True, text=True, timeout=10)
                     self.assertEqual(p.returncode, code)
                     self.assertEqual(p.stderr.splitlines().count(runs.NO_NODE_MODULES_MARKER),
-                                     int(code != 0 and state in ('absent', 'nested-only')))
+                                     int(code not in (0, 127) and state in ('absent', 'nested-only')))
 
     def test_steps_print_one_marker_even_if_last_step_passes(self):
         with tempfile.TemporaryDirectory() as home:
@@ -840,15 +884,17 @@ class MissingDepsTests(unittest.TestCase):
             p = subprocess.run(['bash', '-c', script], env=clean_env(HOME=home),
                                capture_output=True, text=True, timeout=10)
             self.assertEqual(p.returncode, 127)
-            self.assertEqual(p.stderr.splitlines().count(runs.NO_NODE_MODULES_MARKER), 1)
+            self.assertEqual(p.stderr.splitlines().count(runs.NO_NODE_MODULES_MARKER), 0)
+            self.assertIn('offbox: exit 127:', p.stderr)
 
     def test_report_exit_hint_and_silent_cases(self):
         with tempfile.TemporaryDirectory() as d:
             hint = runs.missing_deps_hint(Path(d))
         for code, steps, marker, where, expected in (
-                (1, None, True, 'remote', True), (127, None, True, 'remote', True),
+                (1, None, True, 'remote', True), (127, None, True, 'remote', False),
+                (127, [(1, 1)], True, 'remote', False),
                 (254, None, True, 'remote', True), (2, None, True, 'remote', True),
-                (0, [(1, 127)], True, 'remote', True), (None, [(1, 127)], True, 'remote', True),
+                (0, [(1, 127)], True, 'remote', False), (None, [(1, 127)], True, 'remote', False),
                 (0, None, True, 'remote', False), (None, None, True, 'remote', False),
                 (127, None, False, 'remote', False), (1, None, True, 'local', False)):
             with self.subTest(code=code, steps=steps, marker=marker, where=where):
@@ -975,7 +1021,7 @@ class CliStepTests(Isolated):
                 rc, lines = self.run_cli(['./node_modules/.bin/vitest'], code,
                                          log + runs.NO_NODE_MODULES_MARKER + '\n')
                 self.assertEqual(rc, code)
-                self.assertIn("corepack pnpm@11.10.0 install --frozen-lockfile && <command>", lines[-2])
+                self.assertEqual(any("corepack pnpm@11.10.0 install --frozen-lockfile && <command>" in line for line in lines), code != 127)
                 self.assertEqual(lines[-1], f'offbox: remote exit {code}')
         rc, lines = self.run_cli(['./node_modules/.bin/vitest'], 127, log)
         self.assertEqual(lines, ['offbox: remote exit 127'])
@@ -986,9 +1032,9 @@ class CliStepTests(Isolated):
         log = runs.LOGS_DIR / 'bg.log'
         row = dict(run_id='bg', mode='bg', box_id='B', repo_root=str(root), pulls='[]', exit_code=127,
                    status='failed', error=None)
-        cases = [(1, '', True), (127, '', True), (254, '', True), (0, '', False),
+        cases = [(1, '', True), (127, '', False), (254, '', True), (0, '', False),
                  (None, '', False), (None, 'offbox step 1 rc=0: vitest\n', False),
-                 (None, 'offbox step 1 rc=127: vitest\n', True),
+                 (None, 'offbox step 1 rc=127: vitest\n', False),
                  (0, 'offbox step 1 rc=1: pnpm test\n', True)]
         for code, steps, failed in cases:
             row['exit_code'] = code
@@ -1260,6 +1306,41 @@ class AutoSizeTests(Isolated):
 
 
 class ExitHintTests(unittest.TestCase):
+
+    def test_command_not_found_event_uses_received_tail(self):
+        row = dict(run_id='r', box_id='B', exit_code=127, mode='bg', end_at=2, start_at=1,
+                   process_id=None, wrapper_pid=None)
+        for text, name in (('rg: command not found\n', 'rg'),
+                           ('bash: line 1: vitest: command not found\n', 'vitest'),
+                           ('rg: command not found\ntee: command not found\n', 'rg'),
+                           ('\n'.join(['old: command not found'] + ['line'] * 201), None),
+                           ('', None)):
+            with self.subTest(text=text), tempfile.TemporaryDirectory() as d:
+                logs = Path(d)
+                (logs / 'r.log').write_text(text)
+                with patch.object(runs, 'LOGS_DIR', logs), patch.object(runs, 'event') as event, \
+                        patch.object(runs, 'db') as db, patch('toollog.emit'):
+                    runs.emit_terminal(row)
+                event.assert_called_once_with(db.return_value, 'B', 'command_not_found',
+                                              json.dumps({'run': 'r', 'name': name}))
+
+    def test_command_not_found_event_remains_json_at_storage_limit(self):
+        row = dict(run_id='r', box_id='B', exit_code=127, mode='bg', end_at=2, start_at=1,
+                   process_id=None, wrapper_pid=None)
+        for length, expected in ((256, 'x' * 256), (257, None), (2100, None)):
+            with self.subTest(length=length), tempfile.TemporaryDirectory() as d:
+                logs = Path(d)
+                (logs / 'r.log').write_text('x' * length + ': command not found\n')
+                con = sqlite3.connect(':memory:')
+                con.execute('CREATE TABLE events (ts REAL, box TEXT, kind TEXT, detail TEXT)')
+                stored = []
+                def record(*args):
+                    runs.common.event(*args)
+                    stored.append(con.execute('SELECT detail FROM events').fetchone()[0])
+                with patch.object(runs, 'LOGS_DIR', logs), patch.object(runs, 'event', side_effect=record), \
+                        patch.object(runs, 'db', return_value=con), patch.object(runs.common, 'log'), patch('toollog.emit'):
+                    runs.emit_terminal(row)
+                self.assertEqual([json.loads(detail) for detail in stored], [{'run': 'r', 'name': expected}])
 
     def test_137_prints_memory_hint_before_exit_line(self):
         err = io.StringIO()

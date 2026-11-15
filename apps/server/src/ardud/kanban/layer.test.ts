@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest";
-import type { OrchestrationV2DomainEvent } from "@t3tools/contracts";
+import { RunId, type OrchestrationV2DomainEvent } from "@t3tools/contracts";
 
 import { boardEventRoute, threadEventOf, startTimeoutOf } from "./layer.ts";
 
@@ -14,16 +14,25 @@ describe("boardEventRoute", () => {
     const payload = {
       type: "error",
       status: "failed",
-      runId: "expired",
+      runId: RunId.make("expired"),
       failure: {
         code: "provider_start_timeout",
         message: "The provider never started this run (waited 10 min).",
       },
     };
     assert.deepEqual(startTimeoutOf(event("turn-item.updated", payload)), {
-      runId: "expired",
+      runId: RunId.make("expired"),
       reason: payload.failure.message,
     });
+    assert.deepEqual(
+      startTimeoutOf(
+        event("turn-item.updated", {
+          ...payload,
+          failure: { code: "restart_admission_timeout", message: "Restart admission expired" },
+        }),
+      ),
+      { runId: RunId.make("expired"), reason: "Restart admission expired", restartAdmission: true },
+    );
     assert.isUndefined(
       startTimeoutOf(
         event("turn-item.updated", { ...payload, failure: { ...payload.failure, code: "other" } }),
@@ -35,6 +44,26 @@ describe("boardEventRoute", () => {
     assert.strictEqual(
       boardEventRoute(event("run.updated", { status: "running" })),
       "threadChanged",
+    );
+  });
+  it("routes lost native events to the owning run failure without claiming it never started", () => {
+    assert.deepEqual(
+      startTimeoutOf(
+        event("turn-item.updated", {
+          type: "error",
+          status: "failed",
+          runId: RunId.make("lost"),
+          failure: {
+            code: "provider_events_lost",
+            message: "Native session native-123 produced output that was not ingested",
+            retryable: false,
+          },
+        }),
+      ),
+      {
+        runId: RunId.make("lost"),
+        reason: "Native session native-123 produced output that was not ingested",
+      },
     );
   });
 

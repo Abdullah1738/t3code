@@ -49,6 +49,7 @@ export class McpCall extends Context.Service<
     saved: boolean | "unknown";
     replyFailure?: "reply_timeout" | "reply_error";
     replyStage?: string;
+    replySubSteps?: ReadonlyArray<{ readonly subStep: string; readonly ms: number }>;
     handlerErrorTag?: string;
     handlerOutcome?: "timeout" | "refused";
   }
@@ -68,6 +69,9 @@ const BOARD_BUSY =
   /^(?:Missions board conflict: )?(?:Board busy: not written|Not saved \(board busy\))/;
 const TYPED_OUTCOMES = {
   TimeoutError: "timeout",
+  ThreadReadTimeoutError: "timeout",
+  PullRequestWatchTimeoutError: "timeout",
+  PullRequestToolTimeoutError: "timeout",
   PreviewAutomationTimeoutError: "timeout",
   PreviewAutomationRecordingDeadlineExpiredError: "timeout",
   PreviewAutomationUnavailableError: "refused",
@@ -159,6 +163,8 @@ export const trackDelegation = Effect.fnUntraced(function* (
 
 // The toolkit erases defects and some typed errors while encoding the MCP reply.
 export const handlerFailure = Effect.fnUntraced(function* <E>(cause: Cause.Cause<E>) {
+  // Detached cleanup after a deadline must not overwrite the returned timeout with "Failure".
+  if (Cause.hasInterruptsOnly(cause)) return;
   const call = yield* Effect.serviceOption(McpCall);
   if (call._tag === "None") return;
   const error = cause.reasons.flatMap((reason) =>
@@ -183,7 +189,11 @@ export function callOutcome(
       outcome: "interrupted",
       saved: state.saved,
       errorPhase: state.phase,
-      props: { code: "unknown", ...interruptionProps(exit.cause) },
+      props: {
+        code: "unknown",
+        ...interruptionProps(exit.cause),
+        ...(state.replySubSteps === undefined ? {} : { subSteps: state.replySubSteps }),
+      },
     };
   const output =
     exit._tag === "Success" && !(exit.value instanceof McpSchema.InputRequired)
@@ -277,6 +287,7 @@ export function callOutcome(
     saved,
     props: {
       ...(state.replyStage === undefined ? {} : { phase: state.replyStage }),
+      ...(state.replySubSteps === undefined ? {} : { subSteps: state.replySubSteps }),
       code:
         state.replyFailure ??
         (busy

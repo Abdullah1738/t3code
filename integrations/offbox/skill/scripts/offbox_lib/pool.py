@@ -1203,7 +1203,7 @@ def _try_warm(me, size, source, exclude, run_id):
                             return None
                         # A cached running lease and a successful TTL update can both outlive its machine.
                         peer = api.get(got['box_id'], deadline=time.time() + 10)
-                        if not peer or peer.get('state') not in api.LIVE_STATES or peer.get('dataExpiredAt') \
+                        if not peer or peer.get('state') not in api.LIVE_STATES or peer.get('dataExpiredAt') or peer.get('heldRuns') \
                                 or peer.get('type') != got['size']:
                             return None
                         left = api.left()
@@ -1327,7 +1327,7 @@ def _refresh_background(con, key, pull_artifacts=True):
                 if runs.terminal_result(row):
                     runs.finish(row['run_id'], row['exit_code'], row['status'], run=row)
                     continue
-                runs.reconcile_lost(con, row['box_id'])
+                runs.reconcile_lost(con, row['box_id'], foreign=True)
                 row = runs.restore_run_state(con.execute('SELECT * FROM runs WHERE run_id=?', (row['run_id'],)).fetchone())
                 if row['status'] not in ('starting','running') and not (
                         row['status'] == 'infra' and start_check.recovery_marked(con, row)):
@@ -1346,7 +1346,8 @@ def _refresh_background(con, key, pull_artifacts=True):
                             continue
                         if result.code is not None or result.verdict == 'fenced':
                             start_check.settle(con, row, result, 'pool checked an unattached start',
-                                               until=None if api.left() is None else time.time() + api.left())
+                                               until=None if api.left() is None else time.time() + api.left(),
+                                               foreign=True)
                         else:
                             start_check.remember_wrapper(con, row, result.pid)
                             con.commit()
@@ -1375,7 +1376,7 @@ def _refresh_background(con, key, pull_artifacts=True):
                     if pulls:
                         if not pull_artifacts:
                             continue  # pulls keep the slot reserved until the normal follower/reaper finishes
-                        runs.do_pulls(row['box_id'], dict(row), pulls)
+                        runs.do_pulls(row['box_id'], dict(row), pulls, foreign=True)
                     status, code = runs.completed_result(row, {**st, 'exitCode':code})
                     runs.finish(row['run_id'], code, status, run=row)
         except OffboxError:

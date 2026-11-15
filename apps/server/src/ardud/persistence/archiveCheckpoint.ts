@@ -10,6 +10,7 @@ import * as Semaphore from "effect/Semaphore";
 import * as NodeWorkerThreads from "node:worker_threads";
 
 import { forkParked } from "../../serverActivation.ts";
+import { archiveCheckpointWorkerSource } from "./archiveCheckpointWorker.ts";
 import { archiveFilename } from "./historyArchiveSql.ts";
 
 export class HistoryArchiveDurability extends Context.Service<
@@ -25,34 +26,6 @@ export class HistoryArchiveDurability extends Context.Service<
     readonly syncArchive: Effect.Effect<boolean>;
   }
 >()("t3/ardud/persistence/archiveCheckpoint/HistoryArchiveDurability") {}
-
-// Kept in an evaluated worker so bundled builds need no worker file on disk.
-// A complete PASSIVE checkpoint (checkpointed === log) syncs the WAL, copies every
-// frame into the database file and syncs that file, all with F_FULLFSYNC here, off
-// the event loop and off the writer connection.
-const source = `
-const { parentPort, workerData } = require('node:worker_threads');
-const { DatabaseSync } = require('node:sqlite');
-let archive;
-parentPort.on('message', ({ id, operation }) => {
-  let main;
-  let ok = false;
-  let failure;
-  try {
-    const db = operation === 'flush-main'
-      ? (main = new DatabaseSync(workerData.filename))
-      : (archive ??= new DatabaseSync(workerData.archiveFilename));
-    db.exec('PRAGMA busy_timeout=0; PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON;');
-    const result = db.prepare('PRAGMA main.wal_checkpoint(PASSIVE)').get();
-    ok = result.busy === 0 && result.log >= 0 && result.checkpointed === result.log;
-  } catch (error) {
-    failure = { errcode: error && error.errcode, errstr: error && error.errstr, code: error && error.code };
-    ok = false;
-  } finally {
-    try { main?.close(); } catch { ok = false; }
-  }
-  parentPort.postMessage({ id, ok, failure, file: operation === "flush-main" ? workerData.filename : workerData.archiveFilename });
-});`;
 
 /** A reader holding an older archive snapshot only blocks the barrier briefly. */
 const SYNC_ARCHIVE_ATTEMPTS = 4;
@@ -72,7 +45,12 @@ export const archiveCheckpointLayer = (filename: string) =>
       // instead of failing because the worker happened to be busy.
       const serial = yield* Semaphore.make(1);
       let worker: NodeWorkerThreads.Worker | undefined;
-      let pending: { readonly id: number; readonly complete: (ok: boolean) => void } | undefined;
+      let pending:
+        | {
+            readonly id: number;
+            readonly complete: (ok: boolean, attributes?: Record<string, number | string>) => void;
+          }
+        | undefined;
       let requestId = 0;
       // Only a broken worker (error, exit, hang) backs off respawning. A checkpoint that
       // could not finish (a pinned reader) is reported to the caller, which paces itself.
@@ -96,7 +74,7 @@ export const archiveCheckpointLayer = (filename: string) =>
       };
 
       const request = Effect.fn("HistoryArchiveDurability.checkpoint")(
-        (operation: "checkpoint" | "flush-main") =>
+        (operation: "checkpoint" | "flush-main" | "maintenance") =>
           Effect.callback<boolean>((resume) => {
             if (closed || pending !== undefined || now() < retryAt) {
               resume(Effect.succeed(false));
@@ -104,7 +82,7 @@ export const archiveCheckpointLayer = (filename: string) =>
             }
             if (worker === undefined) {
               try {
-                const instance = new NodeWorkerThreads.Worker(source, {
+                const instance = new NodeWorkerThreads.Worker(archiveCheckpointWorkerSource, {
                   eval: true,
                   workerData: { filename, archiveFilename: archiveFilename(filename) },
                 });
@@ -125,6 +103,9 @@ export const archiveCheckpointLayer = (filename: string) =>
                     readonly ok: boolean;
                     readonly failure?: unknown;
                     readonly file: string;
+                    readonly walBytes?: number;
+                    readonly checkpoint?: { readonly log: number; readonly checkpointed: number };
+                    readonly truncate?: { readonly busy: number };
                   }) => {
                     if (worker !== instance || pending?.id !== result.id) return;
                     if (result.failure)
@@ -143,7 +124,18 @@ export const archiveCheckpointLayer = (filename: string) =>
                     pending = undefined;
                     retryDelay = 1000;
                     instance.unref();
-                    waiting.complete(result.ok === true);
+                    waiting.complete(result.ok === true, {
+                      ...(result.walBytes === undefined ? {} : { "db.wal.bytes": result.walBytes }),
+                      ...(result.checkpoint === undefined
+                        ? {}
+                        : {
+                            "db.wal.log_frames": result.checkpoint.log,
+                            "db.wal.checkpointed_frames": result.checkpoint.checkpointed,
+                          }),
+                      ...(result.truncate === undefined
+                        ? {}
+                        : { "db.wal.truncate_busy": result.truncate.busy }),
+                    });
                   },
                 );
                 instance.on("error", failed);
@@ -157,7 +149,16 @@ export const archiveCheckpointLayer = (filename: string) =>
             }
             const instance = worker;
             const id = ++requestId;
-            pending = { id, complete: (ok) => resume(Effect.succeed(ok)) };
+            pending = {
+              id,
+              complete: (ok, attributes = {}) =>
+                resume(
+                  Effect.annotateCurrentSpan({
+                    "archive.operation": operation,
+                    ...attributes,
+                  }).pipe(Effect.as(ok)),
+                ),
+            };
             instance.ref();
             try {
               // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers have no target origin.
@@ -195,8 +196,8 @@ export const archiveCheckpointLayer = (filename: string) =>
       );
 
       yield* forkParked(
-        Effect.sleep("10 seconds").pipe(
-          Effect.andThen(request("checkpoint").pipe(Effect.repeat(Schedule.spaced("10 seconds")))),
+        Effect.sleep("1 minute").pipe(
+          Effect.andThen(request("maintenance").pipe(Effect.repeat(Schedule.spaced("1 minute")))),
         ),
       );
       const flushHistorySource = request("flush-main");

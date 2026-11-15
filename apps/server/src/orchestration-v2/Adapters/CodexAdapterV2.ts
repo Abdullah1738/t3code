@@ -159,6 +159,8 @@ import {
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
+const isTurnNotActiveError = Schema.is(ProviderAdapter.ProviderAdapterTurnNotActiveError);
+
 const CODEX_PROVIDER = ProviderDriverKind.make("codex");
 export const CODEX_DRIVER_KIND = CODEX_PROVIDER;
 export const CODEX_DEFAULT_INSTANCE_ID = defaultInstanceIdForDriver(CODEX_DRIVER_KIND);
@@ -1192,6 +1194,40 @@ export function codexFailureCategory(
   return "unknown";
 }
 
+// Code mode reports these as plain errors, without a CodexErrorInfo discriminator.
+export function normalizeCodexToolHostFailure(
+  failure: OrchestrationV2ProviderFailure,
+): OrchestrationV2ProviderFailure {
+  if (
+    failure.class !== "provider_error" ||
+    failure.retryable === false ||
+    failure.category !== "unknown" ||
+    !/^code-mode host (?:closed its stdout|timed out waiting for wait response)[.!]?$/i.test(
+      failure.message.trim(),
+    )
+  )
+    return failure;
+  return { ...failure, class: "transport_error", code: "codex.tool_host_lost", retryable: true };
+}
+
+export function codexToolHostFailureOf(
+  item: CodexDynamicToolItem,
+): OrchestrationV2ProviderFailure | null {
+  if (item.type !== "dynamicToolCall") return null;
+  const tool = [item.namespace, item.tool].filter(Boolean).join(".");
+  if (tool !== "functions.exec" && tool !== "functions.wait") return null;
+  if (item.status !== "failed" && !(item.status === "completed" && item.success === false))
+    return null;
+  const message = (item.contentItems ?? [])
+    .flatMap((content) => (content.type === "inputText" ? [content.text] : []))
+    .join("\n")
+    .trim();
+  const failure = normalizeCodexToolHostFailure(
+    makeProviderFailure({ class: "provider_error", category: "unknown", message }),
+  );
+  return failure.code === "codex.tool_host_lost" ? failure : null;
+}
+
 function codexUsageLimitError(
   code: string | null,
   errorInfo: CodexErrorInfo | null | undefined,
@@ -1206,6 +1242,8 @@ function codexUsageLimitError(
 interface ActiveCodexTurnContext {
   readonly promptAcceptedAt?: DateTime.Utc;
   closedCommandItemIds?: ReadonlySet<string>;
+  toolHostFailure?: OrchestrationV2ProviderFailure;
+  runtimeStopRequested?: boolean;
   latestProviderFailure?: {
     readonly nativeMessage: string;
     readonly failure: OrchestrationV2ProviderFailure;
@@ -4961,6 +4999,15 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               return;
             }
 
+            // New tool work proves the agent continued. A late completion from
+            // an older background command does not prove the host recovered.
+            if (
+              payload.item.type === "commandExecution" ||
+              payload.item.type === "dynamicToolCall" ||
+              payload.item.type === "mcpToolCall"
+            )
+              delete context.toolHostFailure;
+
             if (payload.item.type === "contextCompaction") {
               yield* emitCompactionItem(
                 context,
@@ -5208,6 +5255,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             }
 
             if (payload.item.type === "mcpToolCall" || payload.item.type === "dynamicToolCall") {
+              const hostFailure = codexToolHostFailureOf(payload.item);
+              if (hostFailure !== null) context.toolHostFailure = hostFailure;
               // ardud: covers the gap until the capture registers or the item lands.
               if (settled) yield* holdHandoff(context.providerThread.id);
               yield* clearRunningDynamicTool(payload.turnId, payload.item.id);
@@ -5936,14 +5985,17 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                       category: completionCategory,
                     });
               const details = input.failureAdditionalDetails?.trim();
+              const normalized = input.context.runtimeStopRequested
+                ? baseFailure
+                : normalizeCodexToolHostFailure(baseFailure);
               const failure = details
                 ? {
-                    ...baseFailure,
+                    ...normalized,
                     message: makeProviderFailure({
                       message: [input.failureMessage, details].filter(Boolean).join("\n"),
                     }).message,
                   }
-                : baseFailure;
+                : normalized;
               return {
                 type: "turn.terminal",
                 driver: CODEX_PROVIDER,
@@ -6423,11 +6475,16 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               (yield* Ref.get(interruptingNativeTurns)).has(payload.turn.id)
                 ? "interrupted"
                 : nativeStatus;
+            const hostFailure =
+              status === "completed" && !context.runtimeStopRequested
+                ? context.toolHostFailure
+                : undefined;
             yield* finalizeCodexTurn({
               context,
               nativeTurnId: payload.turn.id,
-              status,
+              status: hostFailure === undefined ? status : "failed",
               completedAt: codexTimestamp(payload.turn.completedAt),
+              ...(hostFailure === undefined ? {} : { failureMessage: hostFailure.message }),
               ...(payload.turn.error?.message === undefined
                 ? {}
                 : {
@@ -7009,15 +7066,44 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         ) {
           if (exitedSessionSettlementStarted) return;
           exitedSessionSettlementStarted = true;
-          const failure = makeProviderFailure({ cause: error, class: "provider_error" });
+          const runtimeLost =
+            error._tag === "CodexAppServerProcessExitedError" ||
+            error._tag === "CodexAppServerInputStreamEndedError";
+          const baseFailure = makeProviderFailure({ cause: error, class: "provider_error" });
+          const failure =
+            runtimeLost && baseFailure.class !== "usage_limit"
+              ? {
+                  ...baseFailure,
+                  class: "transport_error" as const,
+                  code: "codex.runtime_lost",
+                  retryable: true,
+                }
+              : baseFailure;
+          const retries = yield* Ref.get(providerRetries);
           for (const context of Array.from((yield* Ref.get(activeTurns)).values()).toReversed()) {
-            context.latestProviderFailure = { nativeMessage: failure.message, failure };
+            const previous =
+              context.latestProviderFailure?.failure ??
+              retries.get(context.providerTurnId)?.failure;
+            const classified =
+              previous !== undefined &&
+              ((previous.category !== undefined && previous.category !== "unknown") ||
+                previous.class === "usage_limit" ||
+                previous.retryable === false);
+            const turnFailure = context.runtimeStopRequested
+              ? baseFailure
+              : classified
+                ? previous
+                : failure;
+            context.latestProviderFailure = {
+              nativeMessage: turnFailure.message,
+              failure: turnFailure,
+            };
             yield* finalizeCodexTurn({
               context,
               nativeTurnId: context.nativeTurnId,
               status: "failed",
               completedAt: yield* DateTime.now,
-              failureMessage: failure.message,
+              failureMessage: turnFailure.message,
             });
           }
           for (const context of (yield* Ref.get(settledTurns)).values()) {
@@ -7620,15 +7706,18 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 )
                   return;
                 if (turnInput.requestRuntimeRestart === true) return;
-                return yield* toProtocolError(
-                  `Provider turn ${turnInput.providerTurnId} is not active and cannot be interrupted.`,
-                );
+                return yield* new ProviderAdapter.ProviderAdapterTurnNotActiveError({
+                  driver: CODEX_PROVIDER,
+                  providerThreadId: turnInput.providerThread.id,
+                  providerTurnId: turnInput.providerTurnId,
+                });
               }
               const interruptTargets: Array<{
                 readonly context: ActiveCodexTurnContext;
                 readonly completion: Deferred.Deferred<void, never>;
               }> = [];
               for (const context of interruptTargetContexts) {
+                context.runtimeStopRequested = true;
                 interruptTargets.push({ context, completion: yield* Deferred.make<void>() });
               }
               yield* Ref.update(turnWaiters, (current) => {
@@ -7705,6 +7794,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                           continue;
                         }
                         const completion = yield* Deferred.make<void>();
+                        context.runtimeStopRequested = true;
                         interruptTargets.push({ context, completion });
                         trackedInterruptNativeTurnIds.add(context.nativeTurnId);
                         newlyDiscovered.push(context);
@@ -7774,6 +7864,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                     );
                     for (const context of lineage) {
                       const completion = yield* Deferred.make<void>();
+                      context.runtimeStopRequested = true;
                       interruptTargets.push({ context, completion });
                       trackedInterruptNativeTurnIds.add(context.nativeTurnId);
                       yield* Ref.update(turnWaiters, (current) => {
@@ -7968,14 +8059,15 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             },
             (effect, requestedInput) =>
               effect.pipe(
-                Effect.mapError(
-                  (cause) =>
-                    new ProviderAdapter.ProviderAdapterInterruptError({
-                      driver: CODEX_PROVIDER,
-                      providerThreadId: requestedInput.providerThread.id,
-                      providerTurnId: requestedInput.providerTurnId,
-                      cause,
-                    }),
+                Effect.mapError((cause) =>
+                  isTurnNotActiveError(cause)
+                    ? cause
+                    : new ProviderAdapter.ProviderAdapterInterruptError({
+                        driver: CODEX_PROVIDER,
+                        providerThreadId: requestedInput.providerThread.id,
+                        providerTurnId: requestedInput.providerTurnId,
+                        cause,
+                      }),
                 ),
               ),
           ),

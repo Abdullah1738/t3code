@@ -249,6 +249,7 @@ export interface EffectOutboxV2Shape {
   readonly awaitAvailable: Effect.Effect<void>;
   readonly awaitControlAvailable: Effect.Effect<void>;
   readonly notifyAvailable: (count?: number) => Effect.Effect<void>;
+  readonly wakeRestartEffect: (effectId: string) => Effect.Effect<boolean, EffectOutboxError>;
   /** Persist rows only. Notify workers after the surrounding transaction commits. */
   readonly enqueue: (
     effects: ReadonlyArray<PendingOrchestrationEffectV2>,
@@ -786,6 +787,26 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
           effect.pipe(
             Effect.mapError(
               (cause) => new EffectOutboxError({ operation: "succeed", effectId, cause }),
+            ),
+          ),
+      ),
+      wakeRestartEffect: Effect.fn("EffectOutbox.wakeRestartEffect")(
+        function* (effectId) {
+          const now = DateTime.formatIso(yield* DateTime.now);
+          const rows = yield* sql<{ readonly effect_id: string }>`
+            UPDATE orchestration_v2_effect_outbox
+            SET available_at = MIN(available_at, ${now}), updated_at = ${now}
+            WHERE effect_id = ${effectId} AND status = 'pending'
+              AND effect_type IN ('provider-runtime.continue', 'provider-turn.start')
+            RETURNING effect_id
+          `;
+          if (rows.length > 0) yield* notifyAvailable();
+          return rows.length > 0;
+        },
+        (effect, effectId) =>
+          effect.pipe(
+            Effect.mapError(
+              (cause) => new EffectOutboxError({ operation: "wake-restart", effectId, cause }),
             ),
           ),
       ),

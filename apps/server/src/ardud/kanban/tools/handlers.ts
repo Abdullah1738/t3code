@@ -7,6 +7,7 @@ import {
   OrchestratorMcpFailure,
   kanbanAskIsNotice,
   ProjectId,
+  ThreadId,
   type KanbanActor,
   type KanbanBoard,
   type KanbanBlock,
@@ -14,6 +15,7 @@ import {
   type KanbanCardModel,
   type KanbanError,
   type KanbanMessage,
+  type KanbanOwnerAsk,
   type KanbanThreadLink,
   type ModelSelection,
 } from "@t3tools/contracts";
@@ -51,6 +53,15 @@ import { KanbanToolkit, type ModelInput } from "./tools.ts";
 import * as BoardReplies from "../engine/boardReplies.ts";
 import * as Activity from "../engine/activity.ts";
 import * as SavedWrite from "../engine/savedWrite.ts";
+
+const askGateNote = (
+  card: KanbanCard,
+  ask: KanbanOwnerAsk,
+  guessedGates?: KanbanBoard["guessedGates"],
+) =>
+  [askGateWarning(card, ask, guessedGates), secretKindApprovalWarning(card, ask, guessedGates)]
+    .filter((warning) => warning !== undefined)
+    .join(" ");
 
 const gatedResult = (
   card: KanbanCard,
@@ -492,6 +503,7 @@ const handlers = {
     withCaller((service, caller) =>
       Effect.gen(function* () {
         const board = yield* boardFor(service, caller, input.boardId, true);
+        const releaseBoards = yield* service.boards;
         const limit = Math.min(
           input.limit ?? BoardReplies.BOARD_PAGE_LIMIT,
           BoardReplies.BOARD_PAGE_MAX,
@@ -513,7 +525,7 @@ const handlers = {
             board: {
               id: board.id,
               name: board.name,
-              ...BoardReplies.boardReleaseSummary(board, at),
+              ...BoardReplies.boardReleaseSummary(board, at, releaseBoards),
               window,
               legend: Activity.COMPACT_LEGEND,
               activeCards: rows.length,
@@ -536,6 +548,7 @@ const handlers = {
               { ...snapshot, cards },
               undefined,
               DateTime.formatIso(yield* DateTime.now),
+              releaseBoards,
             ),
             page: { limit, hasMore, nextAfter: hasMore ? cards.at(-1)!.number : null },
           },
@@ -602,14 +615,14 @@ const handlers = {
       Effect.gen(function* () {
         const card = yield* cardFor(service, caller, input.card, input.boardId, true);
         const detail = yield* service.card(card.id);
+        const { id, number, title, stage, boardId } = detail.card;
+        const rest =
+          typeof input.events === "object" && input.events.before !== undefined
+            ? { card: { id, number, title, stage, boardId } }
+            : { card: detail.card, threads: detail.threads };
         return {
-          card: detail.card,
-          threads: detail.threads,
-          ...Activity.pageCardEvents(
-            { card: detail.card, threads: detail.threads },
-            detail.events,
-            input.events,
-          ),
+          ...rest,
+          ...Activity.pageCardEvents(rest, detail.events, input.events),
         };
       }),
     ),
@@ -721,14 +734,7 @@ const handlers = {
         // The newest ask is the one just added.
         const ask = asked.asks.at(-1);
         const warning = ask ? Asks.approvalWarning(asked, ask, board.guessedGates) : undefined;
-        const note = ask
-          ? [
-              askGateWarning(asked, ask, board?.guessedGates),
-              secretKindApprovalWarning(asked, ask, board?.guessedGates),
-            ]
-              .filter((warning) => warning !== undefined)
-              .join(" ")
-          : "";
+        const note = ask ? askGateNote(asked, ask, board.guessedGates) : "";
         return {
           card: Asks.askSummary(asked, ask?.id ?? ""),
           ...(warning === undefined ? {} : { warning }),
@@ -801,9 +807,11 @@ const handlers = {
           edits && revised
             ? Asks.approvalWarning(changed, revised, board?.guessedGates)
             : undefined;
+        const note = edits && revised ? askGateNote(changed, revised, board?.guessedGates) : "";
         return {
           card: Asks.askSummary(changed, askId),
           ...(warning === undefined ? {} : { warning }),
+          ...(note ? { note } : {}),
         };
       }),
     ),
@@ -929,7 +937,14 @@ const handlers = {
           caller.actor,
         );
         return WAITS_ENGINE_WIRED
-          ? { card: waiting }
+          ? {
+              card: waiting,
+              ...(caller.actor._tag === "thread" &&
+              waiting.activeThreadId === caller.actor.threadId &&
+              waiting.activeRole === "work"
+                ? { note: "Wait set; it starts when your turn ends. End your turn now." }
+                : {}),
+            }
           : {
               card: waiting,
               note: "Saved and shown on the board. The board does not end waits by itself yet: keep your own check until it does.",
@@ -1104,6 +1119,16 @@ const handlers = {
   card_create: McpToolAccess.actsAsCaller((input) =>
     withCaller((service, caller) =>
       Effect.gen(function* () {
+        if (input.forThread !== undefined) {
+          if (caller.link?.role !== "evaluator")
+            return yield* refuse("Only evaluators create cards with forThread. Nothing was saved.");
+          if (input.assignToSelf)
+            return yield* refuse("Use forThread or assignToSelf, not both. Nothing was saved.");
+          if (input.priority === KANBAN_BACKLOG || input.stage === "needs_owner")
+            return yield* refuse(
+              "forThread needs a todo card outside the backlog. Nothing was saved.",
+            );
+        }
         if (caller.link?.role === "review") {
           return yield* refuse("Review threads report findings; they don't create cards.");
         }
@@ -1139,6 +1164,13 @@ const handlers = {
           reviewChain: origin ? origin.reviewChain : (input.reviewChain ?? null),
           subtasks: input.subtasks,
         };
+        if (input.forThread !== undefined) {
+          const result = yield* service.createForThread(ThreadId.make(input.forThread), fields, {
+            boardId: board.id,
+            actor: { _tag: "evaluator", threadId: caller.threadId },
+          });
+          return { ...result, ...gatedResult(result.card, input.subtasks, board.guessedGates) };
+        }
         if (input.assignToSelf) {
           const result = yield* service.createForThread(caller.threadId, fields);
           return { ...result, ...gatedResult(result.card, input.subtasks, board.guessedGates) };
@@ -1271,6 +1303,7 @@ const handlers = {
             input.note ?? null,
             caller.actor,
             role,
+            input.releasedAt,
           ),
         };
       }),

@@ -33,9 +33,17 @@ export const startTimeoutOf = (event: OrchestrationV2DomainEvent) =>
   event.type === "turn-item.updated" &&
   event.payload.type === "error" &&
   event.payload.status === "failed" &&
-  event.payload.failure.code === "provider_start_timeout" &&
+  (event.payload.failure.code === "provider_start_timeout" ||
+    event.payload.failure.code === "provider_events_lost" ||
+    event.payload.failure.code === "restart_admission_timeout") &&
   event.payload.runId !== null
-    ? { runId: event.payload.runId, reason: event.payload.failure.message }
+    ? {
+        runId: event.payload.runId,
+        reason: event.payload.failure.message,
+        ...(event.payload.failure.code === "restart_admission_timeout"
+          ? { restartAdmission: true }
+          : {}),
+      }
     : undefined;
 
 /** Which board action a domain event triggers, if any. Exported so the route is tested itself. */

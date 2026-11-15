@@ -92,13 +92,22 @@ A separate `com.abdullah.mac-deep-inventory` LaunchAgent runs daily at 03:30
 local time (Asia/Dubai on this Mac). It starts with the four SSD worktree farms
 and checkpoints the next root to visit, so interrupted passes rotate fairly.
 Cheap batches can share a turn; known timeouts follow healthy discovery and
-refresh work after one early parts turn. Ordinary children that will expire
+refresh work after one early part attempt per root. Ordinary children that will expire
 during the pass are refreshed before more parts work can crowd them out.
-Unknown children get a 15-second probe; a batch deadline falls
-back to individual probes. A timed-out child is split into immediate entries,
+Individual probes use 1.5 times the child's last successful duration, or twice
+its root's median successful duration, bounded to 15–120 seconds. Roots with
+no timing data start at 15 seconds. A short probe timeout doubles the next
+probe and keeps the child in ordinary discovery; only a full probe of at least
+60 seconds establishes a timeout for descent. Legacy timeouts with no recorded
+allowance or parts get one probe conversion. Batch deadlines fall back to
+individual probes. A confirmed timed-out child is split into immediate entries,
 with each completed part checkpointed and at most ten minutes per child per
-pass. Checkpointed parts and their parent have a 72-hour freshness window so
-three nightly passes can finish a child. Ordinary children keep 24 hours.
+pass. A part whose measured or sibling-estimated cost exceeds the time left
+is deferred to the next pass. Checkpointed parts and their parent have a 72-hour freshness window so
+three nightly passes can finish a child. Ordinary children of the SSD worktree
+farms and crpko-devops/tmp retain their real timestamps for 48 hours, so a
+sweep larger than one nightly budget can converge. Other roots keep 24 hours.
+An expired ordinary child makes its root partial until measured again.
 The child has no total until its listing and every part are complete and
 fresh; the total retains the oldest part's timestamp. At expiry it becomes
 partial with no total again. Its own directory allocation is included.
@@ -112,6 +121,10 @@ daily pass exits cleanly; a busy hourly scan logs `skipReason=deep_pass_running`
 and cached totals while crash collection continues. `disk.deep.start`,
 `disk.deep.root`, `disk.deep.parts` and `disk.deep.end` record coverage, ages,
 timeout time, parts progress, the parts freshness window and stop reason.
+Pass timeout totals include all command timeouts; `probeTimeouts` and
+`secondsInProbeTimeouts` report the short-probe subset, and
+`probeAllowanceMedianS` reports the median individual probe allowance.
+Timeout source events include `allowanceS`.
 `childrenRemaining` counts known eligible children; `rootsPartial` on pass
 summaries counts roots whose listing was unavailable, so zero remaining with
 unlisted roots is not complete coverage. All totals count hardlink occurrences,
@@ -192,6 +205,44 @@ Partial inventories and older snapshots without that evidence remain unknown.
 An unknown directory baseline also makes the event incomplete.
 These events never alert or launch extra scans.
 
+## Mac tailnet guard
+
+`com.abdullah.mac-tailnet` invokes `collector.py --tailnet` every 60 seconds,
+independently of the hourly collector's slow disk scans. `tailnet.py` calls only
+`/Applications/Tailscale.app/Contents/MacOS/Tailscale status --json` (five-second
+timeout, no socket override). It never changes Tailscale preferences or reconnects.
+`THRESHOLD_CHECKS` (3) and `PROBE_HOST` (`100.75.104.72`) are its configuration
+values. Up requires `BackendState=Running` and `Self.Online=true`; existing IPs
+and extension PIDs do not prove connectivity. Starting and CLI failures count
+as not up. The third consecutive not-up check queues one Telegram alert. A
+healthy check resets the streak and queues one recovery line for alerted outages.
+Brief outages produce no notification. Three minute checks are a sampling
+threshold, not a guarantee of three full elapsed minutes after the first failure.
+
+`state/tailnet.json` and a separate nonblocking lock preserve streaks and queued
+notification payloads across invocations. Keys and text remain identical on retry,
+including after a timeout that may have followed durable Telegram queueing.
+Recovery uses a distinct key. Unix timestamps measure outages across processes;
+monotonic time measures only one invocation's probe duration.
+
+`tailnet.sample` records backend state, online flag, IP count, CLI exit/timeout,
+extension PIDs and the result of `nc -z -G 3 <PROBE_HOST> 22` (four-second outer
+timeout, only for Running). A failed home probe never triggers a tailnet alert.
+`tailnet.state` and `tailnet.extension` record initial observations and changes;
+a PID change alone is not a crash. `tailnet.alert` / `tailnet.recovery` record
+notification queue acceptance or failure. Failed sends retry next minute.
+Raw CLI output, addresses, peers, identity and notification text never enter
+these events. `mac-log-status` and daily rollups flag a missing sample after
+three minutes. The app CLI's “Skip a start command” and “Peer connection was
+rejected” logs are known harmless noise; check for `EditPrefs` and backend changes
+when verifying read-only behavior.
+
+After review and merge/push, run `zsh integrations/mac-logging/install.zsh`
+(`--dry-run` first, `--check` after). The installer copies but never loads agents.
+Bootstrap `~/Library/LaunchAgents/com.abdullah.mac-tailnet.plist` in the user's GUI
+domain for the minute checks; keep `com.abdullah.mac-log-collector` hourly.
+Removing the minute agent stops checks; no Tailscale change is needed.
+
 ## CPU samples
 
 `com.abdullah.mac-cpu` runs `cpu.py` every 60 seconds at normal priority,
@@ -199,8 +250,8 @@ through `/bin/zsh` for launchd file access. One `/bin/ps` inventory reads PID,
 parent, cumulative CPU time, RSS, state, start time and elapsed time with a
 30-second timeout. It never invokes top or changes another process.
 
-`state/cpu.json` retains only PID, start time and cumulative CPU seconds, plus
-the Unix observation time, under its own nonblocking lock. CPU seconds
+`state/cpu.json` retains PID, start time, cumulative CPU seconds, host CPU ticks,
+the daily spike counter and Unix observation time under its own nonblocking lock. CPU seconds
 and percentages compare successful inventories; 100% is one full core.
 New/reused PIDs and counter resets start at zero. Disappeared processes are
 dropped; their final CPU usage is unknown, so totals cover surviving processes.
@@ -220,19 +271,29 @@ are grouped. Only node/bun/python PIDs in that top 20 get a separate batched
 argv read with a five-second timeout and a start-time recheck. Hint failure
 sets `hintError` without losing numeric CPU evidence.
 
-Hints use the janitor's reviewed #45 `leftover_processes.redact` helper,
+`cpu.spike` captures up to 15 PIDs with parent families and redacted 160-character commands when load1 > 2× logical CPUs, plus host/unattributed CPU, observed spawn families and runnable thread counts; it is capped at 240 records/day and 8192 bytes/record, and is conditional rather than a cadence job.
+
+Host tick deltas add `systemCpuPct`, `userPct`, `sysPct` and
+`unattributedCpuPct` on the same one-core=100% scale; a failed read sets
+`systemCpuError` without losing the sample. The first valid read is a baseline.
+`spawned`/`exited` compare PID + start time, and `spawnedFamilies` counts only
+new processes still visible at the next inventory. `pidAdvance` is omitted:
+long-lived high PIDs hid a real 200-process burst after allocator wrap on this Mac.
+The optional thread read has a two-second timeout.
+
+Hints and spike commands use the janitor's reviewed #45 `leftover_processes.redact` helper,
 loaded from the sibling source tree or the installed
 `~/.config/opencode/skills/dev-resource-janitor/scripts/` directory (including
-its `active_sessions.py` dependency). No janitor scan runs. Inline programs
-are omitted. Paths reduce to a basename, or the first directory after
+its `active_sessions.py` dependency). No janitor scan runs. Hints omit inline
+programs and reduce paths to a basename, or the first directory after
 `ExternalSSD/` or `.local/share/` plus basename; intervening directories use
-`…`. Raw argv and paths never enter sampler state or logs. If the helper is
+`…`. Spike commands replace home prefixes with `~`; argv never enters sampler state. If the helper is
 missing, labels are omitted and the CPU measurements remain available.
 
-The logger bounds labels and lists and caps each encoded CPU line at 8192
+The logger bounds labels and lists and caps samples at 7000 bytes and spikes at 8192
 bytes, dropping lowest-ranked detail rows if necessary (`topOmitted` and
-`familiesOmitted`). At 1440 scheduled runs/day the maximum is 11.8 MB/day,
-so the minute cadence does not need a low-load fallback. The existing shared
+`familiesOmitted`). At 1440 scheduled runs and 240 spikes/day, CPU records
+use at most 12.1 MB/day. The existing shared
 day-log cap and retention still apply. The installer copies the new helpers
 and plist; the evaluator must load `com.abdullah.mac-cpu` after review.
 

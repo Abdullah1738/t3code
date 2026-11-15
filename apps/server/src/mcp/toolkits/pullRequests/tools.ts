@@ -140,6 +140,48 @@ export class PullRequestWatchFailedError extends Schema.TaggedError<PullRequestW
   }
 }
 
+export class PullRequestWatchTimeoutError extends Schema.TaggedError<PullRequestWatchTimeoutError>()(
+  "PullRequestWatchTimeoutError",
+  { saved: Schema.Union([Schema.Boolean, Schema.Literal("unknown")]) },
+) {
+  override get message(): string {
+    const status =
+      this.saved === false
+        ? "Nothing was saved."
+        : this.saved === true
+          ? "The watch change was saved, but its read-back timed out."
+          : "The watch change may have been saved.";
+    return `Pull request watch change timed out. ${status} Call list_thread_pull_requests to check watching before retrying. Do not call unwatch_pull_request to recover from a timeout.`;
+  }
+}
+
+export class PullRequestToolTimeoutError extends Schema.TaggedError<PullRequestToolTimeoutError>()(
+  "PullRequestToolTimeoutError",
+  {
+    tool: Schema.Literals([
+      "link_pull_request",
+      "unlink_pull_request",
+      "list_thread_pull_requests",
+      "write_pull_request_guides",
+      "read_pull_request_guide",
+    ]),
+    saved: Schema.Union([Schema.Boolean, Schema.Literal("unknown")]),
+  },
+) {
+  override get message(): string {
+    if (this.tool === "list_thread_pull_requests" || this.tool === "read_pull_request_guide")
+      return `${this.tool} timed out. Server busy, nothing changed; retry shortly.`;
+    if (this.tool === "write_pull_request_guides")
+      return this.saved === false
+        ? "Writing pull request guides timed out. Nothing was started; retry shortly."
+        : "Writing pull request guides timed out. Some runs may have started; call read_pull_request_guide for each pull request before retrying.";
+    const status = this.saved === false ? "Nothing was saved." : "The change may have been saved.";
+    const action = this.tool === "link_pull_request" ? "link" : "unlink";
+    const noop = action === "link" ? "already linked" : "already unlinked";
+    return `${this.tool} timed out. ${status} Call list_thread_pull_requests to check before retrying; retrying ${action} is safe (it is a no-op when ${noop}).`;
+  }
+}
+
 export class PullRequestNotOpenError extends Schema.TaggedError<PullRequestNotOpenError>()(
   "PullRequestNotOpenError",
   { state: Schema.String },
@@ -197,6 +239,8 @@ export const PullRequestToolError = Schema.Union([
   PullRequestUnlinkFailedError,
   PullRequestListFailedError,
   PullRequestWatchFailedError,
+  PullRequestWatchTimeoutError,
+  PullRequestToolTimeoutError,
   PullRequestNotOpenError,
   PullRequestWatchFromSubagentError,
   PullRequestProjectNotFoundError,
@@ -237,6 +281,12 @@ export const WatchPullRequestResult = Schema.Struct({
   wasWatching: Schema.Boolean.annotate({
     description: "Whether it was already watched before the call.",
   }),
+  alreadyWatching: Schema.optional(Schema.Boolean).annotate({
+    description: "True when watching was already enabled and no command was dispatched.",
+  }),
+  alreadyUnwatched: Schema.optional(Schema.Boolean).annotate({
+    description: "True when watching was already disabled and no command was dispatched.",
+  }),
 });
 export type WatchPullRequestResult = typeof WatchPullRequestResult.Type;
 
@@ -273,7 +323,7 @@ export const ListThreadPullRequestsResult = Schema.Struct({
 export type ListThreadPullRequestsResult = typeof ListThreadPullRequestsResult.Type;
 
 const LinkPullRequestTool = Tool.make("link_pull_request", {
-  description: `${REGISTER_EVERY_PR} Links a pull request to this thread so T3 Code tracks it, shows its status beside the thread, and settles the thread when it merges. Pass the URL, or repository plus number. Linking an already-linked pull request succeeds with alreadyLinked=true.`,
+  description: `${REGISTER_EVERY_PR} Links a pull request to this thread so T3 Code tracks it, shows its status beside the thread, and settles the thread when it merges. Pass the URL, or repository plus number. Linking an already-linked pull request succeeds with alreadyLinked=true. On timeout, check with list_thread_pull_requests before retrying.`,
   parameters: PullRequestTargetInput,
   success: LinkPullRequestResult,
   failure: PullRequestToolError,
@@ -287,7 +337,7 @@ const LinkPullRequestTool = Tool.make("link_pull_request", {
 
 const UnlinkPullRequestTool = Tool.make("unlink_pull_request", {
   description:
-    "Remove a pull request link from this thread, for example after closing a pull request you opened by mistake. Pass the URL, or repository plus number. Unlinking a pull request that is not linked succeeds with wasLinked=false.",
+    "Remove a pull request link from this thread, for example after closing a pull request you opened by mistake. Pass the URL, or repository plus number. Unlinking a pull request that is not linked succeeds with wasLinked=false. On timeout, check with list_thread_pull_requests before retrying.",
   parameters: PullRequestTargetInput,
   success: UnlinkPullRequestResult,
   failure: PullRequestToolError,
@@ -300,7 +350,7 @@ const UnlinkPullRequestTool = Tool.make("unlink_pull_request", {
   .annotate(Tool.OpenWorld, false);
 
 const ListThreadPullRequestsTool = Tool.make("list_thread_pull_requests", {
-  description: `List the pull requests linked to a thread (omit threadId for this thread) with their last known host state, and how they chain into stacks (bottom to top). ${REGISTER_EVERY_PR}`,
+  description: `List the pull requests linked to a thread (omit threadId for this thread) with their last known host state, and how they chain into stacks (bottom to top). ${REGISTER_EVERY_PR} On timeout, retry shortly.`,
   parameters: Schema.Struct({
     threadId: Schema.optional(
       ThreadId.annotate({ description: "Thread to list. Omit for this thread." }),
@@ -318,7 +368,7 @@ const ListThreadPullRequestsTool = Tool.make("list_thread_pull_requests", {
 
 const WatchPullRequestTool = Tool.make("watch_pull_request", {
   description:
-    "Have T3 Code watch an open pull request for this thread, linking it first if needed. T3 Code checks it every two minutes and wakes you with a message when a check fails, all checks on the current head finish without failures (required or not), someone else comments or reviews, or the branch starts to conflict with its base. Use this to monitor or babysit a pull request instead of polling, sleeping, or running a watcher. Only comments posted after this call wake you, so handle the existing ones first, then end your turn. A wake is news, not a merge decision: check readiness yourself before merging. While T3 Code watches, the thread stays in the user's Working list, not their inbox. When you hand the work back to the user, call unwatch_pull_request first so the thread returns to their inbox. Watching ends when the pull request merges or closes, when its thread settles or is archived, when 8 consecutive reads cannot read or evaluate the current head (including host rate limits or mismatched head revisions), when the user stops this thread, or when you call unwatch_pull_request. Unsettle the thread before starting a new watch. A subagent cannot watch: its parent thread owns the pull request.",
+    "Have T3 Code watch an open pull request for this thread, linking it first if needed. Watching an already-watched PR returns immediately without changing the watch; on timeout, check watching with list_thread_pull_requests before retrying, and do not unwatch to recover. T3 Code checks it every two minutes and wakes you with a message when a check fails, all checks on the current head finish without failures (required or not), someone else comments or reviews, or the branch starts to conflict with its base. Use this to monitor or babysit a pull request instead of polling, sleeping, or running a watcher. Only comments posted after the watch started wake you, so handle the existing ones first, then end your turn. A wake is news, not a merge decision: check readiness yourself before merging. While T3 Code watches, the thread stays in the user's Working list, not their inbox. When you hand the work back to the user, call unwatch_pull_request first so the thread returns to their inbox. Watching ends when the pull request merges or closes, when its thread settles or is archived, when 8 consecutive reads cannot read or evaluate the current head (including host rate limits or mismatched head revisions), when the user stops this thread, or when you call unwatch_pull_request. Unsettle the thread before starting a new watch. A subagent cannot watch: its parent thread owns the pull request.",
   parameters: PullRequestTargetInput,
   success: WatchPullRequestResult,
   failure: PullRequestToolError,
@@ -332,7 +382,7 @@ const WatchPullRequestTool = Tool.make("watch_pull_request", {
 
 const UnwatchPullRequestTool = Tool.make("unwatch_pull_request", {
   description:
-    "Stop T3 Code from watching a pull request for this thread. The pull request stays linked. Pass the URL, or repository plus number.",
+    "Stop T3 Code from watching a pull request for this thread. The pull request stays linked. An already-unwatched PR returns immediately; on timeout, check watching with list_thread_pull_requests before retrying, and do not unwatch to recover. Pass the URL, or repository plus number.",
   parameters: PullRequestTargetInput,
   success: WatchPullRequestResult,
   failure: PullRequestToolError,
@@ -379,7 +429,7 @@ export type ReadPullRequestGuideResult = typeof ReadPullRequestGuideResult.Type;
 
 const WritePullRequestGuidesTool = Tool.make("write_pull_request_guides", {
   description:
-    "Write review guides for up to 20 pull requests, the tour a maintainer reads in a pull request's Guide tab. Each run reads its change in a temporary checkout and takes minutes, so this returns once the runs are under way; read a guide with read_pull_request_guide to see when it is written. A guide for the same head that is already running is joined, not restarted; a pull request whose guide is current is written again. Each pull request is read through the project in this environment whose checkout has that repository. Fails while review guides are off on this server.",
+    "Write review guides for up to 20 pull requests, the tour a maintainer reads in a pull request's Guide tab. Each run reads its change in a temporary checkout and takes minutes, so this returns once the runs are under way; read a guide with read_pull_request_guide to see when it is written. A guide for the same head that is already running is joined, not restarted; a pull request whose guide is current is written again. Each pull request is read through the project in this environment whose checkout has that repository. Fails while review guides are off on this server. On timeout, check each PR with read_pull_request_guide before retrying.",
   parameters: Schema.Struct({
     pullRequests: Schema.Array(GuideTarget).check(Schema.isMinLength(1), Schema.isMaxLength(20)),
   }),
@@ -395,7 +445,7 @@ const WritePullRequestGuidesTool = Tool.make("write_pull_request_guides", {
 
 const ReadPullRequestGuideTool = Tool.make("read_pull_request_guide", {
   description:
-    "Read a pull request's stored review guide and its run: run.Running while one is being written, run.Failed with the reason when the last one failed, guide null when none was written. stale is true after a push the guide has not caught up with. Never starts a run.",
+    "Read a pull request's stored review guide and its run: run.Running while one is being written, run.Failed with the reason when the last one failed, guide null when none was written. stale is true after a push the guide has not caught up with. Never starts a run. On timeout, retry shortly.",
   parameters: GuideTarget,
   success: ReadPullRequestGuideResult,
   failure: PullRequestToolError,

@@ -356,11 +356,87 @@ it.effect.each([
       if (outcome === "capped") {
         assert.lengthOf(logs, 2);
         assert.deepInclude(logs[1], { requestKey: "retry", taskId: "task", afterCap: true });
-        assert.oneOf(logs[1]!.outcome, ["committed", "failed"]);
-      } else assert.deepEqual(logs, [{ outcome, requestKey: "retry", taskId: "task" }]);
+        if (!masked)
+          assert.deepInclude(logs[1], {
+            outcome: "failed",
+            cause: "interrupt",
+            wait: "dispatch",
+          });
+        else assert.oneOf(logs[1]!.outcome, ["committed", "failed"]);
+      } else
+        assert.deepEqual(logs, [
+          {
+            outcome,
+            requestKey: "retry",
+            taskId: "task",
+            ...(outcome === "failed"
+              ? {
+                  cause: "failure: OrchestratorMcpFailure: create failed",
+                  wait: "dispatch",
+                }
+              : {}),
+          },
+        ]);
       const logCount = logs.length;
       yield* TestClock.adjust("2 minutes");
       assert.equal(commits, expectedCommits);
       assert.equal(logs.length, logCount);
+    }),
+);
+
+it.effect.each(["failure", "defect"] as const)(
+  "a detached %s logs its bounded cause and last wait",
+  (kind) =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const settled = yield* Deferred.make<void>();
+      const logs: Array<Record<string, unknown>> = [];
+      const logger = Logger.make(({ message }) => {
+        if (!Array.isArray(message) || message[0] !== "MCP detached operation finished") return;
+        const fields: unknown = message[1];
+        if (typeof fields !== "object" || fields === null) return;
+        logs.push({ ...fields });
+        Deferred.doneUnsafe(settled, Effect.void);
+      });
+      const message = "create failed " + "x".repeat(400);
+      const operation = Deferred.succeed(entered, undefined).pipe(
+        Effect.andThen(McpDeadline.waitingOn(Deferred.await(release), "create gate")),
+        Effect.andThen(
+          kind === "failure"
+            ? Effect.fail(new OrchestratorMcpFailure({ code: "orchestration_error", message }))
+            : Effect.die(new Error(message)),
+        ),
+      );
+      const pending = yield* McpDeadline.withDeadline(operation, {
+        code: "delegation_timeout",
+        stage: "dispatch",
+        onTimeout: "detach",
+        threadId: ThreadId.make("caller"),
+        requestKey: "retry",
+        taskId: "task",
+      }).pipe(
+        Effect.flip,
+        Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+        Effect.forkChild,
+      );
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust("10 seconds");
+      assert.equal((yield* Fiber.join(pending)).code, "delegation_timeout");
+      yield* Deferred.succeed(release, undefined);
+      yield* Deferred.await(settled);
+      assert.deepEqual(logs, [
+        {
+          outcome: "failed",
+          requestKey: "retry",
+          taskId: "task",
+          wait: "create gate",
+          cause:
+            `${kind}: ${kind === "failure" ? "OrchestratorMcpFailure" : "Error"}: ${message}`.slice(
+              0,
+              300,
+            ),
+        },
+      ]);
     }),
 );

@@ -2071,3 +2071,77 @@ it.effect("queues a plain send behind the stopped queue and releases its hold", 
     }),
   ),
 );
+
+it.effect.each(["auto", "steer"] as const)(
+  "#1574 assignment stays queued after unrelated live input ($mode)",
+  (mode) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { steered, layer, db, startFirstTurn } = yield* nextTurnSelectionHarness(
+          `assignment-${mode}`,
+        );
+        const management = ThreadManagementService.layer.pipe(
+          Layer.provideMerge(layer),
+          Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(db))),
+          Layer.provide(ServerSettings.layerTest()),
+          Layer.provideMerge(db),
+        );
+        const lifecycle = KanbanThreads.layer.pipe(
+          Layer.provide(management),
+          Layer.provide(db),
+          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+        );
+        yield* Effect.gen(function* () {
+          const threadId = yield* startFirstTurn;
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const threads = yield* KanbanThreads.KanbanThreads;
+          const before = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs[0]!;
+          const reminder = yield* threads.send({
+            threadId,
+            text: "Old reminder",
+            coalesce: "step:other",
+            mode: "queue",
+          });
+          const assignment = yield* threads.send({
+            threadId,
+            text: "New assigned card",
+            key: "assignment",
+            coalesce: "assignment:card",
+            mode: "queue",
+          });
+          if (typeof assignment !== "string") return yield* Effect.die("Assignment did not queue");
+          yield* threads.send({
+            threadId,
+            text: "Unrelated live input",
+            ...(mode === "steer" ? { mode: "steer" as const } : {}),
+          });
+          yield* worker.drain();
+          const after = yield* orchestrator.getThreadRecords(threadId, ["runs", "turnItems"]);
+          assert.equal(after.runs.find((run) => run.id === assignment)?.status, "queued");
+          assert.equal(after.runs.find((run) => run.id === before.id)?.status, "running");
+          assert.equal(
+            after.runs.find((run) => run.id === before.id)?.activeAttemptId,
+            before.activeAttemptId,
+          );
+          assert.deepEqual(steered, ["Unrelated live input"]);
+          assert.isTrue(
+            after.turnItems.some(
+              (item) =>
+                item.type === "user_message" &&
+                item.text === "Unrelated live input" &&
+                item.inputIntent === "steer",
+            ),
+          );
+          assert.equal(after.runs.find((run) => run.id === reminder)?.status, "cancelled");
+          assert.isTrue(yield* threads.cancelQueued(threadId, assignment));
+          assert.equal(
+            (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs.find(
+              (run) => run.id === assignment,
+            )?.status,
+            "cancelled",
+          );
+        }).pipe(Effect.provide(Layer.merge(layer, lifecycle)));
+      }),
+    ),
+);

@@ -1,6 +1,7 @@
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
 import * as Clock from "effect/Clock";
+import * as Deferred from "effect/Deferred";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -28,6 +29,10 @@ export class RestartAdmissionTimeoutError extends Schema.TaggedError<RestartAdmi
   "RestartAdmissionTimeoutError",
   { deadline: Schema.DateTimeUtc },
 ) {}
+export class RestartAdmissionSupersededError extends Schema.TaggedError<RestartAdmissionSupersededError>()(
+  "RestartAdmissionSupersededError",
+  {},
+) {}
 const DISPATCH_GRACE_MS = 2 * 60_000;
 const STUCK_MS = 10 * 60_000;
 
@@ -38,6 +43,9 @@ type LoadHold = {
 };
 type WaitingHold = LoadHold & {
   registeredAt?: number;
+  order?: number;
+  priority?: number;
+  activityAt?: number;
   expiredEffectId?: string;
 };
 
@@ -53,11 +61,17 @@ export class RestartPacing extends Context.Service<
       threadId: ThreadId,
       runId: RunId,
       effectId?: string,
-    ) => Effect.Effect<number, RestartPacingStateError | RestartAdmissionTimeoutError>;
+    ) => Effect.Effect<
+      number,
+      RestartPacingStateError | RestartAdmissionTimeoutError | RestartAdmissionSupersededError
+    >;
     readonly register: (source: RestartSource) => Effect.Effect<void, RestartPacingStateError>;
     readonly acquire: (
       source: RestartSource,
-    ) => Effect.Effect<number, RestartPacingStateError | RestartAdmissionTimeoutError>;
+    ) => Effect.Effect<
+      number,
+      RestartPacingStateError | RestartAdmissionTimeoutError | RestartAdmissionSupersededError
+    >;
     readonly release: (source: RestartSource) => Effect.Effect<void>;
     readonly releaseRun: (
       threadId: ThreadId,
@@ -83,6 +97,7 @@ const make = Effect.gen(function* () {
     Effect.forkScoped,
   );
   const mutex = yield* Semaphore.make(1);
+  let changed = yield* Deferred.make<void>();
   const settingsMutex = yield* Semaphore.make(1);
   let snapshot: { at: number; value: Settings } | undefined;
   const readSettingsSnapshot = Effect.fn("RestartPacing.settingsSnapshot")(
@@ -101,6 +116,10 @@ const make = Effect.gen(function* () {
     string,
     RestartSource & {
       registeredAt: number;
+      order: number;
+      runId?: RunId;
+      readyAt?: number;
+      wakeRequested?: boolean;
       priority: number;
       activityAt: number;
       loadHoldMs: number;
@@ -115,16 +134,59 @@ const make = Effect.gen(function* () {
   // A requeued run can outlive its settled start effect. Keep its load budget
   // across pruning until a replacement effect registers it again.
   const requeuedHolds = new Map<string, WaitingHold>();
+  const retiredNotes = new Map<string, RestartSource>();
   const active = new Map<
     string,
-    { source: RestartSource; dispatching: boolean; admittedAt: number; hold: LoadHold }
+    {
+      source: RestartSource;
+      runId?: RunId;
+      dispatching: boolean;
+      admittedAt: number;
+      hold: LoadHold;
+    }
   >();
+  let nextOrder = 0;
+  const superseded = new Set<string>();
   let lastStartAt: number | undefined;
   let lastProgressAt = 0;
   let pass: { at: number; config: Settings["restartPacing"]; loaded: boolean } | undefined;
   let activeCheckedAt: number | undefined;
   const runSources = new Map<string, RestartSource & { admitted?: boolean; hold?: LoadHold }>();
   const key = (source: RestartSource) => `${source.threadId}:${source.sourceRunId}`;
+  const orderedQueue = (now: number, loaded: boolean) =>
+    [...pending.values()].sort(
+      (a, b) =>
+        Number(
+          loaded &&
+            a.loadHoldMs + (a.wasLoaded ? Math.max(0, now - a.checkedAt) : 0) < MAX_LOAD_HOLD_MS,
+        ) -
+          Number(
+            loaded &&
+              b.loadHoldMs + (b.wasLoaded ? Math.max(0, now - b.checkedAt) : 0) < MAX_LOAD_HOLD_MS,
+          ) ||
+        a.priority - b.priority ||
+        a.order - b.order,
+    );
+  // Record readiness with the mutation that changes the head or frees a slot.
+  // A late timer must expose the missed deadline instead of resetting its age.
+  const queueChanged = Effect.gen(function* () {
+    const now = yield* Clock.currentTimeMillis;
+    if (pass !== undefined) {
+      const queue = orderedQueue(now, pass.loaded);
+      const head = queue[0];
+      const full = active.size >= pass.config.maxActive;
+      for (const entry of queue) if (entry !== head || full) delete entry.readyAt;
+      if (head !== undefined && !full) {
+        const credit = head.loadHoldMs + (head.wasLoaded ? Math.max(0, now - head.checkedAt) : 0);
+        const hold = pass.loaded ? Math.max(0, MAX_LOAD_HOLD_MS - credit) : 0;
+        const spacingAt =
+          lastStartAt === undefined ? head.registeredAt : lastStartAt + pass.config.spacingMs;
+        const readyAt = Math.max(now + hold, spacingAt);
+        head.readyAt = hold > 0 ? readyAt : Math.min(head.readyAt ?? readyAt, readyAt);
+      }
+    }
+    yield* Deferred.succeed(changed, undefined);
+  });
   // Called only under the pacing mutex; the enclosing operation owns tracing.
   const releaseReservation = (source: RestartSource, now: number, retrying = false) => {
     const reservation = active.get(key(source));
@@ -137,7 +199,7 @@ const make = Effect.gen(function* () {
     function* (source: RestartSource) {
       releaseReservation(source, yield* Clock.currentTimeMillis, true);
     },
-    (effect) => mutex.withPermits(1)(effect),
+    (effect) => mutex.withPermits(1)(effect.pipe(Effect.ensuring(queueChanged))),
   );
   const releaseRun = Effect.fn("RestartPacing.releaseRun")(
     function* (threadId: ThreadId, runId: RunId, effectId?: string, retrying = false) {
@@ -155,14 +217,16 @@ const make = Effect.gen(function* () {
       if (retrying && source.hold !== undefined) requeuedHolds.set(key(source), source.hold);
       else if (!retrying) requeuedHolds.delete(key(source));
       releaseReservation(source, yield* Clock.currentTimeMillis);
-      runSources.delete(runKey);
+      if (retrying) runSources.set(runKey, { ...source, admitted: false });
+      else runSources.delete(runKey);
     },
-    (effect) => mutex.withPermits(1)(effect),
+    (effect) => mutex.withPermits(1)(effect.pipe(Effect.ensuring(queueChanged))),
   );
   // Keep allocation/transfer and its finalizer metadata in the same mutex turn.
   const ownRunReservation = (source: RestartSource, runId: RunId) => {
     const reservation = active.get(key(source));
     if (reservation === undefined) return;
+    reservation.runId = runId;
     reservation.source = source;
     reservation.dispatching = false;
     runSources.set(`${source.threadId}:${runId}`, {
@@ -171,11 +235,57 @@ const make = Effect.gen(function* () {
       hold: reservation.hold,
     });
   };
-  const register = Effect.fn("RestartPacing.register")(function* (source: RestartSource) {
+  const completeRetiredNotes = Effect.fn("RestartPacing.completeRetiredNotes")(function* () {
+    for (const [noteKey, source] of retiredNotes) {
+      const closed = yield* state.status(source, null).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("restart-pacing.retired-note-cleanup-failed", {
+            threadId: source.threadId,
+            sourceRunId: source.sourceRunId,
+            cause,
+          }).pipe(Effect.as(false)),
+        ),
+      );
+      if (closed) retiredNotes.delete(noteKey);
+    }
+  });
+  const retire = Effect.fn("RestartPacing.retire")(function* (
+    source: RestartSource,
+    retainHold = false,
+  ) {
+    if (!(yield* state.status(source, null))) {
+      // A replacement still owns the note. Keep cleanup reachable by the next
+      // admission pass without keeping this retired source in the queue.
+      retiredNotes.set(key(source), source);
+    } else {
+      retiredNotes.delete(key(source));
+    }
+    const entry = pending.get(key(source));
+    if (retainHold && entry !== undefined)
+      requeuedHolds.set(key(source), {
+        registeredAt: entry.registeredAt,
+        order: entry.order,
+        priority: entry.priority,
+        activityAt: entry.activityAt,
+        loadHoldMs: entry.loadHoldMs,
+        checkedAt: entry.checkedAt,
+        wasLoaded: entry.wasLoaded,
+      });
+    pending.delete(key(source));
+    for (const [runKey, runSource] of runSources) {
+      if (key(runSource) === key(source)) runSources.delete(runKey);
+    }
+  });
+  const register = Effect.fn("RestartPacing.register")(function* (
+    source: RestartSource,
+    runId?: RunId,
+  ) {
+    if (superseded.has(key(source))) return;
     const existing = pending.get(key(source));
     if (existing !== undefined) {
+      if (existing.runId !== undefined && runId === undefined) return;
       if (source.effectId !== undefined && existing.effectId !== source.effectId) {
-        const replacement = { ...existing, effectId: source.effectId };
+        const replacement = { ...existing, effectId: source.effectId, wakeRequested: false };
         // Fresh input can requeue this run and complete its waiting note. The
         // next promotion owns a new effect, but retains its elapsed load hold.
         delete replacement.position;
@@ -187,6 +297,37 @@ const make = Effect.gen(function* () {
       return;
     }
     if (active.has(key(source))) return;
+    const previous = [...pending.values()].find((entry) => entry.threadId === source.threadId);
+    if (previous !== undefined) {
+      // An old durable retry cannot replace the successor that already took its place.
+      const ordinal = (id: string) => Number(id.match(/:ordinal:(\d+)$/)?.[1]);
+      if (ordinal(source.sourceRunId) < ordinal(previous.sourceRunId)) {
+        superseded.add(key(source));
+        yield* retire(source);
+        return;
+      }
+      yield* retire(previous);
+      superseded.add(key(previous));
+      const replacement = {
+        ...previous,
+        ...source,
+        activityAt: previous.activityAt,
+        effectId: previous.runId === undefined ? source.effectId : previous.effectId,
+        classification: source.classification ?? "continuation",
+        wakeRequested: false,
+      };
+      delete replacement.waitKey;
+      delete replacement.orderWait;
+      pending.set(key(source), replacement);
+      yield* Effect.logInfo("restart-pacing.replaced", {
+        threadId: source.threadId,
+        sourceRunId: source.sourceRunId,
+        supersededRunId: previous.sourceRunId,
+        queueOrder: previous.order,
+        priority: previous.priority,
+      });
+      return;
+    }
     const description = yield* state.describe(source);
     const retained = requeuedHolds.get(key(source));
     const hold =
@@ -196,6 +337,7 @@ const make = Effect.gen(function* () {
     pending.set(key(source), {
       ...source,
       ...description,
+      order: nextOrder++,
       registeredAt: yield* Clock.currentTimeMillis,
       loadHoldMs: 0,
       checkedAt: yield* Clock.currentTimeMillis,
@@ -207,13 +349,22 @@ const make = Effect.gen(function* () {
   });
   const acquire = Effect.fn("RestartPacing.acquire")(
     function* (source: RestartSource, runId?: RunId) {
+      yield* completeRetiredNotes();
+      // A queued wake cannot take admission back from the actual provider start.
+      if (runId === undefined && active.get(key(source))?.runId !== undefined)
+        return yield* new RestartAdmissionSupersededError();
       // Keep the dispatch-to-provider gap reserved; a running turn needs no slot.
       if (active.has(key(source))) {
         if (runId !== undefined) ownRunReservation(source, runId);
         yield* state.status(source, null);
         return 0;
       }
-      yield* register(source);
+      yield* register(source, runId);
+      const owner = pending.get(key(source));
+      if (runId === undefined && owner?.runId !== undefined)
+        return yield* new RestartAdmissionSupersededError();
+      if (owner !== undefined && runId !== undefined) owner.runId = runId;
+      if (superseded.has(key(source))) return yield* new RestartAdmissionSupersededError();
       const now = yield* Clock.currentTimeMillis;
       if (pass === undefined || now - pass.at >= PASS_MS) {
         const config = (yield* settingsSnapshot.pipe(
@@ -245,7 +396,7 @@ const make = Effect.gen(function* () {
             continue;
           }
           if (running.dispatching && now - running.admittedAt < DISPATCH_GRACE_MS) continue;
-          const stillStarting = yield* state.active(running.source).pipe(
+          const stillStarting = yield* state.active(running.source, running.runId).pipe(
             Effect.catch(() =>
               Effect.logWarning("restart-pacing.reservation-read-failed", {
                 ...running.source,
@@ -280,8 +431,7 @@ const make = Effect.gen(function* () {
           Number(loaded && a.loadHoldMs < MAX_LOAD_HOLD_MS) -
             Number(loaded && b.loadHoldMs < MAX_LOAD_HOLD_MS) ||
           a.priority - b.priority ||
-          b.activityAt - a.activityAt ||
-          key(a).localeCompare(key(b)),
+          a.order - b.order,
       );
       // Clearing a settled effect's note reads its projection only on removal;
       // live waiters need no projection reads to retry the gate.
@@ -289,22 +439,21 @@ const make = Effect.gen(function* () {
         const stale = queue[0]!;
         queue.shift();
         // Preserve the replacement's note and budget without blocking other starts.
-        if (!(yield* state.status(stale, null))) continue;
-        requeuedHolds.set(key(stale), {
-          registeredAt: stale.registeredAt,
-          loadHoldMs: stale.loadHoldMs,
-          checkedAt: stale.checkedAt,
-          wasLoaded: stale.wasLoaded,
-        });
-        pending.delete(key(stale));
-        for (const [runKey, runSource] of runSources) {
-          if (key(runSource) === key(stale)) runSources.delete(runKey);
-        }
+        yield* retire(stale, true);
       }
       const entry = pending.get(key(source));
-      if (entry === undefined) return 0;
+      if (entry === undefined) return yield* new RestartAdmissionSupersededError();
+      entry.wakeRequested = false;
       const position = queue.indexOf(entry) + 1;
       if (now - entry.registeredAt >= RESTART_ADMISSION_TIMEOUT_MS) {
+        yield* Effect.logWarning("restart-pacing.bound_failed", {
+          threadId: source.threadId,
+          sourceRunId: source.sourceRunId,
+          queuedAtMs: entry.registeredAt,
+          waitedMs: now - entry.registeredAt,
+          position,
+          hasSuccessor: yield* state.hasSuccessor(source, runId),
+        });
         yield* state.status(source, null);
         pending.delete(key(source));
         // A failed expiry commit retries this effect immediately; a new resume
@@ -374,6 +523,10 @@ const make = Effect.gen(function* () {
             position,
             loaded,
             classification: source.classification ?? "continuation",
+            priority: entry.priority,
+            queueOrder: entry.order,
+            queuedAtMs: entry.registeredAt,
+            waitedMs: now - entry.registeredAt,
             reasons: [
               ...(position > 1 ? ["queue"] : []),
               ...(active.size >= config.maxActive ? ["maxActive"] : []),
@@ -407,31 +560,37 @@ const make = Effect.gen(function* () {
         }
       }
       yield* state.status(source, null);
+      const admittedAt = yield* Clock.currentTimeMillis;
       active.set(key(source), {
         source,
         dispatching: true,
-        admittedAt: now,
+        admittedAt,
         hold: {
           // Admission ends this clock; retries retain only spent load credit.
           loadHoldMs: entry.loadHoldMs,
-          checkedAt: now,
+          checkedAt: admittedAt,
           wasLoaded: loaded,
         },
       });
       pending.delete(key(source));
-      lastStartAt = now;
-      lastProgressAt = now;
+      lastStartAt = admittedAt;
+      lastProgressAt = admittedAt;
       if (runId !== undefined) ownRunReservation(source, runId);
       yield* Effect.logInfo("restart-pacing.admitted", {
         threadId: source.threadId,
         sourceRunId: source.sourceRunId,
         active: active.size,
         loadHoldMs: entry.loadHoldMs,
+        queuedAtMs: entry.registeredAt,
+        waitedMs: admittedAt - entry.registeredAt,
+        headIdleMs: Math.max(0, admittedAt - (entry.readyAt ?? now)),
+        priority: entry.priority,
+        queueOrder: entry.order,
         classification: source.classification ?? "continuation",
       });
       return 0;
     },
-    (effect) => mutex.withPermits(1)(effect),
+    (effect) => mutex.withPermits(1)(effect.pipe(Effect.ensuring(queueChanged))),
   );
   const dispatched = Effect.fn("RestartPacing.dispatched")(
     function* (source: RestartSource, declined = false) {
@@ -452,7 +611,7 @@ const make = Effect.gen(function* () {
       reservation.dispatching = false;
       // Successful per-holder progress must not make a burst rescan every
       // earlier reservation. A failed check still needs a fresh global pass.
-      const stillStarting = yield* state.active(source).pipe(
+      const stillStarting = yield* state.active(source, reservation.runId).pipe(
         Effect.onError(() =>
           Effect.sync(() => {
             activeCheckedAt = undefined;
@@ -463,7 +622,7 @@ const make = Effect.gen(function* () {
         releaseReservation(source, yield* Clock.currentTimeMillis);
       }
     },
-    (effect) => mutex.withPermits(1)(effect),
+    (effect) => mutex.withPermits(1)(effect.pipe(Effect.ensuring(queueChanged))),
   );
   const acquireRun = Effect.fn("RestartPacing.acquireRun")(function* (
     threadId: ThreadId,
@@ -471,16 +630,87 @@ const make = Effect.gen(function* () {
     effectId?: string,
   ) {
     const runKey = `${threadId}:${runId}`;
-    const source = runSources.get(runKey) ?? (yield* state.sourceForRun(threadId, runId));
+    // Queue recovery can admit this run itself even when its persisted
+    // continuation marker still names the superseded predecessor.
+    let source =
+      runSources.get(runKey) ??
+      active.get(runKey)?.source ??
+      pending.get(runKey) ??
+      (yield* state.sourceForRun(threadId, runId));
     if (source === undefined) return 0;
+    if (superseded.has(key(source))) {
+      const current = yield* state.sourceForRun(threadId, runId);
+      if (current === undefined) return 0;
+      // Supersession retires a wake, not the input of a promoted run. Charge its
+      // start to the thread's replacement entry, or revalidate a new admission.
+      source = [...pending.values()].find((entry) => entry.threadId === threadId) ??
+        [...active.values()].find((entry) => entry.source.threadId === threadId)?.source ?? {
+          ...current,
+          sourceRunId: runId,
+        };
+      superseded.delete(key(source));
+    }
     runSources.set(runKey, { ...source, effectId, admitted: false });
     const delay = yield* acquire({ ...source, effectId }, runId);
     if (delay === 0 && !runSources.get(runKey)?.admitted) runSources.delete(runKey);
     return delay;
   });
+  // Durable retries can already be asleep for a minute when they become head.
+  // Wake only that effect; never hold a provider worker while waiting for spacing.
+  const wakeHead = Effect.fn("RestartPacing.wakeHead")(
+    function* () {
+      changed = yield* Deferred.make<void>();
+      yield* completeRetiredNotes();
+      const next = (delay?: number) => ({ delay, signal: changed });
+      if (pass === undefined || pending.size === 0)
+        return next(retiredNotes.size > 0 ? PASS_MS : undefined);
+      const now = yield* Clock.currentTimeMillis;
+      const { config, loaded } = pass;
+      const queue = orderedQueue(now, loaded);
+      while (queue.length > 0 && !(yield* state.pending(queue[0]!))) {
+        yield* retire(queue.shift()!, true);
+      }
+      const head = queue[0];
+      if (head === undefined) return next(PASS_MS);
+      const spacingAt =
+        lastStartAt === undefined ? head.registeredAt : lastStartAt + config.spacingMs;
+      const blocked =
+        active.size >= config.maxActive ||
+        (loaded &&
+          head.loadHoldMs + (head.wasLoaded ? Math.max(0, now - head.checkedAt) : 0) <
+            MAX_LOAD_HOLD_MS);
+      for (const entry of queue)
+        if (entry !== head || active.size >= config.maxActive) delete entry.readyAt;
+      if (blocked) return next(PASS_MS);
+      head.readyAt ??= Math.max(now, spacingAt);
+      if (now < spacingAt) return next(spacingAt - now);
+      if (head.wakeRequested || head.effectId === undefined) return next(PASS_MS);
+      head.wakeRequested = yield* state.wake(head);
+      // A claim may still be unwinding into its durable retry. Retry only that
+      // race; sleeping heads are woken once, at their spacing deadline.
+      return next(head.wakeRequested ? PASS_MS : 100);
+    },
+    (effect) => mutex.withPermits(1)(effect),
+  );
+  yield* Effect.gen(function* () {
+    const next = yield* wakeHead();
+    const notified = Deferred.await(next.signal);
+    yield* next.delay === undefined
+      ? notified
+      : Effect.raceFirst(notified, Effect.sleep(next.delay));
+  }).pipe(
+    Effect.catchCause((cause) =>
+      Effect.logWarning("restart-pacing.wake-failed", { cause }).pipe(
+        Effect.andThen(Effect.sleep(1000)),
+      ),
+    ),
+    Effect.forever,
+    Effect.forkScoped,
+  );
   return RestartPacing.of({
     settingsSnapshot,
-    register,
+    register: (source) =>
+      mutex.withPermits(1)(register(source).pipe(Effect.ensuring(queueChanged))),
     acquire,
     acquireRun,
     dispatched,

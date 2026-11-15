@@ -4,6 +4,8 @@
 #   bash install-host.sh image      # (re)build the offbox-base image from base-image.sh
 #   bash install-host.sh tmp-profile # only configure /tmp for future box starts; no service restarts
 #   bash install-host.sh update-policy # config and pending-restart writer only; no service restart
+#   bash install-host.sh cpu-admission # save old admission value and configure CPU backpressure; no restart
+#   bash install-host.sh cpu-admission-undo # restore the saved admission value; no restart
 # Everything that must outlive an OS reinstall is on the pool: boatd's state (dataset offbox/boatd at
 # /var/lib/boatd: database, run logs, hashed tokens) and Incus's own state (offbox/incus-var at /var/lib/incus:
 # its database of boxes, images, profiles). So this script handles both a fresh pool and one that already holds
@@ -19,6 +21,58 @@ MGMT_ASSETS=$HERE
 [ -f "$MGMT_ASSETS/offbox_mgmt_sshd_config" ] || MGMT_ASSETS=$HERE/../skill/templates/home
 POOL=offbox
 export DEBIAN_FRONTEND=noninteractive
+
+if [ "${1:-}" = cpu-admission ] || [ "${1:-}" = cpu-admission-undo ]; then
+  python3 - "${BOATD_ETC:-/etc/boatd}" "$1" <<'PY'
+import json, math, os, pathlib, sqlite3, sys, tempfile
+root, action = pathlib.Path(sys.argv[1]), sys.argv[2]
+p = root / "config.json"
+backup = root / "config.json.before-117"
+c = json.loads(p.read_text())
+if action == "cpu-admission":
+    if not backup.exists():
+        with backup.open("xb") as f:
+            os.chmod(backup, 0o600)
+            f.write(p.read_bytes())
+            f.flush()
+            os.fsync(f.fileno())
+    saved = json.loads(backup.read_text())
+    if not isinstance(saved, dict):
+        raise ValueError("saved config must be an object")
+    database = pathlib.Path(os.environ.get("BOATD_VAR", "/var/lib/boatd")) / "boatd.db"
+    if database.exists():
+        # Existing runners need the lookup index before the new admission code is installed.
+        connection = sqlite3.connect(database, timeout=30)
+        try:
+            connection.execute("CREATE INDEX IF NOT EXISTS commands_cpu_start ON commands(sync, started_at)")
+        finally:
+            connection.close()
+    c["cpu_pressure_limit"] = 50
+else:
+    # Absence meant disabled before #117; removing the key would enable the new default.
+    saved = json.loads(backup.read_text())
+    previous = saved.get("cpu_pressure_limit", 0)
+    try:
+        valid = not isinstance(previous, bool) and math.isfinite(float(previous)) and 0 <= float(previous) <= 100
+    except (TypeError, ValueError):
+        valid = False
+    c["cpu_pressure_limit"] = previous if valid else 0
+temporary = None
+try:
+    with tempfile.NamedTemporaryFile(mode="w", dir=root, prefix="config.json.", delete=False) as f:
+        temporary = pathlib.Path(f.name)
+        json.dump(c, f, indent=1)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temporary, p)
+finally:
+    if temporary is not None:
+        temporary.unlink(missing_ok=True)
+print(f"cpu_pressure_limit={c['cpu_pressure_limit']}; waiting boatd runners read this on their next admission check")
+PY
+  exit 0
+fi
 
 tmp_profile() {
   local current entry
@@ -327,6 +381,7 @@ systemctl restart incus  # re-adds its own NAT/DHCP rules after the flush
 install -d -m 700 /etc/boatd
 mkdir -p /opt/boatd
 install -m 0755 "$HERE/boatd.py" /opt/boatd/boatd.py
+install -m 0755 "$HERE/boatd-wrap" /opt/boatd/boatd-wrap
 install -m 0644 "$MGMT_ASSETS/offbox_mgmt_sshd_config" /opt/boatd/offbox_mgmt_sshd_config
 tool_log="$HERE/toollog.py"
 [ -f "$tool_log" ] || tool_log="$HERE/../skill/scripts/toollog.py"
@@ -346,6 +401,7 @@ except (OSError, ValueError):
     c = {}
 c.update(listen=sys.argv[1], ssh_host=sys.argv[1], port=c.get("port", 8443), zpool=sys.argv[2],
          state_dataset=sys.argv[2] + "/boatd")
+c.setdefault("cpu_pressure_limit", 50)
 with open(p + ".tmp", "w") as f:
     json.dump(c, f, indent=1)
 os.replace(p + ".tmp", p)
