@@ -794,6 +794,12 @@ const CardCreate = tool(
         "Work threads: take the card yourself now. It runs on your model and project.",
       ),
     ),
+    forThread: Schema.optional(
+      describe(
+        TrimmedNonEmptyString,
+        "Evaluators: give the new card to this existing work thread on the board (it keeps its context); no other thread can take it.",
+      ),
+    ),
     title: Schema.optional(Schema.String),
     description: Schema.optional(Schema.String),
     priority: Schema.optional(
