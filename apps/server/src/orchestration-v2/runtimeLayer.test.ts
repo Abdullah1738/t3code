@@ -9771,6 +9771,14 @@ it.effect.each(["starting", "running"] as const)(
         starts.length = 0;
         yield* recovery.reconcile("startup");
         yield* engine.recoverDelegatedTasks;
+        const recoveringParent = yield* engine.getThreadProjection(parentId);
+        assert.isNull(recoveringParent.subagents.find((row) => row.id === task.id)!.result);
+        assert.isFalse(
+          recoveringParent.contextTransfers.some(
+            (transfer) =>
+              transfer.type === "subagent_result" && transfer.sourceThreadId === childId,
+          ),
+        );
         yield* worker.drain();
         assert.deepEqual(starts.toSorted(), [parentId, childId].toSorted());
         const resumed = yield* engine.getThreadProjection(childId);
