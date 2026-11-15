@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import sys
 import unittest
+from janitor_test_safety import JanitorTestCase
 from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skill/scripts'
@@ -12,7 +13,7 @@ sys.path.insert(0, str(SCRIPTS))
 import worktree_reaper as reaper
 
 
-class ReaperTimeoutTests(unittest.TestCase):
+class ReaperTimeoutTests(JanitorTestCase):
     def test_discovery_timeout_does_not_abort_other_repos(self):
         def run(cmd, **kwargs):
             if '/slow' in cmd:
