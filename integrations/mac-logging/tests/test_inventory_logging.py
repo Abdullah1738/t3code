@@ -185,7 +185,10 @@ class InventoryLoggingTests(unittest.TestCase):
         parts = [child/('%04d'%i) for i in range(129)]
         for part in parts:
             part.mkdir()
-        own = ((child.stat().st_blocks*512+1023)//1024)*1024
+        # Keep the exact 20% boundary independent of delayed directory-block
+        # allocation between the fixture's stat and the scanner's later lstat.
+        metadata = child.stat()
+        own = ((metadata.st_blocks*512+1023)//1024)*1024
         for old, new, notable in [(1024, 1024, False), (500, 400, True),
                                   (500, 600, True), (500, 405, False)]:
             with self.subTest(old=old, new=new), patch.dict(os.environ, TOOLLOG_DIR=str(self.logs/str(new))):
@@ -198,7 +201,8 @@ class InventoryLoggingTests(unittest.TestCase):
                     return SimpleNamespace(returncode=0, stderr='', stdout=''.join(
                         '%d\t%s\n' % ((new*1024**2-own)//1024 if key == str(parts[0]) else 0, key)
                         for key in cmd[2:]))
-                deep_inventory.run_pass([self.root], run, budget=100)
+                with patch.object(jobs.os, 'lstat', return_value=metadata):
+                    deep_inventory.run_pass([self.root], run, budget=100)
                 rows = [r for p in (self.logs/str(new)).glob('*.ndjson')
                         for r in map(json.loads, p.read_text().splitlines())]
                 self.assertEqual(sum(r['name'] == 'disk.inventory.source' and r['props']['source'] == str(child)
