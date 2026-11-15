@@ -532,7 +532,7 @@ const CardAskChange = tool(
     blocking: Schema.optional(
       describe(
         Schema.Boolean,
-        "true makes an async ask blocking. A blocking ask can't be made async.",
+        "true makes an async ask blocking. false is accepted only on an ask that is already async (no change); a blocking ask can't be made async.",
       ),
     ),
     revisionNote: Schema.optional(describe(Schema.String, "One line: what you changed and why.")),
