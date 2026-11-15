@@ -704,6 +704,15 @@ export const approvalProblem = (
 export const MAX_SUBTASKS = 30;
 export const MAX_TEXT = 500;
 
+// Only presentation changes may reuse approval for the previous wording.
+const approvalText = (text: string) =>
+  text
+    .trim()
+    .replace(/\s+/g, " ")
+    .replace(/[.!;:]+$/, "")
+    .trimEnd()
+    .toLowerCase();
+
 export interface SubtaskInput {
   /** An existing id alone keeps the subtask unchanged; leave out for a new one. */
   readonly id?: string | undefined;
@@ -932,12 +941,11 @@ export function planSubtasks(
             ? known.gateCleared
             : undefined;
       // Cosmetic edits keep the approval's time bound, including its absence on legacy plans.
-      const inferred = text !== known.text ? inferGate(text) : undefined;
       const approvalChanged =
         gate !== previousGate ||
-        (gateSource === "set" && known.gateSource !== "set") ||
+        (input.gate != null && gateSource === "set" && known.gateSource !== "set") ||
         script !== known.script ||
-        (inferred !== undefined && inferred !== inferGate(known.text));
+        approvalText(text) !== approvalText(known.text);
       planned.push({
         ...rest,
         step,

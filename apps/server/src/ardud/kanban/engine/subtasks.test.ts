@@ -1532,7 +1532,8 @@ describe("planSubtasks", () => {
       later,
     );
     if (!plan.ok) throw new Error(plan.reason);
-    expect(plan.subtasks[0]).toMatchObject({ gate: "deploy", createdAt: at });
+    // Rewording a retained gate requires a new approval, even with gate:null.
+    expect(plan.subtasks[0]).toMatchObject({ gate: "deploy", createdAt: later });
   });
 
   it.each([undefined, "secret", "deploy", "money"] as const)(
@@ -1649,7 +1650,7 @@ describe("planSubtasks approval clock", () => {
     return plan.subtasks[0]!;
   };
 
-  it("replays #621's read-back reword and a same-text gate:null edit after signoff", () => {
+  it("requires fresh approval for #621's gated read-back reword, then preserves a same-text re-listing", () => {
     const known = {
       ...step,
       text: "Owner read-back on the installed desktop build: post in a board chat after a server stall without Cmd+R.",
@@ -1663,9 +1664,10 @@ describe("planSubtasks approval clock", () => {
       gate: null,
     });
     const relisted = replan(reworded, { id: "s4", text: readBack, gate: null });
-    expect(relisted.createdAt).toBe(before);
+    // The retained gate makes this reword a replacement, even for a read-back.
+    expect(relisted.createdAt).toBe(edited);
     expect(relisted.gate).toBe("deploy");
-    expect(approvalProblem(approvedCard(relisted), relisted)).toBeNull();
+    expect(approvalProblem(approvedCard(relisted), relisted)).toContain(`since ${edited}`);
   });
 
   it.each([
@@ -1675,12 +1677,84 @@ describe("planSubtasks approval clock", () => {
     { id: "s4", text: readBack, gate: null },
     { id: "s4", text: `  ${readBack}  ` },
     { id: "s4", step: 7 },
-    { id: "s4", text: "Read back the board chat result." },
   ])("preserves the clock and approval for an immaterial edit: %j", (input) => {
     const saved = replan(step, input);
     expect(saved.createdAt).toBe(before);
     expect(approvalProblem(approvedCard(saved), saved)).toBeNull();
   });
+
+  it.each([
+    { gate: "deploy", text: "Deploy build 41", replacement: "Deploy build 42" },
+    { gate: "deploy", text: "Deploy to host-a", replacement: "Deploy to host-b" },
+    {
+      gate: "money",
+      text: "Pay the invoice for AED 100",
+      replacement: "Pay the invoice for AED 200",
+    },
+    { gate: "money", text: "Pay the invoice to Alice", replacement: "Pay the invoice to Bob" },
+    {
+      gate: "secret",
+      text: "Rotate the API key for staging",
+      replacement: "Rotate the API key for production",
+    },
+    { gate: "deploy", text: readBack, replacement: "Read back the board chat result." },
+  ] as const)(
+    "restarts a same-kind $gate gate for $text → $replacement",
+    ({ gate, text, replacement }) => {
+      for (const taskOwner of ["evaluator", "script"] as const) {
+        const script = taskOwner === "script" ? "land" : undefined;
+        const known = { ...step, text, gate, owner: taskOwner, script };
+        expect(approvalProblem(approvedCard(known), known)).toBeNull();
+        expect(inferGate(replacement)).toBe(inferGate(text));
+        const saved = replan(known, { id: "s4", text: replacement, script });
+        expect(saved).toMatchObject({ gate, createdAt: edited });
+        expect(approvalProblem(approvedCard(saved), saved)).toContain(`since ${edited}`);
+        // An answer after the edit still cannot approve a question presented before it.
+        const pending = {
+          ...signoff,
+          answer: { verdict: "approved" as const, by: owner, at: edited },
+          closedAt: edited,
+        };
+        expect(approvalProblem({ ...approvedCard(saved), asks: [pending] }, saved)).toContain(
+          `since ${edited}`,
+        );
+        const fresh = { ...pending, at: edited };
+        expect(approvalProblem({ ...approvedCard(saved), asks: [fresh] }, saved)).toBeNull();
+      }
+    },
+  );
+
+  it.each(["deploy", "money", "secret"] as const)("preserves cosmetic %s edits", (gate) => {
+    const text = {
+      deploy: "Deploy build 41",
+      money: "Pay the invoice",
+      secret: "Rotate the API key",
+    }[gate];
+    for (const replacement of [
+      `  ${text}  `,
+      text.replaceAll(" ", " \t\n "),
+      text.toUpperCase(),
+      ...[".", "!", ";", ":"].map((suffix) => `${text}${suffix}`),
+    ]) {
+      const saved = replan({ ...step, text, gate }, { id: "s4", text: replacement });
+      expect(saved.createdAt).toBe(before);
+      expect(approvalProblem(approvedCard(saved), saved)).toBeNull();
+    }
+  });
+
+  it.each(["ownerOnly", "interrupting"] as const)(
+    "keeps the clock for an existing gate's %s toggle",
+    (flag) => {
+      for (const gateSource of [undefined, "guessed", "set"] as const) {
+        for (const value of [false, true]) {
+          const known = { ...step, gateSource, [flag]: !value };
+          const saved = replan(known, { id: "s4", [flag]: value });
+          expect(saved.createdAt).toBe(before);
+          expect(approvalProblem(approvedCard(saved), saved)).toBeNull();
+        }
+      }
+    },
+  );
 
   it.each([
     ["deploy", "Deploy the helper after the read-back."],
@@ -1746,6 +1820,38 @@ describe("planSubtasks approval clock", () => {
     expect(saved.createdAt).toBe(edited);
   });
 
+  it("keeps an unstored inferred gate's clock when re-listing the same text", () => {
+    const { gate: _gate, gateSource: _source, ...legacy } = step;
+    const saved = replan(
+      { ...legacy, text: "Deploy build 41" },
+      { id: "s4", text: "Deploy build 41" },
+    );
+    expect(saved).toMatchObject({ gate: "deploy", createdAt: before });
+  });
+
+  it("allows an evaluator to clear a guessed gate while rewording a read-back", () => {
+    const plan = planSubtasks(
+      [step],
+      [
+        {
+          id: "s4",
+          text: "Read back the result.",
+          gate: null,
+          clearGate: "This step only reads the result; it changes no live service",
+        },
+      ],
+      4,
+      edited,
+      undefined,
+      { _tag: "evaluator", threadId: ThreadId.make("evaluator") },
+    );
+    if (!plan.ok) throw new Error(plan.reason);
+    const saved = plan.subtasks[0]!;
+    expect(gateOf(saved)).toBeUndefined();
+    expect(saved.gateCleared?.text).toBe("Read back the result.");
+    expect(approvalProblem({ ...approvedCard(saved), asks: [] }, saved)).toBeNull();
+  });
+
   it.each([
     { previous: undefined, script: "land" },
     { previous: "land", script: "land-v2" },
@@ -1766,7 +1872,7 @@ describe("planSubtasks approval clock", () => {
 
   it.each([
     { id: "s4", gate: null },
-    { id: "s4", text: "Read back the result" },
+    { id: "s4", text: `  ${readBack}  ` },
   ])("preserves an absent legacy createdAt: %j", (input) => {
     const { createdAt: _createdAt, ...legacy } = step;
     const saved = replan(legacy, input);
@@ -1774,7 +1880,15 @@ describe("planSubtasks approval clock", () => {
     expect(approvalProblem(approvedCard(saved), saved)).toBeNull();
   });
 
-  it("keeps the Offbox #133 approval through gate:null and a reword of read-back and tell-back steps", () => {
+  it("restarts an absent legacy clock for a meaningful gated reword", () => {
+    const { createdAt: _createdAt, ...legacy } = step;
+    const saved = replan(legacy, { id: "s4", text: "Read back the result" });
+    // Legacy plans need a new bound when the gated action changes too.
+    expect(saved.createdAt).toBe(edited);
+    expect(approvalProblem(approvedCard(saved), saved)).toContain(`since ${edited}`);
+  });
+
+  it("keeps Offbox #133's gate:null re-listing but requires fresh approval for gated rewords", () => {
     const tasks = ["s1", "s8", "s9"].map((id) => ({
       ...step,
       id,
@@ -1794,6 +1908,15 @@ describe("planSubtasks approval clock", () => {
       edited,
     );
     if (!sameText.ok) throw new Error(sameText.reason);
+    for (const saved of sameText.subtasks) {
+      expect(saved.createdAt).toBe(before);
+      expect(
+        approvalProblem(
+          { number: 133, createdAt: before, asks, subtasks: sameText.subtasks },
+          saved,
+        ),
+      ).toBeNull();
+    }
     const reworded = planSubtasks(
       sameText.subtasks,
       tasks.map((s) => ({ id: s.id, text: "Read back the result." })),
@@ -1802,13 +1925,14 @@ describe("planSubtasks approval clock", () => {
     );
     if (!reworded.ok) throw new Error(reworded.reason);
     for (const saved of reworded.subtasks) {
-      expect(saved.createdAt).toBe(before);
+      // A read-back reword still invalidates the go while its deploy gate remains.
+      expect(saved.createdAt).toBe(edited);
       expect(
         approvalProblem(
           { number: 133, createdAt: before, asks, subtasks: reworded.subtasks },
           saved,
         ),
-      ).toBeNull();
+      ).toContain(`since ${edited}`);
     }
   });
 });
