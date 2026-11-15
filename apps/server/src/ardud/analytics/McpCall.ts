@@ -68,6 +68,7 @@ const BOARD_BUSY =
   /^(?:Missions board conflict: )?(?:Board busy: not written|Not saved \(board busy\))/;
 const TYPED_OUTCOMES = {
   TimeoutError: "timeout",
+  PullRequestWatchTimeoutError: "timeout",
   PreviewAutomationTimeoutError: "timeout",
   PreviewAutomationRecordingDeadlineExpiredError: "timeout",
   PreviewAutomationUnavailableError: "refused",

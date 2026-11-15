@@ -1,4 +1,4 @@
-import { cardKind, toolError, toolLog } from "./toollog.ts";
+import { cardKind, logCardRender, toolError } from "./toollog.ts";
 /**
  * Sendblue fetches a static card's image outside the tailnet. Read it here and use the existing
  * media upload, so the page can stay private and the provider never receives an unreachable image URL.
@@ -53,36 +53,45 @@ export function ogImageOf(html: string, pageUrl: string): string | undefined {
   return undefined;
 }
 
-export function cardPreviewImage(upload: (file: LineFile) => Promise<string>, fetchFn: typeof fetch = fetch) {
+export function cardPreviewImage(upload: (file: LineFile) => Promise<string>, fetchFn: typeof fetch = fetch, chat?: string) {
   return async (pageUrl: string): Promise<string | undefined> => {
     const at = performance.now();
     let ok = false;
+    let failureCode = "invalid_url";
     try {
     if (!httpsUrl(pageUrl)) throw new LineError("Card preview is unavailable", "card_preview_unavailable", true, false);
     try {
+      failureCode = "page_fetch";
       const page = await fetchFn(pageUrl, { redirect: "follow", signal: AbortSignal.timeout(TIMEOUT_MS) });
       if (!page.ok || !/text\/html/i.test(page.headers.get("content-type") ?? "")) {
+        failureCode = page.ok ? "page_type" : "page_http";
         await page.body?.cancel();
         throw new Error("invalid preview page");
       }
+      failureCode = "page_body";
       const html = await boundedBody(page, MAX_HTML);
       if (!html) throw new Error("invalid preview page");
       const image = ogImageOf(new TextDecoder().decode(html), page.url || pageUrl);
-      if (!image) { ok = true; return undefined; }
+      if (!image) { failureCode = "none"; ok = true; return undefined; }
+      failureCode = "image_fetch";
       const response = await fetchFn(image, { redirect: "manual", signal: AbortSignal.timeout(TIMEOUT_MS) });
       const mimeType = (response.headers.get("content-type") ?? "").split(";", 1)[0]!.trim().toLowerCase();
       const extension = Object.hasOwn(IMAGE_EXTENSIONS, mimeType) ? IMAGE_EXTENSIONS[mimeType] : undefined;
-      if (response.status !== 200 || !extension) { await response.body?.cancel(); throw new Error("invalid preview image"); }
+      if (response.status !== 200 || !extension) { failureCode = response.status !== 200 ? "image_http" : "image_type"; await response.body?.cancel(); throw new Error("invalid preview image"); }
+      failureCode = "image_body";
       const data = await boundedBody(response, MAX_IMAGE);
       if (!data) throw new Error("invalid preview image");
+      failureCode = "upload";
       const uploaded = await upload({ data, name: `preview.${extension}`, mimeType });
+      failureCode = "upload_url";
       const result = httpsUrl(uploaded);
       if (!result) throw new Error("invalid preview upload");
+      failureCode = "none";
       ok = true;
       return result.href;
     } catch (caughtError) { toolError("card-preview", "card-preview.catch3", caughtError);
       throw new LineError("Card preview is unavailable", "card_preview_unavailable", true, false);
     }
-    } finally { toolLog.capture(() => toolLog.write({ component: "cards", kind: "perf", name: "card.render", ok, durationMs: performance.now() - at, props: { cardKind: cardKind(pageUrl) } })); }
+    } finally { logCardRender("cards", cardKind(pageUrl), performance.now() - at, ok, { chat, failureCode }); }
   };
 }
