@@ -5929,6 +5929,47 @@ const make = Effect.gen(function* () {
     return events.findLast((event) => event.kind === "moved" && event.toStage === "needs_owner");
   });
 
+  // A parked card must not observe a sibling's model between its switch and commit.
+  // Wait outside the board gate, then keep the model lock through attachment/slot saving.
+  const lockOwnerParkModel = Effect.fn("KanbanService.lockOwnerParkModel")(function* (
+    card: KanbanCard,
+    discussion?: KanbanDiscussion,
+  ) {
+    const parked = card.ownerPark;
+    if (
+      card.stage !== "needs_owner" ||
+      parked?.stage !== "working" ||
+      parked.threadId === null ||
+      parked.threadId !== card.workThreadId
+    )
+      return Effect.void;
+    const lock = threadModelLock(parked.threadId);
+    const acquire = Effect.gen(function* () {
+      yield* lock.take(1);
+      let held = true;
+      return Effect.suspend(() => {
+        if (!held) return Effect.void;
+        held = false;
+        return Effect.asVoid(lock.release(1));
+      });
+    });
+    return yield* Effect.acquireRelease(
+      locks.outside(
+        acquire,
+        (release) => release,
+        true,
+        Effect.gen(function* () {
+          if (!sameCardState(yield* rawStore.card(card.id), card)) return false;
+          return (
+            discussion === undefined ||
+            NodeUtil.isDeepStrictEqual(yield* rawStore.discussion(discussion.id), discussion)
+          );
+        }),
+      ),
+      (release) => release,
+    );
+  });
+
   /** Reattach a parked worker without a dispatch or a second assignment wake. */
   const restoreOwnerPark = Effect.fn("KanbanService.restoreOwnerPark")(function* (
     card: KanbanCard,
@@ -6262,6 +6303,7 @@ const make = Effect.gen(function* () {
     /** A typed answer to store on the asks it closes, and how the card's move reads in its history. */
     record?: { readonly answer: KanbanAskAnswer; readonly moved: string },
   ) {
+    const releaseModel = yield* lockOwnerParkModel(card, discussion);
     const at = yield* nowIso;
     const open = kanbanOpenAsks(card);
     const answered = open.filter(which);
@@ -6414,6 +6456,7 @@ const make = Effect.gen(function* () {
       const reply = yield* ownerRestoredReply;
       if (restored && reply !== undefined) reply.notice = notice;
     }
+    yield* releaseModel;
     if (answeredBy._tag === "owner")
       for (const ask of next.asks) {
         if (!answeredIds.has(ask.id) || ask.answer?.verdict === "dropped") continue;
@@ -6444,7 +6487,7 @@ const make = Effect.gen(function* () {
     }
     if (unblock) yield* kick;
     return { told, discussion: current, card: next };
-  });
+  }, Effect.scoped);
 
   /**
    * The telling half of `answerAsks`: the evaluator whose blocking ask held the
@@ -17375,6 +17418,7 @@ const make = Effect.gen(function* () {
         const card = (yield* upgradeFindings([yield* cardOf(cardId)]))[0]!;
         if (action !== "stop" && (yield* boardOf(card.boardId)).archivedAt !== null)
           return yield* failWith("denied", "Board is deleted");
+        const releaseModel = action === "wake" ? yield* lockOwnerParkModel(card) : Effect.void;
         const at = yield* nowIso;
         // Eligibility controls when the note is delivered, never whether newer
         // wake/reset text can discard context that has not reached the worker.
@@ -17607,8 +17651,10 @@ const make = Effect.gen(function* () {
           body: "Woken",
         });
         yield* saveCard(next, undefined, false, next.stage === "working" ? "restore" : undefined);
-        if (next.stage === "working" && next.activeThreadId !== null) {
+        if (next.stage === "working" && next.activeThreadId !== null)
           yield* dropHold(next.activeThreadId, "join", next.id);
+        yield* releaseModel;
+        if (next.stage === "working" && next.activeThreadId !== null) {
           const wake: Extract<BoardEffect, { readonly kind: "ownerWake" }> = {
             kind: "ownerWake",
             cardId: next.id,
@@ -17629,7 +17675,7 @@ const make = Effect.gen(function* () {
         yield* laterEvaluatorTurn(card, next, actor);
         yield* kick;
         return next;
-      }),
+      }).pipe(Effect.scoped),
     );
 
   /**

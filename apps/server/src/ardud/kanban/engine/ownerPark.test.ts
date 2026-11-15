@@ -3,6 +3,7 @@ import { ThreadId, AnalyticsEvent } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
 import * as FileSystem from "effect/FileSystem";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
@@ -740,6 +741,109 @@ it.effect(
           Rules.poolKey(switched),
         );
       }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect.each(["answer", "drop", "wake", "post", "pick"] as const)(
+  "restored %s serializes with a sibling's unfinished model switch",
+  (close) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const switched = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const closing = yield* Deferred.make<void>();
+      let gated = true;
+      const layer = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (real) =>
+          KanbanThreads.of({
+            ...real,
+            setModel: (threadId, model) =>
+              real.setModel(threadId, model).pipe(
+                Effect.andThen(
+                  Effect.suspend(() => {
+                    if (!gated) return Effect.void;
+                    gated = false;
+                    return Deferred.succeed(switched, undefined).pipe(
+                      Effect.andThen(Deferred.await(release)),
+                    );
+                  }),
+                ),
+              ),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, board, card, threadId, worker } = yield* workingCard();
+        const sibling = yield* kanban.createForThread(threadId, {
+          title: "Sibling",
+          prompt: "Sibling",
+        });
+        yield* kanban.askOwner(
+          card.id,
+          {
+            question: "Continue?",
+            blocking: true,
+            ...(close === "pick" ? { options: ["Yes", "No"] } : {}),
+          },
+          worker,
+          "cardThread",
+        );
+        const discussion = yield* kanban.cardDiscussion(card.id);
+        const ask = askOf((yield* kanban.card(card.id)).card);
+        const model = modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", variant: "max" });
+        yield* kanban.setPool(board.id, model, 2);
+        const editing = yield* Effect.forkChild(
+          kanban.editCard(sibling.card.id, { model }, owner).pipe(Effect.result),
+        );
+        yield* Deferred.await(switched);
+        assert.deepEqual((yield* Ref.get(fake.threads)).get(threadId)?.model, model);
+        assert.deepEqual((yield* kanban.card(sibling.card.id)).card.model, card.model);
+        const restoring = yield* Effect.forkChild(
+          Effect.gen(function* () {
+            yield* Deferred.succeed(closing, undefined);
+            if (close === "answer")
+              yield* kanban.answerAsk(
+                card.id,
+                ask.id,
+                { verdict: "answered", text: "Yes", revision: 0 },
+                owner,
+              );
+            else if (close === "drop")
+              yield* kanban.changeAsk(card.id, ask.id, "drop", owner, "owner");
+            else if (close === "wake") yield* kanban.cardThread(card.id, "wake", "Continue", owner);
+            else if (close === "post")
+              yield* kanban.post(discussion.id, owner, [{ _tag: "md", text: "Yes" }]);
+            else
+              yield* kanban.answer(discussion.id, ask.seq!, ask.id, [ask.options![0]!.id], owner);
+          }),
+        );
+        yield* Deferred.await(closing);
+        yield* Effect.yieldNow;
+        assert.isUndefined(restoring.pollUnsafe());
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(editing);
+        yield* Fiber.join(restoring);
+        const restored = (yield* kanban.card(card.id)).card;
+        const carried = (yield* kanban.card(sibling.card.id)).card;
+        const current = (yield* Ref.get(fake.threads)).get(threadId)?.model;
+        assert.equal(restored.stage, "working");
+        assert.equal(restored.activeThreadId, threadId);
+        assert.deepEqual(restored.model, current);
+        assert.deepEqual(carried.model, current);
+        assert.equal(restored.activePool, carried.activePool);
+        assert.equal(restored.activePool, Rules.poolKey(restored.model));
+        for (const target of [card.id, sibling.card.id]) {
+          yield* kanban.cardThread(target, "wake", "Continue with the shared model", owner);
+          assert.deepEqual((yield* Ref.get(fake.threads)).get(threadId)?.model, current);
+        }
+        const slots = yield* (yield* KanbanStore.KanbanStore).openSlots(board.id);
+        assert.equal(slots.filter((slot) => slot.threadId === threadId).length, 1);
+        assert.equal(
+          slots.find((slot) => slot.threadId === threadId)?.poolKey,
+          restored.activePool,
+        );
+      }).pipe(Effect.provide(testLayer(layer)));
     }),
 );
 
