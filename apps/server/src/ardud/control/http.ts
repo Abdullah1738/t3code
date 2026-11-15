@@ -1269,7 +1269,7 @@ const makeRoutes = Effect.gen(function* () {
               : Buffer.from(encodeUserMessageCursorJson(page.next)).toString("base64url"),
         });
       }).pipe(NodeSqliteClient.foregroundReads),
-      "poll",
+      "controlRead",
     );
   });
 
@@ -1277,8 +1277,8 @@ const makeRoutes = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
     const threadId = yield* param("threadId");
     const params = yield* searchParams;
-    // Bridge polls read one thread: they queue on the poll lane only, never
-    // behind thread lists, HTTP snapshots or MCP reads.
+    // Share the single foreground control permit with cross-thread messages;
+    // a burst must leave the second foreground reader available to the UI.
     const page = yield* ReplyBuilders.bounded(
       Effect.gen(function* () {
         yield* getShell(threadId);
@@ -1299,8 +1299,8 @@ const makeRoutes = Effect.gen(function* () {
                 : clampInt(params.get("limit"), DEFAULT_MESSAGE_LIMIT, 1000),
           })
           .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
-      }),
-      "poll",
+      }).pipe(NodeSqliteClient.foregroundReads),
+      "controlRead",
     );
     return yield* encoded({
       ok: true,
