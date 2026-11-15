@@ -65,16 +65,16 @@ class ConvergenceTests(unittest.TestCase):
                     deep.run_pass(roots, self.runner(cost,calls), budget=budget)
                     duration = self.clock[0]-start
                     state = jobs.read_state('disk-inventory')
-                    complete = sum(not jobs.inventory_needs_measurement(v,self.now+self.clock[0])
-                                   for cache in state['childState'].values() for v in cache.values())
+                    complete = sum(not jobs.inventory_needs_measurement(v,self.now+self.clock[0],root=root_key)
+                                   for root_key, cache in state['childState'].items() for v in cache.values())
                     results.append(dict(passNumber=night+1, seconds=duration, complete=complete,
                                         remaining=sum(count for _,count in counts)-complete))
                     self.assertLessEqual(duration,budget+.001)
                     # No raw retry of a known timeout. All its later work is parts.
                     for giant in giants:
                         raw = [cmd for cmd,_ in calls if str(giant) in cmd[2:]]
-                        self.assertLessEqual(len(raw),0 if str(giant) in known else 2)
-                        self.assertLessEqual(sum(len(cmd)==3 for cmd in raw),0 if str(giant) in known else 1)
+                        self.assertLessEqual(len(raw),0 if str(giant) in known else 4)
+                        self.assertLessEqual(sum(len(cmd)==3 for cmd in raw),0 if str(giant) in known else 3)
                         spent = sum(min(cost(Path(key)),timeout) for cmd,timeout in calls
                                     for key in cmd[2:] if Path(key).parent == giant)
                         self.assertLessEqual(spent,600)
@@ -83,7 +83,7 @@ class ConvergenceTests(unittest.TestCase):
                     self.clock[0] = (night+1)*86400
                 evidence[str(budget)] = results
                 if budget == 2700:
-                    self.assertTrue(state['partials'], '24 h expiry prevents accumulating a >45 min sweep across nights')
+                    self.assertTrue(state['partials'], '45 min passes cannot fit discovery and refresh within the freshness window')
                 else:
                     self.assertFalse(state['partials'])
                     self.assertEqual(complete,4499)
@@ -140,11 +140,11 @@ class ConvergenceTests(unittest.TestCase):
                 ordinary_remaining={}
                 for root in roots:
                     cache=state['childState'][str(root)]
-                    ordinary_remaining[root.name]=sum(jobs.inventory_needs_measurement(cache.get(str(p)),self.now+self.clock[0])
+                    ordinary_remaining[root.name]=sum(jobs.inventory_needs_measurement(cache.get(str(p)),self.now+self.clock[0],root=root)
                         for p in topology[root] if p not in giants)
-                for cache in state['childState'].values():
+                for root_key, cache in state['childState'].items():
                     for value in cache.values():
-                        complete+=not jobs.inventory_needs_measurement(value,self.now+self.clock[0])
+                        complete+=not jobs.inventory_needs_measurement(value,self.now+self.clock[0],root=root_key)
                         if 'parts' in value:
                             if value.get('partial') is False:
                                 self.assertEqual(value['partsDone'],value['partsTotal'])
@@ -188,7 +188,7 @@ class ConvergenceTests(unittest.TestCase):
             (child/name).mkdir()
         key = str(child)
         jobs.save_state('disk-inventory',dict(duMode='links',childState={str(root):{
-            key:dict(timeouts=2,lastTimeoutAt=self.now,attemptedAt=self.now,partial=True)}}))
+            key:dict(timeouts=2,lastTimeoutS=60,lastTimeoutAt=self.now,attemptedAt=self.now,partial=True)}}))
         normal = self.runner(lambda p:1)
         calls = []
         def killed(command,**kwargs):
@@ -224,7 +224,7 @@ class ConvergenceTests(unittest.TestCase):
         for name in ('a','b','c'):
             (child/name).mkdir()
         jobs.save_state('disk-inventory',dict(duMode='links',childState={str(root):{
-            str(child):dict(timeouts=2,partial=True)}}))
+            str(child):dict(timeouts=2,lastTimeoutS=60,partial=True)}}))
         for night in range(3):
             self.clock[0]=night*86400
             started=self.clock[0]
@@ -278,7 +278,7 @@ class ConvergenceTests(unittest.TestCase):
                 for i in range(count):
                     (child/str(i)).mkdir()
                 jobs.save_state('disk-inventory',dict(duMode='links',childState={str(root):{
-                    str(child):dict(timeouts=2,partial=True)}}))
+                    str(child):dict(timeouts=2,lastTimeoutS=60,partial=True)}}))
                 for night in range(expected_night):
                     self.clock[0]=night*86400
                     started=self.clock[0]
@@ -334,7 +334,7 @@ class ConvergenceTests(unittest.TestCase):
         ordinary=str(roots[0]/'0000')
         jobs.save_state('disk-inventory',dict(duMode='links',childState={
             str(roots[0]):{ordinary:dict(bytes=1024,at=self.now-86400+10,partial=False)},
-            str(roots[1]):{str(child):dict(timeouts=2,partial=True)}}))
+            str(roots[1]):{str(child):dict(timeouts=2,lastTimeoutS=60,partial=True)}}))
         calls=[]
         deep.run_pass(roots,self.runner(lambda p:600 if p.name=='part' else 1,calls),budget=600)
         state=jobs.read_state('disk-inventory')
@@ -342,20 +342,21 @@ class ConvergenceTests(unittest.TestCase):
         self.assertNotIn(str(roots[0]),state['partials'])
         self.assertTrue(state['childState'][str(roots[1])][str(child)]['partial'])
 
-    def test_new_timeout_cannot_bypass_ordinary_priority_after_reserved_parts_turn(self):
+    def test_new_timeout_cannot_take_second_early_part_before_ordinary_peer(self):
         for count in (1,130):
             with self.subTest(batch=count>1):
                 roots=self.roots([('a-known-%d'%count,1),('b-new-%d'%count,count),('c-ordinary-%d'%count,1)])
                 for root in roots[:2]:
                     (root/'0000'/'part').mkdir()
                 jobs.save_state('disk-inventory',dict(duMode='links',childState={str(roots[0]):{
-                    str(roots[0]/'0000'):dict(timeouts=2,partial=True)}}))
+                    str(roots[0]/'0000'):dict(timeouts=2,lastTimeoutS=60,partial=True)}}))
+                (roots[1]/'0000'/'part2').mkdir()
                 self.clock[0]=0
                 calls=[]
-                deep.run_pass(roots,self.runner(lambda p:350 if p.name=='part' else 700
-                    if p==roots[1]/'0000' else 1,calls),budget=600)
+                deep.run_pass(roots,self.runner(lambda p:350 if p.name.startswith('part') else 700
+                    if p==roots[1]/'0000' else 1,calls),budget=1200)
                 keys=[key for cmd,_ in calls for key in cmd[2:]]
-                self.assertLess(keys.index(str(roots[2]/'0000')),keys.index(str(roots[1]/'0000'/'part')))
+                self.assertLess(keys.index(str(roots[2]/'0000')),keys.index(str(roots[1]/'0000'/'part2')))
                 self.assertNotIn(str(roots[2]),jobs.read_state('disk-inventory')['partials'])
 
     def test_budget_truncated_probe_does_not_classify_an_ordinary_child_as_slow(self):
@@ -366,7 +367,8 @@ class ConvergenceTests(unittest.TestCase):
                 cache={child:dict(bytes=1024,at=self.now-90000,attemptedAt=0,partial=False)}
                 self.clock[0]=0
                 jobs.big_root_inventory(root,self.runner(lambda p:20),allowance,cache,deep=True,max_batches=1)
-                self.assertEqual(bool(cache[child].get('timeouts')),allowance>=15)
+                self.assertFalse(cache[child].get('timeouts'))
+                self.assertEqual(cache[child]['probeTimeouts'],1)
                 self.assertEqual(jobs.inventory_deep_owned(cache[child],self.now+self.clock[0]),allowance>=15)
 
     def test_background_runner_reports_effective_probe_allowance_before_cleanup(self):
@@ -393,7 +395,8 @@ class ConvergenceTests(unittest.TestCase):
                 with patch.object(deep.subprocess,'Popen',return_value=process),patch.object(deep.os,'killpg',side_effect=kill):
                     cache={}
                     jobs.big_root_inventory(root,runner,seconds_left,cache,deep=True,max_batches=1)
-                self.assertEqual(bool(cache[child].get('timeouts')),full)
+                self.assertFalse(cache[child].get('timeouts'))
+                self.assertEqual(cache[child]['probeTimeouts'],1)
                 self.assertEqual(jobs.inventory_deep_owned(cache[child],self.now+self.clock[0]),full)
 
     def test_batch_timeout_isolates_and_measures_cheap_singles(self):
@@ -439,7 +442,7 @@ class ConvergenceTests(unittest.TestCase):
         child = roots[0]/'0000'
         (child/'blocked').mkdir()
         jobs.save_state('disk-inventory',dict(duMode='links',childState={str(roots[0]):{
-            str(child):dict(timeouts=2,partial=True,lastTimeoutAt=self.now)}}))
+            str(child):dict(timeouts=2,lastTimeoutS=60,partial=True,lastTimeoutAt=self.now)}}))
         calls = []
         deep.run_pass(roots,self.runner(lambda p:700 if p.name=='blocked' else 1,calls),budget=600)
         value = jobs.read_state('disk-inventory')['childState'][str(roots[0])][str(child)]
@@ -463,7 +466,7 @@ class ConvergenceTests(unittest.TestCase):
         # Actual commands need real deadlines rather than the fixture's clock.
         with patch.object(original,'monotonic',side_effect=None,return_value=0):
             expected,_,_ = jobs.du_total(child,subprocess.run,10)
-            cache = {str(child):dict(timeouts=2,partial=True)}
+            cache = {str(child):dict(timeouts=2,lastTimeoutS=60,partial=True)}
             entries,listed = jobs.inventory_listing(root,10)
             work = {}
             for _ in range(10):
@@ -482,7 +485,7 @@ class ConvergenceTests(unittest.TestCase):
         for name in ('a','b'):
             (child/name).mkdir()
         jobs.save_state('disk-inventory',dict(duMode='links',childState={str(root):{
-            str(child):dict(timeouts=2,partial=True)}}))
+            str(child):dict(timeouts=2,lastTimeoutS=60,partial=True)}}))
         script = '''
 import signal,sys
 from pathlib import Path
@@ -571,7 +574,7 @@ deep_inventory.run_pass([Path(sys.argv[2])],run,budget=30)
         for index in range(4):
             with self.subTest(command=index+1), patch.dict(os.environ,TOOLLOG_DIR=str(self.logs/str(index))):
                 slow=root/('%04d'%index)
-                deep.run_pass([root],self.runner(lambda p:20 if p==slow else 1))
+                deep.run_pass([root],self.runner(lambda p:70 if p==slow else 1))
                 state=jobs.read_state('disk-inventory')
                 self.assertFalse(state['partials'])
                 self.assertIn('parts',state['childState'][str(root)][str(slow)])
@@ -597,9 +600,9 @@ deep_inventory.run_pass([Path(sys.argv[2])],run,budget=30)
         for path in (first/'a',first/'b',second/'part'):
             path.mkdir()
         jobs.save_state('disk-inventory',dict(duMode='links',childState={str(root):{
-            str(first):dict(timeouts=2,partial=True,parts={str(first/'a'):
+            str(first):dict(timeouts=2,lastTimeoutS=60,partial=True,parts={str(first/'a'):
                 dict(bytes=1024,at=self.now-jobs.INVENTORY_PARTS_FRESH_S+1,partial=False)}),
-            str(second):dict(timeouts=2,partial=True)}}))
+            str(second):dict(timeouts=2,lastTimeoutS=60,partial=True)}}))
         calls=[]
         deep.run_pass([root],self.runner(lambda p:2 if p==second/'part' else .1,calls),budget=5400)
         self.assertEqual([cmd[-1] for cmd,_ in calls],
@@ -619,9 +622,9 @@ deep_inventory.run_pass([Path(sys.argv[2])],run,budget=30)
                 for path in (first/'a',first/'b',second/'part'):
                     path.mkdir()
                 jobs.save_state('disk-inventory',dict(duMode='links',childState={str(root):{
-                    str(first):dict(timeouts=2,partial=True,parts={str(first/'a'):
+                    str(first):dict(timeouts=2,lastTimeoutS=60,partial=True,parts={str(first/'a'):
                         dict(bytes=1024,at=self.now-jobs.INVENTORY_PARTS_FRESH_S+1,partial=False)}),
-                    str(second):dict(timeouts=2,partial=True)}}))
+                    str(second):dict(timeouts=2,lastTimeoutS=60,partial=True)}}))
                 calls=[]
                 normal=self.runner(lambda p:2 if p==second/'part' else 700
                                    if failure=='cap' and p==first/'a' else .1,calls)

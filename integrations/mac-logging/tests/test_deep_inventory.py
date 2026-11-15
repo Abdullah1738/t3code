@@ -211,7 +211,7 @@ class DeepInventoryTests(unittest.TestCase):
         for root in roots[:2]:
             (root/'0000'/'blocked').touch()
         deep.run_pass(roots,self.runner(lambda p:700 if any(root in p.parents for root in roots[:2]) else .034,calls))
-        self.assertEqual(sum(len(command)-2 for command,_ in calls),134)
+        self.assertEqual(sum(len(command)-2 for command,_ in calls),138)
         self.assertEqual(self.rows('disk.deep.end')[-1]['props']['childrenRemaining'],2)
         self.assertEqual(self.rows('disk.deep.end')[-1]['props']['childrenPartial'],2)
         self.assertLess(self.clock[0],2700)
