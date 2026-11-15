@@ -68,6 +68,8 @@ export interface ReadonlyExportMetrics {
   readonly phaseSteps: Record<string, number>;
   readonly identityRows: number;
   readonly identityLagMaxMs: number;
+  readonly updatedAtLagMs?: number;
+  readonly auxiliaryWindowMs?: number;
 }
 
 /** Self-contained for the packaged server's eval worker. No live write handle. */
@@ -109,6 +111,7 @@ export function createReadonlyReplica(
   // each miss so a busy source cannot keep a cycle open (see publishStep).
   const drainPagesInitial = 20;
   const drainPagesMax = 640;
+  const auxiliaryMaxAgeMs = 15_000;
   if (!Number.isInteger(batchSize))
     throw new Error("Readonly export batch size must be an integer");
   const replicaName = path.resolve(options.replicaPath);
@@ -1218,6 +1221,35 @@ export function createReadonlyReplica(
           ON CONFLICT(${q(primary)}) ${values.length ? `DO UPDATE SET ${values.map((c) => `${q(c)}=excluded.${q(c)}`).join(",")} WHERE ${values.map((c) => `${q(name)}.${q(c)} IS NOT excluded.${q(c)}`).join(" OR ")}` : "DO NOTHING"}`);
       }
     };
+    const stageAuxiliaryPage = (name: string, cursor: number) => {
+      const stage = auxiliaryStages.get(name)!;
+      if (cursor === 0) out.exec(`DELETE FROM temp.${q(stage.stage)}`);
+      const rows = page(name, cursor);
+      notePage(name, rows.length, Number(rows.at(-1)?.__rowid ?? cursor));
+      transaction(() => {
+        for (const row of rows) stage.insert.run(...tables.get(name)!.columns.map((c) => row[c]!));
+      });
+      return rows;
+    };
+    const refreshStaleAuxiliary = () => {
+      if (Date.now() - auxiliaryCapturedAt! <= auxiliaryMaxAgeMs) return;
+      // Catch-up can outlive the paged capture. Recopy under the final main
+      // snapshot, with a matching board snapshot, without another timer lap.
+      auxiliaryCapturedAt = Date.now();
+      boards?.exec("BEGIN");
+      try {
+        for (const name of auxiliary) {
+          let cursor = 0;
+          for (;;) {
+            const rows = measure("auxiliary", () => stageAuxiliaryPage(name, cursor));
+            if (rows.length < batchSize) break;
+            cursor = Number(rows.at(-1)!.__rowid);
+          }
+        }
+      } finally {
+        boards?.exec("ROLLBACK");
+      }
+    };
     const upsertEvent = out.prepare("INSERT OR REPLACE INTO orchestration_events VALUES (?,?,?,?)");
     const routes: Record<string, string> = {
       run: "runs",
@@ -1706,14 +1738,7 @@ export function createReadonlyReplica(
         return measure("auxiliary", () => {
           auxiliaryCapturedAt ??= Date.now();
           const name = auxiliary[auxiliaryIndex]!;
-          const stage = auxiliaryStages.get(name)!;
-          if (auxiliaryCursor === 0) out.exec(`DELETE FROM temp.${q(stage.stage)}`);
-          const rows = page(name, auxiliaryCursor);
-          notePage(name, rows.length, Number(rows.at(-1)?.__rowid ?? auxiliaryCursor));
-          transaction(() => {
-            for (const row of rows)
-              stage.insert.run(...tables.get(name)!.columns.map((c) => row[c]!));
-          });
+          const rows = stageAuxiliaryPage(name, auxiliaryCursor);
           auxiliaryCursor = Number(rows.at(-1)?.__rowid ?? auxiliaryCursor);
           if (rows.length < batchSize) {
             auxiliaryIndex++;
@@ -1982,6 +2007,7 @@ export function createReadonlyReplica(
             return true;
           }
         }
+        refreshStaleAuxiliary();
         reconcileIndex++;
         transaction(() => {
           measure("auxiliaryCommit", applyAuxiliary);
@@ -2023,12 +2049,9 @@ export function createReadonlyReplica(
           // replica" (stream-recovery defers threads newer than it). Events
           // and projections are current to the drain snapshot; the small
           // tables to the start of their copy. The older of the two is honest.
-          const previous = Date.parse(getMeta("updated_at") ?? "") || 0;
           meta(
             "updated_at",
-            new Date(
-              Math.max(Math.min(confirmedAt, auxiliaryCapturedAt ?? confirmedAt), previous + 1),
-            ).toISOString(),
+            new Date(Math.min(confirmedAt, auxiliaryCapturedAt ?? confirmedAt)).toISOString(),
           );
           // Bind capability evidence to this publication. An older exporter
           // leaves it behind, so readers safely fall back after a downgrade.
@@ -2054,6 +2077,18 @@ export function createReadonlyReplica(
       if (cycleTransaction) {
         commitCycle();
       }
+      const publishedAt = Date.now();
+      metrics = {
+        ...metrics,
+        updatedAtLagMs: Math.max(
+          metrics.updatedAtLagMs ?? 0,
+          publishedAt - Date.parse(getMeta("updated_at")!),
+        ),
+        auxiliaryWindowMs: Math.max(
+          metrics.auxiliaryWindowMs ?? 0,
+          publishedAt - auxiliaryCapturedAt!,
+        ),
+      };
       pendingAuxiliarySchemas.clear();
       identitySequence = Math.max(identitySequence, cycleTarget!);
       cycleTarget = undefined;

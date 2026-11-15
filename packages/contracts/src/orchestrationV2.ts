@@ -3246,6 +3246,14 @@ const OrchestrationV2InternalCommand = Schema.Union([
     runId: RunId,
     expectedAttemptId: Schema.NullOr(RunAttemptId),
     deadline: Schema.DateTimeUtc,
+    nativeEvidence: Schema.optional(
+      Schema.Struct({
+        runId: RunId,
+        attemptId: RunAttemptId,
+        nativeSessionId: Schema.NullOr(Schema.String),
+        acceptedAt: Schema.DateTimeUtc,
+      }),
+    ),
   }),
 
   Schema.Struct({

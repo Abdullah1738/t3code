@@ -82,6 +82,7 @@ const BOARD_BUSY =
   /^(?:Missions board conflict: )?(?:Board busy: not written|Not saved \(board busy\))/;
 const TYPED_OUTCOMES = {
   TimeoutError: "timeout",
+  ThreadReadTimeoutError: "timeout",
   PullRequestWatchTimeoutError: "timeout",
   PullRequestToolTimeoutError: "timeout",
   PreviewAutomationTimeoutError: "timeout",
@@ -182,6 +183,8 @@ export const trackDelegation = Effect.fnUntraced(function* (
 
 // The toolkit erases defects and some typed errors while encoding the MCP reply.
 export const handlerFailure = Effect.fnUntraced(function* <E>(cause: Cause.Cause<E>) {
+  // Detached cleanup after a deadline must not overwrite the returned timeout with "Failure".
+  if (Cause.hasInterruptsOnly(cause)) return;
   const call = yield* Effect.serviceOption(McpCall);
   if (call._tag === "None") return;
   const error = cause.reasons.flatMap((reason) =>

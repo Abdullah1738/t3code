@@ -46,6 +46,26 @@ describe("boardEventRoute", () => {
       "threadChanged",
     );
   });
+  it("routes lost native events to the owning run failure without claiming it never started", () => {
+    assert.deepEqual(
+      startTimeoutOf(
+        event("turn-item.updated", {
+          type: "error",
+          status: "failed",
+          runId: RunId.make("lost"),
+          failure: {
+            code: "provider_events_lost",
+            message: "Native session native-123 produced output that was not ingested",
+            retryable: false,
+          },
+        }),
+      ),
+      {
+        runId: RunId.make("lost"),
+        reason: "Native session native-123 produced output that was not ingested",
+      },
+    );
+  });
 
   it("re-announces thread state when a question opens or resolves without a run update", () => {
     assert.strictEqual(boardEventRoute(event("runtime-request.updated")), "threadChanged");

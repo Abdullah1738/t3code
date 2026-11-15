@@ -66,6 +66,10 @@ export const ensureShellLookupIndexes = Effect.fn("ensureShellLookupIndexes")(fu
     CREATE INDEX IF NOT EXISTS ardud_provider_turns_completed_idx
     ON orchestration_v2_projection_provider_turns(completed_at)
   `;
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_provider_turns_attempt_idx
+    ON orchestration_v2_projection_provider_turns(thread_id, run_attempt_id, provider_thread_id, ordinal)
+  `;
   // Control listings by updatedSince read the changed range newest first instead of
   // building every thread's shell (a 145 s reader stall on 9 Nov). Not partial on
   // deleted_at: a smaller partial index would win every plain "deleted_at IS NULL" scan

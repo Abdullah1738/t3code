@@ -10,6 +10,7 @@ import {
 } from "./launchRecovery.ts";
 import * as Random from "effect/Random";
 import * as DelegatedTaskRecoveryService from "./DelegatedTaskRecoveryService.ts";
+import * as ProviderStartProgress from "../ardud/orchestration/ProviderStartProgress.ts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { makeAssistantStreamingFilter } from "./assistantStreaming.ts";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
@@ -727,6 +728,7 @@ export const layer: Layer.Layer<
     const turnItemPositions = yield* TurnItemPositionStore.TurnItemPositionStoreV2;
     const finalizationObserver = yield* RunFinalizationService.RunFinalizationObserver;
     const analyticsContext = yield* Effect.context<never>();
+    const startProgress = yield* Effect.serviceOption(ProviderStartProgress.ProviderStartProgress);
 
     const usageByRun = new Map<
       string,
@@ -1093,6 +1095,15 @@ export const layer: Layer.Layer<
         },
       ),
       startRootRun: Effect.fn("RunExecutionService.startRootRun")(function* (input) {
+        const progressAttempt = {
+          threadId: input.run.threadId,
+          runId: input.run.id,
+          attemptId: input.attemptId,
+        };
+        const withIngestionStep = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+          Option.isSome(startProgress)
+            ? startProgress.value.withRunStep(progressAttempt, "run_ingestion_write", effect)
+            : effect;
         const observeFirstToken = yield* makeFirstTokenObserver(input.run, input.attempt.id).pipe(
           Effect.provideContext(analyticsContext),
         );
@@ -1707,46 +1718,85 @@ export const layer: Layer.Layer<
         let orphanRecovery: Fiber.Fiber<void, ProviderAdapter.ProviderAdapterV2Error> | undefined;
         const stopOrphanedProviderTurn = Effect.fn("RunExecutionService.stopOrphanedProviderTurn")(
           function* (providerThread: OrchestrationV2ProviderThread) {
-            while (!(yield* nativeEndConfirmed) && !(yield* Ref.get(orphanStopConfirmed))) {
-              if (input.shouldFinalizeRun !== undefined) {
-                const current = yield* input
-                  .shouldFinalizeRun()
-                  .pipe(Effect.timeout("10 seconds"), Effect.exit);
-                if (Exit.isSuccess(current) && !current.value) return;
+            let attempts = 0;
+            let providerTurnId: ProviderTurnId | null = null;
+            let lastCause: unknown = "provider turn id not yet observed";
+            // Ten attempts bound quick failures; the deadline also bounds slow probes and Stops.
+            const stopped = yield* Effect.gen(function* () {
+              while (attempts < 10) {
+                if ((yield* nativeEndConfirmed) || (yield* Ref.get(orphanStopConfirmed)))
+                  return true;
+                attempts++;
+                providerTurnId = (yield* Ref.get(eventRouting)).rootProviderTurnId;
+                const current = yield* (input.shouldFinalizeRun?.() ?? Effect.succeed(true)).pipe(
+                  Effect.timeout("10 seconds"),
+                  Effect.exit,
+                );
+                if (Exit.isSuccess(current) && !current.value) return true;
                 if (Exit.isFailure(current)) {
-                  yield* Effect.sleep("1 second");
-                  continue;
+                  lastCause = current.cause;
+                } else if (providerTurnId === null) {
+                  lastCause = "provider turn id not yet observed";
+                } else {
+                  const stop = yield* input.session
+                    .interruptTurn({
+                      providerThread,
+                      providerTurnId,
+                      requestRuntimeRestart: false,
+                      stopBackgroundWork: false,
+                    })
+                    .pipe(
+                      Effect.catchTags({
+                        ProviderAdapterTurnNotActiveError: () =>
+                          Effect.logInfo(
+                            "orchestration V2 orphaned provider turn already stopped",
+                            {
+                              runId: input.run.id,
+                              threadId: input.run.threadId,
+                              providerTurnId,
+                              reason: "turn no longer active",
+                            },
+                          ),
+                      }),
+                      Effect.timeout("30 seconds"),
+                      Effect.exit,
+                    );
+                  if (Exit.isSuccess(stop)) {
+                    yield* Ref.set(orphanStopConfirmed, true);
+                    return true;
+                  }
+                  lastCause = stop.cause;
                 }
+                if (attempts === 1) {
+                  yield* Effect.logWarning(
+                    "orchestration V2 could not stop an orphaned provider turn",
+                    {
+                      runId: input.run.id,
+                      threadId: input.run.threadId,
+                      providerTurnId,
+                      cause: lastCause,
+                    },
+                  );
+                }
+                // Recovery is lineage-scoped: killing the shared app-server would also
+                // terminate unrelated threads that still own healthy turns.
+                if (attempts < 10)
+                  yield* Effect.sleep(Math.min(1000 * 2 ** (attempts - 1), 30_000));
               }
-              const providerTurnId = (yield* Ref.get(eventRouting)).rootProviderTurnId;
-              if (providerTurnId === null) {
-                yield* Effect.sleep("1 second");
-                continue;
-              }
-              const stopped = yield* input.session
-                .interruptTurn({
-                  providerThread,
-                  providerTurnId,
-                  requestRuntimeRestart: false,
-                  stopBackgroundWork: false,
-                })
-                .pipe(Effect.timeout("30 seconds"), Effect.exit);
-              if (Exit.isSuccess(stopped)) {
-                yield* Ref.set(orphanStopConfirmed, true);
-                return;
-              }
-              yield* Effect.logWarning(
-                "orchestration V2 could not stop an orphaned provider turn",
+              return false;
+            }).pipe(Effect.timeoutOption("5 minutes"));
+            if (Option.isNone(stopped) || !stopped.value) {
+              yield* Effect.logError(
+                "orchestration V2 gave up stopping an orphaned provider turn",
                 {
                   runId: input.run.id,
                   threadId: input.run.threadId,
                   providerTurnId,
-                  cause: stopped.cause,
+                  attempts,
+                  reason: Option.isNone(stopped) ? "deadline reached" : "attempt limit reached",
+                  cause: lastCause,
                 },
               );
-              // Recovery is lineage-scoped: killing the shared app-server would also
-              // terminate unrelated threads that still own healthy turns.
-              yield* Effect.sleep("1 second");
             }
           },
           (effect) =>
@@ -1846,6 +1896,22 @@ export const layer: Layer.Layer<
               yield* usage.observe(event);
               yield* observeNativeLifecycle(event);
               const rootTurnId = (yield* Ref.get(eventRouting)).rootProviderTurnId;
+              if (
+                Option.isSome(startProgress) &&
+                ((event.type === "provider_turn.updated" &&
+                  event.providerTurn.id === rootTurnId &&
+                  event.providerTurn.promptAcceptedAt !== undefined) ||
+                  (event.type === "turn_item.updated" &&
+                    event.turnItem.providerTurnId === rootTurnId &&
+                    nativeOutputAcknowledgesStart(event.turnItem)))
+              ) {
+                yield* startProgress.value.observe(
+                  progressAttempt,
+                  "native_accepted",
+                  input.providerThread.nativeThreadRef?.nativeId ?? undefined,
+                );
+                yield* startProgress.value.observe(progressAttempt, "orchestration_ingestion");
+              }
               if (event.type === "provider_turn.updated" && event.providerTurn.id === rootTurnId) {
                 observedRootTurn = {
                   ...event.providerTurn,
@@ -1864,28 +1930,30 @@ export const layer: Layer.Layer<
                 observedRootTurn.promptAcceptedAt === undefined
               ) {
                 const acknowledged = { ...observedRootTurn, promptAcceptedAt: yield* DateTime.now };
-                yield* providerEventIngestor.ingestNormalized({
-                  analyticsContext: {
-                    modelSelection: input.modelSelection,
-                    runtimeMode: input.runtimePolicy.runtimeMode,
-                    interactionMode: input.runtimePolicy.interactionMode,
-                  },
-                  providerSessionId: input.providerSessionId,
-                  providerInstanceId: input.run.providerInstanceId,
-                  threadId: input.run.threadId,
-                  runId: input.run.id,
-                  nodeId: input.rootNode.id,
-                  event: {
-                    type: "provider_turn.updated",
-                    driver: event.driver,
-                    providerTurn: acknowledged,
-                  },
-                  writeIfRunCurrent: {
+                yield* withIngestionStep(
+                  providerEventIngestor.ingestNormalized({
+                    analyticsContext: {
+                      modelSelection: input.modelSelection,
+                      runtimeMode: input.runtimePolicy.runtimeMode,
+                      interactionMode: input.runtimePolicy.interactionMode,
+                    },
+                    providerSessionId: input.providerSessionId,
+                    providerInstanceId: input.run.providerInstanceId,
+                    threadId: input.run.threadId,
                     runId: input.run.id,
-                    activeAttemptId: input.attempt.id,
-                    expectedStatus: "running",
-                  },
-                });
+                    nodeId: input.rootNode.id,
+                    event: {
+                      type: "provider_turn.updated",
+                      driver: event.driver,
+                      providerTurn: acknowledged,
+                    },
+                    writeIfRunCurrent: {
+                      runId: input.run.id,
+                      activeAttemptId: input.attempt.id,
+                      expectedStatus: "running",
+                    },
+                  }),
+                );
                 observedRootTurn = acknowledged;
               }
               // Native completion remains termination evidence even if persisting it fails.
@@ -1907,37 +1975,39 @@ export const layer: Layer.Layer<
                 const isRootProviderThreadUpdate =
                   event.type === "provider_thread.updated" &&
                   event.providerThread.id === input.providerThread.id;
-                const storedEvents = yield* providerEventIngestor.ingestNormalized({
-                  analyticsContext: {
-                    modelSelection: input.modelSelection,
-                    runtimeMode: input.runtimePolicy.runtimeMode,
-                    interactionMode: input.runtimePolicy.interactionMode,
-                  },
-                  providerSessionId: input.providerSessionId,
-                  providerInstanceId: input.run.providerInstanceId,
-                  threadId: input.run.threadId,
-                  runId: input.run.id,
-                  nodeId: input.rootNode.id,
-                  event: deliveredEvent,
-                  ...(isRootProviderThreadUpdate
-                    ? rootTerminalAlreadySeen
-                      ? {
-                          writeIfProviderThreadOwner: {
-                            providerThreadId: input.providerThread.id,
-                            runId: input.run.id,
-                            activeAttemptId: input.attempt.id,
-                            expectedLastRunOrdinal: input.run.ordinal,
-                          },
-                        }
-                      : {
-                          writeIfRunCurrent: {
-                            runId: input.run.id,
-                            activeAttemptId: input.attempt.id,
-                            expectedStatus: "running" as const,
-                          },
-                        }
-                    : {}),
-                });
+                const storedEvents = yield* withIngestionStep(
+                  providerEventIngestor.ingestNormalized({
+                    analyticsContext: {
+                      modelSelection: input.modelSelection,
+                      runtimeMode: input.runtimePolicy.runtimeMode,
+                      interactionMode: input.runtimePolicy.interactionMode,
+                    },
+                    providerSessionId: input.providerSessionId,
+                    providerInstanceId: input.run.providerInstanceId,
+                    threadId: input.run.threadId,
+                    runId: input.run.id,
+                    nodeId: input.rootNode.id,
+                    event: deliveredEvent,
+                    ...(isRootProviderThreadUpdate
+                      ? rootTerminalAlreadySeen
+                        ? {
+                            writeIfProviderThreadOwner: {
+                              providerThreadId: input.providerThread.id,
+                              runId: input.run.id,
+                              activeAttemptId: input.attempt.id,
+                              expectedLastRunOrdinal: input.run.ordinal,
+                            },
+                          }
+                        : {
+                            writeIfRunCurrent: {
+                              runId: input.run.id,
+                              activeAttemptId: input.attempt.id,
+                              expectedStatus: "running" as const,
+                            },
+                          }
+                      : {}),
+                  }),
+                );
                 storedEventCount = storedEvents.length;
                 if (
                   isRootProviderThreadUpdate &&
@@ -2311,6 +2381,11 @@ export const layer: Layer.Layer<
           ),
           // Wait for acceptance so abandoned startup cannot leave a refresher
           // on the already-detached ingestion fiber.
+          Effect.tap(() =>
+            Option.isSome(startProgress)
+              ? startProgress.value.step(progressAttempt, "awaiting_native_acceptance")
+              : Effect.void,
+          ),
           Effect.tap(() =>
             Fiber.await(providerEventFiber).pipe(
               Effect.raceFirst(touchMcpCredential.pipe(Effect.delay("1 hour"), Effect.forever)),

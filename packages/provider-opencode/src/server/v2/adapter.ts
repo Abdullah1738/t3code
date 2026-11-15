@@ -4471,10 +4471,18 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
             return yield* lock.withPermit(finishTurn(state, { status: "interrupted" }));
           }
           if (!reply.value.interrupted && state.active === turn) {
-            turn.interrupted = false;
-            return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+            yield* lock.withPermit(
+              Effect.gen(function* () {
+                if (state.active !== turn) return;
+                // Its native end may still be queued; the next turn must skip that late event.
+                markUnsettled(state);
+                yield* finishTurn(state, { status: "interrupted" });
+              }),
+            );
+            return yield* new ProviderAdapter.ProviderAdapterTurnNotActiveError({
               driver: OPENCODE_PROVIDER,
-              detail: `OpenCode session ${sessionId} had nothing running to stop`,
+              providerThreadId: interruptInput.providerThread.id,
+              providerTurnId: interruptInput.providerTurnId,
             });
           }
         },

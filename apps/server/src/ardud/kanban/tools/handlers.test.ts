@@ -114,7 +114,12 @@ const fakeThreads = (
     saved: Deferred.Deferred<void>;
     enabled?: () => boolean;
   },
-  delivery?: { readonly findExisting: boolean; readonly send: KanbanThreads["Service"]["send"] },
+  delivery?: {
+    readonly findExisting: boolean;
+    readonly send: KanbanThreads["Service"]["send"];
+    readonly queuedRuns?: KanbanThreads["Service"]["queuedRuns"];
+    readonly cancelQueued?: KanbanThreads["Service"]["cancelQueued"];
+  },
 ) => {
   const running = new Set<string>();
   const queued = new Set<string>();
@@ -127,6 +132,15 @@ const fakeThreads = (
   let launched = 0;
   const launches: Array<string> = [];
   const views: Array<string> = [];
+  const latestRuns = new Map<
+    ThreadId,
+    NonNullable<Effect.Success<ReturnType<KanbanThreads["Service"]["latestRun"]>>>
+  >();
+  const targetViews = new Map<
+    ThreadId,
+    Partial<import("../engine/threads.ts").KanbanThreadView> | null
+  >();
+  const interrupts: ThreadId[] = [];
   const viewControl = { beforeRead: (_threadId: ThreadId): Effect.Effect<void> => Effect.void };
   const queueControl = { beforeRead: (_threadId: ThreadId): Effect.Effect<void> => Effect.void };
   const callerControl = { beforeRead: (): Effect.Effect<void> => Effect.void };
@@ -172,6 +186,7 @@ const fakeThreads = (
       Effect.andThen(
         Effect.sync(() => {
           views.push(threadId);
+          if (targetViews.get(threadId) === null) return null;
           return {
             threadId,
             projectId: ProjectId.make("project-1"),
@@ -185,6 +200,7 @@ const fakeThreads = (
             prWatches: 0,
             prs: [],
             archived: false,
+            ...targetViews.get(threadId),
           };
         }),
       ),
@@ -202,7 +218,7 @@ const fakeThreads = (
       find: delivery?.findExisting ? view : () => Effect.succeed(null),
       lastFailure: () => Effect.succeed(null),
       findLastFailure: () => Effect.succeed(null),
-      latestRun: () => Effect.succeed(null),
+      latestRun: (threadId) => Effect.sync(() => latestRuns.get(threadId) ?? null),
       runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       launch: (input) => {
@@ -231,14 +247,19 @@ const fakeThreads = (
           models.set(threadId, model);
         }),
       withdraw: () => Effect.void,
-      queuedRuns: (threadId) =>
-        Effect.suspend(() => queueControl.beforeRead(threadId)).pipe(
-          Effect.andThen(
-            Effect.sync(() => (queued.has(threadId) ? [{ status: "queued" } as never] : [])),
-          ),
-        ),
-      cancelQueued: () => Effect.succeed(false),
-      interrupt: () => Effect.void,
+      queuedRuns:
+        delivery?.queuedRuns ??
+        ((threadId) =>
+          Effect.suspend(() => queueControl.beforeRead(threadId)).pipe(
+            Effect.andThen(
+              Effect.sync(() => (queued.has(threadId) ? [{ status: "queued" } as never] : [])),
+            ),
+          )),
+      cancelQueued: delivery?.cancelQueued ?? (() => Effect.succeed(false)),
+      interrupt: (threadId) =>
+        Effect.sync(() => {
+          interrupts.push(threadId);
+        }),
     }),
   );
   const boardFilesLayer = ServerConfig.layerTest(process.cwd(), {
@@ -392,6 +413,9 @@ const fakeThreads = (
     views,
     viewControl,
     queueControl,
+    targetViews,
+    latestRuns,
+    interrupts,
     callerControl,
     storeControl,
     rejectSends,
@@ -402,6 +426,7 @@ const fakeThreads = (
 const decodeRelease = Schema.decodeUnknownSync(KanbanRelease);
 const owner: KanbanActor = { _tag: "owner" };
 const decodeMessage = Schema.decodeUnknownEffect(KanbanMessage);
+const decodeCard = Schema.decodeUnknownSync(KanbanCard);
 
 it.live("card_flag saves its stalled reason while the board background reader is held", () =>
   Effect.gen(function* () {
@@ -1536,6 +1561,7 @@ it.effect(
       assert.isAtMost(page.length, 20);
       assert.strictEqual(page.at(-1)!.id, allEvents.at(-1)!.id);
       assert.strictEqual(latest.structured.olderEvents, page[0]!.id);
+      assert.isArray(latest.structured.threads);
       // Walk the cursor back to the first event: every event once, in order.
       const walked = [...page];
       let cursor = latest.structured.olderEvents as number | null;
@@ -1546,6 +1572,14 @@ it.effect(
         });
         assert.isFalse(older.isError, older.text);
         assert.isAtMost(JSON.stringify(older.structured).length, 60_000);
+        assert.deepStrictEqual(older.structured.card, {
+          id: busy.id,
+          number: busy.number,
+          title: busy.title,
+          stage: "working",
+          boardId: board.id,
+        });
+        assert.notProperty(older.structured, "threads");
         walked.unshift(...(older.structured.events as typeof page));
         cursor = older.structured.olderEvents as number | null;
       }
@@ -1603,6 +1637,63 @@ it.effect(
     }).pipe(Effect.provide(layer));
   },
 );
+
+it.effect("card_get pages a card whose prompt fills the first reply", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "toy",
+      name: "Toy",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+    const giant = yield* kanban.createCard(
+      board.id,
+      { prompt: "G".repeat(70_000), title: "Giant" },
+      owner,
+    );
+    yield* kanban.dispatchNow;
+    const detail = yield* kanban.card(giant.id);
+    const thread = detail.card.activeThreadId!;
+    const first = yield* call(thread, "card_get", { card: giant.id, events: { limit: 100 } });
+    assert.isFalse(first.isError, first.text);
+    assert.deepStrictEqual(first.structured.card, detail.card);
+    assert.deepStrictEqual(first.structured.threads, detail.threads);
+    assert.deepStrictEqual(first.structured.events, []);
+    let cursor = first.structured.olderEvents as number | null;
+    assert.isNotNull(cursor);
+    const seen: number[] = [];
+    const cursors = new Set<number>();
+    for (let count = 0; cursor !== null && count < 200; count++) {
+      assert.isFalse(cursors.has(cursor));
+      cursors.add(cursor);
+      const page = yield* call(thread, "card_get", {
+        card: giant.id,
+        events: { before: cursor, limit: 2 },
+      });
+      assert.isFalse(page.isError, page.text);
+      assert.deepStrictEqual(page.structured.card, {
+        id: giant.id,
+        number: giant.number,
+        title: giant.title,
+        stage: detail.card.stage,
+        boardId: board.id,
+      });
+      assert.notProperty(page.structured, "threads");
+      assert.isAtMost(JSON.stringify(page.structured).length, 60_000);
+      seen.unshift(...(page.structured.events as Array<{ id: number }>).map((event) => event.id));
+      const next = page.structured.olderEvents as number | null;
+      if (next !== null) assert.isBelow(next, cursor);
+      cursor = next;
+    }
+    assert.isNull(cursor);
+    assert.deepStrictEqual(
+      seen,
+      detail.events.map((event) => event.id),
+    );
+  }).pipe(Effect.provide(layer));
+});
 
 it.live("card and discussion tools answer while the SQLite writer is held", () =>
   Effect.gen(function* () {
@@ -8556,3 +8647,317 @@ it.effect("a worker's later-step subtask refusal keeps its message and fixed rea
     assert.include(move.text, "stage_owned_by_dispatcher");
   }).pipe(Effect.provide(layer));
 });
+
+it.effect.each(["idle", "busy", "home-moved-on"] as const)(
+  "evaluator forThread atomically assigns to an existing %s thread and queues its brief",
+  (state) => {
+    const sent: Array<Parameters<KanbanThreads["Service"]["send"]>[0]> = [];
+    const fake = fakeThreads(undefined, undefined, undefined, undefined, undefined, {
+      findExisting: true,
+      send: (input) =>
+        Effect.sync(() => {
+          sent.push(input);
+          return "assignment-run";
+        }),
+    });
+    return Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "handoff",
+        name: "Handoff",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+      const origin = yield* kanban.createCard(
+        board.id,
+        { title: "Origin", prompt: "Origin" },
+        owner,
+      );
+      const other = yield* kanban.createCard(board.id, { title: "Other", prompt: "Other" }, owner);
+      yield* kanban.dispatchNow;
+      const worker = (yield* kanban.card(origin.id)).card.workThreadId!;
+      const second = (yield* kanban.card(other.id)).card.workThreadId!;
+      if (state === "home-moved-on")
+        yield* kanban.moveCard(origin.id, "needs_review", "cardThread", {
+          _tag: "thread",
+          threadId: worker,
+        });
+      if (state === "busy") fake.running.add(worker);
+      const evaluator = yield* kanban.startEvaluator(board.id, { kind: "check" });
+      const launches = fake.launches.length;
+      sent.length = 0;
+      const created = yield* call(evaluator, "card_create", {
+        forThread: worker,
+        title: "Follow-up",
+        description: "Explicit",
+        prompt: "Use the existing context",
+      });
+      assert.isFalse(created.isError, created.text);
+      const card = decodeCard(created.structured.card);
+      assert.strictEqual(card.stage, "working");
+      assert.strictEqual(card.activeThreadId, worker);
+      assert.deepStrictEqual(card.createdBy, { _tag: "evaluator", threadId: evaluator });
+      assert.deepStrictEqual(card.model, board.defaultCardModel);
+      assert.strictEqual(sent.length, 1);
+      assert.strictEqual(sent[0]!.threadId, worker);
+      assert.strictEqual(sent[0]!.mode, "queue");
+      assert.include(sent[0]!.text, "Use the existing context");
+      assert.lengthOf(fake.interrupts, 0);
+      if (state === "busy") {
+        assert.isTrue(fake.running.has(worker));
+        assert.strictEqual((yield* kanban.card(origin.id)).card.stage, "working");
+      }
+      const stolen = yield* call(second, "card_claim", { card: card.id });
+      assert.isTrue(stolen.isError, stolen.text);
+      const events = (yield* kanban.card(card.id)).events;
+      assert.isTrue(
+        events.some((event) => event.actor._tag === "evaluator" && event.body?.includes(worker)),
+      );
+      // Keep the completed home card from starting its review during this tick.
+      if (state === "home-moved-on") yield* kanban.flagCard(origin.id, "Review later", owner);
+      yield* kanban.dispatchNow;
+      assert.strictEqual(fake.launches.length, launches);
+      assert.strictEqual((yield* kanban.card(card.id)).card.activeThreadId, worker);
+    }).pipe(Effect.provide(fake.layer));
+  },
+);
+
+it.effect.each([
+  "worker",
+  "reviewer",
+  "unlinked",
+  "both",
+  "foreign-board",
+  "missing",
+  "ended",
+  "paused",
+  "stopped",
+  "cancelled",
+  "archived",
+  "model",
+  "project",
+  "backlog",
+  "needs-owner",
+  "full-batch",
+  "target-reviewer",
+] as const)("evaluator forThread refuses %s before inserting anything", (reason) => {
+  const fake = fakeThreads(undefined, undefined, undefined, undefined, undefined, {
+    findExisting: true,
+    send: () => Effect.void,
+  });
+  const expectedReasons = {
+    worker: "role_not_allowed",
+    reviewer: "role_not_allowed",
+    unlinked: "role_not_allowed",
+    both: "invalid_args",
+    "foreign-board": "cross_board",
+    missing: "resource_not_found",
+    ended: "target_thread_unavailable",
+    paused: "target_thread_unavailable",
+    stopped: "target_thread_stopped",
+    cancelled: "target_thread_stopped",
+    archived: "target_thread_unavailable",
+    model: "model_pool_mismatch",
+    project: "project_mismatch",
+    backlog: "stage_not_allowed",
+    "needs-owner": "stage_not_allowed",
+    "full-batch": "thread_batch_full",
+    "target-reviewer": "role_not_allowed",
+  } as const;
+  let pending: Deferred.Deferred<AnalyticsEvent> | undefined;
+  const sink = Layer.mock(Analytics.Analytics)({
+    record: (event) =>
+      pending && event.kind === "mcp.call" && event.tool === "card_create"
+        ? Deferred.succeed(pending, event).pipe(Effect.asVoid)
+        : Effect.void,
+  });
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const store = yield* KanbanStore.KanbanStore;
+    const board = yield* kanban.ensureBoard({
+      slug: "handoff-refusal",
+      name: "Refusal",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+    const origin = yield* kanban.createCard(board.id, { title: "Origin", prompt: "Origin" }, owner);
+    yield* kanban.dispatchNow;
+    const worker = (yield* kanban.card(origin.id)).card.workThreadId!;
+    const evaluator = yield* kanban.startEvaluator(board.id, { kind: "check" });
+    const link = (yield* store.threadLink(worker))!;
+    if (reason === "foreign-board") {
+      const other = yield* kanban.ensureBoard({
+        slug: "foreign",
+        name: "Foreign",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* store.putThreadLink({ ...link, boardId: other.id });
+    }
+    if (reason === "ended")
+      yield* store.putThreadLink({ ...link, endedAt: "2026-10-26T08:00:00.000Z" });
+    if (reason === "paused")
+      yield* store.putThreadLink({
+        ...link,
+        paused: { message: "Quota", at: "2026-10-26T08:00:00.000Z", runId: null },
+      });
+    if (reason === "missing") fake.targetViews.set(worker, null);
+    if (reason === "stopped" || reason === "cancelled")
+      fake.latestRuns.set(worker, {
+        runId: "stopped-run",
+        status: reason === "cancelled" ? "cancelled" : "interrupted",
+        message: "Stop",
+      });
+    if (reason === "archived") fake.targetViews.set(worker, { archived: true });
+    if (reason === "reviewer" || reason === "target-reviewer")
+      yield* store.putThreadLink({ ...link, role: "review" });
+    if (reason === "full-batch")
+      for (const n of [1, 2, 3])
+        yield* kanban.createForThread(worker, { title: `Extra ${n}`, prompt: `Extra ${n}` });
+    if (reason === "model")
+      yield* kanban.setPool(
+        board.id,
+        {
+          instanceId: ProviderInstanceId.make("opencode"),
+          model: "opus/gpt-6-astra",
+          options: [{ id: "variant", value: "xhigh" }],
+        },
+        1,
+      );
+    const before = yield* kanban.cards(board.id);
+    pending = yield* Deferred.make<AnalyticsEvent>();
+    const result = yield* call(
+      reason === "worker" || reason === "reviewer"
+        ? worker
+        : reason === "unlinked"
+          ? ThreadId.make("outside")
+          : evaluator,
+      "card_create",
+      {
+        forThread: worker,
+        title: "Refused",
+        description: "Explicit",
+        prompt: "Must not be saved",
+        ...(reason === "both" ? { assignToSelf: true } : {}),
+        ...(reason === "backlog" ? { priority: 5 } : {}),
+        ...(reason === "needs-owner" ? { stage: "needs_owner", question: "Wait?" } : {}),
+        ...(reason === "project" ? { projectId: "another-project" } : {}),
+        ...(reason === "model"
+          ? { model: { instanceId: "opencode", model: "opus/gpt-6-astra#xhigh" } }
+          : {}),
+      },
+    );
+    assert.isTrue(result.isError, result.text);
+    assert.deepStrictEqual(yield* kanban.cards(board.id), before);
+    assert.include(result.text, "Nothing was saved");
+    const row = yield* Deferred.await(pending);
+    assert.equal(row.denyReason, expectedReasons[reason]);
+    assert.equal(row.errorTag, reason === "missing" ? "invalid_request" : "capability_denied");
+    assert.equal(row.saved, reason === "missing" ? "unknown" : false);
+    assert.equal(
+      row.callerRole,
+      reason === "worker"
+        ? "work"
+        : reason === "reviewer"
+          ? "review"
+          : reason === "unlinked"
+            ? "none"
+            : "evaluator",
+    );
+    assert.notInclude(JSON.stringify(row), "Must not be saved");
+    assert.notInclude(JSON.stringify(row), "Nothing was saved");
+  }).pipe(Effect.provide(fake.layer.pipe(Layer.provide(sink))));
+});
+
+it.effect.each(["queued", "in-flight"] as const)(
+  "#1574 releasing a card withdraws its %s assignment without dropping sibling work",
+  (timing) =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const resume = yield* Deferred.make<void>();
+      const enqueued = yield* Deferred.make<void>();
+      const withdrawn = yield* Deferred.make<void>();
+      const runs: Array<{
+        id: string;
+        userMessageId: string;
+        ordinal: number;
+        status: "queued" | "cancelled";
+      }> = [];
+      const cancelled: string[] = [];
+      const fake = fakeThreads(undefined, undefined, undefined, undefined, undefined, {
+        findExisting: true,
+        send: (input) =>
+          Effect.gen(function* () {
+            if (!input.coalesce?.startsWith("assignment:")) return;
+            yield* Deferred.succeed(entered, undefined);
+            if (timing === "in-flight") yield* Deferred.await(resume);
+            runs.push({
+              id: "assignment-run",
+              userMessageId: `kanban:${input.coalesce}:delivery`,
+              ordinal: 2,
+              status: "queued",
+            });
+            yield* Deferred.succeed(enqueued, undefined);
+            return "assignment-run";
+          }),
+        queuedRuns: () =>
+          Effect.sync(
+            () =>
+              runs as unknown as Effect.Success<ReturnType<KanbanThreads["Service"]["queuedRuns"]>>,
+          ),
+        cancelQueued: (_thread, id) =>
+          Effect.gen(function* () {
+            const run = runs.find((run) => run.id === id);
+            if (!run || run.status !== "queued") return false;
+            run.status = "cancelled";
+            cancelled.push(id);
+            yield* Deferred.succeed(withdrawn, undefined);
+            return true;
+          }),
+      });
+      yield* Effect.gen(function* () {
+        const kanban = yield* KanbanService.KanbanService;
+        const board = yield* kanban.ensureBoard({
+          slug: "assignment-release",
+          name: "Assignment release",
+          defaultProjectId: ProjectId.make("project-1"),
+        });
+        yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+        const origin = yield* kanban.createCard(
+          board.id,
+          { prompt: "Origin", title: "Origin" },
+          owner,
+        );
+        yield* kanban.dispatchNow;
+        const threadId = (yield* kanban.card(origin.id)).card.workThreadId!;
+        const evaluator = yield* kanban.startEvaluator(board.id, { kind: "check" });
+        const creating = yield* call(evaluator, "card_create", {
+          forThread: threadId,
+          prompt: "Follow-up",
+          title: "Follow-up",
+          description: "Explicit",
+        }).pipe(Effect.forkChild);
+        yield* Deferred.await(entered);
+        assert.isFalse((yield* Fiber.join(creating)).isError);
+        if (timing === "queued") yield* Deferred.await(enqueued);
+        const card = (yield* kanban.cards(board.id)).find((card) => card.id !== origin.id)!;
+        runs.push({
+          id: "sibling-assignment",
+          userMessageId: `kanban:assignment:${origin.id}:sibling`,
+          ordinal: 3,
+          status: "queued",
+        });
+        yield* kanban.moveCard(card.id, "needs_review", "cardThread", { _tag: "thread", threadId });
+        yield* Deferred.succeed(resume, undefined);
+        yield* Deferred.await(withdrawn);
+        assert.deepEqual(cancelled, ["assignment-run"]);
+        assert.equal(runs.find((run) => run.id === "sibling-assignment")?.status, "queued");
+        assert.equal((yield* kanban.card(origin.id)).card.activeThreadId, threadId);
+        assert.lengthOf(fake.interrupts, 0);
+      }).pipe(
+        Effect.provide(
+          fake.layer.pipe(Layer.provide(Layer.succeed(KanbanService.OwnerRouteMode, "deferred"))),
+        ),
+        Effect.ensuring(Deferred.succeed(resume, undefined)),
+      );
+    }),
+);

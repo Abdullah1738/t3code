@@ -265,7 +265,7 @@ const CardSearch = tool(
 const CardGet = tool(
   "card_get",
   "Read a card",
-  'One card with its latest 20 events (moves, edits, comments, review verdicts), eventsTotal, a cursor for older ones (olderEvents) and every thread it has had. Pass events {before: olderEvents, limit} to page back, or "all" for every event (it can be more than your client accepts). The card itself is never trimmed; a reply stays under 60,000 characters by leaving out its oldest events.',
+  'One card with its latest 20 events (moves, edits, comments, review verdicts), eventsTotal, a cursor for older ones (olderEvents) and every thread it has had. Pass events {before: olderEvents, limit} to page back, or "all" for every event (it can be more than your client accepts). With before, the reply carries only the card\'s id, number, title, stage and boardId, without the full card or threads. Pages leave out oldest events to fit 60,000 characters; a full card and threads can exceed this on the first read. A single oversized event is skipped with a note; "all" returns it. Follow olderEvents until null, even after an empty page.',
   {
     card: Schema.optional(CardRef),
     boardId: BoardRef,
@@ -282,9 +282,12 @@ const CardGet = tool(
     ),
   },
   {
-    card: Record,
+    card: describe(
+      Record,
+      "Full card on the first read; only id, number, title, stage and boardId with events.before.",
+    ),
     events: Records,
-    threads: Records,
+    threads: Schema.optional(Records),
     eventsTotal: NonNegativeInt,
     olderEvents: Schema.NullOr(NonNegativeInt),
     note: Schema.optional(Schema.String),
@@ -792,6 +795,12 @@ const CardCreate = tool(
       describe(
         Schema.Boolean,
         "Work threads: take the card yourself now. It runs on your model and project.",
+      ),
+    ),
+    forThread: Schema.optional(
+      describe(
+        TrimmedNonEmptyString,
+        "Evaluators: give the new card to this existing work thread on the board (it keeps its context); no other thread can take it.",
       ),
     ),
     title: Schema.optional(Schema.String),

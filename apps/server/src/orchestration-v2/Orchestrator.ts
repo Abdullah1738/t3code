@@ -31,6 +31,7 @@ import type {
 import {
   latestExecutedRun,
   latestRootProviderFailure,
+  rootRuntimeLoss,
   runRanAfter,
   usageLimitBlockedRun,
 } from "@t3tools/shared/orchestrationV2ThreadError";
@@ -1633,6 +1634,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const timeoutCode = latestRootProviderFailure(failedRun ?? null, projection.turnItems)?.code;
       const startTimedOut =
         timeoutCode === PROVIDER_START_TIMEOUT_CODE || timeoutCode === "restart_admission_timeout";
+      // Lost events mean native work ran: retain the normal failure hold until
+      // its side effects can be reconciled, unlike a start that never arrived.
       const failureHolds =
         failureClass !== undefined &&
         failureClass !== "validation_error" &&
@@ -9692,12 +9695,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const { projection, run } = state;
     const now = yield* DateTime.now;
     const emitEvent = emit(events, command);
+    const lostEvents =
+      command.phase === "provider" &&
+      command.nativeEvidence?.runId === run.id &&
+      command.nativeEvidence.attemptId === run.activeAttemptId;
     const message =
       command.phase === "restart_admission"
         ? "The restart admission queue never released this run (waited 30 min)."
         : command.phase === "restart_cleanup"
           ? "Provider restart cleanup did not finish (waited 30 sec). The replacement was not sent."
-          : `The provider never started this run (waited ${PROVIDER_START_TIMEOUT_MS / 60_000} min).`;
+          : lostEvents
+            ? `The provider accepted this run, but its events did not reach orchestration within ${PROVIDER_START_TIMEOUT_MS / 60_000} min (native session: ${command.nativeEvidence?.nativeSessionId ?? "unknown"}).`
+            : `Robob could not confirm that the provider started this run within ${PROVIDER_START_TIMEOUT_MS / 60_000} min.`;
     for (const turn of projection.providerTurns.filter(
       (turn) => run.activeAttemptId !== null && turn.runAttemptId === run.activeAttemptId,
     )) {
@@ -9764,7 +9773,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ordinal: yield* nextTurnItemOrdinal(projection),
         status: "failed",
         type: "error",
-        title: "Provider did not start",
+        title: lostEvents ? "Provider events lost" : "Provider start unconfirmed",
         startedAt: now,
         completedAt: now,
         updatedAt: now,
@@ -9773,7 +9782,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           code:
             command.phase === "restart_admission"
               ? "restart_admission_timeout"
-              : PROVIDER_START_TIMEOUT_CODE,
+              : lostEvents
+                ? "provider_events_lost"
+                : PROVIDER_START_TIMEOUT_CODE,
+          ...(lostEvents ? { retryable: false } : {}),
           message,
         }),
       },
@@ -11884,7 +11896,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (
         resultChain.some((run) => run.ordinal === 1) &&
         !child.messages.some((message) => message.role === "assistant") &&
-        child.turnItems.length === 0 &&
+        // The startup marker explains the cut; it is not the child's answer.
+        child.turnItems.every((item) =>
+          resultChain.some((run) => rootRuntimeLoss(run, [item]) !== null),
+        ) &&
         continuations.some(
           (effect) =>
             effect.commandId.startsWith("command:runtime-reconcile:startup:") ||

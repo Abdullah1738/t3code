@@ -29439,6 +29439,18 @@ it.live("a thread with a stop still pending takes no new card until the stop has
         .pipe(Effect.flip);
       assert.strictEqual(refused.code, "conflict");
       assert.include(refused.detail, "being stopped");
+      const assigned = yield* kanban
+        .createForThread(
+          threadId,
+          { prompt: "Assigned", title: "Assigned" },
+          {
+            boardId: board.id,
+            actor: { _tag: "evaluator", threadId: ThreadId.make("evaluator") },
+          },
+        )
+        .pipe(Effect.flip);
+      assert.strictEqual(assigned.code, "conflict");
+      assert.include(assigned.detail, "Nothing was saved");
       const claim = yield* kanban.claimCard(threadId, other.id).pipe(Effect.flip);
       assert.strictEqual(claim.code, "conflict");
       assert.strictEqual((yield* kanban.cards(board.id)).length, before);

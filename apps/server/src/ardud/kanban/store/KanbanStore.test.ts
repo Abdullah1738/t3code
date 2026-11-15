@@ -1601,7 +1601,7 @@ it.effect("system channel lookup uses its index and reuses the latest settled ch
 );
 
 it.live(
-  "keeps board, goal and board-scoped pool caches uncapped with separate goal projections",
+  "keeps board, goal and board-scoped pool working sets with separate goal projections",
   () =>
     Effect.gen(function* () {
       const store = yield* KanbanStore.KanbanStore;

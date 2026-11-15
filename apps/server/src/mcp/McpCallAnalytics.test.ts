@@ -360,6 +360,73 @@ it.effect(
     ),
 );
 
+it.effect("freezes the timed-out read stage before response delivery and late cleanup", () =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const cleaned = yield* Deferred.make<void>();
+    const settled = yield* Deferred.make<void>();
+    const recorded = yield* Deferred.make<AnalyticsEvent>();
+    const toolkit = probe("t3_thread_read");
+    const registration = McpHttpServer.toolkitRegistration(
+      toolkit,
+      McpToolAccess.toLayer(toolkit, {
+        t3_thread_read: McpToolAccess.reads(() =>
+          ThreadReadMetrics.read(
+            "timeline",
+            Deferred.succeed(entered, undefined).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.uninterruptible,
+            ),
+          ).pipe(Effect.ensuring(Deferred.succeed(cleaned, undefined))),
+        ),
+      }),
+    ).pipe(
+      Layer.provideMerge(McpServer.McpServer.layer),
+      Layer.provide(Testkit.liveThreadsLayer),
+      Layer.provide(
+        Layer.mock(Analytics.Analytics)({
+          record: (row) =>
+            row.kind === "mcp.call"
+              ? Deferred.succeed(recorded, row).pipe(Effect.asVoid)
+              : Effect.void,
+          flush: Effect.void,
+        }),
+      ),
+      Layer.provideMerge(invocation),
+    );
+    yield* Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      const pending = yield* server.callTool({ name: "t3_thread_read", arguments: args }).pipe(
+        Effect.provideService(McpSchema.McpServerClient, client),
+        Effect.provideService(McpResponseDelivery.McpResponseDelivery, {
+          settled: Deferred.await(settled),
+          closeReason: "unknown",
+          snapshot: () => ({ responseDelivery: "finished", responseElapsedMs: 56_000 }),
+        }),
+        Effect.forkChild,
+      );
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust("55 seconds");
+      const result = yield* Fiber.join(pending);
+      expect(result.isError).toBe(true);
+      yield* Deferred.succeed(release, undefined);
+      yield* Deferred.await(cleaned);
+      expect(yield* Deferred.isDone(recorded)).toBe(false);
+      yield* TestClock.adjust("1 second");
+      yield* Deferred.succeed(settled, undefined);
+      const row = yield* Deferred.await(recorded);
+      expect(row).toMatchObject({
+        outcome: "timeout",
+        errorTag: "ThreadReadTimeoutError",
+        durationMs: 55_000,
+        responseElapsedMs: 56_000,
+        threadReadStages: [{ stage: "timeline", durationMs: 55_000, completed: false }],
+      });
+    }).pipe(Effect.provide(registration));
+  }),
+);
+
 it.effect.each(["finished", "closed"] as const)(
   "records a saved result separately from a %s HTTP response without blocking its handler",
   (responseDelivery) =>
