@@ -91,7 +91,7 @@ class StartupTests(HomeFiles):
         self.assertEqual(reason, "home still starting after 12 s (reconcile)")
         self.assertEqual(self.clock.now, 12)
         self.assertEqual(self.events.call_args.kwargs["props"],
-                         {"phase": "reconcile", "checkpoint": "post", "outcome": "failover"})
+                         {"phase": "reconcile", "class": "starting", "checkpoint": "post", "outcome": "failover"})
         self.assertEqual(self.events.call_args.kwargs["ids"]["run"], "run-1")
 
     def test_reconcile_failure_is_never_starting(self):

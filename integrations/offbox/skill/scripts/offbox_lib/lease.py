@@ -1035,8 +1035,17 @@ class ResumeProvisionStalled(OffboxError):
         super().__init__(message, outage=home.may_fail_over())
 
 
+def _readiness_get(box_id, *, deadline=None):
+    from . import home
+    try:
+        return api.readiness_get(box_id, deadline=deadline) if deadline is not None else api.readiness_get(box_id)
+    except api.NetworkError as error:
+        return home.recover_slow_read(error, lambda end: api.get(box_id, deadline=end), box=box_id, deadline=deadline)
+
+
 def _wait_unanswered_resume(con, box_id):
-    from . import outage
+    from . import outage, allocation
+    from .pool import PoolBusyError
     seconds = capacity.setting("OFFBOX_RESUME_PROVISION_SECONDS", 300, minimum=1, maximum=900)
     key = f'resume_provision:{box_id}'
     saved = con.execute('SELECT v FROM kv WHERE k=?', (key,)).fetchone()
@@ -1047,6 +1056,7 @@ def _wait_unanswered_resume(con, box_id):
     with outage.accepted_machine():
         network_failures = 0
         while True:
+            allocation.check_queue()
             left = end - time.time()
             budget_left = api.left()
             if budget_left is not None:
@@ -1059,8 +1069,8 @@ def _wait_unanswered_resume(con, box_id):
                 raise ResumeProvisionStalled(f"unanswered resume of {box_id} stayed provisioning for {seconds}s; "
                                              "nothing ran; set aside and trying a new box")
             try:
-                state = api.readiness_get(box_id, deadline=time.time() + left)
-            except (api.BudgetExpired, StartWaitFailed):
+                state = _readiness_get(box_id, deadline=time.time() + left)
+            except (api.BudgetExpired, StartWaitFailed, PoolBusyError):
                 raise
             except OffboxError as error:
                 network_failures = network_failures + 1 if isinstance(error, api.NetworkError) else 0
@@ -1148,7 +1158,7 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
             if left <= 0:
                 break
             try:
-                last = api.readiness_get(box_id, deadline=time.time() + left)
+                last = _readiness_get(box_id, deadline=time.time() + left)
             except (api.BudgetExpired, StartWaitFailed):
                 raise
             except OffboxError as error:
@@ -1397,7 +1407,7 @@ def _reuse_available(con, row, size, skip_archiving=False, retrying=False, befor
         ssh_sync.close_master(box_id)
         event(con, box_id, "ssh_master_stale", reason)
     try:
-        s = api.readiness_get(box_id)
+        s = _readiness_get(box_id)
     except api.NetworkError as error:
         if allocation.in_queue() and pending_grow and api.left() is not None and api.left() <= 0:
             raise ArchivingSkip(f"{box_id} status read reached its affinity deadline; waiting in the pool queue",
