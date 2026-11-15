@@ -141,6 +141,17 @@ export const readOnly = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect
     restore(Effect.provideService(effect, ReadOnly, restore)),
   );
 
+const ReaderRequired = Context.Reference<boolean>(
+  "@t3tools/shared/nodeSqliteClient/ReaderRequired",
+  {
+    defaultValue: () => false,
+  },
+);
+
+/** Wrap the whole read transaction to fail acquisition rather than borrow the writer. */
+export const requireReader = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+  readOnly(Effect.provideService(effect, ReaderRequired, true));
+
 interface Acquired {
   readonly connection: "writer" | "reader";
   readonly lockWaitMs: number;
@@ -2783,6 +2794,12 @@ const make = Effect.fn("makeWithDatabase")(function* (
       admission,
       Effect.withFiber<RouteTarget, SqlError>((fiber) => {
         if (!Context.get(fiber.context, ReadOnly)) return Effect.succeed(writer);
+        const writerFallback: Effect.Effect<RouteTarget, SqlError> = Context.get(
+          fiber.context,
+          ReaderRequired,
+        )
+          ? Effect.fail(readerBusy("Required SQLite reader unavailable", false))
+          : Effect.succeed(writer);
         const requestedLane = Context.get(fiber.context, ReaderLane);
         const lane = effectiveLane(fiber.context);
         const pending = pendingForClient(fiber);
@@ -2804,7 +2821,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
         if (background === undefined) {
           if (span?._tag === "Span")
             span.attribute("db.reader.route_reason", "reader_pool_unconfigured");
-          return Effect.succeed(writer);
+          return writerFallback;
         }
         if (isReservedLane(lane)) {
           const reserved = reservedReader(lane);
@@ -2817,13 +2834,13 @@ const make = Effect.fn("makeWithDatabase")(function* (
           if (span?._tag === "Span")
             span.attribute("db.reader.route_reason", "reserved_lane_unconfigured");
         }
-        // An unavailable reader falls back to the main connection, as before lanes.
+        // Ordinary reads retain writer fallback; long snapshots can require a reader.
         const viaBackground = viaPool(
           background,
-          Effect.sync(() => {
+          Effect.suspend(() => {
             if (span?._tag === "Span")
               span.attribute("db.reader.route_reason", "background_worker_unavailable");
-            return writer;
+            return writerFallback;
           }),
         );
         if (lane === "foreground" && foreground !== undefined) {
@@ -3092,6 +3109,15 @@ const make = Effect.fn("makeWithDatabase")(function* (
     withTransaction: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       Effect.withFiber((fiber) =>
         Effect.uninterruptibleMask((restore) => {
+          // Nested transactions bypass route(); retain the outer reader context for deeper savepoints.
+          if (Context.getOption(fiber.context, client.transactionService)._tag === "Some") {
+            return fiber.getRef(ReaderRequired) &&
+              pendingForClient(fiber)?.acquired?.connection !== "reader"
+              ? Effect.fail(
+                  readerBusy("Required SQLite reader unavailable inside writer transaction", false),
+                )
+              : restore(withTransaction(effect));
+          }
           // SqlClient masks setup; acquisition must preserve the caller's interruptibility.
           const pending: TransactionPending = {
             owner: transactionOwner,

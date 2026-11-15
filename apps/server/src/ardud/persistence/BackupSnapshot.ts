@@ -231,10 +231,11 @@ export const layerWithOptions = (options: Options) =>
                     }),
                   )
                   .pipe(
-                    NodeSqliteClient.readOnly,
+                    NodeSqliteClient.requireReader,
                     NodeSqliteClient.backgroundReads,
                     Effect.timeout("2 minutes"),
                   );
+                table = "statev2.sqlite";
                 yield* copyState;
                 table = "backup_meta";
                 const result = yield* request({
@@ -276,17 +277,6 @@ export const layerWithOptions = (options: Options) =>
               }),
             ).pipe(Effect.timeout("10 minutes"));
             yield* snapshot.pipe(
-              Effect.catchCause((cause) =>
-                Cause.hasInterruptsOnly(cause)
-                  ? Effect.interrupt
-                  : Effect.flatMap(Clock.currentTimeMillis, (now) =>
-                      Effect.logError("Backup snapshot error", {
-                        table,
-                        cause,
-                        elapsedMs: now - start,
-                      }),
-                    ),
-              ),
               Effect.ensuring(
                 Effect.promise(() =>
                   Promise.all(
@@ -299,6 +289,17 @@ export const layerWithOptions = (options: Options) =>
                     Effect.logWarning("Backup snapshot cleanup failed", { table, cause }),
                   ),
                 ),
+              ),
+              Effect.catchCause((cause) =>
+                Cause.hasInterruptsOnly(cause)
+                  ? Effect.interrupt
+                  : Effect.flatMap(Clock.currentTimeMillis, (now) =>
+                      Effect.logError("Backup snapshot error", {
+                        table,
+                        cause,
+                        elapsedMs: now - start,
+                      }),
+                    ),
               ),
             );
           }),

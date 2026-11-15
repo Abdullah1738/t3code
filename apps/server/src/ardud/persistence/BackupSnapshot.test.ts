@@ -63,14 +63,21 @@ const fixture = () => {
   }
   state.close();
   const logs: string[] = [];
+  const failedCycle = Deferred.makeUnsafe<void>();
   const logger = Logger.make(({ message }) => {
-    logs.push(JSON.stringify(message));
+    const entry = JSON.stringify(message);
+    logs.push(entry);
+    if (entry.includes('"Backup snapshot error"')) Deferred.doneUnsafe(failedCycle, Effect.void);
   });
   const run = <E, R>(
     test: (service: BackupSnapshot.BackupSnapshot["Service"]) => Effect.Effect<void, E, R>,
     options: Partial<Parameters<typeof BackupSnapshot.layerWithOptions>[0]> = {},
     transform?: Statement.Transformer,
     ready: Effect.Effect<void> = Effect.void,
+    readerOptions: Pick<
+      NodeSqliteClient.SqliteClientConfig,
+      "readerWorker" | "readerInitializationSql"
+    > = {},
   ) =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -98,13 +105,13 @@ const fixture = () => {
     ).pipe(
       Effect.provide(
         Layer.mergeAll(
-          NodeSqliteClient.layer({ filename: statePath, readerWorker: true }),
+          NodeSqliteClient.layer({ filename: statePath, readerWorker: true, ...readerOptions }),
           Logger.layer([logger], { mergeWithExisting: false }),
           NodeServices.layer,
         ),
       ),
     );
-  return { dir, outputPath, statePath, boardsPath, logs, run };
+  return { dir, outputPath, statePath, boardsPath, logs, failedCycle, run };
 };
 
 it.live(
@@ -337,6 +344,7 @@ it.effect("waits three minutes at startup and retries a failed cycle six hours l
         expect(f.logs.filter((line) => line.includes("Backup snapshot start"))).toHaveLength(0);
         yield* TestClock.adjust("1 second");
         expect(f.logs.filter((line) => line.includes("Backup snapshot start"))).toHaveLength(1);
+        yield* Deferred.await(f.failedCycle);
         expect(f.logs.some((line) => line.includes("Backup snapshot error"))).toBe(true);
         yield* TestClock.adjust("21599 seconds");
         expect(f.logs.filter((line) => line.includes("Backup snapshot start"))).toHaveLength(1);
@@ -480,39 +488,90 @@ it.live.each(["temp-open", "rename", "directory-open", "directory-sync"] as cons
 it.live("configured backup records the build commit preserved by server startup", () =>
   Effect.gen(function* () {
     const f = fixture();
-    const config = yield* ServerConfig.ServerConfig;
-    const sql = yield* SqlClient.SqlClient;
-    const services = yield* Layer.build(BackupSnapshot.layer).pipe(
-      Effect.provideService(ServerConfig.ServerConfig, {
-        ...config,
-        dbPath: f.statePath,
-        robobBuildCommit: "fedcba123456",
+    yield* f.run(() =>
+      Effect.gen(function* () {
+        const config = yield* ServerConfig.ServerConfig;
+        const sql = yield* SqlClient.SqlClient;
+        const services = yield* Layer.build(BackupSnapshot.layer).pipe(
+          Effect.provideService(ServerConfig.ServerConfig, {
+            ...config,
+            dbPath: f.statePath,
+            robobBuildCommit: "fedcba123456",
+          }),
+          Effect.provideService(BoardsDatabase.BoardsDatabase, {
+            path: f.boardsPath,
+            sql,
+            ready: Effect.void,
+          }),
+          Effect.provideService(ServerActivation, Effect.never),
+        );
+        yield* Context.get(services, BackupSnapshot.BackupSnapshot).write;
+        const output = new NodeSqlite.DatabaseSync(f.outputPath, { readOnly: true });
+        try {
+          expect(output.prepare("SELECT build_commit FROM backup_meta").get()!.build_commit).toBe(
+            "fedcba123456",
+          );
+        } finally {
+          output.close();
+        }
       }),
-      Effect.provideService(BoardsDatabase.BoardsDatabase, {
-        path: f.boardsPath,
-        sql,
-        ready: Effect.void,
-      }),
-      Effect.provideService(ServerActivation, Effect.never),
     );
-    yield* Context.get(services, BackupSnapshot.BackupSnapshot).write;
-    const output = new NodeSqlite.DatabaseSync(f.outputPath, { readOnly: true });
-    try {
-      expect(output.prepare("SELECT build_commit FROM backup_meta").get()!.build_commit).toBe(
-        "fedcba123456",
-      );
-    } finally {
-      output.close();
-    }
   }).pipe(
-    Effect.scoped,
     Effect.provide(
-      Layer.merge(
-        ServerConfig.layerTest(process.cwd(), { prefix: "backup-build-" }).pipe(
-          Layer.provideMerge(NodeServices.layer),
-        ),
-        NodeSqliteClient.layer({ filename: ":memory:" }),
+      ServerConfig.layerTest(process.cwd(), { prefix: "backup-build-" }).pipe(
+        Layer.provideMerge(NodeServices.layer),
       ),
     ),
   ),
+);
+
+it.live.each([
+  { name: "unconfigured reader", options: { readerWorker: false } },
+  {
+    name: "failed reader initialization",
+    options: { readerInitializationSql: ["SELECT * FROM missing_reader_fixture"] },
+  },
+])("skips a cycle with $name without entering the writer transaction", ({ options }) =>
+  Effect.gen(function* () {
+    const f = fixture();
+    yield* f.run((service) => service.write);
+    const previous = NodeFS.readFileSync(f.outputPath);
+    let enteredSourceBody = false;
+    const observe: Statement.Transformer = (statement) =>
+      Effect.sync(() => {
+        if (statement.compile()[0].includes("sqlite_schema")) {
+          enteredSourceBody = true;
+          // With writer fallback, this competing connection cannot commit here.
+          const writer = new NodeSqlite.DatabaseSync(f.statePath);
+          try {
+            writer.exec(
+              "PRAGMA busy_timeout=0; UPDATE scheduled_tasks SET value='competing writer'",
+            );
+          } finally {
+            writer.close();
+          }
+        }
+        return statement;
+      });
+    yield* f.run((service) => service.write, {}, observe, Effect.void, options);
+    expect(enteredSourceBody).toBe(false);
+    expect(NodeFS.readFileSync(f.outputPath)).toEqual(previous);
+    expect(
+      f.logs.some(
+        (line) =>
+          line.includes("Backup snapshot error") &&
+          line.includes("statev2.sqlite") &&
+          line.includes("Required SQLite reader unavailable"),
+      ),
+    ).toBe(true);
+    const writer = new NodeSqlite.DatabaseSync(f.statePath);
+    try {
+      writer.exec(
+        "PRAGMA busy_timeout=0; UPDATE scheduled_tasks SET value='writer remains available'",
+      );
+    } finally {
+      writer.close();
+    }
+    expect(NodeFS.readdirSync(NodePath.dirname(f.outputPath))).toEqual(["backup.sqlite"]);
+  }),
 );
