@@ -19,6 +19,7 @@ type Fixture = {
   statusError?: boolean;
   nativeError?: boolean;
   sendError?: boolean;
+  requireSendJournal?: boolean;
   sendAmbiguous?: boolean;
   strictWakeKey?: boolean;
   wakeAmbiguousOnce?: boolean;
@@ -54,6 +55,10 @@ const args = process.argv.slice(2);
 appendFileSync(${JSON.stringify(callsFile)}, JSON.stringify({ cli: ${JSON.stringify(cli)}, args }) + '\\n');
 const config = JSON.parse(readFileSync(${JSON.stringify(config)}, 'utf8'));
 if (${JSON.stringify(cli)} === 't3ctl') {
+  if (args[0] === 'send' && config.requireSendJournal) {
+    const state = JSON.parse(readFileSync(${JSON.stringify(join(dir, 'root/watchers/route-test/state.json'))}, 'utf8'));
+    if (state.pending?.creatorSend?.thread !== args[1] || !(state.pending.creatorSend.sentAt <= Date.now())) process.exit(1);
+  }
   if (args[0] === 'send' && config.sendAmbiguous) process.exit(4);
   if (args[0] === 'status' && config.sendSpawnError) unlinkSync(import.meta.path);
   if (config[args[0] + 'SleepOnce']) {
@@ -323,6 +328,7 @@ test("a retried pending event reuses its request ID and cached creator resolutio
     return { held, state: loadState(watcher.id) };
   })()`);
   expect(result.held.pending?.key).toBe("robob-watch:route-test:1:stable-event");
+  expect(result.held.pending?.creatorSend).toBeUndefined();
   expect(result.state.last_delivery).toBe("thread:abcd1234");
   expect(result.state.pending).toBeUndefined();
   const sends = calls.filter(c => c.cli === "t3ctl" && c.args[0] === "send");
@@ -644,4 +650,79 @@ test('ambiguous native-to-owner recovery preserves its route and payload at the 
   expect(calls.filter(call => call.cli === 'spectrum' && call.args[0] === 'send')).toHaveLength(0);
   expect(calls.filter(call => call.cli === 'telegram')).toHaveLength(1);
   expect(result.state.confirm).toMatchObject({ ownerFallback: true, alertDone: true, fallbackDone: true });
+});
+
+test.each([{ sendError: true }, { sendSpawnError: true }])('native recovery falls back after a rejected send even when the creator is running (%j)', async failure => {
+  const { result, calls, logs } = await fixture({ nativeSleep: true, watcher: { created_by_session: 'ses_old' } }, confirmBody(`
+    writeFileSync(configPath, JSON.stringify({ ...${JSON.stringify(failure)}, status: { threadId: ${JSON.stringify(projectThread)}, archived: false, state: 'running' } }));
+    Date.now = () => base + 60_000;
+    await tickOne(watcher.id);
+  `));
+  expect(calls.filter(call => call.cli === 'spectrum' && call.args[0] === 'wake')).toHaveLength(1);
+  expect(result.state.confirm).toMatchObject({ ownerFallback: true, thread: projectThread });
+  expect(logs.filter(row => row.name === 'wake.confirmed')).toHaveLength(0);
+});
+
+test.each([{ sendSleep: true }, { sendAmbiguous: true }])('native recovery keeps ambiguous sends pending without an owner fallback (%j)', async failure => {
+  const { result, calls, logs } = await fixture({ nativeSleep: true, watcher: { created_by_session: 'ses_old' } }, confirmBody(`
+    writeFileSync(configPath, JSON.stringify({ ...${JSON.stringify(failure)}, status: { threadId: ${JSON.stringify(projectThread)}, archived: false } }));
+    Date.now = () => base + 60_000;
+    await tickOne(watcher.id);
+  `));
+  expect(result.state.confirm).toMatchObject({ thread: projectThread });
+  expect(result.state.confirm?.ownerFallback).not.toBe(true);
+  expect(calls.filter(call => call.cli !== 't3ctl')).toHaveLength(0);
+  expect(logs.filter(row => row.name === 'wake.confirmed')).toHaveLength(0);
+});
+
+for (const outcome of ['completed', 'failed', 'cancelled', 'five newer runs']) {
+  test(`restart preserves the first send time when replaying a ${outcome} run`, async () => {
+    const { result, calls, logs } = await fixture({}, `(async () => {
+      state.pending = { key, event: 'event happened', at: new Date().toISOString(), watcher };
+      saveState(watcher.id, state);
+      await deliver(watcher, 'event happened', key, state);
+      // The runner stopped after acceptance; the original attempt survives with the pending event.
+      const originalAt = loadState(watcher.id).pending.creatorSend.sentAt;
+      const run = { runId: 'original-run', status: ${JSON.stringify(outcome === 'five newer runs' ? 'completed' : outcome)},
+        requestedAt: new Date(originalAt).toISOString(), startedAt: new Date(originalAt + 1).toISOString() };
+      const recentRuns = ${outcome === 'five newer runs'} ? Array.from({ length: 5 }, (_, i) => ({
+        runId: 'newer-' + i, status: 'completed', requestedAt: new Date(originalAt + 100 + i).toISOString() })) : [run];
+      writeFileSync(configPath, JSON.stringify({ sendOutput: JSON.stringify({ ok: true, runId: 'original-run', status: run.status }),
+        status: { threadId: watcher.created_by_session, archived: false, recentRuns } }));
+      const restartTick = async at => {
+        const code = 'Date.now = () => ' + at + '; const { tickOne } = await import(' + ${JSON.stringify(JSON.stringify(runnerPath))} + '); await tickOne("route-test");';
+        const child = Bun.spawn([process.execPath, '-e', code], { env: process.env, stdout: 'pipe', stderr: 'pipe' });
+        const [output, error, codeValue] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+        if (codeValue) throw new Error(error);
+        process.stdout.write(output);
+      };
+      await restartTick(originalAt + 60_000);
+      const before = loadState(watcher.id);
+      if (before.confirm.sentAt !== originalAt) throw new Error('replay replaced the persisted first attempt');
+      await restartTick(originalAt + 11 * 60_000);
+      return { before, state: loadState(watcher.id) };
+    })()`);
+    const sends = calls.filter(call => call.cli === 't3ctl' && call.args[0] === 'send');
+    expect(sends).toHaveLength(2);
+    expect(sends[0]!.args).toEqual(sends[1]!.args);
+    expect(result.state.confirm).toBeUndefined();
+    expect(logs.filter(row => row.name === 'wake.confirmed')).toHaveLength(1);
+    expect(calls.filter(call => call.cli !== 't3ctl')).toHaveLength(0);
+  });
+}
+
+test('the first send time is persisted before dispatch even when the send times out', async () => {
+  const { result, calls } = await fixture({ sendSleep: true, requireSendJournal: true }, `(async () => {
+    state.pending = { key, event: 'event happened', at: new Date().toISOString(), watcher };
+    saveState(watcher.id, state);
+    const beforeAt = Date.now();
+    const delivery = await deliver(watcher, 'event happened', key, state);
+    const pending = loadState(watcher.id).pending;
+    if (!pending.creatorSend || pending.creatorSend.sentAt < beforeAt) throw new Error('send attempt was not persisted');
+    if (delivery.confirmation.sentAt !== pending.creatorSend.sentAt) throw new Error('confirmation lost the attempt');
+    return { ...delivery, state: loadState(watcher.id) };
+  })()`);
+  expect(result.accepted).toBe(true);
+  expect(result.state.pending?.creatorSend?.thread).toBe(projectThread);
+  expect(calls.filter(call => call.cli !== 't3ctl')).toHaveLength(0);
 });

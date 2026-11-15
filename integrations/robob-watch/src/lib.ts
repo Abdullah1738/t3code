@@ -161,7 +161,7 @@ export type State = {
   /** Wall time of the last check run, in ms. */
   last_run_ms?: number;
   /** An event whose delivery has not succeeded yet; retried verbatim with the same key. */
-  pending?: { key: string; event: string; at: string; count?: number; urgent?: boolean; route?: WakeRoute; watcher?: Watcher; context_file?: string; healthRun?: string; healthRuns?: string[] };
+  pending?: { key: string; event: string; at: string; count?: number; urgent?: boolean; route?: WakeRoute; watcher?: Watcher; creatorSend?: { thread: string; sentAt: number }; context_file?: string; healthRun?: string; healthRuns?: string[] };
   last_delivery?: string;
   confirm?: WakeConfirmation;
   /** Later fires must not replace an older wake that is still awaiting confirmation. */
@@ -831,9 +831,31 @@ function resolveCreator(watcher: Watcher, cli: string): Promise<CreatorRoute> {
   return entry.route;
 }
 
+const ambiguousSend = (result: { code: number; signal: NodeJS.Signals | null }) => result.signal === "SIGKILL" || result.code === 4;
+
 function wakeThread(cli: string, thread: string, text: string, key: string) {
   if (underTest() && !process.env.ROBOB_WATCH_T3CTL) return Promise.resolve({ ...refused("t3ctl send"), code: 127, signal: null });
   return run([cli, "send", thread, clip(text, MAX_WAKE), "--request-id", key, "--mode", "queue"], creatorSendTimeout());
+}
+
+function creatorSendAt(watcher: Watcher, key: string, thread: string): number {
+  const fresh = loadState(watcher.id);
+  if (fresh.pending?.key !== key) return now();
+  const attempt = fresh.pending.creatorSend;
+  if (attempt?.thread === thread) return attempt.sentAt;
+  const sentAt = now();
+  // Commit the first attempt before dispatch: a same-key replay after a crash can
+  // return a run that already finished, earlier than the replay's own start time.
+  fresh.pending.creatorSend = { thread, sentAt };
+  saveState(watcher.id, fresh);
+  return sentAt;
+}
+
+function clearCreatorSend(watcher: Watcher, key: string): void {
+  const fresh = loadState(watcher.id);
+  if (fresh.pending?.key !== key || !fresh.pending.creatorSend) return;
+  delete fresh.pending.creatorSend;
+  saveState(watcher.id, fresh);
 }
 
 export function wake(source: string, text: string, key: string): Promise<{ ok: boolean; out: string }> {
@@ -1101,21 +1123,23 @@ export async function deliver(watcher: Watcher, event: string, key: string, stat
       }
       if (creator.kind === "thread") {
         const prefix = `[Watcher event from robob-watch ${watcher.id}, not typed by anyone in this thread.]`;
+        const firstSentAt = creatorSendAt(watcher, key, creator.thread);
         const sendStarted = now();
         let reason = "error";
         try {
           const result = await wakeThread(cli, creator.thread, `${prefix}\n${text}`, key);
           if (result.ok) { route = "creator"; return queued(`thread:${shortThread(creator.thread)}`, result.out,
-            { ...confirmation(), sentAt: sendStarted, thread: creator.thread }); }
+            { ...confirmation(), sentAt: firstSentAt, thread: creator.thread }); }
           reason = exitReason(result);
-          if (reason === "timeout" || result.code === 4) {
+          if (ambiguousSend(result)) {
             route = "creator";
             log(watcher.id, `creator send unconfirmed thread=${creator.thread} ${probeDetail("send", result, sendStarted)}`);
             return queued(`thread:${shortThread(creator.thread)}`, probeDetail("send", result, sendStarted),
-              { ...confirmation(), sentAt: sendStarted, thread: creator.thread });
+              { ...confirmation(), sentAt: firstSentAt, thread: creator.thread });
           }
           missed = { thread: creator.thread, reason: [creator.reason, probeDetail("send", result, sendStarted)].filter(Boolean).join(", ") };
         } catch (error) { missed = { thread: creator.thread, reason: [creator.reason, `send error after ${((now() - sendStarted) / 1000).toFixed(1)}s: ${String(error).slice(0, 300)}`].filter(Boolean).join(", ") }; }
+        clearCreatorSend(watcher, key);
         creatorFallback(watcher, "send", reason, sendStarted);
         // log(watcher.id, ...) below stays in the watcher archive; stdout reaches runner.log.
         log(null, `creator wake fallback watcher=${watcher.id} thread=${creator.thread} reason=${reason}`);
@@ -1150,6 +1174,16 @@ export async function deliver(watcher: Watcher, event: string, key: string, stat
   }
 }
 
+async function deliverToOwner(watcher: Watcher, event: string, text: string, key: string): Promise<Delivery> {
+  const result = await wake(`robob-watch ${watcher.id}`, text, key);
+  if (result.ok) return { ok: true, via: "wake", detail: result.out };
+  const plain = `${watcher.title}\n${clip(event.trim(), MAX_EVENT)}`;
+  const sent = await imessage(plain, key);
+  if (sent.ok) return { ok: true, via: "imessage-send", detail: sent.out };
+  const notified = await telegram(`Watcher ${watcher.id}`, plain, key);
+  return { ok: notified.ok, via: notified.ok ? "telegram" : "none", detail: notified.out };
+}
+
 /** Confirmation is separate from queue acceptance and remains active for capped/paused watchers. */
 export async function confirmWakes(watcher: Watcher): Promise<void> {
   const instance = watcherInstance(watcher.id);
@@ -1182,9 +1216,28 @@ export async function confirmWakes(watcher: Watcher): Promise<void> {
         entry.deadlineAt ??= entry.sentAt;
         entry.sentAt = now();
         if (!update(entry)) return;
+        const sendStarted = now();
         const result = await wakeThread(cli, route.thread,
-          `[Watcher event from robob-watch ${watcher.id}, not typed by anyone in this thread.]\n${entry.text}`, entry.key);
+          `[Watcher event from robob-watch ${watcher.id}, not typed by anyone in this thread.]\n${entry.text}`, entry.key)
+          .catch(error => ({ ok: false, code: 127, signal: null, out: String(error).slice(0, 300) }));
         log(watcher.id, `native wake resolved thread=${route.thread} accepted=${result.ok} ${result.out.slice(0, 300)}`);
+        if (!result.ok && !ambiguousSend(result)) {
+          creatorFallback(watcher, "send", exitReason(result), sendStarted);
+          const detail = probeDetail("send", result, sendStarted);
+          log(watcher.id, `creator wake fallback thread=${route.thread} ${detail}`);
+          log(null, `creator wake fallback watcher=${watcher.id} thread=${route.thread} ${detail}`);
+          // Persist the failed creator route before trying another channel, so a running
+          // thread cannot confirm a rejected event on this tick or after a restart.
+          entry.ownerFallback = true;
+          entry.text = `(meant for thread ${shortThread(route.thread)}, which could not be reached)\n${entry.text}`;
+          if (!update(entry)) return;
+          const fallback = await deliverToOwner(watcher, entry.event, entry.text, entry.key);
+          const via = fallback.via === "wake" ? "wake:owner-fallback" : fallback.via;
+          log(watcher.id, `native wake fallback via=${via} meant_for=${shortThread(route.thread)} confirmed=${fallback.via === "wake" ? "pending" : "n/a"}`);
+          const complete = fallback.ok && fallback.via !== "wake";
+          if (!update(entry, complete, via)) return;
+          if (complete) continue;
+        }
       } else if (route.kind === "owner") {
         entry.deadlineAt ??= entry.sentAt;
         entry.sentAt = now();
@@ -1246,15 +1299,9 @@ export async function confirmWakes(watcher: Watcher): Promise<void> {
       entry.fallbackText ??= entry.ownerFallback || !entry.thread && !entry.nativeSession ? entry.text
         : `(meant for thread ${shortThread(target)}; its wake is still unconfirmed)\n${entry.text}`;
       if (!update(entry)) return;
-      const result = await wake(`robob-watch ${watcher.id}`, entry.fallbackText, entry.key);
-      let via = "none";
-      if (result.ok) { entry.ownerFallback = true; via = entry.thread || entry.nativeSession ? "wake:owner-fallback" : "wake"; }
-      else {
-        const plain = `${watcher.title}\n${clip(entry.event.trim(), MAX_EVENT)}`;
-        const sent = await imessage(plain, entry.key);
-        if (sent.ok) via = "imessage-send";
-        else if ((await telegram(`Watcher ${watcher.id}`, plain, entry.key)).ok) via = "telegram";
-      }
+      const fallback = await deliverToOwner(watcher, entry.event, entry.fallbackText, entry.key);
+      const via = fallback.via === "wake" && (entry.thread || entry.nativeSession) ? "wake:owner-fallback" : fallback.via;
+      if (fallback.ok && fallback.via === "wake") entry.ownerFallback = true;
       entry.fallbackDone = via !== "none";
       if (!update(entry, false, via)) return;
       log(watcher.id, `wake escalation key=${entry.key} via=${via} confirmed=pending`);
