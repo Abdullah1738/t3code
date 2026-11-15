@@ -174,7 +174,8 @@ class DeepInventoryTests(unittest.TestCase):
 
     def test_hourly_skips_inventory_while_deep_holds_lock_but_collects_crashes(self):
         root=self.roots([('lock',1)])[0]
-        jobs.save_state('disk-inventory',dict(duMode='links',sizes={str(root):1024},partials={}))
+        jobs.save_state('disk-inventory',dict(duMode='links',sizes={str(root):1024},partials={},
+            childState={str(root): {str(root/'0000'): dict(bytes=1024, at=self.now, partial=False)}}))
         with jobs.inventory_lock() as acquired:
             self.assertIsNot(acquired,False)
             with patch.object(collector,'collect') as crash, patch.object(collector,'disk_wait'), \
@@ -211,7 +212,7 @@ class DeepInventoryTests(unittest.TestCase):
         for root in roots[:2]:
             (root/'0000'/'blocked').touch()
         deep.run_pass(roots,self.runner(lambda p:700 if any(root in p.parents for root in roots[:2]) else .034,calls))
-        self.assertEqual(sum(len(command)-2 for command,_ in calls),134)
+        self.assertEqual(sum(len(command)-2 for command,_ in calls),138)
         self.assertEqual(self.rows('disk.deep.end')[-1]['props']['childrenRemaining'],2)
         self.assertEqual(self.rows('disk.deep.end')[-1]['props']['childrenPartial'],2)
         self.assertLess(self.clock[0],2700)
