@@ -312,7 +312,7 @@ commands, same box model, no hourly price, no start limits, no spend cap). Boat 
   15 minutes and carries on from where the output stopped. If the machine itself restarted, the server runs the
   command **again from the start, once**, and you get one line saying so (`... running it again from the start
   (attempt 2)`). Runs the server had queued start after it. `--no-retry` turns the second run off; the run then
-  ends with **94**.
+  ends with **94**. An Incus restart or exec-stream drop on home counts as a server restart: a command still running is re-attached; otherwise it is retried once, or ends 94 with `--no-retry`, with the message saying whether processes remain on the box.
 - Each backend has its own boxes, saved states and templates. `offbox bases` lists both backends; expired bases
   are hidden unless `--all`. An unpinned run naming a base that exists only on Boat uses Boat and says so.
   `offbox list` shows the selected backend; `logs`, `wait`, `kill`, `release`, `ssh` find the right one from the
@@ -379,8 +379,8 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
   runs held the pool's lock that long). Nothing ran, not an infra failure: just retry. A slow box resume or create no longer holds up other runs of the same repo.
 - **93** = person work (`offbox-person`) while the home server is down. Nothing ran and nothing went to Boat. It
   is not a failure of the command: the task waits for the server. Don't retry in a loop and don't route around it.
-- **94** = the home server restarted under the run and it was not run again (`--no-retry`, person work, or it
-  had already been retried once). The command ran partly: check what it did before running it again.
+- **94** = the home command was interrupted by a server/Incus restart or exec-stream loss and was not run again (`--no-retry`, person work, or it
+  had already been retried once). The command ran partly: check what it did before running it again; the message reports clean, stopped leftovers, or unknown cleanup.
 - **96** = local state DB failure. Before start: 'nothing ran, safe to retry'. After start: the message names the run and tells you to use `offbox wait <run>`; do not rerun the command. No automatic local fallback. A local bookkeeping failure after a known remote exit warns and returns that remote exit code.
 - **100** from `offbox wait` / `offbox logs` = the client ended before it got a box. The run never started; nothing ran, safe to rerun.
 - **124** from `offbox wait --timeout` = you stopped waiting; the run is still going. Wait again.
