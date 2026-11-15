@@ -20,8 +20,10 @@ import * as Semaphore from "effect/Semaphore";
  *   pages waited up to 13 s for a permit and two gave up after 20-25 s unadmitted).
  *   A page is at most 500 rows (0.7 MB on the synthetic fixture, about 1.3 MB in the
  *   live traces; rows are not capped in bytes), so three at once stay cheap.
- * - poll: the per-thread control message read, so bridge polls queue only
- *   behind each other, never behind lists, snapshots or MCP reads.
+ * - poll: control thread detail reads, isolated from lists, snapshots and MCP.
+ * - controlRead: control message reads on foreground readers. One request
+ *   at a time leaves the other foreground reader available to the UI, even
+ *   when an all=true read hydrates a large imported transcript.
  * - mcp: a whole large MCP read (t3_thread_read, board/card/wiki reads...).
  *   It bounds how many large results are built at once; a slow one delays
  *   only other large MCP reads.
@@ -31,17 +33,24 @@ import * as Semaphore from "effect/Semaphore";
  * GET /threads (p95 14.6 s) and MCP reads (t3_thread_read up to 153 s, while
  * waiting for reader slots), and everything else on it hit client timeouts.
  */
-export type Lane = "interactive" | "agent" | "snapshot" | "thread" | "shellPage" | "poll" | "mcp";
+export type Lane =
+  | "interactive"
+  | "agent"
+  | "snapshot"
+  | "thread"
+  | "shellPage"
+  | "poll"
+  | "controlRead"
+  | "mcp";
 
 export class ReplyBuilders extends Context.Service<
   ReplyBuilders,
   { readonly [K in Lane]: Semaphore.Semaphore }
 >()("t3/ardud/http/ReplyBuilders") {}
 
-// Payload construction is still bounded: at most 2 + 2 + 2 + 2 + 4 admitted 16 MiB
-// builds (192 MiB, excluding object/encoding overhead); poll reads are one
-// thread's messages each and shell pages are 500 rows each. Each lane is shared across connections, not
-// allocated per board or request.
+// Lanes are shared across connections, not allocated per board or request.
+// The control read permit includes hydration and SQL, so even all=true reads
+// cannot take both foreground readers. Response encoding uses the agent lane.
 export const PERMITS: { readonly [K in Lane]: number } = {
   interactive: 2,
   agent: 2,
@@ -49,6 +58,7 @@ export const PERMITS: { readonly [K in Lane]: number } = {
   thread: 2,
   shellPage: 3,
   poll: 4,
+  controlRead: 1,
   mcp: 4,
 };
 
@@ -62,6 +72,7 @@ export const layer = Layer.effect(
       thread: yield* Semaphore.make(PERMITS.thread),
       shellPage: yield* Semaphore.make(PERMITS.shellPage),
       poll: yield* Semaphore.make(PERMITS.poll),
+      controlRead: yield* Semaphore.make(PERMITS.controlRead),
       mcp: yield* Semaphore.make(PERMITS.mcp),
     };
   }),

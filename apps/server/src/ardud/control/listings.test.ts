@@ -27,6 +27,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
+import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Etag from "effect/http/Etag";
 import * as HttpPlatform from "effect/http/HttpPlatform";
@@ -58,6 +59,7 @@ import * as Analytics from "../analytics/Analytics.ts";
 import { guidanceContext } from "../imessage/guidance.ts";
 import { accumulate, finishRollup, makeAccumulator } from "../analytics/rollup.ts";
 import * as StartupPhaseLog from "../observability/StartupPhaseLog.ts";
+import * as ReplyBuilders from "../http/ReplyBuilders.ts";
 
 const askedAt = DateTime.makeUnsafe("2026-01-01T00:05:00.000Z");
 const encodeThreadPayload = Schema.encodeEffect(
@@ -249,6 +251,7 @@ const makeHarness = (
   authFailures: Array<unknown> = [],
   realSnapshots = false,
   heldList?: { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
+  heldMessage?: { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
 ) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
@@ -284,6 +287,10 @@ const makeHarness = (
     const targetedReads = yield* Ref.make<Array<ReadonlyArray<string>>>([]);
     const shellReads = yield* Ref.make(0);
     const recordReads = yield* Ref.make(0);
+    const authenticated = yield* Queue.unbounded<void>();
+    const replyBuilders = yield* ReplyBuilders.ReplyBuilders.pipe(
+      Effect.provide(ReplyBuilders.layer),
+    );
     const config = yield* ServerConfig.ServerConfig.pipe(
       Effect.provide(
         ServerConfig.layerTest(process.cwd(), { prefix: "t3-control-listings" }).pipe(
@@ -332,7 +339,17 @@ const makeHarness = (
       },
       getThreadShell: (threadId) =>
         sql
-          .withTransaction(sql`SELECT 1`)
+          .withTransaction(
+            sql`SELECT 1`.pipe(
+              Effect.andThen(
+                heldMessage === undefined
+                  ? Effect.void
+                  : Deferred.succeed(heldMessage.entered, undefined).pipe(
+                      Effect.andThen(Deferred.await(heldMessage.release)),
+                    ),
+              ),
+            ),
+          )
           .pipe(
             Effect.orDie,
             Effect.andThen(Ref.update(shellReads, (count) => count + 1)),
@@ -365,6 +382,7 @@ const makeHarness = (
                         : sql`SELECT 1`.pipe(
                             NodeSqliteClient.authReadOnly,
                             Effect.orDie,
+                            Effect.andThen(Queue.offer(authenticated, undefined)),
                             Effect.as({
                               sessionId: AuthSessionId.make("session-cli"),
                               subject: "cli-issued-session",
@@ -436,6 +454,7 @@ const makeHarness = (
             disableLogger: true,
             middleware: (effect) =>
               effect.pipe(
+                Effect.provideService(ReplyBuilders.ReplyBuilders, replyBuilders),
                 Effect.provideService(Statement.CurrentTransformer, (statement) => {
                   statements.push(statement.compile());
                   return Effect.succeed(statement);
@@ -477,6 +496,7 @@ const makeHarness = (
       statements,
       shellReads,
       recordReads,
+      authenticated,
       startupLog,
       sql,
     };
@@ -1376,6 +1396,76 @@ describe("control listings", () => {
           yield* Fiber.join(holder);
         }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live.each([
+    "/threads/quiet/messages",
+    "/threads/quiet/messages?since=0&role=user&all=true",
+    "/messages?since=0&limit=1000",
+  ])("GET %s completes while the background reader is held", (endpoint) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "control-message-lane-" });
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const harness = yield* makeHarness();
+        const expected = yield* harness.get(endpoint);
+        assert.equal(expected.status, 200);
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const holder = yield* sql
+          .withTransaction(
+            Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          )
+          .pipe(NodeSqliteClient.readOnly, NodeSqliteClient.backgroundReads, Effect.forkChild);
+        yield* Deferred.await(entered);
+        yield* Effect.gen(function* () {
+          const response = yield* harness.get(endpoint);
+          assert.equal(response.status, 200);
+          assert.deepEqual(response.body, expected.body);
+          assert.isUndefined(holder.pollUnsafe());
+        }).pipe(Effect.timeout("2 seconds"), Effect.ensuring(Deferred.succeed(release, undefined)));
+        yield* Fiber.join(holder);
+      }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("a control message burst leaves a foreground reader for the UI", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "control-message-ui-" });
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const harness = yield* makeHarness(undefined, [], new Set(), [], false, undefined, {
+          entered,
+          release,
+        });
+        const burst = yield* Effect.all(
+          Array.from({ length: 6 }, () => harness.get("/threads/quiet/messages?all=true")),
+          { concurrency: "unbounded" },
+        ).pipe(Effect.forkChild);
+        yield* Deferred.await(entered);
+        // Authentication precedes control admission, so every request has reached the burst.
+        yield* Effect.forEach(Array.from({ length: 6 }), () => Queue.take(harness.authenticated));
+        const crossThread = yield* harness.get("/messages?since=0").pipe(Effect.forkChild);
+        yield* Queue.take(harness.authenticated);
+        yield* Effect.gen(function* () {
+          const rows = yield* sql
+            .withTransaction(sql`SELECT 123 AS value`)
+            .pipe(NodeSqliteClient.readOnly, NodeSqliteClient.foregroundReads);
+          assert.equal(rows[0]!.value, 123);
+          assert.equal((yield* harness.get("/health")).status, 200);
+          assert.isUndefined(burst.pollUnsafe());
+          assert.isUndefined(crossThread.pollUnsafe());
+        }).pipe(Effect.timeout("2 seconds"), Effect.ensuring(Deferred.succeed(release, undefined)));
+        for (const response of yield* Fiber.join(burst)) assert.equal(response.status, 200);
+        assert.equal((yield* Fiber.join(crossThread)).status, 200);
+      }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
   it.live("a held list transaction leaves both foreground slots available", () =>
