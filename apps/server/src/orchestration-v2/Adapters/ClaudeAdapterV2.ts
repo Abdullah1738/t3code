@@ -1,4 +1,6 @@
 import * as ClaudeApiErrorTranscript from "./ClaudeApiErrorTranscript.ts";
+import * as ProviderStartProgress from "../../ardud/orchestration/ProviderStartProgress.ts";
+import { nativeOutputAcknowledgesStart } from "../providerStartDeadlinePolicy.ts";
 import {
   optionalMcpRegistration,
   mcpStartupTimeoutMs,
@@ -4084,6 +4086,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
     openSession: Effect.fn("ClaudeAdapterV2.openSession")(
       function* (input: ProviderAdapter.ProviderAdapterV2OpenSessionInput) {
         const sessionScope = yield* Effect.scope;
+        const startProgress = yield* Effect.serviceOption(
+          ProviderStartProgress.ProviderStartProgress,
+        );
         const now = yield* DateTime.now;
         const session = providerSession({
           providerSessionId: input.providerSessionId,
@@ -4404,8 +4409,44 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         const runtimeContext = yield* Effect.context<never>();
         const runPromise = Effect.runPromiseWith(runtimeContext);
 
-        const emitProviderEvent = (event: ProviderAdapter.ProviderAdapterV2Event) =>
-          Queue.offer(events, event).pipe(Effect.asVoid);
+        // Observe the SDK's acceptance before the session manager can block forwarding it.
+        const emitProviderEvent = Effect.fnUntraced(function* (
+          event: ProviderAdapter.ProviderAdapterV2Event,
+        ) {
+          if (
+            Option.isSome(startProgress) &&
+            ((event.type === "provider_turn.updated" &&
+              event.providerTurn.promptAcceptedAt !== undefined) ||
+              (event.type === "turn_item.updated" && nativeOutputAcknowledgesStart(event.turnItem)))
+          ) {
+            const context = yield* Ref.get(activeTurn);
+            if (
+              context !== null &&
+              (event.type === "provider_turn.updated"
+                ? context.input.attemptId === event.providerTurn.runAttemptId
+                : event.type === "turn_item.updated" &&
+                  event.turnItem.runId === context.input.runId &&
+                  event.turnItem.providerTurnId === context.providerTurnId)
+            ) {
+              const attempt = {
+                threadId: context.input.threadId,
+                runId: context.input.runId,
+                attemptId: context.input.attemptId,
+              };
+              yield* startProgress.value.observe(
+                attempt,
+                "native_accepted",
+                context.nativeThreadId,
+              );
+              yield* startProgress.value.observe(
+                attempt,
+                "adapter_emitted",
+                context.nativeThreadId,
+              );
+            }
+          }
+          yield* Queue.offer(events, event);
+        });
 
         // Reports one root request's usage as the current context. Usage
         // without input is a placeholder, never a measurement.
@@ -9418,6 +9459,16 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         ) {
           if (context.promptAcceptedAt !== undefined) return;
           context.promptAcceptedAt = yield* DateTime.now;
+          if (Option.isSome(startProgress))
+            yield* startProgress.value.observe(
+              {
+                threadId: context.input.threadId,
+                runId: context.input.runId,
+                attemptId: context.input.attemptId,
+              },
+              "native_accepted",
+              context.nativeThreadId,
+            );
           yield* emitProviderEvent({
             type: "provider_turn.updated",
             driver: CLAUDE_PROVIDER,
@@ -9448,6 +9499,16 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           const liveQuery = yield* Ref.get(queryContext);
           if (context !== null && liveQuery?.query === input.query) {
             context.lastSdkMessageAt = yield* Clock.currentTimeMillis;
+            if (Option.isSome(startProgress))
+              yield* startProgress.value.observe(
+                {
+                  threadId: context.input.threadId,
+                  runId: context.input.runId,
+                  attemptId: context.input.attemptId,
+                },
+                "sdk_received",
+                context.nativeThreadId,
+              );
           }
           if (
             context !== null &&
@@ -10253,6 +10314,13 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           function* (turnInput: ProviderAdapter.ProviderAdapterV2TurnInput) {
             const startedAt = yield* DateTime.now;
             const nativeThreadId = yield* getNativeThreadId(turnInput.providerThread);
+            const progressAttempt = {
+              threadId: turnInput.threadId,
+              runId: turnInput.runId,
+              attemptId: turnInput.attemptId,
+            };
+            if (Option.isSome(startProgress))
+              yield* startProgress.value.step(progressAttempt, "turn_preparation", nativeThreadId);
             const nativeTurnId = `turn:${turnInput.attemptId}`;
             // Fresh for every offer: Claude acks a prompt whose uuid its
             // transcript already holds without running a turn, and a session
@@ -10447,7 +10515,14 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               yield* attachTurn;
               yield* startUserTurnForWakeReports(nativeThreadId);
               // Preparation releases the control lock before native delivery runs.
-              return admitRecovery.pipe(Effect.andThen(querySession.query.offer(userMessage)));
+              return admitRecovery.pipe(
+                Effect.andThen(
+                  Option.isSome(startProgress)
+                    ? startProgress.value.step(progressAttempt, "start_send")
+                    : Effect.void,
+                ),
+                Effect.andThen(querySession.query.offer(userMessage)),
+              );
             }
             yield* Ref.set(pendingContinuation, { context, querySession });
             // Transcript reads suspend replay. Hold live SDK frames until the whole

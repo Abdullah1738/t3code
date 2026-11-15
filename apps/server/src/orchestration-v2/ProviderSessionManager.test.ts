@@ -1819,6 +1819,76 @@ it.effect.each(["failure", "interruption"] as const)(
     }),
 );
 
+it.effect("a blocked session status write does not hold another session's native events", () =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    const hook = yield* Ref.make<SessionWriteHook>(() => Effect.void);
+    const paused = yield* Deferred.make<void>();
+    const commit = yield* Deferred.make<void>();
+    yield* Effect.gen(function* () {
+      const f = yield* makeSessionAudienceFixture(state, 1);
+      const otherThread = ThreadId.make("independent-claude-session");
+      yield* f.eventSink.write({
+        events: [
+          yield* makeThreadCreatedEvent({
+            idAllocator: f.idAllocator,
+            threadId: otherThread,
+            now: f.now,
+          }),
+        ],
+      });
+      const otherSessionId = yield* f.idAllocator.allocate.providerSession({
+        threadId: otherThread,
+        providerInstanceId: modelSelection.instanceId,
+      });
+      const other = yield* f.manager.open({
+        threadId: otherThread,
+        providerSessionId: otherSessionId,
+        modelSelection,
+        runtimePolicy,
+      });
+      const subscription = yield* Effect.acquireRelease(other.subscribeEvents!, (sub) => sub.close);
+      yield* Ref.set(hook, (input) =>
+        input.events.some(
+          (event) =>
+            event.type === "provider-session.updated" &&
+            event.payload.id === f.providerSessionId &&
+            event.payload.status === "running",
+        )
+          ? Deferred.succeed(paused, undefined).pipe(Effect.andThen(Deferred.await(commit)))
+          : Effect.void,
+      );
+      const queues = (yield* Ref.get(state)).eventQueues;
+      yield* Queue.offer(queues.get(String(f.providerSessionId))!, {
+        type: "provider_session.updated",
+        driver: f.runtime.driver,
+        providerSession: { ...f.runtime.providerSession, status: "running" },
+      });
+      yield* Deferred.await(paused);
+      const running = {
+        type: "provider_session.updated" as const,
+        driver: other.driver,
+        providerSession: { ...other.providerSession, status: "running" as const },
+      };
+      yield* Queue.offer(queues.get(String(otherSessionId))!, running);
+      assert.deepEqual(yield* subscription.events.pipe(Stream.runHead), Option.some(running));
+      assert.isFalse(yield* Deferred.isDone(commit));
+      const records = yield* f.projectionStore.getThreadRecords(otherThread, ["providerSessions"]);
+      assert.equal(records.providerSessions.at(-1)?.status, "running");
+    }).pipe(
+      Effect.ensuring(Deferred.succeed(commit, undefined)),
+      Effect.provide(
+        layerTest({
+          state,
+          idleTimeoutMs: 60_000,
+          driver: ProviderDriverKind.make("claudeAgent"),
+          sessionWriteHook: hook,
+        }),
+      ),
+    );
+  }),
+);
+
 it.effect(
   "interrupting a pump write releases the audience permit for a different live session",
   () =>

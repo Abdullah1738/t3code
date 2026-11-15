@@ -1,5 +1,6 @@
 import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
 import * as RunStartDeadline from "./RunStartDeadline.ts";
+import * as ProviderStartProgress from "../ardud/orchestration/ProviderStartProgress.ts";
 import {
   PROVIDER_START_CLEANUP_TIMEOUT_MS,
   PROVIDER_START_TIMEOUT_CODE,
@@ -9992,7 +9993,8 @@ it.effect.each(["timeout", "cancel"])(
               (item) =>
                 item.type === "error" &&
                 item.failure.code === PROVIDER_START_TIMEOUT_CODE &&
-                item.failure.message.includes("waited 10 min"),
+                item.failure.message.includes("within 10 min") &&
+                !item.failure.message.includes("never started"),
             ),
           );
         const effects = yield* outbox.listByCommandId(CommandId.make(`${threadId}:send:0`));
@@ -10437,8 +10439,10 @@ it.effect.each([
   { status: "running", strength: "strong", bootstrap: true },
   { status: "running", strength: "strong", replayedPi: true },
   { status: "running", strength: "strong", replayedMuse: true },
+  { status: "running", strength: "strong", lostEvents: true },
+  { status: "running", strength: "strong", staleEvidence: true },
 ] as const)(
-  "start deadline expires local registration $status/$strength without native acceptance",
+  "start deadline expires local registration $status/$strength without persisted native acceptance",
   (row) =>
     Effect.gen(function* () {
       const { status, strength } = row;
@@ -10450,6 +10454,21 @@ it.effect.each([
       );
       const run = projection.runs[0]!;
       const now = yield* DateTime.now;
+      if ("lostEvents" in row || "staleEvidence" in row) {
+        const progress = yield* ProviderStartProgress.ProviderStartProgress;
+        const evidenceAttempt =
+          "staleEvidence" in row ? RunAttemptId.make("stale-attempt") : run.activeAttemptId!;
+        const identity = { threadId, runId: run.id, attemptId: evidenceAttempt };
+        yield* progress.begin({
+          ...identity,
+          attemptOrdinal: 1,
+          provider: run.providerInstanceId,
+          model: run.modelSelection.model,
+          delegated: false,
+          providerSessionId: projection.providerThreads[0]!.providerSessionId!,
+        });
+        yield* progress.observe(identity, "native_accepted", "lost-native-session");
+      }
       const deadline = DateTime.makeUnsafe(DateTime.toEpochMillis(now) + PROVIDER_START_TIMEOUT_MS);
       const events: Array<Parameters<typeof sink.write>[0]["events"][number]> = [
         {
@@ -10525,7 +10544,9 @@ it.effect.each([
         Stream.runForEach((event) =>
           event.type === "run.updated" &&
           event.payload.id === projection.runs[1]!.id &&
-          event.payload.status === "starting"
+          ("lostEvents" in row
+            ? event.payload.queueHeld === true
+            : event.payload.status === "starting")
             ? Deferred.succeed(promoted, undefined)
             : Effect.void,
         ),
@@ -10548,13 +10569,28 @@ it.effect.each([
         yield* Deferred.await(failed);
       } else {
         for (const event of events) yield* guard.handle(event);
-        yield* TestClock.adjust(`${PROVIDER_START_TIMEOUT_MS} millis`);
+        yield* TestClock.adjust(PROVIDER_START_TIMEOUT_MS - 1);
+        yield* guard.check();
+        assert.equal((yield* engine.getThreadProjection(threadId)).runs[0]?.status, "running");
+        yield* TestClock.adjust(1);
         yield* guard.check();
       }
       yield* Deferred.await(promoted);
       const after = yield* engine.getThreadProjection(threadId);
       assert.equal(after.runs[0]?.status, "failed");
       assert.equal(after.providerTurns[0]?.status, "failed");
+      const failure = after.turnItems.find(
+        (item) => item.type === "error" && item.runId === run.id,
+      );
+      assert.equal(
+        failure?.type === "error" ? failure.failure.code : null,
+        "lostEvents" in row ? "provider_events_lost" : PROVIDER_START_TIMEOUT_CODE,
+      );
+      if ("lostEvents" in row && failure?.type === "error") {
+        assert.include(failure.failure.message, "lost-native-session");
+        assert.notInclude(failure.failure.message, "never started");
+        assert.isFalse(failure.failure.retryable);
+      }
       const outbox = yield* EffectOutbox.EffectOutboxV2;
       const stop = Option.getOrThrow(
         yield* outbox.claimNext({
@@ -10569,7 +10605,8 @@ it.effect.each([
         assert.isTrue(stop.request.startTimeout);
         assert.equal(stop.request.providerTurnId, after.providerTurns[0]!.id);
       }
-      assert.equal(after.runs[1]?.status, "starting");
+      assert.equal(after.runs[1]?.status, "lostEvents" in row ? "queued" : "starting");
+      if ("lostEvents" in row) assert.isTrue(after.runs[1]?.queueHeld);
     }).pipe(Effect.provide(Layer.fresh(layerDeadlineTest))),
 );
 

@@ -10,6 +10,7 @@ import { claudeRecoveryResult } from "../orchestration-v2/launchRecovery.ts";
 import { stalledSummary } from "../orchestration-v2/delegatedTaskProgress.ts";
 import {
   CommandId,
+  type RunAttemptId,
   type RunId,
   isProviderAvailable,
   MessageId,
@@ -17,6 +18,7 @@ import {
   NodeId,
   TurnItemId,
   type OrchestrationV2Run,
+  type OrchestrationV2ProviderTurn,
   type OrchestrationV2Subagent,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadShell,
@@ -134,6 +136,7 @@ import {
 } from "./McpInvocationContext.ts";
 import * as Metrics from "../observability/Metrics.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
+import * as ProviderStartProgress from "../ardud/orchestration/ProviderStartProgress.ts";
 
 const DEFAULT_WAIT_TIMEOUT_MS = 10 * 60 * 1_000;
 // Bun's HTTP client closes a silent request after five minutes. Leave room for
@@ -1143,6 +1146,35 @@ const make = Effect.gen(function* () {
     );
   const crypto = yield* Crypto.Crypto;
   const threadManagement = yield* ThreadManagementService.ThreadManagementService;
+  const startProgress = yield* Effect.serviceOption(ProviderStartProgress.ProviderStartProgress);
+  const startState = (
+    run: OrchestrationV2Run | null | undefined,
+    turns: ReadonlyArray<OrchestrationV2ProviderTurn>,
+  ) =>
+    ProviderStartProgress.startState(
+      run,
+      turns,
+      run == null || Option.isNone(startProgress)
+        ? null
+        : startProgress.value.get(run.id, run.activeAttemptId),
+    );
+  const readStartState = Effect.fnUntraced(function* (run: OrchestrationV2Run | null | undefined) {
+    if (
+      run == null ||
+      run.activeAttemptId == null ||
+      !["preparing", "starting", "running"].includes(run.status)
+    )
+      return startState(run, []);
+    const { providerTurns } = yield* threadManagement
+      .getThreadRecords(
+        run.threadId,
+        ["providerTurns"],
+        { providerTurnAttemptId: run.activeAttemptId },
+        { projectionOnly: true },
+      )
+      .pipe(NodeSqliteClient.foregroundReads, Effect.mapError(threadManagementFailure));
+    return startState(run, providerTurns);
+  });
   const progressGuard = yield* Effect.serviceOption(
     DelegatedTaskProgressGuard.DelegatedTaskProgressGuard,
   );
@@ -2107,6 +2139,7 @@ const make = Effect.gen(function* () {
       latestTerminalStatus:
         terminalStatus !== null && isTerminalTaskStatus(terminalStatus) ? terminalStatus : null,
       hasPendingChildRuns: hasPendingChildRuns(childControls, childRun),
+      ...startState(currentRun ?? childRun, childControls.providerTurns),
     });
     const progress = delegatedTaskProgress(childControls);
     const taskResultRun =
@@ -2315,9 +2348,10 @@ const make = Effect.gen(function* () {
       status,
       ...(taskFailure === undefined ? {} : { failure: taskFailure }),
       startedAt: childRun?.startedAt == null ? null : DateTime.formatIso(childRun.startedAt),
-      startPending:
-        childRun?.startedAt == null &&
-        (childRun?.status === "preparing" || childRun?.status === "starting"),
+      ...startState(
+        isTerminalTaskStatus(status) ? childRun : (currentRun ?? childRun),
+        childControls.providerTurns,
+      ),
       workState,
       hasPendingChildRuns: hasPendingChildRuns(childProjection, childRun),
       providerInstanceId: modelSelection.instanceId,
@@ -3183,7 +3217,8 @@ const make = Effect.gen(function* () {
         childNodeId: taskId,
         status: "running",
         startedAt: childRun?.startedAt == null ? null : DateTime.formatIso(childRun.startedAt),
-        startPending: childRun?.startedAt == null,
+        ...startState(childRun, []),
+        ...(childRun === undefined ? { startPending: true } : {}),
         workState: "working",
         hasPendingChildRuns: false,
         providerInstanceId: taskEvent.event.payload.providerInstanceId,
@@ -3955,6 +3990,8 @@ const make = Effect.gen(function* () {
       const call = yield* Effect.serviceOption(McpCallAnalytics.McpCall);
       if (Option.isSome(call)) call.value.waitStage = "lookup.caller";
       let snapshot: OrchestratorMcpThreadWaitResult | undefined;
+      let snapshotRun: OrchestrationV2Run | null | undefined;
+      let acceptedAttemptId: RunAttemptId | null | undefined;
       const waiting = Effect.gen(function* () {
         yield* loadCaller(scope);
         if (Option.isSome(call)) {
@@ -3991,24 +4028,31 @@ const make = Effect.gen(function* () {
             "run_not_found",
             `Run ${input.runId} was not found in thread ${input.threadId}.`,
           );
+        snapshotRun = selected;
         snapshot = {
           threadId: input.threadId,
           runId: selected?.id ?? null,
           status: selected === undefined ? "idle" : runOutcome(selected),
           timedOut: true,
+          ...startState(selected, []),
         };
+        snapshot = { ...snapshot, ...(yield* readStartState(selected)) };
+        if (selected != null && snapshot.startPending === false)
+          acceptedAttemptId = selected.activeAttemptId;
         if (Option.isSome(call)) {
           call.value.waitLookupMs = Number((yield* Clock.monotonicTimeNanos) - waitStartedAt) / 1e6;
           call.value.waitStage = "waiting";
           // Event-driven waiting still uses background history and restart-continuation reads.
           call.value.readerLane = "background";
         }
+        // Leave a bounded slice of the caller's budget for the final native-ACK read.
+        const remaining = yield* remainingWaitMs(waitStartedAt, input.timeoutMs);
         const result = yield* threadManagement
           .waitForThread({
             projectId: records.thread.projectId,
             threadId: input.threadId,
             ...(input.runId === undefined ? {} : { runId: input.runId }),
-            timeoutMs: yield* remainingWaitMs(waitStartedAt, input.timeoutMs),
+            timeoutMs: Math.max(1, remaining - Math.min(250, remaining / 4)),
           })
           .pipe(
             NodeSqliteClient.backgroundReads,
@@ -4018,12 +4062,24 @@ const make = Effect.gen(function* () {
             ),
             Effect.mapError(threadManagementFailure),
           );
-        return {
+        snapshotRun = result.run;
+        snapshot = {
           threadId: input.threadId,
           runId: result.run?.id ?? null,
           status: result.run === null ? "idle" : runOutcome(result.run),
           timedOut: result.timedOut,
+          ...startState(result.run, []),
+          ...(result.run != null && result.run.activeAttemptId === acceptedAttemptId
+            ? { startPending: false, startProgress: null }
+            : {}),
         } satisfies OrchestratorMcpThreadWaitResult;
+        const finalState = yield* readStartState(result.run);
+        return {
+          ...snapshot,
+          ...(snapshot.startPending === false
+            ? { startPending: false, startProgress: null }
+            : finalState),
+        };
       });
       const result = yield* waiting.pipe(
         McpDeadline.awaitInterruptibly,
@@ -4040,7 +4096,14 @@ const make = Effect.gen(function* () {
       );
       if (Option.isSome(result)) return result.value;
       return (
-        snapshot ??
+        (snapshot === undefined
+          ? undefined
+          : {
+              ...snapshot,
+              ...(snapshot.startPending
+                ? { startProgress: startState(snapshotRun, []).startProgress }
+                : {}),
+            }) ??
         (yield* failure(
           "lookup_timeout",
           `Robob took longer than ${Math.min(MAX_WAIT_TIMEOUT_MS, Math.max(1, input.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS)) / 1000} s to read thread ${input.threadId}. Nothing changed. Retry t3_thread_wait, or check the task with task_status.`,
