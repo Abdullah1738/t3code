@@ -123,6 +123,7 @@ export type CallerRow = Pick<
   | "worktreePath"
 >;
 export type CallerActiveRow = CallerRow & {
+  readonly lineage?: OrchestrationV2AppThread["lineage"];
   readonly activeRunId: RunId | null;
   // Absent when exact liveness needs fork history or exceeds the bounded caller read.
   readonly pendingBackgroundTasks?: OrchestrationV2ThreadShell["pendingBackgroundTasks"];

@@ -1,3 +1,4 @@
+import { KanbanService } from "../ardud/kanban/engine/KanbanService.ts";
 import * as ThreadReadMetrics from "../ardud/analytics/ThreadReadMetrics.ts";
 import * as OwnerAnalytics from "../ardud/analytics/Analytics.ts";
 import * as McpCallLedger from "../ardud/analytics/McpCallLedger.ts";
@@ -913,6 +914,29 @@ const handoffTargetIds = (
   return typeof threadId === "string" ? [threadId] : [];
 };
 
+export const withFailureStructuredContent = (
+  result: McpSchema.CallToolResult | McpSchema.InputRequired,
+) => {
+  if (
+    result instanceof McpSchema.InputRequired ||
+    result.isError !== true ||
+    result.structuredContent !== undefined
+  )
+    return result;
+  const part = result.content.find((part) => part.type === "text");
+  if (part?.type !== "text" || part.text.length > 8192) return result;
+  try {
+    const failure = JSON.parse(part.text) as Schema.Json;
+    if (failure !== null && typeof failure === "object" && !Array.isArray(failure)) {
+      // Effect drops structuredContent on failures, but scripted callers read it.
+      return new McpSchema.CallToolResult({ ...result, structuredContent: failure });
+    }
+  } catch {
+    /* Plain-text failures stay unchanged. */
+  }
+  return result;
+};
+
 /**
  * Runs a tool registration against a server that records one anonymous
  * `mcp.tool.invoked` event per call: the tool, the calling agent's provider,
@@ -926,6 +950,7 @@ const withToolAnalytics =
   Effect.fnUntraced(function* <A, E, R>(registration: Effect.Effect<A, E, R>) {
     const server = yield* McpServer.McpServer;
     const ledger = yield* McpCallLedger.McpCallLedger;
+    const kanbanContext = yield* Effect.serviceOption(KanbanService);
     const startup = yield* Effect.serviceOption(StartupPhaseLog.StartupPhaseLog);
     const callBootId = Option.isSome(startup) ? startup.value.snapshot().bootId : bootId;
     const analytics = yield* Effect.serviceOption(AnalyticsService.AnalyticsService);
@@ -1074,6 +1099,7 @@ const withToolAnalytics =
                       if (invocation?.thread)
                         delivery.value.callerThreadId = invocation.thread.threadId;
                     }
+                    const initialReaderLane = yield* NodeSqliteClient.ReaderLane;
                     const callState: McpCallAnalytics.McpCall["Service"] = {
                       ...(options.tool.name === "t3_thread_read"
                         ? {
@@ -1098,7 +1124,8 @@ const withToolAnalytics =
                         : {}),
                       callerResolved: false,
                       callerResolveMs: 0,
-                      readerLane: yield* NodeSqliteClient.ReaderLane,
+                      callerReaderLane: initialReaderLane,
+                      readerLane: initialReaderLane,
                       phase: "handler",
                       saved: "unknown",
                     };
@@ -1116,6 +1143,43 @@ const withToolAnalytics =
                       payload,
                       invocation?.thread?.threadId ?? invocation?.requestNamespace,
                     );
+                    const isKanbanTool = Object.hasOwn(KanbanToolkit.tools, options.tool.name);
+                    callState.callerRole = "none";
+                    callState.callerKind =
+                      invocation === undefined || invocation.thread ? "unknown" : "cli";
+                    callState.resolveCallerContext = (parentThreadId) => {
+                      if (callState.callerCardNumber !== undefined) return;
+                      const id = parentThreadId ?? invocation?.thread?.threadId;
+                      const context =
+                        id && Option.isSome(kanbanContext)
+                          ? kanbanContext.value.callerAnalytics?.(id)
+                          : undefined;
+                      const delegated =
+                        parentThreadId !== undefined || context?.callerKind === "delegated_child";
+                      callState.callerRole = context?.callerRole ?? "none";
+                      callState.callerKind = delegated
+                        ? "delegated_child"
+                        : (context?.callerKind ?? (context?.boardId ? "board_thread" : "unknown"));
+                      if (context) {
+                        if (
+                          (!isKanbanTool || identifiers.boardId === undefined) &&
+                          context.boardId !== undefined
+                        )
+                          callState.boardId = context.boardId;
+                        if (!isKanbanTool) {
+                          if (context.cardId !== undefined) callState.cardId = context.cardId;
+                          if (context.cardNumber !== undefined)
+                            callState.cardNumber = context.cardNumber;
+                          if (context.cardStage !== undefined)
+                            callState.cardStage = context.cardStage;
+                        }
+                        if (context.cardNumber !== undefined)
+                          callState.callerCardNumber = context.cardNumber;
+                        if (context.cardStage !== undefined)
+                          callState.callerCardStage = context.cardStage;
+                      }
+                    };
+                    if (invocation?.thread) callState.resolveCallerContext();
                     // The request span already covers ledger capture on this hot path.
                     const row = Effect.fnUntraced(function* (
                       outcome: ReturnType<typeof McpCallAnalytics.callOutcome>,
@@ -1147,6 +1211,7 @@ const withToolAnalytics =
                           : callState.requestTiming.preHandlerMs + durationMs;
                       if (totalMs !== undefined)
                         yield* Effect.annotateCurrentSpan({ "mcp.total_ms": totalMs });
+                      const callerReaderLane = callState.callerReaderLane ?? initialReaderLane;
                       return {
                         ts: DateTime.formatIso(DateTime.makeUnsafe(startedAt)),
                         kind: "mcp.call" as const,
@@ -1162,13 +1227,43 @@ const withToolAnalytics =
                         ...(invocation?.thread
                           ? { callerThreadId: invocation.thread.threadId }
                           : {}),
+                        callerRole: callState.callerRole ?? "none",
+                        callerKind: callState.callerKind ?? "unknown",
+                        ...(callState.cardNumber === undefined
+                          ? {}
+                          : { cardNumber: callState.cardNumber }),
+                        ...(callState.callerCardNumber === undefined
+                          ? {}
+                          : { callerCardNumber: callState.callerCardNumber }),
+                        ...(callState.callerCardStage === undefined
+                          ? {}
+                          : { callerCardStage: callState.callerCardStage }),
+                        ...(callState.writePhases === undefined
+                          ? {}
+                          : { writePhases: callState.writePhases }),
+                        ...(callState.cardStage === undefined
+                          ? {}
+                          : { cardStage: callState.cardStage }),
+                        ...(callState.denyReason === undefined
+                          ? {}
+                          : { denyReason: callState.denyReason }),
+                        ...(callState.replyStage === undefined
+                          ? {}
+                          : { replyStage: callState.replyStage }),
+                        ...(callState.replyPhases === undefined
+                          ? {}
+                          : { replyPhases: callState.replyPhases }),
+                        ...(callState.requestTiming === undefined
+                          ? {}
+                          : { requestTiming: callState.requestTiming }),
                         callerResolved: callState.callerResolved,
                         callerResolveMs:
                           callState.callerResolveMs +
                           (callState.callerStarted === undefined
                             ? 0
                             : Math.max(0, Number(ended - callState.callerStarted) / 1e6)),
-                        readerLane: callState.readerLane,
+                        callerReaderLane,
+                        readerLane: callerReaderLane,
                         ...(callState.waitStage === undefined
                           ? {}
                           : { waitStage: callState.waitStage }),
@@ -1252,6 +1347,7 @@ const withToolAnalytics =
                     const result = readiness
                       .pipe(Effect.andThen(largeRead ? advance("handler") : Effect.void))
                       .pipe(Effect.andThen(options.handle(payload)))
+                      .pipe(Effect.map(withFailureStructuredContent))
                       .pipe(Effect.provideService(ReplyRejection, rejection));
                     // Large reads run on their own "mcp" lane (whole call, so at most
                     // PERMITS.mcp large results are built at once). They queue only behind
@@ -1373,7 +1469,7 @@ const withToolAnalytics =
                           ),
                         )
                       : boundedRead;
-                    const protectedCall = SavedBoardReply.TOOLS.has(options.tool.name)
+                    const protectedCall = SavedBoardReply.TIMED_TOOLS.has(options.tool.name)
                       ? SavedBoardReply.protect(measuredRead, options.tool.name)
                       : measuredRead;
                     return yield* protectedCall.pipe(
@@ -1384,6 +1480,7 @@ const withToolAnalytics =
                           callState.boardId = receipt.card.boardId;
                           callState.cardId = receipt.card.id;
                           callState.cardNumber = receipt.card.number;
+                          callState.cardStage = receipt.card.stage;
                         }
                         parentSaved(receipt);
                       }),

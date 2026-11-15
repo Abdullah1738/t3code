@@ -1,3 +1,4 @@
+import type { McpDenyReason } from "@t3tools/contracts";
 /**
  * A card's subtasks: its flow as steps (write the PR, review, merge and
  * deploy, tell the reporter, read back). Pure rules; KanbanService applies them.
@@ -967,7 +968,16 @@ export type SubtaskPlan =
       /** The card's counter after this plan; store it with the card. */
       readonly subtaskSeq: number;
     }
-  | { readonly ok: false; readonly reason: string; readonly code?: "denied" };
+  | {
+      readonly ok: false;
+      readonly reason: string;
+      readonly code?: "denied";
+      readonly denyReason:
+        | "invalid_args"
+        | "subtask_not_found"
+        | "approval_required"
+        | "subtask_owner_mismatch";
+    };
 
 /**
  * Who is marking a subtask. Evaluators can mark any; a worker only its own
@@ -975,7 +985,9 @@ export type SubtaskPlan =
  */
 export type SubtaskRole = "work" | "review" | "evaluator" | "script";
 
-export type MarkCheck = { readonly ok: true } | { readonly ok: false; readonly reason: string };
+export type MarkCheck =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly reason: string; readonly denyReason: McpDenyReason };
 
 const idNumber = (id: string) => Number.parseInt(id.replace(/^s/, ""), 10) || 0;
 
@@ -1056,6 +1068,7 @@ export function planSubtasks(
       return {
         ok: false,
         code: "denied",
+        denyReason: "subtask_owner_mismatch",
         reason: `subtask ${known.id} must be owned by the evaluator or a script to clear a guessed gate`,
       };
     if (
@@ -1066,7 +1079,11 @@ export function planSubtasks(
     ) {
       return known.gateCleared
         ? { ok: true, gateCleared: { ...known.gateCleared, text } }
-        : { ok: false, reason: `subtask ${known.id} has no gate to clear` };
+        : {
+            ok: false,
+            denyReason: "invalid_args",
+            reason: `subtask ${known.id} has no gate to clear`,
+          };
     }
     // Rewording in the same edit cannot turn a deliberate gate into a guessed one.
     if (
@@ -1079,9 +1096,15 @@ export function planSubtasks(
       return {
         ok: false,
         code: "denied",
+        denyReason: "approval_required",
         reason: `subtask ${known.id} has a ${gate} gate set on purpose; only Abdullah's answer clears it (card_ask naming ${known.id})`,
       };
-    if (!actor || !at) return { ok: false, reason: "clearGate needs the clearing actor and time" };
+    if (!actor || !at)
+      return {
+        ok: false,
+        denyReason: "invalid_args",
+        reason: "clearGate needs the clearing actor and time",
+      };
     return { ok: true, gateCleared: { gate, reason, by: actor, at, text } };
   };
   const byId = new Map(existing.map((subtask) => [subtask.id, subtask]));
@@ -1094,20 +1117,35 @@ export function planSubtasks(
     const id = input.id?.trim();
     const reason = input.clearGate?.trim();
     if (reason !== undefined) {
-      if (!id) return { ok: false, reason: "clearGate needs an existing subtask id" };
+      if (!id)
+        return {
+          ok: false,
+          denyReason: "invalid_args",
+          reason: "clearGate needs an existing subtask id",
+        };
       if (input.gate != null)
-        return { ok: false, reason: "clearGate cannot be combined with an explicit gate" };
+        return {
+          ok: false,
+          denyReason: "invalid_args",
+          reason: "clearGate cannot be combined with an explicit gate",
+        };
       if (reason.length < 10 || reason.length > 300)
-        return { ok: false, reason: "clearGate needs a reason of 10–300 characters" };
+        return {
+          ok: false,
+          denyReason: "invalid_args",
+          reason: "clearGate needs a reason of 10–300 characters",
+        };
     }
     const known = id ? byId.get(id) : undefined;
     if (id) {
       if (!known)
         return {
           ok: false,
+          denyReason: "subtask_not_found",
           reason: `the card has no subtask ${id}. Existing subtask ids: ${subtaskIds(existing) || "none"}`,
         };
-      if (listed.has(id)) return { ok: false, reason: `subtask ${id} is listed twice` };
+      if (listed.has(id))
+        return { ok: false, denyReason: "invalid_args", reason: `subtask ${id} is listed twice` };
       listed.add(id);
       if (known.state !== "open" && reason !== undefined) {
         const clear = planClear(
@@ -1146,16 +1184,26 @@ export function planSubtasks(
     const rawText = input.text ?? known?.text;
     const owner = input.owner ?? known?.owner;
     if (rawText === undefined || owner === undefined) {
-      return { ok: false, reason: "a new subtask needs text and owner" };
+      return {
+        ok: false,
+        denyReason: "invalid_args",
+        reason: "a new subtask needs text and owner",
+      };
     }
     const text = rawText.trim();
-    if (text.length === 0) return { ok: false, reason: "a subtask needs text" };
+    if (text.length === 0)
+      return { ok: false, denyReason: "invalid_args", reason: "a subtask needs text" };
     if (text.length > MAX_TEXT) {
-      return { ok: false, reason: `a subtask is at most ${MAX_TEXT} characters` };
+      return {
+        ok: false,
+        denyReason: "invalid_args",
+        reason: `a subtask is at most ${MAX_TEXT} characters`,
+      };
     }
     if (owner === "work" && input.gate != null) {
       return {
         ok: false,
+        denyReason: "invalid_args",
         reason: `subtask "${text}" is the worker's; a deploy, money or secret step must be owned by the evaluator or a script`,
       };
     }
@@ -1165,21 +1213,31 @@ export function planSubtasks(
     if (service !== undefined && !/^[a-z0-9._-]{1,64}$/.test(service)) {
       return {
         ok: false,
+        denyReason: "invalid_args",
         reason: "service must be 1–64 characters using a-z, 0-9, dot, underscore or hyphen",
       };
     }
     if (input.service != null && !interrupting) {
-      return { ok: false, reason: "service requires interrupting: true" };
+      return {
+        ok: false,
+        denyReason: "invalid_args",
+        reason: "service requires interrupting: true",
+      };
     }
     if (interrupting && (owner === "work" || owner === "review")) {
       return {
         ok: false,
+        denyReason: "invalid_args",
         reason: "an interrupting step must be owned by the evaluator or a script",
       };
     }
     const ownerOnly = input.ownerOnly ?? known?.ownerOnly;
     if (ownerOnly && (owner === "work" || owner === "review")) {
-      return { ok: false, reason: "an owner-only step must be owned by the evaluator or a script" };
+      return {
+        ok: false,
+        denyReason: "invalid_args",
+        reason: "an owner-only step must be owned by the evaluator or a script",
+      };
     }
     const { gate, gateSource, previousGate, keepClear } = planGate(
       input,
@@ -1194,11 +1252,16 @@ export function planSubtasks(
     if (script && owner !== "script") {
       return {
         ok: false,
+        denyReason: "invalid_args",
         reason: `subtask "${text}" names a script, so its owner must be "script"`,
       };
     }
     if (input.step !== undefined && (!Number.isInteger(input.step) || input.step < 1)) {
-      return { ok: false, reason: "a subtask's step is a whole number from 1" };
+      return {
+        ok: false,
+        denyReason: "invalid_args",
+        reason: "a subtask's step is a whole number from 1",
+      };
     }
     step = input.step ?? known?.step ?? step + 1;
     if (known) {
@@ -1267,7 +1330,11 @@ export function planSubtasks(
     });
   const subtasks = [...planned, ...kept].toSorted((a, b) => a.step - b.step);
   if (subtasks.length > MAX_SUBTASKS) {
-    return { ok: false, reason: `a card has at most ${MAX_SUBTASKS} subtasks` };
+    return {
+      ok: false,
+      denyReason: "invalid_args",
+      reason: `a card has at most ${MAX_SUBTASKS} subtasks`,
+    };
   }
   return { ok: true, subtasks, subtaskSeq: nextId };
 }
@@ -1285,23 +1352,40 @@ export function checkMark(
   if (!subtask)
     return {
       ok: false,
+      denyReason: "subtask_not_found",
       reason: `card #${card.number} has no subtask ${id}. Existing subtask ids: ${subtaskIds(card.subtasks) || "none"}`,
     };
-  if (subtask.state === state) return { ok: false, reason: `subtask ${id} is already ${state}` };
+  if (subtask.state === state)
+    return {
+      ok: false,
+      denyReason: "subtask_state_unchanged",
+      reason: `subtask ${id} is already ${state}`,
+    };
   if (state === "skipped" && !note?.trim()) {
-    return { ok: false, reason: "say why the subtask is skipped" };
+    return {
+      ok: false,
+      denyReason: "skip_note_required",
+      reason: "say why the subtask is skipped",
+    };
   }
   if (role === "evaluator") return { ok: true };
   if (role === "review") {
     return {
       ok: false,
+      denyReason: "review_verdict_required",
       reason: "a review ticks its subtasks with its verdict (card_review_result)",
     };
   }
-  if (state === "open") return { ok: false, reason: "only an evaluator reopens a subtask" };
+  if (state === "open")
+    return {
+      ok: false,
+      denyReason: "role_not_allowed",
+      reason: "only an evaluator reopens a subtask",
+    };
   if (subtask.owner !== role) {
     return {
       ok: false,
+      denyReason: "subtask_owner_mismatch",
       reason: `subtask ${id} is for the ${OWNER_NAMES[subtask.owner]}, not you`,
     };
   }
@@ -1310,11 +1394,16 @@ export function checkMark(
     subtask.script !== undefined &&
     subtask.script.toLowerCase() !== (scriptName ?? "").toLowerCase()
   ) {
-    return { ok: false, reason: `subtask ${id} is for the script "${subtask.script}"` };
+    return {
+      ok: false,
+      denyReason: "subtask_script_mismatch",
+      reason: `subtask ${id} is for the script "${subtask.script}"`,
+    };
   }
   if (subtask.step !== kanbanOpenStep(card)) {
     return {
       ok: false,
+      denyReason: "subtask_not_in_current_step",
       reason: `subtask ${id} is in step ${subtask.step}; finish step ${kanbanOpenStep(card)} first`,
     };
   }
@@ -1332,19 +1421,39 @@ export function checkHandBack(
   if (!subtask)
     return {
       ok: false,
+      denyReason: "subtask_not_found",
       reason: `card #${card.number} has no subtask ${id}. Existing subtask ids: ${subtaskIds(card.subtasks) || "none"}`,
     };
-  if (!note.trim()) return { ok: false, reason: "say what failed or didn't match" };
-  if (subtask.owner !== "script") return { ok: false, reason: `subtask ${id} isn't a script's` };
+  if (!note.trim())
+    return {
+      ok: false,
+      denyReason: "handoff_note_required",
+      reason: "say what failed or didn't match",
+    };
+  if (subtask.owner !== "script")
+    return {
+      ok: false,
+      denyReason: "subtask_owner_mismatch",
+      reason: `subtask ${id} isn't a script's`,
+    };
   if (subtask.state !== "open") {
-    return { ok: false, reason: `subtask ${id} is already ${subtask.state}` };
+    return {
+      ok: false,
+      denyReason: "subtask_not_open",
+      reason: `subtask ${id} is already ${subtask.state}`,
+    };
   }
   if (subtask.script !== undefined && subtask.script.toLowerCase() !== scriptName.toLowerCase()) {
-    return { ok: false, reason: `subtask ${id} is for the script "${subtask.script}"` };
+    return {
+      ok: false,
+      denyReason: "subtask_script_mismatch",
+      reason: `subtask ${id} is for the script "${subtask.script}"`,
+    };
   }
   if (subtask.step !== kanbanOpenStep(card)) {
     return {
       ok: false,
+      denyReason: "subtask_not_in_current_step",
       reason: `subtask ${id} is in step ${subtask.step}; finish step ${kanbanOpenStep(card)} first`,
     };
   }

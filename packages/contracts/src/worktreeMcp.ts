@@ -1,3 +1,4 @@
+import { McpDenyReason } from "./ardud/mcpDenyReason.ts";
 import * as Schema from "effect/Schema";
 
 import { TrimmedNonEmptyString } from "./baseSchemas.ts";
@@ -113,5 +114,6 @@ export class WorktreeMcpFailure extends Schema.TaggedError<WorktreeMcpFailure>()
       "thread_credential_required",
     ]),
     message: Schema.String,
+    reason: Schema.optionalKey(McpDenyReason),
   },
 ) {}

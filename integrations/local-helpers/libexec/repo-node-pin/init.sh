@@ -1,4 +1,6 @@
 # Sourced by zsh and bash. Never replaces the safe-chain pnpm function.
+# Agent shells are noninteractive and do not read the vendor's .zshrc/.bashrc hooks.
+[ ! -r "$HOME/.safe-chain/scripts/init-posix.sh" ] || . "$HOME/.safe-chain/scripts/init-posix.sh"
 _repo_node_refresh() {
     [ "${_repo_node_busy:-}" = 1 ] && return 0
     [ "${_repo_node_seen_pwd:-}" = "$PWD" ] && [ "${_repo_node_seen_path:-}" = "$PATH" ] && return 0

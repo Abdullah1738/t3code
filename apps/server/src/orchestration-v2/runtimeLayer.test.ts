@@ -6448,22 +6448,28 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       assert.equal(wake.status, "queued");
       assert.notEqual(wake.queueHeld, true);
       const textContinuation = queued.runs[4]!;
-      assert.isTrue(textContinuation.queueHeld);
-      const now = yield* DateTime.now;
-      yield* events.write({
-        events: [
-          {
-            id: EventId.make(`${threadId}:active-done`),
-            type: "run.updated",
-            threadId,
-            runId: active.id,
-            occurredAt: now,
-            payload: { ...active, status: "completed", completedAt: now },
-          },
-        ],
-      });
-      yield* orchestrator.resumeQueuedRuns;
-      const after = yield* orchestrator.getThreadProjection(threadId);
+      assert.notEqual(textContinuation.queueHeld, true);
+      const complete = (runId: RunId) =>
+        Effect.gen(function* () {
+          const current = yield* orchestrator.getThreadProjection(threadId);
+          const run = current.runs.find((candidate) => candidate.id === runId)!;
+          const now = yield* DateTime.now;
+          yield* events.write({
+            events: [
+              {
+                id: EventId.make(`${threadId}:done:${runId}`),
+                type: "run.updated",
+                threadId,
+                runId,
+                occurredAt: now,
+                payload: { ...run, status: "completed", completedAt: now },
+              },
+            ],
+          });
+          yield* orchestrator.resumeQueuedRuns;
+          return yield* orchestrator.getThreadProjection(threadId);
+        });
+      const after = yield* complete(active.id);
       assert.equal(after.runs.find((run) => run.id === wake.id)?.status, "starting");
       assert.deepEqual(
         after.runs.find((run) => run.id === held.id),
@@ -6472,6 +6478,24 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       assert.deepEqual(
         after.runs.find((run) => run.id === textContinuation.id),
         textContinuation,
+      );
+      const afterWake = yield* complete(wake.id);
+      assert.equal(
+        afterWake.runs.find((run) => run.id === textContinuation.id)?.status,
+        "starting",
+      );
+      assert.deepEqual(
+        afterWake.runs.find((run) => run.id === held.id),
+        held,
+      );
+      const afterContinuation = yield* complete(textContinuation.id);
+      assert.deepEqual(
+        afterContinuation.runs.filter((run) => run.status === "queued").map((run) => run.id),
+        [held.id],
+      );
+      assert.deepEqual(
+        afterContinuation.runs.find((run) => run.id === held.id),
+        held,
       );
     }),
   );
@@ -6535,28 +6559,52 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       assert.equal(note.status, "queued");
       assert.equal(note.contextReset, true);
       assert.notEqual(note.queueHeld, true);
-      assert.isTrue(ordinary.queueHeld);
-      const now = yield* DateTime.now;
-      yield* events.write({
-        events: [
-          {
-            id: EventId.make(`${threadId}:active-done`),
-            type: "run.updated",
-            threadId,
-            runId: active.id,
-            occurredAt: now,
-            payload: { ...active, status: "completed", completedAt: now },
-          },
-        ],
-      });
-      yield* orchestrator.resumeQueuedRuns;
-      const after = yield* orchestrator.getThreadProjection(threadId);
+      assert.notEqual(ordinary.queueHeld, true);
+      const complete = (runId: RunId) =>
+        Effect.gen(function* () {
+          const current = yield* orchestrator.getThreadProjection(threadId);
+          const run = current.runs.find((candidate) => candidate.id === runId)!;
+          const now = yield* DateTime.now;
+          yield* events.write({
+            events: [
+              {
+                id: EventId.make(`${threadId}:done:${runId}`),
+                type: "run.updated",
+                threadId,
+                runId,
+                occurredAt: now,
+                payload: { ...run, status: "completed", completedAt: now },
+              },
+            ],
+          });
+          yield* orchestrator.resumeQueuedRuns;
+          return yield* orchestrator.getThreadProjection(threadId);
+        });
+      const after = yield* complete(active.id);
       assert.include(
         ["starting", "running", "completed"],
         after.runs.find((run) => run.id === note.id)?.status,
       );
-      assert.equal(after.runs.find((run) => run.id === held.id)?.status, "queued");
+      assert.deepEqual(
+        after.runs.find((run) => run.id === held.id),
+        held,
+      );
       assert.equal(after.runs.find((run) => run.id === ordinary.id)?.status, "queued");
+      const afterNote = yield* complete(note.id);
+      assert.equal(afterNote.runs.find((run) => run.id === ordinary.id)?.status, "starting");
+      assert.deepEqual(
+        afterNote.runs.find((run) => run.id === held.id),
+        held,
+      );
+      const afterOrdinary = yield* complete(ordinary.id);
+      assert.deepEqual(
+        afterOrdinary.runs.filter((run) => run.status === "queued").map((run) => run.id),
+        [held.id],
+      );
+      assert.deepEqual(
+        afterOrdinary.runs.find((run) => run.id === held.id),
+        held,
+      );
     }),
   );
 

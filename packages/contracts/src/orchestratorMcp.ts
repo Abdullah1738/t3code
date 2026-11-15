@@ -1,3 +1,4 @@
+import { McpDenyReason } from "./ardud/mcpDenyReason.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as Struct from "effect/Struct";
@@ -121,7 +122,7 @@ export const OrchestratorMcpTarget = Schema.Struct({
   options: Schema.optional(
     OrchestratorMcpTargetOptions.annotate({
       description:
-        "Model options from orchestrator_capabilities. For the same provider instance and model, overrides individual inherited values; [] or {} clears them. Standard mode only: Claude {effort: 'max'}; Codex {reasoningEffort: 'max', serviceTier: 'default'}; never fast mode. Only use options advertised by the selected model.",
+        "Model options from orchestrator_capabilities. For the same provider instance and model, overrides individual inherited values; [] or {} clears them. Standard mode only: never fast mode (Claude fastMode false; Codex serviceTier 'default'). Set effort to exactly what the routing asks for, e.g. Claude {effort: 'medium'}; there is no default effort. Only use options advertised by the selected model.",
     }),
   ),
 });
@@ -810,5 +811,6 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
       "target_required",
     ]),
     message: Schema.String,
+    reason: Schema.optional(McpDenyReason),
   },
 ) {}

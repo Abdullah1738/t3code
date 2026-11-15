@@ -1918,6 +1918,31 @@ export const layerWithOptions = (
               }
               if (hasBusyTurn(entry, pending.providerThread.id, input.nativeThreadKey))
                 return "deferred" as const;
+              // Native busy begins after preparation. Protect unfinished runs on the current
+              // native ID, while still retiring superseded IDs owned by the same provider row.
+              const loadedKey = entry.providerThreadLoadsByThread.get(
+                input.threadId,
+              )?.nativeThreadKey;
+              if (
+                input.orphan === undefined &&
+                (loadedKey === undefined || loadedKey === input.nativeThreadKey)
+              ) {
+                const records = yield* projectionStore
+                  .getThreadRecords(input.threadId, ["runs"], { unfinishedRunsOnly: true })
+                  .pipe(Effect.exit);
+                if (Exit.isFailure(records)) return "deferred" as const;
+                if (
+                  records.value.runs.some(
+                    (run) =>
+                      ["preparing", "queued", "starting", "running", "waiting"].includes(
+                        run.status,
+                      ) &&
+                      (run.providerThreadId === null ||
+                        run.providerThreadId === pending.providerThread.id),
+                  )
+                )
+                  return "deferred" as const;
+              }
               // Unloading stops the native thread's background terminals, so a
               // thread still running background work stays loaded.
               const holdsWork =
