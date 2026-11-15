@@ -2376,9 +2376,11 @@ describe("OrchestratorMcpService provider resolution", () => {
           ],
         } as unknown as OrchestrationV2ThreadProjection;
         const lanes: string[] = [];
-        const pointRead = <A>(value: A, readOnly = true) =>
+        const pointRead = <A>(value: A, readOnly = true, expectedLane = "foreground") =>
           Effect.gen(function* () {
-            lanes.push(yield* NodeSqliteClient.ReaderLane);
+            const lane = yield* NodeSqliteClient.ReaderLane;
+            lanes.push(lane);
+            assert.equal(lane, expectedLane);
             yield* sql
               .withTransaction(sql`SELECT * FROM entries`)
               .pipe(readOnly ? NodeSqliteClient.readOnly : (effect) => effect, Effect.orDie);
@@ -2388,7 +2390,8 @@ describe("OrchestratorMcpService provider resolution", () => {
         const dependencies = Layer.mergeAll(
           NodeServices.layer,
           Layer.mock(ThreadManagementService.ThreadManagementService)({
-            getCallerRow: (id) => pointRead({ ...liveThreadShell(id), ...parent.thread }),
+            getCallerRow: (id) =>
+              pointRead({ ...liveThreadShell(id), ...parent.thread }, true, "identity"),
             getThreadRecords: (id, _fields, _filter, options) => {
               assert.isTrue(options?.projectionOnly, "task reads must skip transcript hydration");
               return pointRead(id === parentThreadId ? parent : child);
@@ -2438,7 +2441,7 @@ describe("OrchestratorMcpService provider resolution", () => {
           assert.equal(retry.summary, "Review complete.");
           assert.deepEqual(commands, [commands[0], commands[0]]);
           assert.isTrue(lanes.length > 6);
-          assert.isTrue(lanes.every((lane) => lane === "foreground"));
+          assert.deepEqual([...new Set(lanes)].sort(), ["foreground", "identity"]);
           assert.isBelow(Number((yield* Clock.monotonicTimeNanos) - started) / 1_000_000, 10_000);
           assert.isUndefined(holder.pollUnsafe(), "the background slot stays held throughout");
           assert.isUndefined(writer.pollUnsafe(), "receipt probes must not require the writer");
@@ -2453,6 +2456,7 @@ describe("OrchestratorMcpService provider resolution", () => {
           NodeSqliteClient.layer({
             filename: path.join(directory, "state.sqlite"),
             readerWorker: true,
+            identityReaderProcess: true,
             foregroundReaderSlots: 1,
             backgroundReaderSlots: 1,
           }),
