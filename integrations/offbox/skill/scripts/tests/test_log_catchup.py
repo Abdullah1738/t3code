@@ -471,7 +471,7 @@ class LogCatchupTests(Isolated):
                 self.assertIn('is still running', err)
                 self.assertIn('7 bytes, last written ', err)
                 self.assertIn('includes the output fetched so far', err)
-                self.assertIn('`offbox wait run-x` as a background command', err)
+                self.assertIn('`offbox wait run-x` using the remote-compute skill', err)
                 self.assertEqual(self.path.stat().st_mtime_ns, before.st_mtime_ns)
                 self.assertEqual(common.offsets_path(self.path).read_bytes(), ck)
         self.history.assert_not_called()

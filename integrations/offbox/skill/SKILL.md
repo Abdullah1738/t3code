@@ -78,19 +78,15 @@ The monitor ignores apps opened by LaunchServices (XPC_SERVICE_NAME=application.
 
 ## Waiting for a run
 
-Every model request resends your whole context. Start long or queued runs with `offbox run --bg -- <cmd>`, note the run id, start one background waiter as below, and **end your turn**. The waiter covers pool queueing, first sync, execution and `--pull` artifacts. Its completion wakes you; `offbox wait` prints the run id, backend, exit code, log path and a short log tail. Keep foreground `offbox run -- <cmd>` for short runs.
+Every model request resends your whole context. Start long or queued runs with `offbox run --bg -- <cmd>`, note the run id, hand the wait off using your harness’s route below, and **end your turn**. The waiter covers pool queueing, first sync, execution and `--pull` artifacts. Its completion wakes you; `offbox wait` prints the run id, backend, exit code, log path and a short log tail. Keep foreground `offbox run -- <cmd>` for short runs.
 
-- **Codex:** start `offbox wait <run-id>` without `--timeout`, using `exec_command` through `exec` with `yield_time_ms: 1000`. When it returns a running session id, end your turn. Robob wakes you with `Background command completed (exit N)` and the output tail. This route has been proven through pool queueing and turn endings. Do not repeatedly call `write_stdin` or `wait` to check it.
+- **Codex:** delegate the watcher brief below with `delegate_task`, async, target `providerInstanceId: "claudeAgent"`, `model: "claude-sonnet-5-5"`, `options: {effort: "medium"}`, then end your turn. The child waits with blocking `offbox wait <run-id> --timeout 570` calls and a 600000 ms shell timeout; it replies once after the run ends. Medium is the approved watcher effort; standard mode rules out fast mode. Use these current ids directly; check the catalog only if rejected. While it runs, do not check `task_status` or the run's logs. Until #1626 is fixed, a Claude child's parent notification can carry its first-turn launch text: on a completion notification, read `task_status` once and use `latestTerminalSummary` for the result. Launch text is not a run result. If it still has pending work, end your turn and await completion; do not loop status calls.
 - **Claude Code:** use Bash `run_in_background: true` for `offbox wait <run-id> --timeout 1500`, with the run id in `description`. End your turn. The `<task-notification>` has the description, exit code and `output-file`, but no output tail: Read that file once. Exit 124 means only that the wait expired; start another 1500-second background waiter and end your turn again. If a T3 call from the wake turn returns `parent_not_active`, retry that call once.
 - **OpenCode:** native shell background launch was observed, but its completion wake has not been captured. Until verified, use `offbox wait <run-id> --timeout 540` in a shell call with a timeout of at least 550 seconds. On exit 124, the run continues: use another long bounded wait when you need its result. Do not shorten this to a 45-second loop.
 
-Codex's `exec_command` yields within 30 seconds and an empty `write_stdin` poll waits at most 300 seconds; neither can block for 25 minutes. Use the completion wake instead of polling. Do not loop waits, `offbox logs`, sleeps or tails of `logs/<id>.client.log`, including while queued. `offbox logs <id>` once is fine to inspect progress when asked; never check queue position. A queued run starts by itself.
+Codex's `exec_command` yields within 30 seconds and an empty `write_stdin` poll waits at most 300 seconds; neither can block for 25 minutes. Hand the wait to the watcher instead of polling. In the worker thread, do not loop waits, `offbox logs`, sleeps or tails of `logs/<id>.client.log`, including while queued. `offbox logs <id>` once is fine to inspect progress when asked; never check queue position. A queued run starts by itself.
 
 A board nudge while a background waiter or child is pending needs one line saying it holds the wait, then end your turn again. Do not re-check the run or write progress updates that only say you are still waiting.
-
-### Fallback when native background completion is unavailable
-
-For Codex, delegate the watcher below with `delegate_task`, async, target `providerInstanceId: "claudeAgent"`, `model: "claude-sonnet-5-5"`, `options: {effort: "medium"}`, then end your turn. Use this fallback only when the native completion wake is unavailable. Until #1626 is fixed, a Claude child's parent notification can carry its first-turn launch text: on a completion notification, read `task_status` once and use `latestTerminalSummary` for the result. Launch text is not a run result. If it still has pending work, end your turn and await completion; do not loop `task_status`.
 
 Watcher brief (fill in the brackets):
 
@@ -148,7 +144,7 @@ are placeholders unless they name a particular repo; apply this check first.
 
 ## Your box (lease)
 
-A new worktree’s first run on a box can take minutes; it is seeded from a sibling when available. For long first syncs, use `offbox run --bg` and the background waiter in **Waiting for a run**; end your turn while it syncs and runs.
+A new worktree’s first run on a box can take minutes; it is seeded from a sibling when available. For long first syncs, use `offbox run --bg` and the harness route in **Waiting for a run**; end your turn while it syncs and runs.
 
 - Up to **four pooled boxes per repository key** (default raised from 2 on 2026-10-17 for the PR factory ramp), shared by threads and worktrees. An idle running box is preferred,
   then an existing stopped box; legacy boxes are adopted without deleting their disks. Each box runs one command
@@ -228,7 +224,7 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
 | `--git` | export a portable `.git` with the selected checkout's exact HEAD and ancestor history |
 | `--include PATH` | sync a path the filters skip (e.g. a committed `testdata/server.key`). Under a gitignored dir such as `tmp/`, only that path mirrors; the box's other files in that dir are kept |
 | `--no-sync` | run without syncing (box already has what you need) |
-| `--bg` | queue in a detached client and return a run id at once, even while the pool is full; then start one background waiter and end your turn (see **Waiting for a run**). It collects `--pull` artifacts, prints a final summary and log tail, and exits with the run’s code. Client diagnostics: `logs/<id>.client.log` in the offbox state directory. |
+| `--bg` | queue in a detached client and return a run id at once, even while the pool is full; then hand the wait off using your harness’s route and end your turn (see **Waiting for a run**). It collects `--pull` artifacts, prints a final summary and log tail, and exits with the run’s code. Client diagnostics: `logs/<id>.client.log` in the offbox state directory. |
 | `--base N` / `--fresh` | new lease from saved base N / ignoring bases and templates. `--fresh` doesn't always mean a new box: in the repository pool it can still reuse a pool box that was itself created fresh. In a full pool with no box of that kind, it stops at once (exit 2) instead of queueing. It isn't a way off a bad box: offbox now stops broken boxes itself, and `offbox release <id>` stops one by hand. |
 | `--no-fallback` | return 90/91 instead of falling back to a local run |
 | `--remote` | same as `--no-fallback` (kept for old commands; every run uses a box now) |
@@ -236,14 +232,14 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
 | `--no-retry` | home server only: if the server restarts under this run, don't run it again (exit 94). For commands that are not safe to run twice (a deploy, a migration, anything that sends) |
 
 Runs longer than 10 minutes are fine (every run is a boat background command, reattached on network blips).
-For long gates, use `offbox run --bg …` and the background waiter in **Waiting for a run**; end your turn instead of polling. Do not rely on setsid or detached tmux to protect a foreground client from interruption.
+For long gates, use `offbox run --bg …` and the harness route in **Waiting for a run**; end your turn instead of polling. Do not rely on setsid or detached tmux to protect a foreground client from interruption.
 If Robob restarts on the Mac during a foreground run (home box or Boat), the run detaches and keeps going; re-attach using **Waiting for a run** (client exit 95). The home server itself restarting is a separate case (exit 94, below).
 Ctrl-C, Stop and SIGTERM-based timeouts still kill the run; a native SIGKILL cannot be caught by offbox.
 The reaper refreshes the box's deadline while the remote run is confirmed live, even if its starting client is gone, for up to 6 hours from run start.
 `offbox wait` / `logs --follow` on a run whose own `offbox run` is still following it waits for that run to record
 its end and returns its code. If the box says the process ended but that `offbox run` still hasn't recorded it a
 minute later (30 min with `--pull`), wait returns the box's exit code and says the other client looks stuck.
-`offbox wait --timeout S` stops waiting after S seconds with exit 124; the run keeps going. Native Codex background waiters omit this flag; other harnesses use the limits in **Waiting for a run**.
+`offbox wait --timeout S` stops waiting after S seconds with exit 124; the run keeps going. Use the harness-specific wait limits in **Waiting for a run**.
 On a run still queued for a pool box the waiter says "waiting for a box" and stays attached until it gets one or settles; no further agent calls are needed.
 A queued `--bg` run survives its caller ending. If the offbox client itself dies before getting a box, wait marks the run lost and wait/logs return 100 ("never started; nothing ran, safe to rerun").
 
@@ -463,7 +459,7 @@ Detailed metadata logs are at `~/.robob/logs/tools/offbox/YYYY-MM-DD.ndjson` (UT
 
 - A box held by an unconfirmed checkout cleanup is rechecked by reap, release and the pool queue; it frees itself once the cleanup is confirmed gone.
 
-- A just-resumed box can have a cold disk: its first sync, installs and Docker databases can be slow for 5-25 min. Offbox moves a first sync once to a free warm box when available; otherwise use `offbox run --bg` and the background waiter in **Waiting for a run**, then end your turn.
+- A just-resumed box can have a cold disk: its first sync, installs and Docker databases can be slow for 5-25 min. Offbox moves a first sync once to a free warm box when available; otherwise use `offbox run --bg` and the harness route in **Waiting for a run**, then end your turn.
 
 - Python/boto3 suites that take hours with idle pytest workers on a box: AWS instance-metadata lookups. Offbox now sets `AWS_EC2_METADATA_DISABLED=true` on every box run; older notes that say to pass `--env AWS_EC2_METADATA_DISABLED` by hand are no longer needed.
 - Go `unsafeTraceExpWriter redeclared`: stale overlay sources; the run preamble removes `runtime/traceexp.go` for Go 1.25+ and replaces mixed Go 1.26+ trees from the exact official release; template installs replace GOROOT, never overlay it.

@@ -999,8 +999,9 @@ def logs(run_id: str, do_follow: bool) -> int:
             st = p.stat() if p.exists() else None
             written = time.strftime('%H:%M:%S', time.localtime(st.st_mtime)) if st else 'never'
             say(f"{r['run_id']} is still running; this local copy ({st.st_size if st else 0} bytes, last written "
-                f"{written}) includes the output fetched so far. For completion, start one "
-                f"`offbox wait {r['run_id']}` as a background command and end your turn; do not poll logs.")
+                f"{written}) includes the output fetched so far. For completion, hand off "
+                f"`offbox wait {r['run_id']}` using the remote-compute skill’s Waiting for a run route; "
+                "end your turn and do not poll logs.")
         return 0
     result = _catch_up_log(r, lock_wait=LOG_READ_WAIT_S)
     from . import resources

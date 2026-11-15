@@ -3031,7 +3031,8 @@ def _background(a, me: dict) -> int:
 
 
 def background_wait_hint(run_id: str) -> None:
-    say(f"Run `offbox wait {run_id}` as a background command and end your turn; its completion wakes you.")
+    say(f"Hand off `offbox wait {run_id}` using the remote-compute skill’s Waiting for a run route, "
+        "then end your turn; completion wakes you.")
 
 
 def background_queue(run_id: str, payload: dict) -> int:
