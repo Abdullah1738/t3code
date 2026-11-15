@@ -18,7 +18,7 @@ const PAYTO = '0x2670B922ef37C7Df47158725C0CC407b5382293F';
 
 function cfgFor(extra = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'vx402-'));
-  return { ...loadConfig({ HOME: dir, VENICE_X402_DATA_DIR: dir, VENICE_X402_API_BASE: 'https://api.venice.ai/api/v1' }), ...extra };
+  return { ...loadConfig({ HOME: dir, VENICE_X402_DATA_DIR: dir, VENICE_X402_API_BASE: 'https://api.venice.ai/api/v1', VENICE_X402_EGRESS_WAIT_S: '0', VENICE_X402_RETRY_DELAY_S: '0' }), ...extra };
 }
 
 test('siwx header is a signed EIP-4361 message Venice can rebuild', async () => {
@@ -142,7 +142,7 @@ async function startProxy(cfg, mock, opts = {}) {
   const ledger = new Ledger(cfg);
   const venice = new Venice({ cfg, account, ledger, fetchImpl: mock.fetchImpl });
   const token = 't'.repeat(40);
-  const { server } = createProxy({ cfg, venice, ledger, clientToken: token, egressCheck: opts.egressCheck });
+  const { server } = createProxy({ cfg, venice, ledger, clientToken: token, egressCheck: opts.egressCheck, log: opts.log });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const base = `http://127.0.0.1:${server.address().port}/v1`;
   const call = (path, body, auth = token) =>
@@ -205,4 +205,106 @@ test('egress check runs the command async and caches only success', async () => 
   assert.equal(await ok(), true);
   assert.equal(await ok(), true);
   assert.equal(await defaultEgressCheck({ egressCheck: '', egressCheckTtlMs: 1 })(), true);
+});
+
+// Wraps the mock so the first chat calls fail the way the tunnel fails.
+function flaky(mock, failures) {
+  const inner = mock.fetchImpl;
+  let n = 0;
+  mock.fetchImpl = async (url, init) => {
+    if (String(url).endsWith('/chat/completions') && n < failures.length) {
+      const f = failures[n++];
+      if (f === 'throw') throw Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }) });
+      return new Response('{"error":"bad gateway"}', { status: f });
+    }
+    return inner(url, init);
+  };
+  return mock;
+}
+
+test('connection failures and gateway errors are retried, re-checking egress', async () => {
+  const events = [];
+  let checks = 0;
+  const egressCheck = Object.assign(async () => (checks++, true), { reset: () => events.push({ event: 'reset' }) });
+  const mock = flaky(mockVenice({ credit: 5 }), ['throw', 503, 'throw']);
+  const p = await startProxy(cfgFor(), mock, { egressCheck, log: (o) => events.push(o) });
+  try {
+    const r = await p.call('/chat/completions', { model: MODEL, stream: true, messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(r.status, 200);
+    assert.match(await r.text(), /\[DONE\]/);
+    const retries = events.filter((e) => e.event === 'upstream_retry');
+    assert.deepEqual(retries.map((e) => e.attempt), [1, 2, 3]);
+    assert.match(retries[0].why, /fetch failed \(ECONNRESET\)/);
+    assert.equal(retries[1].why, 'status 503');
+    assert.equal(events.filter((e) => e.event === 'reset').length, 3);
+    assert.ok(checks >= 4);
+    assert.equal(p.ledger.snapshot().requests, 1);
+  } finally {
+    p.server.close();
+  }
+});
+
+test('retries stop after upstreamAttempts and the client gets the cause', async () => {
+  const events = [];
+  const mock = flaky(mockVenice({ credit: 5 }), ['throw', 'throw', 'throw']);
+  const p = await startProxy(cfgFor({ upstreamAttempts: 2 }), mock, { egressCheck: async () => true, log: (o) => events.push(o) });
+  try {
+    const r = await p.call('/chat/completions', { model: MODEL, messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(r.status, 502);
+    assert.match((await r.json()).error.message, /ECONNRESET/);
+    assert.equal(events.filter((e) => e.event === 'upstream_retry').length, 1);
+    // gateway errors that outlast the retries are passed through as-is
+    const m2 = flaky(mockVenice({ credit: 5 }), [504, 504]);
+    const p2 = await startProxy(cfgFor({ upstreamAttempts: 2 }), m2, { egressCheck: async () => true });
+    try {
+      assert.equal((await p2.call('/chat/completions', { model: MODEL, messages: [{ role: 'user', content: 'hi' }] })).status, 504);
+    } finally {
+      p2.server.close();
+    }
+  } finally {
+    p.server.close();
+  }
+});
+
+test('requests wait for egress to recover instead of failing at once', async () => {
+  let n = 0;
+  const events = [];
+  const mock = mockVenice({ credit: 5 });
+  const p = await startProxy(cfgFor({ egressWaitMs: 2000, egressPollMs: 10 }), mock, { egressCheck: async () => ++n > 3, log: (o) => events.push(o) });
+  try {
+    const r = await p.call('/chat/completions', { model: MODEL, messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(r.status, 200);
+    assert.ok(events.some((e) => e.event === 'egress_recovered'));
+  } finally {
+    p.server.close();
+  }
+  const mock2 = mockVenice({ credit: 5 });
+  const p2 = await startProxy(cfgFor({ egressWaitMs: 60, egressPollMs: 10 }), mock2, { egressCheck: async () => false });
+  try {
+    const t0 = Date.now();
+    const r = await p2.call('/chat/completions', { model: MODEL, messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(r.status, 503);
+    assert.ok(Date.now() - t0 >= 50);
+    assert.equal(mock2.calls.length, 0);
+  } finally {
+    p2.server.close();
+  }
+});
+
+test('egress check logs the failing reason and reset() drops a cached success', async () => {
+  const { defaultEgressCheck } = await import('../lib/server.mjs');
+  const events = [];
+  const bad = defaultEgressCheck({ egressCheck: 'echo "ok   dns"; echo "FAIL tunnel not healthy"; exit 1', egressCheckTtlMs: 60_000 }, (o) => events.push(o));
+  assert.equal(await bad(), false);
+  assert.deepEqual(events, [{ event: 'egress_failed', reason: 'FAIL tunnel not healthy' }]);
+  const dir = mkdtempSync(join(tmpdir(), 'vx402-egress-'));
+  const flag = join(dir, 'ok');
+  const { writeFileSync, rmSync } = await import('node:fs');
+  writeFileSync(flag, '');
+  const c = defaultEgressCheck({ egressCheck: `test -e ${flag}`, egressCheckTtlMs: 60_000 });
+  assert.equal(await c(), true);
+  rmSync(flag);
+  assert.equal(await c(), true); // cached
+  c.reset();
+  assert.equal(await c(), false);
 });

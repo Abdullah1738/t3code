@@ -1,0 +1,60 @@
+#!/bin/zsh -f
+# Keep the venice-x402 proxy up.
+#
+# Why: on 2026-11-15 the proxy stopped at 14:07Z and its LaunchAgent was no
+# longer loaded at all, so launchd's KeepAlive could not restart it. Four
+# board cards on the venice-x402 model then failed every run with
+# "ConnectionRefused" against 127.0.0.1:43402.
+#
+# This guard (com.ardud.venice-x402-guard, every 60 s):
+#   1. bootstraps the LaunchAgent when the job is not loaded;
+#   2. kickstarts it when the job is loaded but nothing listens on the port;
+#   3. does nothing when the port answers.
+# It never touches the wallet, the ledger or the caps.
+set -u
+label=com.ardud.venice-x402
+plist=/Users/ardud/Library/LaunchAgents/$label.plist
+port=${VENICE_X402_PORT:-43402}
+uid=$(id -u)
+domain=gui/$uid
+log=${VENICE_X402_GUARD_LOG:-/Users/ardud/Library/Logs/venice-x402-guard.log}
+
+say() { print -r -- "$(date -u +%Y-%m-%dT%H:%M:%SZ) venice-guard: $*" >>"$log" }
+
+listening() { /usr/bin/nc -z 127.0.0.1 "$port" >/dev/null 2>&1 }
+
+loaded() { /bin/launchctl print "$domain/$label" >/dev/null 2>&1 }
+
+wait_up() {
+  local i
+  for i in {1..40}; do
+    listening && return 0
+    /bin/sleep 0.5
+  done
+  return 1
+}
+
+if listening; then
+  exit 0
+fi
+
+if ! loaded; then
+  say "job not loaded; bootstrapping $plist"
+  /bin/launchctl bootstrap "$domain" "$plist" 2>>"$log"
+  rc=$?
+  if (( rc != 0 )); then
+    # 37 = "service already loaded"; anything else is a real failure.
+    (( rc == 37 )) || say "bootstrap failed rc=$rc"
+  fi
+else
+  say "job loaded but nothing listens on 127.0.0.1:$port; kickstarting"
+  /bin/launchctl kickstart -k "$domain/$label" 2>>"$log" || say "kickstart failed"
+fi
+
+if wait_up; then
+  say "up on 127.0.0.1:$port"
+  exit 0
+fi
+
+say "still down after restart; see venice-x402.log"
+exit 1
