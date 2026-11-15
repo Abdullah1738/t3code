@@ -114,7 +114,7 @@ export interface BoardTelemetry {
   boardFetchErrors: number;
   threadReads: number;
   threadReadErrors: number;
-  threadReadsByReason: Record<"run" | "state" | "followup", number>;
+  threadReadsByReason: Record<"run" | "state" | "followup" | "created", number>;
   boardBackoffMs: number;
   lastFetchDurationMs: number | null;
   lastFetchReason: "dirty" | "age" | "cold" | null;

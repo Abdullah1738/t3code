@@ -129,7 +129,7 @@ export function createApi({ store, enabled, chatId, timezone, health }: Options)
             }
             if (board.threadReadsByReason && typeof board.threadReadsByReason === "object" && !Array.isArray(board.threadReadsByReason)) {
               counters.threadReadsByReason = Object.fromEntries(Object.entries(board.threadReadsByReason)
-                .filter(([key, value]) => ["run", "state", "followup"].includes(key) && count(value)));
+                .filter(([key, value]) => ["run", "state", "followup", "created"].includes(key) && count(value)));
             }
             if (board.dirtyEventsByType && typeof board.dirtyEventsByType === "object" && !Array.isArray(board.dirtyEventsByType)) {
               const events: Record<string, { hard: number; soft: number; local?: number }> = {};
