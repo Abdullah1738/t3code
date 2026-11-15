@@ -568,6 +568,10 @@ describe("rollup", () => {
       count: 1,
       items: [{ card: 15, ask: "q1", askedAt: "2026-11-12T10:00Z", hours: 14, blocking: true }],
     });
+    expect(run.threads.evaluatorStarts).toEqual({
+      count: 3,
+      cardsWith2OrMore: { items: [{ card: 15, starts: 3 }] },
+    });
     expect(run.threads.evaluatorWakes).toEqual({
       count: 3,
       cardsWith2OrMore: { items: [{ card: 15, wakes: 3 }] },

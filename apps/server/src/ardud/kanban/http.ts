@@ -433,6 +433,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
             { ...snapshot, cards },
             undefined,
             DateTime.formatIso(yield* DateTime.now),
+            yield* service.boards,
           ),
           page: { limit, hasMore, nextAfter: hasMore ? cards.at(-1)!.number : null },
         };

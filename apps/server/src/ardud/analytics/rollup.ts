@@ -221,7 +221,7 @@ export const makeAccumulator = () => ({
         operation: string;
         boardId: string | null;
         kind: "operation" | "child";
-        outcome: NonNullable<AnalyticsEvent["outcome"]>;
+        outcome: NonNullable<AnalyticsRollup["textGeneration"]>[number]["outcome"];
       };
       durations: Durations;
     }
@@ -260,6 +260,18 @@ export const makeAccumulator = () => ({
   usage: makeUsageAccumulator(),
   boards: new Map<string, BoardGroup>(),
   tickPhases: new Map<string, { boardId: string; phase: string; durations: Durations }>(),
+  evaluatorOutcomes: new Map<
+    string,
+    {
+      boardId: string;
+      trigger: string;
+      purposeKind: string;
+      outcome: string;
+      reuseMissReason: string | null;
+      count: number;
+    }
+  >(),
+  evaluatorStartsByTrigger: new Map<string, { boardId: string; trigger: string; count: number }>(),
   mcp: new Map<string, McpGroup>(),
   retries: new Map<string, RetryAttempt[]>(),
   retryAttempts: 0,
@@ -394,6 +406,7 @@ function boardAccumulate(target: ReturnType<typeof makeAccumulator>, event: Anal
     board.stalls.set(key, stall);
   }
   if (event.kind === "kanban.worker_failed") increment(board.failures, p.errorClass ?? "other");
+  if (event.kind === "kanban.assignment_wake_failed") increment(board.failures, "assignment_wake");
   if (event.kind === "kanban.worker_restarted") board.restarts++;
   if (event.kind === "kanban.ask_snapshot" || event.kind === "kanban.ask_pending") {
     let snapshot = board.snapshots.get(event.ts);
@@ -497,7 +510,14 @@ export function accumulate(
       operation: event.props.operation,
       boardId: event.boardId ?? null,
       kind: event.kind === "text-generation.child" ? ("child" as const) : ("operation" as const),
-      outcome: event.outcome ?? "error",
+      outcome:
+        event.outcome === "ok" ||
+        event.outcome === "timeout" ||
+        event.outcome === "refused" ||
+        event.outcome === "interrupted" ||
+        event.outcome === "interrupted_by_shutdown"
+          ? event.outcome
+          : ("error" as const),
     };
     const key = JSON.stringify(labels);
     // Bound all dimensions together. Overflow remains visible in kindCounts and raw day files.
@@ -622,6 +642,49 @@ export function accumulate(
         group.histogram.set(bucket, (group.histogram.get(bucket) ?? 0) + n);
       target.longTasks.set(key, group);
     }
+  }
+
+  if (
+    event.kind === "kanban.evaluator" &&
+    event.boardId &&
+    event.trigger &&
+    event.purposeKind &&
+    event.outcome
+  ) {
+    if (event.outcome === "started") {
+      const identity = JSON.stringify([event.boardId, event.trigger]);
+      const key = boundedKey(target.evaluatorStartsByTrigger, identity);
+      const group = target.evaluatorStartsByTrigger.get(key) ?? {
+        boardId: key === OTHER ? OTHER : event.boardId,
+        trigger: key === OTHER ? OTHER : event.trigger,
+        count: 0,
+      };
+      group.count++;
+      target.evaluatorStartsByTrigger.set(key, group);
+    }
+    const labels = {
+      boardId: event.boardId,
+      trigger: event.trigger,
+      purposeKind: event.purposeKind,
+      outcome: event.outcome,
+      reuseMissReason: event.reuseMissReason ?? null,
+    };
+    const identity = JSON.stringify(labels);
+    const key = boundedKey(target.evaluatorOutcomes, identity);
+    const group =
+      target.evaluatorOutcomes.get(key) ??
+      (key === OTHER
+        ? {
+            boardId: OTHER,
+            trigger: OTHER,
+            purposeKind: OTHER,
+            outcome: OTHER,
+            reuseMissReason: null,
+            count: 0,
+          }
+        : { ...labels, count: 0 });
+    group.count++;
+    target.evaluatorOutcomes.set(key, group);
   }
 
   if (
@@ -820,6 +883,12 @@ export function finishRollup(
     total: target.total,
     invalidLines: target.invalidLines,
     kindCounts: Object.fromEntries(target.kinds),
+    evaluatorOutcomes: [...target.evaluatorOutcomes.values()].sort((a, b) =>
+      JSON.stringify(a).localeCompare(JSON.stringify(b)),
+    ),
+    evaluatorStartsByTrigger: [...target.evaluatorStartsByTrigger.values()].sort((a, b) =>
+      JSON.stringify(a).localeCompare(JSON.stringify(b)),
+    ),
     textGenerationOverflow: target.textGenerationOverflow,
     textGeneration: [...target.textGeneration.values()]
       .map((group) => ({ ...group.labels, ...summarize(group.durations) }))

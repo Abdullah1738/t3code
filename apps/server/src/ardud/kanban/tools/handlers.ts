@@ -521,6 +521,7 @@ const handlers = {
     withCaller((service, caller) =>
       Effect.gen(function* () {
         const board = yield* boardFor(service, caller, input.boardId, true);
+        const releaseBoards = yield* service.boards;
         const limit = Math.min(
           input.limit ?? BoardReplies.BOARD_PAGE_LIMIT,
           BoardReplies.BOARD_PAGE_MAX,
@@ -542,7 +543,7 @@ const handlers = {
             board: {
               id: board.id,
               name: board.name,
-              ...BoardReplies.boardReleaseSummary(board, at),
+              ...BoardReplies.boardReleaseSummary(board, at, releaseBoards),
               window,
               legend: Activity.COMPACT_LEGEND,
               activeCards: rows.length,
@@ -565,6 +566,7 @@ const handlers = {
               { ...snapshot, cards },
               undefined,
               DateTime.formatIso(yield* DateTime.now),
+              releaseBoards,
             ),
             page: { limit, hasMore, nextAfter: hasMore ? cards.at(-1)!.number : null },
           },
@@ -1356,6 +1358,7 @@ const handlers = {
             input.note ?? null,
             caller.actor,
             role,
+            input.releasedAt,
           ),
         };
       }),

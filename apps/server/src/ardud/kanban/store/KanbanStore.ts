@@ -316,6 +316,14 @@ export interface KanbanStoreShape {
     { readonly seq: number; readonly createdAt: string; readonly answered: boolean } | null,
     KanbanStoreError
   >;
+  readonly ownerReply: (
+    id: KanbanDiscussionId,
+    threadId: ThreadId,
+    evaluator: boolean,
+  ) => Effect.Effect<
+    { readonly key: string; readonly createdAt: string; readonly answered: boolean } | null,
+    KanbanStoreError
+  >;
   /** Every message of a discussion, oldest first. */
   readonly allMessages: (
     id: KanbanDiscussionId,
@@ -1480,6 +1488,43 @@ const make = Effect.gen(function* () {
         },
       ),
     );
+  const ownerReply: KanbanStoreShape["ownerReply"] = Effect.fn("KanbanStore.ownerReply")(
+    function* (id, threadId, evaluator) {
+      return yield* runRead(
+        "read owner reply obligation",
+        Effect.map(
+          sql<{ readonly key: string; readonly createdAt: string; readonly answered: number }>`
+            WITH actions AS (
+              SELECT seq, '' AS block, json_extract(json, '$.createdAt') AS at
+              FROM ardud_kanban_messages
+              WHERE discussion_id = ${id} AND json_extract(json, '$.author._tag') = 'owner'
+              UNION ALL
+              SELECT m.seq, json_extract(a.value, '$.blockId'), json_extract(a.value, '$.at')
+              FROM ardud_kanban_messages m, json_each(m.json, '$.answers') a
+              WHERE m.discussion_id = ${id} AND json_extract(a.value, '$.by._tag') = 'owner'
+            )
+            SELECT seq || ':' || block || ':' || at AS key, at AS createdAt, EXISTS (
+              SELECT 1 FROM ardud_kanban_messages reply
+              WHERE reply.discussion_id = ${id}
+                AND (json_extract(reply.json, '$.createdAt') > actions.at OR
+                  (json_extract(reply.json, '$.createdAt') = actions.at AND reply.seq > actions.seq))
+                AND ((${evaluator} AND json_extract(reply.json, '$.author._tag') = 'evaluator')
+                  OR json_extract(reply.json, '$.author.threadId') = ${threadId})
+            ) AS answered
+            FROM actions ORDER BY at DESC, seq DESC, block DESC LIMIT 1
+          `,
+          (rows) =>
+            rows[0]
+              ? {
+                  key: rows[0].key,
+                  createdAt: rows[0].createdAt,
+                  answered: Number(rows[0].answered) === 1,
+                }
+              : null,
+        ),
+      );
+    },
+  );
   const allMessages = (id: KanbanDiscussionId) =>
     runRead(
       "read all messages",
@@ -1787,6 +1832,7 @@ const make = Effect.gen(function* () {
     putDiscussion,
     messages,
     ownerWait,
+    ownerReply,
     allMessages,
     message,
     putMessage,

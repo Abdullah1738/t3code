@@ -15,7 +15,17 @@ export interface ReadonlyReplicaOptions {
   /** While a rebuild is held back, the failure is reported this often (default 1 h). */
   readonly rebuildNoticeMs?: number;
   readonly onRebuildEvent?: (event: ReadonlyRebuildEvent) => void;
+  readonly onDiagnosticEvent?: (event: ReadonlyExportDiagnosticEvent) => void;
 }
+
+export type ReadonlyExportDiagnosticEvent =
+  | {
+      readonly event: "open";
+      readonly sequence: number;
+      readonly identitySequence: number;
+      readonly sourceSequence: number;
+    }
+  | { readonly event: "replay"; readonly replayEvents: number; readonly replayMs: number };
 
 export interface ReadonlyRebuildEvent {
   readonly event: "start" | "progress" | "publish" | "abort";
@@ -27,6 +37,8 @@ export interface ReadonlyRebuildEvent {
   readonly pages: number;
   readonly elapsedMs: number;
   readonly bytes?: number;
+  readonly sequence?: number;
+  readonly identitySequence?: number;
   readonly error?: string;
 }
 
@@ -691,6 +703,8 @@ export function createReadonlyReplica(
     }
     const storedSource = getMeta("source");
     const storedSequence = getMeta("sequence");
+    // A full rebuild replaces these keys inside its private publication transaction.
+    const storedIdentitySequence = getMeta("identity_sequence");
     const changedProjection =
       changedTables.find(({ name }) => projections.includes(name) && !additions.has(name)) ??
       sourceTables.find(({ name }) => projections.includes(name) && changedIndexes.has(name));
@@ -728,6 +742,8 @@ export function createReadonlyReplica(
         elapsedMs: Date.now() - rebuild.started,
         ...(event === "publish"
           ? {
+              sequence: Number(getMeta("sequence") ?? 0),
+              identitySequence: Number(getMeta("identity_sequence") ?? 0),
               bytes:
                 fs.statSync(options.replicaPath).size +
                 (fs.existsSync(options.replicaPath + "-wal")
@@ -1239,6 +1255,28 @@ export function createReadonlyReplica(
       for (const [name, cursor] of identityCursors) meta(`identity_cursor:${name}`, String(cursor));
       meta("identity_sequence", String(identitySequence));
     });
+    options.onDiagnosticEvent?.({
+      event: "open",
+      sequence: Number(storedSequence ?? getMeta("sequence") ?? 0),
+      identitySequence: Number(
+        storedIdentitySequence ?? storedSequence ?? getMeta("identity_sequence") ?? 0,
+      ),
+      sourceSequence: sequence(),
+    });
+    const replayStarted = Date.now();
+    let replayEvents = 0;
+    let replayComplete = false;
+    const noteReplay = (events: number, sourceSequence: number) => {
+      if (replayComplete) return;
+      replayEvents += events;
+      if (identitySequence < sourceSequence) return;
+      replayComplete = true;
+      options.onDiagnosticEvent?.({
+        event: "replay",
+        replayEvents,
+        replayMs: Date.now() - replayStarted,
+      });
+    };
     let identityCheckedAt = Number.NEGATIVE_INFINITY;
     const identityCreatedAt = (row: Record<string, NodeSqlite.SQLOutputValue>) => {
       const timestamp = row.created_at ?? row.started_at ?? row.updated_at;
@@ -1258,7 +1296,13 @@ export function createReadonlyReplica(
           }));
           // Bindings may acquire their native id after insertion. A bounded event
           // scan also catches those updates without scanning updated_at columns.
-          const events = eventPage(source, "orchestration_events", identitySequence, sequence());
+          const sourceSequence = sequence();
+          const events = eventPage(
+            source,
+            "orchestration_events",
+            identitySequence,
+            sourceSequence,
+          );
           const changed =
             pages.some(({ rows }) => rows.length > 0) ||
             events.some(
@@ -1279,10 +1323,14 @@ export function createReadonlyReplica(
             // This cursor is a source scan, independent of the full-cycle
             // sequence. Do not rescan the same non-identity prefix forever.
             identitySequence = Number(events.at(-1)?.sequence ?? identitySequence);
+            noteReplay(events.length, sourceSequence);
             if (events.length === batchSize) identityCheckedAt = Number.NEGATIVE_INFINITY;
             return events.length === batchSize;
           }
-          if (!changed && events.length === 0) return false;
+          if (!changed && events.length === 0) {
+            noteReplay(0, sourceSequence);
+            return false;
+          }
           const nextCursors = new Map(identityCursors);
           let oldestCreated: number | undefined;
           transaction(() => {
@@ -1374,6 +1422,7 @@ export function createReadonlyReplica(
                 throw new Error("Readonly cycle could not resume after identity publication");
             });
           // Drain a backlog in bounded pages at the worker's 10 ms cadence.
+          noteReplay(events.length, sourceSequence);
           if (pages.some(({ rows }) => rows.length === batchSize) || events.length === batchSize)
             identityCheckedAt = Number.NEGATIVE_INFINITY;
           return changed || identityCheckedAt === Number.NEGATIVE_INFINITY;

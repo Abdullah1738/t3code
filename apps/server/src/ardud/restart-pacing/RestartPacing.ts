@@ -87,7 +87,6 @@ export class RestartPacing extends Context.Service<
 >()("t3/ardud/restart-pacing/RestartPacing") {}
 
 const make = Effect.gen(function* () {
-  const scope = yield* Effect.scope;
   const state = yield* RestartPacingState.RestartPacingState;
   const settings = yield* ServerSettings.ServerSettingsService;
   const load = yield* RestartLoad;
@@ -135,6 +134,7 @@ const make = Effect.gen(function* () {
   // A requeued run can outlive its settled start effect. Keep its load budget
   // across pruning until a replacement effect registers it again.
   const requeuedHolds = new Map<string, WaitingHold>();
+  const retiredNotes = new Map<string, RestartSource>();
   const active = new Map<
     string,
     {
@@ -235,14 +235,9 @@ const make = Effect.gen(function* () {
       hold: reservation.hold,
     });
   };
-  const retire = Effect.fn("RestartPacing.retire")(function* (
-    source: RestartSource,
-    retainHold = false,
-  ) {
-    if (!(yield* state.status(source, null))) {
-      // The replacement may still own this note. Retire its queue entry now;
-      // close the protected note outside the admission mutex after it settles.
-      yield* state.status(source, null).pipe(
+  const completeRetiredNotes = Effect.fn("RestartPacing.completeRetiredNotes")(function* () {
+    for (const [noteKey, source] of retiredNotes) {
+      const closed = yield* state.status(source, null).pipe(
         Effect.catchCause((cause) =>
           Effect.logWarning("restart-pacing.retired-note-cleanup-failed", {
             threadId: source.threadId,
@@ -250,10 +245,20 @@ const make = Effect.gen(function* () {
             cause,
           }).pipe(Effect.as(false)),
         ),
-        Effect.delay(PASS_MS),
-        Effect.repeat({ while: (closed) => !closed }),
-        Effect.forkIn(scope),
       );
+      if (closed) retiredNotes.delete(noteKey);
+    }
+  });
+  const retire = Effect.fn("RestartPacing.retire")(function* (
+    source: RestartSource,
+    retainHold = false,
+  ) {
+    if (!(yield* state.status(source, null))) {
+      // A replacement still owns the note. Keep cleanup reachable by the next
+      // admission pass without keeping this retired source in the queue.
+      retiredNotes.set(key(source), source);
+    } else {
+      retiredNotes.delete(key(source));
     }
     const entry = pending.get(key(source));
     if (retainHold && entry !== undefined)
@@ -344,6 +349,7 @@ const make = Effect.gen(function* () {
   });
   const acquire = Effect.fn("RestartPacing.acquire")(
     function* (source: RestartSource, runId?: RunId) {
+      yield* completeRetiredNotes();
       // A queued wake cannot take admission back from the actual provider start.
       if (runId === undefined && active.get(key(source))?.runId !== undefined)
         return yield* new RestartAdmissionSupersededError();
@@ -654,8 +660,10 @@ const make = Effect.gen(function* () {
   const wakeHead = Effect.fn("RestartPacing.wakeHead")(
     function* () {
       changed = yield* Deferred.make<void>();
+      yield* completeRetiredNotes();
       const next = (delay?: number) => ({ delay, signal: changed });
-      if (pass === undefined || pending.size === 0) return next();
+      if (pass === undefined || pending.size === 0)
+        return next(retiredNotes.size > 0 ? PASS_MS : undefined);
       const now = yield* Clock.currentTimeMillis;
       const { config, loaded } = pass;
       const queue = orderedQueue(now, loaded);

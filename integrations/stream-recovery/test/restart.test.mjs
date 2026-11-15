@@ -494,18 +494,18 @@ test('restartScan sends one note per affected thread and one summary, then never
   assert.equal(calls.telegram.length, 1);
 });
 
-test('an unavailable or expired replica never causes recovery or consumes retries', async () => {
+for (const code of ['REPLICA_UNAVAILABLE', 'REPLICA_NOT_READY']) test(`${code} never causes recovery or consumes retries`, async () => {
   const fake = fakeIo({ subs: restartBurst(), threads });
   const state = { handled: {}, servers: [] };
-  const unavailable = () => { throw Object.assign(new Error('replica stale'), { code: 'REPLICA_UNAVAILABLE' }); };
+  const unavailable = () => { throw Object.assign(new Error('replica deferred'), { code }); };
   fake.io.assertReplicaFresh = unavailable;
-  await assert.rejects(restartScan(scanArgs(state), fake.io), /replica stale/);
+  await assert.rejects(restartScan(scanArgs(state), fake.io), e => e.code === code);
   assert.deepEqual(state.handled, {});
   assert.equal(fake.calls.send.length + fake.calls.commands.length, 0);
 
   let checks = 0;
   fake.io.assertReplicaFresh = () => { if (++checks > 1) unavailable(); };
-  await assert.rejects(restartScan(scanArgs(state), fake.io), /replica stale/);
+  await assert.rejects(restartScan(scanArgs(state), fake.io), e => e.code === code);
   assert.equal(fake.calls.send.length + fake.calls.commands.length, 0);
   assert.equal(Object.values(state.handled).some((h) => h.done), false);
 });

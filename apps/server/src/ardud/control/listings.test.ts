@@ -51,6 +51,7 @@ import * as ManagedProjectFolders from "../../project/ManagedProjectFolders.ts";
 import * as ProjectService from "../../project/ProjectService.ts";
 import * as ProviderRegistry from "../../provider/ProviderRegistry.ts";
 import * as ServerRuntimeStartup from "../../serverRuntimeStartup.ts";
+import { makePersistedServerRuntimeState } from "../../serverRuntimeState.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import { CONTROL_ROUTE_PREFIX, controlRouteLayer } from "./http.ts";
 import * as Analytics from "../analytics/Analytics.ts";
@@ -1199,6 +1200,10 @@ describe("control listings", () => {
             Effect.gen(function* () {
               const first = yield* get("/health");
               const second = yield* get("/health");
+              const runtime = yield* makePersistedServerRuntimeState({
+                config: { host: undefined, devUrl: undefined },
+                port: 3773,
+              });
               assert.strictEqual(first.status, 200);
               assert.strictEqual(first.body.status, "healthy");
               assert.strictEqual(first.body.sequence, 42);
@@ -1206,6 +1211,9 @@ describe("control listings", () => {
               assert.strictEqual(second.body.buildCommit, expected);
               assert.match(first.body.serverStartedAt, /^\d{4}-\d{2}-\d{2}T/);
               assert.strictEqual(second.body.serverStartedAt, first.body.serverStartedAt);
+              assert.match(first.body.bootId, /^[0-9a-f-]{36}$/);
+              assert.strictEqual(first.body.bootId, runtime.bootId);
+              assert.strictEqual(second.body.bootId, first.body.bootId);
             }),
           input,
         );

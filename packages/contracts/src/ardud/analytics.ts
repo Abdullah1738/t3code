@@ -67,6 +67,66 @@ const McpOutcome = Schema.Literals([
   "interrupted_by_shutdown",
 ]);
 const McpPhase = Schema.Literals(["caller", "dispatch", "result", "handler"]);
+export const EvaluatorTrigger = Schema.Literals([
+  "owner_answer",
+  "card_ask",
+  "discussion_post",
+  "step_transition",
+  "step_reminder",
+  "stall_run_failure",
+  "system_stall",
+  "review_verdict",
+  "wait_ended",
+  "wait_expired",
+  "wait_failing",
+  "report_bug",
+  "evaluator_start",
+  "tick_check",
+  "tick_stalled",
+  "tick_completed",
+  "tick_deployed",
+  "tick_packets",
+  "nightly",
+  "setup",
+  "discussion_nudge",
+  "thread_send",
+  "legacy_queue",
+]);
+export type EvaluatorTrigger = typeof EvaluatorTrigger.Type;
+export const EvaluatorOutcome = Schema.Literals([
+  "started",
+  "reused",
+  "merged",
+  "queued_spawn_cap",
+]);
+export type EvaluatorOutcome = typeof EvaluatorOutcome.Type;
+export const EvaluatorReuseMissReason = Schema.Literals([
+  "no_card_reuse_scope",
+  "no_candidates",
+  "all_candidates_rejected",
+  "idle_expired",
+  "archived",
+  "failed",
+  "missing",
+  "different_purpose",
+  "forced_new",
+  "not_attempted",
+  "legacy_queue",
+]);
+export type EvaluatorReuseMissReason = typeof EvaluatorReuseMissReason.Type;
+const EventOutcome = Schema.Union([McpOutcome, EvaluatorOutcome]);
+export const EvaluatorPurposeKind = Schema.Literals([
+  "discussion",
+  "nightly",
+  "stalled",
+  "completed",
+  "deployed",
+  "check",
+  "packets",
+  "setup",
+  "request",
+  "unknown",
+]);
 const GeneralEvent = Schema.Struct({
   ts: Timestamp,
   kind: Label.check(Schema.makeFilter((kind) => kind !== "run.usage")),
@@ -111,7 +171,10 @@ const GeneralEvent = Schema.Struct({
   preHandlerMs: Schema.optionalKey(Measurement),
   totalMs: Schema.optionalKey(Measurement),
   clientRequestId: Schema.optionalKey(Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/))),
-  outcome: Schema.optionalKey(McpOutcome),
+  outcome: Schema.optionalKey(EventOutcome),
+  purposeKind: Schema.optionalKey(EvaluatorPurposeKind),
+  trigger: Schema.optionalKey(EvaluatorTrigger),
+  reuseMissReason: Schema.optionalKey(EvaluatorReuseMissReason),
   errorTag: Schema.optionalKey(Label),
   errorPhase: Schema.optionalKey(McpPhase),
   saved: Schema.optionalKey(Schema.Union([Schema.Boolean, Schema.Literal("unknown")])),
@@ -323,7 +386,7 @@ export const AnalyticsReadInput = Schema.Struct({
   cardId: Schema.optionalKey(Id),
   cardNumber: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThan(0))),
   tool: Schema.optionalKey(Label),
-  outcome: Schema.optionalKey(McpOutcome),
+  outcome: Schema.optionalKey(EventOutcome),
   section: Schema.optionalKey(AnalyticsReadSection),
   cursor: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(160))),
   limit: Schema.optionalKey(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 500 }))),
@@ -547,6 +610,27 @@ export const AnalyticsRollup = Schema.Struct({
   askLatency: AskLatencyRollup,
   tickPhases: Schema.optionalKey(
     Schema.Array(Schema.Struct({ boardId: Id, phase: Label, ...LatencyFields })),
+  ),
+  evaluatorOutcomes: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        boardId: Id,
+        trigger: Label,
+        purposeKind: Label,
+        outcome: Label,
+        reuseMissReason: Schema.NullOr(Label),
+        count: Measurement,
+      }),
+    ),
+  ),
+  evaluatorStartsByTrigger: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        boardId: Id,
+        trigger: Label,
+        count: Measurement,
+      }),
+    ),
   ),
   mcpCalls: Schema.Array(
     Schema.Struct({

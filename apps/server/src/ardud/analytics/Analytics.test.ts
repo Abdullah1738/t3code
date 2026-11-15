@@ -1297,3 +1297,49 @@ it.effect("pages filtered samples from the existing view without hot-path reads"
     );
   }).pipe(Effect.provide(NodeServices.layer)),
 );
+
+it.effect("#1490 reads persisted evaluator starts for one board and UTC day in one call", () =>
+  Effect.gen(function* () {
+    const setup = yield* fixture;
+    const analytics = yield* open(setup);
+    for (const [boardId, trigger, outcome] of [
+      ["board-offbox", "report_bug", "started"],
+      ["board-offbox", "discussion_post", "reused"],
+      ["board-other", "report_bug", "started"],
+    ] as const)
+      yield* analytics.record(
+        event({
+          kind: "kanban.evaluator",
+          surface: "server",
+          boardId,
+          trigger,
+          outcome,
+          purposeKind: "request",
+        }),
+      );
+    yield* analytics.flush;
+    const result = yield* (yield* open(setup)).read({
+      day,
+      boardId: "board-offbox",
+      kind: "kanban.evaluator",
+      outcome: "started",
+    });
+    assert.deepEqual(result.rollup.evaluatorStartsByTrigger, [
+      { boardId: "board-offbox", trigger: "report_bug", count: 1 },
+    ]);
+    assert.equal(result.rollup.total, 1);
+    assert.equal(result.samples[0]!.outcome, "started");
+    const section = yield* analytics.read({
+      day,
+      boardId: "board-offbox",
+      kind: "kanban.evaluator",
+      outcome: "started",
+      section: "evaluatorStartsByTrigger",
+    });
+    assert.equal(section.hasMore, false);
+    assert.deepEqual(
+      section.rows?.map((row) => row.value),
+      [{ boardId: "board-offbox", trigger: "report_bug", count: 1 }],
+    );
+  }).pipe(Effect.provide(NodeServices.layer)),
+);

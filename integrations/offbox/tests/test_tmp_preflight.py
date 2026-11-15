@@ -3,7 +3,7 @@ import io
 import json
 import shlex
 import subprocess
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 if __package__:
     from .test_boatd import Base, boatd
@@ -31,15 +31,16 @@ class TempPreflightTests(Base):
                     stdout.write(b'ENOSPC: write failed\n' if next(errors) else b'assertion failed\n')
                     # The failing command's finally block has restored free space.
                     stderr.write(probe('end'))
-                    return subprocess.CompletedProcess([], 2)
+                    return Mock(wait=Mock(return_value=2))
                 with patch.object(boatd, 'load_cfg'), patch.object(boatd, 'db', return_value=self.con), \
                         patch.object(boatd, 'admit', return_value=0), patch.object(boatd, 'disk_preflight', preflight), \
-                        patch.object(boatd, 'ct_exec'), patch.object(boatd.subprocess, 'run', run), \
+                        patch.object(boatd, 'ct_exec'), patch.object(boatd.subprocess, 'Popen', run), \
                         patch.object(boatd, 'read_cg', return_value={}), \
                         patch.object(boatd, 'cg_path', return_value=self.tmp/'cgroup'), \
                         patch.object(boatd, 'ct_running', return_value=False):
                     for attempt in (1, 2):
-                        self.con.execute('UPDATE commands SET attempt=?', (attempt,))
+                        self.con.execute("UPDATE commands SET attempt=?,status='queued',started_at=NULL,ended_at=NULL,"
+                                         "exit_code=NULL,signal=NULL,metrics=NULL", (attempt,))
                         self.assertEqual(boatd.run_cmd(box, 1001), 0)
                 row = self.status(box, 1001)
                 self.assertEqual(row['exit_code'], 2)
