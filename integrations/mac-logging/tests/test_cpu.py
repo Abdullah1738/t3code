@@ -323,6 +323,51 @@ class CpuTests(unittest.TestCase):
                                          props=dict(top=[dict(cmd=command, parentCmd=command)]))
                     self.assertNotIn('tiny', json.dumps(row))
 
+    def test_otp_forms_at_logger_boundary(self):
+        for value in ('0123', '654321', '12345678'):
+            for marker in ('--otp=', '--otp ', '--otp:', '--OTP=', 'otp=', 'otp: '):
+                for prefix in ('npm publish ', 'npm publish '+'v'*32, 'npm publish '+'x'*200+' '):
+                    command = prefix+marker+value
+                    with self.subTest(value=value, marker=marker, prefix=prefix):
+                        row = toollog.record('cpu', 'event', 'cpu.spike', dt.datetime.now(dt.timezone.utc),
+                                             props=dict(top=[dict(cmd=command, parentCmd=command)]))
+                        for key in ('cmd', 'parentCmd'):
+                            self.assertEqual(row['props']['top'][0][key], '[redacted]')
+                        self.assertNotIn(value, json.dumps(row['props']))
+
+    def test_payment_number_lengths_and_separators_at_logger_boundary(self):
+        for digits in range(13, 20):
+            number = '4242424242424242424'[:digits]
+            for separator in ('', ' ', '-'):
+                value = separator.join(number[i:i+4] for i in range(0, len(number), 4))
+                for prefix in ('curl --data ', 'curl '+'x'*200+' --data '):
+                    command = prefix+'"card_number='+value+'"'
+                    with self.subTest(digits=digits, separator=separator, prefix=prefix):
+                        row = toollog.record('cpu', 'event', 'cpu.spike', dt.datetime.now(dt.timezone.utc),
+                                             props=dict(top=[dict(cmd=command, parentCmd=command)]))
+                        for key in ('cmd', 'parentCmd'):
+                            self.assertEqual(row['props']['top'][0][key], '[redacted]')
+                        self.assertNotIn(value, json.dumps(row['props']))
+        # The shared policy's numeric boundaries are 13–19 digits, rather than
+        # every numeric argument in an otherwise useful command.
+        for digits in (12, 20):
+            self.assertIsNone(toollog.SECRET.search('tool --count='+'4'*digits))
+        command = 'python -u report.py --count=654321'
+        row = toollog.record('cpu', 'event', 'cpu.spike', dt.datetime.now(dt.timezone.utc),
+                             props=dict(top=[dict(cmd=command, parentCmd=command)]))
+        self.assertEqual(row['props']['top'][0]['cmd'], command)
+        self.assertEqual(row['props']['top'][0]['parentCmd'], command)
+
+    def test_shared_secret_guard_checks_original_command_before_helper(self):
+        for command in ('npm publish --otp=654321', 'curl --data card_number=4242424242424242'):
+            with self.subTest(command=command), patch('cpu_labels.janitor_redact', return_value='safe') as helper:
+                self.assertEqual(cpu_labels.command_label(command), '[redacted]')
+                row = toollog.record('cpu', 'event', 'cpu.spike', dt.datetime.now(dt.timezone.utc),
+                                     props=dict(top=[dict(cmd=command, parentCmd=command)]))
+                self.assertEqual(row['props']['top'][0]['cmd'], '[redacted]')
+                self.assertEqual(row['props']['top'][0]['parentCmd'], '[redacted]')
+                helper.assert_not_called()
+
     def test_churn_preserves_exiting_identities_without_cpu_baselines(self):
         rows = cpu.parse_ps(line(pid=1)+line(pid=2, cpu_time='0:10'))
         _, old = cpu.deltas(rows, {}, 100)

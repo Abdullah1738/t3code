@@ -47,10 +47,13 @@ def family(command):
 
 
 def command_label(args):
+    # cpu_fields imports this module, so load its shared guard at call time.
+    from toollog import SECRET
+
     # The shared argv helper does not cover short cookie values or curl's
     # overloaded short auth flags. Check before opaque-token redaction can
     # erase the flag/header name but leave a short credential behind.
-    if (SECRET_LABEL.search(args)
+    if (SECRET.search(args) or SECRET_LABEL.search(args)
             or re.search(r'(?:^|[/\s\"\x27])curl\b', args)
             and re.search(r'''(?:^|[\s"'])(?:-(?!-)[^\s]*[uUb]|--(?:proxy-)?user\b)''', args)):
         return '[redacted]'
