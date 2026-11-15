@@ -1538,10 +1538,53 @@ def _replica_reader_source(source):
     return source
 
 
+def _strip_config_dir_db_names(source):
+    # A tool's own ~/.config/<tool>/state.sqlite deny list is not Robob's live state.
+    if 'state.sqlite' not in source or '.config' not in source:
+        return source
+    string = r'''(?:"[^"\\\n]*"|'[^'\\\n]*')'''
+    database = r'''(?:"state\.sqlite(?:-(?:wal|shm|journal))?"|'state\.sqlite(?:-(?:wal|shm|journal))?')'''
+    join = r'(?<![\w$.])(?:path\.join|join|resolve)\s*\(\s*(?:os\.)?homedir\s*\(\s*\)\s*,\s*'
+    config = r'''(?:"\.config"|'\.config')\s*,\s*(?P<tool>''' + string + r')\s*,\s*'
+
+    def safe_tool(value):
+        return (bool(re.fullmatch(r'[A-Za-z0-9_.-]+', value)) and value not in {'.', '..'} and
+                value.lower() not in {'robob', 't3', 't3code', 'opencode', 'robob-data', 'opencode-data'})
+
+    def operand(match):
+        if match['names'] is None:
+            return literal(match)
+        if not safe_tool(match['tool'][1:-1]) or LIVE.search(match[0]):
+            return match[0]
+        start, end = match.span('names')
+        names = re.sub(string, lambda item: "''" if re.fullmatch(database, item[0]) else item[0], match['names'])
+        return (match[0][:start - match.start()] + names +
+                match[0][end - match.start():])
+
+    array = (r'\[(?P<names>\s*' + string + r'(?:\s*,\s*' + string + r')*\s*,?\s*)\]\s*'
+             r'\.map\(\s*(?P<param>[A-Za-z_$][\w$]*)\s*=>\s*' + join + config +
+             r'(?P=param)\s*\)\s*\)')
+    def literal(match):
+        if match[0][0] not in "\"'":
+            return match[0]
+        value = match[0][1:-1]
+        path = re.fullmatch(r'(?:~/|/(?:[^/]+/)*)\.config/([^/]+)/state\.sqlite(?:-(?:wal|shm|journal))?', value)
+        if (path and safe_tool(path[1]) and '..' not in value.split('/') and
+                not any(char in value for char in ('\\', '$', '*', '?', '[')) and not LIVE.search(value) and
+                re.search(r'\b(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*$', source[:match.start()])):
+            return "''"
+        return match[0]
+
+    quoted = r'''//[^\n]*|/\*[\s\S]*?\*/|"(?:[^"\\]|\\[\s\S])*"|'(?:[^'\\]|\\[\s\S])*'|`(?:[^`\\]|\\[\s\S])*`'''
+    source = re.sub(array + '|' + quoted, operand, source)
+    return re.sub(join + config + r'(?P<names>' + database + r')\s*\)|' + quoted, operand, source)
+
+
 def _source_hit(source, directory, python=False, shell=False):
     # Inspect the original body, including literals/comments, never its path or argv.
     discount_foreign = not PROTECTED_SOURCE_TOKEN.search(source)
-    if discount_foreign and 'state.sqlite' in source and _foreign_reader_shadowed(source):
+    foreign_source = _strip_config_dir_db_names(source) if not python else source
+    if discount_foreign and 'state.sqlite' in foreign_source and _foreign_reader_shadowed(source):
         return True
     # Keep the root evidence so the replica cannot hide a second database name.
     replica = REPLICA.search(source)
@@ -2871,7 +2914,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
 
     def scan_child(source, directory, depth):
         # The shell walker cannot prove how a local reader rewrites its argument.
-        if 'state.sqlite' in source and _foreign_reader_shadowed(source):
+        if 'state.sqlite' in _strip_config_dir_db_names(source) and _foreign_reader_shadowed(source):
             check_source(source, directory, rule='live-database-read')
         previous = {name: set(values) for name, values in script_values.items()}
         previous_fresh = set(fresh_variables)

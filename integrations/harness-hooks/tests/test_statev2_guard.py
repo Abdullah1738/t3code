@@ -3117,6 +3117,107 @@ class GuardTests(unittest.TestCase):
 SRC = Path(__file__).resolve().parents[1] / "src"
 
 
+class ConfigDirectoryDatabaseNamesTests(unittest.TestCase):
+    IMPORTS = ('import { open } from "node:fs/promises";\nimport { homedir } from "node:os";\n'
+               'let handle: Awaited<ReturnType<typeof open>> | undefined;\n')
+
+    def setUp(self):
+        clean = isolated_source_cases.fixture_environment_patch()
+        clean.start()
+        self.addCleanup(clean.stop)
+        self.temp = tempfile.TemporaryDirectory(prefix='config-db-guard-')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def deny_list(self, tool='"telegram-bridge"', parameter='item', names=None):
+        names = names or '["credentials.env", "state.sqlite", "state.sqlite-wal", "state.sqlite-shm", "state.sqlite-journal", "bridge.sock"]'
+        return (f'const protectedPaths = {names}\n'
+                f'  .map({parameter} => join(homedir(), ".config", {tool}, {parameter}));\n')
+
+    def assert_source(self, body, expected=None, args=('notify --text x', '--help')):
+        source = self.IMPORTS + body.rstrip() + '\n'
+        script = self.root / 'cli.ts'
+        script.write_text(source)
+        for argv in args:
+            with self.subTest(argv=argv):
+                self.assertEqual(guard.classify_detail(f'bun {shlex.quote(str(script))} {argv}', str(self.root)),
+                                 (expected, None))
+        for command in ("node - <<'JS'\n" + source + 'JS',
+                        'bash -c ' + shlex.quote("node - <<'JS'\n" + source + 'JS')):
+            with self.subTest(command=command):
+                self.assertEqual(guard.classify_detail(command, str(self.root)),
+                                 (READ if expected else None, None))
+
+    def test_bridge_deny_lists_with_open_import(self):
+        self.assert_source(self.deny_list())
+        self.assert_source(self.deny_list('"spectrum-bridge"', 'name'),
+                           args=('send --text x', 'react --target X --kind like'))
+        self.assert_source("// The bridge's own deny list.\n" + self.deny_list())
+
+    def test_direct_config_database_operands(self):
+        for home in ('homedir()', 'os.homedir()'):
+            for join in ('join', 'path.join', 'resolve'):
+                for quote in ('"', "'"):
+                    for suffix in ('', '-wal', '-shm', '-journal'):
+                        with self.subTest(home=home, join=join, quote=quote, suffix=suffix):
+                            self.assert_source(f'const p = {join}({home}, {quote}.config{quote}, '
+                                               f'{quote}mytool{quote}, {quote}state.sqlite{suffix}{quote});')
+        for path in ('~/.config/mytool/state.sqlite', '/Users/x/.config/mytool/state.sqlite-wal'):
+            for quote in ('"', "'"):
+                with self.subTest(path=path, quote=quote):
+                    self.assert_source(f'const p = {quote}{path}{quote};')
+
+    def test_reserved_tools_are_not_discharged(self):
+        for tool in ('robob', 't3', 'opencode', 'T3Code', 'robob-data', 'opencode-data'):
+            with self.subTest(tool=tool):
+                self.assert_source(self.deny_list(json.dumps(tool)), SCRIPT)
+                self.assert_source(f'const p = join(homedir(), ".config", "{tool}", "state.sqlite");', SCRIPT)
+                self.assert_source(f'const p = "~/.config/{tool}/state.sqlite"; const root = ".robob";', SCRIPT)
+
+    def test_nonliteral_and_unconfined_names_are_not_discharged(self):
+        for body in (
+            self.deny_list('dir'), self.deny_list('`my${tool}`'),
+            self.deny_list('"../mytool"'), self.deny_list('".."'), self.deny_list('"my*tool"'),
+            self.deny_list(names='["../state.sqlite"]'),
+            self.deny_list(names='[`state.sqlite${suffix}`]'),
+            self.deny_list(names='["state.sqlite", "../state.sqlite"]'),
+            self.deny_list(names='["prefix \'state.sqlite\' suffix"]'),
+            'const p = join(homedir(), ".config", dir, "state.sqlite");',
+            'const p = join(homedir(), ".config", "mytool", `state.sqlite${suffix}`);',
+            'const p = join(homedir(), ".config", "mytool", "../state.sqlite");',
+            'const p = `${h}/.config/mytool/state.sqlite`;',
+            'const p = `~/.config/mytool/state.sqlite`;',
+            'const p = "/Users/../x/.config/mytool/state.sqlite";',
+            'const p = "~/.config/mytool/state.sqlite?mode=ro";',
+            'const p = "~/.config/mytool/state.sqlite\\x";',
+            'const p = "~/.config/mytool/state.sqlite*";',
+            'const p = "~/.config/${tool}/state.sqlite";',
+            'const names = ["state.sqlite"];\nnames.map(n => join(homedir(), ".config", "mytool", n));',
+            '["state.sqlite"].map(n => join(homedir(), ".config", "mytool", other));',
+            '`join(homedir(), ".config", "mytool", "state.sqlite")`;',
+        ):
+            with self.subTest(body=body):
+                self.assert_source(body, SCRIPT)
+
+    def test_safe_deny_list_does_not_hide_another_database(self):
+        for body in (
+            'const n = "state.sqlite"; join(homedir(), ".robob", "userdata", n);',
+            'const p = join(homedir(), ".t3/userdata", "state.sqlite");',
+            'const p = join(homedir(), ".config", dir, "state.sqlite");',
+            'const p = "/Users/x/.robob/userdata/statev2.sqlite";',
+        ):
+            with self.subTest(body=body):
+                self.assert_source(self.deny_list() + body, SCRIPT)
+        self.assert_source('const n = "state.sqlite"; join(homedir(), ".robob", "userdata", n);', SCRIPT)
+
+    def test_config_basename_reuse_keeps_live_root_evidence(self):
+        for value in ('join(homedir(), ".config", "mytool", "state.sqlite")',
+                      '"~/.config/mytool/state.sqlite"'):
+            with self.subTest(value=value):
+                self.assert_source(f'const p = {value};\n'
+                                   'open(join(homedir(), ".robob", "userdata", path.basename(p)));', SCRIPT)
+
+
 class LiveDatabaseGuardTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="live-db-guard-")
