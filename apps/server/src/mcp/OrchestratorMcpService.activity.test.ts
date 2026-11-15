@@ -1,6 +1,7 @@
 import { expectJsonRoundTrip } from "./McpJson.testkit.ts";
 import {
   EnvironmentId,
+  MessageId,
   NodeId,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadShell,
@@ -232,11 +233,32 @@ it.effect.each(
                 run: projection.runs[0]!,
                 delivery: "started",
                 dispatch: { sequence: 1, storedEvents: [] },
+                projection,
+                message: {
+                  id: MessageId.make("message-json-cancellation"),
+                  threadId: parentThreadId,
+                  runId: run.id,
+                  nodeId: null,
+                  role: "user",
+                  text: "Follow up",
+                  phase: "unknown",
+                  attachments: [],
+                  streaming: false,
+                  createdBy: "agent",
+                  creationSource: "mcp",
+                  createdAt: now,
+                  updatedAt: now,
+                },
+                turnItem: null,
               }),
             waitForThread: () =>
               operation === "wait timeout"
                 ? Deferred.succeed(waiting, undefined).pipe(Effect.andThen(Effect.never))
-                : Effect.succeed({ run: projection.runs[0]!, timedOut: false }),
+                : Effect.succeed({
+                    threadId: parentThreadId,
+                    run: projection.runs[0]!,
+                    timedOut: false,
+                  }),
           }),
           ServerSettings.layerTest(),
           Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
