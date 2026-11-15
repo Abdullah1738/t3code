@@ -37,6 +37,7 @@ ENUMS = {
     "cmd_via": {"argv", "file"},
     "backend": {"home", "boat"}, "from": {"home", "boat"}, "to": {"home", "boat"},
     "reason": {"pinned", "home_up", "home_down", "unreachable", "boat_only", "boat_only_base", "infra", "cap", "busy", "person_home_down", "base_home_down"},
+    "stream": {"stderr", "stdout"},
     "leaseKind": {"fresh", "reused", "saved-base"},
     "decision": {"allowed", "denied", "local-override", "boat", "wait_explicit_base", "wait_person", "wait_pinned"},
     "harness": {"opencode", "codex", "claudeAgent", "codex-cu"},
@@ -47,6 +48,7 @@ ENUMS = {
     "infra_failure": {"enospc", "native_crash", "disk_probe"},
     "infra_reason": {"low_space_gate", "disk_exhausted", "toolchain_unpack_crash", "probe_crashed"},
 }
+ENUMS['reason'].update({'history_empty', 'history_timeout', 'history_no_progress', 'history_unavailable'})
 ENUMS.update({f'{fs}_fstype': {'tmpfs', 'zfs', 'ext2', 'ext3', 'ext4', 'xfs', 'btrfs', 'overlay', 'unknown'}
               for fs in ('tmp', 'var_tmp', 'home', 'workspace')})
 ENUMS.update(cause={'incus_unavailable', 'exec_stream_lost', 'host_restart', 'boatd_restart', 'runner_restart'},

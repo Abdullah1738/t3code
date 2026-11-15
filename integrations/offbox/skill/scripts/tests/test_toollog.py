@@ -30,6 +30,11 @@ class Logs(unittest.TestCase):
     def rows(self):
         return [json.loads(line) for path in self.root.glob('*.ndjson') for line in path.read_text().splitlines()]
 
+    def test_missing_stderr_metadata_survives_serialization(self):
+        props = dict(stream='stderr', backend='boat', reason='history_empty')
+        toollog.emit('run', 'run.log_stream_missing', kind='error', ok=False, ids={'run': 'run-fixture'}, props=props)
+        self.assertEqual(self.rows()[0]['props'], props)
+
     def test_command_transport_fields_survive_serialization(self):
         for mode in ('argv', 'file'):
             for name in ('run.start', 'run.command'):
