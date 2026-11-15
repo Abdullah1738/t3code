@@ -13489,7 +13489,15 @@ const make = Effect.gen(function* () {
           for (const subtask of plan.subtasks) {
             const cleared = subtask.gateCleared;
             const previous = card.subtasks.find((entry) => entry.id === subtask.id);
-            if (!cleared || cleared === previous?.gateCleared) continue;
+            const previousClear = previous?.gateCleared;
+            if (
+              !cleared ||
+              (previousClear &&
+                cleared.gate === previousClear.gate &&
+                cleared.at === previousClear.at &&
+                actorKey(cleared.by) === actorKey(previousClear.by))
+            )
+              continue;
             yield* logEvent(next, actor, "comment", {
               body: `Cleared guessed ${cleared.gate} gate on ${subtask.id} ("${cleared.text}"): ${cleared.reason}`,
             });
@@ -13497,11 +13505,21 @@ const make = Effect.gen(function* () {
             const text =
               `An evaluator cleared the ${cleared.gate} gate the board guessed on ${subtask.id}: "${cleared.text}". Reason: ${cleared.reason}.` +
               (previous?.gateSource === undefined ? " (origin not recorded: an older gate)" : "");
+            const title = `Gate cleared on #${card.number} ${subtask.id}`;
+            next = Asks.closeAsks(
+              next,
+              at,
+              (ask) =>
+                ask.kind === "notice" &&
+                ask.batchKey === "gate-cleared" &&
+                ask.title === title &&
+                ask.answer === undefined,
+            );
             const askId = Asks.nextAskId(next);
             next = Asks.updateAsk(Asks.addAsk(next, text, false, actor, at), askId, {
               kind: "notice",
               respond: { ack: true },
-              title: `Gate cleared on #${card.number} ${subtask.id}`,
+              title,
               batchKey: "gate-cleared",
             });
           }
