@@ -3,6 +3,7 @@ import {
   KanbanCardId,
   ProviderInstanceId,
   ThreadId,
+  type KanbanBoard,
   type KanbanCard,
   type KanbanCardEvent,
   type KanbanOwnerAsk,
@@ -1725,5 +1726,121 @@ describe("ledger pool activity", () => {
     );
     expect(result.queueWait[pool]).toEqual([0, 1, 1]);
     expect(result.queueWait[other]).toBeUndefined();
+  });
+});
+
+describe("queued current-state rollup", () => {
+  const board: KanbanBoard = {
+    id: KanbanBoardId.make("b1"),
+    slug: "queued",
+    name: "Queued",
+    icon: null,
+    iconImage: null,
+    defaultProjectId: null,
+    managerModel: sonnet,
+    evaluatorModel: opus,
+    defaultCardModel: opus,
+    reviewChains: [{ name: "Default", steps: [opus] }],
+    defaultReviewChain: "Default",
+    standingApprovals: [],
+    instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },
+    setup: null,
+    pause: null,
+    createdAt: before,
+    nightlyReview: null,
+    archivedAt: null,
+  };
+  const pools = [{ key: Rules.poolKey(opus), model: opus, slots: 1 }];
+  it("keeps current queued rows even when they never moved in the window", () => {
+    const holder = card("held", {
+      number: 44,
+      stage: "working",
+      activeRole: "work",
+      activePool: Rules.poolKey(opus),
+      activeThreadId: ThreadId.make("held"),
+    });
+    const review = card("review", {
+      number: 42,
+      priority: 4,
+      stage: "needs_review",
+      analyticsStageEnteredAt: t("10:00"),
+    });
+    const todo = card("todo", { number: 47, priority: 3, analyticsStageEnteredAt: t("12:00") });
+    const waiting = card("waiting", {
+      number: 48,
+      movedAt: t("20:00"),
+      wait: { ...waitOn, at: t("20:00") },
+    });
+    const result = Activity.rollup({
+      board,
+      window,
+      cards: [holder, todo, waiting, review],
+      pools,
+      threads: [],
+      events: [],
+    });
+    expect(result.stages.queued).toMatchObject({
+      count: 3,
+      byReason: { pool_full: 2, "wait:ci": 1 },
+      items: [
+        {
+          card: 42,
+          hours: 14,
+          reason: "pool_full",
+          rank: 2,
+          ahead: { count: 1, items: [47] },
+          held: [{ card: 44, role: "work" }],
+        },
+        { card: 47, hours: 12, reason: "pool_full", rank: 1 },
+        { card: 48, hours: 4, reason: "wait:ci" },
+      ],
+    });
+    expect(result.stages.queuedOver6h).toMatchObject({
+      count: 2,
+      items: [{ card: 42 }, { card: 47 }],
+    });
+    expect(JSON.stringify(result.stages.queued)).not.toContain('"title"');
+    expect(JSON.stringify(result.stages.queued)).not.toContain('"prompt"');
+  });
+  it("uses live reservations and masked dispatch pools separately from history", () => {
+    const todo = card("todo");
+    const read = { board, window, cards: [todo], pools, threads: [], events: [] };
+    expect(Activity.rollup(read).stages.queued.items[0]?.reason).toBe("would_start");
+    expect(
+      Activity.rollup({ ...read, holds: new Map([["reserved", Rules.poolKey(opus)]]) }).stages
+        .queued.items[0]?.reason,
+    ).toBe("pool_full");
+    expect(
+      Activity.rollup({ ...read, dispatchPools: pools.map((pool) => ({ ...pool, slots: 0 })) })
+        .stages.queued.items[0]?.reason,
+    ).toBe("no_pool");
+  });
+  it("measures gates and stage ages at the requested window end", () => {
+    const todo = card("retry", { movedAt: t("03:00") });
+    const read = {
+      board,
+      cards: [todo],
+      pools,
+      threads: [],
+      events: [],
+      assignmentWakeRetries: new Map([
+        [todo.id, { movedAt: todo.movedAt, attempts: 1, retryAt: Date.parse(t("12:00")) }],
+      ]),
+    };
+    const before = Activity.rollup({ ...read, window: { ...window, until: t("11:00") } });
+    expect(before.stages.queued.items[0]).toMatchObject({ reason: "retry_backoff", hours: 8 });
+    const after = Activity.rollup({ ...read, window: { ...window, until: t("14:00") } });
+    expect(after.stages.queued.items[0]).toMatchObject({ reason: "would_start", hours: 11 });
+    expect(after.stages.queuedOver6h.count).toBe(1);
+  });
+
+  it("caps both queued lists while retaining full counts", () => {
+    const cards = Array.from({ length: 200 }, (_, i) => card(`q${i}`, { number: i + 1 }));
+    const result = Activity.rollup({ board, window, cards, pools, threads: [], events: [] });
+    expect(result.stages.queued.count).toBe(200);
+    expect(result.stages.queued.items.length).toBeLessThan(200);
+    expect(result.stages.queued.byReason).toEqual({ would_start: 1, pool_full: 199 });
+    expect(result.stages.queuedOver6h.count).toBe(200);
+    expect(result.stages.queuedOver6h.items.length).toBeLessThan(200);
   });
 });

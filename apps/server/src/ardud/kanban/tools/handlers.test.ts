@@ -53,6 +53,9 @@ import * as ProjectService from "../../../project/ProjectService.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
 import * as KanbanService from "../engine/KanbanService.ts";
 import * as KanbanModels from "../engine/models.ts";
+import * as Activity from "../engine/activity.ts";
+import * as Rules from "../engine/rules.ts";
+import { newWait } from "../engine/waits.ts";
 import { KanbanThreads, KanbanThreadError } from "../engine/threads.ts";
 import * as KanbanStore from "../store/KanbanStore.ts";
 import { layer as providerRegistryLayer } from "../../../provider/testUtils/providerRegistryMock.ts";
@@ -1874,7 +1877,27 @@ it.effect(
           answeredItems: Array<{ card: number; id: string; minutes?: number }>;
         };
         cards: { active: number };
+        stages: {
+          queued: {
+            count: number;
+            items: Array<{
+              card: number;
+              reason: string;
+              held: Array<{ card: number; role: string }>;
+            }>;
+          };
+          queuedOver6h: { count: number };
+        };
       };
+      assert.strictEqual(activity.stages.queued.count, 1);
+      assert.strictEqual(activity.stages.queuedOver6h.count, 1);
+      assert.deepInclude(activity.stages.queued.items[0], {
+        card: quiet.number,
+        reason: "pool_full",
+      });
+      assert.deepEqual(activity.stages.queued.items[0]?.held, [
+        { card: busy.number, role: "work" },
+      ]);
       assert.strictEqual(activity.boardId, board.id);
       assert.strictEqual(activity.cards.active, 1);
       assert.strictEqual(activity.asks.answered, 1);
@@ -9279,4 +9302,88 @@ it.effect.each(["queued", "in-flight"] as const)(
         Effect.ensuring(Deferred.succeed(resume, undefined)),
       );
     }),
+);
+
+it.effect.each([
+  { stage: "needs_owner", form: "none", included: false },
+  { stage: "completed", form: "none", included: false },
+  { stage: "deployed", form: "none", included: false },
+  { stage: "verified", form: "none", included: false },
+  { stage: "needs_owner", form: "wait", included: true },
+  { stage: "needs_owner", form: "deciding", included: true },
+  { stage: "needs_owner", form: "active", included: true },
+  { stage: "needs_owner", form: "settled", included: false },
+] as const)(
+  "queue ranking uses the dispatch snapshot for $stage/$form",
+  ({ stage, form, included }) => {
+    const { layer } = fakeThreads();
+    return Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const store = yield* KanbanStore.KanbanStore;
+      const board = yield* kanban.ensureBoard({
+        slug: "snapshot",
+        name: "Snapshot",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+      const root = yield* kanban.createCard(
+        board.id,
+        { title: "Root", prompt: "Root", priority: 4 },
+        owner,
+      );
+      const higher = yield* kanban.createCard(
+        board.id,
+        { title: "Higher", prompt: "Higher", priority: 3 },
+        owner,
+      );
+      const outsider = yield* kanban.createCard(
+        board.id,
+        { title: "Outside", prompt: "Outside", priority: 1 },
+        owner,
+      );
+      const at = outsider.movedAt;
+      yield* store.putCard({
+        ...outsider,
+        stage,
+        blockedBy: [root.id],
+        settledAt: form === "settled" ? at : null,
+        ...(form === "wait"
+          ? { wait: newWait({ on: "ci", note: "CI", pr: "https://example.com/pr/1" }, owner, at) }
+          : {}),
+        ...(form === "deciding"
+          ? { deciding: { since: at, why: "Wait ended", toldAt: null } }
+          : {}),
+        ...(form === "active" ? { activeThreadId: ThreadId.make("outside") } : {}),
+      });
+      const until = DateTime.formatIso(DateTime.makeUnsafe(yield* Clock.currentTimeMillis));
+      const window = {
+        since: DateTime.formatIso(DateTime.makeUnsafe(Date.parse(until) - 3600000)),
+        until,
+      };
+      const read = yield* kanban.activity(board.id, window);
+      assert.strictEqual(
+        read.dispatchCards.some((card) => card.id === outsider.id),
+        included,
+      );
+      const result = Activity.rollup({ window, ...read });
+      const starts = result.stages.queued.items
+        .filter((row) => row.reason === "would_start")
+        .map((row) => row.card);
+      const expected = Rules.planDispatch(
+        board,
+        read.dispatchCards,
+        read.dispatchPools,
+        read.holds,
+        () => 0,
+        Date.parse(until),
+      ).map((entry) => read.cards.find((card) => card.id === entry.cardId)!.number);
+      assert.deepEqual(starts, expected);
+      if (!included) assert.deepEqual(starts, [higher.number]);
+      yield* kanban.dispatchNow;
+      const actual = (yield* kanban.cards(board.id))
+        .filter((card) => card.activeRole === "work")
+        .map((card) => card.number);
+      assert.deepEqual(actual, starts);
+    }).pipe(Effect.provide(layer));
+  },
 );

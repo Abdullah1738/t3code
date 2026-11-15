@@ -416,7 +416,13 @@ const capped = <T>(items: ReadonlyArray<T>, max: number) =>
 
 export interface RollupInput {
   readonly window: ActivityWindow;
-  readonly board?: Pick<KanbanBoard, "pause" | "setup" | "archivedAt"> | null;
+  readonly board?: KanbanBoard | Pick<KanbanBoard, "pause" | "setup" | "archivedAt"> | null;
+  readonly dispatchCards?: ReadonlyArray<KanbanCard>;
+  readonly holds?: ReadonlyMap<string, string>;
+  readonly dispatchPools?: ReadonlyArray<KanbanPool>;
+  readonly reviews?: ReadonlyMap<string, Rules.ReviewEvidence>;
+  readonly workThreadHomes?: ReadonlyMap<string, KanbanCard | null>;
+  readonly assignmentWakeRetries?: ReadonlyMap<string, Rules.AssignmentWakeRetry>;
   readonly cards: ReadonlyArray<KanbanCard>;
   readonly events: ReadonlyArray<KanbanCardEvent>;
   readonly threads: ReadonlyArray<KanbanThreadLink>;
@@ -989,6 +995,28 @@ export const rollup = (input: RollupInput) => {
   }
   oldAsks.sort((left, right) => right.hours - left.hours || left.card - right.card);
 
+  const queued =
+    input.board && "reviewChains" in input.board
+      ? Rules.dispatchQueueStatus(
+          input.board,
+          input.dispatchCards ?? input.cards,
+          input.dispatchPools ?? input.pools,
+          input.holds,
+          time(until),
+          input.reviews,
+          input.workThreadHomes,
+          input.assignmentWakeRetries,
+        ).toSorted((a, b) => b.hours - a.hours || a.card - b.card)
+      : [];
+  const queuedByReason: Record<string, number> = {};
+  for (const row of queued) queuedByReason[row.reason] = (queuedByReason[row.reason] ?? 0) + 1;
+  const stageStartByNumber = new Map(
+    input.cards.map((card) => [card.number, time(card.analyticsStageEnteredAt ?? card.movedAt)]),
+  );
+  const queuedOver6h = queued.filter(
+    (row) => time(until) - stageStartByNumber.get(row.card)! > 6 * HOUR,
+  );
+
   const build = (max: number) => ({
     window: { since: window.since, until },
     cards: {
@@ -1019,6 +1047,8 @@ export const rollup = (input: RollupInput) => {
       longest,
       openOver24h: { count: longOpen.length, byStage: longOpenByStage, ...capped(longOpen, max) },
       withoutThread: { count: idle.length, ...capped(idle, max) },
+      queued: { count: queued.length, byReason: queuedByReason, ...capped(queued, max) },
+      queuedOver6h: { count: queuedOver6h.length, ...capped(queuedOver6h, max) },
       inReviewNoThreadWithEvaluatorStepsOnly: {
         count: evaluatorOnly.length,
         ...capped(evaluatorOnly, max),
