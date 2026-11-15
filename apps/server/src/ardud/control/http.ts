@@ -47,6 +47,7 @@ import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
 import * as OrchestrationEventStore from "../../persistence/OrchestrationEventStore.ts";
 import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
 import * as ThreadMessageIntake from "../../orchestration-v2/ThreadMessageIntake.ts";
+import * as SendAcknowledgement from "../orchestration/ThreadSendAcknowledgement.ts";
 import { userFacingDispatchErrorMessage } from "../../orchestration-v2/UserFacingErrors.ts";
 import * as ManagedProjectFolders from "../../project/ManagedProjectFolders.ts";
 import * as ProjectService from "../../project/ProjectService.ts";
@@ -517,6 +518,7 @@ const makeRoutes = Effect.gen(function* () {
   const providers = yield* ProviderRegistry.ProviderRegistry;
   const settingsService = yield* ServerSettings.ServerSettingsService;
   const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
+  const serviceScope = yield* Effect.scope;
   const store = yield* ControlStore.ControlStore;
   const threadRead = yield* ControlThreadRead.ControlThreadRead;
   const usage = yield* Usage.Usage;
@@ -1308,69 +1310,92 @@ const makeRoutes = Effect.gen(function* () {
     const threadId = yield* param("threadId");
     const body = yield* decodeBody(decodeSendBody);
     yield* ControlRequestAnalytics.sendMode(body.mode ?? "auto");
-    const shell = yield* getShell(threadId);
-    const commandId = yield* commandIdFor(`send:${threadId}`, body.clientRequestId);
-    // ardud: channel guidance is framed as the bridge's, so only it may send some.
-    if (body.guidance !== undefined && !isBridgeSession(session)) {
-      return yield* fail("forbidden", "Only the iMessage bridge sends channel guidance.");
-    }
-    if (body.guidance !== undefined && !guidanceFits(body.guidance)) {
-      return yield* fail(
-        "invalid_request",
-        `Channel guidance is limited to ${GUIDANCE_MAX_CHARS} characters once encoded.`,
-      );
-    }
-    const context = guidanceContext(body.guidance);
-    const hasSelection =
-      body.model !== undefined ||
-      body.variant !== undefined ||
-      body.providerInstanceId !== undefined ||
-      body.options !== undefined;
-    const settings = yield* settingsService.getSettings.pipe(
-      Effect.mapError((cause) => fail("internal", errorDetail(cause))),
+    const result = yield* SendAcknowledgement.bounded(
+      (clientRequestId) =>
+        Effect.gen(function* () {
+          const shell = yield* getShell(threadId);
+          const commandId = yield* commandIdFor(`send:${threadId}`, clientRequestId);
+          // ardud: channel guidance is framed as the bridge's, so only it may send some.
+          if (body.guidance !== undefined && !isBridgeSession(session)) {
+            return yield* fail("forbidden", "Only the iMessage bridge sends channel guidance.");
+          }
+          if (body.guidance !== undefined && !guidanceFits(body.guidance)) {
+            return yield* fail(
+              "invalid_request",
+              `Channel guidance is limited to ${GUIDANCE_MAX_CHARS} characters once encoded.`,
+            );
+          }
+          const context = guidanceContext(body.guidance);
+          const hasSelection =
+            body.model !== undefined ||
+            body.variant !== undefined ||
+            body.providerInstanceId !== undefined ||
+            body.options !== undefined;
+          const settings = yield* settingsService.getSettings.pipe(
+            Effect.mapError((cause) => fail("internal", errorDetail(cause))),
+          );
+          const modelSelection =
+            hasSelection || selectionMigrationApplies(settings)
+              ? yield* resolveControlSelection({
+                  model: body.model,
+                  variant: body.variant,
+                  instanceId: body.providerInstanceId,
+                  options: body.options,
+                  base: shell.modelSelection,
+                  settings,
+                })
+              : undefined;
+          // Queue only a readiness marker: a cancelled send must never leave its
+          // message effect in the startup worker after the commit lease expires.
+          yield* startup
+            .enqueueCommand(Effect.void)
+            .pipe(Effect.mapError((cause) => fail("conflict", errorDetail(cause))));
+          const result = yield* ThreadMessageIntake.sendToThread({
+            projectId: shell.projectId,
+            commandId,
+            threadId: shell.id,
+            messageId: MessageId.make(commandId),
+            text: body.text,
+            attachments: toChatAttachments(body.attachments),
+            ...(modelSelection === undefined ? {} : { modelSelection }),
+            mode: body.mode ?? "auto",
+            // ardud: a bearer token is not the owner typing.
+            createdBy: CONTROL_ACTOR,
+            creationSource: "server",
+            ...(context === undefined ? {} : { context }),
+          }).pipe(
+            // The captured services can include the route's background reader lane.
+            NodeSqliteClient.foregroundReads,
+            Effect.provide(intakeContext),
+            Effect.mapError((cause) =>
+              isThreadManagementError(cause) && cause._tag === "ThreadManagementThreadNotFoundError"
+                ? fail("not_found", cause.message)
+                : fail("conflict", errorDetail(cause)),
+            ),
+          );
+          return {
+            threadId: shell.id,
+            messageId: result.message.id,
+            runId: result.run.id,
+            status: result.run.status,
+            delivery: result.delivery,
+          };
+        }),
+      serviceScope,
+      body.clientRequestId,
+    ).pipe(
+      Effect.provideService(Crypto.Crypto, crypto),
+      Effect.mapError((cause) =>
+        cause._tag === "ControlError" ? cause : fail("conflict", errorDetail(cause)),
+      ),
     );
-    const modelSelection =
-      hasSelection || selectionMigrationApplies(settings)
-        ? yield* resolveControlSelection({
-            model: body.model,
-            variant: body.variant,
-            instanceId: body.providerInstanceId,
-            options: body.options,
-            base: shell.modelSelection,
-            settings,
-          })
-        : undefined;
-    const result = yield* startup
-      .enqueueCommand(
-        ThreadMessageIntake.sendToThread({
-          projectId: shell.projectId,
-          commandId,
-          threadId: shell.id,
-          messageId: MessageId.make(commandId),
-          text: body.text,
-          attachments: toChatAttachments(body.attachments),
-          ...(modelSelection === undefined ? {} : { modelSelection }),
-          mode: body.mode ?? "auto",
-          // ardud: a bearer token is not the owner typing.
-          createdBy: CONTROL_ACTOR,
-          creationSource: "server",
-          ...(context === undefined ? {} : { context }),
-        }).pipe(Effect.provide(intakeContext)),
-      )
-      .pipe(
-        Effect.mapError((cause) =>
-          isThreadManagementError(cause) && cause._tag === "ThreadManagementThreadNotFoundError"
-            ? fail("not_found", cause.message)
-            : fail("conflict", errorDetail(cause)),
-        ),
-      );
     return json({
       ok: true,
-      threadId: shell.id,
-      messageId: result.message.id,
-      runId: result.run.id,
-      status: result.run.status,
-      delivery: result.delivery,
+      threadId: result.threadId,
+      messageId: result.messageId,
+      runId: result.runId,
+      status: result.status,
+      delivery: body.mode === "restart" ? "restarted" : result.delivery,
     });
   });
 
