@@ -1001,6 +1001,7 @@ export class KanbanService extends Context.Service<KanbanService, KanbanServiceS
 ) {}
 
 interface StartTimeout {
+  readonly restartAdmission?: boolean;
   readonly runId: string;
   readonly reason: string;
 }
@@ -2130,7 +2131,8 @@ const make = Effect.gen(function* () {
         "thread_status",
         locks.outside(threadIo.pendingUserInputs(id), undefined, true),
       ),
-    queuedRuns: (id) => locks.outside(threadIo.queuedRuns(id), undefined, true),
+    queuedRuns: (id, includeActive) =>
+      locks.outside(threadIo.queuedRuns(id, includeActive), undefined, true),
     view: (id) => threadRead("view", id, threadIo.view(id)),
     find: (id) => threadRead("find", id, threadIo.find(id)),
     model: (id, activeRun = false) =>
@@ -2223,6 +2225,9 @@ const make = Effect.gen(function* () {
   };
   /** Thread reads that confirm the current run: always read, never replayed. */
   const freshThreads = {
+    unsettledRuns: (threadId: ThreadId) =>
+      locks.outside(threadIo.queuedRuns(threadId, true), undefined, true),
+    model: (threadId: ThreadId) => locks.outside(threadIo.model(threadId), undefined, true),
     find: (threadId: ThreadId) => locks.outside(threadIo.find(threadId), undefined, true),
     findLastFailure: (threadId: ThreadId) =>
       locks.outside(threadIo.findLastFailure(threadId), undefined, true),
@@ -9058,6 +9063,62 @@ const make = Effect.gen(function* () {
     );
   });
 
+  const finishStartTimeout = Effect.fn("KanbanService.finishStartTimeout")(function* (
+    threadId: ThreadId,
+    link: KanbanThreadLink,
+    startTimeout: StartTimeout,
+    at: string,
+  ) {
+    if (startTimeout.restartAdmission) {
+      const runs = yield* freshThreads.unsettledRuns(threadId);
+      if (runs.some((run) => run.id !== startTimeout.runId)) return;
+    }
+    const ids =
+      link.role === "work" ? yield* store.threadCards(threadId) : link.cardId ? [link.cardId] : [];
+    for (const id of ids) {
+      const current = yield* store.card(id);
+      if (
+        current === null ||
+        current.stalled !== null ||
+        (current.activeThreadId !== null && current.activeThreadId !== threadId) ||
+        !(link.role === "work"
+          ? current.workThreadId === threadId && ["todo", "working"].includes(current.stage)
+          : link.role === "review" &&
+            current.reviewThreadId === threadId &&
+            ["needs_review", "in_review"].includes(current.stage))
+      )
+        continue;
+      const by: KanbanActor = { _tag: "system", component: "dispatcher" };
+      const reason = `Run failed: ${startTimeout.reason}${
+        startTimeout.restartAdmission
+          ? " The card's evaluator can clear this flag; a new run on its work thread clears it automatically."
+          : ""
+      }`;
+      const next = releaseToQueue(
+        {
+          ...Retries.withoutRetries(current),
+          stalled: {
+            reason,
+            by,
+            at,
+            ...(startTimeout.restartAdmission && link.role === "work"
+              ? { runFailure: { threadId, runId: startTimeout.runId } }
+              : {}),
+          },
+        },
+        at,
+      );
+      yield* logEvent(next, by, "flagged", {
+        fromStage: current.stage,
+        toStage: next.stage,
+        body: `${reason}\nRun: ${startTimeout.runId}`,
+      });
+      yield* saveCard(next);
+    }
+    yield* kick;
+    return;
+  });
+
   const finishTurn = Effect.fn("KanbanService.turnEndedUnlocked")(function* (
     threadId: ThreadId,
     expectedFailedWorkRunId?: string,
@@ -9077,42 +9138,8 @@ const make = Effect.gen(function* () {
     const at = yield* nowIso;
     // Queue promotion can already have replaced this failed run. Its deadline
     // still belongs to cards on this thread, including cards with no pool slot.
-    if (startTimeout !== undefined) {
-      const ids =
-        link.role === "work"
-          ? yield* store.threadCards(threadId)
-          : link.cardId
-            ? [link.cardId]
-            : [];
-      for (const id of ids) {
-        const current = yield* store.card(id);
-        if (
-          current === null ||
-          current.stalled !== null ||
-          (current.activeThreadId !== null && current.activeThreadId !== threadId) ||
-          !(link.role === "work"
-            ? current.workThreadId === threadId && ["todo", "working"].includes(current.stage)
-            : link.role === "review" &&
-              current.reviewThreadId === threadId &&
-              ["needs_review", "in_review"].includes(current.stage))
-        )
-          continue;
-        const by: KanbanActor = { _tag: "system", component: "dispatcher" };
-        const reason = `Run failed: ${startTimeout.reason}`;
-        const next = releaseToQueue(
-          { ...Retries.withoutRetries(current), stalled: { reason, by, at } },
-          at,
-        );
-        yield* logEvent(next, by, "flagged", {
-          fromStage: current.stage,
-          toStage: next.stage,
-          body: `${reason}\nRun: ${startTimeout.runId}`,
-        });
-        yield* saveCard(next);
-      }
-      yield* kick;
-      return;
-    }
+    if (startTimeout !== undefined)
+      return yield* finishStartTimeout(threadId, link, startTimeout, at);
     // Every board-thread turn end is announced, so the Threads view rereads the run
     // as finished even when the dispatcher leaves the card as it is (a worker that
     // moved to needs_owner, a one-shot evaluator, and so on).
@@ -9182,6 +9209,22 @@ const make = Effect.gen(function* () {
       return next;
     });
     const failure = lastFailure.success;
+    if (failure?.code === "restart_admission_timeout") {
+      if (failure.runId == null) {
+        yield* Ref.update(unresolvedTurnEnds, (all) => new Set(all).add(threadId));
+        return;
+      }
+      return yield* finishStartTimeout(
+        threadId,
+        link,
+        {
+          runId: failure.runId,
+          reason: failure.message,
+          restartAdmission: true,
+        },
+        at,
+      );
+    }
     if (fromTick && failure !== null && expectedFailedWorkRunId === undefined) {
       if (failure.runId == null) {
         yield* Ref.update(unresolvedTurnEnds, (all) => new Set(all).add(threadId));
@@ -13082,8 +13125,8 @@ const make = Effect.gen(function* () {
     } satisfies ClaimResult;
   });
 
-  const claimCard: KanbanServiceShape["claimCard"] = (threadId, cardId) =>
-    guard(
+  const claimCard: KanbanServiceShape["claimCard"] = (threadId, cardId) => {
+    const claim = guard(
       "card.claim",
       Effect.gen(function* () {
         const thread = yield* workThreadOf(threadId);
@@ -13092,6 +13135,8 @@ const make = Effect.gen(function* () {
         return yield* takeCard(threadId, thread.pool, card, "Taken by its work thread");
       }),
     );
+    return reconcileRunFailure(threadId).pipe(Effect.andThen(claim));
+  };
 
   // The card is checked as a draft first, so a refused take leaves nothing
   // behind for the dispatcher to start twice.
@@ -14410,8 +14455,8 @@ const make = Effect.gen(function* () {
       cardId,
     );
 
-  const flagCard: KanbanServiceShape["flagCard"] = (cardId, reason, actor) =>
-    savedCardGuard(
+  const flagCard: KanbanServiceShape["flagCard"] = (cardId, reason, actor) => {
+    const write = savedCardGuard(
       "card.flag",
       Effect.gen(function* () {
         yield* checkText([["reason", reason]]);
@@ -14470,6 +14515,10 @@ const make = Effect.gen(function* () {
         return next;
       }),
     );
+    return (
+      actor._tag === "thread" && reason === null ? reconcileRunFailure(actor.threadId) : Effect.void
+    ).pipe(Effect.andThen(write));
+  };
 
   const activeWaitThreadRunning = Effect.fn("KanbanService.activeWaitThreadRunning")(function* (
     card: KanbanCard,
@@ -16808,6 +16857,65 @@ const make = Effect.gen(function* () {
     );
   }, Effect.mapError(toKanbanError));
 
+  const reconcileRunFailure = Effect.fn("KanbanService.reconcileRunFailure")(function* (
+    threadId: ThreadId,
+  ) {
+    yield* Deferred.await(startupReady);
+    for (const id of yield* store.threadCards(threadId)) {
+      const initial = yield* store.card(id);
+      if (initial?.stalled?.runFailure?.threadId !== threadId) continue;
+      yield* guard(
+        "card.recoverRunFailure",
+        Effect.gen(function* () {
+          const card = yield* store.card(id);
+          const stalled = card?.stalled;
+          if (
+            card === null ||
+            stalled?.runFailure?.threadId !== threadId ||
+            stalled.by._tag !== "system" ||
+            stalled.by.component !== "dispatcher" ||
+            card.workThreadId !== threadId ||
+            card.stage !== "todo" ||
+            (card.activeThreadId !== null && card.activeThreadId !== threadId)
+          )
+            return;
+          const view = yield* freshThreads.find(threadId);
+          if (
+            view?.runId == null ||
+            view.runId === stalled.runFailure.runId ||
+            view.runStartedAt === null ||
+            view.state === "idle"
+          )
+            return;
+          const model = yield* freshThreads.model(threadId);
+          const at = yield* nowIso;
+          const next: KanbanCard = {
+            ...card,
+            stalled: null,
+            stage: "working",
+            activeThreadId: threadId,
+            activeRole: "work",
+            activePool: Rules.poolOf(yield* store.pools(card.boardId), model ?? card.model),
+            nudgedAt: null,
+            movedAt: at,
+            updatedAt: at,
+          };
+          yield* logEvent(next, { _tag: "system", component: "dispatcher" }, "flagged", {
+            fromStage: card.stage,
+            toStage: "working",
+            body: `Cleared run-failed stall: work resumed in ${view.runId}`,
+          });
+          yield* saveCard(next);
+          yield* Effect.logInfo("restart-pacing.stall_auto_cleared", {
+            cardId: id,
+            threadId,
+            runId: view.runId,
+          });
+        }),
+        id,
+      );
+    }
+  }, Effect.mapError(toKanbanError));
   return KanbanService.of({
     ready: Deferred.await(startupReady),
     boards: readDb(store.boards),
@@ -17263,6 +17371,7 @@ const make = Effect.gen(function* () {
         Effect.gen(function* () {
           const link = yield* store.threadLink(threadId);
           if (!link) return;
+          if (link.role === "work") yield* reconcileRunFailure(threadId);
           const view = yield* threads.view(threadId);
           if (!view) return;
           yield* publish(link.boardId, {

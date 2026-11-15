@@ -199,8 +199,10 @@ export interface KanbanThreadsShape {
     threadId: ThreadId,
     model: ModelSelection,
   ) => Effect.Effect<void, KanbanThreadError>;
+  /** Include live runs when a successor check needs one projection snapshot. */
   readonly queuedRuns: (
     threadId: ThreadId,
+    includeActive?: boolean,
   ) => Effect.Effect<ReadonlyArray<OrchestrationV2Run>, KanbanThreadError>;
   /** Cancels only this queued brief; false means it may already be acting. */
   readonly cancelQueued: (
@@ -888,9 +890,11 @@ const make = Effect.gen(function* () {
   );
 
   const queuedRuns: KanbanThreadsShape["queuedRuns"] = Effect.fn("KanbanThreads.queuedRuns")(
-    function* (threadId) {
+    function* (threadId, includeActive = false) {
       return (yield* threads.getThreadRecords(threadId, ["runs"])).runs.filter(
-        (run) => run.status === "queued",
+        (run) =>
+          run.status === "queued" ||
+          (includeActive && ["preparing", "starting", "running", "waiting"].includes(run.status)),
       );
     },
     Effect.mapError(

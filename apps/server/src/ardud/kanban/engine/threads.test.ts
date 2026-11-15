@@ -15,6 +15,7 @@ import {
   RunId,
   RuntimeRequestId,
   NodeId,
+  type OrchestrationV2Run,
   type OrchestrationV2RuntimeRequest,
   type OrchestrationV2TurnItem,
   ThreadId,
@@ -1968,4 +1969,49 @@ it.effect("claimContext loads only caller identity, without thread shell or run 
       ),
     );
   }),
+);
+
+it.effect.each([false, true])(
+  "successor reads queued and live statuses from one run snapshot: includeActive=%s",
+  (includeActive) => {
+    const statuses = [
+      "queued",
+      "preparing",
+      "starting",
+      "running",
+      "waiting",
+      "completed",
+      "failed",
+      "cancelled",
+      "interrupted",
+    ] as const;
+    const runs = statuses.map((status) => ({
+      id: RunId.make(`run:${status}`),
+      status,
+    })) as OrchestrationV2Run[];
+    let reads = 0;
+    const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+      getThreadRecords: () =>
+        Effect.sync(() => {
+          reads++;
+          return { runs } as never;
+        }),
+    });
+    return Effect.gen(function* () {
+      const threads = yield* KanbanThreads;
+      const found = yield* threads.queuedRuns(ThreadId.make("thread:successor"), includeActive);
+      expect(found.map((run) => run.status)).toEqual(
+        includeActive ? statuses.slice(0, 5) : ["queued"],
+      );
+      expect(reads).toBe(1);
+    }).pipe(
+      Effect.provide(
+        layer.pipe(
+          Layer.provide(management),
+          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+          Layer.provide(Sqlite.layerMemory),
+        ),
+      ),
+    );
+  },
 );
