@@ -157,6 +157,12 @@ const SubtasksInput = describe(
           "For a script's subtask: the name of the board script that does it. Left out on a new or edited entry, any script on the board can. An id alone keeps its stored binding; done and skipped subtasks keep theirs.",
         ),
       ),
+      holdsDependents: Schema.optional(
+        describe(
+          Schema.Boolean,
+          "true on the step that lands the work where dependents need it (merge, land, fast-forward, push): a Completed card's dependents wait until it's done. false: never holds. Left out: guessed from the text (merge/land/fast-forward).",
+        ),
+      ),
     }),
   ),
   `At most ${MAX_SUBTASKS} subtasks, each at most ${MAX_TEXT} characters. The card's plan, in order: the work, its review and everything after (merge, deploy, telling whoever asked, updating tickets, a read-back). Leave out steps that aren't needed. On card_edit it replaces the plan: list existing ids to keep them (an id alone keeps it unchanged; done and skipped ones can't be rewritten), add new entries without an id; open ones left out go, done ones stay.`,

@@ -834,6 +834,75 @@ it.effect(
   },
 );
 
+it.effect("card_create and card_edit round-trip subtask hold marks", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "holds",
+      name: "Holds",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    const store = yield* KanbanStore.KanbanStore;
+    yield* store.putScript(boardScript(board.id, "land"));
+    const evaluator = ThreadId.make("thread-evaluator");
+    const created = yield* call(evaluator, "card_create", {
+      prompt: "Ship the change",
+      title: "Ship the change",
+      description: "Landing",
+      subtasks: [
+        { text: "Ship it", owner: "evaluator", holdsDependents: true },
+        { text: "Merge later", owner: "script", script: "land", holdsDependents: false },
+      ],
+    });
+    assert.isFalse(created.isError, created.text);
+    const createdCard = created.structured.card as {
+      id: string;
+      subtasks: Array<{ holdsDependents?: boolean }>;
+    };
+    assert.deepStrictEqual(
+      createdCard.subtasks.map((s) => s.holdsDependents),
+      [true, false],
+    );
+    const edited = yield* call(evaluator, "card_edit", {
+      card: createdCard.id,
+      basedOn: (yield* kanban.card(KanbanCardId.make(createdCard.id))).card.updatedAt,
+      subtasks: [
+        { id: "s1", text: "Ship it", owner: "evaluator" },
+        { id: "s2", holdsDependents: true },
+        { text: "Land elsewhere", owner: "work", holdsDependents: false },
+      ],
+    });
+    assert.isFalse(edited.isError, edited.text);
+    assert.deepStrictEqual(
+      (yield* kanban.card(KanbanCardId.make(createdCard.id))).card.subtasks.map(
+        (s) => s.holdsDependents,
+      ),
+      [true, true, false],
+    );
+    assert.strictEqual(
+      (yield* kanban.card(KanbanCardId.make(createdCard.id))).card.subtasks[1]?.script,
+      "land",
+    );
+    const overridden = yield* call(evaluator, "card_edit", {
+      card: createdCard.id,
+      basedOn: (yield* kanban.card(KanbanCardId.make(createdCard.id))).card.updatedAt,
+      subtasks: [
+        { id: "s1", text: "Ship it", owner: "evaluator", holdsDependents: false },
+        { id: "s2", text: "Merge later", owner: "script" },
+        { id: "s3", text: "Land elsewhere", owner: "work" },
+      ],
+    });
+    assert.isFalse(overridden.isError, overridden.text);
+    assert.deepStrictEqual(
+      (yield* kanban.card(KanbanCardId.make(createdCard.id))).card.subtasks.map(
+        (s) => s.holdsDependents,
+      ),
+      [false, true, false],
+    );
+  }).pipe(Effect.provide(layer));
+});
+
 it.effect("card_edit reports control characters to an evaluator", () => {
   const { layer } = fakeThreads();
   return Effect.gen(function* () {
