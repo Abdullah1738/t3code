@@ -8,6 +8,7 @@ the email", 24 Oct). Only a charge none of these explain goes to him.
 import contextvars
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeout
 import datetime as dt
+from email.utils import parseaddr
 from decimal import Decimal, InvalidOperation
 import importlib.util
 import hashlib
@@ -941,11 +942,77 @@ def receipt_window(at, now, named):
     return at - before, min(min(now, at + after) + dt.timedelta(minutes=1), at + WAIT)
 
 
+def receipt_variant(charge):
+    if charge['currency'] != 'AED':
+        return None
+    name = words(charge['merchant'])
+    if name == ['uber'] and charge.get('pending'):
+        return 'uber'
+    if name in (['boat', 'dev'], ['browser', 'use']):
+        return 'usd'
+    return None
+
+
+def labelled_money(text, label, currency):
+    number = r'(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?(?![\d.,])'
+    signs = '|'.join([rf'\b{currency}\b'] + [re.escape(s) for s in SYMBOLS[currency]])
+    pattern = rf'\b{label}\b\s*:?\s*(?:(?:{signs})\s*({number})|({number})\s*(?:{signs}))'
+    return {Decimal((m[1] or m[2]).replace(',', '')) for m in re.finditer(pattern, text, re.I)}
+
+
+def alternate_receipt(charge, at, now, row, text):
+    variant = receipt_variant(charge)
+    if not variant or not RECEIPT_WORDS.search(text):
+        return False
+    # These bank descriptors were verified against branded receipts, not arbitrary
+    # mentions of generic descriptor words such as "dev", "browser" or "use".
+    brand = r'\buber\b' if variant == 'uber' else \
+        r'\bboat(?:\.dev)?\b' if words(charge['merchant']) == ['boat', 'dev'] else r'\bbrowser[\s-]+use\b'
+    if not re.search(brand, text, re.I) or not re.search(brand, str(row.get('sender') or ''), re.I):
+        return False
+    if variant == 'usd' and not re.fullmatch(brand + r'(?:\s+Inc\.?)?',
+                                            parseaddr(str(row.get('sender') or ''))[0].strip(), re.I):
+        return False
+    received = dt.datetime.fromtimestamp(row.get('ts') or 0, TZ)
+    start, end = receipt_window(at, now, True)
+    if not start <= received <= end:
+        return False
+    amount = Decimal(charge['amount'])
+    if amount <= 0:
+        return False
+    if variant == 'usd':
+        paid = labelled_money(text, 'amount paid', 'USD')
+        if len(paid) != 1 or next(iter(paid)) <= 0:
+            return False
+        # Both observed AED 190.47 charges have USD 50 receipts: the AED peg
+        # plus 3.7% bank markup. Only these verified merchants use the 0–4% band.
+        base = next(iter(paid)) * Decimal('3.6725')
+        return base.quantize(Decimal('.01')) <= amount <= (base * Decimal('1.04')).quantize(Decimal('.01'))
+    domain = parseaddr(str(row.get('sender_addr') or row.get('sender') or ''))[1].rpartition('@')[2].lower()
+    if domain != 'uber.com' and not domain.endswith('.uber.com'):
+        return False
+    if not at <= received <= min(now + dt.timedelta(minutes=1), at + dt.timedelta(hours=2)):
+        return False
+    totals = labelled_money(text, 'total', 'AED')
+    waits = labelled_money(text, 'wait time', 'AED')
+    if len(totals) != 1 or len(waits) > 1:
+        return False
+    total = next(iter(totals))
+    candidates = {total}
+    # Two holds equal the final total before its explicitly itemized wait-time
+    # fee; a third differs by AED 0.09. Do not tolerate an arbitrary fare change.
+    if waits and 0 <= next(iter(waits)) < total:
+        candidates.add(total - next(iter(waits)))
+    tolerance = min(Decimal('1.00'), amount * Decimal('.01'))
+    return any(abs(amount - candidate) <= tolerance for candidate in candidates)
+
+
 def receipt(charge, at, now, find=None, deadline=None, read=None, memo=None, stats=None, receipt_ok=None):
     """The receipt or order mail for a charge. It shows the amount as money in the charge's currency
     and reads as a receipt, and either names the merchant (from two hours before to 36 hours after) or,
     under another name, shows the card's last four digits within 15 minutes of it. Search hits are
-    checked against the mail itself."""
+    checked against the mail itself. Verified pending-hold and USD conversion variants
+    additionally require a branded receipt and the bounded amount proof above."""
     options = {}
     if memo is not None:
         options['memo'] = memo
@@ -964,11 +1031,21 @@ def receipt(charge, at, now, find=None, deadline=None, read=None, memo=None, sta
     if names:
         # Questions can remain unanswered indefinitely; a later recurring purchase's receipt
         # must not explain them merely because its merchant and amount happen to repeat.
+        variant = receipt_variant(charge)
+        exact = lambda row, text: money.search(text) and named.search(text) and RECEIPT_WORDS.search(text)
+        if variant:
+            # Generic "dev"/"use" words and later trips exhaust the read cap.
+            # Find the verified brand in its own window without the alert amount.
+            query = '"uber"' if variant == 'uber' else '"boat"' if names == ['boat', 'dev'] else '"browser use"'
+            window = (at, min(now + dt.timedelta(minutes=1), at + dt.timedelta(hours=2))) \
+                if variant == 'uber' else receipt_window(at, now, True)
+            tries.append((query, *window, lambda row, text: exact(row, text)
+                          or alternate_receipt(charge, at, now, row, text)))
         named_query = ' OR '.join(f'"{w}"' for w in names)
-        tries.append(((named_query if integral else amount + ' ' + named_query), *receipt_window(at, now, True),
-                      lambda text: named.search(text) and RECEIPT_WORDS.search(text)))
+        tries.append(((named_query if integral else amount + ' ' + named_query),
+                      *receipt_window(at, now, True), exact))
     tries.append((f'"{charge["card"]}"' if integral else amount, *receipt_window(at, now, False),
-                  lambda text: card.search(text) and RECEIPT_WORDS.search(text)))
+                  lambda row, text: money.search(text) and card.search(text) and RECEIPT_WORDS.search(text)))
     reads, seen_bodies, incomplete = 0, set(), False
     for query, start, end, proves in tries:
         # Usage notices with the same amount and merchant can fill a page of hits, so the search goes
@@ -993,7 +1070,7 @@ def receipt(charge, at, now, find=None, deadline=None, read=None, memo=None, sta
                 raise Lookup('receipt scan incomplete: read limit reached')
             reads += 1
             seen_bodies.add(key)
-            if money.search(text) and proves(text):
+            if proves(row, text):
                 if receipt_ok is None or receipt_ok(row, text):
                     return row
                 # Identical receipt bodies can be sent for separate transactions. A rejected

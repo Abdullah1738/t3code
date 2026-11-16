@@ -4810,5 +4810,40 @@ class PaymentDeadlines(Base):
         self.assertEqual(parent['payment_case'], bank)
 
 
+class ReceiptVariantCompetition(unittest.TestCase):
+    def test_different_amounts_cannot_share_a_variant_receipt(self):
+        observed = at('2026-11-12T12:00')
+        forms = [
+            ('UBER * PENDING', '201.03', True, '200.94', False,
+             'Uber <receipts@uber.com>', 'Uber receipt\nTotal AED 200.94', False),
+            ('UBER * PENDING', '201.03', True, '201.00', True,
+             'Uber <receipts@uber.com>', 'Uber receipt\nTotal AED 200.94', False),
+            ('BOAT.DEV', '190.47', False, '190.90', False,
+             'Boat <receipts@stripe.example>', 'Boat receipt\nAmount paid $50.00', False),
+            ('UBER * PENDING', '201.03', True, '200.94', True,
+             'Uber <receipts@uber.com>', 'Uber receipt\nTotal AED 200.94', True),
+        ]
+        for merchant, amount, pending, rival_amount, rival_pending, sender, text, bound in forms:
+            current = dict(id='q-current', kind='charge', currency='AED', card='1111',
+                           merchant=merchant, amount=amount, pending=pending, at=mc.stamp(observed))
+            rival = dict(current, id='q-rival', amount=rival_amount, pending=rival_pending,
+                         at=mc.stamp(observed + dt.timedelta(minutes=1)))
+            if bound:
+                rival.update(status='closed', explanation={'msgs': 7})
+            row = dict(id=7, ts=(observed + dt.timedelta(minutes=45)).timestamp(),
+                       sender=sender, subject='Receipt')
+            for known in [False, True]:
+                with self.subTest(merchant=merchant, rival=rival_amount, known=known):
+                    questions = [current, rival] if known else [rival]
+                    accepts = mc.receipt_for_question(None, current, 'q-current' if known else None,
+                                                     questions, observed)
+                    self.assertFalse(accepts(row, text))
+                    unrelated = dict(rival, merchant='Other', amount='999.00', pending=False)
+                    unrelated.pop('explanation', None)
+                    accepts = mc.receipt_for_question(None, current, 'q-current' if known else None,
+                                                     [unrelated], observed)
+                    self.assertTrue(accepts(row, text))
+
+
 if __name__ == '__main__':
     unittest.main()

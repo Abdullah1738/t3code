@@ -4,6 +4,7 @@ from collections import Counter
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import http.server
 import threading
@@ -342,7 +343,7 @@ class Finder:
     def split(query):
         # Groups are separated where two quoted terms meet without an OR between them.
         groups, cur, prev = [], [], None
-        for tok in query.split(' '):
+        for tok in re.findall(r'"[^"]*"|\S+', query):
             if tok == 'OR':
                 prev = 'OR'
                 continue
@@ -365,6 +366,133 @@ CHARGE = ch.parse('Purchase of EUR 12.34 with Credit Card ending 1111 at ACME * 
 
 def read(row, deadline=None):
     return f"{row.get('subject', '')}\n{row.get('body', '')}"
+
+
+class ReceiptVariants(unittest.TestCase):
+    def setUp(self):
+        for name, replacement in [('show', read), ('card_owner', lambda charge: 'abdullah')]:
+            mock = patch.object(ch, name, replacement)
+            mock.start()
+            self.addCleanup(mock.stop)
+
+    def explain(self, merchant, amount, body, sender, *, pending=False, minutes=30,
+                subject=None, receipt_ok=None):
+        charge = dict(CHARGE, merchant=merchant, currency='AED', amount=amount, pending=pending)
+        row = dict(id=7, ts=ts('2026-10-24T12:00') + minutes * 60, sender=sender,
+                   subject=subject or f'Your receipt from {merchant}', body=body)
+        return ch.explain(charge, at('2026-10-24T12:00'), at('2026-10-27T12:00'),
+                          find=Finder([row]), said=nobody, receipt_ok=receipt_ok)
+
+    def test_uber_pending_total_and_explicit_wait_fee(self):
+        for hold, total, wait in [('201.03', '200.94', None), ('77.45', '106.25', '28.80'),
+                                  ('73.46', '84.77', '11.31')]:
+            with self.subTest(hold=hold):
+                body = f'Uber receipt\nTotal AED {total}'
+                if wait:
+                    body += f'\nWait Time\n\nAED {wait}'
+                self.assertEqual(self.explain('UBER * PENDING', hold, body, 'Uber <receipts@uber.com>',
+                                             pending=True)['verdict'], 'receipt')
+
+    def test_uber_tolerance_is_one_percent_capped_at_one_dirham(self):
+        for hold, total, expected in [('100.00', '99.00', 'receipt'), ('100.00', '98.99', 'ask'),
+                                       ('50.00', '49.50', 'receipt'), ('50.00', '49.49', 'ask'),
+                                       ('201.03', '199.99', 'ask'), ('44.81', '80.48', 'ask')]:
+            with self.subTest(hold=hold, total=total):
+                self.assertEqual(self.explain('UBER * PENDING', hold, f'Uber receipt\nTotal AED {total}',
+                                             'Uber <receipts@uber.com>', pending=True)['verdict'], expected)
+
+    def test_uber_requires_pending_merchant_sender_window_and_total(self):
+        for changes in [dict(pending=False), dict(merchant='OTHER * PENDING'),
+                        dict(sender='Other <receipts@other.example>'),
+                        dict(sender='Uber <receipts@uber.com.other.example>'),
+                        dict(minutes=-1), dict(minutes=121), dict(body='Uber receipt\nFare AED 200.94'),
+                        dict(body='Uber receipt\nTotal AED 200.94\nTotal AED 50.00'),
+                        dict(body='Uber receipt\nTotal EUR 200.94')]:
+            with self.subTest(changes=changes):
+                options = dict(merchant='UBER * PENDING', amount='201.03', pending=True,
+                               body='Uber receipt\nTotal AED 200.94', sender='Uber <receipts@uber.com>')
+                self.assertEqual(self.explain(**{**options, **changes})['verdict'], 'ask')
+
+    def test_aed_usd_receipts_need_the_brand_and_plausible_paid_total(self):
+        for merchant, sender in [('BOAT.DEV', 'Boat <receipts@stripe.example>'),
+                                  ('BOAT.DEV', 'Boat.dev <receipts@stripe.example>'),
+                                  ('BROWSER USE INC', 'Browser Use <receipts@stripe.example>'),
+                                  ('BROWSER USE INC', 'Browser Use Inc. <receipts@stripe.example>')]:
+            for paid, expected in [('50.00', 'receipt'), ('25.00', 'ask'), ('100.00', 'ask')]:
+                with self.subTest(merchant=merchant, paid=paid):
+                    self.assertEqual(self.explain(merchant, '190.47', f'Amount paid ${paid}', sender,
+                                                 subject=f'Your receipt from {sender.split(" <")[0]}')['verdict'], expected)
+
+    def test_fx_never_uses_another_merchants_receipt_or_a_bare_number(self):
+        for body, sender, subject in [
+                ('Amount paid $50.00', 'Other <receipts@other.example>', 'Your receipt from Other'),
+                ('Boat plan $50.00', 'Boat <news@boat.example>', 'Boat upgrade'),
+                ('Boat invoice: total $50.00', 'Boat <receipts@stripe.example>', 'Boat invoice'),
+                ('Boat receipt: Amount paid 50.00', 'Boat <receipts@stripe.example>', 'Boat receipt'),
+                ('Boat receipt: Amount paid EUR 50.00', 'Boat <receipts@stripe.example>', 'Boat receipt'),
+                ('Boat receipt: Amount paid $50.00\nAmount paid $25.00', 'Boat <receipts@stripe.example>', 'Boat receipt'),
+                ('Browser invoice: use credits. Amount paid $50.00', 'Other <receipts@other.example>', 'Dev invoice'),
+                ('Boat receipt: Amount paid $50.00', 'Other <receipts@other.example>', 'Other receipt'),
+                ('Boat receipt: Amount paid $50.00', 'Other <receipts@other.example>', 'Receipt for Boat equipment'),
+                ('Boat receipt: Amount paid $50.00', 'Boat Tours <receipts@tours.example>', 'Boat Tours receipt'),
+        ]:
+            for merchant in ['BOAT.DEV', 'BROWSER USE INC']:
+                with self.subTest(merchant=merchant, body=body, subject=subject):
+                    self.assertEqual(self.explain(merchant, '190.47', body, sender, subject=subject)['verdict'], 'ask')
+
+    def test_usd_markup_edges_and_recurring_receipt_window(self):
+        for amount, minutes, expected in [('183.62', 30, 'receipt'), ('183.61', 30, 'ask'),
+                                          ('190.97', 30, 'receipt'), ('190.98', 30, 'ask'),
+                                          ('190.47', -121, 'ask'), ('190.47', 2161, 'ask')]:
+            with self.subTest(amount=amount, minutes=minutes):
+                self.assertEqual(self.explain('BOAT.DEV', amount, 'Amount paid $50.00',
+                                             'Boat <receipts@stripe.example>', minutes=minutes)['verdict'], expected)
+
+    def test_paid_amount_forms_are_currency_bound(self):
+        forms = [('Amount paid $50.00', '50'), ('Amount paid:\nUSD 50.00', '50'),
+                 ('Amount paid\n50.00 USD', '50'), ('Amount paid $1,234.50', '1234.50'),
+                 ('Amount paid $50', '50'), ('Amount paid $50.001', None),
+                 ('Amount paid -$50.00', None), ('Amount paid 50 items', None),
+                 ('Amount paid EUR 50.00', None)]
+        for text, expected in forms:
+            with self.subTest(text=text):
+                self.assertEqual(ch.labelled_money(text, 'amount paid', 'USD'),
+                                 {ch.Decimal(expected)} if expected else set())
+
+    def test_receipt_veto_and_source_errors_remain_closed(self):
+        self.assertEqual(self.explain('BOAT.DEV', '190.47', 'Amount paid $50.00',
+                                     'Boat <receipts@stripe.example>', receipt_ok=lambda *a: False)['verdict'], 'ask')
+        for name in ['show', 'search']:
+            with self.subTest(source=name), patch.object(ch, name, side_effect=ch.Lookup('unavailable')):
+                charge = dict(CHARGE, merchant='BOAT.DEV', currency='AED', amount='190.47', pending=False)
+                options = {} if name == 'search' else dict(find=Finder([
+                    dict(id=7, ts=ts('2026-10-24T12:30'), sender='Boat', body='Boat receipt Amount paid $50.00')]))
+                result = ch.explain(charge, at('2026-10-24T12:00'), at('2026-10-27T12:00'), said=nobody, **options)
+                self.assertEqual(result['verdict'], 'unverified')
+
+    def test_justlife_completion_without_priced_receipt_does_not_explain_a_charge(self):
+        self.assertEqual(self.explain('Justlife', '110.90', 'Justlife booking completed',
+                                     'Justlife <booking@justlife.example>', subject='Booking completed')['verdict'], 'ask')
+
+    def test_variant_searches_leave_the_read_budget_for_relevant_mail(self):
+        for merchant, amount, sender, body, pending in [
+                ('UBER * PENDING', '201.03', 'Uber <receipts@uber.com>', 'Uber receipt\nTotal AED 200.94', True),
+                ('BROWSER USE INC', '190.47', 'Browser Use <receipts@stripe.example>', 'Amount paid $50.00', False)]:
+            with self.subTest(merchant=merchant):
+                row = dict(id=7, ts=ts('2026-10-24T12:30'), sender=sender,
+                           subject=f'Your receipt from {merchant}', body=body)
+                noise = [dict(id=100 + i, ts=ts('2026-10-25T10:00') + i,
+                              sender=sender if pending else 'Other <news@other.example>',
+                              subject='Uber receipt' if pending else 'View in browser: use credits',
+                              body=f'Unrelated notice {i}') for i in range(20)]
+                charge = dict(CHARGE, merchant=merchant, currency='AED', amount=amount, pending=pending)
+                result = ch.explain(charge, at('2026-10-24T12:00'), at('2026-10-27T12:00'),
+                                    find=Finder(noise + [row]), said=nobody)
+                self.assertEqual(result['verdict'], 'receipt')
+
+    def test_a_later_exact_uber_receipt_keeps_the_existing_window(self):
+        self.assertEqual(self.explain('UBER * PENDING', '201.03', 'Uber receipt\nAED 201.03',
+                                     'Uber <receipts@uber.com>', pending=True, minutes=700)['verdict'], 'receipt')
 
 
 class Explain(unittest.TestCase):
