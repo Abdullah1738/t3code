@@ -12443,6 +12443,171 @@ const nudgesTo = (fake: Effect.Success<typeof makeFake>, threadId: string) =>
     ),
   );
 
+it.effect.each(["pr_watch", "quiet_not_due", "queued_run", "restart_hold", "self_wait"] as const)(
+  "#1757 idle decisions explain %s and are limited to one row per ten minutes",
+  (reason) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const events: AnalyticsEvent[] = [];
+      let queuedThread: ThreadId | undefined;
+      const wrapped = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (io) =>
+          KanbanThreads.of({
+            ...io,
+            queuedRuns: (threadId) =>
+              Effect.succeed(
+                threadId === queuedThread
+                  ? [
+                      {
+                        id: RunId.make("queued-successor"),
+                        threadId,
+                        ordinal: 2,
+                        providerInstanceId: ProviderInstanceId.make("opencode"),
+                        modelSelection: DEFAULT_CARD_MODEL,
+                        providerThreadId: null,
+                        userMessageId: MessageId.make("successor"),
+                        rootNodeId: null,
+                        activeAttemptId: null,
+                        status: "queued" as const,
+                        requestedAt: DateTime.makeUnsafe("2026-10-25T13:31:00.000Z"),
+                        startedAt: null,
+                        completedAt: null,
+                        checkpointId: null,
+                        contextHandoffId: null,
+                      },
+                    ]
+                  : [],
+              ),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      yield* Effect.gen(function* () {
+        const started = "2026-10-25T13:00:00.000Z";
+        yield* TestClock.setTime(Date.parse(started));
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        const card = yield* kanban.createCard(
+          board.id,
+          {
+            title: "Idle decision",
+            prompt: "Build",
+            subtasks: [{ owner: "work", step: 1, text: "Build" }],
+          },
+          owner,
+        );
+        yield* kanban.dispatchNow;
+        const working = (yield* kanban.card(card.id)).card;
+        const thread = working.activeThreadId!;
+        // .12 stored the handoff timestamp without a dispatcher event, as in #4497.
+        yield* store.putCard({ ...working, nudgedAt: started });
+        const worker = (yield* Ref.get(fake.threads)).get(thread)!;
+        worker.quietSince = started;
+        worker.prWatches = reason === "pr_watch" ? 1 : 0;
+        if (reason === "queued_run") queuedThread = thread;
+        if (reason === "restart_hold") worker.restartRecovery = { runId: "cut-run" };
+        if (reason === "self_wait") {
+          yield* store.putCard({
+            ...working,
+            nudgedAt: started,
+            wait: yield* decodeWait({
+              on: "time",
+              until: "2026-10-26T13:00:00.000Z",
+              at: started,
+              by: { _tag: "thread", threadId: thread },
+              note: "Waiting on a durable job",
+              wakeRole: "work",
+            }),
+          });
+        }
+        yield* TestClock.adjust(reason === "quiet_not_due" ? "1 minute" : "31 minutes");
+        for (let index = 0; index < 3; index++) yield* kanban.tick;
+        const rows = () =>
+          events.filter(
+            (event) => event.kind === "kanban.worker_idle_skip" && event.cardId === card.id,
+          );
+        assert.lengthOf(rows(), 1);
+        const persisted = yield* decodeAnalyticsEvent(rows()[0]);
+        assert.deepStrictEqual(persisted, rows()[0]);
+        assert.strictEqual(rows()[0]!.props?.reason, reason);
+        assert.strictEqual(rows()[0]!.boardId, board.id);
+        assert.strictEqual(rows()[0]!.props?.nudgedAt, started);
+        assert.strictEqual(rows()[0]!.props?.lastRunEndedAt, started);
+        assert.strictEqual(rows()[0]!.props?.quietDueAt, "2026-10-25T13:30:00.000Z");
+        assert.strictEqual(yield* nudgesTo(fake, thread), 0);
+        const after = (yield* kanban.card(card.id)).card;
+        assert.strictEqual(after.stage, reason === "self_wait" ? "todo" : "working");
+        if (reason !== "self_wait") {
+          yield* TestClock.adjust("9 minutes");
+          yield* kanban.tick;
+          assert.lengthOf(rows(), 1);
+          yield* TestClock.adjust("1 minute");
+          yield* kanban.tick;
+          assert.lengthOf(rows(), 2);
+        }
+      }).pipe(Effect.provide(evaluatorAnalyticsLayer(wrapped, events)));
+    }),
+);
+
+it.effect.each(["legacy handoff", "recorded handoff", "restart wake"] as const)(
+  "#1757 an idle worker with %s and an open step leaves Working once",
+  (origin) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const started = "2026-10-25T13:00:00.000Z";
+        yield* TestClock.setTime(Date.parse(started));
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        const card = yield* kanban.createCard(
+          board.id,
+          {
+            title: "Open worker step",
+            prompt: "Build",
+            subtasks: [{ owner: "work", step: 1, text: "Build" }],
+          },
+          owner,
+        );
+        yield* kanban.dispatchNow;
+        const working = (yield* kanban.card(card.id)).card;
+        yield* store.putCard({ ...working, nudgedAt: started });
+        if (origin !== "legacy handoff")
+          yield* store.addCardEvent({
+            cardId: card.id,
+            at: started,
+            actor: { _tag: "system", component: "dispatcher" },
+            kind: "thread",
+            fromStage: null,
+            toStage: null,
+            head: null,
+            body:
+              origin === "recorded handoff"
+                ? Rules.WORKER_NUDGE_EVENT
+                : "System restart recovery wake",
+          });
+        yield* TestClock.adjust("31 minutes");
+        yield* kanban.tick;
+        const after = yield* kanban.card(card.id);
+        assert.strictEqual(after.card.stage, "todo");
+        assert.isNull(after.card.activeThreadId);
+        assert.lengthOf(
+          after.events.filter(
+            (event) => event.kind === "moved" && event.body === "Work thread idle; slot freed",
+          ),
+          1,
+        );
+        // A later tick may dispatch the returned card again; it must not release it twice.
+        yield* kanban.tick;
+        assert.lengthOf(
+          (yield* kanban.card(card.id)).events.filter(
+            (event) => event.kind === "moved" && event.body === "Work thread idle; slot freed",
+          ),
+          1,
+        );
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
 const evaluatorNotesFor = (fake: Effect.Success<typeof makeFake>, text: string) =>
   Ref.get(fake.threads).pipe(
     Effect.map(

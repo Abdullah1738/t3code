@@ -23,6 +23,33 @@ const decodeEvent = Schema.decodeUnknownSync(AnalyticsEvent);
 const decodeRead = Schema.decodeUnknownSync(AnalyticsReadInput);
 const decodeRunUsage = Schema.decodeUnknownSync(RunUsageEvent, { onExcessProperty: "error" });
 describe("analytics ingest contract", () => {
+  it.each([event.ts, null])("preserves worker idle decision timestamps (%s)", (at) => {
+    const input = {
+      ...event,
+      kind: "kanban.worker_idle_skip",
+      surface: "server",
+      route: "kanban",
+      boardId: "board-crpko",
+      cardId: "card-4497",
+      props: {
+        board: "board-crpko",
+        reason: "pr_watch",
+        nudgedAt: at,
+        lastRunEndedAt: at,
+        quietDueAt: at,
+        holdUntil: at,
+        prWatches: 1,
+      },
+    };
+    const strict = Schema.decodeUnknownSync(AnalyticsEvent, { onExcessProperty: "error" });
+    expect(strict(input)).toEqual(input);
+    expect(() =>
+      strict({
+        ...input,
+        props: { ...input.props, quietDueAt: "tomorrow" },
+      }),
+    ).toThrow();
+  });
   it("preserves typed board metadata and excludes text", () => {
     const input = {
       ...event,
