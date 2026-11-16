@@ -621,6 +621,7 @@ const make = Effect.gen(function* () {
       readonly requestedAt: bigint;
       readonly reason: string;
       readonly onArrival: (requestedAt: bigint) => Effect.Effect<void>;
+      generation: number;
     }
   >();
   const pendingDelegations = yield* Ref.make<ReadonlyMap<CommandId, number>>(new Map());
@@ -661,7 +662,7 @@ const make = Effect.gen(function* () {
           // The limit spans keys. Check and insert without yielding, and never
           // evict an acknowledged cancel while its create can still land.
           if (cancelsOnArrival.size >= 500) return "capacity" as const;
-          cancelsOnArrival.set(commandId, { ...input, requestedAt });
+          cancelsOnArrival.set(commandId, { ...input, requestedAt, generation: 0 });
           return "cancel_pending" as const;
         });
       }),
@@ -1142,11 +1143,13 @@ const make = Effect.gen(function* () {
                   return next;
                 });
                 const requested = cancelsOnArrival.get(command.commandId);
+                if (requested === undefined) return undefined;
                 if (exit._tag === "Success") cancelsOnArrival.delete(command.commandId);
-                return requested;
+                return { requested, generation: ++requested.generation };
               }),
             );
             if (cancel !== undefined) {
+              const { requested, generation } = cancel;
               // Do not inherit the caller's foreground SQLite lane. Cancellation
               // runs after commit and outside both locks, and cannot fail create.
               const followUp = Effect.gen(function* () {
@@ -1157,27 +1160,32 @@ const make = Effect.gen(function* () {
                   const committed = yield* delegationDispatchLock.withLock(
                     command.commandId,
                     Effect.gen(function* () {
-                      if (cancelsOnArrival.get(command.commandId) !== cancel) return false;
+                      if (cancelsOnArrival.get(command.commandId) !== requested) return false;
                       if (Option.isSome(receipt) && receipt.value.status === "accepted") {
                         cancelsOnArrival.delete(command.commandId);
                         return true;
                       }
-                      // A queued same-id retry still owns this cancellation.
-                      if (!(yield* Ref.get(pendingDelegations)).has(command.commandId))
+                      // A missing receipt can predate a retry's masked commit.
+                      // Only the latest settlement may discard this cancel;
+                      // a pending retry will reconcile its own receipt on exit.
+                      if (
+                        requested.generation === generation &&
+                        !(yield* Ref.get(pendingDelegations)).has(command.commandId)
+                      )
                         cancelsOnArrival.delete(command.commandId);
                       return false;
                     }),
                   );
                   if (!committed) return;
                 }
-                yield* cancel.onArrival(cancel.requestedAt);
+                yield* requested.onArrival(requested.requestedAt);
               });
               yield* followUp.pipe(
                 NodeSqliteClient.backgroundReads,
                 Effect.catchCause((cause) =>
                   Effect.logWarning("delegated task cancellation on arrival failed", {
                     commandId: command.commandId,
-                    reason: cancel.reason,
+                    reason: requested.reason,
                     cause,
                   }),
                 ),
