@@ -59,6 +59,14 @@ export class McpCall extends Context.Service<
       readonly build: string;
       readonly bootId: string;
     };
+    threadList?: {
+      phase: "caller" | "project" | "candidates" | "shell" | "render";
+      batchCount: number;
+      candidateRows: number;
+      elapsedMs: number;
+      readerWaitMs: number;
+      queryMs: number;
+    };
     threadRead?: {
       readerWaitMs: number;
       queryMs: number;
@@ -129,6 +137,7 @@ const BOARD_BUSY =
 const TYPED_OUTCOMES = {
   TimeoutError: "timeout",
   ThreadReadTimeoutError: "timeout",
+  WikiReadTimeoutError: "timeout",
   PullRequestWatchTimeoutError: "timeout",
   PullRequestWatchUnavailableError: "refused",
   PullRequestToolTimeoutError: "timeout",
@@ -388,7 +397,8 @@ export function callOutcome(
         : content;
   const classified = classifyFailure(error);
   // The boundary deadline wins over a detached handler's cancellation/cleanup failure.
-  const readTimeout = classified?.tag === "ThreadReadTimeoutError";
+  const readTimeout =
+    classified?.tag === "ThreadReadTimeoutError" || classified?.tag === "WikiReadTimeoutError";
   const code = readTimeout ? classified.tag : (state.handlerErrorTag ?? classified?.tag);
   const typedOutcome = readTimeout
     ? classified.outcome

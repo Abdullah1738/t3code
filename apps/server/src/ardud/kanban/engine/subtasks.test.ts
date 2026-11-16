@@ -7,7 +7,9 @@ import {
   kanbanStepSubtasks,
   type KanbanOwnerAsk,
   type KanbanSubtask,
+  type KanbanCardEvent,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
@@ -21,6 +23,7 @@ import {
   markSubtask,
   PACKET_SUBTASK,
   passReview,
+  reviewRoundStartedAt,
   planSubtasks,
   pendingWakeNote,
   subtaskLines,
@@ -1701,8 +1704,13 @@ describe("planSubtasks", () => {
   it("refuses unknown or repeated ids and empty text", () => {
     expect(planSubtasks([], [{ id: "s9" }])).toMatchObject({
       ok: false,
-      denyReason: "subtask_not_found",
-      reason: "the card has no subtask s9. Existing subtask ids: none",
+      denyReason: "invalid_args",
+      reason: "a new subtask needs text and owner",
+    });
+    expect(planSubtasks([], [{ id: "s9", text: "x" }])).toMatchObject({
+      ok: false,
+      denyReason: "invalid_args",
+      reason: "a new subtask needs text and owner",
     });
     const subtasks = planned();
     expect(planSubtasks(subtasks, [{ id: "s1" }, { id: "s1" }])).toMatchObject({
@@ -1710,7 +1718,141 @@ describe("planSubtasks", () => {
       denyReason: "invalid_args",
       reason: "subtask s1 is listed twice",
     });
+    expect(
+      planSubtasks(
+        [],
+        [
+          { id: "s5", text: "a", owner: "work" },
+          { id: "s5", text: "b", owner: "work" },
+        ],
+      ),
+    ).toMatchObject({
+      ok: false,
+      denyReason: "invalid_args",
+      reason: "subtask s5 is listed twice",
+    });
+    // A numbered entry and a later explicit one cannot both take the same id.
+    expect(
+      planSubtasks(
+        [],
+        [
+          { text: "a", owner: "work" },
+          { id: "s1", text: "b", owner: "work" },
+        ],
+      ),
+    ).toMatchObject({
+      ok: false,
+      denyReason: "invalid_args",
+      reason: "subtask s1 is listed twice",
+    });
     expect(planSubtasks([], [{ text: "  ", owner: "work" }])).toMatchObject({ ok: false });
+  });
+
+  it.each(["foo", "S1", "s0", "s01", "s 1", "s", "1", "s1x"])(
+    "refuses %j as a subtask id",
+    (id) => {
+      expect(planSubtasks([], [{ id, text: "x", owner: "work" }])).toEqual({
+        ok: false,
+        denyReason: "invalid_args",
+        reason: `"${id}" is not a subtask id; use s1, s2, ...`,
+      });
+    },
+  );
+
+  it("takes an explicit s<N> id for a new subtask and moves the counter past it", () => {
+    expect(planSubtasks([], [{ id: "s9", text: "x", owner: "work" }], 0, at)).toEqual({
+      ok: true,
+      subtasks: [
+        {
+          id: "s9",
+          step: 1,
+          text: "x",
+          owner: "work",
+          createdAt: at,
+          state: "open",
+          note: null,
+          doneBy: null,
+          doneAt: null,
+        },
+      ],
+      subtaskSeq: 9,
+    });
+    // The reported create call: an s1 the card does not have yet.
+    const first = planSubtasks([], [{ id: "s1", text: "one", owner: "work" }], 0, at);
+    if (!first.ok) throw new Error(first.reason);
+    expect(first.subtasks.map((subtask) => [subtask.id, subtask.step])).toEqual([["s1", 1]]);
+    expect(first.subtaskSeq).toBe(1);
+    // Later entries without an id take the numbers after the explicit one.
+    const mixed = planSubtasks(
+      [],
+      [
+        { id: "s3", text: "three", owner: "work" },
+        { text: "four", owner: "work" },
+      ],
+      0,
+      at,
+    );
+    if (!mixed.ok) throw new Error(mixed.reason);
+    expect(mixed.subtasks.map((subtask) => [subtask.id, subtask.step, subtask.text])).toEqual([
+      ["s3", 1, "three"],
+      ["s4", 2, "four"],
+    ]);
+    expect(mixed.subtaskSeq).toBe(4);
+    // A number below the card's counter keeps the counter where it is.
+    const low = planSubtasks([], [{ id: "s2", text: "two", owner: "work" }], 9, at);
+    if (!low.ok) throw new Error(low.reason);
+    expect(low.subtaskSeq).toBe(9);
+  });
+
+  it("keeps known ids' state, step and history while adding an explicit new one", () => {
+    const done = markSubtask(planned(), "s2", "done", "PR #4", owner, at);
+    const plan = planSubtasks(
+      done,
+      [
+        { id: "s1" },
+        { id: "s2", text: "Review" },
+        { id: "s3" },
+        { id: "s4" },
+        { id: "s5" },
+        { id: "s6" },
+        { id: "s9", text: "Extra check", owner: "evaluator" },
+      ],
+      done.length,
+      at,
+    );
+    if (!plan.ok) throw new Error(plan.reason);
+    expect(plan.subtasks.map((subtask) => [subtask.id, subtask.state, subtask.text])).toEqual([
+      ["s1", "open", "Write the PR"],
+      ["s2", "done", "Review"],
+      ["s3", "open", "Merge and deploy"],
+      ["s4", "open", "Tell the reporter"],
+      ["s5", "open", "Update linked tickets"],
+      ["s6", "open", "Read back"],
+      ["s9", "open", "Extra check"],
+    ]);
+    expect(plan.subtaskSeq).toBe(9);
+  });
+
+  it("still needs an existing id to clear a gate", () => {
+    expect(
+      planSubtasks(
+        [],
+        [
+          {
+            id: "s9",
+            text: "x",
+            owner: "evaluator",
+            clearGate: "the guessed gate is wrong here",
+          },
+        ],
+        0,
+        at,
+      ),
+    ).toEqual({
+      ok: false,
+      denyReason: "invalid_args",
+      reason: "clearGate needs an existing subtask id",
+    });
   });
 });
 
@@ -2191,6 +2333,94 @@ describe("subtask ids stay unique for the life of a card", () => {
   });
 });
 
+describe("review round start", () => {
+  const dispatch = { kind: "moved", toStage: "in_review", body: null } as const;
+  const clear = { kind: "review", toStage: "needs_review", body: "clear" } as const;
+  const flagged = { kind: "flagged", toStage: "needs_review", body: "Need context" } as const;
+  const paused = { kind: "moved", toStage: "needs_owner", body: null } as const;
+  const findings = { kind: "review", toStage: "todo", body: "Fix it" } as const;
+  const finished = { kind: "review", toStage: "completed", body: "clear" } as const;
+  const work = { kind: "moved", toStage: "working", body: null } as const;
+  const events = (entries: ReadonlyArray<Pick<KanbanCardEvent, "kind" | "toStage" | "body">>) =>
+    entries.map((entry, index) => ({
+      ...entry,
+      id: index,
+      cardId: KanbanCardId.make("round-start"),
+      at: DateTime.formatIso(DateTime.makeUnsafe(Date.parse(at) + index * 1000)),
+      actor: owner,
+      fromStage: null,
+      head: null,
+    }));
+
+  it.each([
+    { label: "first reviewer", step: 0, history: [dispatch], start: 0 },
+    { label: "second reviewer", step: 1, history: [dispatch, clear, dispatch], start: 0 },
+    {
+      label: "third reviewer",
+      step: 2,
+      history: [dispatch, clear, dispatch, clear, dispatch],
+      start: 0,
+    },
+    {
+      label: "retry before a clear",
+      step: 1,
+      history: [dispatch, flagged, dispatch, clear, dispatch],
+      start: 0,
+    },
+    {
+      label: "retry after a clear",
+      step: 1,
+      history: [dispatch, clear, dispatch, flagged, dispatch],
+      start: 0,
+    },
+    { label: "late verdict", step: 1, history: [dispatch, clear, dispatch, flagged], start: 0 },
+    { label: "owner pause", step: 1, history: [dispatch, clear, paused, dispatch], start: 0 },
+    {
+      label: "new round after findings",
+      step: 0,
+      history: [dispatch, findings, dispatch],
+      start: 2,
+    },
+    {
+      label: "new round after final clear",
+      step: 0,
+      history: [dispatch, finished, dispatch],
+      start: 2,
+    },
+    {
+      label: "new round after clear waiting for PRs",
+      step: 0,
+      history: [dispatch, { ...finished, toStage: "in_review" }, dispatch],
+      start: 2,
+    },
+    {
+      label: "new round after clear returning to work",
+      step: 0,
+      history: [dispatch, { ...finished, toStage: "todo" }, dispatch],
+      start: 2,
+    },
+    {
+      label: "new round after work",
+      step: 0,
+      history: [dispatch, clear, work, dispatch],
+      start: 3,
+    },
+    {
+      label: "second reviewer of new round",
+      step: 1,
+      history: [dispatch, findings, dispatch, clear, dispatch],
+      start: 2,
+    },
+    { label: "incomplete chain history", step: 1, history: [dispatch], start: undefined },
+    { label: "missing dispatch history", step: 0, history: [], start: undefined },
+  ] as const)("#1729 keeps the whole round's anchor: $label", ({ step, history, start }) => {
+    const recorded = events(history);
+    expect(reviewRoundStartedAt(recorded, step)).toBe(
+      start === undefined ? undefined : recorded[start]?.at,
+    );
+  });
+});
+
 describe("marking subtasks", () => {
   it.each(["work", "evaluator", "script"] as const)(
     "passes the first open review step behind an unfinished %s step",
@@ -2205,7 +2435,7 @@ describe("marking subtasks", () => {
         ],
       );
       if (!plan.ok) throw new Error(plan.reason);
-      const subtasks = passReview({ subtasks: plan.subtasks }, owner, at);
+      const subtasks = passReview({ subtasks: plan.subtasks }, owner, at, at);
       expect(subtasks.map((subtask) => subtask.state)).toEqual(["open", "done", "done", "open"]);
       expect(workAfterReview({ subtasks })).toBe(firstOwner === "work");
       const finishedEarlier = markSubtask(subtasks, "s1", "done", null, owner, at);
@@ -2217,6 +2447,76 @@ describe("marking subtasks", () => {
     const subtasks = planned().filter((subtask) => subtask.owner !== "review");
     expect(passReview({ subtasks }, owner, at)).toEqual(subtasks);
   });
+
+  it.each(["open", "done", "skipped"] as const)(
+    "#1729 keeps future work's review open when an earlier evaluator task is %s during review",
+    (state) => {
+      const plan = planSubtasks(
+        [],
+        [
+          { text: "Version bump", owner: "work", step: 1 },
+          { text: "Merge bump", owner: "evaluator", step: 2 },
+          { text: "Write notes", owner: "work", step: 3 },
+          { text: "Review notes", owner: "review", step: 4 },
+          { text: "Land notes", owner: "evaluator", step: 5 },
+        ],
+      );
+      if (!plan.ok) throw new Error(plan.reason);
+      const startedAt = "2026-10-26T12:01:00.000Z";
+      const verdictAt = "2026-10-26T12:03:00.000Z";
+      const before = markSubtask(plan.subtasks, "s1", "done", null, owner, at);
+      const subtasks =
+        state === "open"
+          ? before
+          : markSubtask(before, "s2", state, "Handled", owner, "2026-10-26T12:02:00.000Z");
+      expect(passReview({ subtasks }, owner, verdictAt, startedAt)).toEqual(subtasks);
+      if (state !== "open") {
+        expect(passReview({ subtasks }, owner, verdictAt)[3]?.state).toBe("done");
+      }
+    },
+  );
+
+  it.each(["done", "skipped"] as const)(
+    "#1729 treats future work marked %s during review as still open for that verdict",
+    (state) => {
+      const plan = planSubtasks(
+        [],
+        [
+          { text: "Earlier evaluator task", owner: "evaluator", step: 1 },
+          { text: "Future work", owner: "work", step: 2 },
+          { text: "Future review", owner: "review", step: 3 },
+        ],
+      );
+      if (!plan.ok) throw new Error(plan.reason);
+      const subtasks = markSubtask(plan.subtasks, "s2", state, "Handled", owner, at);
+      expect(passReview({ subtasks }, owner, at, "2026-10-26T11:59:00.000Z")).toEqual(subtasks);
+    },
+  );
+
+  it.each(["2026-10-26T12:00:00.000Z", "2026-10-26T12:01:00.000Z"])(
+    "#1729 counts tasks finished before or at review start %s as done",
+    (startedAt) => {
+      const plan = planSubtasks(
+        [],
+        [
+          { text: "First work", owner: "work", step: 1 },
+          { text: "Second work", owner: "work", step: 2 },
+          { text: "Review", owner: "review", step: 3 },
+        ],
+      );
+      if (!plan.ok) throw new Error(plan.reason);
+      const subtasks = markSubtask(
+        markSubtask(plan.subtasks, "s1", "done", null, owner, at),
+        "s2",
+        "done",
+        null,
+        owner,
+        at,
+      );
+      const passed = passReview({ subtasks }, owner, "2026-10-26T12:03:00.000Z", startedAt);
+      expect(passed.map((subtask) => subtask.state)).toEqual(["done", "done", "done"]);
+    },
+  );
 
   it.each(["open", "done", "skipped"] as const)(
     "a later worker step that is %s bounds which review can pass",
@@ -3346,6 +3646,10 @@ describe("interrupting release pacing", () => {
     else {
       expect(problem).toContain("card #2 s1 (interrupting) is inside the 4 h release window");
       expect(problem).toContain("last release #1 at 12:00Z, next window 16:00Z");
+      expect(problem).toContain('write "critical: <reason>" in the done note to override');
+      expect(problem).toContain(
+        '; if this step records release #1 that already happened, tick it with releasedAt: "2026-10-26T12:00:00.000Z" (or the real restart time); it is recorded then and starts no new window',
+      );
     }
   });
   it.each(["2026-10-26T16:00:00.000Z", "2026-10-26T16:01:00.000Z"])("opens at %s", (now) => {
@@ -3389,7 +3693,26 @@ describe("interrupting release pacing", () => {
       }),
     ).toBeNull();
     expect(approvalProblem(card, subtask, replay)).toContain("set service on s1 (card_edit)");
+    expect(approvalProblem(card, tagged, { ...replay, at: "2026-11-15T05:00:00.000Z" })).toContain(
+      'releasedAt: "2026-11-15T02:13:00.000Z"',
+    );
   });
+  it.each([
+    { role: "evaluator" as const, interrupting: true, correcting: true, allowed: true },
+    { role: "evaluator" as const, interrupting: true, correcting: false, allowed: false },
+    { role: "evaluator" as const, interrupting: false, correcting: true, allowed: false },
+    { role: "work" as const, interrupting: true, correcting: true, allowed: false },
+    { role: "review" as const, interrupting: true, correcting: true, allowed: false },
+    { role: "script" as const, interrupting: true, correcting: true, allowed: false },
+  ])(
+    "release correction role=$role interrupting=$interrupting correcting=$correcting",
+    ({ role, interrupting, correcting, allowed }) => {
+      const done = { ...subtask, state: "done" as const, interrupting };
+      expect(
+        checkMark({ ...card, subtasks: [done] }, done.id, "done", role, null, null, correcting).ok,
+      ).toBe(allowed);
+    },
+  );
   it("post-hoc timestamps skip only pacing, preserving owner-only and other approval gates", () => {
     const postHoc = { ...context, releasedAt: at };
     expect(approvalProblem(card, subtask, postHoc)).toBeNull();

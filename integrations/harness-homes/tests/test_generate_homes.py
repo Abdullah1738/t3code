@@ -96,7 +96,8 @@ class HarnessTestCase(unittest.TestCase):
         raw = fixture / ".nvm/versions/node/v26.2.0/bin/quint"
         wrapper = fixture / ".local/bin/quint"
         link = fixture / ".local/share/quint-guard/bin/quint"
-        for executable in [raw, wrapper]:
+        safe_chain = fixture / ".safe-chain/bin/safe-chain"
+        for executable in [raw, wrapper, safe_chain]:
             write(executable, "#!/bin/sh\nexit 0\n")
             executable.chmod(0o755)
         link.parent.mkdir(parents=True)
@@ -105,6 +106,8 @@ class HarnessTestCase(unittest.TestCase):
             self.assertEqual(shutil.which("quint", path=path.replace("/Users/ardud", str(fixture))), str(link))
             self.assertEqual(path, expected)
             entries = path.split(":")
+            self.assertEqual(entries[-1], "/Users/ardud/.safe-chain/bin")
+            self.assertEqual(shutil.which("safe-chain", path=entries[-1].replace("/Users/ardud", str(fixture))), str(safe_chain))
             self.assertEqual(entries[:2], [
                 "/Users/ardud/.config/opencode/skills/remote-compute/scripts/blockers",
                 "/Users/ardud/.local/share/quint-guard/bin",
@@ -147,6 +150,82 @@ class HarnessTestCase(unittest.TestCase):
 
 
 class GenerateTests(HarnessTestCase):
+    def test_safe_chain_check_covers_each_harness_and_service_path(self) -> None:
+        self.run_gen()
+        homes = {harness: str(self.root / harness) for harness in gh.HARNESSES}
+        executable = self.tmp / "safe-bin/safe-chain"
+        write(executable, "#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+        good_path = str(executable.parent)
+        missing_path = str(self.tmp / "empty-bin")
+        Path(missing_path).mkdir()
+        service = self.tmp / "start.zsh"
+        write(service, f"export PATH={good_path}\n")
+
+        def set_path(harness, value):
+            if harness == "claude":
+                path = self.claude / "settings.json"
+                config = json.loads(path.read_text())
+                config["env"]["PATH"] = value
+                path.write_text(json.dumps(config))
+            else:
+                path = self.root / harness / "config.toml"
+                config = tomllib.loads(path.read_text())
+                config["shell_environment_policy"]["set"]["PATH"] = value
+                path.write_text(gh.toml_dump(config))
+
+        for harness in homes:
+            set_path(harness, good_path)
+        self.assertEqual(gh.safe_chain_failures(homes, service), [])
+        for harness in homes:
+            with self.subTest(harness=harness):
+                set_path(harness, missing_path)
+                failures = gh.safe_chain_failures(homes, service)
+                self.assertEqual(len(failures), 1)
+                self.assertIn(harness + ": safe-chain", failures[0])
+                set_path(harness, good_path)
+        for value in [missing_path, '"$PATH:/missing"', ""]:
+            with self.subTest(service_path=value):
+                write(service, f"export PATH={value}\n")
+                failures = gh.safe_chain_failures(homes, service)
+                self.assertEqual(len(failures), 1)
+                self.assertTrue(failures[0].startswith("opencode:"))
+        for content in [f'export PATH="{good_path}"\n', f"export PATH={missing_path}\nexport PATH={good_path}\n"]:
+            write(service, content)
+            self.assertEqual(gh.safe_chain_failures(homes, service), [])
+        for content in ["#!/bin/zsh\n", f"export PATH={good_path}\nexport PATH={missing_path}\n"]:
+            write(service, content)
+            self.assertEqual(len(gh.safe_chain_failures(homes, service)), 1)
+        self.assertEqual(len(gh.safe_chain_failures(homes, self.tmp / "absent.zsh")), 1)
+        write(service, f"export PATH={good_path}\n")
+        executable.chmod(0o644)
+        self.assertEqual(len(gh.safe_chain_failures(homes, service)), len(homes) + 1)
+
+    def test_check_reports_safe_chain_drift_for_configured_homes_only(self) -> None:
+        safe_chain = self.tmp / "safe-bin/safe-chain"
+        write(safe_chain, "#!/bin/sh\nexit 0\n")
+        safe_chain.chmod(0o755)
+        m = self.manifest()
+        m.pop("mcpParity")
+        m["homes"] = {name: str(self.root / name) for name in gh.HARNESSES}
+        m["shellPath"][-1] = str(safe_chain.parent)
+        start = self.home / ".local/share/opencode-service/start.zsh"
+        write(start, f"export PATH={safe_chain.parent}\n")
+
+        def run(*args: str) -> tuple[int, str]:
+            with mock.patch.object(gh, "load_manifest", return_value=m):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    return gh.main(list(args)), out.getvalue()
+
+        self.assertEqual(run("generate")[0], 0)
+        self.assertEqual(run("check"), (0, "OK harness homes match the manifest\n"))
+        write(start, f"export PATH={self.tmp / 'empty-bin'}\n")
+        rc, output = run("check")
+        self.assertEqual(rc, 1, output)
+        self.assertIn("FAIL opencode: safe-chain", output)
+        self.assertEqual(run("check", "--home-root", str(self.root))[0], 0)
+
     def test_full_generate_writes_every_file_with_exact_values(self) -> None:
         m = self.manifest()
         m["hooks"] = [{"event": "PreToolUse", "matcher": "Bash", "command": "/usr/bin/true", "timeoutSec": 5}]
@@ -645,7 +724,8 @@ class GenerateTests(HarnessTestCase):
             return out
 
         claude_hooks, codex_hooks = split(all_claude, False), split(all_codex, False)
-        self.assertEqual(set(claude_hooks), {"PreToolUse", "PostToolUse", "PostToolUseFailure", "SessionStart"})
+        self.assertEqual(set(claude_hooks), {"PreToolUse", "PostToolUse", "PostToolUseFailure", "SessionStart",
+                                             "Stop", "SubagentStop", "SessionEnd"})
         # Codex has no PostToolUseFailure; turn-end hooks close desktop calls that failed without PostToolUse.
         self.assertEqual(set(codex_hooks), {"PreToolUse", "PostToolUse", "Stop", "SubagentStop", "SessionEnd"})
         claude_recall, codex_recall = split(all_claude, True), split(all_codex, True)

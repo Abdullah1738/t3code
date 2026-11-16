@@ -84,6 +84,8 @@ describe("statement statistics", () => {
             db.close();
           });
         const stats = makeStatementStats(true);
+        const observations: Sqlite.SqliteStatementObservation[] = [];
+        const timings: Sqlite.SqliteStatementObservation[] = [];
         yield* Effect.gen(function* () {
           const sql = yield* SqlClient.SqlClient;
           yield* sql`CREATE TABLE entries (id INTEGER PRIMARY KEY)`;
@@ -105,12 +107,44 @@ describe("statement statistics", () => {
             }),
           ),
           Effect.provideService(Sqlite.StatementStats, stats.record),
+          Effect.provideService(Sqlite.StatementObserver, {
+            slowThresholdMs: 0,
+            record: (observation) =>
+              Effect.sync(() => {
+                observations.push(observation);
+              }),
+          }),
+          Effect.provideService(Sqlite.StatementTimingObserver, (observation) => {
+            timings.push(observation);
+          }),
         );
         const rows = stats.drain();
         const select = rows.find((row) => row.sql === "SELECT id FROM entries");
         assert.strictEqual(select?.calls, 1);
         assert.strictEqual(select?.rows, 2);
         assert.strictEqual(select?.connection, workers ? "reader" : "writer");
+        assert.deepEqual(
+          observations.map(({ connection, lane, outcome }) => ({ connection, lane, outcome })),
+          workers
+            ? [
+                { connection: "writer", lane: undefined, outcome: "success" },
+                { connection: "writer", lane: undefined, outcome: "success" },
+                { connection: "reader", lane: "background", outcome: "success" },
+                { connection: "reader", lane: "auth", outcome: "success" },
+                { connection: "reader", lane: "identity", outcome: "success" },
+                { connection: "writer", lane: undefined, outcome: "failure" },
+              ]
+            : [
+                { connection: "writer", lane: undefined, outcome: "success" },
+                { connection: "writer", lane: undefined, outcome: "success" },
+                { connection: "writer", lane: undefined, outcome: "success" },
+              ],
+        );
+        assert.strictEqual(timings.length, observations.length);
+        assert.strictEqual(
+          rows.reduce((total, row) => total + row.calls, 0),
+          workers ? 6 : 3,
+        );
         if (workers)
           assert.deepEqual(
             rows

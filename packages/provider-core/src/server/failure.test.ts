@@ -16,6 +16,7 @@ import {
   makeProviderFailureTurnItem,
   MAX_PROVIDER_FAILURE_CODE_LENGTH,
   MAX_PROVIDER_FAILURE_MESSAGE_LENGTH,
+  ClaudeTurnPreparationTimeoutError,
   ContextHandoffBudgetError,
   ContextHandoffBackgroundWorkError,
 } from "./failure.ts";
@@ -375,5 +376,34 @@ it("classifies a provider usage limit anywhere in the cause chain over a generic
       class: "provider_error",
     }).class,
     "provider_error",
+  );
+});
+
+it.each([
+  ["turn_preparation", "turn preparation"],
+  ["skill_discovery", "skill discovery"],
+  ["attachments", "attachment preparation"],
+  ["sdk_open", "SDK session setup"],
+  ["mcp_registration", "MCP registration"],
+] as const)("names safe Claude preparation timeout stage %s", (stage, label) => {
+  const failure = makeProviderFailure({
+    cause: Cause.fail({
+      _tag: "ProviderAdapterTurnStartError",
+      cause: new ClaudeTurnPreparationTimeoutError({ stage, cause: new Error("private config") }),
+    }),
+  });
+  assert.equal(
+    failure.message,
+    `Claude did not start within 15 s (${label}); nothing was sent to the model. Retry is safe.`,
+  );
+});
+
+it.each([
+  { _tag: "TimeoutError" },
+  { _tag: "ClaudeTurnPreparationTimeoutError", stage: "private-config" },
+])("does not call arbitrary startup errors safe to retry", (cause) => {
+  assert.equal(
+    makeProviderFailure({ cause: { _tag: "ProviderAdapterTurnStartError", cause } }).message,
+    "The provider could not start this turn. Retry the turn; if it keeps failing, check the provider setup and server logs.",
   );
 });

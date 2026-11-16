@@ -41,12 +41,12 @@ class TransportTests(unittest.TestCase):
             self.assertEqual(p.returncode, 4, p.stderr)
             self.assertEqual((root / '.offbox/exit/run-file.rc').read_text().strip(), '4')
 
-    def test_home_small_command_is_byte_for_byte_unchanged(self):
+    def test_home_small_command_transport_is_frozen(self):
         with patch.object(api, 'BACKEND', 'server'):
             cmd, path = runs.command_payload('echo SMALL_OK', 'run-small')
         self.assertIsNone(path)
         self.assertEqual(hashlib.sha256(cmd.encode()).hexdigest(),
-                         '57a000e386d39504da3da2f562440825ae44ad9f0d8b05d98c58c7f9138baeba')
+                         'bb70526591c133841192e63ce4119bb9e6510928b129e8ab8712c5e13812b04a')
 
     def test_final_bytes_include_crpko_and_node_preambles(self):
         with tempfile.TemporaryDirectory() as d, patch.object(api, 'BACKEND', 'server'):

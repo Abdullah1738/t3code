@@ -2253,6 +2253,8 @@ export const KanbanParticipant = Schema.Struct({
   typingUntil: Schema.NullOr(IsoDateTime),
   /** Agent was asked to reply here; "nudged" after one reminder at turn end. */
   owes: Schema.NullOr(Schema.Literals(["asked", "nudged"])),
+  /** The delivered ask stays fixed when reading later messages advances lastReadSeq. */
+  askedSeq: Schema.optional(NonNegativeInt),
   /** A turn-end reminder held by the board pause, to be retried after release. */
   deferred: Schema.optional(Schema.Boolean),
   /** Stable ID for retrying one deferred reminder after an ambiguous send. */
@@ -2516,6 +2518,8 @@ export type KanbanBoardSummary = typeof KanbanBoardSummary.Type;
  * resends neither board pictures nor every thread id.
  */
 export const KanbanBoardListEntry = Schema.Struct({
+  // A content-free entry keeps failed thread deletions hidden until cleanup commits.
+  purged: Schema.optional(Schema.Boolean),
   boardId: KanbanBoardId,
   board: Schema.NullOr(KanbanBoard),
   needsOwner: NonNegativeInt,
@@ -2528,6 +2532,11 @@ export type KanbanBoardListEntry = typeof KanbanBoardListEntry.Type;
 export const KanbanChange = Schema.Union([
   // `by`: who saved the card, when the save came from a move. Script listeners need it to skip a script's own moves.
   Schema.TaggedStruct("card", { card: KanbanCard, by: Schema.optional(KanbanActor) }),
+  Schema.TaggedStruct("purgeThreads", {
+    boardId: KanbanBoardId,
+    threadIds: Schema.Array(ThreadId),
+  }),
+  Schema.TaggedStruct("boardRemoved", { boardId: KanbanBoardId }),
   Schema.TaggedStruct("cardRemoved", { cardId: KanbanCardId }),
   Schema.TaggedStruct("goal", { goal: KanbanGoal }),
   Schema.TaggedStruct("pools", { pools: Schema.Array(KanbanPool) }),

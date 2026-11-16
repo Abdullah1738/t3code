@@ -2,6 +2,7 @@ import contextlib
 import datetime as dt
 import fcntl
 from email.message import EmailMessage
+import hashlib
 import io
 import json
 import shlex
@@ -422,6 +423,84 @@ class OrderProof(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(tracker.main(['can-report', 'ORD-123']), 0)
             self.assertEqual(tracker.main(['can-report', 'missing']), 1)
+
+    def assert_logged_can_report(self, argv, refusal):
+        expected = (receipt.can_report(argv[1]) if len(argv) == 2 else
+                    {'ok': False, 'error': 'usage: order-watch can-report ORDER_ID'})
+        folder = self.root / 'logs'
+        def rows():
+            return [json.loads(line) for path in (folder / 'orders').glob('*.ndjson')
+                    for line in path.read_text().splitlines()]
+        before = len(rows())
+        output = io.StringIO()
+        with patch.dict('os.environ', {'ROBOB_TOOL_LOG_DIR': str(folder), 'TOOLLOG_ROOT': str(folder)}), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(tracker.main(argv), 0 if expected['ok'] else 1)
+        self.assertEqual(output.getvalue(), json.dumps(expected) + '\n')
+        row, = rows()[before:]
+        self.assertEqual(row['name'], 'order_watch.can_report')
+        self.assertEqual(row['component'], 'order-watch')
+        self.assertEqual(row['kind'], 'event')
+        self.assertEqual(row['ok'], expected['ok'])
+        self.assertEqual(row['props'], {
+            'outcome': 'success' if expected['ok'] else 'refused', 'refusal': refusal,
+            'untrackable': bool(expected.get('untrackable')),
+            'eta_given': expected.get('eta') not in (None, 'no ETA given')})
+        identity = expected.get('tracker')
+        self.assertEqual(row.get('ids', {}), {'watcher': hashlib.sha256(identity.encode()).hexdigest()[:16]}
+                         if identity else {})
+        self.assertEqual(set(row) - {'ids'}, {'ts', 'tool', 'component', 'kind', 'name', 'ok', 'props'})
+        return row
+
+    def test_can_report_logs_each_refusal_once_without_changing_output(self):
+        cases = [
+            ('unregistered', ['can-report', 'missing'], [], None, 'not_registered'),
+            ('ambiguous', ['can-report', 'ORD-123'], [self.cfg, self.cfg], None, 'not_registered'),
+            ('invalid-id', ['can-report', 'private@example.test'], [], None, 'invalid_id'),
+            ('invalid-registration', ['can-report', 'ORD-123'], [dict(self.cfg, watcher='../private')],
+             None, 'invalid_registration'),
+            ('not-running', ['can-report', 'ORD-123'], [self.cfg], None, 'not_running_or_held'),
+            ('held', ['can-report', 'ORD-123'], [dict(self.cfg, delivery_card={'held': True})],
+             {'id': self.cfg['watcher'], 'check': 'check command'}, 'not_running_or_held'),
+            ('missing-id', ['can-report'], [], None, 'usage'),
+            ('extra-id', ['can-report', 'ORD-123', 'extra'], [], None, 'usage'),
+        ]
+        for label, argv, configs, definition, refusal in cases:
+            with self.subTest(label=label), patch.object(tracker, 'ROOT', self.root / label), \
+                    patch.object(tracker, 'WATCHERS', self.root / label / 'watchers'):
+                for index, cfg in enumerate(configs):
+                    tracker.write(tracker.ROOT / 'orders' / (str(index) + '.json'), cfg)
+                if definition:
+                    tracker.write(tracker.WATCHERS / self.cfg['watcher'] / 'watcher.json', definition)
+                self.assert_logged_can_report(argv, refusal)
+
+    def test_can_report_logs_success_eta_and_untrackable_without_private_text(self):
+        tracker.write(tracker.WATCHERS / self.cfg['watcher'] / 'watcher.json',
+                      {'id': self.cfg['watcher'], 'check': 'check command'})
+        for untrackable in (False, True):
+            for eta in (None, 'no ETA given', '14–15 November, leave at Apartment 987 Example Street'):
+                with self.subTest(untrackable=untrackable, eta=eta):
+                    tracker.write(tracker.ROOT / 'orders' / (self.cfg['watcher'] + '.json'),
+                                  dict(self.cfg, untrackable=untrackable, eta=eta))
+                    row = self.assert_logged_can_report(['can-report', 'ORD-123'], 'none')
+                    self.assertNotIn('ORD-123', json.dumps(row))
+                    if eta:
+                        self.assertNotIn(eta, json.dumps(row))
+
+    def test_can_report_survives_emit_and_disk_write_failures(self):
+        folder = self.root / 'logs'
+        tracker.write(tracker.ROOT / 'orders' / (self.cfg['watcher'] + '.json'),
+                      dict(self.cfg, untrackable=True))
+        for order in ('ORD-123', 'missing'):
+            expected = receipt.can_report(order)
+            for target in ('emit', 'os.open'):
+                with self.subTest(order=order, target=target), \
+                        patch.dict('os.environ', {'ROBOB_TOOL_LOG_DIR': str(folder), 'TOOLLOG_ROOT': str(folder)}), \
+                        patch('toollog.' + target, side_effect=OSError('disk full')), \
+                        contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(tracker.main(['can-report', order]), 0 if expected['ok'] else 1)
+                self.assertEqual(output.getvalue(), json.dumps(expected) + '\n')
+        self.assertFalse(list(folder.glob('orders/*.ndjson')))
 
     def test_untrackable_registration_never_polls_until_manual_delivery(self):
         argv = ['add', '--merchant', 'Acme', '--order-id', 'ORD-123', '--untrackable',

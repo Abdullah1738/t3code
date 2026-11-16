@@ -466,10 +466,13 @@ export type OrchestratorMcpThreadListItem = typeof OrchestratorMcpThreadListItem
 
 export const OrchestratorMcpThreadListResult = Schema.Struct({
   projectId: ProjectId,
+  projectTitle: Schema.optional(Schema.String),
   currentThreadId: Schema.NullOr(ThreadId),
   threads: Schema.Array(OrchestratorMcpThreadListItem),
   nextCursor: Schema.NullOr(NonNegativeInt),
+  /** Lower bound when totalIsExact is false; older servers always returned an exact total. */
   total: NonNegativeInt,
+  totalIsExact: Schema.optional(Schema.Boolean),
 });
 export type OrchestratorMcpThreadListResult = typeof OrchestratorMcpThreadListResult.Type;
 
@@ -803,6 +806,7 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
     code: Schema.Literals([
       "capability_denied",
       "parent_not_active",
+      "run_starting",
       "caller_unresolved",
       "delegation_timeout",
       "ambiguous_replay",

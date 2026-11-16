@@ -309,6 +309,7 @@ const threads = Layer.effect(
       } satisfies KanbanThreadView;
     });
     return KanbanThreads.of({
+      remove: () => Effect.void,
       claimContext: (threadId) =>
         Effect.sync(() => (views.has(threadId) ? { projectId, model } : null)),
       view,

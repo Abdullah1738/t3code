@@ -100,6 +100,20 @@ class TrackedIgnoredTests(unittest.TestCase):
         for rel in ("dist/local.js", "docs/untracked.md", "config/.env", "vendor/node_modules/x/index.js"):
             self.assertFalse(self.on_box(rel), rel)
 
+    def test_tracked_blocker_shims_sync_without_include(self):
+        paths = [f'integrations/offbox/skill/scripts/blockers/{name}'
+                 for name in ('docker', 'himalaya', 'himalaya-heal', 'wacli')]
+        blockers = Path(__file__).resolve().parents[1] / 'blockers'
+        for rel in paths:
+            self.write(rel, (blockers / Path(rel).name).read_text())
+            (self.src / rel).chmod(0o755)
+        self.git('add', '--', *paths)
+        self.push()
+        for rel in paths:
+            with self.subTest(path=rel):
+                self.assertEqual((self.remote / rel).read_bytes(), (self.src / rel).read_bytes())
+                self.assertTrue(os.access(self.remote / rel, os.X_OK))
+
     def test_secret_tracked_file_still_needs_include(self):
         self.push(includes=["config/.env"])
         self.assertTrue(self.on_box("config/.env"))

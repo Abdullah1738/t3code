@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-const CAP = 50 * 1024 * 1024;
+const CAP = 200 * 1024 * 1024;
 const seen = new Set();
 const failurePhases = new WeakMap();
 const props = new Set(['model','size','count','status','enabled','locked','limited','reloginNeeded','state','action','tag','dryRun','complete','cost','hour','exitCode','attempt','source','failed','total','fourxx','fivexx','phase','durationMaxMs','omitted']);

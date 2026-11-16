@@ -226,7 +226,7 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
 | `--include PATH` | sync a path the filters skip (e.g. a committed `testdata/server.key`). Under a gitignored dir such as `tmp/`, only that path mirrors; the box's other files in that dir are kept |
 | `--no-sync` | run without syncing (box already has what you need) |
 | `--bg` | queue in a detached client and return a run id at once, even while the pool is full; then hand the wait off using your harness’s route and end your turn (see **Waiting for a run**). It collects `--pull` artifacts, prints a final summary and log tail, and exits with the run’s code. Client diagnostics: `logs/<id>.client.log` in the offbox state directory. |
-| `--base N` / `--fresh` | new lease from saved base N / ignoring bases and templates. `--fresh` doesn't always mean a new box: in the repository pool it can still reuse a pool box that was itself created fresh. In a full pool with no box of that kind, it stops at once (exit 2) instead of queueing. It isn't a way off a bad box: offbox now stops broken boxes itself, and `offbox release <id>` stops one by hand. |
+| `--base N` / `--fresh` | new lease from saved base N / ignoring bases and templates. A full pool queues `--template`/`--base` runs, then detaches and stops (never deletes) an idle box from another source to make room. `--fresh` can still reuse a pool box created fresh; it exits 2 when a full pool has no fresh-source member. It isn't a way off a bad box: offbox now stops broken boxes itself, and `offbox release <id>` stops one by hand. |
 | `--no-fallback` | return 90/91 instead of falling back to a local run |
 | `--remote` | same as `--no-fallback` (kept for old commands; every run uses a box now) |
 | `--step CMD` (repeatable) | run several checks with a real exit code each (see Fallback and exit codes) |
@@ -445,7 +445,7 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
 
 ## Disk space
 
-Offbox records /tmp, /var/tmp and workspace filesystem space before and after each run. Below 1 GiB free in /tmp it warns; below 256 MiB it refuses the command with **90**. On home boxes, an idle box first attempts safe cleanup of stale user-owned temp files. Critically full boxes with concurrent runs are refused without cleanup. The pool picker does not automatically move the run to another box.
+Offbox records /tmp, /var/tmp and workspace filesystem space before and after each run. Below 1 GiB free in /tmp it warns; below 256 MiB it refuses the command with **90**. A full box (workspace or /tmp) is cleaned once or kept out of the pool, and the run moves once to another box unless `--no-retry` is set; after manual cleanup, `offbox box release-disk-full <box>` returns it to the pool.
 
 After a nonzero exit, ENOSPC output or less than 64 MiB free on a measured filesystem marks the result `infra_failure: "enospc"` and returns **90** from run/wait/logs. The command's original exit and the start/end measurements stay in the state record and analytics. These test results are invalid; rerun after space is available. Successful commands retain exit 0.
 

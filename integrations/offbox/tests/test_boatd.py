@@ -176,6 +176,7 @@ class Logging(Base):
     def test_memory_admission_logs_queue_before_wait(self):
         b = self.box()
         pid = self.cmd(b, status='queued')
+        self.cmd(b, pid=1002, status='running')
         with patch.object(boatd, 'mem_available', return_value=0), patch.object(boatd.time, 'sleep', side_effect=RuntimeError('stop fixture wait')):
             with self.assertRaises(RuntimeError): boatd.admit(self.con,b,pid,'k',io.BytesIO())
         row = self.rows('run.queue')[0]
@@ -399,7 +400,7 @@ class Queue(Base):
         boatd.CFG["cpu_pressure_limit"] = 50
         self.assertEqual(boatd.admission_cpu_limit(), 0)
 
-    def test_one_hour_escape_only_when_cpu_admission_is_off(self):
+    def test_one_hour_never_bypasses_admission_even_when_cpu_check_is_off(self):
         for limit in (0, 50, None):
             for blocked in ("fifo", "memory", "cap"):
                 with self.subTest(limit=limit, blocked=blocked):
@@ -429,9 +430,9 @@ class Queue(Base):
                         queued_s = boatd.admit(self.con, b, q, "k", io.BytesIO())
                     self.assertEqual(queued_s, 3601)
                     self.assertEqual(waits[:2], [10000, 13600])
-                    self.assertEqual(len(waits), 2 if limit == 0 else 3)
-                    self.assertEqual(self.status(b, q)["status"], "running" if limit == 0 else "queued")
-                    self.assertEqual(self.status(b, q)["started_at"], 13601 if limit == 0 else None)
+                    self.assertEqual(len(waits), 3)
+                    self.assertEqual(self.status(b, q)["status"], "queued")
+                    self.assertEqual(self.status(b, q)["started_at"], None)
                     self.assertEqual(self.status(b, earlier)["status"], earlier_status)
                     self.con.execute("DELETE FROM commands WHERE box_id=?", (b,))
                     self.con.execute("DELETE FROM boxes WHERE id=?", (b,))
@@ -472,6 +473,7 @@ class Queue(Base):
     def test_installer_undo_releases_an_existing_cpu_waiter(self):
         b = self.box()
         q = self.cmd(b, status="queued")
+        self.cmd(b, pid=1002, status="running")
         boatd.CFG["cpu_pressure_limit"] = 50
         (boatd.ETC / "config.json").write_text('{"cpu_pressure_limit":50}')
         (boatd.ETC / "config.json.before-117").write_text('{}')
@@ -493,6 +495,8 @@ class Queue(Base):
             with self.subTest(pressure=pressure):
                 b = self.box(bid="bx_cpuqueue")
                 q = self.cmd(b, status="queued")
+                self.cmd(b, pid=1002, status="running", age=200)
+                self.con.execute("UPDATE commands SET started_at=1 WHERE pid=1002")
                 boatd.CFG["cpu_pressure_limit"] = 50
                 err = io.BytesIO()
                 reading = [pressure]
@@ -651,6 +655,7 @@ class Queue(Base):
         boatd.mem_available = lambda: 1 * 2**30
         b = self.box()
         q = self.cmd(b, status="queued")
+        self.cmd(b, pid=1002, status="running")
         self.assertFalse(self.admit_now(b, q))
 
     def test_retry_interrupted_must_be_asked_for(self):
@@ -761,6 +766,7 @@ class Http(Base):
                 b = self.box("bx_same" if same_box else "bx_exec")
                 queued_box = b if same_box else self.box("bx_queued")
                 queued_pid = self.cmd(queued_box, status="queued")
+                self.cmd(queued_box, pid=1002, status="running")
                 entered, release = threading.Event(), threading.Event()
                 errors = []
                 def hold_admission(_):

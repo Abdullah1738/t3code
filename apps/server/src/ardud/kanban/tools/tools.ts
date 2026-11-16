@@ -105,7 +105,7 @@ const SubtasksInput = describe(
       id: Schema.optional(
         describe(
           TrimmedNonEmptyString,
-          "Existing s<N> id from card_get. Listed alone it keeps that subtask as it is; omit id for a new subtask.",
+          "Existing s<N> id from card_get. Listed alone it keeps that subtask as it is. An s<N> id the card does not have yet creates a new subtask with that id (text and owner required); omit id to let the board number a new subtask.",
         ),
       ),
       step: Schema.optional(
@@ -165,7 +165,7 @@ const SubtasksInput = describe(
       ),
     }),
   ),
-  `At most ${MAX_SUBTASKS} subtasks, each at most ${MAX_TEXT} characters. The card's plan, in order: the work, its review and everything after (merge, deploy, telling whoever asked, updating tickets, a read-back). Leave out steps that aren't needed. On card_edit it replaces the plan: list existing ids to keep them (an id alone keeps it unchanged; done and skipped ones can't be rewritten), add new entries without an id; open ones left out go, done ones stay.`,
+  `At most ${MAX_SUBTASKS} subtasks, each at most ${MAX_TEXT} characters. The card's plan, in order: the work, its review and everything after (merge, deploy, telling whoever asked, updating tickets, a read-back). Leave out steps that aren't needed. On card_edit it replaces the plan: list existing ids to keep them (an id alone keeps it unchanged; done and skipped ones can't be rewritten), add new entries without an id or with a new s<N> id; open ones left out go, done ones stay.`,
 );
 
 const LinkInput = Schema.Struct({
@@ -935,7 +935,7 @@ const SubtaskDone = tool(
     releasedAt: Schema.optional(
       describe(
         IsoDateTime,
-        "When the restart actually happened, for ticking a release after the fact; it records that time and does not start a new window.",
+        "When the restart actually happened, for ticking a release after the fact; it records that time and does not start a new window; use it for any step that records a release that already happened, including a second card's step for the same release.",
       ),
     ),
   },
@@ -946,7 +946,7 @@ const SubtaskDone = tool(
 const CardThread = tool(
   "card_thread",
   "Steer, stop, wake or reset a card thread",
-  "Evaluators: steer the card's live thread with text, stop it (the card keeps its place; move it if needed), wake its last work thread with text, or reset it: the card drops its threads and its next run starts on a fresh one, with text as a note for it. Steer and wake require non-blank text. message is an alias for text; if both are supplied, they must match.",
+  "Evaluators: steer the card's live thread with text, stop it (the card keeps its place; move it if needed), wake its last work thread with text, or reset it: the card drops its threads and its next run starts on a fresh one, with text as a note for it. Steer and wake require non-blank text and an open worker step or pending review findings, unless a reviewer is attached. message is an alias for text; if both are supplied, they must match.",
   {
     boardId: BoardRef,
     card: CardRef,

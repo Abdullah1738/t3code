@@ -809,6 +809,9 @@ export const OrchestrationV2Subagent = Schema.Struct({
   completionWake: Schema.optional(Schema.Literals(["always", "settled_only"])),
   selectionRouting: Schema.optional(ModelSelectionRouting),
   completionDelivery: Schema.optional(OrchestrationV2DelegatedCompletionTaskDelivery),
+  lastAnnouncedStatus: Schema.optional(
+    Schema.Literals(["completed", "failed", "cancelled", "interrupted"]),
+  ),
   status: Schema.Literals([
     "idle",
     "pending",

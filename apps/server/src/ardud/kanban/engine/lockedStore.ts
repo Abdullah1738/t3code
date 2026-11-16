@@ -41,6 +41,11 @@ export const wrap = (
   return {
     ...store,
     boards: locks.observe(store.boards),
+    boardThreadIds: (id) => locks.access(id, store.boardThreadIds(id)),
+    purgeBoard: (id) => locks.access(id, store.purgeBoard(id), true),
+    pendingBoardPurges: locks.observe(store.pendingBoardPurges),
+    finishBoardPurgeThread: (id, threadId) =>
+      locks.access(id, store.finishBoardPurgeThread(id, threadId), true),
     board: (id) => locks.access(id, store.board(id), false, "board"),
     putBoard: (row) => locks.access(row.id, store.putBoard(row), true, "board"),
     putBoardWithPools: (row, pools, application) =>
@@ -104,7 +109,8 @@ export const wrap = (
     scripts: (id) => locks.access(id, store.scripts(id)),
     automations: (id) => locks.access(id, store.automations(id)),
     putAutomation: (row) => locks.access(row.boardId, store.putAutomation(row), true),
-    wiki: (id) => locks.access(id, store.wiki(id)),
+    wiki: (id, slugs) => locks.access(id, store.wiki(id, slugs)),
+    wikiIndex: (id, slugs) => locks.access(id, store.wikiIndex(id, slugs)),
     putWiki: (row) => locks.access(row.boardId, store.putWiki(row), true),
     threadLink: (id) => thread(id, store.threadLink(id)),
     threadLinksByIds: (ids) => locks.observe(store.threadLinksByIds(ids)),

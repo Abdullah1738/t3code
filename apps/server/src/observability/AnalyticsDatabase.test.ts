@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import { AnalyticsEvent } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
@@ -12,7 +13,7 @@ import * as Analytics from "../ardud/analytics/Analytics.ts";
 import * as AnalyticsDatabase from "./AnalyticsDatabase.ts";
 import { sampleProcessDiskRead } from "./processDiskRead.ts";
 
-const decodeEvent = Schema.decodeUnknownEffect(AnalyticsEvent);
+const decodeEvent = Schema.decodeUnknownEffect(AnalyticsEvent, { onExcessProperty: "error" });
 
 vi.mock("./processDiskRead.ts", async (original) => {
   let bytes = 500;
@@ -24,6 +25,7 @@ vi.mock("./processDiskRead.ts", async (original) => {
 
 it.effect("flushes actual SQL completions once per minute through the analytics schema", () =>
   Effect.gen(function* () {
+    const initialSamples = vi.mocked(sampleProcessDiskRead).mock.calls.length;
     const output = yield* Queue.unbounded<AnalyticsEvent>();
     const recorded: AnalyticsEvent[] = [];
     const database = NodeSqliteClient.layer({ filename: ":memory:" });
@@ -32,7 +34,7 @@ it.effect("flushes actual SQL completions once per minute through the analytics 
       Effect.gen(function* () {
         // Match boot: analytics constructs persistence before the flushing layer.
         const sql = yield* SqlClient.SqlClient;
-        assert.strictEqual(vi.mocked(sampleProcessDiskRead).mock.calls.length, 1);
+        assert.strictEqual(vi.mocked(sampleProcessDiskRead).mock.calls.length, initialSamples + 1);
         yield* sql`SELECT 3 AS value`.pipe(Effect.withTracerEnabled(false));
         yield* TestClock.adjust("30 seconds");
         return {
@@ -84,6 +86,46 @@ it.effect("flushes actual SQL completions once per minute through the analytics 
           Layer.provide(AnalyticsDatabase.layerStatementStats),
         ),
       ),
+    );
+  }).pipe(Effect.scoped),
+);
+
+it.effect("records the reader workload interval and lane without SQL or bindings", () =>
+  Effect.gen(function* () {
+    const events: AnalyticsEvent[] = [];
+    yield* Effect.gen(function* () {
+      const observer = yield* NodeSqliteClient.StatementObserver;
+      yield* observer!.record({
+        operation: "read",
+        connection: "reader",
+        lane: "background",
+        durationMs: 200,
+        span: "KanbanThreads.find",
+        outcome: "success",
+      });
+    }).pipe(
+      Effect.provide(
+        AnalyticsDatabase.layer.pipe(
+          Layer.provide(
+            Layer.mock(Analytics.Analytics)({
+              record: (event) =>
+                Effect.sync(() => {
+                  events.push(event);
+                }),
+            }),
+          ),
+          Layer.provide(AnalyticsDatabase.layerStatementStats),
+        ),
+      ),
+    );
+    const event = events[0]!;
+    assert.deepEqual(yield* decodeEvent(event), event);
+    assert.equal(event.props?.readerLane, "background");
+    assert.equal(event.props?.span, "KanbanThreads.find");
+    assert.equal(
+      DateTime.toEpochMillis(DateTime.makeUnsafe(event.ts)) -
+        DateTime.toEpochMillis(DateTime.makeUnsafe(event.startedAt!)),
+      200,
     );
   }).pipe(Effect.scoped),
 );
