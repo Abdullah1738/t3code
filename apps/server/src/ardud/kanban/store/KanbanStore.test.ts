@@ -2963,6 +2963,173 @@ it.effect("reopened caller attribution follows nested subagents and stops at for
   }).pipe(Effect.provide(TestLayer)),
 );
 
+it.effect("#1616 nested caller rollback discards only its own metadata", () =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const sql = yield* SqlClient.SqlClient;
+    const current = card(4336, "working");
+    const other = card(4337, "todo");
+    const id = ThreadId.make("nested-worker");
+    const link: KanbanThreadLink = {
+      threadId: id,
+      boardId,
+      cardId: current.id,
+      role: "work",
+      purpose: null,
+      discussionId: null,
+      model,
+      startedAt: at,
+      endedAt: null,
+      paused: null,
+    };
+    yield* store.putCard(current);
+    yield* store.putCard(other);
+    yield* store.putThreadLink(link);
+    yield* store.observeCallerWrites(
+      sql.withTransaction(
+        Effect.gen(function* () {
+          yield* store.putCard({ ...current, stage: "in_review" });
+          yield* store
+            .observeCallerWrites(
+              sql.withTransaction(
+                Effect.gen(function* () {
+                  yield* store.putCard({ ...current, stage: "needs_review" });
+                  yield* store.putThreadLink({ ...link, role: "review" });
+                  return yield* Effect.fail("rollback");
+                }),
+              ),
+            )
+            .pipe(Effect.ignore);
+          yield* store.putCard({ ...other, stage: "working" });
+        }),
+      ),
+    );
+    const savedCard = yield* store.card(current.id);
+    const savedLink = yield* store.threadLink(id);
+    assert.equal(savedCard?.stage, "in_review");
+    assert.equal(savedLink?.role, "work");
+    assert.equal((yield* store.card(other.id))?.stage, "working");
+    assert.deepEqual(store.callerAnalytics!(id), {
+      boardId,
+      cardId: current.id,
+      cardNumber: current.number,
+      cardStage: "in_review",
+      callerRole: "work",
+    });
+  }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect.each(["rekey", "selection"] as const)(
+  "#1616 nested %s rollback preserves earlier outer metadata",
+  (mode) =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const sql = yield* SqlClient.SqlClient;
+      const current = card(4336, "working");
+      const other = card(4337, "todo");
+      const id = ThreadId.make("nested-bulk-worker");
+      const link: KanbanThreadLink = {
+        threadId: id,
+        boardId,
+        cardId: current.id,
+        role: "work",
+        purpose: null,
+        discussionId: null,
+        model,
+        startedAt: at,
+        endedAt: null,
+        paused: null,
+      };
+      yield* store.putCard(current);
+      yield* store.putCard(other);
+      yield* store.putThreadLink(link);
+      const changed = { ...current, stage: "needs_review" as const };
+      const bulk =
+        mode === "rekey"
+          ? store.rekeyBoard(boardId, [], [changed]).pipe(
+              Effect.andThen(store.putThreadLink({ ...link, role: "review" })),
+            )
+          : store.migrateBoardSelections({
+              board,
+              pools: [],
+              oldPoolKeys: [],
+              cards: [changed],
+              threadLinks: [{ ...link, role: "review" }],
+            });
+      yield* store.observeCallerWrites(
+        sql.withTransaction(
+          Effect.gen(function* () {
+            yield* store.putCard({ ...current, stage: "in_review" });
+            const nested = yield* store
+              .observeCallerWrites(
+                sql.withTransaction(bulk.pipe(Effect.andThen(Effect.fail("rollback")))),
+              )
+              .pipe(Effect.exit);
+            assert.equal(nested._tag, "Failure");
+            yield* store.putCard({ ...other, stage: "working" });
+          }),
+        ),
+      );
+      const savedCard = yield* store.card(current.id);
+      const savedLink = yield* store.threadLink(id);
+      assert.equal(savedCard?.stage, "in_review");
+      assert.equal(savedLink?.role, "work");
+      assert.equal((yield* store.card(other.id))?.stage, "working");
+      assert.equal(store.callerAnalytics!(id)?.cardStage, savedCard?.stage);
+      assert.equal(store.callerAnalytics!(id)?.callerRole, savedLink?.role);
+    }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect.each(["commit", "rollback"] as const)(
+  "#1616 successful nested metadata follows the outer %s",
+  (outcome) =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const sql = yield* SqlClient.SqlClient;
+      const current = card(4336, "working");
+      const id = ThreadId.make("successful-nested-worker");
+      const link: KanbanThreadLink = {
+        threadId: id,
+        boardId,
+        cardId: current.id,
+        role: "work",
+        purpose: null,
+        discussionId: null,
+        model,
+        startedAt: at,
+        endedAt: null,
+        paused: null,
+      };
+      yield* store.putCard(current);
+      yield* store.putThreadLink(link);
+      const result = yield* store
+        .observeCallerWrites(
+          sql.withTransaction(
+            Effect.gen(function* () {
+              yield* store.observeCallerWrites(
+                sql.withTransaction(
+                  store.putCard({ ...current, stage: "needs_review" }).pipe(
+                    Effect.andThen(store.putThreadLink({ ...link, role: "review" })),
+                  ),
+                ),
+              );
+              assert.equal(store.callerAnalytics!(id)?.cardStage, "working");
+              assert.equal(store.callerAnalytics!(id)?.callerRole, "work");
+              if (outcome === "rollback") return yield* Effect.fail("outer rollback");
+            }),
+          ),
+        )
+        .pipe(Effect.exit);
+      assert.equal(result._tag, outcome === "commit" ? "Success" : "Failure");
+      const savedCard = yield* store.card(current.id);
+      const savedLink = yield* store.threadLink(id);
+      assert.equal(savedCard?.stage, outcome === "commit" ? "needs_review" : "working");
+      assert.equal(savedLink?.role, outcome === "commit" ? "review" : "work");
+      assert.equal(store.callerAnalytics!(id)?.cardStage, savedCard?.stage);
+      assert.equal(store.callerAnalytics!(id)?.callerRole, savedLink?.role);
+    }).pipe(Effect.provide(TestLayer)),
+);
+
 it.effect.each(["rekey", "selection"] as const)(
   "%s caller metadata waits for the enclosing commit",
   (mode) =>

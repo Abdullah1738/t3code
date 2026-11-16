@@ -474,7 +474,12 @@ const make = Effect.gen(function* () {
   // metadata only after that enclosing operation succeeds, including bulk writes.
   const observeCallerWrites: KanbanStoreShape["observeCallerWrites"] = Effect.fnUntraced(
     function* (effect) {
-      if ((yield* callerWrites) !== undefined) return yield* effect;
+      const pending = yield* callerWrites;
+      if (pending !== undefined) {
+        const start = pending.length;
+        // A caught savepoint failure must not publish its rolled-back metadata at the outer commit.
+        return yield* effect.pipe(Effect.onError(() => Effect.sync(() => pending.splice(start))));
+      }
       const updates: Array<() => void> = [];
       const parent = yield* NodeSqliteClient.TransactionCommitObserver;
       const apply = () => {
