@@ -3,7 +3,7 @@ if __package__:
 else:
     import test_environment
 
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 import io
 import json
 import os
@@ -195,34 +195,49 @@ class GuardTests(unittest.TestCase):
     def heredoc(self, target, body):
         return 'cat > ' + target + " <<'GUARD_BODY'\n" + body.rstrip() + '\nGUARD_BODY\n'
 
+    @contextmanager
+    def trusted_node_environment(self):
+        # This synthetic location is classified only, never executed or opened.
+        # No installed Node version or system executable ownership is required.
+        node = str(Path.home() / '.nvm/versions/node/v0.0.0/bin/node')
+        lookup = guard.shutil.which
+
+        def which(name, *args, **kwargs):
+            return node if name == 'node' else lookup(name, *args, **kwargs)
+
+        search = [str(Path(node).parent), *(entry for entry in os.get_exec_path() if os.path.isabs(entry))]
+        with patch.dict(os.environ, {'PATH': os.pathsep.join(search)}), patch.object(guard.shutil, 'which', side_effect=which):
+            yield
+
     def reporter_body(self, name):
         return (Path(__file__).with_name('fixtures') / 'heredoc-rerun' / name).read_text()
 
     def test_checked_intervening_reporters(self):
-        fixtures = Path(__file__).with_name('fixtures') / 'checked-intervening'
-        sources = json.loads((fixtures / 'sources.json').read_text())
-        for row in json.loads((fixtures / 'cases.json').read_text()):
-            directory = self.root / row['fixture']
-            directory.mkdir()
-            for group, entries in sources.items():
-                if row['fixture'].startswith(group):
-                    for entry in entries:
-                        target = directory / entry['path']
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        target.write_text((fixtures / entry['snapshot']).read_text())
-            command = (fixtures / row['fixture']).read_text().replace(row['cwd'], str(directory))
-            with self.subTest(reporter=row['fixture'], shape=row['label']):
-                rule, cause = guard.classify_detail(command, str(directory))
-                if row['expected'] == 'allow':
-                    self.assertIsNone(rule, cause)
-                else:
-                    self.assertIsNotNone(rule)
-                if row.get('script'):
-                    self.assertEqual(rule, UNRESOLVED)
-                    self.assertIn(row['script'], cause)
-                    reason = guard.refusal_reason(rule, cause, str(directory))
-                    self.assertIn('Split source preparation and execution into separate calls', reason)
-                    self.assertNotIn('literal absolute', reason)
+        with self.trusted_node_environment():
+            fixtures = Path(__file__).with_name('fixtures') / 'checked-intervening'
+            sources = json.loads((fixtures / 'sources.json').read_text())
+            for row in json.loads((fixtures / 'cases.json').read_text()):
+                directory = self.root / row['fixture']
+                directory.mkdir()
+                for group, entries in sources.items():
+                    if row['fixture'].startswith(group):
+                        for entry in entries:
+                            target = directory / entry['path']
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            target.write_text((fixtures / entry['snapshot']).read_text())
+                command = (fixtures / row['fixture']).read_text().replace(row['cwd'], str(directory))
+                with self.subTest(reporter=row['fixture'], shape=row['label']):
+                    rule, cause = guard.classify_detail(command, str(directory))
+                    if row['expected'] == 'allow':
+                        self.assertIsNone(rule, cause)
+                    else:
+                        self.assertIsNotNone(rule)
+                    if row.get('script'):
+                        self.assertEqual(rule, UNRESOLVED)
+                        self.assertIn(row['script'], cause)
+                        reason = guard.refusal_reason(rule, cause, str(directory))
+                        self.assertIn('Split source preparation and execution into separate calls', reason)
+                        self.assertNotIn('literal absolute', reason)
 
     def test_checked_intervening_writers(self):
         target = 'tmp/checked.py'
@@ -264,27 +279,28 @@ class GuardTests(unittest.TestCase):
                 self.adapters(command)
 
     def test_checked_intervening_syntax_checks(self):
-        for flag in ['--check', '-c']:
-            prefix = self.heredoc('tmp/checked.mjs', 'console.log(1)')
-            run = 'node tmp/checked.mjs'
-            command = prefix + f'node {flag} tmp/checked.mjs\n' + run
-            with self.subTest(flag=flag):
+        with self.trusted_node_environment():
+            for flag in ['--check', '-c']:
+                prefix = self.heredoc('tmp/checked.mjs', 'console.log(1)')
+                run = 'node tmp/checked.mjs'
+                command = prefix + f'node {flag} tmp/checked.mjs\n' + run
+                with self.subTest(flag=flag):
+                    self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+                    self.adapters(command)
+                for check in [f'node --require tmp/hook.cjs {flag} tmp/checked.mjs',
+                              f'node --import tmp/hook.mjs {flag} tmp/checked.mjs',
+                              f'NODE_OPTIONS=--require=./tmp/hook.cjs node {flag} tmp/checked.mjs']:
+                    with self.subTest(check=check):
+                        self.assertEqual(self.classify(prefix + check + '\n' + run), UNRESOLVED)
+            startup = self.write('startup.sh', "echo replacement > tmp/checked.py")
+            prefix = self.heredoc('tmp/checked.py', 'print(1)')
+            with patch.dict(os.environ, {'BASH_ENV': str(startup)}):
+                command = prefix + 'bash -n tmp/checked.py\npython3 -I tmp/checked.py'
                 self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
-                self.adapters(command)
-            for check in [f'node --require tmp/hook.cjs {flag} tmp/checked.mjs',
-                          f'node --import tmp/hook.mjs {flag} tmp/checked.mjs',
-                          f'NODE_OPTIONS=--require=./tmp/hook.cjs node {flag} tmp/checked.mjs']:
-                with self.subTest(check=check):
-                    self.assertEqual(self.classify(prefix + check + '\n' + run), UNRESOLVED)
-        startup = self.write('startup.sh', "echo replacement > tmp/checked.py")
-        prefix = self.heredoc('tmp/checked.py', 'print(1)')
-        with patch.dict(os.environ, {'BASH_ENV': str(startup)}):
-            command = prefix + 'bash -n tmp/checked.py\npython3 -I tmp/checked.py'
-            self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
-        with patch.dict(os.environ, {'BASH_FUNC_node%%': "() { printf 'print(2)\\n' > tmp/checked.py; }"}):
-            command = prefix + self.heredoc('tmp/checked.mjs', 'console.log(1)')
-            command += 'node --check tmp/checked.mjs\npython3 -I tmp/checked.py'
-            self.assertEqual(self.classify('bash -c ' + shlex.quote(command)), UNRESOLVED)
+            with patch.dict(os.environ, {'BASH_FUNC_node%%': "() { printf 'print(2)\\n' > tmp/checked.py; }"}):
+                command = prefix + self.heredoc('tmp/checked.mjs', 'console.log(1)')
+                command += 'node --check tmp/checked.mjs\npython3 -I tmp/checked.py'
+                self.assertEqual(self.classify('bash -c ' + shlex.quote(command)), UNRESOLVED)
 
     def test_checked_intervening_node_identity(self):
         prefix = self.heredoc('tmp/checked.py', 'print(1)')
