@@ -10411,3 +10411,163 @@ test.each([false, true])("late human steer confirmation survives agent-bus failu
   expect(h.controls().map(op => op.text)).toEqual(["Something went wrong on my end with that one. Mind trying again?"]);
   expect(JSON.stringify(h.store.pendingOutbox())).not.toContain("PRIVATE_BUS_REQUEST");
 });
+
+test("unanswered watchdog recovers the 16 Nov accepted human row after a wake ends NO_REPLY", async () => {
+  const start = Date.parse("2026-11-16T11:30:17Z");
+  setSystemTime(start);
+  const alerts: string[][] = [];
+  const h = setup(":memory:", { notifyUnanswered: async (...args) => { alerts.push(args); return true; } });
+  h.input("wake:running", "watcher update", { source: "composed" });
+  await h.router.tick();
+  // Reconstruct pre-#58 persisted membership: admission said 'done' although
+  // respond threw, and the wake remained entitled to end without replying.
+  h.input("swallowed-human", "PRIVATE_OWNER_WORDS", { source: "typed" });
+  h.store.updateInbound("swallowed-human", "done");
+  const wake = h.store.get<Record<string, unknown>>("activeTurn")!;
+  h.store.set("activeTurn", { ...wake, covered: ["swallowed-human"] });
+  h.store.set("inbound-delivered:swallowed-human", start);
+  h.backend.step("NO_REPLY"); h.backend.settle();
+  await h.router.tick();
+  h.input("wake:pending", "later watcher", { source: "composed" });
+  setSystemTime(start + 5 * 60_000);
+  await h.router.checkUnanswered();
+  expect(inbounds(h.store).find(row => row.id === "swallowed-human")?.state).toBe("pending");
+  await h.router.tick();
+  expect(h.backend.prompts.at(-1)?.text).toContain("PRIVATE_OWNER_WORDS");
+  expect(h.backend.prompts.at(-1)?.text).not.toContain("later watcher");
+  h.backend.step("Done"); h.backend.settle();
+  await h.router.tick();
+  for (const op of h.store.pendingOutbox()) h.store.outboxState(op.id, "sent");
+  const human = inbounds(h.store).find(row => row.id === "swallowed-human")!.payload as import("../src/unanswered.ts").AnsweredInput;
+  expect(human.answeredAt).toBe(start + 5 * 60_000);
+  setSystemTime(start + 10 * 60_000);
+  await h.router.checkUnanswered();
+  expect(alerts).toHaveLength(0);
+});
+
+test("unanswered failed replay alerts once at ten minutes, without the owner's words", async () => {
+  const start = Date.parse("2026-11-16T11:30:17Z"); setSystemTime(start);
+  const alerts: string[][] = [];
+  const h = setup(":memory:", { notifyUnanswered: async (...args) => { alerts.push(args); return true; } });
+  h.input("unanswered-failure", "PRIVATE_OWNER_WORDS", { source: "typed" });
+  h.store.updateInbound("unanswered-failure", "done");
+  setSystemTime(start + 5 * 60_000); await h.router.checkUnanswered();
+  await h.router.tick();
+  h.backend.settle("failed"); await h.router.tick();
+  setSystemTime(start + 10 * 60_000); await h.router.checkUnanswered();
+  await h.router.checkUnanswered();
+  expect(alerts).toHaveLength(1);
+  expect(alerts[0]![0]).toBe("attention");
+  expect(alerts[0]![1]).toContain("Abdullah's iMessage from 15:30 (Dubai)");
+  expect(alerts[0]![1]).not.toContain("PRIVATE_OWNER_WORDS");
+  expect(alerts[0]![2]).toBe("imessage-unanswered:unanswered-failure");
+});
+
+test("slow human-led turn is logged overdue without a second prompt, then retried if it ends silent", async () => {
+  const start = Date.parse("2026-11-16T11:30:17Z"); setSystemTime(start);
+  const h = setup();
+  h.input("slow-human", "Long task", { source: "typed" });
+  await h.router.tick();
+  const logs = await captureLogs(async () => {
+    setSystemTime(start + 5 * 60_000); await h.router.checkUnanswered();
+    await h.router.checkUnanswered();
+  });
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(inbounds(h.store)[0]!.state).toBe("done");
+  expect(logs.filter(line => line.name === "inbound.overdue")).toHaveLength(1);
+  expect(logs.find(line => line.name === "inbound.overdue")?.props).toMatchObject({ action: "in_turn", leaderKind: "human" });
+  h.backend.step("NO_REPLY"); h.backend.settle(); await h.router.tick();
+  setSystemTime(start + 6 * 60_000); await h.router.checkUnanswered();
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(2);
+  expect(h.backend.prompts[1]!.messageId).not.toBe(h.backend.prompts[0]!.messageId);
+});
+
+test("unanswered Telegram failures retry three times across ticks and persist across reopen", async () => {
+  const start = Date.parse("2026-11-16T11:30:17Z"); setSystemTime(start);
+  let calls = 0;
+  const h = setup(":memory:", { notifyUnanswered: async () => { calls++; throw new Error("offline"); } });
+  h.input("telegram-down", "private", { source: "typed" }); h.store.updateInbound("telegram-down", "done");
+  setSystemTime(start + 10 * 60_000);
+  for (let n = 0; n < 5; n++) await h.router.checkUnanswered();
+  expect(calls).toBe(3);
+});
+
+test("unanswered watchdog requeues one sealed human batch and excludes every member of an outage notice", async () => {
+  const start = Date.parse("2026-11-16T11:30:17Z"); setSystemTime(start);
+  const h = setup();
+  for (const id of ["first", "second"]) h.input(id, id, { source: "typed" });
+  await h.router.tick();
+  h.backend.step("NO_REPLY"); h.backend.settle(); await h.router.tick();
+  setSystemTime(start + 5 * 60_000); await h.router.checkUnanswered();
+  expect(inbounds(h.store).map(row => row.state)).toEqual(["pending", "batched"]);
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(2);
+  h.backend.step("Done"); h.backend.settle(); await h.router.tick();
+  for (const op of h.store.pendingOutbox()) h.store.outboxState(op.id, "sent");
+  expect(inbounds(h.store).every(row => (row.payload as import("../src/unanswered.ts").AnsweredInput).answeredAt !== undefined)).toBe(true);
+
+  const other = setup();
+  for (const id of ["held", "held-member"]) other.input(id, id, { source: "typed" });
+  await other.router.tick();
+  other.store.enqueue({ id: "outage:notice", kind: "control", text: "Technical problem", replyTo: "held" });
+  setSystemTime(start + 11 * 60_000); await other.router.checkUnanswered();
+  expect(inbounds(other.store).every(row => (row.payload as import("../src/unanswered.ts").AnsweredInput).unanswered === undefined)).toBe(true);
+});
+
+test("unanswered watchdog rechecks later candidates after an alert awaits while their reply sends", async () => {
+  const start = Date.parse("2026-11-16T11:30:17Z"); setSystemTime(start);
+  const h = setup(":memory:", { notifyUnanswered: async () => {
+    h.store.enqueue({ id: "late-send", kind: "conversation", text: "Done", replyTo: "next" });
+    h.store.outboxState("late-send", "sent"); return true;
+  } });
+  for (const id of ["first", "next"]) { h.input(id, id, { source: "typed" }); h.store.updateInbound(id, "done"); }
+  setSystemTime(start + 10 * 60_000); await h.router.checkUnanswered();
+  expect((inbounds(h.store)[1]!.payload as import("../src/unanswered.ts").AnsweredInput).answeredAt).toBeNumber();
+  expect(inbounds(h.store)[1]!.state).toBe("done");
+  expect((inbounds(h.store)[1]!.payload as import("../src/unanswered.ts").AnsweredInput).unanswered).toBeUndefined();
+});
+
+test("unanswered watchdog heals a lost-response steer admitted into a silent wake without the wake absorption fix", async () => {
+  const start = Date.parse("2026-11-16T11:30:17Z"); setSystemTime(start);
+  const alerts: string[][] = [];
+  const h = setup(":memory:", { replyMode: "tool", notifyUnanswered: async (...args) => { alerts.push(args); return true; } });
+  const steers = steering(h.backend, async call => {
+    h.backend.records.push({ id: call.messageId, type: "user", text: call.text, time: { created: Date.now() } });
+    throw new Error("respond failed after admission");
+  });
+  h.input("wake:nov16", "Watcher event", { source: "composed" }); await h.router.tick();
+  h.input("nov16-owner", "PRIVATE_NOV16_WORDS", { source: "typed" }); await h.router.tick();
+  expect(steers).toHaveLength(1);
+  expect(h.store.get<{ inboundId: string }>("activeTurn")?.inboundId).toBe("wake:nov16");
+  h.backend.step("NO_REPLY"); h.backend.settle(); await h.router.tick();
+  h.input("wake:later-nov16", "Later wake", { source: "composed" });
+  setSystemTime(start + 5 * 60_000);
+  const logs = await captureLogs(async () => { await h.router.checkUnanswered(); });
+  expect(logs.find(line => line.name === "inbound.requeued")?.props?.reason).toBe("watchdog_overdue");
+  await h.router.tick();
+  expect(h.backend.prompts.at(-1)?.text).toContain("PRIVATE_NOV16_WORDS");
+  expect(h.backend.prompts.at(-1)?.messageId).not.toBe(steers[0]!.messageId);
+  const route = h.store.get<{ id: string; generation: number }>("route")!;
+  h.store.enqueue({ id: "nov16-reply", kind: "conversation", text: "Done", sessionId: route.id, generation: route.generation });
+  h.store.outboxState("nov16-reply", "sent");
+  setSystemTime(start + 10 * 60_000); await h.router.checkUnanswered();
+  expect(alerts).toHaveLength(0);
+});
+
+test.each(["A", '/answer q_1 [["A"]]'])("a later reply covers the human question answer %s", async text => {
+  const h = setup();
+  h.input("question-root", "Ask me", { source: "typed" });
+  await h.router.tick();
+  h.backend.questionRequests = [question()];
+  await h.router.tick();
+  deliver(h.store);
+  h.input("question-answer", text, { source: "typed" });
+  await h.router.tick();
+  expect(h.backend.questionReplies).toHaveLength(1);
+  expect((inbounds(h.store).find(row => row.id === "question-answer")!.payload as import("../src/unanswered.ts").AnsweredInput).answeredAt).toBeUndefined();
+  h.backend.step("Thanks, done"); h.backend.settle();
+  await h.router.tick();
+  for (const op of h.store.pendingOutbox()) h.store.outboxState(op.id, "sent");
+  expect((inbounds(h.store).find(row => row.id === "question-answer")!.payload as import("../src/unanswered.ts").AnsweredInput).answeredAt).toBeNumber();
+});
