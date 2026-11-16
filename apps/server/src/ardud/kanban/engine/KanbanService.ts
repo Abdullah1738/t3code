@@ -2168,6 +2168,12 @@ const make = Effect.gen(function* () {
           detail: "The launch's card no longer exists.",
         });
       pendingLaunches.set(boardId, (pendingLaunches.get(boardId) ?? 0) + 1);
+      let retained = false;
+      const releasePending = Effect.sync(() => {
+        const left = (pendingLaunches.get(boardId) ?? 1) - 1;
+        if (left === 0) pendingLaunches.delete(boardId);
+        else pendingLaunches.set(boardId, left);
+      });
       return yield* Effect.flatMap(launchReconcile, (reconcile) => {
         let launched: ThreadId | undefined;
         let launchFailure: KanbanThreadError | undefined;
@@ -2232,17 +2238,22 @@ const make = Effect.gen(function* () {
                 ? Effect.succeed(result.success)
                 : Effect.fail(result.failure),
             ),
-            Effect.tap((id) => locks.launched(id, abandonLaunch(input, id))),
+            Effect.tap((id) =>
+              Effect.uninterruptible(
+                Effect.gen(function* () {
+                  yield* locks.launched(id, abandonLaunch(input, id));
+                  // Attachment may still release the gate. Keep purge blocked through
+                  // the owning operation, after its abandonment compensation finishes.
+                  yield* locks.launched(
+                    `pending-launch:${NodeCrypto.randomUUID()}`,
+                    releasePending,
+                  );
+                  retained = true;
+                }),
+              ),
+            ),
           );
-      }).pipe(
-        Effect.ensuring(
-          Effect.sync(() => {
-            const left = (pendingLaunches.get(boardId) ?? 1) - 1;
-            if (left === 0) pendingLaunches.delete(boardId);
-            else pendingLaunches.set(boardId, left);
-          }),
-        ),
-      );
+      }).pipe(Effect.ensuring(Effect.suspend(() => (retained ? Effect.void : releasePending))));
     }),
     send: sendThread,
     withdraw: (input) => locks.outside(touching(input.threadId, threadIo.withdraw(input))),

@@ -34912,3 +34912,111 @@ it.effect.each(["work", "review", "evaluator", "discussion"] as const)(
       );
     }),
 );
+
+it.effect.each(["attachment", "abandonment"] as const)(
+  "#1264 purge waits for post-launch discussion %s",
+  (finish) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const entered = yield* Deferred.make<void>();
+      const resume = yield* Deferred.make<void>();
+      const cleaning = yield* Deferred.make<void>();
+      const finishCleanup = yield* Deferred.make<void>();
+      const old = ThreadId.make("old-discussion-owner");
+      let oldReads = 0;
+      let launched: ThreadId | undefined;
+      const removed: ThreadId[] = [];
+      const lifecycle = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (real) =>
+          KanbanThreads.of({
+            ...real,
+            launch: (input) =>
+              real.launch(input).pipe(
+                Effect.tap((id) =>
+                  Effect.sync(() => {
+                    launched = id;
+                  }),
+                ),
+              ),
+            find: (id) =>
+              Effect.gen(function* () {
+                if (id === old && ++oldReads === 2) {
+                  yield* Deferred.succeed(entered, undefined);
+                  yield* Deferred.await(resume);
+                  if (finish === "abandonment")
+                    return yield* new KanbanThreadError({
+                      operation: "find",
+                      detail: "injected post-launch reconciliation failure",
+                    });
+                }
+                return yield* real.find(id);
+              }),
+            interrupt: (id, ...args) =>
+              Effect.gen(function* () {
+                if (finish === "abandonment" && id === launched) {
+                  yield* Deferred.succeed(cleaning, undefined);
+                  yield* Deferred.await(finishCleanup);
+                }
+                return yield* real.interrupt(id, ...args);
+              }),
+            remove: (id) =>
+              Effect.sync(() => {
+                removed.push(id);
+              }),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        const discussion = yield* kanban.createDiscussion(
+          board.id,
+          "Replace stale evaluator",
+          owner,
+        );
+        yield* store.putDiscussion({ ...discussion, evaluatorThreadId: old });
+        const launching = yield* kanban
+          .startEvaluator(board.id, {
+            kind: "discussion",
+            discussionId: discussion.id,
+            title: discussion.title,
+            cardNumber: null,
+          })
+          .pipe(Effect.exit, Effect.forkChild);
+        yield* Deferred.await(entered);
+        assert.isDefined(launched);
+        assert.isNull(yield* store.threadLink(launched!));
+        yield* kanban.updateBoard(board.id, { archived: true }, owner);
+        const refused = yield* Effect.result(kanban.purgeBoard(board.id, owner));
+        assert.equal(refused._tag, "Failure");
+        if (refused._tag === "Failure") assert.equal(refused.failure.code, "conflict");
+        assert.isNotNull(yield* store.board(board.id));
+        yield* Deferred.succeed(resume, undefined);
+        if (finish === "abandonment") {
+          yield* Deferred.await(cleaning);
+          const duringCleanup = yield* Effect.result(kanban.purgeBoard(board.id, owner));
+          assert.equal(duringCleanup._tag, "Failure");
+          if (duringCleanup._tag === "Failure")
+            assert.equal(duringCleanup.failure.code, "conflict");
+          yield* Deferred.succeed(finishCleanup, undefined);
+        }
+        yield* Fiber.join(launching);
+        assert.equal((yield* store.threadLink(launched!))?.boardId, board.id);
+        yield* kanban.purgeBoard(board.id, owner);
+        assert.include(removed, launched!);
+        assert.isNull(yield* store.board(board.id));
+        assert.isNull(yield* store.threadLink(launched!));
+        assert.deepStrictEqual(yield* store.pendingBoardPurges, []);
+        yield* kanban.purgeBoard(board.id, owner);
+        assert.isNull(yield* store.threadLink(launched!));
+      }).pipe(
+        Effect.ensuring(
+          Deferred.succeed(resume, undefined).pipe(
+            Effect.andThen(Deferred.succeed(finishCleanup, undefined)),
+          ),
+        ),
+        Effect.provide(testLayer(lifecycle)),
+      );
+    }),
+);
