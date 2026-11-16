@@ -38,7 +38,7 @@ _NAMES = {
     'case.open', 'case.update', 'case.close', 'case.reopen', 'case.corroborate',
     'question.ask', 'check.run', 'cache_reset', 'marketplace.refresh',
     'order_watch.item_drop_check',
-    'collector.hold_seen', 'collector.hold_stale', 'collector.hold_cleared',
+    'collector.hold_seen', 'collector.hold_stale', 'collector.hold_cleared', 'collector.hold_alert_sent',
 }
 _ENUMS = {
     'route': {'cdp', 'phone', 'unspecified'},
