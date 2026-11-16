@@ -5466,6 +5466,146 @@ function delegatedNoticeReply(h: ReturnType<typeof setup>, text = "Done: order #
   return `${runId}:reply`;
 }
 
+test.each(([false, true] as const).flatMap(sealed => [
+  { mode: "forwarded", outcome: "forwarded", replies: 1 },
+  { mode: "NO_REPLY", outcome: "no_reply", replies: 0 },
+  { mode: "owner", outcome: "owner_typed", replies: 0 },
+  { mode: "mixed-owner", outcome: "owner_typed", replies: 0 },
+  { mode: "tool", outcome: "quiet", replies: 0 },
+  { mode: "unfinished", outcome: "incomplete", replies: 0 },
+  { mode: "tool-calls", outcome: "incomplete", replies: 0 },
+  { mode: "failed", outcome: "failed", replies: 0 },
+  { mode: "modelError", outcome: "failed", replies: sealed ? 0 : 1 },
+  { mode: "error", outcome: "failed", replies: 0 },
+  { mode: "empty", outcome: "no_reply", replies: 0 },
+].map(row => ({ ...row, sealed }))))("notice.reply logs one reduced outcome ($mode, sealed=$sealed)", async ({ mode, outcome, replies, sealed }) => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0, ...(mode === "tool" ? { replyMode: "tool" as const } : {}) });
+  await exchange(h, "delegated-first", "Check the order", "NO_REPLY");
+  let runId = "";
+  const insert = () => {
+    const replyId = delegatedNoticeReply(h, mode === "NO_REPLY" ? "Private note\nNO_REPLY" : "PRIVATE_NOTICE_REPLY", mode === "owner" ? "user" : "agent");
+    const step = h.backend.records.at(-2) as Assistant;
+    const idle = h.backend.records.at(-1) as Extract<MessageRecord, { type: "idle" }>;
+    runId = mode === "empty" ? idle.id : replyId.slice(0, -":reply".length);
+    if (mode === "mixed-owner") h.backend.records.splice(-2, 0, { id: "desktop-prompt", type: "user", createdBy: "user", text: "PRIVATE_OWNER_PROMPT", time: { created: Date.now() } });
+    if (mode === "unfinished") delete step.time.completed;
+    if (mode === "tool-calls") step.finish = "tool-calls";
+    if (mode === "failed") idle.outcome = "failed";
+    if (mode === "modelError") idle.modelError = true;
+    if (mode === "error") step.error = { type: "provider", message: "PRIVATE_ERROR" };
+    if (mode === "empty") h.backend.records.splice(-2, 1);
+  };
+  const logs = await captureLogs(async () => {
+    if (sealed) {
+      h.backend.promptBehavior = async call => { insert(); h.backend.accept(call); };
+      h.input("wake:notice-log", "PRIVATE_WAKE");
+      await h.router.tick();
+      await h.router.tick();
+      h.backend.final("NO_REPLY");
+    } else insert();
+    for (let i = 0; i < 5; i++) await h.router.tick();
+    const restarted = new Router(h.store, h.backend, h.transport, h.routerOptions);
+    for (let i = 0; i < 3; i++) await restarted.tick();
+  });
+  const events = logs.filter(line => line.name === "notice.reply");
+  expect(events).toHaveLength(1);
+  expect(events[0]).toEqual({ ts: new Date(10_000).toISOString(), tool: "imessage", component: "router", kind: "event", name: "notice.reply",
+    ids: { chat: "owner", runId }, props: { source: sealed ? "settle_preceding" : "watch", outcome, replies, sealedWake: sealed } });
+  expect(JSON.stringify(events)).not.toMatch(/PRIVATE_|Result details|reached a terminal/);
+  expect(h.conversations()).toHaveLength(replies);
+});
+
+test("notice.reply stays absent for plain owner turns", async () => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0 });
+  const logs = await captureLogs(async () => {
+    await exchange(h, "owner-first", "Hello", "Hi");
+    delegatedNoticeReply(h, "Desktop reply", "user", "From the desktop");
+    for (let i = 0; i < 4; i++) await h.router.tick();
+  });
+  expect(logs.filter(line => line.name === "notice.reply")).toEqual([]);
+});
+
+test.each([false, true])("notice.reply counts each run and each enqueued assistant message (sealed=%s)", async sealed => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "delegated-first", "Check the order", "NO_REPLY");
+  const insert = () => {
+    delegatedNoticeReply(h);
+    const reply = h.backend.records.at(-2) as Assistant;
+    h.backend.records.splice(-1, 0, { ...reply, id: `${reply.id}:second` });
+    delegatedNoticeReply(h, "NO_REPLY");
+  };
+  const logs = await captureLogs(async () => {
+    if (sealed) {
+      h.backend.promptBehavior = async call => { insert(); h.backend.accept(call); };
+      h.input("wake:notice-count", "Another update");
+      await h.router.tick();
+      h.backend.final("NO_REPLY");
+    } else insert();
+    for (let i = 0; i < 7; i++) await h.router.tick();
+    await new Router(h.store, h.backend, h.transport, h.routerOptions).tick();
+  });
+  expect(logs.filter(line => line.name === "notice.reply").map(line => line.props)).toEqual([
+    { source: sealed ? "settle_preceding" : "watch", outcome: "forwarded", replies: 2, sealedWake: sealed },
+    { source: sealed ? "settle_preceding" : "watch", outcome: "no_reply", replies: 0, sealedWake: sealed },
+  ]);
+  expect(h.conversations()).toHaveLength(2);
+});
+
+test.each([
+  { mode: "forwarded", outcome: "forwarded", replies: 1 },
+  { mode: "NO_REPLY", outcome: "no_reply", replies: 0 },
+  { mode: "owner", outcome: "owner_typed", replies: 0 },
+  { mode: "mixed-before", outcome: "owner_typed", replies: 0 },
+  { mode: "mixed-after", outcome: "owner_typed", replies: 0 },
+])("notice.reply logs a notice sharing the sealed wake's idle ($mode)", async ({ mode, outcome, replies }) => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "delegated-first", "Check the order", "NO_REPLY");
+  h.backend.promptBehavior = async call => {
+    const before = h.backend.records.length;
+    delegatedNoticeReply(h, mode === "NO_REPLY" ? "NO_REPLY" : "Done", mode === "owner" ? "user" : "agent");
+    h.backend.records.pop();
+    if (mode.startsWith("mixed-")) h.backend.records.splice(before + (mode === "mixed-before" ? 0 : 1), 0,
+      { id: "desktop-prompt", type: "user", createdBy: "user", text: "Private owner text", time: { created: Date.now() } });
+    h.backend.accept(call);
+  };
+  const logs = await captureLogs(async () => {
+    h.input("wake:notice-shared", "Another update");
+    await h.router.tick();
+    await h.router.tick();
+    h.backend.final("NO_REPLY");
+    for (let i = 0; i < 4; i++) await h.router.tick();
+  });
+  expect(logs.filter(line => line.name === "notice.reply").map(line => line.props)).toEqual([
+    { source: "settle_preceding", outcome, replies, sealedWake: true },
+  ]);
+  expect(h.conversations()).toHaveLength(replies);
+});
+
+test.each([false, true])("notice.reply logging failures preserve forwarding (sealed=%s)", async sealed => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "delegated-first", "Check the order", "NO_REPLY");
+  const write = toolLog.write;
+  const failingLog = spyOn(toolLog, "write").mockImplementation(entry => {
+    if (entry.name === "notice.reply") throw new Error("Log unavailable");
+    write(entry);
+  });
+  try {
+    if (sealed) {
+      h.backend.promptBehavior = async call => { delegatedNoticeReply(h); h.backend.accept(call); };
+      h.input("wake:notice-failure", "Another update");
+      await h.router.tick();
+      h.backend.final("NO_REPLY");
+    } else delegatedNoticeReply(h);
+    for (let i = 0; i < 4; i++) await h.router.tick();
+    expect(h.conversations().map(op => op.text)).toEqual(["Done: order #2635"]);
+  } finally { failingLog.mockRestore(); }
+});
+
 test.each(delegatedNotices)("a delegated-task notice after the watermark forwards its reply exactly once (%s)", async notice => {
   setSystemTime(10_000);
   const h = setup(":memory:", { watchMs: 0 });
