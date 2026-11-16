@@ -234,7 +234,8 @@ def guard(box_id=None, recover_create=False, reconcile=False, lock_wait=None):
                 raise Busy(f"another caller is starting a box for {key}") from e
     try:
         check_queue()
-        if not queued and (wait > 0 or said) and time.monotonic() >= end:
+        # A zero lock budget still permits one immediate acquisition, regardless of the ordinary pool wait.
+        if not queued and lock_wait != 0 and (wait > 0 or said) and time.monotonic() >= end:
             raise pool.PoolBusyError(f"repository pool busy for {key}: allocation queue timed out; nothing ran")
     except BaseException:
         lock.__exit__(None, None, None)
