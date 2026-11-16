@@ -1528,7 +1528,9 @@ def _settled(r, echo=False, pos=0, *, locked=False, until=None, show_failure=Fal
     if _never_started(r):
         return _report_never_started(r)
     from . import pulls
-    if json.loads(dict(r).get('pulls') or '[]') and r['exit_code'] is not None and (r['status'] in ('done', 'failed', 'interrupted', 'killed')
+    from .runs import killed_result, complete_killed
+    killed = killed_result(r['run_id'], wait=r['exit_code'] in (None, 137, 143), until=until, row=r)
+    if killed is None and json.loads(dict(r).get('pulls') or '[]') and r['exit_code'] is not None and (r['status'] in ('done', 'failed', 'interrupted', 'killed')
                                      or dict(r).get('pull_state') in ('pending', 'running')):
         pulls.wait(r['run_id'], until=until)
         with contextlib.closing(db()) as con:
@@ -1536,9 +1538,8 @@ def _settled(r, echo=False, pos=0, *, locked=False, until=None, show_failure=Fal
         if current is not None and current['status'] in ('starting', 'running'):
             from .runs import finish
             finish(r['run_id'], r['exit_code'], r['status'], until=until, catch_up=False, bookkeeping=False)
+        killed = killed_result(r['run_id'], wait=r['exit_code'] in (None, 137, 143), until=until, row=r)
     from .runs import repo_setup_failed, settled_steps_code, planned_steps
-    from .runs import killed_result, complete_killed
-    killed = killed_result(r['run_id'], wait=r['exit_code'] in (None, 137, 143), until=until, row=r)
     budget = None if until is None else max(0, until-now())
     try:
         result = _catch_up_log(r, budget=budget, lock_wait=LOG_READ_WAIT_S)

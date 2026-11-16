@@ -2964,6 +2964,7 @@ def killed_result(run_id, *, wait=False, until=None, row=None, known_code=None):
                     if (current['status'], current['exit_code']) != ('killed', cached['exit_code']):
                         # Repair old killed/NULL rows and confirmed kills saved during a DB outage.
                         con.execute("UPDATE runs SET status='killed',exit_code=?,end_at=COALESCE(end_at,?) WHERE run_id=? "
+                                    "AND (pull_state IS NULL OR pull_state!='running') "
                                     "AND (status IN ('starting','running') OR exit_code IS NULL OR "
                                     "(status='failed' AND exit_code IN (137,143)))",
                                     (cached['exit_code'], cached.get('end_at') or now(), run_id))
@@ -3036,6 +3037,7 @@ def complete_killed(row, log_path=None, *, pulls=(), until=None, role='wait'):
         try:
             from .pulls import wait, report
             wait(row['run_id'], role, until=until)
+            killed_result(row['run_id'], known_code=row['exit_code'], until=until)
             report(row['run_id'], until=until)
         except (OffboxError, OSError, subprocess.TimeoutExpired, sqlite3.Error) as error:
             if isinstance(error, OffboxError) and error.code == EXIT_WAIT_TIMEOUT:
@@ -3151,6 +3153,10 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
             state_warning(run_id, code, error)
         return code
     if not r:
+        return code
+    if st == 'killed' and code == 143 and r['pull_state'] == 'running' and r['exit_code'] in (None, 137, 143):
+        # Keep the command receipt without releasing the box while its pull is publishing.
+        save_run_state(run_id, status=st, exit_code=code, end_at=now(), until=until)
         return code
     st, code = r['status'], r['exit_code']
     if log_row is not None:
