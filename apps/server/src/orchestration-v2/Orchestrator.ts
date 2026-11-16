@@ -11013,6 +11013,55 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             allocateEventId,
           }).pipe(mapDispatchError(command));
           yield* Ref.update(events, (current) => [...current, ...ended]);
+          const emitted = yield* Ref.get(events);
+          for (const node of child.nodes) {
+            if (
+              node.runId !== null ||
+              !ownedNodes.has(node.id) ||
+              !isOrchestrationV2WorkActive(node.status) ||
+              emitted.some((event) => event.type === "node.updated" && event.payload.id === node.id)
+            )
+              continue;
+            yield* emit(
+              events,
+              command,
+            )({
+              type: "node.updated",
+              threadId: command.threadId,
+              nodeId: node.id,
+              occurredAt: now,
+              payload: { ...node, status: "interrupted", completedAt: now },
+            });
+          }
+          for (const item of child.turnItems) {
+            if (
+              item.runId !== null ||
+              item.providerTurnId !== command.providerTurnId ||
+              !isOrchestrationV2WorkActive(item.status) ||
+              emitted.some(
+                (event) => event.type === "turn-item.updated" && event.payload.id === item.id,
+              )
+            )
+              continue;
+            yield* emit(
+              events,
+              command,
+            )({
+              type: "turn-item.updated",
+              threadId: command.threadId,
+              ...(item.nodeId === null ? {} : { nodeId: item.nodeId }),
+              occurredAt: now,
+              payload: {
+                ...item,
+                status: "interrupted",
+                completedAt: now,
+                updatedAt: now,
+                ...(item.type === "reasoning" || item.type === "assistant_message"
+                  ? { streaming: false }
+                  : {}),
+              },
+            });
+          }
           for (const message of child.messages) {
             if (
               message.runId !== null ||

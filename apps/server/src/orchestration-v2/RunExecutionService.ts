@@ -1323,10 +1323,12 @@ export const layer: Layer.Layer<
           attemptId: input.attempt.id,
           providerThreadId: input.providerThread.id,
         };
+        const subscribe =
+          input.session.subscribeEventsForIngestion ?? input.session.subscribeEvents;
         const eventSubscription =
-          input.session.subscribeEvents === undefined
+          subscribe === undefined
             ? { events: input.session.events, close: Effect.void }
-            : yield* input.session.subscribeEvents;
+            : yield* subscribe;
         // Admission can stop before the detached reader registers its finalizers.
         const closeSubscription = yield* Effect.cached(eventSubscription.close);
         const inheritedBackgroundTurnItems = yield* (
@@ -2173,6 +2175,7 @@ export const layer: Layer.Layer<
               Effect.flatMap((cause) => Effect.failCause(cause).pipe(Effect.delay("10 seconds"))),
             ),
           ),
+          Effect.ensuring(eventSubscription.ingestionEnded ?? Effect.void),
           Effect.mapError((cause) => new RunExecutionIngestError({ runId: input.run.id, cause })),
           Effect.flatMap(() =>
             Effect.gen(function* () {

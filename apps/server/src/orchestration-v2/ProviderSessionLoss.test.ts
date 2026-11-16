@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import {
   CommandId,
+  CheckpointScopeId,
   EventId,
   MessageId,
   NodeId,
@@ -22,6 +23,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import { TestClock } from "effect/testing";
 import { vi } from "vite-plus/test";
@@ -33,6 +35,7 @@ import * as EventSink from "./EventSink.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as Registry from "./ProviderAdapterRegistry.ts";
+import * as RunExecution from "./RunExecutionService.ts";
 import * as Sessions from "./ProviderSessionManager.ts";
 import * as Harness from "./testkit/ProviderReplayHarness.ts";
 import { userFacingDispatchErrorMessage } from "./UserFacingErrors.ts";
@@ -50,6 +53,7 @@ const sessionLoss = ({
   markerFailure = false,
   nativeThreads = false,
   shared = true,
+  buffered,
 }: {
   instance: "codex" | "codex-cu" | "opencode";
   reason: Sessions.ProviderSessionReleaseReason;
@@ -63,8 +67,13 @@ const sessionLoss = ({
   markerFailure?: boolean;
   nativeThreads?: boolean;
   shared?: boolean;
+  buffered?: "new turn" | "running update";
 }) =>
   Effect.gen(function* () {
+    const allAdmitted = yield* Deferred.make<void>();
+    const admitted = yield* Deferred.make<void>();
+    const resumeIngestion = yield* Deferred.make<void>();
+    const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
     const closing = yield* Deferred.make<void>();
     const finishClose = yield* Deferred.make<void>();
     const instanceId = ProviderInstanceId.make(instance);
@@ -107,7 +116,19 @@ const sessionLoss = ({
               updatedAt: now,
               lastError: null,
             },
-            events: Stream.never,
+            events: buffered
+              ? Stream.fromQueue(events).pipe(
+                  Stream.rechunk(1),
+                  Stream.tap((event) =>
+                    event.type === "provider_session.updated"
+                      ? Deferred.succeed(allAdmitted, undefined)
+                      : Effect.void,
+                  ),
+                )
+              : Stream.never,
+            startTurn: () => Effect.void,
+            interruptTurn: () => Effect.void,
+            awaitSessionExit: Effect.void,
             ...(instance === "opencode" ? {} : { backgroundTasksEndWithProcess: true }),
             steerTurn: ({
               providerThread,
@@ -124,6 +145,13 @@ const sessionLoss = ({
           } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime;
         }),
     } as ProviderAdapter.ProviderAdapterV2["Service"];
+    let firstIngest = true;
+    const afterProviderEvent = Effect.gen(function* () {
+      if (!firstIngest) return;
+      firstIngest = false;
+      yield* Deferred.succeed(admitted, undefined);
+      yield* Deferred.await(resumeIngestion);
+    });
     const database = Sqlite.layerMemory;
     const layer = Layer.mergeAll(
       ProjectionStore.layer.pipe(Layer.provide(database)),
@@ -134,6 +162,7 @@ const sessionLoss = ({
         {
           databaseLayer: database,
           runEffectWorker: false,
+          ...(buffered ? { afterProviderEvent } : {}),
         },
       ),
     );
@@ -394,6 +423,7 @@ const sessionLoss = ({
             providerThreadId: providerThread.id,
             providerTurnId: turnId,
           };
+          const toolId = NodeId.make(`native-tool:${depth}`);
           const taskId = NodeId.make(`native-task:${depth}`);
           const events = [
             {
@@ -424,6 +454,13 @@ const sessionLoss = ({
               },
             },
             {
+              id: EventId.make(`native-tool:${depth}`),
+              type: "node.updated" as const,
+              threadId,
+              occurredAt: now,
+              payload: { ...root, id: toolId, kind: "tool_call" as const, parentNodeId: rootId },
+            },
+            {
               id: EventId.make(`native-item:${depth}`),
               type: "turn-item.updated" as const,
               threadId,
@@ -432,7 +469,7 @@ const sessionLoss = ({
                 id: TurnItemId.make(`native-item:${depth}`),
                 threadId,
                 runId: null,
-                nodeId: rootId,
+                nodeId: toolId,
                 providerThreadId: providerThread.id,
                 providerTurnId: turnId,
                 nativeItemRef: null,
@@ -448,7 +485,12 @@ const sessionLoss = ({
               },
             },
           ];
-          yield* sink.write({ events });
+          yield* sink.write({
+            events:
+              buffered === "new turn" && depth === 1
+                ? events.filter((event) => event.type !== "provider-turn.updated")
+                : events,
+          });
           yield* sink.write({
             events: [
               {
@@ -530,6 +572,104 @@ const sessionLoss = ({
           ],
         });
       }
+      if (buffered) {
+        const execution = yield* RunExecution.RunExecutionServiceV2;
+        const current = yield* projections.getThreadProjection(target.threadId);
+        const runtime = Option.getOrThrow(yield* sessions.get(sessionId));
+        yield* execution.startRootRun({
+          commandId: CommandId.make("buffered-reader"),
+          appThread: current.thread,
+          providerSessionId: sessionId,
+          session: runtime,
+          run: current.runs[0]!,
+          rootNode: current.nodes.find((node) => node.id === target.root.id)!,
+          checkpointScope: {
+            id: CheckpointScopeId.make("buffered-scope"),
+            threadId: target.threadId,
+            runId: target.run.id,
+            nodeId: target.root.id,
+            parentScopeId: null,
+            providerThreadId: target.providerThread.id,
+            kind: "root_run",
+            ordinalWithinParent: 0,
+            advancesAppRunCount: true,
+            cwd: process.cwd(),
+            createdAt: yield* DateTime.now,
+          },
+          providerThread: current.providerThreads[0]!,
+          attempt: current.attempts[0]!,
+          attemptId: target.attempt.id,
+          providerTurnOrdinal: 1,
+          relatedThreadIds: [ThreadId.make("native-child:0"), ThreadId.make("native-child:1")],
+          message: {
+            messageId: MessageId.make("initial:session-loss-a"),
+            text: "initial",
+            attachments: [],
+            createdBy: "agent",
+            creationSource: "mcp",
+          },
+          modelSelection,
+          runtimePolicy: {
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            cwd: process.cwd(),
+          },
+        });
+        yield* Queue.offer(events, {
+          type: "provider_turn.updated",
+          driver,
+          providerTurn: target.turn,
+        });
+        yield* Deferred.await(admitted);
+        // This turn does not exist in the projection until the old reader drains.
+        const native = yield* projections.getThreadProjection(ThreadId.make("native-child:1"));
+        const oldTurn = {
+          ...target.turn,
+          id: ProviderTurnId.make("native-turn:1"),
+          providerThreadId: ProviderThreadId.make("native-provider-thread:1"),
+          nodeId: NodeId.make("native-root:1"),
+          runAttemptId: null,
+        };
+        const now = yield* DateTime.now;
+        if (buffered === "running update")
+          yield* sink.write({
+            events: [
+              {
+                id: EventId.make("remove-buffered-native-turn"),
+                type: "provider-turn.updated",
+                threadId: ThreadId.make("native-child:1"),
+                occurredAt: now,
+                payload: { ...oldTurn, status: "interrupted", completedAt: now },
+              },
+            ],
+          });
+        // Preserve routing to both native threads before the delayed running update.
+        const parent = current.subagents.find((task) => task.id === `remote:${target.threadId}`)!;
+        const firstChild = yield* projections.getThreadProjection(ThreadId.make("native-child:0"));
+        yield* Queue.offer(events, { type: "subagent.updated", driver, subagent: parent });
+        yield* Queue.offer(events, {
+          type: "subagent.updated",
+          driver,
+          subagent: firstChild.subagents[0]!,
+        });
+        yield* Queue.offer(events, {
+          type: "provider_thread.updated",
+          driver,
+          providerThread: native.providerThreads[0]!,
+        });
+        yield* Queue.offer(events, {
+          type: "provider_turn.updated",
+          driver,
+          providerTurn: oldTurn,
+          threadId: ThreadId.make("native-child:1"),
+        });
+        yield* Queue.offer(events, {
+          type: "provider_session.updated",
+          driver,
+          providerSession: runtime.providerSession,
+        });
+        yield* Deferred.await(allAdmitted);
+      }
       if (terminalBeforeRelease !== undefined) {
         const now = yield* DateTime.now;
         yield* sink.write({
@@ -592,6 +732,10 @@ const sessionLoss = ({
         .release({ providerSessionId: sessionId, reason })
         .pipe(Effect.forkScoped);
       yield* Deferred.await(closing);
+      if (buffered) {
+        assert.isTrue(Option.isNone(yield* outbox.get("effect:session-ended:native-turn:1")));
+        yield* Deferred.succeed(resumeIngestion, undefined);
+      }
       assert.isTrue(Option.isNone(yield* sessions.get(sessionId)));
       const steer = {
         type: "message.dispatch" as const,
@@ -895,19 +1039,21 @@ const sessionLoss = ({
           !nativeThreads
         );
         const current = yield* projections.getThreadProjection(target.threadId);
+        const settled =
+          buffered && index === 0
+            ? ["failed", "interrupted"]
+            : [(index === 0 ? terminalBeforeRelease : undefined) ?? "interrupted"];
         assert.equal(
           current.providerTurns.find((turn) => turn.id === target.turn.id)?.status,
           (index === 0 ? terminalBeforeRelease : undefined) ?? "interrupted",
         );
-        assert.equal(
-          current.runs.find((run) => run.id === target.run.id)?.status,
+        assert.include(
           replace && index === 0
-            ? "running"
-            : index === 0 && terminalBeforeRelease !== undefined
-              ? terminalBeforeRelease === "completed"
-                ? "waiting"
-                : terminalBeforeRelease
-              : "interrupted",
+            ? ["running"]
+            : index === 0 && terminalBeforeRelease === "completed"
+              ? ["waiting"]
+              : settled,
+          current.runs.find((run) => run.id === target.run.id)?.status,
         );
         if (replace && index === 0) {
           assert.equal(
@@ -939,13 +1085,15 @@ const sessionLoss = ({
           );
         }
         if (hasNativeWork && instance !== "opencode") {
-          assert.equal(
+          const childSettled =
+            buffered && index === 0 ? ["failed", "interrupted"] : ["interrupted"];
+          assert.include(
+            childSettled,
             current.subagents.find((task) => task.id === `remote:${target.threadId}`)?.status,
-            "interrupted",
           );
-          assert.equal(
+          assert.include(
+            childSettled,
             current.nodes.find((node) => node.id === `remote:${target.threadId}`)?.status,
-            "interrupted",
           );
         }
         if (hasNativeWork)
@@ -954,14 +1102,11 @@ const sessionLoss = ({
             instance === "opencode" ? "running" : "interrupted",
           );
         if (!replace || index !== 0) {
-          assert.equal(
+          assert.include(
+            settled,
             current.attempts.find((attempt) => attempt.id === target.attempt.id)?.status,
-            (index === 0 ? terminalBeforeRelease : undefined) ?? "interrupted",
           );
-          assert.equal(
-            current.nodes.find((node) => node.id === target.root.id)?.status,
-            (index === 0 ? terminalBeforeRelease : undefined) ?? "interrupted",
-          );
+          assert.include(settled, current.nodes.find((node) => node.id === target.root.id)?.status);
         }
       }
       if (nativeThreads)
@@ -975,6 +1120,10 @@ const sessionLoss = ({
           );
           assert.equal(
             child.nodes.find((node) => node.id === `native-root:${depth}`)?.status,
+            "interrupted",
+          );
+          assert.equal(
+            child.nodes.find((node) => node.id === `native-tool:${depth}`)?.status,
             "interrupted",
           );
           assert.equal(
@@ -1014,7 +1163,11 @@ const sessionLoss = ({
         );
         assert.lengthOf(current.runs, 2);
       }
-    }).pipe(Effect.ensuring(Deferred.succeed(finishClose, undefined)), Effect.provide(layer));
+    }).pipe(
+      Effect.ensuring(Deferred.succeed(resumeIngestion, undefined)),
+      Effect.ensuring(Deferred.succeed(finishClose, undefined)),
+      Effect.provide(layer),
+    );
   });
 
 it.effect.each([
@@ -1094,4 +1247,10 @@ it.effect("retains an accepted steer after exclusive-session loss and replacemen
     terminalBeforeRelease: "failed",
     shared: false,
   }),
+);
+
+it.effect.each(["new turn", "running update"] as const)(
+  "drains admitted native-child writes before capturing shared session loss (%s)",
+  (buffered) =>
+    sessionLoss({ instance: "codex-cu", reason: "runtime_error", nativeThreads: true, buffered }),
 );
