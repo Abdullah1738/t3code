@@ -529,8 +529,15 @@ def receipt_for_question(data, charge, qid=None, questions=None, at=None):
     current = current or (dict(charge, at=stamp(at)) if at is not None else None)
     # Descriptor variants of one alert may have different question IDs. Only
     # different transactions, including settled ones, compete for a receipt.
+    # Hold estimates and converted totals can compete across different amounts;
+    # USD receipts also compete with the supported AED conversion on either side.
+    variant = charges.receipt_variant(charge)
     rivals = [q for q in questions if q['id'] != qid and q.get('kind') == 'charge'
-              and q['currency'] == charge['currency'] and Decimal(q['amount']) == Decimal(charge['amount'])
+              and (q['currency'] == charge['currency']
+                   or ({q['currency'], charge['currency']} == {'AED', 'USD'}
+                       and (variant == 'usd' or charges.receipt_variant(q) == 'usd')))
+              and (Decimal(q['amount']) == Decimal(charge['amount'])
+                   or variant or charges.receipt_variant(q))
               and (not current or not moment(q.get('at')) or not alert_alias(current, q))]
 
     def accepts(row, text):
@@ -541,6 +548,10 @@ def receipt_for_question(data, charge, qid=None, questions=None, at=None):
                 return False
             observed = moment(other.get('at'))
             if observed is None:
+                continue
+            if charges.alternate_receipt(other, observed, received, row, text):
+                return False
+            if not charges.amount_pattern(other).search(text):
                 continue
             named = any(re.search(r'\b' + re.escape(word) + r'\b', text, re.I)
                         for word in charges.words(other['merchant']))

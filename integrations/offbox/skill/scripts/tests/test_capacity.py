@@ -418,6 +418,7 @@ class PoolTests(Isolated):
         self.assertEqual(row['box_id'], 'new')
         self.assertIn('skipping a', err.getvalue())
         self.assertIn('fresh lease', err.getvalue())
+        self.assertNotIn('--delete', err.getvalue())
         new.assert_called_once()
         # The marked box is never offered again: a second acquire never even tries to reuse it.
         tried = []

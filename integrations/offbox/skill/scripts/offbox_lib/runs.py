@@ -24,7 +24,7 @@ from types import SimpleNamespace
 
 from . import home, api, capacity, identity, lease, node_tools, node_version, package_manager, pnpm_version, pool, ssh_sync, run_evidence
 from . import command_usage, common, containers, java_version, prune, prepare, userns
-from . import resources
+from . import resources, queue_lifecycle
 from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_LOCAL, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
                      RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError, atomic_write_json, db, db_retry, event, file_lock, local_error, log, new_id, now,
                      is_silenced, offsets_path, person, read_json, record_delivery, say, silence, write)
@@ -1931,6 +1931,9 @@ class Runner:
     def require_pending(self, con) -> None:
         row = con.execute('SELECT status FROM runs WHERE run_id=?', (self.run_id,)).fetchone()
         if not row or row['status'] != 'starting':
+            if os.environ.get(BACKGROUND_RUN_ENV):
+                queue_lifecycle.note(self.run_id, 'settled', 'row_no_longer_pending',
+                                     status=row['status'] if row else None)
             raise OffboxError(f'{self.run_id}: settled before the command started; nothing ran', code=130)
 
     def _prepare_box(self, con, a, rdir, env_file, body) -> dict | None:
@@ -3245,6 +3248,13 @@ def background_wait_hint(run_id: str) -> None:
 
 
 def background_queue(run_id: str, payload: dict) -> int:
+    with queue_lifecycle.client(run_id) as result:
+        code = _background_queue(run_id, payload)
+        result['exit_code'] = code
+        return code
+
+
+def _background_queue(run_id: str, payload: dict) -> int:
     a, me = SimpleNamespace(**payload['args']), payload['me']
     source_failure = None
     con = db()
@@ -3254,6 +3264,7 @@ def background_queue(run_id: str, payload: dict) -> int:
             if (not row or row['mode'] != 'bg' or row['status'] != 'starting' or row['box_id'] or row['process_id']
                     or row['client_pid'] != os.getpid() or row['owner'] != me['owner']
                     or row['repo_root'] != me['repo_root'] or payload['backend'] != common.backend()):
+                queue_lifecycle.note(run_id, 'settled', 'adoption_rejected', status=row['status'] if row else None)
                 raise OffboxError(f'{run_id}: queued run cannot be adopted', code=EXIT_LOCAL)
             con.execute('UPDATE runs SET client_pid=?,start_at=? WHERE run_id=?', (os.getpid(), now(), run_id))
         cwd = Path(row['local_cwd'] or row['cwd'])
@@ -3278,6 +3289,7 @@ def background_client(a, me: dict, ready=None, accept=None, signal_mask=None, so
     from . import cli
     rid = os.environ[BACKGROUND_RUN_ENV]
     def interrupted(signum, frame):
+        queue_lifecycle.received(rid, signum)
         raise _ClientSignal
     old = {s: signal.signal(s, interrupted) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
     code = EXIT_LOCAL
@@ -3297,6 +3309,7 @@ def background_client(a, me: dict, ready=None, accept=None, signal_mask=None, so
             finally:
                 os.close(accept)
             if accepted not in (b'1', b''):
+                queue_lifecycle.note(rid, 'settled', 'handoff_rejected')
                 finish(rid, EXIT_LOCAL, 'local_error')
                 return EXIT_LOCAL
         rn = Runner(a, me)
@@ -3309,6 +3322,7 @@ def background_client(a, me: dict, ready=None, accept=None, signal_mask=None, so
             error, queue_s = source_failure
             rn.queue_s = queue_s
             rn.source_gone(error)
+            queue_lifecycle.note(rid, 'settled', 'source_gone', message=str(error))
             say(str(error))
             code = 2
             return code
@@ -3338,9 +3352,11 @@ def forward_background(env: dict, *, backend="boat") -> None:
     if _background_context is None:
         raise OffboxError('background failover has no queued run context', code=EXIT_LOCAL)
     # Reuse the stdin protocol on failover too: an exec of the original argv would expose --env values.
+    rid = os.environ.get(BACKGROUND_RUN_ENV)
     common.select_backend(backend)
     os.environ.clear()
     os.environ.update(env)
+    queue_lifecycle.note(rid, 'handoff', 'forwarded', backend=backend)
     raise SystemExit(_background(*_background_context))
 
 
@@ -3481,6 +3497,8 @@ def _run_remote(a, rn) -> int:
     def on_sig(signum, _frame):
         if interrupted['sig'] is None:
             interrupted["sig"] = signum
+            if os.environ.get(BACKGROUND_RUN_ENV):
+                queue_lifecycle.received(rn.run_id, signum)
             raise _ClientSignal
 
     # Installed before rn.start(): a tool-call timeout's SIGTERM during the pool wait or the lease must reach
@@ -3520,6 +3538,8 @@ def _run_remote(a, rn) -> int:
             finish(rn.run_id, rn.recovered_code)
             print(rn.run_id)
             background_wait_hint(rn.run_id)
+            if os.environ.get(BACKGROUND_RUN_ENV):
+                queue_lifecycle.note(rn.run_id, 'handoff', 'handoff', box_id=rn.box, recovered_code=rn.recovered_code)
             return 0
         if a.bg:
             # Nobody stays attached to refresh the deadline: give the box a long one. The reaper stops it
@@ -3528,6 +3548,8 @@ def _run_remote(a, rn) -> int:
             print(rn.run_id)
             background_wait_hint(rn.run_id)
             say(f"started in background on {rn.box}")
+            if os.environ.get(BACKGROUND_RUN_ENV):
+                queue_lifecycle.note(rn.run_id, 'handoff', 'handoff', box_id=rn.box, process_id=rn.pid)
             return 0
         kill_hint = dict(run_id=rn.run_id, status='running', exit_code=None, process_id=getattr(rn, 'pid', None), box_id=rn.box,
                          step_count=len(getattr(a, 'steps', None) or []), mode='fg')

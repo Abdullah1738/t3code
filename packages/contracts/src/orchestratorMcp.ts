@@ -803,6 +803,7 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
     code: Schema.Literals([
       "capability_denied",
       "parent_not_active",
+      "run_starting",
       "caller_unresolved",
       "delegation_timeout",
       "ambiguous_replay",
