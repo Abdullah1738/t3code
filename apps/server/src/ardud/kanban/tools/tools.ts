@@ -850,7 +850,7 @@ const CardNext = tool(
 const CardEdit = tool(
   "card_edit",
   "Edit a card",
-  "Evaluators: change any card field. Links are added by URL and removeLinks takes them off by URL (both in one call replace a link); blockedBy replaces the list. promptEdits / subtaskEdits: exact find-and-replace on the prompt / open subtask texts; each oldString must appear exactly count times (default 1) in the text as left by the edits before it; all apply or none do. Not with prompt / subtasks in the same call.",
+  "Evaluators: change any card field. Links are added by URL and removeLinks takes them off by URL (both in one call replace a link); blockedBy replaces the list. Replacing prompt or subtasks requires basedOn from the updatedAt you read; on conflict, card_get again, merge, and retry. promptEdits / subtaskEdits: exact find-and-replace on the prompt / open subtask texts; each oldString must appear exactly count times (default 1) in the text as left by the edits before it; all apply or none do. Not with prompt / subtasks in the same call.",
   {
     boardId: BoardRef,
     card: CardRef,
@@ -859,6 +859,12 @@ const CardEdit = tool(
     prompt: Schema.optional(Schema.String),
     promptEdits: Schema.optional(ExactEdits),
     subtaskEdits: Schema.optional(ExactEdits),
+    basedOn: Schema.optional(
+      describe(
+        Schema.String,
+        "updatedAt from your last card_get/card_create/card_edit result; required when replacing prompt or subtasks.",
+      ),
+    ),
     priority: Schema.optional(
       describe(
         KanbanPriority,

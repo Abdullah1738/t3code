@@ -284,6 +284,7 @@ export interface NewCard {
 }
 
 export interface CardPatch {
+  readonly basedOn?: string | undefined;
   readonly title?: string | undefined;
   readonly description?: string | undefined;
   readonly prompt?: string | undefined;
@@ -3349,6 +3350,9 @@ const make = Effect.gen(function* () {
                 ? yield* nowIso
                 : (before.analyticsStageEnteredAt ?? before.movedAt),
           };
+        // Other mutations must not roll back a version used as an edit's basedOn.
+        if (before !== null && Date.parse(card.updatedAt) < Date.parse(before.updatedAt))
+          card = { ...card, updatedAt: before.updatedAt };
         // A release completion and its pacing receipt must survive the same restart.
         const write = releaseBoard
           ? rawStore.observeCallerWrites(
@@ -10740,7 +10744,9 @@ const make = Effect.gen(function* () {
       stalled: null,
       nudgedAt: null,
       // Recovery retains queue age, parked waits, and every retry record.
-      updatedAt: yield* nowIso,
+      updatedAt: DateTime.formatIso(
+        DateTime.makeUnsafe(Math.max(yield* Clock.currentTimeMillis, Date.parse(card.updatedAt))),
+      ),
     };
     yield* saveReviewGateState(card, next, { head: Retries.gateRefusalHead(refused) });
     yield* kick;
@@ -15853,7 +15859,7 @@ const make = Effect.gen(function* () {
       "card.update",
       Effect.gen(function* () {
         const card = yield* cardOf(cardId);
-        const { promptEdits, subtaskEdits, ...fields } = inputPatch;
+        const { promptEdits, subtaskEdits, basedOn, ...fields } = inputPatch;
         let patch: CardPatch = fields;
         if (promptEdits !== undefined) {
           if (patch.prompt !== undefined)
@@ -15899,8 +15905,39 @@ const make = Effect.gen(function* () {
         }
         // Instruction audits deduplicate by receipt: two real applications can
         // have identical comments, even from the same evaluator.
+        const protectedFields = (["prompt", "subtasks"] as const).filter(
+          (field) => patch[field] !== undefined,
+        );
+        if (
+          (promptEdits !== undefined || subtaskEdits !== undefined) &&
+          Object.values(patch).every((value) => value === undefined)
+        )
+          return card;
+        const checkBase = basedOn !== undefined && protectedFields.length > 0;
+        const baseMs = basedOn === undefined ? NaN : Date.parse(basedOn);
+        if (
+          checkBase &&
+          (!/^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(
+            basedOn!,
+          ) ||
+            !Number.isFinite(baseMs) ||
+            DateTime.formatIso(DateTime.makeUnsafe(`${basedOn!.slice(0, 10)}T00:00:00.000Z`)).slice(
+              0,
+              10,
+            ) !== basedOn!.slice(0, 10))
+        )
+          return yield* failWith(
+            "invalid",
+            "basedOn must be the ISO updatedAt from the card you read",
+          );
+        if (checkBase && baseMs > Date.parse(card.updatedAt))
+          return yield* failWith(
+            "invalid",
+            "basedOn cannot be newer than the card's current updatedAt; read it again with card_get",
+          );
         const events =
-          instructionApplication === undefined && isRetryActor(actor) && patch.comment?.trim()
+          checkBase ||
+          (instructionApplication === undefined && isRetryActor(actor) && patch.comment?.trim())
             ? yield* store.cardEvents(card.id)
             : [];
         if (
@@ -15908,7 +15945,49 @@ const make = Effect.gen(function* () {
           editRepeats(card, patch, events, actor, yield* Clock.currentTimeMillis)
         )
           return card;
-        const at = yield* nowIso;
+        if (checkBase) {
+          const conflict = events.find(
+            (event) =>
+              (event.kind === "edited" || event.kind === "linked") &&
+              Date.parse(event.at) > baseMs &&
+              actorKey(event.actor) !== actorKey(actor) &&
+              event.body
+                ?.split(",")
+                .some((field) =>
+                  protectedFields.some((protectedField) => field.trim() === protectedField),
+                ),
+          );
+          if (conflict) {
+            const changed = conflict
+              .body!.split(",")
+              .map((field) => field.trim())
+              .filter((field) =>
+                protectedFields.some((protectedField) => field === protectedField),
+              );
+            const by = conflict.actor;
+            const who =
+              by._tag === "evaluator" || by._tag === "thread"
+                ? `${by._tag} thread ${by.threadId}`
+                : by._tag === "system"
+                  ? `system ${by.component}`
+                  : by._tag === "script"
+                    ? `script ${by.scriptId}`
+                    : "owner";
+            return yield* failWith(
+              "conflict",
+              `card #${card.number}'s ${changed.join(" and ")} was changed at ${conflict.at} by ${who}, after the ${basedOn} version you based this edit on. Read it again with card_get, merge your change into the current prompt/subtasks, and retry with basedOn set to its updatedAt.`,
+            );
+          }
+        }
+        // updatedAt is the edit base: distinguish writes in the same clock millisecond.
+        const at = DateTime.formatIso(
+          DateTime.makeUnsafe(
+            Math.max(
+              yield* Clock.currentTimeMillis,
+              Date.parse(card.updatedAt) + (protectedFields.length > 0 ? 1 : 0),
+            ),
+          ),
+        );
         const pools = yield* store.pools(card.boardId);
         const models = patch.models ? yield* cardModels(card.boardId, patch.models) : null;
         const model = models
@@ -16075,6 +16154,7 @@ const make = Effect.gen(function* () {
           .map(([key]) => key);
         if (changed.length > 0)
           yield* logEvent(next, actor, patch.links || patch.removeLinks ? "linked" : "edited", {
+            at,
             body: changed.join(", "),
           });
         if (patch.comment?.trim())

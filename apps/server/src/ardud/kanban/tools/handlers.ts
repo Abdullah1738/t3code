@@ -1326,6 +1326,11 @@ const handlers = {
   card_edit: McpToolAccess.actsAsCaller((input) =>
     asEvaluator((service, caller) =>
       Effect.gen(function* () {
+        if ((input.prompt !== undefined || input.subtasks !== undefined) && !input.basedOn?.trim())
+          return yield* invalid(
+            "card_edit with prompt or subtasks requires basedOn from the updatedAt of the card you read; use card_get, merge your change, and retry",
+            "invalid_args",
+          );
         if (
           input.subtasks?.some((subtask) => subtask.clearGate !== undefined) &&
           (yield* ancestorThreadIds(caller)).length > 0
@@ -1347,6 +1352,7 @@ const handlers = {
             prompt: input.prompt,
             promptEdits: input.promptEdits,
             subtaskEdits: input.subtaskEdits,
+            basedOn: input.basedOn,
             priority: input.priority,
             ...(input.goalId !== undefined
               ? { goalId: input.goalId === null ? null : KanbanGoalId.make(input.goalId) }
