@@ -49,7 +49,7 @@ class PhoneLockTests(unittest.TestCase):
         for obj, name, value in [(lock, 'LOCK_DIR', self.root), (lock, 'HOLD', self.root/'priority-hold'),
                                   (lock, 'LEASE', self.root/'lease.json'), (ph, 'STATE', self.root/'events'),
                                   (ph, 'd', Mock(return_value=self.device)), (ph, '_d', None),
-                                  (lock, 'event_hook', ph.lock_event),
+                                  (lock, 'event_hook', ph.lock_event), (lock, '_lost_holds', set()),
                                   (ph, 'caller_chain', Mock(return_value=[dict(pid=123, comm='zsh', cwd_tail='projects/fixture')]))]:
             p = patch.object(obj, name, value)
             p.start(); self.addCleanup(p.stop)
@@ -309,6 +309,53 @@ class PhoneLockTests(unittest.TestCase):
             self.assertEqual(self.cli('open','dev.fixture')[0],5)
         self.assertEqual(lock.HOLD.read_text(),'successor')
         self.device.app_start.assert_not_called()
+
+    def test_bad_library_holder_pid_leaves_no_hold(self):
+        for pid in (0,-1,True,False,'123',1.5):
+            with self.subTest(pid=pid):
+                with self.assertRaises(ValueError): lock.hold_acquire(HOLD_TOKEN,holder_pid=pid)
+                self.assertFalse(lock.HOLD.exists())
+                self.assertFalse((self.root/'priority-hold.owner.json').exists())
+
+    def test_broken_metadata_lock_keeps_diagnostics_and_gate_usable(self):
+        for failure in (FileExistsError,PermissionError,NotADirectoryError):
+            with self.subTest(failure=failure), patch.object(lock,'metadata_lock',side_effect=failure):
+                for args in [('help',),('log',),('ui',)]:
+                    self.assertEqual(self.cli(*args)[0],0)
+                code,out=self.cli('open','dev.fixture')
+                self.assertEqual(code,5,out)
+                self.assertIn('lease metadata unavailable',out)
+        self.device.app_start.assert_not_called()
+
+    def test_event_path_sweep_keeps_lost_hold_until_reacquired(self):
+        for sweep in (lambda: lock.status(), lambda: ph.lock_event('fixture')):
+            with self.subTest(sweep=sweep), patch.dict(os.environ,PHONE_HOLD_OWNER=HOLD_TOKEN):
+                self.hold(pid=99999999)
+                with patch.object(lock,'process_started',return_value=False): sweep()
+                self.assertFalse(lock.HOLD.exists())
+                self.assertEqual(self.cli('open','dev.fixture')[0],5)
+                self.assertEqual(self.cli('open','dev.fixture')[0],5)
+                self.assertNotIn(HOLD_TOKEN,str(lock._lost_holds))
+                lock.hold_acquire(HOLD_TOKEN)
+                self.assertEqual(self.cli('open','dev.fixture')[0],0)
+
+    def test_hold_discovered_dead_in_action_status_refuses_send(self):
+        self.hold(pid=99999999)
+        with patch.dict(os.environ,PHONE_HOLD_OWNER=HOLD_TOKEN), patch.object(lock,'process_started',side_effect=['fixture start',False]):
+            code,out=self.cli('open','dev.fixture')
+        self.assertEqual(code,5,out)
+        self.assertIn('acquire it again',out)
+        self.device.app_start.assert_not_called()
+
+    def test_refresh_of_absent_or_expired_hold_requests_reacquire(self):
+        with patch.dict(os.environ,PHONE_HOLD_OWNER=HOLD_TOKEN):
+            for age in (None,31*60):
+                with self.subTest(age=age):
+                    if age is not None: self.hold(age)
+                    code,out=self.cli('hold','refresh')
+                    self.assertEqual(code,5,out)
+                    self.assertIn('acquire it again',out)
+                    self.assertFalse(lock.HOLD.exists())
 
     def test_invalid_hold_arguments_never_echo_tokens(self):
         for args in [('acquire', '--token', HOLD_TOKEN, 'extra'), ('status', HOLD_TOKEN),
@@ -720,6 +767,18 @@ class LeaseRunTests(unittest.TestCase):
     def command(self, code):
         return [sys.executable, '-I', self.script, 'lease', 'run', '--owner', 'runner', '--purpose', 'qa',
                 '--ttl', '2s', '--', sys.executable, '-I', '-c', code]
+
+    def test_real_cli_with_lock_dir_pointing_to_file(self):
+        script=str(Path(__file__).with_name('ph.py'))
+        blocked=self.root/'not-a-directory'
+        blocked.touch()
+        env={**self.env,'PH_LOCK_DIR':str(blocked),'HOME':str(self.root)}
+        for args,expected in [(['help'],0),(['log'],0),(['open','dev.fixture'],5),(['hold','status','--json'],0)]:
+            with self.subTest(args=args):
+                result=subprocess.run([sys.executable,'-I',script,*args],env=env,cwd=self.root,
+                                      capture_output=True,text=True,timeout=10)
+                self.assertEqual(result.returncode,expected,result.stdout+result.stderr)
+                self.assertNotIn('Traceback',result.stderr)
 
     def test_real_cli_archive_and_refusal_keep_context(self):
         script=str(Path(__file__).with_name('ph.py'))

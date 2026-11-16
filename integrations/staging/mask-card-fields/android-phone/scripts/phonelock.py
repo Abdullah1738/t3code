@@ -27,6 +27,7 @@ DEFAULT_TTL = 20 * 60
 MAX_TTL = 120 * 60
 HOLD_STALE_AFTER = 30 * 60
 event_hook = lambda kind: None
+_lost_holds = set()
 
 
 class Busy(Exception):
@@ -197,9 +198,11 @@ def _hold_status():
                   'not_refreshed' if age > stale_after else None)
         if reason:
             if archive_hold(snapshot):
+                lost = bool(held) and os.environ.get('PHONE_HOLD_OWNER') == held
+                if lost:
+                    _lost_holds.add(token_sha(held))
                 hold_archive_event(reason, age, state['agent_comm'], token_sha(held))
-                state.update(present=os.path.lexists(HOLD), archived=reason,
-                             lost_hold=bool(held) and os.environ.get('PHONE_HOLD_OWNER') == held)
+                state.update(present=os.path.lexists(HOLD), archived=reason, lost_hold=lost)
             # A replaced or refreshed hold is busy even when we restored it.
             return state
         state['own_hold'] = bool(held) and os.environ.get('PHONE_HOLD_OWNER') == held
@@ -233,8 +236,12 @@ def hold_archive_event(reason, age_s, agent_comm, digest):
 
 
 def hold_status():
-    with metadata_lock():
-        return _hold_status()
+    try:
+        with metadata_lock():
+            return _hold_status()
+    except OSError:
+        return dict(present=os.path.lexists(HOLD), own_hold=False, age_s=None, stale_in_s=None,
+                    holder_alive=None, agent_comm=None)
 
 
 def hold_state():
@@ -245,6 +252,8 @@ def hold_state():
 def hold_acquire(token, *, holder_pid=None):
     if not token or token != token.strip():
         raise ValueError('hold token must be nonempty without surrounding whitespace')
+    if holder_pid is not None and (not isinstance(holder_pid, int) or isinstance(holder_pid, bool) or holder_pid <= 0):
+        raise ValueError('invalid holder pid')
     with metadata_lock():
         if _hold_status()['present']:
             raise Busy(HOLD_REASON)
@@ -263,6 +272,7 @@ def hold_acquire(token, *, holder_pid=None):
                 write_holder(token, holder_pid)
             except OSError:
                 pass
+            _lost_holds.discard(token_sha(token))
         finally:
             path.unlink(missing_ok=True)
 
@@ -271,7 +281,7 @@ def hold_refresh():
     with metadata_lock():
         state = _hold_status()
         if not state['own_hold']:
-            raise Busy('hold is not yours')
+            raise Busy(HOLD_LOST_REASON if not state['present'] else 'hold is not yours')
         snapshot = hold_snapshot()
         with HOLD.open() as handle:
             if not same_hold(snapshot, (os.fstat(handle.fileno()), handle.read())) or snapshot[1].strip() != os.environ.get('PHONE_HOLD_OWNER'):
@@ -448,7 +458,8 @@ def status():
 
 def check(action):
     hold = hold_status()
-    if hold.get('lost_hold'):
+    owner = os.environ.get('PHONE_HOLD_OWNER')
+    if hold.get('lost_hold') or (owner and token_sha(owner) in _lost_holds and not hold['own_hold']):
         return False, HOLD_LOST_REASON
     present, own_hold = hold['present'], hold['own_hold']
     if present:
