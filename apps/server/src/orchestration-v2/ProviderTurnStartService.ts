@@ -1739,11 +1739,9 @@ export const layer: Layer.Layer<
       const {
         sameNativeThread,
         handoffUsage,
-        deliveredItemIds,
         acceptedAttempts,
         nativeInputRunIds,
         legacyInputRunIds,
-        budget,
       } = handoffContext;
       const retryHandoff = resumedRetryHandoff ?? (yield* prepareRetryHandoff(handoffContext));
       // ardud: the marker belongs to the adopted native id, not a later replacement.
@@ -1894,15 +1892,18 @@ export const layer: Layer.Layer<
       );
       const startWithHandoffs = Effect.fn("ProviderTurnStartService.startWithHandoffs")(
         function* (turnInput: Parameters<typeof session.startTurn>[0], compact = false) {
-          const contextForInput = handoffContextForThread(turnInput.providerThread);
+          // The prepared budget includes capacity reported while loading a fresh native thread.
+          const contextForInput =
+            turnInput.providerThread.nativeThreadRef?.nativeId ===
+            loadedProviderThread.nativeThreadRef?.nativeId
+              ? handoffContext
+              : handoffContextForThread(turnInput.providerThread);
           const delivery = yield* deliverContextHandoffs({
             handoffs: [...effectiveHandoffs, ...retryHandoff],
             deferInline: compact,
             providerThread: turnInput.providerThread,
-            budget: contextForInput.sameNativeThread ? budget : contextForInput.budget,
-            alreadyDeliveredItemIds: contextForInput.sameNativeThread
-              ? deliveredItemIds
-              : contextForInput.deliveredItemIds,
+            budget: contextForInput.budget,
+            alreadyDeliveredItemIds: contextForInput.deliveredItemIds,
             ...(session.injectHistory === undefined
               ? {}
               : {
