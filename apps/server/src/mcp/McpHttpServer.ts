@@ -79,6 +79,7 @@ import { AttachmentToolkit } from "./toolkits/attachment/tools.ts";
 import * as AttachmentHandlers from "./toolkits/attachment/handlers.ts";
 import { ThreadToolkit } from "./toolkits/thread/tools.ts";
 import * as ThreadHandlers from "./toolkits/thread/handlers.ts";
+import * as BackgroundTerminals from "../ardud/exec-sessions/BackgroundTerminals.ts";
 import * as ThreadMetadataMcpService from "./ThreadMetadataMcpService.ts";
 import * as McpSessionRegistry from "./McpSessionRegistry.ts";
 import * as PreviewAutomationBroker from "./PreviewAutomationBroker.ts";
@@ -1727,7 +1728,11 @@ export const layerPreviewToolkit = Layer.mergeAll(
 export const layerOrchestratorToolkit = toolkitRegistration(
   OrchestratorToolkit,
   OrchestratorHandlers.layer,
-).pipe(Layer.provide(OrchestratorMcpService.layer), Layer.provide(ThreadMetadataMcpService.layer));
+).pipe(
+  Layer.provide(OrchestratorMcpService.layer),
+  Layer.provide(ThreadMetadataMcpService.layer),
+  Layer.provide(BackgroundTerminals.layer),
+);
 
 export const layerThreadToolkit = toolkitRegistration(ThreadToolkit, ThreadHandlers.layer);
 

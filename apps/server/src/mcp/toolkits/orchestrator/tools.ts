@@ -41,6 +41,8 @@ import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as OrchestratorMcpService from "../../OrchestratorMcpService.ts";
 import * as ThreadMetadataMcpService from "../../ThreadMetadataMcpService.ts";
 
+import * as BackgroundTerminals from "../../../ardud/exec-sessions/BackgroundTerminals.ts";
+
 const dependencies = [
   McpInvocationContext.McpInvocationContext,
   ThreadManagementService.ThreadManagementService,
@@ -273,7 +275,36 @@ const ThreadInterruptTool = Tool.make("t3_thread_interrupt", {
   .annotate(Tool.Title, "Interrupt a T3 thread")
   .annotate(Tool.Destructive, true);
 
+const execDependencies = [
+  McpInvocationContext.McpInvocationContext,
+  ThreadManagementService.ThreadManagementService,
+  BackgroundTerminals.BackgroundTerminals,
+];
+const ExecSessionsTool = Tool.make("t3_exec_sessions", {
+  description:
+    "List your own Codex background exec_command sessions. Ctrl-C via write_stdin only interrupts sessions started with tty:true; use t3_exec_session_stop for others.",
+  success: Schema.Struct({ sessions: Schema.Array(BackgroundTerminals.ExecSession) }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies: execDependencies,
+})
+  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Idempotent, true);
+const ExecSessionStopTool = Tool.make("t3_exec_session_stop", {
+  description:
+    "Stop your own Codex background exec_command session by sessionId. Ctrl-C via write_stdin only interrupts sessions started with tty:true.",
+  parameters: BackgroundTerminals.StopInput,
+  success: BackgroundTerminals.StopResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies: execDependencies,
+})
+  .annotate(Tool.Destructive, true)
+  .annotate(Tool.Idempotent, true);
+
 export const OrchestratorToolkit = Toolkit.make(
+  ExecSessionsTool,
+  ExecSessionStopTool,
   OrchestratorCapabilitiesTool,
   DelegateTaskTool,
   TaskStatusTool,

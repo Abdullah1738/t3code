@@ -1,3 +1,6 @@
+import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
+import * as ProviderSessionManager from "../../orchestration-v2/ProviderSessionManager.ts";
 import { AnalyticsToolkit } from "./analytics/tools.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -66,6 +69,9 @@ import { WorktreeToolkit } from "./worktree/tools.ts";
 import { DeviceToolkit } from "./device/tools.ts";
 
 const layerOrchestratorToolkit = McpHttpServer.layerOrchestratorToolkit.pipe(
+  Layer.provide(McpProviderSessions.layer),
+  Layer.provide(Layer.mock(Orchestrator.OrchestratorV2)({})),
+  Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
   Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
 );
