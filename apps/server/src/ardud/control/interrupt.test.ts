@@ -237,6 +237,13 @@ describe("control interrupt", () => {
         const response = yield* post({ expectedRunId: "run-old" });
         assert.strictEqual(response.status, 409);
         assert.strictEqual(response.body.error.code, "conflict");
+        assert.strictEqual(response.body.error.reason, "run_not_interruptible");
+        assert.strictEqual(response.body.error.retrySafe, false);
+        assert.deepStrictEqual(response.body.error.holder, {
+          threadId,
+          runId: "run-old",
+          status: null,
+        });
         assert.strictEqual((yield* Ref.get(calls))[0]?.runId, "run-old");
         assert.deepStrictEqual(yield* Ref.get(dispatched), []);
       }),
@@ -273,6 +280,9 @@ describe("control interrupt", () => {
         assert.deepStrictEqual(response.body.error, {
           code: "conflict",
           message: "Run run-new is on attempt att-2, not att-1.",
+          reason: "attempt_changed",
+          retrySafe: false,
+          holder: { threadId, runId: "run-new", status: "running" },
         });
         assert.deepStrictEqual(yield* Ref.get(calls), []);
         assert.deepStrictEqual(yield* Ref.get(dispatched), []);
@@ -313,6 +323,8 @@ describe("control interrupt", () => {
         const missing = yield* post({ expectedRunId: "run-missing", expectedAttemptId: "att-1" });
         assert.strictEqual(missing.status, 409);
         assert.strictEqual(missing.body.error.code, "conflict");
+        assert.strictEqual(missing.body.error.reason, "run_not_found");
+        assert.strictEqual(missing.body.error.retrySafe, false);
         assert.deepStrictEqual(
           (yield* Ref.get(calls)).map((input) => input.runId),
           [RunId.make("run-done"), RunId.make("run-missing")],
