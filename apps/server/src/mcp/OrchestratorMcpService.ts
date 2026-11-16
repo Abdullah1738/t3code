@@ -3379,10 +3379,11 @@ const make = Effect.gen(function* () {
         )
           return yield* recoverAsyncReceipt();
       }
-      const callerRuntime = yield* bounded(
+      const callerIdentity = yield* bounded(
         "caller_credential",
         resolveCallerRuntime(credentials, scope.thread, parentRecords),
       );
+      const callerRuntime = callerIdentity?.runtimeProviderSessionId;
       const parentRun =
         parentRecords.runs
           .filter(

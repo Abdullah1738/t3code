@@ -18,6 +18,7 @@ import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as ThreadManagementService from "../ThreadManagementService.ts";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
+import type * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
 import * as McpSessionRegistryTestkit from "../../mcp/McpSessionRegistry.testkit.ts";
 import * as VcsDriverRegistry from "../../vcs/VcsDriverRegistry.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
@@ -285,6 +286,7 @@ export function layerWithRegistry<Error>(
     readonly continueThreadsAfterServerUpdate?: boolean;
     readonly ardudHarnessMigration?: import("@t3tools/contracts").ArdudHarnessMigrationSettings;
     readonly configureMcp?: boolean;
+    readonly mcpRegistryLayer?: Layer.Layer<McpSessionRegistry.McpSessionRegistry>;
   } = {},
 ): Layer.Layer<
   | Orchestrator.OrchestratorV2
@@ -419,7 +421,7 @@ export function layerWithRegistry<Error>(
         layerEventSinkProvided,
         IdAllocator.layer,
         McpProviderSessions.layer,
-        McpSessionRegistryTestkit.layer,
+        options.mcpRegistryLayer ?? McpSessionRegistryTestkit.layer,
         layerProviderEventIngestorProvided,
         layerStores,
       ),
@@ -551,7 +553,7 @@ export function layerWithRegistry<Error>(
         layerStores,
         layerEventSinkProvided,
         layerRunFinalizationServiceProvided,
-        McpSessionRegistryTestkit.layer,
+        options.mcpRegistryLayer ?? McpSessionRegistryTestkit.layer,
         layerCheckpointRollbackServiceProvided,
         layerProviderSessionManagerProvided,
         layerProviderTurnControlServiceProvided,
