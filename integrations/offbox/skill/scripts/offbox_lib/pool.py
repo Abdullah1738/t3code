@@ -1196,8 +1196,8 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                         # still-full pool queues (exit 92) instead of failing with the resume error (exit 90).
                         stopped_failed = True
                         say(f"skipping {row['box_id']}: its disk needs {e.need} GiB but '{e.size}' holds {e.holds} GiB. "
-                            f"It stays stopped with its disk and no longer counts toward the pool (remove it with: "
-                            f"offbox release {row['box_id']} --delete). Trying other pool boxes, then a fresh lease.")
+                            "It stays stopped with its disk and no longer counts toward the pool. "
+                            "Trying other pool boxes, then a fresh lease.")
                         continue
                     except OffboxError as e:
                         if isinstance(e, home.StartWaitFailed):
