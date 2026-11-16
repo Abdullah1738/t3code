@@ -10099,7 +10099,12 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           nativeThreadId: string,
         ) {
           const queryPolicy = claudeRuntimeQueryPolicyForRuntimePolicy(turnInput.runtimePolicy);
-          const mcpSession = yield* mcpSessions.read(turnInput.threadId);
+          const mcpSession = yield* McpProviderSessions.readForRuntime(
+            mcpSessions,
+            turnInput.threadId,
+            input.providerSessionId,
+            CLAUDE_PROVIDER,
+          );
           const recallUrl = adapterOptions.environment.ROBOB_RECALL_MCP_URL?.trim();
           const mcpOverrides = claudeMcpQueryOverrides({
             mcpSession,

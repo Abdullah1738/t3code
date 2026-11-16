@@ -926,7 +926,10 @@ describe("ClaudeAdapterV2 MCP query overrides", () => {
             },
           });
           const threadId = ThreadId.make("thread-claude-recall");
-          yield* (yield* McpProviderSessions.McpProviderSessions).set(mcpSessionFor(threadId));
+          yield* (yield* McpProviderSessions.McpProviderSessions).set({
+            ...mcpSessionFor(threadId),
+            runtimeProviderSessionId: ProviderSessionId.make("provider-session-claude-recall"),
+          });
           const runtime = yield* adapter.openSession({
             threadId,
             providerSessionId: ProviderSessionId.make("provider-session-claude-recall"),

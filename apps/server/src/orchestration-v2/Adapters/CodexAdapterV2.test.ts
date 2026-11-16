@@ -2916,7 +2916,8 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           yield* (yield* McpProviderSessions.McpProviderSessions).set({
             environmentId: EnvironmentId.make("environment-codex-mcp"),
             threadId,
-            providerSessionId: `provider-session-${scenario}`,
+            providerSessionId: `mcp-credential-${scenario}`,
+            runtimeProviderSessionId: ProviderSessionId.make(`provider-session-${scenario}`),
             providerInstanceId: ProviderInstanceId.make("codex"),
             endpoint: "http://127.0.0.1:43123/mcp",
             authorizationHeader: "Bearer secret-codex-token",
@@ -3133,7 +3134,8 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       yield* (yield* McpProviderSessions.McpProviderSessions).set({
         environmentId: EnvironmentId.make("environment-codex-mcp"),
         threadId: ThreadId.make(`thread-${scenario}`),
-        providerSessionId: `provider-session-${scenario}`,
+        providerSessionId: `mcp-credential-${scenario}`,
+        runtimeProviderSessionId: ProviderSessionId.make(`provider-session-${scenario}`),
         providerInstanceId: ProviderInstanceId.make("codex"),
         endpoint: "http://127.0.0.1:43123/mcp",
         authorizationHeader: "Bearer secret-codex-token",
@@ -3188,7 +3190,8 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       yield* (yield* McpProviderSessions.McpProviderSessions).set({
         environmentId: EnvironmentId.make("environment-codex-recall"),
         threadId,
-        providerSessionId: `provider-session-${scenario}`,
+        providerSessionId: `mcp-credential-${scenario}`,
+        runtimeProviderSessionId: ProviderSessionId.make(`provider-session-${scenario}`),
         providerInstanceId: ProviderInstanceId.make("codex"),
         endpoint: "http://127.0.0.1:43123/mcp",
         authorizationHeader: "Bearer secret-codex-token",
@@ -5061,6 +5064,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           environmentId: EnvironmentId.make("test"),
           threadId: harness.threadId,
           providerSessionId: "context-session",
+          runtimeProviderSessionId: ProviderSessionId.make("provider-session-restore-context"),
           providerInstanceId: ProviderInstanceId.make("codex"),
           endpoint: "http://127.0.0.1:43123/mcp",
           authorizationHeader: "Bearer test",

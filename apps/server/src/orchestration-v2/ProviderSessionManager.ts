@@ -587,6 +587,7 @@ export const layerWithOptions = (
       const prepareMcpSession = (
         threadId: ThreadId,
         providerInstanceId: ProviderInstanceId,
+        providerSessionId: ProviderSessionId,
       ): Effect.Effect<PreparedMcpCredential> =>
         options.configureMcp === false
           ? mcpSessions
@@ -595,12 +596,9 @@ export const layerWithOptions = (
           : mcpPrepareLock.withLock(
               threadId,
               Effect.gen(function* () {
-                // Reuse a still-valid credential for this thread instead of
-                // rotating: long-lived provider processes (codex app-server)
-                // build their MCP client once per conversation and keep using
-                // the credential it started with, so a thread that detaches and
-                // re-attaches across a workspace handoff must come back to the
-                // same token or the process's tool calls fail auth.
+                // A live runtime's MCP client keeps its token across a workspace
+                // detach/reattach. A replacement runtime needs a new credential
+                // so its predecessor cannot adopt the replacement's active run.
                 const { browser: browserToolsAvailable, device: deviceToolsAvailable } =
                   yield* agentAccessSettings(threadId);
                 const capabilities = new Set<
@@ -609,7 +607,14 @@ export const layerWithOptions = (
                 if (browserToolsAvailable) capabilities.add("preview");
                 if (deviceToolsAvailable) capabilities.add("device");
                 const existing = yield* mcpSessions.read(threadId);
-                if (existing !== undefined) {
+                const recordedCredential = (yield* Ref.get(sessions))
+                  .get(sessionKey(providerSessionId))
+                  ?.mcpCredentialIdByThread.get(threadId);
+                if (
+                  existing !== undefined &&
+                  recordedCredential === existing.providerSessionId &&
+                  existing.runtimeProviderSessionId === providerSessionId
+                ) {
                   // Reserve before the async resolve so a release cannot
                   // revoke the credential between validation and reservation.
                   reserveMcpCredential(threadId, existing.providerSessionId);
@@ -643,7 +648,10 @@ export const layerWithOptions = (
                   browserToolsAvailable,
                   capabilities,
                 });
-                yield* mcpSessions.set(credential.config);
+                yield* mcpSessions.set({
+                  ...credential.config,
+                  runtimeProviderSessionId: providerSessionId,
+                });
                 reserveMcpCredential(threadId, credential.config.providerSessionId);
                 return { mcpCredentialId: credential.config.providerSessionId, issued: true };
               }),
@@ -1591,7 +1599,11 @@ export const layerWithOptions = (
               Effect.uninterruptible,
             );
             if (attached !== undefined) {
-              const prepared = yield* prepareMcpSession(input.threadId, input.providerInstanceId);
+              const prepared = yield* prepareMcpSession(
+                input.threadId,
+                input.providerInstanceId,
+                input.providerSessionId,
+              );
               preparedForCleanup = prepared;
               if (prepared.mcpCredentialId !== undefined) {
                 const mcpCredentialId = prepared.mcpCredentialId;
@@ -2863,6 +2875,7 @@ export const layerWithOptions = (
               const prepared = yield* prepareMcpSession(
                 input.threadId,
                 input.modelSelection.instanceId,
+                input.providerSessionId,
               );
               const mcpCredentialId = prepared.mcpCredentialId;
               let reservationDropped = mcpCredentialId === undefined;

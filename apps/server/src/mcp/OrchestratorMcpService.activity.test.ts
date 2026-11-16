@@ -1,3 +1,4 @@
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import { expectJsonRoundTrip } from "./McpJson.testkit.ts";
 import {
   EnvironmentId,
@@ -110,6 +111,7 @@ it.effect.each(["caller row", "caller records", "idle target", "dispatch"] as co
 );
 
 const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
+  Layer.provide(McpProviderSessions.layer),
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
   Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
 );

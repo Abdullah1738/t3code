@@ -1,3 +1,4 @@
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as DelegatedTaskProgressGuard from "../orchestration-v2/DelegatedTaskProgressGuard.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -49,6 +50,7 @@ import type { McpInvocationScope } from "./McpInvocationContext.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 
 const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
+  Layer.provide(McpProviderSessions.layer),
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
   Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
 );
