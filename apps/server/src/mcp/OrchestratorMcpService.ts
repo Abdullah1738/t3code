@@ -3085,6 +3085,18 @@ const make = Effect.gen(function* () {
           ...(saved === undefined ? {} : { saved }),
           message: `Task ${expectedTaskId} ${saved === true ? "was created; use task_status to recover it" : "may still be created; use task_status to check whether it was saved"}. Retry only with the same clientRequestId: ${key}.`,
         });
+      const rejected = Effect.fn("OrchestratorMcpService.delegationRejected")(function* (
+        reason: string,
+        previousCall = false,
+      ) {
+        yield* McpCallAnalytics.setSaved(false);
+        const message = previousCall
+          ? `Delegated task was not created; safe to retry with a new clientRequestId. An earlier call with this clientRequestId was rejected: ${reason}`
+          : `Delegated task was not created; safe to retry with the same clientRequestId. ${reason}`;
+        return /Parent (?:run|node) .* (?:not active|stopping|not part)/.test(reason)
+          ? new OrchestratorMcpFailure({ code: "parent_not_active", saved: false, message })
+          : new OrchestratorMcpFailure({ code: "orchestration_error", saved: false, message });
+      });
       const parentRun =
         parentRecords.runs
           .filter((run) => {
@@ -3119,6 +3131,11 @@ const make = Effect.gen(function* () {
         }
         if (state === undefined || state.status === "pending")
           return yield* uncertainCreation(undefined);
+        if (state.status === "rejected")
+          return yield* yield* rejected(
+            state.error ?? "The orchestrator rejected the request.",
+            true,
+          );
         yield* McpCallAnalytics.setSaved(false);
         return yield* new OrchestratorMcpFailure({
           code: "parent_not_active",
@@ -3196,15 +3213,6 @@ const make = Effect.gen(function* () {
         workspaceStrategy = { type: "worktree", baseRef: base.commitSha, startFromOrigin: false };
       }
       const dispatchAccepted = yield* Deferred.make<void, OrchestratorMcpFailure>();
-      const rejected = Effect.fn("OrchestratorMcpService.delegationRejected")(function* (
-        reason: string,
-      ) {
-        yield* McpCallAnalytics.setSaved(false);
-        const message = `Delegated task was not created; safe to retry with the same clientRequestId. ${reason}`;
-        return /Parent (?:run|node) .* (?:not active|stopping|not part)/.test(reason)
-          ? new OrchestratorMcpFailure({ code: "parent_not_active", saved: false, message })
-          : new OrchestratorMcpFailure({ code: "orchestration_error", saved: false, message });
-      });
       const upgradeCompletionWake = Effect.fn("OrchestratorMcpService.upgradeCompletionWake")(
         (taskId: NodeId) =>
           threadManagement
@@ -3276,7 +3284,7 @@ const make = Effect.gen(function* () {
                 Effect.flatMap(Effect.fail),
               ),
             OrchestratorCommandPreviouslyRejectedError: (error) =>
-              rejected(error.detail).pipe(Effect.flatMap(Effect.fail)),
+              rejected(error.detail, true).pipe(Effect.flatMap(Effect.fail)),
           }),
           Effect.mapError((error) =>
             isOrchestratorMcpFailure(error)

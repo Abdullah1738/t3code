@@ -1969,101 +1969,117 @@ describe("OrchestratorMcpService provider resolution", () => {
     turnItems: [],
   } as unknown as OrchestrationV2ThreadProjection;
 
-  it.effect.each(["direct rejection", "rejected receipt at timeout", "no active run"] as const)(
-    "delegateTask gives a definite not-created reply for %s",
-    (path) =>
-      Effect.gen(function* () {
-        const entered = yield* Deferred.make<void>();
-        const release = yield* Deferred.make<void>();
-        const finished = yield* Deferred.make<void>();
-        const commandId = CommandId.make(
-          `command:mcp:delegate-task:${encodeURIComponent(scope.environmentId)}:${encodeURIComponent(parentThreadId)}:parent-ended`,
-        );
-        const receipt = {
-          commandId,
-          threadId: parentThreadId,
-          commandType: "delegated_task.request",
-          acceptedAt: DateTime.makeUnsafe("2026-11-16T00:00:00Z"),
-          resultSequence: 0,
-          status: "rejected" as const,
-          error: `Parent run ${parentRunId} is not active.`,
-        };
-        const state: McpCall["Service"] = {
-          callerResolved: false,
-          callerResolveMs: 0,
-          readerLane: "background",
-          phase: "handler",
-          saved: "unknown",
-        };
-        let rejected = false;
-        const dependencies = Layer.mergeAll(
-          NodeServices.layer,
-          Layer.mock(ThreadManagementService.ThreadManagementService)({
-            getCallerRow: (id) =>
-              Effect.succeed({ ...liveThreadShell(id), ...parentProjection([]).thread }),
-            getThreadRecords: () => {
-              const projection = parentProjection([]);
-              return Effect.succeed(
-                path === "no active run" ? { ...projection, runs: [] } : projection,
-              );
-            },
-            hasReceipt: () => Effect.succeed(false),
-            getCommandReceipt: () =>
-              Effect.succeed(rejected ? Option.some(receipt) : Option.none()),
-            getDelegationCommandState: () =>
-              Effect.succeed(rejected ? receipt : { status: "never_saved" as const }),
-            dispatch: (command) =>
-              Effect.gen(function* () {
-                assert.equal(command.commandId, commandId);
-                rejected = true;
-                yield* Deferred.succeed(entered, undefined);
-                if (path === "rejected receipt at timeout") yield* Deferred.await(release);
-                return yield* new Orchestrator.OrchestratorDispatchError({
+  it.effect.each([
+    "direct rejection",
+    "rejected receipt at timeout",
+    "no active run",
+    "previously rejected receipt",
+    "idle previously rejected receipt",
+  ] as const)("delegateTask gives a definite not-created reply for %s", (path) =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const finished = yield* Deferred.make<void>();
+      const commandId = CommandId.make(
+        `command:mcp:delegate-task:${encodeURIComponent(scope.environmentId)}:${encodeURIComponent(parentThreadId)}:parent-ended`,
+      );
+      const receipt = {
+        commandId,
+        threadId: parentThreadId,
+        commandType: "delegated_task.request",
+        acceptedAt: DateTime.makeUnsafe("2026-11-16T00:00:00Z"),
+        resultSequence: 0,
+        status: "rejected" as const,
+        error: `Parent run ${parentRunId} is not active.`,
+      };
+      const state: McpCall["Service"] = {
+        callerResolved: false,
+        callerResolveMs: 0,
+        readerLane: "background",
+        phase: "handler",
+        saved: "unknown",
+      };
+      const previousCall = path.includes("previously rejected");
+      const idle = path === "no active run" || path === "idle previously rejected receipt";
+      let rejected = previousCall;
+      let dispatches = 0;
+      const dependencies = Layer.mergeAll(
+        NodeServices.layer,
+        Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getCallerRow: (id) =>
+            Effect.succeed({ ...liveThreadShell(id), ...parentProjection([]).thread }),
+          getThreadRecords: () => {
+            const projection = parentProjection([]);
+            return Effect.succeed(idle ? { ...projection, runs: [] } : projection);
+          },
+          hasReceipt: () => Effect.succeed(false),
+          getCommandReceipt: () => Effect.succeed(rejected ? Option.some(receipt) : Option.none()),
+          getDelegationCommandState: () =>
+            Effect.succeed(rejected ? receipt : { status: "never_saved" as const }),
+          dispatch: (command) =>
+            Effect.gen(function* () {
+              assert.equal(command.commandId, commandId);
+              dispatches++;
+              rejected = true;
+              yield* Deferred.succeed(entered, undefined);
+              if (path === "rejected receipt at timeout") yield* Deferred.await(release);
+              if (previousCall)
+                return yield* new Orchestrator.OrchestratorCommandPreviouslyRejectedError({
                   commandId: command.commandId,
                   commandType: command.type,
-                  cause: receipt.error,
+                  detail: receipt.error,
                 });
-              }).pipe(Effect.ensuring(Deferred.succeed(finished, undefined))),
+              return yield* new Orchestrator.OrchestratorDispatchError({
+                commandId: command.commandId,
+                commandType: command.type,
+                cause: receipt.error,
+              });
+            }).pipe(Effect.ensuring(Deferred.succeed(finished, undefined))),
+        }),
+        ServerSettings.layerTest(),
+        providerRegistryLayer([
+          providerSnapshot({
+            instanceId: codexInstanceId,
+            driver: ProviderDriverKind.make("codex"),
+            model: "gpt-5.4",
           }),
-          ServerSettings.layerTest(),
-          providerRegistryLayer([
-            providerSnapshot({
-              instanceId: codexInstanceId,
-              driver: ProviderDriverKind.make("codex"),
-              model: "gpt-5.4",
-            }),
-          ]),
-          adapterRegistryLayer([codexInstanceId]),
-          Layer.mock(ProjectService.ProjectService)({}),
-          Layer.mock(SecretRequests.SecretRequests)({}),
-          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        ]),
+        adapterRegistryLayer([codexInstanceId]),
+        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(SecretRequests.SecretRequests)({}),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        const pending = yield* service
+          .delegateTask(scope, { task: "Review", mode: "async", clientRequestId: "parent-ended" })
+          .pipe(Effect.flip, Effect.forkChild);
+        if (!idle) yield* Deferred.await(entered);
+        if (path === "rejected receipt at timeout") yield* TestClock.adjust("10 seconds");
+        const error = yield* Fiber.join(pending);
+        yield* Deferred.succeed(release, undefined);
+        if (!idle) yield* Deferred.await(finished);
+        assert.equal(error.code, "parent_not_active");
+        assert.isTrue("saved" in error);
+        assert.equal(error.saved, false);
+        assert.equal(
+          (yield* decodeMcpFailureJson(yield* encodeMcpFailureJson(error))).saved,
+          false,
         );
-        yield* Effect.gen(function* () {
-          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
-          const pending = yield* service
-            .delegateTask(scope, { task: "Review", mode: "async", clientRequestId: "parent-ended" })
-            .pipe(Effect.flip, Effect.forkChild);
-          if (path !== "no active run") yield* Deferred.await(entered);
-          if (path === "rejected receipt at timeout") yield* TestClock.adjust("10 seconds");
-          const error = yield* Fiber.join(pending);
-          yield* Deferred.succeed(release, undefined);
-          if (path !== "no active run") yield* Deferred.await(finished);
-          assert.equal(error.code, "parent_not_active");
-          assert.isTrue("saved" in error);
-          assert.equal(error.saved, false);
-          assert.equal(
-            (yield* decodeMcpFailureJson(yield* encodeMcpFailureJson(error))).saved,
-            false,
-          );
-          assert.match(error.message, /not created; safe to retry/i);
-          if (path !== "no active run") assert.include(error.message, receipt.error);
-          assert.notInclude(error.message, "may still be created");
-          assert.equal(state.saved, false);
-        }).pipe(
-          Effect.provideService(McpCall, state),
-          Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))),
-        );
-      }),
+        assert.match(error.message, /not created; safe to retry/i);
+        if (path !== "no active run") assert.include(error.message, receipt.error);
+        if (previousCall) {
+          assert.include(error.message, "An earlier call with this clientRequestId was rejected");
+          assert.include(error.message, "safe to retry with a new clientRequestId");
+        }
+        assert.equal(dispatches, idle ? 0 : 1);
+        assert.notInclude(error.message, "may still be created");
+        assert.equal(state.saved, false);
+      }).pipe(
+        Effect.provideService(McpCall, state),
+        Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))),
+      );
+    }),
   );
 
   it.effect.each(
