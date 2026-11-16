@@ -554,10 +554,26 @@ def _fields(props):
                            for kind, bucket in value.items() if kind in {'receipt', 'order', 'refund', 'history', 'other'}
                            and isinstance(bucket, dict)}
         elif key == 'chargeCensus' and isinstance(value, dict):
-            result[key] = {app: {k: v for k, v in counts.items()
-                if k in {'open', 'matched', 'proven_clean', 'limited', 'error', 'not_checked', 'marketplace_hold', 'marketplace_stale'}
-                and type(v) is int and 0 <= v <= 10**9}
-                for app, counts in value.items() if app in {'noon', 'careem'} and isinstance(counts, dict)}
+            result[key] = {}
+            reason_codes = {
+                'marketplace_hold', 'marketplace_stale', 'receipt_out_of_time', 'msgs_timeout',
+                'owner_list_failed', 'owner_incomplete', 'receipt_not_checked', 'other',
+                'source_limit:ORDER_LIST_HOST_BINDING_UNVERIFIED',
+            } | {f'{kind}:{lane}' for kind in ('lane_uncovered', 'lane_slice_out', 'lane_error')
+                 for lane in ('minutes', 'marketplace', 'food', 'nownow')}
+            for app, counts in value.items():
+                if app not in {'noon', 'careem'} or not isinstance(counts, dict):
+                    continue
+                safe = {k: v for k, v in counts.items()
+                        if k in {'open', 'matched', 'proven_clean', 'limited', 'error', 'not_checked',
+                                 'marketplace_hold', 'marketplace_stale'}
+                        and type(v) is int and 0 <= v <= 10**9}
+                for field, allowed in (('limit_reasons', reason_codes),
+                                       ('limit_age_days', {'lt7', '7_30', '30_60', 'gt60'})):
+                    if isinstance(counts.get(field), dict):
+                        safe[field] = {k: v for k, v in counts[field].items() if k in allowed
+                                       and type(v) is int and 0 <= v <= 10**9}
+                result[key][app] = safe
         elif key == 'orderCoverage' and isinstance(value, dict):
             result[key] = {}
             for app in ('noon', 'careem'):
