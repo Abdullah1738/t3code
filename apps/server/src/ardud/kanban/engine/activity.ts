@@ -15,6 +15,7 @@ import {
   kanbanWithoutDeciding,
   kanbanRetryNotBefore,
   kanbanAskKind,
+  kanbanStepSubtasks,
   KANBAN_DECIDE_MS,
   type KanbanBoard,
   type KanbanCard,
@@ -435,6 +436,8 @@ const capped = <T>(items: ReadonlyArray<T>, max: number) =>
 
 export interface RollupInput {
   readonly window: ActivityWindow;
+  readonly currentAt?: string;
+  readonly currentSlots?: ReadonlyArray<SlotEvent>;
   readonly board?: KanbanBoard | Pick<KanbanBoard, "pause" | "setup" | "archivedAt"> | null;
   readonly dispatchCards?: ReadonlyArray<KanbanCard>;
   readonly holds?: ReadonlyMap<string, string>;
@@ -457,6 +460,68 @@ export interface RollupInput {
   /** First stage change at or after the window, for cards with no earlier stage history. */
   readonly after?: ReadonlyArray<KanbanCardEvent>;
 }
+
+const holderStep = (card: KanbanCard | undefined) => {
+  if (card === undefined || kanbanStepSubtasks(card).length === 0) return "none";
+  if (kanbanWorkStep(card)) return "work";
+  if (kanbanEvaluatorStep(card)) return "evaluator";
+  if (kanbanScriptStep(card)) return "script";
+  return "review";
+};
+
+const currentHolders = (input: RollupInput) => {
+  const cards = input.dispatchCards ?? input.cards;
+  const holding = Rules.poolThreads(cards, input.holds);
+  const linked = new Map<string, KanbanCard>();
+  for (const card of cards) {
+    if (card.activeThreadId !== null && card.activePool !== null)
+      linked.set(`${card.activePool}:${card.activeThreadId}`, card);
+  }
+  const takes = new Map<string, string>();
+  const currentAt = input.currentAt ?? input.window.until;
+  for (const event of [...(input.currentSlots ?? input.slotHistory?.events ?? [])].sort(
+    (a, b) => a.id - b.id,
+  )) {
+    if (event.at > currentAt) continue;
+    const key = `${event.poolKey}:${event.threadId}`;
+    if (event.kind === "take") takes.set(key, event.at);
+    else takes.delete(key);
+  }
+  const pools = new Map(input.pools.map((pool) => [pool.key, pool.slots]));
+  for (const pool of holding.keys()) if (!pools.has(pool)) pools.set(pool, 0);
+  return new Map(
+    [...pools]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([pool, slots]) => {
+        const holders = [...(holding.get(pool) ?? [])]
+          .map((thread) => {
+            const card = linked.get(`${pool}:${thread}`);
+            const take = takes.get(`${pool}:${thread}`);
+            const heldSince =
+              take !== undefined && take >= input.window.since
+                ? take
+                : (card?.analyticsStageEnteredAt ?? card?.movedAt ?? null);
+            return {
+              card: card?.number ?? null,
+              role: card?.activeRole === "review" ? "review" : "work",
+              stage: card?.stage ?? null,
+              thread: thread.slice(-8),
+              heldSince,
+              heldForH:
+                heldSince === null ? null : hours(Math.max(0, time(currentAt) - time(heldSince))),
+              openStep: holderStep(card),
+              turn: "unknown",
+            };
+          })
+          .sort(
+            (a, b) =>
+              (a.heldSince ?? "~").localeCompare(b.heldSince ?? "~") ||
+              a.thread.localeCompare(b.thread),
+          );
+        return [pool, { pool, slots, holders }] as const;
+      }),
+  );
+};
 
 /** Replay thread identities, preserving ledger order even when timestamps tie. */
 const ledgerUsage = (
@@ -1135,6 +1200,19 @@ export const rollup = (input: RollupInput) => {
   }
   oldAsks.sort((left, right) => right.hours - left.hours || left.card - right.card);
 
+  const holders = currentHolders(input);
+  const heldRows = (pool: string | undefined, max: number) =>
+    capped(pool === undefined ? [] : (holders.get(pool)?.holders ?? []), Math.min(50, max));
+  const queueRows = (rows: typeof queued, max: number) =>
+    rows.map((row) => {
+      if (row.held === undefined) return row;
+      const held = heldRows(row.pool, max);
+      return {
+        ...row,
+        held: held.items,
+        ...(held.more === undefined ? {} : { heldMore: held.more }),
+      };
+    });
   const queued =
     input.board && "reviewChains" in input.board
       ? Rules.dispatchQueueStatus(
@@ -1202,8 +1280,12 @@ export const rollup = (input: RollupInput) => {
         none: { count: none.length, ...capped(none, max) },
         ...capped(idle, max),
       },
-      queued: { count: queued.length, byReason: queuedByReason, ...capped(queued, max) },
-      queuedOver6h: { count: queuedOver6h.length, ...capped(queuedOver6h, max) },
+      queued: {
+        count: queued.length,
+        byReason: queuedByReason,
+        ...capped(queueRows(queued, max), max),
+      },
+      queuedOver6h: { count: queuedOver6h.length, ...capped(queueRows(queuedOver6h, max), max) },
       inReviewNoThreadWithEvaluatorStepsOnly: {
         count: evaluatorOnly.length,
         ...capped(evaluatorOnly, max),
@@ -1228,6 +1310,18 @@ export const rollup = (input: RollupInput) => {
       },
     },
     pools: poolUsage,
+    holders: capped(
+      [...holders.values()].map(({ pool, slots }) => {
+        const held = heldRows(pool, max);
+        return {
+          pool,
+          slots,
+          holders: held.items,
+          ...(held.more === undefined ? {} : { more: held.more }),
+        };
+      }),
+      max,
+    ),
   });
   let max = LIST_MAX;
   let answeredMax = answeredItems.length;

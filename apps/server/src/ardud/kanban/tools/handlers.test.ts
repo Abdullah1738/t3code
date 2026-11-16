@@ -2200,9 +2200,29 @@ it.effect(
         card: quiet.number,
         reason: "pool_full",
       });
-      assert.deepEqual(activity.stages.queued.items[0]?.held, [
-        { card: busy.number, role: "work" },
-      ]);
+      const holders = (
+        rollup.structured.activity as {
+          holders: {
+            items: Array<{
+              holders: Array<{
+                card: number;
+                role: string;
+                stage: string;
+                openStep: string;
+                turn: string;
+              }>;
+            }>;
+          };
+        }
+      ).holders;
+      assert.deepEqual(activity.stages.queued.items[0]?.held, holders.items[0]?.holders);
+      assert.deepInclude(holders.items[0]?.holders[0], {
+        card: busy.number,
+        role: "work",
+        stage: "working",
+        openStep: "none",
+        turn: "unknown",
+      });
       assert.strictEqual(activity.boardId, board.id);
       assert.strictEqual(activity.cards.active, 1);
       assert.strictEqual(activity.asks.answered, 1);
