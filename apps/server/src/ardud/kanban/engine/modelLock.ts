@@ -11,11 +11,13 @@ export const acquire = Effect.fn("KanbanModelLock.acquire")(function* (lock: Sem
           yield* restore(Effect.interruptible(lock.withPermits(1)(Effect.void)));
         }
         let held = true;
-        return Effect.suspend(() => {
-          if (!held) return Effect.void;
-          held = false;
-          return Effect.asVoid(lock.release(1));
-        });
+        return Effect.uninterruptible(
+          Effect.suspend(() => {
+            if (!held) return Effect.void;
+            held = false;
+            return Effect.asVoid(lock.release(1));
+          }),
+        );
       }),
     ),
     (release) => release,
