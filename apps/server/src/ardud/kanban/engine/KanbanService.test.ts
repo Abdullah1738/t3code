@@ -29235,9 +29235,9 @@ it.effect("a cancellation pending at card commit still records the saved result"
       Effect.map(KanbanStore.KanbanStore, (real) =>
         KanbanStore.KanbanStore.of({
           ...real,
-          putCard: (card) =>
+          updateCard: (card, before) =>
             real
-              .putCard(card)
+              .updateCard(card, before)
               .pipe(
                 Effect.andThen(
                   Effect.suspend(() =>
@@ -38382,13 +38382,13 @@ it.effect("slot ledger completes a committed card release despite pending cancel
       KanbanStore.KanbanStore,
       Effect.map(KanbanStore.KanbanStore, (real) => ({
         ...real,
-        putCard: (card: Parameters<typeof real.putCard>[0]) =>
+        updateCard: (...args: Parameters<typeof real.updateCard>) =>
           real
-            .putCard(card)
+            .updateCard(...args)
             .pipe(
               Effect.andThen(
                 Effect.suspend(() =>
-                  armed && card.stage === "completed"
+                  armed && args[0].stage === "completed"
                     ? Deferred.succeed(committed, undefined).pipe(
                         Effect.andThen(Deferred.await(release)),
                       )
@@ -44524,5 +44524,243 @@ it.effect.each([
       yield* kanban.tick;
       assert.lengthOf(wakes(), expected);
     }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect.each(["card", "board", "cardEvents", "cardsByThread"] as const)(
+  "#1712 a stalled move %s read releases the gate and revalidates concurrent edits",
+  (dependency) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const entered = yield* Deferred.make<void>();
+      const releaseRead = yield* Deferred.make<void>();
+      let armed = false;
+      let reads = 0;
+      const observed = Layer.effect(
+        KanbanStore.KanbanStore,
+        Effect.map(KanbanStore.KanbanStore, (real) => {
+          const stall = <A, E, R>(name: typeof dependency, effect: Effect.Effect<A, E, R>) =>
+            Effect.suspend(() => {
+              if (name !== dependency || !armed || (dependency === "card" && ++reads === 1))
+                return effect;
+              armed = false;
+              // Return the old snapshot after the concurrent edit lands.
+              return effect.pipe(
+                Effect.tap(() =>
+                  Deferred.succeed(entered, undefined).pipe(
+                    Effect.andThen(Deferred.await(releaseRead)),
+                  ),
+                ),
+              );
+            });
+          return KanbanStore.KanbanStore.of({
+            ...real,
+            card: (id) => stall("card", real.card(id)),
+            board: (id) => stall("board", real.board(id)),
+            cardEvents: (id) => stall("cardEvents", real.cardEvents(id)),
+            cardsByThread: (id) => stall("cardsByThread", real.cardsByThread(id)),
+          });
+        }),
+      ).pipe(Layer.provide(KanbanStore.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, card, threadId } = yield* workingCard;
+        armed = true;
+        const move = yield* kanban
+          .moveCard(card.id, "needs_review", "cardThread", {
+            _tag: "thread",
+            threadId,
+          })
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(entered);
+        // This needs the same board gate. It must finish while the read is blocked.
+        yield* kanban.editCard(card.id, { title: "Edited during move" }, owner);
+        yield* TestClock.adjust(10_000);
+        assert.isUndefined(move.pollUnsafe());
+        yield* Deferred.succeed(releaseRead, undefined);
+        const moved = yield* Fiber.join(move);
+        assert.equal(moved.stage, "needs_review");
+        assert.equal(moved.title, "Edited during move");
+        assert.equal((yield* kanban.card(card.id)).card.title, "Edited during move");
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(releaseRead, undefined)),
+        Effect.provide(testLayer(fake.layer, undefined, undefined, observed)),
+      );
+    }),
+);
+
+it.effect(
+  "#1712 a stalled move snapshot reports its read and times out without a long gate hold",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const entered = yield* Deferred.make<void>();
+      const warnings: unknown[] = [];
+      const logger = Logger.make(({ message }) => {
+        warnings.push(message);
+      });
+      let armed = false;
+      const observed = Layer.effect(
+        KanbanStore.KanbanStore,
+        Effect.map(KanbanStore.KanbanStore, (real) =>
+          KanbanStore.KanbanStore.of({
+            ...real,
+            board: (id) =>
+              Effect.suspend(() =>
+                armed
+                  ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never))
+                  : real.board(id),
+              ),
+          }),
+        ),
+      ).pipe(Layer.provide(KanbanStore.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, card, threadId } = yield* workingCard;
+        armed = true;
+        const call = yield* SavedReply.protect(
+          SavedWrite.mutating(
+            kanban.moveCard(card.id, "needs_review", "cardThread", { _tag: "thread", threadId }),
+          ).pipe(Effect.as(new McpSchema.CallToolResult({ content: [] }))),
+          "card_move",
+        ).pipe(Effect.forkChild);
+        yield* Deferred.await(entered);
+        yield* TestClock.adjust(SavedReply.REPLY_BUDGET_MS);
+        const result = yield* Fiber.join(call);
+        assert.isTrue(isMcpCallToolResult(result));
+        if (!isMcpCallToolResult(result)) return;
+        assert.isTrue(result.isError);
+        assert.deepInclude(result.structuredContent, { saved: false });
+        armed = false;
+        assert.equal((yield* kanban.card(card.id)).card.stage, "working");
+        const timeout = warnings.find(
+          (message) =>
+            Array.isArray(message) && message[0] === "kanban saved write reply unavailable",
+        );
+        assert.deepInclude((timeout as [string, Record<string, unknown>])[1], {
+          "kanban.reply.stage_at_timeout": "read",
+          subSteps: [{ subStep: "card.move.read.board", ms: 25_000 }],
+        });
+        assert.isFalse(
+          warnings.some((message) =>
+            String(message).includes('"event":"kanban board lock long hold"'),
+          ),
+        );
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            testLayer(fake.layer, undefined, undefined, observed),
+            Logger.layer([logger], { mergeWithExisting: false }),
+          ),
+        ),
+      );
+    }),
+);
+
+it.effect("#1712 a protected sibling card_update is not refused behind a stalled move read", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const entered = yield* Deferred.make<void>();
+    const releaseRead = yield* Deferred.make<void>();
+    let armed = false;
+    let moveFiberId: number | undefined;
+    const observed = Layer.effect(
+      KanbanStore.KanbanStore,
+      Effect.map(KanbanStore.KanbanStore, (real) =>
+        KanbanStore.KanbanStore.of({
+          ...real,
+          board: (id) =>
+            Effect.gen(function* () {
+              if (!armed || (yield* Effect.fiberId) !== moveFiberId) return yield* real.board(id);
+              armed = false;
+              return yield* Deferred.succeed(entered, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseRead)),
+                Effect.andThen(real.board(id)),
+              );
+            }),
+        }),
+      ),
+    ).pipe(Layer.provide(KanbanStore.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board, card, threadId } = yield* workingCard;
+      const sibling = yield* kanban.createCard(
+        board.id,
+        { title: "Sibling", prompt: "Sibling" },
+        owner,
+      );
+      armed = true;
+      const move = yield* Effect.gen(function* () {
+        moveFiberId = yield* Effect.fiberId;
+        return yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+          _tag: "thread",
+          threadId,
+        });
+      }).pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      const update = yield* SavedReply.protect(
+        kanban
+          .editCard(sibling.id, { title: "Sibling saved" }, owner)
+          .pipe(Effect.as(new McpSchema.CallToolResult({ content: [] }))),
+        "card_update",
+      ).pipe(Effect.forkChild);
+      yield* TestClock.adjust(SavedReply.ADMISSION_BUDGET_MS + 1);
+      const result = yield* Fiber.join(update);
+      assert.isTrue(isMcpCallToolResult(result));
+      if (!isMcpCallToolResult(result)) return;
+      assert.isNotTrue(result.isError);
+      assert.equal((yield* kanban.card(sibling.id)).card.title, "Sibling saved");
+      assert.isUndefined(move.pollUnsafe());
+      yield* Deferred.succeed(releaseRead, undefined);
+      assert.equal((yield* Fiber.join(move)).stage, "needs_review");
+    }).pipe(
+      Effect.ensuring(Deferred.succeed(releaseRead, undefined)),
+      Effect.provide(testLayer(fake.layer, undefined, undefined, observed)),
+    );
+  }),
+);
+
+it.effect("#1712 retaining the worker slot reuses the outside-gate cards snapshot", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const moving = Context.Reference("test/KanbanMoveSlotRead", { defaultValue: () => false });
+    const warnings: unknown[] = [];
+    const logger = Logger.make(({ message }) => {
+      warnings.push(message);
+    });
+    let reads = 0;
+    const observed = Layer.effect(
+      KanbanStore.KanbanStore,
+      Effect.map(KanbanStore.KanbanStore, (real) =>
+        KanbanStore.KanbanStore.of({
+          ...real,
+          cardsByThread: (id) =>
+            Effect.gen(function* () {
+              if ((yield* moving) && ++reads > 1) return yield* Effect.never;
+              return yield* real.cardsByThread(id);
+            }),
+        }),
+      ),
+    ).pipe(Layer.provide(KanbanStore.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, card, threadId } = yield* workingCard;
+      const move = yield* kanban
+        .moveCard(card.id, "needs_review", "cardThread", { _tag: "thread", threadId })
+        .pipe(Effect.provideService(moving, true), Effect.forkChild);
+      // A duplicate slot read would exhaust syncSlot's best-effort budget.
+      yield* TestClock.adjust(5_000);
+      assert.equal((yield* Fiber.join(move)).stage, "needs_review");
+      assert.equal(reads, 1);
+      assert.isTrue((yield* kanban.nextCards(threadId)).holdsSlot);
+      assert.isFalse(
+        warnings.some((message) =>
+          String(message).includes('"event":"kanban board lock long hold"'),
+        ),
+      );
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          testLayer(fake.layer, undefined, undefined, observed),
+          Logger.layer([logger], { mergeWithExisting: false }),
+        ),
+      ),
+    );
   }),
 );

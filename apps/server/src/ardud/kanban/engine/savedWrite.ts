@@ -48,7 +48,15 @@ export const subSteps = Effect.fnUntraced(function* <A, E, R>(
   const account = (fiberId: number) => {
     if (holds.size === 0) return;
     const at = now();
-    const step = active.get(fiberId)?.at(-1)?.name ?? name;
+    const span = active.get(fiberId)?.at(-1);
+    // Store SELECTs share one span name; retain their static operation label
+    // so a reader wait identifies the table instead of just "KanbanStore.read".
+    const operation =
+      span?.name === "KanbanStore.read" ? span.attributes.get("kanban.operation") : undefined;
+    const step =
+      typeof operation === "string"
+        ? `KanbanStore.${operation.replaceAll(" ", ".")}`
+        : (span?.name ?? name);
     for (const hold of holds) {
       if (hold.fiberId !== fiberId) continue;
       const ms = Math.max(0, at - hold.since);
