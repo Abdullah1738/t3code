@@ -409,12 +409,26 @@ function workEntryIndicatesToolFailureFromOutput(
   return output.length > 0 && toolOutputIndicatesFailure(output);
 }
 
+// Stream updates replace immutable entries and their output. Weak keys let old
+// history disappear without rescanning its output when another entry changes.
+const displayedToolFailures = new WeakMap<WorkLogPresentationEntry, boolean>();
+const toolFailuresIncludingCommand = new WeakMap<WorkLogPresentationEntry, boolean>();
+
+function cachedToolFailure(entry: WorkLogPresentationEntry, includeCommand: boolean): boolean {
+  const cache = includeCommand ? toolFailuresIncludingCommand : displayedToolFailures;
+  const cached = cache.get(entry);
+  if (cached !== undefined) return cached;
+  const failed = workEntryIndicatesToolFailureFromOutput(entry, includeCommand);
+  cache.set(entry, failed);
+  return failed;
+}
+
 export function workEntryIndicatesToolFailure(entry: WorkLogPresentationEntry): boolean {
-  return workEntryIndicatesToolFailureFromOutput(entry, true);
+  return cachedToolFailure(entry, true);
 }
 
 export function workEntryDisplayIndicatesToolFailure(entry: WorkLogPresentationEntry): boolean {
-  return workEntryIndicatesToolFailureFromOutput(entry, false);
+  return cachedToolFailure(entry, false);
 }
 
 export function workEntryIndicatesToolSuccess(entry: WorkLogPresentationEntry): boolean {
