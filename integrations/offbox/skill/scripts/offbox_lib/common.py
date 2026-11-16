@@ -718,9 +718,10 @@ def _owner_columns(con) -> None:
 
 
 def event(con, box_id: str | None, kind: str, detail: str = "") -> None:
-    con.execute("INSERT INTO events VALUES (?,?,?,?)", (now(), box_id, kind, detail[:2000]))
+    # Fetch summaries are bounded JSON; truncating them drops fields and makes analytics unreadable.
+    con.execute("INSERT INTO events VALUES (?,?,?,?)", (now(), box_id, kind, detail if kind == 'logs_fetch' else detail[:2000]))
     con.commit()
-    log(f"{kind} {box_id or '-'} {detail[:300]}")
+    log(f"{kind} {box_id or '-'} {detail if kind == 'logs_fetch' else detail[:300]}")
 
 
 def kv_get(con, k: str, max_age: float | None = None):
