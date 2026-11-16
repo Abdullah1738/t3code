@@ -16401,6 +16401,10 @@ const make = Effect.gen(function* () {
     const card = yield* cardOf(cardId);
     if (card.stage !== "working" || card.activeThreadId !== threadId || card.activeRole !== "work")
       return;
+    // This brief belongs to createForThread's first attachment, including old saved rows.
+    // Returning to the same thread after a park must not revive its original assignment.
+    const moves = (yield* store.cardEvents(cardId)).filter((event) => event.kind === "moved");
+    if (moves.length !== 1 || moves[0]?.toStage !== "working") return;
     yield* refusePendingStop(threadId);
     yield* sendThread(
       {

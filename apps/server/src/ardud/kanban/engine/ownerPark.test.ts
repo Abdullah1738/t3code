@@ -7,6 +7,7 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as Tracer from "effect/Tracer";
 
 import * as Analytics from "../../analytics/Analytics.ts";
 import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
@@ -26,6 +27,177 @@ import { modelSelectionOf } from "./defaults.ts";
 import * as Rules from "./rules.ts";
 
 const decodeAnalytics = Schema.decodeUnknownEffect(AnalyticsEvent);
+
+it.effect.each(
+  (["post", "pick", "answer", "drop", "wake", "unchanged", "edit"] as const).flatMap((reply) =>
+    [false, true].map((accepted) => ({ reply, accepted })),
+  ),
+)(
+  "a pre-park assignment stays expired after $reply and restart (accepted=$accepted)",
+  ({ reply, accepted }) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "assignment-park-1615-" });
+      const db = `${directory}/boards.sqlite`;
+      const fake = yield* makeFake;
+      const assignmentEntered = yield* Deferred.make<void>();
+      const releaseAssignment = yield* Deferred.make<void>();
+      const assignmentFailed = yield* Deferred.make<void>();
+      const ownerHeard = yield* Deferred.make<void>();
+      const replayDrained = yield* Deferred.make<void>();
+      const marker = "Original assignment 1615";
+      let target: ThreadId | undefined;
+      let assignmentScope: string | undefined;
+      let attempts = 0;
+      let replaying = false;
+      const delivered = new Set<string>();
+      const transport = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (real) =>
+          KanbanThreads.of({
+            ...real,
+            send: (input) =>
+              Effect.gen(function* () {
+                const assignment =
+                  input.threadId === target && input.coalesce?.startsWith("assignment:");
+                if (assignment) {
+                  assignmentScope ??= input.coalesce;
+                  attempts++;
+                  if (attempts === 1) {
+                    if (accepted && !input.isStale?.()) {
+                      yield* real.send(input);
+                      delivered.add(input.key!);
+                    }
+                    yield* Deferred.succeed(assignmentEntered, undefined);
+                    yield* Deferred.await(releaseAssignment);
+                    return yield* Effect.fail(
+                      new KanbanThreadError({
+                        operation: "send",
+                        detail: "Retry initial assignment",
+                      }),
+                    ).pipe(Effect.ensuring(Deferred.succeed(assignmentFailed, undefined)));
+                  }
+                  if (!replaying) return yield* Effect.never;
+                }
+                if (!input.isStale?.() && !(assignment && delivered.has(input.key!))) {
+                  yield* real.send(input);
+                  if (assignment) delivered.add(input.key!);
+                }
+                if (
+                  input.threadId === target &&
+                  input.coalesce === assignmentScope?.replace("assignment:", "owner:")
+                )
+                  yield* Deferred.succeed(ownerHeard, undefined);
+              }),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      const prior = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const { kanban, board, threadId, worker } = yield* workingCard();
+          target = threadId;
+          const evaluator = yield* kanban.startEvaluator(board.id, {
+            kind: "request",
+            text: "Assign follow-up",
+          });
+          const assigned = yield* kanban.createForThread(
+            threadId,
+            { title: "Follow-up", prompt: marker },
+            { boardId: board.id, actor: { _tag: "evaluator", threadId: evaluator } },
+          );
+          yield* Deferred.await(assignmentEntered);
+          const restored = reply !== "unchanged" && reply !== "edit";
+          if (restored) {
+            yield* kanban.askOwner(
+              assigned.card.id,
+              {
+                question: "Continue?",
+                blocking: true,
+                ...(reply === "pick" ? { options: ["Yes", "No"] } : {}),
+              },
+              worker,
+              "cardThread",
+            );
+            if (reply === "post" || reply === "pick") {
+              const discussion = yield* kanban.cardDiscussion(assigned.card.id);
+              if (reply === "post")
+                yield* kanban.post(discussion.id, owner, [
+                  { _tag: "md", text: "Continue after owner answer" },
+                ]);
+              else {
+                const ask = askOf((yield* kanban.card(assigned.card.id)).card);
+                yield* kanban.answer(discussion.id, ask.seq!, ask.id, [ask.options![0]!.id], owner);
+              }
+            } else if (reply === "answer")
+              yield* kanban.answerAsk(
+                assigned.card.id,
+                "q1",
+                { verdict: "answered", text: "Continue", revision: 0 },
+                owner,
+              );
+            else if (reply === "drop")
+              yield* kanban.changeAsk(assigned.card.id, "q1", "drop", owner, "owner");
+            else yield* kanban.cardThread(assigned.card.id, "wake", "Continue", owner);
+            yield* Deferred.await(ownerHeard);
+          } else if (reply === "edit")
+            yield* kanban.editCard(assigned.card.id, { title: "Edited follow-up" }, owner);
+          assert.equal((yield* kanban.card(assigned.card.id)).card.stage, "working");
+          yield* Deferred.succeed(releaseAssignment, undefined);
+          yield* Deferred.await(assignmentFailed);
+          const sql = yield* BoardsDatabase.client;
+          const rows = yield* sql<{ id: number; discussion_id: string }>`
+        SELECT id, discussion_id FROM ardud_kanban_owner_routes
+        WHERE json_extract(json, '$.effect.kind') = 'assignment'
+          AND json_extract(json, '$.effect.cardId') = ${assigned.card.id}
+      `;
+          assert.lengthOf(rows, 1);
+          return { cardId: assigned.card.id, threadId, route: rows[0]!, restored };
+        }).pipe(
+          Effect.provide(
+            fileTestLayer(transport, db).pipe(
+              Layer.provide(Layer.succeed(KanbanService.OwnerRouteMode, "deferred")),
+            ),
+          ),
+        ),
+      );
+      replaying = true;
+      const tracer = Tracer.make({
+        span: (options) => {
+          const span = new Tracer.NativeSpan(options);
+          const end = span.end.bind(span);
+          span.end = (...args) => {
+            end(...args);
+            if (
+              span.name === "KanbanService.drainOwnerRoutes" &&
+              span.attributes.get("discussion.id") === prior.route.discussion_id
+            )
+              Deferred.doneUnsafe(replayDrained, Effect.void);
+          };
+          return span;
+        },
+      });
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const kanban = yield* KanbanService.KanbanService;
+          yield* kanban.ready;
+          const sql = yield* BoardsDatabase.client;
+          const pending = yield* sql<{ done_at: string | null }>`
+            SELECT done_at FROM ardud_kanban_owner_routes WHERE id = ${prior.route.id}
+          `;
+          if (pending[0]?.done_at === null) yield* Deferred.await(replayDrained);
+          const rows = yield* sql<{
+            done_at: string | null;
+          }>`SELECT done_at FROM ardud_kanban_owner_routes WHERE id = ${prior.route.id}`;
+          assert.isNotNull(rows[0]?.done_at);
+          assert.equal((yield* kanban.card(prior.cardId)).card.activeThreadId, prior.threadId);
+          assert.equal(
+            (yield* fake.heard(prior.threadId)).filter((text) => text.includes(marker)).length,
+            accepted || !prior.restored ? 1 : 0,
+          );
+        }).pipe(Effect.provide(fileTestLayer(transport, db)), Effect.withTracer(tracer)),
+      );
+    }).pipe(Effect.provide(filesLayer)),
+);
 
 it.effect.each(
   (["await", "deferred", "inline"] as const).flatMap((mode) =>
