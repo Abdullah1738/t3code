@@ -463,8 +463,10 @@ export const layerExecutor: Layer.Layer<
                 Effect.catch((error) =>
                   Effect.gen(function* () {
                     if (
-                      !("turnCompleted" in error) ||
-                      !error.turnCompleted ||
+                      !(
+                        ("turnCompleted" in error && error.turnCompleted) ||
+                        ("steerNotDelivered" in error && error.steerNotDelivered)
+                      ) ||
                       effect.request.type !== "provider-turn.steer"
                     ) {
                       return yield* error;
@@ -480,6 +482,13 @@ export const layerExecutor: Layer.Layer<
                     const message = projection.messages.find((item) => item.id === messageId);
                     const run = projection.runs.find((item) => item.id === message?.runId);
                     if (message === undefined || run === undefined) return yield* error;
+                    // Mailbox ownership is released by the terminal projection; until then
+                    // its existing delivery recovery must retain the claim.
+                    if (
+                      message.delegatedCompletion !== undefined &&
+                      !("turnCompleted" in error && error.turnCompleted)
+                    )
+                      return yield* error;
                     // Reuse the message identity and a stable command receipt so an outbox
                     // retry cannot append a duplicate message or start a second follow-up.
                     yield* threads
@@ -494,13 +503,7 @@ export const layerExecutor: Layer.Layer<
                         ...(message.delegatedCompletion === undefined
                           ? {}
                           : { modelSelection: run.modelSelection }),
-                        dispatchMode: {
-                          type:
-                            message.delegatedCompletion === undefined &&
-                            message.notification === undefined
-                              ? "start_immediately"
-                              : "queue_after_active",
-                        },
+                        dispatchMode: { type: "queue_after_active" },
                         createdBy: message.createdBy,
                         creationSource: message.creationSource,
                         ...(message.delegatedCompletion === undefined

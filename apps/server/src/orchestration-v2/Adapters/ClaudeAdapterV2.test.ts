@@ -3365,6 +3365,61 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     });
   const makeWakeHarness = makeWakeHarnessWithOptions();
 
+  it.effect.each(["no-query", "wrong-turn", "ended"] as const)(
+    "marks a rejected steer as not sent ($0)",
+    (state) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const h = yield* makeWakeHarness;
+          const input = makeClaudeTestTurnInput({
+            threadId: h.threadId,
+            providerThread: h.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("attempt-rejected-steer"),
+            text: "first",
+            attachments: [],
+          });
+          if (state !== "no-query") yield* h.runtime.startTurn(input);
+          const ids = yield* IdAllocator.IdAllocatorV2;
+          const providerTurnId = ids.derive.providerTurn({
+            driver: ClaudeAdapterV2.CLAUDE_PROVIDER,
+            nativeTurnId: `turn:${input.attemptId}`,
+          });
+          if (state === "ended") {
+            yield* h.offerAndWait(
+              makeResultFrame({ uuid: "rejected-steer-ended", result: "Done" }),
+            );
+            yield* Queue.take(h.terminalReceipts);
+          }
+          const before = h.offeredMessages.length;
+          const error = yield* h.runtime
+            .steerTurn({
+              threadId: h.threadId,
+              runId: input.runId,
+              providerThread: h.providerThread,
+              providerTurnId:
+                state === "wrong-turn" ? ProviderTurnId.make("other-turn") : providerTurnId,
+              message: {
+                messageId: MessageId.make("msg_f7121c54"),
+                text: "owner correction",
+                attachments: [],
+                createdBy: "user",
+                creationSource: "web",
+              },
+            })
+            .pipe(Effect.flip);
+          assert.equal(error._tag, "ProviderAdapterSteerRunError");
+          if (error._tag === "ProviderAdapterSteerRunError")
+            assert.equal(error.delivery, "not_sent");
+          assert.equal(h.offeredMessages.length, before);
+        }),
+      ).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
   it.effect.each(["lifecycle", "prompt_echo", "native_output"] as const)(
     "records same-attempt native %s evidence before orchestration receives it",
     (evidence) =>
