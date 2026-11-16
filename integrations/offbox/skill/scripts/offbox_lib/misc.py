@@ -1380,6 +1380,9 @@ def logs(run_id: str, do_follow: bool) -> int:
         return report_killed(killed, p)
     code = settled_steps_code(r, r['exit_code'], catch_up=False, history_result=result)
     _incomplete_log(_validated_step_row(r, code), result)
+    from . import uv_cache
+    if r['mode'] != 'local':
+        uv_cache.report(r['box_id'], r['run_id'], _raw_log(p), code)
     if code is None:
         from .run_evidence import report
         report(dict(r), p)
@@ -1496,7 +1499,7 @@ def _settled(r, echo=False, pos=0, *, locked=False, until=None, show_failure=Fal
         return EXIT_INFRA
     if r['error'] == 'box wedged before the command':
         say(f"{r['box_id']} was wedged before the command and set aside. Nothing ran: retry")
-    _report_deps_hint(r, code, LOGS_DIR / f"{r['run_id']}.log")
+    _report_deps_hint(r, code, LOGS_DIR / f"{r['run_id']}.log", until=until)
     status = checked['status']
     if planned_steps(r) and code is not None and status in ('done', 'failed', 'infra', 'lost'):
         if (status, code) != (r['status'], r['exit_code']):
@@ -2002,7 +2005,10 @@ def _resolve_exit(r, log_path, until, start_offsets, replay_path, echo=True, mir
     return code
 
 
-def _report_deps_hint(r, code, log_path) -> None:
+def _report_deps_hint(r, code, log_path, *, until=None) -> None:
+    from . import uv_cache
+    if dict(r).get('mode') != 'local':
+        uv_cache.report(r['box_id'], r['run_id'], _raw_log(log_path), code, until=until)
     from .runs import box_deps_hint, step_results
     results = step_results(log_path)
     failed_code = next((rc for _, rc in results if rc), code)
@@ -2087,7 +2093,7 @@ def _finalize(r, code, log_path, until=None, *, echo=False, show_failure=False) 
             _failure_tail(log_path)
             failure_tail_shown = True
         go_std_glitch(r["box_id"], r["run_id"], log_path, code)
-        _report_deps_hint(r, code, log_path)
+        _report_deps_hint(r, code, log_path, until=until)
     except sqlite3.Error as error:
         if not quarantine_pending:
             code = finish(r['run_id'], code, until=until, run=r)

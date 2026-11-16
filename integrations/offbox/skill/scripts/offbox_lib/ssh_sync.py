@@ -203,8 +203,10 @@ def ssh_base(box_id: str, *, probe: bool = True) -> list[str]:
                        "use the home control API (`offbox exec`, #95)")
 
 
-def ssh(box_id: str, command: str, input: bytes | None = None, timeout: float = 120, check: bool = False):
-    p = subprocess.run(ssh_base(box_id) + [box_id, command], input=input, capture_output=True, timeout=timeout)
+def ssh(box_id: str, command: str, input: bytes | None = None, timeout: float = 120, check: bool = False,
+        *, base: list[str] | None = None):
+    p = subprocess.run((ssh_base(box_id) if base is None else base) + [box_id, command],
+                       input=input, capture_output=True, timeout=timeout)
     if p.returncode == 255:
         check_host_key(box_id, p.stderr)
     if p.returncode == 255:

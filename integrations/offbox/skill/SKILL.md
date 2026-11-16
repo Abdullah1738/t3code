@@ -459,6 +459,8 @@ Detailed metadata logs are at `~/.robob/logs/tools/offbox/YYYY-MM-DD.ndjson` (UT
 
 ## Troubleshooting
 
+- uv 'failed to open file …archive-v0…': offbox moves the broken cache entry aside; rerun.
+
 - A box held by an unconfirmed checkout cleanup is rechecked by reap, release and the pool queue; it frees itself once the cleanup is confirmed gone.
 
 - A just-resumed box can have a cold disk: its first sync, installs and Docker databases can be slow for 5-25 min. Offbox moves a first sync once to a free warm box when available; otherwise use `offbox run --bg` and the harness route in **Waiting for a run**, then end your turn.
