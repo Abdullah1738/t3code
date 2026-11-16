@@ -8,5 +8,7 @@
   "expires_at": null,
   "max_fires": 0,
   "paused": true,
-  "relays": []
+  "relays": [],
+  "max_consecutive_failures": 0,
+  "timeout_s": 90
 }
