@@ -224,6 +224,90 @@ it.effect("uses one budget across admission, query and render", () =>
   }),
 );
 
+it.effect.each([
+  { operation: "transaction", mask: "inside" },
+  { operation: "transaction", mask: "outside" },
+  { operation: "statement", mask: "inside" },
+  { operation: "statement", mask: "outside" },
+] as const)(
+  "preserves an explicit mask $mask readOnly while $operation waits for the snapshot gate",
+  ({ operation, mask }) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "thread-read-masked-" });
+      const rows = yield* Queue.unbounded<AnalyticsEvent>();
+      const gate = yield* Semaphore.make(1);
+      const gateHeld = yield* Deferred.make<void>();
+      const openGate = yield* Deferred.make<void>();
+      const waiting = yield* Deferred.make<void>();
+      const cleaned = yield* Deferred.make<void>();
+      const readFinished = yield* Deferred.make<void>();
+      const readerSnapshotLock = {
+        ...gate,
+        withPermits:
+          (permits: number) =>
+          <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+            Deferred.succeed(waiting, undefined).pipe(
+              Effect.andThen(gate.withPermits(permits)(effect)),
+            ),
+      };
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`PRAGMA journal_mode = WAL`;
+        yield* sql`CREATE TABLE ardud_turn_items (value INTEGER)`;
+        const holder = yield* gate
+          .withPermits(1)(
+            Deferred.succeed(gateHeld, undefined).pipe(Effect.andThen(Deferred.await(openGate))),
+          )
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(gateHeld);
+        const query = sql`SELECT * FROM ardud_turn_items`;
+        const read = (operation === "transaction" ? sql.withTransaction(query) : query).pipe(
+          Effect.andThen(Deferred.succeed(readFinished, undefined)),
+        );
+        const handler = (
+          mask === "inside"
+            ? read.pipe(Effect.uninterruptible, NodeSqliteClient.requireReader)
+            : read.pipe(NodeSqliteClient.requireReader, Effect.uninterruptible)
+        ).pipe(
+          NodeSqliteClient.foregroundReads,
+          Effect.orDie,
+          Effect.as({ ready: true }),
+          Effect.ensuring(Deferred.succeed(cleaned, undefined)),
+        );
+        yield* Effect.gen(function* () {
+          const pending = yield* callRead.pipe(Effect.forkChild);
+          yield* Deferred.await(waiting);
+          yield* TestClock.adjust(McpDeadline.READ_TIMEOUT);
+          expect((yield* Fiber.join(pending)).isError).toBe(true);
+          expect(yield* Deferred.isDone(readFinished)).toBe(false);
+          yield* Deferred.succeed(openGate, undefined);
+          yield* Deferred.await(cleaned);
+          expect(yield* Deferred.isDone(readFinished)).toBe(true);
+          yield* sql`SELECT 1`.pipe(
+            NodeSqliteClient.requireReader,
+            NodeSqliteClient.foregroundReads,
+          );
+        }).pipe(
+          Effect.provide(readLayer(handler, rows)),
+          Effect.ensuring(Deferred.succeed(openGate, undefined)),
+        );
+        yield* Fiber.join(holder);
+      }).pipe(
+        Effect.provide(
+          NodeSqliteClient.layer({
+            filename: path.join(directory, "test.sqlite"),
+            readerWorker: true,
+            foregroundReaderSlots: 1,
+            readerSnapshotSql: ["SELECT rootpage FROM main.sqlite_schema LIMIT 1"],
+            readerSnapshotLock,
+          }),
+        ),
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
 it.effect.each(["deadline", "disconnect"] as const)(
   "releases admission on %s even when handler cleanup is masked",
   (exit) =>
@@ -311,6 +395,184 @@ it.effect("cancels a SQLite foreground transaction and makes its reader slot reu
       ),
     );
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect.each([
+  { operation: "transaction", stop: "deadline" },
+  { operation: "transaction", stop: "disconnect" },
+  { operation: "statement", stop: "deadline" },
+  { operation: "statement", stop: "disconnect" },
+] as const)(
+  "reuses the foreground reader before opening the snapshot gate after $operation $stop",
+  ({ operation, stop }) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "thread-read-snapshot-" });
+      const rows = yield* Queue.unbounded<AnalyticsEvent>();
+      const gate = yield* Semaphore.make(1);
+      const gateHeld = yield* Deferred.make<void>();
+      const openGate = yield* Deferred.make<void>();
+      const waiting = yield* Deferred.make<void>();
+      const cleaned = yield* Deferred.make<void>();
+      const readFinished = yield* Deferred.make<void>();
+      const readerSnapshotLock = {
+        ...gate,
+        withPermits:
+          (permits: number) =>
+          <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+            Deferred.succeed(waiting, undefined).pipe(
+              Effect.andThen(gate.withPermits(permits)(effect)),
+            ),
+      };
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`PRAGMA journal_mode = WAL`;
+        yield* sql`CREATE TABLE ardud_turn_items (value INTEGER)`;
+        const holder = yield* gate
+          .withPermits(1)(
+            Deferred.succeed(gateHeld, undefined).pipe(Effect.andThen(Deferred.await(openGate))),
+          )
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(gateHeld);
+        let calls = 0;
+        const handler = Effect.suspend(() => {
+          if (++calls !== 1) return sql`SELECT 1`.pipe(Effect.as({ ready: true }));
+          const query = sql`SELECT * FROM ardud_turn_items`;
+          return (operation === "transaction" ? sql.withTransaction(query) : query).pipe(
+            Effect.andThen(Deferred.succeed(readFinished, undefined)),
+            Effect.as({ ready: true }),
+            Effect.ensuring(Deferred.succeed(cleaned, undefined)),
+          );
+        }).pipe(NodeSqliteClient.requireReader, NodeSqliteClient.foregroundReads, Effect.orDie);
+        yield* Effect.gen(function* () {
+          const pending = yield* callRead.pipe(Effect.forkChild);
+          yield* Deferred.await(waiting);
+          if (stop === "deadline") {
+            yield* TestClock.adjust(McpDeadline.READ_TIMEOUT);
+            expect((yield* Fiber.join(pending)).structuredContent).toMatchObject({
+              _tag: "ThreadReadTimeoutError",
+              phase: "query",
+            });
+          } else yield* Fiber.interrupt(pending);
+          yield* Deferred.await(cleaned);
+          expect(yield* Deferred.isDone(openGate)).toBe(false);
+          expect(yield* Deferred.isDone(readFinished)).toBe(false);
+          expect((yield* callRead).structuredContent).toEqual({ ready: true });
+          expect(yield* gate.takeIfAvailable(1)).toBe(false);
+        }).pipe(
+          Effect.provide(readLayer(handler, rows)),
+          Effect.ensuring(Deferred.succeed(openGate, undefined)),
+        );
+        yield* Fiber.join(holder);
+      }).pipe(
+        Effect.provide(
+          NodeSqliteClient.layer({
+            filename: path.join(directory, "test.sqlite"),
+            readerWorker: true,
+            foregroundReaderSlots: 1,
+            readerSnapshotSql: ["SELECT rootpage FROM main.sqlite_schema LIMIT 1"],
+            readerSnapshotLock,
+          }),
+        ),
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect.each(["deadline", "disconnect"] as const)(
+  "restores snapshot protection after cancellation during admitted BEGIN on %s",
+  (stop) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "thread-read-pinned-" });
+      const rows = yield* Queue.unbounded<AnalyticsEvent>();
+      const gate = yield* Semaphore.make(1);
+      const pinned = yield* Deferred.make<void>();
+      const finishSetup = yield* Deferred.make<void>();
+      const cleaned = yield* Deferred.make<void>();
+      const waiting = yield* Deferred.make<void>();
+      let snapshots = 0;
+      const readerSnapshotLock = {
+        ...gate,
+        withPermits:
+          (permits: number) =>
+          <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+            Effect.suspend(() => {
+              const first = ++snapshots === 1;
+              return (first ? Effect.void : Deferred.succeed(waiting, undefined)).pipe(
+                Effect.andThen(
+                  gate.withPermits(permits)(
+                    effect.pipe(
+                      Effect.tap(() =>
+                        first
+                          ? Deferred.succeed(pinned, undefined).pipe(
+                              Effect.andThen(Deferred.await(finishSetup)),
+                            )
+                          : Effect.void,
+                      ),
+                      Effect.uninterruptible,
+                    ),
+                  ),
+                ),
+              );
+            }),
+      };
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`PRAGMA journal_mode = WAL`;
+        yield* sql`CREATE TABLE ardud_turn_items (value INTEGER)`;
+        let calls = 0;
+        const handler = Effect.suspend(() => {
+          const query = sql`SELECT * FROM ardud_turn_items`;
+          return (
+            ++calls === 1
+              ? sql
+                  .withTransaction(query)
+                  .pipe(Effect.ensuring(Deferred.succeed(cleaned, undefined)))
+              : query
+          ).pipe(Effect.as({ ready: true }));
+        }).pipe(NodeSqliteClient.requireReader, NodeSqliteClient.foregroundReads, Effect.orDie);
+        yield* Effect.gen(function* () {
+          const pending = yield* callRead.pipe(Effect.forkChild);
+          yield* Deferred.await(pinned);
+          if (stop === "deadline") {
+            yield* TestClock.adjust(McpDeadline.READ_TIMEOUT);
+            expect((yield* Fiber.join(pending)).isError).toBe(true);
+          } else yield* Fiber.interrupt(pending);
+          yield* Deferred.succeed(finishSetup, undefined);
+          yield* Deferred.await(cleaned);
+          const next = yield* gate.withPermits(1)(
+            Effect.gen(function* () {
+              const next = yield* callRead.pipe(Effect.forkChild);
+              yield* Deferred.await(waiting).pipe(
+                Effect.raceFirst(
+                  Fiber.join(next).pipe(
+                    Effect.flatMap(() => Effect.die(new Error("Read bypassed the snapshot gate"))),
+                  ),
+                ),
+              );
+              expect(next.pollUnsafe()).toBeUndefined();
+              return next;
+            }),
+          );
+          expect((yield* Fiber.join(next)).structuredContent).toEqual({ ready: true });
+        }).pipe(
+          Effect.provide(readLayer(handler, rows)),
+          Effect.ensuring(Deferred.succeed(finishSetup, undefined)),
+        );
+      }).pipe(
+        Effect.provide(
+          NodeSqliteClient.layer({
+            filename: path.join(directory, "test.sqlite"),
+            readerWorker: true,
+            foregroundReaderSlots: 1,
+            readerSnapshotSql: ["SELECT rootpage FROM main.sqlite_schema LIMIT 1"],
+            readerSnapshotLock,
+          }),
+        ),
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
 it.effect.each(["during commit", "after commit"] as const)(

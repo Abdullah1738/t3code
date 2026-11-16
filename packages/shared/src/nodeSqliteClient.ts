@@ -1092,6 +1092,14 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
       (sql) => request({ sql, params: [], cached: true, values: false, raw: false }, false),
       { discard: true },
     );
+    // Statement spans cover this gate; admission keeps the policy captured before setup was masked.
+    // Once admitted, BEGIN and pinning must finish together before the gate is released.
+    const withSnapshotLock = Effect.fnUntraced(function* <A, E, R>(
+      effect: Effect.Effect<A, E, R>,
+      restore: typeof Effect.interruptible,
+    ) {
+      return yield* restore(snapshotLock.withPermits(1)(Effect.uninterruptible(effect)));
+    });
     const withSnapshot = <A>(sql: string, effect: Effect.Effect<A, SqlError>) =>
       Effect.suspend(() => {
         if (
@@ -1101,28 +1109,27 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
         )
           return effect;
         return Effect.uninterruptibleMask((restore) =>
-          snapshotLock
-            .withPermits(1)(
+          withSnapshotLock(
+            request(
+              { sql: "BEGIN", params: [], cached: false, values: false, raw: false },
+              false,
+            ).pipe(Effect.andThen(pinSnapshots)),
+            restore,
+          ).pipe(
+            Effect.andThen(restore(effect)),
+            Effect.ensuring(
               request(
-                { sql: "BEGIN", params: [], cached: false, values: false, raw: false },
+                {
+                  sql: "ROLLBACK",
+                  params: [],
+                  cached: false,
+                  values: false,
+                  raw: false,
+                },
                 false,
-              ).pipe(Effect.andThen(pinSnapshots)),
-            )
-            .pipe(
-              Effect.andThen(restore(effect)),
-              Effect.ensuring(
-                request(
-                  {
-                    sql: "ROLLBACK",
-                    params: [],
-                    cached: false,
-                    values: false,
-                    raw: false,
-                  },
-                  false,
-                ).pipe(Effect.ignore),
-              ),
+              ).pipe(Effect.ignore),
             ),
+          ),
         );
       });
     const connection = identity<Connection>({
@@ -1159,8 +1166,8 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
         if (/^\s*BEGIN\b/i.test(sql) && options.readerSnapshotSql !== undefined) {
           // WAL snapshots are per attached DB. Pin both while no archive mover
           // can replace a cold row between their snapshot acquisitions.
-          return Effect.uninterruptible(
-            snapshotLock.withPermits(1)(
+          return Effect.withFiber((fiber) =>
+            withSnapshotLock(
               effect.pipe(
                 Effect.andThen(pinSnapshots),
                 Effect.tap(() =>
@@ -1170,6 +1177,7 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
                 ),
                 Effect.as([]),
               ),
+              fiber.getRef(TransactionAcquire)?.restore ?? identity,
             ),
           ).pipe(
             Effect.onError(() =>
@@ -1179,7 +1187,14 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
                 cached: false,
                 values: false,
                 raw: false,
-              }).pipe(Effect.ignore),
+              }).pipe(
+                Effect.tap(() =>
+                  Effect.sync(() => {
+                    snapshotTransaction = false;
+                  }),
+                ),
+                Effect.ignore,
+              ),
             ),
           );
         }
