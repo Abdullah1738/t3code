@@ -164,6 +164,8 @@ export const KanbanSubtask = Schema.Struct({
   createdAt: Schema.optional(IsoDateTime),
   /** For a script's subtask: the name of the board script that does it. Absent: any script on the card's board. */
   script: Schema.optional(Schema.String),
+  /** True: a Completed card's dependents on other threads wait until this subtask is done or skipped; false: never holds; absent: guessed from the text. */
+  holdsDependents: Schema.optional(Schema.Boolean),
   state: Schema.Literals(["open", "done", "skipped"]),
   /** What was done, or why it was skipped. */
   note: Schema.NullOr(Schema.String),
@@ -1393,19 +1395,19 @@ const isOpenCard = (card: Pick<KanbanCard, "stage" | "settledAt">) =>
   !KANBAN_DONE_STAGES.has(card.stage) && card.settledAt === null;
 
 /**
- * A completed card whose evaluator merge subtask is still open: review has
- * passed, but its work isn't on ardud/main yet. Completed means review-passed;
- * the merge is a later evaluator subtask.
+ * A completed card whose landing step is still open. Completed means review
+ * passed, but dependents on other threads may still need its work to land.
  */
 export const kanbanAwaitsMerge = (card: Pick<KanbanCard, "stage" | "subtasks">): boolean =>
   card.stage === "completed" &&
   card.subtasks.some(
     (subtask) =>
       subtask.state === "open" &&
-      (subtask.owner === "evaluator" || subtask.owner === "script") &&
-      // A merge action starts a clause ("merge router.ts into ...", "...; merge; deploy ...");
-      // a check that only mentions a merge ("blocker's merge subtask") doesn't.
-      /(?:^|[;:,.]\s*|\b(?:and|then)\s+)merge\b/i.test(subtask.text),
+      (subtask.holdsDependents === true ||
+        (subtask.holdsDependents === undefined &&
+          (subtask.owner === "evaluator" || subtask.owner === "script") &&
+          // The action must start a clause, not just be mentioned in a check.
+          /(?:^|[;:,.]\s*|\b(?:and|then)\s+)(?:merge|land|fast[- ]forward)\b/i.test(subtask.text))),
   );
 
 /**
@@ -1414,7 +1416,7 @@ export const kanbanAwaitsMerge = (card: Pick<KanbanCard, "stage" | "subtasks">):
  * in order unless stalled, in the backlog, waiting on the evaluator, or held
  * up in turn. Once the blocker leaves for review, the thread's branch is
  * unreviewed and rework can come back. A completed blocker still holds while
- * its merge subtask is open; deployed and verified blockers never do.
+ * its landing step is open; deployed and verified blockers never do.
  */
 export function kanbanHeldUpBy(
   card: KanbanCard,

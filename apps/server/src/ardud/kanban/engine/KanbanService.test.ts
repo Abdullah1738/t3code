@@ -15364,7 +15364,7 @@ it.effect("a thread's new card waits for an evaluator's packet; the owner's goes
           title: "Retry",
           subtasks: [
             { text: "Fix it", owner: "work" },
-            { text: "Tell QA", owner: "evaluator", step: 2 },
+            { text: "Tell QA", owner: "evaluator", step: 2, holdsDependents: true },
           ],
         },
         thread,
@@ -15377,6 +15377,8 @@ it.effect("a thread's new card waits for an evaluator's packet; the owner's goes
           ["s3", 3, "evaluator"],
         ],
       );
+      assert.strictEqual(noted.subtasks[2]?.holdsDependents, true);
+      assert.strictEqual((yield* kanban.card(noted.id)).card.subtasks[2]?.holdsDependents, true);
       const told = [...(yield* Ref.get(fake.threads)).values()].filter((view) =>
         view.messages.some((text) => text.includes("waiting on your subtasks: s1")),
       );
