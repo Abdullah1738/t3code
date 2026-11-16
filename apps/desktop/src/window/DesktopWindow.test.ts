@@ -570,6 +570,7 @@ describe("DesktopWindow", () => {
         Layer.mock(DesktopLinuxUrlHandler.DesktopLinuxUrlHandler)({ register: Effect.void }),
         Layer.mock(DesktopShellEnvironment.DesktopShellEnvironment)({
           installIntoProcess: Effect.succeed(true),
+          pathHydration: { source: "none", probes: [] },
         }),
         Layer.succeed(DesktopPreReadyPlatform.DesktopPreReadyElectronOptions, {
           linux: null,

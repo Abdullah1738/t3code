@@ -1,3 +1,4 @@
+import type { DesktopBackendBootstrap } from "@t3tools/contracts";
 import {
   buildEnvironmentCaptureCommand,
   listLoginShellCandidates,
@@ -17,11 +18,15 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
 
+type PathHydration = NonNullable<DesktopBackendBootstrap["shellPathHydration"]>;
+type ProbeOutcome = PathHydration["probes"][number];
+
 type EnvironmentPatch = Record<string, string>;
 
 interface ShellEnvironmentConfig {
   readonly env: NodeJS.ProcessEnv;
   readonly platform: NodeJS.Platform;
+  readonly pathHydration?: { source: PathHydration["source"]; probes: ProbeOutcome[] };
 }
 
 interface WindowsProbeOptions {
@@ -71,6 +76,7 @@ export class DesktopShellEnvironment extends Context.Service<
   {
     // Reuses the installation result; false leaves server hydration enabled.
     readonly installIntoProcess: Effect.Effect<boolean>;
+    readonly pathHydration: PathHydration;
   }
 >()("@t3tools/desktop/shell/DesktopShellEnvironment") {}
 
@@ -277,8 +283,11 @@ const runCommandOutput = Effect.fn("desktop.shellEnvironment.runCommandOutput")(
   readonly args: ReadonlyArray<string>;
   readonly timeout: Duration.Duration;
   readonly shell?: boolean;
+  readonly onProbe?: ((outcome: ProbeOutcome) => void) | undefined;
 }): Effect.fn.Return<string, never, ChildProcessSpawner.ChildProcessSpawner> {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const started = yield* Clock.monotonicTimeNanos;
+  let failureTag = "none";
   const output = yield* Effect.scoped(
     Effect.gen(function* () {
       const child = yield* spawner.spawn(
@@ -317,14 +326,21 @@ const runCommandOutput = Effect.fn("desktop.shellEnvironment.runCommandOutput")(
     ),
     Effect.map(([stdout]) => stdout),
     Effect.catchTags({
-      DesktopShellEnvironmentCommandError: (error) =>
-        logShellEnvironmentCommandError(error).pipe(Effect.as("")),
+      DesktopShellEnvironmentCommandError: (error) => {
+        failureTag = error._tag;
+        return logShellEnvironmentCommandError(error).pipe(Effect.as(""));
+      },
     }),
     Effect.timeoutOption(input.timeout),
   );
-  if (Option.isSome(output)) {
-    return output.value;
+  const timedOut = Option.isNone(output);
+  failureTag = timedOut ? "DesktopShellEnvironmentCommandTimeoutError" : failureTag;
+  const elapsedMs = Number((yield* Clock.monotonicTimeNanos) - started) / 1_000_000;
+  yield* Effect.annotateCurrentSpan({ failureTag, timedOut, elapsedMs });
+  if (input.probe === "login-shell" || input.probe === "launchctl-path") {
+    input.onProbe?.({ probe: input.probe, failureTag, timedOut, elapsedMs });
   }
+  if (Option.isSome(output)) return output.value;
 
   const error = new DesktopShellEnvironmentCommandTimeoutError({
     probe: input.probe,
@@ -339,6 +355,7 @@ const runCommandOutput = Effect.fn("desktop.shellEnvironment.runCommandOutput")(
 const readLoginShellEnvironment = (
   shell: string,
   names: ReadonlyArray<string>,
+  onProbe: ((outcome: ProbeOutcome) => void) | undefined,
 ): Effect.Effect<EnvironmentPatch, never, ChildProcessSpawner.ChildProcessSpawner> =>
   names.length === 0
     ? Effect.succeed({})
@@ -347,14 +364,17 @@ const readLoginShellEnvironment = (
         command: shell,
         args: ["-ilc", buildEnvironmentCaptureCommand(shell, names)],
         timeout: LOGIN_SHELL_TIMEOUT,
+        onProbe,
       }).pipe(Effect.map((output) => extractEnvironment(output, names)));
 
-const readLaunchctlPath = runCommandOutput({
-  probe: "launchctl-path",
-  command: "/bin/launchctl",
-  args: ["getenv", "PATH"],
-  timeout: LAUNCHCTL_TIMEOUT,
-}).pipe(Effect.map(trimNonEmpty));
+const readLaunchctlPath = (onProbe: ((outcome: ProbeOutcome) => void) | undefined) =>
+  runCommandOutput({
+    probe: "launchctl-path",
+    command: "/bin/launchctl",
+    args: ["getenv", "PATH"],
+    timeout: LAUNCHCTL_TIMEOUT,
+    onProbe,
+  }).pipe(Effect.map(trimNonEmpty));
 
 const readWindowsEnvironment = Effect.fn("desktop.shellEnvironment.readWindowsEnvironment")(
   function* (
@@ -432,32 +452,43 @@ const installPosixEnvironment = Effect.fn("desktop.shellEnvironment.installPosix
   function* (
     config: ShellEnvironmentConfig,
   ): Effect.fn.Return<
-    void,
+    boolean,
     never,
     ChildProcessSpawner.ChildProcessSpawner | FileSystem.FileSystem
   > {
     const fileSystem = yield* FileSystem.FileSystem;
     const shellEnvironment: EnvironmentPatch = {};
+    const onProbe = (outcome: ProbeOutcome) => config.pathHydration?.probes.push(outcome);
 
     for (const shell of listLoginShellCandidates(config.platform, config.env.SHELL)) {
       Object.assign(
         shellEnvironment,
-        yield* readLoginShellEnvironment(shell, LOGIN_SHELL_ENV_NAMES),
+        yield* readLoginShellEnvironment(shell, LOGIN_SHELL_ENV_NAMES, onProbe),
       );
-      if (shellEnvironment.PATH) break;
+      if (Option.isSome(trimNonEmpty(shellEnvironment.PATH))) break;
     }
 
     const launchctlPath =
-      config.platform === "darwin" && !shellEnvironment.PATH
-        ? yield* readLaunchctlPath
+      config.platform === "darwin" && Option.isNone(trimNonEmpty(shellEnvironment.PATH))
+        ? yield* readLaunchctlPath(onProbe)
         : Option.none<string>();
     const mergedPath = mergePaths(config.platform, [
       trimNonEmpty(shellEnvironment.PATH).pipe(Option.orElse(() => launchctlPath)),
       readEnvPath(config.env),
     ]);
 
-    if (Option.isSome(mergedPath)) {
+    const hydrated =
+      Option.isSome(mergedPath) &&
+      (Option.isSome(trimNonEmpty(shellEnvironment.PATH)) || Option.isSome(launchctlPath));
+    if (hydrated && Option.isSome(mergedPath)) {
       config.env.PATH = mergedPath.value;
+    }
+    if (config.pathHydration) {
+      config.pathHydration.source = hydrated
+        ? Option.isSome(trimNonEmpty(shellEnvironment.PATH))
+          ? "desktop-shell"
+          : "desktop-launchctl"
+        : "none";
     }
     // The server, relaunch and updater all inherit process.env, so scrubbing
     // here keeps earlier AppImage launches' mounts out of every one of them.
@@ -542,6 +573,7 @@ const installPosixEnvironment = Effect.fn("desktop.shellEnvironment.installPosix
         }
       }
     }
+    return hydrated;
   },
 );
 
@@ -556,7 +588,7 @@ const installShellEnvironment = (
     return installWindowsEnvironment(config);
   }
   if (config.platform === "darwin" || config.platform === "linux") {
-    return installPosixEnvironment(config).pipe(Effect.as(true));
+    return installPosixEnvironment(config);
   }
   return Effect.succeed(false);
 };
@@ -566,11 +598,16 @@ export const make = Effect.gen(function* () {
   const environment = yield* DesktopEnvironment.DesktopEnvironment;
   const fileSystem = yield* FileSystem.FileSystem;
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const pathHydration: { source: PathHydration["source"]; probes: ProbeOutcome[] } = {
+    source: "none",
+    probes: [],
+  };
   const installIntoProcess: DesktopShellEnvironment["Service"]["installIntoProcess"] =
     yield* Effect.cached(
       installShellEnvironment({
         env: process.env,
         platform: environment.platform,
+        pathHydration,
       }).pipe(
         Effect.provideService(FileSystem.FileSystem, fileSystem),
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
@@ -578,7 +615,7 @@ export const make = Effect.gen(function* () {
       ),
     );
 
-  return DesktopShellEnvironment.of({ installIntoProcess });
+  return DesktopShellEnvironment.of({ installIntoProcess, pathHydration });
 });
 
 export const layer = Layer.effect(DesktopShellEnvironment, make);
