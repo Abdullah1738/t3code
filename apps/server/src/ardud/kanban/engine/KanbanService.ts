@@ -243,6 +243,7 @@ interface EvaluatorQueueRow {
   readonly json: string;
   readonly started_at: string | null;
   readonly thread_id: string | null;
+  readonly done_at: string | null;
 }
 
 export interface NewLink {
@@ -950,6 +951,19 @@ export interface KanbanServiceShape {
       readonly forceNew?: boolean;
     },
   ) => Effect.Effect<EvaluatorSubmission, KanbanError>;
+  readonly evaluatorStatus: (
+    boardId: KanbanBoardId,
+    handle: { readonly queueId?: number; readonly threadId?: string },
+  ) => Effect.Effect<
+    {
+      readonly saved: boolean;
+      readonly queued: boolean;
+      readonly queueId?: number;
+      readonly threadId?: ThreadId;
+      readonly cards: ReadonlyArray<Pick<KanbanCard, "id" | "number" | "title" | "stage">>;
+    },
+    KanbanError
+  >;
   readonly reportBug: (input: {
     readonly boardId: string;
     readonly threadId: ThreadId;
@@ -2679,9 +2693,7 @@ const make = Effect.gen(function* () {
     Effect.flatMap(nowMillis, (at) =>
       Ref.update(holds, (all) =>
         new Map(all).set(threadId, { ...all.get(threadId), boardId, pool, at }),
-      ).pipe(
-        Effect.andThen(syncSlot(boardId, threadId, "hold", cardId)),
-      ),
+      ).pipe(Effect.andThen(syncSlot(boardId, threadId, "hold", cardId))),
     );
   /** One board's held slots, thread id to pool, as the rules take them. `except`: a start's own key. */
   const boardHolds = (boardId: string, except?: string) =>
@@ -3331,6 +3343,7 @@ const make = Effect.gen(function* () {
       readonly fromStage?: KanbanStage | null;
       readonly toStage?: KanbanStage | null;
       readonly body?: string | null;
+      readonly sourceThreadId?: ThreadId;
       readonly head?: string | null;
       readonly instructionApplication?: InstructionApplication;
       readonly undoAssignment?: true;
@@ -3349,6 +3362,7 @@ const make = Effect.gen(function* () {
         fromStage: extra.fromStage ?? null,
         toStage: extra.toStage ?? null,
         body: extra.body ?? null,
+        ...(extra.sourceThreadId === undefined ? {} : { sourceThreadId: extra.sourceThreadId }),
         head: extra.head ?? null,
         ...(extra.assignmentWake === undefined ? {} : { assignmentWake: extra.assignmentWake }),
       },
@@ -4888,6 +4902,7 @@ const make = Effect.gen(function* () {
   ) {
     yield* logEvent(card, { _tag: "system", component: "evaluator-admission" }, "comment", {
       body: `sighting from ${caller ?? "board"}: ${text.slice(0, 400)}`,
+      ...(caller === undefined ? {} : { sourceThreadId: caller }),
     });
   });
 
@@ -5059,41 +5074,43 @@ const make = Effect.gen(function* () {
     }
     // @effect-diagnostics-next-line preferSchemaOverJson:off -- internal durable job, same shape as its caller.
     const json = JSON.stringify({ purpose, extra });
-    const enqueue = tickSql`
+    const enqueue = tickSql<{ id: number }>`
       INSERT INTO ardud_kanban_evaluator_queue (job_key, board_id, card_id, json, created_at)
       VALUES (${key}, ${board.id}, ${extra.cardId ?? null}, ${json}, ${at})
-      ON CONFLICT (job_key) DO NOTHING
+      ON CONFLICT (job_key) DO UPDATE SET job_key = excluded.job_key
+      RETURNING id
     `;
     if (nightly) {
       const saved = nightly;
       // The daily marker must never outlive a failed admission without its recoverable job.
       yield* locks.access(
         board.id,
-        tickTransaction(
-          Effect.gen(function* () {
-            yield* rawStore.putDiscussion(saved.discussion);
-            yield* rawStore.putBoard(saved.board);
-            yield* enqueue;
-          }),
-        ),
+        Effect.gen(function* () {
+          const rows = yield* tickTransaction(
+            Effect.gen(function* () {
+              yield* rawStore.putDiscussion(saved.discussion);
+              yield* rawStore.putBoard(saved.board);
+              return yield* enqueue;
+            }),
+          );
+          yield* SavedWrite.record({ kind: "evaluatorQueue", key, queueId: rows[0]!.id });
+        }),
         true,
       );
       yield* publish(board.id, { _tag: "discussion", discussion: saved.discussion });
       yield* publish(board.id, { _tag: "board", board: saved.board });
     } else {
-      yield* locks.access(
-        board.id,
-        Effect.gen(function* () {
-          yield* enqueue;
-          if (reportAdmissionAt !== undefined) {
-            const rows =
-              yield* tickSql<EvaluatorQueueRow>`SELECT * FROM ardud_kanban_evaluator_queue WHERE job_key = ${key}`;
+      yield* locks
+        .access(
+          board.id,
+          Effect.gen(function* () {
+            const rows = yield* enqueue;
             yield* SavedWrite.record({ kind: "evaluatorQueue", key, queueId: rows[0]!.id });
-          }
-        }),
-        true,
-        "evaluator-queue",
-      );
+          }),
+          true,
+          "evaluator-queue",
+        )
+        .pipe(Effect.withSpan("KanbanService.evaluatorQueueWrite"));
     }
     if (yield* enqueueEvaluatorOnly) {
       const rows =
@@ -8554,9 +8571,7 @@ const make = Effect.gen(function* () {
       next.delete(reused);
       return next;
     }).pipe(
-      Effect.andThen(
-        reused === null ? Effect.void : syncSlot(board.id, reused, "join", card.id),
-      ),
+      Effect.andThen(reused === null ? Effect.void : syncSlot(board.id, reused, "join", card.id)),
     );
     let cleaned = false;
     let failureTag = "interrupted";
@@ -19068,10 +19083,11 @@ const make = Effect.gen(function* () {
             const bucket = Math.floor(at / retryWindowMs);
             const candidateKey = `${keyPrefix}${bucket}`;
             const since = DateTime.formatIso(DateTime.makeUnsafe(at - retryWindowMs));
-            // Check both buckets so a timeout retry across their boundary reuses its admission.
+            // Recover pending work across bucket boundaries and long spawn-cap waits.
             const previous =
               (yield* tickSql<EvaluatorQueueRow>`SELECT * FROM ardud_kanban_evaluator_queue
-              WHERE board_id = ${board.id} AND job_key IN (${candidateKey}, ${`${keyPrefix}${bucket - 1}`}) AND created_at > ${since}
+              WHERE board_id = ${board.id} AND job_key >= ${keyPrefix} AND job_key < ${`${keyPrefix}~`}
+                AND (done_at IS NULL OR done_at > ${since})
               ORDER BY id DESC LIMIT 1`)[0];
             key = previous?.job_key ?? candidateKey;
             if (previous?.thread_id) {
@@ -19510,10 +19526,56 @@ const make = Effect.gen(function* () {
         }),
       ),
     startEvaluator,
-    reportBug,
+    evaluatorStatus: Effect.fn("KanbanService.evaluatorStatus")(function* (boardId, handle) {
+      if ((handle.queueId === undefined) === (handle.threadId === undefined))
+        return yield* failWith("invalid", "Pass exactly one of queueId or threadId.");
+      return yield* readDb(
+        Effect.gen(function* () {
+          yield* boardOf(boardId);
+          const row = (yield* tickSql<EvaluatorQueueRow>`SELECT * FROM ardud_kanban_evaluator_queue
+            WHERE board_id = ${boardId} AND
+              (id = ${handle.queueId ?? null} OR thread_id = ${handle.threadId ?? null})
+            ORDER BY id DESC LIMIT 1`)[0];
+          const threadId = row?.thread_id ?? handle.threadId;
+          const link = threadId ? yield* rawStore.threadLink(threadId) : null;
+          const saved =
+            row !== undefined || (link?.boardId === boardId && link.role === "evaluator");
+          if (!saved) return { saved: false, queued: false, cards: [] };
+          // Follow persisted identities, including a duplicate appended to a
+          // card created by another evaluator. Titles and live ownership can change.
+          const ids = yield* tickSql<{ id: string }>`SELECT c.id FROM ardud_kanban_cards c
+            WHERE c.board_id = ${boardId} AND (c.id = ${row?.card_id ?? link?.cardId ?? null} OR
+              (json_extract(c.json, '$.createdBy._tag') = 'evaluator'
+               AND json_extract(c.json, '$.createdBy.threadId') = ${threadId ?? null}) OR
+              EXISTS (SELECT 1 FROM ardud_kanban_card_events e WHERE e.card_id = c.id
+                AND (json_extract(e.json, '$.actor.threadId') = ${threadId ?? null}
+                  OR json_extract(e.json, '$.sourceThreadId') = ${threadId ?? null})) OR
+              EXISTS (SELECT 1 FROM ardud_kanban_messages m
+                WHERE m.discussion_id = json_extract(c.json, '$.discussionId')
+                AND json_extract(m.json, '$.author.threadId') = ${threadId ?? null}))
+            ORDER BY c.number`;
+          const cards = yield* Effect.forEach(ids, ({ id }) =>
+            rawStore.card(KanbanCardId.make(id)),
+          );
+          return {
+            saved: true,
+            queued: row !== undefined && row.done_at === null,
+            ...(row ? { queueId: row.id } : {}),
+            ...(threadId ? { threadId: ThreadId.make(threadId) } : {}),
+            cards: cards.flatMap((card) =>
+              card
+                ? [{ id: card.id, number: card.number, title: card.title, stage: card.stage }]
+                : [],
+            ),
+          };
+        }),
+      ).pipe(Effect.mapError(toKanbanError));
+    }),
+    reportBug: (input) => SavedWrite.subSteps("bug.report", reportBug(input), true),
     submitEvaluator: (boardId, purpose, options = {}) => {
-      const key = uuid();
-      return guard(
+      let key: string = uuid();
+      let matchedCard: KanbanCard | undefined;
+      const submission = guard(
         "evaluator.submit",
         evaluatorAdmission(
           boardId,
@@ -19526,6 +19588,41 @@ const make = Effect.gen(function* () {
               ],
             ]);
             const board = yield* boardOf(boardId);
+            // Pending admissions remain retryable even beyond the recent-call
+            // window, including interruption between create and first turn.
+            if (purpose.kind === "request" && options.callerThreadId !== undefined) {
+              const prefix = `evaluator-request:${NodeCrypto.createHash("sha256")
+                .update(
+                  encodeBugReportIdentity([
+                    boardId,
+                    options.callerThreadId,
+                    options.matchText ?? purpose.text,
+                    options.text ?? "",
+                    String(options.forceNew === true),
+                  ]),
+                )
+                .digest("hex")}:`;
+              const at = yield* nowMillis;
+              const windowMs = 30 * 60_000;
+              const bucket = Math.floor(at / windowMs);
+              const since = DateTime.formatIso(DateTime.makeUnsafe(at - windowMs));
+              const previous =
+                (yield* tickSql<EvaluatorQueueRow>`SELECT * FROM ardud_kanban_evaluator_queue
+                WHERE board_id = ${boardId} AND job_key >= ${prefix} AND job_key < ${`${prefix}~`}
+                AND (done_at IS NULL OR done_at > ${since}) ORDER BY id DESC LIMIT 1`)[0];
+              key = previous?.job_key ?? `${prefix}${bucket}`;
+              if (previous !== undefined) {
+                if (previous.thread_id !== null) {
+                  const threadId = ThreadId.make(previous.thread_id);
+                  yield* SavedWrite.record({ kind: "evaluator", key, threadId });
+                  return { threadId };
+                }
+                yield* SavedWrite.record({ kind: "evaluatorQueue", key, queueId: previous.id });
+                return (yield* enqueueEvaluatorOnly)
+                  ? { queued: true as const, queueId: previous.id }
+                  : yield* drainEvaluatorQueue(boardId, key);
+              }
+            }
             if (["stalled", "completed", "deployed", "check", "nightly"].includes(purpose.kind)) {
               const running = yield* runningSweep(board.id, purpose.kind);
               if (running)
@@ -19565,10 +19662,14 @@ const make = Effect.gen(function* () {
                   endedRecently ||
                   (yield* reusableEvaluator(card, reuse)) !== null
                 ) {
+                  matchedCard = card;
                   yield* appendSighting(
                     card,
                     options.matchText ?? purpose.text,
                     options.callerThreadId,
+                  ).pipe(
+                    Effect.andThen(SavedWrite.record({ kind: "card", card })),
+                    Effect.uninterruptible,
                   );
                   return { matched: true as const, card, sightingAppended: true as const };
                 }
@@ -19587,7 +19688,20 @@ const make = Effect.gen(function* () {
             });
           }),
         ),
-      ).pipe(Effect.mapError(toKanbanError));
+      );
+      const recover = (saved: SavedWrite.Saved): EvaluatorSubmission | undefined =>
+        saved.kind === "evaluator" && saved.key === key
+          ? { threadId: saved.threadId }
+          : saved.kind === "evaluatorQueue" && saved.key === key
+            ? { queued: true, queueId: saved.queueId }
+            : saved.kind === "card" && saved.card.id === matchedCard?.id
+              ? { matched: true, card: saved.card, sightingAppended: true }
+              : undefined;
+      return (
+        options.callerThreadId !== undefined ? SavedWrite.recover(submission, recover) : submission
+      ).pipe(Effect.mapError(toKanbanError), (effect) =>
+        SavedWrite.subSteps("evaluator.submit", effect, true),
+      );
     },
     resolveBoard: Effect.fn("KanbanService.resolveBoard")(function* (threadId, input) {
       return yield* readDb(

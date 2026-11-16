@@ -78,15 +78,18 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
   let commitStarted = false;
   let receipt: SavedWrite.Saved | undefined;
   let reportLookup: SavedWrite.ReportLookup | undefined;
-  // reportBug publishes its target before any report write, so no target proves this call saved no report.
+  // raceFirst joins cancellation before replying. Evaluator admissions and bug
+  // sightings publish their receipt inside the masked write, including queue-only saves.
   const savedState = () =>
     receipt !== undefined
       ? true
-      : tool === "report_bug" && reportLookup === undefined
+      : tool === "evaluator_start" || (tool === "report_bug" && timerLatenessMs !== null)
         ? false
-        : commitStarted
-          ? null
-          : false;
+        : tool === "report_bug" && reportLookup === undefined
+          ? false
+          : commitStarted
+            ? null
+            : false;
   const attributes = () => ({
     "kanban.reply.stage_at_timeout": stageAtTimeout,
     "kanban.reply.timed_out": timerLatenessMs !== null,
@@ -121,30 +124,38 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
     const saved = savedState();
     const message =
       saved === false
-        ? tool === "report_bug"
-          ? "Nothing was saved; retry with the same arguments."
-          : "Not saved (board busy). Safe to retry."
-        : tool === "report_bug"
-          ? receipt === undefined
-            ? reportLookup === undefined
-              ? "Nothing was saved; retry with the same arguments."
-              : `Bug report outcome unknown. ${
-                  reportLookup.kind === "card"
-                    ? `Look up card #${reportLookup.number} (${reportLookup.cardId}) on board ${reportLookup.boardId}.`
-                    : `Look up evaluator key prefix ${reportLookup.keyPrefix} on board ${reportLookup.boardId}.`
-                } Retry with the same arguments to recover the report or save it once.`
-            : receipt.kind === "evaluator"
-              ? "Saved; the returned threadId identifies the request evaluator. Do not submit another report."
-              : receipt.kind === "evaluatorQueue"
-                ? "Saved; the request evaluator is queued with the returned queueId and evaluatorKey. Do not submit another report."
-                : "Saved; the sighting is on appendedTo. Read it with card_get."
-          : tool === "discussion_post"
+        ? tool === "evaluator_start"
+          ? "Not saved; evaluator not started. Safe to retry with the same arguments."
+          : tool === "report_bug"
+            ? "Nothing was saved; retry with the same arguments."
+            : "Not saved (board busy). Safe to retry."
+        : tool === "evaluator_start"
+          ? receipt?.kind === "evaluator"
+            ? `Saved; evaluator launched as ${receipt.threadId}. Do not retry. Use evaluator_status with this threadId to find its cards.`
+            : receipt?.kind === "evaluatorQueue"
+              ? "Saved; the request is queued. The launch may still finish. Use evaluator_status with the returned queueId to find its evaluator and cards. Retry only with the same arguments to recover this request; do not submit a new request."
+              : "Saved; the sighting is on the returned card. Do not retry."
+          : tool === "report_bug"
             ? receipt === undefined
-              ? "Discussion post reply timed out; the message may have been saved. Read back with discussion_read before retrying."
-              : "Saved; discussion_read for details."
-            : receipt === undefined
-              ? "Board write reply timed out; the write may have been saved. Read back with card_get (evaluator_start: check board threads) before retrying."
-              : "Saved; card_get for details.";
+              ? reportLookup === undefined
+                ? "Nothing was saved; retry with the same arguments."
+                : `Bug report outcome unknown. ${
+                    reportLookup.kind === "card"
+                      ? `Look up card #${reportLookup.number} (${reportLookup.cardId}) on board ${reportLookup.boardId}.`
+                      : `Look up evaluator key prefix ${reportLookup.keyPrefix} on board ${reportLookup.boardId}.`
+                  } Retry with the same arguments to recover the report or save it once.`
+              : receipt.kind === "evaluator"
+                ? "Saved; the returned threadId identifies the request evaluator. Use evaluator_status with this threadId to find its cards. Do not submit another report."
+                : receipt.kind === "evaluatorQueue"
+                  ? "Saved; the request evaluator is queued. Its launch may still finish. Use evaluator_status with the returned queueId to find its evaluator and cards. Retry only with the same arguments to recover this request. Do not submit another report."
+                  : "Saved; the sighting is on appendedTo. Read it with card_get."
+            : tool === "discussion_post"
+              ? receipt === undefined
+                ? "Discussion post reply timed out; the message may have been saved. Read back with discussion_read before retrying."
+                : "Saved; discussion_read for details."
+              : receipt === undefined
+                ? "Board write reply timed out; the write may have been saved. Read back with card_get (evaluator_start: check board threads) before retrying."
+                : "Saved; card_get for details.";
     const fields = attributes();
     return Effect.annotateCurrentSpan(fields).pipe(
       Effect.andThen(
@@ -204,7 +215,8 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
         )
           receipt = saved;
       } else if (tool === "evaluator_start") {
-        if (saved.kind === "evaluator") receipt = saved;
+        if (saved.kind === "evaluator" || saved.kind === "evaluatorQueue" || saved.kind === "card")
+          receipt = saved;
       } else if (tool === "discussion_post") {
         if (
           saved.kind === "message" &&

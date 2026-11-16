@@ -5,6 +5,7 @@ import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Logger from "effect/Logger";
@@ -472,10 +473,11 @@ it.effect.each([...SavedReply.TOOLS])(
       const data = replyData(result.structuredContent);
       {
         assert.isTrue(result.isError);
-        assert.isNull(data.saved);
-        if (tool === "report_bug")
-          assert.include(String(data.message), "Retry with the same arguments");
-        else {
+        if (tool === "evaluator_start" || tool === "report_bug") {
+          assert.isFalse(data.saved);
+          assert.match(data.message, /[Rr]etry with the same arguments/);
+        } else {
+          assert.isNull(data.saved);
           assert.include(String(data.message), "may have been saved");
           assert.include(
             String(data.message),
@@ -521,8 +523,8 @@ it.effect.each([
       cardId: KanbanCardId.make("card-a"),
       number: 1480,
     },
-    saved: null,
-    text: "card #1480 (card-a) on board board-a",
+    saved: false,
+    text: "Nothing was saved",
   },
   {
     name: "evaluator",
@@ -531,8 +533,8 @@ it.effect.each([
       boardId: KanbanBoardId.make("board-a"),
       keyPrefix: "bug-report:pending:",
     },
-    saved: null,
-    text: "evaluator key prefix bug-report:pending: on board board-a",
+    saved: false,
+    text: "Nothing was saved",
   },
 ] as const)(
   "report_bug timeout with $name recovery target reports a proven or named outcome",
@@ -580,29 +582,139 @@ it.effect("a saved receipt survives slow encoding as a non-error reply", () =>
       assert.isFalse(result.isError);
       assert.strictEqual(data.saved, true);
       assert.strictEqual(data.threadId, threadId);
-      assert.include(String(data.message), "Saved");
+      assert.include(String(data.message), "launched as evaluator-1107");
+      assert.include(String(data.message), "Do not retry");
     }
   }),
 );
 
-it.effect("report_bug returns its saved evaluator queue after a reply failure", () =>
-  Effect.gen(function* () {
-    const result = callResult(
-      yield* SavedReply.protect(
-        SavedWrite.record({ kind: "evaluatorQueue", key: "report-1480", queueId: 1480 }).pipe(
-          Effect.andThen(Effect.die(new BoardLocks.BoardStateChanged(true))),
+it.effect.each(["report_bug", "evaluator_start"])(
+  "%s returns its saved evaluator queue after a reply failure",
+  (tool) =>
+    Effect.gen(function* () {
+      const result = callResult(
+        yield* SavedReply.protect(
+          SavedWrite.record({ kind: "evaluatorQueue", key: "report-1480", queueId: 1480 }).pipe(
+            Effect.andThen(Effect.die(new BoardLocks.BoardStateChanged(true))),
+          ),
+          tool,
         ),
-        "report_bug",
+      );
+      assert.isFalse(result.isError);
+      assert.deepInclude(result.structuredContent, {
+        saved: true,
+        queued: true,
+        queueId: 1480,
+        evaluatorKey: "report-1480",
+      });
+      assert.notInclude(JSON.stringify(result), BoardLocks.MAY_HAVE_APPLIED);
+    }),
+);
+
+it.effect("evaluator substeps include an interrupted receipt read outside the board lock", () =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const callState: McpCall["Service"] = {
+      callerResolved: true,
+      callerResolveMs: 0,
+      readerLane: "foreground",
+      phase: "handler",
+      saved: "unknown",
+    };
+    const call = yield* SavedReply.protect(
+      SavedWrite.subSteps(
+        "evaluator.submit",
+        Effect.gen(function* () {
+          yield* SavedWrite.record({ kind: "evaluatorQueue", key: "request", queueId: 1644 });
+          return yield* Deferred.succeed(entered, undefined).pipe(
+            Effect.andThen(Effect.never),
+            Effect.withSpan("ThreadLaunchService.messageReceipt"),
+          );
+        }),
+        true,
       ),
-    );
-    assert.isFalse(result.isError);
-    assert.deepInclude(result.structuredContent, {
-      saved: true,
-      queued: true,
-      queueId: 1480,
-      evaluatorKey: "report-1480",
+      "evaluator_start",
+    ).pipe(Effect.provideService(McpCall, callState), Effect.forkChild);
+    yield* Deferred.await(entered);
+    yield* TestClock.adjust(SavedReply.REPLY_BUDGET_MS);
+    const result = callResult(yield* Fiber.join(call));
+    assert.deepInclude(result.structuredContent, { saved: true, queued: true, queueId: 1644 });
+    assert.include(replyData(result.structuredContent).message, "launch may still finish");
+    const ledger = ledgerEvent({
+      ts: "2026-11-15T20:00:00.000Z",
+      kind: "mcp.call",
+      surface: "server",
+      route: "mcp",
+      ...callOutcome(Exit.succeed(result), callState),
     });
-    assert.notInclude(JSON.stringify(result), BoardLocks.MAY_HAVE_APPLIED);
+    assert.equal(ledger.saved, true);
+    assert.deepEqual(ledger.props?.subSteps, [
+      { subStep: "ThreadLaunchService.messageReceipt", ms: 25_000 },
+    ]);
+  }),
+);
+
+it.effect("evaluator substeps count a long board hold once alongside an outside receipt wait", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const held = yield* Deferred.make<void>();
+    const releaseHold = yield* Deferred.make<void>();
+    const reading = yield* Deferred.make<void>();
+    const releaseRead = yield* Deferred.make<void>();
+    const warnings: unknown[] = [];
+    const logger = Logger.make(({ message }) => warnings.push(message));
+    const state: McpCall["Service"] = {
+      callerResolved: true,
+      callerResolveMs: 0,
+      readerLane: "foreground",
+      phase: "handler",
+      saved: "unknown",
+    };
+    const pending = yield* SavedReply.protect(
+      SavedWrite.subSteps(
+        "evaluator.submit",
+        Effect.gen(function* () {
+          yield* locks.run(
+            locks.board(
+              "a",
+              Deferred.succeed(held, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseHold)),
+                Effect.withSpan("KanbanService.evaluatorQueueWrite"),
+              ),
+            ),
+          );
+          yield* Deferred.succeed(reading, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseRead)),
+            Effect.withSpan("ThreadLaunchService.messageReceipt"),
+          );
+          return reply;
+        }),
+        true,
+      ),
+      "evaluator_start",
+    ).pipe(
+      Effect.exit,
+      Effect.provideService(McpCall, state),
+      Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+      Effect.forkChild,
+    );
+    yield* Deferred.await(held);
+    yield* TestClock.adjust(6_000);
+    yield* Deferred.succeed(releaseHold, undefined);
+    yield* Deferred.await(reading);
+    yield* TestClock.adjust(8_000);
+    yield* Deferred.succeed(releaseRead, undefined);
+    const result = yield* Fiber.join(pending);
+    const steps = [
+      { subStep: "ThreadLaunchService.messageReceipt", ms: 8_000 },
+      { subStep: "KanbanService.evaluatorQueueWrite", ms: 6_000 },
+    ];
+    assert.deepEqual(callOutcome(result, state).props?.subSteps, steps);
+    const holds = warnings.filter((message) =>
+      String(message).includes('"event":"kanban board lock long hold"'),
+    );
+    assert.lengthOf(holds, 1);
+    assert.deepEqual(JSON.parse(String(holds[0])).subSteps, [steps[1]]);
   }),
 );
 

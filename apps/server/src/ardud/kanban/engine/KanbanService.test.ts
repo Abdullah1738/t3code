@@ -34901,8 +34901,235 @@ it.effect.each([false, true])(
     }),
 );
 
+it.effect.each(["queued", "launched"] as const)(
+  "evaluator_start timeout after %s saves one request and an identical retry recovers it",
+  (milestone) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const entered = yield* Deferred.make<void>();
+      let block = true;
+      const delayed = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (real) =>
+          KanbanThreads.of({
+            ...real,
+            launch: (input) =>
+              block && milestone === "queued"
+                ? Effect.sync(() => {
+                    block = false;
+                  }).pipe(
+                    Effect.andThen(Deferred.succeed(entered, undefined)),
+                    Effect.andThen(Effect.never),
+                  )
+                : real.launch(input),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const purpose = { kind: "request" as const, text: "Novel evaluator timeout" };
+        const options = { callerThreadId: ThreadId.make("same-caller") };
+        const windowMs = 30 * 60_000;
+        yield* TestClock.adjust(
+          (2 * windowMs - ((yield* Clock.currentTimeMillis) % windowMs) - 10_000) % windowMs,
+        );
+        const call = yield* SavedReply.protect(
+          kanban
+            .submitEvaluator(board.id, purpose, options)
+            .pipe(
+              Effect.flatMap(() =>
+                milestone === "launched"
+                  ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never))
+                  : Effect.succeed(new McpSchema.CallToolResult({ content: [] })),
+              ),
+            ),
+          "evaluator_start",
+        ).pipe(Effect.forkChild);
+        yield* Deferred.await(entered);
+        yield* TestClock.adjust(SavedReply.REPLY_BUDGET_MS);
+        const reply = yield* Fiber.join(call);
+        if (!isMcpCallToolResult(reply)) return assert.fail("Expected result");
+        assert.isFalse(reply.isError);
+        assert.deepInclude(reply.structuredContent, {
+          saved: true,
+          ...(milestone === "queued" ? { queued: true } : { threadId: "thread-1" }),
+        });
+        if (milestone === "queued") yield* TestClock.adjust("31 minutes");
+        const first = yield* kanban.submitEvaluator(board.id, purpose, options);
+        assert.isTrue("threadId" in first);
+        assert.deepEqual(yield* kanban.submitEvaluator(board.id, purpose, options), first);
+        assert.equal((yield* Ref.get(fake.threads)).size, 1);
+        const sql = yield* BoardsDatabase.client;
+        assert.lengthOf(yield* sql`SELECT id FROM ardud_kanban_evaluator_queue`, 1);
+      }).pipe(Effect.provide(testLayer(delayed)));
+    }),
+);
+
+it.effect.each([
+  "request",
+  "setup",
+  "check",
+  "nightly",
+  "stalled",
+  "completed",
+  "deployed",
+  "packets",
+  "discussion",
+] as const)(
+  "evaluator_start %s timeout retains its own handle while draining older requests",
+  (kind) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const primerEntered = yield* Deferred.make<void>();
+      const primerRelease = yield* Deferred.make<void>();
+      const currentEntered = yield* Deferred.make<void>();
+      let launches = 0;
+      const delayed = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (real) =>
+          KanbanThreads.of({
+            ...real,
+            launch: (input) =>
+              Effect.gen(function* () {
+                launches++;
+                if (launches === 1) {
+                  yield* Deferred.succeed(primerEntered, undefined);
+                  yield* Deferred.await(primerRelease);
+                } else if (launches === 3) {
+                  yield* Deferred.succeed(currentEntered, undefined);
+                  return yield* Effect.never;
+                }
+                return yield* real.launch(input);
+              }),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const discussion = yield* kanban.createDiscussion(board.id, "Current discussion", owner);
+        const primer = yield* kanban
+          .submitEvaluator(board.id, { kind: "request", text: "Primer" })
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(primerEntered);
+        const older = yield* kanban.submitEvaluator(board.id, {
+          kind: "request",
+          text: "Older pending request",
+        });
+        assert.isTrue("queued" in older);
+        yield* Deferred.succeed(primerRelease, undefined);
+        yield* Fiber.join(primer);
+        const purpose: Briefs.EvaluatorPurpose =
+          kind === "request" || kind === "setup"
+            ? { kind, text: "Current request" }
+            : kind === "discussion"
+              ? { kind, discussionId: discussion.id, title: discussion.title, cardNumber: null }
+              : { kind };
+        const call = yield* SavedReply.protect(
+          kanban
+            .submitEvaluator(board.id, purpose, { callerThreadId: ThreadId.make("caller") })
+            .pipe(Effect.as(new McpSchema.CallToolResult({ content: [] }))),
+          "evaluator_start",
+        ).pipe(Effect.forkChild);
+        yield* Deferred.await(currentEntered);
+        yield* TestClock.adjust(SavedReply.REPLY_BUDGET_MS);
+        const reply = yield* Fiber.join(call);
+        if (!isMcpCallToolResult(reply)) return assert.fail("Expected result");
+        const sql = yield* BoardsDatabase.client;
+        const pending = yield* sql<{
+          id: number;
+        }>`SELECT id FROM ardud_kanban_evaluator_queue WHERE done_at IS NULL`;
+        assert.lengthOf(pending, 1);
+        assert.isFalse(reply.isError);
+        assert.deepInclude(reply.structuredContent, {
+          saved: true,
+          queued: true,
+          queueId: pending[0]!.id,
+        });
+        assert.notProperty(reply.structuredContent, "threadId");
+        assert.strictEqual((yield* Ref.get(fake.threads)).size, 2);
+      }).pipe(
+        Effect.provide(testLayer(delayed)),
+        Effect.ensuring(Deferred.succeed(primerRelease, undefined)),
+      );
+    }),
+);
+
+it.effect("evaluator_start concurrent identical retries share the pending admission", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const delayed = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (real) =>
+        KanbanThreads.of({
+          ...real,
+          launch: (input) =>
+            Deferred.succeed(entered, undefined).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.andThen(real.launch(input)),
+            ),
+        }),
+      ),
+    ).pipe(Layer.provide(fake.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const purpose = { kind: "request" as const, text: "Concurrent evaluator incident" };
+      const options = { callerThreadId: ThreadId.make("same-caller") };
+      const first = yield* kanban
+        .submitEvaluator(board.id, purpose, options)
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      const second = yield* kanban.submitEvaluator(board.id, purpose, options);
+      assert.isTrue("queued" in second);
+      yield* Deferred.succeed(release, undefined);
+      const launched = yield* Fiber.join(first);
+      assert.deepEqual(yield* kanban.submitEvaluator(board.id, purpose, options), launched);
+      assert.equal((yield* Ref.get(fake.threads)).size, 1);
+      const sql = yield* BoardsDatabase.client;
+      assert.lengthOf(yield* sql`SELECT id FROM ardud_kanban_evaluator_queue`, 1);
+    }).pipe(Effect.provide(testLayer(delayed)));
+  }),
+);
+
+it.effect.each(["caller", "text", "board", "forceNew", "stamp"] as const)(
+  "evaluator_start retry fingerprint distinguishes %s",
+  (change) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const other = yield* kanban.ensureBoard({
+          slug: "other-retry",
+          name: "Other retry",
+          defaultProjectId: board.defaultProjectId,
+        });
+        const purpose = { kind: "request" as const, text: "Original provenance\n\nNovel incident" };
+        const options = { callerThreadId: ThreadId.make("reporter"), matchText: "Novel incident" };
+        const first = yield* kanban.submitEvaluator(board.id, purpose, options);
+        const retry = yield* kanban.submitEvaluator(
+          change === "board" ? other.id : board.id,
+          change === "text"
+            ? { ...purpose, text: "Another incident" }
+            : change === "stamp"
+              ? { ...purpose, text: "Retitled provenance\n\nNovel incident" }
+              : purpose,
+          {
+            ...options,
+            ...(change === "caller" ? { callerThreadId: ThreadId.make("other-reporter") } : {}),
+            ...(change === "text" ? { matchText: "Another incident" } : {}),
+            ...(change === "forceNew" ? { forceNew: true } : {}),
+          },
+        );
+        if (change === "stamp") assert.deepEqual(retry, first);
+        else assert.notDeepEqual(retry, first);
+        assert.equal((yield* Ref.get(fake.threads)).size, change === "stamp" ? 1 : 2);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
 it.effect(
-  "reportBug saved=null at the 25s reply timeout asks for identical retry and retries admit one evaluator",
+  "reportBug saved=false before queue admission asks for identical retry and retries admit one evaluator",
   () =>
     Effect.gen(function* () {
       const fake = yield* makeFake;
@@ -34948,12 +35175,14 @@ it.effect(
         if (!isMcpCallToolResult(reply)) return assert.fail("Expected a tool result");
         assert.isTrue(reply.isError);
         const data = decodeBugTimeoutReply(reply.structuredContent);
-        assert.isNull(data.saved);
+        assert.isFalse(data.saved);
         assert.strictEqual(data.lookup.boardId, board.id);
         assert.match(data.lookup.keyPrefix, /^bug-report:[0-9a-f]{64}:$/);
         const message = reply.content.find((block) => block.type === "text")?.text ?? "";
-        assert.include(message, data.lookup.keyPrefix);
-        assert.include(message, board.id);
+        assert.include(message, "Nothing was saved");
+        assert.equal((yield* Ref.get(fake.threads)).size, 0);
+        const before = yield* BoardsDatabase.client;
+        assert.lengthOf(yield* before`SELECT id FROM ardud_kanban_evaluator_queue`, 0);
         assert.match(
           reply.content.find((block) => block.type === "text")?.text ?? "",
           /[Rr]etry with the same arguments/,

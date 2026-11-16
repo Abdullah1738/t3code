@@ -1632,6 +1632,18 @@ const handlers = {
     ),
   ),
 
+  evaluator_status: McpToolAccess.readsAsCaller((input) =>
+    withCaller((service, caller) =>
+      Effect.gen(function* () {
+        const board = yield* boardFor(service, caller, input.boardId);
+        return yield* service.evaluatorStatus(board.id, {
+          ...(input.queueId === undefined ? {} : { queueId: input.queueId }),
+          ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
+        });
+      }),
+    ),
+  ),
+
   evaluator_start: McpToolAccess.actsAsCaller((input) =>
     withCaller((service, caller) =>
       Effect.gen(function* () {
