@@ -824,5 +824,6 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
     ]),
     message: Schema.String,
     reason: Schema.optional(McpDenyReason),
+    saved: Schema.optional(Schema.Boolean),
   },
 ) {}
