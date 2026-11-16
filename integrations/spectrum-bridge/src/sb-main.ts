@@ -41,7 +41,7 @@ import { Sendblue } from "./sendblue.ts";
 import { Store } from "./store.ts";
 import { chatDbSwipes } from "./swipe.ts";
 import { transcribe } from "./stt.ts";
-import { notificationAccepted, socketPost, telegramOutlet } from "./telegram-fallback.ts";
+import { fenceOwnerAlert, notificationAccepted, socketPost, telegramOutlet } from "./telegram-fallback.ts";
 
 export type MainIo = {
   log: (event: string, code?: string) => void;
@@ -212,7 +212,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   const build = (chat: ChatCore): Parts => {
     const remoteConfig = remoteBoxConfig(config, chat.info.slug);
     if (remoteConfig) {
-      const remote = new RemoteBox(remoteConfig, chat.store, { log, ownerAlert: outlet.notify,
+      const remote = new RemoteBox(remoteConfig, chat.store, { log, ownerAlert: fenceOwnerAlert(telegramBridgeSocket),
         active: () => {
           try { const live = JSON.parse(readFileSync(join(stateRoot, "config.json"), "utf8"));
             return remoteBoxConfig(live, "moni")?.epoch === remoteConfig.epoch; } catch { return false; }

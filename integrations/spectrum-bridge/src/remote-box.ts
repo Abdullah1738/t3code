@@ -11,6 +11,7 @@ export type RemoteBoxConfig = { kind: "remote-box"; url: string; tokenFile: stri
   noticeAfterMs?: number; outageClearMs?: number; noticeMinGapMs?: number };
 type Outage = { id: string; unreachableSince: number | null; reachableSince: number | null; noticeAttempted?: boolean };
 type Fence = { id: string; since: number; queuedBehind: number };
+type FenceAlert = { key: string; text: string };
 type BoxEvent = { id: string; state: string; failure: string | null; kind: "inbound" | "wake"; interruptedAt: number | null; hasSend: boolean };
 export class RemoteRequestError extends Error {
   constructor(readonly status: number) { super("Box request failed"); }
@@ -38,6 +39,7 @@ export class RemoteBox {
   private readonly token: string;
   private readonly callbackToken: string;
   private busy = false;
+  private fenceBusy = false;
   private nextProbe = 0;
   private failures = 0;
   constructor(readonly config: RemoteBoxConfig, readonly store: Store, private readonly io: {
@@ -134,20 +136,24 @@ export class RemoteBox {
       this.store.set("remoteFence", fence);
       this.emit("moni-box-fenced", undefined, undefined, { event, kind: head.kind, ageMs, hasSend: head.hasSend, queuedBehind });
     }
-    const key = `moni-box-fenced:${event}`;
-    if (this.io.ownerAlert && !this.store.get<boolean>(`remoteFenceAlert:${head.id}`)) {
-      // Reserve before notifying: a lost response or restart must not send a second alert.
-      this.store.set(`remoteFenceAlert:${head.id}`, true);
+    const alertKey = `remoteFenceAlert:${head.id}`;
+    const savedAlert = this.store.get<true | FenceAlert>(alertKey);
+    if (this.io.ownerAlert && savedAlert !== true) {
       const age = ageMs < 60_000 ? `${Math.floor(ageMs / 1000)}s` : `${Math.floor(ageMs / 60_000)}m`;
+      const alert = savedAlert ?? { key: `moni-box-fenced:${event}`,
+        text: `Moni's box agent is stuck on one interrupted ${head.kind} (${age}); ${queuedBehind} later messages waiting. Resolve: spectrum-bridge remote-resolve --chat moni --id ${head.id} --state done|pending --session <owner-session>` };
+      // Telegram deduplicates immutable requests. Keep the original text across retries and restarts.
+      if (!savedAlert) this.store.set(alertKey, alert);
       try {
-        const sent = await this.io.ownerAlert("attention", `Moni's box agent is stuck on one interrupted ${head.kind} (${age}); ${queuedBehind} later messages waiting. Resolve: spectrum-bridge remote-resolve --chat moni --id ${head.id} --state done|pending --session <owner-session>`, key);
-        if (!sent) this.emit("moni-box-fence-alert-error");
+        if (await this.io.ownerAlert("attention", alert.text, alert.key)) this.store.set(alertKey, true);
+        else this.emit("moni-box-fence-alert-error");
       } catch { this.emit("moni-box-fence-alert-error"); }
     }
   }
   async tick(): Promise<void> {
     if (this.busy || this.now() < this.nextProbe || !this.io.active()) return;
     this.busy = true;
+    let healthy = false;
     try {
       const status = await this.request("/lease", { epoch: this.config.epoch, boxId: this.config.boxId });
       if (status.boxId !== this.config.boxId || status.epoch !== this.config.epoch) throw new Error("Box identity mismatch");
@@ -170,8 +176,8 @@ export class RemoteBox {
       }
       if (delivered) this.emit("moni-queue-delivered", `n=${delivered}`);
       this.emit("moni-queue-depth", `n=${this.store.db.query<{ n: number }, []>("SELECT count(*) n FROM remote_inbox WHERE sealed IS NOT NULL").get()!.n}`);
-      await this.probeFence();
       this.nextProbe = this.now() + 5_000;
+      healthy = true;
     } catch {
       const saved = this.store.get<Outage | null>("remoteOutage");
       const outage: Outage = saved ?? { id: opaqueId(String(this.now())), unreachableSince: this.now(), reachableSince: null };
@@ -194,6 +200,12 @@ export class RemoteBox {
       this.nextProbe = this.now() + Math.min(60_000, 1_000 * 2 ** Math.min(++this.failures, 6));
       this.emit("moni-runner-error", "unreachable");
     } finally { this.busy = false; }
+    // Observational requests must not hold up lease renewal, including while Telegram is stalled.
+    if (healthy && !this.fenceBusy) {
+      this.fenceBusy = true;
+      try { await this.probeFence(); } catch { this.emit("moni-box-events-error"); }
+      finally { this.fenceBusy = false; }
+    }
   }
   async send(id: string, text: string, mediaUrl: string | undefined, line: Line, chat: ChatKey): Promise<{ id: string; handle: string }> {
     const row = this.store.db.query<{ at: number; state: string; handle: string }, [string]>("SELECT * FROM remote_sends WHERE id=?").get(id);
