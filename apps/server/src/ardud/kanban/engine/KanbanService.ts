@@ -1,3 +1,4 @@
+import { backgroundCommandWakeKey } from "../../../orchestration-v2/backgroundCommandWake.ts";
 import * as CardNextMetrics from "../../analytics/CardNextMetrics.ts";
 import { stableStringify } from "@t3tools/shared/relaySigning";
 import { classifyReply } from "./ownerReplies.ts";
@@ -2328,6 +2329,8 @@ const make = Effect.gen(function* () {
       ),
     queuedRuns: (id, includeActive) =>
       locks.outside(threadIo.queuedRuns(id, includeActive), undefined, true),
+    backgroundStoppedSince: (id, since) =>
+      locks.outside(threadIo.backgroundStoppedSince(id, since), undefined, true),
     view: (id) => threadRead("view", id, threadIo.view(id)),
     find: (id) => threadRead("find", id, threadIo.find(id)),
     model: (id, activeRun = false) =>
@@ -2687,6 +2690,43 @@ const make = Effect.gen(function* () {
   const statusAsked = yield* Ref.make<
     ReadonlyMap<ThreadId, { readonly run: string; readonly at: number }>
   >(new Map());
+  const backgroundWaits = new Map<
+    ThreadId,
+    {
+      boardId: string;
+      quietSince: string;
+      jobs: Map<string, { label: string; endedAt: number | null }>;
+    }
+  >();
+  const observeBackground = (
+    boardId: string,
+    threadId: ThreadId,
+    view: KanbanThreadView,
+    now: number,
+  ) => {
+    if (view.state !== "idle") {
+      backgroundWaits.delete(threadId);
+      return;
+    }
+    const pending = view.backgroundJobs ?? [];
+    let wait = backgroundWaits.get(threadId);
+    // A provider wake may have run and finished between board ticks.
+    if (wait?.quietSince !== view.quietSince) {
+      wait = { boardId, quietSince: view.quietSince, jobs: new Map() };
+      backgroundWaits.set(threadId, wait);
+    }
+    const live = new Set(pending.map((job) => job.taskId));
+    for (const job of pending)
+      wait.jobs.set(job.taskId, {
+        label: job.description ?? job.taskId,
+        endedAt: null,
+      });
+    for (const [id, job] of wait.jobs) {
+      if (!live.has(id) && job.endedAt === null) job.endedAt = now;
+    }
+    if (wait.jobs.size === 0) backgroundWaits.delete(threadId);
+  };
+
   // Cards waiting on evaluator subtasks: the step's subtask ids, when the wait began, and whether woken.
   const stepWaits = yield* Ref.make<
     ReadonlyMap<
@@ -11745,6 +11785,13 @@ const make = Effect.gen(function* () {
         const next: KanbanCard = { ...cleared, updatedAt: at };
         return saveCard(next).pipe(Effect.as(next));
       });
+      observeBackground(link.boardId, threadId, view, yield* nowMillis);
+      if (
+        [...(backgroundWaits.get(threadId)?.jobs.values() ?? [])].some(
+          (job) => job.endedAt !== null,
+        )
+      )
+        return;
       // A worker waiting on its own subagents hasn't stopped.
       if (Rules.waitingOnBackground(view, yield* nowMillis)) return;
       if (discussionAttempted) return;
@@ -12353,7 +12400,11 @@ const make = Effect.gen(function* () {
         (candidate) =>
           Effect.gen(function* () {
             let board = yield* tickBoardOf;
-            if (board.archivedAt !== null) return;
+            if (board.archivedAt !== null) {
+              for (const [threadId, wait] of backgroundWaits)
+                if (wait.boardId === board.id) backgroundWaits.delete(threadId);
+              return;
+            }
             const { views, viewFences, freshFind, confirmFind, planFind, planView } = makeViews();
             const step = <A, E, R>(name: string, effect: Effect.Effect<A, E, R>, cardId?: string) =>
               tickStep(
@@ -12399,6 +12450,18 @@ const make = Effect.gen(function* () {
             const invalidateCards = () => {
               boardCards = undefined;
             };
+            const eligibleBackgroundWorkers = new Set(
+              (yield* cardsForPlan).flatMap((card) =>
+                card.stage === "working" && card.activeRole === "work" && card.activeThreadId
+                  ? [card.activeThreadId]
+                  : card.stage === "todo" && card.workThreadId
+                    ? [card.workThreadId]
+                    : [],
+              ),
+            );
+            for (const [threadId, wait] of backgroundWaits)
+              if (wait.boardId === board.id && !eligibleBackgroundWorkers.has(threadId))
+                backgroundWaits.delete(threadId);
             const savedCard = (card: KanbanCard) => {
               if (boardCards !== undefined) {
                 boardCards = boardCards
@@ -12843,6 +12906,89 @@ const make = Effect.gen(function* () {
                 initial.id,
               );
             }
+            const backgroundRecoveryHolds = new Set<ThreadId>();
+            for (const initial of yield* cardsForPlan) {
+              const threadId =
+                initial.activeRole === "work"
+                  ? initial.activeThreadId
+                  : initial.stage === "todo"
+                    ? initial.workThreadId
+                    : null;
+              if (
+                threadId === null ||
+                initial.wait !== undefined ||
+                Retries.heldForRetry(initial, now) ||
+                (board.pause && !board.pause.keep.includes(initial.id))
+              )
+                continue;
+              yield* step(
+                "backgroundWakeBackstop",
+                Effect.gen(function* () {
+                  if ((yield* store.threadLink(threadId))?.paused) return;
+                  const view = yield* planView(threadId);
+                  if (view === null) return;
+                  observeBackground(board.id, threadId, view, now);
+                  const wait = backgroundWaits.get(threadId);
+                  if (!wait) return;
+                  const ended = [...wait.jobs].filter(([, job]) => job.endedAt !== null);
+                  if (ended.length === 0) return;
+                  backgroundRecoveryHolds.add(threadId);
+                  if (!ended.some(([, job]) => now - job.endedAt! >= 120_000)) return;
+                  if (yield* threads.backgroundStoppedSince(threadId, wait.quietSince)) {
+                    backgroundWaits.delete(threadId);
+                    return;
+                  }
+                  const fresh = yield* freshFind(threadId);
+                  const current = yield* store.card(initial.id);
+                  const carried = yield* store.cardsByThread(threadId);
+                  const latestBoard = yield* boardOf(board.id);
+                  if (
+                    Option.isNone(fresh) ||
+                    fresh.value?.state !== "idle" ||
+                    fresh.value.quietSince !== wait.quietSince ||
+                    current === null ||
+                    (current.activeThreadId ?? current.workThreadId) !== threadId ||
+                    !["working", "todo"].includes(current.stage) ||
+                    current.wait !== undefined ||
+                    Retries.heldForRetry(current, now) ||
+                    kanbanOpenAsks(current).some((ask) => ask.blocking) ||
+                    carried.some(
+                      (card) =>
+                        Retries.heldByPause(latestBoard, card) ||
+                        card.wait !== undefined ||
+                        kanbanOpenAsks(card).some((ask) => ask.blocking),
+                    ) ||
+                    waking(threadId) ||
+                    (yield* threads.queuedRuns(threadId)).length > 0
+                  )
+                    return;
+                  for (const [itemId, job] of ended) {
+                    if (
+                      now - job.endedAt! < 120_000 ||
+                      fresh.value.backgroundJobs?.some((task) => task.taskId === itemId)
+                    )
+                      continue;
+                    yield* sendThread({
+                      threadId,
+                      key: backgroundCommandWakeKey(threadId, itemId),
+                      text: `Background work finished: ${job.label.slice(0, 200)}`,
+                      mode: "queue",
+                    });
+                    wait.jobs.delete(itemId);
+                    yield* logEvent(
+                      current,
+                      { _tag: "system", component: "dispatcher" },
+                      "thread",
+                      {
+                        body: `Background work finished; woke its worker: ${job.label.slice(0, 200)}`,
+                      },
+                    );
+                  }
+                  if (wait.jobs.size === 0) backgroundWaits.delete(threadId);
+                }),
+                initial.id,
+              );
+            }
             // Backstop for a missed turn end, or a worker stuck on its own question.
             for (const initial of yield* cardsForPlan) {
               if (
@@ -12863,7 +13009,8 @@ const make = Effect.gen(function* () {
                     return;
                   if (board.pause && !board.pause.keep.includes(card.id)) return;
                   if ((yield* Ref.get(unresolvedTurnEnds)).has(threadId)) return;
-                  if (discussionWakes.has(threadId)) return;
+                  if (discussionWakes.has(threadId) || backgroundRecoveryHolds.has(threadId))
+                    return;
                   // Provider recovery owns nudges, but a deferred wait can park
                   // once the work that held it after the outage has drained.
                   if ((yield* store.threadLink(threadId))?.paused) {
