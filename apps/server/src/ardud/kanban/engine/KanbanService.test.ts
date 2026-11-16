@@ -5722,6 +5722,53 @@ it.effect.each([
     }),
 );
 
+it.effect("#155 an explicit s<N> id creates a new subtask on create and on edit", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "explicit-subtask-id",
+        name: "Explicit subtask ids",
+        defaultProjectId: null,
+      });
+      // The reported call: card_create with an s1 the card does not have yet.
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Explicit ids",
+          prompt: "The reported create call",
+          subtasks: [{ id: "s1", text: "one", owner: "work" }],
+        },
+        owner,
+      );
+      assert.deepStrictEqual(
+        card.subtasks.map(({ id, step, text, owner, state }) => ({ id, step, text, owner, state })),
+        [{ id: "s1", step: 1, text: "one", owner: "work", state: "open" }],
+      );
+      assert.strictEqual(card.subtaskSeq, 1);
+      const edited = yield* kanban.editCard(
+        card.id,
+        { subtasks: [{ id: "s1" }, { id: "s4", text: "four", owner: "evaluator" }] },
+        owner,
+      );
+      assert.deepStrictEqual(
+        edited.subtasks.map(({ id, step, text, state }) => ({ id, step, text, state })),
+        [
+          { id: "s1", step: 1, text: "one", state: "open" },
+          { id: "s4", step: 2, text: "four", state: "open" },
+        ],
+      );
+      assert.strictEqual(edited.subtaskSeq, 4);
+      const unknown = yield* kanban
+        .editCard(card.id, { subtasks: [{ id: "s1" }, { id: "s9", text: "x" }] }, owner)
+        .pipe(Effect.flip);
+      assert.strictEqual(unknown.code, "invalid");
+      assert.include(unknown.detail, "a new subtask needs text and owner");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect.each([
   { title: "Scribe title", description: "Scribe description" },
   { links: [{ url: "https://example.com/a" }], comment: "Evidence" },

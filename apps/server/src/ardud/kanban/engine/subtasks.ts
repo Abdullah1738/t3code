@@ -992,13 +992,18 @@ export type MarkCheck =
 
 const idNumber = (id: string) => Number.parseInt(id.replace(/^s/, ""), 10) || 0;
 
+/** The ids the board hands out: s1, s2, ... */
+const subtaskId = /^s[1-9]\d*$/;
+
 /**
  * Replaces a card's plan with `inputs`. An id alone keeps that subtask;
  * omitted text, owner and step on open ids keep their stored values. New
- * entries need text and owner and get the next id. Listed done and skipped
+ * entries need text and owner; a new entry may name its own `s<N>` id that the
+ * card does not have yet, and otherwise gets the next one. Listed done and skipped
  * subtasks keep their history (but may clear a guessed gate), and omitted ones stay.
  * `seq` is the card's counter of ids ever handed out, so an open subtask dropped
- * from the plan never has its id reused by a later entry.
+ * from the plan never has its id reused by a later entry, and naming an id moves
+ * it past that number.
  */
 export function planSubtasks(
   existing: ReadonlyArray<KanbanSubtask>,
@@ -1139,58 +1144,67 @@ export function planSubtasks(
     }
     const known = id ? byId.get(id) : undefined;
     if (id) {
-      if (!known)
-        return {
-          ok: false,
-          denyReason: "subtask_not_found",
-          reason: `the card has no subtask ${id}. Existing subtask ids: ${subtaskIds(existing) || "none"}`,
-        };
       if (listed.has(id))
         return { ok: false, denyReason: "invalid_args", reason: `subtask ${id} is listed twice` };
+      // An s<N> id the card does not have yet names a new subtask below.
+      if (!known && !subtaskId.test(id))
+        return {
+          ok: false,
+          denyReason: "invalid_args",
+          reason: `"${id}" is not a subtask id; use s1, s2, ...`,
+        };
+      if (!known && reason !== undefined)
+        return {
+          ok: false,
+          denyReason: "invalid_args",
+          reason: "clearGate needs an existing subtask id",
+        };
       listed.add(id);
-      if (known.state !== "open" && reason !== undefined) {
-        const clear = planClear(
-          known,
-          reason,
-          known.owner,
-          known.text,
-          known.ownerOnly,
-          known.interrupting,
-          gateOf(known, guessedGates),
-        );
-        if (!clear.ok) return clear;
-        const { gate: _gate, gateSource: _source, ...rest } = known;
-        planned.push({ ...rest, gateCleared: clear.gateCleared });
-        step = known.step;
-        continue;
-      }
-      // An id or hold-only patch preserves script bindings and approval timestamps.
-      if (
-        known.state !== "open" ||
-        (input.text === undefined &&
-          input.owner === undefined &&
-          input.step === undefined &&
-          input.gate === undefined &&
-          input.clearGate === undefined &&
-          input.ownerOnly === undefined &&
-          input.interrupting === undefined &&
-          input.service === undefined &&
-          input.script === undefined)
-      ) {
-        if (known.state === "open" && input.holdsDependents !== undefined) {
-          if (input.holdsDependents && (known.owner === "work" || known.owner === "review")) {
-            return {
-              ok: false,
-              denyReason: "invalid_args",
-              reason: "a step holding dependents must be owned by the evaluator or a script",
-            };
-          }
-          planned.push({ ...known, holdsDependents: input.holdsDependents });
-        } else {
-          planned.push(known);
+      if (known) {
+        if (known.state !== "open" && reason !== undefined) {
+          const clear = planClear(
+            known,
+            reason,
+            known.owner,
+            known.text,
+            known.ownerOnly,
+            known.interrupting,
+            gateOf(known, guessedGates),
+          );
+          if (!clear.ok) return clear;
+          const { gate: _gate, gateSource: _source, ...rest } = known;
+          planned.push({ ...rest, gateCleared: clear.gateCleared });
+          step = known.step;
+          continue;
         }
-        step = known.step;
-        continue;
+        // An id or hold-only patch preserves script bindings and approval timestamps.
+        if (
+          known.state !== "open" ||
+          (input.text === undefined &&
+            input.owner === undefined &&
+            input.step === undefined &&
+            input.gate === undefined &&
+            input.clearGate === undefined &&
+            input.ownerOnly === undefined &&
+            input.interrupting === undefined &&
+            input.service === undefined &&
+            input.script === undefined)
+        ) {
+          if (known.state === "open" && input.holdsDependents !== undefined) {
+            if (input.holdsDependents && (known.owner === "work" || known.owner === "review")) {
+              return {
+                ok: false,
+                denyReason: "invalid_args",
+                reason: "a step holding dependents must be owned by the evaluator or a script",
+              };
+            }
+            planned.push({ ...known, holdsDependents: input.holdsDependents });
+          } else {
+            planned.push(known);
+          }
+          step = known.step;
+          continue;
+        }
       }
     }
     const rawText = input.text ?? known?.text;
@@ -1323,9 +1337,15 @@ export function planSubtasks(
         ...(holdsDependents === undefined ? {} : { holdsDependents }),
       });
     } else {
-      nextId += 1;
+      // An explicit id names the new subtask; the counter still moves past it so
+      // a later entry without one never reuses the number.
+      if (id === undefined) nextId += 1;
+      else nextId = Math.max(nextId, idNumber(id));
+      const newId = id ?? `s${nextId}`;
+      // Tracked so a later entry cannot name the same id again, whichever way it was made.
+      listed.add(newId);
       planned.push({
-        id: `s${nextId}`,
+        id: newId,
         step,
         text,
         owner,
