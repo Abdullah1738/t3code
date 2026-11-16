@@ -12,6 +12,7 @@ export const initializeKanbanSchema = Effect.fn("initializeKanbanSchema")(functi
     "ardud_kanban_cards",
     "ardud_kanban_card_events",
     "ardud_kanban_discussions",
+    "ardud_kanban_messages",
   ]) {
     const missingIndex = kanbanDDL.some((ddl) => {
       const match = /^CREATE INDEX IF NOT EXISTS (\w+)\s+ON (\w+)/.exec(ddl);
@@ -103,6 +104,10 @@ export const kanbanDDL = [
   `CREATE TABLE IF NOT EXISTS ardud_kanban_messages (
     discussion_id TEXT NOT NULL, seq INTEGER NOT NULL, json TEXT NOT NULL, PRIMARY KEY (discussion_id, seq)
   )`,
+  // Keep the literal predicate identical to the ask feed's bounded message reads.
+  `CREATE INDEX IF NOT EXISTS ardud_kanban_messages_ask_marked
+    ON ardud_kanban_messages (discussion_id, json_extract(json, '$.askId'), seq)
+    WHERE instr(json, '"askId":"') > 0`,
   `CREATE TABLE IF NOT EXISTS ardud_kanban_scripts (
     id TEXT PRIMARY KEY, board_id TEXT NOT NULL, json TEXT NOT NULL
   )`,
