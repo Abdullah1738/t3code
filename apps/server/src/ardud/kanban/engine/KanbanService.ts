@@ -17641,6 +17641,21 @@ const make = Effect.gen(function* () {
               (card.stalled !== null ? ` (replaces the stalled flag: ${card.stalled.reason})` : ""),
           });
           yield* saveCard(next);
+          if (check.deferredUntilTurnEnds && actor._tag === "thread")
+            yield* recordAnalytics({
+              kind: "wait_set",
+              boardId: card.boardId,
+              cardId: card.id,
+              threadId: actor.threadId,
+              callerRole: "work",
+              props: {
+                on: wait.on,
+                ...(wait.until === null
+                  ? {}
+                  : { until: DateTime.formatIso(DateTime.makeUnsafe(wait.until)) }),
+                ...(wait.script === null ? {} : { script: BoardAnalytics.label(wait.script) }),
+              },
+            });
         });
         // The board gate alone cannot order this write against new turns.
         yield* card.activeThreadId === null
@@ -18619,10 +18634,14 @@ const make = Effect.gen(function* () {
             Effect.succeed(true),
           );
           const current = yield* cardOf(cardId);
-          // A detached steer can start a run; its old holds must not hide that run.
+          // A worker owns its explicit wait even when another signal starts a run.
           let next = current;
           if (current.activeThreadId === null && current.workThreadId === threadId) {
-            if (card.wait !== undefined && NodeUtil.isDeepStrictEqual(current.wait, card.wait))
+            if (
+              card.wait !== undefined &&
+              !(card.wait.by._tag === "thread" && card.wait.by.threadId === threadId) &&
+              NodeUtil.isDeepStrictEqual(current.wait, card.wait)
+            )
               next = kanbanWithoutWait(next);
             if (
               card.retries !== undefined &&

@@ -243,6 +243,9 @@ const GeneralEvent = Schema.Struct({
   ),
   props: Schema.optionalKey(
     Schema.Struct({
+      on: Schema.optionalKey(Label),
+      until: Schema.optionalKey(Timestamp),
+      script: Schema.optionalKey(Label),
       number: Schema.optionalKey(Measurement),
       from: Schema.optionalKey(Label),
       to: Schema.optionalKey(Label),
