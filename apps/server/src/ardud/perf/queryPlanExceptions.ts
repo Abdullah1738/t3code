@@ -3,6 +3,20 @@ export const queryPlanExceptions = [
   {
     route: "shell.selection",
     queryHash: "2ae357a3818c0e5fb4e0dff3177b6ce326a1c2318a2b57bb8349de773f250f73",
+    pattern: "^SCAN t USING INDEX ardud_recovery_active_threads_idx$",
+    reason:
+      "The existing full active-shell fallback now scans the narrower active-ID partial index instead of the primary key. Its query and sorting are unchanged; recovery itself uses a bounded indexed range.",
+  },
+  {
+    route: "shell.client-selection",
+    queryHash: "cee0d1252df0831198bb09470f638d1abd3c7b0e7a69b297b537354377530164",
+    pattern: "^SCAN t USING INDEX ardud_recovery_active_threads_idx$",
+    reason:
+      "The existing full client-shell fallback now scans the narrower active-ID partial index instead of the primary key. Its query and sorting are unchanged; recovery itself uses a bounded indexed range.",
+  },
+  {
+    route: "shell.selection",
+    queryHash: "2ae357a3818c0e5fb4e0dff3177b6ce326a1c2318a2b57bb8349de773f250f73",
     pattern: "^SCAN\\ t\\ USING\\ INDEX\\ sqlite_autoindex_orchestration_v2_projection_threads_1$",
     reason:
       "Existing M0 shell derivation; replace with indexed materialized views in M1/M3. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card",

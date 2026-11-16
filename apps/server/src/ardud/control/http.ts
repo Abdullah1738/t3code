@@ -970,17 +970,21 @@ const makeRoutes = Effect.gen(function* () {
       return yield* fail("invalid_request", "active=true or active=false is required.");
     }
     // Pure reads: keep them off the single writer, as the board reads do.
-    const page = yield* recovery
-      .page({
-        active,
-        cursor: params.get("cursor") || null,
-        // The service applies the default and the 500 cap.
-        limit: Number(params.get("limit") ?? Number.NaN),
-      })
-      .pipe(
-        NodeSqliteClient.readOnly,
-        Effect.mapError((cause) => fail("internal", errorDetail(cause))),
-      );
+    const page = yield* ReplyBuilders.bounded(
+      recovery
+        .page({
+          active,
+          cursor: params.get("cursor") || null,
+          // The service applies the default and the 500 cap.
+          limit: Number(params.get("limit") ?? Number.NaN),
+        })
+        .pipe(
+          NodeSqliteClient.readOnly,
+          NodeSqliteClient.foregroundReads,
+          Effect.mapError((cause) => fail("internal", errorDetail(cause))),
+        ),
+      "controlRead",
+    );
     return json({ ok: true, threads: page.threads, nextCursor: page.nextCursor });
   });
 

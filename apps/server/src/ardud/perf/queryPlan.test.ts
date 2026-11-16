@@ -96,6 +96,21 @@ it.effect(
           | SqlError.SqlError
         >;
       }> = [
+        { route: "recovery.active-page", run: projection.pageActiveThreadIds("a", 501) },
+        { route: "recovery.live-page", run: control.pageLiveThreadIds("a", 501) },
+        {
+          route: "recovery.records",
+          run: projection.getThreadRecords(
+            threadId,
+            ["runs", "runtimeRequests", "providerThreads", "subagents"],
+            {
+              currentRunOnly: true,
+              pendingRuntimeRequestsOnly: true,
+              subagentsWithChildThreadOnly: true,
+              providerThreadIds: [],
+            },
+          ),
+        },
         { route: "shell.runs", run: ShellQueries.selectShellRunRows(sql, ids) },
         { route: "shell.archive", run: projection.getShellSnapshot({ location: "archive" }) },
         { route: "shell.counts", run: ShellQueries.selectShellRunItemCounts(sql, ids) },
@@ -232,7 +247,9 @@ it.effect(
           )
             assert.isAtMost(
               (statement.match(/\?/g) ?? []).length,
-              entry.route === "control.threads-updated-since" ? 4 : 2,
+              entry.route === "control.threads-updated-since" || entry.route.startsWith("recovery.")
+                ? 4
+                : 2,
               `${entry.route} bind count`,
             );
           const plan = yield* sql.unsafe<{ detail: string }>(
