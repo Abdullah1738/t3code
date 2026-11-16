@@ -1,4 +1,5 @@
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
+import { resolveCallerRuntime } from "./callerCredential.ts";
 import * as ThreadReadMetrics from "../ardud/analytics/ThreadReadMetrics.ts";
 import * as McpDeadline from "./McpDeadline.ts";
 import * as McpTaskTrace from "../ardud/observability/McpTaskTrace.ts";
@@ -71,7 +72,6 @@ import {
   type ProviderOptionDescriptor,
   type ProviderOptionSelection,
   ProviderRequestKind,
-  ProviderSessionId,
   type RuntimeMode,
   type ScheduledTask,
   type ScheduledTaskUpsertInput,
@@ -1217,6 +1217,7 @@ const make = Effect.gen(function* () {
         ),
       ),
     );
+  const credentials = yield* McpProviderSessions.McpProviderSessions;
   const crypto = yield* Crypto.Crypto;
   const threadManagement = yield* ThreadManagementService.ThreadManagementService;
   const startProgress = yield* Effect.serviceOption(ProviderStartProgress.ProviderStartProgress);
@@ -3178,19 +3179,20 @@ const make = Effect.gen(function* () {
           ? new OrchestratorMcpFailure({ code: "parent_not_active", saved: false, message })
           : new OrchestratorMcpFailure({ code: "orchestration_error", saved: false, message });
       });
+      const callerRuntime = yield* bounded(
+        "caller_credential",
+        resolveCallerRuntime(credentials, scope.thread, parentRecords),
+      );
       const parentRun =
         parentRecords.runs
-          .filter((run) => {
-            const providerThread = parentRecords.providerThreads?.find(
-              (thread) => thread.id === run.providerThreadId,
-            );
-            return (
+          .filter(
+            (run) =>
+              callerRuntime !== undefined &&
               ThreadManagementService.isActiveRun(run) &&
               run.providerInstanceId === scope.thread.providerInstanceId &&
-              (providerThread?.providerSessionId == null ||
-                providerThread.providerSessionId === scope.thread.providerSessionId)
-            );
-          })
+              parentRecords.providerThreads.find((thread) => thread.id === run.providerThreadId)
+                ?.providerSessionId === callerRuntime,
+          )
           .toSorted((left, right) => right.ordinal - left.ordinal)[0] ??
         (isRetryOfAcceptedDelegation
           ? parentRecords.runs.find(
@@ -3358,7 +3360,7 @@ const make = Effect.gen(function* () {
           parentRunId: parentRun.id,
           parentNodeId: parentRun.rootNodeId,
           parentAdmittedAt,
-          parentProviderSessionId: ProviderSessionId.make(scope.thread.providerSessionId),
+          ...(callerRuntime === undefined ? {} : { parentProviderSessionId: callerRuntime }),
           task: taskPrompt(input),
           ...(input.idleTimeoutMs === undefined ? {} : { idleTimeoutMs: input.idleTimeoutMs }),
           ...(input.title === undefined ? {} : { title: input.title }),
@@ -4512,6 +4514,7 @@ export const layer: Layer.Layer<
   OrchestratorMcpService,
   never,
   | Crypto.Crypto
+  | McpProviderSessions.McpProviderSessions
   | ThreadManagementService.ThreadManagementService
   | ThreadLaunchService.ThreadLaunchService
   | GitVcsDriver.GitVcsDriver

@@ -1,3 +1,4 @@
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import { expectJsonRoundTrip } from "./McpJson.testkit.ts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -24,6 +25,7 @@ import {
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderSessionId,
   ProviderThreadId,
   ProviderTurnId,
   RunAttemptId,
@@ -103,7 +105,25 @@ const decodeLegacyDelegateTaskResult = Schema.decodeUnknownSync(
   ),
 );
 
+const unitCredential = (
+  threadId: ThreadId,
+  providerSessionId = "provider-session:mcp-providers",
+) => ({
+  environmentId: EnvironmentId.make("environment:mcp-providers"),
+  threadId,
+  providerSessionId,
+  runtimeProviderSessionId: ProviderSessionId.make("runtime:unit-parent"),
+  providerInstanceId: ProviderInstanceId.make("codex"),
+  endpoint: "http://127.0.0.1/mcp",
+  authorizationHeader: "Bearer unit-test",
+  browserToolsAvailable: false,
+});
+const layerUnitCredentials = Layer.mock(McpProviderSessions.McpProviderSessions)({
+  read: (threadId) => Effect.succeed(unitCredential(threadId)),
+});
+
 const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
+  Layer.provide(layerUnitCredentials),
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
   Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
 );
@@ -1948,6 +1968,8 @@ describe("OrchestratorMcpService provider resolution", () => {
   ): OrchestrationV2ThreadProjection =>
     ({
       thread: {
+        ...idleThreadProjection(liveThreadShell(parentThreadId)).thread,
+        activeProviderThreadId: ProviderThreadId.make("provider-thread:unit-parent"),
         id: parentThreadId,
         projectId,
         title: "MCP parent",
@@ -1960,11 +1982,20 @@ describe("OrchestratorMcpService provider resolution", () => {
       runs: [
         {
           id: parentRunId,
+          providerThreadId: ProviderThreadId.make("provider-thread:unit-parent"),
           ordinal: 1,
           status: "running",
           rootNodeId: parentNodeId,
           providerInstanceId: codexInstanceId,
           modelSelection,
+        },
+      ],
+      providerThreads: [
+        {
+          id: ProviderThreadId.make("provider-thread:unit-parent"),
+          appThreadId: parentThreadId,
+          providerInstanceId: codexInstanceId,
+          providerSessionId: ProviderSessionId.make("runtime:unit-parent"),
         },
       ],
       contextTransfers: [],
@@ -3489,7 +3520,14 @@ describe("OrchestratorMcpService provider resolution", () => {
           const result = yield* Fiber.join(call);
           assert.equal(result.taskId, taskId);
           assert.isTrue(result.waitTimedOut);
-        }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(dependencies))));
+        }).pipe(
+          Effect.provide(
+            OrchestratorMcpService.layer.pipe(
+              Layer.provide(layerUnitCredentials),
+              Layer.provide(dependencies),
+            ),
+          ),
+        );
       }),
     ),
   );
@@ -3633,7 +3671,10 @@ describe("OrchestratorMcpService provider resolution", () => {
         );
         const lifetime = yield* Scope.make();
         const context = yield* Layer.buildWithScope(
-          OrchestratorMcpService.layer.pipe(Layer.provide(dependencies)),
+          OrchestratorMcpService.layer.pipe(
+            Layer.provide(layerUnitCredentials),
+            Layer.provide(dependencies),
+          ),
           lifetime,
         );
         yield* Effect.gen(function* () {
@@ -4362,6 +4403,7 @@ describe("OrchestratorMcpService provider resolution", () => {
             }),
           ).pipe(Layer.provideMerge(threads));
           const layerTest = OrchestratorMcpService.layer.pipe(
+            Layer.provideMerge(McpProviderSessions.layer),
             Layer.provideMerge(threadsWithWatchSignal),
             Layer.provideMerge(storeLayer),
             Layer.provide(
@@ -4446,13 +4488,15 @@ describe("OrchestratorMcpService provider resolution", () => {
               dispatchMode: { type: "start_immediately" },
             });
             const parentAtAdmission = yield* orchestrator.getThreadProjection(parentThreadId);
-            const callerSession = parentAtAdmission.providerThreads.find(
+            const credentials = yield* McpProviderSessions.McpProviderSessions;
+            const callerRuntimeId = parentAtAdmission.providerThreads.find(
               (thread) => thread.id === parentAtAdmission.runs[0]!.providerThreadId,
             )!.providerSessionId!;
-            let boundScope = {
-              ...scope,
-              thread: { ...scope.thread!, providerSessionId: callerSession },
-            };
+            yield* credentials.set({
+              ...unitCredential(parentThreadId),
+              runtimeProviderSessionId: callerRuntimeId,
+            });
+            const boundScope = scope;
             const request = {
               task: "Review.",
               mode,
@@ -4491,17 +4535,6 @@ describe("OrchestratorMcpService provider resolution", () => {
                 createdBy: "user",
                 creationSource: "web",
               });
-              const resumed = yield* orchestrator.getThreadProjection(parentThreadId);
-              const runNow = resumed.runs.at(-1)!;
-              boundScope = {
-                ...boundScope,
-                thread: {
-                  ...boundScope.thread,
-                  providerSessionId: resumed.providerThreads.find(
-                    (thread) => thread.id === runNow.providerThreadId,
-                  )!.providerSessionId!,
-                },
-              };
             }
             if (legacy) {
               const parent = yield* orchestrator.getThreadProjection(parentThreadId);
@@ -4775,6 +4808,10 @@ describe("OrchestratorMcpService provider resolution", () => {
               requestNamespace: "provider-session:renewed",
               thread: { ...scope.thread!, providerSessionId: "provider-session:renewed" },
             };
+            yield* credentials.set({
+              ...unitCredential(parentThreadId, renewedScope.thread.providerSessionId),
+              runtimeProviderSessionId: callerRuntimeId,
+            });
             const retry = yield* service
               .delegateTask(renewedScope, request)
               .pipe(Effect.forkScoped);
@@ -7786,6 +7823,7 @@ describe("OrchestratorMcpService provider resolution", () => {
           Effect.flatMap(call),
           Effect.provide(
             OrchestratorMcpService.layer.pipe(
+              Layer.provide(layerUnitCredentials),
               Layer.provide(
                 Layer.mergeAll(
                   NodeServices.layer,

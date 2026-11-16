@@ -3741,6 +3741,7 @@ describe("delegated background results", () => {
         ],
       });
       const layerStatus = OrchestratorMcpService.layer.pipe(
+        Layer.provide(McpProviderSessions.layer),
         Layer.provide(
           Layer.mergeAll(
             Layer.mock(ThreadManagementService.ThreadManagementService)({

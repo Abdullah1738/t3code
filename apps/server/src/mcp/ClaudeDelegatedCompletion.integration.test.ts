@@ -4,7 +4,6 @@ import { expect, it } from "@effect/vitest";
 import {
   ClaudeSettings,
   CommandId,
-  EnvironmentId,
   MessageId,
   type ModelSelection,
   type OrchestrationV2DomainEvent,
@@ -215,6 +214,7 @@ it.live.each([false, true])(
           { name: "claude-delegated-completion", runtimePolicyOverride: { cwd } },
           layerRegistry,
           {
+            configureMcp: true,
             runEffectWorker: false,
             beforeEventWrite: (input) =>
               blockParentStatus &&
@@ -324,12 +324,22 @@ it.live.each([false, true])(
             parentThreadId,
             (event) => event.type === "provider-turn.updated" && event.payload.status === "running",
           );
+          const credential = yield* (yield* McpProviderSessions.McpProviderSessions)
+            .read(parentThreadId)
+            .pipe(Effect.filterOrFail((value) => value !== undefined));
+          expect(credential.runtimeProviderSessionId).toBe(
+            parentOffer.query.input.providerSessionId,
+          );
+          expect(credential.providerSessionId).not.toBe(credential.runtimeProviderSessionId);
+          expect(parentOffer.query.input.options.mcpServers?.["t3-code"]).toMatchObject({
+            headers: { Authorization: credential.authorizationHeader },
+          });
           const invocation: McpInvocationContext.McpInvocationScope = {
-            environmentId: EnvironmentId.make("environment:claude-delegated-completion"),
-            requestNamespace: parentOffer.query.input.providerSessionId,
+            environmentId: credential.environmentId,
+            requestNamespace: credential.providerSessionId,
             thread: {
               threadId: parentThreadId,
-              providerSessionId: parentOffer.query.input.providerSessionId,
+              providerSessionId: credential.providerSessionId,
               providerInstanceId: selection.instanceId,
             },
             client: undefined,

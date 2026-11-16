@@ -1,3 +1,4 @@
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
@@ -54,6 +55,7 @@ const layer = (
   schedules: Partial<ScheduledTasks.ScheduledTaskService["Service"]> = {},
 ) =>
   OrchestratorMcp.layer.pipe(
+    Layer.provide(McpProviderSessions.layer),
     Layer.provide(
       Layer.mergeAll(
         NodeServices.layer,

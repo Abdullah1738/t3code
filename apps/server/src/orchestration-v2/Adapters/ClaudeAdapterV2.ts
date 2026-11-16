@@ -10109,7 +10109,12 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           startup: ClaudeTurnStartup.StartupAttempt,
         ) {
           const queryPolicy = claudeRuntimeQueryPolicyForRuntimePolicy(turnInput.runtimePolicy);
-          const mcpSession = yield* mcpSessions.read(turnInput.threadId);
+          const mcpSession = yield* McpProviderSessions.readForRuntime(
+            mcpSessions,
+            turnInput.threadId,
+            input.providerSessionId,
+            CLAUDE_PROVIDER,
+          );
           const recallUrl = adapterOptions.environment.ROBOB_RECALL_MCP_URL?.trim();
           const mcpOverrides = claudeMcpQueryOverrides({
             mcpSession,
@@ -11167,7 +11172,12 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           },
         );
 
-        const wakeCredential = yield* mcpSessions.read(input.threadId);
+        const wakeCredential = yield* McpProviderSessions.readForRuntime(
+          mcpSessions,
+          input.threadId,
+          input.providerSessionId,
+          CLAUDE_PROVIDER,
+        );
         if (wakeCredential !== undefined) {
           // The CLI executes wake tools before queued continuation output is replayed.
           yield* mcpSessions.registerWakeCaller(wakeCredential, () => {

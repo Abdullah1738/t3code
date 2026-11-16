@@ -936,7 +936,10 @@ describe("ClaudeAdapterV2 MCP query overrides", () => {
             },
           });
           const threadId = ThreadId.make("thread-claude-recall");
-          yield* (yield* McpProviderSessions.McpProviderSessions).set(mcpSessionFor(threadId));
+          yield* (yield* McpProviderSessions.McpProviderSessions).set({
+            ...mcpSessionFor(threadId),
+            runtimeProviderSessionId: ProviderSessionId.make("provider-session-claude-recall"),
+          });
           const runtime = yield* adapter.openSession({
             threadId,
             providerSessionId: ProviderSessionId.make("provider-session-claude-recall"),
@@ -3476,13 +3479,15 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           providerSessionId: "wake-credential",
           providerInstanceId: ProviderInstanceId.make("claudeAgent"),
         };
-        yield* sessions.set({
+        const credential = {
           ...caller,
+          runtimeProviderSessionId: ProviderSessionId.make("provider-session-claude-wake"),
           environmentId: EnvironmentId.make("test"),
           endpoint: "http://localhost/mcp",
           authorizationHeader: "Bearer test",
           browserToolsAvailable: false,
-        });
+        };
+        yield* sessions.set(credential);
         const h = yield* makeWakeHarness;
         const shell = {
           ...liveThreadShell(threadId, { activeRunId: null }),
@@ -3528,6 +3533,15 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         assert.lengthOf(h.continuationRequests, 1);
         yield* assertLiveCallerShell(shell, caller);
         yield* h.offerAndWait(wakeResult);
+        yield* assertLiveCallerShell(shell, caller);
+        yield* sessions.set({
+          ...credential,
+          providerSessionId: "replacement-credential",
+          runtimeProviderSessionId: ProviderSessionId.make("replacement-runtime"),
+        });
+        const replaced = yield* assertLiveCallerShell(shell, caller).pipe(Effect.flip);
+        assert.equal(replaced.code, "parent_not_active");
+        yield* sessions.set(credential);
         yield* assertLiveCallerShell(shell, caller);
         yield* Queue.shutdown(h.sdkMessages);
         yield* h.awaitQueryCleanup;

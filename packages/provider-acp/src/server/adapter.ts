@@ -1346,10 +1346,6 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
   const host = yield* ProviderHost.ProviderHost;
   const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
   const { flavor, selfInvocation: self } = options;
-  const readMcpContext = (threadId: ThreadId | null) =>
-    threadId === null
-      ? Effect.succeed(acpMcpContext(undefined, self))
-      : mcpSessions.read(threadId).pipe(Effect.map((session) => acpMcpContext(session, self)));
   const driver = flavor.driver;
   const continuationRequests = options.continuationRequests;
   const postSettleContinuationEnabled =
@@ -1362,6 +1358,15 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
     planSelectionTransition: (input) => Effect.succeed(acpSelectionTransition(input)),
     openSession: Effect.fn("AcpAdapterV2.openSession")(
       function* (input: ProviderAdapter.ProviderAdapterV2OpenSessionInput) {
+        const readMcpContext = (threadId: ThreadId | null) =>
+          threadId === null
+            ? Effect.succeed(acpMcpContext(undefined, self))
+            : McpProviderSessions.readForRuntime(
+                mcpSessions,
+                threadId,
+                input.providerSessionId,
+                driver,
+              ).pipe(Effect.map((session) => acpMcpContext(session, self)));
         const sessionScope = yield* Effect.scope;
         let itemIdentityVersion: 2 | undefined =
           input.initialProviderItemIdentityVersion ??
@@ -1562,7 +1567,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
         const nativeBuildConfigurationBySessionId = new Map<string, AcpNativeBuildConfiguration>();
         const initialSessionActivationFailure = yield* Ref.make<{
           readonly sessionId: string;
-          readonly error: EffectAcpErrors.AcpError;
+          readonly error: EffectAcpErrors.AcpError | ProviderAdapter.ProviderAdapterProtocolError;
         } | null>(null);
         const activeSessionSetup =
           yield* Ref.make<AcpSessionRuntime.AcpSessionRuntimeStartResult | null>(null);
@@ -6322,7 +6327,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           threadId: ThreadId | null,
           commitSessionState: (
             replacement: AcpSessionRuntime.AcpSessionRuntimeStartResult,
-          ) => Effect.Effect<void>,
+          ) => Effect.Effect<void, ProviderAdapter.ProviderAdapterProtocolError>,
         ) {
           const previousScope = runtimeScope;
           const previousGeneration = yield* Ref.get(runtimeCallbackGeneration);
