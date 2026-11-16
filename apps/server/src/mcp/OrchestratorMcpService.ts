@@ -1212,6 +1212,13 @@ const make = Effect.gen(function* () {
       ).pipe(McpTaskTrace.withTrace(prefix));
     });
 
+  // delegateTask owns the span; its local scope owns completion-wake cleanup.
+  const withDelegationLifetime = Effect.fnUntraced(function* <A, E, R>(
+    effect: Effect.Effect<A, E, R>,
+  ) {
+    return yield* effect.pipe(Effect.scoped, traceUntilShutdown("t3.delegate"));
+  });
+
   const requireProject = (projectId: ProjectId) =>
     projects.getById(projectId).pipe(
       Effect.mapError((error) =>
@@ -3233,7 +3240,12 @@ const make = Effect.gen(function* () {
         }
         workspaceStrategy = { type: "worktree", baseRef: base.commitSha, startFromOrigin: false };
       }
-      const dispatchAccepted = yield* Deferred.make<void, OrchestratorMcpFailure>();
+      const dispatchAccepted = yield* Deferred.make<
+        Effect.Success<ReturnType<typeof threadManagement.dispatch>>,
+        OrchestratorMcpFailure
+      >();
+      let savedTaskId: NodeId | undefined;
+      let deliveredTerminalResult = false;
       const upgradeCompletionWake = Effect.fn("OrchestratorMcpService.upgradeCompletionWake")(
         (taskId: NodeId) =>
           threadManagement
@@ -3269,6 +3281,18 @@ const make = Effect.gen(function* () {
               Effect.asVoid,
             ),
       );
+      yield* Effect.addFinalizer((exit) => {
+        if (input.mode !== "wait" || (Exit.isSuccess(exit) && deliveredTerminalResult))
+          return Effect.void;
+        // One exit path owns wake delivery, including failed reads and disconnects
+        // after the detached create has already been recovered.
+        return (savedTaskId === undefined ? Deferred.await(dispatchAccepted) : Effect.void).pipe(
+          Effect.andThen(upgradeCompletionWake(savedTaskId ?? expectedTaskId)),
+          Effect.ignoreCause,
+          Effect.forkIn(serviceScope, { uninterruptible: false }),
+          Effect.asVoid,
+        );
+      });
       // ThreadManagementService.dispatch is the chokepoint for this command
       // type's own enablement check, using the same command id and its
       // receipt-replay exemption, so no separate assert runs here.
@@ -3343,7 +3367,7 @@ const make = Effect.gen(function* () {
           Effect.onExit((exit) =>
             Deferred.done(
               dispatchAccepted,
-              Exit.map(exit, () => undefined),
+              Exit.map(exit, ({ result }) => result),
             ),
           ),
           (effect) => bounded("dispatch", effect, expectedTaskId),
@@ -3361,7 +3385,9 @@ const make = Effect.gen(function* () {
                 state.commandType === "delegated_task.request"
               ) {
                 yield* McpCallAnalytics.setSaved(true);
-                return yield* uncertainCreation(true);
+                savedTaskId = expectedTaskId;
+                if (input.mode !== "wait" || error.code !== "delegation_timeout")
+                  return yield* uncertainCreation(true);
               }
               if (
                 state?.status === "rejected" &&
@@ -3372,6 +3398,55 @@ const make = Effect.gen(function* () {
                   state.error ?? "The orchestrator rejected the request.",
                 );
               }
+              if (input.mode === "wait" && error.code === "delegation_timeout") {
+                const accepted = yield* Deferred.await(dispatchAccepted).pipe(
+                  Effect.catchCause((cause) =>
+                    Effect.gen(function* () {
+                      if (savedTaskId !== undefined) return yield* uncertainCreation(true);
+                      const createError = cause.reasons.find(
+                        (reason) => reason._tag === "Fail",
+                      )?.error;
+                      if (createError?.saved !== undefined) return yield* createError;
+                      const finalState = yield* creationState();
+                      if (
+                        finalState?.status === "accepted" &&
+                        finalState.threadId === scope.thread.threadId &&
+                        finalState.commandType === "delegated_task.request"
+                      ) {
+                        savedTaskId = expectedTaskId;
+                        yield* McpCallAnalytics.setSaved(true);
+                        return yield* uncertainCreation(true);
+                      }
+                      if (
+                        finalState?.status === "rejected" ||
+                        finalState?.status === "abandoned" ||
+                        finalState?.status === "never_saved"
+                      )
+                        return yield* yield* rejected(
+                          finalState.status === "rejected"
+                            ? (finalState.error ??
+                                createError?.message ??
+                                "The create was rejected.")
+                            : (createError?.message ?? "The create stopped before it was saved."),
+                        );
+                      return yield* Effect.failCause(cause);
+                    }),
+                  ),
+                  Effect.timeoutOption(
+                    Duration.millis(yield* remainingWaitMs(waitStartedAt, input.timeoutMs)),
+                  ),
+                );
+                if (Option.isSome(accepted)) {
+                  yield* McpCallAnalytics.dispatchFenceRecovered;
+                  yield* Effect.annotateCurrentSpan({
+                    "t3.delegate.dispatch_fence_recovered": true,
+                  });
+                  // Retain the committed events for the timeout fallback; waitForTask
+                  // reads the current projection within the remaining call budget.
+                  return { result: accepted.value, preparation: undefined };
+                }
+                return yield* state?.status === "accepted" ? uncertainCreation(true) : error;
+              }
               if (
                 error.code === "orchestration_error" &&
                 (state?.status === "abandoned" || state?.status === "never_saved")
@@ -3381,17 +3456,6 @@ const make = Effect.gen(function* () {
               return yield* error;
             }),
           ),
-          Effect.onExit((exit) => {
-            if (input.mode !== "wait" || Exit.isSuccess(exit)) return Effect.void;
-            // The caller has no waiter after a dispatch timeout or disconnect.
-            // Await this create before upgrading, including when it already committed.
-            return Deferred.await(dispatchAccepted).pipe(
-              Effect.andThen(upgradeCompletionWake(expectedTaskId)),
-              Effect.catchCause(() => Effect.void),
-              Effect.forkIn(serviceScope, { uninterruptible: false }),
-              Effect.asVoid,
-            );
-          }),
         );
       const taskEvent = result.storedEvents.find(
         (stored) =>
@@ -3406,6 +3470,7 @@ const make = Effect.gen(function* () {
       // Receipt existence includes rejections; the persisted task proves this delegation was saved.
       yield* McpCallAnalytics.setSaved(true);
       const taskId = taskEvent.event.payload.id;
+      savedTaskId = taskId;
       yield* Effect.annotateCurrentSpan({
         "t3.delegate.task_id": taskId,
         "t3.delegate.provider_instance_id": taskEvent.event.payload.providerInstanceId,
@@ -3473,10 +3538,6 @@ const make = Effect.gen(function* () {
             ...(yield* Ref.get(snapshot)),
             waitTimedOut: input.mode === "wait",
           };
-      // A slow writer must not hide the identity of an already accepted task.
-      if (input.mode === "wait" && (answer.waitTimedOut || !isTerminalTaskStatus(answer.status))) {
-        yield* upgradeCompletionWake(taskId).pipe(Effect.forkIn(serviceScope));
-      }
       yield* Effect.annotateCurrentSpan({
         "t3.delegate.outcome": answer.waitTimedOut
           ? "timeout_wait"
@@ -3484,8 +3545,9 @@ const make = Effect.gen(function* () {
             ? "completed"
             : "accepted",
       });
+      deliveredTerminalResult = !answer.waitTimedOut && isTerminalTaskStatus(answer.status);
       return answer;
-    }, traceUntilShutdown("t3.delegate")),
+    }, withDelegationLifetime),
     taskStatus: Effect.fn("OrchestratorMcpService.taskStatus")(function* (callerScope, taskId) {
       yield* Effect.annotateCurrentSpan({
         "t3.mcp.caller_thread_id": callerScope.thread?.threadId ?? null,
