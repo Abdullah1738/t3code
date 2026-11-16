@@ -4013,76 +4013,140 @@ const make = Effect.gen(function* () {
       },
     ),
     listThreads: Effect.fn("OrchestratorMcpService.listThreads")(function* (scope, input) {
-      const { parent } = yield* loadCaller(scope);
-      const projectId = yield* resolveProjectTarget(parent, input.projectId);
-      const projectThreads = yield* threadManagement
-        .getThreadListCandidates(projectId)
-        .pipe(
-          Effect.mapError((error) =>
-            failure("orchestration_error", `Unable to list threads: ${errorMessage(error)}`),
-          ),
-        );
-      const nowMs = yield* Clock.currentTimeMillis;
-      const statuses = input.statuses === undefined ? null : new Set(input.statuses);
-      const titleContains = input.titleContains?.toLocaleLowerCase();
-      const filtered = projectThreads
-        .filter(
-          (thread) =>
-            input.includeSubagents !== false || thread.lineage.relationshipToParent !== "subagent",
-        )
-        .toSorted(
-          (left, right) =>
-            DateTime.toEpochMillis(right.updatedAt) - DateTime.toEpochMillis(left.updatedAt) ||
-            right.id.localeCompare(left.id),
-        )
-        .filter(
-          (thread) => statuses === null || statuses.has(thread.activityRunStatus ?? thread.status),
-        )
-        .filter(
-          (thread) =>
-            input.settled === undefined || threadSettlement(thread).settled === input.settled,
-        )
-        .filter(
-          (thread) => input.snoozed === undefined || isSnoozed(thread, nowMs) === input.snoozed,
-        )
-        .filter(
-          (thread) =>
-            titleContains === undefined || thread.title.toLocaleLowerCase().includes(titleContains),
-        );
-      const cursor = input.cursor ?? 0;
-      const limit = input.limit ?? DEFAULT_THREAD_LIST_LIMIT;
-      const page = filtered.slice(cursor, cursor + limit);
-      const shells =
-        page.length === 0
-          ? []
-          : (yield* threadManagement
-              .getShellSnapshot({
-                location: "active",
-                threadIds: page.map((thread) => thread.id),
-              })
-              .pipe(Effect.mapError(threadManagementFailure))).threads;
-      const shellsById = new Map(shells.map((shell) => [shell.id, shell]));
-      const nextCursor = cursor + page.length < filtered.length ? cursor + page.length : null;
-      return {
-        projectId,
-        currentThreadId: parent?.thread.id ?? null,
-        threads: page.flatMap((candidate) => {
-          const shell = shellsById.get(candidate.id);
-          return shell === undefined
+      const started = yield* Clock.monotonicTimeNanos;
+      const call = yield* Effect.serviceOption(McpCallAnalytics.McpCall);
+      const metrics: NonNullable<McpCallAnalytics.McpCall["Service"]["threadList"]> = {
+        phase: "caller",
+        batchCount: 0,
+        candidateRows: 0,
+        elapsedMs: 0,
+        readerWaitMs: 0,
+        queryMs: 0,
+      };
+      if (Option.isSome(call)) {
+        call.value.threadList = metrics;
+        call.value.readerLane = "foreground";
+      }
+      let projectId = input.projectId;
+      let projectTitle: string | undefined;
+      const parentWaitObserver = yield* NodeSqliteClient.ReaderWaitObserver;
+      const parentStatements = yield* NodeSqliteClient.StatementObserver;
+      const operation = Effect.gen(function* () {
+        const { parent } = yield* loadCaller(scope);
+        projectId = yield* resolveProjectTarget(parent, input.projectId);
+        metrics.phase = "project";
+        const project = yield* requireProject(projectId);
+        projectTitle = project.title;
+        const nowMs = yield* Clock.currentTimeMillis;
+        const statuses = input.statuses === undefined ? null : new Set(input.statuses);
+        const titleContains = input.titleContains?.toLocaleLowerCase();
+        const cursor = input.cursor ?? 0;
+        const limit = input.limit ?? DEFAULT_THREAD_LIST_LIMIT;
+        const filtered: ThreadListCandidate[] = [];
+        let after: { updatedAtMs: number; threadId: string } | undefined;
+        let exhausted = statuses?.size === 0;
+        metrics.phase = "candidates";
+        while (!exhausted && filtered.length < cursor + limit + 1) {
+          // Only fetch enough candidates to fill the offset, page and lookahead.
+          const batchLimit = Math.min(100, cursor + limit + 1 - filtered.length);
+          metrics.batchCount++;
+          const candidates = yield* threadManagement
+            .getThreadListCandidates(projectId, {
+              limit: batchLimit,
+              ...(input.titleContains === undefined ? {} : { titleContains: input.titleContains }),
+              ...(after === undefined ? {} : { after }),
+            })
+            .pipe(Effect.mapError(threadManagementFailure));
+          metrics.candidateRows += candidates.length;
+          for (const thread of candidates) {
+            if (
+              (input.includeSubagents !== false ||
+                thread.lineage.relationshipToParent !== "subagent") &&
+              (statuses === null || statuses.has(thread.activityRunStatus ?? thread.status)) &&
+              (input.settled === undefined || threadSettlement(thread).settled === input.settled) &&
+              (input.snoozed === undefined || isSnoozed(thread, nowMs) === input.snoozed) &&
+              (titleContains === undefined ||
+                thread.title.toLocaleLowerCase().includes(titleContains))
+            ) {
+              filtered.push(thread);
+            }
+          }
+          exhausted = candidates.length < batchLimit;
+          const last = candidates.at(-1);
+          if (last !== undefined)
+            after = { updatedAtMs: DateTime.toEpochMillis(last.updatedAt), threadId: last.id };
+        }
+        const page = filtered.slice(cursor, cursor + limit);
+        metrics.phase = "shell";
+        const shells =
+          page.length === 0
             ? []
-            : [
-                listItemFromShell(
-                  {
-                    ...candidate,
-                    visibleItemCount: shell.visibleItemCount,
-                  },
-                  nowMs,
-                ),
-              ];
+            : (yield* threadManagement
+                .getShellSnapshot({
+                  location: "active",
+                  threadIds: page.map((thread) => thread.id),
+                })
+                .pipe(Effect.mapError(threadManagementFailure))).threads;
+        metrics.phase = "render";
+        const shellsById = new Map(shells.map((shell) => [shell.id, shell]));
+        return {
+          projectId,
+          projectTitle,
+          currentThreadId: parent?.thread.id ?? null,
+          threads: page.flatMap((candidate) => {
+            const shell = shellsById.get(candidate.id);
+            return shell === undefined
+              ? []
+              : [
+                  listItemFromShell(
+                    {
+                      ...candidate,
+                      visibleItemCount: shell.visibleItemCount,
+                    },
+                    nowMs,
+                  ),
+                ];
+          }),
+          nextCursor: cursor + page.length < filtered.length ? cursor + page.length : null,
+          total: filtered.length,
+          totalIsExact: exhausted,
+        } satisfies OrchestratorMcpThreadListResult;
+      });
+      return yield* operation.pipe(
+        NodeSqliteClient.foregroundReads,
+        Effect.provideService(NodeSqliteClient.ReaderWaitObserver, (ms) => {
+          metrics.readerWaitMs += ms;
+          parentWaitObserver?.(ms);
         }),
-        nextCursor,
-        total: filtered.length,
-      } satisfies OrchestratorMcpThreadListResult;
+        Effect.provideService(NodeSqliteClient.StatementObserver, {
+          slowThresholdMs: 0,
+          record: (observation) => {
+            metrics.queryMs += observation.durationMs;
+            return parentStatements !== undefined &&
+              observation.durationMs >= parentStatements.slowThresholdMs
+              ? parentStatements.record(observation)
+              : Effect.void;
+          },
+        }),
+        // A masked SQLite cleanup must not extend the reply deadline.
+        McpDeadline.awaitInterruptibly,
+        Effect.timeoutOrElse({
+          duration: "25 seconds",
+          orElse: () =>
+            Effect.fail(
+              failure(
+                "lookup_timeout",
+                `Thread list timed out after 25s reading project ${projectTitle ?? "(title unresolved)"} (${projectId ?? "caller project unresolved"}) during ${metrics.phase}; retry with projectId/statuses or a narrower titleContains.`,
+              ),
+            ),
+        }),
+        Effect.ensuring(
+          Effect.gen(function* () {
+            metrics.elapsedMs = Number((yield* Clock.monotonicTimeNanos) - started) / 1e6;
+            yield* Effect.annotateCurrentSpan({ ...metrics, projectId: projectId ?? "unresolved" });
+          }),
+        ),
+      );
     }),
     readThread: Effect.fn("OrchestratorMcpService.readThread")(
       function* (scope, rawInput) {

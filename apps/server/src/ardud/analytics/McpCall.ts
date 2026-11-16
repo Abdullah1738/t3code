@@ -59,6 +59,14 @@ export class McpCall extends Context.Service<
       readonly build: string;
       readonly bootId: string;
     };
+    threadList?: {
+      phase: "caller" | "project" | "candidates" | "shell" | "render";
+      batchCount: number;
+      candidateRows: number;
+      elapsedMs: number;
+      readerWaitMs: number;
+      queryMs: number;
+    };
     threadRead?: {
       readerWaitMs: number;
       queryMs: number;

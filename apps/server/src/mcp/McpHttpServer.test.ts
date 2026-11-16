@@ -623,7 +623,6 @@ it.effect.each([
   "discussion_read",
   "card_search",
   "t3_thread_read",
-  "t3_thread_list",
 ])("traces %s without adding a scheduled-read deadline", (name) =>
   Effect.gen(function* () {
     const entered = yield* Deferred.make<void>();
@@ -1860,4 +1859,37 @@ it.effect("returns a text-only snapshot without requiring screenshot bytes", () 
       expect(result.content.some((entry) => entry.type === "image")).toBe(false);
     }),
   ).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("thread lists leave every large-read reply permit available while scanning", () =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const toolkit = Toolkit.make(
+      Tool.make("t3_thread_list", {
+        description: "A latched bounded list.",
+        success: Schema.Struct({ ready: Schema.Boolean }),
+      }),
+    );
+    const layer = McpHttpServer.toolkitRegistration(
+      toolkit,
+      McpToolAccess.toLayer(toolkit, {
+        t3_thread_list: McpToolAccess.reads(() =>
+          Deferred.succeed(entered, undefined).pipe(
+            Effect.andThen(Deferred.await(release)),
+            Effect.as({ ready: true }),
+          ),
+        ),
+      }),
+    ).pipe(Layer.provideMerge(McpServer.McpServer.layer), Layer.provideMerge(ReplyBuilders.layer));
+    yield* Effect.gen(function* () {
+      const pending = yield* callTool("t3_thread_list", {}).pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      const builders = yield* ReplyBuilders.ReplyBuilders;
+      expect(yield* builders.mcp.takeIfAvailable(ReplyBuilders.PERMITS.mcp)).toBe(true);
+      yield* builders.mcp.release(ReplyBuilders.PERMITS.mcp);
+      yield* Deferred.succeed(release, undefined);
+      expect((yield* Fiber.join(pending)).isError).not.toBe(true);
+    }).pipe(Effect.provide(layer));
+  }),
 );

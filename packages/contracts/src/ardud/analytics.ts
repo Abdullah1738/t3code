@@ -398,6 +398,16 @@ const GeneralEvent = Schema.Struct({
       queuedCount: Schema.optionalKey(Measurement),
       heldCount: Schema.optionalKey(Measurement),
       phase: Schema.optionalKey(Label),
+      threadList: Schema.optionalKey(
+        Schema.Struct({
+          phase: Schema.Literals(["caller", "project", "candidates", "shell", "render"]),
+          batchCount: Measurement,
+          candidateRows: Measurement,
+          elapsedMs: Measurement,
+          readerWaitMs: Measurement,
+          queryMs: Measurement,
+        }),
+      ),
       subSteps: Schema.optionalKey(
         Schema.Array(Schema.Struct({ subStep: Label, ms: Measurement })).check(
           Schema.isMaxLength(3),

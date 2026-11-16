@@ -210,6 +210,7 @@ export const normalizeMcpHttpResponse = (
 
 // Session tokens are `<payload>.<signature>`; registry tokens are a bare base64url secret.
 const looksLikeProviderToken = (token: string) => token.length > 0 && !token.includes(".");
+// Thread lists bound their own SQL page and deadline; scanning must not occupy a reply permit.
 const LARGE_READ_TOOLS = new Set([
   "board_get",
   "board_activity",
@@ -218,7 +219,6 @@ const LARGE_READ_TOOLS = new Set([
   "discussion_read",
   "card_search",
   "t3_thread_read",
-  "t3_thread_list",
   "list_scheduled_tasks",
 ]);
 const BOARD_READ_TOOLS = new Set([
@@ -1371,6 +1371,9 @@ const withToolAnalytics =
                         ...(Option.isSome(delivery) ? delivery.value.snapshot() : {}),
                         props: {
                           ...outcome.props,
+                          ...(callState.threadList === undefined
+                            ? {}
+                            : { threadList: { ...callState.threadList } }),
                           ...(callState.boardId ? { boardId: callState.boardId } : {}),
                           ...(callState.cardNumber === undefined
                             ? {}
