@@ -1,0 +1,1094 @@
+"""Reader policy and lifecycle tests exercise the real qualification boundaries."""
+import base64
+import hashlib
+import json
+import re
+from unittest.mock import patch
+import subprocess
+
+import pytest
+
+from harness import qa_access, qa_access_kafka
+from harness.async_observers import AuditObserver, AuditQueryResult, EventObserver, EventQueryResult, ReaderPermissionDenied
+from harness.completion.contract import ArtifactRef, AttemptResult, CasePlan, canonical_bytes, record_digest
+from harness.completion.publication import ArtifactIdentity, AttemptIdentity, AttemptRef, publish_artifact, verify_seal
+from harness.evidence import CompletionEvidenceStore
+from harness.completion.reader_grants import ReaderControl, ReaderGrantSpec, ReaderOwnership, may_teardown_reader
+from harness.completion.reader_grants import EffectiveGrantSnapshot, qualify_reader_grants, reader_scope_digest, scope_resources
+from harness.completion.observer_source import judge_cardinality, qualify_source_window, source_ref, request_journal_digest
+from harness.state import StateContext
+from test_completion_environment_lease import authority, backend, operation, scope
+from harness.completion.environment_lease import LeaseConflictError, acquire_leases, release_leases
+from test_completion_environment_lease import cleanup
+from test_completion_observer_source import Reader, audit_record, expectation, obligation, qualification
+from test_completion_publication import result as published_result, run_for
+
+V = "completion-v1"
+
+
+def _artifact(digest="a"):
+    return ArtifactRef(schema_version=V, ref="test:" + digest, sha256=digest * 64, size_bytes=1)
+
+
+def _records(source, cluster, principal, allowed):
+    kafka = any(p.startswith("kafka-") for p in allowed)
+    clickhouse = any(p.startswith("clickhouse-") for p in allowed)
+    try:
+        kind, resources = scope_resources(allowed)
+    except ValueError:
+        kind, resources = ("kafka" if kafka else "database"), ()
+    digest = reader_scope_digest(kind, resources)
+    physical = ("clickhouse:12345678-1234-1234-1234-123456789abc" if clickhouse else
+                "kafka:cluster-id" if kafka else "pgsys:123")
+    denied = (("clickhouse-table:crpko.outside:SELECT",) if clickhouse else
+              ("kafka-topic:outside:READ",) if kafka else ("column:secret:SELECT",))
+    read = next((p for p in allowed if p.endswith(":READ") and p.startswith("kafka-topic:")
+                  or p.endswith(":SELECT") and p.startswith("column:")), "kafka-topic:events:READ")
+    if clickhouse:
+        read = next((p for p in allowed if p.startswith("clickhouse-column:")),
+                    "clickhouse-column:" + allowed[0].split(":")[1] + ".balance:SELECT")
+    spec = ReaderGrantSpec(schema_version=V, source_id=source, cluster=cluster,
+        principal=principal, incarnation="boot-1", physical_source=physical, principal_incarnation="identity-1",
+        scope_digest=digest, allowed=allowed, denied=denied)
+    ownership = ReaderOwnership(schema_version=V, source_id=source, cluster=cluster,
+        principal=principal, incarnation="boot-1", operation_id="op-b", owner_operation_id="op-a",
+        physical_source=physical, principal_incarnation="identity-1", lease_ref="lease-b", origin="borrowed",
+        resource_ref=f"principal:{physical}:{principal}", proof=_artifact())
+    controls = tuple(ReaderControl(schema_version=V, source_id=source, cluster=cluster,
+        principal=principal, incarnation="boot-1", physical_source=physical, principal_incarnation="identity-1",
+        scope_digest=digest, kind=kind, capability=read if kind == "permitted_read" else denied[0],
+        resource=read.split(":")[1] if kind == "permitted_read" else denied[0].split(":")[1],
+        api="SELECT table" if clickhouse and kind == "forbidden_access" else "Fetch" if kafka else "SELECT column",
+        expected="ALLOWED" if kind == "permitted_read" else "DENIED",
+        send_ref=kind, evidence=_artifact("b" if kind == "permitted_read" else "c"),
+        outcome="observed_pass", observed_at_ms=85, proof=_artifact())
+        for kind in ("permitted_read", "forbidden_access"))
+    return spec, ownership, controls
+
+
+def _snapshot(spec, controls, **changes):
+    fields = dict(schema_version=V, source_id=spec.source_id, cluster=spec.cluster,
+        incarnation=spec.incarnation, physical_source=spec.physical_source, principal=spec.principal,
+        principal_incarnation=spec.principal_incarnation, scope_digest=spec.scope_digest,
+        permissions=spec.allowed, unknown=(), observed_at_ms=80, expires_at_ms=1000,
+        proof=_artifact(), controls=controls)
+    return EffectiveGrantSnapshot(**(fields | changes))
+
+
+@pytest.mark.parametrize("permission", [
+    *(f"clickhouse-table:crpko.t:{op}" for op in (
+        "INSERT", "ALTER", "CREATE", "DROP", "TRUNCATE", "OPTIMIZE", "SYSTEM SYNC REPLICA", "SHOW", "GRANT")),
+    "clickhouse-table:*.*:SELECT", "clickhouse-table:crpko.*:SELECT", "clickhouse-table:*.t:SELECT",
+    *(f"clickhouse-table:crpko.{function}(x):SELECT" for function in ("remote", "url", "s3", "file", "dictGet")),
+    "clickhouse-table:`crpko`.t:SELECT", "clickhouse-table:crpko.t.extra:SELECT",
+    "clickhouse-column:crpko.t.*:SELECT", "clickhouse-column:crpko.t.1x:SELECT",
+])
+def test_clickhouse_write_admin_or_wildcard_grant_is_not_read_only(permission):
+    """An allowlist cannot bless writes, admin operations, functions or nonliteral names."""
+    spec, own, controls = _records("source", "env", "reader", ("clickhouse-column:crpko.t.balance:SELECT",))
+    spec = spec.model_copy(update={"allowed": (*spec.allowed, permission)})
+    receipt = qualify_reader_grants(spec, _snapshot(spec, controls), own)
+    assert "effective capability is not a supported read-only permission" in receipt.issues
+    assert not receipt.qualified and receipt.observer_grant().effective_permissions == ()
+
+
+def test_clickhouse_column_outside_scope_is_an_issue():
+    spec, own, controls = _records("source", "env", "reader", ("clickhouse-column:crpko.t.balance:SELECT",))
+    receipt = qualify_reader_grants(spec, _snapshot(spec, controls,
+        permissions=(*spec.allowed, "clickhouse-column:crpko.t.secret:SELECT")), own)
+    assert "effective permissions differ from the exact allowed scope" in receipt.issues
+    assert receipt.observer_grant().effective_permissions == ()
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_clickhouse_table_wide_select_when_columns_specified_is_an_issue(overlap):
+    allowed = ("clickhouse-column:crpko.t.balance:SELECT",)
+    if overlap:
+        allowed += ("clickhouse-table:crpko.t:SELECT",)
+    spec, own, controls = _records("source", "env", "reader", allowed)
+    permissions = spec.allowed if overlap else ("clickhouse-table:crpko.t:SELECT",)
+    receipt = qualify_reader_grants(spec, _snapshot(spec, controls, permissions=permissions), own)
+    assert ("table-wide read overlaps column scope" if overlap else
+            "effective permissions differ from the exact allowed scope") in receipt.issues
+    assert receipt.observer_grant().effective_permissions == ()
+
+
+def test_audit_allowlist_does_not_apply_to_clickhouse_columns():
+    spec, own, controls = _records("source", "env", "reader", ("clickhouse-column:crpko.t.balance:SELECT",))
+    receipt = qualify_reader_grants(spec, _snapshot(spec, controls), own)
+    assert "audit column is outside the supported non-sensitive projection" not in receipt.issues
+    assert receipt.qualified and receipt.observer_grant().effective_permissions == ("read",)
+
+
+def test_clickhouse_physical_source_must_name_a_replica(tmp_path):
+    """Even a matching real lease cannot make a cluster name a replica identity."""
+    env, store = authority(), backend(tmp_path, [1000])
+    for physical, accepted in (("clickhouse:crpko_cluster", False),
+            ("clickhouse:12345678-1234-1234-1234-123456789abc", True)):
+        op = operation("creator-" + str(accepted))
+        resource = f"principal:{physical}:reader"
+        own = ReaderOwnership(schema_version=V, source_id="source", cluster=env.cluster,
+            incarnation=env.incarnation, physical_source=physical, principal="reader", principal_incarnation="user-id",
+            operation_id=op.id, owner_operation_id=op.id, lease_ref=op.holder_id, origin="created",
+            resource_ref=resource, proof=_artifact())
+        held = acquire_leases(env, [scope("reader", resource, "exclusive")], op, store)
+        assert may_teardown_reader(own, [held]) == accepted
+        release_leases(held, cleanup(), store)
+
+
+@pytest.mark.parametrize("permission", ["clickhouse-table:crpko.t:SELECT", "clickhouse-column:crpko.t.balance:SELECT"])
+def test_qualified_clickhouse_fixture_projects_read_but_database_window_rejects_scope(permission):
+    """The grant qualifies; a database-kind window cannot stand in for ClickHouse coverage."""
+    spec, own, controls = _records("source", "env", "reader", (permission,))
+    spec = spec.model_copy(update={"incarnation": "boot1"})
+    own = own.model_copy(update={"incarnation": "boot1"})
+    controls = tuple(c.model_copy(update={"incarnation": "boot1"}) for c in controls)
+    grant = qualify_reader_grants(spec, _snapshot(spec, controls), own)
+    assert grant.issues == ()
+    assert grant.observer_grant().effective_permissions == ("read",)
+    expected, item = expectation(False, expect_present=False), obligation(relation="absent")
+    baseline = qualification(expected, event=False, obligation=item)
+    assert baseline.qualified
+    window = baseline.window.model_copy(update={"scope_digest": spec.scope_digest,
+        "read_resources": scope_resources(spec.allowed)[1]})
+    control = baseline.controls[0].model_copy(update={"source": source_ref(window),
+        "counter_offset_fence": _artifact().model_copy(update={"sha256": record_digest(window)})})
+    result = qualify_source_window(window, grant.observer_grant(), (control,),
+                                  baseline.coverage.model_copy(update={"window": window}))
+    assert result.issues == ("database window scope digest differs from read resources",)
+    assert not result.qualified
+    assert judge_cardinality(item, (), result).status == "unobserved"
+
+
+@pytest.mark.parametrize("other", ["kafka-topic:events:READ", "column:audit_id:SELECT", "database:prod:CONNECT"])
+def test_clickhouse_scope_cannot_mix_other_source_kinds(other):
+    spec, own, controls = _records("source", "env", "reader", ("clickhouse-column:crpko.t.balance:SELECT",))
+    spec = spec.model_copy(update={"allowed": (*spec.allowed, other)})
+    receipt = qualify_reader_grants(spec, _snapshot(spec, controls), own)
+    assert ("allowed permissions mix source kinds" if other.startswith("database:") else
+            "allowed scope mixes source kinds") in receipt.issues
+    assert receipt.observer_grant().effective_permissions == ()
+
+
+@pytest.mark.parametrize("change", ["foreign-column", "in-scope-table", "write-api", "cluster-name"])
+def test_clickhouse_controls_and_identity_cannot_overclaim_table_scope(change):
+    spec, own, controls = _records("source", "env", "reader", ("clickhouse-table:crpko.t:SELECT",))
+    assert qualify_reader_grants(spec, _snapshot(spec, controls), own).qualified
+    if change == "foreign-column":
+        controls = (controls[0].model_copy(update={"capability": "clickhouse-column:crpko.other.balance:SELECT",
+                                                  "resource": "crpko.other.balance"}), controls[1])
+    elif change == "in-scope-table":
+        spec = spec.model_copy(update={"denied": ("clickhouse-table:crpko.t:SELECT",)})
+        controls = (controls[0], controls[1].model_copy(update={"capability": spec.denied[0], "resource": "crpko.t"}))
+    elif change == "write-api":
+        controls = (controls[0], controls[1].model_copy(update={"api": "INSERT"}))
+    else:
+        spec = spec.model_copy(update={"physical_source": "clickhouse:crpko_cluster"})
+        own = own.model_copy(update={"physical_source": spec.physical_source})
+        controls = tuple(c.model_copy(update={"physical_source": spec.physical_source}) for c in controls)
+    receipt = qualify_reader_grants(spec, _snapshot(spec, controls), own)
+    assert not receipt.qualified and receipt.observer_grant().effective_permissions == ()
+
+
+class _Seeder:
+    def __init__(self, output):
+        self.output = output
+        self.calls = []
+
+    def _run_sql(self, sql):
+        self.calls.append(sql)
+        if isinstance(self.output, Exception):
+            raise self.output
+        return self.output
+
+
+class _Broker:
+    """Only broker/SSM transport is replaced; parsing and qualification stay real."""
+    def __init__(self, listing):
+        self.listing = listing
+        self.calls = []
+
+    def __call__(self, commands, timeout_s=120, instance_id=None):
+        self.calls.append((commands, instance_id))
+        joined = "\n".join(commands)
+        if "QA_JAVA" not in joined and ("CHECK_DONE" in joined or "QA_NODE_BEGIN" in joined):
+            return ("CONFIG=/opt/kafka/config/server.properties\n"
+                    "authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer\n"
+                    "allow.everyone.if.no.acl.found=false\nsuper.users=User:broker\nCHECK_DONE\n"
+                    f"QA_NODE_BEGIN\nnode.id={instance_id.split('-')[-1]}\nQA_NODE_END\n")
+        if "QA_CLUSTER_BEGIN" in joined:
+            return "QA_CLUSTER_BEGIN\nClusterId: cluster-id\nQA_CLUSTER_END\n"
+        if "QA_ACLS_BEGIN" in joined:
+            return self.listing
+        if "QA_REPLICATION_BEGIN" in joined:
+            return ("QA_REPLICATION_BEGIN\nNodeId DirectoryId LogEndOffset Lag LastFetchTimestamp LastCaughtUpTimestamp Status\n"
+                "1 abc 100 0 -1 -1 Leader\n2 def 100 0 100 100 Follower\nQA_REPLICATION_END\n"
+                "QA_BROKERS_BEGIN\nbroker-1:9096 (id: 1 rack: null) -> (\n\tFetch(1): 0 to 16 [usable: 16]\n)\n"
+                "broker-2:9096 (id: 2 rack: null) -> (\n\tFetch(1): 0 to 16 [usable: 16]\n)\nQA_BROKERS_END")
+        if "QA_SCRAM_BEGIN" in joined:
+            principal = commands[2].split("--entity-name ")[-1]
+            return f"QA_SCRAM_BEGIN\nSCRAM credential configs for user-principal '{principal}' are SCRAM-SHA-512=iterations=8192\nQA_SCRAM_END"
+        raise AssertionError("unexpected broker write")
+
+
+class _BrokerEC2:
+    def describe_instances(self, InstanceIds):
+        return {"Reservations": [{"Instances": [dict(InstanceId=iid,
+            PrivateIpAddress="10.0.0." + iid.split("-")[-1]) for iid in InstanceIds]}]}
+
+
+def _runtime_listing(node, listing):
+    return (f"QA_RESPONDER_BEGIN\n{node}\nQA_RESPONDER_END\n"
+        "QA_POLICY_BEGIN\nCONFIG=runtime\nauthorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer\n"
+        "super.users=User:broker\nallow.everyone.if.no.acl.found=false\nCHECK_DONE\nQA_POLICY_END\n" + listing)
+
+class _BrokerSSM:
+    """SSM stdout has its real cap; only the remote I/O response is replaced."""
+    def __init__(self, broker, page_change=None, responder=None, meta_change=None):
+        self.broker, self.page_change, self.responder = broker, page_change, responder
+        self.meta_change = meta_change
+        self.files, self.outputs, self.sizes = {}, [], []
+
+    def send_command(self, InstanceIds, Parameters, **kwargs):
+        iid, commands = InstanceIds[0], Parameters["commands"]
+        joined = "\n".join(commands)
+        if "QA_JAVA" in joined:
+            listing = self.broker(commands, instance_id=iid)
+            node = self.responder(iid) if self.responder else iid.split("-")[-1]
+            data = _runtime_listing(node, listing).encode()
+            # Let the I/O fixture provide a distinct running policy independently of disk.
+            if hasattr(self.broker, "runtime_change"):
+                data = self.broker.runtime_change(data.decode(), iid, self.broker).encode()
+            self.files[iid] = data
+            self.sizes.append(len(data))
+            meta = dict(size=len(data), sha256=hashlib.sha256(data).hexdigest(), rows=data.count(b"permissionType="))
+            if self.meta_change:
+                self.meta_change(meta)
+            output = json.dumps(meta)
+        elif "QA_PAGE'" in joined:
+            offset = int(re.search(r"offset=([0-9]+)", joined)[1])
+            page = dict(offset=offset, data=base64.b64encode(
+                self.files[iid][offset:offset + qa_access_kafka._ACL_PAGE_BYTES]).decode(), end="QA_PAGE_END")
+            if self.page_change:
+                self.page_change(page, iid)
+            output = json.dumps(page)
+        elif joined.startswith("rm -rf /tmp/harness-qa-acls-"):
+            self.files.pop(iid, None)
+            output = ""
+        else:
+            # Kafka's old AdminClient may choose broker 1 regardless of bootstrap host.
+            output = self.broker(commands, instance_id="i-1" if "kafka-acls.sh" in joined else iid)
+        self.outputs.append(output[:24000])
+        return {"Command": {"CommandId": str(len(self.outputs) - 1)}}
+
+    def get_command_invocation(self, CommandId, **kwargs):
+        return dict(Status="Success", StandardOutputContent=self.outputs[int(CommandId)])
+
+
+
+def test_effective_grants_reject_hidden_overbreadth():
+    """SET ROLE and wildcard WRITE cannot hide behind the intended positive read."""
+    audit, own, controls = _records("audit", "pgsys:123:1", "audit_reader", ("column:audit_id:SELECT",))
+    data = {"role": "audit_reader", "physical_source": "pgsys:123", "database_oid": "1", "database": "crpko",
+            "principal_incarnation": "42", "epoch_digest": "a" * 64, "absent_catalogs": [], "auth_event_view": None,
+            "permissions": ["column:audit_id:SELECT", "role-set:writer"],
+            "other_databases": [], "audit_rls": False, "observed_at_ms": 100, "snapshot_at_ms": 100}
+    seeder = _Seeder("                   ?column?\n-------------------------------\n QA_EFFECTIVE:" + json.dumps(data) + "\n(1 row)\n")
+    audit_receipt = qa_access.QAAccess().audit_qualify(seeder, audit, own, controls=controls, expires_at_ms=200)
+    assert not audit_receipt.qualified
+    assert "effective capability is not a supported read-only permission" in audit_receipt.issues
+    assert not audit_receipt.observer_grant().effective_permissions
+    assert len(seeder.calls) == 2
+
+    principal = "harness-qa-reader-v1"
+    spec, own, controls = _records("events", "kafka:cluster-id", principal, ("kafka-topic:events:READ",))
+    listing = ("QA_ACLS_BEGIN\n"
+        "Current ACLs for resource `ResourcePattern(resourceType=TOPIC, name=events, patternType=LITERAL)`:\n"
+        f"\t(principal=User:{principal}, host=*, operation=READ, permissionType=ALLOW)\n"
+        "Current ACLs for resource `ResourcePattern(resourceType=TOPIC, name=*, patternType=LITERAL)`:\n"
+        f"\t(principal=User:{principal}, host=*, operation=WRITE, permissionType=ALLOW)\nQA_ACLS_END\n")
+    broker = _Broker(listing)
+    access = qa_access_kafka.KafkaQAAccess(_BrokerEC2(), _BrokerSSM(broker), None)
+    access.broker_ids = lambda: ["i-1", "i-2"]
+    with patch("time.sleep"):
+        receipt = access.qualify(spec, own, controls=controls, observed_at_ms=100, expires_at_ms=200,
+            capacity_manifest={"listener_port":9096, "advertised_listener_name":"SASL_PLAINTEXT",
+                "broker_records":[{"broker_id":str(i), "advertised_endpoints":[f"broker-{i}:9096"]} for i in (1,2)]})
+    assert not receipt.qualified
+    assert "kafka-topic:literal:*:WRITE" in receipt.effective.permissions
+    assert {call[1] for call in broker.calls} == {"i-1", "i-2"}
+    assert "password" not in receipt.model_dump_json().lower()
+
+
+def test_kafka_superuser_with_spaced_config_is_not_qualified():
+    """Java properties allow whitespace before '='; a superuser cannot be read-only."""
+    config = ("CONFIG=/opt/kafka/config/server.properties\n"
+        "authorizer.class.name = org.apache.kafka.metadata.authorizer.StandardAuthorizer\n"
+        "allow.everyone.if.no.acl.found = false\nsuper.users = User:reader\nCHECK_DONE\n")
+    assert not qa_access_kafka._qualified_authorizer(config, "reader")
+    assert not qa_access_kafka._qualified_authorizer(config + "super.users=User:broker\n", "reader")
+    assert not qa_access_kafka._qualified_authorizer(config.replace("super.users = User:reader", "super.users:User:reader"), "reader")
+    assert not qa_access_kafka._qualified_authorizer(config.replace("User:reader", "User:read\\\ner"), "reader")
+
+
+@pytest.mark.parametrize("setting", ["super.users User:reader", "super.users\tUser:reader", "super.users:User:reader",
+                                    "foo=bar\rsuper.users=User:reader", "super.users=User:broker;\fUser:reader",
+                                    "super.users\f=User:reader"])
+def test_authorizer_command_rejects_ambiguous_java_properties(tmp_path, monkeypatch, setting):
+    """The actual shell readback cannot omit a valid alternate superuser spelling."""
+    path = tmp_path / "server.properties"
+    path.write_text("authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer\n"
+                    "allow.everyone.if.no.acl.found=false\n" + setting + "\n")
+    monkeypatch.setattr(qa_access_kafka, "SERVER_CONFIGS", (str(path),))
+    result = subprocess.run(["sh", "-c", qa_access_kafka.authorizer_check_command()],
+                            capture_output=True, text=True, check=True)
+    assert "CONFIG_AMBIGUOUS" in result.stdout
+    assert not qa_access_kafka._qualified_authorizer(result.stdout, "reader")
+
+
+def test_denied_audit_read_remains_unqualified_without_error_secrets():
+    """Permission denied cannot become a successful reader grant or leak the exception."""
+    spec, own, controls = _records("audit", "pgsys:123:1", "audit_reader", ("column:audit_id:SELECT",))
+    seeder = _Seeder(RuntimeError("permission denied for password secret-value"))
+    receipt = qa_access.QAAccess().audit_qualify(seeder, spec, own, controls=controls, expires_at_ms=200)
+    assert not receipt.qualified
+    assert "audit privilege readback permission denied" in receipt.issues
+    assert not receipt.observer_grant().effective_permissions
+    assert "secret-value" not in receipt.model_dump_json()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event", [False, True])
+async def test_denied_read_is_source_gap_not_missing_product_event(event):
+    """Both observer paths distinguish an inaccessible reader from a genuine absent event."""
+    if event:
+        spec, own, controls = _records("events", "kafka:cluster-id", "reader", ("kafka-topic:events:READ",))
+        access = qa_access_kafka.KafkaQAAccess(None, None, None)
+        access.broker_ids = lambda: ["i-1"]
+        access.run = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("permission denied"))
+        grant = access.qualify(spec, own, controls=controls, observed_at_ms=80, expires_at_ms=1000)
+        reason = "broker inventory or ACL readback unavailable"
+    else:
+        spec, own, controls = _records("audit", "pgsys:123:1", "audit_reader", ("column:audit_id:SELECT",))
+        grant = qa_access.QAAccess().audit_qualify(_Seeder(RuntimeError("permission denied")),
+                                                   spec, own, controls=controls, expires_at_ms=1000)
+        reason = "audit privilege readback permission denied"
+    expected, item = expectation(event), obligation()
+    baseline = qualification(expected, event=event, obligation=item)
+    failed_window = baseline.window.model_copy(update={"source_id": spec.source_id,
+        "incarnation": spec.incarnation, "scope_digest": spec.scope_digest})
+    failed_coverage = baseline.coverage.model_copy(update={"window": failed_window,
+                                                           "reader_failure_reason": reason})
+    failed = baseline.model_copy(update={"window": failed_window, "grants": grant.observer_grant(),
+                                         "coverage": failed_coverage})
+    result_type, observer_type = (EventQueryResult, EventObserver) if event else (AuditQueryResult, AuditObserver)
+    failed_result = result_type((), True, spec.source_id, qualification=failed)
+    denied = await observer_type(expected, Reader(failed_result), obligation=item).observe(
+        StateContext("run"), qualification=failed)
+    assert denied.status == "unobserved" and reason in denied.reason
+    denied_query = await observer_type(expected, Reader(ReaderPermissionDenied("password=secret-value")),
+        obligation=item).observe(StateContext("run"), qualification=baseline)
+    assert denied_query.status == "unobserved"
+    assert "reader permission denied" in denied_query.reason
+    assert denied_query.source_qualification == "unqualified"
+    assert "secret-value" not in denied_query.model_dump_json()
+    valid_spec, valid_own, valid_controls = _records("source", "fixture-cluster", "reader", (
+        "kafka-topic:events:READ",) if event else ("column:audit_id:SELECT",))
+    valid_spec = valid_spec.model_copy(update={"incarnation": baseline.window.incarnation})
+    valid_own = valid_own.model_copy(update={"incarnation": baseline.window.incarnation})
+    valid_controls = tuple(c.model_copy(update={"incarnation": baseline.window.incarnation}) for c in valid_controls)
+    # A permission-denied readback must remain unqualified even with valid controls.
+    snapshot = _snapshot(valid_spec, valid_controls, unknown=(reason,))
+    denied_grant = qualify_reader_grants(valid_spec, snapshot, valid_own)
+    assert not denied_grant.qualified and reason in denied_grant.issues
+    blocked = baseline.model_copy(update={"grants": denied_grant.observer_grant()})
+    empty = result_type((), True, "source", qualification=blocked)
+    result = await observer_type(expected, Reader(empty), obligation=item).observe(
+        StateContext("run"), qualification=blocked)
+    assert result.status == "unobserved" and "reader grant" in result.reason
+    # An independently qualified HC-021 fixture demonstrates the product boundary.
+    complete = result_type((), True, "source", qualification=baseline)
+    missing = await observer_type(expected, Reader(complete), obligation=item).observe(
+        StateContext("run"), qualification=baseline)
+    assert missing.status == "observed_violation" and not grant.qualified
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event", [False, True])
+@pytest.mark.parametrize("retain_qualification", [False, True])
+@pytest.mark.parametrize("failure_path", ["exception", "coverage", "unavailable", "missing"])
+async def test_denied_read_retains_product_finding_through_publisher(tmp_path, event, retain_qualification, failure_path):
+    """Denied reads stay incomplete without discarding an independent product failure."""
+    expected, item = expectation(event), obligation()
+    source = qualification(expected, event=event, obligation=item)
+    if failure_path != "exception":
+        source = source.model_copy(update={"coverage": source.coverage.model_copy(
+            update={"reader_failure_reason": "reader privilege readback denied"})})
+    attempt, capture = published_result(tmp_path, product="violation", unknown_cleanup=True)
+    identity = AttemptIdentity(campaign_id=attempt.campaign_id, partition_id=attempt.partition_id,
+        run_id=attempt.run_id, attempt_id=attempt.attempt_id, row=attempt.row)
+    artifacts = [capture]
+    qualification_ref = None
+    if retain_qualification:
+        qualification_ref = publish_artifact(tmp_path, ArtifactIdentity(**identity.model_dump(),
+            path="source-qualification.json"), canonical_bytes(source))
+        artifacts.append(qualification_ref)
+    observer = EventObserver if event else AuditObserver
+    result_type = EventQueryResult if event else AuditQueryResult
+    response = (ReaderPermissionDenied("password=secret-value") if failure_path == "exception" else
+                RuntimeError("password=secret-value") if failure_path == "unavailable" else
+                result_type((), True, "source", qualification=source))
+    reader = None if failure_path == "missing" else Reader(response)
+    denied = await observer(expected, reader,
+        obligation=item).observe(StateContext("run"), qualification=source, qualification_artifact=qualification_ref)
+    assert denied.status == "unobserved" and denied.source_qualification == "unqualified"
+    assert denied.evidence == ((qualification_ref,) if qualification_ref else ())
+    assert ("reader permission denied" if failure_path == "exception" else "reader privilege readback denied") in denied.reason
+    assert "secret-value" not in denied.model_dump_json()
+    raw = json.loads(canonical_bytes(attempt))
+    source_obligation = item.model_dump(mode="json")
+    source_obligation["row"] = attempt.row.model_dump(mode="json")
+    raw["plan"]["obligations"].append(source_obligation)
+    raw["plan_sha256"] = record_digest(CasePlan.model_validate_json(json.dumps(raw["plan"])))
+    raw["observations"].append(denied.model_dump(mode="json"))
+    raw["observation_sha256s"].append(record_digest(denied))
+    raw["completeness"] = "incomplete"
+    attempt = AttemptResult.model_validate_json(json.dumps(raw))
+    store = CompletionEvidenceStore(tmp_path)
+    ref = store.store(attempt, tuple(artifacts))
+    assert isinstance(ref, AttemptRef)
+    seal = store.seal(run_for(attempt), (ref,), ())
+    retained = verify_seal(tmp_path, seal).attempts[0]
+    assert retained.product == "violation" and retained.completeness == "incomplete"
+    assert any(o.reason == denied.reason and o.evidence == denied.evidence for o in retained.observations)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["sha256", "size_bytes"])
+async def test_denied_read_rejects_mismatched_qualification_artifact(field):
+    expected, item = expectation(), obligation()
+    source = qualification(expected, obligation=item)
+    ref = ArtifactRef(schema_version=V, ref="source.json", sha256=record_digest(source),
+                      size_bytes=len(canonical_bytes(source)))
+    bad = ref.model_copy(update={field: "f" * 64 if field == "sha256" else ref.size_bytes + 1})
+    with pytest.raises(ValueError, match="qualification artifact"):
+        await EventObserver(expected, Reader(ReaderPermissionDenied()), obligation=item).observe(
+            StateContext("run"), qualification=source, qualification_artifact=bad)
+
+
+def test_shared_and_expired_reader_leases_cannot_authorize_teardown(tmp_path):
+    """An owner must hold the current exclusive physical scope, not just a name."""
+    now = [1000]
+    store = backend(tmp_path, now)
+    env, op = authority(), operation("creator")
+    resource = "principal:kafka:cluster-id:reader"
+    own = ReaderOwnership(schema_version=V, source_id="events", cluster=env.cluster,
+        principal="reader", incarnation=env.incarnation, operation_id=op.id, owner_operation_id=op.id,
+        physical_source="kafka:cluster-id", principal_incarnation="identity-1",
+        lease_ref=op.holder_id, origin="created", resource_ref=resource, proof=_artifact())
+    held = acquire_leases(env, [scope("reader", resource, "exclusive")], op, store)
+    assert may_teardown_reader(own, [held])
+    with pytest.raises(LeaseConflictError):
+        acquire_leases(env, [scope("reader", resource, "shared")], operation("other-source"), store)
+    assert not may_teardown_reader(own.model_copy(update={"origin": "borrowed"}), [held])
+    assert not may_teardown_reader(own.model_copy(update={"incarnation": "boot-2"}), [held])
+    assert not may_teardown_reader(own.model_copy(update={"principal": "another"}), [held])
+    assert not may_teardown_reader(own.model_copy(update={"physical_source": "pgsys:123:1"}), [held])
+    assert not may_teardown_reader(own, [])
+    assert not may_teardown_reader(own, [held, held])
+    release_leases(held, cleanup(), store)
+    shared = acquire_leases(env, [scope("reader", resource, "shared")], op.model_copy(
+        update={"holder_id": "new-holder"}), store)
+    own = own.model_copy(update={"lease_ref": "new-holder"})
+    assert not may_teardown_reader(own, [shared])
+    release_leases(shared, cleanup(), store)
+    expiration_op = op.model_copy(update={"holder_id": "expiry-holder"})
+    expired = acquire_leases(env, [scope("reader", resource, "exclusive")], expiration_op, store)
+    own = own.model_copy(update={"lease_ref": expiration_op.holder_id})
+    assert may_teardown_reader(own, [expired])
+    now[0] = 1100
+    assert not may_teardown_reader(own, [expired])
+
+
+def test_created_role_on_cluster_scope_passes_teardown_under_real_lease(tmp_path):
+    """A live physical cluster lease authorizes its creator, not other scopes or expired leases."""
+    now = [1000]
+    store, env, op = backend(tmp_path, now), authority(), operation("creator")
+    physical = "pgsys:7301234567890123456"
+    resource = f"principal:{physical}:qa_role"
+    own = ReaderOwnership(schema_version=V, source_id="audit", cluster=env.cluster,
+        incarnation=env.incarnation, physical_source=physical, principal="qa_role", principal_incarnation="16384",
+        operation_id=op.id, owner_operation_id=op.id, lease_ref=op.holder_id, origin="created",
+        resource_ref=resource, proof=_artifact())
+    held = acquire_leases(env, [scope("reader", resource, "exclusive")], op, store)
+    assert may_teardown_reader(own, [held])
+    database_id = physical + ":16384"
+    assert not may_teardown_reader(own.model_copy(update={"physical_source": database_id,
+        "resource_ref": f"principal:{database_id}:qa_role"}), [held])
+    other = acquire_leases(env, [scope("reader", "principal:pgsys:999:qa_role", "exclusive")],
+                           operation("other"), store)
+    assert not may_teardown_reader(own, [other])
+    now[0] = 1100
+    assert not may_teardown_reader(own, [held])
+
+
+def test_two_sources_on_one_cluster_share_the_principal_lease(tmp_path):
+    """Different source IDs do not create separate locks for one physical role."""
+    env, store, op = authority(), backend(tmp_path, [1000]), operation("creator")
+    _, own, _ = _records("audit-one", env.cluster, "qa_role", ("column:audit_id:SELECT",))
+    own = own.model_copy(update={"origin": "created", "operation_id": op.id,
+        "owner_operation_id": op.id, "lease_ref": op.holder_id})
+    held = acquire_leases(env, [scope("reader", own.resource_ref, "exclusive")], op, store)
+    assert may_teardown_reader(own, [held])
+    second_source = own.model_copy(update={"source_id": "audit-two"})
+    with pytest.raises(LeaseConflictError):
+        acquire_leases(env, [scope("reader", second_source.resource_ref, "shared")], operation("other"), store)
+
+
+@pytest.mark.parametrize("record", ["effective", "ownership", "permitted_read", "forbidden_access"])
+def test_principal_incarnation_mismatch_is_an_issue(record):
+    spec, own, controls = _records("source", "env", "reader", ("kafka-topic:events:READ",))
+    snap = _snapshot(spec, controls)
+    assert qualify_reader_grants(spec, snap, own).qualified
+    if record == "effective":
+        snap = snap.model_copy(update={"principal_incarnation": "identity-2"})
+        reason = "effective source, cluster, incarnation or principal differs"
+    elif record == "ownership":
+        own = own.model_copy(update={"principal_incarnation": "identity-2"})
+        reason = "reader ownership source, cluster, incarnation or principal differs"
+    else:
+        snap = snap.model_copy(update={"controls": tuple(c.model_copy(update={"principal_incarnation": "identity-2"})
+            if c.kind == record else c for c in controls)})
+        reason = f"qualified {record} control is missing, failed or foreign"
+    receipt = qualify_reader_grants(spec, snap, own)
+    assert reason in receipt.issues and receipt.observer_grant().effective_permissions == ()
+
+
+@pytest.mark.parametrize("kind,resource,reason", [
+    ("permitted_read", "other", "permitted read control does not bind an allowed data read"),
+    ("forbidden_access", "events", "forbidden access control does not bind a denied capability outside the read scope"),
+])
+def test_control_for_foreign_resource_cannot_qualify(kind, resource, reason):
+    spec, own, controls = _records("source", "env", "reader", ("kafka-topic:events:READ",))
+    if kind == "forbidden_access":
+        spec = spec.model_copy(update={"denied": ("kafka-topic:events:DESCRIBE",)})
+    snap = _snapshot(spec, tuple(c.model_copy(update={"resource": resource,
+        "api": "ListOffsets" if kind == "forbidden_access" else c.api,
+        "capability": spec.denied[0] if kind == "forbidden_access" else c.capability}) if c.kind == kind else c for c in controls))
+    receipt = qualify_reader_grants(spec, snap, own)
+    assert reason in receipt.issues and receipt.observer_grant().effective_permissions == ()
+
+
+def test_forbidden_control_must_test_a_denied_capability():
+    spec, own, controls = _records("source", "env", "reader", ("kafka-topic:events:READ",))
+    controls = tuple(c.model_copy(update={"capability": "kafka-topic:elsewhere:READ"})
+                     if c.kind == "forbidden_access" else c for c in controls)
+    receipt = qualify_reader_grants(spec, _snapshot(spec, controls), own)
+    assert "forbidden access control does not bind a denied capability outside the read scope" in receipt.issues
+    assert receipt.observer_grant().effective_permissions == ()
+
+
+def test_denied_capability_must_name_the_control_resource():
+    """An in-scope denial cannot be relabelled as a probe on an unrelated resource."""
+    spec, own, controls = _records("source", "env", "reader", ("kafka-topic:events:READ",))
+    spec = spec.model_copy(update={"denied": ("kafka-topic:events:DESCRIBE",)})
+    controls = tuple(c.model_copy(update={"api": "ListOffsets", "capability": "kafka-topic:events:DESCRIBE", "resource": "outside"})
+                     if c.kind == "forbidden_access" else c for c in controls)
+    receipt = qualify_reader_grants(spec, _snapshot(spec, controls), own)
+    assert "forbidden access control does not bind a denied capability outside the read scope" in receipt.issues
+    assert receipt.observer_grant().effective_permissions == ()
+
+
+def test_scope_digest_mismatch_projects_no_read():
+    spec, own, controls = _records("source", "env", "reader", ("kafka-topic:events:READ",))
+    wrong = reader_scope_digest("kafka", ("other",))
+    spec = spec.model_copy(update={"scope_digest": wrong})
+    controls = tuple(c.model_copy(update={"scope_digest": wrong}) for c in controls)
+    receipt = qualify_reader_grants(spec, _snapshot(spec, controls), own)
+    assert "scope digest does not match the allowed read resources" in receipt.issues
+    assert receipt.observer_grant().effective_permissions == ()
+
+
+def test_qualified_fixture_projects_read_and_passes_observer_window():
+    spec, own, controls = _records("source", "env", "reader", ("kafka-topic:events:READ",))
+    spec = spec.model_copy(update={"incarnation": "boot1"})
+    own = own.model_copy(update={"incarnation": "boot1"})
+    controls = tuple(c.model_copy(update={"incarnation": "boot1"}) for c in controls)
+    receipt = qualify_reader_grants(spec, _snapshot(spec, controls), own)
+    assert receipt.qualified and receipt.observer_grant().effective_permissions == ("read",)
+    expected, item = expectation(), obligation()
+    baseline = qualification(expected, obligation=item)
+    window = baseline.window.model_copy(update={"scope_digest": spec.scope_digest})
+    control = baseline.controls[0].model_copy(update={"source": source_ref(window),
+        "counter_offset_fence": ArtifactRef(schema_version=V, ref="window",
+                                            sha256=record_digest(window), size_bytes=1)})
+    coverage = baseline.coverage.model_copy(update={"window": window})
+    result = qualify_source_window(window, receipt.observer_grant(), (control,), coverage)
+    assert result.issues == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("permission,event", [
+    ("kafka-topic:other:READ", True), ("column:audit_id:SELECT", True),
+    ("kafka-topic:events:READ", False), ("column:path_template:SELECT", False),
+    ("kafka-topic:unrelated-topic:READ", "projection"), ("column:audit_id:SELECT", "projection"),
+    ("kafka-topic:audit_id:READ", "projection"),
+])
+async def test_copied_grant_digest_cannot_prove_absence_on_foreign_window(permission, event):
+    """A foreign topic, column or source kind cannot pass by copying its grant digest."""
+    spec, own, controls = _records("source", "env", "reader", (permission,))
+    spec = spec.model_copy(update={"incarnation": "boot1"})
+    own = own.model_copy(update={"incarnation": "boot1"})
+    controls = tuple(c.model_copy(update={"incarnation": "boot1"}) for c in controls)
+    grant = qualify_reader_grants(spec, _snapshot(spec, controls), own)
+    assert grant.qualified
+    expected, item = expectation(event is True, expect_present=False), obligation(relation="absent")
+    if event == "projection":
+        from test_completion_projection_coverage import projection
+        baseline = projection()
+    else:
+        baseline = qualification(expected, event=event, obligation=item)
+    assert baseline.qualified
+    window = baseline.window.model_copy(update={"scope_digest": spec.scope_digest, "obligation_digest": record_digest(item),
+        "read_resources": baseline.window.read_resources})
+    control = baseline.controls[0].model_copy(update={"source": source_ref(window),
+        "counter_offset_fence": ArtifactRef(schema_version=V, ref="window", sha256=record_digest(window), size_bytes=1)})
+    bound = qualify_source_window(window, grant.observer_grant(), (control,),
+                                  baseline.coverage.model_copy(update={"window": window}))
+    reason = ("projection window scope digest differs from read resources" if event == "projection" else
+              "Kafka window scope digest differs from partition topics" if event else
+              "database window scope digest differs from read resources")
+    assert reason in bound.issues
+    assert judge_cardinality(item, (), bound).status == "unobserved"
+    if event == "projection":
+        return
+    result_type, observer = (EventQueryResult, EventObserver) if event else (AuditQueryResult, AuditObserver)
+    observed = await observer(expected, Reader(result_type((), True, "source", qualification=bound)),
+                              obligation=item).observe(StateContext("run"), qualification=bound)
+    assert observed.status == "unobserved" and reason in observed.reason
+
+
+def test_mixed_read_scope_cannot_qualify():
+    spec, own, controls = _records("source", "env", "reader",
+        ("kafka-topic:events:READ", "column:audit_id:SELECT"))
+    receipt = qualify_reader_grants(spec, _snapshot(spec, controls), own)
+    assert "allowed scope mixes source kinds" in receipt.issues
+    assert receipt.observer_grant().effective_permissions == ()
+
+
+@pytest.mark.parametrize("change,reason", [
+    ("source", "physical source does not match the allowed read kind"),
+    ("allowed", "allowed permissions mix source kinds"),
+    ("denied", "forbidden access control does not bind a denied capability outside the read scope"),
+])
+def test_reader_source_kind_cannot_cross_database_and_kafka(change, reason):
+    """A Kafka read cannot be proved by PostgreSQL identity, privileges or controls."""
+    spec, own, controls = _records("source", "env", "reader", ("kafka-topic:events:READ",))
+    if change == "source":
+        spec = spec.model_copy(update={"physical_source": "pgsys:123"})
+        own = own.model_copy(update={"physical_source": spec.physical_source})
+        controls = tuple(c.model_copy(update={"physical_source": spec.physical_source}) for c in controls)
+    elif change == "allowed":
+        spec = spec.model_copy(update={"allowed": (*spec.allowed, "database:prod:CONNECT")})
+    else:
+        spec = spec.model_copy(update={"denied": ("column:secret:SELECT",)})
+        controls = tuple(c.model_copy(update={"capability": spec.denied[0], "resource": "secret"})
+                         if c.kind == "forbidden_access" else c for c in controls)
+    receipt = qualify_reader_grants(spec, _snapshot(spec, controls), own)
+    assert reason in receipt.issues and receipt.observer_grant().effective_permissions == ()
+
+
+@pytest.mark.parametrize("kind,change,reason", [
+    ("permitted_read", {"expected": "DENIED"}, "permitted read control does not bind an allowed data read"),
+    ("forbidden_access", {"expected": "ALLOWED"}, "forbidden access control does not bind a denied capability outside the read scope"),
+    ("permitted_read", {"evidence": _artifact()}, "reader control evidence is not independent of the inventory"),
+])
+def test_control_must_have_expected_outcome_and_independent_evidence(kind, change, reason):
+    spec, own, controls = _records("source", "env", "reader", ("kafka-topic:events:READ",))
+    controls = tuple(c.model_copy(update=change) if c.kind == kind else c for c in controls)
+    receipt = qualify_reader_grants(spec, _snapshot(spec, controls), own)
+    assert reason in receipt.issues and receipt.observer_grant().effective_permissions == ()
+
+
+def test_qualified_kafka_describe_projection_is_explicit():
+    spec, own, controls = _records("source", "env", "reader",
+        ("kafka-topic:events:READ", "kafka-topic:events:DESCRIBE"))
+    receipt = qualify_reader_grants(spec, _snapshot(spec, controls), own)
+    assert receipt.qualified and receipt.observer_grant().effective_permissions == ("describe", "read")
+
+
+@pytest.mark.parametrize("kind,api,capability,qualified", [
+    ("permitted_read", "Fetch", "kafka-topic:events:READ", True),
+    ("permitted_read", "ListOffsets", "kafka-topic:events:READ", False),
+    ("permitted_read", "unknown", "kafka-topic:events:READ", False),
+    ("forbidden_access", "Fetch", "kafka-topic:outside:READ", True),
+    ("forbidden_access", "ListOffsets", "kafka-topic:outside:READ", False),
+    ("forbidden_access", "ListOffsets", "kafka-topic:outside:DESCRIBE", True),
+    ("forbidden_access", "unknown", "kafka-topic:outside:READ", False),
+    ("forbidden_access", "CreateTopics(validateOnly)", "kafka-cluster:cluster-id:CREATE", True),
+])
+def test_native_control_api_must_prove_its_capability(kind, api, capability, qualified):
+    """Metadata evidence cannot stand in for Fetch; unknown native checks fail closed."""
+    spec, own, controls = _records("source", "env", "reader", ("kafka-topic:events:READ",))
+    if kind == "forbidden_access":
+        spec = spec.model_copy(update={"denied": (capability,)})
+    controls = tuple(c.model_copy(update={"api": api, "capability": capability,
+        "resource": capability.split(":")[1]}) if c.kind == kind else c for c in controls)
+    receipt = qualify_reader_grants(spec, _snapshot(spec, controls), own)
+    assert receipt.qualified == qualified
+    assert ("reader control API does not test its native capability" in receipt.issues) == (not qualified)
+    assert receipt.observer_grant().effective_permissions == (("read",) if qualified else ())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field,column,value", [
+    ("method", "method", "POST"), ("route", "path_template", "/v1/settings"),
+    ("resource_type", "resource_scope", "USER"), ("resource_id", "resource_id", "r1"),
+    ("result", "result", "SUCCESS"), ("status_code", "status_code", 200),
+    ("audit_id", "audit_id", "a1"), ("actor_id", "actor_user_id", "actor"),
+    ("request_id", "request_id", "req1"), ("account_id", "account_id", "acct1"),
+    ("correlation_id", "correlation_id", "correlation"), ("occurred_at_ms", "created_at_ms", 110),
+])
+async def test_audit_selector_requires_proven_column_before_read(field, column, value):
+    """Unselected audit fields cannot turn an omitted value into qualified absence."""
+    expected = expectation(False, expect_present=False, **({field: value} if field != "occurred_at_ms" else {}))
+    item = obligation(relation="absent")
+    columns = tuple(sorted({"audit_id", "actor_user_id", "created_at_ms", "correlation_id", column}))
+    for covered in (False, True):
+        resources = columns if covered else tuple(c for c in columns if c != column)
+        records = (audit_record(**({field: value} if covered else {field: None})),) if field != "audit_id" or covered else ()
+        baseline = qualification(expected, records, event=False, obligation=item)
+        window = baseline.window.model_copy(update={"read_resources": resources,
+            "scope_digest": reader_scope_digest("database", resources)})
+        control = baseline.controls[0].model_copy(update={"source": source_ref(window),
+            "counter_offset_fence": ArtifactRef(schema_version=V, ref="window", sha256=record_digest(window), size_bytes=1)})
+        bound = qualify_source_window(window, baseline.grants.model_copy(update={"scope_digest": window.scope_digest}),
+            (control,), baseline.coverage.model_copy(update={"window": window}))
+        class TrackedReader(Reader):
+            calls = 0
+
+            async def query(self, *args, **kwargs):
+                self.calls += 1
+                return await super().query(*args, **kwargs)
+        reader = TrackedReader(AuditQueryResult(records, True, "source", qualification=bound))
+        observed = await AuditObserver(expected, reader, obligation=item).observe(StateContext("run"), qualification=bound)
+        assert observed.status == ("observed_violation" if covered else "unobserved")
+        assert reader.calls == int(covered)
+        if not covered:
+            assert "selector/grading columns" in observed.reason and column in observed.reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("permission", ["kafka-topic:other:READ", "kafka-topic:events:DESCRIBE"])
+async def test_unbound_or_describe_only_grant_cannot_grade_event(permission):
+    """A readable unrelated topic or metadata alone cannot prove this event window."""
+    expected, item = expectation(), obligation()
+    baseline = qualification(expected, obligation=item)
+    spec, own, controls = _records("source", "fixture-cluster", "reader", (permission,))
+    spec = spec.model_copy(update={"incarnation": "boot1"})
+    own = own.model_copy(update={"incarnation": "boot1"})
+    controls = tuple(c.model_copy(update={"scope_digest": spec.scope_digest, "incarnation": "boot1", "observed_at_ms": 85})
+                     for c in controls)
+    snap = _snapshot(spec, controls)
+    grant = qualify_reader_grants(spec, snap, own)
+    assert ("allowed scope contains no supported data read" in grant.issues) == permission.endswith(":DESCRIBE")
+    projected = grant.observer_grant()
+    if permission.endswith(":DESCRIBE"):
+        assert not grant.qualified and projected.effective_permissions == ()
+    else:
+        assert grant.qualified and projected.effective_permissions == ("read",)
+    source = baseline.model_copy(update={"grants": projected})
+    result = EventQueryResult((), True, "source", qualification=source)
+    observed = await EventObserver(expected, Reader(result), obligation=item).observe(
+        StateContext("run"), qualification=source)
+    assert observed.status == "unobserved" and ("reader grant" in observed.reason or
+                                                "scope digest" in observed.reason)
+
+
+@pytest.mark.parametrize("group", ["service-production", "a", "crpko-harness-qa-test"])
+def test_service_consumer_group_is_not_a_qualified_reader(group):
+    """Kafka group READ can commit offsets and must not include service groups."""
+    permissions = ("kafka-topic:orders:READ", f"kafka-group:prefixed:{group}:READ")
+    spec, own, controls = _records("events", "kafka:cluster-id", "reader", permissions)
+    snap = _snapshot(spec, controls)
+    receipt = qualify_reader_grants(spec, snap, own)
+    assert ("consumer group lacks a dedicated harness namespace" in receipt.issues) == (group != "crpko-harness-qa-test")
+    assert receipt.qualified == (group == "crpko-harness-qa-test")
+
+
+@pytest.mark.parametrize("operation", ["audit_up", "audit_down", "reader_up", "reader_down"])
+def test_unowned_audit_lifecycle_fails_before_io(operation):
+    """Legacy lifecycle cannot mutate a shared role, secret, task or log group."""
+    access = qa_access.QAAccess()
+    seeder = _Seeder("")
+    with pytest.raises(RuntimeError, match="ownership|lease"):
+        getattr(access, operation)(seeder) if operation.startswith("audit_") else getattr(access, operation)()
+    assert seeder.calls == []
+
+
+@pytest.mark.parametrize("operation", ["up", "down"])
+def test_unowned_kafka_lifecycle_fails_before_io(operation):
+    """A borrower cannot rotate credentials or run unconditional rollback."""
+    access = qa_access_kafka.KafkaQAAccess(None, None, None)
+    broker = _Broker("")
+    access.run = broker
+    with pytest.raises(RuntimeError, match="ownership"):
+        access.up(["events"]) if operation == "up" else access.down()
+    assert broker.calls == []
+
+
+class _CatalogSeeder(_Seeder):
+    def _run_sql(self, sql):
+        self.calls.append(sql)
+        value = self.output[len(self.calls) - 1]
+        if isinstance(value, Exception):
+            raise value
+        return " ?column?\n QA_EFFECTIVE:" + json.dumps(value) + "\n(1 row)\n"
+
+
+def _audit_case(**changes):
+    spec, own, controls = _records("audit", "qa-cluster", qa_access.AUDIT_ROLE, ("column:audit_id:SELECT",))
+    spec = spec.model_copy(update={"principal_incarnation": "42"})
+    own = own.model_copy(update={"principal_incarnation": "42"})
+    controls = tuple(c.model_copy(update={"principal_incarnation": "42", "observed_at_ms": 110}) for c in controls)
+    before = dict(role=spec.principal, physical_source="pgsys:123", principal_incarnation="42",
+                  database="crpko", database_oid="1", auth_event_view=None, epoch_digest="a" * 64,
+                  permissions=list(spec.allowed), other_databases=[], audit_rls=False, observed_at_ms=100, snapshot_at_ms=100, absent_catalogs=[])
+    after = dict(before, observed_at_ms=120, snapshot_at_ms=120, **changes)
+    return spec, own, controls, before, after
+
+
+def _audit_run(changes=None, *, mutate=None):
+    spec, own, controls, before, after = _audit_case(**(changes or {}))
+    seeder = _CatalogSeeder([before, after])
+    if mutate:
+        mutate(before, after)
+    receipt = qa_access.QAAccess().audit_qualify(seeder, spec, own, controls=controls, expires_at_ms=200)
+    return receipt
+
+
+def test_role_recreated_between_brackets_is_new_incarnation():
+    receipt = _audit_run({"principal_incarnation": "43"})
+    assert receipt.effective.principal_incarnation == "43"
+    assert receipt.effective.incarnation == "boot-1" and receipt.effective.cluster == "qa-cluster"
+    assert not receipt.qualified and receipt.effective.epoch_kind == "unknown"
+    assert "PostgreSQL catalog changed between epoch brackets" in receipt.issues
+    assert not receipt.observer_grant().effective_permissions
+
+
+def test_grant_changed_between_brackets_is_unknown():
+    receipt = _audit_run({"epoch_digest": "b" * 64})
+    assert not receipt.qualified and receipt.effective.epoch_kind == "unknown"
+    assert "PostgreSQL catalog changed between epoch brackets" in receipt.issues
+    assert not receipt.observer_grant().effective_permissions
+
+
+def test_second_database_privileges_are_enumerated_not_ignored():
+    # Cross-database catalogs cannot be queried in this transport; retain the names.
+    receipt = _audit_run(mutate=lambda before, after: [r.update(other_databases=["analytics", "archive"])
+                                                     for r in (before, after)])
+    assert not receipt.qualified
+    assert "privileges in other connectable databases are not enumerated: analytics, archive" in receipt.issues
+    assert not receipt.observer_grant().effective_permissions
+
+
+def test_catalog_physical_source_differs_from_spec_is_issue():
+    receipt = _audit_run(mutate=lambda before, after: [r.update(physical_source="pgsys:999")
+                                                     for r in (before, after)])
+    assert receipt.effective.physical_source == "pgsys:999" and receipt.effective.cluster == "qa-cluster"
+    assert "catalog physical source differs from spec" in receipt.issues
+    assert not receipt.qualified and not receipt.observer_grant().effective_permissions
+
+
+@pytest.mark.parametrize("start,stop,uncertainty,positive,qualified", [
+    (112, 118, 0, 111, True), (112, 120, 0, 111, False),
+    (115, 125, 0, 111, False), (130, 150, 0, 125, False),
+    (112, 119, 1, 110, False), (112, 118, 0, 125, False), (109, 115, 0, 108, False),
+])
+def test_catalog_bracket_bounds_survive_serialization_into_source_qualification(start, stop, uncertainty, positive, qualified):
+    receipt = _audit_run()
+    assert receipt.qualified, receipt.issues
+    assert receipt.effective.principal_incarnation == "42"
+    assert receipt.observer_grant().effective_permissions == ("read",)
+    encoded = receipt.model_dump_json()
+    assert json.loads(encoded)["effective"]["epoch_kind"] == "bracketed"
+    restored = qa_access.AuditGrantReceipt.model_validate_json(encoded)
+    result = _qualify_audit_source(restored, start, stop, uncertainty, positive)
+    assert result.qualified == qualified, result.issues
+    assert restored.qualified and restored.observer_grant().effective_permissions == ("read",)
+
+
+def _qualify_audit_source(receipt, start, stop, uncertainty, positive):
+    projected = receipt.observer_grant()
+    baseline = qualification(expectation(False, occurred_after_ms=start, occurred_before_ms=stop), event=False)
+    window = baseline.window.model_copy(update={"source_id": receipt.spec.source_id,
+        "incarnation": receipt.spec.incarnation, "scope_digest": receipt.spec.scope_digest,
+        "read_resources": ("audit_id",), "time": baseline.window.time.model_copy(update={"uncertainty_ms": uncertainty})})
+    control = baseline.controls[0].model_copy(update={"source": source_ref(window),
+        "counter_offset_fence": _artifact().model_copy(update={"sha256": record_digest(window)}),
+        "window": baseline.controls[0].window.model_copy(update={"start_ms": positive, "stop_ms": positive})})
+    requests = tuple(r.model_copy(update={"occurred_at_ms": positive if r.request_id == control.send_ref else start})
+                     for r in baseline.coverage.requests)
+    coverage = baseline.coverage.model_copy(update={"window": window, "requests": requests,
+        "watermark_ms": stop + uncertainty,
+        "request_journal": _artifact().model_copy(update={"sha256": request_journal_digest(requests)})})
+    return qualify_source_window(window, projected, (control,), coverage)
+
+
+@pytest.mark.parametrize("change", [
+    {"principal_incarnation": None}, {"principal_incarnation": 42}, {"epoch_digest": None},
+    {"physical_source": None}, {"database_oid": True}, {"observed_at_ms": True},
+    {"audit_rls": None}, {"permissions": [None]}, {"other_databases": [False]},
+    {"absent_catalogs": ["pg_type"]},
+    {"snapshot_at_ms": None}, {"snapshot_at_ms": True}, {"snapshot_at_ms": 121},
+])
+def test_incomplete_catalog_bracket_cannot_qualify(change):
+    spec, own, controls, before, after = _audit_case()
+    after.update(change)
+    receipt = qa_access.QAAccess().audit_qualify(_CatalogSeeder([before, after]), spec, own,
+                                               controls=controls, expires_at_ms=200)
+    assert not receipt.qualified and receipt.effective.epoch_kind == "unknown"
+    assert "audit privilege readback unavailable or malformed" in receipt.issues
+
+
+@pytest.mark.parametrize("time", [90, 130])
+def test_controls_outside_catalog_brackets_do_not_qualify(time):
+    spec, own, controls, before, after = _audit_case()
+    controls = tuple(c.model_copy(update={"observed_at_ms": time}) for c in controls)
+    receipt = qa_access.QAAccess().audit_qualify(_CatalogSeeder([before, after]), spec, own,
+                                               controls=controls, expires_at_ms=200)
+    assert "reader controls are outside the PostgreSQL epoch bracket" in receipt.issues
+    assert not receipt.qualified
+
+
+@pytest.mark.parametrize("error", ["permission denied for function pg_control_system",
+                                  "function pg_control_system() does not exist"])
+def test_aurora_fallback_reads_resource_identity_without_claiming_pgsys(error):
+    spec, own, controls, before, after = _audit_case()
+    for row in before, after:
+        row["physical_source"] = "rds:cluster-ABC123"
+    class RDS:
+        def describe_db_clusters(self, **kw):
+            assert kw == {"DBClusterIdentifier": qa_access.AUDIT_CLUSTER_ID}
+            return {"DBClusters": [{"DBClusterIdentifier": qa_access.AUDIT_CLUSTER_ID,
+                    "Engine": "aurora-postgresql", "DbClusterResourceId": "cluster-ABC123"}]}
+    seeder = _CatalogSeeder([RuntimeError(error), before, RuntimeError(error), after])
+    receipt = qa_access.QAAccess(rds=RDS()).audit_qualify(seeder, spec, own, controls=controls, expires_at_ms=200)
+    assert receipt.effective.physical_source == "rds:cluster-ABC123"
+    assert "pg_control_system" not in seeder.calls[1] and "rds:cluster-ABC123" in seeder.calls[1]
+    assert not receipt.qualified and not receipt.observer_grant().effective_permissions
+
+
+@pytest.mark.parametrize("permission", ["system-acl:1260:SELECT", "system-column-acl:1260:11:SELECT",
+    "system-function-acl:2624", "system-schema-acl:11:CREATE", "credential-column:pg_authid.rolpassword"])
+def test_system_privilege_change_or_existing_grant_cannot_qualify(permission):
+    changed = _audit_run({"epoch_digest": "b" * 64, "permissions": ["column:audit_id:SELECT", permission]})
+    assert "PostgreSQL catalog changed between epoch brackets" in changed.issues
+    assert not changed.qualified
+    def grant(before, after):
+        for row in before, after:
+            row["permissions"] = ["column:audit_id:SELECT", permission]
+    existing = _audit_run(mutate=grant)
+    assert "effective capability is not a supported read-only permission" in existing.issues
+    assert not existing.qualified and not existing.observer_grant().effective_permissions
+
+
+def test_budget_registry_matches_broker():
+    from harness.completion.reader_grants import AUDIT_PRINCIPAL_BUDGET, PRINCIPAL_BUDGETS
+    # Aurora PostgreSQL §4.5's closed permission list, independent of production constants.
+    columns = "audit_id actor_user_id method path_template resource_scope resource_id result status_code error_code duration_ms created_at_ms".split()
+    assert dict(PRINCIPAL_BUDGETS) == {"crpko_harness_qa_audit": frozenset({
+        "database:crpko:CONNECT", "schema:backoffice:USAGE", "schema:harness_qa:USAGE",
+        "relation:harness_qa.owned_auth_events:SELECT", *(f"column:{c}:SELECT" for c in columns)})}
+    assert AUDIT_PRINCIPAL_BUDGET == PRINCIPAL_BUDGETS[qa_access.AUDIT_ROLE]
+    assert qa_access.AUDIT_DB_NAME == "crpko" and set(qa_access.AUDIT_COLUMNS) == set(columns)
+
+
+@pytest.mark.parametrize("permission,extra", [
+    ("kafka-topic:events:READ", "kafka-topic:other:READ"),
+    ("clickhouse-column:crpko.t.balance:SELECT", "clickhouse-column:crpko.t.secret:SELECT"),
+    ("column:audit_id:SELECT", "column:method:SELECT"),
+])
+def test_unregistered_principal_keeps_exact_equality(permission, extra):
+    spec, own, controls = _records("source", "env", "reader", (permission,))
+    receipt = qualify_reader_grants(spec, _snapshot(spec, controls, permissions=(*spec.allowed, extra)), own)
+    assert receipt.issues == ("effective permissions differ from the exact allowed scope",)
+
+
+def test_relation_scope_resources_and_digest():
+    from harness.completion.reader_grants import OWNED_AUTH_EVENT_RESOURCES
+    allowed = ("relation:harness_qa.owned_auth_events:SELECT",)
+    kind, resources = scope_resources(allowed)
+    assert kind == "database" and resources == OWNED_AUTH_EVENT_RESOURCES
+    assert reader_scope_digest(kind, resources) == reader_scope_digest("database", OWNED_AUTH_EVENT_RESOURCES)
+    with pytest.raises(ValueError, match="database scope mixes relation and column reads"):
+        scope_resources((*allowed, "column:audit_id:SELECT"))
+
+
+@pytest.mark.parametrize("physical,accepted", [
+    ("rds:cluster-ABC123", True), ("pgsys:42", True), ("rds:db-x", False),
+    ("rds:cluster-", False), ("rds:cluster-a_b", False),
+])
+def test_rds_cluster_physical_source(physical, accepted):
+    spec, own, controls = _records("audit", "env", qa_access.AUDIT_ROLE, ("column:audit_id:SELECT",))
+    fields = {"physical_source": physical}
+    spec, own = spec.model_copy(update=fields), own.model_copy(update=fields)
+    controls = tuple(c.model_copy(update=fields) for c in controls)
+    receipt = qualify_reader_grants(spec, _snapshot(spec, controls), own)
+    assert receipt.qualified == accepted, receipt.issues
+    assert not may_teardown_reader(own, [])
+
+
+def _relation_records():
+    allowed = ("relation:harness_qa.owned_auth_events:SELECT",)
+    spec, own, controls = _records("auth-event-reader", "env", qa_access.AUDIT_ROLE, allowed)
+    spec = spec.model_copy(update={"denied": ("column:payload_json:SELECT",)})
+    controls = (controls[0].model_copy(update={"api": "SELECT relation", "capability": allowed[0],
+        "resource": "harness_qa.owned_auth_events"}), controls[1].model_copy(update={
+        "capability": spec.denied[0], "resource": "payload_json"}))
+    return spec, own, controls
+
+
+@pytest.mark.parametrize("change,qualified", [
+    ({}, True), ({"capability": "relation:harness_qa.other:SELECT"}, False),
+    ({"api": "SELECT column"}, False), ({"resource": "owned_auth_events"}, False),
+])
+def test_relation_permitted_control_and_column_forbidden_control(change, qualified):
+    spec, own, controls = _relation_records()
+    controls = (controls[0].model_copy(update=change), controls[1])
+    receipt = qualify_reader_grants(spec, _snapshot(spec, controls), own)
+    assert receipt.qualified == qualified, receipt.issues
+
+
+@pytest.mark.parametrize("scope", ["audit", "relation"])
+@pytest.mark.parametrize("change,issue", [
+    ({"extra": "column:session_id:SELECT"}, "effective permission is outside the principal budget"),
+    ({"extra": "relation:harness_qa.other:SELECT"}, "effective permission is outside the principal budget"),
+    ({"allowed": ("column:session_id:SELECT",)}, "allowed scope is outside the principal budget"),
+    ({"denied": ("column:method:SELECT",)}, "forbidden capability is inside the principal budget"),
+    ({"permissions": ()}, "effective permissions lack the source's allowed scope"),
+])
+def test_budget_rejections(scope, change, issue):
+    spec, own, controls = (_relation_records() if scope == "relation" else
+        _records("audit", "env", qa_access.AUDIT_ROLE, ("column:audit_id:SELECT",)))
+    extra = change.get("extra")
+    snapshot = {"permissions": (*spec.allowed, extra)} if extra else {}
+    snapshot.update({k: v for k, v in change.items() if k == "permissions"})
+    spec = spec.model_copy(update={k: v for k, v in change.items() if k in {"allowed", "denied"}})
+    receipt = qualify_reader_grants(spec, _snapshot(spec, controls, **snapshot), own)
+    assert not receipt.qualified and issue in receipt.issues
+
+
+def test_rds_reader_cannot_teardown_even_with_matching_creator_lease(tmp_path):
+    env, store = authority(), backend(tmp_path, [1000])
+    op = operation("creator")
+    resource = "principal:rds:cluster-ABC123:reader"
+    held = acquire_leases(env, [scope("reader", resource, "exclusive")], op, store)
+    own = ReaderOwnership(schema_version=V, source_id="source", cluster=env.cluster,
+        incarnation=env.incarnation, physical_source="rds:cluster-ABC123", principal="reader",
+        principal_incarnation="42", operation_id=op.id, owner_operation_id=op.id,
+        lease_ref=op.holder_id, origin="created", resource_ref=resource, proof=_artifact())
+    try:
+        assert not may_teardown_reader(own, [held])
+    finally:
+        release_leases(held, cleanup(), store)

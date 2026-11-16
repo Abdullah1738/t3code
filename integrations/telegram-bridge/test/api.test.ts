@@ -125,11 +125,42 @@ test("health exposes bounded status subkeys and local counts without payload ide
 test("health allows only bounded single-thread read counters and reasons", async () => {
   const h = setup();
   h.state.health = { board: { threadReads: 5, threadReadErrors: 1,
-    threadReadsByReason: { run: 2, state: 2, followup: 1, threadId: "PRIVATE_ID", title: "PRIVATE_TITLE" } } };
+    threadReadsByReason: { run: 2, state: 2, followup: 1, created: 3, threadId: "PRIVATE_ID", title: "PRIVATE_TITLE" } } };
   expect((await (await h.get("/health")).json()).board).toEqual({ threadReads: 5, threadReadErrors: 1,
-    threadReadsByReason: { run: 2, state: 2, followup: 1 } });
+    threadReadsByReason: { run: 2, state: 2, followup: 1, created: 3 } });
   h.state.health = { board: { threadReads: -1, threadReadErrors: 0.5, threadReadsByReason: { run: Infinity, state: "PRIVATE_ID", followup: -1 } } };
   expect((await (await h.get("/health")).json()).board).toEqual({ threadReadsByReason: {} });
+});
+
+test("health exposes stream counters and bounds codes without identities or malformed values", async () => {
+  const h = setup();
+  const endAt = "2026-11-16T00:00:00.000Z";
+  h.state.health = { board: {
+    streamConnects: 4, streamEndsByKind: { errorFrame: 1, clean: 1, thrown: 1, aborted: 1, title: "PRIVATE_TITLE", threadId: "PRIVATE_ID" },
+    streamLastConnectedMs: 85, streamMinConnectedMs: 0, streamMaxConnectedMs: 200,
+    lastStreamEndAt: endAt, lastStreamEndKind: "errorFrame",
+    streamErrorCodes: { replica_lag: 2, ["__proto__"]: 1, constructor: 1, other: 3,
+      ...Object.fromEntries(Array.from({ length: 25 }, (_, index) => [`code-${index}`, 1])),
+      "thread:PRIVATE_ID": 2, "PRIVATE_TITLE": 1, ["x".repeat(41)]: 1, negative: -1, fraction: 0.5, infinite: Infinity, text: "PRIVATE_VALUE" },
+    threadId: "PRIVATE_ID", title: "PRIVATE_TITLE",
+  } };
+  const health = await (await h.get("/health")).json();
+  expect(health.board).toMatchObject({ streamConnects: 4, streamEndsByKind: { errorFrame: 1, clean: 1, thrown: 1, aborted: 1 },
+    streamLastConnectedMs: 85, streamMinConnectedMs: 0, streamMaxConnectedMs: 200, lastStreamEndAt: endAt, lastStreamEndKind: "errorFrame" });
+  expect(Object.keys(health.board.streamErrorCodes)).toHaveLength(21);
+  expect(health.board.streamErrorCodes).toMatchObject({ replica_lag: 2, ["__proto__"]: 1, constructor: 1, other: 15 });
+  expect(JSON.stringify(health)).not.toContain("PRIVATE_");
+  h.state.health = { board: { streamConnects: -1, streamEndsByKind: { clean: -1, thrown: 0.5, aborted: Infinity, errorFrame: "PRIVATE_TITLE" },
+    streamLastConnectedMs: -1, streamMinConnectedMs: Infinity, streamMaxConnectedMs: "PRIVATE_VALUE", lastStreamEndAt: "PRIVATE_DATE", lastStreamEndKind: "PRIVATE_KIND",
+    streamErrorCodes: { broken: "PRIVATE_VALUE" } } };
+  expect((await (await h.get("/health")).json()).board).toEqual({ streamEndsByKind: {}, streamErrorCodes: {} });
+  const empty = { streamLastConnectedMs: null, streamMinConnectedMs: null, streamMaxConnectedMs: null, lastStreamEndAt: null, lastStreamEndKind: null };
+  h.state.health = { board: empty };
+  expect((await (await h.get("/health")).json()).board).toEqual(empty);
+  for (const value of [null, [], "PRIVATE_VALUE"]) {
+    h.state.health = { board: { streamEndsByKind: value, streamErrorCodes: value } };
+    expect((await (await h.get("/health")).json()).board).toEqual({});
+  }
 });
 
 test("notify queues one stable operation and never touches reminders or session notices", async () => {

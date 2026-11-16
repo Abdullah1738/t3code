@@ -41,7 +41,9 @@ test("a real refused ControlClient connection logs the native fetch cause safely
   await expect(client.request("GET", "/health?message=PRIVATE_BODY&token=PRIVATE_QUERY")).rejects.toMatchObject({ name: "ControlError", status: 0 });
   toolLog.flush();
   const records = rows(new Date().toISOString().slice(0, 10));
-  const failure = records.find(line => line.error?.tag === "control.catch1")!;
+  const failure = records.find(line => line.error?.tag === "control.request_failed")!;
+  expect(records.filter(line => line.error)).toHaveLength(1);
+  expect(failure.name).toBe("turn.robob_call");
   expect(failure.error).toMatchObject({ code: "ECONNREFUSED" });
   expect(failure.site).toMatch(/^src\/control.ts:\d+$/);
   expect(JSON.stringify(records)).not.toMatch(/PRIVATE_|127\.0\.0\.1|message=|token=/);

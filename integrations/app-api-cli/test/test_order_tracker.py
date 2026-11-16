@@ -404,7 +404,7 @@ class TrackerTest(unittest.TestCase):
         self.assertEqual(t.error_family('email_account_unavailable:juno'), 'email_account_unavailable')
         for error in ('native_status_unknown', 'email_account_unavailable:outlook', 'no_order_status_evidence',
                       'native_account_capture_required_guest_catalog_only', 'amazon_message_read_timeout',
-                      'amazon_account_timeout', 'notifications_RuntimeError', 'notifications_priority_hold'):
+                      'amazon_account_timeout', 'notifications_RuntimeError', 'notifications_priority_hold_stale'):
             self.assertTrue(t.quiet_error(error), error)
         for error in ('native_auth_expired', 'native_schema_changed', 'native_order_mismatch_or_schema_changed'):
             self.assertFalse(t.quiet_error(error), error)

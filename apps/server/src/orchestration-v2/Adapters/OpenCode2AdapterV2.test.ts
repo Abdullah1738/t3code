@@ -2140,10 +2140,11 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
               event.type === "provider_turn.updated" &&
               id?.startsWith(`${CHILD}:turn:`) === true
             ) {
-              if (!childTurns.has(id)) {
-                callsAtChildTurnStart.set(id, Object.fromEntries(calls));
+              const ordinalKey = id.split(":").slice(0, 3).join(":");
+              if (!childTurns.has(ordinalKey)) {
+                callsAtChildTurnStart.set(ordinalKey, Object.fromEntries(calls));
               }
-              childTurns.set(id, event.providerTurn.status);
+              childTurns.set(id.split(":").slice(0, 3).join(":"), event.providerTurn.status);
             }
             yield* Deferred.succeed(wake, undefined);
           }),
@@ -2168,6 +2169,39 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
     returnedRunning("call-background"),
     event("session.execution.started", { sessionID: CHILD }),
   ];
+
+  it.effect("keeps child turn identities distinct across adapter reopen", () =>
+    Effect.gen(function* () {
+      const ids: Array<string> = [];
+      const items: Array<string> = [];
+      for (let index = 0; index < 2; index += 1) {
+        yield* Effect.gen(function* () {
+          const { runtime, thread } = yield* resumed(launchedAndRunning);
+          const started = yield* Deferred.make<void>();
+          yield* runtime.events.pipe(
+            Stream.runForEach((event) =>
+              Effect.gen(function* () {
+                if (
+                  event.type === "provider_turn.updated" &&
+                  event.providerTurn.nativeTurnRef?.nativeId?.startsWith(`${CHILD}:turn:`)
+                ) {
+                  ids.push(event.providerTurn.id);
+                  items.push(event.providerTurn.nodeId!);
+                  yield* Deferred.succeed(started, undefined);
+                }
+              }),
+            ),
+            Effect.forkScoped,
+          );
+          yield* runtime.startTurn(withLineage(thread));
+          yield* Deferred.await(started);
+        }).pipe(Effect.scoped);
+      }
+      assert.lengthOf(ids, 2);
+      assert.notEqual(ids[0], ids[1]);
+      assert.notEqual(items[0], items[1]);
+    }).pipe(Effect.scoped),
+  );
 
   it.effect("settles a background subagent that fails, so no work is left pending", () =>
     Effect.gen(function* () {
@@ -2450,7 +2484,9 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
               event.type === "provider_turn.updated" &&
               event.providerTurn.nativeTurnRef?.nativeId?.startsWith(`${MIDDLE}:turn:`) === true
             ) {
-              middleTurns.push(event.providerTurn.nativeTurnRef.nativeId);
+              middleTurns.push(
+                event.providerTurn.nativeTurnRef.nativeId.split(":").slice(0, 3).join(":"),
+              );
             }
             if (event.type === "turn_item.updated" && event.turnItem.type === "assistant_message") {
               yield* Deferred.succeed(launched, undefined);
@@ -2641,7 +2677,7 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
             const native = event.type === "provider_turn.updated" ? event.providerTurn : undefined;
             const id = native?.nativeTurnRef?.nativeId;
             if (native !== undefined && id?.startsWith(`${MIDDLE}:turn:`) === true) {
-              middleTurns.set(id, native.status);
+              middleTurns.set(id.split(":").slice(0, 3).join(":"), native.status);
             }
             yield* Deferred.succeed(wake, undefined);
           }),
@@ -3507,23 +3543,49 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
     replyAfterUnclearFailure(true),
   );
 
-  it.effect("does not report a Stop the server says did nothing", () =>
-    Effect.gen(function* () {
-      const { runtime, thread } = yield* resumed([
-        out("session.prompt", { sessionID: SESSION, text: "<any>" }),
-        promptAccepted,
-        out("session.interrupt", { sessionID: SESSION }),
-        reply("session.interrupt", { interrupted: false }),
-      ]);
-      yield* runtime.startTurn(turnInput(thread));
-      const failed = yield* runtime
-        .interruptTurn({
-          providerThread: thread,
-          providerTurnId: yield* providerTurnId,
-        })
-        .pipe(Effect.flip);
-      assert.equal(failed._tag, "ProviderAdapterProtocolError");
-    }).pipe(Effect.scoped),
+  it.effect(
+    "releases an inactive turn and ignores its late terminal after a successor starts",
+    () =>
+      Effect.gen(function* () {
+        const { runtime, thread } = yield* resumed([
+          out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+          promptAccepted,
+          out("session.interrupt", { sessionID: SESSION }),
+          reply("session.interrupt", { interrupted: false }),
+          out("session.active"),
+          replyData("session.active", {}),
+          out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+          promptAccepted,
+          event("session.execution.interrupted", { sessionID: SESSION }),
+          event("session.execution.started", { sessionID: SESSION }),
+          event("session.execution.succeeded", { sessionID: SESSION }),
+        ]);
+        const terminals = yield* runtime.events.pipe(
+          Stream.filter((event) => event.type === "turn.terminal"),
+          Stream.take(2),
+          Stream.runCollect,
+          Effect.forkScoped,
+        );
+        yield* runtime.startTurn(turnInput(thread));
+        const failed = yield* runtime
+          .interruptTurn({
+            providerThread: thread,
+            providerTurnId: yield* providerTurnId,
+          })
+          .pipe(Effect.flip);
+        assert.equal(failed._tag, "ProviderAdapterTurnNotActiveError");
+        if (failed._tag !== "ProviderAdapterTurnNotActiveError")
+          throw new Error("Expected not-active Stop");
+        assert.equal(failed.providerThreadId, thread.id);
+        assert.equal(failed.providerTurnId, yield* providerTurnId);
+        yield* runtime.startTurn(secondTurn(thread));
+        const ended = yield* Fiber.join(terminals);
+        assert.deepEqual(
+          ended.map((event) => event.status),
+          ["interrupted", "completed"],
+        );
+        assert.notEqual(ended[0]?.providerTurnId, ended[1]?.providerTurnId);
+      }).pipe(Effect.scoped),
   );
 
   it.effect("reports a turn as completed when its Stop request failed", () =>
@@ -4156,7 +4218,10 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
         [...(yield* Fiber.join(ended))].map((terminal) => terminal.status),
         ["completed", "completed"],
       );
-      assert.deepEqual([...childTurns], [`${CHILD}:turn:1`, `${CHILD}:turn:2`]);
+      assert.deepEqual(
+        [...childTurns].map((id) => id.split(":").slice(0, 3).join(":")),
+        [`${CHILD}:turn:1`, `${CHILD}:turn:2`],
+      );
     }).pipe(Effect.scoped),
   );
 
@@ -4696,7 +4761,7 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
         const childTurn = collected.findLast(
           (event) =>
             event.type === "provider_turn.updated" &&
-            event.providerTurn.nativeTurnRef?.nativeId === `${CHILD}:turn:1`,
+            event.providerTurn.nativeTurnRef?.nativeId?.startsWith(`${CHILD}:turn:1:`) === true,
         );
         assert.isTrue(
           collected.some(

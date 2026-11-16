@@ -1,3 +1,7 @@
+import {
+  backgroundCommandWakeCommandId,
+  backgroundCommandWakeMessageId,
+} from "../backgroundCommandWake.ts";
 import { revertCodexThread } from "../../provider/CodexThreadRevert.ts";
 import { codexHistoryItems, readStagedHistory } from "../../ardud/harness-migrate/StagedHistory.ts";
 import { CodexHistoryNotSentError } from "../../ardud/harness-migrate/CodexHistoryDeliveryError.ts";
@@ -158,6 +162,8 @@ import {
 } from "@t3tools/provider-core/server/subagentProjection";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+
+const isTurnNotActiveError = Schema.is(ProviderAdapter.ProviderAdapterTurnNotActiveError);
 
 const CODEX_PROVIDER = ProviderDriverKind.make("codex");
 export const CODEX_DRIVER_KIND = CODEX_PROVIDER;
@@ -1240,6 +1246,7 @@ function codexUsageLimitError(
 interface ActiveCodexTurnContext {
   readonly promptAcceptedAt?: DateTime.Utc;
   closedCommandItemIds?: ReadonlySet<string>;
+  completedCommandItemIds?: Set<string>;
   toolHostFailure?: OrchestrationV2ProviderFailure;
   runtimeStopRequested?: boolean;
   latestProviderFailure?: {
@@ -2142,6 +2149,17 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         const runningCommandItemsByTurn = yield* Ref.make(
           new Map<string, Map<string, TrackedRunningCommandItem>>(),
         );
+        const backgroundCommandIdsByTurn = new Map<string, Set<string>>();
+        const completedBackgroundCommandsByTurn = new Map<
+          string,
+          Map<
+            string,
+            Extract<
+              CodexSchema.V2ItemCompletedNotification__ThreadItem,
+              { type: "commandExecution" }
+            >
+          >
+        >();
         const runningDynamicToolsByTurn = yield* Ref.make(
           new Map<string, Map<string, CodexDynamicToolItem>>(),
         );
@@ -2368,6 +2386,66 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             return updated;
           });
 
+        const offerBackgroundCommand = Effect.fn("CodexAdapterV2.offerBackgroundCommand")(
+          function* (
+            context: ActiveCodexTurnContext,
+            nativeTurnId: string,
+            item: Extract<
+              CodexSchema.V2ItemCompletedNotification__ThreadItem,
+              { type: "commandExecution" }
+            >,
+          ) {
+            if (
+              context.subagent === null &&
+              continuationRequests !== undefined &&
+              !(yield* Ref.get(interruptingNativeTurns)).has(nativeTurnId)
+            ) {
+              const alreadyOffered = yield* Ref.modify(
+                offeredContinuationItemsByTurn,
+                (current) => {
+                  const items = current.get(nativeTurnId);
+                  if (items !== undefined && items.has(item.id)) {
+                    return [true, current] as const;
+                  }
+                  const updated = new Map(current);
+                  const updatedItems = new Set(items ?? []);
+                  updatedItems.add(item.id);
+                  updated.set(nativeTurnId, updatedItems);
+                  return [false, updated] as const;
+                },
+              );
+              if (!alreadyOffered) {
+                yield* continuationRequests.offer({
+                  messageId: backgroundCommandWakeMessageId(context.projectionThreadId, item.id),
+                  commandId: backgroundCommandWakeCommandId(context.projectionThreadId, item.id),
+                  threadId: context.projectionThreadId,
+                  providerThreadId: context.providerThread.id,
+                  driver: CODEX_PROVIDER,
+                  // Codex starts a new turn from this text, so nothing is buffered.
+                  delivery: "message_text",
+                  detail: codexBackgroundCommandDetail(item),
+                  notification: {
+                    ...backgroundWorkNotification([
+                      {
+                        kind: "command",
+                        label: item.command,
+                        outcome:
+                          item.exitCode === 0
+                            ? "completed"
+                            : item.exitCode == null
+                              ? "unknown"
+                              : "failed",
+                        exitCode: item.exitCode ?? undefined,
+                      },
+                    ]),
+                    detail: item.command,
+                  },
+                });
+              }
+            }
+          },
+        );
+
         const clearRunningCommandItem = (nativeTurnId: string, nativeItemId: string) =>
           Ref.modify(runningCommandItemsByTurn, (current) => {
             const items = current.get(nativeTurnId);
@@ -2435,6 +2513,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         const turnHasRetainedBackgroundWork =
           /* Provider events include streaming deltas; avoid a span for each update. */
           Effect.fnUntraced(function* (nativeTurnId: string) {
+            if ((completedBackgroundCommandsByTurn.get(nativeTurnId)?.size ?? 0) > 0) return true;
             const commands = (yield* Ref.get(runningCommandItemsByTurn)).get(nativeTurnId);
             if (commands !== undefined && commands.size > 0) {
               return true;
@@ -2473,7 +2552,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             if (!roots.some((root) => context === root || isDescendantCodexTurn(context, root)))
               return false;
             const turnId = context.nativeTurnId;
-            if ((commands.get(turnId)?.size ?? 0) > 0 || captures.has(turnId)) return true;
+            if (
+              (commands.get(turnId)?.size ?? 0) > 0 ||
+              captures.has(turnId) ||
+              (completedBackgroundCommandsByTurn.get(turnId)?.size ?? 0) > 0
+            )
+              return true;
             if (context.subagent !== null && active.has(turnId)) return true;
             return [...(tools.get(turnId)?.values() ?? [])].some(isPersistentCodexDynamicTool);
           });
@@ -4990,11 +5074,70 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           }).pipe(Effect.orDie, turnTerminalizationPermit.withPermits(1)),
         );
 
+        yield* client.handleServerNotification("rawResponseItem/completed", (payload) =>
+          Effect.gen(function* () {
+            const item = payload.item;
+            if (item.type !== "function_call_output" && item.type !== "custom_tool_call_output")
+              return;
+            const processIds = new Set<string>();
+            const readOutput = (value: unknown): void => {
+              if (typeof value === "string") {
+                const match = /^Process running with session ID (\d+)$/m.exec(value);
+                if (match) processIds.add(match[1]!);
+                try {
+                  const parsed: unknown = JSON.parse(value);
+                  if (typeof parsed !== "string") readOutput(parsed);
+                } catch {}
+              } else if (Array.isArray(value)) {
+                for (const part of value) readOutput(part);
+              } else if (value !== null && typeof value === "object") {
+                // Code mode can return the exec result after the process already
+                // exited while that same call awaited another tool (#1529).
+                if (
+                  "session_id" in value &&
+                  (typeof value.session_id === "number" || typeof value.session_id === "string") &&
+                  "chunk_id" in value &&
+                  typeof value.chunk_id === "string" &&
+                  !("exit_code" in value)
+                )
+                  processIds.add(String(value.session_id));
+                if ("type" in value && value.type === "input_text" && "text" in value)
+                  readOutput(value.text);
+              }
+            };
+            readOutput(item.output);
+            if (processIds.size === 0) return;
+            const commands = (yield* Ref.get(runningCommandItemsByTurn)).get(payload.turnId);
+            const completed = completedBackgroundCommandsByTurn.get(payload.turnId);
+            for (const command of [...(commands?.values() ?? []), ...(completed?.values() ?? [])]) {
+              if (typeof command.processId !== "string" || !processIds.has(command.processId))
+                continue;
+              let ids = backgroundCommandIdsByTurn.get(payload.turnId);
+              if (ids === undefined)
+                backgroundCommandIdsByTurn.set(payload.turnId, (ids = new Set()));
+              ids.add(command.id);
+            }
+          }).pipe(Effect.orDie, turnTerminalizationPermit.withPermits(1)),
+        );
+
         yield* client.handleServerNotification("item/started", (payload) =>
           Effect.gen(function* () {
             const context = yield* awaitActiveTurn(payload.turnId);
             if (context === undefined) {
               return;
+            }
+
+            // Model output while a PTY still runs proves exec yielded. Overlapping
+            // tool starts alone can be foreground calls awaited in parallel.
+            if (payload.item.type === "agentMessage" || payload.item.type === "reasoning") {
+              const commands = (yield* Ref.get(runningCommandItemsByTurn)).get(payload.turnId);
+              for (const command of commands?.values() ?? []) {
+                if (command.processId === undefined) continue;
+                let ids = backgroundCommandIdsByTurn.get(payload.turnId);
+                if (ids === undefined)
+                  backgroundCommandIdsByTurn.set(payload.turnId, (ids = new Set()));
+                ids.add(command.id);
+              }
             }
 
             // New tool work proves the agent continued. A late completion from
@@ -5185,6 +5328,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             if (payload.item.type === "commandExecution") {
               // Other tools can retain the context after thread closure.
               if (context.closedCommandItemIds?.has(payload.item.id)) return;
+              const completedIds = (context.completedCommandItemIds ??= new Set());
+              if (completedIds.has(payload.item.id)) return;
+              completedIds.add(payload.item.id);
               if (settled) yield* holdHandoff(context.providerThread.id);
               const turnDrained = yield* clearRunningCommandItem(payload.turnId, payload.item.id);
               const artifacts = yield* buildCommandExecutionArtifacts(context, payload.item);
@@ -5198,53 +5344,14 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 driver: CODEX_PROVIDER,
                 turnItem: artifacts.turnItem,
               });
+              if (!settled && typeof payload.item.processId === "string") {
+                let completed = completedBackgroundCommandsByTurn.get(payload.turnId);
+                if (completed === undefined)
+                  completedBackgroundCommandsByTurn.set(payload.turnId, (completed = new Map()));
+                completed.set(payload.item.id, payload.item);
+              }
               if (settled) {
-                if (
-                  context.subagent === null &&
-                  continuationRequests !== undefined &&
-                  !(yield* Ref.get(interruptingNativeTurns)).has(payload.turnId)
-                ) {
-                  const alreadyOffered = yield* Ref.modify(
-                    offeredContinuationItemsByTurn,
-                    (current) => {
-                      const items = current.get(payload.turnId);
-                      if (items !== undefined && items.has(payload.item.id)) {
-                        return [true, current] as const;
-                      }
-                      const updated = new Map(current);
-                      const updatedItems = new Set(items ?? []);
-                      updatedItems.add(payload.item.id);
-                      updated.set(payload.turnId, updatedItems);
-                      return [false, updated] as const;
-                    },
-                  );
-                  if (!alreadyOffered) {
-                    yield* continuationRequests.offer({
-                      threadId: context.projectionThreadId,
-                      providerThreadId: context.providerThread.id,
-                      driver: CODEX_PROVIDER,
-                      // Codex starts a new turn from this text, so nothing is buffered.
-                      delivery: "message_text",
-                      detail: codexBackgroundCommandDetail(payload.item),
-                      notification: {
-                        ...backgroundWorkNotification([
-                          {
-                            kind: "command",
-                            label: payload.item.command,
-                            outcome:
-                              payload.item.exitCode === 0
-                                ? "completed"
-                                : payload.item.exitCode == null
-                                  ? "unknown"
-                                  : "failed",
-                            exitCode: payload.item.exitCode ?? undefined,
-                          },
-                        ]),
-                        detail: payload.item.command,
-                      },
-                    });
-                  }
-                }
+                yield* offerBackgroundCommand(context, payload.turnId, payload.item);
                 if (turnDrained) {
                   yield* releaseSettledTurnIfIdle(payload.turnId);
                 }
@@ -6421,6 +6528,17 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 yield* Deferred.succeed(input.context.nativeStartReady, undefined);
               }
               yield* flushReadyRootTerminals();
+              if (input.status === "completed") {
+                for (const item of completedBackgroundCommandsByTurn
+                  .get(input.nativeTurnId)
+                  ?.values() ?? []) {
+                  if (backgroundCommandIdsByTurn.get(input.nativeTurnId)?.has(item.id))
+                    yield* offerBackgroundCommand(input.context, input.nativeTurnId, item);
+                }
+              }
+              backgroundCommandIdsByTurn.delete(input.nativeTurnId);
+              completedBackgroundCommandsByTurn.delete(input.nativeTurnId);
+              yield* releaseSettledTurnIfIdle(input.nativeTurnId);
               if (!retainSettledContext && !interruptInProgress) {
                 yield* Ref.update(runningCommandItemsByTurn, (current) => {
                   if (!current.has(input.nativeTurnId)) {
@@ -7704,9 +7822,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 )
                   return;
                 if (turnInput.requestRuntimeRestart === true) return;
-                return yield* toProtocolError(
-                  `Provider turn ${turnInput.providerTurnId} is not active and cannot be interrupted.`,
-                );
+                return yield* new ProviderAdapter.ProviderAdapterTurnNotActiveError({
+                  driver: CODEX_PROVIDER,
+                  providerThreadId: turnInput.providerThread.id,
+                  providerTurnId: turnInput.providerTurnId,
+                });
               }
               const interruptTargets: Array<{
                 readonly context: ActiveCodexTurnContext;
@@ -8055,14 +8175,15 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             },
             (effect, requestedInput) =>
               effect.pipe(
-                Effect.mapError(
-                  (cause) =>
-                    new ProviderAdapter.ProviderAdapterInterruptError({
-                      driver: CODEX_PROVIDER,
-                      providerThreadId: requestedInput.providerThread.id,
-                      providerTurnId: requestedInput.providerTurnId,
-                      cause,
-                    }),
+                Effect.mapError((cause) =>
+                  isTurnNotActiveError(cause)
+                    ? cause
+                    : new ProviderAdapter.ProviderAdapterInterruptError({
+                        driver: CODEX_PROVIDER,
+                        providerThreadId: requestedInput.providerThread.id,
+                        providerTurnId: requestedInput.providerTurnId,
+                        cause,
+                      }),
                 ),
               ),
           ),

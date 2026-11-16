@@ -1,0 +1,92 @@
+cat > scripts/runbooks/kafka-acl-probes.mjs <<'EOF'
+#!/usr/bin/env node
+import { spawnSync } from 'node:child_process';
+import { readFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { pathToFileURL, fileURLToPath } from 'node:url';
+import { gunzipSync } from 'node:zlib';
+import { deriveProbeMatrix, planPrincipal, digest, requireBinding, requirePreflight, assertEmpty } from '../lib/kafka-acl-probe-plan.mjs';
+import { environment, readLatch, awsReader } from '../lib/rebuild-admission.mjs';
+import { requireIdleKafkaClients, writeAclEvidence } from '../lib/kafka-acl-evidence.mjs';
+import { kafkaAdminPrelude } from '../lib/kafka-onbox-admin.mjs';
+import { commandCaptureShell, checkedCapture, parseTopicInventory } from '../lib/kafka-client-snapshot.mjs';
+import { listChunkCommand, verifyListPayload } from '../lib/kafka-acl-apply.mjs';
+import { waitForCommandInvocation } from './ssm-command-waiter.mjs';
+import { waitForTaskStop } from '../lib/ecs-task-wait.mjs';
+const root=fileURLToPath(new URL('../../',import.meta.url));
+const json=path=>JSON.parse(readFileSync(path,'utf8'));
+const fail=message=>{throw new Error(message);};
+function run(command,args){const r=spawnSync(command,args,{encoding:'utf8',maxBuffer:16*1024*1024,timeout:30*60*1000});if(r.error||r.status!==0)fail(`${command} failed; see retained command evidence`);return r.stdout;}
+export function options(argv){const flags=new Set(['env','stage','principal','preflight','dry-run','runtime','preflight-dir','pre-topic-receipt','profile','evidence-prefix']);const args={};for(let i=0;i<argv.length;i++){const key=argv[i].slice(2);if(!argv[i].startsWith('--')||!flags.has(key)||Object.hasOwn(args,key))fail('invalid option');args[key]=['dry-run','preflight'].includes(key)?true:argv[++i];if(args[key]===undefined||String(args[key]).startsWith('--'))fail('option value missing');}if(!['pre-topic','post-topic'].includes(args.stage))fail('--stage pre-topic|post-topic required');if(args.env!=='dev')fail('only dev is wired for probe execution');return args;}
+export function parseOffsets(text,inventory){const expected=new Set(inventory.flatMap(t=>t.partitions.map(p=>`${t.topic}:${p}`))),result=new Map();for(const line of text.trim().split(/\r?\n/).filter(Boolean)){const m=/^([^:\s]+):(\d+):(\d+)$/.exec(line),key=m&&`${m[1]}:${m[2]}`;if(!m||!expected.has(key)||result.has(key))fail('offset inventory differs');result.set(key,m[3]);}if(result.size!==expected.size)fail('offset inventory incomplete');return result;}
+export async function main(argv){
+  const args=options(argv),manifest=json(resolve(root,'plan/kafka/acl-manifest.dev.v1.json')),matrix=deriveProbeMatrix(manifest);
+  if(JSON.stringify(matrix)!==JSON.stringify(json(resolve(root,'plan/kafka/acl-probe-matrix.v1.json'))))fail('probe matrix stale');
+  const selected=matrix.principals.filter(p=>(!args.principal||p.principal===args.principal)&&(args.preflight||args.stage!=='pre-topic'||p.class==='P'));
+  if(!selected.length)fail('no principal selected');
+  if(args['dry-run']){const report={stage:args.stage,preflight:!!args.preflight,manifest_sha256:manifest.sha256,principals:matrix.principals.map(p=>({principal:p.principal,class:p.class,stage_selected:selected.includes(p),probe_count:args.preflight?0:planPrincipal(manifest,p.principal,{stage:p.class==='P'?args.stage:'post-topic'}).probes.length}))};console.log(JSON.stringify(report,null,2));return report;}
+  if(!args.runtime||!args['preflight-dir']||!args['evidence-prefix'])fail('--runtime, --preflight-dir and --evidence-prefix required');
+  const target=environment(args.env),aws=awsReader(target,{profile:args.profile??'crpko-dev'}),runtime=json(resolve(args.runtime)),runId=randomUUID(),date=new Date().toISOString().slice(0,10),localDir=resolve(root,`tmp/dev-rebuild-${date}/kafka-authz/probes/${runId}`);
+  if(aws(['sts','get-caller-identity']).Account!==target.account_id)fail('account differs');
+  const latch=readLatch(target,{ssm:aws});if(!latch)fail('installation latch required');
+  if(!/^s3:\/\/crpko-dev-evidence\/rebuild\/\d{4}-\d{2}-\d{2}\/kafka-authz\/[A-Za-z0-9/_-]+$/.test(args['evidence-prefix']))fail('invalid evidence prefix');
+  const prefix=args['evidence-prefix'];
+  const verify=label=>{const text=run(process.execPath,[resolve(root,'scripts/runbooks/apply-kafka-acls.mjs'),'--env',target.env,'--region',target.region,'--profile',args.profile??'crpko-dev','--mode','verify','--admin-auth','broker-scram','--evidence-out',`${prefix}/${runId}-${label}.json`]);const report=JSON.parse(text);if(!report.ok||!report.evidence?.local_path)fail('G-ACL verify failed');return json(report.evidence.local_path);};
+  requireIdleKafkaClients({awsJson:aws,env:target.env});
+  const binding=verify('before');if(binding.installation_id!==latch.installation_id||binding.manifest_sha256!==manifest.sha256)fail('installation or manifest differs');
+  const ssm=(instance,shell)=>{const response=aws(['ssm','send-command','--instance-ids',instance,'--document-name','AWS-RunShellScript','--parameters',JSON.stringify({commands:[shell]}),'--timeout-seconds','120']);const invocation=waitForCommandInvocation({commandId:response.Command?.CommandId,instanceId:instance,timeoutSeconds:'180',getInvocation:(c,i)=>aws(['ssm','get-command-invocation','--command-id',c,'--instance-id',i])});if(invocation.Status!=='Success'||invocation.ResponseCode!==0||invocation.StandardErrorContent)fail('broker capture failed');return invocation.StandardOutputContent;};
+  const prelude=kafkaAdminPrelude({env:target.env,region:target.region});
+  const capture=command=>{const header=ssm(binding.instance_ids[0],commandCaptureShell(prelude,command)).trim(),m=/^FILE (\/tmp\/kafka-acls-list\.[A-Za-z0-9]+) LEN (\d+) SHA ([a-f0-9]{64})$/.exec(header);if(!m)fail('capture header differs');const length=Number(m[2]);if(length<1||length>8*1024*1024)fail('capture exceeds limit');let encoded='';try{for(let start=0;start<length;start+=20000)encoded+=ssm(binding.instance_ids[0],listChunkCommand(m[1],start,20000));verifyListPayload({encoded,length,sha256:m[3]});return checkedCapture(JSON.parse(gunzipSync(Buffer.from(encoded,'base64')).toString()),'probe inventory').text;}finally{ssm(binding.instance_ids[0],`rm -f -- '${m[1]}'`);}};
+  // TLS-only preflights are deliberately after Stage B, even though injection itself does not connect.
+  for(const instance of binding.instance_ids)ssm(instance,'set -euo pipefail\ngrep -Eq "^listeners=.*:9097(,|$)" /opt/kafka/config/kraft.properties\nss -ltn | grep -Eq ":9097[[:space:]]"\necho TLS_STAGE_B');
+  const base='--bootstrap-server "$BOOT" --command-config "$CFG"';
+  const names=capture(`/opt/kafka/bin/kafka-topics.sh ${base} --list --exclude-internal`);
+  if(names.split(/\r?\n/).includes('crpko-acl-probe-absent'))fail('sentinel exists');
+  let inventory=[],topology={};
+  if(!args.preflight&&args.stage==='post-topic'){
+    const described=capture(`/opt/kafka/bin/kafka-topics.sh ${base} --describe --exclude-internal`);inventory=parseTopicInventory(names,described);
+    const starts=parseOffsets(capture(`/opt/kafka/bin/kafka-get-offsets.sh ${base} --time -2 --exclude-internal-topics`),inventory),ends=parseOffsets(capture(`/opt/kafka/bin/kafka-get-offsets.sh ${base} --time -1 --exclude-internal-topics`),inventory);
+    const leaders=new Map([...described.matchAll(/Topic:\s+(\S+)\s+Partition:\s+(\d+)\s+Leader:\s+(\d+)/g)].map(m=>[`${m[1]}:${m[2]}`,Number(m[3])]));
+    // Endpoints come from the Terraform task's bootstrap list; broker order is node-id order.
+    for(const topic of inventory)topology[topic.topic]=topic.partitions.map(partition=>({partition,start:starts.get(`${topic.topic}:${partition}`),end:ends.get(`${topic.topic}:${partition}`),leader:leaders.get(`${topic.topic}:${partition}`)}));
+  }
+  if(!args.preflight){
+    const receipts=matrix.principals.map(p=>json(resolve(args['preflight-dir'],`${p.principal}.json`)));requirePreflight(receipts,binding,matrix.principals.map(p=>p.principal));
+    if(args.stage==='post-topic'){if(!args['pre-topic-receipt'])fail('K6p receipt required');const pre=json(resolve(args['pre-topic-receipt']));requireBinding(pre,binding);if(pre.stage!=='pre-topic'||pre.principal!=='topic_provisioner'||!pre.passed)fail('K6p receipt invalid');}
+  }
+  const receipts=[];
+  for(const entry of selected){
+    requireIdleKafkaClients({awsJson:aws,env:target.env});requireBinding(verify(`before-${entry.principal}`),binding);
+    const definition=aws(['ecs','describe-task-definition','--task-definition',runtime.tasks?.[entry.principal]??fail('probe definition missing')]).taskDefinition;
+    const container=definition?.containerDefinitions?.[0],ownSecret=`crpko/${target.env}/kafka/scram/${entry.principal}-`;
+    if(definition.family!==`crpko-${target.env}-kafka-acl-probe-${entry.principal}`||definition.containerDefinitions.length!==1||container.name!=='kafka-acl-probe'||container.image!==runtime.image||!/@sha256:[a-f0-9]{64}$/.test(container.image)||!container.secrets?.filter(s=>s.name.startsWith('KAFKA_SCRAM_')).every(s=>s.valueFrom.includes(ownSecret))||container.secrets.filter(s=>s.name.startsWith('KAFKA_SCRAM_')).length!==2)fail('task definition differs');
+    const endpoints=container.environment.find(e=>e.name==='KAFKA_BOOTSTRAP_BROKERS').value.split(',');
+    const plan=args.preflight?null:planPrincipal(manifest,entry.principal,{stage:args.stage,run:runId});
+    const needed=new Set(plan?.probes.filter(p=>p.expected==='TOPIC_AUTHORIZATION_FAILED'&&['Fetch','ListOffsets','IncrementalAlterConfigs'].includes(p.api)).map(p=>p.resource));
+    const foreign=Object.fromEntries([...needed].filter(t=>topology[t]).map(t=>[t,topology[t].map(p=>({...p,endpoint:endpoints[p.leader-1]}))]));
+    const command=['--principal',entry.principal,...(args.preflight?['--preflight']:['--stage',args.stage,'--run',runId,'--topology',JSON.stringify(foreign),'--binding',JSON.stringify(Object.fromEntries(['installation_id','environment','account_id','region','cluster_id','format_sha256','manifest_sha256','listing_sha256','user_list_sha256'].map(k=>[k,binding[k]])))])];
+    const overrides={containerOverrides:[{name:'kafka-acl-probe',command}]};if(JSON.stringify(overrides).length>8192)fail('probe override too large');
+    const network=runtime.networks?.[entry.principal];if(!network?.subnets?.length||network.securityGroups?.length!==1||network.assignPublicIp!=='DISABLED')fail('probe network missing');
+    const started=aws(['ecs','run-task','--cluster',`crpko-${target.env}`,'--task-definition',definition.taskDefinitionArn,'--launch-type','FARGATE','--count','1','--client-token',`${runId}-${receipts.length}`,'--network-configuration',JSON.stringify({awsvpcConfiguration:network}),'--overrides',JSON.stringify(overrides)]);
+    if(started.failures?.length||started.tasks?.length!==1)fail('probe task did not start');const taskArn=started.tasks[0].taskArn;
+    const waited=waitForTaskStop({budgetMs:30*60*1000,describeTask:()=>{const response=aws(['ecs','describe-tasks','--cluster',`crpko-${target.env}`,'--tasks',taskArn]);if(response.failures?.length||response.tasks?.length!==1)fail('task state unavailable');return {task:response.tasks[0]};}});
+    if(!waited.stopped||waited.task.stopCode==='TaskFailedToStart'||waited.task.containers?.length!==1||waited.task.containers[0].exitCode!==0)fail('probe task failed, including ResourceInitializationError');
+    const logGroup=container.logConfiguration.options['awslogs-group'],stream=`probe/kafka-acl-probe/${taskArn.split('/').at(-1)}`;
+    const logs=aws(['logs','get-log-events','--log-group-name',logGroup,'--log-stream-name',stream,'--start-from-head']);const lines=logs.events?.filter(e=>e.message.startsWith('CRPKO_PROBE_RESULT '));if(lines?.length!==1)fail('probe result missing or duplicated');const result=JSON.parse(lines[0].message.slice(19));
+    if(result.principal!==entry.principal||result.passed!==true||!!result.preflight!==!!args.preflight)fail('probe result differs');if(!args.preflight)requireBinding(result,binding);
+    requireIdleKafkaClients({awsJson:aws,env:target.env});requireBinding(verify(`after-${entry.principal}`),binding);
+    const receipt={...binding,...result,task_arn:taskArn,task_definition_arn:definition.taskDefinitionArn,image:container.image,run_id:runId,captured_at:new Date().toISOString()};mkdirSync(localDir,{recursive:true});writeAclEvidence({awsJson:aws,evidence:receipt,localPath:resolve(localDir,`${entry.principal}.json`),uri:`${prefix}/probes/${runId}/${entry.principal}.json`});
+    if(args.preflight){mkdirSync(resolve(args['preflight-dir']),{recursive:true});writeFileSync(resolve(args['preflight-dir'],`${entry.principal}.json`),JSON.stringify(receipt)+'\n',{flag:'wx',mode:0o600});}receipts.push(receipt);
+  }
+  if(!args.preflight&&args.stage==='post-topic'){
+    const topics=[...new Set(manifest.rows.filter(r=>r.principal==='User:clickhouse_balance_bootstrap'&&r.resource_type==='TOPIC').map(r=>r.resource_name))];
+    const freshStarts=parseOffsets(capture(`/opt/kafka/bin/kafka-get-offsets.sh ${base} --time -2 --exclude-internal-topics`),inventory),freshEnds=parseOffsets(capture(`/opt/kafka/bin/kafka-get-offsets.sh ${base} --time -1 --exclude-internal-topics`),inventory);
+    assertEmpty(Object.fromEntries(inventory.map(t=>[t.topic,t.partitions.map(partition=>({partition,start:freshStarts.get(`${t.topic}:${partition}`),end:freshEnds.get(`${t.topic}:${partition}`)}))])),topics);
+  }
+  requireBinding(verify('final'),binding);if(readLatch(target,{ssm:aws})?.installation_id!==latch.installation_id)fail('installation changed');
+  console.log(JSON.stringify({passed:true,stage:args.stage,local_dir:localDir,principals:receipts.map(r=>r.principal)}));return receipts;
+}
+if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href)main(process.argv.slice(2)).catch(e=>{console.error(e.message);process.exitCode=1;});
+EOF
+node --check scripts/runbooks/kafka-acl-probes.mjs

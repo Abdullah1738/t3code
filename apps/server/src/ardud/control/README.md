@@ -92,7 +92,7 @@ All paths are under `/api/ardud/control`.
 | GET    | `/health`                                                | Token check plus the latest event sequence.                                                                                                                                                                                                                       |
 | GET    | `/projects`                                              | Registered projects (`projectId`, `title`, `workspaceRoot`, `scratch`).                                                                                                                                                                                           |
 | GET    | `/models`                                                | Default model and runtime mode, plus each provider's models, option descriptors and variants.                                                                                                                                                                     |
-| GET    | `/messages?since=<ISO or epoch ms>&cursor=&limit=`       | User messages across all non-deleted threads, including archived threads; default 200, maximum 1000 per page.                                                                                                                                                     |
+| GET    | `/messages?since=<ISO or epoch ms>&role=&threadIds=&cursor=&limit=`       | Messages across non-deleted threads, including archived threads; role defaults to user (also assistant, system, all); optional comma-separated threadIds (max 50); default 200, max 1000 per page.                                                                                                                                                     |
 | GET    | `/usage`                                                 | Usage records in a time range, with optional board filter and cursor pagination.                                                                                                                                                                                  |
 | GET    | `/threads`                                               | List threads (see filters below).                                                                                                                                                                                                                                 |
 | POST   | `/threads`                                               | Create a thread, optionally with a first prompt.                                                                                                                                                                                                                  |
@@ -250,6 +250,8 @@ JSON-quoted incoming message ID in an iMessage channel-guidance context record,
 or null. Synthetic bridge IDs (`wake:`, `reset:`, `secret:`) are preserved so
 callers can distinguish them from relayed owner messages.
 
+Thread summaries and details include `changeMarker`, the latest V2 thread event sequence (0 if none). Compare it for incremental polling; `updatedAt` and `updatedSince` can miss timestamp ties. Poll known ids without `updatedSince`, then read changed messages with an overlapping `since` watermark.
+
 ### GET /threads/:id/wait
 
 Query: `timeoutMs` (default 10 min, max 60 min), `runId` (wait for that run),
@@ -302,9 +304,27 @@ server's compression middleware leaves it alone. Frames go out as they happen,
 with a `: ping` comment every 15 s. Each frame carries `id: <sequence>` and
 `event: <type>`. `data` is JSON with `type`, `threadId`, and `origin`.
 
-Start: the stream opens at the live head with an `event: ready` frame carrying
-`sequence`. Resume with the `Last-Event-ID` header or `?after=<sequence>` to
-replay everything since. The client reconnects and resumes on its own.
+Start: without a cursor the stream opens at the live head. Its `ready` frame
+carries `sequence` and `resumed:false`; fetch current state while buffering new
+events. Reconnect with `Last-Event-ID` or `?after=<sequence>` (the header wins).
+A decimal safe integer cursor at or below the head is honoured when its replay
+range has no compaction tombstones: `ready.resumed:true` means replay of matching
+events strictly after that cursor, then live events, with no gap or duplicate at
+the boundary. Keep the same filters when resuming. Invalid, future or compacted
+cursors start at the head with `resumed:false` and require a refetch.
+
+Failures send `event:error` with `type:error`, an optional `code`, and the last
+emitted sequence as `id`. Codes are `buffer_overflow`, `event_read_failed`,
+`origin_lookup_failed`, `history_compacted`, and `unknown`. Normal disconnects
+send no error. Reconnect from the last received id after transient failures;
+`history_compacted` means maintenance raced replay, so refetch current state.
+The client reconnects and resumes on its own.
+
+Control analytics records `events.stream_failed` with `props.code` and an
+`events.stream_failed.<code>` error tag, so existing analytics reads expose both
+the total and per-code counts. `events.stream_connected` and
+`events.stream_closed` record connection counts and lifetime separately from
+request setup latency.
 
 Filters: `threadId`, `origin` (or `none`), `types=a,b`.
 

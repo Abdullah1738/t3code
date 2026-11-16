@@ -35,6 +35,7 @@ def isolate_home(stack, root, *, guard_failover=True):
                            ("BACKEND_PATH", "backend"), ("HOME_FAILURES", "home-failures.jsonl")):
         stack.enter_context(patch.object(common, name, root / filename))
     stack.enter_context(patch.object(common, "_BACKEND", None))
+    stack.enter_context(patch.object(home, "slow_read_reachable", return_value=False))
     if guard_failover:
         stack.enter_context(patch.object(home, "probe", return_value=None))
         stack.enter_context(patch.object(home, "fail_over", side_effect=AssertionError(

@@ -8,7 +8,7 @@ type FixtureEntry = Omit<LogEntry, "ids" | "props"> & {
   ts: string;
   tool: string;
   ids?: Record<string, string>;
-  props?: Record<string, string | number | boolean>;
+  props?: Record<string, string | number | boolean | null>;
 };
 
 export function useToolLogFixture() {

@@ -8,12 +8,14 @@ import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import { forkParked } from "../serverActivation.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as EventSink from "./EventSink.ts";
 import { providerStartAccepted } from "./providerStartDeadlinePolicy.ts";
+import * as ProviderStartProgress from "../ardud/orchestration/ProviderStartProgress.ts";
 
 export class RunStartDeadline extends Context.Service<
   RunStartDeadline,
@@ -28,12 +30,14 @@ export class RunStartDeadline extends Context.Service<
 const make = Effect.gen(function* () {
   const engine = yield* Orchestrator.OrchestratorV2;
   const eventSink = yield* EventSink.EventSinkV2;
+  const progress = yield* Effect.serviceOption(ProviderStartProgress.ProviderStartProgress);
   const pending = new Map<OrchestrationV2Run["id"], OrchestrationV2Run>();
   let bootstrapping = false;
   const bootstrapTouched = new Set<OrchestrationV2Run["id"]>();
   const bootstrapAccepted = new Set<RunAttemptId>();
   // Domain events are already traced at their persistence boundary.
   const handle = Effect.fnUntraced(function* (event: OrchestrationV2DomainEvent) {
+    if (Option.isSome(progress)) yield* progress.value.handle(event);
     yield* Effect.sync(() => {
       if (event.type === "run.created" || event.type === "run.updated") {
         const run = event.payload;
@@ -72,6 +76,7 @@ const make = Effect.gen(function* () {
     for (const [id, run] of pending) {
       const deadline = run.providerStartDeadlineAt;
       if (deadline === undefined || now < DateTime.toEpochMillis(deadline)) continue;
+      const observed = Option.isSome(progress) ? progress.value.get(id, run.activeAttemptId) : null;
       yield* engine
         .dispatch({
           type: "run.start-expire",
@@ -83,6 +88,16 @@ const make = Effect.gen(function* () {
           runId: id,
           expectedAttemptId: run.activeAttemptId,
           deadline,
+          ...(observed?.nativeAcceptedAt == null
+            ? {}
+            : {
+                nativeEvidence: {
+                  runId: id,
+                  attemptId: observed.attemptId,
+                  nativeSessionId: observed.nativeSessionId,
+                  acceptedAt: DateTime.makeUnsafe(observed.nativeAcceptedAt),
+                },
+              }),
         })
         .pipe(
           Effect.tap(() =>

@@ -67,6 +67,8 @@ RECEIPT_SUBJECT = re.compile(r'\bservice charges receipt\b', re.I)
 RANK = {'unknown': -1, 'pending confirmation': 0, 'placed': 0, 'ordered': 0, 'shipped': 2, 'preparing': 1, 'packed':1.5, 'picked up': 2,
         'out for delivery': 3, 'nearby': 4, 'delivered': 5, 'cancelled': 5}
 TRACKING_PROBLEM_REPEAT_S = 86400
+POLL_FAILURE_THRESHOLD = 3
+POLL_BACKOFF_MAX_S = 1800
 WEB_PROOF_VERSION = 5
 WEB_NUMBER_WORDS = {word: value for value, word in enumerate(
     'zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty'.split())}
@@ -199,8 +201,13 @@ def send_problem_notices(cfg, state, path, folder):
         try:
             # Telegram's alerts queue survives iMessage session rotation; ordinary
             # conversation sends are bound to the chat's current generation.
-            p = subprocess.run([BUN, PROBLEM_CLI, 'notify', '--source', 'order-watch', '--severity', 'attention', '--key', key,
-                                '--text=' + notice['text']], capture_output=True, text=True,
+            args = [BUN, PROBLEM_CLI, 'notify', '--source', 'order-watch', '--severity', 'attention', '--key', key]
+            if notice.get('chat', 'owner') != 'owner':
+                route = bridge_route()
+                if not route:
+                    break
+                args = [BUN, BRIDGE_CLI, 'send', '--to', notice['chat'], '--session', route, '--key', key]
+            p = subprocess.run([*args, '--text=' + notice['text']], capture_output=True, text=True,
                                timeout=20, env=store.clean_env())
             ack = json.loads(p.stdout) if p.returncode == 0 else None
             if (isinstance(ack, dict) and isinstance(ack.get('id'), str)
@@ -210,6 +217,40 @@ def send_problem_notices(cfg, state, path, folder):
             pass  # The retained text and key make an ambiguous retry safe.
         write(path, state)
         break  # Keep the poll's send budget bounded; the rest stay pending.
+
+
+def queue_tracking_unavailable(cfg, result, state, events):
+    if (cfg['app'] != 'amazon' or poll_succeeded(cfg, result) or state.get('status') in TERMINAL
+            or terminal_order(cfg, result)):
+        return events
+    # This keyed notice replaces repeat tracking_problem wakes for Amazon outages.
+    events = [event for event in events if event['kind'] != 'tracking_problem']
+    if state.get('consecutive_failures', 0) < POLL_FAILURE_THRESHOLD:
+        return events
+    chat = chat_of(cfg)
+    # #20 already queues the owner's immediate expensive-order problem alert.
+    if chat == 'owner' and order_total_aed(cfg, result, state) >= 500:
+        return events
+    key = 'order-unavailable:' + hashlib.sha256(
+        json.dumps([cfg['app'], cfg['order']], separators=(',', ':')).encode()).hexdigest()
+    state.setdefault('problem_notices', {}).setdefault(key, {
+        'status': 'pending', 'chat': chat,
+        'text': f"Amazon order {cfg['order']}: tracking is unavailable. I'll keep checking."})
+    return events
+
+
+def poll_succeeded(cfg, result):
+    if cfg.get('app') == 'amazon' and 'amazon_read_ok' in result:
+        return result['amazon_read_ok'] is True
+    return not bool(result.get('errors'))
+
+
+def retry_interval(cfg, state, interval):
+    failures = state.get('consecutive_failures', 0)
+    if cfg.get('app') != 'amazon' or type(failures) is not int or failures < POLL_FAILURE_THRESHOLD:
+        return interval
+    return max(interval, min(POLL_BACKOFF_MAX_S,
+                            interval * 2 ** min(failures - POLL_FAILURE_THRESHOLD + 1, 32)))
 
 
 def poll_interval(eta, now=None):
@@ -1014,6 +1055,8 @@ def amazon_fetch(cfg, state, now):
               'shipments': mail.get('shipments', []), 'coverage': mail.get('coverage', {}),
               'eta': cfg.get('eta'), 'eta_source': 'checkout_supplied' if cfg.get('eta') else None,
               'rider': None, 'checked_at': stamp(now), 'email_checked_at': mail.get('checked_at'),
+              # Optional notification warnings do not describe the Amazon read.
+              'amazon_read_ok': not bool(mail.get('errors')),
               'errors': ['amazon_' + e['code'] for e in mail.get('errors', [])],
                'evidence': [], 'partial_evidence': [],
                'aftercare_evidence': [amazon_proof(e) for e in aftercare]}
@@ -1492,6 +1535,7 @@ def print_wake(cfg, result, state, events):
                           'whole_order_complete': result.get('whole_order_complete'), 'bank_charge': bank}))
 
 
+@toollog.entrypoint('order-watch', 'check')
 def check(cfg):
     toollog.previous_day_rollup()
     with toollog.deferred():
@@ -1536,6 +1580,8 @@ def _check(cfg, pending_only=False):
             interval = None
         if type(interval) is not int or interval <= 0:
             interval = poll_interval(cfg.get('eta'))
+        base_interval = interval
+        interval = retry_interval(cfg, state, interval)
         toollog.poll_observation({'polled': False, 'consecutive_failures': state.get('consecutive_failures', 0),
                                  'last_success_at': state.get('last_success_at'),
                                  'poll_interval_s': interval})
@@ -1543,6 +1589,7 @@ def _check(cfg, pending_only=False):
         if cfg.get('app') == 'web' and os.environ.get('WATCH_RUN', '').startswith('prime-'):
             return {'ok': True}
         if pending_only and order_total_aed(cfg, {}, state) < 500:
+            send_problem_notices(cfg, state, path, folder)
             return {'ok': True}
         if pending_only and os.environ.get('WATCH_MAIN_CHECKED') == '1':
             send_problem_notices(cfg, state, path, folder)
@@ -1571,14 +1618,30 @@ def _check(cfg, pending_only=False):
             return {'ok': not bool(state.get('retire_error') or state.get('card_error')),
                     'logProps': {'merchant': cfg.get('app'), 'state': state['status'], 'changed': False}}
         now = time.time()
+        if cfg.get('app') == 'amazon' and now < state.get('next_poll_at', 0):
+            if pending_only:
+                send_problem_notices(cfg, state, path, folder)
+            return {'ok': True}
         try:
             result = fetch(cfg, deepcopy(state) if pending_only else state, now)
         except Exception:
-            record_poll(state, False, now, interval)
+            record_poll(state, False, time.time(), base_interval, cfg)
+            if cfg.get('app') == 'amazon':
+                failed = {'status': 'unknown', 'errors': ['tracking_poll_failed']}
+                queue_problem_notices(cfg, failed, state, [], now)
+                queue_tracking_unavailable(cfg, failed, state, [])
             write(path, state)
             raise
-        record_poll(state, not bool(result.get('errors')), time.time(), interval)
+        record_poll(state, poll_succeeded(cfg, result), time.time(), base_interval, cfg)
         state['known_total_aed'] = str(order_total_aed(cfg, result, state))
+        if cfg.get('app') == 'amazon':
+            if result.get('errors') and not terminal_order(cfg, result):
+                queue_problem_notices(cfg, result, state, [], now)
+            queue_tracking_unavailable(cfg, result, state, [])
+            # Rendering can exhaust the check's remaining budget. Commit retry
+            # state first, and preserve it in the renderer's stage checkpoint.
+            write(path, state)
+            committed = deepcopy(state)
         if pending_only:
             # Leave stage/delivery cursors untouched: their ordinary wake is still
             # pending, and the normal check must see every later stage after it.
@@ -1598,6 +1661,7 @@ def _check(cfg, pending_only=False):
                 if card.get('link_health') == 'needs_repair':
                     events.append({'kind': 'card_link_problem', 'message': 'The delivery card link needs repair'})
             queue_problem_notices(cfg, result, alert_state, events, now)
+            queue_tracking_unavailable(cfg, result, alert_state, events)
             state['problem_notices'] = alert_state.get('problem_notices', {})
             write(path, state)
             send_problem_notices(cfg, state, path, folder)
@@ -1649,6 +1713,7 @@ def _check(cfg, pending_only=False):
         # Priming suppresses sends, but must retain problems that could recover
         # before the first scheduled poll.
         events = queue_problem_notices(cfg, result, state, events, now)
+        events = queue_tracking_unavailable(cfg, result, state, events)
         write(path, state)
         print_wake(cfg, result, state, events)
 
@@ -1656,12 +1721,18 @@ def _check(cfg, pending_only=False):
             'logProps': {'merchant':cfg.get('app'),'state':current,'changed':current != previous}}
 
 
-def record_poll(state, success, now, interval):
+def record_poll(state, success, now, interval, cfg=None):
     failures = state.get('consecutive_failures', 0)
     failures = failures if type(failures) is int and failures >= 0 else 0
     state['consecutive_failures'] = 0 if success else failures + 1
     if success:
         state['last_success_at'] = stamp(now)
+    if cfg and cfg.get('app') == 'amazon':
+        interval = retry_interval(cfg, state, interval)
+        if state['consecutive_failures'] >= POLL_FAILURE_THRESHOLD:
+            state['next_poll_at'] = now + interval
+        else:
+            state.pop('next_poll_at', None)
     toollog.poll_observation({'polled': True, 'consecutive_failures': state['consecutive_failures'],
                              'last_success_at': state.get('last_success_at'),
                              'poll_interval_s': interval})
@@ -1733,6 +1804,7 @@ def retire(cfg, path, watcher=None):
 
 
 @toollog.registration
+@toollog.entrypoint('order-watch', 'status', cli=True)
 def main(argv=None, _locked=False):
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ['can-report']:
@@ -1778,7 +1850,7 @@ def main(argv=None, _locked=False):
     parser.add_argument('--store', help='store/restaurant name for the placement text (default: from label or app)')
     parser.add_argument('--total', help='order total for the placement text, e.g. "AED 47.25" (stored at first registration)')
     parser.add_argument('--vertical', help='card lane: minutes/nownow/supermall/main/food, restaurants/mart/shops, food/quik/shops/box, same-day')
-    parser.add_argument('--items-file', help='card display metadata or item array (name, qty, price, image_url); read-only')
+    parser.add_argument('--items-file', help='card display metadata or item array (name, qty, price, image_url; item_code/sku/sku_config help spot dropped items); read-only')
     parser.add_argument('--card-items-json', help=argparse.SUPPRESS)
     parser.add_argument('--chat', '--card-chat', dest='chat', help='bridge chat slug the order was placed from; the card and arrival texts go there. Default: $ORDER_WATCH_CHAT, then the iMessage chat folder this runs in, then owner/moni')
     parser.add_argument('--no-card-send', action='store_true', help='build and refresh the card without a placement message')

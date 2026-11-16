@@ -191,6 +191,26 @@ const withHarness = <A, E>(body: (h: Effect.Success<typeof makeHarness>) => Effe
   Effect.scoped(Effect.flatMap(makeHarness, body)).pipe(Effect.provide(Sqlite.layerMemory));
 
 describe("control interrupt", () => {
+  it.effect.each([undefined, "user_stop", "task_stalled", "superseded"] as const)(
+    "forwards a typed interruption source from the control caller (%s)",
+    (cancelReason) =>
+      withHarness(({ post, calls }) =>
+        Effect.gen(function* () {
+          const response = yield* post({ cancelReason, expectedRunId: "run-new" });
+          assert.equal(response.status, 200);
+          assert.equal((yield* Ref.get(calls))[0]?.cancelReason, cancelReason);
+        }),
+      ),
+  );
+  it.effect("rejects an unrecognized interruption source before dispatch", () =>
+    withHarness(({ post, calls }) =>
+      Effect.gen(function* () {
+        const response = yield* post({ cancelReason: "automatic-ish" });
+        assert.equal(response.status, 400);
+        assert.isEmpty(yield* Ref.get(calls));
+      }),
+    ),
+  );
   it.effect("keeps the unguarded behavior", () =>
     withHarness(({ post, calls, dispatched, reads }) =>
       Effect.gen(function* () {

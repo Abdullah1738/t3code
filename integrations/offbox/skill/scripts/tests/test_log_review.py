@@ -41,7 +41,8 @@ class LoggingReview(Isolated):
         with patch.object(api,'call',return_value=status) as request:
             self.assertIs(api.cmd_status('bx_fixture',42),status)
         request.assert_called_once()
-        with patch.object(runs,'now',return_value=3600): runs.finish(row['run_id'],0,bookkeeping=False)
+        with patch.object(runs,'now',return_value=3600), patch.object(misc, '_catch_up_finished'):
+            runs.finish(row['run_id'],0,bookkeeping=False)
 
         row=self.command_row('run-pulls','fg',43)
         frame={'type':'exit','exitCode':0,'commandId':row['command_id'],

@@ -1,3 +1,5 @@
+// integrations/harness-hooks/src/statev2_guard.py::_isolated_migration_source proves this shape; run its tests after changes.
+
 import type * as Path from "effect/Path";
 
 /** Also serialized into the readonly export worker; keep runtime dependencies explicit. */

@@ -15,7 +15,7 @@ import {
   MessageId,
   type ModelSelection,
   type OrchestrationV2Command,
-  type OrchestrationV2StoredEvent,
+  OrchestrationV2CancelReason,
   type OrchestrationV2ThreadShell,
   ProjectId,
   ProviderApprovalDecision,
@@ -38,7 +38,6 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
-import * as Stream from "effect/Stream";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import { issueAttachmentUploadUrl } from "../../assets/AttachmentUpload.ts";
@@ -55,6 +54,8 @@ import * as ProviderRegistry from "../../provider/ProviderRegistry.ts";
 import * as ServerRuntimeStartup from "../../serverRuntimeStartup.ts";
 import * as ServerConfig from "../../config.ts";
 import * as ServerSettings from "../../serverSettings.ts";
+import * as ControlEvents from "./ControlEvents.ts";
+import * as Analytics from "../analytics/Analytics.ts";
 import * as ControlStore from "./ControlStore.ts";
 import * as ControlRequestAnalytics from "./ControlRequestAnalytics.ts";
 import * as ControlThreadRead from "./ControlThreadRead.ts";
@@ -71,7 +72,6 @@ import {
 import { CONTROL_ACTOR, controlActor, telegramAnswerOwner } from "./actor.ts";
 import {
   formatModel,
-  lastAssistantText,
   messageSummary,
   modelSelectionFrom,
   parseSince,
@@ -81,13 +81,11 @@ import {
   stateFromRuns,
   stateFromShell,
   TERMINAL_RUN_STATUSES,
-  type ControlThreadState,
 } from "./model.ts";
 import { messagePreview, providerTurnsSettled, runToolEvidence } from "./evidence.ts";
 import * as ReplyBuilders from "../http/ReplyBuilders.ts";
 
 export const CONTROL_ROUTE_PREFIX = "/api/ardud/control";
-const SSE_HEARTBEAT = Duration.seconds(15);
 const DEFAULT_LIST_LIMIT = 50;
 const MAX_LIST_LIMIT = 500;
 const DEFAULT_MESSAGE_LIMIT = 50;
@@ -358,6 +356,7 @@ const SendBody = Schema.Struct({
 
 const InterruptBody = Schema.Struct({
   reason: OptionalString,
+  cancelReason: Schema.optional(OrchestrationV2CancelReason),
   clientRequestId: OptionalString,
   expectedRunId: OptionalString,
   expectedAttemptId: OptionalString,
@@ -429,102 +428,8 @@ const DECISIONS: Record<string, ProviderApprovalDecision> = {
   always: "acceptForSession",
 };
 
-export type ControlEvent =
-  | {
-      readonly type: "thread.created";
-      readonly threadId: string;
-      readonly projectId: string;
-      readonly title: string;
-      readonly parentThreadId: string | null;
-    }
-  | {
-      readonly type: "thread.status";
-      readonly threadId: string;
-      readonly runId: string;
-      readonly status: string;
-      readonly state: ControlThreadState;
-    }
-  | {
-      readonly type: "message.completed";
-      readonly threadId: string;
-      readonly runId: string | null;
-      readonly messageId: string;
-      readonly role: string;
-      readonly text: string;
-    }
-  | {
-      readonly type: "request.opened" | "request.resolved";
-      readonly threadId: string;
-      readonly requestId: string;
-      readonly kind: "approval" | "question";
-      readonly requestKind: string;
-      readonly status: string;
-    }
-  | { readonly type: "thread.updated"; readonly threadId: string; readonly change: string };
-
-/** Maps one stored orchestration event onto the small set of events integrations act on. */
-export function controlEventFromStored(stored: OrchestrationV2StoredEvent): ControlEvent | null {
-  const event = stored.event;
-  switch (event.type) {
-    case "thread.created":
-      return {
-        type: "thread.created",
-        threadId: event.threadId,
-        projectId: event.payload.projectId,
-        title: event.payload.title,
-        parentThreadId: event.payload.lineage.parentThreadId,
-      };
-    case "run.created":
-    case "run.updated":
-      return {
-        type: "thread.status",
-        threadId: event.threadId,
-        runId: event.payload.id,
-        status: event.payload.status,
-        state: stateFromRuns([event.payload], false).state,
-      };
-    case "message.updated":
-      if (event.payload.streaming || event.payload.role === "system") return null;
-      if (event.payload.role === "assistant" && event.payload.text.trim().length === 0) return null;
-      return {
-        type: "message.completed",
-        threadId: event.threadId,
-        runId: event.payload.runId,
-        messageId: event.payload.id,
-        role: event.payload.role,
-        text: event.payload.text,
-      };
-    case "runtime-request.updated":
-      return {
-        type: event.payload.status === "pending" ? "request.opened" : "request.resolved",
-        threadId: event.threadId,
-        requestId: event.payload.id,
-        kind: event.payload.kind === "user_input" ? "question" : "approval",
-        requestKind: event.payload.kind,
-        status: event.payload.status,
-      };
-    case "thread.archived":
-    case "thread.unarchived":
-    case "thread.deleted":
-    case "thread.metadata-updated":
-    case "thread.runtime-mode-updated":
-    case "thread.interaction-mode-updated":
-    case "thread.model-selection-updated":
-    case "thread.provider-switched":
-    case "thread.settled":
-    case "thread.unsettled":
-      return { type: "thread.updated", threadId: event.threadId, change: event.type };
-    default:
-      return null;
-  }
-}
-
-const encoder = new TextEncoder();
-const encodeEventJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
-const sseFrame = (sequence: number, event: ControlEvent & { readonly origin?: string | null }) =>
-  `id: ${sequence}\nevent: ${event.type}\ndata: ${encodeEventJson(event)}\n\n`;
-
 const makeRoutes = Effect.gen(function* () {
+  const analytics = yield* Effect.serviceOption(Analytics.Analytics);
   const candidateBuildCommit = (yield* ServerConfig.ServerConfig).robobBuildCommit;
   const buildCommit =
     typeof candidateBuildCommit === "string" &&
@@ -698,11 +603,6 @@ const makeRoutes = Effect.gen(function* () {
           ? {}
           : { recentRunLimit: options.recentRunLimit }),
       })
-      .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
-
-  const readMessages = (threadId: string) =>
-    threads
-      .getThreadRecords(ThreadId.make(threadId), ["messages"])
       .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
 
   const filterByOrigin = Effect.fn("ControlHttp.filterByOrigin")(function* (
@@ -974,17 +874,21 @@ const makeRoutes = Effect.gen(function* () {
       return yield* fail("invalid_request", "active=true or active=false is required.");
     }
     // Pure reads: keep them off the single writer, as the board reads do.
-    const page = yield* recovery
-      .page({
-        active,
-        cursor: params.get("cursor") || null,
-        // The service applies the default and the 500 cap.
-        limit: Number(params.get("limit") ?? Number.NaN),
-      })
-      .pipe(
-        NodeSqliteClient.readOnly,
-        Effect.mapError((cause) => fail("internal", errorDetail(cause))),
-      );
+    const page = yield* ReplyBuilders.bounded(
+      recovery
+        .page({
+          active,
+          cursor: params.get("cursor") || null,
+          // The service applies the default and the 500 cap.
+          limit: Number(params.get("limit") ?? Number.NaN),
+        })
+        .pipe(
+          NodeSqliteClient.readOnly,
+          NodeSqliteClient.foregroundReads,
+          Effect.mapError((cause) => fail("internal", errorDetail(cause))),
+        ),
+      "controlRead",
+    );
     return json({ ok: true, threads: page.threads, nextCursor: page.nextCursor });
   });
 
@@ -1240,6 +1144,22 @@ const makeRoutes = Effect.gen(function* () {
         "since must be an ISO timestamp or epoch milliseconds.",
       );
     }
+    const role = params.get("role") ?? "user";
+    if (role !== "user" && role !== "assistant" && role !== "system" && role !== "all") {
+      return yield* fail("invalid_request", "role must be user, assistant, system or all.");
+    }
+    const rawThreadIds = params.get("threadIds");
+    const threadIds =
+      rawThreadIds === null ? undefined : rawThreadIds.split(",").map((id) => id.trim());
+    if (
+      threadIds !== undefined &&
+      (threadIds.length > 50 || threadIds.some((id) => id.length === 0))
+    ) {
+      return yield* fail(
+        "invalid_request",
+        "threadIds must contain between 1 and 50 nonempty thread ids.",
+      );
+    }
     const cursor = yield* decodeUserMessageCursor(params.get("cursor"));
     return yield* ReplyBuilders.bounded(
       Effect.gen(function* () {
@@ -1247,6 +1167,8 @@ const makeRoutes = Effect.gen(function* () {
           .userMessagesSince({
             since,
             cursor,
+            role,
+            ...(threadIds === undefined ? {} : { threadIds }),
             limit: clampInt(params.get("limit"), 200, 1000),
           })
           .pipe(
@@ -1501,6 +1423,7 @@ const makeRoutes = Effect.gen(function* () {
           commandId: yield* commandIdFor(`interrupt:${threadId}`, body.clientRequestId),
           threadId: shell.id,
           ...(body.reason === undefined ? {} : { reason: body.reason }),
+          ...(body.cancelReason === undefined ? {} : { cancelReason: body.cancelReason }),
           ...(expectedRunId === undefined ? {} : { runId: RunId.make(expectedRunId) }),
           ...(body.expectedAttemptId === undefined
             ? {}
@@ -1755,12 +1678,14 @@ const makeRoutes = Effect.gen(function* () {
       }
     }).pipe(Effect.timeoutOption(Duration.millis(timeoutMs)));
     const detail = yield* threadDetail(shell.id);
-    const records = yield* readMessages(threadId);
+    const lastAssistant = yield* store
+      .lastAssistant(threadId, runIdParam ?? detail.run?.runId ?? null)
+      .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
     return json({
       ok: true,
       timedOut: Option.isNone(waited),
       thread: detail,
-      lastAssistant: lastAssistantText(records.messages, runIdParam ?? detail.run?.runId),
+      lastAssistant,
     });
   });
 
@@ -1849,11 +1774,6 @@ const makeRoutes = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
     const request = yield* HttpServerRequest.HttpServerRequest;
     const params = yield* searchParams;
-    const resumeRaw = request.headers["last-event-id"] ?? params.get("after");
-    const resume =
-      resumeRaw === undefined || resumeRaw === null || resumeRaw === ""
-        ? Number.NaN
-        : Number(resumeRaw);
     const threadFilter = params.get("threadId");
     const originFilter = params.get("origin");
     const typeFilter = params.get("types")?.split(",").filter(Boolean);
@@ -1862,15 +1782,13 @@ const makeRoutes = Effect.gen(function* () {
       originCache.has(threadId)
         ? Effect.succeed(originCache.get(threadId) ?? null)
         : Effect.gen(function* () {
-            const own = yield* store.getOrigin(threadId).pipe(Effect.orElseSucceed(() => null));
+            const own = yield* store.getOrigin(threadId);
             let origin = own;
             if (origin === null) {
-              const shell = yield* threads
-                .getThreadShell(ThreadId.make(threadId))
-                .pipe(Effect.orElseSucceed(() => null));
+              const shell = yield* threads.getThreadShell(ThreadId.make(threadId));
               const rootId = shell?.lineage.rootThreadId;
               if (rootId !== undefined && rootId !== threadId) {
-                origin = yield* store.getOrigin(rootId).pipe(Effect.orElseSucceed(() => null));
+                origin = yield* store.getOrigin(rootId);
               }
             }
             // Origin rows can be written after a thread starts; only cache hits.
@@ -1878,43 +1796,57 @@ const makeRoutes = Effect.gen(function* () {
             return origin;
           });
 
-    // Without a cursor the stream starts at the live head instead of replaying history.
-    const afterSequence =
-      Number.isSafeInteger(resume) && resume >= 0
-        ? resume
-        : yield* eventStore.latestAgentSequence().pipe(Effect.orElseSucceed(() => 0));
-    const source = threads
-      .streamStoredEventsFrom({
-        afterSequence,
-        ...(threadFilter === null ? {} : { threadId: ThreadId.make(threadFilter) }),
-      })
-      .pipe(
-        Stream.mapEffect((stored) =>
-          Effect.gen(function* () {
-            const event = controlEventFromStored(stored);
-            if (event === null) return "";
-            if (typeFilter !== undefined && !typeFilter.includes(event.type)) return "";
-            const origin = yield* originOf(event.threadId);
-            if (originFilter !== null) {
-              const matches = originFilter === "none" ? origin === null : origin === originFilter;
-              if (!matches) return "";
-            }
-            return sseFrame(stored.sequence, { ...event, origin });
-          }),
-        ),
-        Stream.filter((frame) => frame.length > 0),
-      );
-    const hello = Stream.make(
-      `retry: 3000\nid: ${afterSequence}\nevent: ready\ndata: {"type":"ready","sequence":${afterSequence}}\n\n`,
+    const head = yield* eventStore
+      .latestAgentSequence()
+      .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+    const requestedStart = ControlEvents.streamStart(
+      request.headers["last-event-id"],
+      params.get("after"),
+      head,
     );
-    const heartbeats = Stream.tick(SSE_HEARTBEAT).pipe(
-      Stream.drop(1),
-      Stream.map(() => ": ping\n\n"),
-    );
-    const body = Stream.concat(hello, Stream.merge(source, heartbeats)).pipe(
-      Stream.catchCause(() => Stream.make(`event: error\ndata: {"type":"error"}\n\n`)),
-      Stream.map((frame) => encoder.encode(frame)),
-    );
+    const compacted = requestedStart.resumed
+      ? yield* store
+          .hasCompactedEvents(requestedStart.afterSequence, head)
+          .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))))
+      : false;
+    const start = compacted ? { afterSequence: head, resumed: false } : requestedStart;
+    const accepts = (stored: Parameters<typeof ControlEvents.controlEventFromStored>[0]) => {
+      const event = ControlEvents.controlEventFromStored(stored);
+      return event !== null && (typeFilter === undefined || typeFilter.includes(event.type));
+    };
+    const source = threads.streamStoredEventsFrom({
+      afterSequence: start.afterSequence,
+      ...(threadFilter === null ? {} : { threadId: ThreadId.make(threadFilter) }),
+      // Drop streaming deltas before projection and the bounded live queue.
+      filter: accepts,
+      ...(start.resumed
+        ? {
+            verifyReplay: (throughSequence: number) =>
+              store
+                .hasCompactedEvents(start.afterSequence, throughSequence)
+                .pipe(
+                  Effect.flatMap((missing) =>
+                    missing
+                      ? Effect.fail(new ControlEvents.ControlHistoryCompactedError())
+                      : Effect.void,
+                  ),
+                ),
+          }
+        : {}),
+    });
+    // Subscribe before catch-up; replay covers > cursor through the captured head,
+    // then live covers > head. A resumed connection can apply incrementally with
+    // the same filters. Compacted history resets to the head with resumed:false;
+    // compaction racing catch-up fails with history_compacted (refetch required).
+    const body = yield* ControlEvents.makeBody({
+      source,
+      ...start,
+      threadFilter,
+      originFilter,
+      accepts,
+      originOf,
+      analytics: Option.getOrUndefined(analytics),
+    });
     return HttpServerResponse.stream(body, {
       contentType: "text/event-stream",
       headers: {

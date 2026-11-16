@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from janitor_test_safety import JanitorTestCase
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
@@ -130,7 +131,7 @@ def thread(i):
     return {"threadId": f"thread-{i:04d}", "state": "running", "worktreePath": f"/work/t{i}"}
 
 
-class ActiveSetTests(unittest.TestCase):
+class ActiveSetTests(JanitorTestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -240,7 +241,7 @@ class ActiveSetTests(unittest.TestCase):
 NOW_MS = 1_800_000_000_000  # a fixed clock, so the native window's cut is exact
 
 
-class TwoQueryActiveSetTests(unittest.TestCase):
+class TwoQueryActiveSetTests(JanitorTestCase):
     """Both the non-idle and recent provider/MCP queries must be complete."""
 
     def setUp(self):
@@ -396,7 +397,7 @@ class TwoQueryActiveSetTests(unittest.TestCase):
         self.assertTrue(any("active" in p for p in snap["problems"]), snap["problems"])
 
 
-class RootWorkspaceTests(unittest.TestCase):
+class RootWorkspaceTests(JanitorTestCase):
     """A thread on a project's root workspace has worktreePath null. Its checkout is still in use."""
 
     def setUp(self):
@@ -465,7 +466,7 @@ class RootWorkspaceTests(unittest.TestCase):
         self.assertEqual(len(projects_reads), 1, stub.requests)
 
 
-class JanitorKeepsEverythingTests(unittest.TestCase):
+class JanitorKeepsEverythingTests(JanitorTestCase):
     """An incomplete active set must keep every resource and every worktree, never reap."""
 
     def test_dev_janitor_scan_keeps_every_resource_when_the_snapshot_is_incomplete(self):
@@ -561,7 +562,7 @@ class JanitorKeepsEverythingTests(unittest.TestCase):
 
 
 
-class ControlPaginationTests(unittest.TestCase):
+class ControlPaginationTests(JanitorTestCase):
     query = '/threads?projectId=p&includeSubagents=true&limit=500&updatedSince=10'
 
     def row(self, tid, updated='2026-11-01T00:00:00Z', **fields):

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { PATHS, loadState, saveState } from '../lib/io.mjs';
+import { PATHS, loadStallState, saveStallState } from '../lib/io.mjs';
 import { fingerprint, stallId } from '../lib/stall.mjs';
 import { stallScan } from '../lib/stallwatch.mjs';
 
@@ -117,15 +117,15 @@ test('first stall is recovered and persisted silently; a distinct later stall of
     let state = freshState();
     const first = watch(state, 'ses_a');
     await scan(state, fake, T0);
-    assert.deepEqual(fake.calls.interrupt, [{ id: 'thread:A', clientRequestId: first, reason: 'stall watch: waiting on the model', expectedRunId: 'run:ses_a' }]);
+    assert.deepEqual(fake.calls.interrupt, [{ id: 'thread:A', clientRequestId: first, reason: 'stall watch: waiting on the model', expectedRunId: 'run:ses_a', cancelReason: 'task_stalled' }]);
     fake.active([]);
     a.activeRunId = null;
     await scan(state, fake, T0 + MIN);
     assert.equal(fake.calls.note.length, 1);
     assert.equal(fake.calls.telegram.length, 0);
     assert.equal(state.stalls[first].alertEligible, false);
-    saveState(state, T0 + MIN);
-    state = loadState();
+    saveStallState(state, T0 + MIN);
+    state = loadStallState();
     a.nativeSessionId = 'ses_b';
     a.activeRunId = 'run:ses_b';
     const second = watch(state, 'ses_b', T0 - 29 * MIN);
@@ -228,8 +228,8 @@ test('failed Telegram sends retry three times with the same key across reloads',
     state.stalls.current = record('ses_b', 'thread:A', T0, { alertOwnerId: 'thread:A', alertPending: true });
     for (let i = 0; i < 4; i++) {
       await scan(state, fake, T0 + (i + 1) * MIN);
-      saveState(state, T0 + (i + 1) * MIN);
-      state = loadState();
+      saveStallState(state, T0 + (i + 1) * MIN);
+      state = loadStallState();
     }
     assert.equal(fake.calls.telegram.length, 3);
     assert.deepEqual(new Set(fake.calls.telegram.map((x) => x.key)), new Set(['stream-recovery:current']));

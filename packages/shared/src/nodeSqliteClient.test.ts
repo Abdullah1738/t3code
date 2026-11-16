@@ -21,6 +21,7 @@ import * as Tracer from "effect/Tracer";
 import { vi } from "vite-plus/test";
 
 import * as SqliteClient from "./nodeSqliteClient.ts";
+import { normalizeSql } from "./sqlDiagnostics.ts";
 
 const startedWorkers = vi.hoisted((): Array<NodeWorkerThreads.Worker> => []);
 const writerWorkers = vi.hoisted((): Array<NodeWorkerThreads.Worker> => []);
@@ -2910,8 +2911,10 @@ it.effect(
           yield* countEntries(sql).pipe(SqliteClient.readOnly);
           const startedBefore = startedWorkers.length;
           // About 30 s of work, far past the 1.5 s limit.
+          const stuckQuery =
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 400000000) SELECT max(x) AS last FROM c";
           const stuck = yield* Effect.forkChild(
-            slowRead(sql, 400_000_000).pipe(SqliteClient.readOnly, Effect.flip),
+            sql.unsafe(stuckQuery).pipe(SqliteClient.readOnly, Effect.flip),
           );
           yield* realPause(100);
           const queued = yield* Effect.forkChild(countEntries(sql).pipe(SqliteClient.readOnly));
@@ -2926,7 +2929,7 @@ it.effect(
             JSON.stringify(warning).includes("SQLite reader statement is slow"),
           );
           // The warning names the statement, so a stall can be traced to its query.
-          assert.include(JSON.stringify(slow), "WITH RECURSIVE c(x)");
+          assert.include(JSON.stringify(slow), normalizeSql(stuckQuery));
         }),
       logger,
     );

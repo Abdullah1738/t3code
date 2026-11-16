@@ -1347,6 +1347,11 @@ describe("checkWait", () => {
     expect(reason(running, request({ on: "ci" }), worker, true)).toContain(
       "Waiting on CI for a PR: call watch_pull_request",
     );
+    expect(checkWait(running, request({ on: "ci" }), worker, NOW, true)).toMatchObject({
+      ok: false,
+      code: "denied",
+      denyReason: "active_worker_cannot_wait",
+    });
   });
 
   it.each([

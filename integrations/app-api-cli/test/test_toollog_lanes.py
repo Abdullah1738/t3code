@@ -28,6 +28,12 @@ class LaneLogs(unittest.TestCase):
             rows = [json.loads(line) for p in (Path(temp)/'orders').glob('*.ndjson') for line in p.read_text().splitlines()]
             for row in rows:
                 if row['name'].startswith(('provider.', 'track.')):
+                    if row['name'].startswith('provider.'):
+                        self.assertIn(row['props']['caller'], {'money-cases', 'order-watch', 'commerce-cmd', 'delivery-card', 'other'})
+                        self.assertIn('trigger', row['props'])
+                        if row['name'] == 'provider.orders':
+                            self.assertIs(type(row['props']['pagesFetched']), int)
+                            self.assertIs(type(row['props']['rowsReturned']), int)
                     self.assertIn(row['props']['merchant'], {'noon', 'careem', 'amazon', 'uber', 'other', 'unknown'})
             return rows
 

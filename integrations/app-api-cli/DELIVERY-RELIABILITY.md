@@ -71,6 +71,8 @@ SMS/email evidence. An absent bank alert does not authorize another payment.
   retained 30 days, source health, reconciliation records. Mode 0600.
 - `delivery-source-health`: 60s robob-watch check, expires 7 Oct 2027. Existing
   failure escalation wakes repair and alerts rather than remaining silent.
+  Live phone priority-holds defer collection without failing health; dead holders,
+  expired matching leases or holds older than 60 minutes fail health. Collection never bypasses or removes a hold.
 - Existing per-order watchers keep their cursors. Context migration changes
   routing to arrival-only and asks Abdullah for actual arrival once per order.
 - ID-less delivery-window pushes wake verification, never certify arrival.

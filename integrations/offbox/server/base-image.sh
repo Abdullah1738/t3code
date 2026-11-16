@@ -9,7 +9,12 @@ apt-get update -qq
 apt-get install -y -qq --no-install-recommends openssh-server sudo ca-certificates curl wget gnupg git rsync jq \
   build-essential pkg-config make unzip zip xz-utils zstd file less vim-tiny procps psmisc lsof iproute2 \
   iputils-ping dnsutils python3 python3-venv python3-pip python3-dev tzdata locales util-linux tmux htop \
-  fuse-overlayfs >/dev/null
+  fuse-overlayfs openjdk-21-jdk-headless sqlite3 >/dev/null
+bash /root/offbox-sqlite.sh
+rm -f /root/offbox-sqlite.sh /root/fetch.sh
+update-alternatives --set java /usr/lib/jvm/java-21-openjdk-amd64/bin/java
+update-alternatives --set javac /usr/lib/jvm/java-21-openjdk-amd64/bin/javac
+javac -version 2>&1 | grep -q '^javac 21\.' || { echo 'offbox template: javac 21 missing' >&2; exit 1; }
 locale-gen en_US.UTF-8 >/dev/null
 
 id user >/dev/null 2>&1 || { userdel -r ubuntu 2>/dev/null || true; useradd -m -u 1000 -s /bin/bash user; }

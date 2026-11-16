@@ -27,7 +27,7 @@ function deps() {
   return { account, ledger, venice };
 }
 
-const egressOk = defaultEgressCheck(cfg);
+const egressOk = defaultEgressCheck(cfg, log);
 
 async function needEgress() {
   if (!(await egressOk())) {

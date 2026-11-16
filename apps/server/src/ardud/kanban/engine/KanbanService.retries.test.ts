@@ -18,6 +18,7 @@ import * as TestClock from "effect/testing/TestClock";
 
 import {
   KanbanError,
+  KanbanScriptId,
   kanbanRetryNotBefore,
   kanbanRetrying,
   kanbanWaiting,
@@ -42,12 +43,14 @@ import * as KanbanStore from "../store/KanbanStore.ts";
 import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
 import * as KanbanModels from "./models.ts";
 import * as KanbanService from "./KanbanService.ts";
+import * as BoardLocks from "./boardLocks.ts";
 import * as Retries from "./retries.ts";
 import * as Rules from "./rules.ts";
 import { effortOptionId } from "@t3tools/client-runtime/ardud/models/harnessRouting";
 import * as Waits from "./waits.ts";
 import { opencodeTestProvider } from "./testProviders.ts";
 import { KanbanThreads, type KanbanThreadView } from "./threads.ts";
+import { ownerReplyPending } from "./ownerReplyWake.ts";
 
 type Failure = OrchestrationV2ProviderFailure & {
   readonly runId?: string | null;
@@ -136,6 +139,7 @@ const makeFake = () => {
                 model: later.model,
               };
         }),
+      backgroundStoppedSince: () => Effect.succeed(false),
       runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       launch: (input) =>
@@ -778,6 +782,40 @@ it.effect.each(["running", "idle"] as const)(
         }
       }).pipe(Effect.provide(testLayer(fake.layer)));
     }),
+);
+
+it.effect("a script post keeps its reply reminder without an owner message", () =>
+  Effect.gen(function* () {
+    const fake = makeFake();
+    yield* Effect.gen(function* () {
+      const { kanban, card, thread } = yield* workingCard;
+      const store = yield* KanbanStore.KanbanStore;
+      const discussion = yield* kanban.cardDiscussion(card.id);
+      const script = { _tag: "script" as const, scriptId: KanbanScriptId.make("script-reminder") };
+      yield* kanban.post(discussion.id, script, [{ _tag: "md", text: "Please check this result" }]);
+      assert.isNull(yield* store.ownerReply(discussion.id, thread, false));
+      const action = yield* ownerReplyPending(store, discussion.id, thread);
+      assert.isNotNull(action);
+      yield* kanban.post(discussion.id, { _tag: "system", component: "scribe" }, [
+        { _tag: "md", text: "Status" },
+      ]);
+      const sent = fake.messages(thread).length;
+      yield* kanban.turnEnded(thread);
+      assert.deepStrictEqual(fake.messages(thread).slice(sent), [
+        `The owner is waiting for your reply in discussion ${discussion.id}. Post it with discussion_post.`,
+      ]);
+      assert.strictEqual(yield* ownerReplyPending(store, discussion.id, thread), action);
+      yield* kanban.post(discussion.id, { _tag: "thread", threadId: thread }, [
+        { _tag: "md", text: "Checked" },
+      ]);
+      assert.isNull(yield* ownerReplyPending(store, discussion.id, thread));
+      yield* kanban.post(discussion.id, script, [
+        { _tag: "md", text: "Please check the next result" },
+      ]);
+      assert.isNotNull(yield* ownerReplyPending(store, discussion.id, thread));
+      assert.notStrictEqual(yield* ownerReplyPending(store, discussion.id, thread), action);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
 );
 
 it.effect.each(["retry", "wait"] as const)(
@@ -2462,6 +2500,148 @@ it.effect(
     }).pipe(Effect.provide(testLayer(fake.layer)));
   },
 );
+
+it.effect.each([false, true])(
+  "#1573 claim recovery conflict committed=%s preserves the recovery outcome",
+  (committed) => {
+    const fake = makeFake();
+    let target: KanbanCard["id"] | undefined;
+    let targetFiber: number | undefined;
+    let conflicts = 0;
+    const faulted = Layer.effect(
+      KanbanStore.KanbanStore,
+      Effect.map(KanbanStore.KanbanStore, (store) =>
+        KanbanStore.KanbanStore.of({
+          ...store,
+          card: (id) =>
+            Effect.gen(function* () {
+              const card = yield* store.card(id);
+              if (
+                !committed &&
+                id === target &&
+                (yield* Effect.fiberId) === targetFiber &&
+                conflicts === 0 &&
+                card?.stalled?.runFailure
+              ) {
+                conflicts++;
+                yield* store.putCard({ ...card, description: "Concurrent edit" });
+                return yield* Effect.die(new BoardLocks.BoardStateChanged(false));
+              }
+              return card;
+            }),
+          putCard: (card) =>
+            Effect.gen(function* () {
+              yield* store.putCard(card);
+              if (
+                committed &&
+                card.id === target &&
+                (yield* Effect.fiberId) === targetFiber &&
+                conflicts === 0 &&
+                card.stalled === null
+              ) {
+                conflicts++;
+                return yield* Effect.die(new BoardLocks.BoardStateChanged(true));
+              }
+            }),
+        }),
+      ),
+    ).pipe(Layer.provide(KanbanStore.layer));
+    return Effect.gen(function* () {
+      const { kanban, board, card, thread, now } = yield* workingCard;
+      yield* kanban.turnEnded(thread, {
+        runId: "expired",
+        reason: "Restart admission expired",
+        restartAdmission: true,
+      });
+      assert.isNotNull((yield* now).card.stalled?.runFailure);
+      const next = yield* kanban.createCard(board.id, { prompt: "Next", title: "Next" }, owner);
+      yield* fake.start(thread);
+      target = card.id;
+      targetFiber = yield* Effect.fiberId;
+      const result = yield* Effect.result(kanban.claimCard(thread, next.id));
+      assert.strictEqual(conflicts, 1);
+      if (committed) {
+        assert.strictEqual(result._tag, "Failure");
+        if (result._tag === "Failure") {
+          assert.strictEqual(result.failure.code, "conflict");
+          assert.include(result.failure.detail, "may have been applied");
+        }
+        assert.strictEqual((yield* kanban.card(next.id)).card.stage, "todo");
+      } else {
+        assert.strictEqual(result._tag, "Success");
+        if (result._tag === "Success") {
+          assert.strictEqual(result.success.card.id, next.id);
+          assert.strictEqual(result.success.card.workThreadId, thread);
+        }
+        assert.strictEqual((yield* now).card.description, "Concurrent edit");
+      }
+      const recovered = yield* now;
+      assert.isNull(recovered.card.stalled);
+      assert.strictEqual(recovered.card.stage, "working");
+      assert.lengthOf(
+        recovered.events.filter((event) => event.body?.startsWith("Cleared run-failed stall")),
+        1,
+      );
+    }).pipe(Effect.provide(testLayer(fake.layer, faulted)));
+  },
+);
+
+it.effect("#1573 claim retries a concurrent edit during the recovery run read", () => {
+  const fake = makeFake();
+  let concurrentEdit: Effect.Effect<void> | undefined;
+  let recoveryReads = 0;
+  const racing = Layer.effect(
+    KanbanThreads,
+    Effect.map(KanbanThreads, (threads) =>
+      KanbanThreads.of({
+        ...threads,
+        latestRun: (threadId, afterRunId) =>
+          Effect.gen(function* () {
+            if (concurrentEdit !== undefined) {
+              const edit = concurrentEdit;
+              concurrentEdit = undefined;
+              yield* edit.pipe(Effect.forkChild, Effect.flatMap(Fiber.join));
+            }
+            recoveryReads++;
+            return yield* threads.latestRun(threadId, afterRunId);
+          }),
+      }),
+    ),
+  ).pipe(Layer.provide(fake.layer));
+  return Effect.gen(function* () {
+    const { kanban, board, card: first, thread } = yield* workingCard;
+    const carried = yield* kanban.createCard(
+      board.id,
+      { prompt: "Carried", title: "Carried" },
+      owner,
+    );
+    const { card } = yield* kanban.claimCard(thread, carried.id);
+    const now = kanban.card(card.id);
+    yield* kanban.turnEnded(thread, {
+      runId: "expired",
+      reason: "Restart admission expired",
+      restartAdmission: true,
+    });
+    yield* kanban.flagCard(first.id, "Investigation", owner);
+    const next = yield* kanban.createCard(board.id, { prompt: "Next", title: "Next" }, owner);
+    yield* fake.start(thread);
+    recoveryReads = 0;
+    concurrentEdit = kanban
+      .editCard(card.id, { description: "Concurrent recovery edit" }, owner)
+      .pipe(Effect.asVoid, Effect.orDie);
+    const claimed = yield* kanban.claimCard(thread, next.id);
+    assert.strictEqual(claimed.card.workThreadId, thread);
+    assert.strictEqual(recoveryReads, 2);
+    const recovered = yield* now;
+    assert.isNull(recovered.card.stalled);
+    assert.strictEqual(recovered.card.description, "Concurrent recovery edit");
+    assert.strictEqual((yield* kanban.card(first.id)).card.stalled?.reason, "Investigation");
+    assert.lengthOf(
+      recovered.events.filter((event) => event.body?.startsWith("Cleared run-failed stall")),
+      1,
+    );
+  }).pipe(Effect.provide(testLayer(racing)));
+});
 
 it.effect.each(["deadline notification", "duplicate terminal notification"] as const)(
   "a successor promoted during %s cannot disappear between reads",

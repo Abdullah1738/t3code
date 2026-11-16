@@ -33,6 +33,8 @@ describe("standard-mode policy", () => {
     const text = source.replace(/\\(["'])/g, "$1");
     expect(text).not.toMatch(/["']?fastMode["']?\s*:\s*true/);
     expect(text).not.toMatch(/["']?serviceTier["']?\s*:\s*["']priority["']/);
+    expect(text).not.toMatch(/["']?effort["']?\s*:\s*["']max["']/);
+    expect(text).not.toMatch(/["']?reasoningEffort["']?\s*:\s*["']max["']/);
     expect(text).toContain("Standard mode only");
     expect(text).toContain("never fast mode");
   });

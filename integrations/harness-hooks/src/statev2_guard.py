@@ -422,11 +422,27 @@ def _python_touches_live(source, directory, replica=False):
 
 def _trusted_fixture_tool(executable, name, directory):
     trusted = {f'/bin/{name}', f'/usr/bin/{name}'}
+    if name == 'node':
+        trusted.add('/usr/local/bin/node')
+    system_paths = set(trusted)
+    if name in {'node', 'bash'}:
+        def root_owned(path):
+            try:
+                path = Path(os.path.realpath(path))
+                return all((info := os.stat(part)).st_uid == 0 and not info.st_mode & 0o022 for part in (path, *path.parents))
+            except Exception:
+                return False
+        trusted = {path for path in trusted if root_owned(path)}
     # This Mac's default Bash is Homebrew's versioned package, not /bin/bash.
     if name == 'bash':
         brew = '/opt/homebrew/bin/bash'
         if re.fullmatch(r'/opt/homebrew/Cellar/bash/[^/]+/bin/bash', os.path.realpath(brew)):
             trusted.add(brew)
+    if name == 'node':
+        for candidate in (executable, shutil.which(name)):
+            if candidate and candidate not in system_paths and os.path.isabs(candidate) and (re.fullmatch(r'/opt/homebrew/Cellar/node(?:@\d+)?/[^/]+/bin/node', os.path.realpath(candidate)) or
+                              re.fullmatch(re.escape(str(Path.home() / '.nvm/versions/node')) + r'/v\d+\.\d+\.\d+/bin/node', os.path.realpath(candidate))):
+                trusted.add(candidate)
     if executable in trusted:
         return True
     if executable != name:
@@ -1538,10 +1554,108 @@ def _replica_reader_source(source):
     return source
 
 
+def _strip_config_dir_db_names(source, directory):
+    # A tool's own ~/.config/<tool>/state.sqlite deny list is not Robob's live state.
+    if 'state.sqlite' not in source or '.config' not in source:
+        return source
+    # A config basename may still be opened relative to the live working directory.
+    if directory is not None and any(LIVE.search(str(Path(directory).resolve() / name))
+                                     for name in ('state.sqlite', 'statev2.sqlite', 'opencode.db')):
+        return source
+    string = r'''(?:"[^"\\\n]*"|'[^'\\\n]*')'''
+    database = r'''(?:"state\.sqlite(?:-(?:wal|shm|journal))?"|'state\.sqlite(?:-(?:wal|shm|journal))?')'''
+    join = r'(?<![\w$.])(?:path\.join|join|resolve)\s*\(\s*(?:os\.)?homedir\s*\(\s*\)\s*,\s*'
+    config = r'''(?:"\.config"|'\.config')\s*,\s*(?P<tool>''' + string + r')\s*,\s*'
+    quoted = r'''//[^\n]*|/\*[\s\S]*?\*/|"(?:[^"\\]|\\[\s\S])*"|'(?:[^'\\]|\\[\s\S])*'|`(?:[^`\\]|\\[\s\S])*`'''
+    identifier = r'[A-Za-z_$][\w$]*'
+
+    def fixed_uses(match, array=False):
+        # Stored names retain evidence unless every use keeps the fixed config path.
+        declaration = re.search(r'\bconst\s+(' + identifier + r')\s*=\s*$', code[:match.start()])
+        if not declaration or not re.match(r'\s*;', code[match.end():]):
+            return False
+        for use in re.finditer(r'(?<![\w$])' + re.escape(declaration[1]) + r'(?![\w$])', source):
+            if use.span() == declaration.span(1):
+                continue
+            if not array:
+                return False
+            if re.match(r'\s*\.\s*includes\s*\(', code[use.end():]):
+                continue
+            loop = re.search(r'\bfor\s*\(\s*const\s+(' + identifier + r')\s+of\s*$', code[:use.start()])
+            opening = re.match(r'\s*\)\s*\{', code[use.end():])
+            if not loop or not opening or not fixed_stat():
+                return False
+            start = end = use.end() + opening.end()
+            depth = 1
+            while end < len(code) and depth:
+                depth += (code[end] == '{') - (code[end] == '}')
+                end += 1
+            if depth:
+                return False
+            for item in re.finditer(r'(?<![\w$])' + re.escape(loop[1]) + r'(?![\w$])', source[start:end - 1]):
+                at, after = start + item.start(), start + item.end()
+                if (not re.search(r'(?<![\w$.])stat\s*\(\s*$', code[start:at]) or
+                        not re.match(r'\s*[,)]', code[after:])):
+                    return False
+        return True
+
+    def fixed_stat():
+        imports = [item for item in re.finditer(r'''\bimport\s*\{[^{}]*\bstat\b[^{}]*\}\s*from\s*(["'])node:fs/promises\1''', source)
+                   if code[item.start():].startswith('import')]
+        for use in re.finditer(r'\bstat\b', source):
+            if any(item.start() <= use.start() < item.end() and
+                   re.search(r'(?:\{|,)\s*stat\s*(?:,|\})', item[0]) for item in imports):
+                continue
+            if code[:use.start()].rstrip().endswith('.') and re.match(r'\s*\(', code[use.end():]):
+                continue
+            if (not imports or not re.match(r'\s*\(', code[use.end():]) or
+                    re.search(r'\bfunction\s*\*?\s*$', code[:use.start()])):
+                return False
+        return bool(imports)
+
+    def safe_tool(value):
+        return (bool(re.fullmatch(r'[A-Za-z0-9_.-]+', value)) and value not in {'.', '..'} and
+                value.lower() not in {'robob', 't3', 't3code', 'opencode', 'robob-data', 'opencode-data'})
+
+    def operand(match):
+        if match['names'] is None:
+            return literal(match)
+        if (not safe_tool(match['tool'][1:-1]) or LIVE.search(match[0]) or
+                not fixed_uses(match, array=match[0].startswith('['))):
+            return match[0]
+        start, end = match.span('names')
+        names = re.sub(string, lambda item: "''" if re.fullmatch(database, item[0]) else item[0], match['names'])
+        return (match[0][:start - match.start()] + names +
+                match[0][end - match.start():])
+
+    array = (r'\[(?P<names>\s*' + string + r'(?:\s*,\s*' + string + r')*\s*,?\s*)\]\s*'
+             r'\.map\(\s*(?P<param>[A-Za-z_$][\w$]*)\s*=>\s*' + join + config +
+             r'(?P=param)\s*\)\s*\)')
+    def literal(match):
+        if match[0][0] not in "\"'":
+            return match[0]
+        value = match[0][1:-1]
+        path = re.fullmatch(r'(?:~/|/(?:[^/]+/)*)\.config/([^/]+)/state\.sqlite(?:-(?:wal|shm|journal))?', value)
+        if (path and safe_tool(path[1]) and '..' not in value.split('/') and
+                not any(char in value for char in ('\\', '$', '*', '?', '[')) and not LIVE.search(value) and
+                fixed_uses(match)):
+            return "''"
+        return match[0]
+
+    # Prototype access can replace membership checks or iteration with a reader.
+    if re.search(r'\b(?:prototype|__proto__|getPrototypeOf|setPrototypeOf)\b', source):
+        return source
+    code = re.sub(quoted, lambda match: ' ' * len(match[0]), source)
+    source = re.sub(array + '|' + quoted, operand, source)
+    code = re.sub(quoted, lambda match: ' ' * len(match[0]), source)
+    return re.sub(join + config + r'(?P<names>' + database + r')\s*\)|' + quoted, operand, source)
+
+
 def _source_hit(source, directory, python=False, shell=False):
     # Inspect the original body, including literals/comments, never its path or argv.
     discount_foreign = not PROTECTED_SOURCE_TOKEN.search(source)
-    if discount_foreign and 'state.sqlite' in source and _foreign_reader_shadowed(source):
+    foreign_source = _strip_config_dir_db_names(source, directory) if not python else source
+    if discount_foreign and 'state.sqlite' in foreign_source and _foreign_reader_shadowed(source):
         return True
     # Keep the root evidence so the replica cannot hide a second database name.
     replica = REPLICA.search(source)
@@ -1592,10 +1706,70 @@ def _source_hit(source, directory, python=False, shell=False):
     return bool(database and (live_root or home_userdata))
 
 
-def _isolated_migration_source(source, directory):
+def _isolated_migration_history_helpers(location):
+    # These are the only imported helpers that select history files. Read the
+    # checkout being inspected, never a helper from the guard's own checkout.
+    root = Path(os.path.realpath(location)).parent.parent / 'src/ardud/persistence'
+
+    def reject(name):
+        raise LiveRead('live-database-script', f"{root / name}: guard's module pin needs re-auditing; isolated migration refused.")
+
+    bodies = []
+    for name in ('historySourceFiles.ts', 'historyArchiveSql.ts'):
+        try:
+            with (root / name).open('rb') as handle:
+                info = os.fstat(handle.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_SOURCE_BYTES:
+                    reject(name)
+                body = handle.read(MAX_SOURCE_BYTES + 1)
+            if len(body) > MAX_SOURCE_BYTES:
+                reject(name)
+            bodies.append(body.decode('utf-8'))
+        except (OSError, UnicodeError):
+            reject(name)
+    history, archive = bodies
+    # A whole-helper shape proves the basename check and the source-directory
+    # join together; accepting the return expression alone could hide a write.
+    expected = r'''// integrations/harness-hooks/src/statev2_guard.py::_isolated_migration_source proves this shape; run its tests after changes.
+
+import type * as Path from "effect/Path";
+
+/** Also serialized into the readonly export worker; keep runtime dependencies explicit. */
+export function resolveHistoryBasePath(
+  path: Pick<Path.Path, "dirname" | "basename" | "join">,
+  sourcePath: string,
+  rows: ReadonlyArray<{ readonly filename: unknown }>,
+) {
+  if (rows.length === 0) return undefined;
+  const filename = rows[0]!.filename;
+  if (
+    rows.length !== 1 ||
+    typeof filename !== "string" ||
+    !/^statev2\.pre-shrink-[^/\\]+\.sqlite$/.test(filename) ||
+    path.basename(filename) !== filename
+  )
+    throw new Error("Invalid readonly history base filename");
+  return path.join(path.dirname(sourcePath), filename);
+}'''
+    if history.strip() != expected:
+        reject('historySourceFiles.ts')
+    # Node executes the entire imported module. Pin the audited SQL-only body,
+    # including imports and initializers: a safe archiveFilename alone cannot
+    # discharge extra runtime I/O. Re-audit the whole module before changing it.
+    if hashlib.sha256(archive.encode('utf-8')).hexdigest() != 'cc4ac6791b0764fc1c33f89fb8682bfbb795f14a5b007efbe53e5454a566400e':
+        reject('historyArchiveSql.ts')
+    archive_name = r'export const archiveFilename = \(filename: string\) =>\s*NodePath\.join\(NodePath\.dirname\(filename\), "archive\.sqlite"\);'
+    return len(re.findall(archive_name, archive)) == 1
+
+
+def _isolated_migration_source(source, directory, location):
     # Discharge the one default-source expression only after the caller has
     # supplied isolated --source and --base-dir arguments. All other source
     # text still goes through the live-path check.
+    # A literal home root can assemble a second live path after the default
+    # is discharged, even when its segments escape the ordinary source scan.
+    if re.search(r'''['"`]/(?:Users|home|root|var/root|private)(?=/|['"`])''', source):
+        return False
     default = re.compile(r'const sourcePath = path\.resolve\(\s*input\.source \?\? path\.join\(sharedHome, "userdata", "statev2\.sqlite"\),\s*\);')
     if len(default.findall(source)) != 1 or source.count('NodeOS.homedir()') != 1:
         return False
@@ -1615,13 +1789,52 @@ def _isolated_migration_source(source, directory):
     options = r'Command\.make\(\s*"migrate-dev-db",\s*\{\s*' + integer('projects', 'projects') + r'\s*' + integer('threadsPerProject', 'threads-per-project') + r'\s*' + string('baseDir', 'base-dir') + r'\s*' + string('source', 'source') + r'\s*\},\s*' + callback.pattern
     if len(re.findall(options, source)) != 1:
         return False
-    # The source argument must reach the sole ATTACH, and every SQLite client
+    # The source argument must reach the read-only ATTACHes, and every SQLite client
     # must open a destination. An isolated CLI flag proves neither by itself.
     if len(re.findall(r'\bcopySourceSlice\b', source)) != 2 or len(re.findall(r'copySourceSlice\(sourcePath\)', source)) != 1:
         return False
-    attach = 'ATTACH DATABASE ${`${NodeURL.pathToFileURL(sourcePath).href}?mode=ro`} AS src'
-    if source.count(attach) != 1 or len(re.findall(r'\bATTACH\b', source)) != 1:
+    attaches = [f'ATTACH DATABASE ${{`${{NodeURL.pathToFileURL({operand}).href}}?mode=ro`}} AS {schema}'
+                for operand, schema in (('sourcePath', 'src'), ('archivePath', 'cold'), ('basePath', 'base'))]
+    if any(source.count(attach) != 1 for attach in attaches) or len(re.findall(r'\bATTACH\b', source)) != 3:
         return False
+    copy_start = 'const copySourceSlice = Effect.fn("copyDevDbSourceSlice")(function* (sourcePath: string) {'
+    if source.count(copy_start) != 1:
+        return False
+    copy_body = source.split(copy_start, 1)[1].split('\nconst pruneSnapshot =', 1)[0]
+    if any(attach not in copy_body for attach in attaches):
+        return False
+    if not _isolated_migration_history_helpers(location):
+        return False
+    # Remove complete, proven derivations before checking every remaining use.
+    # An extra alias, mutation, reader or writer of either history path fails.
+    history_uses = source
+    history_forms = (
+        r'import \{ resolveHistoryBasePath \} from "../src/ardud/persistence/historySourceFiles\.ts";',
+        r'import \{\s*archiveFilename,\s*HISTORY_TABLES,\s*liveColumns,\s*\} from "../src/ardud/persistence/historyArchiveSql\.ts";',
+        r'const archivePath = archiveFilename\(sourcePath\);',
+        r'const archivePath = `\$\{archiveFilename\(databasePath\)\}\$\{suffix\}`;',
+        r'const baseRows = hasTable\("ardud_history_base_archive"\)\s*\? yield\* sql<\{\s*filename: string;\s*\}>`SELECT filename FROM src\.ardud_history_base_archive LIMIT 2`\s*: \[\];',
+        r'const basePath = yield\* Effect\.try\(\{\s*try: \(\) => resolveHistoryBasePath\(path, sourcePath, baseRows\),\s*catch: \(\) =>\s*new MigrateDevDbHistoryArchiveError\(\{\s*sourcePath,\s*archivePath: sourcePath,\s*reason: "invalid-base",\s*\}\),\s*\}\);',
+    )
+    for form in history_forms:
+        if len(re.findall(form, history_uses)) != 1:
+            return False
+        history_uses = re.sub(form, '', history_uses)
+    for attach in attaches:
+        history_uses = history_uses.replace(attach, '')
+    history_uses = re.sub(r'new MigrateDevDbHistoryArchiveError\(\{\s*sourcePath,\s*archivePath(?:: basePath)?,\s*reason: "(?:missing|identity-mismatch)",\s*\}\)|new MigrateDevDbDestinationArchiveError\(\{ databasePath, archivePath \}\)', 'guard_history_error', history_uses)
+    history_uses = re.sub(r'\barchivePath: Schema\.String|\bthis\.archivePath\b|\bfs\.exists\((?:archivePath|basePath)\)|\bbasePath !== undefined', 'guard_history_use', history_uses)
+    if re.search(r'\b(?:archiveFilename|resolveHistoryBasePath|archivePath|basePath)\b', history_uses):
+        return False
+    if len(re.findall(r'\bbaseRows\b', history_uses)) != 0:
+        return False
+    for binding in (
+        'const stateDir = path.join(baseDir, "userdata");',
+        'const databasePath = path.join(stateDir, "statev2.sqlite");',
+        'const snapshotPath = `${databasePath}.migrate-dev-db-tmp`;',
+    ):
+        if source.count(binding) != 1:
+            return False
     database_uses = re.sub(r'import \* as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";', '', source)
     database_uses = re.sub(r'NodeSqliteClient\.layer\(\{ filename: (?:databasePath|snapshotPath) \}\)', 'guard_destination_client', database_uses)
     if re.search(r'\bNodeSqliteClient\b', database_uses):
@@ -1631,15 +1844,22 @@ def _isolated_migration_source(source, directory):
     if re.search(r'\bsharedHome\b', homes):
         return False
     home_api = homes.replace('import * as NodeOS from "node:os";', '')
-    url_api = source.replace('import * as NodeURL from "node:url";', '').replace(attach, '')
+    url_api = source.replace('import * as NodeURL from "node:url";', '')
+    for attach in attaches:
+        url_api = url_api.replace(attach, '')
     if re.search(r'\bNodeOS\b', home_api) or re.search(r'\bNodeURL\b', url_api):
         return False
     path_api = re.sub(r'const path = yield\* Path\.Path;', '', source)
+    path_api = path_api.replace('resolveHistoryBasePath(path, sourcePath, baseRows)', 'guard_history_base')
     path_api = re.sub(r'\bpath\.(?:join|resolve|dirname)\s*(?=\()', 'guard_path_operation', path_api)
     path_api = path_api.replace('path to a real statev2.sqlite', 'guard_source_help').replace('path this command rewrites', 'guard_destination_help')
     if re.search(r'\bpath\b', path_api):
         return False
     source_uses = default.sub('', source)
+    source_uses = source_uses.replace('resolveHistoryBasePath(path, sourcePath, baseRows)', 'guard_history_base')
+    source_uses = source_uses.replace('archiveFilename(sourcePath)', 'guard_history_archive')
+    source_uses = source_uses.replace('archivePath: sourcePath', 'guard_history_error')
+    source_uses = re.sub(r'(new MigrateDevDbHistoryArchiveError\(\{\s*)sourcePath,', r'\1guard_source_error,', source_uses)
     source_uses = re.sub(r'\bsourcePath: (?:Schema\.String|string)|\bthis\.sourcePath\b|\{ sourcePath \}(?=\))|\$\{sourcePath\}|\bdatabasePath: sourcePath\b', 'guard_source_use', source_uses)
     source_uses = re.sub(r'\b(?:copySourceSlice|NodeURL\.pathToFileURL|fs\.exists|fs\.stat)\(sourcePath\)|\.realPath\(sourcePath\)|\(\) => sourcePath\b', 'guard_source_read', source_uses)
     if re.search(r'\bsourcePath\b', source_uses):
@@ -2270,13 +2490,15 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
     invalidated_written = set()
     write_history = {}
     variable_written = set()
+    tool_changes = set()
     stdin_words, stdin_bodies = _stdin or ([], {})
     if _sources is not None:
-        prior_written, prior_invalidated, prior_history, prior_variable = _sources
+        prior_written, prior_invalidated, prior_history, prior_variable, prior_tool_changes = _sources
         written.update(prior_written)
         invalidated_written.update(prior_invalidated)
         write_history.update((path, list(history)) for path, history in prior_history.items())
         variable_written.update(prior_variable)
+        tool_changes.update(prior_tool_changes)
     unknown_cause = "directory changed in a conditional branch"
     conditional = 0
     inherited_values, inherited_unsafe, caller_command = _environment or ({}, False, None)
@@ -2302,6 +2524,9 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
     noclobber = False
 
     def affected_sources(path, descendants=False):
+        # Executable trust must survive the whole call, even writes before a
+        # script is remembered. None records an unbounded mutation.
+        tool_changes.add(path)
         if path is None:
             return set(written)
         affected = {remembered for remembered in written
@@ -2324,6 +2549,33 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 affected.add(remembered)
         return affected
 
+    def unchanged_tool(executable, directory):
+        if None in tool_changes:
+            return False
+        candidates = set()
+        if '/' not in executable:
+            # Relative PATH entries depend on the shell's current directory.
+            if any(not os.path.isabs(entry) for entry in os.get_exec_path()):
+                return False
+            candidates.update(_literal_path(str(Path(entry) / executable), directory) for entry in os.get_exec_path())
+            executable = shutil.which(executable)
+        path = _literal_path(executable, directory) if executable else None
+        if path is None:
+            return False
+        candidates.add(path)
+        for changed in tool_changes:
+            if any(candidate is None or candidate == changed or candidate.is_relative_to(changed) for candidate in candidates):
+                return False
+            for candidate in candidates:
+                try:
+                    if os.path.samefile(candidate, changed):
+                        return False
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    return False
+        return True
+
     def python_preserves_sources(source, directory):
         try:
             tree = ast.parse(source)
@@ -2334,19 +2586,54 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         def string_value(node):
             return (isinstance(node, ast.Constant) and isinstance(node.value, str) or
                     isinstance(node, ast.Name) and node.id in strings or
+                    isinstance(node, ast.Subscript) and string_value(node.value) or
+                    isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add) and string_value(node.left) and string_value(node.right) or
                     isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and
                     (node.func.attr == 'read' and isinstance(node.func.value, ast.Call) and _name(node.func.value.func) == 'open' or
+                     node.func.attr in {'read_text', 'read_bytes'} or
                      node.func.attr == 'replace' and string_value(node.func.value)))
 
         class StringMethods(ast.NodeTransformer):
             def visit_Call(self, node):
-                string_replace = isinstance(node.func, ast.Attribute) and node.func.attr == 'replace' and string_value(node.func.value)
+                string_replace = isinstance(node.func, ast.Attribute) and node.func.attr in {'replace', 'index'} and string_value(node.func.value)
+                parse = (_name(node.func) == 'ast.parse' or _name(node.func) == 'compile')
                 self.generic_visit(node)
-                if string_replace:
-                    return ast.Tuple(elts=[node.func.value, *node.args, *(k.value for k in node.keywords)], ctx=ast.Load())
+                if string_replace or parse:
+                    return ast.Tuple(elts=[*([node.func.value] if string_replace else []), *node.args, *(k.value for k in node.keywords)], ctx=ast.Load())
                 return node
 
+        def bound_names(node):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                return [node.id]
+            if isinstance(node, ast.arg):
+                return [node.arg]
+            if isinstance(node, ast.alias):
+                return [node.asname or node.name.split('.')[0]]
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.ExceptHandler)):
+                return [node.name] if node.name else []
+            return []
+
         for statement in tree.body:
+            # Compound scopes can rebind a value before using it. Only a
+            # straight-line assignment may keep the preceding value for its
+            # RHS (s = s.replace(...)); nested rebinding needs another call.
+            assignment_target = (statement.targets[0] if isinstance(statement, ast.Assign) and len(statement.targets) == 1 and
+                                 isinstance(statement.targets[0], ast.Name) else None)
+            for node in ast.walk(statement):
+                if isinstance(node, ast.NamedExpr) or type(node).__name__ == 'Match':
+                    return False
+                if node is not assignment_target and any(name in bindings or name in strings for name in bound_names(node)):
+                    return False
+            if isinstance(statement, ast.Import):
+                statement.names = [item for item in statement.names if item.name != 'ast' or item.asname]
+            # Shadowed parsers and path constructors cannot justify preserving
+            # source or selecting a sibling destination.
+            constructors = {id(item) for item in statement.names
+                            if (isinstance(statement, ast.Import) and item.name == 'pathlib' or
+                                isinstance(statement, ast.ImportFrom) and statement.module == 'pathlib' and item.name == 'Path') and item.asname is None} if isinstance(statement, (ast.Import, ast.ImportFrom)) else set()
+            if any(name in {'ast', 'compile', 'Path', 'pathlib'} and id(node) not in constructors
+                   for node in ast.walk(statement) for name in bound_names(node)):
+                return False
             # Only straight-line literal destinations can prove that a data
             # edit leaves remembered scripts alone. Keep all value expressions
             # in the AST so their side effects still face the read-only check.
@@ -2418,9 +2705,17 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         if binary == 'unset' and all(re.fullmatch(r'[A-Za-z_]\w*', arg) for arg in words[1:]):
             return False
         if binary in {'bash', 'sh', 'zsh', 'dash', 'ksh', 'node', 'bun', 'deno'} or re.fullmatch(r'python[\d.]*', binary):
+            if (binary == 'node' and not unsafe_bindings and not os.environ.get('NODE_OPTIONS') and
+                    'NODE_OPTIONS' not in shell_values and len(words) == 3 and words[1] in {'--check', '-c'} and
+                    not words[2].startswith('-') and not any(name.startswith('BASH_FUNC_') for name in os.environ) and
+                    _trusted_fixture_tool(words[0], 'node', directory) and unchanged_tool(words[0], directory)):
+                return False
             if (binary in {'bash', 'sh', 'zsh', 'dash', 'ksh'} and len(words) == 3 and words[1] == '-n' and
-                    not words[2].startswith('-') and not unsafe_bindings and
-                    not any(name in shell_values or os.environ.get(name) and not inherited_startup_safe(name, directory) for name in {'BASH_ENV', 'ENV', 'ZDOTDIR'}) and
+                    not words[2].startswith('-') and not unsafe_bindings and unchanged_tool(words[0], directory) and
+                    # Bash's noexec mode also disables startup-file commands.
+                    # Other shells retain their existing startup proof.
+                    (binary == 'bash' and _trusted_fixture_tool(words[0], 'bash', directory) or
+                     not any(name in shell_values or os.environ.get(name) and not inherited_startup_safe(name, directory) for name in {'BASH_ENV', 'ENV', 'ZDOTDIR'})) and
                     not any(name.startswith('BASH_FUNC_') for name in os.environ)):
                 return False
             if re.fullmatch(r'python[\d.]*', binary):
@@ -2537,6 +2832,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         # The older proof already handles literal data edits and a restricted
         # read-only helper grammar. Add only the JSON/HTTP readback grammar
         # here, never a denylist of Python writers: unknown code can write too.
+        if any(type(node).__name__ == 'Match' for node in ast.walk(tree)):
+            return False
         modules = {'json', 'sys', 'pathlib', 'urllib.request', 'unittest', 'tempfile'}
         calls = {'print', 'len', 'dict', 'list', 'tuple', 'str', 'int', 'bool',
                  'json.load', 'json.loads', 'json.dumps', 'pathlib.Path', 'pathlib.Path.read_text',
@@ -2846,7 +3143,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                     return
                 source = handle.read(MAX_SOURCE_BYTES + 1)
             if len(source) <= MAX_SOURCE_BYTES:
-                if migration_args is not None and _isolated_migration_source(source.decode('utf-8', errors='replace'), directory):
+                if migration_args is not None and _isolated_migration_source(source.decode('utf-8', errors='replace'), directory, path):
                     migration_source(migration_args, directory)
                     return
                 check_source(source.decode("utf-8", errors="replace"), directory, path.suffix == ".py", shell=shell, test_target=test_target, location=path)
@@ -2871,7 +3168,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
 
     def scan_child(source, directory, depth):
         # The shell walker cannot prove how a local reader rewrites its argument.
-        if 'state.sqlite' in source and _foreign_reader_shadowed(source):
+        if 'state.sqlite' in _strip_config_dir_db_names(source, directory) and _foreign_reader_shadowed(source):
             check_source(source, directory, rule='live-database-read')
         previous = {name: set(values) for name, values in script_values.items()}
         previous_fresh = set(fresh_variables)
@@ -2899,7 +3196,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                             if STARTUP_ENV.fullmatch(name) or name in {'ZDOTDIR', 'PATH', 'IFS'}},
                            unsafe_bindings, caller_command if caller_command is not None else command)
         remote_paths = scripts_in(source, directory, _depth=depth,
-                                  _sources=(written, invalidated_written, write_history, variable_written),
+                                  _sources=(written, invalidated_written, write_history, variable_written, tool_changes),
                                   _stdin=(input_words, input_bodies or {}), _environment=environment)
         paths.extend(path for path in remote_paths if path not in paths)
         if len(paths) > MAX_SCRIPTS:
@@ -3107,6 +3404,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                         scan_remote(argv[0] if len(argv) == 1 else shlex.join(argv), directory, depth + 1,
                                     remote_input, remote_bodies, inherit_environment=True)
                     if may_change_scripts(words, directory, documents):
+                        tool_changes.add(None)
                         changed_sources.update(written)
                         fresh_variables.clear()
                 # Local output redirects still need the normal invalidation
@@ -3150,6 +3448,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         if cwd_only:
             return scan(" ".join(args), directory, depth + 1, cwd_only=True) if binary == "eval" else after
         if binary == 'unset' and all(re.fullmatch(r'[A-Za-z_]\w*', arg) for arg in args):
+            if 'PATH' in args:
+                unsafe_bindings = True
             for name in args:
                 invalidate_variable(name)
                 script_values.pop(name, None)
@@ -3164,10 +3464,13 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         stdin_sources = documents if exact_documents and not here_strings and not any(op == '<' for op, _ in redirects) else []
         changes_scripts = may_change_scripts(words, directory, stdin_sources)
         if changes_scripts:
+            tool_changes.add(None)
             changed_sources.update(written)
             opaque_written.clear()
             fresh_variables.clear()
         if binary == 'chmod':
+            tool_changes.update(_literal_path(candidate, directory) for arg in args if not arg.startswith('-')
+                                for candidate in script_variants(arg))
             opaque_written.clear()
             fresh_variables.clear()
         if words[0].startswith(('/', './', '../')) and re.search(r'\.(?:py|mjs|cjs|js|ts|sh)$', words[0]):
@@ -3539,6 +3842,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                             continue
                         targets = [group[i + 1] for i, token in enumerate(group[:-1]) if token in {'>', '>>'}]
                         if may_change_scripts(group, current):
+                            tool_changes.add(None)
                             invalidated_written.update(written)
                         if group and os.path.basename(group[0]) in {'cp', 'mv', 'rsync', 'ditto', 'tee', 'sed', 'perl', 'truncate'}:
                             targets += group[1:]

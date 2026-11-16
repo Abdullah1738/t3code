@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+// integrations/harness-hooks/src/statev2_guard.py::_isolated_migration_source proves this shape; run its tests after changes.
+
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeOS from "node:os";

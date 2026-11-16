@@ -12,6 +12,7 @@ export const initializeKanbanSchema = Effect.fn("initializeKanbanSchema")(functi
     "ardud_kanban_cards",
     "ardud_kanban_card_events",
     "ardud_kanban_discussions",
+    "ardud_kanban_messages",
   ]) {
     const missingIndex = kanbanDDL.some((ddl) => {
       const match = /^CREATE INDEX IF NOT EXISTS (\w+)\s+ON (\w+)/.exec(ddl);
@@ -25,6 +26,23 @@ export const initializeKanbanSchema = Effect.fn("initializeKanbanSchema")(functi
 });
 
 export const kanbanDDL = [
+  `CREATE TABLE IF NOT EXISTS ardud_kanban_slot_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, board_id TEXT NOT NULL, pool_key TEXT NOT NULL,
+    thread_id TEXT NOT NULL, card_id TEXT,
+    kind TEXT NOT NULL CHECK (kind IN ('take','release')), at TEXT NOT NULL, why TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS ardud_kanban_slot_events_board_at
+    ON ardud_kanban_slot_events (board_id, at)`,
+  `CREATE INDEX IF NOT EXISTS ardud_kanban_slot_events_slot
+    ON ardud_kanban_slot_events (board_id, pool_key, thread_id, id)`,
+  `CREATE TABLE IF NOT EXISTS ardud_kanban_evaluator_requests (
+    board_id TEXT NOT NULL, body TEXT NOT NULL, reporter_thread_id TEXT NOT NULL,
+    queue_id INTEGER NOT NULL, admitted_at TEXT NOT NULL,
+    PRIMARY KEY (board_id, body, reporter_thread_id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS ardud_kanban_evaluator_reminders (
+    card_id TEXT PRIMARY KEY, step_key TEXT NOT NULL, signature TEXT NOT NULL
+  )`,
   `CREATE TABLE IF NOT EXISTS ardud_kanban_evaluator_spawns (
     launch_key TEXT PRIMARY KEY, board_id TEXT NOT NULL, card_id TEXT, at TEXT NOT NULL
   )`,
@@ -94,6 +112,10 @@ export const kanbanDDL = [
   `CREATE TABLE IF NOT EXISTS ardud_kanban_messages (
     discussion_id TEXT NOT NULL, seq INTEGER NOT NULL, json TEXT NOT NULL, PRIMARY KEY (discussion_id, seq)
   )`,
+  // Keep the literal predicate identical to the ask feed's bounded message reads.
+  `CREATE INDEX IF NOT EXISTS ardud_kanban_messages_ask_marked
+    ON ardud_kanban_messages (discussion_id, json_extract(json, '$.askId'), seq)
+    WHERE instr(json, '"askId":"') > 0`,
   `CREATE TABLE IF NOT EXISTS ardud_kanban_scripts (
     id TEXT PRIMARY KEY, board_id TEXT NOT NULL, json TEXT NOT NULL
   )`,

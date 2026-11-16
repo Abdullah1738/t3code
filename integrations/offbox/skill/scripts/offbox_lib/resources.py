@@ -295,6 +295,12 @@ def finalize(row):
                     data['host_boxes'] = host
             save_run_state(run_id, resources=data)
             line = summary(data) + '\n'
+            if api.BACKEND == 'boat' and row.get('mode') == 'bg':
+                code = row.get('exit_code')
+                if code is None:
+                    code = saved.get('exit_code', saved.get('command_exit_code'))
+                if code is not None:
+                    line += f"offbox: remote exit {code}\n"
             if not path.exists() or not text.endswith(line):
                 if not ck or not (ck.get('stdoutOffset', 0) + ck.get('stderrOffset', 0)):
                     return  # A footer must never turn an empty, recoverable log into uncheckpointed output.

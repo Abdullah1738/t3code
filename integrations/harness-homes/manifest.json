@@ -151,13 +151,13 @@
     "catalogSource": "vendor/codex-models-0.166.0.json",
     "extended": ["gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra"],
     "contextWindow": 872000,
-    "autoCompactTokenLimit": 450000
+    "autoCompactTokenLimit": 250000
   },
   "codexCu": {
     "model": "gpt-6.1-terra",
     "prefixedModel": "cx/gpt-6.1-terra",
     "contextWindow": 1050000,
-    "autoCompactTokenLimit": 450000
+    "autoCompactTokenLimit": 250000
   },
   "claude": {
     "mcpTimeoutMs": 15000,

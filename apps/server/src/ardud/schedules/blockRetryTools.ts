@@ -65,6 +65,7 @@ const handlers = {
       if (input.fallbacks !== undefined) {
         if (input.fallbacks !== null && task.threadId !== null) {
           return yield* new OrchestratorMcpFailure({
+            reason: "invalid_args",
             code: "invalid_request",
             message:
               "Only tasks that start a new thread can retry; this one posts into an existing thread.",

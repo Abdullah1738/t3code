@@ -5,6 +5,43 @@ import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { McpCall } from "./McpCall.ts";
 
 type Stage = NonNullable<McpCall["Service"]["threadRead"]>["threadReadStages"][number]["stage"];
+type ReadPhase = NonNullable<NonNullable<McpCall["Service"]["threadRead"]>["phase"]>;
+
+// The MCP call owns the span and deadline; these transitions only account for its budget.
+export const enterPhase = Effect.fnUntraced(function* (name: ReadPhase["name"]) {
+  const call = yield* Effect.serviceOption(McpCall);
+  if (Option.isNone(call) || call.value.threadRead === undefined) return;
+  const metrics = call.value.threadRead;
+  const now = yield* Clock.monotonicTimeNanos;
+  if (metrics.phase === undefined) {
+    metrics.phase = { name, started: now, elapsed: { lane_wait: 0, query: 0, render: 0 } };
+  } else {
+    metrics.phase.elapsed[metrics.phase.name] += Number(now - metrics.phase.started) / 1e6;
+    metrics.phase.name = name;
+    metrics.phase.started = now;
+  }
+});
+
+export function phaseSnapshot(phase: ReadPhase, now: bigint) {
+  return {
+    phase: phase.name,
+    phaseMs: {
+      ...phase.elapsed,
+      [phase.name]: phase.elapsed[phase.name] + Math.max(0, Number(now - phase.started) / 1e6),
+    },
+  };
+}
+
+// The read deadline must distinguish untouched reads from an acknowledgement whose
+// masked commit can finish after the caller stops waiting.
+export const acknowledge = Effect.fnUntraced(function* <A, E, R>(effect: Effect.Effect<A, E, R>) {
+  const call = yield* Effect.serviceOption(McpCall);
+  const metrics = Option.isSome(call) ? call.value.threadRead : undefined;
+  if (metrics !== undefined) metrics.acknowledgement = "may_have_completed";
+  const result = yield* effect;
+  if (metrics !== undefined) metrics.acknowledgement = "completed";
+  return result;
+});
 
 // The service operation already owns a span. Keep stage accounting through interruption,
 // independently of trace sampling, without holding a reader during result assembly.
@@ -56,6 +93,7 @@ export const read = Effect.fnUntraced(function* <A, E, R>(
 });
 
 export const render = Effect.fnUntraced(function* <A>(build: () => A) {
+  yield* enterPhase("render");
   const call = yield* Effect.serviceOption(McpCall);
   const started = yield* Clock.monotonicTimeNanos;
   return yield* Effect.sync(build).pipe(

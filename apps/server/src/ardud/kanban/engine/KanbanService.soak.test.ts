@@ -449,6 +449,8 @@ const makeHost = (watch: Watch) => {
                 head: pr.head,
                 headAt: at,
                 checks: pr.checks,
+                // Host reads include head-check evidence; thread snapshots do not.
+                failedChecks: [],
               });
             }
             return { readings, read, failed: [], carried: [] };
@@ -551,6 +553,7 @@ const makeThreads = (watch: Watch) => {
       lastFailure: failureOf,
       findLastFailure: failureOf,
       latestRun: () => Effect.succeed(null),
+      backgroundStoppedSince: () => Effect.succeed(false),
       runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       launch: (input) =>

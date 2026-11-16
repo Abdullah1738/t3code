@@ -22,7 +22,7 @@ class LogCatchupTests(Isolated):
     def setUp(self):
         super().setUp()
         self.stack.enter_context(patch.object(api, 'call', side_effect=AssertionError('offline: no API calls')))
-        self.stack.enter_context(patch.object(api, 'get', side_effect=AssertionError('must not inspect or wake box')))
+        self.stack.enter_context(patch.object(api, 'get', return_value=dict(state='archived')))
         self.stack.enter_context(patch.object(runs.lease, 'touch'))
         self.stack.enter_context(patch.object(runs.lease, 'idle_ttl'))
         self.stack.enter_context(patch.object(runs, 'settle_docker'))
@@ -471,7 +471,7 @@ class LogCatchupTests(Isolated):
                 self.assertIn('is still running', err)
                 self.assertIn('7 bytes, last written ', err)
                 self.assertIn('includes the output fetched so far', err)
-                self.assertIn('offbox logs --follow run-x', err)
+                self.assertIn('`offbox wait run-x` using the remote-compute skill', err)
                 self.assertEqual(self.path.stat().st_mtime_ns, before.st_mtime_ns)
                 self.assertEqual(common.offsets_path(self.path).read_bytes(), ck)
         self.history.assert_not_called()
@@ -619,15 +619,18 @@ class LogCatchupTests(Isolated):
         self.assertEqual(common.checkpoint(self.path)['stdoutOffset'], 7)
 
     def test_timeout_preserves_original_and_is_forwarded_to_transport(self):
-        clock = [1000.0]
-        def history(*args, **kwargs):
-            self.assertEqual(kwargs['deadline'], 1010)
-            clock[0] = 1011
-            raise OffboxError('deadline expired')
-        self.history.side_effect = history
-        with patch.object(misc.time, 'time', side_effect=lambda: clock[0]):
-            self.assertEqual(misc._catch_up_log(self.row(), budget=10), 'incomplete:timeout')
-        self.assertEqual(self.path.read_bytes(), b'prefix\n')
+        for backend, deadline in (('boat', 1005), ('server', 1010)):
+            with self.subTest(backend=backend):
+                clock = [1000.0]
+                def history(*args, **kwargs):
+                    self.assertEqual(kwargs['deadline'], deadline)
+                    clock[0] = deadline + 1
+                    raise OffboxError('deadline expired')
+                self.history.side_effect = history
+                with patch.object(api, 'BACKEND', backend), \
+                        patch.object(misc.time, 'time', side_effect=lambda: clock[0]):
+                    self.assertEqual(misc._catch_up_log(self.row(), budget=10), 'incomplete:timeout')
+                self.assertEqual(self.path.read_bytes(), b'prefix\n')
 
     def test_stale_takeover_cannot_shrink_completed_log(self):
         takeover = self.path.with_name(self.path.name + '.takeover')
@@ -715,6 +718,27 @@ class LogCatchupTests(Isolated):
         with patch.object(misc.time, 'time', lambda: clock[0]):
             self.assertEqual(misc._catch_up_log(self.row()), 'incomplete:timeout')
         self.assertEqual(self.path.read_bytes(), b'prefix\n')
+
+    def test_retained_copy_budget_includes_the_checkpointed_history_being_verified(self):
+        prefix, total, page_size = 40_000_000, 50_000_000, 1_000_000
+        with self.path.open('wb') as f:
+            f.truncate(prefix)
+        common.atomic_write_json(common.offsets_path(self.path),
+                                 dict(stdoutOffset=prefix, stderrOffset=0, logBytes=prefix))
+        Path(str(self.path) + '.remote').write_bytes(b'\0')
+        common.atomic_write_json(Path(str(self.path) + '.remote.json'), dict(source='process log', merged=False))
+        clock = [1000.0]
+        def history(box, cmd, which, offset, **kw):
+            clock[0] += 1
+            size = total if which == 'stdout' else 0
+            nxt = min(size, offset + page_size)
+            return dict(data='\0' * (nxt - offset), nextOffset=nxt, size=size, done=nxt == size)
+        with patch.object(api, 'history_logs', history), patch.object(misc.time, 'time', lambda: clock[0]):
+            self.assertEqual(misc._catch_up_log(self.row()), 'caught_up')
+        self.assertGreater(clock[0], 1030)
+        self.assertEqual(self.path.stat().st_size, total)
+        self.assertEqual(common.checkpoint(self.path), dict(stdoutOffset=total, stderrOffset=0, logBytes=total))
+        self.assertEqual(misc._shown_log(self.path), self.path)
 
     def test_streaming_log_preserves_utf8_across_file_chunks(self):
         content = 'x' * 65535 + '€' + 'y' * 65535 + 'é'

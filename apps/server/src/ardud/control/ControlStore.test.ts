@@ -3,6 +3,7 @@ import { assert, describe, it } from "@effect/vitest";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -811,11 +812,118 @@ describe("ControlStore message pages", () => {
           limit: 1,
         });
         assert.equal(page.total, 0);
+        assert.deepStrictEqual(
+          yield* store.lastAssistant("t-moved", "answer-run"),
+          page.lastAssistant,
+        );
+        assert.isNull(yield* store.lastAssistant("t-moved", "missing-run"));
         assert.deepStrictEqual(page.lastAssistant, {
           messageId: "msg_Z",
           runId: "answer-run",
           text: "msg_Z",
         });
+      }),
+    ),
+  );
+
+  it.effect("last-assistant reads one newest payload and skips 200 older invalid payloads", () =>
+    run(
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const store = yield* ControlStore.ControlStore;
+        for (let n = 0; n < 201; n++) {
+          const id = `bounded-${n}`;
+          const at = DateTime.formatIso(
+            DateTime.makeUnsafe(Date.parse("2026-03-01T00:00:00Z") + n * 1000),
+          );
+          yield* sql`INSERT INTO orchestration_v2_projection_messages ${sql.insert({
+            message_id: id,
+            thread_id: "t-moved",
+            run_id: "bounded",
+            node_id: null,
+            role: "assistant",
+            streaming: 0,
+            created_at: at,
+            updated_at: at,
+            payload_json:
+              n === 200
+                ? JSON.stringify({
+                    id,
+                    threadId: "t-moved",
+                    runId: "bounded",
+                    nodeId: null,
+                    role: "assistant",
+                    text: "newest",
+                    attachments: [],
+                    streaming: false,
+                    createdBy: "agent",
+                    creationSource: "provider",
+                    createdAt: at,
+                    updatedAt: at,
+                  })
+                : "invalid older payload",
+          })}`;
+        }
+        for (const runId of [null, "bounded"]) {
+          assert.deepStrictEqual(yield* store.lastAssistant("t-moved", runId), {
+            text: "newest",
+            messageId: "bounded-200",
+            runId: "bounded",
+          });
+        }
+      }),
+    ),
+  );
+
+  it.effect("last-assistant SQL matches text, run and timestamp edge cases", () =>
+    run(
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const store = yield* ControlStore.ControlStore;
+        const fixtures = [
+          ["old", "answer-run", "old", "2026-03-01T00:00:00Z"],
+          ["A", "answer-run", " upper ", "2026-03-02T00:00:00Z"],
+          ["a", "answer-run", "lower", "2026-03-02T04:00:00+04:00"],
+          ["nul", "nul-run", "\u0000answer", "2026-03-03T00:00:00Z"],
+          ["blank", "answer-run", "\u00a0\u2003\ufeff", "2026-03-04T00:00:00Z"],
+        ];
+        for (const [id, runId, text, at] of fixtures) {
+          yield* sql`INSERT INTO orchestration_v2_projection_messages ${sql.insert({
+            message_id: id,
+            thread_id: "t-moved",
+            run_id: runId,
+            node_id: null,
+            role: "assistant",
+            streaming: 0,
+            created_at: at,
+            updated_at: at,
+            payload_json: JSON.stringify({
+              id,
+              threadId: "t-moved",
+              runId,
+              nodeId: null,
+              role: "assistant",
+              text,
+              createdBy: "agent",
+              creationSource: "provider",
+              attachments: [],
+              streaming: false,
+              createdAt: at,
+              updatedAt: at,
+            }),
+          })}`;
+        }
+        for (const runId of [null, "answer-run", "nul-run", "missing"]) {
+          const page = yield* store.messagePage({
+            threadId: "t-moved",
+            role: "user",
+            runId,
+            since: undefined,
+            afterMessageId: null,
+            limit: 1,
+          });
+          assert.deepStrictEqual(yield* store.lastAssistant("t-moved", runId), page.lastAssistant);
+        }
       }),
     ),
   );
@@ -877,3 +985,17 @@ describe("ControlStore message pages", () => {
     ),
   );
 });
+
+it.effect("resume detects compaction only inside the requested sequence range", () =>
+  Effect.gen(function* () {
+    const store = yield* ControlStore.ControlStore;
+    const sql = yield* SqlClient.SqlClient;
+    assert.isFalse(yield* store.hasCompactedEvents(0, 100));
+    yield* sql`CREATE TABLE ardud_history_compacted_events (revision INTEGER PRIMARY KEY, sequence INTEGER NOT NULL UNIQUE)`;
+    yield* sql`INSERT INTO ardud_history_compacted_events (sequence) VALUES (10), (30)`;
+    assert.isFalse(yield* store.hasCompactedEvents(10, 29));
+    assert.isTrue(yield* store.hasCompactedEvents(9, 10));
+    assert.isTrue(yield* store.hasCompactedEvents(10, 30));
+    assert.isFalse(yield* store.hasCompactedEvents(30, 100));
+  }).pipe(Effect.provide(ControlStore.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
+);

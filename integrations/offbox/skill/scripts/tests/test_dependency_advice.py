@@ -43,7 +43,7 @@ class DependencyAdviceTests(unittest.TestCase):
 
     def run_command(self, cmd='', *, rel='.', steps=None, setup=':'):
         with patch.object(runs, 'GO_REPAIR', setup), patch.object(runs, 'DOCKER_REPAIR', ':'), \
-             patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs, 'WATCH_REPAIR', ':'), \
+             patch.multiple(runs, LDCACHE_REPAIR=':', SQLITE_SETUP=':'), patch.object(runs, 'WATCH_REPAIR', ':'), \
              patch.object(runs.userns, 'setup', return_value=':'), \
              patch.object(runs.containers, 'script', return_value=':'), \
              patch.object(runs.node_tools, 'block', return_value=':'):

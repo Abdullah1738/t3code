@@ -61,6 +61,32 @@ class RulePreflightOffTest(unittest.TestCase):
             body = dict(trigger="tool", tool="shell", arguments={"command": "git push origin HEAD:main"}, cwd=self.fixture.cwd)
             self.assertEqual("deny", self.engine.preflight(body)[2]["decision"])
 
+    def test_cached_prompt_notes_keep_replica_warning_and_native_budget(self):
+        import recall_core as rc
+        from recall_note import bounded_note, MAX_NOTE_BYTES, PREFIX, SUFFIX
+        warning = "replica as of old; rebuild in progress since started (threads, 250 rows)"
+        for trigger in ("first_prompt", "compaction"):
+            for note in ("short history", "é" * 740):
+                with self.subTest(trigger=trigger, bytes=len(note.encode())):
+                    rc.robob_readonly.reset_replica_warnings()
+                    body = dict(trigger=trigger, request_id=f"{trigger}:{len(note)}", prompt="remember earlier", session_id="fixture")
+                    def recalled(*args, **kwargs):
+                        rc.robob_readonly._warnings.snapshots = {"fixture": {"warning": warning}}
+                        return {"note": note, "sources": ["fixture"]}
+                    with patch("recall_admission.cheap_note", side_effect=recalled) as read:
+                        first = self.engine.cached_check(body)
+                        rc.robob_readonly.reset_replica_warnings()
+                        cached = self.engine.cached_check(body)
+                        self.assertEqual(read.call_count, 1)
+                    self.assertTrue(cached["cached"])
+                    self.assertEqual(first["note"], cached["note"])
+                    self.assertEqual(first["replica_warnings"], cached["replica_warnings"])
+                    self.assertIn(warning, cached["note"])
+                    self.assertIsNotNone(bounded_note(cached["note"]))
+                    self.assertLessEqual(len((PREFIX + cached["note"] + SUFFIX).encode()), MAX_NOTE_BYTES)
+                    self.assertEqual(rc.robob_readonly.annotate_result(cached)["note"], cached["note"])
+        rc.robob_readonly.reset_replica_warnings()
+
 
 class EngineTest(unittest.TestCase):
     """The rule index path, which is dormant unless RECALL_RULE_PREFLIGHT=1."""
@@ -116,6 +142,41 @@ class EngineTest(unittest.TestCase):
         self.assertIn("never say", result["note"])
         compaction = self.engine.check(dict(trigger="compaction", cwd="/work", prompt="messaging Moni"))
         self.assertIn("Moni", compaction["note"])
+
+    def test_prompt_rule_notes_keep_instructions_and_citations_without_unused_history(self):
+        import robob_readonly as ro
+        from recall_note import bounded_note
+        from recall_rules import RuleIndex
+        self.addCleanup(ro.reset_replica_warnings)
+        warning = ("replica as of 2026-11-14T22:33:50.385Z; rebuild in progress since "
+                   "2026-11-14T22:43:15.751Z (orchestration_v2_projection_turn_items, 100000 rows)")
+        for repeats in (24, 0):
+            instruction = "When messaging Moni, never say 'as requested'. " + "Keep the explicit wording constraints from the owner. " * repeats
+            index = RuleIndex(self.root / f"rules-{repeats}.sqlite")
+            index.remember(instruction, actions=["message"], recipient="Moni", source_session="owner")
+            engine = CheckEngine(index.path)
+            for trigger in ("first_prompt", "compaction"):
+                with self.subTest(trigger=trigger, rule="near-limit" if repeats else "short"):
+                    ro.reset_replica_warnings()
+                    body = dict(trigger=trigger, request_id=trigger, session_id="fixture", cwd="/work",
+                                prompt="remember earlier messaging Moni wording constraints")
+                    preflight = engine.preflight(body)
+                    def unused_history(*args, **kwargs):
+                        ro._warnings.snapshots = {"fixture": {"warning": warning}}
+                        return {"note": "optional history", "sources": ["history"]}
+                    with patch("recall_admission.cheap_note", side_effect=unused_history) as history:
+                        first = engine.cached_check(body, preflight)
+                        ro.reset_replica_warnings()
+                        cached = engine.cached_check(body, preflight)
+                    for result in (first, cached):
+                        self.assertIn(instruction, result["note"])
+                        self.assertEqual(result["sources"], ["owner"])
+                        self.assertIsNotNone(bounded_note(result["note"]))
+                        if repeats:
+                            self.assertGreater(len(result["note"].encode()), 1300)
+                        self.assertNotIn("replica_warnings", result)
+                    self.assertTrue(cached["cached"])
+                    history.assert_not_called()
 
     def test_trigger_fixture_latencies_and_log_schema(self):
         timings = {trigger: [] for trigger in ("first_prompt", "compaction", "tool")}

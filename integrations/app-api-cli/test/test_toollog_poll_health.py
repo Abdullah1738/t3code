@@ -210,7 +210,8 @@ class PollHealth(unittest.TestCase):
                 patch.object(tracker, 'bank_charge_events', return_value=[]), \
                 contextlib.redirect_stdout(io.StringIO()):
             tracker._check(self.cfg)
-        rows = {row['name']: row for row in self.rows()}
+        rows = {row['name']: row for row in self.rows()
+                if row['name'] in {'provider.track', 'track.error', 'track.poll'}}
         self.assertTrue({'provider.track', 'track.error', 'track.poll'} <= rows.keys())
         for row in rows.values():
             self.assertEqual(row['error']['cause']['phase'], 'session_open')
