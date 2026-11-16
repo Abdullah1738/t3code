@@ -148,7 +148,14 @@ const asKanbanError = (error: unknown): KanbanError =>
       });
 
 const fail = (code: KanbanError["code"], detail: string) =>
-  Effect.fail(new KanbanError({ code, detail, saved: false }));
+  Effect.fail(
+    new KanbanError({
+      code,
+      detail,
+      saved: false,
+      reason: code === "denied" ? "board_deleted" : "invalid_args",
+    }),
+  );
 
 const isFile = (path: string) =>
   Effect.promise(() =>

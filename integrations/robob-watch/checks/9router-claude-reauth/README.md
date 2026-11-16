@@ -23,6 +23,14 @@ This packet does not alter or restart 9router.
 
 The notification-only detector GETs `/api/providers`
 with local CLI auth every 60 seconds.
+The first fetch has a 6-second timeout. Transient timeouts, refused/reset sockets
+and HTTP 502/503/504 get one retry after 1 second, bounded at 15 seconds.
+Two transient failures skip that tick without changing incidents or pending
+notices; the journal keeps the first unavailable time and consecutive count.
+A valid snapshot resets that counter. After 15 minutes without one, the check
+fails through the runner's normal alert/pause path. Auth, JSON and schema errors
+fail immediately. Retry outcomes and skipped ticks go to the watcher log and
+the private 9router tool log; successful ticks emit no wake event.
 It selects only `provider=claude`, `authType=oauth`, `isActive=true`, and a
 truthy effective `reauthRequiredAt`; the server has already reconciled stale
 marks with the current credential fingerprint. No dashboard health labels,

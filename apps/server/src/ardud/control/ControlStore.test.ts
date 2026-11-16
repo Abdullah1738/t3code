@@ -985,3 +985,17 @@ describe("ControlStore message pages", () => {
     ),
   );
 });
+
+it.effect("resume detects compaction only inside the requested sequence range", () =>
+  Effect.gen(function* () {
+    const store = yield* ControlStore.ControlStore;
+    const sql = yield* SqlClient.SqlClient;
+    assert.isFalse(yield* store.hasCompactedEvents(0, 100));
+    yield* sql`CREATE TABLE ardud_history_compacted_events (revision INTEGER PRIMARY KEY, sequence INTEGER NOT NULL UNIQUE)`;
+    yield* sql`INSERT INTO ardud_history_compacted_events (sequence) VALUES (10), (30)`;
+    assert.isFalse(yield* store.hasCompactedEvents(10, 29));
+    assert.isTrue(yield* store.hasCompactedEvents(9, 10));
+    assert.isTrue(yield* store.hasCompactedEvents(10, 30));
+    assert.isFalse(yield* store.hasCompactedEvents(30, 100));
+  }).pipe(Effect.provide(ControlStore.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
+);

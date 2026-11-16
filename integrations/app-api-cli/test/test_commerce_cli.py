@@ -15,6 +15,95 @@ from commerce_flow import FlowGate
 from talabat_place_contract import PlaceObservation
 from talabat_http_checkout import AsyncPaymentContext, PaymentResult
 
+
+class MoniBusGoTests(unittest.TestCase):
+    def setUp(self):
+        from agent_bus_support import create_bus
+        import datetime as dt
+        from types import SimpleNamespace
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.db = Path(self.temp.name) / 'bus.sqlite'
+        create_bus(self.db, dt.datetime.now(dt.timezone.utc))
+        env = patch.dict(_os.environ, {'AGENT_BUS_DB': str(self.db),
+            'ROBOB_TOOL_LOG_DIR': str(Path(self.temp.name) / 'logs')})
+        env.start(); self.addCleanup(env.stop)
+        from agent_bus_support import REQUEST
+        self.args = SimpleNamespace(command='order', recipient='moni', prepare_only=False,
+            moni_bus_request=REQUEST, moni_go=None, moni_chat=None)
+
+    def test_bus_path_checks_each_active_status_without_reading_her_messages(self):
+        from agent_bus_support import REQUEST, update_bus
+        for status in ('open', 'pending', 'timed_out'):
+            update_bus(self.db, status=status)
+            with patch('moni_go.verify', side_effect=AssertionError('must not read messages')):
+                self.assertEqual(c.require_moni_go(self.args),
+                    {'source':'agent-bus', 'request':REQUEST, 'status':status})
+
+    def test_bus_closed_and_unreadable_refuse_and_log_reason(self):
+        from agent_bus_support import update_bus
+        for status in ('done', 'declined', 'done_late'):
+            update_bus(self.db, status=status)
+            with self.assertRaisesRegex(RuntimeError, '^BUS_REQUEST_CLOSED$'):
+                c.require_moni_go(self.args)
+        with patch.dict(_os.environ, {'AGENT_BUS_DB': str(self.db.parent / 'missing.sqlite')}):
+            with self.assertRaisesRegex(RuntimeError, '^BUS_UNREADABLE$'):
+                c.require_moni_go(self.args)
+        rows = [json.loads(line) for p in (self.db.parent / 'logs/orders').glob('*.ndjson')
+                for line in p.read_text().splitlines()]
+        self.assertEqual([r['name'] for r in rows], ['moni_go.bus_refused'] * 4)
+        self.assertEqual(rows[-1]['props']['reason'], 'BUS_UNREADABLE')
+
+    def test_exactly_one_flag_and_prepare_only_skip(self):
+        for quote, bus_id in ((None, None), ('yes', self.args.moni_bus_request)):
+            self.args.moni_go, self.args.moni_bus_request = quote, bus_id
+            with self.assertRaisesRegex(RuntimeError, '^MONI_GO_REQUIRED$'):
+                c.require_moni_go(self.args)
+            self.args.prepare_only = True
+            self.assertIsNone(c.require_moni_go(self.args))
+            self.args.prepare_only = False
+
+    def test_original_go_still_passes_quote_and_chat_unchanged(self):
+        self.args.moni_bus_request = None
+        self.args.moni_go, self.args.moni_chat = 'her exact words', 'group-test'
+        with patch('moni_go.verify', return_value={'verified':True}) as verify:
+            self.assertEqual(c.require_moni_go(self.args), {'verified':True})
+        verify.assert_called_once_with('her exact words', chat='group-test')
+
+    def test_all_order_parsers_accept_bus_flag_before_entering_lane(self):
+        from agent_bus_support import REQUEST
+        for lane, flags in [('minutes',['--sku','TEST']), ('nownow',['--product-code','TEST','--store-code','TEST']),
+                            ('main',['--sku-config','TEST']), ('supermall',['--sku-config','TEST']),
+                            ('food',['--outlet-code','TEST','--items-file','unused.json'])]:
+            with self.subTest(lane=lane), patch.object(c, 'dispatch', return_value=0) as dispatch:
+                c.main(['order', lane, *flags, '--for', 'moni', '--moni-bus-request', REQUEST])
+                self.assertEqual(dispatch.call_args.args[0].moni_bus_request, REQUEST)
+
+    def test_food_persists_recipient_before_place_and_recovery_keeps_it(self):
+        import commerce_food as food
+        import noon_food_financial as financial
+        import noon_food_recovery as recovery
+        from unittest.mock import Mock
+        items=self.db.parent/'items.json';items.write_text('[]')
+        statefile=self.db.parent/'retained.json'
+        flow=Mock(flow_id='synthetic',state={})
+        flow.save.side_effect=lambda:statefile.write_text(json.dumps(flow.state))
+        args=type('Args',(),dict(items_file=str(items),outlet_code='OUTLET',resume_flow=None,
+                               recipient='moni',prepare_only=False))()
+        def before_place():
+            self.assertEqual(json.loads(statefile.read_text())['recipient'],'moni')
+            return {'ok':True}
+        with patch.object(food,'FoodFlow',return_value=flow), \
+             patch('commerce_pending.cli_review',return_value=None), \
+             patch.object(recovery,'NativeReader'),patch.object(recovery,'TrackerRegistrar'), \
+             patch.object(financial,'Coordinator') as coordinator:
+            coordinator.return_value.place.side_effect=before_place
+            self.assertTrue(food.prepare(args)['ok'])
+        with patch.object(c.journal,'binding',return_value={'app':'noon','vertical':'food'}), \
+             patch.object(food,'recover',return_value={'ok':True}) as recover:
+            c.recover_payment('synthetic',recipient='moni')
+        recover.assert_called_once_with('synthetic',recipient='moni')
+
 _card_state=tempfile.TemporaryDirectory()
 _card_env=patch.dict('os.environ',{'CARD_STATUS_FILE':str(Path(_card_state.name)/'card-status.json')})
 

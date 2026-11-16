@@ -250,9 +250,14 @@ class AlertText(unittest.TestCase):
                         patch.object(ch, 'card_owner', return_value='abdullah'):
                     for _ in range(2):
                         errors = []
+                        limits = []
                         self.assertIsNone(ch.found(charge, now, now, said=lambda *a, **kw: [],
-                                                   errors=errors, memo=memo))
-                        self.assertIn('orders: noon orders: lookup unavailable or incomplete', errors)
+                                                   errors=errors, memo=memo, limits=limits))
+                        if isinstance(result, Exception):
+                            self.assertIn('orders: noon orders: lookup unavailable or incomplete', errors)
+                        else:
+                            self.assertEqual(errors, [])
+                            self.assertEqual(limits[0]['kinds'], ['marketplace_stale'])
                     self.assertEqual(lookup.call_count, 1)
                     ch.found(charge, now, now, said=lambda *a, **kw: [], memo={})
                     self.assertEqual(lookup.call_count, 2)
@@ -1455,6 +1460,38 @@ class SearchOutput(unittest.TestCase):
             got = ch.search('Apple', '2026-11-01')
         self.assertEqual([r['id'] for r in got], [1, 2])
         self.assertEqual(got[0]['snip'], rows[0]['snip'])
+
+
+class MarketplaceProof(unittest.TestCase):
+    def test_freshness_hold_edges_and_positive_precedence(self):
+        charges = ch
+        import order_lookup
+        at = dt.datetime(2026, 11, 10, 12, tzinfo=dt.timezone.utc)
+        charge = dict(merchant='noon', amount='12.34', currency='AED')
+        for minutes, walked, expected in ((0, 16, 'marketplace_hold'), (15, 15, 'marketplace_hold'),
+                (-15, 15, 'marketplace_hold'), (16, 15, None), (-16, 15, None),
+                (0, 14, 'marketplace_stale'), (16, 14, 'marketplace_stale')):
+            with self.subTest(minutes=minutes, walked=walked):
+                result = {'orders': [], 'complete': True, 'lanes': {
+                    name: {'exhaustive': True} for name in order_lookup.LANES}}
+                result['lanes']['marketplace'].update(
+                    walked_at=(at + dt.timedelta(minutes=walked)).isoformat(),
+                    hold_times=[(at + dt.timedelta(minutes=minutes)).isoformat()])
+                reader = lambda *a, **kw: result
+                if expected:
+                    with self.assertRaises(charges.SourceLimit) as exc:
+                        charges.order_receipt(charge, at, at, lookup=reader)
+                    self.assertEqual(exc.exception.kinds, [expected])
+                else:
+                    self.assertIsNone(charges.order_receipt(charge, at, at, lookup=reader))
+                result['orders'] = [dict(order='N1', placed_at=at.isoformat(), total='12.34', currency='AED', status='delivered')]
+                self.assertEqual(charges.order_receipt(charge, at, at, lookup=reader)['verdict'], 'receipt')
+                result['orders'][0]['status'] = 'cancelled'
+                if expected:
+                    with self.assertRaises(charges.SourceLimit):
+                        charges.order_receipt(charge, at, at, lookup=reader)
+                else:
+                    self.assertIsNone(charges.order_receipt(charge, at, at, lookup=reader))
 
 
 if __name__ == '__main__':

@@ -19,6 +19,12 @@ from offbox_lib import api, cli, common, home, lease, misc, outage, pool, reap, 
 from test_capacity import Isolated
 
 
+def _publish(path, text):
+    pending = path.with_name(f'{path.name}.{os.getpid()}.tmp')
+    pending.write_text(text)
+    os.replace(pending, path)
+
+
 def configure_fixture(root, backend):
     common.STATE = root / 'STATE'
     common.DB_PATH = root / 'db.sqlite'
@@ -36,7 +42,7 @@ def configure_fixture(root, backend):
     if os.environ.get('OFFBOX_TEST_ENTRY'):
         a.cmd = ['proof' + 'x' * 300000]
     pool.release_guard = lambda row: None
-    lease.ensure_ttl = lambda *args: (root / 'ttl').write_text('extended')
+    lease.ensure_ttl = lambda *args: _publish(root / 'ttl', 'extended')
     api.get = lambda *args: {'state': 'running'}
     lease.touch = lease.idle_ttl = lambda *args: None
     lease.auto_size = lambda *args: ('large', '')
@@ -58,7 +64,7 @@ def configure_fixture(root, backend):
         runs.Runner.register_pending = aged
 
     def acquire(*args, **kwargs):
-        (root / 'waiting').write_text(str(os.getpid()))
+        _publish(root / 'waiting', str(os.getpid()))
         with common.file_lock('fixture-slot', timeout=15):
             return dict(box_id='box-fake', size='large', remote_dir='repo')
 
@@ -75,10 +81,6 @@ def configure_fixture(root, backend):
 def fixture(root, bg, backend):
     a, me = configure_fixture(root, backend)
     a.bg = bg
-    def publish(name, value):
-        pending = root / (name + '.tmp')
-        pending.write_text(value)
-        pending.replace(root / name)
     if os.environ.get('OFFBOX_TEST_THREADED_CALLER'):
         threading.Thread(target=threading.Event().wait, daemon=True).start()
     masked = bool(os.environ.get('OFFBOX_TEST_MASKED_MAIN'))
@@ -87,15 +89,15 @@ def fixture(root, bg, backend):
         def interrupted(signum, frame):
             nonlocal interruptions
             interruptions += 1
-            publish('caller-interrupted', str(interruptions))
+            _publish(root / 'caller-interrupted', str(interruptions))
         signal.signal(signal.SIGINT, interrupted)
         signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGINT,))
     if os.environ.get('OFFBOX_TEST_READY_TIMEOUT'):
         runs.BG_READY_TIMEOUT_S = float(os.environ['OFFBOX_TEST_READY_TIMEOUT'])
     code = runs.run_remote(a, me)
     if masked:
-        publish('mask-restored', str(signal.SIGINT in signal.pthread_sigmask(signal.SIG_BLOCK, ())))
-    publish('returned', str(code))
+        _publish(root / 'mask-restored', str(signal.SIGINT in signal.pthread_sigmask(signal.SIG_BLOCK, ())))
+    _publish(root / 'returned', str(code))
     while True:
         if masked:
             time.sleep(.01)
@@ -104,19 +106,29 @@ def fixture(root, bg, backend):
 
 
 class BackgroundQueueTests(Isolated):
-    def launch(self, *, bg=True, backend='boat', old_registration=False):
+    def launch(self, *, bg=True, backend='boat', old_registration=False, cleanup=None):
+        cleanup = self.addCleanup if cleanup is None else cleanup
+        last_row = self.con.execute('SELECT COALESCE(MAX(rowid), 0) FROM runs').fetchone()[0]
         proc = subprocess.Popen([sys.executable, '-I', str(Path(__file__).resolve()), '--fixture',
                                  self.tmp.name, str(int(bg)), backend], stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, start_new_session=True,
                                 env=dict(os.environ, OFFBOX_TEST_OLD_REGISTRATION='1' if old_registration else ''))
-        self.addCleanup(self.stop, proc)
+        cleanup(self.stop_fixture, proc, last_row)
         self.until(lambda: (Path(self.tmp.name) / ('returned' if bg else 'waiting')).exists(), proc)
         row = self.con.execute('SELECT * FROM runs ORDER BY start_at DESC LIMIT 1').fetchone()
         self.assertIsNotNone(row)
-        self.addCleanup(self.stop_child, row['client_pid'], proc.pid)
         if bg:
             self.assertEqual((Path(self.tmp.name) / 'returned').read_text(), '0')
         return proc, dict(row)
+
+    def stop_fixture(self, proc, last_row):
+        try:
+            self.stop(proc)
+        finally:
+            # launch() can fail before reading the row; stop the caller before looking up its detached child.
+            rows = self.con.execute('SELECT client_pid FROM runs WHERE rowid > ?', (last_row,)).fetchall()
+            for row in rows:
+                self.stop_child(row['client_pid'], proc.pid)
 
     def stop(self, proc):
         if proc.poll() is None:
@@ -152,12 +164,12 @@ class BackgroundQueueTests(Isolated):
     def test_full_pool_survives_caller_group_signals_on_both_backends(self):
         for backend, sig in ((backend, sig) for backend in ('boat', 'server')
                              for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGKILL)):
-            with self.subTest(backend=backend, signal=sig):
+            with self.subTest(backend=backend, signal=sig), contextlib.ExitStack() as cleanup:
                 root = Path(self.tmp.name)
                 for name in ('returned', 'waiting', 'starts', 'ttl'):
                     (root / name).unlink(missing_ok=True)
                 with common.file_lock('fixture-slot'):
-                    proc, row = self.launch(backend=backend)
+                    proc, row = self.launch(backend=backend, cleanup=cleanup.callback)
                     self.until(lambda: (root / 'waiting').exists(), proc)
                     self.assertNotEqual(row['client_pid'], proc.pid)
                     self.assertEqual(os.getsid(row['client_pid']), row['client_pid'])
@@ -168,7 +180,8 @@ class BackgroundQueueTests(Isolated):
                     out, err = proc.communicate(timeout=5)
                     self.assertEqual(out.decode().strip(), row['run_id'])
                     self.assertIn('queued in background', err.decode())
-                    self.assertIn('Follow:', err.decode())
+                    self.assertIn(f"Hand off `offbox wait {row['run_id']}` using the remote-compute skill’s Waiting for a run route, "
+                                  "then end your turn; completion wakes you.", err.decode())
                     self.assertTrue(misc._client_alive(row['client_pid'], row['start_at']))
                 self.until(lambda: (root / 'ttl').exists())
                 self.assertEqual((root / 'starts').read_text().splitlines(), [row['run_id']])
@@ -655,7 +668,7 @@ if __name__ == '__main__' and len(sys.argv) > 1:
         root = Path(os.environ['OFFBOX_TEST_ROOT'])
         configure_fixture(root, payload['backend'])
         if os.environ.get('OFFBOX_TEST_HANDOFF'):
-            (root / 'handoff').write_text(str(os.getpid()))
+            _publish(root / 'handoff', str(os.getpid()))
             with common.file_lock('fixture-handoff', timeout=15):
                 pass
         sys.exit(runs.background_queue(sys.argv[2], payload))

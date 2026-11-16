@@ -23,6 +23,24 @@ SHARED = HERE.parents[2] / 'app-api-cli' / 'toollog.py'
 
 
 class Logging(Base):
+    def test_marketplace_metadata_is_sanitized_and_copies_match(self):
+        mc.toollog.emit('money-cases', 'check.run', props={
+            'marketplace_refresh': 'fresh', 'limitKinds': ['marketplace_hold', 'marketplace_stale'],
+            'chargeCensus': {'noon': {'limited': 3, 'marketplace_hold': 2, 'marketplace_stale': 1}},
+            'orderCoverage': {'noon': {'marketplace': {'hold_count': 2, 'placements_known': 4,
+                'placements_total': 4, 'snapshot_age_s': 60, 'stop_reason': 'snapshot_corrupt',
+                'hold_times': ['PRIVATE'], 'walked_at': 'PRIVATE', 'orders': ['PRIVATE']}}}})
+        mc.toollog.emit('money-cases', 'marketplace.refresh', props={
+            'orders_total': 4, 'known': 4, 'delivered': 2, 'fetched': 4, 'pages': 1, 'ms': 100,
+            'result': 'end_of_history', 'snapshot_error': 'snapshot_corrupt', 'private': 'PRIVATE'})
+        run, = self.rows('check.run')
+        self.assertEqual(run['props']['marketplace_refresh'], 'fresh')
+        self.assertEqual(run['props']['chargeCensus']['noon']['marketplace_hold'], 2)
+        lane = run['props']['orderCoverage']['noon']['marketplace']
+        self.assertEqual(lane['snapshot_age_s'], 60)
+        self.assertNotIn('PRIVATE', json.dumps(self.rows()))
+        self.assertEqual((HERE / 'toollog.py').read_bytes(), SHARED.read_bytes())
+
     def test_owner_cache_reset_diagnostics_wait_for_book_unlock(self):
         path = self.data / 'owner-texts.json'
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -279,9 +297,9 @@ class Logging(Base):
         row, = self.rows('check.run')
         self.assertFalse(row['ok'])
         self.assertEqual(row['durationMs'], 40000)
-        self.assertEqual(row['props'], {'budgetHit': True, 'openCases': 1, 'fired': 0, 'slowestPhase': 'follow', 'sourceLimits': 0, 'limitKinds': [], 'orderCoverage': {}, 'chargeCensus': {},
+        self.assertEqual(row['props'], {'marketplace_refresh': 'skipped', 'budgetHit': True, 'openCases': 1, 'fired': 0, 'slowestPhase': 'follow', 'sourceLimits': 0, 'limitKinds': [], 'orderCoverage': {}, 'chargeCensus': {},
             **dict.fromkeys((*mc.TIMING_KEYS, *mc.charges.OWNER_TIMING_KEYS), 0), 'owner_result': 'ok', 'follow_ms': 40000, 'questions_ms': 40000,
-            'starved_by': 'questions'})
+            'starved_by': 'questions', **mc.charges.receipt_timing({})})
 
     def test_check_distinguishes_short_lock_timeout_from_work_deadline(self):
         self.case()

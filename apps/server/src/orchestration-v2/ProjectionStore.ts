@@ -123,6 +123,7 @@ export type CallerRow = Pick<
   | "worktreePath"
 >;
 export type CallerActiveRow = CallerRow & {
+  readonly lineage?: OrchestrationV2AppThread["lineage"];
   readonly activeRunId: RunId | null;
   // Absent when exact liveness needs fork history or exceeds the bounded caller read.
   readonly pendingBackgroundTasks?: OrchestrationV2ThreadShell["pendingBackgroundTasks"];
@@ -363,6 +364,7 @@ export interface ProjectionRecordFilter {
   readonly providerSessionId?: ProviderSessionId;
   readonly providerThreadIds?: ReadonlyArray<string>;
   readonly pendingBackgroundTasksOnly?: boolean;
+  readonly providerTurnAttemptId?: RunAttemptId;
   readonly messageRoles?: ReadonlyArray<OrchestrationV2ConversationMessage["role"]>;
   readonly turnItemRunId?: RunId;
   readonly messageIds?: ReadonlyArray<MessageId>;
@@ -980,6 +982,12 @@ function preserveRunRecordedFields(
   if (current === undefined) return next;
   return {
     ...next,
+    ...((next.cancelReason === undefined ||
+      next.cancelReason === "provider_cancelled" ||
+      next.cancelReason === "provider_interrupted") &&
+    current.cancelReason !== undefined
+      ? { cancelReason: current.cancelReason, cancelDetail: current.cancelDetail }
+      : {}),
     ...(current.lastActivityAt !== undefined &&
     (next.lastActivityAt === undefined ||
       DateTime.toEpochMillis(current.lastActivityAt) > DateTime.toEpochMillis(next.lastActivityAt))
@@ -1169,6 +1177,23 @@ export function applyToProjection(
     case "provider-session.detached":
       return {
         ...base,
+        runs:
+          event.payload.cancelReason === undefined
+            ? base.runs
+            : base.runs.map((run) =>
+                ["preparing", "starting", "running", "waiting"].includes(run.status) &&
+                base.providerThreads.some(
+                  (thread) =>
+                    thread.id === run.providerThreadId &&
+                    thread.providerSessionId === event.payload.providerSessionId,
+                )
+                  ? {
+                      ...run,
+                      cancelReason: event.payload.cancelReason,
+                      cancelDetail: event.payload.reason?.slice(0, 500),
+                    }
+                  : run,
+              ),
         providerSessions: base.providerSessions.filter(
           (session) => session.id !== event.payload.providerSessionId,
         ),
@@ -1209,14 +1234,31 @@ export function applyToProjection(
     case "turn-item.updated":
       return withLocalVisibleTurnItems({
         ...base,
-        runs: base.runs.map((run) =>
-          run.id === event.payload.runId &&
-          (run.lastActivityAt === undefined ||
-            DateTime.toEpochMillis(run.lastActivityAt) <
-              DateTime.toEpochMillis(event.payload.updatedAt))
-            ? { ...run, lastActivityAt: event.payload.updatedAt }
-            : run,
-        ),
+        runs: base.runs.map((run) => {
+          if (run.id !== event.payload.runId) return run;
+          const request = event.payload;
+          const recorded =
+            request.type === "run_interrupt_request" &&
+            request.cancelReason !== undefined &&
+            (!(run.status === "cancelled" || run.status === "interrupted") ||
+              run.cancelReason === undefined ||
+              run.cancelReason === "provider_cancelled" ||
+              run.cancelReason === "provider_interrupted")
+              ? {
+                  ...run,
+                  cancelReason: request.cancelReason,
+                  cancelDetail:
+                    request.message === "Interrupt requested"
+                      ? undefined
+                      : request.message.slice(0, 500),
+                }
+              : run;
+          return recorded.lastActivityAt === undefined ||
+            DateTime.toEpochMillis(recorded.lastActivityAt) <
+              DateTime.toEpochMillis(request.updatedAt)
+            ? { ...recorded, lastActivityAt: request.updatedAt }
+            : recorded;
+        }),
         turnItems: upsertById(base.turnItems, event.payload),
       });
     case "plan.updated":
@@ -2405,7 +2447,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 status = excluded.status,
                 requested_at = excluded.requested_at,
                 completed_at = excluded.completed_at,
-                payload_json = ${keepRecordedRunField(
+                payload_json = json_patch(${keepRecordedRunField(
                   keepRecordedRunField(
                     keepRecordedRunField(
                       keepRecordedRunField(sql`excluded.payload_json`, "$.delegatedCompletion"),
@@ -2414,7 +2456,16 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                     "$.restartCancelledBackgroundWork",
                   ),
                   "$.lastActivityAt",
-                )}
+                )}, CASE
+                  WHEN json_type(orchestration_v2_projection_runs.payload_json, '$.cancelReason') IS NOT NULL
+                    AND (json_type(excluded.payload_json, '$.cancelReason') IS NULL
+                      OR json_extract(excluded.payload_json, '$.cancelReason') IN ('provider_cancelled', 'provider_interrupted'))
+                  THEN json_object(
+                    'cancelReason', json_extract(orchestration_v2_projection_runs.payload_json, '$.cancelReason'),
+                    'cancelDetail', json_extract(orchestration_v2_projection_runs.payload_json, '$.cancelDetail')
+                  )
+                  ELSE '{}'
+                END)
             `;
               break;
             }
@@ -2652,6 +2703,17 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               break;
             }
             case "provider-session.detached": {
+              if (event.payload.cancelReason !== undefined) {
+                yield* sql`UPDATE orchestration_v2_projection_runs
+                  SET payload_json = json_patch(payload_json, json_object(
+                    'cancelReason', ${event.payload.cancelReason},
+                    'cancelDetail', ${event.payload.reason?.slice(0, 500) ?? null}))
+                  WHERE thread_id = ${event.threadId}
+                    AND status IN ('preparing', 'starting', 'running', 'waiting')
+                    AND provider_thread_id IN (
+                      SELECT provider_thread_id FROM orchestration_v2_projection_provider_threads
+                      WHERE provider_session_id = ${event.payload.providerSessionId})`;
+              }
               yield* sql`
               DELETE FROM orchestration_v2_projection_provider_session_bindings
               WHERE provider_session_id = ${event.payload.providerSessionId}
@@ -2974,6 +3036,21 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 updated_at = excluded.updated_at,
                 payload_json = excluded.payload_json
             `;
+              if (
+                event.payload.type === "run_interrupt_request" &&
+                event.payload.cancelReason !== undefined &&
+                event.payload.runId !== null
+              ) {
+                const request = event.payload;
+                yield* sql`UPDATE orchestration_v2_projection_runs
+                  SET payload_json = json_patch(payload_json, json_object(
+                    'cancelReason', ${request.cancelReason},
+                    'cancelDetail', ${request.message === "Interrupt requested" ? null : request.message.slice(0, 500)}))
+                  WHERE run_id = ${request.runId}
+                    AND (status NOT IN ('cancelled', 'interrupted')
+                      OR json_extract(payload_json, '$.cancelReason') IS NULL
+                      OR json_extract(payload_json, '$.cancelReason') IN ('provider_cancelled', 'provider_interrupted'))`;
+              }
               // One run-row update keeps the board sweep independent of transcript size.
               if (event.payload.runId !== null) {
                 yield* sql`UPDATE orchestration_v2_projection_runs
@@ -3796,11 +3873,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             SELECT payload_json
             FROM orchestration_v2_projection_provider_turns
             WHERE thread_id = ${threadId}
+              ${filter?.providerTurnAttemptId === undefined ? sql`` : sql`AND run_attempt_id = ${filter.providerTurnAttemptId}`}
             ORDER BY provider_thread_id ASC, ordinal ASC
           `
               : sql<PayloadRow>`
             SELECT payload_json FROM orchestration_v2_projection_provider_turns
             WHERE thread_id = ${threadId}
+              ${filter?.providerTurnAttemptId === undefined ? sql`` : sql`AND run_attempt_id = ${filter.providerTurnAttemptId}`}
               AND (status IN ('starting','running','waiting')
                 OR provider_turn_id IN (SELECT value FROM json_each(${cohortProviderTurnIds}))
                 OR node_id IN (SELECT value FROM json_each(${cohortNodeIds})))
@@ -8043,6 +8122,11 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
             : undefined;
           const selected = {
             ...projection,
+            providerTurns: projection.providerTurns.filter(
+              (turn) =>
+                filter?.providerTurnAttemptId === undefined ||
+                turn.runAttemptId === filter.providerTurnAttemptId,
+            ),
             messages: projection.messages.filter(
               (row) =>
                 (filter?.messageRunIds === undefined ||

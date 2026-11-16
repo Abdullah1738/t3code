@@ -16,6 +16,41 @@ fast settle (60 ms polls, label-only fingerprint so map animation is ignored), s
 Safety: never taps labels matching BLOCK (Request/Order/Pay/...), stops on low confidence."""
 import subprocess, json, sys, time, re, pathlib, threading, os, fcntl, tempfile, xml.etree.ElementTree as ET
 import builtins
+_error_output = sys.stderr
+_typed_values = set()
+
+def report_error(exc_type, _exc, _traceback):
+    # RPC exceptions and tracebacks include params/source lines; report only the type.
+    name = exc_type.__name__
+    if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,79}', name): name = 'Exception'
+    _error_output.write('ERROR: ' + name + '\n')
+    _error_output.flush()
+
+class PrivateStderrBuffer:
+    def write(self, data):
+        if _typed_values:
+            if data: _error_output.write('[redacted stderr]\n')
+            return len(data)
+        return _error_output.buffer.write(data)
+
+    def __getattr__(self, name):
+        return getattr(_error_output.buffer, name)
+
+class PrivateStderr:
+    buffer = PrivateStderrBuffer()
+    def write(self, text):
+        if _typed_values:
+            if text: _error_output.write('[redacted stderr]\n')
+            return len(text)
+        return _error_output.write(text)
+
+    def __getattr__(self, name):
+        return getattr(_error_output, name)
+
+sys.stderr = PrivateStderr()
+sys.excepthook = report_error
+threading.excepthook = lambda args: report_error(args.exc_type, args.exc_value, args.exc_traceback)
+
 import requests, uiautomator2 as u
 T0 = time.time()
 KEY = pathlib.Path('~/.config/opencode/openrouter-key').expanduser().read_text().strip()

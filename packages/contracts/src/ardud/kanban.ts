@@ -1,3 +1,4 @@
+import { McpDenyReason } from "./mcpDenyReason.ts";
 /**
  * Missions board (code name kanban): cards move through fixed stages, a
  * dispatcher starts agent threads for them from per-model pools, and
@@ -1918,6 +1919,10 @@ export const KanbanCardEvent = Schema.Struct({
   fromStage: Schema.NullOr(KanbanStage),
   toStage: Schema.NullOr(KanbanStage),
   body: Schema.NullOr(Schema.String),
+  /** Original delivery to reconcile when assignment inputs have since changed. */
+  assignmentWake: Schema.optionalKey(
+    Schema.Struct({ threadId: ThreadId, key: TrimmedNonEmptyString }),
+  ),
   /** Review events: the commit the reviewer reviewed, when it said. Null otherwise. */
   head: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
 });
@@ -2411,7 +2416,7 @@ export type KanbanErrorCode = typeof KanbanErrorCode.Type;
  * `not_owner_device`: the session is a paired device, but not one the owner
  * paired as his own. It has to be paired again from an owner device.
  */
-export const KanbanDeniedReason = Schema.Literals(["not_owner_device"]);
+export const KanbanDeniedReason = McpDenyReason;
 export type KanbanDeniedReason = typeof KanbanDeniedReason.Type;
 
 export class KanbanError extends Schema.TaggedError<KanbanError>()("KanbanError", {

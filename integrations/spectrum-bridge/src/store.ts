@@ -1,3 +1,4 @@
+import { rememberHealthReceipt, type HealthSidecar } from "./health-receipts.ts";
 import { toolError, toolLog } from "./toollog.ts";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
@@ -33,6 +34,7 @@ export type OutboxOperation = {
   generation?: number;
   replyTo?: string;
   attachment?: FileAttachment;
+  healthReceipt?: HealthSidecar;
   /** SDK effect name, such as "confetti"; applies to the first text chunk only. */
   effect?: string;
   subject?: string;
@@ -173,6 +175,7 @@ export class Store {
       generation: op.generation, replyTo: op.replyTo,
       attachment: op.attachment ? { sha256: op.attachment.sha256, name: op.attachment.name,
         mimeType: op.attachment.mimeType, size: op.attachment.size } : undefined,
+      ...(op.healthReceipt ? { healthReceipt: op.healthReceipt } : {}),
       effect: op.effect, subject: op.subject,
       poll: op.poll ? { title: op.poll.title, options: [...op.poll.options] } : undefined,
       app: op.app ? { url: op.app.url, caption: op.app.caption, subcaption: op.app.subcaption,
@@ -265,6 +268,7 @@ export class Store {
         state = ?, providerId = COALESCE(?, providerId) WHERE id = ?`
       ).run(state, state, providerId ?? null, id);
       if (!result.changes) throw new Error(`Unknown outbox operation: ${id}`);
+      rememberHealthReceipt(this, id, state);
     }).immediate();
   }
 

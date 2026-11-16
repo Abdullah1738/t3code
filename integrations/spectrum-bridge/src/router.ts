@@ -241,6 +241,7 @@ export function sendblueContextPrompt(context: ChatContext, eyes: boolean, sende
     lines.push("moni = Moni's assistant: her accounts, WhatsApp, files, preferences and browser on her own box.");
     lines.push("groups = no private data.");
   }
+  if (chat.kind === "owner") lines.push('When Abdullah says "tell me when Moni …", save his exact words with `notify-rule add --text "<his words>" --session CURRENT_SESSION_ID`. `notify-rule list --session CURRENT_SESSION_ID` shows his rules; `notify-rule rm --id N --session CURRENT_SESSION_ID` removes one when he asks.');
   if (chat.kind === "owner" && background) lines.push("Strangers who text the line are never answered by you directly; follow the bridge's own note.");
   // 27 Oct: Moni's blank-card report went from her chat straight to a fix agent and a deploy, with no card and no review.
   if (!background) {
@@ -2466,7 +2467,7 @@ export class Router {
     await this.updateTyping(false);
     if (old && turn && turn.id === old.id && turn.generation === old.generation && turn.directory === old.directory) {
       // A turn that won't stop can't take the nudge, so that /new escapes to a new thread.
-      await this.reading(this.backend.abort(old.id, old.directory), false).catch((caughtError) => { toolError("router", "router.catch19", caughtError); inPlace = false; });
+      await this.reading(this.backend.abort(old.id, old.directory, "thread_reset"), false).catch((caughtError) => { toolError("router", "router.catch19", caughtError); inPlace = false; });
     }
     if (old && inPlace) {
       this.store.db.transaction(() => {

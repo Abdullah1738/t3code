@@ -52,7 +52,7 @@ class RetryTests(unittest.TestCase):
         self.guard.start()
         self.addCleanup(self.guard.stop)
 
-    def adb(self, args, t=5, strict=False):
+    def adb(self, args, t=5, strict=False, *, device_action=False):
         self.calls.append((args, t))
         if "default_input_method" in args:
             return 'com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME\n'
@@ -157,7 +157,7 @@ class RetryTests(unittest.TestCase):
                     self.device.send_keys.reset_mock()
                     self.device.send_keys.side_effect = RPCUnknownError("RPC failed", [text], "stack")
                     log = "InputMethod: payload=" + encode(text)
-                    def adb(args, t=5, strict=False):
+                    def adb(args, t=5, strict=False, *, device_action=False):
                         return log if "logcat" in args else self.adb(args, t, strict)
                     with patch.object(ph, "_run", adb):
                         code, out = self.cli("type", text)
@@ -182,7 +182,7 @@ class RetryTests(unittest.TestCase):
                    json.dumps(text)[:-1]]
         for encoded in formats:
             with self.subTest(encoded=encoded):
-                def adb(args, t=5, strict=False):
+                def adb(args, t=5, strict=False, *, device_action=False):
                     return "InputMethod: " + encoded if "logcat" in args else self.adb(args, t, strict)
                 with patch.object(ph, "_run", adb):
                     code, _ = self.cli("note-drop", "--source", "torssh", "--cmd", "type",

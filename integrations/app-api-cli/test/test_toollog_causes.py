@@ -227,7 +227,8 @@ class CauseLogs(unittest.TestCase):
                 self.assertEqual(live.call_count, int(live_path))
                 self.assertEqual(fallback.call_count, int(not live_path))
                 self.assertEqual(bool(state['last_result'].get('live_source_ok')), live_path and not errors)
-                rows = self.rows()[start:]
+                rows = [row for row in self.rows()[start:]
+                        if row['name'] in {'provider.track', 'track.error', 'track.poll'}]
                 self.assertTrue({'track.error', 'track.poll'} <= {r['name'] for r in rows})
                 for row in rows:
                     self.assertEqual(row['props']['merchant'], 'careem')

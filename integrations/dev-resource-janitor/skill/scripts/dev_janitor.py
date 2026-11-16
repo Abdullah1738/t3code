@@ -260,7 +260,7 @@ def record_report(st):
     with open(LAST, "w") as report:
         json.dump(st, report, indent=1)
     audit({"ts": st["ts"], "event": "report", "liveness_unavailable": st["liveness_unavailable"],
-           "processes": {key: st["processes"][key] for key in ("candidates", "problems", "checked", "skipped", "budget_skipped")}})
+           "processes": {key: st["processes"][key] for key in ("candidates", "problems", "checked", "skipped", "budget_skipped", "owner_calls")}})
 
 
 def audit(entry):

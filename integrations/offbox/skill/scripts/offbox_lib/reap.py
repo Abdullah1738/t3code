@@ -576,13 +576,33 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
                     if wedged:
                         actions.append(wedged_message(bid, *wedged))
                         continue
-                if run['mode'] == 'bg' and status in ('done','failed') and run['pulls']:
+                from .runs import killed_result
+                killed = killed_result(run['run_id'], wait=True, row=run, known_code=code) if code in (None, 137, 143) else None
+                if killed is not None and killed['process_id']:
+                    status, code = 'killed', killed['exit_code']
+                if run['mode'] == 'bg' and status in ('done','failed','killed') and run['pulls']:
                     import json
                     from .runs import do_pulls
-                    do_pulls(bid, dict(run), json.loads(run['pulls']), foreign=True)
+                    try:
+                        do_pulls(bid, dict(run), json.loads(run['pulls']), foreign=True)
+                    except (OffboxError, OSError, sqlite3.Error) as error:
+                        if killed is None:
+                            raise
+                        say(f"warning: {run['run_id']}: artifact pull after offbox kill failed ({error})")
                 from .runs import planned_steps
                 code = finish(run['run_id'], code, status, run=run, bookkeeping=False, report=True)
-                if planned_steps(run):
+                try:
+                    settled = con.execute('SELECT * FROM runs WHERE run_id=?', (run['run_id'],)).fetchone()
+                except sqlite3.Error as error:
+                    from .runs import state_warning
+                    state_warning(run['run_id'], code, error)
+                    settled = run
+                if settled['status'] == 'killed':
+                    from .runs import report_killed
+                    report_killed(settled)
+                    status = 'killed'
+                    actions[-1] = f"mark run {run['run_id']} killed by offbox kill exit={code}"
+                elif planned_steps(run):
                     status = 'infra' if code is None else ('done' if code == 0 else 'failed')
                 try:
                     from .misc import _catch_up_finished

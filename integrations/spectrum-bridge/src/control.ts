@@ -165,6 +165,7 @@ export class ControlClient {
     });
     let loggingOk = false;
     let loggingError: unknown;
+    let loggingTag = "control.request_failed";
     try {
     // Reads get 25 s: Robob under load answers in seconds to tens of seconds, and giving up early only looks like an outage.
     const timeout = AbortSignal.timeout(options.timeoutMs ?? 25_000);
@@ -184,14 +185,17 @@ export class ControlClient {
         proxy: "",
         verbose: false,
       });
-    } catch (caughtError) { toolError("control", "control.catch1", caughtError);
+    } catch (caughtError) {
       loggingError = caughtError;
       throw new ControlError(0);
     }
     let data: { ok?: unknown; error?: { code?: unknown } } | undefined;
     try {
       data = await response.json() as typeof data;
-    } catch (caughtError) { toolError("control", "control.catch2", caughtError); /* Non-JSON bodies only come from proxies or crashes. */ }
+    } catch (caughtError) {
+      loggingError = caughtError;
+      if (caughtError instanceof SyntaxError) loggingTag = "control.invalid_json";
+    }
     if (!response.ok || data?.ok !== true) {
       throw new ControlError(response.status || 0, typeof data?.error?.code === "string" ? data.error.code : "");
     }
@@ -204,8 +208,8 @@ export class ControlClient {
       toolLog.capture(() => {
       finishRead?.();
       toolLog.capture(() => toolLog.write({ component: "robob", kind: "perf", name: "turn.robob_call", durationMs: performance.now() - loggingAt,
-        ok: loggingOk, ids: loggingIds, props: { method, route },
-        ...(!loggingOk ? { error: { tag: "control.request_failed", cause: loggingError } } : {}) }));
+        ok: loggingOk, ids: loggingIds, props: { method, route, ...(!loggingOk ? { failureFormat: "single" } : {}) },
+        ...(!loggingOk ? { error: { tag: loggingTag, cause: loggingError } } : {}) }));
       });
     }
   }

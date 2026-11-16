@@ -134,11 +134,14 @@ export const filesLayer = ServerConfig.layerTest(process.cwd(), { prefix: "t3-ka
   Layer.provideMerge(ServerSettings.layerTest()),
 );
 
-export const testLayer = (fake: Layer.Layer<KanbanThreads>) =>
+export const testLayer = (
+  fake: Layer.Layer<KanbanThreads>,
+  store: typeof KanbanStore.layer = KanbanStore.layer,
+) =>
   KanbanService.layer.pipe(
     Layer.provideMerge(fake),
     Layer.provideMerge(KanbanModels.layerTest(null)),
-    Layer.provideMerge(KanbanStore.layer),
+    Layer.provideMerge(store),
     Layer.provideMerge(Sqlite.layerMemory),
     Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
     Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),

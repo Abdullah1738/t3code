@@ -958,7 +958,7 @@ def recover_payment(flow_id, *, max_reads=90, recipient='owner'):
     binding=journal.binding(flow_id)
     if binding['app']=='noon' and binding['vertical']=='food':
         from commerce_food import recover
-        return recover(flow_id)
+        return recover(flow_id, recipient=recipient)
     if binding['app']=='talabat':return recover_talabat(flow_id,max_reads=max_reads,recipient=recipient)
     if binding['vertical']=='nownow' and journal.inspect(flow_id)['order_id']:
         from commerce_nownow_capture import recover
@@ -984,9 +984,15 @@ def basket_arguments(parser, flag):
     parser.add_argument('--prepare-only',action='store_true',
         help='create/review the basket with exact readback, without ordering or paying (not read-only)')
     recipient_argument(parser)
+    moni_go_arguments(parser)
+
+
+def moni_go_arguments(parser):
     parser.add_argument('--moni-go',default=None,metavar='HER_WORDS',
-        help="required with --for moni unless --prepare-only: Moni's own go, quoted from her chat (checked against "
+        help="with --for moni use this or --moni-bus-request unless --prepare-only: Moni's own go (checked against "
              'her messages in the last 45 min; fails closed with MONI_GO_NOT_FOUND)')
+    parser.add_argument('--moni-bus-request',default=None,metavar='AREQ_ID',
+        help='alternative to --moni-go: open Moni-to-owner agent-bus request from the last 24 hours')
     parser.add_argument('--moni-chat',default=None,metavar='SLUG',
         help='bridge chat where she gave the go, e.g. group-sb_gro; default: her 1:1 plus every group chat')
 
@@ -999,6 +1005,21 @@ def require_moni_go(args):
     """
     placing=args.command=='test-talabat-shops' or args.command=='order'
     if not placing or getattr(args,'recipient','owner')!='moni' or getattr(args,'prepare_only',False):return None
+    request_id=getattr(args,'moni_bus_request',None)
+    quote=getattr(args,'moni_go',None)
+    if (request_id is not None) == (quote is not None):
+        raise RuntimeError('MONI_GO_REQUIRED')
+    if request_id is not None:
+        from agent_bus_read import BusError, bus_request
+        try:
+            row=bus_request(request_id)
+        except BusError as exc:
+            toollog.emit('commerce','moni_go.bus_refused',kind='error',ok=False,
+                         ids={'requestId':request_id},props={'reason':exc.code},error=exc.code)
+            raise RuntimeError(exc.code) from exc
+        toollog.emit('commerce','moni_go.bus_checked',ok=True,
+                     ids={'requestId':request_id},props={'busStatus':row['status']})
+        return {'source':'agent-bus','request':request_id,'status':row['status']}
     import moni_go
     chat=getattr(args,'moni_chat',None)
     return moni_go.verify(getattr(args,'moni_go',None) or '', **({'chat':chat} if chat else {}))
@@ -1151,6 +1172,8 @@ def main(argv=None):
     food_order.add_argument('--ack-pending',action='append',default=[],metavar='FLOW_UUID')
     food_order.add_argument('--prepare-only',action='store_true')
     food_order.add_argument('--resume-flow')
+    recipient_argument(food_order)
+    moni_go_arguments(food_order)
     talabat_order=order_commands.add_parser('talabat',
         help='Caller-authorized Talabat basket with per-item notes and menu choices')
     talabat_arguments(talabat_order)

@@ -78,5 +78,8 @@ export const ownerReplyPending = Effect.fn("Kanban.ownerReplyPending")(function*
     threadId,
     participant.actor._tag === "evaluator",
   );
-  return action?.answered === false ? action.key : null;
+  // Script posts and evaluator handoffs can owe a reply without an owner action.
+  // Keep that delivery's key stable across reminders and later system posts.
+  if (action === null) return `asked:${participant.lastReadSeq}`;
+  return action.answered ? null : action.key;
 });

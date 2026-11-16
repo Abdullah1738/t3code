@@ -3,9 +3,20 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { clean, emit, observed } from '../toollog.mjs';
+import { clean, emit, observed, tagFailurePhase } from '../toollog.mjs';
 
 import {fixture} from './support.mjs';
+test('retry and scan diagnostics enforce fixed targets, token names, numbers and booleans', () => {
+  const cleanProps = props => clean({component:'stream-recovery',name:'http.retry',kind:'event',props}).props;
+  assert.deepEqual(cleanProps({target:'control',tag:'EPIPE',ok:true,loopBlockMaxMs:75,longestSyncOp:'failedRunsSince',longestSyncMs:74}),
+    {target:'control',tag:'EPIPE',ok:true,loopBlockMaxMs:75,longestSyncOp:'failedRunsSince',longestSyncMs:74});
+  assert.deepEqual(cleanProps({target:'opencode',ok:false}), {target:'opencode',ok:false});
+  for (const value of ['private text', 'sk-private', 'https://user:password@example.invalid', '', NaN, Infinity, -1, false, null, {}, []]) {
+    const result = cleanProps({target:value,ok:value,loopBlockMaxMs:value,longestSyncMs:value,longestSyncOp:value,
+      url:'https://private.invalid',path:'/private',message:'private'});
+    assert.deepEqual(result, value === false ? {ok:false} : undefined);
+  }
+});
 test('replica diagnostics only retain finite numbers or unknown', async t => {
   const {rows} = fixture(t);
   for (const value of [42, 0, -5_001, 'unknown', 'sk-private', '/home/fixture@example.invalid', '42', NaN, Infinity, -Infinity, null, false, [], {}]) {
@@ -57,6 +68,51 @@ test('hostile metadata and broken writes never replace results or errors', async
   assert.equal(await observed('test','fixture.result',()=>42,hostile),42);
   await assert.rejects(observed('test','fixture.error',()=>{throw hostile;},hostile),e=>e===hostile);
 });
+test('fetch and abort causes keep safe codes and fixed messages without cause text', async t => {
+  const {rows} = fixture(t);
+  const privateMessage = 'connect https://user:password@example.invalid:3773/?token=sk-private';
+  const cases = [
+    ['TypeError', 'fetch failed', {code:'ECONNREFUSED'}, 'ECONNREFUSED'],
+    ['TypeError', 'fetch failed', {code:'UND_ERR_CONNECT_TIMEOUT'}, 'UND_ERR_CONNECT_TIMEOUT'],
+    ['TypeError', 'fetch failed', {code:'UND_ERR_SOCKET'}, 'UND_ERR_SOCKET'],
+    ['TypeError', 'fetch failed', {name:'AbortError'}, 'AbortError'],
+    ['TypeError', 'fetch failed', {name:'TimeoutError'}, 'TimeoutError'],
+    ['TypeError', 'fetch failed', undefined, 'FETCH_FAILED'],
+    ['TypeError', 'fetch failed', null, 'FETCH_FAILED'],
+    ['TypeError', 'fetch failed', {}, 'FETCH_FAILED'],
+    ['TypeError', 'fetch failed', {code:privateMessage,name:'TimeoutError'}, 'TimeoutError'],
+    ['TypeError', 'fetch failed', {code:'sk-private',name:privateMessage}, 'FETCH_FAILED'],
+    ['TypeError', 'fetch failed', {code:'x'.repeat(65),name:'AbortError'}, 'AbortError'],
+    ['TypeError', 'fetch failed', {code:20,name:'AbortError'}, 'AbortError'],
+    ['AbortError', 'The operation was aborted', {code:'ECONNRESET'}, 'ECONNRESET'],
+    ['TimeoutError', 'The operation was aborted due to timeout', {code:'UND_ERR_CONNECT_TIMEOUT'}, 'UND_ERR_CONNECT_TIMEOUT'],
+    ['AbortError', 'The operation was aborted', {name:'TimeoutError'}, 'TimeoutError'],
+    ['TimeoutError', 'The operation was aborted due to timeout', {code:privateMessage,name:privateMessage}, 'FETCH_FAILED'],
+    ['AbortError', 'The operation was aborted', undefined, 'AbortError'],
+    ['TimeoutError', 'The operation was aborted due to timeout', undefined, 'TimeoutError'],
+    ['TypeError', privateMessage, {code:'ECONNREFUSED'}, 'TypeError'],
+    ['Error', 'fetch failed', {code:'ECONNREFUSED'}, 'Error'],
+  ];
+  for (const [name, message, cause, tag] of cases) {
+    const error = Object.assign(new Error(message, {cause:cause && {...cause,message:privateMessage}}), {name});
+    await assert.rejects(observed('test', 'fixture.fetch', () => {throw error;}), value => value === error);
+    assert.deepEqual(rows().at(-1).error, {tag,message:message === privateMessage ? tag : message});
+  }
+  const cause = {code:'ECONNREFUSED',get message(){assert.fail('cause.message must not be read');}};
+  await assert.rejects(observed('test','fixture.fetch',()=>{throw new TypeError('fetch failed',{cause});}));
+  assert.deepEqual(rows().at(-1).error,{tag:'ECONNREFUSED',message:'fetch failed'});
+  for (const secret of ['example.invalid', 'password', 'sk-private', '?token=']) assert.ok(!JSON.stringify(rows()).includes(secret));
+});
+test('failure phases use validated private metadata and preserve frozen errors', async t => {
+  const {rows} = fixture(t);
+  for (const phase of ['activeSessions', 'bad phase', 'sk-private', 'https://user:password@example.invalid', '', 'x'.repeat(101)]) {
+    const error = Object.freeze(Object.assign(new Error('fetch failed'), {name:'TypeError',op:'untrusted',phase:'untrusted'}));
+    assert.equal(tagFailurePhase(error, phase), error);
+    await assert.rejects(observed('test','fixture.phase',()=>{throw error;}),value=>value===error);
+    assert.equal(rows().at(-1).props?.phase,phase === 'activeSessions' ? phase : undefined);
+  }
+  for (const error of [null, undefined, 'private', 42]) assert.equal(tagFailurePhase(error,'activeSessions'),error);
+});
 test('JS schema, privacy, errors, permissions and fail-open writes', async t => {
   const {root, rows} = fixture(t);
   emit('test','fixture.ok',{kind:'perf',ok:true,durationMs:1,ids:{account:'fixture@example.invalid',key:'sk-fixture-do-not-log'},props:{model:'cx/gpt-image-2',prompt:'private prompt',email:'fixture@example.invalid',tag:'sk-fixture-do-not-log'},error:{tag:'http_502',message:'private prompt fixture@example.invalid sk-fixture-do-not-log'}});
@@ -83,4 +139,12 @@ test('JS cap keeps errors, emits one cap marker, and expires only day files', t=
   emit('test','fixture.drop');emit('test','fixture.drop');emit('test','fixture.error',{kind:'error',error:{tag:'http_502'}});
   const fd=fs.openSync(path,'r'),buf=Buffer.alloc(4096);const n=fs.readSync(fd,buf,0,4096,50*1024*1024);fs.closeSync(fd);const tail=buf.subarray(0,n).toString();
   assert.equal(tail.split('log.cap').length-1,1);assert.ok(!tail.includes('fixture.drop'));assert.ok(tail.includes('fixture.error'));
+});
+
+test('provider availability analytics retain timings and counters but exclude private values', () => {
+  const row = clean({ component: 'reauth', name: 'providers.fetch.retry', kind: 'event', props: {
+    firstAttemptMs: 6000, retryAttemptMs: 15000, outcome: 'unavailable', consecutive: 3, sinceMs: 1_700_000_000_000,
+    url: 'https://private.example/auth', authorization: 'private',
+  } });
+  assert.deepEqual(row.props, { firstAttemptMs: 6000, retryAttemptMs: 15000, outcome: 'unavailable', consecutive: 3, sinceMs: 1_700_000_000_000 });
 });

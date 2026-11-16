@@ -30,6 +30,11 @@ class Logs(unittest.TestCase):
     def rows(self):
         return [json.loads(line) for path in self.root.glob('*.ndjson') for line in path.read_text().splitlines()]
 
+    def test_missing_stderr_metadata_survives_serialization(self):
+        props = dict(stream='stderr', backend='boat', reason='history_empty')
+        toollog.emit('run', 'run.log_stream_missing', kind='error', ok=False, ids={'run': 'run-fixture'}, props=props)
+        self.assertEqual(self.rows()[0]['props'], props)
+
     def test_command_transport_fields_survive_serialization(self):
         for mode in ('argv', 'file'):
             for name in ('run.start', 'run.command'):
@@ -51,6 +56,12 @@ class Logs(unittest.TestCase):
         toollog.emit('run', 'run.disk_space', ids={'box': 'bx_fixture'}, props=props)
         self.assertEqual(self.rows()[0]['props'], props)
         self.assertEqual(self.rows()[0]['ids'], {'box': 'bx_fixture'})
+
+    def test_queue_resume_fields_survive_serialization_including_unknown_places(self):
+        for place in (1, None):
+            props = dict(outageS=15, waitedMs=31000, placeBefore=place, placeAfter=place, deadlineKept=True)
+            toollog.emit('pool', 'run.queue_resumed', ids={'run': 'run-A'}, props=props)
+            self.assertEqual(self.rows()[-1]['props'], props)
 
     def test_format_private_modes_and_only_allowed_metadata(self):
         secret = 'password=secret-1234567890123456'

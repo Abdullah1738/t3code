@@ -84,12 +84,58 @@ def _key(timeout: float | None = None) -> str:
     return _KEY
 
 
+class ProbeFailure(str):
+    """String-compatible failure detail for existing callers, with typed diagnostic fields."""
+    def __new__(cls, classification, detail, began, *, prefix=None):
+        ms = round(max(0, time.monotonic() - began) * 1000, 1)
+        value = prefix or f"authenticated API did not answer ({detail})"
+        result = super().__new__(cls, f"{value}; class={classification} ms={ms:g}")
+        result.classification, result.detail, result.ms = classification, detail, ms
+        return result
+
+
+def probe_failure(error, began, stage):
+    from .home import StartWaitFailed
+    from .health_reachability import timed_out
+    if isinstance(error, StartWaitFailed):
+        return ProbeFailure("starting", "StartWaitFailed", began, prefix=str(error) + " (StartWaitFailed)")
+    if stage == "keychain":
+        return ProbeFailure("keychain", "Keychain lookup failed" if not isinstance(error, subprocess.TimeoutExpired)
+                            else "Keychain lookup exceeded deadline", began)
+    status = error.status if isinstance(error, ApiError) else error.code if isinstance(error, urllib.error.HTTPError) else None
+    if status is not None:
+        return ProbeFailure("http", f"HTTP {status}" + (" unauthorized" if status == 401 else ""), began)
+    causes, current = [], error
+    while current is not None and id(current) not in {id(e) for e in causes}:
+        causes.append(current)
+        current = getattr(current, "reason", None) or getattr(current, "__cause__", None)
+    if any(isinstance(e, ConnectionRefusedError) or getattr(e, "errno", None) == 61
+           or "connection refused" in str(e).lower() for e in causes):
+        return ProbeFailure("refused", "connect refused", began)
+    transport = isinstance(error, (NetworkError, TimeoutError, urllib.error.URLError,
+                                   BudgetExpired, http.client.HTTPException))
+    if transport and any(isinstance(e, (TimeoutError, BudgetExpired)) or timed_out(e) for e in causes):
+        return ProbeFailure("timeout", "timeout", began)
+    if isinstance(error, (ValueError, http.client.HTTPException)):
+        return ProbeFailure("invalid_response", "invalid response", began)
+    return ProbeFailure("unreachable", "transport error", began)
+
+
 def probe_backend(name: str, timeout: float = 3) -> str | None:
     """An authenticated /limits must succeed before moving new work onto a backend."""
+    began = time.monotonic()
     end = time.time() + timeout
+    stage = "keychain"
     try:
+        from . import disk_pressure
+        if name == 'server' and disk_pressure.pending():
+            from . import home
+            why = home.probe(timeout)
+            if why:
+                return why
         if name == BACKEND:
             _key(timeout=timeout)
+            stage = "request"
             with RequestScope(max(.001, end - time.time())).active():
                 call("GET", "/limits", retries=0, connect_retries=0, timeout=timeout, deadline=end)
         else:
@@ -98,7 +144,8 @@ def probe_backend(name: str, timeout: float = 3) -> str | None:
             key = subprocess.run(["security", "find-generic-password", "-s", service, "-a", account, "-w"],
                                  capture_output=True, text=True, timeout=timeout)
             if key.returncode or not key.stdout.strip():
-                return "API key unavailable"
+                return ProbeFailure("keychain", "Keychain missing", began)
+            stage = "request"
             url = _server_url() if name == "server" else os.environ.get("OFFBOX_BOAT_API") or "https://boat.dev/api/v1"
             req = urllib.request.Request(url + "/limits", headers={"Authorization": "Bearer " + key.stdout.strip(),
                                                                   "Accept": "application/json"})
@@ -109,10 +156,7 @@ def probe_backend(name: str, timeout: float = 3) -> str | None:
                     json.loads(_read_response(response, end))
         return None
     except (OffboxError, OSError, ValueError, subprocess.TimeoutExpired, http.client.HTTPException) as error:
-        from .home import StartWaitFailed
-        if isinstance(error, StartWaitFailed):
-            return str(error)
-        return "authenticated API did not answer successfully"
+        return probe_failure(error, began, stage)
 
 
 def redact(obj):
@@ -136,9 +180,17 @@ class ApiError(OffboxError):
         if status in CF_OUTAGE and not message:
             message = f"Cloudflare could not reach boat.dev ({CF_OUTAGE[status]})"
         # server_not_ready: our server is up but still importing its pool or reconciling after a restart.
-        super().__init__(f"{NAME} API {status} {code}: {message}",
+        from . import disk_pressure
+        full = BACKEND == 'server' and disk_pressure.is_full(message)
+        low = BACKEND == 'server' and code == 'server_disk_low'
+        if full or low:
+            disk_pressure.remember(True)
+        text = ('home server out of disk' if full else
+                'home offbox server is ' + disk_pressure.refusal(message, ((data or {}).get('error') or {}).get('details') or data) if low else
+                f"{NAME} API {status} {code}: {message}")
+        super().__init__(text,
                          124 if status == 408 and code == "command_timeout" else EXIT_INFRA,
-                         outage=status in CF_OUTAGE or code in ("server_not_ready", "server_starting"))
+                         outage=status in CF_OUTAGE or code in ("server_not_ready", "server_starting") or full or low)
         self.status, self.api_code, self.retryable = status, code, retryable
         self.message = message
         self.data = data or {}
@@ -221,7 +273,7 @@ _PRE_DELIVERY = re.compile(r"^connect (EADDRNOTAVAIL|ECONNREFUSED|ETIMEDOUT|EHOS
 
 
 def _never_delivered(status: int, code: str, msg: str) -> bool:
-    if status in CF_NOT_DELIVERED:
+    if status in CF_NOT_DELIVERED or (BACKEND == 'server' and code == 'server_disk_low'):
         return True
     return status in (502, 503) and code == "sandbox_direct_failed" and bool(_PRE_DELIVERY.match(msg or ""))
 
@@ -235,10 +287,12 @@ _REQUEST_SCOPE = contextvars.ContextVar('boat_request_scope', default=None)
 class RequestScope:
     """Cancel a worker's requests without changing another thread's API budget."""
 
-    def __init__(self, seconds: float, parent=None, network_timeout=False):
+    def __init__(self, seconds: float, parent=None, network_timeout=False, caller_deadline=None):
         self.seconds = seconds
         self.end = time.time() + seconds
         self.parent = parent
+        ends = [end for end in (caller_deadline, getattr(parent, 'caller_deadline', None)) if end is not None]
+        self.caller_deadline = min(ends, default=None)
         self.network_timeout = network_timeout or bool(parent and parent.network_timeout)
         self.stopped = threading.Event()
         self.lock = threading.Lock()
@@ -486,7 +540,10 @@ def _call(method: str, path: str, body=None, headers: dict | None = None, timeou
         try:
             # A refusal ends this request. Startup has its own bound; a retry needs a fresh child timer.
             with scope.request() if scope is not None else contextlib.nullcontext():
-                return _request(method, path, body, headers, timeout, retries, ok404, connect_retries, deadline)
+                result = _request(method, path, body, headers, timeout, retries, ok404, connect_retries, deadline)
+                if BACKEND == "server":
+                    home.note_home_answer()
+                return result
         except ApiError as error:
             phase = home.error_phase(error)
             if BACKEND != "server" or home.PRE_START.get() is None or not phase:
@@ -508,6 +565,9 @@ def _call(method: str, path: str, body=None, headers: dict | None = None, timeou
                 _DEADLINE += elapsed
             if scope is not None:
                 scope.end += elapsed
+                if scope.caller_deadline is not None:
+                    deadline = scope.caller_deadline if deadline is None else min(deadline, scope.caller_deadline)
+                    scope.end = min(scope.end, scope.caller_deadline)
 
 
 def command_metadata(data: dict) -> dict:
@@ -560,6 +620,8 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
     if scope is not None:
         scope.check()
         end = scope.end
+        if scope.caller_deadline is not None:
+            end = min(end, scope.caller_deadline)
         deadline = end if deadline is None else min(end, deadline)
         retries = connect_retries = 0
     if _DEADLINE is not None:
@@ -653,8 +715,13 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
                     capacity.complete(request_id, "accepted", (result.get("sandbox") or {}).get("id"))
                 if method == "POST" and path.endswith("/commands") and not (body or {}).get("detached"):
                     _log_request_error(method, path, "", status=200, data=result)
+                if BACKEND == 'server' and method not in ('GET', 'HEAD'):
+                    from . import disk_pressure
+                    disk_pressure.remember(False)
                 return result
         except urllib.error.HTTPError as e:
+            if allocation.in_scope() and not (e.code == 404 and ok404):
+                outage.queue_api_failed()
             try:
                 d = json.loads(_read_response(e, deadline))
             except Exception:  # noqa: BLE001
@@ -704,7 +771,7 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
             safe_method = method in ("GET", "DELETE", "PATCH") or "Idempotency-Key" in h
             # A start is never resent on a Cloudflare not-delivered answer, not even under the generic retry below:
             # each send reserves a start slot (create/fork carry an Idempotency-Key, so safe_method is true there).
-            start_not_delivered = is_start and e.code in CF_NOT_DELIVERED
+            start_not_delivered = is_start and (e.code in CF_NOT_DELIVERED or (BACKEND == 'server' and code == 'server_disk_low'))
             if attempt <= retries and (retryable or (e.code >= 500 and safe_method)) and not start_not_delivered \
                     and _room(1.5 * attempt) and _in_deadline(deadline, 1.5 * attempt):
                 time.sleep(1.5 * attempt)
@@ -725,6 +792,8 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
                                   "nothing ran. Check boat before retrying")
             raise ApiError(e.code, code, msg, retryable, data=d)
         except (NetworkError, urllib.error.URLError, http.client.HTTPException, TimeoutError, ConnectionError, OSError) as e:
+            if allocation.in_scope():
+                outage.queue_api_failed()
             if request_id:
                 capacity.complete(request_id, "uncertain")
                 uncertain_start = True
@@ -747,6 +816,12 @@ def probe(timeout: float = 15) -> str | None:
     would add sends and sleeps, so a probe would outrun its interval."""
     from .home import StartWaitFailed
     try:
+        from . import disk_pressure
+        if BACKEND == 'server' and disk_pressure.pending():
+            from . import home
+            why = home.probe(timeout)
+            if why:
+                return why
         call("GET", "/limits", timeout=timeout, retries=0, connect_retries=0, deadline=time.time() + timeout)
         return None
     except StartWaitFailed:
@@ -1027,13 +1102,17 @@ def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7
     network_failures = 0
     while True:
         try:
-            s = readiness_get(box_id)
-        except NetworkError:
-            network_failures += 1
-            if not home.may_fail_over() or network_failures >= HOME_NETWORK_FAILURES:
-                raise
-            time.sleep(poll)
-            continue
+            s = readiness_get(box_id, deadline=deadline) if home.may_fail_over() else readiness_get(box_id)
+        except NetworkError as error:
+            try:
+                s = home.recover_slow_read(error, lambda end: get(box_id, deadline=end), box=box_id,
+                                           deadline=deadline)
+            except NetworkError:
+                network_failures += 1
+                if not home.may_fail_over() or network_failures >= HOME_NETWORK_FAILURES:
+                    raise
+                time.sleep(poll)
+                continue
         network_failures = 0
         if s is None:
             raise OffboxError(f"box {box_id} disappeared")

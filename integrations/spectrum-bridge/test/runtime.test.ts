@@ -605,20 +605,39 @@ describe("Sendblue socket API", () => {
     } finally { chats.wake = originalWake; setSystemTime(); }
   });
 
-  test("agent bus uses admin group membership, including alternate addresses, and current admin role", async () => {
+  test("default bus pairs are explicit; group forwarding stays audience scoped", async () => {
     const { post, chats } = api();
     const family = chats.open(chatKey.group("GRP-Allowed-123"));
-    const work = chats.open(chatKey.group("GRP-Work-456"));
-    const ask = (to: string, key: string) => post("/agent-ask", { sessionId: "ses_moni", to, text: "q", dedupeKey: key });
-    expect((await ask(family.info.slug, "no-member")).status).toBe(403);
     family.store.acceptInbound("written", { sender: "moni@example.com", text: "hi" });
-    expect((await ask(family.info.slug, "member")).status).toBe(202);
-    expect((await ask(work.info.slug, "wrong-group")).status).toBe(403);
-    access.people[0]!.role = "person";
-    expect((await ask(family.info.slug, "demoted")).status).toBe(403);
-    expect((await ask("owner", "guest-owner")).status).toBe(202);
+    expect((await post("/agent-ask", { sessionId: "ses_moni", to: family.info.slug, text: "q", dedupeKey: "group" })).status).toBe(403);
     family.store.set("route", { id: "ses_group", generation: 1 });
     expect((await post("/agent-ask", { sessionId: "ses_group", to: "moni", text: "q", dedupeKey: "group" })).status).toBe(202);
+    const stranger = chats.open(chatKey.dm("+15555550888"));
+    stranger.store.set("route", { id: "ses_stranger", generation: 1 });
+    expect((await post("/agent-ask", { sessionId: "ses_stranger", to: "owner", text: "q", dedupeKey: "guest" })).status).toBe(403);
+  });
+
+  test("notify rules require the current owner session and are visible to the next bus wake", async () => {
+    const { post, chats, stateRoot } = api();
+    const add = { action: "add", text: "tell me when Moni orders" };
+    for (const [sessionId, status] of [[undefined, 400], ["stale", 409], ["ses_owner@0", 409], ["ses_moni", 403]] as const) {
+      for (const action of [add, { action: "list" }, { action: "rm", id: 1 }]) {
+        expect((await post("/notify-rule", { ...action, sessionId })).status).toBe(status);
+      }
+    }
+    const added = await post("/notify-rule", { ...add, sessionId: "ses_owner@1" });
+    expect(added.status).toBe(200);
+    const rule = added.body.rule;
+    expect((await post("/notify-rule", { action: "list", sessionId: "ses_owner" })).body.notify).toEqual([rule]);
+    expect(JSON.parse(readFileSync(join(stateRoot, "agent-policy.json"), "utf8")).notify).toEqual([rule]);
+    await post("/agent-ask", { sessionId: "ses_moni", to: "owner", text: "q", dedupeKey: "notify" });
+    expect(JSON.stringify(chats.owner.store.pendingInbound())).toContain(add.text);
+    expect((await post("/notify-rule", { action: "rm", id: (rule as { id: number }).id, sessionId: "ses_owner" })).status).toBe(200);
+    expect((await post("/notify-rule", { action: "list", sessionId: "ses_owner" })).body.notify).toEqual([]);
+    for (const bad of [{ action: "add", text: "" }, { action: "add", text: "x", id: 1 }, { action: "rm", id: "1" },
+      { action: "rm", id: 0 }, { action: "list", text: "x" }, { action: "unknown" }, { action: "list", extra: true }]) {
+      expect((await post("/notify-rule", { ...bad, sessionId: "ses_owner" })).status).toBe(400);
+    }
   });
 
   test("agent routes validate bodies, reject missing/stale sessions, and respect readiness", async () => {

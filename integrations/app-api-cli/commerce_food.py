@@ -247,9 +247,16 @@ def prepare(args):
     raw=json.loads(Path(args.items_file).read_text())
     rows=raw.get('items') if isinstance(raw,dict) else raw
     flow=FoodFlow(args.outlet_code, rows, args.resume_flow)
+    recipient=getattr(args,'recipient','owner')
+    require(recipient in ('owner','moni'), 'ORDER_RECIPIENT_INVALID')
+    require(flow.state.get('recipient',recipient)==recipient, 'ORDER_RECIPIENT_INVALID')
     from commerce_pending import cli_review
     pending=cli_review(flow,args)
     result=flow.prepare()
+    # Retain routing before a financial send so status-only recovery reaches
+    # the same recipient even when its CLI uses the default --for owner.
+    flow.state['recipient']=recipient
+    flow.save()
     if pending:result['warnings']=pending
     if args.prepare_only:return result
     from noon_food_financial import Coordinator, AutomaticTransport
@@ -258,7 +265,7 @@ def prepare(args):
     return Coordinator(flow.flow_id,reader,TrackerRegistrar(reader),transport=AutomaticTransport(reader)).place()
 
 
-def recover(flow_id):
+def recover(flow_id, *, recipient='owner'):
     """Status-only recovery never turns an interrupted preparation into a send."""
     binding=journal.binding(flow_id); local=journal.inspect(flow_id)
     require(binding['app']=='noon' and binding['vertical']=='food', 'FOOD_FLOW_REQUIRED')
@@ -271,7 +278,7 @@ def recover(flow_id):
         from noon_food_financial import Coordinator
         from noon_food_recovery import NativeReader, TrackerRegistrar
         reader=NativeReader(flow_id)
-        return Coordinator(flow_id,reader,TrackerRegistrar(reader)).recover()
+        return Coordinator(flow_id,reader,TrackerRegistrar(reader,recipient=recipient)).recover()
     state=json.loads((ROOT/(flow_id+'.json')).read_text())
     rows=[{'item_code':r['itemCode'],'qty':r['qty'],'modifiers':r['modifiers'],'notes':r['notes']} for r in state['items']]
     flow=FoodFlow(state['outlet'],rows,flow_id,read_only=True)

@@ -131,6 +131,10 @@ const usage = {
 it("requires the metadata-only usage schema and preserves null measurements", () => {
   const decodeUsage = Schema.decodeUnknownSync(RunUsageEvent, { onExcessProperty: "error" });
   expect(decodeUsage(usage)).toEqual(usage);
+  expect(Object.hasOwn(decodeUsage(usage), "cancelReason")).toBe(false);
+  const cancelled = { ...usage, endReason: "cancelled", cancelReason: "server_shutdown" };
+  expect(decodeUsage(cancelled)).toEqual(cancelled);
+  expect(() => decodeUsage({ ...cancelled, cancelReason: "unclassified" })).toThrow();
   for (const key of ["prompt", "message", "text", "toolArgs", "toolOutput", "output"]) {
     expect(() => decodeUsage({ ...usage, [key]: "private" })).toThrow();
   }
