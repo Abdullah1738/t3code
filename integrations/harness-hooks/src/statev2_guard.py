@@ -466,9 +466,10 @@ FIXTURE_TOOLS = ('mktemp', 'cat', 'ln', 'cp', 'mkdir', 'rm', 'chmod', 'touch', '
 # A changed helper fails closed until its new hash is reviewed in here.
 REPO_NODE_PIN_HASHES = {
     'bash-env.sh': {'84d84773c9b61952f5a39367470ad4043c463e8573259846ec3bb614931c8d60'},
-    # Both audited startup forms work; only the newer one sources safe-chain.
+    # Keep the pre-safe-chain form and both safe-chain forms during rollout.
     'init.sh': {'d97da32ec68ee02cbf663db7675199cd12e9bd47db27cd9bb45468d133e9a4b0',
-                '90a6436ed6c5ab91b13da9fd27e57d26cdd96b6dcfe0677e591ca5f942f38327'},
+                '90a6436ed6c5ab91b13da9fd27e57d26cdd96b6dcfe0677e591ca5f942f38327',
+                'c853ec309cdbdf38108e133875a54141bf348c6e23b6cd4e881010aa24d37aea'},
     'select.py': {'7be0cf8c91fdb19d5ea261085f67d8fe88d9100bf39d3ebca1eec4f6d867eaa4',
                   '1ded56be26d29b956ca8a62217e94c1ca952513f2cd96934a9680c08c045d61d'},
 }
