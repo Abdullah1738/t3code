@@ -4312,6 +4312,134 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       ),
   );
 
+  it.effect.each(["lifecycle", "init_echo"] as const)(
+    "gives a follow-up on the same open query its own acceptance and final result: %s",
+    (evidence) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const harness = yield* makeWakeHarness;
+          const acceptedAt: Array<number> = [];
+          for (const ordinal of [1, 2]) {
+            const input = {
+              ...makeClaudeTestTurnInput({
+                threadId: harness.threadId,
+                providerThread: harness.providerThread,
+                now: yield* DateTime.now,
+                attemptId: RunAttemptId.make(`same-query-${ordinal}`),
+                text: `Prompt ${ordinal}`,
+                attachments: [],
+                providerTurnOrdinal: ordinal,
+              }),
+              runOrdinal: ordinal,
+            };
+            yield* harness.runtime.startTurn(input);
+            const provisional = Option.getOrThrow(
+              yield* Stream.fromQueue(harness.providerTurnReceipts).pipe(
+                Stream.filter((event) => event.providerTurn.runAttemptId === input.attemptId),
+                Stream.take(1),
+                Stream.runHead,
+              ),
+            ).providerTurn;
+            assert.equal(provisional.status, "running");
+            assert.isUndefined(provisional.promptAcceptedAt);
+            assert.lengthOf(harness.processQueues, 1);
+            const promptUuid = harness.promptUuid(ordinal - 1);
+            if (ordinal === 2) assert.notEqual(promptUuid, harness.promptUuid(0));
+            yield* harness.offerAndWait(
+              claudeSdkFrame({
+                type: "command_lifecycle",
+                command_uuid: promptUuid,
+                state: "queued",
+              }),
+            );
+            const init = claudeSdkFrame({
+              type: "system",
+              subtype: "init",
+              uuid: `00000000-0000-4000-8000-00000000991${ordinal}`,
+              session_id: WAKE_NATIVE_SESSION,
+              user_message_uuids: [promptUuid],
+            });
+            yield* harness.offerAndWait(
+              evidence === "lifecycle"
+                ? claudeSdkFrame({
+                    type: "command_lifecycle",
+                    command_uuid: promptUuid,
+                    state: "started",
+                  })
+                : init,
+            );
+            const accepted = Option.getOrThrow(
+              yield* Stream.fromQueue(harness.providerTurnReceipts).pipe(
+                Stream.filter(
+                  (event) =>
+                    event.providerTurn.runAttemptId === input.attemptId &&
+                    event.providerTurn.promptAcceptedAt !== undefined,
+                ),
+                Stream.take(1),
+                Stream.runHead,
+              ),
+            ).providerTurn;
+            if (accepted.promptAcceptedAt === undefined) throw new Error("Prompt was not accepted");
+            acceptedAt.push(DateTime.toEpochMillis(accepted.promptAcceptedAt));
+            assert.equal(accepted.id, provisional.id);
+            if (evidence === "lifecycle") yield* harness.offerAndWait(init);
+            const text = `Result ${ordinal}`;
+            yield* harness.offerAndWait(
+              makeAssistantTextFrame({
+                uuid: `00000000-0000-4000-8000-00000000992${ordinal}`,
+                text,
+              }),
+            );
+            yield* harness.offerAndWait(
+              claudeSdkFrame({
+                ...makeResultFrame({
+                  uuid: `00000000-0000-4000-8000-00000000993${ordinal}`,
+                  result: text,
+                  terminalReason: null,
+                }),
+                user_message_uuid: promptUuid,
+                user_message_uuids: [promptUuid],
+              }),
+            );
+            const terminal = yield* Queue.take(harness.terminalReceipts);
+            assert.equal(terminal.providerTurnId, provisional.id);
+            assert.equal(terminal.runOrdinal, ordinal);
+            assert.equal(terminal.status, "completed");
+            assert.isNull(terminal.failure);
+            const completed = harness.events.findLast(
+              (event) =>
+                event.type === "provider_turn.updated" && event.providerTurn.id === provisional.id,
+            );
+            if (completed?.type !== "provider_turn.updated") throw new Error("Missing turn end");
+            assert.equal(completed.providerTurn.status, "completed");
+            assert.deepEqual(completed.providerTurn.promptAcceptedAt, accepted.promptAcceptedAt);
+            assert.isNotNull(completed.providerTurn.completedAt);
+            const final = harness.events.findLast(
+              (event) => event.type === "message.updated" && event.message.runId === input.runId,
+            );
+            if (final?.type !== "message.updated") throw new Error("Missing final result");
+            assert.equal(final.message.text, text);
+            assert.equal(final.message.phase, "answer");
+            yield* harness.offerAndWait(
+              claudeSdkFrame({
+                type: "command_lifecycle",
+                command_uuid: promptUuid,
+                state: "completed",
+              }),
+            );
+            yield* TestClock.adjust("1 second");
+          }
+          assert.isAbove(acceptedAt[1]!, acceptedAt[0]!);
+          assert.lengthOf(harness.terminalEvents(), 2);
+          assert.lengthOf(harness.processQueues, 1);
+        }),
+      ).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
   describe("Plan-mode tool approval", () => {
     const openPlanTurn = Effect.fn("openPlanTurn")(function* (
       runtimeMode: "auto" | "full-access",
