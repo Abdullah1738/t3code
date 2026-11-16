@@ -1,3 +1,4 @@
+import { expectJsonRoundTrip } from "./McpJson.testkit.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
@@ -4562,9 +4563,10 @@ describe("orchestrator MCP toolkit", () => {
               Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
               Effect.provideService(McpSchema.McpServerClient, client),
               Effect.tap((response) =>
-                Effect.sync(() =>
-                  expect(response.isError, JSON.stringify({ name, response })).not.toBe(true),
-                ),
+                Effect.sync(() => {
+                  expect(response.isError, JSON.stringify({ name, response })).not.toBe(true);
+                  expectJsonRoundTrip(response.structuredContent);
+                }),
               ),
             );
 

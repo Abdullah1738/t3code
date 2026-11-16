@@ -193,6 +193,8 @@ it.effect.each([
                     latestTerminalRunId: null,
                     latestTerminalStatus: null,
                     hasPendingChildRuns: false,
+                    startPending: false as const,
+                    startProgress: null,
                     // The child's run status is known before the result read starts.
                     status: "running" as const,
                   }

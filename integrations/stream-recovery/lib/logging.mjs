@@ -1,5 +1,8 @@
-const { emit, observed, tagFailurePhase = error => error } = await import('../../router-logging/toollog.mjs').catch(() => ({ emit: () => {}, observed: (_c, _n, work) => work() }));
-export { emit, observed };
+import { monitorEventLoopDelay } from 'node:perf_hooks';
+import { setTimeout as delay } from 'node:timers/promises';
+
+const { emit, observed, failure = () => ({}), tagFailurePhase = error => error } = await import('../../router-logging/toollog.mjs').catch(() => ({ emit: () => {}, observed: (_c, _n, work) => work() }));
+export { emit, observed, failure };
 
 export function deferThread(io, threadId, error) {
   if (error?.code !== 'REPLICA_BEHIND_THREAD') return false;
@@ -21,7 +24,9 @@ const phases = new Set(['acquireLock', 'loadState', 'saveState', 'openDb', 'serv
 export async function timedScan(name, io, work) {
   const totals = new Map(), timed = { ...io };
   const deferred = new Set();
-  const props = { deferredThreads:0, maxThreadAheadMs:'unknown' };
+  const props = { deferredThreads:0, maxThreadAheadMs:'unknown', longestSyncMs:0 };
+  let longestSyncMs = -1;
+  const loopDelay = monitorEventLoopDelay({ resolution:20 });
   timed.recordThreadDeferral = (threadId, error) => {
     deferred.add(threadId);
     props.deferredThreads = deferred.size;
@@ -34,22 +39,41 @@ export async function timedScan(name, io, work) {
     if (typeof io[key] !== 'function') continue;
     timed[key] = (...args) => {
       const start = performance.now();
-      const finish = (failed = false) => {
+      const finish = (failed = false, sync = false) => {
         const ms = performance.now() - start;
         const row = totals.get(key) ?? { ms: 0, max: 0, count: 0, failed: 0 };
         row.ms += ms; row.max = Math.max(row.max, ms); row.count++; row.failed += Number(failed);
         totals.set(key, row);
+        if (sync && ms > longestSyncMs) {
+          longestSyncMs = ms;
+          props.longestSyncOp = key;
+          props.longestSyncMs = Math.round(ms);
+        }
       };
       try {
         const result = io[key](...args);
         if (result && typeof result.then === 'function') return result.then(
           value => { finish(); return value; }, error => { finish(true); throw tagFailurePhase(error, key); });
-        finish();
+        finish(false, true);
         return result;
-      } catch (error) { finish(true); throw tagFailurePhase(error, key); }
+      } catch (error) { finish(true, true); throw tagFailurePhase(error, key); }
     };
   }
-  try { return await observed('stream-recovery', `${name}.scan`, () => work(timed), {props}); }
+  try { return await observed('stream-recovery', `${name}.scan`, async () => {
+    loopDelay.enable();
+    try {
+      // Prime the histogram before synchronous work; sample again before emitting
+      // so a scan that never yields still records its event-loop delay.
+      await delay(20);
+      return await work(timed);
+    } finally {
+      try { await delay(0); }
+      finally {
+        loopDelay.disable();
+        props.loopBlockMaxMs = Math.round(loopDelay.max / 1e6);
+      }
+    }
+  }, {props}); }
   finally {
     // Aggregate repeated calls and cap output, including on failed scans. No
     // SQL, call arguments or server responses are retained by the timer.

@@ -21,7 +21,13 @@ _PENDING = contextvars.ContextVar('orders_log_pending', default=None)
 _SCOPES = contextvars.ContextVar('orders_log_scopes', default=())
 _REQUEST = contextvars.ContextVar('orders_log_request', default=None)
 _SEEN = set()
+DELEGATION_REASONS = {'NO_STANDING_DELEGATION', 'DUPLICATE_DELEGATED_RECORD',
+    'BUS_REQUEST_MISSING', 'BUS_WRONG_SENDER', 'BUS_WRONG_TARGET', 'BUS_REQUEST_CLOSED',
+    'BUS_REQUEST_STALE', 'BUS_UNREADABLE', 'INVALID_LIFETIME', 'UNSUPPORTED_DELEGATION',
+    'DELEGATED_RECORD_INVALID'}
 _NAMES = {
+    'delegate.created', 'delegate.revoked', 'delegated_record.created', 'delegated_record.refused',
+    'moni_go.bus_checked', 'moni_go.bus_refused',
     'cmd.start', 'cmd.end', 'cmd.error', 'guard.refused', 'payment.may_have_sent',
     'step.auth', 'step.cart_build', 'step.checkout', 'step.payment_submit',
     'step.bank_approval_wait', 'step.confirmation', 'flow.recover_payment',
@@ -31,8 +37,11 @@ _NAMES = {
     'case.open', 'case.update', 'case.close', 'case.reopen', 'case.corroborate',
     'question.ask', 'check.run', 'cache_reset',
     'order_watch.item_drop_check',
+    'collector.hold_seen', 'collector.hold_stale', 'collector.hold_cleared',
 }
 _ENUMS = {
+    'reason': DELEGATION_REASONS,
+    'busStatus': {'open', 'pending', 'timed_out'},
     'lane': {'food', 'minutes', 'nownow', 'main', 'supermall', 'marketplace', 'careem', 'uber',
              'quik', 'shops', 'box', 'same-day'},
     'merchant': {'noon', 'careem', 'amazon', 'web', 'uber', 'other', 'unknown'},
@@ -40,7 +49,7 @@ _ENUMS = {
     'outcome': {'success', 'failure', 'refused', 'ask_now', 'dont_ask', 'unverified', 'failed'},
     'kind': {'refund', 'dispute', 'decline', 'unasked_charge', 'charge', 'hold',
              'payment_deadline', 'autopay_expected', 'merchant_card'},
-    'starved_by': {'none', 'owner_threads', 'msgs', 'lookups', 'census', 'receipt',
+    'starved_by': {'none', 'owner_threads', 'msgs', 'lookups', 'census', 'receipt', 'history',
                    'reconcile', 'follow', 'attention', 'build_write', 'merchants', 'order_charges',
                    'payments', 'questions', 'refunds', 'order_screen', 'loads', 'writes', 'locks'},
     'owner_result': {'ok', 'incomplete', 'list_failed'},
@@ -51,9 +60,9 @@ _ENUMS = {
 _ENUMS['from'] = _ENUMS['to'] = _ENUMS['state']
 _BOOLS = {'prepareOnly', 'changed', 'fallback', 'budgetHit', 'unmatched', 'deadlineMoved', 'answered', 'polled'}
 _NUMBERS = {'exitCode', 'amountMinor', 'count', 'ageDays', 'openCases', 'fired', 'sourceLimits',
-            'msgs_timeouts', 'msgs_p50_ms',
+            'msgs_cpu_ms', 'msgs_concurrent_max', 'msgs_cache_hits', 'msgs_timeouts', 'msgs_p50_ms',
             'merchants_ms', 'order_charges_ms', 'payments_ms', 'questions_ms', 'refunds_ms',
-            'order_screen_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'writes_n', 'locks_ms', 'follow_ms', 'untimed_ms',
+            'order_screen_ms', 'history_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'writes_n', 'locks_ms', 'follow_ms', 'untimed_ms',
             'owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms',
             'owner_list_pages', 'owner_list_ms', 'owner_threads_selected', 'owner_threads_fresh',
             'owner_threads_needed', 'owner_threads_fetched', 'owner_fetch_ms_max', 'owner_timeouts', 'owner_cache_size'}
@@ -65,9 +74,9 @@ _MONEY_PROPS = {
     'case.close': {'kind', 'ageDays'},
     'question.ask': {'outcome'},
     'check.run': {'budgetHit', 'openCases', 'fired', 'slowestPhase', 'sourceLimits', 'limitKinds', 'orderCoverage', 'chargeCensus',
-                  'msgs_timeouts', 'msgs_p50_ms', 'msgs_by_kind', 'receipt_result',
+                  'msgs_cpu_ms', 'msgs_concurrent_max', 'msgs_cache_hits', 'msgs_timeouts', 'msgs_p50_ms', 'msgs_by_kind', 'receipt_result',
                   'merchants_ms', 'order_charges_ms', 'payments_ms', 'questions_ms', 'refunds_ms',
-                  'order_screen_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'writes_n', 'locks_ms', 'follow_ms', 'untimed_ms',
+                  'order_screen_ms', 'history_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'writes_n', 'locks_ms', 'follow_ms', 'untimed_ms',
                   'owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms', 'starved_by',
                   'owner_list_pages', 'owner_list_ms', 'owner_threads_selected', 'owner_threads_fresh',
                   'owner_threads_needed', 'owner_threads_fetched', 'owner_fetch_ms_max', 'owner_timeouts', 'owner_cache_size', 'owner_result'},
@@ -156,7 +165,7 @@ SUPERMALL_SILENT_DELIVERY_NOT_ACTIVE TALABAT_ADDRESS_CHECK_FAILED TALABAT_RETIRE
 UNSUPPORTED_NATIVE_MARKETPLACE_QUIET_DELIVERY UNSUPPORTED_QUIET_OPTION_SEMANTICS
 """.split())
 
-_KNOWN_TAGS = _GUARD_TAGS | frozenset("""
+_KNOWN_TAGS = _GUARD_TAGS | DELEGATION_REASONS | frozenset("""
 OPERATION_FAILED LOG_CAP TRACK_REGISTRATION_FAILED TRACK_POLL_SOURCE_ERROR
 AUTH_EXPIRED AUTH_FORBIDDEN ACCOUNT_CAPTURE_REQUIRED INVALID_ORDER_ID INVALID_ARGUMENTS
 DIA_BRIDGE_UNAVAILABLE DIA_INVALID_RESPONSE DIA_TRANSPORT_FAILED FAILED SOURCE_ERRORS
@@ -441,7 +450,11 @@ def _fields(props):
         elif key in _BOOLS and type(value) is bool:
             result[key] = value
         elif key in _NUMBERS and type(value) is int and abs(value) <= 10**12 \
-                and (not (key.endswith('_ms') or key == 'writes_n' or key.startswith('owner_')) or value >= 0):
+                and (not (key.endswith('_ms') or key.startswith('msgs_') or key == 'writes_n' or key.startswith('owner_')) or value >= 0):
+            result[key] = value
+        elif key == 'hours' and type(value) in (int, float) and math.isfinite(value) and 0 < value <= 24:
+            result[key] = value
+        elif key == 'currency' and type(value) is str and re.fullmatch(r'[A-Z]{3}', value):
             result[key] = value
         elif key == 'limitKinds' and isinstance(value, list):
             result[key] = sorted({v for v in value if isinstance(v, str) and v in {
@@ -452,7 +465,7 @@ def _fields(props):
         elif key == 'msgs_by_kind' and isinstance(value, dict):
             result[key] = {kind: {k: v for k, v in bucket.items() if k in {'count', 'ms'}
                                   and type(v) is int and 0 <= v <= 10**9}
-                           for kind, bucket in value.items() if kind in {'receipt', 'order', 'other'}
+                           for kind, bucket in value.items() if kind in {'receipt', 'order', 'refund', 'history', 'other'}
                            and isinstance(bucket, dict)}
         elif key == 'chargeCensus' and isinstance(value, dict):
             result[key] = {app: {k: v for k, v in counts.items()
@@ -513,7 +526,7 @@ def _ids(values):
     # Hash even syntactically valid IDs: input IDs can themselves contain a PAN/OTP.
     return {key: hashlib.sha256(str(value).encode()).hexdigest()[:16]
             for key, value in (values or {}).items()
-            if key in {'flowId', 'orderId', 'caseId', 'watcher'} and type(value) in (str, int) and value != ''}
+            if key in {'flowId', 'orderId', 'caseId', 'requestId', 'delegationId', 'watcher'} and type(value) in (str, int) and value != ''}
 
 
 def _noon_lane(order):
@@ -526,7 +539,7 @@ def _noon_lane(order):
 
 def emit(component, name, *, kind='event', duration_ms=None, ok=None, ids=None, props=None, error=None, cause=None):
     try:
-        if component not in {'commerce', 'order-watch', 'card_status', 'noon', 'careem', 'amazon', 'uber', 'toollog', 'money-cases'}:
+        if component not in {'commerce', 'order-watch', 'card_status', 'noon', 'careem', 'amazon', 'uber', 'toollog', 'money-cases', 'owner-go'}:
             return
         if kind not in {'event', 'perf', 'error'} or name not in _NAMES:
             return
@@ -553,6 +566,15 @@ def emit(component, name, *, kind='event', duration_ms=None, ok=None, ids=None, 
                 props['lane'] = _noon_lane((ids or {}).get('orderId'))
         if props:
             row['props'] = _fields(props)
+            if component == 'order-watch' and name.startswith('collector.hold_'):
+                row['props'] = {
+                    'owner': props.get('owner')[:120] if type(props.get('owner')) is str else None,
+                    'reason': props.get('reason') if props.get('reason') in {
+                        'hold_older_than_60m', 'lease_expired', 'holder_pid_dead', 'lease_live',
+                        'no_matching_lease_within_bound', 'hold_absent'} else None,
+                    'age_s': props.get('age_s') if type(props.get('age_s')) is int
+                             and props['age_s'] >= 0 else None,
+                }
         if error is not None:
             code = tag(error)
             detail = cause or context.get('failure') or context.get('last') or _cause(error)
@@ -736,7 +758,7 @@ def rollup(day=None):
                     component = row.get('component')
                     if not isinstance(component, str) or component not in {
                             'commerce', 'order-watch', 'card_status', 'noon', 'careem',
-                            'amazon', 'uber', 'toollog', 'money-cases'}:
+                            'amazon', 'uber', 'toollog', 'money-cases', 'owner-go'}:
                         component = 'unknown'
                     component_totals[component] = component_totals.get(component, 0) + 1
                     component_errors.setdefault(component, {})

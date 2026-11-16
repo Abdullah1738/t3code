@@ -169,6 +169,7 @@ print(format(stat.S_IMODE(os.stat(sys.argv[3]).st_mode), 'o'))
                     ".local/libexec/card-preview/cardpreview.py", ".local/libexec/qcard/render.py",
                     ".local/bin/toollog", ".local/libexec/toollog/toollog.py",
                     ".local/bin/vp", ".local/libexec/vp/worktree.mjs",
+                    ".local/libexec/vp/config-snapshot.mjs",
                     ".local/libexec/vp/toolchain-state.mjs", ".local/libexec/vp/toolchain",
                     ".local/bin/qcard", ".local/bin/quint", ".local/bin/himalaya-heal", ".local/bin/mailsearch",
                     "Library/LaunchAgents/local.ardud.otp-idle.plist",

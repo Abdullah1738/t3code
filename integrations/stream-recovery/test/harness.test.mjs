@@ -9,6 +9,26 @@ import * as io from '../lib/io.mjs';
 const status = (over = {}) => ({ active: false, completed: false, claimedThreadIds: [], claimedRunIds: [], ...over });
 const old = { threadId: 't', state: 'running', activeRunId: 'r', nativeSessionId: 'ses_old', model: { instanceId: 'opencode' } };
 
+test('stream recovery stamps the stale queued pulse command as superseded', async () => {
+  const commands = [];
+  const fake = {
+    getThread: async () => old,
+    harnessCutoverStatus: async () => status(),
+    assertReplicaFresh: () => {},
+    assertThreadInReplica: () => {},
+    dispatchCommand: async (command) => { commands.push(command); },
+  };
+  const result = await act({ db: null, incident: { id: 'incident' }, g: {
+    thread: old, sourceRuns: ['r'], plan: { threadId: 't', action: 'report', resumeQueue: true },
+    staleHeld: [{ run_id: 'stale' }], held: [], lost: [], forms: [],
+  } }, fake);
+  assert.equal(result.ok, true);
+  assert.deepEqual(commands, [{
+    type: 'queued-run.cancel', commandId: 'incident:cancel:stale', threadId: 't', runId: 'stale',
+    reason: 'superseded', detail: 'Stale coordination pulse replaced during restart recovery.',
+  }]);
+});
+
 test('provider identity, not ses_ aliases, controls OpenCode liveness', () => {
   assert.equal(openCodeSession(old), 'ses_old');
   for (const instanceId of ['claudeAgent', 'codex', 'codex-cu']) {

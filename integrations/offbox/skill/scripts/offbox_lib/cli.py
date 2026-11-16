@@ -268,7 +268,18 @@ def _run_with_wait_budget(a, me) -> int:
                     capacity_round = time.monotonic()
                 with outage.allocation_budget(remaining):
                     return _remote_once(a, me)
+            except home.FailbackReady as ready:
+                # Runner signal handlers and all queue/box scopes must unwind before transferring to a new client.
+                return home.fail_back(ready, getattr(a, "argv", None) or sys.argv[1:])
             except OffboxError as e:
+                if home.active() and os.environ.get(home.RETURNED_HOME_ENV) and home.unreachable(e):
+                    # This invocation already left Boat's queue once. Remain at home through subsequent outages.
+                    say("home offbox server is unavailable again; this run stays queued on home")
+                    runs.retry_background(e, run_id=e.run_id)
+                    if e.run_id:
+                        os.environ[home.RUN_ID_ENV] = e.run_id
+                    time.sleep(home.failback_probe_seconds())
+                    continue
                 runs.retry_background(e)
                 run_id = e.run_id or os.environ.get(runs.BACKGROUND_RUN_ENV, '')
                 if isinstance(e, pool.PoolBusyError) and waited_from is not None and last_outage is not None and \
@@ -454,7 +465,7 @@ def _main(argv: list[str] | None = None) -> int:
         if a.sub == "logs":
             return misc.logs(a.run_id, a.follow)
         if a.sub == "wait":
-            return misc.wait(a.run_id, a.timeout)
+            return misc.wait(a.run_id, a.timeout, summary=True)
         if a.sub == "local":
             misc.local_exempt(me, a.reason, a.ttl, a.list, a.clear)
         elif a.sub == "list":

@@ -560,6 +560,32 @@ const OrchestrationV2DelegatedTaskStall = Schema.Struct({
   lastProgressKind: Schema.String,
 });
 
+export const OrchestrationV2CancelReason = Schema.Literals([
+  "server_shutdown",
+  "server_restart",
+  "user_stop",
+  "thread_reset",
+  "thread_archive",
+  "thread_settle",
+  "thread_delete",
+  "workspace_change",
+  "runtime_mode_change",
+  "session_detach",
+  "card_stop",
+  "superseded",
+  "promoted_to_steer",
+  "task_cancel",
+  "delegated_parent_cancelled",
+  "queued_cancel",
+  "provider_cancelled",
+  "provider_interrupted",
+  "task_stalled",
+  "unknown",
+]);
+export type OrchestrationV2CancelReason = typeof OrchestrationV2CancelReason.Type;
+
+const CancelDetail = Schema.String.check(Schema.isMaxLength(500));
+
 export const OrchestrationV2Run = Schema.Struct({
   id: RunId,
   threadId: ThreadId,
@@ -571,6 +597,8 @@ export const OrchestrationV2Run = Schema.Struct({
   rootNodeId: Schema.NullOr(NodeId),
   activeAttemptId: Schema.NullOr(RunAttemptId),
   status: OrchestrationV2RunStatus,
+  cancelReason: Schema.optional(OrchestrationV2CancelReason),
+  cancelDetail: Schema.optional(CancelDetail),
   queuePosition: Schema.optional(Schema.NullOr(PositiveInt)),
   queueHeld: Schema.optional(Schema.Boolean),
   requestedAt: Schema.DateTimeUtc,
@@ -783,6 +811,8 @@ export const OrchestrationV2Subagent = Schema.Struct({
   ]),
   idleTimeoutMs: Schema.optional(Schema.Finite),
   failureReason: Schema.optional(Schema.Literal("stalled")),
+  cancelReason: Schema.optional(OrchestrationV2CancelReason),
+  cancelDetail: Schema.optional(CancelDetail),
   progress: Schema.optional(Schema.String),
   workflow: Schema.optional(OrchestrationV2SubagentWorkflow),
   result: Schema.NullOr(Schema.String),
@@ -831,6 +861,7 @@ export const OrchestrationV2ProviderSessionDetached = Schema.Struct({
   providerSessionId: ProviderSessionId,
   detachedAt: Schema.DateTimeUtc,
   reason: Schema.optional(Schema.String),
+  cancelReason: Schema.optional(OrchestrationV2CancelReason),
 });
 export type OrchestrationV2ProviderSessionDetached =
   typeof OrchestrationV2ProviderSessionDetached.Type;
@@ -1594,6 +1625,7 @@ export const OrchestrationV2TurnItem = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2TurnItemBaseFields,
     type: Schema.Literal("run_interrupt_request"),
+    cancelReason: Schema.optional(OrchestrationV2CancelReason),
     message: Schema.String,
   }),
   Schema.Struct({
@@ -2385,6 +2417,7 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2TurnItemJsonBaseFields,
     type: Schema.Literal("run_interrupt_request"),
+    cancelReason: Schema.optional(OrchestrationV2CancelReason),
     message: Schema.String,
   }),
   Schema.Struct({
@@ -2760,6 +2793,7 @@ export type OrchestrationV2StoredEventJson = typeof OrchestrationV2StoredEventJs
 export const OrchestrationV2Command = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("thread.stop"),
+    cancelReason: Schema.optional(OrchestrationV2CancelReason),
     commandId: CommandId,
     threadId: ThreadId,
     reason: Schema.optional(Schema.String),
@@ -2992,6 +3026,7 @@ export const OrchestrationV2Command = Schema.Union([
     threadId: ThreadId,
     providerSessionId: ProviderSessionId,
     reason: Schema.optional(Schema.String),
+    cancelReason: Schema.optional(OrchestrationV2CancelReason),
   }),
   Schema.Struct({
     type: Schema.Literal("message.dispatch"),
@@ -3079,6 +3114,7 @@ export const OrchestrationV2Command = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("run.interrupt"),
+    cancelReason: Schema.optional(OrchestrationV2CancelReason),
     commandId: CommandId,
     threadId: ThreadId,
     runId: RunId,
@@ -3110,6 +3146,8 @@ export const OrchestrationV2Command = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("queued-run.cancel"),
+    reason: Schema.optional(OrchestrationV2CancelReason),
+    detail: Schema.optional(CancelDetail),
     commandId: CommandId,
     threadId: ThreadId,
     runId: RunId,

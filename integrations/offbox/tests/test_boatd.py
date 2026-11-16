@@ -794,7 +794,7 @@ class Http(Base):
         boatd.health(fresh=True)
         st, d = self.call(None, "GET", "/health")
         self.assertEqual(st, 200)
-        self.assertEqual(sorted(d), ["boatd_uptime_s", "boot", "boot_id", "mdraid", "mode", "ok", "phase", "pool", "queue", "reasons",
+        self.assertEqual(sorted(d), ["boatd_uptime_s", "boot", "boot_id", "disk", "disk_full", "disk_low", "host", "mdraid", "mode", "ok", "phase", "pool", "queue", "reasons",
                                      "refresh_stage", "refresh_stage_ms", "refresh_timings_ms", "restartPending", "running", "snapshot_age_s",
                                      "startedAt", "starting", "startupPhases", "up", "uptime_s", "version"])
         self.assertNotIn("moni", json.dumps(d))
@@ -1229,6 +1229,40 @@ class HealthSnapshot(Base):
         health = boatd.health()
         self.assertTrue(health["starting"])
         self.assertEqual(health["phase"], "reconciling runs and boxes after start")
+
+    def test_host_pressure_is_fresh_even_when_health_snapshot_is_stale_or_missing(self):
+        proc = {"/proc/loadavg": "131.25 112.50 115.75 193/10000 1\n",
+                "/proc/pressure/cpu": "some avg10=83.42 avg60=81.0 avg300=79.0 total=1\n",
+                "/proc/pressure/io": "some avg10=35.20 avg60=30.0 avg300=25.0 total=1\n"}
+        read_text = Path.read_text
+
+        def read(path, *args, **kwargs):
+            if str(path) in proc:
+                return proc[str(path)]
+            return read_text(path, *args, **kwargs)
+
+        with patch.object(Path, "read_text", read), patch.object(boatd.os, "cpu_count", return_value=32):
+            boatd._HEALTH.update(ts=0, v=None)
+            self.assertEqual(boatd.health()["host"], {"loadavg": [131.25, 112.5, 115.75], "cores": 32,
+                                                     "cpu_some_avg10": 83.42, "io_some_avg10": 35.2})
+            boatd.health(fresh=True)
+            proc["/proc/loadavg"] = "1 2 3 1/100 1"
+            with patch.object(boatd, "_sh", side_effect=AssertionError("host read must not spawn")):
+                self.assertEqual(boatd.health()["host"]["loadavg"], [1, 2, 3])
+
+    def test_missing_and_malformed_host_metrics_stay_unknown(self):
+        for value in (OSError(), "", "oops", "nan inf -1", "1 2"):
+            with self.subTest(value=value):
+                def read(path, *args, **kwargs):
+                    if isinstance(value, Exception):
+                        raise value
+                    return value
+                with patch.object(Path, "read_text", read), patch.object(boatd.os, "cpu_count", return_value=None):
+                    self.assertEqual(boatd.host_pressure(), {"loadavg": None, "cores": None,
+                                                           "cpu_some_avg10": None, "io_some_avg10": None})
+        for value in ("nan", "inf", "-1", "101"):
+            with self.subTest(psi=value), patch.object(Path, "read_text", return_value=f"some avg10={value} total=1"):
+                self.assertIsNone(boatd.psi("cpu"))
 
     def test_slow_stage_logs_what_waited(self):
         with patch.object(boatd.time, "monotonic", side_effect=[10, 12]), patch.object(boatd, "log") as log:

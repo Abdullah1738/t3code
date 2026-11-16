@@ -49,6 +49,17 @@ export class McpCall extends Context.Service<
       };
     };
     callerResolved: boolean;
+    cardNext?: {
+      stages: Array<{
+        stage: NonNullable<AnalyticsEvent["cardNextStages"]>[number]["stage"];
+        durationMs: number;
+        readerWaitMs: number;
+        queryMs: number;
+        completed: boolean;
+      }>;
+      active?: { started: bigint; index: number; durationBefore: number };
+      waitingSince?: bigint;
+    };
     callerResolveMs: number;
     requestTiming?: {
       readonly authMs: number;

@@ -7102,28 +7102,43 @@ it.layer(layerSharedApplicationDataPlaneTest)("pending provider interruption", (
     }),
   );
 
-  it.effect(
-    "stops an attached starting attempt before terminalizing a run with no provider turn projection",
-    () =>
+  it.effect.each(
+    ([undefined, "interrupted", "cancelled"] as const).flatMap((terminalStatus) =>
+      (
+        [
+          "user_stop",
+          "task_cancel",
+          "thread_reset",
+          "card_stop",
+          "delegated_parent_cancelled",
+          "superseded",
+          "task_stalled",
+        ] as const
+      ).map((cancelReason) => ({ terminalStatus, cancelReason })),
+    ),
+  )(
+    "stops an attached starting attempt before terminalizing: $terminalStatus / $cancelReason",
+    ({ terminalStatus, cancelReason }) =>
       Effect.gen(function* () {
         const projects = yield* ProjectService.ProjectService;
         const orchestrator = yield* Orchestrator.OrchestratorV2;
         const threadManagement = yield* ThreadManagementService.ThreadManagementService;
         const effectWorker = yield* EffectWorker.OrchestrationEffectWorkerV2;
-        const projectId = ProjectId.make("runtime-layer-attached-interrupt-project");
-        const threadId = ThreadId.make("runtime-layer-attached-interrupt-thread");
+        const suffix = `${terminalStatus ?? "pending"}:${cancelReason}`;
+        const projectId = ProjectId.make(`runtime-layer-attached-interrupt-project:${suffix}`);
+        const threadId = ThreadId.make(`runtime-layer-attached-interrupt-thread:${suffix}`);
 
         yield* projects.create({
-          commandId: CommandId.make("runtime-layer-attached-interrupt-project-create"),
+          commandId: CommandId.make(`runtime-layer-attached-interrupt-project-create:${suffix}`),
           projectId,
           title: "Pending interrupt project",
-          workspaceRoot: "/tmp/runtime-layer-attached-interrupt-project",
+          workspaceRoot: `/tmp/runtime-layer-attached-interrupt-project-${suffix}`,
         });
         yield* orchestrator.dispatch({
           type: "thread.create",
           createdBy: "user",
           creationSource: "web",
-          commandId: CommandId.make("runtime-layer-attached-interrupt-create"),
+          commandId: CommandId.make(`runtime-layer-attached-interrupt-create:${suffix}`),
           threadId,
           projectId,
           title: "Pending interrupt",
@@ -7137,9 +7152,9 @@ it.layer(layerSharedApplicationDataPlaneTest)("pending provider interruption", (
           type: "message.dispatch",
           createdBy: "user",
           creationSource: "web",
-          commandId: CommandId.make("runtime-layer-attached-interrupt-message"),
+          commandId: CommandId.make(`runtime-layer-attached-interrupt-message:${suffix}`),
           threadId,
-          messageId: MessageId.make("runtime-layer-attached-interrupt-message"),
+          messageId: MessageId.make(`runtime-layer-attached-interrupt-message:${suffix}`),
           text: "Do not reach the provider.",
           attachments: [],
           modelSelection,
@@ -7161,7 +7176,7 @@ it.layer(layerSharedApplicationDataPlaneTest)("pending provider interruption", (
         yield* sink.write({
           events: [
             {
-              id: EventId.make("attached-run-running"),
+              id: EventId.make(`attached-run-running:${suffix}`),
               type: "run.updated",
               threadId,
               runId: run.id,
@@ -7169,7 +7184,7 @@ it.layer(layerSharedApplicationDataPlaneTest)("pending provider interruption", (
               payload: { ...run, status: "running" },
             },
             {
-              id: EventId.make("attached-attempt-running"),
+              id: EventId.make(`attached-attempt-running:${suffix}`),
               type: "run-attempt.updated",
               threadId,
               runId: run.id,
@@ -7177,14 +7192,14 @@ it.layer(layerSharedApplicationDataPlaneTest)("pending provider interruption", (
               payload: { ...attempt, status: "running" },
             },
             {
-              id: EventId.make("attached-session-bound"),
+              id: EventId.make(`attached-session-bound:${suffix}`),
               type: "provider-thread.updated",
               threadId,
               runId: run.id,
               occurredAt: at,
               payload: {
                 ...providerThread,
-                providerSessionId: ProviderSessionId.make("attached-claude-session"),
+                providerSessionId: ProviderSessionId.make(`attached-claude-session:${suffix}`),
               },
             },
           ],
@@ -7199,7 +7214,48 @@ it.layer(layerSharedApplicationDataPlaneTest)("pending provider interruption", (
             assert.equal(input.attemptId, attempt.id);
             yield* Deferred.succeed(stopping, undefined);
             yield* Deferred.await(stopped);
-          }),
+            if (terminalStatus !== undefined)
+              yield* sink.write({
+                events: [
+                  {
+                    id: EventId.make(`attached-provider-terminal-run:${suffix}`),
+                    type: "run.updated",
+                    threadId,
+                    runId: run.id,
+                    occurredAt: at,
+                    payload: {
+                      ...run,
+                      status: terminalStatus,
+                      cancelReason:
+                        terminalStatus === "cancelled"
+                          ? "provider_cancelled"
+                          : "provider_interrupted",
+                      completedAt: at,
+                    },
+                  },
+                  {
+                    id: EventId.make(`attached-provider-terminal-attempt:${suffix}`),
+                    type: "run-attempt.updated",
+                    threadId,
+                    runId: run.id,
+                    occurredAt: at,
+                    payload: { ...attempt, status: terminalStatus, completedAt: at },
+                  },
+                  {
+                    id: EventId.make(`attached-provider-terminal-node:${suffix}`),
+                    type: "node.updated",
+                    threadId,
+                    runId: run.id,
+                    occurredAt: at,
+                    payload: {
+                      ...starting.nodes.find((node) => node.id === run.rootNodeId)!,
+                      status: terminalStatus,
+                      completedAt: at,
+                    },
+                  },
+                ],
+              });
+          }).pipe(Effect.orDie),
         );
         const spy = vi.spyOn(sessions, "get").mockReturnValue(
           Effect.succeed(
@@ -7212,10 +7268,11 @@ it.layer(layerSharedApplicationDataPlaneTest)("pending provider interruption", (
         const interrupting = yield* threadManagement
           .interruptThread({
             projectId,
-            commandId: CommandId.make("runtime-layer-attached-interrupt-command"),
+            commandId: CommandId.make(`runtime-layer-attached-interrupt-command:${suffix}`),
             threadId,
             runId: run.id,
             reason: "Cancelled before provider start",
+            cancelReason,
           })
           .pipe(Effect.forkScoped);
         const milestone = yield* Effect.raceFirst(
@@ -7231,11 +7288,13 @@ it.layer(layerSharedApplicationDataPlaneTest)("pending provider interruption", (
         assert.equal(interrupt.type, "interrupt_requested");
 
         const interrupted = yield* orchestrator.getThreadProjection(threadId);
-        assert.equal(interrupted.runs[0]?.status, "interrupted");
-        assert.equal(interrupted.attempts[0]?.status, "interrupted");
+        assert.equal(interrupted.runs[0]?.status, terminalStatus ?? "interrupted");
+        assert.equal(interrupted.runs[0]?.cancelReason, cancelReason);
+        assert.equal(interrupted.runs[0]?.cancelDetail, "Cancelled before provider start");
+        assert.equal(interrupted.attempts[0]?.status, terminalStatus ?? "interrupted");
         assert.equal(
           interrupted.nodes.find((node) => node.kind === "root_turn")?.status,
-          "interrupted",
+          terminalStatus ?? "interrupted",
         );
         assert.deepEqual(
           interrupted.turnItems.filter((item) => item.runId === run.id).map((item) => item.type),

@@ -1228,7 +1228,7 @@ def read(row, deadline=None, **_):
 
 def finder(*rows):
     """A fake msgs search; charges.py itself keeps rows by time, sender and source."""
-    def find(query, since, until=None, source=None, n=20, deadline=None, memo=None, stats=None):
+    def find(query, since, until=None, source=None, n=20, deadline=None, memo=None, stats=None, all_copies=False):
         return [r for r in rows if source is None or r['source'] == source]
     return find
 

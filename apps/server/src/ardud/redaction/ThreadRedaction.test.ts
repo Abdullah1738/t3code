@@ -11,6 +11,7 @@ import * as NodeFS from "node:fs";
 import * as NodeWorkerThreads from "node:worker_threads";
 import * as Fiber from "effect/Fiber";
 import * as ReadonlyReplica from "../persistence/ReadonlyReplica.ts";
+import { initializeKanbanSchema } from "../persistence/kanbanSchema.ts";
 import { makeEventNdjsonLogStore } from "../../provider/EventNdjsonLogger.ts";
 import { filesBelow } from "./providerFiles.ts";
 import * as TestClock from "effect/testing/TestClock";
@@ -866,8 +867,7 @@ const extendedStores = (distinct = true) =>
     const baseOnly = distinct ? "eyJFAKE.BASE-ONLY.NO-SIGNATURE" : fake;
     const replicaOnly = distinct ? "eyJFAKE.REPLICA-ONLY.NO-SIGNATURE" : fake;
     yield* sql`CREATE TABLE ardud_opencode_import (native_session_id TEXT PRIMARY KEY, thread_id TEXT)`;
-    yield* sql`CREATE TABLE ardud_kanban_cards (id TEXT PRIMARY KEY, active_thread_id TEXT, json TEXT)`;
-    yield* sql`CREATE TABLE ardud_kanban_threads (thread_id TEXT PRIMARY KEY, ended INTEGER)`;
+    yield* initializeKanbanSchema(sql);
     yield* sql`CREATE TABLE ardud_history_base_archive (filename TEXT NOT NULL)`;
     yield* sql`INSERT INTO ardud_history_base_archive VALUES ('statev2.pre-shrink-fixture.sqlite')`;
     yield* sql`INSERT INTO projection_thread_sessions(thread_id,status,provider_name,provider_session_id,updated_at) VALUES (${threadId},'stopped','claudeAgent','session-fixture','2026-01-01')`;
@@ -1024,14 +1024,12 @@ it.live("redaction stops a real export worker and resumed publication stays clea
       const paths = yield* extendedStores(false);
       const config = yield* Config.ServerConfig;
       const sql = yield* SqlClient.SqlClient;
-      let started!: () => void;
-      let resumed!: () => void;
-      const startup = new Promise<void>((resolve) => {
-        started = resolve;
-      });
-      const published = new Promise<void>((resolve) => {
-        resumed = resolve;
-      });
+      const startup = yield* Deferred.make<void, Error>();
+      const published = yield* Deferred.make<void, Error>();
+      const fail = (error: Error) => {
+        Deferred.doneUnsafe(startup, Effect.fail(error));
+        Deferred.doneUnsafe(published, Effect.fail(error));
+      };
       let generation = 0;
       const control = yield* ReadonlyReplica.makeCoordinatedReplica(() => {
         const current = ++generation;
@@ -1047,14 +1045,18 @@ it.live("redaction stops a real export worker and resumed publication stays clea
             },
           },
         );
-        worker.on("message", (message: { type: string }) => {
-          if (current === 1 && message.type === "opened") started();
-          if (current >= 2 && message.type === "published") resumed();
+        worker.on("message", (message: { type: string; stage?: string; error?: string }) => {
+          if (message.type === "failed")
+            fail(new Error(`Export worker ${current} failed (${message.stage}): ${message.error}`));
+          if (current === 1 && message.type === "opened") Deferred.doneUnsafe(startup, Effect.void);
+          if (current >= 2 && message.type === "published")
+            Deferred.doneUnsafe(published, Effect.void);
         });
+        worker.on("error", fail);
         return worker as unknown as ReadonlyReplica.ExportWorker;
       });
       const supervisor = yield* Effect.forkScoped(control.run, { startImmediately: true });
-      yield* Effect.promise(() => startup);
+      yield* Deferred.await(startup);
       const service = yield* ThreadRedaction.ThreadRedaction.pipe(
         Effect.provide(
           Layer.fresh(ThreadRedaction.layer).pipe(
@@ -1078,7 +1080,7 @@ it.live("redaction stops a real export worker and resumed publication stays clea
         compact: true,
       });
       expect(result.verify).toBe(true);
-      yield* Effect.promise(() => published);
+      yield* Deferred.await(published);
       yield* Fiber.interrupt(supervisor);
       const rows = yield* sql<{
         payload_json: string;

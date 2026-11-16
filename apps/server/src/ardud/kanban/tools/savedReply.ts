@@ -72,14 +72,25 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
   };
   const parent = yield* SavedWrite.observer;
   const parentCommitting = yield* SavedWrite.commitObserver;
+  const parentLookup = yield* SavedWrite.reportLookupObserver;
   const call = yield* Effect.serviceOption(McpCall);
   let slowSubSteps: ReadonlyArray<SavedWrite.SubStep> = [];
   let commitStarted = false;
   let receipt: SavedWrite.Saved | undefined;
+  let reportLookup: SavedWrite.ReportLookup | undefined;
+  // reportBug publishes its target before any report write, so no target proves this call saved no report.
+  const savedState = () =>
+    receipt !== undefined
+      ? true
+      : tool === "report_bug" && reportLookup === undefined
+        ? false
+        : commitStarted
+          ? null
+          : false;
   const attributes = () => ({
     "kanban.reply.stage_at_timeout": stageAtTimeout,
     "kanban.reply.timed_out": timerLatenessMs !== null,
-    "kanban.reply.saved": receipt !== undefined ? true : commitStarted ? null : false,
+    "kanban.reply.saved": savedState(),
     "kanban.reply.commit_started": commitStarted,
     "kanban.reply.elapsed_ms": elapsed(),
     "kanban.reply.budget_ms": REPLY_BUDGET_MS,
@@ -98,19 +109,35 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
           }
         : receipt?.kind === "evaluator"
           ? { threadId: receipt.threadId }
-          : receipt?.kind === "message"
-            ? { message: { discussionId: receipt.message.discussionId, seq: receipt.message.seq } }
-            : {};
-    const saved = receipt !== undefined ? true : commitStarted ? null : false;
+          : receipt?.kind === "evaluatorQueue"
+            ? { queued: true, queueId: receipt.queueId, evaluatorKey: receipt.key }
+            : receipt?.kind === "message"
+              ? {
+                  message: { discussionId: receipt.message.discussionId, seq: receipt.message.seq },
+                }
+              : tool === "report_bug" && reportLookup !== undefined
+                ? { lookup: reportLookup }
+                : {};
+    const saved = savedState();
     const message =
       saved === false
-        ? "Not saved (board busy). Safe to retry."
+        ? tool === "report_bug"
+          ? "Nothing was saved; retry with the same arguments."
+          : "Not saved (board busy). Safe to retry."
         : tool === "report_bug"
           ? receipt === undefined
-            ? "Bug report reply timed out; a sighting or evaluator may have been saved. Check card_get and board threads before retrying."
+            ? reportLookup === undefined
+              ? "Nothing was saved; retry with the same arguments."
+              : `Bug report outcome unknown. ${
+                  reportLookup.kind === "card"
+                    ? `Look up card #${reportLookup.number} (${reportLookup.cardId}) on board ${reportLookup.boardId}.`
+                    : `Look up evaluator key prefix ${reportLookup.keyPrefix} on board ${reportLookup.boardId}.`
+                } Retry with the same arguments to recover the report or save it once.`
             : receipt.kind === "evaluator"
               ? "Saved; the returned threadId identifies the request evaluator. Do not submit another report."
-              : "Saved; the sighting is on appendedTo. Read it with card_get."
+              : receipt.kind === "evaluatorQueue"
+                ? "Saved; the request evaluator is queued with the returned queueId and evaluatorKey. Do not submit another report."
+                : "Saved; the sighting is on appendedTo. Read it with card_get."
           : tool === "discussion_post"
             ? receipt === undefined
               ? "Discussion post reply timed out; the message may have been saved. Read back with discussion_read before retrying."
@@ -157,6 +184,10 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
       BoardLocks.writeWaitMs,
       timingOnly ? yield* BoardLocks.writeWaitMs : ADMISSION_BUDGET_MS,
     ),
+    Effect.provideService(SavedWrite.reportLookupObserver, (lookup) => {
+      reportLookup = lookup;
+      parentLookup(lookup);
+    }),
     Effect.provideService(SavedWrite.commitObserver, () => {
       commitStarted = true;
       parentCommitting();
@@ -166,6 +197,7 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
       if (tool === "report_bug") {
         if (
           saved.kind === "evaluator" ||
+          saved.kind === "evaluatorQueue" ||
           (saved.kind === "card" &&
             (receipt === undefined ||
               (receipt.kind === "card" && saved.card.id === receipt.card.id)))

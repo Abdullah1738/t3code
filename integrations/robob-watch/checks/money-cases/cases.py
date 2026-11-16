@@ -107,7 +107,7 @@ FOLLOW_BUDGET = 20  # seconds of archive lookups per check
 ORDER_RESERVE = 12
 ORDER_SCREEN_BUDGET = 1
 FOLLOW_STEPS = ('merchants', 'order_charges', 'payments', 'questions', 'refunds',
-                'owner_threads', 'msgs', 'receipt', 'lookups', 'order_screen', 'census', 'loads', 'writes', 'locks')
+                'owner_threads', 'msgs', 'history', 'receipt', 'lookups', 'order_screen', 'census', 'loads', 'writes', 'locks')
 TIMING_KEYS = tuple(name + '_ms' for name in FOLLOW_STEPS) + ('msgs_max_ms', 'follow_ms', 'untimed_ms', 'writes_n')
 FOLLOW_EACH = 6  # at most this many of them per question, least recently checked first
 DONT_ASK = 3
@@ -2743,7 +2743,8 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
             census[app]['not_checked'] -= 1
         census[app][outcome] += 1
 
-    memo = {('orders_cache',): Path(data) / 'order-details.json'}
+    memo = {('orders_cache',): Path(data) / 'order-details.json',
+            ('msgs_cache',): Path(data) / 'msgs-searches.json'}
     for app in ('noon', 'careem'):
         times = [at - charges.SAME_TIME for _, at, q in todo
                  if q.get('kind') == 'charge' and charges.order_app(charge_of(q)) == app]
@@ -3108,7 +3109,7 @@ def direct_refund_statement(evidence, done, merchant):
 
 
 def refund_mails(data, now, deadline, find=None, read=None, stats=None):
-    find = find or (lambda *a, **kw: charges.search(*a, **kw, stats=stats))
+    find = find or (lambda *a, **kw: charges.search(*a, **kw, stats=stats, all_copies=True))
     read = read or (lambda *a, **kw: charges.show(*a, **kw, stats=stats))
     errors = []
     for case in load(data)['cases']:
@@ -3123,7 +3124,9 @@ def refund_mails(data, now, deadline, find=None, read=None, stats=None):
         try:
             with within(deadline, LookupTimeout('out of time')):
                 rows = find(' OR '.join(f'"{w}"' for w in words) + ' refund OR credited', charges.day(since),
-                            source='email', n=10, deadline=deadline)
+                            until=charges.day(now + dt.timedelta(days=1)), source='email', n=10, deadline=deadline)
+                if getattr(rows, 'raw_count', len(rows)) >= 10:
+                    raise charges.Lookup('refund scan incomplete: search limit reached')
                 for row in sorted(rows, key=lambda row: row['ts'], reverse=True):
                     mailed = dt.datetime.fromtimestamp(row['ts'], TZ)
                     sender = row.get('sender', '').lower()

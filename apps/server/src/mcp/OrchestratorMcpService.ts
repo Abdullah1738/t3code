@@ -113,6 +113,7 @@ import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterReg
 import {
   subagentResultForRun,
   delegatedTaskProgress,
+  delegatedTaskResultRun,
 } from "@t3tools/provider-core/server/subagentProjection";
 import {
   DispatchModeLimit,
@@ -588,6 +589,30 @@ function taskResultTransfer(
   task: OrchestrationV2Subagent,
 ) {
   const originalRun = delegatedTaskRun(child, task);
+  const transferredRunIds = new Set(
+    parent.contextTransfers
+      .filter(
+        (transfer) =>
+          transfer.type === "subagent_result" &&
+          transfer.sourceThreadId === task.childThreadId &&
+          transfer.targetThreadId === parent.thread.id,
+      )
+      .map((transfer) => transfer.sourcePoint.runId),
+  );
+  const selectedResultRun = delegatedTaskResultRun(
+    {
+      runs: child.runs.filter(
+        (run) =>
+          run.delegatedTaskId !== undefined ||
+          run.id === originalRun?.id ||
+          transferredRunIds.has(run.id),
+      ),
+      messages: [],
+      contextTransfers: parent.contextTransfers,
+    },
+    task.id,
+    originalRun,
+  );
   const resultRunIds = new Set(
     child.runs
       .filter(
@@ -598,6 +623,7 @@ function taskResultTransfer(
       .map((run) => run.id),
   );
   if (originalRun !== undefined) resultRunIds.add(originalRun.id);
+  if (selectedResultRun !== undefined) resultRunIds.add(selectedResultRun.id);
   return parent.contextTransfers.find(
     (transfer) =>
       transfer.type === "subagent_result" &&
@@ -990,6 +1016,12 @@ function threadRun(run: OrchestrationV2Run): OrchestratorMcpThreadRun {
     runId: run.id,
     ordinal: run.ordinal,
     status: run.status,
+    ...(run.cancelReason === undefined ? {} : { cancelReason: run.cancelReason }),
+    ...(run.cancelDetail === undefined ? {} : { cancelDetail: run.cancelDetail }),
+    statusSummary:
+      run.status === "cancelled" || run.status === "interrupted"
+        ? `${run.status} (${run.cancelReason ?? "unknown"}${run.cancelDetail === undefined ? "" : `: ${run.cancelDetail}`})`
+        : run.status,
     providerInstanceId: run.modelSelection.instanceId,
     model: run.modelSelection.model,
     requestedAt: DateTime.formatIso(run.requestedAt),
@@ -2155,7 +2187,17 @@ const make = Effect.gen(function* () {
         McpTaskTrace.stage(effect, "child_records", "t3.task"),
       );
     const childRun = delegatedTaskRun(childControls, task);
-    const terminalRun = latestTerminalResultRun(childControls, childRun);
+    const progress = delegatedTaskProgress(childControls);
+    const taskResultRun =
+      childRun?.delegatedTaskId === task.id
+        ? delegatedTaskResultRun(childControls, task.id, childRun)
+        : progress.resultRun;
+    // Untagged notification wakes can be cancelled before starting; tagged
+    // restart recuts must still pass the started-run filter.
+    const terminalRun = latestTerminalResultRun(
+      childControls,
+      taskResultRun?.delegatedTaskId === undefined ? (taskResultRun ?? childRun) : childRun,
+    );
     const unfinishedRuns = childControls.runs
       .filter(
         (run) =>
@@ -2180,13 +2222,6 @@ const make = Effect.gen(function* () {
       hasPendingChildRuns: hasPendingChildRuns(childControls, childRun),
       ...startState(currentRun ?? childRun, childControls.providerTurns),
     });
-    const progress = delegatedTaskProgress(childControls);
-    const taskResultRun =
-      childRun?.delegatedTaskId === task.id
-        ? childControls.runs
-            .filter((run) => run.delegatedTaskId === task.id)
-            .toSorted((a, b) => b.ordinal - a.ordinal)[0]
-        : progress.resultRun;
     const resultRunAncestors = new Set<RunId>();
     let resultSource = taskResultRun;
     while (resultSource !== undefined && !resultRunAncestors.has(resultSource.id)) {
@@ -2375,6 +2410,20 @@ const make = Effect.gen(function* () {
               filesMayBePartlyWritten: true,
             };
     const finishedOn = claudeRecoveryResult(recoveredRun, null).finishedOn;
+    const transferredResultRun = childControls.runs.find(
+      (run) => run.id === resultTransfer?.sourcePoint.runId,
+    );
+    const hasSpecificTaskCancellation =
+      task.cancelReason !== undefined &&
+      task.cancelReason !== "unknown" &&
+      task.cancelReason !== "provider_cancelled" &&
+      task.cancelReason !== "provider_interrupted";
+    const cancellation =
+      task.result !== null
+        ? hasSpecificTaskCancellation || transferredResultRun?.cancelReason === undefined
+          ? task
+          : transferredResultRun
+        : resultRun;
     const response = {
       retry,
       partial: false,
@@ -2385,6 +2434,12 @@ const make = Effect.gen(function* () {
       childRunId: childRun?.id ?? null,
       childNodeId: task.id,
       status,
+      ...(cancellation?.cancelReason === undefined
+        ? {}
+        : { cancelReason: cancellation.cancelReason }),
+      ...(cancellation?.cancelDetail === undefined
+        ? {}
+        : { cancelDetail: cancellation.cancelDetail }),
       ...(taskFailure === undefined ? {} : { failure: taskFailure }),
       startedAt: childRun?.startedAt == null ? null : DateTime.formatIso(childRun.startedAt),
       ...startState(
@@ -3462,6 +3517,7 @@ const make = Effect.gen(function* () {
         yield* threadManagement
           .dispatch({
             type: "thread.stop",
+            cancelReason: "task_cancel",
             commandId,
             threadId: current.childThreadId,
             ...(reason === undefined ? {} : { reason }),
@@ -3498,6 +3554,8 @@ const make = Effect.gen(function* () {
           yield* threadManagement
             .dispatch({
               type: "queued-run.cancel",
+              reason: "task_cancel",
+              detail: reason.slice(0, 500),
               commandId: stableCommandId({
                 scope,
                 requestKey: key,
@@ -4018,6 +4076,12 @@ const make = Effect.gen(function* () {
                 ? {}
                 : { taskId: result.run.delegatedTaskId }),
               status: result.run.status,
+              ...(result.run.cancelReason === undefined
+                ? {}
+                : { cancelReason: result.run.cancelReason }),
+              ...(result.run.cancelDetail === undefined
+                ? {}
+                : { cancelDetail: result.run.cancelDetail }),
               delivery: result.delivery,
             } satisfies OrchestratorMcpThreadSendResult;
           }),
@@ -4073,6 +4137,8 @@ const make = Effect.gen(function* () {
           threadId: input.threadId,
           runId: selected?.id ?? null,
           status: selected === undefined ? "idle" : runOutcome(selected),
+          ...(selected?.cancelReason === undefined ? {} : { cancelReason: selected.cancelReason }),
+          ...(selected?.cancelDetail === undefined ? {} : { cancelDetail: selected.cancelDetail }),
           timedOut: true,
           ...startState(selected, []),
         };
@@ -4107,6 +4173,12 @@ const make = Effect.gen(function* () {
           threadId: input.threadId,
           runId: result.run?.id ?? null,
           status: result.run === null ? "idle" : runOutcome(result.run),
+          ...(result.run?.cancelReason === undefined
+            ? {}
+            : { cancelReason: result.run.cancelReason }),
+          ...(result.run?.cancelDetail === undefined
+            ? {}
+            : { cancelDetail: result.run.cancelDetail }),
           timedOut: result.timedOut,
           ...startState(result.run, []),
           ...(result.run != null && result.run.activeAttemptId === acceptedAttemptId
@@ -4185,10 +4257,22 @@ const make = Effect.gen(function* () {
           status: "no_active_run",
         } satisfies OrchestratorMcpThreadInterruptResult;
       }
+      const committedRun = yield* loadProjection(input.threadId, ["runs"], {
+        projectionOnly: true,
+      }).pipe(
+        Effect.map((projection) => projection.runs.find((run) => run.id === result.run.id)),
+        Effect.orElseSucceed(() => undefined),
+      );
       return {
         threadId: input.threadId,
         runId: result.run.id,
         status: result.type === "already_terminal" ? result.run.status : "interrupt_requested",
+        ...(committedRun?.cancelReason === undefined
+          ? {}
+          : { cancelReason: committedRun.cancelReason }),
+        ...(committedRun?.cancelDetail === undefined
+          ? {}
+          : { cancelDetail: committedRun.cancelDetail }),
       } satisfies OrchestratorMcpThreadInterruptResult;
     }),
   });

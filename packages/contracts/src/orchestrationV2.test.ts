@@ -37,6 +37,8 @@ import {
   OrchestrationV2ProviderTurn,
   OrchestrationV2ProviderTurnJson,
   OrchestrationV2RpcSchemas,
+  OrchestrationV2RunJson,
+  OrchestrationV2CancelReason,
   OrchestrationV2ShellSnapshot,
   OrchestrationV2SubscribeThreadInput,
   OrchestrationV2Subagent,
@@ -637,6 +639,21 @@ describe("orchestration V2 contracts", () => {
       throw new Error(`Expected run.created, received ${event.type}.`);
     }
     expect(event.payload.id).toBe(RunId.make("run-1"));
+    expect(event.payload.cancelReason).toBeUndefined();
+    const legacy = Schema.encodeSync(OrchestrationV2RunJson)(event.payload);
+    expect(Schema.decodeSync(OrchestrationV2RunJson)(legacy).cancelReason).toBeUndefined();
+    for (const cancelReason of OrchestrationV2CancelReason.literals) {
+      const run = {
+        ...event.payload,
+        status: "cancelled" as const,
+        cancelReason,
+        cancelDetail: "Stopped before launch.",
+      };
+      expect(
+        Schema.decodeSync(OrchestrationV2RunJson)(Schema.encodeSync(OrchestrationV2RunJson)(run)),
+      ).toEqual(run);
+    }
+    expect(() => Schema.decodeUnknownSync(OrchestrationV2CancelReason)("not_a_reason")).toThrow();
   });
 
   it("accepts a thread Stop without a client-resolved run", () => {

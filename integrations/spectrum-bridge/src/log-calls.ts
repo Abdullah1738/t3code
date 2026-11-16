@@ -11,7 +11,10 @@ const CALLS: Record<string, string> = {
 };
 const NAMES = new Set(Object.values(CALLS));
 const MAX_MS = 86_400_000;
-export type CallStats = { count: number; ok: number; failed: number; p50: number; p95: number; max: number; histogram: [number, number][] };
+export const SLOW_CALL_MS = 5_000;
+const SLOW_WINDOW_MS = 600_000;
+const SLOW_ROW_LIMIT = 20;
+export type CallStats = { count: number; ok: number; failed: number; p50: number; p95: number; max: number; histogram: [number, number][]; suppressedSlow?: number };
 export type CallSummary = Record<string, CallStats>;
 
 export function callName(line: LogLine): string | undefined {
@@ -46,15 +49,19 @@ export function cleanCalls(value: unknown): CallSummary | undefined {
     const count = [...histogram.values()].reduce((a, b) => a + b, 0);
     if (count !== stats.ok! + stats.failed!) continue;
     result[name] = { count, ok: stats.ok!, failed: stats.failed!, ...percentiles(histogram), histogram: [...histogram] };
+    if (Number.isSafeInteger(stats.suppressedSlow) && stats.suppressedSlow! >= 0 && stats.suppressedSlow! <= stats.ok!) result[name]!.suppressedSlow = stats.suppressedSlow;
   }
   if (Object.keys(result).length) return result;
 }
 
-type Group = { ids: Record<string, string>; ts: string; calls: Map<string, { ok: number; failed: number; histogram: Map<number, number> }> };
+type Group = { ids: Record<string, string>; ts: string; calls: Map<string, { ok: number; failed: number; histogram: Map<number, number>; suppressedSlow: number }> };
 
 export function createCallAggregation(processRunId: string) {
   const active = new Map<string, { runId: string; messageId?: string }>();
   const groups = new Map<string, Group>();
+  // Summaries may flush during a turn; keep the sliding limit independent of those batches.
+  const slowRows = new Map<string, number[]>();
+  let sweptAt = 0;
   let day = "";
   const turnId = (thread: string, message: string) => createHash("sha256").update(thread).update("\0").update(message).digest("hex").slice(0, 32);
   function ids(threadId?: string): Record<string, string> {
@@ -68,6 +75,7 @@ export function createCallAggregation(processRunId: string) {
       for (const [name, stats] of group.calls) calls[name] = {
         count: stats.ok + stats.failed, ok: stats.ok, failed: stats.failed,
         ...percentiles(stats.histogram), histogram: [...stats.histogram],
+        ...(stats.suppressedSlow ? { suppressedSlow: stats.suppressedSlow } : {}),
       };
       lines.push({ ts: group.ts, tool: "imessage", component: "robob", kind: "perf", name: "turn.robob_calls", ids: group.ids, calls });
       groups.delete(key);
@@ -100,21 +108,33 @@ export function createCallAggregation(processRunId: string) {
           groups.set(runId, group);
         }
         group.ts = line.ts;
-        const stats = group.calls.get(name) ?? { ok: 0, failed: 0, histogram: new Map<number, number>() };
+        const stats = group.calls.get(name) ?? { ok: 0, failed: 0, histogram: new Map<number, number>(), suppressedSlow: 0 };
         if (line.ok) stats.ok++; else stats.failed++;
         // Millisecond bins merge exactly across turns and days without keeping raw fast calls.
         const ms = Math.round(line.durationMs);
         stats.histogram.set(ms, (stats.histogram.get(ms) ?? 0) + 1);
         group.calls.set(name, stats);
         line.ids = { ...line.ids, callBatchId: group.ids.callBatchId! };
-        if (line.durationMs <= 1_000 && line.ok) return output;
+        if (line.ok) {
+          if (line.durationMs <= SLOW_CALL_MS) return output;
+          const at = Date.parse(line.ts);
+          if (at - sweptAt >= SLOW_WINDOW_MS) {
+            for (const [key, timestamps] of slowRows) if (timestamps.every(time => time <= at - SLOW_WINDOW_MS)) slowRows.delete(key);
+            sweptAt = at;
+          }
+          const key = `${runId}\0${name}`;
+          const timestamps = (slowRows.get(key) ?? []).filter(time => time > at - SLOW_WINDOW_MS);
+          slowRows.set(key, timestamps);
+          if (timestamps.length >= SLOW_ROW_LIMIT) { stats.suppressedSlow++; return output; }
+          timestamps.push(at);
+        }
       }
     }
     if (line.name === "turn.end") {
       output.push(...flush(line.ids?.runId));
       if (thread && active.get(thread)?.runId === line.ids?.runId) active.delete(thread);
     }
-    if (line.name === "bridge.stop") { output.push(...flush()); active.clear(); }
+    if (line.name === "bridge.stop") { output.push(...flush()); active.clear(); slowRows.clear(); }
     output.push(line);
     return output;
   }

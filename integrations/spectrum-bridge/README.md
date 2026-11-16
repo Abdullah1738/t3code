@@ -348,6 +348,10 @@ jq . "$HOME/.robob/logs/tools/imessage/rollup-$(date -u +%F).json"
 `total` includes calls represented by turn summaries; `recordedRows` counts disk
 records. Call percentiles merge millisecond histograms, including slow and failed
 calls that also retain individual rows. `byComponent` includes each call name.
+Successful calls retain individual rows only above 5 seconds, capped at 20 per
+run and call name in a rolling 10-minute window. Summaries count every call and
+report `suppressedSlow` for capped rows. Failed requests always retain one
+`turn.robob_call` row with their reduced error, without a duplicate catch row.
 After 50 MB, `log.degraded` marks errors-and-turns logging for the rest of the day.
 
 ## Upstream
