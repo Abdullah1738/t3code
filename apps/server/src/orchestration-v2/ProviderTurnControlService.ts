@@ -20,6 +20,11 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 import { providerUserMessageText } from "./ProviderMessageText.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import { PROVIDER_START_CLEANUP_TIMEOUT_MS } from "./providerStartDeadlinePolicy.ts";
+import * as KanbanStore from "../ardud/kanban/store/KanbanStore.ts";
+import {
+  postRecoveryIdentity,
+  postRecoveryPending,
+} from "../ardud/kanban/engine/ownerReplyWake.ts";
 
 const yieldToRuntime = Effect.yieldNow.pipe(
   Effect.andThen(
@@ -93,6 +98,7 @@ export const layer: Layer.Layer<
   Effect.gen(function* () {
     const projections = yield* ProjectionStore.ProjectionStoreV2;
     const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+    const kanban = yield* Effect.serviceOption(KanbanStore.KanbanStore);
 
     const load = Effect.fn("ProviderTurnControlService.load")(function* (input: {
       readonly threadId: ThreadId;
@@ -366,6 +372,15 @@ export const layer: Layer.Layer<
             });
           }
           const text = yield* providerUserMessageText(message);
+          // Running turns receive steering without passing provider-start admission.
+          const recovery = postRecoveryIdentity(input.messageId);
+          if (
+            input.messageId.startsWith("kanban:post-recovery:") &&
+            Option.isSome(kanban) &&
+            (recovery === null ||
+              !(yield* postRecoveryPending(kanban.value, recovery.discussionId, recovery.seq)))
+          )
+            return;
           yield* loaded.session.value
             .steerTurn({
               threadId: input.threadId,

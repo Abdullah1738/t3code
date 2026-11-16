@@ -41,7 +41,12 @@ import * as ServerSettings from "../serverSettings.ts";
 import { restartNoteText } from "../ardud/opencode-import/ChildSessions.ts";
 import { CodexHistoryNotSentError } from "../ardud/harness-migrate/CodexHistoryDeliveryError.ts";
 import * as KanbanStore from "../ardud/kanban/store/KanbanStore.ts";
-import { ownerReplyDiscussion, ownerReplyPending } from "../ardud/kanban/engine/ownerReplyWake.ts";
+import {
+  ownerReplyDiscussion,
+  ownerReplyPending,
+  postRecoveryIdentity,
+  postRecoveryPending,
+} from "../ardud/kanban/engine/ownerReplyWake.ts";
 // ardud: unconfirmed native history must not be replaced by a lossy handoff.
 import { isClaudeSeeded, seededUnconfirmed } from "../ardud/harness-migrate/seededGuard.ts";
 import { makeIsManagedWorktreePath } from "../worktreesDirectory.ts";
@@ -88,6 +93,7 @@ const isProviderTurnStartError = Schema.is(ProviderTurnStartError);
 const refusedBeforePrompt = (error: unknown): boolean =>
   Predicate.isTagged(error, "ClaudeBackgroundWorkBlocksQueryReplacementError") ||
   Predicate.isTagged(error, "ProviderAdapterRecoveryRefusedError") ||
+  (Predicate.hasProperty(error, "code") && error.code === "provider_prompt_not_sent") ||
   (Predicate.hasProperty(error, "cause") && refusedBeforePrompt(error.cause));
 
 const isProtocolError = Schema.is(ProviderAdapter.ProviderAdapterProtocolError);
@@ -284,6 +290,7 @@ export const layer: Layer.Layer<
       liveSession: ProviderAdapter.ProviderAdapterV2SessionRuntime,
       isIncomingRunCurrent: () => Effect.Effect<boolean, ProjectionStore.ProjectionStoreV2Error>,
       loadRecoveryAdmission?: RunExecutionService.RunExecutionServiceV2StartRootRunInput["loadRecoveryAdmission"],
+      recovery?: NonNullable<ReturnType<typeof postRecoveryIdentity>>,
     ) => {
       const startWithRecovery = Effect.fn("ProviderTurnStartService.startWithRecovery")(function* (
         turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
@@ -311,10 +318,36 @@ export const layer: Layer.Layer<
                       : Effect.succeed(true),
                 ),
               ),
-        ).pipe(Effect.mapError(readFailure));
+        ).pipe(
+          Effect.flatMap((current) =>
+            !current || recovery === undefined || Option.isNone(kanban)
+              ? Effect.succeed(current)
+              : postRecoveryPending(kanban.value, recovery.discussionId, recovery.seq).pipe(
+                  Effect.flatMap((pending) =>
+                    pending
+                      ? Effect.succeed(true)
+                      : Effect.fail(
+                          new ProviderAdapter.ProviderAdapterTurnStartError({
+                            driver: liveSession.driver,
+                            threadId: turnInput.threadId,
+                            providerThreadId: turnInput.providerThread.id,
+                            runId: turnInput.runId,
+                            code: "provider_prompt_not_sent",
+                            cause: "Discussion post already handled",
+                          }),
+                        ),
+                  ),
+                ),
+          ),
+          Effect.mapError(readFailure),
+        );
         // Handoff delivery and stale-turn Stop can await after outer admission.
         // Guard the first native offer and the one native retry at this boundary.
-        if (loadRecoveryAdmission !== undefined && !(yield* incomingIsCurrent)) return;
+        if (
+          (loadRecoveryAdmission !== undefined || recovery !== undefined) &&
+          !(yield* incomingIsCurrent)
+        )
+          return;
         const result = yield* Effect.result(start(turnInput));
         if (result._tag === "Success") return;
         const stale = activeTurnRefusal(result.failure)?.activeTurn;
@@ -598,6 +631,33 @@ export const layer: Layer.Layer<
           }).pipe(Effect.uninterruptible);
         },
       );
+      const recoveryPost = postRecoveryIdentity(run.userMessageId);
+      if (
+        run.userMessageId.startsWith("kanban:post-recovery:") &&
+        Option.isSome(kanban) &&
+        (recoveryPost === null ||
+          !(yield* postRecoveryPending(
+            kanban.value,
+            recoveryPost.discussionId,
+            recoveryPost.seq,
+          ).pipe(Effect.mapError((cause) => new ProviderTurnStartError({ runId, cause })))))
+      ) {
+        yield* settleRunBeforeStart({
+          signal: "stale-owner-reply",
+          status: "completed",
+          now: yield* DateTime.now,
+          providerInstanceId: run.providerInstanceId,
+          itemProviderThreadId: providerThread.id,
+          item: {
+            type: "command_execution",
+            title: "Discussion post already handled",
+            input: "",
+            output: "",
+            exitCode: 0,
+          },
+        });
+        return;
+      }
       const ownerDiscussion = Option.isSome(kanban)
         ? yield* ownerReplyDiscussion(kanban.value, run.userMessageId, message.text).pipe(
             Effect.mapError((cause) => new ProviderTurnStartError({ runId, cause })),
@@ -914,6 +974,7 @@ export const layer: Layer.Layer<
         isAutomaticClaudeRecovery(sessionResult.success.driver, run)
           ? runControls.loadRecoveryAdmission
           : undefined,
+        recoveryPost ?? undefined,
       );
       if (!(yield* isCurrentAttemptInStatus("starting"))) return;
       const loadFromProvider = Effect.fn("ProviderTurnStartService.loadFromProvider")(function* (
