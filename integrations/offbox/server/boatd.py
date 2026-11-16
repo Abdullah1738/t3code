@@ -57,6 +57,7 @@ except ImportError:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import boatd_disk as disk
+import boatd_tmp
 
 try:
     import offbox_disk_space
@@ -101,6 +102,7 @@ DEFAULTS = {
     "default_peak_gb": 4,             # admission: predicted peak for a kind with no history
     "retention": dict(RETENTION),
     "zpool": "offbox",
+    "scratch_disk": True,             # new boxes only; keep lifecycle handling enabled on rollback
     "state_dataset": "",              # e.g. offbox/boatd: boatd refuses to keep state anywhere else (set by install-host.sh)
     "owners": ["ardud", "moni"], "default_owner": "ardud",
     "person_owners": ["moni"],        # their boxes get hourly/daily/weekly snapshots
@@ -193,6 +195,8 @@ def migrate(con) -> None:
     con.executescript(SCHEMA_V2)
     if "mgmt_ssh_port" not in _cols(con, "boxes"):
         con.execute("ALTER TABLE boxes ADD COLUMN mgmt_ssh_port INTEGER")
+    if "provision_identity" not in _cols(con, "boxes"):
+        con.execute("ALTER TABLE boxes ADD COLUMN provision_identity INTEGER NOT NULL DEFAULT 0")
     owner = CFG.get("default_owner") or "ardud"
     if "owner" not in _cols(con, "boxes"):
         con.execute("ALTER TABLE boxes ADD COLUMN owner TEXT")
@@ -766,6 +770,32 @@ def ct_exec(box_id: str, cmd: str, input: bytes | None = None, timeout: float = 
     return incus(*args, "--", "bash", "-c", cmd, input=input, timeout=timeout, check=check)
 
 
+def scratch():
+    return boatd_tmp.Scratch(CFG, incus)
+
+
+def check_instance_identity(box_id: str) -> None:
+    p = incus('query', f'/1.0/instances/{ct(box_id)}', check=False, timeout=30)
+    if p.returncode and not instance_missing(p):
+        raise Fail(500, 'incus_failed', 'cannot confirm interrupted instance identity')
+    if not p.returncode and json.loads(p.stdout).get('config', {}).get('user.offbox.provision') != box_id:
+        raise Fail(500, 'instance_identity', 'refusing cleanup of an unlabelled interrupted instance')
+
+
+def delete_instance(box_id: str, owner: str, require_identity: bool = False) -> None:
+    with boatd_tmp.lock(box_id):
+        if require_identity:
+            check_instance_identity(box_id)
+        deleted = incus('delete', ct(box_id), '--force', timeout=300, check=False)
+        if deleted.returncode and not instance_missing(deleted):
+            raise Fail(500, 'incus_failed', 'Incus did not confirm instance deletion')
+        scratch().delete(box_id, owner)
+
+
+def cleanup_provision(box_id: str, owner: str) -> None:
+    delete_instance(box_id, owner, require_identity=True)
+
+
 # ---------------------------------------------------------------- boxes
 
 def new_box_id(con) -> str:
@@ -922,26 +952,37 @@ def provision(box_id: str, source: tuple[str, str | None], t: str) -> None:
     """source: ("image", alias) | ("saved", instance) | ("box", box_id). Runs in a thread."""
     con = db()
     try:
+        # Keep the identity requirement after failed creation, later resumes and reaping.
+        set_box(con, box_id, provision_identity=1)
         kind, ref = source
         name = ct(box_id)
+        marker = ('-c', f'user.offbox.provision={box_id}')
         if kind == "image":
-            incus("init", ref, name, "-p", "default", "-p", "offbox", timeout=900)
+            incus("init", ref, name, "-p", "default", "-p", "offbox", *marker, timeout=900)
         elif kind == "saved":
-            incus("copy", ref, name, "--instance-only", "-p", "default", "-p", "offbox", timeout=900)
+            incus("copy", ref, name, "--instance-only", "-p", "default", "-p", "offbox", *marker, timeout=900)
         else:
-            incus("copy", ct(ref), name, "--instance-only", "-p", "default", "-p", "offbox", timeout=900)
+            incus("copy", ct(ref), name, "--instance-only", "-p", "default", "-p", "offbox", *marker, timeout=900)
+        r = box_row(con, box_id)
+        scratch().create(box_id, r['owner'])
         apply_size(box_id, t)
         r = box_row(con, box_id)
         _ensure_proxy(box_id, r["ssh_port"])
         _ensure_mgmt_proxy(con, box_id)
-        incus("start", name, timeout=300)
+        scratch().start(box_id)
         _wait_boot(box_id, ssh=False)
+        scratch().verify(box_id)
         _fresh_identity(box_id)
         _wait_boot(box_id)
         set_box(con, box_id, state="ready", last_active=now(), error=None)
         log(f"box {box_id} ready ({kind} {ref} {t})")
     except Exception as e:  # noqa: BLE001
         log(f"provision {box_id} failed: {e}")
+        try:
+            cleanup_provision(box_id, box_row(con, box_id)['owner'])
+        except Exception as cleanup:
+            log(f'provision cleanup deferred for {box_id}: {cleanup}')
+            e = RuntimeError(f'{e}; cleanup deferred: {cleanup}')
         set_box(con, box_id, state="error", error=str(e)[:500])
     finally:
         con.close()
@@ -972,7 +1013,7 @@ def create_box(con, body: dict, idem: str | None, owner: str, src_box: str | Non
     t0 = now()
     con.execute("BEGIN IMMEDIATE")
     con.execute("INSERT INTO boxes (id, name, type, state, ttl, last_active, created_at, updated_at, ssh_port, source, "
-                "owner) VALUES (?,?,?,?,?,?,?,?,?,?,?)", (bid, (body.get("name") or bid)[:120], t, "provisioning",
+                "owner, provision_identity) VALUES (?,?,?,?,?,?,?,?,?,?,?,1)", (bid, (body.get("name") or bid)[:120], t, "provisioning",
                                                           int(body.get("ttlSeconds") or 1200), t0, t0, t0,
                                                           next_ssh_port(con), src_label, owner))
     if idem:
@@ -1094,8 +1135,9 @@ def resume_box(con, box_id: str, body: dict) -> None:
             _ensure_proxy(box_id, box_row(c2, box_id)["ssh_port"])
             _ensure_mgmt_proxy(c2, box_id)
             if not ct_running(box_id):
-                incus("start", ct(box_id), timeout=300)
+                scratch().start(box_id)
             _wait_boot(box_id)
+            scratch().verify(box_id)
             set_box(c2, box_id, state="ready", last_active=now())
             log(f"box {box_id} resumed")
         except Exception as e:  # noqa: BLE001
@@ -1110,11 +1152,12 @@ def delete_box(con, box_id: str) -> None:
     r = box_row(con, box_id)
     if r["pinned"]:
         raise Fail(409, "sandbox_pinned", f"{box_id} is pinned; unpin it first")
-    for c in con.execute("SELECT pid FROM commands WHERE box_id=? AND status IN ('queued','running')", (box_id,)):
-        kill_cmd(con, box_id, c["pid"], lost=True)
-    deleted = incus("delete", ct(box_id), "--force", timeout=300, check=False)
-    if deleted.returncode and not instance_missing(deleted):
-        raise Fail(500, 'incus_failed', 'Incus did not confirm instance deletion')
+    with boatd_tmp.lock(box_id):
+        if r['provision_identity']:
+            check_instance_identity(box_id)
+        for c in con.execute("SELECT pid FROM commands WHERE box_id=? AND status IN ('queued','running')", (box_id,)):
+            kill_cmd(con, box_id, c["pid"], lost=True)
+        delete_instance(box_id, r['owner'], require_identity=bool(r['provision_identity']))
     con.execute("DELETE FROM snaps WHERE box_id=?", (box_id,))
     set_box(con, box_id, state="deleted", deleted_at=now())
     log(f"box {box_id} deleted")
@@ -1146,6 +1189,7 @@ def save_box(con, box_id: str, name: str, owner: str) -> dict:
         c2 = db()
         try:
             incus("copy", ct(box_id), inst, "--instance-only", "--stateless", timeout=900)
+            scratch().detach_copy(inst)
             size = _instance_bytes(inst)
             prev = c2.execute("SELECT instance FROM saved WHERE owner=? AND name=?", key).fetchone()
             c2.execute("UPDATE saved SET instance=?, source=?, type=?, status='ready', error=NULL, size_bytes=?, "
@@ -2323,8 +2367,9 @@ def start_container(box_id: str) -> str | None:
             apply_size(box_id, r["type"])
             _ensure_proxy(box_id, r["ssh_port"])
             _ensure_mgmt_proxy(c2, box_id)
-            incus("start", ct(box_id), timeout=300)
+            scratch().start(box_id)
         _wait_boot(box_id)
+        scratch().verify(box_id)
         set_box(c2, box_id, state="ready", last_active=now(), error=None)
         return None
     except Exception as e:  # noqa: BLE001
@@ -2370,9 +2415,15 @@ def reconcile(con) -> dict:
     # stays as an error so the client that asked for it gets a clear answer.
     for bid, r in boxes.items():
         if r["state"] == "provisioning":
-            incus("delete", ct(bid), "--force", timeout=300, check=False)
-            set_box(con, bid, state="error", error="creation was interrupted by a server restart; create it again")
-            out["cleaned"].append(f"half-created box {bid}")
+            set_box(con, bid, provision_identity=1)
+            try:
+                cleanup_provision(bid, r['owner'])
+                set_box(con, bid, state="error", error="creation was interrupted by a server restart; create it again")
+                out["cleaned"].append(f"half-created box {bid}")
+            except Exception as e:
+                # An unsafe backing must not be erased, or block recovery of unrelated boxes.
+                set_box(con, bid, state="error", error=f"creation interrupted; cleanup deferred: {e}"[:500])
+                log(f'creation cleanup deferred for {bid}: {e}')
     # 2. Saved states whose copy was cut short: remove exactly that copy, keep the previous one.
     for sv in con.execute("SELECT * FROM saved WHERE status='pending'").fetchall():
         if sv["pending_instance"]:
@@ -3274,7 +3325,8 @@ def main() -> int:
             if owner not in CFG["owners"]:
                 print(f"boatd: owner must be one of {', '.join(CFG['owners'])}", file=sys.stderr)
                 return 2
-            box_row(con, a[2])
+            r = box_row(con, a[2])
+            scratch().chown(a[2], r['owner'], owner)
             set_box(con, a[2], owner=owner)
             print(f"{a[2]} now belongs to {owner}")
             return 0
