@@ -45,9 +45,20 @@ export class AgentBus {
       hop INTEGER NOT NULL, status TEXT NOT NULL, text_chars INTEGER NOT NULL, answer_chars INTEGER,
       created_at INTEGER NOT NULL, answered_at INTEGER, timed_out_at INTEGER
     );
+    CREATE TABLE IF NOT EXISTS agent_operations (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS agent_requests_open ON agent_requests(created_at) WHERE status IN ('open', 'pending', 'timed_out');
     CREATE INDEX IF NOT EXISTS agent_requests_from ON agent_requests(from_slug, created_at DESC);
     CREATE INDEX IF NOT EXISTS agent_requests_to ON agent_requests(to_slug, created_at DESC);`);
+  }
+
+  once(id: string, fingerprint: string, perform: () => SbApiResult): SbApiResult {
+    return this.deps.db.transaction(() => {
+      const old = this.deps.db.query<{ fingerprint: string; result: string }, [string]>("SELECT * FROM agent_operations WHERE id=?").get(id);
+      if (old) return old.fingerprint === fingerprint ? JSON.parse(old.result) : failure(409, "Operation key reused");
+      const result = perform();
+      if (result.status < 400) this.deps.db.query("INSERT INTO agent_operations VALUES (?,?,?)").run(id, fingerprint, JSON.stringify(result));
+      return result;
+    })();
   }
 
   private get(id: string): RequestRow | null {
