@@ -1,0 +1,97 @@
+import { isDeepStrictEqual } from "node:util";
+import { parseClientSnapshot, parseScramUsers } from "./kafka-acl-evidence.mjs";
+import { scramUsersShell, shellQuote } from "./kafka-onbox-admin.mjs";
+
+const base = '--bootstrap-server "$BOOT" --command-config "$CFG"';
+export const SNAPSHOT_COMMANDS = {
+  users: scramUsersShell(),
+  topics: `/opt/kafka/bin/kafka-topics.sh ${base} --list --exclude-internal`,
+  partitions: `/opt/kafka/bin/kafka-topics.sh ${base} --describe --exclude-internal`,
+  groups: `/opt/kafka/bin/kafka-consumer-groups.sh ${base} --list`,
+  assignments: `/opt/kafka/bin/kafka-consumer-groups.sh ${base} --describe --all-groups`,
+  offsets: `/opt/kafka/bin/kafka-get-offsets.sh ${base} --time -1 --exclude-internal-topics`
+};
+const fail = detail => { throw new Error(`incomplete Kafka snapshot: ${detail}`); };
+const lines = text => text.split(/\r?\n/).filter(l => l.trim());
+
+// A subshell owns the capture files; the outer admin prelude retains its CFG trap.
+// Both streams and the actual CLI status travel inside the checksummed payload.
+export function commandCaptureShell(prelude, command) {
+  const encode = 'import json,pathlib,sys; print(json.dumps({"status":int(sys.argv[1]),"stdout":pathlib.Path(sys.argv[2]).read_text(),"stderr":pathlib.Path(sys.argv[3]).read_text()}))';
+  return [...prelude, "(", "umask 077", "F= O= E= KEEP=",
+    'trap \'rm -f -- "$O" "$E"; if [ "$KEEP" != yes ]; then rm -f -- "$F"; fi\' EXIT',
+    "F=$(mktemp /tmp/kafka-acls-list.XXXXXXXX)", "O=$(mktemp /tmp/kafka-capture-out.XXXXXXXX)", "E=$(mktemp /tmp/kafka-capture-err.XXXXXXXX)",
+    "RC=0", `{ ${command}; } > "$O" 2> "$E" || RC=$?`,
+    `python3 -I -c ${shellQuote(encode)} "$RC" "$O" "$E" | gzip -c | base64 -w0 > "$F"`,
+    'echo "FILE $F LEN $(wc -c < "$F" | tr -d " ") SHA $(sha256sum "$F" | cut -d" " -f1)"', "KEEP=yes", ")"].join("\n");
+}
+
+export function checkedCapture(result, kind, { allowEmptyGroups = false } = {}) {
+  if (!result || typeof result.stdout !== "string" || typeof result.stderr !== "string" || !Number.isInteger(result.status) || result.status !== 0) fail(`${kind} command failed`);
+  const emptyGroups = [];
+  for (const line of lines(result.stderr)) {
+    const notice = /^Consumer group '(.+)' has no active members\.$/.exec(line.trim());
+    if (!allowEmptyGroups || !notice || emptyGroups.includes(notice[1])) fail(`${kind} diagnostics: ${line.trim()}`);
+    emptyGroups.push(notice[1]);
+  }
+  return { text: result.stdout, emptyGroups };
+}
+
+function names(text, kind) {
+  const result = lines(text).map(l => l.trim());
+  if (result.some(n => !/^\S+$/.test(n)) || new Set(result).size !== result.length) fail(`${kind} inventory malformed`);
+  return result.sort();
+}
+
+export function parseTopicInventory(topicNames, description) {
+  const topics = new Map();
+  for (const line of lines(description)) {
+    const summary = /^Topic:\s+(\S+)\s+TopicId:\s+(\S+)\s+PartitionCount:\s+(\d+)\s+ReplicationFactor:\s+(\d+)\s+Configs:.*$/.exec(line);
+    if (summary) {
+      const [, topic, id, count] = summary;
+      if (topic.startsWith("__") || topics.has(topic) || !/^[A-Za-z0-9_-]{22}$/.test(id) || !Number.isSafeInteger(Number(count)) || Number(count) < 1) fail("topic summary invalid");
+      topics.set(topic, { topic, id, count: Number(count), partitions: [] });
+      continue;
+    }
+    const partition = /^\s+Topic:\s+(\S+)\s+Partition:\s+(\d+)\s+Leader:\s+(?:\d+|none)\s+Replicas:\s+[\d,]+\s+Isr:\s*[\d,]*(?:\s+(?:Adding Replicas|Removing Replicas):\s*[\d,]*|\s+(?:Elr|LastKnownElr):\s*(?:N\/A|[\d,]*))*\s*$/.exec(line);
+    const entry = partition && topics.get(partition[1]), id = Number(partition?.[2]);
+    if (!entry || !Number.isSafeInteger(id) || id >= entry.count || entry.partitions.includes(id)) fail("topic partition inventory invalid");
+    entry.partitions.push(id);
+  }
+  const listed = names(topicNames, "topic");
+  const result = [...topics.values()].sort((a,b) => a.topic.localeCompare(b.topic));
+  if (!isDeepStrictEqual(listed, result.map(t => t.topic).sort()) || result.some(t => t.partitions.length !== t.count)) fail("topic partition inventory incomplete");
+  return result.map(t => ({ topic: t.topic, id: t.id, partitions: t.partitions.sort((a,b) => a-b) }));
+}
+
+export function validateOffsetInventory(text, topics) {
+  const expected = new Set(topics.flatMap(t => t.partitions.map(p => `${t.topic}:${p}`))), seen = new Set();
+  for (const line of lines(text)) {
+    const match = /^([^:\s]+):(\d+):(\d+)$/.exec(line);
+    const key = match && `${match[1]}:${match[2]}`;
+    if (!match || !expected.has(key) || seen.has(key) || !Number.isSafeInteger(Number(match[3]))) fail("offset partition inventory differs");
+    seen.add(key);
+  }
+  if (seen.size !== expected.size) fail("offset partition inventory incomplete");
+}
+
+export function captureClientSnapshot({ env, clusterId, capture }) {
+  const clean = kind => checkedCapture(capture(SNAPSHOT_COMMANDS[kind]), kind).text;
+  const users = parseScramUsers(clean("users"));
+  const groups = names(clean("groups"), "group");
+  const assignments = checkedCapture(capture(SNAPSHOT_COMMANDS.assignments), "assignments", { allowEmptyGroups: true });
+  const described = new Set(assignments.emptyGroups);
+  for (const line of lines(assignments.text)) {
+    if (/^GROUP\s+TOPIC\s+PARTITION\s+/.test(line)) continue;
+    described.add(line.trim().split(/\s+/)[0]);
+  }
+  if (!isDeepStrictEqual(groups, [...described].sort()) || !isDeepStrictEqual(groups, names(clean("groups"), "group"))) fail("group inventory incomplete or changed");
+  const inventory = () => parseTopicInventory(clean("topics"), clean("partitions"));
+  const before = inventory();
+  // GetOffsetShell exits 1 on no matches. A clean, stable empty inventory is
+  // sufficient; no failing Kafka request is converted into an empty response.
+  const offsetsText = before.length ? clean("offsets") : "";
+  validateOffsetInventory(offsetsText, before);
+  if (!isDeepStrictEqual(before, inventory())) fail("topic inventory changed during capture");
+  return parseClientSnapshot({ env, clusterId, users, groupsText: assignments.text, offsetsText });
+}

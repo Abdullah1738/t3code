@@ -905,6 +905,7 @@ def c10(c):
 
 
 HOST_FILES = ("../skill/scripts/toollog.py", "../skill/scripts/offbox_disk_space.py", "boatd.py", "boatd_disk.py", "boatd-wrap", "base-image.sh", "boatd.service", "install-host.sh",
+              "../skill/templates/tools/sqlite.sh", "../skill/templates/tools/fetch.sh",
               "../skill/templates/home/offbox-mgmt-ssh.service", "../skill/templates/home/offbox_mgmt_sshd_config",
               "../skill/templates/home/offbox-ssh-runtime.conf")
 

@@ -36,6 +36,9 @@ class ActiveOrderTests(unittest.TestCase):
                               ADDRESS_REF)
         j.open_flow(flow_id=flow, app=app, vertical=vertical,
                     account_hash=account, scope_hash=scope)
+        # 8d0b10e223 requires a fresh matching review before NowNow sends.
+        if app == 'noon' and vertical == 'nownow':
+            j.record_nownow_prepared(flow, j.digest('review'))
         j.consume(flow, 'place', kind='place', request_hash=j.digest('place'),
                   cart_hash=j.digest({'flow': flow, 'store': store}),
                   review_hash=j.digest('review'), payable_minor=5185)
@@ -170,14 +173,24 @@ class ActiveOrderTests(unittest.TestCase):
                     self.assertIsNone(binding)
                 self.assertEqual(j.inspect(prior), before)
 
-    def test_unfinished_financial_flow_still_fences_new_flow(self):
-        for outcome in ('ACTIVE', 'MAY_HAVE_SENT', 'UNKNOWN', 'CHALLENGE_REQUIRED'):
+    def test_unfinished_send_stays_consumed_while_new_flow_is_independent(self):
+        for outcome, error in (
+                ('ACTIVE', 'JOURNAL_PLACE_ALREADY_CONSUMED'),
+                ('MAY_HAVE_SENT', 'JOURNAL_PREVIOUS_SEND_UNOBSERVED'),
+                ('UNKNOWN', 'JOURNAL_FLOW_FENCED'),
+                ('CHALLENGE_REQUIRED', 'JOURNAL_FLOW_FENCED')):
             with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as temp, \
                     patch.object(j, 'ROOT', Path(temp).resolve() / 'commerce'):
                 prior = self.prior(outcome=outcome)
                 before = j.inspect(prior)
-                with self.assertRaisesRegex(j.JournalError, 'ACCOUNT_RECONCILIATION_REQUIRED'):
-                    make_flow(self.responses(ORDER))
+                # b63bddc127 scopes noon fences to the original flow. An
+                # unattributed active order still blocks the new preparation.
+                flow, harness = make_flow(self.responses(ORDER))
+                self.assert_blocked(flow, harness, 'prepare_only')
+                with self.assertRaisesRegex(j.JournalError, '^' + error + '$'):
+                    j.consume(prior, 'retry', kind='place', request_hash=j.digest('retry'),
+                              cart_hash=j.digest('retry-cart'),
+                              review_hash=j.digest('review'), payable_minor=5185)
                 self.assertEqual(j.inspect(prior), before)
 
 

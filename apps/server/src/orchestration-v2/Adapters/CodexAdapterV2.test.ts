@@ -6901,6 +6901,197 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       ),
   );
 
+  it.effect.each([
+    "agentMessage",
+    "reasoning",
+    "dynamicToolCall",
+    "commandExecution",
+    "retainedSibling",
+    "foreground",
+    "rawNative",
+    "rawCodeMode",
+    "rawCodeModeString",
+    "rawUnrelatedSession",
+    "rawForegroundExit",
+  ] as const)(
+    "a %s command exiting before turn end only wakes once when execution yielded",
+    (mode) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const inbound = (label: string) => {
+            const entry = backgroundExecTranscript.entries.find(
+              (entry) => entry.type === "emit_inbound" && entry.label === label,
+            );
+            if (entry?.type !== "emit_inbound") throw new Error(`Missing inbound ${label}`);
+            return entry;
+          };
+          const started = inbound("item/started/command");
+          const completed = inbound("item/completed/command-late");
+          const answer = inbound("item/completed/root-answer");
+          const terminal = inbound("turn/completed");
+          const raw = mode.startsWith("raw");
+          const yielded = [
+            "agentMessage",
+            "reasoning",
+            "rawNative",
+            "rawCodeMode",
+            "rawCodeModeString",
+          ].includes(mode);
+          const parts = [
+            {
+              type: "input_text",
+              text: JSON.stringify({
+                chunk_id: "yielded-command",
+                wall_time_seconds: 1,
+                session_id: mode === "rawUnrelatedSession" ? 4243 : 4242,
+                ...(mode === "rawForegroundExit" ? { exit_code: 0 } : {}),
+                output: "",
+              }),
+            },
+          ];
+          const rawResult = {
+            type: "emit_inbound" as const,
+            label: "rawResponseItem/completed/yielded",
+            frame: {
+              method: "rawResponseItem/completed",
+              params: {
+                threadId: BG_NATIVE_THREAD,
+                turnId: BG_NATIVE_TURN,
+                item: {
+                  type: "custom_tool_call_output",
+                  call_id: "outer-code-cell",
+                  output:
+                    mode === "rawNative"
+                      ? "Process running with session ID 4242"
+                      : mode === "rawCodeModeString"
+                        ? JSON.stringify(parts)
+                        : parts,
+                },
+              },
+            },
+          };
+          const nextItem =
+            mode === "reasoning"
+              ? { type: "reasoning", id: "next-work", summary: [], content: [] }
+              : mode === "dynamicToolCall"
+                ? {
+                    type: "dynamicToolCall",
+                    id: "next-work",
+                    tool: "exec",
+                    arguments: {},
+                    contentItems: null,
+                    success: null,
+                    durationMs: null,
+                    status: "inProgress",
+                  }
+                : mode === "commandExecution" || mode === "retainedSibling"
+                  ? {
+                      type: "commandExecution",
+                      id: "next-work",
+                      command: "echo next",
+                      cwd: "/repo",
+                      processId: null,
+                      status: "inProgress",
+                      commandActions: [],
+                      aggregatedOutput: null,
+                      exitCode: null,
+                      durationMs: null,
+                    }
+                  : {
+                      type: "agentMessage",
+                      id: "next-work",
+                      text: "",
+                      phase: "commentary",
+                      memoryCitation: null,
+                    };
+          const transcript = makeCodexReplayTranscript({
+            scenario: `codex-bg-before-settle-${mode}`,
+            entries: [
+              ...codexReplayPreamble({
+                nativeThreadId: BG_NATIVE_THREAD,
+                nativeTurnId: BG_NATIVE_TURN,
+                prompt: BG_PROMPT,
+              }),
+              started,
+              ...(mode !== "foreground" && !raw
+                ? [
+                    {
+                      type: "emit_inbound" as const,
+                      label: "item/started/next-work",
+                      frame: {
+                        method: "item/started",
+                        params: {
+                          item: nextItem,
+                          threadId: BG_NATIVE_THREAD,
+                          turnId: BG_NATIVE_TURN,
+                          startedAtMs: 1782622441000,
+                        },
+                      },
+                    },
+                  ]
+                : []),
+              ...(mode === "rawNative" ? [rawResult] : []),
+              { ...completed, afterMs: 0 },
+              ...(mode === "commandExecution"
+                ? [
+                    {
+                      type: "emit_inbound" as const,
+                      label: "item/completed/parallel-command",
+                      frame: {
+                        method: "item/completed",
+                        params: {
+                          item: { ...nextItem, status: "completed", exitCode: 0, durationMs: 1 },
+                          threadId: BG_NATIVE_THREAD,
+                          turnId: BG_NATIVE_TURN,
+                          completedAtMs: 1782622442000,
+                        },
+                      },
+                    },
+                  ]
+                : []),
+              ...(raw && mode !== "rawNative" ? [rawResult] : []),
+              answer,
+              terminal,
+              { ...completed, label: "item/completed/duplicate", afterMs: 30_000 },
+            ],
+          });
+          const harness = yield* makeCodexReplayHarness(transcript);
+          yield* harness.runtime.startTurn(
+            makeCodexTestTurnInput({
+              threadId: harness.threadId,
+              providerThread: harness.providerThread,
+              now: yield* DateTime.now,
+              attemptId: RunAttemptId.make(`attempt-bg-before-settle-${mode}`),
+              text: BG_PROMPT,
+            }),
+          );
+          yield* awaitUntil(() => harness.terminalEvents().length === 1, "root turn terminal");
+          if (yielded)
+            yield* awaitUntil(
+              () => harness.continuationRequests.length === 1,
+              "pre-settle command wake",
+            );
+          assert.lengthOf(harness.continuationRequests, yielded ? 1 : 0);
+          if (yielded) {
+            assert.equal(
+              harness.continuationRequests[0]?.detail,
+              `Background command completed (exit 0): ${BG_COMMAND}\n\nOutput tail:\nCODEX_BG_WAKE_DONE`,
+            );
+            assert.equal(
+              harness.continuationRequests[0]?.commandId,
+              `kanban:send:background-command:${harness.threadId}:${BG_COMMAND_ITEM}`,
+            );
+          }
+          yield* TestClock.adjust("30 seconds");
+          assert.lengthOf(harness.continuationRequests, yielded ? 1 : 0);
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
+        ),
+      ),
+  );
+
   it.effect("holds a finished background command until its continuation is offered", () =>
     Effect.scoped(
       Effect.gen(function* () {

@@ -100,6 +100,7 @@ export const makeFake = Effect.gen(function* () {
       lastFailure: () => Effect.succeed(null),
       findLastFailure: () => Effect.succeed(null),
       latestRun: () => Effect.succeed(null),
+      backgroundStoppedSince: () => Effect.succeed(false),
       runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       model: (threadId) =>

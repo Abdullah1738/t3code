@@ -3,6 +3,8 @@ import type {
   PullRequestCheck,
   PullRequestComment,
   PullRequestDetail,
+  PullRequestUnavailableError,
+  PullRequestOperationError,
   ThreadPullRequestWatch,
   ThreadPullRequestLink,
 } from "@t3tools/contracts";
@@ -17,6 +19,20 @@ import { threadPullRequestKeysEqual } from "@t3tools/shared/threadPullRequests";
 export const PULL_REQUEST_WATCH_WAKE_LIMIT = 10;
 const LISTED_ITEMS = 10;
 const SNIPPET_LENGTH = 200;
+
+export function pullRequestWatchStopMessage(
+  link: Pick<ThreadPullRequestLink, "host" | "number" | "url">,
+  failures: number,
+  error: PullRequestUnavailableError | PullRequestOperationError | undefined,
+  reason?: string,
+): string {
+  const stopped = `T3 Code stopped watching pull request #${link.number} (${link.url}) after ${failures} consecutive unsuccessful ${failures === 1 ? "read" : "reads"}.${reason ? ` ${reason}` : ""}`;
+  if (error?._tag === "PullRequestUnavailableError") {
+    const host = link.host ?? parseChangeRequestUrl(link.url)?.host ?? "this host";
+    return `${stopped} The server can't read pull requests on ${host} (${error.reason}). ${error.message} Watching again won't help until server access is fixed. Check the PR with your own tools instead.`;
+  }
+  return `${stopped}${error === undefined ? "" : ` Last error: ${error.message}`} Check it yourself, and call watch_pull_request to watch it again.`;
+}
 
 export type PullRequestWatchChange =
   | { readonly kind: "checks-failed"; readonly failed: ReadonlyArray<PullRequestCheck> }

@@ -13,6 +13,7 @@ import {
   KanbanBoard,
   KanbanCard,
   KanbanCardEvent,
+  KanbanError,
   KanbanDiscussion,
   KanbanGoal,
   KanbanGroup,
@@ -251,9 +252,14 @@ export interface KanbanStoreShape {
   ) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanStoreError>;
   readonly nextCardNumber: (boardId: KanbanBoardId) => Effect.Effect<number, KanbanStoreError>;
   readonly putCard: (card: KanbanCard) => Effect.Effect<void, KanbanStoreError>;
+  readonly updateCard: (
+    card: KanbanCard,
+    before: KanbanCard,
+  ) => Effect.Effect<void, KanbanStoreError>;
   readonly addCardEvent: (
     event: NewCardEvent,
     applicationId?: string,
+    card?: Pick<KanbanCard, "id" | "boardId">,
   ) => Effect.Effect<KanbanCardEvent, KanbanStoreError>;
   readonly pendingInstructionApplications: (
     cardId: KanbanCardId,
@@ -1094,14 +1100,26 @@ const make = Effect.gen(function* () {
         (rows) => Number(rows[0]?.next ?? 1),
       ),
     );
-  const putCard = (value: KanbanCard) =>
+  const saveCard = (value: KanbanCard, before?: KanbanCard) =>
     run(
       "write card",
       Effect.gen(function* () {
         const observe = yield* cardWrites;
-        const previous = observe === undefined ? null : yield* card(value.id);
+        const previous = before ?? (observe === undefined ? null : yield* card(value.id));
         const json = yield* Card.encode(value);
-        yield* sql`
+        if (before !== undefined) {
+          // Snapshot-backed writes update only the checked row, including PR
+          // metadata saved before a verdict's event existence check.
+          const rows = yield* sql<{ readonly id: string }>`
+            UPDATE ardud_kanban_cards SET stage = ${value.stage}, active_thread_id = ${value.activeThreadId}, json = ${json}
+            WHERE id = ${value.id} AND board_id = ${before.boardId} RETURNING id
+          `;
+          if (rows.length === 0)
+            return yield* Effect.fail(
+              new KanbanError({ code: "not-found", detail: `card ${value.id}` }),
+            );
+        } else
+          yield* sql`
           INSERT INTO ardud_kanban_cards (id, board_id, number, stage, active_thread_id, json)
           VALUES (${value.id}, ${value.boardId}, ${value.number}, ${value.stage}, ${value.activeThreadId}, ${json})
           ON CONFLICT (id) DO UPDATE SET
@@ -1116,6 +1134,8 @@ const make = Effect.gen(function* () {
         );
       }),
     );
+  const putCard: KanbanStoreShape["putCard"] = (value) => saveCard(value);
+  const updateCard: KanbanStoreShape["updateCard"] = (value, before) => saveCard(value, before);
   const slotColumns = sql.literal(
     'id, board_id AS "boardId", pool_key AS "poolKey", thread_id AS "threadId", card_id AS "cardId", kind, at, why',
   );
@@ -1188,7 +1208,7 @@ const make = Effect.gen(function* () {
       ),
     );
 
-  const addCardEvent = (event: NewCardEvent, applicationId?: string) => {
+  const addCardEvent: KanbanStoreShape["addCardEvent"] = (event, applicationId, card) => {
     const insert = Effect.gen(function* () {
       if (applicationId !== undefined) {
         const existing = yield* sql<IdJsonRow>`
@@ -1202,11 +1222,24 @@ const make = Effect.gen(function* () {
         }
       }
       const json = yield* CardEvent.encode(event);
-      const rows = yield* sql<{ readonly id: number }>`
-        INSERT INTO ardud_kanban_card_events (card_id, json) VALUES (${event.cardId}, ${json})
-        RETURNING id
-      `;
-      const id = Number(rows[0]?.id ?? 0);
+      // Creation logs its event before inserting the card. Other known-card
+      // writes must not append an orphan if a purge bypassed the board generation.
+      const rows = yield* card !== undefined && event.kind !== "created"
+        ? sql<{ readonly id: number }>`
+          INSERT INTO ardud_kanban_card_events (card_id, json)
+          SELECT id, ${json} FROM ardud_kanban_cards
+          WHERE id = ${event.cardId} AND board_id = ${card.boardId}
+          RETURNING id
+        `
+        : sql<{ readonly id: number }>`
+          INSERT INTO ardud_kanban_card_events (card_id, json) VALUES (${event.cardId}, ${json})
+          RETURNING id
+        `;
+      if (rows.length === 0)
+        return yield* Effect.fail(
+          new KanbanError({ code: "not-found", detail: `card ${event.cardId}` }),
+        );
+      const id = Number(rows[0]!.id);
       if (applicationId !== undefined) {
         yield* sql`
           UPDATE ardud_kanban_instruction_applications SET audit_event_id = ${id}
@@ -1958,6 +1991,7 @@ const make = Effect.gen(function* () {
     cardsInStage,
     nextCardNumber,
     putCard,
+    updateCard,
     addSlotEvent,
     slotEvents,
     slotHistory,

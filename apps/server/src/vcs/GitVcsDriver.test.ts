@@ -151,6 +151,100 @@ const makeCheckpointFixture = Effect.fn("makeCheckpointFixture")(function* (
   return { git, checkpointRef };
 });
 
+it.effect(
+  "shares concurrent checkpoint directory reads, but captures every ref and rereads later",
+  () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const original = yield* GitVcsDriver.makeVcsDriverShape();
+      const live = yield* VcsProcess.VcsProcess;
+      const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "checkpoint-flight-" });
+      const { git } = yield* makeCheckpointFixture(original, cwd);
+      const started = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let reads = 0;
+      const driver = yield* GitVcsDriver.makeVcsDriverShape().pipe(
+        Effect.provideService(VcsProcess.VcsProcess, {
+          run: Effect.fn(function* (input: VcsProcess.VcsProcessInput) {
+            if (input.args.includes("--git-common-dir")) {
+              reads++;
+              yield* Deferred.succeed(started, undefined);
+              yield* Deferred.await(release);
+            }
+            return yield* live.run(input);
+          }),
+        }),
+      );
+      const refs = Array.from({ length: 6 }, (_, i) =>
+        CheckpointRef.make(`refs/t3/checkpoints/flight-${i}`),
+      );
+      const fibers = yield* Effect.forEach(refs, (checkpointRef) =>
+        driver.checkpoints.captureCheckpoint({ cwd, checkpointRef }).pipe(Effect.forkChild),
+      );
+      yield* Deferred.await(started);
+      // Drain runnable test fibers so every request has joined the held lookup.
+      yield* TestClock.adjust(0);
+      assert.strictEqual(reads, 1);
+      yield* Deferred.succeed(release, undefined);
+      yield* Effect.forEach(fibers, Fiber.join);
+      for (const ref of refs)
+        assert.strictEqual((yield* git(["show", `${ref}:file.txt`])).stdout, "unstaged\n");
+      yield* driver.checkpoints.captureCheckpoint({ cwd, checkpointRef: refs[0]! });
+      assert.strictEqual(reads, 2);
+    }).pipe(Effect.scoped, Effect.provide(layerGitContract)),
+);
+
+it.effect(
+  "failed checkpoint directory lookups are shared only in flight and retry independently per cwd",
+  () =>
+    Effect.gen(function* () {
+      const release = yield* Deferred.make<void>();
+      const started = yield* Deferred.make<void>();
+      const counts = new Map<string, number>();
+      const driver = yield* GitVcsDriver.makeVcsDriverShape().pipe(
+        Effect.provideService(VcsProcess.VcsProcess, {
+          run: Effect.fn(function* (input: VcsProcess.VcsProcessInput) {
+            counts.set(input.cwd, (counts.get(input.cwd) ?? 0) + 1);
+            yield* Deferred.succeed(started, undefined);
+            yield* Deferred.await(release);
+            return yield* Effect.fail(
+              new VcsProcessExitError({
+                operation: "checkpoint-directory-test",
+                command: "git",
+                cwd: input.cwd,
+                exitCode: 1,
+                detail: "Test lookup failed",
+              }),
+            );
+          }),
+        }),
+      );
+      const capture = (cwd: string) =>
+        driver.checkpoints
+          .captureCheckpoint({
+            cwd,
+            checkpointRef: CheckpointRef.make("refs/t3/checkpoints/failure"),
+          })
+          .pipe(Effect.exit);
+      const fibers = yield* Effect.forEach(["/a", "/a", "/a", "/b"], (cwd) =>
+        capture(cwd).pipe(Effect.forkChild),
+      );
+      yield* Deferred.await(started);
+      yield* TestClock.adjust(0);
+      assert.deepEqual(
+        [...counts],
+        [
+          ["/a", 1],
+          ["/b", 1],
+        ],
+      );
+      yield* Deferred.succeed(release, undefined);
+      for (const fiber of fibers) assert.isTrue(Exit.isFailure(yield* Fiber.join(fiber)));
+      yield* capture("/a");
+      assert.strictEqual(counts.get("/a"), 2);
+    }).pipe(Effect.scoped, Effect.provide(layerGitContract)),
+);
+
 it.effect("checkpoint capture skips untracked nested repositories without a commit", () =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;

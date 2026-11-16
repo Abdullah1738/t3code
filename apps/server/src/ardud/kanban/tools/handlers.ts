@@ -1326,6 +1326,11 @@ const handlers = {
   card_edit: McpToolAccess.actsAsCaller((input) =>
     asEvaluator((service, caller) =>
       Effect.gen(function* () {
+        if ((input.prompt !== undefined || input.subtasks !== undefined) && !input.basedOn?.trim())
+          return yield* invalid(
+            "card_edit with prompt or subtasks requires basedOn from the updatedAt of the card you read; use card_get, merge your change, and retry",
+            "invalid_args",
+          );
         if (
           input.subtasks?.some((subtask) => subtask.clearGate !== undefined) &&
           (yield* ancestorThreadIds(caller)).length > 0
@@ -1347,6 +1352,7 @@ const handlers = {
             prompt: input.prompt,
             promptEdits: input.promptEdits,
             subtaskEdits: input.subtaskEdits,
+            basedOn: input.basedOn,
             priority: input.priority,
             ...(input.goalId !== undefined
               ? { goalId: input.goalId === null ? null : KanbanGoalId.make(input.goalId) }
@@ -1422,9 +1428,16 @@ const handlers = {
   card_thread: McpToolAccess.actsAsCaller((input) =>
     asEvaluator((service, caller) =>
       Effect.gen(function* () {
+        if (input.text !== undefined && input.message !== undefined && input.text !== input.message)
+          return yield* invalid("text and message must match; pass only one", "invalid_args");
         const card = yield* cardFor(service, caller, input.card, input.boardId);
         return {
-          card: yield* service.cardThread(card.id, input.action, input.text ?? "", caller.actor),
+          card: yield* service.cardThread(
+            card.id,
+            input.action,
+            input.text ?? input.message ?? "",
+            caller.actor,
+          ),
         };
       }),
     ),
@@ -1620,14 +1633,48 @@ const handlers = {
     ),
   ),
 
-  report_bug: McpToolAccess.actsAsCaller((input) =>
+  report_bug: McpToolAccess.reportsBug((input, reporter) =>
+    Effect.gen(function* () {
+      yield* SavedWrite.linkReply();
+      const service = yield* KanbanService;
+      if (reporter.unverifiedReason !== undefined) {
+        const observe = yield* SavedWrite.reporterUnverified;
+        observe(reporter.unverifiedReason);
+      }
+      const result = yield* service.agentCall(
+        reporter.threadId,
+        SavedWrite.mutating(
+          service.reportBug({
+            boardId: input.boardId,
+            title: input.title,
+            evidence: input.evidence,
+            cardHint: input.cardHint,
+            threadId: reporter.threadId,
+            callerUnverifiedReason: reporter.unverifiedReason,
+          }),
+        ),
+      );
+      return {
+        ...result,
+        callerVerified: reporter.unverifiedReason === undefined,
+        ...(reporter.unverifiedReason === undefined
+          ? {}
+          : {
+              callerUnverifiedReason: reporter.unverifiedReason,
+              message: `Saved with an unverified caller; reporter unverified (${reporter.unverifiedReason}).`,
+            }),
+      };
+    }).pipe(Effect.catchTags({ KanbanError: (error) => Effect.fail(toolFailure(error)) })),
+  ),
+
+  evaluator_status: McpToolAccess.readsAsCaller((input) =>
     withCaller((service, caller) =>
-      service.reportBug({
-        boardId: input.boardId,
-        title: input.title,
-        evidence: input.evidence,
-        cardHint: input.cardHint,
-        threadId: caller.threadId,
+      Effect.gen(function* () {
+        const board = yield* boardFor(service, caller, input.boardId);
+        return yield* service.evaluatorStatus(board.id, {
+          ...(input.queueId === undefined ? {} : { queueId: input.queueId }),
+          ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
+        });
       }),
     ),
   ),

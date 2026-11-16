@@ -339,6 +339,8 @@ The operational setup and private credential handling remain in the local
 directory when changing the bridge.
 
 Tool-log rollups refresh at turn end, hourly, and after the UTC day changes.
+`notice.reply` records each completion-notice run's handling path, outcome,
+enqueued reply count and sealed-wake flag, with chat/run ids and no message text.
 Read today's saved rollup with:
 
 ```sh

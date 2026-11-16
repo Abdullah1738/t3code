@@ -16,6 +16,7 @@ import {
   type OrchestrationV2Subagent,
   EnvironmentId,
   OrchestratorMcpFailure,
+  PullRequestUnavailableError,
   ProviderInstanceId,
   ThreadId,
   PreviewAutomationError,
@@ -61,6 +62,7 @@ import * as McpToolAccess from "./McpToolAccess.ts";
 import {
   PullRequestToolTimeoutError,
   PullRequestWatchTimeoutError,
+  PullRequestWatchUnavailableError,
 } from "./toolkits/pullRequests/tools.ts";
 import * as Testkit from "./McpToolAccess.testkit.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -119,6 +121,7 @@ const client = McpSchema.McpServerClient.of({
 const ProbeFailure = Schema.Union([
   OrchestratorMcpFailure,
   PullRequestWatchTimeoutError,
+  PullRequestWatchUnavailableError,
   PullRequestToolTimeoutError,
   KanbanError,
   PreviewAutomationError,
@@ -1174,6 +1177,13 @@ const typedFailures = [
     outcome: "timeout",
   })),
   { error: new PullRequestWatchTimeoutError({ saved: "unknown" }), outcome: "timeout" },
+  {
+    error: new PullRequestWatchUnavailableError({
+      host: "github.com",
+      cause: new PullRequestUnavailableError({ reason: "cli-missing" }),
+    }),
+    outcome: "refused",
+  },
   { error: new PreviewAutomationTimeoutError(browserRequest), outcome: "timeout" },
   {
     error: new PreviewAutomationRecordingDeadlineExpiredError({
@@ -2184,3 +2194,72 @@ it.each([
     callerCardStage: "working",
   });
 });
+
+it.effect("records a late detached create with the original HTTP call's correlation metadata", () =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const callRow = yield* Deferred.make<AnalyticsEvent>();
+    const detachedRow = yield* Deferred.make<AnalyticsEvent>();
+    const toolkit = probe("delegate_task");
+    const registration = McpHttpServer.toolkitRegistration(
+      toolkit,
+      McpToolAccess.toLayer(toolkit, {
+        delegate_task: McpToolAccess.reads(() =>
+          McpDeadline.withDeadline(
+            Deferred.succeed(entered, undefined).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.as({ taskId: "created-task" }),
+            ),
+            {
+              code: "delegation_timeout",
+              threadId: ThreadId.make("caller-ledger"),
+              stage: "dispatch",
+              onTimeout: "detach",
+              requestKey: args.clientRequestId,
+            },
+          ),
+        ),
+      }),
+    ).pipe(
+      Layer.provideMerge(McpServer.McpServer.layer),
+      Layer.provide(Testkit.liveThreadsLayer),
+      Layer.provide(
+        Layer.mock(Analytics.Analytics)({
+          record: (row) =>
+            row.kind === "mcp.call"
+              ? Deferred.succeed(callRow, row).pipe(Effect.asVoid)
+              : row.kind === "mcp.detached"
+                ? Deferred.succeed(detachedRow, row).pipe(Effect.asVoid)
+                : Effect.void,
+        }),
+      ),
+      Layer.provideMerge(invocation),
+    );
+    yield* Effect.gen(function* () {
+      const pending = yield* (yield* McpServer.McpServer)
+        .callTool({ name: "delegate_task", arguments: args })
+        .pipe(Effect.provideService(McpSchema.McpServerClient, client), Effect.forkChild);
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust("10 seconds");
+      expect((yield* Fiber.join(pending)).isError).toBe(true);
+      const call = yield* Deferred.await(callRow);
+      yield* TestClock.adjust("3 seconds");
+      yield* Deferred.succeed(release, undefined);
+      const detached = yield* Deferred.await(detachedRow);
+      expect(detached).toMatchObject({
+        kind: "mcp.detached",
+        outcome: "committed",
+        lateMs: 3000,
+        tool: call.tool,
+        startedAt: call.startedAt,
+        bootId: call.bootId,
+        build: call.build,
+        clientRequestId: call.clientRequestId,
+        callerThreadId: call.callerThreadId,
+      });
+      expect(JSON.stringify(detached)).not.toContain(args.clientRequestId);
+      yield* decodeAnalyticsEvent(detached);
+    }).pipe(Effect.provide(registration));
+  }),
+);

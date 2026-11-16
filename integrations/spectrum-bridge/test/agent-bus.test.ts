@@ -32,6 +32,7 @@ function setup() {
   const deps: AgentBusDeps = {
     db: store.db, forSession: session => infos.find(chat => session === `session-${chat.slug}`),
     bySlug: slug => infos.find(chat => chat.slug === slug), policyPath,
+    groupMembers: () => ["Abdullah", "Moni", "Sam"],
     deliver: (target, text, key, receipt) => {
       if (fail || target.slug === failedSlug) throw new Error("delivery unavailable");
       if (!wakes.some(wake => wake.key === key)) wakes.push({ slug: target.slug, text, key, receipt });
@@ -65,6 +66,84 @@ test("missing sessions/targets are refused without logging supplied values", () 
   expect(env.ask("PRIVATE_SESSION").status).toBe(409);
   expect(env.ask("owner", "PRIVATE_TARGET").status).toBe(404);
   expect(JSON.stringify(env.logs)).not.toContain("PRIVATE");
+});
+
+test.each(["single roster", "newer blank roster", "superseded roster"])("repeated audience reads preserve all members: %s", kind => {
+  const env = setup();
+  if (kind === "superseded roster") env.store.acceptInbound("old", { sender: "old", participants: ["old"] });
+  env.store.acceptInbound("roster", { sender: "owner", participants: ["owner", "moni", "silent"] });
+  env.store.acceptInbound("new-member", { sender: "sam" });
+  if (kind === "newer blank roster") env.store.acceptInbound("blank", { sender: "owner", participants: ["\t"] });
+  const expected = ["moni", "owner", "sam", "silent"];
+  for (let read = 0; read < 3; read++) expect(env.store.groupAudience().sort()).toEqual(expected);
+});
+
+test.each(["owner", "moni"])("group requests tell %s the audience and return the answer only to the group assistant", to => {
+  const env = setup();
+  const id = env.id(env.ask("group-family", to));
+  expect(env.wakes[0]?.text).toContain('This answer will be posted in the group "Family" (members: Abdullah, Moni, Sam).');
+  expect(env.wakes[0]?.text).toContain("Share only what is fine for everyone there to read.");
+  expect(env.wakes[0]?.text).toContain("If it's private and the person it belongs to isn't the one asking, say what can be shared instead.");
+  expect(env.answer(id, "done", to).status).toBe(202);
+  expect(env.wakes.map(wake => wake.slug)).toEqual([to, "group-family"]);
+  expect(env.wakes[1]?.text).toEndWith("\nPRIVATE_ANSWER");
+  expect(env.logs).toContainEqual(["agent-ask", `group-family>${to} hop=1 group=1`]);
+  expect(JSON.stringify(env.logs)).not.toMatch(/PRIVATE|Family|Abdullah|Moni|Sam/);
+});
+
+test.each(["owner", "moni", "sam"])("%s DM requests have no group audience or group log flag", from => {
+  const env = setup();
+  if (from === "sam") writeFileSync(env.policyPath, JSON.stringify({ ...defaultAgentPolicy(),
+    pairs: [...defaultAgentPolicy().pairs, { from: "sam", to: "owner", approval: "none" }] }));
+  expect(env.ask(from, from === "owner" ? "moni" : "owner").status).toBe(202);
+  expect(env.wakes[0]?.text).not.toContain("This answer will be posted in the group");
+  expect(env.wakes[0]?.text).not.toContain("members:");
+  expect(env.logs.find(([event]) => event === "agent-ask")?.[1]).not.toContain("group=1");
+});
+
+test("unknown group members are explicit and group audience survives a second hop", () => {
+  const env = setup();
+  env.deps.groupMembers = () => [];
+  const root = env.id(env.ask("group-family", "owner"));
+  expect(env.wakes[0]?.text).toContain('(members: unknown)');
+  env.ask("owner", "moni", "forwarded", root);
+  expect(env.wakes[1]?.text).toContain('This answer will be posted in the group "Family" (members: unknown).');
+});
+
+test.each(["owner", "moni"])("group audience survives the second hop through %s alongside its policy", via => {
+  const env = setup();
+  const rule = "tell me when Moni orders";
+  expect(env.bus.notifyRules({ sessionId: "session-owner", action: "add", text: rule }).status).toBe(200);
+  const first = env.ask("group-family", via);
+  expect(first.status).toBe(202);
+  const to = via === "owner" ? "moni" : "owner";
+  const second = env.ask(via, to, "forwarded", env.id(first));
+  expect(second.status).toBe(202);
+  const header = env.wakes[1]!.text;
+  expect(header).toContain('This answer will be posted in the group "Family" (members: Abdullah, Moni, Sam). Share only what is fine for everyone there to read. If it\'s private and the person it belongs to isn\'t the one asking, say what can be shared instead.');
+  expect(header).not.toContain("This answer will be posted in a group.");
+  if (via === "owner") {
+    expect(header).toContain("Answer anything the owner's agent asks, in full. Send the answer back through agent-answer.");
+    expect(header).not.toContain(rule);
+  } else {
+    expect(header).toContain("Exception: installing or downloading anything onto the Mac.");
+    expect(header).toContain("Use --status pending only for this install/download exception");
+    expect(header).toContain(`owner-go record-delegated --principal moni --bus-request ${env.id(second)}`);
+    expect(header).toContain(rule);
+  }
+  expect(env.logs).toContainEqual(["agent-ask", `group-family>${via} hop=1 group=1`]);
+  expect(env.logs).toContainEqual(["agent-ask", `${via}>${to} hop=2`]);
+  expect(JSON.stringify(env.logs)).not.toMatch(/PRIVATE|Family|Abdullah|Moni|Sam|tell me/);
+});
+
+test("a group answering a DM request still supplies its own audience when it asks another assistant", () => {
+  const env = setup();
+  writeFileSync(env.policyPath, JSON.stringify({ ...defaultAgentPolicy(),
+    pairs: [...defaultAgentPolicy().pairs, { from: "owner", to: "group-family", approval: "none" }] }));
+  const first = env.ask("owner", "group-family");
+  expect(first.status).toBe(202);
+  expect(env.ask("group-family", "moni", "followup", env.id(first)).status).toBe(202);
+  expect(env.wakes[1]?.text).toContain('This answer will be posted in the group "Family" (members: Abdullah, Moni, Sam).');
 });
 
 test("dedupe is caller scoped and survives a new bus; changed payload does not redeliver", () => {
@@ -275,7 +354,7 @@ test("full answers and group audiences are scoped to the matching pair", () => {
   const env = setup(); env.ask();
   expect(env.wakes[0]?.text).toContain("Answer anything the owner's agent asks, in full.");
   env.ask("group-family", "moni", "group");
-  expect(env.wakes[1]?.text).toContain("only with information that is fine to share in that group");
+  expect(env.wakes[1]?.text).toContain('This answer will be posted in the group "Family" (members: Abdullah, Moni, Sam).');
   for (const text of ["in full", "no approval from Abdullah", "notify rules"]) expect(env.wakes[1]?.text).not.toContain(text);
 });
 

@@ -3,7 +3,7 @@ import { StderrCause, stderrCause } from "./cause.ts";
 import { Database } from "bun:sqlite";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -172,6 +172,8 @@ export type State = {
   trigger_sig?: string;
   /** Persisted repeat window for one failing trigger; never stores the path. */
   trigger_error?: { triggerPathHash: string; triggerKind: "file" | "wal"; errnoCode: string; missingSince: string; loggedAt: number; count: number };
+  /** Missing triggers use the interval; only hashes survive runner restarts. */
+  trigger_missing?: { paths: (MissingTrigger & { missingSince: string })[]; loggedAt: number };
 };
 export type TrackedWake = { inbound: string; key: string; event: string; delivered_at: number; attempts?: number };
 export type WakeConfirmation = {
@@ -460,6 +462,8 @@ function validRelays(value: unknown): value is Relay[] {
 
 export const watcherDir = (id: string) => join(WATCHERS, id);
 
+export type MissingTrigger = { triggerPathHash: string; triggerKind: "file" | "wal" };
+
 export class TriggerError extends Error {
   readonly triggerPathHash: string;
   readonly triggerKind: "file" | "wal";
@@ -476,14 +480,20 @@ export class TriggerError extends Error {
 }
 
 /** Cheap change signature of a watcher's trigger files (a stat per file). */
-export function triggerSig(watcher: Watcher): string | undefined {
+export function triggerSig(watcher: Watcher, onMissing?: (trigger: MissingTrigger) => void): string | undefined {
   if (!watcher.triggers?.length) return undefined;
   return watcher.triggers.map(path => {
     try { const st = statSync(path); return `${st.mtimeMs}:${st.size}`; }
     catch (error) {
-      // SQLite removes a checkpointed WAL even when only that WAL is configured as a trigger.
-      if ((error as NodeJS.ErrnoException).code === "ENOENT" && path.endsWith("-wal")
-        && existsSync(path.slice(0, -4))) return "missing";
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        // A dangling symlink is broken, while a file (or parent directory) that appears later is normal.
+        try { lstatSync(path); }
+        catch (linkError) {
+          if ((linkError as NodeJS.ErrnoException).code !== "ENOENT") throw new TriggerError(path, linkError);
+          onMissing?.({ triggerPathHash: hash(path).slice(0, 16), triggerKind: path.endsWith("-wal") ? "wal" : "file" });
+          return "missing";
+        }
+      }
       throw new TriggerError(path, error);
     }
   }).join("|");

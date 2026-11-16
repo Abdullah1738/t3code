@@ -1,5 +1,6 @@
 import { assert, describe, it } from "@effect/vitest";
 import {
+  CommandId,
   MessageId,
   ProjectId,
   ProviderDriverKind,
@@ -25,6 +26,10 @@ import * as TestClock from "effect/testing/TestClock";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import * as ProviderContinuationService from "./ProviderContinuationService.ts";
+import {
+  backgroundCommandWakeCommandId,
+  backgroundCommandWakeMessageId,
+} from "./backgroundCommandWake.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 
 const threadId = ThreadId.make("thread-provider-continuation");
@@ -139,6 +144,35 @@ function layerTest(input: {
 }
 
 describe("ProviderContinuationService", () => {
+  it.effect("preserves the board's background completion delivery identity", () =>
+    Effect.gen(function* () {
+      const dispatched = yield* Queue.unbounded<unknown>();
+      yield* Effect.gen(function* () {
+        const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+        const commandId = backgroundCommandWakeCommandId(threadId, "exec-background");
+        const messageId = backgroundCommandWakeMessageId(threadId, "exec-background");
+        yield* requests.offer({
+          ...request(),
+          commandId,
+          messageId,
+          delivery: "message_text",
+          detail: "Background command completed (exit 0): sleep 60 && echo X",
+        });
+        const command = (yield* Queue.take(dispatched)) as {
+          readonly commandId: CommandId;
+          readonly messageId: MessageId;
+        };
+        assert.equal(command.commandId, commandId);
+        assert.equal(command.messageId, messageId);
+      }).pipe(
+        Effect.provide(
+          layerTest({ dispatched, getThreadRecords: () => Effect.succeed(projection) }),
+        ),
+        Effect.scoped,
+      );
+    }),
+  );
+
   it.effect("recovers an unaccepted persisted steer using the same delivery identity", () =>
     Effect.gen(function* () {
       const dispatched = yield* Queue.unbounded<unknown>();

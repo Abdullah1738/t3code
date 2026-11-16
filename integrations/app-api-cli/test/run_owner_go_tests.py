@@ -1,6 +1,10 @@
 """Run approval and affected commerce regressions without a live Keychain.
 
-PYTHONPATH=.:test python3 test/run_owner_go_tests.py
+From the package directory, install the pinned test dependencies in a venv:
+    python3 -m venv .venv
+    .venv/bin/python3 -I -m pip install -r test/requirements.txt
+    .venv/bin/python3 -I test/run_owner_go_tests.py
+    .venv/bin/python3 -I test/test_commerce_cli.py
 """
 import sys
 import os
