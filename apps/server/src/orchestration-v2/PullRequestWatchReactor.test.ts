@@ -11,6 +11,7 @@ import {
   type PullRequestComment,
 } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -104,7 +105,14 @@ const makeHarness = Effect.fn("makeWatchFailureHarness")(function* (
     ),
   );
   const reactor = yield* PullRequestWatchReactor.make.pipe(Effect.provide(dependencies));
-  return { reactor, commands, watch: () => watch };
+  return {
+    reactor,
+    commands,
+    watch: () => watch,
+    restart: () => {
+      if (watch) watch = { ...watch, startedAt: "2026-11-12T01:00:00.000Z" };
+    },
+  };
 });
 
 const makeFailureHarness = (failure: PullRequestService.PullRequestError) =>
@@ -392,7 +400,6 @@ it.effect("reports remarks without recording check state on a settling head", ()
 
 it.effect.each([
   "provider-unsupported",
-  "cli-missing",
   "cli-unauthenticated",
 ] satisfies PullRequestUnavailableReason[])("ends an unavailable watch immediately: %s", (reason) =>
   Effect.gen(function* () {
@@ -406,6 +413,122 @@ it.effect.each([
     assert.notInclude(commands[0]!.wake?.text ?? "", "8 times");
     yield* reactor.sweep;
     assert.strictEqual(commands.length, 1);
+  }),
+);
+
+const missingToolErrors = [
+  new PullRequestUnavailableError({ reason: "cli-missing" }),
+  new PullRequestOperationError({
+    operation: "detail",
+    detail: "fj is missing",
+    cause: new PullRequestProviderError({
+      provider: SourceControlProviderKind.make("forgejo"),
+      operation: "detail",
+      reason: "missing-tool",
+      detail: "fj is missing",
+    }),
+  }),
+];
+
+it.effect.each(missingToolErrors)("retries a persistent missing tool with backoff: %s", (error) =>
+  Effect.gen(function* () {
+    let reads = 0;
+    const harness = yield* makeHarness({
+      detail: () => {
+        reads++;
+        return Effect.fail(error);
+      },
+      activity: () =>
+        Effect.succeed({
+          comments: [],
+          commentCount: 0,
+          commentsTruncated: false,
+          reviewThreads: [],
+          commits: [],
+        }),
+    }).pipe(Effect.provideService(HostProcess.Environment, { PATH: "/test/server/bin:/usr/bin" }));
+    yield* harness.reactor.sweep;
+    assert.equal(reads, 1);
+    assert.isDefined(harness.watch());
+    yield* harness.reactor.sweep;
+    assert.equal(reads, 1);
+    yield* TestClock.adjust("1 minute");
+    yield* harness.reactor.sweep;
+    assert.equal(reads, 2);
+    yield* TestClock.adjust("1 minute");
+    yield* harness.reactor.sweep;
+    assert.equal(reads, 2);
+    assert.isDefined(harness.watch());
+    yield* TestClock.adjust("1 minute");
+    yield* harness.reactor.sweep;
+    assert.equal(reads, 3);
+    assert.isUndefined(harness.watch());
+    assert.include(harness.commands.at(-1)?.wake?.text ?? "", "3 consecutive unsuccessful reads");
+    assert.include(
+      harness.commands.at(-1)?.wake?.text ?? "",
+      "Server PATH: /test/server/bin:/usr/bin",
+    );
+  }),
+);
+
+it.effect.each(["detail", "activity"] as const)(
+  "recovers from transient missing-tool %s reads and resets the streak",
+  (failureAt) =>
+    Effect.gen(function* () {
+      let missing = false;
+      let reads = 0;
+      const harness = yield* makeHarness({
+        detail: () => {
+          reads++;
+          return missing && failureAt === "detail"
+            ? Effect.fail(missingToolErrors[0]!)
+            : Effect.succeed(greenDetail());
+        },
+        activity: () =>
+          missing && failureAt === "activity"
+            ? Effect.fail(missingToolErrors[0]!)
+            : Effect.succeed({
+                comments: [],
+                commentCount: 0,
+                commentsTruncated: false,
+                reviewThreads: [],
+                commits: [],
+              }),
+      });
+      yield* harness.reactor.sweep;
+      for (let episode = 0; episode < 2; episode++) {
+        missing = true;
+        yield* TestClock.adjust("10 minutes");
+        yield* harness.reactor.sweep;
+        yield* TestClock.adjust("1 minute");
+        yield* harness.reactor.sweep;
+        assert.isDefined(harness.watch());
+        missing = false;
+        yield* TestClock.adjust("2 minutes");
+        const before = reads;
+        yield* harness.reactor.sweep;
+        assert.equal(reads, before + 1);
+        assert.isDefined(harness.watch());
+      }
+      assert.isFalse(harness.commands.some((command) => command.watch === null));
+    }),
+);
+
+it.effect("gives a newly registered watch a fresh missing-tool retry budget", () =>
+  Effect.gen(function* () {
+    const harness = yield* makeFailureHarness(missingToolErrors[0]!);
+    yield* harness.reactor.sweep;
+    yield* TestClock.adjust("1 minute");
+    yield* harness.reactor.sweep;
+    harness.restart();
+    yield* harness.reactor.sweep;
+    assert.isDefined(harness.watch());
+    yield* TestClock.adjust("1 minute");
+    yield* harness.reactor.sweep;
+    assert.isDefined(harness.watch());
+    yield* TestClock.adjust("2 minutes");
+    yield* harness.reactor.sweep;
+    assert.isUndefined(harness.watch());
   }),
 );
 
