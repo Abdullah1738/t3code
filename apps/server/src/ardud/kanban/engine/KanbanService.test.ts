@@ -10441,6 +10441,65 @@ it.effect.each(["todo", "needs_review"] as const)(
     }),
 );
 
+it.effect.each(
+  (["steer", "wake"] as const).flatMap((action) =>
+    ["", " ", "\n\t\u00a0"].map((text) => ({ action, text })),
+  ),
+)("card_thread refuses blank text without side effects (%j)", ({ action, text }) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const created = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const before = yield* kanban.card(created.id);
+      const sends = fake.sends.length;
+      const error = yield* kanban.cardThread(created.id, action, text, owner).pipe(Effect.flip);
+      assert.strictEqual(error.code, "invalid");
+      assert.strictEqual(error.detail, `${action} needs text: pass the message as text`);
+      assert.strictEqual(fake.sends.length, sends);
+      assert.deepStrictEqual(yield* kanban.card(created.id), before);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect.each([false, true])(
+  "card_thread steer delivers exact text and logs it (running=%s)",
+  (running) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const created = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+        yield* kanban.dispatchNow;
+        const card = (yield* kanban.card(created.id)).card;
+        const thread = (yield* Ref.get(fake.threads)).get(card.activeThreadId!)!;
+        thread.running = running;
+        const before = [...thread.messages];
+        const text = "  Keep the exact spacing.\nUse juno.  ";
+        yield* kanban.cardThread(card.id, "steer", text, owner);
+        assert.deepStrictEqual(thread.messages, [...before, text]);
+        const events = (yield* kanban.card(card.id)).events;
+        assert.strictEqual(events.at(-1)?.body, `Steered: ${text}`);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect("card_thread does not log a steer when delivery fails", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const before = yield* kanban.card(card.id);
+      fake.rejectSends.add(before.card.activeThreadId!);
+      yield* kanban.cardThread(card.id, "steer", "Do this", owner).pipe(Effect.flip);
+      assert.deepStrictEqual((yield* kanban.card(card.id)).events, before.events);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("a card restarted on a new thread keeps what it was woken with", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
@@ -32360,7 +32419,12 @@ it.effect.each(pendingContextActions)(
         );
         yield* kanban.cardThread(card.id, "wake", "Owner says use 2%", owner);
         yield* kanban.markSubtask(card.id, "s1", "done", "QA replied", owner, "evaluator");
-        yield* kanban.cardThread(card.id, action, text, owner);
+        if (action === "wake" && !text.trim()) {
+          const before = yield* kanban.card(card.id);
+          const refused = yield* kanban.cardThread(card.id, action, text, owner).pipe(Effect.flip);
+          assert.strictEqual(refused.code, "invalid");
+          assert.deepStrictEqual(yield* kanban.card(card.id), before);
+        } else yield* kanban.cardThread(card.id, action, text, owner);
         yield* kanban.dispatchNow;
         const running = (yield* kanban.card(card.id)).card;
         assert.strictEqual(running.stage, "working");
@@ -32406,7 +32470,12 @@ it.effect.each(pendingContextActions)(
         yield* kanban.reviewResult(reviewer, "findings", ["Reject negative rates before saving"]);
         yield* setRunning(fake, worker, false);
         yield* TestClock.adjust(1);
-        yield* kanban.cardThread(card.id, action, text, owner);
+        if (action === "wake" && !text.trim()) {
+          const before = yield* kanban.card(card.id);
+          const refused = yield* kanban.cardThread(card.id, action, text, owner).pipe(Effect.flip);
+          assert.strictEqual(refused.code, "invalid");
+          assert.deepStrictEqual(yield* kanban.card(card.id), before);
+        } else yield* kanban.cardThread(card.id, action, text, owner);
         yield* kanban.dispatchNow;
         const running = (yield* kanban.card(card.id)).card;
         assert.strictEqual(running.stage, "working");
