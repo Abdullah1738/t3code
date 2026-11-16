@@ -372,6 +372,8 @@ def _run_with_wait_budget(a, me) -> int:
         if wait_explicit_base and not e.started and (home.unreachable(e) or
                 (last_home_outage is not None and e.code == EXIT_INFRA and api.client_budget_expired(e))):
             e = home.base_down_error(explicit_base, str(e))
+        if os.environ.get(runs.BACKGROUND_RUN_ENV):
+            runs.queue_lifecycle.failed(os.environ[runs.BACKGROUND_RUN_ENV], e)
         if e.code not in (EXIT_INFRA, EXIT_CAP, EXIT_BUSY):
             say(str(e))
             return e.code

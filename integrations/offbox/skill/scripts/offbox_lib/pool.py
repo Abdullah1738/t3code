@@ -589,9 +589,12 @@ def _acquire_with_pins(me, size, template, base, fresh, run_id, exclude, check_s
         except home.FailbackReady as ready:
             handoff = ready
             data["props"]["outcome"] = "ready"
-        except BaseException:
+        except BaseException as error:
+            from . import queue_lifecycle
+            details = queue_lifecycle.failed(run_id, error)
             toollog.emit("pool", "run.queue", kind="error", ok=False, duration_ms=(time.monotonic()-started)*1000,
-                         ids={"run": run_id}, props={"queued": True, "waitMs": (time.monotonic()-started)*1000}, tag="queue_failed")
+                         ids={"run": run_id}, props={"queued": True, "waitMs": (time.monotonic()-started)*1000,
+                                                    **details}, tag="queue_failed")
             raise
         if handoff is None:
             data["ids"] = {"run": run_id, "box": row["box_id"]}

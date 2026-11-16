@@ -1330,8 +1330,10 @@ def _never_started(r) -> bool:
 
 
 def _report_never_started(r) -> int:
+    from . import queue_lifecycle
     if r['status'] == 'killed':
         say(f"{r['run_id']}: killed while queued; never started; nothing ran, safe to rerun")
+        say(queue_lifecycle.last_end(r['run_id']))
         return 130
     client_log = LOGS_DIR / f"{r['run_id']}.client.log"
     try:
@@ -1351,6 +1353,7 @@ def _report_never_started(r) -> int:
         guess = '' if client_log.exists() else ' (caller interrupted?)'
         say(f"{r['run_id']}: never started: the offbox client that queued it ended before it got a box"
             f"{guess}; nothing ran, safe to rerun")
+    say(queue_lifecycle.last_end(r['run_id']))
     if tail:
         say(f"client log: {client_log}")
         for line in tail:
@@ -1850,19 +1853,31 @@ def _pid_started_at(pid: int) -> float | None:
         return None
 
 
-def _client_alive(pid: int | None, start_at: float | None) -> bool:
+def _client_alive(pid: int | None, start_at: float | None, *, reaper_run=None) -> bool:
     """Is the `offbox run` that inserted this row still running? Unknown (no pid recorded) counts as alive.
     A live pid that started after the run did is a reused pid, so the client is gone."""
+    alive, check, began = _client_check(pid, start_at)
+    if not alive and reaper_run:
+        with contextlib.suppress(Exception):
+            age = f'{now() - start_at:.3f}' if start_at is not None else 'unknown'
+            log(f"reaper no-box run {reaper_run} client_pid={pid} check={check} "
+                f"age_s={age} row_start_at={start_at} observed_start_at={began}")
+    return alive
+
+
+def _client_check(pid, start_at):
     if not pid:
-        return True
+        return True, 'no_pid', None
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
-        return False
+        return False, 'pid_missing', None
     except PermissionError:
         pass
     began = _pid_started_at(pid)
-    return began is None or start_at is None or began <= start_at + 2
+    alive = began is None or start_at is None or began <= start_at + 2
+    check = 'identity_unavailable' if began is None or start_at is None else 'alive' if alive else 'pid_reused'
+    return alive, check, began
 
 
 def _wait_start_receipt(row, deadline, *, locked=False):

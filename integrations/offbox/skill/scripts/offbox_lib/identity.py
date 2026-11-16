@@ -598,6 +598,10 @@ def require_proven(me: dict, action: str) -> None:
     must never reach a selector, where it would silently match nothing or the wrong caller's rows.
     """
     if not me.get("proven", True):
+        if os.environ.get('OFFBOX_BACKGROUND_RUN'):
+            from . import queue_lifecycle
+            queue_lifecycle.note(os.environ['OFFBOX_BACKGROUND_RUN'], 'caller_lookup', 'caller_lookup_failure',
+                                 resolution=me.get('resolution'), message=me.get('lookupError'), action=action)
         waited = f"; waited {me['lookupWaited']:.0f} s" if me.get("lookupWaited") is not None else ""
         if me.get("resolution") == "unavailable" and me.get("lookupError"):
             raise OffboxError(
