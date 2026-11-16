@@ -4743,6 +4743,7 @@ const make = Effect.gen(function* () {
         ? { deferred: false }
         : {}),
       ...patch,
+      ...(patch.owes === "asked" ? { askedSeq: patch.lastReadSeq ?? current.lastReadSeq } : {}),
     };
     const participants = [...discussion.participants];
     if (index >= 0) participants[index] = updated;
@@ -9161,6 +9162,50 @@ const make = Effect.gen(function* () {
     );
   });
 
+  const sendDiscussionReminder = Effect.fn("KanbanService.sendDiscussionReminder")(function* (
+    discussion: KanbanDiscussion,
+    threadId: ThreadId,
+    action: string,
+  ) {
+    return yield* threads
+      .send({
+        threadId,
+        text: Briefs.nudgeDiscussionText(discussion.id),
+        coalesce: `owner:${discussion.cardId ?? discussion.id}`,
+        key: ownerReplyKey(discussion.id, threadId, action),
+      })
+      .pipe(
+        Effect.provideService(EvaluatorAnalytics.origin, "discussion_nudge"),
+        EvaluatorAnalytics.forCard(discussion.boardId, discussion.cardId),
+        Effect.result,
+      );
+  });
+
+  const recordDiscussionReminder = Effect.fn("KanbanService.recordDiscussionReminder")(function* (
+    discussion: KanbanDiscussion,
+    participant: KanbanParticipant,
+    sent: Effect.Success<ReturnType<typeof sendDiscussionReminder>>,
+    retry: boolean,
+  ) {
+    if (Result.isFailure(sent)) {
+      if (participant.deferred && sent.failure.rejected) {
+        yield* saveDiscussion(
+          withParticipant(discussion, participant.actor, participant.name, {
+            deferredKey: NodeCrypto.randomUUID(),
+          }),
+        );
+      }
+      if (retry || participant.deferred) return true;
+    }
+    yield* saveDiscussion(
+      withParticipant(discussion, participant.actor, participant.name, {
+        owes: "nudged",
+        typingUntil: yield* typingUntil,
+      }),
+    );
+    return true;
+  });
+
   /** A deferral must leave the turn's reminder attempt available for an active sibling. */
   const settleParticipant = Effect.fn("KanbanService.settleParticipant")(function* (
     discussion: KanbanDiscussion,
@@ -9205,35 +9250,8 @@ const make = Effect.gen(function* () {
       }
       const action = yield* ownerReplyPending(store, discussion.id, threadId);
       if (action === null) return false;
-      const sent = yield* threads
-        .send({
-          threadId,
-          text: Briefs.nudgeDiscussionText(discussion.id),
-          coalesce: `owner:${discussion.cardId ?? discussion.id}`,
-          key: ownerReplyKey(discussion.id, threadId, action),
-        })
-        .pipe(
-          Effect.provideService(EvaluatorAnalytics.origin, "discussion_nudge"),
-          EvaluatorAnalytics.forCard(discussion.boardId, discussion.cardId),
-          Effect.result,
-        );
-      if (Result.isFailure(sent)) {
-        if (participant.deferred && sent.failure.rejected) {
-          yield* saveDiscussion(
-            withParticipant(discussion, participant.actor, participant.name, {
-              deferredKey: NodeCrypto.randomUUID(),
-            }),
-          );
-        }
-        if (retry || participant.deferred) return true;
-      }
-      yield* saveDiscussion(
-        withParticipant(discussion, participant.actor, participant.name, {
-          owes: "nudged",
-          typingUntil: yield* typingUntil,
-        }),
-      );
-      return true;
+      const sent = yield* sendDiscussionReminder(discussion, threadId, action);
+      return yield* recordDiscussionReminder(discussion, participant, sent, retry);
     }
     if (participant.typingUntil !== null || participant.owes !== null) {
       yield* saveDiscussion(
@@ -11630,74 +11648,153 @@ const make = Effect.gen(function* () {
   });
 
   // The persisted deferral belongs to the participant even after its card is released.
-  const wakeDiscussionNudges = Effect.fn("KanbanService.wakeDiscussionNudges")(function* (
-    board: KanbanBoard,
-    wakes = new Set<ThreadId>(),
-  ) {
-    for (const initial of yield* store.openDiscussions(board.id)) {
-      if (initial.settledAt !== null || initial.archivedAt !== null) continue;
-      for (const entry of initial.participants) {
-        if (entry.actor._tag !== "thread" || !entry.deferred || entry.owes !== "asked") continue;
-        const threadId = entry.actor.threadId;
-        if ((yield* Ref.get(unresolvedTurnEnds)).has(threadId)) continue;
-        if (wakes.has(threadId)) continue;
-        const discussion = yield* store.discussion(initial.id);
-        if (!discussion || discussion.settledAt !== null || discussion.archivedAt !== null)
-          continue;
-        const participant = discussion.participants.find(
-          (candidate) => candidate.actor._tag === "thread" && candidate.actor.threadId === threadId,
-        );
-        if (!participant?.deferred || participant.owes !== "asked") continue;
-        const link = yield* store.threadLink(threadId);
-        if (!link || link.boardId !== board.id || link.paused) continue;
-        if (yield* discussionWaitHeld(discussion, link)) continue;
-        const carried = yield* store.cardsByThread(threadId);
-        if (discussionHeld(board, discussion, link, carried)) continue;
-        if (!(yield* isHome(discussion, threadId))) {
-          yield* saveDiscussion(
-            withParticipant(discussion, participant.actor, participant.name, {
-              owes: null,
-              typingUntil: null,
-            }),
-          );
-          continue;
-        }
-        const view = yield* threads.view(threadId);
-        if (
-          !view ||
-          view.archived ||
-          view.state !== "idle" ||
-          Rules.waitingOnBackground(view, yield* nowMillis)
-        )
-          continue;
-        const failure = yield* Effect.result(threads.findLastFailure(threadId));
-        if (Result.isFailure(failure) || failure.success !== null) {
-          if (Result.isSuccess(failure)) yield* turnEndedUnlocked(threadId, undefined, true);
-          wakes.add(threadId);
-          continue;
-        }
-        // An attempted eligible reminder takes precedence over a work nudge, even
-        // when the send is refused and must be retried on the next tick.
-        wakes.add(threadId);
-        yield* settleParticipant(discussion, threadId, true);
-        const updated = yield* store.discussion(discussion.id);
-        const stillAsked = updated?.participants.some(
-          (candidate) =>
-            candidate.actor._tag === "thread" &&
-            candidate.actor.threadId === threadId &&
-            candidate.owes === "asked",
-        );
-        if (!stillAsked) {
-          yield* Ref.update(deferredNudges, (set) => {
-            const next = new Set(set);
-            next.delete(threadId);
-            return next;
+  const wakeDiscussionNudges = Effect.fn("KanbanService.wakeDiscussionNudges")(
+    function* (board: KanbanBoard, wakes = new Set<ThreadId>()) {
+      // Collection admission can queue for seconds too. Only candidate validation
+      // and recording own a board operation; thread I/O runs between those operations.
+      const candidates = [];
+      for (const discussion of yield* store.openDiscussions(board.id)) {
+        if (discussion.settledAt !== null || discussion.archivedAt !== null) continue;
+        for (const participant of discussion.participants) {
+          if (
+            participant.actor._tag !== "thread" ||
+            !participant.deferred ||
+            participant.owes !== "asked"
+          )
+            continue;
+          // Legacy participants have no stable ask cursor; prefer a conservative
+          // creation-time age over dating their ask from a later read or status.
+          const ask =
+            participant.askedSeq === undefined || participant.askedSeq === 0
+              ? null
+              : yield* store.message(discussion.id, participant.askedSeq);
+          candidates.push({
+            discussionId: discussion.id,
+            threadId: participant.actor.threadId,
+            deferredKey: participant.deferredKey,
+            lastReadSeq: participant.lastReadSeq,
+            askedSeq: participant.askedSeq,
+            askedAt: ask?.createdAt ?? discussion.createdAt,
           });
         }
       }
-    }
-    return wakes;
-  });
+      candidates.sort((a, b) => a.askedAt.localeCompare(b.askedAt));
+      let sends = 0;
+      for (const candidate of candidates) {
+        if (sends >= 10) break;
+        const { threadId } = candidate;
+        if ((yield* Ref.get(unresolvedTurnEnds)).has(threadId) || wakes.has(threadId)) continue;
+        const prepare = Effect.gen(function* () {
+          const discussion = yield* store.discussion(candidate.discussionId);
+          if (!discussion || discussion.settledAt !== null || discussion.archivedAt !== null)
+            return null;
+          const participant = discussion.participants.find(
+            (entry) => entry.actor._tag === "thread" && entry.actor.threadId === threadId,
+          );
+          if (
+            !participant?.deferred ||
+            participant.owes !== "asked" ||
+            participant.deferredKey !== candidate.deferredKey ||
+            participant.lastReadSeq !== candidate.lastReadSeq ||
+            participant.askedSeq !== candidate.askedSeq
+          )
+            return null;
+          const link = yield* store.threadLink(threadId);
+          const currentBoard = yield* boardOf(board.id);
+          if (
+            currentBoard.archivedAt !== null ||
+            !link ||
+            link.boardId !== board.id ||
+            link.paused ||
+            (yield* Ref.get(unresolvedTurnEnds)).has(threadId)
+          )
+            return null;
+          if (yield* discussionWaitHeld(discussion, link)) return null;
+          if (discussionHeld(currentBoard, discussion, link, yield* store.cardsByThread(threadId)))
+            return null;
+          if (!(yield* isHome(discussion, threadId))) {
+            yield* saveDiscussion(
+              withParticipant(discussion, participant.actor, participant.name, {
+                owes: null,
+                typingUntil: null,
+              }),
+            );
+            return null;
+          }
+          const action = yield* ownerReplyPending(store, discussion.id, threadId).pipe(
+            locks.dispatchRead,
+          );
+          return action === null ? null : { discussion, participant, action };
+        });
+        const locked = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+          locks.step(
+            locks.boundedReads(effect),
+            undefined,
+            "KanbanService.tickStep:wakeDiscussionNudges",
+          );
+        // A read budget miss ends this pass; retrying immediately would keep taking
+        // the gate from writers while the same reader remains backed up.
+        const processed = yield* Effect.gen(function* () {
+          if (!(yield* locked(prepare))) return;
+          const view = yield* threads.view(threadId);
+          if (
+            !view ||
+            view.archived ||
+            view.state !== "idle" ||
+            Rules.waitingOnBackground(view, yield* nowMillis)
+          )
+            return;
+          const failure = yield* Effect.result(threads.findLastFailure(threadId));
+          const ready = yield* locked(prepare);
+          if (!ready) return;
+          if (Result.isFailure(failure) || failure.success !== null) {
+            wakes.add(threadId);
+            // The serial turn-end handler needs an operation parent so its own
+            // commits advance the pause caller's snapshot when it resumes.
+            if (Result.isSuccess(failure))
+              yield* locked(turnEndedUnlocked(threadId, undefined, true));
+            return;
+          }
+          // An attempted reminder wins over a work nudge, including a refused send.
+          wakes.add(threadId);
+          sends += 1;
+          const sent = yield* sendDiscussionReminder(ready.discussion, threadId, ready.action);
+          yield* locked(
+            Effect.gen(function* () {
+              const fresh = yield* prepare;
+              if (fresh)
+                yield* recordDiscussionReminder(fresh.discussion, fresh.participant, sent, true);
+              const stillAsked = fresh
+                ? Result.isFailure(sent)
+                : (yield* store.discussion(candidate.discussionId))?.participants.some(
+                    (entry) =>
+                      entry.actor._tag === "thread" &&
+                      entry.actor.threadId === threadId &&
+                      entry.owes === "asked",
+                  );
+              if (!stillAsked) {
+                yield* Ref.update(deferredNudges, (set) => {
+                  const next = new Set(set);
+                  next.delete(threadId);
+                  return next;
+                });
+              }
+            }),
+          );
+        }).pipe(
+          Effect.as(true),
+          Effect.catchDefect((defect) =>
+            defect instanceof BoardLocks.BoardReadBudgetExceeded
+              ? Effect.succeed(false)
+              : Effect.die(defect),
+          ),
+        );
+        if (!processed) break;
+      }
+      return wakes;
+    },
+    (effect) => locks.outside(locks.fresh(effect)),
+  );
 
   /**
    * An evaluator failed twice (or ran out of context): it is given up. Its discussions

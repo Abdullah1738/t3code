@@ -6620,7 +6620,7 @@ it.effect("a started write finishes after the start deadline", () =>
       const busyError = yield* Fiber.join(queued);
       assert.strictEqual(
         busyError.detail,
-        "Board busy: not written (waited 120s behind 0; most time: card.update 120s). Safe to retry once.",
+        "Board busy: not written (held 120000ms by card.update; waited 120000ms behind 0; most time: card.update 120s). Safe to retry once.",
       );
       const refusals = warnings.filter((entry) =>
         String(entry.message).includes('"event":"kanban board write refused"'),
