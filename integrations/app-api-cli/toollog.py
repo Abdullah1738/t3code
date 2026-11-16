@@ -38,7 +38,7 @@ _NAMES = {
     'case.open', 'case.update', 'case.close', 'case.reopen', 'case.corroborate',
     'question.ask', 'check.run', 'cache_reset', 'marketplace.refresh',
     'order_watch.item_drop_check', 'order_watch.can_report',
-    'collector.hold_seen', 'collector.hold_stale', 'collector.hold_cleared', 'collector.hold_alert_sent',
+    'collector.hold_seen', 'collector.hold_cleared',
 }
 _ENUMS = {
     'route': {'cdp', 'phone', 'unspecified'},
@@ -676,14 +676,20 @@ def emit(component, name, *, kind='event', duration_ms=None, ok=None, ids=None, 
                 # Run triggers are constructed here, never accepted from props.
                 row['props'].update(_caller_fields(props.get('caller'), props.get('trigger')))
             if component == 'order-watch' and name.startswith('collector.hold_'):
+                age = props.get('age_s')
+                comm = props.get('agent_comm')
                 row['props'] = {
-                    'owner': props.get('owner')[:120] if type(props.get('owner')) is str else None,
-                    'reason': props.get('reason') if props.get('reason') in {
-                        'hold_older_than_60m', 'lease_expired', 'holder_pid_dead', 'lease_live',
-                        'no_matching_lease_within_bound', 'hold_absent'} else None,
-                    'age_s': props.get('age_s') if type(props.get('age_s')) is int
-                             and props['age_s'] >= 0 else None,
+                    'age_s': age if type(age) in (int, float) and math.isfinite(age) and age >= 0 else None,
+                    'holder_alive': props.get('holder_alive') if type(props.get('holder_alive')) is bool else None,
+                    'agent_comm': comm if isinstance(comm, str) and re.fullmatch(r'[A-Za-z0-9_.+-]{1,80}', comm) else None,
                 }
+                failure = props.get('error')
+                if isinstance(failure, str) and (failure in {
+                        'ph timed out', 'invalid ph status', 'FileNotFoundError', 'PermissionError',
+                        'OSError', 'IsADirectoryError', 'NotADirectoryError', 'JSONDecodeError',
+                        'UnicodeDecodeError', 'ValueError', 'UnicodeError'}
+                        or re.fullmatch(r'ph exited -?[0-9]{1,3}', failure)):
+                    row['props']['error'] = failure
         if error is not None:
             code = tag(error)
             detail = cause or context.get('failure') or context.get('last') or _cause(error)
