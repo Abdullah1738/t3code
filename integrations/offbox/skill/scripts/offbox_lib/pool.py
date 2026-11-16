@@ -351,6 +351,7 @@ def members(con, key):
         AND COALESCE(l.note,'') NOT LIKE ?
         AND COALESCE(l.note,'') NOT LIKE ?
         AND COALESCE(l.note,'') NOT LIKE ?
+        AND COALESCE(l.note,'') NOT LIKE 'disk-full:%'
         AND NOT EXISTS (SELECT 1 FROM kv WHERE k='boot_dead:' || l.box_id)
         ORDER BY (l.state='running') DESC, l.last_used_at DESC""", (key, TOO_BIG_LIKE, DEAD_LIKE, WEDGED_LIKE, RECYCLED_LIKE)).fetchall()
 
@@ -383,6 +384,7 @@ def candidates(con, key, size, source, me=None):
         AND COALESCE(l.note,'') NOT LIKE ?
         AND COALESCE(l.note,'') NOT LIKE ?
         AND COALESCE(l.note,'') NOT LIKE ?
+        AND COALESCE(l.note,'') NOT LIKE 'disk-full:%'
         AND NOT EXISTS (SELECT 1 FROM bases b WHERE b.box_id=l.box_id)
         AND NOT EXISTS (SELECT 1 FROM templates t WHERE t.box_id=l.box_id)
         AND (EXISTS (SELECT 1 FROM pool_callers c WHERE c.box_id=l.box_id AND c.owner=? AND c.repo_root=?)
@@ -851,7 +853,8 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
         lease.cap_check()
         pending = poll.call(lambda: con.execute("SELECT l.* FROM leases l JOIN kv k ON k.k='resume_unanswered:' || l.box_id "
                               f"WHERE l.repo_key=? AND {token_mine('l')} AND l.state IN ('running','stopped') "
-                              "AND COALESCE(l.note,'') NOT LIKE ? LIMIT 1", (key, WEDGED_LIKE)).fetchone())
+                              "AND COALESCE(l.note,'') NOT LIKE ? AND COALESCE(l.note,'') NOT LIKE 'disk-full:%' "
+                              "LIMIT 1", (key, WEDGED_LIKE)).fetchone())
         if create_first or (pending and (pending['box_id'] in unusable or
                                             pending_busy.get(pending['box_id'], 0) > time.monotonic())):
             pending = None
@@ -915,7 +918,8 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
             try:
                 pending = con.execute("SELECT l.* FROM leases l JOIN kv k ON k.k='resume_unanswered:' || l.box_id "
                                       "WHERE l.box_id=? AND l.state IN ('running','stopped') "
-                                      "AND COALESCE(l.note,'') NOT LIKE ?", (bid, WEDGED_LIKE)).fetchone()
+                                      "AND COALESCE(l.note,'') NOT LIKE ? "
+                                      "AND COALESCE(l.note,'') NOT LIKE 'disk-full:%'", (bid, WEDGED_LIKE)).fetchone()
                 if not pending:
                     _unreserve_and_release(con, waiter, guard)
                     continue
@@ -1069,6 +1073,12 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                                 if preferred:
                                     wait_own = True
                                     break
+                                continue
+                            from . import box_disk
+                            if not box_disk.picker_ok(con, r):
+                                g.__exit__(None, None, None)
+                                guard = None
+                                can_create = _room(con, key)
                                 continue
                             allocation.check_queue()
                             row, guard = r, g

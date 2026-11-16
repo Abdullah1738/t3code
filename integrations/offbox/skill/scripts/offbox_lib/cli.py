@@ -132,6 +132,9 @@ def build_parser() -> argparse.ArgumentParser:
     k.add_argument("--days", type=float, default=30)
     k.add_argument("--box", help="clear your pin on a previous box (with --days 0)")
 
+    bx = sp.add_parser("box")
+    bx.add_argument("action", choices=["release-disk-full"])
+    bx.add_argument("box_id")
     t = sp.add_parser("template")
     t.add_argument("action", choices=["build", "list"])
     t.add_argument("name", nargs="?")
@@ -493,6 +496,9 @@ def _main(argv: list[str] | None = None) -> int:
             misc.list_leases(me, a.all, a.json)
         elif a.sub == "kill":
             return misc.kill_run(a.run_id, me)
+        elif a.sub == "box":
+            from . import box_disk
+            box_disk.release(me, a.box_id)
         elif a.sub == "release":
             misc.release(me, a.box_id, a.mine, a.delete)
         elif a.sub == "ssh":

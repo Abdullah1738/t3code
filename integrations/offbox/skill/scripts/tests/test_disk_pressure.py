@@ -85,13 +85,17 @@ class ClientDisk(unittest.TestCase):
                 runner=runs.Runner.__new__(runs.Runner);runner.box='bx_aaaaaaaa';runner.me={'repo_key':'repo'}
                 runner.root=Path(self.tmp.name);runner.run_id='disk-sync';runner.check_source=lambda _:None
                 stack.enter_context(patch.object(api,'left',return_value=None))
+                stack.enter_context(patch.object(runs.box_disk,'measure',return_value={}))
                 stack.enter_context(patch.object(runs.ssh_sync,'put_file',side_effect=common.OffboxError('No space left on device') if no_sync else None))
                 stack.enter_context(patch.object(runs,'_seed_candidates',return_value=[]))
                 stack.enter_context(patch.object(runs.ssh_sync,'push',side_effect=common.OffboxError('rsync error code 23: ENOSPC')))
                 stack.enter_context(patch.object(runs.prepare,'phase',side_effect=lambda *a:contextlib.nullcontext()))
                 with self.assertRaises(common.OffboxError) as caught:
                     runner._sync_box(None,SimpleNamespace(no_sync=no_sync,git=False),'/repo','/env',b'')
-                self.assertEqual(caught.exception.code,90);self.assertIn('home server out of disk',str(caught.exception));self.assertTrue(caught.exception.outage)
+                self.assertEqual(caught.exception.code,90)
+                self.assertIn('is out of disk',str(caught.exception))
+                self.assertFalse(caught.exception.outage)
+                self.assertEqual(caught.exception.fs,'workspace')
 
     def test_slow_health_retry_distinguishes_disk_refusal_from_transport_delay(self):
         for level, expected in [('ok', None), ('full', 'out of disk'), ('unknown', 'measurement unavailable')]:
