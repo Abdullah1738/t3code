@@ -15,6 +15,54 @@ const event = (input: Partial<AnalyticsEvent> = {}): AnalyticsEvent => ({
 });
 
 describe("analytics rollups", () => {
+  it("sums statement work and actual process bytes without counting unavailable intervals as idle", () => {
+    const target = makeAccumulator();
+    for (const connection of ["reader", "reader", "export"])
+      accumulate(
+        target,
+        event({
+          kind: "db.statement.summary",
+          props: {
+            database: "statev2.sqlite",
+            connection,
+            lane: "background",
+            sqlFingerprint: "abc",
+            key: "SELECT:threads",
+            count: 12,
+            totalMs: 20,
+            maxMs: 5,
+            resultCount: 6,
+            failures: 1,
+          },
+        }),
+      );
+    accumulate(
+      target,
+      event({ kind: "db.process.disk_read", props: { readBytes: 1000, sampleMs: 60000 } }),
+    );
+    accumulate(
+      target,
+      event({ kind: "db.process.disk_read", props: { readBytes: 0, sampleMs: 60000 } }),
+    );
+    accumulate(target, event({ kind: "db.process.disk_read", props: { reason: "unavailable" } }));
+    const result = finishRollup(target, "2026-11-13", ts);
+    assert.deepInclude(result.dbStatementFamilies?.[0], {
+      connection: "reader",
+      calls: 24,
+      totalMs: 40,
+      maxMs: 5,
+      returnedRows: 12,
+      failures: 2,
+    });
+    assert.strictEqual(result.dbStatementFamilies?.length, 2);
+    assert.deepEqual(result.processDiskRead, {
+      readBytes: 1000,
+      sampleMs: 120000,
+      samples: 2,
+      unavailableSamples: 1,
+    });
+  });
+
   it("groups control routes by UTC hour and method, retaining statuses and deadline counts", () => {
     const target = makeAccumulator();
     const sample = (durationMs: number, status: number, hour = "12", method = "GET") =>
