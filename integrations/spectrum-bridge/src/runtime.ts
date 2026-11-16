@@ -1,5 +1,7 @@
 import { markReactionAnswered } from "./unanswered.ts";
 import type { RemoteBox } from "./remote-box.ts";
+import { RemoteRequestError } from "./remote-box.ts";
+import { validId } from "./remote-protocol.ts";
 import { messageLengthError } from "./message-length.ts";
 import { toolError, toolLog } from "./toollog.ts";
 /**
@@ -407,6 +409,22 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
           if (!text(sessionId, 200) || !validAgentRequestId(body.request)
             || !text(body.text, 12_000) || (body.status !== undefined && !validAnswerStatus(body.status))) throw new HttpError(400, "Invalid request");
           return result(invokeBus(() => bus.answer({ sessionId, request: body.request as string, text: body.text as string, status: body.status as import("./agent-bus.ts").AnswerStatus | undefined })));
+        }
+        case "/remote-events":
+        case "/remote-resolve": {
+          only(body, path === "/remote-events" ? ["sessionId", "chat", "after"] : ["sessionId", "chat", "id", "state"]);
+          ownerOnly(false);
+          live();
+          if (body.chat !== "moni" || path === "/remote-events" && body.after !== undefined && !validId(body.after)
+            || path === "/remote-resolve" && (!validId(body.id) || !["done", "pending"].includes(String(body.state)))) throw new HttpError(400, "Invalid request");
+          const remote = registry.bySlugName("moni")?.remote;
+          if (!remote) throw new HttpError(409, "Moni's chat is not on its box");
+          try {
+            return reply(200, path === "/remote-events" ? await remote.events(body.after as string | undefined) : await remote.resolve(body.id as string, body.state as "done" | "pending"));
+          } catch (error) {
+            if (error instanceof RemoteRequestError && error.status === 409) throw new HttpError(409, "Event is not interrupted/attachment-failed");
+            throw new HttpError(502, "Box request failed");
+          }
         }
         case "/agent-requests": {
           only(body, ["sessionId"]);
