@@ -34,7 +34,8 @@ class GateTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         self.ledger = go.Ledger(Path(temp.name) / 'go')
         import card_status
-        p = patch.dict(os.environ, {'CARD_STATUS_FILE':str(Path(temp.name) / 'cards.json')})
+        p = patch.dict(os.environ, {'CARD_STATUS_FILE':str(Path(temp.name) / 'cards.json'),
+                                    'ORDERING_PAUSE_FILE':str(Path(temp.name) / 'paused')})
         p.start(); self.addCleanup(p.stop)
         card_status.record_declined('9546', reason='synthetic-test-decline', source='unit-test')
         p = patch.object(go, 'Ledger', return_value=self.ledger)
@@ -42,7 +43,8 @@ class GateTests(unittest.TestCase):
         p = patch.object(journal, 'ROOT', Path(temp.name) / 'commerce')
         p.start(); self.addCleanup(p.stop)
         self.home = Path(temp.name)
-        p = patch.dict(os.environ, {'ROBOB_TOOL_LOG_DIR': str(self.home / 'logs')})
+        p = patch.dict(os.environ, {'ROBOB_TOOL_LOG_DIR': str(self.home / 'logs'),
+                                    'TOOLLOG_ROOT': str(self.home / 'logs')})
         p.start(); self.addCleanup(p.stop)
         p = patch.object(hcloud.Path, 'home', return_value=self.home)
         p.start(); self.addCleanup(p.stop)
@@ -287,6 +289,8 @@ process.on('exit', () => process.stdout.write(JSON.stringify(seen)));
                     self.assertEqual(len(seen['expressions']), 2)
                     self.assertIn('e.value.length > 0', seen['expressions'][1])
 
+    # The private 9546 decline permits this fallback; 9546 NowNow place has an earlier contract gate.
+    @patch.object(journal.order_card, 'LAST4', '2342')
     def test_every_commerce_lane_and_financial_kind_refuses_before_consumption(self):
         for vertical in ('minutes', 'nownow', 'main', 'supermall', 'food'):
             for kind in ('place', 'payment', 'preauthorize', 'prepay'):
