@@ -446,7 +446,8 @@ def _recycle_log(kind, detail):
                         'stateBefore': detail.get('state_before'), 'result': detail.get('result'),
                         'ageSeconds': detail.get('age_seconds'), 'runCount': detail.get('run_count'),
                         'waitSeconds': detail['wait_seconds'], 'errorClass': detail.get('error_class'),
-                        **{k: detail[k] for k in ('busy', 'idle', 'serving', 'held', 'pending', 'cap') if k in detail}},
+                        **{k: detail[k] for k in ('busy', 'idle', 'serving', 'held', 'pending', 'cap',
+                                                  'deficit', 'members_before') if k in detail}},
                  tag='recycle_stop_failed' if detail.get('result') == 'stop_failed' else None)
 
 
@@ -500,11 +501,14 @@ def _recycle_slot(con, key, source, run_id, waiter, started, excluded):
         with write(con):
             # Cap callers register without the pool lock; pending creates can finish or fail meanwhile.
             # Hold the SQLite writer while refreshing the deficit and committing the detachments/slot.
-            count = len(members(con, key)) + _pending(con, key, locked=True) - pool_cap(con, key, locked=True) + 1
+            members_before = len(members(con, key))
+            cap = pool_cap(con, key, locked=True)
+            count = members_before + _pending(con, key, locked=True) - cap + 1
             if len(selected) < count:
                 return None, []
             kept = selected[:max(0, count)]
             for row, _, detail in kept:
+                detail.update(deficit=count, members_before=members_before, cap=cap)
                 bid = row['box_id']
                 con.execute('DELETE FROM pool_members WHERE box_id=? AND pool_key=?', (bid, key))
                 con.execute('UPDATE leases SET note=? WHERE box_id=?',

@@ -212,8 +212,11 @@ class PoolRecycleTests(Isolated):
 
     def test_same_source_waiter_queues_behind_pending_recycle(self):
         make = self.create
+        second_pid = os.getpid() + 1
         def create(*args):
-            with patch.object(lease, 'acquire_private', side_effect=AssertionError('second create')):
+            # Real callers have distinct client PIDs; failed callers clear only their own pending rows.
+            with patch.object(pool.os, 'getpid', return_value=second_pid), patch.object(pool, '_alive', return_value=True), \
+                    patch.object(lease, 'acquire_private', side_effect=AssertionError('second create')):
                 with self.assertRaises(pool.PoolBusyError):
                     pool.acquire(dict(self.me, owner='second'), template='generic')
             self.assertEqual(len(self.events('pool_recycle')), 1)
@@ -237,7 +240,8 @@ class PoolRecycleTests(Isolated):
         self.assertEqual(rollup['countsByName']['pool_recycle'], 2)
         self.assertEqual(recycled[-1]['ids'], dict(run='request', box='old', newBox='new'))
         self.assertEqual(recycled[-1]['props']['repo'], toollog.repo_id('repo'))
-        for field in ('source', 'fromSource', 'size', 'stateBefore', 'result', 'ageSeconds', 'runCount', 'waitSeconds'):
+        for field in ('source', 'fromSource', 'size', 'stateBefore', 'result', 'ageSeconds', 'runCount', 'waitSeconds',
+                      'deficit', 'members_before', 'cap'):
             self.assertIn(field, recycled[-1]['props'])
 
     def test_pin_published_at_box_guard_boundary_is_rechecked(self):
@@ -311,6 +315,70 @@ class PoolRecycleTests(Isolated):
             got = pool.acquire(self.me, template='generic')
             pool.release_guard(got)
         stop.assert_not_called()
+        self.assertFalse(self.events('pool_recycle'))
+
+    def test_twelve_members_at_cap_eight_queue_until_five_slots_can_be_recycled(self):
+        for i in range(10):
+            self.box(f'extra-{i}', member=True, state='stopped')
+            if i >= 3:
+                self.busy(f'extra-{i}')
+        self.assertEqual(len(pool.members(self.con, 'repo')), 12)
+        clock = FakeClock()
+        original_sleep = clock.time.sleep
+        observed = []
+
+        def free(seconds):
+            state = pool.queue_state(self.con, 'repo', 'over-cap', source='template:generic')
+            observed.append((state['total'], state['cap'], state['place']))
+            self.assertFalse(self.events('pool_recycle'))
+            self.assertEqual(pool._pending(self.con, 'repo'), 0)
+            self.con.execute("UPDATE runs SET status='done' WHERE box_id='extra-3'")
+            self.con.commit()
+            original_sleep(seconds)
+
+        def create(*args):
+            self.assertEqual(len(pool.members(self.con, 'repo')), 7)
+            self.assertEqual(pool.pool_cap(self.con, 'repo'), 8)
+            return self.create(*args)
+
+        clock.time.sleep = free
+        with patch.dict(os.environ, {'OFFBOX_POOL_SIZE': '8', 'OFFBOX_POOL_WAIT_SECONDS': '10'}), \
+                patch.object(pool, 'time', clock.time), patch.object(lease, 'stop_box', side_effect=self.stop) as stop, \
+                patch.object(lease, 'acquire_private', side_effect=create):
+            got = pool.acquire(self.me, template='generic', run_id='over-cap')
+            pool.release_guard(got)
+            self.assertEqual(len(pool.members(self.con, 'repo')), 8)
+        self.assertEqual(observed, [(12, 8, 1)])
+        self.assertEqual(stop.call_count, 1)
+        detached = [r for r in self.events('pool_recycle') if r['result'] == 'detached']
+        self.assertEqual(len(detached), 5)
+        self.assertEqual({r['box_id'] for r in detached}, {'old', 'extra-0', 'extra-1', 'extra-2', 'extra-3'})
+        for event in detached:
+            self.assertEqual((event['run_id'], event['deficit'], event['members_before'], event['cap']),
+                             ('over-cap', 5, 12, 8))
+        self.assertEqual(self.con.execute('SELECT count(*) FROM pool_pending').fetchone()[0], 0)
+
+    def test_idle_resume_stalled_members_do_not_consume_slots_or_get_reused(self):
+        self.con.execute("UPDATE leases SET state='resume_stalled' WHERE box_id='old'")
+        for i in range(10):
+            self.box(f'stalled-{i}', member=True, state='resume_stalled')
+        self.con.commit()
+        self.assertEqual(self.con.execute('SELECT count(*) FROM pool_members').fetchone()[0], 12)
+        self.assertEqual(len(pool.members(self.con, 'repo')), 1)
+
+        def create(*args):
+            self.assertTrue(pool_lock_free())
+            self.assertEqual(pool._pending(self.con, 'repo'), 1)
+            self.box('new', source='base:repo:tools')
+            return dict(self.con.execute("SELECT * FROM leases WHERE box_id='new'").fetchone())
+
+        with patch.object(lease, 'stop_box') as stop, patch.object(lease, '_reuse') as reuse, \
+                patch.object(lease, 'acquire_private', side_effect=create):
+            got = pool.acquire(self.me, base='tools')
+            pool.release_guard(got)
+        self.assertEqual(got['box_id'], 'new')
+        stop.assert_not_called()
+        reuse.assert_not_called()
         self.assertFalse(self.events('pool_recycle'))
 
     def test_recycled_marker_stays_excluded_in_full_and_nonfull_pools(self):
