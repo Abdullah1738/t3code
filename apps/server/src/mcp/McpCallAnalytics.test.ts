@@ -16,6 +16,7 @@ import {
   type OrchestrationV2Subagent,
   EnvironmentId,
   OrchestratorMcpFailure,
+  PullRequestUnavailableError,
   ProviderInstanceId,
   ThreadId,
   PreviewAutomationError,
@@ -61,6 +62,7 @@ import * as McpToolAccess from "./McpToolAccess.ts";
 import {
   PullRequestToolTimeoutError,
   PullRequestWatchTimeoutError,
+  PullRequestWatchUnavailableError,
 } from "./toolkits/pullRequests/tools.ts";
 import * as Testkit from "./McpToolAccess.testkit.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -119,6 +121,7 @@ const client = McpSchema.McpServerClient.of({
 const ProbeFailure = Schema.Union([
   OrchestratorMcpFailure,
   PullRequestWatchTimeoutError,
+  PullRequestWatchUnavailableError,
   PullRequestToolTimeoutError,
   KanbanError,
   PreviewAutomationError,
@@ -1174,6 +1177,13 @@ const typedFailures = [
     outcome: "timeout",
   })),
   { error: new PullRequestWatchTimeoutError({ saved: "unknown" }), outcome: "timeout" },
+  {
+    error: new PullRequestWatchUnavailableError({
+      host: "github.com",
+      cause: new PullRequestUnavailableError({ reason: "cli-missing" }),
+    }),
+    outcome: "refused",
+  },
   { error: new PreviewAutomationTimeoutError(browserRequest), outcome: "timeout" },
   {
     error: new PreviewAutomationRecordingDeadlineExpiredError({
