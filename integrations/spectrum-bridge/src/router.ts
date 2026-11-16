@@ -4197,21 +4197,74 @@ export class Router {
     return found;
   }
 
+  private logNoticeReply(turn: Pick<Turn, "id" | "generation"> & Partial<Pick<Turn, "messageId" | "earlySent" | "earlyOutbox">>, scope: MessageRecord[], record: MessageRecord,
+    source: "watch" | "settle_preceding", sealedWake = false,
+    outcome?: "incomplete" | "failed" | "owner_typed"): void {
+    toolLog.capture(() => {
+      const pendingKey = turn.messageId ? `log-notice-pending:${turn.id}:${turn.messageId}` : undefined;
+      let pending = pendingKey
+        ? this.store.get<{ noticeId: string; ownerTyped: boolean; sealedWake: boolean; runId?: string; replyIds?: string[]; precedingIdleIds?: string[] } | null>(pendingKey) : undefined;
+      const observe = (run: MessageRecord[], boundary: MessageRecord, override?: typeof outcome) => {
+        const notice = run.find(m => (m.type === "user" || m.type === "synthetic")
+          && typeof m.text === "string" && isCompletionNoticeText(m.text));
+        const carried = pending?.precedingIdleIds?.includes(boundary.id) ? undefined : pending;
+        if (carried) pending = undefined;
+        const noticeId = carried?.noticeId ?? notice?.id;
+        if (!noticeId) return;
+        const key = `${turn.id}:${noticeId}`;
+        // Incomplete runs leave the watermark unchanged, including across a bridge restart.
+        const logged = this.store.get<string[]>("log-notice-replies") ?? [];
+        if (logged.includes(key)) { if (carried && pendingKey) this.store.set(pendingKey, null); return; }
+        const steps = run.filter((m): m is Extract<MessageRecord, { type: "assistant" }> => m.type === "assistant");
+        const final = steps.at(-1);
+        const runId = carried?.runId ?? steps.find(m => typeof m.runId === "string")?.runId;
+        // Early replies are already in the outbox when terminal processing excludes them from outgoing.
+        const replies = this.toolMode ? 0 : new Set([
+          ...(carried?.replyIds ?? []),
+          ...steps.filter(m => this.store.getOperation(`reply:${turn.generation}:${m.id}`)
+            || m.id === turn.earlySent && turn.earlyOutbox && this.store.getOperation(turn.earlyOutbox)).map(m => m.id),
+        ]).size;
+        toolLog.write({ component: "router", kind: "event", name: "notice.reply",
+          ids: { chat: this.options.context?.chat.slug ?? "owner", runId: runId ?? boundary.id },
+          props: { source: carried ? "settle_preceding" : source, outcome: carried?.ownerTyped || run.some(ownerPrompt) ? "owner_typed" : override
+            ?? (boundary.type === "idle" && (boundary.outcome !== "succeeded" || boundary.modelError) || final?.error ? "failed"
+              : boundary.type === "idle" && final && (final.time.completed === undefined || final.finish === "tool-calls") ? "incomplete"
+              : this.toolMode ? "quiet" : replies ? "forwarded" : "no_reply"), replies, sealedWake: carried?.sealedWake ?? sealedWake } });
+        this.store.set("log-notice-replies", [...logged.slice(-255), key]);
+        if (carried && pendingKey) this.store.set(pendingKey, null);
+      };
+      // Foreground steering can collect several completed runs before its final idle.
+      let run: MessageRecord[] = [];
+      for (const item of scope) {
+        if (item.type !== "idle") { run.push(item); continue; }
+        // Earlier replies stay held until the final steered run reaches the outbox transaction.
+        if (outcome === "incomplete") pending = undefined;
+        else observe(run, item);
+        run = [];
+      }
+      observe(run, record, outcome);
+    });
+  }
+
   /** Completed notice runs retain their own outcome even when a sealed wake overtakes them. */
   private settlePrecedingCompletions(turn: Turn, records: MessageRecord[]): void {
     const replies: Extract<MessageRecord, { type: "assistant" }>[] = [];
+    const observations: { scope: MessageRecord[]; record: MessageRecord; outcome?: "incomplete" | "failed" }[] = [];
     let scope: MessageRecord[] = [];
     let settled: string | undefined;
     for (const record of records) {
       if (record.type !== "idle") { scope.push(record); continue; }
+      const observation: typeof observations[number] = { scope, record };
+      observations.push(observation);
       if (!scope.some(backgroundCompletion) || scope.some(ownerPrompt)) { scope = []; continue; }
       const steps = withoutProgressReplies(scope).filter((m): m is Extract<MessageRecord, { type: "assistant" }> => m.type === "assistant");
       const final = steps.at(-1);
       if (record.outcome === "succeeded" && !record.modelError && !final?.error) {
-        if (final && (final.time.completed === undefined || final.finish === "tool-calls")) break;
+        if (final && (final.time.completed === undefined || final.finish === "tool-calls")) { observation.outcome = "incomplete"; break; }
         const quiet = quietMessages(scope);
         replies.push(...steps.filter(m => !quiet.has(m.id) && !m.error && (m.answer === true || (m === final && m.answer !== false))));
       }
+      else observation.outcome = "failed";
       settled = record.id;
       scope = [];
     }
@@ -4224,7 +4277,25 @@ export class Router {
       replies.push(...answered);
       settled = answered.at(-1)?.id ?? settled;
     }
-    if (!settled) return;
+    const log = () => {
+      for (const observation of observations) this.logNoticeReply(turn, observation.scope, observation.record, "settle_preceding",
+        !!turn.inboundId?.startsWith("wake:"), observation.outcome);
+      if (scope.length && !observations.some(observation => observation.scope === scope)) toolLog.capture(() => {
+        const notice = scope.find(m => (m.type === "user" || m.type === "synthetic")
+          && typeof m.text === "string" && isCompletionNoticeText(m.text));
+        const steps = scope.filter((m): m is Extract<MessageRecord, { type: "assistant" }> => m.type === "assistant");
+        // A completed answer can precede more answers or a failed idle in this same run.
+        // Retain its identity and committed reply IDs when admission moves the watermark past them.
+        if (notice) this.store.set(`log-notice-pending:${turn.id}:${turn.messageId}`, {
+          noticeId: notice.id, ownerTyped: scope.some(ownerPrompt), sealedWake: !!turn.inboundId?.startsWith("wake:"),
+          runId: steps.find(m => typeof m.runId === "string")?.runId,
+          replyIds: steps.filter(m => this.store.getOperation(`reply:${turn.generation}:${m.id}`)).map(m => m.id),
+          // With no new answer to advance the watermark, earlier idles can be read again.
+          precedingIdleIds: observations.map(observation => observation.record.id),
+        });
+      });
+    };
+    if (!settled) { log(); return; }
     let enqueued = false;
     this.store.db.transaction(() => {
       for (const reply of this.toolMode ? [] : replies) {
@@ -4237,6 +4308,7 @@ export class Router {
       }
       this.store.set("watermark", { sessionId: turn.id, id: settled! } satisfies Watermark);
     }).immediate();
+    log();
     if (enqueued) this.stage("reply-enqueued", turn.inboundId ?? turn.messageId);
   }
 
@@ -4531,6 +4603,7 @@ export class Router {
             this.fail(turn!, text, idle.id, reason, immediate);
             for (const id of completed) this.store.updateInbound(id, "done");
           }).immediate();
+          this.logNoticeReply(turn!, scope, idle, "watch", false, "failed");
           if (!this.toolMode && completedEarlier.length) this.stage("reply-enqueued", turn!.inboundId ?? turn!.messageId);
         };
         const providerError = [...replies].reverse().find(reply => reply.error)?.error;
@@ -4599,10 +4672,16 @@ export class Router {
       const tools = replies.flatMap(m => Array.isArray(m.content) ? m.content.filter(p => p?.type === "tool") : []);
       const runningTools = tools.some(p => !["completed", "error"].includes((p as { state?: { status?: string } }).state?.status ?? ""));
       if (turn.phase !== "running") return;
-      if (runningTools || !idle) return;
+      if (runningTools || !idle) {
+        if (idle) this.logNoticeReply(turn, scope, idle, "watch", false, "incomplete");
+        return;
+      }
       // An unsent final that has not completed, or that stopped to call tools, keeps the turn open. Narration
       // is the last word only when nothing follows it, so it closes here once the run is idle.
-      if (final && final.id !== turn.earlySent && (final.time.completed === undefined || final.finish === "tool-calls")) return;
+      if (final && final.id !== turn.earlySent && (final.time.completed === undefined || final.finish === "tool-calls")) {
+        this.logNoticeReply(turn, scope, idle, "watch", false, "incomplete");
+        return;
+      }
       // Unsent narration (text before a tool call, `answer` false) stays quiet. A final whose phase
       // is unknown still does, as before: the owner chose to keep forwarding unknown finals.
       const early = replies.find(reply => reply.id === turn!.earlySent);
@@ -4682,6 +4761,7 @@ export class Router {
       // Tool mode safety net: a typed message whose turn texted nothing gets one reminder.
       if (sent && !sent.length && !silent && !waiting.length) this.nudgeReply(turn);
     }).immediate();
+    this.logNoticeReply(turn, scope, idle, "watch");
     if (!this.toolMode && (text || earlier.length)) this.stage("reply-enqueued", turn.inboundId ?? turn.messageId);
   }
 
@@ -4752,6 +4832,14 @@ export class Router {
         }
       }
       if (!after.length && statuses[route.id] === undefined) return;
+      if (statuses[route.id] === undefined && (after.some(ownerPrompt) || !after.some(m => m.type === "assistant"))) {
+        let scope: MessageRecord[] = [];
+        for (const record of after) {
+          if (record.type !== "idle") { scope.push(record); continue; }
+          this.logNoticeReply(route, scope, record, "watch", false, after.some(ownerPrompt) ? "owner_typed" : undefined);
+          scope = [];
+        }
+      }
       if (after.some(ownerPrompt)) {
         // Desktop owner replies stay there even if a completion also arrived.
         const idle = [...after].reverse().find(m => m.type === "idle");

@@ -30,6 +30,136 @@ SCRIPT = "live-database-script"
 UNRESOLVED = "live-database-script-unresolved"
 
 
+# Reviewed @aikidosec/safe-chain 1.5.29 startup bytes; never executed here.
+SAFE_CHAIN_INIT_POSIX = r'''if [ -n "${BASH_SOURCE[0]:-}" ]; then
+    _sc_script_path="${BASH_SOURCE[0]}"
+elif [ -n "${ZSH_VERSION:-}" ]; then
+    # ${(%):-%x} uses Zsh prompt expansion to get the sourced file's path.
+    # eval is required so other shells don't try to parse the Zsh-specific syntax.
+    eval '_sc_script_path="${(%):-%x}"'
+else
+    _sc_script_path="$0"
+fi
+_sc_scripts_dir=$(CDPATH= cd -- "$(dirname -- "$_sc_script_path")" 2>/dev/null && pwd -P)
+_sc_base=$(dirname -- "$_sc_scripts_dir")
+export PATH="$PATH:${_sc_base}/bin"
+unset _sc_base _sc_script_path _sc_scripts_dir
+
+function npx() {
+  wrapSafeChainCommand "npx" "$@"
+}
+
+function yarn() {
+  wrapSafeChainCommand "yarn" "$@"
+}
+
+function pnpm() {
+  wrapSafeChainCommand "pnpm" "$@"
+}
+
+function pnpx() {
+  wrapSafeChainCommand "pnpx" "$@"
+}
+
+function rush() {
+  wrapSafeChainCommand "rush" "$@"
+}
+
+function rushx() {
+  wrapSafeChainCommand "rushx" "$@"
+}
+
+function bun() {
+  wrapSafeChainCommand "bun" "$@"
+}
+
+function bunx() {
+  wrapSafeChainCommand "bunx" "$@"
+}
+
+function npm() {
+  if [[ "$1" == "-v" || "$1" == "--version" ]] && [[ $# -eq 1 ]]; then
+    # If args is just -v or --version and nothing else, just run the npm version command
+    # This is because nvm uses this to check the version of npm
+    command npm "$@"
+    return
+  fi
+
+  wrapSafeChainCommand "npm" "$@"
+}
+
+function pip() {
+  wrapSafeChainCommand "pip" "$@"
+}
+
+function pip3() {
+  wrapSafeChainCommand "pip3" "$@"
+}
+
+function uv() {
+  wrapSafeChainCommand "uv" "$@"
+}
+
+function uvx() {
+  wrapSafeChainCommand "uvx" "$@"
+}
+
+function poetry() {
+  wrapSafeChainCommand "poetry" "$@"
+}
+
+# `python -m pip`, `python -m pip3`.
+function python() {
+  wrapSafeChainCommand "python" "$@"
+}
+
+# `python3 -m pip`, `python3 -m pip3'.
+function python3() {
+  wrapSafeChainCommand "python3" "$@"
+}
+
+function pipx() {
+  wrapSafeChainCommand "pipx" "$@"
+}
+
+function pdm() {
+  wrapSafeChainCommand "pdm" "$@"
+}
+
+function printSafeChainWarning() {
+  # \033[43;30m is used to set the background color to yellow and text color to black
+  # \033[0m is used to reset the text formatting
+  printf "\033[43;30mWarning:\033[0m safe-chain is not available to protect you from installing malware. %s will run without it.\n" "$1"
+  # \033[36m is used to set the text color to cyan
+  printf "Install safe-chain by using \033[36mnpm install -g @aikidosec/safe-chain\033[0m.\n"
+}
+
+function wrapSafeChainCommand() {
+  local original_cmd="$1"
+
+  if ! type -f "${original_cmd}" > /dev/null 2>&1; then
+    # If the original command is not available, don't try to wrap it: invoke it
+    # transparently, so the shell can report errors as if this wrapper didn't
+    # exist.
+    command "$@"
+    return $?
+  fi
+
+  if command -v safe-chain > /dev/null 2>&1; then
+    # If the aikido command is available, just run it with the provided arguments.
+    # Unset PKG_EXECPATH so the yao-pkg bootstrap inside the safe-chain binary doesn't
+    # mistake argv[1] for a script path and try to resolve it against cwd.
+    (unset PKG_EXECPATH; safe-chain "$@")
+  else
+    # If the aikido command is not available, print a warning and run the original command
+    printSafeChainWarning "$original_cmd"
+
+    command "$@"
+  fi
+}
+'''
+
+
 class GuardTests(unittest.TestCase):
     def setUp(self):
         clean = isolated_source_cases.fixture_environment_patch()
@@ -1977,6 +2107,7 @@ class GuardTests(unittest.TestCase):
                 self.assertEqual(self.classify(command), expected)
 
     def test_isolated_migrate_source_and_note_case_matrix(self):
+        isolated_source_cases.write_migration_helpers(self.root)
         source = Path(__file__).resolve().parents[3] / 'apps/server/scripts/migrate-dev-db.ts'
         self.write('apps/server/scripts/migrate-dev-db.ts', source.read_text())
         self.write('package.json', json.dumps({'scripts': {'migrate-dev-db': 'node apps/server/scripts/migrate-dev-db.ts'}}))
@@ -1986,6 +2117,7 @@ class GuardTests(unittest.TestCase):
                 self.assertEqual(guard.classify_detail(command, str(self.root))[0], expected)
 
     def test_isolated_migrate_history_attach_provenance(self):
+        isolated_source_cases.write_migration_helpers(self.root)
         source = Path(__file__).resolve().parents[3] / 'apps/server/scripts/migrate-dev-db.ts'
         original = source.read_text()
         script = 'apps/server/scripts/migrate-dev-db.ts'
@@ -2034,6 +2166,9 @@ class GuardTests(unittest.TestCase):
                  'baseRows.push({filename: "other.sqlite"}); const basePath = yield* Effect.try({')
         for helper, module in (('archiveFilename', 'historyArchiveSql'), ('resolveHistoryBasePath', 'historySourceFiles')):
             mutation(helper + '-wrong-import', '../src/ardud/persistence/' + module + '.ts', './other.ts')
+            for prefix in ('xx', '.x', 'x.'):
+                mutation(helper + '-import-prefix-' + prefix, '../src/ardud/persistence/' + module + '.ts',
+                         prefix + '/src/ardud/persistence/' + module + '.ts')
             rows.append((helper + '-redefined', original + '\n' + helper + ' = () => "/tmp/other.sqlite";\n', SCRIPT))
         mutation('duplicate-cold-initializer', 'const archivePath = archiveFilename(sourcePath);',
                  'const archivePath = archiveFilename(sourcePath); const archivePath = archiveFilename(sourcePath);')
@@ -2043,6 +2178,187 @@ class GuardTests(unittest.TestCase):
             for invocation in invocations:
                 with self.subTest(case=label, invocation=invocation):
                     self.assertEqual(self.classify(invocation + arguments), expected)
+
+    def test_isolated_migrate_history_file_isolation(self):
+        isolated_source_cases.write_migration_helpers(self.root)
+        original = (Path(__file__).resolve().parents[3] / 'apps/server/scripts/migrate-dev-db.ts').read_text()
+        script = 'apps/server/scripts/migrate-dev-db.ts'
+        self.write(script, original)
+        self.write('package.json', json.dumps({'scripts': {'migrate-dev-db': 'node ' + script}}))
+        for filename in ('copy.sqlite', 'archive.sqlite', 'statev2.pre-shrink-copy.sqlite'):
+            for shape, expected in (('absent', None), ('copy', None), ('isolated-symlink', None),
+                                    ('live-symlink', READ), ('live-archive-symlink', READ),
+                                    ('hard-link', UNRESOLVED), ('directory', UNRESOLVED)):
+                folder = self.root / (filename + '-' + shape)
+                folder.mkdir()
+                source = folder / 'copy.sqlite'
+                target = folder / filename
+                if filename != source.name:
+                    source.write_text('isolated source')
+                if shape == 'copy':
+                    target.write_text('isolated copy')
+                elif shape == 'isolated-symlink':
+                    copy = self.write('isolated/' + folder.name, 'isolated copy')
+                    target.symlink_to(copy)
+                elif shape == 'live-symlink':
+                    target.symlink_to(LIVE)
+                elif shape == 'live-archive-symlink':
+                    target.symlink_to(Path.home() / '.robob/userdata/archive.sqlite')
+                elif shape == 'hard-link':
+                    copy = self.write('isolated/' + folder.name, 'isolated copy')
+                    os.link(copy, target)
+                    if filename == source.name:
+                        expected = None
+                elif shape == 'directory':
+                    target.mkdir()
+                for invocation in ('node ' + script, 'vp run migrate-dev-db'):
+                    with self.subTest(file=filename, shape=shape, invocation=invocation):
+                        command = invocation + ' --source ' + str(source) + ' --base-dir /tmp/dev-home'
+                        self.assertEqual(self.classify(command), expected)
+                        if filename == source.name and shape == 'hard-link':
+                            with patch.object(guard, 'protected_databases', return_value={copy}):
+                                self.assertEqual(self.classify(command), READ)
+        # Derivation uses the source spelling, even when src itself is a link.
+        source = self.root / 'source-alias/copy.sqlite'
+        source.parent.mkdir()
+        source.symlink_to(self.write('actual/copy.sqlite', 'isolated copy'))
+        (source.parent / 'archive.sqlite').symlink_to(LIVE)
+        self.assertEqual(self.classify('node ' + script + ' --source ' + str(source) + ' --base-dir /tmp/dev-home'), READ)
+
+    def test_isolated_migrate_path_normalization_and_sidecars(self):
+        isolated_source_cases.write_migration_helpers(self.root)
+        script = 'apps/server/scripts/migrate-dev-db.ts'
+        self.write(script, (Path(__file__).resolve().parents[3] / script).read_text())
+        hop = self.root / 'inputs/hop'
+        elsewhere = self.root / 'elsewhere/deep'
+        elsewhere.mkdir(parents=True)
+        hop.parent.mkdir()
+        hop.symlink_to(elsewhere, target_is_directory=True)
+        self.write('elsewhere/copy.sqlite', 'isolated')
+        self.write('inputs/copy.sqlite', 'isolated').unlink()
+        (hop.parent / 'copy.sqlite').symlink_to(LIVE)
+        (hop.parent / 'live-home').symlink_to(Path.home() / '.robob', target_is_directory=True)
+        for flag, filename in (('--source', 'copy.sqlite'), ('--base-dir', 'live-home')):
+            paths = (str(hop) + '/../' + filename, str(hop) + '/./../' + filename,
+                     str(hop.parent) + '//hop//../' + filename,
+                     'inputs/hop/../' + filename)
+            for value in paths:
+                for separator in (' ', '='):
+                    other = '--base-dir /tmp/dev-home' if flag == '--source' else '--source /tmp/copy.sqlite'
+                    command = 'node ' + script + ' ' + flag + separator + shlex.quote(value) + ' ' + other
+                    with self.subTest(flag=flag, value=value, separator=separator):
+                        self.assertEqual(self.classify(command), READ)
+            for value in ('-', 'copy*.sqlite', 'copy?.sqlite', 'copy[1].sqlite', 'copy$UNKNOWN.sqlite', 'copy`unknown`.sqlite'):
+                other = '--base-dir /tmp/dev-home' if flag == '--source' else '--source /tmp/copy.sqlite'
+                with self.subTest(flag=flag, nonliteral=value):
+                    self.assertEqual(self.classify('node ' + script + ' ' + flag + ' ' + shlex.quote(value) + ' ' + other), UNRESOLVED)
+        for name in ('copy.sqlite', 'archive.sqlite', 'statev2.pre-shrink-copy.sqlite'):
+            for suffix in ('-wal', '-shm', '-journal'):
+                for shape, expected in (('copy', None), ('live-link', READ), ('hard-link', UNRESOLVED)):
+                    folder = self.root / (name + suffix + shape)
+                    folder.mkdir()
+                    source = folder / 'copy.sqlite'
+                    source.write_text('isolated')
+                    primary = folder / name
+                    primary.write_text('isolated')
+                    sidecar = Path(str(primary) + suffix)
+                    if shape == 'copy':
+                        sidecar.write_text('isolated')
+                    elif shape == 'live-link':
+                        sidecar.symlink_to(LIVE + suffix)
+                    else:
+                        copy = self.write('sidecars/' + folder.name + suffix, 'isolated')
+                        os.link(copy, sidecar)
+                        if name == source.name:
+                            expected = None
+                    command = 'node ' + script + ' --source ' + str(source) + ' --base-dir /tmp/dev-home'
+                    with self.subTest(file=name, suffix=suffix, shape=shape):
+                        self.assertEqual(self.classify(command), expected)
+                        if name == source.name and shape == 'hard-link':
+                            with patch.object(guard, 'protected_databases', return_value={Path(str(copy)[:-len(suffix)])}):
+                                self.assertEqual(self.classify(command), READ)
+
+    def test_isolated_migrate_physical_working_directory(self):
+        isolated_source_cases.write_migration_helpers(self.root)
+        script = self.write('apps/server/scripts/migrate-dev-db.ts',
+                            (Path(__file__).resolve().parents[3] / 'apps/server/scripts/migrate-dev-db.ts').read_text())
+        live_home = self.root / 'fake-home'
+        readonly = live_home / '.robob/userdata/readonly'
+        readonly.mkdir(parents=True)
+        alias = self.root / 'cwd-alias'
+        alias.symlink_to(readonly, target_is_directory=True)
+        rows = (('--source', '../statev2.sqlite', '--base-dir /tmp/dev-home'),
+                ('--base-dir', '../..', '--source /tmp/copy.sqlite'))
+        for flag, value, other in rows:
+            for separator in (' ', '='):
+                for cwd in (alias, readonly):
+                    with self.subTest(flag=flag, separator=separator, cwd=str(cwd)), patch.object(Path, 'home', return_value=live_home):
+                        command = 'node ' + str(script) + ' ' + flag + separator + value + ' ' + other
+                        self.assertEqual(guard.classify(command, str(cwd)), READ)
+
+    def test_isolated_migrate_source_hard_links_to_live_history(self):
+        isolated_source_cases.write_migration_helpers(self.root)
+        script = 'apps/server/scripts/migrate-dev-db.ts'
+        self.write(script, (Path(__file__).resolve().parents[3] / script).read_text())
+        home = self.root / 'fake-home'
+        roots = ('.robob/userdata', '.t3/userdata', '.local/share/opencode', '.robob/userdata/readonly')
+        suffixes = ('', '-wal', '-shm', '-journal')
+        alias_index = 0
+        for root in roots:
+            for name in ('statev2.sqlite', 'archive.sqlite', 'statev2.pre-shrink-live.sqlite'):
+                for live_suffix in suffixes:
+                    live = home / root / (name + live_suffix)
+                    live.parent.mkdir(parents=True, exist_ok=True)
+                    live.write_text('fixture only')
+                    for input_suffix in suffixes:
+                        folder = self.root / ('alias-' + str(alias_index))
+                        alias_index += 1
+                        folder.mkdir()
+                        source = folder / 'copy.sqlite'
+                        if input_suffix:
+                            source.write_text('isolated')
+                        os.link(live, Path(str(source) + input_suffix))
+                        command = 'node ' + script + ' --source ' + str(source) + ' --base-dir /tmp/dev-home'
+                        with self.subTest(root=root, name=name, live_suffix=live_suffix, input_suffix=input_suffix), patch.object(Path, 'home', return_value=home):
+                            self.assertEqual(self.classify(command), READ)
+                    live.unlink()
+
+    def test_isolated_migrate_source_hard_links_to_symlinked_live_history(self):
+        isolated_source_cases.write_migration_helpers(self.root)
+        script = 'apps/server/scripts/migrate-dev-db.ts'
+        self.write(script, (Path(__file__).resolve().parents[3] / script).read_text())
+        home = self.root / 'fake-home'
+        roots = ('.robob/userdata', '.t3/userdata', '.local/share/opencode', '.robob/userdata/readonly')
+        suffixes = ('', '-wal', '-shm', '-journal')
+        alias_index = 0
+        for root in roots:
+            for name in ('statev2.sqlite', 'archive.sqlite', 'statev2.pre-shrink-live.sqlite'):
+                primary = home / root / name
+                primary.parent.mkdir(parents=True, exist_ok=True)
+                physical = self.write('physical/' + str(alias_index) + '/live.sqlite', 'fixture only')
+                primary.symlink_to(physical)
+                for spelling in ('lexical', 'physical'):
+                    for live_suffix in suffixes:
+                        live = Path(str(primary if spelling == 'lexical' else physical) + live_suffix)
+                        live.write_text('fixture only')
+                        for input_suffix in suffixes:
+                            folder = self.root / ('alias-' + str(alias_index))
+                            alias_index += 1
+                            folder.mkdir()
+                            source = folder / 'copy.sqlite'
+                            if input_suffix:
+                                source.write_text('isolated')
+                            os.link(live.resolve(), Path(str(source) + input_suffix))
+                            command = 'node ' + script + ' --source ' + str(source) + ' --base-dir /tmp/dev-home'
+                            with self.subTest(root=root, name=name, spelling=spelling, live_suffix=live_suffix, input_suffix=input_suffix), patch.object(Path, 'home', return_value=home):
+                                self.assertEqual(self.classify(command), READ)
+                        alias = self.root / ('symlink-' + str(alias_index) + '.sqlite')
+                        alias.symlink_to(live.resolve())
+                        with self.subTest(root=root, name=name, spelling=spelling, live_suffix=live_suffix, input_shape='symlink'), patch.object(Path, 'home', return_value=home):
+                            self.assertEqual(self.classify('node ' + script + ' --source ' + str(alias) + ' --base-dir /tmp/dev-home'), READ)
+                        if live_suffix:
+                            live.unlink()
+
 
     def test_node_test_database_names_and_live_root_siblings(self):
         for label, source, expected in isolated_source_cases.database_name_sources():
@@ -2076,6 +2392,7 @@ class GuardTests(unittest.TestCase):
                 self.assertEqual('vp test run names.test.mjs' in detail, module in {'vitest', 'vite-plus/test'})
 
     def test_migration_exemption_checks_source_and_plain_node_invocation(self):
+        isolated_source_cases.write_migration_helpers(self.root)
         source = Path(__file__).resolve().parents[3] / 'apps/server/scripts/migrate-dev-db.ts'
         original = source.read_text()
         self.write('apps/server/scripts/migrate-dev-db.ts', original)
@@ -2088,6 +2405,239 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(self.classify('vp run migrate-dev-db --source /tmp/copy.sqlite --base-dir /tmp/dev-home'), SCRIPT)
         self.write('package.json', json.dumps({'scripts': {'migrate-dev-db': 'node other.ts'}}))
         self.assertEqual(self.classify('vp run migrate-dev-db --source /tmp/copy.sqlite'), UNRESOLVED)
+
+    def test_migration_cold_history_paths_fail_closed(self):
+        repo = Path(__file__).resolve().parents[3]
+        script = 'apps/server/scripts/migrate-dev-db.ts'
+        original = (repo / script).read_text()
+        isolated_source_cases.write_migration_helpers(self.root)
+        self.write('package.json', json.dumps({'scripts': {'migrate-dev-db': 'node ' + script}}))
+        commands = [prefix + ' --source /tmp/copy.sqlite --base-dir /tmp/dev-home'
+                    for prefix in ('node ' + script, 'vp run migrate-dev-db')]
+        mutations = [
+            ('archive-home', 'archiveFilename(sourcePath)', 'archiveFilename(path.join(NodeOS.homedir(), ".t3/userdata/statev2.sqlite"))'),
+            ('archive-shared-home', 'archiveFilename(sourcePath)', 'archiveFilename(path.join(sharedHome, "userdata/statev2.sqlite"))'),
+            ('base-home', 'resolveHistoryBasePath(path, sourcePath, baseRows)', 'resolveHistoryBasePath(path, NodeOS.homedir(), baseRows)'),
+            ('base-shared-home', 'resolveHistoryBasePath(path, sourcePath, baseRows)', 'resolveHistoryBasePath(path, sharedHome, baseRows)'),
+            ('base-metadata-other-db', 'SELECT filename FROM src.ardud_history_base_archive', 'SELECT filename FROM main.ardud_history_base_archive'),
+            ('unproven-destination', 'path.join(stateDir, "statev2.sqlite")', 'path.join("/tmp/elsewhere", "statev2.sqlite")'),
+        ]
+        for operand, schema in (('sourcePath', 'src'), ('archivePath', 'cold'), ('basePath', 'base')):
+            attach = f'ATTACH DATABASE ${{`${{NodeURL.pathToFileURL({operand}).href}}?mode=ro`}} AS {schema}'
+            mutations.extend([
+                (schema + '-writable', attach, attach.replace('?mode=ro', '')),
+                (schema + '-extra-attach', attach, attach + '; ATTACH DATABASE "file:extra.sqlite?mode=ro" AS extra'),
+                (schema + '-path-alias', 'const sql = yield* SqlClient.SqlClient;\n  yield* sql`ATTACH',
+                 'const leaked = ' + operand + ';\n  const sql = yield* SqlClient.SqlClient;\n  yield* sql`ATTACH'),
+            ])
+        for operand in ('sourcePath', 'archivePath', 'basePath', '"/tmp/unproven.sqlite"'):
+            mutations.append(('non-destination-client-' + operand, 'filename: snapshotPath', 'filename: ' + operand))
+        for operand in ('archivePath', 'basePath'):
+            mutations.append(('history-write-' + operand, 'const hasArchive = yield* fs.exists(archivePath);',
+                              'yield* fs.remove(' + operand + ');\n      const hasArchive = yield* fs.exists(archivePath);'))
+        for label, before, after in mutations:
+            with self.subTest(case=label):
+                self.assertIn(before, original)
+                mutated = original.replace(before, after)
+                self.assertNotEqual(mutated, original)
+                self.write(script, mutated)
+                for command in commands:
+                    self.assertEqual(self.classify(command), SCRIPT)
+        self.write(script, original)
+        for command in commands:
+            self.assertIsNone(self.classify(command))
+
+    def test_migration_history_helpers_fail_closed(self):
+        repo = Path(__file__).resolve().parents[3]
+        script = 'apps/server/scripts/migrate-dev-db.ts'
+        self.write(script, (repo / script).read_text())
+        command = 'node ' + script + ' --source /tmp/copy.sqlite --base-dir /tmp/dev-home'
+        helper = 'apps/server/src/ardud/persistence/historySourceFiles.ts'
+        archive = 'apps/server/src/ardud/persistence/historyArchiveSql.ts'
+        cases = [
+            ('helper-home', helper, 'path.dirname(sourcePath)', 'NodeOS.homedir()'),
+            ('helper-shared-home', helper, 'path.dirname(sourcePath)', 'sharedHome'),
+            ('helper-other-directory', helper, 'path.dirname(sourcePath)', '"/tmp/elsewhere"'),
+            ('helper-no-basename-check', helper, 'path.basename(filename) !== filename', 'false'),
+            ('helper-no-name-check', helper, '!/^statev2\\.pre-shrink-[^/\\\\]+\\.sqlite$/.test(filename)', 'false'),
+            ('helper-extra-io', helper, 'return path.join', 'fs.remove(sourcePath); return path.join'),
+            ('archive-home', archive, 'NodePath.dirname(filename)', 'NodeOS.homedir()'),
+            ('archive-shared-home', archive, 'NodePath.dirname(filename)', 'sharedHome'),
+            ('archive-extra-use', archive, 'export const archiveFilename', 'const alias = NodePath;\nexport const archiveFilename'),
+            ('archive-extra-home-read', archive, 'export const archiveFilename',
+             'import { readFileSync } from "node:fs"; import { join } from "node:path";\nreadFileSync(join("/Users/ardud/.t3", "userdata", "statev2.sqlite"));\nexport const archiveFilename'),
+        ]
+        for label, relative, before, after in cases:
+            with self.subTest(case=label):
+                isolated_source_cases.write_migration_helpers(self.root)
+                original = (repo / relative).read_text()
+                self.assertIn(before, original)
+                self.write(relative, original.replace(before, after))
+                self.assertEqual(self.classify(command), SCRIPT)
+        for relative in (helper, archive):
+            with self.subTest(missing=relative):
+                isolated_source_cases.write_migration_helpers(self.root)
+                (self.root / relative).unlink()
+                self.assertEqual(self.classify(command), SCRIPT)
+        isolated_source_cases.write_migration_helpers(self.root)
+        self.assertIsNone(self.classify(command))
+
+    def test_migration_archive_module_runtime_fail_closed(self):
+        repo = Path(__file__).resolve().parents[3]
+        script = 'apps/server/scripts/migrate-dev-db.ts'
+        archive = 'apps/server/src/ardud/persistence/historyArchiveSql.ts'
+        self.write(script, (repo / script).read_text())
+        self.write('package.json', json.dumps({'scripts': {'migrate-dev-db': 'node ' + script}}))
+        isolated_source_cases.write_migration_helpers(self.root)
+        original = (repo / archive).read_text()
+        commands = [prefix + ' --source /tmp/copy.sqlite --base-dir /tmp/dev-home'
+                    for prefix in ('node ' + script, 'vp run migrate-dev-db')]
+        # Imported modules execute top-level code, even when archiveFilename
+        # itself still derives the expected path. Check the whole I/O class.
+        homes = (
+            ('named-homedir', 'import { homedir } from "node:os";', 'homedir()'),
+            ('namespace-homedir', 'import * as NodeOS from "node:os";', 'NodeOS.homedir()'),
+            ('user-info', 'import * as os from "node:os";', 'os.userInfo().homedir'),
+            ('env-home', '', 'process.env.HOME'),
+            ('absolute-home', '', json.dumps(str(Path.home()))),
+        )
+        operations = (
+            ('readFileSync', ''), ('writeFileSync', ', ""'),
+            ('appendFileSync', ', ""'), ('truncateSync', ', 0'), ('unlinkSync', ''),
+        )
+        for home_label, home_import, home in homes:
+            for operation, extra in operations:
+                injection = ('import { ' + operation + ' } from "node:fs"; ' + home_import + '\n' +
+                             operation + '(' + home + ' + "/.t3/userdata/archive.sqlite"' + extra + ');\n')
+                for placement, body in (('prepend', injection + original), ('append', original + injection)):
+                    for command in commands:
+                        with self.subTest(home=home_label, operation=operation, placement=placement, command=command):
+                            self.write(archive, body)
+                            self.assertEqual(self.classify(command), SCRIPT)
+        for label, body in (
+            ('extra-import', 'import "./unproven.ts";\n' + original),
+            ('extra-runtime', original + '\nthrow new Error("unproven module");\n'),
+            ('changed-export', original.replace('table === "orchestration_events"', '(console.log("unproven"), table === "orchestration_events")')),
+        ):
+            self.assertNotEqual(body, original)
+            self.write(archive, body)
+            for command in commands:
+                with self.subTest(case=label, command=command):
+                    self.assertEqual(self.classify(command), SCRIPT)
+        self.write(archive, original)
+        for command in commands:
+            self.assertIsNone(self.classify(command))
+
+    def test_migration_helper_pin_drift_names_module(self):
+        repo = Path(__file__).resolve().parents[3]
+        script = 'apps/server/scripts/migrate-dev-db.ts'
+        self.write(script, (repo / script).read_text())
+        self.write('package.json', json.dumps({'scripts': {'migrate-dev-db': 'node ' + script}}))
+        commands = [prefix + ' --source /tmp/copy.sqlite --base-dir /tmp/dev-home'
+                    for prefix in ('node ' + script, 'vp run migrate-dev-db')]
+        # Keep the reviewer's exact import-time write, independent of the matrix.
+        repro = ('import { writeFileSync } from "node:fs"; import { homedir } from "node:os"; '
+                 'writeFileSync(homedir() + "/.t3/userdata/archive.sqlite", "");\n')
+        for name in ('historySourceFiles.ts', 'historyArchiveSql.ts'):
+            relative = 'apps/server/src/ardud/persistence/' + name
+            original = (repo / relative).read_text()
+            for label, body in (('reviewer-repro', repro + original),
+                                ('ordinary-drift', original + '\n// helper changed\n'),
+                                ('missing', None)):
+                isolated_source_cases.write_migration_helpers(self.root)
+                if body is None:
+                    (self.root / relative).unlink()
+                else:
+                    self.write(relative, body)
+                for command in commands:
+                    with self.subTest(module=name, case=label, command=command):
+                        rule, cause = guard.classify_detail(command, str(self.root))
+                        self.assertEqual(rule, SCRIPT)
+                        reason = guard.refusal_reason(rule, cause, str(self.root))
+                        self.assertIn(relative, reason)
+                        self.assertIn("guard's module pin needs re-auditing", reason)
+        isolated_source_cases.write_migration_helpers(self.root)
+        for command in commands:
+            self.assertIsNone(self.classify(command))
+
+    def test_migration_helpers_belong_to_invoked_script(self):
+        repo = Path(__file__).resolve().parents[3]
+        relative = 'apps/server/scripts/migrate-dev-db.ts'
+        original = (repo / relative).read_text()
+        caller, target = self.root / 'caller', self.root / 'target'
+        isolated_source_cases.write_migration_helpers(caller)
+        isolated_source_cases.write_migration_helpers(target)
+        script = self.write('target/' + relative, original)
+        link = caller / 'migrate-dev-db.ts'
+        link.symlink_to(script)
+        forms = ('node ' + str(script), 'node ../target/' + relative, 'node migrate-dev-db.ts')
+        history = 'apps/server/src/ardud/persistence/historySourceFiles.ts'
+        archive = 'apps/server/src/ardud/persistence/historyArchiveSql.ts'
+        # Cross the invocation shape with every helper state: a safe caller
+        # must not discharge a missing or live-derived helper beside the script.
+        for label, missing, changed in (
+            ('valid', None, None),
+            ('missing-base-helper', history, None),
+            ('missing-archive-helper', archive, None),
+            ('live-base-helper', None, history),
+            ('live-archive-helper', None, archive),
+        ):
+            isolated_source_cases.write_migration_helpers(target)
+            if missing:
+                (target / missing).unlink()
+            if changed:
+                body = (target / changed).read_text()
+                before = ('path.dirname(sourcePath)' if changed == history else 'NodePath.dirname(filename)')
+                self.assertIn(before, body)
+                (target / changed).write_text(body.replace(before, json.dumps(LIVE)))
+            for form in forms:
+                with self.subTest(case=label, invocation=form):
+                    command = form + ' --source /tmp/copy.sqlite --base-dir /tmp/dev-home'
+                    self.assertEqual(guard.classify_detail(command, str(caller))[0], None if label == 'valid' else SCRIPT)
+        isolated_source_cases.write_migration_helpers(target)
+        # Conversely, a caller's untrusted helper is irrelevant to a safe script.
+        (caller / history).write_text('return ' + json.dumps(LIVE) + ';')
+        for form in forms:
+            with self.subTest(case='unrelated-caller-helper', invocation=form):
+                self.assertIsNone(guard.classify_detail(form + ' --source /tmp/copy.sqlite --base-dir /tmp/dev-home', str(caller))[0])
+        for flag in ('--preserve-symlinks', '--preserve-symlinks-main'):
+            args = ' migrate-dev-db.ts --source /tmp/copy.sqlite --base-dir /tmp/dev-home'
+            for placement, command in (
+                ('cli', 'node ' + flag + args),
+                ('shell-env', 'NODE_OPTIONS=' + shlex.quote(flag) + ' node' + args),
+            ):
+                with self.subTest(flag=flag, placement=placement):
+                    self.assertEqual(guard.classify_detail(command, str(caller))[0], SCRIPT if placement == 'cli' else UNRESOLVED)
+            with self.subTest(flag=flag, placement='inherited-env'), patch.dict(os.environ, {'NODE_OPTIONS': flag}):
+                self.assertEqual(guard.classify_detail('node' + args, str(caller))[0], UNRESOLVED)
+
+    def test_migration_absolute_home_roots_fail_closed(self):
+        repo = Path(__file__).resolve().parents[3]
+        relative = 'apps/server/scripts/migrate-dev-db.ts'
+        original = (repo / relative).read_text()
+        isolated_source_cases.write_migration_helpers(self.root)
+        command = 'node ' + relative + ' --source /tmp/copy.sqlite --base-dir /tmp/dev-home'
+        anchor = 'const hasArchive = yield* fs.exists(archivePath);'
+        self.assertIn(anchor, original)
+        for home in ('/Users/ardud', '/home/user', '/root', '/var/root', '/private/var/root', '/private/tmp/home', str(Path.home())):
+            for quote in ('"', "'", '`'):
+                quoted = lambda value: quote + value + quote
+                for label, operand in (
+                    ('full-path', quoted(home + '/.t3/userdata/statev2.sqlite')),
+                    ('userdata-split', 'path.join(' + quoted(home + '/.t3') + ', "userdata", "statev2.sqlite")'),
+                    ('home-split', 'path.resolve(' + quoted(home) + ', ".t3", "userdata", "statev2.sqlite")'),
+                ):
+                    with self.subTest(home=home, quote=quote, shape=label):
+                        self.write(relative, original.replace(anchor, 'yield* fs.readFileString(' + operand + ');\n      ' + anchor))
+                        self.assertEqual(self.classify(command), SCRIPT)
+        for home in ('process.env.HOME', 'os.homedir()', 'NodeOS.homedir()', 'os.userInfo().homedir'):
+            with self.subTest(home=home):
+                body = original.replace('import * as NodeOS from "node:os";', 'import * as NodeOS from "node:os"; import * as os from "node:os";')
+                operand = 'path.join(' + home + ', ".t3", "userdata", "statev2.sqlite")'
+                self.write(relative, body.replace(anchor, 'yield* fs.readFileString(' + operand + ');\n      ' + anchor))
+                self.assertEqual(self.classify(command), SCRIPT)
+        self.write(relative, original)
+        self.assertIsNone(self.classify(command))
 
     def test_exact_isolated_source_reporters_are_data(self):
         fixture_dir = Path(__file__).with_name('fixtures') / 'isolated-source'
@@ -2326,6 +2876,71 @@ class GuardTests(unittest.TestCase):
                            "cp /tmp/evil.py " + str(home / '.nvm/versions/node/v26.0.0/bin/cat') + "; "):
                 with self.subTest(writer=writer):
                     self.assertEqual(self.classify(writer + 'bash tmp/fixture.sh'), SCRIPT)
+
+    def test_inherited_repo_node_pin_safe_chain_bytes(self):
+        import hashlib
+        self.assertEqual(hashlib.sha256(SAFE_CHAIN_INIT_POSIX.encode()).hexdigest(),
+                         guard.REPO_NODE_PIN_SAFE_CHAIN_SHA256)
+        commands = self.write_plain_subpath_fixture()
+        home, helper, environment = self.repo_node_pin()
+        environment['PATH'] = os.pathsep.join(entry for entry in os.get_exec_path() if os.path.isabs(entry))
+        startup = home / '.safe-chain/scripts/init-posix.sh'
+        for label, body, expected in (
+            ('absent', None, None),
+            ('matching', SAFE_CHAIN_INIT_POSIX, None),
+            ('changed', SAFE_CHAIN_INIT_POSIX + '\n# changed\n', UNRESOLVED),
+            ('other', 'echo unexpected\n', UNRESOLVED),
+        ):
+            if body is not None:
+                startup.parent.mkdir(parents=True, exist_ok=True)
+                startup.write_text(body)
+            with patch.dict(os.environ, environment):
+                for command in commands:
+                    with self.subTest(case=label, command=command):
+                        rule, reason = guard.classify_detail(command, str(self.root))
+                        self.assertEqual(rule, expected)
+                        if expected is not None:
+                            self.assertIn(str(startup), reason)
+                            self.assertIn('REPO_NODE_PIN_SAFE_CHAIN_SHA256', reason)
+        startup.write_text(SAFE_CHAIN_INIT_POSIX)
+        original_open = open
+        for target in (Path(LIVE), Path.home() / '.robob/userdata/archive.sqlite',
+                       self.write('outside-safe-chain.sh', SAFE_CHAIN_INIT_POSIX)):
+            startup.unlink()
+            startup.symlink_to(target)
+
+            def checked_open(path, *args, **kwargs):
+                if Path(path) == startup:
+                    raise AssertionError('must reject startup target before opening it')
+                return original_open(path, *args, **kwargs)
+
+            with self.subTest(startup_target=str(target)), patch.dict(os.environ, environment), patch('builtins.open', side_effect=checked_open):
+                rule, reason = guard.classify_detail(commands[0], str(self.root))
+                self.assertEqual(rule, UNRESOLVED)
+                self.assertIn('REPO_NODE_PIN_SAFE_CHAIN_SHA256', reason)
+        startup.unlink()
+        startup.write_text(SAFE_CHAIN_INIT_POSIX)
+        with patch.dict(os.environ, environment):
+            for writer in (self.heredoc(str(startup), 'echo changed'),
+                           'cp /tmp/other.sh ' + str(startup) + '; '):
+                with self.subTest(writer=writer):
+                    self.assertIsNotNone(self.classify(writer + commands[0]))
+            # Startup executes dirname and then adds its bin directory. Check
+            # both dependencies against shadowing in either search location.
+            for tool in ('cat', 'dirname'):
+                for folder in (home / 'shadow-bin', home / '.safe-chain/bin'):
+                    shadow = folder / tool
+                    shadow.parent.mkdir(parents=True, exist_ok=True)
+                    shadow.write_text('#!/bin/sh\n')
+                    shadow.chmod(0o755)
+                    with self.subTest(tool=tool, folder=str(folder)), patch.dict(os.environ, {'PATH': str(folder) + os.pathsep + environment['PATH']}):
+                        self.assertEqual(self.classify(commands[0]), SCRIPT)
+                    shadow.unlink()
+        original = (helper / 'init.sh').read_text()
+        (helper / 'init.sh').write_text(original.replace('init-posix.sh', 'other.sh'))
+        with patch.dict(os.environ, environment):
+            self.assertEqual(self.classify(commands[0]), SCRIPT)
+
 
     def test_inherited_bash_env_refusals(self):
         commands = self.write_plain_subpath_fixture()
@@ -2726,6 +3341,7 @@ class GuardTests(unittest.TestCase):
                 self.assertEqual(self.classify('bash tmp/fixture.sh'), SCRIPT)
 
     def test_migration_source_propagation_corpus(self):
+        isolated_source_cases.write_migration_helpers(self.root)
         migrate = Path(__file__).resolve().parents[3] / 'apps/server/scripts/migrate-dev-db.ts'
         for label, source, expected in isolated_source_cases.migration_mutations(migrate.read_text()):
             self.write('apps/server/scripts/migrate-dev-db.ts', source)

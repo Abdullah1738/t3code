@@ -71,6 +71,10 @@ ENV_DENY_HINTS = ("AWS_", "TOKEN", "SECRET", "PASSWORD", "KEY", "CREDENTIAL", "S
 # Read from this checkout's skill root, not common.TEMPLATES_DIR: the live copy lacks the file until install.zsh runs.
 DOCKER_HOOK_B64 = base64.b64encode(
     (Path(__file__).resolve().parents[2] / "templates" / "boat-sync-docker-firewall").read_bytes()).decode()
+SQLITE_SETUP = ("bash -c " + shlex.quote(
+    (Path(__file__).resolve().parents[2] / "templates/tools/fetch.sh").read_text() + "\n" +
+    (Path(__file__).resolve().parents[2] / "templates/tools/sqlite.sh").read_text()) +
+    ' || { echo "offbox: sqlite3 setup failed" >&2; exit 97; }')
 
 # Recipes travel with this runner so an uninstalled checkout can prove the exact change.
 REPO_RECIPES_DIR = Path(__file__).resolve().parents[2] / "templates" / "repos"
@@ -1529,6 +1533,7 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
               probe + ' start "$__obsw" || { __obprobe_rc=$?; [ "$__obprobe_rc" != 90 ] || exit 90; '
               'echo "offbox: disk-space probe failed (exit $__obprobe_rc); the command runs without disk evidence" >&2; }',
               userns.setup(api.BACKEND, box_id),
+              SQLITE_SETUP,
               DOCKER_REPAIR,
               LDCACHE_REPAIR,
               CACHE_OWNER_REPAIR.replace('__OFFBOX_BOX__', shlex.quote(box_id)),

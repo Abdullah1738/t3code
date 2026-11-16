@@ -465,10 +465,15 @@ FIXTURE_TOOLS = ('mktemp', 'cat', 'ln', 'cp', 'mkdir', 'rm', 'chmod', 'touch', '
 # A changed helper fails closed until its new hash is reviewed in here.
 REPO_NODE_PIN_HASHES = {
     'bash-env.sh': {'84d84773c9b61952f5a39367470ad4043c463e8573259846ec3bb614931c8d60'},
-    'init.sh': {'d97da32ec68ee02cbf663db7675199cd12e9bd47db27cd9bb45468d133e9a4b0'},
+    # Both audited startup forms work; only the newer one sources safe-chain.
+    'init.sh': {'d97da32ec68ee02cbf663db7675199cd12e9bd47db27cd9bb45468d133e9a4b0',
+                '90a6436ed6c5ab91b13da9fd27e57d26cdd96b6dcfe0677e591ca5f942f38327'},
     'select.py': {'7be0cf8c91fdb19d5ea261085f67d8fe88d9100bf39d3ebca1eec4f6d867eaa4',
                   '1ded56be26d29b956ca8a62217e94c1ca952513f2cd96934a9680c08c045d61d'},
 }
+# @aikidosec/safe-chain 1.5.29; its only startup read is this exact script.
+REPO_NODE_PIN_SAFE_CHAIN_SHA256 = '1802eddd1a871cd5dc639d894be3cbf069679adba3a24aa49cbb90786cce9e1d'
+REPO_NODE_PIN_SAFE_CHAIN_SOURCE = b'[ ! -r "$HOME/.safe-chain/scripts/init-posix.sh" ] || . "$HOME/.safe-chain/scripts/init-posix.sh"'
 REPO_NODE_PIN_PYTHON = '/opt/homebrew/bin/python3'
 # select.py may move these harness guard dirs to the front of PATH.
 REPO_NODE_PIN_MANAGED = ('.config/opencode/skills/remote-compute/scripts/blockers',
@@ -616,16 +621,48 @@ def _inherited_startup_safe(name, directory, command=None, bindings=None, writte
         if any(resolved == root or resolved.startswith(root + os.sep)
                for root in (real_helper, os.path.realpath(nvm))):
             return False
+    sources_safe_chain = False
     for part, hashes in REPO_NODE_PIN_HASHES.items():
         try:
             with open(os.path.join(real_helper, part), 'rb') as handle:
                 info = os.fstat(handle.fileno())
                 if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_SOURCE_BYTES:
                     return False
-                if hashlib.sha256(handle.read(MAX_SOURCE_BYTES + 1)).hexdigest() not in hashes:
+                body = handle.read(MAX_SOURCE_BYTES + 1)
+                if hashlib.sha256(body).hexdigest() not in hashes:
                     return False
+                if part == 'init.sh':
+                    sources_safe_chain = body.splitlines().count(REPO_NODE_PIN_SAFE_CHAIN_SOURCE) == 1
         except OSError:
             return False
+    safe_chain = os.path.join(home, '.safe-chain')
+    safe_chain_bin = None
+    if sources_safe_chain:
+        startup = os.path.join(safe_chain, 'scripts/init-posix.sh')
+        failure = startup + ' does not match REPO_NODE_PIN_SAFE_CHAIN_SHA256; review and re-pin the safe-chain startup file.'
+        if any(os.path.realpath(remembered) == os.path.realpath(safe_chain) or
+               os.path.realpath(remembered).startswith(os.path.realpath(safe_chain) + os.sep)
+               for remembered in written):
+            raise AmbiguousScript(failure)
+        try:
+            os.lstat(startup)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            raise AmbiguousScript(failure) from None
+        else:
+            confined = os.path.join(os.path.realpath(home), '.safe-chain') + os.sep
+            if not os.path.realpath(startup).startswith(confined) or not _repo_node_pin_input_safe(startup):
+                raise AmbiguousScript(failure)
+            try:
+                with open(startup, 'rb') as handle:
+                    info = os.fstat(handle.fileno())
+                    if (not stat.S_ISREG(info.st_mode) or info.st_size > MAX_SOURCE_BYTES or
+                            hashlib.sha256(handle.read(MAX_SOURCE_BYTES + 1)).hexdigest() != REPO_NODE_PIN_SAFE_CHAIN_SHA256):
+                        raise AmbiguousScript(failure)
+                safe_chain_bin = os.path.join(os.path.dirname(os.path.realpath(os.path.dirname(startup))), 'bin')
+            except OSError:
+                raise AmbiguousScript(failure) from None
     # Python puts the script's directory first on sys.path, even with -S.
     try:
         entries = list(os.scandir(real_helper))
@@ -646,12 +683,15 @@ def _inherited_startup_safe(name, directory, command=None, bindings=None, writte
     search = list(os.get_exec_path())
     search += glob.glob(os.path.join(glob.escape(nvm), 'versions', 'node', '*', 'bin'))
     search += [os.path.join(helper, 'pnpm-bin'), *(os.path.join(home, managed) for managed in REPO_NODE_PIN_MANAGED)]
+    if safe_chain_bin is not None:
+        search.append(safe_chain_bin)
     added = os.environ.get('_repo_node_added_node', '')
     if added:
         search.append(added)
     if any(not os.path.isabs(entry) for entry in search):
         return False
-    for tool in FIXTURE_TOOLS:
+    startup_tools = ('dirname',) if safe_chain_bin is not None else ()
+    for tool in (*FIXTURE_TOOLS, *startup_tools):
         trusted = {os.path.realpath(f'/bin/{tool}'), os.path.realpath(f'/usr/bin/{tool}')}
         for entry in search:
             candidate = os.path.join(entry, tool)
@@ -1706,10 +1746,70 @@ def _source_hit(source, directory, python=False, shell=False):
     return bool(database and (live_root or home_userdata))
 
 
-def _isolated_migration_source(source, directory):
+def _isolated_migration_history_helpers(location):
+    # These are the only imported helpers that select history files. Read the
+    # checkout being inspected, never a helper from the guard's own checkout.
+    root = Path(os.path.realpath(location)).parent.parent / 'src/ardud/persistence'
+
+    def reject(name):
+        raise LiveRead('live-database-script', f"{root / name}: guard's module pin needs re-auditing; isolated migration refused.")
+
+    bodies = []
+    for name in ('historySourceFiles.ts', 'historyArchiveSql.ts'):
+        try:
+            with (root / name).open('rb') as handle:
+                info = os.fstat(handle.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_SOURCE_BYTES:
+                    reject(name)
+                body = handle.read(MAX_SOURCE_BYTES + 1)
+            if len(body) > MAX_SOURCE_BYTES:
+                reject(name)
+            bodies.append(body.decode('utf-8'))
+        except (OSError, UnicodeError):
+            reject(name)
+    history, archive = bodies
+    # A whole-helper shape proves the basename check and the source-directory
+    # join together; accepting the return expression alone could hide a write.
+    expected = r'''// integrations/harness-hooks/src/statev2_guard.py::_isolated_migration_source proves this shape; run its tests after changes.
+
+import type * as Path from "effect/Path";
+
+/** Also serialized into the readonly export worker; keep runtime dependencies explicit. */
+export function resolveHistoryBasePath(
+  path: Pick<Path.Path, "dirname" | "basename" | "join">,
+  sourcePath: string,
+  rows: ReadonlyArray<{ readonly filename: unknown }>,
+) {
+  if (rows.length === 0) return undefined;
+  const filename = rows[0]!.filename;
+  if (
+    rows.length !== 1 ||
+    typeof filename !== "string" ||
+    !/^statev2\.pre-shrink-[^/\\]+\.sqlite$/.test(filename) ||
+    path.basename(filename) !== filename
+  )
+    throw new Error("Invalid readonly history base filename");
+  return path.join(path.dirname(sourcePath), filename);
+}'''
+    if history.strip() != expected:
+        reject('historySourceFiles.ts')
+    # Node executes the entire imported module. Pin the audited SQL-only body,
+    # including imports and initializers: a safe archiveFilename alone cannot
+    # discharge extra runtime I/O. Re-audit the whole module before changing it.
+    if hashlib.sha256(archive.encode('utf-8')).hexdigest() != 'cc4ac6791b0764fc1c33f89fb8682bfbb795f14a5b007efbe53e5454a566400e':
+        reject('historyArchiveSql.ts')
+    archive_name = r'export const archiveFilename = \(filename: string\) =>\s*NodePath\.join\(NodePath\.dirname\(filename\), "archive\.sqlite"\);'
+    return len(re.findall(archive_name, archive)) == 1
+
+
+def _isolated_migration_source(source, directory, location):
     # Discharge the one default-source expression only after the caller has
     # supplied isolated --source and --base-dir arguments. All other source
     # text still goes through the live-path check.
+    # A literal home root can assemble a second live path after the default
+    # is discharged, even when its segments escape the ordinary source scan.
+    if re.search(r'''['"`]/(?:Users|home|root|var/root|private)(?=/|['"`])''', source):
+        return False
     default = re.compile(r'const sourcePath = path\.resolve\(\s*input\.source \?\? path\.join\(sharedHome, "userdata", "statev2\.sqlite"\),\s*\);')
     if len(default.findall(source)) != 1 or source.count('NodeOS.homedir()') != 1:
         return False
@@ -1729,39 +1829,52 @@ def _isolated_migration_source(source, directory):
     options = r'Command\.make\(\s*"migrate-dev-db",\s*\{\s*' + integer('projects', 'projects') + r'\s*' + integer('threadsPerProject', 'threads-per-project') + r'\s*' + string('baseDir', 'base-dir') + r'\s*' + string('source', 'source') + r'\s*\},\s*' + callback.pattern
     if len(re.findall(options, source)) != 1:
         return False
-    # The source argument must reach only the three read-only ATTACHes, and every SQLite client
+    # The source argument must reach the read-only ATTACHes, and every SQLite client
     # must open a destination. An isolated CLI flag proves neither by itself.
     if len(re.findall(r'\bcopySourceSlice\b', source)) != 2 or len(re.findall(r'copySourceSlice\(sourcePath\)', source)) != 1:
         return False
-    attaches = tuple('ATTACH DATABASE ${`${NodeURL.pathToFileURL(' + operand + ').href}?mode=ro`} AS ' + alias
-                     for operand, alias in (('sourcePath', 'src'), ('archivePath', 'cold'), ('basePath', 'base')))
+    attaches = [f'ATTACH DATABASE ${{`${{NodeURL.pathToFileURL({operand}).href}}?mode=ro`}} AS {schema}'
+                for operand, schema in (('sourcePath', 'src'), ('archivePath', 'cold'), ('basePath', 'base'))]
     if any(source.count(attach + '`;') != 1 for attach in attaches) or len(re.findall(r'\bATTACH\b', source)) != 3:
         return False
-    # The base binding is read from src, then resolved to a validated basename
-    # beside sourcePath by historySourceFiles. Neither history operand may be
-    # aliased, reassigned or supplied by another helper/import.
-    archive_import = re.compile(r'import\s*\{\s*archiveFilename,\s*HISTORY_TABLES,\s*liveColumns,?\s*\}\s*from "../src/ardud/persistence/historyArchiveSql\.ts";')
-    base_import = 'import { resolveHistoryBasePath } from "../src/ardud/persistence/historySourceFiles.ts";'
-    archive_source = re.compile(r'const archivePath = archiveFilename\(sourcePath\);')
-    base_source = re.compile(
-        r'const baseRows = hasTable\("ardud_history_base_archive"\)\s*'
-        r'\? yield\* sql<\{\s*filename: string;\s*\}>`SELECT filename FROM src\.ardud_history_base_archive LIMIT 2`\s*'
-        r': \[\];\s*const basePath = yield\* Effect\.try\(\{\s*'
-        r'try: \(\) => resolveHistoryBasePath\(path, sourcePath, baseRows\),\s*'
-        r'catch: \(\) =>\s*new MigrateDevDbHistoryArchiveError\(\{\s*'
-        r'sourcePath,\s*archivePath: sourcePath,\s*reason: "invalid-base",\s*\}\),\s*\}\);')
-    if (len(archive_import.findall(source)) != 1 or source.count(base_import) != 1 or
-            len(archive_source.findall(source)) != 1 or len(base_source.findall(source)) != 1):
+    copy_start = 'const copySourceSlice = Effect.fn("copyDevDbSourceSlice")(function* (sourcePath: string) {'
+    if source.count(copy_start) != 1:
         return False
-    history_uses = archive_import.sub('', source).replace(base_import, '')
-    history_uses = base_source.sub('', archive_source.sub('', history_uses))
+    copy_body = source.split(copy_start, 1)[1].split('\nconst pruneSnapshot =', 1)[0]
+    if any(attach not in copy_body for attach in attaches):
+        return False
+    if not _isolated_migration_history_helpers(location):
+        return False
+    # Remove complete, proven derivations before checking every remaining use.
+    # An extra alias, mutation, reader or writer of either history path fails.
+    history_uses = source
+    history_forms = (
+        r'import \{ resolveHistoryBasePath \} from "\.\./src/ardud/persistence/historySourceFiles\.ts";',
+        r'import \{\s*archiveFilename,\s*HISTORY_TABLES,\s*liveColumns,\s*\} from "\.\./src/ardud/persistence/historyArchiveSql\.ts";',
+        r'const archivePath = archiveFilename\(sourcePath\);',
+        r'const archivePath = `\$\{archiveFilename\(databasePath\)\}\$\{suffix\}`;',
+        r'const baseRows = hasTable\("ardud_history_base_archive"\)\s*\? yield\* sql<\{\s*filename: string;\s*\}>`SELECT filename FROM src\.ardud_history_base_archive LIMIT 2`\s*: \[\];',
+        r'const basePath = yield\* Effect\.try\(\{\s*try: \(\) => resolveHistoryBasePath\(path, sourcePath, baseRows\),\s*catch: \(\) =>\s*new MigrateDevDbHistoryArchiveError\(\{\s*sourcePath,\s*archivePath: sourcePath,\s*reason: "invalid-base",\s*\}\),\s*\}\);',
+    )
+    for form in history_forms:
+        if len(re.findall(form, history_uses)) != 1:
+            return False
+        history_uses = re.sub(form, '', history_uses)
     for attach in attaches:
         history_uses = history_uses.replace(attach, '')
-    history_uses = re.sub(r'const archivePath = `\$\{archiveFilename\(databasePath\)\}\$\{suffix\}`;', '', history_uses)
-    history_uses = re.sub(r'fs\.exists\((?:archivePath|basePath)\)|basePath !== undefined|archivePath: basePath', 'guard_history_read', history_uses)
-    history_uses = re.sub(r'archivePath: Schema\.String|this\.archivePath\b|archivePath(?=,\s*reason:|\s*\}\))', 'guard_history_error', history_uses)
-    if re.search(r'\b(?:archiveFilename|resolveHistoryBasePath|baseRows|basePath|archivePath)\b', history_uses):
+    history_uses = re.sub(r'new MigrateDevDbHistoryArchiveError\(\{\s*sourcePath,\s*archivePath(?:: basePath)?,\s*reason: "(?:missing|identity-mismatch)",\s*\}\)|new MigrateDevDbDestinationArchiveError\(\{ databasePath, archivePath \}\)', 'guard_history_error', history_uses)
+    history_uses = re.sub(r'\barchivePath: Schema\.String|\bthis\.archivePath\b|\bfs\.exists\((?:archivePath|basePath)\)|\bbasePath !== undefined', 'guard_history_use', history_uses)
+    if re.search(r'\b(?:archiveFilename|resolveHistoryBasePath|archivePath|basePath)\b', history_uses):
         return False
+    if len(re.findall(r'\bbaseRows\b', history_uses)) != 0:
+        return False
+    for binding in (
+        'const stateDir = path.join(baseDir, "userdata");',
+        'const databasePath = path.join(stateDir, "statev2.sqlite");',
+        'const snapshotPath = `${databasePath}.migrate-dev-db-tmp`;',
+    ):
+        if source.count(binding) != 1:
+            return False
     detach = re.compile(r'const attached = yield\* sql<\{ name: string \}>`PRAGMA database_list`;\s*for \(const name of \["base", "cold", "src"\]\) \{\s*if \(attached\.some\(\(entry\) => entry\.name === name\)\) yield\* sql`DETACH DATABASE \$\{sql\(name\)\}`;\s*\}')
     if len(detach.findall(source)) != 1 or len(re.findall(r'\bDETACH\b', source)) != 1:
         return False
@@ -1779,13 +1892,17 @@ def _isolated_migration_source(source, directory):
         url_api = url_api.replace(attach, '')
     if re.search(r'\bNodeOS\b', home_api) or re.search(r'\bNodeURL\b', url_api):
         return False
-    path_api = re.sub(r'const path = yield\* Path\.Path;', '', base_source.sub('', source))
+    path_api = re.sub(r'const path = yield\* Path\.Path;', '', source)
+    path_api = path_api.replace('resolveHistoryBasePath(path, sourcePath, baseRows)', 'guard_history_base')
     path_api = re.sub(r'\bpath\.(?:join|resolve|dirname)\s*(?=\()', 'guard_path_operation', path_api)
     path_api = path_api.replace('path to a real statev2.sqlite', 'guard_source_help').replace('path this command rewrites', 'guard_destination_help')
     if re.search(r'\bpath\b', path_api):
         return False
-    source_uses = base_source.sub('', archive_source.sub('', default.sub('', source)))
-    source_uses = re.sub(r'new MigrateDevDbHistoryArchiveError\(\{\s*sourcePath,\s*archivePath(?:: basePath)?,\s*reason: "(?:missing|identity-mismatch)",\s*\}\)', 'guard_history_error', source_uses)
+    source_uses = default.sub('', source)
+    source_uses = source_uses.replace('resolveHistoryBasePath(path, sourcePath, baseRows)', 'guard_history_base')
+    source_uses = source_uses.replace('archiveFilename(sourcePath)', 'guard_history_archive')
+    source_uses = source_uses.replace('archivePath: sourcePath', 'guard_history_error')
+    source_uses = re.sub(r'(new MigrateDevDbHistoryArchiveError\(\{\s*)sourcePath,', r'\1guard_source_error,', source_uses)
     source_uses = re.sub(r'\bsourcePath: (?:Schema\.String|string)|\bthis\.sourcePath\b|\{ sourcePath \}(?=\))|\$\{sourcePath\}|\bdatabasePath: sourcePath\b', 'guard_source_use', source_uses)
     source_uses = re.sub(r'\b(?:copySourceSlice|NodeURL\.pathToFileURL|fs\.exists|fs\.stat)\(sourcePath\)|\.realPath\(sourcePath\)|\(\) => sourcePath\b', 'guard_source_read', source_uses)
     if re.search(r'\bsourcePath\b', source_uses):
@@ -2924,7 +3041,21 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
 
     def migration_source(args, directory):
         source = None
+        source_operand = None
+        source_directory = None
         destination = None
+
+        def migration_path(value, flag):
+            if value == '-' or re.search(r'[$`*?\[\]]', value) or not os.path.isabs(value) and directory is None:
+                raise AmbiguousScript("non-literal migrate-dev-db " + flag + ' ' + _token(value))
+            # Node uses a physical process.cwd(), then path.resolve normalizes
+            # operand dot segments before following links within the operand.
+            operand = Path(os.path.abspath(value if os.path.isabs(value) else Path(os.path.realpath(directory)) / value))
+            resolved = _literal_path(str(operand), directory)
+            if resolved is None:
+                raise AmbiguousScript("non-literal migrate-dev-db " + flag + ' ' + _token(value))
+            return operand, resolved
+
         index = 0
         while index < len(args):
             flag, equal, value = args[index].partition("=")
@@ -2942,13 +3073,12 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             if flag == "--source":
                 if source is not None:
                     raise AmbiguousScript("duplicate migrate-dev-db --source")
-                source = _literal_path(value, directory)
-                if source is None:
-                    raise AmbiguousScript("non-literal migrate-dev-db --source " + _token(value))
+                source_operand, source = migration_path(value, flag)
+                # The migrator resolves the spelling of --source, rather than
+                # its realpath, before deriving its history siblings.
+                source_directory = source_operand.parent
             elif flag == "--base-dir":
-                destination = _literal_path(value, directory)
-                if destination is None:
-                    raise AmbiguousScript("non-literal migrate-dev-db --base-dir " + _token(value))
+                _, destination = migration_path(value, flag)
                 if _direct_read(['cat', str(destination / 'userdata/statev2.sqlite')], directory):
                     raise LiveRead("live-database-read")
             index += 1
@@ -2957,6 +3087,86 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             raise LiveRead("live-database-read")
         if destination is None:
             raise AmbiguousScript("migrate-dev-db needs an explicit isolated --base-dir")
+
+        def live_history_path(path):
+            resolved = os.path.realpath(path)
+            return (LIVE.search(resolved) or
+                    re.search(r'(?:\.robob|robob-data)/userdata(?:/|$)|(?:\.local/share/opencode|opencode-data)(?:/|$)', resolved) or
+                    resolved.startswith(str(Path.home() / '.t3/userdata') + os.sep))
+
+        if live_history_path(source):
+            raise LiveRead("live-database-read")
+        # Check every possible history binding without opening the source DB.
+        # A sibling symlink or hard link must not turn an isolated copy into a
+        # read of a live file before the migrator's identity check runs.
+        candidates = [source_operand, source_directory / 'archive.sqlite']
+        try:
+            with os.scandir(source_directory) as entries:
+                for entry in entries:
+                    if re.fullmatch(r'statev2\.pre-shrink-[^/\\]+\.sqlite', entry.name):
+                        candidates.append(Path(entry.path))
+                        if len(candidates) > MAX_SCRIPTS:
+                            raise AmbiguousScript("too many migrate-dev-db history siblings to prove isolation")
+        except FileNotFoundError:
+            pass
+        except OSError:
+            raise AmbiguousScript("cannot inspect migrate-dev-db history siblings") from None
+        # SQLite may access sidecars through either spelling of a symlinked DB.
+        inputs = {(Path(str(spelling) + suffix), primary == source_operand, suffix)
+                  for primary in candidates for spelling in (primary, Path(os.path.realpath(primary)))
+                  for suffix in ('', '-wal', '-shm', '-journal')}
+        protected_identities = None
+        for candidate, source_input, suffix in inputs:
+            if live_history_path(candidate):
+                raise LiveRead("live-database-read")
+            try:
+                info = candidate.stat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                raise AmbiguousScript("cannot prove migrate-dev-db input is isolated " + _token(str(candidate))) from None
+            if not stat.S_ISREG(info.st_mode):
+                raise AmbiguousScript("migrate-dev-db input needs an isolated regular copy " + _token(str(candidate)))
+            if info.st_nlink != 1 and not source_input:
+                raise AmbiguousScript("migrate-dev-db history input needs an isolated regular copy " + _token(str(candidate)))
+            # Closed backups may be supplied through a neutral hard link.
+            # Compare every input against live identities: a plain symlink
+            # can reach a neutral physical target without increasing st_nlink.
+            if protected_identities is None:
+                databases = protected_databases()
+                roots = {database.parent for database in databases}
+                roots.update(Path.home() / relative for relative in ('.robob/userdata', '.t3/userdata', '.local/share/opencode'))
+                roots.update(root / 'readonly' for root in tuple(roots))
+                live_files = {Path(str(database) + ending) for database in databases
+                              for ending in ('', '-wal', '-shm', '-journal')}
+                try:
+                    for root in roots:
+                        try:
+                            with os.scandir(root) as entries:
+                                for entry in entries:
+                                    match = re.fullmatch(r'(statev2\.sqlite|state\.sqlite|opencode\.db|archive\.sqlite|statev2\.pre-shrink-[^/\\]+\.sqlite)(?:-(?:wal|shm|journal))?', entry.name)
+                                    if match:
+                                        primary = root / match[1]
+                                        # SQLite may use sidecars beside either
+                                        # spelling of a symlinked live database.
+                                        live_files.update(Path(str(spelling) + ending)
+                                                          for spelling in (primary, Path(os.path.realpath(primary)))
+                                                          for ending in ('', '-wal', '-shm', '-journal'))
+                                        if len(live_files) > MAX_SCRIPTS * 4:
+                                            raise AmbiguousScript("too many live history files to prove hard-linked migrate-dev-db source is isolated")
+                        except FileNotFoundError:
+                            pass
+                    protected_identities = set()
+                    for live in live_files:
+                        try:
+                            live_info = live.stat()
+                        except FileNotFoundError:
+                            continue
+                        protected_identities.add((live_info.st_dev, live_info.st_ino))
+                except OSError:
+                    raise AmbiguousScript("cannot prove hard-linked migrate-dev-db source is isolated") from None
+            if (info.st_dev, info.st_ino) in protected_identities:
+                raise LiveRead("live-database-read")
 
     def migration_context(words):
         # A preceding edit or link can invalidate both the source proof and
@@ -3069,7 +3279,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                     return
                 source = handle.read(MAX_SOURCE_BYTES + 1)
             if len(source) <= MAX_SOURCE_BYTES:
-                if migration_args is not None and _isolated_migration_source(source.decode('utf-8', errors='replace'), directory):
+                if migration_args is not None and _isolated_migration_source(source.decode('utf-8', errors='replace'), directory, path):
                     migration_source(migration_args, directory)
                     return
                 check_source(source.decode("utf-8", errors="replace"), directory, path.suffix == ".py", shell=shell, test_target=test_target, location=path)
