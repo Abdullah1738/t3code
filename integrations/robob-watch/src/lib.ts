@@ -1,3 +1,4 @@
+import type { OwnerAlertEpisode } from "./owner-alerts.ts";
 import { assertMacWatcher } from "./person-box.ts";
 import { toolLog, toolError } from "./toollog.ts";
 import { StderrCause, stderrCause, type DependencyBusy } from "./cause.ts";
@@ -111,6 +112,8 @@ export type Watcher = {
   depends?: Dependency[];
   /** Opt-in: text the owner a short heads-up when a wake sits queued behind a busy turn. Off by default. */
   headsup?: boolean;
+  /** Opt-in owner-chat notices for a failure pause/escalation and its recovery. */
+  owner_imessage_alerts?: boolean;
   /**
    * Files whose change (mtime/size) runs the check on the next 1s tick instead of waiting for interval_s,
    * e.g. ~/Library/Messages/chat.db-wal. interval_s stays as the fallback cadence.
@@ -153,6 +156,8 @@ export type State = {
   load_timeouts?: number;
   load_timeout_since?: string;
   failure_paused_at?: string;
+  /** Separate from Telegram flags; retained through resume until bridge acceptance. */
+  owner_imessage_episodes?: OwnerAlertEpisode[];
   last_error?: string;
   dependency_busy?: { dependency: string; since: string };
   /** A changed failure kind needs a fresh bridge key without resetting backoff or grace periods. */
@@ -544,6 +549,8 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
   if (!Number.isInteger(maxFires) || maxFires < 0) errors.push("max_fires must be an integer >= 0 (0 = unlimited)");
   const maxFailures = input.max_consecutive_failures;
   if (maxFailures !== undefined && (!Number.isInteger(maxFailures) || maxFailures < 0)) errors.push("max_consecutive_failures must be an integer >= 0 (0 = never pause)");
+  if (input.owner_imessage_alerts !== undefined && typeof input.owner_imessage_alerts !== "boolean") errors.push("owner_imessage_alerts must be boolean");
+  if (input.owner_imessage_alerts === true && input.chat !== undefined) errors.push("owner_imessage_alerts requires an owner watcher");
   const noticeAfter = input.failure_notice_after;
   if (noticeAfter !== undefined && (!Number.isInteger(noticeAfter) || noticeAfter < 1)) errors.push("failure_notice_after must be an integer >= 1 (1 = every failure)");
   const depends = input.depends;
@@ -576,6 +583,7 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
     ...(depends !== undefined ? { depends: [...new Set(depends)] } : {}),
     ...(triggers.length ? { triggers: (triggers as string[]).map(t => t.trim().replace(/^~(?=\/)/, HOME)) } : {}),
     ...(input.headsup === true ? { headsup: true } : {}),
+    ...(input.owner_imessage_alerts === true ? { owner_imessage_alerts: true } : {}),
     ...(Number.isFinite(Number(input.trigger_gap_s)) && Number(input.trigger_gap_s) > 0 ? { trigger_gap_s: Number(input.trigger_gap_s) } : {}),
     ...(quiet !== undefined ? { quiet: { start: quiet.start, end: quiet.end, time_zone: quiet.time_zone } } : {}),
     ...(trip !== undefined ? { trip } : {}),
@@ -958,10 +966,26 @@ export async function wakeChat(chat: string, source: string, text: string, key: 
   return run([BUN, cli, "wake", `--chat=${chat}`, `--source=${source.slice(0, 100)}`, `--text=${clip(text, MAX_WAKE)}`, `--session=${session}`, `--key=${key}`]);
 }
 
-export async function imessage(text: string, key: string): Promise<{ ok: boolean; out: string }> {
+export async function imessage(text: string, key: string, options: { reconcile?: boolean } = {}): Promise<{ ok: boolean; out: string }> {
   // Decide the CLI before the await: an override removed while liveSession() is pending must not reopen the live path.
   const cli = spectrumCli();
   if (underTest() && !process.env.ROBOB_WATCH_SPECTRUM_CLI) return refused("imessage send");
+  if (options.reconcile) {
+    // The bridge binds a send's dedupe spec to a session generation. After /new, an
+    // accepted send must be recognised by its original key before resolving the new route.
+    const receipt = await run(["/usr/bin/sqlite3", "-readonly", BRIDGE_DB,
+      `select coalesce((select value from kv where key='api:send:send:${hash(key)}'),'null')`], 10_000, 100_000);
+    if (!receipt.ok) return { ok: false, out: "bridge acceptance lookup failed" };
+    try {
+      const saved = JSON.parse(receipt.out) as { spec?: string } | null;
+      if (saved) {
+        const operation = JSON.parse(saved.spec ?? "null") as { kind?: string; text?: string } | null;
+        return operation?.kind === "conversation" && operation.text === clip(text, MAX_WAKE)
+          ? { ok: true, out: "bridge already accepted this key" }
+          : { ok: false, out: "bridge acceptance content mismatch" };
+      }
+    } catch { return { ok: false, out: "bridge acceptance unreadable" }; }
+  }
   const session = await liveSession();
   if (!session) return { ok: false, out: "no live route session" };
   return run([BUN, cli, "send", `--text=${clip(text, MAX_WAKE)}`, `--session=${session}`, `--key=${key}`]);
@@ -1393,10 +1417,11 @@ export async function confirmWakes(watcher: Watcher): Promise<void> {
 }
 
 /** Housekeeping notices (failures, expiry) go to the alert channel first, iMessage second. */
-export async function alert(watcher: Watcher, text: string, key: string, severity = "attention"): Promise<Delivery> {
+export async function alert(watcher: Watcher, text: string, key: string, severity = "attention", imessageFallback = true): Promise<Delivery> {
   const notified = await telegram(`Watcher ${watcher.id}`, text, key, severity,
     severity === "error" ? `watcher-failure:${watcher.id}` : undefined);
   if (notified.ok) return { ok: true, via: "telegram", detail: notified.out };
+  if (!imessageFallback) return { ok: false, via: "none", detail: notified.out };
   const sent = await imessage(`${watcher.title}: ${text}`, key);
   return sent.ok ? { ok: true, via: "imessage-send", detail: sent.out } : { ok: false, via: "none", detail: `${notified.out} | ${sent.out}` };
 }
@@ -1471,7 +1496,7 @@ function failureSummary(state: State): string {
   return sources.length ? `failing sources: ${sources.join(", ")}` : "its check is failing";
 }
 
-export async function escalate(watcher: Watcher, state: State, key: string): Promise<Delivery> {
+export async function escalate(watcher: Watcher, state: State, key: string, imessageFallback = true): Promise<Delivery> {
   const started = now();
   let delivery: Delivery | undefined;
   try {
@@ -1479,6 +1504,7 @@ export async function escalate(watcher: Watcher, state: State, key: string): Pro
     const text = escalationText(watcher, state, mins);
     const woke = await wake(`robob-watch ${watcher.id} ${state.dependency_busy ? "dependency busy" : "failing"}`, text, key);
     if (woke.ok) delivery = { ok: true, via: "wake", detail: woke.out };
+    else if (!imessageFallback) delivery = { ok: false, via: "none", detail: woke.out };
     else {
       const summary = state.dependency_busy ? `Dependency ${state.dependency_busy.dependency} has been busy for ${mins} min; watcher "${watcher.title}" keeps retrying; nothing is lost.`
         : `Watcher "${watcher.title}" has been failing for ${mins} min; ${failureSummary(state)}. Last error: ${(state.last_error ?? "").slice(0, 300)}`;

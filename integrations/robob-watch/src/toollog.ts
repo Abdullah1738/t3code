@@ -17,6 +17,7 @@ const boolean = new Set(["deduped", "accepted", "timedOut", "notified", "batched
 const errnoCodes = new Set(Object.keys(constants.errno));
 const signals = new Set(Object.keys(constants.signals));
 const values: Record<string, readonly string[]> = {
+  alertKind: ["pause", "failing", "recovered"],
   severity: ["info", "attention", "error"], outcome: ["fire", "no_change", "fail", "timeout", "busy"],
   source: ["mail", "sms", "bank", "charge"], routed: ["board", "chat", "ignored"],
   class: ["urgent", "today", "info", "noise", "candidate", "charge", "bank", "security", "otp", "unknown", "fail_open", "deduped"],
