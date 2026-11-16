@@ -10741,6 +10741,68 @@ it.effect.each(
   }).pipe(Effect.provide(fake.layer));
 });
 
+it.effect.each(
+  (["wake", "steer"] as const).flatMap((action) =>
+    (["evaluator", "review"] as const).flatMap((stepOwner) =>
+      [{ text: "Resume this step" }, { message: "Resume this step" }].map((fields) => ({
+        action,
+        stepOwner,
+        fields,
+      })),
+    ),
+  ),
+)(
+  "#1739 card_thread $action returns a typed refusal for $stepOwner ($fields)",
+  ({ action, stepOwner, fields }) => {
+    const sent: Array<string> = [];
+    const fake = fakeThreads(undefined, undefined, undefined, undefined, undefined, {
+      findExisting: true,
+      send: (input) =>
+        Effect.sync(() => {
+          sent.push(input.text);
+        }),
+    });
+    return Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const store = yield* KanbanStore.KanbanStore;
+      const board = yield* kanban.ensureBoard({
+        slug: "no-worker-step",
+        name: "No worker step",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          prompt: "A",
+          title: "A",
+          subtasks: [{ text: "Next", owner: stepOwner, step: 1 }],
+        },
+        { _tag: "evaluator", threadId: ThreadId.make("thread-evaluator") },
+      );
+      yield* store.putCard({
+        ...card,
+        stage: "working",
+        activeRole: "work",
+        activeThreadId: ThreadId.make("worker"),
+      });
+      const before = yield* kanban.card(card.id);
+      const result = yield* call(ThreadId.make("thread-evaluator"), "card_thread", {
+        boardId: board.id,
+        card: card.id,
+        action,
+        ...fields,
+      });
+      assert.isTrue(result.isError);
+      const failure = yield* decodeToolFailure(result.text);
+      assert.strictEqual(failure.reason, "work_step_missing");
+      assert.include(failure.message, "Step 1 (s1)");
+      assert.include(failure.message, stepOwner);
+      assert.deepStrictEqual(sent, []);
+      assert.deepStrictEqual(yield* kanban.card(card.id), before);
+    }).pipe(Effect.provide(fake.layer));
+  },
+);
+
 it.effect.each([
   { message: "  Exact steer\nsecond line  " },
   { text: "  Exact steer\nsecond line  " },
