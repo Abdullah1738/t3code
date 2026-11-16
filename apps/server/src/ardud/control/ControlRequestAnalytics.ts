@@ -11,11 +11,11 @@ import type * as HttpRouter from "effect/http/HttpRouter";
 
 import * as Analytics from "../analytics/Analytics.ts";
 import { recordServerAnalytics } from "../../observability/RpcInstrumentation.ts";
+import * as ReplyBuilders from "../http/ReplyBuilders.ts";
 
-const RequestMethod = Context.Reference<{ method: string } | undefined>(
-  "t3/ardud/control/RequestMethod",
-  { defaultValue: () => undefined },
-);
+const RequestMethod = Context.Reference<
+  { method: string; threadId?: string; serializationMs: number } | undefined
+>("t3/ardud/control/RequestMethod", { defaultValue: () => undefined });
 
 // Route layers supply services while building handlers, before the HTTP request fiber exists.
 export const make = Effect.gen(function* () {
@@ -48,6 +48,27 @@ export const sendMode = Effect.fnUntraced(function* (mode: "auto" | "queue" | "s
   if (request) request.method = `control.send.${mode}`;
 });
 
+// Only decoded route parameters enter correlation, never arbitrary URL text.
+export const thread = Effect.fnUntraced(function* (threadId: string) {
+  const request = yield* RequestMethod;
+  if (request) request.threadId = threadId;
+});
+
+// Response encoding belongs to the request span, rather than another span per reply.
+export const encoding = Effect.fnUntraced(function* <A, E, R>(effect: Effect.Effect<A, E, R>) {
+  const request = yield* RequestMethod;
+  if (!request) return yield* effect;
+  const clock = yield* Clock.Clock;
+  const started = clock.monotonicTimeNanosUnsafe();
+  return yield* effect.pipe(
+    Effect.ensuring(
+      Effect.sync(() => {
+        request.serializationMs += Number(clock.monotonicTimeNanosUnsafe() - started) / 1e6;
+      }),
+    ),
+  );
+});
+
 // The span below measures response construction, so the function adds no second span.
 // An SSE connection's lifetime is not request latency.
 export const observe = Effect.fnUntraced(function* <E, R>(
@@ -60,14 +81,55 @@ export const observe = Effect.fnUntraced(function* <E, R>(
   const clock = yield* Clock.Clock;
   const started = clock.monotonicTimeNanosUnsafe();
   const startedAt = DateTime.formatIso(yield* DateTime.now);
-  const request = { method };
+  const request: { method: string; threadId?: string; serializationMs: number } = {
+    method,
+    serializationMs: 0,
+  };
   let waitMs = 0;
+  const readerTimings = new Map<
+    string,
+    { lane: string; waitMs: number; queryMs: number; statements: number }
+  >();
+  const replyAdmissions: Array<{ lane: string; waitMs: number; runMs: number; acquired: boolean }> =
+    [];
+  const timing = (lane: string) => {
+    let row = readerTimings.get(lane);
+    if (!row) {
+      row = { lane, waitMs: 0, queryMs: 0, statements: 0 };
+      readerTimings.set(lane, row);
+    }
+    return row;
+  };
   const parent = yield* NodeSqliteClient.ReaderWaitObserver;
+  const parentStatement = yield* NodeSqliteClient.StatementTimingObserver;
+  const parentAdmission = yield* ReplyBuilders.AdmissionObserver;
+  const parentContention = yield* NodeSqliteClient.ReaderContentionObserver;
+  const readerHolders = new Map<string, { lane: string; holder: string; holdMs: number }>();
   return yield* effect.pipe(
     Effect.provideService(RequestMethod, request),
     Effect.provideService(NodeSqliteClient.ReaderWaitObserver, (ms, lane) => {
       waitMs += ms;
+      timing(lane ?? "unknown").waitMs += ms;
       parent?.(ms, lane);
+    }),
+    Effect.provideService(NodeSqliteClient.StatementTimingObserver, (sample) => {
+      const row = timing(sample.lane ?? sample.connection);
+      row.queryMs += sample.durationMs;
+      row.statements++;
+      parentStatement?.(sample);
+    }),
+    Effect.provideService(ReplyBuilders.AdmissionObserver, (sample) => {
+      if (replyAdmissions.length < 8) replyAdmissions.push(sample);
+      parentAdmission?.(sample);
+    }),
+    Effect.provideService(NodeSqliteClient.ReaderContentionObserver, (sample) => {
+      const key = `${sample.lane}:${sample.holder}`;
+      // Bound request-local work even when a long read meets many distinct workloads.
+      const row = readerHolders.get(key);
+      if (row) row.holdMs += sample.holdMs;
+      else if (readerHolders.size < 64)
+        readerHolders.set(key, { lane: sample.lane, holder: sample.holder, holdMs: sample.holdMs });
+      parentContention?.(sample);
     }),
     Effect.onExit((exit) =>
       Effect.gen(function* () {
@@ -91,6 +153,7 @@ export const observe = Effect.fnUntraced(function* <E, R>(
           kind: "rpc.request",
           surface: "server",
           route: request.method,
+          ...(request.threadId === undefined ? {} : { threadId: request.threadId }),
           durationMs,
           outcome,
           props: {
@@ -98,6 +161,12 @@ export const observe = Effect.fnUntraced(function* <E, R>(
             ...(route === undefined ? {} : { httpMethod: route.method, httpRoute: route.path }),
             phase: "unary",
             waitMs,
+            readerTimings: [...readerTimings.values()],
+            replyAdmissions,
+            serializationMs: request.serializationMs,
+            readerHolders: [...readerHolders.values()]
+              .sort((a, b) => b.holdMs - a.holdMs)
+              .slice(0, 8),
             ...(status === undefined ? {} : { status }),
             ...(outcome === "ok"
               ? {}

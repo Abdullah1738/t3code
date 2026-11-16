@@ -239,7 +239,8 @@ const json = (body: unknown, status = 200) => jsonReply(body, status);
 
 // The agent reply lane covers only building the JSON body: every database read
 // and wait happens before it (ReplyBuilders.ts).
-const encoded = (body: unknown) => ReplyBuilders.bounded(Effect.sync(() => json(body)));
+const encoded = (body: unknown) =>
+  ReplyBuilders.bounded(ControlRequestAnalytics.encoding(Effect.sync(() => json(body))));
 
 const chunkIds = (ids: ReadonlyArray<string>, size = 400): Array<ReadonlyArray<string>> => {
   const out: Array<ReadonlyArray<string>> = [];
@@ -275,6 +276,7 @@ const param = Effect.fn("ControlHttp.param")(function* (name: string) {
     return yield* fail("invalid_request", `Missing path parameter ${name}.`);
   }
   // The router already percent-decodes path parameters.
+  if (name === "threadId") yield* ControlRequestAnalytics.thread(value);
   return value;
 });
 
@@ -1084,7 +1086,7 @@ const makeRoutes = Effect.gen(function* () {
       threadDetail(threadId).pipe(NodeSqliteClient.foregroundReads),
       "poll",
     );
-    return json({ ok: true, thread });
+    return yield* ControlRequestAnalytics.encoding(Effect.sync(() => json({ ok: true, thread })));
   });
 
   const byNative = Effect.gen(function* () {
