@@ -423,15 +423,24 @@ class NeverStartedTests(Isolated):
                     self.assertNotIn('retry', text.lower())
 
     def test_exit_two_pool_refusals_keep_their_own_remedy_verbatim(self):
-        for source, count in (('template:generic', '8/8'), ('base:recall-backup', '12/8')):
-            error = (f'pool is full ({count} boxes, none from {source}), so waiting cannot help; '
-                     'nothing ran. Run without --base/--template or choose a matching source.')
-            with self.subTest(source=source):
-                self.infra_row(error=error, exit_code=2)
-                text = self.assert_refusal(2, error, safe=False)
-                self.assertEqual(text, f'offbox: run-refused: never started: {error}\n')
-                self.assertNotIn('retry', text.lower())
-                self.assertNotIn('safe to rerun', text)
+        for backend in ('boat', 'server'):
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(patch.dict(os.environ, OFFBOX_BACKEND=backend))
+                stack.enter_context(patch.object(common, '_BACKEND', backend))
+                stack.enter_context(patch.object(common, 'DB_PATH', common.db_path_for(backend)))
+                con = stack.enter_context(contextlib.closing(common.db()))
+                stack.enter_context(patch.object(self, 'con', con))
+                self.assertEqual(Path(con.execute('PRAGMA database_list').fetchone()['file']), common.DB_PATH.resolve())
+                for source, count in (('template:generic', '8/8'), ('base:recall-backup', '12/8')):
+                    error = (f'pool is full ({count} boxes, none from {source}), so waiting cannot help; '
+                             'nothing ran. Run without --base/--template or choose a matching source.')
+                    for steps in (0, 2):
+                        with self.subTest(backend=backend, source=source, steps=steps):
+                            self.infra_row(error=error, exit_code=2, steps=steps)
+                            text = self.assert_refusal(2, error, safe=False)
+                            self.assertEqual(text, f'offbox: run-refused: never started: {error}\n')
+                            self.assertNotIn('retry', text.lower())
+                            self.assertNotIn('safe to rerun', text)
 
     def test_infra_reason_is_one_line_and_at_most_300_characters(self):
         error = 'NOTHING RAN\n' + 'reason ' * 70
