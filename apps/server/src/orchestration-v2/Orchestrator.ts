@@ -14064,6 +14064,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     },
     (effect, stored) =>
       effect.pipe(
+        // Completion holds dispatch locks; background snapshots must not block new sends through them.
+        NodeSqliteClient.foregroundReads,
         Effect.catchCause((cause) =>
           Effect.logWarning("Failed to react to V2 run update", {
             threadId: stored.event.threadId,
