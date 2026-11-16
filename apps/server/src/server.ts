@@ -22,7 +22,7 @@ import * as DelegatedTaskQuestionReactor from "./orchestration-v2/DelegatedTaskQ
 import * as NodeHttp from "node:http";
 
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
-import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as ServerProcessRuntime from "./serverProcessRuntime.ts";
 import { EnvironmentHttpApi, type RepositoryIdentity } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Duration from "effect/Duration";
@@ -359,8 +359,6 @@ const layerHttpServer = Layer.unwrap(
     );
   }),
 ).pipe(StartupPhaseLog.withStartupLayer("http.listen"));
-
-const layerPlatformServices = NodeServices.layer;
 
 const layerPersistence = BoardsDatabase.layerConfig.pipe(
   Layer.provideMerge(layerSqlitePersistence),
@@ -1198,11 +1196,10 @@ const layerMakeServer = Layer.unwrap(
         Layer.provideMerge(ProviderProcessRegistry.layer),
       )
       .pipe(
-        Layer.provideMerge(layerPlatformServices),
         StartupPhaseLog.withStartupLayer("boot"),
         Layer.provide(StartupPhaseLog.layer(config.logsDir)),
       );
   }),
-).pipe(Layer.provide(ProcessRunner.layer));
+).pipe(ServerProcessRuntime.provide);
 
 export const runServer = Layer.launch(layerMakeServer);

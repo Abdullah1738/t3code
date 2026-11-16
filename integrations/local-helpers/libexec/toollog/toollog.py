@@ -660,7 +660,7 @@ def rollup(board, day, top_n=20):
         if board == 'orders':
             component = row.get('component')
             if not isinstance(component, str) or component not in {
-                    'commerce', 'order-watch', 'card_status', 'noon', 'careem',
+                    'commerce', 'order-watch', 'card_status', 'card-vault-fill', 'noon', 'careem',
                     'amazon', 'uber', 'toollog', 'money-cases'}:
                 component = 'unknown'
             component_totals[component] += weight

@@ -17,6 +17,9 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import { SpawnExecutableResolution } from "@t3tools/shared/shell";
 
 import * as ProcessRunner from "./processRunner.ts";
+import * as OffMainSpawner from "./ardud/process/OffMainSpawner.ts";
+
+const layerNative = OffMainSpawner.layer.pipe(Layer.provideMerge(NodeServices.layer));
 import { writeFakeCli } from "@t3tools/provider-testing/fakeCli";
 import { makeProcessProbe, processProbeSource } from "./testUtils/processProbe.ts";
 
@@ -423,7 +426,7 @@ describe("runProcess", () => {
       yield* TestClock.adjust("1 second");
       yield* probe.exited;
       expect((yield* Fiber.join(fiber))._tag).toBe("ProcessTimeoutError");
-    }).pipe(Effect.provide(ProcessRunner.layer.pipe(Layer.provideMerge(NodeServices.layer)))),
+    }).pipe(Effect.provide(ProcessRunner.layer.pipe(Layer.provideMerge(layerNative)))),
   );
 
   for (const wrapperExit of ["timeout", "success"] as const) {
@@ -467,7 +470,7 @@ describe("runProcess", () => {
               success: { code: 0, timedOut: false },
             });
           }
-        }).pipe(Effect.provide(ProcessRunner.layer.pipe(Layer.provideMerge(NodeServices.layer)))),
+        }).pipe(Effect.provide(ProcessRunner.layer.pipe(Layer.provideMerge(layerNative)))),
     );
   }
 
@@ -497,11 +500,13 @@ describe("runProcess", () => {
           import * as Layer from "effect/Layer";
           import * as NodeServices from "@effect/platform-node/NodeServices";
           import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
+          import * as OffMainSpawner from ${JSON.stringify(new URL("./ardud/process/OffMainSpawner.ts", import.meta.url).href)};
+          const layerNative = OffMainSpawner.layer.pipe(Layer.provideMerge(NodeServices.layer));
           import * as ProcessRunner from ${JSON.stringify(new URL("./processRunner.ts", import.meta.url).href)};
           NodeRuntime.runMain(Effect.gen(function* () {
             const runner = yield* ProcessRunner.ProcessRunner;
             yield* runner.run({ command: ${JSON.stringify(helper)}, args: [] });
-          }).pipe(Effect.provide(ProcessRunner.layer.pipe(Layer.provideMerge(NodeServices.layer)))));
+          }).pipe(Effect.provide(ProcessRunner.layer.pipe(Layer.provideMerge(layerNative)))));
         `,
             ],
             {
@@ -519,7 +524,7 @@ describe("runProcess", () => {
           [backend.exitCode.pipe(Effect.timeout("4 seconds"), TestClock.withLive), probe.exited],
           { concurrency: "unbounded" },
         );
-      }).pipe(Effect.provide(NodeServices.layer)),
+      }).pipe(Effect.provide(layerNative)),
   );
 
   it.effect("returns a synthetic timed out result when timeoutBehavior is timedOutResult", () =>
