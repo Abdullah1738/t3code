@@ -1,3 +1,4 @@
+import { kanbanReasonClass } from "../../analytics/McpFailureReason.ts";
 import { backgroundCommandWakeKey } from "../../../orchestration-v2/backgroundCommandWake.ts";
 import * as CardNextMetrics from "../../analytics/CardNextMetrics.ts";
 import { stableStringify } from "@t3tools/shared/relaySigning";
@@ -1191,7 +1192,18 @@ const failWith = (
       : code === "failed"
         ? "operation_failed"
         : "invalid_args",
-) => Effect.fail(new KanbanError({ code, detail, reason }));
+  reasonClass: NonNullable<KanbanError["reasonClass"]> = kanbanReasonClass(code, reason),
+  invalidField?: string,
+) =>
+  Effect.fail(
+    new KanbanError({
+      code,
+      detail,
+      reason,
+      reasonClass,
+      ...(invalidField === undefined ? {} : { invalidField }),
+    }),
+  );
 
 /** A refused answer, with the revision the ask is at when that is why. */
 const failAnswer = (problem: Asks.AskProblem) =>
@@ -1200,6 +1212,8 @@ const failAnswer = (problem: Asks.AskProblem) =>
       code: problem.code,
       detail: problem.detail,
       reason: "invalid_args",
+      reasonClass: problem.reasonClass ?? kanbanReasonClass(problem.code),
+      ...(problem.invalidField === undefined ? {} : { invalidField: problem.invalidField }),
       ...(problem.revision === undefined ? {} : { revision: problem.revision }),
     }),
   );
@@ -2662,6 +2676,10 @@ const make = Effect.gen(function* () {
                     : locks.fresh(locks.run(whenBusy)),
                 ),
               ),
+        undefined,
+        false,
+        undefined,
+        { writesTrackedInside: true },
       );
     }).pipe(
       Effect.withSpan("KanbanService.serial", {
@@ -3005,7 +3023,14 @@ const make = Effect.gen(function* () {
       false,
       "board",
     );
-    if (!board) return yield* failWith("not-found", `board ${boardId}`);
+    if (!board)
+      return yield* failWith(
+        "not-found",
+        `board ${boardId}`,
+        "resource_not_found",
+        "not_found",
+        "boardId",
+      );
     return board;
   });
 
@@ -3084,7 +3109,14 @@ const make = Effect.gen(function* () {
 
   const cardOf = Effect.fn("KanbanService.cardOf")(function* (cardId: KanbanCard["id"]) {
     const card = yield* store.card(cardId);
-    if (!card) return yield* failWith("not-found", `card ${cardId}`);
+    if (!card)
+      return yield* failWith(
+        "not-found",
+        `card ${cardId}`,
+        "resource_not_found",
+        "not_found",
+        "card",
+      );
     return card;
   });
 
@@ -3092,7 +3124,14 @@ const make = Effect.gen(function* () {
     id: KanbanDiscussion["id"],
   ) {
     const discussion = yield* store.discussion(id);
-    if (!discussion) return yield* failWith("not-found", `discussion ${id}`);
+    if (!discussion)
+      return yield* failWith(
+        "not-found",
+        `discussion ${id}`,
+        "resource_not_found",
+        "not_found",
+        "discussionId",
+      );
     return discussion;
   });
 
@@ -8437,7 +8476,13 @@ const make = Effect.gen(function* () {
   ) {
     yield* checkText(messageTextFields(blocks));
     if (blocks.length === 0)
-      return yield* failWith("invalid", "a message needs at least one block");
+      return yield* failWith(
+        "invalid",
+        "a message needs at least one block",
+        "invalid_args",
+        "missing_required",
+        "blocks",
+      );
     const discussion = yield* discussionOf(discussionId);
     if (captureContext) yield* captureDiscussionContext(discussion);
     if (
@@ -12454,7 +12499,14 @@ const make = Effect.gen(function* () {
     );
     const tickBoardOf = Effect.gen(function* () {
       const board = yield* readTickBoard;
-      if (!board) return yield* failWith("not-found", `board ${boardId}`);
+      if (!board)
+        return yield* failWith(
+          "not-found",
+          `board ${boardId}`,
+          "resource_not_found",
+          "not_found",
+          "boardId",
+        );
       return board;
     });
     const now = yield* nowMillis;
@@ -14946,7 +14998,14 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const card = yield* cardOf(cardId);
         const ask = card.asks.find((entry) => entry.id === askId);
-        if (!ask) return yield* failWith("not-found", `ask ${askId} on card #${card.number}`);
+        if (!ask)
+          return yield* failWith(
+            "not-found",
+            `ask ${askId} on card #${card.number}`,
+            undefined,
+            "bad_reference",
+            "ask",
+          );
         if (!ask.closedAt)
           return yield* failWith("denied", `ask ${askId} is still open`, "ask_open");
         if (ask.answer?.verdict === "dropped") {
@@ -15072,7 +15131,14 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const card = yield* cardOf(cardId);
         const ask = card.asks.find((entry) => entry.id === askId);
-        if (!ask) return yield* failWith("not-found", `ask ${askId} on card #${card.number}`);
+        if (!ask)
+          return yield* failWith(
+            "not-found",
+            `ask ${askId} on card #${card.number}`,
+            undefined,
+            "bad_reference",
+            "ask",
+          );
         if (!ask.closedAt)
           return yield* failWith("denied", `ask ${askId} is still open`, "ask_open");
         if (ask.answer?.verdict === "dropped") {
@@ -15476,6 +15542,9 @@ const make = Effect.gen(function* () {
       return yield* failWith(
         "conflict",
         `card #${twin.card.number} "${twin.card.title}" is already open with the same ${twin.why}; add to it (card_edit / comment) instead of a second card`,
+        "conflict",
+        twin.why === "title" ? "duplicate_title" : "duplicate_link",
+        twin.why === "title" ? "title" : "links",
       );
     }
   });
@@ -15489,7 +15558,13 @@ const make = Effect.gen(function* () {
     const board = yield* boardOf(boardId);
     const prompt = input.prompt.trim();
     if (prompt.length === 0 && !input.title?.trim()) {
-      return yield* failWith("invalid", "a card needs a prompt or a title");
+      return yield* failWith(
+        "invalid",
+        "a card needs a prompt or a title",
+        "invalid_args",
+        "missing_required",
+        "title",
+      );
     }
     const at = yield* nowIso;
     const stage = input.stage ?? "todo";
@@ -15509,7 +15584,8 @@ const make = Effect.gen(function* () {
         "role_not_allowed",
       );
     const plan = Subtasks.planSubtasks([], input.subtasks ?? [], 0, at, board.guessedGates);
-    if (!plan.ok) return yield* failWith("invalid", plan.reason, plan.denyReason);
+    if (!plan.ok)
+      return yield* failWith("invalid", plan.reason, plan.denyReason, "other", "subtasks");
     yield* checkScriptNames(boardId, plan.subtasks);
     return {
       id: KanbanCardId.make(`card-${uuid()}`),
@@ -15622,7 +15698,14 @@ const make = Effect.gen(function* () {
       ? yield* threads.claimContext(threadId).pipe(NodeSqliteClient.identityReadOnly)
       : null;
     const view = compact ? context : yield* threads.view(threadId);
-    if (!view) return yield* failWith("not-found", `thread ${threadId}`);
+    if (!view)
+      return yield* failWith(
+        "not-found",
+        `thread ${threadId}`,
+        "resource_not_found",
+        "bad_reference",
+        "threadId",
+      );
     const carried = yield* reader.cardsByThread(threadId);
     const held = (yield* Ref.get(holds)).get(threadId);
     // Past the last card and the hold, the thread's own model still names its pool.
@@ -15944,6 +16027,8 @@ const make = Effect.gen(function* () {
               : new KanbanError({
                   code: error.code,
                   reason: error.reason ?? "operation_failed",
+                  ...(error.reasonClass === undefined ? {} : { reasonClass: error.reasonClass }),
+                  ...(error.invalidField === undefined ? {} : { invalidField: error.invalidField }),
                   detail: `${error.detail}. Nothing was saved.`,
                 });
           }),
@@ -16285,7 +16370,13 @@ const make = Effect.gen(function* () {
             )
           : null;
         if (plan && !plan.ok)
-          return yield* failWith(plan.code ?? "invalid", plan.reason, plan.denyReason);
+          return yield* failWith(
+            plan.code ?? "invalid",
+            plan.reason,
+            plan.denyReason,
+            kanbanReasonClass(plan.code ?? "invalid", plan.denyReason),
+            "subtasks",
+          );
         if (plan?.ok) {
           for (const subtask of card.subtasks) {
             if (subtask.state !== "open") continue;
@@ -16600,7 +16691,13 @@ const make = Effect.gen(function* () {
             }
           }
           if (ownReviewHandoff && !options?.note?.trim()) {
-            return yield* failWith("invalid", "needs_review needs a note naming the new head");
+            return yield* failWith(
+              "invalid",
+              "needs_review needs a note naming the new head",
+              undefined,
+              "missing_required",
+              "note",
+            );
           }
           if (ownReviewHandoff && card.stage === "needs_review") {
             yield* logEvent(card, actor, "comment", { body: options!.note!.trim() });
@@ -16608,7 +16705,13 @@ const make = Effect.gen(function* () {
             return card;
           }
           if (to === "needs_owner" && !options?.question?.trim()) {
-            return yield* failWith("invalid", "needs_owner needs the question for the owner");
+            return yield* failWith(
+              "invalid",
+              "needs_owner needs the question for the owner",
+              undefined,
+              "missing_required",
+              "question",
+            );
           }
           const work = kanbanStepSubtasks(card, "work");
           if (to === "needs_review" && work.length > 0) {
@@ -16932,10 +17035,16 @@ const make = Effect.gen(function* () {
         const card = yield* cardOf(cardId);
         if (!isUnattachedOwnThread(card, actor)) yield* checkCardThread(card, actor, role);
         const question = input.question.trim();
-        if (!question) return yield* failWith("invalid", "an ask needs the question");
+        if (!question)
+          return yield* failWith(
+            "invalid",
+            "an ask needs the question",
+            undefined,
+            "missing_required",
+            "question",
+          );
         const written = Asks.askFields(input, { blocking: input.blocking, card });
-        if (Asks.isAskProblem(written))
-          return yield* failWith(written.code, written.detail, "invalid_args");
+        if (Asks.isAskProblem(written)) return yield* failAnswer(written);
         if (written.to === "evaluator" && actor._tag !== "thread") {
           return yield* failWith(
             "invalid",
@@ -16993,7 +17102,14 @@ const make = Effect.gen(function* () {
         const card = yield* cardOf(cardId);
         if (!isUnattachedOwnThread(card, actor)) yield* checkCardThread(card, actor, role);
         const ask = Asks.findOpenAsk(card, askId);
-        if (!ask) return yield* failWith("not-found", `open ask ${askId} on card #${card.number}`);
+        if (!ask)
+          return yield* failWith(
+            "not-found",
+            `open ask ${askId} on card #${card.number}`,
+            undefined,
+            "bad_reference",
+            "ask",
+          );
         const at = yield* nowIso;
         if (action === "drop") {
           const discussion = yield* cardDiscussionUnlocked(card.id);
@@ -17048,7 +17164,13 @@ const make = Effect.gen(function* () {
     const ask = Asks.findOpenAsk(card, askId);
     return ask
       ? Effect.succeed(ask)
-      : failWith("not-found", `open ask ${askId} on card #${card.number}`);
+      : failWith(
+          "not-found",
+          `open ask ${askId} on card #${card.number}`,
+          undefined,
+          "bad_reference",
+          "ask",
+        );
   };
 
   const editAsk: KanbanServiceShape["editAsk"] = (cardId, askId, edit, actor, role) =>
@@ -17066,8 +17188,7 @@ const make = Effect.gen(function* () {
         const ask = yield* openAskOf(card, askId);
         const at = yield* nowIso;
         const written = Asks.reviseAsk(ask, edit, at, card);
-        if (Asks.isAskProblem(written))
-          return yield* failWith(written.code, written.detail, "invalid_args");
+        if (Asks.isAskProblem(written)) return yield* failAnswer(written);
         const { blocks: _blocks, ...revised } = written;
         // New blocks replace the old ones; otherwise the last version's come along whole.
         const kept = ask.blocks?.length ?? 0;
@@ -17115,10 +17236,23 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const card = yield* cardOf(cardId);
         const ask = card.asks.find((entry) => entry.id === askId);
-        if (!ask) return yield* failWith("not-found", `ask ${askId} on card #${card.number}`);
+        if (!ask)
+          return yield* failWith(
+            "not-found",
+            `ask ${askId} on card #${card.number}`,
+            undefined,
+            "bad_reference",
+            "ask",
+          );
         const plan = Asks.secretPlan(card, ask, fieldIds);
         if (Asks.isAskProblem(plan))
-          return yield* failWith(plan.code, plan.detail, "approval_required");
+          return yield* failWith(
+            plan.code,
+            plan.detail,
+            "approval_required",
+            plan.reasonClass,
+            plan.invalidField,
+          );
         const projectId = card.projectId ?? (yield* boardOf(card.boardId)).defaultProjectId;
         return { ...plan, projectId };
       }),
@@ -17157,7 +17291,14 @@ const make = Effect.gen(function* () {
         yield* checkText(Asks.answerTextFields(input));
         const card = yield* cardOf(cardId);
         const ask = card.asks.find((entry) => entry.id === askId);
-        if (!ask) return yield* failWith("not-found", `ask ${askId} on card #${card.number}`);
+        if (!ask)
+          return yield* failWith(
+            "not-found",
+            `ask ${askId} on card #${card.number}`,
+            undefined,
+            "bad_reference",
+            "ask",
+          );
         const byOwner = actor._tag === "owner";
         if (
           byOwner &&
@@ -17416,11 +17557,17 @@ const make = Effect.gen(function* () {
         }
         const card = yield* cardOf(cardId);
         const ask = card.asks.find((entry) => entry.id === askId);
-        if (!ask) return yield* failWith("not-found", `ask ${askId} on card #${card.number}`);
+        if (!ask)
+          return yield* failWith(
+            "not-found",
+            `ask ${askId} on card #${card.number}`,
+            undefined,
+            "bad_reference",
+            "ask",
+          );
         const at = yield* nowIso;
         const snoozed = Asks.snoozeAsk(card, ask, until, at);
-        if (Asks.isAskProblem(snoozed))
-          return yield* failWith(snoozed.code, snoozed.detail, "invalid_args");
+        if (Asks.isAskProblem(snoozed)) return yield* failAnswer(snoozed);
         const next = { ...snoozed, updatedAt: at };
         yield* saveCard(next);
         return next;
@@ -17443,7 +17590,14 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const card = yield* cardOf(cardId);
         const ask = card.asks.find((entry) => entry.id === askId);
-        if (!ask) return yield* failWith("not-found", `ask ${askId} on card #${card.number}`);
+        if (!ask)
+          return yield* failWith(
+            "not-found",
+            `ask ${askId} on card #${card.number}`,
+            undefined,
+            "bad_reference",
+            "ask",
+          );
         const kept = ask.blocks?.length ?? 0;
         // The card holds big blocks as stubs; the ask's message holds them whole.
         const asked =
@@ -17473,7 +17627,13 @@ const make = Effect.gen(function* () {
         const now = yield* nowIso;
         const observed = receipt.at ?? now;
         if (receipt.type === "seen" && Math.abs(Date.parse(observed) - Date.parse(now)) > 300_000)
-          return yield* failWith("invalid", "receipt time is outside the clock window");
+          return yield* failWith(
+            "invalid",
+            "receipt time is outside the clock window",
+            undefined,
+            "bad_time",
+            "at",
+          );
         const at =
           receipt.type === "seen" && Number.isFinite(Date.parse(observed))
             ? DateTime.formatIso(
@@ -17483,7 +17643,13 @@ const make = Effect.gen(function* () {
               )
             : observed;
         if (!Number.isFinite(Date.parse(at)) || at < ask.at || at > now)
-          return yield* failWith("invalid", "receipt time is outside the ask lifetime");
+          return yield* failWith(
+            "invalid",
+            "receipt time is outside the ask lifetime",
+            undefined,
+            "bad_time",
+            "at",
+          );
         const updated = markAskTiming(
           ask,
           receipt.type,
@@ -18026,7 +18192,13 @@ const make = Effect.gen(function* () {
                 DateTime.makeUnsafe(`${releasedAt.slice(0, 10)}T00:00:00.000Z`),
               ).slice(0, 10) !== releasedAt.slice(0, 10)
             )
-              return yield* failWith("invalid", "releasedAt must be an ISO datetime");
+              return yield* failWith(
+                "invalid",
+                "releasedAt must be an ISO datetime",
+                "invalid_args",
+                "bad_time",
+                "releasedAt",
+              );
             if (state !== "done" || !gated?.interrupting)
               return yield* failWith(
                 "invalid",
@@ -18038,7 +18210,13 @@ const make = Effect.gen(function* () {
                 "releasedAt cannot be in the future (beyond 1 minute of clock skew)",
               );
             if (millis < Date.parse(card.createdAt))
-              return yield* failWith("invalid", "releasedAt cannot be before the card's createdAt");
+              return yield* failWith(
+                "invalid",
+                "releasedAt cannot be before the card's createdAt",
+                "invalid_args",
+                "bad_time",
+                "releasedAt",
+              );
             releaseAt = DateTime.formatIso(DateTime.makeUnsafe(millis));
           }
           const releaseBoards =
@@ -18447,7 +18625,13 @@ const make = Effect.gen(function* () {
               );
             }
             if (verdict === "findings" && findings.length === 0) {
-              return yield* failWith("invalid", "findings need at least one line");
+              return yield* failWith(
+                "invalid",
+                "findings need at least one line",
+                undefined,
+                "missing_required",
+                "findings",
+              );
             }
             if (sha !== null && !/^[0-9a-f]{7,40}$/.test(sha)) {
               return yield* failWith(
@@ -19177,7 +19361,14 @@ const make = Effect.gen(function* () {
           yield* kick;
           return changed;
         }
-        if (slots === undefined) return yield* failWith("invalid", "slots is required");
+        if (slots === undefined)
+          return yield* failWith(
+            "invalid",
+            "slots is required",
+            "invalid_args",
+            "missing_required",
+            "slots",
+          );
         const count = Math.max(0, Math.round(slots));
         const pools = yield* store.pools(board.id);
         const same = pools.filter((pool) => Rules.modelKey(pool.model) === Rules.modelKey(model));
@@ -19285,7 +19476,13 @@ const make = Effect.gen(function* () {
         const existing = input.id ? goals.find((goal) => goal.id === input.id) : undefined;
         if (input.id && !existing) return yield* failWith("not-found", `goal ${input.id}`);
         if (!existing && !input.name?.trim())
-          return yield* failWith("invalid", "a new goal needs a name");
+          return yield* failWith(
+            "invalid",
+            "a new goal needs a name",
+            "invalid_args",
+            "missing_required",
+            "name",
+          );
         const base: KanbanGoal = existing ?? {
           id: KanbanGoalId.make(`goal-${uuid()}`),
           boardId,
@@ -19380,7 +19577,14 @@ const make = Effect.gen(function* () {
         let next = discussion;
         if (patch.title !== undefined) {
           const title = patch.title.trim().slice(0, DISCUSSION_TITLE_MAX);
-          if (!title) return yield* failWith("invalid", "a discussion needs a title");
+          if (!title)
+            return yield* failWith(
+              "invalid",
+              "a discussion needs a title",
+              "invalid_args",
+              "missing_required",
+              "title",
+            );
           next = { ...next, title, titleEditedAt: at };
         }
         if (patch.settled === true && typeof patch.snoozedUntil === "string") {
@@ -19410,10 +19614,22 @@ const make = Effect.gen(function* () {
         } else if (patch.snoozedUntil !== undefined) {
           const until = DateTime.make(patch.snoozedUntil);
           if (Option.isNone(until)) {
-            return yield* failWith("invalid", "snoozedUntil is not a time");
+            return yield* failWith(
+              "invalid",
+              "snoozedUntil is not a time",
+              "invalid_args",
+              "bad_time",
+              "snoozedUntil",
+            );
           }
           if (DateTime.toEpochMillis(until.value) <= (yield* nowMillis)) {
-            return yield* failWith("invalid", "snoozedUntil must be in the future");
+            return yield* failWith(
+              "invalid",
+              "snoozedUntil must be in the future",
+              "invalid_args",
+              "bad_time",
+              "snoozedUntil",
+            );
           }
           next = {
             ...next,
@@ -19676,9 +19892,21 @@ const make = Effect.gen(function* () {
         (options?.section !== undefined || options?.outline === true) &&
         options?.slug === undefined
       )
-        return yield* failWith("invalid", "section and outline require slug");
+        return yield* failWith(
+          "invalid",
+          "section and outline require slug",
+          "invalid_args",
+          "missing_required",
+          "slug",
+        );
       if (options?.section !== undefined && options?.outline === true)
-        return yield* failWith("invalid", "Pass section or outline, not both.");
+        return yield* failWith(
+          "invalid",
+          "Pass section or outline, not both.",
+          "invalid_args",
+          "conflict",
+          "section",
+        );
       const pages = yield* readDb(store.wiki(boardId));
       if (options?.slug === undefined) return pages;
       const page = pages.find((page) => page.slug === options.slug);
@@ -19691,6 +19919,8 @@ const make = Effect.gen(function* () {
           "invalid",
           `no wiki section ${options.section}; headings: ${section.headings.join(", ")}`,
           "wiki_section_unknown",
+          "not_found",
+          "section",
         );
       return [
         {
@@ -19707,7 +19937,13 @@ const make = Effect.gen(function* () {
       "wiki.write",
       Effect.gen(function* () {
         if ((page.body === undefined) === (page.edits === undefined))
-          return yield* failWith("invalid", "Pass exactly one of body or edits.");
+          return yield* failWith(
+            "invalid",
+            "Pass exactly one of body or edits.",
+            undefined,
+            "conflict",
+            "body",
+          );
         if (page.title !== undefined) yield* checkText([["title", page.title]]);
         yield* boardOf(boardId);
         const slug = page.slug
@@ -19715,7 +19951,14 @@ const make = Effect.gen(function* () {
           .toLowerCase()
           .replace(/[^a-z0-9]+/g, "-")
           .replace(/^-|-$/g, "");
-        if (!slug) return yield* failWith("invalid", "a wiki page needs a slug");
+        if (!slug)
+          return yield* failWith(
+            "invalid",
+            "a wiki page needs a slug",
+            "invalid_args",
+            "missing_required",
+            "slug",
+          );
         // boardOf acquires the board's exclusive guard until this operation returns;
         // both full replacements and edits read and write under that same guard.
         const current =
@@ -19725,7 +19968,13 @@ const make = Effect.gen(function* () {
         let body = page.body ?? current?.body ?? "";
         if (page.edits !== undefined) {
           if (current === undefined)
-            return yield* failWith("invalid", `no wiki page ${slug}; create it with body`);
+            return yield* failWith(
+              "invalid",
+              `no wiki page ${slug}; create it with body`,
+              undefined,
+              "not_found",
+              "slug",
+            );
           body = (yield* applyExactEdits([body], page.edits))[0]!;
         }
         yield* checkText([["wiki body", body]]);
@@ -20089,8 +20338,7 @@ const make = Effect.gen(function* () {
             if (card && !options.forceNew) {
               matchedCard = card;
               const discussion = yield* cardDiscussionUnlocked(card.id).pipe(
-                // Opening a discussion is not a receipt for the incoming sighting.
-                Effect.provideService(SavedWrite.observer, () => {}),
+                SavedWrite.preparatory,
               );
               // Sightings are new evidence, like answers/verdicts/wait endings: deliver,
               // never just save an audit comment or merge them into card-less intake.
@@ -20467,8 +20715,7 @@ const make = Effect.gen(function* () {
             appended = duplicate ? { ...response, deduped: true } : response;
             appendKey = uuid();
             const discussion = yield* cardDiscussionUnlocked(target.id).pipe(
-              // A discussion save cannot acknowledge evidence that is not yet committed.
-              Effect.provideService(SavedWrite.observer, () => {}),
+              SavedWrite.preparatory,
             );
             const observer = yield* SavedWrite.observer;
             // An existing evidence comment can have a new title or target. Only

@@ -786,6 +786,64 @@ it.effect.each([
     }),
 );
 
+it.effect.each(
+  ["evaluator_start", "report_bug"].flatMap((tool) =>
+    ["none", "evaluator", "evaluatorQueue"].map((receipt) => ({ tool, receipt })),
+  ),
+)("$tool timeout after preparation counts only its $receipt request receipt", ({ tool, receipt }) =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const entered = yield* Deferred.make<void>();
+    const receipts: SavedWrite.Saved[] = [];
+    const state: McpCall["Service"] = {
+      callerResolved: true,
+      callerResolveMs: 0,
+      readerLane: "foreground",
+      phase: "handler",
+      saved: false,
+      boardWrite: true,
+      boardAdmitted: true,
+    };
+    const saved: SavedWrite.Saved = {
+      kind: "evaluator",
+      threadId: ThreadId.make("private-preparatory-thread"),
+    };
+    const pending = yield* SavedReply.protect(
+      Effect.gen(function* () {
+        yield* locks.board(
+          "a",
+          locks.access("a", SavedWrite.record(saved), true).pipe(SavedWrite.preparatory),
+        );
+        assert.strictEqual(state.saved, false);
+        assert.isEmpty(receipts);
+        if (receipt !== "none")
+          yield* SavedWrite.record(
+            receipt === "evaluatorQueue"
+              ? { kind: "evaluatorQueue", key: "private-request-key", queueId: 1642 }
+              : saved,
+          );
+        yield* Deferred.succeed(entered, undefined);
+        return yield* Effect.never;
+      }),
+      tool,
+    ).pipe(
+      Effect.provideService(McpCall, state),
+      Effect.provideService(SavedWrite.observer, (saved) => receipts.push(saved)),
+      Effect.forkChild,
+    );
+    yield* Deferred.await(entered);
+    yield* TestClock.adjust(SavedReply.REPLY_BUDGET_MS);
+    const result = callResult(yield* Fiber.join(pending));
+    const expected = receipt !== "none";
+    assert.strictEqual(replyData(result.structuredContent).saved, expected);
+    const row = callOutcome(Exit.succeed(result), state);
+    assert.strictEqual(row.saved, expected);
+    assert.strictEqual(state.refusedAt, expected ? "post_write" : "in_write");
+    assert.lengthOf(receipts, expected ? 1 : 0);
+    assert.notInclude(JSON.stringify(row), "private");
+  }),
+);
+
 it.effect("a saved receipt survives slow encoding as a non-error reply", () =>
   Effect.gen(function* () {
     const saved = yield* Deferred.make<void>();

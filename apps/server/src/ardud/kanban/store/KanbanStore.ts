@@ -489,6 +489,7 @@ const make = Effect.gen(function* () {
       };
       return yield* effect.pipe(
         Effect.provideService(callerWrites, updates),
+        Effect.provideService(SavedWrite.afterCommit, (confirm) => updates.push(confirm)),
         Effect.provideService(NodeSqliteClient.TransactionCommitObserver, () => {
           apply();
           parent?.();

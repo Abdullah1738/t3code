@@ -709,7 +709,9 @@ describe("Analytics", () => {
             tool: "task_status",
             saved,
             outcome: "notFoundReason" in props ? "error" : "ok",
-            ...("notFoundReason" in props ? { errorTag: "task_not_found" } : {}),
+            ...("notFoundReason" in props
+              ? { errorTag: "task_not_found", reasonClass: "not_found", invalidField: "taskId" }
+              : {}),
             props: { ...props, idShape: "task_id" },
           }),
         );
@@ -742,7 +744,9 @@ describe("Analytics", () => {
       const result = yield* analytics.read(input);
       assert.deepInclude(result.rollup.mcpCalls[0], {
         count: 11,
-        savedCounts: { unknown: 7, false: 1, true: 3 },
+        savedCounts: { unknown: 6, false: 1, true: 3, "n/a": 1 },
+        reasonClasses: { not_found: 4 },
+        invalidFields: { taskId: 4 },
         notFoundReasons: {
           non_canonical_id: 2,
           never_saved: 1,

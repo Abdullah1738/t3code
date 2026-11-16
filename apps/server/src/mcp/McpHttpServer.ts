@@ -509,7 +509,15 @@ const decodeAsAdvertised = <Tools extends Record<string, Tool.Any>>(
   // The clones keep each tool's id, name and decoded parameter type, so handlers still match.
   Toolkit.make(
     ...Object.values(toolkit.tools).map((tool) =>
-      tool.setParameters(Schema.toCodecJson(tool.parametersSchema)),
+      tool.setParameters(
+        Schema.toCodecJson(tool.parametersSchema).pipe(
+          // @effect-diagnostics-next-line anyUnknownInErrorContext:off - Tool.Any erases each codec's requirements at registration.
+          Schema.middlewareDecoding((decode) =>
+            // @effect-diagnostics-next-line anyUnknownInErrorContext:off - Preserve the erased requirements while observing failures.
+            decode.pipe(Effect.tapError(McpCallAnalytics.parameterFailure)),
+          ),
+        ),
+      ),
     ),
   ) as unknown as Toolkit.Toolkit<Tools>;
 
@@ -939,6 +947,16 @@ export const withFailureStructuredContent = (
   return result;
 };
 
+const inputKeyCache = new WeakMap<object, ReadonlySet<string>>();
+const inputKeysOf = (tool: McpSchema.Tool): ReadonlySet<string> => {
+  let keys = inputKeyCache.get(tool);
+  if (keys === undefined) {
+    keys = new Set(Object.keys(tool.inputSchema.properties ?? {}));
+    inputKeyCache.set(tool, keys);
+  }
+  return keys;
+};
+
 /**
  * Runs a tool registration against a server that records one anonymous
  * `mcp.tool.invoked` event per call: the tool, the calling agent's provider,
@@ -1109,7 +1127,13 @@ const withToolAnalytics =
                         delivery.value.callerThreadId = invocation.thread.threadId;
                     }
                     const initialReaderLane = yield* NodeSqliteClient.ReaderLane;
+                    const readOnly = Context.get(options.annotations, Tool.Readonly);
+                    const boardWrite =
+                      Object.hasOwn(KanbanToolkit.tools, options.tool.name) && !readOnly;
                     const callState: McpCallAnalytics.McpCall["Service"] = {
+                      readOnly,
+                      boardWrite,
+                      inputKeys: inputKeysOf(options.tool),
                       detachedAnalytics: {
                         tool: options.tool.name,
                         callerIdentity:
@@ -1158,7 +1182,7 @@ const withToolAnalytics =
                       callerReaderLane: initialReaderLane,
                       readerLane: initialReaderLane,
                       phase: "handler",
-                      saved: "unknown",
+                      saved: boardWrite ? false : "unknown",
                     };
                     if (callState.requestTiming !== undefined)
                       yield* Effect.annotateCurrentSpan({
@@ -1222,6 +1246,16 @@ const withToolAnalytics =
                     const row = Effect.fnUntraced(function* (
                       outcome: ReturnType<typeof McpCallAnalytics.callOutcome>,
                     ) {
+                      if (outcome.outcome !== "ok") {
+                        callState.reasonClass ??= "other";
+                        if (boardWrite)
+                          callState.refusedAt =
+                            outcome.saved === true
+                              ? "post_write"
+                              : callState.boardAdmitted
+                                ? "in_write"
+                                : "pre_lock";
+                      }
                       const ended = handlerEnded ?? (yield* Clock.monotonicTimeNanos);
                       const interrupted =
                         outcome.outcome === "interrupted" ||
@@ -1285,6 +1319,16 @@ const withToolAnalytics =
                         ...(callState.denyReason === undefined
                           ? {}
                           : { denyReason: callState.denyReason }),
+                        ...(callState.reasonClass === undefined
+                          ? {}
+                          : { reasonClass: callState.reasonClass }),
+                        ...(callState.invalidField === undefined ||
+                        !callState.inputKeys?.has(callState.invalidField)
+                          ? {}
+                          : { invalidField: callState.invalidField }),
+                        ...(outcome.outcome === "ok" || callState.refusedAt === undefined
+                          ? {}
+                          : { refusedAt: callState.refusedAt }),
                         ...(callState.replyStage === undefined
                           ? {}
                           : { replyStage: callState.replyStage }),
@@ -1330,7 +1374,9 @@ const withToolAnalytics =
                           ...(callState.cardNumber === undefined
                             ? {}
                             : { cardNumber: callState.cardNumber }),
-                          saved: outcome.saved ?? "unknown",
+                          ...(readOnly && callState.taskLookup === undefined
+                            ? {}
+                            : { saved: outcome.saved ?? "unknown" }),
                         },
                         ...(committed === undefined
                           ? {}
@@ -1358,7 +1404,14 @@ const withToolAnalytics =
                             ? {}
                             : { idShape: callState.taskLookup.idShape }),
                         },
-                        saved: callState.saved,
+                        ...(readOnly && callState.taskLookup === undefined
+                          ? {}
+                          : {
+                              saved:
+                                boardWrite && callState.saved === false
+                                  ? ("unknown" as const)
+                                  : callState.saved,
+                            }),
                         errorPhase: callState.phase,
                       }),
                     );
@@ -1571,7 +1624,7 @@ const withToolAnalytics =
                     return yield* measuredRead.pipe(
                       Effect.provideService(McpCallAnalytics.McpCall, callState),
                       Effect.provideService(SavedWrite.observer, (receipt) => {
-                        callState.saved = true;
+                        if (!boardWrite) callState.saved = true;
                         if (receipt.kind === "card" && callState.cardId === undefined) {
                           callState.boardId = receipt.card.boardId;
                           callState.cardId = receipt.card.id;
@@ -1581,7 +1634,8 @@ const withToolAnalytics =
                         parentSaved(receipt);
                       }),
                       Effect.provideService(SavedWrite.commitObserver, () => {
-                        if (callState.saved !== true) callState.saved = "unknown";
+                        // Board writes scope commit evidence to the incoming request in SavedWrite.
+                        if (!boardWrite && callState.saved !== true) callState.saved = "unknown";
                         parentCommitting();
                       }),
                       Effect.onExit((exit) => {
@@ -1661,7 +1715,9 @@ const withToolAnalytics =
                                 durationMs: Math.max(0, endedAt - startedAt),
                                 props: {
                                   ...outcome.props,
-                                  saved: outcome.saved ?? "unknown",
+                                  ...(readOnly && callState.taskLookup === undefined
+                                    ? {}
+                                    : { saved: outcome.saved ?? "unknown" }),
                                   ...(callState.boardId
                                     ? { boardId: callState.boardId }
                                     : identifiers.boardId
