@@ -1931,6 +1931,14 @@ describe("waitingOnBackground and reviewerQuietDue", () => {
     expect(waitingOnBackground(bg("running", 1), at(59))).toBe(false);
   });
 
+  it("uses the child's activity deadline, then releases a silent child at the ceiling", () => {
+    const active = { ...bg("idle", 1), backgroundWorkUntil: "2026-10-25T01:20:00.000Z" };
+    expect(waitingOnBackground(active, at(65))).toBe(true);
+    expect(waitingOnBackground(active, at(80))).toBe(false);
+    expect(waitingOnBackground({ ...active, backgroundWork: 0 }, at(65))).toBe(false);
+    expect(waitingOnBackground({ ...active, state: "running" }, at(65))).toBe(false);
+  });
+
   it("holds an idle thread with a PR watch for six hours only", () => {
     expect(PR_WATCH_GRACE_MS).toBe(6 * 60 * 60 * 1000);
     expect(waitingOnBackground(bg("idle", 0, 1), at(359))).toBe(true);

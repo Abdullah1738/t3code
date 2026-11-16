@@ -82,6 +82,7 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
   let slowSubSteps: ReadonlyArray<SavedWrite.SubStep> = [];
   let commitStarted = false;
   let receipt: SavedWrite.Saved | undefined;
+  let unverifiedReporter: SavedWrite.UnverifiedReporterReason | undefined;
   let reportLookup: SavedWrite.ReportLookup | undefined;
   // raceFirst joins cancellation before replying. Evaluator admissions and bug
   // sightings publish their receipt inside the masked write, including queue-only saves.
@@ -126,8 +127,11 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
               : tool === "report_bug" && reportLookup !== undefined
                 ? { lookup: reportLookup }
                 : {};
+    if (tool === "report_bug" && unverifiedReporter !== undefined) {
+      Object.assign(details, { callerVerified: false, callerUnverifiedReason: unverifiedReporter });
+    }
     const saved = savedState();
-    const message =
+    const savedMessage =
       saved === false
         ? tool === "evaluator_start"
           ? "Not saved; evaluator not started. Safe to retry with the same arguments."
@@ -161,6 +165,10 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
               : receipt === undefined
                 ? "Board write reply timed out; the write may have been saved. Read back with card_get (evaluator_start: check board threads) before retrying."
                 : "Saved; card_get for details.";
+    const message =
+      tool === "report_bug" && saved === true && unverifiedReporter !== undefined
+        ? `${savedMessage} Saved with an unverified caller; reporter unverified (${unverifiedReporter}).`
+        : savedMessage;
     const fields = attributes();
     return Effect.annotateCurrentSpan(fields).pipe(
       Effect.andThen(
@@ -242,6 +250,9 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
     Effect.provideService(SavedWrite.reportLookupObserver, (lookup) => {
       reportLookup = lookup;
       parentLookup(lookup);
+    }),
+    Effect.provideService(SavedWrite.reporterUnverified, (reason) => {
+      unverifiedReporter = reason;
     }),
     Effect.provideService(SavedWrite.commitObserver, () => {
       commitStarted = true;

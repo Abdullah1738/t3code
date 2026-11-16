@@ -57,8 +57,17 @@ export const wrap = (
     cardsByThread: (id) => thread(id, store.cardsByThread(id)),
     nextCardNumber: (id) => locks.access(id, store.nextCardNumber(id)),
     putCard: (row) => locks.access(row.boardId, store.putCard(row), true, `card:${row.id}`),
-    addCardEvent: (row, applicationId) =>
-      card(row.cardId, store.addCardEvent(row, applicationId), true),
+    updateCard: (row, before) =>
+      locks.access(before.boardId, store.updateCard(row, before), true, `card:${row.id}`),
+    addCardEvent: (row, applicationId, snapshot) =>
+      snapshot?.id === row.cardId
+        ? locks.access(
+            snapshot.boardId,
+            store.addCardEvent(row, applicationId, snapshot),
+            true,
+            `card:${row.cardId}`,
+          )
+        : card(row.cardId, store.addCardEvent(row, applicationId), true),
     pendingInstructionApplications: (cardId, boardId, field, askId) =>
       card(cardId, store.pendingInstructionApplications(cardId, boardId, field, askId)),
     cardEvents: (id) => card(id, store.cardEvents(id)),

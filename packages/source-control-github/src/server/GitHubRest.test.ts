@@ -1,4 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
+import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
+import { SpawnExecutableResolution } from "@t3tools/shared/shell";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -314,6 +316,7 @@ describe("GitHubCredentials", () => {
   const credentialsWith = (run: SourceControlHost.SourceControlHost["Service"]["process"]["run"]) =>
     GitHubCredentials.layer.pipe(
       Layer.provide(TestSourceControlHost.layer({ process: { run } })),
+      Layer.provide(NodeFileSystem.layer),
       Layer.provide(NodeCrypto.layer),
     );
 
@@ -323,6 +326,7 @@ describe("GitHubCredentials", () => {
       const error = yield* Effect.flip(credentials.get("git.acme.internal"));
       expect(error._tag).toBe("GitHubCliMissingError");
     }).pipe(
+      Effect.provideService(SpawnExecutableResolution, () => undefined),
       Effect.provide(
         credentialsWith(() =>
           Effect.fail(

@@ -24,6 +24,8 @@ import {
   RuntimeRequestId,
   NodeId,
   type OrchestrationV2Run,
+  type OrchestrationV2Subagent,
+  type OrchestrationV2ThreadShell,
   type OrchestrationV2RuntimeRequest,
   type OrchestrationV2ServerCommand,
   type OrchestrationV2TurnItem,
@@ -61,10 +63,11 @@ import {
   viewStateOf,
 } from "./threads.ts";
 
-import { liveThreadShell } from "../../../mcp/McpToolAccess.testkit.ts";
+import { idleThreadProjection, liveThreadShell } from "../../../mcp/McpToolAccess.testkit.ts";
 import * as Analytics from "../../analytics/Analytics.ts";
 import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
 import * as EvaluatorAnalytics from "./evaluatorAnalytics.ts";
+import { waitingOnBackground } from "./rules.ts";
 
 const at = (iso: string) => DateTime.makeUnsafe(iso);
 const QUESTION_AT = "2026-10-25T00:10:00.000Z";
@@ -320,6 +323,7 @@ describe("prWatchesOf", () => {
           ...(state === "current" ? { observedHeadSha: observed } : {}),
         };
         const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getThreadRecords: () => Effect.succeed({ subagents: [] } as never),
           getThreadShell: () =>
             Effect.succeed({
               ...shell({}),
@@ -2764,6 +2768,717 @@ it.effect("#1574 assignment queue preserves a busy run and replays once", () => 
     ),
   );
 });
+
+it.effect.each(["sql", "memory"] as const)(
+  "find holds live child progress and pending final-summary delivery (%s)",
+  (storage) =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const parentId = ThreadId.make("background-parent");
+      const childId = ThreadId.make("background-child");
+      const quiet = at("2026-11-15T00:00:00.000Z");
+      const progress = at("2026-11-15T01:10:00.000Z");
+      const finished = at("2026-11-15T01:12:00.000Z");
+      const parent = {
+        ...liveThreadShell(parentId, { activeRunId: null }),
+        status: "idle" as const,
+        activityRunStatus: null,
+        latestRunCompletedAt: quiet,
+        pendingBackgroundTasks: [
+          { taskId: "child-task", kind: "subagent" as const, childThreadId: childId },
+        ] as OrchestrationV2ThreadShell["pendingBackgroundTasks"],
+      };
+      for (const id of [parentId, childId])
+        yield* projections.apply({
+          id: EventId.make(`create:${id}`),
+          type: "thread.created",
+          threadId: id,
+          occurredAt: quiet,
+          payload: idleThreadProjection(liveThreadShell(id)).thread,
+        });
+      const childRun = {
+        id: RunId.make("child-run"),
+        threadId: childId,
+        ordinal: 1,
+        providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("claudeAgent"),
+          model: "claude-sonnet-5-5",
+        },
+        providerThreadId: null,
+        userMessageId: MessageId.make("child-input"),
+        rootNodeId: null,
+        activeAttemptId: null,
+        status: "running" as const,
+        requestedAt: quiet,
+        startedAt: quiet,
+        completedAt: null,
+        checkpointId: null,
+        contextHandoffId: null,
+        lastActivityAt: progress,
+      } satisfies OrchestrationV2Run;
+      yield* projections.apply({
+        id: EventId.make("child-start"),
+        type: "run.updated",
+        threadId: childId,
+        runId: childRun.id,
+        occurredAt: quiet,
+        payload: { ...childRun, lastActivityAt: quiet },
+      });
+      const task = {
+        id: NodeId.make("child-task"),
+        threadId: parentId,
+        runId: null,
+        parentNodeId: NodeId.make("parent-root"),
+        origin: "app_owned" as const,
+        createdBy: "agent" as const,
+        driver: ProviderDriverKind.make("claudeAgent"),
+        providerInstanceId: childRun.providerInstanceId,
+        providerThreadId: null,
+        childThreadId: childId,
+        nativeTaskRef: null,
+        prompt: "Watch the proof",
+        title: null,
+        model: "claude-sonnet-5-5",
+        status: "running" as const,
+        idleTimeoutMs: 15 * 60_000,
+        completionDelivery: { state: "pending" as const, observedByRunId: null },
+        result: null,
+        startedAt: quiet,
+        completedAt: null,
+        updatedAt: quiet,
+      } satisfies OrchestrationV2Subagent;
+      yield* projections.apply({
+        id: EventId.make("task-start"),
+        type: "subagent.updated",
+        threadId: parentId,
+        occurredAt: quiet,
+        payload: task,
+      });
+      const childShells = new Map<ThreadId, OrchestrationV2ThreadShell>([
+        [
+          childId,
+          {
+            ...parent,
+            id: childId,
+            activeRunId: childRun.id,
+            pendingBackgroundTasks: [],
+          },
+        ],
+      ]);
+      const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+        getThreadShell: (id) =>
+          Effect.succeed(id === parentId ? parent : (childShells.get(id) ?? null)),
+        getThreadRecords: (id, fields, filter) =>
+          projections.getThreadRecords(id, fields, filter).pipe(Effect.orDie),
+      });
+      yield* Effect.gen(function* () {
+        const threads = yield* KanbanThreads;
+        parent.pendingBackgroundTasks = [
+          ...parent.pendingBackgroundTasks!,
+          { taskId: "native-command", kind: "command" },
+        ];
+        const nativeHold = yield* threads.find(parentId);
+        expect(nativeHold?.backgroundWork).toBe(2);
+        expect(nativeHold?.backgroundWorkUntil).toBe("2026-11-15T01:00:00.000Z");
+        expect(waitingOnBackground(nativeHold!, Date.parse("2026-11-15T00:59:00Z"))).toBe(true);
+        expect(waitingOnBackground(nativeHold!, Date.parse("2026-11-15T01:00:00Z"))).toBe(false);
+        parent.pendingBackgroundTasks = parent.pendingBackgroundTasks?.filter(
+          (job) => job.taskId !== "native-command",
+        );
+        yield* projections.apply({
+          id: EventId.make("child-progress"),
+          type: "run.updated",
+          threadId: childId,
+          occurredAt: progress,
+          payload: childRun,
+        });
+        const live = yield* threads.find(parentId);
+        expect(live?.backgroundWork).toBe(1);
+        expect(live?.backgroundWorkUntil).toBe("2026-11-15T01:25:00.000Z");
+        expect(waitingOnBackground(live!, Date.parse("2026-11-15T01:15:00Z"))).toBe(true);
+        expect(waitingOnBackground(live!, Date.parse("2026-11-15T01:25:00Z"))).toBe(false);
+        parent.pendingBackgroundTasks = [
+          ...parent.pendingBackgroundTasks!,
+          { taskId: "native-command", kind: "command" },
+        ];
+        const mixed = yield* threads.find(parentId);
+        expect(mixed?.backgroundWork).toBe(2);
+        expect(mixed?.backgroundJobs?.map((job) => job.taskId)).toEqual([
+          "child-task",
+          "native-command",
+        ]);
+        expect(mixed?.backgroundWorkUntil).toBe("2026-11-15T01:25:00.000Z");
+        parent.pendingBackgroundTasks = parent.pendingBackgroundTasks?.filter(
+          (job) => job.taskId !== "native-command",
+        );
+        for (const [index, idleTimeoutMs, expected] of [
+          [0, undefined, "2026-11-15T02:10:00.000Z"],
+          [1, 0, "2026-11-15T02:10:00.000Z"],
+          [2, 1, "2026-11-15T01:11:00.000Z"],
+          [3, 3 * 60 * 60_000, "2026-11-15T03:10:00.000Z"],
+        ] as const) {
+          yield* projections.apply({
+            id: EventId.make(`timeout:${index}`),
+            type: "subagent.updated",
+            threadId: parentId,
+            occurredAt: quiet,
+            payload: { ...task, idleTimeoutMs },
+          });
+          expect((yield* threads.find(parentId))?.backgroundWorkUntil).toBe(expected);
+        }
+        yield* projections.apply({
+          id: EventId.make("task:queued-followup-timeout"),
+          type: "subagent.updated",
+          threadId: parentId,
+          occurredAt: quiet,
+          payload: task,
+        });
+        for (const ordinal of [2, 3]) {
+          const queuedAt = at(`2026-11-15T00:0${ordinal - 1}:00Z`);
+          yield* projections.apply({
+            id: EventId.make(`child:queue:${ordinal}`),
+            type: "run.updated",
+            threadId: childId,
+            occurredAt: queuedAt,
+            payload: {
+              ...childRun,
+              id: RunId.make(`child-queued:${ordinal}`),
+              ordinal,
+              status: "queued",
+              requestedAt: queuedAt,
+              startedAt: null,
+              lastActivityAt: undefined,
+            },
+          });
+          const queued = yield* threads.find(parentId);
+          expect(queued?.backgroundWorkUntil).toBe("2026-11-15T01:25:00.000Z");
+          expect(waitingOnBackground(queued!, Date.parse("2026-11-15T01:20:00Z"))).toBe(true);
+        }
+        yield* projections.apply({
+          id: EventId.make("child:active-progress-with-queue"),
+          type: "run.updated",
+          threadId: childId,
+          occurredAt: at("2026-11-15T01:19:00Z"),
+          payload: { ...childRun, lastActivityAt: at("2026-11-15T01:19:00Z") },
+        });
+        const activeWithQueue = yield* threads.find(parentId);
+        expect(activeWithQueue?.backgroundWorkUntil).toBe("2026-11-15T01:34:00.000Z");
+        expect(waitingOnBackground(activeWithQueue!, Date.parse("2026-11-15T01:26:00Z"))).toBe(
+          true,
+        );
+        expect(waitingOnBackground(activeWithQueue!, Date.parse("2026-11-15T01:34:00Z"))).toBe(
+          false,
+        );
+        const idleChildId = ThreadId.make("idle-child-waiting-for-watcher");
+        task.childThreadId = idleChildId;
+        const idleChildShell = {
+          ...parent,
+          id: idleChildId,
+          pendingBackgroundTasks: [] as OrchestrationV2ThreadShell["pendingBackgroundTasks"],
+        };
+        childShells.set(idleChildId, idleChildShell);
+        yield* projections.apply({
+          id: EventId.make("idle-child:create"),
+          type: "thread.created",
+          threadId: idleChildId,
+          occurredAt: quiet,
+          payload: idleThreadProjection(liveThreadShell(idleChildId)).thread,
+        });
+        const watcherId = ThreadId.make("background-watcher-grandchild");
+        childShells.set(watcherId, { ...parent, id: watcherId, pendingBackgroundTasks: [] });
+        yield* projections.apply({
+          id: EventId.make("watcher:create"),
+          type: "thread.created",
+          threadId: watcherId,
+          occurredAt: quiet,
+          payload: idleThreadProjection(liveThreadShell(watcherId)).thread,
+        });
+        yield* projections.apply({
+          id: EventId.make("child:waiting-for-watcher"),
+          type: "run.updated",
+          threadId: idleChildId,
+          runId: RunId.make("idle-child-run"),
+          occurredAt: quiet,
+          payload: {
+            ...childRun,
+            id: RunId.make("idle-child-run"),
+            threadId: idleChildId,
+            status: "completed",
+            completedAt: quiet,
+            lastActivityAt: quiet,
+          },
+        });
+        yield* projections.apply({
+          id: EventId.make("task:waiting-for-watcher"),
+          type: "subagent.updated",
+          threadId: parentId,
+          occurredAt: quiet,
+          payload: { ...task, status: "waiting" },
+        });
+        const watcherTask = {
+          ...task,
+          id: NodeId.make("watcher-task"),
+          threadId: idleChildId,
+          childThreadId: watcherId,
+        };
+        yield* projections.apply({
+          id: EventId.make("watcher:task"),
+          type: "subagent.updated",
+          threadId: idleChildId,
+          occurredAt: quiet,
+          payload: watcherTask,
+        });
+        const watcherRun = { ...childRun, id: RunId.make("watcher-run"), threadId: watcherId };
+        yield* projections.apply({
+          id: EventId.make("watcher:progress"),
+          type: "run.updated",
+          threadId: watcherId,
+          runId: watcherRun.id,
+          occurredAt: progress,
+          payload: watcherRun,
+        });
+        const nested = yield* threads.find(parentId);
+        expect(nested?.backgroundWorkUntil).toBe("2026-11-15T01:25:00.000Z");
+        expect(waitingOnBackground(nested!, Date.parse("2026-11-15T01:15:00Z"))).toBe(true);
+        expect(waitingOnBackground(nested!, Date.parse("2026-11-15T01:25:00Z"))).toBe(false);
+        yield* projections.apply({
+          id: EventId.make("watcher:more-progress"),
+          type: "run.updated",
+          threadId: watcherId,
+          runId: watcherRun.id,
+          occurredAt: at("2026-11-15T01:20:00Z"),
+          payload: { ...watcherRun, lastActivityAt: at("2026-11-15T01:20:00Z") },
+        });
+        const renewed = yield* threads.find(parentId);
+        expect(renewed?.backgroundWorkUntil).toBe("2026-11-15T01:35:00.000Z");
+        expect(waitingOnBackground(renewed!, Date.parse("2026-11-15T01:26:00Z"))).toBe(true);
+        expect(waitingOnBackground(renewed!, Date.parse("2026-11-15T01:35:00Z"))).toBe(false);
+        for (const [index, ancestorMinutes, descendantMinutes, expected] of [
+          [0, 15, 120, "2026-11-15T03:20:00.000Z"],
+          [1, 120, 15, "2026-11-15T02:00:00.000Z"],
+          [2, 1, undefined, "2026-11-15T02:20:00.000Z"],
+          [3, undefined, 1, "2026-11-15T01:21:00.000Z"],
+        ] as const) {
+          yield* projections.apply({
+            id: EventId.make(`ancestor-timeout:${index}`),
+            type: "subagent.updated",
+            threadId: parentId,
+            occurredAt: quiet,
+            payload: {
+              ...task,
+              status: "waiting",
+              idleTimeoutMs: ancestorMinutes === undefined ? undefined : ancestorMinutes * 60_000,
+            },
+          });
+          yield* projections.apply({
+            id: EventId.make(`descendant-timeout:${index}`),
+            type: "subagent.updated",
+            threadId: idleChildId,
+            occurredAt: quiet,
+            payload: {
+              ...watcherTask,
+              idleTimeoutMs:
+                descendantMinutes === undefined ? undefined : descendantMinutes * 60_000,
+            },
+          });
+          const bounded = yield* threads.find(parentId);
+          expect(bounded?.backgroundWorkUntil).toBe(expected);
+          expect(waitingOnBackground(bounded!, Date.parse(expected) - 1)).toBe(true);
+          expect(waitingOnBackground(bounded!, Date.parse(expected))).toBe(false);
+        }
+        for (const state of [
+          "pending",
+          "claimed",
+          "acknowledged",
+          "delivered",
+          "disposed",
+        ] as const) {
+          yield* projections.apply({
+            id: EventId.make(`watcher-delivery:${state}`),
+            type: "subagent.updated",
+            threadId: idleChildId,
+            occurredAt: finished,
+            payload: {
+              ...watcherTask,
+              status: "completed",
+              result: "FINAL watcher proof passed: exit 0",
+              completedAt: finished,
+              updatedAt: finished,
+              completionDelivery: { state, observedByRunId: null },
+            },
+          });
+          const delivery = yield* threads.find(parentId);
+          expect(delivery?.backgroundWorkUntil).toBe(
+            state === "pending" || state === "claimed"
+              ? "2026-11-15T02:12:00.000Z"
+              : "2026-11-15T01:00:00.000Z",
+          );
+          expect(waitingOnBackground(delivery!, Date.parse("2026-11-15T01:30:00Z"))).toBe(
+            state === "pending" || state === "claimed",
+          );
+          expect(waitingOnBackground(delivery!, Date.parse("2026-11-15T02:12:00Z"))).toBe(false);
+        }
+        // The shell no longer has a live item; the persisted delivery is now the hold.
+        parent.pendingBackgroundTasks = [];
+        const final = {
+          ...task,
+          status: "completed" as const,
+          result: "FINAL proof passed: exit 0",
+          updatedAt: finished,
+          completedAt: finished,
+          completionDelivery: { state: "pending" as const, observedByRunId: null },
+        };
+        yield* projections.apply({
+          id: EventId.make("task-final"),
+          type: "subagent.updated",
+          threadId: parentId,
+          occurredAt: finished,
+          payload: final,
+        });
+        const pending = yield* threads.find(parentId);
+        expect(pending?.backgroundWork).toBe(1);
+        expect(pending?.backgroundWorkUntil).toBe("2026-11-15T02:12:00.000Z");
+        expect(waitingOnBackground(pending!, Date.parse("2026-11-15T01:30:00Z"))).toBe(true);
+        expect(waitingOnBackground(pending!, Date.parse("2026-11-15T02:12:00Z"))).toBe(false);
+        const records = yield* projections.getThreadRecords(parentId, ["subagents"], {
+          pendingBackgroundTasksOnly: true,
+        });
+        expect(records.subagents[0]?.result).toBe("FINAL proof passed: exit 0");
+        yield* projections.apply({
+          id: EventId.make("task:without-child-thread"),
+          type: "subagent.updated",
+          threadId: parentId,
+          occurredAt: finished,
+          payload: { ...final, childThreadId: null },
+        });
+        expect(
+          (yield* projections.getThreadRecords(parentId, ["subagents"], {
+            pendingBackgroundTasksOnly: true,
+          })).subagents,
+        ).toHaveLength(1);
+        expect(
+          (yield* projections.getThreadRecords(parentId, ["subagents"], {
+            pendingBackgroundTasksOnly: true,
+            subagentsWithChildThreadOnly: true,
+          })).subagents,
+        ).toEqual([]);
+        yield* projections.apply({
+          id: EventId.make("task:restore-child-thread"),
+          type: "subagent.updated",
+          threadId: parentId,
+          occurredAt: finished,
+          payload: final,
+        });
+        for (const state of ["claimed", "acknowledged", "delivered", "disposed"] as const) {
+          yield* projections.apply({
+            id: EventId.make(`task:${state}`),
+            type: "subagent.updated",
+            threadId: parentId,
+            occurredAt: finished,
+            payload: { ...final, completionDelivery: { state, observedByRunId: null } },
+          });
+          const delivery = yield* threads.find(parentId);
+          expect(delivery?.backgroundWork).toBe(state === "claimed" ? 1 : 0);
+          expect(waitingOnBackground(delivery!, Date.parse("2026-11-15T02:12:00Z"))).toBe(false);
+        }
+        yield* projections.apply({
+          id: EventId.make("watcher:still-running"),
+          type: "subagent.updated",
+          threadId: idleChildId,
+          occurredAt: finished,
+          payload: watcherTask,
+        });
+        idleChildShell.pendingBackgroundTasks = [
+          { taskId: "watcher-task", kind: "subagent", childThreadId: watcherId },
+        ];
+        for (const status of ["completed", "failed", "cancelled", "interrupted"] as const) {
+          for (const state of ["acknowledged", "delivered"] as const) {
+            yield* projections.apply({
+              id: EventId.make(`terminal-with-watcher:${status}:${state}`),
+              type: "subagent.updated",
+              threadId: parentId,
+              occurredAt: finished,
+              payload: { ...final, status, completionDelivery: { state, observedByRunId: null } },
+            });
+            const inherited = yield* threads.find(parentId);
+            expect(inherited?.backgroundWork).toBe(1);
+            expect(inherited?.backgroundWorkUntil).toBe("2026-11-15T01:35:00.000Z");
+            expect(waitingOnBackground(inherited!, Date.parse("2026-11-15T01:30:00Z"))).toBe(true);
+            expect(waitingOnBackground(inherited!, Date.parse("2026-11-15T01:35:00Z"))).toBe(false);
+          }
+        }
+        const resumedRun = {
+          ...childRun,
+          id: RunId.make("completion-wake-with-live-sibling"),
+          threadId: idleChildId,
+          ordinal: 2,
+          lastActivityAt: quiet,
+        };
+        yield* projections.apply({
+          id: EventId.make("child:completion-wake-with-live-sibling"),
+          type: "run.updated",
+          threadId: idleChildId,
+          occurredAt: quiet,
+          payload: resumedRun,
+        });
+        childShells.set(idleChildId, {
+          ...idleChildShell,
+          activeRunId: resumedRun.id,
+          status: "running",
+          activityRunStatus: "running",
+          pendingBackgroundTasks: [],
+        });
+        for (const state of ["acknowledged", "delivered", "disposed"] as const) {
+          yield* projections.apply({
+            id: EventId.make(`finished-sibling:${state}`),
+            type: "subagent.updated",
+            threadId: idleChildId,
+            occurredAt: finished,
+            payload: {
+              ...watcherTask,
+              id: NodeId.make("finished-sibling"),
+              childThreadId: null,
+              status: "completed",
+              completedAt: finished,
+              completionDelivery: { state, observedByRunId: resumedRun.id },
+              result: "FINAL sibling passed",
+            },
+          });
+          for (const status of ["pending", "running", "waiting"] as const) {
+            yield* projections.apply({
+              id: EventId.make(`resumed-child:${state}:watcher:${status}`),
+              type: "subagent.updated",
+              threadId: idleChildId,
+              occurredAt: finished,
+              payload: { ...watcherTask, status },
+            });
+            const resumed = yield* threads.find(parentId);
+            expect(resumed?.backgroundWork).toBe(1);
+            expect(resumed?.backgroundWorkUntil).toBe("2026-11-15T01:35:00.000Z");
+            expect(waitingOnBackground(resumed!, Date.parse("2026-11-15T01:30:00Z"))).toBe(true);
+            expect(waitingOnBackground(resumed!, Date.parse("2026-11-15T01:35:00Z"))).toBe(false);
+          }
+        }
+        yield* projections.apply({
+          id: EventId.make("watcher:before-terminal-chain"),
+          type: "subagent.updated",
+          threadId: idleChildId,
+          occurredAt: finished,
+          payload: {
+            ...watcherTask,
+            status: "completed",
+            completedAt: finished,
+            completionDelivery: { state: "acknowledged", observedByRunId: null },
+          },
+        });
+        expect((yield* threads.find(parentId))?.backgroundWork).toBe(0);
+        childShells.set(idleChildId, idleChildShell);
+        idleChildShell.pendingBackgroundTasks = [];
+        for (const depth of [2, 3]) {
+          const ancestorIds = [idleChildId];
+          for (let level = 1; level < depth; level++) {
+            const id = ThreadId.make(`terminal-chain:${depth}:${level}`);
+            ancestorIds.push(id);
+            childShells.set(id, { ...parent, id, pendingBackgroundTasks: [] });
+            yield* projections.apply({
+              id: EventId.make(`create:${id}`),
+              type: "thread.created",
+              threadId: id,
+              occurredAt: quiet,
+              payload: idleThreadProjection(liveThreadShell(id)).thread,
+            });
+          }
+          const links = ancestorIds.map((id, level) => ({
+            ...watcherTask,
+            id: NodeId.make(`chain-task:${depth}:${level}`),
+            threadId: id,
+            childThreadId: ancestorIds[level + 1] ?? watcherId,
+          }));
+          const leaf = links.at(-1)!;
+          childShells.set(leaf.threadId, {
+            ...childShells.get(leaf.threadId)!,
+            pendingBackgroundTasks: [
+              { taskId: leaf.id, kind: "subagent", childThreadId: watcherId },
+            ],
+          });
+          yield* projections.apply({
+            id: EventId.make(`chain:${depth}:watcher`),
+            type: "subagent.updated",
+            threadId: leaf.threadId,
+            occurredAt: quiet,
+            payload: leaf,
+          });
+          for (const status of ["completed", "failed", "cancelled", "interrupted"] as const) {
+            for (const state of ["acknowledged", "delivered", "disposed"] as const) {
+              for (const link of links.slice(0, -1))
+                yield* projections.apply({
+                  id: EventId.make(`chain:${link.id}:${status}:${state}`),
+                  type: "subagent.updated",
+                  threadId: link.threadId,
+                  occurredAt: finished,
+                  payload: {
+                    ...link,
+                    status,
+                    completedAt: finished,
+                    completionDelivery: { state, observedByRunId: null },
+                  },
+                });
+              const inherited = yield* threads.find(parentId);
+              expect(inherited?.backgroundWork).toBe(1);
+              expect(inherited?.backgroundWorkUntil).toBe("2026-11-15T01:35:00.000Z");
+              expect(waitingOnBackground(inherited!, Date.parse("2026-11-15T01:30:00Z"))).toBe(
+                true,
+              );
+              expect(waitingOnBackground(inherited!, Date.parse("2026-11-15T01:35:00Z"))).toBe(
+                false,
+              );
+            }
+          }
+          childShells.set(leaf.threadId, {
+            ...childShells.get(leaf.threadId)!,
+            pendingBackgroundTasks: [],
+          });
+          for (const state of [
+            "pending",
+            "claimed",
+            "acknowledged",
+            "delivered",
+            "disposed",
+          ] as const) {
+            yield* projections.apply({
+              id: EventId.make(`chain:${depth}:delivery:${state}`),
+              type: "subagent.updated",
+              threadId: leaf.threadId,
+              occurredAt: finished,
+              payload: {
+                ...leaf,
+                status: "completed",
+                completedAt: finished,
+                updatedAt: finished,
+                completionDelivery: { state, observedByRunId: null },
+              },
+            });
+            const delivery = yield* threads.find(parentId);
+            const owed = state === "pending" || state === "claimed";
+            expect(delivery?.backgroundWork).toBe(owed ? 1 : 0);
+            expect(waitingOnBackground(delivery!, Date.parse("2026-11-15T01:30:00Z"))).toBe(owed);
+            expect(waitingOnBackground(delivery!, Date.parse("2026-11-15T02:12:00Z"))).toBe(false);
+          }
+        }
+        yield* projections.apply({
+          id: EventId.make("terminal-cycle"),
+          type: "subagent.updated",
+          threadId: idleChildId,
+          occurredAt: finished,
+          payload: {
+            ...final,
+            id: NodeId.make("terminal-cycle"),
+            threadId: idleChildId,
+            childThreadId: idleChildId,
+            completionDelivery: { state: "acknowledged", observedByRunId: null },
+          },
+        });
+        expect((yield* threads.find(parentId))?.backgroundWork).toBe(0);
+        yield* projections.apply({
+          id: EventId.make("watcher:after-terminal-chain"),
+          type: "subagent.updated",
+          threadId: idleChildId,
+          occurredAt: finished,
+          payload: watcherTask,
+        });
+        idleChildShell.pendingBackgroundTasks = [
+          { taskId: "pull-request-watch:only", kind: "monitor" },
+        ];
+        expect((yield* threads.find(parentId))?.backgroundWork).toBe(0);
+        yield* projections.apply({
+          id: EventId.make("watcher:finally-delivered"),
+          type: "subagent.updated",
+          threadId: idleChildId,
+          occurredAt: finished,
+          payload: {
+            ...watcherTask,
+            status: "completed",
+            result: "FINAL proof passed",
+            completedAt: finished,
+            completionDelivery: { state: "delivered", observedByRunId: null },
+          },
+        });
+        idleChildShell.pendingBackgroundTasks = [];
+        expect((yield* threads.find(parentId))?.backgroundWork).toBe(0);
+        const backgroundTool = {
+          id: TurnItemId.make("child-background-shell"),
+          threadId: idleChildId,
+          runId: resumedRun.id,
+          nodeId: null,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal: 1,
+          type: "dynamic_tool" as const,
+          status: "running" as const,
+          title: null,
+          startedAt: progress,
+          completedAt: null,
+          updatedAt: progress,
+          toolName: "background-shell",
+          input: { persistent: true },
+        };
+        yield* projections.apply({
+          id: EventId.make("child:background-shell"),
+          type: "turn-item.updated",
+          threadId: idleChildId,
+          occurredAt: progress,
+          payload: backgroundTool,
+        });
+        yield* projections.apply({
+          id: EventId.make("child:shell-progress"),
+          type: "run.updated",
+          threadId: idleChildId,
+          runId: resumedRun.id,
+          occurredAt: progress,
+          payload: {
+            ...resumedRun,
+            status: "completed",
+            completedAt: quiet,
+            lastActivityAt: progress,
+          },
+        });
+        idleChildShell.pendingBackgroundTasks = [
+          { taskId: "child-background-shell", kind: "background_task" },
+        ];
+        const shellWait = yield* threads.find(parentId);
+        expect(shellWait?.backgroundWork).toBe(1);
+        expect(shellWait?.backgroundWorkUntil).toBe("2026-11-15T02:10:00.000Z");
+        expect(waitingOnBackground(shellWait!, Date.parse("2026-11-15T01:30:00Z"))).toBe(true);
+        expect(waitingOnBackground(shellWait!, Date.parse("2026-11-15T02:10:00Z"))).toBe(false);
+        yield* projections.apply({
+          id: EventId.make("child:shell-finished"),
+          type: "turn-item.updated",
+          threadId: idleChildId,
+          occurredAt: finished,
+          payload: { ...backgroundTool, status: "completed", completedAt: finished },
+        });
+        idleChildShell.pendingBackgroundTasks = [];
+        expect((yield* threads.find(parentId))?.backgroundWork).toBe(0);
+      }).pipe(
+        Effect.provide(
+          layer.pipe(
+            Layer.provide(management),
+            Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+            Layer.provide(Sqlite.layerMemory),
+          ),
+        ),
+      );
+    }).pipe(
+      Effect.provide(
+        storage === "sql"
+          ? ProjectionStore.layer.pipe(Layer.provide(Sqlite.layerMemory))
+          : ProjectionStore.layerMemory,
+      ),
+    ),
+);
 
 it.effect.each([
   "missing",

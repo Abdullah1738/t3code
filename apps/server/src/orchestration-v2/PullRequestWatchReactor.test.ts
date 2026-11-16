@@ -18,6 +18,7 @@ import * as Layer from "effect/Layer";
 import * as TestClock from "effect/testing/TestClock";
 import { PullRequestProviderError } from "@t3tools/source-control-core/server/PullRequestProvider";
 
+import { pullRequestWatchStopMessage } from "./pullRequestWatch.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import { makeSweepFixture } from "../pullRequest/testkit/sweepFixture.ts";
 import * as Orchestrator from "./Orchestrator.ts";
@@ -411,6 +412,7 @@ it.effect.each([
     assert.isNull(commands[0]!.watch);
     assert.include(commands[0]!.wake?.text ?? "", reason);
     assert.notInclude(commands[0]!.wake?.text ?? "", "8 times");
+    assert.notInclude(commands[0]!.wake?.text ?? "", "watch_pull_request");
     yield* reactor.sweep;
     assert.strictEqual(commands.length, 1);
   }),
@@ -430,13 +432,14 @@ const missingToolErrors = [
   }),
 ];
 
-it.effect.each(missingToolErrors)("retries a persistent missing tool with backoff: %s", (error) =>
+it.effect.each(missingToolErrors)("retries a later missing tool with backoff: %s", (error) =>
   Effect.gen(function* () {
+    let missing = false;
     let reads = 0;
     const harness = yield* makeHarness({
       detail: () => {
         reads++;
-        return Effect.fail(error);
+        return missing ? Effect.fail(error) : Effect.succeed(greenDetail());
       },
       activity: () =>
         Effect.succeed({
@@ -450,24 +453,36 @@ it.effect.each(missingToolErrors)("retries a persistent missing tool with backof
     yield* harness.reactor.sweep;
     assert.equal(reads, 1);
     assert.isDefined(harness.watch());
-    yield* harness.reactor.sweep;
-    assert.equal(reads, 1);
-    yield* TestClock.adjust("1 minute");
-    yield* harness.reactor.sweep;
-    assert.equal(reads, 2);
-    yield* TestClock.adjust("1 minute");
+    missing = true;
+    yield* TestClock.adjust("10 minutes");
     yield* harness.reactor.sweep;
     assert.equal(reads, 2);
     assert.isDefined(harness.watch());
+    yield* harness.reactor.sweep;
+    assert.equal(reads, 2);
     yield* TestClock.adjust("1 minute");
     yield* harness.reactor.sweep;
     assert.equal(reads, 3);
+    yield* TestClock.adjust("1 minute");
+    yield* harness.reactor.sweep;
+    assert.equal(reads, 3);
+    assert.isDefined(harness.watch());
+    yield* TestClock.adjust("1 minute");
+    yield* harness.reactor.sweep;
+    assert.equal(reads, 4);
     assert.isUndefined(harness.watch());
     assert.include(harness.commands.at(-1)?.wake?.text ?? "", "3 consecutive unsuccessful reads");
     assert.include(
       harness.commands.at(-1)?.wake?.text ?? "",
-      "Server PATH: /test/server/bin:/usr/bin",
+      "Server PATH: /test/server/bin:/usr/bin.",
     );
+    if (error._tag === "PullRequestUnavailableError") {
+      assert.include(
+        harness.commands.at(-1)?.wake?.text ?? "",
+        "Watching again won't help until server access is fixed.",
+      );
+      assert.notInclude(harness.commands.at(-1)?.wake?.text ?? "", "watch_pull_request");
+    }
   }),
 );
 
@@ -532,12 +547,89 @@ it.effect("gives a newly registered watch a fresh missing-tool retry budget", ()
   }),
 );
 
-it.effect("retries transient host failures eight times and reports the last error", () =>
+it.effect.each(["cli-missing", "failed"] as const)(
+  "survives one %s tool failure, resets on recovery, and stops at its consecutive failure limit",
+  (reason) =>
+    Effect.gen(function* () {
+      let failing = true;
+      const failure =
+        reason === "cli-missing"
+          ? new PullRequestUnavailableError({ reason })
+          : new PullRequestOperationError({
+              operation: "detail",
+              detail: "The GitHub CLI could not hand over a credential",
+              cause: new PullRequestProviderError({
+                provider: SourceControlProviderKind.make("github"),
+                operation: "detail",
+                reason: "failed",
+                detail: "The GitHub CLI could not hand over a credential",
+              }),
+            });
+      const harness = yield* makeHarness({
+        detail: () => (failing ? Effect.fail(failure) : Effect.succeed(greenDetail())),
+        activity: () =>
+          Effect.succeed({
+            comments: [],
+            reviewThreads: [],
+            commits: [],
+            commentCount: 0,
+            commentsTruncated: false,
+          }),
+      });
+      yield* harness.reactor.sweep;
+      assert.isDefined(harness.watch());
+      assert.deepStrictEqual(harness.commands, []);
+      failing = false;
+      yield* TestClock.adjust("2 minutes");
+      yield* harness.reactor.sweep;
+      assert.isDefined(harness.watch());
+      failing = true;
+      const limit = reason === "cli-missing" ? 3 : 8;
+      for (let attempt = 0; attempt < limit - 1; attempt++) {
+        yield* TestClock.adjust("2 minutes");
+        yield* harness.reactor.sweep;
+        assert.isDefined(harness.watch());
+      }
+      yield* TestClock.adjust("2 minutes");
+      yield* harness.reactor.sweep;
+      assert.isUndefined(harness.watch());
+      const stopped = harness.commands.filter((command) => command.watch === null);
+      assert.lengthOf(stopped, 1);
+      assert.include(stopped[0]!.wake?.text ?? "", `${limit} consecutive unsuccessful reads`);
+      if (reason === "cli-missing") {
+        assert.notInclude(stopped[0]!.wake?.text ?? "", "watch_pull_request");
+        assert.include(stopped[0]!.wake?.text ?? "", "Server PATH:");
+        assert.include(
+          stopped[0]!.wake?.text ?? "",
+          "Watching again won't help until server access is fixed.",
+        );
+      } else {
+        assert.include(stopped[0]!.wake?.text ?? "", "watch_pull_request");
+      }
+    }),
+);
+
+it.effect.each([
+  { provider: null, detail: "Host unreachable: connection timed out" },
+  { provider: "github", detail: "Host unreachable: connection timed out" },
+  { provider: "github", detail: "GitHub returned HTTP 503" },
+  { provider: "forgejo", detail: "Forgejo returned HTTP 502" },
+])("retries $provider host failures eight times: $detail", ({ provider, detail }) =>
   Effect.gen(function* () {
     const { reactor, commands } = yield* makeFailureHarness(
       new PullRequestOperationError({
         operation: "detail",
-        detail: "Host unreachable: connection timed out",
+        detail,
+        ...(provider === null
+          ? {}
+          : {
+              cause: new PullRequestProviderError({
+                provider: SourceControlProviderKind.make(provider),
+                operation: "detail",
+                reason: "failed",
+                detail,
+              }),
+            }),
       }),
     );
     for (let attempt = 0; attempt < 7; attempt++) yield* reactor.sweep;
@@ -545,8 +637,8 @@ it.effect("retries transient host failures eight times and reports the last erro
     yield* reactor.sweep;
     assert.strictEqual(commands.length, 1);
     assert.isNull(commands[0]!.watch);
-    assert.include(commands[0]!.wake?.text ?? "", "8");
-    assert.include(commands[0]!.wake?.text ?? "", "Host unreachable: connection timed out");
+    assert.include(commands[0]!.wake?.text ?? "", "8 consecutive unsuccessful reads");
+    assert.include(commands[0]!.wake?.text ?? "", detail);
   }),
 );
 
@@ -848,3 +940,65 @@ it.effect("measures project listing and identity spawns across watch sweeps", ()
     assert.strictEqual(commands.length, 40);
   }),
 );
+
+it.each(["cli-missing", "cli-unauthenticated", "provider-unsupported"] as const)(
+  "unavailable stop text does not invite re-watching: %s",
+  (reason) => {
+    const error = new PullRequestUnavailableError({
+      reason,
+      provider: SourceControlProviderKind.make("forgejo"),
+    });
+    const text = pullRequestWatchStopMessage(
+      { host: "forgejo.example", number: 9, url: "https://forgejo.example/o/r/pulls/9" },
+      1,
+      error,
+      undefined,
+      "/test/server/bin:/usr/bin",
+    );
+    assert.include(text, `The server can't read pull requests on forgejo.example (${reason}).`);
+    assert.include(text, error.message);
+    assert.include(text, "Watching again won't help until server access is fixed.");
+    assert.include(text, "Check the PR with your own tools instead.");
+    assert.notInclude(text, "watch_pull_request");
+    assert.strictEqual(text.includes("Server PATH:"), reason === "cli-missing");
+  },
+);
+
+it.each(
+  missingToolErrors.flatMap((error) =>
+    [
+      { serverPath: "/opt/homebrew/bin:/usr/bin", expected: "/opt/homebrew/bin:/usr/bin" },
+      {
+        serverPath: "C:\\tools;C:\\Windows\\System32",
+        expected: "C:\\tools;C:\\Windows\\System32",
+      },
+      { serverPath: "", expected: "(unset)" },
+      { serverPath: undefined, expected: "(unset)" },
+    ].map((path) => ({ error, ...path })),
+  ),
+)(
+  "missing-tool stop text includes PATH ($error._tag, $serverPath)",
+  ({ error, serverPath, expected }) => {
+    const text = pullRequestWatchStopMessage(
+      { host: "forgejo.example", number: 9, url: "https://forgejo.example/o/r/pulls/9" },
+      3,
+      error,
+      undefined,
+      serverPath,
+    );
+    assert.isTrue(text.endsWith(` Server PATH: ${expected}.`));
+  },
+);
+
+it("transient stop text keeps the eight-read retry advice", () => {
+  assert.strictEqual(
+    pullRequestWatchStopMessage(
+      { host: "github.com", number: 9, url: "https://github.com/o/r/pull/9" },
+      8,
+      new PullRequestOperationError({ operation: "detail", detail: "Rate limited" }),
+      "Still delayed.",
+      "/test/server/bin:/usr/bin",
+    ),
+    "T3 Code stopped watching pull request #9 (https://github.com/o/r/pull/9) after 8 consecutive unsuccessful reads. Still delayed. Last error: Pull request operation detail failed: Rate limited Check it yourself, and call watch_pull_request to watch it again.",
+  );
+});

@@ -38,8 +38,10 @@ import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import {
   evaluatePullRequestWatch,
+  isMissingTool,
   pullRequestChecksSettling,
   pullRequestWatchMessage,
+  pullRequestWatchStopMessage,
 } from "./pullRequestWatch.ts";
 
 /**
@@ -62,13 +64,6 @@ const QUIET_REREAD_MS = 10 * 60_000;
 const FINGERPRINT_REREAD_MS = 30 * 60_000;
 
 const isProviderError = Schema.is(PullRequestProviderError);
-
-const isMissingTool = (error: PullRequestService.PullRequestError) =>
-  error._tag === "PullRequestUnavailableError"
-    ? error.reason === "cli-missing"
-    : error._tag === "PullRequestOperationError" &&
-      isProviderError(error.cause) &&
-      error.cause.reason === "missing-tool";
 
 const isRateLimited = (cause: Cause.Cause<PullRequestService.PullRequestError>) =>
   Option.match(Cause.findErrorOption(cause), {
@@ -323,14 +318,13 @@ export const make = Effect.gen(function* () {
     reason?: string,
   ) =>
     record(target, null, {
-      text: `T3 Code stopped watching pull request #${target.link.number} (${target.link.url}) after ${failures} consecutive unsuccessful ${failures === 1 ? "read" : "reads"}.${reason ? ` ${reason}` : ""}${Option.match(
-        error,
-        {
-          onNone: () => "",
-          onSome: (failure) =>
-            ` Last error: ${failure.message}${failure._tag === "PullRequestUnavailableError" ? ` (${failure.reason})` : ""}`,
-        },
-      )}${Option.isSome(error) && isMissingTool(error.value) ? ` Server PATH: ${serverEnv.PATH ?? "(unset)"}.` : ""} Check it yourself, and call watch_pull_request to watch it again.`,
+      text: pullRequestWatchStopMessage(
+        target.link,
+        failures,
+        Option.getOrUndefined(error),
+        reason,
+        Option.isSome(error) && isMissingTool(error.value) ? serverEnv.PATH : undefined,
+      ),
       notification: {
         source: { kind: "monitor" },
         outcome: "failed",
