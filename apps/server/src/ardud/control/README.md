@@ -304,9 +304,27 @@ server's compression middleware leaves it alone. Frames go out as they happen,
 with a `: ping` comment every 15 s. Each frame carries `id: <sequence>` and
 `event: <type>`. `data` is JSON with `type`, `threadId`, and `origin`.
 
-Start: the stream opens at the live head with an `event: ready` frame carrying
-`sequence`. Resume with the `Last-Event-ID` header or `?after=<sequence>` to
-replay everything since. The client reconnects and resumes on its own.
+Start: without a cursor the stream opens at the live head. Its `ready` frame
+carries `sequence` and `resumed:false`; fetch current state while buffering new
+events. Reconnect with `Last-Event-ID` or `?after=<sequence>` (the header wins).
+A decimal safe integer cursor at or below the head is honoured when its replay
+range has no compaction tombstones: `ready.resumed:true` means replay of matching
+events strictly after that cursor, then live events, with no gap or duplicate at
+the boundary. Keep the same filters when resuming. Invalid, future or compacted
+cursors start at the head with `resumed:false` and require a refetch.
+
+Failures send `event:error` with `type:error`, an optional `code`, and the last
+emitted sequence as `id`. Codes are `buffer_overflow`, `event_read_failed`,
+`origin_lookup_failed`, `history_compacted`, and `unknown`. Normal disconnects
+send no error. Reconnect from the last received id after transient failures;
+`history_compacted` means maintenance raced replay, so refetch current state.
+The client reconnects and resumes on its own.
+
+Control analytics records `events.stream_failed` with `props.code` and an
+`events.stream_failed.<code>` error tag, so existing analytics reads expose both
+the total and per-code counts. `events.stream_connected` and
+`events.stream_closed` record connection counts and lifetime separately from
+request setup latency.
 
 Filters: `threadId`, `origin` (or `none`), `types=a,b`.
 

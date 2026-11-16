@@ -16,6 +16,11 @@ import {
   type ApplicationStoredEvent,
   type OrchestrationV2DomainEvent,
 } from "@t3tools/contracts";
+import {
+  ControlHistoryCompactedError,
+  controlEventFromStored,
+  makeBody as makeControlBody,
+} from "../ardud/control/ControlEvents.ts";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -110,6 +115,7 @@ const stores = Layer.mergeAll(
 const testLayer = (
   hooks: {
     append?: Effect.Effect<void>;
+    read?: Effect.Effect<void>;
     project?: (event: OrchestrationV2DomainEvent) => Effect.Effect<void>;
     outbox?: Effect.Effect<void>;
     normalize?: Effect.Effect<void>;
@@ -121,6 +127,8 @@ const testLayer = (
       EventStore.EventStoreV2,
       Effect.map(EventStore.EventStoreV2, (store) => ({
         ...store,
+        read: (input) =>
+          Stream.unwrap((hooks.read ?? Effect.void).pipe(Effect.as(store.read(input)))),
         append: (input) => (hooks.append ?? Effect.void).pipe(Effect.andThen(store.append(input))),
         publishCommitted: (events) =>
           (hooks.publish?.(events) ?? Effect.void).pipe(
@@ -1179,4 +1187,178 @@ it.effect(
       assert.equal(batch.attributes.get("db.transaction.control.commit_count"), 1);
     }).pipe(Effect.provide(testLayer({ project: () => nestedRead })));
   },
+);
+
+it.effect.each([false, true])(
+  "control SSE burst with upstream selection=%s behind blocked origin lookup",
+  (filtered) =>
+    Effect.gen(function* () {
+      const sink = yield* EventSink.EventSinkV2;
+      const [seed] = yield* sink.write({ events: [created] });
+      assert.isDefined(seed);
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const drained = yield* Deferred.make<void>();
+      const overflowLogger = Logger.make(({ message }) => {
+        if (String(message).includes("orchestration live event buffer is full"))
+          Deferred.doneUnsafe(drained, Effect.void);
+      });
+      const accepts = (stored: import("@t3tools/contracts").OrchestrationV2StoredEvent) =>
+        controlEventFromStored(stored) !== null;
+      const body = yield* makeControlBody({
+        source: sink.stream({
+          afterSequence: 0,
+          bounded: true,
+          ...(filtered
+            ? {
+                filter: (stored: import("@t3tools/contracts").OrchestrationV2StoredEvent) => {
+                  if (stored.sequence === seed!.sequence + 1101)
+                    Deferred.doneUnsafe(drained, Effect.void);
+                  return accepts(stored);
+                },
+              }
+            : {}),
+        }),
+        afterSequence: 0,
+        resumed: true,
+        threadFilter: null,
+        originFilter: null,
+        accepts,
+        analytics: undefined,
+        originOf: () =>
+          Deferred.succeed(entered, undefined).pipe(
+            Effect.andThen(Deferred.await(release)),
+            Effect.as(null),
+          ),
+      });
+      const pull = yield* Stream.toPull(body);
+      yield* pull; // ready
+      const reader = yield* pull.pipe(
+        Effect.provide(Logger.layer([overflowLogger])),
+        Effect.forkScoped,
+      );
+      yield* Deferred.await(entered);
+      const eventStore = yield* EventStore.EventStoreV2;
+      const burst = yield* eventStore.append({
+        events: Array.from({ length: 1100 }, (_, i) => item(i)),
+      });
+      const [sentinel] = yield* eventStore.append({
+        events: [{ ...created, id: EventId.make("event:sentinel") }],
+      });
+      assert.isDefined(sentinel);
+      yield* sink.publishCommitted([...burst, sentinel!]);
+      yield* Deferred.await(drained);
+      yield* Deferred.succeed(release, undefined);
+      const frames = [...(yield* Fiber.join(reader))];
+      while (
+        !frames.some((frame) =>
+          new TextDecoder()
+            .decode(frame)
+            .includes(filtered ? `id: ${sentinel!.sequence}` : "event: error"),
+        )
+      ) {
+        frames.push(...(yield* pull));
+      }
+      const output = frames.map((frame) => new TextDecoder().decode(frame)).join("");
+      if (filtered) {
+        assert.notInclude(output, "event: error");
+        assert.include(output, `id: ${sentinel!.sequence}`);
+      } else {
+        assert.include(output, '"code":"buffer_overflow"');
+        const cursor = Number(output.match(/id: (\d+)\nevent: error/)?.[1]);
+        const resumedBody = yield* makeControlBody({
+          source: sink.stream({ afterSequence: cursor, bounded: true, filter: accepts }),
+          afterSequence: cursor,
+          resumed: true,
+          threadFilter: null,
+          originFilter: null,
+          accepts,
+          analytics: undefined,
+          originOf: () => Effect.succeed(null),
+        });
+        const expected = [seed!.sequence, sentinel!.sequence].filter(
+          (sequence) => sequence > cursor,
+        );
+        const replayed = yield* resumedBody.pipe(
+          Stream.take(1 + expected.length),
+          Stream.runCollect,
+        );
+        const replayText = replayed.map((frame) => new TextDecoder().decode(frame)).join("");
+        assert.include(replayText, '"resumed":true');
+        assert.deepEqual(
+          [...replayText.matchAll(/id: (\d+)\nevent: thread.created/g)].map((match) =>
+            Number(match[1]),
+          ),
+          expected,
+        );
+        const initialIds = [...output.matchAll(/id: (\d+)\nevent: thread.created/g)].map((match) =>
+          Number(match[1]),
+        );
+        assert.deepEqual([...initialIds, ...expected], [seed!.sequence, sentinel!.sequence]);
+      }
+    }).pipe(Effect.scoped, Effect.provide(testLayer())),
+);
+
+it.effect("cursor replay joins live exactly once across a blocked catch-up read", () =>
+  Effect.gen(function* () {
+    const replayStarted = yield* Deferred.make<void>();
+    const releaseReplay = yield* Deferred.make<void>();
+    return yield* Effect.gen(function* () {
+      const sink = yield* EventSink.EventSinkV2;
+      const [seed] = yield* sink.write({ events: [created] });
+      const retained = yield* sink.write({ events: [item(1), item(2)] });
+      const reader = yield* sink
+        .stream({
+          afterSequence: seed!.sequence,
+          bounded: true,
+          filter: (stored) => stored.event.type === "turn-item.updated",
+        })
+        .pipe(Stream.take(4), Stream.runCollect, Effect.forkScoped);
+      yield* Deferred.await(replayStarted);
+      const duringReplay = yield* sink.write({ events: [item(3)] });
+      yield* Deferred.succeed(releaseReplay, undefined);
+      const sentinel = yield* sink.write({ events: [item(4)] });
+      assert.deepEqual(
+        Array.from(yield* Fiber.join(reader), (stored) => stored.sequence),
+        [...retained, ...duringReplay, ...sentinel].map((stored) => stored.sequence),
+      );
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        testLayer({
+          read: Deferred.succeed(replayStarted, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseReplay)),
+          ),
+        }),
+      ),
+    );
+  }),
+);
+
+it.effect("compaction discovered after catch-up fails before delivering the live tail", () =>
+  Effect.gen(function* () {
+    const sink = yield* EventSink.EventSinkV2;
+    const [seed] = yield* sink.write({ events: [created] });
+    const body = yield* makeControlBody({
+      source: sink.stream({
+        afterSequence: 0,
+        bounded: true,
+        verifyReplay: () =>
+          sink
+            .publishCommitted([{ ...seed!, sequence: seed!.sequence + 1 }])
+            .pipe(Effect.andThen(Effect.fail(new ControlHistoryCompactedError()))),
+      }),
+      afterSequence: 0,
+      resumed: true,
+      threadFilter: null,
+      originFilter: null,
+      accepts: () => true,
+      originOf: () => Effect.succeed(null),
+      analytics: undefined,
+    });
+    const frames = yield* body.pipe(Stream.runCollect);
+    const output = frames.map((frame) => new TextDecoder().decode(frame)).join("");
+    assert.include(output, '"code":"history_compacted"');
+    assert.isAtMost(Number(output.match(/id: (\d+)\nevent: error/)?.[1]), seed!.sequence);
+  }).pipe(Effect.provide(testLayer())),
 );
