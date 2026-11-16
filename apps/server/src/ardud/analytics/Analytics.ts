@@ -193,6 +193,10 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
     (filter?.tool === undefined || filter.tool === event.tool) &&
     (filter?.outcome === undefined || filter.outcome === event.outcome) &&
     (filter?.responseDelivery === undefined || filter.responseDelivery === event.responseDelivery);
+  const relatedDetached = (event: AnalyticsEvent, filter?: AnalyticsReadInput) =>
+    event.kind === "mcp.detached" &&
+    (filter?.kind === undefined || filter.kind === "mcp.call") &&
+    (filter?.tool === undefined || filter.tool === event.tool);
   const viewKey = (day: string, filter?: AnalyticsReadInput) =>
     JSON.stringify([
       day,
@@ -271,7 +275,10 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
         accumulator.invalidLines++;
         return;
       }
-      if (!matches(event, filter)) return;
+      if (!matches(event, filter)) {
+        if (relatedDetached(event, filter)) accumulate(accumulator, event, true);
+        return;
+      }
       accumulate(accumulator, event);
       samples.add(event);
     });
@@ -484,7 +491,11 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
         for (const view of views.values()) {
           if (view.day !== first.day) continue;
           for (const entry of attempted) {
-            if (!matches(entry.event, view.filter)) continue;
+            if (!matches(entry.event, view.filter)) {
+              if (relatedDetached(entry.event, view.filter))
+                accumulate(view.accumulator, entry.event, true);
+              continue;
+            }
             accumulate(view.accumulator, entry.event);
             view.samples.add(entry.event);
           }
