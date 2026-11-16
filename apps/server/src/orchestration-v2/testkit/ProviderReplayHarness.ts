@@ -274,6 +274,9 @@ export function layerWithRegistry<Error>(
       MigrationError | PlatformError.PlatformError | SqlError
     >;
     readonly afterProviderEvent?: Effect.Effect<void>;
+    readonly beforeEventWrite?: (
+      input: Parameters<EventSink.EventSinkV2Shape["write"]>[0],
+    ) => Effect.Effect<void>;
     readonly runEffectWorker?: boolean;
     readonly runContinuationWorker?: boolean;
     readonly recoverOnStartup?: boolean;
@@ -325,9 +328,23 @@ export function layerWithRegistry<Error>(
     EffectOutbox.layer,
     TurnItemPositionStore.layer,
   ).pipe(Layer.provide(layerDatabase));
-  const layerEventSinkProvided = EventSink.layerFromStores.pipe(
+  const layerEventSinkBase = EventSink.layerFromStores.pipe(
     Layer.provide(Layer.mergeAll(layerStores, layerDatabase)),
   );
+  const layerEventSinkProvided =
+    options.beforeEventWrite === undefined
+      ? layerEventSinkBase
+      : Layer.effect(
+          EventSink.EventSinkV2,
+          Effect.gen(function* () {
+            const sink = yield* EventSink.EventSinkV2;
+            return {
+              ...sink,
+              write: (input: Parameters<EventSink.EventSinkV2Shape["write"]>[0]) =>
+                options.beforeEventWrite!(input).pipe(Effect.andThen(sink.write(input))),
+            };
+          }),
+        ).pipe(Layer.provide(layerEventSinkBase));
   const layerCommandReceiptStoreProvided = CommandReceiptStore.layer.pipe(
     Layer.provide(layerDatabase),
   );

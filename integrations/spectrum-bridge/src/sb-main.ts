@@ -232,7 +232,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     const router = new Router(chat.store, chatBackend, transport as unknown as ConstructorParameters<typeof Router>[2], {
       ...config, chatGuid: chat.info.key, skillPath, alertSkillPath, alertSocketPath: telegramBridgeSocket,
       medsFold: {},
-      transcribe: input => transcribe(input), notifyFailure: notifyFailedInbound, log, context: chat.context,
+      transcribe: input => transcribe(input), notifyUnanswered: outlet.notify, notifyFailure: notifyFailedInbound, log, context: chat.context,
       ...(chat.info.kind === "group" ? { groupJudge } : {}),
       swipes: { find: swipes, line: config.sendblueNumber ?? "" },
     });
@@ -377,6 +377,9 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
       await sleep(1_000);
     }
   }
+  const unansweredTimer = setInterval(() => {
+    if (ready()) for (const chat of chats.all()) void chat.parts.router?.checkUnanswered().catch(error => toolError("sb-main", "unanswered.check", error));
+  }, 60_000);
   const timer = setInterval(() => {
     for (const chat of chats.all()) {
       if (chat.parts.remote) { if (ready()) void chat.parts.remote.tick(); continue; }
@@ -400,6 +403,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     toolLog.capture(() => toolLog.write({ component: "process", kind: "event", name: "bridge.stop" }));
     abort.abort();
     clearInterval(timer);
+    clearInterval(unansweredTimer);
     await server.stop(true);
     await apps?.stop().catch((caughtError) => { toolError("sb-main", "sb-main.catch17", caughtError);});
     await shares.stopAll().catch((caughtError) => { toolError("sb-main", "sb-main.catch18", caughtError);});

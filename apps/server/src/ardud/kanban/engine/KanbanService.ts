@@ -7229,7 +7229,7 @@ const make = Effect.gen(function* () {
     kanbanEvaluatorStep(card) &&
     card.activeThreadId === null &&
     card.settledAt === null &&
-    ((card.stage === "todo" && card.wakeNote === null) ||
+    (card.stage === "todo" ||
       card.stage === "in_review" ||
       (KANBAN_DONE_STAGES.has(card.stage) && card.stage !== "verified"))
       ? Subtasks.subtaskIds(kanbanStepSubtasks(card, "evaluator"))
@@ -16263,7 +16263,7 @@ const make = Effect.gen(function* () {
     yield* checkText(cardTextFields(input));
     // A thread's or a script's card waits for an evaluator to write its packet;
     // the owner's and the evaluators' own come written.
-    const packet = actor._tag === "thread" || actor._tag === "script";
+    const packet = Subtasks.needsPacketStep(actor);
     const fields = packet
       ? { ...input, subtasks: Subtasks.withPacketStep(input.subtasks ?? []) }
       : input;
@@ -16295,7 +16295,9 @@ const make = Effect.gen(function* () {
     const context = compact
       ? yield* threads.claimContext(threadId).pipe(NodeSqliteClient.identityReadOnly)
       : null;
-    const view = compact ? context : yield* threads.view(threadId);
+    const view = compact
+      ? context
+      : yield* threads.view(threadId).pipe(Effect.withSpan("read.workThread.view"));
     if (!view)
       return yield* failWith(
         "not-found",
@@ -16312,7 +16314,10 @@ const make = Effect.gen(function* () {
       held?.pool ??
       Rules.poolOf(
         yield* reader.pools(board.id),
-        context?.model ?? (yield* threads.model(threadId)) ?? link.model ?? board.defaultCardModel,
+        context?.model ??
+          (yield* threads.model(threadId).pipe(Effect.withSpan("read.workThread.model"))) ??
+          link.model ??
+          board.defaultCardModel,
       );
     const origin = compact
       ? null
@@ -16505,15 +16510,25 @@ const make = Effect.gen(function* () {
   });
 
   const claimCard: KanbanServiceShape["claimCard"] = (threadId, cardId) =>
-    guard(
+    SavedWrite.subSteps(
       "card.claim",
-      Effect.gen(function* () {
-        yield* reconcileRunFailureUnlocked(threadId);
-        const thread = yield* workThreadOf(threadId);
-        const card = (yield* upgradeFindings([yield* cardOf(cardId)]))[0]!;
-        yield* checkTake(thread, threadId, card);
-        return yield* takeCard(threadId, thread.pool, card, "Taken by its work thread");
-      }),
+      guard(
+        "card.claim",
+        Effect.gen(function* () {
+          // Repairs and pending notes do not acknowledge the requested claim.
+          const { thread, card } = yield* Effect.gen(function* () {
+            yield* reconcileRunFailureUnlocked(threadId).pipe(
+              Effect.withSpan("reconcile.runFailure"),
+            );
+            const thread = yield* workThreadOf(threadId);
+            const card = (yield* upgradeFindings([yield* cardOf(cardId)]))[0]!;
+            yield* checkTake(thread, threadId, card);
+            return { thread, card };
+          }).pipe(SavedWrite.preparatory);
+          return yield* takeCard(threadId, thread.pool, card, "Taken by its work thread");
+        }),
+      ),
+      true,
     );
 
   const sendCreatedAssignment = Effect.fn("KanbanService.sendCreatedAssignment")(function* (
@@ -19570,31 +19585,38 @@ const make = Effect.gen(function* () {
         if ((action === "steer" || action === "wake") && !text.trim())
           return yield* failWith("invalid", `${action} needs text: pass the message as text`);
         yield* checkText([["note", text]]);
-        const card = (yield* upgradeFindings([yield* cardOf(cardId)]))[0]!;
+        const stored = yield* cardOf(cardId);
+        const card = (yield* upgradeFindings([stored], false))[0]!;
         if (action !== "stop" && (yield* boardOf(card.boardId)).archivedAt !== null)
           return yield* failWith("denied", "Board is deleted", "board_deleted");
+        if (
+          (action === "steer" || action === "wake") &&
+          card.activeRole !== "review" &&
+          !kanbanWorkStep(card)
+        ) {
+          const open = kanbanStepSubtasks(card);
+          const owners = [...new Set(open.map((subtask) => subtask.owner))];
+          const step =
+            open.length === 0
+              ? "All subtasks are finished."
+              : `Step ${kanbanOpenStep(card)} (${Subtasks.subtaskIds(open)}) belongs to ${owners.join(" and ")}.`;
+          const next = owners.includes("review")
+            ? "The dispatcher starts the reviewer; use card_move to needs_review if the card is still in working."
+            : open.length === 0
+              ? "Add work subtasks with card_edit, then wake."
+              : "Complete that step, or add work subtasks with card_edit, then wake.";
+          return yield* failWith(
+            "denied",
+            `card #${card.number}: no worker step open. ${step} ${next}`,
+            "work_step_missing",
+          );
+        }
+        if (card !== stored) yield* saveCard(card);
         const at = yield* nowIso;
-        // Eligibility controls when the note is delivered, never whether newer
-        // wake/reset text can discard context that has not reached the worker.
         const wakeNote = Subtasks.pendingWakeNote({
           ...card,
           wakeNote: [card.wakeNote, text.trim()].filter(Boolean).join("\n\n") || null,
         });
-        if (
-          (action === "steer" || (action === "wake" && card.activeThreadId !== null)) &&
-          card.activeRole !== "review" &&
-          !kanbanWorkStep(card)
-        ) {
-          // A note waits for eligible work; direct sends would otherwise start
-          // an idle worker without passing the dispatcher or claim checks.
-          const next = {
-            ...card,
-            wakeNote,
-            updatedAt: at,
-          };
-          yield* saveCard(next);
-          return next;
-        }
         if (action === "steer") {
           const threadId = card.activeThreadId ?? card.workThreadId;
           if (threadId === null)
