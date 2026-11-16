@@ -449,6 +449,7 @@ const GeneralEvent = Schema.Struct({
       ),
       hasBatchKey: Schema.optionalKey(Schema.Boolean),
       openAsksAtCreation: Schema.optionalKey(Measurement),
+      openNoticesAtCreation: Schema.optionalKey(Measurement),
       answeredVia: Schema.optionalKey(Schema.Literals(["single", "batch", "free_text"])),
       status: Schema.optionalKey(Measurement),
       count: Schema.optionalKey(Measurement),

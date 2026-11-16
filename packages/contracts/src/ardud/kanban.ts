@@ -499,6 +499,7 @@ export const KANBAN_ASK_VERDICTS = [
   "acknowledged",
   "handed",
   "dropped",
+  "auto_closed",
 ] as const;
 export const KanbanAskVerdict = Schema.String;
 export type KanbanAskVerdict = string;
@@ -558,6 +559,7 @@ export const KanbanOwnerAsk = Schema.Struct({
         Schema.Literals(["approve", "pick", "draft", "action", "input", "notice"]),
       ),
       openAsksAtCreation: Schema.optional(NonNegativeInt),
+      openNoticesAtCreation: Schema.optional(NonNegativeInt),
       notified: Schema.optional(
         Schema.Struct({
           in_app: Schema.optional(IsoDateTime),
@@ -600,6 +602,8 @@ export const KanbanOwnerAsk = Schema.Struct({
   expiresAt: Schema.optional(IsoDateTime),
   /** Asks with the same key on a board are the same shape and can be answered together. */
   batchKey: Schema.optional(Schema.String),
+  /** The subtask a gate-cleared notice belongs to. Older notices use their title. */
+  subtaskId: Schema.optional(Schema.String),
   /** Bumped every time the agent edits the open ask. Absent means 0. */
   revision: Schema.optional(NonNegativeInt),
   revisedAt: Schema.optional(IsoDateTime),
