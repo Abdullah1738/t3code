@@ -101,6 +101,7 @@ import {
   modelSelectionOf,
 } from "./defaults.ts";
 import * as Rules from "./rules.ts";
+import { PACKET_SUBTASK } from "./subtasks.ts";
 import * as Retries from "./retries.ts";
 import * as Activity from "./activity.ts";
 import * as Briefs from "./briefs.ts";
@@ -16295,6 +16296,52 @@ it.effect("a thread's new card waits for an evaluator's packet; the owner's goes
       assert.strictEqual(started.stage, "working");
       const messages = (yield* Ref.get(fake.threads)).get(started.activeThreadId!)!.messages;
       assert.include(messages[0] ?? "", "retry with backoff");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a card a work thread takes at once keeps its own plan, without a packet", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+      const origin = yield* kanban.createCard(
+        board.id,
+        { title: "Origin", prompt: "Origin" },
+        owner,
+      );
+      yield* kanban.dispatchNow;
+      const worker = (yield* kanban.card(origin.id)).card.activeThreadId!;
+      // The caller's plan starts on the evaluator's step. Taken at once, it is
+      // still the whole plan: no packet step goes in front of it, and the take
+      // is not refused for waiting on the evaluator.
+      const taken = yield* kanban.createForThread(worker, {
+        title: "Deploy the helper",
+        prompt: "Deploy the helper",
+        subtasks: [{ text: "Deploy the helper", owner: "evaluator" }],
+      });
+      assert.deepStrictEqual(
+        taken.card.subtasks.map(({ id, step, text }) => [id, step, text]),
+        [["s1", 1, "Deploy the helper"]],
+      );
+      const carried = (yield* kanban.card(taken.card.id)).card;
+      assert.strictEqual(carried.stage, "working");
+      assert.strictEqual(carried.workThreadId, worker);
+      assert.strictEqual(carried.activeThreadId, worker);
+      // The ordinary thread create still waits on its evaluator's packet.
+      const queued = yield* kanban.createCard(
+        board.id,
+        { title: "Queued", prompt: "Queued", subtasks: [{ text: "Fix it", owner: "work" }] },
+        { _tag: "thread", threadId: worker },
+      );
+      assert.deepStrictEqual(
+        queued.subtasks.map(({ id, step, owner: by, text }) => [id, step, by, text]),
+        [
+          ["s1", 1, "evaluator", PACKET_SUBTASK],
+          ["s2", 2, "work", "Fix it"],
+        ],
+      );
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );

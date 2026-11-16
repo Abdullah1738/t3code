@@ -1058,7 +1058,12 @@ export interface KanbanServiceShape {
     threadId: ThreadId,
     cardId: KanbanCard["id"],
   ) => Effect.Effect<ClaimResult, KanbanError>;
-  /** Creates and takes a card atomically; evaluator assignments also queue its brief. */
+  /**
+   * Creates and takes a card atomically; evaluator assignments also queue its
+   * brief. A card the thread makes for itself (no assignment) keeps the caller's
+   * subtasks as its whole plan: no evaluator packet step goes in front of them,
+   * and the take is not refused for a plan whose first step is the evaluator's.
+   */
   readonly createForThread: (
     threadId: ThreadId,
     input: NewCard,
@@ -17241,6 +17246,7 @@ const make = Effect.gen(function* () {
     threadId: ThreadId,
     card: KanbanCard,
     observe = false,
+    takeAtOnce = false,
   ) {
     let capacity: Effect.Success<ReturnType<typeof takeCapacity>> | undefined;
     return yield* Effect.gen(function* () {
@@ -17268,6 +17274,7 @@ const make = Effect.gen(function* () {
         slots: capacity.slots,
         pools: capacity.pools,
         nowMs: yield* nowMillis,
+        takeAtOnce,
       });
       if (!check.ok)
         return yield* failWith(
@@ -17418,7 +17425,9 @@ const make = Effect.gen(function* () {
   });
 
   // The card is checked as a draft first, so a refused take leaves nothing
-  // behind for the dispatcher to start twice.
+  // behind for the dispatcher to start twice. A card the caller's own thread
+  // takes here carries the caller's subtasks as its whole plan (no packet step
+  // in front of them), so that plan's open step is never a reason to refuse it.
   const createForThread: KanbanServiceShape["createForThread"] = (threadId, input, assignment) =>
     guardDeferred(
       "card.createForThread",
@@ -17493,7 +17502,7 @@ const make = Effect.gen(function* () {
           const actor: KanbanActor = assignment?.actor ?? { _tag: "thread", threadId };
           yield* refuseTwin(thread.board.id, fields, actor);
           const draft = yield* draftCard(thread.board.id, fields, actor);
-          yield* checkTake(thread, threadId, draft);
+          yield* checkTake(thread, threadId, draft, false, assignment === undefined);
           return { thread, fields, draft, actor };
         }).pipe(
           Effect.mapError((cause) => {
