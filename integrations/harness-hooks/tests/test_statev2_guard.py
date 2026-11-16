@@ -2053,8 +2053,43 @@ test('failure', () => {
 
     def test_js_temp_database_config_strip_cannot_supply_proof(self):
         setup = 'const root = mkdtempSync(tmpdir()); '
-        self.js_mutation_cases((tool, setup + f'const config = "~/.config/{tool}/state.sqlite"; ' +
-            'readFileSync(join(root, ".robob/userdata/statev2.sqlite"));') for tool in ('homedir', 'cwd', 'HOME'))
+        imports = "import {mkdtempSync} from 'node:fs'; import {tmpdir} from 'node:os'; import {join} from 'node:path';\n"
+        cases = []
+        for tool in ('homedir', 'cwd', 'HOME'):
+            source = setup + f'const protectedPath = "~/.config/{tool}/state.sqlite"; ' + \
+                'readFileSync(join(root, ".robob/userdata/statev2.sqlite"));'
+            checked = imports + source
+            stripped = guard._strip_config_dir_db_names(checked, str(self.root))
+            self.assertNotEqual(stripped, checked)
+            self.assertEqual(guard._js_fixture_source(checked), checked)
+            self.assertNotEqual(guard._js_fixture_source(stripped), stripped)
+            cases.append((tool, source))
+        self.js_mutation_cases(cases)
+
+    def test_js_temp_database_mask_preserves_second_database(self):
+        setup = 'const tmpRoot = mkdtempSync(join(tmpdir(), "guard95-")); '
+        imports = "import {mkdtempSync} from 'node:fs'; import {tmpdir} from 'node:os'; import {join} from 'node:path';\n"
+        live = 'join(homedir(), ".t3/userdata/state.sqlite")'
+        fixture = 'join(tmpRoot, "state.sqlite")'
+        cases = [
+            ('concatenated live join', 'import {homedir} from "node:os"; ' + setup +
+             f'readFileSync({fixture} + {live});'),
+            ('same-line live join', 'import {homedir} from "node:os"; ' + setup +
+             f'readFileSync({fixture}); readFileSync({live});'),
+        ]
+        fixture = 'join(tmpRoot, ".robob/userdata/statev2.sqlite")'
+        live = '"~/.config/spectrum-bridge/state.sqlite"'
+        for label, expression in (
+                ('concatenated config operand', f'readFileSync({fixture} + {live});'),
+                ('nested config reader', f'consume({fixture}, readFileSync({live}));')):
+            source = setup + expression
+            checked = imports + source
+            masked = guard._js_fixture_source(checked)
+            self.assertNotEqual(masked, checked)
+            self.assertNotIn('statev2.sqlite', masked)
+            self.assertIn(live, masked)
+            cases.append((label, source))
+        self.js_mutation_cases(cases)
 
     def test_js_temp_database_fixture_expressions(self):
         imports = '''import { mkdtempSync, realpathSync } from 'node:fs';
