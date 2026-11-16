@@ -1,6 +1,10 @@
 #!/bin/sh
 set -eu
 
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+. "$here/../libexec/repo-node-pin/shared-deps.sh"
+repo_shared_deps_check vp "$@" || exit 1
+
 if [ "${REPO_VP_SHIM_ACTIVE:-}" = 1 ]; then
   echo 'vp: recursive shim; run offbox run -- vp instead' >&2
   exit 127
