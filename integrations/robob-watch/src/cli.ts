@@ -353,6 +353,8 @@ async function main(argv: string[]): Promise<void> {
           s.failure_alerted = false;
           delete s.failure_escalated;
           delete s.failing_since;
+          delete s.dependency_busy;
+          delete s.failure_episode;
           delete s.last_error;
           delete s.last_error_sources;
         }
