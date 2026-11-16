@@ -82,6 +82,9 @@ import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import { BoardsDatabase } from "../ardud/persistence/BoardsDatabase.ts";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as WikiReadTiming from "../ardud/analytics/WikiReadTiming.ts";
 
 it("hashes retry ids deterministically within their caller identity", () => {
   const first = callIdentifiers(
@@ -1365,6 +1368,87 @@ it.effect.each(outcomeCases)(
         );
         expect(yield* decodeEvent(row)).toEqual(row);
       }).pipe(Effect.provide(registration));
+    }),
+);
+
+const wikiLaneCases = (["caller", "body"] as const).flatMap((stage) =>
+  (["foreground", "background", "writer"] as const).flatMap((routedLane) =>
+    (["success", "timeout"] as const).map((ending) => ({ stage, routedLane, ending })),
+  ),
+);
+it.effect.each(wikiLaneCases)(
+  "wiki_read emits routed $stage lane $routedLane on $ending",
+  ({ stage, routedLane, ending }) =>
+    Effect.gen(function* () {
+      const recorded = yield* Deferred.make<AnalyticsEvent>();
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const toolkit = probe("wiki_read");
+      const handler = Effect.gen(function* () {
+        expect(yield* NodeSqliteClient.ReaderLane).toBe("foreground");
+        const start = yield* NodeSqliteClient.ReaderWaitStartedObserver;
+        const acquired = yield* NodeSqliteClient.ReaderWaitObserver;
+        const read = (phase: "caller" | "body") =>
+          WikiReadTiming.step(
+            phase,
+            Effect.gen(function* () {
+              const lane = phase === stage ? routedLane : "foreground";
+              const finish = start?.("foreground");
+              finish?.(lane, false);
+              if (phase === "caller") yield* TestClock.adjust("5 millis");
+              if (phase === stage) {
+                yield* Deferred.succeed(entered, undefined);
+                if (ending === "timeout") yield* Deferred.await(release);
+              }
+              if (lane !== "writer") acquired?.(phase === "caller" ? 5 : 0, lane);
+              finish?.(lane, true);
+              return { boardId: "board-robob" };
+            }),
+          );
+        yield* read("caller");
+        yield* read("body");
+        return { pages: [] };
+      });
+      const registration = McpHttpServer.toolkitRegistration(
+        toolkit,
+        McpToolAccess.toLayer(toolkit, {
+          wiki_read: McpToolAccess.reads(() => handler),
+        }),
+      ).pipe(
+        Layer.provideMerge(McpServer.McpServer.layer),
+        Layer.provide(Testkit.liveThreadsLayer),
+        Layer.provide(
+          Layer.mock(BoardsDatabase)({ ready: Effect.void, path: "/synthetic/boards.sqlite" }),
+        ),
+        Layer.provide(
+          Layer.mock(Analytics.Analytics)({
+            record: (event) =>
+              event.kind === "mcp.call"
+                ? Deferred.succeed(recorded, event).pipe(Effect.asVoid)
+                : Effect.void,
+          }),
+        ),
+        Layer.provideMerge(invocation),
+      );
+      yield* Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const pending = yield* server
+          .callTool({ name: "wiki_read", arguments: args })
+          .pipe(Effect.provideService(McpSchema.McpServerClient, client), Effect.forkChild);
+        yield* Deferred.await(entered);
+        if (ending === "timeout") yield* TestClock.adjust("20 seconds");
+        yield* Fiber.join(pending);
+        const row = yield* Deferred.await(recorded);
+        expect(yield* decodeAnalyticsEvent(row)).toMatchObject({
+          tool: "wiki_read",
+          outcome: ending === "timeout" ? "timeout" : "ok",
+          callerResolved: !(stage === "caller" && ending === "timeout"),
+          callerResolveMs: stage === "caller" && ending === "timeout" ? 20000 : 5,
+          callerReaderLane: stage === "caller" ? routedLane : "foreground",
+          readerLane: ending === "timeout" || stage === "body" ? routedLane : "foreground",
+          ...(ending === "timeout" ? { props: { phase: stage } } : {}),
+        });
+      }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)), Effect.provide(registration));
     }),
 );
 

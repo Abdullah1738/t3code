@@ -69,6 +69,7 @@ import * as KanbanHandlers from "./handlers.ts";
 import { boardReleaseSummary, compactBoard } from "../engine/boardReplies.ts";
 import { COMPACT_READ_CHARS } from "../../compactRead.ts";
 import * as McpBoardReplies from "../engine/mcpBoardReplies.ts";
+import * as ReplyBuilders from "../../http/ReplyBuilders.ts";
 import { KanbanToolkit } from "./tools.ts";
 import { ModelBody } from "../http.ts";
 
@@ -167,6 +168,7 @@ const fakeThreads = (
     afterBoardWrite?: () => Effect.Effect<void>;
     beforeGoals?: () => Effect.Effect<void>;
     beforeThreadLink?: () => Effect.Effect<void>;
+    beforeWiki?: (slugs: ReadonlyArray<string> | undefined) => Effect.Effect<void>;
     beforeClaimContext?: () => Effect.Effect<void>;
     beforeCardWrite?: () => Effect.Effect<void, KanbanStore.KanbanStoreError>;
     beforeCardEvent?: (
@@ -179,6 +181,10 @@ const fakeThreads = (
       const store = yield* KanbanStore.KanbanStore;
       return KanbanStore.KanbanStore.of({
         ...store,
+        wiki: (id, slugs) =>
+          Effect.suspend(() => storeControl.beforeWiki?.(slugs) ?? Effect.void).pipe(
+            Effect.andThen(store.wiki(id, slugs)),
+          ),
         goals: (id) =>
           Effect.suspend(() => storeControl.beforeGoals?.() ?? Effect.void).pipe(
             Effect.andThen(store.goals(id)),
@@ -2777,6 +2783,141 @@ it.effect("wiki_read refuses conflicting selectors and invalid slug batches", ()
     }
   }).pipe(Effect.provide(layer));
 });
+
+it.effect(
+  "wiki_read answers single-slug and index reads while all shared MCP permits are held",
+  () => {
+    const { layer } = fakeThreads();
+    return Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "wiki",
+        name: "Wiki",
+        defaultProjectId: null,
+      });
+      const page = yield* kanban.writeWiki(
+        board.id,
+        { slug: "page", body: "Selected body" },
+        owner,
+      );
+      const held = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const builders = yield* ReplyBuilders.ReplyBuilders;
+      const holder = yield* builders.mcp
+        .withPermits(ReplyBuilders.PERMITS.mcp)(
+          Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        )
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(held);
+      yield* Effect.gen(function* () {
+        const single = yield* call(ThreadId.make("thread-evaluator"), "wiki_read", {
+          slug: "page",
+        });
+        assert.deepStrictEqual(single.structured, { pages: [page] });
+        const index = yield* call(ThreadId.make("thread-evaluator"), "wiki_read", {});
+        assert.isFalse(index.isError, index.text);
+        assert.deepStrictEqual(index.structured.pages, []);
+        assert.lengthOf(index.structured.index as unknown[], 1);
+        assert.isUndefined(holder.pollUnsafe());
+      }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+      yield* Fiber.join(holder);
+    }).pipe(Effect.provide(layer.pipe(Layer.provideMerge(ReplyBuilders.layer))));
+  },
+);
+
+it.effect("wiki_read finds missing slugs before loading bodies and limits mixed batches", () => {
+  const { layer, storeControl } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({ slug: "wiki", name: "Wiki", defaultProjectId: null });
+    const page = yield* kanban.writeWiki(board.id, { slug: "page", body: "Selected body" }, owner);
+    yield* kanban.writeWiki(board.id, { slug: "unrelated", body: "Unrelated body" }, owner);
+    const bodies: Array<ReadonlyArray<string> | undefined> = [];
+    storeControl.beforeWiki = (slugs) =>
+      Effect.sync(() => {
+        bodies.push(slugs);
+      });
+    const thread = ThreadId.make("thread-evaluator");
+    for (const input of [{ slug: "missing" }, { slugs: ["missing", "also-missing"] }, {}]) {
+      const result = yield* call(thread, "wiki_read", input);
+      assert.isFalse(result.isError, result.text);
+      assert.deepStrictEqual(result.structured.pages, []);
+      assert.deepStrictEqual(bodies, []);
+    }
+    for (const input of [
+      { slug: "page", slugs: ["missing"] },
+      { section: "Missing" },
+      { slugs: ["page"], section: "Missing" },
+      { slug: "page", section: "Missing", outline: true },
+    ]) {
+      const result = yield* call(thread, "wiki_read", input);
+      assert.isTrue(result.isError, result.text);
+      assert.deepStrictEqual(bodies, []);
+    }
+    const mixed = yield* call(thread, "wiki_read", { slugs: ["missing", "page", "also-missing"] });
+    assert.deepStrictEqual(mixed.structured, {
+      pages: [page],
+      missing: ["missing", "also-missing"],
+    });
+    assert.deepStrictEqual(bodies, [["page"]]);
+  }).pipe(Effect.provide(layer));
+});
+
+it.live("wiki_read does not wait behind a held background SQLite reader", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "wiki-reader-" });
+    const state = Context.get(
+      yield* Layer.build(
+        NodeSqliteClient.layer({
+          filename: path.join(directory, "probe.sqlite"),
+          readerWorker: true,
+          foregroundReaderSlots: 1,
+          backgroundReaderSlots: 1,
+        }),
+      ),
+      SqlClient.SqlClient,
+    );
+    yield* state`PRAGMA journal_mode = WAL`;
+    yield* state`CREATE TABLE probe (value INTEGER)`;
+    const fake = fakeThreads();
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "wiki",
+        name: "Wiki",
+        defaultProjectId: null,
+      });
+      const page = yield* kanban.writeWiki(
+        board.id,
+        { slug: "page", body: "Selected body" },
+        owner,
+      );
+      const held = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const holder = yield* state
+        .withTransaction(
+          state`SELECT * FROM probe`.pipe(
+            Effect.andThen(Deferred.succeed(held, undefined)),
+            Effect.andThen(Deferred.await(release)),
+          ),
+        )
+        .pipe(NodeSqliteClient.readOnly, Effect.forkChild);
+      yield* Deferred.await(held);
+      fake.storeControl.beforeThreadLink = () =>
+        state`SELECT * FROM probe`.pipe(NodeSqliteClient.readOnly, Effect.orDie, Effect.asVoid);
+      yield* Effect.gen(function* () {
+        const result = yield* call(ThreadId.make("thread-evaluator"), "wiki_read", {
+          slug: "page",
+        });
+        assert.deepStrictEqual(result.structured, { pages: [page] });
+        assert.isUndefined(holder.pollUnsafe());
+      }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+      yield* Fiber.join(holder);
+    }).pipe(Effect.provide(fake.layer));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
 
 it.effect("wiki_read keeps a 230-page board's index below 50 KB", () => {
   const { layer } = fakeThreads();
@@ -7848,11 +7989,7 @@ it.effect("a work thread's card_create numbers the packet first in its gated rep
       defaultProjectId: ProjectId.make("project-1"),
     });
     yield* kanban.setPool(board.id, board.defaultCardModel, 1);
-    const origin = yield* kanban.createCard(
-      board.id,
-      { title: "Origin", prompt: "Origin" },
-      owner,
-    );
+    const origin = yield* kanban.createCard(board.id, { title: "Origin", prompt: "Origin" }, owner);
     yield* kanban.dispatchNow;
     const worker = (yield* kanban.card(origin.id)).card.workThreadId!;
     running.add(worker);

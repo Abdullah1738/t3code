@@ -22,6 +22,7 @@ import {
 } from "@t3tools/contracts";
 import { resolvedContext } from "../../analytics/McpCall.ts";
 import * as CardNextMetrics from "../../analytics/CardNextMetrics.ts";
+import * as WikiReadTiming from "../../analytics/WikiReadTiming.ts";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -176,7 +177,10 @@ const withCaller = Effect.fn("KanbanTools.withCaller")(
     return yield* service.agentCall(
       threadId,
       Effect.gen(function* () {
-        const link = yield* CardNextMetrics.stage("caller", service.caller(threadId));
+        const link = yield* WikiReadTiming.step(
+          "caller",
+          CardNextMetrics.stage("caller", service.caller(threadId)),
+        );
         if (link?.boardId) yield* resolvedContext({ boardId: link.boardId });
         const actor: KanbanActor =
           link !== null && link.role !== "evaluator"
@@ -1224,9 +1228,27 @@ const handlers = {
             "slug",
           );
         }
-        const board = yield* boardFor(service, caller, input.boardId, true);
+        const board = yield* WikiReadTiming.step(
+          "board",
+          boardFor(service, caller, input.boardId, true),
+        );
+        if (
+          input.slug === undefined &&
+          input.slugs === undefined &&
+          input.section === undefined &&
+          !input.outline
+        ) {
+          return {
+            pages: [],
+            index: (yield* service.wikiIndex(board.id)).toSorted((a, b) =>
+              a.slug.localeCompare(b.slug),
+            ),
+            hint: "Pass slug to read a page.",
+          };
+        }
         const pages = yield* service.wiki(board.id, {
           slug: input.slug,
+          slugs: input.slugs,
           section: input.section,
           outline: input.outline,
         });
@@ -1243,18 +1265,7 @@ const handlers = {
             missing: input.slugs.filter((slug) => !bySlug.has(slug)),
           };
         }
-        return {
-          pages: [],
-          index: pages
-            .toSorted((a, b) => a.slug.localeCompare(b.slug))
-            .map((page) => ({
-              slug: page.slug,
-              title: page.title,
-              updatedAt: page.updatedAt,
-              bytes: Buffer.byteLength(page.body, "utf8"),
-            })),
-          hint: "Pass slug to read a page.",
-        };
+        return { pages };
       }),
     ),
   ),

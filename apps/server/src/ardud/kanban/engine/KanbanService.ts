@@ -1,6 +1,7 @@
 import { kanbanReasonClass } from "../../analytics/McpFailureReason.ts";
 import { backgroundCommandWakeKey } from "../../../orchestration-v2/backgroundCommandWake.ts";
 import * as CardNextMetrics from "../../analytics/CardNextMetrics.ts";
+import * as WikiReadTiming from "../../analytics/WikiReadTiming.ts";
 import { stableStringify } from "@t3tools/shared/relaySigning";
 import { classifyReply } from "./ownerReplies.ts";
 import {
@@ -923,10 +924,14 @@ export interface KanbanServiceShape {
     boardId: KanbanBoard["id"],
     options?: {
       readonly slug?: string | undefined;
+      readonly slugs?: ReadonlyArray<string> | undefined;
       readonly section?: string | undefined;
       readonly outline?: boolean | undefined;
     },
   ) => Effect.Effect<ReadonlyArray<KanbanWikiPage & { readonly note?: string }>, KanbanError>;
+  readonly wikiIndex: (
+    boardId: KanbanBoard["id"],
+  ) => Effect.Effect<Effect.Success<ReturnType<KanbanStore["Service"]["wikiIndex"]>>, KanbanError>;
   readonly writeWiki: (
     boardId: KanbanBoard["id"],
     page: {
@@ -20595,13 +20600,25 @@ const make = Effect.gen(function* () {
           "conflict",
           "section",
         );
-      const pages = yield* readDb(store.wiki(boardId));
+      const requested = options?.slug === undefined ? options?.slugs : [options.slug];
+      const selected =
+        requested === undefined
+          ? undefined
+          : (yield* WikiReadTiming.step(
+              "metadata",
+              readDb(store.wikiIndex(boardId, requested)),
+            )).map((page) => page.slug);
+      if (selected?.length === 0) return [];
+      const pages = yield* WikiReadTiming.step("body", readDb(store.wiki(boardId, selected)));
       if (options?.slug === undefined) return pages;
       const page = pages.find((page) => page.slug === options.slug);
       if (page === undefined) return [];
       if (options.outline) return [{ ...page, body: wikiOutline(page.body) }];
       if (options.section === undefined) return [page];
-      const section = wikiSection(page.body, options.section);
+      const section = yield* WikiReadTiming.step(
+        "section",
+        Effect.sync(() => wikiSection(page.body, options.section!)),
+      );
       if (!section.found)
         return yield* failWith(
           "invalid",
@@ -20618,6 +20635,10 @@ const make = Effect.gen(function* () {
         },
       ];
     },
+  );
+
+  const wikiIndex: KanbanServiceShape["wikiIndex"] = Effect.fn("KanbanService.wikiIndex")(
+    (boardId) => WikiReadTiming.step("metadata", readDb(store.wikiIndex(boardId))),
   );
 
   const writeWiki: KanbanServiceShape["writeWiki"] = (boardId, page, actor) =>
@@ -22014,6 +22035,7 @@ const make = Effect.gen(function* () {
     markRead,
     markReadSoon,
     wiki,
+    wikiIndex,
     writeWiki,
     endSetup: (boardId, actor) => guard("board.endSetup", endSetupUnlocked(boardId, actor)),
     pauseBoard: (boardId, pause, actor, callerAncestors = []) =>

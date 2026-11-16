@@ -4,6 +4,8 @@ import * as OwnerAnalytics from "../ardud/analytics/Analytics.ts";
 import * as McpCallLedger from "../ardud/analytics/McpCallLedger.ts";
 import * as McpResponseDelivery from "../ardud/http/McpResponseDelivery.ts";
 import * as ThreadReadDeadline from "./ThreadReadDeadline.ts";
+import * as WikiReadDeadline from "./WikiReadDeadline.ts";
+import * as WikiReadTiming from "../ardud/analytics/WikiReadTiming.ts";
 import * as StartupPhaseLog from "../ardud/observability/StartupPhaseLog.ts";
 import { bootId } from "../ardud/fast-install/report.ts";
 import * as McpCallAnalytics from "../ardud/analytics/McpCall.ts";
@@ -214,7 +216,6 @@ const LARGE_READ_TOOLS = new Set([
   "board_get",
   "board_activity",
   "card_get",
-  "wiki_read",
   "discussion_read",
   "card_search",
   "t3_thread_read",
@@ -1346,7 +1347,10 @@ const withToolAnalytics =
                             ? 0
                             : Math.max(0, Number(ended - callState.callerStarted) / 1e6)),
                         callerReaderLane,
-                        readerLane: callerReaderLane,
+                        readerLane:
+                          options.tool.name === "wiki_read"
+                            ? callState.readerLane
+                            : callerReaderLane,
                         ...(callState.cardNext === undefined
                           ? {}
                           : (cardNextAtExit ??
@@ -1435,7 +1439,8 @@ const withToolAnalytics =
                       : options.tool.name === "list_scheduled_tasks"
                         ? controlReplyReady
                         : Effect.void;
-                    const largeRead = LARGE_READ_TOOLS.has(options.tool.name);
+                    const measuredReadTool =
+                      LARGE_READ_TOOLS.has(options.tool.name) || options.tool.name === "wiki_read";
                     let phase: "lane" | "readiness" | "handler" = "lane";
                     let phaseStarted = yield* Clock.monotonicTimeNanos;
                     const readStarted = phaseStarted;
@@ -1452,8 +1457,12 @@ const withToolAnalytics =
                       phase = next;
                       phaseStarted = now;
                     });
-                    const result = readiness
-                      .pipe(Effect.andThen(largeRead ? advance("handler") : Effect.void))
+                    const result = (
+                      options.tool.name === "wiki_read"
+                        ? WikiReadTiming.step("readiness", readiness)
+                        : readiness
+                    )
+                      .pipe(Effect.andThen(measuredReadTool ? advance("handler") : Effect.void))
                       .pipe(
                         Effect.andThen(
                           options.tool.name === "t3_thread_read"
@@ -1472,7 +1481,9 @@ const withToolAnalytics =
                               ? undefined
                               : argumentFailure(options.tool.name, allowed, payload);
                           return failure === undefined
-                            ? options.handle(payload)
+                            ? options.tool.name === "wiki_read"
+                              ? WikiReadTiming.step("handler", options.handle(payload))
+                              : options.handle(payload)
                             : Effect.succeed(
                                 new McpSchema.CallToolResult({
                                   isError: true,
@@ -1515,22 +1526,34 @@ const withToolAnalytics =
                         content: [{ type: "text", text: REPLY_TOO_LARGE }],
                       });
                     };
-                    const completed = result.pipe(
+                    const checkedResult =
+                      options.tool.name === "wiki_read"
+                        ? result.pipe(
+                            Effect.flatMap((built) =>
+                              WikiReadTiming.step(
+                                "encode",
+                                Effect.sync(() => check(built)),
+                              ),
+                            ),
+                          )
+                        : Effect.map(result, check);
+                    const completed = checkedResult.pipe(
                       (call) =>
-                        largeRead
+                        measuredReadTool
                           ? ReplyBuilders.bounded(
                               advance("readiness").pipe(
                                 Effect.andThen(
-                                  options.tool.name === "t3_thread_read"
+                                  options.tool.name === "t3_thread_read" ||
+                                    options.tool.name === "wiki_read"
                                     ? // Keep the permit outside the detached waiter so masked cleanup
                                       // cannot retain admission after the read deadline or disconnect.
-                                      McpDeadline.awaitInterruptibly(Effect.map(call, check))
-                                    : Effect.map(call, check),
+                                      McpDeadline.awaitInterruptibly(call)
+                                    : call,
                                 ),
                               ),
-                              "mcp",
+                              options.tool.name === "wiki_read" ? "wiki" : "mcp",
                             )
-                          : Effect.map(call, check),
+                          : call,
                       Effect.catchCauseIf(
                         (cause) =>
                           cause.reasons.some(
@@ -1558,35 +1581,39 @@ const withToolAnalytics =
                     const boundedRead =
                       options.tool.name === "t3_thread_read"
                         ? ThreadReadDeadline.withDeadline(completed)
-                        : options.tool.name === "list_scheduled_tasks"
-                          ? McpDeadline.awaitInterruptibly(completed).pipe(
-                              Effect.timeoutOrElse({
-                                duration: "20 seconds",
-                                orElse: Effect.fn("McpHttpServer.scheduledReadBusy")(function* () {
-                                  const now = yield* Clock.monotonicTimeNanos;
-                                  return new McpSchema.CallToolResult({
-                                    isError: true,
-                                    content: [
-                                      {
-                                        type: "text",
-                                        text: "Robob is busy; nothing was read. Retry the same call.",
-                                      },
-                                    ],
-                                    structuredContent: {
-                                      reason: "server_busy",
-                                      phase,
-                                      waitedMs: Number(now - readStarted) / 1e6,
+                        : options.tool.name === "wiki_read"
+                          ? WikiReadDeadline.withDeadline(completed)
+                          : options.tool.name === "list_scheduled_tasks"
+                            ? McpDeadline.awaitInterruptibly(completed).pipe(
+                                Effect.timeoutOrElse({
+                                  duration: "20 seconds",
+                                  orElse: Effect.fn("McpHttpServer.scheduledReadBusy")(
+                                    function* () {
+                                      const now = yield* Clock.monotonicTimeNanos;
+                                      return new McpSchema.CallToolResult({
+                                        isError: true,
+                                        content: [
+                                          {
+                                            type: "text",
+                                            text: "Robob is busy; nothing was read. Retry the same call.",
+                                          },
+                                        ],
+                                        structuredContent: {
+                                          reason: "server_busy",
+                                          phase,
+                                          waitedMs: Number(now - readStarted) / 1e6,
+                                        },
+                                      });
                                     },
-                                  });
+                                  ),
                                 }),
-                              }),
-                            )
-                          : completed;
+                              )
+                            : completed;
                     const protectedRead = SavedBoardReply.TIMED_TOOLS.has(options.tool.name)
                       ? SavedBoardReply.protect(boundedRead, options.tool.name)
                       : boundedRead;
                     // Keep read timings on tools/call, outside the saved-reply child span.
-                    const measuredRead = largeRead
+                    const measuredRead = measuredReadTool
                       ? protectedRead.pipe(
                           Effect.onExit((exit) =>
                             Effect.gen(function* () {

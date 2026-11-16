@@ -411,7 +411,17 @@ export interface KanbanStoreShape {
 
   readonly wiki: (
     boardId: KanbanBoardId,
+    slugs?: ReadonlyArray<string>,
   ) => Effect.Effect<ReadonlyArray<KanbanWikiPage>, KanbanStoreError>;
+  readonly wikiIndex: (
+    boardId: KanbanBoardId,
+    slugs?: ReadonlyArray<string>,
+  ) => Effect.Effect<
+    ReadonlyArray<
+      Pick<KanbanWikiPage, "slug" | "title" | "updatedAt"> & { readonly bytes: number }
+    >,
+    KanbanStoreError
+  >;
   readonly putWiki: (page: KanbanWikiPage) => Effect.Effect<void, KanbanStoreError>;
 
   /** Threads the board started; a thread belongs to at most one board. */
@@ -1835,13 +1845,26 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  const wiki = (boardId: KanbanBoardId) =>
+  const wiki = (boardId: KanbanBoardId, slugs?: ReadonlyArray<string>) =>
     runRead(
       "read wiki",
       Effect.flatMap(
-        sql<JsonRow>`SELECT json FROM ardud_kanban_wiki WHERE board_id = ${boardId} ORDER BY slug`,
+        sql<JsonRow>`SELECT json FROM ardud_kanban_wiki
+          WHERE board_id = ${boardId} ${slugs === undefined ? sql`` : sql`AND slug IN ${sql.in(slugs)}`}
+          ORDER BY slug`,
         (rows) => decodeAll(rows, Wiki.decode),
       ),
+    );
+  const wikiIndex: KanbanStoreShape["wikiIndex"] = (boardId, slugs) =>
+    runRead(
+      "read wiki index",
+      sql<Pick<KanbanWikiPage, "slug" | "title" | "updatedAt"> & { readonly bytes: number }>`
+        SELECT slug, json_extract(json, '$.title') AS title,
+          json_extract(json, '$.updatedAt') AS updatedAt,
+          length(CAST(json_extract(json, '$.body') AS BLOB)) AS bytes
+        FROM ardud_kanban_wiki WHERE board_id = ${boardId}
+          ${slugs === undefined ? sql`` : sql`AND slug IN ${sql.in(slugs)}`}
+        ORDER BY slug`,
     );
   const putWiki = (page: KanbanWikiPage) =>
     run(
@@ -2043,6 +2066,7 @@ const make = Effect.gen(function* () {
     automations,
     putAutomation,
     wiki,
+    wikiIndex,
     putWiki,
     threadLink,
     threadLinksByIds,

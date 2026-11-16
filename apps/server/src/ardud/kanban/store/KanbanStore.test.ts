@@ -55,6 +55,34 @@ import * as Rules from "../engine/rules.ts";
 
 const TestLayer = KanbanStore.layer.pipe(Layer.provideMerge(Sqlite.layerMemory));
 
+it.effect("wiki selection and metadata do not decode unrelated page bodies", () =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const sql = yield* SqlClient.SqlClient;
+    const page: KanbanWikiPage = {
+      boardId: KanbanBoardId.make("board-wiki"),
+      slug: "selected",
+      title: "Selected",
+      body: "café 😀",
+      updatedAt: "2026-11-16T00:00:00.000Z",
+      updatedBy: { _tag: "owner" },
+    };
+    yield* store.putWiki(page);
+    yield* store.putWiki({ ...page, slug: "unrelated" });
+    yield* sql`UPDATE ardud_kanban_wiki SET json = json_set(json, '$.body', 42) WHERE slug = 'unrelated'`;
+    assert.deepStrictEqual(yield* store.wiki(page.boardId, ["selected"]), [page]);
+    assert.deepStrictEqual(yield* store.wiki(page.boardId, ["missing"]), []);
+    const index = yield* store.wikiIndex(page.boardId);
+    assert.equal(index[0]?.bytes, Buffer.byteLength(page.body, "utf8"));
+    assert.deepStrictEqual(
+      index.map((row) => row.slug),
+      ["selected", "unrelated"],
+    );
+    assert.isFalse(index.some((row) => "body" in row));
+    assert.isTrue((yield* Effect.exit(store.wiki(page.boardId)))._tag === "Failure");
+  }).pipe(Effect.provide(TestLayer)),
+);
+
 const model = { instanceId: ProviderInstanceId.make("opencode"), model: "opus/claude-opus-5-5" };
 const at = "2026-10-25T13:00:00.000Z";
 const boardId = KanbanBoardId.make("board-1");
