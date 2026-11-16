@@ -5,6 +5,7 @@ import { NodeHttpServer } from "@effect/platform-node";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import {
+  AnalyticsEvent,
   EnvironmentId,
   OrchestratorMcpFailure,
   PreviewTabId,
@@ -51,12 +52,14 @@ import { OrchestratorToolkit } from "./toolkits/orchestrator/tools.ts";
 import { ProjectToolkit } from "./toolkits/project/tools.ts";
 import * as ReplyBuilders from "../ardud/http/ReplyBuilders.ts";
 import { KanbanService } from "../ardud/kanban/engine/KanbanService.ts";
+import * as Analytics from "../ardud/analytics/Analytics.ts";
 import * as McpCallAnalytics from "../ardud/analytics/McpCall.ts";
 
 const environmentId = EnvironmentId.make("environment-mcp-test");
 const threadId = ThreadId.make("thread-mcp-test");
 const tabId = PreviewTabId.make("tab-mcp-test");
 const alternateTabId = PreviewTabId.make("tab-mcp-alternate");
+const decodeAnalyticsEvent = Schema.decodeUnknownEffect(AnalyticsEvent);
 const decodeJsonText = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const encodeOrchestratorFailure = Schema.encodeSync(OrchestratorMcpFailure);
 const invocation = {
@@ -616,14 +619,7 @@ it.effect("uses one scheduled-read budget across lane, readiness and handler", (
   }),
 );
 
-it.effect.each([
-  "board_get",
-  "board_activity",
-  "card_get",
-  "discussion_read",
-  "card_search",
-  "t3_thread_read",
-])("traces %s without adding a scheduled-read deadline", (name) =>
+it.effect.each(["t3_thread_read"])("traces %s without adding a scheduled-read deadline", (name) =>
   Effect.gen(function* () {
     const entered = yield* Deferred.make<void>();
     const release = yield* Deferred.make<void>();
@@ -670,6 +666,106 @@ it.effect.each([
       expect(span?.attributes.has("taskCount")).toBe(false);
     }).pipe(Effect.provide(layer), Effect.withTracer(tracer));
   }),
+);
+
+const boardReadNames = [
+  "board_get",
+  "board_activity",
+  "card_get",
+  "wiki_read",
+  "discussion_read",
+  "card_search",
+];
+
+it.effect.each(
+  boardReadNames.flatMap((name) =>
+    (["lane", "readiness", "handler", "masked handler"] as const).flatMap((blocked) =>
+      (["timeout", "disconnect"] as const).map((ending) => ({ name, blocked, ending })),
+    ),
+  ),
+)(
+  "bounds $name during $blocked on $ending and records the reached phase",
+  ({ name, blocked, ending }) =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const cleaned = yield* Deferred.make<void>();
+      const recorded = yield* Deferred.make<AnalyticsEvent>();
+      const stuck = Deferred.succeed(entered, undefined).pipe(
+        Effect.andThen(Deferred.await(release)),
+      );
+      const handler =
+        blocked === "handler" || blocked === "masked handler"
+          ? (blocked === "masked handler" ? Effect.uninterruptible(stuck) : stuck).pipe(
+              Effect.as({ ready: true }),
+              Effect.ensuring(Deferred.succeed(cleaned, undefined)),
+            )
+          : Effect.succeed({ ready: true });
+      const toolkit = Toolkit.make(
+        Tool.make(name, {
+          description: "Synthetic board read.",
+          success: Schema.Struct({ ready: Schema.Boolean }),
+        }),
+      );
+      const registration = McpHttpServer.toolkitRegistration(
+        toolkit,
+        McpToolAccess.toLayer(toolkit, { [name]: McpToolAccess.reads(() => handler) }),
+      ).pipe(
+        Layer.provideMerge(McpServer.McpServer.layer),
+        Layer.provideMerge(ReplyBuilders.layer),
+        Layer.provide(
+          Layer.mock(BoardsDatabase)({
+            ready: blocked === "readiness" ? stuck : Effect.void,
+            path: "/synthetic/boards.sqlite",
+          }),
+        ),
+        Layer.provide(
+          Layer.mock(Analytics.Analytics)({
+            record: (row) =>
+              row.kind === "mcp.call"
+                ? Deferred.succeed(recorded, row).pipe(Effect.asVoid)
+                : Effect.void,
+          }),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const builders = yield* ReplyBuilders.ReplyBuilders;
+        const lane = name === "wiki_read" ? "wiki" : "mcp";
+        if (blocked === "lane") yield* builders[lane].take(ReplyBuilders.PERMITS[lane]);
+        const pending = yield* callTool(name, {}).pipe(Effect.forkChild);
+        if (blocked !== "lane") yield* Deferred.await(entered);
+        yield* TestClock.adjust(ending === "disconnect" ? "100 millis" : "20 seconds");
+        const phase =
+          blocked === "lane" && name === "wiki_read"
+            ? "admission"
+            : blocked === "masked handler"
+              ? "handler"
+              : blocked;
+        const waitedMs = ending === "disconnect" ? 100 : 20000;
+        if (ending === "disconnect") yield* Fiber.interrupt(pending);
+        else {
+          const result = yield* Fiber.join(pending);
+          expect(result.isError).toBe(true);
+          expect(result.structuredContent).toEqual({ reason: "server_busy", phase, waitedMs });
+          expect(result.content).toEqual([
+            { type: "text", text: "Robob is busy; nothing was read. Retry the same call." },
+          ]);
+        }
+        const row = yield* Deferred.await(recorded);
+        expect(yield* decodeAnalyticsEvent(row)).toMatchObject({
+          tool: name,
+          phase,
+          waitedMs,
+          outcome: ending === "disconnect" ? "interrupted" : "timeout",
+        });
+        if (blocked === "lane") yield* builders[lane].release(ReplyBuilders.PERMITS[lane]);
+        // Every permit is available even while a masked handler still unwinds.
+        expect(yield* builders[lane].takeIfAvailable(ReplyBuilders.PERMITS[lane])).toBe(true);
+        yield* builders[lane].release(ReplyBuilders.PERMITS[lane]);
+        if (blocked === "masked handler") expect(yield* Deferred.isDone(cleaned)).toBe(false);
+        if (blocked === "handler") yield* Deferred.await(cleaned);
+      }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)), Effect.provide(registration));
+    }),
 );
 
 const WikiReadToolkit = Toolkit.make(
@@ -728,10 +824,9 @@ it.effect.each([
         const result = yield* Fiber.join(pending);
         expect(result.isError).toBe(true);
         expect(result.structuredContent).toMatchObject({
-          _tag: "WikiReadTimeoutError",
+          reason: "server_busy",
           phase,
           waitedMs: 20000,
-          retryable: true,
         });
         if (blocked === "admission") yield* builders.wiki.release(ReplyBuilders.PERMITS.wiki);
         // Taking every permit before unblocking cleanup proves none was retained.

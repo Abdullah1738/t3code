@@ -58,6 +58,7 @@ import * as ThreadReadMetrics from "../ardud/analytics/ThreadReadMetrics.ts";
 import * as McpResponseDelivery from "../ardud/http/McpResponseDelivery.ts";
 import * as SavedWrite from "../ardud/kanban/engine/savedWrite.ts";
 import * as McpHttpServer from "./McpHttpServer.ts";
+import * as BoundedReadDeadline from "./BoundedReadDeadline.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpToolAccess from "./McpToolAccess.ts";
 import {
@@ -1404,12 +1405,19 @@ it.effect.each(outcomeCases)(
 
 const wikiLaneCases = (["caller", "body"] as const).flatMap((stage) =>
   (["foreground", "background", "writer"] as const).flatMap((routedLane) =>
-    (["success", "timeout"] as const).map((ending) => ({ stage, routedLane, ending })),
+    (["success", "timeout", "disconnect"] as const).flatMap((ending) =>
+      (["linked", "unlinked"] as const).map((callerResult) => ({
+        stage,
+        routedLane,
+        ending,
+        callerResult,
+      })),
+    ),
   ),
 );
 it.effect.each(wikiLaneCases)(
-  "wiki_read emits routed $stage lane $routedLane on $ending",
-  ({ stage, routedLane, ending }) =>
+  "wiki_read emits routed $stage lane $routedLane on $ending with $callerResult caller",
+  ({ stage, routedLane, ending, callerResult }) =>
     Effect.gen(function* () {
       const recorded = yield* Deferred.make<AnalyticsEvent>();
       const entered = yield* Deferred.make<void>();
@@ -1429,11 +1437,13 @@ it.effect.each(wikiLaneCases)(
               if (phase === "caller") yield* TestClock.adjust("5 millis");
               if (phase === stage) {
                 yield* Deferred.succeed(entered, undefined);
-                if (ending === "timeout") yield* Deferred.await(release);
+                if (ending !== "success") yield* Deferred.await(release);
               }
               if (lane !== "writer") acquired?.(phase === "caller" ? 5 : 0, lane);
               finish?.(lane, true);
-              return { boardId: "board-robob" };
+              return phase === "caller" && callerResult === "unlinked"
+                ? null
+                : { boardId: "board-robob" };
             }),
           );
         yield* read("caller");
@@ -1468,15 +1478,23 @@ it.effect.each(wikiLaneCases)(
           .pipe(Effect.provideService(McpSchema.McpServerClient, client), Effect.forkChild);
         yield* Deferred.await(entered);
         if (ending === "timeout") yield* TestClock.adjust("20 seconds");
-        yield* Fiber.join(pending);
+        if (ending === "disconnect") {
+          yield* TestClock.adjust("100 millis");
+          yield* Fiber.interrupt(pending);
+        } else yield* Fiber.join(pending);
         const row = yield* Deferred.await(recorded);
         expect(yield* decodeAnalyticsEvent(row)).toMatchObject({
           tool: "wiki_read",
-          outcome: ending === "timeout" ? "timeout" : "ok",
-          callerResolved: !(stage === "caller" && ending === "timeout"),
-          callerResolveMs: stage === "caller" && ending === "timeout" ? 20000 : 5,
+          outcome: ending === "success" ? "ok" : ending === "timeout" ? "timeout" : "interrupted",
+          callerResolved:
+            callerResult === "linked" && !(stage === "caller" && ending !== "success"),
+          callerResolveMs:
+            stage === "caller" && ending !== "success" ? (ending === "timeout" ? 20000 : 105) : 5,
           callerReaderLane: stage === "caller" ? routedLane : "foreground",
-          readerLane: ending === "timeout" || stage === "body" ? routedLane : "foreground",
+          readerLane: ending !== "success" || stage === "body" ? routedLane : "foreground",
+          ...(ending === "success"
+            ? {}
+            : { phase: stage, waitedMs: ending === "timeout" ? 20000 : 105 }),
           ...(ending === "timeout" ? { props: { phase: stage } } : {}),
         });
       }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)), Effect.provide(registration));
@@ -2612,5 +2630,43 @@ it.effect("records a late detached create with the original HTTP call's correlat
       expect(JSON.stringify(detached)).not.toContain(args.clientRequestId);
       yield* decodeAnalyticsEvent(detached);
     }).pipe(Effect.provide(registration));
+  }),
+);
+
+it.effect.each([
+  {
+    name: "typed failure",
+    cause: Cause.fail(
+      new OrchestratorMcpFailure({ code: "orchestration_error", message: "Cleanup failed." }),
+    ),
+  },
+  { name: "defect", cause: Cause.die(new Error("Cleanup failed.")) },
+])("read deadline wins over a late cleanup $name before analytics serialization", ({ cause }) =>
+  Effect.gen(function* () {
+    const state: McpCall.McpCall["Service"] = {
+      callerResolved: true,
+      callerResolveMs: 0,
+      readerLane: "background",
+      readOnly: true,
+      phase: "handler",
+      saved: "unknown",
+    };
+    yield* Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const pending = yield* BoundedReadDeadline.withDeadline(
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+        () => ({ phase: "handler", waitedMs: 20000 }),
+      ).pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust("20 seconds");
+      const reply = yield* Fiber.join(pending);
+      // The detached handler can report cleanup failure before the ledger builds its row.
+      yield* McpCall.handlerFailure(cause);
+      expect(McpCall.callOutcome(Exit.succeed(reply), state)).toMatchObject({
+        outcome: "timeout",
+        errorTag: "TimeoutError",
+      });
+      expect(state.boundedRead).toEqual({ phase: "handler", waitedMs: 20000 });
+    }).pipe(Effect.provideService(McpCall.McpCall, state));
   }),
 );
