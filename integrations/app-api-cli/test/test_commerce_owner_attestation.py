@@ -270,6 +270,8 @@ class OwnerAttestationTests(unittest.TestCase):
     def test_v1_schema_migrates_once_preserving_operations_and_fence(self):
         before = journal.inspect(self.flow)
         with sqlite3.connect(self.root / 'journal.sqlite') as db:
+            # b63bddc127 added baskets in v4; a v1 fixture must not retain it.
+            db.execute('DROP TABLE baskets')
             db.execute('DROP TABLE owner_attestations')
             db.execute('DROP TABLE duplicate_closures')
             db.execute('DROP INDEX active_account')
@@ -277,7 +279,7 @@ class OwnerAttestationTests(unittest.TestCase):
             db.execute('PRAGMA user_version=1')
         self.assertEqual(journal.inspect(self.flow), before)
         with sqlite3.connect(self.root / 'journal.sqlite') as db:
-            self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0], 3)
+            self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0], 4)
         with self.provider():
             self.close()
         self.assertEqual(journal.inspect(self.flow)['state'], 'OWNER_ATTESTED_UNCHARGED')

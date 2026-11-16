@@ -139,6 +139,7 @@ const makeFake = () => {
                 model: later.model,
               };
         }),
+      backgroundStoppedSince: () => Effect.succeed(false),
       runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       launch: (input) =>

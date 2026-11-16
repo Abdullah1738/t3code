@@ -427,7 +427,7 @@ class GoRepairTests(unittest.TestCase):
             (home / 'w').mkdir()
             (home / 'w/go.mod').write_text('module repair-fixture\n')
             env = clean_env(HOME=tmp, PATH=f'{bins}:/usr/bin:/bin', FAKE_GOROOT=str(root))
-            with patch.object(runs, 'DOCKER_REPAIR', ':'), patch.object(runs, 'LDCACHE_REPAIR', ':'), \
+            with patch.object(runs, 'DOCKER_REPAIR', ':'), patch.multiple(runs, LDCACHE_REPAIR=':', SQLITE_SETUP=':'), \
                     patch.object(runs.userns, 'setup', return_value=':'):
                 script = remote_script('w', '.', ['echo USER_COMMAND'], None, 'test', repo_root=home / 'w')
             script = script.replace(
@@ -518,7 +518,7 @@ class NonGoRepairTests(unittest.TestCase):
                     repair = GO_REPAIR.replace('/usr/local', str(fx.local)).replace(
                         '/tmp/offbox-go-repair.lock', str(fx.home / 'repair.lock'))
                     with patch.object(runs, 'GO_REPAIR', repair), patch.object(runs, 'DOCKER_REPAIR', ':'), \
-                         patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs, 'WATCH_REPAIR', ':'), \
+                         patch.multiple(runs, LDCACHE_REPAIR=':', SQLITE_SETUP=':'), patch.object(runs, 'WATCH_REPAIR', ':'), \
                          patch.object(runs.userns, 'setup', return_value=':'), \
              patch.object(runs.containers, 'script', return_value=':'), \
                          patch.object(runs.node_tools, 'block', return_value=':'):

@@ -367,7 +367,7 @@ class BlockRunTests(unittest.TestCase):
             w = node_version.want(repo, repo)
             blk = node_version.block(w)
             with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
-                    patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs.userns, 'setup', return_value=':'):
+                    patch.multiple(runs, LDCACHE_REPAIR=':', SQLITE_SETUP=':'), patch.object(runs.userns, 'setup', return_value=':'):
                 script = runs.remote_script('w/repo', '.', cmd_argv or ['node --version'], None, 'run-test',
                                             steps=steps, node=blk)
             bindir = Path(home) / 'bin'

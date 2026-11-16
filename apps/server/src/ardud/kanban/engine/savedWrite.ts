@@ -23,10 +23,12 @@ export const subStepObserver = Context.Reference<
 >("KanbanSavedWriteSubSteps", { defaultValue: () => undefined });
 
 // Reuse existing operation spans, including interrupted SQL admission. No extra
-// spans or detail rows on fast calls; count only time while a board permit is held.
+// spans or detail rows on fast calls. Evaluator calls also count launch I/O
+// outside the board permit, where command-receipt reads can wait on a reader.
 export const subSteps = Effect.fnUntraced(function* <A, E, R>(
   name: string,
   effect: Effect.Effect<A, E, R>,
+  includeOutsideLocks = false,
 ) {
   const delegate = yield* Tracer.Tracer;
   const parent = yield* subStepObserver;
@@ -74,31 +76,41 @@ export const subSteps = Effect.fnUntraced(function* <A, E, R>(
     },
     ...(delegate.context ? { context: delegate.context } : {}),
   });
+  const hold = (fiberId: number) => {
+    const held = { fiberId, since: now(), totals: new Map<string, number>() };
+    holds.add(held);
+    return (long: boolean) => {
+      account(fiberId);
+      holds.delete(held);
+      if (!long) return undefined;
+      return [...held.totals]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 3)
+        .map(([subStep, ms]) => ({
+          subStep:
+            subStep.length <= 160 && /^[a-zA-Z0-9_.:/#@%+-]+$/.test(subStep) ? subStep : "unknown",
+          ms,
+        }));
+    };
+  };
+  const finish = includeOutsideLocks ? hold(yield* Effect.fiberId) : undefined;
+  const report = yield* subStepReporter;
   return yield* effect.pipe(
+    // Lock collectors still return their diagnostics, but only the enclosing
+    // whole-call collector publishes to the reply ledger.
+    (effect) =>
+      includeOutsideLocks ? effect.pipe(Effect.provideService(subStepReporter, () => {})) : effect,
     Effect.withTracer(tracer),
     Effect.provideService(subStepObserver, {
       tracer: parent?.tracer ?? delegate,
-      hold(fiberId) {
-        const started = now();
-        const hold = { fiberId, since: started, totals: new Map<string, number>() };
-        holds.add(hold);
-        return (long) => {
-          account(fiberId);
-          holds.delete(hold);
-          if (!long) return undefined;
-          return [...hold.totals]
-            .sort((a, b) => b[1] - a[1])
-            .slice(0, 3)
-            .map(([subStep, ms]) => ({
-              subStep:
-                subStep.length <= 160 && /^[a-zA-Z0-9_.:/#@%+-]+$/.test(subStep)
-                  ? subStep
-                  : "unknown",
-              ms,
-            }));
-        };
-      },
+      hold,
     }),
+    Effect.ensuring(
+      Effect.sync(() => {
+        const steps = finish?.(now() >= LONG_HOLD_MS);
+        if (steps !== undefined) report(steps);
+      }),
+    ),
   );
 });
 
@@ -109,9 +121,23 @@ export const afterCommit = Context.Reference<(confirm: () => void) => void>(
     defaultValue: () => (confirm) => confirm(),
   },
 );
+const requestCommitEvidence = Context.Reference<boolean>("KanbanSavedWriteRequestCommitEvidence", {
+  defaultValue: () => true,
+});
+
+// Setup may persist a discussion while the incoming request is still unsaved.
+export const preparatory = Effect.fn("KanbanSavedWrite.preparatory")(function* <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+) {
+  return yield* effect.pipe(
+    Effect.provideService(observer, () => {}),
+    Effect.provideService(requestCommitEvidence, false),
+  );
+});
+
 export const committed = Effect.fnUntraced(function* () {
   const call = yield* Effect.serviceOption(McpCall);
-  if (call._tag === "Some" && call.value.boardWrite)
+  if (call._tag === "Some" && call.value.boardWrite && (yield* requestCommitEvidence))
     (yield* afterCommit)(() => {
       call.value.saved = true;
       delete call.value.refusedAt;
@@ -225,7 +251,7 @@ export const commitObserver = Context.Reference<() => void>("KanbanSavedWriteCom
 
 // Runs at every store write; the enclosing lock operation already supplies its span.
 export const committing = Effect.gen(function* () {
-  yield* writeCommitting();
+  if (yield* requestCommitEvidence) yield* writeCommitting();
   const trace = yield* traceObserver;
   trace?.mark("commit", yield* Effect.fiberId);
   (yield* commitObserver)();

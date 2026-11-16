@@ -1599,7 +1599,8 @@ const withToolAnalytics =
                         parentSaved(receipt);
                       }),
                       Effect.provideService(SavedWrite.commitObserver, () => {
-                        if (callState.saved !== true) callState.saved = "unknown";
+                        // Board writes scope commit evidence to the incoming request in SavedWrite.
+                        if (!boardWrite && callState.saved !== true) callState.saved = "unknown";
                         parentCommitting();
                       }),
                       Effect.onExit((exit) => {

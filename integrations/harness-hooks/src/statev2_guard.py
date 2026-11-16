@@ -1706,10 +1706,70 @@ def _source_hit(source, directory, python=False, shell=False):
     return bool(database and (live_root or home_userdata))
 
 
-def _isolated_migration_source(source, directory):
+def _isolated_migration_history_helpers(location):
+    # These are the only imported helpers that select history files. Read the
+    # checkout being inspected, never a helper from the guard's own checkout.
+    root = Path(os.path.realpath(location)).parent.parent / 'src/ardud/persistence'
+
+    def reject(name):
+        raise LiveRead('live-database-script', f"{root / name}: guard's module pin needs re-auditing; isolated migration refused.")
+
+    bodies = []
+    for name in ('historySourceFiles.ts', 'historyArchiveSql.ts'):
+        try:
+            with (root / name).open('rb') as handle:
+                info = os.fstat(handle.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_SOURCE_BYTES:
+                    reject(name)
+                body = handle.read(MAX_SOURCE_BYTES + 1)
+            if len(body) > MAX_SOURCE_BYTES:
+                reject(name)
+            bodies.append(body.decode('utf-8'))
+        except (OSError, UnicodeError):
+            reject(name)
+    history, archive = bodies
+    # A whole-helper shape proves the basename check and the source-directory
+    # join together; accepting the return expression alone could hide a write.
+    expected = r'''// integrations/harness-hooks/src/statev2_guard.py::_isolated_migration_source proves this shape; run its tests after changes.
+
+import type * as Path from "effect/Path";
+
+/** Also serialized into the readonly export worker; keep runtime dependencies explicit. */
+export function resolveHistoryBasePath(
+  path: Pick<Path.Path, "dirname" | "basename" | "join">,
+  sourcePath: string,
+  rows: ReadonlyArray<{ readonly filename: unknown }>,
+) {
+  if (rows.length === 0) return undefined;
+  const filename = rows[0]!.filename;
+  if (
+    rows.length !== 1 ||
+    typeof filename !== "string" ||
+    !/^statev2\.pre-shrink-[^/\\]+\.sqlite$/.test(filename) ||
+    path.basename(filename) !== filename
+  )
+    throw new Error("Invalid readonly history base filename");
+  return path.join(path.dirname(sourcePath), filename);
+}'''
+    if history.strip() != expected:
+        reject('historySourceFiles.ts')
+    # Node executes the entire imported module. Pin the audited SQL-only body,
+    # including imports and initializers: a safe archiveFilename alone cannot
+    # discharge extra runtime I/O. Re-audit the whole module before changing it.
+    if hashlib.sha256(archive.encode('utf-8')).hexdigest() != 'cc4ac6791b0764fc1c33f89fb8682bfbb795f14a5b007efbe53e5454a566400e':
+        reject('historyArchiveSql.ts')
+    archive_name = r'export const archiveFilename = \(filename: string\) =>\s*NodePath\.join\(NodePath\.dirname\(filename\), "archive\.sqlite"\);'
+    return len(re.findall(archive_name, archive)) == 1
+
+
+def _isolated_migration_source(source, directory, location):
     # Discharge the one default-source expression only after the caller has
     # supplied isolated --source and --base-dir arguments. All other source
     # text still goes through the live-path check.
+    # A literal home root can assemble a second live path after the default
+    # is discharged, even when its segments escape the ordinary source scan.
+    if re.search(r'''['"`]/(?:Users|home|root|var/root|private)(?=/|['"`])''', source):
+        return False
     default = re.compile(r'const sourcePath = path\.resolve\(\s*input\.source \?\? path\.join\(sharedHome, "userdata", "statev2\.sqlite"\),\s*\);')
     if len(default.findall(source)) != 1 or source.count('NodeOS.homedir()') != 1:
         return False
@@ -1729,13 +1789,52 @@ def _isolated_migration_source(source, directory):
     options = r'Command\.make\(\s*"migrate-dev-db",\s*\{\s*' + integer('projects', 'projects') + r'\s*' + integer('threadsPerProject', 'threads-per-project') + r'\s*' + string('baseDir', 'base-dir') + r'\s*' + string('source', 'source') + r'\s*\},\s*' + callback.pattern
     if len(re.findall(options, source)) != 1:
         return False
-    # The source argument must reach the sole ATTACH, and every SQLite client
+    # The source argument must reach the read-only ATTACHes, and every SQLite client
     # must open a destination. An isolated CLI flag proves neither by itself.
     if len(re.findall(r'\bcopySourceSlice\b', source)) != 2 or len(re.findall(r'copySourceSlice\(sourcePath\)', source)) != 1:
         return False
-    attach = 'ATTACH DATABASE ${`${NodeURL.pathToFileURL(sourcePath).href}?mode=ro`} AS src'
-    if source.count(attach) != 1 or len(re.findall(r'\bATTACH\b', source)) != 1:
+    attaches = [f'ATTACH DATABASE ${{`${{NodeURL.pathToFileURL({operand}).href}}?mode=ro`}} AS {schema}'
+                for operand, schema in (('sourcePath', 'src'), ('archivePath', 'cold'), ('basePath', 'base'))]
+    if any(source.count(attach) != 1 for attach in attaches) or len(re.findall(r'\bATTACH\b', source)) != 3:
         return False
+    copy_start = 'const copySourceSlice = Effect.fn("copyDevDbSourceSlice")(function* (sourcePath: string) {'
+    if source.count(copy_start) != 1:
+        return False
+    copy_body = source.split(copy_start, 1)[1].split('\nconst pruneSnapshot =', 1)[0]
+    if any(attach not in copy_body for attach in attaches):
+        return False
+    if not _isolated_migration_history_helpers(location):
+        return False
+    # Remove complete, proven derivations before checking every remaining use.
+    # An extra alias, mutation, reader or writer of either history path fails.
+    history_uses = source
+    history_forms = (
+        r'import \{ resolveHistoryBasePath \} from "../src/ardud/persistence/historySourceFiles\.ts";',
+        r'import \{\s*archiveFilename,\s*HISTORY_TABLES,\s*liveColumns,\s*\} from "../src/ardud/persistence/historyArchiveSql\.ts";',
+        r'const archivePath = archiveFilename\(sourcePath\);',
+        r'const archivePath = `\$\{archiveFilename\(databasePath\)\}\$\{suffix\}`;',
+        r'const baseRows = hasTable\("ardud_history_base_archive"\)\s*\? yield\* sql<\{\s*filename: string;\s*\}>`SELECT filename FROM src\.ardud_history_base_archive LIMIT 2`\s*: \[\];',
+        r'const basePath = yield\* Effect\.try\(\{\s*try: \(\) => resolveHistoryBasePath\(path, sourcePath, baseRows\),\s*catch: \(\) =>\s*new MigrateDevDbHistoryArchiveError\(\{\s*sourcePath,\s*archivePath: sourcePath,\s*reason: "invalid-base",\s*\}\),\s*\}\);',
+    )
+    for form in history_forms:
+        if len(re.findall(form, history_uses)) != 1:
+            return False
+        history_uses = re.sub(form, '', history_uses)
+    for attach in attaches:
+        history_uses = history_uses.replace(attach, '')
+    history_uses = re.sub(r'new MigrateDevDbHistoryArchiveError\(\{\s*sourcePath,\s*archivePath(?:: basePath)?,\s*reason: "(?:missing|identity-mismatch)",\s*\}\)|new MigrateDevDbDestinationArchiveError\(\{ databasePath, archivePath \}\)', 'guard_history_error', history_uses)
+    history_uses = re.sub(r'\barchivePath: Schema\.String|\bthis\.archivePath\b|\bfs\.exists\((?:archivePath|basePath)\)|\bbasePath !== undefined', 'guard_history_use', history_uses)
+    if re.search(r'\b(?:archiveFilename|resolveHistoryBasePath|archivePath|basePath)\b', history_uses):
+        return False
+    if len(re.findall(r'\bbaseRows\b', history_uses)) != 0:
+        return False
+    for binding in (
+        'const stateDir = path.join(baseDir, "userdata");',
+        'const databasePath = path.join(stateDir, "statev2.sqlite");',
+        'const snapshotPath = `${databasePath}.migrate-dev-db-tmp`;',
+    ):
+        if source.count(binding) != 1:
+            return False
     database_uses = re.sub(r'import \* as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";', '', source)
     database_uses = re.sub(r'NodeSqliteClient\.layer\(\{ filename: (?:databasePath|snapshotPath) \}\)', 'guard_destination_client', database_uses)
     if re.search(r'\bNodeSqliteClient\b', database_uses):
@@ -1745,15 +1844,22 @@ def _isolated_migration_source(source, directory):
     if re.search(r'\bsharedHome\b', homes):
         return False
     home_api = homes.replace('import * as NodeOS from "node:os";', '')
-    url_api = source.replace('import * as NodeURL from "node:url";', '').replace(attach, '')
+    url_api = source.replace('import * as NodeURL from "node:url";', '')
+    for attach in attaches:
+        url_api = url_api.replace(attach, '')
     if re.search(r'\bNodeOS\b', home_api) or re.search(r'\bNodeURL\b', url_api):
         return False
     path_api = re.sub(r'const path = yield\* Path\.Path;', '', source)
+    path_api = path_api.replace('resolveHistoryBasePath(path, sourcePath, baseRows)', 'guard_history_base')
     path_api = re.sub(r'\bpath\.(?:join|resolve|dirname)\s*(?=\()', 'guard_path_operation', path_api)
     path_api = path_api.replace('path to a real statev2.sqlite', 'guard_source_help').replace('path this command rewrites', 'guard_destination_help')
     if re.search(r'\bpath\b', path_api):
         return False
     source_uses = default.sub('', source)
+    source_uses = source_uses.replace('resolveHistoryBasePath(path, sourcePath, baseRows)', 'guard_history_base')
+    source_uses = source_uses.replace('archiveFilename(sourcePath)', 'guard_history_archive')
+    source_uses = source_uses.replace('archivePath: sourcePath', 'guard_history_error')
+    source_uses = re.sub(r'(new MigrateDevDbHistoryArchiveError\(\{\s*)sourcePath,', r'\1guard_source_error,', source_uses)
     source_uses = re.sub(r'\bsourcePath: (?:Schema\.String|string)|\bthis\.sourcePath\b|\{ sourcePath \}(?=\))|\$\{sourcePath\}|\bdatabasePath: sourcePath\b', 'guard_source_use', source_uses)
     source_uses = re.sub(r'\b(?:copySourceSlice|NodeURL\.pathToFileURL|fs\.exists|fs\.stat)\(sourcePath\)|\.realPath\(sourcePath\)|\(\) => sourcePath\b', 'guard_source_read', source_uses)
     if re.search(r'\bsourcePath\b', source_uses):
@@ -3037,7 +3143,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                     return
                 source = handle.read(MAX_SOURCE_BYTES + 1)
             if len(source) <= MAX_SOURCE_BYTES:
-                if migration_args is not None and _isolated_migration_source(source.decode('utf-8', errors='replace'), directory):
+                if migration_args is not None and _isolated_migration_source(source.decode('utf-8', errors='replace'), directory, path):
                     migration_source(migration_args, directory)
                     return
                 check_source(source.decode("utf-8", errors="replace"), directory, path.suffix == ".py", shell=shell, test_target=test_target, location=path)

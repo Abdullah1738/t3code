@@ -10,6 +10,8 @@ It exercises the real v2 projection and client reducers. This matters because th
 built-app benchmark fixtures seed v1 orchestration events; running those fixtures against a v2
 client can produce reassuring timings while missing the active transport path.
 
+Before merging changes to `apps/server/src/orchestration-v2/{ProjectionStore,ShellQueries,IdSetQueries,ProjectStore}.ts`, include `apps/server/src/ardud/perf/queryPlan.test.ts` in the focused tests (`cd apps/server && vp test run src/ardud/perf/queryPlan.test.ts`), using the Node version in `packages/perf-harness/runtime.json` so the SQLite planner matches the reviewed exceptions.
+
 The v2 checks pin these invariants:
 
 - Client cold opens target 75 recent timeline rows and about 1 MiB of encoded data. Required

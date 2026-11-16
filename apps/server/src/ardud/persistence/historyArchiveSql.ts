@@ -1,3 +1,5 @@
+// integrations/harness-hooks/src/statev2_guard.py::_isolated_migration_source proves this shape; run its tests after changes.
+
 // Pure SQL construction also runs before the Effect layer exists; no filesystem I/O.
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodePath from "node:path";
