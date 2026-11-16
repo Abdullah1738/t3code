@@ -1992,13 +1992,16 @@ describe("queued current-state rollup", () => {
       items: [
         {
           card: 42,
+          stage: "needs_review",
+          role: "review",
           hours: 14,
           reason: "pool_full",
-          rank: 2,
-          ahead: { count: 1, items: [47] },
+          pool: Rules.poolKey(opus),
+          rank: 1,
+          ahead: { count: 0, items: [] },
           held: [{ card: 44, role: "work" }],
         },
-        { card: 47, hours: 12, reason: "pool_full", rank: 1 },
+        { card: 47, hours: 12, reason: "pool_full", rank: 2, ahead: { count: 1, items: [42] } },
         { card: 48, hours: 4, reason: "wait:ci" },
       ],
     });
