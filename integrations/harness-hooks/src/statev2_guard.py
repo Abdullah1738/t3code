@@ -2384,13 +2384,15 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
     invalidated_written = set()
     write_history = {}
     variable_written = set()
+    tool_changes = set()
     stdin_words, stdin_bodies = _stdin or ([], {})
     if _sources is not None:
-        prior_written, prior_invalidated, prior_history, prior_variable = _sources
+        prior_written, prior_invalidated, prior_history, prior_variable, prior_tool_changes = _sources
         written.update(prior_written)
         invalidated_written.update(prior_invalidated)
         write_history.update((path, list(history)) for path, history in prior_history.items())
         variable_written.update(prior_variable)
+        tool_changes.update(prior_tool_changes)
     unknown_cause = "directory changed in a conditional branch"
     conditional = 0
     inherited_values, inherited_unsafe, caller_command = _environment or ({}, False, None)
@@ -2416,6 +2418,9 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
     noclobber = False
 
     def affected_sources(path, descendants=False):
+        # Executable trust must survive the whole call, even writes before a
+        # script is remembered. None records an unbounded mutation.
+        tool_changes.add(path)
         if path is None:
             return set(written)
         affected = {remembered for remembered in written
@@ -2437,6 +2442,33 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             except OSError:
                 affected.add(remembered)
         return affected
+
+    def unchanged_tool(executable, directory):
+        if None in tool_changes:
+            return False
+        candidates = set()
+        if '/' not in executable:
+            # Relative PATH entries depend on the shell's current directory.
+            if any(not os.path.isabs(entry) for entry in os.get_exec_path()):
+                return False
+            candidates.update(_literal_path(str(Path(entry) / executable), directory) for entry in os.get_exec_path())
+            executable = shutil.which(executable)
+        path = _literal_path(executable, directory) if executable else None
+        if path is None:
+            return False
+        candidates.add(path)
+        for changed in tool_changes:
+            if any(candidate is None or candidate == changed or candidate.is_relative_to(changed) for candidate in candidates):
+                return False
+            for candidate in candidates:
+                try:
+                    if os.path.samefile(candidate, changed):
+                        return False
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    return False
+        return True
 
     def python_preserves_sources(source, directory):
         try:
@@ -2570,10 +2602,10 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             if (binary == 'node' and not unsafe_bindings and not os.environ.get('NODE_OPTIONS') and
                     'NODE_OPTIONS' not in shell_values and len(words) == 3 and words[1] in {'--check', '-c'} and
                     not words[2].startswith('-') and not any(name.startswith('BASH_FUNC_') for name in os.environ) and
-                    _trusted_fixture_tool(words[0], 'node', directory)):
+                    _trusted_fixture_tool(words[0], 'node', directory) and unchanged_tool(words[0], directory)):
                 return False
             if (binary in {'bash', 'sh', 'zsh', 'dash', 'ksh'} and len(words) == 3 and words[1] == '-n' and
-                    not words[2].startswith('-') and not unsafe_bindings and
+                    not words[2].startswith('-') and not unsafe_bindings and unchanged_tool(words[0], directory) and
                     # Bash's noexec mode also disables startup-file commands.
                     # Other shells retain their existing startup proof.
                     (binary == 'bash' and _trusted_fixture_tool(words[0], 'bash', directory) or
@@ -3058,7 +3090,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                             if STARTUP_ENV.fullmatch(name) or name in {'ZDOTDIR', 'PATH', 'IFS'}},
                            unsafe_bindings, caller_command if caller_command is not None else command)
         remote_paths = scripts_in(source, directory, _depth=depth,
-                                  _sources=(written, invalidated_written, write_history, variable_written),
+                                  _sources=(written, invalidated_written, write_history, variable_written, tool_changes),
                                   _stdin=(input_words, input_bodies or {}), _environment=environment)
         paths.extend(path for path in remote_paths if path not in paths)
         if len(paths) > MAX_SCRIPTS:
@@ -3266,6 +3298,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                         scan_remote(argv[0] if len(argv) == 1 else shlex.join(argv), directory, depth + 1,
                                     remote_input, remote_bodies, inherit_environment=True)
                     if may_change_scripts(words, directory, documents):
+                        tool_changes.add(None)
                         changed_sources.update(written)
                         fresh_variables.clear()
                 # Local output redirects still need the normal invalidation
@@ -3309,6 +3342,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         if cwd_only:
             return scan(" ".join(args), directory, depth + 1, cwd_only=True) if binary == "eval" else after
         if binary == 'unset' and all(re.fullmatch(r'[A-Za-z_]\w*', arg) for arg in args):
+            if 'PATH' in args:
+                unsafe_bindings = True
             for name in args:
                 invalidate_variable(name)
                 script_values.pop(name, None)
@@ -3323,10 +3358,13 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         stdin_sources = documents if exact_documents and not here_strings and not any(op == '<' for op, _ in redirects) else []
         changes_scripts = may_change_scripts(words, directory, stdin_sources)
         if changes_scripts:
+            tool_changes.add(None)
             changed_sources.update(written)
             opaque_written.clear()
             fresh_variables.clear()
         if binary == 'chmod':
+            tool_changes.update(_literal_path(candidate, directory) for arg in args if not arg.startswith('-')
+                                for candidate in script_variants(arg))
             opaque_written.clear()
             fresh_variables.clear()
         if words[0].startswith(('/', './', '../')) and re.search(r'\.(?:py|mjs|cjs|js|ts|sh)$', words[0]):
@@ -3698,6 +3736,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                             continue
                         targets = [group[i + 1] for i, token in enumerate(group[:-1]) if token in {'>', '>>'}]
                         if may_change_scripts(group, current):
+                            tool_changes.add(None)
                             invalidated_written.update(written)
                         if group and os.path.basename(group[0]) in {'cp', 'mv', 'rsync', 'ditto', 'tee', 'sed', 'perl', 'truncate'}:
                             targets += group[1:]

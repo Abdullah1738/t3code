@@ -202,6 +202,74 @@ class GuardTests(unittest.TestCase):
             with self.subTest(ownership=label), patch.object(os, 'stat', side_effect=metadata), patch.object(os.path, 'realpath', side_effect=lambda path, *a, **k: str(node) if str(path) == str(node) else realpath(path, *a, **k)):
                 self.assertEqual(self.classify(command), None if unsafe is None else UNRESOLVED)
 
+    def test_checked_intervening_tool_mutations(self):
+        home = (self.root / 'home').resolve()
+        node = self.write('home/.nvm/versions/node/v26.0.0/bin/node', '#!/bin/sh\nexit 0\n').resolve()
+        node.chmod(0o755)
+        symlink = self.root / 'node-symlink'
+        symlink.symlink_to(node)
+        hardlink = self.root / 'node-hardlink'
+        os.link(node, hardlink)
+        prefix = self.heredoc('tmp/checked.py', 'print(1)') + self.heredoc('tmp/checked.mjs', 'console.log(1)')
+        writer = '#!/bin/sh\ncp tmp/replacement.py tmp/checked.py\n'
+        edits = {
+            'heredoc': self.heredoc(str(node), writer),
+            'redirect': f'cat tmp/replacement.sh > {node}\n',
+            'append': f'cat tmp/replacement.sh >> {node}\n',
+            'tee': f'tee {node} <<\'EDIT\'\n{writer}EDIT\n',
+            'stdin write_text': "python3 -I - <<'EDIT'\nfrom pathlib import Path\n" + f'Path({str(node)!r}).write_text({writer!r})\nEDIT\n',
+            'stdin open': "python3 -I - <<'EDIT'\n" + f'open({str(node)!r}, "w").write({writer!r})\nEDIT\n',
+            'copy': f'cp tmp/replacement.sh {node}\n',
+            'move': f'mv tmp/replacement.sh {node}\n',
+            'sed': f'sed -i s/exit/cp/ {node}\n',
+            'replace directory': f'mv tmp/bin {node.parent}\n',
+            'replace link': f'ln -sf tmp/replacement.sh {node}\n',
+            'symlink alias': self.heredoc(str(symlink), writer),
+            'hardlink alias': self.heredoc(str(hardlink), writer),
+            'shell child': 'sh -c ' + shlex.quote(f'cat tmp/replacement.sh > {node}') + '\n',
+            'PATH binding': f'PATH={node.parent}:$PATH\n',
+            'unset PATH': 'unset PATH\n',
+            'shell alias': "alias node='cp tmp/replacement.py tmp/checked.py'\n",
+            'shell function': 'node() { cp tmp/replacement.py tmp/checked.py; }\n',
+            'hash binding': f'hash -p {node} node\n',
+        }
+        with patch.object(Path, 'home', return_value=home), patch.dict(os.environ, {'PATH': str(node.parent) + os.pathsep + os.environ['PATH']}):
+            self.assertTrue(guard._trusted_fixture_tool(str(node), 'node', self.root))
+            self.assertEqual(self.classify(prefix + 'node --check tmp/checked.mjs\npython3 -I tmp/checked.py'), None)
+            for executable in [str(node), 'node']:
+                for label, edit in edits.items():
+                    command = prefix + edit + executable + ' --check tmp/checked.mjs\npython3 -I tmp/checked.py'
+                    with self.subTest(executable=executable, mutation=label):
+                        rule, cause = guard.classify_detail(command, str(self.root))
+                        self.assertEqual(rule, UNRESOLVED, cause)
+                        self.assertIn('tmp/checked.py', cause)
+                        self.adapters(command, UNRESOLVED)
+            for label, command in {
+                'mutation before script creation': edits['heredoc'] + prefix + 'node --check tmp/checked.mjs\npython3 -I tmp/checked.py',
+                'opaque before script creation': 'unknown-program\n' + prefix + 'node --check tmp/checked.mjs\npython3 -I tmp/checked.py',
+                'offbox payload': prefix + edits['stdin write_text'] + "offbox run -- 'node --check tmp/checked.mjs; python3 -I tmp/checked.py'",
+                'bash executable': prefix + self.heredoc('/bin/bash', writer) + '/bin/bash -n tmp/checked.mjs\npython3 -I tmp/checked.py',
+            }.items():
+                with self.subTest(mutation=label):
+                    self.assertEqual(self.classify(command), UNRESOLVED)
+                    self.adapters(command, UNRESOLVED)
+            shadow = self.write('shadow/node', writer)
+            shadow.chmod(0o644)
+            shadow_link = self.root / 'shadow-hardlink'
+            os.link(shadow, shadow_link)
+            edits = {
+                'create PATH shadow': self.heredoc(str(shadow), writer),
+                'enable PATH shadow': f'chmod +x {shadow}\n',
+                'enable PATH shadow through hardlink': f'chmod +x {shadow_link}\n',
+                'stdin PATH shadow': "python3 -I - <<'EDIT'\nfrom pathlib import Path\n" + f'Path({str(shadow)!r}).write_text({writer!r})\nEDIT\n',
+            }
+            with patch.dict(os.environ, {'PATH': str(shadow.parent) + os.pathsep + os.environ['PATH']}):
+                for label, edit in edits.items():
+                    with self.subTest(resolution=label):
+                        command = prefix + edit + 'node --check tmp/checked.mjs\npython3 -I tmp/checked.py'
+                        self.assertEqual(self.classify(command), UNRESOLVED)
+                        self.adapters(command, UNRESOLVED)
+
     def test_checked_intervening_constructor_shadowing(self):
         bindings = {
             'match': 'match pick:\n case Path: pass',
