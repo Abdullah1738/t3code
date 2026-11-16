@@ -1,3 +1,5 @@
+import { assertLiveCallerShell } from "../../mcp/OrchestratorMcpService.ts";
+import { liveThreadShell } from "../../mcp/McpToolAccess.testkit.ts";
 import * as ProviderProcessRegistry from "../../ardud/providers/ProviderProcessRegistry.ts";
 import type { OrchestrationV2Run } from "@t3tools/contracts";
 import { continuedLaunchRecovery, nextLaunchRecovery } from "../launchRecovery.ts";
@@ -3365,6 +3367,81 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     });
   const makeWakeHarness = makeWakeHarnessWithOptions();
 
+  it.effect("keeps the current Claude wake caller live before continuation admission", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const sessions = yield* McpProviderSessions.McpProviderSessions;
+        const threadId = ThreadId.make("thread-claude-wake");
+        const caller = {
+          threadId,
+          providerSessionId: "wake-credential",
+          providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+        };
+        yield* sessions.set({
+          ...caller,
+          environmentId: EnvironmentId.make("test"),
+          endpoint: "http://localhost/mcp",
+          authorizationHeader: "Bearer test",
+          browserToolsAvailable: false,
+        });
+        const h = yield* makeWakeHarness;
+        const shell = {
+          ...liveThreadShell(threadId, { activeRunId: null }),
+          providerInstanceId: caller.providerInstanceId,
+        };
+        yield* h.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId,
+            providerThread: h.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("wake-access"),
+            text: "Start background work",
+            attachments: [],
+          }),
+        );
+        yield* h.offerAndWait(wakeTaskStarted);
+        yield* h.offerAndWait(turnOneResult);
+        yield* Queue.take(h.terminalReceipts);
+        yield* h.offerAndWait(wakeNotification);
+        assert.equal(yield* sessions.readWakeCaller(caller), "starting");
+        const gap = yield* assertLiveCallerShell(shell, caller).pipe(Effect.flip);
+        assert.equal(gap.code, "run_starting");
+        const firstTool = claudeSdkFrame({
+          type: "assistant",
+          message: {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_use",
+                id: "wake-board-write",
+                name: "mcp__t3-code__card_update",
+                input: { card: "#1038" },
+              },
+            ],
+          },
+          parent_tool_use_id: null,
+          uuid: "wake-board-write",
+          session_id: WAKE_NATIVE_SESSION,
+        });
+        yield* h.offerAndWait(firstTool);
+        // No continuation has been admitted: the first write must use native wake evidence.
+        assert.lengthOf(h.terminalEvents(), 1);
+        assert.lengthOf(h.continuationRequests, 1);
+        yield* assertLiveCallerShell(shell, caller);
+        yield* h.offerAndWait(wakeResult);
+        yield* assertLiveCallerShell(shell, caller);
+        yield* Queue.shutdown(h.sdkMessages);
+        yield* h.awaitQueryCleanup;
+        const ended = yield* assertLiveCallerShell(shell, caller).pipe(Effect.flip);
+        assert.equal(ended.code, "parent_not_active");
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
   it.effect.each(["lifecycle", "prompt_echo", "native_output"] as const)(
     "records same-attempt native %s evidence before orchestration receives it",
     (evidence) =>
@@ -4304,6 +4381,134 @@ describe("ClaudeAdapterV2 background wake turns", () => {
                 event.providerTurn.tokenUsage?.usedTokens === 400,
             ),
           );
+        }),
+      ).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
+  it.effect.each(["lifecycle", "init_echo"] as const)(
+    "gives a follow-up on the same open query its own acceptance and final result: %s",
+    (evidence) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const harness = yield* makeWakeHarness;
+          const acceptedAt: Array<number> = [];
+          for (const ordinal of [1, 2]) {
+            const input = {
+              ...makeClaudeTestTurnInput({
+                threadId: harness.threadId,
+                providerThread: harness.providerThread,
+                now: yield* DateTime.now,
+                attemptId: RunAttemptId.make(`same-query-${ordinal}`),
+                text: `Prompt ${ordinal}`,
+                attachments: [],
+                providerTurnOrdinal: ordinal,
+              }),
+              runOrdinal: ordinal,
+            };
+            yield* harness.runtime.startTurn(input);
+            const provisional = Option.getOrThrow(
+              yield* Stream.fromQueue(harness.providerTurnReceipts).pipe(
+                Stream.filter((event) => event.providerTurn.runAttemptId === input.attemptId),
+                Stream.take(1),
+                Stream.runHead,
+              ),
+            ).providerTurn;
+            assert.equal(provisional.status, "running");
+            assert.isUndefined(provisional.promptAcceptedAt);
+            assert.lengthOf(harness.processQueues, 1);
+            const promptUuid = harness.promptUuid(ordinal - 1);
+            if (ordinal === 2) assert.notEqual(promptUuid, harness.promptUuid(0));
+            yield* harness.offerAndWait(
+              claudeSdkFrame({
+                type: "command_lifecycle",
+                command_uuid: promptUuid,
+                state: "queued",
+              }),
+            );
+            const init = claudeSdkFrame({
+              type: "system",
+              subtype: "init",
+              uuid: `00000000-0000-4000-8000-00000000991${ordinal}`,
+              session_id: WAKE_NATIVE_SESSION,
+              user_message_uuids: [promptUuid],
+            });
+            yield* harness.offerAndWait(
+              evidence === "lifecycle"
+                ? claudeSdkFrame({
+                    type: "command_lifecycle",
+                    command_uuid: promptUuid,
+                    state: "started",
+                  })
+                : init,
+            );
+            const accepted = Option.getOrThrow(
+              yield* Stream.fromQueue(harness.providerTurnReceipts).pipe(
+                Stream.filter(
+                  (event) =>
+                    event.providerTurn.runAttemptId === input.attemptId &&
+                    event.providerTurn.promptAcceptedAt !== undefined,
+                ),
+                Stream.take(1),
+                Stream.runHead,
+              ),
+            ).providerTurn;
+            if (accepted.promptAcceptedAt === undefined) throw new Error("Prompt was not accepted");
+            acceptedAt.push(DateTime.toEpochMillis(accepted.promptAcceptedAt));
+            assert.equal(accepted.id, provisional.id);
+            if (evidence === "lifecycle") yield* harness.offerAndWait(init);
+            const text = `Result ${ordinal}`;
+            yield* harness.offerAndWait(
+              makeAssistantTextFrame({
+                uuid: `00000000-0000-4000-8000-00000000992${ordinal}`,
+                text,
+              }),
+            );
+            yield* harness.offerAndWait(
+              claudeSdkFrame({
+                ...makeResultFrame({
+                  uuid: `00000000-0000-4000-8000-00000000993${ordinal}`,
+                  result: text,
+                  terminalReason: null,
+                }),
+                user_message_uuid: promptUuid,
+                user_message_uuids: [promptUuid],
+              }),
+            );
+            const terminal = yield* Queue.take(harness.terminalReceipts);
+            assert.equal(terminal.providerTurnId, provisional.id);
+            assert.equal(terminal.runOrdinal, ordinal);
+            assert.equal(terminal.status, "completed");
+            assert.isNull(terminal.failure);
+            const completed = harness.events.findLast(
+              (event) =>
+                event.type === "provider_turn.updated" && event.providerTurn.id === provisional.id,
+            );
+            if (completed?.type !== "provider_turn.updated") throw new Error("Missing turn end");
+            assert.equal(completed.providerTurn.status, "completed");
+            assert.deepEqual(completed.providerTurn.promptAcceptedAt, accepted.promptAcceptedAt);
+            assert.isNotNull(completed.providerTurn.completedAt);
+            const final = harness.events.findLast(
+              (event) => event.type === "message.updated" && event.message.runId === input.runId,
+            );
+            if (final?.type !== "message.updated") throw new Error("Missing final result");
+            assert.equal(final.message.text, text);
+            assert.equal(final.message.phase, "answer");
+            yield* harness.offerAndWait(
+              claudeSdkFrame({
+                type: "command_lifecycle",
+                command_uuid: promptUuid,
+                state: "completed",
+              }),
+            );
+            yield* TestClock.adjust("1 second");
+          }
+          assert.isAbove(acceptedAt[1]!, acceptedAt[0]!);
+          assert.lengthOf(harness.terminalEvents(), 2);
+          assert.lengthOf(harness.processQueues, 1);
         }),
       ).pipe(
         Effect.provide(

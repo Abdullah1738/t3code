@@ -7316,6 +7316,110 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       ),
   );
 
+  it.effect.each(["terminated", "already_exited", "unknown", "unloaded"] as const)(
+    "exposes background terminal metadata and safely stops %s sessions",
+    (scenario) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          let requestId = 4;
+          const entries: Array<CodexReplay.CodexAppServerReplayEntry> = [];
+          const exchange = (
+            method: string,
+            params: Record<string, unknown>,
+            result: unknown,
+            error = false,
+          ) => {
+            const id = requestId++;
+            entries.push(
+              { type: "expect_outbound", frame: { id, method, params } },
+              { type: "emit_inbound", frame: error ? { id, error: result } : { id, result } },
+            );
+          };
+          const metadata = {
+            processId: "4242",
+            command: BG_COMMAND,
+            cwd: "/workspace",
+            itemId: BG_COMMAND_ITEM,
+            osPid: 9876,
+            cpuPercent: 1.5,
+            rssKb: 2048,
+          };
+          exchange(
+            "thread/backgroundTerminals/list",
+            { threadId: BG_NATIVE_THREAD },
+            { data: [metadata], nextCursor: "page-two" },
+          );
+          exchange(
+            "thread/backgroundTerminals/list",
+            { threadId: BG_NATIVE_THREAD, cursor: "page-two" },
+            { data: [{ processId: "12" }] },
+          );
+          exchange(
+            "thread/backgroundTerminals/list",
+            { threadId: BG_NATIVE_THREAD },
+            { data: scenario === "unknown" ? [] : [metadata], nextCursor: null },
+          );
+          if (scenario !== "unknown") {
+            exchange(
+              "thread/backgroundTerminals/terminate",
+              { threadId: BG_NATIVE_THREAD, processId: "4242" },
+              scenario === "unloaded"
+                ? { code: -32600, message: `thread not found: ${BG_NATIVE_THREAD}` }
+                : { terminated: scenario === "terminated" },
+              scenario === "unloaded",
+            );
+            if (scenario === "already_exited") {
+              exchange(
+                "thread/backgroundTerminals/list",
+                { threadId: BG_NATIVE_THREAD },
+                { data: [], nextCursor: null },
+              );
+            }
+          }
+          const harness = yield* makeCodexReplayHarness(
+            makeCodexReplayTranscript({
+              scenario: `codex-exec-session-${scenario}`,
+              entries: [
+                ...backgroundExecTranscript.entries.slice(0, -1),
+                ...entries,
+                backgroundExecTranscript.entries.at(-1)!,
+              ],
+            }),
+          );
+          yield* harness.runtime.startTurn(
+            makeCodexTestTurnInput({
+              threadId: harness.threadId,
+              providerThread: harness.providerThread,
+              now: yield* DateTime.now,
+              attemptId: RunAttemptId.make(`attempt-exec-session-${scenario}`),
+              text: BG_PROMPT,
+            }),
+          );
+          yield* harness.firstTerminal;
+          assert.deepEqual(
+            yield* harness.runtime.listBackgroundTerminals!({
+              providerThread: harness.providerThread,
+            }),
+            [metadata, { processId: "12" }],
+          );
+          assert.deepEqual(
+            yield* harness.runtime.terminateBackgroundTerminal!({
+              providerThread: harness.providerThread,
+              processId: "4242",
+            }),
+            {
+              terminated: true,
+              alreadyGone: scenario !== "terminated",
+            },
+          );
+        }),
+      ).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
   const backgroundStopCases = [true, false, "still_running", "thread_unloaded"] as const;
   const makeBackgroundStopTranscript = (terminated: (typeof backgroundStopCases)[number]) => {
     const stillRunning = terminated === "still_running";

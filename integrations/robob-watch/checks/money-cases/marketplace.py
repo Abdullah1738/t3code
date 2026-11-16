@@ -2,6 +2,7 @@
 import datetime as dt
 import fcntl
 import json
+import data_io
 import os
 import re
 from pathlib import Path
@@ -20,7 +21,7 @@ def empty():
 def load(data):
     from order_lookup import moment
     try:
-        obj = json.loads((Path(data) / 'marketplace-placements.json').read_text())
+        obj = json.loads(data_io.read_text(Path(data) / 'marketplace-placements.json'))
         if (obj.get('version') != 1 or type(obj.get('complete')) is not bool
                 or not isinstance(obj.get('orders'), dict)):
             raise ValueError()
@@ -65,16 +66,21 @@ def lane(snapshot, cache, reason=None):
 
 
 def refresh(data, root, budget=120):
+    with data_io.scope(time.time() + budget):
+        return _refresh(data, root, budget)
+
+
+def _refresh(data, root, budget):
     from order_lookup import load_cache, moment, projection
     from state_json import write_json
     from toollog import emit
     data = Path(data)
-    data.mkdir(parents=True, exist_ok=True)
+    data_io.materialize_io(lambda: data.mkdir(parents=True, exist_ok=True), data)
     started = time.monotonic()
     stats = dict(orders_total=0, known=0, delivered=0, fetched=0, pages=0, ms=0, result='busy')
-    with (data / 'marketplace-refresh.lock').open('a') as refresh_lock:
+    with data_io.materialize_io(lambda: (data / 'marketplace-refresh.lock').open('a'), data / 'marketplace-refresh.lock') as refresh_lock:
         try:
-            fcntl.flock(refresh_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            data_io.materialize_io(lambda: fcntl.flock(refresh_lock, fcntl.LOCK_EX | fcntl.LOCK_NB), data / 'marketplace-refresh.lock')
         except BlockingIOError:
             emit('money-cases', 'marketplace.refresh', kind='perf', duration_ms=0, ok=True, props=stats)
             return stats
@@ -168,10 +174,10 @@ def refresh(data, root, budget=120):
         signal.signal(signal.SIGALRM, timeout)
         signal.setitimer(signal.ITIMER_REAL, max(0.001, end - time.monotonic()))
         try:
-            with (data / 'order-details.lock').open('a') as cache_lock:
+            with data_io.materialize_io(lambda: (data / 'order-details.lock').open('a'), data / 'order-details.lock') as cache_lock:
                 while True:
                     try:
-                        fcntl.flock(cache_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        data_io.materialize_io(lambda: fcntl.flock(cache_lock, fcntl.LOCK_EX | fcntl.LOCK_NB), data / 'order-details.lock')
                         break
                     except BlockingIOError:
                         time.sleep(min(0.05, max(0.001, end - time.monotonic())))
@@ -210,9 +216,9 @@ def refresh_status(data):
         if time.time() - moment(snapshot['walked_at']).timestamp() < MARKETPLACE_REFRESH_AFTER:
             return 'fresh'
     try:
-        Path(data).mkdir(parents=True, exist_ok=True)
-        with (Path(data) / 'marketplace-refresh.lock').open('a') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        data_io.materialize_io(lambda: Path(data).mkdir(parents=True, exist_ok=True), Path(data))
+        with data_io.materialize_io(lambda: (Path(data) / 'marketplace-refresh.lock').open('a'), Path(data) / 'marketplace-refresh.lock') as lock:
+            data_io.materialize_io(lambda: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB), Path(data) / 'marketplace-refresh.lock')
         return 'started'
     except BlockingIOError:
         return 'busy'

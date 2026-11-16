@@ -102,6 +102,30 @@ class LoggingTests(unittest.TestCase):
         self.assertEqual(rows[1]['error']['message'], 'REPLICA_UNAVAILABLE')
         self.assertEqual(rows[2]['error']['message'], 'REPLICA_UNAVAILABLE')
 
+    def test_200_mib_cap_boundaries_preserve_errors(self):
+        self.assertEqual(toollog.CAP, 200 * 1024 * 1024)
+        for offset in (-1, 0, 1):
+            with self.subTest(offset=offset):
+                root = self.root / str(offset)
+                root.mkdir(parents=True)
+                day = dt.datetime.now(dt.timezone.utc).date().isoformat()
+                path = root / (day + '.ndjson')
+                with path.open('wb') as out:
+                    out.truncate(toollog.CAP + offset)
+                with patch.dict(os.environ, ROUTER_LOG_DIR=str(root)):
+                    toollog.emit('test', 'fixture.first')
+                    self.assertEqual((root / ('.cap-' + day)).exists(), offset >= 0)
+                    toollog.emit('test', 'fixture.dropped')
+                    toollog.emit('test', 'fixture.dropped')
+                    toollog.emit('test', 'fixture.error', kind='error', error={'tag': 'http_502'})
+                with path.open('rb') as source:
+                    source.seek(toollog.CAP + offset)
+                    tail = source.read(4096).decode()
+                self.assertEqual(tail.count('log.cap'), 1)
+                self.assertEqual('fixture.first' in tail, offset < 0)
+                self.assertNotIn('fixture.dropped', tail)
+                self.assertIn('fixture.error', tail)
+
     def test_rollup_fixture_and_cli(self):
         self.root.mkdir()
         rows = [dict(tool='9router', name='img.result', kind='perf', ok=True, durationMs=n) for n in range(1, 101)]

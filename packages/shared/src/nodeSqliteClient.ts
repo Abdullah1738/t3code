@@ -46,7 +46,11 @@ import {
   readerBusy,
 } from "./nodeSqliteReaderLanes.ts";
 
-export { ReaderLane, readerLaneFailure } from "./nodeSqliteReaderLanes.ts";
+export {
+  ReaderLane,
+  readerLaneFailure,
+  ReaderContentionObserver,
+} from "./nodeSqliteReaderLanes.ts";
 export type { ReaderLaneName } from "./nodeSqliteReaderLanes.ts";
 import type { ReaderLaneName } from "./nodeSqliteReaderLanes.ts";
 
