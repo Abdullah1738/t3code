@@ -481,7 +481,7 @@ def die(msg: str, code: int = 2):
 
 
 def new_id(prefix: str) -> str:
-    return f"{prefix}-{dt.datetime.now(TZ).strftime('%m%d-%H%M%S')}-{secrets.token_hex(2)}"
+    return f"{prefix}-{dt.datetime.now(TZ).strftime('%m%d-%H%M%S')}-{secrets.token_hex(4)}"
 
 
 SCHEMA = """
