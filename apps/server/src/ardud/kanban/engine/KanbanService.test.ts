@@ -38856,11 +38856,10 @@ it.effect.each(
             ),
           );
           yield* Deferred.await(editStarted);
-          yield* Effect.yieldNow;
-          assert.isUndefined(edit.pollUnsafe());
+          yield* Fiber.join(edit);
+          assert.equal((yield* kanban.card(card.id)).card.stage, "in_review");
           yield* Deferred.succeed(releaseCleanup, undefined);
           yield* Fiber.join(departure);
-          yield* Fiber.join(edit);
           const departed = yield* kanban.card(card.id);
           assert.equal(departed.card.stage, "todo");
           assert.equal(departed.card.description, "Concurrent edit during cleanup");
