@@ -853,7 +853,10 @@ const layerMakeServer = Layer.unwrap(
     const routesReady = yield* Deferred.make<void>();
     const layerLauncher = ServiceLauncherClient.layer;
 
-    yield* fixPath({ shellEnvironmentPrepared: config.shellEnvironmentPrepared });
+    yield* fixPath({
+      shellEnvironmentPrepared: config.shellEnvironmentPrepared,
+      shellPathHydration: config.shellPathHydration,
+    });
 
     const layerHttpListening = Layer.effectDiscard(
       Effect.gen(function* () {

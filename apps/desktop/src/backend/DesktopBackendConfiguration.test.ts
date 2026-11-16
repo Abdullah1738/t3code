@@ -42,6 +42,7 @@ const isDesktopBackendObservabilitySettingsReadError = Schema.is(
 const layerShellEnvironment = (prepared = true) =>
   Layer.succeed(DesktopShellEnvironment.DesktopShellEnvironment, {
     installIntoProcess: Effect.succeed(prepared),
+    pathHydration: { source: "none", probes: [] },
   });
 
 const layerBackendConfiguration = (prepared = true, buildCommit = Option.none<string>()) =>
@@ -406,7 +407,9 @@ describe("DesktopBackendConfiguration", () => {
         const wsl = yield* configuration.resolveWsl({ port: 5000, distro: null });
 
         assert.equal(primary.bootstrap.shellEnvironmentPrepared, true);
+        assert.deepEqual(primary.bootstrap.shellPathHydration, { source: "none", probes: [] });
         assert.isUndefined(wsl.bootstrap.shellEnvironmentPrepared);
+        assert.isUndefined(wsl.bootstrap.shellPathHydration);
       }),
     ),
   );

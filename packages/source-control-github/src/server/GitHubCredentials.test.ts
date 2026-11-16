@@ -2,10 +2,13 @@ import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
+import * as PlatformError from "effect/PlatformError";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Redacted from "effect/Redacted";
 import { ChildProcessSpawner } from "effect/process";
 
-import { DEFAULT_SERVER_SETTINGS } from "@t3tools/contracts";
+import { DEFAULT_SERVER_SETTINGS, VcsProcessSpawnError } from "@t3tools/contracts";
 import type * as SourceControlHost from "@t3tools/source-control-core/server/SourceControlHost";
 import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
 import * as TestSourceControlHost from "@t3tools/source-control-testing/TestSourceControlHost";
@@ -72,6 +75,54 @@ describe("GitHubCredentials", () => {
   });
   afterEach(() => {
     vi.unstubAllEnvs();
+  });
+
+  it.effect("logs only PATH entry count when gh is missing", () => {
+    const messages: unknown[] = [];
+    const layer = GitHubCredentials.layer.pipe(
+      Layer.provide(
+        TestSourceControlHost.layer({
+          process: {
+            run: (input) =>
+              Effect.fail(
+                new VcsProcessSpawnError({
+                  operation: input.operation,
+                  command: input.command,
+                  cwd: input.cwd,
+                  cause: PlatformError.systemError({
+                    _tag: "NotFound",
+                    module: "ChildProcess",
+                    method: "spawn",
+                    pathOrDescriptor: "gh",
+                  }),
+                }),
+              ),
+          },
+        }),
+      ),
+      Layer.provide(NodeCrypto.layer),
+    );
+    return Effect.gen(function* () {
+      const credentials = yield* GitHubCredentials.GitHubCredentials;
+      expect((yield* Effect.flip(credentials.get("github.com")))._tag).toBe(
+        "GitHubCliMissingError",
+      );
+      const flat = messages.flatMap((message) => (Array.isArray(message) ? message : [message]));
+      expect(flat).toContain("GitHubCliMissingError");
+      expect(flat).toContainEqual({ host: "github.com", pathEntryCount: 2 });
+      expect(JSON.stringify(flat)).not.toContain("/private/bin");
+    }).pipe(
+      Effect.provide(layer),
+      Effect.provideService(HostProcess.Environment, { PATH: "/private/bin:/usr/bin" }),
+      Effect.provideService(HostProcess.Platform, "darwin"),
+      Effect.provide(
+        Logger.layer([
+          Logger.make(({ message }) => {
+            messages.push(message);
+          }),
+        ]),
+      ),
+    );
   });
 
   it.effect("asks gh for the active login when Settings pin nothing", () => {
