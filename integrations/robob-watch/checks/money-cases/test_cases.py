@@ -4811,6 +4811,48 @@ class PaymentDeadlines(Base):
 
 
 class ReceiptVariantCompetition(unittest.TestCase):
+    def test_aed_usd_charges_compete_for_the_same_receipt(self):
+        observed = at('2026-11-12T12:00')
+        for merchant, brand in [('BOAT.DEV', 'Boat'), ('BROWSER USE INC', 'Browser Use')]:
+            row = dict(id=7, ts=(observed + dt.timedelta(minutes=45)).timestamp(),
+                       sender=f'{brand} <receipts@stripe.example>', subject='Receipt')
+            text = f'{brand} receipt\nAmount paid $50.00'
+            for currency, amount, rival_currency, rival_amount in [
+                    ('AED', '190.47', 'USD', '50.00'), ('USD', '50.00', 'AED', '190.47')]:
+                current = dict(id='q-current', kind='charge', currency=currency, card='1111',
+                               merchant=merchant, amount=amount, pending=False, at=mc.stamp(observed))
+                for bound in [False, True]:
+                    rival = dict(current, id='q-rival', currency=rival_currency, amount=rival_amount,
+                                 at=mc.stamp(observed + dt.timedelta(minutes=1)))
+                    if bound:
+                        # A recorded binding vetoes reuse even outside the matching window.
+                        rival.update(at=mc.stamp(observed - dt.timedelta(days=7)), status='closed',
+                                     explanation={'msgs': row['id']})
+                    for known in [False, True]:
+                        with self.subTest(merchant=merchant, currency=currency, bound=bound, known=known):
+                            questions = [current, rival] if known else [rival]
+                            accepts = mc.receipt_for_question(None, current, 'q-current' if known else None,
+                                                             questions, observed)
+                            self.assertFalse(accepts(row, text))
+
+    def test_unbound_fx_competitors_need_matching_evidence(self):
+        observed = at('2026-11-12T12:00')
+        row = dict(id=7, ts=(observed + dt.timedelta(minutes=45)).timestamp(),
+                   sender='Boat <receipts@stripe.example>', subject='Receipt')
+        for currency, amount, rival_currency, rival_amount, wrong_amount in [
+                ('AED', '190.47', 'USD', '50.00', '25.00'),
+                ('USD', '50.00', 'AED', '190.47', '100.00')]:
+            current = dict(id='q-current', kind='charge', currency=currency, card='1111',
+                           merchant='BOAT.DEV', amount=amount, pending=False, at=mc.stamp(observed))
+            rival = dict(current, id='q-rival', currency=rival_currency, amount=rival_amount)
+            for label, changes in [('merchant', {'merchant': 'Other'}),
+                                   ('amount', {'amount': wrong_amount}), ('currency', {'currency': 'EUR'}),
+                                   ('time', {'at': mc.stamp(observed - dt.timedelta(days=7))})]:
+                with self.subTest(currency=currency, form=label):
+                    accepts = mc.receipt_for_question(None, current, 'q-current',
+                                                     [current, dict(rival, **changes)], observed)
+                    self.assertTrue(accepts(row, 'Boat receipt\nAmount paid $50.00'))
+
     def test_different_amounts_cannot_share_a_variant_receipt(self):
         observed = at('2026-11-12T12:00')
         forms = [

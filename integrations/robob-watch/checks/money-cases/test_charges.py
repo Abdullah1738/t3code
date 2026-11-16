@@ -494,6 +494,119 @@ class ReceiptVariants(unittest.TestCase):
         self.assertEqual(self.explain('UBER * PENDING', '201.03', 'Uber receipt\nAED 201.03',
                                      'Uber <receipts@uber.com>', pending=True, minutes=700)['verdict'], 'receipt')
 
+    def test_variant_noise_cannot_block_an_exact_receipt(self):
+        observed = at('2026-10-24T12:00')
+        for merchant, brand, pending in [('BOAT.DEV', 'Boat', False),
+                                         ('BROWSER USE INC', 'Browser Use', False),
+                                         ('UBER * PENDING', 'Uber', True)]:
+            noise = [dict(id=100 + i, ts=(observed + dt.timedelta(minutes=6 + i)).timestamp(),
+                          sender=brand, subject=f'{brand} usage notice', body=f'Usage update {i}')
+                     for i in range(ch.RECEIPT_READS + 1)]
+            charge = dict(CHARGE, merchant=merchant, currency='AED', amount='190.47', pending=pending)
+            for match in ['merchant', 'card']:
+                with self.subTest(merchant=merchant, match=match):
+                    row = dict(id=7, ts=(observed + dt.timedelta(minutes=5)).timestamp(),
+                               sender=brand if match == 'merchant' else 'Payment processor',
+                               subject='Your receipt', body='Paid AED 190.47' +
+                               (f' to {brand}' if match == 'merchant' else ' with card 1111'))
+                    result = ch.explain(charge, observed, observed + dt.timedelta(days=3),
+                                        find=Finder(noise + [row]), said=nobody)
+                    self.assertEqual((result['verdict'], result.get('msgs')), ('receipt', 7))
+
+    def test_a_body_seen_by_exact_search_can_still_prove_a_variant(self):
+        self.assertEqual(self.explain('BOAT.DEV', '190.47',
+                                     'Boat receipt\n190.47 credits\nAmount paid $50.00',
+                                     'Boat <receipts@stripe.example>')['verdict'], 'receipt')
+
+    def test_whole_aed_variants_survive_broad_merchant_noise(self):
+        observed = at('2026-10-24T12:00')
+        forms = [('BOAT.DEV', '190.00', 'Boat <receipts@stripe.example>', False,
+                  'Amount paid $50.00', 'Terraform dev notice'),
+                 ('BROWSER USE INC', '190.00', 'Browser Use <receipts@stripe.example>', False,
+                  'Amount paid $50.00', 'View in browser: use credits'),
+                 ('UBER * PENDING', '200.00', 'Uber <receipts@uber.com>', True,
+                  'Total AED 199.50', 'Uber usage notice')]
+        for merchant, amount, sender, pending, body, noise_subject in forms:
+            for form, paid in [('variant', body), ('exact', f'Paid AED {amount}')]:
+                row = dict(id=7, ts=(observed + dt.timedelta(minutes=30)).timestamp(), sender=sender,
+                           subject=f'Your receipt from {merchant}', body=paid)
+                noise = [dict(id=100 + i, ts=(observed + dt.timedelta(hours=12, seconds=i)).timestamp(),
+                              sender='Other <notice@other.example>', subject=noise_subject,
+                              body=f'Unrelated notice {i}') for i in range(ch.RECEIPT_READS + 1)]
+                with self.subTest(merchant=merchant, form=form):
+                    charge = dict(CHARGE, merchant=merchant, currency='AED', amount=amount, pending=pending)
+                    result = ch.explain(charge, observed, observed + dt.timedelta(days=3),
+                                        find=Finder(noise + [row]), said=nobody)
+                    self.assertEqual((result['verdict'], result.get('msgs')), ('receipt', 7))
+
+    def test_rejected_receipt_copies_only_consume_one_body_read(self):
+        observed = at('2026-10-24T12:00')
+        charge = dict(CHARGE, merchant='BOAT.DEV', currency='AED', amount='190.47', pending=False)
+        notice = dict(id=8, ts=(observed + dt.timedelta(minutes=40)).timestamp(),
+                      sender='Boat', subject='Boat usage notice', body='Boat plan AED 190.47')
+        copies = [dict(notice, id=100 + i, subject='Your Boat receipt',
+                       ts=(observed + dt.timedelta(minutes=20, seconds=i)).timestamp())
+                  for i in range(ch.RECEIPT_READS + 1)]
+        row = dict(notice, id=7, ts=(observed + dt.timedelta(minutes=5)).timestamp(),
+                   subject='Your Boat receipt', body='Boat payment AED 190.47')
+
+        def shown(row, deadline=None):
+            return f'Subject: {row["subject"]}\n\n{row["body"]}'
+
+        result = ch.receipt(charge, observed, observed + dt.timedelta(days=3),
+                            find=Finder([notice] + copies + [row]), read=shown,
+                            receipt_ok=lambda candidate, text: candidate['id'] == 7)
+        self.assertEqual(result['id'], 7)
+
+    def test_whole_aed_exact_receipts_keep_existing_paths(self):
+        for merchant, brand, pending, minutes, named in [
+                ('BOAT.DEV', 'Boat', False, 30, True),
+                ('BROWSER USE INC', 'Browser Use', False, 30, True),
+                ('UBER * PENDING', 'Uber', True, 30, True),
+                ('UBER * PENDING', 'Uber', True, 700, True),
+                ('BOAT.DEV', 'Boat', False, 5, False)]:
+            with self.subTest(merchant=merchant, minutes=minutes, named=named):
+                body = f'{brand} receipt AED 190.00' if named else 'Receipt AED 190.00 paid with card 1111'
+                self.assertEqual(self.explain(merchant, '190.00', body,
+                                             brand if named else 'Payment processor',
+                                             subject='Receipt', pending=pending, minutes=minutes)['verdict'], 'receipt')
+
+    def test_decimal_variants_survive_both_exact_search_noise_paths(self):
+        observed = at('2026-10-24T12:00')
+        for merchant, sender, pending, body, named_noise in [
+                ('BOAT.DEV', 'Boat <receipts@stripe.example>', False, 'Amount paid $50.00', 'Terraform dev'),
+                ('BROWSER USE INC', 'Browser Use <receipts@stripe.example>', False,
+                 'Amount paid $50.00', 'View in browser: use credits'),
+                ('UBER * PENDING', 'Uber <receipts@uber.com>', True, 'Total AED 190.40', 'Uber later trip')]:
+            charge = dict(CHARGE, merchant=merchant, currency='AED', amount='190.47', pending=pending)
+            row = dict(id=7, ts=(observed + dt.timedelta(minutes=5)).timestamp(), sender=sender,
+                       subject=f'Your receipt from {merchant}', body=body)
+            for path in ['merchant', 'card']:
+                noise = [dict(id=100 + i, ts=(observed + dt.timedelta(
+                    hours=12 if path == 'merchant' else 0, minutes=6, seconds=i)).timestamp(),
+                    sender='Other <notice@other.example>', subject=named_noise if path == 'merchant' else 'Usage',
+                    body=f'190.47 credits remaining, update {i}') for i in range(ch.RECEIPT_READS + 1)]
+                for veto in [False, True]:
+                    with self.subTest(merchant=merchant, path=path, veto=veto):
+                        result = ch.explain(charge, observed, observed + dt.timedelta(days=3),
+                                            find=Finder(noise + [row]), said=nobody,
+                                            receipt_ok=(lambda *args: False) if veto else None)
+                        self.assertEqual(result['verdict'], 'unverified' if veto else 'receipt')
+                        if not veto:
+                            self.assertEqual(result['msgs'], 7)
+
+    def test_variant_read_allowance_is_bounded(self):
+        observed = at('2026-10-24T12:00')
+        charge = dict(CHARGE, merchant='BOAT.DEV', currency='AED', amount='190.47', pending=False)
+        row = dict(id=7, ts=(observed + dt.timedelta(minutes=5)).timestamp(),
+                   sender='Boat <receipts@stripe.example>', subject='Boat receipt', body='Amount paid $50.00')
+        noise = [dict(row, id=100 + i, ts=(observed + dt.timedelta(minutes=6, seconds=i)).timestamp(),
+                      subject='Boat usage', body=f'Usage update {i}') for i in range(ch.RECEIPT_READS + 1)]
+        result = ch.explain(charge, observed, observed + dt.timedelta(days=3),
+                            find=Finder(noise + [row]), said=nobody)
+        self.assertEqual(result['verdict'], 'unverified')
+        self.assertIn('read limit reached', str(result['errors']))
+
 
 class Explain(unittest.TestCase):
     def setUp(self):

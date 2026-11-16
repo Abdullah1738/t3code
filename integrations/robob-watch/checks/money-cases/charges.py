@@ -1025,29 +1025,29 @@ def receipt(charge, at, now, find=None, deadline=None, read=None, memo=None, sta
     names = words(charge['merchant'])
     named = re.compile(r'\b(?:' + '|'.join(map(re.escape, names)) + r')\b', re.I) if names else None
     tries = []
+    variant = receipt_variant(charge)
     integral = Decimal(charge['amount']) == Decimal(charge['amount']).to_integral_value()
     # "$1" is just the common token "1" to FTS. For whole amounts, find candidates
     # by merchant/card instead; the same currency/amount proof below still decides.
     if names:
         # Questions can remain unanswered indefinitely; a later recurring purchase's receipt
         # must not explain them merely because its merchant and amount happen to repeat.
-        variant = receipt_variant(charge)
         exact = lambda row, text: money.search(text) and named.search(text) and RECEIPT_WORDS.search(text)
-        if variant:
-            # Generic "dev"/"use" words and later trips exhaust the read cap.
-            # Find the verified brand in its own window without the alert amount.
-            query = '"uber"' if variant == 'uber' else '"boat"' if names == ['boat', 'dev'] else '"browser use"'
-            window = (at, min(now + dt.timedelta(minutes=1), at + dt.timedelta(hours=2))) \
-                if variant == 'uber' else receipt_window(at, now, True)
-            tries.append((query, *window, lambda row, text: exact(row, text)
-                          or alternate_receipt(charge, at, now, row, text)))
         named_query = ' OR '.join(f'"{w}"' for w in names)
         tries.append(((named_query if integral else amount + ' ' + named_query),
-                      *receipt_window(at, now, True), exact))
+                      *receipt_window(at, now, True), exact, 'exact'))
     tries.append((f'"{charge["card"]}"' if integral else amount, *receipt_window(at, now, False),
-                  lambda row, text: money.search(text) and card.search(text) and RECEIPT_WORDS.search(text)))
-    reads, seen_bodies, incomplete = 0, set(), False
-    for query, start, end, proves in tries:
+                  lambda row, text: money.search(text) and card.search(text) and RECEIPT_WORDS.search(text), 'exact'))
+    if variant:
+        # Preserve exact-search priority and reserve a separate bounded allowance:
+        # generic dev/browser words or amount-only notices must not starve the brand query.
+        query = '"uber"' if variant == 'uber' else '"boat"' if names == ['boat', 'dev'] else '"browser use"'
+        window = (at, min(now + dt.timedelta(minutes=1), at + dt.timedelta(hours=2))) \
+            if variant == 'uber' else receipt_window(at, now, True)
+        tries.append((query, *window, lambda row, text: exact(row, text)
+                      or alternate_receipt(charge, at, now, row, text), 'variant'))
+    reads, seen_bodies, incomplete, read_limited = {'exact': 0, 'variant': 0}, set(), False, False
+    for query, start, end, proves, budget in tries:
         # Usage notices with the same amount and merchant can fill a page of hits, so the search goes
         # wider than one page. Reads are capped, and a body already read counts for nothing new: a
         # run of identical notices must not use up the reads before the receipt.
@@ -1064,19 +1064,21 @@ def receipt(charge, at, now, find=None, deadline=None, read=None, memo=None, sta
                 continue
             text = read(row, deadline)
             key = body_key(text)
-            if key in seen_bodies:
-                continue
-            if reads >= RECEIPT_READS:
-                raise Lookup('receipt scan incomplete: read limit reached')
-            reads += 1
-            seen_bodies.add(key)
+            # A later query can prove a variant from a body whose exact amount failed.
+            if key not in seen_bodies:
+                if reads[budget] >= RECEIPT_READS:
+                    if not variant:
+                        raise Lookup('receipt scan incomplete: read limit reached')
+                    read_limited = True
+                    break
+                reads[budget] += 1
+                seen_bodies.add(key)
             if proves(row, text):
                 if receipt_ok is None or receipt_ok(row, text):
                     return row
-                # Identical receipt bodies can be sent for separate transactions. A rejected
-                # ambiguous copy must not hide an older, uniquely correlated receipt.
-                seen_bodies.discard(key)
         incomplete = incomplete or getattr(rows, 'raw_count', count) >= RECEIPT_HITS
+    if read_limited:
+        raise Lookup('receipt scan incomplete: read limit reached')
     if incomplete:
         raise Lookup('receipt scan incomplete: search limit reached')
     return None
