@@ -1,3 +1,4 @@
+import { McpReasonClass, McpInvalidField } from "./mcpReasonClass.ts";
 import { McpDenyReason } from "./mcpDenyReason.ts";
 /**
  * Missions board (code name kanban): cards move through fixed stages, a
@@ -2421,6 +2422,8 @@ export type KanbanDeniedReason = typeof KanbanDeniedReason.Type;
 
 export class KanbanError extends Schema.TaggedError<KanbanError>()("KanbanError", {
   code: KanbanErrorCode,
+  reasonClass: Schema.optionalKey(McpReasonClass),
+  invalidField: Schema.optionalKey(McpInvalidField),
   detail: Schema.String,
   reason: Schema.optionalKey(KanbanDeniedReason),
   /**

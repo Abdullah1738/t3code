@@ -1,3 +1,5 @@
+import * as McpCall from "../../analytics/McpCall.ts";
+import * as SavedWrite from "../engine/savedWrite.ts";
 // @effect-diagnostics nodeBuiltinImport:off - random fixture text prevents string interning in retention measurements.
 import * as NodeCrypto from "node:crypto";
 import * as NodeV8 from "node:v8";
@@ -3070,4 +3072,35 @@ it.effect("#1569 owner choices use their answer time, and a later evaluator clea
     });
     assert.strictEqual((yield* store.ownerReply(talk.id, evaluator, true))?.answered, false);
   }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect.each([false, true])(
+  "saved analytics publishes after an outer transaction commits (rollback=%s)",
+  (rollback) =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const sql = yield* SqlClient.SqlClient;
+      const state: McpCall.McpCall["Service"] = {
+        callerResolved: true,
+        callerResolveMs: 0,
+        readerLane: "foreground",
+        phase: "handler",
+        boardWrite: true,
+        saved: false,
+      };
+      yield* sql`CREATE TABLE saved_probe (value INTEGER)`;
+      const write = Effect.gen(function* () {
+        yield* SavedWrite.committing;
+        yield* sql`INSERT INTO saved_probe VALUES (1)`;
+        yield* SavedWrite.committed();
+        assert.strictEqual(state.saved, "unknown");
+        if (rollback) return yield* Effect.fail("rollback");
+      });
+      yield* store
+        .observeCallerWrites(sql.withTransaction(write))
+        .pipe(Effect.provideService(McpCall.McpCall, state), Effect.exit);
+      const rows = yield* sql`SELECT * FROM saved_probe`;
+      assert.lengthOf(rows, rollback ? 0 : 1);
+      assert.strictEqual(state.saved, rollback ? "unknown" : true);
+    }).pipe(Effect.provide(TestLayer)),
 );

@@ -1,3 +1,4 @@
+import { McpReasonClass, McpInvalidField, McpRefusedAt } from "./mcpReasonClass.ts";
 import { McpDenyReason } from "./mcpDenyReason.ts";
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
@@ -160,6 +161,9 @@ const GeneralEvent = Schema.Struct({
   ),
   cardStage: Schema.optionalKey(Label),
   denyReason: Schema.optionalKey(McpDenyReason),
+  reasonClass: Schema.optionalKey(McpReasonClass),
+  invalidField: Schema.optionalKey(McpInvalidField),
+  refusedAt: Schema.optionalKey(McpRefusedAt),
   replyStage: Schema.optionalKey(Label),
   replyPhases: Schema.optionalKey(McpReplyPhases),
   requestTiming: Schema.optionalKey(
@@ -668,6 +672,8 @@ export const AnalyticsRollup = Schema.Struct({
       failureRate: Measurement,
       outcomes: Schema.Record(Label, Measurement),
       savedCounts: Schema.Record(Label, Measurement),
+      reasonClasses: Schema.Record(Label, Measurement),
+      invalidFields: Schema.Record(Label, Measurement),
       errors: Schema.Array(
         Schema.Struct({ errorTag: Label, errorPhase: McpPhase, count: Measurement }),
       ),

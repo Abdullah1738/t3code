@@ -1,5 +1,6 @@
 import type { AnalyticsEvent } from "@t3tools/contracts";
 import * as Analytics from "../../analytics/Analytics.ts";
+import * as Queue from "effect/Queue";
 import { vi } from "vite-plus/test";
 import { assert, it } from "@effect/vitest";
 import {
@@ -9171,7 +9172,7 @@ it.effect.each([
     const row = yield* Deferred.await(pending);
     assert.equal(row.denyReason, expectedReasons[reason]);
     assert.equal(row.errorTag, reason === "missing" ? "invalid_request" : "capability_denied");
-    assert.equal(row.saved, reason === "missing" ? "unknown" : false);
+    assert.equal(row.saved, false);
     assert.equal(
       row.callerRole,
       reason === "worker"
@@ -9278,5 +9279,121 @@ it.effect.each(["queued", "in-flight"] as const)(
         ),
         Effect.ensuring(Deferred.succeed(resume, undefined)),
       );
+    }),
+);
+
+it.effect(
+  "MCP refusal rows distinguish duplicates, missing cards and bad activity times without values",
+  () =>
+    Effect.gen(function* () {
+      const rows: Array<AnalyticsEvent> = [];
+      const recorded = yield* Queue.unbounded<AnalyticsEvent>();
+      const fake = fakeThreads();
+      const analytics = Layer.mock(Analytics.Analytics)({
+        record: (row) =>
+          row.kind === "mcp.call" ? Queue.offer(recorded, row).pipe(Effect.asVoid) : Effect.void,
+      });
+      yield* Effect.gen(function* () {
+        const service = yield* KanbanService.KanbanService;
+        const board = yield* service.ensureBoard({
+          slug: "refusals",
+          name: "Refusals",
+          defaultProjectId: null,
+        });
+        const thread = ThreadId.make("outside-refusals");
+        const input = {
+          boardId: board.id,
+          title: "private unique title",
+          prompt: "private prompt body",
+        };
+        const created = yield* call(thread, "card_create", input);
+        assert.isFalse(created.isError, created.text);
+        rows.push(yield* Queue.take(recorded));
+        assert.strictEqual(rows.at(-1)?.saved, true);
+        const duplicate = yield* call(thread, "card_create", input);
+        assert.isTrue(duplicate.isError);
+        rows.push(yield* Queue.take(recorded));
+        assert.strictEqual(rows.at(-1)?.errorTag, "invalid_request");
+        assert.deepInclude(rows.at(-1), {
+          reasonClass: "duplicate_title",
+          invalidField: "title",
+          saved: false,
+          refusedAt: "in_write",
+        });
+        const missing = yield* call(thread, "card_edit", {
+          boardId: board.id,
+          card: "#999999",
+          description: "private description",
+        });
+        assert.isTrue(missing.isError);
+        rows.push(yield* Queue.take(recorded));
+        assert.deepInclude(rows.at(-1), { reasonClass: "not_found", saved: false });
+        const time = yield* call(thread, "board_activity", {
+          boardId: board.id,
+          since: "yesterday-ish",
+        });
+        assert.isTrue(time.isError);
+        rows.push(yield* Queue.take(recorded));
+        assert.deepInclude(rows.at(-1), { reasonClass: "bad_time", invalidField: "since" });
+        assert.isUndefined(rows.at(-1)?.saved);
+        assert.isUndefined(rows.at(-1)?.props?.saved);
+        const wiki = yield* call(thread, "wiki_read", {
+          boardId: board.id,
+          section: "private heading",
+        });
+        assert.isTrue(wiki.isError);
+        rows.push(yield* Queue.take(recorded));
+        assert.deepInclude(rows.at(-1), { reasonClass: "missing_required", invalidField: "slug" });
+        assert.isUndefined(rows.at(-1)?.saved);
+        const scenarios = [
+          {
+            input: { expiresAt: "private invalid time" },
+            reasonClass: "bad_time",
+            invalidField: "expiresAt",
+          },
+          { input: { kind: "private".repeat(8) }, reasonClass: "too_long", invalidField: "kind" },
+          {
+            input: { options: Array.from({ length: 13 }, (_, i) => `private option ${i}`) },
+            reasonClass: "too_many",
+            invalidField: "options",
+          },
+        ] as const;
+        const askInput = {
+          boardId: board.id,
+          card: "#1",
+          question: "private question",
+          blocking: false,
+        };
+        for (const scenario of scenarios) {
+          const rejected = yield* call(thread, "card_ask", { ...askInput, ...scenario.input });
+          assert.isTrue(rejected.isError);
+          const row = yield* Queue.take(recorded);
+          rows.push(row);
+          assert.deepInclude(row, {
+            reasonClass: scenario.reasonClass,
+            invalidField: scenario.invalidField,
+            saved: false,
+          });
+        }
+        const asked = yield* call(thread, "card_ask", askInput);
+        assert.isFalse(asked.isError, asked.text);
+        rows.push(yield* Queue.take(recorded));
+        for (const scenario of scenarios) {
+          const rejected = yield* call(thread, "card_ask_change", {
+            ...askInput,
+            ask: "q1",
+            ...scenario.input,
+          });
+          assert.isTrue(rejected.isError);
+          const row = yield* Queue.take(recorded);
+          rows.push(row);
+          assert.deepInclude(row, {
+            reasonClass: scenario.reasonClass,
+            invalidField: scenario.invalidField,
+            saved: false,
+          });
+        }
+        assert.notMatch(JSON.stringify(rows), /private|yesterday-ish/);
+      }).pipe(Effect.provide(fake.layer.pipe(Layer.provide(analytics))));
     }),
 );

@@ -997,3 +997,42 @@ it("#1490 counts evaluator starts by origin without treating steers and queued i
   );
   assert.deepEqual(result.errorCounts, {});
 });
+
+it("counts and bounds refusal classes and fields per tool and hour", () => {
+  const target = makeAccumulator();
+  for (let i = 0; i < 160; i++)
+    accumulate(
+      target,
+      event({
+        kind: "mcp.call",
+        tool: "card_create",
+        outcome: "error",
+        saved: false,
+        reasonClass: i % 2 === 0 ? "duplicate_title" : "missing_required",
+        invalidField: `field${i}`,
+      }),
+    );
+  accumulate(
+    target,
+    event({
+      kind: "mcp.call",
+      tool: "wiki_read",
+      outcome: "error",
+      reasonClass: "not_found",
+      invalidField: "slug",
+    }),
+  );
+  const rows = finishRollup(target, "2026-11-13", ts).mcpCalls;
+  const write = rows.find((row) => row.tool === "card_create")!;
+  assert.deepEqual(write.reasonClasses, { duplicate_title: 80, missing_required: 80 });
+  assert.equal(Object.keys(write.invalidFields).length, 129);
+  assert.equal(
+    Object.values(write.invalidFields).reduce((sum, count) => sum + count, 0),
+    160,
+  );
+  assert.deepEqual(write.savedCounts, { false: 160 });
+  const read = rows.find((row) => row.tool === "wiki_read")!;
+  assert.deepEqual(read.reasonClasses, { not_found: 1 });
+  assert.deepEqual(read.invalidFields, { slug: 1 });
+  assert.deepEqual(read.savedCounts, { "n/a": 1 });
+});
