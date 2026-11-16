@@ -16,6 +16,7 @@ import * as TestClock from "effect/testing/TestClock";
 import { KanbanError } from "@t3tools/contracts";
 
 import * as BoardLocks from "./boardLocks.ts";
+import * as SavedWrite from "./savedWrite.ts";
 import * as SavedReply from "../tools/savedReply.ts";
 import { McpSchema } from "effect/ai";
 
@@ -1760,4 +1761,49 @@ it.effect("#1412 lock holds retain board and step attribution in metrics and ana
       ),
     );
   }),
+);
+
+it.effect.each(["read.card", "syncPrs.fetch", "syncPrs.write", "apply"] as const)(
+  "long holds and active holder warnings name the %s sub-step",
+  (phase) =>
+    Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const lines: Array<Record<string, unknown>> = [];
+      const logger = Logger.make(({ message }) => {
+        const line = String(message);
+        if (line.startsWith('{"event":"kanban board lock')) lines.push(JSON.parse(line));
+      });
+      yield* Effect.gen(function* () {
+        const holder = yield* Effect.forkChild(
+          SavedWrite.subSteps(
+            "tickStep:landing",
+            locks.board(
+              "a",
+              Deferred.succeed(entered, undefined).pipe(
+                Effect.andThen(Deferred.await(release).pipe(Effect.withSpan("KanbanStore.read"))),
+                Effect.withSpan(phase),
+              ),
+            ),
+          ),
+        );
+        yield* Deferred.await(entered);
+        yield* TestClock.adjust(60_000);
+        const active = yield* locks.holders;
+        assert.deepEqual(active.find((holder) => holder.lock === "gate")?.subSteps, [
+          { subStep: phase, ms: 60_000 },
+        ]);
+        const waiter = yield* Effect.forkChild(locks.board("a", Effect.void));
+        yield* TestClock.adjust(0);
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(holder);
+        yield* Fiber.join(waiter);
+        const hold = lines.find((line) => line.event === "kanban board lock long hold");
+        assert.deepEqual(hold?.subSteps, [{ subStep: phase, ms: 60_000 }]);
+        const warning = lines.find((line) => line.event === "kanban board lock held too long");
+        const blockers = warning?.["board.blockers"] as Array<{ subSteps?: unknown }> | undefined;
+        assert.deepEqual(blockers?.[0]?.subSteps, [{ subStep: phase, ms: 60_000 }]);
+      }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
+    }),
 );

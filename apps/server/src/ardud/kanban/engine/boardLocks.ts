@@ -205,15 +205,20 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
       ? `${parent?._tag === "Span" ? parent.name : nearest.name} (${nearest.attributes.get("serial.queue") ?? "serial"})`
       : nearest.name;
   });
+  const holdSteps = new Map<number, SavedWrite.SubStepCollection>();
+  const holderAt = (holder: Holder, now: number) => ({
+    ...holder,
+    cardId: holder.cardId ?? null,
+    heldForMs: Math.max(0, now - holder.acquiredAtMs),
+    ...(now - holder.acquiredAtMs >= LONG_HOLD_MS && holdSteps.has(holder.fiberId)
+      ? { subSteps: holdSteps.get(holder.fiberId)!.snapshot() }
+      : {}),
+  });
   const holdersAt = (now: number) =>
     [
       ...[...boards.values()].flatMap((board) => [...board.holders.values()]),
       ...[...migrationHolders.values()].filter((holder) => holder.mode === "exclusive"),
-    ].map((holder) => ({
-      ...holder,
-      cardId: holder.cardId ?? null,
-      heldForMs: Math.max(0, now - holder.acquiredAtMs),
-    }));
+    ].map((holder) => holderAt(holder, now));
   const waitingOn = (boardId: string, lock: Holder["lock"], cardId?: string) => ({
     boardId,
     lock,
@@ -227,11 +232,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
             holder.lock === target.lock &&
             (target.lock !== "card" || holder.cardId === target.cardId),
         )
-    ).map((holder) => ({
-      ...holder,
-      cardId: holder.cardId ?? null,
-      heldForMs: Math.max(0, now - holder.acquiredAtMs),
-    }));
+    ).map((holder) => holderAt(holder, now));
   const recordHold = Effect.fnUntraced(function* (
     holder: Holder,
     waiters: number,
@@ -520,8 +521,10 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
           const finish = primary
             ? (yield* SavedWrite.subStepObserver)?.hold(op.fiberId)
             : undefined;
+          if (finish) holdSteps.set(op.fiberId, finish);
           return primary
             ? Effect.suspend(() => recordHold(holder, board.waiters, finish)).pipe(
+                Effect.ensuring(Effect.sync(() => holdSteps.delete(op.fiberId))),
                 Effect.andThen(release),
               )
             : release;
@@ -984,9 +987,14 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
     // Only the metadata persistence is marked; publication and its follow-ups keep normal conflicts.
     dispatchMetadata: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       effect.pipe(Effect.provideService(dispatchMetadata, true)),
-    step: <A, E, R>(effect: Effect.Effect<A, E, R>, cardId?: string, operationLabel?: string) =>
+    step: <A, E, R>(
+      effect: Effect.Effect<A, E, R>,
+      cardId?: string,
+      operationLabel?: string,
+      reruns = 2,
+    ) =>
       run(effect, cardId, 0, undefined, undefined, operationLabel).pipe(
-        Effect.provideService(retryPolicy, { reruns: 2, backoffMs: 10 }),
+        Effect.provideService(retryPolicy, { reruns, backoffMs: 10 }),
       ),
     access,
     outside,
