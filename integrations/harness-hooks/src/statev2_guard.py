@@ -1592,27 +1592,33 @@ def _source_hit(source, directory, python=False, shell=False):
     return bool(database and (live_root or home_userdata))
 
 
-def _isolated_migration_history_helpers(location, directory):
+def _isolated_migration_history_helpers(location):
     # These are the only imported helpers that select history files. Read the
     # checkout being inspected, never a helper from the guard's own checkout.
     root = Path(os.path.realpath(location)).parent.parent / 'src/ardud/persistence'
-    try:
-        bodies = []
-        for name in ('historySourceFiles.ts', 'historyArchiveSql.ts'):
+
+    def reject(name):
+        raise LiveRead('live-database-script', f"{root / name}: guard's module pin needs re-auditing; isolated migration refused.")
+
+    bodies = []
+    for name in ('historySourceFiles.ts', 'historyArchiveSql.ts'):
+        try:
             with (root / name).open('rb') as handle:
                 info = os.fstat(handle.fileno())
                 if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_SOURCE_BYTES:
-                    return False
+                    reject(name)
                 body = handle.read(MAX_SOURCE_BYTES + 1)
             if len(body) > MAX_SOURCE_BYTES:
-                return False
+                reject(name)
             bodies.append(body.decode('utf-8'))
-    except (OSError, UnicodeError):
-        return False
+        except (OSError, UnicodeError):
+            reject(name)
     history, archive = bodies
     # A whole-helper shape proves the basename check and the source-directory
     # join together; accepting the return expression alone could hide a write.
-    expected = r'''import type * as Path from "effect/Path";
+    expected = r'''// integrations/harness-hooks/src/statev2_guard.py::_isolated_migration_source proves this shape; run its tests after changes.
+
+import type * as Path from "effect/Path";
 
 /** Also serialized into the readonly export worker; keep runtime dependencies explicit. */
 export function resolveHistoryBasePath(
@@ -1632,17 +1638,14 @@ export function resolveHistoryBasePath(
   return path.join(path.dirname(sourcePath), filename);
 }'''
     if history.strip() != expected:
-        return False
+        reject('historySourceFiles.ts')
+    # Node executes the entire imported module. Pin the audited SQL-only body,
+    # including imports and initializers: a safe archiveFilename alone cannot
+    # discharge extra runtime I/O. Re-audit the whole module before changing it.
+    if hashlib.sha256(archive.encode('utf-8')).hexdigest() != 'cc4ac6791b0764fc1c33f89fb8682bfbb795f14a5b007efbe53e5454a566400e':
+        reject('historyArchiveSql.ts')
     archive_name = r'export const archiveFilename = \(filename: string\) =>\s*NodePath\.join\(NodePath\.dirname\(filename\), "archive\.sqlite"\);'
-    if len(re.findall(archive_name, archive)) != 1:
-        return False
-    uses = re.sub(archive_name, '', archive)
-    uses = uses.replace('import * as NodePath from "node:path";', '')
-    uses = re.sub(r'export const baseArchiveFilename = \(filename: string, basename: string\) =>\s*NodePath\.resolve\(NodePath\.dirname\(filename\), basename\);', '', uses)
-    uses = uses.replace('archiveFilename(filename)', 'guard_archive_name')
-    return (not re.search(r'\b(?:NodePath|archiveFilename)\b', uses) and
-            not re.search(r'''['"`]/(?:Users|home|root|var/root|private)(?=/|['"`])''', archive) and
-            not _source_hit(archive, directory))
+    return len(re.findall(archive_name, archive)) == 1
 
 
 def _isolated_migration_source(source, directory, location):
@@ -1686,7 +1689,7 @@ def _isolated_migration_source(source, directory, location):
     copy_body = source.split(copy_start, 1)[1].split('\nconst pruneSnapshot =', 1)[0]
     if any(attach not in copy_body for attach in attaches):
         return False
-    if not _isolated_migration_history_helpers(location, directory):
+    if not _isolated_migration_history_helpers(location):
         return False
     # Remove complete, proven derivations before checking every remaining use.
     # An extra alias, mutation, reader or writer of either history path fails.

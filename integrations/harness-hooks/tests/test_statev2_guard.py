@@ -1788,6 +1788,84 @@ class GuardTests(unittest.TestCase):
         isolated_source_cases.write_migration_helpers(self.root)
         self.assertIsNone(self.classify(command))
 
+    def test_migration_archive_module_runtime_fail_closed(self):
+        repo = Path(__file__).resolve().parents[3]
+        script = 'apps/server/scripts/migrate-dev-db.ts'
+        archive = 'apps/server/src/ardud/persistence/historyArchiveSql.ts'
+        self.write(script, (repo / script).read_text())
+        self.write('package.json', json.dumps({'scripts': {'migrate-dev-db': 'node ' + script}}))
+        isolated_source_cases.write_migration_helpers(self.root)
+        original = (repo / archive).read_text()
+        commands = [prefix + ' --source /tmp/copy.sqlite --base-dir /tmp/dev-home'
+                    for prefix in ('node ' + script, 'vp run migrate-dev-db')]
+        # Imported modules execute top-level code, even when archiveFilename
+        # itself still derives the expected path. Check the whole I/O class.
+        homes = (
+            ('named-homedir', 'import { homedir } from "node:os";', 'homedir()'),
+            ('namespace-homedir', 'import * as NodeOS from "node:os";', 'NodeOS.homedir()'),
+            ('user-info', 'import * as os from "node:os";', 'os.userInfo().homedir'),
+            ('env-home', '', 'process.env.HOME'),
+            ('absolute-home', '', json.dumps(str(Path.home()))),
+        )
+        operations = (
+            ('readFileSync', ''), ('writeFileSync', ', ""'),
+            ('appendFileSync', ', ""'), ('truncateSync', ', 0'), ('unlinkSync', ''),
+        )
+        for home_label, home_import, home in homes:
+            for operation, extra in operations:
+                injection = ('import { ' + operation + ' } from "node:fs"; ' + home_import + '\n' +
+                             operation + '(' + home + ' + "/.t3/userdata/archive.sqlite"' + extra + ');\n')
+                for placement, body in (('prepend', injection + original), ('append', original + injection)):
+                    for command in commands:
+                        with self.subTest(home=home_label, operation=operation, placement=placement, command=command):
+                            self.write(archive, body)
+                            self.assertEqual(self.classify(command), SCRIPT)
+        for label, body in (
+            ('extra-import', 'import "./unproven.ts";\n' + original),
+            ('extra-runtime', original + '\nthrow new Error("unproven module");\n'),
+            ('changed-export', original.replace('table === "orchestration_events"', '(console.log("unproven"), table === "orchestration_events")')),
+        ):
+            self.assertNotEqual(body, original)
+            self.write(archive, body)
+            for command in commands:
+                with self.subTest(case=label, command=command):
+                    self.assertEqual(self.classify(command), SCRIPT)
+        self.write(archive, original)
+        for command in commands:
+            self.assertIsNone(self.classify(command))
+
+    def test_migration_helper_pin_drift_names_module(self):
+        repo = Path(__file__).resolve().parents[3]
+        script = 'apps/server/scripts/migrate-dev-db.ts'
+        self.write(script, (repo / script).read_text())
+        self.write('package.json', json.dumps({'scripts': {'migrate-dev-db': 'node ' + script}}))
+        commands = [prefix + ' --source /tmp/copy.sqlite --base-dir /tmp/dev-home'
+                    for prefix in ('node ' + script, 'vp run migrate-dev-db')]
+        # Keep the reviewer's exact import-time write, independent of the matrix.
+        repro = ('import { writeFileSync } from "node:fs"; import { homedir } from "node:os"; '
+                 'writeFileSync(homedir() + "/.t3/userdata/archive.sqlite", "");\n')
+        for name in ('historySourceFiles.ts', 'historyArchiveSql.ts'):
+            relative = 'apps/server/src/ardud/persistence/' + name
+            original = (repo / relative).read_text()
+            for label, body in (('reviewer-repro', repro + original),
+                                ('ordinary-drift', original + '\n// helper changed\n'),
+                                ('missing', None)):
+                isolated_source_cases.write_migration_helpers(self.root)
+                if body is None:
+                    (self.root / relative).unlink()
+                else:
+                    self.write(relative, body)
+                for command in commands:
+                    with self.subTest(module=name, case=label, command=command):
+                        rule, cause = guard.classify_detail(command, str(self.root))
+                        self.assertEqual(rule, SCRIPT)
+                        reason = guard.refusal_reason(rule, cause, str(self.root))
+                        self.assertIn(relative, reason)
+                        self.assertIn("guard's module pin needs re-auditing", reason)
+        isolated_source_cases.write_migration_helpers(self.root)
+        for command in commands:
+            self.assertIsNone(self.classify(command))
+
     def test_migration_helpers_belong_to_invoked_script(self):
         repo = Path(__file__).resolve().parents[3]
         relative = 'apps/server/scripts/migrate-dev-db.ts'
