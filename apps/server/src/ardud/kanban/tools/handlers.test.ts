@@ -5088,8 +5088,13 @@ it.effect("card_edit analytics separates invalid subtask plans from approval ref
     const cases = [
       {
         subtasks: [{ id: "s999" }],
-        reason: "subtask_not_found",
-        message: "the card has no subtask s999. Existing subtask ids: s1, s2",
+        reason: "invalid_args",
+        message: "a new subtask needs text and owner",
+      },
+      {
+        subtasks: [{ id: "foo", text: "New", owner: "work" }],
+        reason: "invalid_args",
+        message: "is not a subtask id; use s1, s2, ...",
       },
       {
         subtasks: [{ id: "s1" }, { id: "s1" }],
@@ -7756,6 +7761,30 @@ it.effect("card_create and card_edit report guessed gates and expose clearGate",
     assert.deepStrictEqual(created.structured.gated, [
       { id: "s1", gate: "deploy", source: "guessed" },
     ]);
+    // A no-id entry before an explicit id still reports the gate on the id it
+    // actually got (the plan numbers s1, then takes s4), not on the explicit one.
+    const mixed = yield* call(evaluator, "card_create", {
+      boardId: board.id,
+      title: "Mixed order",
+      prompt: "Work",
+      subtasks: [
+        { text: "Deploy the helper", owner: "evaluator" },
+        { id: "s4", text: "Fix the copy", owner: "work" },
+      ],
+    });
+    assert.isFalse(mixed.isError, mixed.text);
+    assert.deepStrictEqual(mixed.structured.gated, [
+      { id: "s1", gate: "deploy", source: "guessed" },
+    ]);
+    const mixedCard = yield* decodeKanbanCard(mixed.structured.card);
+    assert.deepStrictEqual(
+      mixedCard.subtasks.map(({ id, step }) => [id, step]),
+      [
+        ["s1", 1],
+        ["s4", 2],
+      ],
+    );
+    assert.strictEqual(mixedCard.subtaskSeq, 4);
     assert.strictEqual(
       created.structured.message,
       "s1 got a guessed deploy gate from its wording; if that's wrong, pass clearGate with a reason on this id",

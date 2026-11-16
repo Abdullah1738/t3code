@@ -37,6 +37,7 @@ import * as Asks from "../engine/asks.ts";
 import {
   askGateWarning,
   gateOf,
+  idNumber,
   secretKindApprovalWarning,
   type SubtaskInput,
 } from "../engine/subtasks.ts";
@@ -70,10 +71,19 @@ const gatedResult = (
   card: KanbanCard,
   inputs: ReadonlyArray<SubtaskInput> = [],
   guessedGates?: KanbanBoard["guessedGates"],
+  /** The card before the plan, so generated ids match planSubtasks exactly. */
+  before?: Pick<KanbanCard, "subtaskSeq" | "subtasks">,
 ) => {
-  let nextId = card.subtaskSeq - inputs.filter((input) => !input.id?.trim()).length;
+  // The ids planSubtasks hands out: an explicit one raises the counter, an
+  // entry without one takes the next number (in input order).
+  let nextId = (before?.subtasks ?? []).reduce(
+    (max, subtask) => Math.max(max, idNumber(subtask.id)),
+    before?.subtaskSeq ?? 0,
+  );
   const gated = inputs.flatMap((input) => {
-    const id = input.id?.trim() || `s${++nextId}`;
+    const explicit = input.id?.trim();
+    if (explicit) nextId = Math.max(nextId, idNumber(explicit));
+    const id = explicit || `s${++nextId}`;
     const subtask = card.subtasks.find((entry) => entry.id === id);
     const gate = subtask && gateOf(subtask, guessedGates);
     return input.gate == null && gate && subtask && subtask.gateSource !== "set"
@@ -1455,7 +1465,7 @@ const handlers = {
                     entry.text !== card.subtasks.find((previous) => previous.id === entry.id)?.text,
                 )
                 .map(({ id }) => ({ id })));
-        return { card: edited, ...gatedResult(edited, planInput, board.guessedGates) };
+        return { card: edited, ...gatedResult(edited, planInput, board.guessedGates, card) };
       }),
     ),
   ),

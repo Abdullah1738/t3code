@@ -990,7 +990,8 @@ export type MarkCheck =
   | { readonly ok: true }
   | { readonly ok: false; readonly reason: string; readonly denyReason: McpDenyReason };
 
-const idNumber = (id: string) => Number.parseInt(id.replace(/^s/, ""), 10) || 0;
+/** The number in an `s<N>` subtask id; 0 for anything else. */
+export const idNumber = (id: string) => Number.parseInt(id.replace(/^s/, ""), 10) || 0;
 
 /** The ids the board hands out: s1, s2, ... */
 const subtaskId = /^s[1-9]\d*$/;
