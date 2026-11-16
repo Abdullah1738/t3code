@@ -108,6 +108,9 @@ export const traceObserver = Context.Reference<
       readonly span: Tracer.Span;
       readonly enter: (stage: Stage, fiberId: number) => () => void;
       readonly mark: (stage: Stage, fiberId: number) => void;
+      readonly observeLocks?: (
+        snapshot: (now: number) => Readonly<Record<string, unknown>>,
+      ) => () => void;
     }
   | undefined
 >("KanbanSavedWriteTrace", { defaultValue: () => undefined });
