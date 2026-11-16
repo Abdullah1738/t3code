@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tests._env import clean_env
+from tests._env import clean_env, require_shim_interpreter
 
 BLOCKERS = Path(__file__).resolve().parent.parent / "blockers"
 
@@ -28,6 +28,7 @@ class SendGuardTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def run_shim(self, name, *args, env=None):
+        require_shim_interpreter(self, BLOCKERS / name)
         return subprocess.run([str(BLOCKERS / name), *args], env=env or self.env,
                               capture_output=True, text=True, timeout=10)
 
