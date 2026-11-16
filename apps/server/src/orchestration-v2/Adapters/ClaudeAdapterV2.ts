@@ -11139,6 +11139,43 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           },
         );
 
+        const wakeCredential = yield* McpProviderSessions.readForRuntime(
+          mcpSessions,
+          input.threadId,
+          input.providerSessionId,
+          CLAUDE_PROVIDER,
+        );
+        if (wakeCredential !== undefined) {
+          // The CLI executes wake tools before queued continuation output is replayed.
+          yield* mcpSessions.registerWakeCaller(wakeCredential, () => {
+            const live = Ref.getUnsafe(queryContext);
+            if (live === null || live.stopping) return "inactive";
+            const route = Ref.getUnsafe(lastTurnRouteByNativeThread).get(live.nativeThreadId);
+            if (route?.threadId !== input.threadId) return "inactive";
+            const buffered = Ref.getUnsafe(wakeBuffers).get(live.nativeThreadId)?.messages ?? [];
+            if (
+              buffered.some(
+                (message) =>
+                  isClaudeTurnStartMessage(message) ||
+                  ((message.type === "assistant" ||
+                    message.type === "user" ||
+                    message.type === "result") &&
+                    parentToolUseIdFromSdkMessage(message) === null),
+              )
+            )
+              return "live";
+            return buffered.some(
+              (message) => message.type === "system" && message.subtype === "task_notification",
+            ) ||
+              rosterForNativeThread(
+                Ref.getUnsafe(pendingBackgroundTasksByNativeThread),
+                live.nativeThreadId,
+              ).size > 0
+              ? "starting"
+              : "inactive";
+          });
+        }
+
         const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
           instanceId: adapterOptions.instanceId,
           driver: CLAUDE_PROVIDER,

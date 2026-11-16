@@ -302,6 +302,61 @@ export const isLiveCallerShell = (
     ) ??
       false));
 
+const readNativeWakeCaller = Effect.fn("mcp.readNativeWakeCaller")(function* (
+  caller: McpInvocationScope["thread"],
+) {
+  const sessions = yield* Effect.serviceOption(McpProviderSessions.McpProviderSessions);
+  return caller !== undefined && Option.isSome(sessions)
+    ? yield* sessions.value.readWakeCaller(caller)
+    : "inactive";
+});
+
+const wakeRunStarting = () =>
+  new OrchestratorMcpFailure({
+    code: "run_starting",
+    saved: false,
+    message:
+      "The background wake turn is starting. Retry this call in a few seconds; nothing was saved.",
+  });
+
+const failCallerRunUnavailable = Effect.fn("mcp.failCallerRunUnavailable")(function* (
+  caller: McpInvocationScope["thread"],
+  shell: Parameters<typeof isLiveCallerShell>[0],
+  message: string,
+) {
+  if (
+    shell !== null &&
+    shell.archivedAt === null &&
+    shell.providerInstanceId === caller?.providerInstanceId
+  ) {
+    const wake = yield* readNativeWakeCaller(caller);
+    if (wake !== "inactive") return yield* wakeRunStarting();
+  }
+  return yield* new OrchestratorMcpFailure({ code: "parent_not_active", saved: false, message });
+});
+
+// Keep the existing run/subagent predicate; only Claude registers a native wake probe.
+export const assertLiveCallerShell = Effect.fn("mcp.assertLiveCallerShell")(function* (
+  shell: Parameters<typeof isLiveCallerShell>[0],
+  caller: McpInvocationScope["thread"],
+) {
+  if (isLiveCallerShell(shell, caller?.providerInstanceId)) return;
+  if (
+    shell !== null &&
+    shell.archivedAt === null &&
+    shell.providerInstanceId === caller?.providerInstanceId &&
+    caller !== undefined
+  ) {
+    const wake = yield* readNativeWakeCaller(caller);
+    if (wake === "live") return;
+    if (wake === "starting") return yield* wakeRunStarting();
+  }
+  return yield* failure(
+    "parent_not_active",
+    "The calling provider no longer owns an active thread run.",
+  );
+});
+
 function threadManagementFailure(error: unknown): OrchestratorMcpFailure {
   if (isOrchestratorMcpFailure(error)) return error;
   if (!isThreadManagementError(error)) return failure("orchestration_error", errorMessage(error));
@@ -1531,11 +1586,7 @@ const make = Effect.gen(function* () {
             threadId: parent.thread.id,
             stage: "caller",
           }),
-        Effect.flatMap((shell) =>
-          isLiveCallerShell(shell, scope.thread?.providerInstanceId)
-            ? Effect.void
-            : Effect.fail(notActive),
-        ),
+        Effect.flatMap((shell) => assertLiveCallerShell(shell, scope.thread)),
       );
     }
     if (
@@ -2855,8 +2906,9 @@ const make = Effect.gen(function* () {
           run.rootNodeId === null ||
           run.providerInstanceId !== threadScope.thread.providerInstanceId
         ) {
-          return yield* failure(
-            "parent_not_active",
+          return yield* failCallerRunUnavailable(
+            threadScope.thread,
+            parent.thread,
             "Asking for a secret requires an active run owned by this MCP provider session.",
           );
         }
@@ -3168,12 +3220,11 @@ const make = Effect.gen(function* () {
             true,
           );
         yield* McpCallAnalytics.setSaved(false);
-        return yield* new OrchestratorMcpFailure({
-          code: "parent_not_active",
-          saved: false,
-          message:
-            "Delegated task was not created; safe to retry with the same clientRequestId. Delegated tasks require an active run owned by this MCP provider session.",
-        });
+        return yield* failCallerRunUnavailable(
+          scope.thread,
+          parent.thread,
+          "Delegated task was not created; safe to retry with the same clientRequestId. Delegated tasks require an active run owned by this MCP provider session.",
+        );
       }
       yield* Effect.annotateCurrentSpan({
         "t3.delegate.parent_run_id": parentRun.id,
@@ -3585,11 +3636,7 @@ const make = Effect.gen(function* () {
         );
         if (caller === null || caller.deletedAt !== null)
           return yield* failure("thread_not_found", "The calling thread was not found.");
-        if (!isLiveCallerShell(caller, scope.thread.providerInstanceId))
-          return yield* failure(
-            "parent_not_active",
-            "The calling provider no longer owns an active thread run.",
-          );
+        yield* assertLiveCallerShell(caller, scope.thread);
         partial = { ...partial, callerResolved: true, stoppedAt: "parent_records" };
         return yield* readTask(scope, taskId, false, "background", undefined, (progress) => {
           partial = {
@@ -3813,8 +3860,9 @@ const make = Effect.gen(function* () {
           parentRun.rootNodeId === null ||
           parentRun.providerInstanceId !== scope.thread.providerInstanceId
         ) {
-          return yield* failure(
-            "parent_not_active",
+          return yield* failCallerRunUnavailable(
+            scope.thread,
+            parent.thread,
             "Thread creation requires an active run owned by this MCP provider session.",
           );
         }

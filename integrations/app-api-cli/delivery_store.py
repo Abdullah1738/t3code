@@ -8,6 +8,7 @@ import re
 import sqlite3
 import stat
 import subprocess
+import tempfile
 import time
 
 import toollog
@@ -15,6 +16,7 @@ import toollog
 ROOT = Path(os.environ.get('DELIVERY_STORE', str(Path.home() / '.local/state/order-tracker')))
 PHONE_LOCK = Path.home() / '.local/share/phone-lock'
 HOLD_MAX_S = 3600
+HOLD_ALERT_S = 900
 HOLD_DETAILS = {'deferred_priority_hold', 'priority_hold_stale'}
 PACKAGES = {'com.talabat': 'talabat', 'com.noon.buyerapp': 'noon',
             'com.careem.acma': 'careem', 'com.amazon.mShop.android.shopping': 'amazon'}
@@ -220,6 +222,33 @@ def reconcile(cfg, detected=None, source=None, evidence_time=None, reported=None
     return row
 
 
+def record_hold_alert(hold):
+    try:
+        mtime = (PHONE_LOCK / 'priority-hold').lstat().st_mtime
+    except FileNotFoundError:
+        return False
+    alert_id = hashlib.sha256((hold['owner'] + '|' + str(int(mtime))).encode()).hexdigest()
+    path = ROOT / 'hold-alerts.json'
+    try:
+        sent = json.loads(path.read_text())
+        if not isinstance(sent, list) or not all(isinstance(item, str) for item in sent):
+            sent = []
+    except (OSError, ValueError, UnicodeError):
+        sent = []
+    if alert_id in sent:
+        return False
+    with tempfile.NamedTemporaryFile(mode='w', dir=ROOT, prefix='hold-alerts-',
+                                     suffix='.tmp', delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+            json.dump((sent + [alert_id])[-50:], stream)
+            stream.close()
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return True
+
+
 def health_check():
     now = time.time()
     with connect() as db:
@@ -233,10 +262,16 @@ def health_check():
                 raise RuntimeError('notification collection blocked by stale phone priority-hold: '
                                    'owner={owner} reason={reason} age={age_s}s; '
                                    "do not remove another task's hold, report it to its owner".format(**hold))
-            print(json.dumps({'status': 'deferred', 'reason': 'priority_hold',
-                              'owner': hold['owner'] if hold else None,
-                              'hold_reason': hold['reason'] if hold else 'hold_absent',
-                              'age_s': hold['age_s'] if hold else None}))
+            if (hold is not None and hold['reason'] == 'no_matching_lease_within_bound'
+                    and hold['age_s'] > HOLD_ALERT_S and record_hold_alert(hold)):
+                print(json.dumps({
+                    'status': 'alert', 'reason': 'phone_priority_hold_without_lease',
+                    'owner': hold['owner'], 'age_min': hold['age_s'] // 60,
+                    'collection': 'blocked',
+                    'note': 'delivery notifications are not being collected; the holder has no lease; '
+                            "ask the holder to release it, never remove another task's hold"}))
+                toollog.emit('order-watch', 'collector.hold_alert_sent',
+                             props={key: hold[key] for key in ('owner', 'age_s', 'reason')})
             return
         if not row['ok']:
             raise RuntimeError('notification collection unavailable: ' + row['detail'])

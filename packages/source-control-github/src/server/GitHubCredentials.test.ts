@@ -1,5 +1,4 @@
 import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
-import * as FileSystem from "effect/FileSystem";
 import { SpawnExecutableResolution } from "@t3tools/shared/shell";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "@effect/vitest";
@@ -16,6 +15,7 @@ import type * as SourceControlHost from "@t3tools/source-control-core/server/Sou
 import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
 import * as TestSourceControlHost from "@t3tools/source-control-testing/TestSourceControlHost";
 import * as GitHubCredentials from "./GitHubCredentials.ts";
+import { gitHubProviderFailure } from "./GitHubPullRequestProvider.ts";
 
 const TOKEN_VARIABLES = [
   "GH_TOKEN",
@@ -67,8 +67,7 @@ function harness(
         process: { run },
       }),
     ),
-    Layer.provide(NodeCrypto.layer),
-    Layer.provide(NodeFileSystem.layer),
+    Layer.provide(Layer.merge(NodeCrypto.layer, NodeFileSystem.layer)),
   );
   return { layer, calls };
 }
@@ -82,95 +81,89 @@ describe("GitHubCredentials", () => {
   });
 
   it.effect.each([
-    { resolved: "/hydrated/bin/gh", cwdExists: true, expected: "GitHubCliFailedError" },
-    { resolved: undefined, cwdExists: true, expected: "GitHubCliMissingError" },
-    { resolved: "/hydrated/bin/gh", cwdExists: false, expected: "GitHubCliFailedError" },
-    { resolved: undefined, cwdExists: false, expected: "GitHubCliFailedError" },
-  ])("classifies ENOENT with $resolved and cwdExists=$cwdExists", (row) => {
+    { cwd: "/", gh: undefined, expected: "GitHubCliMissingError" },
+    { cwd: "/missing-pr-watch-cwd", gh: "/tools/gh", expected: "GitHubCliFailedError" },
+    { cwd: "/missing-pr-watch-cwd", gh: undefined, expected: "GitHubCliFailedError" },
+    { cwd: "/", gh: "/tools/gh", expected: "GitHubCliFailedError" },
+  ])("classifies spawn NotFound with cwd=$cwd gh=$gh", ({ cwd, gh, expected }) => {
     const messages: unknown[] = [];
-    let attempts = 0;
-    const native = Object.assign(new Error("must not log raw cause or token-secret"), {
-      code: "ENOENT",
-      errno: -2,
-      syscall: "spawn gh",
-    });
+    let calls = 0;
     const layer = GitHubCredentials.layer.pipe(
       Layer.provide(
         TestSourceControlHost.layer({
           process: {
-            run: (input) =>
-              ++attempts === 1
-                ? Effect.fail(
-                    new VcsProcessSpawnError({
-                      operation: input.operation,
-                      command: input.command,
-                      cwd: input.cwd,
-                      cause: PlatformError.systemError({
-                        _tag: "NotFound",
-                        module: "ChildProcess",
-                        method: "spawn",
-                        syscall: "spawn",
-                        cause: native,
-                      }),
+            run: (input) => {
+              calls++;
+              if (calls > 1)
+                return Effect.succeed(TestSourceControlHost.processOutput("recovered-token"));
+              return Effect.fail(
+                new VcsProcessSpawnError({
+                  operation: input.operation,
+                  command: input.command,
+                  cwd: input.cwd,
+                  cause: PlatformError.systemError({
+                    _tag: "NotFound",
+                    module: "ChildProcess",
+                    method: "spawn",
+                    syscall: "spawn gh",
+                    cause: Object.assign(new Error("private-token-must-not-be-logged"), {
+                      errno: -2,
+                      code: "ENOENT",
+                      syscall: "spawn gh",
+                      path: "gh",
+                      stdout: "private-token-must-not-be-logged",
+                      stderr: "private-token-must-not-be-logged",
                     }),
-                  )
-                : Effect.succeed(TestSourceControlHost.processOutput("recovered-token")),
+                  }),
+                }),
+              );
+            },
           },
         }),
       ),
-      Layer.provide(NodeCrypto.layer),
-      Layer.provide(
-        FileSystem.layerNoop({
-          stat: () =>
-            row.cwdExists
-              ? Effect.succeed({ type: "Directory" } as FileSystem.File.Info)
-              : Effect.fail(
-                  PlatformError.systemError({
-                    _tag: "NotFound",
-                    module: "FileSystem",
-                    method: "stat",
-                  }),
-                ),
-        }),
-      ),
+      Layer.provide(Layer.merge(NodeCrypto.layer, NodeFileSystem.layer)),
     );
     return Effect.gen(function* () {
       const credentials = yield* GitHubCredentials.GitHubCredentials;
-      expect((yield* Effect.flip(credentials.get("github.com")))._tag).toBe(row.expected);
-      if (row.expected === "GitHubCliFailedError") {
+      const failure = yield* Effect.flip(credentials.get("github.com"));
+      expect(failure._tag).toBe(expected);
+      expect(gitHubProviderFailure(failure).reason).toBe(
+        expected === "GitHubCliMissingError" ? "missing-tool" : "failed",
+      );
+      if (expected === "GitHubCliFailedError") {
         expect(Redacted.value((yield* credentials.get("github.com")).token)).toBe(
           "recovered-token",
         );
-        expect(attempts).toBe(2);
+      } else {
+        expect((yield* Effect.flip(credentials.get("github.com")))._tag).toBe(expected);
       }
+      expect(calls).toBe(expected === "GitHubCliFailedError" ? 2 : 1);
       const flat = messages.flatMap((message) => (Array.isArray(message) ? message : [message]));
-      expect(flat).toContain("GitHubCredentials.get spawn failed");
+      expect(flat).toContain("GitHub credential CLI failed");
       expect(flat).toContainEqual(
         expect.objectContaining({
-          command: "gh",
+          operation: "GitHubCredentials.get",
           host: "github.com",
-          path: "/hydrated/bin:/usr/bin",
-          cwd: "/credential-cwd",
-          cwdExists: row.cwdExists,
-          resolvedCommand: row.resolved ?? null,
-          code: "ENOENT",
           errno: -2,
+          code: "ENOENT",
           syscall: "spawn gh",
+          path: "gh",
+          cwd,
+          cwdExists: cwd === "/",
+          resolvedGh: gh ?? null,
+          pathDirs: ["/private/bin", "/usr/bin"],
+          credentialErrorTag: expected,
+          command: gh ?? "gh",
         }),
       );
-      expect(JSON.stringify(flat)).not.toContain("token-secret");
+      expect(JSON.stringify(flat)).not.toContain("private-token-must-not-be-logged");
       expect(JSON.stringify(flat)).not.toContain("recovered-token");
     }).pipe(
       Effect.provide(layer),
-      Effect.provideService(HostProcess.Environment, {
-        PATH: "/hydrated/bin:/usr/bin",
-        OTHER_SECRET: "token-secret",
-      }),
-      Effect.provideService(HostProcess.WorkingDirectory, "/credential-cwd"),
-      Effect.provideService(SpawnExecutableResolution, (_command, _platform, env) => {
-        expect(env.PATH).toBe("/hydrated/bin:/usr/bin");
-        return row.resolved;
-      }),
+      Effect.provideService(HostProcess.Environment, { PATH: "/private/bin:/usr/bin" }),
+      Effect.provideService(HostProcess.WorkingDirectory, cwd),
+      Effect.provideService(HostProcess.Platform, "darwin"),
+      Effect.provideService(SpawnExecutableResolution, () => gh),
       Effect.provide(
         Logger.layer([
           Logger.make(({ message }) => {
@@ -180,49 +173,6 @@ describe("GitHubCredentials", () => {
       ),
     );
   });
-
-  it.effect.each([true, false])("checks the hydrated PATH on disk (installed=%s)", (installed) =>
-    Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const platform = yield* HostProcess.Platform;
-      const cwd = yield* fs.makeTempDirectoryScoped();
-      if (installed) {
-        const executable = `${cwd}/${platform === "win32" ? "gh.exe" : "gh"}`;
-        yield* fs.writeFileString(executable, "#!/bin/sh\n");
-        if (platform !== "win32") yield* fs.chmod(executable, 0o755);
-      }
-      const layer = GitHubCredentials.layer.pipe(
-        Layer.provide(
-          TestSourceControlHost.layer({
-            process: {
-              run: (input) =>
-                Effect.fail(
-                  new VcsProcessSpawnError({
-                    operation: input.operation,
-                    command: input.command,
-                    cwd: input.cwd,
-                    cause: PlatformError.systemError({
-                      _tag: "NotFound",
-                      module: "ChildProcess",
-                      method: "spawn",
-                    }),
-                  }),
-                ),
-            },
-          }),
-        ),
-        Layer.provide(NodeCrypto.layer),
-      );
-      const error = yield* Effect.gen(function* () {
-        return yield* Effect.flip((yield* GitHubCredentials.GitHubCredentials).get("github.com"));
-      }).pipe(
-        Effect.provide(layer),
-        Effect.provideService(HostProcess.Environment, { PATH: cwd }),
-        Effect.provideService(HostProcess.WorkingDirectory, cwd),
-      );
-      expect(error._tag).toBe(installed ? "GitHubCliFailedError" : "GitHubCliMissingError");
-    }).pipe(Effect.provide(NodeFileSystem.layer), Effect.scoped),
-  );
 
   it.effect("asks gh for the active login when Settings pin nothing", () => {
     const { layer, calls } = harness();

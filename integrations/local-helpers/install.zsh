@@ -74,6 +74,8 @@ typeset -A live=(
   libexec/qcard "$HOME/.local/libexec/qcard"
   libexec/mirage "$HOME/.local/libexec/mirage"
   libexec/vp "$HOME/.local/libexec/vp"
+  libexec/repo-node-pin "$HOME/.local/libexec/repo-node-pin"
+  libexec/repo-node-pin/pnpm-bin "$HOME/.local/libexec/repo-node-pin/pnpm-bin"
   juno-proxy "$HOME/.local/share/juno-proxy"
   lydia-ticks "$HOME/.local/share/lydia-ticks"
   bin "$HOME/.local/bin"

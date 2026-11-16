@@ -117,7 +117,7 @@ def list_leases(me: dict, show_all: bool, as_json: bool) -> None:
         print("no leases" + ("" if show_all else " for this thread (use --all)"))
     for d in out:
         pin = " pinned" if (d.get("pinned_until") or 0) > now() else ""
-        note = f"  [{d['note']}]" if d['state'] == 'resume_stalled' or (d.get("note") or "").startswith((TOO_BIG_NOTE, DEAD_MOUNT_NOTE, BOX_WEDGED_NOTE)) else ""
+        note = f"  [{d['note']}]" if d['state'] == 'resume_stalled' or (d.get("note") or "").startswith((TOO_BIG_NOTE, DEAD_MOUNT_NOTE, BOX_WEDGED_NOTE, pool.RECYCLED_NOTE)) else ""
         print(f"{d['box_id']:<12} {d['state']:<8} {d['size'] or '':<8} {d['repo_key']:<24} used {ago(d['last_used_at']):>6} "
               f"ago runs:{d['active_runs']}{pin}{note}  {d['source'] or ''}  {(d['thread_title'] or d['owner'])[:40]}")
 
@@ -206,6 +206,9 @@ def _release_one(con, r, delete, me=None):
             pin = lease.foreign_pin(con, r['box_id'], me)
             if pin:
                 print(f"stopped {r['box_id']} (disk kept; pinned by {pin[0]} until {iso(pin[1])}; other runs won't pick it)")
+                return
+            if (r['note'] or '').startswith(pool.RECYCLED_NOTE):
+                print(f"stopped {r['box_id']} (disk kept; detached from the repository pool)")
                 return
             print(f"stopped {r['box_id']} (free; disk kept; next offbox run resumes it)")
 
@@ -625,6 +628,9 @@ def status(me: dict) -> None:
             reason = lease.boot_dead(con, b['id'])
             if reason:
                 held += f' set aside [{reason}]'
+            retained = con.execute('SELECT note FROM leases WHERE box_id=?', (b['id'],)).fetchone()
+            if retained and (retained['note'] or '').startswith(pool.RECYCLED_NOTE):
+                held += f" detached [{retained['note']}]"
             print(f"  {b['id']:<12} {b.get('state'):<9} {b.get('type'):<8} {(b.get('name') or '')[:60]}{held}")
     except OffboxError as e:
         print(f"boxes: boat API unreachable ({e})")
@@ -1324,8 +1330,10 @@ def _never_started(r) -> bool:
 
 
 def _report_never_started(r) -> int:
+    from . import queue_lifecycle
     if r['status'] == 'killed':
         say(f"{r['run_id']}: killed while queued; never started; nothing ran, safe to rerun")
+        say(queue_lifecycle.last_end(r['run_id']))
         return 130
     client_log = LOGS_DIR / f"{r['run_id']}.client.log"
     try:
@@ -1345,6 +1353,7 @@ def _report_never_started(r) -> int:
         guess = '' if client_log.exists() else ' (caller interrupted?)'
         say(f"{r['run_id']}: never started: the offbox client that queued it ended before it got a box"
             f"{guess}; nothing ran, safe to rerun")
+    say(queue_lifecycle.last_end(r['run_id']))
     if tail:
         say(f"client log: {client_log}")
         for line in tail:
@@ -1844,19 +1853,31 @@ def _pid_started_at(pid: int) -> float | None:
         return None
 
 
-def _client_alive(pid: int | None, start_at: float | None) -> bool:
+def _client_alive(pid: int | None, start_at: float | None, *, reaper_run=None) -> bool:
     """Is the `offbox run` that inserted this row still running? Unknown (no pid recorded) counts as alive.
     A live pid that started after the run did is a reused pid, so the client is gone."""
+    alive, check, began = _client_check(pid, start_at)
+    if not alive and reaper_run:
+        with contextlib.suppress(Exception):
+            age = f'{now() - start_at:.3f}' if start_at is not None else 'unknown'
+            log(f"reaper no-box run {reaper_run} client_pid={pid} check={check} "
+                f"age_s={age} row_start_at={start_at} observed_start_at={began}")
+    return alive
+
+
+def _client_check(pid, start_at):
     if not pid:
-        return True
+        return True, 'no_pid', None
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
-        return False
+        return False, 'pid_missing', None
     except PermissionError:
         pass
     began = _pid_started_at(pid)
-    return began is None or start_at is None or began <= start_at + 2
+    alive = began is None or start_at is None or began <= start_at + 2
+    check = 'identity_unavailable' if began is None or start_at is None else 'alive' if alive else 'pid_reused'
+    return alive, check, began
 
 
 def _wait_start_receipt(row, deadline, *, locked=False):

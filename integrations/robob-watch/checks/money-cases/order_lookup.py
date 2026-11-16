@@ -13,6 +13,9 @@ import sys
 import time
 from zoneinfo import ZoneInfo
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import data_io
+
 LANES = ('minutes', 'marketplace', 'food', 'nownow')
 SAME_TIME = dt.timedelta(minutes=15)
 BINDING_LIMIT = 'ORDER_LIST_HOST_BINDING_UNVERIFIED'
@@ -59,13 +62,18 @@ def projection(row):
 
 def load_cache(path):
     try:
-        rows = json.loads(path.read_text())
+        rows = json.loads(data_io.read_text(path))
         return [projection(row) for row in rows if terminal(row)] if isinstance(rows, list) else []
     except (OSError, ValueError, TypeError, AttributeError, InvalidOperation):
         return []
 
 
 def read(app, deadline=None, since=None, cache_path=None):
+    with data_io.scope(min(time.time() + 10, deadline) if deadline is not None else time.time() + 10):
+        return _read(app, deadline, since, cache_path)
+
+
+def _read(app, deadline, since, cache_path):
     from state_json import write_json
     remaining = 10 if deadline is None else min(10, deadline - time.time() - 0.1)
     if remaining < 1:
@@ -80,14 +88,14 @@ def read(app, deadline=None, since=None, cache_path=None):
         if app == 'noon':
             # The lock must precede the snapshot and span the subprocess: locking
             # only the write lets a stale reader restore an evicted receipt.
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            lock_fd = os.open(cache_path.with_suffix('.lock'), os.O_CREAT | os.O_RDWR, 0o600)
+            data_io.materialize_io(lambda: cache_path.parent.mkdir(parents=True, exist_ok=True), cache_path.parent)
+            lock_fd = data_io.materialize_io(lambda: os.open(cache_path.with_suffix('.lock'), os.O_CREAT | os.O_RDWR, 0o600), cache_path.with_suffix('.lock'), deadline)
             while True:
                 left = end - time.monotonic()
                 if left < 1:
                     raise OutOfTime('order lookup out of time')
                 try:
-                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    data_io.materialize_io(lambda: fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB), cache_path.with_suffix('.lock'), deadline)
                     break
                 except BlockingIOError:
                     time.sleep(min(0.05, left))

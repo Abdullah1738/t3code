@@ -12,7 +12,14 @@ export interface SpawnRequest {
 
 export type SpawnEvent =
   | { readonly type: "spawn"; readonly pid: number }
-  | { readonly type: "error"; readonly message: string; readonly code?: string }
+  | {
+      readonly type: "error";
+      readonly message: string;
+      readonly code?: string;
+      readonly errno?: number;
+      readonly syscall?: string;
+      readonly path?: string;
+    }
   | { readonly type: "data"; readonly stream: "stdout" | "stderr"; readonly data: Uint8Array }
   | { readonly type: "end"; readonly stream: "stdout" | "stderr" }
   | { readonly type: "written"; readonly error?: string }
@@ -23,6 +30,18 @@ export type SpawnEvent =
 export function spawnWorker(cp: typeof NodeChildProcess, parent: NodeWorkerThreads.MessagePort) {
   parent.on("message", (request: SpawnRequest) => {
     const { port } = request;
+    // Native errors may also hold output or arguments; only transport diagnostic fields.
+    const sendError = (error: NodeJS.ErrnoException) => {
+      const event: SpawnEvent = {
+        type: "error",
+        message: error.message,
+        ...(typeof error.code === "string" ? { code: error.code } : {}),
+        ...(typeof error.errno === "number" ? { errno: error.errno } : {}),
+        ...(typeof error.syscall === "string" ? { syscall: error.syscall } : {}),
+        ...(typeof error.path === "string" ? { path: error.path } : {}),
+      };
+      port.postMessage(event);
+    };
     const state = new Int32Array(request.state);
     if (Atomics.load(state, 1)) {
       port.close();
@@ -43,9 +62,7 @@ export function spawnWorker(cp: typeof NodeChildProcess, parent: NodeWorkerThrea
       // visible before the worker can service its next message.
       if (Atomics.load(state, 1)) kill();
       child.on("spawn", () => port.postMessage({ type: "spawn", pid: child.pid }));
-      child.on("error", (error: NodeJS.ErrnoException) => {
-        port.postMessage({ type: "error", message: error.message, code: error.code });
-      });
+      child.on("error", sendError);
       child.on("exit", (code, signal) => {
         port.postMessage({ type: "exit", code, signal });
         if (code !== 0 && code !== null) {
@@ -70,7 +87,7 @@ export function spawnWorker(cp: typeof NodeChildProcess, parent: NodeWorkerThrea
           port.postMessage({ type: "data", stream: name, data });
         });
         output.on("end", () => port.postMessage({ type: "end", stream: name }));
-        output.on("error", (error) => port.postMessage({ type: "error", message: error.message }));
+        output.on("error", sendError);
       }
       child.stdin?.on("error", (error) =>
         port.postMessage({ type: "written", error: error.message }),
@@ -105,8 +122,7 @@ export function spawnWorker(cp: typeof NodeChildProcess, parent: NodeWorkerThrea
         child.stdin?.destroy();
       });
     } catch (error) {
-      const cause = error as NodeJS.ErrnoException;
-      port.postMessage({ type: "error", message: cause.message, code: cause.code });
+      sendError(error as NodeJS.ErrnoException);
     }
   });
 }

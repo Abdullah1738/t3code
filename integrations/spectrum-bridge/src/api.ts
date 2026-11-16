@@ -1,3 +1,4 @@
+import { markReactionAnswered } from "./unanswered.ts";
 import { parseHealthSidecar } from "./health-receipts.ts";
 import { messageLengthError } from "./message-length.ts";
 import { toolError } from "./toollog.ts";
@@ -466,6 +467,7 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         if (!inbound && !store.byProviderId(target)) throw new ApiError(403);
         const id = `reaction:${hash(target + kind)}`;
         await photon.react(chat, target, kind as ReactionKind, id);
+        markReactionAnswered(store, target);
         return json({ id });
       }
 

@@ -3,10 +3,16 @@ import * as NodeChildProcess from "node:child_process";
 import * as NodeModule from "node:module";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as HostProcess from "@t3tools/shared/HostProcess";
-import { assert, it } from "@effect/vitest";
+import * as GitHubCredentials from "@t3tools/source-control-github/server/GitHubCredentials";
+import * as TestSourceControlHost from "@t3tools/source-control-testing/TestSourceControlHost";
+import { assert, expect, it } from "@effect/vitest";
 import { vi } from "vite-plus/test";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
+import * as Path from "effect/Path";
+import * as Redacted from "effect/Redacted";
 import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as ProcessRunner from "./processRunner.ts";
@@ -18,6 +24,81 @@ const native = NodeModule.createRequire(import.meta.url)(
 ) as typeof NodeChildProcess;
 const cases = ["startup", "application"].flatMap((phase) =>
   ["direct", "runner", "vcs"].map((kind) => ({ phase, kind })),
+);
+
+it.effect.skipIf(HostProcess.Platform.defaultValue() === "win32")(
+  "logs native credential spawn diagnostics through the server worker and recovers without leaking output",
+  () => {
+    const messages: unknown[] = [];
+    return Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "t3-credential-spawn-" });
+      const gh = path.join(cwd, "gh");
+      // A present executable with a missing interpreter reproduces native ENOENT
+      // without requiring a real gh installation or touching the machine's login.
+      yield* fs.writeFileString(gh, `#!${path.join(cwd, "missing-interpreter")}\n`);
+      yield* fs.chmod(gh, 0o700);
+      const host = Layer.unwrap(
+        Effect.gen(function* () {
+          const vcs = yield* VcsProcess.VcsProcess;
+          return TestSourceControlHost.layer({ process: { run: vcs.run } });
+        }),
+      ).pipe(Layer.provide(VcsProcess.layer));
+      const boot = Layer.effectDiscard(
+        Effect.gen(function* () {
+          const credentials = yield* GitHubCredentials.GitHubCredentials;
+          const error = yield* credentials.get("github.com").pipe(Effect.flip);
+          assert.strictEqual(error._tag, "GitHubCliFailedError");
+          const flat = messages.flatMap((message) =>
+            Array.isArray(message) ? message : [message],
+          );
+          expect(flat).toContainEqual(
+            expect.objectContaining({
+              operation: "GitHubCredentials.get",
+              command: gh,
+              credentialErrorTag: "GitHubCliFailedError",
+              platformReason: "NotFound",
+              errno: -2,
+              code: "ENOENT",
+              syscall: `spawn ${gh}`,
+              path: gh,
+              cwd,
+              cwdExists: true,
+              resolvedGh: gh,
+              pathDirs: [cwd],
+            }),
+          );
+          yield* fs.writeFileString(gh, "#!/bin/sh\nprintf '%s' 'private-worker-token'\n");
+          const recovered = yield* credentials.get("github.com");
+          assert.strictEqual(Redacted.value(recovered.token), "private-worker-token");
+          assert.notInclude(JSON.stringify(messages), "private-worker-token");
+        }),
+      ).pipe(
+        Layer.provide(GitHubCredentials.layer.pipe(Layer.provide(host))),
+        ServerProcessRuntime.provide,
+      );
+      yield* Layer.build(boot).pipe(
+        Effect.provideService(HostProcess.Environment, {
+          PATH: cwd,
+          OTHER_SECRET: "private-worker-token",
+        }),
+        Effect.provideService(HostProcess.WorkingDirectory, cwd),
+      );
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.merge(
+          NodeServices.layer,
+          Logger.layer([
+            Logger.make(({ message }) => {
+              messages.push(message);
+            }),
+          ]),
+        ),
+      ),
+    );
+  },
 );
 
 for (const { phase, kind } of cases) {

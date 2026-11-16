@@ -13,6 +13,11 @@ spec.loader.exec_module(installer)
 
 
 class InstallTests(unittest.TestCase):
+    def setUp(self):
+        pin = patch.object(installer, 'pin_data_dir', return_value='already pinned')
+        pin.start()
+        self.addCleanup(pin.stop)
+
     def dirs(self, tmp):
         return Path(tmp) / 'live', Path(tmp) / 'data', Path(tmp) / 'bin' / 'money-cases'
 
