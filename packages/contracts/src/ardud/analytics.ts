@@ -256,6 +256,8 @@ const GeneralEvent = Schema.Struct({
       actor: Schema.optionalKey(
         Schema.Literals(["owner", "thread", "evaluator", "script", "system"]),
       ),
+      seq: Schema.optionalKey(Measurement),
+      target: Schema.optionalKey(Schema.Literals(["live_thread", "steer", "start", "none"])),
       msInPrevStage: Schema.optionalKey(Measurement),
       round: Schema.optionalKey(Measurement),
       chain: Schema.optionalKey(Label),

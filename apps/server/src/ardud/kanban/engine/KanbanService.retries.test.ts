@@ -894,9 +894,11 @@ it.effect("a script post keeps its reply reminder without an owner message", () 
       const discussion = yield* kanban.cardDiscussion(card.id);
       const script = { _tag: "script" as const, scriptId: KanbanScriptId.make("script-reminder") };
       yield* kanban.post(discussion.id, script, [{ _tag: "md", text: "Please check this result" }]);
-      assert.isNull(yield* store.ownerReply(discussion.id, thread, false));
+      const obligation = yield* store.ownerReply(discussion.id, thread, false);
+      assert.isNotNull(obligation);
+      assert.isFalse(obligation!.answered);
       const action = yield* ownerReplyPending(store, discussion.id, thread);
-      assert.isNotNull(action);
+      assert.strictEqual(action, obligation!.key);
       yield* kanban.post(discussion.id, { _tag: "system", component: "scribe" }, [
         { _tag: "md", text: "Status" },
       ]);

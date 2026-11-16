@@ -102,6 +102,7 @@ export interface KanbanThreadView {
 }
 
 export interface KanbanLaunchInput {
+  readonly messageId?: MessageId;
   readonly onStarted?: (threadId: ThreadId) => Effect.Effect<void>;
   /** Stable per logical launch so a retry finds the same thread. */
   readonly key: string;
@@ -757,7 +758,11 @@ const make = Effect.gen(function* () {
         runtimeMode: DEFAULT_RUNTIME_MODE,
         interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
         workspaceStrategy: { type: "root" },
-        initialMessage: { text: input.text, attachments: [] },
+        initialMessage: {
+          text: input.text,
+          attachments: [],
+          ...(input.messageId === undefined ? {} : { messageId: input.messageId }),
+        },
         createdBy: "system",
         creationSource: "server",
       })

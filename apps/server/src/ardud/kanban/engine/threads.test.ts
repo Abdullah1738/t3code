@@ -62,6 +62,7 @@ import {
   prWatchesOf,
   viewStateOf,
 } from "./threads.ts";
+import { postRecoveryKey } from "./ownerReplyWake.ts";
 
 import { idleThreadProjection, liveThreadShell } from "../../../mcp/McpToolAccess.testkit.ts";
 import * as Analytics from "../../analytics/Analytics.ts";
@@ -879,6 +880,77 @@ it.effect("a keyed send passes stable command and message ids to thread manageme
       ),
     );
   }),
+);
+
+it.effect(
+  "#1603 retained recovery bodies survive owner wake coalescing and later message pruning",
+  () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("retained-post");
+      const runs: Array<{
+        id: RunId;
+        ordinal: number;
+        userMessageId: MessageId;
+        status: "queued" | "cancelled";
+      }> = [];
+      const messages: Array<{ id: MessageId; text: string }> = [];
+      const cancelled: RunId[] = [];
+      const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+        getThreadShell: () =>
+          Effect.succeed({ projectId: ProjectId.make("project-1603"), deletedAt: null } as never),
+        getThreadRecords: () => Effect.succeed({ runs, messages } as never),
+        sendToThread: (input) =>
+          Effect.sync(() => {
+            const run = {
+              id: RunId.make(`retained-run-${runs.length + 1}`),
+              ordinal: runs.length + 1,
+              userMessageId: input.messageId,
+              status: "queued" as const,
+            };
+            runs.push(run);
+            messages.push({ id: input.messageId, text: input.text });
+            return { run, delivery: "queued" } as never;
+          }),
+        dispatch: (command) =>
+          Effect.sync(() => {
+            expect(command.type).toBe("queued-run.cancel");
+            if (command.type === "queued-run.cancel") {
+              cancelled.push(command.runId);
+              runs.find((run) => run.id === command.runId)!.status = "cancelled";
+            }
+            return undefined as never;
+          }),
+      });
+      yield* Effect.gen(function* () {
+        const threads = yield* KanbanThreads;
+        yield* threads.send({
+          threadId,
+          text: "Original script body",
+          key: postRecoveryKey("disc-1603", 39, "retained"),
+        });
+        const retained = runs[0]!;
+        yield* threads.send({
+          threadId,
+          text: "Another card's reminder",
+          coalesce: "owner:card-other",
+          key: "other-reminder",
+        });
+        yield* threads.send({ threadId, text: "Another card's actual message", key: "other-post" });
+        expect(cancelled).toEqual([runs[1]!.id]);
+        expect(retained.status).toBe("queued");
+        expect(messages.find((message) => message.id === retained.userMessageId)?.text).toBe(
+          "Original script body",
+        );
+      }).pipe(
+        Effect.provide(
+          layer.pipe(
+            Layer.provide(management),
+            Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+            Layer.provide(Sqlite.layerMemory),
+          ),
+        ),
+      );
+    }),
 );
 
 it.effect.each([
