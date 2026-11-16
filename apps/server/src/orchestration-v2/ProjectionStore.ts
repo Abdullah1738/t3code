@@ -1010,6 +1010,9 @@ function preserveRunRecordedFields(
     current.delegatedTaskStallRecovery !== undefined
       ? { delegatedTaskStallRecovery: current.delegatedTaskStallRecovery }
       : {}),
+    ...(next.transientRecovery === undefined && current.transientRecovery !== undefined
+      ? { transientRecovery: current.transientRecovery }
+      : {}),
     ...(next.delegatedCompletion === undefined && current.delegatedCompletion !== undefined
       ? { delegatedCompletion: current.delegatedCompletion }
       : {}),
@@ -2465,7 +2468,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   keepRecordedRunField(
                     keepRecordedRunField(
                       keepRecordedRunField(
-                        keepRecordedRunField(sql`excluded.payload_json`, "$.delegatedCompletion"),
+                        keepRecordedRunField(
+                          keepRecordedRunField(sql`excluded.payload_json`, "$.delegatedCompletion"),
+                          "$.transientRecovery",
+                        ),
                         "$.delegatedTaskStallRecovery",
                       ),
                       "$.delegatedTaskStall",

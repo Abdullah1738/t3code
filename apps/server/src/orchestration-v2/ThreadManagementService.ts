@@ -500,6 +500,13 @@ export interface ThreadManagementServiceShape {
     { readonly sequence: number } | { readonly settlesWhenTurnEnds: true },
     Orchestrator.OrchestratorV2Error | ThreadManagementProviderInstanceDisabledError
   >;
+  readonly getDelegatedRetryCheck?: (input: {
+    readonly threadId: ThreadId;
+    readonly runId: RunId;
+    readonly attemptId: OrchestrationV2Run["activeAttemptId"];
+    readonly noResponseBudgetMs: number;
+    readonly flapLimit: number;
+  }) => Effect.Effect<Effect.Effect<boolean> | undefined>;
   readonly interruptThread: (
     input: ThreadManagementInterruptInput,
   ) => Effect.Effect<ThreadManagementInterruptResult, ThreadManagementFailure>;
@@ -1569,6 +1576,40 @@ const make = Effect.gen(function* () {
     return { sequence: result.sequence };
   });
 
+  const getDelegatedRetryCheck = Effect.fn("ThreadManagementService.getDelegatedRetryCheck")(
+    function* (
+      input: Parameters<NonNullable<ThreadManagementServiceShape["getDelegatedRetryCheck"]>>[0],
+    ) {
+      const records = yield* orchestrator.getThreadRecords(input.threadId, [
+        "runs",
+        "providerThreads",
+      ]);
+      const run = records.runs.find((run) => run.id === input.runId);
+      if (run?.status !== "running" || run.activeAttemptId !== input.attemptId) return undefined;
+      const provider = records.providerThreads.find(
+        (provider) => provider.id === run.providerThreadId,
+      );
+      if (provider?.driver !== "claudeAgent" || provider.providerSessionId === null)
+        return Effect.succeed(false);
+      const runtime = yield* sessions.get(provider.providerSessionId);
+      if (Option.isNone(runtime)) return undefined;
+      if (runtime.value.checkRetryHealth === undefined) return Effect.succeed(false);
+      return runtime.value
+        .checkRetryHealth(input)
+        .pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("delegated retry check failed", { cause }).pipe(Effect.as(false)),
+          ),
+        );
+    },
+    (effect) =>
+      effect.pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("delegated retry lookup failed", { cause }).pipe(Effect.as(undefined)),
+        ),
+      ),
+  );
+
   const interruptThread: ThreadManagementServiceShape["interruptThread"] = Effect.fn(
     "ThreadManagementService.interruptThread",
   )(function* (input) {
@@ -1828,6 +1869,7 @@ const make = Effect.gen(function* () {
     settleAfterRun,
     settleThread,
     interruptThread,
+    getDelegatedRetryCheck,
     stopDelegatedTasks,
     stopWorkflow,
     getThreadEventSequence: orchestrator.getThreadEventSequence,

@@ -4684,7 +4684,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       (!input.forceRestart ||
         input.createdBy !== "system" ||
         input.creationSource !== "server" ||
-        !supportsSilentRecovery(providerThread?.driver, stallRecovery.phase) ||
+        !supportsSilentRecovery(providerThread?.driver) ||
         targetRun.delegatedTaskId === undefined ||
         !silentRecoveryStillSafe(input.projection, targetRun, stallRecovery))
     ) {
@@ -4880,24 +4880,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       selectionChanged &&
       (providerInstanceChanged || selectionTransition?.type !== "apply_on_next_turn");
     const steeringPolicy = yield* enforceCommandPolicy(input.command)(
-      // Claude normally queues steering. A verified request with no model event
-      // needs a fresh attempt, rather than another message on the hung request.
-      stallRecovery?.phase === "first_event" && providerThread.driver === "claudeAgent"
-        ? commandPolicy
-            .ensureInterrupt({
-              commandId: input.command.commandId,
-              threadId: input.command.threadId,
-              providerInstanceId: targetRun.providerInstanceId,
-              capabilities: session.providerSession.capabilities,
-            })
-            .pipe(Effect.as("interrupt_restart" as const))
-        : commandPolicy.decideSteeringExecution({
-            commandId: input.command.commandId,
-            threadId: input.command.threadId,
-            providerInstanceId: targetRun.providerInstanceId,
-            capabilities: session.providerSession.capabilities,
-            forceRestart: input.forceRestart || selectionMustApplyNow,
-          }),
+      commandPolicy.decideSteeringExecution({
+        commandId: input.command.commandId,
+        threadId: input.command.threadId,
+        providerInstanceId: targetRun.providerInstanceId,
+        capabilities: session.providerSession.capabilities,
+        forceRestart: input.forceRestart || selectionMustApplyNow,
+      }),
     );
 
     if (input.activeTurnOnly && steeringPolicy !== "active_steering") {
@@ -5621,6 +5610,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     );
     const continuedTaskId = continuationSource?.delegatedTaskId;
     const continuedStallRecovery = continuationSource?.delegatedTaskStallRecovery;
+    const continuedTransientRecovery = continuationSource?.transientRecovery;
     const continuedRecovery = continuedLaunchRecovery(continuationSource, projection.providerTurns);
 
     if (projection.thread.settledOverride !== null) {
@@ -6168,6 +6158,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...(continuedStallRecovery === undefined
           ? {}
           : { delegatedTaskStallRecovery: continuedStallRecovery }),
+        ...(continuedTransientRecovery === undefined
+          ? {}
+          : { transientRecovery: continuedTransientRecovery }),
         ...(continuedRecovery === undefined ? {} : { launchRecovery: continuedRecovery }),
         ...(command.contextReset === true ? { contextReset: true } : {}),
       };
@@ -6523,6 +6516,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...(continuedStallRecovery === undefined
           ? {}
           : { delegatedTaskStallRecovery: continuedStallRecovery }),
+        ...(continuedTransientRecovery === undefined
+          ? {}
+          : { transientRecovery: continuedTransientRecovery }),
         ...(continuedRecovery === undefined ? {} : { launchRecovery: continuedRecovery }),
         ...(command.contextReset === true ? { contextReset: true } : {}),
         ...wakeWorkStartedAt(projection.runs, command),
@@ -7254,6 +7250,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       ...(continuedStallRecovery === undefined
         ? {}
         : { delegatedTaskStallRecovery: continuedStallRecovery }),
+      ...(continuedTransientRecovery === undefined
+        ? {}
+        : { transientRecovery: continuedTransientRecovery }),
       ...(continuedRecovery === undefined ? {} : { launchRecovery: continuedRecovery }),
       ...(command.contextReset === true ? { contextReset: true } : {}),
       ...wakeWorkStartedAt(projection.runs, command),

@@ -49,6 +49,7 @@ import * as EventStore from "./EventStore.ts";
 import * as ProjectionMaintenance from "./ProjectionMaintenance.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import { startState } from "../ardud/orchestration/ProviderStartProgress.ts";
+import { silentRecoveryStillSafe } from "./delegatedTaskProgress.ts";
 import {
   buildBoundedThreadProjection,
   decodeThreadHistoryCursor,
@@ -2513,6 +2514,71 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
           );
         }
       }),
+  );
+  it.effect.each([
+    "claude_no_response_budget",
+    "claude_retry_flap",
+    "claude_network_error",
+  ] as const)("keeps %s recovery through a stale provider restart in SQL and memory", (code) =>
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const threadId = yield* addRolledBackRecoveryCandidate(`network-recovery:${code}`);
+      let memory = yield* store.getThreadProjection(threadId);
+      const run = {
+        ...memory.runs[0]!,
+        status: "running" as const,
+        activeAttemptId: RunAttemptId.make(`attempt:${code}:initial`),
+      };
+      const now = yield* DateTime.now;
+      // The switch captured attempt A before the cutoff committed attempt B.
+      const staleRestart = { ...run, status: "running" as const };
+      const recovery = {
+        firstError: {
+          class: "transport_error" as const,
+          category: "transient" as const,
+          code,
+          retryable: true,
+          message: "Connection dropped (ECONNRESET)",
+        },
+        since: DateTime.formatIso(now),
+      };
+      const emptyProgress = { turnItems: [], runtimeRequests: [], messages: [] };
+      const silent = {
+        phase: "first_event" as const,
+        lastProgressAt: DateTime.formatIso(now),
+        attemptId: run.activeAttemptId,
+      };
+      assert.isTrue(silentRecoveryStillSafe(emptyProgress, staleRestart, silent));
+      for (const [index, payload] of [
+        run,
+        {
+          ...run,
+          status: "starting" as const,
+          activeAttemptId: RunAttemptId.make(`${run.id}:network-recovery`),
+          transientRecovery: recovery,
+        },
+        staleRestart,
+      ].entries()) {
+        const event = {
+          id: EventId.make(`event:network-recovery:${code}:${index}`),
+          type: "run.updated" as const,
+          threadId,
+          runId: run.id,
+          providerInstanceId,
+          occurredAt: now,
+          payload,
+        };
+        yield* store.apply(event);
+        memory = ProjectionStore.applyToProjection(memory, event);
+      }
+      const sql = yield* store.getThreadProjection(threadId);
+      for (const projection of [memory, sql]) {
+        const current = projection.runs[0]!;
+        assert.deepEqual(current.transientRecovery, recovery);
+        assert.isUndefined(current.delegatedTaskStallRecovery);
+        assert.isFalse(silentRecoveryStillSafe(emptyProgress, current, silent));
+      }
+    }),
   );
   it.effect.each(
     (["interrupted", "cancelled"] as const).flatMap((status) =>
