@@ -37,6 +37,7 @@ _NAMES = {
     'case.open', 'case.update', 'case.close', 'case.reopen', 'case.corroborate',
     'question.ask', 'check.run', 'cache_reset', 'marketplace.refresh',
     'order_watch.item_drop_check',
+    'collector.hold_seen', 'collector.hold_stale', 'collector.hold_cleared',
 }
 _ENUMS = {
     'reason': DELEGATION_REASONS,
@@ -569,6 +570,15 @@ def emit(component, name, *, kind='event', duration_ms=None, ok=None, ids=None, 
                 props['lane'] = _noon_lane((ids or {}).get('orderId'))
         if props:
             row['props'] = _fields(props)
+            if component == 'order-watch' and name.startswith('collector.hold_'):
+                row['props'] = {
+                    'owner': props.get('owner')[:120] if type(props.get('owner')) is str else None,
+                    'reason': props.get('reason') if props.get('reason') in {
+                        'hold_older_than_60m', 'lease_expired', 'holder_pid_dead', 'lease_live',
+                        'no_matching_lease_within_bound', 'hold_absent'} else None,
+                    'age_s': props.get('age_s') if type(props.get('age_s')) is int
+                             and props['age_s'] >= 0 else None,
+                }
         if error is not None:
             code = tag(error)
             detail = cause or context.get('failure') or context.get('last') or _cause(error)
