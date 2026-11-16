@@ -57,6 +57,12 @@ class Logs(unittest.TestCase):
         self.assertEqual(self.rows()[0]['props'], props)
         self.assertEqual(self.rows()[0]['ids'], {'box': 'bx_fixture'})
 
+    def test_queue_resume_fields_survive_serialization_including_unknown_places(self):
+        for place in (1, None):
+            props = dict(outageS=15, waitedMs=31000, placeBefore=place, placeAfter=place, deadlineKept=True)
+            toollog.emit('pool', 'run.queue_resumed', ids={'run': 'run-A'}, props=props)
+            self.assertEqual(self.rows()[-1]['props'], props)
+
     def test_format_private_modes_and_only_allowed_metadata(self):
         secret = 'password=secret-1234567890123456'
         toollog.emit('run', 'run.request', ok=True, duration_ms=1.2345,

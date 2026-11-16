@@ -720,6 +720,8 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
                     disk_pressure.remember(False)
                 return result
         except urllib.error.HTTPError as e:
+            if allocation.in_scope() and not (e.code == 404 and ok404):
+                outage.queue_api_failed()
             try:
                 d = json.loads(_read_response(e, deadline))
             except Exception:  # noqa: BLE001
@@ -790,6 +792,8 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
                                   "nothing ran. Check boat before retrying")
             raise ApiError(e.code, code, msg, retryable, data=d)
         except (NetworkError, urllib.error.URLError, http.client.HTTPException, TimeoutError, ConnectionError, OSError) as e:
+            if allocation.in_scope():
+                outage.queue_api_failed()
             if request_id:
                 capacity.complete(request_id, "uncertain")
                 uncertain_start = True

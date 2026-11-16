@@ -215,6 +215,7 @@ def wait_while_starting(reason, run_id="", *, checkpoint="probe", box=None,
     phase = reason if isinstance(reason, str) else starting_phase(reason)
     slow = phase == "slow"
     start = clock()
+    from . import allocation, outage
     begin_transient(clock)
     episode_end = WAIT_BUDGET.get()["transient_since"] + wait_seconds()
     slow_cap = deadline if slow else None
@@ -224,9 +225,15 @@ def wait_while_starting(reason, run_id="", *, checkpoint="probe", box=None,
         if slow:
             end = slow_deadline(clock, slow_cap)
             inherited = wait_budget_end()
-            return min(end, inherited, episode_end) if inherited is not None else min(end, episode_end)
-        end = wait_deadline(wait_seconds(), clock=clock)
-        return min(end, startup_cap, episode_end) if startup_cap is not None else min(end, episode_end)
+            end = min(end, inherited, episode_end) if inherited is not None else min(end, episode_end)
+        else:
+            end = wait_deadline(wait_seconds(), clock=clock)
+            end = min(end, startup_cap, episode_end) if startup_cap is not None else min(end, episode_end)
+        if not outage.machine_accepted():
+            queued_left = allocation.queue_left() if allocation.in_queue() else allocation.retry_queue_left()
+            if queued_left is not None:
+                end = min(end, clock() + queued_left)
+        return end
 
     if not slow:
         note_home_answer(clock, ready=False)
@@ -371,12 +378,13 @@ def slow_read_reachable(deadline=None):
 
 def recover_slow_read(error, read, *, box, deadline=None):
     """Retry a timed-out box observation in place; no allocation send is repeated here."""
-    from . import api, allocation, prepare
+    from . import api, allocation, outage, prepare
     if not active():
         raise error
     queue = allocation._QUEUE.get()
     if queue is not None:
-        QUEUE_WAIT.set(queue.get("queue_wait_s", max(0, queue['wait'] - (queue['end'] - time.monotonic()))))
+        started = queue.get('started', queue['end'] - queue['wait'])
+        QUEUE_WAIT.set(queue.get("queue_wait_s", max(0, time.monotonic() - started)))
     if not timed_out(error):
         raise error
     if WAIT_BUDGET.get() is None:
@@ -391,8 +399,14 @@ def recover_slow_read(error, read, *, box, deadline=None):
         home_ends.append(wait_budget_end())
     home_end = min(home_ends)
 
+    def unaccepted_queue_left():
+        return None if outage.machine_accepted() else allocation.queue_left()
+
     def check_caller():
-        allocation.check_queue()
+        if outage.machine_accepted():
+            allocation.check_source()
+        else:
+            allocation.check_queue()
         if caller_end is not None and time.time() >= caller_end:
             raise api.BudgetExpired(f"client deadline passed while reading {box}; nothing ran")
 
@@ -407,7 +421,7 @@ def recover_slow_read(error, read, *, box, deadline=None):
             ends.append(slow_deadline(time.monotonic, began + slow_down_seconds()))
         if caller_end is not None:
             ends.append(time.monotonic() + max(0, caller_end - time.time()))
-        queue_left = allocation.queue_left()
+        queue_left = unaccepted_queue_left()
         if queue_left is not None:
             ends.append(time.monotonic() + queue_left)
         return max(0, min(ends) - time.monotonic())
@@ -429,7 +443,7 @@ def recover_slow_read(error, read, *, box, deadline=None):
         if timeout <= 0:
             return "no answer (TimeoutError)"
         try:
-            queue_left = allocation.queue_left()
+            queue_left = unaccepted_queue_left()
             ends = [end for end in (caller_end, time.time() + max(0, home_end - time.monotonic()),
                                     time.time() + queue_left if queue_left is not None else None)
                     if end is not None]
@@ -454,7 +468,7 @@ def recover_slow_read(error, read, *, box, deadline=None):
     caller_bounds = [home_end]
     if caller_end is not None:
         caller_bounds.append(time.monotonic() + max(0, caller_end - time.time()))
-    queue_left = allocation.queue_left()
+    queue_left = unaccepted_queue_left()
     if queue_left is not None:
         caller_bounds.append(time.monotonic() + queue_left)
     budget = WAIT_BUDGET.get()

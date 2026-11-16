@@ -20,11 +20,13 @@ NUMBERS.update("ms slow_ms last_good_boatd_uptime_s snapshot_age_s boatd_uptime_
 NUMBERS.update({'command_exit_code', 'wrapper_exit_code', 'disk_attempt', 'client_started_at', 'disk_probe_module_mtime'})
 NUMBERS.add("waited_s")
 NUMBERS.update({'leftoverKilled', 'boxRc', 'incusRc', 'cgroupProcessCount'})
+NUMBERS.update({'outageS', 'waitedMs', 'placeBefore', 'placeAfter'})
 NUMBERS.update(f'{fs}_{field}' for fs in ('tmp', 'var_tmp', 'home', 'workspace')
                for field in ('free_bytes', 'size_bytes'))
 BOOLEANS = {"peer_online"} | set("queued killed fresh bg noSync git noFallback noRetry remote failed stale timeoutHit fallback dryRun baseGiven templateGiven sizeGiven".split())
 BOOLEANS.add("ok")
 BOOLEANS.update({'retry', 'rcFilePresent', 'superseded'})
+BOOLEANS.add('deadlineKept')
 ENUMS = {
     "jdk_phase": {"check", "install", "result"},
     "jdk_result": {"pending", "present", "installed", "compiler-missing", "apt-failed"},
@@ -83,7 +85,7 @@ def _props(values, *, name=None):
     for k, v in (values or {}).items():
         if k == "reason" and name == "backend.failback" and isinstance(v, str):
             out[k] = v[:200]
-        elif k in {'leftoverKilled', 'boxRc', 'cgroupProcessCount'} and v is None:
+        elif k in {'leftoverKilled', 'boxRc', 'cgroupProcessCount', 'placeBefore', 'placeAfter'} and v is None:
             out[k] = None
         elif k == 'stderrTail' and isinstance(v, str):
             # Only Incus' fixed transport diagnostics belong here, never arbitrary command output.
