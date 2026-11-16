@@ -2916,7 +2916,8 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           yield* (yield* McpProviderSessions.McpProviderSessions).set({
             environmentId: EnvironmentId.make("environment-codex-mcp"),
             threadId,
-            providerSessionId: `provider-session-${scenario}`,
+            providerSessionId: `mcp-credential-${scenario}`,
+            runtimeProviderSessionId: ProviderSessionId.make(`provider-session-${scenario}`),
             providerInstanceId: ProviderInstanceId.make("codex"),
             endpoint: "http://127.0.0.1:43123/mcp",
             authorizationHeader: "Bearer secret-codex-token",
@@ -3133,7 +3134,8 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       yield* (yield* McpProviderSessions.McpProviderSessions).set({
         environmentId: EnvironmentId.make("environment-codex-mcp"),
         threadId: ThreadId.make(`thread-${scenario}`),
-        providerSessionId: `provider-session-${scenario}`,
+        providerSessionId: `mcp-credential-${scenario}`,
+        runtimeProviderSessionId: ProviderSessionId.make(`provider-session-${scenario}`),
         providerInstanceId: ProviderInstanceId.make("codex"),
         endpoint: "http://127.0.0.1:43123/mcp",
         authorizationHeader: "Bearer secret-codex-token",
@@ -3188,7 +3190,8 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       yield* (yield* McpProviderSessions.McpProviderSessions).set({
         environmentId: EnvironmentId.make("environment-codex-recall"),
         threadId,
-        providerSessionId: `provider-session-${scenario}`,
+        providerSessionId: `mcp-credential-${scenario}`,
+        runtimeProviderSessionId: ProviderSessionId.make(`provider-session-${scenario}`),
         providerInstanceId: ProviderInstanceId.make("codex"),
         endpoint: "http://127.0.0.1:43123/mcp",
         authorizationHeader: "Bearer secret-codex-token",
@@ -5061,6 +5064,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           environmentId: EnvironmentId.make("test"),
           threadId: harness.threadId,
           providerSessionId: "context-session",
+          runtimeProviderSessionId: ProviderSessionId.make("provider-session-restore-context"),
           providerInstanceId: ProviderInstanceId.make("codex"),
           endpoint: "http://127.0.0.1:43123/mcp",
           authorizationHeader: "Bearer test",
@@ -6852,6 +6856,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           assert.isTrue(
             yield* harness.runtime.hasPendingBackgroundWorkForThread!(harness.providerThread),
           );
+          assert.isTrue(yield* harness.runtime.holdsWorkForThread!(harness.providerThread));
           assert.lengthOf(harness.continuationRequests, 0);
           const terminalIndex = harness.events.findIndex((event) => event.type === "turn.terminal");
 
@@ -6893,6 +6898,198 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           );
           assert.lengthOf(harness.terminalEvents(), 1);
           assert.isFalse(yield* harness.hasPendingBackgroundWork);
+          assert.isFalse(yield* harness.runtime.holdsWorkForThread!(harness.providerThread));
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
+        ),
+      ),
+  );
+
+  it.effect.each([
+    "agentMessage",
+    "reasoning",
+    "dynamicToolCall",
+    "commandExecution",
+    "retainedSibling",
+    "foreground",
+    "rawNative",
+    "rawCodeMode",
+    "rawCodeModeString",
+    "rawUnrelatedSession",
+    "rawForegroundExit",
+  ] as const)(
+    "a %s command exiting before turn end only wakes once when execution yielded",
+    (mode) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const inbound = (label: string) => {
+            const entry = backgroundExecTranscript.entries.find(
+              (entry) => entry.type === "emit_inbound" && entry.label === label,
+            );
+            if (entry?.type !== "emit_inbound") throw new Error(`Missing inbound ${label}`);
+            return entry;
+          };
+          const started = inbound("item/started/command");
+          const completed = inbound("item/completed/command-late");
+          const answer = inbound("item/completed/root-answer");
+          const terminal = inbound("turn/completed");
+          const raw = mode.startsWith("raw");
+          const yielded = [
+            "agentMessage",
+            "reasoning",
+            "rawNative",
+            "rawCodeMode",
+            "rawCodeModeString",
+          ].includes(mode);
+          const parts = [
+            {
+              type: "input_text",
+              text: JSON.stringify({
+                chunk_id: "yielded-command",
+                wall_time_seconds: 1,
+                session_id: mode === "rawUnrelatedSession" ? 4243 : 4242,
+                ...(mode === "rawForegroundExit" ? { exit_code: 0 } : {}),
+                output: "",
+              }),
+            },
+          ];
+          const rawResult = {
+            type: "emit_inbound" as const,
+            label: "rawResponseItem/completed/yielded",
+            frame: {
+              method: "rawResponseItem/completed",
+              params: {
+                threadId: BG_NATIVE_THREAD,
+                turnId: BG_NATIVE_TURN,
+                item: {
+                  type: "custom_tool_call_output",
+                  call_id: "outer-code-cell",
+                  output:
+                    mode === "rawNative"
+                      ? "Process running with session ID 4242"
+                      : mode === "rawCodeModeString"
+                        ? JSON.stringify(parts)
+                        : parts,
+                },
+              },
+            },
+          };
+          const nextItem =
+            mode === "reasoning"
+              ? { type: "reasoning", id: "next-work", summary: [], content: [] }
+              : mode === "dynamicToolCall"
+                ? {
+                    type: "dynamicToolCall",
+                    id: "next-work",
+                    tool: "exec",
+                    arguments: {},
+                    contentItems: null,
+                    success: null,
+                    durationMs: null,
+                    status: "inProgress",
+                  }
+                : mode === "commandExecution" || mode === "retainedSibling"
+                  ? {
+                      type: "commandExecution",
+                      id: "next-work",
+                      command: "echo next",
+                      cwd: "/repo",
+                      processId: null,
+                      status: "inProgress",
+                      commandActions: [],
+                      aggregatedOutput: null,
+                      exitCode: null,
+                      durationMs: null,
+                    }
+                  : {
+                      type: "agentMessage",
+                      id: "next-work",
+                      text: "",
+                      phase: "commentary",
+                      memoryCitation: null,
+                    };
+          const transcript = makeCodexReplayTranscript({
+            scenario: `codex-bg-before-settle-${mode}`,
+            entries: [
+              ...codexReplayPreamble({
+                nativeThreadId: BG_NATIVE_THREAD,
+                nativeTurnId: BG_NATIVE_TURN,
+                prompt: BG_PROMPT,
+              }),
+              started,
+              ...(mode !== "foreground" && !raw
+                ? [
+                    {
+                      type: "emit_inbound" as const,
+                      label: "item/started/next-work",
+                      frame: {
+                        method: "item/started",
+                        params: {
+                          item: nextItem,
+                          threadId: BG_NATIVE_THREAD,
+                          turnId: BG_NATIVE_TURN,
+                          startedAtMs: 1782622441000,
+                        },
+                      },
+                    },
+                  ]
+                : []),
+              ...(mode === "rawNative" ? [rawResult] : []),
+              { ...completed, afterMs: 0 },
+              ...(mode === "commandExecution"
+                ? [
+                    {
+                      type: "emit_inbound" as const,
+                      label: "item/completed/parallel-command",
+                      frame: {
+                        method: "item/completed",
+                        params: {
+                          item: { ...nextItem, status: "completed", exitCode: 0, durationMs: 1 },
+                          threadId: BG_NATIVE_THREAD,
+                          turnId: BG_NATIVE_TURN,
+                          completedAtMs: 1782622442000,
+                        },
+                      },
+                    },
+                  ]
+                : []),
+              ...(raw && mode !== "rawNative" ? [rawResult] : []),
+              answer,
+              terminal,
+              { ...completed, label: "item/completed/duplicate", afterMs: 30_000 },
+            ],
+          });
+          const harness = yield* makeCodexReplayHarness(transcript);
+          yield* harness.runtime.startTurn(
+            makeCodexTestTurnInput({
+              threadId: harness.threadId,
+              providerThread: harness.providerThread,
+              now: yield* DateTime.now,
+              attemptId: RunAttemptId.make(`attempt-bg-before-settle-${mode}`),
+              text: BG_PROMPT,
+            }),
+          );
+          yield* awaitUntil(() => harness.terminalEvents().length === 1, "root turn terminal");
+          if (yielded)
+            yield* awaitUntil(
+              () => harness.continuationRequests.length === 1,
+              "pre-settle command wake",
+            );
+          assert.lengthOf(harness.continuationRequests, yielded ? 1 : 0);
+          if (yielded) {
+            assert.equal(
+              harness.continuationRequests[0]?.detail,
+              `Background command completed (exit 0): ${BG_COMMAND}\n\nOutput tail:\nCODEX_BG_WAKE_DONE`,
+            );
+            assert.equal(
+              harness.continuationRequests[0]?.commandId,
+              `kanban:send:background-command:${harness.threadId}:${BG_COMMAND_ITEM}`,
+            );
+          }
+          yield* TestClock.adjust("30 seconds");
+          assert.lengthOf(harness.continuationRequests, yielded ? 1 : 0);
         }).pipe(
           Effect.provide(
             Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
@@ -7082,8 +7279,10 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         const unload = harness.runtime.unloadThread!({ providerThread: harness.providerThread });
         yield* unload;
         assert.isTrue(yield* harness.hasPendingBackgroundWork);
+        assert.isTrue(yield* harness.runtime.holdsWorkForThread!(harness.providerThread));
         yield* unload;
         assert.isTrue(yield* harness.hasPendingBackgroundWork);
+        assert.lengthOf(harness.continuationRequests, 0);
         yield* unload;
         assert.equal(yield* harness.hasPendingBackgroundWork, retainContext);
         yield* Deferred.await(interrupted);
@@ -7110,15 +7309,127 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             items: ["running", "interrupted"],
             nodes: ["running", "interrupted"],
             roots: ["completed"],
-            continuations: 0,
+            continuations: 1,
           },
         );
+        assert.equal(
+          harness.continuationRequests[0]?.detail,
+          `Background command interrupted (Codex thread closed): ${BG_COMMAND}`,
+        );
+        assert.equal(harness.continuationRequests[0]?.delivery, "message_text");
+        assert.equal(harness.continuationRequests[0]?.threadId, harness.threadId);
+        assert.equal(harness.continuationRequests[0]?.notification?.outcome, "cancelled");
         assert.isFalse(yield* harness.hasPendingBackgroundWork);
+        assert.isFalse(yield* harness.runtime.holdsWorkForThread!(harness.providerThread));
         assert.isFalse(
           yield* harness.runtime.hasPendingBackgroundWorkForThread!(harness.providerThread),
         );
       }).pipe(
         Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
+  it.effect.each(["terminated", "already_exited", "unknown", "unloaded"] as const)(
+    "exposes background terminal metadata and safely stops %s sessions",
+    (scenario) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          let requestId = 4;
+          const entries: Array<CodexReplay.CodexAppServerReplayEntry> = [];
+          const exchange = (
+            method: string,
+            params: Record<string, unknown>,
+            result: unknown,
+            error = false,
+          ) => {
+            const id = requestId++;
+            entries.push(
+              { type: "expect_outbound", frame: { id, method, params } },
+              { type: "emit_inbound", frame: error ? { id, error: result } : { id, result } },
+            );
+          };
+          const metadata = {
+            processId: "4242",
+            command: BG_COMMAND,
+            cwd: "/workspace",
+            itemId: BG_COMMAND_ITEM,
+            osPid: 9876,
+            cpuPercent: 1.5,
+            rssKb: 2048,
+          };
+          exchange(
+            "thread/backgroundTerminals/list",
+            { threadId: BG_NATIVE_THREAD },
+            { data: [metadata], nextCursor: "page-two" },
+          );
+          exchange(
+            "thread/backgroundTerminals/list",
+            { threadId: BG_NATIVE_THREAD, cursor: "page-two" },
+            { data: [{ processId: "12" }] },
+          );
+          exchange(
+            "thread/backgroundTerminals/list",
+            { threadId: BG_NATIVE_THREAD },
+            { data: scenario === "unknown" ? [] : [metadata], nextCursor: null },
+          );
+          if (scenario !== "unknown") {
+            exchange(
+              "thread/backgroundTerminals/terminate",
+              { threadId: BG_NATIVE_THREAD, processId: "4242" },
+              scenario === "unloaded"
+                ? { code: -32600, message: `thread not found: ${BG_NATIVE_THREAD}` }
+                : { terminated: scenario === "terminated" },
+              scenario === "unloaded",
+            );
+            if (scenario === "already_exited") {
+              exchange(
+                "thread/backgroundTerminals/list",
+                { threadId: BG_NATIVE_THREAD },
+                { data: [], nextCursor: null },
+              );
+            }
+          }
+          const harness = yield* makeCodexReplayHarness(
+            makeCodexReplayTranscript({
+              scenario: `codex-exec-session-${scenario}`,
+              entries: [
+                ...backgroundExecTranscript.entries.slice(0, -1),
+                ...entries,
+                backgroundExecTranscript.entries.at(-1)!,
+              ],
+            }),
+          );
+          yield* harness.runtime.startTurn(
+            makeCodexTestTurnInput({
+              threadId: harness.threadId,
+              providerThread: harness.providerThread,
+              now: yield* DateTime.now,
+              attemptId: RunAttemptId.make(`attempt-exec-session-${scenario}`),
+              text: BG_PROMPT,
+            }),
+          );
+          yield* harness.firstTerminal;
+          assert.deepEqual(
+            yield* harness.runtime.listBackgroundTerminals!({
+              providerThread: harness.providerThread,
+            }),
+            [metadata, { processId: "12" }],
+          );
+          assert.deepEqual(
+            yield* harness.runtime.terminateBackgroundTerminal!({
+              providerThread: harness.providerThread,
+              processId: "4242",
+            }),
+            {
+              terminated: true,
+              alreadyGone: scenario !== "terminated",
+            },
+          );
+        }),
+      ).pipe(
         Effect.provide(
           Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
         ),

@@ -267,14 +267,17 @@ class Accuracy(Base):
                 modules = {'native_orders': SimpleNamespace(orders=orders),
                            'noon_order_details': SimpleNamespace(details=lambda *a, **k: None)}
                 with patch.dict(sys.modules, modules):
-                    result = mc.charges.order_lookup.native('noon', '/unused-test-path')
+                    snapshot = None if service == 'marketplace' else dict(version=1, complete=True,
+                        walked_at=at('2026-10-24T10:00').isoformat(), orders={})
+                    result = mc.charges.order_lookup.native('noon', '/unused-test-path', snapshot=snapshot)
                 self.assertFalse(result['complete'])
                 with patch.object(mc.charges.order_lookup, 'read', return_value=result):
                     rc, msg = mc.ask(self.tmp / service, 'yours?', ALERT.replace('ACME * EATS PENDING', 'NOON'),
                                      BANK, at('2026-10-23T23:47'), now=at('2026-10-24T10:00'),
                                      find=finder(), said=nobody)
                 self.assertEqual(rc, 4)
-                self.assertIn('UNVERIFIED: source orders unreadable', msg)
+                self.assertIn('Marketplace snapshot predates' if service == 'marketplace'
+                              else 'UNVERIFIED: source orders unreadable', msg)
 
 
     def test_receipt_timeout_can_only_use_cached_words_for_abdullah_cards(self):

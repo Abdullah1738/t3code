@@ -1,3 +1,7 @@
+import {
+  backgroundCommandWakeCommandId,
+  backgroundCommandWakeMessageId,
+} from "../backgroundCommandWake.ts";
 import { revertCodexThread } from "../../provider/CodexThreadRevert.ts";
 import { codexHistoryItems, readStagedHistory } from "../../ardud/harness-migrate/StagedHistory.ts";
 import { CodexHistoryNotSentError } from "../../ardud/harness-migrate/CodexHistoryDeliveryError.ts";
@@ -229,12 +233,8 @@ const CodexBackgroundTerminalTerminateResponse = Schema.Struct({
   terminated: Schema.Boolean,
 });
 const CodexBackgroundTerminalsListResponse = Schema.Struct({
-  data: Schema.Array(
-    Schema.Struct({
-      processId: Schema.String,
-    }),
-  ),
-  nextCursor: Schema.NullOr(Schema.String),
+  data: Schema.Array(ProviderAdapter.ProviderBackgroundTerminal),
+  nextCursor: Schema.optionalKey(Schema.NullOr(Schema.String)),
 });
 type CodexBackgroundTerminalsListPage = typeof CodexBackgroundTerminalsListResponse.Type;
 const decodeCodexBackgroundTerminalTerminateResponse = Schema.decodeUnknownEffect(
@@ -442,15 +442,20 @@ export function codexSkillMentionText(text: string): string {
 const BACKGROUND_COMMAND_DETAIL_COMMAND_MAX_LENGTH = 200;
 const BACKGROUND_COMMAND_DETAIL_OUTPUT_TAIL_MAX_LENGTH = 1_000;
 
-export function codexBackgroundCommandDetail(item: {
-  readonly command: string;
-  readonly exitCode?: number | null | undefined;
-  readonly aggregatedOutput?: string | null | undefined;
-}): string {
+export function codexBackgroundCommandDetail(
+  item: {
+    readonly command: string;
+    readonly exitCode?: number | null | undefined;
+    readonly aggregatedOutput?: string | null | undefined;
+  },
+  outcome: "completed" | "interrupted" = "completed",
+): string {
   const command =
     item.command.length > BACKGROUND_COMMAND_DETAIL_COMMAND_MAX_LENGTH
       ? `${item.command.slice(0, BACKGROUND_COMMAND_DETAIL_COMMAND_MAX_LENGTH)}...`
       : item.command;
+  if (outcome === "interrupted")
+    return `Background command interrupted (Codex thread closed): ${command}`;
   const exit =
     item.exitCode === null || item.exitCode === undefined ? "" : ` (exit ${item.exitCode})`;
   const output = (item.aggregatedOutput ?? "").trimEnd();
@@ -1242,6 +1247,7 @@ function codexUsageLimitError(
 interface ActiveCodexTurnContext {
   readonly promptAcceptedAt?: DateTime.Utc;
   closedCommandItemIds?: ReadonlySet<string>;
+  completedCommandItemIds?: Set<string>;
   toolHostFailure?: OrchestrationV2ProviderFailure;
   runtimeStopRequested?: boolean;
   latestProviderFailure?: {
@@ -1956,7 +1962,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   }),
                 )
               : Effect.succeed(undefined)
-            : mcpSessions.read(threadId);
+            : McpProviderSessions.readForRuntime(
+                mcpSessions,
+                threadId,
+                input.providerSessionId,
+                CODEX_PROVIDER,
+              );
         const recallForThread = (threadId: ThreadId | null) =>
           recallUrl && threadId !== null ? { url: recallUrl, threadId } : undefined;
         const client = yield* clientFactory.open({
@@ -2144,6 +2155,17 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         const runningCommandItemsByTurn = yield* Ref.make(
           new Map<string, Map<string, TrackedRunningCommandItem>>(),
         );
+        const backgroundCommandIdsByTurn = new Map<string, Set<string>>();
+        const completedBackgroundCommandsByTurn = new Map<
+          string,
+          Map<
+            string,
+            Extract<
+              CodexSchema.V2ItemCompletedNotification__ThreadItem,
+              { type: "commandExecution" }
+            >
+          >
+        >();
         const runningDynamicToolsByTurn = yield* Ref.make(
           new Map<string, Map<string, CodexDynamicToolItem>>(),
         );
@@ -2370,6 +2392,71 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             return updated;
           });
 
+        const offerBackgroundCommand = Effect.fn("CodexAdapterV2.offerBackgroundCommand")(
+          function* (
+            context: ActiveCodexTurnContext,
+            nativeTurnId: string,
+            item: {
+              readonly id: string;
+              readonly command: string;
+              readonly exitCode?: number | null | undefined;
+              readonly aggregatedOutput?: string | null | undefined;
+            },
+            outcome: "completed" | "interrupted" = "completed",
+          ) {
+            if (
+              context.subagent === null &&
+              continuationRequests !== undefined &&
+              !(yield* Ref.get(interruptingNativeTurns)).has(nativeTurnId)
+            ) {
+              const alreadyOffered = yield* Ref.modify(
+                offeredContinuationItemsByTurn,
+                (current) => {
+                  const items = current.get(nativeTurnId);
+                  if (items !== undefined && items.has(item.id)) {
+                    return [true, current] as const;
+                  }
+                  const updated = new Map(current);
+                  const updatedItems = new Set(items ?? []);
+                  updatedItems.add(item.id);
+                  updated.set(nativeTurnId, updatedItems);
+                  return [false, updated] as const;
+                },
+              );
+              if (!alreadyOffered) {
+                yield* continuationRequests.offer({
+                  messageId: backgroundCommandWakeMessageId(context.projectionThreadId, item.id),
+                  commandId: backgroundCommandWakeCommandId(context.projectionThreadId, item.id),
+                  threadId: context.projectionThreadId,
+                  providerThreadId: context.providerThread.id,
+                  driver: CODEX_PROVIDER,
+                  // Codex starts a new turn from this text, so nothing is buffered.
+                  delivery: "message_text",
+                  detail: codexBackgroundCommandDetail(item, outcome),
+                  notification: {
+                    ...backgroundWorkNotification([
+                      {
+                        kind: "command",
+                        label: item.command,
+                        outcome:
+                          outcome === "interrupted"
+                            ? "cancelled"
+                            : item.exitCode === 0
+                              ? "completed"
+                              : item.exitCode == null
+                                ? "unknown"
+                                : "failed",
+                        exitCode: item.exitCode ?? undefined,
+                      },
+                    ]),
+                    detail: item.command,
+                  },
+                });
+              }
+            }
+          },
+        );
+
         const clearRunningCommandItem = (nativeTurnId: string, nativeItemId: string) =>
           Ref.modify(runningCommandItemsByTurn, (current) => {
             const items = current.get(nativeTurnId);
@@ -2437,6 +2524,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         const turnHasRetainedBackgroundWork =
           /* Provider events include streaming deltas; avoid a span for each update. */
           Effect.fnUntraced(function* (nativeTurnId: string) {
+            if ((completedBackgroundCommandsByTurn.get(nativeTurnId)?.size ?? 0) > 0) return true;
             const commands = (yield* Ref.get(runningCommandItemsByTurn)).get(nativeTurnId);
             if (commands !== undefined && commands.size > 0) {
               return true;
@@ -2475,7 +2563,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             if (!roots.some((root) => context === root || isDescendantCodexTurn(context, root)))
               return false;
             const turnId = context.nativeTurnId;
-            if ((commands.get(turnId)?.size ?? 0) > 0 || captures.has(turnId)) return true;
+            if (
+              (commands.get(turnId)?.size ?? 0) > 0 ||
+              captures.has(turnId) ||
+              (completedBackgroundCommandsByTurn.get(turnId)?.size ?? 0) > 0
+            )
+              return true;
             if (context.subagent !== null && active.has(turnId)) return true;
             return [...(tools.get(turnId)?.values() ?? [])].some(isPersistentCodexDynamicTool);
           });
@@ -2599,6 +2692,42 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           }
         });
 
+        const listBackgroundTerminals = Effect.fn("CodexAdapterV2.listBackgroundTerminals")(
+          function* (nativeThreadId: string) {
+            const terminals: Array<ProviderAdapter.ProviderBackgroundTerminal> = [];
+            const cursors = new Set<string>();
+            let cursor: string | undefined;
+            do {
+              const response = yield* client.raw
+                .request("thread/backgroundTerminals/list", {
+                  threadId: nativeThreadId,
+                  ...(cursor === undefined ? {} : { cursor }),
+                })
+                .pipe(
+                  Effect.catchTags({
+                    CodexAppServerProcessExitedError: () => Effect.succeed({ data: [] }),
+                    CodexAppServerInputStreamEndedError: () => Effect.succeed({ data: [] }),
+                    CodexAppServerRequestError: (error) =>
+                      error.code === -32600 && error.errorMessage.startsWith("thread not found:")
+                        ? Effect.succeed({ data: [] })
+                        : Effect.fail(error),
+                  }),
+                );
+              const page = yield* decodeCodexBackgroundTerminalsListResponse(response);
+              terminals.push(...page.data);
+              cursor = page.nextCursor ?? undefined;
+              if (cursor !== undefined && cursors.has(cursor)) {
+                return yield* toProtocolError(
+                  "Codex background terminal listing repeated a cursor.",
+                );
+              }
+              if (cursor !== undefined) cursors.add(cursor);
+            } while (cursor !== undefined);
+            return terminals;
+          },
+          Effect.timeout("10 seconds"),
+        );
+
         const terminateBackgroundTerminal = Effect.fn("CodexAdapterV2.terminateBackgroundTerminal")(
           function* (nativeThreadId: string, processId: string) {
             const response = yield* client.raw
@@ -2607,20 +2736,24 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 processId,
               })
               .pipe(
+                Effect.map((response) => ({ response, alreadyGone: false })),
                 Effect.catchTags({
-                  CodexAppServerProcessExitedError: () => Effect.succeed({ terminated: true }),
-                  CodexAppServerInputStreamEndedError: () => Effect.succeed({ terminated: true }),
+                  CodexAppServerProcessExitedError: () =>
+                    Effect.succeed({ response: { terminated: true }, alreadyGone: true }),
+                  CodexAppServerInputStreamEndedError: () =>
+                    Effect.succeed({ response: { terminated: true }, alreadyGone: true }),
                   // The thread is unloaded, as Codex does a minute after a
                   // settle or archive unsubscribes it. Unloading kills the
                   // thread's terminals, so nothing is left to stop.
                   CodexAppServerRequestError: (error) =>
                     error.code === -32600 && error.errorMessage.startsWith("thread not found:")
-                      ? Effect.succeed({ terminated: true })
+                      ? Effect.succeed({ response: { terminated: true }, alreadyGone: true })
                       : Effect.fail(error),
                 }),
               );
-            const result = yield* decodeCodexBackgroundTerminalTerminateResponse(response);
-            if (result.terminated) return;
+            const result = yield* decodeCodexBackgroundTerminalTerminateResponse(response.response);
+            if (result.terminated)
+              return { terminated: true, alreadyGone: response.alreadyGone } as const;
             let cursor: string | null = null;
             while (true) {
               const response: unknown = yield* client.raw.request(
@@ -2637,7 +2770,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   `Codex background terminal ${processId} remained active after termination.`,
                 );
               }
-              if (page.nextCursor === null) return;
+              if (page.nextCursor == null) return { terminated: true, alreadyGone: true } as const;
               cursor = page.nextCursor;
             }
           },
@@ -4982,6 +5115,14 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 "interrupted",
                 completedAt,
               );
+              for (const command of commands?.values() ?? []) {
+                yield* offerBackgroundCommand(
+                  context,
+                  context.nativeTurnId,
+                  command,
+                  "interrupted",
+                );
+              }
               yield* Ref.update(runningCommandItemsByTurn, (current) => {
                 const updated = new Map(current);
                 updated.delete(context.nativeTurnId);
@@ -4992,11 +5133,70 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           }).pipe(Effect.orDie, turnTerminalizationPermit.withPermits(1)),
         );
 
+        yield* client.handleServerNotification("rawResponseItem/completed", (payload) =>
+          Effect.gen(function* () {
+            const item = payload.item;
+            if (item.type !== "function_call_output" && item.type !== "custom_tool_call_output")
+              return;
+            const processIds = new Set<string>();
+            const readOutput = (value: unknown): void => {
+              if (typeof value === "string") {
+                const match = /^Process running with session ID (\d+)$/m.exec(value);
+                if (match) processIds.add(match[1]!);
+                try {
+                  const parsed: unknown = JSON.parse(value);
+                  if (typeof parsed !== "string") readOutput(parsed);
+                } catch {}
+              } else if (Array.isArray(value)) {
+                for (const part of value) readOutput(part);
+              } else if (value !== null && typeof value === "object") {
+                // Code mode can return the exec result after the process already
+                // exited while that same call awaited another tool (#1529).
+                if (
+                  "session_id" in value &&
+                  (typeof value.session_id === "number" || typeof value.session_id === "string") &&
+                  "chunk_id" in value &&
+                  typeof value.chunk_id === "string" &&
+                  !("exit_code" in value)
+                )
+                  processIds.add(String(value.session_id));
+                if ("type" in value && value.type === "input_text" && "text" in value)
+                  readOutput(value.text);
+              }
+            };
+            readOutput(item.output);
+            if (processIds.size === 0) return;
+            const commands = (yield* Ref.get(runningCommandItemsByTurn)).get(payload.turnId);
+            const completed = completedBackgroundCommandsByTurn.get(payload.turnId);
+            for (const command of [...(commands?.values() ?? []), ...(completed?.values() ?? [])]) {
+              if (typeof command.processId !== "string" || !processIds.has(command.processId))
+                continue;
+              let ids = backgroundCommandIdsByTurn.get(payload.turnId);
+              if (ids === undefined)
+                backgroundCommandIdsByTurn.set(payload.turnId, (ids = new Set()));
+              ids.add(command.id);
+            }
+          }).pipe(Effect.orDie, turnTerminalizationPermit.withPermits(1)),
+        );
+
         yield* client.handleServerNotification("item/started", (payload) =>
           Effect.gen(function* () {
             const context = yield* awaitActiveTurn(payload.turnId);
             if (context === undefined) {
               return;
+            }
+
+            // Model output while a PTY still runs proves exec yielded. Overlapping
+            // tool starts alone can be foreground calls awaited in parallel.
+            if (payload.item.type === "agentMessage" || payload.item.type === "reasoning") {
+              const commands = (yield* Ref.get(runningCommandItemsByTurn)).get(payload.turnId);
+              for (const command of commands?.values() ?? []) {
+                if (command.processId === undefined) continue;
+                let ids = backgroundCommandIdsByTurn.get(payload.turnId);
+                if (ids === undefined)
+                  backgroundCommandIdsByTurn.set(payload.turnId, (ids = new Set()));
+                ids.add(command.id);
+              }
             }
 
             // New tool work proves the agent continued. A late completion from
@@ -5187,6 +5387,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             if (payload.item.type === "commandExecution") {
               // Other tools can retain the context after thread closure.
               if (context.closedCommandItemIds?.has(payload.item.id)) return;
+              const completedIds = (context.completedCommandItemIds ??= new Set());
+              if (completedIds.has(payload.item.id)) return;
+              completedIds.add(payload.item.id);
               if (settled) yield* holdHandoff(context.providerThread.id);
               const turnDrained = yield* clearRunningCommandItem(payload.turnId, payload.item.id);
               const artifacts = yield* buildCommandExecutionArtifacts(context, payload.item);
@@ -5200,53 +5403,14 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 driver: CODEX_PROVIDER,
                 turnItem: artifacts.turnItem,
               });
+              if (!settled && typeof payload.item.processId === "string") {
+                let completed = completedBackgroundCommandsByTurn.get(payload.turnId);
+                if (completed === undefined)
+                  completedBackgroundCommandsByTurn.set(payload.turnId, (completed = new Map()));
+                completed.set(payload.item.id, payload.item);
+              }
               if (settled) {
-                if (
-                  context.subagent === null &&
-                  continuationRequests !== undefined &&
-                  !(yield* Ref.get(interruptingNativeTurns)).has(payload.turnId)
-                ) {
-                  const alreadyOffered = yield* Ref.modify(
-                    offeredContinuationItemsByTurn,
-                    (current) => {
-                      const items = current.get(payload.turnId);
-                      if (items !== undefined && items.has(payload.item.id)) {
-                        return [true, current] as const;
-                      }
-                      const updated = new Map(current);
-                      const updatedItems = new Set(items ?? []);
-                      updatedItems.add(payload.item.id);
-                      updated.set(payload.turnId, updatedItems);
-                      return [false, updated] as const;
-                    },
-                  );
-                  if (!alreadyOffered) {
-                    yield* continuationRequests.offer({
-                      threadId: context.projectionThreadId,
-                      providerThreadId: context.providerThread.id,
-                      driver: CODEX_PROVIDER,
-                      // Codex starts a new turn from this text, so nothing is buffered.
-                      delivery: "message_text",
-                      detail: codexBackgroundCommandDetail(payload.item),
-                      notification: {
-                        ...backgroundWorkNotification([
-                          {
-                            kind: "command",
-                            label: payload.item.command,
-                            outcome:
-                              payload.item.exitCode === 0
-                                ? "completed"
-                                : payload.item.exitCode == null
-                                  ? "unknown"
-                                  : "failed",
-                            exitCode: payload.item.exitCode ?? undefined,
-                          },
-                        ]),
-                        detail: payload.item.command,
-                      },
-                    });
-                  }
-                }
+                yield* offerBackgroundCommand(context, payload.turnId, payload.item);
                 if (turnDrained) {
                   yield* releaseSettledTurnIfIdle(payload.turnId);
                 }
@@ -6423,6 +6587,17 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 yield* Deferred.succeed(input.context.nativeStartReady, undefined);
               }
               yield* flushReadyRootTerminals();
+              if (input.status === "completed") {
+                for (const item of completedBackgroundCommandsByTurn
+                  .get(input.nativeTurnId)
+                  ?.values() ?? []) {
+                  if (backgroundCommandIdsByTurn.get(input.nativeTurnId)?.has(item.id))
+                    yield* offerBackgroundCommand(input.context, input.nativeTurnId, item);
+                }
+              }
+              backgroundCommandIdsByTurn.delete(input.nativeTurnId);
+              completedBackgroundCommandsByTurn.delete(input.nativeTurnId);
+              yield* releaseSettledTurnIfIdle(input.nativeTurnId);
               if (!retainSettledContext && !interruptInProgress) {
                 yield* Ref.update(runningCommandItemsByTurn, (current) => {
                   if (!current.has(input.nativeTurnId)) {
@@ -6786,7 +6961,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             codexInput: ReadonlyArray<CodexSchema.V2TurnStartParams__UserInput>,
           ) {
             const threadId = yield* getNativeThreadId(turnInput.providerThread);
-            const mcpSession = yield* mcpSessions.read(turnInput.threadId);
+            const mcpSession = yield* readMcpSession(turnInput.threadId);
             const turnStartParams = yield* buildCodexTurnStartParams({
               nativeThreadId: threadId,
               codexInput,
@@ -7256,7 +7431,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 }
                 const preflight = Effect.gen(function* () {
                   const mcpSession = yield* ensureInitialized.pipe(
-                    Effect.andThen(mcpSessions.read(threadInput.threadId)),
+                    Effect.andThen(readMcpSession(threadInput.threadId)),
                   );
                   const response = yield* client
                     .request(
@@ -7570,6 +7745,39 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                     }),
                 ),
               ),
+          ),
+          listBackgroundTerminals: Effect.fn("CodexAdapterV2.listThreadBackgroundTerminals")(
+            function* ({ providerThread }) {
+              return yield* listBackgroundTerminals(yield* getNativeThreadId(providerThread));
+            },
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapter.ProviderAdapterProtocolError({
+                  driver: CODEX_PROVIDER,
+                  detail: "Failed to list Codex background terminals.",
+                  cause: normalizeCodexCause(cause),
+                }),
+            ),
+          ),
+          terminateBackgroundTerminal: Effect.fn(
+            "CodexAdapterV2.terminateThreadBackgroundTerminal",
+          )(
+            function* ({ providerThread, processId }) {
+              const nativeThreadId = yield* getNativeThreadId(providerThread);
+              const terminals = yield* listBackgroundTerminals(nativeThreadId);
+              if (!terminals.some((terminal) => terminal.processId === processId)) {
+                return { terminated: true, alreadyGone: true } as const;
+              }
+              return yield* terminateBackgroundTerminal(nativeThreadId, processId);
+            },
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapter.ProviderAdapterProtocolError({
+                  driver: CODEX_PROVIDER,
+                  detail: "Failed to stop Codex background terminal.",
+                  cause: normalizeCodexCause(cause),
+                }),
+            ),
           ),
           listLoadedNativeThreads: Effect.fn("CodexAdapterV2.listLoadedNativeThreads")(
             function* () {
@@ -8277,7 +8485,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                             ? {}
                             : { lastTurnId: boundary.lastTurnId }),
                           ...codexThreadRuntimeParams({
-                            mcpSession: yield* mcpSessions.read(threadInput.targetThreadId),
+                            mcpSession: yield* readMcpSession(threadInput.targetThreadId),
                             recall: recallForThread(threadInput.targetThreadId),
                             ...(threadInput.modelSelection === undefined
                               ? {}

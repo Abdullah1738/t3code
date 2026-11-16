@@ -154,7 +154,12 @@ class InstrumentationTests(unittest.TestCase):
             'import os\nfrom pathlib import Path\nPath(os.environ["TRIGGER_RESULT"]).write_text(os.environ.get("HEALTH_TOOLLOG_TRIGGER", "unknown"))\n')
         db = vault / 'health.db'
         with sqlite3.connect(str(db)) as con:
-            con.executescript('CREATE TABLE whoop_recovery(raw_json TEXT); CREATE TABLE whoop_sleep(raw_json TEXT);')
+            con.executescript('''
+                CREATE TABLE whoop_recovery(cycle_id INTEGER PRIMARY KEY, sleep_id TEXT, score_state TEXT,
+                                            created_at_api TEXT, raw_json TEXT);
+                CREATE TABLE whoop_sleep(sleep_id TEXT PRIMARY KEY, start_utc TEXT, end_utc TEXT,
+                                         is_nap INTEGER, score_state TEXT, created_at_api TEXT, raw_json TEXT);
+            ''')
         env = dict(os.environ, VAULT_DIR=str(vault), CARDS_DIR=str(cards), WATCH_DIR=str(self.watch),
                    HEALTH_DB=str(db), NOW_DXB='2026-11-13T12:00', TRIGGER_RESULT=str(result),
                    HEALTH_TOOLLOG_TRIGGER='schedule')
@@ -162,6 +167,7 @@ class InstrumentationTests(unittest.TestCase):
         run = subprocess.run(['/bin/zsh', str(PACKAGE / 'watchers/whoop-recovery-card/check.sh')],
                              env=env, capture_output=True, text=True, timeout=15)
         self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stderr, '')
         self.assertEqual(result.read_text(), 'chained')
 
     def test_forge_run_trigger(self):

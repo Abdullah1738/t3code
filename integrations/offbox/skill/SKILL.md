@@ -82,6 +82,7 @@ Every model request resends your whole context. Start long or queued runs with `
 
 - **Codex:** delegate the watcher brief below with `delegate_task`, async, target `providerInstanceId: "claudeAgent"`, `model: "claude-sonnet-5-5"`, `options: {effort: "medium"}`, then end your turn. The child waits with blocking `offbox wait <run-id> --timeout 570` calls and a 600000 ms shell timeout; it replies once after the run ends. Medium is the owner’s choice for watchers: the delegation note "Standard mode only ... effort max" only rules out fast mode, it does not ask for max here. These ids are current, so skip `orchestrator_capabilities` unless the call is rejected. While it runs, do not check `task_status` or the run's logs. Until #1626 is fixed, a Claude child's parent notification can carry its first-turn launch text. On a completion notification, read `task_status` once. After a complete response confirms the task is terminal, `workState: result_available` and `hasPendingChildRuns: false`, consume `latestTerminalSummary ?? summary` (the latest field is null when it duplicates `summary`). First-turn launch text is not a run result even if marked terminal: require the run id, exit code and log path from the watcher. If work is pending, end your turn and await completion; do not loop status calls.
 - **Claude Code:** use Bash `run_in_background: true` for `offbox wait <run-id> --timeout 1500`, with the run id in `description`. End your turn. The `<task-notification>` has the description, exit code and `output-file`, but no output tail: Read that file once. Exit 124 means only that the wait expired; start another 1500-second background waiter and end your turn again. If a T3 call from the wake turn returns `parent_not_active`, retry that call once.
+- **One long local waiter in Claude Code** (not `offbox wait`, e.g. a FIFO or result-file watcher): start it once with Bash `run_in_background: true, timeout: 7200000`. A foreground command that gets moved to the background only gets the 30-minute default and is then killed. Don't start a second reader while it runs; wait for its completion notification.
 - **OpenCode:** native shell background launch was observed, but its completion wake has not been captured. Until verified, use `offbox wait <run-id> --timeout 540` in a shell call with a timeout of at least 550 seconds. On exit 124, the run continues: use another long bounded wait when you need its result. Do not shorten this to a 45-second loop.
 
 Codex's `exec_command` yields within 30 seconds and an empty `write_stdin` poll waits at most 300 seconds; neither can block for 25 minutes. Hand the wait to the watcher instead of polling. In the worker thread, do not loop waits, `offbox logs`, sleeps or tails of `logs/<id>.client.log`, including while queued. `offbox logs <id>` once is fine to inspect progress when asked; never check queue position. A queued run starts by itself.
@@ -225,7 +226,7 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
 | `--include PATH` | sync a path the filters skip (e.g. a committed `testdata/server.key`). Under a gitignored dir such as `tmp/`, only that path mirrors; the box's other files in that dir are kept |
 | `--no-sync` | run without syncing (box already has what you need) |
 | `--bg` | queue in a detached client and return a run id at once, even while the pool is full; then hand the wait off using your harness’s route and end your turn (see **Waiting for a run**). It collects `--pull` artifacts, prints a final summary and log tail, and exits with the run’s code. Client diagnostics: `logs/<id>.client.log` in the offbox state directory. |
-| `--base N` / `--fresh` | new lease from saved base N / ignoring bases and templates. `--fresh` doesn't always mean a new box: in the repository pool it can still reuse a pool box that was itself created fresh. In a full pool with no box of that kind, it stops at once (exit 2) instead of queueing. It isn't a way off a bad box: offbox now stops broken boxes itself, and `offbox release <id>` stops one by hand. |
+| `--base N` / `--fresh` | new lease from saved base N / ignoring bases and templates. A full pool queues `--template`/`--base` runs, then detaches and stops (never deletes) an idle box from another source to make room. `--fresh` can still reuse a pool box created fresh; it exits 2 when a full pool has no fresh-source member. It isn't a way off a bad box: offbox now stops broken boxes itself, and `offbox release <id>` stops one by hand. |
 | `--no-fallback` | return 90/91 instead of falling back to a local run |
 | `--remote` | same as `--no-fallback` (kept for old commands; every run uses a box now) |
 | `--step CMD` (repeatable) | run several checks with a real exit code each (see Fallback and exit codes) |
@@ -398,7 +399,7 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
   `offbox run --step 'go vet ./...' --step 'go test -count=1 ./pkg/...'`
   Each step runs in its own subshell with pipefail and does not stop the next. You get `offbox step N rc=X: ...`
   per step, then `offbox steps: K ok, M failed (step N rc=X)`, then `offbox: remote exit <first nonzero rc>`.
-  A run missing any planned step result exits 90 (`steps incomplete`); rerun the checks before treating them as passed.
+  A run missing any planned step result exits 90 (`steps incomplete`), except a confirmed `offbox kill` returns 143 with the stopped step. Rerun the checks before treating them as passed.
   `--step` plus a trailing `-- cmd` is a usage error (2). Exit 1 whose last pipeline stage is grep gets a hint line:
   it may mean "no match" or an earlier stage failed.
 - **99** = the repo-pinned Node or pnpm could not be provided or activated. The command never started; fix the pin or retry after the download failure. Offbox does not run on the box default instead.
@@ -413,6 +414,7 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
   had already been retried once). The command ran partly: check what it did before running it again; the message reports clean, stopped leftovers, or unknown cleanup.
 - **96** = local state DB failure. Before start: 'nothing ran, safe to retry'. After start: the message names the run and tells you to use `offbox wait <run>`; do not rerun the command. No automatic local fallback. A local bookkeeping failure after a known remote exit warns and returns that remote exit code.
 - **100** from `offbox wait` / `offbox logs` = the client ended before it got a box. The run never started; nothing ran, safe to rerun.
+- **143** = a started run was killed by `offbox kill`, on either backend. Run, wait, and logs report the kill rather than an infrastructure failure; missing step results do not change it to 90. A queued kill that never started retains exit 130.
 - **124** from `offbox wait --timeout` = you stopped waiting; the run is still going. Resume using **Waiting for a run**, not a short wait or logs loop.
 - **90** = infra failure (or, on the Boat standby, an exhausted start budget); **91** = Boat's spend guard, which only
   exists on the standby (the home server has no cap). Heavy commands
@@ -446,7 +448,7 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
 
 ## Disk space
 
-Offbox records /tmp, /var/tmp and workspace filesystem space before and after each run. Below 1 GiB free in /tmp it warns; below 256 MiB it refuses the command with **90**. On home boxes, an idle box first attempts safe cleanup of stale user-owned temp files. Critically full boxes with concurrent runs are refused without cleanup. The pool picker does not automatically move the run to another box.
+Offbox records /tmp, /var/tmp and workspace filesystem space before and after each run. Below 1 GiB free in /tmp it warns; below 256 MiB it refuses the command with **90**. A full box (workspace or /tmp) is cleaned once or kept out of the pool, and the run moves once to another box unless `--no-retry` is set; after manual cleanup, `offbox box release-disk-full <box>` returns it to the pool.
 
 After a nonzero exit, ENOSPC output or less than 64 MiB free on a measured filesystem marks the result `infra_failure: "enospc"` and returns **90** from run/wait/logs. The command's original exit and the start/end measurements stay in the state record and analytics. These test results are invalid; rerun after space is available. Successful commands retain exit 0.
 

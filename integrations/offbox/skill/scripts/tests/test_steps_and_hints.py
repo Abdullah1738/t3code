@@ -48,7 +48,7 @@ class StepScriptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as home:
             (Path(home) / 'w/repo/sub').mkdir(parents=True)
             with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
-                patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs.userns, 'setup', return_value=':'):
+                patch.multiple(runs, LDCACHE_REPAIR=':', SQLITE_SETUP=':'), patch.object(runs.userns, 'setup', return_value=':'):
                 script = runs.remote_script('w/repo', 'sub', [], None, 'run-test', steps=steps)
             env = {'HOME': home, 'PATH': os.environ.get('PATH', '/usr/bin:/bin')}
             p = subprocess.run(['bash', '-c', script], env=env, capture_output=True, text=True)
@@ -56,7 +56,7 @@ class StepScriptTests(unittest.TestCase):
 
     def test_script_has_one_marker_per_step_and_pipefail(self):
         with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
-                patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs.userns, 'setup', return_value=':'):
+                patch.multiple(runs, LDCACHE_REPAIR=':', SQLITE_SETUP=':'), patch.object(runs.userns, 'setup', return_value=':'):
             script = runs.remote_script('w/repo', '.', [], None, 'r', steps=['true', 'false | cat'])
         self.assertEqual(script.count('offbox step '), 2)
         self.assertEqual(script.count('set -o pipefail'), 2)
@@ -865,7 +865,7 @@ class MissingDepsTests(unittest.TestCase):
                     elif state == 'symlink':
                         (root / 'node_modules').symlink_to(root / 'sub', target_is_directory=True)
                     with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
-                            patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs.userns, 'setup', return_value=':'):
+                            patch.multiple(runs, LDCACHE_REPAIR=':', SQLITE_SETUP=':'), patch.object(runs.userns, 'setup', return_value=':'):
                         script = runs.remote_script('w/repo', 'sub', [f'node -e \"process.exit({code})\"; cd /; exit {code}'], None, 'r', repo_root=root)
                     p = subprocess.run(['bash', '-c', script], env=clean_env(HOME=home),
                                        capture_output=True, text=True, timeout=10)
@@ -879,7 +879,7 @@ class MissingDepsTests(unittest.TestCase):
             root.mkdir(parents=True)
             (root / 'package.json').write_text('{"devDependencies":{"vitest":"1"}}')
             with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
-                    patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs.userns, 'setup', return_value=':'):
+                    patch.multiple(runs, LDCACHE_REPAIR=':', SQLITE_SETUP=':'), patch.object(runs.userns, 'setup', return_value=':'):
                 script = runs.remote_script('w/repo', '.', [], None, 'r', steps=['node -e \"process.exit(127)\"', 'true'], repo_root=root)
             p = subprocess.run(['bash', '-c', script], env=clean_env(HOME=home),
                                capture_output=True, text=True, timeout=10)
@@ -969,8 +969,15 @@ class SummaryAndHintTests(unittest.TestCase):
 
 class CliStepTests(Isolated):
 
-    def run_cli(self, argv, code, log_text='', recorded=None):
+    def run_cli(self, argv, code, log_text='', recorded=None, *, setup_history=False):
         a = cli.build_parser().parse_args(['run'] + argv)
+
+        def start(rn):
+            result = fake_start(rn)
+            if setup_history:
+                rn.register_pending()
+                rn.record(box_id=rn.box, process_id=rn.pid, command_id='setup-command', status='running')
+            return result
 
         def fake_follow(box, pid, log_path, echo=True, run_id=None, start_offsets=(0, 0)):
             if log_path:
@@ -978,7 +985,9 @@ class CliStepTests(Isolated):
             return code
 
         err = io.StringIO()
-        with patch.object(runs.Runner, 'start', fake_start), patch.object(runs, 'follow', fake_follow), \
+        with patch.object(runs.Runner, 'start', start), patch.object(runs, 'follow', fake_follow), \
+                patch.object(runs.api, 'history_logs', return_value=dict(data=log_text, done=True)), \
+                patch.object(runs.lease, 'idle_ttl'), \
                 patch.object(runs, 'recorded_exit', return_value=recorded), contextlib.redirect_stderr(err):
             rc = cli.cmd_run(a, self.me)
         return rc, err.getvalue().strip().splitlines()
@@ -1116,7 +1125,7 @@ class CliStepTests(Isolated):
 
     def test_setup_97_maps_to_infra_90(self):
         rc, lines = self.run_cli(['--no-fallback', 'go', 'test', './...'], 97,
-                                 'offbox: Go repair: lock\noffbox-setup-failed\n')
+                                 'offbox: Go repair: lock\noffbox-setup-failed\n', setup_history=True)
         self.assertEqual(rc, 90)
         self.assertIn('offbox: box setup failed (exit 97), not your command', lines)
 
@@ -1127,7 +1136,7 @@ class CliStepTests(Isolated):
 
     def test_repo_setup_98_maps_to_infra_90(self):
         rc, lines = self.run_cli(['--no-fallback', '--step', 'java -version'], 98,
-                                 'offbox-repo-setup-failed\n')
+                                 'offbox-repo-setup-failed\n', setup_history=True)
         self.assertEqual(rc, 90)
         self.assertIn('offbox: repo toolchain setup failed (exit 98), not your command', lines)
 

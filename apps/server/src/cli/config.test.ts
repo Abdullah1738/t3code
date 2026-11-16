@@ -623,6 +623,11 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
         (yield* resolveWith({ shellEnvironmentPrepared: true })).shellEnvironmentPrepared,
         true,
       );
+      const shellPathHydration = { source: "desktop-shell" as const, probes: [] };
+      assert.deepEqual(
+        (yield* resolveWith({ shellPathHydration })).shellPathHydration,
+        shellPathHydration,
+      );
     }),
   );
 

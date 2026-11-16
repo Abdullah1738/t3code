@@ -2,6 +2,7 @@
 import datetime as dt
 import fcntl
 import importlib.util
+import hashlib
 import io
 import json
 import os
@@ -11,7 +12,7 @@ import subprocess
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location('money_cases', Path(__file__).with_name('cases.py'))
@@ -19,6 +20,8 @@ mc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mc)
 
 from test_charges import ControlServer, summary
+
+os.environ['MONEY_CASES_REFRESH_DISABLED'] = '1'
 
 TZ = mc.TZ
 
@@ -75,6 +78,103 @@ class Base(unittest.TestCase):
         (folder / 'state.json').write_text(json.dumps({'status': status, 'fires': fires,
                                                        'last_fire_at': '2026-10-23T10:44:18Z',
                                                        'last_run_at': '2026-10-23T11:00:00Z'}))
+
+
+def data_snapshot(data):
+    return {str(p.relative_to(data)): (p.stat().st_size, hashlib.sha256(p.read_bytes()).hexdigest(),
+                                      p.stat().st_mtime_ns)
+            for p in data.rglob('*') if p.is_file()}
+
+
+@contextmanager
+def screen_sources(root, corrupt=False, locks=True):
+    """Real cache readers/writers with only the control API and subprocess sources replaced."""
+    data = root / 'data'
+    data.mkdir()
+    charged, now = at('2026-10-24T04:10'), at('2026-10-24T05:00')
+    text = 'Purchase of AED 12.34 with Credit Card ending 1111 at noon, Dubai. Avl Cr. Limit'
+    book = {'version': 1, 'questions': []}
+    mc.new_question(book, mc.charges.parse(text, 'EmiratesNBD'), text, charged, now, 'sms')
+    owner = {'a': {'version': mc.charges.OWNER_CACHE_VERSION, 'updatedAt': '2026-10-24T00:00:00Z',
+                  'coveredFrom': '2026-10-23T00:00:00Z', 'title': 'iMessage test', 'texts': []}}
+    files = {'cases.json': {'version': 1, 'cases': [], 'purchases': []}, 'questions.json': book,
+             'owner-texts.json': owner, 'order-details.json': [], 'msgs-searches.json': {},
+             'subscriptions.json': {'version': 1, 'subscriptions': []},
+             'cards.json': {'dead': {}}}
+    import marketplace
+    files['marketplace-placements.json'] = marketplace.empty()
+    for name, value in files.items():
+        (data / name).write_text(json.dumps(value) + '\n')
+    if corrupt:
+        (data / 'owner-texts.json').write_text('{broken owner cache\n')
+    if locks:
+        for name in ('cases', 'questions', 'cards', 'subscriptions', 'order-details', 'marketplace-refresh'):
+            (data / (name + '.lock')).touch()
+    (data / 'nested').mkdir()
+    (data / 'nested' / 'sentinel').write_bytes(b'unchanged')
+    msgs = root / 'msgs'
+    calls = root / 'msgs-calls'
+    msgs.write_text('#!/bin/sh\nprintf "called\\n" >> ' + str(calls) + '\nprintf "\\n"\n')
+    msgs.chmod(0o700)
+    original = subprocess.run
+    orders = []
+
+    def run(argv, *args, **kwargs):
+        if len(argv) > 3 and str(argv[3]) == str(Path(mc.charges.order_lookup.__file__).resolve()):
+            orders.append(json.loads(kwargs['input']))
+            row = dict(service='food', order='new-order', total='99.00', currency='AED',
+                       placed_at=charged.isoformat(), status='delivered', raw_status='delivered')
+            result = {'orders': [row], 'complete': True,
+                      'lanes': {name: {'exhaustive': True, 'covered_from': None, 'limit': None,
+                                       'walked_at': now.isoformat()} for name in mc.charges.order_lookup.LANES}}
+            return subprocess.CompletedProcess(argv, 0, json.dumps(result), '')
+        return original(argv, *args, **kwargs)
+
+    with ExitStack() as stack:
+        server = stack.enter_context(ControlServer([summary('unrelated owner words')]))
+        stack.enter_context(patch.dict(os.environ, {'MONEY_CASES_DIR': str(data),
+                                                   'ROBOB_TOOL_LOG_DIR': str(root / 'logs'),
+                                                   'TOOLLOG_ROOT': str(root / 'logs')}))
+        stack.enter_context(patch.object(mc, 'DATA', data))
+        stack.enter_context(patch.object(mc.charges, 'MSGS', str(msgs)))
+        stack.enter_context(patch.object(subprocess, 'run', side_effect=run))
+        yield data, text, charged, now, server, orders, calls
+
+
+class ScreenReadOnly(unittest.TestCase):
+    def test_screen_default_sources_leave_every_file_unchanged(self):
+        for corrupt, locks in ((False, True), (True, True), (False, False)):
+            with self.subTest(corrupt=corrupt, locks=locks), tempfile.TemporaryDirectory() as tmp:
+                with screen_sources(Path(tmp), corrupt, locks) as (data, text, charged, now, server, orders, calls):
+                    before = data_snapshot(data)
+                    result = mc.screen(text, 'EmiratesNBD', at=charged, now=now, data=data, record=False)
+                    self.assertEqual(result['verdict'], 'ask', result)
+                    self.assertEqual(result['errors'], [])
+                    self.assertEqual(data_snapshot(data), before)
+                    self.assertTrue(orders)
+                    self.assertTrue(calls.read_text().strip())
+                    self.assertTrue(any(path.endswith('/messages') for path, _, _ in server.calls))
+
+    def test_read_only_screen_does_not_create_a_missing_data_directory(self):
+        with tempfile.TemporaryDirectory() as tmp, screen_sources(Path(tmp)) as fixture:
+            data, text, charged, now, server, orders, calls = fixture
+            missing = data.parent / 'missing-data'
+            result = mc.screen(text, 'EmiratesNBD', at=charged, now=now, data=missing, record=False)
+            self.assertEqual(result['verdict'], 'ask', result)
+            self.assertFalse(missing.exists())
+
+    def test_recording_still_saves_both_caches_and_question(self):
+        with tempfile.TemporaryDirectory() as tmp, screen_sources(Path(tmp)) as fixture:
+            data, text, charged, now, server, orders, calls = fixture
+            before = data_snapshot(data)
+            result = mc.screen(text, 'EmiratesNBD', at=charged, now=now, data=data, record=True)
+            self.assertEqual(result['verdict'], 'ask', result)
+            after = data_snapshot(data)
+            for name in ('owner-texts.json', 'order-details.json', 'questions.json'):
+                self.assertNotEqual(before[name], after[name], name)
+            self.assertEqual(json.loads((data / 'owner-texts.json').read_text())['a']['texts'][0]['text'],
+                             'unrelated owner words')
+            self.assertEqual(json.loads((data / 'order-details.json').read_text())[0]['order'], 'new-order')
 
 
 class Moments(unittest.TestCase):
@@ -2764,6 +2864,52 @@ class UnmatchedCharges(Base):
 
 
 class CheckBudget(Base):
+    def test_marketplace_limits_are_counted_as_limited(self):
+        now = at('2026-11-14T12:00')
+        when = now - dt.timedelta(days=3)
+        for kind in ('marketplace_hold', 'marketplace_stale'):
+            with self.subTest(kind=kind):
+                self.data = self.tmp / kind
+                self.seed([when])
+                with mc.Locked(self.data, 'questions') as book:
+                    book['questions'][0].update(merchant='noon', mkey='noon')
+                result = {'orders': [], 'complete': True, 'lanes': {
+                    name: {'exhaustive': True} for name in mc.charges.order_lookup.LANES}}
+                result['lanes']['marketplace'].update(
+                    walked_at=(when if kind == 'marketplace_stale' else now).isoformat(),
+                    hold_times=[when.isoformat()] if kind == 'marketplace_hold' else [])
+                stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+                with patch.object(mc.charges.order_lookup, 'read', return_value=result):
+                    mc.follow(self.data, now, self.root, find=finder(), said=nobody, stats=stats)
+                self.assertEqual(stats['charge_census']['noon'][kind], 1)
+                self.assertEqual(stats['charge_census']['noon']['limited'], 1)
+                self.assertEqual(stats['charge_census']['noon']['error'], 0)
+
+    def test_detached_refresh_runs_after_logging_without_affecting_check_duration(self):
+        import marketplace
+        from state_json import write_json
+        self.case()
+        with patch.dict(os.environ, {'MONEY_CASES_REFRESH_DISABLED': '0'}), \
+                patch.object(marketplace.subprocess, 'Popen') as launch, \
+                patch.object(mc, 'record_event') as log:
+            self.check('2026-10-24T09:00')
+            launch.assert_called_once()
+            self.assertTrue(launch.call_args.kwargs['start_new_session'])
+            self.assertEqual(launch.call_args.kwargs['stdout'], subprocess.DEVNULL)
+            self.assertEqual(launch.call_args.kwargs['stderr'], subprocess.DEVNULL)
+            event = next(c for c in log.call_args_list if c.args[0] == 'check.run')
+            self.assertEqual(event.kwargs['props']['marketplace_refresh'], 'started')
+            launch.reset_mock()
+            write_json(self.data / 'marketplace-placements.json', dict(marketplace.empty(),
+                walked_at=dt.datetime.now(dt.timezone.utc).isoformat()))
+            self.check('2026-10-24T09:00')
+            launch.assert_not_called()
+            write_json(self.data / 'marketplace-placements.json', marketplace.empty())
+            with (self.data / 'marketplace-refresh.lock').open('a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                self.check('2026-10-24T09:00')
+            launch.assert_not_called()
+
     def test_follow_redacts_repeated_text_once_without_batching_cursor_commits(self):
         from collections import Counter
         now = at('2026-10-25T12:00')
@@ -2947,7 +3093,7 @@ class CheckBudget(Base):
         def orders(app, deadline=None, **kwargs):
             calls.append((app, deadline - time.time()))
             return {'orders': [], 'complete': False, 'lanes': {
-                lane: {'covered_from': None, 'stop_reason': 'slice_out'}
+                lane: {'walked_at': '2026-12-31T00:00:00+00:00', 'covered_from': None, 'stop_reason': 'slice_out'}
                 for lane in mc.charges.order_lookup.LANES}}
         def slow(*args, **kwargs):
             Event().wait(1)
@@ -2981,7 +3127,7 @@ class CheckBudget(Base):
                     return {'orders': ([{'order': 'fixture', 'total': sample['amount'], 'currency': sample['currency'],
                         'placed_at': (now - dt.timedelta(hours=1)).isoformat(), 'status': 'delivered'}]
                         if matched else []), 'complete': False, 'lanes': {
-                        lane: {'covered_from': None if lane == 'marketplace' else
+                        lane: {'walked_at': '2026-12-31T00:00:00+00:00', 'covered_from': None if lane == 'marketplace' else
                                (now - dt.timedelta(days=5)).isoformat(), 'exhaustive': False}
                         for lane in mc.charges.order_lookup.LANES}}
                 def owner(*args, **kwargs):
@@ -3023,7 +3169,7 @@ class CheckBudget(Base):
                 def orders(*args, **kwargs):
                     clock[0] += 11
                     return {'orders': [], 'complete': False, 'lanes': {
-                        lane: {'covered_from': None if offset is None else
+                        lane: {'walked_at': '2026-12-31T00:00:00+00:00', 'covered_from': None if offset is None else
                             (edge + dt.timedelta(seconds=offset)).isoformat(), 'exhaustive': False}
                         for lane in mc.charges.order_lookup.LANES}}
                 stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
@@ -3035,7 +3181,7 @@ class CheckBudget(Base):
                 self.assertFalse(q.get('checked'))
                 self.assertEqual(q['status'], 'open')
                 self.assertFalse(q.get('case_opened') or q.get('asks'))
-                self.assertEqual(stats['charge_census']['noon'], dict(open=1, matched=0,
+                self.assertEqual(stats['charge_census']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=1, matched=0,
                     proven_clean=0, limited=1, error=0, not_checked=0))
 
     def test_owner_precedes_reserved_order_reads_with_independent_slices(self):
@@ -3075,7 +3221,7 @@ class CheckBudget(Base):
                 def orders(app, deadline=None, **kwargs):
                     reads.append(deadline - time.time())
                     return {'orders': [], 'complete': False, 'lanes': {
-                        lane: {'covered_from': None, 'stop_reason': 'unproven_paging'}
+                        lane: {'walked_at': '2026-12-31T00:00:00+00:00', 'covered_from': None, 'stop_reason': 'unproven_paging'}
                         for lane in mc.charges.order_lookup.LANES}}
                 stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
                 with patch.object(mc.charges, 'OWNER_BUDGET', 0.05), \
@@ -3176,7 +3322,7 @@ class CheckBudget(Base):
         ])
         with patch.object(mc.charges, 'explain', side_effect=lambda *a, **kw: next(outcomes)):
             mc.follow(self.data, now, self.root, find=finder(), said=nobody, stats=stats)
-        self.assertEqual(stats['charge_census']['noon'], dict(open=4, matched=1,
+        self.assertEqual(stats['charge_census']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=4, matched=1,
             proven_clean=1, limited=1, error=1, not_checked=0))
         self.assertEqual(stats['charge_census']['careem'], dict(open=1, matched=0,
             proven_clean=0, limited=1, error=0, not_checked=0))
@@ -3218,7 +3364,7 @@ class CheckBudget(Base):
                     mc.follow(self.data, now, self.root, 1007 if form == 'deferred' else None,
                               finder(), nobody, stats=stats)
                 self.assertTrue(all(q['status'] == 'closed' for q in self.questions()))
-                self.assertEqual(stats['charge_census']['noon'], dict(open=2, matched=2,
+                self.assertEqual(stats['charge_census']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=2, matched=2,
                     proven_clean=0, limited=0, error=0, not_checked=0))
 
     def census_alias_check(self, label, merchants, outcomes, deferred=False):
@@ -3235,7 +3381,8 @@ class CheckBudget(Base):
                 clock[0] += 2
             return next(results)
         with patch.object(mc.charges.order_lookup, 'read', return_value={'orders': [], 'complete': True,
-                    'lanes': {lane: {'exhaustive': True} for lane in mc.charges.order_lookup.LANES}}), \
+                    'lanes': {lane: {'exhaustive': True, 'walked_at': now.isoformat()}
+                              for lane in mc.charges.order_lookup.LANES}}), \
                 patch.object(mc.time, 'time', side_effect=lambda: clock[0]), \
                 patch.object(mc, 'FOLLOW_BUDGET', 7 if deferred else mc.FOLLOW_BUDGET), \
                 patch.object(mc.charges, 'explain', side_effect=explain):
@@ -3268,7 +3415,9 @@ class CheckBudget(Base):
                             census = row['props']['chargeCensus']
                             for source, count in (('noon', 2 if peer == 'noon food' else 1),
                                                   ('careem', 1 if peer == 'careem' else 0)):
-                                self.assertEqual(census[source], dict(open=count, matched=0,
+                                self.assertEqual(census[source], dict(
+                                    **({'marketplace_hold': 0, 'marketplace_stale': 0} if source == 'noon' else {}),
+                                    open=count, matched=0,
                                     proven_clean=0, limited=count if kind == 'limited' else 0,
                                     error=count if kind == 'error' else 0, not_checked=0))
                             self.assertEqual(row['ok'], kind == 'limited')
@@ -3284,7 +3433,7 @@ class CheckBudget(Base):
                 questions, row = self.census_alias_check('mixed-' + str(reverse),
                     ['noon', 'noon food'], outcomes)
                 self.assertTrue(all(q['unverified'] for q in questions))
-                self.assertEqual(row['props']['chargeCensus']['noon'], dict(open=2, matched=0,
+                self.assertEqual(row['props']['chargeCensus']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=2, matched=0,
                     proven_clean=0, limited=0, error=2, not_checked=0))
                 self.assertFalse(row['ok'])
 
@@ -3296,7 +3445,7 @@ class CheckBudget(Base):
         questions, row = self.census_alias_check('non-transitive',
             ['noon', 'noon food', 'noon'], [failed, limited, clear])
         self.assertTrue(all(q['unverified'] for q in questions))
-        self.assertEqual(row['props']['chargeCensus']['noon'], dict(open=3, matched=0,
+        self.assertEqual(row['props']['chargeCensus']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=3, matched=0,
             proven_clean=0, limited=1, error=2, not_checked=0))
 
     def test_check_census_deferred_alias_has_only_order_evidence(self):
@@ -3305,7 +3454,7 @@ class CheckBudget(Base):
                                                [clear], deferred=True)
         self.assertTrue(questions[0]['unverified'])
         self.assertFalse(questions[1].get('checked'))
-        self.assertEqual(row['props']['chargeCensus']['noon'], dict(open=2, matched=0,
+        self.assertEqual(row['props']['chargeCensus']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=2, matched=0,
             proven_clean=0, limited=2, error=0, not_checked=0))
         self.assertFalse(row['ok'])
 
@@ -3318,7 +3467,7 @@ class CheckBudget(Base):
             with self.subTest(kind=kind):
                 questions, row = self.census_alias_check('distinct-' + kind,
                                                        ['noon', 'noon'], [clear, blocked])
-                self.assertEqual(row['props']['chargeCensus']['noon'], dict(open=2, matched=0,
+                self.assertEqual(row['props']['chargeCensus']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=2, matched=0,
                     proven_clean=1, limited=1 if kind == 'limited' else 0,
                     error=1 if kind == 'error' else 0, not_checked=0))
                 self.assertFalse(questions[0]['unverified'])
@@ -3468,6 +3617,7 @@ class CheckBudget(Base):
                             mc.case_from(self.data, book['questions'][0], now, 'check', self.root)
                 cid = mc.load(self.data)['cases'][0]['id']
                 self.assertEqual(self.questions()[0]['status'], 'open')
+                before = data_snapshot(self.data) if entry == 'readonly' else None
                 if entry == 'answered':
                     mc.answered(self.data, qid, 'not mine', now)
                     q = self.questions()[0]
@@ -3485,6 +3635,8 @@ class CheckBudget(Base):
                 else:
                     mc.triaged(self.data, [(qid, 'imsg:test', False)], now)
                 q = self.questions()[0]
+                if entry == 'readonly':
+                    self.assertEqual(data_snapshot(self.data), before)
                 if entry not in ('answered', 'readonly'):
                     self.assertEqual((q['status'], q['case']), ('case', cid))
                 self.assertEqual(mc.load(self.data)['cases'][0]['status'], 'open')
@@ -4757,6 +4909,83 @@ class PaymentDeadlines(Base):
         self.assertNotIn('21:00', event)
         parent = next(c for c in mc.load(self.data)['cases'] if c['kind'] == 'autopay_expected')
         self.assertEqual(parent['payment_case'], bank)
+
+
+class ReceiptVariantCompetition(unittest.TestCase):
+    def test_aed_usd_charges_compete_for_the_same_receipt(self):
+        observed = at('2026-11-12T12:00')
+        for merchant, brand in [('BOAT.DEV', 'Boat'), ('BROWSER USE INC', 'Browser Use')]:
+            row = dict(id=7, ts=(observed + dt.timedelta(minutes=45)).timestamp(),
+                       sender=f'{brand} <receipts@stripe.example>', subject='Receipt')
+            text = f'{brand} receipt\nAmount paid $50.00'
+            for currency, amount, rival_currency, rival_amount in [
+                    ('AED', '190.47', 'USD', '50.00'), ('USD', '50.00', 'AED', '190.47')]:
+                current = dict(id='q-current', kind='charge', currency=currency, card='1111',
+                               merchant=merchant, amount=amount, pending=False, at=mc.stamp(observed))
+                for bound in [False, True]:
+                    rival = dict(current, id='q-rival', currency=rival_currency, amount=rival_amount,
+                                 at=mc.stamp(observed + dt.timedelta(minutes=1)))
+                    if bound:
+                        # A recorded binding vetoes reuse even outside the matching window.
+                        rival.update(at=mc.stamp(observed - dt.timedelta(days=7)), status='closed',
+                                     explanation={'msgs': row['id']})
+                    for known in [False, True]:
+                        with self.subTest(merchant=merchant, currency=currency, bound=bound, known=known):
+                            questions = [current, rival] if known else [rival]
+                            accepts = mc.receipt_for_question(None, current, 'q-current' if known else None,
+                                                             questions, observed)
+                            self.assertFalse(accepts(row, text))
+
+    def test_unbound_fx_competitors_need_matching_evidence(self):
+        observed = at('2026-11-12T12:00')
+        row = dict(id=7, ts=(observed + dt.timedelta(minutes=45)).timestamp(),
+                   sender='Boat <receipts@stripe.example>', subject='Receipt')
+        for currency, amount, rival_currency, rival_amount, wrong_amount in [
+                ('AED', '190.47', 'USD', '50.00', '25.00'),
+                ('USD', '50.00', 'AED', '190.47', '100.00')]:
+            current = dict(id='q-current', kind='charge', currency=currency, card='1111',
+                           merchant='BOAT.DEV', amount=amount, pending=False, at=mc.stamp(observed))
+            rival = dict(current, id='q-rival', currency=rival_currency, amount=rival_amount)
+            for label, changes in [('merchant', {'merchant': 'Other'}),
+                                   ('amount', {'amount': wrong_amount}), ('currency', {'currency': 'EUR'}),
+                                   ('time', {'at': mc.stamp(observed - dt.timedelta(days=7))})]:
+                with self.subTest(currency=currency, form=label):
+                    accepts = mc.receipt_for_question(None, current, 'q-current',
+                                                     [current, dict(rival, **changes)], observed)
+                    self.assertTrue(accepts(row, 'Boat receipt\nAmount paid $50.00'))
+
+    def test_different_amounts_cannot_share_a_variant_receipt(self):
+        observed = at('2026-11-12T12:00')
+        forms = [
+            ('UBER * PENDING', '201.03', True, '200.94', False,
+             'Uber <receipts@uber.com>', 'Uber receipt\nTotal AED 200.94', False),
+            ('UBER * PENDING', '201.03', True, '201.00', True,
+             'Uber <receipts@uber.com>', 'Uber receipt\nTotal AED 200.94', False),
+            ('BOAT.DEV', '190.47', False, '190.90', False,
+             'Boat <receipts@stripe.example>', 'Boat receipt\nAmount paid $50.00', False),
+            ('UBER * PENDING', '201.03', True, '200.94', True,
+             'Uber <receipts@uber.com>', 'Uber receipt\nTotal AED 200.94', True),
+        ]
+        for merchant, amount, pending, rival_amount, rival_pending, sender, text, bound in forms:
+            current = dict(id='q-current', kind='charge', currency='AED', card='1111',
+                           merchant=merchant, amount=amount, pending=pending, at=mc.stamp(observed))
+            rival = dict(current, id='q-rival', amount=rival_amount, pending=rival_pending,
+                         at=mc.stamp(observed + dt.timedelta(minutes=1)))
+            if bound:
+                rival.update(status='closed', explanation={'msgs': 7})
+            row = dict(id=7, ts=(observed + dt.timedelta(minutes=45)).timestamp(),
+                       sender=sender, subject='Receipt')
+            for known in [False, True]:
+                with self.subTest(merchant=merchant, rival=rival_amount, known=known):
+                    questions = [current, rival] if known else [rival]
+                    accepts = mc.receipt_for_question(None, current, 'q-current' if known else None,
+                                                     questions, observed)
+                    self.assertFalse(accepts(row, text))
+                    unrelated = dict(rival, merchant='Other', amount='999.00', pending=False)
+                    unrelated.pop('explanation', None)
+                    accepts = mc.receipt_for_question(None, current, 'q-current' if known else None,
+                                                     [unrelated], observed)
+                    self.assertTrue(accepts(row, text))
 
 
 if __name__ == '__main__':

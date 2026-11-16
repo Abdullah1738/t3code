@@ -3,6 +3,8 @@
 #   bash install-host.sh            # packages, ZFS pool, state datasets, Incus, firewall, boatd service, timers
 #   bash install-host.sh image      # (re)build the offbox-base image from base-image.sh
 #   bash install-host.sh tmp-profile # only configure /tmp for future box starts; no service restarts
+#   bash install-host.sh scratch-disk # prepare per-box /tmp parent and enable new-box disks; no restart
+#   bash install-host.sh scratch-disk-undo # disable new-box disks; retain existing disk lifecycle
 #   bash install-host.sh update-policy # config and pending-restart writer only; no service restart
 #   bash install-host.sh cpu-priority # relative control-plane CPU weights only; no restart
 #   bash install-host.sh cpu-admission # save old admission value and configure CPU backpressure; no restart
@@ -20,6 +22,9 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 MGMT_ASSETS=$HERE
 [ -f "$MGMT_ASSETS/offbox_mgmt_sshd_config" ] || MGMT_ASSETS=$HERE/../skill/templates/home
+SQLITE_ASSET=$HERE/sqlite.sh
+[ -f "$SQLITE_ASSET" ] || SQLITE_ASSET=$HERE/../skill/templates/tools/sqlite.sh
+FETCH_ASSET=$(dirname "$SQLITE_ASSET")/fetch.sh
 POOL=offbox
 export DEBIAN_FRONTEND=noninteractive
 
@@ -150,12 +155,39 @@ if [ "${1:-}" = disk-reservations ]; then disk_reservations; exit 0; fi
 
 if [ "${1:-}" = tmp-profile ]; then tmp_profile; exit 0; fi
 
+scratch_disk() {
+  python3 - "$HERE" "${BOATD_ETC:-/etc/boatd}" "$POOL" "${1:-enable}" <<'PY'
+import json, os, pathlib, sys, tempfile
+sys.path.insert(0, sys.argv[1])
+from boatd_tmp import Scratch
+root = pathlib.Path(sys.argv[2])
+p = root / 'config.json'
+c = json.loads(p.read_text())
+enabled = sys.argv[4] != 'disable'
+if enabled:
+    Scratch({'zpool': sys.argv[3]}, None).prepare_parent()
+c['scratch_disk'] = enabled
+with tempfile.NamedTemporaryFile(mode='w', dir=root, prefix='config.json.', delete=False) as f:
+    temporary = f.name
+    json.dump(c, f, indent=1)
+    f.write('\n')
+    f.flush()
+    os.fsync(f.fileno())
+os.replace(temporary, p)
+print(f'scratch_disk={enabled}; takes effect when boatd next loads its config; no boxes changed')
+PY
+}
+if [ "${1:-}" = scratch-disk ]; then scratch_disk; exit 0; fi
+if [ "${1:-}" = scratch-disk-undo ]; then scratch_disk disable; exit 0; fi
+
 image() {
   incus delete --force offbox-build 2>/dev/null || true
   incus launch images:ubuntu/24.04 offbox-build -p default -p offbox
   for _ in $(seq 60); do incus exec offbox-build -- systemctl is-system-running 2>/dev/null | grep -qE 'running|degraded' && break; sleep 1; done
   incus file push "$HERE/boatd-wrap" offbox-build/usr/local/sbin/boatd-wrap --mode 0755
   incus file push "$HERE/base-image.sh" offbox-build/root/base-image.sh --mode 0700
+  incus file push "$SQLITE_ASSET" offbox-build/root/offbox-sqlite.sh --mode 0700
+  incus file push "$FETCH_ASSET" offbox-build/root/fetch.sh --mode 0600
   incus file push "$MGMT_ASSETS/offbox-mgmt-ssh.service" offbox-build/root/offbox-mgmt-ssh.service --mode 0644
   incus file push "$MGMT_ASSETS/offbox_mgmt_sshd_config" offbox-build/root/offbox_mgmt_sshd_config --mode 0600
   incus file push "$MGMT_ASSETS/offbox-ssh-runtime.conf" offbox-build/root/offbox-ssh-runtime.conf --mode 0644
@@ -429,6 +461,7 @@ install -d -m 700 /etc/boatd
 mkdir -p /opt/boatd
 install -m 0755 "$HERE/boatd.py" /opt/boatd/boatd.py
 install -m 0644 "$HERE/boatd_disk.py" /opt/boatd/boatd_disk.py
+install -m 0644 "$HERE/boatd_tmp.py" /opt/boatd/boatd_tmp.py
 install -m 0755 "$HERE/boatd-wrap" /opt/boatd/boatd-wrap
 install -m 0644 "$MGMT_ASSETS/offbox_mgmt_sshd_config" /opt/boatd/offbox_mgmt_sshd_config
 tool_log="$HERE/toollog.py"
@@ -449,12 +482,13 @@ except (OSError, ValueError):
     c = {}
 c.update(listen=sys.argv[1], ssh_host=sys.argv[1], port=c.get("port", 8443), zpool=sys.argv[2],
          state_dataset=sys.argv[2] + "/boatd")
-c.setdefault("cpu_pressure_limit", 50)
+c.setdefault("cpu_pressure_limit", 0)
 with open(p + ".tmp", "w") as f:
     json.dump(c, f, indent=1)
 os.replace(p + ".tmp", p)
 os.chmod(p, 0o600)
 PY
+scratch_disk
 install -m 0644 "$HERE/boatd.service" /etc/systemd/system/boatd.service
 
 # ---- timers: snapshots of the person boxes (retention numbers: RETENTION in boatd.py, or "retention" in

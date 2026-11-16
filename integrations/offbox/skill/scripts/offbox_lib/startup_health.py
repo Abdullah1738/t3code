@@ -31,3 +31,18 @@ def starting_phase(data):
         if re.fullmatch(r"state dataset \S+ (?:not found \(pool \S+ is MISSING\)|is not mounted)", str(reason)):
             return str(reason)
     return None
+
+
+def accepting_health(data):
+    """Loop degradation does not refuse runs; explicit admission failures still do."""
+    if not isinstance(data, dict):
+        return False
+    if data.get("ok") is True:
+        return True
+    if data.get("degraded") is not True or data.get("up") is False or data.get("starting") or starting_phase(data):
+        return False
+    disk = data.get("disk") if isinstance(data.get("disk"), dict) else {}
+    if data.get("disk_full") or disk.get("disk_full") or disk.get("level") in ("full", "unknown"):
+        return False
+    reasons = data.get("reasons") or []
+    return isinstance(reasons, list) and all(re.match(r"(?:reaper|sampler) has not completed a pass for ", str(r)) for r in reasons)

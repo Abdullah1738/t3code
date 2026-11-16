@@ -1,3 +1,4 @@
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
@@ -54,6 +55,7 @@ const layer = (
   schedules: Partial<ScheduledTasks.ScheduledTaskService["Service"]> = {},
 ) =>
   OrchestratorMcp.layer.pipe(
+    Layer.provide(McpProviderSessions.layer),
     Layer.provide(
       Layer.mergeAll(
         NodeServices.layer,
@@ -601,7 +603,7 @@ it.effect.each(
         command === "command:mcp:delegate-task:environment:caller:retry" ||
         (command.startsWith("command:mcp:old") &&
           (testCase.state === "never_saved" || testCase.state === "pending"))
-          ? "No delegated task has this id. Check the id; copy it exactly from delegate_task."
+          ? "No delegated task has this id. Expected the taskId returned by delegate_task."
           : testCase.message,
     })),
   ),

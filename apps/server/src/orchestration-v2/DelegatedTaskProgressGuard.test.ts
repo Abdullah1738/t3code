@@ -4,6 +4,8 @@ import {
   EventId,
   MessageId,
   NodeId,
+  ProviderInstanceId,
+  ProviderThreadId,
   RunId,
   ThreadId,
   TurnItemId,
@@ -11,27 +13,35 @@ import {
   type OrchestrationV2Run,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2TurnItem,
+  AnalyticsEvent,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
+import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 import * as Guard from "./DelegatedTaskProgressGuard.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as Threads from "./ThreadManagementService.ts";
+import * as Analytics from "../ardud/analytics/Analytics.ts";
 import { normalizeIdleTimeout, stalledSummary } from "./delegatedTaskProgress.ts";
 
 const threadId = ThreadId.make("child");
 const runId = RunId.make("run");
+const decodeAnalytics = Schema.decodeEffect(AnalyticsEvent, { onExcessProperty: "error" });
 const makeHarness = Effect.gen(function* () {
   const now = yield* DateTime.now;
   const stops: Array<Threads.ThreadManagementInterruptInput> = [];
+  const recoveries: Array<Threads.ThreadManagementSendInput> = [];
+  const analytics: Array<AnalyticsEvent> = [];
+  let failPromptRead = false;
   let interruptRace: Effect.Effect<void> | undefined;
   let selectedTimeout: number | undefined;
   let run = {
     id: runId,
     threadId,
+    providerInstanceId: ProviderInstanceId.make("test-provider"),
     delegatedTaskId: NodeId.make("task"),
     status: "running",
     activeAttemptId: null,
@@ -44,6 +54,7 @@ const makeHarness = Effect.gen(function* () {
     turnItems: [],
     runtimeRequests: [],
     messages: [],
+    providerThreads: [],
   } as unknown as OrchestrationV2ThreadProjection;
   const guard = yield* Guard.DelegatedTaskProgressGuard.pipe(
     Effect.provide(
@@ -51,18 +62,24 @@ const makeHarness = Effect.gen(function* () {
         Layer.provide(
           Layer.mergeAll(
             Layer.mock(Orchestrator.OrchestratorV2)({
-              getThreadRecords: () =>
-                Effect.succeed({
-                  ...projection,
-                  subagents: [
-                    {
-                      id: NodeId.make("task"),
-                      origin: "app_owned",
-                      childThreadId: threadId,
-                      idleTimeoutMs: 60_000,
-                    },
-                  ],
-                } as unknown as OrchestrationV2ThreadProjection),
+              getThreadRecords: (_threadId, sections) =>
+                Effect.suspend(() => {
+                  if (failPromptRead && sections.length === 1 && sections[0] === "messages") {
+                    failPromptRead = false;
+                    return Effect.die(new Error("temporary prompt read failure"));
+                  }
+                  return Effect.succeed({
+                    ...projection,
+                    subagents: [
+                      {
+                        id: NodeId.make("task"),
+                        origin: "app_owned",
+                        childThreadId: threadId,
+                        idleTimeoutMs: 60_000,
+                      },
+                    ],
+                  } as unknown as OrchestrationV2ThreadProjection);
+                }),
               streamDomainEvents: Stream.empty,
               getShellSnapshot: () =>
                 Effect.succeed({
@@ -79,6 +96,13 @@ const makeHarness = Effect.gen(function* () {
                 } as never),
             }),
             Layer.mock(Threads.ThreadManagementService)({
+              sendToThread: (input) =>
+                Effect.sync(() => {
+                  recoveries.push(input);
+                  run = { ...run, delegatedTaskStallRecovery: input.delegatedTaskStallRecovery };
+                  projection = { ...projection, runs: [run] };
+                  return { run } as never;
+                }),
               interruptThread: (input) =>
                 Effect.gen(function* () {
                   if (interruptRace !== undefined) {
@@ -110,6 +134,18 @@ const makeHarness = Effect.gen(function* () {
                     } as never;
                   });
                 }),
+            }),
+            Layer.mock(Analytics.Analytics)({
+              record: (event) =>
+                decodeAnalytics(event).pipe(
+                  Effect.orDie,
+                  Effect.tap((decoded) =>
+                    Effect.sync(() => {
+                      analytics.push(decoded);
+                    }),
+                  ),
+                  Effect.asVoid,
+                ),
             }),
           ),
         ),
@@ -191,6 +227,43 @@ const makeHarness = Effect.gen(function* () {
   return {
     guard,
     stops,
+    recoveries,
+    analytics,
+    failNextPromptRead: () => {
+      failPromptRead = true;
+    },
+    projectItems: (items: ReadonlyArray<OrchestrationV2TurnItem>) => {
+      projection = { ...projection, turnItems: items };
+    },
+    enableCodex: () => {
+      const instanceId = ProviderInstanceId.make("codex");
+      const providerThreadId = ProviderThreadId.make("provider-child");
+      run = {
+        ...run,
+        providerInstanceId: instanceId,
+        providerThreadId,
+        userMessageId: MessageId.make("original"),
+        modelSelection: {
+          instanceId,
+          model: "gpt-6.1-sol",
+          options: [{ id: "reasoningEffort", value: "max" }],
+        },
+      };
+      projection = {
+        ...projection,
+        runs: [run],
+        providerThreads: [{ id: providerThreadId, driver: "codex" }],
+        messages: [
+          {
+            id: run.userMessageId,
+            runId,
+            role: "user",
+            text: "Review this patch",
+            attachments: [],
+          },
+        ],
+      } as unknown as OrchestrationV2ThreadProjection;
+    },
     start,
     item,
     send,
@@ -217,6 +290,131 @@ const makeHarness = Effect.gen(function* () {
 });
 
 describe("DelegatedTaskProgressGuard", () => {
+  it.effect("a failed original-prompt read does not disable later recovery", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness;
+      h.enableCodex();
+      yield* h.start(60_000);
+      yield* TestClock.adjust("1 minute");
+      h.failNextPromptRead();
+      yield* h.guard.check();
+      assert.lengthOf(h.recoveries, 0);
+      assert.lengthOf(h.stops, 0);
+      yield* h.guard.check();
+      assert.lengthOf(h.recoveries, 1);
+      assert.equal(h.recoveries[0]!.text, "Review this patch");
+      assert.lengthOf(h.analytics, 1);
+    }),
+  );
+
+  it.effect("parallel tools are attributed in completion order", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness;
+      yield* h.start(60_000);
+      const items = [1, 2].map((ordinal): OrchestrationV2TurnItem => ({
+        id: TurnItemId.make(`parallel-${ordinal}`),
+        threadId,
+        runId,
+        nodeId: null,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        type: "dynamic_tool",
+        ordinal,
+        status: "running",
+        title: null,
+        startedAt: h.now,
+        completedAt: null,
+        toolName: `tool-${ordinal}`,
+        input: null,
+        updatedAt: h.now,
+      }));
+      for (const item of items) yield* h.send({ type: "turn-item.updated", payload: item });
+      for (const index of [1, 0]) {
+        yield* TestClock.adjust("1 second");
+        items[index] = {
+          ...items[index]!,
+          status: "completed",
+          completedAt: yield* DateTime.now,
+          updatedAt: yield* DateTime.now,
+        };
+        yield* h.send({ type: "turn-item.updated", payload: items[index]! });
+      }
+      h.projectItems(items);
+      yield* TestClock.adjust("1 minute");
+      yield* h.guard.check();
+      assert.equal(h.stops[0]!.delegatedTaskStall?.lastProgressTool, "tool-1");
+      assert.equal(h.analytics[0]!.props?.lastProgressTool, "tool-1");
+      assert.equal(h.analytics[0]!.props?.silentSeconds, 60);
+    }),
+  );
+
+  it.effect.each(["post_tool", "first_event", "mid_turn"] as const)(
+    "%s recovers at most once and records each stall decision",
+    (phase) =>
+      Effect.gen(function* () {
+        const h = yield* makeHarness;
+        h.enableCodex();
+        yield* h.start(60_000);
+        if (phase === "post_tool") yield* h.item("dynamic_tool", "completed");
+        if (phase === "mid_turn") yield* h.item("reasoning");
+        yield* TestClock.adjust("1 minute");
+        yield* h.guard.check();
+        if (phase !== "mid_turn") {
+          assert.lengthOf(h.stops, 0);
+          assert.lengthOf(h.recoveries, 1);
+          assert.equal(h.recoveries[0]!.mode, "restart");
+          assert.equal(h.recoveries[0]!.modelSelection?.model, "gpt-6.1-sol");
+          assert.equal(
+            h.recoveries[0]!.text,
+            phase === "post_tool"
+              ? "Your last model request got no reply. Write your final report now from what you have."
+              : "Review this patch",
+          );
+          assert.equal(h.recoveries[0]!.delegatedTaskStallRecovery?.phase, phase);
+          yield* h.guard.check();
+          assert.lengthOf(h.analytics, 1);
+          yield* TestClock.adjust("1 minute");
+          yield* h.guard.check();
+          assert.lengthOf(h.recoveries, 1);
+        }
+        assert.lengthOf(h.stops, 1);
+        assert.deepEqual(
+          h.analytics.map((event) => event.props?.action),
+          phase === "mid_turn"
+            ? ["failed"]
+            : [phase === "post_tool" ? "resumed" : "restarted", "failed"],
+        );
+        assert.equal(h.analytics[0]!.props?.phase, phase);
+        assert.equal(h.analytics[0]!.props?.silentSeconds, 60);
+        assert.equal(h.analytics[0]!.props?.effort, "max");
+      }),
+  );
+
+  it.each(["post_tool", "first_event"] as const)(
+    "%s summary names the missing final report",
+    (phase) => {
+      const text = stalledSummary(
+        {
+          idleTimeoutMs: 900_000,
+          lastProgressAt: DateTime.makeUnsafe("2026-11-16T07:34:02Z"),
+          lastProgressKind: phase === "post_tool" ? "dynamic_tool_finished" : "run_started",
+          lastProgressTool: "t3-code.list_thread_pull_requests",
+          phase,
+        },
+        "Checking files",
+      );
+      assert.include(text, "stalled: no model output for 15 min after ");
+      assert.include(
+        text,
+        phase === "post_tool" ? "tool t3-code.list_thread_pull_requests" : "run start",
+      );
+      assert.include(text, "at 2026-11-16T07:34:02.000Z; no final report");
+      assert.include(text, "Checking files");
+    },
+  );
+
   it.effect.each(
     [
       { value: undefined, expected: 900_000 },

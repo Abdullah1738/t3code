@@ -42,7 +42,12 @@ import * as ServerSettings from "../serverSettings.ts";
 import { restartNoteText } from "../ardud/opencode-import/ChildSessions.ts";
 import { CodexHistoryNotSentError } from "../ardud/harness-migrate/CodexHistoryDeliveryError.ts";
 import * as KanbanStore from "../ardud/kanban/store/KanbanStore.ts";
-import { ownerReplyDiscussion, ownerReplyPending } from "../ardud/kanban/engine/ownerReplyWake.ts";
+import {
+  ownerReplyDiscussion,
+  ownerReplyPending,
+  postRecoveryIdentity,
+  postRecoveryPending,
+} from "../ardud/kanban/engine/ownerReplyWake.ts";
 // ardud: unconfirmed native history must not be replaced by a lossy handoff.
 import { isClaudeSeeded, seededUnconfirmed } from "../ardud/harness-migrate/seededGuard.ts";
 import { makeIsManagedWorktreePath } from "../worktreesDirectory.ts";
@@ -90,6 +95,7 @@ const isProviderTurnStartError = Schema.is(ProviderTurnStartError);
 const refusedBeforePrompt = (error: unknown): boolean =>
   Predicate.isTagged(error, "ClaudeBackgroundWorkBlocksQueryReplacementError") ||
   Predicate.isTagged(error, "ProviderAdapterRecoveryRefusedError") ||
+  (Predicate.hasProperty(error, "code") && error.code === "provider_prompt_not_sent") ||
   (Predicate.hasProperty(error, "cause") && refusedBeforePrompt(error.cause));
 
 const isProtocolError = Schema.is(ProviderAdapter.ProviderAdapterProtocolError);
@@ -374,6 +380,7 @@ export const layer: Layer.Layer<
         compact: boolean,
         error: ProviderAdapter.ProviderAdapterV2Error,
       ) => Effect.Effect<void, ProviderAdapter.ProviderAdapterV2Error>,
+      recovery?: NonNullable<ReturnType<typeof postRecoveryIdentity>>,
     ) => {
       const handlesResume = recoverResume !== undefined;
       let recover = recoverResume;
@@ -410,10 +417,36 @@ export const layer: Layer.Layer<
                         : Effect.succeed(true),
                   ),
                 ),
-          ).pipe(Effect.mapError(readFailure));
+          ).pipe(
+            Effect.flatMap((current) =>
+              !current || recovery === undefined || Option.isNone(kanban)
+                ? Effect.succeed(current)
+                : postRecoveryPending(kanban.value, recovery.discussionId, recovery.seq).pipe(
+                    Effect.flatMap((pending) =>
+                      pending
+                        ? Effect.succeed(true)
+                        : Effect.fail(
+                            new ProviderAdapter.ProviderAdapterTurnStartError({
+                              driver: liveSession.driver,
+                              threadId: turnInput.threadId,
+                              providerThreadId: turnInput.providerThread.id,
+                              runId: turnInput.runId,
+                              code: "provider_prompt_not_sent",
+                              cause: "Discussion post already handled",
+                            }),
+                          ),
+                    ),
+                  ),
+            ),
+            Effect.mapError(readFailure),
+          );
           // Handoff delivery and stale-turn Stop can await after outer admission.
           // Guard the first native offer and the one native retry at this boundary.
-          if (loadRecoveryAdmission !== undefined && !(yield* incomingIsCurrent)) return;
+          if (
+            (loadRecoveryAdmission !== undefined || recovery !== undefined) &&
+            !(yield* incomingIsCurrent)
+          )
+            return;
           const result = yield* Effect.result(start(turnInput));
           if (result._tag === "Success") return;
           if (handlesResume) {
@@ -727,6 +760,33 @@ export const layer: Layer.Layer<
           }).pipe(Effect.uninterruptible);
         },
       );
+      const recoveryPost = postRecoveryIdentity(run.userMessageId);
+      if (
+        run.userMessageId.startsWith("kanban:post-recovery:") &&
+        Option.isSome(kanban) &&
+        (recoveryPost === null ||
+          !(yield* postRecoveryPending(
+            kanban.value,
+            recoveryPost.discussionId,
+            recoveryPost.seq,
+          ).pipe(Effect.mapError((cause) => new ProviderTurnStartError({ runId, cause })))))
+      ) {
+        yield* settleRunBeforeStart({
+          signal: "stale-owner-reply",
+          status: "completed",
+          now: yield* DateTime.now,
+          providerInstanceId: run.providerInstanceId,
+          itemProviderThreadId: providerThread.id,
+          item: {
+            type: "command_execution",
+            title: "Discussion post already handled",
+            input: "",
+            output: "",
+            exitCode: 0,
+          },
+        });
+        return;
+      }
       const ownerDiscussion = Option.isSome(kanban)
         ? yield* ownerReplyDiscussion(kanban.value, run.userMessageId, message.text).pipe(
             Effect.mapError((cause) => new ProviderTurnStartError({ runId, cause })),
@@ -1045,6 +1105,8 @@ export const layer: Layer.Layer<
         isAutomaticClaudeRecovery(sessionResult.success.driver, run)
           ? runControls.loadRecoveryAdmission
           : undefined,
+        undefined,
+        recoveryPost ?? undefined,
       );
       if (!(yield* isCurrentAttemptInStatus("starting"))) return;
       const loadFromProvider = Effect.fn("ProviderTurnStartService.loadFromProvider")(function* (
@@ -1739,11 +1801,9 @@ export const layer: Layer.Layer<
       const {
         sameNativeThread,
         handoffUsage,
-        deliveredItemIds,
         acceptedAttempts,
         nativeInputRunIds,
         legacyInputRunIds,
-        budget,
       } = handoffContext;
       const retryHandoff = resumedRetryHandoff ?? (yield* prepareRetryHandoff(handoffContext));
       // ardud: the marker belongs to the adopted native id, not a later replacement.
@@ -1894,15 +1954,18 @@ export const layer: Layer.Layer<
       );
       const startWithHandoffs = Effect.fn("ProviderTurnStartService.startWithHandoffs")(
         function* (turnInput: Parameters<typeof session.startTurn>[0], compact = false) {
-          const contextForInput = handoffContextForThread(turnInput.providerThread);
+          // The prepared budget includes capacity reported while loading a fresh native thread.
+          const contextForInput =
+            turnInput.providerThread.nativeThreadRef?.nativeId ===
+            loadedProviderThread.nativeThreadRef?.nativeId
+              ? handoffContext
+              : handoffContextForThread(turnInput.providerThread);
           const delivery = yield* deliverContextHandoffs({
             handoffs: [...effectiveHandoffs, ...retryHandoff],
             deferInline: compact,
             providerThread: turnInput.providerThread,
-            budget: contextForInput.sameNativeThread ? budget : contextForInput.budget,
-            alreadyDeliveredItemIds: contextForInput.sameNativeThread
-              ? deliveredItemIds
-              : contextForInput.deliveredItemIds,
+            budget: contextForInput.budget,
+            alreadyDeliveredItemIds: contextForInput.deliveredItemIds,
             ...(session.injectHistory === undefined
               ? {}
               : {

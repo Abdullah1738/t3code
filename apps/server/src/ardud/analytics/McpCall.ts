@@ -1,12 +1,19 @@
+import { isReasonClass, kanbanReasonClass, schemaReason } from "./McpFailureReason.ts";
 import { interruptionProps } from "../../observability/analyticsInterruption.ts";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- Hashing the small retry key synchronously keeps ledger capture independent of runtime crypto services.
 import * as NodeCrypto from "node:crypto";
-import { McpDenyReason, OrchestratorMcpFailure, type AnalyticsEvent } from "@t3tools/contracts";
+import {
+  KanbanErrorCode,
+  McpDenyReason,
+  OrchestratorMcpFailure,
+  type AnalyticsEvent,
+} from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type * as Exit from "effect/Exit";
+import type * as SchemaIssue from "effect/SchemaIssue";
 import { McpSchema } from "effect/ai";
 
 type Phase = NonNullable<AnalyticsEvent["errorPhase"]>;
@@ -31,11 +38,26 @@ export class McpCall extends Context.Service<
     writePhases?: AnalyticsEvent["writePhases"];
     cardStage?: string;
     denyReason?: AnalyticsEvent["denyReason"];
+    reasonClass?: AnalyticsEvent["reasonClass"];
+    invalidField?: string;
+    refusedAt?: AnalyticsEvent["refusedAt"];
+    boardWrite?: boolean;
+    boardAdmitted?: boolean;
+    readOnly?: boolean;
+    inputKeys?: ReadonlySet<string>;
     replyPhases?: AnalyticsEvent["replyPhases"];
     resolveCallerContext?: (parentThreadId?: string) => void;
     delegation?: {
       readonly taskId: string;
       readonly readCommitted: Effect.Effect<boolean | "unknown">;
+    };
+    detachedAnalytics?: {
+      readonly tool: string;
+      readonly callerIdentity: string | undefined;
+      readonly callerThreadId: string | undefined;
+      readonly startedAt: string;
+      readonly build: string;
+      readonly bootId: string;
     };
     threadRead?: {
       readerWaitMs: number;
@@ -80,6 +102,7 @@ export class McpCall extends Context.Service<
     waitLookupMs?: number;
     phase: Phase;
     saved: boolean | "unknown";
+    dispatchFenceRecovered?: boolean;
     taskLookup?: TaskLookup;
     replyFailure?: "reply_timeout" | "reply_error";
     replyStage?: string;
@@ -100,12 +123,14 @@ const label = (value: unknown, max = 160): string | undefined =>
     : undefined;
 const isFailureCode = Schema.is(OrchestratorMcpFailure.fields.code);
 const isDenyReason = Schema.is(McpDenyReason);
+const isKanbanErrorCode = Schema.is(KanbanErrorCode);
 const BOARD_BUSY =
   /^(?:Missions board conflict: )?(?:Board busy: not written|Not saved \(board busy\))/;
 const TYPED_OUTCOMES = {
   TimeoutError: "timeout",
   ThreadReadTimeoutError: "timeout",
   PullRequestWatchTimeoutError: "timeout",
+  PullRequestWatchUnavailableError: "refused",
   PullRequestToolTimeoutError: "timeout",
   PreviewAutomationTimeoutError: "timeout",
   PreviewAutomationRecordingDeadlineExpiredError: "timeout",
@@ -139,6 +164,12 @@ function classifyFailure(error: Record<string, unknown>) {
   return undefined;
 }
 
+export function hashClientRequestId(clientRequestId: string, callerIdentity: string | undefined) {
+  return NodeCrypto.createHash("sha256")
+    .update(JSON.stringify([callerIdentity ?? "", clientRequestId]))
+    .digest("hex");
+}
+
 export function callIdentifiers(payload: unknown, callerIdentity: string | undefined) {
   const input = fields(payload);
   return {
@@ -148,13 +179,54 @@ export function callIdentifiers(payload: unknown, callerIdentity: string | undef
       : {}),
     ...(typeof input.clientRequestId === "string"
       ? {
-          clientRequestId: NodeCrypto.createHash("sha256")
-            .update(JSON.stringify([callerIdentity ?? "", input.clientRequestId]))
-            .digest("hex"),
+          clientRequestId: hashClientRequestId(input.clientRequestId, callerIdentity),
         }
       : {}),
   };
 }
+
+function failureMetadata(error: Record<string, unknown>, state: McpCall["Service"]) {
+  if (isReasonClass(error.reasonClass)) state.reasonClass = error.reasonClass;
+  else if (error._tag === "KanbanError" && isKanbanErrorCode(error.code))
+    state.reasonClass = kanbanReasonClass(
+      error.code,
+      typeof error.reason === "string" ? error.reason : undefined,
+    );
+  if (typeof error.invalidField === "string" && state.inputKeys?.has(error.invalidField))
+    state.invalidField = error.invalidField;
+}
+
+// Capture the first issue before MCP encodes parameter failures as InvalidParams.
+export const parameterFailure = Effect.fnUntraced(function* (issue: SchemaIssue.Issue) {
+  const call = yield* Effect.serviceOption(McpCall);
+  if (call._tag === "Some") {
+    failureMetadata(schemaReason(issue), call.value);
+    if (!call.value.readOnly && call.value.taskLookup === undefined && call.value.saved !== true)
+      call.value.saved = false;
+  }
+});
+
+export const writeAdmitted = Effect.fnUntraced(function* () {
+  const call = yield* Effect.serviceOption(McpCall);
+  if (call._tag === "Some" && call.value.boardWrite) {
+    call.value.boardAdmitted = true;
+    delete call.value.refusedAt;
+  }
+});
+
+export const writeCommitting = Effect.fnUntraced(function* () {
+  const call = yield* Effect.serviceOption(McpCall);
+  if (call._tag === "Some" && call.value.boardWrite && call.value.saved !== true)
+    call.value.saved = "unknown";
+});
+
+export const writeRefused = Effect.fnUntraced(function* (
+  stage: "pre_lock" | "in_write" | "post_write",
+) {
+  const call = yield* Effect.serviceOption(McpCall);
+  if (call._tag === "Some" && call.value.boardWrite && call.value.refusedAt === undefined)
+    call.value.refusedAt = call.value.saved === true ? "post_write" : stage;
+});
 
 // Resolution already happens in the tool; capture only its canonical metadata without another DB read.
 export const resolvedContext = Effect.fnUntraced(function* (context: {
@@ -196,7 +268,16 @@ export const failedPhase = Effect.fnUntraced(function* (phase: string) {
 // Dispatch owns the commit span; observing the receipt must not add per-event spans.
 export const setSaved = Effect.fnUntraced(function* (saved: boolean) {
   const call = yield* Effect.serviceOption(McpCall);
-  if (call._tag === "Some") call.value.saved = saved;
+  if (call._tag === "Some" && call.value.saved !== true) call.value.saved = saved;
+});
+
+// Recovery belongs to the enclosing delegateTask span, not another analytics span.
+export const dispatchFenceRecovered = Effect.gen(function* () {
+  const call = yield* Effect.serviceOption(McpCall);
+  if (call._tag === "Some") {
+    call.value.dispatchFenceRecovered = true;
+    call.value.phase = "result";
+  }
 });
 
 // readTask owns the lookup span; retain only categories in the call ledger.
@@ -243,6 +324,7 @@ export const handlerFailure = Effect.fnUntraced(function* <E>(cause: Cause.Cause
         ? [fields(reason.defect)]
         : [],
   )[0];
+  failureMetadata(error ?? {}, call.value);
   const classified = classifyFailure(error ?? {});
   if (
     (error?.code === "invalid_request" || String(error?.code).endsWith("_denied")) &&
@@ -262,10 +344,15 @@ export function callOutcome(
   if (exit._tag === "Failure" && Cause.hasInterruptsOnly(exit.cause))
     return {
       outcome: "interrupted",
-      saved: state.saved,
+      ...(state.readOnly && state.taskLookup === undefined
+        ? {}
+        : {
+            saved: state.boardWrite && state.saved === false ? ("unknown" as const) : state.saved,
+          }),
       errorPhase: state.phase,
       props: {
         ...taskLookup,
+        ...(state.dispatchFenceRecovered ? { dispatchFenceRecovered: true } : {}),
         code: "unknown",
         ...interruptionProps(exit.cause),
         ...(state.replySubSteps === undefined ? {} : { subSteps: state.replySubSteps }),
@@ -313,6 +400,18 @@ export function callOutcome(
     output?.isError === true ||
     (content._tag !== undefined && code !== undefined);
   if (failed || state.handlerErrorTag !== undefined || state.replyFailure !== undefined) {
+    failureMetadata(error, state);
+    if (state.replyFailure === "reply_timeout") state.reasonClass = "reply_timeout";
+    state.reasonClass ??=
+      state.replyFailure === "reply_timeout"
+        ? "reply_timeout"
+        : code === "board_busy"
+          ? "board_busy"
+          : code?.endsWith("_denied") || code === "parent_not_active"
+            ? "not_allowed"
+            : code?.endsWith("_not_found")
+              ? "not_found"
+              : "other";
     if (
       (error.code === "invalid_request" || String(error.code).endsWith("_denied")) &&
       isDenyReason(error.reason)
@@ -356,15 +455,23 @@ export function callOutcome(
       ? true
       : typeof content.saved === "boolean"
         ? content.saved
-        : inputRequired ||
-            code === "caller_unresolved" ||
-            code === "capability_denied" ||
-            code === "parent_not_active" ||
-            code === "PreviewAutomationUnavailableError" ||
-            code === "McpCapabilityUnavailableError" ||
-            busy
-          ? false
-          : state.saved;
+        : content.saved === null || content.saved === "unknown"
+          ? "unknown"
+          : inputRequired ||
+              code === "caller_unresolved" ||
+              code === "capability_denied" ||
+              code === "parent_not_active" ||
+              code === "PreviewAutomationUnavailableError" ||
+              code === "McpCapabilityUnavailableError" ||
+              busy
+            ? false
+            : state.saved;
+  if (state.boardWrite && (failed || timeout || state.replyFailure))
+    state.refusedAt =
+      saved === true
+        ? "post_write"
+        : (state.refusedAt ?? (state.boardAdmitted ? "in_write" : "pre_lock"));
+  else delete state.refusedAt;
   return {
     outcome: timeout
       ? "timeout"
@@ -373,9 +480,10 @@ export function callOutcome(
           ? "refused"
           : "error"
         : "ok",
-    saved,
+    ...(state.readOnly && state.taskLookup === undefined ? {} : { saved }),
     props: {
       ...taskLookup,
+      ...(state.dispatchFenceRecovered ? { dispatchFenceRecovered: true } : {}),
       ...(code === "task_not_found" && notFoundReason !== undefined ? { notFoundReason } : {}),
       ...(state.replyStage === undefined ? {} : { phase: state.replyStage }),
       ...(state.replySubSteps === undefined ? {} : { subSteps: state.replySubSteps }),

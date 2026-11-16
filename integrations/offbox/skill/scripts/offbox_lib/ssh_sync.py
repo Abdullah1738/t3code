@@ -204,7 +204,16 @@ def ssh_base(box_id: str, *, probe: bool = True) -> list[str]:
 
 
 def ssh(box_id: str, command: str, input: bytes | None = None, timeout: float = 120, check: bool = False):
-    p = subprocess.run(ssh_base(box_id) + [box_id, command], input=input, capture_output=True, timeout=timeout)
+    until = time.time() + timeout
+    with api.budget(timeout):
+        argv = ssh_base(box_id) + [box_id, command]
+        remaining = until - time.time()
+        left = api.left()
+        if left is not None:
+            remaining = min(remaining, left)
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(argv, timeout)
+        p = subprocess.run(argv, input=input, capture_output=True, timeout=remaining)
     if p.returncode == 255:
         check_host_key(box_id, p.stderr)
     if p.returncode == 255:

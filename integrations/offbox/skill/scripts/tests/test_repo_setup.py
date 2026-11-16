@@ -64,7 +64,7 @@ class RepoSetupTests(unittest.TestCase):
 
     def script(self, key=KEY):
         with patch.object(runs, 'REPO_RECIPES_DIR', self.recipes), \
-             patch.object(runs, 'DOCKER_REPAIR', ':'), patch.object(runs, 'LDCACHE_REPAIR', ':'), \
+             patch.object(runs, 'DOCKER_REPAIR', ':'), patch.multiple(runs, LDCACHE_REPAIR=':', SQLITE_SETUP=':'), \
              patch.object(runs, 'GO_REPAIR', 'echo GO_REPAIR'), patch.object(runs.userns, 'setup', return_value=':'):
             return runs.remote_script('w/repo', 'android', [], None, 'run-test', repo_key=key,
                                       steps=['echo USER_COMMAND; echo "$JAVA_HOME"; command -v gomobile'])

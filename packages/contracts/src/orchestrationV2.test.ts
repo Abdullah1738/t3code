@@ -51,6 +51,8 @@ import {
   OrchestrationV2TurnItemJson,
 } from "./orchestrationV2.ts";
 
+const encodeRunJson = Schema.encodeSync(OrchestrationV2RunJson);
+const decodeRunJson = Schema.decodeSync(OrchestrationV2RunJson);
 const now = DateTime.makeUnsafe("2026-04-20T00:00:00.000Z");
 function emptyThreadProjection() {
   return {
@@ -640,8 +642,27 @@ describe("orchestration V2 contracts", () => {
     }
     expect(event.payload.id).toBe(RunId.make("run-1"));
     expect(event.payload.cancelReason).toBeUndefined();
-    const legacy = Schema.encodeSync(OrchestrationV2RunJson)(event.payload);
-    expect(Schema.decodeSync(OrchestrationV2RunJson)(legacy).cancelReason).toBeUndefined();
+    const legacy = encodeRunJson(event.payload);
+    expect(decodeRunJson(legacy).cancelReason).toBeUndefined();
+    for (const phase of ["post_tool", "first_event"] as const) {
+      const run = {
+        ...event.payload,
+        delegatedTaskStallRecovery: {
+          phase,
+          lastProgressAt: DateTime.formatIso(now),
+          attemptId: RunAttemptId.make("attempt-1"),
+        },
+        delegatedTaskStall: {
+          idleTimeoutMs: 900_000,
+          lastProgressAt: now,
+          lastProgressKind: phase === "post_tool" ? "dynamic_tool_finished" : "run_started",
+          phase,
+          silentSeconds: 900,
+          lastProgressTool: "list_thread_pull_requests",
+        },
+      };
+      expect(decodeRunJson(encodeRunJson(run))).toEqual(run);
+    }
     for (const cancelReason of OrchestrationV2CancelReason.literals) {
       const run = {
         ...event.payload,
@@ -649,9 +670,7 @@ describe("orchestration V2 contracts", () => {
         cancelReason,
         cancelDetail: "Stopped before launch.",
       };
-      expect(
-        Schema.decodeSync(OrchestrationV2RunJson)(Schema.encodeSync(OrchestrationV2RunJson)(run)),
-      ).toEqual(run);
+      expect(decodeRunJson(encodeRunJson(run))).toEqual(run);
     }
     expect(() => Schema.decodeUnknownSync(OrchestrationV2CancelReason)("not_a_reason")).toThrow();
   });

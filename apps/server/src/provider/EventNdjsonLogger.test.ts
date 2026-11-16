@@ -54,6 +54,35 @@ function parseLogLine(line: string) {
 }
 
 it.layer(NodeServices.layer)("EventNdjsonLogger", (it) => {
+  it.effect("keeps children with a shared truncated prefix in different files", () =>
+    Effect.gen(function* () {
+      const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-provider-log-"));
+      try {
+        const basePath = NodePath.join(tempDir, "events.ndjson");
+        const logger = yield* makeEventNdjsonLogger(basePath, { stream: "native" });
+        assert.exists(logger);
+        if (!logger) return;
+        const prefix = `thread-delegated-task-${"session-".repeat(20)}`;
+        for (const suffix of ["review-a", "review-b"]) {
+          yield* logger.write({ child: suffix }, ThreadId.make(`${prefix}${suffix}`));
+        }
+        yield* logger.close();
+        const files = NodeFS.readdirSync(tempDir).filter((file) => file.endsWith(".log"));
+        assert.lengthOf(files, 2);
+        const contents = files.map((file) =>
+          NodeFS.readFileSync(NodePath.join(tempDir, file), "utf8"),
+        );
+        assert.equal(contents.filter((text) => text.includes("review-a")).length, 1);
+        assert.equal(contents.filter((text) => text.includes("review-b")).length, 1);
+        assert.isTrue(
+          contents.every((text) => !(text.includes("review-a") && text.includes("review-b"))),
+        );
+      } finally {
+        NodeFS.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }),
+  );
+
   it.effect("summarizes circular events without exposing their contents in diagnostics", () => {
     const messages: Array<unknown> = [];
     const logCapture = Logger.make<unknown, void>(({ message }) => {

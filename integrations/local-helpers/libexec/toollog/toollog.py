@@ -33,7 +33,8 @@ _FIELDS = {'harness', 'guard', 'decision', 'rule', 'firstWord', 'commandLength',
            'exitCode', 'failingStep', 'count', 'dryRun', 'toolCount', 'operation', 'status',
            'cwdClass', 'matchedRoot', 'argv0Class', 'repeatCount', 'threadIdSource',
            'method', 'toolName', 'load1', 'load5', 'load15', 'sampleRate',
-           'httpMethod', 'ttfbMs', 'reason', 'identity_source'}
+           'httpMethod', 'ttfbMs', 'reason', 'identity_source', 'driver', 'route', 'httpStatus',
+           'resolution', 'attempt', 'command', 'attempts', 'waitedMs'}
 _IDS = {'sessionId', 'threadId', 'nativeAgentId', 'cardNumber', 'serverId', 'home', 'sampleId'}
 _WORDS = set('git rg grep find ls cat cp mv rm python python3 node bun npm pnpm yarn vp go cargo rustc make docker offbox bash sh zsh curl sqlite3 terraform aws rcsim runcloud printf echo env sudo'.split())
 
@@ -659,7 +660,7 @@ def rollup(board, day, top_n=20):
         if board == 'orders':
             component = row.get('component')
             if not isinstance(component, str) or component not in {
-                    'commerce', 'order-watch', 'card_status', 'noon', 'careem',
+                    'commerce', 'order-watch', 'card_status', 'card-vault-fill', 'noon', 'careem',
                     'amazon', 'uber', 'toollog', 'money-cases'}:
                 component = 'unknown'
             component_totals[component] += weight

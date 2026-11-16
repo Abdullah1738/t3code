@@ -49,7 +49,7 @@ class PhoneLockTests(unittest.TestCase):
         for obj, name, value in [(lock, 'LOCK_DIR', self.root), (lock, 'HOLD', self.root/'priority-hold'),
                                   (lock, 'LEASE', self.root/'lease.json'), (ph, 'STATE', self.root/'events'),
                                   (ph, 'd', Mock(return_value=self.device)), (ph, '_d', None),
-                                  (lock, 'event_hook', ph.lock_event),
+                                  (lock, 'event_hook', ph.lock_event), (lock, '_lost_holds', set()),
                                   (ph, 'caller_chain', Mock(return_value=[dict(pid=123, comm='zsh', cwd_tail='projects/fixture')]))]:
             p = patch.object(obj, name, value)
             p.start(); self.addCleanup(p.stop)
@@ -74,6 +74,295 @@ class PhoneLockTests(unittest.TestCase):
 
     def claim(self, owner='holder', ttl='20m'):
         return lock.acquire(owner, 'qa', ttl)
+
+    def hold(self, age=0, pid=None, started=None):
+        (self.root/'priority-hold.owner.json').unlink(missing_ok=True)
+        lock.HOLD.write_text(HOLD_TOKEN)
+        stamp = lock.now().timestamp()-age
+        os.utime(lock.HOLD, (stamp, stamp))
+        if pid is not None:
+            (self.root/'priority-hold.owner.json').write_text(json.dumps(dict(
+                token_sha=lock.token_sha(HOLD_TOKEN), agent_pid=pid, agent_comm='claude',
+                hold_dev=lock.HOLD.stat().st_dev, hold_ino=lock.HOLD.stat().st_ino,
+                agent_started=started or 'fixture start', recorded_at=lock.now().isoformat())))
+
+    def test_dead_and_reused_holder_gate_archive_and_privacy(self):
+        for started in (False, 'reused start'):
+            with self.subTest(started=started):
+                self.hold(pid=99999999)
+                with patch.object(lock, 'process_started', return_value=started):
+                    code, out = self.cli('open', 'dev.example')
+                self.assertEqual(code, 0)
+                self.assertFalse(lock.HOLD.exists())
+                self.assertFalse((self.root/'priority-hold.owner.json').exists())
+                archives = list(self.root.glob('priority-hold.stale-*'))
+                self.assertTrue(archives)
+                self.assertTrue(all(p.read_text() == HOLD_TOKEN for p in archives))
+                rows = [r for r in self.events() if r['event']=='hold_archived']
+                self.assertEqual(rows[-1]['reason'], 'holder_exited')
+                self.assertEqual(rows[-1]['token_sha'], lock.token_sha(HOLD_TOKEN))
+                self.assertIn('caller_chain', rows[-1])
+                self.assertNotIn(HOLD_TOKEN, out+json.dumps(self.events()))
+
+    def test_holder_age_and_unknown_metadata_matrix(self):
+        for metadata in ('live', 'missing', 'mismatched', 'broken', 'probe_failed'):
+            for age, code in ((29*60, 5), (31*60, 0)):
+                with self.subTest(metadata=metadata, age=age):
+                    (self.root/'priority-hold.owner.json').unlink(missing_ok=True)
+                    self.hold(age, os.getpid() if metadata != 'missing' else None)
+                    if metadata=='mismatched':
+                        (self.root/'priority-hold.owner.json').write_text('{"token_sha":"other","agent_pid":99999999}')
+                    elif metadata=='broken':
+                        (self.root/'priority-hold.owner.json').write_text('not json')
+                    with patch.object(lock, 'process_started', return_value=None if metadata=='probe_failed' else 'fixture start'):
+                        result, out = self.cli('open', 'dev.example')
+                    self.assertEqual(result, code, out)
+                    if code==0:
+                        self.assertEqual([r for r in self.events() if r['event']=='hold_archived'][-1]['reason'], 'not_refreshed')
+                    self.assertNotIn(HOLD_TOKEN, out+json.dumps(self.events()))
+
+    def test_own_call_refreshes_at_most_once_per_minute_and_lazy_metadata(self):
+        self.hold(90)
+        os.environ['PHONE_HOLD_OWNER'] = HOLD_TOKEN
+        self.assertEqual(self.cli('help')[0], 0)
+        first = lock.HOLD.stat().st_mtime_ns
+        self.assertLess(abs(lock.HOLD.stat().st_mtime-lock.now().timestamp()), 2)
+        sidecar = self.root/'priority-hold.owner.json'
+        owner = json.loads(sidecar.read_text())
+        self.assertIsNone(owner['agent_pid'])
+        self.assertNotIn(HOLD_TOKEN, sidecar.read_text())
+        self.assertEqual(self.cli('open', 'dev.example')[0], 0)
+        self.assertEqual(lock.HOLD.stat().st_mtime_ns, first)
+        sidecar.write_text('{"token_sha":"wrong"}')
+        self.assertEqual(self.cli('hold', 'refresh')[0], 0)
+        self.assertEqual(json.loads(sidecar.read_text())['token_sha'], lock.token_sha(HOLD_TOKEN))
+
+    def test_hold_acquire_refresh_release_and_status(self):
+        self.hold(31*60)
+        self.assertEqual(self.cli('hold', 'acquire', '--token', HOLD_TOKEN)[0], 0)
+        self.assertEqual(self.cli('hold', 'acquire', '--token', 'other')[0], 5)
+        self.assertEqual(self.cli('hold', 'release')[0], 5)
+        self.assertEqual(self.cli('hold', 'refresh')[0], 5)
+        self.assertTrue(lock.HOLD.exists())
+        os.environ['PHONE_HOLD_OWNER'] = HOLD_TOKEN
+        self.assertEqual(self.cli('hold', 'refresh')[0], 0)
+        self.assertEqual(self.cli('hold', 'release')[0], 0)
+        self.assertFalse(lock.HOLD.exists())
+        self.assertFalse((self.root/'priority-hold.owner.json').exists())
+        self.hold(31*60)
+        code, out = self.cli('hold', 'status', '--json')
+        state = json.loads(out)
+        self.assertEqual(code, 0)
+        self.assertFalse(state['present'])
+        self.assertEqual(state['archived'], 'not_refreshed')
+        self.assertNotIn(HOLD_TOKEN, out+json.dumps(self.events()))
+
+    def test_hold_status_live_fields_and_lease_status_sweep(self):
+        self.hold(29*60, os.getpid())
+        with patch.object(lock, 'process_started', return_value='fixture start'):
+            state = json.loads(self.cli('hold', 'status', '--json')[1])
+        self.assertTrue(state['holder_alive'])
+        self.assertEqual(state['agent_comm'], 'claude')
+        self.assertAlmostEqual(state['stale_in_s'], 60, delta=2)
+        self.hold(31*60)
+        state = json.loads(self.cli('lease', 'status', '--json')[1])
+        self.assertFalse(state['hold_present'])
+        self.assertEqual(state['archived'], 'not_refreshed')
+
+    def test_hold_replace_or_refresh_at_rename_restores_and_refuses(self):
+        real_rename = os.rename
+        for change in ('replace', 'refresh', 'third_holder'):
+            with self.subTest(change=change):
+                self.hold(31*60)
+                def renamed(source, target):
+                    if change in ('replace', 'third_holder'):
+                        lock.HOLD.unlink()
+                        lock.HOLD.write_text('successor token')
+                    else:
+                        os.utime(lock.HOLD, None)
+                    real_rename(source, target)
+                    if change=='third_holder': lock.HOLD.write_text('third token')
+                with patch.object(lock.os, 'rename', side_effect=renamed):
+                    self.assertEqual(self.cli('open', 'dev.example')[0], 5)
+                self.assertEqual(lock.HOLD.read_text(), 'third token' if change=='third_holder' else
+                                 'successor token' if change=='replace' else HOLD_TOKEN)
+        self.device.app_start.assert_not_called()
+        self.assertFalse(any(r['event']=='hold_archived' for r in self.events()))
+
+    def test_metadata_nearest_agent_and_start_probe(self):
+        for chain, expected in ((['claude','codex'], 'claude'), (['codex','claude'], 'codex'),
+                                (['opencode','codex'], 'opencode'), (['zsh'], None)):
+            with self.subTest(chain=chain):
+                rows = [dict(pid=100+i, comm=c, cwd_tail=None) for i,c in enumerate(chain)]
+                with patch.object(ph, 'caller_chain', return_value=rows), patch.object(lock, 'process_started', return_value=' raw start '):
+                    owner = lock.holder_metadata(HOLD_TOKEN)
+                self.assertEqual(owner['agent_comm'], expected)
+                self.assertEqual(owner['agent_pid'], 100 if expected in ('claude','codex') else None)
+                self.assertNotIn(HOLD_TOKEN, json.dumps(owner))
+        for result, expected in ((Mock(returncode=0, stdout=' raw start \n'), ' raw start '),
+                                 (Mock(returncode=1, stdout=''), False), (Mock(returncode=2, stdout=''), None)):
+            with patch.object(lock.subprocess, 'run', return_value=result):
+                self.assertEqual(lock.process_started(os.getpid()), expected)
+
+    def test_process_alive_tristate_and_library_hold_lifecycle(self):
+        for result, expected in [('fixture start',True), ('reused',False), (False,False), (None,None)]:
+            with self.subTest(result=result), patch.object(lock, 'process_started', return_value=result):
+                self.assertIs(lock.process_alive(os.getpid(), 'fixture start'), expected)
+        for pid, started in [(None,'start'), (True,'start'), (0,'start'), (123,None), (123,'')]:
+            self.assertIsNone(lock.process_alive(pid,started))
+        with patch.object(lock, 'process_started', return_value='runner start'), patch.object(ph, 'process_comm', return_value='Python'):
+            lock.hold_acquire(HOLD_TOKEN, holder_pid=os.getpid())
+            owner=json.loads((self.root/'priority-hold.owner.json').read_text())
+            self.assertEqual((owner['agent_pid'],owner['agent_started']), (os.getpid(),'runner start'))
+            state=lock.hold_status()
+            self.assertTrue(state['holder_alive'])
+            self.assertEqual(state['agent_comm'],'Python')
+        with self.assertRaises(lock.Busy): lock.hold_release('foreign')
+        self.assertTrue(lock.HOLD.exists())
+        lock.hold_release(HOLD_TOKEN)
+        self.assertFalse(lock.HOLD.exists())
+        self.assertFalse((self.root/'priority-hold.owner.json').exists())
+
+    def test_staleness_override_duration_forms(self):
+        for value, seconds in [('30m',1800), ('1800',1800), ('1800s',1800), ('0.5h',1800), ('0.1s',0.1)]:
+            with self.subTest(value=value), patch.dict(os.environ, PH_HOLD_STALE_AFTER=value):
+                self.assertEqual(lock.hold_stale_after(), seconds)
+                self.hold(seconds+1)
+                self.assertFalse(lock.hold_state()[0])
+        for value in ('0', '-1', 'NaN', '30minutes', ''):
+            with self.subTest(value=value), patch.dict(os.environ, PH_HOLD_STALE_AFTER=value):
+                with self.assertRaises(ValueError): lock.hold_stale_after()
+
+    def test_empty_and_whitespace_holds_expire_but_fresh_stays_busy(self):
+        for contents in ('', '\n', '  \t'):
+            for age, expected in ((29*60,5), (31*60,0)):
+                with self.subTest(contents=contents,age=age):
+                    self.hold(age)
+                    lock.HOLD.write_text(contents)
+                    stamp=lock.now().timestamp()-age
+                    os.utime(lock.HOLD,(stamp,stamp))
+                    self.assertEqual(self.cli('open','dev.fixture')[0],expected)
+
+    def test_previous_hold_metadata_cannot_reap_reused_token(self):
+        self.hold(pid=99999999)
+        os.rename(lock.HOLD,self.root/'previous-hold')
+        lock.HOLD.write_text(HOLD_TOKEN)
+        with patch.object(lock,'process_started',return_value=False) as probe:
+            self.assertEqual(self.cli('open','dev.fixture')[0],5)
+        probe.assert_not_called()
+        self.assertTrue(lock.HOLD.exists())
+        self.assertFalse(list(self.root.glob('priority-hold.stale-*')))
+
+    def test_own_expired_hold_stops_device_command_before_reacquire(self):
+        for age, pid in ((31*60,None),(0,99999999)):
+            with self.subTest(age=age,pid=pid):
+                self.hold(age,pid)
+                with patch.dict(os.environ,PHONE_HOLD_OWNER=HOLD_TOKEN), patch.object(lock,'process_started',return_value=False):
+                    code,out=self.cli('open','dev.fixture')
+                self.assertEqual(code,5,out)
+                self.assertIn('acquire it again',out)
+                self.assertFalse(lock.HOLD.exists())
+                self.assertEqual(self.events()[-1]['reason'],'hold')
+        self.device.app_start.assert_not_called()
+
+    def test_sidecar_write_failures_do_not_lose_owned_hold(self):
+        import errno
+        for failure in (errno.ENOSPC,errno.EACCES):
+            with self.subTest(failure=failure), patch.object(lock,'write_holder',side_effect=OSError(failure,'fixture')):
+                lock.HOLD.unlink(missing_ok=True)
+                self.assertEqual(self.cli('hold','acquire','--token',HOLD_TOKEN)[0],0)
+                with patch.dict(os.environ,PHONE_HOLD_OWNER=HOLD_TOKEN):
+                    self.assertEqual(self.cli('open','dev.fixture')[0],0)
+                    self.assertEqual(self.cli('hold','release')[0],0)
+                self.assertFalse(lock.HOLD.exists())
+
+    def test_invalid_staleness_override_uses_default_without_breaking_release(self):
+        for value in ('0','-1','NaN','30minutes',''):
+            with self.subTest(value=value), patch.dict(os.environ,PH_HOLD_STALE_AFTER=value):
+                self.hold(29*60)
+                self.assertEqual(self.cli('help')[0],0)
+                self.assertEqual(self.cli('open','dev.fixture')[0],5)
+                self.hold(31*60)
+                self.assertEqual(self.cli('hold','status','--json')[0],0)
+                self.claim()
+                self.hold()
+                self.assertEqual(self.cli('lease','release','--owner','holder')[0],0)
+                self.assertFalse(lock.LEASE.exists())
+
+    def test_successful_release_keeps_unreadable_successor(self):
+        self.hold()
+        original=Path.unlink
+        def replace_after_unlink(path,*args,**kwargs):
+            result=original(path,*args,**kwargs)
+            if path==lock.HOLD: path.write_bytes(b'\xff')
+            return result
+        with patch.object(Path,'unlink',replace_after_unlink):
+            lock.hold_release(HOLD_TOKEN)
+        self.assertEqual(lock.HOLD.read_bytes(),b'\xff')
+
+    def test_lazy_metadata_replacement_does_not_grant_successor_access(self):
+        self.hold()
+        def replace(*_args):
+            lock.HOLD.unlink()
+            lock.HOLD.write_text('successor')
+        with patch.dict(os.environ,PHONE_HOLD_OWNER=HOLD_TOKEN), patch.object(lock,'write_holder',side_effect=replace):
+            self.assertEqual(self.cli('open','dev.fixture')[0],5)
+        self.assertEqual(lock.HOLD.read_text(),'successor')
+        self.device.app_start.assert_not_called()
+
+    def test_bad_library_holder_pid_leaves_no_hold(self):
+        for pid in (0,-1,True,False,'123',1.5):
+            with self.subTest(pid=pid):
+                with self.assertRaises(ValueError): lock.hold_acquire(HOLD_TOKEN,holder_pid=pid)
+                self.assertFalse(lock.HOLD.exists())
+                self.assertFalse((self.root/'priority-hold.owner.json').exists())
+
+    def test_broken_metadata_lock_keeps_diagnostics_and_gate_usable(self):
+        for failure in (FileExistsError,PermissionError,NotADirectoryError):
+            with self.subTest(failure=failure), patch.object(lock,'metadata_lock',side_effect=failure):
+                for args in [('help',),('log',),('ui',)]:
+                    self.assertEqual(self.cli(*args)[0],0)
+                code,out=self.cli('open','dev.fixture')
+                self.assertEqual(code,5,out)
+                self.assertIn('lease metadata unavailable',out)
+        self.device.app_start.assert_not_called()
+
+    def test_event_path_sweep_keeps_lost_hold_until_reacquired(self):
+        for sweep in (lambda: lock.status(), lambda: ph.lock_event('fixture')):
+            with self.subTest(sweep=sweep), patch.dict(os.environ,PHONE_HOLD_OWNER=HOLD_TOKEN):
+                self.hold(pid=99999999)
+                with patch.object(lock,'process_started',return_value=False): sweep()
+                self.assertFalse(lock.HOLD.exists())
+                self.assertEqual(self.cli('open','dev.fixture')[0],5)
+                self.assertEqual(self.cli('open','dev.fixture')[0],5)
+                self.assertNotIn(HOLD_TOKEN,str(lock._lost_holds))
+                lock.hold_acquire(HOLD_TOKEN)
+                self.assertEqual(self.cli('open','dev.fixture')[0],0)
+
+    def test_hold_discovered_dead_in_action_status_refuses_send(self):
+        self.hold(pid=99999999)
+        with patch.dict(os.environ,PHONE_HOLD_OWNER=HOLD_TOKEN), patch.object(lock,'process_started',side_effect=['fixture start',False]):
+            code,out=self.cli('open','dev.fixture')
+        self.assertEqual(code,5,out)
+        self.assertIn('acquire it again',out)
+        self.device.app_start.assert_not_called()
+
+    def test_refresh_of_absent_or_expired_hold_requests_reacquire(self):
+        with patch.dict(os.environ,PHONE_HOLD_OWNER=HOLD_TOKEN):
+            for age in (None,31*60):
+                with self.subTest(age=age):
+                    if age is not None: self.hold(age)
+                    code,out=self.cli('hold','refresh')
+                    self.assertEqual(code,5,out)
+                    self.assertIn('acquire it again',out)
+                    self.assertFalse(lock.HOLD.exists())
+
+    def test_invalid_hold_arguments_never_echo_tokens(self):
+        for args in [('acquire', '--token', HOLD_TOKEN, 'extra'), ('status', HOLD_TOKEN),
+                     (HOLD_TOKEN,), ('acquire', '--token='+HOLD_TOKEN, '--bad')]:
+            code, out = self.cli('hold', *args)
+            self.assertEqual(code, 2)
+            self.assertNotIn(HOLD_TOKEN, out+json.dumps(self.events()))
 
     def test_exclusive_and_nonowner_release(self):
         self.claim()
@@ -478,6 +767,76 @@ class LeaseRunTests(unittest.TestCase):
     def command(self, code):
         return [sys.executable, '-I', self.script, 'lease', 'run', '--owner', 'runner', '--purpose', 'qa',
                 '--ttl', '2s', '--', sys.executable, '-I', '-c', code]
+
+    def test_real_cli_with_lock_dir_pointing_to_file(self):
+        script=str(Path(__file__).with_name('ph.py'))
+        blocked=self.root/'not-a-directory'
+        blocked.touch()
+        env={**self.env,'PH_LOCK_DIR':str(blocked),'HOME':str(self.root)}
+        for args,expected in [(['help'],0),(['log'],0),(['open','dev.fixture'],5),(['hold','status','--json'],0)]:
+            with self.subTest(args=args):
+                result=subprocess.run([sys.executable,'-I',script,*args],env=env,cwd=self.root,
+                                      capture_output=True,text=True,timeout=10)
+                self.assertEqual(result.returncode,expected,result.stdout+result.stderr)
+                self.assertNotIn('Traceback',result.stderr)
+
+    def test_real_cli_archive_and_refusal_keep_context(self):
+        script=str(Path(__file__).with_name('ph.py'))
+        env={**self.env,'HOME':str(self.root)}
+        hold=self.root/'priority-hold'
+        hold.write_text(HOLD_TOKEN)
+        stamp=time.time()-31*60
+        os.utime(hold,(stamp,stamp))
+        result=subprocess.run([sys.executable,'-I',script,'hold','status','--json'],env=env,cwd=self.root,
+                              capture_output=True,text=True,timeout=10)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(result.stdout)['archived'],'not_refreshed')
+        hold.write_text(HOLD_TOKEN)
+        result=subprocess.run([sys.executable,'-I',script,'hold','release'],env=env,cwd=self.root,
+                              capture_output=True,text=True,timeout=10)
+        self.assertEqual(result.returncode,5,result.stdout+result.stderr)
+        rows=[json.loads(line) for line in (self.root/'.local/state/ph/events.jsonl').read_text().splitlines()]
+        self.assertEqual(rows[0]['cmd'],'hold')
+        self.assertEqual((rows[-1]['event'],rows[-1]['reason']),('busy_refused','hold'))
+        self.assertNotIn(HOLD_TOKEN,json.dumps(rows)+result.stdout+result.stderr)
+
+    def test_process_start_identity_is_independent_of_timezone_and_locale(self):
+        expected=lock.process_started(os.getpid())
+        bootstrap=('import sys; sys.path.insert(0,'+repr(str(Path(__file__).resolve().parent))+'); '
+                   'import phonelock; print(phonelock.process_started(int(sys.argv[1])))')
+        for tz,locale in [('UTC0','C'),('Asia/Dubai','C'),('America/New_York','en_US.UTF-8'),('Asia/Tokyo','de_DE.UTF-8')]:
+            with self.subTest(tz=tz,locale=locale):
+                result=subprocess.run([sys.executable,'-I','-c',bootstrap,str(os.getpid())],
+                                      env={**self.env,'TZ':tz,'LC_ALL':locale},capture_output=True,text=True,timeout=10)
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertEqual(result.stdout.rstrip('\n'),expected)
+
+    def test_real_pid_liveness_and_stale_status_subprocess(self):
+        hold = self.root/'priority-hold'
+        sidecar = self.root/'priority-hold.owner.json'
+        started = lock.process_started(os.getpid())
+        bootstrap = ('import sys; sys.path.insert(0,'+repr(str(Path(__file__).resolve().parent))+'); '
+                     'from unittest.mock import Mock; from pathlib import Path; import ph; ph.STATE=Path('+repr(str(self.root/'events'))+'); ph.d=Mock(return_value=Mock()); '
+                     'sys.exit(ph.run(["open","dev.fixture"]))')
+        for pid, start, age, code, reason in ((os.getpid(),started,29*60,5,None),
+                                             (os.getpid(),started,31*60,0,'not_refreshed'),
+                                             (os.getpid(),'reused',0,0,'holder_exited'),
+                                             (99999999,started,0,0,'holder_exited')):
+            with self.subTest(pid=pid, age=age, start_matches=start==started):
+                hold.write_text(HOLD_TOKEN)
+                stamp=time.time()-age
+                os.utime(hold,(stamp,stamp))
+                sidecar.write_text(json.dumps(dict(token_sha=lock.token_sha(HOLD_TOKEN),agent_pid=pid,
+                                                  agent_started=start,agent_comm='codex',hold_dev=hold.stat().st_dev,hold_ino=hold.stat().st_ino)))
+                result=subprocess.run([sys.executable,'-I','-c',bootstrap],env=self.env,cwd=self.root,
+                                      capture_output=True,text=True,timeout=10)
+                self.assertEqual(result.returncode,code,result.stdout+result.stderr)
+                self.assertNotIn(HOLD_TOKEN,result.stdout+result.stderr)
+                if reason:
+                    self.assertFalse(hold.exists())
+                    rows=[json.loads(x) for x in (self.root/'events'/'events.jsonl').read_text().splitlines()]
+                    self.assertEqual([r for r in rows if r['event']=='hold_archived'][-1]['reason'],reason)
+                    self.assertNotIn(HOLD_TOKEN,json.dumps(rows))
 
     def test_child_environment_and_normal_nonzero_release(self):
         for code in [0, 7]:

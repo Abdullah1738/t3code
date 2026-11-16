@@ -2307,10 +2307,13 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
                 event.data.error.type === "provider.rate-limit"
                   ? "usage_limit"
                   : "provider_error",
+              // OpenCode uses provider.no-route for missing models and invalid variants alike.
               ...(event.data.error.type === "provider.quota" ||
               event.data.error.type === "provider.rate-limit"
                 ? { category: "quota" as const }
-                : {}),
+                : event.data.error.message.startsWith("Model unavailable: ")
+                  ? { category: "transient" as const }
+                  : {}),
             }),
           });
         default:
@@ -3621,7 +3624,12 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       state: ThreadState,
       turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
     ) {
-      const mcpSession = yield* mcpSessions.read(turnInput.threadId);
+      const mcpSession = yield* McpProviderSessions.readForRuntime(
+        mcpSessions,
+        turnInput.threadId,
+        input.providerSessionId,
+        OPENCODE_PROVIDER,
+      );
       // state.directory follows session.moved, so the server goes where the agent moved the session.
       const directory = state.directory;
       const name = yield* mcpServerNameFor(turnInput.threadId);

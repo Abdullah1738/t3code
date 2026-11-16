@@ -1,3 +1,4 @@
+import * as ClaudeTurnStartup from "../../ardud/providers/ClaudeTurnStartup.ts";
 import * as ClaudeApiErrorTranscript from "./ClaudeApiErrorTranscript.ts";
 import * as ProviderStartProgress from "../../ardud/orchestration/ProviderStartProgress.ts";
 import { nativeOutputAcknowledgesStart } from "../providerStartDeadlinePolicy.ts";
@@ -145,6 +146,7 @@ import {
   type CompiledClaudeModelSelection,
 } from "../../claudeModelOptions.ts";
 import * as ServerConfig from "../../config.ts";
+import * as ProviderProcessRegistry from "../../ardud/providers/ProviderProcessRegistry.ts";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
 import { spawnAndCollect } from "@t3tools/provider-core/server/snapshotProbe";
 import { signalProcessGroup } from "@t3tools/provider-core/server/processGroup";
@@ -326,7 +328,12 @@ const WORKFLOW_MEMBER_TRANSCRIPT_FLUSH_MS = 500;
  * reads (#3089). Those stay in the CLI's group, so the rest of the group gets SIGKILL once the
  * CLI exits for any reason.
  */
-function spawnClaudeProcessGroup(options: ClaudeSpawnOptions): ClaudeSpawnedProcess {
+function spawnClaudeProcessGroup(
+  options: ClaudeSpawnOptions,
+  registry: ProviderProcessRegistry.ProviderProcessRegistry["Service"],
+  threadId: string,
+  providerCommandLine: string,
+): ClaudeSpawnedProcess {
   const child = NodeChildProcess.spawn(options.command, options.args, {
     cwd: options.cwd,
     env: options.env,
@@ -334,11 +341,21 @@ function spawnClaudeProcessGroup(options: ClaudeSpawnOptions): ClaudeSpawnedProc
     stdio: ["pipe", "pipe", "ignore"],
     detached: true,
   });
+  let untrack = () => {};
   child.once("exit", () => {
+    untrack();
     try {
       signalProcessGroup(child.pid ?? 0, "SIGKILL");
     } catch {}
   });
+  if (child.pid !== undefined) {
+    try {
+      untrack = registry.track(child.pid, "claudeAgent", threadId, providerCommandLine);
+    } catch (error) {
+      signalProcessGroup(child.pid, "SIGKILL");
+      throw error;
+    }
+  }
   return child;
 }
 
@@ -489,6 +506,7 @@ export type ClaudeAgentSdkQueryOptions = Omit<
 export interface ClaudeAgentSdkQueryOpenInput {
   readonly options: ClaudeAgentSdkQueryOptions;
   readonly onMcpStatus?: (status: McpRegistrationStatus) => Effect.Effect<void>;
+  readonly measureStartup?: ClaudeTurnStartup.StartupAttempt["stage"];
   readonly threadId: ThreadId;
   readonly providerSessionId: OrchestrationV2ProviderSession["id"];
 }
@@ -576,10 +594,6 @@ export interface ClaudeAgentSdkSubagentLookupInput {
 // The CLI can stop answering control requests while still running tools. Close it
 // after this bound so orchestration can safely end the run and accept another.
 const CLAUDE_INTERRUPT_SETTLE_TIMEOUT = "10 seconds";
-
-// Stop waits for admission to release its lock. Native preparation requests
-// must not hold it forever before a turn exists for Stop to interrupt.
-const CLAUDE_TURN_PREPARATION_TIMEOUT = "15 seconds";
 
 class ClaudeSkillCacheKey extends Data.Class<{
   readonly configDir: string;
@@ -900,6 +914,7 @@ export const layerQueryRunner: Layer.Layer<
   | Crypto.Crypto
   | Path.Path
   | ProviderEventLoggers.ProviderEventLoggers
+  | ProviderProcessRegistry.ProviderProcessRegistry
 > = Layer.effect(
   ClaudeAgentSdkQueryRunner,
   Effect.gen(function* () {
@@ -909,6 +924,7 @@ export const layerQueryRunner: Layer.Layer<
     const { native: nativeEventLogger } = yield* ProviderEventLoggers.ProviderEventLoggers;
     const agentScope = yield* AgentScope;
     const platform = yield* HostProcess.Platform;
+    const processRegistry = yield* ProviderProcessRegistry.ProviderProcessRegistry;
 
     return ClaudeAgentSdkQueryRunner.of({
       allocateSessionId: crypto
@@ -970,7 +986,19 @@ export const layerQueryRunner: Layer.Layer<
         // Windows has no process groups, so there the SDK spawns the CLI itself.
         const spawnClaudeCodeProcess =
           options.spawnClaudeCodeProcess ??
-          (platform === "win32" ? undefined : spawnClaudeProcessGroup);
+          (platform === "win32"
+            ? undefined
+            : (options: ClaudeSpawnOptions) =>
+                spawnClaudeProcessGroup(
+                  options,
+                  processRegistry,
+                  input.threadId,
+                  [
+                    // wrap receives no arguments, so its last argument is the resolved CLI.
+                    launch === undefined ? options.command : (launch.args.at(-1) ?? launch.command),
+                    ...options.args.slice(launch === undefined ? 0 : launch.args.length),
+                  ].join(" "),
+                ));
         const queryRuntime = yield* Effect.uninterruptibleMask((restore) =>
           Effect.try({
             try: () =>
@@ -1035,7 +1063,10 @@ export const layerQueryRunner: Layer.Layer<
                         if (input.onMcpStatus) yield* input.onMcpStatus(status);
                       }),
                     });
-                    yield* registration.attempt;
+                    yield* (
+                      input.measureStartup?.("mcp_registration", registration.attempt) ??
+                        registration.attempt
+                    );
                   }
                   yield* logProtocolEvent({
                     direction: "outgoing",
@@ -1518,6 +1549,7 @@ export const CLAUDE_T3_MCP_TOOL_WILDCARD = "mcp__t3-code__*";
 // ClaudeAdapterV2.test.ts cross-checks this list against the toolkit.
 export const CLAUDE_READ_ONLY_T3_MCP_ALLOWED_TOOLS: ReadonlyArray<string> = [
   "mcp__t3-code__orchestrator_capabilities",
+  "mcp__t3-code__t3_exec_sessions",
   "mcp__t3-code__list_scheduled_tasks",
   "mcp__t3-code__t3_thread_list",
   "mcp__t3-code__t3_thread_wait",
@@ -3566,6 +3598,14 @@ interface ActiveClaudeTurnContext {
   latestApiFailureCategory: OrchestrationV2ProviderFailureCategory | undefined;
   /** The CLI refused this turn with no fallback model (model_refusal_no_fallback): a content filter, not a usage limit. */
   refusalMessage: string | undefined;
+  refusalFallback:
+    | {
+        readonly notice: string;
+        readonly originalModel: string;
+        readonly fallbackModel: string;
+        readonly category: string | null;
+      }
+    | undefined;
   readonly rejectedRateLimitTypes: Set<string>;
   readonly rateLimitResetTimes: Map<string, string | null>;
   latestAssistantRateLimit: {
@@ -4154,6 +4194,14 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           });
         const sdkMessageLock = yield* Semaphore.make(1);
         const turnControlLock = yield* Semaphore.make(1);
+        const startingTurns = new Map<
+          ProviderAdapter.ProviderAdapterV2TurnInput["attemptId"],
+          {
+            readonly runId: RunId;
+            readonly providerThreadId: ProviderThreadId;
+            stopped: boolean;
+          }
+        >();
         // Survives turn settle: members mostly finish after the launching
         // turn has ended, and each transition must be emitted exactly once.
         const workflowMemberStates = yield* Ref.make(
@@ -8406,6 +8454,17 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             (message.subtype === "model_refusal_fallback" ||
               (message.subtype === "informational" && message.level !== "info"))
           ) {
+            if (message.subtype === "model_refusal_fallback") {
+              context.refusalFallback = {
+                notice: message.content,
+                originalModel: message.original_model,
+                fallbackModel: message.fallback_model,
+                category:
+                  message.api_refusal_category ??
+                  /Details:\s*`?\[([^\]]+)\]/i.exec(message.content)?.[1] ??
+                  null,
+              };
+            }
             const now = yield* DateTime.now;
             const nativeItemId = message.uuid;
             context.assistant.noticeTexts.add(message.content);
@@ -9335,7 +9394,14 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                       code: "model_refusal",
                       category: "content_filter",
                     })
-                  : failureWithRetryCause;
+                  : context.refusalFallback !== undefined && turnFailure !== null
+                    ? makeProviderFailure({
+                        class: "provider_error",
+                        code: "model_refusal",
+                        category: "content_filter",
+                        message: `${context.refusalFallback.originalModel} safeguards flagged this session${context.refusalFallback.category === null ? "" : ` [${context.refusalFallback.category}]`}; the fallback model ${context.refusalFallback.fallbackModel} failed (${failureWithRetryCause?.message ?? turnFailure.message}).`,
+                      })
+                    : failureWithRetryCause;
             const currentStatus = message.subtype === "success" ? message.api_error_status : null;
             // SDK delivery can lag transcript writes. Conflicting channels cannot
             // establish which native error happened last, so they never authorize replay.
@@ -10040,9 +10106,15 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         const openQuery = Effect.fnUntraced(function* (
           turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
           nativeThreadId: string,
+          startup: ClaudeTurnStartup.StartupAttempt,
         ) {
           const queryPolicy = claudeRuntimeQueryPolicyForRuntimePolicy(turnInput.runtimePolicy);
-          const mcpSession = yield* mcpSessions.read(turnInput.threadId);
+          const mcpSession = yield* McpProviderSessions.readForRuntime(
+            mcpSessions,
+            turnInput.threadId,
+            input.providerSessionId,
+            CLAUDE_PROVIDER,
+          );
           const recallUrl = adapterOptions.environment.ROBOB_RECALL_MCP_URL?.trim();
           const mcpOverrides = claudeMcpQueryOverrides({
             mcpSession,
@@ -10136,8 +10208,15 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           const hasPersistedProviderTurn =
             isClaudeSeeded(turnInput.providerThread) ||
             (turnInput.nativeThreadHasTurns ?? turnInput.providerTurnOrdinal > 1);
+          // The CLI may save a turn after the server dies, before Robob records it.
           const shouldResume =
-            resumeSessionAt !== undefined || openedWithResume || hasPersistedProviderTurn;
+            resumeSessionAt !== undefined ||
+            openedWithResume ||
+            hasPersistedProviderTurn ||
+            (yield* findClaudeTranscriptPaths(nativeThreadId).pipe(
+              Effect.map((paths) => paths.length > 0),
+              Effect.orElseSucceed(() => false),
+            ));
           const queryOptions = makeClaudeQueryOptions({
             modelSelection: turnInput.modelSelection,
             nativeThreadId,
@@ -10170,6 +10249,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               threadId: turnInput.threadId,
               providerSessionId: input.providerSessionId,
               options: queryOptions,
+              measureStartup: startup.stage,
               onMcpStatus: Effect.fn("ClaudeAdapterV2.mcpStatus")(function* (
                 status: McpRegistrationStatus,
               ) {
@@ -10312,161 +10392,169 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             },
           });
 
-        const startTurn = Effect.fn("ClaudeAdapterV2.startTurn")(
-          function* (turnInput: ProviderAdapter.ProviderAdapterV2TurnInput) {
-            const startedAt = yield* DateTime.now;
-            const nativeThreadId = yield* getNativeThreadId(turnInput.providerThread);
-            const progressAttempt = {
+        const prepareTurn = Effect.fn("ClaudeAdapterV2.prepareTurn")(function* (
+          turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
+          startup: ClaudeTurnStartup.StartupAttempt,
+        ) {
+          const startedAt = yield* DateTime.now;
+          const nativeThreadId = yield* getNativeThreadId(turnInput.providerThread);
+          const progressAttempt = {
+            threadId: turnInput.threadId,
+            runId: turnInput.runId,
+            attemptId: turnInput.attemptId,
+          };
+          if (Option.isSome(startProgress))
+            yield* startProgress.value.step(progressAttempt, "turn_preparation", nativeThreadId);
+          const nativeTurnId = `turn:${turnInput.attemptId}`;
+          // Fresh for every offer: Claude acks a prompt whose uuid its
+          // transcript already holds without running a turn, and a session
+          // can outlive this database (or be resumed from a copy of it), so
+          // a uuid derived from run ids can repeat.
+          const promptUuid = isClaudeProviderContinuationTurn(turnInput)
+            ? null
+            : yield* crypto.randomUUIDv4().pipe(
+                Effect.filterOrFail(isClaudePromptUuid),
+                Effect.mapError(
+                  (cause) =>
+                    new ProviderAdapter.ProviderAdapterProtocolError({
+                      driver: CLAUDE_PROVIDER,
+                      detail: "Failed to allocate a Claude prompt uuid.",
+                      payload: cause,
+                    }),
+                ),
+              );
+          const providerTurnId = idAllocator.derive.providerTurn({
+            driver: CLAUDE_PROVIDER,
+            nativeTurnId,
+          });
+          const providerTurnOrdinal = turnInput.providerTurnOrdinal;
+          const currentTurn =
+            (yield* Ref.get(activeTurn)) ?? (yield* Ref.get(pendingContinuation))?.context ?? null;
+          if (currentTurn !== null) return yield* previousTurnActiveError(currentTurn);
+          yield* Ref.update(lastTurnRouteByNativeThread, (current) => {
+            const updated = new Map(current);
+            updated.set(nativeThreadId, {
               threadId: turnInput.threadId,
-              runId: turnInput.runId,
-              attemptId: turnInput.attemptId,
+              providerThreadId: turnInput.providerThread.id,
+            });
+            return updated;
+          });
+          const remembered = (yield* Ref.get(lastProviderThreadByNativeThread)).get(nativeThreadId);
+          if (remembered?.nativeMetadata?.claudeRefusalObserved === true) {
+            turnInput = {
+              ...turnInput,
+              providerThread: {
+                ...turnInput.providerThread,
+                nativeMetadata: {
+                  ...turnInput.providerThread.nativeMetadata,
+                  claudeRefusalObserved: true,
+                },
+              },
             };
-            if (Option.isSome(startProgress))
-              yield* startProgress.value.step(progressAttempt, "turn_preparation", nativeThreadId);
-            const nativeTurnId = `turn:${turnInput.attemptId}`;
-            // Fresh for every offer: Claude acks a prompt whose uuid its
-            // transcript already holds without running a turn, and a session
-            // can outlive this database (or be resumed from a copy of it), so
-            // a uuid derived from run ids can repeat.
-            const promptUuid = isClaudeProviderContinuationTurn(turnInput)
-              ? null
-              : yield* crypto.randomUUIDv4().pipe(
-                  Effect.filterOrFail(isClaudePromptUuid),
-                  Effect.mapError(
-                    (cause) =>
-                      new ProviderAdapter.ProviderAdapterProtocolError({
-                        driver: CLAUDE_PROVIDER,
-                        detail: "Failed to allocate a Claude prompt uuid.",
-                        payload: cause,
-                      }),
-                  ),
+          }
+          if (
+            !(turnInput.nativeThreadHasTurns ?? turnInput.providerTurnOrdinal > 1) &&
+            turnInput.providerThread.nativeMetadata?.claudeRefusalObserved === undefined
+          ) {
+            turnInput = {
+              ...turnInput,
+              providerThread: {
+                ...turnInput.providerThread,
+                nativeMetadata: {
+                  ...turnInput.providerThread.nativeMetadata,
+                  claudeRefusalObserved: false,
+                },
+              },
+            };
+          }
+          yield* rememberProviderThread(turnInput.providerThread);
+          if (!goalsByNativeThread.has(nativeThreadId)) {
+            goalsByNativeThread.set(nativeThreadId, turnInput.providerThread.goal ?? null);
+          }
+          const context: ActiveClaudeTurnContext = {
+            input: turnInput,
+            nativeThreadId,
+            nativeTurnId,
+            nativeMessageCursor: null,
+            providerTurnId,
+            providerTurnOrdinal,
+            startedAt,
+            itemOrdinals: new Map(),
+            assistant: {
+              fallbackText: "",
+              fallbackNativeItemId: `assistant:${turnInput.runId}`,
+              emittedNativeItemIds: new Set(),
+              noticeTexts: new Set(),
+              textGroups: new Map(),
+              toolGroups: new Set(),
+              endedGroups: new Set(),
+            },
+            reasoning: {
+              messageId: null,
+              streamBlocks: new Map(),
+              nextBlockIndex: new Map(),
+              snapshotBlockIndex: new Map(),
+              lastThinking: null,
+              snapshots: new Set(),
+              blocks: new Map(),
+            },
+            streamUsage: null,
+            toolCalls: new Map(),
+            compaction: null,
+            compactionWatchdogStop: null,
+            lastSdkMessageAt: yield* Clock.currentTimeMillis,
+            ignoredTaskIds: new Set(),
+            announcedUsageLimits: new Set(),
+            authenticationFailureMessage: undefined,
+            latestApiFailureCategory: undefined,
+            latestApiFailure: undefined,
+            hadSuccessfulResponse:
+              successfulModelsByNativeThread
+                .get(nativeThreadId)
+                ?.has(turnInput.modelSelection.model) === true ||
+              turnInput.providerThread.nativeMetadata?.successfulModels?.includes(
+                turnInput.modelSelection.model,
+              ) === true,
+            responseReceived: false,
+            sessionRefused:
+              turnInput.providerThread.nativeMetadata?.claudeRefusalObserved ??
+              ((turnInput.nativeThreadHasTurns ?? turnInput.providerTurnOrdinal > 1)
+                ? undefined
+                : false),
+            realApiStatus: undefined,
+            refusalMessage: undefined,
+            refusalFallback: undefined,
+            rejectedRateLimitTypes: new Set(),
+            rateLimitResetTimes: new Map(),
+            latestAssistantRateLimit: null,
+            compactionFailure: null,
+            steeredSegmentUsage: [],
+            pendingSteers: new Map(),
+            acceptingSteers: true,
+            subagentsByTaskId: new Map(),
+            subagentsByToolUseId: new Map(),
+            subagentNodesByTaskId: new Map(),
+            promptUuid,
+            promptEcho: isClaudeProviderContinuationTurn(turnInput) ? "confirmed" : "pending",
+            promptStarted: false,
+            promptAcceptedAt: undefined,
+            nativeWakeStarted: false,
+            gatedFramesBeforeEcho: 0,
+            heldRootFrames: [],
+          };
+          const skills =
+            promptUuid === null
+              ? new Map<string, ClaudeSkillTarget>()
+              : yield* startup.stage(
+                  "skill_discovery",
+                  userInvocableSkills(turnInput.message.text, turnInput.runtimePolicy.cwd),
                 );
-            const providerTurnId = idAllocator.derive.providerTurn({
-              driver: CLAUDE_PROVIDER,
-              nativeTurnId,
-            });
-            const providerTurnOrdinal = turnInput.providerTurnOrdinal;
-            const currentTurn =
-              (yield* Ref.get(activeTurn)) ??
-              (yield* Ref.get(pendingContinuation))?.context ??
-              null;
-            if (currentTurn !== null) return yield* previousTurnActiveError(currentTurn);
-            yield* Ref.update(lastTurnRouteByNativeThread, (current) => {
-              const updated = new Map(current);
-              updated.set(nativeThreadId, {
-                threadId: turnInput.threadId,
-                providerThreadId: turnInput.providerThread.id,
-              });
-              return updated;
-            });
-            const remembered = (yield* Ref.get(lastProviderThreadByNativeThread)).get(
-              nativeThreadId,
-            );
-            if (remembered?.nativeMetadata?.claudeRefusalObserved === true) {
-              turnInput = {
-                ...turnInput,
-                providerThread: {
-                  ...turnInput.providerThread,
-                  nativeMetadata: {
-                    ...turnInput.providerThread.nativeMetadata,
-                    claudeRefusalObserved: true,
-                  },
-                },
-              };
-            }
-            if (
-              !(turnInput.nativeThreadHasTurns ?? turnInput.providerTurnOrdinal > 1) &&
-              turnInput.providerThread.nativeMetadata?.claudeRefusalObserved === undefined
-            ) {
-              turnInput = {
-                ...turnInput,
-                providerThread: {
-                  ...turnInput.providerThread,
-                  nativeMetadata: {
-                    ...turnInput.providerThread.nativeMetadata,
-                    claudeRefusalObserved: false,
-                  },
-                },
-              };
-            }
-            yield* rememberProviderThread(turnInput.providerThread);
-            if (!goalsByNativeThread.has(nativeThreadId)) {
-              goalsByNativeThread.set(nativeThreadId, turnInput.providerThread.goal ?? null);
-            }
-            const context: ActiveClaudeTurnContext = {
-              input: turnInput,
-              nativeThreadId,
-              nativeTurnId,
-              nativeMessageCursor: null,
-              providerTurnId,
-              providerTurnOrdinal,
-              startedAt,
-              itemOrdinals: new Map(),
-              assistant: {
-                fallbackText: "",
-                fallbackNativeItemId: `assistant:${turnInput.runId}`,
-                emittedNativeItemIds: new Set(),
-                noticeTexts: new Set(),
-                textGroups: new Map(),
-                toolGroups: new Set(),
-                endedGroups: new Set(),
-              },
-              reasoning: {
-                messageId: null,
-                streamBlocks: new Map(),
-                nextBlockIndex: new Map(),
-                snapshotBlockIndex: new Map(),
-                lastThinking: null,
-                snapshots: new Set(),
-                blocks: new Map(),
-              },
-              streamUsage: null,
-              toolCalls: new Map(),
-              compaction: null,
-              compactionWatchdogStop: null,
-              lastSdkMessageAt: yield* Clock.currentTimeMillis,
-              ignoredTaskIds: new Set(),
-              announcedUsageLimits: new Set(),
-              authenticationFailureMessage: undefined,
-              latestApiFailureCategory: undefined,
-              latestApiFailure: undefined,
-              hadSuccessfulResponse:
-                successfulModelsByNativeThread
-                  .get(nativeThreadId)
-                  ?.has(turnInput.modelSelection.model) === true ||
-                turnInput.providerThread.nativeMetadata?.successfulModels?.includes(
-                  turnInput.modelSelection.model,
-                ) === true,
-              responseReceived: false,
-              sessionRefused:
-                turnInput.providerThread.nativeMetadata?.claudeRefusalObserved ??
-                ((turnInput.nativeThreadHasTurns ?? turnInput.providerTurnOrdinal > 1)
-                  ? undefined
-                  : false),
-              realApiStatus: undefined,
-              refusalMessage: undefined,
-              rejectedRateLimitTypes: new Set(),
-              rateLimitResetTimes: new Map(),
-              latestAssistantRateLimit: null,
-              compactionFailure: null,
-              steeredSegmentUsage: [],
-              pendingSteers: new Map(),
-              acceptingSteers: true,
-              subagentsByTaskId: new Map(),
-              subagentsByToolUseId: new Map(),
-              subagentNodesByTaskId: new Map(),
-              promptUuid,
-              promptEcho: isClaudeProviderContinuationTurn(turnInput) ? "confirmed" : "pending",
-              promptStarted: false,
-              promptAcceptedAt: undefined,
-              nativeWakeStarted: false,
-              gatedFramesBeforeEcho: 0,
-              heldRootFrames: [],
-            };
-            const userMessage =
-              promptUuid === null
-                ? null
-                : yield* makeClaudeUserMessageWithAttachments({
+          const userMessage =
+            promptUuid === null
+              ? null
+              : yield* startup.stage(
+                  "attachments",
+                  makeClaudeUserMessageWithAttachments({
                     text: applyClaudePromptEffortPrefix(
                       turnInput.message.text,
                       compileClaudeModelSelection(turnInput.modelSelection).promptEffort,
@@ -10474,213 +10562,228 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                     attachments: turnInput.message.attachments,
                     attachmentsDir,
                     fileSystem,
-                    skills: yield* userInvocableSkills(
-                      turnInput.message.text,
-                      turnInput.runtimePolicy.cwd,
-                    ),
+                    skills,
                     uuid: promptUuid,
-                  });
-            const querySession = yield* openQuery(turnInput, nativeThreadId);
-            yield* querySession.query.retryMcp ?? Effect.void;
-            turnQueries.set(context, querySession);
-            const admitRecovery = Effect.gen(function* () {
-              if (turnInput.automaticRecovery !== true) return;
-              if (
-                context.sessionRefused === true ||
-                (yield* Ref.get(lastProviderThreadByNativeThread)).get(nativeThreadId)
-                  ?.nativeMetadata?.claudeRefusalObserved === true
-              ) {
-                yield* Ref.update(activeTurn, (current) => (current === context ? null : current));
-                return yield* new ProviderAdapter.ProviderAdapterRecoveryRefusedError();
-              }
-            });
-            const attachTurn = Effect.gen(function* () {
-              yield* admitRecovery;
-              if (
-                (yield* Ref.get(lastProviderThreadByNativeThread)).get(nativeThreadId)
-                  ?.nativeMetadata?.claudeRefusalObserved === true
-              )
-                context.sessionRefused = true;
-              querySession.lastTurn = context;
-              yield* Ref.set(activeTurn, context);
-              yield* emitProviderEvent({
-                type: "provider_turn.updated",
-                driver: CLAUDE_PROVIDER,
-                providerTurn: providerTurnPayload({
-                  context,
-                  status: "running",
-                  completedAt: null,
-                }),
-              });
-            });
-            if (userMessage !== null) {
-              yield* attachTurn;
-              yield* startUserTurnForWakeReports(nativeThreadId);
-              // Preparation releases the control lock before native delivery runs.
-              return admitRecovery.pipe(
-                Effect.andThen(
-                  Option.isSome(startProgress)
-                    ? startProgress.value.step(progressAttempt, "start_send")
-                    : Effect.void,
-                ),
-                Effect.andThen(querySession.query.offer(userMessage)),
-              );
+                  }),
+                );
+          const querySession = yield* startup.stage(
+            "sdk_open",
+            openQuery(turnInput, nativeThreadId, startup),
+          );
+          yield* startup.stage("mcp_registration", querySession.query.retryMcp ?? Effect.void);
+          // From admission onward a timeout must never re-run preparation or claim no delivery.
+          yield* startup.seal;
+          turnQueries.set(context, querySession);
+          const admitRecovery = Effect.gen(function* () {
+            if (turnInput.automaticRecovery !== true) return;
+            if (
+              context.sessionRefused === true ||
+              (yield* Ref.get(lastProviderThreadByNativeThread)).get(nativeThreadId)?.nativeMetadata
+                ?.claudeRefusalObserved === true
+            ) {
+              yield* Ref.update(activeTurn, (current) => (current === context ? null : current));
+              return yield* new ProviderAdapter.ProviderAdapterRecoveryRefusedError();
             }
-            yield* Ref.set(pendingContinuation, { context, querySession });
-            // Transcript reads suspend replay. Hold live SDK frames until the whole
-            // buffer has been applied so starts, completions and the root result stay ordered.
-            return sdkMessageLock.withPermits(1)(
-              Effect.gen(function* () {
-                yield* turnControlLock.withPermits(1)(
-                  Effect.gen(function* () {
-                    if (
-                      (yield* Ref.get(queryContext))?.query !== querySession.query ||
-                      querySession.stopping ||
-                      (yield* Ref.get(pendingContinuation))?.context !== context
-                    ) {
-                      return yield* new ProviderAdapter.ProviderAdapterProtocolError({
-                        driver: CLAUDE_PROVIDER,
-                        detail: "Claude provider query ended before the continuation could start.",
-                      });
-                    }
-                    const currentTurn = yield* Ref.get(activeTurn);
-                    if (currentTurn !== null) return yield* previousTurnActiveError(currentTurn);
-                    yield* Ref.set(pendingContinuation, null);
-                    yield* attachTurn;
-                  }),
-                );
-                const drained = (yield* Ref.get(wakeBuffers)).get(nativeThreadId)?.messages ?? [];
-                yield* Ref.update(requestedContinuations, (current) => {
-                  const updated = new Set(current);
-                  updated.delete(nativeThreadId);
-                  return updated;
-                });
-                if (drained.length === 0) {
-                  const completedAt = yield* DateTime.now;
-                  yield* finalizeActiveTurn({ context, status: "completed", completedAt });
-                  return;
-                }
-                // Replay any result message last: a result finalizes the turn, and
-                // replaying it before the rest would drop them back into the wake
-                // buffer and request another continuation. When Claude dequeues
-                // several notifications at once it can end an empty turn and open
-                // the next within a millisecond; that next turn is still running
-                // and owns this run, so the empty turn's result must not settle it.
-                const lastResultIndex = drained.findLastIndex((entry) => entry.type === "result");
-                const tailResult = drained[lastResultIndex];
-                const emptyTurnBeforeNextTurn =
-                  tailResult?.type === "result" &&
-                  tailResult.num_turns === 0 &&
-                  !tailResult.is_error &&
-                  terminalStatusFromResult(tailResult) === "completed" &&
-                  drained
-                    .slice(lastResultIndex + 1)
-                    .some((entry) => isClaudeTurnStartMessage(entry));
-                // The CLI can append empty task successes after a failure. Filter
-                // those for replay without changing the raw-tail successor guard.
-                const isEmptyTaskNotificationSuccess = (entry: SDKMessage) =>
-                  isClaudeTaskNotificationOriginResult(entry) &&
-                  entry.subtype === "success" &&
-                  !entry.is_error &&
-                  entry.num_turns === 0 &&
-                  entry.result.length === 0 &&
-                  terminalStatusFromResult(entry) === "completed";
-                const replayResultIndex = drained.findLastIndex(
-                  (entry) => entry.type === "result" && !isEmptyTaskNotificationSuccess(entry),
-                );
-                const lastResult =
-                  drained[replayResultIndex === -1 ? lastResultIndex : replayResultIndex];
-                const opaqueReplayTombstones = taskIdSetForNativeThread(
-                  yield* Ref.get(opaqueBackgroundTaskReplayTombstonesByNativeThread),
-                  nativeThreadId,
-                );
-                const hasOpaqueTaskNotification = drained.some(
-                  (entry) =>
-                    entry.type === "system" &&
-                    entry.subtype === "task_notification" &&
-                    opaqueReplayTombstones.has(entry.task_id),
-                );
-                for (const entry of drained) {
-                  if (
-                    !(yield* Ref.get(wakeBuffers)).get(nativeThreadId)?.messages.includes(entry)
-                  ) {
-                    continue;
-                  }
-                  if (entry.type !== "result") {
-                    yield* handleSdkMessage({ query: querySession.query, message: entry });
-                  }
-                  yield* Ref.update(wakeBuffers, (current) => {
-                    const buffered = current.get(nativeThreadId);
-                    if (buffered === undefined) return current;
-                    const index = buffered.messages.indexOf(entry);
-                    if (index === -1) return current;
-                    const messages = [
-                      ...buffered.messages.slice(0, index),
-                      ...buffered.messages.slice(index + 1),
-                    ];
-                    const next = new Map(current);
-                    if (messages.length === 0) next.delete(nativeThreadId);
-                    else next.set(nativeThreadId, { ...buffered, messages });
-                    return next;
-                  });
-                }
-                if (lastResult !== undefined && !emptyTurnBeforeNextTurn) {
-                  yield* handleSdkMessage({ query: querySession.query, message: lastResult });
-                  return;
-                }
-                if (hasOpaqueTaskNotification && !context.nativeWakeStarted) {
-                  const completedAt = yield* DateTime.now;
-                  yield* finalizeActiveTurn({ context, status: "completed", completedAt });
-                } else if (!context.nativeWakeStarted) {
-                  yield* Effect.sleep(CLAUDE_WAKE_TURN_START_DEADLINE).pipe(
-                    Effect.andThen(
-                      sdkMessageLock.withPermits(1)(
-                        Effect.gen(function* () {
-                          if (
-                            (yield* Ref.get(activeTurn)) !== context ||
-                            (yield* Ref.get(queryContext)) !== querySession ||
-                            querySession.stopping ||
-                            context.nativeWakeStarted ||
-                            (yield* Ref.get(interruptedTurns)).has(context.providerTurnId)
-                          )
-                            return;
-                          yield* Effect.logWarning(
-                            "orchestration-v2.claude-wake-turn-never-opened",
-                            {
-                              providerTurnId: context.providerTurnId,
-                              nativeThreadId,
-                            },
-                          );
-                          const completedAt = yield* DateTime.now;
-                          yield* finalizeActiveTurn({ context, status: "completed", completedAt });
-                        }),
-                      ),
-                    ),
-                    Effect.forkIn(sessionScope),
-                  );
-                }
+          });
+          const attachTurn = Effect.gen(function* () {
+            yield* admitRecovery;
+            if (
+              (yield* Ref.get(lastProviderThreadByNativeThread)).get(nativeThreadId)?.nativeMetadata
+                ?.claudeRefusalObserved === true
+            )
+              context.sessionRefused = true;
+            querySession.lastTurn = context;
+            yield* Ref.set(activeTurn, context);
+            yield* emitProviderEvent({
+              type: "provider_turn.updated",
+              driver: CLAUDE_PROVIDER,
+              providerTurn: providerTurnPayload({
+                context,
+                status: "running",
+                completedAt: null,
               }),
-            );
-          },
-          (effect, turnInput) =>
-            effect.pipe(
-              Effect.timeout(CLAUDE_TURN_PREPARATION_TIMEOUT),
-              turnControlLock.withPermits(1),
-              // Delivery and transcript replay can stall. Only admission owns the
-              // control lock so Stop can still close the query while they wait.
-              Effect.flatMap((offer) => offer ?? Effect.void),
-              Effect.mapError(
-                (cause) =>
-                  new ProviderAdapter.ProviderAdapterTurnStartError({
-                    driver: CLAUDE_PROVIDER,
-                    threadId: turnInput.threadId,
-                    providerThreadId: turnInput.providerThread.id,
-                    runId: turnInput.runId,
-                    cause,
-                  }),
+            });
+          });
+          if (userMessage !== null) {
+            yield* attachTurn;
+            yield* startUserTurnForWakeReports(nativeThreadId);
+            // Preparation releases the control lock before native delivery runs.
+            return admitRecovery.pipe(
+              Effect.andThen(
+                Option.isSome(startProgress)
+                  ? startProgress.value.step(progressAttempt, "start_send")
+                  : Effect.void,
               ),
+              Effect.andThen(querySession.query.offer(userMessage)),
+            );
+          }
+          yield* Ref.set(pendingContinuation, { context, querySession });
+          // Transcript reads suspend replay. Hold live SDK frames until the whole
+          // buffer has been applied so starts, completions and the root result stay ordered.
+          return sdkMessageLock.withPermits(1)(
+            Effect.gen(function* () {
+              yield* turnControlLock.withPermits(1)(
+                Effect.gen(function* () {
+                  if (
+                    (yield* Ref.get(queryContext))?.query !== querySession.query ||
+                    querySession.stopping ||
+                    (yield* Ref.get(pendingContinuation))?.context !== context
+                  ) {
+                    return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                      driver: CLAUDE_PROVIDER,
+                      detail: "Claude provider query ended before the continuation could start.",
+                    });
+                  }
+                  const currentTurn = yield* Ref.get(activeTurn);
+                  if (currentTurn !== null) return yield* previousTurnActiveError(currentTurn);
+                  yield* Ref.set(pendingContinuation, null);
+                  yield* attachTurn;
+                }),
+              );
+              const drained = (yield* Ref.get(wakeBuffers)).get(nativeThreadId)?.messages ?? [];
+              yield* Ref.update(requestedContinuations, (current) => {
+                const updated = new Set(current);
+                updated.delete(nativeThreadId);
+                return updated;
+              });
+              if (drained.length === 0) {
+                const completedAt = yield* DateTime.now;
+                yield* finalizeActiveTurn({ context, status: "completed", completedAt });
+                return;
+              }
+              // Replay any result message last: a result finalizes the turn, and
+              // replaying it before the rest would drop them back into the wake
+              // buffer and request another continuation. When Claude dequeues
+              // several notifications at once it can end an empty turn and open
+              // the next within a millisecond; that next turn is still running
+              // and owns this run, so the empty turn's result must not settle it.
+              const lastResultIndex = drained.findLastIndex((entry) => entry.type === "result");
+              const tailResult = drained[lastResultIndex];
+              const emptyTurnBeforeNextTurn =
+                tailResult?.type === "result" &&
+                tailResult.num_turns === 0 &&
+                !tailResult.is_error &&
+                terminalStatusFromResult(tailResult) === "completed" &&
+                drained.slice(lastResultIndex + 1).some((entry) => isClaudeTurnStartMessage(entry));
+              // The CLI can append empty task successes after a failure. Filter
+              // those for replay without changing the raw-tail successor guard.
+              const isEmptyTaskNotificationSuccess = (entry: SDKMessage) =>
+                isClaudeTaskNotificationOriginResult(entry) &&
+                entry.subtype === "success" &&
+                !entry.is_error &&
+                entry.num_turns === 0 &&
+                entry.result.length === 0 &&
+                terminalStatusFromResult(entry) === "completed";
+              const replayResultIndex = drained.findLastIndex(
+                (entry) => entry.type === "result" && !isEmptyTaskNotificationSuccess(entry),
+              );
+              const lastResult =
+                drained[replayResultIndex === -1 ? lastResultIndex : replayResultIndex];
+              const opaqueReplayTombstones = taskIdSetForNativeThread(
+                yield* Ref.get(opaqueBackgroundTaskReplayTombstonesByNativeThread),
+                nativeThreadId,
+              );
+              const hasOpaqueTaskNotification = drained.some(
+                (entry) =>
+                  entry.type === "system" &&
+                  entry.subtype === "task_notification" &&
+                  opaqueReplayTombstones.has(entry.task_id),
+              );
+              for (const entry of drained) {
+                if (!(yield* Ref.get(wakeBuffers)).get(nativeThreadId)?.messages.includes(entry)) {
+                  continue;
+                }
+                if (entry.type !== "result") {
+                  yield* handleSdkMessage({ query: querySession.query, message: entry });
+                }
+                yield* Ref.update(wakeBuffers, (current) => {
+                  const buffered = current.get(nativeThreadId);
+                  if (buffered === undefined) return current;
+                  const index = buffered.messages.indexOf(entry);
+                  if (index === -1) return current;
+                  const messages = [
+                    ...buffered.messages.slice(0, index),
+                    ...buffered.messages.slice(index + 1),
+                  ];
+                  const next = new Map(current);
+                  if (messages.length === 0) next.delete(nativeThreadId);
+                  else next.set(nativeThreadId, { ...buffered, messages });
+                  return next;
+                });
+              }
+              if (lastResult !== undefined && !emptyTurnBeforeNextTurn) {
+                yield* handleSdkMessage({ query: querySession.query, message: lastResult });
+                return;
+              }
+              if (hasOpaqueTaskNotification && !context.nativeWakeStarted) {
+                const completedAt = yield* DateTime.now;
+                yield* finalizeActiveTurn({ context, status: "completed", completedAt });
+              } else if (!context.nativeWakeStarted) {
+                yield* Effect.sleep(CLAUDE_WAKE_TURN_START_DEADLINE).pipe(
+                  Effect.andThen(
+                    sdkMessageLock.withPermits(1)(
+                      Effect.gen(function* () {
+                        if (
+                          (yield* Ref.get(activeTurn)) !== context ||
+                          (yield* Ref.get(queryContext)) !== querySession ||
+                          querySession.stopping ||
+                          context.nativeWakeStarted ||
+                          (yield* Ref.get(interruptedTurns)).has(context.providerTurnId)
+                        )
+                          return;
+                        yield* Effect.logWarning("orchestration-v2.claude-wake-turn-never-opened", {
+                          providerTurnId: context.providerTurnId,
+                          nativeThreadId,
+                        });
+                        const completedAt = yield* DateTime.now;
+                        yield* finalizeActiveTurn({ context, status: "completed", completedAt });
+                      }),
+                    ),
+                  ),
+                  Effect.forkIn(sessionScope),
+                );
+              }
+            }),
+          );
+        });
+
+        const startTurn = Effect.fn("ClaudeAdapterV2.startTurn")(function* (
+          turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
+        ) {
+          const starting = {
+            runId: turnInput.runId,
+            providerThreadId: turnInput.providerThread.id,
+            stopped: false,
+          };
+          startingTurns.set(turnInput.attemptId, starting);
+          return yield* ClaudeTurnStartup.prepare(
+            turnInput,
+            !isClaudeProviderContinuationTurn(turnInput),
+            (startup) =>
+              Effect.suspend(() =>
+                starting.stopped ? Effect.interrupt : prepareTurn(turnInput, startup),
+              ),
+            turnControlLock.withPermits(1),
+            Effect.suspend(() => (starting.stopped ? Effect.interrupt : Effect.void)),
+          ).pipe(
+            Effect.flatMap((offer) => offer),
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapter.ProviderAdapterTurnStartError({
+                  driver: CLAUDE_PROVIDER,
+                  threadId: turnInput.threadId,
+                  providerThreadId: turnInput.providerThread.id,
+                  runId: turnInput.runId,
+                  cause,
+                }),
             ),
-        );
+            Effect.ensuring(
+              Effect.sync(() => {
+                startingTurns.delete(turnInput.attemptId);
+              }),
+            ),
+          );
+        });
 
         const interruptTurn = Effect.fn("ClaudeAdapterV2.interruptTurn")(
           function* (turnInput: ProviderAdapter.ProviderAdapterV2InterruptInput) {
@@ -11019,11 +11122,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         });
         yield* Effect.addFinalizer(() => closeSession());
 
-        // A CLI stopped before it saved the first prompt can leave a transcript
-        // with only metadata lines. Claude can neither resume that id nor
-        // create it again, so resumeThread fails and the caller binds a fresh
-        // native session with a context handoff.
-        const hasEmptyClaudeTranscript = Effect.fn("ClaudeAdapterV2.hasEmptyClaudeTranscript")(
+        const findClaudeTranscriptPaths = Effect.fn("ClaudeAdapterV2.findClaudeTranscriptPaths")(
           function* (nativeThreadId: string) {
             const configuredDir = adapterOptions.environment.CLAUDE_CONFIG_DIR?.trim() ?? "";
             const projectsDir = path.join(
@@ -11032,9 +11131,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 : path.join(yield* HostProcess.HomeDirectory, ".claude"),
               "projects",
             );
-            // Empty only when every copy of the id is empty; any message means
-            // the CLI may still resume it.
-            let found = false;
+            const matches: Array<string> = [];
             for (const project of yield* fileSystem.readDirectory(projectsDir)) {
               const transcriptPath = path.join(projectsDir, project, `${nativeThreadId}.jsonl`);
               // Stray files beside the project dirs fail with ENOTDIR.
@@ -11043,6 +11140,22 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               ) {
                 continue;
               }
+              matches.push(transcriptPath);
+            }
+            return matches;
+          },
+        );
+
+        // A CLI stopped before it saved the first prompt can leave a transcript
+        // with only metadata lines. Claude can neither resume that id nor
+        // create it again, so resumeThread fails and the caller binds a fresh
+        // native session with a context handoff.
+        const hasEmptyClaudeTranscript = Effect.fn("ClaudeAdapterV2.hasEmptyClaudeTranscript")(
+          function* (nativeThreadId: string) {
+            const transcriptPaths = yield* findClaudeTranscriptPaths(nativeThreadId);
+            // Empty only when every copy of the id is empty; any message means
+            // the CLI may still resume it.
+            for (const transcriptPath of transcriptPaths) {
               const conversationLine = yield* fileSystem
                 .stream(transcriptPath)
                 .pipe(
@@ -11054,11 +11167,47 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               if (Option.isSome(conversationLine)) {
                 return false;
               }
-              found = true;
             }
-            return found;
+            return transcriptPaths.length > 0;
           },
         );
+
+        const wakeCredential = yield* McpProviderSessions.readForRuntime(
+          mcpSessions,
+          input.threadId,
+          input.providerSessionId,
+          CLAUDE_PROVIDER,
+        );
+        if (wakeCredential !== undefined) {
+          // The CLI executes wake tools before queued continuation output is replayed.
+          yield* mcpSessions.registerWakeCaller(wakeCredential, () => {
+            const live = Ref.getUnsafe(queryContext);
+            if (live === null || live.stopping) return "inactive";
+            const route = Ref.getUnsafe(lastTurnRouteByNativeThread).get(live.nativeThreadId);
+            if (route?.threadId !== input.threadId) return "inactive";
+            const buffered = Ref.getUnsafe(wakeBuffers).get(live.nativeThreadId)?.messages ?? [];
+            if (
+              buffered.some(
+                (message) =>
+                  isClaudeTurnStartMessage(message) ||
+                  ((message.type === "assistant" ||
+                    message.type === "user" ||
+                    message.type === "result") &&
+                    parentToolUseIdFromSdkMessage(message) === null),
+              )
+            )
+              return "live";
+            return buffered.some(
+              (message) => message.type === "system" && message.subtype === "task_notification",
+            ) ||
+              rosterForNativeThread(
+                Ref.getUnsafe(pendingBackgroundTasksByNativeThread),
+                live.nativeThreadId,
+              ).size > 0
+              ? "starting"
+              : "inactive";
+          });
+        }
 
         const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
           instanceId: adapterOptions.instanceId,
@@ -11260,6 +11409,12 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           interruptStartingRun: Effect.fn("ClaudeAdapterV2.interruptStartingRun")(function* (
             runInput,
           ) {
+            const starting = startingTurns.get(runInput.attemptId);
+            if (
+              starting?.runId === runInput.runId &&
+              starting.providerThreadId === runInput.providerThread.id
+            )
+              starting.stopped = true;
             const current =
               (yield* Ref.get(activeTurn)) ??
               (yield* Ref.get(pendingContinuation))?.context ??

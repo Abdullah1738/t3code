@@ -1,6 +1,5 @@
-import os as _os, tempfile as _tempfile
-# commerce_cli reads the pause file at import; the owner's real one must not refuse test orders.
-_os.environ['ORDERING_PAUSE_FILE'] = _os.path.join(_tempfile.gettempdir(), 'ordering-pause-test-absent', 'ordering-paused')
+import os as _os
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -8,16 +7,58 @@ import contextlib
 import json
 import io
 from unittest.mock import patch
+from types import SimpleNamespace
+import uuid
 
-import commerce_cli as c
+# Match run_owner_go_tests.py (63ce83b619), including isolated Python imports.
+sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parent)]
+
+_module_state = tempfile.TemporaryDirectory()
+_module_env = patch.dict(_os.environ, {
+    'ORDERING_PAUSE_FILE': str(Path(_module_state.name) / 'ordering-paused'),
+    'CARD_STATUS_FILE': str(Path(_module_state.name) / 'cards.json'),
+    'ROBOB_TOOL_LOG_DIR': str(Path(_module_state.name) / 'logs'),
+    'TOOLLOG_ROOT': str(Path(_module_state.name) / 'logs'),
+})
+# PAUSE_FILE is captured at import; scope the override to this import as well.
+with _module_env:
+    import commerce_cli as c
+
 import commerce_minutes
+from owner_go_support import approve_test_flows
 from commerce_flow import FlowGate
 from talabat_place_contract import PlaceObservation
 from talabat_http_checkout import AsyncPaymentContext, PaymentResult
 
 
-class MoniBusGoTests(unittest.TestCase):
+class CLITestCase(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
+        # The shared captured-fixture helper declines 9546 to permit 2342.
+        # This entry point also runs with the current 9546 default.
+        if c.order_card.LAST4 == '9546':
+            c.card_status.record_ok('9546', source='synthetic-cli-test')
+
+    def journal_flow(self, flow, lane, *, amount=1980, order='NAEFIxture'):
+        # b63bddc127 and fdf2d338b8 require real isolated journal bindings
+        # even when the merchant adapter itself is mocked.
+        flow.flow_id = str(uuid.uuid4())
+        flow.account_hash = uuid.uuid4().hex * 2
+        flow.snapshot = SimpleNamespace(account_ref=flow.account_hash, address_ref='a'*64)
+        flow.items = [{'sku_config': 'Z1', 'quantity': 1}]
+        flow.skus = [{'sku': 'SKU1', 'qty': 1}]
+        flow.driver_note_extra = None
+        flow.use_current_cart = False
+        flow.order = order
+        flow.review = {'payable_minor': amount, 'order': order, 'amount': amount}
+        c.journal.open_flow(flow_id=flow.flow_id, app='noon', vertical=lane,
+                           account_hash=flow.account_hash, scope_hash='b'*64)
+        return flow
+
+
+class MoniBusGoTests(CLITestCase):
+    def setUp(self):
+        super().setUp()
         from agent_bus_support import create_bus
         import datetime as dt
         from types import SimpleNamespace
@@ -104,31 +145,28 @@ class MoniBusGoTests(unittest.TestCase):
             c.recover_payment('synthetic',recipient='moni')
         recover.assert_called_once_with('synthetic',recipient='moni')
 
-_card_state=tempfile.TemporaryDirectory()
-_card_env=patch.dict('os.environ',{'CARD_STATUS_FILE':str(Path(_card_state.name)/'card-status.json')})
-
-
 def setUpModule():
-    # The live card-status record must never decide these tests.
-    _card_env.start()
+    _module_env.start()
+    _pause_patch.start()
 
 
 def tearDownModule():
-    _card_env.stop()
-    _card_state.cleanup()
+    _pause_patch.stop()
+    _module_env.stop()
+    _module_state.cleanup()
 
 
-class MarketplacePaymentCLITests(unittest.TestCase):
+class MarketplacePaymentCLITests(CLITestCase):
     def test_both_lanes_prepare_cvv_before_single_place_and_wait(self):
         from unittest.mock import Mock
         for lane, target in (('main','commerce_main_order.MainOrderFlow'),
                              ('supermall','commerce_supermall_order.SupermallOrderFlow')):
             with self.subTest(lane=lane):
                 flow = Mock()
-                flow.flow_id, flow.order = 'fixture-flow', 'NAEFIxture'
+                self.journal_flow(flow, lane)
                 flow.review = {'payable_minor': 1980}
                 flow.prepare_only.return_value = {'flow_id': flow.flow_id, 'prepared_only': True,
-                    'review': {}, 'readback': {'verified': True}}
+                    'review': {'payable_minor': 1980}, 'readback': {'verified': True}}
                 flow.prepare_payment.side_effect = lambda *, cvv_loader: cvv_loader()
                 flow.place.return_value = {'order': flow.order}
                 flow.await_success.return_value = {'paid': True}
@@ -158,10 +196,10 @@ class MarketplacePaymentCLITests(unittest.TestCase):
             for provider in ('', 'PAYPAL'):
                 with self.subTest(lane=lane, provider=provider):
                     flow = Mock()
-                    flow.flow_id, flow.order = 'fixture-flow', None
+                    self.journal_flow(flow, lane, order=None)
                     flow.review = {'payable_minor': 1980}
                     flow.prepare_only.return_value = {'flow_id': flow.flow_id, 'prepared_only': True,
-                        'review': {}, 'readback': {'verified': True}}
+                        'review': {'payable_minor': 1980}, 'readback': {'verified': True}}
                     flow.session_response.data = fixture.session_state()
                     flow.session_response.data['paymentProviderCode'] = provider
                     flow.prepare_payment.side_effect = lambda **kw: MarketplacePayment.prepare_payment(flow, **kw)
@@ -201,10 +239,10 @@ class MarketplacePaymentCLITests(unittest.TestCase):
                              ('supermall','commerce_supermall_order.SupermallOrderFlow')):
             with self.subTest(lane=lane):
                 flow = Mock()
-                flow.flow_id, flow.order = 'fixture-flow', 'NAEFIxture'
+                self.journal_flow(flow, lane)
                 flow.review = {'payable_minor': 1980}
                 flow.prepare_only.return_value = {'flow_id': flow.flow_id, 'prepared_only': True,
-                    'review': {}, 'readback': {'verified': True}}
+                    'review': {'payable_minor': 1980}, 'readback': {'verified': True}}
                 flow.place.return_value = {'order': flow.order}
                 for error, code in ((MarketplaceError('REQUEST_TIMEOUT'), 'REQUEST_TIMEOUT'),
                                     (KeyError('status'), 'COMMERCE_OPERATION_FAILED')):
@@ -228,10 +266,10 @@ class MarketplacePaymentCLITests(unittest.TestCase):
                                     (MarketplaceError('AUTH_EXPIRED', may_have_sent=True), False)):
                 with self.subTest(lane=lane, error=error.code):
                     flow = Mock()
-                    flow.flow_id, flow.order = 'fixture-flow', None
+                    self.journal_flow(flow, lane, order=None)
                     flow.review = {'payable_minor': 1980}
                     flow.prepare_only.return_value = {'flow_id': flow.flow_id, 'prepared_only': True,
-                        'review': {}, 'readback': {'verified': True}}
+                        'review': {'payable_minor': 1980}, 'readback': {'verified': True}}
                     flow.place.side_effect = error
                     with patch(target,return_value=flow), patch.object(c,'CommerceAuth'), \
                          patch.object(c,'cvv_from_keychain',return_value=b'123'), \
@@ -249,7 +287,7 @@ class MarketplacePaymentCLITests(unittest.TestCase):
                         # No command can find an order without its number: say so, keep the fence.
                         steps = ' '.join(result['next'])
                         self.assertIn("Orders page; its order number never came back", steps)
-                        self.assertIn('leave flow fixture-flow fenced', steps)
+                        self.assertIn(f'leave flow {flow.flow_id} fenced', steps)
                         self.assertNotIn('order-status', steps)
                         self.assertNotIn('commerce reconcile-order', steps)
 
@@ -276,7 +314,7 @@ class MarketplacePaymentCLITests(unittest.TestCase):
                 complete.assert_called_once_with('fixture-flow')
 
 
-class RecoveryTests(unittest.TestCase):
+class RecoveryTests(CLITestCase):
     def test_capabilities_are_explicit_and_auth_failure_sets_exit_status(self):
         with contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(c.main(['capabilities']),0)
@@ -284,7 +322,8 @@ class RecoveryTests(unittest.TestCase):
         data=json.loads(out.getvalue())
         self.assertIsNone(data['order_cap_minor'])
         self.assertIsNone(data['campaign_cap_minor'])
-        self.assertEqual(len(data['verticals']),7)
+        # 7357d7517b added the noon.food lane.
+        self.assertEqual(len(data['verticals']),8)
         for vertical in ('shops','mart','restaurants'):
             self.assertEqual(data['verticals']['talabat.'+vertical]['payment'],'native_async_live_paid')
             self.assertEqual(data['verticals']['talabat.'+vertical]['place'],'live_order_created')
@@ -416,7 +455,7 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual(len(c.journal.inspect(flow)['operations']),2)
 
 
-class MinutesOrderTests(unittest.TestCase):
+class MinutesOrderTests(CLITestCase):
     def test_order_minutes_requires_wiring_and_cvv_flag(self):
         import argparse
         # Missing --sku exits with usage error before any dispatch.
@@ -497,8 +536,7 @@ class MinutesOrderTests(unittest.TestCase):
                 patch.object(c,'cvv_from_keychain',return_value=b'007'):
             if flows is not None:flows.append(flow.return_value)
             f=flow.return_value
-            f.flow_id='10000000-0000-4000-8000-000000000009'
-            f.review={'order':'IAEGA123','amount':1725}
+            self.journal_flow(f, 'minutes', amount=1725, order='IAEGA123')
             f.prepare_only.return_value={'flow_id':f.flow_id,'prepared_only':True,'review':{'payable_minor':1725},
                                          'readback':{'verified':True}}
             f.place.return_value={'order':'IAEGA123'}
@@ -530,7 +568,7 @@ class MinutesOrderTests(unittest.TestCase):
         with patch.object(cm.subprocess,'run',side_effect=OSError):
             result=self.minutes_order(complete={'payment_status':'payment_pending'},paid=paid,
                                       notify={'wraps':cm.telegram_3ds_notify},flows=flows)
-        flows[0].await_payment.assert_called_once_with(wait_seconds=600,stall=commerce_minutes.telegram_stall_notify)
+        flows[0].await_payment.assert_called_once_with(wait_seconds=600,stall=commerce_minutes.telegram_stall_notify,open_redirect=True)
         self.assertEqual((result['error'],result['charge']),('MINUTES_PAYMENT_WINDOW_ELAPSED_NO_RETRY','unknown'))
         result=self.minutes_order(complete={'payment_status':'payment_pending'},paid=paid,
                                   notify={'side_effect':RuntimeError('telegram down')})
@@ -558,7 +596,7 @@ class MinutesOrderTests(unittest.TestCase):
                 'transaction_status':'CREATED','polls':1,'timed_out':True}
             self.assertEqual(c.main(['await-payment','flow','--no-notify']),1)
         flow.resume_payment.assert_called_once_with('flow')
-        flow.resume_payment.return_value.await_payment.assert_called_once_with(notify=None,wait_seconds=600.0,stall=None)
+        flow.resume_payment.return_value.await_payment.assert_called_once_with(notify=None,wait_seconds=600.0,stall=None,open_redirect=False)
         notify.assert_not_called()
         # Unconfirmed is never reported as uncharged.
         result=json.loads(output.getvalue().strip().splitlines()[-1])
@@ -658,8 +696,7 @@ class MinutesOrderTests(unittest.TestCase):
         import argparse
         import commerce_minutes as cm
         from unittest.mock import Mock
-        flow=Mock()
-        flow.review={'order':'IAEGA123'}
+        flow=self.journal_flow(Mock(), 'minutes', amount=1725, order='IAEGA123')
         flow.await_payment.return_value={'paid':False,'payment_status':'payment_pending',
             'transaction_status':'CREATED','polls':1,'timed_out':True}
         flow.verify_tracking.return_value={'order':'IAEGA123','status':'preparing',
@@ -676,21 +713,22 @@ class MinutesOrderTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()):
             flow_cls.resume_payment.return_value=flow
             result=c.await_payment_flow(argparse.Namespace(
-                flow_id='f',minutes=4,no_notify=False))
-        reported.assert_called_once_with('f')
+                flow_id=flow.flow_id,minutes=4,no_notify=False))
+        reported.assert_called_once_with(flow.flow_id)
         notify.assert_not_called()
         flow.await_payment.assert_not_called()
         self.assertEqual(result['delivery_status'],'preparing')
         self.assertEqual(result['watcher'],'order-noon-iaega123')
         # register_tracker received the tracking eta through review seeding
         self.assertEqual(flow.review['eta'],'2026-10-10T14:44:00+04:00')
-        complete.assert_called_once_with('f')
+        complete.assert_called_once_with(flow.flow_id)
 
 
 
 
-class OrderChatTests(unittest.TestCase):
+class OrderChatTests(CLITestCase):
     def setUp(self):
+        super().setUp()
         temp=tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.root=Path(temp.name)
@@ -751,21 +789,7 @@ class OrderChatTests(unittest.TestCase):
         code,seen,_=self.run_lane(['order','minutes','--sku','SKU1','--for','owner'])
         self.assertEqual((code,seen['chat']),(0,None))
 
-# Metadata checks run even when a transport is stubbed.
-_journal_temp = tempfile.TemporaryDirectory()
-_journal_patch = patch.object(c.journal, 'ROOT', Path(_journal_temp.name).resolve()/'commerce')
-_original_setup = globals().get('setUpModule', lambda: None)
-_original_teardown = globals().get('tearDownModule', lambda: None)
-def setUpModule():
-    _journal_patch.start()
-    _original_setup()
-    import order_card, card_status
-    if order_card.LAST4=='2342':
-        card_status.record_declined('9546',reason='synthetic issuer decline',source='test')
-def tearDownModule():
-    _original_teardown()
-    _journal_patch.stop()
-    _journal_temp.cleanup()
+_pause_patch = patch.object(c, 'PAUSE_FILE', Path(_module_state.name) / 'ordering-paused')
 
 
 if __name__ == '__main__':

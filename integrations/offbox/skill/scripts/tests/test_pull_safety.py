@@ -1045,6 +1045,56 @@ class PullSafetyTests(Isolated):
                 self.assertEqual((summary['files'], summary['bytes'], summary['conflicts']), (1, 6, int(bool(edited))))
 
 
+    def test_merged_kill_completion_uses_one_claim_and_preserves_local_edit(self):
+        self.write_file('f.txt', 'base')
+        self.baseline()
+        self.write_file('f.txt', 'edit after push')
+        self.write_file('f.txt', 'remote', remote=True)
+        self.con.execute("UPDATE runs SET status='killed',exit_code=143")
+        with patch.object(ssh_sync, 'pull', side_effect=self.sync):
+            self.assertEqual(runs.complete_killed(self.row(), pulls=['f.txt'], role='fg'), 143)
+            self.assertEqual(runs.complete_killed(self.row(), pulls=['f.txt']), 143)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual((self.row()['status'], self.row()['exit_code'], self.row()['pull_state']),
+                         ('killed', 143, 'partial'))
+        self.assertEqual((self.root/'f.txt').read_text(), 'edit after push')
+        self.assertEqual((self.root/'f.txt.offbox-pulled').read_text(), 'remote')
+        self.assertEqual(self.events('pull_conflict')[0]['role'], 'fg')
+        self.assertIn('pulls: partial (1 files, 1 conflicts)', self.output.getvalue())
+
+    def test_merged_kill_completion_observes_existing_pull_claim_and_timeout(self):
+        self.baseline()
+        self.con.execute("UPDATE runs SET status='killed',exit_code=143,pull_state='running',pull_owner=?",
+                         (json.dumps(dict(pid=os.getpid(),role='refresh')),))
+        clock = [100.0]
+        def pause(seconds):
+            clock[0] += seconds
+        with patch.object(common, 'now', side_effect=lambda: clock[0]), \
+                patch.object(pulls.time, 'sleep', side_effect=pause), \
+                patch.object(ssh_sync, 'pull') as transfer:
+            with self.assertRaises(common.OffboxError) as raised:
+                runs.complete_killed(self.row(), pulls=['f.txt'], until=100.2)
+        self.assertEqual(raised.exception.code, 124)
+        transfer.assert_not_called()
+        self.assertEqual((self.row()['exit_code'], self.row()['pull_state']), (143,'running'))
+        self.assertIn('pulls: still running', self.output.getvalue())
+
+    def test_queued_edit_is_the_push_baseline(self):
+        self.write_file('f.txt', 'at queue time')
+        self.write_file('f.txt', 'edited before push')
+        self.baseline()
+        self.write_file('f.txt', 'remote', remote=True)
+        self.assertEqual(common.read_json(pulls.baseline_path('run-pull'), {})['files']['f.txt'],
+                         pulls.fingerprint(self.root/'f.txt'))
+        with patch.object(ssh_sync, 'pull', side_effect=self.sync):
+            pulls.wait('run-pull')
+        self.assertEqual((self.root/'f.txt').read_text(), 'remote')
+        backups=self.events('pull_backup')
+        self.assertEqual(len(backups),1)
+        self.assertEqual((self.root/backups[0]['backup']).read_text(),'edited before push')
+        self.assertEqual(self.row()['pull_state'],'done')
+
+
 def configure_push_fixture(root):
     from test_bg_queue_detach import configure_fixture
     a, me = configure_fixture(root, 'boat')

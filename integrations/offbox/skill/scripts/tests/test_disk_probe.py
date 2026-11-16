@@ -102,7 +102,7 @@ class DiskProbeTests(unittest.TestCase):
         path = self.root / 'offbox_disk_space.py'
         shutil.copyfile(disk.__file__, path)
         module = load_copy(path)
-        source = ('import os,json,subprocess,sys\nfrom pathlib import Path\n'
+        source = ('import os,json,re,subprocess,sys\nfrom pathlib import Path\n'
                   f'WARN_BYTES={module.WARN_BYTES}\nGATE_BYTES={module.GATE_BYTES}\nMARKER={module.MARKER!r}\n'
                   + '\n'.join(inspect.getsource(f) for f in (module.snapshot, module.warning, module.probe)) + '\nprobe()\n')
         before = module.probe_payload()
@@ -135,7 +135,7 @@ class DiskProbeTests(unittest.TestCase):
 
     def script(self, payload, steps=None):
         with ExitStack() as stack:
-            for name in ('GO_REPAIR', 'DOCKER_REPAIR', 'LDCACHE_REPAIR', 'CACHE_OWNER_REPAIR', 'WATCH_REPAIR'):
+            for name in ('GO_REPAIR', 'DOCKER_REPAIR', 'SQLITE_SETUP', 'LDCACHE_REPAIR', 'CACHE_OWNER_REPAIR', 'WATCH_REPAIR'):
                 stack.enter_context(patch.object(runs, name, ':'))
             stack.enter_context(patch.object(runs.userns, 'setup', return_value=':'))
             stack.enter_context(patch.object(runs.containers, 'script', return_value=':'))
@@ -278,7 +278,7 @@ print('queue-ready', flush=True)
 sys.stdin.readline()
 assert disk.probe_payload() == before
 compile(zlib.decompress(base64.b64decode(before)), '<frozen probe>', 'exec')
-for name in ('GO_REPAIR', 'DOCKER_REPAIR', 'LDCACHE_REPAIR', 'CACHE_OWNER_REPAIR', 'WATCH_REPAIR'):
+for name in ('GO_REPAIR', 'DOCKER_REPAIR', 'SQLITE_SETUP', 'LDCACHE_REPAIR', 'CACHE_OWNER_REPAIR', 'WATCH_REPAIR'):
     setattr(runs, name, ':')
 runs.userns.setup = lambda *a: ':'
 runs.containers.script = lambda *a, **kw: ':'

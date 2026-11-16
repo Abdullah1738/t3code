@@ -2,16 +2,40 @@ import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import { Switches } from "../perf/speedups.ts";
+import { threadReadIndexes } from "./threadReadIndexes.ts";
 
 // Lives outside Migrations: the fork forbids new numbered upstream migrations.
 // Idempotent, so it runs on every open, after runMigrations, for fresh and upgraded databases.
 // Predicate must match the authored subqueries in ProjectionStore (INDEXED BY).
 export const ensureShellLookupIndexes = Effect.fn("ensureShellLookupIndexes")(function* () {
   const sql = yield* SqlClient.SqlClient;
+  for (const statement of threadReadIndexes("main", "orchestration_v2_projection_turn_items")) {
+    yield* sql.unsafe(statement);
+  }
   yield* sql`
     CREATE INDEX IF NOT EXISTS ardud_v2_messages_latest_user_authored_idx
     ON orchestration_v2_projection_messages(thread_id, updated_at DESC, message_id DESC)
     WHERE role = 'user' AND json_extract(payload_json, '$.createdBy') = 'user'
+  `;
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_recovery_active_threads_idx
+    ON orchestration_v2_projection_threads(thread_id)
+    WHERE deleted_at IS NULL AND json_extract(payload_json, '$.archivedAt') IS NULL
+  `;
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_recovery_live_threads_idx
+    ON orchestration_v2_projection_runs(thread_id, ordinal DESC)
+    WHERE status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
+  `;
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_recovery_pending_requests_idx
+    ON orchestration_v2_projection_runtime_requests(thread_id, created_at, runtime_request_id)
+    WHERE status = 'pending'
+  `;
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_recovery_child_subagents_idx
+    ON orchestration_v2_projection_subagents(thread_id, COALESCE(started_at, ''), subagent_id)
+    WHERE child_thread_id IS NOT NULL
   `;
   // Periodic session maintenance starts from loaded native IDs or nonempty rosters,
   // never every provider thread accumulated by a long-lived application thread.

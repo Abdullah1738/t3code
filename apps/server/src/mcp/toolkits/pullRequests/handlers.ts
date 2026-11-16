@@ -20,6 +20,8 @@ import {
   visibleThreadPullRequests,
 } from "@t3tools/shared/threadPullRequests";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -28,6 +30,7 @@ import * as Option from "effect/Option";
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
 import * as ProjectService from "../../../project/ProjectService.ts";
 import * as RepositoryIdentityResolver from "../../../project/RepositoryIdentityResolver.ts";
+import * as PullRequestService from "../../../pullRequest/PullRequestService.ts";
 import * as PullRequestReviewGuideService from "../../../pullRequest/PullRequestReviewGuideService.ts";
 import { pullRequestSyncKey } from "../../../pullRequest/pullRequestSyncKey.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
@@ -45,6 +48,7 @@ import {
   PullRequestNotOpenError,
   type PullRequestTargetInput,
   PullRequestWatchFailedError,
+  PullRequestWatchUnavailableError,
   PullRequestWatchTimeoutError,
   PullRequestToolTimeoutError,
   PullRequestWatchFromSubagentError,
@@ -65,16 +69,50 @@ interface ResolvedTarget {
 
 class PullRequestOperationState extends Context.Service<
   PullRequestOperationState,
-  { saved: boolean | "unknown"; phase: string | undefined }
+  {
+    saved: boolean | "unknown";
+    phase: string | undefined;
+    since: bigint;
+    totals: { admission: number; read: number; mutate: number; ack: number };
+  }
 >()("t3/mcp/toolkits/pullRequests/handlers/PullRequestOperationState") {}
+
+// The operation deadline already owns the span; retain its stages in the call ledger.
+const operationPhase = Effect.fnUntraced(function* (phase: string) {
+  const state = yield* PullRequestOperationState;
+  const now = yield* Clock.monotonicTimeNanos;
+  finishPhase(state, now);
+  state.phase = phase;
+});
+
+function finishPhase(state: PullRequestOperationState["Service"], now: bigint) {
+  const key =
+    state.phase === "dispatch"
+      ? "mutate"
+      : state.phase === "result"
+        ? "ack"
+        : state.phase === undefined
+          ? "admission"
+          : "read";
+  state.totals[key] += Number(now - state.since) / 1e6;
+  state.since = now;
+}
 
 const pullRequestDeadline = <Timeout>(
   makeError: (saved: boolean | "unknown") => Timeout,
   span = "PullRequestsToolkit.pullRequestDeadline",
 ) =>
   Effect.fn(span)(function* <A, E, R>(operation: Effect.Effect<A, E, R>) {
-    const state = PullRequestOperationState.of({ saved: false, phase: undefined });
+    const state = PullRequestOperationState.of({
+      saved: false,
+      phase: undefined,
+      since: yield* Clock.monotonicTimeNanos,
+      totals: { admission: 0, read: 0, mutate: 0, ack: 0 },
+    });
     return yield* operation.pipe(
+      // PR point reads and receipt checks must not queue behind background history scans.
+      // This changes reader selection only; commits still use the writer connection.
+      NodeSqliteClient.foregroundReads,
       Effect.provideService(PullRequestOperationState, state),
       // A masked SQLite commit can outlive cancellation; never join its cleanup before replying.
       McpDeadline.awaitInterruptibly,
@@ -86,6 +124,14 @@ const pullRequestDeadline = <Timeout>(
             Effect.andThen(Effect.fail(makeError(state.saved))),
           ),
       }),
+      Effect.ensuring(
+        Effect.gen(function* () {
+          finishPhase(state, yield* Clock.monotonicTimeNanos);
+          const call = yield* Effect.serviceOption(McpCall.McpCall);
+          if (Option.isSome(call)) call.value.replyPhases = { ...state.totals };
+          if (state.saved !== "unknown") yield* McpCall.setSaved(state.saved);
+        }),
+      ),
     );
   });
 
@@ -240,6 +286,7 @@ function projectForPullRequest(
 
 const make = Effect.gen(function* () {
   const engine = yield* Orchestrator.OrchestratorV2;
+  const pullRequests = yield* PullRequestService.PullRequestService;
   const reviewGuides = yield* PullRequestReviewGuideService.PullRequestReviewGuideService;
 
   const projects = yield* ProjectService.ProjectService;
@@ -308,7 +355,7 @@ const make = Effect.gen(function* () {
     watching: boolean,
   ) {
     const state = yield* PullRequestOperationState;
-    state.phase = "handler";
+    yield* operationPhase("handler");
     const thread = yield* requireThread(PullRequestWatchFailedError, input.threadId);
     const project = yield* projectOf(thread, PullRequestWatchFailedError);
     const target = yield* resolveTarget(input, project);
@@ -332,8 +379,49 @@ const make = Effect.gen(function* () {
         ...(watching ? { alreadyWatching: true } : { alreadyUnwatched: true }),
       };
     }
+    if (watching) {
+      const preflight = yield* pullRequests
+        .detail({
+          projectId: thread.projectId,
+          host: target.host,
+          repository: target.repository,
+          number: target.number,
+          allowStale: false,
+        })
+        .pipe(
+          McpDeadline.awaitInterruptibly,
+          // Leave most of the ten-second operation budget for saving and reading back the watch.
+          Effect.timeout("3 seconds"),
+          Effect.match({
+            onSuccess: () => ({ outcome: "ok" as const }),
+            onFailure: (error) =>
+              error._tag === "PullRequestUnavailableError"
+                ? { outcome: "unavailable" as const, error }
+                : {
+                    outcome:
+                      error._tag === "TimeoutError"
+                        ? ("timeout" as const)
+                        : ("skipped-error" as const),
+                  },
+          }),
+        );
+      yield* Effect.annotateCurrentSpan("pullRequest.watch.preflight", preflight.outcome);
+      if (preflight.outcome === "unavailable") {
+        yield* Effect.logWarning("pull request watch preflight refused", {
+          host: target.host,
+          repository: target.repository,
+          number: target.number,
+          reason: preflight.error.reason,
+          threadId: thread.id,
+        });
+        return yield* new PullRequestWatchUnavailableError({
+          host: target.host,
+          cause: preflight.error,
+        });
+      }
+    }
     const id = yield* commandId("mcp-pr-watch", thread.id);
-    state.phase = "dispatch";
+    yield* operationPhase("dispatch");
     state.saved = "unknown";
     yield* engine
       .dispatch({
@@ -348,7 +436,7 @@ const make = Effect.gen(function* () {
       })
       .pipe(Effect.catchCause(dispatchFailure(PullRequestWatchFailedError)));
     state.saved = true;
-    state.phase = "result";
+    yield* operationPhase("result");
     const after = yield* requireThread(PullRequestWatchFailedError, thread.id);
     return {
       host: target.host,
@@ -363,8 +451,7 @@ const make = Effect.gen(function* () {
   const locateAll = Effect.fn("PullRequestsToolkit.locateAll")(function* (
     targets: ReadonlyArray<Omit<PullRequestTargetInput, "threadId">>,
   ) {
-    const state = yield* PullRequestOperationState;
-    state.phase = "handler";
+    yield* operationPhase("handler");
     const scope = yield* McpInvocationContext.requireMcpCapability("pull-requests");
     const callerThread =
       scope.thread === undefined
@@ -414,7 +501,7 @@ const make = Effect.gen(function* () {
       writesThread((input) =>
         Effect.gen(function* () {
           const state = yield* PullRequestOperationState;
-          state.phase = "handler";
+          yield* operationPhase("handler");
           const thread = yield* requireThread(PullRequestLinkFailedError, input.threadId);
           const project = yield* projectOf(thread, PullRequestLinkFailedError);
           const target = yield* resolveTarget(input, project);
@@ -424,7 +511,7 @@ const make = Effect.gen(function* () {
           if (existing && existing.source !== "stack-dismissed")
             return { ...target, alreadyLinked: true };
           const id = yield* commandId("mcp-pr-link", thread.id);
-          state.phase = "dispatch";
+          yield* operationPhase("dispatch");
           state.saved = "unknown";
           const alreadyLinked = yield* engine
             .dispatch({
@@ -443,6 +530,7 @@ const make = Effect.gen(function* () {
               Effect.catchCause(dispatchFailure(PullRequestLinkFailedError)),
             );
           state.saved = true;
+          yield* operationPhase("result");
           return { ...target, alreadyLinked };
         }),
       ),
@@ -452,7 +540,7 @@ const make = Effect.gen(function* () {
       writesThread((input) =>
         Effect.gen(function* () {
           const state = yield* PullRequestOperationState;
-          state.phase = "handler";
+          yield* operationPhase("handler");
           const thread = yield* requireThread(PullRequestUnlinkFailedError, input.threadId);
           const project = yield* projectOf(thread, PullRequestUnlinkFailedError);
           const target = yield* resolveTarget(input, project);
@@ -466,7 +554,7 @@ const make = Effect.gen(function* () {
               wasLinked: false,
             };
           const id = yield* commandId("mcp-pr-unlink", thread.id);
-          state.phase = "dispatch";
+          yield* operationPhase("dispatch");
           state.saved = "unknown";
           const wasLinked = yield* engine
             .dispatch({
@@ -483,6 +571,7 @@ const make = Effect.gen(function* () {
               Effect.catchCause(dispatchFailure(PullRequestUnlinkFailedError)),
             );
           state.saved = true;
+          yield* operationPhase("result");
           return {
             host: target.host,
             repository: target.repository,
@@ -543,7 +632,7 @@ const make = Effect.gen(function* () {
                   };
                 }
                 const state = yield* PullRequestOperationState;
-                state.phase = "dispatch";
+                yield* operationPhase("dispatch");
                 state.saved = "unknown";
                 return yield* reviewGuides
                   .generate(guideReference(entry.project, entry.target))
