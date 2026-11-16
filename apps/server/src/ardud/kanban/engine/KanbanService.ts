@@ -1873,6 +1873,7 @@ const make = Effect.gen(function* () {
     string,
     { boardId: string; pool: string; movedAt: string; at: number }
   >();
+  const dispatchSkips = new Map<string, { boardId: string; reason: string }>();
   const context =
     yield* Effect.context<import("../../../serverSettings.ts").ServerSettingsService>();
   const locks = yield* BoardLocks.make();
@@ -9509,11 +9510,19 @@ const make = Effect.gen(function* () {
     boardId: KanbanBoard["id"],
     dispatch: Rules.Dispatch,
     planned: KanbanCard,
-    destination: { newThread: boolean; expectedCard: KanbanCard; valid: Effect.Effect<boolean> },
+    destination: {
+      newThread: boolean;
+      expectedCard: KanbanCard;
+      valid: Effect.Effect<boolean>;
+      skipReason: string | undefined;
+    },
     pass: ReturnType<typeof dispatchCardPass>,
   ) {
     const board = yield* boardOf(boardId);
-    if (settingUp.has(board.id)) return;
+    if (settingUp.has(board.id)) {
+      destination.skipReason = "setup_running";
+      return;
+    }
     const card = yield* cardOf(dispatch.cardId);
     // Planning and starting use separate snapshots; confirm before any side effect.
     const confirmed = Rules.confirmDispatch(
@@ -9524,11 +9533,15 @@ const make = Effect.gen(function* () {
       yield* boardHolds(board.id, `${board.id}:${dispatch.cardId}`),
       dispatch,
     );
-    if (!confirmed) return;
+    if (!confirmed) {
+      destination.skipReason = "dispatch_changed";
+      return;
+    }
     const projectId = card.projectId ?? board.defaultProjectId;
     const at = yield* nowIso;
     const system: KanbanActor = { _tag: "system", component: "dispatcher" };
     if (projectId === null) {
+      destination.skipReason = "no_project";
       const next = {
         ...card,
         stalled: { reason: "No project set for this card", by: system, at },
@@ -9540,6 +9553,7 @@ const make = Effect.gen(function* () {
     }
     const refused = modelProblem(yield* providerRegistry.getProviders, dispatch.model);
     if (refused !== null) {
+      destination.skipReason = "model_refused";
       const reason = `Model refused: ${refused}`;
       const next = { ...card, stalled: { reason, by: system, at }, updatedAt: at };
       yield* logEvent(next, system, "flagged", { body: reason });
@@ -9567,10 +9581,18 @@ const make = Effect.gen(function* () {
       : dispatch.role === "work"
         ? card.workThreadId
         : Rules.reviewThreadToReuse(board, card);
+    const checkStop = (id: string) =>
+      refusePendingStop(id).pipe(
+        Effect.tapError(() =>
+          Effect.sync(() => {
+            destination.skipReason = "thread_stopping";
+          }),
+        ),
+      );
     // Reset releases the home card before its old run finishes stopping.
     // Claimed cards must wait for that reservation even with a fresh destination.
     if (dispatch.freshReason !== undefined && card.workThreadId !== null)
-      yield* refusePendingStop(card.workThreadId);
+      yield* checkStop(card.workThreadId);
     let threadId: ThreadId | null = null;
     let adoptRunning = false;
     let runStateAtSend = "idle";
@@ -9611,14 +9633,20 @@ const make = Effect.gen(function* () {
     if (existing !== null) {
       // A pending interrupt invalidates the running view used for orphan adoption.
       yield* settlePendingNotes(board.id, existing, true);
-      yield* refusePendingStop(existing);
+      yield* checkStop(existing);
       // Do not mistake a failed projection read for a missing work thread.
       const existingRead =
         dispatch.role === "work" ? yield* Effect.result(threads.find(existing)) : null;
-      if (existingRead?._tag === "Failure") return;
+      if (existingRead?._tag === "Failure") {
+        destination.skipReason = "thread_read_failed";
+        return;
+      }
       let view = existingRead === null ? yield* threads.view(existing) : existingRead.success;
       const priorDelivery = delivering.get(card.id);
-      if (priorDelivery?.threadId === existing && !priorDelivery.revoked) return;
+      if (priorDelivery?.threadId === existing && !priorDelivery.revoked) {
+        destination.skipReason = "assignment_delivering";
+        return;
+      }
       if (rollbackAt !== undefined && assignmentKey !== null) {
         // A crash after rollback can leave the old assignment alive. Repair its
         // withdrawal before the busy-thread guard can defer this card again.
@@ -9629,15 +9657,22 @@ const make = Effect.gen(function* () {
           withdrawalBefore: rollbackAt,
           text: `The board changed while assigning card #${card.number}. Re-read card_get before acting on that assignment; keep working on your other cards.`,
         });
-        if (withdrawn === "pending") return;
+        if (withdrawn === "pending") {
+          destination.skipReason = "withdrawal_pending";
+          return;
+        }
         const refreshed = yield* Effect.result(threads.find(existing));
-        if (Result.isFailure(refreshed)) return;
+        if (Result.isFailure(refreshed)) {
+          destination.skipReason = "thread_read_failed";
+          return;
+        }
         view = refreshed.success;
       }
       runStateAtSend = view?.runStatus ?? view?.state ?? "missing";
       const compactEvent =
         dispatch.role === "work" ? yield* threadCompacting(existing, yield* pass.read) : undefined;
       if (dispatch.joins && !view) {
+        destination.skipReason = "thread_missing";
         // The thread holding the slot is gone: the card stops pointing at it,
         // so the next pass gives it a slot of its own instead of joining again.
         yield* dropHold(existing);
@@ -9652,6 +9687,7 @@ const make = Effect.gen(function* () {
       if (view && dispatch.role === "work") {
         const reason = yield* ensureWorkModel(existing, dispatch.model, card.id);
         if (reason !== null) {
+          destination.skipReason = "thread_model_mismatch";
           const next = { ...card, stalled: { reason, by: system, at }, updatedAt: at };
           yield* logEvent(next, system, "flagged", { body: reason });
           destination.expectedCard = yield* saveDispatchCard(next);
@@ -9700,15 +9736,20 @@ const make = Effect.gen(function* () {
           dispatch.role === "work" &&
           compactEvent !== undefined &&
           (yield* store.cardsByThread(existing)).length === 0;
-        if (waitingForCompact) return;
+        if (waitingForCompact) {
+          destination.skipReason = "compaction_pending";
+          return;
+        }
         if (view.state === "running") {
           // Starting late does not renew a delivery superseded before provider admission.
           if (
             rollback !== undefined &&
             (view.runRequestedAt == null ||
               Date.parse(view.runRequestedAt) <= Date.parse(rollback.at))
-          )
+          ) {
+            destination.skipReason = "assignment_withdrawn";
             return;
+          }
           const ownershipChange = events.findLast(
             (event) =>
               event.fromStage !== event.toStage &&
@@ -9727,15 +9768,19 @@ const make = Effect.gen(function* () {
               ownershipChange.actor.threadId !== existing) &&
             (view.runStartedAt === null ||
               Date.parse(view.runStartedAt) <= Date.parse(ownershipChange.at))
-          )
+          ) {
+            destination.skipReason = "thread_stopping";
             return;
+          }
           // A run predating a wake has not received its instructions yet.
           if (
             card.wakeNote !== null &&
             (view.runStartedAt === null ||
               !(Date.parse(view.runStartedAt) > Date.parse(card.movedAt)))
-          )
+          ) {
+            destination.skipReason = "wake_pending_run";
             return;
+          }
           if (dispatch.role === "review") {
             const verdict = events.findLast(
               (event) =>
@@ -9748,13 +9793,21 @@ const make = Effect.gen(function* () {
               verdict &&
               (view.runStartedAt === null ||
                 !(Date.parse(view.runStartedAt) > Date.parse(verdict.at)))
-            )
+            ) {
+              destination.skipReason = "review_verdict_pending";
               return;
+            }
             const model = yield* threads.model(existing, true);
-            if (model === null || Rules.poolKey(model) !== Rules.poolKey(dispatch.model)) return;
+            if (model === null || Rules.poolKey(model) !== Rules.poolKey(dispatch.model)) {
+              destination.skipReason = "review_model_mismatch";
+              return;
+            }
           }
           adoptRunning = true;
-        } else if (!dispatch.joins) return;
+        } else if (!dispatch.joins) {
+          destination.skipReason = `thread_${view.state}`;
+          return;
+        }
       }
       if (view?.state === "idle" && compactEvent !== undefined) {
         const compactRunId = compactEvent.body?.match(/\[compact-run ([^\]]+)\]$/)?.[1];
@@ -9764,13 +9817,20 @@ const make = Effect.gen(function* () {
             : yield* Effect.result(threads.compactRun(existing, compactRunId));
         // A failed read or the original failure is not proof that maintenance
         // finished; wait rather than silently abandon the thread.
-        if (
-          latest._tag === "Failure" ||
-          latest.success?.message?.trim().toLowerCase() !== "/compact"
-        )
+        if (latest._tag === "Failure") {
+          destination.skipReason = "compaction_read_failed";
           return;
+        }
+        if (latest.success?.message?.trim().toLowerCase() !== "/compact") {
+          destination.skipReason = "compaction_not_started";
+          return;
+        }
         if (latest.success.status !== "completed") {
-          if (!["failed", "cancelled", "interrupted"].includes(latest.success.status)) return;
+          if (!["failed", "cancelled", "interrupted"].includes(latest.success.status)) {
+            destination.skipReason = "compaction_pending";
+            return;
+          }
+          destination.skipReason = "compaction_failed_fresh";
           // An accepted send can still fail as a provider maintenance run.
           const fresh: KanbanCard = {
             ...card,
@@ -9796,6 +9856,7 @@ const make = Effect.gen(function* () {
         // Its old thread is gone, so a block by that thread's work counts again.
         const byId = new Map((yield* pass.read).map((c) => [c.id as string, c]));
         if (Rules.isBlocked(card, byId, null)) {
+          destination.skipReason = "fresh_thread_blocked";
           destination.expectedCard = yield* saveDispatchCard({
             ...card,
             workThreadId: null,
@@ -9845,7 +9906,7 @@ const make = Effect.gen(function* () {
     const reused = threadId;
     if (reused !== null) {
       // A release saved during the thread reads must settle before a later attempt.
-      yield* refusePendingStop(reused);
+      yield* checkStop(reused);
     }
     if (threadId === null) {
       destination.newThread = true;
@@ -10134,6 +10195,7 @@ const make = Effect.gen(function* () {
         );
         // An owner stop can revoke delivery before its card write returns.
         if (pending?.revoked) {
+          destination.skipReason = "assignment_revoked";
           yield* cleanup;
           return;
         }
@@ -10187,6 +10249,7 @@ const make = Effect.gen(function* () {
       durationMs: Math.max(0, dispatchedAt - Date.parse(card.movedAt)),
       props: { poolKey: dispatch.pool, phase: dispatch.role, span: "KanbanService.startCard" },
     });
+    if (destination.skipReason !== "assignment_revoked") destination.skipReason = undefined;
   });
 
   const recordPoolWaits = Effect.fnUntraced(function* (
@@ -10346,6 +10409,58 @@ const make = Effect.gen(function* () {
     }
   });
 
+  const dispatchSkipEligible = (card: KanbanCard, byId: ReadonlyMap<string, KanbanCard>) =>
+    (card.stage === "todo" || card.stage === "needs_review") &&
+    card.activeThreadId === null &&
+    card.settledAt === null &&
+    card.priority !== KANBAN_BACKLOG &&
+    card.stalled === null &&
+    !kanbanWaiting(card) &&
+    (card.stage !== "todo" || (kanbanWorkStep(card) && !Rules.isBlocked(card, byId)));
+
+  const recordDispatchSkip = Effect.fn("KanbanService.recordDispatchSkip")(function* (
+    board: KanbanBoard,
+    card: KanbanCard,
+    cards: ReadonlyArray<KanbanCard>,
+    pools: ReadonlyArray<KanbanPool>,
+    held: ReadonlyMap<string, string>,
+    poolKey: string,
+    reason: string,
+  ) {
+    if (dispatchSkips.get(card.id)?.reason === reason) return;
+    if (!dispatchSkipEligible(card, new Map(cards.map((row) => [row.id as string, row])))) {
+      dispatchSkips.delete(card.id);
+      return;
+    }
+    const pool = pools.find((pool) => pool.key === poolKey);
+    const holding = Rules.poolThreads(cards, held);
+    const role = card.stage === "todo" ? "work" : "review";
+    const threadId = role === "work" ? card.workThreadId : Rules.reviewThreadToReuse(board, card);
+    const busyPools =
+      threadId === null
+        ? []
+        : [...holding].filter(([, threads]) => threads.has(threadId)).map(([key]) => key);
+    const poolUsed = holding.get(poolKey)?.size ?? 0;
+    dispatchSkips.set(card.id, { boardId: board.id, reason });
+    yield* Effect.logWarning("kanban dispatch skipped", {
+      cardId: card.id,
+      boardId: board.id,
+      pool: poolKey,
+      reason,
+      workThreadId: card.workThreadId,
+      threadId,
+      role,
+      countedBusy: busyPools.length > 0,
+      busyPools,
+      heldReservation: threadId !== null && held.has(threadId),
+      carrying: cards.filter((row) => row.activeRole === "work" && row.activeThreadId === threadId)
+        .length,
+      poolUsed,
+      poolSlots: pool?.slots ?? 0,
+      poolFree: Math.max(0, (pool?.slots ?? 0) - poolUsed),
+    });
+  });
+
   const dispatchUnlocked = Effect.fn("KanbanService.dispatchUnlocked")(function* (
     boardId?: string,
     stoppedCards: ReadonlySet<string> = new Set(),
@@ -10367,6 +10482,7 @@ const make = Effect.gen(function* () {
               const changed = yield* rawStore.watchCardWrites(candidate.id);
               const pass = dispatchCardPass(candidate.id, changed);
               const attempted = new Set(stoppedCards);
+              const skipReasons = new Map<string, string>();
               while (true) {
                 // Replan after each attempt so a failed head leaves room for lower cards.
                 const planned = yield* TickTimings.measure(
@@ -10450,6 +10566,45 @@ const make = Effect.gen(function* () {
                         homes,
                         assignmentWakeRetries,
                       )[0];
+                      const queued = Rules.dispatchQueueStatus(
+                        board,
+                        cards,
+                        pools,
+                        held,
+                        now,
+                        reviews,
+                        homes,
+                        assignmentWakeRetries,
+                        attempted,
+                      );
+                      const byNumber = new Map(cards.map((card) => [card.number, card]));
+                      const byId = new Map(cards.map((card) => [card.id as string, card]));
+                      for (const [id, entry] of dispatchSkips)
+                        if (
+                          entry.boardId === board.id &&
+                          (!byId.has(id) || !dispatchSkipEligible(byId.get(id)!, byId))
+                        )
+                          dispatchSkips.delete(id);
+                      // Record actual skips ahead of this start, before it consumes capacity.
+                      for (const entry of queued) {
+                        const card = byNumber.get(entry.card)!;
+                        if (card.id === dispatch?.cardId) break;
+                        const reason = skipReasons.get(card.id) ?? entry.reason;
+                        if (
+                          !skipReasons.has(card.id) &&
+                          ["would_start", "joins_thread"].includes(reason)
+                        )
+                          continue;
+                        yield* recordDispatchSkip(
+                          board,
+                          card,
+                          cards,
+                          pools,
+                          held,
+                          entry.pool ?? Rules.poolOf(pools, Rules.nextModel(board, card)),
+                          reason,
+                        );
+                      }
                       if (!dispatch) {
                         yield* TickTimings.measure(
                           "pool_accounting",
@@ -10467,7 +10622,9 @@ const make = Effect.gen(function* () {
                         return null;
                       }
                       const card = cards.find((card) => card.id === dispatch.cardId);
-                      return card ? { boardId: board.id, dispatch, card } : null;
+                      return card
+                        ? { boardId: board.id, dispatch, card, board, cards, pools, held }
+                        : null;
                     }),
                   ),
                 );
@@ -10476,6 +10633,7 @@ const make = Effect.gen(function* () {
                 attempted.add(dispatch.cardId);
                 const key = `${boardId}:${dispatch.cardId}`;
                 const destination = {
+                  skipReason: "start_deferred" as string | undefined,
                   valid: Effect.succeed(true),
                   expectedCard: card,
                   newThread:
@@ -10730,6 +10888,24 @@ const make = Effect.gen(function* () {
                           ),
                     ),
                     Effect.as(true),
+                    Effect.tapCause((cause) =>
+                      Effect.sync(() => {
+                        if (destination.skipReason === "start_deferred") {
+                          const defects = cause.reasons.flatMap((reason) =>
+                            reason._tag === "Die" ? [reason.defect] : [],
+                          );
+                          destination.skipReason = defects.some(
+                            (defect) => defect instanceof BoardLocks.DispatchReadBudgetExceeded,
+                          )
+                            ? "read_budget_exceeded"
+                            : defects.some(
+                                  (defect) => defect instanceof BoardLocks.BoardStateChanged,
+                                )
+                              ? "dispatch_changed"
+                              : "thread_start_failed";
+                        }
+                      }),
+                    ),
                     Effect.catchCause((cause) =>
                       Effect.logWarning("kanban dispatch failed", {
                         cardId: dispatch.cardId,
@@ -10753,7 +10929,47 @@ const make = Effect.gen(function* () {
                       ),
                     ),
                   );
-                // The reader may still be stalled; don't immediately retake the planning gate.
+                if (destination.skipReason === undefined) {
+                  dispatchSkips.delete(card.id);
+                } else {
+                  const reason = destination.skipReason;
+                  skipReasons.set(card.id, reason);
+                  // A read-budget failure must not reacquire the stalled reader to log it.
+                  if (!continuePass) {
+                    yield* recordDispatchSkip(
+                      planned.board,
+                      card,
+                      planned.cards,
+                      planned.pools,
+                      planned.held,
+                      dispatch.pool,
+                      reason,
+                    );
+                  } else {
+                    yield* locks.run(
+                      Effect.gen(function* () {
+                        const cards = yield* pass.read;
+                        const current = cards.find((row) => row.id === card.id);
+                        if (current === undefined || current.activeThreadId !== null) {
+                          dispatchSkips.delete(card.id);
+                          return;
+                        }
+                        yield* recordDispatchSkip(
+                          yield* boardOf(boardId),
+                          current,
+                          cards,
+                          Rules.maskDownPools(
+                            yield* store.pools(boardId),
+                            new Set((yield* Ref.get(down)).keys()),
+                          ),
+                          yield* boardHolds(boardId),
+                          dispatch.pool,
+                          reason,
+                        );
+                      }),
+                    );
+                  }
+                }
                 if (!continuePass) break;
               }
             }).pipe(Effect.scoped),
