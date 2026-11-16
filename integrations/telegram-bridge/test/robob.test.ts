@@ -1,9 +1,9 @@
-import { afterEach, expect, setSystemTime, test } from "bun:test";
+import { afterEach, expect, setSystemTime, spyOn, test } from "bun:test";
 import { useToolLogFixture } from "./toollog-fixture.ts";
 import { Attention } from "../src/attention.ts";
 import { createApi } from "../src/api.ts";
 import { backendKind } from "../src/config.ts";
-import type { PendingRequest, ThreadState, ThreadSummary } from "../src/control.ts";
+import { ControlError, type ControlEventFrame, type PendingRequest, type ThreadState, type ThreadSummary } from "../src/control.ts";
 import { ActiveThreadsBoard, boardEntry, RobobAlertBackend, runOrdinal, type RobobAlertOptions } from "../src/robob.ts";
 import { Store } from "../src/store.ts";
 
@@ -107,7 +107,10 @@ function cachedBoard() {
 test("board reads are cached until 30 seconds old, with safe telemetry only", async () => {
   const h = cachedBoard();
   const counters = { fetchesByReason: { cold: 0, age: 0, hard: 0, soft: 0 }, dirtyEventsByType: {}, windowStartedAt: new Date(0).toISOString(),
-    threadReads: 0, threadReadErrors: 0, threadReadsByReason: { run: 0, state: 0, followup: 0, created: 0 } };
+    threadReads: 0, threadReadErrors: 0, threadReadsByReason: { run: 0, state: 0, followup: 0, created: 0 },
+    streamConnects: 0, streamEndsByKind: { errorFrame: 0, clean: 0, thrown: 0, aborted: 0 },
+    streamLastConnectedMs: null, streamMinConnectedMs: null, streamMaxConnectedMs: null,
+    streamErrorCodes: {}, lastStreamEndAt: null, lastStreamEndKind: null };
   expect(h.board.status()).toEqual({ boardFetches: 0, boardCacheHits: 0, boardFetchErrors: 0, boardBackoffMs: 0, lastFetchDurationMs: null, lastFetchReason: null, ...counters });
   const first = await h.board.snapshot();
   for (const at of [1, 3_000, 10_000, 29_999]) {
@@ -1456,4 +1459,155 @@ test.each([
   await control.backend.sessionBoard();
 });
 
-useToolLogFixture();
+const streamLogs = useToolLogFixture();
+
+
+type StreamScript = (abort: AbortController) => AsyncGenerator<ControlEventFrame, void, unknown>;
+async function scriptedStreams(scripts: StreamScript[]) {
+  const control = fakeControl([], { now: () => now });
+  const abort = new AbortController();
+  const resumes: Array<number | undefined> = [];
+  const delays: number[] = [];
+  let index = 0;
+  control.backend.client.events = async function* (options) {
+    resumes.push(options.after);
+    const script = scripts[index++];
+    if (!script) { abort.abort(); return; }
+    yield* script(abort);
+  };
+  const timer = spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void, delay: number) => {
+    delays.push(delay);
+    callback();
+    return 0;
+  }) as unknown as typeof setTimeout);
+  const events = [];
+  let callbacks = 0;
+  try {
+    for await (const event of control.backend.notifications(abort.signal, () => { callbacks++; })) events.push(event);
+  } finally { timer.mockRestore(); }
+  return { control, events, callbacks, resumes, delays };
+}
+
+test("stream ends record first-frame lifetimes, clean and error-frame ends, and preserve replay/backoff", async () => {
+  let at = now;
+  // Use the injected wall clock for both the board window and connection durations.
+  const control = fakeControl([], { now: () => at });
+  const abort = new AbortController();
+  let connection = 0;
+  const resumes: Array<number | undefined> = [];
+  control.backend.client.events = async function* (options) {
+    resumes.push(options.after);
+    if (connection++ === 0) {
+      yield { id: "5", data: { type: "ready", threadId: "thread:PRIVATE_ID", title: "PRIVATE_TITLE" } };
+      at += 10;
+      yield { id: "6", data: { type: "future.event", text: "PRIVATE_PAYLOAD" } };
+      at += 75;
+      yield { id: "7", data: { type: "error", code: "replica_lag", token: "PRIVATE_TOKEN" } };
+    } else if (connection === 2) {
+      at += 100;
+      yield { id: "8", data: { type: "ready" } };
+      at += 25;
+    } else { abort.abort(); }
+  };
+  const delays: number[] = [];
+  const timer = spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void, delay: number) => {
+    delays.push(delay); callback(); return 0;
+  }) as unknown as typeof setTimeout);
+  let callbacks = 0;
+  try { for await (const event of control.backend.notifications(abort.signal, () => { callbacks++; })) void event; }
+  finally { timer.mockRestore(); }
+  const stats = control.backend.boardStatus()!;
+  expect(stats).toMatchObject({ streamConnects: 2, streamEndsByKind: { errorFrame: 1, clean: 1, thrown: 0, aborted: 1 },
+    streamLastConnectedMs: 25, streamMinConnectedMs: 25, streamMaxConnectedMs: 85, streamErrorCodes: { replica_lag: 1 },
+    lastStreamEndAt: new Date(at).toISOString(), lastStreamEndKind: "aborted", windowStartedAt: new Date(now).toISOString(),
+    dirtyEventsByType: { ready: { hard: 2, soft: 0 }, error: { hard: 0, soft: 1 } } });
+  expect(callbacks).toBe(4);
+  expect(resumes).toEqual([undefined, 7, 8]);
+  // The no-frame abort still follows the existing reconnect sleep path.
+  expect(delays).toEqual([1000, 1000, 2000]);
+  expect(streamLogs.entries().filter(row => row.name === "tg.robob.streamEnd").map(row => row.props)).toEqual([
+    { kind: "errorFrame", connectedMs: 85, code: "replica_lag" },
+    { kind: "clean", connectedMs: 25, code: "none" },
+    { kind: "aborted", connectedMs: null, code: "none" },
+  ]);
+  const { attention: alerts } = attention(control.backend);
+  expect(alerts.status().board).toEqual(stats);
+  const store = new Store(":memory:"); stores.push(store);
+  const api = createApi({ store, enabled: () => true, chatId: () => 100, timezone: "UTC", health: () => ({ board: control.backend.boardStatus() }) });
+  const health = await (await api(new Request("http://bridge/health"))).json();
+  expect(health.board).toEqual(stats);
+  expect(JSON.stringify(health) + streamLogs.text()).not.toContain("PRIVATE_");
+  stats.streamEndsByKind.clean = 100;
+  stats.streamErrorCodes.replica_lag = 100;
+  expect(control.backend.boardStatus()?.streamEndsByKind.clean).toBe(1);
+  expect(control.backend.boardStatus()?.streamErrorCodes.replica_lag).toBe(1);
+});
+
+test("stream throws retain toolError and aborts override thrown and error-frame outcomes", async () => {
+  const result = await scriptedStreams([
+    async function* () { yield { data: { type: "ready" } }; throw new Error("PRIVATE_ERROR"); },
+    async function* (abort) { yield { data: { type: "error", code: "replica_lag" } }; abort.abort(); throw new Error("PRIVATE_ABORT"); },
+  ]);
+  expect(result.control.backend.boardStatus()).toMatchObject({ streamConnects: 2,
+    streamEndsByKind: { errorFrame: 0, clean: 0, thrown: 1, aborted: 1 }, lastStreamEndKind: "aborted" });
+  expect(result.delays).toEqual([1000]);
+  expect(streamLogs.entries().filter(row => row.error?.tag === "tg.robob.notifications")).toHaveLength(2);
+  expect(streamLogs.entries().filter(row => row.name === "tg.robob.streamEnd").map(row => row.props?.kind)).toEqual(["thrown", "aborted"]);
+  expect(streamLogs.text()).not.toContain("PRIVATE_");
+});
+
+test("stream auth failures still escape and record a thrown attempt with no connected lifetime", async () => {
+  const control = fakeControl();
+  const error = new ControlError(401, "unauthorized");
+  control.backend.client.events = async function* () { throw error; };
+  const stream = control.backend.notifications(new AbortController().signal);
+  await expect(stream.next()).rejects.toBe(error);
+  expect(control.backend.boardStatus()).toMatchObject({ streamConnects: 0,
+    streamEndsByKind: { thrown: 1 }, streamLastConnectedMs: null, streamMinConnectedMs: null, streamMaxConnectedMs: null });
+  expect(streamLogs.entries().filter(row => row.error?.tag === "tg.robob.notifications")).toHaveLength(1);
+});
+
+test("error-frame codes are bounded, private payloads are excluded, and only the final frame determines clean ends", async () => {
+  const result = await scriptedStreams([async function* () {
+    yield { data: { type: "ready" } };
+    for (const code of ["replica_lag", undefined, "PRIVATE_TITLE", "x".repeat(41), "", 123, "bad code", "__proto__", "constructor",
+      ...Array.from({ length: 25 }, (_, index) => `code-${index}`), "replica_lag"]) {
+      yield { data: { type: "error", code, threadId: "thread:PRIVATE_ID", title: "PRIVATE_TITLE", text: "PRIVATE_PAYLOAD" } };
+    }
+    yield { data: { type: "ready" } };
+  }]);
+  const stats = result.control.backend.boardStatus()!;
+  expect(stats.streamConnects).toBe(1);
+  expect(stats.streamEndsByKind).toEqual({ errorFrame: 0, clean: 1, thrown: 0, aborted: 1 });
+  expect(Object.keys(stats.streamErrorCodes)).toHaveLength(21);
+  expect(stats.streamErrorCodes).toMatchObject({ replica_lag: 2, none: 6, constructor: 1, ["__proto__"]: 1, other: 9 });
+  expect(JSON.stringify(stats) + streamLogs.text()).not.toContain("PRIVATE_");
+  const fresh = fakeControl().backend.boardStatus()!;
+  expect(fresh.streamConnects).toBe(0);
+  expect(fresh.streamErrorCodes).toEqual({});
+});
+
+
+test.each([
+  ["replica_lag", "replica_lag"], ["a.b-c_9", "a.b-c_9"], ["x".repeat(40), "x".repeat(40)],
+  ["__proto__", "__proto__"], ["constructor", "constructor"], ["other", "other"],
+  [undefined, "none"], [null, "none"], [123, "none"], ["", "none"], ["x".repeat(41), "none"],
+  ["PRIVATE_TITLE", "none"], ["bad code", "none"], ["thread:private-id", "none"], ["line\n", "none"],
+] satisfies Array<[unknown, string]>)("final error code %p is counted and logged as %s", async (code, expected) => {
+  const result = await scriptedStreams([async function* () { yield { data: { type: "ready" } }; yield { data: { type: "error", code } }; }]);
+  expect(result.control.backend.boardStatus()?.streamEndsByKind.errorFrame).toBe(1);
+  expect(result.control.backend.boardStatus()?.streamErrorCodes).toEqual({ [expected]: 1 });
+  const end = streamLogs.entries().find(row => row.name === "tg.robob.streamEnd");
+  expect(end?.props).toEqual({ kind: "errorFrame", connectedMs: 0, code: expected });
+});
+
+test("overflow error code logs as other and aborting a clean iterator records only aborted", async () => {
+  const result = await scriptedStreams([async function* (abort) {
+    for (let index = 0; index < 25; index++) yield { data: { type: "error", code: `code-${index}` } };
+    abort.abort();
+  }]);
+  expect(result.control.backend.boardStatus()?.streamEndsByKind).toEqual({ errorFrame: 0, clean: 0, thrown: 0, aborted: 1 });
+  expect(streamLogs.entries().find(row => row.name === "tg.robob.streamEnd")?.props).toEqual({ kind: "aborted", connectedMs: 0, code: "other" });
+  const empty = await scriptedStreams([async function* (abort) { abort.abort(); }]);
+  expect(empty.control.backend.boardStatus()).toMatchObject({ streamConnects: 0, streamEndsByKind: { aborted: 1 }, streamLastConnectedMs: null });
+});

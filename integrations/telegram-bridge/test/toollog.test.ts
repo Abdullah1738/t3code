@@ -110,3 +110,20 @@ test("cause classes never retain arbitrary codes, messages or unapproved fields"
   expect(rows(dir).at(-1).props).toBeUndefined();
   expect(readFileSync(join(dir, `${day()}.ndjson`), "utf8")).not.toContain(secret);
 });
+
+
+test("stream end logs allow only lifecycle fields and obey the existing event cap", () => {
+  const dir = fixture();
+  toolLog({ component: "telegram", kind: "event", name: "tg.robob.streamEnd",
+    props: { kind: "errorFrame", connectedMs: 85, code: "replica_lag", title: "PRIVATE_TITLE", threadId: "PRIVATE_ID", payload: "PRIVATE_PAYLOAD" } });
+  expect(rows(dir)[0].props).toEqual({ kind: "errorFrame", connectedMs: 85, code: "replica_lag" });
+  toolLog({ component: "telegram", kind: "event", name: "tg.robob.streamEnd", props: { kind: "PRIVATE_KIND", connectedMs: -1, code: "PRIVATE_CODE" } });
+  expect(rows(dir)[1]).not.toHaveProperty("props");
+  expect(JSON.stringify(rows(dir))).not.toContain("PRIVATE_");
+  const file = join(dir, `${day()}.ndjson`), cap = 50 * 1024 * 1024 + 1;
+  truncateSync(file, cap);
+  toolLog({ component: "telegram", kind: "event", name: "tg.robob.streamEnd", props: { kind: "clean", connectedMs: 85, code: "none" } });
+  const tail = readFileSync(file).subarray(cap).toString();
+  expect(tail).toContain('"name":"log.cap"');
+  expect(tail).not.toContain("tg.robob.streamEnd");
+});

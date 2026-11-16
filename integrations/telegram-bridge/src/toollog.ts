@@ -2,6 +2,7 @@ import { chmodSync, closeSync, existsSync, fchmodSync, mkdirSync, openSync, read
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { STREAM_END_KINDS, STREAM_ERROR_CODE } from "./stream-telemetry.ts";
 
 export type LogEntry = {
   component: string; kind: "event" | "perf" | "error"; name: string;
@@ -36,6 +37,10 @@ function fields(entry: LogEntry, at: Date) {
   const props: Record<string, string | number | boolean | null> = {};
   for (const [key, value] of Object.entries(entry.props ?? {})) {
     if (key === "exitCode" && value === null) props[key] = null;
+    else if (entry.name === "tg.robob.streamEnd" && key === "kind" && STREAM_END_KINDS.includes(value as typeof STREAM_END_KINDS[number])) props[key] = String(value);
+    else if (entry.name === "tg.robob.streamEnd" && key === "connectedMs"
+      && (value === null || (typeof value === "number" && Number.isFinite(value) && value >= 0))) props[key] = value;
+    else if (entry.name === "tg.robob.streamEnd" && key === "code" && typeof value === "string" && STREAM_ERROR_CODE.test(value)) props[key] = value;
     else if (key === "cause" && safeCause(value)) props[key] = value;
     else if (key === "detail" && safeDetail(value)) props[key] = value;
     else if (key === "errorClass" && typeof value === "string" && errorClasses.has(value)) props[key] = value;
