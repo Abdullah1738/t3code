@@ -6,11 +6,17 @@ import math
 import os
 from pathlib import Path
 import re
+import atexit
+import time
+import signal
+import threading
+import volume
 
 CAP = 200 * 1024 * 1024
 _seen = set()
+_last_report = time.monotonic()
 PROPS = {'endpoint', 'model', 'size', 'count', 'status', 'enabled', 'locked', 'limited', 'reloginNeeded', 'state', 'action', 'tag', 'dryRun', 'complete', 'cost', 'hour', 'exitCode', 'attempt', 'source', 'failed', 'total', 'fourxx', 'fivexx', 'phase', 'durationMaxMs', 'omitted', 'provider', 'scope', 'cause', 'lockMs', 'until', 'previousBackoffLevel', 'backoffLevel', 'source'}
-IDS = {'account', 'connection', 'thread', 'incident', 'request', 'session'}
+IDS = {'account', 'connection', 'thread', 'incident', 'request', 'session', 'writer'}
 MESSAGES = {'Robob replica is stale; recovery deferred', 'Robob replica is not ready',
             'thread is newer than Robob replica; recovery deferred', 'unverified Robob replica',
             'The operation was aborted due to timeout', 'The operation was aborted'}
@@ -44,6 +50,8 @@ def clean(event, now):
             v = token(v)
         if v is not None and (isinstance(v, (str, bool)) or isinstance(v, (int, float)) and math.isfinite(v)):
             props[k] = v
+    if name == 'log.volume':
+        props.update(volume.clean_props(event.get('props', {})))
     if ids:
         row['ids'] = ids
     if props:
@@ -55,15 +63,32 @@ def clean(event, now):
     return row
 
 def emit(component, name, kind='event', **fields):
+    state = None
     try:
         now = dt.datetime.now(dt.timezone.utc)
+        root = directory()
+        day = now.date().isoformat()
+        state = volume.state_for(root, day)
         row = clean(dict(component=component, name=name, kind=kind, **fields), now)
         if row is None:
+            volume.dropped(state, 'invalid_event')
             return
-        root = directory()
+        if len((json.dumps(row, separators=(',', ':')) + '\n').encode()) > 4096:
+            volume.dropped(state, 'line_size')
+            return
+        _write(root, day, now, row, state)
+        if time.monotonic() - _last_report >= volume.INTERVAL_SECONDS:
+            report_volume(heartbeat=True)
+    except Exception:
+        if state is not None:
+            volume.dropped(state, 'invalid_event')
+
+
+def _write(root, day, now, row, state):
+    is_volume = row['name'] == 'log.volume'
+    try:
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(root, 0o700)
-        day = now.date().isoformat()
         key = (str(root), day)
         if key not in _seen:
             # Cross-process marker makes retention a once-a-day operation.
@@ -87,12 +112,57 @@ def emit(component, name, kind='event', **fields):
                     os.close(marker)
                     cap = clean(dict(component='logger', name='log.cap', kind='error', error={'tag': 'daily_cap'}), now)
                     os.write(fd, (json.dumps(cap, separators=(',', ':')) + '\n').encode())
+                    volume.written(state, 'log.cap')
                 except FileExistsError:
                     pass
-                if kind != 'error':
-                    return
+                # Drop counters must remain visible after the daily cap.
+                if row['kind'] != 'error' and not is_volume:
+                    volume.dropped(state, 'daily_cap')
+                    return False
             os.write(fd, (json.dumps(row, separators=(',', ':')) + '\n').encode())
+            if not is_volume:
+                volume.written(state, row['name'])
+            return True
         finally:
             os.close(fd)
     except Exception:
-        pass
+        volume.write_error(state, not is_volume)
+        return False
+
+
+def report_volume(heartbeat=False):
+    global _last_report
+    _last_report = time.monotonic()
+    for state in list(volume.STATES.values()):
+        if state['version'] <= state['reported'] and not (heartbeat and state['day'] == dt.datetime.now(dt.timezone.utc).date().isoformat()):
+            continue
+        try:
+            root, day = state['root'], state['day']
+            if not root.is_dir():
+                continue
+            path = root / (day + '.ndjson')
+            record = volume.snapshot(state, path.stat().st_size if path.exists() else 0)
+            now = dt.datetime.combine(dt.date.fromisoformat(day), dt.datetime.now(dt.timezone.utc).timetz())
+            row = clean(dict(component='logger', name='log.volume', kind='event', ids=record['ids'], props=record['props']), now)
+            if _write(root, day, now, row, state):
+                state['reported'] = record['version']
+        except Exception:
+            volume.write_error(state, False)
+
+
+atexit.register(report_volume)
+
+def _report_on_signal(signum, previous):
+    def handle(received, frame):
+        report_volume()
+        if callable(previous):
+            previous(received, frame)
+        elif previous == signal.SIG_DFL:
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+    return handle
+
+
+if threading.current_thread() is threading.main_thread():
+    for _signum in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(_signum, _report_on_signal(_signum, signal.getsignal(_signum)))
