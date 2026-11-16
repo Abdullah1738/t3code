@@ -564,9 +564,10 @@ def receipt_for_question(data, charge, qid=None, questions=None, at=None):
     return accepts
 
 
-def explain_charge(data, charge, at, now, deadline=None, find=None, said=None, qid=None, *, purchases=True):
+def explain_charge(data, charge, at, now, deadline=None, find=None, said=None, qid=None, *, purchases=True, write_cache=True):
     said = said or (lambda *a, **kw: charges.owner_texts(
-        *a, **kw, cache_path=Path(data or DATA) / 'owner-texts.json', cache_reset=lambda: record_event('cache_reset')))
+        *a, **kw, cache_path=Path(data or DATA) / 'owner-texts.json',
+        cache_reset=lambda: record_event('cache_reset'), write_cache=write_cache))
     if charge['kind'] != 'charge':
         return charges.explain(charge, at, now, deadline, find, said)
     questions = load_questions(data)['questions']
@@ -579,7 +580,7 @@ def explain_charge(data, charge, at, now, deadline=None, find=None, said=None, q
         return shared
     stop = deadline if deadline is not None else time.time() + 30
     aliases = [current] + [q for q in questions if q['id'] != qid and alert_alias(current, q)]
-    memo = {('orders_cache',): Path(data or DATA) / 'order-details.json'}
+    memo = {('orders_cache',): Path(data or DATA) / 'order-details.json', ('write_cache',): write_cache}
     for app in ('noon', 'careem'):
         times = [parse_time(q['at']) - charges.SAME_TIME for q in aliases
                  if charges.order_app(charge_of(q)) == app]
@@ -2454,6 +2455,7 @@ def screen(text, sender='', at=None, now=None, deadline=None, data=None, find=No
     at = (at or now).astimezone(TZ)
     chan = channel(sender)
     q = question_for(load_questions(data), charge, at, chan, item)
+    # Recovery only projects persisted case state into this local question.
     recover_case(data, q)
     owner = charges.card_owner(charge)
     base = {'kind': charge['kind'], 'owner': owner, 'errors': []}
@@ -2477,7 +2479,8 @@ def screen(text, sender='', at=None, now=None, deadline=None, data=None, find=No
         return {**base, 'verdict': 'asked', 'why': f"another alert for this charge ({q['item']}) went to him",
                 'id': q['id']}
     matched = subscription_match(data, charge, at, record=record, end=deadline) if dated else None
-    r = matched or explain_charge(data, charge, at, now, deadline, find, said, q['id'] if q else None)
+    r = matched or explain_charge(data, charge, at, now, deadline, find, said, q['id'] if q else None,
+                                  write_cache=record)
     verdict = 'explained' if r['verdict'] in ('receipt', 'owner', 'subscription') else r['verdict']
     qid = q['id'] if q else None
     if record:
