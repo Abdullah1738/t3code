@@ -55,6 +55,7 @@ import * as Sqlite from "../../../persistence/Sqlite.ts";
 import * as ProjectService from "../../../project/ProjectService.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
 import * as KanbanService from "../engine/KanbanService.ts";
+import { PACKET_SUBTASK } from "../engine/subtasks.ts";
 import * as KanbanModels from "../engine/models.ts";
 import * as Activity from "../engine/activity.ts";
 import * as Rules from "../engine/rules.ts";
@@ -7828,6 +7829,48 @@ it.effect("card_create and card_edit report guessed gates and expose clearGate",
     const saved = (yield* kanban.card(card.id)).card;
     assert.lengthOf(saved.asks, 1);
     assert.strictEqual(saved.subtasks[0]!.gateCleared?.text, "Tell both reporters once installed");
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("a work thread's card_create numbers the packet first in its gated reply", () => {
+  const { layer, running } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "worker-gates",
+      name: "Worker gates",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+    const origin = yield* kanban.createCard(
+      board.id,
+      { title: "Origin", prompt: "Origin" },
+      owner,
+    );
+    yield* kanban.dispatchNow;
+    const worker = (yield* kanban.card(origin.id)).card.workThreadId!;
+    running.add(worker);
+    const created = yield* call(worker, "card_create", {
+      title: "Worker follow-up",
+      prompt: "Follow-up",
+      subtasks: [{ text: "Deploy the helper", owner: "evaluator" }],
+    });
+    assert.isFalse(created.isError, created.text);
+    // The engine put the packet first, so the deploy step is s2 and the reply
+    // must name s2, not the s1 the input would get on an evaluator's card.
+    assert.deepStrictEqual(created.structured.gated, [
+      { id: "s2", gate: "deploy", source: "guessed" },
+    ]);
+    assert.include(created.structured.message, "s2 got a guessed deploy gate");
+    const card = yield* decodeKanbanCard(created.structured.card);
+    assert.deepStrictEqual(
+      card.subtasks.map(({ id, step, text }) => [id, step, text]),
+      [
+        ["s1", 1, PACKET_SUBTASK],
+        ["s2", 2, "Deploy the helper"],
+      ],
+    );
+    assert.strictEqual(card.subtasks[1]!.gate, "deploy");
   }).pipe(Effect.provide(layer));
 });
 

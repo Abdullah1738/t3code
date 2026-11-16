@@ -38,7 +38,9 @@ import {
   askGateWarning,
   gateOf,
   idNumber,
+  needsPacketStep,
   secretKindApprovalWarning,
+  withPacketStep,
   type SubtaskInput,
 } from "../engine/subtasks.ts";
 import { KanbanService, messageTextFields } from "../engine/KanbanService.ts";
@@ -1343,7 +1345,12 @@ const handlers = {
           { ...fields, stage: input.stage, question: input.question ?? null },
           caller.actor,
         );
-        return { card, ...gatedResult(card, input.subtasks, board.guessedGates) };
+        // The engine puts the packet first for a thread's or a script's card, so
+        // the ids the reply names must be numbered with it in front.
+        const planInput = needsPacketStep(caller.actor)
+          ? withPacketStep(input.subtasks ?? [])
+          : input.subtasks;
+        return { card, ...gatedResult(card, planInput, board.guessedGates) };
       }),
     ),
   ),

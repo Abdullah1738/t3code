@@ -962,6 +962,10 @@ export const withPacketStep = (
   ...inputs.map((input) => (input.step === undefined ? input : { ...input, step: input.step + 1 })),
 ];
 
+/** A thread's or a script's card waits for an evaluator to write its packet. */
+export const needsPacketStep = (actor: KanbanActor): boolean =>
+  actor._tag === "thread" || actor._tag === "script";
+
 export type SubtaskPlan =
   | {
       readonly ok: true;
