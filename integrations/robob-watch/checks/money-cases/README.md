@@ -182,3 +182,59 @@ The command screens receipts, orders, purchase notes and subscriptions before li
 After installing this fix, run `money-cases migrate-legacy-asks --dry-run`, review the list, then run `money-cases migrate-legacy-asks` once. It seeds the existing ask marker on open non-bill cases from the original daily list whose current cycle started before 13 Nov 2026 04:25Z, plus four verified legacy cases. Age and receipt-wait eligibility are frozen at that cutoff. It preserves their status; historical notifications do not become pending questions. Repeating it makes no further changes. Existing asks and answered state prevent another daily first ask, including linked questions and structured owner answers.
 
 Declined daily items retain a reason until their revision, cycle or charge evidence changes. Receipt waits resume at their expiry; timeouts and unreadable lookups can be retried. Cases without usable card evidence or a matching charge date are excluded from the daily count.
+
+## iCloud downloads
+
+DATA stays at `~/Documents/assistant/money-cases` (or `MONEY_CASES_DIR`).
+Book and cache reads, lock opens/flocks, and atomic writes retry EDEADLK after
+one bounded `brctl download` attempt. Backoffs and the download share the
+remaining check/phase deadline. Other I/O errors keep their existing behavior.
+An unreadable dependency aborts before any further save; it is never treated as
+an empty book. Temporary JSON files are renamed only after a complete write.
+
+The runner counts **every nonzero exit**, including 75, as a failure. There is no
+skip code. On EDEADLK exhaustion, `check` therefore prints one diagnostic line
+and returns 0 with no event. It retains pings.json and its outbox. The runner
+advances its acknowledgement; the next check resumes from money-cases' retained
+state. The existing busy-check.lock exit 75 is unchanged. Other CLI commands
+return 75 for an unavailable data file.
+
+Each skip records `skip_streak`, `first_skip_at` / `last_skip_at` (Unix seconds),
+`last_file`, `edeadlk_retries` and `edeadlk_ms` in `data-skips.json` in WATCH_DIR,
+**outside DATA**. A streak at least two hours old exits 1 to trigger the normal
+failure/alert path. A clean run removes that file and records the preceding
+streak as `timing.edeadlk_skips_before`. Successful pings.json timing also includes
+`edeadlk_retries`, `edeadlk_ms`, and a metadata-only startup `dataless_files` count
+(SF_DATALESS, 0x40000000); those counters are allowed in check.run tool logs too.
+
+### Keep Downloaded
+
+Every install attempts the idempotent pin, without failing the install when
+pinning fails. Run `money-cases pin` to retry, or `money-cases pin --check` for
+FileProvider's pin state and current dataless count. No data path changes.
+
+Verified on macOS 27.0.1 (26A434), 16 Nov 2026, in disposable folders under
+Documents, removed afterwards:
+
+```
+xattr -w 'com.apple.fileprovider.pinned#PX' 1 <folder>
+fileproviderctl evaluate <folder>
+```
+
+FileProvider processes this asynchronously. The installer waits up to eight
+seconds after setting the attribute and only reports `pinned` when
+`fileproviderctl evaluate` reports `isKeepDownloaded = 1;`. A repeated install
+reports `already pinned` only after the same confirmation. A written xattr alone
+is insufficient: the unsuffixed `com.apple.fileprovider.pinned` test did **not**
+report Keep Downloaded. The pinned folder's child also reported
+`isKeepDownloaded = 1;`; an unpinned control reported 0. `brctl evict <child>`
+refused eviction with NSFileProviderErrorDomain -2008 and the file remained
+materialized. The newly created, not-yet-uploaded control was also refused, so
+that refusal alone does not establish the cause. FileProvider's affirmative
+Keep Downloaded state is the verification used by the CLI and installer.
+`brctl` and `fileproviderctl` help list no pin subcommand on this OS. The xattr
+interface is not an Apple-supported public pin API, so failed or changed behavior
+is reported, never assumed successful.
+
+Sources: [Apple's Keep Downloaded guide](https://support.apple.com/guide/mac-help/work-with-folders-and-files-in-icloud-drive-mchl1a02d711/mac)
+and [the FileProvider/xattr investigation](https://eclecticlight.co/2026/10/13/pin-files-in-icloud-drive/).
