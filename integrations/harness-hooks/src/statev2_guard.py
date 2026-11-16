@@ -1651,6 +1651,309 @@ def _strip_config_dir_db_names(source, directory):
     return re.sub(join + config + r'(?P<names>' + database + r')\s*\)|' + quoted, operand, source)
 
 
+def _js_fixture_source(source):
+    # Only immutable strings in unshadowed const spans supply root evidence.
+    # Ambiguous syntax retains the original scan for the affected span.
+    if re.search(r'\b(?:homedir|cwd)\b|\bHOME\b(?!\s*:)|\bprocess\s*(?:\[|\.\s*(?:env\s*\[|(?:chdir|cwd)\b))|[\'"`]~/(?:\.robob|\.t3|\.local/share/opencode)\b', source):
+        return source
+    if re.search(r'''['"`]/[^'"`\n]*/(?:\.robob|\.t3|\.local/share/opencode|robob-data|opencode-data)(?:/|['"`])''', source):
+        return source
+    live_parents = {str(parent) for path in protected_databases() for parent in path.parents if str(parent) != '/'}
+    for match in re.finditer(r'''['"`](/[^'"`\n]*)['"`]''', source):
+        value = os.path.normpath(match[1])
+        if value in live_parents or re.fullmatch(r'/(?:Users|home)/[^/]+|/root', value):
+            return source
+    token = re.compile(r'''//[^\n]*|/\*[\s\S]*?\*/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*|===|!==|==|!=|=>|(?:>>>|<<|>>|\*\*|&&|\|\||\?\?|[+*/%&|^-])=|\+\+|--|[^\s]''')
+    regexp = re.compile(r'''/(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\\n\[])+/[dgimsuvy]*''')
+    quoted = re.compile(r"//[^\n]*|/\*[\s\S]*?\*/|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'")
+
+    def template_end(start, nesting=0):
+        if nesting > 24:
+            return None, True
+        position, uncertain = start + 1, False
+        while position < len(source):
+            if source[position] == '\\':
+                position += 2
+            elif source[position] == '`':
+                return position + 1, uncertain
+            elif source.startswith('${', position):
+                position += 2
+                begin, groups = position, ['}']
+                while groups and position < len(source):
+                    string = quoted.match(source, position)
+                    if string:
+                        position = string.end()
+                        continue
+                    char = source[position]
+                    if char == '`':
+                        position, _ = template_end(position, nesting + 1)
+                        uncertain = True
+                        if position is None:
+                            return None, True
+                        continue
+                    if char == '/':
+                        return None, True
+                    if char in {'"', "'", '\\'}:
+                        return None, True
+                    if char in '{[(':
+                        groups.append({'{': '}', '[': ']', '(': ')'}[char])
+                        uncertain |= char == '{'
+                    elif char in '}])':
+                        if char != groups.pop():
+                            return None, True
+                    position += 1
+                if groups:
+                    return None, True
+                uncertain |= bool(re.search(r'\bfunction\b|=>|(?<![=!<>])=(?!=|>)|\+\+|--', source[begin:position - 1]))
+            else:
+                position += 1
+        return None, True
+    regex_prefixes = {'(', '[', '=', ',', ':', ';', '?', '~', '+', '-', '*', '/', '%', '&', '|', '^',
+                      '==', '!=', '===', '!==', '=>', 'return', 'throw', 'case', 'typeof', 'void', 'delete', 'in', 'instanceof'}
+    matches, position, uncertain_tokens = [], 0, set()
+    while (match := token.search(source, position)) is not None:
+        if match[0].startswith('`'):
+            end, uncertain = template_end(match.start())
+            if end is None:
+                return source
+            if uncertain:
+                uncertain_tokens.add(len(matches))
+            match = re.compile(r'[\s\S]+').match(source, match.start(), end)
+        elif match[0] in {'"', "'"}:
+            return source
+        if match[0] == '/':
+            previous = re.sub(r'\s+', '', matches[-1][0]) if matches else ''
+            # Optional access can split a keyword property off its receiver.
+            member = len(matches) > 1 and matches[-2][0] == '.'
+            # A division sign must not swallow the following assignments as a
+            # regex. Block/control endings need a parser, so retain the scan.
+            if not member and (not previous or previous in regex_prefixes or re.fullmatch(r'(?:>>>|<<|>>|\*\*|&&|\|\||\?\?|[+*/%&|^-])?=', previous)):
+                match = regexp.match(source, match.start())
+                if match is None:
+                    return source
+            elif not member and (previous in {')', '}', '!', '<', '>', 'of', 'yield', 'await'} or not (re.fullmatch(r'[\w$]+(?:\.[\w$]+)*', previous) or
+                    previous[:1] in {'"', "'", '`', '/'} or previous in {']', '++', '--'})):
+                return source
+        position = match.end()
+        if not match[0].startswith(('//', '/*')):
+            matches.append(match)
+    words = [re.sub(r'\s+', '', m[0]) if m[0][0] not in "\"'`" else m[0] for m in matches]
+    scopes, parents, scope_ends, stack = [], {0: None}, {}, [0]
+    for i, word in enumerate(words):
+        scopes.append(stack[-1])
+        if word == '{':
+            parents[i + 1] = stack[-1]
+            stack.append(i + 1)
+        elif word == '}':
+            if len(stack) == 1:
+                return source
+            scope_ends[stack.pop()] = i
+    if len(stack) != 1:
+        return source
+    scope_ends[0] = len(words)
+    definitions, writes = {}, []
+    for i in range(len(words) - 2):
+        if words[i] in {'const', 'let'} and re.fullmatch(r'[A-Za-z_$][\w$]*', words[i + 1]) and words[i + 2] == '=':
+            definitions.setdefault((scopes[i], words[i + 1]), []).append((i + 3, i + 1))
+        if re.fullmatch(r'[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*', words[i]) and (
+                re.fullmatch(r'(?:>>>|<<|>>|\*\*|&&|\|\||\?\?|[+*/%&|^-])?=', words[i + 1]) or
+                words[i + 1] in {'++', '--', 'of', 'in'} or words[i - 1:i] in (['++'], ['--'], ['delete'])):
+            writes.append(i)
+
+    def binding(name, i):
+        scope = scopes[i]
+        while scope is not None:
+            key = (scope, name)
+            if key in definitions:
+                return key
+            scope = parents[scope]
+        return None
+
+    invalid = set()
+    for i in writes:
+        key = binding(words[i], i)
+        if key and (len(definitions[key]) != 1 or definitions[key][0][1] != i):
+            invalid.add(key)
+    # A complex assignment target proves nothing about any name it contains.
+    # Include its receiver for indexed writes; unrelated fixture names survive.
+    brackets, openings = [], {}
+    for i, word in enumerate(words):
+        if word in {'[', '{', '('}:
+            brackets.append(i)
+        elif word in {']', '}', ')'} and brackets:
+            if words[brackets[-1]] != {']': '[', '}': '{', ')': '('}[word]:
+                return source
+            openings[i] = brackets.pop()
+        elif word in {']', '}', ')'}:
+            return source
+        if word in {']', '}', ')', '!'} and words[i + 1:i + 2] and (
+                words[i + 1] in {'of', 'in'} or re.fullmatch(r'(?:>>>|<<|>>|\*\*|&&|\|\||\?\?|[+*/%&|^-])?=', words[i + 1])):
+            start = openings.get(i, i)
+            for n in range(max(0, start - 1), i):
+                invalid.add(binding(words[n], n))
+                invalid.add(binding(words[n].split('.')[0], n))
+    if brackets:
+        return source
+    declarations = []
+    for i, word in enumerate(words[:-2]):
+        if word in {'const', 'let', 'var', 'function', 'class'} and re.fullmatch(r'[A-Za-z_$][\w$]*', words[i + 1]):
+            declarations.append((words[i + 1], i + 1))
+        if word == 'function' and words[i + 1] == '*' and re.fullmatch(r'[A-Za-z_$][\w$]*', words[i + 2]):
+            declarations.append((words[i + 2], i + 2))
+        if word in {'const', 'let', 'var'} and re.fullmatch(r'[A-Za-z_$][\w$]*', words[i + 1]) and words[i + 2] != '=':
+            definitions[(scopes[i], words[i + 1])] = []
+        if word in {'const', 'let', 'var'} and words[i + 1] in {'{', '['}:
+            end = next((n for n in range(i + 2, len(words)) if words[n] == '='), i + 2)
+            names = set(words[i + 2:end])
+            for name in names:
+                if re.fullmatch(r'[A-Za-z_$][\w$]*', name):
+                    definitions[(scopes[i], name)] = []
+                    declarations.append((name, i + 1))
+        if word == 'import' and words[i + 1] != '(':
+            end = next((n for n in range(i + 1, len(words)) if words[n] == 'from' or words[n][:1] in {'"', "'"}), len(words))
+            declarations.extend((words[n], n) for n in range(i + 1, end) if re.fullmatch(r'[A-Za-z_$][\w$]*', words[n]))
+    # Parameter bindings shadow outer fixture names even without an assignment.
+    # Unknown/destructured parameter syntax can only remove a proof.
+    parameters, nesting = [], []
+    for i, word in enumerate(words):
+        if word == '(':
+            nesting.append(i)
+        elif word == ')' and nesting:
+            start = nesting.pop()
+            after = i + 1
+            prefix = start - 1
+            if prefix >= 0 and words[prefix] == '>':
+                depth = 1
+                prefix -= 1
+                while prefix >= 0 and depth:
+                    depth += (words[prefix] == '>') - (words[prefix] == '<')
+                    prefix -= 1
+            before = words[max(0, prefix - 2):prefix + 1]
+            function = 'function' in before
+            # Return types do not affect parameter bindings. Unknown type
+            # syntax must not let a header borrow an enclosing const proof.
+            if words[after:after + 1] == [':']:
+                parameters.append((start + 1, i, after))
+                continue
+            arrow = words[after:after + 1] == ['=>']
+            if arrow:
+                after += 1
+            # Method names can be keywords, literals or computed properties.
+            # Ambiguous control headers may only remove an outer root proof.
+            method = words[after:after + 1] == ['{']
+            if arrow or function or method:
+                parameters.append((start + 1, i, after))
+        elif word == '=>' and i and re.fullmatch(r'[\w$]+', words[i - 1]):
+            parameters.append((i - 1, i, i + 1))
+    parameter_names = set()
+    for start, end, body in parameters:
+        names = {word for word in words[start:end] if re.fullmatch(r'[A-Za-z_$][\w$]*', word)}
+        parameter_names.update(names)
+        declarations.extend((name, start) for name in names)
+        if words[body:body + 1] == ['{']:
+            for name in names:
+                definitions[(body + 1, name)] = []
+        else:
+            # Concise arrows and typed returns need no expression-extent
+            # inference: remove the enclosing binding's proof conservatively.
+            invalid.update(binding(name, body) for name in names)
+    # Const strings cannot be redirected by missed writes. A different binding
+    # anywhere in the declaration's remaining block still voids that proof.
+    for key, values in definitions.items():
+        if len(values) != 1:
+            continue
+        _, declaration = values[0]
+        if (words[declaration - 1] != 'const' or
+                any(name == key[1] and declaration < i < scope_ends[key[0]] for name, i in declarations) or
+                any(declaration < i < scope_ends[key[0]] and
+                    (key[1] in words[i] or DATABASE_NAME.search(words[i])) for i in uncertain_tokens)):
+            invalid.add(key)
+
+    def suffix(value):
+        return bool(value) and not value.startswith(('/', '~')) and not re.search(r'[\\$`]', value) and '..' not in value.split('/')
+
+    def expression(i, seen=frozenset(), awaited=False):
+        if i >= len(words) or len(seen) > 24:
+            return None, i
+        if words[i] == 'await':
+            return expression(i + 1, seen, awaited=True)
+        word = words[i]
+        if word[:1] in {'"', "'"}:
+            value = word[1:-1]
+            return ('part', value) if suffix(value) else None, i + 1
+        if word.startswith('`'):
+            if i in uncertain_tokens:
+                return None, i + 1
+            template = re.fullmatch(r'`\$\{([\w$.]+)\}/([^`]+)`', word)
+            if template and suffix(template[2]):
+                root = reference(template[1], i, seen)
+                if root and root[0] == 'temp':
+                    return ('temp', ''), i + 1
+            return None, i + 1
+        if words[i + 1:i + 2] != ['(']:
+            return reference(word, i, seen), i + 1
+        args, end = [], i + 2
+        while end < len(words) and words[end] != ')':
+            value, end = expression(end, seen)
+            args.append(value)
+            if words[end:end + 1] != [',']:
+                break
+            end += 1
+        if words[end:end + 1] != [')']:
+            return None, end
+        end += 1
+        if word in {'mkdtemp', 'fsp.mkdtemp', 'realpath', 'fsp.realpath'} and not awaited:
+            return None, end
+        if word in {'tmpdir', 'os.tmpdir'} and not args:
+            return ('prefix', ''), end
+        if word in {'join', 'path.join', 'resolve', 'path.resolve'} and args and args[0] and args[0][0] in {'temp', 'prefix'} and all(arg and arg[0] == 'part' for arg in args[1:]):
+            return args[0], end
+        if word in {'mkdtempSync', 'fs.mkdtempSync', 'mkdtemp', 'fsp.mkdtemp'} and len(args) == 1 and args[0] and args[0][0] == 'prefix':
+            return ('temp', ''), end
+        if word in {'realpathSync', 'fs.realpathSync', 'realpath', 'fsp.realpath'} and len(args) == 1 and args[0] and args[0][0] == 'temp':
+            return args[0], end
+        return None, end
+
+    def reference(name, i, seen):
+        key = binding(name, i)
+        if '.' in name or key is None or key in invalid or key in seen or len(definitions[key]) != 1:
+            return None
+        start, declaration = definitions[key][0]
+        if declaration >= i:
+            return None
+        value, end = expression(start, seen | {key})
+        return value if words[end:end + 1] and words[end] in {';', ',', ')', '}'} else None
+
+    # Builtin names must not be rebound or shadowed by local implementations.
+    calls = {'tmpdir', 'os.tmpdir', 'join', 'path.join', 'resolve', 'path.resolve', 'mkdtempSync', 'fs.mkdtempSync', 'mkdtemp', 'fsp.mkdtemp', 'realpathSync', 'fs.realpathSync', 'realpath', 'fsp.realpath'}
+    apis = {word.split('.')[0] for i, word in enumerate(words) if word in calls and words[i + 1:i + 2] == ['(']}
+    imported = set()
+    for match in re.finditer(r'''\bimport\s+([^;'"\n]+)\s+from\s+['"](?:node:)?(fs(?:/promises)?|os|path)['"]''', source):
+        spec, module = match.groups()
+        names = {'os': {'tmpdir'}, 'path': {'join', 'resolve'}, 'fs': {'mkdtempSync', 'realpathSync'}, 'fs/promises': {'mkdtemp', 'realpath'}}[module]
+        if spec.strip().startswith('{'):
+            imported.update(name.strip() for name in spec.strip()[1:-1].split(',') if name.strip() in names)
+        elif re.fullmatch(r'(?:\*\s+as\s+)?' + {'os': 'os', 'path': 'path', 'fs': 'fs', 'fs/promises': 'fsp'}[module], spec.strip()):
+            imported.add(spec.strip().split()[-1])
+    if not apis <= imported or apis & parameter_names:
+        return source
+    if any(name.split('.')[0] in apis for _, name in definitions) or any(words[i].split('.')[0] in apis for i in writes):
+        return source
+    if apis and re.search(r'\bfunction\s+(?:' + '|'.join(apis) + r')\b', source):
+        return source
+    spans = []
+    for i, word in enumerate(words):
+        if word in {'join', 'path.join', 'resolve', 'path.resolve'} or word.startswith('`'):
+            value, end = expression(i)
+            if value and value[0] == 'temp' and end > i and DATABASE_NAME.search(source[matches[i].start():matches[end - 1].end()]):
+                spans.append((matches[i].start(), matches[end - 1].end()))
+    for start, end in sorted(spans, reverse=True):
+        # Other operands may reuse a protected root, even when this path is
+        # temporary. Discharge its DB name without erasing that root evidence.
+        source = source[:start] + DATABASE_NAME.sub(lambda match: ' ' * len(match[0]), source[start:end]) + source[end:]
+    return source
+
+
 def _source_hit(source, directory, python=False, shell=False):
     # Inspect the original body, including literals/comments, never its path or argv.
     discount_foreign = not PROTECTED_SOURCE_TOKEN.search(source)
@@ -2236,12 +2539,84 @@ def _listing_only(words):
     return binary == 'ls'
 
 
+def _search_read_words(words):
+    # Regexps are data; pattern files, include globs and positional paths are
+    # still readers. Parse options before choosing an implicit first pattern.
+    result, positionals, explicit, options = [words[0]], [], False, True
+    index = 1
+    values = {'-A', '--after-context', '-B', '--before-context', '-C', '--context', '-m', '--max-count'}
+    switches = {'--files-with-matches', '--count', '--quiet', '--line-number',
+                '--text', '--fixed-strings', '--ignore-case',
+                '--word-regexp', '--line-regexp', '--invert-match', '--only-matching', '--no-messages',
+                '--with-filename', '--no-filename', '--null', '--null-data'}
+    short_switches = set('abchiIlLnNqsvwxoFHzU')
+    grep = os.path.basename(words[0]) == 'grep'
+    if grep:
+        values |= {'--include', '--exclude', '--exclude-dir', '--exclude-from', '--label',
+                   '--binary-files', '--directories', '--devices', '-d', '-D'}
+        switches |= {'--recursive', '--dereference-recursive', '--files-without-match', '--initial-tab'}
+        short_switches |= set('EGPRrTuVZ0123456789')
+    else:
+        values |= {'-g', '--glob', '--iglob', '-t', '--type', '-T', '--type-not', '-j', '--threads',
+                   '-M', '--max-columns', '-E', '--encoding', '--color', '--colors', '--sort', '--sortr',
+                   '--max-depth', '--max-filesize', '--ignore-file', '--type-add', '--type-clear',
+                   '--engine', '--replace', '-r', '--path-separator', '--hostname-bin', '--pre', '--pre-glob'}
+        switches |= {'--files', '--files-without-match', '--count-matches', '--json', '--hidden',
+                     '--no-hidden', '--no-ignore', '--no-ignore-vcs', '--follow', '--no-line-number',
+                     '--case-sensitive', '--smart-case', '--pcre2', '--stats', '--multiline'}
+        short_switches |= set('PSuV0')
+    while index < len(words):
+        word = words[index]
+        flag, equal, _ = word.partition('=')
+        if options and word == '--':
+            options = False
+            result.append(word)
+        elif options and flag in {'-e', '--regexp', '-f', '--file'}:
+            explicit = True
+            if flag in {'-f', '--file'}:
+                result.extend(words[index:index + (1 if equal else 2)])
+            index += 0 if equal else 1
+        elif options and flag in values:
+            result.extend(words[index:index + (1 if equal else 2)])
+            index += 0 if equal else 1
+        elif options and word.startswith('-') and not word.startswith('--'):
+            operand = next((n for n, char in enumerate(word[1:], 1) if char in 'ef' or '-' + char in values), None)
+            prefix = word[1:operand] if operand is not None else word[1:]
+            if any(char not in short_switches for char in prefix):
+                return words
+            if operand is not None:
+                char = word[operand]
+                attached = operand + 1 < len(word)
+                explicit |= char in 'ef'
+                if char != 'e':
+                    result.append(word)
+                    if not attached and index + 1 < len(words):
+                        result.append(words[index + 1])
+                index += 0 if attached else 1
+            else:
+                result.append(word)
+        elif options and word.startswith('--'):
+            # GNU grep's color operand is optional and must be attached.
+            if word not in switches and not (grep and flag in {'--color', '--colour'}):
+                return words
+            result.append(word)
+        else:
+            positionals.append(len(result))
+            result.append(word)
+        index += 1
+    if not explicit and not _rg_lists_files(words) and positionals:
+        del result[positionals[0]]
+    return result
+
+
 def _read_words(words):
     if not words:
         return words
     binary = os.path.basename(words[0])
     if binary == "jq":
         return _jq_read_words(words)
+    if binary in {'rg', 'grep'}:
+        words = _search_read_words(words)
     listing = _rg_lists_files(words)
     fd_listing = binary in {"fd", "fdfind"} and _listing_only(words)
     find_listing = binary == "find" and _listing_only(words)
@@ -2984,7 +3359,9 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 live_assignments.add(str(path) if path is not None else candidate)
 
     def check_source(source, directory, python=False, rule="live-database-script", shell=False, test_target=None, location=None):
-        if _source_hit(source, directory, python, shell):
+        # Config/foreign operand discounts cannot supply fixture evidence.
+        checked = _js_fixture_source(source) if test_target is not None and not python and not shell else source
+        if _source_hit(checked, directory, python, shell):
             if test_target is not None:
                 match = _database_reference(source)
                 if match:

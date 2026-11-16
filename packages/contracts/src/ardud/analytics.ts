@@ -126,7 +126,8 @@ export const EvaluatorReuseMissReason = Schema.Literals([
   "legacy_queue",
 ]);
 export type EvaluatorReuseMissReason = typeof EvaluatorReuseMissReason.Type;
-const EventOutcome = Schema.Union([McpOutcome, EvaluatorOutcome]);
+const DetachedOutcome = Schema.Literals(["committed", "failed", "capped"]);
+const EventOutcome = Schema.Union([McpOutcome, EvaluatorOutcome, DetachedOutcome]);
 export const EvaluatorPurposeKind = Schema.Literals([
   "discussion",
   "nightly",
@@ -149,6 +150,8 @@ const GeneralEvent = Schema.Struct({
   discussionId: Schema.optionalKey(Id),
   threadId: Schema.optionalKey(DerivedId),
   durationMs: Schema.optionalKey(Measurement),
+  lateMs: Schema.optionalKey(Measurement),
+  afterCap: Schema.optionalKey(Schema.Boolean),
   tool: Schema.optionalKey(Label),
   build: Schema.optionalKey(Label),
   bootId: Schema.optionalKey(Id),
@@ -244,6 +247,9 @@ const GeneralEvent = Schema.Struct({
   ),
   props: Schema.optionalKey(
     Schema.Struct({
+      on: Schema.optionalKey(Label),
+      until: Schema.optionalKey(Timestamp),
+      script: Schema.optionalKey(Label),
       number: Schema.optionalKey(Measurement),
       from: Schema.optionalKey(Label),
       to: Schema.optionalKey(Label),
@@ -713,9 +719,21 @@ export const AnalyticsRollup = Schema.Struct({
       ),
       failedThenRetried: Measurement,
       retrySucceeded: Measurement,
+      dispatchTimeouts: Schema.optionalKey(
+        Schema.Struct({
+          committed: Measurement,
+          failed: Measurement,
+          capped: Measurement,
+          noOutcome: Measurement,
+        }),
+      ),
     }),
   ),
-  mcpOverflow: Schema.Struct({ groups: Measurement, retryAttempts: Measurement }),
+  mcpOverflow: Schema.Struct({
+    groups: Measurement,
+    retryAttempts: Measurement,
+    detachedOutcomes: Schema.optionalKey(Measurement),
+  }),
 });
 export type AnalyticsRollup = typeof AnalyticsRollup.Type;
 export const AnalyticsReadResult = Schema.Struct({

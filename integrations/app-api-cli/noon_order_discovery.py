@@ -3,6 +3,7 @@
 The watcher wakes a registrar; it never purchases or interprets a history row as
 whole-order delivery proof. Failed lanes keep their previous baseline.
 """
+import toollog
 import datetime as dt
 import fcntl
 import json
@@ -65,6 +66,7 @@ def registered(order):
         return False
 
 
+@toollog.entrypoint('order-watch', 'noon-discovery')
 def main():
     root = Path(os.environ['WATCH_DIR'])
     root.mkdir(parents=True, exist_ok=True)

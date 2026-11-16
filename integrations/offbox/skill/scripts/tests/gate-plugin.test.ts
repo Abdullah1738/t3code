@@ -1,7 +1,7 @@
 // bun test: the gate plugin's shell hook. The plugin imports the classifier
 // relative to ~/.config/opencode/plugin, so it is loaded from a temp copy laid
 // out the same way.
-import { afterAll, expect, mock, test } from "bun:test"
+import { afterAll, expect, mock, spyOn, test } from "bun:test"
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { homedir } from "node:os"
@@ -114,13 +114,16 @@ test("shared gate log records allowed decisions and classifier failures without 
   const hooks: Record<string, (e: any) => unknown> = {}
   const on = (name: string) => ({ hook: async (event: string, fn: any) => { hooks[`${name}:${event}`] = fn } })
   await plugin.setup({ tool: on("tool"), shell: on("shell"), session: on("session") })
-  await hooks["tool:execute.before"]({ tool: "shell", sessionID: "fixture", input: { command: "echo private-prompt-text" } })
+  const random = spyOn(Math, "random").mockReturnValue(0)
+  try {
+    await hooks["tool:execute.before"]({ tool: "shell", sessionID: "fixture", input: { command: "echo private-prompt-text" } })
+  } finally { random.mockRestore() }
   await hooks["tool:execute.before"]({ tool: "shell", input: { get command() { throw new Error("private-token-value") } } })
   const { readFileSync, readdirSync } = await import("node:fs")
   const folder = join(root, "tool-logs")
   const text = readdirSync(folder).filter(f => f.endsWith(".ndjson")).map(f => readFileSync(join(folder, f), "utf8")).join("")
   const lines = text.trim().split("\n").map(line => JSON.parse(line))
-  expect(lines.some(line => line.name === "gate.decision" && line.ok && line.props.decision === "allowed")).toBe(true)
+  expect(lines.some(line => line.name === "gate.decision" && line.ok && line.props.decision === "allowed" && line.props.sample === 20)).toBe(true)
   expect(lines.some(line => line.name === "gate.decision" && !line.ok && line.error.tag === "gate_failed")).toBe(true)
   expect(text).not.toContain("private-prompt-text")
   expect(text).not.toContain("private-token-value")

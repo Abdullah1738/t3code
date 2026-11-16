@@ -11,6 +11,7 @@ import hmac
 import json
 import os
 from pathlib import Path
+import random
 import re
 import secrets
 import shlex
@@ -34,11 +35,18 @@ import rootwide_search_guard
 
 import toollog
 
+GATE_LIGHT_SAMPLE = 20
+
 
 def _tool_log(**fields):
     try:
-        from offbox_toollog import emit
         props = fields.get("props", {})
+        if (fields.get("kind") == "perf" and fields.get("ok") is True
+                and props.get("decision") == "allowed" and props.get("commandClass") == "light"):
+            if not random.random() < 1 / GATE_LIGHT_SAMPLE:
+                return
+            props["sample"] = GATE_LIGHT_SAMPLE
+        from offbox_toollog import emit
         if props.get("harness") == "claude":
             props["harness"] = "claudeAgent"
         emit("gate", "gate.decision", **fields)

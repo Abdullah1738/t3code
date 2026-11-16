@@ -32,6 +32,7 @@ interface McpGroup {
   durations: Durations;
   preHandler: Durations;
   failures: number;
+  dispatchTimeouts: number;
   outcomes: Map<string, number>;
   savedCounts: Map<string, number>;
   reasonClasses: Map<string, number>;
@@ -48,6 +49,23 @@ interface RetryAttempt {
   ts: string;
   group: string;
   ok: boolean;
+  detachedKey?: string;
+}
+
+interface DetachedResult {
+  ts: string;
+  outcome: "committed" | "failed" | "capped";
+  afterCap: boolean;
+}
+
+function detachedKey(event: AnalyticsEvent, startedAt: string) {
+  return JSON.stringify([
+    event.tool,
+    event.clientRequestId,
+    event.ts.slice(0, 10),
+    startedAt,
+    event.bootId ?? "unknown",
+  ]);
 }
 
 interface Breakdown {
@@ -280,7 +298,9 @@ export const makeAccumulator = () => ({
   mcp: new Map<string, McpGroup>(),
   retries: new Map<string, RetryAttempt[]>(),
   retryAttempts: 0,
-  mcpOverflow: { groups: 0, retryAttempts: 0 },
+  detached: new Map<string, DetachedResult[]>(),
+  detachedOutcomes: 0,
+  mcpOverflow: { groups: 0, retryAttempts: 0, detachedOutcomes: 0 },
 });
 
 function boundedKey<T>(groups: Map<string, T>, key: string): string {
@@ -498,7 +518,26 @@ function boardAccumulate(target: ReturnType<typeof makeAccumulator>, event: Anal
 export function accumulate(
   target: ReturnType<typeof makeAccumulator>,
   event: AnalyticsEvent,
+  correlationOnly = false,
 ): void {
+  if (
+    event.kind === "mcp.detached" &&
+    event.tool &&
+    event.clientRequestId &&
+    event.startedAt &&
+    (event.outcome === "committed" || event.outcome === "failed" || event.outcome === "capped")
+  ) {
+    if (target.detachedOutcomes >= 100_000) target.mcpOverflow.detachedOutcomes++;
+    else {
+      const key = detachedKey(event, event.startedAt);
+      const results = target.detached.get(key) ?? [];
+      results.push({ ts: event.ts, outcome: event.outcome, afterCap: event.afterCap === true });
+      target.detached.set(key, results);
+      target.detachedOutcomes++;
+    }
+  }
+  // Related follow-ups inform a filtered call view without becoming selected events or samples.
+  if (correlationOnly) return;
   boardAccumulate(target, event);
   target.total++;
   if ("runId" in event) accumulateUsage(target.usage, event);
@@ -764,6 +803,7 @@ export function accumulate(
         durations: durations(),
         preHandler: durations(),
         failures: 0,
+        dispatchTimeouts: 0,
         outcomes: new Map(),
         savedCounts: new Map(),
         reasonClasses: new Map(),
@@ -776,6 +816,8 @@ export function accumulate(
       target.mcp.set(key, group);
     }
     addDuration(group.durations, event.durationMs ?? 0);
+    const dispatchTimeout = event.outcome === "timeout" && event.errorPhase === "dispatch";
+    if (dispatchTimeout) group.dispatchTimeouts++;
     if (event.preHandlerMs !== undefined) addDuration(group.preHandler, event.preHandlerMs);
     increment(group.outcomes, event.outcome);
     increment(group.savedCounts, String(event.saved ?? "n/a"));
@@ -807,7 +849,14 @@ export function accumulate(
           event.clientRequestId,
         ]);
         const attempts = target.retries.get(identity) ?? [];
-        attempts.push({ ts: event.ts, group: key, ok: event.outcome === "ok" });
+        attempts.push({
+          ts: event.ts,
+          group: key,
+          ok: event.outcome === "ok",
+          ...(dispatchTimeout
+            ? { detachedKey: detachedKey(event, event.startedAt ?? event.ts) }
+            : {}),
+        });
         target.retries.set(identity, attempts);
         target.retryAttempts++;
       }
@@ -879,9 +928,47 @@ export function finishRollup(
   generatedAt: string,
 ): AnalyticsRollup {
   const retries = new Map<string, { failedThenRetried: number; retrySucceeded: number }>();
+  const detached = new Map<string, DetachedResult[]>();
+  const matchedDetached = new Map<string, number>();
+  for (const [key, events] of target.detached) {
+    const results: DetachedResult[] = [];
+    const caps: number[] = [];
+    let nextCap = 0;
+    for (const event of events.toSorted((a, b) => a.ts.localeCompare(b.ts))) {
+      // A masked commit can settle after its cap; it replaces that observation, not another call.
+      const capped = event.afterCap ? caps[nextCap++] : undefined;
+      if (capped !== undefined) results[capped] = event;
+      else {
+        if (event.outcome === "capped") caps.push(results.length);
+        results.push(event);
+      }
+    }
+    detached.set(key, results);
+  }
+  const dispatchTimeouts = new Map<
+    string,
+    { committed: number; failed: number; capped: number; noOutcome: number }
+  >();
+  for (const [key, group] of target.mcp)
+    dispatchTimeouts.set(key, {
+      committed: 0,
+      failed: 0,
+      capped: 0,
+      noOutcome: group.dispatchTimeouts,
+    });
   for (const attempts of target.retries.values()) {
     // Detached emission and overlapping calls can arrive out of order, including across segments.
     const ordered = attempts.toSorted((a, b) => a.ts.localeCompare(b.ts));
+    for (const attempt of ordered) {
+      if (attempt.detachedKey === undefined) continue;
+      const index = matchedDetached.get(attempt.detachedKey) ?? 0;
+      const result = detached.get(attempt.detachedKey)?.[index];
+      if (result === undefined) continue;
+      matchedDetached.set(attempt.detachedKey, index + 1);
+      const counts = dispatchTimeouts.get(attempt.group)!;
+      counts.noOutcome--;
+      counts[result.outcome]++;
+    }
     for (let index = 1; index < ordered.length; index++) {
       const previous = ordered[index - 1]!;
       if (previous.ok) continue;
@@ -1094,6 +1181,7 @@ export function finishRollup(
         savedCounts: Object.fromEntries(group.savedCounts),
         reasonClasses: Object.fromEntries(group.reasonClasses),
         invalidFields: Object.fromEntries(group.invalidFields),
+        dispatchTimeouts: dispatchTimeouts.get(key)!,
         notFoundReasons: Object.fromEntries(group.notFoundReasons),
         foundByCounts: Object.fromEntries(group.foundByCounts),
         idShapeCounts: Object.fromEntries(group.idShapeCounts),

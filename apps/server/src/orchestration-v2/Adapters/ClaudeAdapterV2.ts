@@ -145,6 +145,7 @@ import {
   type CompiledClaudeModelSelection,
 } from "../../claudeModelOptions.ts";
 import * as ServerConfig from "../../config.ts";
+import * as ProviderProcessRegistry from "../../ardud/providers/ProviderProcessRegistry.ts";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
 import { spawnAndCollect } from "@t3tools/provider-core/server/snapshotProbe";
 import { signalProcessGroup } from "@t3tools/provider-core/server/processGroup";
@@ -326,7 +327,12 @@ const WORKFLOW_MEMBER_TRANSCRIPT_FLUSH_MS = 500;
  * reads (#3089). Those stay in the CLI's group, so the rest of the group gets SIGKILL once the
  * CLI exits for any reason.
  */
-function spawnClaudeProcessGroup(options: ClaudeSpawnOptions): ClaudeSpawnedProcess {
+function spawnClaudeProcessGroup(
+  options: ClaudeSpawnOptions,
+  registry: ProviderProcessRegistry.ProviderProcessRegistry["Service"],
+  threadId: string,
+  providerCommandLine: string,
+): ClaudeSpawnedProcess {
   const child = NodeChildProcess.spawn(options.command, options.args, {
     cwd: options.cwd,
     env: options.env,
@@ -334,11 +340,21 @@ function spawnClaudeProcessGroup(options: ClaudeSpawnOptions): ClaudeSpawnedProc
     stdio: ["pipe", "pipe", "ignore"],
     detached: true,
   });
+  let untrack = () => {};
   child.once("exit", () => {
+    untrack();
     try {
       signalProcessGroup(child.pid ?? 0, "SIGKILL");
     } catch {}
   });
+  if (child.pid !== undefined) {
+    try {
+      untrack = registry.track(child.pid, "claudeAgent", threadId, providerCommandLine);
+    } catch (error) {
+      signalProcessGroup(child.pid, "SIGKILL");
+      throw error;
+    }
+  }
   return child;
 }
 
@@ -900,6 +916,7 @@ export const layerQueryRunner: Layer.Layer<
   | Crypto.Crypto
   | Path.Path
   | ProviderEventLoggers.ProviderEventLoggers
+  | ProviderProcessRegistry.ProviderProcessRegistry
 > = Layer.effect(
   ClaudeAgentSdkQueryRunner,
   Effect.gen(function* () {
@@ -909,6 +926,7 @@ export const layerQueryRunner: Layer.Layer<
     const { native: nativeEventLogger } = yield* ProviderEventLoggers.ProviderEventLoggers;
     const agentScope = yield* AgentScope;
     const platform = yield* HostProcess.Platform;
+    const processRegistry = yield* ProviderProcessRegistry.ProviderProcessRegistry;
 
     return ClaudeAgentSdkQueryRunner.of({
       allocateSessionId: crypto
@@ -970,7 +988,19 @@ export const layerQueryRunner: Layer.Layer<
         // Windows has no process groups, so there the SDK spawns the CLI itself.
         const spawnClaudeCodeProcess =
           options.spawnClaudeCodeProcess ??
-          (platform === "win32" ? undefined : spawnClaudeProcessGroup);
+          (platform === "win32"
+            ? undefined
+            : (options: ClaudeSpawnOptions) =>
+                spawnClaudeProcessGroup(
+                  options,
+                  processRegistry,
+                  input.threadId,
+                  [
+                    // wrap receives no arguments, so its last argument is the resolved CLI.
+                    launch === undefined ? options.command : (launch.args.at(-1) ?? launch.command),
+                    ...options.args.slice(launch === undefined ? 0 : launch.args.length),
+                  ].join(" "),
+                ));
         const queryRuntime = yield* Effect.uninterruptibleMask((restore) =>
           Effect.try({
             try: () =>
@@ -3566,6 +3596,14 @@ interface ActiveClaudeTurnContext {
   latestApiFailureCategory: OrchestrationV2ProviderFailureCategory | undefined;
   /** The CLI refused this turn with no fallback model (model_refusal_no_fallback): a content filter, not a usage limit. */
   refusalMessage: string | undefined;
+  refusalFallback:
+    | {
+        readonly notice: string;
+        readonly originalModel: string;
+        readonly fallbackModel: string;
+        readonly category: string | null;
+      }
+    | undefined;
   readonly rejectedRateLimitTypes: Set<string>;
   readonly rateLimitResetTimes: Map<string, string | null>;
   latestAssistantRateLimit: {
@@ -8406,6 +8444,17 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             (message.subtype === "model_refusal_fallback" ||
               (message.subtype === "informational" && message.level !== "info"))
           ) {
+            if (message.subtype === "model_refusal_fallback") {
+              context.refusalFallback = {
+                notice: message.content,
+                originalModel: message.original_model,
+                fallbackModel: message.fallback_model,
+                category:
+                  message.api_refusal_category ??
+                  /Details:\s*`?\[([^\]]+)\]/i.exec(message.content)?.[1] ??
+                  null,
+              };
+            }
             const now = yield* DateTime.now;
             const nativeItemId = message.uuid;
             context.assistant.noticeTexts.add(message.content);
@@ -9335,7 +9384,14 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                       code: "model_refusal",
                       category: "content_filter",
                     })
-                  : failureWithRetryCause;
+                  : context.refusalFallback !== undefined && turnFailure !== null
+                    ? makeProviderFailure({
+                        class: "provider_error",
+                        code: "model_refusal",
+                        category: "content_filter",
+                        message: `${context.refusalFallback.originalModel} safeguards flagged this session${context.refusalFallback.category === null ? "" : ` [${context.refusalFallback.category}]`}; the fallback model ${context.refusalFallback.fallbackModel} failed (${failureWithRetryCause?.message ?? turnFailure.message}).`,
+                      })
+                    : failureWithRetryCause;
             const currentStatus = message.subtype === "success" ? message.api_error_status : null;
             // SDK delivery can lag transcript writes. Conflicting channels cannot
             // establish which native error happened last, so they never authorize replay.
@@ -10136,8 +10192,15 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           const hasPersistedProviderTurn =
             isClaudeSeeded(turnInput.providerThread) ||
             (turnInput.nativeThreadHasTurns ?? turnInput.providerTurnOrdinal > 1);
+          // The CLI may save a turn after the server dies, before Robob records it.
           const shouldResume =
-            resumeSessionAt !== undefined || openedWithResume || hasPersistedProviderTurn;
+            resumeSessionAt !== undefined ||
+            openedWithResume ||
+            hasPersistedProviderTurn ||
+            (yield* findClaudeTranscriptPaths(nativeThreadId).pipe(
+              Effect.map((paths) => paths.length > 0),
+              Effect.orElseSucceed(() => false),
+            ));
           const queryOptions = makeClaudeQueryOptions({
             modelSelection: turnInput.modelSelection,
             nativeThreadId,
@@ -10445,6 +10508,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   : false),
               realApiStatus: undefined,
               refusalMessage: undefined,
+              refusalFallback: undefined,
               rejectedRateLimitTypes: new Set(),
               rateLimitResetTimes: new Map(),
               latestAssistantRateLimit: null,
@@ -11019,11 +11083,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         });
         yield* Effect.addFinalizer(() => closeSession());
 
-        // A CLI stopped before it saved the first prompt can leave a transcript
-        // with only metadata lines. Claude can neither resume that id nor
-        // create it again, so resumeThread fails and the caller binds a fresh
-        // native session with a context handoff.
-        const hasEmptyClaudeTranscript = Effect.fn("ClaudeAdapterV2.hasEmptyClaudeTranscript")(
+        const findClaudeTranscriptPaths = Effect.fn("ClaudeAdapterV2.findClaudeTranscriptPaths")(
           function* (nativeThreadId: string) {
             const configuredDir = adapterOptions.environment.CLAUDE_CONFIG_DIR?.trim() ?? "";
             const projectsDir = path.join(
@@ -11032,9 +11092,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 : path.join(yield* HostProcess.HomeDirectory, ".claude"),
               "projects",
             );
-            // Empty only when every copy of the id is empty; any message means
-            // the CLI may still resume it.
-            let found = false;
+            const matches: Array<string> = [];
             for (const project of yield* fileSystem.readDirectory(projectsDir)) {
               const transcriptPath = path.join(projectsDir, project, `${nativeThreadId}.jsonl`);
               // Stray files beside the project dirs fail with ENOTDIR.
@@ -11043,6 +11101,22 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               ) {
                 continue;
               }
+              matches.push(transcriptPath);
+            }
+            return matches;
+          },
+        );
+
+        // A CLI stopped before it saved the first prompt can leave a transcript
+        // with only metadata lines. Claude can neither resume that id nor
+        // create it again, so resumeThread fails and the caller binds a fresh
+        // native session with a context handoff.
+        const hasEmptyClaudeTranscript = Effect.fn("ClaudeAdapterV2.hasEmptyClaudeTranscript")(
+          function* (nativeThreadId: string) {
+            const transcriptPaths = yield* findClaudeTranscriptPaths(nativeThreadId);
+            // Empty only when every copy of the id is empty; any message means
+            // the CLI may still resume it.
+            for (const transcriptPath of transcriptPaths) {
               const conversationLine = yield* fileSystem
                 .stream(transcriptPath)
                 .pipe(
@@ -11054,9 +11128,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               if (Option.isSome(conversationLine)) {
                 return false;
               }
-              found = true;
             }
-            return found;
+            return transcriptPaths.length > 0;
           },
         );
 

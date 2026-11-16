@@ -310,6 +310,7 @@ it.effect("mirrors encoded typed handler failures without changing text or analy
 
 it.each([
   '{ "code": "delegation_timeout", "taskId": "task-1567", "retryHint": "same key" }',
+  '{ "_tag": "OrchestratorMcpFailure", "code": "parent_not_active", "saved": false, "message": "Delegated task was not created; safe to retry with the same clientRequestId. Parent run ended." }',
   "{}",
   JSON.stringify({ message: "x".repeat(8178) }),
 ])("mirrors JSON object failures and preserves their original text: %.80s", (text) => {

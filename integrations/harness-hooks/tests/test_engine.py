@@ -598,6 +598,49 @@ class EngineTests(unittest.TestCase):
         self.assertNotIn("private-message", text)
         self.assertNotIn("private-token", text)
 
+    def test_light_allowed_offbox_logs_are_sampled(self):
+        for harness in ("claude", "codex"):
+            for draw, written in ((0.0, True), (0.049, True), (0.05, False), (0.99, False)):
+                with self.subTest(harness=harness, draw=draw):
+                    logdir = self.root / f"sample-{harness}-{draw}"
+                    with patch.dict(os.environ, OFFBOX_TOOL_LOG_DIR=str(logdir)), \
+                            patch.object(engine.random, "random", return_value=draw):
+                        result = engine.decide(self.event("echo fixture", session="root", agent=None), harness)
+                    self.assertEqual(result["decision"], "allow")
+                    rows = [json.loads(line) for p in logdir.glob("*.ndjson") for line in p.read_text().splitlines()]
+                    self.assertEqual(len(rows), int(written))
+                    if written:
+                        self.assertEqual(rows[0]["props"], {"harness": "claudeAgent" if harness == "claude" else harness,
+                            "decision": "allowed", "commandClass": "light", "sample": 20})
+
+    def test_other_offbox_logs_are_never_sampled(self):
+        for harness in ("claude", "codex"):
+            for mode, exempt, failed, decision, kind, command_class in (
+                    ("enforce", False, False, "denied", "perf", "js-test"),
+                    ("enforce", True, False, "local-override", "perf", "js-test"),
+                    ("observe", False, False, "allowed", "perf", "js-test"),
+                    ("enforce", False, True, "allowed", "error", "unknown"),
+                    ("off", False, False, "allowed", "event", "unknown")):
+                with self.subTest(harness=harness, mode=mode, exempt=exempt, failed=failed):
+                    logdir = self.root / f"full-{harness}-{mode}-{exempt}-{failed}"
+                    with patch.dict(os.environ, OFFBOX_TOOL_LOG_DIR=str(logdir), OFFBOX_GATE_MODE=mode), \
+                            patch.object(engine.random, "random", return_value=0.99), \
+                            patch.object(engine, "_exempt", return_value=exempt), \
+                            patch.object(engine, "_classify_offbox", return_value={"heavy": True, "class": "js-test", "rule": "js-test", "why": "fixture", "rewrite": "offbox run -- npm ci"},
+                                         side_effect=ValueError("fixture") if failed else None):
+                        engine.decide(self.event("npm ci", session="root", agent=None), harness)
+                    rows = [json.loads(line) for p in logdir.glob("*.ndjson") for line in p.read_text().splitlines()]
+                    self.assertEqual(len(rows), 1)
+                    self.assertEqual(rows[0]["props"], {"harness": "claudeAgent" if harness == "claude" else harness,
+                        "decision": decision, "commandClass": command_class})
+                    self.assertEqual(rows[0]["kind"], kind)
+                    if failed:
+                        self.assertEqual(rows[0]["error"]["tag"], "gate_failed")
+
+    def test_sampling_failure_does_not_escape_logging(self):
+        with patch.object(engine.random, "random", side_effect=RuntimeError("fixture")):
+            engine._tool_log(kind="perf", ok=True, props={"decision": "allowed", "commandClass": "light"})
+
     def test_native_and_mcp_shell_aliases_enforce_offbox(self):
         self.add_identity("codex-child", "child", parent="parent", model="claude-haiku-5-5")
         tools = ("Bash", "bash", "shell", "exec_command", "shell_command", "mcp__test__shell", "mcp__test__bash")

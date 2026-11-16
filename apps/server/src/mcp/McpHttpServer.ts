@@ -1127,6 +1127,15 @@ const withToolAnalytics =
                       readOnly,
                       boardWrite,
                       inputKeys: inputKeysOf(options.tool),
+                      detachedAnalytics: {
+                        tool: options.tool.name,
+                        callerIdentity:
+                          invocation?.thread?.threadId ?? invocation?.requestNamespace,
+                        callerThreadId: invocation?.thread?.threadId,
+                        startedAt: DateTime.formatIso(DateTime.makeUnsafe(startedAt)),
+                        build,
+                        bootId: callBootId,
+                      },
                       ...(options.tool.name === "task_status" || options.tool.name === "task_cancel"
                         ? {
                             taskLookup: {

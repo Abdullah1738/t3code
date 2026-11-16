@@ -1,3 +1,4 @@
+import * as ProviderProcessRegistry from "../../ardud/providers/ProviderProcessRegistry.ts";
 // @effect-diagnostics nodeBuiltinImport:off -- the fake CLI and its leftover child are real processes.
 import * as ClaudeSdk from "@anthropic-ai/claude-agent-sdk";
 import * as NodeChildProcess from "node:child_process";
@@ -15,6 +16,7 @@ import * as Path from "effect/Path";
 import { vi } from "vite-plus/test";
 
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import { AgentScope, agentScopeCommand } from "@t3tools/shared/AgentScope";
 import { ProviderEventLoggers } from "@t3tools/provider-core/server/ProviderEventLoggers";
 import {
   CLAUDE_AGENT_SDK_QUERY_PROTOCOL,
@@ -23,6 +25,109 @@ import {
 } from "./ClaudeAdapterV2.ts";
 
 vi.mock("@anthropic-ai/claude-agent-sdk", { spy: true });
+vi.mock("node:child_process", { spy: true });
+
+it.effect.each([
+  {
+    name: "bare PATH command with shell scope",
+    binaryPath: "claude",
+    resolved: "/opt/bin/claude",
+    wrapped: true,
+  },
+  {
+    name: "absolute command with shell scope",
+    binaryPath: "/opt/bin/claude",
+    resolved: "/opt/bin/claude",
+    wrapped: true,
+  },
+  {
+    name: "relative command with shell scope",
+    binaryPath: "../bin/claude",
+    resolved: "/repo/bin/claude",
+    wrapped: true,
+  },
+  {
+    name: "command containing spaces",
+    binaryPath: "claude",
+    resolved: "/opt/Claude Tools/claude",
+    wrapped: true,
+  },
+  {
+    name: "resolved command without a wrapper",
+    binaryPath: "claude",
+    resolved: "/opt/bin/claude",
+    wrapped: false,
+  },
+])("records the final provider invocation for $name", ({ binaryPath, resolved, wrapped }) =>
+  Effect.gen(function* () {
+    const planned: string[] = [];
+    const spawn = vi.spyOn(NodeChildProcess, "spawn").mockReturnValue({
+      pid: 42,
+      once: vi.fn(),
+    } as unknown as NodeChildProcess.ChildProcess);
+    const query = vi.spyOn(ClaudeSdk, "query").mockImplementation(({ options }) => {
+      options!.spawnClaudeCodeProcess!({
+        command: options!.pathToClaudeCodeExecutable!,
+        args: [...(options!.executableArgs ?? []), "--session-id", "native-session"],
+        env: {},
+        cwd: "/repo",
+        signal: new AbortController().signal,
+      });
+      return {} as ClaudeSdk.Query;
+    });
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        spawn.mockRestore();
+        query.mockRestore();
+      }),
+    );
+    yield* Effect.gen(function* () {
+      const runner = yield* ClaudeAgentSdkQueryRunner;
+      yield* runner.open({
+        threadId: ThreadId.make("thread-planned-command"),
+        providerSessionId: ProviderSessionId.make("session-planned-command"),
+        options: {
+          pathToClaudeCodeExecutable: binaryPath,
+          sessionId: "native-session",
+          model: "claude-sonnet-4-6",
+          tools: [],
+          permissionMode: "default",
+        },
+      });
+    }).pipe(
+      Effect.provide(
+        layerQueryRunner.pipe(
+          Layer.provide(
+            Layer.succeed(ProviderProcessRegistry.ProviderProcessRegistry, {
+              track: (_pid, _provider, _threadId, commandLine) => {
+                planned.push(commandLine);
+                return () => {};
+              },
+              reap: Effect.succeed([]),
+            }),
+          ),
+          Layer.provide(
+            Layer.succeed(ProviderEventLoggers, { native: undefined, canonical: undefined }),
+          ),
+          Layer.provide(
+            Layer.succeed(AgentScope, {
+              ...AgentScope.defaultValue(),
+              wrap: () =>
+                Effect.succeed(
+                  wrapped
+                    ? agentScopeCommand({ command: resolved, args: [] })
+                    : { command: resolved, args: [] },
+                ),
+            }),
+          ),
+          Layer.provide(Layer.succeed(HostProcess.Platform, "linux")),
+        ),
+      ),
+    );
+    assert.deepEqual(planned, [`${resolved} --session-id native-session`]);
+    assert.equal(spawn.mock.calls.length, 1);
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
 
 it.effect("logs successful task stops for replay and omits failed stops", () =>
   Effect.gen(function* () {
@@ -68,6 +173,7 @@ it.effect("logs successful task stops for replay and omits failed stops", () =>
     }).pipe(
       Effect.provide(
         layerQueryRunner.pipe(
+          Layer.provide(ProviderProcessRegistry.ProviderProcessRegistry.layerTest),
           Layer.provide(
             Layer.succeed(ProviderEventLoggers, {
               native: {
@@ -120,6 +226,7 @@ const writeClaudeSession = Effect.fnUntraced(function* (configDir: string) {
 });
 
 const forkRunnerLayer = layerQueryRunner.pipe(
+  Layer.provide(ProviderProcessRegistry.ProviderProcessRegistry.layerTest),
   Layer.provide(Layer.succeed(ProviderEventLoggers, { native: undefined, canonical: undefined })),
 );
 
@@ -178,6 +285,7 @@ it.effect("forks in-process when the instance shares the server's config dir", (
   ).pipe(Effect.provide(NodeServices.layer)),
 );
 const realQueryRunner = layerQueryRunner.pipe(
+  Layer.provide(ProviderProcessRegistry.ProviderProcessRegistry.layerTest),
   Layer.provide(
     Layer.succeed(ProviderEventLoggers, {
       native: undefined,

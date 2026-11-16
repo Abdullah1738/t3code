@@ -1,7 +1,13 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it as effectIt } from "@effect/vitest";
 import * as HostProcess from "@t3tools/shared/HostProcess";
-import { CommandAvailability, WindowsShellEnvironment } from "@t3tools/shared/shell";
+import {
+  CommandAvailability,
+  WindowsShellEnvironment,
+  SpawnExecutableResolution,
+} from "@t3tools/shared/shell";
+import * as FileSystem from "effect/FileSystem";
+import * as Logger from "effect/Logger";
 import * as Effect from "effect/Effect";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- Observe the existing synchronous shell probe without launching the user's login shell.
 import * as NodeChildProcess from "node:child_process";
@@ -170,3 +176,185 @@ effectIt.effect("replaces a Path-spelled Windows PATH instead of adding a second
     assert.deepEqual(env, { PATH: "C:\\Tools;C:\\Windows" });
   }),
 );
+
+for (const failure of ["ETIMEDOUT", "ENOENT", "empty"] as const) {
+  effectIt.effect(`appends existing Darwin CLI directories after ${failure} probes`, () =>
+    Effect.acquireUseRelease(
+      Effect.sync(() =>
+        vi.spyOn(NodeChildProcess, "execFileSync").mockImplementation((command) => {
+          if (command === "/bin/launchctl" || failure === "empty") return "";
+          throw Object.assign(new Error("probe failed"), { code: failure });
+        }),
+      ),
+      () =>
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const directory = yield* fs.stat(NodeOS.tmpdir());
+          const statPaths: string[] = [];
+          const messages: unknown[] = [];
+          const env: NodeJS.ProcessEnv = {
+            HOME: "/Users/test",
+            SHELL: "/bin/zsh",
+            PATH: "/custom/bin:/usr/bin:/opt/homebrew/bin",
+          };
+          yield* fixPath({
+            shellEnvironmentPrepared: false,
+            shellPathHydration: {
+              source: "none",
+              probes: [
+                {
+                  probe: "login-shell",
+                  failureTag: "DesktopShellEnvironmentCommandTimeoutError",
+                  timedOut: true,
+                  elapsedMs: 5360,
+                },
+              ],
+            },
+          }).pipe(
+            Effect.provideService(HostProcess.Platform, "darwin"),
+            Effect.provideService(HostProcess.Environment, env),
+            Effect.provideService(FileSystem.FileSystem, {
+              ...fs,
+              stat: (path) => {
+                statPaths.push(path);
+                // A regular file at a candidate path must not become a PATH directory.
+                return Effect.succeed({
+                  ...directory,
+                  type: path === "/usr/local/bin" ? "File" : "Directory",
+                });
+              },
+            }),
+            Effect.provideService(SpawnExecutableResolution, (command, platform, finalEnv) => {
+              assert.equal(command, "gh");
+              assert.equal(platform, "darwin");
+              assert.equal(
+                finalEnv.PATH,
+                "/custom/bin:/usr/bin:/opt/homebrew/bin:/Users/test/.local/bin",
+              );
+              return "/opt/homebrew/bin/gh";
+            }),
+            Effect.provide(
+              Logger.layer([
+                Logger.make(({ message }) => {
+                  messages.push(message);
+                }),
+              ]),
+            ),
+          );
+          assert.deepEqual(statPaths, [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/Users/test/.local/bin",
+          ]);
+          assert.equal(env.PATH, "/custom/bin:/usr/bin:/opt/homebrew/bin:/Users/test/.local/bin");
+          const flat = messages.flatMap((message) =>
+            Array.isArray(message) ? message : [message],
+          );
+          assert.include(flat, "Server PATH hydration");
+          const outcome = flat.find(
+            (message) => typeof message === "object" && message !== null && "source" in message,
+          );
+          assert.deepInclude(outcome, {
+            source: "fallback-dirs",
+            timedOut: true,
+            elapsedMs: 5360,
+            ghResolves: true,
+            pathEntryCount: 4,
+          });
+          assert.notInclude(JSON.stringify(outcome), "/custom/bin");
+          if (failure !== "empty") assert.include(JSON.stringify(outcome), failure);
+        }).pipe(Effect.provide(NodeServices.layer)),
+      (probe) => Effect.sync(() => probe.mockRestore()),
+    ),
+  );
+}
+
+effectIt.effect.each(["darwin", "linux"] as const)(
+  "uses a real shell PATH without appending fallback directories on %s",
+  (platform) =>
+    Effect.acquireUseRelease(
+      Effect.sync(() =>
+        vi
+          .spyOn(NodeChildProcess, "execFileSync")
+          .mockReturnValue(
+            "__T3CODE_ENV_PATH_START__\n/custom/bin:/usr/bin\n__T3CODE_ENV_PATH_END__\n",
+          ),
+      ),
+      () =>
+        Effect.gen(function* () {
+          const env: NodeJS.ProcessEnv = {
+            HOME: "/Users/test",
+            PATH: "/usr/bin",
+            SHELL: "/bin/zsh",
+          };
+          const fs = yield* FileSystem.FileSystem;
+          yield* fixPath({ shellEnvironmentPrepared: false }).pipe(
+            Effect.provideService(HostProcess.Platform, platform),
+            Effect.provideService(HostProcess.Environment, env),
+            Effect.provideService(FileSystem.FileSystem, {
+              ...fs,
+              stat: () => Effect.die("fallback stat must not run"),
+            }),
+            Effect.provideService(SpawnExecutableResolution, () => undefined),
+          );
+          assert.equal(env.PATH, "/custom/bin:/usr/bin");
+        }).pipe(Effect.provide(NodeServices.layer)),
+      (probe) => Effect.sync(() => probe.mockRestore()),
+    ),
+);
+
+for (const scenario of [
+  { platform: "darwin", launchctl: "/launchctl/bin:/usr/bin", source: "server-launchctl" },
+  { platform: "darwin", launchctl: "", source: "none" },
+  { platform: "linux", launchctl: "", source: "none" },
+] as const) {
+  effectIt.effect(`reports ${scenario.source} on ${scenario.platform} with no shell PATH`, () =>
+    Effect.acquireUseRelease(
+      Effect.sync(() =>
+        vi
+          .spyOn(NodeChildProcess, "execFileSync")
+          .mockImplementation((command) =>
+            command === "/bin/launchctl" ? scenario.launchctl : "",
+          ),
+      ),
+      () =>
+        Effect.gen(function* () {
+          const env: NodeJS.ProcessEnv = {
+            HOME: "/Users/test",
+            PATH: "/usr/bin",
+            SHELL: "/bin/zsh",
+          };
+          const messages: unknown[] = [];
+          const fs = yield* FileSystem.FileSystem;
+          const regularFile = yield* fs.stat(import.meta.filename);
+          yield* fixPath({ shellEnvironmentPrepared: false }).pipe(
+            Effect.provideService(HostProcess.Platform, scenario.platform),
+            Effect.provideService(HostProcess.Environment, env),
+            Effect.provideService(FileSystem.FileSystem, {
+              ...fs,
+              stat: () => Effect.succeed(regularFile),
+            }),
+            Effect.provideService(SpawnExecutableResolution, () => undefined),
+            Effect.provide(
+              Logger.layer([
+                Logger.make(({ message }) => {
+                  messages.push(message);
+                }),
+              ]),
+            ),
+          );
+          assert.equal(env.PATH, scenario.launchctl || "/usr/bin");
+          const flat = messages.flatMap((message) =>
+            Array.isArray(message) ? message : [message],
+          );
+          assert.deepInclude(
+            flat.find(
+              (message) => typeof message === "object" && message !== null && "source" in message,
+            ),
+            { source: scenario.source, ghResolves: false, timedOut: false },
+          );
+        }).pipe(Effect.provide(NodeServices.layer)),
+      (probe) => Effect.sync(() => probe.mockRestore()),
+    ),
+  );
+}

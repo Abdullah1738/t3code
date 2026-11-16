@@ -1500,9 +1500,16 @@ const handlers = {
   card_thread: McpToolAccess.actsAsCaller((input) =>
     asEvaluator((service, caller) =>
       Effect.gen(function* () {
+        if (input.text !== undefined && input.message !== undefined && input.text !== input.message)
+          return yield* invalid("text and message must match; pass only one", "invalid_args");
         const card = yield* cardFor(service, caller, input.card, input.boardId);
         return {
-          card: yield* service.cardThread(card.id, input.action, input.text ?? "", caller.actor),
+          card: yield* service.cardThread(
+            card.id,
+            input.action,
+            input.text ?? input.message ?? "",
+            caller.actor,
+          ),
         };
       }),
     ),

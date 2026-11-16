@@ -4,6 +4,8 @@ import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Queue from "effect/Queue";
+import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
 import type * as Statement from "effect/sql/Statement";
 import {
@@ -17,6 +19,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderThreadId,
+  ProviderTurnId,
   RunId,
   RuntimeRequestId,
   NodeId,
@@ -39,6 +42,9 @@ import * as ServerSettings from "../../../serverSettings.ts";
 import { CodexProviderCapabilitiesV2 } from "../../../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as CommandReceiptStore from "../../../orchestration-v2/CommandReceiptStore.ts";
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
+import * as EffectWorker from "../../../orchestration-v2/EffectWorker.ts";
+import * as EventSink from "../../../orchestration-v2/EventSink.ts";
+import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
 import * as ProjectionStore from "../../../orchestration-v2/ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "../../../orchestration-v2/ProviderAdapterRegistry.ts";
 import * as ProviderReplayHarness from "../../../orchestration-v2/testkit/ProviderReplayHarness.ts";
@@ -2811,4 +2817,169 @@ it.effect.each([
       ),
     ),
   ),
+);
+
+it.effect.each([false, true])(
+  "card_thread delivery persists exact text on an idle or running thread (running=%s)",
+  (running) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const db = Sqlite.layerMemory;
+        const instanceId = ProviderInstanceId.make("codex");
+        const driver = ProviderDriverKind.make("codex");
+        const projectId = ProjectId.make("project:card-thread-text");
+        const threadId = ThreadId.make("thread:card-thread-text");
+        const model = { instanceId, model: "gpt-5.1-codex" };
+        const cwd = yield* checkpointWorkspace("kanban-card-thread-text");
+        const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+        const received: string[] = [];
+        const adapter: ProviderAdapter.ProviderAdapterV2["Service"] = {
+          instanceId,
+          driver,
+          getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
+          planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" }),
+          openSession: (input) =>
+            Effect.gen(function* () {
+              const now = yield* DateTime.now;
+              return {
+                instanceId,
+                driver,
+                providerSessionId: input.providerSessionId,
+                providerSession: {
+                  id: input.providerSessionId,
+                  driver,
+                  providerInstanceId: instanceId,
+                  status: "ready",
+                  cwd,
+                  model: model.model,
+                  capabilities: CodexProviderCapabilitiesV2,
+                  createdAt: now,
+                  updatedAt: now,
+                  lastError: null,
+                },
+                events: Stream.fromQueue(events),
+                ensureThread: ({ threadId }) =>
+                  Effect.succeed({
+                    id: ProviderThreadId.make(`provider-thread:${threadId}`),
+                    driver,
+                    providerInstanceId: instanceId,
+                    providerSessionId: input.providerSessionId,
+                    appThreadId: threadId,
+                    ownerNodeId: null,
+                    nativeThreadRef: { driver, nativeId: "native-thread", strength: "strong" },
+                    nativeConversationHeadRef: null,
+                    status: "idle",
+                    firstRunOrdinal: null,
+                    lastRunOrdinal: null,
+                    handoffIds: [],
+                    forkedFrom: null,
+                    createdAt: now,
+                    updatedAt: now,
+                  }),
+                resumeThread: ({ providerThread }) => Effect.succeed(providerThread),
+                startTurn: (turn) =>
+                  Effect.gen(function* () {
+                    received.push(turn.message.text);
+                    yield* Queue.offer(events, {
+                      type: "provider_turn.updated",
+                      driver,
+                      providerTurn: {
+                        id: ProviderTurnId.make(`provider-turn:${turn.attemptId}`),
+                        providerThreadId: turn.providerThread.id,
+                        nodeId: turn.rootNodeId,
+                        runAttemptId: turn.attemptId,
+                        nativeTurnRef: { driver, nativeId: "native-turn", strength: "strong" },
+                        ordinal: turn.providerTurnOrdinal,
+                        status: "running",
+                        startedAt: now,
+                        completedAt: null,
+                      },
+                    });
+                  }),
+                steerTurn: (input) =>
+                  Effect.sync(() => {
+                    received.push(input.message.text);
+                  }),
+                interruptTurn: () => Effect.void,
+                respondToRuntimeRequest: () => Effect.die("unused"),
+                readThreadSnapshot: () => Effect.die("unused"),
+                rollbackThread: () => Effect.die("unused"),
+                forkThread: () => Effect.die("unused"),
+              };
+            }),
+        };
+        const runtime = ProviderReplayHarness.layerWithRegistry(
+          { name: "kanban-card-thread-text" },
+          ProviderAdapterRegistry.layerFromAdapters([adapter]),
+          { databaseLayer: db, runEffectWorker: false },
+        );
+        const receipts = CommandReceiptStore.layer.pipe(Layer.provide(db));
+        const management = ThreadManagementService.layer.pipe(
+          Layer.provideMerge(Layer.mergeAll(runtime, receipts, ServerSettings.layerTest(), db)),
+        );
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const sink = yield* EventSink.EventSinkV2;
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make("card-thread-text:create"),
+            threadId,
+            projectId,
+            title: "Card thread delivery",
+            modelSelection: model,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: cwd,
+            createdBy: "system",
+            creationSource: "server",
+          });
+          yield* Effect.gen(function* () {
+            const threads = yield* KanbanThreads;
+            if (running) {
+              const afterSequence = yield* sink.latestSequence({ threadId });
+              yield* threads.send({ threadId, text: "Initial turn", model });
+              yield* worker.drain();
+              yield* sink.stream({ threadId, afterSequence }).pipe(
+                Stream.filter(
+                  (stored) =>
+                    stored.event.type === "provider-turn.updated" &&
+                    stored.event.payload.status === "running",
+                ),
+                Stream.take(1),
+                Stream.runDrain,
+              );
+            }
+            const text = "  Keep the exact spacing.\nUse juno.  ";
+            const runId = yield* threads.send({ threadId, text, model, flushQueued: "steer" });
+            const records = yield* orchestrator.getThreadRecords(threadId, [
+              "runs",
+              "messages",
+              "turnItems",
+            ]);
+            const message = records.messages.find((entry) => entry.text === text);
+            expect(message?.text).toBe(text);
+            expect(message?.runId).toBe(runId);
+            expect(
+              records.turnItems.some(
+                (item) => item.type === "user_message" && item.messageId === message?.id,
+              ),
+            ).toBe(true);
+            expect(records.runs.find((run) => run.id === runId)?.status).not.toBe("queued");
+            expect(records.messages.filter((entry) => entry.text === text)).toHaveLength(1);
+            yield* worker.drain();
+            expect(received).toEqual(running ? ["Initial turn", text] : [text]);
+          }).pipe(Effect.provide(layer));
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              management,
+              receipts,
+              Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+            ),
+          ),
+        );
+      }),
+    ),
 );

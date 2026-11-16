@@ -948,6 +948,9 @@ it("readThread and sendToThread reach threads in other projects", async () => {
             if (threadId === foreignThreadId) return Effect.succeed(foreignProjection(threadId));
             return Effect.die(`unexpected thread ${threadId}`);
           },
+          hasReceipt: () => Effect.succeed(false),
+          getCommandReceipt: () => Effect.succeed(Option.none()),
+          getDelegationCommandState: () => Effect.succeed({ status: "never_saved" }),
           getCallerRow: (threadId) =>
             Effect.succeed(
               threadId === foreignThreadId

@@ -1512,3 +1512,64 @@ it.effect("#1490 reads persisted evaluator starts for one board and UTC day in o
     );
   }).pipe(Effect.provide(NodeServices.layer)),
 );
+
+it.effect(
+  "correlates detached results in filtered cold and live views without widening samples",
+  () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const analytics = yield* open(setup);
+      const call = event({
+        surface: "server",
+        route: "mcp",
+        kind: "mcp.call",
+        tool: "delegate_task",
+        outcome: "timeout",
+        errorPhase: "dispatch",
+        clientRequestId: "a".repeat(64),
+        durationMs: 10000,
+        boardId: "robob",
+        cardNumber: 1559,
+      });
+      yield* analytics.record(call);
+      const input = {
+        day,
+        kind: "mcp.call",
+        tool: "delegate_task",
+        outcome: "timeout",
+        boardId: "robob",
+        cardNumber: 1559,
+      } as const;
+      const before = yield* analytics.read(input);
+      assert.equal(before.rollup.mcpCalls[0]!.dispatchTimeouts!.noOutcome, 1);
+      // Correlation follows the original selected call even if the result has no board attribution.
+      yield* analytics.record(
+        event({
+          surface: "server",
+          route: "mcp",
+          kind: "mcp.detached",
+          tool: "delegate_task",
+          outcome: "committed",
+          clientRequestId: "a".repeat(64),
+          startedAt: ts,
+          ts: `${day}T12:00:15.000Z`,
+          lateMs: 5000,
+        }),
+      );
+      const warm = yield* analytics.read(input);
+      assert.deepEqual(warm.rollup.mcpCalls[0]!.dispatchTimeouts, {
+        committed: 1,
+        failed: 0,
+        capped: 0,
+        noOutcome: 0,
+      });
+      assert.deepEqual(warm.samples, [call]);
+      assert.equal(warm.rollup.total, 1);
+      assert.deepEqual(warm.rollup.kindCounts, { "mcp.call": 1 });
+      const cold = yield* open(setup);
+      assert.deepEqual((yield* cold.read(input)).rollup.mcpCalls, warm.rollup.mcpCalls);
+      const section = yield* analytics.read({ ...input, section: "mcpCalls" });
+      assert.include(JSON.stringify(section.rows), '"committed":1');
+      assert.isBelow(JSON.stringify(section).length, 50000);
+    }).pipe(Effect.provide(NodeServices.layer)),
+);

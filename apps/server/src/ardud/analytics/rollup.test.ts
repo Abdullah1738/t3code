@@ -351,7 +351,7 @@ describe("analytics rollups", () => {
       rollup.mcpCalls.find((group) => group.build === "new")!.hour,
       "2026-11-13T13:00:00.000Z",
     );
-    assert.deepEqual(rollup.mcpOverflow, { groups: 0, retryAttempts: 0 });
+    assert.deepEqual(rollup.mcpOverflow, { groups: 0, retryAttempts: 0, detachedOutcomes: 0 });
     assert.deepEqual(finishRollup(accumulator, "2026-11-13", ts), rollup);
   });
   it("keeps pre-handler percentiles separate and skips historical calls without timing", () => {
@@ -1036,3 +1036,146 @@ it("counts and bounds refusal classes and fields per tool and hour", () => {
   assert.deepEqual(read.invalidFields, { slug: 1 });
   assert.deepEqual(read.savedCounts, { "n/a": 1 });
 });
+const timeoutCall = (input: Partial<AnalyticsEvent> = {}) =>
+  event({
+    kind: "mcp.call",
+    route: "mcp",
+    tool: "delegate_task",
+    outcome: "timeout",
+    errorPhase: "dispatch",
+    clientRequestId: "a".repeat(64),
+    callerThreadId: "caller",
+    build: "test",
+    bootId: "boot",
+    durationMs: 10000,
+    ...input,
+  });
+const detachedResult = (input: Partial<AnalyticsEvent> = {}) =>
+  timeoutCall({
+    ts: "2026-11-13T12:00:15.000Z",
+    kind: "mcp.detached",
+    outcome: "committed",
+    startedAt: ts,
+    lateMs: 5000,
+    ...input,
+  });
+const finishDetached = (events: AnalyticsEvent[]) => {
+  const target = makeAccumulator();
+  for (const event of events) accumulate(target, event);
+  return finishRollup(target, "2026-11-13", ts);
+};
+
+it("splits dispatch timeouts into matched outcomes and missing results", () => {
+  const rows = finishDetached([
+    timeoutCall(),
+    timeoutCall({ clientRequestId: "b".repeat(64) }),
+    detachedResult(),
+  ]).mcpCalls;
+  assert.deepEqual(rows[0]!.dispatchTimeouts, { committed: 1, failed: 0, capped: 0, noOutcome: 1 });
+});
+
+it.each([false, true])(
+  "matches overlapping same-id retries once, independent of emission order (reversed=%s)",
+  (reverse) => {
+    const events = [
+      timeoutCall(),
+      timeoutCall({ ts: "2026-11-13T12:00:20.000Z" }),
+      timeoutCall({ ts: "2026-11-13T12:00:40.000Z" }),
+      timeoutCall({ ts: "2026-11-13T12:00:50.000Z", outcome: "ok" }),
+      detachedResult({ startedAt: "2026-11-13T12:00:20.000Z", ts: "2026-11-13T12:01:00.000Z" }),
+    ];
+    const target = makeAccumulator();
+    for (const event of reverse ? events.toReversed() : events) accumulate(target, event);
+    const rollup = finishRollup(target, "2026-11-13", ts);
+    assert.deepEqual(rollup.mcpCalls[0]!.dispatchTimeouts, {
+      committed: 1,
+      failed: 0,
+      capped: 0,
+      noOutcome: 2,
+    });
+    assert.deepEqual(finishRollup(target, "2026-11-13", ts), rollup);
+  },
+);
+
+it.each(["committed", "failed", "capped"] as const)(
+  "counts %s once, including an after-cap settlement",
+  (outcome) => {
+    const rows = [timeoutCall(), detachedResult({ outcome: "capped" })];
+    if (outcome !== "capped")
+      rows.push(detachedResult({ outcome, ts: "2026-11-13T12:02:10.000Z", afterCap: true }));
+    const counts = { committed: 0, failed: 0, capped: 0, noOutcome: 0, [outcome]: 1 };
+    assert.deepEqual(finishDetached(rows.toReversed()).mcpCalls[0]!.dispatchTimeouts, counts);
+    if (outcome !== "capped")
+      assert.deepEqual(finishDetached([rows[0]!, rows[2]!]).mcpCalls[0]!.dispatchTimeouts, counts);
+  },
+);
+
+it.each([
+  { tool: "other" },
+  { clientRequestId: "b".repeat(64) },
+  { bootId: "other" },
+  { ts: "2026-11-14T00:00:01.000Z" },
+  { startedAt: "2026-11-13T12:00:01.000Z" },
+])("does not cross correlation boundaries: %j", (boundary) => {
+  assert.deepEqual(
+    finishDetached([timeoutCall(), detachedResult(boundary)]).mcpCalls[0]!.dispatchTimeouts,
+    { committed: 0, failed: 0, capped: 0, noOutcome: 1 },
+  );
+});
+
+it("attributes a late result to the call's original UTC hour", () => {
+  const call = timeoutCall({ ts: "2026-11-13T12:59:55.000Z" });
+  const result = detachedResult({ ts: "2026-11-13T13:00:15.000Z", startedAt: call.ts });
+  const row = finishDetached([result, call]).mcpCalls[0]!;
+  assert.equal(row.hour, "2026-11-13T12:00:00.000Z");
+  assert.equal(row.dispatchTimeouts!.committed, 1);
+});
+
+it("keeps unkeyed timeouts and bounds detached observations without counting one call twice", () => {
+  const target = makeAccumulator();
+  accumulate(target, timeoutCall());
+  const { clientRequestId: _requestId, ...unkeyed } = timeoutCall();
+  accumulate(target, unkeyed);
+  for (let index = 0; index < 100001; index++) accumulate(target, detachedResult());
+  const result = finishRollup(target, "2026-11-13", ts);
+  assert.deepEqual(result.mcpCalls[0]!.dispatchTimeouts, {
+    committed: 1,
+    failed: 0,
+    capped: 0,
+    noOutcome: 1,
+  });
+  assert.equal(result.mcpOverflow.detachedOutcomes, 1);
+  assert.equal(target.detachedOutcomes, 100000);
+});
+
+it.each(["failed", "noOutcome"] as const)(
+  "keeps a never-saved first dispatch %s when only its same-id retry commits (#1559 watcher sighting)",
+  (firstOutcome) => {
+    const first = timeoutCall({ ts: "2026-11-13T12:59:40.000Z" });
+    const retry = timeoutCall({ ts: "2026-11-13T13:00:05.000Z" });
+    const retryResult = detachedResult({ startedAt: retry.ts, ts: "2026-11-13T13:00:20.000Z" });
+    const events = [retryResult, retry, first];
+    if (firstOutcome === "failed")
+      events.push(
+        detachedResult({
+          startedAt: first.ts,
+          ts: "2026-11-13T12:59:51.000Z",
+          outcome: "failed",
+          props: { cause: "unknown" },
+        }),
+      );
+    const rows = finishDetached(events).mcpCalls;
+    assert.deepEqual(rows[0]!.dispatchTimeouts, {
+      committed: 0,
+      failed: firstOutcome === "failed" ? 1 : 0,
+      capped: 0,
+      noOutcome: firstOutcome === "noOutcome" ? 1 : 0,
+    });
+    assert.deepEqual(rows[1]!.dispatchTimeouts, {
+      committed: 1,
+      failed: 0,
+      capped: 0,
+      noOutcome: 0,
+    });
+  },
+);

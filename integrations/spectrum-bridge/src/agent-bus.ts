@@ -24,6 +24,7 @@ export type AgentBusDeps = {
   forSession: (sessionId: string) => ChatInfo | undefined;
   bySlug: (slug: string) => ChatInfo | undefined;
   policyPath?: string;
+  groupMembers: (chat: ChatInfo) => string[];
   /** Deduped by key. All target delivery goes through this boundary, including answers and timeouts. */
   deliver: (target: ChatInfo, text: string, key: string, receipt?: AgentAnswerReceipt) => void;
   receipt: (target: ChatInfo, key: string) => AgentAnswerReceipt | undefined;
@@ -96,7 +97,7 @@ export class AgentBus {
       (id, from_slug, to_slug, parent_id, hop, status, text_chars, created_at)
       VALUES (?, ?, ?, ?, ?, 'open', ?, ?)`)
       .run(id, caller.slug, target.slug, input.parent ?? null, hop, input.text.length, at);
-    deps.log("agent-ask", `${caller.slug}>${target.slug} hop=${hop}`);
+    deps.log("agent-ask", `${caller.slug}>${target.slug} hop=${hop}${caller.kind === "group" ? " group=1" : ""}`);
     this.deliverRequest(this.get(id)!, caller, target, input.text, policy, pair);
     return { status: 202, body: { id, created: true } };
   }
@@ -113,7 +114,10 @@ export class AgentBus {
       lines.push("If this request matches one of these, tell Abdullah in one line in this chat after it's done. Otherwise don't mention it.");
     }
     if (pair.answer === "full") lines.push("Answer anything the owner's agent asks, in full. Send the answer back through agent-answer.");
-    if (pair.audience === "group") lines.push("This answer will be posted in a group. Answer only with information that is fine to share in that group.");
+    // A second-hop request still answers the original group's question.
+    const parent = row.parent_id ? this.get(row.parent_id) : null;
+    const origin = caller.kind === "group" || !parent ? caller : this.deps.bySlug(parent.from_slug);
+    if (origin?.kind === "group") lines.push(`This answer will be posted in the group ${JSON.stringify(origin.title)} (members: ${this.deps.groupMembers(origin).join(", ") || "unknown"}). Share only what is fine for everyone there to read. If it's private and the person it belongs to isn't the one asking, say what can be shared instead.`);
     this.deps.deliver(target, lines.join("\n") + `\n${text}`, `agent-ask:${row.id}`);
   }
 

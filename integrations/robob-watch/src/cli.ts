@@ -46,7 +46,8 @@ watcher.json failure_notice_after overrides 2 (1 = every failure); pause and ale
 watcher.json max_consecutive_failures overrides 5 (0 = backoff only); resume clears the failure pause and count.
 Keep your own state in $WATCH_DIR. Helpers on PATH: whatsapp-new-message, output-changed, email-new-message.
 Default interval 15s (min 5s). --trigger FILE runs the check within ~1s of FILE changing (push instead of poll),
-e.g. --trigger ~/Library/Messages/chat.db-wal for iMessage; the interval stays as the fallback.`;
+e.g. --trigger ~/Library/Messages/chat.db-wal for iMessage; the interval stays as the fallback.
+Trigger files may appear later; the interval runs the check until they exist.`;
 
 class CliError extends Error {}
 
@@ -261,7 +262,8 @@ async function main(argv: string[]): Promise<void> {
         const w = loadWatcher(id)!;
         const s = loadState(id);
         const status = statusLabel(w, s);
-        console.log(`${id}  [${status}] ${w.mode} every ${w.interval_s}s${w.triggers?.length ? "+trigger" : ""}  fires ${s.fires}/${w.max_fires || "inf"}  expires ${w.expires_at?.slice(0, 16) ?? "never"}  last run ${ago(s.last_run_at)}${s.last_run_ms !== undefined ? ` (${(s.last_run_ms / 1000).toFixed(1)}s)` : ""}${s.pending ? "  UNDELIVERED EVENT" : s.batch ? `  BATCHING ${s.batch.events.length} EVENTS` : ""}${s.consecutive_failures ? `  failing x${s.consecutive_failures}` : ""}${s.load_timeouts ? `  load-timeouts ${s.load_timeouts}` : ""}\n    ${w.title}`);
+        const triggerHint = w.triggers?.length ? (s.trigger_missing?.paths.length ? "+trigger(waiting)" : "+trigger") : "";
+        console.log(`${id}  [${status}] ${w.mode} every ${w.interval_s}s${triggerHint}  fires ${s.fires}/${w.max_fires || "inf"}  expires ${w.expires_at?.slice(0, 16) ?? "never"}  last run ${ago(s.last_run_at)}${s.last_run_ms !== undefined ? ` (${(s.last_run_ms / 1000).toFixed(1)}s)` : ""}${s.pending ? "  UNDELIVERED EVENT" : s.batch ? `  BATCHING ${s.batch.events.length} EVENTS` : ""}${s.consecutive_failures ? `  failing x${s.consecutive_failures}` : ""}${s.load_timeouts ? `  load-timeouts ${s.load_timeouts}` : ""}\n    ${w.title}`);
       }
       return;
     }

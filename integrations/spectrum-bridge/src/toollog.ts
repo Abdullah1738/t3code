@@ -180,13 +180,16 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
       if (entry.kind === "error" || entry.name === "form.fail" || entry.name === "turn.robob_call" && entry.ok === false) entry = { ...entry, site: entry.site ?? logSite() };
       if (entry.name === "form.fail" && entry.kind !== "error") entry = { ...entry, kind: "error", error: entry.error ?? { tag: "form.gone" } };
       const line = clean(entry, new Date(now()).toISOString(), processRunId);
-      if (!line) return;
+      if (!line) {
+        if (entry.name === "card.render" || entry.name === "card.renders") writeFailed = true;
+        return;
+      }
       for (const render of renders.accept(line)) for (const record of calls.accept(render, entry.ids?.runId !== undefined)) enqueue(record);
       if (entry.name === "turn.end") void scheduleRollup(line.ts.slice(0, 10));
       if (["turn.start", "reply.sent"].includes(line.name) && line.ids?.chat && line.ids.inboundId) {
         refreshChains(`${line.ids.chat}\0${line.ids.inboundId}`);
       }
-    } catch { /* Optional logging never affects the caller. */ }
+    } catch { writeFailed = true; }
   }
   function readRenderCounts(dir: string, day: string): ReturnType<typeof renderCounts> {
     try { return renderCounts(dir, day); }
@@ -381,7 +384,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
       } finally { rolling = false; }
     } catch { /* Best effort. */ }
   }
-  function capture(action: () => void): void { try { action(); } catch { /* Optional attribution must not affect work. */ } }
+  function capture(action: () => void): void { try { action(); } catch { writeFailed = true; } }
   function beginRun(threadId: string, messageId: string): void {
     capture(() => {
       const line = clean({ component: "router", kind: "event", name: "turn.start", ids: { threadId, messageId } }, new Date(now()).toISOString(), processRunId);

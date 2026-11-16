@@ -1581,24 +1581,25 @@ it.effect.each(
               createdBy: "system",
               creationSource: "server",
             });
+          const before = yield* kanban.card(card.id);
           const result = yield* Effect.result(
             kanban.cardThread(card.id, action, text, { _tag: "owner" }),
           );
-          assert.equal(Result.isFailure(result), rejected);
+          const refused = rejected || !text.trim();
+          assert.equal(Result.isFailure(result), refused);
+          if (!text.trim()) {
+            assert(Result.isFailure(result));
+            assert.equal(result.failure.code, "invalid");
+            assert.deepEqual(yield* kanban.card(card.id), before);
+          }
           yield* worker.drain();
-          assert.deepEqual(
-            steered,
-            rejected ? [] : [...queuedText, text.trim() ? text : "latest snapshot"],
-          );
-          if (rejected) {
+          assert.deepEqual(steered, refused ? [] : [...queuedText, text]);
+          if (refused) {
             assert.lengthOf(yield* threads.queuedRuns(threadId), 1);
           }
-          yield* kanban.cardThread(card.id, "wake", "", { _tag: "owner" });
+          yield* orchestrator.promoteQueuedMessages(threadId, "wake");
           yield* worker.drain();
-          assert.deepEqual(steered, [
-            ...queuedText,
-            !rejected && text.trim() ? text : "latest snapshot",
-          ]);
+          assert.deepEqual(steered, [...queuedText, refused ? "latest snapshot" : text]);
           assert.lengthOf(yield* threads.queuedRuns(threadId), 0);
           const records = yield* orchestrator.getThreadRecords(threadId, ["runs"]);
           assert.equal(records.runs.find((run) => run.id === queuedId)!.status, "cancelled");
