@@ -39843,6 +39843,215 @@ const assertSlotReplay = (boardId: string, holds: ReadonlyMap<string, string> = 
     );
   });
 
+it.effect.each(["held", "review", "needs-input", "waiting", "queued", "late-turn-end"] as const)(
+  "#1732 a worker keeps its held slot through %s and claims related work",
+  (mode) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      let target: ThreadId | undefined;
+      let state: KanbanThreadView["state"] | undefined;
+      const states = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (real) => {
+          const find = (id: ThreadId) =>
+            real
+              .find(id)
+              .pipe(
+                Effect.map((view) => (view && id === target && state ? { ...view, state } : view)),
+              );
+          return KanbanThreads.of({
+            ...real,
+            find,
+            view: (id) => find(id).pipe(Effect.catch(() => Effect.succeed(null))),
+          });
+        }),
+      ).pipe(Layer.provide(fake.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        yield* kanban.updateBoard(board.id, {
+          reviewChains: [{ name: "Same pool", steps: [board.defaultCardModel] }],
+          defaultReviewChain: "Same pool",
+        });
+        const first = yield* kanban.createCard(
+          board.id,
+          { title: "First", prompt: "First" },
+          owner,
+        );
+        yield* kanban.dispatchNow;
+        const threadId = (yield* kanban.card(first.id)).card.activeThreadId!;
+        target = threadId;
+        yield* setRunning(fake, threadId, true);
+        const related = yield* kanban.createCard(
+          board.id,
+          { title: "Related", prompt: "Related" },
+          owner,
+        );
+        yield* kanban.setGroups(board.id, [
+          {
+            id: "related",
+            name: "Related",
+            summary: "",
+            cardIds: [first.id, related.id],
+          },
+        ]);
+        yield* kanban.moveCard(first.id, "needs_review", "cardThread", {
+          _tag: "thread",
+          threadId,
+        });
+        const offered = yield* kanban.nextCards(threadId);
+        assert.isTrue(offered.holdsSlot);
+        assert.deepStrictEqual(
+          offered.candidates.map(({ card }) => card.id),
+          [related.id],
+        );
+        if (mode !== "held") {
+          yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+          yield* kanban.dispatchNow;
+          assert.equal((yield* kanban.card(first.id)).card.stage, "in_review");
+          assert.equal((yield* kanban.card(related.id)).card.stage, "todo");
+          // Lowering capacity does not evict holders. The review now fills the pool.
+          yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+        }
+        if (mode === "needs-input" || mode === "waiting" || mode === "queued") {
+          state = mode;
+          yield* kanban.tick;
+          state = undefined;
+        } else if (mode === "late-turn-end") {
+          yield* kanban.turnEnded(threadId);
+        }
+        assert.isTrue((yield* kanban.nextCards(threadId)).holdsSlot);
+        const claimed = yield* kanban.claimCard(threadId, related.id);
+        assert.equal(claimed.card.activeThreadId, threadId);
+        assert.equal(claimed.card.stage, "working");
+        assert.notInclude(
+          (yield* slotRows(board.id))
+            .filter((row) => row.threadId === threadId)
+            .map((row) => row.kind),
+          "release",
+        );
+      }).pipe(Effect.provide(testLayer(states)));
+    }),
+);
+
+it.effect.each(["turn-end", "idle-tick", "timeout"] as const)(
+  "#1732 no hold after %s means next and claim both see a full pool",
+  (mode) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        yield* kanban.updateBoard(board.id, {
+          reviewChains: [{ name: "Same pool", steps: [board.defaultCardModel] }],
+          defaultReviewChain: "Same pool",
+        });
+        const first = yield* kanban.createCard(
+          board.id,
+          { title: "First", prompt: "First" },
+          owner,
+        );
+        yield* kanban.dispatchNow;
+        const threadId = (yield* kanban.card(first.id)).card.activeThreadId!;
+        yield* setRunning(fake, threadId, true);
+        const related = yield* kanban.createCard(
+          board.id,
+          { title: "Related", prompt: "Related" },
+          owner,
+        );
+        yield* kanban.setGroups(board.id, [
+          { id: "related", name: "Related", summary: "", cardIds: [first.id, related.id] },
+        ]);
+        yield* kanban.moveCard(first.id, "needs_review", "cardThread", {
+          _tag: "thread",
+          threadId,
+        });
+        yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+        yield* kanban.dispatchNow;
+        assert.equal((yield* kanban.card(first.id)).card.stage, "in_review");
+        yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+        if (mode === "timeout") yield* TestClock.adjust("31 minutes");
+        else yield* setRunning(fake, threadId, false);
+        if (mode === "turn-end") yield* kanban.turnEnded(threadId);
+        else yield* kanban.tick;
+        const next = yield* kanban.nextCards(threadId);
+        assert.isFalse(next.holdsSlot);
+        assert.deepStrictEqual(next.candidates, []);
+        const refused = yield* kanban.claimCard(threadId, related.id).pipe(Effect.flip);
+        assert.equal(refused.code, "denied");
+        assert.equal(refused.reason, "pool_full");
+        assert.equal((yield* kanban.card(related.id)).card.stage, "todo");
+        assert.deepStrictEqual(
+          (yield* slotRows(board.id))
+            .filter((row) => row.threadId === threadId)
+            .map((row) => [row.kind, row.why]),
+          [
+            ["take", "start"],
+            ["release", "hold_end"],
+          ],
+        );
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect("#1732 an expired hold check cannot release a replacement hold", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const reached = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.updateBoard(board.id, {
+        reviewChains: [{ name: "Same pool", steps: [board.defaultCardModel] }],
+        defaultReviewChain: "Same pool",
+      });
+      const first = yield* kanban.createCard(board.id, { title: "First", prompt: "First" }, owner);
+      yield* kanban.dispatchNow;
+      const threadId = (yield* kanban.card(first.id)).card.activeThreadId!;
+      yield* setRunning(fake, threadId, true);
+      const second = yield* kanban.createCard(
+        board.id,
+        { title: "Second", prompt: "Second" },
+        owner,
+      );
+      const third = yield* kanban.createCard(board.id, { title: "Third", prompt: "Third" }, owner);
+      yield* kanban.setGroups(board.id, [
+        {
+          id: "related",
+          name: "Related",
+          summary: "",
+          cardIds: [first.id, second.id, third.id],
+        },
+      ]);
+      const actor: KanbanActor = { _tag: "thread", threadId };
+      yield* kanban.moveCard(first.id, "needs_review", "cardThread", actor);
+      yield* TestClock.adjust("31 minutes");
+      fake.findCalls.length = 0;
+      fake.findControl.beforeRead = (id, attempt) =>
+        id === threadId && attempt === 2
+          ? Deferred.succeed(reached, undefined).pipe(Effect.andThen(Deferred.await(release)))
+          : Effect.void;
+      const tick = yield* Effect.forkChild(kanban.tick);
+      yield* Deferred.await(reached);
+      yield* kanban.claimCard(threadId, second.id);
+      yield* kanban.moveCard(second.id, "needs_review", "cardThread", actor);
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(tick);
+      const next = yield* kanban.nextCards(threadId);
+      assert.isTrue(next.holdsSlot);
+      assert.deepStrictEqual(
+        next.candidates.map(({ card }) => card.id),
+        [third.id],
+      );
+      assert.notInclude(
+        (yield* slotRows(board.id))
+          .filter((row) => row.threadId === threadId)
+          .map((row) => row.kind),
+        "release",
+      );
+      assert.equal((yield* kanban.claimCard(threadId, third.id)).card.activeThreadId, threadId);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("slot ledger counts shared cards once and retains a hold until turn end", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
