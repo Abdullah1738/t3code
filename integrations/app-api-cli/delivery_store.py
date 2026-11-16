@@ -6,10 +6,16 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import subprocess
 import time
 
+import toollog
+
 ROOT = Path(os.environ.get('DELIVERY_STORE', str(Path.home() / '.local/state/order-tracker')))
+PHONE_LOCK = Path.home() / '.local/share/phone-lock'
+HOLD_MAX_S = 3600
+HOLD_DETAILS = {'deferred_priority_hold', 'priority_hold_stale'}
 PACKAGES = {'com.talabat': 'talabat', 'com.noon.buyerapp': 'noon',
             'com.careem.acma': 'careem', 'com.amazon.mShop.android.shopping': 'amazon'}
 
@@ -55,12 +61,82 @@ def parse_pushes(dump, now=None):
         yield (key, PACKAGES[pkg[1]], posted, now, text[:1500], json.dumps(ids))
 
 
+def hold_state(now=None):
+    now = time.time() if now is None else now
+    hold = PHONE_LOCK / 'priority-hold'
+    try:
+        metadata = hold.lstat()
+    except FileNotFoundError:
+        return None
+    owner = ''
+    try:
+        # Every hold entry blocks collection, including dangling symlinks and
+        # special files. Only regular files have safe-to-read owner metadata.
+        if stat.S_ISREG(metadata.st_mode):
+            with hold.open() as stream:
+                owner = stream.readline().strip()
+    except (OSError, UnicodeError):
+        # Unreadable owner metadata must never permit phone access.
+        owner = ''
+    age = max(0, now - metadata.st_mtime)
+    state = {'state': 'live', 'owner': owner[:120],
+             'reason': 'no_matching_lease_within_bound', 'age_s': int(age),
+             'lease_expires_at': None, 'pid': None}
+    try:
+        lease = json.loads((PHONE_LOCK / 'lease.json').read_text())
+    except (OSError, ValueError):
+        lease = None
+    expiry = None
+    if owner and isinstance(lease, dict) and lease.get('owner') == owner:
+        expires = lease.get('expires_at')
+        if isinstance(expires, str):
+            try:
+                parsed = dt.datetime.fromisoformat(expires.replace('Z', '+00:00'))
+                if parsed.tzinfo is not None:
+                    expiry = parsed.timestamp()
+                    state['lease_expires_at'] = expires
+            except (ValueError, OverflowError):
+                pass
+        pid = lease.get('pid')
+        if type(pid) is int and 0 < pid <= 2147483647:
+            state['pid'] = pid
+    if age > HOLD_MAX_S:
+        state.update(state='stale', reason='hold_older_than_60m')
+    elif expiry is not None and state['pid'] is not None:
+        # Partial or malformed leases cannot establish holder liveness.
+        state['reason'] = 'lease_live'
+        if expiry <= now:
+            state.update(state='stale', reason='lease_expired')
+        else:
+            try:
+                os.kill(state['pid'], 0)
+            except ProcessLookupError:
+                state.update(state='stale', reason='holder_pid_dead')
+            except PermissionError:
+                pass
+    return state
+
+
+def log_hold_transition(previous, hold):
+    detail = ('deferred_priority_hold' if hold['state'] == 'live' else 'priority_hold_stale') if hold else None
+    if detail == previous or (detail is None and previous not in HOLD_DETAILS):
+        return
+    event = ('seen' if hold['state'] == 'live' else 'stale') if hold else 'cleared'
+    toollog.emit('order-watch', 'collector.hold_' + event,
+                 props={key: hold[key] for key in ('owner', 'reason', 'age_s')} if hold else
+                 {'owner': None, 'reason': 'hold_absent', 'age_s': None})
+
+
 def collect():
     now = time.time()
     with connect() as db:
-        if (Path.home() / '.local/share/phone-lock/priority-hold').exists():
+        previous = db.execute('SELECT detail FROM health WHERE source="phone"').fetchone()
+        hold = hold_state(now)
+        log_hold_transition(previous['detail'] if previous else None, hold)
+        if hold is not None:
+            live = hold['state'] == 'live'
             db.execute('INSERT OR REPLACE INTO health VALUES (?,?,?,?)',
-                       ('phone', now, 0, 'priority_hold'))
+                       ('phone', now, int(live), 'deferred_priority_hold' if live else 'priority_hold_stale'))
             return
         try:
             p = subprocess.run(['adb', '-s', '002473611000997', 'shell', 'dumpsys', 'notification', '--noredact'],
@@ -145,10 +221,23 @@ def reconcile(cfg, detected=None, source=None, evidence_time=None, reported=None
 
 
 def health_check():
+    now = time.time()
     with connect() as db:
         row = db.execute('SELECT * FROM health WHERE source="phone"').fetchone()
-        if not row or time.time() - row['checked'] > 120:
+        if not row or now - row['checked'] > 120:
             raise RuntimeError('notification collector is stale; restart com.ardud.delivery-notifications')
+        if row['detail'] in HOLD_DETAILS:
+            # The collector row can lag behind lease expiry or holder exit.
+            hold = hold_state(now)
+            if hold is not None and hold['state'] == 'stale':
+                raise RuntimeError('notification collection blocked by stale phone priority-hold: '
+                                   'owner={owner} reason={reason} age={age_s}s; '
+                                   "do not remove another task's hold, report it to its owner".format(**hold))
+            print(json.dumps({'status': 'deferred', 'reason': 'priority_hold',
+                              'owner': hold['owner'] if hold else None,
+                              'hold_reason': hold['reason'] if hold else 'hold_absent',
+                              'age_s': hold['age_s'] if hold else None}))
+            return
         if not row['ok']:
             raise RuntimeError('notification collection unavailable: ' + row['detail'])
 
