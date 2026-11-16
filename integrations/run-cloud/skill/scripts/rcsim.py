@@ -375,6 +375,15 @@ def identity_for(native: str, driver: str, *, retry_unavailable: bool = False, c
     return _resolve_identity(native, driver, "identity", command, retry_unavailable)
 
 
+def resolved_owner(ident: dict) -> dict:
+    thread = ident.get("robobThreadId")
+    parent = ident.get("parentThreadId")
+    _, t = thread_get(thread) if thread else (None, None)
+    return {"resolution": "resolved", "executionKind": ident.get("executionKind"),
+            "thread": thread, "title": (t or {}).get("title"), "manager": parent,
+            "relationship": "subagent" if parent else None}
+
+
 def whoami(thread: str | None = None, manager: str | None = None, *, ignore_env: bool = False,
            retry_unavailable: bool = False, command: str = "whoami") -> dict:
     """The execution rcsim acts for: owner thread, its title, and its manager (parent) thread.
@@ -412,12 +421,7 @@ def whoami(thread: str | None = None, manager: str | None = None, *, ignore_env:
         me["resolution"] = ident.get("resolution")
         me["executionKind"] = ident.get("executionKind")
         if ident.get("resolution") == "resolved":
-            me["thread"] = ident.get("robobThreadId")
-            me["manager"] = ident.get("parentThreadId")
-            if me["thread"]:
-                state, t = thread_get(me["thread"])
-                me["title"] = (t or {}).get("title")
-            me["relationship"] = "subagent" if me["manager"] else None
+            me.update(resolved_owner(ident))
     elif explicit is not None:
         # An explicit --thread names the owner the operator chose. It counts only when it is this execution or
         # one of its ancestors. RCSIM_THREAD is inherited shell state: it can never replace a resolved owner,
@@ -428,19 +432,20 @@ def whoami(thread: str | None = None, manager: str | None = None, *, ignore_env:
         ident = identity_for(native, driver, retry_unavailable=retry_unavailable, command=command) if native is not None else None
         if thread is None and ident is not None and ident.get("resolution") == "resolved":
             # Inherited RCSIM_THREAD: keep the resolved execution as the owner and drop the env value.
-            # An ancestor value is only informational here, so it is logged and ignored.
+            # Reuse this answer so ignoring the env value cannot restart the retry budget.
             if explicit != ident.get("robobThreadId"):
                 log(f"RCSIM_THREAD ignored: the resolved execution owns this call, not the inherited {explicit}")
-            return whoami(None, manager, ignore_env=True, retry_unavailable=retry_unavailable, command=command)
-        if ident is not None and ident.get("resolution") == "resolved":
-            allowed = {ident.get("robobThreadId"), ident.get("parentThreadId")} - {None}
-            if explicit not in allowed:
-                die(f"--thread {explicit} is not this session's thread or its parent")
-        me.update(thread=explicit, title=(t or {}).get("title"),
-                  resolution="resolved" if (ident is None or ident.get("resolution") == "resolved") else
-                  ident.get("resolution"))
-        if t and t.get("relationshipToParent") == "subagent" and t.get("parentThreadId"):
-            me.update(manager=t["parentThreadId"], relationship="subagent")
+            me.update(resolved_owner(ident))
+        else:
+            if ident is not None and ident.get("resolution") == "resolved":
+                allowed = {ident.get("robobThreadId"), ident.get("parentThreadId")} - {None}
+                if explicit not in allowed:
+                    die(f"--thread {explicit} is not this session's thread or its parent")
+            me.update(thread=explicit, title=(t or {}).get("title"),
+                      resolution="resolved" if (ident is None or ident.get("resolution") == "resolved") else
+                      ident.get("resolution"))
+            if t and t.get("relationshipToParent") == "subagent" and t.get("parentThreadId"):
+                me.update(manager=t["parentThreadId"], relationship="subagent")
     if ident is not None:
         for key in ("reason", "detail", "_attempts", "_waited_ms"):
             if key in ident:
@@ -685,6 +690,8 @@ def cmd_heartbeat(a) -> None:
     me = whoami(a.thread, retry_unavailable=True, command="heartbeat")
     if a.ids:
         refuse_native_unproven(me, "heartbeat")
+    else:
+        refuse_unresolved(me, "heartbeat")
     ids = [resolve_id(con, i) for i in a.ids] if a.ids else [r["id"] for r in my_active(con, me)]
     if not ids:
         die("no active simulators registered to this thread (pass ids explicitly)", 1)

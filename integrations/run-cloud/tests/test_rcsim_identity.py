@@ -276,6 +276,7 @@ class RcsimIdentityTests(unittest.TestCase):
             (rcsim.cmd_release, SimpleNamespace(thread=None, mine=True, ids=[])),
             (rcsim.cmd_release, SimpleNamespace(thread=None, mine=False, ids=["sim-child-a"])),
             (rcsim.cmd_heartbeat, SimpleNamespace(thread=None, ids=["sim-child-a"])),
+            (rcsim.cmd_heartbeat, SimpleNamespace(thread=None, ids=[])),
             (rcsim.cmd_handoff, SimpleNamespace(thread=None, id="sim-child-a", to=PARENT, note=None)),
         ]
         for command, args in cases:
@@ -332,6 +333,80 @@ class RcsimIdentityTests(unittest.TestCase):
         self.assertIn("timed out", me["detail"])
         for secret in ("test-token", "user:pass", "https://"):
             self.assertNotIn(secret, me["detail"])
+
+    def test_heartbeat_without_ids_refuses_before_matching_owned_simulators(self):
+        con = self._seed_shared_session_sims()
+        self.addCleanup(con.close)
+        before = self._snapshot_db(con)
+        cases = [
+            (0, {"error": "offline"}, 4, 3, "control-api-unreachable", "control API"),
+            (503, {"error": "offline"}, 4, 3, "control-api-unreachable", "control API"),
+            (200, {"identity": {"resolution": "unavailable"}}, 4, 3, "identity-pending", "hasn't mapped"),
+            (200, {"identity": {"resolution": "pending"}}, 4, 3, "identity-pending", "hasn't mapped"),
+            (404, {}, 1, 2, "not-mapped", "isn't mapped"),
+            (200, {"identity": {"resolution": "ambiguous"}}, 1, 2, "ambiguous", "resolution=ambiguous"),
+        ]
+        for status, body, attempts, code, reason, message in cases:
+            with self.subTest(status=status, reason=reason, body=body), self.shell(CODEX_THREAD_ID=CODEX_UUID), \
+                    self.fake_ctl([(status, body)] * attempts) as ctl, \
+                    patch.object(rcsim, "my_active") as active:
+                rcsim.time.sleep.reset_mock()
+                count = len(self.log_events())
+                self.assert_refused(rcsim.cmd_heartbeat, SimpleNamespace(thread=None, ids=[]), code,
+                                    message, "simulator keeps billing")
+            active.assert_not_called()
+            self.assertEqual(self._snapshot_db(con), before)
+            self.assertEqual(len(self.identity_calls(ctl)), attempts)
+            expected_waits = [call(5), call(10), call(20)] if attempts == 4 else []
+            self.assertEqual(rcsim.time.sleep.call_args_list, expected_waits)
+            events = self.log_events()[count:]
+            self.assertEqual(len(events), attempts + 1)
+            self.assertEqual(events[-1]["name"], "identity.refused")
+            self.assertEqual(events[-1]["props"]["reason"], reason)
+            self.assertEqual(events[-1]["props"]["exitCode"], code)
+            self.assertEqual(events[-1]["props"]["attempts"], attempts)
+            self.assertEqual(events[-1]["props"]["waitedMs"], 35000 if attempts == 4 else 0)
+
+    def test_inherited_thread_reuses_recovered_identity_for_heartbeat(self):
+        con = self._seed_shared_session_sims()
+        self.addCleanup(con.close)
+        other = "thread-unrelated"
+        self.stub.threads[other] = {"threadId": other, "title": "Other"}
+        for inherited in (CHILD, PARENT, other):
+            with self.subTest(inherited=inherited), \
+                    self.shell(CODEX_THREAD_ID=CODEX_UUID, RCSIM_THREAD=inherited), \
+                    self.fake_ctl([(0, {"error": "offline"})] * 3 +
+                                  [(200, {"identity": resolved(CHILD, PARENT, "app-managed-child")})]) as ctl, \
+                    patch.object(rcsim, "rc") as run_cloud, contextlib.redirect_stdout(io.StringIO()):
+                rcsim.time.sleep.reset_mock()
+                count = len(self.log_events())
+                before = self._snapshot_db(con)
+                rcsim.cmd_heartbeat(SimpleNamespace(thread=None, ids=[]))
+            self.assertEqual(len(self.identity_calls(ctl)), 4)
+            self.assertEqual(rcsim.time.sleep.call_args_list, [call(5), call(10), call(20)])
+            self.assertEqual(rcsim.get_row(con, "sim-child-a")["hb_by"], CHILD)
+            after = self._snapshot_db(con)
+            self.assertEqual([r for r in after if r[0] != "sim-child-a"],
+                             [r for r in before if r[0] != "sim-child-a"])
+            events = self.log_events()[count:]
+            self.assertEqual([e["props"]["attempt"] for e in events], [1, 2, 3, 4])
+            self.assertEqual([e["ok"] for e in events], [False, False, False, True])
+            run_cloud.assert_not_called()
+
+    def test_whoami_with_inherited_thread_uses_one_lookup_and_keeps_manager(self):
+        for manager, expected in ((None, PARENT), ("none", None), ("thread-manager", "thread-manager")):
+            with self.subTest(manager=manager), self.shell(CODEX_THREAD_ID=CODEX_UUID, RCSIM_THREAD=PARENT), \
+                    self.fake_ctl([(200, {"identity": resolved(CHILD, PARENT, "app-managed-child")})]) as ctl:
+                me = rcsim.whoami(manager=manager)
+            self.assertEqual(len(self.identity_calls(ctl)), 1)
+            self.assertEqual(me["thread"], CHILD)
+            self.assertEqual(me["title"], "Child")
+            self.assertEqual(me["manager"], expected)
+            self.assertEqual(me["relationship"], "subagent")
+            self.assertEqual(me["executionKind"], "app-managed-child")
+            self.assertEqual(me["_attempts"], 1)
+            self.assertEqual(me["_waited_ms"], 0)
+        rcsim.time.sleep.assert_not_called()
 
     # --- identity
 
