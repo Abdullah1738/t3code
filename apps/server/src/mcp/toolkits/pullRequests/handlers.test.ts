@@ -42,6 +42,7 @@ import {
 import * as ProjectService from "../../../project/ProjectService.ts";
 import * as RepositoryIdentityResolver from "../../../project/RepositoryIdentityResolver.ts";
 import * as PullRequestService from "../../../pullRequest/PullRequestService.ts";
+import { PullRequestProviderError } from "@t3tools/source-control-core/server/PullRequestProvider";
 import * as PullRequestReviewGuideService from "../../../pullRequest/PullRequestReviewGuideService.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
@@ -473,20 +474,34 @@ describe("pull request toolkit handlers", () => {
       }),
   );
 
-  it.effect("watch preflight registers despite a transient host read error", () =>
-    Effect.gen(function* () {
-      const harness = yield* makeHarness({
-        detail: () =>
-          Effect.fail(
-            new PullRequestOperationError({ operation: "detail", detail: "Rate limited" }),
-          ),
-      });
-      yield* harness.call("watch_pull_request", { repository: "t3tools/t3code", number: 9 });
-      expect(yield* Ref.get(harness.detailRequests)).toHaveLength(1);
-      expect(yield* Ref.get(harness.commands)).toMatchObject([
-        { type: "thread.pull-request.watch", watching: true },
-      ]);
-    }),
+  it.effect.each(["rate-limited", "failed"] as const)(
+    "watch preflight registers despite a transient provider error (%s)",
+    (reason) =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({
+          detail: () =>
+            Effect.fail(
+              new PullRequestOperationError({
+                operation: "detail",
+                detail:
+                  reason === "failed"
+                    ? "The GitHub CLI could not hand over a credential"
+                    : "Rate limited",
+                cause: new PullRequestProviderError({
+                  provider: SourceControlProviderKind.make("github"),
+                  operation: "getChangeRequest",
+                  reason,
+                  detail: "Transient gh spawn or host failure",
+                }),
+              }),
+            ),
+        });
+        yield* harness.call("watch_pull_request", { repository: "t3tools/t3code", number: 9 });
+        expect(yield* Ref.get(harness.detailRequests)).toHaveLength(1);
+        expect(yield* Ref.get(harness.commands)).toMatchObject([
+          { type: "thread.pull-request.watch", watching: true },
+        ]);
+      }),
   );
 
   it.effect("watch preflight times out and still dispatches before the operation deadline", () =>
