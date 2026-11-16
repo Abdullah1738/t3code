@@ -22,7 +22,11 @@ export const layer = Layer.effect(
           surface: "server",
           route: "database",
           durationMs: observation.durationMs,
+          startedAt: DateTime.formatIso(
+            DateTime.makeUnsafe(DateTime.toEpochMillis(now) - observation.durationMs),
+          ),
           props: {
+            ...(observation.lane === undefined ? {} : { readerLane: observation.lane }),
             ...(observation.waitMs === undefined ? {} : { waitMs: observation.waitMs }),
             ...(observation.outcome === "interrupt" ? { cause: "unknown" as const } : {}),
             phase: observation.operation,
