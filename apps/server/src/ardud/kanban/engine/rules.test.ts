@@ -2106,6 +2106,21 @@ describe("isOutage category", () => {
       }),
     ).toBe(false);
   });
+
+  it.each([
+    [undefined, true],
+    ["unknown", true],
+    ["model_invalid", false],
+  ] as const)("classifies Model unavailable with category %s as outage=%s", (category, outage) => {
+    expect(
+      isOutage({
+        class: "provider_error",
+        code: "provider.no-route",
+        message: "Model unavailable: sable/x",
+        category,
+      }),
+    ).toBe(outage);
+  });
 });
 
 describe("isOutage", () => {
