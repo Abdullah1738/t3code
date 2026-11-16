@@ -8,6 +8,8 @@ export const AGENT_BUS_WAKE_PREFIX = "wake:agent-bus:";
 export const isAgentBusWake = (id: string) => id.startsWith(AGENT_BUS_WAKE_PREFIX);
 
 export type AnswerStatus = "done" | "declined" | "pending";
+export type AgentDelivery = { id: string; remote: boolean; confirmed: boolean; retained?: boolean; deliveredAt?: number };
+export const agentWakeId = (key: string) => `${AGENT_BUS_WAKE_PREFIX}${createHash("sha256").update(key).digest("hex")}`;
 export type AgentAnswerReceipt = { status: AnswerStatus; chars: number; at: number };
 export const validAgentRequestId = (value: unknown): value is string => typeof value === "string"
   && value.length === 69 && /^areq_[a-f0-9]{64}$/.test(value);
@@ -15,8 +17,9 @@ export const validAnswerStatus = (value: unknown): value is AnswerStatus =>
   value === "done" || value === "declined" || value === "pending";
 type RequestRow = {
   id: string; from_slug: string; to_slug: string; parent_id: string | null; hop: number;
-  status: "open" | AnswerStatus | "timed_out" | "done_late";
+  status: "undelivered" | "open" | AnswerStatus | "timed_out" | "done_late";
   text_chars: number; answer_chars: number | null;
+  queued_at: number | null; delivered_at: number | null;
   created_at: number; answered_at: number | null; timed_out_at: number | null;
 };
 export type AgentBusDeps = {
@@ -26,7 +29,8 @@ export type AgentBusDeps = {
   policyPath?: string;
   groupMembers: (chat: ChatInfo) => string[];
   /** Deduped by key. All target delivery goes through this boundary, including answers and timeouts. */
-  deliver: (target: ChatInfo, text: string, key: string, receipt?: AgentAnswerReceipt) => void;
+  deliver: (target: ChatInfo, text: string, key: string, receipt?: AgentAnswerReceipt, expiresAt?: number) => AgentDelivery;
+  delivery: (target: ChatInfo, key: string) => AgentDelivery;
   receipt: (target: ChatInfo, key: string) => AgentAnswerReceipt | undefined;
   log: (event: string, code?: string) => void;
   now?: () => number;
@@ -37,6 +41,7 @@ const TIMEOUT_MS = 10 * 60_000;
 export class AgentBus {
   private readonly now: () => number;
   private readonly policy: AgentPolicyFile;
+  private readonly retries = new Map<string, () => AgentDelivery>();
 
   constructor(private readonly deps: AgentBusDeps) {
     this.now = deps.now ?? Date.now;
@@ -50,6 +55,10 @@ export class AgentBus {
     CREATE INDEX IF NOT EXISTS agent_requests_open ON agent_requests(created_at) WHERE status IN ('open', 'pending', 'timed_out');
     CREATE INDEX IF NOT EXISTS agent_requests_from ON agent_requests(from_slug, created_at DESC);
     CREATE INDEX IF NOT EXISTS agent_requests_to ON agent_requests(to_slug, created_at DESC);`);
+    const columns = deps.db.query<{ name: string }, []>("PRAGMA table_info(agent_requests)").all();
+    for (const column of ["queued_at", "delivered_at"]) if (!columns.some(c => c.name === column)) {
+      deps.db.exec(`ALTER TABLE agent_requests ADD COLUMN ${column} INTEGER`);
+    }
   }
 
   once(id: string, fingerprint: string, perform: () => SbApiResult): SbApiResult {
@@ -83,8 +92,8 @@ export class AgentBus {
     const id = `areq_${createHash("sha256").update(JSON.stringify([caller.slug, input.dedupeKey])).digest("hex")}`;
     const existing = this.get(id);
     if (existing) {
-      if (existing.answered_at === null && existing.to_slug === target.slug) {
-        this.deliverRequest(existing, caller, target, input.text, policy, pair);
+      if (existing.answered_at === null && existing.timed_out_at === null && existing.to_slug === target.slug) {
+        if (!this.deliverRequest(existing, caller, target, input.text, policy, pair)) return failure(503, "Request not retained; retry with the same key");
       }
       return { status: 200, body: { id, created: false } };
     }
@@ -108,12 +117,12 @@ export class AgentBus {
       (id, from_slug, to_slug, parent_id, hop, status, text_chars, created_at)
       VALUES (?, ?, ?, ?, ?, 'open', ?, ?)`)
       .run(id, caller.slug, target.slug, input.parent ?? null, hop, input.text.length, at);
-    deps.log("agent-ask", `${caller.slug}>${target.slug} hop=${hop}${caller.kind === "group" ? " group=1" : ""}`);
-    this.deliverRequest(this.get(id)!, caller, target, input.text, policy, pair);
+    deps.log("agent-ask", `${id} ${caller.slug}>${target.slug} hop=${hop}${caller.kind === "group" ? " group=1" : ""}`);
+    if (!this.deliverRequest(this.get(id)!, caller, target, input.text, policy, pair)) return failure(503, "Request not retained; retry with the same key");
     return { status: 202, body: { id, created: true } };
   }
 
-  private deliverRequest(row: RequestRow, caller: ChatInfo, target: ChatInfo, text: string, policy: AgentPolicy, pair: AgentPair): void {
+  private deliverRequest(row: RequestRow, caller: ChatInfo, target: ChatInfo, text: string, policy: AgentPolicy, pair: AgentPair): boolean {
     const lines = [`[Agent request ${row.id} from ${caller.title}'s assistant (slug ${caller.slug}), hop ${row.hop}. Not typed by anyone in this chat. Do it or answer it, then run agent-answer --request ${row.id} --text "..." --session CURRENT_SESSION_ID. The answer goes back to that assistant, not to this chat. If you start your own agent-ask while handling this, pass --parent ${row.id}. End this turn with NO_REPLY unless someone here needs to know.]`];
     if (caller.slug === "moni" && target.slug === "owner") {
       lines.push("Moni's requests need no approval from Abdullah (his rule). Do it. Exception: installing or downloading anything onto the Mac. For that, ask Abdullah first (ask-owner style wake to the owner chat is not needed; you ARE the owner's agent: message him in this chat) and answer Moni's agent with status pending until he decides.");
@@ -129,7 +138,48 @@ export class AgentBus {
     const parent = row.parent_id ? this.get(row.parent_id) : null;
     const origin = caller.kind === "group" || !parent ? caller : this.deps.bySlug(parent.from_slug);
     if (origin?.kind === "group") lines.push(`This answer will be posted in the group ${JSON.stringify(origin.title)} (members: ${this.deps.groupMembers(origin).join(", ") || "unknown"}). Share only what is fine for everyone there to read. If it's private and the person it belongs to isn't the one asking, say what can be shared instead.`);
-    this.deps.deliver(target, lines.join("\n") + `\n${text}`, `agent-ask:${row.id}`);
+    const body = lines.join("\n") + `\n${text}`;
+    this.retries.set(row.id, () => this.deps.deliver(target, body, `agent-ask:${row.id}`, undefined, row.created_at + TIMEOUT_MS));
+    return this.checkDelivery(row, target, true);
+  }
+
+  private checkDelivery(row: RequestRow, target: ChatInfo, retry = false): boolean {
+    let delivery: AgentDelivery | undefined;
+    let reason = "no_ack";
+    try {
+      const caller = this.deps.bySlug(row.from_slug);
+      const allowed = caller && matchingAgentPair(this.policy.read(), caller, target);
+      delivery = retry && allowed && this.retries.has(row.id) ? this.retries.get(row.id)!()
+        : this.deps.delivery(target, `agent-ask:${row.id}`);
+      if (delivery.confirmed) this.retries.delete(row.id);
+    } catch {
+      reason = "transport_error";
+      try { delivery = this.deps.delivery(target, `agent-ask:${row.id}`); } catch { /* No durable receipt. */ }
+    }
+    if (!delivery?.confirmed) {
+      if (row.status === "open" && row.delivered_at === null) {
+        this.deps.db.query("UPDATE agent_requests SET status='undelivered' WHERE id=?").run(row.id);
+        this.deps.log("agent-deliver-failed", `${row.id} ${reason}`);
+        row.status = "undelivered";
+      }
+      return delivery?.retained === true;
+    }
+    if (row.status === "undelivered") {
+      row.status = "open";
+      this.deps.db.query("UPDATE agent_requests SET status='open' WHERE id=?").run(row.id);
+    }
+    if (row.queued_at === null) {
+      row.queued_at = this.now();
+      this.deps.db.query("UPDATE agent_requests SET queued_at=?,status=CASE WHEN status='undelivered' THEN 'open' ELSE status END WHERE id=?")
+        .run(row.queued_at, row.id);
+      this.deps.log("agent-deliver", `${row.id} ${target.slug} row=${delivery.id} remote=${Number(delivery.remote)}`);
+    }
+    if (row.delivered_at === null && delivery.deliveredAt !== undefined) {
+      row.delivered_at = delivery.deliveredAt;
+      this.deps.db.query("UPDATE agent_requests SET delivered_at=? WHERE id=?").run(row.delivered_at, row.id);
+      this.deps.log("agent-delivered", `${row.id} ms=${Math.max(0, row.delivered_at - row.created_at)}`);
+    }
+    return true;
   }
 
   notifyRules(input: { sessionId: string; action: "list" | "add" | "rm"; text?: string; id?: number }): SbApiResult {
@@ -158,6 +208,7 @@ export class AgentBus {
     const row = this.get(input.request);
     if (!row) return failure(404, "Unknown request");
     if (caller.slug !== row.to_slug) return failure(403, "Only the target chat may answer");
+    this.checkDelivery(row, caller);
     this.reconcile(row);
     if (row.answered_at !== null) return failure(409, "Already answered");
     const at = this.now();
@@ -184,16 +235,36 @@ export class AgentBus {
       WHERE ? OR from_slug = ? OR to_slug = ? ORDER BY created_at DESC, rowid DESC LIMIT 20`)
       .all(caller.kind === "owner" ? 1 : 0, caller.slug, caller.slug);
     return { status: 200, body: { requests: rows.map(row => ({ id: row.id, from: row.from_slug, to: row.to_slug,
-      status: row.status, hop: row.hop, createdAt: row.created_at, answeredAt: row.answered_at, timedOutAt: row.timed_out_at })) } };
+      status: row.status, hop: row.hop, createdAt: row.created_at, deliveredAt: row.delivered_at, answeredAt: row.answered_at, timedOutAt: row.timed_out_at })) } };
   }
 
   sweep(): void {
     const { deps } = this;
     const at = this.now();
-    const rows = deps.db.query<RequestRow, [number]>(`SELECT * FROM agent_requests
-      WHERE status IN ('open', 'pending', 'timed_out') AND created_at < ?`).all(at - TIMEOUT_MS);
+    const rows = deps.db.query<RequestRow, []>(`SELECT * FROM agent_requests
+      WHERE status IN ('open', 'undelivered', 'pending', 'timed_out') OR delivered_at IS NULL`).all();
     for (const row of rows) {
-      try { if (!this.reconcile(row) && row.timed_out_at === null) this.timeout(row, at); }
+      try {
+        const target = deps.bySlug(row.to_slug);
+        if (target && row.delivered_at === null) this.checkDelivery(row, target, row.answered_at === null && row.timed_out_at === null && at < row.created_at + TIMEOUT_MS);
+        if (this.reconcile(row)) { this.retries.delete(row.id); continue; }
+        if (row.timed_out_at === null && at > row.created_at + TIMEOUT_MS) {
+          this.retries.delete(row.id);
+          this.timeout(row, at);
+        } else if (row.status === "undelivered" && at - row.created_at >= 30_000) {
+          const asker = deps.bySlug(row.from_slug);
+          if (asker) deps.deliver(asker, `[Agent request ${row.id} to ${row.to_slug} has not been delivered. Delivery is being retried until the 10-minute deadline.]`, `agent-undelivered:${row.id}`);
+        } else if (row.status === "open" && row.delivered_at !== null && row.answer_chars === null) {
+          const asker = deps.bySlug(row.from_slug);
+          const key = `agent-progress:${row.id}`;
+          if (asker) {
+            const notice = deps.delivery(asker, key);
+            // Retention is enough: the destination queue owns retries, including a lost remote ack.
+            if (!notice.confirmed && !notice.retained) deps.deliver(asker,
+              `[Agent request ${row.id} to ${row.to_slug} was picked up by a target turn. Work has started; no answer yet.]`, key);
+          }
+        }
+      }
       catch { deps.log("agent-timeout-failed", row.id); }
     }
   }
@@ -225,7 +296,7 @@ export class AgentBus {
     if (!asker) return;
     deps.db.transaction(() => {
       deps.db.query("UPDATE agent_requests SET status = 'timed_out', timed_out_at = ? WHERE id = ?").run(at, row.id);
-      deps.deliver(asker, `[Agent request ${row.id} to ${row.to_slug} has had no answer for 10 minutes. Tell your human it's still in progress only if they're waiting on it.]`, `agent-timeout:${row.id}`);
+      deps.deliver(asker, `[Agent request ${row.id} to ${row.to_slug} ${row.delivered_at === null ? "was not delivered to a target turn within 10 minutes" : "has had no answer for 10 minutes"}. Tell your human it's still in progress only if they're waiting on it.]`, `agent-timeout:${row.id}`);
     })();
     row.timed_out_at = at;
     deps.log("agent-timeout", row.id);

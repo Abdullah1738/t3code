@@ -30,6 +30,7 @@ function setup() {
   let eventsFail = false, routerReady = true, callbackReady = true;
   let requestHook: ((path: string) => Promise<void>) | undefined;
   let now = 1000, online = true, dropAck = false, active = true;
+  let afterStatus: (()=>Promise<void>) | undefined;
   const store = new Store(join(mac, "state.sqlite")); closes.push(() => store.close());
   const runner = new BoxRunner({ root: box, boxId: config.boxId, epoch: config.epoch, token, callbackToken, privateKey: keys.privateKey, callbackUrl: "http://127.0.0.1:12346", system: "system" }, { run: async ({ text }) => { texts.push(text); return "NO_REPLY"; } }, { now: () => now, modelReady: async () => routerReady, callbackReady: async () => callbackReady, fetch: (async () => Response.json({ epoch: "test", accepted: true })) });
   closes.push(() => runner.db.close());
@@ -41,6 +42,7 @@ function setup() {
       await requestHook?.(path);
       if (path === "/events" && eventsFail) return Response.json({ error: "PRIVATE_EVENTS_ERROR" }, { status: 503 });
       const response = await runner.handle(new Request(String(url), init));
+      if (String(url).endsWith("/delivery-status") && afterStatus) { const hook=afterStatus; afterStatus=undefined; await hook(); }
       if (String(url).endsWith("/deliver") && dropAck) { dropAck = false; throw new Error("lost ack"); } return response; }),
   } satisfies ConstructorParameters<typeof RemoteBox>[2];
   let remote = new RemoteBox(config, store, io);
@@ -57,6 +59,7 @@ function setup() {
     restart: () => { remote.stop(); const reopened = new Store(join(mac, "state.sqlite")); closes.push(() => reopened.close()); remote = new RemoteBox(config, reopened, io); },
     failNotice: () => { io.notice = async id => { notices.push(id); throw new Error("ambiguous notice"); }; },
     advance: (ms = 65_000) => { now += ms; }, offline: () => { online = false; }, online: () => { online = true; }, drop: () => { dropAck = true; }, rollback: () => { active = false; },
+    afterStatus: (hook: ()=>Promise<void>) => {afterStatus=hook;},
     request: (path: string, body: unknown = {}, auth = callbackToken) => new Request(`http://bridge${path}`, { method: "POST", headers: { authorization: `Bearer ${auth}` }, body: JSON.stringify({ epoch: "test", ...body as object }) }),
   };
 }
@@ -840,8 +843,8 @@ test.each(["before", "after"])("delivery card bus retry recovers a failure %s th
     if (fail) throw new Error("fixture acknowledgement lost");
     return created;
   };
-  expect((await ask()).status).toBe(500);
-  expect(ownerStore.db.query<{ status: string }, []>("SELECT status FROM agent_requests").all()).toEqual([{ status: "open" }]);
+  expect((await ask()).status).toBe(failure === "before" ? 503 : 202);
+  expect(ownerStore.db.query<{ status: string }, []>("SELECT status FROM agent_requests").all()).toEqual([{ status: "undelivered" }]);
   expect(s.store.db.query<{ n: number }, []>("SELECT count(*) n FROM remote_inbox").get()!.n).toBe(failure === "before" ? 0 : 1);
   fail = false;
   const recovered = await ask();
@@ -1070,3 +1073,100 @@ test.each(["pending", "running"].flatMap(state => ["inbound", "wake"].flatMap(he
     expect(s.runner.db.query<{ state: string }, [string]>("SELECT state FROM inbox WHERE id=?").get(head)?.state).toBe(state);
     expect(JSON.stringify([s.logs, s.alerts])).not.toContain("PRIVATE_");
   });
+
+
+test("remote bus confirmation requires ack and reports pickup from the box without text", async () => {
+  const s = setup(); const id = "wake:agent-bus:delivery-canary";
+  const privateText = randomUUID();
+  s.remote.accept(id, { id, text: privateText, agentExpiresAt: 9999999999999 });
+  expect(s.remote.delivery(id)).toEqual({ retained: true, confirmed: false });
+  s.drop(); await s.remote.tick();
+  expect(s.remote.delivery(id)).toEqual({ retained: true, confirmed: false });
+  s.advance(); await s.remote.tick();
+  expect(s.remote.delivery(id)).toEqual({ retained: true, confirmed: true });
+  await s.runner.tick(); s.advance(); await s.remote.tick();
+  expect(s.remote.delivery(id).deliveredAt).toBeGreaterThan(0);
+  expect(s.texts.join()).toContain(privateText);
+  expect(files(s.mac)).not.toContain(privateText);
+  expect(s.logs.join()).not.toContain(privateText);
+});
+
+
+test("expired acked requests do not starve later pickup receipts", async () => {
+  const s = setup();
+  for (let i=0; i<50; i++) s.remote.accept(`expired-${i}`, { text: "PRIVATE", agentExpiresAt: 2_000 });
+  await s.remote.tick(); s.advance(); await s.remote.tick();
+  for (let i=0; i<50; i++) await s.runner.tick();
+  const id = "wake:agent-bus:after-expired";
+  s.remote.accept(id, { text: "next", agentExpiresAt: 9999999999999 });
+  s.advance(); await s.remote.tick(); await s.runner.tick(); s.advance(); await s.remote.tick();
+  expect(s.remote.delivery(id).deliveredAt).toBeGreaterThan(0); expect(s.texts).toEqual(["next"]);
+});
+
+test("lost ack pickup is reconciled after expiry without resending", async () => {
+  const s = setup(), id = "wake:agent-bus:lost-ack";
+  s.remote.accept(id, { text: "PRIVATE", agentExpiresAt: 20_000 });
+  s.drop(); await s.remote.tick(); await s.runner.tick(); expect(s.remote.delivery(id).confirmed).toBe(false);
+  s.advance(); await s.remote.tick();
+  expect(s.remote.delivery(id)).toMatchObject({ confirmed: true, deliveredAt: 1_000 }); expect(s.texts).toEqual(["PRIVATE"]);
+});
+
+
+test("a pre-expiry receipt snapshot arriving after expiry stays eligible for reconciliation", async () => {
+  const s=setup(),id="wake:agent-bus:receipt-race";
+  s.remote.accept(id,{text:"PRIVATE",agentExpiresAt:20_000});
+  s.afterStatus(async()=>{await s.runner.tick();s.advance();}); await s.remote.tick();
+  expect(s.remote.delivery(id).deliveredAt).toBeUndefined();
+  s.advance(); await s.remote.tick(); expect(s.remote.delivery(id).deliveredAt).toBe(1000);
+  expect(s.texts).toEqual(["PRIVATE"]);
+});
+
+test("slow pickup receipts allow concurrent lease renewal with one status probe", async () => {
+  const s = setup(), entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  s.remote.accept("wake:agent-bus:slow-receipt", { text: "PRIVATE", agentExpiresAt: 200_000 });
+  let leases = 0, probes = 0;
+  s.requestHook(async path => {
+    if (path === "/lease") { leases++; s.advance(8_000); }
+    if (path === "/delivery-status") { probes++; entered.resolve(); await release.promise; }
+  });
+  const probing = s.remote.tick(); await entered.promise;
+  try {
+    expect(s.runner.active()).toBe(true);
+    s.advance(5_000); await s.remote.tick();
+    expect(leases).toBe(2); expect(probes).toBe(1);
+    expect(s.runner.active()).toBe(true);
+    s.advance(8_000);
+    expect(s.runner.active()).toBe(true);
+  } finally { release.resolve(); await probing; }
+  expect(s.logs).not.toContain("moni-box-down ");
+});
+
+test("remote transfer acknowledgement and legacy migration never fabricate target pickup", async () => {
+  const s = setup(); const id = "wake:agent-bus:legacy-pickup";
+  s.remote.accept(id, { id, text: `[Agent request areq_${"b".repeat(64)} from Owner's assistant]PRIVATE`, receivedAt: 1_000 });
+  await s.remote.tick();
+  expect(s.store.db.query("SELECT delivered_at,picked_up_at FROM remote_inbox WHERE id=?").get(opaqueId(id)))
+    .toEqual({ delivered_at: 1_000, picked_up_at: null });
+  expect(s.remote.delivery(id)).toEqual({ retained: true, confirmed: true });
+  s.store.db.query("UPDATE remote_inbox SET expires_at=200000 WHERE id=?").run(opaqueId(id));
+  s.restart(); s.advance(); await s.remote.tick();
+  expect(s.remote.delivery(id).deliveredAt).toBeUndefined();
+  await s.runner.tick(); s.advance(); await s.remote.tick();
+  expect(s.remote.delivery(id).deliveredAt).toBe(66_000);
+  expect(s.texts).toHaveLength(1);
+});
+
+test.each([false, true])("legacy encrypted asks receive deadline metadata before delayed pickup, acked=%s", async acked => {
+  const s = setup(); const id = "wake:agent-bus:legacy-deadline";
+  s.remote.accept(id, { id, text: `[Agent request areq_${"a".repeat(64)} from Owner's assistant]PRIVATE`, receivedAt: 1_000 });
+  if (acked) { await s.remote.tick(); await s.runner.tick(); expect(s.texts).toEqual([]); }
+  // The bridge migration can update metadata without decrypting the retained envelope.
+  s.store.db.query("UPDATE remote_inbox SET expires_at=2000 WHERE id=?").run(opaqueId(id));
+  s.advance();
+  // Exercise transfer just before expiry as well as an existing acknowledged box row.
+  if (!acked) s.store.db.query("UPDATE remote_inbox SET expires_at=67000 WHERE id=?").run(opaqueId(id));
+  await s.remote.tick(); s.advance();
+  await s.remote.tick(); await s.runner.tick(); expect(s.texts).toEqual([]);
+  expect(s.runner.db.query<{ expires_at: number; state: string; delivered_at: number | null }, [string]>("SELECT expires_at,state,delivered_at FROM inbox WHERE id=?").get(opaqueId(id)))
+    .toEqual({ expires_at: acked ? 2000 : 67000, state: "done", delivered_at: null });
+});

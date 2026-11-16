@@ -44,6 +44,7 @@ export class RemoteBox {
   private readonly callbackToken: string;
   private busy = false;
   private fenceBusy = false;
+  private deliveryBusy = false;
   private nextProbe = 0;
   private failures = 0;
   private nextStateLog = 0;
@@ -84,6 +85,8 @@ export class RemoteBox {
       outage.unreachableSince = null; outage.reachableSince = null; store.set("remoteOutage", outage);
     }
     this.backendState();
+    const columns = store.db.query<{ name: string }, []>("PRAGMA table_info(remote_inbox)").all();
+    for (const column of ["expires_at", "picked_up_at", "delivery_checked_at", "delivery_final"]) if (!columns.some(c => c.name === column)) store.db.exec(`ALTER TABLE remote_inbox ADD COLUMN ${column} INTEGER`);
   }
   private backendState() {
     this.nextStateLog = this.now() + 300_000;
@@ -126,8 +129,9 @@ export class RemoteBox {
   accept(id: string, input: unknown, receipt?: AgentAnswerReceipt, kind: "inbound" | "wake" = "inbound"): boolean {
     const key = opaqueId(id);
     return this.store.db.transaction(() => {
-      const created = this.store.db.query("INSERT OR IGNORE INTO remote_inbox(id,sealed,receipt,kind,received_at) VALUES (?,?,?,?,?)")
-        .run(key, JSON.stringify(seal(this.publicKey, typeof input === "object" && input !== null ? { ...input, kind } : input)), receipt ? JSON.stringify(receipt) : null, kind, this.now()).changes === 1;
+      const created = this.store.db.query("INSERT OR IGNORE INTO remote_inbox(id,sealed,receipt,kind,received_at,expires_at) VALUES (?,?,?,?,?,?)")
+        .run(key, JSON.stringify(seal(this.publicKey, typeof input === "object" && input !== null ? { ...input, kind } : input)), receipt ? JSON.stringify(receipt) : null, kind, this.now(),
+          typeof input === "object" && input !== null && "agentExpiresAt" in input && Number.isSafeInteger(input.agentExpiresAt) ? input.agentExpiresAt as number : null).changes === 1;
       if (created && kind === "inbound") this.unanswered.accept(key, this.now());
       return created;
     })();
@@ -138,6 +142,10 @@ export class RemoteBox {
   }
   hasMessage(id: string): boolean {
     return !!this.store.db.query("SELECT 1 FROM remote_inbox WHERE id=?").get(opaqueId(id));
+  }
+  delivery(id: string): { retained: boolean; confirmed: boolean; deliveredAt?: number } {
+    const row = this.store.db.query<{ sealed: string | null; picked_up_at: number | null }, [string]>("SELECT sealed,picked_up_at FROM remote_inbox WHERE id=?").get(opaqueId(id));
+    return { retained: !!row, confirmed: row?.sealed === null, ...(row?.picked_up_at == null ? {} : { deliveredAt: row.picked_up_at }) };
   }
   async request(path: string, body: unknown): Promise<Record<string, unknown>> {
     const response = await (this.io.fetch ?? fetch)(this.config.url + path, { method: "POST", redirect: "error",
@@ -309,10 +317,10 @@ export class RemoteBox {
       if (status.boxId !== this.config.boxId || status.epoch !== this.config.epoch) throw new Error("Box identity mismatch");
       dependenciesReady = status.routerReady !== false && status.callbackReady !== false;
       this.failures = 0;
-      const rows = this.store.db.query<{ id: string; seq: number; sealed: string }, []>("SELECT id,seq,sealed FROM remote_inbox WHERE sealed IS NOT NULL ORDER BY seq LIMIT 50").all();
+      const rows = this.store.db.query<{ id: string; seq: number; sealed: string; expires_at: number | null }, [number]>("SELECT id,seq,sealed,expires_at FROM remote_inbox WHERE sealed IS NOT NULL AND (expires_at IS NULL OR expires_at > ?) ORDER BY seq LIMIT 50").all(this.now());
       let delivered = 0;
       for (const row of rows) {
-        const ack = await this.request("/deliver", { id: row.id, sealed: JSON.parse(row.sealed) as Sealed, epoch: this.config.epoch });
+        const ack = await this.request("/deliver", { id: row.id, sealed: JSON.parse(row.sealed) as Sealed, epoch: this.config.epoch, expiresAt: row.expires_at });
         if (ack.id !== row.id || ack.accepted !== true) throw new Error("Invalid box acknowledgement");
         this.store.db.query("UPDATE remote_inbox SET sealed=NULL,delivered_at=COALESCE(delivered_at,?) WHERE id=?").run(this.now(), row.id);
         delivered++;
@@ -342,6 +350,7 @@ export class RemoteBox {
       this.emit("moni-runner-error", "unreachable");
     } finally { this.busy = false; }
     // Observational requests must not hold up lease renewal, including while Telegram is stalled.
+    const delivery = healthy ? this.checkDeliveries() : undefined;
     if (healthy && !this.fenceBusy) {
       this.fenceBusy = true;
       try {
@@ -352,6 +361,27 @@ export class RemoteBox {
       } catch { this.emit("moni-box-events-error"); }
       finally { this.fenceBusy = false; }
     }
+    await delivery;
+  }
+  private async checkDeliveries(): Promise<void> {
+    if (this.deliveryBusy || !this.io.active()) return;
+    this.deliveryBusy = true;
+    try {
+      const waiting = this.store.db.query<{ id: string; expires_at: number }, []>("SELECT id,expires_at FROM remote_inbox WHERE picked_up_at IS NULL AND expires_at IS NOT NULL AND delivery_final IS NULL ORDER BY COALESCE(delivery_checked_at,0),seq LIMIT 50").all();
+      if (!waiting.length) return;
+      const probedAt = this.now();
+      const status = await this.request("/delivery-status", { ids: waiting.map(r => r.id), deadlines: waiting.map(r => ({ id: r.id, expiresAt: r.expires_at })), epoch: this.config.epoch });
+      if (!Array.isArray(status.deliveries)) throw new Error("Invalid delivery status");
+      for (const receipt of status.deliveries) {
+        if (!receipt || !waiting.some(r => r.id === receipt.id) || typeof receipt.accepted !== "boolean"
+          || receipt.deliveredAt !== null && (!Number.isSafeInteger(receipt.deliveredAt) || receipt.deliveredAt < 0)) throw new Error("Invalid delivery receipt");
+        this.store.db.query(`UPDATE remote_inbox SET picked_up_at=?,
+          sealed=CASE WHEN ? THEN NULL ELSE sealed END, delivery_checked_at=?,
+          delivery_final=CASE WHEN expires_at<=? THEN 1 ELSE NULL END WHERE id=?`)
+          .run(receipt.deliveredAt, Number(receipt.accepted), this.now(), probedAt, receipt.id);
+      }
+    } catch { this.emit("moni-box-delivery-status-error"); }
+    finally { this.deliveryBusy = false; }
   }
   private async flushAutoFailAlerts() {
     const rows = this.store.db.query<{ key: string; value: string }, []>("SELECT key,value FROM kv WHERE key GLOB 'remoteWakeAutoFail:*'").all();
