@@ -848,6 +848,94 @@ it.effect.each(["answer", "drop", "wake", "post", "pick"] as const)(
 );
 
 it.effect.each(
+  (["answer", "drop", "wake", "post", "pick"] as const).flatMap((close) =>
+    (["excluded", "kept", "shared excluded"] as const).map((hold) => ({ close, hold })),
+  ),
+)("a pause during restored $close revokes held owner notes ($hold)", ({ close, hold }) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const finished = yield* Deferred.make<void>();
+    const marker = "Pause race 1615";
+    const gated = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (real) =>
+        KanbanThreads.of({
+          ...real,
+          send: (input) =>
+            Effect.gen(function* () {
+              if (!input.text.includes(marker)) return yield* real.send(input);
+              yield* Deferred.succeed(entered, undefined);
+              yield* Deferred.await(release);
+              if (!input.isStale?.()) yield* real.send(input);
+              yield* Deferred.succeed(finished, undefined);
+            }),
+        }),
+      ),
+    ).pipe(Layer.provide(fake.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board, card, threadId, worker } = yield* workingCard();
+      if (hold === "shared excluded")
+        yield* kanban.createForThread(threadId, { title: "Held sibling", prompt: "Held sibling" });
+      yield* kanban.askOwner(
+        card.id,
+        {
+          question: marker,
+          blocking: true,
+          ...(close === "pick" ? { options: [marker, "No"] } : {}),
+        },
+        worker,
+        "cardThread",
+      );
+      yield* Ref.update(fake.threads, (all) =>
+        new Map(all).set(threadId, {
+          ...all.get(threadId)!,
+          state: "idle",
+          latestStatus: "completed",
+        }),
+      );
+      const discussion = yield* kanban.cardDiscussion(card.id);
+      const ask = askOf((yield* kanban.card(card.id)).card);
+      if (close === "answer")
+        yield* kanban.answerAsk(
+          card.id,
+          ask.id,
+          { verdict: "answered", text: marker, revision: 0 },
+          owner,
+        );
+      else if (close === "drop") yield* kanban.changeAsk(card.id, ask.id, "drop", owner, "owner");
+      else if (close === "wake") yield* kanban.cardThread(card.id, "wake", marker, owner);
+      else if (close === "post")
+        yield* kanban.post(discussion.id, owner, [{ _tag: "md", text: marker }]);
+      else yield* kanban.answer(discussion.id, ask.seq!, ask.id, [ask.options![0]!.id], owner);
+      yield* Deferred.await(entered);
+      assert.equal((yield* kanban.card(card.id)).card.stage, "working");
+      yield* kanban.pauseBoard(
+        board.id,
+        {
+          reason: "Hold work",
+          keep: hold === "excluded" ? [] : [card.id],
+        },
+        owner,
+      );
+      yield* Deferred.succeed(release, undefined);
+      yield* Deferred.await(finished);
+      assert.equal(
+        (yield* fake.heard(threadId)).filter((text) => text.includes(marker)).length,
+        hold === "kept" ? 1 : 0,
+      );
+    }).pipe(
+      Effect.provide(
+        testLayer(gated).pipe(
+          Layer.provide(Layer.succeed(KanbanService.OwnerRouteMode, "deferred")),
+        ),
+      ),
+    );
+  }),
+);
+
+it.effect.each(
   (["stop", "reset"] as const).flatMap((action) =>
     (["answer", "drop", "wake"] as const).map((close) => ({ action, close })),
   ),

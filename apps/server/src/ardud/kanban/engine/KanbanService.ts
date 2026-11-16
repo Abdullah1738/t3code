@@ -3518,15 +3518,15 @@ const make = Effect.gen(function* () {
     threadId: ThreadId,
     cardId: string,
     discussionId: string | null,
-  ) {
-    const scopes = [
+    scopes: ReadonlyArray<string> = [
       "nudge",
       `step:${cardId}`,
       `assignment:${cardId}`,
       `plan:${cardId}`,
       `owner:${cardId}`,
       ...(discussionId === null ? [] : [`owner:${discussionId}`]),
-    ];
+    ],
+  ) {
     // Queue reads can wait on statev2's reader. Replay a fenced read after a
     // concurrent board write; no card transition has been saved at this point.
     const queued = yield* Effect.gen(function* () {
@@ -5529,7 +5529,22 @@ const make = Effect.gen(function* () {
     // Before changing the hold, recover turn ends that may have been missed.
     if (board.pause !== null) yield* reconcileHeldDiscussions(board);
     const next: KanbanBoard = { ...board, pause: nextPause };
-    if (next.pause !== null) yield* reconcileHeldDiscussions(next);
+    if (next.pause !== null) {
+      const cards = yield* store.cards(board.id);
+      const held = new Set(
+        cards.flatMap((card) =>
+          card.activeThreadId !== null && !next.pause!.keep.includes(card.id)
+            ? [card.activeThreadId]
+            : [],
+        ),
+      );
+      // A kept card cannot wake a shared thread while any carried sibling is held.
+      for (const card of cards) {
+        if (card.activeThreadId !== null && held.has(card.activeThreadId))
+          yield* pruneWakes(card.activeThreadId, card.id, card.discussionId, [`owner:${card.id}`]);
+      }
+      yield* reconcileHeldDiscussions(next);
+    }
     yield* store.putBoard(next);
     yield* publish(board.id, { _tag: "board", board: next });
     yield* wakeRecovered(next);
