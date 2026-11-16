@@ -239,7 +239,8 @@ it.live.each([false, true])(
         const layerTest = McpHttpServer.layerOrchestratorToolkit.pipe(
           Layer.provideMerge(McpServer.McpServer.layer),
           Layer.provideMerge(layerOrchestration),
-          Layer.provide(layerRegistry.pipe(Layer.provide(McpProviderSessions.layer))),
+          Layer.provide(layerRegistry),
+          Layer.provide(McpProviderSessions.layer),
           Layer.provide(
             ProviderRegistryMock.layer([
               {
