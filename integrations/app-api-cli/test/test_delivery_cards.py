@@ -204,6 +204,11 @@ class CardTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        self.real_preview = c.preview
+        def preview(path, view):
+            path.write_bytes(b'fixture-preview')
+            return True
+        p = patch.object(c, 'preview', side_effect=preview); p.start(); self.addCleanup(p.stop)
         for obj, name, value in ((c, 'APPS', self.root/'apps'), (c, 'ROOT', self.root/'state'),
                                  (t, 'ROOT', self.root/'state'), (t, 'WATCHERS', self.root/'watchers'),
                                  (c, 'WATCHERS', self.root/'watchers')):
@@ -515,7 +520,7 @@ class CardTests(unittest.TestCase):
 
     def test_missing_pillow_and_renderer_still_publishes_and_sends(self):
         self.metadata_warnings = ['missing og:image']
-        with patch.dict(sys.modules, {'PIL': None}), patch.object(c, 'preview_chrome', return_value=False):
+        with patch.object(c, 'preview', side_effect=self.real_preview), patch.dict(sys.modules, {'PIL': None}), patch.object(c, 'preview_chrome', return_value=False):
             result = c.sync(self.cfg, self.data, send=True)
         self.assertEqual(result['status'], 'sent')
         folder = c.APPS / result['slug']
@@ -546,6 +551,7 @@ class CardTests(unittest.TestCase):
                     self.calls.clear()
                     with contextlib.ExitStack() as stack:
                         if not has_preview:
+                            stack.enter_context(patch.object(c, 'preview', side_effect=self.real_preview))
                             stack.enter_context(patch.dict(sys.modules, {'PIL': None}))
                             stack.enter_context(patch.object(c, 'preview_chrome', return_value=False))
                         result = c.sync(cfg, self.data, send=True)
