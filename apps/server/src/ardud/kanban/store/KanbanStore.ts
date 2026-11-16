@@ -367,6 +367,8 @@ export interface KanbanStoreShape {
    */
   readonly ownerWait: (
     id: KanbanDiscussionId,
+    includeScripts?: boolean,
+    atSeq?: number,
   ) => Effect.Effect<
     { readonly seq: number; readonly createdAt: string; readonly answered: boolean } | null,
     KanbanStoreError
@@ -1643,7 +1645,7 @@ const make = Effect.gen(function* () {
     );
   // Walks the discussion's primary key newest first; json_extract stays in SQLite, so a
   // multi-MB history is never decoded.
-  const ownerWait = (id: KanbanDiscussionId) =>
+  const ownerWait = (id: KanbanDiscussionId, includeScripts = false, atSeq?: number) =>
     runRead(
       "read owner wait",
       Effect.map(
@@ -1656,7 +1658,9 @@ const make = Effect.gen(function* () {
                 AND json_extract(e.json, '$.author._tag') = 'evaluator'
             ) AS answered
           FROM ardud_kanban_messages m
-          WHERE m.discussion_id = ${id} AND json_extract(m.json, '$.author._tag') = 'owner'
+          WHERE m.discussion_id = ${id} AND (json_extract(m.json, '$.author._tag') = 'owner'
+            OR (${includeScripts} AND json_extract(m.json, '$.author._tag') = 'script'))
+            AND (${atSeq ?? null} IS NULL OR m.seq = ${atSeq ?? null})
           ORDER BY m.seq DESC LIMIT 1
         `,
         (rows) => {
@@ -1680,7 +1684,11 @@ const make = Effect.gen(function* () {
             WITH actions AS (
               SELECT seq, '' AS block, json_extract(json, '$.createdAt') AS at
               FROM ardud_kanban_messages
-              WHERE discussion_id = ${id} AND json_extract(json, '$.author._tag') = 'owner'
+              WHERE discussion_id = ${id} AND (json_extract(json, '$.author._tag') = 'owner'
+                OR (json_extract(json, '$.author._tag') = 'script' AND EXISTS (
+                  SELECT 1 FROM ardud_kanban_discussions d
+                  WHERE d.id = ${id} AND json_extract(d.json, '$.cardId') IS NOT NULL
+                )))
               UNION ALL
               SELECT m.seq, json_extract(a.value, '$.blockId'), json_extract(a.value, '$.at')
               FROM ardud_kanban_messages m, json_each(m.json, '$.answers') a

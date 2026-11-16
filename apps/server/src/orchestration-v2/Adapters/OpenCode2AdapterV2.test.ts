@@ -569,29 +569,33 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
   );
 
   it.effect.each([
-    ["provider.quota", "usage_limit", "quota"],
-    ["provider.rate-limit", "usage_limit", "quota"],
-    ["provider", "provider_error", null],
-  ] as const)("classifies a %s execution failure as %s", ([code, failureClass, category]) =>
+    ["provider.quota", "Provider rejected the request", "usage_limit", "quota"],
+    ["provider.rate-limit", "Provider rejected the request", "usage_limit", "quota"],
+    ["provider.quota", "Model unavailable: sable/x", "usage_limit", "quota"],
+    ["provider", "Provider rejected the request", "provider_error", null],
+    ["provider.no-route", "Model unavailable: sable/x", "provider_error", "transient"],
+    ["unknown", "Model unavailable: lyber/x", "provider_error", "transient"],
+    ["provider.no-route", "Variant unavailable for sable/x: high", "provider_error", null],
+    ["unknown", "Provider said Model unavailable: sable/x", "provider_error", null],
+    ["unknown", "Model unavailable", "provider_error", null],
+  ] as const)("classifies a %s execution failure (%s)", ([code, message, failureClass, category]) =>
     Effect.gen(function* () {
       const { runtime, thread } = yield* resumed([
         out("session.prompt", { sessionID: SESSION, text: "<any>" }),
         promptAccepted,
         event("session.execution.failed", {
           sessionID: SESSION,
-          error: { type: code, message: "Provider rejected the request" },
+          error: { type: code, message },
         }),
       ]);
       const terminal = yield* terminalOf(runtime).pipe(Effect.forkScoped);
       yield* runtime.startTurn(turnInput(thread));
       const ended = yield* Fiber.join(terminal);
       assert.equal(ended?.status, "failed");
-      // Only quota/rate-limit carries a category; other OpenCode failures keep their
-      // original record shape.
       assert.deepEqual(ended?.failure, {
         class: failureClass,
         code,
-        message: "Provider rejected the request",
+        message,
         retryable: null,
         ...(category === null ? {} : { category }),
       });

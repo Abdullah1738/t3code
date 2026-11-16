@@ -3,7 +3,14 @@ import { backgroundCommandWakeKey } from "../../../orchestration-v2/backgroundCo
 import * as CardNextMetrics from "../../analytics/CardNextMetrics.ts";
 import { stableStringify } from "@t3tools/shared/relaySigning";
 import { classifyReply } from "./ownerReplies.ts";
-import { ownerReplyDiscussion, ownerReplyKey, ownerReplyPending } from "./ownerReplyWake.ts";
+import {
+  ownerReplyDiscussion,
+  ownerReplyKey,
+  ownerReplyPending,
+  postRecoveryIdentity,
+  postRecoveryKey,
+  postRecoveryPending,
+} from "./ownerReplyWake.ts";
 import {
   EVALUATOR_LIMITS,
   matchingCards,
@@ -17,12 +24,14 @@ import type { ThreadManagementTerminalRunStatus } from "../../../orchestration-v
 
 import {
   KANBAN_BACKLOG,
+  MessageId,
   type OrchestrationV2Run,
   type KanbanMoveOptions,
   KANBAN_DONE_STAGES,
   KANBAN_THREAD_STAGES,
   kanbanCardModels,
   kanbanEvaluatorStep,
+  kanbanScriptStep,
   kanbanAskExpired,
   kanbanAskIsFreeText,
   kanbanAskRevision,
@@ -239,6 +248,9 @@ interface EvaluatorJob {
     readonly note?: boolean;
     readonly seq?: number;
     readonly answer?: EvaluatorAnswer;
+    readonly recoveryPost?: { readonly discussionId: KanbanDiscussionId; readonly seq: number };
+    readonly retainedDeliveryStarted?: boolean;
+    readonly routingPost?: PostRoutingPost;
     readonly model?: ModelSelection;
   };
 }
@@ -1160,6 +1172,7 @@ const waitingOnEvaluatorStep = (card: KanbanCard) =>
 // An owner message a running evaluator hasn't answered gets one reminder; its turn
 // end covers an idle evaluator, so the tick doesn't double it.
 const OWNER_WAIT_MS = 15 * 60_000;
+const POST_RECOVERY_MS = 3 * 60_000;
 // A Now someone wrote this recently (an evaluator, by hand) is not overwritten by the scribe.
 const SCRIBE_KEEPS_NOW_MS = 5 * 60_000;
 
@@ -1515,9 +1528,38 @@ interface OwnerRoutePost {
   readonly kind: "post";
   readonly seq: number;
   readonly createdAt: string;
+  /** Older rows are owner posts. */
+  readonly authorKind?: "owner" | "script";
+  readonly cardId?: KanbanCardId | null;
   /** The discussion's title is written from this post once its route is delivered. */
   readonly writeTitle?: boolean;
 }
+interface PostRoutingPost {
+  readonly discussionId: KanbanDiscussionId;
+  readonly seq: number;
+  readonly authorKind: KanbanActor["_tag"];
+}
+interface PostRoutingTarget {
+  target: "live_thread" | "steer" | "start" | "none";
+  readonly post: PostRoutingPost;
+  phase?: string;
+  threadId?: ThreadId;
+  boardId?: KanbanBoardId;
+  cardId?: KanbanCardId | null;
+  outcome?: EvaluatorOutcome;
+}
+const postRoutingTarget = Context.Reference<PostRoutingTarget | undefined>(
+  "KanbanPostRoutingTarget",
+  {
+    defaultValue: () => undefined,
+  },
+);
+const recoveryPost = Context.Reference<EvaluatorJob["extra"]["recoveryPost"]>(
+  "KanbanRecoveryPost",
+  {
+    defaultValue: () => undefined,
+  },
+);
 interface OwnerRouteAnswer {
   readonly kind: "answer";
   readonly seq: number;
@@ -1715,6 +1757,46 @@ const make = Effect.gen(function* () {
     const buffered = yield* analyticsSink;
     if (buffered !== undefined) buffered.push(recorded);
     else yield* recordServerAnalytics(analytics.value, recorded);
+  });
+  // Observation shares the post/drain span; no second span per routing decision.
+  const observePostRouting = Effect.fnUntraced(function* <A, E, R>(
+    discussion: Pick<KanbanDiscussion, "id"> &
+      Partial<Pick<KanbanDiscussion, "boardId" | "cardId">>,
+    message: { readonly author: Pick<KanbanActor, "_tag">; readonly seq: number },
+    effect: Effect.Effect<A, E, R>,
+    phase = "routed",
+  ) {
+    const target: PostRoutingTarget = {
+      target: "none",
+      post: { discussionId: discussion.id, seq: message.seq, authorKind: message.author._tag },
+    };
+    return yield* effect.pipe(
+      Effect.provideService(postRoutingTarget, target),
+      Effect.onExit((exit) =>
+        recordAnalytics({
+          kind: "kanban.post_routing",
+          ...((target.boardId ?? discussion.boardId) === undefined
+            ? {}
+            : { boardId: target.boardId ?? discussion.boardId }),
+          discussionId: discussion.id,
+          ...((target.cardId ?? discussion.cardId) == null
+            ? {}
+            : { cardId: (target.cardId ?? discussion.cardId)! }),
+          ...(target.threadId === undefined ? {} : { threadId: target.threadId }),
+          outcome: Exit.isSuccess(exit) ? (target.outcome ?? "ok") : "error",
+          ...(Exit.isFailure(exit) ? { errorTag: analyticsErrorTag(exit.cause) } : {}),
+          props: {
+            actor: message.author._tag,
+            seq: message.seq,
+            target: target.target,
+            phase: target.phase ?? phase,
+          },
+        }).pipe(
+          Effect.provideService(analyticsSink, undefined),
+          Effect.catchCause(() => Effect.void),
+        ),
+      ),
+    );
   });
   const evaluatorMeasurements = new Set<string>();
   // Measurements share the start/send span; bounded recent identities suppress retries.
@@ -2762,6 +2844,7 @@ const make = Effect.gen(function* () {
         readonly state: "retry" | "sent" | "gone" | "paused";
         readonly runId: string | null;
         readonly ownerDiscussion?: KanbanDiscussionId;
+        readonly recoveryPost?: NonNullable<ReturnType<typeof postRecoveryIdentity>>;
       }
     >
   >(new Map());
@@ -2828,11 +2911,17 @@ const make = Effect.gen(function* () {
     });
   // One reminder per recipient and owner action, including answers on older messages.
   const ownerWaits = yield* Ref.make<ReadonlyMap<string, string>>(new Map());
-  const hold = (threadId: ThreadId, boardId: string, pool: string, cardId: string) =>
+  const hold = (
+    threadId: ThreadId,
+    boardId: string,
+    pool: string,
+    cardId: string,
+    knownCards?: ReadonlyArray<KanbanCard>,
+  ) =>
     Effect.flatMap(nowMillis, (at) =>
       Ref.update(holds, (all) =>
         new Map(all).set(threadId, { ...all.get(threadId), boardId, pool, at }),
-      ).pipe(Effect.andThen(syncSlot(boardId, threadId, "hold", cardId))),
+      ).pipe(Effect.andThen(syncSlot(boardId, threadId, "hold", cardId, knownCards))),
     );
   /** One board's held slots, thread id to pool, as the rules take them. `except`: a start's own key. */
   const boardHolds = (boardId: string, except?: string) =>
@@ -3670,6 +3759,7 @@ const make = Effect.gen(function* () {
   const upgradeFindings = Effect.fn("KanbanService.upgradeFindings")(function* (
     cards: ReadonlyArray<KanbanCard>,
     persist = true,
+    cardEvents: typeof rawStore.cardEvents = store.cardEvents,
   ) {
     return yield* Effect.forEach(cards, (card) =>
       Effect.gen(function* () {
@@ -3683,7 +3773,7 @@ const make = Effect.gen(function* () {
           return card;
         // Older workers consumed their only findings marker. Read the actual
         // verdict once: a historical findings round alone is not a pending bounce.
-        const verdict = (yield* store.cardEvents(card.id)).findLast((e) => e.kind === "review");
+        const verdict = (yield* cardEvents(card.id)).findLast((e) => e.kind === "review");
         const next = {
           ...card,
           reviewFindingsPending: verdict?.toStage === "todo" && verdict.body !== "clear",
@@ -3844,21 +3934,26 @@ const make = Effect.gen(function* () {
       respectPause = false,
       threadId = card.activeThreadId,
       cancelQueued = false,
+      snapshot,
     }: {
       /** Set to pause the card instead of dropping it: when it comes back. */
       readonly until?: string | null;
       readonly respectPause?: boolean;
       readonly threadId?: ThreadId | null;
       readonly cancelQueued?: boolean;
+      readonly snapshot?: CardWriteSnapshot | undefined;
     } = {},
   ) {
     if (threadId === null) return false;
-    if (threadId === card.reviewThreadId) yield* endReviewLink(threadId);
+    if (threadId === card.reviewThreadId)
+      yield* endReviewLink(threadId, undefined, snapshot?.reviewLink);
     const pending = delivering.get(card.id);
     if (pending?.threadId === threadId) pending.revoked = true;
     const others =
       card.activeRole === "work" || cancelQueued
-        ? (yield* store.cardsByThread(threadId)).filter((other) => other.id !== card.id)
+        ? (snapshot?.slots.get(threadId) ?? (yield* store.cardsByThread(threadId))).filter(
+            (other) => other.id !== card.id,
+          )
         : [];
     if (bySelf) {
       if (
@@ -3866,7 +3961,13 @@ const make = Effect.gen(function* () {
         others.every((other) => delivering.has(other.id)) &&
         card.activePool !== null
       ) {
-        yield* hold(threadId, card.boardId, card.activePool, card.id);
+        yield* hold(
+          threadId,
+          card.boardId,
+          card.activePool,
+          card.id,
+          snapshot?.slots.get(threadId),
+        );
       }
       return others.length > 0;
     }
@@ -3969,8 +4070,9 @@ const make = Effect.gen(function* () {
     role: Rules.MoveRole,
     actor: KanbanActor,
     options: KanbanMoveOptions = {},
+    snapshot?: CardWriteSnapshot,
   ) {
-    const board = yield* boardOf(card.boardId);
+    const board = snapshot?.board ?? (yield* boardOf(card.boardId));
     const check = Rules.checkMove(role, card, to);
     if (!check.ok)
       return yield* failWith(
@@ -3980,7 +4082,12 @@ const make = Effect.gen(function* () {
       );
     const waitFrom =
       card.stage === "needs_owner" && to === "needs_review"
-        ? (yield* askedBy(card))?.fromStage
+        ? (snapshot
+            ? snapshot.events.findLast(
+                (event) => event.kind === "moved" && event.toStage === "needs_owner",
+              )
+            : yield* askedBy(card)
+          )?.fromStage
         : null;
     // A pause only resumes a review when its recorded origin and counter
     // identify an unfinished chain. Work-origin and unknown pauses start over.
@@ -3994,8 +4101,11 @@ const make = Effect.gen(function* () {
     const kept = !leaving
       ? false
       : to === "needs_owner"
-        ? yield* letGo(card, bySelf, "waits on the owner's answer", { until: "with the answer" })
-        : yield* letGo(card, bySelf, `moved to ${to}`);
+        ? yield* letGo(card, bySelf, "waits on the owner's answer", {
+            until: "with the answer",
+            snapshot,
+          })
+        : yield* letGo(card, bySelf, `moved to ${to}`, { snapshot });
     // Pulled back to todo while its thread goes on with other cards: the
     // thread was told to drop it, so it starts fresh instead of rejoining.
     const base = leaving
@@ -4021,6 +4131,7 @@ const make = Effect.gen(function* () {
                     subtask.state === "open" &&
                     (subtask.owner === "evaluator" || subtask.owner === "script"),
                 ))),
+          snapshot,
         ),
       ),
       stage: to,
@@ -4066,8 +4177,9 @@ const make = Effect.gen(function* () {
       fromStage: card.stage,
       toStage: to,
       body: options.note ?? null,
+      ...(snapshot === undefined ? {} : { before: snapshot.before }),
     });
-    yield* saveCard(next, actor);
+    yield* saveCard(next, actor, false, undefined, undefined, snapshot);
     for (const ask of dropped) {
       if (ask.by._tag !== "evaluator") continue;
       const evaluator = ask.by.threadId;
@@ -4632,6 +4744,7 @@ const make = Effect.gen(function* () {
         ? { deferred: false }
         : {}),
       ...patch,
+      ...(patch.owes === "asked" ? { askedSeq: patch.lastReadSeq ?? current.lastReadSeq } : {}),
     };
     const participants = [...discussion.participants];
     if (index >= 0) participants[index] = updated;
@@ -4833,10 +4946,27 @@ const make = Effect.gen(function* () {
       text: string,
       note = false,
       key?: string,
+      recoveredPost?: EvaluatorJob["extra"]["recoveryPost"],
     ) {
-      const seq = (yield* ownerPostSeq) ?? discussion.lastSeq;
+      const seq = recoveredPost?.seq ?? (yield* ownerPostSeq) ?? discussion.lastSeq;
+      const sendKey = recoveredPost
+        ? postRecoveryKey(
+            recoveredPost.discussionId,
+            recoveredPost.seq,
+            key ?? `${threadId}:reused`,
+          )
+        : key;
+      const observed = yield* postRoutingTarget;
+      if (observed && observed.target !== "start") {
+        observed.target = actor._tag === "thread" ? "live_thread" : "steer";
+        observed.threadId = threadId;
+      }
       yield* locks.outside(
-        threads.send({ threadId, text, ...(key ? { key } : {}) }),
+        threads.send({
+          threadId,
+          text,
+          ...(sendKey ? { key: sendKey } : {}),
+        }),
         undefined,
         false,
         Effect.succeed(true),
@@ -4851,7 +4981,11 @@ const make = Effect.gen(function* () {
         name,
         note || progressed
           ? {}
-          : { lastReadSeq: seq, typingUntil: yield* typingUntil, owes: "asked" },
+          : {
+              lastReadSeq: seq,
+              typingUntil: yield* typingUntil,
+              owes: recoveredPost ? "nudged" : "asked",
+            },
       );
       yield* saveDiscussion(next);
       return next;
@@ -4905,6 +5039,13 @@ const make = Effect.gen(function* () {
     const title = Briefs.evaluatorTitle(purpose);
     const launchInput = (key: string) => ({
       key: `${board.id}:eval:${Briefs.purposeKey(purpose)}:${key}`,
+      ...(extra.recoveryPost === undefined
+        ? {}
+        : {
+            messageId: MessageId.make(
+              `kanban:${postRecoveryKey(extra.recoveryPost.discussionId, extra.recoveryPost.seq, key)}`,
+            ),
+          }),
       onStarted: (threadId: ThreadId) =>
         recordEvaluator(`start:${threadId}`, {
           boardId: board.id,
@@ -5350,6 +5491,23 @@ const make = Effect.gen(function* () {
     job: EvaluatorJob,
     threadId: ThreadId,
   ) {
+    // Acceptance can survive a crash before deliver saves the reader. Complete
+    // that receipt before releasing admission ownership to the waiting-post sweep.
+    if (job.purpose.kind === "discussion" && !job.extra.note) {
+      const discussion = yield* discussionOf(KanbanDiscussionId.make(job.purpose.discussionId));
+      const seq = job.extra.recoveryPost?.seq ?? job.extra.seq ?? discussion.lastSeq;
+      const reader = discussion.participants.find(
+        (p) => p.actor._tag === "evaluator" && p.actor.threadId === threadId,
+      );
+      if (!reader || reader.lastReadSeq < seq)
+        yield* saveDiscussion(
+          withParticipant(discussion, { _tag: "evaluator", threadId }, "Evaluator", {
+            lastReadSeq: seq,
+            typingUntil: yield* typingUntil,
+            owes: job.extra.recoveryPost ? "nudged" : "asked",
+          }),
+        );
+    }
     const at = yield* nowIso;
     const changed = yield* locks.access(
       boardId,
@@ -5404,8 +5562,10 @@ const make = Effect.gen(function* () {
         (yield* EvaluatorAnalytics.origin) ??
         EvaluatorAnalytics.triggerFor(purpose.kind),
       reuseMissReason:
-        input.reuseMissReason ??
-        (input.cardId ? ("not_attempted" as const) : ("no_card_reuse_scope" as const)),
+        input.model !== undefined
+          ? ("forced_new" as const)
+          : (input.reuseMissReason ??
+            (input.cardId ? ("not_attempted" as const) : ("no_card_reuse_scope" as const))),
       answer: input.answer ?? (yield* evaluatorAnswer),
     };
     let sightingCard: KanbanCard | undefined;
@@ -5492,10 +5652,13 @@ const make = Effect.gen(function* () {
         .replace(/\s+/g, " ");
     }
     // A stall wake has its own eligibility and delivery key; never merge it into an owner job.
+    // Recovery bodies have independent cancellation identities. Keep them in separate
+    // jobs; the queue still shares the discussion's evaluator when those jobs drain.
     if (
       purpose.kind === "discussion" &&
       extra.model === undefined &&
       extra.answer === undefined &&
+      extra.recoveryPost === undefined &&
       !key.startsWith(STALL_WAKE_PREFIX)
     ) {
       const pending =
@@ -5505,6 +5668,8 @@ const make = Effect.gen(function* () {
             (json_extract(json, '$.purpose.kind') = 'discussion' AND json_extract(json, '$.purpose.discussionId') = ${purpose.discussionId}))
           AND job_key NOT LIKE 'kanban-stall:%'
           AND done_at IS NULL AND started_at IS NULL AND json_extract(json, '$.extra.answer') IS NULL
+          AND json_extract(json, '$.extra.recoveryPost') IS NULL
+          AND COALESCE(json_extract(json, '$.extra.retainedDeliveryStarted'), 0) = 0
           AND COALESCE(json_extract(json, '$.extra.delivering'), 0) = 0 ORDER BY id LIMIT 1`)[0];
       if (pending && pending.job_key !== key) {
         // @effect-diagnostics-next-line preferSchemaOverJson:off -- queue rows are written by this method.
@@ -5761,9 +5926,10 @@ const make = Effect.gen(function* () {
     // The drain span covers cap handling, including reuse that needs no launch.
     const recordBlocked = Effect.fnUntraced(
       function* (head: EvaluatorQueueRow) {
+        const headIndex = rows.findIndex((row) => row.id === head.id);
         // Caps limit starts, not delivery to an existing request evaluator. Answers,
         // verdicts, waits, stalls, first handoffs, nightly and setup never merge here.
-        for (const row of rows.slice(rows.indexOf(head) + 1)) {
+        for (const row of rows.slice(headIndex + 1)) {
           // @effect-diagnostics-next-line preferSchemaOverJson:off -- rows are written by admitEvaluator.
           const job = JSON.parse(row.json) as EvaluatorJob;
           if (
@@ -5781,7 +5947,7 @@ const make = Effect.gen(function* () {
           ),
         );
         yield* Effect.forEach(
-          rows.slice(rows.indexOf(head)).filter((row) => pending.has(row.id)),
+          rows.slice(headIndex).filter((row) => pending.has(row.id)),
           (row) => recordSpawnCap(row, JSON.parse(row.json) as EvaluatorJob),
           { discard: true },
         );
@@ -5789,51 +5955,94 @@ const make = Effect.gen(function* () {
       Effect.catchCause(() => Effect.void),
     );
     let result: EvaluatorLaunch | undefined;
-    for (const row of rows) {
+    for (const queued of rows) {
+      // Earlier launches release the board lock, allowing later jobs to merge.
+      const row = (yield* locks.access(
+        boardId,
+        tickSql<EvaluatorQueueRow>`SELECT * FROM ardud_kanban_evaluator_queue WHERE id = ${queued.id} AND done_at IS NULL`,
+        false,
+        "evaluator-queue",
+      ))[0];
+      if (!row) continue;
       // A discussion may have acquired an owner while its launch was queued.
       // Deliver its retained text there before considering another spawn.
       // @effect-diagnostics-next-line preferSchemaOverJson:off -- only written by admitEvaluator.
       let job = JSON.parse(row.json) as EvaluatorJob;
-      if (row.job_key.startsWith(STALL_WAKE_PREFIX)) {
-        const card = row.card_id ? yield* store.card(KanbanCardId.make(row.card_id)) : null;
-        const discussion =
-          job.purpose.kind === "discussion"
-            ? yield* store.discussion(KanbanDiscussionId.make(job.purpose.discussionId))
-            : null;
+      const route = Effect.gen(function* () {
+        const observed = row.job_key !== wanted ? yield* postRoutingTarget : undefined;
         if (
-          !card ||
-          card.stalled?.by._tag !== "system" ||
-          card.settledAt !== null ||
-          stallWakeKey(card) !== row.job_key
+          job.extra.recoveryPost &&
+          !(yield* postRecoveryPending(
+            store,
+            job.extra.recoveryPost.discussionId,
+            job.extra.recoveryPost.seq,
+          ))
         ) {
+          if (observed) observed.phase = "queue_stale";
           yield* locks.access(
             boardId,
             tickSql`UPDATE ardud_kanban_evaluator_queue SET done_at = ${yield* nowIso} WHERE id = ${row.id}`,
             true,
             "evaluator-queue",
           );
-          continue;
+          return;
         }
-        if (!discussion || discussion.settledAt !== null || discussion.archivedAt !== null)
-          continue;
-        const board = yield* boardOf(boardId);
+        if (row.job_key.startsWith(STALL_WAKE_PREFIX)) {
+          const card = row.card_id ? yield* store.card(KanbanCardId.make(row.card_id)) : null;
+          const discussion =
+            job.purpose.kind === "discussion"
+              ? yield* store.discussion(KanbanDiscussionId.make(job.purpose.discussionId))
+              : null;
+          if (
+            !card ||
+            card.stalled?.by._tag !== "system" ||
+            card.settledAt !== null ||
+            stallWakeKey(card) !== row.job_key
+          ) {
+            yield* locks.access(
+              boardId,
+              tickSql`UPDATE ardud_kanban_evaluator_queue SET done_at = ${yield* nowIso} WHERE id = ${row.id}`,
+              true,
+              "evaluator-queue",
+            );
+            return;
+          }
+          if (!discussion || discussion.settledAt !== null || discussion.archivedAt !== null)
+            return;
+          const board = yield* boardOf(boardId);
+          if (
+            !systemStallDue(card, yield* nowMillis) ||
+            (board.pause && !board.pause.keep.includes(card.id))
+          )
+            return;
+        }
+        if (job.extra.answer) {
+          const expected = job.extra.answer;
+          const message = yield* store.message(expected.discussionId, expected.seq);
+          const current = message?.answers.find(
+            (answer) => answer.blockId === expected.blockId && answer.by._tag === "owner",
+          );
+          if (
+            !current ||
+            current.at !== expected.at ||
+            current.text !== expected.text ||
+            !NodeUtil.isDeepStrictEqual(current.choice, expected.choice)
+          ) {
+            const at = yield* nowIso;
+            yield* locks.access(
+              boardId,
+              tickSql`UPDATE ardud_kanban_evaluator_queue SET done_at = ${at} WHERE id = ${row.id}`,
+              true,
+              "evaluator-queue",
+            );
+            return;
+          }
+        }
+        const currentBoard = yield* boardOf(boardId);
         if (
-          !systemStallDue(card, yield* nowMillis) ||
-          (board.pause && !board.pause.keep.includes(card.id))
-        )
-          continue;
-      }
-      if (job.extra.answer) {
-        const expected = job.extra.answer;
-        const message = yield* store.message(expected.discussionId, expected.seq);
-        const current = message?.answers.find(
-          (answer) => answer.blockId === expected.blockId && answer.by._tag === "owner",
-        );
-        if (
-          !current ||
-          current.at !== expected.at ||
-          current.text !== expected.text ||
-          !NodeUtil.isDeepStrictEqual(current.choice, expected.choice)
+          job.purpose.kind === "nightly" &&
+          job.purpose.scheduled &&
+          (!currentBoard.nightlyReview?.enabled || currentBoard.archivedAt !== null)
         ) {
           const at = yield* nowIso;
           yield* locks.access(
@@ -5842,372 +6051,423 @@ const make = Effect.gen(function* () {
             true,
             "evaluator-queue",
           );
-          continue;
+          return;
         }
-      }
-      // Intake bursts retain every request. Real card events (answers, verdicts,
-      // wait endings, stalls and first handoffs), nightly and setup never enter here.
-      if (
-        job.purpose.kind === "request" &&
-        row.card_id === null &&
-        row.started_at === null &&
-        !job.extra.forceNew
-      ) {
-        // A durable accepted send owns its original recipient even after the
-        // reuse window expires. Reconcile it before selecting or starting a thread.
-        const recovered = yield* threads.acceptedSend!(row.job_key);
-        if (recovered) {
-          yield* finishIntakeMerge(boardId, row, job, recovered);
-          if (row.job_key === wanted) result = { threadId: recovered };
-          continue;
+        // Intake bursts retain every request. Real card events (answers, verdicts,
+        // wait endings, stalls and first handoffs), nightly and setup never enter here.
+        if (
+          job.purpose.kind === "request" &&
+          row.card_id === null &&
+          row.started_at === null &&
+          !job.extra.forceNew &&
+          job.extra.model === undefined
+        ) {
+          // A durable accepted send owns its original recipient even after the
+          // reuse window expires. Reconcile it before selecting or starting a thread.
+          const recovered = yield* threads.acceptedSend!(row.job_key);
+          if (recovered) {
+            yield* finishIntakeMerge(boardId, row, job, recovered);
+            if (row.job_key === wanted) result = { threadId: recovered };
+            return;
+          }
+          const now = yield* nowMillis;
+          const since = DateTime.formatIso(
+            DateTime.makeUnsafe(now - EVALUATOR_LIMITS.requestReuseMs),
+          );
+          const candidates =
+            yield* tickSql<EvaluatorQueueRow>`SELECT * FROM ardud_kanban_evaluator_queue
+            WHERE board_id = ${boardId} AND card_id IS NULL AND started_at > ${since}
+            AND thread_id IS NOT NULL AND json_extract(json, '$.purpose.kind') = 'request'
+            AND COALESCE(json_extract(json, '$.extra.intakeMerges'), 0) < ${EVALUATOR_LIMITS.requestMerges}
+            ORDER BY id DESC`;
+          let merged = false;
+          for (const candidate of candidates) {
+            const threadId = ThreadId.make(candidate.thread_id!);
+            let accepted: string | undefined;
+            let attempted = false;
+            const delivered = yield* Effect.gen(function* () {
+              const view = yield* threads.find(threadId);
+              if (
+                (yield* Ref.get(evaluatorFailures)).get(threadId)?.state === "gone" ||
+                !view ||
+                view.archived ||
+                (view.state === "idle" &&
+                  now - Date.parse(view.quietSince) >= EVALUATOR_LIMITS.requestReuseMs)
+              )
+                return false;
+              const requestText = [
+                job.purpose.kind === "request" ? job.purpose.text : "",
+                job.extra.text,
+              ]
+                .filter(Boolean)
+                .join("\n\n");
+              const reporter = job.extra.reporterThreadId;
+              attempted = true;
+              yield* threads
+                .send({
+                  threadId,
+                  text:
+                    reporter && !requestText.includes(`t3-thread://v1/${reporter}`)
+                      ? `Reported by thread [${reporter}](t3-thread://v1/${reporter}).\n\n${requestText}`
+                      : requestText,
+                  key: row.job_key,
+                  // Intake must survive the active turn ending after acceptance.
+                  // Auto delivery steers live turns and retains a durable follow-up.
+                })
+                .pipe(
+                  Effect.provideService(ownerDeliveryKey, undefined),
+                  Effect.provideService(
+                    EvaluatorAnalytics.origin,
+                    job.extra.trigger ?? "evaluator_start",
+                  ),
+                  Effect.provideService(evaluatorDeliveryObserved, (identity) =>
+                    Effect.sync(() => {
+                      accepted = identity;
+                    }),
+                  ),
+                  EvaluatorAnalytics.forCard(boardId, null),
+                );
+              return true;
+            }).pipe(Effect.catch(() => Effect.succeed(accepted !== undefined)));
+            const recipient = delivered ? threadId : yield* threads.acceptedSend!(row.job_key);
+            if (!recipient) {
+              if (attempted) break;
+              continue;
+            }
+            yield* finishIntakeMerge(
+              boardId,
+              row,
+              job,
+              recipient,
+              recipient === threadId ? candidate.id : undefined,
+            );
+            if (row.job_key === wanted) result = { threadId: recipient };
+            merged = true;
+            break;
+          }
+          if (merged) return;
+          job = {
+            ...job,
+            extra: {
+              ...job.extra,
+              reuseMissReason: candidates.length > 0 ? "all_candidates_rejected" : "no_candidates",
+            },
+          };
         }
-        const now = yield* nowMillis;
-        const since = DateTime.formatIso(
-          DateTime.makeUnsafe(now - EVALUATOR_LIMITS.requestReuseMs),
-        );
-        const candidates =
-          yield* tickSql<EvaluatorQueueRow>`SELECT * FROM ardud_kanban_evaluator_queue
-          WHERE board_id = ${boardId} AND card_id IS NULL AND started_at > ${since}
-          AND thread_id IS NOT NULL AND json_extract(json, '$.purpose.kind') = 'request'
-          AND COALESCE(json_extract(json, '$.extra.intakeMerges'), 0) < ${EVALUATOR_LIMITS.requestMerges}
-          ORDER BY id DESC`;
-        let merged = false;
-        for (const candidate of candidates) {
-          const threadId = ThreadId.make(candidate.thread_id!);
-          let accepted: string | undefined;
-          let attempted = false;
-          const delivered = yield* Effect.gen(function* () {
-            const view = yield* threads.find(threadId);
-            if (
-              (yield* Ref.get(evaluatorFailures)).get(threadId)?.state === "gone" ||
-              !view ||
-              view.archived ||
-              (view.state === "idle" &&
-                now - Date.parse(view.quietSince) >= EVALUATOR_LIMITS.requestReuseMs)
-            )
-              return false;
-            const requestText = [
-              job.purpose.kind === "request" ? job.purpose.text : "",
-              job.extra.text,
-            ]
-              .filter(Boolean)
-              .join("\n\n");
-            const reporter = job.extra.reporterThreadId;
-            attempted = true;
+        // A started job may already have delivered its initial message. Recover
+        // its stable launch before treating an attached evaluator as another owner.
+        if (job.purpose.kind === "discussion" && row.started_at === null) {
+          const retainedKey = job.extra.recoveryPost
+            ? postRecoveryKey(
+                job.extra.recoveryPost.discussionId,
+                job.extra.recoveryPost.seq,
+                `${row.job_key}:retained`,
+              )
+            : `${row.job_key}:retained`;
+          const recovered = yield* threads.acceptedSend!(retainedKey);
+          if (recovered) {
+            if (observed) {
+              observed.target = "steer";
+              observed.threadId = recovered;
+              observed.outcome = "reused";
+            }
+            yield* finishRetainedDelivery(boardId, row, job, recovered);
+            if (row.job_key === wanted) result = { threadId: recovered };
+            return;
+          }
+          let discussion = yield* discussionOf(KanbanDiscussionId.make(job.purpose.discussionId));
+          // A replacement that names its own model (a safeguard refusal moving to
+          // Sol) must start fresh rather than land on the refused thread.
+          const reuse: EvaluatorAnalytics.ReuseObservation = {
+            reason: job.extra.model !== undefined ? "forced_new" : "no_candidates",
+          };
+          const owner =
+            job.extra.model !== undefined
+              ? null
+              : row.card_id
+                ? yield* reusableEvaluator(yield* cardOf(KanbanCardId.make(row.card_id)), reuse)
+                : discussion.evaluatorThreadId !== null &&
+                    (yield* eligibleDiscussionEvaluator(
+                      discussion.evaluatorThreadId,
+                      discussion.boardId,
+                    ))
+                  ? discussion.evaluatorThreadId
+                  : null;
+          if (!owner && job.extra.reuseMissReason === "not_attempted")
+            job = { ...job, extra: { ...job.extra, reuseMissReason: reuse.reason } };
+          if (owner) {
+            if (discussion.evaluatorThreadId !== owner)
+              discussion = yield* saveDiscussion({ ...discussion, evaluatorThreadId: owner });
+            // Freeze the retained body before provider I/O releases the board lock.
+            // Later sightings get another row; none may join an in-flight send.
+            const claimed = yield* locks.access(
+              boardId,
+              tickSql<{ json: string }>`UPDATE ardud_kanban_evaluator_queue
+                SET json = json_set(json, '$.extra.delivering', json('true'),
+                  '$.extra.retainedDeliveryStarted', json('true'))
+                WHERE id = ${row.id} AND done_at IS NULL RETURNING json`,
+              true,
+              "evaluator-queue",
+            );
+            if (claimed.length === 0) return;
+            // @effect-diagnostics-next-line preferSchemaOverJson:off -- internal queue body frozen above.
+            job = JSON.parse(claimed[0]!.json) as EvaluatorJob;
+            let accepted: string | undefined;
+            const delivered = yield* deliver(
+              discussion,
+              { _tag: "evaluator", threadId: owner },
+              "Evaluator",
+              owner,
+              job.extra.text ?? "Discussion follow-up",
+              job.extra.note,
+              `${row.job_key}:retained`,
+              job.extra.recoveryPost,
+            ).pipe(
+              Effect.as(true),
+              Effect.catch(() => Effect.succeed(accepted !== undefined)),
+              Effect.provideService(evaluatorDeliveryObserved, (identity) =>
+                Effect.sync(() => {
+                  accepted = identity;
+                }),
+              ),
+              Effect.provideService(ownerDeliveryKey, undefined),
+              Effect.provideService(ownerPostSeq, job.extra.seq),
+              Effect.provideService(EvaluatorAnalytics.origin, job.extra.trigger ?? "legacy_queue"),
+            );
+            const recipient = delivered ? owner : yield* threads.acceptedSend!(retainedKey);
+            if (recipient) {
+              if (observed) {
+                observed.threadId = recipient;
+                observed.outcome = "reused";
+              }
+              yield* finishRetainedDelivery(boardId, row, job, recipient);
+              if (row.job_key === wanted) result = { threadId: recipient };
+              return;
+            }
+            yield* Ref.update(evaluatorFailures, (all) =>
+              new Map(all).set(owner, {
+                state: "gone" as const,
+                dueAt: 0,
+                message: "Sighting delivery failed",
+                runId: null,
+              }),
+            );
+            yield* saveDiscussion({
+              ...(yield* discussionOf(discussion.id)),
+              evaluatorThreadId: null,
+            });
+          }
+        }
+        const existingSweep = ["stalled", "completed", "deployed", "check", "nightly"].includes(
+          job.purpose.kind,
+        )
+          ? yield* runningSweep(boardId, job.purpose.kind)
+          : job.purpose.kind === "setup" && currentBoard.setup?.status === "running"
+            ? currentBoard.setup.threadId
+            : null;
+        if (existingSweep) {
+          const text = [job.purpose.kind === "setup" ? job.purpose.text : undefined, job.extra.text]
+            .filter(Boolean)
+            .join("\n\n");
+          if (text)
             yield* threads
-              .send({
-                threadId,
-                text:
-                  reporter && !requestText.includes(`t3-thread://v1/${reporter}`)
-                    ? `Reported by thread [${reporter}](t3-thread://v1/${reporter}).\n\n${requestText}`
-                    : requestText,
-                key: row.job_key,
-                // Intake must survive the active turn ending after acceptance.
-                // Auto delivery steers live turns and retains a durable follow-up.
-              })
+              .send({ threadId: existingSweep, text, key: `${row.job_key}:sweep` })
               .pipe(
                 Effect.provideService(ownerDeliveryKey, undefined),
                 Effect.provideService(
                   EvaluatorAnalytics.origin,
-                  job.extra.trigger ?? "evaluator_start",
+                  job.extra.trigger ?? "legacy_queue",
                 ),
-                Effect.provideService(evaluatorDeliveryObserved, (identity) =>
-                  Effect.sync(() => {
-                    accepted = identity;
-                  }),
+                EvaluatorAnalytics.forCard(
+                  boardId,
+                  job.extra.analyticsCardId === undefined ? row.card_id : job.extra.analyticsCardId,
                 ),
-                EvaluatorAnalytics.forCard(boardId, null),
               );
-            return true;
-          }).pipe(Effect.catch(() => Effect.succeed(accepted !== undefined)));
-          const recipient = delivered ? threadId : yield* threads.acceptedSend!(row.job_key);
-          if (!recipient) {
-            if (attempted) break;
-            continue;
-          }
-          yield* finishIntakeMerge(
+          const at = yield* nowIso;
+          yield* locks.access(
             boardId,
-            row,
-            job,
-            recipient,
-            recipient === threadId ? candidate.id : undefined,
-          );
-          if (row.job_key === wanted) result = { threadId: recipient };
-          merged = true;
-          break;
-        }
-        if (merged) continue;
-        job = {
-          ...job,
-          extra: {
-            ...job.extra,
-            reuseMissReason: candidates.length > 0 ? "all_candidates_rejected" : "no_candidates",
-          },
-        };
-      }
-      // A started job may already have delivered its initial message. Recover
-      // its stable launch before treating an attached evaluator as another owner.
-      if (job.purpose.kind === "discussion" && row.started_at === null) {
-        const recovered = yield* threads.acceptedSend!(`${row.job_key}:retained`);
-        if (recovered) {
-          yield* finishRetainedDelivery(boardId, row, job, recovered);
-          if (row.job_key === wanted) result = { threadId: recovered };
-          continue;
-        }
-        let discussion = yield* discussionOf(KanbanDiscussionId.make(job.purpose.discussionId));
-        // A replacement that names its own model (a safeguard refusal moving to
-        // Sol) must start fresh rather than land on the refused thread.
-        const reuse: EvaluatorAnalytics.ReuseObservation = {
-          reason: job.extra.model !== undefined ? "forced_new" : "no_candidates",
-        };
-        const owner =
-          job.extra.model !== undefined
-            ? null
-            : row.card_id
-              ? yield* reusableEvaluator(yield* cardOf(KanbanCardId.make(row.card_id)), reuse)
-              : discussion.evaluatorThreadId !== null &&
-                  (yield* eligibleDiscussionEvaluator(
-                    discussion.evaluatorThreadId,
-                    discussion.boardId,
-                  ))
-                ? discussion.evaluatorThreadId
-                : null;
-        if (!owner && job.extra.reuseMissReason === "not_attempted")
-          job = { ...job, extra: { ...job.extra, reuseMissReason: reuse.reason } };
-        if (owner) {
-          if (discussion.evaluatorThreadId !== owner)
-            discussion = yield* saveDiscussion({ ...discussion, evaluatorThreadId: owner });
-          // Freeze the retained body before provider I/O releases the board lock.
-          // Later sightings get another row; none may join an in-flight send.
-          const claimed = yield* locks.access(
-            boardId,
-            tickSql<{ json: string }>`UPDATE ardud_kanban_evaluator_queue
-              SET json = json_set(json, '$.extra.delivering', json('true'))
-              WHERE id = ${row.id} AND done_at IS NULL RETURNING json`,
+            tickSql`UPDATE ardud_kanban_evaluator_queue SET thread_id = ${existingSweep}, done_at = ${at} WHERE id = ${row.id}`,
             true,
             "evaluator-queue",
           );
-          if (claimed.length === 0) continue;
-          // @effect-diagnostics-next-line preferSchemaOverJson:off -- internal queue body frozen above.
-          job = JSON.parse(claimed[0]!.json) as EvaluatorJob;
-          let accepted: string | undefined;
-          const delivered = yield* deliver(
-            discussion,
-            { _tag: "evaluator", threadId: owner },
-            "Evaluator",
-            owner,
-            job.extra.text ?? "Discussion follow-up",
-            job.extra.note,
-            `${row.job_key}:retained`,
-          ).pipe(
-            Effect.as(true),
-            Effect.catch(() => Effect.succeed(accepted !== undefined)),
-            Effect.provideService(evaluatorDeliveryObserved, (identity) =>
-              Effect.sync(() => {
-                accepted = identity;
-              }),
-            ),
-            Effect.provideService(ownerDeliveryKey, undefined),
-            Effect.provideService(EvaluatorAnalytics.origin, job.extra.trigger ?? "legacy_queue"),
-          );
-          const recipient = delivered
-            ? owner
-            : yield* threads.acceptedSend!(`${row.job_key}:retained`);
-          if (recipient) {
-            yield* finishRetainedDelivery(boardId, row, job, recipient);
-            if (row.job_key === wanted) result = { threadId: recipient };
-            continue;
+          if (row.job_key === wanted) result = { threadId: existingSweep };
+          return;
+        }
+        if (reuseOnly) return;
+        const now = yield* nowMillis;
+        const since = DateTime.formatIso(DateTime.makeUnsafe(now - EVALUATOR_LIMITS.boardWindowMs));
+        const recent = yield* tickSql<{ count: number }>`
+          SELECT COUNT(*) AS count FROM ardud_kanban_evaluator_queue
+          WHERE board_id = ${boardId} AND started_at > ${since}
+        `;
+        if (row.started_at === null && recent[0]!.count >= EVALUATOR_LIMITS.boardSpawns) {
+          if (observed) {
+            observed.phase = "queue_waiting";
+            observed.outcome = "queued_spawn_cap";
           }
-          yield* Ref.update(evaluatorFailures, (all) =>
-            new Map(all).set(owner, {
-              state: "gone" as const,
-              dueAt: 0,
-              message: "Sighting delivery failed",
-              runId: null,
-            }),
-          );
-          yield* saveDiscussion({
-            ...(yield* discussionOf(discussion.id)),
-            evaluatorThreadId: null,
-          });
-        }
-      }
-      const currentBoard = yield* boardOf(boardId);
-      if (
-        job.purpose.kind === "nightly" &&
-        job.purpose.scheduled &&
-        (!currentBoard.nightlyReview?.enabled || currentBoard.archivedAt !== null)
-      ) {
-        const at = yield* nowIso;
-        yield* locks.access(
-          boardId,
-          tickSql`UPDATE ardud_kanban_evaluator_queue SET done_at = ${at} WHERE id = ${row.id}`,
-          true,
-          "evaluator-queue",
-        );
-        continue;
-      }
-      const existingSweep = ["stalled", "completed", "deployed", "check", "nightly"].includes(
-        job.purpose.kind,
-      )
-        ? yield* runningSweep(boardId, job.purpose.kind)
-        : job.purpose.kind === "setup" && currentBoard.setup?.status === "running"
-          ? currentBoard.setup.threadId
-          : null;
-      if (existingSweep) {
-        const text = [job.purpose.kind === "setup" ? job.purpose.text : undefined, job.extra.text]
-          .filter(Boolean)
-          .join("\n\n");
-        if (text)
-          yield* threads
-            .send({ threadId: existingSweep, text, key: `${row.job_key}:sweep` })
-            .pipe(
-              Effect.provideService(ownerDeliveryKey, undefined),
-              Effect.provideService(EvaluatorAnalytics.origin, job.extra.trigger ?? "legacy_queue"),
-              EvaluatorAnalytics.forCard(
-                boardId,
-                job.extra.analyticsCardId === undefined ? row.card_id : job.extra.analyticsCardId,
-              ),
-            );
-        const at = yield* nowIso;
-        yield* locks.access(
-          boardId,
-          tickSql`UPDATE ardud_kanban_evaluator_queue SET thread_id = ${existingSweep}, done_at = ${at} WHERE id = ${row.id}`,
-          true,
-          "evaluator-queue",
-        );
-        if (row.job_key === wanted) result = { threadId: existingSweep };
-        continue;
-      }
-      if (reuseOnly) continue;
-      const now = yield* nowMillis;
-      const since = DateTime.formatIso(DateTime.makeUnsafe(now - EVALUATOR_LIMITS.boardWindowMs));
-      const recent = yield* tickSql<{ count: number }>`
-        SELECT COUNT(*) AS count FROM ardud_kanban_evaluator_queue
-        WHERE board_id = ${boardId} AND started_at > ${since}
-      `;
-      if (row.started_at === null && recent[0]!.count >= EVALUATOR_LIMITS.boardSpawns) {
-        yield* recordBlocked(row);
-        break;
-      }
-      const board = yield* boardOf(boardId);
-      const at = yield* nowIso;
-      // Reserve before releasing the board lock for provider I/O. A failed or
-      // interrupted launch keeps its stable key and reservation for replay.
-      if (row.card_id && row.started_at === null) {
-        const links = yield* cardEvaluatorLinks(yield* cardOf(KanbanCardId.make(row.card_id)));
-        if (
-          links.some(
-            (link) =>
-              link.role === "evaluator" &&
-              now - Date.parse(link.startedAt) < EVALUATOR_LIMITS.cardSpawnMs,
-          )
-        ) {
           yield* recordBlocked(row);
-          break;
+          return "blocked" as const;
         }
-      }
-      // Freeze the current body with its launch reservation: an earlier launch
-      // may have released the lock while this row acquired more evidence.
-      const claimed = yield* locks.access(
-        boardId,
-        tickSql<{ json: string }>`UPDATE ardud_kanban_evaluator_queue
-          SET started_at = COALESCE(started_at, ${at}),
-            json = json_set(json, '$.extra.delivering', json('true'),
-              '$.extra.reuseMissReason', ${job.extra.reuseMissReason ?? "not_attempted"})
-          WHERE id = ${row.id} AND done_at IS NULL RETURNING json`,
-        true,
-        "evaluator-queue",
-      );
-      if (claimed.length === 0) continue;
-      // @effect-diagnostics-next-line preferSchemaOverJson:off -- internal queue body frozen above.
-      job = JSON.parse(claimed[0]!.json) as EvaluatorJob;
-      let threadId = yield* launchEvaluator(board, job.purpose, {
-        ...job.extra,
-        key: row.job_key,
-      }).pipe(
-        Effect.provideService(
-          ownerRouteRow,
-          row.job_key === wanted ? yield* ownerRouteRow : undefined,
-        ),
-        Effect.catchTags({
-          KanbanError: (error) =>
-            error.detail.startsWith("Evaluator queued (")
-              ? Effect.succeed(null)
-              : Effect.fail(error),
-        }),
-      );
-      if (threadId === null) {
-        yield* recordBlocked(row);
-        break;
-      }
-      if (job.purpose.kind === "discussion") {
-        const discussion = yield* reconcileDiscussionOwner(
-          KanbanDiscussionId.make(job.purpose.discussionId),
-          threadId,
+        const board = yield* boardOf(boardId);
+        const at = yield* nowIso;
+        // Reserve before releasing the board lock for provider I/O. A failed or
+        // interrupted launch keeps its stable key and reservation for replay.
+        if (row.card_id && row.started_at === null) {
+          const links = yield* cardEvaluatorLinks(yield* cardOf(KanbanCardId.make(row.card_id)));
+          if (
+            links.some(
+              (link) =>
+                link.role === "evaluator" &&
+                now - Date.parse(link.startedAt) < EVALUATOR_LIMITS.cardSpawnMs,
+            )
+          ) {
+            if (observed) {
+              observed.phase = "queue_waiting";
+              observed.outcome = "queued_spawn_cap";
+            }
+            yield* recordBlocked(row);
+            return "blocked" as const;
+          }
+        }
+        // Freeze the current body with its launch reservation: an earlier launch
+        // may have released the lock while this row acquired more evidence.
+        const claimed = yield* locks.access(
+          boardId,
+          tickSql<{ json: string }>`UPDATE ardud_kanban_evaluator_queue
+            SET started_at = COALESCE(started_at, ${at}),
+              json = json_set(json, '$.extra.delivering', json('true'),
+                '$.extra.reuseMissReason', ${job.extra.reuseMissReason ?? "not_attempted"})
+            WHERE id = ${row.id} AND done_at IS NULL RETURNING json`,
+          true,
+          "evaluator-queue",
         );
-        const winner = discussion.evaluatorThreadId;
-        if (winner !== null && winner !== threadId) {
-          yield* deliver(
-            discussion,
-            { _tag: "evaluator", threadId: winner },
-            "Evaluator",
-            winner,
-            job.extra.text ?? "Discussion follow-up",
-            job.extra.note,
-            `${row.job_key}:retained`,
-          ).pipe(
-            Effect.provideService(ownerDeliveryKey, undefined),
+        if (claimed.length === 0) return;
+        // @effect-diagnostics-next-line preferSchemaOverJson:off -- internal queue body frozen above.
+        job = JSON.parse(claimed[0]!.json) as EvaluatorJob;
+        if (observed) observed.target = "start";
+        let threadId = yield* launchEvaluator(board, job.purpose, {
+          ...job.extra,
+          key: row.job_key,
+        }).pipe(
+          Effect.provideService(
+            ownerRouteRow,
+            row.job_key === wanted ? yield* ownerRouteRow : undefined,
+          ),
+          Effect.catchTags({
+            KanbanError: (error) =>
+              error.detail.startsWith("Evaluator queued (")
+                ? Effect.succeed(null)
+                : Effect.fail(error),
+          }),
+        );
+        if (threadId === null) {
+          if (observed) {
+            observed.phase = "queue_waiting";
+            observed.outcome = "queued_spawn_cap";
+          }
+          yield* recordBlocked(row);
+          return "blocked" as const;
+        }
+        if (observed) {
+          observed.threadId = threadId;
+          observed.outcome = "started";
+        }
+        if (job.purpose.kind === "discussion") {
+          const discussion = yield* reconcileDiscussionOwner(
+            KanbanDiscussionId.make(job.purpose.discussionId),
+            threadId,
+          );
+          const winner = discussion.evaluatorThreadId;
+          if (winner !== null && winner !== threadId) {
+            if (observed) {
+              observed.target = "steer";
+              observed.threadId = winner;
+              observed.outcome = "reused";
+            }
+            yield* deliver(
+              discussion,
+              { _tag: "evaluator", threadId: winner },
+              "Evaluator",
+              winner,
+              job.extra.text ?? "Discussion follow-up",
+              job.extra.note,
+              `${row.job_key}:retained`,
+              job.extra.recoveryPost,
+            ).pipe(
+              Effect.provideService(ownerDeliveryKey, undefined),
+              Effect.provideService(ownerPostSeq, job.extra.seq),
+              Effect.provideService(EvaluatorAnalytics.origin, job.extra.trigger ?? "legacy_queue"),
+            );
+            threadId = winner;
+          } else if ((yield* rawStore.threadLink(threadId))?.endedAt != null)
+            return yield* failWith("conflict", "Queued discussion evaluator ended during launch");
+        }
+        const discussionId =
+          job.purpose.kind === "discussion"
+            ? KanbanDiscussionId.make(job.purpose.discussionId)
+            : row.card_id && job.extra.seq !== undefined
+              ? (yield* cardOf(KanbanCardId.make(row.card_id))).discussionId
+              : null;
+        if (discussionId && (row.job_key !== wanted || job.extra.requestBody !== undefined)) {
+          const discussion = yield* discussionOf(discussionId);
+          const seq = job.extra.seq ?? discussion.lastSeq;
+          const progressed = discussion.participants.some(
+            (p) =>
+              p.actor._tag === "evaluator" && p.actor.threadId === threadId && p.lastReadSeq > seq,
+          );
+          yield* saveDiscussion(
+            withParticipant(
+              { ...discussion, evaluatorThreadId: threadId },
+              { _tag: "evaluator", threadId },
+              "Evaluator",
+              progressed
+                ? {}
+                : job.extra.note
+                  ? { lastReadSeq: seq }
+                  : {
+                      lastReadSeq: seq,
+                      typingUntil: yield* typingUntil,
+                      owes: job.extra.recoveryPost ? "nudged" : "asked",
+                    },
+            ),
+          );
+          const setupBoard = yield* boardOf(boardId);
+          if (
+            setupBoard.setup?.status === "running" &&
+            setupBoard.setup.discussionId === discussionId &&
+            setupBoard.setup.threadId !== threadId
+          ) {
+            const next = { ...setupBoard, setup: { ...setupBoard.setup, threadId } };
+            yield* store.putBoard(next);
+            yield* publish(boardId, { _tag: "board", board: next });
+          }
+          yield* locks.attached(threadId);
+          yield* resumeDiscussionHandoffs(discussionId, threadId).pipe(
             Effect.provideService(EvaluatorAnalytics.origin, job.extra.trigger ?? "legacy_queue"),
           );
-          threadId = winner;
-        } else if ((yield* rawStore.threadLink(threadId))?.endedAt != null)
-          return yield* failWith("conflict", "Queued discussion evaluator ended during launch");
-      }
-      const discussionId =
-        job.purpose.kind === "discussion"
-          ? KanbanDiscussionId.make(job.purpose.discussionId)
-          : row.card_id && job.extra.seq !== undefined
-            ? (yield* cardOf(KanbanCardId.make(row.card_id))).discussionId
-            : null;
-      if (discussionId && (row.job_key !== wanted || job.extra.requestBody !== undefined)) {
-        const discussion = yield* discussionOf(discussionId);
-        yield* saveDiscussion(
-          withParticipant(
-            { ...discussion, evaluatorThreadId: threadId },
-            { _tag: "evaluator", threadId },
-            "Evaluator",
-            job.extra.note
-              ? { lastReadSeq: job.extra.seq ?? discussion.lastSeq }
-              : {
-                  lastReadSeq: job.extra.seq ?? discussion.lastSeq,
-                  typingUntil: yield* typingUntil,
-                  owes: "asked",
-                },
-          ),
-        );
-        const setupBoard = yield* boardOf(boardId);
-        if (
-          setupBoard.setup?.status === "running" &&
-          setupBoard.setup.discussionId === discussionId &&
-          setupBoard.setup.threadId !== threadId
-        ) {
-          const next = { ...setupBoard, setup: { ...setupBoard.setup, threadId } };
-          yield* store.putBoard(next);
-          yield* publish(boardId, { _tag: "board", board: next });
         }
-        yield* locks.attached(threadId);
-        yield* resumeDiscussionHandoffs(discussionId, threadId).pipe(
-          Effect.provideService(EvaluatorAnalytics.origin, job.extra.trigger ?? "legacy_queue"),
+        yield* locks.access(
+          boardId,
+          tickSql`UPDATE ardud_kanban_evaluator_queue SET thread_id = ${threadId}, done_at = ${at} WHERE id = ${row.id}`,
+          true,
+          "evaluator-queue",
         );
-      }
-      yield* locks.access(
-        boardId,
-        tickSql`UPDATE ardud_kanban_evaluator_queue SET thread_id = ${threadId}, done_at = ${at} WHERE id = ${row.id}`,
-        true,
-        "evaluator-queue",
-      );
-      if (row.job_key === wanted) result = { threadId };
+        if (row.job_key === wanted) result = { threadId };
+      });
+      const post = job.extra.routingPost;
+      const decision = yield* post && row.job_key !== wanted
+        ? observePostRouting(
+            {
+              id: post.discussionId,
+              boardId,
+              cardId: row.card_id ? KanbanCardId.make(row.card_id) : null,
+            },
+            { author: { _tag: post.authorKind }, seq: post.seq },
+            route,
+            "queue",
+          )
+        : route;
+      if (decision === "blocked") break;
     }
     if (result) return result;
     const saved =
@@ -6520,13 +6780,33 @@ const make = Effect.gen(function* () {
       model?: ModelSelection,
     ) {
       if ((yield* boardOf(discussion.boardId)).archivedAt !== null) return discussion;
+      const recovery = yield* recoveryPost;
       const actorOf = (threadId: ThreadId): KanbanActor => ({ _tag: "evaluator", threadId });
       const deliverSaved = Effect.fn("KanbanService.deliverDiscussionEvaluator")(function* (
         current: KanbanDiscussion,
         resumeHandoffs = true,
       ) {
         const threadId = current.evaluatorThreadId!;
+        const observed = yield* postRoutingTarget;
+        if (observed && observed.target !== "start") {
+          observed.target = "steer";
+          observed.threadId = threadId;
+        }
         const seq = (yield* ownerPostSeq) ?? current.lastSeq;
+        if (!note && recovery) {
+          yield* deliver(
+            current,
+            actorOf(threadId),
+            "Evaluator",
+            threadId,
+            text,
+            false,
+            undefined,
+            recovery,
+          );
+          if (resumeHandoffs) yield* resumeDiscussionHandoffs(current.id, threadId, false);
+          return yield* discussionOf(current.id);
+        }
         yield* locks.outside(
           threads.send({
             threadId,
@@ -6654,9 +6934,11 @@ const make = Effect.gen(function* () {
       // hear it is handed over, and stop typing there.
       const priors = card ? yield* liveEvaluatorAskers(card) : [];
       const priorText = priors.length > 0 ? Briefs.priorAskerText(priors) : undefined;
-      const seq = (yield* ownerPostSeq) ?? discussion.lastSeq;
+      const seq = recovery?.seq ?? (yield* ownerPostSeq) ?? discussion.lastSeq;
       // The launch serializer owns a fresh operation; reload this caller's snapshot
       // after it returns so posts made during the launch survive the attachment.
+      const observed = yield* postRoutingTarget;
+      if (observed) observed.target = "start";
       const threadId = yield* locks
         .outside(
           startEvaluatorUnlocked(
@@ -6668,9 +6950,10 @@ const make = Effect.gen(function* () {
               cardNumber: card?.number ?? null,
             },
             {
-              // Native questions are rechecked and sent with their key after admission.
+              // Recovery carries the post in its guarded initial run, including
+              // when admission delays launch. Other keyed questions send after admission.
               text:
-                deliveryKey === undefined
+                deliveryKey === undefined || recovery !== undefined
                   ? priorText
                     ? `${text}\n\n${priorText}`
                     : text
@@ -6682,6 +6965,8 @@ const make = Effect.gen(function* () {
               ...(model === undefined ? {} : { model }),
               note,
               seq,
+              ...(recovery === undefined ? {} : { recoveryPost: recovery }),
+              ...(observed === undefined ? {} : { routingPost: observed.post }),
             },
           ).pipe(
             Effect.provideService(launchReconcile, () =>
@@ -6701,11 +6986,15 @@ const make = Effect.gen(function* () {
           Effect.catchTags({
             KanbanError: (error) =>
               deliveryKey === undefined && error.detail.startsWith("Evaluator queued (")
-                ? Effect.succeed(null)
+                ? Effect.sync(() => {
+                    if (observed) observed.outcome = "queued_spawn_cap";
+                    return null;
+                  })
                 : Effect.fail(error),
           }),
         );
       if (threadId === null) return yield* discussionOf(discussion.id);
+      if (observed) observed.threadId = threadId;
 
       const current = yield* reconcileDiscussionOwner(discussion.id, threadId);
       if (current.evaluatorThreadId !== null && current.evaluatorThreadId !== threadId) {
@@ -6733,7 +7022,11 @@ const make = Effect.gen(function* () {
           ? {}
           : note
             ? { lastReadSeq: seq }
-            : { lastReadSeq: seq, typingUntil: yield* typingUntil, owes: "asked" },
+            : {
+                lastReadSeq: seq,
+                typingUntil: yield* typingUntil,
+                owes: recovery ? "nudged" : "asked",
+              },
       );
       for (const priorId of handoffPriors) {
         const prior = actorOf(priorId);
@@ -6758,7 +7051,7 @@ const make = Effect.gen(function* () {
         yield* store.putBoard(running);
         yield* publish(running.id, { _tag: "board", board: running });
       }
-      return deliveryKey === undefined
+      return deliveryKey === undefined || recovery !== undefined
         ? yield* discussionOf(discussion.id)
         : yield* deliverSaved(yield* discussionOf(discussion.id));
     },
@@ -6938,7 +7231,7 @@ const make = Effect.gen(function* () {
     kanbanEvaluatorStep(card) &&
     card.activeThreadId === null &&
     card.settledAt === null &&
-    ((card.stage === "todo" && card.wakeNote === null) ||
+    (card.stage === "todo" ||
       card.stage === "in_review" ||
       (KANBAN_DONE_STAGES.has(card.stage) && card.stage !== "verified"))
       ? Subtasks.subtaskIds(kanbanStepSubtasks(card, "evaluator"))
@@ -7475,6 +7768,11 @@ const make = Effect.gen(function* () {
       }
       if (pick && told.size > 0) return;
       if (card.activeThreadId !== null && card.activeRole !== null) {
+        const observed = yield* postRoutingTarget;
+        if (observed) {
+          observed.target = "live_thread";
+          observed.threadId = card.activeThreadId;
+        }
         if (!told.has(card.activeThreadId)) {
           yield* deliver(
             current,
@@ -7493,10 +7791,54 @@ const make = Effect.gen(function* () {
     yield* locks.outside(toEvaluator(current, text), undefined, false, Effect.succeed(true));
   });
 
+  const postNeedsReader = Effect.fn("KanbanService.postNeedsReader")(function* (
+    discussionId: KanbanDiscussionId,
+    seq: number,
+  ) {
+    const discussion = yield* discussionOf(discussionId);
+    if (
+      discussion.cardId === null ||
+      discussion.settledAt !== null ||
+      discussion.archivedAt !== null
+    )
+      return false;
+    const waiting = yield* store.ownerWait(discussionId, true);
+    if (waiting === null || waiting.seq !== seq || waiting.answered) return false;
+    const card = yield* cardOf(discussion.cardId);
+    for (const participant of discussion.participants) {
+      const actor = participant.actor;
+      if (participant.lastReadSeq < seq) continue;
+      if (actor._tag === "evaluator" && actor.threadId === discussion.evaluatorThreadId) {
+        if (yield* liveEvaluator(actor.threadId)) return false;
+      } else if (actor._tag === "thread" && actor.threadId === card.activeThreadId) {
+        const view = yield* threads.find(actor.threadId);
+        if (view && !view.archived) return false;
+      }
+    }
+    // A committed route or admitted launch already owns delivery. Recheck under
+    // the routing serializer too, so the sweep cannot race the normal path.
+    const pending = yield* tickSql<{ id: number }>`
+      SELECT id FROM ardud_kanban_owner_routes
+      WHERE route_key = ${ownerPostKey({ discussionId, seq, createdAt: waiting.createdAt })}
+        AND done_at IS NULL LIMIT 1
+    `;
+    if (pending.length > 0) return false;
+    const admitting = yield* tickSql<{ id: number }>`
+      SELECT id FROM ardud_kanban_evaluator_queue
+      WHERE board_id = ${discussion.boardId} AND done_at IS NULL
+        AND (card_id = ${discussion.cardId} OR
+          json_extract(json, '$.purpose.discussionId') = ${discussion.id})
+      LIMIT 1
+    `;
+    return admitting.length === 0;
+  });
+
   const ownerDeliveries = new Map<string, Set<string>>();
   /** A durable route row a delivery attempt works for (see `deliverOwnerRoute`). */
   interface SavedOwnerRow {
     readonly id: number;
+    readonly boardId?: KanbanBoardId;
+    readonly cardId?: KanbanCardId | null;
     readonly launched: ReadonlyArray<string>;
     /** The askers that hear this answer, fixed by its first delivery attempt. */
     readonly askers: { readonly ids: ReadonlyArray<string>; readonly needsOwner: boolean } | null;
@@ -7738,6 +8080,26 @@ const make = Effect.gen(function* () {
   const ownerPostRoute = Effect.fn("KanbanService.ownerPostRoute")(
     function* (message: KanbanMessage, key: string, row?: SavedOwnerRow) {
       const initial = yield* discussionOf(message.discussionId);
+      const observed = yield* postRoutingTarget;
+      if (observed) {
+        observed.boardId = initial.boardId;
+        observed.cardId = initial.cardId;
+      }
+      if (message.author._tag === "script") {
+        return yield* routeSavedOwner(
+          message.discussionId,
+          key,
+          Effect.gen(function* () {
+            const current = yield* discussionOf(message.discussionId);
+            yield* routeToOwnerAgent(
+              current,
+              `Script "${message.authorName}" posted in "${current.title}" (discussion ${current.id}):\n\n${blocksText(message.blocks, attachments.pathOf)}`,
+              "script",
+            );
+          }),
+          row,
+        );
+      }
       const text = Briefs.ownerMessageText(
         initial.title,
         initial.id,
@@ -7762,15 +8124,23 @@ const make = Effect.gen(function* () {
         row,
       );
     },
-    (effect, message) =>
-      effect.pipe(
+    (effect, message, _key, row?: SavedOwnerRow) =>
+      observePostRouting(
+        {
+          id: message.discussionId,
+          ...(row?.boardId === undefined ? {} : { boardId: row.boardId }),
+          ...(row?.cardId === undefined ? {} : { cardId: row.cardId }),
+        },
+        message,
+        effect,
+      ).pipe(
         Effect.provideService(ownerPostSeq, message.seq),
         Effect.provideService(EvaluatorAnalytics.origin, "discussion_post"),
         Effect.mapError(toKanbanError),
       ),
   );
   const routeOwnerPost = (message: KanbanMessage) =>
-    message.author._tag !== "owner"
+    message.author._tag !== "owner" && message.author._tag !== "script"
       ? Effect.void
       : durableOwnerRoutes
         ? afterOwnerCommit(message.discussionId)
@@ -8033,7 +8403,11 @@ const make = Effect.gen(function* () {
         : ownerDeliveryNotice(KanbanDiscussionId.make(lane), text);
   const routeWhat = (record: OwnerRouteRecord) => {
     const payload = ownerRoutePayload(record);
-    return payload.kind === "effect" ? `Board follow-up (${payload.effect.kind})` : "Owner message";
+    return payload.kind === "effect"
+      ? `Board follow-up (${payload.effect.kind})`
+      : payload.kind === "post" && payload.authorKind === "script"
+        ? "Script post"
+        : "Owner message";
   };
 
   /**
@@ -8153,7 +8527,7 @@ const make = Effect.gen(function* () {
         Effect.map((message): OwnerRouteClosed | null => {
           if (payload.kind === "post") {
             return message === null ||
-              message.author._tag !== "owner" ||
+              message.author._tag !== (payload.authorKind ?? "owner") ||
               message.createdAt !== payload.createdAt
               ? "not-saved"
               : null;
@@ -8177,6 +8551,10 @@ const make = Effect.gen(function* () {
     const message = (yield* rawStore.message(discussionId, payload.seq))!;
     const row: SavedOwnerRow = {
       id: record.id,
+      boardId: KanbanBoardId.make(record.board_id),
+      ...(payload.kind === "post" && payload.cardId !== undefined
+        ? { cardId: payload.cardId }
+        : {}),
       // @effect-diagnostics-next-line preferSchemaOverJson:off
       launched: JSON.parse(record.launched) as ReadonlyArray<string>,
       askers: payload.askers ?? null,
@@ -8491,7 +8869,7 @@ const make = Effect.gen(function* () {
     blocks: ReadonlyArray<KanbanBlock>,
     route = true,
     dedupe = false,
-    /** Commit an owner post with its routing obligation (see `saveOwnerRoute`). */
+    /** Commit an owner or script post with its routing obligation. */
     saveRoute = false,
     /** The ask whose discussion the message belongs to. */
     askId?: string,
@@ -8528,6 +8906,7 @@ const make = Effect.gen(function* () {
           JSON.stringify(blocks.map(normalizeMessageBlock)) === JSON.stringify(last.blocks);
         if (sameBlocks) {
           yield* SavedWrite.record({ kind: "message", message: last });
+          yield* observePostRouting(discussion, last, Effect.void, "deduplicated");
           return last;
         }
       }
@@ -8558,7 +8937,7 @@ const make = Effect.gen(function* () {
       ...(askId === undefined || askRevision === undefined ? {} : { askRevision }),
     };
     const writeTitle = author._tag === "owner" && (yield* wantsWrittenTitle(discussion));
-    const durablePost = saveRoute && author._tag === "owner";
+    const durablePost = saveRoute && (author._tag === "owner" || author._tag === "script");
     // A board discussion with no evaluator yet belongs to the first one that
     // speaks in it. Card discussions keep starting their own, which knows the card.
     const owned =
@@ -8586,6 +8965,8 @@ const make = Effect.gen(function* () {
                 kind: "post",
                 seq: message.seq,
                 createdAt: message.createdAt,
+                authorKind: author._tag as "owner" | "script",
+                cardId: discussion.cardId,
                 writeTitle,
               });
             }
@@ -8602,90 +8983,105 @@ const make = Effect.gen(function* () {
 
     const text = blocksText(storedBlocks, attachments.pathOf);
     if (!route) {
+      yield* observePostRouting(posted, message, Effect.void, durablePost ? "pending" : "skipped");
       // A durable owner post's title follows its delivery (see `runOwnerRoute`).
       if (writeTitle && !durablePost) yield* forkDiscussionTitle(discussion.id, text);
       return message;
     }
-    if (author._tag === "owner") {
-      yield* routeToOwnerAgent(
-        posted,
-        Briefs.ownerMessageText(posted.title, posted.id, text),
-        "owner",
-        undefined,
-        message.createdAt,
-        text,
-      ).pipe(Effect.provideService(EvaluatorAnalytics.origin, "discussion_post"));
-    } else if (author._tag === "script") {
-      yield* routeToOwnerAgent(
-        posted,
-        `Script "${authorName}" posted in "${posted.title}" (discussion ${posted.id}):\n\n${text}`,
-        "script",
-      ).pipe(Effect.provideService(EvaluatorAnalytics.origin, "discussion_post"));
-    } else if (author._tag === "evaluator" && posted.cardId !== null) {
-      // An evaluator in a card discussion speaks to the card's live thread too.
-      const card = yield* cardOf(posted.cardId);
-      if (card.activeThreadId !== null && card.activeThreadId !== author.threadId) {
-        const threadId = card.activeThreadId;
-        const relay = `Evaluator in the discussion of card #${card.number} (${posted.id}):\n\n${text}`;
-        yield* later(
-          posted.boardId,
-          posted.id,
-          { kind: "send", threadId, text: relay, evaluatorCardId: posted.cardId },
-          threads.send({ threadId, text: relay }),
-        );
-      }
-    } else if (
-      author._tag === "thread" &&
-      posted.cardId !== null &&
-      asksSomething(storedBlocks, text)
-    ) {
-      // Nothing else reads a worker's post, so its question goes to the discussion's evaluator.
-      const card = yield* cardOf(posted.cardId);
-      const question = Briefs.workerQuestionText(card.number, posted.id, author.threadId, text);
-      yield* later(
-        posted.boardId,
-        posted.id,
-        {
-          kind: "toEvaluator",
-          discussionId: posted.id,
-          text: question,
-          note: true,
-          evaluatorTrigger: "card_ask",
-        },
-        toEvaluator(posted, question, true).pipe(
-          Effect.catchCause((cause) =>
-            Effect.logWarning("kanban worker question routing failed", { cardId: card.id, cause }),
-          ),
-        ),
-      );
-    }
-    if (posted.cardId !== null && author._tag !== "owner" && author._tag !== "script") {
-      const current = yield* discussionOf(posted.id);
-      const isDiscussionEvaluator =
-        author._tag === "evaluator" && current.evaluatorThreadId === author.threadId;
-      // Worker questions above already route with their specific brief.
-      if (
-        !isDiscussionEvaluator &&
-        !(author._tag === "thread" && asksSomething(storedBlocks, text))
-      ) {
-        const textToEvaluator = `${authorName} posted in "${posted.title}" (discussion ${posted.id}):\n\n${text}`;
-        const authorThreadId =
-          author._tag === "thread" || author._tag === "evaluator" ? author.threadId : undefined;
-        yield* later(
-          posted.boardId,
-          posted.id,
-          {
-            kind: "toEvaluator",
-            discussionId: posted.id,
-            evaluatorTrigger: "discussion_post",
-            text: textToEvaluator,
-            note: true,
-            ...(authorThreadId === undefined ? {} : { authorThreadId }),
-          },
-          toEvaluator(current, textToEvaluator, true, authorThreadId),
-        );
-      }
-    }
+    yield* observePostRouting(
+      posted,
+      message,
+      Effect.gen(function* () {
+        if (author._tag === "owner") {
+          yield* routeToOwnerAgent(
+            posted,
+            Briefs.ownerMessageText(posted.title, posted.id, text),
+            "owner",
+            undefined,
+            message.createdAt,
+            text,
+          ).pipe(Effect.provideService(EvaluatorAnalytics.origin, "discussion_post"));
+        } else if (author._tag === "script") {
+          yield* routeToOwnerAgent(
+            posted,
+            `Script "${authorName}" posted in "${posted.title}" (discussion ${posted.id}):\n\n${text}`,
+            "script",
+          ).pipe(Effect.provideService(EvaluatorAnalytics.origin, "discussion_post"));
+        } else if (author._tag === "evaluator" && posted.cardId !== null) {
+          // An evaluator in a card discussion speaks to the card's live thread too.
+          const card = yield* cardOf(posted.cardId);
+          if (card.activeThreadId !== null && card.activeThreadId !== author.threadId) {
+            const threadId = card.activeThreadId;
+            const observed = yield* postRoutingTarget;
+            if (observed) {
+              observed.target = "live_thread";
+              observed.threadId = threadId;
+            }
+            const relay = `Evaluator in the discussion of card #${card.number} (${posted.id}):\n\n${text}`;
+            yield* later(
+              posted.boardId,
+              posted.id,
+              { kind: "send", threadId, text: relay, evaluatorCardId: posted.cardId },
+              threads.send({ threadId, text: relay }),
+            );
+          }
+        } else if (
+          author._tag === "thread" &&
+          posted.cardId !== null &&
+          asksSomething(storedBlocks, text)
+        ) {
+          // Nothing else reads a worker's post, so its question goes to the discussion's evaluator.
+          const card = yield* cardOf(posted.cardId);
+          const question = Briefs.workerQuestionText(card.number, posted.id, author.threadId, text);
+          yield* later(
+            posted.boardId,
+            posted.id,
+            {
+              kind: "toEvaluator",
+              discussionId: posted.id,
+              text: question,
+              note: true,
+              evaluatorTrigger: "card_ask",
+            },
+            toEvaluator(posted, question, true).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("kanban worker question routing failed", {
+                  cardId: card.id,
+                  cause,
+                }),
+              ),
+            ),
+          );
+        }
+        if (posted.cardId !== null && author._tag !== "owner" && author._tag !== "script") {
+          const current = yield* discussionOf(posted.id);
+          const isDiscussionEvaluator =
+            author._tag === "evaluator" && current.evaluatorThreadId === author.threadId;
+          // Worker questions above already route with their specific brief.
+          if (
+            !isDiscussionEvaluator &&
+            !(author._tag === "thread" && asksSomething(storedBlocks, text))
+          ) {
+            const textToEvaluator = `${authorName} posted in "${posted.title}" (discussion ${posted.id}):\n\n${text}`;
+            const authorThreadId =
+              author._tag === "thread" || author._tag === "evaluator" ? author.threadId : undefined;
+            yield* later(
+              posted.boardId,
+              posted.id,
+              {
+                kind: "toEvaluator",
+                discussionId: posted.id,
+                evaluatorTrigger: "discussion_post",
+                text: textToEvaluator,
+                note: true,
+                ...(authorThreadId === undefined ? {} : { authorThreadId }),
+              },
+              toEvaluator(current, textToEvaluator, true, authorThreadId),
+            );
+          }
+        }
+      }),
+    );
     // A title write must not invalidate this post while routing releases the board lock.
     if (writeTitle) yield* forkDiscussionTitle(discussion.id, text);
     return message;
@@ -8767,6 +9163,50 @@ const make = Effect.gen(function* () {
     );
   });
 
+  const sendDiscussionReminder = Effect.fn("KanbanService.sendDiscussionReminder")(function* (
+    discussion: KanbanDiscussion,
+    threadId: ThreadId,
+    action: string,
+  ) {
+    return yield* threads
+      .send({
+        threadId,
+        text: Briefs.nudgeDiscussionText(discussion.id),
+        coalesce: `owner:${discussion.cardId ?? discussion.id}`,
+        key: ownerReplyKey(discussion.id, threadId, action),
+      })
+      .pipe(
+        Effect.provideService(EvaluatorAnalytics.origin, "discussion_nudge"),
+        EvaluatorAnalytics.forCard(discussion.boardId, discussion.cardId),
+        Effect.result,
+      );
+  });
+
+  const recordDiscussionReminder = Effect.fn("KanbanService.recordDiscussionReminder")(function* (
+    discussion: KanbanDiscussion,
+    participant: KanbanParticipant,
+    sent: Effect.Success<ReturnType<typeof sendDiscussionReminder>>,
+    retry: boolean,
+  ) {
+    if (Result.isFailure(sent)) {
+      if (participant.deferred && sent.failure.rejected) {
+        yield* saveDiscussion(
+          withParticipant(discussion, participant.actor, participant.name, {
+            deferredKey: NodeCrypto.randomUUID(),
+          }),
+        );
+      }
+      if (retry || participant.deferred) return true;
+    }
+    yield* saveDiscussion(
+      withParticipant(discussion, participant.actor, participant.name, {
+        owes: "nudged",
+        typingUntil: yield* typingUntil,
+      }),
+    );
+    return true;
+  });
+
   /** A deferral must leave the turn's reminder attempt available for an active sibling. */
   const settleParticipant = Effect.fn("KanbanService.settleParticipant")(function* (
     discussion: KanbanDiscussion,
@@ -8811,35 +9251,8 @@ const make = Effect.gen(function* () {
       }
       const action = yield* ownerReplyPending(store, discussion.id, threadId);
       if (action === null) return false;
-      const sent = yield* threads
-        .send({
-          threadId,
-          text: Briefs.nudgeDiscussionText(discussion.id),
-          coalesce: `owner:${discussion.cardId ?? discussion.id}`,
-          key: ownerReplyKey(discussion.id, threadId, action),
-        })
-        .pipe(
-          Effect.provideService(EvaluatorAnalytics.origin, "discussion_nudge"),
-          EvaluatorAnalytics.forCard(discussion.boardId, discussion.cardId),
-          Effect.result,
-        );
-      if (Result.isFailure(sent)) {
-        if (participant.deferred && sent.failure.rejected) {
-          yield* saveDiscussion(
-            withParticipant(discussion, participant.actor, participant.name, {
-              deferredKey: NodeCrypto.randomUUID(),
-            }),
-          );
-        }
-        if (retry || participant.deferred) return true;
-      }
-      yield* saveDiscussion(
-        withParticipant(discussion, participant.actor, participant.name, {
-          owes: "nudged",
-          typingUntil: yield* typingUntil,
-        }),
-      );
-      return true;
+      const sent = yield* sendDiscussionReminder(discussion, threadId, action);
+      return yield* recordDiscussionReminder(discussion, participant, sent, retry);
     }
     if (participant.typingUntil !== null || participant.owes !== null) {
       yield* saveDiscussion(
@@ -10442,6 +10855,24 @@ const make = Effect.gen(function* () {
     const woken = new Map<KanbanBoard["id"], number>();
     for (const { link, board } of yield* pausedLinks) {
       if (link.paused === null || linkKey(link, board) !== key) continue;
+      const pausedRun =
+        link.role === "evaluator" && link.paused.runId !== null
+          ? yield* threads.compactRun(link.threadId, link.paused.runId)
+          : null;
+      const recovery = postRecoveryIdentity(pausedRun?.messageId ?? "");
+      if (
+        pausedRun?.messageId?.startsWith("kanban:post-recovery:") &&
+        (recovery === null ||
+          !(yield* postRecoveryPending(store, recovery.discussionId, recovery.seq)))
+      ) {
+        yield* store.putThreadLink({ ...link, paused: null });
+        yield* Ref.update(evaluatorFailures, (all) => {
+          const next = new Map(all);
+          next.delete(link.threadId);
+          return next;
+        });
+        continue;
+      }
       // Only a thread that still owns its work and isn't already running again.
       let live = link.role === "evaluator";
       if (link.role === "work")
@@ -10483,7 +10914,13 @@ const make = Effect.gen(function* () {
         .send({
           threadId: link.threadId,
           text: Briefs.providerBackText(link.paused.message),
-          key: wakeKey(link.threadId, link.paused.at),
+          key: recovery
+            ? postRecoveryKey(
+                recovery.discussionId,
+                recovery.seq,
+                `outage:${link.threadId}:${link.paused.at}`,
+              )
+            : wakeKey(link.threadId, link.paused.at),
         })
         .pipe(
           Effect.provideService(EvaluatorAnalytics.origin, "stall_run_failure"),
@@ -10535,38 +10972,90 @@ const make = Effect.gen(function* () {
     yield* kick;
   });
 
+  const recoveringBoards = new Set<string>();
   const wakeRecovered = Effect.fn("KanbanService.wakeRecovered")(function* (board: KanbanBoard) {
-    const recovered = yield* Ref.get(recoveredThreads);
-    if (recovered.size === 0) return;
-    for (const { link } of yield* pausedLinks) {
-      if (link.boardId !== board.id || link.paused === null || !recovered.has(link.threadId))
-        continue;
-      const carried = yield* upgradeFindings(yield* store.cardsByThread(link.threadId));
-      if (carried.length === 0 || (link.role === "work" && !carried.some(kanbanWorkStep))) {
-        yield* store.putThreadLink({ ...link, paused: null });
-        yield* Ref.update(recoveredThreads, (map) => {
-          const next = new Map(map);
-          next.delete(link.threadId);
-          return next;
-        });
-        continue;
-      }
-      if (board.pause && carried.some((card) => !board.pause!.keep.includes(card.id))) continue;
-      if ((yield* Ref.get(down)).has(linkKey(link, board))) continue;
-      const found = yield* Effect.result(threads.find(link.threadId));
-      if (Result.isFailure(found)) continue;
-      const view = found.success;
-      if (view !== null && !view.archived && view.state === "idle") {
-        const sent = yield* threads
-          .send({ threadId: link.threadId, text: Briefs.providerBackText(link.paused.message) })
-          .pipe(
-            Effect.as(true),
-            Effect.catchCause(() => Effect.succeed(false)),
-          );
-        if (!sent) continue;
-      }
-      yield* store.putThreadLink({ ...link, paused: null });
-    }
+    // Reserve before any read: unpause and overlapping ticks share one recovery pass.
+    if (recoveringBoards.has(board.id)) return;
+    recoveringBoards.add(board.id);
+    yield* Effect.gen(function* () {
+      const recovered = yield* Ref.get(recoveredThreads);
+      if (recovered.size === 0) return;
+      // A global pausedLinks scan makes every board's tick queue on every other
+      // board. Select only this board's recovered links before taking any gate.
+      const candidates = (yield* locks.outside(
+        rawStore.threadLinksByIds([...recovered.keys()]),
+        undefined,
+        true,
+      )).filter((link) => link.boardId === board.id && link.paused !== null);
+      if (candidates.length === 0) return;
+      yield* tickStep(
+        board.id,
+        "wakeRecovered",
+        locks.access(
+          board.id,
+          Effect.gen(function* () {
+            for (const candidate of candidates) {
+              // #1656's helper checks the board generation before consuming the
+              // snapshot, including legacy findings reads, after reader admission.
+              const { currentBoard, link, carried } = yield* locks.outside(
+                Effect.gen(function* () {
+                  const currentBoard = yield* rawStore.board(board.id);
+                  const link = yield* rawStore.threadLink(candidate.threadId);
+                  const carried = yield* upgradeFindings(
+                    yield* rawStore.cardsByThread(candidate.threadId),
+                    false,
+                    rawStore.cardEvents,
+                  );
+                  return { currentBoard, link, carried };
+                }),
+                undefined,
+                true,
+              );
+              if (
+                currentBoard === null ||
+                currentBoard.archivedAt !== null ||
+                link?.boardId !== board.id ||
+                link.paused === null ||
+                !(yield* Ref.get(recoveredThreads)).has(link.threadId)
+              )
+                continue;
+              if (carried.length === 0 || (link.role === "work" && !carried.some(kanbanWorkStep))) {
+                yield* store.putThreadLink({ ...link, paused: null });
+                yield* Ref.update(recoveredThreads, (map) => {
+                  const next = new Map(map);
+                  next.delete(link.threadId);
+                  return next;
+                });
+                continue;
+              }
+              if (
+                currentBoard.pause &&
+                carried.some((card) => !currentBoard.pause!.keep.includes(card.id))
+              )
+                continue;
+              if ((yield* Ref.get(down)).has(linkKey(link, currentBoard))) continue;
+              const found = yield* Effect.result(threads.find(link.threadId));
+              if (Result.isFailure(found)) continue;
+              const view = found.success;
+              if (view !== null && !view.archived && view.state === "idle") {
+                const sent = yield* threads
+                  .send({
+                    threadId: link.threadId,
+                    text: Briefs.providerBackText(link.paused.message),
+                    key: wakeKey(link.threadId, link.paused.at),
+                  })
+                  .pipe(
+                    Effect.as(true),
+                    Effect.catchCause(() => Effect.succeed(false)),
+                  );
+                if (!sent) continue;
+              }
+              yield* store.putThreadLink({ ...link, paused: null });
+            }
+          }),
+        ),
+      );
+    }).pipe(Effect.ensuring(Effect.sync(() => recoveringBoards.delete(board.id))));
   });
 
   const nudgeThread = Effect.fn("KanbanService.nudgeThread")(function* (
@@ -10660,6 +11149,139 @@ const make = Effect.gen(function* () {
     }
   });
 
+  const advanceFinishedWorker = Effect.fn("KanbanService.advanceFinishedWorker")(function* (
+    card: KanbanCard,
+  ) {
+    const threadId = card.activeThreadId;
+    if (
+      threadId === null ||
+      card.stage !== "working" ||
+      card.activeRole !== "work" ||
+      card.settledAt !== null ||
+      card.stalled !== null ||
+      kanbanWorkStep(card) ||
+      card.wait !== undefined ||
+      kanbanOpenAsks(card).some((ask) => ask.blocking) ||
+      Waits.decidingHolds(card) ||
+      waking(threadId)
+    )
+      return card;
+    card = (yield* upgradeFindings([card]))[0]!;
+    if (kanbanWorkStep(card)) return card;
+    const review = kanbanStepSubtasks(card, "review").length > 0;
+    if (!review && !kanbanEvaluatorStep(card) && !kanbanScriptStep(card)) return card;
+    if (review && !Rules.checkMove("cardThread", card, "needs_review").ok) return card;
+    const view = yield* freshThreads.find(threadId);
+    if (
+      view?.state !== "idle" ||
+      view.backgroundWork > 0 ||
+      Rules.waitingOnBackground(view, yield* nowMillis) ||
+      (yield* threads.queuedRuns(threadId)).length > 0
+    )
+      return card;
+    if (
+      [...(backgroundWaits.get(threadId)?.jobs.values() ?? [])].some((job) => job.endedAt !== null)
+    )
+      return card;
+    const at = yield* nowIso;
+    const reason = review ? "review_step" : "evaluator_step";
+    const next: KanbanCard = {
+      ...Retries.withoutRetries(release(card)),
+      stage: review ? "needs_review" : "todo",
+      ...(review ? { reviewStep: 0, reviewFindingsPending: false } : { wakeNote: null }),
+      question: null,
+      nudgedAt: null,
+      movedAt: at,
+      updatedAt: at,
+    };
+    // Wake cleanup may take admission itself. Finish it before locking, then
+    // recheck the card and thread together so a worker's own move wins the race.
+    yield* prepareTransition(next);
+    const sink: EffectSink = { effects: [], closed: false };
+    const publications: Array<BoardPublication> = [];
+    const measurements: AnalyticsEvent[] = [];
+    const observer = yield* SavedWrite.observer;
+    const receipts: SavedWrite.Saved[] = [];
+    let lanes = new Set<string>();
+    const saved = yield* turnAdmission.withLock(
+      threadId,
+      Effect.gen(function* () {
+        const live = yield* threadIo.find(threadId);
+        if (
+          !sameCardState(yield* store.card(card.id), card) ||
+          live?.state !== "idle" ||
+          live.backgroundWork > 0 ||
+          Rules.waitingOnBackground(live, yield* nowMillis) ||
+          (yield* threadIo.queuedRuns(threadId)).length > 0 ||
+          (yield* store.threadLink(threadId))?.paused ||
+          Retries.heldByPause(yield* boardOf(card.boardId), card) ||
+          waking(threadId)
+        )
+          return false;
+        const actor: KanbanActor = { _tag: "system", component: "dispatcher" };
+        const ageMs = BoardAnalytics.elapsed(at, card.analyticsStageEnteredAt ?? card.movedAt);
+        // Turn-end and tick have no write-effect sink. Save the handoff and its
+        // evaluator obligation together so a rejected notification can replay.
+        lanes = yield* Effect.uninterruptible(
+          boardTransaction(
+            card.boardId,
+            Effect.gen(function* () {
+              yield* logEvent(next, actor, "moved", {
+                fromStage: card.stage,
+                toStage: next.stage,
+                body: `Auto-advanced: ${reason}; ${ageMs} ms in Working`,
+              });
+              yield* saveCard(next, actor, false, false);
+              yield* recordAnalytics({
+                kind: "kanban.card.autoAdvanced",
+                boardId: card.boardId,
+                cardId: card.id,
+                threadId,
+                props: {
+                  number: card.number,
+                  from: card.stage,
+                  to: next.stage,
+                  actor: "system",
+                  reasonClass: reason,
+                  msInPrevStage: ageMs,
+                },
+              });
+              yield* laterEvaluatorTurn(card, next, actor);
+              return yield* saveEffectRows(sink.effects);
+            }).pipe(
+              Effect.provideService(SavedWrite.observer, (receipt) => {
+                receipts.push(receipt);
+              }),
+              Effect.provideService(effectSink, sink),
+              Effect.provideService(publicationSink, publications),
+              Effect.provideService(analyticsSink, measurements),
+              Effect.ensuring(
+                Effect.sync(() => {
+                  sink.closed = true;
+                }),
+              ),
+            ),
+          ).pipe(
+            Effect.tap(() =>
+              Effect.sync(() => {
+                for (const receipt of receipts) observer(receipt);
+              }),
+            ),
+            // The slot cache and returned receipts must only reflect committed state.
+            Effect.tap(() => syncSlot(card.boardId, threadId, "card_left", card.id)),
+          ),
+        );
+        return true;
+      }),
+    );
+    if (!saved) return yield* cardOf(card.id);
+    for (const measurement of measurements) yield* recordAnalytics(measurement);
+    for (const publication of publications) yield* publish(publication.boardId, publication.change);
+    for (const lane of lanes) yield* triggerOwnerDrain(lane);
+    yield* kick;
+    return next;
+  });
+
   /** Nudge a stopped worker once, then release cards still idle after the grace. */
   const nudgeWorker = Effect.fn("KanbanService.nudgeWorker")(function* (
     threadId: ThreadId,
@@ -10667,6 +11289,7 @@ const make = Effect.gen(function* () {
     runtimeFailureRunId: string | null = null,
   ) {
     if (waking(threadId)) return;
+    for (const card of planned) yield* advanceFinishedWorker(card);
     yield* parkWorkerWaits(threadId, planned);
     const cards: Array<KanbanCard> = [];
     for (const initial of planned) {
@@ -11107,13 +11730,23 @@ const make = Effect.gen(function* () {
     yield* kick;
   });
 
+  const boardNudgeThreads = Effect.fn("KanbanService.boardNudgeThreads")(function* (
+    boardId: string,
+  ) {
+    const deferred = yield* Ref.get(deferredNudges);
+    if (deferred.size === 0) return [];
+    return (yield* locks.outside(rawStore.threadLinksByIds([...deferred]), undefined, true))
+      .filter((link) => link.boardId === boardId)
+      .map((link) => link.threadId);
+  });
+
   const wakeBoardNudges = Effect.fn("KanbanService.wakeBoardNudges")(function* (
     board: KanbanBoard,
     discussionWakes: ReadonlySet<ThreadId>,
+    candidates?: ReadonlyArray<ThreadId>,
   ) {
-    const deferred = yield* Ref.get(deferredNudges);
-    if (deferred.size === 0) return;
-    for (const threadId of deferred) {
+    for (const threadId of candidates ?? (yield* boardNudgeThreads(board.id))) {
+      if (!(yield* Ref.get(deferredNudges)).has(threadId)) continue;
       const cards = yield* store.openCards(board.id);
       const carried = cards.filter((card) => card.activeThreadId === threadId);
       if (carried.length === 0) {
@@ -11150,74 +11783,153 @@ const make = Effect.gen(function* () {
   });
 
   // The persisted deferral belongs to the participant even after its card is released.
-  const wakeDiscussionNudges = Effect.fn("KanbanService.wakeDiscussionNudges")(function* (
-    board: KanbanBoard,
-    wakes = new Set<ThreadId>(),
-  ) {
-    for (const initial of yield* store.openDiscussions(board.id)) {
-      if (initial.settledAt !== null || initial.archivedAt !== null) continue;
-      for (const entry of initial.participants) {
-        if (entry.actor._tag !== "thread" || !entry.deferred || entry.owes !== "asked") continue;
-        const threadId = entry.actor.threadId;
-        if ((yield* Ref.get(unresolvedTurnEnds)).has(threadId)) continue;
-        if (wakes.has(threadId)) continue;
-        const discussion = yield* store.discussion(initial.id);
-        if (!discussion || discussion.settledAt !== null || discussion.archivedAt !== null)
-          continue;
-        const participant = discussion.participants.find(
-          (candidate) => candidate.actor._tag === "thread" && candidate.actor.threadId === threadId,
-        );
-        if (!participant?.deferred || participant.owes !== "asked") continue;
-        const link = yield* store.threadLink(threadId);
-        if (!link || link.boardId !== board.id || link.paused) continue;
-        if (yield* discussionWaitHeld(discussion, link)) continue;
-        const carried = yield* store.cardsByThread(threadId);
-        if (discussionHeld(board, discussion, link, carried)) continue;
-        if (!(yield* isHome(discussion, threadId))) {
-          yield* saveDiscussion(
-            withParticipant(discussion, participant.actor, participant.name, {
-              owes: null,
-              typingUntil: null,
-            }),
-          );
-          continue;
-        }
-        const view = yield* threads.view(threadId);
-        if (
-          !view ||
-          view.archived ||
-          view.state !== "idle" ||
-          Rules.waitingOnBackground(view, yield* nowMillis)
-        )
-          continue;
-        const failure = yield* Effect.result(threads.findLastFailure(threadId));
-        if (Result.isFailure(failure) || failure.success !== null) {
-          if (Result.isSuccess(failure)) yield* turnEndedUnlocked(threadId, undefined, true);
-          wakes.add(threadId);
-          continue;
-        }
-        // An attempted eligible reminder takes precedence over a work nudge, even
-        // when the send is refused and must be retried on the next tick.
-        wakes.add(threadId);
-        yield* settleParticipant(discussion, threadId, true);
-        const updated = yield* store.discussion(discussion.id);
-        const stillAsked = updated?.participants.some(
-          (candidate) =>
-            candidate.actor._tag === "thread" &&
-            candidate.actor.threadId === threadId &&
-            candidate.owes === "asked",
-        );
-        if (!stillAsked) {
-          yield* Ref.update(deferredNudges, (set) => {
-            const next = new Set(set);
-            next.delete(threadId);
-            return next;
+  const wakeDiscussionNudges = Effect.fn("KanbanService.wakeDiscussionNudges")(
+    function* (board: KanbanBoard, wakes = new Set<ThreadId>()) {
+      // Collection admission can queue for seconds too. Only candidate validation
+      // and recording own a board operation; thread I/O runs between those operations.
+      const candidates = [];
+      for (const discussion of yield* store.openDiscussions(board.id)) {
+        if (discussion.settledAt !== null || discussion.archivedAt !== null) continue;
+        for (const participant of discussion.participants) {
+          if (
+            participant.actor._tag !== "thread" ||
+            !participant.deferred ||
+            participant.owes !== "asked"
+          )
+            continue;
+          // Legacy participants have no stable ask cursor; prefer a conservative
+          // creation-time age over dating their ask from a later read or status.
+          const ask =
+            participant.askedSeq === undefined || participant.askedSeq === 0
+              ? null
+              : yield* store.message(discussion.id, participant.askedSeq);
+          candidates.push({
+            discussionId: discussion.id,
+            threadId: participant.actor.threadId,
+            deferredKey: participant.deferredKey,
+            lastReadSeq: participant.lastReadSeq,
+            askedSeq: participant.askedSeq,
+            askedAt: ask?.createdAt ?? discussion.createdAt,
           });
         }
       }
-    }
-    return wakes;
-  });
+      candidates.sort((a, b) => a.askedAt.localeCompare(b.askedAt));
+      let sends = 0;
+      for (const candidate of candidates) {
+        if (sends >= 10) break;
+        const { threadId } = candidate;
+        if ((yield* Ref.get(unresolvedTurnEnds)).has(threadId) || wakes.has(threadId)) continue;
+        const prepare = Effect.gen(function* () {
+          const discussion = yield* store.discussion(candidate.discussionId);
+          if (!discussion || discussion.settledAt !== null || discussion.archivedAt !== null)
+            return null;
+          const participant = discussion.participants.find(
+            (entry) => entry.actor._tag === "thread" && entry.actor.threadId === threadId,
+          );
+          if (
+            !participant?.deferred ||
+            participant.owes !== "asked" ||
+            participant.deferredKey !== candidate.deferredKey ||
+            participant.lastReadSeq !== candidate.lastReadSeq ||
+            participant.askedSeq !== candidate.askedSeq
+          )
+            return null;
+          const link = yield* store.threadLink(threadId);
+          const currentBoard = yield* boardOf(board.id);
+          if (
+            currentBoard.archivedAt !== null ||
+            !link ||
+            link.boardId !== board.id ||
+            link.paused ||
+            (yield* Ref.get(unresolvedTurnEnds)).has(threadId)
+          )
+            return null;
+          if (yield* discussionWaitHeld(discussion, link)) return null;
+          if (discussionHeld(currentBoard, discussion, link, yield* store.cardsByThread(threadId)))
+            return null;
+          if (!(yield* isHome(discussion, threadId))) {
+            yield* saveDiscussion(
+              withParticipant(discussion, participant.actor, participant.name, {
+                owes: null,
+                typingUntil: null,
+              }),
+            );
+            return null;
+          }
+          const action = yield* ownerReplyPending(store, discussion.id, threadId).pipe(
+            locks.dispatchRead,
+          );
+          return action === null ? null : { discussion, participant, action };
+        });
+        const locked = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+          locks.step(
+            locks.boundedReads(effect),
+            undefined,
+            "KanbanService.tickStep:wakeDiscussionNudges",
+          );
+        // A read budget miss ends this pass; retrying immediately would keep taking
+        // the gate from writers while the same reader remains backed up.
+        const processed = yield* Effect.gen(function* () {
+          if (!(yield* locked(prepare))) return;
+          const view = yield* threads.view(threadId);
+          if (
+            !view ||
+            view.archived ||
+            view.state !== "idle" ||
+            Rules.waitingOnBackground(view, yield* nowMillis)
+          )
+            return;
+          const failure = yield* Effect.result(threads.findLastFailure(threadId));
+          const ready = yield* locked(prepare);
+          if (!ready) return;
+          if (Result.isFailure(failure) || failure.success !== null) {
+            wakes.add(threadId);
+            // The serial turn-end handler needs an operation parent so its own
+            // commits advance the pause caller's snapshot when it resumes.
+            if (Result.isSuccess(failure))
+              yield* locked(turnEndedUnlocked(threadId, undefined, true));
+            return;
+          }
+          // An attempted reminder wins over a work nudge, including a refused send.
+          wakes.add(threadId);
+          sends += 1;
+          const sent = yield* sendDiscussionReminder(ready.discussion, threadId, ready.action);
+          yield* locked(
+            Effect.gen(function* () {
+              const fresh = yield* prepare;
+              if (fresh)
+                yield* recordDiscussionReminder(fresh.discussion, fresh.participant, sent, true);
+              const stillAsked = fresh
+                ? Result.isFailure(sent)
+                : (yield* store.discussion(candidate.discussionId))?.participants.some(
+                    (entry) =>
+                      entry.actor._tag === "thread" &&
+                      entry.actor.threadId === threadId &&
+                      entry.owes === "asked",
+                  );
+              if (!stillAsked) {
+                yield* Ref.update(deferredNudges, (set) => {
+                  const next = new Set(set);
+                  next.delete(threadId);
+                  return next;
+                });
+              }
+            }),
+          );
+        }).pipe(
+          Effect.as(true),
+          Effect.catchDefect((defect) =>
+            defect instanceof BoardLocks.BoardReadBudgetExceeded
+              ? Effect.succeed(false)
+              : Effect.die(defect),
+          ),
+        );
+        if (!processed) break;
+      }
+      return wakes;
+    },
+    (effect) => locks.outside(locks.fresh(effect)),
+  );
 
   /**
    * An evaluator failed twice (or ran out of context): it is given up. Its discussions
@@ -11226,6 +11938,7 @@ const make = Effect.gen(function* () {
   const evaluatorGiveUp = Effect.fn("KanbanService.evaluatorGiveUp")(function* (
     link: KanbanThreadLink,
     message: string,
+    recoveredPost?: EvaluatorJob["extra"]["recoveryPost"],
     refusal?: { readonly model: string },
   ) {
     const threadId = link.threadId;
@@ -11248,6 +11961,9 @@ const make = Effect.gen(function* () {
     );
     for (const home of homes) {
       yield* Effect.gen(function* () {
+        const recovery = recoveredPost?.discussionId === home.id ? recoveredPost : undefined;
+        if (recovery && !(yield* postRecoveryPending(store, recovery.discussionId, recovery.seq)))
+          return;
         const fresh = refusal
           ? replacementModel !== undefined
           : !(yield* Ref.get(replaced)).has(home.id);
@@ -11260,16 +11976,24 @@ const make = Effect.gen(function* () {
         const cleared = { ...(yield* discussionOf(home.id)), evaluatorThreadId: null };
         if (fresh) {
           yield* Ref.update(replaced, (all) => new Set(all).add(home.id));
-          yield* toEvaluator(
+          const original = recovery ? yield* store.message(home.id, recovery.seq) : null;
+          const text = Briefs.evaluatorTakeoverText(threadId, message);
+          const route = toEvaluator(
             cleared,
-            Briefs.evaluatorTakeoverText(threadId, message),
+            original ? `${text}\n\n${blocksText(original.blocks, attachments.pathOf)}` : text,
             false,
             undefined,
-            undefined,
-            undefined,
+            recovery
+              ? postRecoveryKey(home.id, recovery.seq, `replacement:${threadId}`)
+              : undefined,
+            recovery ? postRecoveryPending(store, home.id, recovery.seq) : undefined,
             undefined,
             replacementModel,
-          ).pipe(Effect.provideService(EvaluatorAnalytics.origin, "stall_run_failure"));
+          ).pipe(
+            Effect.provideService(EvaluatorAnalytics.origin, "stall_run_failure"),
+            Effect.provideService(recoveryPost, recovery),
+          );
+          yield* original ? observePostRouting(cleared, original, route, "replacement") : route;
         } else {
           yield* saveDiscussion(cleared);
         }
@@ -11279,7 +12003,7 @@ const make = Effect.gen(function* () {
         ),
       );
     }
-    if (homes.length > 0) return;
+    if (homes.length > 0 || recoveredPost !== undefined) return;
     yield* Effect.gen(function* () {
       const card = link.cardId !== null ? yield* store.card(link.cardId) : null;
       if (card) {
@@ -11696,6 +12420,7 @@ const make = Effect.gen(function* () {
     const ownerDiscussion = failedRun
       ? yield* ownerReplyDiscussion(store, failedRun.messageId ?? "", failedRun.message ?? "")
       : null;
+    const recoveryPost = postRecoveryIdentity(failedRun?.messageId ?? "");
     let discussionAttempted = false;
     for (const discussion of yield* store.discussions(link.boardId)) {
       const participant = discussion.participants.find(
@@ -11758,10 +12483,18 @@ const make = Effect.gen(function* () {
 
     if (link.role === "evaluator") {
       if (
-        failedRun?.messageId?.startsWith("kanban:wake:owner:") &&
-        (ownerDiscussion === null ||
-          (yield* ownerReplyPending(store, ownerDiscussion, threadId)) === null)
+        (failedRun?.messageId?.startsWith("kanban:wake:owner:") &&
+          (ownerDiscussion === null ||
+            (yield* ownerReplyPending(store, ownerDiscussion, threadId)) === null)) ||
+        (failedRun?.messageId?.startsWith("kanban:post-recovery:") &&
+          (recoveryPost === null ||
+            !(yield* postRecoveryPending(store, recoveryPost.discussionId, recoveryPost.seq))))
       ) {
+        if (failedRun?.messageId?.startsWith("kanban:post-recovery:")) {
+          const current = yield* store.threadLink(threadId);
+          if (current && current.paused?.runId === failure?.runId)
+            yield* store.putThreadLink({ ...current, paused: null });
+        }
         yield* Ref.update(evaluatorFailures, (all) => {
           const next = new Map(all);
           next.delete(threadId);
@@ -11832,12 +12565,13 @@ const make = Effect.gen(function* () {
         yield* evaluatorGiveUp(
           link,
           `safeguard refusal${category === undefined ? "" : ` [${category}]`} on ${model}: ${failure.message}`,
+          recoveryPost ?? undefined,
           { model },
         );
         return;
       }
       if (entry !== undefined || Rules.isContextFull(failure)) {
-        yield* evaluatorGiveUp(link, failure.message);
+        yield* evaluatorGiveUp(link, failure.message, recoveryPost ?? undefined);
         return;
       }
       const dueAt = (yield* nowMillis) + Rules.EVALUATOR_RETRY_MS;
@@ -11848,6 +12582,7 @@ const make = Effect.gen(function* () {
           state: "retry",
           runId: failure.runId ?? null,
           ...(ownerDiscussion === null ? {} : { ownerDiscussion }),
+          ...(recoveryPost === null ? {} : { recoveryPost }),
         }),
       );
       return;
@@ -12679,7 +13414,15 @@ const make = Effect.gen(function* () {
         entry.ownerDiscussion === undefined
           ? undefined
           : yield* ownerReplyPending(store, entry.ownerDiscussion, threadId);
-      if (action === null) {
+      if (
+        action === null ||
+        (entry.recoveryPost !== undefined &&
+          !(yield* postRecoveryPending(
+            store,
+            entry.recoveryPost.discussionId,
+            entry.recoveryPost.seq,
+          )))
+      ) {
         yield* Ref.update(evaluatorFailures, (all) => {
           const next = new Map(all);
           next.delete(threadId);
@@ -12691,12 +13434,20 @@ const make = Effect.gen(function* () {
         .send({
           threadId,
           text: Briefs.evaluatorRetryText(entry.message),
-          ...(entry.ownerDiscussion === undefined || action === undefined
-            ? {}
-            : {
-                key: `${ownerReplyKey(entry.ownerDiscussion, threadId, action)}:automatic-retry`,
-                coalesce: `owner:${entry.ownerDiscussion}`,
-              }),
+          ...(entry.recoveryPost !== undefined
+            ? {
+                key: postRecoveryKey(
+                  entry.recoveryPost.discussionId,
+                  entry.recoveryPost.seq,
+                  `${threadId}:automatic-retry:${entry.runId}`,
+                ),
+              }
+            : entry.ownerDiscussion === undefined || action === undefined
+              ? {}
+              : {
+                  key: `${ownerReplyKey(entry.ownerDiscussion, threadId, action)}:automatic-retry`,
+                  coalesce: `owner:${entry.ownerDiscussion}`,
+                }),
         })
         .pipe(
           Effect.provideService(EvaluatorAnalytics.origin, "stall_run_failure"),
@@ -12713,7 +13464,7 @@ const make = Effect.gen(function* () {
         const link = yield* store.threadLink(threadId);
         if (link) {
           views.clear();
-          yield* evaluatorGiveUp(link, entry.message);
+          yield* evaluatorGiveUp(link, entry.message, entry.recoveryPost);
           views.clear();
         }
       }
@@ -12743,10 +13494,7 @@ const make = Effect.gen(function* () {
                 }),
                 cardId,
               );
-            yield* step(
-              "wakeRecovered",
-              Effect.suspend(() => wakeRecovered(board)),
-            );
+            yield* wakeRecovered(board);
             yield* step(
               "reconcileHeldDiscussions",
               Effect.suspend(() => reconcileHeldDiscussions(board)),
@@ -12757,10 +13505,12 @@ const make = Effect.gen(function* () {
               "wakeDiscussionNudges",
               Effect.suspend(() => wakeDiscussionNudges(board, discussionWakes)),
             );
-            yield* step(
-              "wakeBoardNudges",
-              Effect.suspend(() => wakeBoardNudges(board, discussionWakes)),
-            );
+            const deferredBoardThreads = yield* boardNudgeThreads(board.id);
+            if (deferredBoardThreads.length > 0)
+              yield* step(
+                "wakeBoardNudges",
+                Effect.suspend(() => wakeBoardNudges(board, discussionWakes, deferredBoardThreads)),
+              );
             views.clear();
             let boardCards: ReadonlyArray<KanbanCard> | undefined;
             const cardsForPlan = Effect.suspend(() =>
@@ -13383,12 +14133,14 @@ const make = Effect.gen(function* () {
                     return;
                   }
                   const view = yield* planView(threadId);
-                  if (
-                    view === null ||
-                    Rules.waitingOnBackground(view, now) ||
-                    !Rules.workerQuietDue(card, view, now)
-                  )
+                  if (view === null || Rules.waitingOnBackground(view, now)) return;
+                  const advanced = yield* advanceFinishedWorker(card);
+                  if (advanced.stage !== "working" || advanced.activeThreadId !== threadId) {
+                    updateCard(advanced);
+                    views.delete(threadId);
                     return;
+                  }
+                  if (!Rules.workerQuietDue(card, view, now)) return;
                   const fresh = yield* freshFind(threadId);
                   const current = yield* store.card(card.id);
                   if (
@@ -13792,9 +14544,11 @@ const make = Effect.gen(function* () {
               if (
                 initial.settledAt !== null ||
                 initial.archivedAt !== null ||
-                !initial.participants.some(
-                  (p) => p.actor._tag === "evaluator" && p.owes === "asked",
-                )
+                initial.lastSeq === 0 ||
+                (initial.cardId === null &&
+                  !initial.participants.some(
+                    (p) => p.actor._tag === "evaluator" && p.owes === "asked",
+                  ))
               )
                 continue;
               yield* step(
@@ -13804,6 +14558,57 @@ const make = Effect.gen(function* () {
                   if (!discussion) return;
 
                   if (discussion.settledAt !== null || discussion.archivedAt !== null) return;
+                  // A post can commit before routing attaches any participant. Recover that
+                  // gap here too; the same reply guard drops a queued wake once answered.
+                  if (discussion.cardId !== null) {
+                    const waiting = yield* store.ownerWait(discussion.id, true);
+                    if (
+                      waiting !== null &&
+                      now - Date.parse(waiting.createdAt) >= POST_RECOVERY_MS &&
+                      (yield* postNeedsReader(discussion.id, waiting.seq))
+                    ) {
+                      const message = yield* store.message(discussion.id, waiting.seq);
+                      if (message) {
+                        const text = blocksText(message.blocks, attachments.pathOf);
+                        // Participant order survives reuse of an older evaluator. The last
+                        // completed admission is the durable delivery generation instead.
+                        const prior = (yield* tickSql<{ id: number }>`
+                          SELECT id FROM ardud_kanban_evaluator_queue
+                          WHERE board_id = ${discussion.boardId} AND done_at IS NOT NULL
+                            AND json_extract(json, '$.purpose.kind') = 'discussion'
+                            AND json_extract(json, '$.purpose.discussionId') = ${discussion.id}
+                          ORDER BY id DESC LIMIT 1
+                        `)[0];
+                        yield* observePostRouting(
+                          discussion,
+                          message,
+                          toEvaluator(
+                            discussion,
+                            message.author._tag === "script"
+                              ? `Script "${message.authorName}" posted in "${discussion.title}" (discussion ${discussion.id}):\n\n${text}`
+                              : Briefs.ownerMessageText(discussion.title, discussion.id, text),
+                            false,
+                            undefined,
+                            ownerReplyKey(
+                              discussion.id,
+                              "unassigned",
+                              `post:${waiting.seq}:after:${prior?.id ?? "none"}`,
+                            ),
+                            postNeedsReader(discussion.id, waiting.seq),
+                            `owner:${discussion.cardId}`,
+                          ).pipe(
+                            Effect.provideService(EvaluatorAnalytics.origin, "discussion_nudge"),
+                            Effect.provideService(recoveryPost, {
+                              discussionId: discussion.id,
+                              seq: waiting.seq,
+                            }),
+                          ),
+                          "recovery",
+                        );
+                        return;
+                      }
+                    }
+                  }
                   // Only a discussion whose evaluator owes a reply can have an owner reminder due.
                   const owing = discussion.participants.filter(
                     (participant) =>
@@ -14301,11 +15106,12 @@ const make = Effect.gen(function* () {
   ) {
     const boardId = board.id;
     yield* Effect.annotateCurrentSpan("kanban.board_id", boardId);
-    const previous = runningTicks.get(boardId);
-    const busy = previous !== undefined;
     const tickId = NodeCrypto.randomUUID();
     yield* Effect.annotateCurrentSpan("kanban.tick_id", tickId);
     const timing = yield* TickTimings.create;
+    // No yield between testing and reserving the board, even during a burst.
+    const previous = runningTicks.get(boardId);
+    const busy = previous !== undefined;
     if (!busy) runningTicks.set(boardId, { tickId, timing });
     else {
       previous.timing.overlappingTicks++;
@@ -14667,6 +15473,7 @@ const make = Effect.gen(function* () {
           target ??= saved.card.id;
           return saved.card.id === target && isSaved(saved.card) ? saved.card : undefined;
         }),
+        name === "card.move",
       );
     });
   const read = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
@@ -15690,7 +16497,7 @@ const make = Effect.gen(function* () {
     yield* checkText(cardTextFields(input));
     // A thread's or a script's card waits for an evaluator to write its packet;
     // the owner's and the evaluators' own come written.
-    const packet = actor._tag === "thread" || actor._tag === "script";
+    const packet = Subtasks.needsPacketStep(actor);
     const fields = packet
       ? { ...input, subtasks: Subtasks.withPacketStep(input.subtasks ?? []) }
       : input;
@@ -15722,7 +16529,9 @@ const make = Effect.gen(function* () {
     const context = compact
       ? yield* threads.claimContext(threadId).pipe(NodeSqliteClient.identityReadOnly)
       : null;
-    const view = compact ? context : yield* threads.view(threadId);
+    const view = compact
+      ? context
+      : yield* threads.view(threadId).pipe(Effect.withSpan("read.workThread.view"));
     if (!view)
       return yield* failWith(
         "not-found",
@@ -15739,7 +16548,10 @@ const make = Effect.gen(function* () {
       held?.pool ??
       Rules.poolOf(
         yield* reader.pools(board.id),
-        context?.model ?? (yield* threads.model(threadId)) ?? link.model ?? board.defaultCardModel,
+        context?.model ??
+          (yield* threads.model(threadId).pipe(Effect.withSpan("read.workThread.model"))) ??
+          link.model ??
+          board.defaultCardModel,
       );
     const origin = compact
       ? null
@@ -15932,15 +16744,25 @@ const make = Effect.gen(function* () {
   });
 
   const claimCard: KanbanServiceShape["claimCard"] = (threadId, cardId) =>
-    guard(
+    SavedWrite.subSteps(
       "card.claim",
-      Effect.gen(function* () {
-        yield* reconcileRunFailureUnlocked(threadId);
-        const thread = yield* workThreadOf(threadId);
-        const card = (yield* upgradeFindings([yield* cardOf(cardId)]))[0]!;
-        yield* checkTake(thread, threadId, card);
-        return yield* takeCard(threadId, thread.pool, card, "Taken by its work thread");
-      }),
+      guard(
+        "card.claim",
+        Effect.gen(function* () {
+          // Repairs and pending notes do not acknowledge the requested claim.
+          const { thread, card } = yield* Effect.gen(function* () {
+            yield* reconcileRunFailureUnlocked(threadId).pipe(
+              Effect.withSpan("reconcile.runFailure"),
+            );
+            const thread = yield* workThreadOf(threadId);
+            const card = (yield* upgradeFindings([yield* cardOf(cardId)]))[0]!;
+            yield* checkTake(thread, threadId, card);
+            return { thread, card };
+          }).pipe(SavedWrite.preparatory);
+          return yield* takeCard(threadId, thread.pool, card, "Taken by its work thread");
+        }),
+      ),
+      true,
     );
 
   const sendCreatedAssignment = Effect.fn("KanbanService.sendCreatedAssignment")(function* (
@@ -16666,7 +17488,91 @@ const make = Effect.gen(function* () {
           ["note", options?.note],
           ["question", options?.question],
         ]);
-        const card = yield* cardOf(cardId);
+        const location = yield* locks.outside(
+          rawStore.card(cardId).pipe(Effect.withSpan("card.move.read.location")),
+          undefined,
+          true,
+        );
+        if (!location) return yield* failWith("not-found", `card ${cardId}`);
+        yield* locks.access(location.boardId, Effect.void);
+        // Every read finishes outside the gate; outside() checks the board
+        // generation before any guard or write can use this snapshot.
+        const snapshot = yield* locks.outside(
+          Effect.gen(function* () {
+            const card = yield* rawStore.card(cardId).pipe(Effect.withSpan("card.move.read.card"));
+            if (!card) return yield* failWith("not-found", `card ${cardId}`);
+            const board = yield* rawStore
+              .board(card.boardId)
+              .pipe(Effect.withSpan("card.move.read.board"));
+            if (!board) return yield* failWith("not-found", `board ${card.boardId}`);
+            const slots = new Map<string, ReadonlyArray<KanbanCard>>();
+            if (card.activeThreadId !== null)
+              slots.set(
+                card.activeThreadId,
+                yield* rawStore
+                  .cardsByThread(card.activeThreadId)
+                  .pipe(Effect.withSpan("card.move.read.slots")),
+              );
+            const waitTargets = new Map<string, KanbanCard & { readonly boardName?: string }>();
+            if (card.wait?.card != null) {
+              const target = yield* rawStore
+                .card(KanbanCardId.make(card.wait.card))
+                .pipe(Effect.withSpan("card.move.read.waitTarget"));
+              if (target) {
+                const boardName =
+                  target.boardId === card.boardId
+                    ? undefined
+                    : ((yield* rawStore
+                        .board(target.boardId)
+                        .pipe(Effect.withSpan("card.move.read.waitBoard")))?.name ??
+                      target.boardId);
+                waitTargets.set(target.id, {
+                  ...target,
+                  ...(boardName === undefined ? {} : { boardName }),
+                });
+              }
+            }
+            return {
+              before: card,
+              board,
+              slots,
+              waitTargets,
+              events: yield* rawStore
+                .cardEvents(card.id)
+                .pipe(Effect.withSpan("card.move.read.events")),
+              workCards:
+                card.workThreadId === null
+                  ? []
+                  : yield* rawStore
+                      .threadCards(card.workThreadId)
+                      .pipe(Effect.withSpan("card.move.read.workCards")),
+              reviewLink:
+                card.reviewThreadId === null
+                  ? null
+                  : yield* rawStore
+                      .threadLink(card.reviewThreadId)
+                      .pipe(Effect.withSpan("card.move.read.reviewLink")),
+            } satisfies CardWriteSnapshot;
+          }).pipe(Effect.withSpan("card.move.read.snapshot")),
+          undefined,
+          true,
+        );
+        const card = snapshot.before;
+        // An idle handoff can commit before the worker's delayed card_move.
+        // A new review request still needs its note and follows the normal path.
+        if (
+          role === "cardThread" &&
+          actor._tag === "thread" &&
+          actor.threadId === card.workThreadId &&
+          card.activeThreadId === null &&
+          card.stage === "needs_review" &&
+          to === "needs_review" &&
+          !options?.note?.trim() &&
+          snapshot.events
+            .findLast((event) => event.kind === "moved")
+            ?.body?.startsWith("Auto-advanced: review_step;")
+        )
+          return card;
         if (
           role === "cardThread" &&
           actor._tag === "thread" &&
@@ -16725,8 +17631,11 @@ const make = Effect.gen(function* () {
             );
           }
           if (ownReviewHandoff && card.stage === "needs_review") {
-            yield* logEvent(card, actor, "comment", { body: options!.note!.trim() });
-            yield* saveCard(card, actor);
+            yield* logEvent(card, actor, "comment", {
+              body: options!.note!.trim(),
+              before: snapshot.before,
+            });
+            yield* saveCard(card, actor, false, undefined, undefined, snapshot);
             return card;
           }
           if (to === "needs_owner" && !options?.question?.trim()) {
@@ -16748,7 +17657,7 @@ const make = Effect.gen(function* () {
           }
         }
         if (to === "verified" && role !== "owner") {
-          const board = yield* boardOf(card.boardId);
+          const board = snapshot.board;
           const open = card.subtasks.filter((subtask) => subtask.state === "open");
           const missing = card.subtasks
             .map((subtask) =>
@@ -16772,13 +17681,11 @@ const make = Effect.gen(function* () {
           if (missing) return yield* failWith("denied", missing, "approval_required");
         }
         if ((to === "completed" || to === "deployed") && role !== "owner") {
-          const board = yield* boardOf(card.boardId);
+          const board = snapshot.board;
           const blocked = Rules.reviewGate(card, Rules.chainFor(board, card)?.steps.length ?? 1);
           if (blocked !== null) return yield* failWith("denied", blocked, "review_incomplete");
           if (role === "evaluator" && card.workThreadId !== null) {
-            const reviewed = (yield* store.cardEvents(card.id)).findLast(
-              (event) => event.kind === "review",
-            )?.head;
+            const reviewed = snapshot.events.findLast((event) => event.kind === "review")?.head;
             if (reviewed) {
               const view = yield* threads.view(card.workThreadId);
               const changed = view?.prs.find(
@@ -16821,9 +17728,7 @@ const make = Effect.gen(function* () {
             wakeNote: null,
             nudgedAt: null,
           };
-          const reviewed = (yield* store.cardEvents(card.id)).findLast(
-            (event) => event.kind === "review",
-          )?.head;
+          const reviewed = snapshot.events.findLast((event) => event.kind === "review")?.head;
           moveOptions = {
             ...moveOptions,
             note: `${options!.note!.trim()}\nThe earlier clear${reviewed ? ` at ${reviewed}` : ""} no longer counts; review restarted.`,
@@ -16831,10 +17736,10 @@ const make = Effect.gen(function* () {
         }
         if (answeredRunStall) {
           source = { ...source, stalled: null };
-          yield* logEvent(source, actor, "flagged", { body: "Cleared" });
-          yield* logEvent(source, actor, "comment", { body: clearNote });
+          yield* logEvent(source, actor, "flagged", { body: "Cleared", before: snapshot.before });
+          yield* logEvent(source, actor, "comment", { body: clearNote, before: snapshot.before });
         }
-        const moved = yield* moveUnlocked(source, to, role, actor, moveOptions);
+        const moved = yield* moveUnlocked(source, to, role, actor, moveOptions, snapshot);
         const deferred = yield* effectSink;
         if (deferred === undefined || deferred.closed) {
           yield* forkPostCommit(
@@ -18446,9 +19351,10 @@ const make = Effect.gen(function* () {
             undefined,
             releaseBoard,
           );
-          yield* laterEvaluatorTurn(card, next, actor);
+          const advanced = yield* advanceFinishedWorker(next);
+          if (advanced === next) yield* laterEvaluatorTurn(card, next, actor);
           yield* kick;
-          return next;
+          return advanced;
         }),
       );
       if (!paced) return yield* completing;
@@ -18929,31 +19835,38 @@ const make = Effect.gen(function* () {
         if ((action === "steer" || action === "wake") && !text.trim())
           return yield* failWith("invalid", `${action} needs text: pass the message as text`);
         yield* checkText([["note", text]]);
-        const card = (yield* upgradeFindings([yield* cardOf(cardId)]))[0]!;
+        const stored = yield* cardOf(cardId);
+        const card = (yield* upgradeFindings([stored], false))[0]!;
         if (action !== "stop" && (yield* boardOf(card.boardId)).archivedAt !== null)
           return yield* failWith("denied", "Board is deleted", "board_deleted");
+        if (
+          (action === "steer" || action === "wake") &&
+          card.activeRole !== "review" &&
+          !kanbanWorkStep(card)
+        ) {
+          const open = kanbanStepSubtasks(card);
+          const owners = [...new Set(open.map((subtask) => subtask.owner))];
+          const step =
+            open.length === 0
+              ? "All subtasks are finished."
+              : `Step ${kanbanOpenStep(card)} (${Subtasks.subtaskIds(open)}) belongs to ${owners.join(" and ")}.`;
+          const next = owners.includes("review")
+            ? "The dispatcher starts the reviewer; use card_move to needs_review if the card is still in working."
+            : open.length === 0
+              ? "Add work subtasks with card_edit, then wake."
+              : "Complete that step, or add work subtasks with card_edit, then wake.";
+          return yield* failWith(
+            "denied",
+            `card #${card.number}: no worker step open. ${step} ${next}`,
+            "work_step_missing",
+          );
+        }
+        if (card !== stored) yield* saveCard(card);
         const at = yield* nowIso;
-        // Eligibility controls when the note is delivered, never whether newer
-        // wake/reset text can discard context that has not reached the worker.
         const wakeNote = Subtasks.pendingWakeNote({
           ...card,
           wakeNote: [card.wakeNote, text.trim()].filter(Boolean).join("\n\n") || null,
         });
-        if (
-          (action === "steer" || (action === "wake" && card.activeThreadId !== null)) &&
-          card.activeRole !== "review" &&
-          !kanbanWorkStep(card)
-        ) {
-          // A note waits for eligible work; direct sends would otherwise start
-          // an idle worker without passing the dispatcher or claim checks.
-          const next = {
-            ...card,
-            wakeNote,
-            updatedAt: at,
-          };
-          yield* saveCard(next);
-          return next;
-        }
         if (action === "steer") {
           const threadId = card.activeThreadId ?? card.workThreadId;
           if (threadId === null)
@@ -21318,7 +22231,7 @@ const make = Effect.gen(function* () {
             discussionId,
             author,
             blocks,
-            author._tag !== "owner",
+            author._tag !== "owner" && author._tag !== "script",
             true,
             durableOwnerRoutes,
             undefined,
@@ -21338,7 +22251,7 @@ const make = Effect.gen(function* () {
               discussion.id,
               author,
               blocks,
-              author._tag !== "owner",
+              author._tag !== "owner" && author._tag !== "script",
               true,
               durableOwnerRoutes,
             );

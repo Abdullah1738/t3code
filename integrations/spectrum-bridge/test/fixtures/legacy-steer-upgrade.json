@@ -1,0 +1,430 @@
+{
+  "revision": "b9f78ab59ee0a0e85833f2c7e4241e95d851067c",
+  "start": 1794830400000,
+  "running": {
+    "inbound": [
+      {
+        "id": "legacy-root",
+        "payload": "{\"id\":\"legacy-root\",\"text\":\"First action\",\"attachments\":[],\"isAudioMessage\":false,\"receivedAt\":1794830400000,\"source\":\"typed\"}",
+        "state": "done"
+      },
+      {
+        "id": "legacy-followup",
+        "payload": "{\"id\":\"legacy-followup\",\"text\":\"Second action\",\"attachments\":[],\"isAudioMessage\":false,\"receivedAt\":1794830401000,\"source\":\"typed\"}",
+        "state": "done"
+      },
+      {
+        "id": "legacy-member",
+        "payload": "{\"id\":\"legacy-member\",\"text\":\"Third action\",\"attachments\":[],\"isAudioMessage\":false,\"receivedAt\":1794830401000,\"source\":\"typed\"}",
+        "state": "done"
+      }
+    ],
+    "kv": [
+      {
+        "key": "activeTurn",
+        "value": "{\"id\":\"ses_1\",\"directory\":\"/Chats/ses_1\",\"generation\":1,\"inboundId\":\"legacy-root\",\"messageId\":\"msg_2d1aa1f599c91c8f563034d755a4345ceda9b6694479b2f8e643661dad93c42d\",\"startedAt\":1794830400000,\"phase\":\"running\",\"attempt\":1,\"attemptAt\":1794830400000,\"outbox\":0,\"steered\":[\"msg_7751076c7328548bc9b53d21489917baa099446a7885a20f07858464482d08e8\"],\"steeredAt\":1794830401000}"
+      },
+      {
+        "key": "batch-phase:legacy-followup",
+        "value": "\"accepted\""
+      },
+      {
+        "key": "batch-phase:legacy-root",
+        "value": "\"accepted\""
+      },
+      {
+        "key": "batch:legacy-followup",
+        "value": "{\"id\":\"legacy-member\",\"text\":\"Second action\\nThird action\",\"attachments\":[],\"isAudioMessage\":false,\"receivedAt\":1794830401000,\"source\":\"typed\",\"batchIds\":[\"legacy-followup\",\"legacy-member\"]}"
+      },
+      {
+        "key": "batch:legacy-root",
+        "value": "{\"id\":\"legacy-root\",\"text\":\"First action\",\"attachments\":[],\"isAudioMessage\":false,\"receivedAt\":1794830400000,\"source\":\"typed\",\"batchIds\":[\"legacy-root\"]}"
+      },
+      {
+        "key": "deferredNotice",
+        "value": "null"
+      },
+      {
+        "key": "deliveryOutage",
+        "value": "null"
+      },
+      {
+        "key": "failed-delivery:legacy-followup",
+        "value": "{\"id\":\"ses_1\",\"directory\":\"/Chats/ses_1\",\"generation\":1,\"inboundId\":\"legacy-followup\",\"messageId\":\"msg_7751076c7328548bc9b53d21489917baa099446a7885a20f07858464482d08e8\",\"startedAt\":1794830400000,\"phase\":\"running\",\"attempt\":1,\"attemptAt\":1794830400000,\"outbox\":0}"
+      },
+      {
+        "key": "failed-delivery:legacy-root",
+        "value": "{\"id\":\"ses_1\",\"directory\":\"/Chats/ses_1\",\"generation\":1,\"inboundId\":\"legacy-root\",\"messageId\":\"msg_2d1aa1f599c91c8f563034d755a4345ceda9b6694479b2f8e643661dad93c42d\",\"startedAt\":1794830400000,\"phase\":\"submitting\",\"attempt\":1,\"attemptAt\":1794830400000,\"outbox\":0}"
+      },
+      {
+        "key": "inbound-delivered:legacy-followup",
+        "value": "1794830401000"
+      },
+      {
+        "key": "inbound-delivered:legacy-member",
+        "value": "1794830401000"
+      },
+      {
+        "key": "inbound-delivered:legacy-root",
+        "value": "1794830400000"
+      },
+      {
+        "key": "latency-route:legacy-root",
+        "value": "null"
+      },
+      {
+        "key": "log-queued-behind:legacy-followup",
+        "value": "true"
+      },
+      {
+        "key": "log-queued-behind:legacy-member",
+        "value": "true"
+      },
+      {
+        "key": "log-turn-start:msg_2d1aa1f599c91c8f563034d755a4345ceda9b6694479b2f8e643661dad93c42d",
+        "value": "true"
+      },
+      {
+        "key": "pendingApprovals",
+        "value": "[]"
+      },
+      {
+        "key": "preparingDelivery",
+        "value": "null"
+      },
+      {
+        "key": "route",
+        "value": "{\"id\":\"ses_1\",\"directory\":\"/Chats/ses_1\",\"generation\":1,\"createdAt\":1794830400000,\"threadAt\":1794830400000}"
+      },
+      {
+        "key": "routeGeneration",
+        "value": "1"
+      },
+      {
+        "key": "seed:ses_1",
+        "value": "null"
+      },
+      {
+        "key": "steer-attempt:legacy-followup",
+        "value": "null"
+      },
+      {
+        "key": "steer-attempt:legacy-root",
+        "value": "null"
+      }
+    ],
+    "outbox": []
+  },
+  "completed": {
+    "inbound": [
+      {
+        "id": "legacy-root",
+        "payload": "{\"id\":\"legacy-root\",\"text\":\"First action\",\"attachments\":[],\"isAudioMessage\":false,\"receivedAt\":1794830400000,\"source\":\"typed\"}",
+        "state": "done"
+      },
+      {
+        "id": "legacy-followup",
+        "payload": "{\"id\":\"legacy-followup\",\"text\":\"Second action\",\"attachments\":[],\"isAudioMessage\":false,\"receivedAt\":1794830401000,\"source\":\"typed\"}",
+        "state": "done"
+      },
+      {
+        "id": "legacy-member",
+        "payload": "{\"id\":\"legacy-member\",\"text\":\"Third action\",\"attachments\":[],\"isAudioMessage\":false,\"receivedAt\":1794830401000,\"source\":\"typed\"}",
+        "state": "done"
+      }
+    ],
+    "kv": [
+      {
+        "key": "activeTurn",
+        "value": "null"
+      },
+      {
+        "key": "batch-phase:legacy-followup",
+        "value": "\"accepted\""
+      },
+      {
+        "key": "batch-phase:legacy-root",
+        "value": "\"accepted\""
+      },
+      {
+        "key": "batch:legacy-followup",
+        "value": "{\"id\":\"legacy-member\",\"text\":\"Second action\\nThird action\",\"attachments\":[],\"isAudioMessage\":false,\"receivedAt\":1794830401000,\"source\":\"typed\",\"batchIds\":[\"legacy-followup\",\"legacy-member\"]}"
+      },
+      {
+        "key": "batch:legacy-root",
+        "value": "{\"id\":\"legacy-root\",\"text\":\"First action\",\"attachments\":[],\"isAudioMessage\":false,\"receivedAt\":1794830400000,\"source\":\"typed\",\"batchIds\":[\"legacy-root\"]}"
+      },
+      {
+        "key": "deferredNotice",
+        "value": "null"
+      },
+      {
+        "key": "deliveryOutage",
+        "value": "null"
+      },
+      {
+        "key": "failed-delivery:legacy-followup",
+        "value": "{\"id\":\"ses_1\",\"directory\":\"/Chats/ses_1\",\"generation\":1,\"inboundId\":\"legacy-followup\",\"messageId\":\"msg_7751076c7328548bc9b53d21489917baa099446a7885a20f07858464482d08e8\",\"startedAt\":1794830400000,\"phase\":\"running\",\"attempt\":1,\"attemptAt\":1794830400000,\"outbox\":0}"
+      },
+      {
+        "key": "failed-delivery:legacy-root",
+        "value": "{\"id\":\"ses_1\",\"directory\":\"/Chats/ses_1\",\"generation\":1,\"inboundId\":\"legacy-root\",\"messageId\":\"msg_2d1aa1f599c91c8f563034d755a4345ceda9b6694479b2f8e643661dad93c42d\",\"startedAt\":1794830400000,\"phase\":\"submitting\",\"attempt\":1,\"attemptAt\":1794830400000,\"outbox\":0}"
+      },
+      {
+        "key": "inbound-delivered:legacy-followup",
+        "value": "1794830401000"
+      },
+      {
+        "key": "inbound-delivered:legacy-member",
+        "value": "1794830401000"
+      },
+      {
+        "key": "inbound-delivered:legacy-root",
+        "value": "1794830400000"
+      },
+      {
+        "key": "latency-route:legacy-root",
+        "value": "null"
+      },
+      {
+        "key": "log-inbound-at:reply:1:msg_assistant_2",
+        "value": "1794830400000"
+      },
+      {
+        "key": "log-inbound-id:reply:1:msg_assistant_2",
+        "value": "\"legacy-root\""
+      },
+      {
+        "key": "log-queued-behind:legacy-followup",
+        "value": "true"
+      },
+      {
+        "key": "log-queued-behind:legacy-member",
+        "value": "true"
+      },
+      {
+        "key": "log-queued:reply:1:msg_assistant_2",
+        "value": "1794830402000"
+      },
+      {
+        "key": "log-turn-end:msg_2d1aa1f599c91c8f563034d755a4345ceda9b6694479b2f8e643661dad93c42d",
+        "value": "true"
+      },
+      {
+        "key": "log-turn-start:msg_2d1aa1f599c91c8f563034d755a4345ceda9b6694479b2f8e643661dad93c42d",
+        "value": "true"
+      },
+      {
+        "key": "pendingApprovals",
+        "value": "null"
+      },
+      {
+        "key": "preparingDelivery",
+        "value": "null"
+      },
+      {
+        "key": "route",
+        "value": "{\"id\":\"ses_1\",\"directory\":\"/Chats/ses_1\",\"generation\":1,\"createdAt\":1794830400000,\"threadAt\":1794830400000}"
+      },
+      {
+        "key": "routeGeneration",
+        "value": "1"
+      },
+      {
+        "key": "seed:ses_1",
+        "value": "null"
+      },
+      {
+        "key": "sent-at:reply:1:msg_assistant_2",
+        "value": "1794830402000"
+      },
+      {
+        "key": "settledAt",
+        "value": "1794830402000"
+      },
+      {
+        "key": "steer-attempt:legacy-followup",
+        "value": "null"
+      },
+      {
+        "key": "steer-attempt:legacy-root",
+        "value": "null"
+      },
+      {
+        "key": "watermark",
+        "value": "{\"sessionId\":\"ses_1\",\"id\":\"msg_idle_3\"}"
+      }
+    ],
+    "outbox": [
+      {
+        "id": "reply:1:msg_assistant_2",
+        "payload": "{\"id\":\"reply:1:msg_assistant_2\",\"kind\":\"conversation\",\"text\":\"Both done\",\"sessionId\":\"ses_1\",\"generation\":1,\"replyTo\":\"legacy-root\"}",
+        "state": "sent",
+        "attempts": 0,
+        "providerId": null
+      }
+    ]
+  },
+  "lateAdopted": {
+    "inbound": [
+      {
+        "id": "late-root",
+        "payload": "{\"id\":\"late-root\",\"text\":\"First action\",\"attachments\":[],\"isAudioMessage\":false,\"receivedAt\":1794830400000,\"source\":\"typed\"}",
+        "state": "done"
+      },
+      {
+        "id": "late-followup",
+        "payload": "{\"id\":\"late-followup\",\"text\":\"Second action\",\"attachments\":[],\"isAudioMessage\":false,\"receivedAt\":1794830401000,\"source\":\"typed\"}",
+        "state": "done"
+      },
+      {
+        "id": "late-member",
+        "payload": "{\"id\":\"late-member\",\"text\":\"Third action\",\"attachments\":[],\"isAudioMessage\":false,\"receivedAt\":1794830401000,\"source\":\"typed\"}",
+        "state": "done"
+      }
+    ],
+    "kv": [
+      {
+        "key": "activeTurn",
+        "value": "null"
+      },
+      {
+        "key": "batch-phase:late-followup",
+        "value": "\"accepted\""
+      },
+      {
+        "key": "batch-phase:late-root",
+        "value": "\"accepted\""
+      },
+      {
+        "key": "batch:late-followup",
+        "value": "{\"id\":\"late-member\",\"text\":\"Second action\\nThird action\",\"attachments\":[],\"isAudioMessage\":false,\"receivedAt\":1794830401000,\"source\":\"typed\",\"batchIds\":[\"late-followup\",\"late-member\"]}"
+      },
+      {
+        "key": "batch:late-root",
+        "value": "{\"id\":\"late-root\",\"text\":\"First action\",\"attachments\":[],\"isAudioMessage\":false,\"receivedAt\":1794830400000,\"source\":\"typed\",\"batchIds\":[\"late-root\"]}"
+      },
+      {
+        "key": "deferredNotice",
+        "value": "null"
+      },
+      {
+        "key": "deliveryOutage",
+        "value": "null"
+      },
+      {
+        "key": "failed-delivery:late-followup",
+        "value": "{\"id\":\"ses_1\",\"directory\":\"/Chats/ses_1\",\"generation\":1,\"inboundId\":\"late-followup\",\"messageId\":\"msg_fb2b6667b11fbdbb3b3f357b7ba93463a333b36f2f8c0710b490d20225857352\",\"startedAt\":1794830400000,\"phase\":\"running\",\"attempt\":1,\"attemptAt\":1794830400000,\"outbox\":0,\"steered\":[\"msg_fb2b6667b11fbdbb3b3f357b7ba93463a333b36f2f8c0710b490d20225857352\"],\"steeredAt\":1794830401000}"
+      },
+      {
+        "key": "failed-delivery:late-root",
+        "value": "{\"id\":\"ses_1\",\"directory\":\"/Chats/ses_1\",\"generation\":1,\"inboundId\":\"late-root\",\"messageId\":\"msg_895b094fb064d7818736d8f8f0de4d21954c99645c155d6348b4ffb67e505937\",\"startedAt\":1794830400000,\"phase\":\"submitting\",\"attempt\":1,\"attemptAt\":1794830400000,\"outbox\":0}"
+      },
+      {
+        "key": "inbound-delivered:late-followup",
+        "value": "1794830520000"
+      },
+      {
+        "key": "inbound-delivered:late-member",
+        "value": "1794830520000"
+      },
+      {
+        "key": "inbound-delivered:late-root",
+        "value": "1794830400000"
+      },
+      {
+        "key": "latency-route:late-followup",
+        "value": "null"
+      },
+      {
+        "key": "latency-route:late-root",
+        "value": "null"
+      },
+      {
+        "key": "log-inbound-at:reply:1:msg_assistant_4",
+        "value": "1794830401000"
+      },
+      {
+        "key": "log-inbound-id:reply:1:msg_assistant_4",
+        "value": "\"late-followup\""
+      },
+      {
+        "key": "log-queued-behind:late-followup",
+        "value": "true"
+      },
+      {
+        "key": "log-queued-behind:late-member",
+        "value": "true"
+      },
+      {
+        "key": "log-queued:reply:1:msg_assistant_4",
+        "value": "1794830520000"
+      },
+      {
+        "key": "log-turn-end:msg_895b094fb064d7818736d8f8f0de4d21954c99645c155d6348b4ffb67e505937",
+        "value": "true"
+      },
+      {
+        "key": "log-turn-end:msg_fb2b6667b11fbdbb3b3f357b7ba93463a333b36f2f8c0710b490d20225857352",
+        "value": "true"
+      },
+      {
+        "key": "log-turn-start:msg_895b094fb064d7818736d8f8f0de4d21954c99645c155d6348b4ffb67e505937",
+        "value": "true"
+      },
+      {
+        "key": "log-turn-start:msg_fb2b6667b11fbdbb3b3f357b7ba93463a333b36f2f8c0710b490d20225857352",
+        "value": "true"
+      },
+      {
+        "key": "pendingApprovals",
+        "value": "null"
+      },
+      {
+        "key": "preparingDelivery",
+        "value": "null"
+      },
+      {
+        "key": "route",
+        "value": "{\"id\":\"ses_1\",\"directory\":\"/Chats/ses_1\",\"generation\":1,\"createdAt\":1794830400000,\"threadAt\":1794830400000}"
+      },
+      {
+        "key": "routeGeneration",
+        "value": "1"
+      },
+      {
+        "key": "seed:ses_1",
+        "value": "null"
+      },
+      {
+        "key": "sent-at:reply:1:msg_assistant_4",
+        "value": "1794830520000"
+      },
+      {
+        "key": "settledAt",
+        "value": "1794830520000"
+      },
+      {
+        "key": "steer-attempt:late-followup",
+        "value": "null"
+      },
+      {
+        "key": "steer-attempt:late-root",
+        "value": "null"
+      },
+      {
+        "key": "watermark",
+        "value": "{\"sessionId\":\"ses_1\",\"id\":\"msg_idle_5\"}"
+      }
+    ],
+    "outbox": [
+      {
+        "id": "reply:1:msg_assistant_4",
+        "payload": "{\"id\":\"reply:1:msg_assistant_4\",\"kind\":\"conversation\",\"text\":\"Second action done\",\"sessionId\":\"ses_1\",\"generation\":1,\"replyTo\":\"late-followup\"}",
+        "state": "sent",
+        "attempts": 0,
+        "providerId": null
+      }
+    ]
+  }
+}

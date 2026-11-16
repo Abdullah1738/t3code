@@ -2307,10 +2307,13 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
                 event.data.error.type === "provider.rate-limit"
                   ? "usage_limit"
                   : "provider_error",
+              // OpenCode uses provider.no-route for missing models and invalid variants alike.
               ...(event.data.error.type === "provider.quota" ||
               event.data.error.type === "provider.rate-limit"
                 ? { category: "quota" as const }
-                : {}),
+                : event.data.error.message.startsWith("Model unavailable: ")
+                  ? { category: "transient" as const }
+                  : {}),
             }),
           });
         default:

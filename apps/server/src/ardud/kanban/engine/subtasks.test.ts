@@ -1701,8 +1701,13 @@ describe("planSubtasks", () => {
   it("refuses unknown or repeated ids and empty text", () => {
     expect(planSubtasks([], [{ id: "s9" }])).toMatchObject({
       ok: false,
-      denyReason: "subtask_not_found",
-      reason: "the card has no subtask s9. Existing subtask ids: none",
+      denyReason: "invalid_args",
+      reason: "a new subtask needs text and owner",
+    });
+    expect(planSubtasks([], [{ id: "s9", text: "x" }])).toMatchObject({
+      ok: false,
+      denyReason: "invalid_args",
+      reason: "a new subtask needs text and owner",
     });
     const subtasks = planned();
     expect(planSubtasks(subtasks, [{ id: "s1" }, { id: "s1" }])).toMatchObject({
@@ -1710,7 +1715,135 @@ describe("planSubtasks", () => {
       denyReason: "invalid_args",
       reason: "subtask s1 is listed twice",
     });
+    expect(
+      planSubtasks([], [
+        { id: "s5", text: "a", owner: "work" },
+        { id: "s5", text: "b", owner: "work" },
+      ]),
+    ).toMatchObject({
+      ok: false,
+      denyReason: "invalid_args",
+      reason: "subtask s5 is listed twice",
+    });
+    // A numbered entry and a later explicit one cannot both take the same id.
+    expect(
+      planSubtasks([], [
+        { text: "a", owner: "work" },
+        { id: "s1", text: "b", owner: "work" },
+      ]),
+    ).toMatchObject({
+      ok: false,
+      denyReason: "invalid_args",
+      reason: "subtask s1 is listed twice",
+    });
     expect(planSubtasks([], [{ text: "  ", owner: "work" }])).toMatchObject({ ok: false });
+  });
+
+  it.each(["foo", "S1", "s0", "s01", "s 1", "s", "1", "s1x"])(
+    "refuses %j as a subtask id",
+    (id) => {
+      expect(planSubtasks([], [{ id, text: "x", owner: "work" }])).toEqual({
+        ok: false,
+        denyReason: "invalid_args",
+        reason: `"${id}" is not a subtask id; use s1, s2, ...`,
+      });
+    },
+  );
+
+  it("takes an explicit s<N> id for a new subtask and moves the counter past it", () => {
+    expect(planSubtasks([], [{ id: "s9", text: "x", owner: "work" }], 0, at)).toEqual({
+      ok: true,
+      subtasks: [
+        {
+          id: "s9",
+          step: 1,
+          text: "x",
+          owner: "work",
+          createdAt: at,
+          state: "open",
+          note: null,
+          doneBy: null,
+          doneAt: null,
+        },
+      ],
+      subtaskSeq: 9,
+    });
+    // The reported create call: an s1 the card does not have yet.
+    const first = planSubtasks([], [{ id: "s1", text: "one", owner: "work" }], 0, at);
+    if (!first.ok) throw new Error(first.reason);
+    expect(first.subtasks.map((subtask) => [subtask.id, subtask.step])).toEqual([["s1", 1]]);
+    expect(first.subtaskSeq).toBe(1);
+    // Later entries without an id take the numbers after the explicit one.
+    const mixed = planSubtasks(
+      [],
+      [
+        { id: "s3", text: "three", owner: "work" },
+        { text: "four", owner: "work" },
+      ],
+      0,
+      at,
+    );
+    if (!mixed.ok) throw new Error(mixed.reason);
+    expect(mixed.subtasks.map((subtask) => [subtask.id, subtask.step, subtask.text])).toEqual([
+      ["s3", 1, "three"],
+      ["s4", 2, "four"],
+    ]);
+    expect(mixed.subtaskSeq).toBe(4);
+    // A number below the card's counter keeps the counter where it is.
+    const low = planSubtasks([], [{ id: "s2", text: "two", owner: "work" }], 9, at);
+    if (!low.ok) throw new Error(low.reason);
+    expect(low.subtaskSeq).toBe(9);
+  });
+
+  it("keeps known ids' state, step and history while adding an explicit new one", () => {
+    const done = markSubtask(planned(), "s2", "done", "PR #4", owner, at);
+    const plan = planSubtasks(
+      done,
+      [
+        { id: "s1" },
+        { id: "s2", text: "Review" },
+        { id: "s3" },
+        { id: "s4" },
+        { id: "s5" },
+        { id: "s6" },
+        { id: "s9", text: "Extra check", owner: "evaluator" },
+      ],
+      done.length,
+      at,
+    );
+    if (!plan.ok) throw new Error(plan.reason);
+    expect(plan.subtasks.map((subtask) => [subtask.id, subtask.state, subtask.text])).toEqual([
+      ["s1", "open", "Write the PR"],
+      ["s2", "done", "Review"],
+      ["s3", "open", "Merge and deploy"],
+      ["s4", "open", "Tell the reporter"],
+      ["s5", "open", "Update linked tickets"],
+      ["s6", "open", "Read back"],
+      ["s9", "open", "Extra check"],
+    ]);
+    expect(plan.subtaskSeq).toBe(9);
+  });
+
+  it("still needs an existing id to clear a gate", () => {
+    expect(
+      planSubtasks(
+        [],
+        [
+          {
+            id: "s9",
+            text: "x",
+            owner: "evaluator",
+            clearGate: "the guessed gate is wrong here",
+          },
+        ],
+        0,
+        at,
+      ),
+    ).toEqual({
+      ok: false,
+      denyReason: "invalid_args",
+      reason: "clearGate needs an existing subtask id",
+    });
   });
 });
 

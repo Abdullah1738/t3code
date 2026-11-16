@@ -3604,12 +3604,18 @@ it.effect.each(
           createdBy: "user",
           creationSource: "web",
         });
+        const parentAtAdmission = yield* threads.getThreadProjection(parentThreadId);
+        const parentRun = ThreadManagement.latestActiveRun(parentAtAdmission);
+        assert.isDefined(parentRun);
+        const parentSessionId = parentAtAdmission.providerThreads.find(
+          (thread) => thread.id === parentRun!.providerThreadId,
+        )!.providerSessionId!;
         const scope = {
           environmentId: EnvironmentId.make("delegated-worktree-test"),
           requestNamespace: "parent-session",
           thread: {
             threadId: parentThreadId,
-            providerSessionId: "parent-session",
+            providerSessionId: parentSessionId,
             providerInstanceId: modelSelection.instanceId,
           },
           client: undefined,

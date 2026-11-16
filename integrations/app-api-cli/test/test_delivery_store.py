@@ -1,5 +1,6 @@
 from contextlib import redirect_stdout
 import datetime as dt
+import hashlib
 import io
 import json
 import os
@@ -151,13 +152,144 @@ class DeliveryHoldTests(unittest.TestCase):
         return s.evidence(cfg, t.classify)[1]
 
     def check_deferred(self, reason):
+        self.assertEqual(s.hold_state()['reason'], reason)
         output = io.StringIO()
         with redirect_stdout(output):
             s.health_check()
-        self.assertEqual(json.loads(output.getvalue()), {
-            'status': 'deferred', 'reason': 'priority_hold',
-            'owner': self.owner, 'hold_reason': reason, 'age_s': 600})
-        self.assertEqual(len(output.getvalue().splitlines()), 1)
+        self.assertEqual(output.getvalue(), '')
+        self.assertFalse((s.ROOT / 'hold-alerts.json').exists())
+
+    def health_output(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            s.health_check()
+        self.assert_files_unchanged()
+        return output.getvalue()
+
+    def alert_logs(self):
+        return [row for row in self.logs() if row['name'] == 'collector.hold_alert_sent']
+
+    def test_matching_live_lease_never_alerts_within_age_bound(self):
+        for age in (30 * 60, 60 * 60):
+            with self.subTest(age=age):
+                self.hold(age=age)
+                self.lease()
+                s.collect()
+                self.check_deferred('lease_live')
+                self.assert_files_unchanged()
+        self.assertEqual(self.alert_logs(), [])
+        self.adb.assert_not_called()
+
+    def test_no_lease_is_silent_until_strict_alert_boundary(self):
+        for age in (10 * 60, 15 * 60):
+            with self.subTest(age=age):
+                self.hold(age=age)
+                s.collect()
+                self.check_deferred('no_matching_lease_within_bound')
+                self.assert_files_unchanged()
+        self.assertEqual(self.alert_logs(), [])
+
+    def test_no_lease_alerts_once_and_records_identity_and_log(self):
+        path = self.hold(age=16 * 60)
+        s.collect()
+        output = self.health_output()
+        self.assertEqual(len(output.splitlines()), 1)
+        self.assertEqual(json.loads(output), {
+            'status': 'alert', 'reason': 'phone_priority_hold_without_lease',
+            'owner': self.owner, 'age_min': 16, 'collection': 'blocked',
+            'note': 'delivery notifications are not being collected; the holder has no lease; '
+                    "ask the holder to release it, never remove another task's hold"})
+        alert_id = hashlib.sha256((self.owner + '|' + str(int(path.stat().st_mtime))).encode()).hexdigest()
+        self.assertEqual(json.loads((s.ROOT / 'hold-alerts.json').read_text()), [alert_id])
+        self.assertEqual(self.health_output(), '')
+        with patch.object(s.time, 'time', return_value=self.now + 60):
+            self.assertEqual(self.health_output(), '')
+        self.assertEqual(len(self.alert_logs()), 1)
+        self.assertEqual(self.alert_logs()[0]['props'], {
+            'owner': self.owner, 'age_s': 960, 'reason': 'no_matching_lease_within_bound'})
+        self.assertEqual(list(s.ROOT.glob('hold-alerts-*.tmp')), [])
+
+    def test_no_lease_alert_boundary_and_last_live_second(self):
+        for age, minutes in ((901, 15), (3600, 60)):
+            with self.subTest(age=age):
+                self.hold(age=age)
+                s.collect()
+                self.assertEqual(json.loads(self.health_output())['age_min'], minutes)
+                self.assertEqual(self.health_output(), '')
+
+    def test_rewritten_hold_alerts_once_for_each_new_mtime(self):
+        path = self.hold(age=16 * 60)
+        s.collect()
+        self.assertEqual(json.loads(self.health_output())['status'], 'alert')
+        os.utime(path, (self.now - 17 * 60, self.now - 17 * 60))
+        self.remember(path)
+        self.assertEqual(json.loads(self.health_output())['age_min'], 17)
+        self.assertEqual(self.health_output(), '')
+        self.assertEqual(len(json.loads((s.ROOT / 'hold-alerts.json').read_text())), 2)
+        self.assertEqual(len(self.alert_logs()), 2)
+
+    def test_different_owner_at_same_mtime_alerts_again(self):
+        self.hold(age=960)
+        s.collect()
+        self.assertEqual(json.loads(self.health_output())['owner'], self.owner)
+        self.hold(age=960, owner='other-owner')
+        self.assertEqual(json.loads(self.health_output())['owner'], 'other-owner')
+        self.assertEqual(self.health_output(), '')
+        self.assertEqual(len(json.loads((s.ROOT / 'hold-alerts.json').read_text())), 2)
+
+    def test_corrupt_alert_record_is_replaced_and_dedupes(self):
+        self.hold(age=960)
+        self.lease(owner='other-owner')
+        s.collect()
+        record = s.ROOT / 'hold-alerts.json'
+        for contents in (b'{broken', b'\xff', b'null', b'{}', b'"id"', b'[1, null]'):
+            with self.subTest(contents=contents):
+                record.write_bytes(contents)
+                self.assertEqual(json.loads(self.health_output())['status'], 'alert')
+                self.assertEqual(self.health_output(), '')
+                self.assertEqual(len(json.loads(record.read_text())), 1)
+        self.assertEqual(len(self.alert_logs()), 6)
+
+    def test_alert_history_keeps_last_50_entries_atomically(self):
+        self.hold(age=960)
+        s.collect()
+        record = s.ROOT / 'hold-alerts.json'
+        sent = ['old-{}'.format(index) for index in range(50)]
+        record.write_text(json.dumps(sent))
+        replace = s.os.replace
+        def check_replace(source, destination):
+            self.assertEqual(json.loads(record.read_text()), sent)
+            self.assertEqual(source.parent, s.ROOT)
+            self.assertEqual(destination, record)
+            self.assertEqual(len(json.loads(source.read_text())), 50)
+            replace(source, destination)
+        with patch.object(s.os, 'replace', side_effect=check_replace) as atomic:
+            self.assertEqual(json.loads(self.health_output())['status'], 'alert')
+        atomic.assert_called_once()
+        self.assertEqual(json.loads(record.read_text())[:-1], sent[1:])
+        self.assertEqual(self.health_output(), '')
+
+    def test_hold_gone_with_deferred_row_is_silent(self):
+        path = self.hold()
+        self.lease()
+        s.collect()
+        # The fixture releases its own hold while the collector row lags.
+        path.unlink()
+        del self.snapshots[path]
+        self.assertEqual(self.health_output(), '')
+        self.assertFalse((s.ROOT / 'hold-alerts.json').exists())
+        self.assertEqual(self.alert_logs(), [])
+
+    def test_stale_hold_fails_without_alert_output_or_record(self):
+        self.hold(age=61 * 60)
+        s.collect()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            with self.assertRaisesRegex(RuntimeError, 'hold_older_than_60m'):
+                s.health_check()
+        self.assertEqual(output.getvalue(), '')
+        self.assertFalse((s.ROOT / 'hold-alerts.json').exists())
+        self.assertEqual(self.alert_logs(), [])
 
     def logs(self):
         return [json.loads(line) for path in (self.folder / 'logs/orders').glob('*.ndjson')
@@ -429,7 +561,7 @@ class DeliveryHoldTests(unittest.TestCase):
         output = io.StringIO()
         with redirect_stdout(output):
             s.health_check()
-        self.assertEqual(json.loads(output.getvalue())['hold_reason'], 'hold_absent')
+        self.assertEqual(output.getvalue(), '')
         self.adb.assert_not_called()
 
     def test_deferred_row_still_expires_if_collector_stops(self):

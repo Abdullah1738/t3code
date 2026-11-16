@@ -1,3 +1,5 @@
+import * as ProviderSessionManager from "../../../orchestration-v2/ProviderSessionManager.ts";
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../../../orchestration-v2/ProjectionStore.ts";
 import * as DeviceService from "../../../device/DeviceService.ts";
@@ -43,7 +45,9 @@ import * as SqlitePersistence from "../../../persistence/Sqlite.ts";
 import * as CredentialStore from "../../../ardud/mcp/CredentialStore.ts";
 
 const layerStubServices = Layer.mergeAll(
+  McpProviderSessions.layer,
   Layer.mock(Orchestrator.OrchestratorV2)({}),
+  Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({}),
   Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
   Layer.mock(DeviceService.DeviceService)({}),
   Layer.mock(ThreadManagementService.ThreadManagementService)({}),

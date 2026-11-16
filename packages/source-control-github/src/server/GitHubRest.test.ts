@@ -316,8 +316,7 @@ describe("GitHubCredentials", () => {
   const credentialsWith = (run: SourceControlHost.SourceControlHost["Service"]["process"]["run"]) =>
     GitHubCredentials.layer.pipe(
       Layer.provide(TestSourceControlHost.layer({ process: { run } })),
-      Layer.provide(NodeFileSystem.layer),
-      Layer.provide(NodeCrypto.layer),
+      Layer.provide(Layer.merge(NodeCrypto.layer, NodeFileSystem.layer)),
     );
 
   it.effect("fails with GitHubCliMissingError when gh is not on PATH", () =>
@@ -326,7 +325,6 @@ describe("GitHubCredentials", () => {
       const error = yield* Effect.flip(credentials.get("git.acme.internal"));
       expect(error._tag).toBe("GitHubCliMissingError");
     }).pipe(
-      Effect.provideService(SpawnExecutableResolution, () => undefined),
       Effect.provide(
         credentialsWith(() =>
           Effect.fail(
@@ -343,6 +341,7 @@ describe("GitHubCredentials", () => {
           ),
         ),
       ),
+      Effect.provideService(SpawnExecutableResolution, () => undefined),
     ),
   );
 

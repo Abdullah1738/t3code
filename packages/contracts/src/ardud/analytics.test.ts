@@ -195,6 +195,22 @@ it.each([
   expect(Schema.decodeUnknownSync(RunUsageEvent)({ ...usage, model }).model).toBe(model);
 });
 
+it.each(["live_thread", "steer", "start", "none"] as const)(
+  "#1603 post-routing target %s is retained without message content",
+  (target) => {
+    const row = {
+      ...event,
+      kind: "kanban.post_routing",
+      outcome: "ok",
+      props: { actor: "script", seq: 39, target, phase: "routed" },
+    };
+    expect(decodeEvent(row)).toEqual(row);
+    expect(() =>
+      decodeEvent({ ...row, props: { ...row.props, target: "arbitrary text" } }),
+    ).toThrow();
+  },
+);
+
 it.each(["started", "reused", "merged", "queued_spawn_cap"] as const)(
   "#1490 accepts evaluator outcome %s and bounded attribution labels",
   (outcome) => {

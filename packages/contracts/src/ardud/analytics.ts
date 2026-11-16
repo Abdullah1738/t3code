@@ -256,6 +256,8 @@ const GeneralEvent = Schema.Struct({
       actor: Schema.optionalKey(
         Schema.Literals(["owner", "thread", "evaluator", "script", "system"]),
       ),
+      seq: Schema.optionalKey(Measurement),
+      target: Schema.optionalKey(Schema.Literals(["live_thread", "steer", "start", "none"])),
       msInPrevStage: Schema.optionalKey(Measurement),
       round: Schema.optionalKey(Measurement),
       chain: Schema.optionalKey(Label),
@@ -300,6 +302,36 @@ const GeneralEvent = Schema.Struct({
       readerAcquireMs: Schema.optionalKey(Measurement),
       readerQueryMs: Schema.optionalKey(Measurement),
       readerStatements: Schema.optionalKey(Measurement),
+      serializationMs: Schema.optionalKey(Measurement),
+      readerHolders: Schema.optionalKey(
+        Schema.Array(
+          Schema.Struct({
+            lane: Label,
+            holder: Label,
+            holdMs: Measurement,
+          }),
+        ).check(Schema.isMaxLength(8)),
+      ),
+      readerTimings: Schema.optionalKey(
+        Schema.Array(
+          Schema.Struct({
+            lane: Label,
+            waitMs: Measurement,
+            queryMs: Measurement,
+            statements: Measurement,
+          }),
+        ).check(Schema.isMaxLength(8)),
+      ),
+      replyAdmissions: Schema.optionalKey(
+        Schema.Array(
+          Schema.Struct({
+            lane: Label,
+            waitMs: Measurement,
+            runMs: Measurement,
+            acquired: Schema.Boolean,
+          }),
+        ).check(Schema.isMaxLength(8)),
+      ),
       span: Schema.optionalKey(Label),
       errorTag: Schema.optionalKey(Label),
       code: Schema.optionalKey(Label),
@@ -324,6 +356,7 @@ const GeneralEvent = Schema.Struct({
         ]),
       ),
       idCanonical: Schema.optionalKey(Schema.Boolean),
+      dispatchFenceRecovered: Schema.optionalKey(Schema.Boolean),
       idShape: Schema.optionalKey(
         Schema.Literals(["task_id", "thread_id", "child_thread_id", "empty", "other"]),
       ),

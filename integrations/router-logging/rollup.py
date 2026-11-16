@@ -37,6 +37,9 @@ def rollup(day, root=None):
     counts, kinds, tags = Counter(), Counter(), Counter()
     times, samples = defaultdict(list), {}
     proxy = {}
+    models = defaultdict(lambda: dict(count=0, aborted=0))
+    abort_clients, abort_keys, attempts = Counter(), Counter(), Counter()
+    abort_ttfb = []
     locks, lock_accounts = {}, Counter()
     unlocks = 0
     supervisor = dict(unresponsive=0, crawling=0, memoryHigh=0, killed=0,
@@ -121,7 +124,23 @@ def rollup(day, root=None):
                     if row['name'] == 'proxy.request':
                         group = proxy.setdefault(key, dict(count=0, aborted=0, durations=[], ttfb=[], errors=Counter(), samples={}))
                         group['count'] += 1
-                        group['aborted'] += props.get('client') == 'aborted'
+                        aborted = props.get('status') == 499 or props.get('clientState', props.get('client')) == 'aborted'
+                        group['aborted'] += aborted
+                        model = models[key[0]]
+                        model['count'] += 1
+                        model['aborted'] += aborted
+                        attempt_count = props.get('attempts')
+                        if isinstance(attempt_count, int) and not isinstance(attempt_count, bool) and attempt_count >= 0:
+                            attempts[attempt_count] += 1
+                        if aborted:
+                            client = props.get('client', 'unknown')
+                            abort_clients[client if client in ('claude-code', 'codex', 'curl', 'node', 'python', 'browser', 'other') else 'unknown'] += 1
+                            key_id = props.get('keyId', 'unknown')
+                            if not isinstance(key_id, str) or not (key_id in ('none', 'unknown') or len(key_id) == 16 and all(c in '0123456789abcdef' for c in key_id)):
+                                key_id = 'unknown'
+                            abort_keys[key_id] += 1
+                            if metric(props.get('ttfbMs')):
+                                abort_ttfb.append(props['ttfbMs'])
                         if metric(ms):
                             group['durations'].append(ms)
                         if metric(props.get('ttfbMs')):
@@ -146,6 +165,12 @@ def rollup(day, root=None):
             ttfbMs=percentiles(group['ttfb']),
             topErrors=[dict(tag=tag, count=count, sampleReq=group['samples'][tag]) for tag, count in group['errors'].most_common(20)],
         ))
+    result['proxySummary'] = dict(
+        byModel=[dict(model=m, **g, clientAbortRate=g['aborted'] / g['count']) for m, g in sorted(models.items())],
+        abortsByClient=dict(sorted(abort_clients.items())), abortsByKeyId=dict(sorted(abort_keys.items())),
+        attemptsHistogram={str(n): count for n, count in sorted(attempts.items())},
+        abortTtfbMs=percentiles(abort_ttfb),
+    )
     result['locks'] = dict(
         count=sum(g['count'] for g in locks.values()), unlocks=unlocks,
         byProviderModelCause=[dict(provider=p, model=m, cause=c, count=g['count'], lockMs=percentiles(g['durations'])) for (p, m, c), g in sorted(locks.items())],

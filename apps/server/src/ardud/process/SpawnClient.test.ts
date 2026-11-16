@@ -6,6 +6,52 @@ import { SpawnClient } from "./SpawnClient.ts";
 import { spawnWorker } from "./spawnWorker.ts";
 
 describe("SpawnClient", () => {
+  it.each(["error-event", "throw", "stream-error"])(
+    "preserves only diagnostic fields from a worker %s",
+    async (mode) => {
+      const client = new SpawnClient(
+        () =>
+          new NodeWorkerThreads.Worker(
+            `
+          const { parentPort } = require('node:worker_threads');
+          const { EventEmitter } = require('node:events');
+          const { PassThrough } = require('node:stream');
+          const error = Object.assign(new Error('synthetic spawn failure'), {
+            code: 'EAGAIN', errno: -11, syscall: 'spawn', path: '/fixture/gh',
+            stdout: 'private-worker-token', stderr: 'private-worker-token',
+            spawnargs: ['private-worker-token'], env: { GH_TOKEN: 'private-worker-token' },
+          });
+          (${spawnWorker.toString()})({ spawn() {
+            if (${JSON.stringify(mode)} === 'throw') throw error;
+            const child = new EventEmitter();
+            child.stdout = new PassThrough(); child.stderr = new PassThrough();
+            queueMicrotask(() => (${JSON.stringify(mode)} === 'stream-error' ? child.stdout : child).emit('error', error));
+            return child;
+          } }, parentPort);
+          `,
+            { eval: true, execArgv: [] },
+          ),
+      );
+      try {
+        const child = client.spawn("/fixture/gh", [], { stdio: "pipe" });
+        const error: unknown = await child.started.catch((error: unknown) => error);
+        expect(error).toBeInstanceOf(Error);
+        expect(error).toMatchObject({
+          message: "synthetic spawn failure",
+          code: "EAGAIN",
+          errno: -11,
+          syscall: "spawn",
+          path: "/fixture/gh",
+        });
+        for (const key of ["stdout", "stderr", "spawnargs", "env"])
+          expect(error).not.toHaveProperty(key);
+        expect(JSON.stringify(error)).not.toContain("private-worker-token");
+      } finally {
+        await client.close();
+      }
+    },
+  );
+
   it("leaves an unreferenced child alive when the client scope closes", async () => {
     const client = new SpawnClient();
     const child = client.spawn(
@@ -158,7 +204,12 @@ describe("SpawnClient", () => {
     const client = new SpawnClient();
     try {
       const bad = client.spawn("/does/not/exist/robob", [], { detached: true, stdio: "pipe" });
-      await expect(bad.started).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(bad.started).rejects.toMatchObject({
+        code: "ENOENT",
+        errno: -2,
+        syscall: "spawn /does/not/exist/robob",
+        path: "/does/not/exist/robob",
+      });
       const next = client.spawn(process.execPath, ["-e", ""], { detached: true, stdio: "ignore" });
       await next.started;
       expect(await next.exit).toEqual([0, null]);

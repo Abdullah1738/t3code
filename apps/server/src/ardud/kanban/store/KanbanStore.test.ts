@@ -2739,6 +2739,85 @@ it.effect.each([
   }).pipe(Effect.provide(TestLayer)),
 );
 
+it.effect.each([false, true])(
+  "#1603 script reply obligations require a card discussion (%s)",
+  (onCard) =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const talk = { ...discussion(1603), cardId: onCard ? KanbanCardId.make("card-1603") : null };
+      const evaluator = ThreadId.make("eval-1603");
+      yield* store.putDiscussion(talk);
+      const message: KanbanMessage = {
+        discussionId: talk.id,
+        seq: 1,
+        author: { _tag: "script", scriptId: KanbanScriptId.make("script-1603") },
+        authorName: "Sweep",
+        blocks: [{ _tag: "md", text: "Question" }],
+        answers: [],
+        createdAt: at,
+      };
+      yield* store.putMessage(message);
+      assert.isNull(yield* store.ownerWait(talk.id));
+      assert.strictEqual((yield* store.ownerWait(talk.id, true))?.seq, 1);
+      assert.strictEqual(
+        (yield* store.ownerReply(talk.id, evaluator, true))?.answered ?? null,
+        onCard ? false : null,
+      );
+      yield* store.putMessage({
+        ...message,
+        seq: 2,
+        author: { _tag: "evaluator", threadId: ThreadId.make("other-evaluator") },
+      });
+      assert.strictEqual((yield* store.ownerWait(talk.id, true))?.answered, true);
+      assert.strictEqual(
+        (yield* store.ownerReply(talk.id, evaluator, true))?.answered ?? null,
+        onCard ? true : null,
+      );
+    }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect.each(
+  (["owner", "script"] as const).flatMap((author) =>
+    [false, true].map((answered) => ({ author, answered })),
+  ),
+)("#1603 a retained $author post keeps its own answer state ($answered)", ({ author, answered }) =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const talk = { ...discussion(1604), cardId: KanbanCardId.make("card-1604") };
+    yield* store.putDiscussion(talk);
+    const message: KanbanMessage = {
+      discussionId: talk.id,
+      seq: 1,
+      author:
+        author === "owner"
+          ? { _tag: "owner" }
+          : { _tag: "script", scriptId: KanbanScriptId.make("script-1603") },
+      authorName: author,
+      blocks: [{ _tag: "md", text: "Original" }],
+      answers: [],
+      createdAt: at,
+    };
+    yield* store.putMessage(message);
+    if (answered)
+      yield* store.putMessage({
+        ...message,
+        seq: 2,
+        author: { _tag: "evaluator", threadId: ThreadId.make("answering-1603") },
+      });
+    yield* store.putMessage({ ...message, seq: 3 });
+    assert.deepStrictEqual(yield* store.ownerWait(talk.id, true, 1), {
+      seq: 1,
+      createdAt: at,
+      answered,
+    });
+    assert.deepStrictEqual(yield* store.ownerWait(talk.id, true), {
+      seq: 3,
+      createdAt: at,
+      answered: false,
+    });
+  }).pipe(Effect.provide(TestLayer)),
+);
+
 it.effect("caller analytics is a memory lookup and follows card and link writes", () =>
   Effect.gen(function* () {
     const store = yield* KanbanStore.KanbanStore;

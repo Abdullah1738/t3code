@@ -102,6 +102,7 @@ export class McpCall extends Context.Service<
     waitLookupMs?: number;
     phase: Phase;
     saved: boolean | "unknown";
+    dispatchFenceRecovered?: boolean;
     taskLookup?: TaskLookup;
     replyFailure?: "reply_timeout" | "reply_error";
     replyStage?: string;
@@ -270,6 +271,15 @@ export const setSaved = Effect.fnUntraced(function* (saved: boolean) {
   if (call._tag === "Some" && call.value.saved !== true) call.value.saved = saved;
 });
 
+// Recovery belongs to the enclosing delegateTask span, not another analytics span.
+export const dispatchFenceRecovered = Effect.gen(function* () {
+  const call = yield* Effect.serviceOption(McpCall);
+  if (call._tag === "Some") {
+    call.value.dispatchFenceRecovered = true;
+    call.value.phase = "result";
+  }
+});
+
 // readTask owns the lookup span; retain only categories in the call ledger.
 export const setTaskLookup = Effect.fnUntraced(function* (
   lookup: Required<Pick<TaskLookup, "foundBy" | "idCanonical">> & TaskLookup,
@@ -342,6 +352,7 @@ export function callOutcome(
       errorPhase: state.phase,
       props: {
         ...taskLookup,
+        ...(state.dispatchFenceRecovered ? { dispatchFenceRecovered: true } : {}),
         code: "unknown",
         ...interruptionProps(exit.cause),
         ...(state.replySubSteps === undefined ? {} : { subSteps: state.replySubSteps }),
@@ -472,6 +483,7 @@ export function callOutcome(
     ...(state.readOnly && state.taskLookup === undefined ? {} : { saved }),
     props: {
       ...taskLookup,
+      ...(state.dispatchFenceRecovered ? { dispatchFenceRecovered: true } : {}),
       ...(code === "task_not_found" && notFoundReason !== undefined ? { notFoundReason } : {}),
       ...(state.replyStage === undefined ? {} : { phase: state.replyStage }),
       ...(state.replySubSteps === undefined ? {} : { subSteps: state.replySubSteps }),
