@@ -7326,6 +7326,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           providerSessionId: input.providerSessionId,
           providerSession: session,
           events: Stream.fromQueue(events),
+          backgroundTasksEndWithProcess: true,
           ...(sessionExitObserver === undefined
             ? {}
             : {

@@ -1275,31 +1275,57 @@ export const layerWithOptions = (
         readonly onlyIfIdleGeneration?: number;
         readonly onlyIfEntry?: LiveSessionEntry;
         readonly gracefulSubscribers?: boolean;
-      }) =>
-        Effect.acquireUseRelease(
-          removeLiveEntry(input),
-          ([entry, releasedAt]) =>
-            Option.match(entry, {
+        readonly openLockHeld?: true;
+      }) => {
+        const capture = Effect.gen(function* () {
+          const [entry, releasedAt] = yield* removeLiveEntry(input);
+          if (Option.isNone(entry))
+            return {
+              entry,
+              releasedAt,
+              releasedTurns: Exit.succeed<PendingOrchestrationEffectV2[]>([]),
+              releasedBackgroundTasks: [],
+            };
+          const releasedTurns = yield* Effect.exit(
+            readReleasedTurns({
+              entry: entry.value,
+              reason: input.reason,
+              releasedAt,
+              ...(input.detachedThreadId === undefined
+                ? {}
+                : { detachedThreadId: input.detachedThreadId }),
+            }),
+          );
+          // A replacement must not deliver old-turn steers before their release
+          // identity is durable. Adapter teardown can stay blocked for 30 seconds.
+          if (Exit.isSuccess(releasedTurns)) {
+            yield* eventSink.writeWithEffects({ events: [], effects: releasedTurns.value }).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("orchestration-v2.provider-session-release-turns-write-failed", {
+                  providerSessionId: input.providerSessionId,
+                  cause,
+                }),
+              ),
+            );
+          }
+          const releasedBackgroundTasks = yield* readReleasedBackgroundTasks({
+            entry: entry.value,
+            reason: input.reason,
+            ...(input.detachedThreadId === undefined
+              ? {}
+              : { detachedThreadId: input.detachedThreadId }),
+          });
+          return { entry, releasedAt, releasedTurns, releasedBackgroundTasks } as const;
+        });
+        return Effect.acquireUseRelease(
+          input.openLockHeld === true
+            ? capture
+            : sessionOpen.withLock(input.providerSessionId, capture),
+          (captured) =>
+            Option.match(captured.entry, {
               onNone: () => Effect.void,
               onSome: (entry) =>
                 Effect.gen(function* () {
-                  const releasedTurns = yield* Effect.exit(
-                    readReleasedTurns({
-                      entry,
-                      reason: input.reason,
-                      releasedAt,
-                      ...(input.detachedThreadId === undefined
-                        ? {}
-                        : { detachedThreadId: input.detachedThreadId }),
-                    }),
-                  );
-                  const releasedBackgroundTasks = yield* readReleasedBackgroundTasks({
-                    entry,
-                    reason: input.reason,
-                    ...(input.detachedThreadId === undefined
-                      ? {}
-                      : { detachedThreadId: input.detachedThreadId }),
-                  });
                   if (input.cancelIdleFiber !== false) {
                     yield* cancelIdleFiber(entry.idleFiber);
                   }
@@ -1321,15 +1347,23 @@ export const layerWithOptions = (
                     entry,
                     reason: input.reason,
                     ...(input.detail === undefined ? {} : { detail: input.detail }),
-                    releasedBackgroundTasks,
-                    releasedTurns,
+                    releasedBackgroundTasks: captured.releasedBackgroundTasks,
+                    releasedTurns: captured.releasedTurns,
                     ...(input.detachedThreadId === undefined
                       ? {}
                       : { detachedThreadId: input.detachedThreadId }),
-                    releasedAt,
+                    releasedAt: captured.releasedAt,
                   };
+                  const record = Effect.gen(function* () {
+                    const replaced = (yield* Ref.get(sessions)).has(
+                      sessionKey(input.providerSessionId),
+                    );
+                    yield* writeReleaseRecords({ ...records, replaced });
+                  });
                   const recorded = yield* Effect.exit(
-                    writeReleaseRecords({ ...records, replaced: false }),
+                    input.openLockHeld === true
+                      ? record
+                      : sessionOpen.withLock(input.providerSessionId, record),
                   );
                   if (Exit.isFailure(recorded)) {
                     yield* retryReleaseRecords(records);
@@ -1349,7 +1383,7 @@ export const layerWithOptions = (
                   }),
                 ),
             }),
-          ([entry]) =>
+          ({ entry }) =>
             Option.match(entry, {
               onNone: () => Effect.void,
               onSome: (entry) => {
@@ -1399,6 +1433,7 @@ export const layerWithOptions = (
             ),
           ),
         );
+      };
 
       const releaseIfStillIdle = Effect.fn("ProviderSessionManager.releaseIfStillIdle")(
         function* (input: {
@@ -3076,11 +3111,13 @@ export const layerWithOptions = (
                       ? {
                           providerSessionId: input.providerSessionId,
                           reason: "manual_shutdown",
+                          openLockHeld: true,
                           detail: "The provider session start was interrupted.",
                         }
                       : {
                           providerSessionId: input.providerSessionId,
                           reason: "runtime_error",
+                          openLockHeld: true,
                           detail: "Failed to persist the provider-session attachment.",
                         },
                   ).pipe(logReleaseFailure(input.providerSessionId)),

@@ -10396,15 +10396,57 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     );
     const run = input.projection.runs.find((candidate) => candidate.id === attempt?.runId);
     const rootNode = input.projection.nodes.find((candidate) => candidate.id === run?.rootNodeId);
-    if (
-      attempt === undefined ||
-      run === undefined ||
-      rootNode === undefined ||
-      run.activeAttemptId !== attempt.id ||
-      run.status !== "running" ||
-      attempt.status !== "running"
-    )
-      return;
+    if (attempt === undefined || run === undefined || rootNode === undefined) return;
+    const current =
+      run.activeAttemptId === attempt.id &&
+      run.status === "running" &&
+      attempt.status === "running";
+    if (!current) {
+      if (
+        input.command.type !== "thread.background-work.settle" ||
+        input.command.runOnly !== true ||
+        input.command.preserveBackgroundWork === true
+      )
+        return;
+      // A replacement owns the run now; only the old turn's native children died.
+      const owned = new Set(
+        input.projection.subagents
+          .filter(
+            (task) =>
+              task.origin === "provider_native" &&
+              task.runId === run.id &&
+              input.projection.nodes.some(
+                (node) => node.id === task.id && node.providerTurnId === input.providerTurn.id,
+              ),
+          )
+          .map((task) => task.id),
+      );
+      let previousSize = -1;
+      while (previousSize !== owned.size) {
+        previousSize = owned.size;
+        for (const node of input.projection.nodes)
+          if (node.parentNodeId !== null && owned.has(node.parentNodeId)) owned.add(node.id);
+      }
+      input = {
+        ...input,
+        projection: {
+          ...input.projection,
+          subagents: input.projection.subagents.filter((task) => owned.has(task.id)),
+          nodes: input.projection.nodes.filter((node) => owned.has(node.id)),
+          messages: input.projection.messages.filter(
+            (message) => message.nodeId !== null && owned.has(message.nodeId),
+          ),
+          turnItems: input.projection.turnItems.filter(
+            (item) =>
+              (item.nodeId !== null && owned.has(item.nodeId)) ||
+              (item.type === "subagent" && item.subagentId !== null && owned.has(item.subagentId)),
+          ),
+          runtimeRequests: input.projection.runtimeRequests.filter((request) =>
+            owned.has(request.nodeId),
+          ),
+        },
+      };
+    }
     const emitEvent = emit(input.events, input.command);
     const base = {
       threadId: input.command.threadId,
@@ -10413,7 +10455,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       providerInstanceId: run.providerInstanceId,
       occurredAt: input.now,
     };
-    if (input.providerTurn.status === "running") {
+    if (current && input.providerTurn.status === "running") {
       yield* emitEvent({
         ...base,
         type: "provider-turn.updated",
@@ -10424,19 +10466,24 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         },
       });
     }
-    yield* emitEvent({
-      ...base,
-      type: "run-attempt.updated",
-      payload: {
-        ...attempt,
-        status: "interrupted",
-        completedAt: input.now,
-      },
-    });
+    if (current)
+      yield* emitEvent({
+        ...base,
+        type: "run-attempt.updated",
+        payload: {
+          ...attempt,
+          status: "interrupted",
+          completedAt: input.now,
+        },
+      });
     const providerThread = input.projection.providerThreads.find(
       (candidate) => candidate.id === input.providerTurn.providerThreadId,
     );
-    if (providerThread?.status === "active" && providerThread.lastRunOrdinal === run.ordinal) {
+    if (
+      current &&
+      providerThread?.status === "active" &&
+      providerThread.lastRunOrdinal === run.ordinal
+    ) {
       yield* emitEvent({
         ...base,
         type: "provider-thread.updated",
@@ -10453,7 +10500,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     );
     // Remote tasks can outlive the released wrapper, including their child nodes.
     let previousSize = -1;
-    while (preserveBackgroundWork && previousSize !== delegatedNodeIds.size) {
+    while (previousSize !== delegatedNodeIds.size) {
+      if (!preserveBackgroundWork) break;
       previousSize = delegatedNodeIds.size;
       for (const node of input.projection.nodes) {
         if (node.parentNodeId !== null && delegatedNodeIds.has(node.parentNodeId))
@@ -10491,7 +10539,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             .filter((node) => node.runId === run.id && !delegatedNodeIds.has(node.id))
             .map((node) => [node.id, node]),
         ),
-        turnItems: new Map(),
+        turnItems: new Map(
+          input.projection.turnItems.flatMap((item) =>
+            item.type === "subagent" &&
+            item.runId === run.id &&
+            item.origin === "provider_native" &&
+            item.subagentId !== null &&
+            !delegatedNodeIds.has(item.subagentId)
+              ? [[item.subagentId, item] as const]
+              : [],
+          ),
+        ),
         childTurnItems: new Map(
           input.projection.turnItems
             .filter(
@@ -10527,6 +10585,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         },
       });
     }
+    if (!current) return;
     let cancelReason =
       input.command.type === "run.interrupt"
         ? interruptCancelReason(input.command)
@@ -10929,11 +10988,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (
         stoppedRun === undefined ||
         (["preparing", "starting", "running"].includes(stoppedRun.status) &&
-          stoppedRun.activeAttemptId !== stopped.providerTurn?.runAttemptId)
+          stoppedRun.activeAttemptId !== stopped.providerTurn?.runAttemptId &&
+          command.runOnly !== true)
       )
         return;
       const now = yield* DateTime.now;
-      if (stopped.providerTurn !== undefined && stoppedRun.status === "running") {
+      if (
+        stopped.providerTurn !== undefined &&
+        (stoppedRun.status === "running" || command.runOnly === true)
+      ) {
         const output = yield* projectionStore
           .getThreadRecords(command.threadId, ["messages"], {
             messageRunIds: [stoppedRun.id],

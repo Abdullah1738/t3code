@@ -378,6 +378,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
     readonly afterResume?: Effect.Effect<void>;
     readonly spawnBeforeOpen?: boolean;
     readonly scopeCloseReached?: Deferred.Deferred<void>;
+    readonly afterClose?: Effect.Effect<void>;
     readonly driver?: ProviderDriverKind;
     readonly sessionUpdateFanout?: "interested_threads";
     readonly liveSessions?: Map<ProviderSessionId, OrchestrationV2ProviderSession>;
@@ -391,7 +392,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
     Ref.update(state, (current) => ({
       ...current,
       closeCount: current.closeCount + 1,
-    })),
+    })).pipe(Effect.andThen(options.afterClose ?? Effect.void)),
   );
   // Registered after countClose so it runs first on scope close, wedging the
   // close before the closeCount finalizer, like a provider process that never
@@ -556,6 +557,7 @@ function layerTest(input: {
   readonly afterResume?: Effect.Effect<void>;
   readonly spawnBeforeOpen?: boolean;
   readonly scopeCloseReached?: Deferred.Deferred<void>;
+  readonly afterClose?: Effect.Effect<void>;
   readonly serverSettingsLayer?: ReturnType<typeof ServerSettings.layerTest>;
   readonly projectServiceLayer?: Layer.Layer<ProjectService.ProjectService>;
   readonly sessionWriteHook?: Ref.Ref<SessionWriteHook>;
@@ -621,6 +623,7 @@ function layerTest(input: {
       ...(input.ensureThread === undefined ? {} : { ensureThread: input.ensureThread }),
       ...(input.afterResume === undefined ? {} : { afterResume: input.afterResume }),
       ...(input.spawnBeforeOpen === undefined ? {} : { spawnBeforeOpen: input.spawnBeforeOpen }),
+      ...(input.afterClose === undefined ? {} : { afterClose: input.afterClose }),
       ...(input.scopeCloseReached === undefined
         ? {}
         : { scopeCloseReached: input.scopeCloseReached }),
@@ -3506,6 +3509,7 @@ it.effect("ProviderSessionManagerV2 interrupts event subscriptions on server shu
 it.effect("ProviderSessionManagerV2 drains subscribers when the provider stops", () =>
   Effect.gen(function* () {
     const state = yield* Ref.make(emptyState);
+    const closed = yield* Deferred.make<void>();
     const effect = Effect.gen(function* () {
       const eventSink = yield* EventSink.EventSinkV2;
       const idAllocator = yield* IdAllocator.IdAllocatorV2;
@@ -3559,6 +3563,7 @@ it.effect("ProviderSessionManagerV2 drains subscribers when the provider stops",
       yield* Queue.end(adapterQueue!);
 
       const events = Array.from(yield* Fiber.join(collected));
+      yield* Deferred.await(closed);
       assert.deepEqual(
         events.map((event) => event.type),
         ["turn.terminal", "provider_session.updated"],
@@ -3567,7 +3572,15 @@ it.effect("ProviderSessionManagerV2 drains subscribers when the provider stops",
       assert.equal((yield* Ref.get(state)).closeCount, 1);
     });
 
-    yield* effect.pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 60_000 })));
+    yield* effect.pipe(
+      Effect.provide(
+        layerTest({
+          state,
+          idleTimeoutMs: 60_000,
+          afterClose: Deferred.succeed(closed, undefined).pipe(Effect.asVoid),
+        }),
+      ),
+    );
   }),
 );
 
@@ -4425,7 +4438,14 @@ it.effect("ProviderSessionManagerV2 releases idle sessions without sweeping all 
       });
 
       yield* TestClock.adjust("1 second");
-      yield* Effect.yieldNow;
+      yield* eventSink.stream({ threadId }).pipe(
+        Stream.filter(
+          ({ event }) =>
+            event.type === "provider-session.updated" && event.payload.status === "stopped",
+        ),
+        Stream.take(1),
+        Stream.runDrain,
+      );
 
       const liveSession = yield* manager.get(providerSessionId);
       const runtimeState = yield* Ref.get(state);
@@ -4632,13 +4652,22 @@ it.effect("ProviderSessionManagerV2 clears the background roster of an idle-rele
     const state = yield* Ref.make(emptyState);
     const effect = Effect.gen(function* () {
       const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
-      const { providerSessionId, rosters } = yield* openSessionWithBackgroundCommand(
-        "provider-session-manager-idle-roster",
-      );
+      const eventSink = yield* EventSink.EventSinkV2;
+      const { threadId, providerSessionId, providerThreads, rosters } =
+        yield* openSessionWithBackgroundCommand("provider-session-manager-idle-roster");
       assert.deepStrictEqual(yield* rosters, [["dev-server"], ["dev-server"]]);
 
       yield* TestClock.adjust("1 second");
-      yield* Effect.yieldNow;
+      yield* eventSink.stream({ threadId }).pipe(
+        Stream.filter(
+          ({ event }) =>
+            event.type === "provider-thread.updated" &&
+            event.payload.id === providerThreads[0]!.id &&
+            event.payload.pendingBackgroundTasks?.length === 0,
+        ),
+        Stream.take(1),
+        Stream.runDrain,
+      );
 
       assert.isTrue(Option.isNone(yield* manager.get(providerSessionId)));
       assert.deepStrictEqual(yield* rosters, [[], ["dev-server"]]);

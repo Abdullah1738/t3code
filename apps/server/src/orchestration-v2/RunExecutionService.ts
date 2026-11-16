@@ -1205,6 +1205,7 @@ export const layer: Layer.Layer<
         const makeFailedTerminalEvent = (
           failure: OrchestrationV2ProviderFailure,
           failureItemOrdinal: number,
+          childrenContinue = false,
         ): ProviderTerminalEvent => ({
           type: "turn.terminal",
           driver: input.providerThread.driver,
@@ -1219,6 +1220,7 @@ export const layer: Layer.Layer<
           failureItemOrdinal,
           status: "failed",
           failure,
+          ...(childrenContinue ? { childTurnsContinue: true } : {}),
           threadDisposition: "reusable",
         });
         const responseStreamingMode = yield* Effect.gen(function* () {
@@ -2238,6 +2240,7 @@ export const layer: Layer.Layer<
                       class: "unknown",
                     }),
                     latestItemOrdinal + 1,
+                    input.session.backgroundTasksEndWithProcess !== true,
                   ),
                   failureItemPersisted: false,
                   refreshAfterTurn,

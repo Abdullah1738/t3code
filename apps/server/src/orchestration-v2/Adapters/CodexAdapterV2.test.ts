@@ -2106,6 +2106,20 @@ describe("CodexAdapterV2 session initialize", () => {
   const replayPreamble = (nativeThreadId: string) =>
     codexReplayPreamble({ nativeThreadId, nativeTurnId: "unused", prompt: "unused" });
 
+  it.effect("marks native background work as ending with the app-server", () =>
+    Effect.gen(function* () {
+      const session = yield* openReplaySession(
+        makeCodexReplayTranscript({ scenario: "process-owned-work", entries: [] }),
+      );
+      assert.isTrue(session.runtime.backgroundTasksEndWithProcess);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
   it.effect.each([
     "success",
     "invalid",

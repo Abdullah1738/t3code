@@ -5430,12 +5430,72 @@ it.effect("keeps completed runs completed when pull request refresh fails", () =
   }),
 );
 
+it.effect.each([
+  { provider: "codex", processOwned: true },
+  { provider: "opencode", processOwned: false },
+] as const)(
+  "applies $provider child lifetime on live subscriber failure",
+  ({ provider, processOwned }) =>
+    Effect.gen(function* () {
+      const key = `session-subscriber-failure:${provider}`;
+      const ids = backgroundScenarioIds(key);
+      const providerDriver = ProviderDriverKind.make(provider);
+      const result = yield* captureRootRunTermination({
+        key,
+        providerDriver,
+        backgroundTasksEndWithProcess: processOwned,
+        shouldFinalizeRun: () => Effect.succeed(true),
+        awaitSessionExit: Effect.void,
+        subscribeEvents: () =>
+          Effect.succeed({
+            events: Stream.make(
+              subagentEvent(ids, "running"),
+              {
+                type: "node.updated",
+                driver: providerDriver,
+                node: makeRunOwnedSubagentNodeFixture({ ids, status: "running" }),
+              },
+              backgroundTurnItemEvent(ids, "subagent", "running", 1),
+            ).pipe(
+              Stream.concat(
+                Stream.fail(
+                  new ProviderAdapter.ProviderAdapterEventStreamError({
+                    driver: providerDriver,
+                    providerSessionId: ProviderSessionId.make(`session:${key}`),
+                    cause: "Provider session released: runtime_error.",
+                  }),
+                ),
+              ),
+            ),
+            close: Effect.void,
+          }),
+      });
+      assert.deepEqual(result.observed, ["run:failed", "pull-requests-refreshed"]);
+      const childEvents = result.finalEvents.filter(
+        (event) =>
+          event.type === "subagent.updated" ||
+          (event.type === "node.updated" && event.payload.id === ids.subagentNodeId) ||
+          (event.type === "turn-item.updated" && event.payload.type === "subagent"),
+      );
+      assert.lengthOf(childEvents, processOwned ? 3 : 0);
+      for (const event of childEvents) {
+        if (
+          event.type === "subagent.updated" ||
+          event.type === "node.updated" ||
+          event.type === "turn-item.updated"
+        )
+          assert.equal(event.payload.status, "failed");
+      }
+    }),
+);
+
 function captureRootRunTermination(input: {
   readonly key: string;
   readonly cancelMetadata?: Pick<OrchestrationV2Run, "cancelReason" | "cancelDetail">;
   readonly loadCancelMetadata?: RunExecutionService.RunExecutionServiceV2StartRootRunInput["loadRunCancelMetadata"];
   readonly unobservedProviderTurn?: boolean;
   readonly providerDriver?: ProviderDriverKind;
+  readonly backgroundTasksEndWithProcess?: boolean;
   readonly onTerminalRun?: Effect.Effect<void>;
   readonly delegated?: boolean;
   readonly legacyOwnership?:
@@ -5636,6 +5696,9 @@ function captureRootRunTermination(input: {
         } as OrchestrationV2AppThread,
         providerSessionId: input.sharedSessionId ?? ProviderSessionId.make(`session:${input.key}`),
         session: {
+          ...(input.backgroundTasksEndWithProcess === false
+            ? {}
+            : { backgroundTasksEndWithProcess: true }),
           events: Stream.empty,
           subscribeEvents: (
             input.subscribeEvents?.(ids) ??

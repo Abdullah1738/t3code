@@ -11,8 +11,9 @@ import {
   ProviderTurnId,
   RunAttemptId,
   ThreadId,
+  TurnItemId,
 } from "@t3tools/contracts";
-import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -47,7 +48,7 @@ const sessionLoss = ({
   reason: Sessions.ProviderSessionReleaseReason;
   replace?: boolean;
   promotion?: boolean;
-  accepted?: "before recovery" | "after recovery" | "replacement session";
+  accepted?: "before recovery" | "after recovery" | "replacement session" | "blocked closure";
   faultRead?: boolean;
   activeTurnOnly?: boolean;
   delivered?: boolean;
@@ -89,7 +90,19 @@ const sessionLoss = ({
               lastError: null,
             },
             events: Stream.never,
-            backgroundTasksEndWithProcess: instance !== "opencode",
+            ...(instance === "opencode" ? {} : { backgroundTasksEndWithProcess: true }),
+            steerTurn: ({
+              providerThread,
+              providerTurnId,
+            }: Parameters<ProviderAdapter.ProviderAdapterV2SessionRuntime["steerTurn"]>[0]) =>
+              Effect.fail(
+                new ProviderAdapter.ProviderAdapterSteerRunError({
+                  driver,
+                  providerThreadId: providerThread.id,
+                  providerTurnId,
+                  cause: "The replacement does not own the old turn.",
+                }),
+              ),
           } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime;
         }),
     } as ProviderAdapter.ProviderAdapterV2["Service"];
@@ -215,7 +228,7 @@ const sessionLoss = ({
             },
           ],
         });
-        if (instance === "opencode" || instance === "codex") {
+        {
           const childId = NodeId.make(`remote:${threadId}`);
           yield* sink.write({
             events: [
@@ -229,6 +242,7 @@ const sessionLoss = ({
                   id: childId,
                   kind: "subagent",
                   parentNodeId: root.id,
+                  providerTurnId: turn.id,
                   status: "running",
                   checkpointScopeId: null,
                 },
@@ -258,6 +272,36 @@ const sessionLoss = ({
                   startedAt: now,
                   completedAt: null,
                   updatedAt: now,
+                },
+              },
+              {
+                id: EventId.make(`remote-item:${threadId}`),
+                type: "turn-item.updated",
+                threadId,
+                occurredAt: now,
+                payload: {
+                  id: TurnItemId.make(`remote-item:${threadId}`),
+                  threadId,
+                  runId: run.id,
+                  nodeId: root.id,
+                  providerThreadId: providerThread.id,
+                  providerTurnId: turn.id,
+                  nativeItemRef: null,
+                  parentItemId: null,
+                  ordinal: 1,
+                  status: "running",
+                  title: null,
+                  startedAt: now,
+                  completedAt: null,
+                  updatedAt: now,
+                  type: "subagent",
+                  subagentId: childId,
+                  origin: "provider_native",
+                  driver,
+                  providerInstanceId: instanceId,
+                  childThreadId: null,
+                  prompt: "remote task",
+                  result: null,
                 },
               },
             ],
@@ -390,9 +434,29 @@ const sessionLoss = ({
             },
           ],
         });
+        const duringReplacement = yield* projections.getThreadProjection(target.threadId);
+        const child = duringReplacement.subagents[0]!;
+        const childNode = duringReplacement.nodes.find((node) => node.id === child.id)!;
+        const replacementChild = NodeId.make("replacement-child");
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make("replacement-child-node"),
+              type: "node.updated",
+              threadId: target.threadId,
+              occurredAt: now,
+              payload: { ...childNode, id: replacementChild, providerTurnId: replacementTurn },
+            },
+            {
+              id: EventId.make("replacement-child-task"),
+              type: "subagent.updated",
+              threadId: target.threadId,
+              occurredAt: now,
+              payload: { ...child, id: replacementChild, startedAt: now, updatedAt: now },
+            },
+          ],
+        });
       }
-      yield* Deferred.succeed(finishClose, undefined);
-      yield* Fiber.join(releasing);
       const recordedSteerEffect =
         accepted === undefined
           ? undefined
@@ -406,6 +470,28 @@ const sessionLoss = ({
               request: { ...recordedSteerEffect.request, providerAccepted: true },
             }
           : recordedSteerEffect;
+      if (accepted === "blocked closure") {
+        yield* sessions.open({
+          threadId: target.threadId,
+          providerSessionId: sessionId,
+          modelSelection,
+          runtimePolicy: {
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            cwd: process.cwd(),
+          },
+        });
+        assert.isFalse(yield* Deferred.isDone(finishClose));
+        yield* executor.execute(steerEffect!);
+        const duringClose = yield* projections.getThreadProjection(target.threadId);
+        assert.equal(duringClose.providerTurns[0]?.status, "running");
+        assert.lengthOf(
+          duringClose.runs.filter((run) => run.userMessageId === acceptedCommand.messageId),
+          1,
+        );
+      }
+      yield* Deferred.succeed(finishClose, undefined);
+      yield* Fiber.join(releasing);
       if (accepted === "before recovery") yield* executor.execute(steerEffect!);
       if (faultRead) {
         const effect = Option.getOrThrow(
@@ -480,6 +566,14 @@ const sessionLoss = ({
             current.providerTurns.find((turn) => turn.id === "replacement-turn")?.status,
             "running",
           );
+          assert.equal(
+            current.subagents.find((child) => child.id === "replacement-child")?.status,
+            "running",
+          );
+          assert.equal(
+            current.nodes.find((node) => node.id === "replacement-child")?.status,
+            "running",
+          );
         }
         if (instance === "opencode") {
           assert.deepEqual(
@@ -487,19 +581,29 @@ const sessionLoss = ({
               ?.pendingBackgroundTasks,
             [{ taskId: "remote-work", kind: "subagent" }],
           );
-          assert.equal(current.subagents[0]?.status, "running");
+          assert.equal(
+            current.subagents.find((task) => task.id === `remote:${target.threadId}`)?.status,
+            "running",
+          );
           assert.equal(
             current.nodes.find((node) => node.id === `remote:${target.threadId}`)?.status,
             "running",
           );
         }
-        if (instance === "codex") {
-          assert.equal(current.subagents[0]?.status, "interrupted");
+        if (instance !== "opencode") {
+          assert.equal(
+            current.subagents.find((task) => task.id === `remote:${target.threadId}`)?.status,
+            "interrupted",
+          );
           assert.equal(
             current.nodes.find((node) => node.id === `remote:${target.threadId}`)?.status,
             "interrupted",
           );
         }
+        assert.equal(
+          current.turnItems.find((item) => item.id === `remote-item:${target.threadId}`)?.status,
+          instance === "opencode" ? "running" : "interrupted",
+        );
         if (!replace || index !== 0) {
           assert.equal(
             current.attempts.find((attempt) => attempt.id === target.attempt.id)?.status,
@@ -540,9 +644,13 @@ it.effect.each([
   sessionLoss,
 );
 
-it.effect.each(["before recovery", "after recovery", "replacement session"] as const)(
-  "queues an accepted steer after session loss (%s)",
-  (accepted) => sessionLoss({ instance: "codex-cu", reason: "runtime_error", accepted }),
+it.effect.each([
+  "before recovery",
+  "after recovery",
+  "replacement session",
+  "blocked closure",
+] as const)("queues an accepted steer after session loss (%s)", (accepted) =>
+  sessionLoss({ instance: "codex-cu", reason: "runtime_error", accepted }),
 );
 it.effect("retries session-loss settlement after a transient planning rejection", () =>
   sessionLoss({ instance: "codex-cu", reason: "runtime_error", faultRead: true }),
