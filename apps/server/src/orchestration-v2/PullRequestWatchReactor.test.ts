@@ -393,7 +393,6 @@ it.effect("reports remarks without recording check state on a settling head", ()
 
 it.effect.each([
   "provider-unsupported",
-  "cli-missing",
   "cli-unauthenticated",
 ] satisfies PullRequestUnavailableReason[])("ends an unavailable watch immediately: %s", (reason) =>
   Effect.gen(function* () {
@@ -411,12 +410,80 @@ it.effect.each([
   }),
 );
 
-it.effect("retries transient host failures eight times and reports the last error", () =>
+it.effect.each(["cli-missing", "failed"] as const)(
+  "survives one %s tool failure, resets on recovery, and stops at its consecutive failure limit",
+  (reason) =>
+    Effect.gen(function* () {
+      let failing = true;
+      const failure =
+        reason === "cli-missing"
+          ? new PullRequestUnavailableError({ reason })
+          : new PullRequestOperationError({
+              operation: "detail",
+              detail: "The GitHub CLI could not hand over a credential",
+              cause: new PullRequestProviderError({
+                provider: SourceControlProviderKind.make("github"),
+                operation: "detail",
+                reason: "failed",
+                detail: "The GitHub CLI could not hand over a credential",
+              }),
+            });
+      const harness = yield* makeHarness({
+        detail: () => (failing ? Effect.fail(failure) : Effect.succeed(greenDetail())),
+        activity: () =>
+          Effect.succeed({
+            comments: [],
+            reviewThreads: [],
+            commits: [],
+            commentCount: 0,
+            commentsTruncated: false,
+          }),
+      });
+      yield* harness.reactor.sweep;
+      assert.isDefined(harness.watch());
+      assert.deepStrictEqual(harness.commands, []);
+      failing = false;
+      yield* TestClock.adjust("2 minutes");
+      yield* harness.reactor.sweep;
+      assert.isDefined(harness.watch());
+      failing = true;
+      const limit = reason === "cli-missing" ? 3 : 8;
+      for (let attempt = 0; attempt < limit - 1; attempt++) {
+        yield* TestClock.adjust("2 minutes");
+        yield* harness.reactor.sweep;
+        assert.isDefined(harness.watch());
+      }
+      yield* TestClock.adjust("2 minutes");
+      yield* harness.reactor.sweep;
+      assert.isUndefined(harness.watch());
+      const stopped = harness.commands.filter((command) => command.watch === null);
+      assert.lengthOf(stopped, 1);
+      assert.include(stopped[0]!.wake?.text ?? "", `${limit} consecutive unsuccessful reads`);
+      assert.include(stopped[0]!.wake?.text ?? "", "watch_pull_request");
+    }),
+);
+
+it.effect.each([
+  { provider: null, detail: "Host unreachable: connection timed out" },
+  { provider: "github", detail: "Host unreachable: connection timed out" },
+  { provider: "github", detail: "GitHub returned HTTP 503" },
+  { provider: "forgejo", detail: "Forgejo returned HTTP 502" },
+])("retries $provider host failures eight times: $detail", ({ provider, detail }) =>
   Effect.gen(function* () {
     const { reactor, commands } = yield* makeFailureHarness(
       new PullRequestOperationError({
         operation: "detail",
-        detail: "Host unreachable: connection timed out",
+        detail,
+        ...(provider === null
+          ? {}
+          : {
+              cause: new PullRequestProviderError({
+                provider: SourceControlProviderKind.make(provider),
+                operation: "detail",
+                reason: "failed",
+                detail,
+              }),
+            }),
       }),
     );
     for (let attempt = 0; attempt < 7; attempt++) yield* reactor.sweep;
@@ -424,8 +491,8 @@ it.effect("retries transient host failures eight times and reports the last erro
     yield* reactor.sweep;
     assert.strictEqual(commands.length, 1);
     assert.isNull(commands[0]!.watch);
-    assert.include(commands[0]!.wake?.text ?? "", "8");
-    assert.include(commands[0]!.wake?.text ?? "", "Host unreachable: connection timed out");
+    assert.include(commands[0]!.wake?.text ?? "", "8 consecutive unsuccessful reads");
+    assert.include(commands[0]!.wake?.text ?? "", detail);
   }),
 );
 
