@@ -151,6 +151,7 @@ const probe = (name: string) =>
     }),
   );
 const decodeAnalyticsEvent = Schema.decodeEffect(AnalyticsEvent);
+const decodeAnalyticsEventSync = Schema.decodeUnknownSync(AnalyticsEvent);
 const args = { clientRequestId: "private retry id", boardId: "board-robob", card: "#1301" };
 const isAnalyticsEvent = Schema.is(AnalyticsEvent);
 
@@ -2142,6 +2143,48 @@ it.effect("the canonical target replaces caller attribution and survives depende
       callerCardStage: "working",
     });
   }),
+);
+
+it.effect.each([false, true])(
+  "records the final outcome after a recovered dispatch fence (waitTimedOut=%s)",
+  (waitTimedOut) =>
+    Effect.gen(function* () {
+      const state: McpCall.McpCall["Service"] = {
+        callerResolved: true,
+        callerResolveMs: 0,
+        readerLane: "foreground",
+        phase: "handler",
+        saved: "unknown",
+      };
+      yield* McpCall.failedPhase("dispatch").pipe(Effect.provideService(McpCall.McpCall, state));
+      yield* McpCall.dispatchFenceRecovered.pipe(Effect.provideService(McpCall.McpCall, state));
+      yield* McpCall.setSaved(true).pipe(Effect.provideService(McpCall.McpCall, state));
+      const result = McpCall.callOutcome(
+        Exit.succeed(
+          new McpSchema.CallToolResult({
+            content: [],
+            structuredContent: { taskId: "task", waitTimedOut },
+          }),
+        ),
+        state,
+      );
+      expect(result).toMatchObject({
+        outcome: waitTimedOut ? "timeout" : "ok",
+        saved: true,
+        props: { dispatchFenceRecovered: true },
+      });
+      expect(result.errorTag).toBe(waitTimedOut ? "wait_timeout" : undefined);
+      expect(result.errorPhase).toBe(waitTimedOut ? "result" : undefined);
+      expect(() =>
+        decodeAnalyticsEventSync({
+          ts: "2026-11-16T00:00:00.000Z",
+          kind: "mcp.call",
+          surface: "server",
+          route: "mcp",
+          ...result,
+        }),
+      ).not.toThrow();
+    }),
 );
 
 it("does not take refusal metadata from a successful result body", () => {

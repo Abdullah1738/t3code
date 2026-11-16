@@ -317,6 +317,7 @@ const GeneralEvent = Schema.Struct({
         ]),
       ),
       idCanonical: Schema.optionalKey(Schema.Boolean),
+      dispatchFenceRecovered: Schema.optionalKey(Schema.Boolean),
       idShape: Schema.optionalKey(
         Schema.Literals(["task_id", "thread_id", "child_thread_id", "empty", "other"]),
       ),
