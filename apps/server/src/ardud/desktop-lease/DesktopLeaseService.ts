@@ -1,5 +1,6 @@
 import { ThreadId } from "@t3tools/contracts";
 import * as Context from "effect/Context";
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
@@ -32,6 +33,29 @@ type StoreOptions = {
   readonly now?: () => number;
   readonly factory?: (options: { filename?: string; now?: () => number }) => DesktopLease;
 };
+
+// Each measured phase owns its span; this wrapper only records the elapsed time on exit.
+const measureStart = Effect.fnUntraced(function* <A, E, R>(
+  phase: "total" | "caller" | "lease" | "runningTurn" | "persistence",
+  toolUseId: string,
+  operation: Effect.Effect<A, E, R>,
+) {
+  const started = yield* Clock.currentTimeMillis;
+  return yield* operation.pipe(
+    Effect.onExit((exit) =>
+      Effect.gen(function* () {
+        const ended = yield* Clock.currentTimeMillis;
+        yield* Effect.logInfo("Desktop lease call-start timing", {
+          toolUseId,
+          phase,
+          durationMs: ended - started,
+          outcome: exit._tag,
+        });
+      }),
+    ),
+    Effect.withSpan(`DesktopLease.callStart.${phase}`, { attributes: { toolUseId } }),
+  );
+});
 
 export class DesktopLeaseService extends Context.Service<
   DesktopLeaseService,
@@ -76,29 +100,43 @@ const make = Effect.fn("DesktopLeaseService.make")(function* (options: StoreOpti
   // Opening is synchronous, so concurrent calls cannot construct two stores in this layer.
   const withStore = Effect.fn("DesktopLease.withStore")(function* <A>(
     operation: (store: DesktopLease) => A,
+    toolUseId?: string,
   ) {
-    const current = yield* Effect.try({
-      try: () => {
-        store ??= factory(storeOptions);
-        return { store, lease: store.currentLease() };
-      },
-      catch: failure,
-    });
+    const measure = <B, E, R>(
+      phase: "lease" | "runningTurn" | "persistence",
+      effect: Effect.Effect<B, E, R>,
+    ) => (toolUseId === undefined ? effect : measureStart(phase, toolUseId, effect));
+    const current = yield* measure(
+      "lease",
+      Effect.try({
+        try: () => {
+          store ??= factory(storeOptions);
+          return { store, lease: store.currentLease() };
+        },
+        catch: failure,
+      }),
+    );
     const { lease } = current;
     const running =
       lease?.state === "held"
-        ? yield* projection.getRunningTurnContext(ThreadId.make(lease.childThreadId)).pipe(
-            Effect.map((context) => context.run?.status === "running"),
-            Effect.orElseSucceed(() => false),
+        ? yield* measure(
+            "runningTurn",
+            projection.getRunningTurnContext(ThreadId.make(lease.childThreadId)).pipe(
+              Effect.map((context) => context.run?.status === "running"),
+              Effect.orElseSucceed(() => false),
+            ),
           )
         : false;
-    return yield* Effect.try({
-      try: () => {
-        if (running && lease) current.store.touchHolder(lease.childThreadId, lease.ticket);
-        return operation(current.store);
-      },
-      catch: failure,
-    });
+    return yield* measure(
+      "persistence",
+      Effect.try({
+        try: () => {
+          if (running && lease) current.store.touchHolder(lease.childThreadId, lease.ticket);
+          return operation(current.store);
+        },
+        catch: failure,
+      }),
+    );
   });
 
   yield* Effect.addFinalizer(() => Effect.sync(() => store?.close()));
@@ -139,8 +177,15 @@ const make = Effect.fn("DesktopLeaseService.make")(function* (options: StoreOpti
       return yield* withStore((store) => store.release(resolved, ticket));
     }),
     callStart: Effect.fn("DesktopLease.callStart")(function* (caller, toolUseId) {
-      const resolved = yield* resolveCaller(caller);
-      return yield* withStore((store) => store.callStart(resolved, toolUseId));
+      yield* Effect.annotateCurrentSpan({ toolUseId });
+      return yield* measureStart(
+        "total",
+        toolUseId,
+        Effect.gen(function* () {
+          const resolved = yield* measureStart("caller", toolUseId, resolveCaller(caller));
+          return yield* withStore((store) => store.callStart(resolved, toolUseId), toolUseId);
+        }),
+      );
     }),
     callEnd: Effect.fn("DesktopLease.callEnd")(function* (toolUseId, outcome) {
       return yield* withStore((store) => store.callEnd(toolUseId, outcome));
