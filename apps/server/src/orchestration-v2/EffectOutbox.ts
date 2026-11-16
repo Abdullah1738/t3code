@@ -327,6 +327,11 @@ export interface EffectOutboxV2Shape {
   readonly pruneSettled: Effect.Effect<number, EffectOutboxError>;
 }
 
+export class ExecutingEffect extends Context.Reference<OrchestrationEffectV2 | undefined>(
+  "t3/orchestration-v2/ExecutingEffect",
+  { defaultValue: () => undefined },
+) {}
+
 export class EffectOutboxV2 extends Context.Service<EffectOutboxV2, EffectOutboxV2Shape>()(
   "t3/orchestration-v2/EffectOutbox/EffectOutboxV2",
 ) {}

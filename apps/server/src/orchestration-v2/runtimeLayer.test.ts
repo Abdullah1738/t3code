@@ -1,5 +1,6 @@
 import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
 import * as RunStartDeadline from "./RunStartDeadline.ts";
+import * as Analytics from "../ardud/analytics/Analytics.ts";
 import * as ProviderStartProgress from "../ardud/orchestration/ProviderStartProgress.ts";
 import {
   PROVIDER_START_CLEANUP_TIMEOUT_MS,
@@ -25,6 +26,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import { vi } from "vite-plus/test";
 import {
+  type AnalyticsEvent,
   type ApplicationStoredEvent,
   CheckpointId,
   CheckpointRef,
@@ -9749,6 +9751,161 @@ const layerDeadlineTest = layerTestWithContinuation().pipe(
   Layer.provide(Layer.succeed(RestartPacing.RestartLoad, () => 0)),
 );
 
+it.effect.each([
+  ["restart_admission", false],
+  ["restart_admission", true],
+  ["provider", false],
+] as const)(
+  "self-cancelled %s expiry drains FIFO (admission full=%s)",
+  ([phase, initiallyFull]) => {
+    const rows: AnalyticsEvent[] = [];
+    const drained = Deferred.makeUnsafe<void>();
+    return Effect.gen(function* () {
+      const engine = yield* Orchestrator.OrchestratorV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const { threadId, projection } = yield* createDeadlineThread(`self-cancel-${phase}`);
+      const run = projection.runs[0]!;
+      const deadline = yield* DateTime.now;
+      if (phase === "provider")
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make(`${threadId}:arm`),
+              type: "run.updated",
+              threadId,
+              runId: run.id,
+              occurredAt: deadline,
+              payload: { ...run, providerStartDeadlineAt: deadline },
+            },
+          ],
+        });
+      const failurePublished = yield* Deferred.make<void>();
+      const subscribed = yield* Deferred.make<void>();
+      const promoted = yield* Deferred.make<void>();
+      yield* sink
+        .stream({
+          threadId,
+          eventType: "run.updated",
+          verifyReplay: () => Deferred.succeed(subscribed, undefined),
+        })
+        .pipe(
+          Stream.runForEach(({ event }) =>
+            Effect.gen(function* () {
+              if (
+                event.type === "run.updated" &&
+                event.payload.id === run.id &&
+                event.payload.status === "failed"
+              )
+                yield* Deferred.succeed(failurePublished, undefined);
+              yield* event.type === "run.updated" &&
+              event.payload.id === projection.runs[1]!.id &&
+              event.payload.status === "starting"
+                ? Deferred.succeed(promoted, undefined)
+                : Effect.void;
+            }),
+          ),
+          Effect.forkScoped,
+        );
+      let full = initiallyFull;
+      const offered: RunId[] = [];
+      const testWorker = Context.get(
+        yield* Layer.build(
+          EffectWorker.layer.pipe(
+            Layer.provide(
+              Layer.succeed(EffectWorker.OrchestrationEffectExecutorV2, {
+                execute: (effect) => {
+                  if (effect.request.type !== "provider-turn.start") return Effect.void;
+                  if (effect.request.runId !== run.id) {
+                    if (full)
+                      return Effect.fail(
+                        new EffectWorker.OrchestrationEffectExecutionError({
+                          effectId: effect.id,
+                          effectType: effect.request.type,
+                          deferMs: 1000,
+                        }),
+                      );
+                    offered.push(effect.request.runId);
+                    return Effect.void;
+                  }
+                  return engine
+                    .dispatch({
+                      type: "run.start-expire",
+                      phase,
+                      threadId,
+                      runId: run.id,
+                      commandId: CommandId.make(`${threadId}:expire`),
+                      expectedAttemptId: run.activeAttemptId,
+                      deadline,
+                    })
+                    .pipe(Effect.orDie, Effect.asVoid);
+                },
+              }),
+            ),
+          ),
+        ),
+        EffectWorker.OrchestrationEffectWorkerV2,
+      );
+      yield* Deferred.await(subscribed);
+      yield* testWorker.runThreadOnce!(threadId);
+      assert.equal((yield* engine.getThreadProjection(threadId)).runs[0]!.status, "failed");
+      yield* Deferred.await(failurePublished);
+      yield* Deferred.await(promoted);
+      yield* testWorker.drain();
+      if (initiallyFull) {
+        assert.deepEqual(offered, []);
+        const blocked = yield* engine.getThreadProjection(threadId);
+        assert.equal(blocked.runs[1]!.status, "starting");
+        assert.equal(blocked.runs[2]!.status, "queued");
+        full = false;
+        yield* TestClock.adjust("1 second");
+        yield* testWorker.drain();
+      }
+      assert.deepEqual(offered, [projection.runs[1]!.id]);
+      yield* Deferred.await(drained);
+      const terminalRows = rows.filter(
+        (row) => row.kind === "orchestration.never_started_terminal_drain",
+      );
+      assert.lengthOf(terminalRows, 1);
+      assert.deepInclude(terminalRows[0]!.props, {
+        failedRunId: run.id,
+        failureCode:
+          phase === "restart_admission" ? "restart_admission_timeout" : PROVIDER_START_TIMEOUT_CODE,
+        startedRunId: projection.runs[1]!.id,
+      });
+      const cancellationRows = rows.filter(
+        (row) => row.kind === "effect_outbox.self_cancellation_deferred",
+      );
+      assert.lengthOf(cancellationRows, 1);
+      assert.equal(cancellationRows[0]!.threadId, threadId);
+      assert.equal(cancellationRows[0]!.props?.runId, run.id);
+      assert.deepInclude(cancellationRows[0]!.props, {
+        effectType: "provider-turn.start",
+        commandType: "run.start-expire",
+      });
+      const after = yield* engine.getThreadProjection(threadId);
+      assert.equal(after.runs[1]!.status, "starting");
+      assert.equal(after.runs[2]!.status, "queued");
+    }).pipe(
+      Effect.provide(
+        Layer.fresh(
+          layerDeadlineTest.pipe(
+            Layer.provide(
+              Layer.mock(Analytics.Analytics)({
+                record: (row) =>
+                  Effect.gen(function* () {
+                    rows.push(row);
+                    if (row.kind === "orchestration.never_started_terminal_drain")
+                      yield* Deferred.succeed(drained, undefined);
+                  }),
+              }),
+            ),
+          ),
+        ),
+      ),
+    );
+  },
+);
+
 it.effect.each(["starting", "running"] as const)(
   "restart recovery starts the parent and its awaited child cut while %s",
   (childStatus) =>
@@ -10366,8 +10523,10 @@ it.effect("start deadline bounds a never-started run re-driven after a restart",
 
 it.effect.each(["ordinary", "orphan", "queued source"] as const)(
   "start deadline visibly expires restart admission without a native admission marker: %s",
-  (ownership) =>
-    Effect.gen(function* () {
+  (ownership) => {
+    const rows: AnalyticsEvent[] = [];
+    const drained = Deferred.makeUnsafe<void>();
+    return Effect.gen(function* () {
       const engine = yield* Orchestrator.OrchestratorV2;
       const { threadId, projection } = yield* createDeadlineThread("admission");
       const boards = yield* KanbanStore.KanbanStore;
@@ -10439,6 +10598,26 @@ it.effect.each(["ordinary", "orphan", "queued source"] as const)(
         expectedAttemptId: run.activeAttemptId,
         deadline,
       });
+      yield* Deferred.await(drained);
+      const terminalRows = rows.filter(
+        (row) => row.kind === "orchestration.never_started_terminal_drain",
+      );
+      assert.lengthOf(terminalRows, 1);
+      assert.deepEqual(terminalRows[0]!.props, {
+        failedRunId: run.id,
+        failureCode: "restart_admission_timeout",
+        ...(ownership === "orphan"
+          ? { reason: "start_timeout_owner_denied" }
+          : { startedRunId: projection.runs[1]!.id }),
+      });
+      if (ownership === "orphan")
+        assert.isTrue(
+          rows.some(
+            (row) =>
+              row.kind === "orchestration.queue_drain_skipped" &&
+              row.props?.reason === "start_timeout_owner_denied",
+          ),
+        );
       if (ownership !== "orphan") yield* Deferred.await(promoted);
       else
         yield* engine.dispatch({
@@ -10459,7 +10638,25 @@ it.effect.each(["ordinary", "orphan", "queued source"] as const)(
             item.failure.message.includes("30 min"),
         ),
       );
-    }).pipe(Effect.provide(Layer.fresh(layerDeadlineTest))),
+    }).pipe(
+      Effect.provide(
+        Layer.fresh(
+          layerDeadlineTest.pipe(
+            Layer.provide(
+              Layer.mock(Analytics.Analytics)({
+                record: (row) =>
+                  Effect.gen(function* () {
+                    rows.push(row);
+                    if (row.kind === "orchestration.never_started_terminal_drain")
+                      yield* Deferred.succeed(drained, undefined);
+                  }),
+              }),
+            ),
+          ),
+        ),
+      ),
+    );
+  },
 );
 
 it.effect("start deadline renews admission for a new restart attempt", () =>
