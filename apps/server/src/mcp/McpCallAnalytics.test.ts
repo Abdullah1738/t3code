@@ -402,12 +402,12 @@ it.effect("freezes the timed-out read stage before response delivery and late cl
         Effect.provideService(McpResponseDelivery.McpResponseDelivery, {
           settled: Deferred.await(settled),
           closeReason: "unknown",
-          snapshot: () => ({ responseDelivery: "finished", responseElapsedMs: 56_000 }),
+          snapshot: () => ({ responseDelivery: "finished", responseElapsedMs: 46_000 }),
         }),
         Effect.forkChild,
       );
       yield* Deferred.await(entered);
-      yield* TestClock.adjust("55 seconds");
+      yield* TestClock.adjust(McpDeadline.READ_TIMEOUT);
       const result = yield* Fiber.join(pending);
       expect(result.isError).toBe(true);
       yield* Deferred.succeed(release, undefined);
@@ -419,9 +419,9 @@ it.effect("freezes the timed-out read stage before response delivery and late cl
       expect(row).toMatchObject({
         outcome: "timeout",
         errorTag: "ThreadReadTimeoutError",
-        durationMs: 55_000,
-        responseElapsedMs: 56_000,
-        threadReadStages: [{ stage: "timeline", durationMs: 55_000, completed: false }],
+        durationMs: 45_000,
+        responseElapsedMs: 46_000,
+        threadReadStages: [{ stage: "timeline", durationMs: 45_000, completed: false }],
       });
     }).pipe(Effect.provide(registration));
   }),

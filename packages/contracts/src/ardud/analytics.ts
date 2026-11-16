@@ -67,7 +67,15 @@ const McpOutcome = Schema.Literals([
   "interrupted",
   "interrupted_by_shutdown",
 ]);
-const McpPhase = Schema.Literals(["caller", "dispatch", "result", "handler"]);
+const McpPhase = Schema.Literals([
+  "caller",
+  "dispatch",
+  "result",
+  "handler",
+  "lane_wait",
+  "query",
+  "render",
+]);
 export const EvaluatorTrigger = Schema.Literals([
   "owner_answer",
   "card_ask",
