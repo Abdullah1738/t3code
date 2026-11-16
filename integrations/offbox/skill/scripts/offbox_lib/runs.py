@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
-from . import home, api, capacity, identity, lease, node_tools, node_version, package_manager, pnpm_version, pool, ssh_sync, run_evidence
+from . import home, api, capacity, identity, lease, node_tools, node_version, package_manager, pnpm_version, pool, ssh_sync, run_evidence, quint_tools
 from . import command_usage, common, containers, java_version, prune, prepare, userns
 from . import resources
 from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_LOCAL, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
@@ -1545,6 +1545,7 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
               repo_setup_block(repo_key, rdir),
               f"_offbox_needs_go={int(usage.needs_go)}\n{GO_REPAIR}",
               node,
+              quint_tools.block(),
               node_tools.block(rdir, repo_root),
               java_version.block(java_version.trigger(repo_root or Path.cwd(), rel, argv, steps,
                                                        repo_key=repo_key, template=template)),
@@ -2000,6 +2001,7 @@ class Runner:
             ssh_sync.put_file(self.box, env_file, body, '600', upload_timeout)
             if getattr(self, 'command_file', None):
                 ssh_sync.put_file(self.box, self.command_file, self.command_body, '600', upload_timeout)
+            quint_tools.ensure_archive(self.box)
         upload = (err, upload_files)
         tw = None
         home = api.BACKEND == "server"

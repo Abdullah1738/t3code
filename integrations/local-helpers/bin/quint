@@ -15,6 +15,13 @@ if (( ${+QUINT_JAVA_HOME} )); then
   export JAVA_HOME="$QUINT_JAVA_HOME"
 elif jdk_ok /opt/homebrew/opt/openjdk; then
   export JAVA_HOME=/opt/homebrew/opt/openjdk
+elif [[ -n "${JAVA_HOME:-}" ]] && jdk_ok "$JAVA_HOME"; then
+  export JAVA_HOME
+elif [[ "$OSTYPE" == linux* ]] && (( ${+commands[java]} )); then
+  selected_java="${commands[java]:A}"
+  selected_jdk="${selected_java:h:h}"
+  jdk_ok "$selected_jdk" || die "Java 21+ is required (set QUINT_JAVA_HOME)."
+  export JAVA_HOME="$selected_jdk"
 else
   selected_jdk="$(/usr/libexec/java_home -v '21+' 2>/dev/null)" || selected_jdk=''
   [[ -n "$selected_jdk" ]] && jdk_ok "$selected_jdk" || die "Java 21+ is required; run brew install openjdk (or set QUINT_JAVA_HOME)."
@@ -117,6 +124,37 @@ ARCHIVE_SHA = '51e0e9832eb589d346370b54377850697a597e3dfc23dd49246a02df421c9174'
 JAR_SHA = 'a90f5802b6cfdb59c548513f0be2725ebd7c53a79cb96277cb349e48ea0b8f66'
 PROPERTY = '-Dcom.google.protobuf.error_on_unsafe_pre22_gencode=true'
 FALLBACK = re.compile(rb'Downloading Apalache|Launching Apalache server|Started Apalache server on pid=|No running Apalache server found, launching|QUINT_BACKEND_LAUNCH_BLOCKED', re.I)
+REFLECTION_PROBE = r'''
+const { createRequire } = require('node:module');
+const { realpathSync } = require('node:fs');
+const req = createRequire(realpathSync(process.argv[1]));
+const grpc = req('@grpc/grpc-js');
+const proto = req('@grpc/proto-loader');
+const definition = proto.loadSync(req.resolve('./reflection.proto'), {
+  keepCase: true, longs: String, enums: String, defaults: true, oneofs: true
+});
+const Service = grpc.loadPackageDefinition(definition).grpc.reflection.v1alpha.ServerReflection;
+const until = Date.now() + Number(process.argv[3]);
+function attempt() {
+  const client = new Service(process.argv[2], grpc.credentials.createInsecure());
+  const call = client.ServerReflectionInfo({ deadline: new Date(Math.min(until, Date.now() + 1000)) });
+  let settled = false;
+  function finish(ok) {
+    if (settled) return;
+    settled = true;
+    call.cancel();
+    client.close();
+    if (ok) process.exit(0);
+    if (Date.now() >= until) process.exit(1);
+    setTimeout(attempt, 50);
+  }
+  call.on('data', r => finish(Boolean(r.file_descriptor_response?.file_descriptor_proto?.length)));
+  call.on('error', () => finish(false));
+  call.on('end', () => finish(false));
+  call.write({ file_containing_symbol: 'shai.cmdExecutor.CmdExecutor' });
+}
+attempt();
+'''
 
 
 def fail(message):
@@ -139,6 +177,32 @@ def stop(process):
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
+
+
+def owned_listener(pid, port):
+    if sys.platform.startswith('linux'):
+        # Match the socket inode to our child, not merely another process's
+        # listener on the selected port. Minimal boxes need no lsof package.
+        inodes = set()
+        for fd in Path(f'/proc/{pid}/fd').iterdir():
+            try:
+                target = os.readlink(fd)
+            except FileNotFoundError:
+                continue
+            if target.startswith('socket:['):
+                inodes.add(target[8:-1])
+        for table in ('tcp', 'tcp6'):
+            for line in Path(f'/proc/{pid}/net/{table}').read_text().splitlines()[1:]:
+                fields = line.split()
+                address, hexport = fields[1].split(':')
+                if fields[3] == '0A' and fields[9] in inodes and int(hexport, 16) == port:
+                    if (table, address) not in {('tcp', '0100007F'), ('tcp6', '0000000000000000FFFF00000100007F')}:
+                        fail('patched Apalache listener is not IPv4 loopback')
+                    return True
+        return False
+    listening = subprocess.run(['lsof', '-nP', '-a', '-p', str(pid), f'-iTCP:{port}', '-sTCP:LISTEN', '-Fpn'], capture_output=True, text=True)
+    fields = listening.stdout.splitlines()
+    return f'p{pid}' in fields and f'n127.0.0.1:{port}' in fields
 
 
 def guarded(cli, command_index, args):
@@ -253,7 +317,7 @@ def guarded(cli, command_index, args):
             if i not in endpoint_indices and i not in version_indices:
                 normalized.append(arg)
         args = normalized + after
-        server = client = None
+        server = client = probe = None
         interrupted = []
         def interrupt(signum, frame):
             # Do not raise between Popen creating a child and returning its PID.
@@ -273,13 +337,23 @@ def guarded(cli, command_index, args):
                     fail('patched Apalache exited before listening')
                 # A successful TCP connect alone could belong to a competing
                 # process that won the port race. Require our exact PID to own it.
-                listening = subprocess.run(['lsof', '-nP', '-a', '-p', str(server.pid), f'-iTCP:{port}', '-sTCP:LISTEN', '-Fpn'], capture_output=True, text=True)
-                fields = listening.stdout.splitlines()
-                if f'p{server.pid}' in fields and f'n127.0.0.1:{port}' in fields:
+                if owned_listener(server.pid, port):
                     break
                 if time.monotonic() >= deadline:
                     fail('patched Apalache did not listen within 30s')
                 time.sleep(.05)
+            # Quint's first reflection request has a five-second deadline and
+            # falls straight back to its launcher on failure. LISTEN can precede
+            # a usable HTTP/2/reflection service on a cold JVM.
+            probe = subprocess.Popen(['node', '-e', REFLECTION_PROBE, cli, f'127.0.0.1:{port}',
+                                      str(max(1, int((deadline - time.monotonic()) * 1000)))], env=env)
+            while probe.poll() is None:
+                check_interrupted()
+                if server.poll() is not None or time.monotonic() >= deadline:
+                    fail('patched Apalache reflection did not become ready within 30s')
+                time.sleep(.05)
+            if probe.returncode:
+                fail('patched Apalache reflection readiness failed; verify refused')
             client = subprocess.Popen([cli, *args], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             check_interrupted()
             selector = selectors.DefaultSelector()
@@ -315,6 +389,7 @@ def guarded(cli, command_index, args):
             for sig in old_handlers:
                 signal.signal(sig, signal.SIG_IGN)
             stop(client)
+            stop(probe)
             stop(server)
             for sig, handler in old_handlers.items():
                 signal.signal(sig, handler)
