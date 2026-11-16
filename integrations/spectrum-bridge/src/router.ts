@@ -4175,13 +4175,13 @@ export class Router {
     outcome?: "incomplete" | "failed" | "owner_typed"): void {
     toolLog.capture(() => {
       const pendingKey = turn.messageId ? `log-notice-pending:${turn.id}:${turn.messageId}` : undefined;
-      let pending = source === "watch" && pendingKey
-        ? this.store.get<{ noticeId: string; ownerTyped: boolean; sealedWake: boolean } | null>(pendingKey) : undefined;
+      let pending = pendingKey
+        ? this.store.get<{ noticeId: string; ownerTyped: boolean; sealedWake: boolean; runId?: string; replyIds?: string[]; precedingIdleIds?: string[] } | null>(pendingKey) : undefined;
       const observe = (run: MessageRecord[], boundary: MessageRecord, override?: typeof outcome) => {
         const notice = run.find(m => (m.type === "user" || m.type === "synthetic")
           && typeof m.text === "string" && isCompletionNoticeText(m.text));
-        const carried = pending;
-        pending = undefined;
+        const carried = pending?.precedingIdleIds?.includes(boundary.id) ? undefined : pending;
+        if (carried) pending = undefined;
         const noticeId = carried?.noticeId ?? notice?.id;
         if (!noticeId) return;
         const key = `${turn.id}:${noticeId}`;
@@ -4190,10 +4190,13 @@ export class Router {
         if (logged.includes(key)) { if (carried && pendingKey) this.store.set(pendingKey, null); return; }
         const steps = run.filter((m): m is Extract<MessageRecord, { type: "assistant" }> => m.type === "assistant");
         const final = steps.at(-1);
-        const runId = steps.find(m => typeof m.runId === "string")?.runId;
+        const runId = carried?.runId ?? steps.find(m => typeof m.runId === "string")?.runId;
         // Early replies are already in the outbox when terminal processing excludes them from outgoing.
-        const replies = this.toolMode ? 0 : new Set(steps.filter(m => this.store.getOperation(`reply:${turn.generation}:${m.id}`)
-          || m.id === turn.earlySent && turn.earlyOutbox && this.store.getOperation(turn.earlyOutbox)).map(m => m.id)).size;
+        const replies = this.toolMode ? 0 : new Set([
+          ...(carried?.replyIds ?? []),
+          ...steps.filter(m => this.store.getOperation(`reply:${turn.generation}:${m.id}`)
+            || m.id === turn.earlySent && turn.earlyOutbox && this.store.getOperation(turn.earlyOutbox)).map(m => m.id),
+        ]).size;
         toolLog.write({ component: "router", kind: "event", name: "notice.reply",
           ids: { chat: this.options.context?.chat.slug ?? "owner", runId: runId ?? boundary.id },
           props: { source: carried ? "settle_preceding" : source, outcome: carried?.ownerTyped || run.some(ownerPrompt) ? "owner_typed" : override
@@ -4247,25 +4250,23 @@ export class Router {
       replies.push(...answered);
       settled = answered.at(-1)?.id ?? settled;
     }
-    if (scope.length) {
-      const final = [...scope].reverse().find((m): m is Extract<MessageRecord, { type: "assistant" }> => m.type === "assistant");
-      const answered = scope.some(m => m.type === "assistant" && m.answer === true && m.time.completed !== undefined
-        && !m.continued && m.finish !== "tool-calls");
-      if (answered || observations.some(observation => observation.scope === scope && observation.record.type === "idle")) {
-        observations.push({ scope, record: scope.at(-1)!, outcome: final?.error ? "failed"
-          : final && (final.time.completed === undefined || final.finish === "tool-calls") ? "incomplete" : undefined });
-      } else toolLog.capture(() => {
-        const notice = scope.find(m => (m.type === "user" || m.type === "synthetic")
-          && typeof m.text === "string" && isCompletionNoticeText(m.text));
-        // The admitted wake can precede this run's answer; keep only its diagnostic identity.
-        if (notice) this.store.set(`log-notice-pending:${turn.id}:${turn.messageId}`, {
-          noticeId: notice.id, ownerTyped: scope.some(ownerPrompt), sealedWake: !!turn.inboundId?.startsWith("wake:"),
-        });
-      });
-    }
     const log = () => {
       for (const observation of observations) this.logNoticeReply(turn, observation.scope, observation.record, "settle_preceding",
         !!turn.inboundId?.startsWith("wake:"), observation.outcome);
+      if (scope.length && !observations.some(observation => observation.scope === scope)) toolLog.capture(() => {
+        const notice = scope.find(m => (m.type === "user" || m.type === "synthetic")
+          && typeof m.text === "string" && isCompletionNoticeText(m.text));
+        const steps = scope.filter((m): m is Extract<MessageRecord, { type: "assistant" }> => m.type === "assistant");
+        // A completed answer can precede more answers or a failed idle in this same run.
+        // Retain its identity and committed reply IDs when admission moves the watermark past them.
+        if (notice) this.store.set(`log-notice-pending:${turn.id}:${turn.messageId}`, {
+          noticeId: notice.id, ownerTyped: scope.some(ownerPrompt), sealedWake: !!turn.inboundId?.startsWith("wake:"),
+          runId: steps.find(m => typeof m.runId === "string")?.runId,
+          replyIds: steps.filter(m => this.store.getOperation(`reply:${turn.generation}:${m.id}`)).map(m => m.id),
+          // With no new answer to advance the watermark, earlier idles can be read again.
+          precedingIdleIds: observations.map(observation => observation.record.id),
+        });
+      });
     };
     if (!settled) { log(); return; }
     let enqueued = false;

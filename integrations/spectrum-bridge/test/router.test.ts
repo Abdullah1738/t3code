@@ -5606,6 +5606,101 @@ test.each([false, true])("notice.reply logging failures preserve forwarding (sea
   } finally { failingLog.mockRestore(); }
 });
 
+test.each(["visible", "NO_REPLY", "tool"].flatMap(first => ["reply", "NO_REPLY", "idle", "failed", "modelError", "error"].flatMap(ending =>
+  [false, true].map(restart => ({ first, ending, restart })))))("notice.reply waits for the terminal outcome after a pre-admission answer ($first, $ending, restart=$restart)", async ({ first, ending, restart }) => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0, ...(first === "tool" ? { replyMode: "tool" as const } : {}) });
+  await exchange(h, "notice-initial", "Check the order", "NO_REPLY");
+  let answer: Assistant;
+  let idle: Extract<MessageRecord, { type: "idle" }>;
+  h.backend.promptBehavior = async call => {
+    delegatedNoticeReply(h, first === "NO_REPLY" ? "NO_REPLY" : "First notice answer");
+    idle = h.backend.records.pop() as typeof idle;
+    answer = h.backend.records.at(-1) as Assistant;
+    h.backend.accept(call);
+  };
+  const beforeLogs = await captureLogs(async () => {
+    h.input("wake:notice-open", "Another update");
+    await h.router.tick();
+    await h.router.tick();
+  });
+  expect(h.conversations().map(op => op.text)).toEqual(first === "visible" ? ["First notice answer"] : []);
+  expect(beforeLogs.filter(line => line.name === "notice.reply")).toEqual([]);
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  const logs = await captureLogs(async () => {
+    if (["reply", "NO_REPLY", "modelError", "error"].includes(ending)) h.backend.records.push({
+      ...answer!, id: `${answer!.id}:second`, content: [{ type: "text", text: ending === "NO_REPLY" ? "NO_REPLY" : "Second notice answer" }],
+      ...(ending === "error" ? { error: { type: "provider", message: "Private provider error" } } : {}),
+    });
+    if (ending === "failed") idle!.outcome = "failed";
+    if (ending === "modelError") idle!.modelError = true;
+    h.backend.records.push(idle!);
+    for (let i = 0; i < 4; i++) await router.tick();
+    await new Router(h.store, h.backend, h.transport, h.routerOptions).tick();
+  });
+  const texts = [
+    ...(first === "visible" ? ["First notice answer"] : []),
+    ...(first !== "tool" && ["reply", "modelError"].includes(ending) ? ["Second notice answer"] : []),
+  ];
+  expect(h.conversations().map(op => op.text)).toEqual(texts);
+  expect(logs.filter(line => line.name === "notice.reply").map(line => ({ ids: line.ids, props: line.props }))).toEqual([
+    { ids: { chat: "owner", runId: answer!.runId! }, props: { source: "settle_preceding",
+      outcome: ["failed", "modelError", "error"].includes(ending) ? "failed" : first === "tool" ? "quiet" : texts.length ? "forwarded" : "no_reply",
+      replies: texts.length, sealedWake: true } },
+  ]);
+});
+
+test.each(["succeeded", "failed", "modelError"].flatMap(noticeEnding => ["reply", "NO_REPLY", "failed"].flatMap(wakeEnding =>
+  ["none", "answer", "empty"].flatMap(nextNotice => [false, true].map(restart => ({ noticeEnding, wakeEnding, nextNotice, restart }))))))("notice.reply uses a retained notice's preceding idle ($noticeEnding, $wakeEnding, nextNotice=$nextNotice, restart=$restart)", async ({ noticeEnding, wakeEnding, nextNotice, restart }) => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "notice-initial", "Check the order", "NO_REPLY");
+  let answer: Assistant;
+  let idle: Extract<MessageRecord, { type: "idle" }>;
+  h.backend.promptBehavior = async call => {
+    delegatedNoticeReply(h, "First notice answer");
+    idle = h.backend.records.pop() as typeof idle;
+    answer = h.backend.records.at(-1) as Assistant;
+    h.backend.accept(call);
+  };
+  const beforeLogs = await captureLogs(async () => {
+    h.input("wake:notice-boundary", "Another update");
+    await h.router.tick();
+    await h.router.tick();
+  });
+  expect(beforeLogs.filter(line => line.name === "notice.reply")).toEqual([]);
+  expect(h.conversations().map(op => op.text)).toEqual(["First notice answer"]);
+  if (noticeEnding === "failed") idle!.outcome = "failed";
+  if (noticeEnding === "modelError") idle!.modelError = true;
+  const inserted: MessageRecord[] = [idle!];
+  let nextRunId = "";
+  if (nextNotice !== "none") {
+    nextRunId = delegatedNoticeReply(h, "Next notice answer").slice(0, -":reply".length);
+    inserted.push(...h.backend.records.splice(-3, 3).slice(0, nextNotice === "empty" ? 1 : 2));
+  }
+  const wake = h.backend.prompts.at(-1)!;
+  h.backend.records.splice(h.backend.records.findIndex(m => m.id === wake.messageId), 0, ...inserted);
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  const logs = await captureLogs(async () => {
+    await router.tick();
+    await router.tick();
+    const wakeReply = h.backend.final(wakeEnding === "NO_REPLY" ? "NO_REPLY" : "Wake answer");
+    wakeReply.runId = nextNotice !== "none" ? nextRunId : "run:separate-wake";
+    if (wakeEnding === "failed") (h.backend.records.at(-1) as Extract<MessageRecord, { type: "idle" }>).outcome = "failed";
+    for (let i = 0; i < 4; i++) await router.tick();
+    await new Router(h.store, h.backend, h.transport, h.routerOptions).tick();
+  });
+  expect(h.conversations().map(op => op.text)).toEqual([
+    "First notice answer", ...(nextNotice === "answer" ? ["Next notice answer"] : []), ...(wakeEnding === "reply" ? ["Wake answer"] : []),
+  ]);
+  expect(logs.filter(line => line.name === "notice.reply").map(line => ({ ids: line.ids, props: line.props }))).toEqual([
+    { ids: { chat: "owner", runId: answer!.runId! }, props: { source: "settle_preceding", outcome: noticeEnding === "succeeded" ? "forwarded" : "failed", replies: 1, sealedWake: true } },
+    ...(nextNotice !== "none" ? [{ ids: { chat: "owner", runId: nextRunId }, props: { source: "settle_preceding",
+      outcome: wakeEnding === "failed" ? "failed" : wakeEnding === "reply" || nextNotice === "answer" ? "forwarded" : "no_reply",
+      replies: (nextNotice === "answer" ? 1 : 0) + (wakeEnding === "reply" ? 1 : 0), sealedWake: true } }] : []),
+  ]);
+});
+
 const lateNoticeCases = ["absent", "unfinished", "tool-calls", "narration", "unknown"].flatMap(before =>
   [
     { mode: "forwarded", outcome: "forwarded", replies: 1 },
@@ -5621,8 +5716,9 @@ test.each(lateNoticeCases)("notice.reply waits for the late notice answer after 
   const h = setup(":memory:", { watchMs: 0, ...(mode === "tool" ? { replyMode: "tool" as const } : {}) });
   await exchange(h, "review-initial", "Check the order", "NO_REPLY");
   let late: MessageRecord[] = [];
+  let runId = "";
   h.backend.promptBehavior = async call => {
-    delegatedNoticeReply(h, mode === "NO_REPLY" ? "NO_REPLY" : "Done: delayed notice answer");
+    runId = delegatedNoticeReply(h, mode === "NO_REPLY" ? "NO_REPLY" : "Done: delayed notice answer").slice(0, -":reply".length);
     late = h.backend.records.splice(-2, 2);
     const idle = late[1] as Extract<MessageRecord, { type: "idle" }>;
     if (mode === "failed") idle.outcome = "failed";
@@ -5652,7 +5748,7 @@ test.each(lateNoticeCases)("notice.reply waits for the late notice answer after 
   });
   expect(h.conversations().map(op => op.text)).toEqual(replies ? ["Done: delayed notice answer"] : []);
   expect(logs.filter(line => line.name === "notice.reply").map(line => ({ ids: line.ids, props: line.props }))).toEqual([
-    { ids: { chat: "owner", runId: mode === "empty" ? late[0]!.id : late[0]!.id.slice(0, -":reply".length) },
+    { ids: { chat: "owner", runId: mode === "empty" && before === "absent" ? late[0]!.id : runId },
       props: { source: "settle_preceding", outcome, replies, sealedWake: true } },
   ]);
 });
