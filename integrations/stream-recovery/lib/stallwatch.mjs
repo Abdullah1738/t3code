@@ -51,7 +51,7 @@ export async function stallScan(options, io = realIo) {
   return timedScan('stall', io, timed => stallScanImpl(options, timed));
 }
 
-async function stallScanImpl({ state, now, dryRun = false, verbose = false, log }, io = realIo) {
+async function stallScanImpl({ state, now, dryRun = false, verbose = false, log, save = () => {} }, io = realIo) {
   assertRecoveryActive(io);
   io = recoveryIo(guardRecoveryIo(io));
   const scanStart = performance.now();
@@ -123,6 +123,9 @@ async function stallScanImpl({ state, now, dryRun = false, verbose = false, log 
     }
     assertRecoveryActive(io);
     stall.ocTries = (stall.ocTries ?? 0) + 1;
+    // Replica recovery runs concurrently and must see our exclusion record
+    // before it can discover the cancellation caused by this interrupt.
+    save();
     try {
       stall.ocInterrupted = await io.ocInterrupt(stall.ses);
       stall.ocTried = now;
@@ -255,6 +258,7 @@ async function stallScanImpl({ state, now, dryRun = false, verbose = false, log 
         throw err;
       }
     } else {
+      save();
       try {
         const res = await io.interruptThread(stall.threadId, { clientRequestId: id, reason: `stall watch: ${activity.label}`, expectedRunId: stall.runId ?? undefined, cancelReason: 'task_stalled' });
         stall.robobResult = res.result ?? null;
@@ -346,6 +350,7 @@ async function stallScanImpl({ state, now, dryRun = false, verbose = false, log 
         finish(id, stall, "report");
         continue;
       }
+      save();
       try {
         const res = await io.interruptThread(t.threadId, { clientRequestId: id, reason: `stall watch: ${GHOST_LABEL}`, expectedRunId: t.activeRunId, cancelReason: 'task_stalled' });
         stall.robobResult = res.result ?? null;

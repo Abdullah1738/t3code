@@ -386,6 +386,193 @@ describe("rollup", () => {
     ]);
   });
 
+  it("separates open notices and answer latency from decisions", () => {
+    const mixed = card("mixed", {
+      asks: [
+        ask("notice", t("23:00"), { kind: "notice", respond: { ack: true } }),
+        ask("old-notice", t("16:00"), { kind: "notice", respond: { ack: true } }),
+        ask("approve", t("10:00"), { kind: "approve", blocking: true }),
+        ask("pick", t("20:00"), { kind: "pick" }),
+        ask("answered-notice", t("01:00"), {
+          kind: "notice",
+          closedAt: t("09:00"),
+          answer: { verdict: "ack", by: { _tag: "owner" }, at: t("09:00") },
+        }),
+        ask("answered-pick", t("09:00"), {
+          kind: "pick",
+          blocking: true,
+          closedAt: "2026-11-12T09:00:20.000Z",
+          answer: { verdict: "picked", by: { _tag: "owner" }, at: "2026-11-12T09:00:20.000Z" },
+        }),
+        ask("legacy", t("21:00"), { respond: { ack: true } }),
+        ask("dropped", t("23:30"), { kind: "approve", closedAt: t("23:40") }),
+      ],
+    });
+    const run = Activity.rollup({ window, cards: [mixed], events: [], threads: [], pools: [] });
+    expect(run.asks).toMatchObject({
+      open: 3,
+      openNotices: 2,
+      answered: 2,
+      closedWithoutAnswer: 1,
+    });
+    expect(run.asks.openOver6h).toEqual({
+      count: 1,
+      items: [{ card: 1, ask: "approve", askedAt: "2026-11-12T10:00Z", hours: 14, blocking: true }],
+    });
+    expect(run.asks.noticesOver6h).toEqual({ count: 1 });
+    expect(run.asks.answerMinutesByKind).toEqual({
+      notice: { count: 1, p50: 480, p90: 480, max: 480 },
+      pick: { count: 1, p50: 0, p90: 0, max: 0 },
+    });
+    expect(run.asks.answerMinutesByBlocking).toEqual({
+      blocking: { count: 1, p50: 0, p90: 0, max: 0 },
+      async: { count: 1, p50: 480, p90: 480, max: 480 },
+    });
+    // Retains the existing rounded minutes and nearest-rank percentiles overall.
+    expect(run.asks.answerMinutes).toEqual({ p50: 480, p90: 480, max: 480 });
+    expect(run.asks.answeredItems.map(({ kind, blocking }) => [kind, blocking])).toEqual([
+      ["notice", undefined],
+      ["pick", true],
+    ]);
+    expect(run.asks.others.items.map(({ id, kind }) => [id, kind])).toEqual([
+      ["legacy", undefined],
+      ["pick", "pick"],
+      ["approve", "approve"],
+      ["dropped", "approve"],
+      ["notice", "notice"],
+      ["old-notice", "notice"],
+    ]);
+    expect(run.asks.others.items[0]).not.toHaveProperty("kind");
+  });
+
+  it.each([undefined, "question", "custom", "constructor", "__proto__"])(
+    "groups answered kind %s without inferring it from respond",
+    (kind) => {
+      const answered = ask("answered", t("01:00"), {
+        ...(kind !== undefined ? { kind } : {}),
+        respond: { ack: true },
+        closedAt: t("01:20"),
+        answer: { verdict: "ack", by: { _tag: "owner" }, at: t("01:20") },
+      });
+      const run = Activity.rollup({
+        window,
+        cards: [card("kinds", { asks: [answered] })],
+        events: [],
+        threads: [],
+        pools: [],
+      });
+      expect(run.asks.answerMinutesByKind).toEqual({
+        [kind ?? "question"]: { count: 1, p50: 20, p90: 20, max: 20 },
+      });
+      expect(run.asks.answerMinutesByBlocking.blocking).toEqual({
+        count: 0,
+        p50: null,
+        p90: null,
+        max: null,
+      });
+      expect(run.asks.answerMinutesByBlocking.async).toEqual({
+        count: 1,
+        p50: 20,
+        p90: 20,
+        max: 20,
+      });
+    },
+  );
+
+  it("a notice-only board has no open decisions and ignores settled open notices", () => {
+    const notice = ask("notice", before, { kind: "notice", respond: { ack: true } });
+    const run = Activity.rollup({
+      window,
+      cards: [
+        card("notice", { asks: [notice] }),
+        card("settled", { settledAt: before, asks: [notice] }),
+      ],
+      events: [],
+      threads: [],
+      pools: [],
+    });
+    expect(run.asks.open).toBe(0);
+    expect(run.asks.openNotices).toBe(1);
+    expect(run.asks.openOver6h).toEqual({ count: 0, items: [] });
+    expect(run.asks.noticesOver6h).toEqual({ count: 1 });
+    expect(run.asks.answerMinutesByKind).toEqual({});
+  });
+
+  it("keeps open decisions ahead of newer notices when the list is capped", () => {
+    const notices = Array.from({ length: 160 }, (_, index) =>
+      ask(`notice-${index}`, t("23:00"), { kind: "notice" }),
+    );
+    const run = Activity.rollup({
+      window,
+      cards: [
+        card("capped", { asks: [...notices, ask("decision", t("01:00"), { kind: "approve" })] }),
+      ],
+      events: [],
+      threads: [],
+      pools: [],
+    });
+    expect(run.asks.others.more).toBeGreaterThan(0);
+    expect(run.asks.others.items[0]?.id).toBe("decision");
+    expect(run.asks.open).toBe(1);
+    expect(run.asks.openNotices).toBe(160);
+    expect(JSON.stringify(run).length).toBeLessThan(50_000);
+  });
+
+  it.each([
+    {
+      form: "ordinary repeated",
+      kinds: Array.from({ length: 300 }, (_, i) => ["notice", "pick", "custom"][i % 3]!),
+      cappedKinds: false,
+    },
+    {
+      form: "many long distinct",
+      kinds: Array.from({ length: 300 }, (_, i) => `kind-${i}-${"k".repeat(128)}`),
+      cappedKinds: true,
+    },
+    {
+      form: "JSON-escaped distinct",
+      kinds: Array.from({ length: 300 }, (_, i) => `kind-${i}-${'"\\'.repeat(64)}`),
+      cappedKinds: true,
+    },
+    { form: "one oversized", kinds: ["k".repeat(50_000)], cappedKinds: true },
+  ])("bounds the kind breakdown with $form names", ({ kinds, cappedKinds }) => {
+    const counts = new Map<string, number>();
+    const asks = kinds.map((kind, index) => {
+      counts.set(kind, (counts.get(kind) ?? 0) + 1);
+      return ask(`q${index}`, t("01:00"), {
+        kind,
+        closedAt: t("02:00"),
+        answer: { verdict: "done", by: { _tag: "owner" }, at: t("02:00") },
+      });
+    });
+    const run = Activity.rollup({
+      window,
+      cards: [card("kinds", { asks })],
+      events: [],
+      threads: [],
+      pools: [],
+    });
+    expect(JSON.stringify({ activity: { boardId: "board-robob", ...run } }).length).toBeLessThan(
+      50_000,
+    );
+    expect(run.asks.answered).toBe(kinds.length);
+    expect(run.asks.answerMinutes).toEqual({ p50: 60, p90: 60, max: 60 });
+    expect(run.asks.answerMinutesByBlocking.async).toEqual({
+      count: kinds.length,
+      p50: 60,
+      p90: 60,
+      max: 60,
+    });
+    expect(
+      Object.keys(run.asks.answerMinutesByKind).length + (run.asks.answerMinutesByKindMore ?? 0),
+    ).toBe(counts.size);
+    for (const [kind, summary] of Object.entries(run.asks.answerMinutesByKind)) {
+      expect(summary).toEqual({ count: counts.get(kind), p50: 60, p90: 60, max: 60 });
+    }
+    if (cappedKinds) expect(run.asks.answerMinutesByKindMore).toBeGreaterThan(0);
+    else expect(run.asks).not.toHaveProperty("answerMinutesByKindMore");
+  });
+
   it("adds up time in each stage, the parked card included", () => {
     // #1: 01:00-03:00, 04:15-05:00, 06:01-08:00 working; #2 the whole day.
     expect(result.stages.hours.working?.hours).toBeCloseTo(2 + 0.75 + 119 / 60 + 24, 1);
@@ -756,7 +943,13 @@ describe("rollup", () => {
       expect(text).not.toContain(words);
   });
 
-  it("stays small: a busy day of 300 cards fits one call", () => {
+  it.each([
+    { form: "short per-card", askId: "q1", allAnswers: true },
+    { form: "UUID", askId: "12345678-1234-4234-8234-123456789012", allAnswers: false },
+    { form: "prefixed UUID", askId: "ask-12345678-1234-4234-8234-123456789012", allAnswers: false },
+    { form: "long opaque", askId: "x".repeat(512), allAnswers: false },
+    { form: "JSON-escaped", askId: 'q"\\'.repeat(128), allAnswers: false },
+  ])("stays small: 300 cards with $form ask IDs fit one call", ({ askId, allAnswers }) => {
     const cards: Array<KanbanCard> = [];
     const events: Array<KanbanCardEvent> = [];
     for (let index = 0; index < 300; index++) {
@@ -768,7 +961,8 @@ describe("rollup", () => {
           stage: "working",
           reviewRound: 3,
           asks: [
-            ask("q1", t("01:00"), {
+            ask(askId, t("01:00"), {
+              kind: index % 2 === 0 ? "notice" : "pick",
               closedAt: t("02:00"),
               answer: { verdict: "approve", by: { _tag: "owner" }, at: t("02:00") },
             }),
@@ -782,10 +976,23 @@ describe("rollup", () => {
       );
     }
     const big = Activity.rollup({ window, cards, events, threads: [], pools });
-    expect(JSON.stringify(big).length).toBeLessThan(60_000);
+    expect(JSON.stringify({ activity: { boardId: "board-robob", ...big } }).length).toBeLessThan(
+      50_000,
+    );
     expect(big.asks.answered).toBe(300);
-    // Every ask answered in the window is listed, however long the day.
-    expect(big.asks.answeredItems).toHaveLength(300);
+    expect(big.asks.answeredItems.length + (big.asks.answeredItemsMore ?? 0)).toBe(300);
+    expect(big.asks.answeredItems.length).toBeGreaterThan(0);
+    expect(big.asks.answeredItems.every((row) => row.id === askId)).toBe(true);
+    if (allAnswers) {
+      expect(big.asks.answeredItems).toHaveLength(300);
+      expect(big.asks).not.toHaveProperty("answeredItemsMore");
+    } else expect(big.asks.answeredItemsMore).toBeGreaterThan(0);
+    expect(big.asks.answerMinutes).toEqual({ p50: 60, p90: 60, max: 60 });
+    expect(big.asks.answerMinutesByKind).toEqual({
+      notice: { count: 150, p50: 60, p90: 60, max: 60 },
+      pick: { count: 150, p50: 60, p90: 60, max: 60 },
+    });
+    expect(big.asks.answerMinutesByBlocking.async.count).toBe(300);
     expect(big.stalls.count).toBe(300);
     expect(big.reviews.rounds).toBe(300);
   });
