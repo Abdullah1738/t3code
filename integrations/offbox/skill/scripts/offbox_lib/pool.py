@@ -345,6 +345,7 @@ def members(con, key):
         WHERE p.pool_key=? AND {token_mine('l')} AND l.state IN ('running','stopped') AND COALESCE(l.note,'') NOT LIKE ?
         AND COALESCE(l.note,'') NOT LIKE ?
         AND COALESCE(l.note,'') NOT LIKE ?
+        AND COALESCE(l.note,'') NOT LIKE 'disk-full:%'
         AND NOT EXISTS (SELECT 1 FROM kv WHERE k='boot_dead:' || l.box_id)
         ORDER BY (l.state='running') DESC, l.last_used_at DESC""", (key, TOO_BIG_LIKE, DEAD_LIKE, WEDGED_LIKE)).fetchall()
 
@@ -376,6 +377,7 @@ def candidates(con, key, size, source, me=None):
         AND COALESCE(l.note,'') NOT LIKE ?
         AND COALESCE(l.note,'') NOT LIKE ?
         AND COALESCE(l.note,'') NOT LIKE ?
+        AND COALESCE(l.note,'') NOT LIKE 'disk-full:%'
         AND NOT EXISTS (SELECT 1 FROM bases b WHERE b.box_id=l.box_id)
         AND NOT EXISTS (SELECT 1 FROM templates t WHERE t.box_id=l.box_id)
         AND (EXISTS (SELECT 1 FROM pool_callers c WHERE c.box_id=l.box_id AND c.owner=? AND c.repo_root=?)
@@ -967,6 +969,12 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                                 if preferred:
                                     wait_own = True
                                     break
+                                continue
+                            from . import box_disk
+                            if not box_disk.picker_ok(con, r):
+                                g.__exit__(None, None, None)
+                                guard = None
+                                can_create = _room(con, key)
                                 continue
                             allocation.check_queue()
                             row, guard = r, g

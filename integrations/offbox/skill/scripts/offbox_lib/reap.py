@@ -213,7 +213,15 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
                         actions[-1] += ' (busy; skipped)'
                         return
                     current = con.execute('SELECT * FROM leases WHERE box_id=?', (box_id,)).fetchone()
-                    if current and (current['note'] or '').startswith(BOX_WEDGED_NOTE):
+                    if current and (current['note'] or '').startswith((BOX_WEDGED_NOTE, 'disk-full:')):
+                        from . import box_disk
+                        if (current['note'] or '').startswith(box_disk.NOTE) and what == 'refresh':
+                            fn()
+                            return
+                        if ((current['note'] or '').startswith(box_disk.NOTE) and not box_disk.safe_to_stop(box_id)):
+                            box_disk.keep_running(con, box_id)
+                            actions[-1] += ' (disk_full; live holders or unknown activity; kept)'
+                            return
                         if what == 'stop':
                             lease.stop_box(con, box_id, 'reap: box-wedged', images=False, locked=True)
                         actions[-1] += ' (set aside; stale action skipped)'
@@ -291,7 +299,14 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
                 continue
         # A failed stop is retried without asking Docker; never refresh or automatically delete a wedged box.
         note = con.execute('SELECT note FROM leases WHERE box_id=?', (bid,)).fetchone()[0] or ''
-        if note.startswith(BOX_WEDGED_NOTE):
+        if note.startswith('disk-full:'):
+            stopped = iso_ts(b.get('stoppedAt'))
+            if ((r['pinned_until'] or 0) > now() and state in api.STOPPED_STATES and stopped and
+                    now() - stopped > KEEPALIVE_S and refreshes < 2):
+                refreshes += 1
+                act(bid, 'refresh', 'disk_full pinned disk retention',
+                    lambda bid=bid: lease.refresh_box(con, bid), expected=r)
+        if note.startswith((BOX_WEDGED_NOTE, 'disk-full:')):
             if not running_runs and state in api.LIVE_STATES:
                 act(bid, 'stop', 'set aside: box-wedged',
                     lambda bid=bid: lease.stop_box(con, bid, 'reap: box-wedged', images=False, locked=True))

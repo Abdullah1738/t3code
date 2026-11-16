@@ -17,7 +17,12 @@ def clean_env(**overrides):
 
 
 def isolate_boat(stack):
-    from offbox_lib import api, capacity
+    from offbox_lib import api, capacity, box_disk
+
+    # Disk probes are guest I/O, just like the API boundary. Disk tests opt back in explicitly.
+    stack.enter_context(patch.object(box_disk, "measure", return_value={}))
+    stack.enter_context(patch.object(box_disk, "reclaim", return_value={}))
+    stack.enter_context(patch.object(box_disk, "safe_to_stop", return_value=False))
 
     # These values are cached at import, before a fixture can pin OFFBOX_BACKEND.
     for name, value in (("BACKEND", "boat"), ("NAME", "boat"), ("API", "https://boat.dev/api/v1"),

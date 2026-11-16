@@ -395,14 +395,14 @@ def find_lease(con, owner: str, root: str):
     # On the home server only this token's own boxes (mine()): another owner's box is not ours to hand out.
     mapped = con.execute("SELECT l.*, c.remote_dir AS caller_dir FROM pool_callers c JOIN leases l USING(box_id) "
                          f"WHERE c.owner=? AND c.repo_root=? AND l.state IN ('running','stopped') AND {mine('l')} "
-                         "AND NOT EXISTS (SELECT 1 FROM prune_holds h WHERE h.box_id=l.box_id)", (owner, root)).fetchone()
+                         "AND COALESCE(l.note,'') NOT LIKE 'disk-full:%' AND NOT EXISTS (SELECT 1 FROM prune_holds h WHERE h.box_id=l.box_id)", (owner, root)).fetchone()
     if mapped:
         out = dict(mapped)
         out['remote_dir'] = out.pop('caller_dir')
         return out
     return con.execute("SELECT * FROM leases WHERE owner=? AND repo_root=? AND state IN ('running','stopped') "
                        f"AND {mine('leases')} "
-                       "AND NOT EXISTS (SELECT 1 FROM prune_holds h WHERE h.box_id=leases.box_id) "
+                       "AND COALESCE(note,'') NOT LIKE 'disk-full:%' AND NOT EXISTS (SELECT 1 FROM prune_holds h WHERE h.box_id=leases.box_id) "
                        "ORDER BY last_used_at DESC LIMIT 1", (owner, root)).fetchone()
 
 
@@ -444,7 +444,8 @@ def idle_ttl(box_id: str) -> None:
     if active_runs(con, box_id):
         return
     row = con.execute("SELECT size, note FROM leases WHERE box_id=?", (box_id,)).fetchone()
-    if row and row['note'] == BOX_WEDGED_NOTE + ' unconfirmed keeper TTL PATCH':
+    if row and ((row['note'] or '').startswith('disk-full:') or
+                row['note'] == BOX_WEDGED_NOTE + ' unconfirmed keeper TTL PATCH'):
         return
     ttl = idle_for(con, box_id, row["size"] if row else None)
     if docker_recent(con, box_id):
@@ -1359,7 +1360,7 @@ def _reuse_available(con, row, size, skip_archiving=False, retrying=False, befor
     # Selection may have preceded another holder's quarantine. Re-read after the caller acquired the box lock.
     current = con.execute('SELECT state, note FROM leases WHERE box_id=?', (row['box_id'],)).fetchone()
     if not current or current['state'] not in ('running', 'stopped') or \
-            (current['note'] or '').startswith(BOX_WEDGED_NOTE):
+            (current['note'] or '').startswith((BOX_WEDGED_NOTE, 'disk-full:')):
         return None
     box_id = row["box_id"]
     from . import allocation

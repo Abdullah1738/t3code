@@ -75,6 +75,9 @@ def configure_fixture(root, backend):
 
     pool.acquire = acquire
     api.cmd_start = start
+    api.cmd_attach = lambda *args, **kw: iter([dict(type='stderr',
+        data=f'{runs.COMMAND_STARTED_MARKER} {os.environ[runs.BACKGROUND_RUN_ENV]}\n')])
+    runs._ttl_keeper = lambda *args: None
     return a, me
 
 
@@ -535,6 +538,7 @@ class BackgroundRetryTests(Isolated):
                     patch.object(outage, 'wait_for_capacity', side_effect=lambda *a: (waiting(), None)) as capacity_retry, \
                     patch.object(outage, 'CAPACITY_RETRY_S', 0), patch.object(api, 'get', return_value={'state': 'running'}), \
                     patch.object(lease, 'ensure_ttl'), contextlib.redirect_stdout(io.StringIO()), \
+                    patch.object(runs,'follow',return_value=runs._COMMAND_RUNNING), \
                     contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(runs.background_client(a, self.me), 0)
             self.assertEqual(attempts, ['run-retry', 'run-retry'])
@@ -600,6 +604,7 @@ class BackgroundFailoverTests(Isolated):
                 patch.object(home, '_forward_background') as forward, patch.object(os, 'execve') as execute, \
                 patch.object(runs.Runner, 'start', start), patch.object(outage, 'wait_until_up', side_effect=waiting) as wait, \
                 patch.object(api, 'get', return_value={'state': 'running'}), patch.object(lease, 'ensure_ttl'), \
+                patch.object(runs,'follow',return_value=runs._COMMAND_RUNNING), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
             self.assertEqual(runs.background_client(a, self.me), 0)
         self.assertEqual(attempts, ['run-stays-home', 'run-stays-home'])
