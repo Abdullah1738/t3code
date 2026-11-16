@@ -42,7 +42,7 @@
   <key>ThrottleInterval</key>
   <integer>30</integer>
   <key>ProcessType</key>
-  <string>Background</string>
+  <string>Standard</string>
   <key>StandardOutPath</key>
   <string>/Users/ardud/Library/Logs/venice-x402.log</string>
   <key>StandardErrorPath</key>

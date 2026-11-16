@@ -82,6 +82,10 @@ another transport. Requests failed at once (`egress_unverified`, `fetch failed`)
 - A client that disconnects aborts the upstream call (`client_closed`).
 - Logged causes: `upstream_retry`, `egress_failed`, `egress_recovered`,
   `proxy_error` (with the socket cause, e.g. `fetch failed (ECONNRESET)`).
+- Both LaunchAgents run as `ProcessType` Standard, not Background: under load
+  (~150 after the 16 Nov reboot) macOS starved the Background proxy so badly that
+  a restart sat 6+ min compiling modules, its egress script was SIGKILLed at 30 s
+  and the guard stopped running.
 - `com.ardud.venice-x402-guard` (every 60 s, `bin/venice-ensure`) re-bootstraps
   or kickstarts the proxy when nothing listens on the port. `install.zsh`
   installs both agents.
