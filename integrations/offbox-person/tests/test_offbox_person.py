@@ -2,6 +2,7 @@
 """offbox-person tests. Uses a fake offbox (box home = a local dir) and a fake agent-browser; never a real box."""
 
 import json
+import hashlib
 import os
 import shutil
 import socket
@@ -14,7 +15,8 @@ from pathlib import Path
 import subprocess
 
 HERE = Path(__file__).resolve().parent
-TOOL = HERE.parent / "bin" / "offbox-person"
+TOOL_HOME = Path(os.environ.get("OFFBOX_PERSON_HOME", HERE.parent))
+TOOL = TOOL_HOME / "bin" / "offbox-person"
 FAKES = HERE / "fakes"
 SERVER_DOWN = ("offbox-person: the home offbox server is down; moni's tasks wait until it is back "
                "(nothing ran, nothing was sent to Boat)\n")
@@ -201,6 +203,161 @@ class OffboxPersonTest(unittest.TestCase):
         p = self.tool("secret", "set", "moni", "../evil", input_text="x", check=False)
         self.assertNotEqual(p.returncode, 0)
 
+    def stdin_fault(self, kind, count, name):
+        self.env.pop("FAKE_OFFBOX_DROP_STDIN", None)
+        self.env.pop("FAKE_OFFBOX_TRUNCATE_STDIN", None)
+        self.env[f"FAKE_OFFBOX_{kind}_STDIN"] = str(count)
+        self.env["FAKE_OFFBOX_STDIN_MATCH"] = f".{name}.XXXXXX"
+        Path(str(self.calls) + ".stdin-count").unlink(missing_ok=True)
+
+    def assert_no_write_temps(self):
+        self.assertEqual(list((self.boxhome / "person").rglob(".*.??????")), [])
+        self.assertEqual([p for p in self.mac_tmp.iterdir() if p.is_dir()], [])
+
+    def test_up_retries_dropped_stdin_for_each_file(self):
+        for name in ("launch.py", "session.sh", "config.json"):
+            with self.subTest(name=name):
+                self.stdin_fault("DROP", 1, name)
+                result = self.tool("up", "moni")
+                for script in ("launch.py", "session.sh"):
+                    self.assertEqual((self.boxhome / "person" / script).read_bytes(),
+                                     (TOOL_HOME / "box" / script).read_bytes())
+                cfg = self.boxhome / "person" / "config.json"
+                self.assertEqual(cfg.read_text(), "{}\n")
+                self.assertEqual(stat.S_IMODE(cfg.stat().st_mode), 0o600)
+                self.assertIn(f"~/person/{name}: box got", result.stderr)
+                self.assertIn("offbox ssh dropped stdin", result.stderr)
+                self.assert_no_write_temps()
+
+    def test_failed_or_truncated_up_preserves_each_live_file(self):
+        for kind in ("DROP", "TRUNCATE"):
+            for name in ("launch.py", "session.sh", "config.json"):
+                with self.subTest(kind=kind, name=name):
+                    live = self.boxhome / "person" / name
+                    live.write_bytes(b"previous working copy")
+                    self.stdin_fault(kind, 100, name)
+                    result = self.tool("up", "moni", check=False)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(f"~/person/{name}: verification failed after 3 tries", result.stderr)
+                    self.assertIn("box copy left unchanged", result.stderr)
+                    self.assertEqual(live.read_bytes(), b"previous working copy")
+                    self.assertEqual(int(Path(str(self.calls) + ".stdin-count").read_text()), 3)
+                    self.assert_no_write_temps()
+
+    def test_secret_retries_without_value_or_digest_in_argv(self):
+        self.tool("up", "moni")
+        value = "sensitive 'quoted' $value `not-a-command`\nwith trailing newline\n"
+        digest = hashlib.sha256(value.encode()).hexdigest()
+        self.stdin_fault("DROP", 1, "token")
+        result = self.tool("secret", "set", "moni", "token", input_text=value)
+        secret = self.boxhome / "person" / "secrets" / "token"
+        self.assertEqual(secret.read_bytes(), value.encode())
+        self.assertEqual(stat.S_IMODE(secret.stat().st_mode), 0o600)
+        argv = "\n".join(" ".join(call["args"]) for call in self.offbox_calls())
+        self.assertNotIn(value, argv)
+        self.assertNotIn(digest, argv)
+        self.assertNotIn(digest, result.stdout + result.stderr)
+        self.assertIn("offbox ssh dropped stdin", result.stderr)
+        self.assert_no_write_temps()
+
+    def test_secret_failure_preserves_live_file_and_removes_private_temps(self):
+        self.tool("up", "moni")
+        live = self.boxhome / "person" / "secrets" / "token"
+        live.parent.mkdir()
+        live.write_text("previous secret")
+        for kind in ("DROP", "TRUNCATE"):
+            with self.subTest(kind=kind):
+                self.stdin_fault(kind, 100, "token")
+                result = self.tool("secret", "set", "moni", "token", input_text="new secret", check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(live.read_text(), "previous secret")
+                self.assert_no_write_temps()
+        result = self.tool("secret", "set", "moni", "token", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no secret value on stdin", result.stderr)
+        self.assertEqual(live.read_text(), "previous secret")
+        self.assert_no_write_temps()
+
+    def test_config_credentials_never_enter_argv(self):
+        value = '{"home":false,"proxy":"http://private-user:private-password@example.test"}'
+        cfg = self.root / "moni" / "config.json"
+        cfg.parent.mkdir(parents=True)
+        cfg.write_text(value)
+        self.stdin_fault("TRUNCATE", 1, "config.json")
+        self.tool("up", "moni")
+        self.assertEqual((self.boxhome / "person" / "config.json").read_text(), value)
+        argv = self.calls.read_text()
+        for token in ("private-user", "private-password", hashlib.sha256(value.encode()).hexdigest()):
+            self.assertNotIn(token, argv)
+        self.assert_no_write_temps()
+
+    def test_wa_setup_verifies_all_pushes_then_runs_the_file(self):
+        # Exercise the real setup script; only its installed dependency and systemd are faked.
+        bindir = self.boxhome / "person" / "bin"
+        bindir.mkdir()
+        wacli = bindir / "wacli"
+        wacli.write_text("#!/bin/sh\necho 0.20.0\n")
+        wacli.chmod(0o755)
+        stubs = self.tmp / "stubs"
+        stubs.mkdir()
+        systemctl = stubs / "systemctl"
+        systemctl.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$FAKE_SYSTEMCTL_LOG"\n')
+        systemctl.chmod(0o755)
+        self.env["PATH"] = f"{stubs}:{self.env['PATH']}"
+        self.env["FAKE_SYSTEMCTL_LOG"] = str(self.tmp / "systemctl.log")
+        for name in ("push-wa", "push-wa-db", "wa-setup.sh"):
+            with self.subTest(name=name):
+                self.stdin_fault("DROP", 1, name)
+                result = self.tool("wa", "moni", "setup")
+                self.assertIn("offbox ssh dropped stdin", result.stderr)
+                self.assertEqual((bindir / "wa").read_bytes(), (TOOL_HOME / "box" / "wa").read_bytes())
+                self.assertEqual((bindir / "wa-db").read_bytes(),
+                                 (TOOL_HOME.parent / "robob-watch" / "helpers" / "wa-db").read_bytes())
+                self.assertEqual((self.boxhome / "person" / "run" / "wa-setup.sh").read_bytes(),
+                                 (TOOL_HOME / "box" / "wa-setup.sh").read_bytes())
+                self.assertEqual(self.ssh_calls()[-1]["args"][-1], "bash ~/person/run/wa-setup.sh")
+                self.assertFalse(any(c["args"][-1] == "bash -s" for c in self.ssh_calls()))
+                self.assert_no_write_temps()
+        self.assertEqual((self.tmp / "systemctl.log").read_text().splitlines(), ["--user daemon-reload"] * 3)
+
+    def test_truncated_wa_setup_never_executes_or_replaces_live_script(self):
+        live = self.boxhome / "person" / "run" / "wa-setup.sh"
+        live.parent.mkdir()
+        live.write_text("previous setup script")
+        self.stdin_fault("TRUNCATE", 100, "wa-setup.sh")
+        result = self.tool("wa", "moni", "setup", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(live.read_text(), "previous setup script")
+        self.assertFalse(any(c["args"][-1] == "bash ~/person/run/wa-setup.sh" for c in self.ssh_calls()))
+        self.assert_no_write_temps()
+
+    def test_empty_local_pushes_are_refused_before_replacing_live_files(self):
+        home = self.tmp / "toolhome"
+        shutil.copytree(TOOL_HOME / "box", home / "box")
+        reader = home.parent / "robob-watch" / "helpers" / "wa-db"
+        reader.parent.mkdir(parents=True)
+        shutil.copyfile(TOOL_HOME.parent / "robob-watch" / "helpers" / "wa-db", reader)
+        self.env["OFFBOX_PERSON_HOME"] = str(home)
+        for name, local_file, remote, args in (
+            ("launch.py", home / "box" / "launch.py", "launch.py", ("up", "moni")),
+            ("session.sh", home / "box" / "session.sh", "session.sh", ("up", "moni")),
+            ("wa", home / "box" / "wa", "run/push-wa", ("wa", "moni", "setup")),
+            ("wa-db", reader, "run/push-wa-db", ("wa", "moni", "setup")),
+            ("wa-setup.sh", home / "box" / "wa-setup.sh", "run/wa-setup.sh", ("wa", "moni", "setup")),
+        ):
+            with self.subTest(name=name):
+                content = local_file.read_bytes()
+                local_file.write_bytes(b"")
+                live = self.boxhome / "person" / remote
+                live.parent.mkdir(parents=True, exist_ok=True)
+                live.write_text("previous working copy")
+                result = self.tool(*args, check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("refusing an empty local file", result.stderr)
+                self.assertEqual(live.read_text(), "previous working copy")
+                self.assert_no_write_temps()
+                local_file.write_bytes(content)
+
     def test_run_executes_in_person_work_dir(self):
         self.tool("run", "moni", "--", "echo", "hi")
         runs = [c for c in self.offbox_calls() if c["args"][0] == "run"]
@@ -297,25 +454,29 @@ class OffboxPersonTest(unittest.TestCase):
                     self.assertEqual(len(self.ssh_calls()), 1)
 
     def test_wa_setup_stops_on_box_failure_at_each_step_without_retry(self):
-        for step in range(3):
+        for step in range(7):
             for code in (90, 92):
                 with self.subTest(step=step, code=code):
-                    self.ssh_responses(*([{"exit": 0}] * step), {"exit": code}, {"exit": 0})
+                    self.ssh_responses(*([{"passthrough": True}] * step), {"exit": code}, {"passthrough": True})
                     result = self.tool("wa", "moni", "setup", check=False)
                     self.assertEqual(result.returncode, 90)
                     self.assertEqual(result.stderr,
                                      f"offbox-person: her box didn't start (offbox exit {code}). Her WhatsApp link state is unknown: this is not 'not linked'. Try again in a few minutes.\n"
                                      "offbox-person: the command may have run; check before repeating it.\n")
-                    self.assertEqual(len(self.ssh_calls()), step + 1)
+                    # A failed publish also removes the already verified temp copy.
+                    self.assertEqual(len(self.ssh_calls()), step + 1 + int(step in (1, 3, 5)))
+                    self.assert_no_write_temps()
 
     def test_wa_setup_other_failure_passes_through_without_retry(self):
-        for step in range(3):
+        for step in range(7):
             with self.subTest(step=step):
-                self.ssh_responses(*([{"exit": 0}] * step), {"exit": 17, "stderr": "setup failed\n"})
+                self.ssh_responses(*([{"passthrough": True}] * step), {"exit": 17, "stderr": "setup failed\n"},
+                                   {"passthrough": True})
                 result = self.tool("wa", "moni", "setup", check=False)
                 self.assertEqual(result.returncode, 17)
                 self.assertEqual(result.stderr, "setup failed\n")
-                self.assertEqual(len(self.ssh_calls()), step + 1)
+                self.assertEqual(len(self.ssh_calls()), step + 1 + int(step in (1, 3, 5)))
+                self.assert_no_write_temps()
 
     def test_down_cleans_state_and_stops_tunnels_and_socks(self):
         self.tool("up", "moni")

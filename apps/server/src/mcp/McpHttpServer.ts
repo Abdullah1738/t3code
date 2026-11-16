@@ -7,6 +7,7 @@ import * as ThreadReadDeadline from "./ThreadReadDeadline.ts";
 import * as StartupPhaseLog from "../ardud/observability/StartupPhaseLog.ts";
 import { bootId } from "../ardud/fast-install/report.ts";
 import * as McpCallAnalytics from "../ardud/analytics/McpCall.ts";
+import { delegationIdShape } from "./delegationTaskIdentity.ts";
 import * as CardNextMetrics from "../ardud/analytics/CardNextMetrics.ts";
 import * as SavedWrite from "../ardud/kanban/engine/savedWrite.ts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
@@ -1126,6 +1127,19 @@ const withToolAnalytics =
                       readOnly,
                       boardWrite,
                       inputKeys: inputKeysOf(options.tool),
+                      ...(options.tool.name === "task_status" || options.tool.name === "task_cancel"
+                        ? {
+                            taskLookup: {
+                              idShape: delegationIdShape(
+                                typeof payload === "object" &&
+                                  payload !== null &&
+                                  "taskId" in payload
+                                  ? payload.taskId
+                                  : undefined,
+                              ),
+                            },
+                          }
+                        : {}),
                       ...(options.tool.name === "t3_thread_read"
                         ? {
                             threadRead: {
@@ -1344,7 +1358,9 @@ const withToolAnalytics =
                           ...(callState.cardNumber === undefined
                             ? {}
                             : { cardNumber: callState.cardNumber }),
-                          ...(readOnly ? {} : { saved: outcome.saved ?? "unknown" }),
+                          ...(readOnly && callState.taskLookup === undefined
+                            ? {}
+                            : { saved: outcome.saved ?? "unknown" }),
                         },
                         ...(committed === undefined
                           ? {}
@@ -1359,8 +1375,20 @@ const withToolAnalytics =
                     const complete = yield* ledger.begin(() =>
                       row({
                         outcome: "interrupted_by_shutdown",
-                        props: { code: "unknown", cause: "shutdown" },
-                        ...(readOnly
+                        props: {
+                          code: "unknown",
+                          cause: "shutdown",
+                          ...(callState.taskLookup?.foundBy === undefined
+                            ? {}
+                            : { foundBy: callState.taskLookup.foundBy }),
+                          ...(callState.taskLookup?.idCanonical === undefined
+                            ? {}
+                            : { idCanonical: callState.taskLookup.idCanonical }),
+                          ...(callState.taskLookup?.idShape === undefined
+                            ? {}
+                            : { idShape: callState.taskLookup.idShape }),
+                        },
+                        ...(readOnly && callState.taskLookup === undefined
                           ? {}
                           : {
                               saved:
@@ -1409,7 +1437,21 @@ const withToolAnalytics =
                     });
                     const result = readiness
                       .pipe(Effect.andThen(largeRead ? advance("handler") : Effect.void))
+                      .pipe(
+                        Effect.andThen(
+                          options.tool.name === "t3_thread_read"
+                            ? ThreadReadMetrics.enterPhase("query")
+                            : Effect.void,
+                        ),
+                      )
                       .pipe(Effect.andThen(options.handle(payload)))
+                      .pipe(
+                        Effect.tap(() =>
+                          options.tool.name === "t3_thread_read"
+                            ? ThreadReadMetrics.enterPhase("render")
+                            : Effect.void,
+                        ),
+                      )
                       .pipe(Effect.map(withFailureStructuredContent))
                       .pipe(Effect.provideService(ReplyRejection, rejection));
                     // Large reads run on their own "mcp" lane (whole call, so at most
@@ -1441,7 +1483,15 @@ const withToolAnalytics =
                       (call) =>
                         largeRead
                           ? ReplyBuilders.bounded(
-                              advance("readiness").pipe(Effect.andThen(Effect.map(call, check))),
+                              advance("readiness").pipe(
+                                Effect.andThen(
+                                  options.tool.name === "t3_thread_read"
+                                    ? // Keep the permit outside the detached waiter so masked cleanup
+                                      // cannot retain admission after the read deadline or disconnect.
+                                      McpDeadline.awaitInterruptibly(Effect.map(call, check))
+                                    : Effect.map(call, check),
+                                ),
+                              ),
                               "mcp",
                             )
                           : Effect.map(call, check),
@@ -1470,31 +1520,31 @@ const withToolAnalytics =
                     );
                     // Reuse the bounded-read waiter so masked SQLite cleanup cannot hold the reply.
                     const boundedRead =
-                      options.tool.name === "list_scheduled_tasks"
-                        ? McpDeadline.awaitInterruptibly(completed).pipe(
-                            Effect.timeoutOrElse({
-                              duration: "20 seconds",
-                              orElse: Effect.fn("McpHttpServer.scheduledReadBusy")(function* () {
-                                const now = yield* Clock.monotonicTimeNanos;
-                                return new McpSchema.CallToolResult({
-                                  isError: true,
-                                  content: [
-                                    {
-                                      type: "text",
-                                      text: "Robob is busy; nothing was read. Retry the same call.",
+                      options.tool.name === "t3_thread_read"
+                        ? ThreadReadDeadline.withDeadline(completed)
+                        : options.tool.name === "list_scheduled_tasks"
+                          ? McpDeadline.awaitInterruptibly(completed).pipe(
+                              Effect.timeoutOrElse({
+                                duration: "20 seconds",
+                                orElse: Effect.fn("McpHttpServer.scheduledReadBusy")(function* () {
+                                  const now = yield* Clock.monotonicTimeNanos;
+                                  return new McpSchema.CallToolResult({
+                                    isError: true,
+                                    content: [
+                                      {
+                                        type: "text",
+                                        text: "Robob is busy; nothing was read. Retry the same call.",
+                                      },
+                                    ],
+                                    structuredContent: {
+                                      reason: "server_busy",
+                                      phase,
+                                      waitedMs: Number(now - readStarted) / 1e6,
                                     },
-                                  ],
-                                  structuredContent: {
-                                    reason: "server_busy",
-                                    phase,
-                                    waitedMs: Number(now - readStarted) / 1e6,
-                                  },
-                                });
+                                  });
+                                }),
                               }),
-                            }),
-                          )
-                        : options.tool.name === "t3_thread_read"
-                          ? ThreadReadDeadline.bound(completed)
+                            )
                           : completed;
                     const protectedRead = SavedBoardReply.TIMED_TOOLS.has(options.tool.name)
                       ? SavedBoardReply.protect(boundedRead, options.tool.name)
@@ -1629,7 +1679,9 @@ const withToolAnalytics =
                                 durationMs: Math.max(0, endedAt - startedAt),
                                 props: {
                                   ...outcome.props,
-                                  ...(readOnly ? {} : { saved: outcome.saved ?? "unknown" }),
+                                  ...(readOnly && callState.taskLookup === undefined
+                                    ? {}
+                                    : { saved: outcome.saved ?? "unknown" }),
                                   ...(callState.boardId
                                     ? { boardId: callState.boardId }
                                     : identifiers.boardId

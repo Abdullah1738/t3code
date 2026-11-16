@@ -223,8 +223,8 @@ def _cmd_run(a, me) -> int:
 
 
 def _run_with_retries(a, me) -> int:
-    from . import home
-    with home.run_identity(), home.wait_budget():
+    from . import allocation, home
+    with home.run_identity(), home.wait_budget(), allocation.queue_retries():
         return _run_with_wait_budget(a, me)
 
 
@@ -238,7 +238,7 @@ def _run_with_wait_budget(a, me) -> int:
     explicit_base = full_name(a.base, me['repo_key']) if a.base and not a.fresh else None
     wait_explicit_base = home.active() and home.base_needs_home(explicit_base)
     home.WAIT_STARTED = time.monotonic()
-    from . import api, outage, pool
+    from . import allocation, api, outage, pool
     waited_from = None
     wait_end = None
     capacity_since = capacity_last_say = None
@@ -250,6 +250,7 @@ def _run_with_wait_budget(a, me) -> int:
     try:
         while True:
             try:
+                allocation.check_retry_queue()
                 if waited_from is None:
                     if not preflight_done:
                         preflight_done = True
@@ -261,18 +262,36 @@ def _run_with_wait_budget(a, me) -> int:
                 if capacity_round is not None:
                     pause = outage.CAPACITY_RETRY_S - (time.monotonic() - capacity_round)
                     if pause > 0:
+                        queue_left = allocation.check_retry_queue()
+                        if queue_left is not None:
+                            pause = min(pause, queue_left)
                         time.sleep(min(pause, remaining))
+                        allocation.check_retry_queue()
                         remaining = wait_end - time.monotonic()
                         if remaining <= 0:
                             raise last_outage
                     capacity_round = time.monotonic()
-                with outage.allocation_budget(remaining):
-                    return _remote_once(a, me)
+                with outage.allocation_budget(remaining, pause_queue=capacity_since is None) as idle:
+                    try:
+                        return _remote_once(a, me)
+                    finally:
+                        wait_end += idle['seconds']
+            except home.FailbackReady as ready:
+                # Runner signal handlers and all queue/box scopes must unwind before transferring to a new client.
+                return home.fail_back(ready, getattr(a, "argv", None) or sys.argv[1:])
             except OffboxError as e:
+                if home.active() and os.environ.get(home.RETURNED_HOME_ENV) and home.unreachable(e):
+                    # This invocation already left Boat's queue once. Remain at home through subsequent outages.
+                    say("home offbox server is unavailable again; this run stays queued on home")
+                    runs.retry_background(e, run_id=e.run_id)
+                    if e.run_id:
+                        os.environ[home.RUN_ID_ENV] = e.run_id
+                    time.sleep(home.failback_probe_seconds())
+                    continue
                 runs.retry_background(e)
                 run_id = e.run_id or os.environ.get(runs.BACKGROUND_RUN_ENV, '')
-                if isinstance(e, pool.PoolBusyError) and waited_from is not None and last_outage is not None and \
-                        time.monotonic() >= wait_end and not e.started:
+                if isinstance(e, pool.PoolBusyError) and not e.queue_expired and waited_from is not None and \
+                        last_outage is not None and time.monotonic() >= wait_end and not e.started:
                     raise last_outage
                 if home.active() and home.unreachable(e):
                     last_home_outage = e
@@ -324,20 +343,31 @@ def _run_with_wait_budget(a, me) -> int:
                     if capacity_since is None:
                         capacity_since = outage.now()
                         capacity_round = time.monotonic()
+                    capacity_end = wait_end
+                    queue_left = allocation.check_retry_queue()
+                    if queue_left is not None:
+                        capacity_end = min(capacity_end, time.monotonic() + queue_left)
                     retry, capacity_last_say = outage.wait_for_capacity(
-                        waited_from, capacity_since, capacity_last_say, wait_end - waited_from)
+                        waited_from, capacity_since, capacity_last_say, capacity_end - waited_from)
                     if retry:
                         continue
+                    allocation.check_retry_queue()
                     raise
                 left = wait_end - time.monotonic()
+                queue_left = allocation.retry_queue_left()
+                if queue_left is not None:
+                    left = min(left, queue_left)
                 service = {'service': 'home offbox server'} if wait_explicit_base else {}
                 with home.pre_start(run_id) if wait_explicit_base else contextlib.nullcontext():
                     if left > 0 and outage.wait_until_up(outage.reason_of(e), left, **service):
                         continue
+                allocation.check_retry_queue()
                 if wait_explicit_base and home.unreachable(e):
                     raise home.base_down_error(explicit_base, str(e)) from e
                 raise outage.down_error(e, time.monotonic() - waited_from) from e
     except OffboxError as e:
+        if e.code == EXIT_INFRA and not e.started and allocation.retry_queue_left() == 0:
+            e = pool.PoolBusyError("allocation queue timed out; nothing ran", queue_expired=True)
         # A retry's local deadline can expire after a successful probe without carrying an outage flag.
         if wait_explicit_base and not e.started and (home.unreachable(e) or
                 (last_home_outage is not None and e.code == EXIT_INFRA and api.client_budget_expired(e))):

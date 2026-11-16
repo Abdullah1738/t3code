@@ -20,6 +20,7 @@ import {
   ProviderOptionSelection,
   TrimmedNonEmptyString,
 } from "@t3tools/contracts";
+import { ExactEdits } from "../engine/exactEdits.ts";
 import { Tool, Toolkit } from "effect/ai";
 import * as Schema from "effect/Schema";
 
@@ -227,7 +228,7 @@ const BoardGet = tool(
 const BoardActivity = tool(
   "board_activity",
   "Board activity rollup",
-  "A board's activity in a window (default the last 24 hours, at most 72): every ask answered in the window with asked/answered times and minutes to answer (p50/p90/max), open asks and asks open over 6 hours, review rounds and verdicts per card, hours in each stage with dwell median/p95/max and the longest spans, open cards in one stage over 24 hours, stalls and how long they lasted, run failures (stalled, retried, fresh thread, reviewer without verdict) by kind and model, threads started, restarts and evaluator starts (new threads; evaluatorWakes is a compatibility alias), cards left in working or in_review with no thread, and an estimate of pool slots held per hour per model next to each pool's slots. Card numbers only, no titles or text. Read from the cards' stored history; long lists other than the answered asks are cut and say how many more.",
+  "A board's activity in a window (default the last 24 hours, at most 72): asks answered in the window with asked/answered times and minutes to answer (p50/p90/max), open counts asks that need an answer; open notices are counted in openNotices. Answer times are also split by kind (missing kind is question) and blocking, with separate counts for decisions and notices open over 6 hours; review rounds and verdicts per card, hours in each stage with dwell median/p95/max and the longest spans, open cards in one stage over 24 hours, stalls and how long they lasted, run failures (stalled, retried, fresh thread, reviewer without verdict) by kind and model, threads started, restarts and evaluator starts (new threads; evaluatorWakes is a compatibility alias), cards left in working or in_review with no thread, and an estimate of pool slots held per hour per model next to each pool's slots. Queued todo/needs_review cards include why they wait (pool full with rank, cards ahead and slot holders, blocked, waiting, and other dispatch gates), plus those queued over 6 hours. Card numbers only, no titles or text. Read from the cards' stored history. Lists are shortened to fit 50,000 characters and say how many more; answeredItems stays an array, with answeredItemsMore when some are omitted; an oversized kind breakdown reports omitted groups in answerMinutesByKindMore.",
   {
     boardId: BoardRef,
     since: Schema.optional(
@@ -849,13 +850,15 @@ const CardNext = tool(
 const CardEdit = tool(
   "card_edit",
   "Edit a card",
-  "Evaluators: change any card field. Links are added by URL and removeLinks takes them off by URL (both in one call replace a link); blockedBy replaces the list.",
+  "Evaluators: change any card field. Links are added by URL and removeLinks takes them off by URL (both in one call replace a link); blockedBy replaces the list. promptEdits / subtaskEdits: exact find-and-replace on the prompt / open subtask texts; each oldString must appear exactly count times (default 1) in the text as left by the edits before it; all apply or none do. Not with prompt / subtasks in the same call.",
   {
     boardId: BoardRef,
     card: CardRef,
     title: Schema.optional(Schema.String),
     description: Schema.optional(Schema.String),
     prompt: Schema.optional(Schema.String),
+    promptEdits: Schema.optional(ExactEdits),
+    subtaskEdits: Schema.optional(ExactEdits),
     priority: Schema.optional(
       describe(
         KanbanPriority,
@@ -1027,15 +1030,7 @@ const WikiWrite = tool(
     slug: TrimmedNonEmptyString,
     title: Schema.optional(RawBoardText),
     body: Schema.optional(Schema.String),
-    edits: Schema.optional(
-      Schema.Array(
-        Schema.Struct({
-          oldString: Schema.String.check(Schema.isMinLength(1)),
-          newString: Schema.String,
-          count: Schema.optional(PositiveInt),
-        }),
-      ).check(Schema.isMinLength(1), Schema.isMaxLength(50)),
-    ),
+    edits: Schema.optional(ExactEdits),
   },
   { page: Record },
   { readonly: false },

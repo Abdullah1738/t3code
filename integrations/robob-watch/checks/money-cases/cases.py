@@ -107,7 +107,7 @@ FOLLOW_BUDGET = 20  # seconds of archive lookups per check
 ORDER_RESERVE = 12
 ORDER_SCREEN_BUDGET = 1
 FOLLOW_STEPS = ('merchants', 'order_charges', 'payments', 'questions', 'refunds',
-                'owner_threads', 'msgs', 'receipt', 'lookups', 'order_screen', 'census', 'loads', 'writes', 'locks')
+                'owner_threads', 'msgs', 'history', 'receipt', 'lookups', 'order_screen', 'census', 'loads', 'writes', 'locks')
 TIMING_KEYS = tuple(name + '_ms' for name in FOLLOW_STEPS) + ('msgs_max_ms', 'follow_ms', 'untimed_ms', 'writes_n')
 FOLLOW_EACH = 6  # at most this many of them per question, least recently checked first
 DONT_ASK = 3
@@ -2723,6 +2723,7 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
         census = stats['charge_census'] = {app: dict.fromkeys(
             ('open', 'matched', 'proven_clean', 'limited', 'error', 'not_checked'), 0)
             for app in ('noon', 'careem')}
+        census['noon'].update(marketplace_hold=0, marketplace_stale=0)
         census_questions = {}
         for q in questions:
             app = charges.order_app(charge_of(q)) if q.get('kind') == 'charge' and active(q) else None
@@ -2743,7 +2744,8 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
             census[app]['not_checked'] -= 1
         census[app][outcome] += 1
 
-    memo = {('orders_cache',): Path(data) / 'order-details.json'}
+    memo = {('orders_cache',): Path(data) / 'order-details.json',
+            ('msgs_cache',): Path(data) / 'msgs-searches.json'}
     for app in ('noon', 'careem'):
         times = [at - charges.SAME_TIME for _, at, q in todo
                  if q.get('kind') == 'charge' and charges.order_app(charge_of(q)) == app]
@@ -2969,6 +2971,9 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
                                            for source, _ in peers)
                         counted(q['id'], 'error' if failed_alias else 'limited')
         prune_questions(book, now)
+    for kind in ('marketplace_hold', 'marketplace_stale'):
+        census['noon'][kind] = sum(census_outcomes.get(qid) == 'limited' and kind in limit['kinds']
+                                   for qid, limit in order_limits.items())
     return errors
 
 
@@ -3108,7 +3113,7 @@ def direct_refund_statement(evidence, done, merchant):
 
 
 def refund_mails(data, now, deadline, find=None, read=None, stats=None):
-    find = find or (lambda *a, **kw: charges.search(*a, **kw, stats=stats))
+    find = find or (lambda *a, **kw: charges.search(*a, **kw, stats=stats, all_copies=True))
     read = read or (lambda *a, **kw: charges.show(*a, **kw, stats=stats))
     errors = []
     for case in load(data)['cases']:
@@ -3123,7 +3128,9 @@ def refund_mails(data, now, deadline, find=None, read=None, stats=None):
         try:
             with within(deadline, LookupTimeout('out of time')):
                 rows = find(' OR '.join(f'"{w}"' for w in words) + ' refund OR credited', charges.day(since),
-                            source='email', n=10, deadline=deadline)
+                            until=charges.day(now + dt.timedelta(days=1)), source='email', n=10, deadline=deadline)
+                if getattr(rows, 'raw_count', len(rows)) >= 10:
+                    raise charges.Lookup('refund scan incomplete: search limit reached')
                 for row in sorted(rows, key=lambda row: row['ts'], reverse=True):
                     mailed = dt.datetime.fromtimestamp(row['ts'], TZ)
                     sender = row.get('sender', '').lower()
@@ -3477,6 +3484,8 @@ def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
         diagnostic['ok'] = diagnostic.get('complete', True)
         return event
     finally:
+        from marketplace import refresh_status, launch_refresh
+        marketplace_refresh = refresh_status(data or DATA)
         try:
             # The check owns the start and timing samples; logging adds no second timer.
             duration = diagnostic.get('total_s')
@@ -3492,12 +3501,18 @@ def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
                                 'limitKinds': diagnostic.get('limitKinds', []),
                                 'orderCoverage': diagnostic.get('order_coverage', {}),
                                 'chargeCensus': diagnostic.get('charge_census', {}),
+                                'marketplace_refresh': marketplace_refresh,
                                 **{key: stats.get(key, 0) for key in (*TIMING_KEYS, *charges.OWNER_TIMING_KEYS)},
                                 'owner_result': stats.get('owner_result', 'ok'),
                                 **charges.receipt_timing(stats),
                                 'starved_by': stats.get('starved_by', diagnostic.get('starved_by', 'none'))})
         except Exception:
             pass
+        if marketplace_refresh == 'started':
+            try:
+                launch_refresh(data or DATA)
+            except OSError:
+                record_event('marketplace.refresh', kind='error', ok=False, props={'result': 'launch_error'})
 
 
 def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *, diagnostic):

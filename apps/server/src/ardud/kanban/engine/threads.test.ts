@@ -2723,3 +2723,57 @@ it.effect("#1574 assignment queue preserves a busy run and replays once", () => 
     ),
   );
 });
+
+it.effect.each([
+  "missing",
+  "rejected",
+  "accepted",
+  "accepted retry",
+  "wrong command",
+  "wrong aggregate",
+] as const)("#1561 durable send lookup reconciles $0 receipts without a live thread", (form) =>
+  Effect.gen(function* () {
+    const receipts = yield* CommandReceipts.OrchestrationCommandReceiptRepository;
+    if (form !== "missing") {
+      const status =
+        form === "rejected" || form === "accepted retry"
+          ? ("rejected" as const)
+          : ("accepted" as const);
+      const receipt = {
+        commandId: CommandId.make("kanban:send:durable-key"),
+        aggregateKind: form === "wrong aggregate" ? ("project" as const) : ("thread" as const),
+        aggregateId:
+          form === "wrong aggregate"
+            ? ProjectId.make("original-recipient")
+            : ThreadId.make("original-recipient"),
+        commandType: form === "wrong command" ? "run.interrupt" : "message.dispatch",
+        acceptedAt: QUESTION_AT,
+        resultSequence: 1,
+        status,
+        error: status === "rejected" ? "rejected" : null,
+      };
+      yield* receipts.insertIfAbsent(receipt);
+      if (form === "accepted retry")
+        yield* receipts.insertIfAbsent({
+          ...receipt,
+          commandId: CommandId.make("kanban:send:durable-key:retry:1"),
+          status: "accepted",
+          error: null,
+        });
+    }
+    const threads = yield* KanbanThreads;
+    const found = yield* Effect.result(threads.acceptedSend!("durable-key"));
+    expect(Result.isSuccess(found)).toBe(!form.startsWith("wrong"));
+    if (Result.isSuccess(found))
+      expect(found.success).toBe(form.startsWith("accepted") ? "original-recipient" : null);
+  }).pipe(
+    Effect.provide(
+      layer.pipe(
+        Layer.provide(Layer.mock(ThreadManagementService.ThreadManagementService)({})),
+        Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+        Layer.provideMerge(CommandReceipts.layer),
+        Layer.provide(Sqlite.layerMemory),
+      ),
+    ),
+  ),
+);

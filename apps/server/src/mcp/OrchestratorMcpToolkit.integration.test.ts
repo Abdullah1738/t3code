@@ -1,3 +1,4 @@
+import { expectJsonRoundTrip } from "./McpJson.testkit.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
@@ -93,8 +94,7 @@ const layerOrchestratorToolkit = McpHttpServer.layerOrchestratorToolkit.pipe(
   Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
 );
 
-// Effect returns a declared tool failure as `isError` with its encoded payload
-// as JSON text, never as `structuredContent`.
+// Read Effect's encoded failure text independently of McpHttpServer's structured copy.
 const declaredFailure = (result: McpSchema.CallToolResult) => {
   const text = result.content[0];
   return result.isError === true && text?.type === "text" ? JSON.parse(text.text) : undefined;
@@ -869,7 +869,9 @@ describe("orchestrator MCP toolkit", () => {
                 ...(name === "t3_queue_edit" ? { text: "Keep the active turn." } : {}),
               });
               expect(refusedQueueMutation.isError).toBe(true);
-              expect(refusedQueueMutation.structuredContent).toBeUndefined();
+              expect(refusedQueueMutation.structuredContent).toEqual(
+                declaredFailure(refusedQueueMutation),
+              );
               expect(declaredFailure(refusedQueueMutation)).toEqual({
                 _tag: "OrchestratorMcpFailure",
                 code: "orchestration_error",
@@ -1322,7 +1324,9 @@ describe("orchestrator MCP toolkit", () => {
               code: "thread_not_found",
               message: "The thread was not found.",
             });
-            expect(missingThreadQueue.structuredContent).toBeUndefined();
+            expect(missingThreadQueue.structuredContent).toEqual(
+              declaredFailure(missingThreadQueue),
+            );
             expect(validateQueue({ items: "invalid", nextCursor: null }).valid).toBe(false);
             const missingThreadRead = yield* invoke("t3_thread_read", {
               threadId: missingThreadId,
@@ -4562,9 +4566,10 @@ describe("orchestrator MCP toolkit", () => {
               Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
               Effect.provideService(McpSchema.McpServerClient, client),
               Effect.tap((response) =>
-                Effect.sync(() =>
-                  expect(response.isError, JSON.stringify({ name, response })).not.toBe(true),
-                ),
+                Effect.sync(() => {
+                  expect(response.isError, JSON.stringify({ name, response })).not.toBe(true);
+                  expectJsonRoundTrip(response.structuredContent);
+                }),
               ),
             );
 

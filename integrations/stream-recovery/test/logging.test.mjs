@@ -21,8 +21,62 @@ test('scan deferrals count distinct ancestry units and aggregate nested maxima',
   for (const lane of ['stream','restart']) {
     const row = rows().find(row => row.name === `${lane}.scan`);
     assert.equal(row.ok, true);
-    assert.deepEqual(row.props, {deferredThreads:2,maxThreadAheadMs:2_500});
+    assert.equal(row.props.deferredThreads, 2);
+    assert.equal(row.props.maxThreadAheadMs, 2_500);
+    assert.equal(typeof row.props.loopBlockMaxMs, 'number');
+    assert.equal(row.props.longestSyncMs, 0);
+    assert.equal(row.props.longestSyncOp, undefined);
   }
+});
+
+for (const lane of ['stream', 'restart', 'stall']) {
+  for (const throws of [false, true]) test(`${lane} records loop delay and longest sync IO on ${throws ? 'failure' : 'success'}`, async t => {
+    const { rows } = fixture(t);
+    let clock = 0;
+    t.mock.method(performance, 'now', () => clock);
+    const error = new Error('private');
+    const io = {
+      openDb:() => {clock += 5; return 42;},
+      failedRunsSince:() => {clock += 37; if (throws) throw error; return [];},
+      activeSessions:async () => {await Promise.resolve(); clock += 1000; return new Set();},
+    };
+    const scan = timedScan(lane, io, async timed => {
+      for (let n = 0; n < 10; n++) assert.equal(timed.openDb(), 42);
+      assert.deepEqual(await timed.activeSessions(), new Set());
+      assert.deepEqual(timed.failedRunsSince(), []);
+    });
+    if (throws) await assert.rejects(scan, e => e === error); else await scan;
+    const row = rows().find(row => row.name === `${lane}.scan`);
+    assert.equal(row.ok, !throws);
+    assert.equal(typeof row.props.loopBlockMaxMs, 'number');
+    assert.ok(Number.isInteger(row.props.loopBlockMaxMs) && row.props.loopBlockMaxMs >= 0);
+    assert.equal(row.props.longestSyncOp, 'failedRunsSince');
+    assert.equal(row.props.longestSyncMs, 37);
+    assert.equal(rows().find(row => row.name === `${lane}.phase` && row.props.phase === 'activeSessions').durationMs, 1000);
+  });
+}
+
+test('nested scans measure sync IO independently and unknown IO names stay out', async t => {
+  const { rows } = fixture(t);
+  let clock = 0;
+  t.mock.method(performance, 'now', () => clock);
+  const io = {openDb:() => {clock += 75;}, failedRunsSince:() => {clock += 37;},
+    '/private path':() => {clock += 5000;}};
+  await timedScan('stream', io, async outer => {
+    outer.openDb();
+    await timedScan('restart', outer, inner => {
+      inner.failedRunsSince();
+      inner['/private path']();
+    });
+  });
+  const outer = rows().find(row => row.name === 'stream.scan');
+  const inner = rows().find(row => row.name === 'restart.scan');
+  assert.equal(outer.props.longestSyncOp, 'openDb');
+  assert.equal(outer.props.longestSyncMs, 75);
+  assert.equal(inner.props.longestSyncOp, 'failedRunsSince');
+  assert.equal(inner.props.longestSyncMs, 37);
+  for (const row of [outer, inner]) assert.equal(typeof row.props.loopBlockMaxMs, 'number');
+  assert.ok(!JSON.stringify(rows()).includes('/private path'));
 });
 
 test('scan timings aggregate repeated IO, preserve sync results, and bound output', async t => {

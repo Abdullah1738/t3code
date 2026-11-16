@@ -57,7 +57,9 @@ function fields(entry: LogEntry, at: Date) {
   for (const [key, value] of Object.entries(entry.props ?? {})) {
     if ((key === "exitCode" || key === "signal") && value === null) props[key] = null;
     else if (key === "stderrLines" && typeof value === "number" && Number.isSafeInteger(value) && value >= 0) props[key] = value;
-    else if (key === "stderrHash" && typeof value === "string" && /^[a-f0-9]{16}$/.test(value)) props[key] = value;
+    else if ((key === "stderrHash" || key === "triggerPathHash") && typeof value === "string" && /^[a-f0-9]{16}$/.test(value)) props[key] = value;
+    else if (key === "missingSince" && typeof value === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)
+      && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value) props[key] = value;
     else if (key === "errnoCode" && typeof value === "string" && (errnoCodes.has(value) || value === "UNKNOWN")) props[key] = value;
     else if (key === "signal" && typeof value === "string" && signals.has(value)) props[key] = value;
     else if ((entry.name === "watch.grace_ended" || entry.name === "watch.removed") && key === "reason" && typeof value === "string"

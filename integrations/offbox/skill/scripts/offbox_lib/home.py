@@ -36,11 +36,15 @@ HOME_START_WAIT_S = START_WAIT_S
 PRE_START = contextvars.ContextVar("home_pre_start", default=None)
 WAIT_BUDGET = contextvars.ContextVar("home_wait_budget", default=None)
 FAILOVER_ENV = "OFFBOX_FAILOVER"      # set in the re-executed process: why this run is on Boat ("unreachable: ...")
+RETURNED_HOME_ENV = "OFFBOX_RETURNED_HOME"
+ROUTING_ENV = "OFFBOX_ROUTING_LINES"
+FAILBACK_PROBE_S = 30
 MAX_FAILURE_LINES = 200
 RECENT_FAILURE_S = 180
 RUN_ID_ENV = "OFFBOX_PREFLIGHT_RUN"
 INVOCATION_RUN = contextvars.ContextVar("home_invocation_run", default="")
 QUEUE_WAIT = contextvars.ContextVar("home_queue_wait", default=0.0)
+BOAT_SELECTED = contextvars.ContextVar("home_boat_selected", default=False)
 WAIT_STARTED = None
 PROBE_FACTS = contextvars.ContextVar("home_probe_facts", default=None)
 
@@ -50,9 +54,11 @@ def run_identity():
     token = INVOCATION_RUN.set(os.environ.get("OFFBOX_BACKGROUND_RUN") or os.environ.get(RUN_ID_ENV)
                                or (common.new_id("run") if may_fail_over() else ""))
     queue_token = QUEUE_WAIT.set(0.0)
+    selected_token = BOAT_SELECTED.set(False)
     try:
         yield
     finally:
+        BOAT_SELECTED.reset(selected_token)
         QUEUE_WAIT.reset(queue_token)
         INVOCATION_RUN.reset(token)
 
@@ -95,7 +101,7 @@ def failover_decision(decision: str, reason: str, base: str | None = None, run_i
 def may_fail_over(explicit_base: str | None = None) -> bool:
     """The home server was picked automatically for ordinary work: Boat may take this run instead."""
     return (active() and common.backend_pinned() is None and common.person() is None
-            and not base_needs_home(explicit_base))
+            and not os.environ.get(RETURNED_HOME_ENV) and not base_needs_home(explicit_base))
 
 
 def health_url() -> str | None:
@@ -103,10 +109,10 @@ def health_url() -> str | None:
     return c["url"].rstrip("/") + "/health" if c else None
 
 
-def probe(timeout: float = PROBE_TIMEOUT_S) -> str | None:
+def probe(timeout: float = PROBE_TIMEOUT_S, *, wait: bool = True) -> str | None:
     with toollog.span("health", "home.probe", tag="home_probe") as data:
         with wait_budget():
-            result = _probe(timeout)
+            result = _probe(timeout) if wait else _probe(min(5, timeout), wait=False)
         data["ok"] = result is None
         return result
 
@@ -209,6 +215,7 @@ def wait_while_starting(reason, run_id="", *, checkpoint="probe", box=None,
     phase = reason if isinstance(reason, str) else starting_phase(reason)
     slow = phase == "slow"
     start = clock()
+    from . import allocation, outage
     begin_transient(clock)
     episode_end = WAIT_BUDGET.get()["transient_since"] + wait_seconds()
     slow_cap = deadline if slow else None
@@ -218,9 +225,15 @@ def wait_while_starting(reason, run_id="", *, checkpoint="probe", box=None,
         if slow:
             end = slow_deadline(clock, slow_cap)
             inherited = wait_budget_end()
-            return min(end, inherited, episode_end) if inherited is not None else min(end, episode_end)
-        end = wait_deadline(wait_seconds(), clock=clock)
-        return min(end, startup_cap, episode_end) if startup_cap is not None else min(end, episode_end)
+            end = min(end, inherited, episode_end) if inherited is not None else min(end, episode_end)
+        else:
+            end = wait_deadline(wait_seconds(), clock=clock)
+            end = min(end, startup_cap, episode_end) if startup_cap is not None else min(end, episode_end)
+        if not outage.machine_accepted():
+            queued_left = allocation.queue_left() if allocation.in_queue() else allocation.retry_queue_left()
+            if queued_left is not None:
+                end = min(end, clock() + queued_left)
+        return end
 
     if not slow:
         note_home_answer(clock, ready=False)
@@ -272,13 +285,13 @@ def _health_reason(data):
     return f"server says it cannot take runs ({why or 'not ready'})"
 
 
-def _probe(timeout: float = PROBE_TIMEOUT_S) -> str | None:
+def _probe(timeout: float = PROBE_TIMEOUT_S, *, wait: bool = True) -> str | None:
     start = time.monotonic()
-    data = _health(timeout)
+    data = _health(timeout) if wait else _health(timeout, bounded=True)
     if timed_out(data) or starting_phase(data):
         begin_transient(began=start)
     classification = "good" if isinstance(data, dict) and data.get("ok") is True else "hard"
-    reachable = tcp_connects(health_url() or "") if timed_out(data) else None
+    reachable = tcp_connects(health_url() or "") if wait and timed_out(data) else None
     if reachable:
         classification = "slow"
         elapsed = (time.monotonic() - start) * 1000
@@ -295,7 +308,7 @@ def _probe(timeout: float = PROBE_TIMEOUT_S) -> str | None:
     if phase:
         classification = "starting"
     PROBE_FACTS.set({"class": classification, "tcp": reachable, "ms": round((time.monotonic()-start)*1000, 1)})
-    if phase or classification == "slow":
+    if wait and (phase or classification == "slow"):
         result = wait_while_starting(phase or "slow", invocation_run(),
                                     checkpoint="person" if common.person() else "probe",
                                     deadline=start + slow_down_seconds() if classification == "slow" else None)
@@ -305,20 +318,32 @@ def _probe(timeout: float = PROBE_TIMEOUT_S) -> str | None:
     return None if isinstance(data, dict) and data.get("ok") is True else _health_reason(data)
 
 
-def _health(timeout: float = PROBE_TIMEOUT_S):
+def _health(timeout: float = PROBE_TIMEOUT_S, *, bounded=False):
     """One GET /health (no token): its JSON body or a short transport failure reason."""
     url = health_url()
     if not url:
         return "no home server configured"
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, headers={"Accept": "application/json"}),
-                                    timeout=timeout) as r:
-            d = json.loads(r.read() or b"{}")
+        request = urllib.request.Request(url, headers={"Accept": "application/json"})
+        if bounded:
+            from . import api
+            scope = api.RequestScope(timeout, network_timeout=True)
+            with scope.active(), scope.request():
+                with api._open(request, timeout=timeout) as response:
+                    d = json.loads(api._read_response(response, scope.end) or b"{}")
+        else:
+            with urllib.request.urlopen(request, timeout=timeout) as r:
+                d = json.loads(r.read() or b"{}")
     except urllib.error.HTTPError as e:
         return f"health answered HTTP {e.code}"
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, OffboxError) as e:
         kind = type(getattr(e, "reason", e)).__name__
         return f"no answer ({kind})"
+    if isinstance(d, dict):
+        from . import disk_pressure
+        why = disk_pressure.health_reason(d)
+        if why:
+            return why
     return d
 
 
@@ -353,12 +378,13 @@ def slow_read_reachable(deadline=None):
 
 def recover_slow_read(error, read, *, box, deadline=None):
     """Retry a timed-out box observation in place; no allocation send is repeated here."""
-    from . import api, allocation, prepare
+    from . import api, allocation, outage, prepare
     if not active():
         raise error
     queue = allocation._QUEUE.get()
     if queue is not None:
-        QUEUE_WAIT.set(queue.get("queue_wait_s", max(0, queue['wait'] - (queue['end'] - time.monotonic()))))
+        started = queue.get('started', queue['end'] - queue['wait'])
+        QUEUE_WAIT.set(queue.get("queue_wait_s", max(0, time.monotonic() - started)))
     if not timed_out(error):
         raise error
     if WAIT_BUDGET.get() is None:
@@ -373,8 +399,14 @@ def recover_slow_read(error, read, *, box, deadline=None):
         home_ends.append(wait_budget_end())
     home_end = min(home_ends)
 
+    def unaccepted_queue_left():
+        return None if outage.machine_accepted() else allocation.queue_left()
+
     def check_caller():
-        allocation.check_queue()
+        if outage.machine_accepted():
+            allocation.check_source()
+        else:
+            allocation.check_queue()
         if caller_end is not None and time.time() >= caller_end:
             raise api.BudgetExpired(f"client deadline passed while reading {box}; nothing ran")
 
@@ -389,7 +421,7 @@ def recover_slow_read(error, read, *, box, deadline=None):
             ends.append(slow_deadline(time.monotonic, began + slow_down_seconds()))
         if caller_end is not None:
             ends.append(time.monotonic() + max(0, caller_end - time.time()))
-        queue_left = allocation.queue_left()
+        queue_left = unaccepted_queue_left()
         if queue_left is not None:
             ends.append(time.monotonic() + queue_left)
         return max(0, min(ends) - time.monotonic())
@@ -411,7 +443,7 @@ def recover_slow_read(error, read, *, box, deadline=None):
         if timeout <= 0:
             return "no answer (TimeoutError)"
         try:
-            queue_left = allocation.queue_left()
+            queue_left = unaccepted_queue_left()
             ends = [end for end in (caller_end, time.time() + max(0, home_end - time.monotonic()),
                                     time.time() + queue_left if queue_left is not None else None)
                     if end is not None]
@@ -436,7 +468,7 @@ def recover_slow_read(error, read, *, box, deadline=None):
     caller_bounds = [home_end]
     if caller_end is not None:
         caller_bounds.append(time.monotonic() + max(0, caller_end - time.time()))
-    queue_left = allocation.queue_left()
+    queue_left = unaccepted_queue_left()
     if queue_left is not None:
         caller_bounds.append(time.monotonic() + queue_left)
     budget = WAIT_BUDGET.get()
@@ -510,6 +542,8 @@ def preflight_reason() -> str | None:
     recent = recent_failure()
     PROBE_FACTS.set(None)
     why = probe()
+    if why and "disk" in why:
+        return why
     health_ok = why is None
     if why and (PROBE_FACTS.get() or {}).get("tcp") is False:
         return why
@@ -593,6 +627,8 @@ def fail_over(reason: str, argv: list[str], run_id: str = "", *, explicit_base: 
     from . import api
     from .runs import BACKGROUND_RUN_ENV
     run_id = run_id or invocation_run()
+    if os.environ.get(RETURNED_HOME_ENV):
+        return False
     if common.person() is not None:
         raise OffboxError("person work waits on home; nothing was sent to Boat", code=EXIT_HOME_DOWN)
     failover_decision('boat', 'unreachable', explicit_base, run_id)
@@ -609,11 +645,17 @@ def fail_over(reason: str, argv: list[str], run_id: str = "", *, explicit_base: 
     elapsed = max(0, time.monotonic() - WAIT_STARTED)*1000 if WAIT_STARTED is not None else 0
     toollog.emit("backend", "backend.failover", duration_ms=elapsed, ok=True, ids={"run": run_id},
                  props={"from": "home", "to": "boat", "reason": "unreachable", "waitMs": elapsed})
-    monitor = common.home_state()
-    classification = failure_class(reason)
-    say(f"home offbox server not reachable ({reason[:160]}); this run goes to Boat instead "
-        f"class={classification} run={run_id or '-'} monitor_last_check={monitor.get('last_check')} "
-        f"monitor_last_outcome={monitor.get('last_outcome')}")
+    if 'low on disk' in reason:
+        detail = reason[reason.index('low on disk'):]
+        routing_line(f"home offbox server is {detail}; this run is going to Boat", run_id)
+    elif 'out of disk' in reason:
+        routing_line('home server out of disk; this run is going to Boat', run_id)
+    else:
+        monitor = common.home_state()
+        classification = failure_class(reason)
+        routing_line(f"home offbox server not reachable ({reason[:160]}); this run goes to Boat instead "
+            f"class={classification} run={run_id or '-'} monitor_last_check={monitor.get('last_check')} "
+            f"monitor_last_outcome={monitor.get('last_outcome')}", run_id)
     log(f"failover to boat: {reason[:300]}")
     env = dict(os.environ, OFFBOX_BACKEND="boat")
     env[FAILOVER_ENV] = reason[:200]
@@ -632,26 +674,114 @@ def fail_over(reason: str, argv: list[str], run_id: str = "", *, explicit_base: 
     os.execve(sys.executable, [sys.executable, os.path.realpath(sys.argv[0]), *argv], env)
 
 
-def _forward_background(run_id: str) -> None:
-    """Publish the same queued ID on Boat before retiring its home row; existing waiters can follow the handoff."""
-    source = common.db()
+def _forward_background(run_id: str, source_backend="server", target_backend="boat") -> None:
+    """Publish a queued ID at its destination before retiring the source; followers use status/error to route."""
+    # Opposite transfers share this lock so neither can hold one DB writer while waiting for the other.
+    with common.file_lock("backend-handoff", timeout=30):
+        _forward_queued(run_id, source_backend, target_backend)
+
+
+def _forward_queued(run_id, source_backend, target_backend):
+    source = common.db() if source_backend == "server" and target_backend == "boat" else sqlite3.connect(
+        common.db_path_for(source_backend), isolation_level=None)
+    source.row_factory = sqlite3.Row
     target = None
     try:
-        row = source.execute('SELECT * FROM runs WHERE run_id=?', (run_id,)).fetchone()
-        if not row or row['status'] != 'starting' or row['box_id'] or row['process_id']:
-            raise OffboxError(f'{run_id}: refusing failover after a possible start', started=True)
-        target = sqlite3.connect(common.db_path_for('boat'), isolation_level=None)
-        common.ensure_schema(target)
-        names = list(row.keys())
-        with common.write(target):
-            target.execute('INSERT INTO runs (' + ','.join(names) + ') VALUES (' + ','.join('?' for _ in names) + ')', tuple(row))
-            target.execute("INSERT INTO kv(k,v) VALUES (?, '1')", ('start_claim:' + run_id,))
-        source.execute("UPDATE runs SET status='forwarded',error='boat',end_at=? WHERE run_id=? "
-                       "AND status='starting' AND box_id IS NULL AND process_id IS NULL", (common.now(), run_id))
+        common.ensure_schema(source)
+        with common.write(source):
+            row = source.execute('SELECT * FROM runs WHERE run_id=?', (run_id,)).fetchone()
+            if not row or row['status'] != 'starting' or row['box_id'] or row['process_id']:
+                raise OffboxError(f'{run_id}: refusing failover after a possible start', started=True)
+            target = sqlite3.connect(common.db_path_for(target_backend), isolation_level=None)
+            target.row_factory = sqlite3.Row
+            common.ensure_schema(target)
+            names = list(row.keys())
+            with common.write(target):
+                previous = target.execute('SELECT * FROM runs WHERE run_id=?', (run_id,)).fetchone()
+                if previous:
+                    if (previous['status'] != 'forwarded' or previous['error'] != source_backend
+                            or previous['box_id'] or previous['process_id']):
+                        raise OffboxError(f'{run_id}: refusing failover after a possible start', started=True)
+                    target.execute('DELETE FROM runs WHERE run_id=?', (run_id,))
+                target.execute('INSERT INTO runs (' + ','.join(names) + ') VALUES (' + ','.join('?' for _ in names) + ')', tuple(row))
+                target.execute("INSERT OR REPLACE INTO kv(k,v) VALUES (?, '1')", ('start_claim:' + run_id,))
+                if target_backend == "boat":
+                    target.execute("INSERT OR REPLACE INTO kv(k,v) VALUES (?, '1')", ('failover_queue:' + run_id,))
+            source.execute("UPDATE runs SET status='forwarded',error=?,end_at=? WHERE run_id=?",
+                           (target_backend, common.now(), run_id))
     finally:
         source.close()
         if target is not None:
             target.close()
+
+
+def failed_over() -> bool:
+    return (common.backend() == "boat" and bool(os.environ.get(FAILOVER_ENV))
+            and not common.person() and not os.environ.get(RETURNED_HOME_ENV))
+
+
+def unlimited_queue():
+    return failed_over() or (active() and bool(os.environ.get(RETURNED_HOME_ENV)))
+
+
+def failback_probe_seconds():
+    from . import capacity
+    return capacity.setting("OFFBOX_FAILBACK_PROBE_S", FAILBACK_PROBE_S, minimum=1, maximum=3600)
+
+
+class FailbackReady(BaseException):
+    # Unwind every pool lock/queue scope before exec, without settling an unstarted run as a failure.
+    def __init__(self, run_id, waited, state):
+        self.run_id, self.waited, self.state = run_id, waited, state
+
+
+def flush_routing(run_id):
+    lines = list(dict.fromkeys(json.loads(os.environ.get(ROUTING_ENV, "[]"))))
+    if not run_id or not lines:
+        return
+    path = common.LOGS_DIR / f"{run_id}.client.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = path.read_text(errors="replace") if path.exists() else ""
+    header = "\n".join(lines) + "\n"
+    # The predecessor can still be appending its handoff prints when the replacement Runner starts.
+    if existing.startswith(header):
+        return
+    body = [line for line in existing.splitlines() if line not in lines]
+    updated = "\n".join([*lines, *body]) + "\n"
+    if updated != existing:
+        # Keep the inode: a detached client's append-only stderr still points at this file.
+        with open(path, "r+" if path.exists() else "w", opener=lambda p, f: os.open(p, f, 0o600)) as output:
+            output.write(updated)
+            output.truncate()
+
+
+def routing_line(message, run_id):
+    line = f"offbox: {message}"
+    lines = json.loads(os.environ.get(ROUTING_ENV, "[]"))
+    lines.append(line)
+    os.environ[ROUTING_ENV] = json.dumps(lines)
+    say(message)
+    flush_routing(run_id)
+
+
+def fail_back(ready, argv):
+    from .runs import BACKGROUND_RUN_ENV, forward_background
+    run_id, waited, state = ready.run_id, ready.waited, ready.state
+    reason = os.environ.get(FAILOVER_ENV, "")
+    _forward_background(run_id, "boat", "server")
+    routing_line(f"home offbox server is back; this run leaves the Boat queue "
+                 f"(waited {int(waited)} s, #{state.get('place')} of {state.get('waiting')}) and goes back to home", run_id)
+    toollog.emit("backend", "backend.failback", duration_ms=waited*1000, ids={"run": run_id},
+                 props={"from": "boat", "to": "home", "position": state.get("place"), "reason": reason[:200]})
+    env = dict(os.environ, OFFBOX_BACKEND="server")
+    env.pop(FAILOVER_ENV, None)
+    env[RETURNED_HOME_ENV] = reason or "home recovered"
+    env[RUN_ID_ENV] = run_id
+    if os.environ.get(BACKGROUND_RUN_ENV):
+        forward_background(env, backend="server")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execve(sys.executable, [sys.executable, os.path.realpath(sys.argv[0]), *argv], env)
 
 
 def only_on_home(table: str, where: str, args: tuple) -> bool:

@@ -1798,3 +1798,13 @@ test.each(["dm", "group"].flatMap(kind => [false, true].flatMap(modelError => ["
   expect(h.backend.prompts).toHaveLength(1);
   expect(new Set(steers.map(call => call.messageId)).size).toBe(2);
 });
+
+test("only the owner prompt teaches notify rules in both reply modes", () => {
+  for (const mode of ["final", "tool"] as const) for (const background of [false, true]) {
+    const owner = sendblueContextPrompt(context("owner"), false, [], background, mode);
+    expect(owner).toContain('When Abdullah says "tell me when Moni …"');
+    expect(owner).toContain('notify-rule add --text "<his words>" --session CURRENT_SESSION_ID');
+    expect(owner).toContain('notify-rule rm --id N --session CURRENT_SESSION_ID');
+    for (const kind of ["dm", "group"] as const) expect(sendblueContextPrompt(context(kind), false, [], background, mode)).not.toContain("notify-rule");
+  }
+});

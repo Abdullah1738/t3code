@@ -35,8 +35,9 @@ _NAMES = {
     'track.eta_elapsed', 'track.delivered', 'track.error', 'card.assert',
     'provider.track', 'provider.orders', 'provider.details', 'log.cap',
     'case.open', 'case.update', 'case.close', 'case.reopen', 'case.corroborate',
-    'question.ask', 'check.run', 'cache_reset',
+    'question.ask', 'check.run', 'cache_reset', 'marketplace.refresh',
     'order_watch.item_drop_check',
+    'collector.hold_seen', 'collector.hold_stale', 'collector.hold_cleared',
 }
 _ENUMS = {
     'reason': DELEGATION_REASONS,
@@ -48,9 +49,12 @@ _ENUMS = {
     'outcome': {'success', 'failure', 'refused', 'ask_now', 'dont_ask', 'unverified', 'failed'},
     'kind': {'refund', 'dispute', 'decline', 'unasked_charge', 'charge', 'hold',
              'payment_deadline', 'autopay_expected', 'merchant_card'},
-    'starved_by': {'none', 'owner_threads', 'msgs', 'lookups', 'census', 'receipt',
+    'starved_by': {'none', 'owner_threads', 'msgs', 'lookups', 'census', 'receipt', 'history',
                    'reconcile', 'follow', 'attention', 'build_write', 'merchants', 'order_charges',
                    'payments', 'questions', 'refunds', 'order_screen', 'loads', 'writes', 'locks'},
+    'marketplace_refresh': {'started', 'busy', 'fresh', 'skipped'},
+    'snapshot_error': {'none', 'snapshot_missing', 'snapshot_corrupt'},
+    'result': {'busy', 'budget', 'list_error', 'detail_error', 'invalid_paging', 'placement_unknown', 'end_of_history', 'launch_error', 'cache_busy', 'store_error'},
     'owner_result': {'ok', 'incomplete', 'list_failed'},
     'slowestPhase': {'reconcile', 'follow', 'attention', 'build_write'},
     'state': {'unknown', 'placed', 'ordered', 'shipped', 'preparing', 'picked up', 'out for delivery',
@@ -58,24 +62,25 @@ _ENUMS = {
 }
 _ENUMS['from'] = _ENUMS['to'] = _ENUMS['state']
 _BOOLS = {'prepareOnly', 'changed', 'fallback', 'budgetHit', 'unmatched', 'deadlineMoved', 'answered', 'polled'}
-_NUMBERS = {'exitCode', 'amountMinor', 'count', 'ageDays', 'openCases', 'fired', 'sourceLimits',
-            'msgs_timeouts', 'msgs_p50_ms',
+_NUMBERS = {'orders_total', 'known', 'delivered', 'fetched', 'pages', 'ms', 'exitCode', 'amountMinor', 'count', 'ageDays', 'openCases', 'fired', 'sourceLimits',
+            'msgs_cpu_ms', 'msgs_concurrent_max', 'msgs_cache_hits', 'msgs_timeouts', 'msgs_p50_ms',
             'merchants_ms', 'order_charges_ms', 'payments_ms', 'questions_ms', 'refunds_ms',
-            'order_screen_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'writes_n', 'locks_ms', 'follow_ms', 'untimed_ms',
+            'order_screen_ms', 'history_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'writes_n', 'locks_ms', 'follow_ms', 'untimed_ms',
             'owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms',
             'owner_list_pages', 'owner_list_ms', 'owner_threads_selected', 'owner_threads_fresh',
             'owner_threads_needed', 'owner_threads_fetched', 'owner_fetch_ms_max', 'owner_timeouts', 'owner_cache_size'}
 _CASE_FIELDS = {'merchant', 'amount', 'currency', 'reference', 'state', 'next', 'deadline',
                 'due', 'why', 'who', 'watchers', 'note', 'because', 'reply', 'source'}
 _MONEY_PROPS = {
+    'marketplace.refresh': {'orders_total', 'known', 'delivered', 'fetched', 'pages', 'ms', 'result', 'snapshot_error'},
     'case.open': {'kind', 'unmatched'},
     'case.update': {'fields', 'deadlineMoved', 'answered'},
     'case.close': {'kind', 'ageDays'},
     'question.ask': {'outcome'},
-    'check.run': {'budgetHit', 'openCases', 'fired', 'slowestPhase', 'sourceLimits', 'limitKinds', 'orderCoverage', 'chargeCensus',
-                  'msgs_timeouts', 'msgs_p50_ms', 'msgs_by_kind', 'receipt_result',
+    'check.run': {'budgetHit', 'openCases', 'fired', 'slowestPhase', 'sourceLimits', 'limitKinds', 'orderCoverage', 'chargeCensus', 'marketplace_refresh',
+                  'msgs_cpu_ms', 'msgs_concurrent_max', 'msgs_cache_hits', 'msgs_timeouts', 'msgs_p50_ms', 'msgs_by_kind', 'receipt_result',
                   'merchants_ms', 'order_charges_ms', 'payments_ms', 'questions_ms', 'refunds_ms',
-                  'order_screen_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'writes_n', 'locks_ms', 'follow_ms', 'untimed_ms',
+                  'order_screen_ms', 'history_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'writes_n', 'locks_ms', 'follow_ms', 'untimed_ms',
                   'owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms', 'starved_by',
                   'owner_list_pages', 'owner_list_ms', 'owner_threads_selected', 'owner_threads_fresh',
                   'owner_threads_needed', 'owner_threads_fetched', 'owner_fetch_ms_max', 'owner_timeouts', 'owner_cache_size', 'owner_result'},
@@ -449,7 +454,7 @@ def _fields(props):
         elif key in _BOOLS and type(value) is bool:
             result[key] = value
         elif key in _NUMBERS and type(value) is int and abs(value) <= 10**12 \
-                and (not (key.endswith('_ms') or key == 'writes_n' or key.startswith('owner_')) or value >= 0):
+                and (not (key.endswith('_ms') or key.startswith('msgs_') or key == 'writes_n' or key.startswith('owner_')) or value >= 0):
             result[key] = value
         elif key == 'hours' and type(value) in (int, float) and math.isfinite(value) and 0 < value <= 24:
             result[key] = value
@@ -457,18 +462,18 @@ def _fields(props):
             result[key] = value
         elif key == 'limitKinds' and isinstance(value, list):
             result[key] = sorted({v for v in value if isinstance(v, str) and v in {
-                'ORDER_LIST_HOST_BINDING_UNVERIFIED', 'food_page_1', 'nownow_page_1', 'marketplace_page_1'}})
+                'ORDER_LIST_HOST_BINDING_UNVERIFIED', 'food_page_1', 'nownow_page_1', 'marketplace_page_1', 'marketplace_hold', 'marketplace_stale'}})
         elif key == 'receipt_result' and isinstance(value, dict):
             result[key] = {k: v for k, v in value.items() if k in {'found', 'none', 'out_of_time', 'error'}
                            and type(v) is int and 0 <= v <= 10**9}
         elif key == 'msgs_by_kind' and isinstance(value, dict):
             result[key] = {kind: {k: v for k, v in bucket.items() if k in {'count', 'ms'}
                                   and type(v) is int and 0 <= v <= 10**9}
-                           for kind, bucket in value.items() if kind in {'receipt', 'order', 'other'}
+                           for kind, bucket in value.items() if kind in {'receipt', 'order', 'refund', 'history', 'other'}
                            and isinstance(bucket, dict)}
         elif key == 'chargeCensus' and isinstance(value, dict):
             result[key] = {app: {k: v for k, v in counts.items()
-                if k in {'open', 'matched', 'proven_clean', 'limited', 'error', 'not_checked'}
+                if k in {'open', 'matched', 'proven_clean', 'limited', 'error', 'not_checked', 'marketplace_hold', 'marketplace_stale'}
                 and type(v) is int and 0 <= v <= 10**9}
                 for app, counts in value.items() if app in {'noon', 'careem'} and isinstance(counts, dict)}
         elif key == 'orderCoverage' and isinstance(value, dict):
@@ -482,11 +487,11 @@ def _fields(props):
                     lane = lanes.get(name)
                     if not isinstance(lane, dict):
                         continue
-                    safe = {k: v for k, v in lane.items() if k in {'pages', 'fetched', 'cached', 'ms', 'coverage_cleared_rows'}
+                    safe = {k: v for k, v in lane.items() if k in {'pages', 'fetched', 'cached', 'ms', 'coverage_cleared_rows', 'hold_count', 'placements_known', 'placements_total', 'snapshot_age_s'}
                             and type(v) is int and 0 <= v <= 10**9}
                     if type(lane.get('stop_reason')) is str and lane['stop_reason'] in {'slice_out', 'detail_error', 'unknown_time_row',
                             'scoped_cancellation', 'scoped_conflict', 'unordered', 'repeated_page', 'invalid_detail',
-                            'invalid_paging', 'end_of_history', 'covered', 'unproven_paging', 'list_error', 'reader_error'}:
+                            'snapshot_missing', 'snapshot_incomplete', 'placement_unknown', 'snapshot_corrupt', 'invalid_paging', 'end_of_history', 'covered', 'unproven_paging', 'list_error', 'reader_error'}:
                         safe['stop_reason'] = lane['stop_reason']
                     covered = lane.get('covered_from')
                     if covered is None or (isinstance(covered, str) and re.fullmatch(
@@ -565,6 +570,15 @@ def emit(component, name, *, kind='event', duration_ms=None, ok=None, ids=None, 
                 props['lane'] = _noon_lane((ids or {}).get('orderId'))
         if props:
             row['props'] = _fields(props)
+            if component == 'order-watch' and name.startswith('collector.hold_'):
+                row['props'] = {
+                    'owner': props.get('owner')[:120] if type(props.get('owner')) is str else None,
+                    'reason': props.get('reason') if props.get('reason') in {
+                        'hold_older_than_60m', 'lease_expired', 'holder_pid_dead', 'lease_live',
+                        'no_matching_lease_within_bound', 'hold_absent'} else None,
+                    'age_s': props.get('age_s') if type(props.get('age_s')) is int
+                             and props['age_s'] >= 0 else None,
+                }
         if error is not None:
             code = tag(error)
             detail = cause or context.get('failure') or context.get('last') or _cause(error)

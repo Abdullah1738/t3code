@@ -16,18 +16,30 @@ REMINDER = ('After a payment-method change, pay or retry open invoices only with
 def routes():
     try:
         data = json.loads(ROUTES.read_text())
+        if (not isinstance(data, dict) or not isinstance(data['forbidden'], list)
+                or not isinstance(data['other_owners'], dict) or not isinstance(data['merchants'], dict)):
+            raise ValueError()
         cs._last4(data['default'])
         for last4 in [*data['forbidden'], *data['other_owners']]:
             cs._last4(last4)
+        if not all(isinstance(owner, str) and owner.strip() for owner in data['other_owners'].values()):
+            raise ValueError()
         for key, row in data['merchants'].items():
-            cs._last4(row['expected'])
-            if 'fallback' in row:
-                cs._last4(row['fallback'])
+            if (not key.strip() or not isinstance(row, dict)
+                    or ('any' in row and type(row['any']) is not bool)):
+                raise ValueError()
+            if not row.get('any', False):
+                cs._last4(row['expected'])
+            for field in ('expected', 'fallback'):
+                if field in row:
+                    cs._last4(row[field])
+                    if row[field] in data['forbidden']:
+                        raise ValueError()
             if not isinstance(row['aliases'], list) or not all(isinstance(a, str) for a in row['aliases']):
                 raise ValueError()
         return data
     except (OSError, ValueError, KeyError, TypeError):
-        raise cs.CardStatusError('checkout routes are unreadable or invalid')
+        raise cs.CardStatusError(f'checkout routes are unreadable or invalid: {ROUTES}')
 
 
 def merchant_key(merchant, config=None):
@@ -168,13 +180,15 @@ def _assert_final(merchant, last4, *, fallback=False):
     config = routes()
     key = merchant_key(merchant, config)
     if last4 in config['forbidden']:
-        return False, f'card {last4} is cancelled; never use it'
+        return False, f'card {last4} is forbidden; never use it'
     if last4 in config['other_owners']:
         return False, f"card {last4} belongs to {config['other_owners'][last4]}"
     status = cs.check(last4)
     if status['blocked']:
         return False, status['message']
     row = config['merchants'].get(key, {})
+    if row.get('any', False):
+        return True, f'{key}: final card {last4} matches'
     expected = row.get('expected', config['default'])
     if fallback and row.get('fallback'):
         expected = row['fallback']

@@ -1,0 +1,412 @@
+[
+  {
+    "fixture": "robob1392-repeat-run-1.sh",
+    "label": "exact",
+    "cwd": "/Users/ardud/.robob/worktrees/t3code-fork/068-index-cost",
+    "expected": "deny",
+    "cause": "opaque import or subprocess; follow-up #192",
+    "script": "time-boards-schema.py"
+  },
+  {
+    "fixture": "robob1392-repeat-run-2.sh",
+    "label": "one_run",
+    "cwd": "/Users/ardud/.robob/worktrees/t3code-fork/068-index-cost",
+    "expected": "allow"
+  },
+  {
+    "fixture": "robob1392-repeat-run-3.sh",
+    "label": "two_runs_no_redirect",
+    "cwd": "/Users/ardud/.robob/worktrees/t3code-fork/068-index-cost",
+    "expected": "deny",
+    "cause": "opaque import or subprocess; follow-up #192",
+    "script": "time-boards-schema.py"
+  },
+  {
+    "fixture": "offbox129-guard-1.sh",
+    "label": "A_exact",
+    "cwd": "/Users/ardud",
+    "expected": "deny"
+  },
+  {
+    "fixture": "offbox129-guard-2.sh",
+    "label": "A_mktemp_binding",
+    "cwd": "/Users/ardud",
+    "expected": "allow"
+  },
+  {
+    "fixture": "offbox129-guard-3.sh",
+    "label": "B_exact",
+    "cwd": "/Users/ardud/.robob/worktrees/t3code-fork/offbox-tmp-space-129",
+    "expected": "allow"
+  },
+  {
+    "fixture": "offbox129-guard-4.sh",
+    "label": "B_no_ast",
+    "cwd": "/Users/ardud/.robob/worktrees/t3code-fork/offbox-tmp-space-129",
+    "expected": "allow"
+  },
+  {
+    "fixture": "offbox129-guard-5.sh",
+    "label": "B_ast_only",
+    "cwd": "/Users/ardud/.robob/worktrees/t3code-fork/offbox-tmp-space-129",
+    "expected": "allow"
+  },
+  {
+    "fixture": "offbox129-guard-6.sh",
+    "label": "B_ast_then_local_unittest",
+    "cwd": "/Users/ardud/.robob/worktrees/t3code-fork/offbox-tmp-space-129",
+    "expected": "allow"
+  },
+  {
+    "fixture": "offbox129-guard-7.sh",
+    "label": "B_local_unittest_only",
+    "cwd": "/Users/ardud/.robob/worktrees/t3code-fork/offbox-tmp-space-129",
+    "expected": "allow"
+  },
+  {
+    "fixture": "crpko4308-guard-1.sh",
+    "label": "exact",
+    "cwd": "/Volumes/ExternalSSD/board-wt/crpko-integration-harness-HC-026f",
+    "expected": "allow"
+  },
+  {
+    "fixture": "crpko4308-guard-2.sh",
+    "label": "no_sibling_edit",
+    "cwd": "/Volumes/ExternalSSD/board-wt/crpko-integration-harness-HC-026f",
+    "expected": "allow"
+  },
+  {
+    "fixture": "crpko4308-guard-3.sh",
+    "label": "no_bash_n",
+    "cwd": "/Volumes/ExternalSSD/board-wt/crpko-integration-harness-HC-026f",
+    "expected": "allow"
+  },
+  {
+    "fixture": "crpko4308-guard-4.sh",
+    "label": "write_offbox_only",
+    "cwd": "/Volumes/ExternalSSD/board-wt/crpko-integration-harness-HC-026f",
+    "expected": "allow"
+  },
+  {
+    "fixture": "crpko4308-guard-5.sh",
+    "label": "write_edit_bashn",
+    "cwd": "/Volumes/ExternalSSD/board-wt/crpko-integration-harness-HC-026f",
+    "expected": "allow"
+  },
+  {
+    "fixture": "crpko4308-guard-6.sh",
+    "label": "absolute_write_path",
+    "cwd": "/Volumes/ExternalSSD/board-wt/crpko-integration-harness-HC-026f",
+    "expected": "allow"
+  },
+  {
+    "fixture": "mac40-guard-1.sh",
+    "label": "exact",
+    "cwd": "/Volumes/ExternalSSD/worktrees/mac-40-janitor",
+    "expected": "allow"
+  },
+  {
+    "fixture": "mac40-guard-2.sh",
+    "label": "write_run",
+    "cwd": "/Volumes/ExternalSSD/worktrees/mac-40-janitor",
+    "expected": "allow"
+  },
+  {
+    "fixture": "mac40-guard-3.sh",
+    "label": "write_edit",
+    "cwd": "/Volumes/ExternalSSD/worktrees/mac-40-janitor",
+    "expected": "allow"
+  },
+  {
+    "fixture": "mac40-guard-4.sh",
+    "label": "edit_run",
+    "cwd": "/Volumes/ExternalSSD/worktrees/mac-40-janitor",
+    "expected": "allow"
+  },
+  {
+    "fixture": "mac40-guard-5.sh",
+    "label": "absolute_write_path",
+    "cwd": "/Volumes/ExternalSSD/worktrees/mac-40-janitor",
+    "expected": "allow"
+  },
+  {
+    "fixture": "torssh21-guard-1.sh",
+    "label": "1",
+    "cwd": "/Users/ardud/worktrees/torssh-release-test",
+    "expected": "deny",
+    "cause": "opaque import or subprocess; follow-up #192",
+    "script": "tap.py"
+  },
+  {
+    "fixture": "torssh21-guard-2.sh",
+    "label": "2",
+    "cwd": "/Users/ardud/worktrees/torssh-release-test",
+    "expected": "allow"
+  },
+  {
+    "fixture": "torssh21-guard-3.sh",
+    "label": "3",
+    "cwd": "/Users/ardud/worktrees/torssh-release-test",
+    "expected": "deny",
+    "cause": "opaque import or subprocess; follow-up #192",
+    "script": "tap.py"
+  },
+  {
+    "fixture": "torssh21-guard-4.sh",
+    "label": "4",
+    "cwd": "/Users/ardud/worktrees/torssh-release-test",
+    "expected": "allow"
+  },
+  {
+    "fixture": "torssh21-guard-5.sh",
+    "label": "exact",
+    "cwd": "/Users/ardud/worktrees/torssh-release-test",
+    "expected": "deny",
+    "cause": "opaque import or subprocess; follow-up #192",
+    "script": "tap.py"
+  },
+  {
+    "fixture": "torssh21-guard-6.sh",
+    "label": "write+first_tap_only",
+    "cwd": "/Users/ardud/worktrees/torssh-release-test",
+    "expected": "allow"
+  },
+  {
+    "fixture": "torssh21-guard-7.sh",
+    "label": "write+two_taps",
+    "cwd": "/Users/ardud/worktrees/torssh-release-test",
+    "expected": "deny",
+    "cause": "opaque import or subprocess; follow-up #192",
+    "script": "tap.py"
+  },
+  {
+    "fixture": "torssh21-guard-8.sh",
+    "label": "write+tap+other_scripts",
+    "cwd": "/Users/ardud/worktrees/torssh-release-test",
+    "expected": "allow"
+  },
+  {
+    "fixture": "crpko4156-guard-1.sh",
+    "label": "exact",
+    "cwd": "/Volumes/ExternalSSD/board-wt/harness-4156",
+    "expected": "allow"
+  },
+  {
+    "fixture": "crpko4156-guard-2.sh",
+    "label": "write_run",
+    "cwd": "/Volumes/ExternalSSD/board-wt/harness-4156",
+    "expected": "allow"
+  },
+  {
+    "fixture": "crpko4156-guard-3.sh",
+    "label": "write_edit",
+    "cwd": "/Volumes/ExternalSSD/board-wt/harness-4156",
+    "expected": "allow"
+  },
+  {
+    "fixture": "crpko4156-guard-4.sh",
+    "label": "edit_run",
+    "cwd": "/Volumes/ExternalSSD/board-wt/harness-4156",
+    "expected": "allow"
+  },
+  {
+    "fixture": "crpko4156-guard-5.sh",
+    "label": "absolute_write_path",
+    "cwd": "/Volumes/ExternalSSD/board-wt/harness-4156",
+    "expected": "allow"
+  },
+  {
+    "fixture": "crpko4156-guard-6.sh",
+    "label": "MUSTDENY_db_body_write_run",
+    "cwd": "/Volumes/ExternalSSD/board-wt/harness-4156",
+    "expected": "deny"
+  },
+  {
+    "fixture": "crpko4156-guard-7.sh",
+    "label": "MUSTDENY_db_body_exact",
+    "cwd": "/Volumes/ExternalSSD/board-wt/harness-4156",
+    "expected": "deny"
+  },
+  {
+    "fixture": "robob1457-node-fifo-1.sh",
+    "label": "exact",
+    "cwd": "/Volumes/ExternalSSD/t3code-wt/1457-live-bound",
+    "expected": "allow"
+  },
+  {
+    "fixture": "robob1457-node-fifo-2.sh",
+    "label": "write_run",
+    "cwd": "/Volumes/ExternalSSD/t3code-wt/1457-live-bound",
+    "expected": "allow"
+  },
+  {
+    "fixture": "robob1457-node-fifo-3.sh",
+    "label": "write_edit",
+    "cwd": "/Volumes/ExternalSSD/t3code-wt/1457-live-bound",
+    "expected": "allow"
+  },
+  {
+    "fixture": "robob1457-node-fifo-4.sh",
+    "label": "edit_run",
+    "cwd": "/Volumes/ExternalSSD/t3code-wt/1457-live-bound",
+    "expected": "allow"
+  },
+  {
+    "fixture": "robob1457-node-fifo-5.sh",
+    "label": "overwrite_not_append",
+    "cwd": "/Volumes/ExternalSSD/t3code-wt/1457-live-bound",
+    "expected": "allow"
+  },
+  {
+    "fixture": "robob1457-node-fifo-6.sh",
+    "label": "absolute_write_path",
+    "cwd": "/Volumes/ExternalSSD/t3code-wt/1457-live-bound",
+    "expected": "allow"
+  },
+  {
+    "fixture": "crpko4201-node-check-1.sh",
+    "label": "exact",
+    "cwd": "/Volumes/ExternalSSD/crpko-devops-wt/daz-6b",
+    "expected": "allow"
+  },
+  {
+    "fixture": "crpko4201-node-check-2.sh",
+    "label": "write_check",
+    "cwd": "/Volumes/ExternalSSD/crpko-devops-wt/daz-6b",
+    "expected": "allow"
+  },
+  {
+    "fixture": "crpko4201-node-check-3.sh",
+    "label": "write_run",
+    "cwd": "/Volumes/ExternalSSD/crpko-devops-wt/daz-6b",
+    "expected": "allow"
+  },
+  {
+    "fixture": "crpko4201-node-check-4.sh",
+    "label": "check_run_no_write",
+    "cwd": "/Volumes/ExternalSSD/crpko-devops-wt/daz-6b",
+    "expected": "allow"
+  },
+  {
+    "fixture": "crpko4201-node-check-5.sh",
+    "label": "write_run_run",
+    "cwd": "/Volumes/ExternalSSD/crpko-devops-wt/daz-6b",
+    "expected": "deny",
+    "cause": "opaque import or subprocess; follow-up #192",
+    "script": "kafka-acl-probes.mjs"
+  },
+  {
+    "fixture": "crpko4201-node-check-6.sh",
+    "label": "absolute_write_path",
+    "cwd": "/Volumes/ExternalSSD/crpko-devops-wt/daz-6b",
+    "expected": "allow"
+  },
+  {
+    "fixture": "crpko4201-node-check-7.sh",
+    "label": "check_and_run_joined",
+    "cwd": "/Volumes/ExternalSSD/crpko-devops-wt/daz-6b",
+    "expected": "allow"
+  },
+  {
+    "fixture": "mac54-guard-1.sh",
+    "label": "exact",
+    "cwd": "/Volumes/ExternalSSD/t3code-wt/mac/deep-probe-sizing",
+    "expected": "deny",
+    "cause": "opaque import or subprocess; follow-up #192",
+    "script": "test_deep_probe.py"
+  },
+  {
+    "fixture": "mac54-guard-2.sh",
+    "label": "edit_write_run1",
+    "cwd": "/Volumes/ExternalSSD/t3code-wt/mac/deep-probe-sizing",
+    "expected": "allow"
+  },
+  {
+    "fixture": "mac54-guard-3.sh",
+    "label": "write_3runs",
+    "cwd": "/Volumes/ExternalSSD/t3code-wt/mac/deep-probe-sizing",
+    "expected": "deny",
+    "cause": "opaque import or subprocess; follow-up #192",
+    "script": "test_deep_probe.py"
+  },
+  {
+    "fixture": "mac54-guard-4.sh",
+    "label": "write_run1",
+    "cwd": "/Volumes/ExternalSSD/t3code-wt/mac/deep-probe-sizing",
+    "expected": "allow"
+  },
+  {
+    "fixture": "mac54-guard-5.sh",
+    "label": "write_run1_run2",
+    "cwd": "/Volumes/ExternalSSD/t3code-wt/mac/deep-probe-sizing",
+    "expected": "deny",
+    "cause": "opaque import or subprocess; follow-up #192",
+    "script": "test_deep_probe.py"
+  },
+  {
+    "fixture": "mac54-guard-6.sh",
+    "label": "absolute_write_path",
+    "cwd": "/Volumes/ExternalSSD/t3code-wt/mac/deep-probe-sizing",
+    "expected": "deny",
+    "cause": "opaque import or subprocess; follow-up #192",
+    "script": "test_deep_probe.py"
+  },
+  {
+    "fixture": "recall52-discover-3.sh",
+    "label": "S3_write+sibling_edit+run_plain",
+    "cwd": "/Volumes/ExternalSSD/t3code-wt/recall-partial-backup",
+    "expected": "allow"
+  },
+  {
+    "fixture": "recall52-discover-11.sh",
+    "label": "S2_write+run_plain(no prefix, no sibling edit)",
+    "cwd": "/Volumes/ExternalSSD/t3code-wt/recall-partial-backup",
+    "expected": "allow"
+  },
+  {
+    "fixture": "crpko4364-exact.sh",
+    "label": "crpko4364-exact",
+    "cwd": "/Volumes/ExternalSSD/board-wt/harness-4364",
+    "expected": "allow"
+  },
+  {
+    "fixture": "crpko4364-same-file.sh",
+    "label": "crpko4364-same-file",
+    "cwd": "/Volumes/ExternalSSD/board-wt/harness-4364",
+    "expected": "deny",
+    "script": "test_completion_reader_grants.py"
+  },
+  {
+    "fixture": "dia23-same-file.sh",
+    "label": "dia23-same-file",
+    "cwd": "/Volumes/ExternalSSD/wt/dia-23-error-metadata/dia-agent-bridge",
+    "expected": "deny",
+    "script": "navigation-metadata.test.js"
+  },
+  {
+    "fixture": "robob1392-three-runs.sh",
+    "label": "robob1392-three-runs",
+    "cwd": "/Users/ardud/.robob/worktrees/t3code-fork/068-index-cost",
+    "expected": "deny",
+    "cause": "opaque import or subprocess; follow-up #192",
+    "script": "time-boards-schema.py"
+  },
+  {
+    "fixture": "crpko4308-bash-n-local.sh",
+    "label": "crpko4308-bash-n-local",
+    "cwd": "/Volumes/ExternalSSD/board-wt/crpko-integration-harness-HC-026f",
+    "expected": "allow"
+  },
+  {
+    "fixture": "robob1457-node-fifo-1-live-body.sh",
+    "label": "robob1457-node-fifo-1-live-body",
+    "cwd": "/Volumes/ExternalSSD/t3code-wt/1457-live-bound",
+    "expected": "deny"
+  },
+  {
+    "fixture": "crpko4201-node-check-1-live-body.sh",
+    "label": "crpko4201-node-check-1-live-body",
+    "cwd": "/Volumes/ExternalSSD/crpko-devops-wt/daz-6b",
+    "expected": "deny"
+  }
+]

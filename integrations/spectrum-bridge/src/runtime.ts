@@ -21,6 +21,7 @@ import { getSecretRequest, type SecretDeps } from "./secrets.ts";
 import { SHARE_ROUTES, shareRoute, type Shares } from "./share.ts";
 import { sessionMatches } from "./session.ts";
 import { Store } from "./store.ts";
+import { agentPolicyPath, validNotifyId, validNotifyText } from "./agent-policy.ts";
 import { AGENT_BUS_WAKE_PREFIX, AgentBus, validAgentRequestId, validAnswerStatus, type AgentAnswerReceipt } from "./agent-bus.ts";
 
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
@@ -261,13 +262,12 @@ const adminGroup = <P>(caller: Chat<P> | undefined, target: Chat<P> | undefined)
   && isAdmin(caller) && target !== undefined && target.info.kind === "group"
   && target.store.hasInboundFrom([chatKey.target(caller.info.key), ...(caller.info.person?.addresses ?? [])]);
 
-export function createAgentBus<P>(registry: ChatRegistry<P>, log: (event: string, code?: string) => void = () => {}): AgentBus {
+export function createAgentBus<P>(registry: ChatRegistry<P>, log: (event: string, code?: string) => void = () => {}, policyPath?: string): AgentBus {
   return new AgentBus({
     db: registry.owner.store.db,
     forSession: id => registry.forSession(id)?.info,
     bySlug: slug => registry.bySlugName(slug)?.info,
-    isAdmin: info => { const chat = registry.bySlugName(info.slug); return chat !== undefined && isAdmin(chat); },
-    adminGroup: (caller, target) => adminGroup(registry.bySlugName(caller.slug), registry.bySlugName(target.slug)),
+    policyPath,
     deliver: (target, text, key, receipt) => {
       const chat = registry.bySlugName(target.slug);
       if (!chat) throw new Error("Agent target unavailable");
@@ -290,7 +290,7 @@ export function createAgentBus<P>(registry: ChatRegistry<P>, log: (event: string
  */
 export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>): Handler {
   const { registry } = options;
-  const bus = options.agentBus ?? createAgentBus(registry);
+  const bus = options.agentBus ?? createAgentBus(registry, undefined, agentPolicyPath(options.accessPath));
   const reply = (status: number, body: unknown) => Response.json(body, { status });
   const result = (outcome: SbApiResult) => reply(outcome.status, outcome.body);
   const pendingOptIns = new Set<string>();
@@ -363,6 +363,17 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
       });
 
       switch (path) {
+        case "/notify-rule": {
+          only(body, ["sessionId", "action", "text", "id"]);
+          live();
+          if (!text(sessionId, 200)) throw new HttpError(400, "Invalid request");
+          ownerOnly(false);
+          if (body.action === "add" ? !validNotifyText(body.text) || body.id !== undefined
+            : body.action === "rm" ? !validNotifyId(body.id) || body.text !== undefined
+            : body.action !== "list" || body.id !== undefined || body.text !== undefined) throw new HttpError(400, "Invalid request");
+          return result(bus.notifyRules({ sessionId, action: body.action as "add" | "rm" | "list",
+            ...(typeof body.text === "string" ? { text: body.text } : {}), ...(typeof body.id === "number" ? { id: body.id } : {}) }));
+        }
         case "/agent-ask": {
           only(body, ["sessionId", "to", "text", "dedupeKey", "parent"]);
           live();

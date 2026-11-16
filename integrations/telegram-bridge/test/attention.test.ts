@@ -1,3 +1,4 @@
+import { ControlClient } from "../src/control.ts";
 import { afterEach, beforeEach, expect, setSystemTime, test } from "bun:test";
 import { createServer, type Server } from "node:http";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -1016,4 +1017,22 @@ test("a rejected shared read retains its timeout class in every dependent failur
   const failures = logs.entries().filter(row => row.kind === "error");
   expect(failures.map(row => row.error?.tag)).toEqual(["tg.attention.requests", "tg.attention.directories", "tg.attention.pendingRequests", "tg.attention.pendingRequests"]);
   expect(failures.every(row => row.props?.cause === "timeout")).toBe(true);
+});
+
+
+test("pendingRequests keeps socket detail through the control wrapper and shared read", async () => {
+  const h = setup();
+  const original = globalThis.fetch;
+  const client = new ControlClient({ url: "http://127.0.0.1:1", token: "private-token" });
+  h.backend.board = { version: 1, revision: 1, activatedAt: 1, migrationComplete: true,
+    entries: [{ sessionId: "private-thread-id", directory: "/private-folder", title: "Private title", state: "running", workRevision: 1, updatedAt: now }] };
+  Object.assign(h.backend, { pendingRequests: () => client.request("GET", "/requests") });
+  try {
+    globalThis.fetch = Object.assign(async () => { throw { code: "ConnectionClosed", message: "private-token" }; }, { preconnect: original.preconnect });
+    await h.attention.tick();
+  } finally { globalThis.fetch = original; }
+  const failures = logs.entries().filter(row => row.error?.tag === "tg.attention.pendingRequests");
+  expect(failures).toHaveLength(2);
+  expect(failures.every(row => row.props?.cause === "socket_closed" && row.props.detail === "ConnectionClosed")).toBe(true);
+  for (const part of ["private-thread-id", "/private-folder", "Private title", "private-token"]) expect(logs.text()).not.toContain(part);
 });

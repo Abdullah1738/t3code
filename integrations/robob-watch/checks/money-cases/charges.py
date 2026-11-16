@@ -10,11 +10,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as
 import datetime as dt
 from decimal import Decimal, InvalidOperation
 import importlib.util
+import hashlib
 import itertools
 import json
+import math
 import os
 from pathlib import Path
 import re
+import resource
 import signal
 import statistics
 import subprocess
@@ -132,6 +135,7 @@ OWNER_TIMING_KEYS = (
 OWNER_REQUEST_LIMIT = 64
 OWNER_CACHE_VERSION = 2
 _OWNER_STATS_LOCK = threading.Lock()
+_MSGS_ACTIVE = set()
 MSGS_BUDGET = 2
 RECEIPT_BUDGET = 4
 
@@ -244,6 +248,13 @@ def order_receipt(charge, at, now, deadline=None, lookup=None, memo=None, stats=
             raise ValueError('ambiguous orders')
         if app == 'noon' and isinstance(result, dict):
             lanes = result.get('lanes') or {}
+            marketplace = lanes.get('marketplace') or {}
+            walked = marketplace.get('walked_at')
+            if walked is None or order_lookup.moment(walked) < at + SAME_TIME:
+                raise SourceLimit('noon orders: Marketplace snapshot predates the match window (source limit)',
+                                  ['marketplace_stale'])
+            if any(abs(order_lookup.moment(t) - at) <= SAME_TIME for t in marketplace.get('hold_times', [])):
+                raise SourceLimit('noon orders: Marketplace placement near charge (source limit)', ['marketplace_hold'])
             short = []
             for name in order_lookup.LANES:
                 lane = lanes.get(name) or {}
@@ -338,6 +349,11 @@ def msgs(argv, deadline, cap, memo=None, stats=None):
     if alarm:
         stop = min(stop, time.time() + alarm)
     timed_out = False
+    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    cpu_before = usage.ru_utime + usage.ru_stime
+    active = object()
+    concurrent = len(_MSGS_ACTIVE)
+    _MSGS_ACTIVE.add(active)
     try:
         with step_timing(stats, 'msgs', time.time() + timeout):
             done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
@@ -353,7 +369,12 @@ def msgs(argv, deadline, cap, memo=None, stats=None):
         timed_out = getattr(exc, '_money_cases_timeout', False)
         raise
     finally:
+        _MSGS_ACTIVE.discard(active)
+        usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+        cpu_ms = round(max(0, usage.ru_utime + usage.ru_stime - cpu_before) * 1000)
         if stats is not None:
+            stats['msgs_cpu_ms'] = stats.get('msgs_cpu_ms', 0) + cpu_ms
+            stats['msgs_concurrent_max'] = max(stats.get('msgs_concurrent_max', 0), concurrent + 1)
             elapsed = round((time.monotonic() - started) * 1000)
             stats.setdefault('_msgs_samples_ms', []).append(elapsed)
             stats['msgs_timeouts'] = stats.get('msgs_timeouts', 0) + int(
@@ -361,11 +382,14 @@ def msgs(argv, deadline, cap, memo=None, stats=None):
             names = {frame['name'] for frame in _TIMING_STACK.get()
                      if frame.get('active') and frame['stats'] is stats
                      and (frame['deadline'] is None or called_at < frame['deadline'])}
-            kind = 'receipt' if 'receipt' in names else 'order' if names & {
+            kind = 'receipt' if 'receipt' in names else 'history' if 'history' in names else \
+                'refund' if 'refunds' in names else 'order' if names & {
                 'order_charges', 'lookups', 'order_screen'} else 'other'
             bucket = stats.setdefault('msgs_by_kind', {}).setdefault(kind, {'count': 0, 'ms': 0})
             bucket['count'] += 1
             bucket['ms'] += elapsed
+            stats.setdefault('_msgs_calls', []).append(
+                {'kind': kind, 'wall_ms': elapsed, 'cpu_ms': cpu_ms, 'concurrent': concurrent})
     if memo is not None:
         memo[key] = done
     return done
@@ -374,10 +398,13 @@ def msgs(argv, deadline, cap, memo=None, stats=None):
 def receipt_timing(stats):
     """Bounded metadata only, including defaults for checks without archive work."""
     samples = stats.get('_msgs_samples_ms', [])
-    return {'msgs_timeouts': stats.get('msgs_timeouts', 0),
+    return {'msgs_cpu_ms': stats.get('msgs_cpu_ms', 0),
+            'msgs_concurrent_max': stats.get('msgs_concurrent_max', 0),
+            'msgs_cache_hits': stats.get('msgs_cache_hits', 0),
+            'msgs_timeouts': stats.get('msgs_timeouts', 0),
             'msgs_p50_ms': round(statistics.median(samples)) if samples else 0,
             'msgs_by_kind': {kind: {key: stats.get('msgs_by_kind', {}).get(kind, {}).get(key, 0)
-                                    for key in ('count', 'ms')} for kind in ('receipt', 'order', 'other')},
+                                    for key in ('count', 'ms')} for kind in ('receipt', 'order', 'refund', 'history', 'other')},
             'receipt_result': {key: stats.get('receipt_result', {}).get(key, 0)
                                for key in ('found', 'none', 'out_of_time', 'error')}}
 
@@ -386,13 +413,77 @@ def day(t):
     return t.astimezone(TZ).date().isoformat()
 
 
-def search(query, since, until=None, source=None, n=20, deadline=None, memo=None, stats=None):
+SEARCH_CACHE_DAYS = 14
+SEARCH_CACHE_LIMIT = 256
+SEARCH_ROW_FIELDS = ('id', 'ts', 'source', 'sender', 'subject', 'from_me')
+
+
+def search_cache(path, now):
+    try:
+        entries = json.loads(path.read_text())
+        if not isinstance(entries, dict):
+            return {}
+        clean = {}
+        for key, entry in entries.items():
+            if not re.fullmatch(r'[0-9a-f]{64}', key) or not isinstance(entry, dict):
+                continue
+            saved, rows = entry.get('saved'), entry.get('rows')
+            if (type(saved) not in (int, float) or not math.isfinite(saved)
+                    or not now - SEARCH_CACHE_DAYS * 86400 <= saved <= now
+                    or not isinstance(rows, list) or any(not isinstance(row, dict)
+                        or set(row) - set(SEARCH_ROW_FIELDS)
+                        or type(row.get('id')) not in (str, int)
+                        or type(row.get('ts')) not in (int, float)
+                        or not math.isfinite(row['ts'])
+                        or not isinstance(row.get('sender', ''), str)
+                        or not isinstance(row.get('subject', ''), str)
+                        or type(row.get('from_me', False)) not in (bool, int)
+                        or row.get('source') not in ('email', 'imessage', 'whatsapp') for row in rows)):
+                continue
+            clean[key] = entry
+        return dict(sorted(clean.items(), key=lambda item: item[1]['saved'])[-SEARCH_CACHE_LIMIT:])
+    except (OSError, ValueError, TypeError, OverflowError):
+        return {}
+
+
+def closed_search_cache(memo, until):
+    if memo is None or ('msgs_cache',) not in memo or not until:
+        return None
+    try:
+        closed = dt.date.fromisoformat(until) < dt.datetime.now(TZ).date()
+    except (TypeError, ValueError):
+        return None
+    return Path(memo[('msgs_cache',)]) if closed else None
+
+
+class SearchRows(list):
+    def __init__(self, rows, raw_count):
+        super().__init__(rows)
+        self.raw_count = raw_count
+
+
+def search(query, since, until=None, source=None, n=20, deadline=None, memo=None, stats=None, all_copies=False):
     """Rows from the message archive (the msgs CLI), newest first, without bodies."""
+    # Deduplication happens after msgs limits raw rows, hiding truncated searches.
+    # Keep the raw count, then fold Message-ID copies before any body reads.
+    cache_path = closed_search_cache(memo, until)
     cmd = [MSGS, 'search', query, '--json', '-n', str(n), '--date', '--since', since]
+    if all_copies or cache_path is not None:
+        cmd += ['--all-copies']
     if until:
         cmd += ['--until', until]
     if source:
         cmd += ['--in', source]
+    cache, key = {}, None
+    if cache_path is not None:
+        left(deadline, MSGS_BUDGET)
+        key = hashlib.sha256(json.dumps(cmd, ensure_ascii=False).encode()).hexdigest()
+        cache = search_cache(cache_path, time.time())
+        if key in cache:
+            target = stats if stats is not None else TIMING_STATS.get()
+            if target is not None:
+                target['msgs_cache_hits'] = target.get('msgs_cache_hits', 0) + 1
+            return cache[key]['rows']
     done = msgs(cmd, deadline, 15, memo, stats)
     # split on '\n' only: msgs prints ensure_ascii=False JSON, so a snippet can hold
     # U+2028, \x85 or \x1c-\x1e, which str.splitlines() would treat as line breaks.
@@ -400,9 +491,29 @@ def search(query, since, until=None, source=None, n=20, deadline=None, memo=None
         rows = [json.loads(line) for line in done.stdout.split('\n') if line.strip()]
         if any(not isinstance(row, dict) for row in rows):
             raise ValueError('invalid search row')
-        return rows
     except ValueError as e:
         raise Lookup('msgs: unreadable search output') from e
+    raw_count, unique, seen = len(rows), [], set()
+    for row in rows:
+        msgid = row.get('msgid')
+        ident = msgid.lower() if row.get('source') == 'email' and isinstance(msgid, str) and msgid else None
+        if ident is not None:
+            if ident in seen:
+                continue
+            seen.add(ident)
+        unique.append(row)
+    rows = SearchRows(unique, raw_count)
+    # A capped result is incomplete. Do not freeze it (or any failed search)
+    # into a negative screen; open windows always go back to the archive.
+    if key is not None and raw_count < n:
+        cache[key] = {'saved': time.time(), 'rows': [
+            {field: row[field] for field in SEARCH_ROW_FIELDS if field in row} for row in rows]}
+        cache = dict(sorted(cache.items(), key=lambda item: item[1]['saved'])[-SEARCH_CACHE_LIMIT:])
+        try:
+            write_json(cache_path, cache)
+        except OSError:
+            pass  # A cache write cannot invalidate a completed archive read.
+    return rows
 
 
 def iso(t):
@@ -840,7 +951,7 @@ def receipt(charge, at, now, find=None, deadline=None, read=None, memo=None, sta
         options['memo'] = memo
     if stats is not None:
         options['stats'] = stats
-    find = find or (lambda *a, **kw: search(*a, **kw, **options))
+    find = find or (lambda *a, **kw: search(*a, **kw, all_copies=True, **options))
     read = read or (lambda row, deadline: show(row, deadline, **options))
     amount = ' OR '.join(f'"{v}"' for v in amounts(charge))
     money, card = amount_pattern(charge), last_four(charge)
@@ -867,7 +978,8 @@ def receipt(charge, at, now, find=None, deadline=None, read=None, memo=None, sta
         # the exact shared timestamp window below filters the remaining partial day.
         until = day(end + dt.timedelta(days=1))
         count = 0
-        for row in find(query, day(start), until=until, source='email', n=RECEIPT_HITS, deadline=deadline):
+        rows = find(query, day(start), until=until, source='email', n=RECEIPT_HITS, deadline=deadline)
+        for row in rows:
             count += 1
             ts = row.get('ts') or 0
             if not (start.timestamp() <= ts <= end.timestamp()) or row.get('from_me') \
@@ -887,7 +999,7 @@ def receipt(charge, at, now, find=None, deadline=None, read=None, memo=None, sta
                 # Identical receipt bodies can be sent for separate transactions. A rejected
                 # ambiguous copy must not hide an older, uniquely correlated receipt.
                 seen_bodies.discard(key)
-        incomplete = incomplete or count >= RECEIPT_HITS
+        incomplete = incomplete or getattr(rows, 'raw_count', count) >= RECEIPT_HITS
     if incomplete:
         raise Lookup('receipt scan incomplete: search limit reached')
     return None
@@ -981,11 +1093,13 @@ def owner_said(charge, at, now, said=None, deadline=None):
     return None
 
 
-def known(charge, at, find=None, deadline=None, read=None, stats=None):
+def known(charge, at, find=None, deadline=None, read=None, stats=None, memo=None):
     """How he already pays this merchant, from before the last half day: 'receipt' when a mail with
     a receipt from it came, 'bank' when an earlier bank alert was a charge from it, else None."""
     options = {} if stats is None else {'stats': stats}
-    find = find or (lambda *a, **kw: search(*a, **kw, **options))
+    if memo is not None:
+        options['memo'] = memo
+    find = find or (lambda *a, **kw: search(*a, **kw, all_copies=True, **options))
     read = read or (lambda *a, **kw: show(*a, **kw, **options))
     names = words(charge['merchant'])
     if not names:
@@ -996,6 +1110,8 @@ def known(charge, at, find=None, deadline=None, read=None, stats=None):
     name_re = re.compile(r'\b(?:' + '|'.join(map(re.escape, names)) + r')\b', re.I)
 
     def older(rows):
+        if getattr(rows, 'raw_count', len(rows)) >= 30:
+            raise Lookup('merchant history incomplete: search limit reached')
         return [r for r in rows if (r.get('ts') or 0) < before.timestamp() and not r.get('from_me')]
 
     # Newsletters name big merchants all the time, so mail the merchant sent itself is read first,
@@ -1101,7 +1217,8 @@ def explain(charge, at, now, deadline=None, find=None, said=None, receipt_ok=Non
         return {'verdict': 'held', 'why': 'held for Moni', 'errors': []}
     if now < at + WAIT:
         try:
-            how = known(charge, at, find, deadline, stats=stats)
+            with step_timing(stats, 'history', deadline):
+                how = known(charge, at, find, deadline, stats=stats, memo=memo)
             # A merchant that mails receipts gets its receipt waited for ("Wait for the email", 24 Oct);
             # one he only has bank alerts from is waited for when this is a pending hold.
             if how == 'receipt' or (how == 'bank' and charge['pending']):

@@ -154,7 +154,7 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
   checkouts are deleted at run start: a box keeps the 10 most recent used in the last 3 days plus any used in the
   last 12 h (`OFFBOX_PRUNE_KEEP`, `OFFBOX_PRUNE_DAYS`), so a worktree idle for days may sync and install deps again.
 - A busy pool is a queue (progress line every 60 s). At home the run waits for a free box for up to 24 h and then
-  starts; a repo pool has up to 8 boxes (`OFFBOX_POOL_SIZE`, 1-64). On the Boat standby it waits **up to 600 seconds**
+  starts; a repo pool has up to 8 boxes (`OFFBOX_POOL_SIZE`, 1-64). A run pinned to Boat waits **up to 600 seconds**
   and then returns **92** (nothing ran; retry), with 4 boxes (`OFFBOX_POOL_SIZE` 1-16; raised from 8 for TorSSH by
   Abdullah, 12 Nov 2026) and `OFFBOX_POOL_WAIT_SECONDS` 0-1200. Sizes are minimums on pooled boxes; a larger warm box is reused.
   Waiters are served in arrival order among callers that can use the same box or create slot; `OFFBOX_POOL_SIZE`
@@ -326,13 +326,13 @@ On home boxes the stock ssh.service on port 22 is yours (stop, mask or replace i
 
 Once `bootstrap.zsh client` has written `server.json`, runs go to Abdullah's own server at home (boatd; same
 commands, same box model, no hourly price, no start limits, no spend cap). Boat stays as the standby. Each
-`offbox run` picks its backend once, when it starts:
+`offbox run` starts on the available backend:
 
 - A health monitor on the Mac checks the server every minute and writes `backend-state.json`. Up: the run goes
   home. A run double-checks a down state with a live probe before choosing Boat. Alerts recover after 3 good
   checks; nothing to switch by hand. `offbox status` shows which one is in use.
 - Marked up but not answering when your run starts (or while its box is being fetched): the run moves to Boat
-  before it is sent, with one line (`... this run goes to Boat instead`). **Once the server accepted a run it
+  before it is sent, with one line (`... this run goes to Boat instead`). A run that moved to Boat waits with no time limit for a Boat box or for home, and goes back to home as soon as home is ready. **Once the server accepted a run it
   never moves**, so nothing runs twice. A server that says it is starting is waited for (up to 600 s) instead of failing over. A slow but reachable server is waited for; runs move to Boat only when home is offline or refusing work, or has not answered for 5 minutes.
 - A run naming `--base` saved only on home waits for home (exit **93** when the wait expires) and never runs on Boat's template.
 - The server restarts under an accepted run (power cut, reboot, boatd restart): the client reconnects for up to
@@ -395,21 +395,22 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
   `offbox run --step 'go vet ./...' --step 'go test -count=1 ./pkg/...'`
   Each step runs in its own subshell with pipefail and does not stop the next. You get `offbox step N rc=X: ...`
   per step, then `offbox steps: K ok, M failed (step N rc=X)`, then `offbox: remote exit <first nonzero rc>`.
-  A run missing any planned step result exits 90 (`steps incomplete`); rerun the checks before treating them as passed.
+  A run missing any planned step result exits 90 (`steps incomplete`), except a confirmed `offbox kill` returns 143 with the stopped step. Rerun the checks before treating them as passed.
   `--step` plus a trailing `-- cmd` is a usage error (2). Exit 1 whose last pipeline stage is grep gets a hint line:
   it may mean "no match" or an earlier stage failed.
 - **99** = the repo-pinned Node or pnpm could not be provided or activated. The command never started; fix the pin or retry after the download failure. Offbox does not run on the box default instead.
 - **97 + "box setup failed (exit 97), not your command"** = the box's toolchain setup failed before your command ran
   (18 Oct: `mv: cannot overwrite '/usr/local/go'`). Offbox turns it into 90 (infra) and the normal infra/fallback rules
   apply. A plain 97 without that line is your command's own exit code.
-- **92** = every pool box stayed busy for the whole queue wait (24 h at home, 10 min on the Boat standby; or other
-  runs held the pool's lock that long). Nothing ran, not an infra failure: just retry. A slow box resume or create no longer holds up other runs of the same repo.
+- **92** = every pool box stayed busy for the whole queue wait (24 h at home; 10 min only for runs pinned to Boat; or other
+  runs held the pool's lock that long). Runs that moved to Boat wait with no time limit for a Boat box or for home. Nothing ran, not an infra failure: just retry. A slow box resume or create no longer holds up other runs of the same repo.
 - **93** = person work (`offbox-person`) while the home server is down. Nothing ran and nothing went to Boat. It
   is not a failure of the command: the task waits for the server. Don't retry in a loop and don't route around it.
 - **94** = the home command was interrupted by a server/Incus restart or exec-stream loss and was not run again (`--no-retry`, person work, or it
   had already been retried once). The command ran partly: check what it did before running it again; the message reports clean, stopped leftovers, or unknown cleanup.
 - **96** = local state DB failure. Before start: 'nothing ran, safe to retry'. After start: the message names the run and tells you to use `offbox wait <run>`; do not rerun the command. No automatic local fallback. A local bookkeeping failure after a known remote exit warns and returns that remote exit code.
 - **100** from `offbox wait` / `offbox logs` = the client ended before it got a box. The run never started; nothing ran, safe to rerun.
+- **143** = a started run was killed by `offbox kill`, on either backend. Run, wait, and logs report the kill rather than an infrastructure failure; missing step results do not change it to 90. A queued kill that never started retains exit 130.
 - **124** from `offbox wait --timeout` = you stopped waiting; the run is still going. Resume using **Waiting for a run**, not a short wait or logs loop.
 - **90** = infra failure (or, on the Boat standby, an exhausted start budget); **91** = Boat's spend guard, which only
   exists on the standby (the home server has no cap). Heavy commands
