@@ -5049,6 +5049,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         // their command items, while the shared provider session stays alive.
         yield* client.handleServerNotification("thread/closed", (payload) =>
           Effect.gen(function* () {
+            yield* Effect.logInfo("codex.thread-closed", {
+              provider: CODEX_PROVIDER,
+              providerSessionId: input.providerSessionId,
+              nativeThreadId: payload.threadId,
+            });
             const completedAt = yield* DateTime.now;
             for (const context of (yield* Ref.get(settledTurns)).values()) {
               if (context.providerThread.nativeThreadRef?.nativeId !== payload.threadId) continue;
@@ -7725,13 +7730,24 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             function* (unloadInput) {
               const nativeThreadId = yield* getNativeThreadId(unloadInput.providerThread);
               sessionApprovals.delete(nativeThreadId);
-              yield* client.request("thread/unsubscribe", { threadId: nativeThreadId }).pipe(
-                // An exited app-server holds no subscriptions left to drop.
-                Effect.catchTags({
-                  CodexAppServerProcessExitedError: () => Effect.void,
-                  CodexAppServerInputStreamEndedError: () => Effect.void,
-                }),
-              );
+              const response = yield* client
+                .request("thread/unsubscribe", { threadId: nativeThreadId })
+                .pipe(
+                  // An exited app-server holds no subscriptions left to drop.
+                  Effect.catchTags({
+                    CodexAppServerProcessExitedError: () => Effect.succeed(null),
+                    CodexAppServerInputStreamEndedError: () => Effect.succeed(null),
+                  }),
+                );
+              // The acknowledgement precedes native shutdown and MCP termination;
+              // thread/closed is logged separately when that cleanup completes.
+              yield* Effect.logInfo("codex.thread-unsubscribe", {
+                provider: CODEX_PROVIDER,
+                providerSessionId: input.providerSessionId,
+                threadId: unloadInput.providerThread.appThreadId,
+                nativeThreadId,
+                status: response?.status ?? "runtimeExited",
+              });
             },
             (effect, unloadInput) =>
               effect.pipe(

@@ -1856,6 +1856,27 @@ export const layerWithOptions = (
               const key = sessionKey(input.providerSessionId);
               const entry = (yield* Ref.get(sessions)).get(key);
               let pending = entry?.idleThreadUnloads.get(input.nativeThreadKey);
+              let idleSinceMs = pending?.lastActivityAtMs;
+              const decision = Effect.fn("ProviderSessionManager.logIdleUnloadDecision")(function* (
+                outcome: "unloaded" | "skipped" | "deferred" | "failed" | "unknown",
+                reason: string,
+              ) {
+                const now = yield* Clock.currentTimeMillis;
+                yield* Effect.logInfo("orchestration-v2.driver-session.idle-unload", {
+                  provider: entry?.runtime.driver ?? input.orphan?.runtime.driver ?? "unknown",
+                  providerSessionId: input.providerSessionId,
+                  threadId: input.threadId,
+                  providerThreadId: pending?.providerThread.id ?? input.orphan?.providerThread.id,
+                  nativeThreadId: (pending?.providerThread ?? input.orphan?.providerThread)
+                    ?.nativeThreadRef?.nativeId,
+                  source: input.orphan === undefined ? "timer" : "sweep",
+                  idleMs: idleSinceMs === undefined ? null : Math.max(0, now - idleSinceMs),
+                  outcome:
+                    outcome === "failed" ? "deferred" : outcome === "unknown" ? "skipped" : outcome,
+                  reason,
+                });
+                return outcome;
+              });
               if (input.orphan !== undefined) {
                 const orphan = input.orphan;
                 if (
@@ -1863,11 +1884,15 @@ export const layerWithOptions = (
                   pending !== orphan.pending ||
                   pending?.held === true
                 )
-                  return "skipped" as const;
+                  return yield* decision("skipped", "ownership_changed");
                 const records = yield* projectionStore
                   .getThreadRecords(input.threadId, ["runs"], { unfinishedRunsOnly: true })
                   .pipe(Effect.exit);
-                if (Exit.isFailure(records)) return "unknown" as const;
+                if (Exit.isFailure(records)) return yield* decision("unknown", "state_unavailable");
+                idleSinceMs = Math.max(
+                  DateTime.toEpochMillis(records.value.thread.updatedAt),
+                  pending?.lastActivityAtMs ?? 0,
+                );
                 const now = yield* Clock.currentTimeMillis;
                 if (
                   records.value.runs.some(
@@ -1885,9 +1910,9 @@ export const layerWithOptions = (
                     ) <
                     idleTimeoutMs
                 )
-                  return "skipped" as const;
+                  return yield* decision("skipped", "unfinished_or_recent_run");
                 if (entry.runtime.hasPendingBackgroundWorkForThread === undefined)
-                  return "unknown" as const;
+                  return yield* decision("unknown", "background_probe_unavailable");
                 if (pending === undefined) {
                   // A missed registration is repaired under the same attachment lock.
                   pending = {
@@ -1907,17 +1932,15 @@ export const layerWithOptions = (
                 }
               }
               const unloadThread = entry?.exposedRuntime.unloadThread;
-              if (
-                entry === undefined ||
-                pending === undefined ||
-                pending.generation !== input.generation ||
-                unloadThread === undefined ||
-                !entry.attachedThreadIds.has(input.threadId)
-              ) {
-                return "skipped" as const;
-              }
+              if (entry === undefined) return yield* decision("skipped", "session_missing");
+              if (pending === undefined) return yield* decision("skipped", "registration_missing");
+              if (pending.generation !== input.generation)
+                return yield* decision("skipped", "generation_changed");
+              if (unloadThread === undefined) return yield* decision("skipped", "unsupported");
+              if (!entry.attachedThreadIds.has(input.threadId))
+                return yield* decision("skipped", "thread_detached");
               if (hasBusyTurn(entry, pending.providerThread.id, input.nativeThreadKey))
-                return "deferred" as const;
+                return yield* decision("deferred", "busy_turn");
               // Native busy begins after preparation. Protect unfinished runs on the current
               // native ID, while still retiring superseded IDs owned by the same provider row.
               const loadedKey = entry.providerThreadLoadsByThread.get(
@@ -1930,7 +1953,8 @@ export const layerWithOptions = (
                 const records = yield* projectionStore
                   .getThreadRecords(input.threadId, ["runs"], { unfinishedRunsOnly: true })
                   .pipe(Effect.exit);
-                if (Exit.isFailure(records)) return "deferred" as const;
+                if (Exit.isFailure(records))
+                  return yield* decision("deferred", "state_unavailable");
                 if (
                   records.value.runs.some(
                     (run) =>
@@ -1941,7 +1965,7 @@ export const layerWithOptions = (
                         run.providerThreadId === pending.providerThread.id),
                   )
                 )
-                  return "deferred" as const;
+                  return yield* decision("deferred", "unfinished_run");
               }
               // Unloading stops the native thread's background terminals, so a
               // thread still running background work stays loaded.
@@ -1952,7 +1976,7 @@ export const layerWithOptions = (
                       Effect.timeout(UNLOAD_THREAD_TIMEOUT_MS),
                       Effect.catchCause(() => Effect.succeed(true)),
                     );
-              if (holdsWork) return "deferred" as const;
+              if (holdsWork) return yield* decision("deferred", "held_work");
               const hasPendingWork =
                 entry.runtime.hasPendingBackgroundWorkForThread === undefined
                   ? false
@@ -1962,7 +1986,7 @@ export const layerWithOptions = (
                         Effect.timeout(UNLOAD_THREAD_TIMEOUT_MS),
                         Effect.catchCause(() => Effect.succeed(true)),
                       );
-              if (hasPendingWork) return "deferred" as const;
+              if (hasPendingWork) return yield* decision("deferred", "background_work");
               const unloading = yield* Ref.modify(sessions, (current) => {
                 const latest = current.get(key);
                 if (
@@ -1983,7 +2007,7 @@ export const layerWithOptions = (
                 });
                 return [true, updated] as const;
               });
-              if (!unloading) return "skipped" as const;
+              if (!unloading) return yield* decision("skipped", "ownership_changed");
               const unloaded = yield* unloadThread({ providerThread: pending.providerThread }).pipe(
                 Effect.timeout(UNLOAD_THREAD_TIMEOUT_MS),
                 Effect.as(true),
@@ -1998,7 +2022,7 @@ export const layerWithOptions = (
               );
               // Keep the generation and timer on failure so a transient request
               // error cannot strand a loaded thread for the session's lifetime.
-              if (!unloaded) return "failed" as const;
+              if (!unloaded) return yield* decision("failed", "unload_failed");
               yield* updateIdleThreadUnload(
                 input.providerSessionId,
                 input.nativeThreadKey,
@@ -2006,7 +2030,7 @@ export const layerWithOptions = (
               );
               // A deferred timer must not survive a sweep and match a later registration.
               if (input.orphan !== undefined) yield* cancelIdleFiber(pending.fiber);
-              return "unloaded" as const;
+              return yield* decision("unloaded", "runtime_released");
             }),
           );
         },
