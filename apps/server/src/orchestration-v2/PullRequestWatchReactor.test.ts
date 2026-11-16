@@ -11,6 +11,7 @@ import {
   type PullRequestComment,
 } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -105,7 +106,14 @@ const makeHarness = Effect.fn("makeWatchFailureHarness")(function* (
     ),
   );
   const reactor = yield* PullRequestWatchReactor.make.pipe(Effect.provide(dependencies));
-  return { reactor, commands, watch: () => watch };
+  return {
+    reactor,
+    commands,
+    watch: () => watch,
+    restart: () => {
+      if (watch) watch = { ...watch, startedAt: "2026-11-12T01:00:00.000Z" };
+    },
+  };
 });
 
 const makeFailureHarness = (failure: PullRequestService.PullRequestError) =>
@@ -410,6 +418,135 @@ it.effect.each([
   }),
 );
 
+const missingToolErrors = [
+  new PullRequestUnavailableError({ reason: "cli-missing" }),
+  new PullRequestOperationError({
+    operation: "detail",
+    detail: "fj is missing",
+    cause: new PullRequestProviderError({
+      provider: SourceControlProviderKind.make("forgejo"),
+      operation: "detail",
+      reason: "missing-tool",
+      detail: "fj is missing",
+    }),
+  }),
+];
+
+it.effect.each(missingToolErrors)("retries a later missing tool with backoff: %s", (error) =>
+  Effect.gen(function* () {
+    let missing = false;
+    let reads = 0;
+    const harness = yield* makeHarness({
+      detail: () => {
+        reads++;
+        return missing ? Effect.fail(error) : Effect.succeed(greenDetail());
+      },
+      activity: () =>
+        Effect.succeed({
+          comments: [],
+          commentCount: 0,
+          commentsTruncated: false,
+          reviewThreads: [],
+          commits: [],
+        }),
+    }).pipe(Effect.provideService(HostProcess.Environment, { PATH: "/test/server/bin:/usr/bin" }));
+    yield* harness.reactor.sweep;
+    assert.equal(reads, 1);
+    assert.isDefined(harness.watch());
+    missing = true;
+    yield* TestClock.adjust("10 minutes");
+    yield* harness.reactor.sweep;
+    assert.equal(reads, 2);
+    assert.isDefined(harness.watch());
+    yield* harness.reactor.sweep;
+    assert.equal(reads, 2);
+    yield* TestClock.adjust("1 minute");
+    yield* harness.reactor.sweep;
+    assert.equal(reads, 3);
+    yield* TestClock.adjust("1 minute");
+    yield* harness.reactor.sweep;
+    assert.equal(reads, 3);
+    assert.isDefined(harness.watch());
+    yield* TestClock.adjust("1 minute");
+    yield* harness.reactor.sweep;
+    assert.equal(reads, 4);
+    assert.isUndefined(harness.watch());
+    assert.include(harness.commands.at(-1)?.wake?.text ?? "", "3 consecutive unsuccessful reads");
+    assert.include(
+      harness.commands.at(-1)?.wake?.text ?? "",
+      "Server PATH: /test/server/bin:/usr/bin.",
+    );
+    if (error._tag === "PullRequestUnavailableError") {
+      assert.include(
+        harness.commands.at(-1)?.wake?.text ?? "",
+        "Watching again won't help until server access is fixed.",
+      );
+      assert.notInclude(harness.commands.at(-1)?.wake?.text ?? "", "watch_pull_request");
+    }
+  }),
+);
+
+it.effect.each(["detail", "activity"] as const)(
+  "recovers from transient missing-tool %s reads and resets the streak",
+  (failureAt) =>
+    Effect.gen(function* () {
+      let missing = false;
+      let reads = 0;
+      const harness = yield* makeHarness({
+        detail: () => {
+          reads++;
+          return missing && failureAt === "detail"
+            ? Effect.fail(missingToolErrors[0]!)
+            : Effect.succeed(greenDetail());
+        },
+        activity: () =>
+          missing && failureAt === "activity"
+            ? Effect.fail(missingToolErrors[0]!)
+            : Effect.succeed({
+                comments: [],
+                commentCount: 0,
+                commentsTruncated: false,
+                reviewThreads: [],
+                commits: [],
+              }),
+      });
+      yield* harness.reactor.sweep;
+      for (let episode = 0; episode < 2; episode++) {
+        missing = true;
+        yield* TestClock.adjust("10 minutes");
+        yield* harness.reactor.sweep;
+        yield* TestClock.adjust("1 minute");
+        yield* harness.reactor.sweep;
+        assert.isDefined(harness.watch());
+        missing = false;
+        yield* TestClock.adjust("2 minutes");
+        const before = reads;
+        yield* harness.reactor.sweep;
+        assert.equal(reads, before + 1);
+        assert.isDefined(harness.watch());
+      }
+      assert.isFalse(harness.commands.some((command) => command.watch === null));
+    }),
+);
+
+it.effect("gives a newly registered watch a fresh missing-tool retry budget", () =>
+  Effect.gen(function* () {
+    const harness = yield* makeFailureHarness(missingToolErrors[0]!);
+    yield* harness.reactor.sweep;
+    yield* TestClock.adjust("1 minute");
+    yield* harness.reactor.sweep;
+    harness.restart();
+    yield* harness.reactor.sweep;
+    assert.isDefined(harness.watch());
+    yield* TestClock.adjust("1 minute");
+    yield* harness.reactor.sweep;
+    assert.isDefined(harness.watch());
+    yield* TestClock.adjust("2 minutes");
+    yield* harness.reactor.sweep;
+    assert.isUndefined(harness.watch());
+  }),
+);
+
 it.effect.each(["cli-missing", "failed"] as const)(
   "survives one %s tool failure, resets on recovery, and stops at its consecutive failure limit",
   (reason) =>
@@ -459,7 +596,16 @@ it.effect.each(["cli-missing", "failed"] as const)(
       const stopped = harness.commands.filter((command) => command.watch === null);
       assert.lengthOf(stopped, 1);
       assert.include(stopped[0]!.wake?.text ?? "", `${limit} consecutive unsuccessful reads`);
-      assert.include(stopped[0]!.wake?.text ?? "", "watch_pull_request");
+      if (reason === "cli-missing") {
+        assert.notInclude(stopped[0]!.wake?.text ?? "", "watch_pull_request");
+        assert.include(stopped[0]!.wake?.text ?? "", "Server PATH:");
+        assert.include(
+          stopped[0]!.wake?.text ?? "",
+          "Watching again won't help until server access is fixed.",
+        );
+      } else {
+        assert.include(stopped[0]!.wake?.text ?? "", "watch_pull_request");
+      }
     }),
 );
 
@@ -806,12 +952,41 @@ it.each(["cli-missing", "cli-unauthenticated", "provider-unsupported"] as const)
       { host: "forgejo.example", number: 9, url: "https://forgejo.example/o/r/pulls/9" },
       1,
       error,
+      undefined,
+      "/test/server/bin:/usr/bin",
     );
     assert.include(text, `The server can't read pull requests on forgejo.example (${reason}).`);
     assert.include(text, error.message);
     assert.include(text, "Watching again won't help until server access is fixed.");
     assert.include(text, "Check the PR with your own tools instead.");
     assert.notInclude(text, "watch_pull_request");
+    assert.strictEqual(text.includes("Server PATH:"), reason === "cli-missing");
+  },
+);
+
+it.each(
+  missingToolErrors.flatMap((error) =>
+    [
+      { serverPath: "/opt/homebrew/bin:/usr/bin", expected: "/opt/homebrew/bin:/usr/bin" },
+      {
+        serverPath: "C:\\tools;C:\\Windows\\System32",
+        expected: "C:\\tools;C:\\Windows\\System32",
+      },
+      { serverPath: "", expected: "(unset)" },
+      { serverPath: undefined, expected: "(unset)" },
+    ].map((path) => ({ error, ...path })),
+  ),
+)(
+  "missing-tool stop text includes PATH ($error._tag, $serverPath)",
+  ({ error, serverPath, expected }) => {
+    const text = pullRequestWatchStopMessage(
+      { host: "forgejo.example", number: 9, url: "https://forgejo.example/o/r/pulls/9" },
+      3,
+      error,
+      undefined,
+      serverPath,
+    );
+    assert.isTrue(text.endsWith(` Server PATH: ${expected}.`));
   },
 );
 
@@ -822,6 +997,7 @@ it("transient stop text keeps the eight-read retry advice", () => {
       8,
       new PullRequestOperationError({ operation: "detail", detail: "Rate limited" }),
       "Still delayed.",
+      "/test/server/bin:/usr/bin",
     ),
     "T3 Code stopped watching pull request #9 (https://github.com/o/r/pull/9) after 8 consecutive unsuccessful reads. Still delayed. Last error: Pull request operation detail failed: Rate limited Check it yourself, and call watch_pull_request to watch it again.",
   );

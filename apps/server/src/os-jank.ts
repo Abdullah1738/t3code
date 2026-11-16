@@ -1,6 +1,7 @@
 import type { DesktopBackendBootstrap } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import {
+  isBareMacosPath,
   listLoginShellCandidates,
   mergePathEntries,
   readEnvironmentFromLoginShell,
@@ -25,6 +26,27 @@ function logPathHydrationWarning(message: string, error?: unknown): void {
 
 type DesktopPathHydration = NonNullable<DesktopBackendBootstrap["shellPathHydration"]>;
 type ProbeOutcome = DesktopPathHydration["probes"][number];
+
+const appendMacosCliDirectories = Effect.fn("server.pathHydration.appendMacosCliDirectories")(
+  function* (env: NodeJS.ProcessEnv) {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const candidates = [
+      "/opt/homebrew/bin",
+      "/usr/local/bin",
+      ...(env.HOME ? [`${env.HOME}/.local/bin`] : []),
+    ];
+    const existing: string[] = [];
+    for (const candidate of candidates) {
+      const stat = yield* fileSystem.stat(candidate).pipe(Effect.orElseSucceed(() => undefined));
+      if (stat?.type === "Directory") existing.push(candidate);
+    }
+    const inherited = mergePathEntries(env.PATH, undefined, "darwin");
+    const withFallback = mergePathEntries(inherited, existing.join(":"), "darwin");
+    const changed = withFallback !== inherited;
+    if (withFallback) env.PATH = withFallback;
+    return changed;
+  },
+);
 
 const runPathProbe = Effect.fn("server.pathHydration.probe")(function* <A>(
   probe: ProbeOutcome["probe"],
@@ -55,7 +77,6 @@ const hydratePosixPath = Effect.fn("server.pathHydration.hydratePosixPath")(func
   env: NodeJS.ProcessEnv,
   platform: NodeJS.Platform,
 ) {
-  const fileSystem = yield* FileSystem.FileSystem;
   const probes: ProbeOutcome[] = [];
   let shellEnvironment: Partial<Record<string, string>> = {};
   for (const shell of listLoginShellCandidates(platform, env.SHELL)) {
@@ -94,23 +115,14 @@ const hydratePosixPath = Effect.fn("server.pathHydration.hydratePosixPath")(func
     | "server-shell"
     | "server-launchctl"
     | "fallback-dirs" = shellPath ? "server-shell" : launchctlPath ? "server-launchctl" : "none";
-  let mergedPath = mergePathEntries(shellPath ?? launchctlPath, env.PATH, platform);
-  if (platform === "darwin" && !shellPath && !launchctlPath) {
-    const candidates = [
-      "/opt/homebrew/bin",
-      "/usr/local/bin",
-      ...(env.HOME ? [`${env.HOME}/.local/bin`] : []),
-    ];
-    const existing: string[] = [];
-    for (const candidate of candidates) {
-      const stat = yield* fileSystem.stat(candidate).pipe(Effect.orElseSucceed(() => undefined));
-      if (stat?.type === "Directory") existing.push(candidate);
-    }
-    const withFallback = mergePathEntries(mergedPath, existing.join(":"), platform);
-    if (withFallback !== mergedPath) source = "fallback-dirs";
-    mergedPath = withFallback;
-  }
+  const mergedPath = mergePathEntries(shellPath ?? launchctlPath, env.PATH, platform);
   if (mergedPath) env.PATH = mergedPath;
+  if (
+    platform === "darwin" &&
+    ((!shellPath && !launchctlPath) || isBareMacosPath(env.PATH)) &&
+    (yield* appendMacosCliDirectories(env))
+  )
+    source = "fallback-dirs";
   if (shellPath && shellEnvironment.__MISE_DIFF) env.__MISE_DIFF = shellEnvironment.__MISE_DIFF;
   return { source, probes };
 });
@@ -173,6 +185,14 @@ export const fixPath = Effect.fn("fixPath")(function* (options?: {
       : yield* hydratePosixPath(env, platform).pipe(
           Effect.catchDefect(() => Effect.succeed({ source: "none" as const, probes: [] })),
         );
+  // Older desktops can mark a system-only probe as prepared.
+  if (
+    options?.shellEnvironmentPrepared === true &&
+    platform === "darwin" &&
+    isBareMacosPath(env.PATH) &&
+    (yield* appendMacosCliDirectories(env))
+  )
+    result.source = "fallback-dirs";
   const probes = [
     ...(desktop?.probes.map((probe) => ({ stage: "desktop", ...probe })) ?? []),
     ...result.probes.map((probe) => ({ stage: "server", ...probe })),
