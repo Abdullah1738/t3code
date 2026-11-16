@@ -1004,6 +1004,10 @@ function preserveRunRecordedFields(
     ...(next.delegatedTaskStall === undefined && current.delegatedTaskStall !== undefined
       ? { delegatedTaskStall: current.delegatedTaskStall }
       : {}),
+    ...(next.delegatedTaskStallRecovery === undefined &&
+    current.delegatedTaskStallRecovery !== undefined
+      ? { delegatedTaskStallRecovery: current.delegatedTaskStallRecovery }
+      : {}),
     ...(next.delegatedCompletion === undefined && current.delegatedCompletion !== undefined
       ? { delegatedCompletion: current.delegatedCompletion }
       : {}),
@@ -2458,7 +2462,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 payload_json = json_patch(${keepRecordedRunField(
                   keepRecordedRunField(
                     keepRecordedRunField(
-                      keepRecordedRunField(sql`excluded.payload_json`, "$.delegatedCompletion"),
+                      keepRecordedRunField(
+                        keepRecordedRunField(sql`excluded.payload_json`, "$.delegatedCompletion"),
+                        "$.delegatedTaskStallRecovery",
+                      ),
                       "$.delegatedTaskStall",
                     ),
                     "$.restartCancelledBackgroundWork",

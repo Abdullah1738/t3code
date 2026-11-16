@@ -101,6 +101,8 @@ import { modelSelectionsEqual } from "@t3tools/shared/model";
 import {
   normalizeIdleTimeout,
   stalledSummary,
+  silentRecoveryStillSafe,
+  supportsSilentRecovery,
   progressBlockers,
   latestQualifyingProgress,
 } from "./delegatedTaskProgress.ts";
@@ -4561,6 +4563,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       | "nodes"
       | "thread"
       | "turnItems"
+      | "runtimeRequests"
     >;
     readonly modelSelection: ModelSelection;
     readonly targetRunId: OrchestrationV2Run["id"];
@@ -4643,6 +4646,25 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const providerThread = input.projection.providerThreads.find(
       (candidate) => candidate.id === targetRun.providerThreadId,
     );
+    const stallRecovery =
+      input.command.type === "message.dispatch"
+        ? input.command.delegatedTaskStallRecovery
+        : undefined;
+    if (
+      stallRecovery !== undefined &&
+      (!input.forceRestart ||
+        input.createdBy !== "system" ||
+        input.creationSource !== "server" ||
+        !supportsSilentRecovery(providerThread?.driver, stallRecovery.phase) ||
+        targetRun.delegatedTaskId === undefined ||
+        !silentRecoveryStillSafe(input.projection, targetRun, stallRecovery))
+    ) {
+      return yield* new OrchestratorDispatchError({
+        commandId: input.command.commandId,
+        commandType: input.command.type,
+        cause: "Silent child recovery is no longer safe or was already attempted.",
+      });
+    }
     if (providerThread === undefined || providerThread.providerSessionId === null) {
       return yield* new OrchestratorDispatchError({
         commandId: input.command.commandId,
@@ -4829,13 +4851,24 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       selectionChanged &&
       (providerInstanceChanged || selectionTransition?.type !== "apply_on_next_turn");
     const steeringPolicy = yield* enforceCommandPolicy(input.command)(
-      commandPolicy.decideSteeringExecution({
-        commandId: input.command.commandId,
-        threadId: input.command.threadId,
-        providerInstanceId: targetRun.providerInstanceId,
-        capabilities: session.providerSession.capabilities,
-        forceRestart: input.forceRestart || selectionMustApplyNow,
-      }),
+      // Claude normally queues steering. A verified request with no model event
+      // needs a fresh attempt, rather than another message on the hung request.
+      stallRecovery?.phase === "first_event" && providerThread.driver === "claudeAgent"
+        ? commandPolicy
+            .ensureInterrupt({
+              commandId: input.command.commandId,
+              threadId: input.command.threadId,
+              providerInstanceId: targetRun.providerInstanceId,
+              capabilities: session.providerSession.capabilities,
+            })
+            .pipe(Effect.as("interrupt_restart" as const))
+        : commandPolicy.decideSteeringExecution({
+            commandId: input.command.commandId,
+            threadId: input.command.threadId,
+            providerInstanceId: targetRun.providerInstanceId,
+            capabilities: session.providerSession.capabilities,
+            forceRestart: input.forceRestart || selectionMustApplyNow,
+          }),
     );
 
     if (input.activeTurnOnly && steeringPolicy !== "active_steering") {
@@ -5132,6 +5165,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     );
     const restartedRun: OrchestrationV2Run = {
       ...withoutProviderStartDeadline(targetRun),
+      ...(stallRecovery === undefined ? {} : { delegatedTaskStallRecovery: stallRecovery }),
       providerRestartCleanup: {
         providerSessionId,
         providerThreadId: providerThread.id,
@@ -5557,6 +5591,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       (run) => run.id === command.restartContinuationOfRunId,
     );
     const continuedTaskId = continuationSource?.delegatedTaskId;
+    const continuedStallRecovery = continuationSource?.delegatedTaskStallRecovery;
     const continuedRecovery = continuedLaunchRecovery(continuationSource, projection.providerTurns);
 
     if (projection.thread.settledOverride !== null) {
@@ -6101,6 +6136,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ? {}
           : { restartContinuationOfRunId: command.restartContinuationOfRunId }),
         ...(continuedTaskId === undefined ? {} : { delegatedTaskId: continuedTaskId }),
+        ...(continuedStallRecovery === undefined
+          ? {}
+          : { delegatedTaskStallRecovery: continuedStallRecovery }),
         ...(continuedRecovery === undefined ? {} : { launchRecovery: continuedRecovery }),
         ...(command.contextReset === true ? { contextReset: true } : {}),
       };
@@ -6453,6 +6491,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ? { workspacePreparation: dispatchMode.workspaceStrategy }
           : {}),
         ...(continuedTaskId === undefined ? {} : { delegatedTaskId: continuedTaskId }),
+        ...(continuedStallRecovery === undefined
+          ? {}
+          : { delegatedTaskStallRecovery: continuedStallRecovery }),
         ...(continuedRecovery === undefined ? {} : { launchRecovery: continuedRecovery }),
         ...(command.contextReset === true ? { contextReset: true } : {}),
         ...wakeWorkStartedAt(projection.runs, command),
@@ -7181,6 +7222,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ? {}
         : { restartContinuationOfRunId: command.restartContinuationOfRunId }),
       ...(continuedTaskId === undefined ? {} : { delegatedTaskId: continuedTaskId }),
+      ...(continuedStallRecovery === undefined
+        ? {}
+        : { delegatedTaskStallRecovery: continuedStallRecovery }),
       ...(continuedRecovery === undefined ? {} : { launchRecovery: continuedRecovery }),
       ...(command.contextReset === true ? { contextReset: true } : {}),
       ...wakeWorkStartedAt(projection.runs, command),
@@ -13739,45 +13783,80 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const commitRecheck =
       command.type === "run.interrupt" && plannedStall?.type === "run.updated"
         ? recheckDelegatedTaskStall(command, plannedStall.payload)
-        : command.type === "run.start-expire"
+        : command.type === "message.dispatch" && command.delegatedTaskStallRecovery !== undefined
           ? Effect.gen(function* () {
-              const current = yield* startExpiryState(command);
-              const changed = new OrchestratorDispatchError({
-                commandId: command.commandId,
-                commandType: command.type,
-                cause:
-                  "The provider started or its cleanup target changed before the start deadline committed.",
-              });
-              if (current === undefined) return yield* changed;
-              const plannedStops = plan.effects
-                .flatMap((effect) =>
-                  effect.request.type === "provider-turn.interrupt" &&
-                  effect.request.startTimeout === true
-                    ? [
-                        [
-                          effect.request.providerTurnId,
-                          effect.request.providerThreadId,
-                          effect.request.providerSessionId,
-                          effect.request.replacementProviderSessionId ?? null,
-                        ] as const,
-                      ]
-                    : [],
-                )
-                .sort(([left], [right]) => left.localeCompare(right));
-              const currentStops = startExpiryCleanupTargets(current.projection, current.run)
-                .map(
-                  (target) =>
-                    [
-                      target.providerTurnId,
-                      target.providerThreadId,
-                      target.providerSessionId,
-                      target.replacementProviderSessionId ?? null,
-                    ] as const,
-                )
-                .sort(([left], [right]) => left.localeCompare(right));
-              if (!NodeUtil.isDeepStrictEqual(plannedStops, currentStops)) return yield* changed;
-            })
-          : recheck;
+              const recovery = command.delegatedTaskStallRecovery!;
+              const planned = plan.events.find(
+                (event) =>
+                  event.type === "run.updated" &&
+                  event.payload.delegatedTaskStallRecovery !== undefined,
+              );
+              const current = yield* projectionStore.getThreadRecords(command.threadId, [
+                "runs",
+                "turnItems",
+                "runtimeRequests",
+                "messages",
+              ]);
+              const run =
+                planned?.type === "run.updated"
+                  ? current.runs.find((run) => run.id === planned.payload.id)
+                  : undefined;
+              if (
+                run === undefined ||
+                run.status !== "running" ||
+                current.runs.findLast((candidate) => candidate.status !== "queued")?.id !==
+                  run.id ||
+                run.providerThreadId !==
+                  (planned?.type === "run.updated"
+                    ? planned.payload.providerThreadId
+                    : undefined) ||
+                !silentRecoveryStillSafe(current, run, recovery)
+              )
+                return yield* new OrchestratorDispatchError({
+                  commandId: command.commandId,
+                  commandType: command.type,
+                  cause: "Delegated task progressed or changed before recovery committed.",
+                });
+            }).pipe(mapDispatchError(command))
+          : command.type === "run.start-expire"
+            ? Effect.gen(function* () {
+                const current = yield* startExpiryState(command);
+                const changed = new OrchestratorDispatchError({
+                  commandId: command.commandId,
+                  commandType: command.type,
+                  cause:
+                    "The provider started or its cleanup target changed before the start deadline committed.",
+                });
+                if (current === undefined) return yield* changed;
+                const plannedStops = plan.effects
+                  .flatMap((effect) =>
+                    effect.request.type === "provider-turn.interrupt" &&
+                    effect.request.startTimeout === true
+                      ? [
+                          [
+                            effect.request.providerTurnId,
+                            effect.request.providerThreadId,
+                            effect.request.providerSessionId,
+                            effect.request.replacementProviderSessionId ?? null,
+                          ] as const,
+                        ]
+                      : [],
+                  )
+                  .sort(([left], [right]) => left.localeCompare(right));
+                const currentStops = startExpiryCleanupTargets(current.projection, current.run)
+                  .map(
+                    (target) =>
+                      [
+                        target.providerTurnId,
+                        target.providerThreadId,
+                        target.providerSessionId,
+                        target.replacementProviderSessionId ?? null,
+                      ] as const,
+                  )
+                  .sort(([left], [right]) => left.localeCompare(right));
+                if (!NodeUtil.isDeepStrictEqual(plannedStops, currentStops)) return yield* changed;
+              })
+            : recheck;
     const committed = yield* eventSink
       .commitCommand({
         commandId: command.commandId,

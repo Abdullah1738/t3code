@@ -27,6 +27,16 @@ def write(path: Path, text: str) -> None:
 
 
 class HarnessTestCase(unittest.TestCase):
+    def test_codex_stream_retry_precedes_delegated_child_stall(self) -> None:
+        self.run_gen()
+        for harness, timeout in (("codex", 360000), ("codex-cu", 480000)):
+            with self.subTest(harness=harness):
+                config = tomllib.loads((self.root / harness / "config.toml").read_text())
+                provider = config["model_providers"]["ninerouter"]
+                self.assertEqual(provider["stream_idle_timeout_ms"], timeout)
+                self.assertEqual(provider["stream_max_retries"], 1)
+                self.assertLess(timeout, 900000)
+
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="harness-test-", dir=PKG))
         self.home = self.tmp / "home"
@@ -752,6 +762,8 @@ class GenerateTests(HarnessTestCase):
         self.assertIs(base["features"].pop("computer_use"), False)
         self.assertNotIn("node_repl", base["mcp_servers"])
         self.assertEqual(cu.pop("computer_use"), {"default_app_access": "allow"})
+        self.assertEqual(cu["model_providers"]["ninerouter"].pop("stream_idle_timeout_ms"), 480000)
+        self.assertEqual(base["model_providers"]["ninerouter"].pop("stream_idle_timeout_ms"), 360000)
         self.assertEqual(cu, base)
         self.assertEqual(cu["notify"], [])
         self.assertEqual(cu["analytics"], {"enabled": False})
