@@ -46,6 +46,14 @@ class Base(unittest.TestCase):
         registry.start()
         self.addCleanup(registry.stop)
 
+    def assert_census(self, actual, expected):
+        self.assertEqual(sum(actual['limit_reasons'].values()), actual['limited'])
+        self.assertEqual(sum(actual['limit_age_days'].values()), actual['limited'])
+        self.assertEqual(set(actual['limit_age_days']), {'lt7', '7_30', '30_60', 'gt60'})
+        self.assertTrue(set(actual['limit_reasons']) <= mc.charges.LIMIT_REASONS)
+        self.assertTrue(all(type(n) is int and n >= 0 for n in actual['limit_reasons'].values()))
+        self.assertEqual({k: v for k, v in actual.items() if k not in ('limit_reasons', 'limit_age_days')}, expected)
+
     def case(self, case_id='acme', deadline='2026-10-25', when=at('2026-10-24T09:00'), **extra):
         fields = dict(merchant='Acme', amount='120.50', currency='aed', state='refund asked',
                       next_action='dispute on the card', deadline=deadline, who='Abdullah')
@@ -3181,8 +3189,10 @@ class CheckBudget(Base):
                 self.assertFalse(q.get('checked'))
                 self.assertEqual(q['status'], 'open')
                 self.assertFalse(q.get('case_opened') or q.get('asks'))
-                self.assertEqual(stats['charge_census']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=1, matched=0,
+                self.assert_census(stats['charge_census']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=1, matched=0,
                     proven_clean=0, limited=1, error=0, not_checked=0))
+                self.assertEqual(stats['charge_census']['noon']['limit_reasons'],
+                    {'receipt_not_checked' if offset == -1 else 'lane_uncovered:minutes': 1})
 
     def test_owner_precedes_reserved_order_reads_with_independent_slices(self):
         now = at('2026-11-14T12:00')
@@ -3304,6 +3314,65 @@ class CheckBudget(Base):
         self.assertTrue(all(q['checked'] and q['unverified'] for q in self.questions()))
         self.assertTrue(errors)
 
+    def test_deferred_census_reports_owner_failure_without_reclassifying_charges(self):
+        now = at('2026-11-14T12:00')
+        for owner_result, reason in (('list_failed', 'owner_list_failed'), ('incomplete', 'owner_incomplete')):
+            with self.subTest(owner_result=owner_result):
+                self.data = self.tmp / owner_result
+                self.seed([now - dt.timedelta(days=3)])
+                with mc.Locked(self.data, 'questions') as book:
+                    book['questions'][0].update(merchant='noon', mkey='noon')
+                stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+                clock = [1000.0]
+                def owner(*args, **kwargs):
+                    stats['owner_result'] = owner_result
+                    raise mc.charges.Lookup('fixture owner failure')
+                def orders(*args, **kwargs):
+                    clock[0] += 11
+                    return {'orders': [], 'complete': True, 'lanes': {
+                        lane: {'walked_at': '2026-12-31T00:00:00+00:00', 'exhaustive': True}
+                        for lane in mc.charges.order_lookup.LANES}}
+                with patch.object(mc.time, 'time', lambda: clock[0]), \
+                        patch.object(mc.charges.order_lookup, 'read', orders):
+                    mc.follow(self.data, now, self.root, 1012, finder(), owner, end=1039, stats=stats)
+                counts = stats['charge_census']['noon']
+                self.assertEqual(counts['limit_reasons'], {reason: 1})
+                self.assertEqual(counts['limit_age_days'], {'lt7': 1, '7_30': 0, '30_60': 0, 'gt60': 0})
+                self.assertEqual((counts['limited'], counts['error']), (1, 0))
+                self.assertFalse(self.questions()[0].get('asks'))
+                self.assertFalse(self.questions()[0].get('checked'))
+
+    def test_census_reason_classes_age_edges_and_first_reason(self):
+        now = at('2026-11-14T12:00')
+        reasons = sorted(mc.charges.LIMIT_REASONS)
+        days = [1, 7 - 1/86400, 7, 30, 30 + 1/86400, 60, 60 + 1/86400]
+        self.seed([now - dt.timedelta(days=days[n % len(days)]) for n in range(len(reasons))])
+        with mc.Locked(self.data, 'questions') as book:
+            for n, q in enumerate(book['questions']):
+                q.update(merchant='noon' if n % 2 == 0 else 'careem', mkey='fixture-' + str(n), amount=str(10+n))
+        by_amount = {q['amount']: reason for q, reason in zip(self.questions(), reasons)}
+        def explained(charge, when, *args, **kwargs):
+            reason = by_amount[charge['amount']]
+            return {'verdict': 'unverified', 'why': 'fixture limit', 'errors': [],
+                    'limits': [{'why': 'fixture', 'kinds': ['food_page_1'], 'reason': reason},
+                               {'why': 'later', 'kinds': ['marketplace_hold'], 'reason': 'marketplace_hold'}]}
+        stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+        with patch.object(mc.charges, 'explain', side_effect=explained), \
+                patch.object(mc.charges, 'order_receipt', return_value=None):
+            mc.follow(self.data, now, self.root, find=finder(), said=nobody, stats=stats)
+        for app in ('noon', 'careem'):
+            counts = stats['charge_census'][app]
+            selected = [q for q in self.questions() if q['merchant'] == app]
+            self.assertEqual(counts['limit_reasons'], {by_amount[q['amount']]: 1 for q in selected})
+            expected = dict.fromkeys(('lt7', '7_30', '30_60', 'gt60'), 0)
+            for q in selected:
+                bucket = ('lt7', 'lt7', '7_30', '7_30', '30_60', '30_60', 'gt60')[(int(q['amount']) - 10) % len(days)]
+                expected[bucket] += 1
+            self.assertEqual(counts['limit_age_days'], expected)
+            self.assertEqual(sum(counts['limit_reasons'].values()), counts['limited'])
+            self.assertEqual(sum(expected.values()), counts['limited'])
+            self.assertEqual(counts['error'], 0)
+
     def test_source_census_accounts_for_matches_clean_limits_errors_and_deferred(self):
         now = at('2026-11-14T12:00')
         self.seed([now - dt.timedelta(days=3, hours=5-n) for n in range(5)])
@@ -3322,9 +3391,9 @@ class CheckBudget(Base):
         ])
         with patch.object(mc.charges, 'explain', side_effect=lambda *a, **kw: next(outcomes)):
             mc.follow(self.data, now, self.root, find=finder(), said=nobody, stats=stats)
-        self.assertEqual(stats['charge_census']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=4, matched=1,
+        self.assert_census(stats['charge_census']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=4, matched=1,
             proven_clean=1, limited=1, error=1, not_checked=0))
-        self.assertEqual(stats['charge_census']['careem'], dict(open=1, matched=0,
+        self.assert_census(stats['charge_census']['careem'], dict(open=1, matched=0,
             proven_clean=0, limited=1, error=0, not_checked=0))
         # No time to admit another screen: remaining rows are deferred, never clean.
         stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
@@ -3364,7 +3433,7 @@ class CheckBudget(Base):
                     mc.follow(self.data, now, self.root, 1007 if form == 'deferred' else None,
                               finder(), nobody, stats=stats)
                 self.assertTrue(all(q['status'] == 'closed' for q in self.questions()))
-                self.assertEqual(stats['charge_census']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=2, matched=2,
+                self.assert_census(stats['charge_census']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=2, matched=2,
                     proven_clean=0, limited=0, error=0, not_checked=0))
 
     def census_alias_check(self, label, merchants, outcomes, deferred=False):
@@ -3415,7 +3484,7 @@ class CheckBudget(Base):
                             census = row['props']['chargeCensus']
                             for source, count in (('noon', 2 if peer == 'noon food' else 1),
                                                   ('careem', 1 if peer == 'careem' else 0)):
-                                self.assertEqual(census[source], dict(
+                                self.assert_census(census[source], dict(
                                     **({'marketplace_hold': 0, 'marketplace_stale': 0} if source == 'noon' else {}),
                                     open=count, matched=0,
                                     proven_clean=0, limited=count if kind == 'limited' else 0,
@@ -3433,7 +3502,7 @@ class CheckBudget(Base):
                 questions, row = self.census_alias_check('mixed-' + str(reverse),
                     ['noon', 'noon food'], outcomes)
                 self.assertTrue(all(q['unverified'] for q in questions))
-                self.assertEqual(row['props']['chargeCensus']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=2, matched=0,
+                self.assert_census(row['props']['chargeCensus']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=2, matched=0,
                     proven_clean=0, limited=0, error=2, not_checked=0))
                 self.assertFalse(row['ok'])
 
@@ -3445,7 +3514,7 @@ class CheckBudget(Base):
         questions, row = self.census_alias_check('non-transitive',
             ['noon', 'noon food', 'noon'], [failed, limited, clear])
         self.assertTrue(all(q['unverified'] for q in questions))
-        self.assertEqual(row['props']['chargeCensus']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=3, matched=0,
+        self.assert_census(row['props']['chargeCensus']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=3, matched=0,
             proven_clean=0, limited=1, error=2, not_checked=0))
 
     def test_check_census_deferred_alias_has_only_order_evidence(self):
@@ -3454,7 +3523,7 @@ class CheckBudget(Base):
                                                [clear], deferred=True)
         self.assertTrue(questions[0]['unverified'])
         self.assertFalse(questions[1].get('checked'))
-        self.assertEqual(row['props']['chargeCensus']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=2, matched=0,
+        self.assert_census(row['props']['chargeCensus']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=2, matched=0,
             proven_clean=0, limited=2, error=0, not_checked=0))
         self.assertFalse(row['ok'])
 
@@ -3467,7 +3536,7 @@ class CheckBudget(Base):
             with self.subTest(kind=kind):
                 questions, row = self.census_alias_check('distinct-' + kind,
                                                        ['noon', 'noon'], [clear, blocked])
-                self.assertEqual(row['props']['chargeCensus']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=2, matched=0,
+                self.assert_census(row['props']['chargeCensus']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=2, matched=0,
                     proven_clean=1, limited=1 if kind == 'limited' else 0,
                     error=1 if kind == 'error' else 0, not_checked=0))
                 self.assertFalse(questions[0]['unverified'])

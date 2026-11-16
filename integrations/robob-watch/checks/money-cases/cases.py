@@ -2711,6 +2711,8 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
                     raise charges.Lookup('Robob control: lookup over time')
                 return rows
         except charges.Lookup as exc:
+            if exc.reason == 'other':
+                exc.reason = 'owner_list_failed' if stats.get('owner_result') == 'list_failed' else 'owner_incomplete'
             if str(exc) != 'out of time':
                 source_error = exc
             raise
@@ -2745,22 +2747,44 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
         census = stats['charge_census'] = {app: dict.fromkeys(
             ('open', 'matched', 'proven_clean', 'limited', 'error', 'not_checked'), 0)
             for app in ('noon', 'careem')}
+        for counts in census.values():
+            counts.update(limit_reasons={}, limit_age_days=dict.fromkeys(('lt7', '7_30', '30_60', 'gt60'), 0))
         census['noon'].update(marketplace_hold=0, marketplace_stale=0)
-        census_questions = {}
+        census_questions, census_ages, census_reasons = {}, {}, {}
         for q in questions:
             app = charges.order_app(charge_of(q)) if q.get('kind') == 'charge' and active(q) else None
             if app in census:
                 census_questions[q['id']] = app
+                age = (now - parse_time(q['at'])).total_seconds() / 86400
+                bucket = 'lt7' if age < 7 else '7_30' if age <= 30 else '30_60' if age <= 60 else 'gt60'
+                census_ages[q['id']] = bucket
+                census_reasons[q['id']] = 'other'
+                census[app]['limit_reasons']['other'] = census[app]['limit_reasons'].get('other', 0) + 1
+                census[app]['limit_age_days'][bucket] += 1
                 for key in ('open', 'limited', 'not_checked'):
                     census[app][key] += 1
     census_outcomes = {}
 
-    def counted(qid, outcome):
+    def counted(qid, outcome, reason=None):
         old = census_outcomes.get(qid)
         census_outcomes[qid] = outcome
         app = census_questions.get(qid)
         if app is None:
             return
+        if old in (None, 'limited'):
+            previous_reason = census_reasons[qid]
+            reasons = census[app]['limit_reasons']
+            reasons[previous_reason] -= 1
+            if not reasons[previous_reason]:
+                del reasons[previous_reason]
+            census[app]['limit_age_days'][census_ages[qid]] -= 1
+        if reason is not None:
+            census_reasons[qid] = charges.limit_reason(reason)
+        if outcome == 'limited':
+            reasons = census[app]['limit_reasons']
+            current_reason = census_reasons[qid]
+            reasons[current_reason] = reasons.get(current_reason, 0) + 1
+            census[app]['limit_age_days'][census_ages[qid]] += 1
         census[app][old or 'limited'] -= 1
         if old is None:
             census[app]['not_checked'] -= 1
@@ -2807,18 +2831,23 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
                 continue
             if time.time() >= screen_end:
                 break
+            reason = None
             try:
                 # Only use the fetched memo: this pass must never start a reader,
                 # mail search or owner query, nor consume a per-question slice.
                 with within(screen_end, LookupTimeout('order evidence out of time')):
                     hit = charges.order_receipt(charge_of(q), at, now, screen_end, memo=memo)
                 outcome = 'matched' if hit else 'proven_clean'
+                reason = ('owner_list_failed' if stats.get('owner_result') == 'list_failed' else
+                          'owner_incomplete' if owner_error else 'receipt_not_checked')
                 if hit:
                     hits[q['id']] = hit
             except charges.SourceLimit as exc:
                 outcome = 'limited'
-                order_limits[q['id']] = {'why': str(exc), 'kinds': exc.kinds}
-            except charges.Lookup:
+                order_limits[q['id']] = {'why': str(exc), 'kinds': exc.kinds, 'reason': exc.reason}
+                reason = exc.reason
+            except charges.Lookup as exc:
+                reason = exc.reason
                 outcome = 'limited' if isinstance(memo[('orders', app)], dict) else 'error'
             except LookupTimeout:
                 break
@@ -2828,7 +2857,7 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
             order_outcomes[q['id']] = {'at': stamp(now), 'outcome': outcome}
             # Coverage alone cannot authorize an ask: a negative order result
             # still needs the receipt/owner screen before census proven_clean.
-            counted(q['id'], 'limited' if outcome == 'proven_clean' else outcome)
+            counted(q['id'], 'limited' if outcome == 'proven_clean' else outcome, reason)
     ordered = sorted(todo, key=lambda x: (x[1], x[2]['id']))
     cursor = question_book.get('follow_cursor')
     if cursor:
@@ -2854,7 +2883,7 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
         looked.add(q['id'])
         counted(q['id'], 'error')  # An interrupted attempt must never look clean.
         before_errors = len(errors)
-        limits = []
+        limits, reasons = [], []
         if q.get('kind') == 'charge':
             # Start the full slice after the cursor commit. The phase deadline admits
             # work; the enclosing whole-check alarm still bounds storage and lookups.
@@ -2874,19 +2903,24 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
                                                  receipt_ok=receipt_ok, memo=memo, stats=stats)
                         errors.extend(result['errors'])
                         limits.extend(result.get('limits', []))
+                        if result.get('limit_reason'):
+                            reasons.append(result['limit_reason'])
                         verdicts[q['id']] = result
                         if result['verdict'] in ('receipt', 'owner'):
                             hit = result
                     elif not hit:
                         hit = charges.found(charge, at, now, each, find, owner, errors, memo, stats,
-                                            receipt_ok=receipt_ok, limits=limits)
+                                            receipt_ok=receipt_ok, limits=limits, reasons=reasons)
             except (charges.Lookup, LookupTimeout) as e:
+                reasons.append(getattr(e, 'reason', 'receipt_out_of_time'))
                 errors.append(str(e))
                 # A slow receipt cannot hide owner evidence already loaded in this run.
                 hit = charges.owner_found(charge_of(q), at, now, said=owner, errors=errors) \
                     if owner_rows is not None and charges.card_owner(charge_of(q)) == 'abdullah' else None
             counted(q['id'], 'matched' if hit else 'error' if owner_error or len(errors) > before_errors
-                    else 'limited' if limits else 'proven_clean')
+                    else 'limited' if limits else 'proven_clean',
+                    next(iter(reasons), limits[0].get('reason', charges.source_limit_reason(limits[0]['kinds']))
+                         if limits else None))
             if hit:
                 hits[q['id']] = hit
             if limits and not hit:
