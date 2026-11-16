@@ -1070,7 +1070,7 @@ it.effect("a saved write stalled on acknowledgement has a dominant replyWait", (
   }),
 );
 
-it.effect.each(["card_create", "card_wait", "wiki_read"])(
+it.effect.each(["wiki_read"])(
   "%s records timing without changing its reader lane or adding a deadline",
   (tool) =>
     Effect.gen(function* () {
