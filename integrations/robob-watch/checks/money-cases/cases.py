@@ -3025,7 +3025,11 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
                         peers = transactions.get(unmatched_id(q), [])
                         failed_alias = any(attempted.get(source['id']) == 'error' and alert_alias(q, source)
                                            for source, _ in peers)
-                        counted(q['id'], 'error' if failed_alias else 'limited')
+                        reason = result.get('limit_reason')
+                        if reason is None and result.get('limits'):
+                            limit = result['limits'][0]
+                            reason = limit.get('reason', charges.source_limit_reason(limit['kinds']))
+                        counted(q['id'], 'error' if failed_alias else 'limited', reason)
         prune_questions(book, now)
     for kind in ('marketplace_hold', 'marketplace_stale'):
         census['noon'][kind] = sum(census_outcomes.get(qid) == 'limited' and kind in limit['kinds']

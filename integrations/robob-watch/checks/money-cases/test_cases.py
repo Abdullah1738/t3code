@@ -3489,8 +3489,40 @@ class CheckBudget(Base):
                                     open=count, matched=0,
                                     proven_clean=0, limited=count if kind == 'limited' else 0,
                                     error=count if kind == 'error' else 0, not_checked=0))
+                                self.assertEqual(census[source]['limit_reasons'],
+                                    {'lane_uncovered:food': count} if kind == 'limited' and count else {})
                             self.assertEqual(row['ok'], kind == 'limited')
                             self.assertNotIn('fixture', json.dumps(row))
+
+    def test_check_census_carries_blocking_alias_reason_in_both_orders(self):
+        forms = [
+            ('verdict', 'msgs_timeout', {'limit_reason': 'msgs_timeout',
+                'limits': [{'why': 'fixture later limit', 'kinds': ['food_page_1'], 'reason': 'lane_uncovered:food'}]}),
+            ('limit', 'lane_uncovered:food', {'limits': [
+                {'why': 'fixture first limit', 'kinds': ['food_page_1'], 'reason': 'lane_uncovered:food'},
+                {'why': 'fixture later limit', 'kinds': ['marketplace_hold'], 'reason': 'marketplace_hold'}]}),
+            ('legacy', 'lane_uncovered:food', {'limits': [{'why': 'fixture limit', 'kinds': ['food_page_1']}]}),
+        ]
+        for form, reason, fields in forms:
+            for clean in ('ask', 'wait'):
+                clear = {'verdict': clean, 'why': 'fixture clean', 'errors': [],
+                         'until': at('2026-11-15T12:00').isoformat()}
+                blocked = {'verdict': 'unverified', 'why': 'fixture blocked', 'errors': [], **fields}
+                for reverse in (False, True):
+                    label = f'alias-reason-{form}-{clean}-{reverse}'
+                    with self.subTest(label=label):
+                        merchants, outcomes = ['noon', 'noon food'], [clear, blocked]
+                        if reverse:
+                            merchants.reverse()
+                            outcomes.reverse()
+                        questions, row = self.census_alias_check(label, merchants, outcomes)
+                        census = row['props']['chargeCensus']['noon']
+                        self.assert_census(census, dict(marketplace_hold=0, marketplace_stale=0,
+                            open=2, matched=0, proven_clean=0, limited=2, error=0, not_checked=0))
+                        self.assertEqual(census['limit_reasons'], {reason: 2})
+                        self.assertEqual(census['limit_age_days'], {'lt7': 2, '7_30': 0, '30_60': 0, 'gt60': 0})
+                        self.assertTrue(all(q['unverified'] and q['status'] == 'open' and not q['asks']
+                                            for q in questions))
 
     def test_check_census_mixed_alias_errors_are_order_independent(self):
         limited = {'verdict': 'unverified', 'why': 'fixture limit', 'errors': [],
