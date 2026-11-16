@@ -13,6 +13,9 @@ import {
 import { assert, it } from "@effect/vitest";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
+import * as Logger from "effect/Logger";
+import * as Analytics from "../ardud/analytics/Analytics.ts";
+import type { AnalyticsEvent } from "@t3tools/contracts";
 import * as Layer from "effect/Layer";
 import * as TestClock from "effect/testing/TestClock";
 import { PullRequestProviderError } from "@t3tools/source-control-core/server/PullRequestProvider";
@@ -394,18 +397,152 @@ it.effect.each([
   "provider-unsupported",
   "cli-missing",
   "cli-unauthenticated",
-] satisfies PullRequestUnavailableReason[])("ends an unavailable watch immediately: %s", (reason) =>
+] satisfies PullRequestUnavailableReason[])(
+  "ends an unavailable watch after three consecutive reads: %s",
+  (reason) =>
+    Effect.gen(function* () {
+      const { reactor, commands } = yield* makeFailureHarness(
+        new PullRequestUnavailableError({ reason }),
+      );
+      yield* reactor.sweep;
+      yield* reactor.sweep;
+      assert.strictEqual(commands.length, 0);
+      yield* reactor.sweep;
+      assert.strictEqual(commands.length, 1);
+      assert.isNull(commands[0]!.watch);
+      assert.include(commands[0]!.wake?.text ?? "", "3 consecutive unsuccessful reads");
+      assert.include(commands[0]!.wake?.text ?? "", reason);
+      assert.notInclude(commands[0]!.wake?.text ?? "", "8 times");
+      yield* reactor.sweep;
+      assert.strictEqual(commands.length, 1);
+    }),
+);
+
+it.effect("a successful read clears an isolated unavailable failure and its streak", () =>
   Effect.gen(function* () {
-    const { reactor, commands } = yield* makeFailureHarness(
-      new PullRequestUnavailableError({ reason }),
+    let unavailable = true;
+    const { reactor, commands, watch } = yield* makeHarness({
+      detail: () =>
+        unavailable
+          ? Effect.fail(new PullRequestUnavailableError({ reason: "cli-missing" }))
+          : Effect.succeed({ ...greenDetail(), headBranchSha: OLD_HEAD }),
+      activity: () =>
+        Effect.succeed({
+          comments: [],
+          reviewThreads: [],
+          commits: [],
+          commentCount: 0,
+          commentsTruncated: false,
+        }),
+    });
+    yield* reactor.sweep;
+    assert.strictEqual(commands.length, 0);
+    unavailable = false;
+    yield* reactor.sweep;
+    assert.isDefined(watch());
+    unavailable = true;
+    // Force another detail read rather than the quiet-read optimization.
+    yield* TestClock.adjust("11 minutes");
+    yield* reactor.sweep;
+    yield* reactor.sweep;
+    assert.isDefined(watch());
+    assert.isFalse(commands.some((command) => command.watch === null));
+    yield* reactor.sweep;
+    assert.isUndefined(watch());
+    assert.include(commands.at(-1)!.wake?.text ?? "", "3 consecutive unsuccessful reads");
+  }),
+);
+
+it.effect("logs and records the reason and provider detail when a watch gives up", () => {
+  const messages: unknown[] = [];
+  const events: AnalyticsEvent[] = [];
+  return Effect.gen(function* () {
+    const { reactor } = yield* makeFailureHarness(
+      new PullRequestUnavailableError({
+        reason: "cli-missing",
+        cause: new PullRequestProviderError({
+          provider: SourceControlProviderKind.make("github"),
+          operation: "getChangeRequest",
+          reason: "missing-tool",
+          detail: "gh was not resolved on the server",
+        }),
+      }),
     );
+    for (let attempt = 0; attempt < 3; attempt++) yield* reactor.sweep;
+    const expected = {
+      failures: 3,
+      reason: "cli-missing",
+      errorTag: "PullRequestUnavailableError",
+      providerReason: "missing-tool",
+      providerDetail: "gh was not resolved on the server",
+    };
+    const flat = messages.flatMap((message) => (Array.isArray(message) ? message : [message]));
+    assert.isTrue(
+      flat.some(
+        (value) =>
+          typeof value === "object" &&
+          value !== null &&
+          "providerDetail" in value &&
+          value.providerDetail === expected.providerDetail,
+      ),
+    );
+    assert.deepStrictEqual(events[0]?.props, {
+      number: 3,
+      reason: "cli-missing",
+      errorTag: "PullRequestUnavailableError",
+      provider: "github",
+      reasonClass: "missing-tool",
+      operation: "getChangeRequest",
+    });
+  }).pipe(
+    Effect.provide(
+      Layer.merge(
+        Layer.mock(Analytics.Analytics)({
+          record: (event) =>
+            Effect.sync(() => {
+              events.push(event);
+            }),
+        }),
+        Logger.layer([
+          Logger.make(({ message }) => {
+            messages.push(message);
+          }),
+        ]),
+      ),
+    ),
+  );
+});
+
+it.effect("an intervening transient error resets the unavailable streak", () =>
+  Effect.gen(function* () {
+    let unavailable = true;
+    const { reactor, commands } = yield* makeHarness({
+      detail: () =>
+        Effect.fail(
+          unavailable
+            ? new PullRequestUnavailableError({ reason: "cli-missing" })
+            : new PullRequestOperationError({ operation: "detail", detail: "Host timed out" }),
+        ),
+      activity: () =>
+        Effect.succeed({
+          comments: [],
+          reviewThreads: [],
+          commits: [],
+          commentCount: 0,
+          commentsTruncated: false,
+        }),
+    });
+    yield* reactor.sweep;
+    yield* reactor.sweep;
+    unavailable = false;
+    yield* reactor.sweep;
+    unavailable = true;
+    yield* reactor.sweep;
+    yield* reactor.sweep;
+    assert.strictEqual(commands.length, 0);
     yield* reactor.sweep;
     assert.strictEqual(commands.length, 1);
-    assert.isNull(commands[0]!.watch);
-    assert.include(commands[0]!.wake?.text ?? "", reason);
-    assert.notInclude(commands[0]!.wake?.text ?? "", "8 times");
-    yield* reactor.sweep;
-    assert.strictEqual(commands.length, 1);
+    assert.include(commands[0]!.wake?.text ?? "", "6 consecutive unsuccessful reads");
   }),
 );
 

@@ -18,6 +18,7 @@ import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
+import * as DateTime from "effect/DateTime";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -32,6 +33,7 @@ import {
   PullRequestProviderError,
 } from "@t3tools/source-control-core/server/PullRequestProvider";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
+import * as Analytics from "../ardud/analytics/Analytics.ts";
 import { forkParked } from "../serverActivation.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
@@ -47,6 +49,7 @@ import {
  */
 const SWEEP_MINUTES = 2;
 const READ_FAILURE_LIMIT = 8;
+const UNAVAILABLE_FAILURE_LIMIT = 3;
 /**
  * Without a host fingerprint, a pull request with nothing in flight is read again only when its
  * sync snapshot moves, or after this long, for news the snapshot cannot show, such as a bot
@@ -255,6 +258,7 @@ export const make = Effect.gen(function* () {
     Effect.suspend(() => reportEnd(lifeKey(target), lifeOf(target), reason));
 
   const readFailures = new Map<string, number>();
+  const unavailableReads = new Map<string, number>();
   const lastReads = new Map<string, LastRead>();
   const threadTails = new Map<
     string,
@@ -301,13 +305,28 @@ export const make = Effect.gen(function* () {
     });
   });
 
-  const giveUp = (
+  const giveUp = Effect.fn("PullRequestWatchReactor.giveUp")(function* (
     target: WatchTarget,
     failures: number,
     error: Option.Option<PullRequestService.PullRequestError>,
     reason?: string,
-  ) =>
-    record(target, null, {
+  ) {
+    const failure = Option.getOrUndefined(error);
+    const providerError =
+      failure !== undefined && "cause" in failure && isProviderError(failure.cause)
+        ? failure.cause
+        : undefined;
+    const fields = {
+      failures,
+      reason:
+        failure?._tag === "PullRequestUnavailableError"
+          ? failure.reason
+          : (reason ?? "read-failed"),
+      errorTag: failure?._tag ?? null,
+      providerReason: providerError?.reason ?? null,
+      providerDetail: providerError?.detail ?? null,
+    };
+    yield* record(target, null, {
       text: `T3 Code stopped watching pull request #${target.link.number} (${target.link.url}) after ${failures} consecutive unsuccessful ${failures === 1 ? "read" : "reads"}.${reason ? ` ${reason}` : ""}${Option.match(
         error,
         {
@@ -326,6 +345,33 @@ export const make = Effect.gen(function* () {
       Effect.catch(() => record(target, null)),
       Effect.tap(() => ended(target, "unreadable")),
     );
+    yield* Effect.logWarning("pull request watch gave up", {
+      threadId: target.thread.id,
+      pullRequest: target.link.url,
+      ...fields,
+    });
+    const analytics = yield* Effect.serviceOption(Analytics.Analytics);
+    if (Option.isSome(analytics))
+      yield* analytics.value.record({
+        ts: DateTime.formatIso(yield* DateTime.now),
+        kind: "pull_request.watch.gave_up",
+        surface: "server",
+        route: "pull-request-watch",
+        threadId: target.thread.id,
+        props: {
+          number: failures,
+          reason: failure?._tag === "PullRequestUnavailableError" ? failure.reason : "read-failed",
+          ...(failure === undefined ? {} : { errorTag: failure._tag }),
+          ...(providerError === undefined
+            ? {}
+            : {
+                provider: providerError.provider,
+                reasonClass: providerError.reason,
+                operation: providerError.operation,
+              }),
+        },
+      });
+  });
 
   const readRemarks = Effect.fn("PullRequestWatchReactor.readRemarks")(
     function* (
@@ -476,9 +522,13 @@ export const make = Effect.gen(function* () {
       });
     }
     const unavailable = Option.isSome(error) && error.value._tag === "PullRequestUnavailableError";
-    if (!unavailable && failures < READ_FAILURE_LIMIT) return false;
+    const consecutiveUnavailable = unavailable ? (unavailableReads.get(group.key) ?? 0) + 1 : 0;
+    unavailableReads.set(group.key, consecutiveUnavailable);
+    if (failures < READ_FAILURE_LIMIT && consecutiveUnavailable < UNAVAILABLE_FAILURE_LIMIT)
+      return false;
     if (yield* eachTarget(group, (target) => giveUp(target, failures, error, reason))) {
       readFailures.delete(group.key);
+      unavailableReads.delete(group.key);
     }
     return true;
   });
@@ -552,6 +602,7 @@ export const make = Effect.gen(function* () {
     }
     if (detail.state !== "open") {
       readFailures.delete(group.key);
+      unavailableReads.delete(group.key);
       lastReads.delete(group.key);
       return yield* eachTarget(group, (target) =>
         detail.state === "closed"
@@ -561,6 +612,7 @@ export const make = Effect.gen(function* () {
     }
 
     readFailures.delete(group.key);
+    unavailableReads.delete(group.key);
     const settling = pullRequestChecksSettling(detail);
     const observedHead = detail.headBranchSha ?? detail.checksHeadSha ?? headSha;
     const previous = settlingReads.get(group.key);
@@ -686,7 +738,7 @@ export const make = Effect.gen(function* () {
       targets: members,
       fingerprint: [...new Set(members.map(snapshotFingerprint))].toSorted().join("\n"),
     }));
-    for (const cache of [readFailures, lastReads, threadTails, settlingReads]) {
+    for (const cache of [readFailures, unavailableReads, lastReads, threadTails, settlingReads]) {
       for (const key of cache.keys()) if (!byPullRequest.has(key)) cache.delete(key);
     }
     yield* Effect.forEach(
