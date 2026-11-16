@@ -153,6 +153,7 @@ interface FakeThread {
   stuck?: boolean;
   quietSince?: string;
   background?: number;
+  restartRecovery?: { readonly effectId?: string; readonly runId?: string };
   backgroundWorkUntil?: string;
   backgroundJobs?: KanbanThreadView["backgroundJobs"];
   backgroundStopped?: boolean;
@@ -263,6 +264,7 @@ const makeFake = Effect.gen(function* () {
             runId: thread.runId ?? null,
             runRequestedAt: thread.runRequestedAt ?? null,
             backgroundWork: thread.background ?? 0,
+            restartRecovery: thread.restartRecovery,
             ...(thread.backgroundWorkUntil === undefined
               ? {}
               : { backgroundWorkUntil: thread.backgroundWorkUntil }),
@@ -25922,6 +25924,95 @@ it.effect("the tick catches a reviewer whose turn end was skipped", () =>
   }),
 );
 
+it.effect.each(
+  (["backstop", "turn end", "deferred nudge"] as const).flatMap((path) =>
+    (["effect", "run"] as const).map((source) => ({ path, source })),
+  ),
+)(
+  "restart recovery holds the worker $path ($source) and releases the next backstop",
+  ({ path, source }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const events: AnalyticsEvent[] = [];
+      yield* Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+        const { kanban, board } = yield* toyBoard;
+        const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+        yield* kanban.dispatchNow;
+        const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+        yield* Ref.update(fake.threads, (all) => {
+          all.get(thread)!.restartRecovery =
+            source === "effect"
+              ? { effectId: "effect:restart-continuation:cut" }
+              : { runId: "restart-run" };
+          return all;
+        });
+        yield* TestClock.adjust("31 minutes");
+        if (path === "deferred nudge") {
+          yield* kanban.pauseBoard(board.id, { reason: "Hold", keep: [] }, owner);
+          yield* kanban.turnEnded(thread);
+          yield* kanban.pauseBoard(board.id, null, owner);
+          yield* kanban.tick;
+        } else if (path === "turn end") yield* kanban.turnEnded(thread);
+        else yield* kanban.tick;
+        assert.strictEqual(yield* nudgesTo(fake, thread), 0);
+        const skips = () => events.filter((event) => event.kind === "kanban.nudge_skipped");
+        assert.strictEqual(skips().length, 1);
+        assert.strictEqual(skips()[0]!.props?.reason, "restart_recovery_pending");
+        assert.strictEqual(skips()[0]!.cardId, card.id);
+        assert.strictEqual(skips()[0]!.threadId, thread);
+        assert.strictEqual(
+          source === "effect" ? skips()[0]!.props?.effectId : skips()[0]!.props?.runId,
+          source === "effect" ? "effect:restart-continuation:cut" : "restart-run",
+        );
+        yield* decodeAnalyticsEvent(skips()[0]);
+        yield* kanban.tick;
+        assert.strictEqual(skips().length, 1);
+        yield* TestClock.adjust("10 minutes");
+        yield* kanban.tick;
+        assert.strictEqual(skips().length, 2);
+        assert.isNull((yield* kanban.card(card.id)).card.nudgedAt);
+        yield* Ref.update(fake.threads, (all) => {
+          delete all.get(thread)!.restartRecovery;
+          return all;
+        });
+        yield* kanban.tick;
+        assert.strictEqual(yield* nudgesTo(fake, thread), 1);
+      }).pipe(
+        Effect.provide(
+          testLayer(fake.layer).pipe(
+            Layer.provide(
+              Layer.mock(Analytics.Analytics)({
+                record: (event) =>
+                  Effect.sync(() => {
+                    events.push(event);
+                  }),
+              }),
+            ),
+          ),
+        ),
+      );
+    }),
+);
+
+it.effect("an idle worker without restart recovery keeps its normal backstop", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+      yield* TestClock.adjust("31 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* nudgesTo(fake, thread), 1);
+      yield* kanban.tick;
+      assert.strictEqual(yield* nudgesTo(fake, thread), 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("a worker waiting on its own subagents isn't nudged", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
@@ -34809,6 +34900,85 @@ it.effect.each(["working", "todo", "in_review", "needs_review"] as const)(
           assert.equal((yield* kanban.card(card.id)).card.stage, "working");
         }
       }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect.each(
+  (["planning", "fresh read"] as const).flatMap((observedAt) =>
+    (["effect", "run"] as const).map((source) => ({ observedAt, source })),
+  ),
+)(
+  "restart recovery holds the silent-run backstop ($observedAt, $source)",
+  ({ observedAt, source }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const events: AnalyticsEvent[] = [];
+      yield* Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+        const { kanban, board } = yield* toyBoard;
+        const card = yield* kanban.createCard(board.id, { title: "A", prompt: "A" }, owner);
+        yield* kanban.dispatchNow;
+        const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+        const recovery =
+          source === "effect"
+            ? { effectId: "effect:restart-continuation:cut" }
+            : { runId: "restart-run" };
+        yield* Ref.update(fake.threads, (all) => {
+          Object.assign(all.get(thread)!, {
+            running: true,
+            runId: "restart-run",
+            runRequestedAt: "2026-10-25T13:00:00.000Z",
+            lastActivityAt: "2026-10-25T13:00:00.000Z",
+            ...(observedAt === "planning" ? { restartRecovery: recovery } : {}),
+          });
+          return all;
+        });
+        fake.findCalls.length = 0;
+        let recoveredDuringReread = false;
+        if (observedAt === "fresh read") {
+          fake.findControl.beforeRead = (id, attempt) =>
+            Ref.update(fake.threads, (all) => {
+              if (id === thread && attempt >= 2) {
+                all.get(thread)!.restartRecovery = recovery;
+                recoveredDuringReread = true;
+              }
+              return all;
+            });
+        }
+        yield* TestClock.adjust("31 minutes");
+        yield* kanban.tick;
+        if (observedAt === "fresh read") assert.isTrue(recoveredDuringReread);
+        assert.deepEqual(fake.interrupted, []);
+        assert.strictEqual(yield* nudgesTo(fake, thread), 0);
+        assert.isNull((yield* kanban.card(card.id)).card.nudgedAt);
+        const skips = events.filter((event) => event.kind === "kanban.nudge_skipped");
+        assert.lengthOf(skips, 1);
+        assert.deepInclude(skips[0]!.props, { reason: "restart_recovery_pending", ...recovery });
+        yield* decodeAnalyticsEvent(skips[0]);
+        delete fake.findControl.beforeRead;
+        yield* Ref.update(fake.threads, (all) => {
+          const worker = all.get(thread)!;
+          delete worker.restartRecovery;
+          worker.running = false;
+          return all;
+        });
+        yield* kanban.tick;
+        assert.deepEqual(fake.interrupted, []);
+        assert.strictEqual(yield* nudgesTo(fake, thread), 1);
+      }).pipe(
+        Effect.provide(
+          testLayer(fake.layer).pipe(
+            Layer.provide(
+              Layer.mock(Analytics.Analytics)({
+                record: (event) =>
+                  Effect.sync(() => {
+                    events.push(event);
+                  }),
+              }),
+            ),
+          ),
+        ),
+      );
     }),
 );
 
