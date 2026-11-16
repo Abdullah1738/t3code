@@ -31,6 +31,7 @@ import {
   KANBAN_THREAD_STAGES,
   kanbanCardModels,
   kanbanEvaluatorStep,
+  kanbanScriptStep,
   kanbanAskExpired,
   kanbanAskIsFreeText,
   kanbanAskRevision,
@@ -11130,6 +11131,100 @@ const make = Effect.gen(function* () {
     }
   });
 
+  const advanceFinishedWorker = Effect.fn("KanbanService.advanceFinishedWorker")(function* (
+    card: KanbanCard,
+  ) {
+    const threadId = card.activeThreadId;
+    if (
+      threadId === null ||
+      card.stage !== "working" ||
+      card.activeRole !== "work" ||
+      card.settledAt !== null ||
+      card.stalled !== null ||
+      kanbanWorkStep(card) ||
+      kanbanWaiting(card) ||
+      kanbanOpenAsks(card).some((ask) => ask.blocking) ||
+      Waits.decidingHolds(card) ||
+      waking(threadId)
+    )
+      return card;
+    card = (yield* upgradeFindings([card]))[0]!;
+    if (kanbanWorkStep(card)) return card;
+    const review = kanbanStepSubtasks(card, "review").length > 0;
+    if (!review && !kanbanEvaluatorStep(card) && !kanbanScriptStep(card)) return card;
+    if (review && !Rules.checkMove("cardThread", card, "needs_review").ok) return card;
+    const view = yield* freshThreads.find(threadId);
+    if (
+      view?.state !== "idle" ||
+      view.backgroundWork > 0 ||
+      Rules.waitingOnBackground(view, yield* nowMillis) ||
+      (yield* threads.queuedRuns(threadId)).length > 0
+    )
+      return card;
+    if (
+      [...(backgroundWaits.get(threadId)?.jobs.values() ?? [])].some((job) => job.endedAt !== null)
+    )
+      return card;
+    const at = yield* nowIso;
+    const reason = review ? "review_step" : "evaluator_step";
+    const next: KanbanCard = {
+      ...Retries.withoutRetries(release(card)),
+      stage: review ? "needs_review" : "todo",
+      ...(review ? { reviewStep: 0, reviewFindingsPending: false } : { wakeNote: null }),
+      question: null,
+      nudgedAt: null,
+      movedAt: at,
+      updatedAt: at,
+    };
+    // Wake cleanup may take admission itself. Finish it before locking, then
+    // recheck the card and thread together so a worker's own move wins the race.
+    yield* prepareTransition(next);
+    const saved = yield* turnAdmission.withLock(
+      threadId,
+      Effect.gen(function* () {
+        const live = yield* threadIo.find(threadId);
+        if (
+          !sameCardState(yield* store.card(card.id), card) ||
+          live?.state !== "idle" ||
+          live.backgroundWork > 0 ||
+          Rules.waitingOnBackground(live, yield* nowMillis) ||
+          (yield* threadIo.queuedRuns(threadId)).length > 0 ||
+          (yield* store.threadLink(threadId))?.paused ||
+          Retries.heldByPause(yield* boardOf(card.boardId), card) ||
+          waking(threadId)
+        )
+          return false;
+        const actor: KanbanActor = { _tag: "system", component: "dispatcher" };
+        const ageMs = BoardAnalytics.elapsed(at, card.analyticsStageEnteredAt ?? card.movedAt);
+        yield* logEvent(next, actor, "moved", {
+          fromStage: card.stage,
+          toStage: next.stage,
+          body: `Auto-advanced: ${reason}; ${ageMs} ms in Working`,
+        });
+        yield* saveCard(next, actor);
+        yield* recordAnalytics({
+          kind: "kanban.card.autoAdvanced",
+          boardId: card.boardId,
+          cardId: card.id,
+          threadId,
+          props: {
+            number: card.number,
+            from: card.stage,
+            to: next.stage,
+            actor: "system",
+            reasonClass: reason,
+            msInPrevStage: ageMs,
+          },
+        });
+        return true;
+      }),
+    );
+    if (!saved) return yield* cardOf(card.id);
+    yield* laterEvaluatorTurn(card, next, { _tag: "system", component: "dispatcher" });
+    yield* kick;
+    return next;
+  });
+
   /** Nudge a stopped worker once, then release cards still idle after the grace. */
   const nudgeWorker = Effect.fn("KanbanService.nudgeWorker")(function* (
     threadId: ThreadId,
@@ -11137,6 +11232,7 @@ const make = Effect.gen(function* () {
     runtimeFailureRunId: string | null = null,
   ) {
     if (waking(threadId)) return;
+    for (const card of planned) yield* advanceFinishedWorker(card);
     yield* parkWorkerWaits(threadId, planned);
     const cards: Array<KanbanCard> = [];
     for (const initial of planned) {
@@ -13901,12 +13997,14 @@ const make = Effect.gen(function* () {
                     return;
                   }
                   const view = yield* planView(threadId);
-                  if (
-                    view === null ||
-                    Rules.waitingOnBackground(view, now) ||
-                    !Rules.workerQuietDue(card, view, now)
-                  )
+                  if (view === null || Rules.waitingOnBackground(view, now)) return;
+                  const advanced = yield* advanceFinishedWorker(card);
+                  if (advanced.stage !== "working" || advanced.activeThreadId !== threadId) {
+                    updateCard(advanced);
+                    views.delete(threadId);
                     return;
+                  }
+                  if (!Rules.workerQuietDue(card, view, now)) return;
                   const fresh = yield* freshFind(threadId);
                   const current = yield* store.card(card.id);
                   if (
@@ -17324,6 +17422,21 @@ const make = Effect.gen(function* () {
           true,
         );
         const card = snapshot.before;
+        // An idle handoff can commit before the worker's delayed card_move.
+        // A new review request still needs its note and follows the normal path.
+        if (
+          role === "cardThread" &&
+          actor._tag === "thread" &&
+          actor.threadId === card.workThreadId &&
+          card.activeThreadId === null &&
+          card.stage === "needs_review" &&
+          to === "needs_review" &&
+          !options?.note?.trim() &&
+          snapshot.events
+            .findLast((event) => event.kind === "moved")
+            ?.body?.startsWith("Auto-advanced: review_step;")
+        )
+          return card;
         if (
           role === "cardThread" &&
           actor._tag === "thread" &&
@@ -19102,9 +19215,10 @@ const make = Effect.gen(function* () {
             undefined,
             releaseBoard,
           );
-          yield* laterEvaluatorTurn(card, next, actor);
+          const advanced = yield* advanceFinishedWorker(next);
+          if (advanced === next) yield* laterEvaluatorTurn(card, next, actor);
           yield* kick;
-          return next;
+          return advanced;
         }),
       );
       if (!paced) return yield* completing;
