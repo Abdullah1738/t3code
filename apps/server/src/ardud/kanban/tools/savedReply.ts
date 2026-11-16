@@ -13,6 +13,12 @@ export const REPLY_BUDGET_MS = 25_000;
 export const ADMISSION_BUDGET_MS = REPLY_BUDGET_MS - 5_000;
 
 export const TOOLS = new Set([
+  "card_claim",
+  "card_create",
+  "card_wait",
+  "card_ask",
+  "card_ask_answer",
+  "card_thread",
   "card_move",
   "card_review_result",
   "subtask_done",
@@ -24,7 +30,7 @@ export const TOOLS = new Set([
   "report_bug",
   "discussion_post",
 ]);
-export const TIMED_TOOLS = new Set([...TOOLS, "card_create", "card_wait", "wiki_read"]);
+export const TIMED_TOOLS = new Set([...TOOLS, "wiki_read"]);
 
 /** Encloses encoding and the reply budget, not just the mutation handler. */
 export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
