@@ -2327,6 +2327,8 @@ it.effect.each([
   { restart: false, correction: false, acceptance: "retry" },
   { restart: false, correction: false, acceptance: "projection-retry" },
   { restart: false, correction: false, acceptance: "commit-exhaustion" },
+  { restart: false, correction: false, acceptance: "steer-commit-exhaustion" },
+  { restart: false, correction: false, acceptance: "offer-replay" },
   { restart: false, correction: false, acceptance: "terminal-race" },
   { restart: false, correction: false, acceptance: "unaccepted-restart" },
   { restart: false, correction: false, acceptance: "failed-start" },
@@ -2336,13 +2338,15 @@ it.effect.each([
   ({ restart, correction, acceptance }) =>
     Effect.scoped(
       Effect.gen(function* () {
+        const nativeAcceptance = acceptance === "native" || acceptance.startsWith("steer-");
         const { events, started, steered, layer, startFirstTurn } = yield* nextTurnSelectionHarness(
           `notice-1711-${restart}-${correction}-${acceptance}`,
           false,
           false,
-          acceptance === "native",
+          nativeAcceptance,
         );
         const rows: AnalyticsEvent[] = [];
+        const offers: ProviderContinuationRequests.ProviderContinuationRequest[] = [];
         yield* Effect.gen(function* () {
           const orchestrator = yield* Orchestrator.OrchestratorV2;
           const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
@@ -2401,10 +2405,15 @@ it.effect.each([
             title,
             model: null,
             completionWake: "always",
-            status: i === 0 ? "completed" : "running",
+            status:
+              i === 0
+                ? "completed"
+                : acceptance === "offer-replay" && i === 1
+                  ? "failed"
+                  : "running",
             result: i === 0 ? "Baseline completed" : null,
             startedAt: terminalAt,
-            completedAt: i === 0 ? terminalAt : null,
+            completedAt: i === 0 || (acceptance === "offer-replay" && i === 1) ? terminalAt : null,
             updatedAt: terminalAt,
             completionDelivery: { state: i === 0 ? "claimed" : "pending", observedByRunId: null },
             ...(correction && i === 1
@@ -2485,7 +2494,7 @@ it.effect.each([
                       (e) =>
                         e.event.type === "provider-turn.updated" &&
                         e.event.threadId === threadId &&
-                        (acceptance === "native"
+                        (nativeAcceptance
                           ? e.event.payload.promptAcceptedAt !== undefined
                           : e.event.payload.status === "running"),
                     ),
@@ -2517,7 +2526,7 @@ it.effect.each([
             }
           });
           yield* dispatchDelivery();
-          if (acceptance !== "native") {
+          if (!nativeAcceptance) {
             const offered = yield* orchestrator.getThreadProjection(threadId);
             assert.equal(
               offered.subagents.find((t) => t.id === tasks[0]!.id)?.completionDelivery?.state,
@@ -2717,6 +2726,76 @@ it.effect.each([
               }
               fault.mockRestore();
             }
+            if (acceptance === "offer-replay") {
+              const projections = yield* ProjectionStore.ProjectionStoreV2;
+              const getRecords = projections.getThreadRecords;
+              const commit = sink.commitCommand;
+              let commits = 0;
+              let failedOffer = false;
+              const commitSpy = vi.spyOn(sink, "commitCommand").mockImplementation((input) =>
+                commit(input).pipe(
+                  Effect.tap(() =>
+                    Effect.sync(() => {
+                      if (input.commandType === "notification.delivery.accept") commits++;
+                    }),
+                  ),
+                ),
+              );
+              const readSpy = vi
+                .spyOn(projections, "getThreadRecords")
+                .mockImplementation((id, fields, filter) => {
+                  if (
+                    commits === 1 &&
+                    !failedOffer &&
+                    id === threadId &&
+                    fields.length === 1 &&
+                    fields[0] === "runs" &&
+                    filter === undefined
+                  ) {
+                    failedOffer = true;
+                    return Effect.fail(
+                      new ProjectionStore.ProjectionStoreReadError({
+                        threadId,
+                        cause: new Error("Reader lane unavailable during sibling offer"),
+                      }),
+                    );
+                  }
+                  return getRecords(id, fields, filter);
+                });
+              offers.length = 0;
+              yield* worker.drain();
+              assert.isTrue(failedOffer);
+              assert.equal(commits, 1);
+              assert.lengthOf(offers, 0);
+              assert.equal(
+                (yield* outbox.listByCommandId(
+                  CommandId.make(`command:notice-native-accepted:${threadId}:${firstMessageId}`),
+                ))[0]?.status,
+                "pending",
+              );
+              readSpy.mockRestore();
+              yield* TestClock.adjust(100);
+              yield* worker.drain();
+              commitSpy.mockRestore();
+              assert.equal(commits, 1, "receipt replay must not commit acceptance twice");
+              assert.lengthOf(offers, 1, "receipt replay must re-offer the reserved sibling");
+              const ready = yield* orchestrator.getThreadProjection(threadId);
+              const delivery = ready.runs.find((r) => r.id === source.id)!.delegatedCompletion!
+                .delivery!;
+              assert.deepEqual(delivery.taskIds, [tasks[1]!.id]);
+              assert.equal(offers[0]!.delegatedCompletion?.messageId, delivery.messageId);
+              yield* dispatchDelivery();
+              assert.equal(started.length, 2);
+              assert.lengthOf(steered, 1);
+              const announcements = rows.filter((row) => row.kind === "delegated.notice");
+              assert.deepEqual(
+                announcements.map((row) => row.children?.[0]?.childTaskId),
+                [tasks[0]!.id, tasks[1]!.id],
+              );
+              assert.equal(announcements[0]!.children?.[0]?.delayMs, 12000);
+              assert.equal(announcements[1]!.children?.[0]?.delayMs, 12100);
+              return;
+            }
             yield* worker.drain();
             if (acceptance === "deferred")
               yield* outbox.succeed({
@@ -2846,7 +2925,50 @@ it.effect.each([
               ready.runs.find((r) => r.id === source.id)!.delegatedCompletion!.delivery!.taskIds,
               [task.id],
             );
-            yield* dispatchDelivery();
+            if (acceptance === "steer-commit-exhaustion" && task.id === tasks[1]!.id) {
+              const outbox = yield* EffectOutbox.EffectOutboxV2;
+              const delivery = ready.runs.find((r) => r.id === source.id)!.delegatedCompletion!
+                .delivery!;
+              const commit = sink.commitCommand;
+              let failures = 0;
+              const fault = vi.spyOn(sink, "commitCommand").mockImplementation((input) => {
+                if (input.commandType === "notification.delivery.accept" && failures++ < 6)
+                  return Effect.fail(
+                    new EventSink.EventSinkWriteError({
+                      eventCount: input.events.length,
+                      cause: new Error("accepted steer transaction unavailable"),
+                    }),
+                  );
+                return commit(input);
+              });
+              yield* dispatchDelivery();
+              for (let attempt = 1; attempt <= 6; attempt++) {
+                const effects = yield* outbox.listByCommandId(
+                  CommandId.make(`command:1711-${delivery.generation}`),
+                );
+                const steer = effects.find(
+                  (effect) => effect.request.type === "provider-turn.steer",
+                )!;
+                assert.equal(
+                  steer.status,
+                  "pending",
+                  "accepted steer bookkeeping must survive the native retry budget",
+                );
+                assert.equal(steer.attemptCount, attempt);
+                assert.isTrue(
+                  steer.request.type === "provider-turn.steer" &&
+                    steer.request.providerAccepted === true,
+                );
+                assert.lengthOf(steered, 1, "retry must never resend accepted input");
+                yield* TestClock.adjust(100 * 2 ** (attempt - 1));
+                if (attempt < 6) yield* worker.drain();
+              }
+              fault.mockRestore();
+              yield* worker.drain();
+              assert.lengthOf(steered, 1);
+            } else {
+              yield* dispatchDelivery();
+            }
           }
           const final = yield* orchestrator.getThreadProjection(threadId);
           assert.equal(final.subagents.find((t) => t.id === tasks[0]!.id)?.status, "completed");
@@ -2873,11 +2995,15 @@ it.effect.each([
             assert.deepInclude(row, { parentThreadId: threadId, parentRunId: source.id });
             assert.equal(
               row.children?.[0]?.delayMs,
-              acceptance === "commit-exhaustion"
-                ? 18300
-                : acceptance === "retry" || acceptance === "projection-retry"
-                  ? 12100
-                  : 12000,
+              acceptance === "steer-commit-exhaustion"
+                ? row.children?.[0]?.childTaskId === tasks[0]!.id
+                  ? 12000
+                  : 18300
+                : acceptance === "commit-exhaustion"
+                  ? 18300
+                  : acceptance === "retry" || acceptance === "projection-retry"
+                    ? 12100
+                    : 12000,
             );
           }
           const changes = rows.filter((row) => row.kind === "delegated.terminal-status-changed");
@@ -2892,6 +3018,15 @@ it.effect.each([
         }).pipe(
           Effect.provide(
             layer.pipe(
+              Layer.provide(
+                Layer.succeed(ProviderContinuationRequests.ProviderContinuationRequests, {
+                  offer: (request) =>
+                    Effect.sync(() => {
+                      offers.push(request);
+                    }),
+                  take: Effect.never,
+                }),
+              ),
               Layer.provide(
                 Layer.succeed(Analytics.Analytics, {
                   record: (event) =>

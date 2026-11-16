@@ -763,9 +763,13 @@ export const layer: Layer.Layer<
               input.event.providerTurn.nodeId === input.nodeId &&
               (input.event.threadId === undefined || input.event.threadId === input.threadId)
             ) {
-              const message = yield* projections
-                .getRunMessage(input.threadId, input.runId)
-                .pipe(Effect.mapError(mapWriteError));
+              const message = yield* projections.getRunMessage(input.threadId, input.runId).pipe(
+                Effect.retry({
+                  schedule: transientReadRetrySchedule(),
+                  while: isTransientSqliteReadFailure,
+                }),
+                Effect.mapError(mapWriteError),
+              );
               if (message?.delegatedCompletion !== undefined)
                 effects.push(EffectOutbox.nativeNoticeAcceptanceEffect(input.threadId, message.id));
             }

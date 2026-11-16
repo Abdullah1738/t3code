@@ -1164,7 +1164,10 @@ export const layerWithOptions = (
           if (cancelledBeforeExecution) return true;
 
           // Accepted input cannot be resent; keep its durable bookkeeping retryable until it commits.
-          const acceptance = effect.request.type === "notification.delivery.accept";
+          const acceptance =
+            effect.request.type === "notification.delivery.accept" ||
+            (effect.request.type === "provider-turn.steer" &&
+              effect.request.providerAccepted === true);
           const execution = executor
             .execute(effect, { willRetry: acceptance || effect.attemptCount < maxAttempts })
             .pipe(
@@ -1234,7 +1237,7 @@ export const layerWithOptions = (
             ? yield* outbox
                 .succeed({ effectId: effect.id, workerId })
                 .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))
-            : !acceptance && effect.attemptCount >= maxAttempts
+            : !acceptance && !acceptedSteer && effect.attemptCount >= maxAttempts
               ? yield* outbox
                   .fail({ effectId: effect.id, workerId, error })
                   .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))

@@ -13670,6 +13670,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         acknowledgement.captureRuns(snapshot.runs);
       }
       yield* SendAcknowledgement.replay(command.commandId, storedEvents);
+      if (command.type === "notification.delivery.accept") {
+        // Acceptance can commit before its sibling offer fails; receipt replay must finish that offer.
+        yield* mapDispatchError(command)(offerDelegatedCompletionDeliveries(command.threadId));
+      }
       if (command.type === "queue.resume" || command.type === "queue.cutover-release") {
         yield* mapDispatchError(command)(
           startNextQueuedRun(command.threadId, {
