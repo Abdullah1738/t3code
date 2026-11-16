@@ -23,17 +23,20 @@ function setup() {
   const store = new Store(join(mac, "state.sqlite")); closes.push(() => store.close());
   const runner = new BoxRunner({ root: box, boxId: config.boxId, epoch: config.epoch, token, callbackToken, privateKey: keys.privateKey, callbackUrl: "http://127.0.0.1:12346", system: "system" }, { run: async ({ text }) => { texts.push(text); return "NO_REPLY"; } }, { now: () => now, fetch: (async () => Response.json({ epoch: "test", accepted: true })) });
   closes.push(() => runner.db.close());
-  const remote = new RemoteBox(config, store, { now: () => now, active: () => active,
-    log: (name, code) => logs.push(`${name} ${code ?? ""}`), notice: async id => { if (!notices.includes(id)) notices.push(id); },
+  const io = { now: () => now, active: () => active,
+    log: (name: string, code?: string) => logs.push(`${name} ${code ?? ""}`), notice: async (id: string) => { notices.push(id); },
     fetch: (async (url, init) => { if (!online) throw new Error("private error should never be logged"); const response = await runner.handle(new Request(String(url), init));
       if (String(url).endsWith("/deliver") && dropAck) { dropAck = false; throw new Error("lost ack"); } return response; }),
-  });
+  } satisfies ConstructorParameters<typeof RemoteBox>[2];
+  let remote = new RemoteBox(config, store, io);
   const line: Line = { number: "+15550000000", events: async function* () {}, backfill: async () => [], outbound: async () => [],
     sendText: async () => ({ handle: "sent" }), upload: async () => "https://media.example/file", getMessage: async () => undefined,
     sendApp: async () => ({ handle: "sent" }), react: async () => {}, typing: async () => {}, read: async () => {},
     requestLocation: async () => {}, location: async () => undefined, setOptOut: async () => {}, download: async () => ({ data: new Uint8Array(), name: "", mimeType: "" }) };
-  return { root, mac, box, remote, runner, store, config, logs, notices, texts, line,
-    advance: () => { now += 65_000; }, offline: () => { online = false; }, online: () => { online = true; }, drop: () => { dropAck = true; }, rollback: () => { active = false; },
+  return { root, mac, box, get remote() { return remote; }, runner, store, config, logs, notices, texts, line,
+    restart: () => { const reopened = new Store(join(mac, "state.sqlite")); closes.push(() => reopened.close()); remote = new RemoteBox(config, reopened, io); },
+    failNotice: () => { io.notice = async id => { notices.push(id); throw new Error("ambiguous notice"); }; },
+    advance: (ms = 65_000) => { now += ms; }, offline: () => { online = false; }, online: () => { online = true; }, drop: () => { dropAck = true; }, rollback: () => { active = false; },
     request: (path: string, body: unknown = {}, auth = callbackToken) => new Request(`http://bridge${path}`, { method: "POST", headers: { authorization: `Bearer ${auth}` }, body: JSON.stringify({ epoch: "test", ...body as object }) }),
   };
 }
@@ -47,11 +50,113 @@ test("per-chat selection is explicit, rejects other chats, preserves Robob rollb
 test("offline FIFO survives lost ack without a duplicate harness run or plaintext on relay", async () => {
   const s = setup(), canary = randomUUID(); s.offline();
   s.remote.accept("one", { text: canary }); s.remote.accept("two", { text: "second" });
-  await s.remote.tick(); s.advance(); await s.remote.tick(); expect(s.notices).toHaveLength(1);
+  await s.remote.tick(); s.advance(); await s.remote.tick(); s.advance(); await s.remote.tick(); expect(s.notices).toHaveLength(1);
   s.online(); s.drop(); s.advance(); await s.remote.tick(); s.advance(); await s.remote.tick();
   await s.runner.tick(); await s.runner.tick(); expect(s.texts).toEqual([canary, "second"]);
+  s.advance(300_000); await s.remote.tick();
   expect(files(s.mac)).not.toContain(canary); expect(s.logs.join()).not.toContain(canary);
   expect(s.logs.join()).toContain("moni-box-up"); expect(s.logs.join()).toContain("moni-queue-delivered n=2");
+});
+
+test.each(["empty", "bus", "watcher"])("ten flaps and a long outage stay silent with only %s work", async kind => {
+  const s = setup();
+  if (kind !== "empty") s.remote.accept(`wake:${kind}`, { text: "machine work" }, undefined, "wake");
+  for (let i = 0; i < 10; i++) {
+    s.offline(); await s.remote.tick(); s.advance(30_000);
+    s.online(); await s.remote.tick(); s.advance(30_000);
+  }
+  expect(s.notices).toHaveLength(0);
+  if (kind !== "empty") s.remote.accept(`wake:${kind}:pending`, { text: "machine work" }, undefined, "wake");
+  s.offline(); await s.remote.tick(); s.advance(130_000); await s.remote.tick();
+  expect(s.notices).toHaveLength(0); expect(s.logs.join()).toContain("moni-notice-suppressed not-waiting");
+});
+
+test("waiting inbound needs continuous grace, retains one outage through ten flaps", async () => {
+  const s = setup(); s.remote.accept("real-inbound", { text: "private" });
+  s.offline(); await s.remote.tick();
+  const outage = s.store.get<{ id: string }>("remoteOutage")!.id;
+  s.advance(119_999); await s.remote.tick(); expect(s.notices).toHaveLength(0);
+  s.advance(65_000); await s.remote.tick(); expect(s.notices).toHaveLength(1);
+  s.advance(); await s.remote.tick(); expect(s.notices).toHaveLength(1);
+  expect(s.logs.join()).toContain("moni-notice-suppressed already-sent");
+  for (let i = 0; i < 10; i++) {
+    s.advance(); s.online(); await s.remote.tick(); s.advance(30_000);
+    s.remote.accept(`inbound-${i}`, { text: "private" }); s.offline(); await s.remote.tick();
+    expect(s.store.get<{ id: string }>("remoteOutage")!.id).toBe(outage);
+    s.advance(130_000); await s.remote.tick();
+  }
+  expect(s.notices).toHaveLength(1); expect(s.logs.join()).toContain("moni-notice-suppressed grace");
+});
+
+test("notice cap persists across restart and a distinct outage, then expires at six hours", async () => {
+  const s = setup(); s.remote.accept("first", { text: "private" }); s.offline(); await s.remote.tick();
+  s.advance(120_000); await s.remote.tick(); expect(s.notices).toHaveLength(1);
+  const sentAt = s.store.get<number>("remoteNoticeAt")!;
+  s.restart(); s.advance(); await s.remote.tick(); expect(s.notices).toHaveLength(1);
+  s.advance(120_000); await s.remote.tick(); expect(s.notices).toHaveLength(1);
+  expect(s.logs.join()).toContain("moni-notice-suppressed already-sent");
+  s.online(); s.advance(); await s.remote.tick(); s.advance(300_000); await s.remote.tick();
+  expect(s.store.get("remoteOutage")).toBeNull();
+  s.remote.accept("second", { text: "private" }); s.offline(); s.advance(); await s.remote.tick();
+  s.advance(120_000); s.restart(); await s.remote.tick(); expect(s.notices).toHaveLength(1);
+  s.advance(120_000); await s.remote.tick(); expect(s.notices).toHaveLength(1);
+  expect(s.logs.join()).toContain("moni-notice-suppressed rate-limited");
+  const elapsed = s.store.get<number>("remoteNoticeAt")! - sentAt;
+  expect(elapsed).toBe(0);
+  s.advance(21_600_000); await s.remote.tick(); expect(s.notices).toHaveLength(2);
+});
+
+test.each([60_000, 120_001, 21_600_001].flatMap(stoppedMs => [false, true].map(waiting => ({ stoppedMs, waiting }))))(
+  "restart after $stoppedMs ms restarts continuous grace with waiting=$waiting", async ({ stoppedMs, waiting }) => {
+    const s = setup();
+    if (waiting) s.remote.accept("waiting", { text: "private" });
+    s.offline(); await s.remote.tick();
+    const id = s.store.get<{ id: string }>("remoteOutage")!.id;
+    s.advance(stoppedMs); s.restart(); await s.remote.tick();
+    expect(s.notices).toHaveLength(0);
+    expect(s.store.get<{ id: string }>("remoteOutage")!.id).toBe(id);
+    expect(s.logs.at(-2)).toBe("moni-notice-suppressed grace");
+    s.advance(119_999); await s.remote.tick(); expect(s.notices).toHaveLength(0);
+    s.advance(65_000); await s.remote.tick(); expect(s.notices).toHaveLength(waiting ? 1 : 0);
+    expect(s.store.get<{ id: string }>("remoteOutage")!.id).toBe(id);
+  });
+
+test("restart cannot count unobserved time as sustained recovery", async () => {
+  const s = setup(); s.offline(); await s.remote.tick(); s.online(); s.advance(); await s.remote.tick();
+  const id = s.store.get<{ id: string }>("remoteOutage")!.id;
+  s.advance(600_000); s.restart(); await s.remote.tick();
+  expect(s.store.get<{ id: string }>("remoteOutage")!.id).toBe(id);
+  s.advance(300_000); await s.remote.tick(); expect(s.store.get("remoteOutage")).toBeNull();
+});
+
+test("an uncertain notice reserves both caps before sending and survives restart", async () => {
+  const s = setup(); s.failNotice(); s.remote.accept("waiting", { text: "private" });
+  s.offline(); await s.remote.tick(); s.advance(120_000); await s.remote.tick();
+  expect(s.notices).toHaveLength(1); expect(s.logs.join()).toContain("moni-notice-error");
+  s.restart(); s.advance(); await s.remote.tick(); expect(s.notices).toHaveLength(1);
+  s.online(); s.advance(); await s.remote.tick(); s.advance(300_000); await s.remote.tick();
+  s.remote.accept("waiting-again", { text: "private" }); s.offline(); s.advance(); await s.remote.tick();
+  s.advance(120_000); await s.remote.tick(); expect(s.notices).toHaveLength(1);
+  expect(s.logs.join()).toContain("moni-notice-suppressed rate-limited");
+});
+
+test("legacy sends seed the cap and unclassified ciphertext cannot trigger a notice", async () => {
+  const s = setup(); s.remote.accept("legacy", { text: "private" });
+  s.store.db.exec("UPDATE remote_inbox SET kind='unknown'");
+  s.store.db.query("INSERT INTO remote_sends VALUES (?,1000,'sent','legacy')").run(opaqueId("legacy-notice"));
+  s.restart(); expect(s.store.get<number>("remoteNoticeAt")).toBe(1000);
+  s.offline(); await s.remote.tick(); s.advance(130_000); await s.remote.tick();
+  expect(s.notices).toHaveLength(0); expect(s.logs.join()).toContain("moni-notice-suppressed not-waiting");
+  s.remote.accept("new-inbound", { text: "private" }); s.advance(); await s.remote.tick();
+  expect(s.logs.join()).toContain("moni-notice-suppressed rate-limited"); expect(s.notices).toHaveLength(0);
+});
+
+test.each(["noticeAfterMs", "outageClearMs", "noticeMinGapMs"])("%s validates duration shapes", field => {
+  const s = setup();
+  for (const value of [null, true, "120000", -1, 0.5, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+    expect(() => remoteBoxConfig({ chatBackends: { moni: { ...s.config, [field]: value } } }, "moni")).toThrow();
+  }
+  expect(remoteBoxConfig({ chatBackends: { moni: { ...s.config, [field]: 0 } } }, "moni")).toBeDefined();
 });
 test("interrupted harness is fenced on restart and rollback expires the lease", async () => {
   const s = setup(); await s.remote.tick();
@@ -120,6 +225,8 @@ test("bus answer acknowledgement is idempotent; owner relays refuse before writi
   expect(moni.store.db.query<{ n: number }, []>("SELECT count(*) n FROM outbox").get()!.n).toBe(0);
   const ask = await post("/agent-ask", { sessionId: "owner-thread", to: "moni", text: "question", dedupeKey: "ask" });
   const id = (await ask.json() as { id: string }).id;
+  registry.wake(moni, "watcher work", "watcher-key");
+  expect(s.store.db.query<{ kind: string }, []>("SELECT kind FROM remote_inbox ORDER BY seq").all()).toEqual([{ kind: "wake" }, { kind: "wake" }]);
   const body = { request: id, text: "answer", operationId: opaqueId("bus-answer") };
   expect((await scoped(s.request("/agent-answer", body))).status).toBe(202);
   // Simulate losing the first HTTP response after the owner transaction committed.

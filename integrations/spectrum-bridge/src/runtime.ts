@@ -162,7 +162,7 @@ export class ChatRegistry<P> {
     const id = `${metadata.agentBus ? AGENT_BUS_WAKE_PREFIX : "wake:"}${hash(dedupeKey)}`;
     const payload = { id, text, attachments: [], isAudioMessage: false, receivedAt: this.now(),
       ...(metadata.agentAnswer ? { agentAnswer: metadata.agentAnswer } : {}) };
-    const created = chat.remote ? chat.remote.accept(id, payload, metadata.agentAnswer) : chat.store.acceptInbound(id, payload);
+    const created = chat.remote ? chat.remote.accept(id, payload, metadata.agentAnswer, "wake") : chat.store.acceptInbound(id, payload);
     if (created) this.touch(chat);
     return { id, created };
   }
