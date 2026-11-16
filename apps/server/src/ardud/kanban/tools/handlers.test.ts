@@ -463,6 +463,108 @@ const owner: KanbanActor = { _tag: "owner" };
 const decodeMessage = Schema.decodeUnknownEffect(KanbanMessage);
 const decodeCard = Schema.decodeUnknownSync(KanbanCard);
 
+it.effect(
+  "every kanban tool refuses unknown arguments and advertises a closed input object",
+  () => {
+    const { layer } = fakeThreads();
+    return Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      for (const name of Object.keys(KanbanToolkit.tools)) {
+        const registered = server.tools.find(({ tool }) => tool.name === name);
+        assert.isDefined(registered, name);
+        assert.strictEqual(registered?.tool.inputSchema.additionalProperties, false, name);
+        const result = yield* call(ThreadId.make("worker"), name, { unexpected: "refuse" });
+        assert.isTrue(result.isError, `${name}: ${result.text}`);
+        const failure = yield* decodeToolFailure(result.text);
+        assert.strictEqual(failure.code, "invalid_request", name);
+        assert.strictEqual(failure.reason, "invalid_args", name);
+        assert.include(failure.message, `${name} has no argument "unexpected"`);
+        const allowed = Object.keys(registered?.tool.inputSchema.properties ?? {});
+        assert.include(failure.message, `Allowed: ${allowed.join(", ") || "(none)"}.`);
+      }
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+it.effect(
+  "card_get rejects wrong target keys and keeps explicit and implicit card references",
+  () => {
+    const { layer } = fakeThreads();
+    return Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "argument-keys",
+        name: "Argument keys",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+      const own = yield* kanban.createCard(board.id, { title: "Own", prompt: "Own" }, owner);
+      yield* kanban.dispatchNow;
+      const worker = (yield* kanban.card(own.id)).card.activeThreadId!;
+      const other = yield* kanban.createCard(board.id, { title: "Other", prompt: "Other" }, owner);
+
+      for (const key of ["id", "cardId", "card_id", "number", "cardNumber"]) {
+        for (const args of [{ [key]: other.id }, { card: own.id, [key]: other.id }]) {
+          const result = yield* call(worker, "card_get", args);
+          assert.isTrue(result.isError, result.text);
+          const failure = yield* decodeToolFailure(result.text);
+          assert.strictEqual(failure.code, "invalid_request");
+          assert.include(failure.message, `"${key}"`);
+          assert.include(failure.message, "Allowed: card, boardId, events.");
+          assert.include(failure.message, 'Did you mean "card"?');
+          assert.isUndefined(result.structured.card);
+        }
+      }
+      for (const card of [other.id, String(other.number), `#${other.number}`]) {
+        const result = yield* call(worker, "card_get", { card });
+        assert.isFalse(result.isError, result.text);
+        assert.strictEqual(decodeCard(result.structured.card).id, other.id);
+      }
+      const implicit = yield* call(worker, "card_get", {});
+      assert.isFalse(implicit.isError, implicit.text);
+      assert.strictEqual(decodeCard(implicit.structured.card).id, own.id);
+      const multiple = yield* call(worker, "card_get", { id: other.id, cardId: other.id });
+      const failure = yield* decodeToolFailure(multiple.text);
+      assert.include(failure.message, 'arguments "id", "cardId"');
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+it.effect("card_update refuses wrong target keys without writing to either card", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "write-argument-keys",
+      name: "Write argument keys",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+    const own = yield* kanban.createCard(board.id, { title: "Own", prompt: "Own" }, owner);
+    yield* kanban.dispatchNow;
+    const worker = (yield* kanban.card(own.id)).card.activeThreadId!;
+    const other = yield* kanban.createCard(board.id, { title: "Other", prompt: "Other" }, owner);
+    const beforeOwn = yield* kanban.card(own.id);
+    const beforeOther = yield* kanban.card(other.id);
+    for (const key of ["id", "cardId", "card_id", "number", "cardNumber"]) {
+      const result = yield* call(worker, "card_update", {
+        [key]: other.id,
+        comment: "Must not land",
+      });
+      assert.isTrue(result.isError, result.text);
+      const failure = yield* decodeToolFailure(result.text);
+      assert.strictEqual(failure.code, "invalid_request");
+      assert.include(failure.message, `"${key}"`);
+      assert.include(failure.message, 'Did you mean "card"?');
+      assert.deepStrictEqual(yield* kanban.card(own.id), beforeOwn);
+      assert.deepStrictEqual(yield* kanban.card(other.id), beforeOther);
+    }
+    const accepted = yield* call(worker, "card_update", { card: own.id, comment: "Saved" });
+    assert.isFalse(accepted.isError, accepted.text);
+    assert.isTrue((yield* kanban.card(own.id)).events.some((event) => event.body === "Saved"));
+  }).pipe(Effect.provide(layer));
+});
+
 it.live("card_flag saves its stalled reason while the board background reader is held", () =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -3214,7 +3316,7 @@ it.effect(
         const denied = yield* call(worker, name, {
           boardId: other.id,
           model: other.defaultCardModel,
-          slots: 8,
+          ...(name === "pool_set" ? { slots: 8 } : {}),
         });
         assert.isTrue(denied.isError);
         assert.include(denied.text, "Only evaluators");
@@ -10401,7 +10503,14 @@ it.effect.each(
       ...fields,
     });
     assert.isTrue(result.isError);
-    assert.include(result.text, `${action} needs text: pass the message as text`);
+    const failure = yield* decodeToolFailure(result.text);
+    assert.strictEqual(failure.code, "invalid_request");
+    assert.include(
+      failure.message,
+      "typo" in fields
+        ? 'card_thread has no argument "typo"'
+        : `${action} needs text: pass the message as text`,
+    );
     assert.deepStrictEqual(sent, []);
     assert.deepStrictEqual(yield* kanban.card(card.id), before);
   }).pipe(Effect.provide(fake.layer));

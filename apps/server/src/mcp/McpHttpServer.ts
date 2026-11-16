@@ -105,7 +105,7 @@ import * as ControlStore from "../ardud/control/ControlStore.ts";
 // ardud schedules: retry a scheduled task's blocked runs.
 import * as ScheduledTaskBlockRetry from "../ardud/schedules/blockRetryTools.ts";
 import * as KanbanHandlers from "../ardud/kanban/tools/handlers.ts";
-import { KanbanToolkit } from "../ardud/kanban/tools/tools.ts";
+import { KanbanToolkit, KanbanArgumentKeys, argumentFailure } from "../ardud/kanban/tools/tools.ts";
 import * as PullRequestsHandlers from "./toolkits/pullRequests/handlers.ts";
 import { PullRequestsToolkit } from "./toolkits/pullRequests/tools.ts";
 import * as DeviceHandlers from "./toolkits/device/handlers.ts";
@@ -1067,6 +1067,13 @@ const withToolAnalytics =
       addTool: (options) =>
         server.addTool({
           ...options,
+          tool:
+            Context.getOrUndefined(options.annotations, KanbanArgumentKeys) === undefined
+              ? options.tool
+              : new McpSchema.Tool({
+                  ...options.tool,
+                  inputSchema: { ...options.tool.inputSchema, additionalProperties: false },
+                }),
           handle:
             /* Request instrumentation already owns the span; keep this helper in that context. */
             Effect.fnUntraced(function* (payload) {
@@ -1400,7 +1407,26 @@ const withToolAnalytics =
                             : Effect.void,
                         ),
                       )
-                      .pipe(Effect.andThen(options.handle(payload)))
+                      .pipe(
+                        Effect.andThen(() => {
+                          const allowed = Context.getOrUndefined(
+                            options.annotations,
+                            KanbanArgumentKeys,
+                          );
+                          const failure =
+                            allowed === undefined
+                              ? undefined
+                              : argumentFailure(options.tool.name, allowed, payload);
+                          return failure === undefined
+                            ? options.handle(payload)
+                            : Effect.succeed(
+                                new McpSchema.CallToolResult({
+                                  isError: true,
+                                  content: [{ type: "text", text: encodeJsonText(failure) }],
+                                }),
+                              );
+                        }),
+                      )
                       .pipe(
                         Effect.tap(() =>
                           options.tool.name === "t3_thread_read"
