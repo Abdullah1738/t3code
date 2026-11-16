@@ -344,6 +344,7 @@ async function main(argv: string[]): Promise<void> {
         }
         if (command === "resume") {
           delete s.failure_paused_at;
+          delete s.trigger_error;
           delete s.load_timeouts;
           delete s.load_timeout_since;
           s.consecutive_failures = 0;
