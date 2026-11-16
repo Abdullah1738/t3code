@@ -202,6 +202,38 @@ class GuardTests(unittest.TestCase):
             with self.subTest(ownership=label), patch.object(os, 'stat', side_effect=metadata), patch.object(os.path, 'realpath', side_effect=lambda path, *a, **k: str(node) if str(path) == str(node) else realpath(path, *a, **k)):
                 self.assertEqual(self.classify(command), None if unsafe is None else UNRESOLVED)
 
+    def test_checked_intervening_mac_node_resolution(self):
+        home = Path('/Users/ardud')
+        fixtures = Path(__file__).with_name('fixtures') / 'checked-intervening'
+        fixture = 'crpko4201-node-check-1.sh'
+        row = next(row for row in json.loads((fixtures / 'cases.json').read_text()) if row['fixture'] == fixture)
+        for group, entries in json.loads((fixtures / 'sources.json').read_text()).items():
+            if fixture.startswith(group):
+                for entry in entries:
+                    self.write(entry['path'], (fixtures / entry['snapshot']).read_text())
+        command = (fixtures / fixture).read_text().replace(row['cwd'], str(self.root))
+        rows = [
+            ('Hermes symlink', str(home / '.local/bin/node'), '/Volumes/ExternalSSD/migrated/hermes/node/bin/node', False),
+            ('NVM 24', str(home / '.nvm/versions/node/v24.22.3/bin/node'), str(home / '.nvm/versions/node/v24.22.3/bin/node'), True),
+            ('NVM 26', str(home / '.nvm/versions/node/v26.13.0/bin/node'), str(home / '.nvm/versions/node/v26.13.0/bin/node'), True),
+            ('NVM symlink', str(home / '.local/bin/node'), str(home / '.nvm/versions/node/v26.13.0/bin/node'), True),
+            ('Homebrew symlink', '/opt/homebrew/bin/node', '/opt/homebrew/Cellar/node/26.13.0_2/bin/node', True),
+        ]
+        realpath, which = os.path.realpath, guard.shutil.which
+        for label, executable, resolved, trusted in rows:
+            def resolve(path, *args, **kwargs):
+                return resolved if str(path) == executable else realpath(path, *args, **kwargs)
+            def lookup(name, *args, **kwargs):
+                return executable if name == 'node' else which(name, *args, **kwargs)
+            with self.subTest(toolchain=label), patch.object(Path, 'home', return_value=home), patch.dict(os.environ, {'PATH': str(Path(executable).parent)}), patch.object(os.path, 'realpath', side_effect=resolve), patch.object(guard.shutil, 'which', side_effect=lookup):
+                self.assertEqual(guard._trusted_fixture_tool(executable, 'node', self.root), trusted)
+                self.assertEqual(guard._trusted_fixture_tool('node', 'node', self.root), trusted)
+                rule, cause = guard.classify_detail(command, str(self.root))
+                self.assertEqual(rule, None if trusted else UNRESOLVED, cause)
+                if not trusted:
+                    self.assertIn('kafka-acl-probes.mjs', cause)
+                    self.assertIn('Split source preparation and execution into separate calls', guard.refusal_reason(rule, cause, str(self.root)))
+
     def test_checked_intervening_tool_mutations(self):
         home = (self.root / 'home').resolve()
         node = self.write('home/.nvm/versions/node/v26.0.0/bin/node', '#!/bin/sh\nexit 0\n').resolve()
