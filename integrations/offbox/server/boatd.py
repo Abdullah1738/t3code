@@ -105,7 +105,7 @@ DEFAULTS = {
     "owners": ["ardud", "moni"], "default_owner": "ardud",
     "person_owners": ["moni"],        # their boxes get hourly/daily/weekly snapshots
     "max_running": 0,                 # optional hard cap, in addition to resource admission
-    "cpu_pressure_limit": 50,         # host CPU some avg10 (%); 0 disables CPU admission
+    "cpu_pressure_limit": 0,          # host CPU some avg10 (%); 0 = off (the default until #219)
     "prune_unused_days": 30,          # stopped boxes untouched this long are deleted (not pinned, not saved)
     "sample_s": 10, "keep_samples_days": 90,
 }
@@ -1915,7 +1915,8 @@ def _admit(con, box_id: str, pid: int, kind: str, errf) -> float:
             # PSI is a moving average: let a new run show up before admitting its neighbour.
             cpu_room = cpu_limit == 0 or (cpu_limit is not None and cpu_known and cpu < cpu_limit and
                                         (last_start is None or now() - last_start >= 10))
-            if mine and room and free >= need and cpu_room:
+            # Keep the escape while CPU admission is off; #219 replaces it.
+            if (mine and room and free >= need and cpu_room) or (cpu_limit == 0 and now() - t0 > 3600):
                 con.execute("UPDATE commands SET status='running', started_at=?, queued_s=?, boot_id=? "
                             "WHERE box_id=? AND pid=? AND status='queued' AND killed=0", (now(), now() - t0, boot_id(), box_id, pid))
                 return now() - t0

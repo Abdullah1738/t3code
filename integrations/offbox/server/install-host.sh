@@ -449,7 +449,7 @@ except (OSError, ValueError):
     c = {}
 c.update(listen=sys.argv[1], ssh_host=sys.argv[1], port=c.get("port", 8443), zpool=sys.argv[2],
          state_dataset=sys.argv[2] + "/boatd")
-c.setdefault("cpu_pressure_limit", 50)
+c.setdefault("cpu_pressure_limit", 0)
 with open(p + ".tmp", "w") as f:
     json.dump(c, f, indent=1)
 os.replace(p + ".tmp", p)
