@@ -362,3 +362,25 @@ describe("analytics read budget", () => {
     expect(last.hasMore).toBe(false);
   });
 });
+
+it("pages dispatch outcome counts under the existing reply budget", () => {
+  const rollup = finish(largeEvents);
+  const withOutcomes = {
+    ...rollup,
+    mcpCalls: rollup.mcpCalls.map((row) => ({
+      ...row,
+      dispatchTimeouts: { committed: 12, failed: 3, capped: 2, noOutcome: 1 },
+    })),
+  };
+  const pager = makeReadPager();
+  const input = { day, section: "mcpCalls", limit: 7 } as const;
+  let page = pager.read(input, withOutcomes, []);
+  const rows = [...page.rows!];
+  check(page);
+  while (page.hasMore) {
+    page = pager.resume({ ...input, cursor: page.cursor! })!;
+    check(page);
+    rows.push(...page.rows!);
+  }
+  expect(restore(rows)).toEqual(withOutcomes.mcpCalls);
+});
