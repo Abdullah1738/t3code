@@ -4170,24 +4170,49 @@ export class Router {
     return found;
   }
 
-  private logNoticeReply(turn: Pick<Turn, "id">, scope: MessageRecord[], record: MessageRecord,
-    source: "watch" | "settle_preceding", replies: number, sealedWake = false,
+  private logNoticeReply(turn: Pick<Turn, "id" | "generation"> & Partial<Pick<Turn, "messageId" | "earlySent" | "earlyOutbox">>, scope: MessageRecord[], record: MessageRecord,
+    source: "watch" | "settle_preceding", sealedWake = false,
     outcome?: "incomplete" | "failed" | "owner_typed"): void {
     toolLog.capture(() => {
-      const notice = scope.find(m => (m.type === "user" || m.type === "synthetic")
-        && typeof m.text === "string" && isCompletionNoticeText(m.text));
-      if (!notice) return;
-      const key = `${turn.id}:${notice.id}`;
-      // Incomplete runs leave the watermark unchanged, including across a bridge restart.
-      const logged = this.store.get<string[]>("log-notice-replies") ?? [];
-      if (logged.includes(key)) return;
-      const runId = scope.find(m => m.type === "assistant" && typeof m.runId === "string")?.runId;
-      toolLog.write({ component: "router", kind: "event", name: "notice.reply",
-        ids: { chat: this.options.context?.chat.slug ?? "owner", runId: typeof runId === "string" ? runId : record.id },
-        props: { source, outcome: scope.some(ownerPrompt) ? "owner_typed" : outcome
-          ?? (record.type === "idle" && (record.outcome !== "succeeded" || record.modelError) ? "failed"
-            : this.toolMode ? "quiet" : replies ? "forwarded" : "no_reply"), replies, sealedWake } });
-      this.store.set("log-notice-replies", [...logged.slice(-255), key]);
+      const pendingKey = turn.messageId ? `log-notice-pending:${turn.id}:${turn.messageId}` : undefined;
+      let pending = source === "watch" && pendingKey
+        ? this.store.get<{ noticeId: string; ownerTyped: boolean; sealedWake: boolean } | null>(pendingKey) : undefined;
+      const observe = (run: MessageRecord[], boundary: MessageRecord, override?: typeof outcome) => {
+        const notice = run.find(m => (m.type === "user" || m.type === "synthetic")
+          && typeof m.text === "string" && isCompletionNoticeText(m.text));
+        const carried = pending;
+        pending = undefined;
+        const noticeId = carried?.noticeId ?? notice?.id;
+        if (!noticeId) return;
+        const key = `${turn.id}:${noticeId}`;
+        // Incomplete runs leave the watermark unchanged, including across a bridge restart.
+        const logged = this.store.get<string[]>("log-notice-replies") ?? [];
+        if (logged.includes(key)) { if (carried && pendingKey) this.store.set(pendingKey, null); return; }
+        const steps = run.filter((m): m is Extract<MessageRecord, { type: "assistant" }> => m.type === "assistant");
+        const final = steps.at(-1);
+        const runId = steps.find(m => typeof m.runId === "string")?.runId;
+        // Early replies are already in the outbox when terminal processing excludes them from outgoing.
+        const replies = this.toolMode ? 0 : new Set(steps.filter(m => this.store.getOperation(`reply:${turn.generation}:${m.id}`)
+          || m.id === turn.earlySent && turn.earlyOutbox && this.store.getOperation(turn.earlyOutbox)).map(m => m.id)).size;
+        toolLog.write({ component: "router", kind: "event", name: "notice.reply",
+          ids: { chat: this.options.context?.chat.slug ?? "owner", runId: runId ?? boundary.id },
+          props: { source: carried ? "settle_preceding" : source, outcome: carried?.ownerTyped || run.some(ownerPrompt) ? "owner_typed" : override
+            ?? (boundary.type === "idle" && (boundary.outcome !== "succeeded" || boundary.modelError) || final?.error ? "failed"
+              : boundary.type === "idle" && final && (final.time.completed === undefined || final.finish === "tool-calls") ? "incomplete"
+              : this.toolMode ? "quiet" : replies ? "forwarded" : "no_reply"), replies, sealedWake: carried?.sealedWake ?? sealedWake } });
+        this.store.set("log-notice-replies", [...logged.slice(-255), key]);
+        if (carried && pendingKey) this.store.set(pendingKey, null);
+      };
+      // Foreground steering can collect several completed runs before its final idle.
+      let run: MessageRecord[] = [];
+      for (const item of scope) {
+        if (item.type !== "idle") { run.push(item); continue; }
+        // Earlier replies stay held until the final steered run reaches the outbox transaction.
+        if (outcome === "incomplete") pending = undefined;
+        else observe(run, item);
+        run = [];
+      }
+      observe(run, record, outcome);
     });
   }
 
@@ -4224,13 +4249,23 @@ export class Router {
     }
     if (scope.length) {
       const final = [...scope].reverse().find((m): m is Extract<MessageRecord, { type: "assistant" }> => m.type === "assistant");
-      observations.push({ scope, record: scope.at(-1)!, outcome: final?.error ? "failed"
-        : final && (final.time.completed === undefined || final.finish === "tool-calls") ? "incomplete" : undefined });
+      const answered = scope.some(m => m.type === "assistant" && m.answer === true && m.time.completed !== undefined
+        && !m.continued && m.finish !== "tool-calls");
+      if (answered || observations.some(observation => observation.scope === scope && observation.record.type === "idle")) {
+        observations.push({ scope, record: scope.at(-1)!, outcome: final?.error ? "failed"
+          : final && (final.time.completed === undefined || final.finish === "tool-calls") ? "incomplete" : undefined });
+      } else toolLog.capture(() => {
+        const notice = scope.find(m => (m.type === "user" || m.type === "synthetic")
+          && typeof m.text === "string" && isCompletionNoticeText(m.text));
+        // The admitted wake can precede this run's answer; keep only its diagnostic identity.
+        if (notice) this.store.set(`log-notice-pending:${turn.id}:${turn.messageId}`, {
+          noticeId: notice.id, ownerTyped: scope.some(ownerPrompt), sealedWake: !!turn.inboundId?.startsWith("wake:"),
+        });
+      });
     }
-    const enqueuedIds = new Set<string>();
     const log = () => {
       for (const observation of observations) this.logNoticeReply(turn, observation.scope, observation.record, "settle_preceding",
-        observation.scope.filter(m => enqueuedIds.has(m.id)).length, !!turn.inboundId?.startsWith("wake:"), observation.outcome);
+        !!turn.inboundId?.startsWith("wake:"), observation.outcome);
     };
     if (!settled) { log(); return; }
     let enqueued = false;
@@ -4241,7 +4276,6 @@ export class Router {
         if (text && !this.store.getOperation(id)) {
           this.store.enqueue({ id, kind: "conversation", text, sessionId: turn.id, generation: turn.generation });
           enqueued = true;
-          enqueuedIds.add(reply.id);
         }
       }
       this.store.set("watermark", { sessionId: turn.id, id: settled! } satisfies Watermark);
@@ -4541,7 +4575,7 @@ export class Router {
             this.fail(turn!, text, idle.id, reason, immediate);
             for (const id of completed) this.store.updateInbound(id, "done");
           }).immediate();
-          if (turn!.background) this.logNoticeReply(turn!, scope, idle, "watch", said.length, false, "failed");
+          this.logNoticeReply(turn!, scope, idle, "watch", false, "failed");
           if (!this.toolMode && completedEarlier.length) this.stage("reply-enqueued", turn!.inboundId ?? turn!.messageId);
         };
         const providerError = [...replies].reverse().find(reply => reply.error)?.error;
@@ -4611,13 +4645,13 @@ export class Router {
       const runningTools = tools.some(p => !["completed", "error"].includes((p as { state?: { status?: string } }).state?.status ?? ""));
       if (turn.phase !== "running") return;
       if (runningTools || !idle) {
-        if (turn.background && idle) this.logNoticeReply(turn, scope, idle, "watch", 0, false, "incomplete");
+        if (idle) this.logNoticeReply(turn, scope, idle, "watch", false, "incomplete");
         return;
       }
       // An unsent final that has not completed, or that stopped to call tools, keeps the turn open. Narration
       // is the last word only when nothing follows it, so it closes here once the run is idle.
       if (final && final.id !== turn.earlySent && (final.time.completed === undefined || final.finish === "tool-calls")) {
-        if (turn.background) this.logNoticeReply(turn, scope, idle, "watch", 0, false, "incomplete");
+        this.logNoticeReply(turn, scope, idle, "watch", false, "incomplete");
         return;
       }
       // Unsent narration (text before a tool call, `answer` false) stays quiet. A final whose phase
@@ -4699,7 +4733,7 @@ export class Router {
       // Tool mode safety net: a typed message whose turn texted nothing gets one reminder.
       if (sent && !sent.length && !silent && !waiting.length) this.nudgeReply(turn);
     }).immediate();
-    if (turn.background) this.logNoticeReply(turn, scope, idle, "watch", this.toolMode ? 0 : outgoing.length);
+    this.logNoticeReply(turn, scope, idle, "watch");
     if (!this.toolMode && (text || earlier.length)) this.stage("reply-enqueued", turn.inboundId ?? turn.messageId);
   }
 
@@ -4774,7 +4808,7 @@ export class Router {
         let scope: MessageRecord[] = [];
         for (const record of after) {
           if (record.type !== "idle") { scope.push(record); continue; }
-          this.logNoticeReply(route, scope, record, "watch", 0, false, after.some(ownerPrompt) ? "owner_typed" : undefined);
+          this.logNoticeReply(route, scope, record, "watch", false, after.some(ownerPrompt) ? "owner_typed" : undefined);
           scope = [];
         }
       }

@@ -5606,6 +5606,159 @@ test.each([false, true])("notice.reply logging failures preserve forwarding (sea
   } finally { failingLog.mockRestore(); }
 });
 
+const lateNoticeCases = ["absent", "unfinished", "tool-calls", "narration", "unknown"].flatMap(before =>
+  [
+    { mode: "forwarded", outcome: "forwarded", replies: 1 },
+    { mode: "NO_REPLY", outcome: "no_reply", replies: 0 },
+    { mode: "tool", outcome: "quiet", replies: 0 },
+    { mode: "empty", outcome: "no_reply", replies: 0 },
+    { mode: "failed", outcome: "failed", replies: 0 },
+    { mode: "modelError", outcome: "failed", replies: 1 },
+  ].flatMap(row => [false, true].map(restart => ({ before, ...row, restart }))));
+
+test.each(lateNoticeCases)("notice.reply waits for the late notice answer after shared wake admission ($before, $mode, restart=$restart)", async ({ before, mode, outcome, replies, restart }) => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0, ...(mode === "tool" ? { replyMode: "tool" as const } : {}) });
+  await exchange(h, "review-initial", "Check the order", "NO_REPLY");
+  let late: MessageRecord[] = [];
+  h.backend.promptBehavior = async call => {
+    delegatedNoticeReply(h, mode === "NO_REPLY" ? "NO_REPLY" : "Done: delayed notice answer");
+    late = h.backend.records.splice(-2, 2);
+    const idle = late[1] as Extract<MessageRecord, { type: "idle" }>;
+    if (mode === "failed") idle.outcome = "failed";
+    if (mode === "modelError") idle.modelError = true;
+    if (before !== "absent") {
+      const step = { ...late[0] as Assistant, id: "partial-notice-answer", time: { created: Date.now(), completed: Date.now() } } as Assistant;
+      if (before === "unfinished") delete step.time.completed;
+      if (before === "tool-calls") { step.finish = "tool-calls"; step.continued = true; }
+      if (before === "narration") step.answer = false;
+      if (before === "unknown") delete step.answer;
+      h.backend.records.push(step);
+    }
+    h.backend.accept(call);
+    if (mode === "empty") late = late.slice(-1);
+  };
+  const beforeLogs = await captureLogs(async () => {
+    h.input("wake:review-late-notice", "Another update");
+    await h.router.tick();
+    await h.router.tick();
+  });
+  expect(beforeLogs.filter(line => line.name === "notice.reply")).toEqual([]);
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  const logs = await captureLogs(async () => {
+    h.backend.records.push(...late);
+    for (let i = 0; i < 4; i++) await router.tick();
+    await new Router(h.store, h.backend, h.transport, h.routerOptions).tick();
+  });
+  expect(h.conversations().map(op => op.text)).toEqual(replies ? ["Done: delayed notice answer"] : []);
+  expect(logs.filter(line => line.name === "notice.reply").map(line => ({ ids: line.ids, props: line.props }))).toEqual([
+    { ids: { chat: "owner", runId: mode === "empty" ? late[0]!.id : late[0]!.id.slice(0, -":reply".length) },
+      props: { source: "settle_preceding", outcome, replies, sealedWake: true } },
+  ]);
+});
+
+test.each(["same", "reply", "NO_REPLY"].flatMap(ending => [false, true].map(restart => ({ ending, restart }))))("notice.reply includes a pending notice's early foreground reply ($ending, restart=$restart)", async ({ ending, restart }) => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "notice-initial", "Check the order", "NO_REPLY");
+  let late: MessageRecord[] = [];
+  let replyId = "";
+  h.backend.promptBehavior = async call => {
+    replyId = delegatedNoticeReply(h, "Notice answer before idle");
+    late = h.backend.records.splice(-2, 2);
+    h.backend.accept(call);
+  };
+  const logs = await captureLogs(async () => {
+    h.input("typed-notice-race", "Another question", { source: "typed" });
+    await h.router.tick();
+    h.backend.records.push(late[0]!);
+    setSystemTime(30_000);
+    await h.router.tick();
+    expect(h.conversations().map(op => op.text)).toEqual(["Notice answer before idle"]);
+    expect(h.store.get("activeTurn")).toMatchObject({ earlySent: replyId });
+    const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+    if (ending !== "same") h.backend.step(ending === "reply" ? "Final notice answer" : "NO_REPLY").runId = replyId.slice(0, -":reply".length);
+    h.backend.records.push(late[1]!);
+    for (let i = 0; i < 4; i++) await router.tick();
+  });
+  expect(logs.filter(line => line.name === "notice.reply").map(line => ({ ids: line.ids, props: line.props }))).toEqual([
+    { ids: { chat: "owner", runId: replyId.slice(0, -":reply".length) },
+      props: { source: "settle_preceding", outcome: "forwarded", replies: ending === "reply" ? 2 : 1, sealedWake: false } },
+  ]);
+  expect(h.conversations().map(op => op.text)).toEqual(["Notice answer before idle", ...(ending === "reply" ? ["Final notice answer"] : [])]);
+});
+
+test.each(["plain", "notice"].flatMap(first => ["reply", "NO_REPLY"].flatMap(last => [false, true].map(restart => ({ first, last, restart })))))("notice.reply separates foreground runs ($first, $last, restart=$restart)", async ({ first, last, restart }) => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0 });
+  h.input("notice-foreground", "Check the order");
+  await h.router.tick();
+  const expected: { ids: Record<string, string>; props: Record<string, string | number | boolean> }[] = [];
+  const addNotice = (text: string) => {
+    const replyId = delegatedNoticeReply(h, text);
+    expected.push({ ids: { chat: "owner", runId: replyId.slice(0, -":reply".length) },
+      props: { source: "watch", outcome: text === "NO_REPLY" ? "no_reply" : "forwarded", replies: text === "NO_REPLY" ? 0 : 1, sealedWake: false } });
+  };
+  if (first === "notice") addNotice("First notice answer");
+  else h.backend.final("Ordinary answer").runId = "run:ordinary";
+  addNotice(last === "NO_REPLY" ? "NO_REPLY" : "Second notice answer");
+  h.backend.records.push({ id: "owned-steer", type: "user", text: "Continue", time: { created: Date.now() } });
+  h.store.set("activeTurn", { ...h.store.get<object>("activeTurn"), steered: ["owned-steer"] });
+  h.backend.final("NO_REPLY");
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  const logs = await captureLogs(async () => {
+    for (let i = 0; i < 4; i++) await router.tick();
+  });
+  expect(logs.filter(line => line.name === "notice.reply").map(line => ({ ids: line.ids, props: line.props }))).toEqual(expected);
+  expect(h.conversations().map(op => op.text)).toEqual([
+    first === "notice" ? "First notice answer" : "Ordinary answer",
+    ...(last === "NO_REPLY" ? [] : ["Second notice answer"]),
+  ]);
+});
+
+test.each(["inline", "pending"].flatMap(placement => [1, 2].flatMap(count => ["reply", "NO_REPLY"].flatMap(mode => ["unfinished", "tool-calls"].flatMap(final =>
+  [false, true].map(restart => ({ placement, count, mode, final, restart })))))))("notice.reply defers earlier outcomes until foreground outbox commit ($placement, $count, $mode, $final, restart=$restart)", async ({ placement, count, mode, final, restart }) => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0 });
+  const runIds: string[] = [];
+  let carried: MessageRecord[] = [];
+  if (placement === "pending") {
+    await exchange(h, "notice-initial", "Check the order", "NO_REPLY");
+    h.backend.promptBehavior = async call => {
+      runIds.push(delegatedNoticeReply(h, mode === "NO_REPLY" ? "NO_REPLY" : "Notice answer 0").slice(0, -":reply".length));
+      carried = h.backend.records.splice(-2, 2);
+      h.backend.accept(call);
+    };
+  }
+  h.input("notice-foreground", "Check the order");
+  await h.router.tick();
+  h.backend.records.push(...carried);
+  for (let i = runIds.length; i < count; i++) runIds.push(delegatedNoticeReply(h, mode === "NO_REPLY" ? "NO_REPLY" : `Notice answer ${i}`).slice(0, -":reply".length));
+  h.backend.records.push({ id: "owned-steer", type: "user", text: "Continue", time: { created: Date.now() } });
+  h.store.set("activeTurn", { ...h.store.get<object>("activeTurn"), steered: ["owned-steer"] });
+  const step = h.backend.final("Still working");
+  if (final === "unfinished") delete step.time.completed;
+  else step.finish = "tool-calls";
+  const beforeLogs = await captureLogs(async () => {
+    await h.router.tick();
+    await h.router.tick();
+  });
+  expect(h.conversations()).toEqual([]);
+  expect(beforeLogs.filter(line => line.name === "notice.reply")).toEqual([]);
+  step.time.completed = Date.now();
+  step.finish = "stop";
+  step.content = [{ type: "text", text: "NO_REPLY" }];
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  const logs = await captureLogs(async () => {
+    for (let i = 0; i < 4; i++) await router.tick();
+  });
+  expect(logs.filter(line => line.name === "notice.reply").map(line => ({ ids: line.ids, props: line.props }))).toEqual(
+    runIds.map((runId, i) => ({ ids: { chat: "owner", runId },
+      props: { source: placement === "pending" && i === 0 ? "settle_preceding" : "watch", outcome: mode === "NO_REPLY" ? "no_reply" : "forwarded", replies: mode === "NO_REPLY" ? 0 : 1, sealedWake: false } })),
+  );
+  expect(h.conversations().map(op => op.text)).toEqual(mode === "NO_REPLY" ? [] : runIds.map((_, i) => `Notice answer ${i}`));
+});
+
 test.each(delegatedNotices)("a delegated-task notice after the watermark forwards its reply exactly once (%s)", async notice => {
   setSystemTime(10_000);
   const h = setup(":memory:", { watchMs: 0 });
