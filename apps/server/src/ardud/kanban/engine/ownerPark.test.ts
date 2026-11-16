@@ -847,6 +847,62 @@ it.effect.each(["answer", "drop", "wake", "post", "pick"] as const)(
     }),
 );
 
+it.effect.each(["answer", "drop", "wake"] as const)(
+  "cancelling restored %s releases its model lock for another close and model edit",
+  (close) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const entered = yield* Deferred.make<void>();
+      let target: ThreadId | null = null;
+      const gated = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (real) =>
+          KanbanThreads.of({
+            ...real,
+            latestRun: (...args) =>
+              args[0] === target
+                ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never))
+                : real.latestRun(...args),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, board, card, threadId, worker } = yield* workingCard();
+        yield* kanban.askOwner(
+          card.id,
+          { question: "Continue?", blocking: true },
+          worker,
+          "cardThread",
+        );
+        const closing =
+          close === "answer"
+            ? kanban.answerAsk(
+                card.id,
+                "q1",
+                { verdict: "answered", text: "Yes", revision: 0 },
+                owner,
+              )
+            : close === "drop"
+              ? kanban.changeAsk(card.id, "q1", "drop", owner, "owner")
+              : kanban.cardThread(card.id, "wake", "Continue", owner);
+        target = threadId;
+        const cancelled = yield* Effect.forkChild(closing);
+        yield* Deferred.await(entered);
+        yield* Fiber.interrupt(cancelled);
+        target = null;
+        yield* closing;
+        const restored = (yield* kanban.card(card.id)).card;
+        assert.equal(restored.stage, "working");
+        assert.equal(restored.activeThreadId, threadId);
+        const model = modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", variant: "max" });
+        yield* kanban.setPool(board.id, model, 2);
+        yield* kanban.editCard(card.id, { model }, owner);
+        yield* kanban.cardThread(card.id, "wake", "Use the updated model", owner);
+        assert.deepEqual((yield* Ref.get(fake.threads)).get(threadId)?.model, model);
+      }).pipe(Effect.provide(testLayer(gated)));
+    }),
+);
+
 it.effect.each(
   (["answer", "drop", "wake", "post", "pick"] as const).flatMap((close) =>
     (["excluded", "kept", "shared excluded"] as const).map((hold) => ({ close, hold })),

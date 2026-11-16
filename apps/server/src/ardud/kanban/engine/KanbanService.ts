@@ -137,6 +137,7 @@ import { KanbanModels, isListed } from "./models.ts";
 import { selectionRoutingEnabled } from "./selectionSettings.ts";
 import { planCutoverCardRestore, type RestoreCutoverCardInput } from "./cutoverCards.ts";
 import * as BoardLocks from "./boardLocks.ts";
+import * as ModelLock from "./modelLock.ts";
 import * as ThreadCommandExecutor from "../../../orchestration-v2/ThreadCommandExecutor.ts";
 import * as LockedStore from "./lockedStore.ts";
 import * as TickTimings from "./tickTimings.ts";
@@ -5958,30 +5959,17 @@ const make = Effect.gen(function* () {
       parked.threadId !== card.workThreadId
     )
       return Effect.void;
-    const lock = threadModelLock(parked.threadId);
-    const acquire = Effect.gen(function* () {
-      yield* lock.take(1);
-      let held = true;
-      return Effect.suspend(() => {
-        if (!held) return Effect.void;
-        held = false;
-        return Effect.asVoid(lock.release(1));
-      });
-    });
-    return yield* Effect.acquireRelease(
-      locks.outside(
-        acquire,
-        (release) => release,
-        true,
-        Effect.gen(function* () {
-          if (!sameCardState(yield* rawStore.card(card.id), card)) return false;
-          return (
-            discussion === undefined ||
-            NodeUtil.isDeepStrictEqual(yield* rawStore.discussion(discussion.id), discussion)
-          );
-        }),
-      ),
+    return yield* locks.outside(
+      ModelLock.acquire(threadModelLock(parked.threadId)),
       (release) => release,
+      true,
+      Effect.gen(function* () {
+        if (!sameCardState(yield* rawStore.card(card.id), card)) return false;
+        return (
+          discussion === undefined ||
+          NodeUtil.isDeepStrictEqual(yield* rawStore.discussion(discussion.id), discussion)
+        );
+      }),
     );
   });
 
