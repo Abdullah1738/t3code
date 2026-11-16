@@ -249,6 +249,27 @@ it.live(
                 view === "messages" ? 6 : 101,
                 "page SQL returned rows outside page bound",
               );
+              const hydration = queries.filter((span) =>
+                String(span.attributes.get("db.query.text")).includes(
+                  "SELECT payload_json FROM orchestration_v2_projection_messages",
+                ),
+              );
+              assert.lengthOf(hydration, 1);
+              const query = String(hydration[0]!.attributes.get("db.query.text"));
+              const plan = yield* sql.unsafe<{ detail: string }>(`EXPLAIN QUERY PLAN ${query}`, [
+                result.thread.threadId,
+                "[]",
+              ]);
+              // A thread/created-at range returns the same rows but visits every
+              // stored message. The primary-key SEARCH bounds physical hydration.
+              assert.isTrue(
+                plan.some((row) =>
+                  row.detail.includes(
+                    "USING INDEX sqlite_autoindex_orchestration_v2_projection_messages_1 (message_id=?)",
+                  ),
+                ),
+                "message hydration must use ID point lookups",
+              );
               yield* Effect.log(
                 JSON.stringify(
                   {
