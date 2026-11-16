@@ -3456,6 +3456,17 @@ const make = Effect.gen(function* () {
                     at,
                     why,
                   });
+                  yield* SavedWrite.bestEffort(
+                    recordAnalytics({
+                      kind: "kanban.slot",
+                      ts: at,
+                      boardId,
+                      threadId,
+                      ...(cardId === null ? {} : { cardId }),
+                      props: { poolKey, slot: kind, why, held: held !== undefined },
+                    }),
+                    undefined,
+                  );
                   if (kind === "release") before.delete(poolKey);
                   else before.add(poolKey);
                   if (before.size === 0) board.delete(threadId);
@@ -16959,6 +16970,7 @@ const make = Effect.gen(function* () {
       readonly pool: string;
       readonly carried: ReadonlyArray<KanbanCard>;
     },
+    includeUsage = false,
   ) {
     const pools = yield* store.pools(thread.board.id);
     const slots = pools.find((pool) => pool.key === thread.pool)?.slots ?? 0;
@@ -16969,14 +16981,25 @@ const make = Effect.gen(function* () {
       thread.carried.length +
       [...starting.values()].filter((pending) => pending.threadId === threadId).length;
     let eligible = slots > 0 && carrying < Rules.MAX_BATCH;
-    if (eligible && !holdsSlot) {
+    let used: number | undefined;
+    const usage = Effect.gen(function* () {
       const occupied = new Set(yield* store.poolThreadIds(thread.board.id, thread.pool));
       for (const [id, pool] of yield* boardHolds(thread.board.id)) {
         if (pool === thread.pool) occupied.add(id);
       }
-      eligible = occupied.size < slots;
+      return occupied.size;
+    });
+    if (eligible && !holdsSlot) {
+      used = yield* usage;
+      eligible = used < slots;
+    } else if (includeUsage) {
+      // A diagnostic read for an existing holder must not prevent taking its next card.
+      used = yield* SavedWrite.bestEffort(
+        usage.pipe(Effect.map((value): number | undefined => value)),
+        undefined,
+      );
     }
-    return { pools, slots, carrying, holdsSlot, eligible };
+    return { pools, slots, carrying, holdsSlot, eligible, used };
   });
 
   /** Every card a thread has carried, owned now or not. */
@@ -17064,45 +17087,62 @@ const make = Effect.gen(function* () {
     },
     threadId: ThreadId,
     card: KanbanCard,
+    observe = false,
   ) {
-    yield* settlePendingNotes(thread.board.id, threadId);
-    yield* refusePendingStop(threadId);
-    if (starting.has(`${card.boardId}:${card.id}`)) {
-      return yield* failWith(
-        "conflict",
-        `card #${card.number} is starting; wait for its assignment`,
-      );
-    }
-    if (settingUp.has(card.boardId))
-      return yield* failWith("denied", "Setup is starting", "board_setup_starting");
-    if (card.boardId !== thread.board.id) {
-      return yield* failWith("denied", `card #${card.number} is on another board`, "cross_board");
-    }
-    const cards = yield* store.openCards(card.boardId);
-    const capacity = yield* takeCapacity(threadId, thread);
-    const check = Rules.checkClaim(thread.board, card, {
-      threadId,
-      pool: thread.pool,
-      projectId: thread.projectId,
-      byId: new Map(cards.map((entry) => [entry.id as string, entry])),
-      carrying: capacity.carrying,
-      slots: capacity.slots,
-      pools: capacity.pools,
-      nowMs: yield* nowMillis,
-    });
-    if (!check.ok)
-      return yield* failWith(
-        "denied",
-        check.reason,
-        ("denyReason" in check ? check.denyReason : undefined) ?? "role_not_allowed",
-      );
-    if (!capacity.eligible) {
-      return yield* failWith(
-        "denied",
-        `no free slot on ${thread.pool}; leave it in todo`,
-        "pool_full",
-      );
-    }
+    let capacity: Effect.Success<ReturnType<typeof takeCapacity>> | undefined;
+    return yield* Effect.gen(function* () {
+      yield* settlePendingNotes(thread.board.id, threadId);
+      yield* refusePendingStop(threadId);
+      if (starting.has(`${card.boardId}:${card.id}`)) {
+        return yield* failWith(
+          "conflict",
+          `card #${card.number} is starting; wait for its assignment`,
+        );
+      }
+      if (settingUp.has(card.boardId))
+        return yield* failWith("denied", "Setup is starting", "board_setup_starting");
+      if (card.boardId !== thread.board.id) {
+        return yield* failWith("denied", `card #${card.number} is on another board`, "cross_board");
+      }
+      const cards = yield* store.openCards(card.boardId);
+      capacity = yield* takeCapacity(threadId, thread, observe);
+      const check = Rules.checkClaim(thread.board, card, {
+        threadId,
+        pool: thread.pool,
+        projectId: thread.projectId,
+        byId: new Map(cards.map((entry) => [entry.id as string, entry])),
+        carrying: capacity.carrying,
+        slots: capacity.slots,
+        pools: capacity.pools,
+        nowMs: yield* nowMillis,
+      });
+      if (!check.ok)
+        return yield* failWith(
+          "denied",
+          check.reason,
+          ("denyReason" in check ? check.denyReason : undefined) ?? "role_not_allowed",
+        );
+      if (!capacity.eligible) {
+        return yield* failWith(
+          "denied",
+          `no free slot on ${thread.pool}; leave it in todo`,
+          "pool_full",
+        );
+      }
+      return capacity;
+    }).pipe(
+      Effect.tapError((error) => {
+        if (!observe || !isKanbanError(error)) return Effect.void;
+        const reason = error.reason ?? error.code;
+        return SavedWrite.bestEffort(
+          Effect.gen(function* () {
+            const snapshot = capacity ?? (yield* takeCapacity(threadId, thread, true));
+            yield* recordClaim(threadId, thread, card, snapshot, reason);
+          }),
+          undefined,
+        );
+      }),
+    );
   });
 
   /** Puts a checked todo card on its new work thread. */
@@ -17147,6 +17187,36 @@ const make = Effect.gen(function* () {
     } satisfies ClaimResult;
   });
 
+  const recordClaim = Effect.fn("KanbanService.recordClaim")(function* (
+    threadId: ThreadId,
+    thread: {
+      readonly board: KanbanBoard;
+      readonly pool: string;
+      readonly carried: ReadonlyArray<KanbanCard>;
+    },
+    card: KanbanCard,
+    capacity: Effect.Success<ReturnType<typeof takeCapacity>>,
+    reason?: string,
+  ) {
+    yield* SavedWrite.bestEffort(
+      recordAnalytics({
+        kind: reason === undefined ? "kanban.claim" : "kanban.claim_denied",
+        boardId: thread.board.id,
+        cardId: card.id,
+        threadId,
+        props: {
+          poolKey: thread.pool,
+          reason: reason ?? "taken",
+          holdsSlot: capacity.holdsSlot,
+          carried: thread.carried.length,
+          ...(capacity.used === undefined ? {} : { used: capacity.used }),
+          slots: capacity.slots,
+        },
+      }),
+      undefined,
+    );
+  });
+
   const claimCard: KanbanServiceShape["claimCard"] = (threadId, cardId) =>
     SavedWrite.subSteps(
       "card.claim",
@@ -17154,16 +17224,18 @@ const make = Effect.gen(function* () {
         "card.claim",
         Effect.gen(function* () {
           // Repairs and pending notes do not acknowledge the requested claim.
-          const { thread, card } = yield* Effect.gen(function* () {
+          const { thread, card, capacity } = yield* Effect.gen(function* () {
             yield* reconcileRunFailureUnlocked(threadId).pipe(
               Effect.withSpan("reconcile.runFailure"),
             );
             const thread = yield* workThreadOf(threadId);
             const card = (yield* upgradeFindings([yield* cardOf(cardId)]))[0]!;
-            yield* checkTake(thread, threadId, card);
-            return { thread, card };
+            const capacity = yield* checkTake(thread, threadId, card, Option.isSome(analytics));
+            return { thread, card, capacity };
           }).pipe(SavedWrite.preparatory);
-          return yield* takeCard(threadId, thread.pool, card, "Taken by its work thread");
+          const result = yield* takeCard(threadId, thread.pool, card, "Taken by its work thread");
+          yield* recordClaim(threadId, thread, card, capacity);
+          return result;
         }),
       ),
       true,
@@ -17369,7 +17441,22 @@ const make = Effect.gen(function* () {
             ),
           };
         }),
-      ).pipe(NodeSqliteClient.foregroundReads);
+      ).pipe(
+        NodeSqliteClient.foregroundReads,
+        Effect.tap((result) =>
+          result.candidates.length === 0
+            ? Effect.void
+            : SavedWrite.bestEffort(
+                recordAnalytics({
+                  kind: "kanban.next",
+                  boardId: result.candidates[0]!.card.boardId,
+                  threadId,
+                  props: { holdsSlot: result.holdsSlot, candidateCount: result.candidates.length },
+                }),
+                undefined,
+              ),
+        ),
+      );
     },
   );
 
