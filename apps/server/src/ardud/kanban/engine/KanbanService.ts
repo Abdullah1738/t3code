@@ -19796,10 +19796,18 @@ const make = Effect.gen(function* () {
             const chain = Rules.chainFor(board, card);
             const outcome = Rules.applyReviewResult(card, chain?.steps.length ?? 1, verdict);
             const at = yield* nowIso;
+            const reviewStartedAt = live
+              ? card.movedAt
+              : (events.findLast((event) => event.toStage === "in_review")?.at ?? link.startedAt);
+            const roundStartedAt =
+              Subtasks.reviewRoundStartedAt(events, card.reviewStep) ??
+              (card.reviewStep === 0 ? reviewStartedAt : undefined);
             // Only the last chain verdict closes the plan's next review step,
             // even when earlier work still needs ticking off.
             const passed = verdict === "clear" && !outcome.continueReview;
-            const reviewSubtasks = passed ? Subtasks.reviewSubtasksToPass(card) : [];
+            const reviewSubtasks = passed
+              ? Subtasks.reviewSubtasksToPass(card, roundStartedAt)
+              : [];
             if (passed) {
               for (const subtask of reviewSubtasks) {
                 const missing = Subtasks.approvalProblem(
@@ -19812,7 +19820,7 @@ const make = Effect.gen(function* () {
               }
             }
             const subtasks = passed
-              ? Subtasks.passReview(card, { _tag: "thread", threadId }, at)
+              ? Subtasks.passReview(card, { _tag: "thread", threadId }, at, roundStartedAt)
               : card.subtasks;
             const moreWork = passed && Subtasks.workAfterReview({ subtasks });
             const unfinishedWork = kanbanStepSubtasks({ subtasks }, "work");
@@ -19886,9 +19894,6 @@ const make = Effect.gen(function* () {
               });
               yield* logStageSync(next);
             }
-            const reviewStartedAt = live
-              ? card.movedAt
-              : (events.findLast((event) => event.toStage === "in_review")?.at ?? link.startedAt);
             yield* recordAnalytics({
               kind: "kanban.review_verdict",
               boardId: card.boardId,

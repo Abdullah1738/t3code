@@ -7,7 +7,9 @@ import {
   kanbanStepSubtasks,
   type KanbanOwnerAsk,
   type KanbanSubtask,
+  type KanbanCardEvent,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
@@ -21,6 +23,7 @@ import {
   markSubtask,
   PACKET_SUBTASK,
   passReview,
+  reviewRoundStartedAt,
   planSubtasks,
   pendingWakeNote,
   subtaskLines,
@@ -2324,6 +2327,94 @@ describe("subtask ids stay unique for the life of a card", () => {
   });
 });
 
+describe("review round start", () => {
+  const dispatch = { kind: "moved", toStage: "in_review", body: null } as const;
+  const clear = { kind: "review", toStage: "needs_review", body: "clear" } as const;
+  const flagged = { kind: "flagged", toStage: "needs_review", body: "Need context" } as const;
+  const paused = { kind: "moved", toStage: "needs_owner", body: null } as const;
+  const findings = { kind: "review", toStage: "todo", body: "Fix it" } as const;
+  const finished = { kind: "review", toStage: "completed", body: "clear" } as const;
+  const work = { kind: "moved", toStage: "working", body: null } as const;
+  const events = (entries: ReadonlyArray<Pick<KanbanCardEvent, "kind" | "toStage" | "body">>) =>
+    entries.map((entry, index) => ({
+      ...entry,
+      id: index,
+      cardId: KanbanCardId.make("round-start"),
+      at: DateTime.formatIso(DateTime.makeUnsafe(Date.parse(at) + index * 1000)),
+      actor: owner,
+      fromStage: null,
+      head: null,
+    }));
+
+  it.each([
+    { label: "first reviewer", step: 0, history: [dispatch], start: 0 },
+    { label: "second reviewer", step: 1, history: [dispatch, clear, dispatch], start: 0 },
+    {
+      label: "third reviewer",
+      step: 2,
+      history: [dispatch, clear, dispatch, clear, dispatch],
+      start: 0,
+    },
+    {
+      label: "retry before a clear",
+      step: 1,
+      history: [dispatch, flagged, dispatch, clear, dispatch],
+      start: 0,
+    },
+    {
+      label: "retry after a clear",
+      step: 1,
+      history: [dispatch, clear, dispatch, flagged, dispatch],
+      start: 0,
+    },
+    { label: "late verdict", step: 1, history: [dispatch, clear, dispatch, flagged], start: 0 },
+    { label: "owner pause", step: 1, history: [dispatch, clear, paused, dispatch], start: 0 },
+    {
+      label: "new round after findings",
+      step: 0,
+      history: [dispatch, findings, dispatch],
+      start: 2,
+    },
+    {
+      label: "new round after final clear",
+      step: 0,
+      history: [dispatch, finished, dispatch],
+      start: 2,
+    },
+    {
+      label: "new round after clear waiting for PRs",
+      step: 0,
+      history: [dispatch, { ...finished, toStage: "in_review" }, dispatch],
+      start: 2,
+    },
+    {
+      label: "new round after clear returning to work",
+      step: 0,
+      history: [dispatch, { ...finished, toStage: "todo" }, dispatch],
+      start: 2,
+    },
+    {
+      label: "new round after work",
+      step: 0,
+      history: [dispatch, clear, work, dispatch],
+      start: 3,
+    },
+    {
+      label: "second reviewer of new round",
+      step: 1,
+      history: [dispatch, findings, dispatch, clear, dispatch],
+      start: 2,
+    },
+    { label: "incomplete chain history", step: 1, history: [dispatch], start: undefined },
+    { label: "missing dispatch history", step: 0, history: [], start: undefined },
+  ] as const)("#1729 keeps the whole round's anchor: $label", ({ step, history, start }) => {
+    const recorded = events(history);
+    expect(reviewRoundStartedAt(recorded, step)).toBe(
+      start === undefined ? undefined : recorded[start]?.at,
+    );
+  });
+});
+
 describe("marking subtasks", () => {
   it.each(["work", "evaluator", "script"] as const)(
     "passes the first open review step behind an unfinished %s step",
@@ -2338,7 +2429,7 @@ describe("marking subtasks", () => {
         ],
       );
       if (!plan.ok) throw new Error(plan.reason);
-      const subtasks = passReview({ subtasks: plan.subtasks }, owner, at);
+      const subtasks = passReview({ subtasks: plan.subtasks }, owner, at, at);
       expect(subtasks.map((subtask) => subtask.state)).toEqual(["open", "done", "done", "open"]);
       expect(workAfterReview({ subtasks })).toBe(firstOwner === "work");
       const finishedEarlier = markSubtask(subtasks, "s1", "done", null, owner, at);
@@ -2350,6 +2441,76 @@ describe("marking subtasks", () => {
     const subtasks = planned().filter((subtask) => subtask.owner !== "review");
     expect(passReview({ subtasks }, owner, at)).toEqual(subtasks);
   });
+
+  it.each(["open", "done", "skipped"] as const)(
+    "#1729 keeps future work's review open when an earlier evaluator task is %s during review",
+    (state) => {
+      const plan = planSubtasks(
+        [],
+        [
+          { text: "Version bump", owner: "work", step: 1 },
+          { text: "Merge bump", owner: "evaluator", step: 2 },
+          { text: "Write notes", owner: "work", step: 3 },
+          { text: "Review notes", owner: "review", step: 4 },
+          { text: "Land notes", owner: "evaluator", step: 5 },
+        ],
+      );
+      if (!plan.ok) throw new Error(plan.reason);
+      const startedAt = "2026-10-26T12:01:00.000Z";
+      const verdictAt = "2026-10-26T12:03:00.000Z";
+      const before = markSubtask(plan.subtasks, "s1", "done", null, owner, at);
+      const subtasks =
+        state === "open"
+          ? before
+          : markSubtask(before, "s2", state, "Handled", owner, "2026-10-26T12:02:00.000Z");
+      expect(passReview({ subtasks }, owner, verdictAt, startedAt)).toEqual(subtasks);
+      if (state !== "open") {
+        expect(passReview({ subtasks }, owner, verdictAt)[3]?.state).toBe("done");
+      }
+    },
+  );
+
+  it.each(["done", "skipped"] as const)(
+    "#1729 treats future work marked %s during review as still open for that verdict",
+    (state) => {
+      const plan = planSubtasks(
+        [],
+        [
+          { text: "Earlier evaluator task", owner: "evaluator", step: 1 },
+          { text: "Future work", owner: "work", step: 2 },
+          { text: "Future review", owner: "review", step: 3 },
+        ],
+      );
+      if (!plan.ok) throw new Error(plan.reason);
+      const subtasks = markSubtask(plan.subtasks, "s2", state, "Handled", owner, at);
+      expect(passReview({ subtasks }, owner, at, "2026-10-26T11:59:00.000Z")).toEqual(subtasks);
+    },
+  );
+
+  it.each(["2026-10-26T12:00:00.000Z", "2026-10-26T12:01:00.000Z"])(
+    "#1729 counts tasks finished before or at review start %s as done",
+    (startedAt) => {
+      const plan = planSubtasks(
+        [],
+        [
+          { text: "First work", owner: "work", step: 1 },
+          { text: "Second work", owner: "work", step: 2 },
+          { text: "Review", owner: "review", step: 3 },
+        ],
+      );
+      if (!plan.ok) throw new Error(plan.reason);
+      const subtasks = markSubtask(
+        markSubtask(plan.subtasks, "s1", "done", null, owner, at),
+        "s2",
+        "done",
+        null,
+        owner,
+        at,
+      );
+      const passed = passReview({ subtasks }, owner, "2026-10-26T12:03:00.000Z", startedAt);
+      expect(passed.map((subtask) => subtask.state)).toEqual(["done", "done", "done"]);
+    },
+  );
 
   it.each(["open", "done", "skipped"] as const)(
     "a later worker step that is %s bounds which review can pass",
