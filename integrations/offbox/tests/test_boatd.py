@@ -106,6 +106,10 @@ class Base(unittest.TestCase):
         boatd.load_cfg()
         # Resource inputs are explicit in admission tests, independent of the test runner's host.
         boatd.CFG["cpu_pressure_limit"] = 0
+        for target, values in ((boatd.STATE, {"loops": {}}), (boatd.LOOP_SPECS, {}), (boatd.LOOP_THREADS, {})):
+            fixture = patch.dict(target, values, clear=target is not boatd.STATE)
+            fixture.start()
+            self.addCleanup(fixture.stop)
         boatd.READY.clear()
         boatd._HEALTH.update(ts=0.0, v=None)
         boatd._HEALTH_REFRESH.update(stage="idle", since=None, timings={})
@@ -838,7 +842,7 @@ class Http(Base):
         boatd.health(fresh=True)
         st, d = self.call(None, "GET", "/health")
         self.assertEqual(st, 200)
-        self.assertEqual(sorted(d), ["boatd_uptime_s", "boot", "boot_id", "disk", "disk_full", "disk_low", "host", "mdraid", "mode", "ok", "phase", "pool", "queue", "reasons",
+        self.assertEqual(sorted(d), ["boatd_uptime_s", "boot", "boot_id", "degraded", "disk", "disk_full", "disk_low", "host", "loops", "mdraid", "mode", "ok", "phase", "pool", "problem", "queue", "reasons",
                                      "refresh_stage", "refresh_stage_ms", "refresh_timings_ms", "restartPending", "running", "snapshot_age_s",
                                      "startedAt", "starting", "startupPhases", "up", "uptime_s", "version"])
         self.assertNotIn("moni", json.dumps(d))
@@ -1174,7 +1178,7 @@ unused devices: <none>
         started = []
 
         class NoThread:
-            def __init__(self, target=None, args=(), daemon=None):
+            def __init__(self, target=None, args=(), daemon=None, name=None):
                 self.target, self.args = target, args
 
             def start(self):

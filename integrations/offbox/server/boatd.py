@@ -380,7 +380,7 @@ def vpn_problem() -> str | None:
 
 
 READY = threading.Event()          # set once the state is there and the start-up reconcile has finished
-STATE = {"problem": "starting", "reconcile": None, "boot": None, "phases": {}}
+STATE = {"problem": "starting", "reconcile": None, "boot": None, "phases": {}, "loops": {}}
 
 
 def startup_status():
@@ -438,6 +438,7 @@ def health_stage(stage, read):
 
 def refresh_health(fresh: bool = False) -> dict:
     """Only refreshers serialize; request threads read the published snapshot without this lock."""
+    loops = loop_health()
     with _HEALTH_LOCK:
         cached = _HEALTH["v"]
         if not fresh and cached and now() - _HEALTH["ts"] < 5:
@@ -485,6 +486,10 @@ def refresh_health(fresh: bool = False) -> dict:
                "boot_id": boot_id(), "uptime_s": int(host_uptime()), "boatd_uptime_s": int(now() - STARTED),
                "restartPending": restart_pending(),
                "version": VERSION, **status, "boot": STATE.get("boot"), "startupPhases": STATE.get("phases", {})}
+        problems = [v["problem"] for v in loops.values() if v["stalled"]]
+        out.update(loops=loops, degraded=bool(problems), problem="; ".join(problems) or None)
+        if problems:
+            out.update(mode="degraded", reasons=list(out.get("reasons", [])) + problems)
         _HEALTH.update(ts=now(), v=out)
         _HEALTH_REFRESH.update(stage="idle", since=None)
         return out
@@ -699,7 +704,7 @@ def health(fresh: bool = False) -> dict:
                           "pool": {"name": CFG["zpool"], "state": "UNKNOWN"}, "mdraid": {"state": "unknown", "arrays": {}},
                           "queue": None, "running": None, "version": VERSION,
                           "restartPending": {"count": 0, "since": None}, "boot": STATE.get("boot"),
-                          "startupPhases": STATE.get("phases", {})})
+                          "startupPhases": STATE.get("phases", {}), "loops": {}, "degraded": False, "problem": None})
     if not READY.is_set():
         reason = STATE["problem"] or "starting"
         out.update(ok=False, mode="degraded", reasons=[reason] + [r for r in out.get("reasons", []) if r != reason])
@@ -2640,23 +2645,120 @@ def sample_once(con) -> None:
                  live, st.f_bavail * st.f_frsize))
 
 
-def loop(fn, every: float, name: str) -> None:
+LOOP_LOCK = threading.RLock()
+LOOP_THREADS = {}
+LOOP_SPECS = {}
+
+
+def loop_log(event, name, **fields):
+    # Logging must survive the same disk failure as SQLite.
+    try:
+        log(json.dumps({"event": event, "loop": name, **fields}, sort_keys=True))
+    except (SystemExit, KeyboardInterrupt):
+        raise
+    except BaseException:
+        pass
+
+
+def loop_state(name, every, stamp):
+    return STATE["loops"].setdefault(name, {
+        "every": every, "started_at": stamp, "last_ok": None, "last_error": None,
+        "last_error_at": None, "consecutive_failures": 0, "passes": 0, "failure_since": None})
+
+
+def loop(fn, every: float, name: str, *, clock=None, sleep=None) -> None:
+    clock, sleep = clock or now, sleep or time.sleep
+    error_key, reported_at, repeats = None, 0, 0
     while True:
-        con = None
+        delay = every
         try:
+            con = None
             try:
-                con = db()
-            except sqlite3.Error as e:
-                if name == 'sampler':
-                    disk_maintenance(None, error=e)
-                raise
-            fn(con)
-        except Exception:  # noqa: BLE001
-            log(f"{name}: {traceback.format_exc()[-800:]}")
-        finally:
-            if con is not None:
-                con.close()
-        time.sleep(every)
+                try:
+                    con = db()
+                except sqlite3.Error as e:
+                    if name == 'sampler':
+                        disk_maintenance(None, error=e)
+                    raise
+                fn(con)
+            finally:
+                if con is not None:
+                    con.close()
+            stamp = clock()
+            with LOOP_LOCK:
+                state = loop_state(name, every, stamp)
+                failures = state["consecutive_failures"]
+                since = state["failure_since"]
+                state.update(last_ok=stamp, consecutive_failures=0, passes=state["passes"] + 1, failure_since=None)
+            if failures:
+                duration = stamp - (since if since is not None else stamp)
+                loop_log("loop.recovered", name, message=f"{name} recovered after {failures} failures, {duration:.1f} s",
+                         failures=failures, duration_s=duration)
+            error_key, repeats = None, 0
+        except (SystemExit, KeyboardInterrupt):
+            raise
+        except BaseException as error:
+            stamp = clock()
+            text = f"{type(error).__name__}: {error}"
+            with LOOP_LOCK:
+                state = loop_state(name, every, stamp)
+                failures = state["consecutive_failures"] + 1
+                if state["failure_since"] is None:
+                    state["failure_since"] = stamp
+                state.update(last_error=text[:240], last_error_at=stamp, consecutive_failures=failures)
+            delay = min(every * 2 ** min(failures, 16), 300)
+            if text != error_key:
+                loop_log("loop.failed", name, error=text[:240], traceback=traceback.format_exc(), failures=failures)
+                error_key, reported_at, repeats = text, stamp, 0
+            else:
+                repeats += 1
+                if stamp - reported_at >= 300:
+                    loop_log("loop.failure_repeat", name, error=text[:240], repeats=repeats, failures=failures)
+                    reported_at, repeats = stamp, 0
+        try:
+            sleep(delay)
+        except (SystemExit, KeyboardInterrupt):
+            raise
+        except BaseException as error:
+            loop_log("loop.sleep_failed", name, error=f"{type(error).__name__}: {error}"[:240])
+
+
+def start_loop(fn, every, name):
+    with LOOP_LOCK:
+        LOOP_SPECS[name] = (fn, every)
+        loop_state(name, every, now())
+        thread = LOOP_THREADS.get(name)
+        if thread is None or not thread.is_alive():
+            thread = threading.Thread(target=loop, args=(fn, every, name), name=f"boatd-{name}", daemon=True)
+            LOOP_THREADS[name] = thread
+            thread.start()
+
+
+def loop_health():
+    result = {}
+    with LOOP_LOCK:
+        for name, (fn, every) in LOOP_SPECS.items():
+            state = loop_state(name, every, now())
+            thread = LOOP_THREADS.get(name)
+            alive = thread is not None and thread.is_alive()
+            age = max(0, now() - (state["last_ok"] if state["last_ok"] is not None else state["started_at"]))
+            stalled = not alive or age > max(4 * every, 120)
+            problem = f"{name} has not completed a pass for {int(age)} s ({state['last_error'] or ('thread dead' if not alive else 'no error recorded')})"
+            if stalled and not state.get("stalled"):
+                loop_log("loop.stalled", name, problem=problem, alive=alive, age_s=age)
+            elif not stalled and state.get("stalled"):
+                loop_log("loop.healthy", name, passes=state["passes"])
+            state["stalled"] = stalled
+            result[name] = dict(state, alive=alive, age_s=age, problem=problem if stalled else None)
+            if not alive and READY.is_set():
+                loop_log("loop.respawn", name)
+                try:
+                    start_loop(fn, every, name)
+                except (SystemExit, KeyboardInterrupt):
+                    raise
+                except BaseException as error:
+                    loop_log("loop.respawn_failed", name, error=f"{type(error).__name__}: {error}"[:240])
+    return result
 
 
 # ---------------------------------------------------------------- stats
@@ -3167,8 +3269,8 @@ def startup() -> None:
     log(f"reconciled in {time.monotonic() - began:.3f} s phases={json.dumps(STATE['phases'])}")
     STATE["problem"] = None
     READY.set()
-    threading.Thread(target=loop, args=(reap_once, 15, "reaper"), daemon=True).start()
-    threading.Thread(target=loop, args=(sample_once, CFG["sample_s"], "sampler"), daemon=True).start()
+    start_loop(reap_once, 15, "reaper")
+    start_loop(sample_once, CFG["sample_s"], "sampler")
 
 
 def serve() -> None:
