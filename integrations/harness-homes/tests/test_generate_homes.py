@@ -1014,7 +1014,7 @@ class ParityTests(HarnessTestCase):
             self.assertIn("recall", {server["id"] for server in parity["mcpServers"]})
             self.assertEqual(parity["runtimeMcpServers"], ["t3-code"])
             self.assertEqual({guard["id"] for guard in parity["guards"]},
-                             {"hook-adapters", "live-database", "rootwide-search", "quint-verify", "offbox", "betterstack-scope", "desktop-lease", "recall", "toollog"})
+                             {"hook-adapters", "live-database", "rootwide-search", "phone-adb", "quint-verify", "offbox", "betterstack-scope", "desktop-lease", "recall", "toollog"})
             self.assertFalse(parity["compactSkillCatalog"]["required"])
             self.assertEqual(parity["instructions"]["canonical"]["path"], str(self.canonical))
             self.assertFalse((home / "src").exists())
