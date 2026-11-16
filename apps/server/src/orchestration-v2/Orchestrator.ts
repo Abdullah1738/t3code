@@ -6051,7 +6051,22 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           (command.createdBy === "agent" && command.creationSource === "provider") ||
           command.contextReset === true);
       const stoppedBeforeWork =
-        activeRunWork && (yield* stopReachedRun(command, command.threadId, activeRun.id));
+        activeRunWork &&
+        (yield* projectionStore
+          .getThreadRecords(command.threadId, ["turnItems"], {
+            turnItemTypes: ["run_interrupt_request"],
+            turnItemRunIds: [activeRun.id],
+          })
+          .pipe(
+            // Restart fences the old run's tools, but its replacement input must run.
+            Effect.map(({ turnItems }) =>
+              turnItems.some(
+                (item) =>
+                  item.type === "run_interrupt_request" && item.cancelReason !== "superseded",
+              ),
+            ),
+            mapDispatchError(command),
+          ));
       const wakeSkipsHold = activeRunWork && queueIsHeld && !stoppedBeforeWork;
       const run: OrchestrationV2Run = {
         id: runId,
@@ -14064,6 +14079,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     },
     (effect, stored) =>
       effect.pipe(
+        // Completion holds dispatch locks; background snapshots must not block new sends through them.
+        NodeSqliteClient.foregroundReads,
         Effect.catchCause((cause) =>
           Effect.logWarning("Failed to react to V2 run update", {
             threadId: stored.event.threadId,
