@@ -556,6 +556,7 @@ def rollup(board, day, top_n=20):
     component_totals, component_errors = Counter(), defaultdict(Counter)
     component_samples, component_durations = defaultdict(dict), defaultdict(list)
     order_failures, poll_counts = defaultdict(Counter), {}
+    can_report_outcomes = {'success': 0, 'refused': 0}
     threads_by_rule, attempts = defaultdict(Counter), defaultdict(list)
     thread_decisions, unattributed = defaultdict(Counter), defaultdict(Counter)
     sampled_threads, sampled_attempts, sampled_unknown = set(), set(), set()
@@ -664,6 +665,8 @@ def rollup(board, day, top_n=20):
                     'amazon', 'uber', 'toollog', 'money-cases'}:
                 component = 'unknown'
             component_totals[component] += weight
+            if component == 'order-watch' and name == 'order_watch.can_report' and type(row.get('ok')) is bool:
+                can_report_outcomes['success' if row['ok'] else 'refused'] += weight
             if type(duration) in (int, float) and math.isfinite(duration) and duration >= 0:
                 component_durations[f'{component}:{name}'].append((duration, weight))
             merchant = (row.get('props') or {}).get('merchant')
@@ -768,6 +771,7 @@ def rollup(board, day, top_n=20):
         result['unrecognizedThreadIds'] = unrecognized
         result['unrecognizedThreadIdsSampled'] = unrecognized_sampled
     if board == 'orders':
+        result['canReportByOutcome'] = can_report_outcomes
         result['durationsMs'] = {name: dict(values) for name, values in result['durationMsByName'].items()}
         if order_polls:
             result['durationsMs']['track.poll']['byMerchant'] = {
