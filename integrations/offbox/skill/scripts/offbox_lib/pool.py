@@ -750,7 +750,8 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
         lease.cap_check()
         pending = poll.call(lambda: con.execute("SELECT l.* FROM leases l JOIN kv k ON k.k='resume_unanswered:' || l.box_id "
                               f"WHERE l.repo_key=? AND {token_mine('l')} AND l.state IN ('running','stopped') "
-                              "AND COALESCE(l.note,'') NOT LIKE ? LIMIT 1", (key, WEDGED_LIKE)).fetchone())
+                              "AND COALESCE(l.note,'') NOT LIKE ? AND COALESCE(l.note,'') NOT LIKE 'disk-full:%' "
+                              "LIMIT 1", (key, WEDGED_LIKE)).fetchone())
         if create_first or (pending and (pending['box_id'] in unusable or
                                             pending_busy.get(pending['box_id'], 0) > time.monotonic())):
             pending = None
@@ -814,7 +815,8 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
             try:
                 pending = con.execute("SELECT l.* FROM leases l JOIN kv k ON k.k='resume_unanswered:' || l.box_id "
                                       "WHERE l.box_id=? AND l.state IN ('running','stopped') "
-                                      "AND COALESCE(l.note,'') NOT LIKE ?", (bid, WEDGED_LIKE)).fetchone()
+                                      "AND COALESCE(l.note,'') NOT LIKE ? "
+                                      "AND COALESCE(l.note,'') NOT LIKE 'disk-full:%'", (bid, WEDGED_LIKE)).fetchone()
                 if not pending:
                     _unreserve_and_release(con, waiter, guard)
                     continue

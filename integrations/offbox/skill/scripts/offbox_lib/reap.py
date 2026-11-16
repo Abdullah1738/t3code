@@ -250,6 +250,15 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
         bid = r["box_id"]
         b = live.get(bid)
         if con.execute("SELECT 1 FROM kv WHERE k=?", (f"resume_unanswered:{bid}",)).fetchone():
+            if not dry and (r['note'] or '').startswith('disk-full:'):
+                if api.left() is not None and api.left() <= 0.05:
+                    actions.append('defer retired resumes: maintenance budget exhausted')
+                    return actions
+                try:
+                    with file_lock('box-' + bid, timeout=0):
+                        lease.reconcile_retired_resume(con, bid)
+                except OffboxError as error:
+                    event(con, bid, 'resume_reconcile_deferred', str(error))
             actions.append(f"defer {bid}: unanswered resume needs reconciliation")
             continue
         if bid in protected:

@@ -1,5 +1,6 @@
 """A full pool box is cleaned or fenced before another user command can start."""
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -16,6 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import offbox_disk_space as disk
 from offbox_lib import api, bases, box_disk, cli, common, fallback, lease, misc, pool, reap, runs, ssh_sync, start_check
 from test_capacity import Isolated
+
+_HTTP_CALL, _HTTP_GET = api.call, api.get
 
 
 def space(tmp=4*disk.GIB, workspace=10*disk.GIB):
@@ -743,6 +746,210 @@ class BoxDiskTests(Isolated):
             reap.reap(False)
         refresh.assert_called_once()
         self.assertTrue(self.row('b')['note'].startswith(box_disk.NOTE))
+
+    def test_lost_disk_full_retention_resume_does_not_starve_healthy_peer(self):
+        self.box('bad', member=True, state='stopped')
+        self.box('good', member=True)
+        self.con.execute('UPDATE leases SET pinned_until=? WHERE box_id=?', (common.now()+86400, 'bad'))
+        self.con.commit()
+        common.kv_set(self.con, 'pin_owner:bad', self.me['owner'])
+        box_disk.retire(self.con, 'bad', space(tmp=4096), 'tmp', stop=False)
+        with patch.dict(os.environ, {'OFFBOX_RESUME_CONFIRM_SECONDS':'0'}), \
+             patch.object(lease.capacity, 'check'), \
+             patch.object(api, 'resume', side_effect=api.NetworkError('resume reply lost')):
+            with self.assertRaises(lease.ResumeUnresolved):
+                lease.refresh_box(self.con, 'bad')
+        self.assertTrue(self.con.execute("SELECT 1 FROM kv WHERE k='resume_unanswered:bad'").fetchone())
+        def reuse(con, row, *args, **kwargs):
+            self.assertEqual(row['box_id'], 'good', 'retired resumes must not enter dispatch selection')
+            return dict(row)
+        with patch.object(lease, '_reuse', side_effect=reuse) as reused:
+            got = pool.acquire(self.me)
+            pool.release_guard(got)
+        self.assertEqual(got['box_id'], 'good')
+        reused.assert_called_once()
+        self.assertTrue(self.row('bad')['note'].startswith(box_disk.NOTE))
+
+    def test_reaper_reconciles_retired_resume_without_resend_or_preparation(self):
+        from offbox_lib import allocation
+        self.box('bad', member=True, state='stopped')
+        box_disk.retire(self.con, 'bad', space(tmp=4096), 'tmp', stop=False)
+        for state in ('running', 'starting', 'unknown', 'stopped'):
+            with self.subTest(state=state):
+                common.kv_set(self.con, 'resume_unanswered:bad', '')
+                self.con.execute("INSERT OR REPLACE INTO kv VALUES ('resume_sender:bad','',?)", (common.now(),))
+                self.con.commit()
+                def confirm(*args, **kwargs):
+                    self.assertTrue(kwargs['pending'])
+                    self.assertTrue(kwargs['confirm_only'])
+                    if state == 'unknown':
+                        raise lease.ResumeUnresolved('unreadable')
+                    if state in ('running', 'stopped'):
+                        allocation.clear_resume(self.con, 'bad')
+                    if state == 'stopped':
+                        raise lease.ResumeStopped('confirmed stopped')
+                    return {'state':state}, False
+                with patch.object(api, 'list_boxes', return_value=[dict(id='bad', state='running')]), \
+                     patch.object(bases, 'upkeep'), patch.object(lease, '_resume_confirmed', side_effect=confirm) as observed, \
+                     patch.object(api, 'resume') as send, patch.object(lease, '_bring_up') as prepare:
+                    reap.reap(False)
+                observed.assert_called_once()
+                send.assert_not_called()
+                prepare.assert_not_called()
+                pending = self.con.execute("SELECT 1 FROM kv WHERE k='resume_unanswered:bad'").fetchone()
+                self.assertEqual(bool(pending), state in ('starting', 'unknown'))
+                self.assertTrue(self.row('bad')['note'].startswith(box_disk.NOTE))
+
+    def test_retired_stopped_resume_settles_within_real_reaper_budget_after_grace(self):
+        from offbox_lib import allocation
+        from test_pool_affinity import Clock
+        self.box('bad', member=True, state='stopped')
+        box_disk.retire(self.con, 'bad', space(tmp=4096), 'tmp', stop=False)
+        clock = Clock()
+        clock.t = common.now()
+        self.con.execute("INSERT INTO kv VALUES ('resume_unanswered:bad','',?)", (clock.t,))
+        self.con.execute("INSERT INTO kv VALUES ('resume_sender:bad','',?)", (clock.t,))
+        self.con.commit()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ))
+            os.environ.pop('OFFBOX_RESUME_CONFIRM_SECONDS', None)
+            for name in ('time', 'monotonic', 'sleep'):
+                stack.enter_context(patch.object(time, name, getattr(clock.module, name)))
+            stack.enter_context(patch.object(api, 'readiness_get', return_value={'state':'archived'}))
+            stack.enter_context(patch.object(api, 'list_boxes', return_value=[dict(id='bad', state='archived')]))
+            stack.enter_context(patch.object(bases, 'upkeep'))
+            send = stack.enter_context(patch.object(api, 'resume'))
+            prepare = stack.enter_context(patch.object(lease, '_bring_up'))
+            reap.reap(False)
+            self.assertTrue(allocation.abandoned_resumes(self.con, self.me['repo_key']))
+            self.assertLess(clock.t - self.con.execute("SELECT ts FROM kv WHERE k='resume_unanswered:bad'").fetchone()[0], 3)
+            clock.t += 120
+            before = clock.t
+            reap.reap(False)
+            self.assertLess(clock.t - before, 3)
+            self.assertFalse(allocation.abandoned_resumes(self.con, self.me['repo_key']))
+            with allocation.scope(self.me['repo_key']), allocation.guard():
+                pass
+            for response in (api.NetworkError('unreadable'), {'state':'unknown'}, {'state':'provisioning'}):
+                with self.subTest(response=str(response)):
+                    self.con.execute("INSERT INTO kv VALUES ('resume_unanswered:bad','',?)", (clock.t-121,))
+                    self.con.execute("INSERT INTO kv VALUES ('resume_sender:bad','',?)", (clock.t-121,))
+                    self.con.commit()
+                    read = dict(side_effect=response) if isinstance(response, Exception) else dict(return_value=response)
+                    with patch.object(api, 'readiness_get', **read):
+                        reap.reap(False)
+                    self.assertTrue(allocation.abandoned_resumes(self.con, self.me['repo_key']))
+                    allocation.clear_resume(self.con, 'bad')
+            send.assert_not_called()
+            prepare.assert_not_called()
+        self.assertTrue(self.row('bad')['note'].startswith(box_disk.NOTE))
+
+    def test_retired_resume_http_observations_have_usable_budgets_on_both_backends(self):
+        from offbox_lib import allocation
+        from test_pool_affinity import Clock
+        self.box('bad', member=True, state='stopped')
+        box_disk.retire(self.con, 'bad', space(tmp=4096), 'tmp', stop=False)
+        for backend in ('boat', 'server'):
+            for latency in (0, .01, .04, .06, .1, .25, 1, 2.5, 4):
+                with self.subTest(backend=backend, latency=latency), contextlib.ExitStack() as stack:
+                    clock = Clock()
+                    clock.t = common.now()
+                    self.con.execute("INSERT INTO kv VALUES ('resume_unanswered:bad','',?)", (clock.t-121,))
+                    self.con.execute("INSERT INTO kv VALUES ('resume_sender:bad','',?)", (clock.t-121,))
+                    self.con.commit()
+                    timeouts = []
+                    def observe(req, timeout):
+                        self.assertEqual(req.method, 'GET')
+                        self.assertTrue(req.full_url.endswith('/sandboxes/bad'))
+                        timeouts.append(timeout)
+                        if timeout < latency:
+                            clock.t += timeout
+                            raise TimeoutError('HTTP observation exceeded its budget')
+                        clock.t += latency
+                        return io.BytesIO(b'{"sandbox":{"id":"bad","state":"archived"}}')
+                    stack.enter_context(patch.dict(os.environ, {'OFFBOX_BACKEND':backend}))
+                    os.environ.pop('OFFBOX_RESUME_CONFIRM_SECONDS', None)
+                    stack.enter_context(patch.object(common, '_BACKEND', backend))
+                    stack.enter_context(patch.object(api, 'BACKEND', backend))
+                    for name in ('time', 'monotonic', 'sleep'):
+                        stack.enter_context(patch.object(time, name, getattr(clock.module, name)))
+                    stack.enter_context(patch.object(api, 'call', _HTTP_CALL))
+                    stack.enter_context(patch.object(api, 'get', _HTTP_GET))
+                    stack.enter_context(patch.object(api, '_key', return_value='offline-fixture'))
+                    stack.enter_context(patch.object(api, '_open', side_effect=observe))
+                    stack.enter_context(patch.object(api, 'list_boxes', return_value=[dict(id='bad', state='archived')]))
+                    stack.enter_context(patch.object(bases, 'upkeep'))
+                    send = stack.enter_context(patch.object(api, 'resume'))
+                    prepare = stack.enter_context(patch.object(lease, '_bring_up'))
+                    before = clock.t
+                    reap.reap(False)
+                    self.assertEqual(len(timeouts), 2)
+                    self.assertGreaterEqual(min(timeouts), latency)
+                    self.assertLessEqual(clock.t-before, 10)
+                    self.assertFalse(allocation.abandoned_resumes(self.con, self.me['repo_key']))
+                    self.assertTrue(self.row('bad')['note'].startswith(box_disk.NOTE))
+                    send.assert_not_called()
+                    prepare.assert_not_called()
+
+    def test_retired_reaper_skips_busy_allocation_lock_with_production_pool_wait(self):
+        from test_pool_affinity import Clock
+        boxes = ['bad'+str(i) for i in range(8)]
+        for bid in boxes:
+            self.box(bid, member=True, state='stopped')
+            box_disk.retire(self.con, bid, space(tmp=4096), 'tmp', stop=False)
+        for backend in ('boat', 'server'):
+            with self.subTest(backend=backend), contextlib.ExitStack() as stack:
+                clock = Clock()
+                clock.t = common.now()
+                for bid in boxes:
+                    self.con.execute('INSERT INTO kv VALUES (?,?,?)', ('resume_unanswered:'+bid, '', clock.t-121))
+                    self.con.execute('INSERT INTO kv VALUES (?,?,?)', ('resume_sender:'+bid, '', clock.t-121))
+                self.con.commit()
+                stack.enter_context(patch.dict(os.environ, {'OFFBOX_BACKEND':backend}))
+                os.environ.pop('OFFBOX_POOL_WAIT_SECONDS', None)
+                stack.enter_context(patch.object(common, '_BACKEND', backend))
+                stack.enter_context(patch.object(api, 'BACKEND', backend))
+                for name in ('time', 'monotonic', 'sleep'):
+                    stack.enter_context(patch.object(time, name, getattr(clock.module, name)))
+                read = stack.enter_context(patch.object(api, 'readiness_get', return_value={'state':'archived'}))
+                stack.enter_context(patch.object(api, 'list_boxes', return_value=[dict(id=b, state='archived') for b in boxes]))
+                stack.enter_context(patch.object(bases, 'upkeep'))
+                name = 'allocation-' + hashlib.sha256(self.me['repo_key'].encode()).hexdigest()[:20]
+                before = clock.t
+                with common.file_lock(name, timeout=0):
+                    reap.reap(False)
+                self.assertLess(clock.t-before, 3)
+                read.assert_not_called()
+                self.assertEqual(self.con.execute("SELECT COUNT(*) FROM kv WHERE k LIKE 'resume_unanswered:%'").fetchone()[0], 8)
+                # An immediately available allocation lock must still work with a positive pool wait.
+                reap.reap(False)
+                self.assertEqual(read.call_count, 16)
+                self.assertFalse(self.con.execute("SELECT 1 FROM kv WHERE k LIKE 'resume_unanswered:%'").fetchone())
+
+    def test_retired_reaper_stops_observing_later_boxes_after_maintenance_deadline(self):
+        from test_pool_affinity import Clock
+        clock = Clock()
+        clock.t = common.now()
+        for bid in ('first', 'later'):
+            self.box(bid, member=True, state='stopped')
+            box_disk.retire(self.con, bid, space(tmp=4096), 'tmp', stop=False)
+            self.con.execute('INSERT INTO kv VALUES (?,?,?)', ('resume_unanswered:'+bid, '', clock.t-121))
+            self.con.execute('INSERT INTO kv VALUES (?,?,?)', ('resume_sender:'+bid, '', clock.t-121))
+        self.con.commit()
+        def exhausted(*args, **kwargs):
+            clock.t += 1
+            return {'state':'archived'}
+        with contextlib.ExitStack() as stack:
+            for name in ('time', 'monotonic', 'sleep'):
+                stack.enter_context(patch.object(time, name, getattr(clock.module, name)))
+            stack.enter_context(patch.object(reap, 'REAP_BUDGET_S', 1))
+            read = stack.enter_context(patch.object(api, 'readiness_get', side_effect=exhausted))
+            stack.enter_context(patch.object(api, 'list_boxes', return_value=[dict(id=b, state='archived') for b in ('first', 'later')]))
+            stack.enter_context(patch.object(bases, 'upkeep'))
+            actions = reap.reap(False)
+        read.assert_called_once()
+        self.assertIn('defer retired resumes: maintenance budget exhausted', actions)
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM kv WHERE k LIKE 'resume_unanswered:%'").fetchone()[0], 2)
 
     def test_admission_follow_preserves_chunks_and_stops_at_exact_start_marker(self):
         for chunks in [
