@@ -16,6 +16,15 @@ def fixture_environment_patch():
     return patch.dict(os.environ, {**kept, **blanked}, clear=True)
 
 
+def write_migration_helpers(root):
+    repo = Path(__file__).resolve().parents[3]
+    for name in ('historySourceFiles.ts', 'historyArchiveSql.ts'):
+        relative = Path('apps/server/src/ardud/persistence') / name
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text((repo / relative).read_text())
+
+
 def cases(root):
     live = str(Path.home() / '.robob/userdata/statev2.sqlite')
     opencode = str(Path.home() / '.local/share/opencode/opencode.db')

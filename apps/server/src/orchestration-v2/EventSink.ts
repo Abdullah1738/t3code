@@ -217,6 +217,10 @@ export interface EventSinkV2Shape {
     readonly threadId?: ThreadId;
     readonly afterSequence?: number;
     readonly eventType?: OrchestrationV2DomainEvent["type"];
+    /** Pure selection applied to replay and live before projection or retention. */
+    readonly filter?: (stored: OrchestrationV2StoredEvent) => boolean;
+    /** Runs after catch-up, before live delivery, to reject incomplete retained history. */
+    readonly verifyReplay?: (throughSequence: number) => Effect.Effect<void, unknown>;
     /** Bound RPC subscribers; internal workers must not drop their subscription under load. */
     readonly bounded?: boolean;
   }) => Stream.Stream<OrchestrationV2StoredEvent, EventSinkV2Error>;
@@ -1342,14 +1346,20 @@ const layerBase: Layer.Layer<
       const afterSequence = input?.afterSequence ?? 0;
       const matches = (stored: OrchestrationV2StoredEvent) =>
         (input?.threadId === undefined || stored.event.threadId === input.threadId) &&
-        (input?.eventType === undefined || stored.event.type === input.eventType);
+        (input?.eventType === undefined || stored.event.type === input.eventType) &&
+        (input?.filter?.(stored) ?? true);
       const replay = (throughSequence: number) =>
         catchUp({
           afterSequence,
           throughSequence,
           ...(input?.threadId === undefined ? {} : { threadId: input.threadId }),
           ...(input?.eventType === undefined ? {} : { eventType: input.eventType }),
-        }).pipe(Stream.filter(matches));
+        }).pipe(
+          Stream.filter(matches),
+          Stream.concat(
+            Stream.drain(Stream.fromEffect(input?.verifyReplay?.(throughSequence) ?? Effect.void)),
+          ),
+        );
       return Stream.unwrap(
         Effect.gen(function* () {
           let pubsub = liveEvents;

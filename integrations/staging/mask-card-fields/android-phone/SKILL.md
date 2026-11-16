@@ -117,8 +117,10 @@ model's final checkout verification remain mandatory. Read `plans/COVERAGE.md`
 for actual validated routes, preconditions and gaps; a generic template is not
 evidence that every workflow is trained. Read-only catalog lookups use
 `app-api-search` APIs, without phone verification; Amazon remains app-only.
-Runner exit 5 means PHONE_BUSY: yield. Request tasks set `PHONE_HOLD_OWNER` to
-the exact contents of their own hold; background training must never bypass it.
+`ph` and the runner exit 5 (PHONE_BUSY) when another task holds the phone:
+yield without retrying in a loop. Request tasks export `PHONE_HOLD_OWNER` as
+their exact hold token for every `ph` call and runner. Background training uses
+`ph lease run --owner <card-or-thread-id> --purpose "training" -- <cmd>`.
 Runs also acquire an automatic `jevrun.lock` flock, released on process exit.
 
 Persistent tree reads are often <1s, but repeated standalone ph calls measured
@@ -255,8 +257,19 @@ only the confirmed matching child's hold. Never remove another live task's hold,
 copy its token into PHONE_HOLD_OWNER, or reclaim based on age alone. Check release
 by readback (absent or a different owner's new hold), without deleting a successor.
 
-Background/long-running phone work (e.g. app traffic capture, API reverse-engineering) must yield to owner/Moni tasks (orders, rides, lookups).
-- Request tasks: acquire the hold exclusively with their session ID (shell noclobber), refresh its mtime, and remove it on completion/failure only if its contents still match their session. If another holder exists, coordinate rather than overwrite it.
-- Background builds: before EVERY phone batch check `test -e ~/.local/share/phone-lock/priority-hold`; if present, stop phone input and do off-device work. Resume after release. A hold older than45min needs owner/session liveness checking, not automatic deletion or bypass.
+`ph` enforces priority holds and leases (exit 5, PHONE_BUSY). Under another
+request's hold, every device command is refused, including reads.
+- Request tasks: acquire the hold exclusively with their session ID (shell
+  noclobber), export `PHONE_HOLD_OWNER` as that exact token for every `ph` call
+  and runner, refresh its mtime, and release only their matching hold on exit.
+- Background/long phone jobs (QA, captures, training): use
+  `ph lease run --owner <card-or-thread-id> --purpose "<short>" -- <cmd>`, or
+  `ph lease acquire`, `refresh`, and `release`. Direct uiautomator2/adb scripts
+  must run under a lease or own the priority hold. Request holds outrank leases;
+  expired leases are free. A hold's age alone never grants access: check its
+  owner/session liveness.
+- `ph lease status` shows the claim. Without a lease or hold, actions may
+  interleave with another agent's. Exit 5 means yield: never retry in a loop,
+  copy another holder's token, or delete another task's lease or hold.
 - Proxy gotcha: deleting `http_proxy` (reads null) can leave a cached dead proxy (127.0.0.1:18089) so apps show "no internet". Clear explicitly with `adb shell settings put global http_proxy :0` and leave it at `:0`.
 - Phone serial 002473611000997 (always pass -s). Local emulators are blocked since 2026-10-09 (Run Cloud via the `run-cloud` skill instead), so this phone should be the only adb device.

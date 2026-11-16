@@ -8,8 +8,17 @@ import { CapError, actualCost, estimateAndClamp } from './caps.mjs';
 import { FALLBACK_MODELS } from './config.mjs';
 
 const MAX_BODY = 32 * 1024 * 1024;
+// Cloudflare/origin hiccups worth another try; anything else goes back to the client as-is.
+const RETRY_STATUS = new Set([502, 503, 504, 520, 521, 522, 523, 524]);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// "fetch failed" alone says nothing; the cause (ECONNRESET, UND_ERR_SOCKET...) does.
+export const describeError = (e) => {
+  const c = e?.cause;
+  const cause = c ? c.code || c.message || String(c) : '';
+  return String(e?.message ?? e) + (cause && cause !== e?.message ? ` (${cause})` : '');
+};
 
-export function createProxy({ cfg, venice, ledger, clientToken, log = () => {}, egressCheck = defaultEgressCheck(cfg) }) {
+export function createProxy({ cfg, venice, ledger, clientToken, log = () => {}, egressCheck = defaultEgressCheck(cfg, log) }) {
   const prices = structuredClone(FALLBACK_MODELS);
   let active = 0;
   const waiters = [];
@@ -65,12 +74,61 @@ export function createProxy({ cfg, venice, ledger, clientToken, log = () => {}, 
     return JSON.parse(Buffer.concat(chunks).toString('utf8'));
   }
 
-  async function forward(body) {
+  async function forward(body, signal) {
     return venice.authed('/chat/completions', {
       method: 'POST',
+      signal,
       headers: { 'content-type': 'application/json', accept: body.stream ? 'text/event-stream' : 'application/json' },
       body: JSON.stringify(body),
     });
+  }
+
+  // Waits (up to egressWaitMs) for the Mullvad egress gate instead of failing
+  // at once: a tunnel failover takes minutes, a client retry takes seconds.
+  async function egressReady(signal) {
+    const deadline = Date.now() + (cfg.egressWaitMs ?? 0);
+    let waited = false;
+    for (;;) {
+      if (await egressCheck()) {
+        if (waited) log({ event: 'egress_recovered' });
+        return true;
+      }
+      if (signal?.aborted || Date.now() >= deadline) return false;
+      waited = true;
+      await sleep(Math.min(cfg.egressPollMs ?? 5000, Math.max(0, deadline - Date.now())));
+    }
+  }
+
+  // Sends once, then retries connection failures and 5xx gateway errors. Only
+  // used before any byte has gone to the client, so a retry is invisible to it.
+  async function forwardWithRetry(body, signal) {
+    const attempts = Math.max(1, cfg.upstreamAttempts ?? 1);
+    for (let attempt = 1; ; attempt++) {
+      let up = null;
+      let error = null;
+      try {
+        up = await forward(body, signal);
+      } catch (e) {
+        if (signal?.aborted) throw e;
+        error = e;
+      }
+      if (up && !RETRY_STATUS.has(up.status)) return up;
+      if (attempt >= attempts) {
+        if (up) return up;
+        throw error;
+      }
+      const why = up ? `status ${up.status}` : describeError(error);
+      if (up) await up.body?.cancel().catch(() => {});
+      log({ event: 'upstream_retry', attempt, why });
+      egressCheck.reset?.(); // the tunnel may have just dropped: re-verify before resending
+      await sleep((cfg.retryDelayMs ?? 0) * attempt);
+      if (signal?.aborted) throw error ?? new Error('client closed');
+      if (!(await egressReady(signal))) {
+        const e = new Error('Venice egress via Mullvad could not be verified after an upstream failure; request not resent');
+        e.code = 'egress_unverified';
+        throw e;
+      }
+    }
   }
 
   async function chat(req, res) {
@@ -82,7 +140,16 @@ export function createProxy({ cfg, venice, ledger, clientToken, log = () => {}, 
     }
     const price = prices[body.model];
     if (!price) return err(res, 400, 'model_not_allowed', `model ${body.model} is not enabled on this proxy (${cfg.models.join(', ')})`);
-    if (!(await egressCheck())) return err(res, 503, 'egress_unverified', 'Venice egress via Mullvad could not be verified; request not sent');
+    // Aborts the upstream call (and any wait) when the client goes away.
+    const ac = new AbortController();
+    res.on('close', () => {
+      if (!res.writableFinished) ac.abort();
+    });
+    if (!(await egressReady(ac.signal))) {
+      if (ac.signal.aborted) return;
+      log({ event: 'egress_refused', waitedMs: cfg.egressWaitMs ?? 0 });
+      return err(res, 503, 'egress_unverified', 'Venice egress via Mullvad could not be verified; request not sent');
+    }
 
     let est;
     let slot;
@@ -110,7 +177,7 @@ export function createProxy({ cfg, venice, ledger, clientToken, log = () => {}, 
     let status = 0;
     let requestId = null;
     try {
-      let up = await forward(body);
+      let up = await forwardWithRetry(body, ac.signal);
       if (up.status === 402 && cfg.autoTopUp) {
         const info = await up.json().catch(() => ({}));
         if (info.reason === 'insufficient_balance' || info.code === 'PAYMENT_REQUIRED') {
@@ -120,7 +187,7 @@ export function createProxy({ cfg, venice, ledger, clientToken, log = () => {}, 
             log({ event: 'topup_failed', error: String(e.message).slice(0, 300) });
             return err(res, 402, e.code || 'topup_failed', `Venice credit is low and top-up failed: ${e.message}`);
           }
-          up = await forward(body);
+          up = await forwardWithRetry(body, ac.signal);
         } else {
           return err(res, 402, 'payment_required', String(info.error || 'Venice returned 402').slice(0, 300));
         }
@@ -160,9 +227,15 @@ export function createProxy({ cfg, venice, ledger, clientToken, log = () => {}, 
       }
       res.end();
     } catch (e) {
-      log({ event: 'proxy_error', error: String(e.message).slice(0, 300) });
-      if (!res.headersSent) err(res, 502, 'upstream_failed', e.message);
-      else res.end();
+      if (ac.signal.aborted) {
+        log({ event: 'client_closed', streamed: res.headersSent });
+      } else {
+        log({ event: 'proxy_error', error: describeError(e).slice(0, 300), streamed: res.headersSent });
+        if (!res.headersSent) {
+          if (e.code === 'egress_unverified') err(res, 503, 'egress_unverified', e.message);
+          else err(res, 502, 'upstream_failed', describeError(e));
+        } else res.end();
+      }
     } finally {
       releaseSlot();
       ledger.release(slot);
@@ -207,17 +280,31 @@ export function createProxy({ cfg, venice, ledger, clientToken, log = () => {}, 
 }
 
 // Async (no event-loop stall for streams in flight); concurrent callers share one run.
-export function defaultEgressCheck(cfg) {
+// Failures are logged with the check's own reason (VENICE_EGRESS_VERBOSE=1).
+// reset() drops a cached success, e.g. after an upstream connection failure.
+export function defaultEgressCheck(cfg, log = () => {}) {
   let okUntil = 0;
   let running = null;
   const run = () =>
     new Promise((resolve) => {
-      const p = spawn('/bin/zsh', ['-c', cfg.egressCheck], { stdio: 'ignore' });
+      const p = spawn('/bin/zsh', ['-c', cfg.egressCheck], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env, VENICE_EGRESS_VERBOSE: '1' },
+      });
+      let out = '';
+      const take = (d) => (out = (out + d).slice(-2000));
+      p.stdout.on('data', take);
+      p.stderr.on('data', take);
       const t = setTimeout(() => p.kill('SIGKILL'), 30_000);
-      p.on('error', () => (clearTimeout(t), resolve(false)));
-      p.on('exit', (code) => (clearTimeout(t), resolve(code === 0)));
+      const done = (ok, why) => {
+        clearTimeout(t);
+        if (!ok) log({ event: 'egress_failed', reason: why || out.trim().split('\n').filter((l) => /FAIL/.test(l)).join('; ').slice(0, 300) || out.trim().slice(-300) });
+        resolve(ok);
+      };
+      p.on('error', (e) => done(false, `spawn: ${e.message}`));
+      p.on('close', (code, sig) => done(code === 0, sig ? `killed ${sig}` : undefined));
     });
-  return async () => {
+  const check = async () => {
     if (!cfg.egressCheck) return true;
     if (Date.now() < okUntil) return true;
     running ??= run().finally(() => (running = null));
@@ -225,4 +312,8 @@ export function defaultEgressCheck(cfg) {
     if (ok) okUntil = Date.now() + cfg.egressCheckTtlMs;
     return ok;
   };
+  check.reset = () => {
+    okUntil = 0;
+  };
+  return check;
 }

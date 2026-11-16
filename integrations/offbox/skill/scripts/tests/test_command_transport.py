@@ -41,8 +41,9 @@ class TransportTests(unittest.TestCase):
             self.assertEqual(p.returncode, 4, p.stderr)
             self.assertEqual((root / '.offbox/exit/run-file.rc').read_text().strip(), '4')
 
-    def test_small_command_is_byte_for_byte_unchanged(self):
-        cmd, path = runs.command_payload('echo SMALL_OK', 'run-small')
+    def test_home_small_command_is_byte_for_byte_unchanged(self):
+        with patch.object(api, 'BACKEND', 'server'):
+            cmd, path = runs.command_payload('echo SMALL_OK', 'run-small')
         self.assertIsNone(path)
         self.assertEqual(hashlib.sha256(cmd.encode()).hexdigest(),
                          '57a000e386d39504da3da2f562440825ae44ad9f0d8b05d98c58c7f9138baeba')

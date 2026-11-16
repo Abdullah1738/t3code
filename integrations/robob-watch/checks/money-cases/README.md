@@ -125,6 +125,14 @@ Inbox triage runs every card alert it sees through the same checks before its cl
 
 ## Install or update
 
+Marketplace coverage comes from `marketplace-placements.json`, refreshed outside the check's budget. To prime it after installation, run the installed reader with the account-reader Python:
+
+```sh
+~/.local/share/uv/tools/mitmproxy/bin/python -I -B ~/.local/share/robob-watch/watchers/money-cases/order_lookup.py refresh-marketplace --data ~/Documents/assistant/money-cases --budget 180
+```
+
+The command prints counts and a result. `end_of_history` means the full cursor chain and every placement were read. Checks launch a detached refresh once the snapshot is ten minutes old; simultaneous refreshes exit `busy`. An incomplete snapshot cannot prove absence. A charge whose match window ends after the snapshot's walk began stays limited as `marketplace_stale`; a placement near an order not proven delivered stays limited as `marketplace_hold`.
+
 From this directory run `/usr/bin/python3 -B install.py`. It copies the named source files into `~/.local/share/robob-watch/watchers/money-cases/`, links `~/.local/bin/money-cases` to the live `cases.py` and registers `watcher.json` (paused while it holds `check.lock`, resumed afterwards). It keeps the case data, `pings.json`, the lock inode and the live pause state and session. Until the resume succeeds, the intended pause state is kept in `.install-paused`, so a rerun finishes a failed resume; `install.lock` keeps a second install out until the first has resumed. No service restart is needed.
 
 This package lives under `checks/` because `integrations/deploy.zsh robob-watch` excludes the live `watchers/` tree.

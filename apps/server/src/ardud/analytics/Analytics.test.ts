@@ -114,11 +114,10 @@ describe("Analytics", () => {
       }
       yield* analytics.record(event({ boardId, kind: "kanban.review_verdict" }));
       const cached = yield* analytics.read({ day, boardId, limit: 100 });
-      assert.sameMembers(cached.samples.slice(0, 3).map((row) => row.kind), [
-        "kanban.card_move",
-        "kanban.queue_depth",
-        "kanban.review_verdict",
-      ]);
+      assert.sameMembers(
+        cached.samples.slice(0, 3).map((row) => row.kind),
+        ["kanban.card_move", "kanban.queue_depth", "kanban.review_verdict"],
+      );
       assert.equal(cached.samples.filter((row) => row.kind === "kanban.queue_depth").length, 50);
       assert.isUndefined(cached.rollup.kindCounts["performance.long-task"]);
       assert.equal(cached.rollup.total, 153);
@@ -155,24 +154,29 @@ describe("Analytics", () => {
       }).pipe(Effect.provide(NodeServices.layer)),
   );
 
-  it.effect("keeps equal-timestamp mixed samples ordered across cached appends and cold reads", () =>
-    Effect.gen(function* () {
-      const setup = yield* fixture;
-      const analytics = yield* open(setup);
-      const boardId = "board-a";
-      for (const [kind, cardId] of [
-        ["kanban.card_move", "a1"],
-        ["kanban.queue_depth", "b1"],
-        ["kanban.queue_depth", "b2"],
-      ] as const)
-        yield* analytics.record(event({ boardId, kind, cardId }));
-      yield* analytics.read({ day, boardId });
-      yield* analytics.record(event({ boardId, kind: "kanban.card_move", cardId: "a2" }));
-      const warm = yield* analytics.read({ day, boardId });
-      const cold = yield* (yield* open(setup)).read({ day, boardId });
-      assert.deepEqual(warm.samples.map((row) => row.cardId), ["a2", "b2", "b1", "a1"]);
-      assert.deepEqual(warm.samples, cold.samples);
-    }).pipe(Effect.provide(NodeServices.layer)),
+  it.effect(
+    "keeps equal-timestamp mixed samples ordered across cached appends and cold reads",
+    () =>
+      Effect.gen(function* () {
+        const setup = yield* fixture;
+        const analytics = yield* open(setup);
+        const boardId = "board-a";
+        for (const [kind, cardId] of [
+          ["kanban.card_move", "a1"],
+          ["kanban.queue_depth", "b1"],
+          ["kanban.queue_depth", "b2"],
+        ] as const)
+          yield* analytics.record(event({ boardId, kind, cardId }));
+        yield* analytics.read({ day, boardId });
+        yield* analytics.record(event({ boardId, kind: "kanban.card_move", cardId: "a2" }));
+        const warm = yield* analytics.read({ day, boardId });
+        const cold = yield* (yield* open(setup)).read({ day, boardId });
+        assert.deepEqual(
+          warm.samples.map((row) => row.cardId),
+          ["a2", "b2", "b1", "a1"],
+        );
+        assert.deepEqual(warm.samples, cold.samples);
+      }).pipe(Effect.provide(NodeServices.layer)),
   );
 
   it.effect(
@@ -281,9 +285,7 @@ describe("Analytics", () => {
         }),
       );
       const board = yield* analytics.read({ day, boardId: "a" });
-      assert.deepEqual(board.rollup.boards[0]?.moves, [
-        { from: "todo", to: "working", count: 1 },
-      ]);
+      assert.deepEqual(board.rollup.boards[0]?.moves, [{ from: "todo", to: "working", count: 1 }]);
       assert.equal(board.rollup.tickPhases?.[0]?.p95Ms, 90);
       assert.equal(board.rollup.boards[0]?.timeInStage[0]?.p95Ms, 60_000);
       const result = yield* analytics.read({
@@ -459,7 +461,7 @@ describe("Analytics", () => {
     Effect.gen(function* () {
       const setup = yield* fixture;
       const sql = yield* SqlClient.SqlClient;
-      yield* sql`CREATE TABLE ardud_kanban_cards (id TEXT, board_id TEXT, json TEXT)`;
+      yield* sql`CREATE TABLE ardud_kanban_cards (id TEXT, board_id TEXT, number INTEGER, json TEXT)`;
       const variants = [
         { kind: "draft", draft: { target: "private", format: "text", text: "private draft" } },
         { kind: "approve", respond: { verdict: {} } },
@@ -490,7 +492,7 @@ describe("Analytics", () => {
         },
         ...fields,
       }));
-      yield* sql`INSERT INTO ardud_kanban_cards VALUES ('card', 'board', ${JSON.stringify({ asks })})`;
+      yield* sql`INSERT INTO ardud_kanban_cards VALUES ('card', 'board', 4336, ${JSON.stringify({ asks })})`;
       const analytics = yield* open(setup, {}, setup.fs, {
         sql,
         ready: Effect.void,
@@ -511,95 +513,101 @@ describe("Analytics", () => {
       assert.isFalse(JSON.stringify(result).includes("private"));
     }).pipe(Effect.provide(Layer.merge(NodeServices.layer, Sqlite.layerMemory))),
   );
-  it.effect(
-    "reads the ask split by board/card while persisting the full day without text",
-    () =>
-      Effect.gen(function* () {
-        const setup = yield* fixture;
-        const sql = yield* SqlClient.SqlClient;
-        yield* sql`CREATE TABLE ardud_kanban_cards (id TEXT, board_id TEXT, json TEXT)`;
-        const ask = {
-          id: "q1",
-          text: "private question",
-          at: `${day}T01:00:00.000Z`,
-          blocking: true,
-          closedAt: `${day}T03:00:00.000Z`,
-          answer: {
-            at: `${day}T03:00:00.000Z`,
-            by: { _tag: "owner" },
-            verdict: "approved",
-            text: "private answer",
-          },
-          timing: {
-            kind: "approve",
-            notified: { telegram: `${day}T01:10:00.000Z` },
-            firstSeen: { web: `${day}T02:00:00.000Z`, mobile: `${day}T02:30:00.000Z` },
-          },
-        };
-        for (const [cardId, boardId] of [
-          ["card-a", "board-a"],
-          ["card-b", "board-a"],
-          ["card-c", "board-b"],
-        ])
-          yield* sql`INSERT INTO ardud_kanban_cards VALUES (${cardId}, ${boardId}, ${JSON.stringify({ asks: [ask] })})`;
-        const boards = { sql, ready: Effect.void, path: ":memory:" };
-        let scans = 0;
-        const tracked = FileSystem.FileSystem.of({
-          ...setup.fs,
-          stream: (file, options) => {
-            if (file.endsWith(".ndjson")) scans++;
-            return setup.fs.stream(file, options);
-          },
-        });
-        const analytics = yield* open(setup, {}, tracked, boards);
-        yield* analytics.record(event());
-        yield* analytics.ingest({
-          events: [event({ kind: "ask.answered" }), event({ kind: "ask.seen" })],
-        });
-        yield* analytics.record(event({ kind: "server.rpc", surface: "server", route: "rpc" }));
-        const result = yield* analytics.read({ day, boardId: "board-a" });
-        assert.equal(result.rollup.askLatency.createdToAnswered.count, 2);
-        assert.equal(result.rollup.askLatency.sentToSeen.p50Ms, 50 * 60_000);
-        assert.equal(result.rollup.askLatency.seenToAnswered.p50Ms, 60 * 60_000);
-        assert.equal(result.rollup.askLatency.source, "stored-asks");
-        assert.equal((yield* analytics.read({ day })).rollup.askLatency.createdToAnswered.count, 3);
-        for (const [filter, count] of [
-          [{ cardId: "card-a" }, 1],
-          [{ boardId: "board-a", cardId: "card-a" }, 1],
-          [{ boardId: "board-b", cardId: "card-a" }, 0],
-          [{ cardId: "missing" }, 0],
-        ] as const) {
-          const filtered = yield* analytics.read({ day, ...filter });
-          assert.equal(filtered.rollup.askLatency.createdToAnswered.count, count);
-          const persisted = JSON.parse(
-            yield* setup.fs.readFileString(`${setup.directory}/rollup-${day}.json`),
-          ) as AnalyticsRollup;
-          assert.equal(persisted.askLatency.createdToAnswered.count, 3);
-        }
-        assert.lengthOf(result.samples, 0);
-        assert.isFalse(JSON.stringify(result).includes("private"));
-        const before = scans;
-        const updated = {
-          ...ask,
-          timing: {
-            ...ask.timing,
-            firstSeen: { web: `${day}T01:30:00.000Z` },
-          },
-        };
-        yield* sql`UPDATE ardud_kanban_cards SET json = ${JSON.stringify({ asks: [updated] })} WHERE board_id = 'board-a'`;
-        const warm = yield* analytics.read({ day, boardId: "board-a" });
-        assert.equal(scans, before);
-        assert.equal(warm.rollup.askLatency.sentToSeen.p50Ms, 20 * 60_000);
-        assert.equal(warm.rollup.askLatency.seenToAnswered.p50Ms, 90 * 60_000);
-        const cold = yield* open(setup, {}, setup.fs, boards);
-        assert.deepEqual((yield* cold.read({ day, boardId: "board-a" })).rollup, warm.rollup);
+  it.effect("reads the ask split by board/card while persisting the full day without text", () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`CREATE TABLE ardud_kanban_cards (id TEXT, board_id TEXT, number INTEGER, json TEXT)`;
+      const ask = {
+        id: "q1",
+        text: "private question",
+        at: `${day}T01:00:00.000Z`,
+        blocking: true,
+        closedAt: `${day}T03:00:00.000Z`,
+        answer: {
+          at: `${day}T03:00:00.000Z`,
+          by: { _tag: "owner" },
+          verdict: "approved",
+          text: "private answer",
+        },
+        timing: {
+          kind: "approve",
+          notified: { telegram: `${day}T01:10:00.000Z` },
+          firstSeen: { web: `${day}T02:00:00.000Z`, mobile: `${day}T02:30:00.000Z` },
+        },
+      };
+      for (const [cardId, boardId, number] of [
+        ["card-a", "board-a", 4336],
+        ["card-b", "board-a", 4339],
+        ["card-c", "board-b", 4336],
+      ])
+        yield* sql`INSERT INTO ardud_kanban_cards VALUES (${cardId}, ${boardId}, ${number}, ${JSON.stringify({ asks: [ask] })})`;
+      const boards = { sql, ready: Effect.void, path: ":memory:" };
+      let scans = 0;
+      const tracked = FileSystem.FileSystem.of({
+        ...setup.fs,
+        stream: (file, options) => {
+          if (file.endsWith(".ndjson")) scans++;
+          return setup.fs.stream(file, options);
+        },
+      });
+      const analytics = yield* open(setup, {}, tracked, boards);
+      yield* analytics.record(event());
+      yield* analytics.ingest({
+        events: [event({ kind: "ask.answered" }), event({ kind: "ask.seen" })],
+      });
+      yield* analytics.record(event({ kind: "server.rpc", surface: "server", route: "rpc" }));
+      const result = yield* analytics.read({ day, boardId: "board-a" });
+      assert.equal(result.rollup.askLatency.createdToAnswered.count, 2);
+      assert.equal(result.rollup.askLatency.sentToSeen.p50Ms, 50 * 60_000);
+      assert.equal(result.rollup.askLatency.seenToAnswered.p50Ms, 60 * 60_000);
+      assert.equal(result.rollup.askLatency.source, "stored-asks");
+      assert.equal((yield* analytics.read({ day })).rollup.askLatency.createdToAnswered.count, 3);
+      for (const [filter, count] of [
+        [{ cardId: "card-a" }, 1],
+        [{ boardId: "board-a", cardId: "card-a" }, 1],
+        [{ boardId: "board-b", cardId: "card-a" }, 0],
+        [{ cardId: "missing" }, 0],
+        [{ cardNumber: 4336 }, 2],
+        [{ cardNumber: 4339 }, 1],
+        [{ cardNumber: 9999 }, 0],
+        [{ boardId: "board-a", cardNumber: 4336 }, 1],
+        [{ boardId: "board-b", cardNumber: 4339 }, 0],
+        [{ cardId: "card-b", cardNumber: 4336 }, 0],
+      ] as const) {
+        const filtered = yield* analytics.read({ day, ...filter });
+        assert.equal(filtered.rollup.askLatency.createdToAnswered.count, count);
+        const section = yield* analytics.read({ day, ...filter, section: "askLatency" });
+        assert.deepEqual(section.rows, [{ path: [], value: filtered.rollup.askLatency }]);
         const persisted = JSON.parse(
           yield* setup.fs.readFileString(`${setup.directory}/rollup-${day}.json`),
         ) as AnalyticsRollup;
         assert.equal(persisted.askLatency.createdToAnswered.count, 3);
-        assert.equal(persisted.askLatency.sentToSeen.p50Ms, 20 * 60_000);
-        assert.isFalse(JSON.stringify(persisted).includes("private"));
-      }).pipe(Effect.provide(Sqlite.layerMemory.pipe(Layer.provideMerge(NodeServices.layer)))),
+      }
+      assert.lengthOf(result.samples, 0);
+      assert.isFalse(JSON.stringify(result).includes("private"));
+      const before = scans;
+      const updated = {
+        ...ask,
+        timing: {
+          ...ask.timing,
+          firstSeen: { web: `${day}T01:30:00.000Z` },
+        },
+      };
+      yield* sql`UPDATE ardud_kanban_cards SET json = ${JSON.stringify({ asks: [updated] })} WHERE board_id = 'board-a'`;
+      const warm = yield* analytics.read({ day, boardId: "board-a" });
+      assert.equal(scans, before);
+      assert.equal(warm.rollup.askLatency.sentToSeen.p50Ms, 20 * 60_000);
+      assert.equal(warm.rollup.askLatency.seenToAnswered.p50Ms, 90 * 60_000);
+      const cold = yield* open(setup, {}, setup.fs, boards);
+      assert.deepEqual((yield* cold.read({ day, boardId: "board-a" })).rollup, warm.rollup);
+      const persisted = JSON.parse(
+        yield* setup.fs.readFileString(`${setup.directory}/rollup-${day}.json`),
+      ) as AnalyticsRollup;
+      assert.equal(persisted.askLatency.createdToAnswered.count, 3);
+      assert.equal(persisted.askLatency.sentToSeen.p50Ms, 20 * 60_000);
+      assert.isFalse(JSON.stringify(persisted).includes("private"));
+    }).pipe(Effect.provide(Sqlite.layerMemory.pipe(Layer.provideMerge(NodeServices.layer)))),
   );
   it.effect(
     "filters MCP samples and rollups by tool and outcome while persisting the full day",
@@ -670,6 +678,104 @@ describe("Analytics", () => {
         const cold = yield* open(setup);
         assert.deepEqual((yield* cold.read(filter)).samples, dropped.samples);
       }).pipe(Effect.provide(NodeServices.layer)),
+  );
+  it.effect("rolls up task lookup reasons and recovery paths through analytics_read", () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const analytics = yield* open(setup);
+      const lookups = [
+        {
+          foundBy: "none",
+          notFoundReason: "non_canonical_id",
+          idCanonical: false,
+          saved: "unknown",
+        },
+        {
+          foundBy: "none",
+          notFoundReason: "non_canonical_id",
+          idCanonical: false,
+          saved: "unknown",
+        },
+        { foundBy: "none", notFoundReason: "never_saved", idCanonical: true, saved: false },
+        { foundBy: "receipt", notFoundReason: "accepted", idCanonical: true, saved: true },
+        { foundBy: "request_key_recovery", idCanonical: false, saved: true },
+        { foundBy: "subagents", idCanonical: true, saved: true },
+      ] as const;
+      for (const { saved, ...props } of lookups)
+        yield* analytics.record(
+          event({
+            kind: "mcp.call",
+            surface: "server",
+            tool: "task_status",
+            saved,
+            outcome: "notFoundReason" in props ? "error" : "ok",
+            ...("notFoundReason" in props ? { errorTag: "task_not_found" } : {}),
+            props: { ...props, idShape: "task_id" },
+          }),
+        );
+      // Older rows have no lookup metadata and must not acquire an invented reason.
+      for (const idShape of ["thread_id", "child_thread_id", "empty", "other"] as const)
+        yield* analytics.record(
+          event({
+            kind: "mcp.call",
+            surface: "server",
+            tool: "task_status",
+            saved: "unknown",
+            outcome: "error",
+            errorTag: idShape === "empty" ? "invalid_request" : "task_not_found",
+            props: {
+              idShape,
+              ...(idShape === "empty"
+                ? {}
+                : {
+                    foundBy: "none",
+                    notFoundReason: "not_a_delegation_id",
+                    idCanonical: false,
+                  }),
+            },
+          }),
+        );
+      yield* analytics.record(
+        event({ kind: "mcp.call", surface: "server", tool: "task_status", outcome: "ok" }),
+      );
+      const input = { day, kind: "mcp.call", tool: "task_status" };
+      const result = yield* analytics.read(input);
+      assert.deepInclude(result.rollup.mcpCalls[0], {
+        count: 11,
+        savedCounts: { unknown: 7, false: 1, true: 3 },
+        notFoundReasons: {
+          non_canonical_id: 2,
+          never_saved: 1,
+          accepted: 1,
+          not_a_delegation_id: 3,
+        },
+        foundByCounts: { none: 6, receipt: 1, request_key_recovery: 1, subagents: 1 },
+        idShapeCounts: { task_id: 6, thread_id: 1, child_thread_id: 1, empty: 1, other: 1 },
+      });
+      const filtered = yield* analytics.read({ ...input, outcome: "error" });
+      assert.deepInclude(filtered.rollup.mcpCalls[0], {
+        count: 8,
+        notFoundReasons: {
+          non_canonical_id: 2,
+          never_saved: 1,
+          accepted: 1,
+          not_a_delegation_id: 3,
+        },
+        foundByCounts: { none: 6, receipt: 1 },
+        idShapeCounts: { task_id: 4, thread_id: 1, child_thread_id: 1, empty: 1, other: 1 },
+      });
+      const section = yield* analytics.read({ ...input, section: "mcpCalls" });
+      assert.include(JSON.stringify(section.rows), '"request_key_recovery":1');
+      const cold = yield* open(setup);
+      assert.deepEqual((yield* cold.read(input)).rollup.mcpCalls, result.rollup.mcpCalls);
+      const persisted = JSON.parse(
+        yield* setup.fs.readFileString(`${setup.directory}/rollup-${day}.json`),
+      );
+      assert.deepEqual(
+        persisted.mcpCalls[0].notFoundReasons,
+        result.rollup.mcpCalls[0]!.notFoundReasons,
+      );
+    }).pipe(Effect.provide(NodeServices.layer)),
   );
   it.effect("flushes before reads, filters samples, and atomically saves the full rollup", () =>
     Effect.gen(function* () {
@@ -1127,7 +1233,10 @@ it.effect.each(delegatedUsageCases.filter(({ name }) => name !== "maximum-key"))
       const lines = (yield* setup.fs.readFileString(`${setup.directory}/${day}.ndjson`))
         .trim()
         .split("\n");
-      assert.deepEqual(lines.map((line) => JSON.parse(line)), [row]);
+      assert.deepEqual(
+        lines.map((line) => JSON.parse(line)),
+        [row],
+      );
     }).pipe(Effect.provide(NodeServices.layer)),
 );
 
@@ -1236,6 +1345,69 @@ it.effect("keeps card usage views distinct through repeated reads and appends", 
   }).pipe(Effect.provide(NodeServices.layer)),
 );
 
+it.effect("cardNumber filters target and caller cards and keys cached views separately", () =>
+  Effect.gen(function* () {
+    const setup = yield* fixture;
+    const analytics = yield* open(setup);
+    for (const row of [
+      event({
+        kind: "mcp.call",
+        surface: "server",
+        tool: "delegate_task",
+        outcome: "timeout",
+        cardNumber: 1,
+        callerCardNumber: 4336,
+      }),
+      event({
+        kind: "mcp.call",
+        surface: "server",
+        tool: "delegate_task",
+        outcome: "ok",
+        cardNumber: 4336,
+      }),
+      event({
+        kind: "mcp.call",
+        surface: "server",
+        tool: "delegate_task",
+        outcome: "ok",
+        cardNumber: 4334,
+      }),
+    ])
+      yield* analytics.record(row);
+    assert.equal(
+      (yield* analytics.read({ day, kind: "mcp.call", tool: "delegate_task", cardNumber: 4336 }))
+        .rollup.total,
+      2,
+    );
+    assert.equal(
+      (yield* analytics.read({ day, kind: "mcp.call", tool: "delegate_task", cardNumber: 4334 }))
+        .rollup.total,
+      1,
+    );
+    const selection = {
+      day,
+      kind: "mcp.call",
+      tool: "delegate_task",
+      cardNumber: 4336,
+      section: "samples",
+      limit: 1,
+    } as const;
+    const first = yield* analytics.read(selection);
+    assert.isTrue(first.hasMore);
+    assert.equal(first.summary.events, 2);
+    const second = yield* analytics.read({ ...selection, cursor: first.cursor! });
+    assert.isFalse(second.hasMore);
+    const selected = [...first.rows!, ...second.rows!];
+    assert.lengthOf(selected, 2);
+    assert.isTrue(
+      selected.every(({ value }) => {
+        const row = value as AnalyticsEvent;
+        return row.cardNumber === 4336 || row.callerCardNumber === 4336;
+      }),
+    );
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
 it.effect("pages filtered samples from the existing view without hot-path reads", () =>
   Effect.gen(function* () {
     const setup = yield* fixture;
@@ -1335,4 +1507,65 @@ it.effect("#1490 reads persisted evaluator starts for one board and UTC day in o
       [{ boardId: "board-offbox", trigger: "report_bug", count: 1 }],
     );
   }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "correlates detached results in filtered cold and live views without widening samples",
+  () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const analytics = yield* open(setup);
+      const call = event({
+        surface: "server",
+        route: "mcp",
+        kind: "mcp.call",
+        tool: "delegate_task",
+        outcome: "timeout",
+        errorPhase: "dispatch",
+        clientRequestId: "a".repeat(64),
+        durationMs: 10000,
+        boardId: "robob",
+        cardNumber: 1559,
+      });
+      yield* analytics.record(call);
+      const input = {
+        day,
+        kind: "mcp.call",
+        tool: "delegate_task",
+        outcome: "timeout",
+        boardId: "robob",
+        cardNumber: 1559,
+      } as const;
+      const before = yield* analytics.read(input);
+      assert.equal(before.rollup.mcpCalls[0]!.dispatchTimeouts!.noOutcome, 1);
+      // Correlation follows the original selected call even if the result has no board attribution.
+      yield* analytics.record(
+        event({
+          surface: "server",
+          route: "mcp",
+          kind: "mcp.detached",
+          tool: "delegate_task",
+          outcome: "committed",
+          clientRequestId: "a".repeat(64),
+          startedAt: ts,
+          ts: `${day}T12:00:15.000Z`,
+          lateMs: 5000,
+        }),
+      );
+      const warm = yield* analytics.read(input);
+      assert.deepEqual(warm.rollup.mcpCalls[0]!.dispatchTimeouts, {
+        committed: 1,
+        failed: 0,
+        capped: 0,
+        noOutcome: 0,
+      });
+      assert.deepEqual(warm.samples, [call]);
+      assert.equal(warm.rollup.total, 1);
+      assert.deepEqual(warm.rollup.kindCounts, { "mcp.call": 1 });
+      const cold = yield* open(setup);
+      assert.deepEqual((yield* cold.read(input)).rollup.mcpCalls, warm.rollup.mcpCalls);
+      const section = yield* analytics.read({ ...input, section: "mcpCalls" });
+      assert.include(JSON.stringify(section.rows), '"committed":1');
+      assert.isBelow(JSON.stringify(section).length, 50000);
+    }).pipe(Effect.provide(NodeServices.layer)),
 );

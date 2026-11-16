@@ -32,8 +32,12 @@ interface McpGroup {
   durations: Durations;
   preHandler: Durations;
   failures: number;
+  dispatchTimeouts: number;
   outcomes: Map<string, number>;
   savedCounts: Map<string, number>;
+  notFoundReasons: Map<string, number>;
+  foundByCounts: Map<string, number>;
+  idShapeCounts: Map<string, number>;
   errors: Map<
     string,
     { errorTag: string; errorPhase: NonNullable<AnalyticsEvent["errorPhase"]>; count: number }
@@ -43,6 +47,23 @@ interface RetryAttempt {
   ts: string;
   group: string;
   ok: boolean;
+  detachedKey?: string;
+}
+
+interface DetachedResult {
+  ts: string;
+  outcome: "committed" | "failed" | "capped";
+  afterCap: boolean;
+}
+
+function detachedKey(event: AnalyticsEvent, startedAt: string) {
+  return JSON.stringify([
+    event.tool,
+    event.clientRequestId,
+    event.ts.slice(0, 10),
+    startedAt,
+    event.bootId ?? "unknown",
+  ]);
 }
 
 interface Breakdown {
@@ -50,6 +71,24 @@ interface Breakdown {
   durations: Durations;
   count: number;
   totalWaitMs: number;
+  byReason: Map<string, number>;
+  byRole: Map<string, number>;
+  byCallerReaderLane: Map<string, number>;
+  replyPhases: Map<string, Durations>;
+  writePhases: Map<string, Durations>;
+  contexts: Map<
+    string,
+    {
+      errorTag: string;
+      denyReason: string;
+      callerRole: string;
+      cardStage: string;
+      count: number;
+      durations: Durations;
+      replyPhases: Map<string, Durations>;
+      writePhases: Map<string, Durations>;
+    }
+  >;
 }
 
 // Fixed cardinality, including overflow. Keep all overflowing measurements, not just their count.
@@ -57,6 +96,7 @@ function breakdown(
   groups: Map<string, Breakdown>,
   labels: Breakdown["labels"],
   event: AnalyticsEvent,
+  phases = false,
 ) {
   const identity = JSON.stringify(labels);
   let key = identity;
@@ -90,8 +130,62 @@ function breakdown(
       durations: durations(),
       count: 0,
       totalWaitMs: 0,
+      byReason: new Map(),
+      byRole: new Map(),
+      byCallerReaderLane: new Map(),
+      replyPhases: new Map(),
+      writePhases: new Map(),
+      contexts: new Map(),
     };
     groups.set(key, group);
+  }
+  if (event.kind === "mcp.call") {
+    const reason = event.denyReason ?? "unknown";
+    const role = event.callerRole ?? "none";
+    group.byReason.set(reason, (group.byReason.get(reason) ?? 0) + 1);
+    group.byRole.set(role, (group.byRole.get(role) ?? 0) + 1);
+    const callerLane = event.callerReaderLane ?? event.readerLane ?? "unknown";
+    group.byCallerReaderLane.set(callerLane, (group.byCallerReaderLane.get(callerLane) ?? 0) + 1);
+    const cardStage = event.cardStage ?? "unknown";
+    const errorTag = event.errorTag ?? event.props?.code ?? "unknown";
+    const identity = JSON.stringify([errorTag, reason, role, cardStage]);
+    const key = group.contexts.has(identity) || group.contexts.size < MAX_GROUPS ? identity : OTHER;
+    let context = group.contexts.get(key);
+    if (!context) {
+      context = {
+        errorTag: key === OTHER ? "other" : errorTag,
+        denyReason: key === OTHER ? "other" : reason,
+        callerRole: key === OTHER ? "other" : role,
+        cardStage: key === OTHER ? "other" : cardStage,
+        count: 0,
+        durations: durations(),
+        replyPhases: new Map(),
+        writePhases: new Map(),
+      };
+      group.contexts.set(key, context);
+    }
+    context.count++;
+    if (event.durationMs !== undefined) addDuration(context.durations, event.durationMs);
+    if (phases && (event.errorTag === "reply_timeout" || event.props?.code === "reply_timeout")) {
+      for (const [phase, ms] of Object.entries(event.writePhases ?? {})) {
+        for (const phases of [group.writePhases, context.writePhases]) {
+          let times = phases.get(phase);
+          if (!times) phases.set(phase, (times = durations()));
+          addDuration(times, ms);
+        }
+      }
+    }
+
+    if (phases && (event.errorTag === "reply_timeout" || event.props?.code === "reply_timeout")) {
+      for (const [phase, ms] of Object.entries(event.replyPhases ?? {})) {
+        if (ms === undefined) continue;
+        for (const phases of [group.replyPhases, context.replyPhases]) {
+          let values = phases.get(phase);
+          if (!values) phases.set(phase, (values = durations()));
+          addDuration(values, ms);
+        }
+      }
+    }
   }
   group.count++;
   if (event.durationMs !== undefined) addDuration(group.durations, event.durationMs);
@@ -102,6 +196,29 @@ function finishBreakdown(groups: Map<string, Breakdown>) {
   return [...groups.values()]
     .map((group) => ({
       labels: group.labels,
+      byReason: Object.fromEntries(group.byReason),
+      byRole: Object.fromEntries(group.byRole),
+      byCallerReaderLane: Object.fromEntries(group.byCallerReaderLane),
+      replyPhases: Object.fromEntries(
+        [...group.replyPhases].map(([phase, times]) => [phase, summarize(times)]),
+      ),
+      writePhases: Object.fromEntries(
+        [...group.writePhases].map(([phase, times]) => [phase, summarize(times)]),
+      ),
+      contexts: [...group.contexts.values()].map((context) => ({
+        errorTag: context.errorTag,
+        denyReason: context.denyReason,
+        callerRole: context.callerRole,
+        cardStage: context.cardStage,
+        ...summarize(context.durations),
+        count: context.count,
+        replyPhases: Object.fromEntries(
+          [...context.replyPhases].map(([phase, times]) => [phase, summarize(times)]),
+        ),
+        writePhases: Object.fromEntries(
+          [...context.writePhases].map(([phase, times]) => [phase, summarize(times)]),
+        ),
+      })),
       ...summarize(group.durations),
       count: group.count,
       totalWaitMs: group.totalWaitMs,
@@ -145,6 +262,7 @@ export const makeAccumulator = () => ({
     }
   >(),
   mcpCodes: new Map<string, Breakdown>(),
+  mcpReplyTimeouts: new Map<string, Breakdown>(),
   dbSpans: new Map<string, Breakdown>(),
   rpcs: new Map<string, Durations & { totalWaitMs: number; outcomes: Map<string, number> }>(),
   longTasks: new Map<
@@ -178,7 +296,9 @@ export const makeAccumulator = () => ({
   mcp: new Map<string, McpGroup>(),
   retries: new Map<string, RetryAttempt[]>(),
   retryAttempts: 0,
-  mcpOverflow: { groups: 0, retryAttempts: 0 },
+  detached: new Map<string, DetachedResult[]>(),
+  detachedOutcomes: 0,
+  mcpOverflow: { groups: 0, retryAttempts: 0, detachedOutcomes: 0 },
 });
 
 function boundedKey<T>(groups: Map<string, T>, key: string): string {
@@ -396,7 +516,26 @@ function boardAccumulate(target: ReturnType<typeof makeAccumulator>, event: Anal
 export function accumulate(
   target: ReturnType<typeof makeAccumulator>,
   event: AnalyticsEvent,
+  correlationOnly = false,
 ): void {
+  if (
+    event.kind === "mcp.detached" &&
+    event.tool &&
+    event.clientRequestId &&
+    event.startedAt &&
+    (event.outcome === "committed" || event.outcome === "failed" || event.outcome === "capped")
+  ) {
+    if (target.detachedOutcomes >= 100_000) target.mcpOverflow.detachedOutcomes++;
+    else {
+      const key = detachedKey(event, event.startedAt);
+      const results = target.detached.get(key) ?? [];
+      results.push({ ts: event.ts, outcome: event.outcome, afterCap: event.afterCap === true });
+      target.detached.set(key, results);
+      target.detachedOutcomes++;
+    }
+  }
+  // Related follow-ups inform a filtered call view without becoming selected events or samples.
+  if (correlationOnly) return;
   boardAccumulate(target, event);
   target.total++;
   if ("runId" in event) accumulateUsage(target.usage, event);
@@ -491,6 +630,14 @@ export function accumulate(
       { tool: event.tool ?? "unknown", code: event.props?.code ?? event.errorTag ?? "unknown" },
       event,
     );
+    if (event.errorTag === "reply_timeout" || event.props?.code === "reply_timeout") {
+      breakdown(
+        target.mcpReplyTimeouts,
+        { tool: event.tool ?? "unknown", code: "reply_timeout" },
+        event,
+        true,
+      );
+    }
   }
   if (event.kind === "db.slow") {
     breakdown(
@@ -654,16 +801,26 @@ export function accumulate(
         durations: durations(),
         preHandler: durations(),
         failures: 0,
+        dispatchTimeouts: 0,
         outcomes: new Map(),
         savedCounts: new Map(),
+        notFoundReasons: new Map(),
+        foundByCounts: new Map(),
+        idShapeCounts: new Map(),
         errors: new Map(),
       };
       target.mcp.set(key, group);
     }
     addDuration(group.durations, event.durationMs ?? 0);
+    const dispatchTimeout = event.outcome === "timeout" && event.errorPhase === "dispatch";
+    if (dispatchTimeout) group.dispatchTimeouts++;
     if (event.preHandlerMs !== undefined) addDuration(group.preHandler, event.preHandlerMs);
     increment(group.outcomes, event.outcome);
     increment(group.savedCounts, String(event.saved ?? "unknown"));
+    if (event.props?.notFoundReason !== undefined)
+      increment(group.notFoundReasons, event.props.notFoundReason);
+    if (event.props?.foundBy !== undefined) increment(group.foundByCounts, event.props.foundBy);
+    if (event.props?.idShape !== undefined) increment(group.idShapeCounts, event.props.idShape);
     if (event.outcome !== "ok") {
       group.failures++;
       const errorTag = event.errorTag ?? "unknown";
@@ -686,7 +843,14 @@ export function accumulate(
           event.clientRequestId,
         ]);
         const attempts = target.retries.get(identity) ?? [];
-        attempts.push({ ts: event.ts, group: key, ok: event.outcome === "ok" });
+        attempts.push({
+          ts: event.ts,
+          group: key,
+          ok: event.outcome === "ok",
+          ...(dispatchTimeout
+            ? { detachedKey: detachedKey(event, event.startedAt ?? event.ts) }
+            : {}),
+        });
         target.retries.set(identity, attempts);
         target.retryAttempts++;
       }
@@ -758,9 +922,47 @@ export function finishRollup(
   generatedAt: string,
 ): AnalyticsRollup {
   const retries = new Map<string, { failedThenRetried: number; retrySucceeded: number }>();
+  const detached = new Map<string, DetachedResult[]>();
+  const matchedDetached = new Map<string, number>();
+  for (const [key, events] of target.detached) {
+    const results: DetachedResult[] = [];
+    const caps: number[] = [];
+    let nextCap = 0;
+    for (const event of events.toSorted((a, b) => a.ts.localeCompare(b.ts))) {
+      // A masked commit can settle after its cap; it replaces that observation, not another call.
+      const capped = event.afterCap ? caps[nextCap++] : undefined;
+      if (capped !== undefined) results[capped] = event;
+      else {
+        if (event.outcome === "capped") caps.push(results.length);
+        results.push(event);
+      }
+    }
+    detached.set(key, results);
+  }
+  const dispatchTimeouts = new Map<
+    string,
+    { committed: number; failed: number; capped: number; noOutcome: number }
+  >();
+  for (const [key, group] of target.mcp)
+    dispatchTimeouts.set(key, {
+      committed: 0,
+      failed: 0,
+      capped: 0,
+      noOutcome: group.dispatchTimeouts,
+    });
   for (const attempts of target.retries.values()) {
     // Detached emission and overlapping calls can arrive out of order, including across segments.
     const ordered = attempts.toSorted((a, b) => a.ts.localeCompare(b.ts));
+    for (const attempt of ordered) {
+      if (attempt.detachedKey === undefined) continue;
+      const index = matchedDetached.get(attempt.detachedKey) ?? 0;
+      const result = detached.get(attempt.detachedKey)?.[index];
+      if (result === undefined) continue;
+      matchedDetached.set(attempt.detachedKey, index + 1);
+      const counts = dispatchTimeouts.get(attempt.group)!;
+      counts.noOutcome--;
+      counts[result.outcome]++;
+    }
     for (let index = 1; index < ordered.length; index++) {
       const previous = ordered[index - 1]!;
       if (previous.ok) continue;
@@ -770,6 +972,7 @@ export function finishRollup(
       retries.set(previous.group, count);
     }
   }
+  const mcp = finishBreakdown(target.mcpCodes);
   return {
     day,
     generatedAt,
@@ -810,7 +1013,7 @@ export function finishRollup(
       maxMs: row.maxMs,
       approximate: row.approximate,
     })),
-    mcpErrorsByCode: finishBreakdown(target.mcpCodes).map((row) => ({
+    mcpErrorsByCode: mcp.map((row) => ({
       tool: String(row.labels.tool),
       code: String(row.labels.code),
       count: row.count,
@@ -819,6 +1022,52 @@ export function finishRollup(
       maxMs: row.maxMs,
       approximate: row.approximate,
     })),
+    mcpFailureBreakdown: mcp.map((row) => ({
+      tool: String(row.labels.tool),
+      code: String(row.labels.code),
+      count: row.count,
+      p50Ms: row.p50Ms,
+      p95Ms: row.p95Ms,
+      maxMs: row.maxMs,
+      approximate: row.approximate,
+      byReason: row.byReason,
+      byRole: row.byRole,
+      byCallerReaderLane: row.byCallerReaderLane,
+    })),
+    mcpFailureContexts: mcp.flatMap((row) =>
+      row.contexts.map(
+        ({
+          errorTag,
+          denyReason,
+          callerRole,
+          cardStage,
+          count,
+          p50Ms,
+          p95Ms,
+          maxMs,
+          approximate,
+        }) => ({
+          tool: String(row.labels.tool),
+          code: String(row.labels.code),
+          errorTag,
+          denyReason,
+          callerRole,
+          cardStage,
+          count,
+          p50Ms,
+          p95Ms,
+          maxMs,
+          approximate,
+        }),
+      ),
+    ),
+    mcpReplyTimeouts: finishBreakdown(target.mcpReplyTimeouts).flatMap((row) =>
+      row.contexts.map((context) => ({
+        tool: String(row.labels.tool),
+        code: "reply_timeout" as const,
+        ...context,
+      })),
+    ),
     dbSlowBySpan: finishBreakdown(target.dbSpans).map((row) => ({
       span: String(row.labels.span),
       key: String(row.labels.key),
@@ -924,6 +1173,10 @@ export function finishRollup(
         failureRate: group.failures / group.durations.count,
         outcomes: Object.fromEntries(group.outcomes),
         savedCounts: Object.fromEntries(group.savedCounts),
+        dispatchTimeouts: dispatchTimeouts.get(key)!,
+        notFoundReasons: Object.fromEntries(group.notFoundReasons),
+        foundByCounts: Object.fromEntries(group.foundByCounts),
+        idShapeCounts: Object.fromEntries(group.idShapeCounts),
         errors: [...group.errors.values()],
         ...(retries.get(key) ?? { failedThenRetried: 0, retrySucceeded: 0 }),
       }))

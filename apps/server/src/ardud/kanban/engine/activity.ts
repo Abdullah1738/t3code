@@ -9,6 +9,7 @@ import {
   kanbanWithoutWait,
   kanbanWithoutDeciding,
   kanbanRetryNotBefore,
+  kanbanAskKind,
   KANBAN_DECIDE_MS,
   type KanbanBoard,
   type KanbanCard,
@@ -45,7 +46,8 @@ const OLD_ASK_MS = 6 * 60 * 60 * 1000;
 const EVALUATOR_STARTS_LISTED = 2;
 /** Rows per rollup list at most; lists shrink together until the rollup fits ROLLUP_CHARS. */
 const LIST_MAX = 150;
-const ROLLUP_CHARS = 55_000;
+// Leave room for the tool's activity/boardId wrapper inside the 50,000-character reply.
+const ROLLUP_CHARS = 49_000;
 
 export interface ActivityWindow {
   readonly since: string;
@@ -122,6 +124,7 @@ const endsStall = (event: KanbanCardEvent) =>
 
 /** When the owner answered: the typed answer's time; plain asks keep only closedAt and count as closed. */
 const answeredAt = (ask: KanbanOwnerAsk): string | null => ask.answer?.at ?? null;
+const isNotice = (ask: Pick<KanbanOwnerAsk, "kind">) => ask.kind === "notice";
 
 const askTouched = (ask: KanbanOwnerAsk, window: ActivityWindow) =>
   ask.closedAt === null ||
@@ -161,6 +164,7 @@ const askRow = (ask: KanbanOwnerAsk, until: string) => {
   const end = answered ?? (ask.closedAt === null ? until : null);
   return {
     id: ask.id,
+    ...(ask.kind !== undefined ? { kind: ask.kind } : {}),
     askedAt: stamp(ask.at),
     ...(answered !== null ? { answeredAt: stamp(answered) } : {}),
     ...(ask.closedAt !== null && answered === null ? { closedAt: stamp(ask.closedAt) } : {}),
@@ -242,13 +246,17 @@ export const pageRows = <R extends { readonly number: number }>(
   after: number,
   limit: number,
   maxChars = COMPACT_READ_CHARS,
+  fitRow?: (row: R, maxChars: number) => R,
 ) => {
   const out: Array<R> = [];
   let chars = 0;
   const rest = rows.filter((row) => row.number > after);
-  for (const row of rest) {
-    const size = JSON.stringify(row).length + 1;
-    if (out.length >= limit || (out.length > 0 && chars + size > maxChars)) break;
+  for (const source of rest) {
+    if (out.length >= limit) break;
+    const sourceSize = JSON.stringify(source).length + 1;
+    const row = fitRow && sourceSize > maxChars ? fitRow(source, maxChars) : source;
+    const size = row === source ? sourceSize : JSON.stringify(row).length + 1;
+    if (out.length > 0 && chars + size > maxChars) break;
     out.push(row);
     chars += size;
   }
@@ -268,11 +276,13 @@ export const pageRowsInReply = <R extends { readonly number: number }, Reply>(
     page: ReadonlyArray<R>,
     cursor: { readonly hasMore: boolean; readonly nextAfter: number | null },
   ) => Reply,
+  fitRow?: (row: R, maxChars: number) => R,
 ): Reply => {
   const wrapper = JSON.stringify(
     reply([], { hasMore: true, nextAfter: Number.MAX_SAFE_INTEGER }),
   ).length;
-  const page = pageRows(rows, after, limit, COMPACT_READ_CHARS - wrapper);
+  const maxChars = COMPACT_READ_CHARS - wrapper;
+  const page = pageRows(rows, after, limit, maxChars, fitRow);
   return reply(page.rows, { hasMore: page.hasMore, nextAfter: page.nextAfter });
 };
 
@@ -405,12 +415,28 @@ const waitIntervals = (
 const percentile = (sorted: ReadonlyArray<number>, p: number) =>
   sorted.length === 0 ? null : sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))]!;
 
+const answerSummary = (minutes: ReadonlyArray<number>) => {
+  const sorted = minutes.toSorted((left, right) => left - right);
+  return {
+    count: sorted.length,
+    p50: percentile(sorted, 0.5),
+    p90: percentile(sorted, 0.9),
+    max: sorted.at(-1) ?? null,
+  };
+};
+
 const capped = <T>(items: ReadonlyArray<T>, max: number) =>
   items.length > max ? { items: items.slice(0, max), more: items.length - max } : { items };
 
 export interface RollupInput {
   readonly window: ActivityWindow;
-  readonly board?: Pick<KanbanBoard, "pause" | "setup" | "archivedAt"> | null;
+  readonly board?: KanbanBoard | Pick<KanbanBoard, "pause" | "setup" | "archivedAt"> | null;
+  readonly dispatchCards?: ReadonlyArray<KanbanCard>;
+  readonly holds?: ReadonlyMap<string, string>;
+  readonly dispatchPools?: ReadonlyArray<KanbanPool>;
+  readonly reviews?: ReadonlyMap<string, Rules.ReviewEvidence>;
+  readonly workThreadHomes?: ReadonlyMap<string, KanbanCard | null>;
+  readonly assignmentWakeRetries?: ReadonlyMap<string, Rules.AssignmentWakeRetry>;
   readonly cards: ReadonlyArray<KanbanCard>;
   readonly events: ReadonlyArray<KanbanCardEvent>;
   readonly threads: ReadonlyArray<KanbanThreadLink>;
@@ -713,12 +739,15 @@ export const rollup = (input: RollupInput) => {
     list.sort((left, right) => left.startedAt.localeCompare(right.startedAt));
 
   type AskItem = ReturnType<typeof askRow> & { readonly card: number };
-  // Asks answered in the window are all listed; the rest (open, closed without
-  // an answer) are listed newest first and cut first when the rollup is long.
+  // Prefer keeping every answered ask; the rest put open decisions first,
+  // then newest first, and are cut first when the rollup is long.
   const answeredItems: Array<AskItem> = [];
   const otherAsks: Array<AskItem> = [];
   const answeredMinutes: Array<number> = [];
+  const minutesByKind = new Map<string, Array<number>>();
+  const minutesByBlocking = { blocking: [] as Array<number>, async: [] as Array<number> };
   let open = 0;
+  let openNotices = 0;
   let closedNoAnswer = 0;
   for (const card of active) {
     for (const ask of card.asks) {
@@ -728,12 +757,20 @@ export const rollup = (input: RollupInput) => {
       const answered = answeredAt(ask);
       if (answered !== null && inWindow(answered, window)) {
         answeredItems.push(row);
-        answeredMinutes.push(row.minutes ?? 0);
+        const minutes = row.minutes ?? 0;
+        answeredMinutes.push(minutes);
+        const kind = kanbanAskKind(ask);
+        const bucket = minutesByKind.get(kind);
+        if (bucket) bucket.push(minutes);
+        else minutesByKind.set(kind, [minutes]);
+        minutesByBlocking[ask.blocking ? "blocking" : "async"].push(minutes);
         continue;
       }
       otherAsks.push(row);
-      if (ask.closedAt === null) open++;
-      else if (answered === null && inWindow(ask.closedAt, window)) closedNoAnswer++;
+      if (ask.closedAt === null) {
+        if (isNotice(ask)) openNotices++;
+        else open++;
+      } else if (answered === null && inWindow(ask.closedAt, window)) closedNoAnswer++;
     }
   }
   answeredItems.sort(
@@ -741,9 +778,20 @@ export const rollup = (input: RollupInput) => {
       (left.answeredAt ?? "").localeCompare(right.answeredAt ?? "") || left.card - right.card,
   );
   otherAsks.sort(
-    (left, right) => right.askedAt.localeCompare(left.askedAt) || left.card - right.card,
+    (left, right) =>
+      Number(right.open === true && !isNotice(right)) -
+        Number(left.open === true && !isNotice(left)) ||
+      right.askedAt.localeCompare(left.askedAt) ||
+      left.card - right.card,
   );
   answeredMinutes.sort((left, right) => left - right);
+  const kindSummaries = [...minutesByKind].map(
+    ([kind, minutes]) => [kind, answerSummary(minutes)] as const,
+  );
+  const answerMinutesByBlocking = {
+    blocking: answerSummary(minutesByBlocking.blocking),
+    async: answerSummary(minutesByBlocking.async),
+  };
 
   const reviewCards: Array<{
     card: number;
@@ -969,10 +1017,15 @@ export const rollup = (input: RollupInput) => {
     hours: number;
     blocking?: true;
   }> = [];
+  let noticesOver6h = 0;
   for (const card of input.cards) {
     if (card.settledAt !== null) continue;
-    for (const ask of card.asks)
-      if (ask.closedAt === null && time(until) - time(ask.at) > OLD_ASK_MS)
+    for (const ask of card.asks) {
+      if (ask.closedAt === null && time(until) - time(ask.at) > OLD_ASK_MS) {
+        if (isNotice(ask)) {
+          noticesOver6h++;
+          continue;
+        }
         oldAsks.push({
           card: card.number,
           ask: ask.id,
@@ -980,10 +1033,34 @@ export const rollup = (input: RollupInput) => {
           hours: hours(time(until) - time(ask.at)),
           ...(ask.blocking ? { blocking: true as const } : {}),
         });
+      }
+    }
   }
   oldAsks.sort((left, right) => right.hours - left.hours || left.card - right.card);
 
-  const build = (max: number) => ({
+  const queued =
+    input.board && "reviewChains" in input.board
+      ? Rules.dispatchQueueStatus(
+          input.board,
+          input.dispatchCards ?? input.cards,
+          input.dispatchPools ?? input.pools,
+          input.holds,
+          time(until),
+          input.reviews,
+          input.workThreadHomes,
+          input.assignmentWakeRetries,
+        ).toSorted((a, b) => b.hours - a.hours || a.card - b.card)
+      : [];
+  const queuedByReason: Record<string, number> = {};
+  for (const row of queued) queuedByReason[row.reason] = (queuedByReason[row.reason] ?? 0) + 1;
+  const stageStartByNumber = new Map(
+    input.cards.map((card) => [card.number, time(card.analyticsStageEnteredAt ?? card.movedAt)]),
+  );
+  const queuedOver6h = queued.filter(
+    (row) => time(until) - stageStartByNumber.get(row.card)! > 6 * HOUR,
+  );
+
+  const build = (max: number, answeredMax: number, kindMax: number) => ({
     window: { since: window.since, until },
     cards: {
       active: active.length,
@@ -992,15 +1069,25 @@ export const rollup = (input: RollupInput) => {
     asks: {
       answered: answeredMinutes.length,
       open,
+      openNotices,
       closedWithoutAnswer: closedNoAnswer,
       answerMinutes: {
         p50: percentile(answeredMinutes, 0.5),
         p90: percentile(answeredMinutes, 0.9),
         max: answeredMinutes.at(-1) ?? null,
       },
-      answeredItems,
+      answerMinutesByKind: Object.fromEntries(capped(kindSummaries, kindMax).items),
+      ...(kindMax < kindSummaries.length
+        ? { answerMinutesByKindMore: kindSummaries.length - kindMax }
+        : {}),
+      answerMinutesByBlocking,
+      answeredItems: capped(answeredItems, answeredMax).items,
+      ...(answeredMax < answeredItems.length
+        ? { answeredItemsMore: answeredItems.length - answeredMax }
+        : {}),
       others: capped(otherAsks, max),
       openOver6h: { count: oldAsks.length, ...capped(oldAsks, max) },
+      noticesOver6h: { count: noticesOver6h },
     },
     reviews: {
       rounds: reviewCards.reduce((sum, row) => sum + row.rounds, 0),
@@ -1013,6 +1100,8 @@ export const rollup = (input: RollupInput) => {
       longest,
       openOver24h: { count: longOpen.length, byStage: longOpenByStage, ...capped(longOpen, max) },
       withoutThread: { count: idle.length, ...capped(idle, max) },
+      queued: { count: queued.length, byReason: queuedByReason, ...capped(queued, max) },
+      queuedOver6h: { count: queuedOver6h.length, ...capped(queuedOver6h, max) },
       inReviewNoThreadWithEvaluatorStepsOnly: {
         count: evaluatorOnly.length,
         ...capped(evaluatorOnly, max),
@@ -1039,11 +1128,20 @@ export const rollup = (input: RollupInput) => {
     pools: poolUsage,
   });
   let max = LIST_MAX;
-  let result = build(max);
-  // A busy window shortens every list alike (counts stay exact) so one call never overflows.
-  while (max > 10 && JSON.stringify(result).length > ROLLUP_CHARS) {
+  let answeredMax = answeredItems.length;
+  let kindMax = kindSummaries.length;
+  let result = build(max, answeredMax, kindMax);
+  // Long IDs can make the answered rows alone exceed the budget. Trim them
+  // only after the other lists shrink; all counts and latency samples stay exact.
+  while (
+    (max > 0 || answeredMax > 0 || kindMax > 0) &&
+    JSON.stringify(result).length > ROLLUP_CHARS
+  ) {
+    // Custom kind names are unrestricted; even their aggregate map can be oversized.
+    if (max === 0 && answeredMax === 0) kindMax = Math.floor(kindMax * 0.7);
+    if (max <= 10) answeredMax = Math.floor(answeredMax * 0.7);
     max = Math.floor(max * 0.7);
-    result = build(max);
+    result = build(max, answeredMax, kindMax);
   }
   return result;
 };

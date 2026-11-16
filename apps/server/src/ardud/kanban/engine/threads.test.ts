@@ -4,6 +4,8 @@ import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Queue from "effect/Queue";
+import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
 import type * as Statement from "effect/sql/Statement";
 import {
@@ -16,6 +18,8 @@ import {
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderThreadId,
+  ProviderTurnId,
   RunId,
   RuntimeRequestId,
   NodeId,
@@ -32,12 +36,17 @@ import * as Option from "effect/Option";
 import * as Result from "effect/Result";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
+import { derivePendingBackgroundWork } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
+
 import * as Sqlite from "../../../persistence/Sqlite.ts";
 import * as CommandReceipts from "../../../persistence/OrchestrationCommandReceipts.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
 import { CodexProviderCapabilitiesV2 } from "../../../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as CommandReceiptStore from "../../../orchestration-v2/CommandReceiptStore.ts";
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
+import * as EffectWorker from "../../../orchestration-v2/EffectWorker.ts";
+import * as EventSink from "../../../orchestration-v2/EventSink.ts";
+import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
 import * as ProjectionStore from "../../../orchestration-v2/ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "../../../orchestration-v2/ProviderAdapterRegistry.ts";
 import * as ProviderReplayHarness from "../../../orchestration-v2/testkit/ProviderReplayHarness.ts";
@@ -129,18 +138,61 @@ describe("viewStateOf", () => {
 });
 
 describe("backgroundWorkOf", () => {
-  it("counts subagents and background tasks, not commands or pull-request watches", () => {
+  it("counts commands alongside subagents and tasks, with PR watches counted separately", () => {
     expect(
       backgroundWorkOf({
         pendingBackgroundTasks: [
           { taskId: "a", kind: "subagent" },
           { taskId: "b", kind: "background_task" },
           { taskId: "c", kind: "command" },
+          { taskId: "d", kind: "monitor" },
           { taskId: "pull-request-watch:github.com/x/y#1", kind: "monitor" },
         ],
       }),
-    ).toBe(2);
+    ).toBe(4);
   });
+
+  it.each([
+    "pending",
+    "running",
+    "waiting",
+    "completed",
+    "failed",
+    "cancelled",
+    "interrupted",
+  ] as const)("counts a Codex shell item only while active: %s", (status) => {
+    const pendingBackgroundTasks = derivePendingBackgroundWork({
+      latestRun: { id: RunId.make("parent"), ordinal: 1, status: "completed" },
+      providerThreads: [],
+      turnItems: [{ id: "shell", type: "command_execution", title: "Check", status }],
+    });
+    expect(backgroundWorkOf({ pendingBackgroundTasks })).toBe(
+      status === "pending" || status === "running" || status === "waiting" ? 1 : 0,
+    );
+  });
+
+  it.each(["command", "background_task", "monitor"] as const)(
+    "counts a Claude %s until the provider removes it from its roster",
+    (kind) => {
+      const pendingBackgroundTasks = derivePendingBackgroundWork({
+        latestRun: { id: RunId.make("parent"), ordinal: 1, status: "completed" },
+        providerThreads: [
+          {
+            id: ProviderThreadId.make("claude"),
+            pendingBackgroundTasks: [{ taskId: "bash-or-task", kind }],
+          },
+        ],
+        turnItems: [],
+      });
+      expect(backgroundWorkOf({ pendingBackgroundTasks })).toBe(1);
+      const ended = derivePendingBackgroundWork({
+        latestRun: { id: RunId.make("parent"), ordinal: 1, status: "completed" },
+        providerThreads: [{ id: ProviderThreadId.make("claude"), pendingBackgroundTasks: [] }],
+        turnItems: [],
+      });
+      expect(backgroundWorkOf({ pendingBackgroundTasks: ended })).toBe(0);
+    },
+  );
 
   it("is zero for an empty roster", () => {
     expect(backgroundWorkOf({ pendingBackgroundTasks: [] })).toBe(0);
@@ -149,6 +201,41 @@ describe("backgroundWorkOf", () => {
   it("is zero when the roster is missing (older shells)", () => {
     expect(backgroundWorkOf({})).toBe(0);
   });
+});
+
+it.effect.each([
+  { type: "run_interrupt_request", status: "completed", time: "before", expected: false },
+  { type: "run_interrupt_request", status: "completed", time: "after", expected: true },
+  { type: "command_execution", status: "interrupted", time: "after", expected: true },
+  { type: "dynamic_tool", status: "cancelled", time: "after", expected: true },
+  { type: "subagent", status: "cancelled", time: "after", expected: true },
+  { type: "command_execution", status: "completed", time: "after", expected: false },
+  { type: "command_execution", status: "failed", time: "after", expected: false },
+] as const)("background recovery respects $type $status $time the worker stopped", (row) => {
+  const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+    getThreadRecords: (_, __, filter) =>
+      Effect.succeed({
+        turnItems:
+          filter?.turnItemTypes?.includes(row.type) &&
+          (filter.turnItemStatuses === undefined || filter.turnItemStatuses.includes(row.status))
+            ? [{ updatedAt: at(row.time === "before" ? QUESTION_AT : SHARED_UPDATED) }]
+            : [],
+      } as never),
+  });
+  return Effect.gen(function* () {
+    const threads = yield* KanbanThreads;
+    expect(
+      yield* threads.backgroundStoppedSince(ThreadId.make("stopped-background"), FINISHED_AT),
+    ).toBe(row.expected);
+  }).pipe(
+    Effect.provide(
+      layer.pipe(
+        Layer.provide(management),
+        Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+        Layer.provide(Sqlite.layerMemory),
+      ),
+    ),
+  );
 });
 
 describe("prWatchesOf", () => {
@@ -367,6 +454,7 @@ it.effect.each(
     Effect.gen(function* () {
       const threadId = ThreadId.make("restored-thread");
       const stopped: Array<string | undefined> = [];
+      const sources: Array<string | undefined> = [];
       const cancelled: Array<string> = [];
       let restoredRunning = true;
       let oldCancelled = false;
@@ -397,6 +485,7 @@ it.effect.each(
         interruptThread: (input) =>
           Effect.sync(() => {
             stopped.push(input.runId);
+            sources.push(input.cancelReason);
             if (input.runId === undefined || input.runId === "restored-run")
               restoredRunning = false;
           }).pipe(
@@ -416,6 +505,7 @@ it.effect.each(
             if (input.type === "thread.stop") restoredRunning = false;
             if (input.type === "queued-run.cancel") {
               cancelled.push(input.runId);
+              sources.push(input.reason);
               if (input.runId === "old-run") oldCancelled = true;
             }
             return { storedEvents: [] } as never;
@@ -425,10 +515,25 @@ it.effect.each(
         const threads = yield* KanbanThreads;
         if (mode === "run") {
           yield* threads.cancelQueued(threadId, "old-run");
-          yield* threads.interrupt(threadId, "Late archived send", false, "old-run");
+          yield* threads.interrupt(
+            threadId,
+            "Late archived send",
+            false,
+            "old-run",
+            undefined,
+            "superseded",
+          );
         } else
-          yield* threads.interrupt(threadId, "Late archived send", false, undefined, messageId);
+          yield* threads.interrupt(
+            threadId,
+            "Late archived send",
+            false,
+            undefined,
+            messageId,
+            "superseded",
+          );
         expect(restoredRunning).toBe(true);
+        expect(sources.every((source) => source === "superseded")).toBe(true);
         expect(stopped).toEqual(status === "missing" && mode !== "run" ? [] : ["old-run"]);
         expect(cancelled).toEqual(status === "queued" ? ["old-run"] : []);
       }).pipe(
@@ -1731,17 +1836,26 @@ it.effect("#1490 observes accepted deliveries once and does not block on boards 
   }).pipe(Effect.provide(dependencies));
 });
 
-it.effect.each([
-  "preparing",
-  "queued",
-  "shared queued",
-  "shared active",
-  "shared completed",
-  "shared failed",
-  "shared interrupted",
-] as const)(
-  "#566 stopping an abandoned %s launch prevents its pending turn from starting",
-  (state) => {
+it.effect.each(
+  (
+    [
+      "preparing",
+      "queued",
+      "shared queued",
+      "shared active",
+      "shared completed",
+      "shared failed",
+      "shared interrupted",
+    ] as const
+  ).flatMap((state) =>
+    ([undefined, "task_stalled", "superseded"] as const).map((cancelReason) => ({
+      state,
+      cancelReason,
+    })),
+  ),
+)(
+  "#566 stopping an abandoned $state launch prevents its pending turn from starting ($cancelReason)",
+  ({ state, cancelReason }) => {
     const db = Sqlite.layerMemory;
     const instanceId = ProviderInstanceId.make("codex");
     const projectId = ProjectId.make("project:abandoned");
@@ -1818,9 +1932,19 @@ it.effect.each([
         expect(after.at(-1)?.status).toBe(state === "shared queued" ? "cancelled" : "queued");
         return;
       }
-      yield* threads.interrupt(threadId, "Abandoned launch", true);
+      yield* threads.interrupt(
+        threadId,
+        "Abandoned launch",
+        true,
+        undefined,
+        undefined,
+        cancelReason,
+      );
       const after = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs;
       expect(after.every((run) => ["cancelled", "interrupted"].includes(run.status))).toBe(true);
+      expect(after.map((run) => run.cancelReason)).toEqual(
+        after.map(() => cancelReason ?? "card_stop"),
+      );
       yield* orchestrator.dispatch({
         type: "queue.resume",
         commandId: CommandId.make("abandon:resume"),
@@ -2694,12 +2818,12 @@ it.effect.each(["sql", "memory"] as const)(
         lastActivityAt: progress,
       } satisfies OrchestrationV2Run;
       yield* projections.apply({
-        id: EventId.make("child-progress"),
+        id: EventId.make("child-start"),
         type: "run.updated",
         threadId: childId,
         runId: childRun.id,
-        occurredAt: progress,
-        payload: childRun,
+        occurredAt: quiet,
+        payload: { ...childRun, lastActivityAt: quiet },
       });
       const task = {
         id: NodeId.make("child-task"),
@@ -2750,11 +2874,44 @@ it.effect.each(["sql", "memory"] as const)(
       });
       yield* Effect.gen(function* () {
         const threads = yield* KanbanThreads;
+        parent.pendingBackgroundTasks = [
+          ...parent.pendingBackgroundTasks!,
+          { taskId: "native-command", kind: "command" },
+        ];
+        const nativeHold = yield* threads.find(parentId);
+        expect(nativeHold?.backgroundWork).toBe(2);
+        expect(nativeHold?.backgroundWorkUntil).toBe("2026-11-15T01:00:00.000Z");
+        expect(waitingOnBackground(nativeHold!, Date.parse("2026-11-15T00:59:00Z"))).toBe(true);
+        expect(waitingOnBackground(nativeHold!, Date.parse("2026-11-15T01:00:00Z"))).toBe(false);
+        parent.pendingBackgroundTasks = parent.pendingBackgroundTasks?.filter(
+          (job) => job.taskId !== "native-command",
+        );
+        yield* projections.apply({
+          id: EventId.make("child-progress"),
+          type: "run.updated",
+          threadId: childId,
+          occurredAt: progress,
+          payload: childRun,
+        });
         const live = yield* threads.find(parentId);
         expect(live?.backgroundWork).toBe(1);
         expect(live?.backgroundWorkUntil).toBe("2026-11-15T01:25:00.000Z");
         expect(waitingOnBackground(live!, Date.parse("2026-11-15T01:15:00Z"))).toBe(true);
         expect(waitingOnBackground(live!, Date.parse("2026-11-15T01:25:00Z"))).toBe(false);
+        parent.pendingBackgroundTasks = [
+          ...parent.pendingBackgroundTasks!,
+          { taskId: "native-command", kind: "command" },
+        ];
+        const mixed = yield* threads.find(parentId);
+        expect(mixed?.backgroundWork).toBe(2);
+        expect(mixed?.backgroundJobs?.map((job) => job.taskId)).toEqual([
+          "child-task",
+          "native-command",
+        ]);
+        expect(mixed?.backgroundWorkUntil).toBe("2026-11-15T01:25:00.000Z");
+        parent.pendingBackgroundTasks = parent.pendingBackgroundTasks?.filter(
+          (job) => job.taskId !== "native-command",
+        );
         for (const [index, idleTimeoutMs, expected] of [
           [0, undefined, "2026-11-15T02:10:00.000Z"],
           [1, 0, "2026-11-15T02:10:00.000Z"],
@@ -2988,6 +3145,31 @@ it.effect.each(["sql", "memory"] as const)(
           pendingBackgroundTasksOnly: true,
         });
         expect(records.subagents[0]?.result).toBe("FINAL proof passed: exit 0");
+        yield* projections.apply({
+          id: EventId.make("task:without-child-thread"),
+          type: "subagent.updated",
+          threadId: parentId,
+          occurredAt: finished,
+          payload: { ...final, childThreadId: null },
+        });
+        expect(
+          (yield* projections.getThreadRecords(parentId, ["subagents"], {
+            pendingBackgroundTasksOnly: true,
+          })).subagents,
+        ).toHaveLength(1);
+        expect(
+          (yield* projections.getThreadRecords(parentId, ["subagents"], {
+            pendingBackgroundTasksOnly: true,
+            subagentsWithChildThreadOnly: true,
+          })).subagents,
+        ).toEqual([]);
+        yield* projections.apply({
+          id: EventId.make("task:restore-child-thread"),
+          type: "subagent.updated",
+          threadId: parentId,
+          occurredAt: finished,
+          payload: final,
+        });
         for (const state of ["claimed", "acknowledged", "delivered", "disposed"] as const) {
           yield* projections.apply({
             id: EventId.make(`task:${state}`),
@@ -3295,5 +3477,224 @@ it.effect.each(["sql", "memory"] as const)(
           ? ProjectionStore.layer.pipe(Layer.provide(Sqlite.layerMemory))
           : ProjectionStore.layerMemory,
       ),
+    ),
+);
+
+it.effect.each([
+  "missing",
+  "rejected",
+  "accepted",
+  "accepted retry",
+  "wrong command",
+  "wrong aggregate",
+] as const)("#1561 durable send lookup reconciles $0 receipts without a live thread", (form) =>
+  Effect.gen(function* () {
+    const receipts = yield* CommandReceipts.OrchestrationCommandReceiptRepository;
+    if (form !== "missing") {
+      const status =
+        form === "rejected" || form === "accepted retry"
+          ? ("rejected" as const)
+          : ("accepted" as const);
+      const receipt = {
+        commandId: CommandId.make("kanban:send:durable-key"),
+        aggregateKind: form === "wrong aggregate" ? ("project" as const) : ("thread" as const),
+        aggregateId:
+          form === "wrong aggregate"
+            ? ProjectId.make("original-recipient")
+            : ThreadId.make("original-recipient"),
+        commandType: form === "wrong command" ? "run.interrupt" : "message.dispatch",
+        acceptedAt: QUESTION_AT,
+        resultSequence: 1,
+        status,
+        error: status === "rejected" ? "rejected" : null,
+      };
+      yield* receipts.insertIfAbsent(receipt);
+      if (form === "accepted retry")
+        yield* receipts.insertIfAbsent({
+          ...receipt,
+          commandId: CommandId.make("kanban:send:durable-key:retry:1"),
+          status: "accepted",
+          error: null,
+        });
+    }
+    const threads = yield* KanbanThreads;
+    const found = yield* Effect.result(threads.acceptedSend!("durable-key"));
+    expect(Result.isSuccess(found)).toBe(!form.startsWith("wrong"));
+    if (Result.isSuccess(found))
+      expect(found.success).toBe(form.startsWith("accepted") ? "original-recipient" : null);
+  }).pipe(
+    Effect.provide(
+      layer.pipe(
+        Layer.provide(Layer.mock(ThreadManagementService.ThreadManagementService)({})),
+        Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+        Layer.provideMerge(CommandReceipts.layer),
+        Layer.provide(Sqlite.layerMemory),
+      ),
+    ),
+  ),
+);
+
+it.effect.each([false, true])(
+  "card_thread delivery persists exact text on an idle or running thread (running=%s)",
+  (running) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const db = Sqlite.layerMemory;
+        const instanceId = ProviderInstanceId.make("codex");
+        const driver = ProviderDriverKind.make("codex");
+        const projectId = ProjectId.make("project:card-thread-text");
+        const threadId = ThreadId.make("thread:card-thread-text");
+        const model = { instanceId, model: "gpt-5.1-codex" };
+        const cwd = yield* checkpointWorkspace("kanban-card-thread-text");
+        const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+        const received: string[] = [];
+        const adapter: ProviderAdapter.ProviderAdapterV2["Service"] = {
+          instanceId,
+          driver,
+          getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
+          planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" }),
+          openSession: (input) =>
+            Effect.gen(function* () {
+              const now = yield* DateTime.now;
+              return {
+                instanceId,
+                driver,
+                providerSessionId: input.providerSessionId,
+                providerSession: {
+                  id: input.providerSessionId,
+                  driver,
+                  providerInstanceId: instanceId,
+                  status: "ready",
+                  cwd,
+                  model: model.model,
+                  capabilities: CodexProviderCapabilitiesV2,
+                  createdAt: now,
+                  updatedAt: now,
+                  lastError: null,
+                },
+                events: Stream.fromQueue(events),
+                ensureThread: ({ threadId }) =>
+                  Effect.succeed({
+                    id: ProviderThreadId.make(`provider-thread:${threadId}`),
+                    driver,
+                    providerInstanceId: instanceId,
+                    providerSessionId: input.providerSessionId,
+                    appThreadId: threadId,
+                    ownerNodeId: null,
+                    nativeThreadRef: { driver, nativeId: "native-thread", strength: "strong" },
+                    nativeConversationHeadRef: null,
+                    status: "idle",
+                    firstRunOrdinal: null,
+                    lastRunOrdinal: null,
+                    handoffIds: [],
+                    forkedFrom: null,
+                    createdAt: now,
+                    updatedAt: now,
+                  }),
+                resumeThread: ({ providerThread }) => Effect.succeed(providerThread),
+                startTurn: (turn) =>
+                  Effect.gen(function* () {
+                    received.push(turn.message.text);
+                    yield* Queue.offer(events, {
+                      type: "provider_turn.updated",
+                      driver,
+                      providerTurn: {
+                        id: ProviderTurnId.make(`provider-turn:${turn.attemptId}`),
+                        providerThreadId: turn.providerThread.id,
+                        nodeId: turn.rootNodeId,
+                        runAttemptId: turn.attemptId,
+                        nativeTurnRef: { driver, nativeId: "native-turn", strength: "strong" },
+                        ordinal: turn.providerTurnOrdinal,
+                        status: "running",
+                        startedAt: now,
+                        completedAt: null,
+                      },
+                    });
+                  }),
+                steerTurn: (input) =>
+                  Effect.sync(() => {
+                    received.push(input.message.text);
+                  }),
+                interruptTurn: () => Effect.void,
+                respondToRuntimeRequest: () => Effect.die("unused"),
+                readThreadSnapshot: () => Effect.die("unused"),
+                rollbackThread: () => Effect.die("unused"),
+                forkThread: () => Effect.die("unused"),
+              };
+            }),
+        };
+        const runtime = ProviderReplayHarness.layerWithRegistry(
+          { name: "kanban-card-thread-text" },
+          ProviderAdapterRegistry.layerFromAdapters([adapter]),
+          { databaseLayer: db, runEffectWorker: false },
+        );
+        const receipts = CommandReceiptStore.layer.pipe(Layer.provide(db));
+        const management = ThreadManagementService.layer.pipe(
+          Layer.provideMerge(Layer.mergeAll(runtime, receipts, ServerSettings.layerTest(), db)),
+        );
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const sink = yield* EventSink.EventSinkV2;
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make("card-thread-text:create"),
+            threadId,
+            projectId,
+            title: "Card thread delivery",
+            modelSelection: model,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: cwd,
+            createdBy: "system",
+            creationSource: "server",
+          });
+          yield* Effect.gen(function* () {
+            const threads = yield* KanbanThreads;
+            if (running) {
+              const afterSequence = yield* sink.latestSequence({ threadId });
+              yield* threads.send({ threadId, text: "Initial turn", model });
+              yield* worker.drain();
+              yield* sink.stream({ threadId, afterSequence }).pipe(
+                Stream.filter(
+                  (stored) =>
+                    stored.event.type === "provider-turn.updated" &&
+                    stored.event.payload.status === "running",
+                ),
+                Stream.take(1),
+                Stream.runDrain,
+              );
+            }
+            const text = "  Keep the exact spacing.\nUse juno.  ";
+            const runId = yield* threads.send({ threadId, text, model, flushQueued: "steer" });
+            const records = yield* orchestrator.getThreadRecords(threadId, [
+              "runs",
+              "messages",
+              "turnItems",
+            ]);
+            const message = records.messages.find((entry) => entry.text === text);
+            expect(message?.text).toBe(text);
+            expect(message?.runId).toBe(runId);
+            expect(
+              records.turnItems.some(
+                (item) => item.type === "user_message" && item.messageId === message?.id,
+              ),
+            ).toBe(true);
+            expect(records.runs.find((run) => run.id === runId)?.status).not.toBe("queued");
+            expect(records.messages.filter((entry) => entry.text === text)).toHaveLength(1);
+            yield* worker.drain();
+            expect(received).toEqual(running ? ["Initial turn", text] : [text]);
+          }).pipe(Effect.provide(layer));
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              management,
+              receipts,
+              Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+            ),
+          ),
+        );
+      }),
     ),
 );

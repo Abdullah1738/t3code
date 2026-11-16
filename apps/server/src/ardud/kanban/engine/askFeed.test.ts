@@ -6,6 +6,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Statement from "effect/sql/Statement";
+import * as Tracer from "effect/Tracer";
 
 import * as Sqlite from "../../../persistence/Sqlite.ts";
 import * as KanbanStore from "../store/KanbanStore.ts";
@@ -437,4 +438,331 @@ it.effect("uses partial indexes for three asking cards among 5,100 cards, includ
     yield* sql`DELETE FROM ardud_kanban_cards WHERE id = ${card.id}`;
     assert.deepStrictEqual((yield* readAskFeed(sql, {}, AT)).open, []);
   }).pipe(Effect.provide(KanbanStore.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
+);
+
+const messageJson = (discussionId: string, seq: number, askId?: string) =>
+  JSON.stringify({
+    discussionId,
+    seq,
+    author: { _tag: "owner" },
+    authorName: "Owner",
+    blocks: [{ _tag: "md", text: `Message ${seq} ${"x".repeat(2_048)}` }],
+    answers: [],
+    createdAt: AT,
+    ...(askId === undefined ? {} : { askId }),
+  });
+
+it.effect(
+  "point-reads legacy pairs and bounds indexed ask messages with identical open/history output",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* KanbanStore.KanbanStore;
+      yield* sql`INSERT INTO ardud_kanban_boards (id, slug, json) VALUES ('board-a', 'a', '{"name":"A"}')`;
+      const asks = [
+        { id: "q1", seq: 90, firstSeq: 1, closedAt: null },
+        { id: "q2", seq: 2, firstSeq: 3, closedAt: null },
+        { id: "q3", seq: null, closedAt: "2026-11-10T09:00:00.000Z" },
+        { id: "q4", seq: 4, closedAt: "2026-11-01T09:00:00.000Z" },
+        { id: "q5", seq: null, closedAt: null },
+      ].map((ask) => ({
+        text: "Go?",
+        blocking: false,
+        by: { _tag: "owner" },
+        at: AT,
+        ...ask,
+      }));
+      const card = { ...JSON.parse(cardJson(100, "board-a")), discussionId: "discussion-a", asks };
+      yield* sql`INSERT INTO ardud_kanban_cards (id, board_id, number, stage, json)
+      VALUES (${card.id}, 'board-a', 100, 'needs_owner', ${JSON.stringify(card)})`;
+      for (let seq = 1; seq <= 150; seq++) {
+        // Edited legacy firstSeq/seq, another ask's message at a requested seq,
+        // an unrelated historical ask, and a long tagged discussion interleave.
+        const askId = seq <= 3 ? undefined : seq === 4 ? "q4" : seq % 7 === 0 ? "q3" : "q1";
+        yield* sql`INSERT INTO ardud_kanban_messages VALUES ('discussion-a', ${seq}, ${messageJson("discussion-a", seq, askId)})`;
+      }
+      // Legacy asking messages can also be later than all tagged messages.
+      yield* sql`UPDATE ardud_kanban_cards SET json = json_set(json, '$.asks[1].seq', 151)`;
+      yield* sql`INSERT INTO ardud_kanban_messages VALUES ('discussion-a', 151, ${messageJson("discussion-a", 151)})`;
+      const legacyQuery: Statement.Transformer = (statement) => {
+        const [query] = statement.compile();
+        if (!query.includes("ardud_kanban_messages_ask_marked")) return Effect.succeed(statement);
+        const pairs = JSON.stringify(
+          asks.flatMap((ask) =>
+            [ask.id === "q2" ? 151 : ask.seq, ask.firstSeq].flatMap((seq) =>
+              seq == null ? [] : [["discussion-a", seq]],
+            ),
+          ),
+        );
+        return Effect.succeed(sql`SELECT m.json FROM ardud_kanban_messages m
+        WHERE m.discussion_id = 'discussion-a'
+          AND (instr(m.json, ${'"askId":"'}) > 0 OR EXISTS (
+            SELECT 1 FROM json_each(${pairs}) wanted
+            WHERE json_extract(wanted.value, '$[0]') = m.discussion_id
+              AND json_extract(wanted.value, '$[1]') = m.seq))
+        ORDER BY m.discussion_id, m.seq`);
+      };
+      for (const closedSince of [
+        undefined,
+        "2026-11-10T09:00:00.000Z",
+        "2000-01-01T00:00:00.000Z",
+      ]) {
+        const input = { closedSince };
+        const old = yield* readAskFeed(sql, input, AT).pipe(
+          Effect.provideService(Statement.CurrentTransformer, legacyQuery),
+        );
+        const plans: Array<string> = [];
+        const observe: Statement.Transformer = (statement) => {
+          const [query, params] = statement.compile();
+          if (!query.includes("ardud_kanban_messages_ask_marked")) return Effect.succeed(statement);
+          return sql.unsafe<{ detail: string }>(`EXPLAIN QUERY PLAN ${query}`, params).pipe(
+            Effect.provideService(Statement.CurrentTransformer, undefined),
+            Effect.tap((rows) =>
+              Effect.sync(() => plans.push(rows.map((row) => row.detail).join("\n"))),
+            ),
+            Effect.as(statement),
+            Effect.orDie,
+          );
+        };
+        const spans: Array<Tracer.Span> = [];
+        const tracer = Tracer.make({
+          span: (options) => {
+            const span = new Tracer.NativeSpan(options);
+            spans.push(span);
+            return span;
+          },
+        });
+        const current = yield* readAskFeed(sql, input, AT).pipe(
+          Effect.provideService(Statement.CurrentTransformer, observe),
+          Effect.withTracer(tracer),
+        );
+        const messageSpan = spans.find((span) => span.name === "KanbanAskFeed.messages")!;
+        assert.strictEqual(messageSpan.attributes.get("discussions"), 1);
+        assert.strictEqual(
+          messageSpan.attributes.get("askedPairs"),
+          closedSince === "2000-01-01T00:00:00.000Z" ? 5 : 4,
+        );
+        assert.strictEqual(messageSpan.attributes.get("history"), closedSince !== undefined);
+        assert.isAbove(Number(messageSpan.attributes.get("rowsReturned")), 0);
+        assert.deepStrictEqual(current, old);
+        assert.strictEqual(plans.length, 1);
+        assert.notMatch(plans[0]!, /SCAN (?:m|ardud_kanban_messages)(?:$|\s)/m);
+        assert.match(plans[0]!, /SEARCH m USING INDEX sqlite_autoindex_ardud_kanban_messages_1/);
+        assert.match(plans[0]!, /USING (?:COVERING )?INDEX ardud_kanban_messages_ask_marked/);
+        assert.strictEqual(current.open[0]!.messages.length, 51);
+        assert.strictEqual(current.open[0]!.messages[0]!.seq, 1);
+        assert.deepStrictEqual(
+          current.open[1]!.messages.map((m) => m.seq),
+          [3, 151],
+        );
+        assert.deepStrictEqual(current.open[2]!.messages, []);
+      }
+      // An index update must move the message between asks without stale membership.
+      yield* sql`UPDATE ardud_kanban_messages SET json = json_set(json, '$.askId', 'q5')
+      WHERE discussion_id = 'discussion-a' AND seq = 150`;
+      assert.deepStrictEqual(
+        (yield* readAskFeed(sql, {}, AT)).open[2]!.messages.map((m) => m.seq),
+        [150],
+      );
+    }).pipe(Effect.provide(KanbanStore.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
+);
+
+it.effect(
+  "bounds production-sized message reads and selects only the newest 200 closed asks before SQL",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* KanbanStore.KanbanStore;
+      yield* sql`INSERT INTO ardud_kanban_boards (id, slug, json) VALUES ('board-a', 'a', '{"name":"A"}')`;
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          for (let number = 1; number <= 310; number++) {
+            const discussionId = `discussion-${number}`;
+            const ask = {
+              id: "q1",
+              text: "Go?",
+              blocking: false,
+              by: { _tag: "owner" },
+              at: AT,
+              seq: 1,
+              firstSeq: 1,
+              closedAt: number <= 100 ? null : "2026-11-10T09:00:00.000Z",
+            };
+            const card = {
+              ...JSON.parse(cardJson(number, "board-a")),
+              settledAt: null,
+              discussionId,
+              asks: [ask],
+            };
+            yield* sql`INSERT INTO ardud_kanban_cards (id, board_id, number, stage, json)
+          VALUES (${card.id}, 'board-a', ${number}, 'todo', ${JSON.stringify(card)})`;
+            const count = 500 + ((number - 1) % 6) * 500;
+            const body = messageJson(discussionId, 1);
+            // All messages in every tenth discussion carry askId: SQL must bound dense threads too.
+            yield* sql`WITH RECURSIVE seqs(seq) AS (SELECT 1 UNION ALL SELECT seq + 1 FROM seqs WHERE seq < ${count})
+          INSERT INTO ardud_kanban_messages
+          SELECT ${discussionId}, seq, json_set(${body}, '$.seq', seq,
+            '$.blocks[0].text', printf('%.*c', ${2_048 + (number % 4) * 1_536}, 'x'))
+          FROM seqs`;
+            yield* sql`UPDATE ardud_kanban_messages SET json = json_set(json, '$.askId', 'q1')
+          WHERE discussion_id = ${discussionId}
+            AND (seq = 1 OR seq = ${count} OR ${number % 10} = 0)`;
+          }
+        }),
+      );
+      const total = yield* sql<{
+        count: number;
+      }>`SELECT COUNT(*) AS count FROM ardud_kanban_messages`;
+      assert.isAtLeast(total[0]!.count, 525_000);
+      for (const closedSince of [
+        undefined,
+        "2026-11-10T09:00:00.000Z",
+        "1900-01-01T00:00:00.000Z",
+      ]) {
+        let returned = 0;
+        let queriedDiscussions = 0;
+        const observe: Statement.Transformer = (statement) => {
+          const [query, params] = statement.compile();
+          if (!query.includes("ardud_kanban_messages_ask_marked")) return Effect.succeed(statement);
+          const pairs = JSON.parse(String(params[1])) as Array<[string, string]>;
+          queriedDiscussions = new Set(pairs.map(([discussion]) => discussion)).size;
+          return Effect.gen(function* () {
+            const plan = yield* sql.unsafe<{ detail: string }>(
+              `EXPLAIN QUERY PLAN ${query}`,
+              params,
+            );
+            assert.notMatch(
+              plan.map((r) => r.detail).join("\n"),
+              /SCAN (?:m|ardud_kanban_messages)(?:$|\s)/m,
+            );
+            const rows = yield* sql.unsafe<{ count: number }>(
+              `SELECT COUNT(*) AS count FROM (${query})`,
+              params,
+            );
+            returned = rows[0]!.count;
+            return statement;
+          }).pipe(Effect.provideService(Statement.CurrentTransformer, undefined), Effect.orDie);
+        };
+        const start = performance.now();
+        const feed = yield* readAskFeed(sql, { closedSince }, AT).pipe(
+          Effect.provideService(Statement.CurrentTransformer, observe),
+        );
+        const discussions = closedSince === undefined ? 100 : 300;
+        assert.strictEqual(queriedDiscussions, discussions);
+        assert.strictEqual(returned, (discussions / 10) * 51 + discussions * 0.9 * 2);
+        assert.strictEqual(feed.open.length, 100);
+        assert.strictEqual(feed.closed.length, closedSince === undefined ? 0 : 200);
+        assert.deepStrictEqual(
+          feed.closed.map((item) => item.cardNumber),
+          closedSince === undefined ? [] : Array.from({ length: 200 }, (_, i) => i + 101),
+        );
+        yield* Effect.logInfo(
+          JSON.stringify({
+            fixtureMessages: total[0]!.count,
+            history: closedSince !== undefined,
+            discussions,
+            rowsReturned: returned,
+            requestMs: performance.now() - start,
+          }),
+        );
+      }
+    }).pipe(Effect.provide(KanbanStore.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
+  120_000,
+);
+
+it.effect(
+  "keeps the global history cutoff across boards, timestamps and multiple asks per card",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* KanbanStore.KanbanStore;
+      const stored: Array<{
+        boardId: string;
+        number: number;
+        asks: Array<{ id: string; closedAt: string | null }>;
+      }> = [];
+      for (const boardId of ["board-a", "board-b", "board-c"]) {
+        yield* sql`INSERT INTO ardud_kanban_boards (id, slug, json) VALUES (${boardId}, ${boardId}, '{}')`;
+        for (let number = 1; number <= 45; number++) {
+          const asks = [
+            { id: "q1", closedAt: `2026-11-10T09:${String(number % 30).padStart(2, "0")}:00.000Z` },
+            {
+              id: "q2",
+              closedAt: `2026-11-10T09:${String(29 - (number % 30)).padStart(2, "0")}:00.000Z`,
+            },
+            ...(number % 11 === 0 ? [{ id: "q3", closedAt: null }] : []),
+          ].map((ask) => ({
+            ...ask,
+            text: "Go?",
+            blocking: false,
+            by: { _tag: "owner" },
+            at: AT,
+            seq: null,
+          }));
+          stored.push({ boardId, number, asks });
+          const card = {
+            ...JSON.parse(cardJson(number, boardId)),
+            settledAt: null,
+            discussionId: `discussion-${boardId}-${number}`,
+            asks,
+          };
+          yield* sql`INSERT INTO ardud_kanban_cards (id, board_id, number, stage, json)
+          VALUES (${card.id}, ${boardId}, ${number}, 'todo', ${JSON.stringify(card)})`;
+        }
+      }
+      for (const boardId of [undefined, "board-b"]) {
+        for (const closedSince of [
+          undefined,
+          "2026-11-10T09:10:00.000Z",
+          "1900-01-01T00:00:00.000Z",
+        ]) {
+          // Independent full-card oracle: filter asks, then sort and cap the global result.
+          const eligible = stored
+            .filter((card) => boardId === undefined || card.boardId === boardId)
+            .flatMap((card) =>
+              card.asks.map((ask) => ({ boardId: card.boardId, number: card.number, ask })),
+            );
+          const expectedOpen = eligible.filter(({ ask }) => ask.closedAt === null);
+          const expectedClosed = eligible
+            .filter(
+              ({ ask }) =>
+                ask.closedAt !== null && closedSince !== undefined && ask.closedAt >= closedSince,
+            )
+            .sort((a, b) => (b.ask.closedAt ?? "").localeCompare(a.ask.closedAt ?? ""))
+            .slice(0, 200);
+          let selected: Array<[string, string]> = [];
+          const observe: Statement.Transformer = (statement) => {
+            const [query, params] = statement.compile();
+            if (query.includes("ardud_kanban_messages_ask_marked"))
+              selected = JSON.parse(String(params[1]));
+            return Effect.succeed(statement);
+          };
+          const feed = yield* readAskFeed(sql, { boardId: boardId as never, closedSince }, AT).pipe(
+            Effect.provideService(Statement.CurrentTransformer, observe),
+          );
+          assert.deepStrictEqual(
+            feed.open.map((item) => ({
+              boardId: item.boardId,
+              number: item.cardNumber,
+              ask: item.ask,
+            })),
+            expectedOpen,
+          );
+          assert.deepStrictEqual(
+            feed.closed.map((item) => ({
+              boardId: item.boardId,
+              number: item.cardNumber,
+              ask: item.ask,
+            })),
+            expectedClosed,
+          );
+          assert.deepStrictEqual(
+            selected.map(([discussion, ask]) => `${discussion}:${ask}`).sort(),
+            [...expectedOpen, ...expectedClosed]
+              .map((item) => `discussion-${item.boardId}-${item.number}:${item.ask.id}`)
+              .sort(),
+          );
+        }
+      }
+    }).pipe(Effect.provide(KanbanStore.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
 );

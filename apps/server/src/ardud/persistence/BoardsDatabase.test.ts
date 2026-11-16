@@ -55,6 +55,57 @@ it.effect(
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
 );
 
+it.effect(
+  "prepares populated message payloads before creating the ask index and skips it on reopen",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`CREATE TABLE ardud_kanban_messages (
+      discussion_id TEXT NOT NULL, seq INTEGER NOT NULL, json TEXT NOT NULL,
+      PRIMARY KEY (discussion_id, seq))`;
+      yield* sql`INSERT INTO ardud_kanban_messages VALUES
+      ('discussion', 1, '{"askId":"q1","text":"Ask"}'),
+      ('discussion', 2, '{"text":"Ordinary"}'),
+      ('discussion', 3, '{"askId":"q1","text":"Reply"}')`;
+      const queries: Array<{ text: string; transaction: boolean }> = [];
+      const observe: Statement.Transformer = (statement) =>
+        Effect.gen(function* () {
+          queries.push({
+            text: statement.compile()[0],
+            transaction: (yield* Effect.serviceOption(sql.transactionService))._tag === "Some",
+          });
+          return statement;
+        });
+      const initialize = initializeKanbanSchema(sql).pipe(
+        Effect.provideService(Statement.CurrentTransformer, observe),
+      );
+      yield* initialize;
+      const prepared = queries.filter(({ text }) => text.includes("NOT INDEXED"));
+      assert.lengthOf(prepared, 1);
+      assert.include(prepared[0]!.text, "ardud_kanban_messages");
+      assert.isFalse(prepared[0]!.transaction);
+      assert.isBelow(
+        queries.indexOf(prepared[0]!),
+        queries.findIndex(({ text }) => text.startsWith("CREATE")),
+      );
+      const read = sql<{ seq: number }>`SELECT seq FROM ardud_kanban_messages
+      INDEXED BY ardud_kanban_messages_ask_marked
+      WHERE discussion_id = 'discussion' AND json_extract(json, '$.askId') = 'q1'
+        AND instr(json, '"askId":"') > 0 ORDER BY seq`;
+      assert.deepStrictEqual(
+        (yield* read).map(({ seq }) => seq),
+        [1, 3],
+      );
+      queries.length = 0;
+      yield* initialize;
+      assert.isFalse(queries.some(({ text }) => text.includes("NOT INDEXED")));
+      assert.deepStrictEqual(
+        (yield* read).map(({ seq }) => seq),
+        [1, 3],
+      );
+    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+);
+
 const fixture = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;

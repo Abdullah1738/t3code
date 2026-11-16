@@ -95,14 +95,26 @@ const layerFor = (
   sessions: ProviderSessionManager.ProviderSessionManagerV2Shape,
 ): Layer.Layer<RecoverySnapshot.RecoverySnapshot> => {
   const control = Layer.mock(ControlStore.ControlStore)({
-    liveThreadIds: () => Effect.succeed(fixture.liveIds),
+    pageLiveThreadIds: (cursor, limit) =>
+      Effect.succeed(
+        [...new Set(fixture.liveIds)]
+          .sort()
+          .filter((id) => cursor === null || id > cursor)
+          .slice(0, limit),
+      ),
   });
   const identity = Layer.mock(ExecutionIdentity.ExecutionIdentity)({
     currentNative: () => Effect.succeed(new Map()),
   });
   const threads = Layer.mock(ThreadManagementService.ThreadManagementService)({
-    listActiveThreadIds: () =>
-      Effect.succeed([...fixture.shells.keys()].map((id) => ThreadId.make(id))),
+    pageActiveThreadIds: (cursor, limit) =>
+      Effect.succeed(
+        [...fixture.shells.keys()]
+          .sort()
+          .filter((id) => cursor === null || id > cursor)
+          .slice(0, limit)
+          .map((id) => ThreadId.make(id)),
+      ),
     getShellSnapshot: () => Effect.die("recovery must not build shell snapshots"),
     getThreadShell: (id) => Effect.succeed(fixture.shells.get(id) ?? null),
   });
@@ -153,6 +165,7 @@ describe("RecoverySnapshot", () => {
     const orchestrator = Layer.mock(Orchestrator.OrchestratorV2)({
       getThreadShell: () => Effect.succeed(shell),
       listActiveThreadIds: () => Effect.succeed([targetId]),
+      pageActiveThreadIds: () => Effect.succeed([targetId]),
       getShellSnapshot: () => Effect.die("recovery must not build shell snapshots"),
       getThreadRecords: (id) =>
         Effect.succeed({
@@ -184,7 +197,9 @@ describe("RecoverySnapshot", () => {
       orchestrator,
       management,
       sessions,
-      Layer.mock(ControlStore.ControlStore)({ liveThreadIds: () => Effect.succeed([targetId]) }),
+      Layer.mock(ControlStore.ControlStore)({
+        pageLiveThreadIds: () => Effect.succeed([targetId]),
+      }),
       Layer.mock(ExecutionIdentity.ExecutionIdentity)({
         currentNative: () => Effect.succeed(new Map()),
       }),

@@ -458,7 +458,9 @@ def idle_ttl(box_id: str) -> None:
 
 def bootstrap_fresh(box_id: str) -> None:
     """Fresh box (not from a template/base): put tool caches under $HOME so stop/fork keep them."""
-    script = (TEMPLATES_DIR / "common-env.sh").read_bytes()
+    script = ("bash -c " + shlex.quote((TEMPLATES_DIR / "tools/fetch.sh").read_text() + "\n" +
+                                     (TEMPLATES_DIR / "tools/sqlite.sh").read_text()) +
+              " || exit 1\n" + (TEMPLATES_DIR / "common-env.sh").read_text()).encode()
     p = ssh_sync.ssh(box_id, "bash -s", input=script, timeout=120)
     if p.returncode != 0:
         say(f"warning: cache env bootstrap failed on {box_id}: {p.stderr.decode(errors='replace')[-200:]}")
@@ -887,16 +889,18 @@ def _create_row(con, me: dict, box_id: str, source: str, base_dir, sz, t, box_he
     con.commit()
     event(con, box_id, "lease_new", f"source={source} size={sz} owner={me['owner']} repo={me['repo_root']}")
     try:
-        _bring_up(box_id, fresh=(source == "fresh"),
-                  recipe=source.split(":", 1)[1] if is_recipe else None, box_held=box_held, since=since)
-        try:
-            api.rename(box_id, box_name(me, me["repo_key"]))
-        except StartWaitFailed:
-            raise
-        except OffboxError:
-            pass
-        if relocating:
-            _relocate_base_checkout(con, box_id, base_dir, rdir, box_held=box_held)
+        from . import outage
+        with outage.accepted_machine():
+            _bring_up(box_id, fresh=(source == "fresh"),
+                      recipe=source.split(":", 1)[1] if is_recipe else None, box_held=box_held, since=since)
+            try:
+                api.rename(box_id, box_name(me, me["repo_key"]))
+            except StartWaitFailed:
+                raise
+            except OffboxError:
+                pass
+            if relocating:
+                _relocate_base_checkout(con, box_id, base_dir, rdir, box_held=box_held)
     except (SshHostKeyMismatch, StartWaitFailed):
         raise
     except api.SupplyOut as e:
@@ -1058,6 +1062,10 @@ def _wait_unanswered_resume(con, box_id):
         while True:
             allocation.check_queue()
             left = end - time.time()
+            # An unresolved resume still belongs to the queue, even while provisioning gets its own API budget.
+            queue_left = allocation.queue_left()
+            if queue_left is not None:
+                left = min(left, queue_left)
             budget_left = api.left()
             if budget_left is not None:
                 if budget_left <= 0.05:
@@ -1071,6 +1079,7 @@ def _wait_unanswered_resume(con, box_id):
             try:
                 state = _readiness_get(box_id, deadline=time.time() + left)
             except (api.BudgetExpired, StartWaitFailed, PoolBusyError):
+                allocation.check_queue()
                 raise
             except OffboxError as error:
                 network_failures = network_failures + 1 if isinstance(error, api.NetworkError) else 0

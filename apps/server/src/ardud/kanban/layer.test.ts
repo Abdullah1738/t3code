@@ -10,6 +10,22 @@ const event = (type: string, payload: object = {}) =>
   ({ type, threadId: "thread-1", payload }) as unknown as OrchestrationV2DomainEvent;
 
 describe("boardEventRoute", () => {
+  it.each([
+    {
+      type: "run_interrupt_request",
+      runId: "early",
+      cancelReason: "user_stop",
+      expected: "cancelReason",
+    },
+    { type: "run_interrupt_request", runId: "early", expected: null },
+    { type: "run_interrupt_request", runId: null, cancelReason: "task_cancel", expected: null },
+    { type: "run_interrupt_result", runId: "early", cancelReason: "user_stop", expected: null },
+    { type: "assistant_message", runId: "early", expected: null },
+  ])("routes cancellation metadata without replaying turn end: %s", ({ expected, ...payload }) => {
+    const request = event("turn-item.updated", payload);
+    assert.strictEqual(boardEventRoute(request), expected);
+    assert.strictEqual(threadEventOf(request), expected === "cancelReason" ? "thread-1" : null);
+  });
   it("retains the expired start identity even after FIFO promotion changes the active run", () => {
     const payload = {
       type: "error",

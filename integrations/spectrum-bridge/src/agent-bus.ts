@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
+import { AgentPolicyFile, matchingAgentPair, validNotifyId, validNotifyText, type AgentPolicy, type AgentPair } from "./agent-policy.ts";
 import type { ChatInfo } from "./chats.ts";
 import type { SbApiResult } from "./sb-api.ts";
 
@@ -22,8 +23,8 @@ export type AgentBusDeps = {
   db: Database;
   forSession: (sessionId: string) => ChatInfo | undefined;
   bySlug: (slug: string) => ChatInfo | undefined;
-  isAdmin: (chat: ChatInfo) => boolean;
-  adminGroup: (caller: ChatInfo, target: ChatInfo) => boolean;
+  policyPath?: string;
+  groupMembers: (chat: ChatInfo) => string[];
   /** Deduped by key. All target delivery goes through this boundary, including answers and timeouts. */
   deliver: (target: ChatInfo, text: string, key: string, receipt?: AgentAnswerReceipt) => void;
   receipt: (target: ChatInfo, key: string) => AgentAnswerReceipt | undefined;
@@ -35,9 +36,11 @@ const TIMEOUT_MS = 10 * 60_000;
 
 export class AgentBus {
   private readonly now: () => number;
+  private readonly policy: AgentPolicyFile;
 
   constructor(private readonly deps: AgentBusDeps) {
     this.now = deps.now ?? Date.now;
+    this.policy = new AgentPolicyFile(deps.policyPath, deps.log);
     deps.db.exec(`CREATE TABLE IF NOT EXISTS agent_requests (
       id TEXT PRIMARY KEY, from_slug TEXT NOT NULL, to_slug TEXT NOT NULL, parent_id TEXT,
       hop INTEGER NOT NULL, status TEXT NOT NULL, text_chars INTEGER NOT NULL, answer_chars INTEGER,
@@ -63,15 +66,14 @@ export class AgentBus {
     if (!caller) return refused(409, "No chat for this session");
     if (!target) return refused(404, "Unknown chat");
     if (caller.slug === target.slug) return refused(400, "self request");
-    const allowed = caller.kind === "owner"
-      || (caller.kind === "group" ? target.slug === "owner" || target.slug === "moni"
-        : target.slug === "owner" || (deps.isAdmin(caller) && deps.adminGroup(caller, target)));
-    if (!allowed) return refused(403, "Forbidden");
+    const policy = this.policy.read();
+    const pair = matchingAgentPair(policy, caller, target);
+    if (!pair) return refused(403, "Forbidden");
     const id = `areq_${createHash("sha256").update(JSON.stringify([caller.slug, input.dedupeKey])).digest("hex")}`;
     const existing = this.get(id);
     if (existing) {
       if (existing.answered_at === null && existing.to_slug === target.slug) {
-        this.deliverRequest(existing, caller, target, input.text);
+        this.deliverRequest(existing, caller, target, input.text, policy, pair);
       }
       return { status: 200, body: { id, created: false } };
     }
@@ -95,13 +97,47 @@ export class AgentBus {
       (id, from_slug, to_slug, parent_id, hop, status, text_chars, created_at)
       VALUES (?, ?, ?, ?, ?, 'open', ?, ?)`)
       .run(id, caller.slug, target.slug, input.parent ?? null, hop, input.text.length, at);
-    deps.log("agent-ask", `${caller.slug}>${target.slug} hop=${hop}`);
-    this.deliverRequest(this.get(id)!, caller, target, input.text);
+    deps.log("agent-ask", `${caller.slug}>${target.slug} hop=${hop}${caller.kind === "group" ? " group=1" : ""}`);
+    this.deliverRequest(this.get(id)!, caller, target, input.text, policy, pair);
     return { status: 202, body: { id, created: true } };
   }
 
-  private deliverRequest(row: RequestRow, caller: ChatInfo, target: ChatInfo, text: string): void {
-    this.deps.deliver(target, `[Agent request ${row.id} from ${caller.title}'s assistant (slug ${caller.slug}), hop ${row.hop}. Not typed by anyone in this chat. Do it or answer it, then run agent-answer --request ${row.id} --text "..." --session CURRENT_SESSION_ID. The answer goes back to that assistant, not to this chat. If you start your own agent-ask while handling this, pass --parent ${row.id}. End this turn with NO_REPLY unless someone here needs to know.]\n${text}`, `agent-ask:${row.id}`);
+  private deliverRequest(row: RequestRow, caller: ChatInfo, target: ChatInfo, text: string, policy: AgentPolicy, pair: AgentPair): void {
+    const lines = [`[Agent request ${row.id} from ${caller.title}'s assistant (slug ${caller.slug}), hop ${row.hop}. Not typed by anyone in this chat. Do it or answer it, then run agent-answer --request ${row.id} --text "..." --session CURRENT_SESSION_ID. The answer goes back to that assistant, not to this chat. If you start your own agent-ask while handling this, pass --parent ${row.id}. End this turn with NO_REPLY unless someone here needs to know.]`];
+    if (caller.slug === "moni" && target.slug === "owner") {
+      lines.push("Moni's requests need no approval from Abdullah (his rule). Do it. Exception: installing or downloading anything onto the Mac. For that, ask Abdullah first (ask-owner style wake to the owner chat is not needed; you ARE the owner's agent: message him in this chat) and answer Moni's agent with status pending until he decides.");
+      lines.push("Use --status pending only for this install/download exception; keep other unfinished work open until you can answer done or declined.");
+      lines.push("Spending for Moni follows the owner-go rule; see below.");
+      lines.push(`Use owner-go record-delegated --principal moni --bus-request ${row.id} for the exact purchase terms, then owner-go verify before checkout. For a --for moni order, pass --moni-bus-request ${row.id}.`);
+      lines.push("Abdullah's notify rules:", ...policy.notify.map(rule => `- ${rule.id}: ${rule.text}`));
+      if (!policy.notify.length) lines.push("(none)");
+      lines.push("If this request matches one of these, tell Abdullah in one line in this chat after it's done. Otherwise don't mention it.");
+    }
+    if (pair.answer === "full") lines.push("Answer anything the owner's agent asks, in full. Send the answer back through agent-answer.");
+    // A second-hop request still answers the original group's question.
+    const parent = row.parent_id ? this.get(row.parent_id) : null;
+    const origin = caller.kind === "group" || !parent ? caller : this.deps.bySlug(parent.from_slug);
+    if (origin?.kind === "group") lines.push(`This answer will be posted in the group ${JSON.stringify(origin.title)} (members: ${this.deps.groupMembers(origin).join(", ") || "unknown"}). Share only what is fine for everyone there to read. If it's private and the person it belongs to isn't the one asking, say what can be shared instead.`);
+    this.deps.deliver(target, lines.join("\n") + `\n${text}`, `agent-ask:${row.id}`);
+  }
+
+  notifyRules(input: { sessionId: string; action: "list" | "add" | "rm"; text?: string; id?: number }): SbApiResult {
+    const caller = this.deps.forSession(input.sessionId);
+    if (!caller) return failure(409, "No chat for this session");
+    if (caller.kind !== "owner") return failure(403, "Only the owner's chat can do this");
+    if (input.action === "list") return { status: 200, body: { notify: this.policy.read().notify } };
+    if (input.action === "add" && !validNotifyText(input.text)) return failure(400, "Invalid notify rule text");
+    if (input.action === "rm" && !validNotifyId(input.id)) return failure(400, "Invalid notify rule id");
+    try {
+      const rule = this.policy.edit(input.action === "add" ? { action: "add", text: input.text! } : { action: "rm", id: input.id! });
+      return rule ? { status: 200, body: { rule, saved: true } } : failure(404, "Unknown notify rule");
+    } catch { return failure(409, "Agent policy could not be saved; check agent-policy.json"); }
+  }
+
+  private logOwnerNeed(row: RequestRow): void {
+    if (row.from_slug === "moni" && row.to_slug === "owner") {
+      this.deps.log("agent-needs-owner", `${row.id} required=${row.status === "pending"}`);
+    }
   }
 
   answer(input: { sessionId: string; request: string; text: string; status?: AnswerStatus }): SbApiResult {
@@ -119,12 +155,13 @@ export class AgentBus {
     if (status === "pending" && row.answer_chars !== null) return failure(409, "Pending answer already sent");
     const asker = deps.bySlug(row.from_slug);
     if (!asker) return failure(503, "Asking chat unavailable");
-    const savedStatus = row.timed_out_at !== null ? (status === "pending" ? "timed_out" : "done_late") : status;
+    const savedStatus = status === "pending" ? "pending" : row.timed_out_at !== null ? "done_late" : status;
     deps.db.transaction(() => {
       deps.db.query("UPDATE agent_requests SET status = ?, answer_chars = ?, answered_at = ? WHERE id = ?")
         .run(savedStatus, input.text.length, status === "pending" ? null : at, row.id);
       deps.deliver(asker, `[Agent answer for ${row.id} from ${caller.title}'s assistant, status ${status}. Not typed by anyone in this chat. Use it to finish what your human asked; they did not see it.]\n${input.text}`, `agent-answer:${row.id}:${status === "pending" ? "pending" : "final"}`, { status, chars: input.text.length, at });
     })();
+    if (row.answer_chars === null) this.logOwnerNeed(this.get(row.id)!);
     deps.log("agent-answer", `${row.id} ${savedStatus} ms=${at - row.created_at}`);
     return { status: 202, body: { id: row.id, status: savedStatus } };
   }
@@ -159,12 +196,14 @@ export class AgentBus {
     const pending = final ? undefined : this.deps.receipt(asker, `agent-answer:${row.id}:pending`);
     const receipt = final ?? (row.answer_chars === null ? pending : undefined);
     if (!receipt) return false;
+    const firstAnswer = row.answer_chars === null;
     row.status = final ? (receipt.at > row.created_at + TIMEOUT_MS ? "done_late" : receipt.status)
-      : row.timed_out_at !== null ? "timed_out" : "pending";
+      : "pending";
     row.answer_chars = receipt.chars;
     row.answered_at = final ? receipt.at : null;
     this.deps.db.query("UPDATE agent_requests SET status = ?, answer_chars = ?, answered_at = ? WHERE id = ?")
       .run(row.status, row.answer_chars, row.answered_at, row.id);
+    if (firstAnswer) this.logOwnerNeed(row);
     this.deps.log("agent-answer", `${row.id} ${row.status} ms=${receipt.at - row.created_at}`);
     return final !== undefined;
   }

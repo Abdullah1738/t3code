@@ -10,12 +10,8 @@ import {
   historyViewSql,
   eventHistoryLookupViews,
   emptyBaseSchemaSql,
-} from "../apps/server/src/ardud/persistence/historyArchiveSql.ts";
-import {
-  normalizeSql,
-  sqlFingerprint,
-  sqlParameterOffsets,
-} from "../packages/shared/src/sqlDiagnostics.ts";
+} from "../src/ardud/persistence/historyArchiveSql.ts";
+import { normalizeSql, sqlFingerprint, sqlParameterOffsets } from "@t3tools/shared/sqlDiagnostics";
 
 function snapshotPath(filename: string) {
   const path = NodeFS.realpathSync(filename);
@@ -154,11 +150,11 @@ if (
   process.argv[1] &&
   import.meta.url === NodeURL.pathToFileURL(NodePath.resolve(process.argv[1])).href
 ) {
-  // node scripts/explain-sql.ts SNAPSHOT TRACE FINGERPRINT [SCHEMA=ARCHIVE_SNAPSHOT ...]
+  // node apps/server/scripts/explain-sql.ts SNAPSHOT TRACE FINGERPRINT [SCHEMA=ARCHIVE_SNAPSHOT ...]
   const [, , snapshot, trace, fingerprint, ...archives] = process.argv;
   if (!snapshot || !trace || !fingerprint) {
     console.error(
-      "Usage: node scripts/explain-sql.ts SNAPSHOT TRACE FINGERPRINT [SCHEMA=SNAPSHOT ...]",
+      "Usage: node apps/server/scripts/explain-sql.ts SNAPSHOT TRACE FINGERPRINT [SCHEMA=SNAPSHOT ...]",
     );
     process.exitCode = 1;
   } else {

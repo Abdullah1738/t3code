@@ -4,7 +4,7 @@
 # secrets and anything built or run for the person live on her box under ~/person.
 set -eu
 
-OFFBOX_PERSON_HOME=${0:A:h:h}
+OFFBOX_PERSON_HOME=${OFFBOX_PERSON_HOME:-${0:A:h:h}}
 ROOT=${OFFBOX_PERSON_ROOT:-$HOME/.local/share/offbox-person}
 OFFBOX=${OFFBOX_PERSON_OFFBOX:-offbox}
 AGENT_BROWSER=${OFFBOX_PERSON_AGENT_BROWSER:-agent-browser}
@@ -152,7 +152,40 @@ start_home_route() {
   save_state "$p"
 }
 
-push() { box_ssh "$1" "mkdir -p ~/person && cat > ~/person/$2" < "$OFFBOX_PERSON_HOME/box/$2" >&2; }
+# Only a verified temp file in the destination directory may replace the live copy.
+# Hashes stay in shell variables: even a secret's digest must not enter an ssh argv.
+box_write() {
+  local p=$1 ssh_fn=$2 remote=$3 mode=$4 source=$5
+  local relative=${remote#\~/} dir name expected bytes result temp actual received attempt rc
+  [[ $remote == '~/'* ]] || die "box_write needs a path under ~/"
+  dir=${relative:h} name=${relative:t}
+  bytes=$(wc -c < "$source") || return $?
+  (( bytes > 0 )) || die "$remote: refusing an empty local file; box copy left unchanged"
+  expected=$(shasum -a 256 < "$source") || return $?
+  expected=${expected%% *}
+  for attempt in {1..3}; do
+    rc=0
+    result=$("$ssh_fn" "$p" "set -eu; set -o pipefail; umask 077; mkdir -p \"\$HOME\"/${(qq)dir}; cd \"\$HOME\"/${(qq)dir}; t=\$(mktemp ${(qq):-.$name.XXXXXX}); printf '%s\\n' \"\$t\"; cat > \"\$t\"; sha256sum \"\$t\" | cut -c1-64; wc -c < \"\$t\"" < "$source") || rc=$?
+    local -a lines=("${(@f)result}")
+    temp=${lines[1]:-} actual=${lines[2]:-} received=${lines[3]:-unknown}
+    # Ignore unrelated stdout rather than treating it as a path to remove or publish.
+    if [[ $temp != ".$name."?????? || $temp == */* ]]; then
+      (( rc == 0 )) || return $rc
+      die "$remote: invalid box write receipt; box copy left unchanged"
+    fi
+    if (( rc == 0 )) && [[ $actual == $expected ]] && [[ ${received//[[:space:]]/} == ${bytes//[[:space:]]/} ]]; then
+      "$ssh_fn" "$p" "cd \"\$HOME\"/${(qq)dir} && chmod $mode ${(qq)temp} && mv -f -- ${(qq)temp} ${(qq)name}" </dev/null && return 0
+      rc=$?
+    fi
+    "$ssh_fn" "$p" "cd \"\$HOME\"/${(qq)dir} && rm -f -- ${(qq)temp}" </dev/null || return $?
+    (( rc == 0 )) || return $rc
+    note "$remote: box got $received / $bytes bytes or wrong sha (offbox ssh dropped stdin), retrying ($attempt/3)"
+    (( attempt == 3 )) || sleep 0.2
+  done
+  die "$remote: verification failed after 3 tries; box copy left unchanged"
+}
+
+push() { box_write "$1" box_ssh "~/person/$2" 644 "$OFFBOX_PERSON_HOME/box/$2"; }
 
 cmd_up() {
   local p=$1
@@ -167,11 +200,18 @@ cmd_up() {
   off "$p" run --no-fallback --remote -- "printf %s '$setup_b64' | base64 -d | bash" >&2 \
     || die "box setup failed for $p"
 
-  push "$p" launch.py
-  push "$p" session.sh
+  push "$p" launch.py || return $?
+  push "$p" session.sh || return $?
   local cfg="$(person_dir "$p")/config.json"
-  { if [[ -f $cfg ]]; then cat -- "$cfg"; else print -- '{}'; fi; } \
-    | box_ssh "$p" 'cat > ~/person/config.json && chmod 600 ~/person/config.json' >&2
+  (
+    umask 077
+    local scratch
+    scratch=$(mktemp -d) || exit $?
+    trap 'rm -rf -- "$scratch"' EXIT
+    trap 'exit 1' HUP INT TERM
+    if [[ -f $cfg ]]; then cat -- "$cfg"; else print -- '{}'; fi > "$scratch/config.json" || exit $?
+    box_write "$p" box_ssh '~/person/config.json' 600 "$scratch/config.json"
+  ) || return $?
 
   HOME_ROUTE=$(wants_home_route "$p")
   if [[ $HOME_ROUTE == 1 ]]; then
@@ -290,13 +330,17 @@ cmd_secret() {
     [[ $name =~ '^[A-Za-z0-9._-]{1,64}$' ]] || die "secret name must match [A-Za-z0-9._-]{1,64}"
   fi
   case $action in
-    set)
-      local value
-      value=$(cat)
-      [[ -n $value ]] || die "no secret value on stdin"
+    set) (
+      umask 077
+      local scratch
+      scratch=$(mktemp -d)
+      trap 'rm -rf -- "$scratch"' EXIT
+      trap 'exit 1' HUP INT TERM
+      cat > "$scratch/value"
+      [[ -s $scratch/value ]] || die "no secret value on stdin"
       ensure_up "$p" >/dev/null
-      print -rn -- "$value" | box_ssh "$p" "umask 077; mkdir -p $dir && cat > $dir/$name && chmod 600 $dir/$name"
-      ;;
+      box_write "$p" box_ssh "$dir/$name" 600 "$scratch/value"
+    ) ;;
     get)  ensure_up "$p" >/dev/null; box_ssh "$p" "cat $dir/$name" ;;
     rm)   ensure_up "$p" >/dev/null; box_ssh "$p" "rm -f $dir/$name" ;;
     list) ensure_up "$p" >/dev/null; box_ssh "$p" "ls -1 $dir 2>/dev/null || true" ;;
@@ -341,6 +385,8 @@ wa_box_ssh() {
   return $rc
 }
 
+wa_write_ssh() { local p=$1; shift; wa_box_ssh "$p" 0 "$@"; }
+
 # Her own WhatsApp (wacli linked device) on her box. No `up`: the desktop, browser and tunnels would keep the box
 # warm; a plain ssh resumes a stopped box and the systemd --user sync service starts with it.
 cmd_wa() {
@@ -351,9 +397,10 @@ cmd_wa() {
     local f
     for f in wa:"$OFFBOX_PERSON_HOME/box/wa" wa-db:"$OFFBOX_PERSON_HOME/../robob-watch/helpers/wa-db"; do
       [[ -f ${f#*:} ]] || die "missing ${f#*:}"
-      wa_box_ssh "$p" 0 "mkdir -p ~/person/run && cat > ~/person/run/push-${f%%:*}" < "${f#*:}" >&2
+      box_write "$p" wa_write_ssh "~/person/run/push-${f%%:*}" 600 "${f#*:}" || return $?
     done
-    wa_box_ssh "$p" 0 'bash -s' < "$OFFBOX_PERSON_HOME/box/wa-setup.sh"
+    box_write "$p" wa_write_ssh '~/person/run/wa-setup.sh' 600 "$OFFBOX_PERSON_HOME/box/wa-setup.sh" || return $?
+    wa_box_ssh "$p" 0 'bash ~/person/run/wa-setup.sh' </dev/null
     return
   fi
   local a retry=0 q=()

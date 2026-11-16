@@ -1,11 +1,12 @@
 """Alternating startup and timeout replies cannot renew the overall transient wait forever."""
 from pathlib import Path
+import os
 import sys
 import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from offbox_lib import home
+from offbox_lib import allocation, home, outage
 import home_monitor as hm
 from test_home_backend import HomeFiles
 from test_home_monitor import Sim, ONLINE
@@ -13,6 +14,67 @@ from test_wait_lock import Clock
 
 
 class TransientEpisodeBound(HomeFiles):
+    def test_healthy_queue_time_pauses_the_transient_episode(self):
+        self.configure()
+        starting = {"ok": False, "starting": True, "phase": "reconcile"}
+        for accounting in ("idle", "progress"):
+            for initial in ("slow", "reconcile"):
+                clock = Clock()
+                def read(timeout):
+                    return starting if int((clock.t - 1900) / 5) % 2 else "no answer (TimeoutError)"
+                with self.subTest(accounting=accounting, initial=initial), home.wait_budget(), \
+                        patch.object(outage.time, "monotonic", clock.now), \
+                        patch.object(home, "tcp_connects", return_value=True), patch.object(home, "say"), \
+                        outage.allocation_budget(600):
+                    home.begin_transient(clock.now)
+                    home.wait_deadline(600, clock=clock.now)
+                    if accounting == "idle":
+                        with outage.queue_idle():
+                            clock.sleep(900)
+                    else:
+                        clock.sleep(900)
+                        outage.queue_progress()
+                    self.assertEqual(home.WAIT_BUDGET.get()["transient_since"], 1900)
+                    reason = home.wait_while_starting(initial, clock=clock.now, sleep=clock.sleep, read=read)
+                    self.assertIsNotNone(reason)
+                    self.assertEqual(clock.t, 2500, "only healthy queue time is excluded; alternation stays bounded")
+
+    def test_each_slow_startup_transition_keeps_the_original_queue_deadline(self):
+        self.configure()
+        starting = {"ok": False, "starting": True, "phase": "reconcile"}
+        for initial in ("slow", "reconcile"):
+            clock = Clock()
+            def read(timeout):
+                return starting if int((clock.t - 1000) / 5) % 2 else "no answer (TimeoutError)"
+            with self.subTest(initial=initial), patch.dict(os.environ, OFFBOX_POOL_WAIT_SECONDS="40"), \
+                    patch.object(outage.time, "monotonic", clock.now), \
+                    patch.object(home, "tcp_connects", return_value=True), patch.object(home, "say"), \
+                    allocation.queue() as queue:
+                clock.sleep(15)
+                reason = home.wait_while_starting(initial, clock=clock.now, sleep=clock.sleep, read=read)
+                self.assertEqual(queue["end"], 1040)
+                self.assertIsNotNone(reason)
+                self.assertEqual(clock.t, 1040)
+
+    def test_failed_pass_time_is_spent_and_answer_timestamps_stay_real(self):
+        self.configure()
+        clock = Clock()
+        with home.wait_budget(), patch.object(outage.time, "monotonic", clock.now), \
+                outage.allocation_budget(600):
+            home.begin_transient(clock.now)
+            home.wait_deadline(600, clock=clock.now)
+            budget = home.WAIT_BUDGET.get()
+            budget.update(last_answer=995, slow_anchor=995, slow_end=1295)
+            clock.sleep(6)
+            outage.queue_api_failed()
+            outage.queue_progress()
+            self.assertEqual((budget["end"], budget["transient_since"]), (1600, 1000))
+            clock.sleep(10)
+            outage.queue_progress()
+            self.assertEqual((budget["end"], budget["transient_since"]), (1610, 1010))
+            self.assertEqual(outage.allocation_left(), 594)
+            self.assertEqual((budget["last_answer"], budget["slow_anchor"], budget["slow_end"]), (995, 995, 1295))
+
     def test_client_alternation_is_bounded_from_first_slow_failure(self):
         self.configure()
         starting = {"ok": False, "starting": True, "phase": "reconcile"}

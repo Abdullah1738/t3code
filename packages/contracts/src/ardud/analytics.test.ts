@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
 import {
   AnalyticsEvent,
+  AnalyticsRollup,
   RunUsageEvent,
   AnalyticsIngestInput,
   AnalyticsReadInput,
@@ -131,6 +132,10 @@ const usage = {
 it("requires the metadata-only usage schema and preserves null measurements", () => {
   const decodeUsage = Schema.decodeUnknownSync(RunUsageEvent, { onExcessProperty: "error" });
   expect(decodeUsage(usage)).toEqual(usage);
+  expect(Object.hasOwn(decodeUsage(usage), "cancelReason")).toBe(false);
+  const cancelled = { ...usage, endReason: "cancelled", cancelReason: "server_shutdown" };
+  expect(decodeUsage(cancelled)).toEqual(cancelled);
+  expect(() => decodeUsage({ ...cancelled, cancelReason: "unclassified" })).toThrow();
   for (const key of ["prompt", "message", "text", "toolArgs", "toolOutput", "output"]) {
     expect(() => decodeUsage({ ...usage, [key]: "private" })).toThrow();
   }
@@ -211,3 +216,43 @@ it.each(["started", "reused", "merged", "queued_spawn_cap"] as const)(
       expect(() => decodeEvent({ ...row, [field]: "private words" })).toThrow();
   },
 );
+
+it("decodes detached outcomes additively and rejects raw request ids", () => {
+  const old = { ...event, kind: "mcp.call", tool: "delegate_task", outcome: "timeout" };
+  expect(decodeEvent(old)).toEqual(old);
+  for (const outcome of ["committed", "failed", "capped"] as const) {
+    const row = {
+      ...old,
+      kind: "mcp.detached",
+      outcome,
+      lateMs: 1234,
+      afterCap: true,
+      clientRequestId: "a".repeat(64),
+    };
+    expect(decodeEvent(row)).toEqual(row);
+    expect(() => decodeEvent({ ...row, clientRequestId: "raw-request-id" })).toThrow();
+    expect(() => decodeEvent({ ...row, lateMs: -1 })).toThrow();
+  }
+  expect(
+    Schema.is(AnalyticsRollup.fields.mcpCalls)([
+      {
+        tool: "delegate_task",
+        hour: "2026-11-13T00:00:00.000Z",
+        build: "test",
+        bootId: "boot",
+        count: 1,
+        p50Ms: 10000,
+        p95Ms: 10000,
+        maxMs: 10000,
+        approximate: false,
+        failures: 1,
+        failureRate: 1,
+        outcomes: { timeout: 1 },
+        savedCounts: { unknown: 1 },
+        errors: [],
+        failedThenRetried: 0,
+        retrySucceeded: 0,
+      },
+    ]),
+  ).toBe(true);
+});

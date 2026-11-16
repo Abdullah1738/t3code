@@ -175,7 +175,7 @@ class GenerateTests(HarnessTestCase):
         cfg = tomllib.loads((self.codex / "config.toml").read_text())
         self.assertEqual(cfg["model"], "gpt-6-astra")
         self.assertEqual(cfg["model_context_window"], 872000)
-        self.assertEqual(cfg["model_auto_compact_token_limit"], 450000)
+        self.assertEqual(cfg["model_auto_compact_token_limit"], 250000)
         self.assertEqual(cfg["approval_policy"], "never")
         self.assertEqual(cfg["sandbox_mode"], "danger-full-access")
         self.assertEqual(cfg["features"]["memories"], False)
@@ -209,7 +209,7 @@ class GenerateTests(HarnessTestCase):
         for slug in ("gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra"):
             self.assertEqual(by_slug[slug]["context_window"], 872000)
             self.assertEqual(by_slug[slug]["max_context_window"], 872000)
-            self.assertEqual(by_slug[slug]["auto_compact_token_limit"], 450000)
+            self.assertEqual(by_slug[slug]["auto_compact_token_limit"], 250000)
 
         self.assertEqual(sorted(os.listdir(self.claude / "skills")), ["alpha", "beta", "gamma"])
         self.assertEqual(sorted(os.listdir(self.codex / "skills")), ["alpha", "beta", "gamma"])
@@ -229,7 +229,7 @@ class GenerateTests(HarnessTestCase):
                 self.assertIs(provider["requires_openai_auth"], False)
                 self.assertEqual(provider["http_headers"]["x-openai-actor-authorization"], "robob-9router-local")
                 self.assertNotIn("capabilities", provider)
-                self.assertEqual(cfg["model_auto_compact_token_limit"], 450000)
+                self.assertEqual(cfg["model_auto_compact_token_limit"], 250000)
                 self.assertEqual(cfg["model_auto_compact_token_limit_scope"], "total")
                 self.assertIs(cfg["features"]["output_token_replay"], True)
                 self.assertIs(cfg["features"]["concurrent_reasoning_summaries"], True)
@@ -726,7 +726,7 @@ class GenerateTests(HarnessTestCase):
         cu = tomllib.loads((self.codex_cu / "config.toml").read_text())
         self.assertEqual(cu.pop("model"), "gpt-6.1-terra")
         self.assertEqual(cu.pop("model_context_window"), 1050000)
-        self.assertEqual(cu.pop("model_auto_compact_token_limit"), 450000)
+        self.assertEqual(cu.pop("model_auto_compact_token_limit"), 250000)
         self.assertEqual(cu.pop("model_reasoning_effort"), "low")
         self.assertEqual(cu.pop("model_catalog_json"), str(self.codex_cu / "models.json"))
         self.assertIs(cu["features"].pop("computer_use"), True)
@@ -747,7 +747,7 @@ class GenerateTests(HarnessTestCase):
         })
         self.assertEqual(base.pop("model"), "gpt-6-astra")
         self.assertEqual(base.pop("model_context_window"), 872000)
-        self.assertEqual(base.pop("model_auto_compact_token_limit"), 450000)
+        self.assertEqual(base.pop("model_auto_compact_token_limit"), 250000)
         self.assertEqual(base.pop("model_catalog_json"), str(self.codex / "models.json"))
         self.assertIs(base["features"].pop("computer_use"), False)
         self.assertNotIn("node_repl", base["mcp_servers"])
@@ -799,7 +799,7 @@ class GenerateTests(HarnessTestCase):
         cu_models = {m["slug"]: m for m in cu["models"]}
         original = next(m for m in upstream["models"] if m["slug"] == "gpt-6.1-terra")
         expected_terra = dict(original, slug="cx/gpt-6.1-terra", context_window=1050000,
-                              max_context_window=1050000, auto_compact_token_limit=450000,
+                              max_context_window=1050000, auto_compact_token_limit=250000,
                               default_service_tier="default", service_tiers=[],
                               base_instructions=original["model_messages"]["instructions_template"])
         self.assertEqual(cu_models.pop("cx/gpt-6.1-terra"), expected_terra)

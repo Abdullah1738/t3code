@@ -6,7 +6,7 @@ import { join } from "node:path";
 import {
   withRelayLock, watcherInstance, finalizeClosing, checking, pollingWatcher, checkEvent, PERSON_BATCH_MS, queueEvent, sealBatch, sameDestination, alert, deliver, ensureDirs, escalate, failureSources, hash, shouldEscalate, HEADSUP_GIVE_UP_MS, HEADSUP_MS, headsUpText, imessage,
   trackConfirmation, confirmWakes, inboundState, inQuiet, iso, listIds, loadState, loadWatcher, log, now, ROOT, RUN_OK_FILE, runCheck, saveState, type State, telegram, type TrackedWake,
-  heldByMaintenance, loadMaintenance, type Maintenance, shouldNotifyFailure, shouldPause, FAILURE_NOTICE_AFTER, triggerSig, type Watcher, wakeInboundId, watcherDir, SLOW_RUN_MS, TIMEOUT_BACKOFF_CAP_S,
+  heldByMaintenance, loadMaintenance, type Maintenance, shouldNotifyFailure, shouldPause, FAILURE_NOTICE_AFTER, TriggerError, triggerSig, type MissingTrigger, type Watcher, wakeInboundId, watcherDir, SLOW_RUN_MS, TIMEOUT_BACKOFF_CAP_S,
 } from "./lib.ts";
 
 import { CheckSlots, checkSlotCap, checkTimeout, hostLoad, isMounted, LOAD_GRACE_MS, LOAD_HIGH, SSD_PATH } from "./host.ts";
@@ -174,6 +174,122 @@ async function pauseNotice(watcher: Watcher, state: State): Promise<void> {
   }
 }
 
+async function failWatcher(watcher: Watcher, fresh: State, instance: string | undefined, t: number,
+  timedOut: boolean, message: string, sources: string[] = [], detail = ""): Promise<void> {
+  const id = watcher.id;
+  const sameInstance = () => watcherInstance(id) === instance;
+  fresh.consecutive_failures += 1;
+  fresh.failure_alerted = false;
+  if (fresh.consecutive_failures === 1 || !fresh.failing_since) fresh.failing_since = iso(t);
+  fresh.last_error = message;
+  if (sources.length) fresh.last_error_sources = sources;
+  else delete fresh.last_error_sources;
+  fresh.next_at = now() + backoff(fresh, watcher.interval_s, timedOut);
+  log(id, `check failed (${fresh.consecutive_failures}) ${fresh.last_error}${detail}`);
+  if (shouldPause(watcher, fresh, timedOut)) {
+    toolLog({ component: "runner", kind: "event", name: "watch.disabled", ids: { watcher: id }, props: { action: "pause", count: fresh.consecutive_failures } });
+    fresh.failure_paused_at = iso();
+    fresh.failure_alerted = false;
+    // Commit the pause before sending: a crash or failed send must retry the notice, never the check.
+    saveState(id, fresh);
+    await pauseNotice(watcher, fresh);
+    return;
+  }
+  saveState(id, fresh);
+  if (shouldNotifyFailure(watcher, fresh, timedOut)) {
+    const mins = Math.round((now() - Date.parse(fresh.failing_since!)) / 60_000);
+    const sent = await alert(watcher, `Watcher "${watcher.title}" has failed ${fresh.consecutive_failures} ${fresh.consecutive_failures === 1 ? "time" : "times"} in a row (${mins} min) and is backing off. Last error: ${fresh.last_error.slice(0, 300)}. Check ${join(watcherDir(id), "log")}.`,
+      `robob-watch:${id}:failing:${hash(fresh.failing_since ?? "")}:${fresh.consecutive_failures}`, "error");
+    const current = loadState(id);
+    if (!loadWatcher(id) || !sameInstance() || current.failing_since !== fresh.failing_since) {
+      log(id, "failure notice completed after resume/remove; state kept");
+      return;
+    }
+    fresh = current;
+    fresh.failure_alerted = sent.ok;
+    saveState(id, fresh);
+    log(id, `failure alert ok=${sent.ok} via=${sent.via}`);
+  } else {
+    const count = fresh.consecutive_failures;
+    const threshold = watcher.failure_notice_after ?? FAILURE_NOTICE_AFTER;
+    log(id, `failure notice held (${count}/${threshold})`);
+    toolLog({ component: "runner", kind: "event", name: "watch.failure_notice_held", ids: { watcher: id }, props: { count, threshold, timedOut } });
+  }
+  if (shouldEscalate(watcher, fresh)) {
+    const sent = await escalate(watcher, fresh, `robob-watch:${id}:escalate:${hash(fresh.failing_since ?? "").slice(0, 32)}`);
+    const current = loadState(id);
+    if (!loadWatcher(id) || !sameInstance() || current.failing_since !== fresh.failing_since) {
+      log(id, "failure notice completed after resume/remove; state kept");
+      return;
+    }
+    fresh = current;
+    fresh.failure_escalated = sent.ok;
+    saveState(id, fresh);
+    log(id, `failure escalation ok=${sent.ok} via=${sent.via}${sent.ok ? "" : ` ${sent.detail}`}`);
+  }
+  // Keep the retry cadence at most 5 min apart for wake watchers so escalation and recovery are not delayed
+  // by a 30 min backoff.
+  if (watcher.mode === "wake") fresh.next_at = Math.min(fresh.next_at!, now() + Math.max(watcher.interval_s, 300) * 1_000);
+  saveState(id, fresh);
+}
+
+const TRIGGER_ERROR_REPEAT_MS = 5 * 60_000;
+function logTriggerError(watcher: Watcher, state: State, error: TriggerError, t: number): void {
+  let previous = state.trigger_error;
+  const first = !previous || previous.triggerPathHash !== error.triggerPathHash || previous.errnoCode !== error.errnoCode;
+  if (first) previous = state.trigger_error = {
+    triggerPathHash: error.triggerPathHash, triggerKind: error.triggerKind, errnoCode: error.errnoCode,
+    missingSince: iso(t), loggedAt: t, count: 0,
+  };
+  const window = previous!;
+  window.count += 1;
+  if (!first && t - window.loggedAt < TRIGGER_ERROR_REPEAT_MS) return;
+  const { triggerPathHash, triggerKind, errnoCode, missingSince, count } = window;
+  toolLog({ component: "runner", kind: "error", name: first ? "runner.error" : "runner.error.repeat", ok: false,
+    ids: { watcher: watcher.id }, props: { triggerPathHash, triggerKind, errnoCode, missingSince, count },
+    error: { tag: "watch.trigger_stat_failed" } });
+  window.loggedAt = t;
+  window.count = 0;
+}
+
+const TRIGGER_MISSING_REPEAT_MS = 60 * 60_000;
+function logMissingTriggers(watcher: Watcher, state: State, missing: MissingTrigger[], t: number): void {
+  const previous = state.trigger_missing;
+  if (!previous && !missing.length) return;
+  let changed = false;
+  let loggedAt = previous?.loggedAt ?? t;
+  const paths = [...new Map(missing.map(trigger => [trigger.triggerPathHash, trigger])).values()].map(trigger => {
+    const saved = previous?.paths.find(path => path.triggerPathHash === trigger.triggerPathHash);
+    if (saved) return saved;
+    const path = { ...trigger, missingSince: iso(t) };
+    toolLog({ component: "runner", kind: "event", name: "runner.trigger_missing", ok: true,
+      ids: { watcher: watcher.id }, props: path });
+    changed = true;
+    return path;
+  });
+  for (const path of previous?.paths ?? []) {
+    if (paths.some(current => current.triggerPathHash === path.triggerPathHash)) continue;
+    // Replacing a trigger in the definition is not evidence that the old file appeared.
+    if (watcher.triggers?.some(trigger => hash(trigger).slice(0, 16) === path.triggerPathHash)) {
+      toolLog({ component: "runner", kind: "event", name: "runner.trigger_present", ok: true,
+        ids: { watcher: watcher.id }, props: { triggerPathHash: path.triggerPathHash, missingForS: Math.max(0, (t - Date.parse(path.missingSince)) / 1000) } });
+    }
+    changed = true;
+  }
+  // One reminder per watcher per hour, even when several trigger files are missing.
+  if (paths.length && t - loggedAt >= TRIGGER_MISSING_REPEAT_MS) {
+    const path = paths[0]!;
+    toolLog({ component: "runner", kind: "event", name: "runner.trigger_missing.repeat", ok: true,
+      ids: { watcher: watcher.id }, props: { ...path, missingForS: Math.max(0, (t - Date.parse(path.missingSince)) / 1000) } });
+    loggedAt = t;
+    changed = true;
+  }
+  if (!changed) return;
+  if (paths.length) state.trigger_missing = { paths, loggedAt };
+  else delete state.trigger_missing;
+  saveState(watcher.id, state);
+}
+
 function acknowledgeRun(id: string, instance: string | undefined, run: string): void {
   withRelayLock(() => {
     if (!instance || watcherInstance(id) !== instance || !loadWatcher(id)) return;
@@ -296,8 +412,27 @@ export async function tickOne(id: string): Promise<void> {
   if (state.status !== "closing" && !state.reply_handoff && !state.admitted_run && watcher.max_fires !== 0 && state.fires + (state.batch?.events.length ?? 0) >= watcher.max_fires) return;
   // Trigger files (e.g. chat.db-wal) run the check as soon as they change; interval_s stays the fallback.
   // A failing watcher keeps its backoff; the signature is recorded before the run so a change mid-run re-triggers.
-  const sig = triggerSig(watcher);
-  const triggered = sig !== undefined && sig !== state.trigger_sig && !state.consecutive_failures && !state.load_timeouts && !state.pending
+  let sig: string | undefined;
+  const missing: MissingTrigger[] = [];
+  try { sig = triggerSig(watcher, trigger => missing.push(trigger)); }
+  catch (error) {
+    if (!(error instanceof TriggerError)) throw error;
+    if ((state.next_at ?? 0) > t && !(finalCheck && !state.closing_final_started)) return;
+    state.last_run_at = iso(t);
+    if (finalCheck) state.closing_final_started = true;
+    delete state.load_timeouts;
+    delete state.load_timeout_since;
+    logTriggerError(watcher, state, error, t);
+    await failWatcher(watcher, state, instance, t, false, error.message);
+    return;
+  }
+  if (state.trigger_error) {
+    delete state.trigger_error;
+    saveState(id, state);
+  }
+  logMissingTriggers(watcher, state, missing, t);
+  const initialMissing = state.trigger_sig === undefined && sig?.split("|").every(part => part === "missing");
+  const triggered = !initialMissing && sig !== undefined && sig !== state.trigger_sig && !state.consecutive_failures && !state.load_timeouts && !state.pending
     && t - Date.parse(state.last_run_at ?? "1970-01-01") >= (watcher.trigger_gap_s ? watcher.trigger_gap_s * 1_000 : TRIGGER_MIN_GAP_MS);
   if ((state.next_at ?? 0) > t && !triggered && !(finalCheck && !state.closing_final_started)) return;
   const schedule = () => {
@@ -400,60 +535,10 @@ export async function tickOne(id: string): Promise<void> {
         return;
       }
     }
-    fresh.consecutive_failures += 1;
-    fresh.failure_alerted = false;
-    if (fresh.consecutive_failures === 1 || !fresh.failing_since) fresh.failing_since = iso(t);
-    const sources = timedOut ? [] : failureSources(result.stderr);
-    fresh.last_error = timedOut ? `timed out after ${timeoutMs / 1000}s` : `exit ${result.code}: ${result.stderr.trim().slice(-500)}`;
-    if (sources.length) fresh.last_error_sources = sources;
-    else delete fresh.last_error_sources;
-    fresh.next_at = now() + backoff(fresh, watcher.interval_s, timedOut);
-    log(id, `check failed (${fresh.consecutive_failures}) ${fresh.last_error}${timedOut && result.stderr.trim() ? ` | stderr: ${result.stderr.trim().slice(-300)}` : ""}`);
-    if (shouldPause(watcher, fresh, timedOut)) {
-      toolLog({ component: "runner", kind: "event", name: "watch.disabled", ids: { watcher: id }, props: { action: "pause", count: fresh.consecutive_failures } });
-      fresh.failure_paused_at = iso();
-      fresh.failure_alerted = false;
-      // Commit the pause before sending: a crash or failed send must retry the notice, never the check.
-      saveState(id, fresh);
-      await pauseNotice(watcher, fresh);
-      return;
-    }
-    saveState(id, fresh);
-    if (shouldNotifyFailure(watcher, fresh, timedOut)) {
-      const mins = Math.round((now() - Date.parse(fresh.failing_since!)) / 60_000);
-      const sent = await alert(watcher, `Watcher "${watcher.title}" has failed ${fresh.consecutive_failures} ${fresh.consecutive_failures === 1 ? "time" : "times"} in a row (${mins} min) and is backing off. Last error: ${fresh.last_error.slice(0, 300)}. Check ${join(watcherDir(id), "log")}.`,
-        `robob-watch:${id}:failing:${hash(fresh.failing_since ?? "")}:${fresh.consecutive_failures}`, "error");
-      const current = loadState(id);
-      if (!loadWatcher(id) || !sameInstance() || current.failing_since !== fresh.failing_since) {
-        log(id, "failure notice completed after resume/remove; state kept");
-        return;
-      }
-      fresh = current;
-      fresh.failure_alerted = sent.ok;
-      saveState(id, fresh);
-      log(id, `failure alert ok=${sent.ok} via=${sent.via}`);
-    } else {
-      const count = fresh.consecutive_failures;
-      const threshold = watcher.failure_notice_after ?? FAILURE_NOTICE_AFTER;
-      log(id, `failure notice held (${count}/${threshold})`);
-      toolLog({ component: "runner", kind: "event", name: "watch.failure_notice_held", ids: { watcher: id }, props: { count, threshold, timedOut } });
-    }
-    if (shouldEscalate(watcher, fresh)) {
-      const sent = await escalate(watcher, fresh, `robob-watch:${id}:escalate:${hash(fresh.failing_since ?? "").slice(0, 32)}`);
-      const current = loadState(id);
-      if (!loadWatcher(id) || !sameInstance() || current.failing_since !== fresh.failing_since) {
-        log(id, "failure notice completed after resume/remove; state kept");
-        return;
-      }
-      fresh = current;
-      fresh.failure_escalated = sent.ok;
-      saveState(id, fresh);
-      log(id, `failure escalation ok=${sent.ok} via=${sent.via}${sent.ok ? "" : ` ${sent.detail}`}`);
-    }
-    // Keep the retry cadence at most 5 min apart for wake watchers so escalation and recovery are not delayed
-    // by a 30 min backoff.
-    if (watcher.mode === "wake") fresh.next_at = Math.min(fresh.next_at!, now() + Math.max(watcher.interval_s, 300) * 1_000);
-    saveState(id, fresh);
+    await failWatcher(watcher, fresh, instance, t, timedOut,
+      timedOut ? `timed out after ${timeoutMs / 1000}s` : `exit ${result.code}: ${result.stderr.trim().slice(-500)}`,
+      timedOut ? [] : failureSources(result.stderr),
+      timedOut && result.stderr.trim() ? ` | stderr: ${result.stderr.trim().slice(-300)}` : "");
     return;
   }
   if (finalDeadline !== undefined && fresh.status === "closing" && fresh.closing_until === finalDeadline) fresh.closing_final_check = true;

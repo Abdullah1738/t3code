@@ -20,6 +20,7 @@ import {
   ProviderOptionSelection,
   TrimmedNonEmptyString,
 } from "@t3tools/contracts";
+import { ExactEdits } from "../engine/exactEdits.ts";
 import { Tool, Toolkit } from "effect/ai";
 import * as Schema from "effect/Schema";
 
@@ -206,7 +207,7 @@ const tool = <
 const BoardGet = tool(
   "board_get",
   "Read the board",
-  "Compact Missions board: settings/instructions, goals, pools, groups, live thread states, unread counts and a page of card number/title/stage/owner/model/short status. No card descriptions, prompts, event histories, goal stories or wiki bodies; use card_get and wiki_read for detail. Default 200 cards, max 500; follow board.page.nextAfter with after while hasMore. With since, only cards active since then (an event, or an open or touched ask), one short row each: stage changes, review verdicts, run failures, stall, asks with asked/answered times; no settings, groups or unread; each page stays under 50,000 characters. boardId defaults to the board identified by this thread; when ambiguous, pass one of the candidate board ids in the error.",
+  "Compact Missions board: settings/instructions, goals, pools, groups, live thread states, unread counts and a page of card number/title/stage/owner/model/short status. No card descriptions, prompts, event histories, goal stories or wiki bodies; use card_get and wiki_read for detail. Default 200 cards, max 500. Every page stays under 50,000 characters and can hold fewer cards than limit when rows are large; follow board.page.nextAfter with after while hasMore. With since, only cards active since then (an event, or an open or touched ask), one short row each: stage changes, review verdicts, run failures, stall, asks with asked/answered times; no settings, groups or unread. boardId defaults to the board identified by this thread; when ambiguous, pass one of the candidate board ids in the error.",
   {
     boardId: BoardRef,
     after: Schema.optional(
@@ -227,7 +228,7 @@ const BoardGet = tool(
 const BoardActivity = tool(
   "board_activity",
   "Board activity rollup",
-  "A board's activity in a window (default the last 24 hours, at most 72): every ask answered in the window with asked/answered times and minutes to answer (p50/p90/max), open asks and asks open over 6 hours, review rounds and verdicts per card, hours in each stage with dwell median/p95/max and the longest spans, open cards in one stage over 24 hours, stalls and how long they lasted, run failures (stalled, retried, fresh thread, reviewer without verdict) by kind and model, threads started, restarts and evaluator starts (new threads; evaluatorWakes is a compatibility alias), cards left in working or in_review with no thread, and an estimate of pool slots held per hour per model next to each pool's slots. Card numbers only, no titles or text. Read from the cards' stored history; long lists other than the answered asks are cut and say how many more.",
+  "A board's activity in a window (default the last 24 hours, at most 72): asks answered in the window with asked/answered times and minutes to answer (p50/p90/max), open counts asks that need an answer; open notices are counted in openNotices. Answer times are also split by kind (missing kind is question) and blocking, with separate counts for decisions and notices open over 6 hours; review rounds and verdicts per card, hours in each stage with dwell median/p95/max and the longest spans, open cards in one stage over 24 hours, stalls and how long they lasted, run failures (stalled, retried, fresh thread, reviewer without verdict) by kind and model, threads started, restarts and evaluator starts (new threads; evaluatorWakes is a compatibility alias), cards left in working or in_review with no thread, and an estimate of pool slots held per hour per model next to each pool's slots. Queued todo/needs_review cards include why they wait (pool full with rank, cards ahead and slot holders, blocked, waiting, and other dispatch gates), plus those queued over 6 hours. Card numbers only, no titles or text. Read from the cards' stored history. Lists are shortened to fit 50,000 characters and say how many more; answeredItems stays an array, with answeredItemsMore when some are omitted; an oversized kind breakdown reports omitted groups in answerMinutesByKindMore.",
   {
     boardId: BoardRef,
     since: Schema.optional(
@@ -532,7 +533,7 @@ const CardAskChange = tool(
     blocking: Schema.optional(
       describe(
         Schema.Boolean,
-        "true makes an async ask blocking. A blocking ask can't be made async.",
+        "true makes an async ask blocking. false is accepted only on an ask that is already async (no change); a blocking ask can't be made async.",
       ),
     ),
     revisionNote: Schema.optional(describe(Schema.String, "One line: what you changed and why.")),
@@ -622,7 +623,7 @@ const BoardStandingApproval = tool(
 const CardWait = tool(
   "card_wait",
   "Say what a card waits on",
-  "Set the one thing a card waits for, as data the board shows and checks, instead of writing \"waiting for the dev to push\" in a comment, a subtask or a stalled flag. on: push (new commits on pr; the reviewed commit is taken from the card's last review unless you pass head), merge (pr merged), ci (checks on pr finish), card (waitsOn is done), time (until passes), owner_go (the owner answers open question ask; ask it first with card_ask, and use a blocking card_ask instead when nothing can go on without him). When none of those fit (a Linear issue reaching a state, a deploy landing, a reply from a person), a board script can be the check: on script with script, the name of an enabled script on this board, and args for what it should look at. pr must be a PR link on the card: attach a parent or base PR with links first. One wait per card: a new one replaces the old, and takes over a stalled flag you could clear. When it ends the board clears it, logs why and wakes whoever acts next in the card's stage (wakeRole to choose; new commits on a card in review wake its reviewer for a fresh review); a wait that outlasts its limit (push 3d, merge 2d, ci 3h, card 7d, script 7d, owner_go 2d, or your until) shows the card as stuck. Several things to wait for: set the first, set the next when woken. clear:true removes it. Card threads use it on their own cards only. A worker can set a wait on its own card while running; it takes effect when the turn ends, so end the turn right after. For a PR's CI, call watch_pull_request and end the turn instead." +
+  "Set the one thing a card waits for, as data the board shows and checks, instead of writing \"waiting for the dev to push\" in a comment, a subtask or a stalled flag. on: push (new commits on pr; the reviewed commit is taken from the card's last review unless you pass head), merge (pr merged), ci (checks on pr finish), card (waitsOn is done), time (until passes), owner_go (the owner answers open question ask; ask it first with card_ask, and use a blocking card_ask instead when nothing can go on without him). When none of those fit (a Linear issue reaching a state, a deploy landing, a reply from a person), a board script can be the check: on script with script, the name of an enabled script on this board, and args for what it should look at. pr must be a PR link on the card: attach a parent or base PR with links first. One wait per card: a new one replaces the old, and takes over a stalled flag you could clear. When it ends the board clears it, logs why and wakes whoever acts next in the card's stage (wakeRole to choose; new commits on a card in review wake its reviewer for a fresh review); a wait that outlasts its limit (push 3d, merge 2d, ci 3h, card 7d, script 7d, owner_go 2d, or your until) shows the card as stuck. Several things to wait for: set the first, set the next when woken. clear:true removes it. Card threads use it on their own cards only. A worker in Working can park its own card while running with on: time (until required, at most 24 hours ahead), script, or card. Set it as your last act and end the turn; it survives turn end. Clear it if a durable watcher, offbox result or another wake reaches you first. Workers cannot use push, merge, ci or owner_go while Working: use watch_pull_request for PR waits, or card_ask for the owner's answer." +
     (WAITS_ENGINE_WIRED
       ? ""
       : " Not live yet: the wait is saved and shown, but the board does not end it or wake anyone until its tick checks waits, so keep your own check; it is accepted on cards in in_review, completed, deployed and needs_owner."),
@@ -648,7 +649,7 @@ const CardWait = tool(
     until: Schema.optional(
       describe(
         TrimmedNonEmptyString,
-        "time: when it ends (ISO 8601, at most 30 days ahead). Other kinds: your own deadline, after which the card shows as stuck.",
+        "time: when it ends (ISO 8601, at most 24 hours ahead for a Working worker parking itself, otherwise 30 days). Other kinds: your own deadline, after which the card shows as stuck.",
       ),
     ),
     head: Schema.optional(
@@ -849,13 +850,21 @@ const CardNext = tool(
 const CardEdit = tool(
   "card_edit",
   "Edit a card",
-  "Evaluators: change any card field. Links are added by URL and removeLinks takes them off by URL (both in one call replace a link); blockedBy replaces the list.",
+  "Evaluators: change any card field. Links are added by URL and removeLinks takes them off by URL (both in one call replace a link); blockedBy replaces the list. Replacing prompt or subtasks requires basedOn from the updatedAt you read; on conflict, card_get again, merge, and retry. promptEdits / subtaskEdits: exact find-and-replace on the prompt / open subtask texts; each oldString must appear exactly count times (default 1) in the text as left by the edits before it; all apply or none do. Not with prompt / subtasks in the same call.",
   {
     boardId: BoardRef,
     card: CardRef,
     title: Schema.optional(Schema.String),
     description: Schema.optional(Schema.String),
     prompt: Schema.optional(Schema.String),
+    promptEdits: Schema.optional(ExactEdits),
+    subtaskEdits: Schema.optional(ExactEdits),
+    basedOn: Schema.optional(
+      describe(
+        Schema.String,
+        "updatedAt from your last card_get/card_create/card_edit result; required when replacing prompt or subtasks.",
+      ),
+    ),
     priority: Schema.optional(
       describe(
         KanbanPriority,
@@ -905,12 +914,15 @@ const SubtaskDone = tool(
 const CardThread = tool(
   "card_thread",
   "Steer, stop, wake or reset a card thread",
-  "Evaluators: steer the card's live thread with text, stop it (the card keeps its place; move it if needed), wake its last work thread with text, or reset it: the card drops its threads and its next run starts on a fresh one, with text as a note for it.",
+  "Evaluators: steer the card's live thread with text, stop it (the card keeps its place; move it if needed), wake its last work thread with text, or reset it: the card drops its threads and its next run starts on a fresh one, with text as a note for it. Steer and wake require non-blank text. message is an alias for text; if both are supplied, they must match.",
   {
     boardId: BoardRef,
     card: CardRef,
     action: Schema.Literals(["steer", "stop", "wake", "reset"]),
     text: Schema.optional(Schema.String),
+    message: Schema.optional(
+      describe(Schema.String, "Alias for text; if both are supplied, they must match."),
+    ),
   },
   { card: Record },
   { readonly: false, destructive: true },
@@ -1027,15 +1039,7 @@ const WikiWrite = tool(
     slug: TrimmedNonEmptyString,
     title: Schema.optional(RawBoardText),
     body: Schema.optional(Schema.String),
-    edits: Schema.optional(
-      Schema.Array(
-        Schema.Struct({
-          oldString: Schema.String.check(Schema.isMinLength(1)),
-          newString: Schema.String,
-          count: Schema.optional(PositiveInt),
-        }),
-      ).check(Schema.isMinLength(1), Schema.isMaxLength(50)),
-    ),
+    edits: Schema.optional(ExactEdits),
   },
   { page: Record },
   { readonly: false },
@@ -1112,6 +1116,25 @@ const EvaluatorStart = tool(
   { readonly: false },
 );
 
+const EvaluatorStatus = tool(
+  "evaluator_status",
+  "Look up an evaluator request",
+  "Read back an evaluator_start or report_bug using exactly one returned queueId or threadId. Returns its queue state, evaluator thread and cards it filed or updated, including retitled or settled cards and duplicates recorded on existing cards.",
+  {
+    boardId: BoardRef,
+    queueId: Schema.optional(PositiveInt),
+    threadId: Schema.optional(TrimmedNonEmptyString),
+  },
+  {
+    saved: Schema.Boolean,
+    queued: Schema.Boolean,
+    queueId: Schema.optional(Schema.Number),
+    threadId: Schema.optional(TrimmedNonEmptyString),
+    cards: Records,
+  },
+  { readonly: true },
+);
+
 const SetupDone = tool(
   "setup_done",
   "End board setup",
@@ -1185,5 +1208,6 @@ export const KanbanToolkit = Toolkit.make(
   WikiWrite,
   BoardOpen,
   EvaluatorStart,
+  EvaluatorStatus,
   ReportBug,
 );

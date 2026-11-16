@@ -169,6 +169,7 @@ export default defineConfig({
       "t3code/no-manual-effect-runtime-in-tests": "error",
       "t3code/no-native-title-tooltip": "error",
       "t3code/no-raw-mcp-registration": "error",
+      "t3code/require-mcp-denial-reason": "error",
       "t3code/no-test-in-loop": "error",
       "t3code/no-rpc-permission-bypass": ["error", { allowRawClientAccess: true }],
       "t3code/no-unscoped-has": "error",

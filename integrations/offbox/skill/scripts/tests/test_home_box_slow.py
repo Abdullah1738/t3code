@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from offbox_lib import allocation, api, common, home, lease, pool
+from offbox_lib import allocation, api, common, home, lease, outage, pool
 from test_home_backend import BoxReadinessFailover
 
 REAL_REACHABLE = home.slow_read_reachable
@@ -41,6 +41,52 @@ class HomeBoxSlow(unittest.TestCase):
         self.stack.enter_context(patch.object(lease.subprocess, "run", return_value=SimpleNamespace(returncode=0, stderr=b"")))
         self.stack.enter_context(patch.object(lease, "ensure_ttl"))
         return self.f.con.execute("SELECT * FROM leases WHERE box_id='homebox'").fetchone()
+
+    def test_slow_read_after_acceptance_can_cross_the_queue_deadline(self):
+        for accepted, began in ((False, 39), (True, 0), (True, 39)):
+            self.clock.t = 1000
+            reads = []
+            def opening(request, timeout):
+                self.assertTrue(request.full_url.endswith("/sandboxes/homebox"))
+                reads.append(timeout)
+                if len(reads) == 1:
+                    self.clock.sleep(timeout)
+                    raise TimeoutError("sandbox read timed out")
+                return io.BytesIO(b'{"sandbox":{"id":"homebox","state":"running"}}')
+            with self.subTest(accepted=accepted, began=began), \
+                    patch.dict(os.environ, OFFBOX_POOL_WAIT_SECONDS="40"), allocation.queue() as queue, \
+                    patch.object(api, "get", self.f.status_get), patch.object(api, "_own_box"), \
+                    patch.object(api, "_key", return_value="fixture"), patch.object(api, "_open", side_effect=opening), \
+                    home.wait_budget():
+                self.clock.sleep(began)
+                with outage.accepted_machine() if accepted else contextlib.nullcontext():
+                    if accepted:
+                        self.assertEqual(lease._readiness_get("homebox")["id"], "homebox")
+                    else:
+                        with self.assertRaises(pool.PoolBusyError):
+                            lease._readiness_get("homebox")
+                self.assertEqual(queue["end"], 1040)
+                self.assertEqual(len(reads), 2 if accepted else 1)
+                self.assertEqual(self.clock.t, 1000 + began + 5)
+
+    def test_accepted_slow_read_keeps_caller_and_api_bounds(self):
+        for kind in ("explicit", "api"):
+            self.clock.t = 1000
+            reads = []
+            def opening(request, timeout):
+                reads.append(timeout)
+                self.clock.sleep(timeout)
+                raise TimeoutError("sandbox read timed out")
+            with self.subTest(kind=kind), patch.dict(os.environ, OFFBOX_POOL_WAIT_SECONDS="40"), \
+                    allocation.queue(), patch.object(api, "get", self.f.status_get), \
+                    patch.object(api, "_own_box"), patch.object(api, "_key", return_value="fixture"), \
+                    patch.object(api, "_open", side_effect=opening), home.wait_budget():
+                self.clock.sleep(39)
+                with outage.accepted_machine(), api.budget(8) if kind == "api" else contextlib.nullcontext():
+                    with self.assertRaises(api.BudgetExpired):
+                        lease._readiness_get("homebox", deadline=1047 if kind == "explicit" else None)
+                self.assertEqual(self.clock.t, 1047)
+                self.assertEqual(reads, [5, 3])
 
     def test_warm_ssh_two_transport_timeouts_keep_home_box_after_healthy_preflight(self):
         self.warm_ssh_row()

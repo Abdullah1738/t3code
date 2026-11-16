@@ -122,6 +122,7 @@ export const make = Effect.gen(function* () {
   const process = sourceControlHost.process;
   const crypto = yield* Crypto.Crypto;
   const environment = yield* HostProcess.Environment;
+  const platform = yield* HostProcess.Platform;
   const workingDirectory = yield* HostProcess.WorkingDirectory;
 
   const fingerprintOf = (host: string, token: string) =>
@@ -157,6 +158,16 @@ export const make = Effect.gen(function* () {
               error._tag === "VcsProcessExitError"
               ? new GitHubNotSignedInError({ host, ...(account === undefined ? {} : { account }) })
               : new GitHubCliFailedError({ host, cause: error }),
+        ),
+        Effect.tapError((error) =>
+          error._tag === "GitHubCliMissingError"
+            ? Effect.logWarning("GitHubCliMissingError", {
+                host,
+                pathEntryCount: (environment.PATH ?? environment.Path ?? "")
+                  .split(platform === "win32" ? ";" : ":")
+                  .filter((entry) => entry.trim()).length,
+              })
+            : Effect.void,
         ),
         Effect.map((output) => output.stdout.trim()),
         Effect.filterOrFail(

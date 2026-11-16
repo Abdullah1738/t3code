@@ -186,15 +186,24 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
     (filter?.kind === undefined || filter.kind === event.kind) &&
     (filter?.boardId === undefined || filter.boardId === event.boardId) &&
     (filter?.cardId === undefined || filter.cardId === event.cardId) &&
+    (filter?.cardNumber === undefined ||
+      filter.cardNumber === event.cardNumber ||
+      filter.cardNumber === event.callerCardNumber ||
+      filter.cardNumber === event.props?.cardNumber) &&
     (filter?.tool === undefined || filter.tool === event.tool) &&
     (filter?.outcome === undefined || filter.outcome === event.outcome) &&
     (filter?.responseDelivery === undefined || filter.responseDelivery === event.responseDelivery);
+  const relatedDetached = (event: AnalyticsEvent, filter?: AnalyticsReadInput) =>
+    event.kind === "mcp.detached" &&
+    (filter?.kind === undefined || filter.kind === "mcp.call") &&
+    (filter?.tool === undefined || filter.tool === event.tool);
   const viewKey = (day: string, filter?: AnalyticsReadInput) =>
     JSON.stringify([
       day,
       filter?.kind,
       filter?.boardId,
       filter?.cardId,
+      filter?.cardNumber,
       filter?.tool,
       filter?.outcome,
       filter?.responseDelivery,
@@ -266,7 +275,10 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
         accumulator.invalidLines++;
         return;
       }
-      if (!matches(event, filter)) return;
+      if (!matches(event, filter)) {
+        if (relatedDetached(event, filter)) accumulate(accumulator, event, true);
+        return;
+      }
       accumulate(accumulator, event);
       samples.add(event);
     });
@@ -479,7 +491,11 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
         for (const view of views.values()) {
           if (view.day !== first.day) continue;
           for (const entry of attempted) {
-            if (!matches(entry.event, view.filter)) continue;
+            if (!matches(entry.event, view.filter)) {
+              if (relatedDetached(entry.event, view.filter))
+                accumulate(view.accumulator, entry.event, true);
+              continue;
+            }
             accumulate(view.accumulator, entry.event);
             view.samples.add(entry.event);
           }
@@ -586,9 +602,13 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
     yield* boards.value.ready;
     const sql = boards.value.sql;
     const rows = yield* sql<
-      Omit<AskTimingRow, "kind"> & { kind: string | null; askJson: string | null }
+      Omit<AskTimingRow, "kind"> & {
+        cardNumber: number;
+        kind: string | null;
+        askJson: string | null;
+      }
     >`
-      SELECT c.board_id AS boardId, c.id AS cardId,
+      SELECT c.board_id AS boardId, c.id AS cardId, c.number AS cardNumber,
         json_extract(a.value, '$.id') AS askId,
         json_extract(a.value, '$.at') AS createdAt,
         json_extract(a.value, '$.closedAt') AS closedAt,
@@ -655,7 +675,8 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
                     storedRows.filter(
                       (row) =>
                         (filter?.boardId === undefined || row.boardId === filter.boardId) &&
-                        (filter?.cardId === undefined || row.cardId === filter.cardId),
+                        (filter?.cardId === undefined || row.cardId === filter.cardId) &&
+                        (filter?.cardNumber === undefined || row.cardNumber === filter.cardNumber),
                     ),
                     input.day,
                     generatedAt,

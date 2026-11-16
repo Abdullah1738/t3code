@@ -194,6 +194,7 @@ it.effect("cancels active work without reviving a run while disposing delegated 
     assert.isNull(projection.thread.deletedAt);
     for (const run of deleted.runs) {
       assert.equal(run.status, run.id.endsWith(":completed") ? "completed" : "cancelled");
+      assert.equal(run.cancelReason, run.id.endsWith(":completed") ? undefined : "thread_delete");
       assert.deepEqual(run.completedAt, run.id.endsWith(":completed") ? createdAt : deletedAt);
     }
     for (const attempt of deleted.attempts) {
