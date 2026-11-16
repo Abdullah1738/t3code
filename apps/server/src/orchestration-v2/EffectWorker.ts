@@ -119,6 +119,27 @@ export const layerExecutor: Layer.Layer<
       execute: (effect, options) => {
         const willRetry = options?.willRetry ?? false;
         switch (effect.request.type) {
+          case "provider-session.reconcile-turn":
+            return threads
+              .dispatch({
+                type: "thread.background-work.settle",
+                runOnly: true,
+                commandId: CommandId.make(`${effect.id}:settle`),
+                threadId: effect.threadId,
+                providerThreadId: effect.request.providerThreadId,
+                providerTurnId: effect.request.providerTurnId,
+              })
+              .pipe(
+                Effect.asVoid,
+                Effect.mapError(
+                  (cause) =>
+                    new OrchestrationEffectExecutionError({
+                      effectId: effect.id,
+                      effectType: effect.request.type,
+                      cause,
+                    }),
+                ),
+              );
           case "provider-runtime.continue": {
             const { sourceRunId, queued } = effect.request;
             const source = {

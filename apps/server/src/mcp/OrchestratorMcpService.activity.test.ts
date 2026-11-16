@@ -8,6 +8,7 @@ import {
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderSessionId,
   RunId,
   ScheduledTaskId,
   ThreadId,
@@ -23,6 +24,7 @@ import * as Fiber from "effect/Fiber";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
+import { ProviderSessionEndedError } from "../orchestration-v2/ProviderSessionManager.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
@@ -1237,7 +1239,9 @@ it.each(["missing-session", "capability", "replay"] as const)(
                       commandType: "message.dispatch",
                       cause:
                         kind === "missing-session"
-                          ? "Provider session provider-session-dead is not active."
+                          ? new ProviderSessionEndedError({
+                              providerSessionId: ProviderSessionId.make("provider-session-dead"),
+                            })
                           : new CommandPolicyCapabilityUnsupportedError({
                               commandId: input.commandId,
                               threadId: targetThreadId,
@@ -1278,7 +1282,11 @@ it.each(["missing-session", "capability", "replay"] as const)(
       } else {
         expect(failure.message).toBe(
           `Unable to send to thread ${targetThreadId}: ${
-            kind === "capability" ? reason : "Provider session provider-session-dead is not active."
+            kind === "capability"
+              ? reason
+              : new ProviderSessionEndedError({
+                  providerSessionId: ProviderSessionId.make("provider-session-dead"),
+                }).message
           }`,
         );
       }

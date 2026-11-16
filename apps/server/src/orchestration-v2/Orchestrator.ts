@@ -172,7 +172,7 @@ import { ProviderAdapterRegistryV2 } from "./ProviderAdapterRegistry.ts";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import * as RunExecutionService from "./RunExecutionService.ts";
-import { ProviderSessionManagerV2 } from "./ProviderSessionManager.ts";
+import { ProviderSessionEndedError, ProviderSessionManagerV2 } from "./ProviderSessionManager.ts";
 import { ProviderSwitchServiceV2 } from "./ProviderSwitchService.ts";
 import { isAutomaticCompletionRun, queuedRunsInDeliveryOrder } from "./QueuedRunOrder.ts";
 import { refreshPullRequestCheckWake } from "./pullRequestWatch.ts";
@@ -4722,7 +4722,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       return yield* new OrchestratorDispatchError({
         commandId: input.command.commandId,
         commandType: input.command.type,
-        cause: `Provider session ${providerThread.providerSessionId} is not active.`,
+        cause: new ProviderSessionEndedError({
+          providerSessionId,
+          runId: targetRun.id,
+          ...(input.command.type === "queued-message.promote-to-steer"
+            ? { queuedMessageId: input.messageId }
+            : {}),
+        }),
       });
     }
 
@@ -10888,6 +10894,20 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         (attempt) => attempt.id === stopped.providerTurn?.runAttemptId,
       )?.runId;
       const stoppedRun = projection.runs.find((run) => run.id === stoppedRunId);
+      if (command.runOnly === true && stopped.providerTurn?.status === "running") {
+        const now = yield* DateTime.now;
+        yield* emit(
+          events,
+          command,
+        )({
+          type: "provider-turn.updated",
+          threadId: command.threadId,
+          ...(stoppedRunId === undefined ? {} : { runId: stoppedRunId }),
+          nodeId: stopped.providerTurn.nodeId,
+          occurredAt: now,
+          payload: { ...stopped.providerTurn, status: "interrupted", completedAt: now },
+        });
+      }
       if (
         stoppedRun === undefined ||
         (["preparing", "starting", "running"].includes(stoppedRun.status) &&
@@ -10905,12 +10925,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         yield* settleInterruptedRun({
           command,
           projection: { ...projection, messages: output.messages },
-          providerTurn: stopped.providerTurn,
+          providerTurn:
+            command.runOnly === true
+              ? { ...stopped.providerTurn, status: "interrupted", completedAt: now }
+              : stopped.providerTurn,
           events,
           effects,
           now,
         });
       }
+      // Session loss alone cannot confirm the end of remote background work.
+      if (command.runOnly === true) return;
       // A new turn may have started since Stop; its work is not this Stop's.
       if (
         projection.runs.some(

@@ -182,7 +182,10 @@ export const layer: Layer.Layer<
           threadId: input.threadId,
           operation: input.operation,
           providerTurnId: input.providerTurnId,
-          cause: `Provider session ${input.providerSessionId} is not active.`,
+          cause: new ProviderSessionManager.ProviderSessionEndedError({
+            providerSessionId: input.providerSessionId,
+            ...(context.run === undefined ? {} : { runId: context.run.id }),
+          }),
         });
       }
       return { context, providerThread: interruptProviderThread, providerTurn, session };

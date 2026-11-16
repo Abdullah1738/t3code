@@ -3,19 +3,20 @@ import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import {
+  CommandId,
+  MessageId,
   isOrchestrationV2WorkActive,
   ModelSelection,
   OrchestrationV2DomainEvent,
   OrchestrationV2ProviderSession,
   type OrchestrationV2ProviderThread,
   type OrchestrationV2ConversationMessage,
-  type MessageId,
   OrchestrationV2RuntimeRequest,
   ProviderInstanceId,
   ProviderSessionId,
   ThreadId,
   type ProviderThreadId,
-  type RunId,
+  RunId,
   type RunAttemptId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -51,6 +52,7 @@ import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderS
 import * as ServerSettings from "../serverSettings.ts";
 import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
 import * as EventSink from "./EventSink.ts";
+import type { PendingOrchestrationEffectV2 } from "./EffectOutbox.ts";
 import * as CommandOutputHub from "./CommandOutputHub.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
@@ -88,6 +90,21 @@ export const ProviderSessionReleaseReason = Schema.Literals([
   "server_shutdown",
 ]);
 export type ProviderSessionReleaseReason = typeof ProviderSessionReleaseReason.Type;
+
+export class ProviderSessionEndedError extends Schema.TaggedError<ProviderSessionEndedError>()(
+  "ProviderSessionEndedError",
+  {
+    providerSessionId: ProviderSessionId,
+    runId: Schema.optional(RunId),
+    queuedMessageId: Schema.optional(MessageId),
+  },
+) {
+  override get message(): string {
+    return this.queuedMessageId === undefined
+      ? "The provider session ended before the message could be delivered. Send the follow-up with mode=queue and a new clientRequestId."
+      : "The provider session ended. This message remains queued for the next turn.";
+  }
+}
 
 export class ProviderSessionOpenError extends Schema.TaggedError<ProviderSessionOpenError>()(
   "ProviderSessionOpenError",
@@ -954,6 +971,60 @@ export const layerWithOptions = (
         ReturnType<typeof readReleasedBackgroundTasks>
       >[number];
 
+      const readReleasedTurns = Effect.fn("ProviderSessionManager.readReleasedTurns")(
+        function* (input: {
+          readonly entry: LiveSessionEntry;
+          readonly reason: ProviderSessionReleaseReason;
+          readonly releasedAt: DateTime.Utc;
+          readonly detachedThreadId?: ThreadId;
+        }) {
+          if (input.reason === "server_shutdown" || !input.entry.supportsMultipleProviderThreads)
+            return [];
+          const threadIds = new Set(input.entry.attachedThreadIds);
+          if (input.detachedThreadId !== undefined) threadIds.add(input.detachedThreadId);
+          const effects: PendingOrchestrationEffectV2[] = [];
+          for (const threadId of threadIds) {
+            const projection = yield* projectionStore.getThreadRecords(threadId, [
+              "runs",
+              "providerThreads",
+              "providerTurns",
+            ]);
+            const owned = new Set(
+              projection.providerThreads
+                .filter(
+                  (thread) => thread.providerSessionId === input.entry.runtime.providerSessionId,
+                )
+                .map((thread) => thread.id),
+            );
+            for (const turn of projection.providerTurns) {
+              // A replacement can reuse the shared session id while this release drains.
+              if (
+                turn.status !== "running" ||
+                !owned.has(turn.providerThreadId) ||
+                (turn.startedAt !== null &&
+                  DateTime.isGreaterThan(turn.startedAt, input.releasedAt)) ||
+                !projection.runs.some(
+                  (run) => run.status === "running" && run.activeAttemptId === turn.runAttemptId,
+                )
+              )
+                continue;
+              const id = `effect:session-ended:${turn.id}`;
+              effects.push({
+                id,
+                commandId: CommandId.make(`${id}:reconcile`),
+                threadId,
+                request: {
+                  type: "provider-session.reconcile-turn",
+                  providerThreadId: turn.providerThreadId,
+                  providerTurnId: turn.id,
+                },
+              });
+            }
+          }
+          return effects;
+        },
+      );
+
       // Their process is gone, so nothing will report them ending, and a
       // leftover roster keeps the thread Waiting (#15239).
       const writeReleasedBackgroundWorkEvents = (
@@ -1015,11 +1086,21 @@ export const layerWithOptions = (
         readonly reason: ProviderSessionReleaseReason;
         readonly detail?: string;
         readonly releasedBackgroundTasks: ReadonlyArray<ReleasedBackgroundTasks>;
+        readonly detachedThreadId?: ThreadId;
         readonly releasedAt: DateTime.Utc;
         readonly replaced: boolean;
+        readonly releasedTurns: Exit.Exit<PendingOrchestrationEffectV2[], unknown>;
       }) =>
         Effect.all(
           [
+            Effect.exit(
+              (Exit.isSuccess(input.releasedTurns)
+                ? Effect.succeed(input.releasedTurns.value)
+                : readReleasedTurns(input)
+              ).pipe(
+                Effect.flatMap((effects) => eventSink.writeWithEffects({ events: [], effects })),
+              ),
+            ),
             input.replaced
               ? Effect.succeed(Exit.void)
               : Effect.exit(writeReleasedSessionEvents(input)),
@@ -1200,6 +1281,16 @@ export const layerWithOptions = (
               onNone: () => Effect.void,
               onSome: (entry) =>
                 Effect.gen(function* () {
+                  const releasedTurns = yield* Effect.exit(
+                    readReleasedTurns({
+                      entry,
+                      reason: input.reason,
+                      releasedAt,
+                      ...(input.detachedThreadId === undefined
+                        ? {}
+                        : { detachedThreadId: input.detachedThreadId }),
+                    }),
+                  );
                   const releasedBackgroundTasks = yield* readReleasedBackgroundTasks({
                     entry,
                     reason: input.reason,
@@ -1229,6 +1320,10 @@ export const layerWithOptions = (
                     reason: input.reason,
                     ...(input.detail === undefined ? {} : { detail: input.detail }),
                     releasedBackgroundTasks,
+                    releasedTurns,
+                    ...(input.detachedThreadId === undefined
+                      ? {}
+                      : { detachedThreadId: input.detachedThreadId }),
                     releasedAt,
                   };
                   const recorded = yield* Effect.exit(
