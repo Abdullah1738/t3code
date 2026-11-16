@@ -42,7 +42,9 @@ class Fakes:
         self.sh = {}               # argv prefix tuple -> (rc, out)
         self.sh_calls = []
 
-    def incus(self, *args, input=None, timeout=600, check=True):
+    def incus(self, *args, input=None, timeout=600, check=True, before_dispatch=None):
+        if before_dispatch and not before_dispatch():
+            return subprocess.CompletedProcess(args, 75, b'', b'claim deferred')
         self.calls.append(args)
         rc, out = 0, b""
         if args[:1] == ("start",):
@@ -380,8 +382,14 @@ class ReconcileBoxes(Base):
                          ("ready", "sv-old", None))
         self.assertEqual(rows["first"]["status"], "failed")
         deleted = [c[1] for c in self.f.calls if c[:1] == ("delete",)]
+        pending = [r['instance'] for r in self.con.execute('SELECT instance FROM incus_deletes')]
+        self.assertEqual(sorted(deleted + pending), ['sv-first', 'sv-new'])
+        self.assertEqual(len(deleted), 1)
+        boatd.reap_once(self.con)
+        deleted = [c[1] for c in self.f.calls if c[:1] == ('delete',)]
         self.assertEqual(sorted(deleted), ["sv-first", "sv-new"])
         self.assertNotIn("sv-old", deleted)
+        self.assertEqual(self.con.execute('SELECT count(*) FROM incus_deletes').fetchone()[0], 0)
 
     def test_snapshot_records_follow_what_exists_adopt_and_drop_never_delete(self):
         b = self.box()

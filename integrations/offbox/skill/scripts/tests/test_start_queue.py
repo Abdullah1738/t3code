@@ -327,6 +327,21 @@ class ResumeQueueTests(Isolated):
             resume.assert_not_called()
             self.assertIsNotNone(self.con.execute("SELECT 1 FROM kv WHERE k='resume_unanswered:cold'").fetchone())
 
+    def test_unanswered_stopping_message_is_once_per_queued_run(self):
+        self.box('cold', 'stopped', member=True)
+        self.marker('cold', 99999999)
+        for attempt in range(2):
+            before = len(self.err.getvalue())
+            with patch.dict(os.environ, {'OFFBOX_POOL_SIZE':'1'}), \
+                    patch.object(api, 'get', return_value={'state':'stopping','type':'large'}), \
+                    patch.object(api, 'resume') as resume:
+                with self.assertRaises(pool.PoolBusyError):
+                    self.take()
+            resume.assert_not_called()
+            text = self.err.getvalue()[before:]
+            self.assertEqual(text.count('cold is stopping; skipping it for now'), 1)
+            self.assertNotIn('is stopping; waiting for it to settle', text)
+
     def test_outer_reconcile_box_lock_is_busy_not_90(self):
         self.box('cold','stopped',member=True)
         self.box('peer',member=True)
@@ -468,8 +483,9 @@ class ResumeQueueTests(Isolated):
             def sleep(s):
                 self.clock.t += s
                 if phase[0]=='stopping':
-                    self.marker('cold',os.getpid())
-                    phase[0]='archived'
+                    if self.clock.t >= 1006:
+                        self.marker('cold',os.getpid())
+                        phase[0]='archived'
                 else:
                     allocation.clear_resume(self.con,'cold')
                     phase[0]='running'
@@ -477,7 +493,7 @@ class ResumeQueueTests(Isolated):
                     patch.object(lease,'_bring_up'),patch.object(lease,'ensure_ttl'),patch.object(api,'resume') as resume:
                 self.assertEqual(self.take()['size'],'xlarge')
             resume.assert_not_called()
-        self.assertIn('is stopping; skipping',self.err.getvalue())
+        self.assertEqual(self.err.getvalue().count('cold is stopping; skipping it for now'), 1)
 
     def test_resize_intent_survives_grower_skip_and_smaller_caller(self):
         self.box('grow','running',member=True)
