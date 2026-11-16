@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { normalize, runCheck, TriggerError, triggerSig } from "../src/lib.ts";
@@ -26,8 +26,15 @@ for (const [i, input] of fixtures.entries()) for (const exitCode of [1, 2]) {
   });
 }
 
-test.each(["PRIVATE", "PRIVATE-wal"])("missing trigger %s throws safe metadata for the runner", suffix => {
+test.each(["PRIVATE", "PRIVATE-wal", "PRIVATE-parent/child"])("absent trigger %s contributes a missing signature", suffix => {
   const dir = fixture(), path = join(dir, suffix);
+  const watcher = normalize({ mode: "notify", id: "fixture", title: "PRIVATE", check: "true", triggers: [path] });
+  expect(triggerSig(watcher)).toBe("missing");
+});
+
+test.each(["PRIVATE", "PRIVATE-wal"])("dangling trigger symlink %s throws safe metadata for the runner", suffix => {
+  const dir = fixture(), path = join(dir, suffix);
+  symlinkSync(join(dir, "absent"), path);
   const watcher = normalize({ mode: "notify", id: "fixture", title: "PRIVATE", check: "true", triggers: [path] });
   let error: unknown;
   try { triggerSig(watcher); } catch (caught) { error = caught; }

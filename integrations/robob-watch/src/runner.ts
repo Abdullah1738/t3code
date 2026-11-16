@@ -6,7 +6,7 @@ import { join } from "node:path";
 import {
   withRelayLock, watcherInstance, finalizeClosing, checking, pollingWatcher, checkEvent, PERSON_BATCH_MS, queueEvent, sealBatch, sameDestination, alert, deliver, ensureDirs, escalate, failureSources, hash, shouldEscalate, HEADSUP_GIVE_UP_MS, HEADSUP_MS, headsUpText, imessage,
   trackConfirmation, confirmWakes, inboundState, inQuiet, iso, listIds, loadState, loadWatcher, log, now, ROOT, RUN_OK_FILE, runCheck, saveState, type State, telegram, type TrackedWake,
-  heldByMaintenance, loadMaintenance, type Maintenance, shouldNotifyFailure, shouldPause, FAILURE_NOTICE_AFTER, TriggerError, triggerSig, type Watcher, wakeInboundId, watcherDir, SLOW_RUN_MS, TIMEOUT_BACKOFF_CAP_S,
+  heldByMaintenance, loadMaintenance, type Maintenance, shouldNotifyFailure, shouldPause, FAILURE_NOTICE_AFTER, TriggerError, triggerSig, type MissingTrigger, type Watcher, wakeInboundId, watcherDir, SLOW_RUN_MS, TIMEOUT_BACKOFF_CAP_S,
 } from "./lib.ts";
 
 import { CheckSlots, checkSlotCap, checkTimeout, hostLoad, isMounted, LOAD_GRACE_MS, LOAD_HIGH, SSD_PATH } from "./host.ts";
@@ -252,6 +252,44 @@ function logTriggerError(watcher: Watcher, state: State, error: TriggerError, t:
   window.count = 0;
 }
 
+const TRIGGER_MISSING_REPEAT_MS = 60 * 60_000;
+function logMissingTriggers(watcher: Watcher, state: State, missing: MissingTrigger[], t: number): void {
+  const previous = state.trigger_missing;
+  if (!previous && !missing.length) return;
+  let changed = false;
+  let loggedAt = previous?.loggedAt ?? t;
+  const paths = [...new Map(missing.map(trigger => [trigger.triggerPathHash, trigger])).values()].map(trigger => {
+    const saved = previous?.paths.find(path => path.triggerPathHash === trigger.triggerPathHash);
+    if (saved) return saved;
+    const path = { ...trigger, missingSince: iso(t) };
+    toolLog({ component: "runner", kind: "event", name: "runner.trigger_missing", ok: true,
+      ids: { watcher: watcher.id }, props: path });
+    changed = true;
+    return path;
+  });
+  for (const path of previous?.paths ?? []) {
+    if (paths.some(current => current.triggerPathHash === path.triggerPathHash)) continue;
+    // Replacing a trigger in the definition is not evidence that the old file appeared.
+    if (watcher.triggers?.some(trigger => hash(trigger).slice(0, 16) === path.triggerPathHash)) {
+      toolLog({ component: "runner", kind: "event", name: "runner.trigger_present", ok: true,
+        ids: { watcher: watcher.id }, props: { triggerPathHash: path.triggerPathHash, missingForS: Math.max(0, (t - Date.parse(path.missingSince)) / 1000) } });
+    }
+    changed = true;
+  }
+  // One reminder per watcher per hour, even when several trigger files are missing.
+  if (paths.length && t - loggedAt >= TRIGGER_MISSING_REPEAT_MS) {
+    const path = paths[0]!;
+    toolLog({ component: "runner", kind: "event", name: "runner.trigger_missing.repeat", ok: true,
+      ids: { watcher: watcher.id }, props: { ...path, missingForS: Math.max(0, (t - Date.parse(path.missingSince)) / 1000) } });
+    loggedAt = t;
+    changed = true;
+  }
+  if (!changed) return;
+  if (paths.length) state.trigger_missing = { paths, loggedAt };
+  else delete state.trigger_missing;
+  saveState(watcher.id, state);
+}
+
 function acknowledgeRun(id: string, instance: string | undefined, run: string): void {
   withRelayLock(() => {
     if (!instance || watcherInstance(id) !== instance || !loadWatcher(id)) return;
@@ -375,7 +413,8 @@ export async function tickOne(id: string): Promise<void> {
   // Trigger files (e.g. chat.db-wal) run the check as soon as they change; interval_s stays the fallback.
   // A failing watcher keeps its backoff; the signature is recorded before the run so a change mid-run re-triggers.
   let sig: string | undefined;
-  try { sig = triggerSig(watcher); }
+  const missing: MissingTrigger[] = [];
+  try { sig = triggerSig(watcher, trigger => missing.push(trigger)); }
   catch (error) {
     if (!(error instanceof TriggerError)) throw error;
     if ((state.next_at ?? 0) > t && !(finalCheck && !state.closing_final_started)) return;
@@ -391,7 +430,9 @@ export async function tickOne(id: string): Promise<void> {
     delete state.trigger_error;
     saveState(id, state);
   }
-  const triggered = sig !== undefined && sig !== state.trigger_sig && !state.consecutive_failures && !state.load_timeouts && !state.pending
+  logMissingTriggers(watcher, state, missing, t);
+  const initialMissing = state.trigger_sig === undefined && sig?.split("|").every(part => part === "missing");
+  const triggered = !initialMissing && sig !== undefined && sig !== state.trigger_sig && !state.consecutive_failures && !state.load_timeouts && !state.pending
     && t - Date.parse(state.last_run_at ?? "1970-01-01") >= (watcher.trigger_gap_s ? watcher.trigger_gap_s * 1_000 : TRIGGER_MIN_GAP_MS);
   if ((state.next_at ?? 0) > t && !triggered && !(finalCheck && !state.closing_final_started)) return;
   const schedule = () => {
