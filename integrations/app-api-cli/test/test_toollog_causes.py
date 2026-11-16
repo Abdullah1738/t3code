@@ -50,7 +50,8 @@ class CauseLogs(unittest.TestCase):
                         details.details('FTEST', 'food')
                 opener.open.assert_called_once()
                 row = self.rows()[-1]
-                self.assertEqual(row['props'], {'merchant': 'noon', 'lane': 'food'})
+                self.assertEqual(row['props'], {'merchant': 'noon', 'lane': 'food',
+                                                'caller': 'other', 'trigger': 'other'})
                 self.assertEqual(row['error']['cause'], {
                     'httpStatus': status, 'endpoint': '/_svc/mp-food-api-mpnoon/order/details',
                     'attempt': 1, 'retryable': status != 401, 'upstreamCode': None,

@@ -1535,6 +1535,7 @@ def print_wake(cfg, result, state, events):
                           'whole_order_complete': result.get('whole_order_complete'), 'bank_charge': bank}))
 
 
+@toollog.entrypoint('order-watch', 'check')
 def check(cfg):
     toollog.previous_day_rollup()
     with toollog.deferred():
@@ -1803,6 +1804,7 @@ def retire(cfg, path, watcher=None):
 
 
 @toollog.registration
+@toollog.entrypoint('order-watch', 'status', cli=True)
 def main(argv=None, _locked=False):
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ['can-report']:

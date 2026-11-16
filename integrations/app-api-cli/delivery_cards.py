@@ -4,6 +4,7 @@ Watcher checks supply already-read evidence. No polling process or merchant
 request is started here. Only the allowlisted view is written to the web root.
 """
 import threading
+import toollog
 import argparse
 from collections import Counter
 import datetime as dt
@@ -1107,6 +1108,7 @@ def safe_sync(cfg, data, *, send=False, recover=False, update=False):
         return {'status': 'failed:' + type(exc).__name__ + ':' + str(exc), 'rendered': False}
 
 
+@toollog.entrypoint('delivery-card', 'delivery-card')
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--app', required=True, choices=THEMES)
@@ -1147,7 +1149,7 @@ def main(argv=None):
         else:
             domain_args = ['--merchant-domain', a.merchant_domain] if a.app == 'web' else []
             p = subprocess.run([str(Path.home() / '.local/bin/order-watch'), 'status', '--app', a.app, '--order', a.order,
-                                *domain_args], capture_output=True, text=True, timeout=240)
+                                *domain_args], capture_output=True, text=True, timeout=240, env=toollog.caller_env())
             if p.returncode:
                 raise SystemExit('order-watch status failed')
             data = json.loads(p.stdout)

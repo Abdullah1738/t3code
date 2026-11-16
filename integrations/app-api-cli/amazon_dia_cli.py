@@ -148,8 +148,12 @@ def read_orders(*, tab_id=None, expected_order_id=None, timeout=30):
         raise BrowserOrdersError('DIA_BINDING_MISMATCH')
     result = parse_dia_result(envelope.get('response'), tab_id=binding['tab_id'],
                               target_id=binding['target_id'],
-                              observed_at=dt.datetime.now(dt.timezone.utc).isoformat(),
-                              expected_order_id=expected_order_id)
+                              observed_at=dt.datetime.now(dt.timezone.utc).isoformat())
+    toollog.order_page(result.get('orders'))
+    if expected_order_id is not None:
+        result['orders'] = [row for row in result['orders'] if row['order_id'] == expected_order_id]
+        if not result['orders']:
+            raise BrowserOrdersError('ORDER_NOT_ON_THIS_PAGE')
     result['transport'] = 'dia_mcp_stdio'
     return result
 
@@ -160,6 +164,7 @@ class _SafeParser(argparse.ArgumentParser):
         raise BrowserOrdersError('INVALID_ARGUMENTS')
 
 
+@toollog.entrypoint('commerce-cmd', 'amazon-orders', cli=True)
 def main(argv=None):
     parser = _SafeParser(description='Read the current Amazon.ae orders page in Dia Personal; no navigation or auth.')
     parser.add_argument('command', choices=('orders', 'track'))
