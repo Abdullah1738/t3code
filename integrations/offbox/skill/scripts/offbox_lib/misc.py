@@ -23,7 +23,7 @@ from time import monotonic, sleep
 import toollog
 
 from . import api, capacity, lease, outage, pool, ssh_sync
-from .common import (BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXEMPTIONS, EXIT_INFRA, EXIT_NOT_STARTED, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TOO_BIG_NOTE,
+from .common import (BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXEMPTIONS, EXIT_BUSY, EXIT_INFRA, EXIT_NOT_STARTED, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TOO_BIG_NOTE,
                      OffboxError, ago, atomic_write_json, checkpoint, db, event, file_lock, iso, is_silenced, log, month_key, now,
                      delivered_bytes, offsets_path, out, read_json, record_delivery, require_mine, say, silence)
 from .common import mine as token_mine  # release() has its own `mine` flag
@@ -1276,6 +1276,26 @@ def _validated_step_row(r, code):
 
 
 def _follow_forwarded(r, command, *, timeout=None, follow=False) -> int:
+    reason = '(reason not in the client log)'
+    backend = r['error']
+    source = 'Boat' if backend == 'server' else 'the home offbox server'
+    try:
+        with (LOGS_DIR / f"{r['run_id']}.client.log").open('rb') as stream:
+            stream.seek(max(0, os.fstat(stream.fileno()).st_size - 64 * 1024))
+            for line in reversed(stream.read(64 * 1024).decode(errors='replace').splitlines()):
+                if backend == 'server':
+                    if 'home offbox server is back; this run leaves the Boat queue' in line:
+                        reason = 'home offbox server is back'
+                        break
+                elif 'this run goes to Boat instead' in line or 'this run is going to Boat' in line:
+                    match = (re.search(r'not reachable \((.*)\); this run goes to Boat instead', line) or
+                             re.search(r'home (?:offbox )?server (?:is )?(.+); this run is going to Boat', line))
+                    if match:
+                        reason = match[1]
+                    break
+    except OSError:
+        pass
+    say(f"{r['run_id']} moved from {source} to {backend}: {reason}")
     env = dict(os.environ, OFFBOX_BACKEND=r['error'])
     env.pop('OFFBOX_BACKGROUND_RUN', None)
     args = [sys.executable, str(Path(__file__).resolve().parents[1] / 'offbox.py'), command, r['run_id']]
@@ -1291,6 +1311,13 @@ def _never_started(r) -> bool:
         return False
     if r['status'] == 'killed':
         return not r['box_id'] and not r['process_id']
+    queued_busy = r['status'] == 'busy' and r['exit_code'] == EXIT_BUSY and not r['box_id']
+    if (r['status'] == 'infra' or queued_busy) and not r['command_id'] and not r['process_id']:
+        error = r['error'] or ''
+        if 'nothing ran' in error.lower() or (not r['box_id'] and re.match(r'^box bx_\w+ went to error:', error)):
+            from . import start_check
+            with contextlib.closing(db()) as con:
+                return not start_check.recovery_marked(con, r)
     return (r['status'] == 'lost' and r['exit_code'] is None
             and (r['error'] == 'client ended before it got a box' or
                  (not r['box_id'] and not r['process_id'])))
@@ -1307,14 +1334,22 @@ def _report_never_started(r) -> int:
             tail = stream.read().decode(errors='replace').splitlines()[-20:]
     except OSError:
         tail = []
-    guess = '' if client_log.exists() else ' (caller interrupted?)'
-    say(f"{r['run_id']}: never started: the offbox client that queued it ended before it got a box"
-        f"{guess}; nothing ran, safe to rerun")
+    code = EXIT_NOT_STARTED
+    if r['status'] in ('infra', 'busy'):
+        error = r['error'] or ''
+        match = re.search(r'nothing ran \(exit (\d+)\)', error, re.I)
+        code = r['exit_code'] if r['exit_code'] is not None else int(match[1]) if match else EXIT_INFRA
+        reason = error if code == 2 else ' '.join(error.split())[:300] + '; nothing ran, safe to rerun'
+        say(f"{r['run_id']}: never started: {reason}")
+    else:
+        guess = '' if client_log.exists() else ' (caller interrupted?)'
+        say(f"{r['run_id']}: never started: the offbox client that queued it ended before it got a box"
+            f"{guess}; nothing ran, safe to rerun")
     if tail:
         say(f"client log: {client_log}")
         for line in tail:
             say(line)
-    return EXIT_NOT_STARTED
+    return code
 
 
 def logs(run_id: str, do_follow: bool) -> int:

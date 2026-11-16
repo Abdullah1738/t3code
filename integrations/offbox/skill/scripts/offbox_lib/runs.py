@@ -3032,6 +3032,12 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
         if prior['status'] == 'killed':
             code, st = prior['exit_code'] or (143 if prior['process_id'] else 130), 'killed'
             return
+        if status == 'busy' and incoming == EXIT_BUSY and not any(
+                prior[k] for k in ('box_id', 'command_id', 'process_id')):
+            from . import start_check
+            with contextlib.closing(db()) as con:
+                if not start_check.recovery_marked(con, prior):
+                    return  # A pre-box queue refusal has no step results to validate.
         if incoming in (None, 137, 143):
             killed = killed_result(run_id, wait=True, until=until, row=prior, known_code=incoming)
             if killed is not None:
@@ -3498,7 +3504,10 @@ def _run_remote(a, rn) -> int:
                     finish(rn.run_id, EXIT_LOCAL, "local_error")
                 elif not os.environ.get(BACKGROUND_RUN_ENV) and not (
                         os.environ.get(home.RETURNED_HOME_ENV) and home.unreachable(e)):
-                    finish(rn.run_id, None, "busy" if e.code == EXIT_BUSY else "infra")
+                    # Preserve a pre-box refusal's exit without assigning an exit to an uncertain command start.
+                    code = e.code if not rn.box and (e.code == EXIT_BUSY or (
+                        e.code in (2, EXIT_INFRA) and 'nothing ran' in str(e).lower())) else None
+                    finish(rn.run_id, code, "busy" if e.code == EXIT_BUSY else "infra")
             if not isinstance(e, common.SourceGone):
                 rn.record(error=str(e)[:500])
             raise e
