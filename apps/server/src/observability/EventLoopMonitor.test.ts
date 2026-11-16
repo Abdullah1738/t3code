@@ -3,6 +3,7 @@ import * as NodeTimers from "node:timers";
 import * as NodeV8 from "node:v8";
 import * as NodeVM from "node:vm";
 import * as NodePerfHooks from "node:perf_hooks";
+import * as NodeProcess from "node:process";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -12,6 +13,7 @@ import * as Logger from "effect/Logger";
 import * as Metric from "effect/Metric";
 import * as Tracer from "effect/Tracer";
 import * as TestClock from "effect/testing/TestClock";
+import { vi } from "vite-plus/test";
 
 import * as EventLoopMonitor from "./EventLoopMonitor.ts";
 
@@ -58,6 +60,8 @@ describe("EventLoopMonitor", () => {
   it.effect(
     "logs memory to the logger and a root trace every sixty seconds and stops with scope",
     () => {
+      // TestClock advances the heartbeat while the process may still be in its first half-second.
+      const uptime = vi.spyOn(NodeProcess.getBuiltinModule("process"), "uptime").mockReturnValue(0.1);
       const spans: Array<Tracer.NativeSpan> = [];
       const messages: Array<unknown> = [];
       const tracer = Tracer.make({
@@ -98,7 +102,7 @@ describe("EventLoopMonitor", () => {
             heapTotal: quiet.heapTotalBytes,
             external: quiet.externalBytes,
           });
-          assert.isAbove(Number(attributes.uptimeSeconds), 0);
+          assert.strictEqual(attributes.uptimeSeconds, 0);
           assert.isAbove(Number(attributes.heapLimit), 0);
           assert.isTrue(
             messages.some(
@@ -112,6 +116,7 @@ describe("EventLoopMonitor", () => {
       }).pipe(
         Effect.withTracer(tracer),
         Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+        Effect.ensuring(Effect.sync(() => uptime.mockRestore())),
       );
     },
   );
