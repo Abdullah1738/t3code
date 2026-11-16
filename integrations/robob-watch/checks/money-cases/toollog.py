@@ -37,7 +37,7 @@ _NAMES = {
     'provider.track', 'provider.orders', 'provider.details', 'log.cap',
     'case.open', 'case.update', 'case.close', 'case.reopen', 'case.corroborate',
     'question.ask', 'check.run', 'cache_reset', 'marketplace.refresh',
-    'order_watch.item_drop_check',
+    'order_watch.item_drop_check', 'order_watch.can_report',
     'collector.hold_seen', 'collector.hold_stale', 'collector.hold_cleared', 'collector.hold_alert_sent',
 }
 _ENUMS = {
@@ -45,6 +45,7 @@ _ENUMS = {
     'field': {'card_name', 'card_number', 'card_expiry', 'card_cvc'},
     'cardNickname': {'Marriott', 'MashreqNoon', 'Skywards', 'Mashreq'},
     'reason': DELEGATION_REASONS,
+    'refusal': {'none', 'invalid_id', 'not_registered', 'invalid_registration', 'not_running_or_held', 'usage'},
     'busStatus': {'open', 'pending', 'timed_out'},
     'lane': {'food', 'minutes', 'nownow', 'main', 'supermall', 'marketplace', 'careem', 'uber',
              'quik', 'shops', 'box', 'same-day'},
@@ -65,7 +66,8 @@ _ENUMS = {
               'nearby', 'delivered', 'cancelled', 'pending confirmation'},
 }
 _ENUMS['from'] = _ENUMS['to'] = _ENUMS['state']
-_BOOLS = {'prepareOnly', 'changed', 'fallback', 'budgetHit', 'unmatched', 'deadlineMoved', 'answered', 'polled'}
+_BOOLS = {'prepareOnly', 'changed', 'fallback', 'budgetHit', 'unmatched', 'deadlineMoved', 'answered', 'polled',
+          'untrackable', 'eta_given'}
 _NUMBERS = {'orders_total', 'known', 'delivered', 'fetched', 'pages', 'ms', 'exitCode', 'amountMinor', 'count', 'ageDays', 'openCases', 'fired', 'sourceLimits',
             'msgs_cpu_ms', 'msgs_concurrent_max', 'msgs_cache_hits', 'msgs_timeouts', 'msgs_p50_ms',
             'merchants_ms', 'order_charges_ms', 'payments_ms', 'questions_ms', 'refunds_ms',
@@ -829,6 +831,7 @@ def rollup(day=None):
         component_totals, component_errors, component_samples, component_durations = {}, {}, {}, {}
         order_failures, poll_counts = {}, {}
         caller_counts, caller_durations = {}, {}
+        can_report_outcomes = {'success': 0, 'refused': 0}
         total = oks = failures = error_lines = invalid = source_bytes = 0
         path = folder / (day + '.ndjson')
         if path.exists():
@@ -855,6 +858,8 @@ def rollup(day=None):
                             'amazon', 'uber', 'toollog', 'money-cases', 'owner-go'}:
                         component = 'unknown'
                     component_totals[component] = component_totals.get(component, 0) + 1
+                    if component == 'order-watch' and name == 'order_watch.can_report' and type(row.get('ok')) is bool:
+                        can_report_outcomes['success' if row['ok'] else 'refused'] += 1
                     component_errors.setdefault(component, {})
                     component_samples.setdefault(component, {})
                     value = row.get('durationMs')
@@ -924,6 +929,7 @@ def rollup(day=None):
                             'p95': values[math.ceil(len(values) * .95) - 1],
                             'max': values[-1], 'count': len(values)}
         result['countsByCaller'] = dict(sorted(caller_counts.items()))
+        result['canReportByOutcome'] = can_report_outcomes
         for key, callers in sorted(caller_durations.items()):
             latency[key]['byCaller'] = {}
             for caller, values in sorted(callers.items()):
@@ -985,7 +991,7 @@ def previous_day_rollup():
                 or previous.get('schemaVersion') != 2
                 or not all(key in previous for key in (
                     'countsByCaller', 'errorsByComponent', 'failureShare', 'topErrorSamplesByComponent',
-                    'topOrderFailuresByComponent', 'pollsByMerchant'))):
+                    'topOrderFailuresByComponent', 'pollsByMerchant', 'canReportByOutcome'))):
             rollup(day)
     except Exception:
         pass
