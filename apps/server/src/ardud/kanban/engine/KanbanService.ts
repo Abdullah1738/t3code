@@ -3076,55 +3076,63 @@ const make = Effect.gen(function* () {
   // Keep each board/thread's persisted pools, including transient multi-pool states.
   // Only update the cache after its row commits, so a failed append remains retryable.
   const slotState = new Map<string, Map<string, Set<string>>>();
+  const pendingSlotState = Context.Reference<Map<string, Map<string, Set<string>>> | undefined>(
+    "KanbanPendingSlotState",
+    { defaultValue: () => undefined },
+  );
   const slotWrites = Semaphore.makeUnsafe(1);
-  const syncSlot = Effect.fn("KanbanService.syncSlot")(function* (
+  const writeSlot = Effect.fn("KanbanService.syncSlot")(function* (
     boardId: string,
     threadId: string,
     why: SlotEventWhy,
     cardId: string | null,
   ) {
-    yield* SavedWrite.bestEffort(
-      slotWrites.withPermits(1)(
-        Effect.gen(function* () {
-          const cards = (yield* rawStore.cardsByThread(threadId)).filter(
-            (card) => card.boardId === boardId,
-          );
-          const held = (yield* Ref.get(holds)).get(ThreadId.make(threadId));
-          const current = Rules.poolThreads(
-            cards,
-            new Map(held?.boardId === boardId ? [[threadId, held.pool]] : []),
-          );
-          const board = slotState.get(boardId) ?? new Map<string, Set<string>>();
-          const before = board.get(threadId) ?? new Set<string>();
-          const at = yield* nowIso;
-          for (const kind of ["release", "take"] as const) {
-            for (const poolKey of kind === "release" ? [...before] : current.keys()) {
-              if (kind === "release" ? current.has(poolKey) : before.has(poolKey)) continue;
-              yield* Effect.uninterruptible(
-                Effect.gen(function* () {
-                  yield* rawStore.addSlotEvent({
-                    boardId,
-                    poolKey,
-                    threadId,
-                    cardId,
-                    kind,
-                    at,
-                    why,
-                  });
-                  if (kind === "release") before.delete(poolKey);
-                  else before.add(poolKey);
-                  if (before.size === 0) board.delete(threadId);
-                  else board.set(threadId, before);
-                  slotState.set(boardId, board);
-                }),
-              );
-            }
-          }
-        }),
-      ),
-      undefined,
+    const pending = yield* pendingSlotState;
+    const cards = (yield* rawStore.cardsByThread(threadId)).filter(
+      (card) => card.boardId === boardId,
     );
+    const held = (yield* Ref.get(holds)).get(ThreadId.make(threadId));
+    const current = Rules.poolThreads(
+      cards,
+      new Map(held?.boardId === boardId ? [[threadId, held.pool]] : []),
+    );
+    const target = pending ?? slotState;
+    const board = target.get(boardId) ?? new Map<string, Set<string>>();
+    const before = new Set(
+      board.get(threadId) ??
+        (pending === undefined
+          ? slotState.get(boardId)?.get(threadId)
+          : (yield* rawStore.openSlots(boardId))
+              .filter((row) => row.threadId === threadId)
+              .map((row) => row.poolKey)),
+    );
+    const at = yield* nowIso;
+    for (const kind of ["release", "take"] as const) {
+      for (const poolKey of kind === "release" ? [...before] : current.keys()) {
+        if (kind === "release" ? current.has(poolKey) : before.has(poolKey)) continue;
+        yield* Effect.uninterruptible(
+          Effect.gen(function* () {
+            yield* rawStore.addSlotEvent({
+              boardId,
+              poolKey,
+              threadId,
+              cardId,
+              kind,
+              at,
+              why,
+            });
+            if (kind === "release") before.delete(poolKey);
+            else before.add(poolKey);
+            if (before.size === 0 && pending === undefined) board.delete(threadId);
+            else board.set(threadId, before);
+            target.set(boardId, board);
+          }),
+        );
+      }
+    }
   });
+  const syncSlot = (...args: Parameters<typeof writeSlot>) =>
+    SavedWrite.bestEffort(slotWrites.withPermits(1)(writeSlot(...args)), undefined);
   const seedSlots = Effect.fn("KanbanService.seedSlots")(function* () {
     const rows = yield* rawStore.openSlots();
     slotState.clear();
@@ -3288,7 +3296,10 @@ const make = Effect.gen(function* () {
               ? "pool_moved"
               : "card_left");
           for (const threadId of new Set([previous?.activeThreadId, card.activeThreadId])) {
-            if (threadId != null) yield* syncSlot(card.boardId, threadId, why, card.id);
+            if (threadId != null)
+              yield* (yield* pendingSlotState) === undefined
+                ? syncSlot(card.boardId, threadId, why, card.id)
+                : writeSlot(card.boardId, threadId, why, card.id);
           }
         }
       }),
@@ -3302,6 +3313,47 @@ const make = Effect.gen(function* () {
       publish(card.boardId, by === undefined ? { _tag: "card", card } : { _tag: "card", card, by }),
       undefined,
     );
+  });
+
+  const commitOwnerRestoration = Effect.fn("KanbanService.commitOwnerRestoration")(function* <
+    A,
+    E,
+    R,
+  >(card: KanbanCard, write: Effect.Effect<A, E, R>, afterCommit?: () => void) {
+    const slots = new Map<string, Map<string, Set<string>>>();
+    const publications: BoardPublication[] = [];
+    const measurements: AnalyticsEvent[] = [];
+    const receipts: SavedWrite.Saved[] = [];
+    const observer = yield* SavedWrite.observer;
+    // The durable reply, attachment and slot commit together. Process-local state
+    // and saved-write receipts must not escape a transaction that rolls back.
+    yield* tickTransaction(
+      write.pipe(
+        Effect.provideService(pendingSlotState, slots),
+        Effect.provideService(publicationSink, publications),
+        Effect.provideService(analyticsSink, measurements),
+        Effect.provideService(SavedWrite.observer, (saved) => receipts.push(saved)),
+      ),
+    ).pipe(
+      Effect.tap(() =>
+        Effect.sync(() => {
+          for (const [boardId, threads] of slots) {
+            const board = slotState.get(boardId) ?? new Map<string, Set<string>>();
+            for (const [threadId, pools] of threads) {
+              if (pools.size === 0) board.delete(threadId);
+              else board.set(threadId, pools);
+            }
+            slotState.set(boardId, board);
+          }
+          afterCommit?.();
+          for (const receipt of receipts) observer(receipt);
+        }),
+      ),
+      Effect.tap(() => dropHold(card.activeThreadId!, "join", card.id)),
+      Effect.uninterruptible,
+    );
+    for (const measurement of measurements) yield* recordAnalytics(measurement);
+    for (const publication of publications) yield* publish(publication.boardId, publication.change);
   });
 
   const logEvent = Effect.fn("KanbanService.logEvent")(function* (
@@ -6444,7 +6496,6 @@ const make = Effect.gen(function* () {
       const rowId = restored ? yield* ownerRouteRow : undefined;
       const write = Effect.gen(function* () {
         yield* saveCard(next, undefined, false, restored ? "restore" : undefined);
-        if (restored) yield* dropHold(next.activeThreadId!, "join", next.id);
         if (rowId !== undefined) {
           // A reply retry must retain the attachment it restored, even after its ask closed.
           // @effect-diagnostics-next-line preferSchemaOverJson:off
@@ -6455,9 +6506,13 @@ const make = Effect.gen(function* () {
           `;
         }
       });
-      yield* rowId === undefined ? write : tickTransaction(write);
       const reply = yield* ownerRestoredReply;
-      if (restored && reply !== undefined) reply.notice = notice;
+      if (!restored) yield* write;
+      else {
+        yield* commitOwnerRestoration(next, write, () => {
+          if (reply !== undefined) reply.notice = notice;
+        });
+      }
     }
     yield* releaseModel;
     if (answeredBy._tag === "owner")
@@ -17653,9 +17708,9 @@ const make = Effect.gen(function* () {
           toStage: next.stage,
           body: "Woken",
         });
-        yield* saveCard(next, undefined, false, next.stage === "working" ? "restore" : undefined);
-        if (next.stage === "working" && next.activeThreadId !== null)
-          yield* dropHold(next.activeThreadId, "join", next.id);
+        yield* next.stage === "working" && next.activeThreadId !== null
+          ? commitOwnerRestoration(next, saveCard(next, undefined, false, "restore"))
+          : saveCard(next);
         yield* releaseModel;
         if (next.stage === "working" && next.activeThreadId !== null) {
           const wake: Extract<BoardEffect, { readonly kind: "ownerWake" }> = {

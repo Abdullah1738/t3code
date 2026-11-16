@@ -9,6 +9,7 @@ import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 
 import * as Analytics from "../../analytics/Analytics.ts";
+import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
 import * as KanbanStore from "../store/KanbanStore.ts";
 import {
   askOf,
@@ -25,6 +26,161 @@ import { modelSelectionOf } from "./defaults.ts";
 import * as Rules from "./rules.ts";
 
 const decodeAnalytics = Schema.decodeUnknownEffect(AnalyticsEvent);
+
+it.effect.each([
+  { reply: "post", failure: "reply write" } as const,
+  ...(["post", "pick", "answer", "drop", "wake"] as const).flatMap((reply) =>
+    (["slot write", "cancellation"] as const).map((failure) => ({ reply, failure })),
+  ),
+])("a restored $reply keeps its persisted slot after $failure", ({ reply, failure }) =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "owner-rollback-1615-" });
+    const fake = yield* makeFake;
+    let armed = false;
+    let injected = 0;
+    let restoreAttempts = 0;
+    const storeLayer = Layer.effect(
+      KanbanStore.KanbanStore,
+      Effect.gen(function* () {
+        const real = yield* KanbanStore.KanbanStore;
+        const sql = yield* BoardsDatabase.client;
+        return KanbanStore.KanbanStore.of({
+          ...real,
+          putCard: (card) =>
+            real.putCard(card).pipe(
+              Effect.andThen(
+                Effect.gen(function* () {
+                  if (!armed || card.stage !== "working" || card.ownerPark !== undefined) return;
+                  if (failure === "cancellation") {
+                    armed = false;
+                    injected++;
+                    yield* Effect.withFiber((fiber) => {
+                      fiber.interruptUnsafe();
+                      return Effect.void;
+                    });
+                  } else if (failure === "slot write") {
+                    armed = false;
+                    injected++;
+                    // The trigger rolls back with the failed transaction; normal retry can succeed.
+                    yield* sql.unsafe(`
+                  CREATE TEMP TRIGGER restored_slot_failure
+                  BEFORE INSERT ON ardud_kanban_slot_events
+                  WHEN NEW.why = 'restore' AND NEW.kind = 'take'
+                  BEGIN SELECT RAISE(FAIL, 'injected restored slot failure'); END
+                `);
+                  }
+                }),
+              ),
+              Effect.mapError(
+                (cause) =>
+                  new KanbanStore.KanbanStoreError({
+                    operation: "inject restored card failure",
+                    cause,
+                  }),
+              ),
+            ),
+          addSlotEvent: (row) =>
+            Effect.gen(function* () {
+              if (row.why === "restore" && row.kind === "take") restoreAttempts++;
+              yield* real.addSlotEvent(row);
+              if (
+                !armed ||
+                failure !== "reply write" ||
+                row.why !== "restore" ||
+                row.kind !== "take"
+              )
+                return;
+              armed = false;
+              injected++;
+              yield* sql.unsafe(`
+              CREATE TEMP TRIGGER restored_reply_failure
+              BEFORE UPDATE OF json ON ardud_kanban_owner_routes
+              WHEN json_extract(NEW.json, '$.restoredReply') IS NOT NULL
+              BEGIN SELECT RAISE(FAIL, 'injected restored reply failure'); END
+            `);
+            }).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new KanbanStore.KanbanStoreError({
+                    operation: "inject restored slot failure",
+                    cause,
+                  }),
+              ),
+            ),
+        });
+      }),
+    ).pipe(Layer.provide(KanbanStore.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board, card, threadId, worker } = yield* workingCard();
+      yield* kanban.askOwner(
+        card.id,
+        {
+          question: "Continue?",
+          blocking: true,
+          ...(reply === "pick" ? { options: ["Owner rollback 1615", "No"] } : {}),
+        },
+        worker,
+        "cardThread",
+      );
+      yield* kanban.tick;
+      const store = yield* KanbanStore.KanbanStore;
+      assert.equal(
+        (yield* store.openSlots(board.id)).filter((row) => row.threadId === threadId).length,
+        0,
+      );
+      const discussion = yield* kanban.cardDiscussion(card.id);
+      armed = true;
+      const ask = askOf((yield* kanban.card(card.id)).card);
+      const close =
+        reply === "post"
+          ? Effect.asVoid(
+              kanban.post(discussion.id, owner, [{ _tag: "md", text: "Owner rollback 1615" }]),
+            )
+          : reply === "pick"
+            ? Effect.asVoid(
+                kanban.answer(discussion.id, ask.seq!, ask.id, [ask.options![0]!.id], owner),
+              )
+            : reply === "answer"
+              ? Effect.asVoid(
+                  kanban.answerAsk(
+                    card.id,
+                    ask.id,
+                    { verdict: "answered", text: "Owner rollback 1615", revision: 0 },
+                    owner,
+                  ),
+                )
+              : reply === "drop"
+                ? Effect.asVoid(kanban.changeAsk(card.id, ask.id, "drop", owner, "owner"))
+                : Effect.asVoid(kanban.cardThread(card.id, "wake", "Owner rollback 1615", owner));
+      const first = yield* close.pipe(Effect.forkChild, Effect.flatMap(Fiber.await));
+      if (reply !== "post" && failure === "slot write") {
+        assert.equal(first._tag, "Failure");
+        assert.equal((yield* kanban.card(card.id)).card.stage, "needs_owner");
+        assert.equal(
+          (yield* store.openSlots(board.id)).filter((row) => row.threadId === threadId).length,
+          0,
+        );
+        yield* close;
+      }
+      yield* kanban.post(discussion.id, owner, [{ _tag: "md", text: "Retry drain barrier" }]);
+      assert.equal(injected, 1);
+      const restored = (yield* kanban.card(card.id)).card;
+      assert.equal(restored.stage, "working");
+      assert.equal(restored.activeThreadId, threadId);
+      assert.equal(
+        (yield* store.openSlots(board.id)).filter((row) => row.threadId === threadId).length,
+        1,
+      );
+      assert.equal(restoreAttempts, failure === "cancellation" ? 1 : 2);
+      yield* kanban.cardThread(card.id, "stop", "Release restored slot", owner);
+      assert.equal(
+        (yield* store.openSlots(board.id)).filter((row) => row.threadId === threadId).length,
+        0,
+      );
+    }).pipe(Effect.provide(fileTestLayer(fake.layer, `${directory}/state.sqlite`, storeLayer)));
+  }).pipe(Effect.provide(filesLayer)),
+);
 
 it.effect.each(
   (["post", "pick"] as const).flatMap((reply) =>
