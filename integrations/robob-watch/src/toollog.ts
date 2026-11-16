@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { constants } from "node:os";
+import { safeDependency } from "./cause.ts";
 
 export type LogEntry = {
   component: string; kind: "event" | "perf" | "error"; name: string;
@@ -16,12 +17,12 @@ const boolean = new Set(["deduped", "accepted", "timedOut", "notified", "batched
 const errnoCodes = new Set(Object.keys(constants.errno));
 const signals = new Set(Object.keys(constants.signals));
 const values: Record<string, readonly string[]> = {
-  severity: ["info", "attention", "error"], outcome: ["fire", "no_change", "fail", "timeout"],
+  severity: ["info", "attention", "error"], outcome: ["fire", "no_change", "fail", "timeout", "busy"],
   source: ["mail", "sms", "bank", "charge"], routed: ["board", "chat", "ignored"],
   class: ["urgent", "today", "info", "noise", "candidate", "charge", "bank", "security", "otp", "unknown", "fail_open", "deduped"],
   action: ["create", "queue", "cancel", "snooze", "sent", "retry", "check", "wake", "notify", "send", "coalesce", "conflict", "expire", "pause", "remove", "cap", "resume"],
   state: ["pending", "sending", "sent", "uncertain", "cancelled", "failed", "scheduled", "queued", "done", "expired", "paused", "active"],
-  stderrClass: ["usage_error", "missing_file", "permission", "timeout", "python_traceback", "auth", "connect", "json", "unknown"],
+  stderrClass: ["usage_error", "missing_file", "permission", "timeout", "dependency_busy", "python_traceback", "auth", "connect", "json", "unknown"],
   triggerKind: ["file", "wal"],
   step: ["native", "status", "send"],
   route: ["person", "owner", "group", "creator", "other", "thread", "unverified", "refused"],
@@ -66,7 +67,7 @@ function fields(entry: LogEntry, at: Date) {
         return (typeof holder.watcher === "string" || typeof holder.watcher === "number") && milliseconds(holder.elapsedMs)
           ? [{ watcher: logId("watcher", holder.watcher), elapsedMs: holder.elapsedMs }] : [];
       });
-    }
+    } else if (key === "dependency" && safeDependency(value)) props[key] = value;
     else if ((key === "exitCode" || key === "signal") && value === null) props[key] = null;
     else if (key === "stderrLines" && typeof value === "number" && Number.isSafeInteger(value) && value >= 0) props[key] = value;
     else if (key === "missingForS" && typeof value === "number" && Number.isFinite(value) && value >= 0) props[key] = value;
@@ -163,7 +164,7 @@ const safeId = (key: string, value: unknown): value is string => typeof value ==
   /^[a-f0-9]{24}$/.test(value) || ((key === "watcher" || key === "helper") && /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}$/.test(value) && !/\d{5}/.test(value))
 );
 const milliseconds = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0;
-const outcomes = () => ({ no_change: 0, fire: 0, fail: 0, timeout: 0 });
+const outcomes = () => ({ no_change: 0, fire: 0, fail: 0, timeout: 0, busy: 0 });
 function percentiles(samples: number[]) {
   samples.sort((a, b) => a - b);
   return { p50: samples[Math.ceil(samples.length * .5) - 1] ?? null, p95: samples[Math.ceil(samples.length * .95) - 1] ?? null, max: samples.at(-1) ?? null };
@@ -215,6 +216,7 @@ export async function rollup(selection: string | LogWindow, dir = logDirectory()
     const durations: Record<string, number[]> = Object.create(null);
     const errors: Record<string, number> = Object.create(null);
     const watchers = new Map<string, ReturnType<typeof watcherStats>>();
+    const dependencies = new Map<string, { busyRuns: number; watchers: Set<string> }>();
     const helpers = new Map<string, ReturnType<typeof helperStats>>();
     const sourceErrors = new Map<string, SourceError>();
     const hours = new Map<string, { errors: Map<string, SourceError>; runs: number; fail: number; timeout: number; durations: number[] }>();
@@ -286,14 +288,20 @@ export async function rollup(selection: string | LogWindow, dir = logDirectory()
           if (hour) {
             hour.runs++;
             if (props.outcome === "timeout") hour.timeout++;
-            else if (props.outcome === "fail" || row.ok === false) hour.fail++;
+            else if (props.outcome === "fail" || (row.ok === false && props.outcome !== "busy")) hour.fail++;
             if (milliseconds(row.durationMs)) hour.durations.push(row.durationMs);
           }
           const id = watcher ?? "unknown", stats = watchers.get(id) ?? watcherStats();
           watchers.set(id, stats);
           stats.runs++;
           const outcome = props.outcome;
-          if (outcome === "no_change" || outcome === "fire" || outcome === "fail" || outcome === "timeout") stats.outcomes[outcome]++;
+          if (outcome === "no_change" || outcome === "fire" || outcome === "fail" || outcome === "timeout" || outcome === "busy") stats.outcomes[outcome]++;
+          if (outcome === "busy" && safeDependency(props.dependency)) {
+            const dependency = dependencies.get(props.dependency) ?? { busyRuns: 0, watchers: new Set<string>() };
+            dependencies.set(props.dependency, dependency);
+            dependency.busyRuns++;
+            dependency.watchers.add(id);
+          }
           if (milliseconds(row.durationMs)) stats.durations.push(row.durationMs);
           if (milliseconds(props.queuedMs)) stats.queued.push(props.queuedMs);
           // Runs for one watcher are serialized; helper errors and delivery retries are not new runs.
@@ -346,7 +354,7 @@ export async function rollup(selection: string | LogWindow, dir = logDirectory()
     for (const stats of watchers.values()) {
       watcherTotals.runs += stats.runs;
       watcherTotals.fires += stats.fires;
-      for (const outcome of ["no_change", "fire", "fail", "timeout"] as const) watcherTotals.outcomes[outcome] += stats.outcomes[outcome];
+      for (const outcome of ["no_change", "fire", "fail", "timeout", "busy"] as const) watcherTotals.outcomes[outcome] += stats.outcomes[outcome];
     }
     const helperTotals = { helpers: helpers.size, runs: 0, failures: 0, exitCodes: Object.create(null) as Record<string, number> };
     for (const stats of helpers.values()) {
@@ -386,6 +394,9 @@ export async function rollup(selection: string | LogWindow, dir = logDirectory()
       errors: Object.entries(errors).sort((a, b) => b[1] - a[1]).slice(0, 20).map(([tag, count]) => ({ tag, count,
         topSources: [...sourceErrors.values()].filter(source => source.tag === tag).sort(byErrors).slice(0, 3).map(({ source, id, count }) => ({ source, id, count })),
       })),
+      byDependency: Object.fromEntries([...dependencies].sort(([a, x], [b, y]) => y.busyRuns - x.busyRuns || a.localeCompare(b)).slice(0, 20)
+        .map(([name, stats]) => [name, { busyRuns: stats.busyRuns, watchers: stats.watchers.size }])),
+      dependencyTotals: { dependencies: dependencies.size, busyRuns: [...dependencies.values()].reduce((total, stats) => total + stats.busyRuns, 0) },
       byWatcher, watcherTotals, byHelper, helperTotals, errorsByTagAndSource, wake, hourly, markers: deployMarkers,
       slots: { allSlotsBusyMinutes: allSlotsBusyMs / 60_000, topHolders: [...slotHolders].filter(([, ms]) => ms > 0).sort(([a, x], [b, y]) => y - x || a.localeCompare(b)).slice(0, 20).map(([watcher, ms]) => ({ watcher, slotSeconds: ms / 1000 })) } };
     const target = out ?? (day ? join(dir, `rollup-${day}.json`) : undefined);

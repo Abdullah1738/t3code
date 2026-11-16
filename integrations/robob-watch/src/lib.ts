@@ -1,5 +1,5 @@
 import { toolLog, toolError } from "./toollog.ts";
-import { StderrCause, stderrCause } from "./cause.ts";
+import { StderrCause, stderrCause, type DependencyBusy } from "./cause.ts";
 import { Database } from "bun:sqlite";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -43,6 +43,7 @@ export const FAILURE_ALERT_AFTER = 5;
 export const FAILURE_NOTICE_AFTER = 2;
 /** Timeouts are transient (load spikes): no alert until the watcher has been failing at least this long. */
 export const TIMEOUT_ALERT_AFTER_MS = 10 * 60_000;
+export const BUSY_ALERT_AFTER_MS = Number(process.env.ROBOB_WATCH_BUSY_ALERT_AFTER_MS ?? 20 * 60_000);
 /** Timeouts retry at most this far apart, so a watcher catches up soon after a load spike. */
 export const TIMEOUT_BACKOFF_CAP_S = 120;
 /** Runs slower than this are logged with their duration. */
@@ -152,6 +153,9 @@ export type State = {
   load_timeout_since?: string;
   failure_paused_at?: string;
   last_error?: string;
+  dependency_busy?: { dependency: string; since: string };
+  /** A changed failure kind needs a fresh bridge key without resetting backoff or grace periods. */
+  failure_episode?: string;
   /** Source names parsed before stderr is clipped for storage. */
   last_error_sources?: string[];
   /** When the current run of consecutive failures started. */
@@ -618,7 +622,7 @@ export function log(id: string | null, message: string): void {
 
 export const clip = (text: string, max: number) => text.length <= max ? text : `${text.slice(0, max - 20)}\n...[truncated]`;
 
-export type CheckResult = { code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string; timedOut: boolean; ms: number };
+export type CheckResult = { code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string; timedOut: boolean; ms: number; busy?: DependencyBusy };
 
 /**
  * Runs a check in its own process group so a timeout kills everything it started. The result never waits more
@@ -642,8 +646,9 @@ export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string,
       clearTimeout(grace);
       const ms = now() - started;
       cause.add(extra);
-      toolLog({ component: "helpers", kind: code === 0 && !timedOut ? "perf" : "error", name: "helper.run", durationMs: ms, ok: code === 0 && !timedOut, ids: { watcher: watcher.id, helper: watcher.id }, props: { exitCode: code, signal, timedOut, ...(code === 0 && !timedOut ? {} : cause.props(timedOut)) }, ...(code === 0 && !timedOut ? {} : { error: { tag: timedOut ? "helper.timeout" : "helper.exit_failed" } }) });
-      resolve({ code, signal, stdout, stderr: stderr + extra, timedOut, ms });
+      const busy = cause.busy(code);
+      toolLog({ component: "helpers", kind: code === 0 && !timedOut ? "perf" : "error", name: "helper.run", durationMs: ms, ok: code === 0 && !timedOut, ids: { watcher: watcher.id, helper: watcher.id }, props: { exitCode: code, signal, timedOut, ...(code === 0 && !timedOut ? {} : cause.props(timedOut, code)) }, ...(code === 0 && !timedOut ? {} : { error: { tag: busy ? "helper.dependency_busy" : timedOut ? "helper.timeout" : "helper.exit_failed" } }) });
+      resolve({ code, signal, stdout, stderr: stderr + extra, timedOut, ms, ...(busy ? { busy } : {}) });
     };
     const spawnChild = (closing = extraEnv.WATCH_CLOSING ?? (loadState(watcher.id).status === "closing" ? "1" : "0")) => spawn(shell[0]!, shell.slice(1), {
       cwd: dir, detached: true, stdio: ["ignore", "pipe", "pipe"],
@@ -1396,10 +1401,12 @@ export async function alert(watcher: Watcher, text: string, key: string, severit
 
 export function shouldNotifyFailure(watcher: Watcher, state: State, timedOut: boolean, t = now()): boolean {
   return state.consecutive_failures >= (watcher.failure_notice_after ?? FAILURE_NOTICE_AFTER)
+    && (!state.dependency_busy || t - Date.parse(state.dependency_busy.since) >= BUSY_ALERT_AFTER_MS)
     && (!timedOut || t - Date.parse(state.failing_since ?? iso(t)) >= TIMEOUT_ALERT_AFTER_MS);
 }
 
 export function shouldPause(watcher: Watcher, state: State, timedOut: boolean, t = now()): boolean {
+  if (state.dependency_busy) return false;
   const threshold = watcher.max_consecutive_failures ?? FAILURE_ALERT_AFTER;
   return threshold > 0 && state.consecutive_failures >= threshold
     && (!timedOut || t - Date.parse(state.failing_since ?? iso(t)) >= TIMEOUT_ALERT_AFTER_MS);
@@ -1414,10 +1421,19 @@ export const ESCALATE_AFTER_MS = Number(process.env.ROBOB_WATCH_ESCALATE_AFTER_M
 
 export function shouldEscalate(watcher: Watcher, state: State, t = now()): boolean {
   if (watcher.mode !== "wake" || state.failure_escalated || !state.failing_since) return false;
+  if (state.dependency_busy) return t - Date.parse(state.dependency_busy.since) >= BUSY_ALERT_AFTER_MS;
   return !!state.failure_paused_at || t - Date.parse(state.failing_since) >= ESCALATE_AFTER_MS;
 }
 
 export function escalationText(watcher: Watcher, state: State, mins: number): string {
+  if (state.dependency_busy) return [
+    `Dependency ${state.dependency_busy.dependency} has been busy for ${mins} min for watcher ${watcher.id} ("${watcher.title}").`,
+    "Don't edit the watcher. It retries its check; nothing is lost.",
+    ...(state.dependency_busy.dependency === "msgs" ? [
+      "Check ~/.local/share/message-archive/logs/daemon.log. Kickstart com.ardud.message-archive only if that log has been silent for more than 30 min.",
+    ] : ["Check the dependency's health before changing anything."]),
+    `Then robob-watch resume ${watcher.id} and robob-watch show ${watcher.id} to confirm.`,
+  ].join("\n");
   return [
     `Watcher ${watcher.id} ("${watcher.title}") has been FAILING for ${mins} min (${state.consecutive_failures} runs); ${failureSummary(state)}.`,
     ...(state.failure_paused_at ? ["It is paused and will not check again until resumed."] : []),
@@ -1448,6 +1464,7 @@ export function failureSources(error = ""): string[] {
 }
 
 function failureSummary(state: State): string {
+  if (state.dependency_busy) return `dependency ${state.dependency_busy.dependency} is busy`;
   const sources = state.last_error_sources ?? failureSources(state.last_error);
   return sources.length ? `failing sources: ${sources.join(", ")}` : "its check is failing";
 }
@@ -1456,12 +1473,14 @@ export async function escalate(watcher: Watcher, state: State, key: string): Pro
   const started = now();
   let delivery: Delivery | undefined;
   try {
-    const mins = Math.round((Date.parse(state.failure_paused_at ?? iso()) - Date.parse(state.failing_since!)) / 60_000);
+    const mins = Math.round((Date.parse(state.failure_paused_at ?? iso()) - Date.parse(state.dependency_busy?.since ?? state.failing_since!)) / 60_000);
     const text = escalationText(watcher, state, mins);
-    const woke = await wake(`robob-watch ${watcher.id} failing`, text, key);
+    const woke = await wake(`robob-watch ${watcher.id} ${state.dependency_busy ? "dependency busy" : "failing"}`, text, key);
     if (woke.ok) delivery = { ok: true, via: "wake", detail: woke.out };
     else {
-      const sent = await imessage(`Watcher "${watcher.title}" has been failing for ${mins} min; ${failureSummary(state)}. Last error: ${(state.last_error ?? "").slice(0, 300)}`, key);
+      const summary = state.dependency_busy ? `Dependency ${state.dependency_busy.dependency} has been busy for ${mins} min; watcher "${watcher.title}" keeps retrying; nothing is lost.`
+        : `Watcher "${watcher.title}" has been failing for ${mins} min; ${failureSummary(state)}. Last error: ${(state.last_error ?? "").slice(0, 300)}`;
+      const sent = await imessage(summary, key);
       delivery = sent.ok ? { ok: true, via: "imessage-send", detail: sent.out } : { ok: false, via: "none", detail: `${woke.out} | ${sent.out}` };
     }
     return delivery;
