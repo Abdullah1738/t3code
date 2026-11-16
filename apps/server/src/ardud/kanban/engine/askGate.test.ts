@@ -319,7 +319,7 @@ it.effect.each(["answer", "drop", "create"] as const)(
 );
 
 it.effect.each(["clear", "findings"] as const)(
-  "%s review verdict attributes held wake cancellation to its sub-step",
+  "%s review verdict does not attribute outside wake cancellation to a gate hold",
   (verdict) =>
     Effect.gen(function* () {
       const fake = yield* makeFake;
@@ -381,8 +381,7 @@ it.effect.each(["clear", "findings"] as const)(
         yield* Deferred.await(entered);
         yield* TestClock.adjust(5_000);
         assert.isTrue(Exit.isFailure(yield* Fiber.join(pending)));
-        assert.isDefined(steps);
-        assert.deepInclude(steps!, { subStep: "KanbanService.pruneWakes", ms: 5_000 });
+        assert.isUndefined(steps);
         assert.equal((yield* kanban.card(card.id)).card.stage, "in_review");
       }).pipe(
         Effect.ensuring(Deferred.succeed(finish, undefined)),
