@@ -3570,8 +3570,14 @@ const make = Effect.gen(function* () {
           );
           if (fresh.length > 0) {
             const rows = yield* boardSql<{
-              count: number;
-            }>`SELECT COUNT(*) AS count FROM ardud_kanban_cards c, json_each(c.json, '$.asks') a WHERE instr(c.json, '"closedAt":null') > 0 AND json_extract(a.value, '$.closedAt') IS NULL AND COALESCE(json_extract(a.value, '$.to'), 'owner') != 'evaluator'`;
+              decisions: number;
+              notices: number;
+            }>`SELECT
+              COALESCE(SUM(CASE WHEN COALESCE(json_extract(a.value, '$.kind'), 'decision') != 'notice' THEN 1 ELSE 0 END), 0) AS decisions,
+              COALESCE(SUM(CASE WHEN json_extract(a.value, '$.kind') = 'notice' THEN 1 ELSE 0 END), 0) AS notices
+              FROM ardud_kanban_cards c, json_each(c.json, '$.asks') a
+              WHERE instr(c.json, '"closedAt":null') > 0 AND json_extract(a.value, '$.closedAt') IS NULL
+              AND COALESCE(json_extract(a.value, '$.to'), 'owner') != 'evaluator'`;
             card = {
               ...card,
               asks: card.asks.map((ask) => {
@@ -3582,7 +3588,18 @@ const make = Effect.gen(function* () {
                       ...ask,
                       timing: {
                         kind: askKind(ask),
-                        openAsksAtCreation: (rows[0]?.count ?? 0) + index,
+                        openAsksAtCreation:
+                          (rows[0]?.decisions ?? 0) +
+                          fresh
+                            .slice(0, index)
+                            .filter((entry) => entry.kind !== "notice" && entry.to !== "evaluator")
+                            .length,
+                        openNoticesAtCreation:
+                          (rows[0]?.notices ?? 0) +
+                          fresh
+                            .slice(0, index)
+                            .filter((entry) => entry.kind === "notice" && entry.to !== "evaluator")
+                            .length,
                       },
                     };
               }),
@@ -4221,6 +4238,7 @@ const make = Effect.gen(function* () {
     if (card.stage === "needs_owner" && to !== "needs_owner") {
       next = Asks.closeAsks(next, at, (ask) => ask.blocking);
     }
+    next = Asks.closeClearedGateNotices(next, at);
     const workerDropped = dropped.filter(
       (ask) => ask.by._tag === "thread" && ask.by.threadId === next.workThreadId,
     );
@@ -17505,6 +17523,7 @@ const make = Effect.gen(function* () {
               respond: { ack: true },
               title,
               batchKey: "gate-cleared",
+              subtaskId: subtask.id,
             });
           }
         }
@@ -17521,6 +17540,7 @@ const make = Effect.gen(function* () {
             body: patch.comment.trim(),
             ...(instructionApplication === undefined ? {} : { instructionApplication }),
           });
+        next = Asks.closeClearedGateNotices(next, at);
         if (plan?.ok) next = yield* recheckReviewGate(next, board, true);
         const paused = yield* pauseIfBacklog(card, next, actor, at);
         // An open work thread now runs the new model's pool, so the card's slot moves with it.
@@ -19246,7 +19266,7 @@ const make = Effect.gen(function* () {
             "card_not_verified",
           );
         const at = yield* nowIso;
-        const next = { ...card, settledAt: at, updatedAt: at };
+        const next = Asks.closeClearedGateNotices({ ...card, settledAt: at, updatedAt: at }, at);
         yield* logEvent(next, { _tag: "owner" }, "edited", { body: "Settled" });
         yield* saveCard(next);
         if (card.discussionId !== null) {
@@ -19418,6 +19438,7 @@ const make = Effect.gen(function* () {
             ],
             false,
           ))[0]!;
+          marked = Asks.closeClearedGateNotices(marked, at);
           const text = card.subtasks.find((subtask) => subtask.id === subtaskId)?.text ?? "";
           yield* logEvent(marked, actor, "subtask", {
             body: `${subtaskId} ${state}: ${text}${completionNote?.trim() ? ` (${completionNote.trim()})` : ""}`,
@@ -19857,7 +19878,7 @@ const make = Effect.gen(function* () {
                   ? "in_review"
                   : outcome.stage;
             const prCompletion = to === "completed" && trackedPrs(card).length > 0;
-            const next: KanbanCard = {
+            let next: KanbanCard = {
               // A verdict is a review that ended normally: its retry record goes.
               ...Retries.withoutRetries(
                 release(
@@ -19894,6 +19915,7 @@ const make = Effect.gen(function* () {
               movedAt: at,
               updatedAt: at,
             };
+            next = Asks.closeClearedGateNotices(next, at);
             yield* logEvent(next, { _tag: "thread", threadId }, "review", {
               at,
               fromStage: card.stage,
@@ -21294,6 +21316,20 @@ const make = Effect.gen(function* () {
                   Effect.gen(function* () {
                     yield* rekeyBoard(board);
                     const at = yield* nowIso;
+                    let closedNotices = 0;
+                    for (const card of yield* store.cards(board.id)) {
+                      const next = Asks.closeClearedGateNotices(card, at);
+                      if (next === card) continue;
+                      closedNotices += next.asks.filter(
+                        (ask, index) =>
+                          ask.closedAt !== null && card.asks[index]?.closedAt === null,
+                      ).length;
+                      yield* store.putCard(next);
+                    }
+                    yield* Effect.logInfo("kanban.gate_cleared_notices_backfilled", {
+                      boardId: board.id,
+                      count: closedNotices,
+                    });
                     let ended = 0;
                     for (const { link, card } of yield* store.openReviewLinks(board.id)) {
                       if (
