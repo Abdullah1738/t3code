@@ -46,6 +46,22 @@ const run: OrchestrationV2Run = {
   checkpointId: null,
   contextHandoffId: null,
 };
+type Message = OrchestrationV2ThreadProjection["messages"][number];
+const makeMessage = (overrides: Partial<Message> & Pick<Message, "runId">): Message => ({
+  id: run.userMessageId,
+  threadId: run.threadId,
+  createdBy: "agent",
+  creationSource: "server",
+  nodeId: null,
+  role: "user",
+  text: "Background work completed",
+  phase: "unknown",
+  attachments: [],
+  streaming: false,
+  createdAt: now,
+  updatedAt: now,
+  ...overrides,
+});
 const cases: ReadonlyArray<{
   finish: string | null | undefined;
   phase: OrchestrationV2AssistantPhase;
@@ -328,7 +344,7 @@ it.each([
         : {}),
     startedAt: scenario === "unstarted" ? null : now,
   };
-  const projection = {
+  const projection: Pick<OrchestrationV2ThreadProjection, "runs" | "messages"> = {
     runs:
       scenario === "single"
         ? [tagged]
@@ -337,9 +353,18 @@ it.each([
           : [tagged, later],
     messages:
       scenario === "monitor"
-        ? [{ runId: later.id, notification: { source: { kind: "monitor" } } }]
+        ? [
+            makeMessage({
+              runId: later.id,
+              notification: {
+                source: { kind: "monitor" },
+                outcome: "completed",
+                summary: "Background work completed",
+              },
+            }),
+          ]
         : [],
-  } as Pick<OrchestrationV2ThreadProjection, "runs" | "messages">;
+  };
   assert.equal(
     delegatedTaskResultRun(projection, taskId)?.id,
     ["wake", "cancelled", "latest_tagged", "active_tagged"].includes(scenario)
@@ -380,16 +405,16 @@ it.each([
     source === undefined
       ? []
       : [
-          {
+          makeMessage({
             id: later.userMessageId,
             runId: later.id,
             notification: { source, outcome: "completed", summary: "Background work completed" },
-          },
+          }),
         ];
-  const projection = { runs: [tagged, later], messages } as Pick<
-    OrchestrationV2ThreadProjection,
-    "runs" | "messages"
-  >;
+  const projection: Pick<OrchestrationV2ThreadProjection, "runs" | "messages"> = {
+    runs: [tagged, later],
+    messages,
+  };
   assert.equal(
     delegatedTaskResultRun(projection, taskId)?.id,
     entry.selected ? later.id : tagged.id,
