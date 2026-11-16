@@ -289,16 +289,62 @@ class PhoneLockTests(unittest.TestCase):
                 self.assertEqual(self.cli('lease','release','--owner','holder')[0],0)
                 self.assertFalse(lock.LEASE.exists())
 
+    def test_release_preserves_changes_before_removal(self):
+        real_unlink, real_rename = Path.unlink, os.rename
+        for change in ('replace', 'same_token', 'unreadable', 'refresh', 'rewrite', 'third_holder'):
+            with self.subTest(change=change):
+                self.hold(120)
+                lock.write_holder(HOLD_TOKEN)
+                sidecar = self.root/'priority-hold.owner.json'
+                metadata = sidecar.read_bytes()
+                raced = False
+                def replace():
+                    nonlocal raced
+                    raced = True
+                    if change == 'refresh':
+                        os.utime(lock.HOLD, None)
+                    elif change == 'rewrite':
+                        lock.HOLD.write_text('successor token')
+                    else:
+                        real_unlink(lock.HOLD)
+                        lock.HOLD.write_bytes(b'\xff' if change == 'unreadable' else
+                                              HOLD_TOKEN.encode() if change == 'same_token' else b'successor token')
+                def unlink(path, *args, **kwargs):
+                    if path == lock.HOLD and not raced: replace()
+                    return real_unlink(path, *args, **kwargs)
+                def rename(source, target):
+                    if source == lock.HOLD and not raced: replace()
+                    result = real_rename(source, target)
+                    if source == lock.HOLD and change == 'third_holder': lock.HOLD.write_text('third token')
+                    return result
+                with patch.object(Path, 'unlink', unlink), patch.object(lock.os, 'rename', side_effect=rename):
+                    with self.assertRaises(lock.Busy): lock.hold_release(HOLD_TOKEN)
+                expected = (b'third token' if change == 'third_holder' else b'\xff' if change == 'unreadable'
+                            else HOLD_TOKEN.encode() if change in ('same_token', 'refresh') else b'successor token')
+                self.assertTrue(raced)
+                self.assertEqual(lock.HOLD.read_bytes(), expected)
+                self.assertEqual(sidecar.read_bytes(), metadata)
+                self.assertEqual(self.cli('open', 'dev.fixture')[0], 5)
+                if change == 'third_holder':
+                    self.assertTrue(any(p.read_bytes() == b'successor token'
+                                        for p in self.root.glob('.hold-release-*')))
+        self.device.app_start.assert_not_called()
+        self.assertFalse(any(r['event'] == 'hold_archived' for r in self.events()))
+
     def test_successful_release_keeps_unreadable_successor(self):
-        self.hold()
-        original=Path.unlink
-        def replace_after_unlink(path,*args,**kwargs):
-            result=original(path,*args,**kwargs)
-            if path==lock.HOLD: path.write_bytes(b'\xff')
-            return result
-        with patch.object(Path,'unlink',replace_after_unlink):
-            lock.hold_release(HOLD_TOKEN)
-        self.assertEqual(lock.HOLD.read_bytes(),b'\xff')
+        real_rename = os.rename
+        for contents in (b'successor token', b'\xff'):
+            with self.subTest(contents=contents):
+                self.hold()
+                def replace_after_rename(source, target):
+                    result = real_rename(source, target)
+                    if source == lock.HOLD: lock.HOLD.write_bytes(contents)
+                    return result
+                with patch.object(lock.os, 'rename', side_effect=replace_after_rename):
+                    lock.hold_release(HOLD_TOKEN)
+                self.assertEqual(lock.HOLD.read_bytes(), contents)
+                self.assertEqual(self.cli('open', 'dev.fixture')[0], 5)
+        self.device.app_start.assert_not_called()
 
     def test_lazy_metadata_replacement_does_not_grant_successor_access(self):
         self.hold()
