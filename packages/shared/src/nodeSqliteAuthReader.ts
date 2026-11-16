@@ -256,7 +256,7 @@ export const makeAuthReader = Effect.fnUntraced(function* (
       allowExtension: options.allowExtension ?? false,
       prepareCacheSize: options.prepareCacheSize ?? 200,
       initializationSql: options.readerInitializationSql ?? [],
-      reportStarted: true,
+      reportStarted: false,
       // The child's own SIGKILL guard, which also bounds an orphan or a stalled
       // parent. Arming it at the statement limit for every statement killed each
       // slow autocommit read in-process ("exited with code null") whatever the
@@ -295,8 +295,6 @@ export const makeAuthReader = Effect.fnUntraced(function* (
       readonly post: () => void;
       /** When it was sent. Unset means the child never saw it: it ran nothing. */
       execAt?: number;
-      /** Parent observation of the child's execution start, separate from the deadline clock. */
-      startedAt?: number;
       reported?: boolean;
       /** The caller gave up; the child still finishes it and its reply is dropped. */
       abandoned?: boolean;
@@ -416,16 +414,11 @@ export const makeAuthReader = Effect.fnUntraced(function* (
       pending.clear();
       abandonedCount = 0;
     };
-    worker.on("message", (reply: ReaderReply | ReaderStartup | { readonly started: number }) => {
+    worker.on("message", (reply: ReaderReply | ReaderStartup) => {
       if ("type" in reply) {
         if (reply.type === "unavailable") failed(reply, "Failed to open reader", "open");
         announce(reply);
         if (pending.size === 0) worker.unref();
-        return;
-      }
-      if ("started" in reply) {
-        const request = pending.get(reply.started);
-        if (request !== undefined) request.startedAt = performance.now();
         return;
       }
       if ("error" in reply) {
@@ -535,8 +528,8 @@ export const makeAuthReader = Effect.fnUntraced(function* (
             post: () => worker.postMessage({ id, safeIntegers, ...input, cached }),
             reject: (error) => resume(Effect.fail(error)),
             recordExecutionLowerBound: () => {
-              if (entry.startedAt !== undefined)
-                recordExecution(Math.max(0, performance.now() - entry.startedAt), true);
+              if (entry.execAt !== undefined)
+                recordExecution(Math.max(0, performance.now() - entry.execAt), true);
             },
             resume: (reply) => {
               recordExecution(reply.executionMs);
