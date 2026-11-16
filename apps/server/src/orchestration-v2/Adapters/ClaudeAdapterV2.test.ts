@@ -1,3 +1,4 @@
+import * as ProviderProcessRegistry from "../../ardud/providers/ProviderProcessRegistry.ts";
 import type { OrchestrationV2Run } from "@t3tools/contracts";
 import { continuedLaunchRecovery, nextLaunchRecovery } from "../launchRecovery.ts";
 // @effect-diagnostics nodeBuiltinImport:off -- workflow fixtures use files and the fake Claude CLI uses Node streams
@@ -2616,7 +2617,11 @@ describe("ClaudeAdapterV2 MCP credential channel", () => {
         },
       });
     }).pipe(
-      Effect.provide(ClaudeAdapterV2.layerQueryRunner),
+      Effect.provide(
+        ClaudeAdapterV2.layerQueryRunner.pipe(
+          Layer.provide(ProviderProcessRegistry.ProviderProcessRegistry.layerTest),
+        ),
+      ),
       Effect.provideService(
         ProviderEventLoggers.ProviderEventLoggers,
         ProviderEventLoggers.NoOpProviderEventLoggers,
@@ -2707,6 +2712,7 @@ describe("ClaudeAdapterV2 native session identity", () => {
     providerTurnOrdinal: number,
     nativeThreadHasTurns?: boolean,
     seededHead?: string | null,
+    savedTranscript?: { readonly nativeThreadId: string; readonly text: string },
   ) =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -2715,14 +2721,23 @@ describe("ClaudeAdapterV2 native session identity", () => {
         const attachmentsDir = yield* fileSystem.makeTempDirectoryScoped({
           prefix: "t3-claude-v2-session-identity-",
         });
+        const path = yield* Path.Path;
+        if (savedTranscript !== undefined) {
+          const projectDir = path.join(attachmentsDir, "projects", "-previous-workspace");
+          yield* fileSystem.makeDirectory(projectDir, { recursive: true });
+          yield* fileSystem.writeFileString(
+            path.join(projectDir, `${savedTranscript.nativeThreadId}.jsonl`),
+            savedTranscript.text,
+          );
+        }
         const openedQueries: Array<ClaudeAdapterV2.ClaudeAgentSdkQueryOpenInput> = [];
         const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
           instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
           settings: DEFAULT_CLAUDE_SETTINGS,
-          environment: {},
+          environment: { CLAUDE_CONFIG_DIR: attachmentsDir },
           attachmentsDir,
           fileSystem,
-          path: yield* Path.Path,
+          path,
           crypto: yield* Crypto.Crypto,
           idAllocator,
           queryRunner: {
@@ -2808,20 +2823,25 @@ describe("ClaudeAdapterV2 native session identity", () => {
       ),
     );
 
-  it.effect("creates the native session on the first provider turn", () =>
-    Effect.gen(function* () {
-      const openedQueries = yield* openTurnWithOrdinal(1);
-      assert.equal(openedQueries.length, 1);
-      assert.equal(openedQueries[0]?.options.sessionId, "native-session-identity");
-      assert.equal(openedQueries[0]?.options.resume, undefined);
-    }),
+  it.effect.each([undefined, false])(
+    "creates the first native session without a transcript and nativeThreadHasTurns=%s",
+    (nativeThreadHasTurns) =>
+      Effect.gen(function* () {
+        const openedQueries = yield* openTurnWithOrdinal(1, nativeThreadHasTurns);
+        assert.equal(openedQueries.length, 1);
+        assert.equal(openedQueries[0]?.options.sessionId, "native-session-identity");
+        assert.equal(openedQueries[0]?.options.resume, undefined);
+      }),
   );
 
-  it.effect(
-    "resumes the native session on a fresh session instance when prior provider turns exist",
-    () =>
+  it.effect.each([
+    { providerTurnOrdinal: 1, nativeThreadHasTurns: true },
+    { providerTurnOrdinal: 2, nativeThreadHasTurns: undefined },
+  ])(
+    "resumes a prior native session with ordinal $providerTurnOrdinal and nativeThreadHasTurns=$nativeThreadHasTurns",
+    ({ providerTurnOrdinal, nativeThreadHasTurns }) =>
       Effect.gen(function* () {
-        const openedQueries = yield* openTurnWithOrdinal(2);
+        const openedQueries = yield* openTurnWithOrdinal(providerTurnOrdinal, nativeThreadHasTurns);
         assert.equal(openedQueries.length, 1);
         assert.equal(openedQueries[0]?.options.resume, "native-session-identity");
         assert.equal(openedQueries[0]?.options.sessionId, undefined);
@@ -2834,6 +2854,46 @@ describe("ClaudeAdapterV2 native session identity", () => {
       assert.equal(openedQueries[0]?.options.sessionId, "native-session-identity");
       assert.equal(openedQueries[0]?.options.resume, undefined);
     }),
+  );
+
+  it.effect("creates a new native session when only another session has a transcript", () =>
+    Effect.gen(function* () {
+      const openedQueries = yield* openTurnWithOrdinal(1, false, undefined, {
+        nativeThreadId: "other-native-session",
+        text: '{"type":"user","message":{"role":"user","content":"hello"}}\n',
+      });
+      assert.equal(openedQueries.length, 1);
+      assert.equal(openedQueries[0]?.options.sessionId, "native-session-identity");
+      assert.isUndefined(openedQueries[0]?.options.resume);
+    }),
+  );
+
+  it.effect.each([
+    { providerTurnOrdinal: 1, nativeThreadHasTurns: undefined },
+    { providerTurnOrdinal: 1, nativeThreadHasTurns: false },
+    { providerTurnOrdinal: 2, nativeThreadHasTurns: false },
+  ])(
+    "resumes a saved transcript with ordinal $providerTurnOrdinal and nativeThreadHasTurns=$nativeThreadHasTurns",
+    ({ providerTurnOrdinal, nativeThreadHasTurns }) =>
+      Effect.gen(function* () {
+        const openedQueries = yield* openTurnWithOrdinal(
+          providerTurnOrdinal,
+          nativeThreadHasTurns,
+          undefined,
+          {
+            nativeThreadId: "native-session-identity",
+            text: [
+              '{"type":"user","message":{"role":"user","content":"hello"}}',
+              '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}}',
+              "",
+            ].join("\n"),
+          },
+        );
+        assert.equal(openedQueries.length, 1);
+        assert.equal(openedQueries[0]?.options.resume, "native-session-identity");
+        assert.isUndefined(openedQueries[0]?.options.sessionId);
+        assert.isUndefined(openedQueries[0]?.options.resumeSessionAt);
+      }),
   );
 
   it.effect.each([

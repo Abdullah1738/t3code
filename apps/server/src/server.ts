@@ -46,6 +46,7 @@ import {
 import { fixPath } from "./os-jank.ts";
 import * as Ws from "./ws.ts";
 import * as AgentScopeLive from "./process/agentScope.ts";
+import * as ProviderProcessRegistry from "./ardud/providers/ProviderProcessRegistry.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as NodePtyAdapter from "./terminal/NodePtyAdapter.ts";
 import * as PullRequestHttp from "./pullRequest/http.ts";
@@ -1166,34 +1167,38 @@ const layerMakeServer = Layer.unwrap(
       HeapSnapshot.layer,
     );
 
-    return layerServerApplication.pipe(
-      Layer.provide(CloudLink.layer),
-      Layer.provideMerge(layerRuntimeServices),
-      Layer.provideMerge(
-        McpSessionRegistry.layer.pipe(
-          Layer.provide(CredentialStore.layer),
-          Layer.provide(layerPersistence),
-          Layer.provide(ServerEnvironment.layer.pipe(Layer.provide(layerSecrets))),
+    return layerServerApplication
+      .pipe(
+        Layer.provide(CloudLink.layer),
+        Layer.provideMerge(layerRuntimeServices),
+        Layer.provideMerge(
+          McpSessionRegistry.layer.pipe(
+            Layer.provide(CredentialStore.layer),
+            Layer.provide(layerPersistence),
+            Layer.provide(ServerEnvironment.layer.pipe(Layer.provide(layerSecrets))),
+          ),
         ),
-      ),
-      Layer.provide(layerActivation),
-      Layer.provideMerge(RelayTracing.layerServerRelayBroker),
-      Layer.provideMerge(layerHttpServer),
-      Layer.provide(layerServerAnalyticsErrors),
-      Layer.provide(layerApplicationObservability),
-      Layer.provide(AnalyticsDatabase.layer),
-      Layer.provide(McpCallLedger.layer),
-      Layer.provide(McpAvailability.layer),
-      Layer.provide(OwnerAnalytics.layer.pipe(Layer.provide(layerPersistence))),
-      Layer.provide(LargeReplyLog.layer),
-      Layer.provide(ReplyBuilders.layer),
-      Layer.provideMerge(FetchHttpClient.layer),
-      Layer.provide(VcsProcess.layer),
-      Layer.provideMerge(AgentScopeLive.layer),
-      Layer.provideMerge(layerPlatformServices),
-      StartupPhaseLog.withStartupLayer("boot"),
-      Layer.provide(StartupPhaseLog.layer(config.logsDir)),
-    );
+        Layer.provide(layerActivation),
+        Layer.provideMerge(RelayTracing.layerServerRelayBroker),
+        Layer.provideMerge(layerHttpServer),
+        Layer.provide(layerServerAnalyticsErrors),
+        Layer.provide(layerApplicationObservability),
+        Layer.provide(AnalyticsDatabase.layer),
+        Layer.provide(McpCallLedger.layer),
+        Layer.provide(McpAvailability.layer),
+        Layer.provide(OwnerAnalytics.layer.pipe(Layer.provide(layerPersistence))),
+        Layer.provide(LargeReplyLog.layer),
+        Layer.provide(ReplyBuilders.layer),
+        Layer.provideMerge(FetchHttpClient.layer),
+        Layer.provide(VcsProcess.layer),
+        Layer.provideMerge(AgentScopeLive.layer),
+        Layer.provideMerge(ProviderProcessRegistry.layer),
+      )
+      .pipe(
+        Layer.provideMerge(layerPlatformServices),
+        StartupPhaseLog.withStartupLayer("boot"),
+        Layer.provide(StartupPhaseLog.layer(config.logsDir)),
+      );
   }),
 ).pipe(Layer.provide(ProcessRunner.layer));
 
