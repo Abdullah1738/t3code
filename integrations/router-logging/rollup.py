@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import tempfile
 from toollog import directory
+from volume import REASONS, integer
 
 
 def percentiles(values):
@@ -65,6 +66,7 @@ def rollup(day, root=None, now=None):
     heartbeat_observations = {}
     day_start = dt.datetime.combine(dt.date.fromisoformat(day), dt.time(), dt.timezone.utc).timestamp() * 1000
     day_end = day_start + 86400000
+    volume_writers = {}
     ok = failed = total = malformed = 0
     source = root / (day + '.ndjson')
     if source.exists():
@@ -146,6 +148,16 @@ def rollup(day, root=None, now=None):
                             if isinstance(account, str) and len(account) == 16 and all(c in '0123456789abcdef' for c in account):
                                 lock_accounts[account] += 1
                                 account_distinct[account].add(identity)
+                    if row['name'] == 'log.volume':
+                        writer = row.get('ids', {}).get('writer')
+                        props = row.get('props', {})
+                        drops = props.get('droppedByReason')
+                        if (isinstance(writer, str) and len(writer) == 16 and all(c in '0123456789abcdef' for c in writer)
+                                and isinstance(drops, dict) and all(k in REASONS and integer(v) for k,v in drops.items())
+                                and integer(props.get('droppedLines')) and props['droppedLines'] == sum(drops.values())):
+                            previous = volume_writers.setdefault(writer, Counter())
+                            for reason,count in drops.items():
+                                previous[reason] = max(previous[reason], count)
                     if row['name'] == 'proxy.request':
                         group = proxy.setdefault(key, dict(count=0, aborted=0, durations=[], ttfb=[], errors=Counter(), samples={}))
                         group['count'] += 1
@@ -212,6 +224,12 @@ def rollup(day, root=None, now=None):
                 open_heartbeat.add((primary, worker))
     result['supervisor'] = {**supervisor, 'noHeartbeatMs': interval_total(heartbeat_intervals),
                             'openNoHeartbeatWorkers': len(open_heartbeat)}
+    drops = Counter()
+    for writer in volume_writers.values():
+        drops.update(writer)
+    result['droppedLines'] = sum(drops.values()) if volume_writers else None
+    result['dropsByReason'] = dict(sorted(drops.items()))
+    result['volumeWriters'] = len(volume_writers)
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(root, 0o700)
     fd, tmp = tempfile.mkstemp(prefix='.rollup-', dir=root)
