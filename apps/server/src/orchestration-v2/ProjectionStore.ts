@@ -1,3 +1,4 @@
+import { threadReadCount } from "../ardud/persistence/threadReadCount.ts";
 import * as Deferred from "effect/Deferred";
 import { ShellRunLookupMigration } from "../ardud/persistence/shellRunLookupMigration.ts";
 import * as IdSetQueries from "./IdSetQueries.ts";
@@ -372,6 +373,7 @@ export interface ProjectionRecordFilter {
   readonly messageRoles?: ReadonlyArray<OrchestrationV2ConversationMessage["role"]>;
   readonly turnItemRunId?: RunId;
   readonly messageIds?: ReadonlyArray<MessageId>;
+  readonly messageOrder?: "timeline" | "unordered";
   readonly messageRunIds?: ReadonlyArray<RunId>;
   readonly turnItemRunIds?: ReadonlyArray<RunId | null>;
   readonly runIds?: ReadonlyArray<RunId>;
@@ -3974,6 +3976,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             : window === undefined
               ? sql<PayloadRow>`
                 SELECT payload_json FROM orchestration_v2_projection_messages
+                  ${filter?.messageIds === undefined ? sql`` : sql`INDEXED BY sqlite_autoindex_orchestration_v2_projection_messages_1`}
                 WHERE thread_id = ${threadId}
                   ${filter?.messageIds === undefined ? sql`` : sql`AND message_id IN (SELECT value FROM json_each(${encodeIdList(filter.messageIds)}))`}
                   ${filter?.messageRoles === undefined ? sql`` : sql`AND role IN (SELECT value FROM json_each(${encodeIdList(filter.messageRoles)}))`}
@@ -4117,7 +4120,12 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           decodeRows(decodeContextTransferPayload, threadId)(contextTransferRows),
         ]);
         const messageOrdinals = new Map<string, number>();
-        if (fields !== undefined && fields.includes("messages") && messages.length > 1) {
+        if (
+          fields !== undefined &&
+          fields.includes("messages") &&
+          messages.length > 1 &&
+          filter?.messageOrder !== "unordered"
+        ) {
           const rows = yield* sql<{ message_id: string; ordinal: number }>`
             SELECT json_extract(payload_json, '$.messageId') AS message_id, MIN(ordinal) AS ordinal
             FROM ardud_history_turn_items
@@ -4126,7 +4134,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           `;
           for (const row of rows) messageOrdinals.set(row.message_id, row.ordinal);
         }
-        const orderedMessages = sortMessagesByTurnItemOrder(messages, turnItems, messageOrdinals);
+        const orderedMessages =
+          filter?.messageOrder === "unordered"
+            ? messages
+            : sortMessagesByTurnItemOrder(messages, turnItems, messageOrdinals);
         const projection = {
           thread,
           runs,
@@ -6402,13 +6413,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       threadId: ThreadId,
       options: ProjectionTimelinePageOptions,
     ) {
-      // Keep visibility and global positions before the message filter. Only page ids
-      // cross the worker boundary; counts still inspect the visible index in SQLite.
+      // Stream global positions before filtering messages, stopping at the lookahead.
+      // Sorting this numbered stream or reusing it for totals would exhaust the history.
       const rows = yield* sql<{
         total_items: number;
         turn_item_id: string | null;
         position: number | null;
-      }>`WITH visible AS MATERIALIZED (
+      }>`WITH visible AS NOT MATERIALIZED (
         SELECT i.turn_item_id, i.type,
           ROW_NUMBER() OVER (ORDER BY i.ordinal ASC, i.turn_item_id ASC) - 1 AS position
         FROM ardud_history_turn_items i
@@ -6424,7 +6435,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             AND NOT EXISTS (SELECT 1 FROM ardud_history_turn_items request
               WHERE request.thread_id = i.thread_id AND request.run_id = i.run_id
                 AND request.type = 'run_interrupt_request'))
-      ), page AS (
+      ), page AS MATERIALIZED (
         SELECT turn_item_id, position FROM visible
         WHERE ${
           options.itemId === undefined
@@ -6432,9 +6443,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               ${options.view === "activity" ? sql`` : sql`AND type IN ('user_message', 'assistant_message', 'proposed_plan')`}`
             : sql`turn_item_id = ${options.itemId}`
         }
-        ORDER BY position ASC LIMIT ${options.limit + 1}
+        LIMIT ${options.limit + 1}
       )
-      SELECT (SELECT COUNT(*) FROM visible) AS total_items, page.turn_item_id, page.position
+      SELECT ${threadReadCount(sql, threadId)} AS total_items, page.turn_item_id, page.position
       FROM (SELECT 1) LEFT JOIN page ON 1 ORDER BY page.position ASC`;
       const page = rows.filter((row) => row.turn_item_id !== null && row.position !== null);
       const items = yield* Effect.forEach(page.slice(0, options.limit), (row) =>
