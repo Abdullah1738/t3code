@@ -7132,7 +7132,7 @@ it.effect.each(reviewHandbacks)(
           [],
           head,
         );
-        assert.strictEqual(repeated.card.stage, "completed");
+        assert.strictEqual(repeated.card.stage, "in_review");
         assert.deepStrictEqual(
           repeated.card.subtasks.map((s) => s.state),
           ["done", "done", "open", "open", "open"],
@@ -14552,7 +14552,7 @@ it.effect("a card follows its subtasks: work, review, the evaluator's step, then
       yield* kanban.reviewResult(reviewThread, "clear", []);
       let current = (yield* kanban.card(card.id)).card;
       assert.strictEqual(current.subtasks.find((s) => s.id === "s2")?.state, "done");
-      assert.strictEqual(current.stage, "completed");
+      assert.strictEqual(current.stage, "in_review");
 
       // The step is the evaluator's alone: an evaluator is told, and the card
       // can't be sent to a worker until that step is done.
@@ -14959,6 +14959,214 @@ it.effect("a context PR doesn't hold a reviewed card once its own PR lands", () 
   }),
 );
 
+it.effect.each(["merge sync", "clear verdict", "backfill"] as const)(
+  "#1639 completes a clear review on %s and keeps its evaluator wait and steps",
+  (trigger) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const logs: unknown[] = [];
+      const logger = Logger.make(({ message }) => logs.push(message));
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+        const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+        const card = yield* kanban.createCard(
+          board.id,
+          {
+            prompt: "Stage sync",
+            title: "Stage sync",
+            subtasks: [
+              { text: "Work", owner: "work", step: 1 },
+              { text: "Review", owner: "review", step: 2 },
+              { text: "Read back", owner: "evaluator", step: 3 },
+              { text: "Tell evaluator", owner: "evaluator", step: 4 },
+            ],
+          },
+          evaluator,
+        );
+        yield* kanban.dispatchNow;
+        const work = (yield* kanban.card(card.id)).card.activeThreadId!;
+        const prs = [1, 2].map((id) => ({
+          url: `https://github.com/o/r/pull/${id}`,
+          title: `PR ${id}`,
+          state: "open" as const,
+        }));
+        fake.prs.set(work, prs);
+        const worker: KanbanActor = { _tag: "thread", threadId: work };
+        yield* kanban.markSubtask(card.id, "s1", "done", null, worker, "work");
+        yield* kanban.moveCard(card.id, "needs_review", "cardThread", worker);
+        yield* kanban.dispatchNow;
+        const reviewing = (yield* kanban.card(card.id)).card;
+        assert.strictEqual(reviewing.activeRole, "review");
+        const wait = yield* decodeWait({
+          on: "time",
+          until: "2099-01-01T00:00:00.000Z",
+          note: "Evaluator read-back",
+          by: owner,
+          at: reviewing.updatedAt,
+        });
+        if (trigger === "clear verdict") {
+          yield* store.putCard({ ...reviewing, wait });
+          yield* TestClock.adjust("1 second");
+        }
+        if (trigger === "clear verdict")
+          fake.prs.set(
+            work,
+            prs.map((pr) => ({ ...pr, state: "merged" })),
+          );
+        yield* kanban.reviewResult(reviewing.activeThreadId!, "clear", []);
+        if (trigger !== "clear verdict") {
+          yield* store.putCard({ ...(yield* kanban.card(card.id)).card, wait });
+          assert.strictEqual((yield* kanban.card(card.id)).card.stage, "in_review");
+          yield* TestClock.adjust("1 second");
+          fake.prs.set(
+            work,
+            prs.map((pr, index) => ({ ...pr, state: index === 0 ? "merged" : "open" })),
+          );
+          yield* kanban.tick;
+          assert.strictEqual(
+            (yield* kanban.card(card.id)).card.stage,
+            "in_review",
+            "one open PR holds the card",
+          );
+          fake.prs.set(
+            work,
+            prs.map((pr, index) => ({
+              ...pr,
+              state: trigger === "backfill" || index === 0 ? "merged" : "closed",
+            })),
+          );
+          if (trigger === "backfill") {
+            const existing = (yield* kanban.card(card.id)).card;
+            yield* store.putCard({
+              ...existing,
+              links: existing.links.map((link) => ({ ...link, state: "merged" })),
+            });
+          }
+          yield* TestClock.adjust("1 second");
+          yield* kanban.tick;
+        }
+        const completed = (yield* kanban.card(card.id)).card;
+        assert.strictEqual(completed.stage, "completed");
+        assert.deepStrictEqual(completed.wait, { ...wait, at: completed.movedAt });
+        assert.isAbove(Date.parse(completed.movedAt), Date.parse(wait.at));
+        assert.deepStrictEqual(
+          completed.subtasks.filter((s) => s.owner === "evaluator"),
+          reviewing.subtasks.filter((s) => s.owner === "evaluator"),
+        );
+        const events = (yield* kanban.card(card.id)).events;
+        assert.lengthOf(
+          events.filter((e) => e.toStage === "completed"),
+          1,
+        );
+        assert.isTrue(events.some((e) => e.body === "review clear and PRs merged"));
+        assert.isTrue(events.some((e) => e.kind === "review" && e.body === "clear"));
+        yield* kanban.tick;
+        assert.deepStrictEqual((yield* kanban.card(card.id)).card.wait, completed.wait);
+        assert.lengthOf(
+          (yield* kanban.card(card.id)).events.filter((e) => e.toStage === "completed"),
+          1,
+        );
+        assert.lengthOf(
+          logs.filter((entry) => JSON.stringify(entry).includes("kanban.stage_sync")),
+          1,
+        );
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            testLayer(fake.layer),
+            Logger.layer([logger], { mergeWithExisting: false }),
+          ),
+        ),
+      );
+    }),
+);
+
+it.effect.each(["work", "review", "ask", "findings", "chain"] as const)(
+  "#1639 holds a clear review for an open %s, then completes after it clears",
+  (blocker) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+        const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+        const created = yield* kanban.createCard(
+          board.id,
+          { prompt: "Held", title: "Held" },
+          evaluator,
+        );
+        yield* kanban.dispatchNow;
+        const work = (yield* kanban.card(created.id)).card.activeThreadId!;
+        const pr = { url: "https://github.com/o/r/pull/99", title: "Own", state: "open" as const };
+        fake.prs.set(work, [pr]);
+        yield* kanban.moveCard(created.id, "needs_review", "cardThread", {
+          _tag: "thread",
+          threadId: work,
+        });
+        yield* kanban.dispatchNow;
+        assert.strictEqual((yield* kanban.card(created.id)).card.activeRole, "review");
+        yield* kanban.reviewResult(
+          (yield* kanban.card(created.id)).card.activeThreadId!,
+          "clear",
+          [],
+        );
+        const reviewed = (yield* kanban.card(created.id)).card;
+        const wait = yield* decodeWait({
+          on: "time",
+          until: "2099-01-01T00:00:00.000Z",
+          note: "Later",
+          by: owner,
+          at: reviewed.updatedAt,
+        });
+        const extra = {
+          id: "s99",
+          step: 9,
+          text: "Still open",
+          owner: blocker === "review" ? ("review" as const) : ("work" as const),
+          state: "open" as const,
+          createdAt: reviewed.updatedAt,
+          note: null,
+          doneAt: null,
+          doneBy: null,
+        };
+        const held: KanbanCard = {
+          ...reviewed,
+          wait,
+          subtasks:
+            blocker === "work" || blocker === "review"
+              ? [...reviewed.subtasks, extra]
+              : reviewed.subtasks,
+          reviewFindingsPending: blocker === "findings",
+          reviewStep: blocker === "chain" ? 0 : reviewed.reviewStep,
+          asks:
+            blocker === "ask"
+              ? [
+                  {
+                    id: "q1",
+                    text: "Blocking decision",
+                    blocking: true,
+                    by: owner,
+                    at: reviewed.updatedAt,
+                    seq: null,
+                    closedAt: null,
+                  },
+                ]
+              : reviewed.asks,
+        };
+        yield* store.putCard(held);
+        fake.prs.set(work, [{ ...pr, state: "merged" }]);
+        yield* kanban.tick;
+        assert.strictEqual((yield* kanban.card(created.id)).card.stage, "in_review");
+        yield* store.putCard({ ...reviewed, wait });
+        yield* kanban.tick;
+        assert.strictEqual((yield* kanban.card(created.id)).card.stage, "completed");
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
 it.effect("an evaluator hears once when a reviewed card waits on it for its PRs", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
@@ -15011,12 +15219,14 @@ it.effect("an evaluator hears once when a reviewed card waits on it for its PRs"
       assert.strictEqual(back.stage, "todo");
       assert.notInclude(back.wakeNote ?? "", "Subtasks (");
 
-      // Its PR lands on its own: completed, and the evaluator isn't told twice.
+      // Its PR lands on its own, but future work keeps the card in review.
       const second = yield* reviewed("Second");
       fake.prs.set(second.workThread, [{ url: second.pr, title: "Second", state: "merged" }]);
       yield* kanban.tick;
-      assert.strictEqual((yield* kanban.card(second.card.id)).card.stage, "completed");
+      assert.strictEqual((yield* kanban.card(second.card.id)).card.stage, "in_review");
       assert.strictEqual(yield* toldAbout(second.card.number), 1);
+      yield* kanban.markSubtask(second.card.id, "s3", "done", "merged", evaluator, "evaluator");
+      assert.strictEqual((yield* kanban.card(second.card.id)).card.stage, "todo");
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
@@ -37922,11 +38132,13 @@ it.effect("#1394 the turn-end owner discussion reminder has a card wake scope", 
 
 it.effect.each(
   (["findings", "clear"] as const).flatMap((verdict) =>
-    (["review", "work"] as const).map((target) => ({ verdict, target })),
+    (["review", "work"] as const).flatMap((target) =>
+      [false, true].map((prChanged) => ({ verdict, target, prChanged })),
+    ),
   ),
 )(
-  "#1394 $verdict queue read failure on $target leaves the verdict retryable",
-  ({ verdict, target }) =>
+  "#1394 $verdict queue read failure on $target leaves the verdict retryable (PR changed=$prChanged)",
+  ({ verdict, target, prChanged }) =>
     Effect.gen(function* () {
       const fake = yield* makeFake;
       let failingThread: ThreadId | undefined;
@@ -37962,6 +38174,8 @@ it.effect.each(
         );
         yield* kanban.dispatchNow;
         const work = (yield* kanban.card(created.id)).card.workThreadId!;
+        const pr = { url: "https://github.com/o/r/pull/99", title: "Work", state: "open" as const };
+        if (prChanged) fake.prs.set(work, [pr]);
         yield* kanban.moveCard(created.id, "needs_review", "cardThread", {
           _tag: "thread",
           threadId: work,
@@ -37971,6 +38185,7 @@ it.effect.each(
         const before = (yield* kanban.card(created.id)).card;
         const review = before.activeThreadId!;
         assert.equal(before.stage, "in_review");
+        if (prChanged) fake.prs.set(work, [{ ...pr, state: "merged" }]);
         failingThread = target === "review" ? review : work;
         const failed = yield* Effect.exit(
           kanban.reviewResult(review, verdict, ["Fix queue ordering"], "f202e471a2"),
@@ -37981,6 +38196,8 @@ it.effect.each(
         assert.equal(detail.card.activeThreadId, review);
         assert.equal(detail.card.reviewRound, before.reviewRound);
         assert.equal(detail.card.reviewStep, before.reviewStep);
+        if (prChanged)
+          assert.equal(detail.card.links.find((link) => link.url === pr.url)?.state, "merged");
         assert.lengthOf(
           detail.events.filter((event) => event.kind === "review"),
           0,
