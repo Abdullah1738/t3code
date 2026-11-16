@@ -83,6 +83,7 @@ class PhoneLockTests(unittest.TestCase):
         if pid is not None:
             (self.root/'priority-hold.owner.json').write_text(json.dumps(dict(
                 token_sha=lock.token_sha(HOLD_TOKEN), agent_pid=pid, agent_comm='claude',
+                hold_dev=lock.HOLD.stat().st_dev, hold_ino=lock.HOLD.stat().st_ino,
                 agent_started=started or 'fixture start', recorded_at=lock.now().isoformat())))
 
     def test_dead_and_reused_holder_gate_archive_and_privacy(self):
@@ -231,6 +232,83 @@ class PhoneLockTests(unittest.TestCase):
         for value in ('0', '-1', 'NaN', '30minutes', ''):
             with self.subTest(value=value), patch.dict(os.environ, PH_HOLD_STALE_AFTER=value):
                 with self.assertRaises(ValueError): lock.hold_stale_after()
+
+    def test_empty_and_whitespace_holds_expire_but_fresh_stays_busy(self):
+        for contents in ('', '\n', '  \t'):
+            for age, expected in ((29*60,5), (31*60,0)):
+                with self.subTest(contents=contents,age=age):
+                    self.hold(age)
+                    lock.HOLD.write_text(contents)
+                    stamp=lock.now().timestamp()-age
+                    os.utime(lock.HOLD,(stamp,stamp))
+                    self.assertEqual(self.cli('open','dev.fixture')[0],expected)
+
+    def test_previous_hold_metadata_cannot_reap_reused_token(self):
+        self.hold(pid=99999999)
+        os.rename(lock.HOLD,self.root/'previous-hold')
+        lock.HOLD.write_text(HOLD_TOKEN)
+        with patch.object(lock,'process_started',return_value=False) as probe:
+            self.assertEqual(self.cli('open','dev.fixture')[0],5)
+        probe.assert_not_called()
+        self.assertTrue(lock.HOLD.exists())
+        self.assertFalse(list(self.root.glob('priority-hold.stale-*')))
+
+    def test_own_expired_hold_stops_device_command_before_reacquire(self):
+        for age, pid in ((31*60,None),(0,99999999)):
+            with self.subTest(age=age,pid=pid):
+                self.hold(age,pid)
+                with patch.dict(os.environ,PHONE_HOLD_OWNER=HOLD_TOKEN), patch.object(lock,'process_started',return_value=False):
+                    code,out=self.cli('open','dev.fixture')
+                self.assertEqual(code,5,out)
+                self.assertIn('acquire it again',out)
+                self.assertFalse(lock.HOLD.exists())
+                self.assertEqual(self.events()[-1]['reason'],'hold')
+        self.device.app_start.assert_not_called()
+
+    def test_sidecar_write_failures_do_not_lose_owned_hold(self):
+        import errno
+        for failure in (errno.ENOSPC,errno.EACCES):
+            with self.subTest(failure=failure), patch.object(lock,'write_holder',side_effect=OSError(failure,'fixture')):
+                lock.HOLD.unlink(missing_ok=True)
+                self.assertEqual(self.cli('hold','acquire','--token',HOLD_TOKEN)[0],0)
+                with patch.dict(os.environ,PHONE_HOLD_OWNER=HOLD_TOKEN):
+                    self.assertEqual(self.cli('open','dev.fixture')[0],0)
+                    self.assertEqual(self.cli('hold','release')[0],0)
+                self.assertFalse(lock.HOLD.exists())
+
+    def test_invalid_staleness_override_uses_default_without_breaking_release(self):
+        for value in ('0','-1','NaN','30minutes',''):
+            with self.subTest(value=value), patch.dict(os.environ,PH_HOLD_STALE_AFTER=value):
+                self.hold(29*60)
+                self.assertEqual(self.cli('help')[0],0)
+                self.assertEqual(self.cli('open','dev.fixture')[0],5)
+                self.hold(31*60)
+                self.assertEqual(self.cli('hold','status','--json')[0],0)
+                self.claim()
+                self.hold()
+                self.assertEqual(self.cli('lease','release','--owner','holder')[0],0)
+                self.assertFalse(lock.LEASE.exists())
+
+    def test_successful_release_keeps_unreadable_successor(self):
+        self.hold()
+        original=Path.unlink
+        def replace_after_unlink(path,*args,**kwargs):
+            result=original(path,*args,**kwargs)
+            if path==lock.HOLD: path.write_bytes(b'\xff')
+            return result
+        with patch.object(Path,'unlink',replace_after_unlink):
+            lock.hold_release(HOLD_TOKEN)
+        self.assertEqual(lock.HOLD.read_bytes(),b'\xff')
+
+    def test_lazy_metadata_replacement_does_not_grant_successor_access(self):
+        self.hold()
+        def replace(*_args):
+            lock.HOLD.unlink()
+            lock.HOLD.write_text('successor')
+        with patch.dict(os.environ,PHONE_HOLD_OWNER=HOLD_TOKEN), patch.object(lock,'write_holder',side_effect=replace):
+            self.assertEqual(self.cli('open','dev.fixture')[0],5)
+        self.assertEqual(lock.HOLD.read_text(),'successor')
+        self.device.app_start.assert_not_called()
 
     def test_invalid_hold_arguments_never_echo_tokens(self):
         for args in [('acquire', '--token', HOLD_TOKEN, 'extra'), ('status', HOLD_TOKEN),
@@ -643,10 +721,41 @@ class LeaseRunTests(unittest.TestCase):
         return [sys.executable, '-I', self.script, 'lease', 'run', '--owner', 'runner', '--purpose', 'qa',
                 '--ttl', '2s', '--', sys.executable, '-I', '-c', code]
 
+    def test_real_cli_archive_and_refusal_keep_context(self):
+        script=str(Path(__file__).with_name('ph.py'))
+        env={**self.env,'HOME':str(self.root)}
+        hold=self.root/'priority-hold'
+        hold.write_text(HOLD_TOKEN)
+        stamp=time.time()-31*60
+        os.utime(hold,(stamp,stamp))
+        result=subprocess.run([sys.executable,'-I',script,'hold','status','--json'],env=env,cwd=self.root,
+                              capture_output=True,text=True,timeout=10)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(result.stdout)['archived'],'not_refreshed')
+        hold.write_text(HOLD_TOKEN)
+        result=subprocess.run([sys.executable,'-I',script,'hold','release'],env=env,cwd=self.root,
+                              capture_output=True,text=True,timeout=10)
+        self.assertEqual(result.returncode,5,result.stdout+result.stderr)
+        rows=[json.loads(line) for line in (self.root/'.local/state/ph/events.jsonl').read_text().splitlines()]
+        self.assertEqual(rows[0]['cmd'],'hold')
+        self.assertEqual((rows[-1]['event'],rows[-1]['reason']),('busy_refused','hold'))
+        self.assertNotIn(HOLD_TOKEN,json.dumps(rows)+result.stdout+result.stderr)
+
+    def test_process_start_identity_is_independent_of_timezone_and_locale(self):
+        expected=lock.process_started(os.getpid())
+        bootstrap=('import sys; sys.path.insert(0,'+repr(str(Path(__file__).resolve().parent))+'); '
+                   'import phonelock; print(phonelock.process_started(int(sys.argv[1])))')
+        for tz,locale in [('UTC0','C'),('Asia/Dubai','C'),('America/New_York','en_US.UTF-8'),('Asia/Tokyo','de_DE.UTF-8')]:
+            with self.subTest(tz=tz,locale=locale):
+                result=subprocess.run([sys.executable,'-I','-c',bootstrap,str(os.getpid())],
+                                      env={**self.env,'TZ':tz,'LC_ALL':locale},capture_output=True,text=True,timeout=10)
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertEqual(result.stdout.rstrip('\n'),expected)
+
     def test_real_pid_liveness_and_stale_status_subprocess(self):
         hold = self.root/'priority-hold'
         sidecar = self.root/'priority-hold.owner.json'
-        started = subprocess.run(['ps','-o','lstart=','-p',str(os.getpid())], capture_output=True,text=True,check=True).stdout.rstrip('\n')
+        started = lock.process_started(os.getpid())
         bootstrap = ('import sys; sys.path.insert(0,'+repr(str(Path(__file__).resolve().parent))+'); '
                      'from unittest.mock import Mock; from pathlib import Path; import ph; ph.STATE=Path('+repr(str(self.root/'events'))+'); ph.d=Mock(return_value=Mock()); '
                      'sys.exit(ph.run(["open","dev.fixture"]))')
@@ -659,7 +768,7 @@ class LeaseRunTests(unittest.TestCase):
                 stamp=time.time()-age
                 os.utime(hold,(stamp,stamp))
                 sidecar.write_text(json.dumps(dict(token_sha=lock.token_sha(HOLD_TOKEN),agent_pid=pid,
-                                                  agent_started=start,agent_comm='codex')))
+                                                  agent_started=start,agent_comm='codex',hold_dev=hold.stat().st_dev,hold_ino=hold.stat().st_ino)))
                 result=subprocess.run([sys.executable,'-I','-c',bootstrap],env=self.env,cwd=self.root,
                                       capture_output=True,text=True,timeout=10)
                 self.assertEqual(result.returncode,code,result.stdout+result.stderr)

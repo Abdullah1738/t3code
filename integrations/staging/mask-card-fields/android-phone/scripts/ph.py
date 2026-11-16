@@ -4,6 +4,8 @@ import sys, os, re, time, subprocess, xml.etree.ElementTree as ET
 import argparse, base64, collections, datetime, json, signal, threading
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# phonelock's lazy imports must share this CLI's event context.
+if __name__ == '__main__': sys.modules['ph'] = sys.modules[__name__]
 import phonelock
 SERIAL = os.environ.get("PH_SERIAL", "002473611000997")
 TMP = os.environ.get("PH_TMP", "/private/var/folders/vt/8qndzr_j44z70bh0rn2zyfkm0000gn/T/opencode/phone")
@@ -482,7 +484,7 @@ def lock_event(kind, reason=None, state=None):
         fields = {k: state[k] for k in ("lease_owner", "lease_state", "hold_present")}
     except Exception:
         fields = dict(lease_owner="none", lease_state="foreign", hold_present=phonelock.hold_state()[0])
-    if reason: fields["reason"] = "hold" if reason == phonelock.HOLD_REASON else "lease"
+    if reason: fields["reason"] = "hold" if reason == phonelock.HOLD_REASON or reason == phonelock.HOLD_LOST_REASON or reason.startswith("hold ") else "lease"
     event(kind, device=False, caller_chain=caller_chain(), **fields)
 
 
@@ -519,6 +521,7 @@ def hold_cli(args):
         else:
             state = phonelock.hold_status()
             state.pop("own_hold")
+            state.pop("lost_hold", None)
             print(json.dumps(state) if opts.json else " ".join(f"{k}={v}" for k, v in state.items()))
         return 0
     except phonelock.Busy as exc:
@@ -553,6 +556,7 @@ def lease_cli(args):
         if opts.command == "status":
             state = phonelock.status()
             state.pop("own_hold")
+            state.pop("lost_hold", None)
             print(json.dumps(state) if opts.json else
                   f"hold_present={state['hold_present']} lease={state['lease']} seconds_left={state['seconds_left']:.0f}")
         elif opts.command == "release":
