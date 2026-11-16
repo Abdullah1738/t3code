@@ -3,6 +3,10 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./sqlDiagnostics": {
+      "types": "./src/sqlDiagnostics.ts",
+      "import": "./src/sqlDiagnostics.ts"
+    },
     "./nodeSqliteErrors": "./src/nodeSqliteErrors.ts",
     "./ownedProcessTree": "./src/ownedProcessTree.ts",
     "./githubMarkdownLinks": {
