@@ -26,8 +26,49 @@ export function captureReplyCoverage(store: Store, op: OutboxOperation): void {
   store.set(`reply-covered:${op.id}`, [...new Set(ids.filter(humanRow))]);
 }
 
+/** Older sends have delivery attribution, but predate the coverage snapshot. */
+export function deliveredReplyCoverage(store: Store, op: OutboxOperation): string[] {
+  const saved = store.get<string[]>(`reply-covered:${op.id}`);
+  if (saved !== undefined) return saved;
+  const ids = [store.get<string>(`log-inbound-id:${op.id}`), op.replyTo].flatMap(id => {
+    if (!id) return [];
+    let batch = store.get<NormalizedInbound>(`batch:${id}`);
+    if (!batch) {
+      const parent = store.db.query<{ value: string }, [string]>(
+        "SELECT kv.value FROM kv, json_each(kv.value, '$.batchIds') member WHERE kv.key GLOB 'batch:*' AND member.value = ? LIMIT 1",
+      ).get(id);
+      if (parent) batch = JSON.parse(parent.value) as NormalizedInbound;
+    }
+    return batch?.batchIds ?? [id];
+  });
+  const covered = [...new Set(ids.filter(humanRow))];
+  store.set(`reply-covered:${op.id}`, covered);
+  return covered;
+}
+
+/** Reconcile upgrade history before overdue rows can be replayed. Session identity alone is not proof. */
+export function reconcileLegacyReplies(store: Store, since: number, now: number): void {
+  const rows = store.db.query<{ id: string }, []>(`SELECT o.id FROM outbox o
+    WHERE o.state = 'sent' AND NOT EXISTS (SELECT 1 FROM kv WHERE key = 'reply-covered:' || o.id)`).all()
+    .map(({ id }) => {
+      const sentAt = store.get<number>(`sent-at:${id}`);
+      const known = Number.isSafeInteger(sentAt) && sentAt! >= 0 && sentAt! <= now;
+      return { op: store.getOperation(id)!, at: known ? sentAt! : now, known };
+    }).sort((a, b) => a.at - b.at);
+  store.db.transaction(() => {
+    for (const { op, at, known } of rows) {
+      const covered = deliveredReplyCoverage(store, op).filter(id => {
+        const row = store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(id);
+        const receivedAt = row ? (JSON.parse(row.payload) as AnsweredInput).receivedAt : undefined;
+        return Number.isSafeInteger(receivedAt) && receivedAt! >= since && receivedAt! <= at;
+      });
+      markAnswered(store, covered, at, { recordLatency: known });
+    }
+  }).immediate();
+}
+
 /** All successful text, card, file, poll and explicit reaction paths share this marker. */
-export function markAnswered(store: Store, ids: string[], now = Date.now()): void {
+export function markAnswered(store: Store, ids: string[], now = Date.now(), opts: { recordLatency?: boolean } = {}): void {
   store.db.transaction(() => {
     for (const id of new Set(ids.filter(humanRow))) {
       const row = store.db.query<{ payload: string; state: string }, [string]>("SELECT payload, state FROM inbound WHERE id = ?").get(id);
@@ -38,7 +79,7 @@ export function markAnswered(store: Store, ids: string[], now = Date.now()): voi
       const ageMs = Math.max(0, now - (input.receivedAt ?? now));
       const chat = store.get<string>("unanswered-chat") ?? "other";
       toolLog.capture(() => {
-        if (chat === "owner" || chat === "moni") toolLog.write({ component: "router", kind: "perf", name: "inbound.answered",
+        if (opts.recordLatency !== false && (chat === "owner" || chat === "moni")) toolLog.write({ component: "router", kind: "perf", name: "inbound.answered",
           ids: { inboundId: id, chat }, durationMs: ageMs });
         if (input.unanswered?.overdueAt !== undefined) toolLog.write({ component: "router", kind: "event", name: "inbound.answered_late",
           ids: { inboundId: id, chat }, props: { ageMs } });

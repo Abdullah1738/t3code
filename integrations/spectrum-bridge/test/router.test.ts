@@ -10571,3 +10571,42 @@ test.each(["A", '/answer q_1 [["A"]]'])("a later reply covers the human question
   for (const op of h.store.pendingOutbox()) h.store.outboxState(op.id, "sent");
   expect((inbounds(h.store).find(row => row.id === "question-answer")!.payload as import("../src/unanswered.ts").AnsweredInput).answeredAt).toBeNumber();
 });
+
+test.each(["quote", "source"])("upgrade reconciles an ordinary delivered %s reply before the watchdog can repeat completed actions", async attribution => {
+  const start = Date.parse("2026-11-16T11:36:17Z"); setSystemTime(start);
+  const alerts: string[][] = [];
+  const h = setup(":memory:", { notifyUnanswered: async (...args) => { alerts.push(args); return true; } });
+  h.input("completed-action", "Do this once", { source: "typed", receivedAt: start - 360_000 });
+  h.store.updateInbound("completed-action", "done");
+  const op = { id: "legacy-reply", kind: "conversation", text: "Done", sessionId: "old-session", generation: 1,
+    ...(attribution === "quote" ? { replyTo: "completed-action" } : {}) };
+  h.store.db.query("INSERT INTO outbox (id, payload, state) VALUES (?, ?, 'sent')").run(op.id, JSON.stringify(op));
+  if (attribution === "source") h.store.set(`log-inbound-id:${op.id}`, "completed-action");
+  h.store.set(`sent-at:${op.id}`, start - 300_000);
+  await h.router.checkUnanswered(); await h.router.tick();
+  setSystemTime(start + 600_000); await h.router.checkUnanswered();
+  expect(h.backend.prompts).toHaveLength(0); expect(alerts).toHaveLength(0);
+  const saved = inbounds(h.store)[0]!.payload as import("../src/unanswered.ts").AnsweredInput;
+  expect(saved.answeredAt).toBe(start - 300_000); expect(saved.unanswered).toBeUndefined();
+});
+
+test("a sealed batch straddling the restart cutoff keeps its member batched through retry and alert bookkeeping", async () => {
+  const start = Date.parse("2026-11-16T11:36:17Z"); setSystemTime(start);
+  const alerts: string[][] = [];
+  const h = setup(":memory:", { notifyUnanswered: async (...args) => { alerts.push(args); return true; } });
+  h.input("old-leader", "First action", { source: "typed", receivedAt: start - 30 * 60_000 - 1 });
+  h.input("recent-member", "Second action", { source: "typed", receivedAt: start - 30 * 60_000 + 1 });
+  const leader = inbounds(h.store)[0]!.payload;
+  h.store.set("batch:old-leader", { ...leader, batchIds: ["old-leader", "recent-member"] });
+  h.store.set("batch-phase:old-leader", "accepted");
+  h.store.updateInbound("old-leader", "done"); h.store.updateInbound("recent-member", "batched");
+  await h.router.checkUnanswered();
+  expect(inbounds(h.store).map(row => row.state)).toEqual(["pending", "batched"]);
+  expect(alerts).toHaveLength(1);
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  h.backend.step("Both handled"); h.backend.settle(); await h.router.tick();
+  for (const op of h.store.pendingOutbox()) h.store.outboxState(op.id, "sent");
+  expect(inbounds(h.store).every(row => (row.payload as import("../src/unanswered.ts").AnsweredInput).answeredAt !== undefined)).toBe(true);
+  await h.router.checkUnanswered(); expect(alerts).toHaveLength(1);
+});

@@ -2,12 +2,13 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Store, type InboundRecord } from "../src/store.ts";
-import { findOverdue, markAnswered, markReactionAnswered, UNANSWERED_REQUEUE_MS, type AnsweredInput } from "../src/unanswered.ts";
+import { Store, type InboundRecord, type OutboxOperation } from "../src/store.ts";
+import { findOverdue, markAnswered, markReactionAnswered, reconcileLegacyReplies, UNANSWERED_REQUEUE_MS, type AnsweredInput } from "../src/unanswered.ts";
 import { captureLogs } from "./log-fixture.ts";
 import { summarizeLog } from "../src/log-rollup.ts";
 import { createApi } from "../src/api.ts";
 import { acknowledgePhoton } from "../src/inbound-failure.ts";
+import { Delivery } from "../src/delivery.ts";
 
 const at = Date.parse("2026-11-16T11:30:17Z");
 const input = (id: string, receivedAt = at): AnsweredInput => ({ id, text: "PRIVATE", source: "typed", receivedAt, attachments: [], isAudioMessage: false });
@@ -97,4 +98,65 @@ test("unanswered rollup counts unique alarms across Telegram retries and records
   });
   const summary = await summarizeLog((async function* () { yield* logs; })());
   expect(summary).toMatchObject({ overdue: 1, requeued_by_watchdog: 1, unanswered_alerts: 1 });
+});
+
+function legacyReply(s: Store, op: OutboxOperation, state: string) {
+  s.db.query("INSERT INTO outbox (id, payload, state) VALUES (?, ?, ?)").run(op.id, JSON.stringify(op), state);
+}
+
+test.each(["quote", "source", "quoted-member"])("upgrade reconciles sent replies with persisted %s attribution and their sealed batch", attribution => {
+  const s = store();
+  for (const id of ["root", "member", "unrelated"]) s.acceptInbound(id, input(id));
+  s.set("batch:root", { ...input("root"), batchIds: ["root", "member"] });
+  const op = { id: "legacy", kind: "conversation" as const, text: "Done", sessionId: "old-session", generation: 1,
+    ...(attribution === "source" ? {} : { replyTo: attribution === "quote" ? "root" : "member" }) };
+  legacyReply(s, op, "sent");
+  if (attribution === "source") s.set("log-inbound-id:legacy", "root");
+  s.set("sent-at:legacy", at + 60_000);
+  // A later reply inserted first must not replace the first successful reply's time.
+  legacyReply(s, { ...op, id: "earlier" }, "sent");
+  if (attribution === "source") s.set("log-inbound-id:earlier", "root");
+  s.set("sent-at:earlier", at + 30_000);
+  reconcileLegacyReplies(s, at - 30 * 60_000, at + 360_000);
+  const saved = (id: string) => JSON.parse(s.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(id)!.payload) as AnsweredInput;
+  for (const id of ["root", "member"]) expect(saved(id).answeredAt).toBe(at + 30_000);
+  expect(saved("unrelated").answeredAt).toBeUndefined();
+});
+
+test.each(["pending", "sending", "uncertain", "failed", "session-only", "explicit-empty", "before-inbound"])("upgrade does not infer a delivered reply from %s", kind => {
+  const s = store(); s.acceptInbound("root", input("root"));
+  legacyReply(s, { id: "legacy", kind: "conversation", text: "Done", sessionId: "ses_1", generation: 1,
+    ...(kind === "session-only" ? {} : { replyTo: "root" }) }, ["pending", "sending", "uncertain", "failed"].includes(kind) ? kind : "sent");
+  s.set("activeTurn", { id: "ses_1", generation: 1, messageId: "msg", inboundId: "root", phase: "running" });
+  s.set("sent-at:legacy", kind === "before-inbound" ? at - 1 : at + 60_000);
+  if (kind === "explicit-empty") s.set("reply-covered:legacy", []);
+  reconcileLegacyReplies(s, at - 30 * 60_000, at + 360_000);
+  expect(JSON.parse(s.db.query<{ payload: string }, []>("SELECT payload FROM inbound").get()!.payload).answeredAt).toBeUndefined();
+});
+
+test("upgrade accepts proven delivery without a timestamp without inventing a latency sample", async () => {
+  const s = store(); s.acceptInbound("root", input("root"));
+  legacyReply(s, { id: "legacy", kind: "conversation", text: "Done", replyTo: "root" }, "sent");
+  const logs = await captureLogs(async () => { reconcileLegacyReplies(s, at - 30 * 60_000, at + 360_000); });
+  expect(JSON.parse(s.db.query<{ payload: string }, []>("SELECT payload FROM inbound").get()!.payload).answeredAt).toBe(at + 360_000);
+  expect(logs.filter(line => line.name === "inbound.answered")).toEqual([]);
+});
+
+test.each(["pending", "sending", "uncertain", "failed"])("pre-upgrade %s text recovered after store reopen marks its original human batch", async state => {
+  const d = mkdtempSync(join(tmpdir(), "unanswered-upgrade-")); dirs.push(d);
+  const path = join(d, "test.sqlite");
+  let s = new Store(path);
+  for (const id of ["root", "member"]) s.acceptInbound(id, input(id));
+  s.set("batch:root", { ...input("root"), batchIds: ["root", "member"] });
+  legacyReply(s, { id: "legacy", kind: "conversation", text: "Done", replyTo: "root" }, state);
+  s.set("firstAttempt:legacy", Date.now());
+  s.close(); s = new Store(path); stores.push(s); s.set("unanswered-chat", "owner");
+  reconcileLegacyReplies(s, at - 30 * 60_000, Date.now());
+  let sends = 0;
+  const delivery = new Delivery(s, { sendText: async () => { sends++; return { providerId: "delivered" }; } }, {
+    projectScope: "test", chatGuid: () => "iMessage;-;+15555550123", enabled: () => true, sleep: async () => {},
+  });
+  delivery.recover(); await delivery.tick();
+  expect(sends).toBe(1); expect(s.getOperation("legacy")?.state).toBe("sent");
+  expect(s.db.query<{ payload: string }, []>("SELECT payload FROM inbound").all().every(row => (JSON.parse(row.payload) as AnsweredInput).answeredAt !== undefined)).toBe(true);
 });

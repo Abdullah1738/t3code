@@ -1,5 +1,5 @@
 import { leaderKind, requeueHuman, type RequeueReason } from "./inbound-routing.ts";
-import { findOverdue, turnMembers, unansweredAlert, type AnsweredInput } from "./unanswered.ts";
+import { findOverdue, reconcileLegacyReplies, turnMembers, unansweredAlert, type AnsweredInput } from "./unanswered.ts";
 import { toolLog as watcherLog } from "./watcherlog.ts";
 import { completionReady, toolError, toolLog } from "./toollog.ts";
 import { captureReadTiming, completionChecked, includeReadTiming, timeTick, type ReadTiming } from "./tick-timing.ts";
@@ -867,6 +867,7 @@ export class Router {
 
   private readonly unansweredStartedAt = Date.now();
   private checkingUnanswered?: Promise<void>;
+  private reconciledLegacyReplies = false;
 
   checkUnanswered(now = Date.now()): Promise<void> {
     return this.checkingUnanswered ??= this.sweepUnanswered(now).finally(() => { this.checkingUnanswered = undefined; });
@@ -885,6 +886,10 @@ export class Router {
   private async sweepUnanswered(now: number): Promise<void> {
     const chat = this.store.get<string>("unanswered-chat") ?? "other";
     if (chat === "other") return;
+    if (!this.reconciledLegacyReplies) {
+      reconcileLegacyReplies(this.store, this.unansweredStartedAt - 30 * 60_000, now);
+      this.reconciledLegacyReplies = true;
+    }
     const turn = this.store.get<Turn | null>("activeTurn");
     const running = turn && this.current(turn) && ["running", "submitting", "unknown"].includes(turn.phase)
       ? { members: turnMembers(this.store, turn), leaderKind: turn.background ? "background" as const : leaderKind(turn.inboundId) } : undefined;
@@ -934,11 +939,13 @@ export class Router {
         toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "inbound.overdue",
           ids: { inboundId: row.id, chat }, props: { ageMs, state: row.state, action, leaderKind: kind, severity: "warn" } }));
       }
-      this.store.updateInbound(row.id, due.requeue ? "pending" : row.state, { ...input, unanswered: state });
+      // A sealed member remains batched; only requeueHuman chooses the pending leader.
+      const currentState = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(row.id)!.state;
+      this.store.updateInbound(row.id, currentState, { ...input, unanswered: state });
       if (!due.alert || !this.options.notifyUnanswered) continue;
       state.alertAttempts = (state.alertAttempts ?? 0) + 1;
-      this.store.updateInbound(row.id, due.requeue ? "pending" : row.state, { ...input, unanswered: state });
-      const sent = await this.options.notifyUnanswered("attention", unansweredAlert(chat, input, row.state, ageMs, action === "in_turn"), `imessage-unanswered:${row.id}`).catch(() => false);
+      this.store.updateInbound(row.id, currentState, { ...input, unanswered: state });
+      const sent = await this.options.notifyUnanswered("attention", unansweredAlert(chat, input, currentState, ageMs, action === "in_turn"), `imessage-unanswered:${row.id}`).catch(() => false);
       // Re-read after the await: delivery may have answered or advanced the row meanwhile.
       const live = this.store.db.query<{ payload: string; state: string }, [string]>("SELECT payload, state FROM inbound WHERE id = ?").get(row.id)!;
       const latest = JSON.parse(live.payload) as AnsweredInput;

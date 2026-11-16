@@ -1,4 +1,4 @@
-import { captureReplyCoverage, markAnswered, type AnsweredInput } from "./unanswered.ts";
+import { captureReplyCoverage, deliveredReplyCoverage, markAnswered, type AnsweredInput } from "./unanswered.ts";
 import { rememberHealthReceipt, type HealthSidecar } from "./health-receipts.ts";
 import { toolError, toolLog } from "./toollog.ts";
 import { Database } from "bun:sqlite";
@@ -297,7 +297,7 @@ export class Store {
         state = ?, providerId = COALESCE(?, providerId) WHERE id = ?`
       ).run(state, state, providerId ?? null, id);
       if (!result.changes) throw new Error(`Unknown outbox operation: ${id}`);
-      if (state === "sent") markAnswered(this, this.get<string[]>(`reply-covered:${id}`) ?? []);
+      if (state === "sent") markAnswered(this, deliveredReplyCoverage(this, this.getOperation(id)!));
       rememberHealthReceipt(this, id, state);
     }).immediate();
   }
