@@ -1171,6 +1171,20 @@ def remote_alive(box_id: str, run_id: str, timeout: float = 20) -> str | None:
     return result if p.returncode == 0 and result in ("ended", "alive", "gone") else None
 
 
+def confirm_queue_loss(run_id, status, *, record=True):
+    data = status.get('command', status) if isinstance(status, dict) else {}
+    if (api.BACKEND != 'server' or not run_id or not isinstance(data, dict) or
+            data.get('status') != 'lost' or data.get('running') is True or
+            data.get('notAdmitted') is not True or data.get('startedAt') is not None or
+            data.get('queueLostReason') not in ('killed', 'kill_file', 'unit_inactive', 'unit_failed', 'unit_unknown')):
+        return False
+    if record:
+        with contextlib.closing(db()) as con:
+            con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'lost_confirmed:{run_id}', 'not_admitted'))
+            con.commit()
+    return True
+
+
 def confirmed_lost(box_id: str, run_id: str, timeout: float = 20, *, record: bool = True,
                    check_box: bool = False) -> dict | None:
     """Check retained history, then .rc, then liveness. None keeps the run reserved (alive or unknown)."""
@@ -1184,6 +1198,9 @@ def confirmed_lost(box_id: str, run_id: str, timeout: float = 20, *, record: boo
 
     con = db()
     try:
+        confirmed = con.execute('SELECT v FROM kv WHERE k=?', (f'lost_confirmed:{run_id}',)).fetchone()
+        if confirmed and confirmed['v'] == 'not_admitted':
+            return dict(status='lost', running=False, exitCode=None)
         if record:
             con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)', (f'lost_checked:{run_id}', '1'))
             con.commit()
@@ -1195,7 +1212,10 @@ def confirmed_lost(box_id: str, run_id: str, timeout: float = 20, *, record: boo
             try:
                 # Leave time for the independent SSH evidence even if the tracker hangs.
                 with api.budget(min(5, left() / 2)):
-                    code = (api.history_get(box_id, row['command_id']) or {}).get('exitCode')
+                    history = api.history_get(box_id, row['command_id']) or {}
+                    if confirm_queue_loss(run_id, history, record=record):
+                        return dict(status='lost', running=False, exitCode=None)
+                    code = history.get('exitCode')
             except OffboxError as e:
                 history_unknown = not (isinstance(e, api.ApiError) and e.status == 404)
                 code = None
@@ -1368,6 +1388,9 @@ def recover_lost_exit(box_id: str, run_id: str, log_path: Path | None, planned: 
         confirmed = con.execute('SELECT v FROM kv WHERE k=?', (f'lost_confirmed:{run_id}',)).fetchone()
     finally:
         con.close()
+    # A never-admitted command has no guest markers or output to recover, even on a live box.
+    if confirmed and confirmed['v'] == 'not_admitted':
+        return None, 'the server confirmed the command was not admitted'
     # Only box-state confirmation rules out SSH: a dead PID's saved exit can still be read on a live box.
     stopped = confirmed and confirmed['v'] == 'box'
     code = None if stopped else recorded_exit(box_id, run_id, timeout=timeout)
@@ -2296,6 +2319,8 @@ def _ended(box_id: str, pid: int, until: float | None, run_id: str | None = None
     remember_interruption(run_id, st)
     if st and not st.get("running") and st.get("status") in ("exited", "lost", "interrupted"):
         if st.get('status') == 'lost' and run_id:
+            if confirm_queue_loss(run_id, st):
+                return st
             try:
                 return confirmed_lost(box_id, run_id, 20 if until is None else min(20, max(0, until - now())),
                                       check_box=True)
@@ -2556,8 +2581,10 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
         ended["n"] += 1
         return ended["n"]
 
-    def follow_lost():
+    def follow_lost(status=None):
         if not run_id:
+            return None
+        if confirm_queue_loss(run_id, status):
             return None
         while not stop_evt.is_set():
             if until is not None and now() >= until:
@@ -2589,7 +2616,7 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
         if st is None or ended_again() < 2:
             return _RUNNING
         if st.get('status') == 'lost':
-            return follow_lost()
+            return follow_lost(st)
         return _status_code(st)
 
     def timed_out() -> OffboxError:
@@ -2625,13 +2652,13 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
                         raise timed_out()
                     remember_interruption(run_id, fr)
                     t = fr.get("type")
-                    if t != "error" and run_id and (now() - last_home_read >= 5 or t == "exit"):
+                    if t != "error" and run_id and (now() - last_home_read >= 5 or t in ("hello", "attempt", "exit") or fr.get("status") is not None):
                         from .home_run_observation import observe
                         kind = {"hello": "stream connected", "heartbeat": "stream heartbeat",
                                 "reconnect": "stream connected", "attempt": "stream connected",
                                 "stdout": "output received", "stderr": "output received",
                                 "exit": fr.get("status", "exited")}.get(t)
-                        observe(run_id, kind)
+                        observe(run_id, kind, status=fr.get('status'), attempt=fr.get('attempt'))
                         last_home_read = now()
                     if t in ("stdout", "stderr"):
                         data = fr.get("data") or ""
@@ -2681,11 +2708,14 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
                         if fr.get("status") == "interrupted" and fr.get('running') is not True:
                             raise Interrupted(what, fr)
                         if fr.get('exitCode') is None and not fr.get('signal'):
-                            return follow_lost()
+                            return follow_lost(fr)
                         return fr.get("exitCode") if fr.get("exitCode") is not None else (
                             128 + 15 if fr.get("signal") else None)
                     elif t == "error":
                         raise OffboxError(f"attach error: {fr.get('error')} {fr.get('message')}")
+                    if home_run and run_id and (fr.get('status') == 'queued' or t == 'stderr'):
+                        from .home_run_observation import notice_queue_after_read
+                        notice_queue_after_read(run_id, path=target)
                     failures = 0
                     if until is not None and now() >= until:
                         again = True
@@ -2746,7 +2776,7 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
                     raise Interrupted(what, st)
                 if st and not st.get("running") and st.get("status") in ("exited", "lost"):
                     if st.get("status") == "lost":
-                        return follow_lost()
+                        return follow_lost(st)
                     if ended_again() > 3:
                         return _status_code(st)
                 if failures > 20 and (down_from is None or now() - down_from >= window):

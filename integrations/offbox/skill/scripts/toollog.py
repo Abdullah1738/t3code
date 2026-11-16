@@ -24,6 +24,7 @@ NUMBERS.update({'leftoverKilled', 'boxRc', 'incusRc', 'cgroupProcessCount'})
 NUMBERS.update({'outageS', 'waitedMs', 'placeBefore', 'placeAfter'})
 NUMBERS.update({'ageSeconds', 'runCount', 'waitSeconds', 'serving', 'held', 'pending', 'cap'})
 NUMBERS.update({'deficit', 'members_before'})
+NUMBERS.update({'created_at', 'since', 'total', 'headNeedBytes', 'freeBytes', 'running'})
 NUMBERS.update(f'{fs}_{field}' for fs in ('tmp', 'var_tmp', 'home', 'workspace')
                for field in ('free_bytes', 'size_bytes'))
 BOOLEANS = {"peer_online"} | set("queued killed fresh bg noSync git noFallback noRetry remote failed stale timeoutHit fallback dryRun baseGiven templateGiven sizeGiven".split())
@@ -57,6 +58,8 @@ ENUMS = {
     "stateBefore": {"running", "stopped"},
     "result": {"detached", "stop_failed", "created"},
 }
+ENUMS['reason'].update({'killed', 'kill_file', 'unit_inactive', 'unit_failed', 'unit_unknown',
+                        'memory', 'fifo', 'cpu', 'cpu_config', 'cpu_unknown', 'cpu_settle', 'admitted_alone'})
 ENUMS['reason'].update({'history_empty', 'history_timeout', 'history_no_progress', 'history_unavailable'})
 ENUMS.update({f'{fs}_fstype': {'tmpfs', 'zfs', 'ext2', 'ext3', 'ext4', 'xfs', 'btrfs', 'overlay', 'unknown'}
               for fs in ('tmp', 'var_tmp', 'home', 'workspace')})
@@ -106,6 +109,8 @@ def _props(values, *, name=None):
         elif k in ENUMS and isinstance(v, str) and v in ENUMS[k]:
             out[k] = v
         elif k in ("boot_id", "last_good_boot_id") and isinstance(v, str) and re.fullmatch(r"[A-Za-z0-9-]{1,64}", v):
+            out[k] = v
+        elif k == 'head' and isinstance(v, str) and re.fullmatch(r'bx_[A-Za-z0-9]+/[0-9]+', v):
             out[k] = v
         elif k == "day" and isinstance(v, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
             out[k] = v

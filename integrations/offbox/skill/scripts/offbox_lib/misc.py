@@ -698,6 +698,9 @@ def _catch_up_log(r, budget: float | None = None, *, locked: bool = False, live:
     try:
         result = _fetch_log(r, budget, locked=locked, live=live, lock_wait=lock_wait, stats=stats)
         stats['result'] = result
+        if live:
+            from .home_run_observation import notice_queue_after_read
+            notice_queue_after_read(r['run_id'], row=r, path=_shown_log(LOGS_DIR / f"{r['run_id']}.log"))
         return result
     finally:
         stats['seconds'] = round(monotonic() - started, 3)
@@ -1092,6 +1095,9 @@ def _catch_up_log_locked(r, path, budget, *, live=False, stats=None) -> str:
                     if time.time() >= deadline:
                         return 'incomplete:timeout'
                     remember_interruption(r['run_id'], page)
+                    if live and api.BACKEND == 'server' and page.get('status'):
+                        from .home_run_observation import observe
+                        observe(r['run_id'], page['status'], status=page['status'], attempt=page.get('attempt'))
                     if page.get('size') is not None:
                         sizes[i] = max(sizes[i], int(page['size']) - (0 if remote else ck[which + 'Offset']))
                         if snapshot is None:
@@ -1214,16 +1220,13 @@ def _catch_up_finished(con, run_id, budget: float = 10, *, row=None) -> str | No
 
 
 def _live_log_notice(r, path, result, seconds) -> bool:
-    queued = r['status'] == 'queued'
-    try:
-        if path.stat().st_size <= 256:
-            queued |= path.read_bytes().strip() == b'offbox-server: waiting for earlier runs in the queue'
-    except OSError:
-        pass
+    from .home_run_observation import queued_on_home
+    read = read_json(LOGS_DIR / f"{r['run_id']}.home-read.json", {})
+    queued = r['status'] == 'queued' or queued_on_home(dict(r), read, path=path)
     if queued:
         since = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(r['start_at'])) if r['start_at'] else 'unknown'
         elapsed = f", {max(0, now() - r['start_at']):.0f}s" if r['start_at'] else ''
-        say(f"{r['run_id']} is queued on the server behind earlier runs (since {since}{elapsed}); nothing has run yet. "
+        say(f"{r['run_id']} is queued on the server (since {since}{elapsed}); nothing has run yet. "
             f"Keep reading: offbox logs {r['run_id']} --follow, or offbox wait {r['run_id']} --timeout 570")
         return True
     if not result.startswith('incomplete:'):
