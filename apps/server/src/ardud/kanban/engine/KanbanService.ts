@@ -13506,6 +13506,12 @@ const make = Effect.gen(function* () {
                   if (!card || card.stalled !== null || threadFor(card) !== threadId) return;
                   if (board.pause && !board.pause.keep.includes(card.id)) return;
                   if (
+                    card.stage === "working" &&
+                    card.activeRole === "work" &&
+                    (yield* skipRestartRecovery(threadId, [card], view))
+                  )
+                    return;
+                  if (
                     (yield* Ref.get(unresolvedTurnEnds)).has(threadId) ||
                     discussionWakes.has(threadId) ||
                     (yield* store.threadLink(threadId))?.paused
@@ -13558,6 +13564,12 @@ const make = Effect.gen(function* () {
                       (yield* store.cardsByThread(threadId)).some(
                         (other) => other.id !== current.id,
                       ))
+                  )
+                    return;
+                  if (
+                    current.stage === "working" &&
+                    current.activeRole === "work" &&
+                    (yield* skipRestartRecovery(threadId, [current], fresh.value))
                   )
                     return;
                   if (!stale && !Rules.runSilentDue(current, fresh.value, now)) return;

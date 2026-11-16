@@ -34759,6 +34759,85 @@ it.effect.each(["working", "todo", "in_review", "needs_review"] as const)(
     }),
 );
 
+it.effect.each(
+  (["planning", "fresh read"] as const).flatMap((observedAt) =>
+    (["effect", "run"] as const).map((source) => ({ observedAt, source })),
+  ),
+)(
+  "restart recovery holds the silent-run backstop ($observedAt, $source)",
+  ({ observedAt, source }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const events: AnalyticsEvent[] = [];
+      yield* Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+        const { kanban, board } = yield* toyBoard;
+        const card = yield* kanban.createCard(board.id, { title: "A", prompt: "A" }, owner);
+        yield* kanban.dispatchNow;
+        const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+        const recovery =
+          source === "effect"
+            ? { effectId: "effect:restart-continuation:cut" }
+            : { runId: "restart-run" };
+        yield* Ref.update(fake.threads, (all) => {
+          Object.assign(all.get(thread)!, {
+            running: true,
+            runId: "restart-run",
+            runRequestedAt: "2026-10-25T13:00:00.000Z",
+            lastActivityAt: "2026-10-25T13:00:00.000Z",
+            ...(observedAt === "planning" ? { restartRecovery: recovery } : {}),
+          });
+          return all;
+        });
+        fake.findCalls.length = 0;
+        let recoveredDuringReread = false;
+        if (observedAt === "fresh read") {
+          fake.findControl.beforeRead = (id, attempt) =>
+            Ref.update(fake.threads, (all) => {
+              if (id === thread && attempt >= 2) {
+                all.get(thread)!.restartRecovery = recovery;
+                recoveredDuringReread = true;
+              }
+              return all;
+            });
+        }
+        yield* TestClock.adjust("31 minutes");
+        yield* kanban.tick;
+        if (observedAt === "fresh read") assert.isTrue(recoveredDuringReread);
+        assert.deepEqual(fake.interrupted, []);
+        assert.strictEqual(yield* nudgesTo(fake, thread), 0);
+        assert.isNull((yield* kanban.card(card.id)).card.nudgedAt);
+        const skips = events.filter((event) => event.kind === "kanban.nudge_skipped");
+        assert.lengthOf(skips, 1);
+        assert.deepInclude(skips[0]!.props, { reason: "restart_recovery_pending", ...recovery });
+        yield* decodeAnalyticsEvent(skips[0]);
+        delete fake.findControl.beforeRead;
+        yield* Ref.update(fake.threads, (all) => {
+          const worker = all.get(thread)!;
+          delete worker.restartRecovery;
+          worker.running = false;
+          return all;
+        });
+        yield* kanban.tick;
+        assert.deepEqual(fake.interrupted, []);
+        assert.strictEqual(yield* nudgesTo(fake, thread), 1);
+      }).pipe(
+        Effect.provide(
+          testLayer(fake.layer).pipe(
+            Layer.provide(
+              Layer.mock(Analytics.Analytics)({
+                record: (event) =>
+                  Effect.sync(() => {
+                    events.push(event);
+                  }),
+              }),
+            ),
+          ),
+        ),
+      );
+    }),
+);
+
 it.effect.each(["recent activity", "background work", "fresh activity during reread"])(
   "the silent-run backstop respects %s",
   (kind) =>

@@ -409,6 +409,8 @@ const make = Effect.gen(function* () {
 
   const find: KanbanThreadsShape["find"] = Effect.fn("KanbanThreads.find")(
     function* (threadId) {
+      // Read the effect first so its retirement cannot hide a newly committed recovery run.
+      const effectId = yield* outbox.pendingRunContinuation(threadId);
       const shell = yield* threads.getThreadShell(threadId);
       if (shell === null || shell.deletedAt !== null) return null;
       const runId = shell.activeRunId;
@@ -423,7 +425,6 @@ const make = Effect.gen(function* () {
       );
       const latest = records.runs[0];
       const run = runId === null ? undefined : latest;
-      const effectId = yield* outbox.pendingRunContinuation(threadId);
       const restartRecovery =
         effectId !== null
           ? { effectId }

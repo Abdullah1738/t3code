@@ -3862,3 +3862,90 @@ it.effect.each([
     ),
   );
 });
+
+it.effect.each([
+  { handoffAt: "before-find", effectStatus: "pending" },
+  { handoffAt: "shell-read", effectStatus: "pending" },
+  { handoffAt: "run-read", effectStatus: "pending" },
+  { handoffAt: "before-find", effectStatus: "running" },
+  { handoffAt: "shell-read", effectStatus: "running" },
+  { handoffAt: "run-read", effectStatus: "running" },
+] as const)("thread recovery ownership across the effect-to-run handoff: %j", (row) =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("handoff-thread");
+    const cutId = RunId.make("cut-run");
+    const recoveryId = RunId.make("recovery-run");
+    const effectId = "effect:restart-continuation:cut-run";
+    const now = at(FINISHED_AT);
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    const sql = yield* SqlClient.SqlClient;
+    let handedOff = false;
+    const handoff = Effect.gen(function* () {
+      handedOff = true;
+      yield* sql`UPDATE orchestration_v2_effect_outbox SET status = 'succeeded'
+        WHERE effect_id = ${effectId}`;
+    }).pipe(Effect.orDie);
+    const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+      getThreadShell: () =>
+        Effect.gen(function* () {
+          const snapshot = {
+            ...shell({}),
+            id: threadId,
+            projectId: ProjectId.make("project-1"),
+            deletedAt: null,
+            archivedAt: null,
+            title: "Handoff",
+            status: handedOff ? "running" : "idle",
+            activeRunId: handedOff ? recoveryId : null,
+            activityRunStatus: handedOff ? "starting" : null,
+            activityRunStartedAt: null,
+            latestRunCompletedAt: now,
+            pendingBackgroundTasks: [],
+            pullRequests: [],
+          };
+          if (!handedOff && row.handoffAt === "shell-read") yield* handoff;
+          return snapshot as never;
+        }),
+      getThreadRecords: () =>
+        Effect.gen(function* () {
+          const snapshot = handedOff
+            ? {
+                id: recoveryId,
+                status: "starting",
+                restartContinuationOfRunId: cutId,
+                requestedAt: now,
+                startedAt: null,
+              }
+            : { id: cutId, status: "cancelled", requestedAt: now, startedAt: now };
+          // Return the captured projection even if recovery commits before this read finishes.
+          if (!handedOff && row.handoffAt === "run-read") yield* handoff;
+          return { subagents: [], runs: [snapshot] } as never;
+        }),
+    });
+    yield* outbox.enqueue([
+      {
+        id: effectId,
+        threadId,
+        commandId: CommandId.make("restart"),
+        request: { type: "provider-runtime.continue", sourceRunId: cutId },
+      },
+    ]);
+    yield* sql`UPDATE orchestration_v2_effect_outbox SET status = ${row.effectStatus}
+      WHERE effect_id = ${effectId}`;
+    if (row.handoffAt === "before-find") yield* handoff;
+    yield* Effect.gen(function* () {
+      const threads = yield* KanbanThreads;
+      const view = yield* threads.find(threadId);
+      expect(handedOff).toBe(true);
+      expect([{ effectId }, { runId: recoveryId }]).toContainEqual(view?.restartRecovery);
+      expect((yield* threads.find(threadId))?.restartRecovery).toEqual({ runId: recoveryId });
+    }).pipe(
+      Effect.provide(
+        layer.pipe(
+          Layer.provide(management),
+          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+        ),
+      ),
+    );
+  }).pipe(Effect.provide(EffectOutbox.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
+);
