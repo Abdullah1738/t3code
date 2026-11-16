@@ -1729,12 +1729,41 @@ def _isolated_migration_source(source, directory):
     options = r'Command\.make\(\s*"migrate-dev-db",\s*\{\s*' + integer('projects', 'projects') + r'\s*' + integer('threadsPerProject', 'threads-per-project') + r'\s*' + string('baseDir', 'base-dir') + r'\s*' + string('source', 'source') + r'\s*\},\s*' + callback.pattern
     if len(re.findall(options, source)) != 1:
         return False
-    # The source argument must reach the sole ATTACH, and every SQLite client
+    # The source argument must reach only the three read-only ATTACHes, and every SQLite client
     # must open a destination. An isolated CLI flag proves neither by itself.
     if len(re.findall(r'\bcopySourceSlice\b', source)) != 2 or len(re.findall(r'copySourceSlice\(sourcePath\)', source)) != 1:
         return False
-    attach = 'ATTACH DATABASE ${`${NodeURL.pathToFileURL(sourcePath).href}?mode=ro`} AS src'
-    if source.count(attach) != 1 or len(re.findall(r'\bATTACH\b', source)) != 1:
+    attaches = tuple('ATTACH DATABASE ${`${NodeURL.pathToFileURL(' + operand + ').href}?mode=ro`} AS ' + alias
+                     for operand, alias in (('sourcePath', 'src'), ('archivePath', 'cold'), ('basePath', 'base')))
+    if any(source.count(attach + '`;') != 1 for attach in attaches) or len(re.findall(r'\bATTACH\b', source)) != 3:
+        return False
+    # The base binding is read from src, then resolved to a validated basename
+    # beside sourcePath by historySourceFiles. Neither history operand may be
+    # aliased, reassigned or supplied by another helper/import.
+    archive_import = re.compile(r'import\s*\{\s*archiveFilename,\s*HISTORY_TABLES,\s*liveColumns,?\s*\}\s*from "../src/ardud/persistence/historyArchiveSql\.ts";')
+    base_import = 'import { resolveHistoryBasePath } from "../src/ardud/persistence/historySourceFiles.ts";'
+    archive_source = re.compile(r'const archivePath = archiveFilename\(sourcePath\);')
+    base_source = re.compile(
+        r'const baseRows = hasTable\("ardud_history_base_archive"\)\s*'
+        r'\? yield\* sql<\{\s*filename: string;\s*\}>`SELECT filename FROM src\.ardud_history_base_archive LIMIT 2`\s*'
+        r': \[\];\s*const basePath = yield\* Effect\.try\(\{\s*'
+        r'try: \(\) => resolveHistoryBasePath\(path, sourcePath, baseRows\),\s*'
+        r'catch: \(\) =>\s*new MigrateDevDbHistoryArchiveError\(\{\s*'
+        r'sourcePath,\s*archivePath: sourcePath,\s*reason: "invalid-base",\s*\}\),\s*\}\);')
+    if (len(archive_import.findall(source)) != 1 or source.count(base_import) != 1 or
+            len(archive_source.findall(source)) != 1 or len(base_source.findall(source)) != 1):
+        return False
+    history_uses = archive_import.sub('', source).replace(base_import, '')
+    history_uses = base_source.sub('', archive_source.sub('', history_uses))
+    for attach in attaches:
+        history_uses = history_uses.replace(attach, '')
+    history_uses = re.sub(r'const archivePath = `\$\{archiveFilename\(databasePath\)\}\$\{suffix\}`;', '', history_uses)
+    history_uses = re.sub(r'fs\.exists\((?:archivePath|basePath)\)|basePath !== undefined|archivePath: basePath', 'guard_history_read', history_uses)
+    history_uses = re.sub(r'archivePath: Schema\.String|this\.archivePath\b|archivePath(?=,\s*reason:|\s*\}\))', 'guard_history_error', history_uses)
+    if re.search(r'\b(?:archiveFilename|resolveHistoryBasePath|baseRows|basePath|archivePath)\b', history_uses):
+        return False
+    detach = re.compile(r'const attached = yield\* sql<\{ name: string \}>`PRAGMA database_list`;\s*for \(const name of \["base", "cold", "src"\]\) \{\s*if \(attached\.some\(\(entry\) => entry\.name === name\)\) yield\* sql`DETACH DATABASE \$\{sql\(name\)\}`;\s*\}')
+    if len(detach.findall(source)) != 1 or len(re.findall(r'\bDETACH\b', source)) != 1:
         return False
     database_uses = re.sub(r'import \* as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";', '', source)
     database_uses = re.sub(r'NodeSqliteClient\.layer\(\{ filename: (?:databasePath|snapshotPath) \}\)', 'guard_destination_client', database_uses)
@@ -1745,15 +1774,18 @@ def _isolated_migration_source(source, directory):
     if re.search(r'\bsharedHome\b', homes):
         return False
     home_api = homes.replace('import * as NodeOS from "node:os";', '')
-    url_api = source.replace('import * as NodeURL from "node:url";', '').replace(attach, '')
+    url_api = source.replace('import * as NodeURL from "node:url";', '')
+    for attach in attaches:
+        url_api = url_api.replace(attach, '')
     if re.search(r'\bNodeOS\b', home_api) or re.search(r'\bNodeURL\b', url_api):
         return False
-    path_api = re.sub(r'const path = yield\* Path\.Path;', '', source)
+    path_api = re.sub(r'const path = yield\* Path\.Path;', '', base_source.sub('', source))
     path_api = re.sub(r'\bpath\.(?:join|resolve|dirname)\s*(?=\()', 'guard_path_operation', path_api)
     path_api = path_api.replace('path to a real statev2.sqlite', 'guard_source_help').replace('path this command rewrites', 'guard_destination_help')
     if re.search(r'\bpath\b', path_api):
         return False
-    source_uses = default.sub('', source)
+    source_uses = base_source.sub('', archive_source.sub('', default.sub('', source)))
+    source_uses = re.sub(r'new MigrateDevDbHistoryArchiveError\(\{\s*sourcePath,\s*archivePath(?:: basePath)?,\s*reason: "(?:missing|identity-mismatch)",\s*\}\)', 'guard_history_error', source_uses)
     source_uses = re.sub(r'\bsourcePath: (?:Schema\.String|string)|\bthis\.sourcePath\b|\{ sourcePath \}(?=\))|\$\{sourcePath\}|\bdatabasePath: sourcePath\b', 'guard_source_use', source_uses)
     source_uses = re.sub(r'\b(?:copySourceSlice|NodeURL\.pathToFileURL|fs\.exists|fs\.stat)\(sourcePath\)|\.realPath\(sourcePath\)|\(\) => sourcePath\b', 'guard_source_read', source_uses)
     if re.search(r'\bsourcePath\b', source_uses):

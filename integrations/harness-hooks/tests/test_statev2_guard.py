@@ -1985,6 +1985,65 @@ class GuardTests(unittest.TestCase):
             with self.subTest(case=label, command=command):
                 self.assertEqual(guard.classify_detail(command, str(self.root))[0], expected)
 
+    def test_isolated_migrate_history_attach_provenance(self):
+        source = Path(__file__).resolve().parents[3] / 'apps/server/scripts/migrate-dev-db.ts'
+        original = source.read_text()
+        script = 'apps/server/scripts/migrate-dev-db.ts'
+        self.write('package.json', json.dumps({'scripts': {'migrate-dev-db': 'node ' + script}}))
+        invocations = ('node ' + script, 'vp run migrate-dev-db')
+        arguments = ' --source /tmp/copy.sqlite --base-dir /tmp/dev-home'
+        attaches = {
+            alias: 'ATTACH DATABASE ${`${NodeURL.pathToFileURL(' + operand + ').href}?mode=ro`} AS ' + alias
+            for operand, alias in (('sourcePath', 'src'), ('archivePath', 'cold'), ('basePath', 'base'))
+        }
+        rows = [('current-source', original, None)]
+
+        def mutation(label, before, after):
+            self.assertIn(before, original, label)
+            changed = original.replace(before, after)
+            self.assertNotEqual(changed, original, label)
+            rows.append((label, changed, SCRIPT))
+
+        rows.append(('fourth-attach', original + '\nyield* sql`ATTACH DATABASE "file:/tmp/fourth.sqlite?mode=ro" AS fourth`;\n', SCRIPT))
+        for alias, attach in attaches.items():
+            mutation(alias + '-writable', attach, attach.replace('?mode=ro', ''))
+            mutation(alias + '-wrong-alias', attach, attach.replace('AS ' + alias, 'AS other'))
+            mutation(alias + '-alias-suffix', attach, attach + '_other')
+            mutation(alias + '-missing', attach, '')
+        for alias, operand in (('cold', 'archivePath'), ('base', 'basePath')):
+            for label, replacement in (
+                ('literal-live', json.dumps(LIVE)),
+                ('shared-home', 'path.join(sharedHome, "userdata", "statev2.sqlite")'),
+                ('home', 'path.join(NodeOS.homedir(), ".t3", "userdata", "statev2.sqlite")'),
+                ('environment', 'process.env.HISTORY_DB'),
+                ('other-variable', 'otherPath'),
+            ):
+                mutation(alias + '-attach-' + label, attaches[alias],
+                         attaches[alias].replace('(' + operand + ')', '(' + replacement + ')'))
+                if alias == 'cold':
+                    mutation('cold-initializer-' + label, 'const archivePath = archiveFilename(sourcePath);',
+                             'const archivePath = ' + replacement + ';')
+                else:
+                    mutation('base-resolver-' + label, 'resolveHistoryBasePath(path, sourcePath, baseRows)', replacement)
+            for statement in ('const alias = ' + operand + ';', operand + ' = "/tmp/other.sqlite";',
+                              '[' + operand + '] = other;', 'mutate(' + operand + ');'):
+                mutation(alias + '-unknown-use-' + statement, attaches[alias], attaches[alias] + '; ' + statement)
+        mutation('base-rows-wrong-schema', 'SELECT filename FROM src.ardud_history_base_archive LIMIT 2',
+                 'SELECT filename FROM main.ardud_history_base_archive LIMIT 2')
+        mutation('base-rows-mutation', 'const basePath = yield* Effect.try({',
+                 'baseRows.push({filename: "other.sqlite"}); const basePath = yield* Effect.try({')
+        for helper, module in (('archiveFilename', 'historyArchiveSql'), ('resolveHistoryBasePath', 'historySourceFiles')):
+            mutation(helper + '-wrong-import', '../src/ardud/persistence/' + module + '.ts', './other.ts')
+            rows.append((helper + '-redefined', original + '\n' + helper + ' = () => "/tmp/other.sqlite";\n', SCRIPT))
+        mutation('duplicate-cold-initializer', 'const archivePath = archiveFilename(sourcePath);',
+                 'const archivePath = archiveFilename(sourcePath); const archivePath = archiveFilename(sourcePath);')
+        mutation('detach-other-schema', 'const name of ["base", "cold", "src"]', 'const name of ["other", "cold", "src"]')
+        for label, changed, expected in rows:
+            self.write(script, changed)
+            for invocation in invocations:
+                with self.subTest(case=label, invocation=invocation):
+                    self.assertEqual(self.classify(invocation + arguments), expected)
+
     def test_node_test_database_names_and_live_root_siblings(self):
         for label, source, expected in isolated_source_cases.database_name_sources():
             self.write('names.test.mjs', source)
