@@ -803,6 +803,8 @@ def settled_steps_code(run, code: int | None, *, log_path: Path | None = None, p
     Reuse history catch-up before rejecting a partial follow, including for a process whose
     row is still active. The caller has already established that the process ended.
     """
+    if dict(run).get('status') == 'killed':
+        return dict(run).get('exit_code') or (143 if dict(run).get('process_id') else 130)
     path = log_path or LOGS_DIR / f"{run['run_id']}.log"
     from .misc import _raw_log
     disk = offbox_disk_space.result(_raw_log(path), code)
@@ -2792,13 +2794,19 @@ def save_run_state(run_id, **values):
 
 def restore_run_state(row):
     """A remote handle/result survives a failed SQLite write; wait and reap can repair the row."""
+    row = dict(row)
     saved = read_json(LOGS_DIR / f"{row['run_id']}.state.json", {})
     restored = {**dict(row), **saved}
     # A competing finisher can commit before a blocked writer saves its result to the file.
     # Keep recoverable handles, but a known terminal result already committed to SQLite wins.
-    if terminal_result(row):
+    confirmed_kill = (saved.get('status') == 'killed' and saved.get('exit_code') == 143
+                      and row['status'] == 'failed' and row['exit_code'] in (137, 143))
+    if row['status'] == 'killed':
+        restored.update(status='killed', exit_code=row['exit_code'] or (143 if row.get('process_id') else 130),
+                        end_at=row.get('end_at'))
+    elif terminal_result(row) and not confirmed_kill:
         for key in ('status', 'exit_code', 'end_at'):
-            restored[key] = row[key]
+            restored[key] = row.get(key)
     return restored
 
 
@@ -2881,6 +2889,106 @@ def emit_terminal(row):
         pass
 
 
+def killed_result(run_id, *, wait=False, until=None, row=None, known_code=None):
+    """Prefer confirmed kill receipts; optional refreshes cannot erase a known result."""
+    from .misc import KILL_CONFIRM_S, KILL_REQUEST_S
+    cached = restore_run_state(row) if row is not None else None
+    if row is not None and terminal_result(row) and row['status'] != 'killed' and row['exit_code'] not in (137, 143):
+        return None
+    if row is not None and row['status'] == 'killed' and row['exit_code'] is not None:
+        return dict(row)
+    deadline = now() + KILL_REQUEST_S + KILL_CONFIRM_S + 5
+    if until is not None:
+        deadline = min(deadline, until)
+    while True:
+        try:
+            with contextlib.closing(db()) as con:
+                current = con.execute('SELECT * FROM runs WHERE run_id=?', (run_id,)).fetchone()
+                if current is None:
+                    return None
+                cached = restore_run_state(current)
+                if cached['status'] == 'killed':
+                    cached['exit_code'] = cached['exit_code'] or (143 if cached['process_id'] else 130)
+                    if (current['status'], current['exit_code']) != ('killed', cached['exit_code']):
+                        # Repair old killed/NULL rows and confirmed kills saved during a DB outage.
+                        con.execute("UPDATE runs SET status='killed',exit_code=?,end_at=COALESCE(end_at,?) WHERE run_id=? "
+                                    "AND (status IN ('starting','running') OR exit_code IS NULL OR "
+                                    "(status='failed' AND exit_code IN (137,143)))",
+                                    (cached['exit_code'], cached.get('end_at') or now(), run_id))
+                        con.commit()
+                    return cached
+                if not wait:
+                    return None
+                request = con.execute("SELECT kind,ts FROM events WHERE kind IN "
+                                      "('run_kill_requested','run_kill_confirming','run_kill_finished') "
+                                      "AND substr(detail,1,?)=? ORDER BY rowid DESC LIMIT 1",
+                                      (len(run_id) + 1, run_id + ' ')).fetchone()
+        except sqlite3.Error as error:
+            if cached is not None and cached['status'] == 'killed':
+                cached['exit_code'] = cached['exit_code'] or (143 if cached['process_id'] else 130)
+                state_warning(run_id, cached['exit_code'], error)
+                return cached
+            code = known_code if known_code is not None else cached['exit_code'] if cached is not None else None
+            if code is None:
+                raise
+            state_warning(run_id, code, error)
+            return None
+        if request is None or request['kind'] == 'run_kill_finished':
+            return None
+        window = KILL_CONFIRM_S + 5 + (KILL_REQUEST_S if request['kind'] == 'run_kill_requested' else 0)
+        if now() >= min(deadline, request['ts'] + window):
+            return None
+        # A request alone is not proof. DELETE and stop confirmation have separate bounded windows.
+        time.sleep(min(.5, max(0, deadline - now())))
+
+
+def report_killed(row, log_path=None):
+    if row is None or row['status'] != 'killed' or not row['process_id']:
+        return None
+    try:
+        with contextlib.closing(db()) as con:
+            request = con.execute("SELECT detail FROM events WHERE kind='run_kill_requested' "
+                                  "AND substr(detail,1,?)=? ORDER BY rowid DESC LIMIT 1",
+                                  (len(row['run_id']) + 1, row['run_id'] + ' ')).fetchone()
+    except sqlite3.Error:
+        request = None  # Optional attribution cannot erase a confirmed kill.
+    owner = ('; ' + request['detail'].split(' ', 1)[1]) if request else ''
+    say(f"run {row['run_id']} was killed by offbox kill (process {row['process_id']} on {row['box_id']}{owner})")
+    planned = planned_steps(row)
+    if planned:
+        from .misc import _raw_log
+        path = _raw_log(log_path or LOGS_DIR / f"{row['run_id']}.log")
+        try:
+            text = path.read_text(errors='replace')
+        except OSError:
+            text = ''
+        # Evidence annotates the interrupted step; it never decides the run's result.
+        detail = run_evidence.describe(text, planned)
+        signal_step = re.search(r'caught \w+ at step (\d+)', detail)
+        try:
+            results = dict(step_results(path))
+        except OSError:
+            results = {}
+        step = int(signal_step[1]) if signal_step else next(
+            (n for n in range(1, planned + 1) if n not in results), None)
+        progress = f' at step {step} of {planned}' if step and 1 <= step <= planned else ''
+        say(f'stopped by offbox kill{progress} ({len(results)} of {planned} step results)')
+    return row['exit_code'] if row['exit_code'] is not None else 143
+
+
+def complete_killed(row, log_path=None, *, pulls=(), until=None):
+    pull_metadata = dict(row)
+    if pulls and not (pull_metadata.get('local_cwd') and pull_metadata.get('remote_dir') and 'rel_cwd' in pull_metadata):
+        say(f"warning: {row['run_id']}: artifact pull after offbox kill skipped (pull metadata unavailable)")
+    elif pulls:
+        try:
+            do_pulls(row['box_id'], dict(row), pulls, until=until)
+        except (OffboxError, OSError, subprocess.TimeoutExpired, sqlite3.Error) as error:
+            say(f"warning: {row['run_id']}: artifact pull after offbox kill failed ({error})")
+    resources.finalize(row)
+    return report_killed(row, log_path)
+
+
 def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up: bool = True,
            until: float | None = None, report: bool = False, run=None, bookkeeping: bool = True) -> int | None:
     incoming = code
@@ -2892,12 +3000,23 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
         nonlocal code, st, early_catchup, early_history
         if status == 'source_gone':
             return  # No command or step ran; only the caller's source check failed.
+        if status == 'killed':
+            code, st = incoming, 'killed'
+            return
         prior = run
         if prior is None:
             with contextlib.closing(db()) as before:
                 prior = before.execute('SELECT * FROM runs WHERE run_id=?', (run_id,)).fetchone()
         if prior is None:
             return
+        if prior['status'] == 'killed':
+            code, st = prior['exit_code'] or (143 if prior['process_id'] else 130), 'killed'
+            return
+        if incoming in (None, 137, 143):
+            killed = killed_result(run_id, wait=True, until=until, row=prior, known_code=incoming)
+            if killed is not None:
+                code, st = killed['exit_code'], 'killed'
+                return
         # History can reach the server. An unvalidated wrapper result is never saved as terminal.
         if planned_steps(prior):
             code = None
@@ -2914,6 +3033,11 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
         code = incoming if known_infra or disk.get('infra_failure') not in (None, 'disk_probe') else settled_steps_code(
             prior, incoming, locked=True, until=until, catch_up=catch_up and not early_catchup, report=report,
             history_result=early_history if isinstance(early_history, str) else None)
+        if code is None:
+            killed = killed_result(run_id, wait=True, until=until, row=prior, known_code=incoming)
+            if killed is not None:
+                code, st = killed['exit_code'], 'killed'
+                return
         disk = offbox_disk_space.result(_raw_log(LOGS_DIR / f'{run_id}.log'), incoming)
         if known_infra:
             st = 'infra'
@@ -2932,7 +3056,15 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
             with write(con):
                 r = con.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
                 if r:
-                    con.execute("UPDATE runs SET status=?, exit_code=?, end_at=? WHERE run_id=? "
+                    if r['status'] == 'killed':
+                        if r['exit_code'] is None and r['process_id']:
+                            con.execute("UPDATE runs SET exit_code=143 WHERE run_id=?", (run_id,))
+                    elif st == 'killed' and code == 143 and r['exit_code'] in (None, 137, 143):
+                        # Kill confirmation may arrive after the attached client saved lost/infra.
+                        con.execute("UPDATE runs SET status='killed',exit_code=143,end_at=? WHERE run_id=?",
+                                    (now(), run_id))
+                    else:
+                        con.execute("UPDATE runs SET status=?, exit_code=?, end_at=? WHERE run_id=? "
                                 "AND (status IN ('starting','running') OR (status='lost' AND exit_code IS NULL AND ?='infra') OR "
                                 "(exit_code IS NULL AND ? IS NOT NULL AND (status='lost' OR "
                                 "(status='infra' AND EXISTS (SELECT 1 FROM kv WHERE k='start_unknown:' || runs.run_id)))))",
@@ -3368,6 +3500,9 @@ def _run_remote(a, rn) -> int:
             background_wait_hint(rn.run_id)
             say(f"started in background on {rn.box}")
             return 0
+        kill_hint = dict(run_id=rn.run_id, status='running', exit_code=None, process_id=getattr(rn, 'pid', None), box_id=rn.box,
+                         step_count=len(getattr(a, 'steps', None) or []), mode='fg')
+        stream_killed = None
         code = None
         try:
             code = rn.recovered_code if rn.recovered_code is not None else rn.stream()
@@ -3379,6 +3514,11 @@ def _run_remote(a, rn) -> int:
                 raise OffboxError(f"{rn.run_id}: steps incomplete after the interruption; remote exit unknown",
                                   code=EXIT_INFRA, started=True) from None
             raise
+        except OffboxError:
+            stream_killed = killed_result(rn.run_id, wait=True, row=kill_hint)
+            if stream_killed is None or not stream_killed['process_id']:
+                raise
+            code = stream_killed['exit_code']
     except KeyboardInterrupt:
         if rn.started and rn.box and _host_restarting(interrupted['sig']):
             return _detach(rn, interrupted['sig'])
@@ -3391,10 +3531,26 @@ def _run_remote(a, rn) -> int:
     finally:
         for s, h in old.items():
             signal.signal(s, h)
+    killed = stream_killed or (killed_result(rn.run_id, wait=True, row=kill_hint, known_code=code)
+                              if code in (None, 137, 143) else None)
+    if killed is not None and killed['process_id']:
+        rn.remote_code = killed['exit_code']
+        return complete_killed(killed, rn.log_path, pulls=a.pull)
     if code is None:
-        code, how = recover_lost_exit(rn.box, rn.run_id, rn.log_path, len(getattr(a, "steps", None) or []))
+        try:
+            code, how = recover_lost_exit(rn.box, rn.run_id, rn.log_path, len(getattr(a, "steps", None) or []))
+        except OffboxError:
+            killed = killed_result(rn.run_id, wait=True, row=kill_hint)
+            if killed is None or not killed['process_id']:
+                raise
+            rn.remote_code = killed['exit_code']
+            return complete_killed(killed, rn.log_path, pulls=a.pull)
         if code is not None:
             say(f"boat lost track of the remote process after it ended; exit {code} taken from {how}")
+    killed = killed_result(rn.run_id, wait=True, row=kill_hint, known_code=code) if code in (None, 137, 143) else None
+    if killed is not None and killed['process_id']:
+        rn.remote_code = killed['exit_code']
+        return complete_killed(killed, rn.log_path, pulls=a.pull)
     rn.remote_code = None if getattr(a, 'steps', None) else code
     if code not in (0, None) and scope_failed(rn.log_path):
         rn.started = False
@@ -3457,6 +3613,9 @@ def _run_remote(a, rn) -> int:
         rn.remote_code = code
     code = finish(rn.run_id, code, report=True)
     rn.remote_code = code
+    killed = killed_result(rn.run_id, row=kill_hint, known_code=code) if code in (None, 137, 143) else None
+    if killed is not None and killed['process_id']:
+        return report_killed(killed, rn.log_path)
     go_std_glitch(rn.box, rn.run_id, rn.log_path, code)
     if code is None:
         say("remote process was lost (box restarted?); treating as infra failure")
