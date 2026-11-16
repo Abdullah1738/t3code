@@ -4,8 +4,11 @@ import { homedir } from "node:os"
 import { join } from "node:path"
 
 const days = new Set<string>()
+const GATE_LIGHT_SAMPLE = 20
 export function gateLog(decision: "allowed" | "denied" | "local-override", commandClass: string, durationMs: number, failed = false) {
   try {
+    const sampled = !failed && decision === "allowed" && commandClass === "light"
+    if (sampled && !(Math.random() < 1 / GATE_LIGHT_SAMPLE)) return
     const root = process.env.OFFBOX_TOOL_LOG_DIR ?? join(homedir(), ".robob/logs/tools/offbox")
     const now = new Date(), day = now.toISOString().slice(0, 10)
     mkdirSync(root, { recursive: true, mode: 0o700 }); chmodSync(root, 0o700)
@@ -20,7 +23,8 @@ export function gateLog(decision: "allowed" | "denied" | "local-override", comma
     }
     const line = { ts: now.toISOString(), tool: "offbox", component: "gate", kind: failed ? "error" : "perf", name: "gate.decision",
       ok: !failed, durationMs: Number.isFinite(durationMs) ? Math.max(0, durationMs) : 0,
-      props: { decision, harness: "opencode", commandClass: ["cargo", "evm", "go-build", "go-test", "gradle", "js-test", "lint", "make-test", "pytest", "typecheck", "light", "heavy", "test", "install", "build", "docker", "opaque", "cpu"].includes(commandClass) ? commandClass : "unknown" },
+      props: { decision, harness: "opencode", commandClass: ["cargo", "evm", "go-build", "go-test", "gradle", "js-test", "lint", "make-test", "pytest", "typecheck", "light", "heavy", "test", "install", "build", "docker", "opaque", "cpu"].includes(commandClass) ? commandClass : "unknown",
+        ...(sampled ? { sample: GATE_LIGHT_SAMPLE } : {}) },
       ...(failed ? { error: { tag: "gate_failed", message: "gate failed" } } : {}) }
     const fd = openSync(join(root, day + ".ndjson"), constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NONBLOCK | constants.O_NOFOLLOW, 0o600)
     try {
