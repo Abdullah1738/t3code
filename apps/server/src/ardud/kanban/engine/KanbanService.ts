@@ -1785,6 +1785,16 @@ const make = Effect.gen(function* () {
       rawStore.observeCallerWrites(boardSql.withTransaction(effect)),
       true,
     );
+  // Read admission keeps SavedWrite's commit marker at the first persisted write.
+  const boardTransaction = Effect.fn("KanbanService.boardTransaction")(function* <A, E, R>(
+    boardId: string,
+    effect: Effect.Effect<A, E, R>,
+    resource?: string,
+  ) {
+    return yield* locks.run(
+      locks.access(boardId, Effect.void, false, resource).pipe(Effect.andThen(tickTransaction(effect))),
+    );
+  });
   const store = LockedStore.wrap(rawStore, locks);
   const threadIo = yield* KanbanThreads;
   const turnAdmission = yield* ThreadCommandExecutor.ThreadCommandExecutor;
@@ -3369,10 +3379,9 @@ const make = Effect.gen(function* () {
           card = { ...card, updatedAt: before.updatedAt };
         // A release completion and its pacing receipt must survive the same restart.
         const write = releaseBoard
-          ? rawStore.observeCallerWrites(
-              boardSql.withTransaction(
-                store.putBoard(releaseBoard).pipe(Effect.andThen(store.putCard(card))),
-              ),
+          ? boardTransaction(
+              card.boardId,
+              store.putBoard(releaseBoard).pipe(Effect.andThen(store.putCard(card))),
             )
           : store.putCard(card);
         yield* dispatchMetadata ? locks.dispatchMetadata(write) : write;
@@ -8386,7 +8395,8 @@ const make = Effect.gen(function* () {
     // The acknowledged sequence must survive cancellation with its message.
     yield* Effect.uninterruptible(
       Effect.gen(function* () {
-        yield* tickTransaction(
+        yield* boardTransaction(
+          discussion.boardId,
           Effect.gen(function* () {
             if (durablePost) {
               yield* saveOwnerRoute(discussion.boardId, discussionId, ownerPostKey(message), {
@@ -8399,6 +8409,7 @@ const make = Effect.gen(function* () {
             yield* store.putMessage(message);
             yield* store.putDiscussion(posted);
           }),
+          `discussion:${discussionId}`,
         ).pipe(Effect.onError(() => attachments.release(claim.claimedPaths)));
         yield* SavedWrite.record({ kind: "message", message });
       }),
@@ -10633,6 +10644,7 @@ const make = Effect.gen(function* () {
 
   // A board setting can wrap several recoveries; publish and drain after its outer commit.
   const commitReviewGate = Effect.fn("KanbanService.commitReviewGate")(function* <A, E, R>(
+    boardId: string,
     effect: Effect.Effect<A, E, R>,
   ) {
     const outerPublications = yield* publicationSink;
@@ -10644,7 +10656,8 @@ const make = Effect.gen(function* () {
     const observer = yield* SavedWrite.observer;
     const receipts: SavedWrite.Saved[] = [];
     const result = yield* Effect.uninterruptible(
-      tickTransaction(
+      boardTransaction(
+        boardId,
         effect.pipe(
           Effect.provideService(SavedWrite.observer, (saved) => {
             receipts.push(saved);
@@ -10685,6 +10698,7 @@ const make = Effect.gen(function* () {
     // The receipt must never survive a failed card save, and a retained flag
     // must retain its evaluator notification across a process exit too.
     yield* commitReviewGate(
+      next.boardId,
       Effect.gen(function* () {
         const checked = yield* logEvent(
           next,
@@ -12136,7 +12150,11 @@ const make = Effect.gen(function* () {
               const sink: EffectSink = { effects: [], closed: false };
               const publications: Array<BoardPublication> = [];
               const measurements: AnalyticsEvent[] = [];
-              const lanes = yield* tickTransaction(
+              if (resolved._tag === "hold") {
+                if (resolved.save !== null) yield* prepareTransition(resolved.save);
+              } else if (resolved._tag !== "none") yield* prepareTransition(resolved.card);
+              const lanes = yield* boardTransaction(
+                boardId,
                 Effect.gen(function* () {
                   yield* applyWaitStep(resolved, { _tag: "system", component: "waits" });
                   return yield* saveEffectRows(sink.effects);
@@ -14715,7 +14733,7 @@ const make = Effect.gen(function* () {
     } else {
       const write = store.putBoardWithPools(next, pools, application);
       yield* !NodeUtil.isDeepStrictEqual(board.guessedGates, next.guessedGates)
-        ? commitReviewGate(write.pipe(Effect.andThen(recheckBoardReviewGates(next))))
+        ? commitReviewGate(board.id, write.pipe(Effect.andThen(recheckBoardReviewGates(next))))
         : write;
     }
     if (pools.length > 0) {
@@ -15014,6 +15032,7 @@ const make = Effect.gen(function* () {
   ) {
     const next = { ...board, standingApprovals };
     yield* commitReviewGate(
+      board.id,
       store.putBoard(next).pipe(Effect.andThen(recheckBoardReviewGates(next))),
     );
     yield* publish(board.id, { _tag: "board", board: next });
@@ -16588,8 +16607,10 @@ const make = Effect.gen(function* () {
                 restore: input,
                 board,
                 card,
-                link: yield* store.threadLink(input.threadId),
-                threadCards: yield* store.threadCards(input.threadId),
+                // Validation rejects foreign links; keep their reads in this SQL snapshot
+                // without requesting a second board's gate while holding the writer.
+                link: yield* rawStore.threadLink(input.threadId),
+                threadCards: yield* rawStore.threadCards(input.threadId),
                 cards: yield* store.cards(board.id),
                 pools: yield* store.pools(board.id),
                 holds: yield* boardHolds(board.id),
@@ -19308,7 +19329,8 @@ const make = Effect.gen(function* () {
         };
         // An owner answer commits with its routing obligation, in one transaction.
         yield* durableOwnerRoutes && by._tag === "owner"
-          ? tickTransaction(
+          ? boardTransaction(
+              discussion.boardId,
               saveOwnerRoute(discussion.boardId, discussionId, routeKey, {
                 kind: "answer",
                 seq,
@@ -19318,6 +19340,7 @@ const make = Effect.gen(function* () {
                 choice: choiceIds,
                 text: answerText,
               }).pipe(Effect.andThen(store.putMessage(next))),
+              `discussion:${discussionId}`,
             ).pipe(Effect.mapError(toKanbanError))
           : store.putMessage(next);
         yield* publish(discussion.boardId, { _tag: "message", message: next });
