@@ -157,6 +157,7 @@ const layerProviderSessionManagerProvided = ProviderSessionManager.layer.pipe(
       layerCommandOutputHubProvided,
       layerProviderAdapterRegistryProvided,
       layerEventSinkProvided,
+      EffectOutbox.layer,
       IdAllocator.layer,
       layerProviderEventIngestorProvided,
       ProjectionStore.layer,

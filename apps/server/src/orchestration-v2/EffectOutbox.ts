@@ -37,6 +37,7 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("provider-session.reconcile-turn"),
     preserveBackgroundWork: Schema.optional(Schema.Boolean),
+    releasedAt: Schema.optional(Schema.DateTimeUtcFromString),
     providerThreadId: ProviderThreadId,
     providerTurnId: ProviderTurnId,
   }),
@@ -271,6 +272,9 @@ export interface EffectOutboxV2Shape {
   readonly get: (
     effectId: string,
   ) => Effect.Effect<Option.Option<OrchestrationEffectV2>, EffectOutboxError>;
+  readonly listPendingSteerTurns: (
+    providerSessionId: ProviderSessionId,
+  ) => Effect.Effect<ReadonlyArray<ProviderTurnId>, EffectOutboxError>;
   readonly hasPendingRunContinuation: (
     threadId: ThreadId,
   ) => Effect.Effect<boolean, EffectOutboxError>;
@@ -529,6 +533,19 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
       awaitControlAvailable: Queue.take(controlAvailable),
       awaitStartAvailable: Queue.take(startAvailable),
       notifyAvailable,
+      listPendingSteerTurns: Effect.fn("EffectOutbox.listPendingSteerTurns")(
+        function* (providerSessionId) {
+          const rows = yield* sql<{ readonly turn_id: string }>`
+            SELECT DISTINCT json_extract(payload_json, '$.providerTurnId') AS turn_id
+            FROM orchestration_v2_effect_outbox
+            WHERE status IN ('pending', 'running') AND effect_type = 'provider-turn.steer'
+              AND json_extract(payload_json, '$.providerSessionId') = ${providerSessionId}
+              AND COALESCE(json_extract(payload_json, '$.providerAccepted'), 0) <> 1
+          `;
+          return rows.map((row) => ProviderTurnId.make(row.turn_id));
+        },
+        Effect.mapError((cause) => new EffectOutboxError({ operation: "list", cause })),
+      ),
       hasPendingRunContinuation: Effect.fn("EffectOutbox.hasPendingRunContinuation")(
         function* (threadId) {
           const rows = yield* sql`

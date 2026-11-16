@@ -5432,6 +5432,9 @@ it.effect("keeps completed runs completed when pull request refresh fails", () =
 
 it.effect.each([
   { provider: "codex", processOwned: true },
+  { provider: "cursor", processOwned: true },
+  { provider: "grok", processOwned: true },
+  { provider: "antigravity", processOwned: true },
   { provider: "opencode", processOwned: false },
 ] as const)(
   "applies $provider child lifetime on live subscriber failure",

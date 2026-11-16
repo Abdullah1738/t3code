@@ -202,6 +202,7 @@ export interface AcpAdapterV2ExtensionContext {
 }
 
 export interface AcpAdapterV2Flavor {
+  readonly backgroundTasksEndWithProcess?: true;
   readonly promptFailure?: (cause: unknown) => OrchestrationV2ProviderFailure;
   readonly driver: ProviderDriverKind;
   readonly capabilities: OrchestrationV2ProviderCapabilities;
@@ -7671,6 +7672,9 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           providerSessionId: input.providerSessionId,
           providerSession,
           events: Stream.fromEffectRepeat(Queue.take(events)),
+          ...(flavor.backgroundTasksEndWithProcess === true
+            ? { backgroundTasksEndWithProcess: true as const }
+            : {}),
           ...(flavor.getModelContextWindow === undefined
             ? {}
             : {

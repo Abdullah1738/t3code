@@ -10967,6 +10967,121 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         }
         return;
       }
+      if (command.runOnly === true && command.preserveBackgroundWork !== true) {
+        const cutoff = command.releasedAt ?? (yield* DateTime.now);
+        const ownedTurns = new Set([command.providerTurnId]);
+        const child = yield* projectionStore
+          .getThreadRecords(command.threadId, [
+            "nodes",
+            "subagents",
+            "turnItems",
+            "providerTurns",
+            "providerThreads",
+            "messages",
+            "runtimeRequests",
+          ])
+          .pipe(
+            Effect.catchTags({ ProjectionStoreThreadNotFoundError: () => Effect.succeed(null) }),
+            mapDispatchError(command),
+          );
+        if (child !== null) {
+          const ownedNodes = new Set(
+            child.nodes
+              .filter((node) => node.providerTurnId !== null && ownedTurns.has(node.providerTurnId))
+              .map((node) => node.id),
+          );
+          const now = yield* DateTime.now;
+          const allocateEventId = () =>
+            idAllocator.allocate.event({
+              threadId: command.threadId,
+              commandId: command.commandId,
+            });
+          const ended = yield* endRunlessRootTurns({
+            threadId: command.threadId,
+            providerInstanceId:
+              stopped.providerThread?.providerInstanceId ?? child.thread.providerInstanceId,
+            projection: {
+              nodes: child.nodes.filter((node) => ownedNodes.has(node.id)),
+              turnItems: child.turnItems.filter(
+                (item) => item.nodeId !== null && ownedNodes.has(item.nodeId),
+              ),
+              providerTurns: child.providerTurns.filter((turn) => ownedTurns.has(turn.id)),
+            },
+            status: "interrupted",
+            now,
+            emitted: yield* Ref.get(events),
+            allocateEventId,
+          }).pipe(mapDispatchError(command));
+          yield* Ref.update(events, (current) => [...current, ...ended]);
+          for (const message of child.messages) {
+            if (
+              message.runId !== null ||
+              message.nodeId === null ||
+              !ownedNodes.has(message.nodeId) ||
+              !message.streaming
+            )
+              continue;
+            yield* emit(
+              events,
+              command,
+            )({
+              type: "message.updated",
+              threadId: command.threadId,
+              nodeId: message.nodeId,
+              occurredAt: now,
+              payload: { ...message, streaming: false, updatedAt: now },
+            });
+          }
+          for (const request of child.runtimeRequests) {
+            if (request.status !== "pending" || !ownedNodes.has(request.nodeId)) continue;
+            yield* emit(
+              events,
+              command,
+            )({
+              type: "runtime-request.updated",
+              threadId: command.threadId,
+              nodeId: request.nodeId,
+              occurredAt: now,
+              payload: {
+                ...request,
+                status: "cancelled",
+                resolvedAt: now,
+                responseCapability: {
+                  type: "not_resumable",
+                  reason: "The provider session ended.",
+                },
+              },
+            });
+          }
+          for (const task of child.subagents) {
+            if (
+              task.origin !== "provider_native" ||
+              (task.startedAt !== null && DateTime.isGreaterThan(task.startedAt, cutoff)) ||
+              !(
+                ownedNodes.has(task.parentNodeId) ||
+                ownedNodes.has(task.id) ||
+                child.turnItems.some(
+                  (item) =>
+                    item.type === "subagent" &&
+                    item.subagentId === task.id &&
+                    item.providerTurnId !== null &&
+                    ownedTurns.has(item.providerTurnId),
+                )
+              )
+            )
+              continue;
+            const endedTask = yield* endOrphanedNativeSubagent({
+              projection: child,
+              subagentId: task.id,
+              status: "interrupted",
+              now,
+              emitted: yield* Ref.get(events),
+              allocateEventId,
+            }).pipe(mapDispatchError(command));
+            yield* Ref.update(events, (current) => [...current, ...endedTask]);
+          }
+        }
+      }
       const stoppedRunId = projection.attempts.find(
         (attempt) => attempt.id === stopped.providerTurn?.runAttemptId,
       )?.runId;

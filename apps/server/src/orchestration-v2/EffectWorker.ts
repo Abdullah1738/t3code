@@ -127,6 +127,9 @@ export const layerExecutor: Layer.Layer<
               .dispatch({
                 type: "thread.background-work.settle",
                 runOnly: true,
+                ...(effect.request.releasedAt === undefined
+                  ? {}
+                  : { releasedAt: effect.request.releasedAt }),
                 preserveBackgroundWork: effect.request.preserveBackgroundWork === true,
                 // Rejected planning has a durable receipt; a new attempt must plan again.
                 commandId: CommandId.make(`${effect.id}:settle:${effect.attemptCount}`),

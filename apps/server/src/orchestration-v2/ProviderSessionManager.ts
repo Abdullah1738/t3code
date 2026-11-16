@@ -53,6 +53,7 @@ import * as ServerSettings from "../serverSettings.ts";
 import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
 import * as EventSink from "./EventSink.ts";
 import type { PendingOrchestrationEffectV2 } from "./EffectOutbox.ts";
+import * as EffectOutbox from "./EffectOutbox.ts";
 import * as CommandOutputHub from "./CommandOutputHub.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
@@ -384,6 +385,7 @@ export const layerWithOptions = (
   never,
   | CommandOutputHub.CommandOutputHub
   | EventSink.EventSinkV2
+  | EffectOutbox.EffectOutboxV2
   | FileSystem.FileSystem
   | IdAllocator.IdAllocatorV2
   | McpProviderSessions.McpProviderSessions
@@ -408,6 +410,7 @@ export const layerWithOptions = (
       const serverSettings = yield* Effect.serviceOption(ServerSettings.ServerSettingsService);
       const projectService = yield* Effect.serviceOption(ProjectService.ProjectService);
       const eventSink = yield* EventSink.EventSinkV2;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
       const startProgress = yield* Effect.serviceOption(
         ProviderStartProgress.ProviderStartProgress,
       );
@@ -978,34 +981,80 @@ export const layerWithOptions = (
           readonly releasedAt: DateTime.Utc;
           readonly detachedThreadId?: ThreadId;
         }) {
-          if (input.reason === "server_shutdown" || !input.entry.supportsMultipleProviderThreads)
-            return [];
+          if (input.reason === "server_shutdown") return [];
           const threadIds = new Set(input.entry.attachedThreadIds);
           if (input.detachedThreadId !== undefined) threadIds.add(input.detachedThreadId);
           const effects: PendingOrchestrationEffectV2[] = [];
+          const pendingSteers = new Set(
+            yield* outbox.listPendingSteerTurns(input.entry.runtime.providerSessionId),
+          );
           for (const threadId of threadIds) {
-            const projection = yield* projectionStore.getThreadRecords(threadId, [
-              "runs",
-              "providerThreads",
-              "providerTurns",
-            ]);
-            const owned = new Set(
-              projection.providerThreads
-                .filter(
-                  (thread) => thread.providerSessionId === input.entry.runtime.providerSessionId,
-                )
-                .map((thread) => thread.id),
+            const projection = yield* projectionStore
+              .getThreadRecords(threadId, ["providerTurns", "nodes", "subagents"])
+              .pipe(
+                Effect.catchTags({
+                  ProjectionStoreThreadNotFoundError: () => Effect.succeed(null),
+                }),
+              );
+            if (projection === null || projection.providerTurns.length === 0) continue;
+            const bindings = yield* projectionStore.getThreadRecords(
+              threadId,
+              ["providerThreads"],
+              {
+                providerSessionId: input.entry.runtime.providerSessionId,
+                providerThreadIds: [
+                  ...new Set(projection.providerTurns.map((turn) => turn.providerThreadId)),
+                ],
+              },
             );
+            const owned = new Set(bindings.providerThreads.map((thread) => thread.id));
+            // Native Codex children use runless turns in separate threads. Capture their
+            // identities now so a replacement at the same timestamp cannot be swept later.
+            if (input.entry.runtime.backgroundTasksEndWithProcess === true) {
+              const ownedTurns = new Set(
+                projection.providerTurns
+                  .filter(
+                    (turn) =>
+                      owned.has(turn.providerThreadId) &&
+                      (turn.startedAt === null ||
+                        !DateTime.isGreaterThan(turn.startedAt, input.releasedAt)),
+                  )
+                  .map((turn) => turn.id),
+              );
+              for (const task of projection.subagents) {
+                if (
+                  task.origin === "provider_native" &&
+                  task.childThreadId !== null &&
+                  projection.nodes.some(
+                    (node) =>
+                      node.id === task.id &&
+                      node.providerTurnId !== null &&
+                      ownedTurns.has(node.providerTurnId),
+                  )
+                ) {
+                  threadIds.add(task.childThreadId);
+                }
+              }
+            }
             for (const turn of projection.providerTurns) {
               // A replacement can reuse the shared session id while this release drains.
               if (
-                turn.status !== "running" ||
                 !owned.has(turn.providerThreadId) ||
                 (turn.startedAt !== null &&
                   DateTime.isGreaterThan(turn.startedAt, input.releasedAt)) ||
-                !projection.runs.some(
-                  (run) => run.status === "running" && run.activeAttemptId === turn.runAttemptId,
-                )
+                (turn.status !== "running" &&
+                  !pendingSteers.has(turn.id) &&
+                  !(
+                    input.entry.runtime.backgroundTasksEndWithProcess === true &&
+                    projection.subagents.some(
+                      (task) =>
+                        task.origin === "provider_native" &&
+                        ["pending", "running", "waiting"].includes(task.status) &&
+                        projection.nodes.some(
+                          (node) => node.id === task.id && node.providerTurnId === turn.id,
+                        ),
+                    )
+                  ))
               )
                 continue;
               const id = `effect:session-ended:${turn.id}`;
@@ -1015,6 +1064,7 @@ export const layerWithOptions = (
                 threadId,
                 request: {
                   type: "provider-session.reconcile-turn",
+                  releasedAt: input.releasedAt,
                   preserveBackgroundWork:
                     input.entry.runtime.backgroundTasksEndWithProcess !== true,
                   providerThreadId: turn.providerThreadId,
@@ -1285,8 +1335,9 @@ export const layerWithOptions = (
               releasedAt,
               releasedTurns: Exit.succeed<PendingOrchestrationEffectV2[]>([]),
               releasedBackgroundTasks: [],
+              closing: undefined,
             };
-          const releasedTurns = yield* Effect.exit(
+          const turns = yield* Effect.exit(
             readReleasedTurns({
               entry: entry.value,
               reason: input.reason,
@@ -1295,19 +1346,13 @@ export const layerWithOptions = (
                 ? {}
                 : { detachedThreadId: input.detachedThreadId }),
             }),
+          ).pipe(
+            Effect.flatMap((exit) =>
+              Exit.isSuccess(exit) ? Effect.succeed(exit.value) : Effect.fail(exit.cause),
+            ),
+            Effect.retry({ schedule: Schedule.exponential("1 second") }),
           );
-          // A replacement must not deliver old-turn steers before their release
-          // identity is durable. Adapter teardown can stay blocked for 30 seconds.
-          if (Exit.isSuccess(releasedTurns)) {
-            yield* eventSink.writeWithEffects({ events: [], effects: releasedTurns.value }).pipe(
-              Effect.catchCause((cause) =>
-                Effect.logWarning("orchestration-v2.provider-session-release-turns-write-failed", {
-                  providerSessionId: input.providerSessionId,
-                  cause,
-                }),
-              ),
-            );
-          }
+          const releasedTurns = Exit.succeed(turns);
           const releasedBackgroundTasks = yield* readReleasedBackgroundTasks({
             entry: entry.value,
             reason: input.reason,
@@ -1315,7 +1360,38 @@ export const layerWithOptions = (
               ? {}
               : { detachedThreadId: input.detachedThreadId }),
           });
-          return { entry, releasedAt, releasedTurns, releasedBackgroundTasks } as const;
+          // Teardown proceeds even while storage retries hold replacement opens.
+          const closing = yield* Effect.gen(function* () {
+            if (input.cancelIdleFiber !== false) yield* cancelIdleFiber(entry.value.idleFiber);
+            if (input.gracefulSubscribers === true) yield* endSubscribers(entry.value);
+            else if (input.reason === "server_shutdown") yield* interruptSubscribers(entry.value);
+            else
+              yield* failSubscribers(
+                entry.value,
+                input.detail ?? `Provider session released: ${input.reason}.`,
+              );
+            return yield* closeScopeWithin(entry.value.scope, {
+              providerSessionId: input.providerSessionId,
+              reason: input.reason,
+            });
+          }).pipe(Effect.forkDetach({ startImmediately: true }));
+          // A replacement must not deliver old-turn steers until this identity is durable.
+          if (turns.length > 0)
+            yield* Effect.exit(
+              Effect.suspend(() => eventSink.writeWithEffects({ events: [], effects: turns })),
+            ).pipe(
+              Effect.flatMap((exit) =>
+                Exit.isSuccess(exit) ? Effect.void : Effect.fail(exit.cause),
+              ),
+              Effect.tapError((cause) =>
+                Effect.logWarning("orchestration-v2.provider-session-release-turns-write-failed", {
+                  providerSessionId: input.providerSessionId,
+                  cause,
+                }),
+              ),
+              Effect.retry({ schedule: Schedule.exponential("1 second") }),
+            );
+          return { entry, releasedAt, releasedTurns, releasedBackgroundTasks, closing } as const;
         });
         return Effect.acquireUseRelease(
           input.openLockHeld === true
@@ -1326,23 +1402,7 @@ export const layerWithOptions = (
               onNone: () => Effect.void,
               onSome: (entry) =>
                 Effect.gen(function* () {
-                  if (input.cancelIdleFiber !== false) {
-                    yield* cancelIdleFiber(entry.idleFiber);
-                  }
-                  if (input.gracefulSubscribers === true) {
-                    yield* endSubscribers(entry);
-                  } else if (input.reason === "server_shutdown") {
-                    yield* interruptSubscribers(entry);
-                  } else {
-                    yield* failSubscribers(
-                      entry,
-                      input.detail ?? `Provider session released: ${input.reason}.`,
-                    );
-                  }
-                  const closeExit = yield* closeScopeWithin(entry.scope, {
-                    providerSessionId: input.providerSessionId,
-                    reason: input.reason,
-                  });
+                  const closeExit = yield* Fiber.join(captured.closing!);
                   const records = {
                     entry,
                     reason: input.reason,
