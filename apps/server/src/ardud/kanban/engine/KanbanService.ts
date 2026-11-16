@@ -992,6 +992,7 @@ export interface KanbanServiceShape {
     readonly title: string;
     readonly evidence: string;
     readonly cardHint?: string | undefined;
+    readonly callerUnverifiedReason?: SavedWrite.UnverifiedReporterReason | undefined;
   }) => Effect.Effect<
     {
       readonly appendedTo?: string;
@@ -1803,7 +1804,9 @@ const make = Effect.gen(function* () {
     resource?: string,
   ) {
     return yield* locks.run(
-      locks.access(boardId, Effect.void, false, resource).pipe(Effect.andThen(tickTransaction(effect))),
+      locks
+        .access(boardId, Effect.void, false, resource)
+        .pipe(Effect.andThen(tickTransaction(effect))),
     );
   });
   const store = LockedStore.wrap(rawStore, locks);
@@ -20182,7 +20185,10 @@ const make = Effect.gen(function* () {
     );
     if (!board) return yield* failWith("invalid", `No Missions board "${input.boardId}".`);
     yield* resolvedContext({ boardId: board.id });
-    const source = yield* readDb(store.threadLink(input.threadId));
+    const source =
+      input.callerUnverifiedReason === undefined
+        ? yield* readDb(store.threadLink(input.threadId))
+        : null;
     const reporter =
       source && (source.role === "work" || source.role === "review")
         ? yield* Effect.gen(function* () {
@@ -20202,7 +20208,12 @@ const make = Effect.gen(function* () {
     } else {
       text = `Reported by thread [${input.threadId}](t3-thread://v1/${input.threadId}).\n\n${text}`;
     }
-    const body = `sighting\n\n${evidence}`;
+    const verification =
+      input.callerUnverifiedReason === undefined
+        ? undefined
+        : `reporter unverified (${input.callerUnverifiedReason}); callerVerified: false`;
+    if (verification !== undefined) text = `${verification}\n\n${text}`;
+    const body = `sighting\n\n${verification === undefined ? "" : `${verification}\n\n`}${evidence}`;
     const actor: KanbanActor = { _tag: "thread", threadId: input.threadId };
     // Recover a committed append if publishing the card change races another board write.
     let appended:

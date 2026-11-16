@@ -1076,6 +1076,11 @@ const ReportBug = tool(
   },
   {
     appendedTo: Schema.optional(TrimmedNonEmptyString),
+    callerVerified: Schema.optional(Schema.Boolean),
+    callerUnverifiedReason: Schema.optional(
+      Schema.Literals(["caller_unresolved", "parent_not_active"]),
+    ),
+    message: Schema.optional(Schema.String),
     deduped: Schema.optional(Schema.Boolean),
     candidates: Schema.optional(Records),
     threadId: Schema.optional(TrimmedNonEmptyString),
