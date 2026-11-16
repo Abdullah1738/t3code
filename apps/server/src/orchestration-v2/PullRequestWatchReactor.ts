@@ -39,6 +39,7 @@ import {
   evaluatePullRequestWatch,
   pullRequestChecksSettling,
   pullRequestWatchMessage,
+  pullRequestWatchStopMessage,
 } from "./pullRequestWatch.ts";
 
 /**
@@ -308,14 +309,12 @@ export const make = Effect.gen(function* () {
     reason?: string,
   ) =>
     record(target, null, {
-      text: `T3 Code stopped watching pull request #${target.link.number} (${target.link.url}) after ${failures} consecutive unsuccessful ${failures === 1 ? "read" : "reads"}.${reason ? ` ${reason}` : ""}${Option.match(
-        error,
-        {
-          onNone: () => "",
-          onSome: (failure) =>
-            ` Last error: ${failure.message}${failure._tag === "PullRequestUnavailableError" ? ` (${failure.reason})` : ""}`,
-        },
-      )} Check it yourself, and call watch_pull_request to watch it again.`,
+      text: pullRequestWatchStopMessage(
+        target.link,
+        failures,
+        Option.getOrUndefined(error),
+        reason,
+      ),
       notification: {
         source: { kind: "monitor" },
         outcome: "failed",
