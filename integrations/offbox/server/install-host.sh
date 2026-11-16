@@ -20,6 +20,9 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 MGMT_ASSETS=$HERE
 [ -f "$MGMT_ASSETS/offbox_mgmt_sshd_config" ] || MGMT_ASSETS=$HERE/../skill/templates/home
+SQLITE_ASSET=$HERE/sqlite.sh
+[ -f "$SQLITE_ASSET" ] || SQLITE_ASSET=$HERE/../skill/templates/tools/sqlite.sh
+FETCH_ASSET=$(dirname "$SQLITE_ASSET")/fetch.sh
 POOL=offbox
 export DEBIAN_FRONTEND=noninteractive
 
@@ -156,6 +159,8 @@ image() {
   for _ in $(seq 60); do incus exec offbox-build -- systemctl is-system-running 2>/dev/null | grep -qE 'running|degraded' && break; sleep 1; done
   incus file push "$HERE/boatd-wrap" offbox-build/usr/local/sbin/boatd-wrap --mode 0755
   incus file push "$HERE/base-image.sh" offbox-build/root/base-image.sh --mode 0700
+  incus file push "$SQLITE_ASSET" offbox-build/root/offbox-sqlite.sh --mode 0700
+  incus file push "$FETCH_ASSET" offbox-build/root/fetch.sh --mode 0600
   incus file push "$MGMT_ASSETS/offbox-mgmt-ssh.service" offbox-build/root/offbox-mgmt-ssh.service --mode 0644
   incus file push "$MGMT_ASSETS/offbox_mgmt_sshd_config" offbox-build/root/offbox_mgmt_sshd_config --mode 0600
   incus file push "$MGMT_ASSETS/offbox-ssh-runtime.conf" offbox-build/root/offbox-ssh-runtime.conf --mode 0644
