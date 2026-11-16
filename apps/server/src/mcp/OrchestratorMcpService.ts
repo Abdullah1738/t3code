@@ -2107,7 +2107,7 @@ const make = Effect.gen(function* () {
           case "rejected":
             foundBy = "receipt";
             notFoundReason = "rejected";
-            detail = " This delegation was rejected.";
+            detail = ` This delegation was rejected: ${state.error ?? "No reason was recorded."}`;
             break;
           case "pending":
             if (!callerOwned) {
