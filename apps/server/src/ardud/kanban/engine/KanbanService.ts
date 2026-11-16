@@ -19365,7 +19365,15 @@ const make = Effect.gen(function* () {
               "skipping a gated step needs a reason of 10 to 300 characters in note",
             );
           }
-          const check = Subtasks.checkMark(card, subtaskId, state, role, note, scriptName);
+          const check = Subtasks.checkMark(
+            card,
+            subtaskId,
+            state,
+            role,
+            note,
+            scriptName,
+            releaseAt !== undefined,
+          );
           if (!check.ok) return yield* failWith("denied", check.reason, check.denyReason);
           if (actor._tag !== "owner" && missing && !skipGate)
             return yield* failWith("denied", missing, "approval_required");
@@ -19436,6 +19444,39 @@ const make = Effect.gen(function* () {
               },
             );
           }
+          const previousLedger = board.releaseLedger ?? [];
+          const releaseLedger = gated?.interrupting
+            ? previousLedger.filter(
+                (entry) =>
+                  entry.boardId !== board.id ||
+                  entry.cardId !== card.id ||
+                  entry.subtaskId !== subtaskId,
+              )
+            : previousLedger;
+          const releaseBoard =
+            gated?.interrupting && state === "done"
+              ? {
+                  ...board,
+                  releaseLedger: [
+                    ...releaseLedger,
+                    {
+                      boardId: board.id,
+                      cardId: card.id,
+                      cardNumber: card.number,
+                      subtaskId,
+                      at: releaseAt ?? at,
+                      ...(gated.service === undefined ? {} : { service: gated.service }),
+                      ...(releaseAt === undefined ? {} : { postHoc: true }),
+                      critical: Subtasks.criticalReleaseReason(note),
+                      approvalId: cleared?.id ?? null,
+                    },
+                  ]
+                    .toSorted((a, b) => a.at.localeCompare(b.at))
+                    .slice(-200),
+                }
+              : releaseLedger.length !== previousLedger.length
+                ? { ...board, releaseLedger }
+                : undefined;
           if (
             state !== "open" &&
             gated?.owner === "review" &&
@@ -19445,7 +19486,7 @@ const make = Effect.gen(function* () {
             kanbanReviewAlreadyDone(marked)
           ) {
             analyticsActors.set(marked, actor);
-            yield* saveCard(marked);
+            yield* saveCard(marked, undefined, false, undefined, releaseBoard);
             const synced = yield* syncPrs(marked);
             const evidence = yield* reviewEvidence(board, synced);
             // Ticking the review explicitly answers a pending review request, but
@@ -19498,28 +19539,6 @@ const make = Effect.gen(function* () {
           }
           analyticsActors.set(next, actor);
           // The actor goes with the save: a card a script's subtask moved is a move by that script.
-          const releaseBoard =
-            gated?.interrupting && state === "done"
-              ? {
-                  ...board,
-                  releaseLedger: [
-                    ...(board.releaseLedger ?? []),
-                    {
-                      boardId: board.id,
-                      cardId: card.id,
-                      cardNumber: card.number,
-                      subtaskId,
-                      at: releaseAt ?? at,
-                      ...(gated.service === undefined ? {} : { service: gated.service }),
-                      ...(releaseAt === undefined ? {} : { postHoc: true }),
-                      critical: Subtasks.criticalReleaseReason(note),
-                      approvalId: cleared?.id ?? null,
-                    },
-                  ]
-                    .toSorted((a, b) => a.at.localeCompare(b.at))
-                    .slice(-200),
-                }
-              : undefined;
           yield* saveCard(
             next,
             to !== null && card.stage !== to ? actor : undefined,

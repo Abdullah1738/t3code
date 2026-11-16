@@ -9196,6 +9196,7 @@ it.effect(
         .markSubtask(second.id, "s1", "done", "Installed", actor, "evaluator")
         .pipe(Effect.flip);
       assert.include(denied.detail, "inside the 4 h release window");
+      assert.include(denied.detail, `releasedAt: "${firstAt}"`);
       assert.include(denied.detail, `last release #${first.number}`);
       assert.include(denied.detail, "next window");
       assert.lengthOf((yield* kanban.snapshot(board.id)).board.releaseLedger!, 1);
@@ -9374,7 +9375,10 @@ it.effect("post-hoc ticks keep restart time, ledger ordering and the original wi
     };
     yield* store.putBoard({
       ...(yield* kanban.snapshot(board.id)).board,
-      releaseLedger: [row, { ...row, at: iso(4), service: "telegram-bridge" }],
+      releaseLedger: [
+        { ...row, subtaskId: "s2" },
+        { ...row, subtaskId: "s3", at: iso(4), service: "telegram-bridge" },
+      ],
     });
     yield* TestClock.adjust("5 hours");
     const done = yield* call(evaluator, "subtask_done", {
@@ -9413,6 +9417,245 @@ it.effect("post-hoc ticks keep restart time, ledger ordering and the original wi
     assert.include(refused.detail, `next window ${iso(6).slice(11, 16)}Z`);
     yield* TestClock.adjust("1 hour");
     yield* kanban.markSubtask(next.id, "s1", "done", null, actor, "evaluator");
+  }).pipe(Effect.provide(fakeThreads().layer)),
+);
+
+it.effect(
+  "replays Watchers #83 ledger correction before #78 bookkeeping and the 16:40 release",
+  () =>
+    Effect.gen(function* () {
+      yield* TestClock.adjust(
+        Date.parse("2026-11-16T12:00:00Z") - (yield* Clock.currentTimeMillis),
+      );
+      const { kanban, store, board, actor, evaluator, create } = yield* releaseFixture;
+      const make = (number: number, subtaskId: string) =>
+        Effect.gen(function* () {
+          const card = yield* create({ interrupting: true, service: "robob-watch" });
+          const saved = {
+            ...card,
+            number,
+            subtasks: card.subtasks.map((entry) => ({ ...entry, id: subtaskId })),
+          };
+          yield* store.putCard(saved);
+          return saved;
+        });
+      const release = yield* make(83, "s3");
+      const bookkeeping = yield* make(78, "s5");
+      const next = yield* create({ interrupting: true, service: "robob-watch" });
+      yield* TestClock.adjust((4 * 60 + 29) * 60_000);
+      const tick = (card: string, subtask: string, state: "done" | "open", releasedAt?: string) =>
+        call(evaluator, "subtask_done", {
+          card,
+          subtask,
+          state,
+          ...(releasedAt ? { releasedAt } : {}),
+        });
+      const wrong = yield* tick(release.id, "s3", "done");
+      assert.isFalse(wrong.isError, wrong.text);
+      assert.strictEqual(
+        (yield* kanban.snapshot(board.id)).board.releaseLedger![0]!.at,
+        "2026-11-16T16:29:00.000Z",
+      );
+      const refused = yield* tick(bookkeeping.id, "s5", "done");
+      assert.isTrue(refused.isError);
+      const refusal = yield* decodeToolFailure(refused.text);
+      assert.include(refusal.message, "last robob-watch release #83 at 16:29Z, next window 20:29Z");
+      assert.include(refusal.message, 'releasedAt: "2026-11-16T16:29:00.000Z"');
+      const reopened = yield* tick(release.id, "s3", "open");
+      assert.isFalse(reopened.isError, reopened.text);
+      assert.lengthOf((yield* kanban.snapshot(board.id)).board.releaseLedger!, 0);
+      const restartedAt = "2026-11-16T12:28:16Z";
+      const corrected = yield* tick(release.id, "s3", "done", restartedAt);
+      assert.isFalse(corrected.isError, corrected.text);
+      const ledger = (yield* kanban.snapshot(board.id)).board.releaseLedger!;
+      assert.lengthOf(ledger, 1);
+      assert.deepStrictEqual(ledger[0], {
+        boardId: board.id,
+        cardId: release.id,
+        cardNumber: 83,
+        subtaskId: "s3",
+        at: "2026-11-16T12:28:16.000Z",
+        service: "robob-watch",
+        postHoc: true,
+        critical: null,
+        approvalId: "sa-pacing",
+      });
+      const recorded = yield* tick(bookkeeping.id, "s5", "done", restartedAt);
+      assert.isFalse(recorded.isError, recorded.text);
+      yield* TestClock.adjust("11 minutes");
+      yield* kanban.markSubtask(next.id, "s1", "done", null, actor, "evaluator");
+      const finalLedger = (yield* kanban.snapshot(board.id)).board.releaseLedger!;
+      assert.lengthOf(finalLedger, 3);
+      assert.strictEqual(finalLedger[2]!.at, "2026-11-16T16:40:00.000Z");
+      assert.isUndefined(finalLedger[2]!.postHoc);
+    }).pipe(Effect.provide(fakeThreads().layer)),
+);
+
+it.effect("replays Recall #101 bookkeeping for #144 using the refusal's releasedAt value", () =>
+  Effect.gen(function* () {
+    yield* TestClock.adjust(Date.parse("2026-11-16T19:00:00Z") - (yield* Clock.currentTimeMillis));
+    const { kanban, store, board, actor, evaluator, create } = yield* releaseFixture;
+    const card = yield* create({ interrupting: true, service: "recall" });
+    const bookkeeping = {
+      ...card,
+      number: 101,
+      subtasks: card.subtasks.map((entry) => ({ ...entry, id: "s5" })),
+    };
+    yield* store.putCard(bookkeeping);
+    const releasedAt = "2026-11-16T19:37:00.000Z";
+    const row = {
+      boardId: board.id,
+      cardId: KanbanCardId.make("recall-release-144"),
+      cardNumber: 144,
+      subtaskId: "s3",
+      at: releasedAt,
+      service: "recall",
+      critical: null,
+      approvalId: "sa-pacing",
+    };
+    yield* store.putBoard({ ...(yield* kanban.snapshot(board.id)).board, releaseLedger: [row] });
+    yield* TestClock.adjust("48 minutes");
+    const refused = yield* call(evaluator, "subtask_done", {
+      card: card.id,
+      subtask: "s5",
+      state: "done",
+    });
+    assert.isTrue(refused.isError);
+    const refusal = yield* decodeToolFailure(refused.text);
+    assert.include(refusal.message, "last recall release #144 at 19:37Z, next window 23:37Z");
+    assert.include(
+      refusal.message,
+      `if this step records release #144 that already happened, tick it with releasedAt: "${releasedAt}" (or the real restart time)`,
+    );
+    const recorded = yield* call(evaluator, "subtask_done", {
+      card: card.id,
+      subtask: "s5",
+      state: "done",
+      releasedAt,
+    });
+    assert.isFalse(recorded.isError, recorded.text);
+    const ledger = (yield* kanban.snapshot(board.id)).board.releaseLedger!;
+    assert.deepStrictEqual(ledger, [
+      row,
+      {
+        ...row,
+        cardId: card.id,
+        cardNumber: 101,
+        subtaskId: "s5",
+        postHoc: true,
+      },
+    ]);
+    yield* TestClock.adjust((3 * 60 + 50) * 60_000);
+    const next = yield* create({ interrupting: true, service: "recall" });
+    yield* kanban.markSubtask(next.id, "s1", "done", null, actor, "evaluator");
+    const finalLedger = (yield* kanban.snapshot(board.id)).board.releaseLedger!;
+    assert.lengthOf(finalLedger, 3);
+    assert.strictEqual(finalLedger[2]!.at, "2026-11-16T23:38:00.000Z");
+    assert.isUndefined(finalLedger[2]!.postHoc);
+  }).pipe(Effect.provide(fakeThreads().layer)),
+);
+
+it.effect(
+  "re-ticking done with releasedAt replaces only the matching board/card/subtask receipt",
+  () =>
+    Effect.gen(function* () {
+      const { kanban, store, board, actor, evaluator, create } = yield* releaseFixture;
+      const card = yield* create({ interrupting: true, service: "robob-watch" });
+      yield* kanban.markSubtask(card.id, "s1", "done", null, actor, "evaluator");
+      const saved = (yield* kanban.snapshot(board.id)).board;
+      const row = saved.releaseLedger![0]!;
+      const unrelated = [
+        { ...row, boardId: KanbanBoardId.make("other-board") },
+        { ...row, cardId: KanbanCardId.make("other-card") },
+        { ...row, subtaskId: "s2" },
+      ];
+      yield* store.putBoard({ ...saved, releaseLedger: [row, ...unrelated, row] });
+      yield* TestClock.adjust("1 hour");
+      const at = DateTime.formatIso(yield* DateTime.now);
+      const corrected = yield* call(evaluator, "subtask_done", {
+        card: card.id,
+        subtask: "s1",
+        state: "done",
+        releasedAt: at,
+      });
+      assert.isFalse(corrected.isError, corrected.text);
+      const ledger = (yield* kanban.snapshot(board.id)).board.releaseLedger!;
+      assert.deepStrictEqual(ledger, [...unrelated, { ...row, at, postHoc: true }]);
+      const duplicate = yield* call(evaluator, "subtask_done", {
+        card: card.id,
+        subtask: "s1",
+        state: "done",
+      });
+      assert.isTrue(duplicate.isError);
+      assert.include(duplicate.text, "already done");
+    }).pipe(Effect.provide(fakeThreads().layer)),
+);
+
+it.effect.each(["open", "skipped"] as const)(
+  "setting an interrupting release %s removes its receipt atomically",
+  (state) => {
+    const fake = fakeThreads();
+    return Effect.gen(function* () {
+      const { kanban, board, actor, create } = yield* releaseFixture;
+      const card = yield* create({ interrupting: true, service: "robob-watch" });
+      yield* kanban.markSubtask(card.id, "s1", "done", null, actor, "evaluator");
+      const ledger = (yield* kanban.snapshot(board.id)).board.releaseLedger!;
+      fake.storeControl.beforeCardWrite = () =>
+        Effect.fail(
+          new KanbanStore.KanbanStoreError({ operation: "write card", cause: "unavailable" }),
+        );
+      const failed = yield* kanban
+        .markSubtask(card.id, "s1", state, "Release recorded incorrectly", actor, "evaluator")
+        .pipe(Effect.result);
+      assert.isTrue(Result.isFailure(failed));
+      assert.strictEqual((yield* kanban.card(card.id)).card.subtasks[0]!.state, "done");
+      assert.deepStrictEqual((yield* kanban.snapshot(board.id)).board.releaseLedger, ledger);
+      delete fake.storeControl.beforeCardWrite;
+      yield* kanban.markSubtask(
+        card.id,
+        "s1",
+        state,
+        "Release recorded incorrectly",
+        actor,
+        "evaluator",
+      );
+      assert.strictEqual((yield* kanban.card(card.id)).card.subtasks[0]!.state, state);
+      assert.lengthOf((yield* kanban.snapshot(board.id)).board.releaseLedger!, 0);
+    }).pipe(Effect.provide(fake.layer));
+  },
+);
+
+it.effect("reopening a non-interrupting subtask leaves even a matching ledger row untouched", () =>
+  Effect.gen(function* () {
+    const { kanban, store, board, actor, create } = yield* releaseFixture;
+    const card = yield* create({ interrupting: false });
+    yield* kanban.markSubtask(card.id, "s1", "done", null, actor, "evaluator");
+    const saved = (yield* kanban.snapshot(board.id)).board;
+    const ledger = [
+      {
+        boardId: board.id,
+        cardId: card.id,
+        cardNumber: card.number,
+        subtaskId: "s1",
+        at: card.createdAt,
+        service: "robob-watch",
+        critical: null,
+        approvalId: "sa-pacing",
+      },
+    ];
+    yield* store.putBoard({ ...saved, releaseLedger: ledger });
+    yield* kanban.markSubtask(card.id, "s1", "open", null, actor, "evaluator");
+    assert.deepStrictEqual((yield* kanban.snapshot(board.id)).board.releaseLedger, ledger);
+    const missing = yield* create({ interrupting: true });
+    yield* kanban.markSubtask(
+      missing.id,
+      "s1",
+      "skipped",
+      "No release was needed",
+      actor,
+      "evaluator",
+    );
+    assert.deepStrictEqual((yield* kanban.snapshot(board.id)).board.releaseLedger, ledger);
   }).pipe(Effect.provide(fakeThreads().layer)),
 );
 
@@ -9850,7 +10093,7 @@ it.effect("release receipt rolls back if completion fails, and retains only the 
       boardId: board.id,
       cardId: card.id,
       cardNumber: index + 1,
-      subtaskId: "s1",
+      subtaskId: `s${index + 2}`,
       at,
       critical: null,
       approvalId: "sa-pacing",
