@@ -3895,10 +3895,12 @@ const make = Effect.gen(function* () {
           Effect.forEach(
             [...messageIdsByThread],
             ([threadId, messageIds]) =>
-              threadManagement.getThreadRecords(threadId, ["messages"], { messageIds }).pipe(
-                Effect.map((records) => [threadId, records.messages] as const),
-                Effect.mapError(threadManagementFailure),
-              ),
+              threadManagement
+                .getThreadRecords(threadId, ["messages"], { messageIds, messageOrder: "unordered" })
+                .pipe(
+                  Effect.map((records) => [threadId, records.messages] as const),
+                  Effect.mapError(threadManagementFailure),
+                ),
             { concurrency: 1 },
           ),
         );
