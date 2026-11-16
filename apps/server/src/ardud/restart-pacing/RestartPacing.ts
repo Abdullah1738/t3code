@@ -197,7 +197,10 @@ const make = Effect.gen(function* () {
   ) => {
     for (const [index, entry] of queue.entries()) {
       if (now >= noProgressDeadline(entry)) continue;
-      if (index + 1 < entry.bestPosition) {
+      if (entry.bestPosition === Infinity) {
+        // Establishing the queue baseline is not an improvement in position.
+        entry.bestPosition = index + 1;
+      } else if (index + 1 < entry.bestPosition) {
         entry.bestPosition = index + 1;
         entry.positionImprovedAt = now;
       }
@@ -209,8 +212,9 @@ const make = Effect.gen(function* () {
   const queueChanged = Effect.gen(function* () {
     const now = yield* Clock.currentTimeMillis;
     const queue = orderedQueue(now, pass?.loaded ?? false);
-    observeProgress(queue, now);
     if (pass !== undefined) {
+      // Startup registers the whole batch before the first admission pass.
+      observeProgress(queue, now);
       const head = queue[0];
       const full = active.size >= pass.config.maxActive;
       for (const entry of queue) if (entry !== head || full) delete entry.readyAt;

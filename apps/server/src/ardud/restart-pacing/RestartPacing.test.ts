@@ -1182,6 +1182,68 @@ it.effect("a deep load-held queue keeps a progressing source alive beyond 30 min
   );
 });
 
+it.effect.each([
+  { registrationIndex: 0, firstAcquire: "waiter" },
+  { registrationIndex: 19, firstAcquire: "waiter" },
+  { registrationIndex: 39, firstAcquire: "waiter" },
+  { registrationIndex: 0, firstAcquire: "head" },
+  { registrationIndex: 19, firstAcquire: "head" },
+  { registrationIndex: 39, firstAcquire: "head" },
+] as const)(
+  "a startup waiter registered at $registrationIndex survives draining after $firstAcquire acquires first",
+  ({ registrationIndex, firstAcquire }) => {
+    const h = harness({ maxActive: 4, spacingMs: 0 });
+    h.setLoad(2);
+    return Effect.gen(function* () {
+      const pacing = yield* RestartPacing.RestartPacing;
+      const waiter = source(100);
+      const ahead = Array.from({ length: 39 }, (_, index) => source(index + 1));
+      for (const entry of ahead) h.priorities.set(entry.sourceRunId, 2);
+      const registrationOrder = [...ahead];
+      registrationOrder.splice(registrationIndex, 0, waiter);
+      for (const entry of registrationOrder) yield* pacing.register(entry);
+      if (firstAcquire === "head") assert.isAbove(yield* pacing.acquire(ahead[0]!), 0);
+      assert.isAbove(yield* pacing.acquire(waiter), 0);
+      assert.equal(h.positions.at(-1)?.position, 40);
+      for (let index = 0; index < ahead.length; index++) {
+        yield* TestClock.adjust((index + 1) * 90_000 - (yield* Clock.currentTimeMillis));
+        h.setLoad(0);
+        assert.equal(yield* pacing.acquire(ahead[index]!), 0);
+        yield* pacing.dispatched(ahead[index]!);
+        if (index === ahead.length - 1) break;
+        assert.isAbove(yield* pacing.acquire(waiter), 0);
+        h.setLoad(2);
+        yield* TestClock.adjust(10_000);
+        assert.isAbove(yield* pacing.acquire(waiter), 0);
+      }
+      assert.equal(yield* Clock.currentTimeMillis, 58.5 * 60_000);
+      assert.equal(yield* pacing.acquire(waiter), 0);
+    }).pipe(Effect.provide(h.layer));
+  },
+);
+
+it.effect("a delayed first admission pass cannot reset the position progress window", () => {
+  const h = harness({ maxActive: 4, spacingMs: 0 });
+  h.setLoad(2);
+  return Effect.gen(function* () {
+    const pacing = yield* RestartPacing.RestartPacing;
+    const waiter = source(100);
+    yield* pacing.register(waiter);
+    yield* TestClock.adjust("25 minutes");
+    assert.isAbove(yield* pacing.acquire(waiter), 0);
+    yield* TestClock.adjust("4 minutes");
+    const newcomer = source(1);
+    h.priorities.set(newcomer.sourceRunId, 0);
+    h.setLoad(0);
+    assert.equal(yield* pacing.acquire(newcomer), 0);
+    yield* pacing.dispatched(newcomer);
+    yield* TestClock.adjust("1 minute");
+    const failure = yield* pacing.acquire(waiter).pipe(Effect.flip);
+    assert.instanceOf(failure, RestartPacing.RestartAdmissionTimeoutError);
+    assert.equal(DateTime.toEpochMillis(failure.deadline), 30 * 60_000);
+  }).pipe(Effect.provide(h.layer));
+});
+
 it.effect("the absolute backstop expires a source even while both progress clocks advance", () => {
   const h = harness({ maxActive: 4, spacingMs: 0 });
   h.setLoad(2);
