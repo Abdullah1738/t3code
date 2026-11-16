@@ -14,6 +14,7 @@ import {
   threadPullRequestKeyOf,
   visibleThreadPullRequests,
 } from "@t3tools/shared/threadPullRequests";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -39,8 +40,10 @@ import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import {
   evaluatePullRequestWatch,
+  isMissingTool,
   pullRequestChecksSettling,
   pullRequestWatchMessage,
+  pullRequestWatchStopMessage,
 } from "./pullRequestWatch.ts";
 
 /**
@@ -204,6 +207,7 @@ export const make = Effect.gen(function* () {
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const pullRequests = yield* PullRequestService.PullRequestService;
   const crypto = yield* Crypto.Crypto;
+  const serverEnv = yield* HostProcess.Environment;
   const bootedAt = yield* Clock.currentTimeMillis;
   const lives = new Map<string, WatchLife>();
   const settlingReads = new Map<
@@ -259,6 +263,11 @@ export const make = Effect.gen(function* () {
 
   const readFailures = new Map<string, number>();
   const unavailableReads = new Map<string, number>();
+  const missingToolFailures = new Map<
+    string,
+    { attempts: number; nextAt: number; watches: string }
+  >();
+  const watchSet = (group: WatchGroup) => group.targets.map(watchKey).toSorted().join("\n");
   const lastReads = new Map<string, LastRead>();
   const threadTails = new Map<
     string,
@@ -327,14 +336,13 @@ export const make = Effect.gen(function* () {
       providerDetail: providerError?.detail ?? null,
     };
     yield* record(target, null, {
-      text: `T3 Code stopped watching pull request #${target.link.number} (${target.link.url}) after ${failures} consecutive unsuccessful ${failures === 1 ? "read" : "reads"}.${reason ? ` ${reason}` : ""}${Option.match(
-        error,
-        {
-          onNone: () => "",
-          onSome: (failure) =>
-            ` Last error: ${failure.message}${failure._tag === "PullRequestUnavailableError" ? ` (${failure.reason})` : ""}`,
-        },
-      )} Check it yourself, and call watch_pull_request to watch it again.`,
+      text: pullRequestWatchStopMessage(
+        target.link,
+        failures,
+        failure,
+        reason,
+        failure !== undefined && isMissingTool(failure) ? serverEnv.PATH : undefined,
+      ),
       notification: {
         source: { kind: "monitor" },
         outcome: "failed",
@@ -513,6 +521,23 @@ export const make = Effect.gen(function* () {
   ) {
     const failures = (readFailures.get(group.key) ?? 0) + 1;
     readFailures.set(group.key, failures);
+    const missingTool = Option.isSome(error) && isMissingTool(error.value);
+    if (missingTool) {
+      const previous = missingToolFailures.get(group.key);
+      const attempts = (previous?.watches === watchSet(group) ? previous.attempts : 0) + 1;
+      missingToolFailures.set(group.key, {
+        attempts,
+        nextAt: (yield* Clock.currentTimeMillis) + 60_000 * 2 ** (attempts - 1),
+        watches: watchSet(group),
+      });
+      yield* Effect.logWarning("pull request watch missing tool", {
+        pullRequest: group.key,
+        attempts,
+        path: serverEnv.PATH ?? "",
+      });
+    } else {
+      missingToolFailures.delete(group.key);
+    }
     if (reason !== undefined) {
       yield* Effect.logInfo("pull request watch evaluation delayed", {
         pullRequest: group.key,
@@ -524,11 +549,17 @@ export const make = Effect.gen(function* () {
     const unavailable = Option.isSome(error) && error.value._tag === "PullRequestUnavailableError";
     const consecutiveUnavailable = unavailable ? (unavailableReads.get(group.key) ?? 0) + 1 : 0;
     unavailableReads.set(group.key, consecutiveUnavailable);
-    if (failures < READ_FAILURE_LIMIT && consecutiveUnavailable < UNAVAILABLE_FAILURE_LIMIT)
+    const missingToolAttempts = missingToolFailures.get(group.key)?.attempts ?? 0;
+    if (
+      failures < READ_FAILURE_LIMIT &&
+      consecutiveUnavailable < UNAVAILABLE_FAILURE_LIMIT &&
+      missingToolAttempts < UNAVAILABLE_FAILURE_LIMIT
+    )
       return false;
     if (yield* eachTarget(group, (target) => giveUp(target, failures, error, reason))) {
       readFailures.delete(group.key);
       unavailableReads.delete(group.key);
+      missingToolFailures.delete(group.key);
     }
     return true;
   });
@@ -603,6 +634,7 @@ export const make = Effect.gen(function* () {
     if (detail.state !== "open") {
       readFailures.delete(group.key);
       unavailableReads.delete(group.key);
+      missingToolFailures.delete(group.key);
       lastReads.delete(group.key);
       return yield* eachTarget(group, (target) =>
         detail.state === "closed"
@@ -613,6 +645,7 @@ export const make = Effect.gen(function* () {
 
     readFailures.delete(group.key);
     unavailableReads.delete(group.key);
+    missingToolFailures.delete(group.key);
     const settling = pullRequestChecksSettling(detail);
     const observedHead = detail.headBranchSha ?? detail.checksHeadSha ?? headSha;
     const previous = settlingReads.get(group.key);
@@ -733,12 +766,30 @@ export const make = Effect.gen(function* () {
       const key = `${target.thread.projectId} ${threadPullRequestKeyOf(target.link)}`;
       byPullRequest.set(key, [...(byPullRequest.get(key) ?? []), target]);
     }
-    const groups = [...byPullRequest].map(([key, members]): WatchGroup => ({
-      key,
-      targets: members,
-      fingerprint: [...new Set(members.map(snapshotFingerprint))].toSorted().join("\n"),
-    }));
-    for (const cache of [readFailures, unavailableReads, lastReads, threadTails, settlingReads]) {
+    const now = yield* Clock.currentTimeMillis;
+    const groups = [...byPullRequest]
+      .map(([key, members]): WatchGroup => ({
+        key,
+        targets: members,
+        fingerprint: [...new Set(members.map(snapshotFingerprint))].toSorted().join("\n"),
+      }))
+      .filter((group) => {
+        const retry = missingToolFailures.get(group.key);
+        if (retry && retry.watches !== watchSet(group)) {
+          missingToolFailures.delete(group.key);
+          readFailures.delete(group.key);
+          unavailableReads.delete(group.key);
+        }
+        return retry === undefined || retry.watches !== watchSet(group) || now >= retry.nextAt;
+      });
+    for (const cache of [
+      readFailures,
+      unavailableReads,
+      missingToolFailures,
+      lastReads,
+      threadTails,
+      settlingReads,
+    ]) {
       for (const key of cache.keys()) if (!byPullRequest.has(key)) cache.delete(key);
     }
     yield* Effect.forEach(

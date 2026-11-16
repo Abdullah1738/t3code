@@ -271,5 +271,8 @@ request's hold, every device command is refused, including reads.
 - `ph lease status` shows the claim. Without a lease or hold, actions may
   interleave with another agent's. Exit 5 means yield: never retry in a loop,
   copy another holder's token, or delete another task's lease or hold.
+A forward created before a lease was taken keeps working; inspect it with `adb forward --list`.
+The holder can remove it with `adb forward --remove <local>`; forwards are never removed automatically.
+
 - Proxy gotcha: deleting `http_proxy` (reads null) can leave a cached dead proxy (127.0.0.1:18089) so apps show "no internet". Clear explicitly with `adb shell settings put global http_proxy :0` and leave it at `:0`.
 - Phone serial 002473611000997 (always pass -s). Local emulators are blocked since 2026-10-09 (Run Cloud via the `run-cloud` skill instead), so this phone should be the only adb device.

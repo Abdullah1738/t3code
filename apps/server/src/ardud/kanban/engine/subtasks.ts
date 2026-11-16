@@ -943,6 +943,7 @@ export interface SubtaskInput {
   readonly service?: string | null | undefined;
   /** For a script's subtask: the name of the board script that does it. Absent: any script on the card's board. */
   readonly script?: string | undefined;
+  readonly holdsDependents?: boolean | undefined;
 }
 
 /**
@@ -1163,7 +1164,7 @@ export function planSubtasks(
         step = known.step;
         continue;
       }
-      // An id alone also preserves script bindings and approval timestamps.
+      // An id or hold-only patch preserves script bindings and approval timestamps.
       if (
         known.state !== "open" ||
         (input.text === undefined &&
@@ -1176,7 +1177,18 @@ export function planSubtasks(
           input.service === undefined &&
           input.script === undefined)
       ) {
-        planned.push(known);
+        if (known.state === "open" && input.holdsDependents !== undefined) {
+          if (input.holdsDependents && (known.owner === "work" || known.owner === "review")) {
+            return {
+              ok: false,
+              denyReason: "invalid_args",
+              reason: "a step holding dependents must be owned by the evaluator or a script",
+            };
+          }
+          planned.push({ ...known, holdsDependents: input.holdsDependents });
+        } else {
+          planned.push(known);
+        }
         step = known.step;
         continue;
       }
@@ -1205,6 +1217,14 @@ export function planSubtasks(
         ok: false,
         denyReason: "invalid_args",
         reason: `subtask "${text}" is the worker's; a deploy, money or secret step must be owned by the evaluator or a script`,
+      };
+    }
+    const holdsDependents = input.holdsDependents ?? known?.holdsDependents;
+    if (holdsDependents === true && (owner === "work" || owner === "review")) {
+      return {
+        ok: false,
+        denyReason: "invalid_args",
+        reason: "a step holding dependents must be owned by the evaluator or a script",
       };
     }
     const interrupting = input.interrupting ?? known?.interrupting;
@@ -1300,6 +1320,7 @@ export function planSubtasks(
         ...(gateCleared ? { gateCleared } : {}),
         ...(approvalChanged && gate && !clearing && at ? { createdAt: at } : {}),
         ...(script ? { script } : {}),
+        ...(holdsDependents === undefined ? {} : { holdsDependents }),
       });
     } else {
       nextId += 1;
@@ -1314,6 +1335,7 @@ export function planSubtasks(
         ...(gate === undefined ? {} : { gate, gateSource }),
         ...(at ? { createdAt: at } : {}),
         ...(script ? { script } : {}),
+        ...(input.holdsDependents === undefined ? {} : { holdsDependents: input.holdsDependents }),
         state: "open",
         note: null,
         doneBy: null,
@@ -1574,7 +1596,8 @@ export function subtaskLines(card: Pick<KanbanCard, "subtasks">): string | null 
       subtask.script === undefined
         ? OWNER_NAMES[subtask.owner]
         : `${OWNER_NAMES[subtask.owner]} "${subtask.script}"`;
-    return `- ${subtask.id} step ${subtask.step}, ${owner} (${mark}${note}): ${subtask.text}`;
+    const hold = subtask.holdsDependents === true ? " [holds dependents]" : "";
+    return `- ${subtask.id} step ${subtask.step}, ${owner}${hold} (${mark}${note}): ${subtask.text}`;
   });
   return `Subtasks (same step means any order; a step opens when the ones before are done or skipped):\n${rows.join("\n")}`;
 }

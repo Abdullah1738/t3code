@@ -166,6 +166,7 @@ export interface ThreadManagementSendInput {
   readonly modelSelection?: ModelSelection;
   readonly mode: ThreadManagementSendMode;
   readonly activeTurnOnly?: boolean;
+  readonly delegatedTaskStallRecovery?: OrchestrationV2Run["delegatedTaskStallRecovery"];
   readonly createdBy: OrchestrationV2Actor;
   readonly creationSource: OrchestrationV2CreationSource;
   /** ardud: start the message on a fresh provider thread (context reset). */
@@ -1312,6 +1313,7 @@ const make = Effect.gen(function* () {
           : undefined;
       if (
         input.mode === "restart" &&
+        input.delegatedTaskStallRecovery === undefined &&
         capabilities?.supportsSteeringByInterruptRestart === false &&
         capabilities.supportsInterrupt &&
         capabilities.supportsQueuedMessages
@@ -1359,6 +1361,9 @@ const make = Effect.gen(function* () {
           ...(input.senderThreadId === undefined ? {} : { senderThreadId: input.senderThreadId }),
           text: input.text,
           attachments: input.attachments,
+          ...(input.delegatedTaskStallRecovery === undefined
+            ? {}
+            : { delegatedTaskStallRecovery: input.delegatedTaskStallRecovery }),
           ...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
           dispatchMode,
           createdBy: input.createdBy,

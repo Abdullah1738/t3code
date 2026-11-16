@@ -458,7 +458,10 @@ def codex_config(manifest: dict, codex_home: str, existing_state: dict | None,
                 "wire_api": "responses",
                 "requires_openai_auth": False,
                 "supports_websockets": False,
-                "stream_idle_timeout_ms": 900000,
+                # Leave time for a stream retry before Robob's 15-minute child guard.
+                # CU's measured Terra/max p99 is longer than Codex's Astra/Sol p99.
+                "stream_idle_timeout_ms": 480000 if harness == "codex-cu" else 360000,
+                "stream_max_retries": 1,
                 # For this provider, Codex 0.166 needs a non-empty actor header for image_gen; the fixed placeholder is not a credential and 9router never forwards it upstream.
                 "http_headers": {"x-9router-token-saver": "off",
                                  "x-openai-actor-authorization": "robob-9router-local"},

@@ -1062,6 +1062,31 @@ describe("planDispatch", () => {
     );
   });
 
+  it("holds dispatch for a guessed or marked landing step until it closes", () => {
+    for (const input of [
+      { text: "Land: rebase, fast-forward and push master" },
+      { text: "Host release via #99, then live read-back", holdsDependents: true },
+    ]) {
+      const step = {
+        id: "s1",
+        step: 4,
+        ...input,
+        owner: "evaluator" as const,
+        state: "open" as const,
+        note: null,
+        doneBy: null,
+        doneAt: null,
+      };
+      const blocker = card({ stage: "completed", subtasks: [step] });
+      const waiter = card({ blockedBy: [blocker.id] });
+      expect(planDispatch(board, [blocker, waiter], pools([[opus, 2]]))).toEqual([]);
+      const landed = { ...blocker, subtasks: [{ ...step, state: "done" as const }] };
+      expect(
+        planDispatch(board, [landed, waiter], pools([[opus, 2]])).map((d) => d.cardId),
+      ).toEqual([waiter.id]);
+    }
+  });
+
   it("counts running cards against their pool and never goes negative", () => {
     const running = card({
       stage: "working",
@@ -1929,6 +1954,14 @@ describe("waitingOnBackground and reviewerQuietDue", () => {
     expect(waitingOnBackground(bg("idle", 1), at(61))).toBe(false);
     expect(waitingOnBackground(bg("idle", 0), at(59))).toBe(false);
     expect(waitingOnBackground(bg("running", 1), at(59))).toBe(false);
+  });
+
+  it("uses the child's activity deadline, then releases a silent child at the ceiling", () => {
+    const active = { ...bg("idle", 1), backgroundWorkUntil: "2026-10-25T01:20:00.000Z" };
+    expect(waitingOnBackground(active, at(65))).toBe(true);
+    expect(waitingOnBackground(active, at(80))).toBe(false);
+    expect(waitingOnBackground({ ...active, backgroundWork: 0 }, at(65))).toBe(false);
+    expect(waitingOnBackground({ ...active, state: "running" }, at(65))).toBe(false);
   });
 
   it("holds an idle thread with a PR watch for six hours only", () => {

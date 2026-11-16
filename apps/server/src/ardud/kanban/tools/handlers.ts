@@ -1,3 +1,4 @@
+import { kanbanReasonClass } from "../../analytics/McpFailureReason.ts";
 import {
   KANBAN_BACKLOG,
   KanbanBoardId,
@@ -108,13 +109,35 @@ const toolFailure = (error: KanbanError) =>
             : error.code === "failed"
               ? "operation_failed"
               : "invalid_args"),
+    reasonClass: error.reasonClass ?? kanbanReasonClass(error.code, error.reason),
+    ...(error.invalidField === undefined ? {} : { invalidField: error.invalidField }),
     message: error.message,
   });
 
 const refuse = (message: string, reason: NonNullable<OrchestratorMcpFailure["reason"]>) =>
-  Effect.fail(new OrchestratorMcpFailure({ reason, code: "capability_denied", message }));
-const invalid = (message: string, reason: NonNullable<OrchestratorMcpFailure["reason"]>) =>
-  Effect.fail(new OrchestratorMcpFailure({ reason, code: "invalid_request", message }));
+  Effect.fail(
+    new OrchestratorMcpFailure({
+      reason,
+      reasonClass: kanbanReasonClass("denied", reason),
+      code: "capability_denied",
+      message,
+    }),
+  );
+const invalid = (
+  message: string,
+  reason: NonNullable<OrchestratorMcpFailure["reason"]>,
+  reasonClass: NonNullable<OrchestratorMcpFailure["reasonClass"]> = "other",
+  invalidField?: string,
+) =>
+  Effect.fail(
+    new OrchestratorMcpFailure({
+      reason,
+      reasonClass,
+      ...(invalidField === undefined ? {} : { invalidField }),
+      code: "invalid_request",
+      message,
+    }),
+  );
 
 /** The calling thread and its board link (null for threads the board did not start). */
 interface Caller {
@@ -251,7 +274,12 @@ const boardFor = Effect.fn("KanbanTools.boardFor")(function* (
       Effect.catchTags({
         KanbanError: (error) =>
           error.detail.startsWith("Pass boardId:")
-            ? invalid(`${missingBoard} ${error.detail}`, "board_required")
+            ? invalid(
+                `${missingBoard} ${error.detail}`,
+                "board_required",
+                "missing_required",
+                "boardId",
+              )
             : Effect.fail(error),
       }),
     );
@@ -290,14 +318,24 @@ const defaultCard = Effect.fn("KanbanTools.defaultCard")(function* (
     }
     if (cards.length > 1)
       return yield* invalid(`Pass card: this thread has ${numbers(cards)}.`, "invalid_args");
-    return yield* invalid("Pass card: this thread has no card of its own.", "invalid_args");
+    return yield* invalid(
+      "Pass card: this thread has no card of its own.",
+      "invalid_args",
+      "missing_required",
+      "card",
+    );
   }
   if (caller.link?.cardId) {
     const card = (yield* service.card(caller.link.cardId)).card;
     yield* resolvedContext(card);
     return card;
   }
-  return yield* invalid("Pass card: this thread has no card of its own.", "invalid_args");
+  return yield* invalid(
+    "Pass card: this thread has no card of its own.",
+    "invalid_args",
+    "missing_required",
+    "card",
+  );
 });
 
 /** A card id ("card-...") or number ("#12"/"12"); defaults to the caller's own card. */
@@ -325,7 +363,13 @@ const cardFor = Effect.fn("KanbanTools.cardFor")(function* (
       }),
     );
     const card = yield* service.cardByNumber(board.id, number);
-    if (!card) return yield* invalid(`No card #${number} on ${board.name}.`, "invalid_args");
+    if (!card)
+      return yield* invalid(
+        `No card #${number} on ${board.name}.`,
+        "invalid_args",
+        "not_found",
+        "card",
+      );
     if (captureContext) yield* resolvedContext(card);
     return card;
   }
@@ -545,7 +589,13 @@ const handlers = {
             undefined,
             yield* Clock.currentTimeMillis,
           );
-          if (typeof window === "string") return yield* invalid(window, "invalid_args");
+          if (typeof window === "string")
+            return yield* invalid(
+              window,
+              "invalid_args",
+              "bad_time",
+              window.startsWith("until") ? "until" : "since",
+            );
           const read = yield* service.activity(board.id, window);
           const byCard = Activity.groupEvents(read.events);
           const rows = Activity.activeCards(read.cards, byCard, window).map((card) =>
@@ -597,7 +647,13 @@ const handlers = {
           input.until,
           yield* Clock.currentTimeMillis,
         );
-        if (typeof window === "string") return yield* invalid(window, "invalid_args");
+        if (typeof window === "string")
+          return yield* invalid(
+            window,
+            "invalid_args",
+            "bad_time",
+            window.startsWith("until") ? "until" : "since",
+          );
         const read = yield* service.activity(board.id, window);
         return { activity: { boardId: board.id, ...Activity.rollup({ window, ...read }) } };
       }),
@@ -956,7 +1012,12 @@ const handlers = {
         // Naming a script is enough to say what kind of wait it is.
         const on = input.on ?? (input.script === undefined ? undefined : "script");
         if (on === undefined)
-          return yield* invalid("Pass on (what the card waits on) or clear.", "invalid_args");
+          return yield* invalid(
+            "Pass on (what the card waits on) or clear.",
+            "invalid_args",
+            "missing_required",
+            "on",
+          );
         if (input.script !== undefined && on !== "script") {
           return yield* invalid(
             `script goes with on: script. ${on} is one of the board's own checks, and a script can't stand in for it.`,
@@ -1024,7 +1085,12 @@ const handlers = {
         if (problem) return yield* invalid(problem, "invalid_args");
         const findings = (input.findings ?? []).map((line) => line.trim()).filter(Boolean);
         if (input.verdict === "findings" && findings.length === 0) {
-          return yield* invalid("A findings verdict needs at least one finding.", "invalid_args");
+          return yield* invalid(
+            "A findings verdict needs at least one finding.",
+            "invalid_args",
+            "missing_required",
+            "findings",
+          );
         }
         return yield* service.reviewResult(
           caller.threadId,
@@ -1045,7 +1111,8 @@ const handlers = {
         ]);
         if (problem) return yield* invalid(problem, "invalid_args");
         const blocks = blocksOf(input);
-        if (blocks.length === 0) return yield* invalid("Pass text or blocks.", "invalid_args");
+        if (blocks.length === 0)
+          return yield* invalid("Pass text or blocks.", "invalid_args", "missing_required", "text");
         const askId = input.ask?.trim();
         if (askId) {
           // A reply on one ask goes to its card's discussion and never closes the ask.
@@ -1138,7 +1205,12 @@ const handlers = {
     withCaller((service, caller) =>
       Effect.gen(function* () {
         if (input.slug !== undefined && input.slugs !== undefined) {
-          return yield* invalid("Pass slug or slugs, not both.", "invalid_args");
+          return yield* invalid(
+            "Pass slug or slugs, not both.",
+            "invalid_args",
+            "conflict",
+            "slug",
+          );
         }
         const board = yield* boardFor(service, caller, input.boardId, true);
         const pages = yield* service.wiki(board.id, {
@@ -1633,16 +1705,38 @@ const handlers = {
     ),
   ),
 
-  report_bug: McpToolAccess.actsAsCaller((input) =>
-    withCaller((service, caller) =>
-      service.reportBug({
-        boardId: input.boardId,
-        title: input.title,
-        evidence: input.evidence,
-        cardHint: input.cardHint,
-        threadId: caller.threadId,
-      }),
-    ),
+  report_bug: McpToolAccess.reportsBug((input, reporter) =>
+    Effect.gen(function* () {
+      yield* SavedWrite.linkReply();
+      const service = yield* KanbanService;
+      if (reporter.unverifiedReason !== undefined) {
+        const observe = yield* SavedWrite.reporterUnverified;
+        observe(reporter.unverifiedReason);
+      }
+      const result = yield* service.agentCall(
+        reporter.threadId,
+        SavedWrite.mutating(
+          service.reportBug({
+            boardId: input.boardId,
+            title: input.title,
+            evidence: input.evidence,
+            cardHint: input.cardHint,
+            threadId: reporter.threadId,
+            callerUnverifiedReason: reporter.unverifiedReason,
+          }),
+        ),
+      );
+      return {
+        ...result,
+        callerVerified: reporter.unverifiedReason === undefined,
+        ...(reporter.unverifiedReason === undefined
+          ? {}
+          : {
+              callerUnverifiedReason: reporter.unverifiedReason,
+              message: `Saved with an unverified caller; reporter unverified (${reporter.unverifiedReason}).`,
+            }),
+      };
+    }).pipe(Effect.catchTags({ KanbanError: (error) => Effect.fail(toolFailure(error)) })),
   ),
 
   evaluator_status: McpToolAccess.readsAsCaller((input) =>

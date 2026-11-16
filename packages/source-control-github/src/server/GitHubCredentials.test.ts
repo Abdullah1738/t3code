@@ -15,6 +15,7 @@ import type * as SourceControlHost from "@t3tools/source-control-core/server/Sou
 import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
 import * as TestSourceControlHost from "@t3tools/source-control-testing/TestSourceControlHost";
 import * as GitHubCredentials from "./GitHubCredentials.ts";
+import { gitHubProviderFailure } from "./GitHubPullRequestProvider.ts";
 
 const TOKEN_VARIABLES = [
   "GH_TOKEN",
@@ -93,6 +94,8 @@ describe("GitHubCredentials", () => {
           process: {
             run: (input) => {
               calls++;
+              if (calls > 1)
+                return Effect.succeed(TestSourceControlHost.processOutput("recovered-token"));
               return Effect.fail(
                 new VcsProcessSpawnError({
                   operation: input.operation,
@@ -122,8 +125,18 @@ describe("GitHubCredentials", () => {
     );
     return Effect.gen(function* () {
       const credentials = yield* GitHubCredentials.GitHubCredentials;
-      expect((yield* Effect.flip(credentials.get("github.com")))._tag).toBe(expected);
-      expect((yield* Effect.flip(credentials.get("github.com")))._tag).toBe(expected);
+      const failure = yield* Effect.flip(credentials.get("github.com"));
+      expect(failure._tag).toBe(expected);
+      expect(gitHubProviderFailure(failure).reason).toBe(
+        expected === "GitHubCliMissingError" ? "missing-tool" : "failed",
+      );
+      if (expected === "GitHubCliFailedError") {
+        expect(Redacted.value((yield* credentials.get("github.com")).token)).toBe(
+          "recovered-token",
+        );
+      } else {
+        expect((yield* Effect.flip(credentials.get("github.com")))._tag).toBe(expected);
+      }
       expect(calls).toBe(expected === "GitHubCliFailedError" ? 2 : 1);
       const flat = messages.flatMap((message) => (Array.isArray(message) ? message : [message]));
       expect(flat).toContain("GitHub credential CLI failed");
@@ -144,6 +157,7 @@ describe("GitHubCredentials", () => {
         }),
       );
       expect(JSON.stringify(flat)).not.toContain("private-token-must-not-be-logged");
+      expect(JSON.stringify(flat)).not.toContain("recovered-token");
     }).pipe(
       Effect.provide(layer),
       Effect.provideService(HostProcess.Environment, { PATH: "/private/bin:/usr/bin" }),

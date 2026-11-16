@@ -5,6 +5,7 @@ import {
   PullRequestReviewGuide,
   PullRequestReviewGuideRun,
   PullRequestState,
+  PullRequestUnavailableError,
   ThreadPullRequestLinkSource,
   TrimmedNonEmptyString,
   ThreadId,
@@ -18,6 +19,7 @@ import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as ProjectService from "../../../project/ProjectService.ts";
 import * as RepositoryIdentityResolver from "../../../project/RepositoryIdentityResolver.ts";
+import * as PullRequestService from "../../../pullRequest/PullRequestService.ts";
 import * as PullRequestReviewGuideService from "../../../pullRequest/PullRequestReviewGuideService.ts";
 
 const dependencies = [
@@ -140,6 +142,19 @@ export class PullRequestWatchFailedError extends Schema.TaggedError<PullRequestW
   }
 }
 
+export class PullRequestWatchUnavailableError extends Schema.TaggedError<PullRequestWatchUnavailableError>()(
+  "PullRequestWatchUnavailableError",
+  { host: Schema.String, cause: PullRequestUnavailableError },
+) {
+  get reason() {
+    return this.cause.reason;
+  }
+
+  override get message(): string {
+    return `T3 Code can't read pull requests on ${this.host} from the server (${this.reason}): ${this.cause.message} The watch was not started; check the PR with your own tools instead.`;
+  }
+}
+
 export class PullRequestWatchTimeoutError extends Schema.TaggedError<PullRequestWatchTimeoutError>()(
   "PullRequestWatchTimeoutError",
   { saved: Schema.Union([Schema.Boolean, Schema.Literal("unknown")]) },
@@ -239,6 +254,7 @@ export const PullRequestToolError = Schema.Union([
   PullRequestUnlinkFailedError,
   PullRequestListFailedError,
   PullRequestWatchFailedError,
+  PullRequestWatchUnavailableError,
   PullRequestWatchTimeoutError,
   PullRequestToolTimeoutError,
   PullRequestNotOpenError,
@@ -368,11 +384,11 @@ const ListThreadPullRequestsTool = Tool.make("list_thread_pull_requests", {
 
 const WatchPullRequestTool = Tool.make("watch_pull_request", {
   description:
-    "Have T3 Code watch an open pull request for this thread, linking it first if needed. Watching an already-watched PR returns immediately without changing the watch; on timeout, check watching with list_thread_pull_requests before retrying, and do not unwatch to recover. T3 Code checks it every two minutes and wakes you with a message when a check fails, all checks on the current head finish without failures (required or not), someone else comments or reviews, or the branch starts to conflict with its base. Use this to monitor or babysit a pull request instead of polling, sleeping, or running a watcher. Only comments posted after the watch started wake you, so handle the existing ones first, then end your turn. A wake is news, not a merge decision: check readiness yourself before merging. While T3 Code watches, the thread stays in the user's Working list, not their inbox. When you hand the work back to the user, call unwatch_pull_request first so the thread returns to their inbox. Watching ends when the pull request merges or closes, when its thread settles or is archived, after 3 consecutive unavailable reads (such as a missing CLI or login) or 8 consecutive unsuccessful reads or evaluations of the current head (including host rate limits or mismatched head revisions), when the user stops this thread, or when you call unwatch_pull_request. Unsettle the thread before starting a new watch. A subagent cannot watch: its parent thread owns the pull request.",
+    "Have T3 Code watch an open pull request for this thread, linking it first if needed. If the server can't read the host, the call fails without starting a watch. Watching an already-watched PR returns immediately without changing the watch; on timeout, check watching with list_thread_pull_requests before retrying, and do not unwatch to recover. T3 Code checks it every two minutes and wakes you with a message when a check fails, all checks on the current head finish without failures (required or not), someone else comments or reviews, or the branch starts to conflict with its base. Use this to monitor or babysit a pull request instead of polling, sleeping, or running a watcher. Only comments posted after the watch started wake you, so handle the existing ones first, then end your turn. A wake is news, not a merge decision: check readiness yourself before merging. While T3 Code watches, the thread stays in the user's Working list, not their inbox. When you hand the work back to the user, call unwatch_pull_request first so the thread returns to their inbox. Watching ends when the pull request merges or closes, when its thread settles or is archived, after 3 consecutive unavailable reads (such as a missing CLI or login) or 8 consecutive unsuccessful reads or evaluations of the current head (including host rate limits or mismatched head revisions), when the user stops this thread, or when you call unwatch_pull_request. Unsettle the thread before starting a new watch. A subagent cannot watch: its parent thread owns the pull request.",
   parameters: PullRequestTargetInput,
   success: WatchPullRequestResult,
   failure: PullRequestToolError,
-  dependencies,
+  dependencies: [...dependencies, PullRequestService.PullRequestService],
 })
   .annotate(Tool.Title, "Watch pull request")
   .annotate(Tool.Readonly, false)

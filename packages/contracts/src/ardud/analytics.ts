@@ -1,3 +1,4 @@
+import { McpReasonClass, McpInvalidField, McpRefusedAt } from "./mcpReasonClass.ts";
 import { McpDenyReason } from "./mcpDenyReason.ts";
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
@@ -173,6 +174,9 @@ const GeneralEvent = Schema.Struct({
   ),
   cardStage: Schema.optionalKey(Label),
   denyReason: Schema.optionalKey(McpDenyReason),
+  reasonClass: Schema.optionalKey(McpReasonClass),
+  invalidField: Schema.optionalKey(McpInvalidField),
+  refusedAt: Schema.optionalKey(McpRefusedAt),
   replyStage: Schema.optionalKey(Label),
   replyPhases: Schema.optionalKey(McpReplyPhases),
   requestTiming: Schema.optionalKey(
@@ -243,18 +247,29 @@ const GeneralEvent = Schema.Struct({
   ),
   props: Schema.optionalKey(
     Schema.Struct({
+      on: Schema.optionalKey(Label),
+      until: Schema.optionalKey(Timestamp),
+      script: Schema.optionalKey(Label),
       number: Schema.optionalKey(Measurement),
       from: Schema.optionalKey(Label),
       to: Schema.optionalKey(Label),
       actor: Schema.optionalKey(
         Schema.Literals(["owner", "thread", "evaluator", "script", "system"]),
       ),
+      seq: Schema.optionalKey(Measurement),
+      target: Schema.optionalKey(Schema.Literals(["live_thread", "steer", "start", "none"])),
       msInPrevStage: Schema.optionalKey(Measurement),
       round: Schema.optionalKey(Measurement),
       chain: Schema.optionalKey(Label),
       verdict: Schema.optionalKey(Schema.Literals(["clear", "feedback"])),
       head: Schema.optionalKey(Schema.String.check(Schema.isPattern(/^[0-9a-f]{7,40}$/))),
-      action: Schema.optionalKey(Schema.Literals(["set", "clear"])),
+      action: Schema.optionalKey(
+        Schema.Literals(["set", "clear", "resumed", "restarted", "failed"]),
+      ),
+      effort: Schema.optionalKey(Label),
+      lastProgressKind: Schema.optionalKey(Label),
+      lastProgressTool: Schema.optionalKey(Label),
+      silentSeconds: Schema.optionalKey(Measurement),
       reasonClass: Schema.optionalKey(Label),
       errorClass: Schema.optionalKey(Label),
       cancelReason: Schema.optionalKey(OrchestrationV2CancelReason),
@@ -313,6 +328,12 @@ const GeneralEvent = Schema.Struct({
       poolKey: Schema.optionalKey(Label),
       key: Schema.optionalKey(Label),
       reason: Schema.optionalKey(Label),
+      effectId: Schema.optionalKey(DerivedId),
+      effectType: Schema.optionalKey(Label),
+      commandType: Schema.optionalKey(Label),
+      failedRunId: Schema.optionalKey(DerivedId),
+      startedRunId: Schema.optionalKey(DerivedId),
+      failureCode: Schema.optionalKey(Label),
       headRunId: Schema.optionalKey(DerivedId),
       headOrdinal: Schema.optionalKey(Measurement),
       queuedCount: Schema.optionalKey(Measurement),
@@ -702,6 +723,8 @@ export const AnalyticsRollup = Schema.Struct({
       failureRate: Measurement,
       outcomes: Schema.Record(Label, Measurement),
       savedCounts: Schema.Record(Label, Measurement),
+      reasonClasses: Schema.Record(Label, Measurement),
+      invalidFields: Schema.Record(Label, Measurement),
       notFoundReasons: Schema.optionalKey(Schema.Record(Label, Measurement)),
       foundByCounts: Schema.optionalKey(Schema.Record(Label, Measurement)),
       idShapeCounts: Schema.optionalKey(Schema.Record(Label, Measurement)),

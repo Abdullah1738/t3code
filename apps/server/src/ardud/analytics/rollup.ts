@@ -35,6 +35,8 @@ interface McpGroup {
   dispatchTimeouts: number;
   outcomes: Map<string, number>;
   savedCounts: Map<string, number>;
+  reasonClasses: Map<string, number>;
+  invalidFields: Map<string, number>;
   notFoundReasons: Map<string, number>;
   foundByCounts: Map<string, number>;
   idShapeCounts: Map<string, number>;
@@ -804,6 +806,8 @@ export function accumulate(
         dispatchTimeouts: 0,
         outcomes: new Map(),
         savedCounts: new Map(),
+        reasonClasses: new Map(),
+        invalidFields: new Map(),
         notFoundReasons: new Map(),
         foundByCounts: new Map(),
         idShapeCounts: new Map(),
@@ -816,7 +820,9 @@ export function accumulate(
     if (dispatchTimeout) group.dispatchTimeouts++;
     if (event.preHandlerMs !== undefined) addDuration(group.preHandler, event.preHandlerMs);
     increment(group.outcomes, event.outcome);
-    increment(group.savedCounts, String(event.saved ?? "unknown"));
+    increment(group.savedCounts, String(event.saved ?? "n/a"));
+    if (event.reasonClass) increment(group.reasonClasses, event.reasonClass);
+    if (event.invalidField) increment(group.invalidFields, event.invalidField);
     if (event.props?.notFoundReason !== undefined)
       increment(group.notFoundReasons, event.props.notFoundReason);
     if (event.props?.foundBy !== undefined) increment(group.foundByCounts, event.props.foundBy);
@@ -1173,6 +1179,8 @@ export function finishRollup(
         failureRate: group.failures / group.durations.count,
         outcomes: Object.fromEntries(group.outcomes),
         savedCounts: Object.fromEntries(group.savedCounts),
+        reasonClasses: Object.fromEntries(group.reasonClasses),
+        invalidFields: Object.fromEntries(group.invalidFields),
         dispatchTimeouts: dispatchTimeouts.get(key)!,
         notFoundReasons: Object.fromEntries(group.notFoundReasons),
         foundByCounts: Object.fromEntries(group.foundByCounts),

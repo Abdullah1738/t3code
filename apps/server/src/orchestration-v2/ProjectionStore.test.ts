@@ -2476,6 +2476,44 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       }
     }),
   );
+  it.effect.each(["post_tool", "first_event"] as const)(
+    "keeps the %s recovery cap through stale SQL and memory updates",
+    (phase) =>
+      Effect.gen(function* () {
+        const store = yield* ProjectionStore.ProjectionStoreV2;
+        const threadId = yield* addRolledBackRecoveryCandidate(`stall-recovery:${phase}`);
+        let memory = yield* store.getThreadProjection(threadId);
+        const run = memory.runs[0]!;
+        const now = yield* DateTime.now;
+        const recovery = {
+          phase,
+          lastProgressAt: DateTime.formatIso(now),
+          attemptId: run.activeAttemptId,
+        };
+        for (const [index, payload] of [
+          { ...run, delegatedTaskStallRecovery: recovery },
+          { ...run, status: "running" as const },
+          { ...run, status: "interrupted" as const },
+        ].entries()) {
+          const event = {
+            id: EventId.make(`event:stall-recovery:${phase}:${index}`),
+            type: "run.updated" as const,
+            threadId,
+            runId: run.id,
+            providerInstanceId,
+            occurredAt: now,
+            payload,
+          };
+          yield* store.apply(event);
+          memory = ProjectionStore.applyToProjection(memory, event);
+          assert.deepEqual(memory.runs[0]!.delegatedTaskStallRecovery, recovery);
+          assert.deepEqual(
+            (yield* store.getThreadRecords(threadId, ["runs"])).runs[0]!.delegatedTaskStallRecovery,
+            recovery,
+          );
+        }
+      }),
+  );
   it.effect.each(
     (["interrupted", "cancelled"] as const).flatMap((status) =>
       (

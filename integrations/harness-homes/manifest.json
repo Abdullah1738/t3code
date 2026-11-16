@@ -64,6 +64,16 @@
     {"harness": "codex", "event": "SessionEnd", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/memory-system/hooks/recall_hook.py --harness codex", "timeoutSec": 15}
   ],
   "paritySources": {
+    "phone-adb": [
+      "../harness-hooks/src/phone_adb_guard.py",
+      "../harness-hooks/src/rootwide_search_guard.py",
+      "../harness-hooks/src/statev2_guard.py",
+      "../harness-hooks/src/engine.py",
+      {
+        "source": "../opencode-plugins/plugin/phone-adb-guard.ts",
+        "installed": "~/.config/opencode/plugin/phone-adb-guard.ts"
+      }
+    ],
     "hook-adapters": [
       "../harness-hooks/src/claude.py",
       "../harness-hooks/src/codex.py"
