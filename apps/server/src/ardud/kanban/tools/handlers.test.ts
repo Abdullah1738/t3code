@@ -9316,8 +9316,9 @@ it.effect(
       );
       const refused = yield* tick(bookkeeping.id, "s5", "done");
       assert.isTrue(refused.isError);
-      assert.include(refused.text, "last robob-watch release #83 at 16:29Z, next window 20:29Z");
-      assert.include(refused.text, 'releasedAt: "2026-11-16T16:29:00.000Z"');
+      const refusal = yield* decodeToolFailure(refused.text);
+      assert.include(refusal.message, "last robob-watch release #83 at 16:29Z, next window 20:29Z");
+      assert.include(refusal.message, 'releasedAt: "2026-11-16T16:29:00.000Z"');
       const reopened = yield* tick(release.id, "s3", "open");
       assert.isFalse(reopened.isError, reopened.text);
       assert.lengthOf((yield* kanban.snapshot(board.id)).board.releaseLedger!, 0);
@@ -9378,9 +9379,10 @@ it.effect("replays Recall #101 bookkeeping for #144 using the refusal's released
       state: "done",
     });
     assert.isTrue(refused.isError);
-    assert.include(refused.text, "last recall release #144 at 19:37Z, next window 23:37Z");
+    const refusal = yield* decodeToolFailure(refused.text);
+    assert.include(refusal.message, "last recall release #144 at 19:37Z, next window 23:37Z");
     assert.include(
-      refused.text,
+      refusal.message,
       `if this step records release #144 that already happened, tick it with releasedAt: "${releasedAt}" (or the real restart time)`,
     );
     const recorded = yield* call(evaluator, "subtask_done", {
