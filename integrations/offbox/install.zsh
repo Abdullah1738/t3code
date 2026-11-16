@@ -20,7 +20,7 @@ plist="$HOME/Library/LaunchAgents/$label.plist"
 # Home server health monitor: a one-shot every minute, beside the load monitor (README: "Two monitors").
 home_label="com.ardud.offbox-home-monitor"
 home_plist="$HOME/Library/LaunchAgents/$home_label.plist"
-excludes=(--exclude __pycache__ --exclude '*.pyc' --exclude '*.bak*' --exclude tmp --exclude .DS_Store --exclude tools/quint)
+excludes=(--exclude __pycache__ --exclude '*.pyc' --exclude '*.bak*' --exclude tmp --exclude .DS_Store --exclude /tools/)
 
 mode=install
 dry=()
