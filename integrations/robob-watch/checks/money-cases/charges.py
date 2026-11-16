@@ -13,6 +13,7 @@ import importlib.util
 import hashlib
 import itertools
 import json
+import data_io
 import math
 import os
 from pathlib import Path
@@ -420,7 +421,7 @@ SEARCH_ROW_FIELDS = ('id', 'ts', 'source', 'sender', 'subject', 'from_me')
 
 def search_cache(path, now):
     try:
-        entries = json.loads(path.read_text())
+        entries = json.loads(data_io.read_text(path))
         if not isinstance(entries, dict):
             return {}
         clean = {}
@@ -644,7 +645,7 @@ def owner_time(value):
 
 def owner_cache(path, cache_reset=None):
     try:
-        cache = json.loads(path.read_text())
+        cache = json.loads(data_io.read_text(path))
         if not isinstance(cache, dict):
             raise ValueError()
         for tid, entry in cache.items():
