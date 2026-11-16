@@ -1405,6 +1405,54 @@ it.effect("keeps one host listed when another is not set up", () =>
   }),
 );
 
+it.effect.each(["missing-tool", "unauthenticated"] as const)(
+  "preserves the Forgejo binary and host diagnosis for %s",
+  (reason) =>
+    Effect.gen(function* () {
+      const provider = SourceControlProviderKind.make("forgejo");
+      const detail =
+        reason === "missing-tool"
+          ? "Could not start `fj`. Host: forgejo.test."
+          : "No fj login matches forgejo.test; `tea` is unavailable.";
+      const failure = new PullRequestProviderError({
+        provider,
+        reason,
+        detail,
+        operation: "getChangeRequest",
+      });
+      const service = yield* makeService({
+        projects: [
+          project({
+            id: "p1",
+            title: "web",
+            workspaceRoot: "/repo",
+            repository: "acme/web",
+            provider,
+            host: "forgejo.test",
+          }),
+        ],
+        providers: [
+          fakeProvider(provider, {
+            getChangeRequest: () => Effect.fail(failure),
+            getViewer: () => Effect.fail(failure),
+          }),
+        ],
+      });
+      const error = yield* service
+        .detail({
+          projectId: "p1" as ProjectId,
+          host: "forgejo.test",
+          repository: "acme/web",
+          number: 1,
+        })
+        .pipe(Effect.flip);
+      assert.strictEqual(error._tag, "PullRequestUnavailableError");
+      assert.strictEqual(error.message, detail);
+      const listError = yield* service.list({ state: "open" }).pipe(Effect.flip);
+      assert.strictEqual(listError.message, detail);
+    }),
+);
+
 it.effect("fails as unavailable only when no host can be read", () =>
   Effect.gen(function* () {
     const service = yield* makeService({
