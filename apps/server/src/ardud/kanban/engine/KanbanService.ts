@@ -11142,7 +11142,7 @@ const make = Effect.gen(function* () {
       card.settledAt !== null ||
       card.stalled !== null ||
       kanbanWorkStep(card) ||
-      kanbanWaiting(card) ||
+      card.wait !== undefined ||
       kanbanOpenAsks(card).some((ask) => ask.blocking) ||
       Waits.decidingHolds(card) ||
       waking(threadId)
@@ -11179,6 +11179,10 @@ const make = Effect.gen(function* () {
     // Wake cleanup may take admission itself. Finish it before locking, then
     // recheck the card and thread together so a worker's own move wins the race.
     yield* prepareTransition(next);
+    const sink: EffectSink = { effects: [], closed: false };
+    const publications: Array<BoardPublication> = [];
+    const measurements: AnalyticsEvent[] = [];
+    let lanes = new Set<string>();
     const saved = yield* turnAdmission.withLock(
       threadId,
       Effect.gen(function* () {
@@ -11196,31 +11200,51 @@ const make = Effect.gen(function* () {
           return false;
         const actor: KanbanActor = { _tag: "system", component: "dispatcher" };
         const ageMs = BoardAnalytics.elapsed(at, card.analyticsStageEnteredAt ?? card.movedAt);
-        yield* logEvent(next, actor, "moved", {
-          fromStage: card.stage,
-          toStage: next.stage,
-          body: `Auto-advanced: ${reason}; ${ageMs} ms in Working`,
-        });
-        yield* saveCard(next, actor);
-        yield* recordAnalytics({
-          kind: "kanban.card.autoAdvanced",
-          boardId: card.boardId,
-          cardId: card.id,
-          threadId,
-          props: {
-            number: card.number,
-            from: card.stage,
-            to: next.stage,
-            actor: "system",
-            reasonClass: reason,
-            msInPrevStage: ageMs,
-          },
-        });
+        // Turn-end and tick have no write-effect sink. Save the handoff and its
+        // evaluator obligation together so a rejected notification can replay.
+        lanes = yield* boardTransaction(
+          card.boardId,
+          Effect.gen(function* () {
+            yield* logEvent(next, actor, "moved", {
+              fromStage: card.stage,
+              toStage: next.stage,
+              body: `Auto-advanced: ${reason}; ${ageMs} ms in Working`,
+            });
+            yield* saveCard(next, actor);
+            yield* recordAnalytics({
+              kind: "kanban.card.autoAdvanced",
+              boardId: card.boardId,
+              cardId: card.id,
+              threadId,
+              props: {
+                number: card.number,
+                from: card.stage,
+                to: next.stage,
+                actor: "system",
+                reasonClass: reason,
+                msInPrevStage: ageMs,
+              },
+            });
+            yield* laterEvaluatorTurn(card, next, actor);
+            return yield* saveEffectRows(sink.effects);
+          }).pipe(
+            Effect.provideService(effectSink, sink),
+            Effect.provideService(publicationSink, publications),
+            Effect.provideService(analyticsSink, measurements),
+            Effect.ensuring(
+              Effect.sync(() => {
+                sink.closed = true;
+              }),
+            ),
+          ),
+        );
         return true;
       }),
     );
     if (!saved) return yield* cardOf(card.id);
-    yield* laterEvaluatorTurn(card, next, { _tag: "system", component: "dispatcher" });
+    for (const measurement of measurements) yield* recordAnalytics(measurement);
+    for (const publication of publications) yield* publish(publication.boardId, publication.change);
+    for (const lane of lanes) yield* triggerOwnerDrain(lane);
     yield* kick;
     return next;
   });
