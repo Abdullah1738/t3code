@@ -125,9 +125,9 @@ test("health exposes bounded status subkeys and local counts without payload ide
 test("health allows only bounded single-thread read counters and reasons", async () => {
   const h = setup();
   h.state.health = { board: { threadReads: 5, threadReadErrors: 1,
-    threadReadsByReason: { run: 2, state: 2, followup: 1, threadId: "PRIVATE_ID", title: "PRIVATE_TITLE" } } };
+    threadReadsByReason: { run: 2, state: 2, followup: 1, created: 3, threadId: "PRIVATE_ID", title: "PRIVATE_TITLE" } } };
   expect((await (await h.get("/health")).json()).board).toEqual({ threadReads: 5, threadReadErrors: 1,
-    threadReadsByReason: { run: 2, state: 2, followup: 1 } });
+    threadReadsByReason: { run: 2, state: 2, followup: 1, created: 3 } });
   h.state.health = { board: { threadReads: -1, threadReadErrors: 0.5, threadReadsByReason: { run: Infinity, state: "PRIVATE_ID", followup: -1 } } };
   expect((await (await h.get("/health")).json()).board).toEqual({ threadReadsByReason: {} });
 });

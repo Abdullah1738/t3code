@@ -536,6 +536,12 @@ export interface KanbanServiceShape {
       readonly events: ReadonlyArray<KanbanCardEvent>;
       readonly threads: ReadonlyArray<KanbanThreadLink>;
       readonly pools: ReadonlyArray<KanbanPool>;
+      readonly dispatchCards: ReadonlyArray<KanbanCard>;
+      readonly holds: ReadonlyMap<string, string>;
+      readonly dispatchPools: ReadonlyArray<KanbanPool>;
+      readonly reviews: ReadonlyMap<string, Rules.ReviewEvidence>;
+      readonly workThreadHomes: ReadonlyMap<string, KanbanCard | null>;
+      readonly assignmentWakeRetries: ReadonlyMap<string, Rules.AssignmentWakeRetry>;
       readonly slotHistory: {
         readonly events: ReadonlyArray<SlotEvent>;
         readonly recordedSince: string | null;
@@ -2679,9 +2685,7 @@ const make = Effect.gen(function* () {
     Effect.flatMap(nowMillis, (at) =>
       Ref.update(holds, (all) =>
         new Map(all).set(threadId, { ...all.get(threadId), boardId, pool, at }),
-      ).pipe(
-        Effect.andThen(syncSlot(boardId, threadId, "hold", cardId)),
-      ),
+      ).pipe(Effect.andThen(syncSlot(boardId, threadId, "hold", cardId))),
     );
   /** One board's held slots, thread id to pool, as the rules take them. `except`: a start's own key. */
   const boardHolds = (boardId: string, except?: string) =>
@@ -8554,9 +8558,7 @@ const make = Effect.gen(function* () {
       next.delete(reused);
       return next;
     }).pipe(
-      Effect.andThen(
-        reused === null ? Effect.void : syncSlot(board.id, reused, "join", card.id),
-      ),
+      Effect.andThen(reused === null ? Effect.void : syncSlot(board.id, reused, "join", card.id)),
     );
     let cleaned = false;
     let failureTag = "interrupted";
@@ -10457,6 +10459,14 @@ const make = Effect.gen(function* () {
     return;
   });
 
+  const turnEndCard = Effect.fn("KanbanService.turnEndCard")(function* (
+    id: KanbanCard["id"],
+  ) {
+    // Reader admission can take minutes. The enclosing operation revalidates
+    // its board generation before using this snapshot after reacquiring the gate.
+    return yield* locks.outside(rawStore.card(id), undefined, true);
+  });
+
   const finishTurn = Effect.fn("KanbanService.turnEndedUnlocked")(function* (
     threadId: ThreadId,
     expectedFailedWorkRunId?: string,
@@ -10495,7 +10505,7 @@ const make = Effect.gen(function* () {
       },
     });
     let card = yield* settleDetachedSteer(
-      link.cardId ? yield* store.card(link.cardId) : null,
+      link.cardId ? yield* turnEndCard(link.cardId) : null,
       view,
       viewFence,
     );
@@ -10530,7 +10540,9 @@ const make = Effect.gen(function* () {
     if (card?.discussionId) discussionIds.add(card.discussionId);
     for (const id of carriedIds) {
       const other =
-        id === card?.id ? card : yield* settleDetachedSteer(yield* store.card(id), view, viewFence);
+        id === card?.id
+          ? card
+          : yield* settleDetachedSteer(yield* turnEndCard(id), view, viewFence);
       if (other?.discussionId) discussionIds.add(other.discussionId);
     }
     // A run that failed (the provider refused the model or variant, or a route is gone)
@@ -19360,7 +19372,25 @@ const make = Effect.gen(function* () {
             (event) => event.toStage !== null && event.fromStage !== event.toStage,
           );
           const after = history.filter((event) => event.at >= window.until);
-          return { ...read, prior, after, readinessBefore };
+          const dispatchCards = yield* dispatchCardPass(boardId, new Set()).read;
+          const reviews = new Map<string, Rules.ReviewEvidence>();
+          if (read.board)
+            for (const card of dispatchCards) {
+              if (card.settledAt === null && kanbanReviewAlreadyDone(card))
+                reviews.set(card.id, yield* reviewEvidence(read.board, card));
+            }
+          return {
+            ...read,
+            prior,
+            after,
+            readinessBefore,
+            dispatchCards,
+            holds: yield* boardHolds(boardId),
+            dispatchPools: Rules.maskDownPools(read.pools, new Set((yield* Ref.get(down)).keys())),
+            reviews,
+            workThreadHomes: yield* workThreadHomes(dispatchCards),
+            assignmentWakeRetries: new Map(assignmentWakeRetries),
+          };
         }),
       ),
     cardByNumber: (boardId, number) => readDb(store.cardByNumber(boardId, number)),

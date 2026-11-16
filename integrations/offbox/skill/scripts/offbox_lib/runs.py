@@ -1844,7 +1844,10 @@ class Runner:
             # A 4xx answer (400 E2BIG, 409 not ready, 429 rate limit) means boat refused it: nothing ran.
             # Without this the run sat "starting" for an hour and held the box until it stopped.
             # Cloudflare 521-526 except 524 never reached boat, so nothing ran; 520, 524 and network errors stay started.
-            if getattr(e, "status", None) in (*REFUSED_STATUSES, *api.CF_NOT_DELIVERED):
+            # Home's disk gate returns 503 before dispatch: it is a refusal, not a lost response.
+            disk_refused = (isinstance(e, api.ApiError) and api.BACKEND == 'server'
+                            and e.api_code == 'server_disk_low')
+            if disk_refused or getattr(e, "status", None) in (*REFUSED_STATUSES, *api.CF_NOT_DELIVERED):
                 self.started = False
                 if e.api_code in ("sandbox_not_ready", "machine_not_running"):
                     # boat says the box is stopped: let offbox's next run resume it (lease._reuse) instead of a
@@ -2050,6 +2053,10 @@ class Runner:
                 raise lease.DeadMount(self.box, reason) from e
         sync_exc = push_exc if push_exc is not None else err[0] if err else None
         if sync_exc is not None:
+            from . import disk_pressure
+            if api.BACKEND == 'server' and disk_pressure.is_full(sync_exc):
+                disk_pressure.remember(True)
+                raise OffboxError('home server out of disk during sync; nothing ran', code=EXIT_INFRA, outage=True) from sync_exc
             if re.search(r"Broken pipe|code 255|\(255\)", str(sync_exc)):
                 state = _boat_state(self.box)
                 if state and state not in api.LIVE_STATES:

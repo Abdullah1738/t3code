@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // stream-recovery: detect OpenCode event-stream drops in Robob and resume the
-// threads they knocked out. Run `scan` every minute (LaunchAgent) or by hand.
+// threads they knocked out. Separate LaunchAgents run `scan` and `stall`.
 import {
   findIncidents, planThread, buildNote, buildSummary, lostMessages, invisibleReply,
   assistantText, orphanStatus, sessionFromProviderThread, isNestedThreadId,
@@ -19,7 +19,6 @@ const SETTLE_MS = 90_000;
 const STALE_HELD_MS = 24 * 3600_000;
 const MAX_ATTEMPTS = 3;
 const RESTART_LOOKBACK_MS = 3 * 3600_000;
-const STALL_EVERY_MS = 55_000;
 
 function parseArgs(argv) {
   const [cmd = 'scan', ...rest] = argv;
@@ -388,24 +387,11 @@ async function scanImpl(opts, io) {
       recoveryError = err;
       log(`recovery deferred: ${err?.message || err}${isRecoveryPaused(err) ? "; already-sent mutations may complete; pending work retained" : ""}`);
     }
-    let stalls = [];
-    // Scans run every 15s so restarts are picked up fast; the stall watch reads
-    // every active OpenCode session, so it keeps its once-a-minute pace.
-    const stallDue = !state.lastStallScan || now - Date.parse(state.lastStallScan) >= STALL_EVERY_MS;
-    if (!isRecoveryPaused(recoveryError) && !opts.seed && (stallDue || opts.dryRun)) {
-      try {
-        if (!opts.dryRun) state.lastStallScan = new Date(now).toISOString();
-        stalls = await stallScan({ state, now, dryRun: opts.dryRun, verbose: opts.verbose, log }, io);
-      } catch (err) {
-        if (isRecoveryPaused(err)) recoveryError = err;
-        log(`stall watch failed: ${err?.message || err}`);
-      }
-    }
     if (!opts.dryRun) {
       if (!recoveryError) state.lastScan = new Date(now).toISOString();
       io.saveState(state, now);
     }
-    if (opts.json) console.log(JSON.stringify({ ...recovery, stalls,
+    if (opts.json) console.log(JSON.stringify({ ...recovery,
       ...(recoveryError ? { recoveryError: String(recoveryError?.message || recoveryError) } : {}) }, null, 2));
     if (recoveryError && !isRecoveryPaused(recoveryError)) throw recoveryError;
   } finally {
@@ -413,11 +399,42 @@ async function scanImpl(opts, io) {
   }
 }
 
+export async function stall(opts, io = realIo) {
+  const now = io.now?.() ?? Date.now();
+  const release = opts.dryRun ? () => {} : io.acquireLock(now, 'stall');
+  if (!release) { log('another stall watch is running, skipping'); return; }
+  try {
+    const state = io.loadStallState();
+    try { assertRecoveryActive(io); } catch (err) {
+      if (!isRecoveryPaused(err)) throw err;
+      log(err.message);
+      if (opts.json) console.log(JSON.stringify({ paused: true }));
+      return;
+    }
+    let stalls = [], stallError = null;
+    try {
+      if (!opts.dryRun) state.lastStallScan = new Date(now).toISOString();
+      stalls = await stallScan({ state, now, dryRun: opts.dryRun, verbose: opts.verbose, log,
+        save: () => io.saveStallState(state, now) }, io);
+    } catch (err) {
+      stallError = err;
+      log(`stall watch failed: ${err?.message || err}`);
+    }
+    if (!opts.dryRun) io.saveStallState(state, now);
+    if (opts.json) console.log(JSON.stringify({ stalls,
+      ...(stallError ? { stallError: String(stallError?.message || stallError) } : {}) }, null, 2));
+    if (stallError && !isRecoveryPaused(stallError)) throw stallError;
+  } finally {
+    release();
+  }
+}
+
 function status(opts, io = realIo) {
   const state = io.loadState();
+  const stallState = io.loadStallState();
   const control = controlStatus(io.readControl());
   const pending = Object.values(state.handled).filter((h) => !h.done);
-  const pendingStalls = Object.values(state.stalls).filter((s) => !s.done);
+  const pendingStalls = Object.values(stallState.stalls).filter((s) => !s.done);
   if (opts.json) {
     const pendingIds = pending.flatMap((h) => [...new Set([
       ...Object.keys(h.threads ?? {}), ...(h.incident?.runs ?? []).map((r) => r.thread_id),
@@ -432,12 +449,13 @@ function status(opts, io = realIo) {
   for (const [id, h] of Object.entries(state.handled).sort()) {
     console.log(`${id}  ${h.done ? 'done' : 'retrying'}  ${h.at}  ${h.summary || ''}`);
   }
-  for (const [id, s] of Object.entries(state.stalls).sort()) {
+  for (const [id, s] of Object.entries(stallState.stalls).sort()) {
     console.log(`${id}  ${s.done ? s.outcome : 'following up'}  ${s.at}  ${s.summary || `${s.action} | ${s.title}`}`);
   }
 }
 
 const HELP = `usage: stream-recovery scan [--dry-run] [--since ISO] [--max-age-hours N] [--seed] [--json] [--verbose]
+       stream-recovery stall [--dry-run] [--json] [--verbose]
        stream-recovery pause [--for 30m|2h|1d] [--reason TEXT]
        stream-recovery resume
        stream-recovery status [--json]`;
@@ -446,6 +464,7 @@ if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) 
   const opts = parseArgs(process.argv.slice(2));
   logToStderr = opts.json;
   if (opts.cmd === 'scan') await scan(opts);
+  else if (opts.cmd === 'stall') await stall(opts);
   else if (opts.cmd === 'status') status(opts);
   else if (opts.cmd === 'pause') {
     await pauseRecovery(realIo.PATHS.dataDir, { durationMs: opts.durationMs, reason: opts.reason });

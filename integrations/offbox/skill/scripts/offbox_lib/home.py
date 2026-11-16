@@ -339,6 +339,11 @@ def _health(timeout: float = PROBE_TIMEOUT_S, *, bounded=False):
     except (OSError, ValueError, OffboxError) as e:
         kind = type(getattr(e, "reason", e)).__name__
         return f"no answer ({kind})"
+    if isinstance(d, dict):
+        from . import disk_pressure
+        why = disk_pressure.health_reason(d)
+        if why:
+            return why
     return d
 
 
@@ -537,6 +542,8 @@ def preflight_reason() -> str | None:
     recent = recent_failure()
     PROBE_FACTS.set(None)
     why = probe()
+    if why and "disk" in why:
+        return why
     health_ok = why is None
     if why and (PROBE_FACTS.get() or {}).get("tcp") is False:
         return why
@@ -638,11 +645,17 @@ def fail_over(reason: str, argv: list[str], run_id: str = "", *, explicit_base: 
     elapsed = max(0, time.monotonic() - WAIT_STARTED)*1000 if WAIT_STARTED is not None else 0
     toollog.emit("backend", "backend.failover", duration_ms=elapsed, ok=True, ids={"run": run_id},
                  props={"from": "home", "to": "boat", "reason": "unreachable", "waitMs": elapsed})
-    monitor = common.home_state()
-    classification = failure_class(reason)
-    routing_line(f"home offbox server not reachable ({reason[:160]}); this run goes to Boat instead "
-        f"class={classification} run={run_id or '-'} monitor_last_check={monitor.get('last_check')} "
-        f"monitor_last_outcome={monitor.get('last_outcome')}", run_id)
+    if 'low on disk' in reason:
+        detail = reason[reason.index('low on disk'):]
+        routing_line(f"home offbox server is {detail}; this run is going to Boat", run_id)
+    elif 'out of disk' in reason:
+        routing_line('home server out of disk; this run is going to Boat', run_id)
+    else:
+        monitor = common.home_state()
+        classification = failure_class(reason)
+        routing_line(f"home offbox server not reachable ({reason[:160]}); this run goes to Boat instead "
+            f"class={classification} run={run_id or '-'} monitor_last_check={monitor.get('last_check')} "
+            f"monitor_last_outcome={monitor.get('last_outcome')}", run_id)
     log(f"failover to boat: {reason[:300]}")
     env = dict(os.environ, OFFBOX_BACKEND="boat")
     env[FAILOVER_ENV] = reason[:200]

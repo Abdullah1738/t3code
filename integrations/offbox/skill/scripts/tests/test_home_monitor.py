@@ -32,7 +32,7 @@ NO_INTERNET = dict(ONLINE, online=False, internet=False, internet_detail="1.1.1.
 GOOD = {"mode": "ok", "reasons": [], "pool": "ONLINE", "mdraid": "ok", "boot_id": "boot-a", "version": "1.0",
         "uptime_s": 86400, "boatd_uptime_s": 86000}
 BACKEND_KEYS = {"state", "since", "good_streak", "bad_streak", "last_check", "last_ok", "reason", "outage_id",
-                "degraded", "last_outcome", "class", "last_answer", "boot_id", "slow_since", "flaps_today"}
+                "degraded", "disk", "last_outcome", "class", "last_answer", "boot_id", "slow_since", "flaps_today"}
 
 
 class FakeEffects:

@@ -81,6 +81,7 @@ check "python syntax" pyc
 unit() { python3 vmtest/test_plan.py 2>&1 | tail -3 | tr '\n' ' '; return "${PIPESTATUS[0]}"; }
 check "plan.py unit tests (disk decision, wipe scope, storage layout)" unit
 check "box userns persistence and acceptance regression" python3 ../../tests/test_userns.py
+check "control-plane CPU priority regression" python3 ../../tests/test_cpu_priority.py
 check "box tmpfs profile regression" python3 ../../tests/test_tmp_profile.py
 check "daily-update policy: Perl selectors, apt hook, pending JSON and no-restart install" python3 ../../tests/test_update_policy.py
 

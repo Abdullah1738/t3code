@@ -654,31 +654,51 @@ export function telegram({ text, severity = "info", key }) {
 export const readControl = () => loadControl(PATHS.dataDir);
 
 const statePath = () => join(PATHS.dataDir, "state.json");
+const stallStatePath = () => join(PATHS.dataDir, "stall-state.json");
+const stallState = (s = {}) => ({
+  watch: s.watch ?? {}, stalls: s.stalls ?? {}, ghosts: s.ghosts ?? {}, lastStallScan: s.lastStallScan ?? null,
+});
 
 export function loadState() {
-  if (!existsSync(statePath())) return { handled: {}, lastScan: null, lastStallScan: null, watch: {}, stalls: {}, servers: [], ghosts: {} };
+  if (!existsSync(statePath())) return { handled: {}, lastScan: null, servers: [] };
   const s = parse(readFileSync(statePath(), "utf8"));
   return {
-    handled: s.handled ?? {}, lastScan: s.lastScan ?? null, lastStallScan: s.lastStallScan ?? null, watch: s.watch ?? {}, stalls: s.stalls ?? {},
-    servers: s.servers ?? [], ghosts: s.ghosts ?? {},
+    handled: s.handled ?? {}, lastScan: s.lastScan ?? null, servers: s.servers ?? [],
   };
 }
 
-export function saveState(state, now = Date.now()) {
-  mkdirSync(PATHS.dataDir, { recursive: true });
-  for (const key of ["handled", "stalls"]) {
-    for (const [id, v] of Object.entries(state[key] ?? {})) {
-      if (v.done && recoveryElapsed({ readControl }, Date.parse(v.at), now) > 14 * 86_400_000) delete state[key][id];
-    }
-  }
-  const tmp = `${statePath()}.tmp`;
-  writeFileSync(tmp, JSON.stringify(state, null, 2));
-  renameSync(tmp, statePath());
+export function loadStallState() {
+  // Once published, the stall ledger is authoritative, even if an old scan
+  // later finishes and writes its pre-migration state.json snapshot.
+  const path = existsSync(stallStatePath()) ? stallStatePath() : statePath();
+  return stallState(existsSync(path) ? parse(readFileSync(path, "utf8")) : {});
 }
 
-export function acquireLock(now = Date.now()) {
+function saveLedger(path, state, key, now) {
   mkdirSync(PATHS.dataDir, { recursive: true });
-  const lock = join(PATHS.dataDir, "scan.lock");
+  for (const [id, v] of Object.entries(state[key] ?? {})) {
+    if (v.done && recoveryElapsed({ readControl }, Date.parse(v.at), now) > 14 * 86_400_000) delete state[key][id];
+  }
+  const tmp = `${path}.tmp`;
+  writeFileSync(tmp, JSON.stringify(state, null, 2));
+  renameSync(tmp, path);
+}
+
+export function saveState(state, now = Date.now()) {
+  // A replica scan may finish before the stall job's first run. Preserve the
+  // on-disk migration source until that job has published its own ledger.
+  const legacy = !existsSync(stallStatePath()) && existsSync(statePath())
+    ? stallState(parse(readFileSync(statePath(), "utf8"))) : {};
+  saveLedger(statePath(), { ...legacy, handled: state.handled, lastScan: state.lastScan, servers: state.servers }, "handled", now);
+}
+
+export function saveStallState(state, now = Date.now()) {
+  saveLedger(stallStatePath(), stallState(state), "stalls", now);
+}
+
+export function acquireLock(now = Date.now(), name = 'scan') {
+  mkdirSync(PATHS.dataDir, { recursive: true });
+  const lock = join(PATHS.dataDir, `${name}.lock`);
   if (existsSync(lock)) {
     const { pid, at } = parse(readFileSync(lock, "utf8"));
     let alive = false;
