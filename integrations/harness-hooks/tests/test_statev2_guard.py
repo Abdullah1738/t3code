@@ -585,6 +585,72 @@ class GuardTests(unittest.TestCase):
         run = 'python3 -m unittest discover -s tmp'
         self.assertEqual(guard.classify_detail(prefix + run + '\n' + run, str(self.root)), (None, None))
 
+    def test_same_call_mktemp_reporters(self):
+        body = ('import tempfile, unittest\nclass T(unittest.TestCase):\n'
+                ' def test_fixture(self):\n  with tempfile.TemporaryDirectory() as root:\n'
+                '   self.assertTrue(root)\n')
+        self.write('other_existing.py', 'import unittest\n')
+        venv = '/Users/ardud/.local/share/memory-system/.venv/bin/python3'
+        rows = [
+            ('recall73', 'x.py', f'A=1 B=$(mktemp -d) {venv} -m unittest x other_existing'),
+            ('recall93', 'x.py', 'B=$(mktemp -d) A=1 ~/.local/share/memory-system/.venv/bin/python3 -m unittest x'),
+            ('system', 'x.py', 'A=1 B=$(mktemp -d) python3 -m unittest x'),
+            ('isolated', 'x.py', 'B=$(mktemp -d) python3 -I x.py'),
+            ('template', 'x.py', 'B=$(mktemp -d -t foo.XXXXXX) python3 -I x.py'),
+            ('recall52', 'integrations/memory-system/tests/test_backup_partial.py',
+             f'RECALL_RULE_PREFLIGHT=1 RECALL_TOOL_LOG_DIR=$(mktemp -d) {venv} -m unittest discover -s integrations/memory-system/tests -p test_backup_partial.py'),
+            ('recall115', 'test_backup_io.py', 'RECALL_RULE_PREFLIGHT=1 RECALL_TOOL_LOG_DIR=$(mktemp -d) ~/.local/share/memory-system/.venv/bin/python3 -m unittest test_backup_io'),
+            ('recall94', 'integrations/memory-system/tests/test_backup_shipper.py', 'RECALL_TOOL_LOG_DIR=$(mktemp -d) python3 -m unittest discover -s integrations/memory-system/tests -p test_backup_shipper.py -v'),
+            ('recall94 standalone', 'integrations/memory-system/tests/test_backup_shipper.py', 'D=$(mktemp -d)\nRECALL_TOOL_LOG_DIR="$D" python3 -m unittest discover -s integrations/memory-system/tests -p test_backup_shipper.py -v'),
+            ('recall122', 'integrations/memory-system/tests/test_backup_manifest.py', 'RECALL_TOOL_LOG_DIR=$(mktemp -d) /usr/bin/python3 -m unittest discover -s integrations/memory-system/tests -p test_backup_manifest.py'),
+        ]
+        for label, target, runner in rows:
+            source = body
+            directory = self.root
+            if label == 'recall115':
+                directory = self.root / 'integrations/memory-system/tests'
+                directory.mkdir(parents=True, exist_ok=True)
+                self.write('integrations/memory-system/src/synthetic_backup.py', 'def copy(): pass\n')
+                source = 'import sys\nsys.path.insert(0, "../src")\nfrom synthetic_backup import copy\nfrom unittest import mock\n' + body
+            command = self.heredoc(target, source) + runner
+            with self.subTest(reporter=label):
+                self.assertEqual(guard.classify_detail(command, str(directory)), (None, None))
+                self.adapters('cd ' + shlex.quote(str(directory)) + ' && ' + command)
+
+    def test_same_call_mktemp_substitution_forms(self):
+        prefix = self.heredoc('x.py', 'print(1)')
+        for substitution in ['mktemp -d', 'mktemp -d foo.XXXXXX', 'mktemp -d -t foo.XXXXXX',
+                             'mktemp -d "foo.XXXXXX"', '/usr/bin/mktemp -d']:
+            for assignment in [f'B=$({substitution})', f'B="$({substitution})"']:
+                for setup in [assignment + ' ', 'A=1 ' + assignment + ' C=2 ', assignment + '\n']:
+                    command = prefix + setup + 'python3 -I x.py'
+                    with self.subTest(substitution=substitution, setup=setup):
+                        self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+
+    def test_same_call_mktemp_substitution_still_denies(self):
+        prefix = self.heredoc('x.py', 'print(1)')
+        for substitution in ['cp other.py x.py', 'sed -i s/1/2/ x.py', 'tee x.py < other.py',
+                             'mktemp -u', 'mktemp -d -u', 'mktemp -d --dry-run', 'python3 unchecked.py',
+                             'mktemp -d; cp other.py x.py', 'mktemp -d > x.py',
+                             'mktemp -d $(python3 unchecked.py)', 'mktemp -d "$TEMPLATE"',
+                             'mktemp -d; true', 'mktemp -d | cat']:
+            for setup in [f'B=$({substitution}) ', f'B=$({substitution})\n']:
+                command = prefix + setup + 'python3 -I x.py'
+                with self.subTest(substitution=substitution, setup=setup):
+                    self.assertIsNotNone(self.classify(command))
+        for database in [LIVE, '/Users/x/.local/share/opencode/opencode.db']:
+            command = self.heredoc('x.py', f'open({database!r}, "rb").read()') + 'B=$(mktemp -d) python3 -I x.py'
+            self.assertEqual(self.classify(command), SCRIPT)
+        for setup in ['PATH=/untrusted B=$(mktemp -d) ', 'mktemp() { cp other.py x.py; }\nB=$(mktemp -d) ',
+                      'alias mktemp="cp other.py x.py"\nB=$(mktemp -d) ',
+                      'cp other.py /usr/bin/mktemp\nB=$(mktemp -d) ']:
+            self.assertIsNotNone(self.classify(prefix + setup + 'python3 -I x.py'))
+        command = prefix + 'B=$(mktemp -d) python3 -I x.py'
+        with patch.dict(os.environ, {'BASH_FUNC_mktemp%%': '() { cp other.py x.py; }'}):
+            self.assertIsNotNone(self.classify(command))
+        with patch.object(guard, '_trusted_fixture_tool', return_value=False):
+            self.assertIsNotNone(self.classify(command))
+
     def test_same_call_offbox_reporter(self):
         relative = 'integrations/memory-system/tests/benchmark_recall_storage.py'
         for destination in [relative, str(self.root / relative)]:
