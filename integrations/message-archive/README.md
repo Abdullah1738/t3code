@@ -55,6 +55,17 @@ A failing source logs `<source>: ERROR ...` and backs off up to 10 min. Lock
 contention logs `LOCK_GIVEUP`; contention and token-command timeouts retry at
 the normal source interval. Log: `~/.local/share/message-archive/logs/daemon.log`.
 
+Each completed `msgs search` appends local timings to
+`~/.local/share/message-archive/logs/search-timing.ndjson`; `MSGS_TIMING=1`
+also prints the record on stderr. `MSGS_LOG_DIR` overrides the log directory.
+The stages separate connection setup, date-range lookup, SQL execution,
+row fetching, deduplication, chat counts and output. SQL execution includes
+SQLite's filtering and sorting; lazy reads can also appear in row fetching.
+`rows_matched` counts consumed rows from the limited SQL result before
+deduplication, not every matching message. CPU and block-input counters help
+distinguish work from waiting, though Darwin can report zero block inputs
+even during disk reads. Query text and message contents are never logged.
+
 The memory-system health check (`msgs` in `health_check.py`, every 15 min)
 sends a Telegram alert when the archive's last good iMessage pass hasn't
 changed for an hour of awake time since the check first saw it. Sleep doesn't

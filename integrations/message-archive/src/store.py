@@ -244,7 +244,12 @@ def connect(readonly=False):
     if readonly:
         if not os.path.exists(common.DB_PATH):
             raise common.NotMounted(f"no archive at {common.DB_PATH} (is {common.VOLUME} mounted?)")
-        db = sqlite3.connect(f"file:{common.DB_PATH}?mode=ro", uri=True, timeout=30)
+        db = sqlite3.connect(f"file:{common.DB_PATH}?mode=ro", uri=True, timeout=0.25)
+        db.execute("PRAGMA query_only=ON")
+        # Short-lived searches otherwise use SQLite's 2 MiB cache and no mapping.
+        # SQLite clamps this to its compiled mapping limit (about 2 GiB on this Mac).
+        db.execute("PRAGMA cache_size=-16384")
+        db.execute("PRAGMA mmap_size=4294967296")
     else:
         common.require_volume()
         db = None
@@ -268,7 +273,7 @@ def connect(readonly=False):
                 db.close()
             raise
     if readonly:
-        db.execute("PRAGMA busy_timeout=60000")
+        db.execute("PRAGMA busy_timeout=250")
     db.row_factory = sqlite3.Row
     return db
 
