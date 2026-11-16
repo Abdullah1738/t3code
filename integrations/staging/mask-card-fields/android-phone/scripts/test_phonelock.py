@@ -203,6 +203,25 @@ class PhoneLockTests(unittest.TestCase):
             with patch.object(lock.subprocess, 'run', return_value=result):
                 self.assertEqual(lock.process_started(os.getpid()), expected)
 
+    def test_process_alive_tristate_and_library_hold_lifecycle(self):
+        for result, expected in [('fixture start',True), ('reused',False), (False,False), (None,None)]:
+            with self.subTest(result=result), patch.object(lock, 'process_started', return_value=result):
+                self.assertIs(lock.process_alive(os.getpid(), 'fixture start'), expected)
+        for pid, started in [(None,'start'), (True,'start'), (0,'start'), (123,None), (123,'')]:
+            self.assertIsNone(lock.process_alive(pid,started))
+        with patch.object(lock, 'process_started', return_value='runner start'), patch.object(ph, 'process_comm', return_value='Python'):
+            lock.hold_acquire(HOLD_TOKEN, holder_pid=os.getpid())
+            owner=json.loads((self.root/'priority-hold.owner.json').read_text())
+            self.assertEqual((owner['agent_pid'],owner['agent_started']), (os.getpid(),'runner start'))
+            state=lock.hold_status()
+            self.assertTrue(state['holder_alive'])
+            self.assertEqual(state['agent_comm'],'Python')
+        with self.assertRaises(lock.Busy): lock.hold_release('foreign')
+        self.assertTrue(lock.HOLD.exists())
+        lock.hold_release(HOLD_TOKEN)
+        self.assertFalse(lock.HOLD.exists())
+        self.assertFalse((self.root/'priority-hold.owner.json').exists())
+
     def test_staleness_override_duration_forms(self):
         for value, seconds in [('30m',1800), ('1800',1800), ('1800s',1800), ('0.5h',1800), ('0.1s',0.1)]:
             with self.subTest(value=value), patch.dict(os.environ, PH_HOLD_STALE_AFTER=value):

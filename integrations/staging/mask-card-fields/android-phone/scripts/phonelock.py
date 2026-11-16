@@ -79,14 +79,28 @@ def process_started(pid):
         return None
 
 
-def holder_metadata(token):
-    # Import lazily so Jev shares ph's executable-name-only ancestor walk too.
-    from ph import caller_chain
-    agent = next((row for row in caller_chain() if row['comm'] in ('claude', 'codex', 'opencode')), {})
-    pid = agent.get('pid') if agent.get('comm') in ('claude', 'codex') else None
+def process_alive(pid, started):
+    """True for the same process, False for exit/reuse, None when unknown."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 or not isinstance(started, str) or not started:
+        return None
+    current = process_started(pid)
+    return None if current is None else current == started
+
+
+def holder_metadata(token, holder_pid=None):
+    # Detached lease runners supply their own PID; ordinary requests use ancestry.
+    from ph import caller_chain, process_comm
+    if holder_pid is None:
+        agent = next((row for row in caller_chain() if row['comm'] in ('claude', 'codex', 'opencode')), {})
+        pid = agent.get('pid') if agent.get('comm') in ('claude', 'codex') else None
+        comm = agent.get('comm')
+    else:
+        if not isinstance(holder_pid, int) or isinstance(holder_pid, bool) or holder_pid <= 0:
+            raise ValueError('invalid holder pid')
+        pid, comm = holder_pid, process_comm(holder_pid)
     started = process_started(pid) if pid else None
     return dict(token_sha=token_sha(token), agent_pid=pid if started else None,
-                agent_comm=agent.get('comm'), agent_started=started or None, recorded_at=now().isoformat())
+                agent_comm=comm, agent_started=started or None, recorded_at=now().isoformat())
 
 
 def read_holder(token):
@@ -99,8 +113,8 @@ def read_holder(token):
     return {}
 
 
-def write_holder(token):
-    path = write_temp(holder_metadata(token))
+def write_holder(token, holder_pid=None):
+    path = write_temp(holder_metadata(token, holder_pid))
     try:
         os.replace(path, HOLD.with_name('priority-hold.owner.json'))
     finally:
@@ -165,11 +179,9 @@ def _hold_status(*, refresh_own=True):
         state.update(age_s=age, stale_in_s=max(0, stale_after-age))
         owner = read_holder(held)
         comm = owner.get('agent_comm')
-        state['agent_comm'] = comm if comm in ('claude', 'codex', 'opencode') else None
+        state['agent_comm'] = comm if isinstance(comm, str) and re.fullmatch(r'[A-Za-z0-9_.+-]{1,80}', comm) else None
         pid, started = owner.get('agent_pid'), owner.get('agent_started')
-        if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and isinstance(started, str) and started:
-            current = process_started(pid)
-            state['holder_alive'] = None if current is None else current == started
+        state['holder_alive'] = process_alive(pid, started)
         reason = ('holder_exited' if state['holder_alive'] is False else
                   'not_refreshed' if age > stale_after else None)
         if reason:
@@ -212,7 +224,7 @@ def hold_state():
     return state['present'], state['own_hold']
 
 
-def hold_acquire(token):
+def hold_acquire(token, *, holder_pid=None):
     if not token or token != token.strip():
         raise ValueError('hold token must be nonempty without surrounding whitespace')
     with metadata_lock():
@@ -229,7 +241,7 @@ def hold_acquire(token):
                 os.link(path, HOLD)
             except FileExistsError:
                 raise Busy(HOLD_REASON) from None
-            write_holder(token)
+            write_holder(token, holder_pid)
         finally:
             path.unlink(missing_ok=True)
 
@@ -246,13 +258,13 @@ def hold_refresh():
             os.utime(handle.fileno(), None)
 
 
-def hold_release():
+def hold_release(token=None):
     with metadata_lock():
         try:
             snapshot = hold_snapshot()
         except FileNotFoundError:
             return
-        token = os.environ.get('PHONE_HOLD_OWNER')
+        token = os.environ.get('PHONE_HOLD_OWNER') if token is None else token
         if not token or snapshot[1].strip() != token:
             raise Busy('hold is not yours')
         if not same_hold(snapshot, hold_snapshot()):
