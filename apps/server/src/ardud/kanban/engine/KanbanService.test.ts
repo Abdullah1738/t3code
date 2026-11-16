@@ -20625,6 +20625,84 @@ const lastText = (messages: ReadonlyArray<{ readonly blocks: ReadonlyArray<unkno
     ?.blocks.map((b) => ("text" in (b as object) ? (b as { text: string }).text : ""))
     .join("") ?? "";
 
+it.effect.each(
+  (["request", "discussion", "card"] as const).flatMap((kind) =>
+    (["timeout", "transport", "acknowledgement"] as const).flatMap((reason) =>
+      (["first", "scheduled", "sent", "stale same run"] as const).map((history) => ({
+        kind,
+        reason,
+        history,
+      })),
+    ),
+  ),
+)(
+  "unconfirmed evaluator acceptance never replays ($kind, $reason, $history)",
+  ({ kind, reason, history }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        yield* kanban.setPool(board.id, board.defaultCardModel, 0);
+        const card =
+          kind === "card"
+            ? yield* kanban.createCard(board.id, { title: "Audit", prompt: "Audit" }, owner)
+            : null;
+        const discussion =
+          kind === "request"
+            ? null
+            : card
+              ? yield* kanban.cardDiscussion(card.id)
+              : yield* kanban.createDiscussion(board.id, "Audit", owner);
+        if (discussion)
+          yield* kanban.post(discussion.id, owner, [{ _tag: "md", text: "Read the audit" }]);
+        const thread = discussion
+          ? (yield* kanban.discussion(discussion.id)).evaluatorThreadId!
+          : yield* kanban.startEvaluator(board.id, { kind: "request", text: "Read the audit" });
+        const prior: OrchestrationV2ProviderFailure = {
+          class: "provider_error",
+          code: null,
+          retryable: true,
+          message: "OpenCode is still stopping the previous turn.",
+        };
+        if (history !== "first") {
+          fake.failures.set(thread, prior);
+          yield* kanban.turnEnded(thread);
+          if (history === "sent") {
+            yield* TestClock.adjust("2 minutes");
+            yield* kanban.tick;
+          }
+        }
+        const failure = {
+          class: "provider_error" as const,
+          category: "transient" as const,
+          code: `provider_prompt_acceptance_${reason}`,
+          retryable: false,
+          message:
+            "OpenCode prompt acceptance is unconfirmed; check the session state before retrying.",
+        };
+        const before = yield* Ref.get(fake.threads);
+        const messages = [...before.get(thread)!.messages];
+        const ids = [...before.keys()];
+        if (history === "stale same run") Object.assign(prior, failure);
+        else {
+          fake.failures.set(thread, failure);
+          yield* kanban.turnEnded(thread);
+        }
+        yield* TestClock.adjust("3 minutes");
+        yield* kanban.tick;
+        yield* kanban.turnEnded(thread);
+        yield* TestClock.adjust("10 minutes");
+        yield* kanban.tick;
+        const after = yield* Ref.get(fake.threads);
+        assert.deepEqual([...after.keys()], ids);
+        assert.deepEqual(after.get(thread)!.messages, messages);
+        if (discussion)
+          assert.equal((yield* kanban.discussion(discussion.id)).evaluatorThreadId, thread);
+        assert.isNull((yield* kanban.caller(thread))?.paused ?? null);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
 it.effect("a failed evaluator run is retried once after two minutes", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
@@ -43711,6 +43789,49 @@ it.effect.each(["direct", "prior handoff", "deferred"] as const)(
         yield* kanban.tick;
         assert.strictEqual(yield* nudgesTo(fake, thread), before + 1);
       }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect.each(["timeout", "transport", "acknowledgement"] as const)(
+  "uncertain prompt acceptance %s stays stalled after a healthy model probe",
+  (reason) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      probe.ok = true;
+      probe.calls = 0;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const created = yield* kanban.createCard(
+          board.id,
+          { prompt: "check", title: "check" },
+          owner,
+        );
+        yield* kanban.dispatchNow;
+        const thread = (yield* kanban.card(created.id)).card.activeThreadId!;
+        const messages = (yield* Ref.get(fake.threads)).get(thread)!.messages;
+        const before = messages.length;
+        const failure = {
+          class: "provider_error" as const,
+          category: "transient" as const,
+          code: `provider_prompt_acceptance_${reason}`,
+          retryable: false,
+          message:
+            "OpenCode prompt acceptance unconfirmed; check the session state before retrying.",
+        };
+        fake.failures.set(thread, failure);
+        yield* kanban.turnEnded(thread);
+        const card = (yield* kanban.card(created.id)).card;
+        assert.equal(card.stage, "todo");
+        assert.equal(card.stalled?.reason, `Run failed: ${failure.message}`);
+        assert.isNull((yield* kanban.caller(thread))?.paused ?? null);
+        yield* TestClock.adjust("5 minutes");
+        yield* kanban.probeOutages;
+        yield* kanban.tick;
+        yield* kanban.dispatchNow;
+        assert.equal(probe.calls, 0);
+        assert.equal(messages.length, before);
+        assert.equal((yield* kanban.card(created.id)).card.stalled?.reason, card.stalled?.reason);
+      }).pipe(Effect.provide(probeLayer(fake.layer)));
     }),
 );
 

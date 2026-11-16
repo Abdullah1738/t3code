@@ -12319,6 +12319,16 @@ const make = Effect.gen(function* () {
         }
         return;
       }
+      if (Rules.isUnconfirmedPromptAcceptance(failure)) {
+        // A new evaluator can repeat the original prepare's plugin effects too.
+        // Retire any scheduled retry, keeping the failure for manual reconciliation.
+        yield* Ref.update(evaluatorFailures, (all) => {
+          const next = new Map(all);
+          next.delete(threadId);
+          return next;
+        });
+        return;
+      }
       if (entry?.state === "gone") {
         yield* endLink;
         return;
@@ -13178,6 +13188,14 @@ const make = Effect.gen(function* () {
         (entry.runId !== null && failure.success.runId !== entry.runId)
       )
         continue;
+      if (Rules.isUnconfirmedPromptAcceptance(failure.success)) {
+        yield* Ref.update(evaluatorFailures, (all) => {
+          const next = new Map(all);
+          next.delete(threadId);
+          return next;
+        });
+        continue;
+      }
       const action =
         entry.ownerDiscussion === undefined
           ? undefined

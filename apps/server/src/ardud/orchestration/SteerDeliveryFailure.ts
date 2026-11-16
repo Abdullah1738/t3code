@@ -1,4 +1,9 @@
-import { CommandId, EventId, TurnItemId } from "@t3tools/contracts";
+import {
+  CommandId,
+  EventId,
+  TurnItemId,
+  type OrchestrationV2ProviderFailure,
+} from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 
@@ -8,6 +13,7 @@ import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 
 export const persist = Effect.fn("SteerDeliveryFailure.persist")(function* (
   effect: EffectOutbox.OrchestrationEffectV2,
+  failure?: OrchestrationV2ProviderFailure,
 ) {
   if (effect.request.type !== "provider-turn.steer") return;
   const sink = yield* EventSink.EventSinkV2;
@@ -53,8 +59,11 @@ export const persist = Effect.fn("SteerDeliveryFailure.persist")(function* (
           parentItemId: null,
           ordinal: 0,
           status: "failed",
-          title: "Message delivery failed",
-          message: `Message ${messageId} was saved, but delivery to the provider failed.`,
+          title: failure === undefined ? "Message delivery failed" : "Message delivery unconfirmed",
+          message:
+            failure === undefined
+              ? `Message ${messageId} was saved, but delivery to the provider failed.`
+              : `Message ${messageId} was saved. ${failure.message}`,
           startedAt: now,
           completedAt: now,
           updatedAt: now,

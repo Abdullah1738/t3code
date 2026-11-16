@@ -34,6 +34,7 @@ import * as SteerDeliveryFailure from "../ardud/orchestration/SteerDeliveryFailu
 import * as EventSink from "./EventSink.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as RestartPacing from "../ardud/restart-pacing/RestartPacing.ts";
+import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 
 export class OrchestrationEffectExecutionError extends Schema.TaggedError<OrchestrationEffectExecutionError>()(
   "OrchestrationEffectExecutionError",
@@ -463,6 +464,7 @@ export const layerExecutor: Layer.Layer<
                 Effect.catch((error) =>
                   Effect.gen(function* () {
                     if (
+                      makeProviderFailure({ cause: error }).retryable === false ||
                       !("turnCompleted" in error) ||
                       !error.turnCompleted ||
                       effect.request.type !== "provider-turn.steer"
@@ -537,22 +539,26 @@ export const layerExecutor: Layer.Layer<
                       );
                   }),
                 ),
-                Effect.tapError(() =>
+                Effect.tapError((error) => {
+                  const failure = makeProviderFailure({ cause: error });
                   // Mailbox bookkeeping can fail after the provider accepted the input.
-                  willRetry || providerAccepted
-                    ? Effect.void
-                    : SteerDeliveryFailure.persist(effect).pipe(
-                        Effect.provideService(EventSink.EventSinkV2, eventSink),
-                        Effect.provideService(ProjectionStore.ProjectionStoreV2, projections),
-                        Effect.retry({ times: 2 }),
-                        Effect.catchCause(() =>
-                          Effect.logWarning(
-                            "orchestration-v2.effect-worker.steer-delivery-notice-failed",
-                            { effectId: effect.id, threadId: effect.threadId },
-                          ),
-                        ),
+                  if (providerAccepted || (willRetry && failure.retryable !== false))
+                    return Effect.void;
+                  return SteerDeliveryFailure.persist(
+                    effect,
+                    failure.retryable === false ? failure : undefined,
+                  ).pipe(
+                    Effect.provideService(EventSink.EventSinkV2, eventSink),
+                    Effect.provideService(ProjectionStore.ProjectionStoreV2, projections),
+                    Effect.retry({ times: 2 }),
+                    Effect.catchCause(() =>
+                      Effect.logWarning(
+                        "orchestration-v2.effect-worker.steer-delivery-notice-failed",
+                        { effectId: effect.id, threadId: effect.threadId },
                       ),
-                ),
+                    ),
+                  );
+                }),
                 Effect.mapError(
                   (cause) =>
                     new OrchestrationEffectExecutionError({
@@ -1201,6 +1207,10 @@ export const layerWithOptions = (
             return true;
           }
           const error = Cause.pretty(exit.cause);
+          // An unconfirmed steer may still be admitted after its HTTP request ends.
+          const uncertainSteer =
+            effect.request.type === "provider-turn.steer" &&
+            makeProviderFailure({ cause: exit.cause }).retryable === false;
           const nonRetryable = isNonRetryableProviderTurnControlFailure(effect.request.type, error);
           yield* Effect.logWarning("Orchestration effect execution failed", {
             effectId: effect.id,
@@ -1213,7 +1223,7 @@ export const layerWithOptions = (
             ? yield* outbox
                 .succeed({ effectId: effect.id, workerId })
                 .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))
-            : effect.attemptCount >= maxAttempts
+            : uncertainSteer || effect.attemptCount >= maxAttempts
               ? yield* outbox
                   .fail({ effectId: effect.id, workerId, error })
                   .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))

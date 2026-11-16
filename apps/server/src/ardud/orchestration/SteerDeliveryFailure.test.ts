@@ -42,6 +42,7 @@ import * as McpSessionRegistryTestkit from "../../mcp/McpSessionRegistry.testkit
 import * as ServerSettings from "../../serverSettings.ts";
 import * as SteerDeliveryFailure from "./SteerDeliveryFailure.ts";
 import * as RestartPacingTestkit from "../restart-pacing/RestartPacing.testkit.ts";
+import { ProviderPromptAcceptanceError } from "@t3tools/provider-core/server/failure";
 
 const threadId = ThreadId.make("thread:steer-delivery-failure");
 const messageId = MessageId.make("message:saved-steer");
@@ -239,6 +240,89 @@ const executorLayer = (
       ),
     ),
   );
+
+it.effect.each(
+  (["timeout", "transport", "acknowledgement"] as const).flatMap((reason) =>
+    [false, true].map((turnCompleted) => ({ reason, turnCompleted })),
+  ),
+)(
+  "never replays uncertain steering ($reason, completed=$turnCompleted)",
+  ({ reason, turnCompleted }) =>
+    Effect.gen(function* () {
+      yield* seed();
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const failure = new ProviderPromptAcceptanceError({
+        driver: ProviderDriverKind.make("opencode"),
+        serverOrigin: "http://opencode.test",
+        reason,
+        budgetSeconds: 60,
+      });
+      let calls = 0;
+      let followups = 0;
+      yield* outbox.enqueue([
+        { id: effect.id, commandId: effect.commandId, threadId, request: effect.request },
+      ]);
+      const layer = EffectWorker.layerWithOptions({ workerId: "uncertain-steer" }).pipe(
+        Layer.provide(
+          executorLayer(
+            () =>
+              Effect.suspend(() => {
+                calls++;
+                return Effect.fail(
+                  new ProviderControl.ProviderTurnControlError({
+                    threadId,
+                    providerTurnId,
+                    operation: "steer",
+                    turnCompleted,
+                    cause: failure,
+                  }),
+                );
+              }),
+            {
+              getThreadRecords: (id, fields, filter) =>
+                projections.getThreadRecords(id, fields, filter).pipe(Effect.orDie),
+              dispatch: () =>
+                Effect.sync(() => {
+                  followups++;
+                  return { sequence: 1, storedEvents: [] };
+                }),
+            },
+          ),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        assert.isTrue(yield* worker.runOnce);
+        yield* TestClock.adjust("30 seconds");
+        assert.isFalse(yield* worker.runOnce);
+      }).pipe(Effect.provide(layer));
+      assert.equal(calls, 1);
+      assert.equal(followups, 0);
+      const saved = yield* outbox.get(effect.id);
+      assert.isTrue(Option.isSome(saved));
+      if (Option.isNone(saved)) return;
+      assert.equal(saved.value.status, "failed");
+      const projection = yield* projections.getThreadProjection(threadId);
+      assert.lengthOf(projection.visibleTurnItems, 1);
+      const notices = projection.turnItems;
+      assert.lengthOf(notices, 1);
+      const notice = notices[0]!;
+      assert.equal(notice.type, "system_notice");
+      if (notice.type !== "system_notice") return;
+      assert.include(
+        notice.message,
+        reason === "timeout"
+          ? "OpenCode did not confirm prompt acceptance within 60 seconds"
+          : reason === "transport"
+            ? "OpenCode prompt connection failed"
+            : "OpenCode prompt acknowledgement could not be read",
+      );
+      assert.include(notice.message, "http://opencode.test");
+      assert.include(notice.message, "Acceptance is unconfirmed");
+      assert.equal(notice.title, "Message delivery unconfirmed");
+    }).pipe(Effect.provide(testLayer)),
+);
 
 it.effect(
   "persists one visible notice with actual control metadata when the same effect is replayed",
