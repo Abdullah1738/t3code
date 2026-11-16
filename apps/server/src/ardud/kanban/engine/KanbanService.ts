@@ -16263,7 +16263,7 @@ const make = Effect.gen(function* () {
     yield* checkText(cardTextFields(input));
     // A thread's or a script's card waits for an evaluator to write its packet;
     // the owner's and the evaluators' own come written.
-    const packet = actor._tag === "thread" || actor._tag === "script";
+    const packet = Subtasks.needsPacketStep(actor);
     const fields = packet
       ? { ...input, subtasks: Subtasks.withPacketStep(input.subtasks ?? []) }
       : input;
