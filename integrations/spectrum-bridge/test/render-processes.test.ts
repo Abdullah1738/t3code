@@ -6,11 +6,11 @@ import { createToolLog } from "../src/toollog.ts";
 import { renderCounts } from "../src/log-render-store.ts";
 
 const day = () => new Date().toISOString().slice(0, 10);
-async function cli(root: string, extra: string[] = [], logged = true) {
+async function cli(root: string, extra: string[] = [], logged = true, preload?: string) {
   const { BUN_INSPECT, ...env } = process.env;
   const values = new Map([["--kind", "delivery"], ["--chat", "owner"], ["--ms", "7"], ["--ok", "true"]]);
   for (let i = 0; i < extra.length; i += 2) values.set(extra[i]!, extra[i + 1]!);
-  const child = Bun.spawn([process.execPath, "src/cli.ts", "log-card-render", ...[...values].flat()], {
+  const child = Bun.spawn([process.execPath, ...(preload ? ["--preload", preload] : []), "src/cli.ts", "log-card-render", ...[...values].flat()], {
     cwd: resolve(import.meta.dir, ".."), env: { ...env, NODE_ENV: "test", TOOLLOG_DIR: root }, stdout: "pipe", stderr: "pipe",
   });
   const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
@@ -26,6 +26,32 @@ function rows(root: string) {
   return readdirSync(root).filter(file => file.endsWith(".ndjson")).flatMap(file =>
     readFileSync(join(root, file), "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)));
 }
+
+test.each(["timestamp", "aggregation"])("renderer CLI rejects a %s failure before the counter write", async phase => {
+  const root = mkdtempSync(join(tmpdir(), "render-prepare-failure-"));
+  const preload = join(root, "fault.ts");
+  try {
+    writeFileSync(preload, phase === "timestamp" ? `
+      const original = Date.prototype.toISOString;
+      Date.prototype.toISOString = function () {
+        Date.prototype.toISOString = original;
+        throw new Error("PRIVATE timestamp failure");
+      };
+    ` : `
+      const original = Map.prototype.set;
+      Map.prototype.set = function (key, value) {
+        if (key === "delivery-renderer\\0delivery\\0owner") {
+          Map.prototype.set = original;
+          throw new Error("PRIVATE aggregation failure");
+        }
+        return original.call(this, key, value);
+      };
+    `);
+    await cli(root, [], false, preload);
+    expect(renderCounts(root, day()).count).toBe(0);
+    expect(JSON.stringify(rows(root))).not.toContain("PRIVATE");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 test("independent renderer CLIs share exact counters, retain only failed/slow rows, and refresh both rollup readers", async () => {
   const parent = mkdtempSync(join(tmpdir(), "render-processes-"));

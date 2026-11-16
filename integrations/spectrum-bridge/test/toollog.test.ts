@@ -148,8 +148,22 @@ test("empty days roll up once, and a broken clock cannot reject any logger opera
   expect(await log.rollup(day)).toMatchObject({ total: 0, day, topErrorTags: [] });
   const broken = createToolLog({ now: () => { throw new Error("clock unavailable"); } });
   expect(() => broken.write(entry)).not.toThrow();
+  expect(broken.flush()).toBe(false);
+  expect(broken.flush()).toBe(true);
   await expect(broken.rollup()).resolves.toBeUndefined();
   await expect(broken.tick()).resolves.toBeUndefined();
+});
+
+test("rejected entries and failed capture cannot pass the next flush acknowledgement", () => {
+  const { log, lines } = setup();
+  log.write({ ...entry, component: "invalid component" });
+  expect(log.flush()).toBe(false);
+  expect(() => log.capture(() => { throw new Error("PRIVATE capture failure"); })).not.toThrow();
+  expect(log.flush()).toBe(false);
+  log.write(entry);
+  expect(log.flush()).toBe(true);
+  expect(lines()).toHaveLength(1);
+  expect(JSON.stringify(lines())).not.toContain("PRIVATE");
 });
 
 // Process and recovery records share the same schema without any payload content.
