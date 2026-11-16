@@ -433,13 +433,18 @@ export function waitingOnBackground(
     readonly state: string;
     readonly quietSince: string;
     readonly backgroundWork: number;
+    readonly backgroundWorkUntil?: string;
     readonly prWatches: number;
   },
   nowMs: number,
 ): boolean {
   return (
     view.state === "idle" &&
-    ((view.backgroundWork > 0 && nowMs - Date.parse(view.quietSince) < BACKGROUND_GRACE_MS) ||
+    ((view.backgroundWork > 0 &&
+      nowMs <
+        (view.backgroundWorkUntil === undefined
+          ? Date.parse(view.quietSince) + BACKGROUND_GRACE_MS
+          : Date.parse(view.backgroundWorkUntil))) ||
       // Reviewers never hold PR watches, so this shared guard needs no role check.
       (view.prWatches > 0 && nowMs - Date.parse(view.quietSince) < PR_WATCH_GRACE_MS))
   );

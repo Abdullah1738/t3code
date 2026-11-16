@@ -3712,6 +3712,43 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             SELECT payload_json
             FROM orchestration_v2_projection_subagents
             WHERE thread_id = ${threadId}
+              ${
+                filter?.pendingBackgroundTasksOnly
+                  ? sql`AND json_extract(payload_json, '$.origin') = 'app_owned'
+                AND (status IN ('pending', 'running', 'waiting')
+                  OR (status IN ('completed', 'failed', 'cancelled', 'interrupted')
+                    AND json_extract(payload_json, '$.completionDelivery.state') IN ('pending', 'claimed'))
+                  OR (status IN ('completed', 'failed', 'cancelled', 'interrupted') AND EXISTS (
+                    WITH RECURSIVE descendants(thread_id) AS (
+                      SELECT orchestration_v2_projection_subagents.child_thread_id
+                      UNION
+                      SELECT child.child_thread_id
+                      FROM descendants
+                      JOIN orchestration_v2_projection_subagents AS child
+                        ON child.thread_id = descendants.thread_id
+                      WHERE json_extract(child.payload_json, '$.origin') = 'app_owned'
+                        AND child.status IN ('completed', 'failed', 'cancelled', 'interrupted')
+                        AND child.child_thread_id IS NOT NULL
+                    )
+                    SELECT 1 FROM descendants WHERE EXISTS (
+                    SELECT 1 FROM orchestration_v2_projection_subagents AS child
+                    WHERE child.thread_id = descendants.thread_id
+                      AND (child.status IN ('pending', 'running', 'waiting')
+                        OR json_extract(child.payload_json, '$.completionDelivery.state') IN ('pending', 'claimed'))
+                  )
+                  OR EXISTS (
+                    SELECT 1 FROM orchestration_v2_projection_turn_items AS item
+                    WHERE item.thread_id = descendants.thread_id
+                      AND item.type IN ('command_execution', 'dynamic_tool', 'subagent')
+                      AND item.status IN ('pending', 'running', 'waiting')
+                  )
+                  OR EXISTS (
+                    SELECT 1 FROM orchestration_v2_projection_provider_threads AS provider
+                    WHERE provider.thread_id = descendants.thread_id
+                      AND json_array_length(provider.payload_json, '$.pendingBackgroundTasks') > 0
+                  ))))`
+                  : sql``
+              }
             ORDER BY COALESCE(started_at, ''), subagent_id ASC
           `
               : sql<PayloadRow>`
@@ -8038,7 +8075,8 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
       ),
       getThreadRecords: Effect.fn("ProjectionStore.getThreadRecords")(
         function* (threadId, fields, filter) {
-          const projection = (yield* Ref.get(replayState)).projections.get(threadId);
+          const state = yield* Ref.get(replayState);
+          const projection = state.projections.get(threadId);
           if (projection === undefined)
             return yield* new ProjectionStoreThreadNotFoundError({ threadId });
           const newest = filter?.latestRunOnly
@@ -8084,6 +8122,53 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
                   ? 0
                   : -Math.max(1, Math.min(200, Math.floor(filter.recentTurnItemLimit))),
               ),
+            subagents: filter?.pendingBackgroundTasksOnly
+              ? projection.subagents.filter((task) => {
+                  if (task.origin !== "app_owned") return false;
+                  if (
+                    ["pending", "running", "waiting"].includes(task.status) ||
+                    (["completed", "failed", "cancelled", "interrupted"].includes(task.status) &&
+                      (task.completionDelivery?.state === "pending" ||
+                        task.completionDelivery?.state === "claimed"))
+                  )
+                    return true;
+                  if (!["completed", "failed", "cancelled", "interrupted"].includes(task.status))
+                    return false;
+                  const descendants = new Set(
+                    task.childThreadId === null ? [] : [task.childThreadId],
+                  );
+                  for (const childId of descendants) {
+                    const child = state.projections.get(childId);
+                    if (child === undefined) continue;
+                    if (
+                      child.subagents.some(
+                        (nested) =>
+                          ["pending", "running", "waiting"].includes(nested.status) ||
+                          nested.completionDelivery?.state === "pending" ||
+                          nested.completionDelivery?.state === "claimed",
+                      ) ||
+                      child.turnItems.some(
+                        (item) =>
+                          ["command_execution", "dynamic_tool", "subagent"].includes(item.type) &&
+                          ["pending", "running", "waiting"].includes(item.status),
+                      ) ||
+                      child.providerThreads.some(
+                        (provider) => (provider.pendingBackgroundTasks?.length ?? 0) > 0,
+                      )
+                    )
+                      return true;
+                    for (const nested of child.subagents) {
+                      if (
+                        nested.origin === "app_owned" &&
+                        nested.childThreadId !== null &&
+                        ["completed", "failed", "cancelled", "interrupted"].includes(nested.status)
+                      )
+                        descendants.add(nested.childThreadId);
+                    }
+                  }
+                  return false;
+                })
+              : projection.subagents,
             providerThreads:
               filter?.providerSessionId === undefined &&
               filter?.providerThreadIds === undefined &&

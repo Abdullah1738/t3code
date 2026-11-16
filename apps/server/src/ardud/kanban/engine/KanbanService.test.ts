@@ -131,6 +131,7 @@ interface FakeThread {
   stuck?: boolean;
   quietSince?: string;
   background?: number;
+  backgroundWorkUntil?: string;
   prWatches?: number;
   archived: boolean;
 }
@@ -220,6 +221,9 @@ const makeFake = Effect.gen(function* () {
             runId: thread.runId ?? null,
             runRequestedAt: thread.runRequestedAt ?? null,
             backgroundWork: thread.background ?? 0,
+            ...(thread.backgroundWorkUntil === undefined
+              ? {}
+              : { backgroundWorkUntil: thread.backgroundWorkUntil }),
             prWatches: thread.prWatches ?? 0,
             prs: prs.get(threadId) ?? [],
             archived: thread.archived,
@@ -40031,4 +40035,65 @@ it.effect.each(["quota", "transient"] as const)(
         assert.isNotNull((yield* kanban.caller(thread))?.paused);
       }).pipe(Effect.provide(testLayer(fake.layer)));
     }),
+);
+
+it.effect.each([
+  "active child",
+  "active child with queued followup",
+  "watcher grandchild",
+  "completed child with watcher",
+  "completed ancestor chain with watcher",
+  "resumed child with live sibling watcher",
+  "completion delivery",
+] as const)(
+  "holds the worker nudge for %s after an hour of parent quiet, then releases silent work",
+  (kind) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+        const { kanban, board } = yield* toyBoard;
+        const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+        yield* kanban.dispatchNow;
+        const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+        const worker = (yield* Ref.get(fake.threads)).get(thread)!;
+        worker.background = 1;
+        // Both paths use the same bounded background hold. Delivery keeps the final result pending.
+        worker.backgroundWorkUntil =
+          kind === "completion delivery" ? "2026-10-25T15:05:00.000Z" : "2026-10-25T14:20:00.000Z";
+        yield* TestClock.adjust("65 minutes");
+        yield* kanban.turnEnded(thread);
+        yield* kanban.tick;
+        assert.strictEqual(yield* nudgesTo(fake, thread), 0);
+        yield* TestClock.setTime(Date.parse(worker.backgroundWorkUntil));
+        yield* kanban.tick;
+        assert.strictEqual(yield* nudgesTo(fake, thread), 1);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect("a completion wake starts without a handoff nudge and nothing pending still nudges", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+      const worker = (yield* Ref.get(fake.threads)).get(thread)!;
+      worker.background = 1;
+      worker.backgroundWorkUntil = "2026-10-25T14:00:00.000Z";
+      yield* kanban.turnEnded(thread);
+      assert.strictEqual(yield* nudgesTo(fake, thread), 0);
+      worker.running = true;
+      worker.background = 0;
+      yield* kanban.turnEnded(thread);
+      yield* kanban.tick;
+      assert.strictEqual(yield* nudgesTo(fake, thread), 0);
+      worker.running = false;
+      yield* kanban.turnEnded(thread);
+      assert.strictEqual(yield* nudgesTo(fake, thread), 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
 );
