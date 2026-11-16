@@ -268,7 +268,7 @@ class PollBackoff(unittest.TestCase):
             yield cfg, fetch, reads
 
     def test_real_fetch_success_and_cached_success_ignore_optional_notification_errors(self):
-        warning_forms = [[], ['notification_collector_stale'], ['notifications_priority_hold'],
+        warning_forms = [[], ['notification_collector_stale'], ['notifications_priority_hold_stale'],
                          ['notifications_OperationalError'], ['notifications_TimeoutExpired'],
                          ['notification_collector_stale', 'notifications_RuntimeError']]
         for warnings in warning_forms:
@@ -309,7 +309,7 @@ class PollBackoff(unittest.TestCase):
     def test_real_fetch_amazon_failures_still_back_off_with_optional_notifications(self):
         forms = [({'account': 'timeout'}, (), None),
                  ({1: 'read failed'}, ('notification_collector_stale',), None),
-                 (None, ('notifications_priority_hold',), subprocess.TimeoutExpired('fixture', 35))]
+                 (None, ('notifications_priority_hold_stale',), subprocess.TimeoutExpired('fixture', 35))]
         push = {'stage': 'delivered', 'observed_at': t.stamp(self.clock), 'confidence': 'exact_order'}
         for failures, warnings, exception in forms:
             with self.subTest(failures=failures, warnings=warnings, exception=type(exception).__name__):

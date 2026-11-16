@@ -211,6 +211,8 @@ export interface KanbanThreadsShape {
   >;
   readonly launch: (input: KanbanLaunchInput) => Effect.Effect<ThreadId, KanbanThreadError>;
   readonly send: (input: KanbanSendInput) => Effect.Effect<string | void, KanbanThreadError>;
+  /** Recovers the durable recipient of a keyed send, including across service restarts. */
+  readonly acceptedSend?: (key: string) => Effect.Effect<ThreadId | null, KanbanThreadError>;
   readonly withdraw: (input: {
     readonly threadId: ThreadId;
     readonly key: string;
@@ -883,6 +885,26 @@ const make = Effect.gen(function* () {
     return id;
   });
 
+  const acceptedSend = Effect.fn("KanbanThreads.acceptedSend")(
+    function* (key: string) {
+      for (let attempt = 0; ; attempt += 1) {
+        const identity = attempt === 0 ? key : `${key}:retry:${attempt}`;
+        const receipt = yield* readSendReceipt(CommandId.make(`kanban:send:${identity}`), false);
+        if (Option.isNone(receipt)) return null;
+        if (
+          receipt.value.aggregateKind !== "thread" ||
+          receipt.value.commandType !== "message.dispatch"
+        )
+          return yield* new KanbanThreadError({
+            operation: "send",
+            detail: "keyed send receipt belongs to another command",
+          });
+        if (receipt.value.status === "accepted") return ThreadId.make(receipt.value.aggregateId);
+      }
+    },
+    Effect.mapError((error) => sendError(error)),
+  );
+
   const send: KanbanThreadsShape["send"] = Effect.fn("KanbanThreads.send")(
     function* (input) {
       let acceptedMessageId: string | undefined;
@@ -1313,6 +1335,7 @@ const make = Effect.gen(function* () {
     runSettled,
     launch,
     send,
+    acceptedSend,
     withdraw,
     setModel,
     queuedRuns,

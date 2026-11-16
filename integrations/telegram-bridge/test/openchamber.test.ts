@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { toolError } from "../src/toollog.ts";
 import { useToolLogFixture } from "./toollog-fixture.ts";
 import { OpenChamber, type JsonValue } from "../src/openchamber.ts";
 import { parseNotificationEvent } from "../src/notification-events.ts";
@@ -137,4 +138,68 @@ describe("notification events", () => {
   });
 });
 
-useToolLogFixture();
+const legacyLogs = useToolLogFixture();
+
+test("legacy backend preserves sanitized wrapper diagnostics", async () => {
+  const original = globalThis.fetch;
+  const client = new OpenChamber("http://127.0.0.1:1");
+  const secret = "private-thread-id private-title private-token private-message";
+  const cases: Array<{ error: unknown; props: Record<string, string> }> = [
+    { error: new TypeError(secret), props: { cause: "unclassified", detail: "TypeError", errorClass: "TypeError" } },
+    { error: { code: "UND_ERR_SOCKET", message: secret }, props: { cause: "socket_closed", detail: "UND_ERR_SOCKET" } },
+    { error: secret, props: { cause: "non_error", detail: "String" } },
+  ];
+  try {
+    for (const { error: failure, props } of cases) {
+      globalThis.fetch = Object.assign(async () => { throw failure; }, { preconnect: original.preconnect });
+      try { await client.request("/api/permission/request"); } catch (error) { toolError("telegram", "tg.attention.pendingRequests", undefined, error); }
+      expect(legacyLogs.entries().at(-1)?.props).toEqual(props);
+    }
+  } finally { globalThis.fetch = original; }
+  for (const part of secret.split(" ")) expect(legacyLogs.text()).not.toContain(part);
+});
+
+
+test("legacy fetch and JSON body failures preserve every non-Error input form", async () => {
+  const original = globalThis.fetch;
+  const client = new OpenChamber("http://127.0.0.1:1");
+  const secret = "private-thread-id private-title private-token private-message";
+  const cases: Array<{ failure: unknown; cause: string; detail: string }> = [
+    { failure: undefined, cause: "non_error", detail: "Undefined" },
+    { failure: null, cause: "non_error", detail: "Null" },
+    { failure: "", cause: "non_error", detail: "String" },
+    { failure: secret, cause: "non_error", detail: "String" },
+    { failure: 0, cause: "non_error", detail: "Number" },
+    { failure: 123, cause: "non_error", detail: "Number" },
+    { failure: NaN, cause: "non_error", detail: "Number" },
+    { failure: false, cause: "non_error", detail: "Boolean" },
+    { failure: true, cause: "non_error", detail: "Boolean" },
+    { failure: 0n, cause: "non_error", detail: "BigInt" },
+    { failure: Symbol(secret), cause: "non_error", detail: "Symbol" },
+    { failure: () => secret, cause: "non_error", detail: "Function" },
+    { failure: { message: secret }, cause: "unclassified", detail: "Object" },
+    { failure: [secret], cause: "unclassified", detail: "Array" },
+  ];
+  try {
+    for (const { failure, cause, detail } of cases) {
+      for (const stage of ["fetch", "body"]) {
+        globalThis.fetch = Object.assign(async () => {
+          if (stage === "fetch") throw failure;
+          // ReadableStream.error(undefined) can close instead of rejecting on some runtimes.
+          const response = new Response();
+          response.json = async () => { throw failure; };
+          return response;
+        }, { preconnect: original.preconnect });
+        let caught: unknown;
+        try { await client.request("/api/permission/request"); } catch (error) { caught = error; }
+        expect(caught).toBeInstanceOf(Error);
+        toolError("telegram", "tg.attention.pendingRequests", undefined, caught);
+        const props: Record<string, string> = { cause, detail };
+        if (cause === "unclassified") props.errorClass = detail;
+        expect(legacyLogs.entries().at(-1)?.props).toEqual(props);
+      }
+    }
+  } finally { globalThis.fetch = original; }
+  expect(legacyLogs.entries().filter(row => row.error?.tag === "tg.attention.pendingRequests")).toHaveLength(cases.length * 2);
+  for (const part of secret.split(" ")) expect(legacyLogs.text()).not.toContain(part);
+});

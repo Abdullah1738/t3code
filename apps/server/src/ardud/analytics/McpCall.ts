@@ -12,6 +12,10 @@ import { McpSchema } from "effect/ai";
 type Phase = NonNullable<AnalyticsEvent["errorPhase"]>;
 type ThreadReadStage = NonNullable<AnalyticsEvent["threadReadStages"]>[number];
 type MutableThreadReadStage = { -readonly [K in keyof ThreadReadStage]: ThreadReadStage[K] };
+type TaskLookup = Pick<
+  NonNullable<AnalyticsEvent["props"]>,
+  "foundBy" | "notFoundReason" | "idCanonical" | "idShape"
+>;
 
 export class McpCall extends Context.Service<
   McpCall,
@@ -38,6 +42,12 @@ export class McpCall extends Context.Service<
       queryMs: number;
       renderMs: number;
       threadReadStages: Array<MutableThreadReadStage>;
+      acknowledgement?: "may_have_completed" | "completed";
+      phase?: {
+        name: "lane_wait" | "query" | "render";
+        started: bigint;
+        elapsed: { lane_wait: number; query: number; render: number };
+      };
       activeStage?: {
         readonly row: MutableThreadReadStage;
         readonly started: bigint;
@@ -70,6 +80,7 @@ export class McpCall extends Context.Service<
     waitLookupMs?: number;
     phase: Phase;
     saved: boolean | "unknown";
+    taskLookup?: TaskLookup;
     replyFailure?: "reply_timeout" | "reply_error";
     replyStage?: string;
     replySubSteps?: ReadonlyArray<{ readonly subStep: string; readonly ms: number }>;
@@ -170,7 +181,12 @@ export const failedPhase = Effect.fnUntraced(function* (phase: string) {
   const call = yield* Effect.serviceOption(McpCall);
   if (call._tag === "Some")
     call.value.phase =
-      phase === "caller" || phase === "dispatch" || phase === "result"
+      phase === "caller" ||
+      phase === "dispatch" ||
+      phase === "result" ||
+      phase === "lane_wait" ||
+      phase === "query" ||
+      phase === "render"
         ? phase
         : phase === "records"
           ? "result"
@@ -181,6 +197,28 @@ export const failedPhase = Effect.fnUntraced(function* (phase: string) {
 export const setSaved = Effect.fnUntraced(function* (saved: boolean) {
   const call = yield* Effect.serviceOption(McpCall);
   if (call._tag === "Some") call.value.saved = saved;
+});
+
+// readTask owns the lookup span; retain only categories in the call ledger.
+export const setTaskLookup = Effect.fnUntraced(function* (
+  lookup: Required<Pick<TaskLookup, "foundBy" | "idCanonical">> & TaskLookup,
+) {
+  const call = yield* Effect.serviceOption(McpCall);
+  if (call._tag === "None") return;
+  // Internal status/cancel/ack reads must not erase evidence from the input lookup.
+  const previous = call.value.taskLookup;
+  call.value.taskLookup =
+    previous?.foundBy !== undefined && previous.foundBy !== "none"
+      ? {
+          ...previous,
+          ...lookup,
+          foundBy: previous.foundBy,
+          idCanonical: previous.idCanonical ?? lookup.idCanonical,
+        }
+      : { ...previous, ...lookup };
+  if (lookup.foundBy !== "none") call.value.saved = true;
+  else if (lookup.notFoundReason === "never_saved" && call.value.saved !== true)
+    call.value.saved = false;
 });
 
 // Capture the receipt lookup before dispatch so interruption cannot hide a committed command.
@@ -220,12 +258,14 @@ export function callOutcome(
   exit: Exit.Exit<McpSchema.CallToolResult | McpSchema.InputRequired, unknown>,
   state: McpCall["Service"],
 ): Pick<AnalyticsEvent, "outcome" | "errorTag" | "errorPhase" | "saved" | "props"> {
+  const { notFoundReason, ...taskLookup } = state.taskLookup ?? {};
   if (exit._tag === "Failure" && Cause.hasInterruptsOnly(exit.cause))
     return {
       outcome: "interrupted",
       saved: state.saved,
       errorPhase: state.phase,
       props: {
+        ...taskLookup,
         code: "unknown",
         ...interruptionProps(exit.cause),
         ...(state.replySubSteps === undefined ? {} : { subSteps: state.replySubSteps }),
@@ -260,8 +300,12 @@ export function callOutcome(
         ? encodedError
         : content;
   const classified = classifyFailure(error);
-  const code = state.handlerErrorTag ?? classified?.tag;
-  const typedOutcome = state.handlerOutcome ?? classified?.outcome;
+  // The boundary deadline wins over a detached handler's cancellation/cleanup failure.
+  const readTimeout = classified?.tag === "ThreadReadTimeoutError";
+  const code = readTimeout ? classified.tag : (state.handlerErrorTag ?? classified?.tag);
+  const typedOutcome = readTimeout
+    ? classified.outcome
+    : (state.handlerOutcome ?? classified?.outcome);
   const inputRequired = exit._tag === "Success" && exit.value instanceof McpSchema.InputRequired;
   const failed =
     inputRequired ||
@@ -331,6 +375,8 @@ export function callOutcome(
         : "ok",
     saved,
     props: {
+      ...taskLookup,
+      ...(code === "task_not_found" && notFoundReason !== undefined ? { notFoundReason } : {}),
       ...(state.replyStage === undefined ? {} : { phase: state.replyStage }),
       ...(state.replySubSteps === undefined ? {} : { subSteps: state.replySubSteps }),
       code:
@@ -373,12 +419,15 @@ export function callOutcome(
                             ? "Defect"
                             : "McpToolError"))),
           errorPhase:
-            code === "caller_unresolved" ||
-            (partial && state.phase === "caller" && !state.callerResolved)
-              ? "caller"
-              : replyTooLarge || state.replyFailure || partial || waitTimedOut || requestTimedOut
-                ? "result"
-                : state.phase,
+            readTimeout &&
+            (error.phase === "lane_wait" || error.phase === "query" || error.phase === "render")
+              ? error.phase
+              : code === "caller_unresolved" ||
+                  (partial && state.phase === "caller" && !state.callerResolved)
+                ? "caller"
+                : replyTooLarge || state.replyFailure || partial || waitTimedOut || requestTimedOut
+                  ? "result"
+                  : state.phase,
         }
       : {}),
   };

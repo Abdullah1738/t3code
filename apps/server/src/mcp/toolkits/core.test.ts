@@ -70,8 +70,7 @@ const layerOrchestratorToolkit = McpHttpServer.layerOrchestratorToolkit.pipe(
   Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
 );
 
-// Effect returns a declared tool failure as `isError` with its encoded payload
-// as JSON text, never as `structuredContent`.
+// Read Effect's encoded failure text independently of McpHttpServer's structured copy.
 const declaredFailure = (result: McpSchema.CallToolResult) => {
   const text = result.content[0];
   return result.isError === true && text?.type === "text" ? JSON.parse(text.text) : undefined;
@@ -174,7 +173,7 @@ it.effect("checks capability through the production registration", () =>
       );
     expect(declaredFailure(result)).toMatchObject({ code: "capability_denied" });
     expect(result.isError).toBe(true);
-    expect(result.structuredContent).toBeUndefined();
+    expect(result.structuredContent).toEqual(declaredFailure(result));
   }).pipe(
     Effect.provide(
       layerThreadToolkit.pipe(
@@ -212,7 +211,7 @@ it.effect("returns a bounded public failure without serializing storage causes",
     const validate = new AjvJsonSchemaValidator().getValidator(
       definition!.tool.outputSchema! as JsonSchemaType,
     );
-    expect(result.structuredContent).toBeUndefined();
+    expect(result.structuredContent).toEqual(declaredFailure(result));
     expect(validate({ sequence: 1 }).valid).toBe(true);
     expect(validate({ code: "orchestration_error" }).valid).toBe(false);
     expect(validate({ sequence: "invalid" }).valid).toBe(false);

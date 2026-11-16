@@ -118,6 +118,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   let recovery: Promise<void> | undefined;
   const calls = createCallAggregation(processRunId);
   const renders = createRenderAggregation();
+  let writeFailed = false;
   function append(entry: Entry, stamp?: string): void {
     let fd: number | undefined;
     try {
@@ -149,11 +150,18 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
         finally { if (marker !== undefined) closeSync(marker); }
         const renderDetail = line.name === "card.render" && (line.ok === false || (line.durationMs ?? 0) > 1_000);
         const slowOrFailedCall = line.name === "turn.robob_call" && ((line.durationMs ?? 0) > SLOW_CALL_MS || line.ok === false);
-        if (line.kind !== "error" && !["turn.start", "turn.end", "turn.robob_calls"].includes(line.name) && !slowOrFailedCall && !renderDetail) return;
+        if (line.kind !== "error" && !["turn.start", "turn.end", "turn.robob_calls"].includes(line.name) && !slowOrFailedCall && !renderDetail) {
+          if (line.name === "card.render" || line.name === "card.renders") writeFailed = true;
+          return;
+        }
       }
       if (line.name === "card.renders" && line.renders) recordRenderCounts(dir, line);
       else appendFileSync(fd, JSON.stringify(line) + "\n");
-    } catch { /* Logging must never affect the caller. */ }
+    } catch (error) {
+      writeFailed = true;
+      if (entry.name === "card.renders") append({ component: "logger", kind: "error", name: "bridge.catch", ok: false,
+        error: { tag: "render.counters.write", cause: error } }, stamp);
+    }
     finally { if (fd !== undefined) { try { closeSync(fd); } catch { /* Best effort. */ } } }
   }
   const pending: LogLine[] = [];
@@ -180,6 +188,13 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
       }
     } catch { /* Optional logging never affects the caller. */ }
   }
+  function readRenderCounts(dir: string, day: string): ReturnType<typeof renderCounts> {
+    try { return renderCounts(dir, day); }
+    catch (error) {
+      write({ component: "logger", kind: "error", name: "bridge.catch", ok: false, error: { tag: "render.counters.read", cause: error } });
+      throw error;
+    }
+  }
   async function saveRollup(dir: string, day: string, result: unknown): Promise<void> {
     const path = join(dir, `rollup-${day}.json`);
     const temporary = join(dir, `.rollup-${day}-${randomUUID()}.tmp`);
@@ -201,7 +216,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
       const sources = chainSources(logSources(dir), day);
       const sourceBytes = sources[day] ?? 0;
       const later = Object.fromEntries(Object.entries(sources).filter(([date]) => date > day));
-      const renders = renderCounts(dir, day);
+      const renders = readRenderCounts(dir, day);
       const result = { day, tool: "imessage", sourceBytes, renderSourceCount: renders.count, chainSources: sources,
         ...await summarizeLog(records(dir, { [day]: sourceBytes }), records(dir, later), renders.lines) };
       await saveRollup(dir, day, result);
@@ -264,10 +279,14 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
       if (pending !== undefined) refreshChains(pending);
     });
   }
-  function flushAll(): void {
+  function flushAll(): boolean {
     for (const line of renders.flush()) enqueue(line);
     for (const line of calls.flush()) enqueue(line);
     flush();
+    // Optional logging stays best effort; explicit CLI acknowledgements check this result.
+    const written = !writeFailed;
+    writeFailed = false;
+    return written;
   }
   async function settled(): Promise<void> {
     await Promise.resolve();
@@ -287,7 +306,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
     catch { return; }
   }
   function validOwnDay(saved: Rollup, day: string, bytes: number): saved is NonNullable<Rollup> {
-    return Boolean(saved?.day === day && saved.tool === "imessage" && saved.sourceBytes === bytes && saved.renderSourceCount === renderCounts(root(), day).count
+    return Boolean(saved?.day === day && saved.tool === "imessage" && saved.sourceBytes === bytes && saved.renderSourceCount === readRenderCounts(root(), day).count
       && Number.isSafeInteger(saved.total) && saved.total >= 0 && saved.byComponent && saved.chains && Array.isArray(saved.topErrorTags) && Array.isArray(saved.topCauses));
   }
   function recoverRollups(at: number, hourly: boolean, yesterday?: string): Promise<void> {
@@ -328,7 +347,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
           for await (const line of records(dir, { [day]: sources[day] ?? 0 })) { chains.accept(line); yield line; }
         }
         if (stale.has(day) && !cached.has(day)) {
-          const renders = renderCounts(dir, day);
+          const renders = readRenderCounts(dir, day);
           renderSnapshots.set(day, renders);
           summaries.set(day, await summarizeLog(scan(), undefined, renders.lines));
         }

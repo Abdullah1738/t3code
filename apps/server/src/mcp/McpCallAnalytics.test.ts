@@ -3,12 +3,17 @@ import { expect, it } from "@effect/vitest";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- isolated loopback MCP integration.
 import * as NodeHttp from "node:http";
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { HttpRouter } from "effect/http";
 import { makeHttpSocketTelemetry } from "../ardud/http/HttpSocketTelemetry.ts";
 import * as McpSessionRegistry from "./McpSessionRegistry.ts";
 import {
   AnalyticsEvent,
   CommandId,
+  NodeId,
+  RunId,
+  type OrchestrationV2Run,
+  type OrchestrationV2Subagent,
   EnvironmentId,
   OrchestratorMcpFailure,
   ProviderInstanceId,
@@ -38,6 +43,7 @@ import * as Scope from "effect/Scope";
 import * as TestClock from "effect/testing/TestClock";
 import * as Queue from "effect/Queue";
 import * as Tracer from "effect/Tracer";
+import * as DateTime from "effect/DateTime";
 import { HttpServerRequest, HttpServerResponse } from "effect/http";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -59,9 +65,21 @@ import {
 import * as Testkit from "./McpToolAccess.testkit.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
+import { CommandReceiptStoreReadError } from "../orchestration-v2/CommandReceiptStore.ts";
+import { OrchestratorProjectionError } from "../orchestration-v2/Orchestrator.ts";
 import { callIdentifiers } from "../ardud/analytics/McpCall.ts";
 import * as McpDeadline from "./McpDeadline.ts";
 import { readCallerIdentity } from "./callerIdentity.ts";
+import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
+import { OrchestratorToolkit } from "./toolkits/orchestrator/tools.ts";
+import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
+import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
+import * as ProjectService from "../project/ProjectService.ts";
+import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
+import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
+import * as SecretRequests from "../secrets/SecretRequests.ts";
+import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
+import * as ServerSettings from "../serverSettings.ts";
 
 it("hashes retry ids deterministically within their caller identity", () => {
   const first = callIdentifiers(
@@ -132,6 +150,421 @@ const probe = (name: string) =>
 const decodeAnalyticsEvent = Schema.decodeEffect(AnalyticsEvent);
 const args = { clientRequestId: "private retry id", boardId: "board-robob", card: "#1301" };
 const isAnalyticsEvent = Schema.is(AnalyticsEvent);
+
+const lookupParent = ThreadId.make("caller-ledger");
+const lookupChild = ThreadId.make("private-child");
+const lookupCommand = CommandId.make(
+  "command:mcp:delegate-task:env-ledger:caller-ledger:private%3A%2525%2F%C3%A9",
+);
+const lookupId = IdAllocator.derive.delegatedTaskNode({ commandId: lookupCommand });
+const copiedLookupId = NodeId.make(`node:delegated-task:${encodeURIComponent(lookupId.slice(20))}`);
+const lookupCases = [
+  { name: "normal hit", hit: true, foundBy: "subagents", saved: true },
+  { name: "acknowledgement", hit: true, ack: true, foundBy: "subagents", saved: true },
+  { name: "late projection", late: true, foundBy: "subagents", saved: true },
+  {
+    name: "request key recovery",
+    hit: true,
+    id: copiedLookupId,
+    foundBy: "request_key_recovery",
+    saved: true,
+    canonical: false,
+  },
+  { name: "unsaved", reason: "never_saved", saved: false },
+  {
+    name: "accepted receipt",
+    state: "accepted",
+    reason: "accepted",
+    foundBy: "receipt",
+    saved: true,
+  },
+  {
+    name: "rejected receipt",
+    state: "rejected",
+    reason: "rejected",
+    foundBy: "receipt",
+    saved: true,
+  },
+  { name: "pending", state: "pending", reason: "pending" },
+  { name: "abandoned", state: "abandoned", reason: "abandoned" },
+  { name: "copied miss", id: copiedLookupId, reason: "non_canonical_id", canonical: false },
+  {
+    name: "not a delegation id",
+    id: NodeId.make("private-unknown"),
+    reason: "not_a_delegation_id",
+    canonical: false,
+    shape: "other",
+  },
+  {
+    name: "invalid escape",
+    id: NodeId.make("node:delegated-task:%ZZ"),
+    reason: "not_a_delegation_id",
+    canonical: false,
+    shape: "other",
+  },
+  {
+    name: "foreign caller",
+    id: IdAllocator.derive.delegatedTaskNode({
+      commandId: CommandId.make("command:mcp:delegate-task:env-ledger:private-other:private"),
+    }),
+    reason: "non_canonical_id",
+    canonical: false,
+  },
+  {
+    name: "foreign receipt",
+    state: "accepted",
+    foreign: true,
+    reason: "other_thread",
+    canonical: false,
+  },
+  {
+    name: "wrong command receipt",
+    state: "accepted",
+    wrongCommand: true,
+    reason: "not_a_delegation_command",
+    canonical: false,
+  },
+  {
+    name: "missing child",
+    hit: true,
+    noChild: true,
+    reason: "missing_child_thread",
+    foundBy: "subagents",
+    saved: true,
+  },
+  ...[
+    "thread:project:private:uuid",
+    `thread:delegated-task:${lookupId.slice(20)}`,
+    "019f3baa-87de-7d51-ae17-d80a8d6a6b45",
+    "019F3BAA-87DE-7D51-AE17-D80A8D6A6B45",
+  ].map(
+    (id) =>
+      ({
+        name: `thread shape ${id.slice(0, 20)}`,
+        id,
+        shape: "thread_id",
+        reason: "not_a_delegation_id",
+        canonical: false,
+      }) as const,
+  ),
+  {
+    name: "known child thread",
+    id: lookupChild,
+    hit: true,
+    shape: "child_thread_id",
+    reason: "not_a_delegation_id",
+    canonical: false,
+  },
+  { name: "empty input", id: "", shape: "empty", invalid: true },
+  { name: "blank input", id: "   ", shape: "empty", invalid: true },
+  {
+    name: "missing child receipt failure",
+    hit: true,
+    noChild: true,
+    receiptError: true,
+    foundBy: "subagents",
+    saved: true,
+    error: "orchestration_error",
+  },
+  {
+    name: "missing child receipt timeout",
+    hit: true,
+    noChild: true,
+    pause: "receipt",
+    finish: "timeout",
+    foundBy: "subagents",
+    saved: true,
+    error: "partial_result",
+  },
+  {
+    name: "cancel interrupted on second read",
+    hit: true,
+    cancel: true,
+    pause: "cancel_read",
+    finish: "interrupt",
+    foundBy: "subagents",
+    saved: true,
+  },
+  {
+    name: "cancel fails on second read",
+    hit: true,
+    cancel: true,
+    pause: "cancel_read",
+    finish: "error",
+    foundBy: "subagents",
+    saved: true,
+    error: "orchestration_error",
+  },
+  {
+    name: "shutdown after projection hit",
+    hit: true,
+    pause: "child",
+    finish: "shutdown",
+    foundBy: "subagents",
+    saved: true,
+  },
+  {
+    name: "shutdown after recovery hit",
+    hit: true,
+    id: copiedLookupId,
+    pause: "child",
+    finish: "shutdown",
+    foundBy: "request_key_recovery",
+    canonical: false,
+    saved: true,
+  },
+] as const;
+
+it.effect.each(lookupCases)("records task lookup metadata: $name", (testCase) =>
+  Effect.gen(function* () {
+    const rows = yield* Queue.unbounded<AnalyticsEvent>();
+    const blocked = yield* Deferred.make<void>();
+    const acknowledged = yield* Deferred.make<void>();
+    const parent = Testkit.idleThreadProjection(Testkit.liveThreadShell(lookupParent));
+    const child = {
+      ...Testkit.idleThreadProjection(Testkit.liveThreadShell(lookupChild)),
+      runs:
+        "cancel" in testCase
+          ? [
+              {
+                id: RunId.make("private-run"),
+                threadId: lookupChild,
+                delegatedTaskId: lookupId,
+                ordinal: 1,
+                status: "running",
+                activeAttemptId: null,
+                startedAt: DateTime.makeUnsafe(0),
+                completedAt: null,
+              } as OrchestrationV2Run,
+            ]
+          : [],
+    };
+    const task = {
+      id: lookupId,
+      threadId: lookupParent,
+      origin: "app_owned",
+      childThreadId: "noChild" in testCase ? null : lookupChild,
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      model: "gpt-5",
+      result: "cancel" in testCase ? null : "private result",
+      status: "cancel" in testCase ? "running" : "completed",
+      completionDelivery: { state: "ack" in testCase ? "pending" : "acknowledged" },
+    } as OrchestrationV2Subagent;
+    let parentReads = 0;
+    let acknowledgements = 0;
+    let stopped = false;
+    const threads = Layer.mock(ThreadManagement.ThreadManagementService)({
+      getCallerRow: (id) => Effect.succeed(Testkit.liveThreadShell(id)),
+      getThreadShell: (id) => Effect.succeed(Testkit.liveThreadShell(id)),
+      getThreadProjection: () => Effect.succeed({ ...parent, subagents: [task] }),
+      stopDelegatedTasks: () => Effect.void,
+      getThreadRecords: (id) => {
+        if (
+          "pause" in testCase &&
+          ((testCase.pause === "child" && id === lookupChild) ||
+            (testCase.pause === "cancel_read" && stopped && id === lookupParent))
+        )
+          return Deferred.succeed(blocked, undefined).pipe(
+            Effect.andThen(
+              testCase.finish === "error"
+                ? Effect.fail(
+                    new OrchestratorProjectionError({
+                      threadId: id,
+                      cause: new Error("private"),
+                    }),
+                  )
+                : Effect.never,
+            ),
+          );
+        return Effect.succeed(
+          id === lookupParent
+            ? {
+                ...parent,
+                subagents:
+                  "hit" in testCase || ("late" in testCase && parentReads++ > 0) ? [task] : [],
+              }
+            : child,
+        );
+      },
+      getDelegationCommandState: () => {
+        if ("receiptError" in testCase)
+          return Effect.fail(new CommandReceiptStoreReadError({ commandId: lookupCommand }));
+        if ("pause" in testCase && testCase.pause === "receipt")
+          return Deferred.succeed(blocked, undefined).pipe(Effect.andThen(Effect.never));
+        const status = "state" in testCase ? testCase.state : "never_saved";
+        return Effect.succeed(
+          status === "accepted" || status === "rejected"
+            ? {
+                commandId: lookupCommand,
+                threadId: "foreign" in testCase ? lookupChild : lookupParent,
+                commandType:
+                  "wrongCommand" in testCase ? "thread.create" : "delegated_task.request",
+                acceptedAt: DateTime.makeUnsafe(0),
+                resultSequence: 0,
+                status,
+                error: null,
+              }
+            : status === "abandoned"
+              ? {
+                  status,
+                  elapsedSeconds: 10,
+                  reason: "timeout",
+                  at: DateTime.makeUnsafe(0),
+                }
+              : { status },
+        );
+      },
+      dispatch: (command) =>
+        Effect.sync(() => {
+          acknowledgements++;
+          if (command.type === "thread.stop") stopped = true;
+          return { sequence: 1, storedEvents: [] };
+        }).pipe(Effect.tap(() => Deferred.succeed(acknowledged, undefined))),
+    });
+    const service = OrchestratorMcpService.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          NodeServices.layer,
+          threads,
+          ServerSettings.layerTest(),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({}),
+          Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({}),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+          Layer.mock(GitVcsDriver.GitVcsDriver)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        ),
+      ),
+    );
+    const toolkit = Toolkit.make(
+      OrchestratorToolkit.tools.task_status,
+      OrchestratorToolkit.tools.task_cancel,
+    );
+    const registration = McpHttpServer.toolkitRegistration(
+      toolkit,
+      McpToolAccess.toLayer(toolkit, {
+        task_status: McpToolAccess.readsAsCaller(({ taskId }) =>
+          Effect.gen(function* () {
+            const scope = yield* McpInvocationContext.McpInvocationContext;
+            return yield* (yield* OrchestratorMcpService.OrchestratorMcpService).taskStatus(
+              scope,
+              taskId,
+            );
+          }),
+        ),
+        task_cancel: McpToolAccess.actsAsCaller((input) =>
+          Effect.gen(function* () {
+            const scope = yield* McpInvocationContext.McpInvocationContext;
+            return yield* (yield* OrchestratorMcpService.OrchestratorMcpService).cancelTask(
+              scope,
+              input,
+            );
+          }),
+        ),
+      }),
+    ).pipe(
+      Layer.provideMerge(McpServer.McpServer.layer),
+      Layer.provideMerge(McpCallLedger.layer),
+      Layer.provide(service),
+      Layer.provide(threads),
+      Layer.provide(invocation),
+      Layer.provide(
+        Layer.mock(Analytics.Analytics)({
+          record: (row) =>
+            row.kind === "mcp.call" ? Queue.offer(rows, row).pipe(Effect.asVoid) : Effect.void,
+          flush: Effect.void,
+        }),
+      ),
+    );
+    yield* Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      const names =
+        "cancel" in testCase
+          ? ["task_cancel"]
+          : "reason" in testCase || "invalid" in testCase
+            ? ["task_status", "task_cancel"]
+            : ["task_status"];
+      for (const name of names) {
+        const call = server
+          .callTool({ name, arguments: { taskId: "id" in testCase ? testCase.id : lookupId } })
+          .pipe(Effect.provideService(McpSchema.McpServerClient, client));
+        const response = yield* Effect.gen(function* () {
+          if ("invalid" in testCase) {
+            const exit = yield* call.pipe(Effect.exit);
+            expect(Exit.isFailure(exit)).toBe(true);
+            return undefined;
+          }
+          if (!("pause" in testCase)) return yield* call;
+          const pending = yield* call.pipe(Effect.forkChild);
+          yield* Deferred.await(blocked);
+          if (testCase.finish === "timeout") {
+            yield* TestClock.adjust("10 seconds");
+            return yield* Fiber.join(pending);
+          }
+          if (testCase.finish === "error") return yield* Fiber.join(pending);
+          if (testCase.finish === "shutdown") yield* (yield* McpCallLedger.McpCallLedger).shutdown;
+          yield* Fiber.interrupt(pending);
+          return undefined;
+        });
+        const row = yield* Queue.take(rows);
+        expect(row).toMatchObject({
+          tool: name,
+          saved: "saved" in testCase ? testCase.saved : "unknown",
+          props: {
+            ...("invalid" in testCase
+              ? {}
+              : {
+                  foundBy: "foundBy" in testCase ? testCase.foundBy : "none",
+                  idCanonical: "canonical" in testCase ? testCase.canonical : true,
+                }),
+            idShape: "shape" in testCase ? testCase.shape : "task_id",
+            ...("reason" in testCase ? { notFoundReason: testCase.reason } : {}),
+          },
+        });
+        expect(row.errorTag).toBe(
+          "reason" in testCase
+            ? "task_not_found"
+            : "error" in testCase
+              ? testCase.error
+              : "invalid" in testCase
+                ? "invalid_request"
+                : undefined,
+        );
+        if ("pause" in testCase)
+          expect(row.outcome).toBe(
+            testCase.finish === "shutdown"
+              ? "interrupted_by_shutdown"
+              : testCase.finish === "timeout"
+                ? "timeout"
+                : testCase.finish === "error"
+                  ? "error"
+                  : "interrupted",
+          );
+        expect(isAnalyticsEvent(row)).toBe(true);
+        expect(JSON.stringify(row.props)).not.toMatch(/private|command:|node:|clientRequestId/);
+        if (!("reason" in testCase)) expect(row.props).not.toHaveProperty("notFoundReason");
+        if ("reason" in testCase) {
+          const text = JSON.stringify(response);
+          const threadShape =
+            "shape" in testCase &&
+            (testCase.shape === "thread_id" || testCase.shape === "child_thread_id");
+          expect(text.includes("This looks like a thread id (childThreadId).")).toBe(threadShape);
+          expect(text).toContain(
+            threadShape
+              ? "Use t3_thread_read for the child thread."
+              : "Expected the taskId returned by delegate_task.",
+          );
+          expect(text).not.toContain("id" in testCase ? testCase.id : lookupId);
+        }
+      }
+      if ("ack" in testCase) {
+        yield* Deferred.await(acknowledged);
+        expect(acknowledgements).toBe(1);
+      }
+    }).pipe(Effect.provide(registration));
+  }),
+);
 
 it.effect.each(["provider", "oauth"] as const)(
   "%s auth and dispatch are separate from handler duration, including caller_unresolved",
@@ -402,12 +835,12 @@ it.effect("freezes the timed-out read stage before response delivery and late cl
         Effect.provideService(McpResponseDelivery.McpResponseDelivery, {
           settled: Deferred.await(settled),
           closeReason: "unknown",
-          snapshot: () => ({ responseDelivery: "finished", responseElapsedMs: 56_000 }),
+          snapshot: () => ({ responseDelivery: "finished", responseElapsedMs: 46_000 }),
         }),
         Effect.forkChild,
       );
       yield* Deferred.await(entered);
-      yield* TestClock.adjust("55 seconds");
+      yield* TestClock.adjust(McpDeadline.READ_TIMEOUT);
       const result = yield* Fiber.join(pending);
       expect(result.isError).toBe(true);
       yield* Deferred.succeed(release, undefined);
@@ -419,9 +852,9 @@ it.effect("freezes the timed-out read stage before response delivery and late cl
       expect(row).toMatchObject({
         outcome: "timeout",
         errorTag: "ThreadReadTimeoutError",
-        durationMs: 55_000,
-        responseElapsedMs: 56_000,
-        threadReadStages: [{ stage: "timeline", durationMs: 55_000, completed: false }],
+        durationMs: 45_000,
+        responseElapsedMs: 46_000,
+        threadReadStages: [{ stage: "timeline", durationMs: 45_000, completed: false }],
       });
     }).pipe(Effect.provide(registration));
   }),

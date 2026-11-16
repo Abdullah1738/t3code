@@ -6,6 +6,17 @@ import { join } from 'node:path';
 import { clean, emit, observed, tagFailurePhase } from '../toollog.mjs';
 
 import {fixture} from './support.mjs';
+test('retry and scan diagnostics enforce fixed targets, token names, numbers and booleans', () => {
+  const cleanProps = props => clean({component:'stream-recovery',name:'http.retry',kind:'event',props}).props;
+  assert.deepEqual(cleanProps({target:'control',tag:'EPIPE',ok:true,loopBlockMaxMs:75,longestSyncOp:'failedRunsSince',longestSyncMs:74}),
+    {target:'control',tag:'EPIPE',ok:true,loopBlockMaxMs:75,longestSyncOp:'failedRunsSince',longestSyncMs:74});
+  assert.deepEqual(cleanProps({target:'opencode',ok:false}), {target:'opencode',ok:false});
+  for (const value of ['private text', 'sk-private', 'https://user:password@example.invalid', '', NaN, Infinity, -1, false, null, {}, []]) {
+    const result = cleanProps({target:value,ok:value,loopBlockMaxMs:value,longestSyncMs:value,longestSyncOp:value,
+      url:'https://private.invalid',path:'/private',message:'private'});
+    assert.deepEqual(result, value === false ? {ok:false} : undefined);
+  }
+});
 test('replica diagnostics only retain finite numbers or unknown', async t => {
   const {rows} = fixture(t);
   for (const value of [42, 0, -5_001, 'unknown', 'sk-private', '/home/fixture@example.invalid', '42', NaN, Infinity, -Infinity, null, false, [], {}]) {

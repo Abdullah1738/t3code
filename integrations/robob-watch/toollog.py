@@ -1,5 +1,6 @@
 """Best-effort, allowlisted health tool logs. Python 3.9, stdlib only."""
 import contextlib
+import hashlib
 import datetime as dt
 import fcntl
 import json
@@ -75,7 +76,7 @@ SCHEMAS = {
         **{k: ENDPOINT_SCHEMA for k in ('sleep', 'recovery', 'cycle', 'body')}},
     'sync.gap': {'count': int, 'lastSleepEnd': 'iso', 'lastRecoveryEnd': 'iso', 'gapHours': 'seconds'},
     'card.render': {'kind': {'morning', 'nutrition'}, 'runIdRef': 'run'},
-    'delivery.result': {'kind': {'card', 'nag', 'warning'}, 'ok': bool, 'errorTag': TAGS | {'none'}, 'runIdRef': 'run'},
+    'delivery.result': {'kind': {'card', 'nag', 'warning'}, 'ok': bool, 'errorTag': TAGS | {'none'}, 'runIdRef': 'run', 'source': {'auto', 'manual'}},
     'brief.fresh': {'fresh': bool}, 'nag.sent': {'count': int}, 'nag.snoozed': {'count': int},
     'nag.stopped': {'count': int}, 'nag.folded': {'count': int}, 'validate.conflicts': {'conflictKind': CONFLICTS, 'count': int},
     'nag.resolved': {'slotKind': {'morning', 'evening', 'weekly', 'other'}, 'nagCount': int,
@@ -193,6 +194,12 @@ def _line(component, name, kind, duration_ms, ok, props, tag, run_id, now, rejec
 
 def _retention(root, today):
     cutoff = today - dt.timedelta(days=30)
+    for path in (root / 'receipts').glob('????-??-??.ndjson'):
+        try:
+            if dt.date.fromisoformat(path.stem) < cutoff:
+                path.unlink()
+        except (ValueError, OSError):
+            pass
     for path in root.iterdir():
         name = path.name
         day = name.removeprefix('rollup-').removeprefix('.cap-').removesuffix('.ndjson').removesuffix('.json')
@@ -235,12 +242,12 @@ def _append_row(fd, row):
             os.ftruncate(fd, size)
 
 
-def emit(component, name, kind='event', duration_ms=None, ok=None, props=None, tag=None, run_id=None, rejected=None):
+def emit(component, name, kind='event', duration_ms=None, ok=None, props=None, tag=None, run_id=None, rejected=None, _now=None):
     """Return whether the requested row was fully appended; logging never raises."""
     try:
         if component not in COMPONENTS or name not in SCHEMAS or kind not in ('event', 'perf', 'error'):
             return False
-        now = utcnow()
+        now = _now or utcnow()
         root = log_dir()
         if root is None:
             return False
@@ -282,10 +289,14 @@ class Span:
             self.props['trigger'] = trigger
         self.ok, self.tag, self.run_id, self.start = True, None, None, None
         self.rejected = []
+        self.render_at = None
 
     def __enter__(self):
         try:
             self.start = time.monotonic()
+            if self.name == 'card.render':
+                # A render spanning midnight and all its sidecars share this obligation day.
+                self.render_at = utcnow()
             self.run_id = os.environ.get('HEALTH_TOOLLOG_RUN') if self.name == 'watcher.run' else None
             if not valid_run(self.run_id):
                 self.run_id = uuid.uuid4().hex
@@ -312,7 +323,7 @@ class Span:
                         tb = tb.tb_next
                     self.props['stage'] = tb.tb_frame.f_code.co_name
             emit(self.component, self.name, 'perf' if self.ok else 'error',
-                 (time.monotonic() - self.start) * 1000, self.ok, self.props, self.tag, self.run_id, rejected=self.rejected)
+                 (time.monotonic() - self.start) * 1000, self.ok, self.props, self.tag, self.run_id, rejected=self.rejected, _now=self.render_at)
         except BaseException:
             pass
         return False
@@ -392,12 +403,165 @@ def sync_gap(latest, recovery=_MISSING):
         pass
 
 
+def write_card_sidecars(paths, run_id, render_at=None):
+    """Bind each returned PNG's bytes to one member of a render, without captions or paths."""
+    if not valid_run(run_id) or not paths:
+        return
+    ids = [uuid.uuid4().hex for _ in paths]
+    created = (render_at or utcnow()).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+    for raw, card_id in zip(paths, ids):
+        path = Path(raw)
+        metadata = {'version': 1, 'runId': run_id, 'kind': 'card', 'createdAt': created,
+                    'cardId': card_id, 'cardIds': ids,
+                    'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+        target = path.with_name(path.name + '.delivery.json')
+        temp = target.with_name('.' + uuid.uuid4().hex + '.delivery.json')
+        fd = os.open(str(temp), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, 'w') as fh:
+            json.dump(metadata, fh, separators=(',', ':'))
+            fh.write('\n')
+        os.replace(str(temp), str(target))
+
+
+@contextlib.contextmanager
+def _delivery_lock(root):
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(str(root / '.delivery.lock'), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        # Shared with manual acknowledgements; hold only for receipt/log I/O, never a send.
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _delivery_unlocked(root, kind, run_id, ok, tag, component, source, now):
+    target = root / (now.date().isoformat() + '.ndjson')
+    try:
+        with target.open() as fh:
+            prior = None
+            for line in fh:
+                try:
+                    row = json.loads(line)
+                    props = row.get('props', {})
+                    if (row.get('name') == 'delivery.result' and props.get('runIdRef') == run_id
+                            and props.get('kind') == kind):
+                        prior = props.get('ok')
+                except (ValueError, AttributeError):
+                    continue
+            # A retry may correct a failure; replay/manual+auto cannot duplicate a result
+            # or downgrade accepted media to failed because a second send was rejected.
+            if prior is True or prior is False and not ok:
+                return True
+    except FileNotFoundError:
+        pass
+    # emit's day and timestamp must agree with the render's UTC day for delayed intake.
+    # The acceptance time stays in the private receipt spool, not in user-facing text.
+    return emit(component, 'delivery.result', ok=ok, props={'kind': kind, 'ok': ok,
+                'errorTag': 'none' if ok else (tag if tag in TAGS else 'internal_error'),
+                'runIdRef': run_id, 'source': source}, _now=now)
+
+
 def delivery(kind, run_id, ok=True, tag=None, component='cards'):
     try:
-        emit(component, 'delivery.result', ok=ok, props={'kind': kind, 'ok': ok,
-             'errorTag': 'none' if ok else (tag if tag in TAGS else 'internal_error'), 'runIdRef': run_id})
+        root = log_dir()
+        if root is None or not valid_run(run_id) or kind not in {'card', 'nag', 'warning'} or type(ok) is not bool:
+            return False
+        with _delivery_lock(root):
+            now = utcnow()
+            # Route late manual acknowledgements to the same day as their obligation/auto receipt.
+            for path in sorted(root.glob('????-??-??.ndjson'), reverse=True):
+                found = False
+                with path.open() as fh:
+                    for line in fh:
+                        try:
+                            row = json.loads(line)
+                            obligation = {'card': 'card.render', 'nag': 'nag.sent', 'warning': 'food.warning'}[kind]
+                            if ((row.get('name') == obligation and row.get('ids', {}).get('run') == run_id)
+                                    or (row.get('name') == 'delivery.result' and row.get('props', {}).get('runIdRef') == run_id
+                                        and row.get('props', {}).get('kind') == kind)):
+                                now = dt.datetime.combine(dt.date.fromisoformat(path.stem), now.timetz())
+                                found = True
+                                break
+                        except (ValueError, AttributeError, TypeError):
+                            continue
+                if found:
+                    break
+            return _delivery_unlocked(root, kind, run_id, ok, tag, component, 'manual', now)
     except BaseException:
-        pass
+        return False
+
+
+_RECEIPT_KEYS = {'version', 'runId', 'kind', 'createdAt', 'cardId', 'cardIds', 'sha256',
+                 'ok', 'errorTag', 'acceptedAt'}
+
+
+def _receipt(value, day):
+    if not isinstance(value, dict) or set(value) != _RECEIPT_KEYS:
+        return None
+    created, accepted = iso_stamp(value['createdAt']), iso_stamp(value['acceptedAt'])
+    ids = value['cardIds']
+    if (type(value['version']) is not int or value['version'] != 1 or value['kind'] != 'card'
+            or not valid_run(value['runId']) or not valid_run(value['cardId'])
+            or not isinstance(ids, list) or not 1 <= len(ids) <= 128
+            or not all(valid_run(i) for i in ids) or len(set(ids)) != len(ids)
+            or value['cardId'] not in ids or not created or created[:10] != day or not accepted
+            or dt.datetime.fromisoformat(accepted.replace('Z', '+00:00')) < dt.datetime.fromisoformat(created.replace('Z', '+00:00'))
+            or type(value['ok']) is not bool
+            or not isinstance(value['sha256'], str) or not re.fullmatch(r'[0-9a-f]{64}', value['sha256'])
+            or value['errorTag'] not in ( {'none'} if value['ok'] else TAGS)):
+        return None
+    return {**value, 'createdAt': created, 'acceptedAt': accepted}
+
+
+def intake_receipts(day):
+    """Import bridge-only terminal file outcomes; incomplete renders stay unmarked."""
+    try:
+        day = dt.date.fromisoformat(day).isoformat()
+        root = log_dir()
+        if root is None:
+            return
+        path = root / 'receipts' / (day + '.ndjson')
+        if not path.exists():
+            return True
+        with _delivery_lock(root):
+            groups = {}
+            with path.open() as fh:
+                for line in fh:
+                    try:
+                        receipt = _receipt(json.loads(line), day)
+                        if receipt is None:
+                            continue
+                        key = (receipt['runId'], receipt['kind'])
+                        manifest = (receipt['createdAt'], tuple(receipt['cardIds']))
+                        group = groups.setdefault(key, {'manifest': manifest, 'files': {}, 'invalid': False})
+                        if group['manifest'] != manifest:
+                            group['invalid'] = True
+                            continue
+                        old = group['files'].get(receipt['cardId'])
+                        if old and old['sha256'] != receipt['sha256']:
+                            group['invalid'] = True
+                        # Provider acceptance wins over a failed duplicate/retry, regardless of append order.
+                        if not old or old['ok'] is not True:
+                            group['files'][receipt['cardId']] = receipt
+                    except (ValueError, TypeError, AttributeError):
+                        continue
+            for (run_id, kind), group in groups.items():
+                if group['invalid']:
+                    continue
+                files = group['files']
+                failures = [r for r in files.values() if not r['ok']]
+                complete = set(files) == set(group['manifest'][1])
+                if not failures and not complete:
+                    continue
+                stamp = dt.datetime.fromisoformat(group['manifest'][0].replace('Z', '+00:00'))
+                if not _delivery_unlocked(root, kind, run_id, not failures,
+                                          failures[0]['errorTag'] if failures else None, 'cards', 'auto', stamp):
+                    return False
+            return True
+    except BaseException:
+        # Receipts stay durable on disk: lock/write/cap failures can be retried by the next rollup.
+        return False
 
 
 def _percentile(values, fraction):
@@ -444,6 +608,9 @@ def rollup(day=None):
     try:
         now = utcnow()
         day = dt.date.fromisoformat(day) if day else now.date() - dt.timedelta(days=1)
+        started_ns = time.time_ns()
+        if intake_receipts(day.isoformat()) is False:
+            return None
         start = dt.datetime.combine(day, dt.time(), tzinfo=dt.timezone.utc)
         day_end = start + dt.timedelta(days=1)
         end = max(start, min(now, day_end))
@@ -457,6 +624,7 @@ def rollup(day=None):
         malformed = 0
         zero_sleep, last_scored = 0, None
         food_errors, delivered, expected = Counter(), {}, set()
+        receipt_sources = {}
         nag_latency, open_slots = [], {}
         try:
             source_file = source.open()
@@ -510,7 +678,9 @@ def rollup(day=None):
                     if obligation:
                         expected.add((origin if valid_run(origin) else 'legacy-%d' % sum(names.values()), obligation))
                     if r['name'] == 'delivery.result' and valid_run(props.get('runIdRef')) and type(props.get('ok')) is bool:
-                        delivered[(props['runIdRef'], props.get('kind'))] = props['ok']
+                        key = (props['runIdRef'], props.get('kind'))
+                        delivered[key] = props['ok']
+                        receipt_sources[key] = props.get('source', 'manual')
                     value = r.get('durationMs')
                     if type(value) in (int, float) and math.isfinite(value) and value >= 0:
                         durations[r['name']].append(value)
@@ -543,7 +713,9 @@ def rollup(day=None):
                                'failed': sum(v is False for v in delivered.values()),
                                # Missing same-day receipts, not a count of failed sends.
                                'unmarked': len(expected - set(delivered)),
-                               'unmarkedMeaning': UNMARKED_MEANING}}
+                               'unmarkedMeaning': UNMARKED_MEANING,
+                               'autoReceipts': sum(v == 'auto' for v in receipt_sources.values()),
+                               'manualReceipts': sum(v == 'manual' for v in receipt_sources.values())}}
         for name, values in durations.items():
             values.sort()
             result['durationMs'][name] = {'p50': _percentile(values, .5), 'p95': _percentile(values, .95), 'max': values[-1]}
@@ -559,6 +731,8 @@ def rollup(day=None):
             json.dump(result, fh, separators=(',', ':'), allow_nan=False)
             fh.write('\n')
         os.replace(str(temp), str(target))
+        # A receipt appended during this rollup must trigger another intake.
+        os.utime(str(target), ns=(started_ns, started_ns))
         return result
     except BaseException:
         return None
@@ -571,7 +745,20 @@ def rollup_previous():
         root = log_dir()
         if root is None:
             return
-        if (now.hour, now.minute) >= (0, 5) and not (root / ('rollup-' + day.isoformat() + '.json')).exists():
+        # File sends arrive after the render, sometimes after midnight or an earlier rollup.
+        # Stat only the bounded retained spool; unchanged receipts need no repeated scan.
+        for receipt in (root / 'receipts').glob('????-??-??.ndjson'):
+            receipt_day = dt.date.fromisoformat(receipt.stem)
+            target = root / ('rollup-' + receipt.stem + '.json')
+            source = root / (receipt.stem + '.ndjson')
+            if (0 <= (now.date() - receipt_day).days <= 30
+                    and (not target.exists() or receipt.stat().st_mtime_ns > target.stat().st_mtime_ns
+                         or source.exists() and source.stat().st_mtime_ns > target.stat().st_mtime_ns)):
+                rollup(receipt.stem)
+        target = root / ('rollup-' + day.isoformat() + '.json')
+        source = root / (day.isoformat() + '.ndjson')
+        if ((now.hour, now.minute) >= (0, 5)
+                and (not target.exists() or source.exists() and source.stat().st_mtime_ns > target.stat().st_mtime_ns)):
             rollup(day.isoformat())
     except BaseException:
         pass

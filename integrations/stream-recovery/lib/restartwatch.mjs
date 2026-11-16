@@ -318,18 +318,23 @@ export async function restartScan(options, io = realIo) {
 async function restartScanImpl({ db, refreshDb, state, now, sinceIso, floorMs, dryRun = false, seed = false, verbose = false, log }, io = realIo) {
   assertRecoveryActive(io);
   io = recoveryIo(guardRecoveryIo(io));
-  const freshBatch = () => { if (refreshDb) db = refreshDb(); else io.assertReplicaFresh(db); };
+  const freshBatch = () => { if (refreshDb) db = refreshDb(io); else io.assertReplicaFresh(db); };
   io.assertReplicaFresh(db);
   state.servers = trackServer(state.servers, io.serverRuntime(), now);
   state.servers = trackServer(state.servers, io.openCodeRuntime(), now);
   freshBatch();
   const nativeSubs = io.cancelledSubagentsSince(db, sinceIso)
-    .filter((s) => !stallInterrupted(state, sessionFromProviderThread(s.provider_thread_id), toMs(s.completed_at)));
+    .filter((s) => !stallInterrupted(io.loadStallState(), sessionFromProviderThread(s.provider_thread_id), toMs(s.completed_at)));
   freshBatch();
   const delegatedCandidates = io.cancelledDelegatedTasksSince(db, sinceIso);
   freshBatch();
   const delegatedSubs = delegatedCandidates
-    .filter((s) => !stallInterrupted(state, io.childNativeSession(db, s.childThreadId), toMs(s.completed_at), s.childThreadId));
+    .filter((s) => {
+      const ses = io.childNativeSession(db, s.childThreadId);
+      // Read after the replica query: the independent stall job may have
+      // interrupted this session while discovery was blocked.
+      return !stallInterrupted(io.loadStallState(), ses, toMs(s.completed_at), s.childThreadId);
+    });
   const subs = [...nativeSubs, ...delegatedSubs];
   for (const s of subs) {
     freshBatch();

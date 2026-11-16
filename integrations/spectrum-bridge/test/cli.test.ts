@@ -511,3 +511,22 @@ describe("agent bus commands", () => {
     expect(() => parseCommand(["agent-answer", "--request", request, "--text", "a", "--session", "s", "--status", "timed_out"])).toThrow("Invalid --status");
   });
 });
+
+describe("notify-rule commands", () => {
+  test("parses add/list/remove with a required session", () => {
+    expect(parseCommand(["notify-rule", "add", "--text", "tell me when Moni orders", "--session", "s"]))
+      .toEqual({ method: "POST", path: "/notify-rule", body: { action: "add", text: "tell me when Moni orders", sessionId: "s" } });
+    expect(parseCommand(["notify-rule", "list", "--session=s"]))
+      .toEqual({ method: "POST", path: "/notify-rule", body: { action: "list", sessionId: "s" } });
+    expect(parseCommand(["notify-rule", "rm", "--id=123", "--session=s"]))
+      .toEqual({ method: "POST", path: "/notify-rule", body: { action: "rm", id: 123, sessionId: "s" } });
+  });
+  test("rejects missing sessions, malformed ids/text, and unrelated options", () => {
+    for (const args of [["add", "--text=x"], ["list"], ["rm", "--id=1"]]) expect(() => parseCommand(["notify-rule", ...args])).toThrow("--session");
+    for (const args of [[], ["unknown"], ["add"], ["add", "--text="], ["add", "--text=x\ny"], ["add", `--text=${"x".repeat(2001)}`],
+      ["add", "--text=x", "--id=1"], ["list", "--text=x"], ["list", "--id=1"], ["list", "extra"], ["rm"],
+      ...["0", "-1", "1.5", "01", "1e3", "9007199254740992"].map(id => ["rm", `--id=${id}`]), ["rm", "--id=1", "--text=x"]]) {
+      expect(() => parseCommand(["notify-rule", ...args, "--session=s"])).toThrow();
+    }
+  });
+});
