@@ -1996,6 +1996,13 @@ describe("queued current-state rollup", () => {
       threads: [],
       events: [],
     });
+    expect(result.stages.queued.items[0]!.held).toEqual(result.holders.items[0]!.holders);
+    expect(result.stages.queued.items[0]!.held?.[0]).toMatchObject({
+      card: 44,
+      stage: "working",
+      openStep: "none",
+      heldSince: before,
+    });
     expect(result.stages.queued).toMatchObject({
       count: 3,
       byReason: { pool_full: 2, "wait:ci": 1 },
@@ -2574,5 +2581,198 @@ describe("detached shared-worker timing", () => {
       pools,
     }).stages.withoutThread;
     expect(section.items[0]).toMatchObject({ since: "2026-11-12T16:00Z", hours: 8 });
+  });
+});
+
+describe("#1776 current pool holders", () => {
+  const pool = Rules.poolKey(opus);
+  const held = card("private holder title", {
+    number: 76,
+    stage: "working",
+    activeThreadId: ThreadId.make("thread-12345678"),
+    activePool: pool,
+    activeRole: "work",
+    analyticsStageEnteredAt: t("00:30"),
+  });
+  const slot = (id: number, threadId: string, at: string, poolKey = pool): SlotEvent => ({
+    id,
+    boardId: "b1",
+    threadId,
+    poolKey,
+    cardId: null,
+    kind: "take",
+    at,
+    why: "start",
+  });
+  const run = (patch: Partial<Activity.RollupInput> = {}) =>
+    Activity.rollup({
+      window,
+      pools: [{ key: pool, model: opus, slots: 1 }],
+      cards: [held],
+      events: [],
+      threads: [],
+      slotHistory: { recordedSince: before, events: [slot(1, held.activeThreadId!, t("01:00"))] },
+      ...patch,
+    });
+  const tasks = (owners: Array<KanbanCard["subtasks"][number]["owner"]>) =>
+    owners.map((owner, i) => ({
+      id: `s${i}`,
+      step: 1,
+      owner,
+      text: "Private task",
+      state: "open" as const,
+      createdAt: before,
+      note: null,
+      doneBy: null,
+      doneAt: null,
+    }));
+
+  it("shows review-only work on a held slot using the ledger take and no card text", () => {
+    const result = run({ cards: [{ ...held, subtasks: tasks(["review"]) }] });
+    expect(result.holders.items).toEqual([
+      {
+        pool,
+        slots: 1,
+        holders: [
+          {
+            card: 76,
+            role: "work",
+            stage: "working",
+            thread: "12345678",
+            heldSince: t("01:00"),
+            heldForH: 23,
+            openStep: "review",
+            turn: "unknown",
+          },
+        ],
+      },
+    ]);
+    expect(JSON.stringify(result)).not.toContain("private holder title");
+    expect(JSON.stringify(result)).not.toContain("Private task");
+  });
+
+  it.each([
+    { owners: [], expected: "none" },
+    { owners: ["work"], expected: "work" },
+    { owners: ["review"], expected: "review" },
+    { owners: ["evaluator"], expected: "evaluator" },
+    { owners: ["script"], expected: "script" },
+    { owners: ["evaluator", "script"], expected: "evaluator" },
+    { owners: ["review", "work"], expected: "work" },
+  ] as const)("reuses step-owner rules for $owners", ({ owners, expected }) => {
+    const result = run({ cards: [{ ...held, subtasks: tasks([...owners]) }] });
+    expect(result.holders.items[0]!.holders[0]!.openStep).toBe(expected);
+  });
+
+  it("keeps a hold with no matching card, including an unknown start", () => {
+    const result = run({ cards: [], holds: new Map([[held.activeThreadId!, pool]]) });
+    expect(result.holders.items[0]!.holders[0]).toEqual({
+      card: null,
+      role: "work",
+      stage: null,
+      thread: "12345678",
+      heldSince: t("01:00"),
+      heldForH: 23,
+      openStep: "none",
+      turn: "unknown",
+    });
+    expect(
+      run({
+        cards: [],
+        holds: new Map([["orphan", pool]]),
+        slotHistory: { events: [], recordedSince: null },
+      }).holders.items[0]!.holders[0],
+    ).toMatchObject({ heldSince: null, heldForH: null });
+  });
+
+  it("falls back to the card's stage entry for a take before the window", () => {
+    const result = run({
+      slotHistory: { events: [slot(1, held.activeThreadId!, before)], recordedSince: before },
+    });
+    expect(result.holders.items[0]!.holders[0]).toMatchObject({
+      heldSince: t("00:30"),
+      heldForH: 23.5,
+    });
+  });
+
+  it("includes zero-slot, empty and removed pools without losing holders", () => {
+    const other = Rules.poolKey(sonnet);
+    const result = run({
+      pools: [
+        { key: pool, model: opus, slots: 0 },
+        { key: other, model: sonnet, slots: 0 },
+      ],
+      holds: new Map([["orphan", "removed"]]),
+    });
+    expect(result.holders.items.find((row) => row.pool === pool)).toMatchObject({
+      slots: 0,
+      holders: [{ card: 76 }],
+    });
+    expect(result.holders.items.find((row) => row.pool === other)).toEqual({
+      pool: other,
+      slots: 0,
+      holders: [],
+    });
+    expect(result.holders.items.find((row) => row.pool === "removed")).toMatchObject({
+      slots: 0,
+      holders: [{ card: null }],
+    });
+  });
+
+  it("counts a batched thread once and uses the same final card as dispatcher diagnostics", () => {
+    const result = run({
+      cards: [held, { ...held, number: 77, activeRole: "review", stage: "in_review" }],
+    });
+    expect(result.holders.items[0]!.holders).toHaveLength(1);
+    expect(result.holders.items[0]!.holders[0]).toMatchObject({
+      card: 77,
+      role: "review",
+      stage: "in_review",
+    });
+  });
+
+  it("sorts oldest first and lists only 50 of 60 holders", () => {
+    const cards = Array.from({ length: 60 }, (_, i) => ({
+      ...held,
+      id: KanbanCardId.make(`c${i}`),
+      number: i + 1,
+      activeThreadId: ThreadId.make(`thread-${String(i).padStart(8, "0")}`),
+    }));
+    const events = cards.map((card, i) =>
+      slot(i + 1, card.activeThreadId!, t(`00:${String(i).padStart(2, "0")}`)),
+    );
+    const result = run({
+      cards: cards.toReversed(),
+      slotHistory: { events: events.toReversed(), recordedSince: before },
+    });
+    expect(result.holders.items[0]!.holders).toHaveLength(50);
+    expect(result.holders.items[0]!.more).toBe(10);
+    expect(result.holders.items[0]!.holders.map((row) => row.card)).toEqual(
+      Array.from({ length: 50 }, (_, i) => i + 1),
+    );
+  });
+
+  it("keeps holder details within the shared page budget across many pools", () => {
+    const cards = Array.from({ length: 600 }, (_, i) => ({
+      ...held,
+      id: KanbanCardId.make(`c${i}`),
+      number: i + 1,
+      activeThreadId: ThreadId.make(`thread-${i}`),
+      activePool: `pool-${i % 12}`,
+    }));
+    const result = run({ cards, pools: [] });
+    expect(JSON.stringify(result).length).toBeLessThan(49_000);
+    expect(result.holders.items.length).toBeGreaterThan(0);
+    expect(result.holders.items.every((row) => row.holders.length + (row.more ?? 0) === 50)).toBe(
+      true,
+    );
+    expect(result.holders.items.length + (result.holders.more ?? 0)).toBe(12);
+  });
+
+  it("uses a current take and clock when reporting holders for a historical activity window", () => {
+    const currentAt = "2026-11-14T12:00:00.000Z";
+    const takeAt = "2026-11-14T10:00:00.000Z";
+    const result = run({ currentAt, currentSlots: [slot(2, held.activeThreadId!, takeAt)] });
+    expect(result.holders.items[0]!.holders[0]).toMatchObject({ heldSince: takeAt, heldForH: 2 });
   });
 });

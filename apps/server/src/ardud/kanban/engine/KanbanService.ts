@@ -566,6 +566,8 @@ export interface KanbanServiceShape {
     window: { readonly since: string; readonly until: string },
   ) => Effect.Effect<
     {
+      readonly currentAt?: string;
+      readonly currentSlots?: ReadonlyArray<SlotEvent>;
       readonly board: KanbanBoard | null;
       readonly cards: ReadonlyArray<KanbanCard>;
       readonly events: ReadonlyArray<KanbanCardEvent>;
@@ -22741,6 +22743,9 @@ const make = Effect.gen(function* () {
       readDb(
         Effect.gen(function* () {
           const { history, ...read } = yield* Effect.all({
+            currentAt: nowIso,
+            // Current holders stay current even when the requested activity window is historical.
+            currentSlots: store.openSlots(boardId),
             board: store.board(boardId),
             cards: store.cards(boardId),
             events: store.boardEvents(boardId, window.since, window.until),
