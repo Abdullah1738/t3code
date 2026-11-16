@@ -1,3 +1,5 @@
+import { assertLiveCallerShell } from "../../mcp/OrchestratorMcpService.ts";
+import { liveThreadShell } from "../../mcp/McpToolAccess.testkit.ts";
 import * as ProviderProcessRegistry from "../../ardud/providers/ProviderProcessRegistry.ts";
 import type { OrchestrationV2Run } from "@t3tools/contracts";
 import { continuedLaunchRecovery, nextLaunchRecovery } from "../launchRecovery.ts";
@@ -3364,6 +3366,81 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       };
     });
   const makeWakeHarness = makeWakeHarnessWithOptions();
+
+  it.effect("keeps the current Claude wake caller live before continuation admission", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const sessions = yield* McpProviderSessions.McpProviderSessions;
+        const threadId = ThreadId.make("thread-claude-wake");
+        const caller = {
+          threadId,
+          providerSessionId: "wake-credential",
+          providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+        };
+        yield* sessions.set({
+          ...caller,
+          environmentId: EnvironmentId.make("test"),
+          endpoint: "http://localhost/mcp",
+          authorizationHeader: "Bearer test",
+          browserToolsAvailable: false,
+        });
+        const h = yield* makeWakeHarness;
+        const shell = {
+          ...liveThreadShell(threadId, { activeRunId: null }),
+          providerInstanceId: caller.providerInstanceId,
+        };
+        yield* h.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId,
+            providerThread: h.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("wake-access"),
+            text: "Start background work",
+            attachments: [],
+          }),
+        );
+        yield* h.offerAndWait(wakeTaskStarted);
+        yield* h.offerAndWait(turnOneResult);
+        yield* Queue.take(h.terminalReceipts);
+        yield* h.offerAndWait(wakeNotification);
+        assert.equal(yield* sessions.readWakeCaller(caller), "starting");
+        const gap = yield* assertLiveCallerShell(shell, caller).pipe(Effect.flip);
+        assert.equal(gap.code, "run_starting");
+        const firstTool = claudeSdkFrame({
+          type: "assistant",
+          message: {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_use",
+                id: "wake-board-write",
+                name: "mcp__t3-code__card_update",
+                input: { card: "#1038" },
+              },
+            ],
+          },
+          parent_tool_use_id: null,
+          uuid: "wake-board-write",
+          session_id: WAKE_NATIVE_SESSION,
+        });
+        yield* h.offerAndWait(firstTool);
+        // No continuation has been admitted: the first write must use native wake evidence.
+        assert.lengthOf(h.terminalEvents(), 1);
+        assert.lengthOf(h.continuationRequests, 1);
+        yield* assertLiveCallerShell(shell, caller);
+        yield* h.offerAndWait(wakeResult);
+        yield* assertLiveCallerShell(shell, caller);
+        yield* Queue.shutdown(h.sdkMessages);
+        yield* h.awaitQueryCleanup;
+        const ended = yield* assertLiveCallerShell(shell, caller).pipe(Effect.flip);
+        assert.equal(ended.code, "parent_not_active");
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
 
   it.effect.each(["lifecycle", "prompt_echo", "native_output"] as const)(
     "records same-attempt native %s evidence before orchestration receives it",
