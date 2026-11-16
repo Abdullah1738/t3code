@@ -381,6 +381,49 @@ class ReconcileBoxes(Base):
 
 
 class Queue(Base):
+    def test_cpu_admission_defaults_off_when_config_has_no_limit(self):
+        (boatd.ETC / "config.json").write_text('{}')
+        boatd.CFG["cpu_pressure_limit"] = 50
+        self.assertEqual(boatd.admission_cpu_limit(), 0)
+
+    def test_one_hour_escape_only_when_cpu_admission_is_off(self):
+        for limit in (0, 50, None):
+            for blocked in ("fifo", "memory", "cap"):
+                with self.subTest(limit=limit, blocked=blocked):
+                    clock = [10000.0]
+                    waits = []
+                    def wait(_):
+                        self.assertEqual(self.status(b, q)["status"], "queued")
+                        waits.append(clock[0])
+                        if len(waits) == 1:
+                            clock[0] += 3600
+                        elif len(waits) == 2:
+                            clock[0] += 1
+                        elif len(waits) == 3:
+                            (boatd.cmd_dir(b) / f"{q}.kill").touch()
+                        else:
+                            self.fail("admission did not stop after cancellation")
+                    with patch.object(boatd, "now", side_effect=lambda: clock[0]), \
+                         patch.object(boatd, "mem_available", return_value=0 if blocked == "memory" else 500 * 2**30), \
+                         patch.object(boatd, "psi", return_value=0), \
+                         patch.object(boatd.time, "sleep", side_effect=wait):
+                        b = self.box(bid="bx_escape")
+                        earlier_status = "queued" if blocked == "fifo" else "running"
+                        earlier = self.cmd(b, pid=1001, status=earlier_status, age=200)
+                        q = self.cmd(b, pid=1002, status="queued", age=100)
+                        boatd.CFG["max_running"] = 1 if blocked == "cap" else 0
+                        (boatd.ETC / "config.json").write_text(json.dumps({"cpu_pressure_limit": limit}))
+                        queued_s = boatd.admit(self.con, b, q, "k", io.BytesIO())
+                    self.assertEqual(queued_s, 3601)
+                    self.assertEqual(waits[:2], [10000, 13600])
+                    self.assertEqual(len(waits), 2 if limit == 0 else 3)
+                    self.assertEqual(self.status(b, q)["status"], "running" if limit == 0 else "queued")
+                    self.assertEqual(self.status(b, q)["started_at"], 13601 if limit == 0 else None)
+                    self.assertEqual(self.status(b, earlier)["status"], earlier_status)
+                    self.con.execute("DELETE FROM commands WHERE box_id=?", (b,))
+                    self.con.execute("DELETE FROM boxes WHERE id=?", (b,))
+                    (boatd.cmd_dir(b) / f"{q}.kill").unlink(missing_ok=True)
+
     def test_last_admission_lookup_stays_bounded_as_history_grows(self):
         self.assertIsNone(boatd.last_admission(self.con))
         self.con.execute("BEGIN")
@@ -503,6 +546,7 @@ class Queue(Base):
         self.assertEqual(self.status(b, second)["started_at"] - self.status(b, first)["started_at"], 10)
 
     def test_long_wait_never_bypasses_memory_cap_or_fifo(self):
+        boatd.CFG["cpu_pressure_limit"] = 50
         for blocked in ("memory", "cap", "fifo"):
             with self.subTest(blocked=blocked):
                 b = self.box(bid="bx_longqueue")
