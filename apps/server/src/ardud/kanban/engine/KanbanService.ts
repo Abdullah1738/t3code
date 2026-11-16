@@ -2910,11 +2910,17 @@ const make = Effect.gen(function* () {
     });
   // One reminder per recipient and owner action, including answers on older messages.
   const ownerWaits = yield* Ref.make<ReadonlyMap<string, string>>(new Map());
-  const hold = (threadId: ThreadId, boardId: string, pool: string, cardId: string) =>
+  const hold = (
+    threadId: ThreadId,
+    boardId: string,
+    pool: string,
+    cardId: string,
+    knownCards?: ReadonlyArray<KanbanCard>,
+  ) =>
     Effect.flatMap(nowMillis, (at) =>
       Ref.update(holds, (all) =>
         new Map(all).set(threadId, { ...all.get(threadId), boardId, pool, at }),
-      ).pipe(Effect.andThen(syncSlot(boardId, threadId, "hold", cardId))),
+      ).pipe(Effect.andThen(syncSlot(boardId, threadId, "hold", cardId, knownCards))),
     );
   /** One board's held slots, thread id to pool, as the rules take them. `except`: a start's own key. */
   const boardHolds = (boardId: string, except?: string) =>
@@ -3926,21 +3932,26 @@ const make = Effect.gen(function* () {
       respectPause = false,
       threadId = card.activeThreadId,
       cancelQueued = false,
+      snapshot,
     }: {
       /** Set to pause the card instead of dropping it: when it comes back. */
       readonly until?: string | null;
       readonly respectPause?: boolean;
       readonly threadId?: ThreadId | null;
       readonly cancelQueued?: boolean;
+      readonly snapshot?: CardWriteSnapshot | undefined;
     } = {},
   ) {
     if (threadId === null) return false;
-    if (threadId === card.reviewThreadId) yield* endReviewLink(threadId);
+    if (threadId === card.reviewThreadId)
+      yield* endReviewLink(threadId, undefined, snapshot?.reviewLink);
     const pending = delivering.get(card.id);
     if (pending?.threadId === threadId) pending.revoked = true;
     const others =
       card.activeRole === "work" || cancelQueued
-        ? (yield* store.cardsByThread(threadId)).filter((other) => other.id !== card.id)
+        ? (snapshot?.slots.get(threadId) ?? (yield* store.cardsByThread(threadId))).filter(
+            (other) => other.id !== card.id,
+          )
         : [];
     if (bySelf) {
       if (
@@ -3948,7 +3959,13 @@ const make = Effect.gen(function* () {
         others.every((other) => delivering.has(other.id)) &&
         card.activePool !== null
       ) {
-        yield* hold(threadId, card.boardId, card.activePool, card.id);
+        yield* hold(
+          threadId,
+          card.boardId,
+          card.activePool,
+          card.id,
+          snapshot?.slots.get(threadId),
+        );
       }
       return others.length > 0;
     }
@@ -4051,8 +4068,9 @@ const make = Effect.gen(function* () {
     role: Rules.MoveRole,
     actor: KanbanActor,
     options: KanbanMoveOptions = {},
+    snapshot?: CardWriteSnapshot,
   ) {
-    const board = yield* boardOf(card.boardId);
+    const board = snapshot?.board ?? (yield* boardOf(card.boardId));
     const check = Rules.checkMove(role, card, to);
     if (!check.ok)
       return yield* failWith(
@@ -4062,7 +4080,12 @@ const make = Effect.gen(function* () {
       );
     const waitFrom =
       card.stage === "needs_owner" && to === "needs_review"
-        ? (yield* askedBy(card))?.fromStage
+        ? (snapshot
+            ? snapshot.events.findLast(
+                (event) => event.kind === "moved" && event.toStage === "needs_owner",
+              )
+            : yield* askedBy(card)
+          )?.fromStage
         : null;
     // A pause only resumes a review when its recorded origin and counter
     // identify an unfinished chain. Work-origin and unknown pauses start over.
@@ -4076,8 +4099,11 @@ const make = Effect.gen(function* () {
     const kept = !leaving
       ? false
       : to === "needs_owner"
-        ? yield* letGo(card, bySelf, "waits on the owner's answer", { until: "with the answer" })
-        : yield* letGo(card, bySelf, `moved to ${to}`);
+        ? yield* letGo(card, bySelf, "waits on the owner's answer", {
+            until: "with the answer",
+            snapshot,
+          })
+        : yield* letGo(card, bySelf, `moved to ${to}`, { snapshot });
     // Pulled back to todo while its thread goes on with other cards: the
     // thread was told to drop it, so it starts fresh instead of rejoining.
     const base = leaving
@@ -4103,6 +4129,7 @@ const make = Effect.gen(function* () {
                     subtask.state === "open" &&
                     (subtask.owner === "evaluator" || subtask.owner === "script"),
                 ))),
+          snapshot,
         ),
       ),
       stage: to,
@@ -4148,8 +4175,9 @@ const make = Effect.gen(function* () {
       fromStage: card.stage,
       toStage: to,
       body: options.note ?? null,
+      ...(snapshot === undefined ? {} : { before: snapshot.before }),
     });
-    yield* saveCard(next, actor);
+    yield* saveCard(next, actor, false, undefined, undefined, snapshot);
     for (const ask of dropped) {
       if (ask.by._tag !== "evaluator") continue;
       const evaluator = ask.by.threadId;
@@ -15148,6 +15176,7 @@ const make = Effect.gen(function* () {
           target ??= saved.card.id;
           return saved.card.id === target && isSaved(saved.card) ? saved.card : undefined;
         }),
+        name === "card.move",
       );
     });
   const read = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
@@ -17147,7 +17176,76 @@ const make = Effect.gen(function* () {
           ["note", options?.note],
           ["question", options?.question],
         ]);
-        const card = yield* cardOf(cardId);
+        const location = yield* locks.outside(
+          rawStore.card(cardId).pipe(Effect.withSpan("card.move.read.location")),
+          undefined,
+          true,
+        );
+        if (!location) return yield* failWith("not-found", `card ${cardId}`);
+        yield* locks.access(location.boardId, Effect.void);
+        // Every read finishes outside the gate; outside() checks the board
+        // generation before any guard or write can use this snapshot.
+        const snapshot = yield* locks.outside(
+          Effect.gen(function* () {
+            const card = yield* rawStore.card(cardId).pipe(Effect.withSpan("card.move.read.card"));
+            if (!card) return yield* failWith("not-found", `card ${cardId}`);
+            const board = yield* rawStore
+              .board(card.boardId)
+              .pipe(Effect.withSpan("card.move.read.board"));
+            if (!board) return yield* failWith("not-found", `board ${card.boardId}`);
+            const slots = new Map<string, ReadonlyArray<KanbanCard>>();
+            if (card.activeThreadId !== null)
+              slots.set(
+                card.activeThreadId,
+                yield* rawStore
+                  .cardsByThread(card.activeThreadId)
+                  .pipe(Effect.withSpan("card.move.read.slots")),
+              );
+            const waitTargets = new Map<string, KanbanCard & { readonly boardName?: string }>();
+            if (card.wait?.card != null) {
+              const target = yield* rawStore
+                .card(KanbanCardId.make(card.wait.card))
+                .pipe(Effect.withSpan("card.move.read.waitTarget"));
+              if (target) {
+                const boardName =
+                  target.boardId === card.boardId
+                    ? undefined
+                    : ((yield* rawStore
+                        .board(target.boardId)
+                        .pipe(Effect.withSpan("card.move.read.waitBoard")))?.name ??
+                      target.boardId);
+                waitTargets.set(target.id, {
+                  ...target,
+                  ...(boardName === undefined ? {} : { boardName }),
+                });
+              }
+            }
+            return {
+              before: card,
+              board,
+              slots,
+              waitTargets,
+              events: yield* rawStore
+                .cardEvents(card.id)
+                .pipe(Effect.withSpan("card.move.read.events")),
+              workCards:
+                card.workThreadId === null
+                  ? []
+                  : yield* rawStore
+                      .threadCards(card.workThreadId)
+                      .pipe(Effect.withSpan("card.move.read.workCards")),
+              reviewLink:
+                card.reviewThreadId === null
+                  ? null
+                  : yield* rawStore
+                      .threadLink(card.reviewThreadId)
+                      .pipe(Effect.withSpan("card.move.read.reviewLink")),
+            } satisfies CardWriteSnapshot;
+          }).pipe(Effect.withSpan("card.move.read.snapshot")),
+          undefined,
+          true,
+        );
+        const card = snapshot.before;
         if (
           role === "cardThread" &&
           actor._tag === "thread" &&
@@ -17206,8 +17304,11 @@ const make = Effect.gen(function* () {
             );
           }
           if (ownReviewHandoff && card.stage === "needs_review") {
-            yield* logEvent(card, actor, "comment", { body: options!.note!.trim() });
-            yield* saveCard(card, actor);
+            yield* logEvent(card, actor, "comment", {
+              body: options!.note!.trim(),
+              before: snapshot.before,
+            });
+            yield* saveCard(card, actor, false, undefined, undefined, snapshot);
             return card;
           }
           if (to === "needs_owner" && !options?.question?.trim()) {
@@ -17229,7 +17330,7 @@ const make = Effect.gen(function* () {
           }
         }
         if (to === "verified" && role !== "owner") {
-          const board = yield* boardOf(card.boardId);
+          const board = snapshot.board;
           const open = card.subtasks.filter((subtask) => subtask.state === "open");
           const missing = card.subtasks
             .map((subtask) =>
@@ -17253,13 +17354,11 @@ const make = Effect.gen(function* () {
           if (missing) return yield* failWith("denied", missing, "approval_required");
         }
         if ((to === "completed" || to === "deployed") && role !== "owner") {
-          const board = yield* boardOf(card.boardId);
+          const board = snapshot.board;
           const blocked = Rules.reviewGate(card, Rules.chainFor(board, card)?.steps.length ?? 1);
           if (blocked !== null) return yield* failWith("denied", blocked, "review_incomplete");
           if (role === "evaluator" && card.workThreadId !== null) {
-            const reviewed = (yield* store.cardEvents(card.id)).findLast(
-              (event) => event.kind === "review",
-            )?.head;
+            const reviewed = snapshot.events.findLast((event) => event.kind === "review")?.head;
             if (reviewed) {
               const view = yield* threads.view(card.workThreadId);
               const changed = view?.prs.find(
@@ -17302,9 +17401,7 @@ const make = Effect.gen(function* () {
             wakeNote: null,
             nudgedAt: null,
           };
-          const reviewed = (yield* store.cardEvents(card.id)).findLast(
-            (event) => event.kind === "review",
-          )?.head;
+          const reviewed = snapshot.events.findLast((event) => event.kind === "review")?.head;
           moveOptions = {
             ...moveOptions,
             note: `${options!.note!.trim()}\nThe earlier clear${reviewed ? ` at ${reviewed}` : ""} no longer counts; review restarted.`,
@@ -17312,10 +17409,10 @@ const make = Effect.gen(function* () {
         }
         if (answeredRunStall) {
           source = { ...source, stalled: null };
-          yield* logEvent(source, actor, "flagged", { body: "Cleared" });
-          yield* logEvent(source, actor, "comment", { body: clearNote });
+          yield* logEvent(source, actor, "flagged", { body: "Cleared", before: snapshot.before });
+          yield* logEvent(source, actor, "comment", { body: clearNote, before: snapshot.before });
         }
-        const moved = yield* moveUnlocked(source, to, role, actor, moveOptions);
+        const moved = yield* moveUnlocked(source, to, role, actor, moveOptions, snapshot);
         const deferred = yield* effectSink;
         if (deferred === undefined || deferred.closed) {
           yield* forkPostCommit(

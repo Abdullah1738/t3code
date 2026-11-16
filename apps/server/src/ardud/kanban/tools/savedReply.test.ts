@@ -395,6 +395,7 @@ it.effect("a completed follow-up read does not replace a foreground admission st
         timedOut: true,
         saved: false,
         commitStarted: false,
+        subSteps: [],
         ...Object.fromEntries(
           [...span.attributes].filter(
             ([key]) => key.startsWith("kanban.reply.") && !key.startsWith("kanban.reply.stage_ms."),
@@ -1354,5 +1355,104 @@ it.effect("long-hold sub-step names stay within analytics metadata labels", () =
     yield* Deferred.succeed(finish, undefined);
     yield* Fiber.join(pending);
     assert.deepEqual(steps, [{ subStep: "unknown", ms: 5_000 }]);
+  }),
+);
+
+it.effect(
+  "#1712 a card.move mutate stall names completed and pending awaits in both refusal logs",
+  () =>
+    Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      const firstEntered = yield* Deferred.make<void>();
+      const firstRelease = yield* Deferred.make<void>();
+      const entered = yield* Deferred.make<void>();
+      const warnings: unknown[] = [];
+      const logger = Logger.make(({ message }) => {
+        warnings.push(message);
+      });
+      const call = yield* SavedReply.protect(
+        SavedWrite.subSteps(
+          "card.move",
+          locks
+            .board(
+              "robob",
+              SavedWrite.mutating(
+                Effect.gen(function* () {
+                  yield* Deferred.succeed(firstEntered, undefined).pipe(
+                    Effect.andThen(Deferred.await(firstRelease)),
+                    Effect.withSpan("guard.subtasks"),
+                  );
+                  return yield* Deferred.succeed(entered, undefined).pipe(
+                    Effect.andThen(Effect.never),
+                    Effect.withSpan("guard.reviewChain"),
+                  );
+                }),
+              ),
+            )
+            .pipe(Effect.provideService(BoardLocks.operationName, "card.move")),
+          true,
+        ),
+        "card_move",
+      ).pipe(
+        Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+        Effect.forkChild,
+      );
+      yield* Deferred.await(firstEntered);
+      yield* TestClock.adjust(2_000);
+      yield* Deferred.succeed(firstRelease, undefined);
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust(SavedReply.REPLY_BUDGET_MS - 2_000);
+      const result = callResult(yield* Fiber.join(call));
+      assert.isTrue(result.isError);
+      assert.deepInclude(result.structuredContent, { saved: false });
+      const subSteps = [
+        { subStep: "guard.reviewChain", ms: 23_000 },
+        { subStep: "guard.subtasks", ms: 2_000 },
+      ];
+      const timeout = warnings.find(
+        (message) =>
+          Array.isArray(message) && message[0] === "kanban saved write reply unavailable",
+      );
+      assert.isArray(timeout);
+      assert.deepInclude((timeout as [string, Record<string, unknown>])[1], {
+        "kanban.reply.stage_at_timeout": "mutate",
+        subSteps,
+      });
+      for (const event of ["kanban board write refused", "kanban board lock long hold"]) {
+        const rows = warnings.filter((message) => String(message).includes(`"event":"${event}"`));
+        assert.lengthOf(rows, 1);
+        assert.deepInclude(JSON.parse(String(rows[0])), { subSteps });
+      }
+    }),
+);
+
+it.effect("#1712 store reader substeps retain the specific read operation", () =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const warnings: unknown[] = [];
+    const logger = Logger.make(({ message }) => {
+      warnings.push(message);
+    });
+    const call = yield* SavedReply.protect(
+      SavedWrite.subSteps(
+        "card.move",
+        Deferred.succeed(entered, undefined).pipe(
+          Effect.andThen(Effect.never),
+          Effect.withSpan("KanbanStore.read", { attributes: { "kanban.operation": "read card" } }),
+        ),
+        true,
+      ),
+      "card_move",
+    ).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })), Effect.forkChild);
+    yield* Deferred.await(entered);
+    yield* TestClock.adjust(SavedReply.REPLY_BUDGET_MS);
+    const result = callResult(yield* Fiber.join(call));
+    assert.deepInclude(result.structuredContent, { saved: false });
+    const timeout = warnings.find(
+      (message) => Array.isArray(message) && message[0] === "kanban saved write reply unavailable",
+    );
+    assert.deepInclude((timeout as [string, Record<string, unknown>])[1], {
+      subSteps: [{ subStep: "KanbanStore.read.card", ms: 25_000 }],
+    });
   }),
 );

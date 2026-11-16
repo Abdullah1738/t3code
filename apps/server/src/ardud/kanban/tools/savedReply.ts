@@ -186,6 +186,7 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
                 ...timeoutLocks,
                 "board.reply_phase": stageAtTimeout,
                 "board.reply_elapsed_ms": timeoutElapsedMs,
+                subSteps: slowSubSteps,
               };
               return Effect.logWarning(
                 // Fixed diagnostic fields, as in the lock-admission refusal logger.
@@ -203,6 +204,7 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
           timedOut,
           saved,
           commitStarted,
+          subSteps: slowSubSteps,
           ...fields,
         }),
       ),
