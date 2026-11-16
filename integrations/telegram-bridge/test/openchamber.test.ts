@@ -147,6 +147,9 @@ test("legacy backend preserves sanitized wrapper diagnostics", async () => {
   const cases: Array<{ error: unknown; props: Record<string, string> }> = [
     { error: new TypeError(secret), props: { cause: "unclassified", detail: "TypeError", errorClass: "TypeError" } },
     { error: { code: "UND_ERR_SOCKET", message: secret }, props: { cause: "socket_closed", detail: "UND_ERR_SOCKET" } },
+    ...["ConnectionRefused", "FailedToOpenSocket"].map(code => ({
+      error: Object.assign(new TypeError(secret), { code, errno: 0 }), props: { cause: "ECONNREFUSED", detail: code },
+    })),
     { error: secret, props: { cause: "non_error", detail: "String" } },
   ];
   try {

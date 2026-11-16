@@ -100,7 +100,9 @@ const errorClasses = new Set(["Error", "TypeError", "RangeError", "ReferenceErro
 const schemaClasses = new Set(["ZodError", "ValidationError", "SchemaError", "ParseError"]);
 const cancellationCodes = new Set(["ABORT_ERR", "ERR_CANCELED"]);
 const socketCodes = new Set(["ERR_SOCKET_CLOSED", "ERR_STREAM_PREMATURE_CLOSE", "UND_ERR_SOCKET", "ConnectionClosed", "SocketClosed"]);
-const detailValues = new Set([...causeCodes, ...errorClasses, ...cancellationCodes, ...socketCodes, "AbortError", "TimeoutError"]);
+// Bun reports errno 0 for both refused TCP and missing Unix sockets, so ENOENT cannot be inferred.
+const bunFetchCauses = new Map([["ConnectionRefused", "ECONNREFUSED"], ["FailedToOpenSocket", "ECONNREFUSED"]]);
+const detailValues = new Set([...causeCodes, ...errorClasses, ...cancellationCodes, ...socketCodes, ...bunFetchCauses.keys(), "AbortError", "TimeoutError"]);
 export type ErrorCause = string | number;
 export type ErrorInfo = { cause: ErrorCause; detail: string; errorClass?: string };
 function safeCause(value: unknown): value is ErrorCause {
@@ -149,6 +151,10 @@ export function errorInfo(error: unknown): ErrorInfo {
       if (row.name === "SyntaxError" || row.name === "AssertionError" || row.name === "URIError") return infoForCause("decode", current, row.name);
       if (typeof row.status === "number" && safeCause(row.status)) return infoForCause(row.status, current);
       if (typeof row.code === "string" && causeCodes.has(row.code)) return infoForCause(row.code, current, row.code);
+      if (typeof row.code === "string") {
+        const cause = bunFetchCauses.get(row.code);
+        if (cause) return infoForCause(cause, current, row.code);
+      }
       current = row.cause;
     }
     // Existing cause precedence wins, including a known errno nested inside a new error shape.
