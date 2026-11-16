@@ -268,6 +268,10 @@ export function createAgentBus<P>(registry: ChatRegistry<P>, log: (event: string
     forSession: id => registry.forSession(id)?.info,
     bySlug: slug => registry.bySlugName(slug)?.info,
     policyPath,
+    groupMembers: info => {
+      const chat = registry.bySlugName(info.slug);
+      return chat ? [...new Set(chat.store.groupAudience().map(address => chat.context.roleOf(address).name))] : [];
+    },
     deliver: (target, text, key, receipt) => {
       const chat = registry.bySlugName(target.slug);
       if (!chat) throw new Error("Agent target unavailable");
