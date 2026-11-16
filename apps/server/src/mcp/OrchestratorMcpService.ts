@@ -1050,8 +1050,8 @@ function threadRun(run: OrchestrationV2Run): OrchestratorMcpThreadRun {
     runId: run.id,
     ordinal: run.ordinal,
     status: run.status,
-    cancelReason: run.cancelReason,
-    cancelDetail: run.cancelDetail,
+    ...(run.cancelReason === undefined ? {} : { cancelReason: run.cancelReason }),
+    ...(run.cancelDetail === undefined ? {} : { cancelDetail: run.cancelDetail }),
     statusSummary:
       run.status === "cancelled" || run.status === "interrupted"
         ? `${run.status} (${run.cancelReason ?? "unknown"}${run.cancelDetail === undefined ? "" : `: ${run.cancelDetail}`})`
@@ -2416,8 +2416,12 @@ const make = Effect.gen(function* () {
       childRunId: childRun?.id ?? null,
       childNodeId: task.id,
       status,
-      cancelReason: cancellation?.cancelReason,
-      cancelDetail: cancellation?.cancelDetail,
+      ...(cancellation?.cancelReason === undefined
+        ? {}
+        : { cancelReason: cancellation.cancelReason }),
+      ...(cancellation?.cancelDetail === undefined
+        ? {}
+        : { cancelDetail: cancellation.cancelDetail }),
       ...(taskFailure === undefined ? {} : { failure: taskFailure }),
       startedAt: childRun?.startedAt == null ? null : DateTime.formatIso(childRun.startedAt),
       ...startState(
@@ -4056,7 +4060,10 @@ const make = Effect.gen(function* () {
               status: result.run.status,
               ...(result.run.cancelReason === undefined
                 ? {}
-                : { cancelReason: result.run.cancelReason, cancelDetail: result.run.cancelDetail }),
+                : { cancelReason: result.run.cancelReason }),
+              ...(result.run.cancelDetail === undefined
+                ? {}
+                : { cancelDetail: result.run.cancelDetail }),
               delivery: result.delivery,
             } satisfies OrchestratorMcpThreadSendResult;
           }),
@@ -4112,9 +4119,8 @@ const make = Effect.gen(function* () {
           threadId: input.threadId,
           runId: selected?.id ?? null,
           status: selected === undefined ? "idle" : runOutcome(selected),
-          ...(selected?.cancelReason === undefined
-            ? {}
-            : { cancelReason: selected.cancelReason, cancelDetail: selected.cancelDetail }),
+          ...(selected?.cancelReason === undefined ? {} : { cancelReason: selected.cancelReason }),
+          ...(selected?.cancelDetail === undefined ? {} : { cancelDetail: selected.cancelDetail }),
           timedOut: true,
           ...startState(selected, []),
         };
@@ -4151,7 +4157,10 @@ const make = Effect.gen(function* () {
           status: result.run === null ? "idle" : runOutcome(result.run),
           ...(result.run?.cancelReason === undefined
             ? {}
-            : { cancelReason: result.run.cancelReason, cancelDetail: result.run.cancelDetail }),
+            : { cancelReason: result.run.cancelReason }),
+          ...(result.run?.cancelDetail === undefined
+            ? {}
+            : { cancelDetail: result.run.cancelDetail }),
           timedOut: result.timedOut,
           ...startState(result.run, []),
           ...(result.run != null && result.run.activeAttemptId === acceptedAttemptId
@@ -4242,7 +4251,10 @@ const make = Effect.gen(function* () {
         status: result.type === "already_terminal" ? result.run.status : "interrupt_requested",
         ...(committedRun?.cancelReason === undefined
           ? {}
-          : { cancelReason: committedRun.cancelReason, cancelDetail: committedRun.cancelDetail }),
+          : { cancelReason: committedRun.cancelReason }),
+        ...(committedRun?.cancelDetail === undefined
+          ? {}
+          : { cancelDetail: committedRun.cancelDetail }),
       } satisfies OrchestratorMcpThreadInterruptResult;
     }),
   });

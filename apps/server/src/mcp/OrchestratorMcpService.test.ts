@@ -1,3 +1,4 @@
+import { expectJsonRoundTrip } from "./McpJson.testkit.ts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as FileSystem from "effect/FileSystem";
@@ -2316,7 +2317,8 @@ describe("OrchestratorMcpService provider resolution", () => {
     }),
   );
 
-  it.effect("status and same-key delegation finish while the background reader is held", () =>
+  const jsonReplyMethods = ["task_status", "delegate_task"] as const;
+  it.effect.each(jsonReplyMethods)("returns JSON for %s", (checked) =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
@@ -2405,7 +2407,11 @@ describe("OrchestratorMcpService provider resolution", () => {
                 storedEvents: [
                   { event: { type: "subagent.updated", payload: task } },
                   {
-                    event: { type: "run.created", threadId: childThreadId, payload: child.runs[0] },
+                    event: {
+                      type: "run.created",
+                      threadId: childThreadId,
+                      payload: child.runs[0],
+                    },
                   },
                 ],
               } as never);
@@ -2432,9 +2438,15 @@ describe("OrchestratorMcpService provider resolution", () => {
           if (status.partial) return assert.fail("task status must answer in full");
           assert.equal(status.status, "completed");
           assert.equal(status.summary, "Review complete.");
-          const request = { task: "Review.", mode: "async", clientRequestId: "same-key" } as const;
+          const request = {
+            task: "Review.",
+            mode: "async",
+            clientRequestId: "same-key",
+          } as const;
           const first = yield* service.delegateTask(scope, request);
           const retry = yield* service.delegateTask(scope, request);
+          expectJsonRoundTrip(checked === "task_status" ? status : first);
+          expectJsonRoundTrip(retry);
           assert.equal(first.taskId, taskId);
           assert.equal(retry.taskId, first.taskId);
           assert.equal(retry.childThreadId, first.childThreadId);
