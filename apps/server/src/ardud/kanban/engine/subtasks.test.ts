@@ -2205,7 +2205,7 @@ describe("marking subtasks", () => {
         ],
       );
       if (!plan.ok) throw new Error(plan.reason);
-      const subtasks = passReview({ subtasks: plan.subtasks }, owner, at);
+      const subtasks = passReview({ subtasks: plan.subtasks }, owner, at, at);
       expect(subtasks.map((subtask) => subtask.state)).toEqual(["open", "done", "done", "open"]);
       expect(workAfterReview({ subtasks })).toBe(firstOwner === "work");
       const finishedEarlier = markSubtask(subtasks, "s1", "done", null, owner, at);
@@ -2217,6 +2217,76 @@ describe("marking subtasks", () => {
     const subtasks = planned().filter((subtask) => subtask.owner !== "review");
     expect(passReview({ subtasks }, owner, at)).toEqual(subtasks);
   });
+
+  it.each(["open", "done", "skipped"] as const)(
+    "#1729 keeps future work's review open when an earlier evaluator task is %s during review",
+    (state) => {
+      const plan = planSubtasks(
+        [],
+        [
+          { text: "Version bump", owner: "work", step: 1 },
+          { text: "Merge bump", owner: "evaluator", step: 2 },
+          { text: "Write notes", owner: "work", step: 3 },
+          { text: "Review notes", owner: "review", step: 4 },
+          { text: "Land notes", owner: "evaluator", step: 5 },
+        ],
+      );
+      if (!plan.ok) throw new Error(plan.reason);
+      const startedAt = "2026-10-26T12:01:00.000Z";
+      const verdictAt = "2026-10-26T12:03:00.000Z";
+      const before = markSubtask(plan.subtasks, "s1", "done", null, owner, at);
+      const subtasks =
+        state === "open"
+          ? before
+          : markSubtask(before, "s2", state, "Handled", owner, "2026-10-26T12:02:00.000Z");
+      expect(passReview({ subtasks }, owner, verdictAt, startedAt)).toEqual(subtasks);
+      if (state !== "open") {
+        expect(passReview({ subtasks }, owner, verdictAt)[3]?.state).toBe("done");
+      }
+    },
+  );
+
+  it.each(["done", "skipped"] as const)(
+    "#1729 treats future work marked %s during review as still open for that verdict",
+    (state) => {
+      const plan = planSubtasks(
+        [],
+        [
+          { text: "Earlier evaluator task", owner: "evaluator", step: 1 },
+          { text: "Future work", owner: "work", step: 2 },
+          { text: "Future review", owner: "review", step: 3 },
+        ],
+      );
+      if (!plan.ok) throw new Error(plan.reason);
+      const subtasks = markSubtask(plan.subtasks, "s2", state, "Handled", owner, at);
+      expect(passReview({ subtasks }, owner, at, "2026-10-26T11:59:00.000Z")).toEqual(subtasks);
+    },
+  );
+
+  it.each(["2026-10-26T12:00:00.000Z", "2026-10-26T12:01:00.000Z"])(
+    "#1729 counts tasks finished before or at review start %s as done",
+    (startedAt) => {
+      const plan = planSubtasks(
+        [],
+        [
+          { text: "First work", owner: "work", step: 1 },
+          { text: "Second work", owner: "work", step: 2 },
+          { text: "Review", owner: "review", step: 3 },
+        ],
+      );
+      if (!plan.ok) throw new Error(plan.reason);
+      const subtasks = markSubtask(
+        markSubtask(plan.subtasks, "s1", "done", null, owner, at),
+        "s2",
+        "done",
+        null,
+        owner,
+        at,
+      );
+      const passed = passReview({ subtasks }, owner, "2026-10-26T12:03:00.000Z", startedAt);
+      expect(passed.map((subtask) => subtask.state)).toEqual(["done", "done", "done"]);
+    },
+  );
 
   it.each(["open", "done", "skipped"] as const)(
     "a later worker step that is %s bounds which review can pass",

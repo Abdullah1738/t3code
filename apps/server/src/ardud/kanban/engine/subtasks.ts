@@ -1517,8 +1517,15 @@ export const markSubtask = (
         };
   });
 
-export function reviewSubtasksToPass(card: Pick<KanbanCard, "subtasks">) {
-  const current = kanbanOpenStep(card);
+export function reviewSubtasksToPass(card: Pick<KanbanCard, "subtasks">, roundStartedAt?: string) {
+  // Without a known start, older callers keep judging the plan as it stands.
+  const startedAt = roundStartedAt === undefined ? undefined : Date.parse(roundStartedAt);
+  const subtasks = card.subtasks.map((subtask) =>
+    startedAt !== undefined && subtask.doneAt !== null && Date.parse(subtask.doneAt) > startedAt
+      ? { ...subtask, state: "open" as const }
+      : subtask,
+  );
+  const current = kanbanOpenStep({ subtasks });
   if (current === null) return [];
   const open = card.subtasks.filter(
     (subtask) => subtask.owner === "review" && subtask.state === "open",
@@ -1527,7 +1534,7 @@ export function reviewSubtasksToPass(card: Pick<KanbanCard, "subtasks">) {
   // Unfinished work in the current step can already have been reviewed, but
   // future work must get its turn before its review can pass.
   if (
-    card.subtasks.some(
+    subtasks.some(
       (subtask) =>
         subtask.owner === "work" &&
         subtask.state === "open" &&
@@ -1544,8 +1551,9 @@ export function passReview(
   card: Pick<KanbanCard, "subtasks">,
   by: KanbanActor,
   at: string,
+  roundStartedAt?: string,
 ): ReadonlyArray<KanbanSubtask> {
-  const ids = new Set(reviewSubtasksToPass(card).map((subtask) => subtask.id));
+  const ids = new Set(reviewSubtasksToPass(card, roundStartedAt).map((subtask) => subtask.id));
   return card.subtasks.map((subtask) =>
     ids.has(subtask.id)
       ? { ...subtask, state: "done", note: "Review passed", doneBy: by, doneAt: at }
