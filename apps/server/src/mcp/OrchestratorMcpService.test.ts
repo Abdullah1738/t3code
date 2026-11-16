@@ -3024,6 +3024,7 @@ describe("OrchestratorMcpService provider resolution", () => {
       "within_grace",
       "near_grace_end",
       "accepted_after_grace",
+      "started_at_fence",
       "unknown",
       "rejected",
       "abandoned",
@@ -3050,19 +3051,38 @@ describe("OrchestratorMcpService provider resolution", () => {
           failRead,
         })),
       )
-      .flatMap((testCase) =>
-        testCase.scenario === "retry_between_reads" ||
-        (testCase.read === undefined &&
-          ["within_grace", "accepted_after_grace", "saved_retry"].includes(testCase.scenario))
+      .flatMap((testCase) => {
+        if (testCase.scenario === "retry_between_reads")
+          return [
+            "inherited",
+            "empty",
+            "options",
+            "model",
+            "provider",
+            "driver",
+            "driver_model",
+            "provider_driver",
+            "provider_driver_model",
+            "provider_disabled",
+            "full",
+          ].map((targetForm) => ({
+            ...testCase,
+            targetForm,
+            claude: !["inherited", "empty", "options", "model"].includes(targetForm),
+          }));
+        return testCase.read === undefined &&
+          ["within_grace", "accepted_after_grace", "started_at_fence", "saved_retry"].includes(
+            testCase.scenario,
+          )
           ? [
-              { ...testCase, claude: false },
-              { ...testCase, claude: true },
+              { ...testCase, targetForm: "full", claude: false },
+              { ...testCase, targetForm: "full", claude: true },
             ]
-          : [{ ...testCase, claude: false }],
-      ),
+          : [{ ...testCase, targetForm: "full", claude: false }];
+      }),
   )(
-    "returns an async receipt only for a saved create: $scenario read=$read failed=$failRead claude=$claude",
-    ({ scenario, read, failRead, claude }) =>
+    "returns an async receipt only for a saved create: $scenario read=$read failed=$failRead claude=$claude target=$targetForm",
+    ({ scenario, read, failRead, claude, targetForm }) =>
       Effect.scoped(
         Effect.gen(function* () {
           const { ended, tracer } = captureSpans();
@@ -3082,17 +3102,51 @@ describe("OrchestratorMcpService provider resolution", () => {
             scenario === "saved_retry_slow_state" || scenario === "idle_retry_slow_state";
           const idle = scenario === "idle_retry" || scenario === "idle_retry_slow_state";
           const betweenReads = scenario === "retry_between_reads";
+          const alreadyStarted = scenario === "started_at_fence";
           const retry = scenario === "saved_retry" || slowState || idle || betweenReads;
           const targetInstanceId = claude
-            ? ProviderInstanceId.make("claudeAgent")
+            ? ProviderInstanceId.make(
+                targetForm.startsWith("driver") ? "claude-work" : "claudeAgent",
+              )
             : codexInstanceId;
           const targetModel = claude ? "claude-sonnet-5-5" : "gpt-5.4";
+          const target =
+            targetForm === "inherited"
+              ? undefined
+              : targetForm === "empty"
+                ? {}
+                : targetForm === "options"
+                  ? { options: [] }
+                  : targetForm === "model"
+                    ? { model: targetModel }
+                    : {
+                        ...(targetForm.startsWith("driver")
+                          ? {}
+                          : { providerInstanceId: targetInstanceId }),
+                        ...(targetForm.includes("driver")
+                          ? { driverKind: ProviderDriverKind.make("claudeAgent") }
+                          : {}),
+                        ...(["full", "driver_model", "provider_driver_model"].includes(targetForm)
+                          ? { model: targetModel }
+                          : {}),
+                      };
           const key = "async-fence";
           const commandId = CommandId.make(
             `command:mcp:delegate-task:${encodeURIComponent(scope.environmentId)}:${encodeURIComponent(parentThreadId)}:${key}`,
           );
           let expectedTaskId = NodeId.make(`node:delegated-task:${encodeURIComponent(commandId)}`);
           const childThreadId = IdAllocator.derive.delegatedTaskThread({ commandId });
+          const startedAt = yield* DateTime.now;
+          const startedRun = {
+            ...parentProjection([]).runs[0]!,
+            id: RunId.make("async-started-child"),
+            threadId: childThreadId,
+            delegatedTaskId: expectedTaskId,
+            activeAttemptId: RunAttemptId.make("async-started-attempt"),
+            status: "running" as const,
+            startedAt,
+            modelSelection: { instanceId: targetInstanceId, model: targetModel },
+          };
           let saved = retry && !betweenReads;
           let failed = false;
           let creates = 0;
@@ -3157,6 +3211,27 @@ describe("OrchestratorMcpService provider resolution", () => {
                     ? { ...parentProjection(saved ? [task()] : []), ...(idle ? { runs: [] } : {}) }
                     : {
                         ...childProjection,
+                        ...(alreadyStarted
+                          ? {
+                              runs: [startedRun],
+                              providerTurns: [
+                                {
+                                  id: ProviderTurnId.make("async-started-turn"),
+                                  providerThreadId: ProviderThreadId.make(
+                                    "async-started-provider-thread",
+                                  ),
+                                  nodeId: NodeId.make("async-started-node"),
+                                  runAttemptId: startedRun.activeAttemptId,
+                                  ordinal: 1,
+                                  status: "running" as const,
+                                  nativeTurnRef: null,
+                                  startedAt,
+                                  completedAt: null,
+                                  promptAcceptedAt: startedAt,
+                                },
+                              ],
+                            }
+                          : {}),
                         thread: {
                           ...childProjection.thread,
                           modelSelection: { instanceId: targetInstanceId, model: targetModel },
@@ -3177,6 +3252,7 @@ describe("OrchestratorMcpService provider resolution", () => {
                     `node:delegated-task:${encodeURIComponent(command.commandId)}`,
                   );
                   assert.equal(command.completionWake, "always");
+                  if (alreadyStarted) saved = true;
                   yield* Deferred.succeed(entered, undefined);
                   yield* Deferred.await(release);
                   if (scenario === "rejected")
@@ -3208,11 +3284,14 @@ describe("OrchestratorMcpService provider resolution", () => {
               }),
               ...(claude
                 ? [
-                    providerSnapshot({
-                      instanceId: targetInstanceId,
-                      driver: ProviderDriverKind.make("claudeAgent"),
-                      model: targetModel,
-                    }),
+                    {
+                      ...providerSnapshot({
+                        instanceId: targetInstanceId,
+                        driver: ProviderDriverKind.make("claudeAgent"),
+                        model: targetModel,
+                      }),
+                      enabled: targetForm !== "provider_disabled",
+                    },
                   ]
                 : []),
             ]),
@@ -3228,7 +3307,7 @@ describe("OrchestratorMcpService provider resolution", () => {
                 task: "Review",
                 mode: "async",
                 clientRequestId: key,
-                target: { providerInstanceId: targetInstanceId, model: targetModel },
+                target,
               })
               .pipe(Effect.exit, Effect.forkScoped);
             if (slowState) {
@@ -3252,10 +3331,7 @@ describe("OrchestratorMcpService provider resolution", () => {
                 yield* TestClock.adjust("5 seconds");
               }
             }
-            if (retry && read !== undefined && !failRead) {
-              yield* Deferred.await(readEntered);
-              yield* TestClock.adjust("10 seconds");
-            } else if (!retry && read === "parent" && !failRead) {
+            if (read !== undefined && !failRead) {
               yield* Deferred.await(readEntered);
               yield* TestClock.adjust("1 second");
             }
@@ -3306,7 +3382,11 @@ describe("OrchestratorMcpService provider resolution", () => {
               assert.equal(exit.value.childThreadId, childThreadId);
               assert.equal(exit.value.providerInstanceId, targetInstanceId);
               assert.equal(exit.value.model, targetModel);
-              assert.equal(exit.value.startPending, true);
+              assert.equal(exit.value.startPending, !alreadyStarted);
+              if (alreadyStarted) {
+                assert.equal(exit.value.childRunId, startedRun.id);
+                assert.equal(exit.value.startedAt, DateTime.formatIso(startedAt));
+              }
               assert.equal(exit.value.waitTimedOut, false);
               assert.equal(state.saved, true);
               assert.equal(state.dispatchFenceRecovered, true);
@@ -4605,6 +4685,13 @@ describe("OrchestratorMcpService provider resolution", () => {
     },
     { mode: "wait", legacy: false, dispatchTimeout: "before commit", worktree: true },
     { mode: "async", legacy: false, dispatchTimeout: "before commit", concurrentRetry: true },
+    {
+      mode: "async",
+      legacy: false,
+      dispatchTimeout: "before commit",
+      concurrentRetry: true,
+      retryGrace: true,
+    },
     { mode: "async", legacy: true, dispatchTimeout: "before commit" },
     { mode: "wait", legacy: false, dispatchTimeout: "before commit", noRetry: true },
     {
@@ -4690,11 +4777,13 @@ describe("OrchestratorMcpService provider resolution", () => {
           const dispatchEntered = yield* Deferred.make<void>();
           const dispatchRelease = yield* Deferred.make<void>();
           const dispatchFinished = yield* Deferred.make<void>();
+          const retryDispatchEntered = yield* Deferred.make<void>();
           const wakeUpgraded = yield* Deferred.make<void>();
           const prepared = yield* Deferred.make<void>();
           let blockDispatch = dispatchTimeout !== undefined;
           let failReplayRead = false;
           let blockRecovery = false;
+          let createAttempts = 0;
           const heldOrchestrator = Layer.effect(
             Orchestrator.OrchestratorV2,
             Effect.gen(function* () {
@@ -4754,6 +4843,8 @@ describe("OrchestratorMcpService provider resolution", () => {
                         .dispatch(command)
                         .pipe(Effect.tap(() => Deferred.succeed(wakeUpgraded, undefined)));
                     }
+                    if (command.type === "delegated_task.request" && ++createAttempts === 2)
+                      yield* Deferred.succeed(retryDispatchEntered, undefined);
                     return yield* real
                       .dispatch(command)
                       .pipe(
@@ -5112,11 +5203,31 @@ describe("OrchestratorMcpService provider resolution", () => {
                   assert.notInclude(pendingRetry.message, "not created");
                 }
               }
+              if ("retryGrace" in testCase) {
+                yield* Deferred.await(retryDispatchEntered);
+                yield* TestClock.adjust("10 seconds");
+                assert.isUndefined(concurrent?.pollUnsafe());
+                const threads = yield* ThreadManagementService.ThreadManagementService;
+                const commandId = CommandId.make(
+                  decodeURIComponent(recoveringId.slice("node:delegated-task:".length)),
+                );
+                assert.equal(
+                  (yield* threads.getDelegationCommandState(commandId)).status,
+                  "pending",
+                );
+                yield* TestClock.adjust("1 second");
+              }
               yield* Deferred.succeed(dispatchRelease, undefined);
               yield* Deferred.await(dispatchFinished);
               if ("worktree" in testCase) yield* Deferred.await(prepared);
-              if (concurrent !== undefined)
-                assert.equal((yield* Fiber.join(concurrent)).taskId, recoveringId);
+              if (concurrent !== undefined) {
+                const retry = yield* Fiber.join(concurrent);
+                assert.equal(retry.taskId, recoveringId);
+                if ("retryGrace" in testCase) {
+                  assert.equal(retry.startPending, true);
+                  assert.equal(retry.waitTimedOut, false);
+                }
+              }
               if (
                 !("finishBeforeRelease" in testCase) &&
                 !("finishBeforeReply" in testCase) &&

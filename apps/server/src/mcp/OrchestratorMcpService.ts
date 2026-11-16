@@ -1691,6 +1691,8 @@ const make = Effect.gen(function* () {
      * one checked for a receipt.
      */
     readonly skipProjectEnablementFilter?: boolean;
+    // A saved receipt must survive the target becoming unavailable after acceptance.
+    readonly savedDelegation?: boolean;
   }): Effect.fn.Return<ResolvedTarget, OrchestratorMcpFailure> {
     let requestedInstanceId = input.target?.providerInstanceId;
     let requestedDriver = input.target?.driverKind;
@@ -1806,7 +1808,7 @@ const make = Effect.gen(function* () {
       const candidates = input.providers.filter(
         (provider) =>
           provider.driver === requestedDriver &&
-          orchestrationCapableInstanceIds.has(provider.instanceId),
+          (input.savedDelegation || orchestrationCapableInstanceIds.has(provider.instanceId)),
       );
       if (candidates.length === 0) {
         return yield* failure(
@@ -1815,7 +1817,7 @@ const make = Effect.gen(function* () {
         );
       }
       const healthyCandidates = candidates.filter(
-        (candidate) => providerConstraints(candidate, true).length === 0,
+        (candidate) => input.savedDelegation || providerConstraints(candidate, true).length === 0,
       );
       const inheritedCandidate = healthyCandidates.find(
         (candidate) => candidate.instanceId === inheritedSelection.instanceId,
@@ -1880,7 +1882,7 @@ const make = Effect.gen(function* () {
       provider,
       orchestrationCapableInstanceIds.has(provider.instanceId),
     );
-    if (constraints.length > 0) {
+    if (constraints.length > 0 && !input.savedDelegation) {
       return yield* failure(
         "provider_unavailable",
         `Provider ${instanceId} cannot run a child task: ${constraints.join(" ")}`,
@@ -1908,6 +1910,7 @@ const make = Effect.gen(function* () {
     }
     if (
       (requestedModel !== undefined || input.delegateSelection === true) &&
+      !input.savedDelegation &&
       provider !== undefined &&
       (provider.models.length > 0 || mappedDestination) &&
       !provider.models.some((candidate) => candidate.slug === model)
@@ -3184,9 +3187,11 @@ const make = Effect.gen(function* () {
       });
       let savedTaskId: NodeId | undefined;
       let deliveredTerminalResult = false;
+      let asyncRecoveryReadStartedAt: bigint | undefined;
       let recoveryTask = findDelegatedTask(parentRecords, scope.thread.threadId, expectedTaskId);
       // These continuations annotate the enclosing delegateTask span.
       const readPersistedTask = Effect.fnUntraced(function* () {
+        asyncRecoveryReadStartedAt ??= yield* Clock.monotonicTimeNanos;
         const records = yield* threadManagement
           .getThreadRecords(scope.thread.threadId, ["subagents"], undefined, {
             projectionOnly: true,
@@ -3291,10 +3296,13 @@ const make = Effect.gen(function* () {
         const response = yield* Fiber.join(continuation).pipe(
           Effect.timeoutOption(
             Duration.millis(
-              yield* remainingWaitMs(
-                waitStartedAt,
-                input.mode === "wait" ? input.timeoutMs : 10_000,
-              ),
+              input.mode !== "wait" && asyncRecoveryReadStartedAt !== undefined
+                ? // Projection probing and optional hydration share one bounded read budget.
+                  yield* remainingWaitMs(asyncRecoveryReadStartedAt, 1_000)
+                : yield* remainingWaitMs(
+                    waitStartedAt,
+                    input.mode === "wait" ? input.timeoutMs : 10_000,
+                  ),
             ),
           ),
           (effect) => McpTaskTrace.stage(effect, "wait"),
@@ -3328,6 +3336,7 @@ const make = Effect.gen(function* () {
         result?: Effect.Success<ReturnType<typeof threadManagement.dispatch>>,
         selection?: ModelSelection,
       ) {
+        asyncRecoveryReadStartedAt ??= yield* Clock.monotonicTimeNanos;
         savedTaskId = expectedTaskId;
         yield* McpCallAnalytics.setSaved(true);
         yield* McpCallAnalytics.dispatchFenceRecovered;
@@ -3335,6 +3344,26 @@ const make = Effect.gen(function* () {
           "t3.delegate.dispatch_fence_recovered": true,
         });
         if (result === undefined && recoveryTask === undefined) yield* readPersistedTask();
+        if (selection === undefined && recoveryTask === undefined) {
+          const recovered = yield* Effect.gen(function* () {
+            const providers = yield* loadProviders;
+            const settings = yield* serverSettings.getSettings;
+            return yield* resolveTarget({
+              parent,
+              target: input.target,
+              providers,
+              delegateSelection: true,
+              migrateSelection: settings.ardudHarnessMigration?.selections === "apply",
+              skipProjectEnablementFilter: true,
+              savedDelegation: true,
+            });
+          }).pipe(
+            Effect.catchCause(() => Effect.succeed(undefined)),
+            Effect.timeoutOption("1 second"),
+            Effect.map(Option.getOrUndefined),
+          );
+          selection = recovered?.modelSelection;
+        }
         return yield* continueDelegation(expectedTaskId, result, undefined, selection);
       });
       if (input.mode !== "wait" && isRetryOfAcceptedDelegation) {
