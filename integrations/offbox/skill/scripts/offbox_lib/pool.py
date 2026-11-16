@@ -1232,7 +1232,14 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                             say(f"recycling pool slot {old['box_id']} for {source} (disk kept)")
                             if old['state'] == 'running':
                                 try:
-                                    lease.stop_box(con, old['box_id'], 'pool recycle', locked=True, pin_locked=True)
+                                    stopped = lease.stop_box(con, old['box_id'], 'pool recycle', locked=True, pin_locked=True)
+                                    if stopped is False:
+                                        # A stop 404 returns False even when its confirmation failed or found a live box.
+                                        settled = con.execute('SELECT state FROM leases WHERE box_id=?',
+                                                              (old['box_id'],)).fetchone()
+                                        if not settled or settled['state'] not in ('stopped', 'deleted'):
+                                            state = settled['state'] if settled else 'unknown'
+                                            raise OffboxError(f"stop of {old['box_id']} was not confirmed; lease state is {state}")
                                 except OffboxError as error:
                                     failed = dict(detail, result='stop_failed', error=str(error),
                                                   error_class=type(error).__name__)

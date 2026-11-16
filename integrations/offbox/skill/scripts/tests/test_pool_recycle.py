@@ -435,19 +435,25 @@ class PoolRecycleTests(Isolated):
 
     def test_stop_response_and_confirmation_matrix(self):
         # A 404 may race a state read; transport failure is never proof that the disk disappeared.
-        cases = [(404, None, 'deleted'), (404, {'state': 'archived'}, 'deleted'),
-                 (404, {'state': 'running'}, 'running'), (404, common.OffboxError('get unavailable'), 'running'),
-                 (200, {'state': 'archived'}, 'stopped'), (200, {'state': 'running'}, 'stopped'),
-                 (200, common.OffboxError('get unavailable'), 'stopped')]
+        confirmations = [('gone', None, True), ('archived', {'state': 'archived'}, True),
+                         *[(state, {'state': state}, False) for state in
+                           ('ready', 'idle', 'running', 'starting', 'archiving', 'error', 'unknown')],
+                         ('missing-state', {}, False),
+                         ('transport-error', common.OffboxError('get unavailable'), False),
+                         ('api-error', lease.api.ApiError(503, 'unavailable', 'get unavailable'), False)]
         real_lock = lease.file_lock
         def lock(name, *args, **kwargs):
             if name == 'pin-old':
                 raise AssertionError('pin lock reacquired')
             return real_lock(name, *args, **kwargs)
-        for status, response, state in cases:
-            with self.subTest(status=status, response=str(response)):
+        for status, (form, response, confirmed) in ((status, case) for status in (200, 404, 500)
+                                                  for case in confirmations):
+            with self.subTest(status=status, confirmation=form):
                 self.reset_recycle()
-                stop_error = lease.api.ApiError(404, 'not_found', 'not found') if status == 404 else None
+                run_id = f'stop-{status}-{form}'
+                stop_error = None if status == 200 else lease.api.ApiError(status, 'stop_failed', 'stop unavailable')
+                failed = status == 500 or (status == 404 and not confirmed)
+                state = 'stopped' if status == 200 else 'deleted' if confirmed and status == 404 else 'running'
                 with contextlib.ExitStack() as held:
                     held.enter_context(patch.object(lease, 'file_lock', side_effect=lock))
                     held.enter_context(patch.object(lease.api, 'stop', side_effect=stop_error))
@@ -456,10 +462,30 @@ class PoolRecycleTests(Isolated):
                     held.enter_context(patch.object(lease, 'keep_images'))
                     held.enter_context(patch.object(lease.ssh_sync, 'close_master'))
                     held.enter_context(patch.object(lease, 'acquire_private', side_effect=self.create))
-                    got = pool.acquire(self.me, template='generic')
+                    got = pool.acquire(self.me, template='generic', run_id=run_id)
                     pool.release_guard(got)
+                self.assertEqual(got['box_id'], 'new')
                 self.assertEqual(self.con.execute("SELECT state FROM leases WHERE box_id='old'").fetchone()[0], state)
-                self.assertNotIn('stop_failed', [r['result'] for r in self.events('pool_recycle')])
+                events = self.events('pool_recycle')
+                expected = ['detached', 'stop_failed', 'created'] if failed else ['detached', 'created']
+                self.assertEqual([r['result'] for r in events], expected)
+                self.assertFalse(self.con.execute("SELECT 1 FROM pool_members WHERE box_id='old'").fetchone())
+                self.assertEqual(pool._pending(self.con, 'repo'), 0)
+                self.assertEqual(events[-1]['new_box_id'], 'new')
+                rows = [json.loads(line) for path in (Path(self.tmp.name)/'tools').glob('*.ndjson')
+                        for line in path.read_text().splitlines()]
+                analytics = [r for r in rows if r['name'] == 'pool_recycle' and r['ids']['run'] == run_id]
+                self.assertEqual([r['props']['result'] for r in analytics], expected)
+                self.assertEqual([r['ok'] for r in analytics], [True, False, True] if failed else [True, True])
+                if failed:
+                    self.assertTrue(events[1]['error'])
+                    self.assertEqual(events[1]['error_class'], 'OffboxError' if status == 404 else 'ApiError')
+                    self.assertEqual(analytics[1]['props']['errorClass'], events[1]['error_class'])
+                    self.assertEqual(analytics[1]['error']['tag'], 'recycle_stop_failed')
+                    if status == 404:
+                        self.assertIn('not confirmed', events[1]['error'])
+                with common.file_lock('box-old', timeout=0), common.file_lock('pin-old', timeout=0):
+                    pass
 
     def test_cap_increase_before_recycle_creates_without_detaching(self):
         recycle = pool._recycle_slot
