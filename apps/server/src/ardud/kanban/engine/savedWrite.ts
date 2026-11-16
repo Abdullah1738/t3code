@@ -1,3 +1,4 @@
+import { McpCall, writeCommitting, writeRefused } from "../../analytics/McpCall.ts";
 import type { KanbanCard, KanbanMessage, ThreadId } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -118,6 +119,36 @@ export const subSteps = Effect.fnUntraced(function* <A, E, R>(
   );
 });
 
+// The store defers this callback when SQL is inside an enclosing transaction.
+export const afterCommit = Context.Reference<(confirm: () => void) => void>(
+  "KanbanSavedWriteAfterCommit",
+  {
+    defaultValue: () => (confirm) => confirm(),
+  },
+);
+const requestCommitEvidence = Context.Reference<boolean>("KanbanSavedWriteRequestCommitEvidence", {
+  defaultValue: () => true,
+});
+
+// Setup may persist a discussion while the incoming request is still unsaved.
+export const preparatory = Effect.fn("KanbanSavedWrite.preparatory")(function* <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+) {
+  return yield* effect.pipe(
+    Effect.provideService(observer, () => {}),
+    Effect.provideService(requestCommitEvidence, false),
+  );
+});
+
+export const committed = Effect.fnUntraced(function* () {
+  const call = yield* Effect.serviceOption(McpCall);
+  if (call._tag === "Some" && call.value.boardWrite && (yield* requestCommitEvidence))
+    (yield* afterCommit)(() => {
+      call.value.saved = true;
+      delete call.value.refusedAt;
+    });
+});
+
 export type Stage = "caller" | "admission" | "read" | "mutate" | "commit" | "ack";
 
 export const traceObserver = Context.Reference<
@@ -137,6 +168,11 @@ export const stage = Effect.fnUntraced(function* <A, E, R>(
   effect: Effect.Effect<A, E, R>,
   name: Stage,
 ) {
+  effect = effect.pipe(
+    Effect.onError(() =>
+      writeRefused(name === "admission" || name === "caller" ? "pre_lock" : "in_write"),
+    ),
+  );
   const trace = yield* traceObserver;
   if (trace === undefined) return yield* effect;
   const fiberId = yield* Effect.fiberId;
@@ -223,12 +259,14 @@ export const commitObserver = Context.Reference<() => void>("KanbanSavedWriteCom
 
 // Runs at every store write; the enclosing lock operation already supplies its span.
 export const committing = Effect.gen(function* () {
+  if (yield* requestCommitEvidence) yield* writeCommitting();
   const trace = yield* traceObserver;
   trace?.mark("commit", yield* Effect.fiberId);
   (yield* commitObserver)();
 });
 
 export const record = Effect.fn("KanbanSavedWrite.record")(function* (saved: Saved) {
+  yield* committed();
   const trace = yield* traceObserver;
   trace?.mark("ack", yield* Effect.fiberId);
   (yield* observer)(saved);

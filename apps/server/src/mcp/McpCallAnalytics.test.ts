@@ -2195,6 +2195,199 @@ it.each([
   });
 });
 
+it.effect.each([
+  {
+    name: "mixed union",
+    input: { title: "ok", stage: "todo", choice: 42 },
+    reasonClass: "bad_type",
+    invalidField: "choice",
+  },
+  {
+    name: "nullable enum",
+    input: { title: "ok", stage: "todo", nullableStage: "invalid" },
+    reasonClass: "bad_enum",
+    invalidField: "nullableStage",
+  },
+  {
+    name: "nullable type",
+    input: { title: "ok", stage: "todo", optionalText: 42 },
+    reasonClass: "bad_type",
+    invalidField: "optionalText",
+  },
+  {
+    name: "union missing key",
+    input: { title: "ok", stage: "todo", objectChoice: {} },
+    reasonClass: "missing_required",
+    invalidField: "objectChoice",
+  },
+  { name: "missing", input: {}, reasonClass: "missing_required", invalidField: "title" },
+  {
+    name: "enum",
+    input: { title: "private", stage: "private stage" },
+    reasonClass: "bad_enum",
+    invalidField: "stage",
+  },
+  {
+    name: "type",
+    input: { title: 42, stage: "todo" },
+    reasonClass: "bad_type",
+    invalidField: "title",
+  },
+  {
+    name: "length",
+    input: { title: "private text too long", stage: "todo" },
+    reasonClass: "too_long",
+    invalidField: "title",
+  },
+  {
+    name: "items",
+    input: { title: "ok", stage: "todo", subtasks: ["private a", "private b"] },
+    reasonClass: "too_many",
+    invalidField: "subtasks",
+  },
+])("schema refusal $name retains only the declared field and issue class", (scenario) =>
+  Effect.gen(function* () {
+    const recorded = yield* Deferred.make<AnalyticsEvent>();
+    const toolkit = Toolkit.make(
+      Tool.make("card_create", {
+        parameters: Schema.Struct({
+          title: Schema.String.check(Schema.isMaxLength(8)),
+          stage: Schema.Literals(["todo", "working"]),
+          choice: Schema.optionalKey(
+            Schema.Union([Schema.String, Schema.Struct({ label: Schema.String })]),
+          ),
+          nullableStage: Schema.optionalKey(Schema.NullOr(Schema.Literals(["todo", "working"]))),
+          optionalText: Schema.optionalKey(Schema.NullOr(Schema.String)),
+          objectChoice: Schema.optionalKey(
+            Schema.Union([Schema.Struct({ label: Schema.String }), Schema.String]),
+          ),
+          subtasks: Schema.optionalKey(Schema.Array(Schema.String).check(Schema.isMaxLength(1))),
+        }),
+        success: Schema.Unknown,
+        failure: OrchestratorMcpFailure,
+        failureMode: "return",
+      }),
+    );
+    const registration = McpHttpServer.toolkitRegistration(
+      toolkit,
+      McpToolAccess.toLayer(toolkit, {
+        card_create: McpToolAccess.reads(() =>
+          Effect.die("schema validation must precede handler"),
+        ),
+      }),
+    ).pipe(
+      Layer.provideMerge(McpServer.McpServer.layer),
+      Layer.provide(
+        Layer.mock(Analytics.Analytics)({
+          record: (row) =>
+            row.kind === "mcp.call"
+              ? Deferred.succeed(recorded, row).pipe(Effect.asVoid)
+              : Effect.void,
+        }),
+      ),
+      Layer.provideMerge(invocation),
+      Layer.provide(Testkit.liveThreadsLayer),
+    );
+    yield* Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      yield* server
+        .callTool({ name: "card_create", arguments: scenario.input })
+        .pipe(Effect.provideService(McpSchema.McpServerClient, client), Effect.exit);
+      const row = yield* Deferred.await(recorded);
+      expect(row).toMatchObject({
+        reasonClass: scenario.reasonClass,
+        invalidField: scenario.invalidField,
+        saved: false,
+      });
+      expect(JSON.stringify(row)).not.toContain("private");
+    }).pipe(Effect.provide(registration));
+  }),
+);
+
+it.effect(
+  "a refused write after a commit retains saved true and drops undeclared field names",
+  () =>
+    Effect.gen(function* () {
+      const state: McpCall.McpCall["Service"] = {
+        callerResolved: true,
+        callerResolveMs: 0,
+        readerLane: "foreground",
+        phase: "handler",
+        boardWrite: true,
+        saved: false,
+        inputKeys: new Set(["title"]),
+      };
+      yield* Effect.gen(function* () {
+        yield* SavedWrite.committing;
+        yield* SavedWrite.committed();
+        const error = new OrchestratorMcpFailure({
+          code: "invalid_request",
+          message: "private",
+          reasonClass: "conflict",
+          invalidField: "private_value",
+        });
+        yield* McpCall.handlerFailure(Cause.fail(error));
+        const row = McpCall.callOutcome(Exit.fail(error), state);
+        expect(row.saved).toBe(true);
+        expect(state.refusedAt).toBe("post_write");
+        expect(state.reasonClass).toBe("conflict");
+        expect(state.invalidField).toBeUndefined();
+      }).pipe(Effect.provideService(McpCall.McpCall, state));
+    }),
+);
+
+it.each([true, false, null] as const)(
+  "board-write reply timeout keeps receipt saved=%s",
+  (saved) => {
+    const state: McpCall.McpCall["Service"] = {
+      callerResolved: true,
+      callerResolveMs: 0,
+      readerLane: "foreground",
+      phase: "result",
+      boardWrite: true,
+      saved: false,
+      replyFailure: "reply_timeout",
+      refusedAt: "pre_lock",
+    };
+    const row = McpCall.callOutcome(
+      Exit.succeed(
+        new McpSchema.CallToolResult({
+          isError: true,
+          content: [],
+          structuredContent: { saved },
+        }),
+      ),
+      state,
+    );
+    expect(row.saved).toBe(saved === null ? "unknown" : saved);
+    expect(state.reasonClass).toBe("reply_timeout");
+    expect(state.refusedAt).toBe(saved === true ? "post_write" : "pre_lock");
+  },
+);
+
+it.effect("a recovered admission clears its refusal stage before a later committed timeout", () =>
+  Effect.gen(function* () {
+    const state: McpCall.McpCall["Service"] = {
+      callerResolved: true,
+      callerResolveMs: 0,
+      readerLane: "foreground",
+      phase: "handler",
+      boardWrite: true,
+      saved: false,
+      refusedAt: "pre_lock",
+    };
+    yield* McpCall.writeAdmitted().pipe(Effect.provideService(McpCall.McpCall, state));
+    expect(state.refusedAt).toBeUndefined();
+    yield* SavedWrite.committed().pipe(Effect.provideService(McpCall.McpCall, state));
+    state.replyFailure = "reply_timeout";
+    McpCall.callOutcome(
+      Exit.fail(new OrchestratorMcpFailure({ code: "invalid_request", message: "private" })),
+      state,
+    );
+    expect(state.refusedAt).toBe("post_write");
+  }),
+);
+
 it.effect("records a late detached create with the original HTTP call's correlation metadata", () =>
   Effect.gen(function* () {
     const entered = yield* Deferred.make<void>();

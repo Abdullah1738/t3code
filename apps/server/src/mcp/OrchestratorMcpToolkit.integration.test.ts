@@ -840,10 +840,10 @@ describe("orchestrator MCP toolkit", () => {
 
             const invocation: McpInvocationContext.McpInvocationScope = {
               environmentId: EnvironmentId.make("environment:mcp-orchestrator"),
-              requestNamespace: "mcp-provider-session-parent",
+              requestNamespace: parent.providerSessions[0]!.id,
               thread: {
                 threadId: parentThreadId,
-                providerSessionId: "mcp-provider-session-parent",
+                providerSessionId: parent.providerSessions[0]!.id,
                 providerInstanceId: codexInstanceId,
               },
               client: undefined,
@@ -4224,10 +4224,15 @@ describe("orchestrator MCP toolkit", () => {
               (event) =>
                 event.type === "provider-turn.updated" && event.payload.status === "running",
             );
+            const approvalCaller = yield* orchestrator.getThreadProjection(approvalParentId);
             const approvalScope = {
               ...invocation,
-              requestNamespace: "mcp-approval-parent",
-              thread: { ...invocation.thread!, threadId: approvalParentId },
+              requestNamespace: approvalCaller.providerSessions[0]!.id,
+              thread: {
+                ...invocation.thread!,
+                threadId: approvalParentId,
+                providerSessionId: approvalCaller.providerSessions[0]!.id,
+              },
             };
             const delegateApproval = invokeAs(approvalScope, "delegate_task", {
               task: approvalCompletionPrompt,
@@ -4584,12 +4589,13 @@ describe("orchestrator MCP toolkit", () => {
               ),
             );
 
+          const parent = yield* orchestrator.getThreadProjection(parentThreadId);
           const invocation: McpInvocationContext.McpInvocationScope = {
             environmentId: EnvironmentId.make("environment:mcp-replay"),
-            requestNamespace: "mcp-provider-session-replay-parent",
+            requestNamespace: parent.providerSessions[0]!.id,
             thread: {
               threadId: parentThreadId,
-              providerSessionId: "mcp-provider-session-replay-parent",
+              providerSessionId: parent.providerSessions[0]!.id,
               providerInstanceId: codexInstanceId,
             },
             client: undefined,

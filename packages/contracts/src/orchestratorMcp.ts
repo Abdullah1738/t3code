@@ -1,3 +1,4 @@
+import { McpReasonClass, McpInvalidField } from "./ardud/mcpReasonClass.ts";
 import { McpDenyReason } from "./ardud/mcpDenyReason.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -824,6 +825,8 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
     ]),
     message: Schema.String,
     reason: Schema.optional(McpDenyReason),
+    reasonClass: Schema.optionalKey(McpReasonClass),
+    invalidField: Schema.optionalKey(McpInvalidField),
     saved: Schema.optional(Schema.Boolean),
   },
 ) {}

@@ -1,15 +1,18 @@
 // @effect-diagnostics nodeBuiltinImport:off - command ids only need a random UUID.
 import * as NodeCrypto from "node:crypto";
 import * as EvaluatorAnalytics from "./evaluatorAnalytics.ts";
+import { BACKGROUND_GRACE_MS } from "./rules.ts";
 
 import {
   CommandId,
   DEFAULT_PROVIDER_INTERACTION_MODE,
   DEFAULT_RUNTIME_MODE,
   MessageId,
+  type NodeId,
   RunId,
   type OrchestrationV2UserInputQuestion,
   type OrchestrationV2Run,
+  type OrchestrationV2Subagent,
   type RuntimeRequestId,
   type ModelSelection,
   type ProjectId,
@@ -90,6 +93,7 @@ export interface KanbanThreadView {
   readonly runStatus?: string | null;
   /** Its own subagents, commands and background tasks still running after its turn ended. Pull-request watches are counted in prWatches instead. */
   readonly backgroundWork: number;
+  readonly backgroundWorkUntil?: string;
   readonly backgroundJobs?: OrchestrationV2ThreadShell["pendingBackgroundTasks"];
   /** Pull requests this thread watches (watch_pull_request) that are still open or draft. The watch wakes it on CI and review changes. */
   readonly prWatches: number;
@@ -342,11 +346,49 @@ export const viewStateOf = (
 /** Background work that still runs for the thread once its turn ended. */
 export const backgroundWorkOf = (
   shell: Pick<OrchestrationV2ThreadShell, "pendingBackgroundTasks">,
+  completions: ReadonlyArray<OrchestrationV2Subagent> = [],
+  descendants: ReadonlySet<NodeId> = new Set(),
 ): number =>
   (shell.pendingBackgroundTasks ?? []).filter(
     // Commands may finish the turn, but their completion still wakes an idle worker.
     (task) => !task.taskId.startsWith("pull-request-watch:"),
-  ).length;
+  ).length +
+  completions.filter((task) => completionPending(task) || descendants.has(task.id)).length;
+
+const completionPending = (task: OrchestrationV2Subagent) =>
+  task.origin === "app_owned" &&
+  ["completed", "failed", "cancelled", "interrupted"].includes(task.status) &&
+  (task.completionDelivery?.state === "pending" || task.completionDelivery?.state === "claimed");
+
+const backgroundWorkUntil = (
+  quietSince: DateTime.Utc,
+  tasks: ReadonlyArray<OrchestrationV2Subagent>,
+  activity: ReadonlyMap<ThreadId, DateTime.Utc>,
+  otherBackgroundUntil?: number,
+): string | undefined => {
+  if (tasks.length === 0 && otherBackgroundUntil === undefined) return undefined;
+  const quiet = DateTime.toEpochMillis(quietSince);
+  return DateTime.formatIso(
+    DateTime.makeUnsafe(
+      Math.max(
+        ...(otherBackgroundUntil === undefined ? [] : [otherBackgroundUntil]),
+        ...tasks.map((task) => {
+          const progress =
+            task.childThreadId === null ? undefined : activity.get(task.childThreadId);
+          const since = completionPending(task)
+            ? task.updatedAt
+            : (progress ?? task.startedAt ?? task.updatedAt);
+          const timeout = completionPending(task)
+            ? BACKGROUND_GRACE_MS
+            : task.idleTimeoutMs && Number.isFinite(task.idleTimeoutMs)
+              ? Math.min(2 * BACKGROUND_GRACE_MS, Math.max(60_000, task.idleTimeoutMs))
+              : BACKGROUND_GRACE_MS;
+          return Math.max(quiet, DateTime.toEpochMillis(since)) + timeout;
+        }),
+      ),
+    ),
+  );
+};
 
 export const prWatchesOf = (shell: Pick<OrchestrationV2ThreadShell, "pullRequests">): number =>
   (shell.pullRequests ?? []).filter(
@@ -371,6 +413,104 @@ const make = Effect.gen(function* () {
           ? null
           : yield* threads.getThreadRecords(threadId, ["runs"], { runIds: [runId] });
       const run = records?.runs[0];
+      // The shell drops terminal items before their completion wake is accepted.
+      const pending =
+        runId === null
+          ? (yield* threads.getThreadRecords(
+              threadId,
+              ["subagents"],
+              { pendingBackgroundTasksOnly: true },
+              { projectionOnly: true },
+            )).subagents
+          : [];
+      const activityByChild = new Map<ThreadId, DateTime.Utc>();
+      const pendingTree = [...pending];
+      const visited = new Set<ThreadId>([threadId]);
+      const descendants = new Set<NodeId>();
+      const threadsWithBackground = new Set<ThreadId>();
+      let otherBackgroundUntil =
+        backgroundWorkOf(shell) >
+        pending.filter((task) => ["pending", "running", "waiting"].includes(task.status)).length
+          ? DateTime.toEpochMillis(viewStateOf(shell).quietSince) + BACKGROUND_GRACE_MS
+          : undefined;
+      // Each descendant keeps its own silence timeout or completion-delivery grace.
+      for (const task of pendingTree) {
+        if (task.childThreadId === null) continue;
+        if (visited.has(task.childThreadId)) continue;
+        visited.add(task.childThreadId);
+        const childShell = yield* threads.getThreadShell(task.childThreadId);
+        if (childShell === null || childShell.deletedAt !== null) continue;
+        const child = yield* threads.getThreadRecords(
+          task.childThreadId,
+          ["runs", "subagents"],
+          {
+            ...(childShell.activeRunId === null
+              ? { latestRunOnly: true }
+              : { runIds: [childShell.activeRunId] }),
+            pendingBackgroundTasksOnly: true,
+          },
+          { projectionOnly: true },
+        );
+        const latest = child.runs[0];
+        if (latest)
+          activityByChild.set(
+            task.childThreadId,
+            latest.lastActivityAt ?? latest.startedAt ?? latest.requestedAt,
+          );
+        const background = backgroundWorkOf(childShell, child.subagents);
+        // A completion wake hides pending shell work while its run is active.
+        const activeDelegates =
+          childShell.activeRunId !== null &&
+          child.subagents.some((nested) =>
+            ["pending", "running", "waiting"].includes(nested.status),
+          );
+        if (background > 0 || activeDelegates) {
+          threadsWithBackground.add(task.childThreadId);
+          if (
+            backgroundWorkOf(childShell) >
+            child.subagents.filter((nested) =>
+              ["pending", "running", "waiting"].includes(nested.status),
+            ).length
+          ) {
+            const quiet = DateTime.toEpochMillis(viewStateOf(childShell).quietSince);
+            const activity = latest?.lastActivityAt
+              ? DateTime.toEpochMillis(latest.lastActivityAt)
+              : quiet;
+            otherBackgroundUntil = Math.max(
+              otherBackgroundUntil ?? 0,
+              Math.max(quiet, activity) + BACKGROUND_GRACE_MS,
+            );
+          }
+        }
+        pendingTree.push(...child.subagents);
+      }
+      const terminalParents = new Map<ThreadId, OrchestrationV2Subagent[]>();
+      for (const task of pendingTree) {
+        if (
+          task.childThreadId !== null &&
+          ["completed", "failed", "cancelled", "interrupted"].includes(task.status)
+        ) {
+          const parents = terminalParents.get(task.childThreadId) ?? [];
+          parents.push(task);
+          terminalParents.set(task.childThreadId, parents);
+        }
+      }
+      // Propagate validated work through terminal ancestors, including shared subtrees.
+      for (const childId of threadsWithBackground) {
+        for (const task of terminalParents.get(childId) ?? []) {
+          descendants.add(task.id);
+          threadsWithBackground.add(task.threadId);
+        }
+      }
+      const until = backgroundWorkUntil(
+        viewStateOf(shell).quietSince,
+        pendingTree.filter(
+          (task) =>
+            ["pending", "running", "waiting"].includes(task.status) || completionPending(task),
+        ),
+        activityByChild,
+        otherBackgroundUntil,
+      );
       const started = shell.activityRunStartedAt;
       const activity = run?.lastActivityAt;
       return {
@@ -394,7 +534,8 @@ const make = Effect.gen(function* () {
         runRequestedAt: run ? DateTime.formatIso(run.requestedAt) : null,
         runMessageId: run?.userMessageId ?? null,
         runStatus: run?.status ?? null,
-        backgroundWork: backgroundWorkOf(shell),
+        backgroundWork: backgroundWorkOf(shell, pending, descendants),
+        ...(until === undefined ? {} : { backgroundWorkUntil: until }),
         backgroundJobs: (shell.pendingBackgroundTasks ?? []).filter(
           (task) => !task.taskId.startsWith("pull-request-watch:"),
         ),
